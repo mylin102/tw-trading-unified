@@ -21,35 +21,20 @@ config/
 # 1. 設定環境變數
 cp .env.example .env   # 填入 Shioaji API Key
 
-# 2. 兩個都 paper（不登入 broker）
+# 2. 不登入 broker，純 paper 測試
 python3 main.py --dry-run
 
-# 3. 登入 broker，但兩個都 paper（由 config 控制）
-python3 main.py
-
-# 4. 只讓選擇權 live，期貨 paper
-# 修改 config/options_strategy.yaml → live_trading: true
-python3 main.py --futures-paper
-
-# 5. 兩個都 live
-# 修改兩個 yaml → live_trading: true
+# 3. 登入 broker，live/paper 由各自 config 決定
 python3 main.py
 ```
 
 ## 交易模式控制
 
-兩層控制，CLI 優先覆蓋 config：
-
-| CLI 參數 | 期貨 | 選擇權 |
-|----------|------|--------|
-| `--dry-run` | paper（不登入） | paper（不登入） |
-| `--futures-paper` | paper | 看 config |
-| `--options-paper` | 看 config | paper |
-| 無參數 | 看 config | 看 config |
-
-Config 設定：
+各策略的 live/paper 由各自 config 決定：
 - `config/futures.yaml` → `live_trading: true/false`
 - `config/options_strategy.yaml` → `live_trading: true/false`
+
+CLI 的 `--dry-run` 是安全開關，完全不登入 broker，兩個都強制 paper。
 
 ⚠️ 目前兩個都設為 `live_trading: false`（paper mode）。
 

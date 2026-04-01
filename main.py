@@ -33,38 +33,29 @@ def tick_dispatcher(futures_mon, options_mon):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="Both strategies paper mode, no broker login")
-    parser.add_argument("--futures-paper", action="store_true", help="Force futures to paper mode")
-    parser.add_argument("--options-paper", action="store_true", help="Force options to paper mode")
+    parser.add_argument("--dry-run", action="store_true", help="Skip broker login entirely (both strategies paper)")
     args = parser.parse_args()
-
-    all_dry = args.dry_run
-    futures_dry = all_dry or args.futures_paper
-    options_dry = all_dry or args.options_paper
 
     api = None
     try:
-        need_login = not (futures_dry and options_dry)
-        if need_login:
+        if not args.dry_run:
             api = get_api()
             console.print("[green]✅ Single Shioaji session established[/green]")
         else:
-            console.print("[yellow]🔧 Both strategies paper — no broker login[/yellow]")
+            console.print("[yellow]🔧 Dry-run — no broker login[/yellow]")
 
-        # --- Futures monitor ---
+        # --- Futures monitor (live/paper 由 config/futures.yaml 的 live_trading 決定) ---
         from strategies.futures.monitor import FuturesMonitor
         fm = FuturesMonitor(
             api=api,
             config_path=os.path.join(BASE, "config", "futures.yaml"),
-            dry_run=futures_dry,
+            dry_run=args.dry_run,
         )
         fm.setup()
-        console.print(f"  futures: {'PAPER' if futures_dry else 'LIVE'}")
 
-        # --- Options monitor ---
+        # --- Options monitor (live/paper 由 config/options_strategy.yaml 的 live_trading 決定) ---
         from strategies.options.monitor import OptionsMonitor
-        om = OptionsMonitor(api=api, dry_run=options_dry)
-        console.print(f"  options: {'PAPER' if options_dry else 'LIVE'}")
+        om = OptionsMonitor(api=api, dry_run=args.dry_run)
 
         # --- Tick subscription ---
         if api is not None:
