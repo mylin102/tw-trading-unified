@@ -1,5 +1,5 @@
 active_mode: V2
-live_trading: true
+live_trading: false
 strategy:
   length: 20
   entry_score: 80
