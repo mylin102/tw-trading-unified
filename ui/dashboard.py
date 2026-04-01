@@ -43,6 +43,11 @@ reserve_pct = risk_cfg.get("account", {}).get("margin_reserve_pct", 0.20)
 
 # ── Paths ──
 FUTURES_REPO = Path.home() / "Documents/mylin102/tw-futures-realtime"
+RESTART_FLAG = BASE / ".restart"
+
+def trigger_restart():
+    RESTART_FLAG.touch()
+    st.toast("🔄 正在重啟 monitor（約 30 秒）...")
 OPTIONS_REPO = Path.home() / "Documents/mylin102/tw-option-squeeze-trading"
 FUTURES_MKT = FUTURES_REPO / "logs/market_data"
 FUTURES_TRADES = FUTURES_REPO / "exports/trades"
@@ -384,12 +389,14 @@ with tab_settings:
                     save_yaml(FUTURES_CFG_PATH, futures_cfg)
                     st.session_state["f_confirm_step"] = 0
                     st.toast("🔴 期貨已切換至 LIVE")
+                    trigger_restart()
                     st.rerun()
         else:
             if st.button("切換至 PAPER 📝", key="f_to_paper"):
                 futures_cfg["live_trading"] = False
                 save_yaml(FUTURES_CFG_PATH, futures_cfg)
                 st.toast("📝 期貨已切換至 PAPER")
+                trigger_restart()
                 st.rerun()
     with sw2:
         st.write(f"選擇權: {mode_badge(o_live)}")
@@ -404,12 +411,14 @@ with tab_settings:
                     save_yaml(OPTIONS_CFG_PATH, options_cfg)
                     st.session_state["o_confirm_step"] = 0
                     st.toast("🔴 選擇權已切換至 LIVE")
+                    trigger_restart()
                     st.rerun()
         else:
             if st.button("切換至 PAPER 📝", key="o_to_paper"):
                 options_cfg["live_trading"] = False
                 save_yaml(OPTIONS_CFG_PATH, options_cfg)
                 st.toast("📝 選擇權已切換至 PAPER")
+                trigger_restart()
                 st.rerun()
 
     st.markdown("---")
