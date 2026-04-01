@@ -21,6 +21,11 @@ from squeeze_futures.engine.indicators import calculate_futures_squeeze, calcula
 from squeeze_futures.data.shioaji_client import ShioajiClient
 from squeeze_futures.data.data_storage import save_trade
 
+try:
+    from squeeze_futures.report.notifier import send_email_notification
+except ImportError:
+    send_email_notification = None
+
 console = Console()
 
 
@@ -141,6 +146,11 @@ class FuturesMonitor:
         if result:
             d = "🟢 BUY" if signal == "BUY" else "🔴 SELL" if signal == "SELL" else "⚪ EXIT"
             console.print(f"[bold green][FuturesMonitor] [{ts}] {d} {lots} lots @ {price:.0f}  {result}[/bold green]")
+            if live_ready and send_email_notification:
+                send_email_notification(
+                    f"[TMF] {signal} {lots} lots @ {price:.0f}",
+                    f"{d} {lots} lots @ {price:.0f}\n{result}",
+                )
         return result
 
     def _check_stop_loss(self, ts, price):

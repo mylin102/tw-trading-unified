@@ -19,6 +19,11 @@ os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
 
 import login.shioaji_login as shioaji_login
 
+try:
+    from strategies.futures.squeeze_futures.report.notifier import send_email_notification as _notify
+except ImportError:
+    _notify = None
+
 console = Console()
 
 # 🚀 確保優先使用當前專案的 src 目錄，避免讀取到其他專案的舊版本
@@ -449,12 +454,16 @@ class ShioajiOptionsSmartMonitor:
             self.stop_loss_price = price * (1 - self.stop_loss_pct)
             self.replay_stats["entries"] += 1
             self.log_trade("LIVE_ENTRY_FILLED", side, price, f"qty={quantity}")
+            if _notify:
+                _notify(f"[TXO] ENTRY {side} @ {price:.1f}", f"🟢 ENTRY {side} qty={quantity} @ {price:.1f}")
             if self.position >= self.paper_lots:
                 self.pending_entry = None
             return
         if self.active_side and action == "Sell":
             self.position = max(0, self.position - quantity)
             self.log_trade("LIVE_EXIT_FILLED", self.active_side, price, f"qty={quantity} reason={self.pending_exit_reason or ''}".strip())
+            if _notify:
+                _notify(f"[TXO] EXIT {self.active_side} @ {price:.1f}", f"🔴 EXIT {self.active_side} qty={quantity} @ {price:.1f} reason={self.pending_exit_reason or ''}")
             if self.pending_exit_reason == "LIVE_TP1_SUBMITTED" and self.position > 0:
                 self.has_tp1_hit = True
                 self.replay_stats["tp1_hits"] += 1
