@@ -249,8 +249,13 @@ with tab_overview:
         fig.update_layout(height=350, margin=dict(t=10, b=10, l=40, r=20), legend=dict(orientation="h", y=1.02))
         fig.update_yaxes(title_text="TMF", tickformat=",.0f", secondary_y=False)
         fig.update_yaxes(title_text="MTX", tickformat=",.0f", secondary_y=True)
-        # 統一 X 軸範圍為今天
-        fig.update_xaxes(range=[f"{TODAY} 08:45", f"{TODAY} 13:45"])
+        # X 軸自動適應資料範圍
+        all_ts = pd.concat([
+            f_df["timestamp"] if f_df is not None and not f_df.empty else pd.Series(dtype="datetime64[ns]"),
+            o_df["timestamp"] if o_df is not None and not o_df.empty else pd.Series(dtype="datetime64[ns]"),
+        ])
+        if not all_ts.empty:
+            fig.update_xaxes(range=[all_ts.min(), all_ts.max()])
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("等待數據...")
