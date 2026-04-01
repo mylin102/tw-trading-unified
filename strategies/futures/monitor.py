@@ -137,7 +137,23 @@ class FuturesMonitor:
                 console.print(f"[red][FuturesMonitor] Live order failed: {signal} {lots}[/red]")
                 return None
 
-        save_trade({"type": signal, "timestamp": ts, "price": price, "lots": lots})
+        # 計算 PnL（出場時）
+        pnl_pts = 0
+        pnl_cash = 0
+        direction = ""
+        if signal == "BUY":
+            direction = "LONG"
+        elif signal == "SELL":
+            direction = "SHORT"
+        elif signal in ("EXIT", "PARTIAL_EXIT") and self.trader.entry_price > 0:
+            direction = "LONG" if self.trader.position > 0 else "SHORT"
+            sign = 1 if self.trader.position > 0 else -1
+            pnl_pts = (price - self.trader.entry_price) * sign
+            pnl_cash = pnl_pts * self.trader.point_value * lots
+
+        save_trade({"type": signal, "timestamp": ts, "price": price, "lots": lots,
+                    "direction": direction, "pnl_pts": round(pnl_pts, 1),
+                    "pnl_cash": round(pnl_cash, 0), "reason": exit_reason or ""})
         result = self.trader.execute_signal(
             signal, price, ts, lots=lots,
             max_lots=self.MGMT.get("max_positions", 2),
