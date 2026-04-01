@@ -28,7 +28,7 @@
 st.slider("Entry Score", min=50, max=100, value=90)
 st.number_input("Stop Loss %", min=0.05, max=0.50, step=0.05)
 ```
-修改後顯示 diff 預覽 → 按「套用」→ 寫入 YAML → toast 通知
+修改後按「套用」→ 寫入 YAML → toast 通知 → 下一棒生效
 
 ---
 
@@ -55,7 +55,7 @@ Dashboard 頂部顯示紅色橫幅：🔴 LIVE TRADING ACTIVE
 ### 安全規則
 - 有持倉時**禁止切換**（必須先平倉）
 - LIVE → PAPER 切換只需單次確認（降風險方向）
-- 切換後 30 秒內可一鍵 rollback
+- 切換後自動重啟 monitor（`.restart` flag → main.py 偵測 → 30 秒後重啟）
 
 ### UI 狀態指示
 - PAPER：綠色 badge `📝 PAPER`
