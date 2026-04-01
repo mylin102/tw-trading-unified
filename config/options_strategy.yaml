@@ -2,7 +2,7 @@
 # 📅 日盤/夜盤共享配置
 
 active_mode: "day"  # 選項：day / night
-live_trading: true
+live_trading: false
 
 # 策略參數
 strategy:
