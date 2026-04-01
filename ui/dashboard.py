@@ -74,7 +74,63 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp"):
     fig.update_yaxes(tickformat=",.0f")
     return fig
 
-# ── Loaders ──
+# ── PnL helpers ──
+def calc_futures_pnl(trades_df):
+    """從期貨 trades CSV 算累計 PnL"""
+    if trades_df is None or trades_df.empty:
+        return None
+    pv = 10  # TMF point value
+    records = []
+    entry_price, entry_lots = 0, 0
+    cum_pnl = 0
+    for _, r in trades_df.iterrows():
+        t = r.get("type", "")
+        price = float(r.get("price", 0))
+        lots = int(r.get("lots", 0))
+        if t == "BUY":
+            entry_price, entry_lots = price, lots
+        elif t in ("EXIT", "PARTIAL_EXIT", "SELL") and entry_price > 0:
+            pnl = (price - entry_price) * lots * pv
+            cum_pnl += pnl
+            records.append({"timestamp": r.get("timestamp"), "pnl": cum_pnl})
+            if t == "EXIT":
+                entry_price, entry_lots = 0, 0
+    return pd.DataFrame(records) if records else None
+
+def calc_options_pnl(ledger_df):
+    """從選擇權 ledger 配對 entry/exit 算累計 PnL"""
+    if ledger_df is None or ledger_df.empty:
+        return None
+    pv = 50  # TXO point value
+    records = []
+    entry_price = 0
+    cum_pnl = 0
+    for _, r in ledger_df.iterrows():
+        action = str(r.get("Action", ""))
+        price = 0
+        try:
+            price = float(r.get("Price", 0))
+        except (ValueError, TypeError):
+            continue
+        if "ENTRY_FILLED" in action or "PAPER_ENTRY" in action:
+            entry_price = price
+        elif ("EXIT_FILLED" in action or "PAPER_EXIT" in action or "PAPER_TIME_EXIT" in action) and entry_price > 0:
+            pnl = (price - entry_price) * pv
+            cum_pnl += pnl
+            records.append({"timestamp": r.get("Timestamp"), "pnl": cum_pnl})
+            entry_price = 0
+    return pd.DataFrame(records) if records else None
+
+def make_pnl_chart(pnl_df, title):
+    if pnl_df is None or pnl_df.empty:
+        return None
+    pnl_df["timestamp"] = pd.to_datetime(pnl_df["timestamp"], format="mixed")
+    color = "#00cc66" if pnl_df["pnl"].iloc[-1] >= 0 else "#ff4444"
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=pnl_df["timestamp"], y=pnl_df["pnl"], fill="tozeroy", line=dict(color=color, width=1.5), name="PnL"))
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", line_width=0.5)
+    fig.update_layout(height=250, margin=dict(t=10, b=10, l=40, r=20), title_text=title, title_font_size=14, yaxis_tickformat=",.0f")
+    return fig
 @st.cache_data(ttl=5)
 def load_futures_indicators():
     for tag in ["", "_LIVE", "_PAPER"]:
@@ -194,6 +250,26 @@ with tab_overview:
     else:
         st.info("等待數據...")
 
+    # ── 總覽 PnL ──
+    st.subheader("💰 今日累計 PnL")
+    pc1, pc2 = st.columns(2)
+    ft = load_futures_trades()
+    fpnl = calc_futures_pnl(ft)
+    ol = load_options_ledger()
+    opnl = calc_options_pnl(ol)
+    with pc1:
+        if fpnl is not None and not fpnl.empty:
+            val = fpnl["pnl"].iloc[-1]
+            st.metric("期貨 PnL", f"{val:+,.0f} TWD")
+        else:
+            st.metric("期貨 PnL", "0 TWD")
+    with pc2:
+        if opnl is not None and not opnl.empty:
+            val = opnl["pnl"].iloc[-1]
+            st.metric("選擇權 PnL", f"{val:+,.0f} TWD")
+        else:
+            st.metric("選擇權 PnL", "0 TWD")
+
 # ════════════════════════════════════════
 # Tab 2: 期貨
 # ════════════════════════════════════════
@@ -209,6 +285,10 @@ with tab_futures:
     if ft is not None and not ft.empty:
         st.subheader("交易記錄")
         st.dataframe(ft, use_container_width=True)
+        fpnl = calc_futures_pnl(ft)
+        fig = make_pnl_chart(fpnl, "期貨累計 PnL (TWD)")
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
 
 # ════════════════════════════════════════
 # Tab 3: 選擇權
@@ -225,6 +305,10 @@ with tab_options:
     if ol is not None and not ol.empty:
         st.subheader("交易記錄")
         st.dataframe(ol.tail(30), use_container_width=True)
+        opnl = calc_options_pnl(ol)
+        fig = make_pnl_chart(opnl, "選擇權累計 PnL (TWD)")
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
 
 # ════════════════════════════════════════
 # Tab 4: 設定
