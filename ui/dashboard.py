@@ -333,17 +333,23 @@ with tab_settings:
     with r1:
         f_init = st.number_input("期貨期初資金", 10000, 1000000, int(futures_cfg.get("execution", {}).get("initial_balance", 100000)), 10000, key="f_init")
         if st.button("🔄 重置期貨模擬", key="f_reset"):
-            paper_dir = FUTURES_REPO / "logs/market_data"
-            # Just log the reset
+            paper_dir = FUTURES_REPO / "exports/trades"
+            for f in paper_dir.glob(f"TMF_*_trades.*"):
+                f.unlink()
             st.success(f"✅ 期貨模擬已重置，期初資金 {f_init:,.0f}")
     with r2:
         o_init = st.number_input("選擇權期初資金", 10000, 1000000, 40000, 10000, key="o_init")
         if st.button("🔄 重置選擇權模擬", key="o_reset"):
             paper_dir = OPTIONS_REPO / "logs/paper_trading"
+            # 清交易紀錄
             ledger_f = paper_dir / "options_trade_ledger.csv"
-            equity_f = paper_dir / "equity_curve.csv"
             if ledger_f.exists():
                 pd.DataFrame(columns=["Timestamp", "Mode", "Action", "Side", "Price", "Quantity", "PnL", "Balance", "Note"]).to_csv(ledger_f, index=False)
+            # 清 indicator
+            for f in paper_dir.glob(f"OPTIONS_*_indicators.csv"):
+                f.unlink()
+            # 重置權益曲線
+            equity_f = paper_dir / "equity_curve.csv"
             pd.DataFrame([{"timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "action": "INITIAL", "side": "", "price": 0, "quantity": 0, "pnl": 0, "balance": o_init, "note": "重置"}]).to_csv(equity_f, index=False)
             st.success(f"✅ 選擇權模擬已重置，期初資金 {o_init:,.0f}")
 
