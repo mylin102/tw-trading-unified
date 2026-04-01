@@ -82,50 +82,31 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp"):
 
 # ── PnL helpers ──
 def calc_futures_pnl(trades_df):
-    """從期貨 trades CSV 算累計 PnL"""
+    """從期貨 trades CSV 的 pnl_cash 欄位累計"""
     if trades_df is None or trades_df.empty:
         return None
-    pv = 10  # TMF point value
-    records = []
-    entry_price, entry_lots = 0, 0
-    cum_pnl = 0
-    for _, r in trades_df.iterrows():
-        t = r.get("type", "")
-        price = float(r.get("price", 0))
-        lots = int(r.get("lots", 0))
-        if t == "BUY":
-            entry_price, entry_lots = price, lots
-        elif t in ("EXIT", "PARTIAL_EXIT", "SELL") and entry_price > 0:
-            pnl = (price - entry_price) * lots * pv
-            cum_pnl += pnl
-            records.append({"timestamp": r.get("timestamp"), "pnl": cum_pnl})
-            if t == "EXIT":
-                entry_price, entry_lots = 0, 0
-    return pd.DataFrame(records) if records else None
+    if "pnl_cash" not in trades_df.columns:
+        return None
+    trades_df["pnl_cash"] = pd.to_numeric(trades_df["pnl_cash"], errors="coerce").fillna(0)
+    exits = trades_df[trades_df["pnl_cash"] != 0].copy()
+    if exits.empty:
+        return None
+    exits["cum_pnl"] = exits["pnl_cash"].cumsum()
+    return exits[["timestamp", "cum_pnl"]].rename(columns={"cum_pnl": "pnl"})
 
 def calc_options_pnl(ledger_df):
-    """從選擇權 ledger 配對 entry/exit 算累計 PnL"""
+    """從選擇權 ledger 的 PnL 欄位累計"""
     if ledger_df is None or ledger_df.empty:
         return None
-    pv = 50  # TXO point value
-    records = []
-    entry_price = 0
-    cum_pnl = 0
-    for _, r in ledger_df.iterrows():
-        action = str(r.get("Action", ""))
-        price = 0
-        try:
-            price = float(r.get("Price", 0))
-        except (ValueError, TypeError):
-            continue
-        if "ENTRY_FILLED" in action or "PAPER_ENTRY" in action:
-            entry_price = price
-        elif ("EXIT_FILLED" in action or "PAPER_EXIT" in action or "PAPER_TIME_EXIT" in action) and entry_price > 0:
-            pnl = (price - entry_price) * pv
-            cum_pnl += pnl
-            records.append({"timestamp": r.get("Timestamp"), "pnl": cum_pnl})
-            entry_price = 0
-    return pd.DataFrame(records) if records else None
+    if "PnL" not in ledger_df.columns:
+        return None
+    ledger_df["PnL"] = pd.to_numeric(ledger_df["PnL"], errors="coerce").fillna(0)
+    exits = ledger_df[ledger_df["PnL"] != 0].copy()
+    if exits.empty:
+        return None
+    exits["cum_pnl"] = exits["PnL"].cumsum()
+    return exits[["Timestamp", "cum_pnl"]].rename(columns={"Timestamp": "timestamp", "cum_pnl": "pnl"})
+
 
 def make_pnl_chart(pnl_df, title):
     if pnl_df is None or pnl_df.empty:
