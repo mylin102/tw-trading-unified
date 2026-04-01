@@ -24,6 +24,6 @@ tmux send-keys -t unified:0 "cd $UNIFIED_DIR && python3 main.py 2>&1 | tee $LOG"
 
 # Dashboard
 tmux new-window -t unified:1
-tmux send-keys -t unified:1 "cd $UNIFIED_DIR && python3 -m streamlit run ui/dashboard.py --server.port 8500 --server.address 0.0.0.0 --server.headless true 2>&1 | tee logs/dashboard.log" Enter
+tmux send-keys -t unified:1 "cd $UNIFIED_DIR && python3 -m streamlit run ui/dashboard.py --server.port 8500 --server.address 127.0.0.1 --server.headless true 2>&1 | tee logs/dashboard.log" Enter
 
 echo "[$(date)] unified started" >> "$LOG"

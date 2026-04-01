@@ -14,6 +14,23 @@ from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Trading Unified", page_icon="📊", layout="wide")
 
+# ── 密碼保護 ──
+def check_password():
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+    if st.session_state["authenticated"]:
+        return True
+    pwd = st.text_input("🔒 請輸入密碼", type="password")
+    if pwd == os.environ.get("DASHBOARD_PASSWORD", "trading2026"):
+        st.session_state["authenticated"] = True
+        st.rerun()
+    elif pwd:
+        st.error("密碼錯誤")
+    return False
+
+if not check_password():
+    st.stop()
+
 BASE = Path(__file__).parent.parent
 TODAY = datetime.datetime.now().strftime("%Y-%m-%d")
 DATE_STR = datetime.datetime.now().strftime("%Y%m%d")
