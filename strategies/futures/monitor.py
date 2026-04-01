@@ -9,6 +9,7 @@ import yaml
 import threading
 from datetime import datetime
 from collections import deque
+from pathlib import Path
 import pandas as pd
 from rich.console import Console
 
@@ -150,8 +151,7 @@ class FuturesMonitor:
         return None
 
     def _save_bar(self, row, score, regime):
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        log_dir = os.path.join(base, "..", "..", "logs", "market_data")
+        log_dir = os.path.join(str(Path.home()), "Documents/mylin102/tw-futures-realtime/logs/market_data")
         os.makedirs(log_dir, exist_ok=True)
         path = os.path.join(log_dir, f"{self.ticker}_{datetime.now().strftime('%Y%m%d')}_indicators.csv")
         data = {
