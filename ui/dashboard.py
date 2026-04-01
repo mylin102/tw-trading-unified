@@ -51,6 +51,7 @@ def trigger_restart():
 OPTIONS_REPO = Path.home() / "Documents/mylin102/tw-option-squeeze-trading"
 FUTURES_MKT = FUTURES_REPO / "logs/market_data"
 FUTURES_TRADES = FUTURES_REPO / "exports/trades"
+FUTURES_TRADES_UNIFIED = BASE / "exports/trades"
 OPTIONS_DATA = OPTIONS_REPO / "logs" / ("live_trading" if o_live else "paper_trading")
 
 # ── Filter today only ──
@@ -148,10 +149,11 @@ def load_futures_indicators():
 
 @st.cache_data(ttl=5)
 def load_futures_trades():
-    f = FUTURES_TRADES / f"TMF_{DATE_STR}_trades.csv"
-    if f.exists():
-        try: return pd.read_csv(f)
-        except: pass
+    for d in [FUTURES_TRADES_UNIFIED, FUTURES_TRADES]:
+        f = d / f"TMF_{DATE_STR}_trades.csv"
+        if f.exists():
+            try: return pd.read_csv(f)
+            except: pass
     return None
 
 @st.cache_data(ttl=5)
