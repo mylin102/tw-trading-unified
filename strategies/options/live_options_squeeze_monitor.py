@@ -567,47 +567,39 @@ class ShioajiOptionsSmartMonitor:
         # 使用 py_vollib 計算 IV 與 Greeks
         iv, delta_val, gamma_val, vega_val = 0.0, 0.0, 0.0, 0.0
         try:
-            side = signal["side"]
-            if side in ["C", "P"]:
-                quote = self.current_option_quote(side)
-                contract = self.active_contracts.get(side)
-                
-                # 使用合理的預設值進行計算
-                strike = getattr(contract, "strike_price", resolve_option_strike(signal["price_mtx"], self.strike_rounding))
-                delivery_date = getattr(contract, "delivery_date", None)
-                
-                # 計算 DTE（天數）
-                if delivery_date:
-                    dte_years = calculate_dte(delivery_date, now=signal.get("timestamp") or self._current_strategy_time())
-                else:
-                    dte_years = 3.0 / 365.0
-                
-                # 使用市場報價
-                option_price = quote["mid"]
-                
-                if option_price > 0 and strike > 0:
-                    # 使用 py_vollib 計算 IV
-                    option_type = 'c' if side == 'C' else 'p'
-                    try:
-                        iv = implied_volatility(
-                            option_price,
-                            signal["price_mtx"],
-                            strike,
-                            dte_years,
-                            self.risk_free_rate,
-                            option_type,
-                        )
-                        
-                        # 使用 py_vollib 計算 Greeks
-                        delta_val = delta(option_type, signal["price_mtx"], strike, dte_years, self.risk_free_rate, iv)
-                        gamma_val = gamma(option_type, signal["price_mtx"], strike, dte_years, self.risk_free_rate, iv)
-                        vega_val = vega(option_type, signal["price_mtx"], strike, dte_years, self.risk_free_rate, iv)
-                    except Exception as e:
-                        # 計算失敗時使用預設值
-                        iv = 0.25
-                        delta_val = 0.5 if side == 'C' else -0.5
-                        gamma_val = 0.02
-                        vega_val = 20.0
+            side = signal.get("side") or "C"  # 預設用 Call 估算
+            quote = self.current_option_quote(side)
+            contract = self.active_contracts.get(side)
+            strike = getattr(contract, "strike_price", resolve_option_strike(signal["price_mtx"], self.strike_rounding))
+            delivery_date = getattr(contract, "delivery_date", None)
+
+            if delivery_date:
+                dte_years = calculate_dte(delivery_date, now=signal.get("timestamp") or self._current_strategy_time())
+            else:
+                dte_years = 3.0 / 365.0
+
+            option_price = quote["mid"]
+            option_type = 'c' if side == 'C' else 'p'
+
+            if option_price > 0 and strike > 0:
+                # 有真實報價：用 py_vollib 反推 IV
+                try:
+                    iv = implied_volatility(option_price, signal["price_mtx"], strike, dte_years, self.risk_free_rate, option_type)
+                    delta_val = delta(option_type, signal["price_mtx"], strike, dte_years, self.risk_free_rate, iv)
+                    gamma_val = gamma(option_type, signal["price_mtx"], strike, dte_years, self.risk_free_rate, iv)
+                    vega_val = vega(option_type, signal["price_mtx"], strike, dte_years, self.risk_free_rate, iv)
+                except Exception:
+                    iv = 0.25
+                    delta_val = 0.5 if side == 'C' else -0.5
+                    gamma_val = 0.02
+                    vega_val = 20.0
+            elif strike > 0:
+                # 無報價（paper mode）：用 BS 模型估算
+                iv = 0.25
+                res = black_scholes(signal["price_mtx"], strike, dte_years, self.risk_free_rate, iv, option_type=side)
+                delta_val = res["delta"]
+                gamma_val = res["gamma"]
+                vega_val = res["vega"]
         except Exception as e:
             console.print(f"[red]Greeks calculation error:[/red] {e}")
 
