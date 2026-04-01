@@ -33,29 +33,38 @@ def tick_dispatcher(futures_mon, options_mon):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="Both strategies paper mode, no broker login")
+    parser.add_argument("--futures-paper", action="store_true", help="Force futures to paper mode")
+    parser.add_argument("--options-paper", action="store_true", help="Force options to paper mode")
     args = parser.parse_args()
+
+    all_dry = args.dry_run
+    futures_dry = all_dry or args.futures_paper
+    options_dry = all_dry or args.options_paper
 
     api = None
     try:
-        if not args.dry_run:
+        need_login = not (futures_dry and options_dry)
+        if need_login:
             api = get_api()
             console.print("[green]✅ Single Shioaji session established[/green]")
         else:
-            console.print("[yellow]🔧 Dry-run mode — no broker login[/yellow]")
+            console.print("[yellow]🔧 Both strategies paper — no broker login[/yellow]")
 
         # --- Futures monitor ---
         from strategies.futures.monitor import FuturesMonitor
         fm = FuturesMonitor(
             api=api,
             config_path=os.path.join(BASE, "config", "futures.yaml"),
-            dry_run=args.dry_run,
+            dry_run=futures_dry,
         )
         fm.setup()
+        console.print(f"  futures: {'PAPER' if futures_dry else 'LIVE'}")
 
         # --- Options monitor ---
         from strategies.options.monitor import OptionsMonitor
-        om = OptionsMonitor(api=api, dry_run=args.dry_run)
+        om = OptionsMonitor(api=api, dry_run=options_dry)
+        console.print(f"  options: {'PAPER' if options_dry else 'LIVE'}")
 
         # --- Tick subscription ---
         if api is not None:
