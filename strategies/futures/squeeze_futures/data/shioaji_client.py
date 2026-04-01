@@ -164,9 +164,11 @@ class ShioajiClient:
             if ticker == 'TXFR1': return self.api.Contracts.Futures.TXF.TXFR1
             if ticker == 'MXFR1': return self.api.Contracts.Futures.MXF.MXFR1
             if ticker == 'TMF':
-                contracts = [c for c in self.api.Contracts.Futures.TMF if c.delivery_month]
-                return sorted(contracts, key=lambda x: x.delivery_month)[0]
-            return None
+                # 用近月 R1
+                return self.api.Contracts.Futures.TMF.TMFR1
+            # 支援直接指定合約代碼如 TMFD6
+            category = ticker[:3] if len(ticker) > 3 else ticker
+            return self.api.Contracts.Futures[category][ticker]
         except Exception: return None
 
     def place_order(self, contract, action: str, quantity: int, price: float = 0):
