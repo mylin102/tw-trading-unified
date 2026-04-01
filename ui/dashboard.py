@@ -54,12 +54,12 @@ def filter_today(df, ts_col="timestamp"):
         return df
     df[ts_col] = pd.to_datetime(df[ts_col], format="mixed", utc=True).dt.tz_localize(None)
     df = df[df[ts_col].dt.strftime("%Y-%m-%d") == TODAY].copy()
-    # 過濾 price 異常值（fallback_underlying 產生的假資料）
+    # 過濾 fallback 假資料：用最後一筆的 30% 作為下限
     for col in ["close", "price_mtx"]:
-        if col in df.columns:
-            median = df[col].median()
-            if median > 0:
-                df = df[df[col] > median * 0.8]
+        if col in df.columns and len(df) > 1:
+            latest = df[col].iloc[-1]
+            if latest > 0:
+                df = df[df[col] > latest * 0.7]
     return df
 
 # ── Chart builder (unified style) ──
