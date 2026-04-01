@@ -20,12 +20,16 @@ class OptionsMonitor:
         # Force dry_run=True during construction to skip internal login
         self.monitor = ShioajiOptionsSmartMonitor(dry_run=True, **kwargs)
 
-        # Now override with the real api if not dry-run
-        if not dry_run and api is not None:
-            self.monitor.dry_run = False
+        # Inject shared api for quotes (even in paper mode)
+        if api is not None and not dry_run:
             self.monitor.api = api
+            self.monitor.dry_run = False
             self.monitor.live_trading = self.monitor.full_cfg.get("live_trading", False)
-            self.monitor.broker = ShioajiBrokerAdapter(api, self.monitor.execution_cfg)
+            if self.monitor.live_trading:
+                self.monitor.broker = ShioajiBrokerAdapter(api, self.monitor.execution_cfg)
+            else:
+                # Paper mode: use api for quotes only, mock broker for orders
+                self.monitor.broker = MockBrokerAdapter(self.monitor.execution_cfg)
 
     def on_tick(self, exchange, tick):
         self.monitor.on_tick(exchange, tick)
