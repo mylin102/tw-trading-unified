@@ -192,6 +192,14 @@ class FuturesMonitor:
         if self.dry_run:
             return
 
+        # 市場時間檢查
+        now = datetime.now()
+        h = now.hour
+        is_day = 8 <= h < 14
+        is_night = h >= 15 or h < 5
+        if not (is_day or is_night):
+            return
+
         # 1. Fetch multi-timeframe data
         processed = {}
         for tf in ["5m", "15m", "1h"]:

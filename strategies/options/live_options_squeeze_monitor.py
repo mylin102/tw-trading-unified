@@ -1018,8 +1018,9 @@ class ShioajiOptionsSmartMonitor:
                 # 檢查市場是否開盤 (支援日盤 + 夜盤)
                 market_open, session = self._is_market_open(now)
                 if not market_open:
-                    console.print(f"[bold green]Market closed ({session}). Exiting monitor for daily settlement...[/bold green]")
-                    break
+                    console.print(f"[dim]Market closed ({session}). Waiting for next session...[/dim]")
+                    time.sleep(60)
+                    continue
                 
                 # 夜盤時的特殊處理
                 if session == "night":
