@@ -200,12 +200,27 @@ class ShioajiOptionsSmartMonitor:
         return False, "closed"
     
     def _eod_state(self, current_time):
-        panic_minutes = (self.eod_panic_time[0] * 60) + self.eod_panic_time[1]
+        # 夜盤用 force_close 時間，日盤用 eod_panic_time
+        h = current_time.hour
+        is_night = h >= 15 or h < 5
+        if is_night:
+            night_cfg = self.full_cfg.get("night_trading", {})
+            fc = night_cfg.get("force_close", "04:30")
+            parts = str(fc).split(":")
+            panic_h, panic_m = int(parts[0]), int(parts[1])
+        else:
+            panic_h, panic_m = self.eod_panic_time
+
+        panic_minutes = panic_h * 60 + panic_m
         now_minutes = self._minutes_since_midnight(current_time)
+        # 夜盤跨日：04:30 = 270 分鐘，15:00~23:59 不該觸發 panic
+        if is_night and now_minutes > 300:  # 05:00 以後 = 日盤時段
+            return {"is_passive": False, "is_panic": False, "shutdown_after": 0}
+
         passive_start = panic_minutes - self.eod_passive_window_mins
         return {
             "is_passive": passive_start <= now_minutes < panic_minutes,
-            "is_panic": now_minutes >= panic_minutes,
+            "is_panic": now_minutes >= panic_minutes and (not is_night or now_minutes < 300),
             "shutdown_after": panic_minutes + self.shutdown_grace_mins,
         }
 
@@ -432,7 +447,15 @@ class ShioajiOptionsSmartMonitor:
                 self.market_data[key]["ask"] = float(getattr(tick, 'ask_price', tick.close))
 
     def log_trade(self, action, side, price, note=""):
-        data = {"Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Mode": self.mode, "Action": action, "Side": side, "Price": price, "Note": note}
+        pnl = 0
+        if "EXIT" in action and self.entry_price > 0:
+            pnl = round((price - self.entry_price) * 50, 0)  # TXO point_value=50
+        data = {
+            "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Mode": self.mode, "Action": action, "Side": side,
+            "Price": price, "Quantity": self.position or 1,
+            "PnL": pnl, "Balance": 0, "Note": note,
+        }
         pd.DataFrame([data]).to_csv(self.ledger_path, mode='a', index=False, header=not self.ledger_path.exists())
 
     def on_order_event(self, stat, msg):
