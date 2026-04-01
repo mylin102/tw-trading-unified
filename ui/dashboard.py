@@ -53,7 +53,14 @@ def filter_today(df, ts_col="timestamp"):
     if df is None or df.empty:
         return df
     df[ts_col] = pd.to_datetime(df[ts_col], format="mixed", utc=True).dt.tz_localize(None)
-    return df[df[ts_col].dt.strftime("%Y-%m-%d") == TODAY].copy()
+    df = df[df[ts_col].dt.strftime("%Y-%m-%d") == TODAY].copy()
+    # 過濾 price 異常值（fallback_underlying 產生的假資料）
+    for col in ["close", "price_mtx"]:
+        if col in df.columns:
+            median = df[col].median()
+            if median > 0:
+                df = df[df[col] > median * 0.8]
+    return df
 
 # ── Chart builder (unified style) ──
 def make_price_score_chart(df, price_col, title, ts_col="timestamp"):
@@ -64,6 +71,7 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp"):
         fig.add_trace(go.Bar(x=df[ts_col], y=df["score"], name="Score", marker_color=colors), row=2, col=1)
     fig.update_layout(height=400, margin=dict(t=10, b=10, l=40, r=20), showlegend=False, title_text=title, title_font_size=14)
     fig.update_xaxes(range=[df[ts_col].min(), df[ts_col].max()])
+    fig.update_yaxes(tickformat=",.0f")
     return fig
 
 # ── Loaders ──
@@ -178,8 +186,8 @@ with tab_overview:
         has_data = True
     if has_data:
         fig.update_layout(height=350, margin=dict(t=10, b=10, l=40, r=20), legend=dict(orientation="h", y=1.02))
-        fig.update_yaxes(title_text="TMF", secondary_y=False)
-        fig.update_yaxes(title_text="MTX", secondary_y=True)
+        fig.update_yaxes(title_text="TMF", tickformat=",.0f", secondary_y=False)
+        fig.update_yaxes(title_text="MTX", tickformat=",.0f", secondary_y=True)
         # 統一 X 軸範圍為今天
         fig.update_xaxes(range=[f"{TODAY} 08:45", f"{TODAY} 13:45"])
         st.plotly_chart(fig, use_container_width=True)
