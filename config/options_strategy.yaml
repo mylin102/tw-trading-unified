@@ -1,0 +1,85 @@
+# 🚀 Shioaji Options Squeeze Configuration
+# 📅 日盤/夜盤共享配置
+
+active_mode: "day"  # 選項：day / night
+live_trading: true
+
+# 策略參數
+strategy:
+  length: 20
+  entry_score: 90              # 夜盤 80, 日盤 70
+  score_floor: 20
+  regime_filter: "mid"
+  use_opening_logic: true     # 夜盤 false
+  fallback_underlying_price: 23000
+  monthly_delivery_min_days: 7
+  weights: {"1h": 0.2, "15m": 0.4, "5m": 0.4}
+  
+  # TSM 連動策略 (夜盤專屬)
+  tsm_strategy:
+    enabled: true
+    tsm_threshold: 0.0  # 禁用
+    nvda_threshold: 0.0  # 禁用
+    sox_threshold: 0.0  # 禁用
+
+# 模式設定
+modes:
+  V1: {holding_mode: "daytrade", delivery_pref: "near", tp1_pct: 1.2, force_close_at_end: true}
+  V2: {holding_mode: "swing", delivery_pref: "monthly", tp1_pct: 1.2, bear_boost_pct: 0.8, force_close_at_end: false}
+  V3: {holding_mode: "night", delivery_pref: "near", tp1_pct: 1.2, bear_boost_pct: 0.8, force_close_at_end: true}
+
+# 出場優化
+exit_optimization:
+  eod_passive_window_mins: 20
+  eod_passive_ticks: 3
+  eod_panic_time: "13:30"
+  shutdown_grace_mins: 1
+  opening_spike_capture: true
+  opening_target_pct: 0.15
+
+# 下單執行
+execution:
+  order_type: "Limit"
+  aggressive_ticks: 2
+  max_spread_pct: 0.05
+  order_timeout_secs: 30
+  max_order_retries: 1
+
+# 定價
+pricing:
+  pricing_model: "black_scholes"
+  entry_premium_mode: "model"
+  default_iv: 0.25
+  min_iv: 0.18
+  max_iv: 0.32
+  bull_call_iv_mult: 0.95
+  bear_put_iv_mult: 1.05
+  neutral_iv_mult: 1.00
+  risk_free_rate: 0.02
+  near_dte_days: 3.0
+  expiry_dte_floor_days: 0.35
+  strike_rounding: 100
+
+# 風險管理
+risk_mgmt:
+  stop_loss_pct: 0.15
+  lots_per_trade: 1
+  max_holding_days: 3
+  min_dte_to_exit: 2
+  max_position_size: 0.05      # 夜盤 5%
+  max_daily_loss: 0.02         # 夜盤 2%
+
+# 夜盤專屬配置
+night_trading:
+  enabled: true
+  session_start: "15:00"
+  session_end: "05:00"
+  us_open_winter: "20:30"
+  us_open_summer: "21:30"
+  force_close: "04:30"
+
+# 出場策略
+exit_strategy:
+  stop_loss_pct: 0.15
+  lots_per_trade: 1
+  tp1_pct: 1.2

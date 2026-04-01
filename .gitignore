@@ -1,0 +1,32 @@
+.env
+.env*
+!.env.example
+.venv/
+__pycache__/
+logs/
+exports/
+*.log
+*.html
+*.png
+.DS_Store
+
+# Credentials and Sensitive Configs
+login/account/account_info.json
+config.json
+*.pickle
+*.pfx
+*.p12
+*.pem
+*.key
+
+# Data and caches
+.cache/
+.pytest_cache/
+__pycache__/
+*.pyc
+.env
+*.log
+shioaji.log
+.DS_Store
+.venv/
+login/account/

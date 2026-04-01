@@ -1,0 +1,61 @@
+execution:
+  broker_fee_per_side: 20.0
+  exchange_fee_per_side: 0.0
+  initial_balance: 100000
+  limit_offset_pts: 2.0
+  market_slippage_pts: 1.0
+  order_type: market
+  range_protection_pts: 3.0
+  tax_rate: 2.0e-05
+  tick_size: 1.0
+live_trading: false
+monitoring:
+  callback:
+    buffer_size: 100
+    health_check_secs: 60
+    use_tick_data: false
+  data_mode: hybrid
+  pb_confirmation_bars: 12
+  poll_interval_secs: 30
+risk_mgmt:
+  atr_length: 14
+  atr_multiplier: 0.0
+  break_even_pts: 50
+  exit_on_vwap: false
+  ma_stop_length: 20
+  ma_stop_multiplier: 1.0
+  ma_stop_ticks: 10
+  ma_stop_type: below
+  skip_hours:
+  - 21
+  - 22
+  stop_loss_pts: 60
+  time_filter_enabled: true
+  trailing_stop_distance_pts: 30
+  trailing_stop_enabled: true
+  trailing_stop_trigger_pts: 60
+strategy:
+  entry_score: 20
+  length: 20
+  partial_exit:
+    enabled: true
+    tp1_lots: 1
+    tp1_pts: 50
+  pullback:
+    buffer: 1.002
+    ema_fast: 20
+    ema_slow: 60
+    lookback: 60
+  regime_filter: mid
+  use_pullback: true
+  use_squeeze: true
+  weights:
+    15m: 0.4
+    1h: 0.2
+    5m: 0.4
+trade_mgmt:
+  allow_long: true
+  allow_short: true
+  force_close_at_end: false
+  lots_per_trade: 2
+  max_positions: 2
