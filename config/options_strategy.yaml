@@ -6,7 +6,7 @@ strategy:
   score_floor: 20
   regime_filter: mid
   use_opening_logic: true
-  fallback_underlying_price: 23000
+  fallback_underlying_price: 0     # 0 = 不使用 fallback，避免假資料
   monthly_delivery_min_days: 7
   weights:
     1h: 0.2
@@ -75,7 +75,9 @@ night_trading:
   us_open_winter: '20:30'
   us_open_summer: '21:30'
   force_close: 04:30
+# 出場策略（統一用 risk_mgmt，此區塊保留向後相容）
 exit_strategy:
   stop_loss_pct: 0.10
   lots_per_trade: 1
+  tp1_pct: 1.0
   tp1_pct: 1.0
