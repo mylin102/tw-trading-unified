@@ -1,16 +1,10 @@
-# 全域風險管理配置
-# 期貨 + 選擇權共用同一個永豐期權帳戶
-
 account:
-  total_equity_source: "api"    # api = 從 Shioaji 讀取真實權益數
-  margin_reserve_pct: 0.20      # 保留 20% 不動用（安全墊，不可分配）
-
-# 資金分配（可在 Dashboard 即時調整）
-# 規則：futures + options <= 1.0 - margin_reserve_pct
+  total_equity_source: api
+  margin_reserve_pct: 0.2
 allocation:
   futures:
-    max_margin_pct: 0.40        # 最多用 40% 權益做期貨（0.0 = 不做期貨）
+    max_margin_pct: 0.4
     max_lots: 3
   options:
-    max_margin_pct: 0.40        # 最多用 40% 權益做選擇權（0.0 = 不做選擇權）
+    max_margin_pct: 0.4
     max_lots: 2
