@@ -1,17 +1,20 @@
-active_mode: night
-live_trading: false
+active_mode: V2
+live_trading: true
 strategy:
   length: 20
   entry_score: 80
   score_floor: 20
   regime_filter: mid
   use_opening_logic: true
-  fallback_underlying_price: 0     # 0 = 不使用 fallback，避免假資料
-  monthly_delivery_min_days: 7
+  require_fire: true
+  require_align: true
+  fallback_underlying_price: 33500
+  monthly_delivery_min_days: 14
+  cooldown_bars: 3
   weights:
-    1h: 0.2
+    1h: 0.4
     15m: 0.4
-    5m: 0.4
+    5m: 0.2
   tsm_strategy:
     enabled: true
     tsm_threshold: 0.0
@@ -26,9 +29,10 @@ modes:
   V2:
     holding_mode: swing
     delivery_pref: monthly
-    tp1_pct: 1.0
+    tp1_pct: 0.8
     bear_boost_pct: 0.8
     force_close_at_end: false
+    trailing_stop_pct: 0.15
   V3:
     holding_mode: night
     delivery_pref: near
@@ -62,10 +66,10 @@ pricing:
   expiry_dte_floor_days: 0.35
   strike_rounding: 100
 risk_mgmt:
-  stop_loss_pct: 0.10
-  lots_per_trade: 1
-  max_holding_days: 3
-  min_dte_to_exit: 2
+  stop_loss_pct: 0.1
+  lots_per_trade: 2
+  max_holding_days: 7
+  min_dte_to_exit: 3
   max_position_size: 0.05
   max_daily_loss: 0.02
 night_trading:
@@ -75,9 +79,7 @@ night_trading:
   us_open_winter: '20:30'
   us_open_summer: '21:30'
   force_close: 04:30
-# 出場策略（統一用 risk_mgmt，此區塊保留向後相容）
 exit_strategy:
-  stop_loss_pct: 0.10
+  stop_loss_pct: 0.2
   lots_per_trade: 1
-  tp1_pct: 1.0
   tp1_pct: 1.0

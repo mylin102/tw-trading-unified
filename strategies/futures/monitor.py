@@ -109,10 +109,44 @@ class FuturesMonitor:
             console.print("[red][FuturesMonitor] contract not found[/red]")
             return False
         console.print(f"[green][FuturesMonitor] contract: {self.contract.code}[/green]")
+        # Tick-based bar builder
+        self._tick_bars = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        self._current_bar = {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0, "ts": None}
+        # Pre-fill from kbars if available
+        try:
+            df = self.client.get_kline(self.ticker, interval="5m")
+            if not df.empty:
+                self._tick_bars = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+                console.print(f"[green][FuturesMonitor] pre-filled {len(self._tick_bars)} bars from kbars[/green]")
+        except Exception:
+            pass
         return True
 
     def on_tick(self, exchange, tick):
-        if self.contract and tick.code != self.contract.code:
+        # Accept tick if it matches contract code OR contract category (TMF)
+        if self.contract:
+            if tick.code != self.contract.code and not tick.code.startswith("TMF"):
+                return
+        # Build 5m bars from ticks
+        price = float(tick.close)
+        vol = int(getattr(tick, "volume", 1))
+        ts = pd.Timestamp(tick.datetime).floor("5min")
+        bar = self._current_bar
+        if bar["ts"] is None or ts > bar["ts"]:
+            # Save previous bar
+            if bar["ts"] is not None and bar["open"] > 0:
+                self._tick_bars.loc[bar["ts"]] = [bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"]]
+                # Keep last 300 bars (~25 hours)
+                if len(self._tick_bars) > 300:
+                    self._tick_bars = self._tick_bars.iloc[-300:]
+            bar["ts"] = ts
+            bar["open"] = bar["high"] = bar["low"] = bar["close"] = price
+            bar["volume"] = vol
+        else:
+            bar["high"] = max(bar["high"], price)
+            bar["low"] = min(bar["low"], price)
+            bar["close"] = price
+            bar["volume"] += vol
             return
         cb = self.client._tick_callbacks.get(tick.code)
         if cb:
@@ -177,13 +211,14 @@ class FuturesMonitor:
         return None
 
     def _save_bar(self, row, score, regime):
-        log_dir = os.path.join(str(Path.home()), "Documents/mylin102/tw-futures-realtime/logs/market_data")
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs", "market_data")
         os.makedirs(log_dir, exist_ok=True)
         path = os.path.join(log_dir, f"{self.ticker}_{datetime.now().strftime('%Y%m%d')}_indicators.csv")
         data = {
             "timestamp": [row.name], "close": [row["Close"]], "vwap": [row["vwap"]], "score": [score],
             "sqz_on": [row["sqz_on"]], "mom_state": [row["mom_state"]], "regime": [regime],
             "bull_align": [row["bullish_align"]], "bear_align": [row["bearish_align"]],
+            "in_pb_zone": [row.get("in_bull_pb_zone", False) or row.get("in_bear_pb_zone", False)],
         }
         header = not os.path.exists(path)
         pd.DataFrame(data).to_csv(path, mode="a", index=False, header=header)
@@ -222,6 +257,19 @@ class FuturesMonitor:
             df = self.client.get_kline(self.ticker, interval=tf)
             if not df.empty:
                 processed[tf] = calculate_futures_squeeze(df, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+
+        # Fallback: use tick-built bars if kbars API returns empty
+        if "5m" not in processed and hasattr(self, "_tick_bars") and len(self._tick_bars) >= 30:
+            df_tick = self._tick_bars.copy()
+            processed["5m"] = calculate_futures_squeeze(df_tick, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+            if "15m" not in processed:
+                r15 = df_tick.resample("15min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
+                if len(r15) >= 20:
+                    processed["15m"] = calculate_futures_squeeze(r15, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+            if "1h" not in processed:
+                r1h = df_tick.resample("1h").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
+                if len(r1h) >= 20:
+                    processed["1h"] = calculate_futures_squeeze(r1h, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
 
         if "5m" not in processed or "15m" not in processed:
             return
@@ -278,6 +326,11 @@ class FuturesMonitor:
         elif self.FILTER_MODE == "mid":
             can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.998
             can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.002
+            # bull_align guard: 多頭排列時禁止做空，空頭排列時禁止做多
+            if last_5m.get("bullish_align", False):
+                can_short = False
+            if last_5m.get("bearish_align", False):
+                can_long = False
         else:
             can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.999
             can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.001

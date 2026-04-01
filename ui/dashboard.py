@@ -10,7 +10,10 @@ import yaml
 import datetime
 import os
 from pathlib import Path
+from dotenv import load_dotenv
 import plotly.graph_objects as go
+
+load_dotenv(Path(__file__).parent.parent / ".env")
 from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Trading Unified", page_icon="📊", layout="wide")
@@ -35,6 +38,11 @@ if not check_password():
 BASE = Path(__file__).parent.parent
 TODAY = datetime.datetime.now().strftime("%Y-%m-%d")
 DATE_STR = datetime.datetime.now().strftime("%Y%m%d")
+# 夜盤跨日：00:00~05:00 看前一天的檔案
+if datetime.datetime.now().hour < 5:
+    _yesterday = datetime.datetime.now() - datetime.timedelta(days=1)
+    TODAY = _yesterday.strftime("%Y-%m-%d")
+    DATE_STR = _yesterday.strftime("%Y%m%d")
 
 # ── YAML helpers ──
 def load_yaml(path):
@@ -60,23 +68,23 @@ alloc = risk_cfg.get("allocation", {})
 reserve_pct = risk_cfg.get("account", {}).get("margin_reserve_pct", 0.20)
 
 # ── Paths ──
-FUTURES_REPO = Path.home() / "Documents/mylin102/tw-futures-realtime"
 RESTART_FLAG = BASE / ".restart"
 
 def trigger_restart():
     RESTART_FLAG.touch()
     st.toast("🔄 正在重啟 monitor（約 30 秒）...")
-OPTIONS_REPO = Path.home() / "Documents/mylin102/tw-option-squeeze-trading"
-FUTURES_MKT = FUTURES_REPO / "logs/market_data"
-FUTURES_TRADES = FUTURES_REPO / "exports/trades"
-FUTURES_TRADES_UNIFIED = BASE / "exports/trades"
+OPTIONS_REPO = BASE / "strategies" / "options"
+FUTURES_MKT = BASE / "logs" / "market_data"
+FUTURES_TRADES = BASE / "exports" / "trades"
 OPTIONS_DATA = OPTIONS_REPO / "logs" / ("live_trading" if o_live else "paper_trading")
 
 # ── Filter today only ──
 def filter_today(df, ts_col="timestamp"):
     if df is None or df.empty:
         return df
-    df[ts_col] = pd.to_datetime(df[ts_col], format="mixed", utc=True).dt.tz_localize(None)
+    # 統一去掉時區字串再解析
+    df[ts_col] = df[ts_col].astype(str).str.replace(r"[+-]\d{2}:\d{2}$", "", regex=True)
+    df[ts_col] = pd.to_datetime(df[ts_col], format="mixed")
     df = df[df[ts_col].dt.strftime("%Y-%m-%d") == TODAY].copy()
     # 過濾 fallback 假資料：用最後一筆的 30% 作為下限
     for col in ["close", "price_mtx"]:
@@ -93,7 +101,7 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp"):
     if "score" in df.columns:
         colors = ["#00cc66" if s >= 0 else "#ff4444" for s in df["score"]]
         fig.add_trace(go.Bar(x=df[ts_col], y=df["score"], name="Score", marker_color=colors), row=2, col=1)
-    fig.update_layout(height=400, margin=dict(t=10, b=10, l=40, r=20), showlegend=False, title_text=title, title_font_size=14)
+    fig.update_layout(height=400, margin=dict(t=10, b=10, l=40, r=20), showlegend=False)
     fig.update_xaxes(range=[df[ts_col].min(), df[ts_col].max()])
     fig.update_yaxes(tickformat=",.0f")
     return fig
@@ -148,24 +156,31 @@ def load_futures_indicators():
 
 @st.cache_data(ttl=5)
 def load_futures_trades():
-    for d in [FUTURES_TRADES_UNIFIED, FUTURES_TRADES]:
+    for d in [FUTURES_TRADES]:
         f = d / f"TMF_{DATE_STR}_trades.csv"
         if f.exists():
             try: return pd.read_csv(f)
             except: pass
     return None
 
+OPTIONS_SUB = "live_trading" if o_live else "paper_trading"
+
 @st.cache_data(ttl=5)
 def load_options_indicators():
-    f = OPTIONS_DATA / f"OPTIONS_{DATE_STR}_indicators.csv"
-    if f.exists():
-        try: return filter_today(pd.read_csv(f))
+    # Indicator 可能因重啟寫到不同目錄，取最新的
+    best = None
+    for sub in ["live_trading", "paper_trading"]:
+        f = OPTIONS_REPO / "logs" / sub / f"OPTIONS_{DATE_STR}_indicators.csv"
+        if f.exists() and f.stat().st_mtime > (best[1] if best else 0):
+            best = (f, f.stat().st_mtime)
+    if best:
+        try: return filter_today(pd.read_csv(best[0]))
         except: pass
     return None
 
 @st.cache_data(ttl=5)
 def load_options_ledger():
-    f = OPTIONS_DATA / "options_trade_ledger.csv"
+    f = OPTIONS_REPO / "logs" / OPTIONS_SUB / "options_trade_ledger.csv"
     if f.exists():
         try: return pd.read_csv(f, parse_dates=["Timestamp"])
         except: pass
@@ -173,7 +188,7 @@ def load_options_ledger():
 
 @st.cache_data(ttl=5)
 def load_options_equity():
-    f = OPTIONS_DATA / "equity_curve.csv"
+    f = OPTIONS_REPO / "logs" / OPTIONS_SUB / "equity_curve.csv"
     if f.exists():
         try: return pd.read_csv(f, parse_dates=["timestamp"])
         except: pass
@@ -229,7 +244,9 @@ with tab_overview:
         else:
             st.info("無選擇權指標數據")
         ol = load_options_ledger()
-        if ol is not None and not ol.empty:
+        if ol is not None and not ol.empty and "Timestamp" in ol.columns:
+            ol["Timestamp"] = pd.to_datetime(ol["Timestamp"], errors="coerce")
+            ol = ol.dropna(subset=["Timestamp"])
             today_l = ol[ol["Timestamp"].dt.strftime("%Y%m%d") == DATE_STR]
             entries = today_l[today_l["Action"].str.contains("ENTRY", na=False)]
             st.write(f"今日進場: {len(entries)} 筆")
@@ -288,6 +305,15 @@ with tab_futures:
     st.subheader(f"🔵 期貨 TMF ({mode_badge(f_live)})")
     f_df = load_futures_indicators()
     if f_df is not None and not f_df.empty:
+        last = f_df.iloc[-1]
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        fc1.metric("Close", f"{last.get('close', 0):.0f}")
+        fc2.metric("Score", f"{last.get('score', 0):.1f}")
+        bull = last.get("bull_align", False)
+        bear = last.get("bear_align", False)
+        trend = "🟢 多頭排列" if bull else ("🔴 空頭排列" if bear else "⚪ 中性")
+        fc3.metric("趨勢", trend)
+        fc4.metric("Squeeze", "🔒 壓縮中" if last.get("sqz_on", False) else "🔓 已釋放")
         st.plotly_chart(make_price_score_chart(f_df, "close", "TMF 價格 & Score"), use_container_width=True)
         st.dataframe(f_df.tail(20), use_container_width=True)
     else:
@@ -308,6 +334,15 @@ with tab_options:
     st.subheader(f"🟠 選擇權 TXO ({mode_badge(o_live)})")
     o_df = load_options_indicators()
     if o_df is not None and not o_df.empty and "price_mtx" in o_df.columns:
+        last = o_df.iloc[-1]
+        oc1, oc2, oc3, oc4 = st.columns(4)
+        oc1.metric("MTX", f"{last.get('price_mtx', 0):.0f}")
+        oc2.metric("Score", f"{last.get('score', 0):.1f}")
+        trend = last.get("mid_trend", "")
+        trend_label = "🟢 BULL" if trend == "BULL" else ("🔴 BEAR" if trend == "BEAR" else "⚪ —")
+        oc3.metric("趨勢", trend_label)
+        iv = last.get("iv", 0)
+        oc4.metric("IV", f"{iv*100:.1f}%" if iv and iv < 1 else f"{iv:.1f}%")
         st.plotly_chart(make_price_score_chart(o_df, "price_mtx", "MTX 價格 & Score"), use_container_width=True)
         st.dataframe(o_df.tail(20), use_container_width=True)
     else:
@@ -360,7 +395,7 @@ with tab_settings:
     o_tp = oc3.slider("TP1 %", 30, 300, int(o_exit.get("tp1_pct", 1.2) * 100), 10, key="o_tp")
     oc4, oc5 = st.columns(2)
     o_lots = oc4.slider("Lots/Trade", 1, 3, int(o_risk.get("lots_per_trade", 1)), 1, key="o_lots")
-    o_force = oc5.checkbox("Force Close at End", value=True, key="o_force")
+    o_force = oc5.checkbox("Force Close at End", value=options_cfg.get("modes", {}).get(options_cfg.get("active_mode", "V2"), {}).get("force_close_at_end", False), key="o_force")
 
     if st.button("✅ 套用參數", type="primary"):
         risk_cfg.setdefault("allocation", {}).setdefault("futures", {})["max_margin_pct"] = f_pct / 100
@@ -433,7 +468,7 @@ with tab_settings:
     with r1:
         f_init = st.number_input("期貨期初資金", 10000, 1000000, int(futures_cfg.get("execution", {}).get("initial_balance", 100000)), 10000, key="f_init")
         if st.button("🔄 重置期貨模擬", key="f_reset"):
-            for f in (FUTURES_REPO / "exports/trades").glob("TMF_*_trades.*"):
+            for f in (BASE / "exports/trades").glob("TMF_*_trades.*"):
                 f.unlink()
             st.success(f"✅ 期貨模擬已重置，期初資金 {f_init:,.0f}")
     with r2:

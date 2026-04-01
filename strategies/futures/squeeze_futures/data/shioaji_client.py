@@ -94,10 +94,17 @@ class ShioajiClient:
         Returns:
             DataFrame with OHLCV data
         """
-        if not self.is_logged_in: return pd.DataFrame()
+        if not self.is_logged_in:
+            print("[kbars] not logged in")
+            return pd.DataFrame()
         try:
             contract = self.get_futures_contract(ticker)
-            if not contract: return pd.DataFrame()
+            if not contract:
+                print(f"[kbars] no contract for {ticker}")
+                return pd.DataFrame()
+            if self.api is None:
+                print("[kbars] api is None")
+                return pd.DataFrame()
             start_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
             kbars = self.api.kbars(contract, start=start_date)
             df = pd.DataFrame({**kbars})
@@ -115,7 +122,9 @@ class ShioajiClient:
                 })
             df = df.rename(columns={'Open':'Open','High':'High','Low':'Low','Close':'Close','Volume':'Volume'})
             return df.dropna(subset=["Open", "High", "Low", "Close"])
-        except Exception: return pd.DataFrame()
+        except Exception as e:
+            print(f"[kbars] Error: {e}")
+            return pd.DataFrame()
 
     def start_kbar_callback(self, contract, interval: str, callback: Callable):
         """

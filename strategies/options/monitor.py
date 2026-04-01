@@ -34,6 +34,9 @@ class OptionsMonitor:
     def on_tick(self, exchange, tick):
         self.monitor.on_tick(exchange, tick)
 
+    def on_bidask(self, exchange, bidask):
+        self.monitor.on_bidask(exchange, bidask)
+
     def run(self):
         self.monitor.run()
 

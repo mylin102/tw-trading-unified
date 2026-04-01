@@ -43,8 +43,8 @@ strategy:
     tp1_pts: 100
   pullback:
     buffer: 1.002
-    ema_fast: 20
-    ema_slow: 60
+    ema_fast: 12
+    ema_slow: 36
     lookback: 60
   regime_filter: mid
   use_pullback: true

@@ -130,11 +130,17 @@ class ShioajiOptionsSmartMonitor:
             self.broker = None if self.dry_run else ShioajiBrokerAdapter(self.api, self.execution_cfg)
         
         self.market_data = {"MTX": {"close": 0.0, "bid": 0.0, "ask": 0.0}, "C": {"close": 0.0, "bid": 0.0, "ask": 0.0}, "P": {"close": 0.0, "bid": 0.0, "ask": 0.0}}
+        self._mtx_tick_bars = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        self._current_mtx_bar = {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0, "ts": None}
         self.active_contracts = {}
         self.lock = threading.Lock()
         self.position, self.active_side, self.entry_price, self.has_tp1_hit, self.stop_loss_price = 0, None, 0.0, False, 0.0
         self.entry_mtx_price = 0.0
         self.entry_time = None
+        self.peak_premium = 0.0
+        self.cooldown_until = 0
+        self.cooldown_bars = int(self.strategy_cfg.get("cooldown_bars", 0))
+        self.trailing_stop_pct = float(self.m_cfg.get("trailing_stop_pct", 0))
         self.last_signal = None
         self.last_status_print_at = None
         self.loop_sleep_secs = 60
@@ -331,13 +337,22 @@ class ShioajiOptionsSmartMonitor:
                 return False
                 
             target_mtx = mtx_cons[0]
-            snap = self.api.snapshots([target_mtx])[0]
-            S = snap.close if snap.close > 0 else self.fallback_underlying_price
+            snaps = self.api.snapshots([target_mtx])
+            if not snaps:
+                console.print("[yellow]⚠️ snapshots 回傳空，使用 fallback 價格[/yellow]")
+                S = self.fallback_underlying_price or 20000
+            else:
+                snap = snaps[0]
+                S = snap.close if snap.close > 0 else self.fallback_underlying_price
             
             # 初始化標的行情
             self.market_data["MTX"]["close"] = float(S)
-            self.market_data["MTX"]["bid"] = float(getattr(snap, 'buy_price', S) or S)
-            self.market_data["MTX"]["ask"] = float(getattr(snap, 'sell_price', S) or S)
+            if snaps:
+                self.market_data["MTX"]["bid"] = float(getattr(snaps[0], 'buy_price', S) or S)
+                self.market_data["MTX"]["ask"] = float(getattr(snaps[0], 'sell_price', S) or S)
+            else:
+                self.market_data["MTX"]["bid"] = float(S)
+                self.market_data["MTX"]["ask"] = float(S)
             
             # 4. 根據標的現價過濾 ATM 合約
             atm_strike = resolve_option_strike(S, self.strike_rounding)
@@ -439,22 +454,77 @@ class ShioajiOptionsSmartMonitor:
                 key = "C"
             elif p_contract and code == getattr(p_contract, "code", None):
                 key = "P"
-            elif m_contract and code == getattr(m_contract, "code", None):
+            elif m_contract and (code == getattr(m_contract, "code", None) or code.startswith("MXF")):
                 key = "MTX"
             if key:
                 self.market_data[key]["close"] = float(tick.close)
                 self.market_data[key]["bid"] = float(getattr(tick, 'bid_price', tick.close))
                 self.market_data[key]["ask"] = float(getattr(tick, 'ask_price', tick.close))
 
+            # Build 5m bars from MTX ticks
+            if key == "MTX":
+                price = float(tick.close)
+                vol = int(getattr(tick, "volume", 1))
+                ts = pd.Timestamp(tick.datetime).floor("5min")
+                bar = self._current_mtx_bar
+                if bar["ts"] is None or ts > bar["ts"]:
+                    if bar["ts"] is not None and bar["open"] > 0:
+                        self._mtx_tick_bars.loc[bar["ts"]] = [bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"]]
+                        if len(self._mtx_tick_bars) > 300:
+                            self._mtx_tick_bars = self._mtx_tick_bars.iloc[-300:]
+                    bar["ts"] = ts
+                    bar["open"] = bar["high"] = bar["low"] = bar["close"] = price
+                    bar["volume"] = vol
+                else:
+                    bar["high"] = max(bar["high"], price)
+                    bar["low"] = min(bar["low"], price)
+                    bar["close"] = price
+                    bar["volume"] += vol
+
+    def on_bidask(self, exchange, bidask):
+        """Update bid/ask from BidAsk callback — more frequent than Tick in off-hours."""
+        with self.lock:
+            code = bidask.code
+            bid = bidask.bid_price[0] if hasattr(bidask.bid_price, '__getitem__') else float(bidask.bid_price)
+            ask = bidask.ask_price[0] if hasattr(bidask.ask_price, '__getitem__') else float(bidask.ask_price)
+            c_contract = self.active_contracts.get("C")
+            p_contract = self.active_contracts.get("P")
+            m_contract = self.active_contracts.get("MTX")
+            key = None
+            if c_contract and code == getattr(c_contract, "code", None):
+                key = "C"
+            elif p_contract and code == getattr(p_contract, "code", None):
+                key = "P"
+            elif m_contract and (code == getattr(m_contract, "code", None) or code.startswith("MXF")):
+                key = "MTX"
+            if not key:
+                console.print(f"[dim]bidask unmatched: {code} vs C={getattr(c_contract,'code',None)} P={getattr(p_contract,'code',None)} MTX={getattr(m_contract,'code',None)}[/dim]")
+                return
+            if bid > 0 and ask > 0:
+                self.market_data[key]["bid"] = float(bid)
+                self.market_data[key]["ask"] = float(ask)
+                mid = (bid + ask) / 2
+                if self.market_data[key]["close"] <= 0 or key == "MTX":
+                    self.market_data[key]["close"] = mid
+
     def log_trade(self, action, side, price, note=""):
         pnl = 0
         if "EXIT" in action and self.entry_price > 0:
             pnl = round((price - self.entry_price) * 50, 0)  # TXO point_value=50
+        # 從既有 ledger 累計 balance
+        balance = 0
+        if self.ledger_path.exists():
+            try:
+                prev = pd.read_csv(self.ledger_path)
+                balance = pd.to_numeric(prev["PnL"], errors="coerce").fillna(0).sum()
+            except Exception:
+                pass
+        balance += pnl
         data = {
             "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "Mode": self.mode, "Action": action, "Side": side,
             "Price": price, "Quantity": self.position or 1,
-            "PnL": pnl, "Balance": 0, "Note": note,
+            "PnL": pnl, "Balance": balance, "Note": str(note).replace(",", ";"),
         }
         pd.DataFrame([data]).to_csv(self.ledger_path, mode='a', index=False, header=not self.ledger_path.exists())
 
@@ -475,6 +545,7 @@ class ShioajiOptionsSmartMonitor:
             self.entry_time = self.pending_entry.get("signal_time") or self._current_strategy_time()
             self.has_tp1_hit = False
             self.stop_loss_price = price * (1 - self.stop_loss_pct)
+            self.peak_premium = price
             self.replay_stats["entries"] += 1
             self.log_trade("LIVE_ENTRY_FILLED", side, price, f"qty={quantity}")
             if _notify:
@@ -497,6 +568,8 @@ class ShioajiOptionsSmartMonitor:
                 self.entry_time = None
                 self.has_tp1_hit = False
                 self.stop_loss_price = 0.0
+                self.peak_premium = 0.0
+                self.cooldown_until = self.cooldown_bars
                 self.replay_stats["exits"] += 1
             self.pending_exit_qty = max(0, self.pending_exit_qty - quantity)
             if self.pending_exit_qty == 0:
@@ -548,67 +621,45 @@ class ShioajiOptionsSmartMonitor:
         pass
 
     def record_signal_snapshot(self, signal):
-        # 即使沒有訊號也要記錄數據 (用於 Streamlit 顯示)
-        if not signal:
-            row = {
-                "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "score": 0,
-                "side": "",
-                "price_mtx": self.market_data["MTX"]["close"],
-                "mid_trend": "",
-                "iv": 0.0,
-                "delta": 0.0,
-                "gamma": 0.0,
-                "vega": 0.0
-            }
-            pd.DataFrame([row]).to_csv(self.indicator_log_path, mode="a", index=False, header=not self.indicator_log_path.exists())
-            return
-
-        # 使用 py_vollib 計算 IV 與 Greeks
+        # 即使沒有訊號也用即時報價算 Greeks
         iv, delta_val, gamma_val, vega_val = 0.0, 0.0, 0.0, 0.0
-        try:
-            side = signal.get("side") or "C"  # 預設用 Call 估算
-            quote = self.current_option_quote(side)
-            contract = self.active_contracts.get(side)
-            strike = getattr(contract, "strike_price", resolve_option_strike(signal["price_mtx"], self.strike_rounding))
-            delivery_date = getattr(contract, "delivery_date", None)
+        price_mtx = self.market_data["MTX"]["close"]
+        score = signal["score"] if signal else 0
+        side_label = (signal["side"] or "") if signal else ""
+        mid_trend = (signal["mid_trend"] or "") if signal else ""
 
-            if delivery_date:
-                dte_years = calculate_dte(delivery_date, now=signal.get("timestamp") or self._current_strategy_time())
-            else:
-                dte_years = 3.0 / 365.0
+        if price_mtx > 0:
+            try:
+                calc_side = (signal.get("side") if signal and signal.get("side") else "C")
+                quote = self.current_option_quote(calc_side)
+                contract = self.active_contracts.get(calc_side)
+                strike = getattr(contract, "strike_price", resolve_option_strike(price_mtx, self.strike_rounding))
+                delivery_date = getattr(contract, "delivery_date", None)
+                dte_years = calculate_dte(delivery_date) if delivery_date else 3.0 / 365.0
+                option_price = quote["mid"]
+                option_type = 'c' if calc_side == 'C' else 'p'
 
-            option_price = quote["mid"]
-            option_type = 'c' if side == 'C' else 'p'
-
-            if option_price > 0 and strike > 0:
-                # 有真實報價：用 py_vollib 反推 IV
-                try:
-                    iv = implied_volatility(option_price, signal["price_mtx"], strike, dte_years, self.risk_free_rate, option_type)
-                    delta_val = delta(option_type, signal["price_mtx"], strike, dte_years, self.risk_free_rate, iv)
-                    gamma_val = gamma(option_type, signal["price_mtx"], strike, dte_years, self.risk_free_rate, iv)
-                    vega_val = vega(option_type, signal["price_mtx"], strike, dte_years, self.risk_free_rate, iv)
-                except Exception:
-                    iv = 0.25
-                    delta_val = 0.5 if side == 'C' else -0.5
-                    gamma_val = 0.02
-                    vega_val = 20.0
-            elif strike > 0:
-                # 無報價（paper mode）：用 BS 模型估算
-                iv = 0.25
-                res = black_scholes(signal["price_mtx"], strike, dte_years, self.risk_free_rate, iv, option_type=side)
-                delta_val = res["delta"]
-                gamma_val = res["gamma"]
-                vega_val = res["vega"]
-        except Exception as e:
-            console.print(f"[red]Greeks calculation error:[/red] {e}")
+                if option_price > 0 and strike > 0:
+                    try:
+                        iv = implied_volatility(option_price, price_mtx, strike, dte_years, self.risk_free_rate, option_type)
+                        delta_val = delta(option_type, price_mtx, strike, dte_years, self.risk_free_rate, iv)
+                        gamma_val = gamma(option_type, price_mtx, strike, dte_years, self.risk_free_rate, iv)
+                        vega_val = vega(option_type, price_mtx, strike, dte_years, self.risk_free_rate, iv)
+                    except Exception:
+                        res = black_scholes(price_mtx, strike, dte_years, self.risk_free_rate, 0.25, option_type=calc_side)
+                        iv, delta_val, gamma_val, vega_val = 0.25, res["delta"], res["gamma"], res["vega"]
+                elif strike > 0:
+                    res = black_scholes(price_mtx, strike, dte_years, self.risk_free_rate, 0.25, option_type=calc_side)
+                    iv, delta_val, gamma_val, vega_val = 0.25, res["delta"], res["gamma"], res["vega"]
+            except Exception as e:
+                console.print(f"[red]Greeks calculation error:[/red] {e}")
 
         row = {
             "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "score": signal["score"],
-            "side": signal["side"] or "",
-            "price_mtx": signal["price_mtx"],
-            "mid_trend": signal["mid_trend"] or "",
+            "score": score,
+            "side": side_label,
+            "price_mtx": price_mtx,
+            "mid_trend": mid_trend,
             "iv": round(iv, 4),
             "delta": round(delta_val, 4),
             "gamma": round(gamma_val, 6),
@@ -621,9 +672,12 @@ class ShioajiOptionsSmartMonitor:
             return self._build_dry_run_bars()
         if not hasattr(self.api, "kbars") or "MTX" not in self.active_contracts:
             return None
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        today = datetime.datetime.now()
+        if today.hour < 5:
+            today = today - datetime.timedelta(days=1)
+        date_str = today.strftime("%Y-%m-%d")
         try:
-            bars = self.api.kbars(self.active_contracts["MTX"], start=today, end=today)
+            bars = self.api.kbars(self.active_contracts["MTX"], start=date_str, end=date_str)
             frame = pd.DataFrame({**bars})
         except Exception as e:
             console.print(f"[red]Error fetching kbars:[/red] {e}")
@@ -640,6 +694,22 @@ class ShioajiOptionsSmartMonitor:
             return None
         frame = frame.set_index("ts")[["Open", "High", "Low", "Close", "Volume"]].sort_index()
         return frame
+
+    def pre_fill_bars(self):
+        """Pre-fill tick bar buffer from kbars on startup."""
+        try:
+            bars = self._fetch_today_futures_bars()
+            if bars is not None and len(bars) >= 30:
+                self._mtx_tick_bars = bars[["Open", "High", "Low", "Close", "Volume"]].copy()
+                console.print(f"[green]Pre-filled {len(self._mtx_tick_bars)} MTX bars from kbars[/green]")
+        except Exception:
+            pass
+
+    def _get_tick_bars_fallback(self):
+        """Fallback: use tick-built bars when kbars API is unavailable."""
+        if len(self._mtx_tick_bars) >= 30:
+            return self._mtx_tick_bars.copy()
+        return None
 
     def _build_dry_run_bars(self):
         if self.replay_bars is not None:
@@ -680,6 +750,8 @@ class ShioajiOptionsSmartMonitor:
 
     def fetch_live_signal(self):
         df5_raw = self._fetch_today_futures_bars()
+        if df5_raw is None or len(df5_raw) < 30:
+            df5_raw = self._get_tick_bars_fallback()
         if df5_raw is not None:
             console.print(f"[debug] Raw bars: {len(df5_raw)} rows, from {df5_raw.index[0]} to {df5_raw.index[-1]}")
         if df5_raw is None or len(df5_raw) < max(30, self.strategy_cfg.get("length", 20) + 5):
@@ -725,6 +797,19 @@ class ShioajiOptionsSmartMonitor:
             score = calculate_mtf_alignment(available_data, weights=self.weights)["score"]
             mid_trend = infer_mid_trend(m15)
             side = resolve_entry_side(row, score, row["Close"], self.entry_score, mid_trend=mid_trend, require_mid_trend=True)
+
+            # V2 filters: require_fire and require_align
+            if side and self.strategy_cfg.get("require_fire"):
+                row_fired = row.get("fired", False)
+                # 放寬：fired 或 score 極端值都允許
+                if not row_fired and abs(score) < 90:
+                    side = None
+            if side and self.strategy_cfg.get("require_align"):
+                if side == "C" and not row.get("bullish_align", False):
+                    side = None
+                elif side == "P" and not row.get("bearish_align", False):
+                    side = None
+
             signal = {"score": score, "side": side, "price_mtx": row["Close"], "mid_trend": mid_trend, "timestamp": timestamp}
             self.last_signal = signal
             self.replay_stats["signals"] += 1
@@ -768,6 +853,7 @@ class ShioajiOptionsSmartMonitor:
         self.entry_time = signal.get("timestamp") or self._current_strategy_time()
         self.has_tp1_hit = False
         self.stop_loss_price = entry_price * (1 - self.stop_loss_pct)
+        self.peak_premium = entry_price
         self.replay_stats["entries"] += 1
         self.log_trade("PAPER_ENTRY", side, entry_price, f"score={signal['score']:.1f}")
 
@@ -813,6 +899,8 @@ class ShioajiOptionsSmartMonitor:
         self.entry_time = None
         self.has_tp1_hit = False
         self.stop_loss_price = 0.0
+        self.peak_premium = 0.0
+        self.cooldown_until = self.cooldown_bars
         self.replay_stats["exits"] += 1
 
     def exit_live_position(self, action, note="", quantity=None):
@@ -923,6 +1011,19 @@ class ShioajiOptionsSmartMonitor:
 
         if exit_price <= 0:
             return False
+
+        # 2. Trailing stop: 追蹤最高權利金，回落超過 trailing_stop_pct 就出場
+        if exit_price > self.peak_premium:
+            self.peak_premium = exit_price
+        if self.trailing_stop_pct > 0 and self.has_tp1_hit and self.peak_premium > 0:
+            trail_floor = self.peak_premium * (1 - self.trailing_stop_pct)
+            if exit_price <= trail_floor:
+                reason = f"TRAILING_STOP peak={self.peak_premium:.1f} floor={trail_floor:.1f}"
+                if self.live_trading:
+                    self.exit_live_position("LIVE_TRAIL_EXIT_SUBMITTED", reason)
+                else:
+                    self.exit_paper_position("PAPER_TRAIL_EXIT", exit_price, reason)
+                return True
         
         signal_score = signal["score"] if signal else (self.last_signal["score"] if self.last_signal else 999)
         if should_take_partial_profit(self.position, self.has_tp1_hit, self.entry_price, exit_price, self.m_cfg["tp1_pct"]):
@@ -994,20 +1095,29 @@ class ShioajiOptionsSmartMonitor:
                             return
 
             if self.position == 0 and signal and signal["side"]:
-                if self.live_trading:
+                if self.cooldown_until > 0:
+                    self.cooldown_until -= 1
+                    console.print(f"[dim]Cooldown: {self.cooldown_until} bars remaining[/dim]")
+                elif self.live_trading:
+                    console.print(f"[bold green]>>> ENTRY SIGNAL: {signal['side']} score={signal['score']:.1f}[/bold green]")
                     self.enter_live_position(signal["side"], signal)
                 else:
                     self.enter_paper_position(signal["side"], signal)
             self.print_status_summary(signal)
+            # Always record snapshot (Greeks from live quotes even without signal)
+            if not signal:
+                self.record_signal_snapshot(None)
         except Exception as exc:
             console.print(f"[red]Strategy loop error:[/red] {exc}")
 
     def run(self):
-        if not self.find_best_contracts(): return
+        # find_best_contracts may already be called from main.py
+        if not self.active_contracts:
+            if not self.find_best_contracts(): return
+            self.pre_fill_bars()
         if not self.dry_run and self.api is not None:
-            self.api.quote.set_on_tick_fop_v1_callback(self.on_tick)
-            for con in self.active_contracts.values():
-                self.api.quote.subscribe(con, quote_type='tick')
+            # Don't override callback or subscribe — main.py handles it
+            pass
         console.print(f">>> [{'DRY RUN' if self.dry_run and not self.dry_run_live_orders else self.status_mode_label() + ' MODE'}] [EXIT-SNIPER ENABLED] Monitor Running <<<")
         if self.dry_run_live_orders:
             console.print("[green]Dry live-orders mode active. Mock broker fills will exercise live entry/exit callbacks without real broker login.[/green]")
