@@ -88,6 +88,10 @@ def main():
     args = parser.parse_args()
 
     while True:
+        # Clear cached modules so fresh api gets injected
+        for key in list(sys.modules.keys()):
+            if key.startswith("strategies."):
+                del sys.modules[key]
         restart = run_once(dry_run=args.dry_run)
         if not restart:
             break
