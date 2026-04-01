@@ -88,6 +88,7 @@ account:
   total_equity_source: "api"        # 從 API 讀取真實權益數
   margin_reserve_pct: 0.20          # 保留 20% 不動用（安全墊）
 
+# 規則：futures + options <= 1.0 - margin_reserve_pct
 allocation:
   futures:
     max_margin_pct: 0.40            # 最多用 40% 權益做期貨
@@ -96,6 +97,25 @@ allocation:
     max_margin_pct: 0.40            # 最多用 40% 權益做選擇權
     max_lots: 2
 ```
+
+### Dashboard 即時調整
+
+設定 Tab 提供雙滑桿，可即時調整分配比例：
+
+```
+期貨分配: [====40%====|--------]  ← slider 0~80%
+選擇權分配: [====40%====|--------]  ← slider 0~80%
+安全墊:    [==20%==]               ← 固定，不可調
+
+驗證規則：futures + options + reserve <= 100%
+超過時 slider 自動回彈，顯示警告
+```
+
+常見配置範例：
+- 雙策略均衡：期貨 40% + 選擇權 40% + 安全墊 20%
+- 只做選擇權：期貨 0% + 選擇權 80% + 安全墊 20%
+- 只做期貨：期貨 80% + 選擇權 0% + 安全墊 20%
+- 保守模式：期貨 20% + 選擇權 20% + 安全墊 60%（手動調高 reserve）
 
 ### 下單前檢查流程
 
