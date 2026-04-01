@@ -1,4 +1,4 @@
-active_mode: day
+active_mode: night
 live_trading: false
 strategy:
   length: 20
