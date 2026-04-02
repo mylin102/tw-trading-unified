@@ -143,6 +143,8 @@ class ShioajiOptionsSmartMonitor:
         self.trailing_stop_pct = float(self.m_cfg.get("trailing_stop_pct", 0))
         self.last_signal = None
         self.last_status_print_at = None
+        self.latest_score = 0.0
+        self.latest_mid_trend = ""
         self.loop_sleep_secs = 60
         self.status_print_secs = 300
         self.pending_entry = None
@@ -630,9 +632,11 @@ class ShioajiOptionsSmartMonitor:
         # 即使沒有訊號也用即時報價算 Greeks
         iv, delta_val, gamma_val, vega_val = 0.0, 0.0, 0.0, 0.0
         price_mtx = float(self.market_data["MTX"]["close"])
-        score = float(signal["score"]) if signal else 0.0
+        
+        # 優先使用最新計算出的分數與趨勢，若 signal 存在則覆蓋
+        score = float(signal["score"]) if signal else self.latest_score
+        mid_trend = (signal["mid_trend"] or "") if signal else self.latest_mid_trend
         side_label = (signal["side"] or "") if signal else ""
-        mid_trend = (signal["mid_trend"] or "") if signal else ""
 
         if price_mtx > 0:
             try:
@@ -804,6 +808,11 @@ class ShioajiOptionsSmartMonitor:
 
             score = calculate_mtf_alignment(available_data, weights=self.weights)["score"]
             mid_trend = infer_mid_trend(m15)
+            
+            # 更新最新狀態
+            self.latest_score = score
+            self.latest_mid_trend = mid_trend or ""
+            
             side = resolve_entry_side(row, score, row["Close"], self.entry_score, mid_trend=mid_trend, require_mid_trend=True)
 
             # V2 filters: require_fire and require_align
@@ -1116,9 +1125,6 @@ class ShioajiOptionsSmartMonitor:
                     else:
                         self.enter_paper_position(signal["side"], signal)
             self.print_status_summary(signal)
-            # Always record snapshot (Greeks from live quotes even without signal)
-            if not signal:
-                self.record_signal_snapshot(None)
         except Exception as exc:
             console.print(f"[red]Strategy loop error:[/red] {exc}")
 
