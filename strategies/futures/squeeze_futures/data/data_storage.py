@@ -30,7 +30,10 @@ class DataStorage:
         self.backtest_dir.mkdir(parents=True, exist_ok=True)
         
         # 當前數據文件
-        self.date_str = datetime.now().strftime("%Y%m%d")
+        # 修正：支援交易日邏輯，凌晨 5 點前算在前一天
+        now = datetime.now()
+        self.date_str = (now - datetime.timedelta(days=1)).strftime('%Y%m%d') if now.hour < 5 else now.strftime('%Y%m%d')
+        
         self.market_file = self.market_dir / f"{ticker}_{self.date_str}_indicators.csv"
         self.trade_file = self.trade_dir / f"{ticker}_{self.date_str}_trades.json"
         

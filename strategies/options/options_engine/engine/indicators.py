@@ -63,25 +63,30 @@ def calculate_futures_squeeze(
     # Ensure mom_state is calculated even if resample drops it
     res["mom_prev"] = res["momentum"].shift(1).fillna(0)
 
-    res["date"] = res.index.date
+    # 改進 VWAP：使用交易日 (Trading Day) 而非日曆日 (Calendar Day)
+    # 台指期規則：15:00 以後屬下一個交易日
+    res["trading_day"] = (res.index + pd.Timedelta(hours=9)).date
+    
     typical_price_x_volume = res["Close"] * res["Volume"]
-    res["vwap"] = typical_price_x_volume.groupby(res["date"]).cumsum() / res["Volume"].groupby(res["date"]).cumsum()
+    volume_cumsum = res.groupby("trading_day")["Volume"].cumsum()
+    res["vwap"] = typical_price_x_volume.groupby(res["trading_day"]).cumsum() / volume_cumsum
+    res["vwap"] = res["vwap"].where(volume_cumsum != 0, res["Close"])
     res["price_vs_vwap"] = np.where(res["vwap"] != 0, (res["Close"] - res["vwap"]) / res["vwap"], 0.0)
     res["fired"] = (~res["sqz_on"]) & (res["sqz_on"].shift(1) == True)
 
     # Calculate mom_state vectorized for better performance
-    def get_mom_state_vectorized(momentum, mom_prev):
-        """Vectorized mom_state calculation"""
-        state = pd.Series(0, index=momentum.index)
-        mask_pos = momentum > 0
-        mask_neg = momentum <= 0
-        state[mask_pos & (momentum >= mom_prev)] = 3
-        state[mask_pos & (momentum < mom_prev)] = 2
-        state[mask_neg & (momentum <= mom_prev)] = 0
-        state[mask_neg & (momentum > mom_prev)] = 1
-        return state
-
-    res["mom_state"] = get_mom_state_vectorized(res["momentum"], res["mom_prev"])
+    m = res["momentum"].values
+    p = res["mom_prev"].values
+    res["mom_state"] = np.select(
+        [
+            (m > 0) & (m >= p),
+            (m > 0) & (m < p),
+            (m <= 0) & (m <= p),
+            (m <= 0) & (m > p)
+        ],
+        [3, 2, 0, 1],
+        default=1
+    )
     
     # Safe EMA calculation
     def safe_ema(length):
@@ -113,9 +118,9 @@ def calculate_futures_squeeze(
         & res["bearish_align"]
     )
 
-    res["day_open"] = res.groupby("date")["Open"].transform("first")
-    res["day_min"] = res.groupby("date")["Low"].cummin()
-    res["day_max"] = res.groupby("date")["High"].cummax()
+    res["day_open"] = res.groupby("trading_day")["Open"].transform("first")
+    res["day_min"] = res.groupby("trading_day")["Low"].cummin()
+    res["day_max"] = res.groupby("trading_day")["High"].cummax()
     res["opening_bullish"] = (res["Close"] > res["day_open"]) & (res["day_min"] >= res["day_open"] * 0.999)
     res["opening_bearish"] = (res["Close"] < res["day_open"]) & (res["day_max"] <= res["day_open"] * 1.001)
 

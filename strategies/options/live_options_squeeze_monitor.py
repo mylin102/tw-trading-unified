@@ -156,14 +156,19 @@ class ShioajiOptionsSmartMonitor:
         self.replay_stats = {"signals": 0, "directional_signals": 0, "entries": 0, "exits": 0, "tp1_hits": 0}
         
         # 設定日誌路徑
-        log_sub_dir = "live_trading" if self.live_trading else "paper_trading"
-        log_base = Path(__file__).parent / "logs" / log_sub_dir
-        log_base.mkdir(parents=True, exist_ok=True)
-        
-        self.indicator_log_path = log_base / f"OPTIONS_{datetime.datetime.now().strftime('%Y%m%d')}_indicators.csv"
-        self.ledger_path = log_base / "options_trade_ledger.csv"
+        self._update_log_paths()
         if self.api is not None and hasattr(self.api, "set_order_callback"):
             self.api.set_order_callback(self.on_order_event)
+
+    def _update_log_paths(self):
+        log_sub_dir = "live_trading" if self.live_trading else "paper_trading"
+        # Use cwd-based path (main.py runs from tw-trading-unified root)
+        log_base = Path(os.getcwd()) / "strategies" / "options" / "logs" / log_sub_dir
+        log_base.mkdir(parents=True, exist_ok=True)
+        now = datetime.datetime.now()
+        date_str = (now - datetime.timedelta(days=1)).strftime('%Y%m%d') if now.hour < 5 else now.strftime('%Y%m%d')
+        self.indicator_log_path = log_base / f"OPTIONS_{date_str}_indicators.csv"
+        self.ledger_path = log_base / "options_trade_ledger.csv"
 
     def load_config(self):
         path = Path(__file__).parent / "config" / "options_strategy.yaml"
@@ -509,8 +514,9 @@ class ShioajiOptionsSmartMonitor:
 
     def log_trade(self, action, side, price, note=""):
         pnl = 0
+        point_value = self.pricing_cfg.get("point_value", 50)
         if "EXIT" in action and self.entry_price > 0:
-            pnl = round((price - self.entry_price) * 50, 0)  # TXO point_value=50
+            pnl = round((price - self.entry_price) * point_value, 0)  # TXO point_value=50
         # 從既有 ledger 累計 balance
         balance = 0
         if self.ledger_path.exists():
@@ -1094,15 +1100,19 @@ class ShioajiOptionsSmartMonitor:
                             self.print_status_summary(signal, force=True)
                             return
 
-            if self.position == 0 and signal and signal["side"]:
+            if self.position == 0:
                 if self.cooldown_until > 0:
                     self.cooldown_until -= 1
                     console.print(f"[dim]Cooldown: {self.cooldown_until} bars remaining[/dim]")
-                elif self.live_trading:
-                    console.print(f"[bold green]>>> ENTRY SIGNAL: {signal['side']} score={signal['score']:.1f}[/bold green]")
-                    self.enter_live_position(signal["side"], signal)
-                else:
-                    self.enter_paper_position(signal["side"], signal)
+                
+                if signal and signal["side"]:
+                    if self.cooldown_until > 0:
+                        console.print(f"[dim]Signal {signal['side']} ignored during cooldown[/dim]")
+                    elif self.live_trading:
+                        console.print(f"[bold green]>>> ENTRY SIGNAL: {signal['side']} score={signal['score']:.1f}[/bold green]")
+                        self.enter_live_position(signal["side"], signal)
+                    else:
+                        self.enter_paper_position(signal["side"], signal)
             self.print_status_summary(signal)
             # Always record snapshot (Greeks from live quotes even without signal)
             if not signal:

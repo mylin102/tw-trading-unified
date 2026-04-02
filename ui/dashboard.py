@@ -82,17 +82,30 @@ OPTIONS_DATA = OPTIONS_REPO / "logs" / ("live_trading" if o_live else "paper_tra
 def filter_today(df, ts_col="timestamp"):
     if df is None or df.empty:
         return df
-    # 統一去掉時區字串再解析
-    df[ts_col] = df[ts_col].astype(str).str.replace(r"[+-]\d{2}:\d{2}$", "", regex=True)
-    df[ts_col] = pd.to_datetime(df[ts_col], format="mixed")
-    df = df[df[ts_col].dt.strftime("%Y-%m-%d") == TODAY].copy()
-    # 過濾 fallback 假資料：用最後一筆的 30% 作為下限
-    for col in ["close", "price_mtx"]:
-        if col in df.columns and len(df) > 1:
-            latest = df[col].iloc[-1]
-            if latest > 0:
-                df = df[df[col] > latest * 0.7]
-    return df
+    try:
+        # 統一處理：先轉字串，移除時區偏移 (+HH:MM) 或 UTC 標誌 (Z)
+        df[ts_col] = df[ts_col].astype(str).str.replace(r"[+-]\d{2}:\d{2}$", "", regex=True).str.replace("Z", "")
+        df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+        df = df.dropna(subset=[ts_col])
+        
+        # 取得資料中的最新日期，而不是硬用系統日期比對 (避免跨日數據斷層)
+        latest_date_in_df = df[ts_col].max().strftime("%Y-%m-%d")
+        filtered_df = df[df[ts_col].dt.strftime("%Y-%m-%d") == latest_date_in_df].copy()
+        
+        # 如果過濾後今天沒數據，回傳原始 df (至少讓使用者看到最後的資料)
+        if filtered_df.empty:
+            return df
+            
+        # 過濾 fallback 假資料
+        for col in ["close", "price_mtx"]:
+            if col in filtered_df.columns and len(filtered_df) > 1:
+                latest = filtered_df[col].iloc[-1]
+                if latest > 0:
+                    filtered_df = filtered_df[filtered_df[col] > latest * 0.5]
+        return filtered_df
+    except Exception as e:
+        st.error(f"資料過濾錯誤: {e}")
+        return df
 
 # ── Chart builder (unified style) ──
 def make_price_score_chart(df, price_col, title, ts_col="timestamp"):
@@ -146,12 +159,22 @@ def make_pnl_chart(pnl_df, title):
     return fig
 @st.cache_data(ttl=5)
 def load_futures_indicators():
+    # 1. 優先找今天的檔案
     for tag in ["", "_LIVE", "_PAPER"]:
         f = FUTURES_MKT / f"TMF_{DATE_STR}{tag}_indicators.csv"
         if f.exists():
             try:
                 return filter_today(pd.read_csv(f))
             except: pass
+    
+    # 2. 備案：找目錄下最新的一個 CSV
+    try:
+        all_files = list(FUTURES_MKT.glob("TMF_*_indicators.csv"))
+        if all_files:
+            latest_file = max(all_files, key=os.path.getmtime)
+            return filter_today(pd.read_csv(latest_file))
+    except:
+        pass
     return None
 
 @st.cache_data(ttl=5)
@@ -167,15 +190,24 @@ OPTIONS_SUB = "live_trading" if o_live else "paper_trading"
 
 @st.cache_data(ttl=5)
 def load_options_indicators():
-    # Indicator 可能因重啟寫到不同目錄，取最新的
+    # 1. 優先找今天的
     best = None
     for sub in ["live_trading", "paper_trading"]:
         f = OPTIONS_REPO / "logs" / sub / f"OPTIONS_{DATE_STR}_indicators.csv"
         if f.exists() and f.stat().st_mtime > (best[1] if best else 0):
             best = (f, f.stat().st_mtime)
     if best:
-        try: return filter_today(pd.read_csv(best[0]))
+        try: return filter_today(pd.read_csv(best[0]), ts_col="timestamp")
         except: pass
+    
+    # 2. 備案：找目錄下最新的任何指標檔案
+    try:
+        all_opt_files = list((OPTIONS_REPO / "logs").rglob("OPTIONS_*_indicators.csv"))
+        if all_opt_files:
+            latest_f = max(all_opt_files, key=os.path.getmtime)
+            return filter_today(pd.read_csv(latest_f), ts_col="timestamp")
+    except:
+        pass
     return None
 
 @st.cache_data(ttl=5)

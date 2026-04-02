@@ -20,7 +20,7 @@ console = Console()
 class SimulatorConfig:
     """模擬器配置"""
     initial_balance: float = 100000
-    point_value: float = 10
+    point_value: float = 50
     fee_per_side: float = 20
     exchange_fee: float = 0
     tax_rate: float = 0.00002
@@ -29,8 +29,9 @@ class SimulatorConfig:
     slippage: float = 1.0
 
 
-@nb.njit(parallel=True, cache=True)
+@nb.njit(cache=True)
 def simulate_trades_vectorized(
+    open_prices: np.ndarray,
     close: np.ndarray,
     high: np.ndarray,
     low: np.ndarray,
@@ -81,7 +82,7 @@ def simulate_trades_vectorized(
     lots_held = 0
     tp1_triggered = False
     
-    for i in nb.prange(n):
+    for i in range(n):
         # 記錄當前部位
         positions[i] = position
         
@@ -107,22 +108,24 @@ def simulate_trades_vectorized(
             exit_reason = 0
             
             if position > 0:  # 多單
-                # 停損
+                # 停損 (考慮跳空 Gap)
                 sl_price = entry_price - stop_loss_pts
                 if low[i] <= sl_price:
-                    exit_price = sl_price
+                    # 如果開盤價就低於停損，則以開盤價成交 (模擬跳空滑價)
+                    exit_price = min(open_prices[i], sl_price)
                     exit_reason = 0
                 
                 # 分批停利
                 elif not tp1_triggered and lots_held >= 2 and tp1_lots > 0:
                     tp_price = entry_price + tp1_pts
                     if high[i] >= tp_price:
-                        # 部分平倉
-                        pnl[i] = tp1_lots * (tp_price - entry_price) * point_value
-                        pnl[i] -= calc_costs(tp_price, entry_price, point_value, fee_per_side, exchange_fee, tax_rate, slippage, tp1_lots)
+                        # 如果開盤價就高於停利，則以開盤價成交
+                        exec_tp_price = max(open_prices[i], tp_price)
+                        pnl[i] = tp1_lots * (exec_tp_price - entry_price) * point_value
+                        pnl[i] -= calc_costs(exec_tp_price, entry_price, point_value, fee_per_side, exchange_fee, tax_rate, slippage, tp1_lots)
                         lots_held -= tp1_lots
                         tp1_triggered = True
-                        entry_price = tp_price  # 更新剩餘部位的進場價
+                        entry_price = exec_tp_price  # 更新剩餘部位的進場價
                         continue
                 
                 # VWAP 離場
@@ -136,21 +139,24 @@ def simulate_trades_vectorized(
                     exit_reason = 3
             
             else:  # 空單
-                # 停損
+                # 停損 (考慮跳空 Gap)
                 sl_price = entry_price + stop_loss_pts
                 if high[i] >= sl_price:
-                    exit_price = sl_price
+                    # 如果開盤價就高於停損，則以開盤價成交
+                    exit_price = max(open_prices[i], sl_price)
                     exit_reason = 0
                 
                 # 分批停利
                 elif not tp1_triggered and lots_held >= 2 and tp1_lots > 0:
                     tp_price = entry_price - tp1_pts
                     if low[i] <= tp_price:
-                        pnl[i] = tp1_lots * (entry_price - tp_price) * point_value
-                        pnl[i] -= calc_costs(entry_price, tp_price, point_value, fee_per_side, exchange_fee, tax_rate, slippage, tp1_lots)
+                        # 如果開盤價就低於停利，則以開盤價成交
+                        exec_tp_price = min(open_prices[i], tp_price)
+                        pnl[i] = tp1_lots * (entry_price - exec_tp_price) * point_value
+                        pnl[i] -= calc_costs(entry_price, exec_tp_price, point_value, fee_per_side, exchange_fee, tax_rate, slippage, tp1_lots)
                         lots_held -= tp1_lots
                         tp1_triggered = True
-                        entry_price = tp_price
+                        entry_price = exec_tp_price
                         continue
                 
                 # VWAP 離場
@@ -329,6 +335,7 @@ class VectorizedSimulator:
         self.config = config or SimulatorConfig()
         
         # 轉換為 NumPy 陣列
+        self.open = df['Open'].values
         self.close = df['Close'].values
         self.high = df['High'].values
         self.low = df['Low'].values
@@ -404,7 +411,7 @@ class VectorizedSimulator:
         
         # 2. 執行模擬
         entries, exits, positions, pnl, exit_reasons = simulate_trades_vectorized(
-            self.close, self.high, self.low, self.vwap,
+            self.open, self.close, self.high, self.low, self.vwap,
             long_signals, short_signals,
             self.config.initial_balance,
             self.config.point_value,

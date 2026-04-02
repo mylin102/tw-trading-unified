@@ -31,6 +31,7 @@ class RiskLimits:
     stop_loss_pts: float = 30           # 停損點數
     break_even_pts: float = 30          # 保本停損點數
     trailing_stop_pts: float = 20       # 移動停損點數
+    point_value: float = 50             # 商品點值 (預設小台=50, 大台=200, 微台=10)
 
 
 @dataclass
@@ -109,9 +110,9 @@ class RiskManager:
         
         # 計算未實現損益
         if direction > 0:
-            unrealized_pnl = (current_price - entry_price) * size * 10
+            unrealized_pnl = (current_price - entry_price) * size * self.config.point_value
         else:
-            unrealized_pnl = (entry_price - current_price) * size * 10
+            unrealized_pnl = (entry_price - current_price) * size * self.config.point_value
         
         # 計算風險報酬比
         risk_pts = abs(entry_price - stop_loss_price)
@@ -157,7 +158,7 @@ class RiskManager:
                 return "STOP_LOSS"
             
             # 保本停損檢查
-            if pos.unrealized_pnl >= self.config.break_even_pts * pos.size * 10:
+            if pos.unrealized_pnl >= self.config.break_even_pts * pos.size * self.config.point_value:
                 new_stop = pos.entry_price  # 移動到成本價
                 if current_price <= new_stop:
                     console.print(f"[bold yellow]⚠ BREAK EVEN triggered: {symbol} @ {current_price}[/bold yellow]")
@@ -169,7 +170,7 @@ class RiskManager:
                 return "STOP_LOSS"
             
             # 保本停損檢查
-            if pos.unrealized_pnl >= self.config.break_even_pts * pos.size * 10:
+            if pos.unrealized_pnl >= self.config.break_even_pts * pos.size * self.config.point_value:
                 new_stop = pos.entry_price
                 if current_price >= new_stop:
                     console.print(f"[bold yellow]⚠ BREAK EVEN triggered: {symbol} @ {current_price}[/bold yellow]")
@@ -186,7 +187,7 @@ class RiskManager:
         """
         # 計算總暴露
         self.total_exposure = sum(
-            abs(pos.size * pos.current_price * 10)
+            abs(pos.size * pos.current_price * self.config.point_value)
             for pos in self.positions.values()
         )
         

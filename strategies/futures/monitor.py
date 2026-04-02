@@ -213,7 +213,14 @@ class FuturesMonitor:
     def _save_bar(self, row, score, regime):
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs", "market_data")
         os.makedirs(log_dir, exist_ok=True)
-        path = os.path.join(log_dir, f"{self.ticker}_{datetime.now().strftime('%Y%m%d')}_indicators.csv")
+        
+        # 修正：支援交易日邏輯，凌晨 5 點前算在前一天
+        now = datetime.now()
+        date_str = (now - datetime.timedelta(days=1)).strftime('%Y%m%d') if now.hour < 5 else now.strftime('%Y%m%d')
+        
+        tag = "_DRY" if self.dry_run else ("_LIVE" if self.live_trading else "_PAPER")
+        path = os.path.join(log_dir, f"{self.ticker}_{date_str}{tag}_indicators.csv")
+        
         data = {
             "timestamp": [row.name], "close": [row["Close"]], "vwap": [row["vwap"]], "score": [score],
             "sqz_on": [row["sqz_on"]], "mom_state": [row["mom_state"]], "regime": [regime],
@@ -240,23 +247,23 @@ class FuturesMonitor:
         self._running = False
 
     def _strategy_tick(self):
-        if self.dry_run:
-            return
-
         # 市場時間檢查
         now = datetime.now()
         h = now.hour
         is_day = 8 <= h < 14
         is_night = h >= 15 or h < 5
-        if not (is_day or is_night):
+        
+        # 在 dry_run 模式下跳過時間檢查，方便測試
+        if not self.dry_run and not (is_day or is_night):
             return
 
         # 1. Fetch multi-timeframe data
         processed = {}
-        for tf in ["5m", "15m", "1h"]:
-            df = self.client.get_kline(self.ticker, interval=tf)
-            if not df.empty:
-                processed[tf] = calculate_futures_squeeze(df, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+        if not self.dry_run:
+            for tf in ["5m", "15m", "1h"]:
+                df = self.client.get_kline(self.ticker, interval=tf)
+                if not df.empty:
+                    processed[tf] = calculate_futures_squeeze(df, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
 
         # Fallback: use tick-built bars if kbars API returns empty
         if "5m" not in processed and hasattr(self, "_tick_bars") and len(self._tick_bars) >= 30:
@@ -287,6 +294,10 @@ class FuturesMonitor:
             self._save_bar(last_5m, score, regime)
             self.last_processed_bar = timestamp
             console.print(f"[dim][FuturesMonitor] {datetime.now().strftime('%H:%M')} close={last_price:.0f} score={score:.1f}[/dim]")
+
+        # 如果是 dry_run，計算完指標並存檔後就結束，不執行交易邏輯
+        if self.dry_run:
+            return
 
         # 2. Position management
         if self.trader.position != 0:

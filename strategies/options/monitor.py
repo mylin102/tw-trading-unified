@@ -25,6 +25,8 @@ class OptionsMonitor:
             self.monitor.api = api
             self.monitor.dry_run = False
             self.monitor.live_trading = self.monitor.full_cfg.get("live_trading", False)
+            # Re-set log paths after live_trading is corrected
+            self.monitor._update_log_paths()
             if self.monitor.live_trading:
                 self.monitor.broker = ShioajiBrokerAdapter(api, self.monitor.execution_cfg)
             else:
