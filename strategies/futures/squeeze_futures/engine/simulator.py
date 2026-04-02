@@ -290,7 +290,7 @@ class PaperTrader:
         if self.position == 0 or not self.be_points or self.be_triggered: return False
         pnl = (current_price - self.entry_price) * (1 if self.position > 0 else -1)
         if pnl >= self.be_points:
-            self.current_stop_loss = self.entry_price + (2 * (1 if self.position > 0 else -1))
+            self.current_stop_loss = self.entry_price + (10 * (1 if self.position > 0 else -1))
             self.be_triggered = True; return True
         return False
 

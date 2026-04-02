@@ -2,6 +2,29 @@
 
 台股期貨 + 選擇權整合交易系統。單一 Shioaji session，避免 Too Many Connections。
 
+### 2026-04-03 策略插件化 + ThetaGang + 安全性修復 (v3)
+- **[Arch] 策略插件系統**：8 種期貨進場策略，config 一行切換，Dashboard 下拉選單即時切換
+  - `squeeze_breakout` / `trend_follow` / `vwap_bounce` / `momentum_burst` / `night_short_only`
+  - `volume_reversal` / `psar_breakout` / `cumulative_delta`（參考 NinjaScript）
+- **[Strategy] ThetaGang 賣方策略**：Iron Condor / Credit Spread / Short Strangle，Squeeze ON 自動啟用
+- **[Strategy] Options Score 翻轉出場**：持 Put 但 score 翻正 → 立刻出場，防止利潤全部回吐
+- **[Strategy] Options Trailing Stop 提前啟動**：浮盈 ≥15% 即啟動，不需等 TP1
+- **[Pricing] QuantLib 整合**：BS pricing + Brent IV solver + Vol Surface，config 切換 `quantlib`/`black_scholes`
+- **[Safety] Paper 模式資金限制**：40,000 本金檢查，ATM 買方自動擋單
+- **[Safety] 重複下單防護**：`save_trade` 移到 `execute_signal` 成功之後，position guard 在 entry/exit
+- **[Safety] PnL 含手續費**：CSV 顯示淨損益（扣 broker fee + exchange fee + tax）
+- **[Safety] BE offset 10 pts**：Break-even trailing 確保 cover 手續費（原 2 pts）
+- **[Safety] 停損用市場價**：不再用停損線價格出場
+- **[Fix] Options 重複進場**：`enter_paper_position` 加 position guard + recovery 修復
+- **[Fix] Options PnL 乘口數**：`log_trade` 正確計算 qty × point_value
+- **[Fix] EXIT 歸零順序**：先 position=0 再 log，防止重複 EXIT
+- **[Fix] `datetime.timedelta` 命名衝突**：修復 `from datetime import datetime` 覆蓋問題
+- **[UI] Dashboard 策略選擇器**：期貨 8 策略 + 選擇權 5 策略，含即時說明
+- **[UI] Dashboard Options Max Positions**：可設 0 停止開新倉
+- **[Test] V-Model 測試**：18 個測試案例，覆蓋所有已知 bug
+- **[Doc] SDD + V-Model**：`docs/SDD.md` 架構設計 + `docs/V_MODEL_TEST_PLAN.md` 測試計畫
+- **[Doc] AI Rules**：`RULES.md` + `.kiro/` + `.cursorrules` + `AGENTS.md` + `GEMINI.md`
+
 ### 2026-04-02 策略與安全性重大升級 (v2)
 - **[Strategy] Squeeze Failure Counter 策略**：新增均值回歸反向策略，回測 PF=1.95（原 Breakout PF=1.02）
 - **[Strategy] Auto-Regime 切換**：根據 bullish_align 翻轉頻率自動判斷趨勢/盤整，切換 Breakout/Counter 模式

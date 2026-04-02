@@ -4,7 +4,7 @@ execution:
   initial_balance: 100000
   limit_offset_pts: 2.0
   market_slippage_pts: 1.0
-  order_type: market
+  order_type: MKP
   range_protection_pts: 3.0
   tax_rate: 2.0e-05
   tick_size: 1.0
@@ -59,9 +59,35 @@ strategy:
     confirm_bars: 5
     atr_sl_mult: 2.0
     exit_on_vwap: true
+  active_strategy: cumulative_delta
+  trend_follow:
+    min_score: 30
+    atr_mult: 3.0
+  vwap_bounce:
+    min_distance_pct: 0.003
+    atr_mult: 1.5
+  momentum_burst:
+    min_velocity: 5.0
+    atr_mult: 2.0
+  night_short:
+    min_score: 20
+    atr_mult: 2.0
+  volume_reversal:
+    sma_length: 50
+    volume_multiplier: 2.0
+    atr_mult: 2.0
+  psar_breakout:
+    sma_length: 50
+    acceleration: 0.02
+    acceleration_max: 0.2
+    atr_mult: 2.0
+  cumulative_delta:
+    sma_length: 50
+    lookback: 20
+    atr_mult: 2.0
 trade_mgmt:
   allow_long: true
   allow_short: true
   force_close_at_end: false
-  lots_per_trade: 1
-  max_positions: 1
+  lots_per_trade: 2
+  max_positions: 2

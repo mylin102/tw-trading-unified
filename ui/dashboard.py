@@ -453,6 +453,41 @@ with tab_settings:
     f_strategy = futures_cfg.get("strategy", {})
     f_risk = futures_cfg.get("risk_mgmt", {})
     f_mgmt = futures_cfg.get("trade_mgmt", {})
+
+    # ── 策略切換 ──
+    STRATEGY_OPTIONS = {
+        "squeeze_breakout": "🔵 Squeeze Breakout（原版，通用）",
+        "trend_follow": "📈 Trend Follow（單邊趨勢，寬停損）",
+        "vwap_bounce": "🔄 VWAP Bounce（盤整均值回歸）",
+        "momentum_burst": "💥 Momentum Burst（Squeeze Fire 爆發）",
+        "night_short_only": "🌙 Night Short Only（夜盤只做空）",
+        "volume_reversal": "📊 Volume Reversal（量價反轉）",
+        "psar_breakout": "🔺 PSAR Breakout（拋物線翻轉）",
+        "cumulative_delta": "📉 Cumulative Delta（訂單流動能）",
+    }
+    current_strat = f_strategy.get("active_strategy", "squeeze_breakout")
+    strat_keys = list(STRATEGY_OPTIONS.keys())
+    strat_idx = strat_keys.index(current_strat) if current_strat in strat_keys else 0
+    selected_strat = st.selectbox(
+        "進場策略",
+        strat_keys,
+        index=strat_idx,
+        format_func=lambda k: STRATEGY_OPTIONS[k],
+        key="f_strat",
+    )
+
+    FUTURES_STRAT_DESC = {
+        "squeeze_breakout": "**原版策略** — Squeeze 釋放 + 多週期 Score 對齊 + Regime Filter 進場。ATR 1.5x 停損。適合一般行情，但停損偏緊。",
+        "trend_follow": "**趨勢跟隨** — 只在 15m EMA 方向一致時進場，ATR 3.0x 寬停損。適合單邊趨勢行情（如今晚暴跌），能抱住大波段。",
+        "vwap_bounce": "**VWAP 均值回歸** — 價格偏離 VWAP 0.3% 以上 + 動能反轉時反向進場。ATR 1.5x 緊停損。適合盤整震盪行情。",
+        "momentum_burst": "**動能爆發** — Squeeze Fire 瞬間 + 高 Velocity 進場。ATR 2.0x 停損。適合壓縮後的爆發行情，交易頻率低但爆發力強。",
+        "night_short_only": "**夜盤只做空** — 僅在夜盤（15:00~05:00）+ Bearish Align 時做空。ATR 2.0x 停損。適合夜盤偏空的統計優勢。",
+        "volume_reversal": "**量價反轉**（參考 NinjaScript volumeMA）— 連續 2 根紅 K 量 > 前一根綠 K 量 ×2 + 收盤 > SMA50 → 做多（反之做空）。適合放量反轉。",
+        "psar_breakout": "**拋物線翻轉**（參考 NinjaScript PSAR）— 價格突破 Parabolic SAR + 收盤 > SMA50 進場。ATR 2.0x 停損。適合趨勢翻轉點。",
+        "cumulative_delta": "**累積 Delta**（參考 NinjaScript cumStrat）— 用成交量方向近似訂單流，Delta 上升 + 價格回落 + > SMA50 → 做多。適合訂單流動能交易。",
+    }
+    st.info(FUTURES_STRAT_DESC.get(selected_strat, ""))
+
     fc1, fc2, fc3 = st.columns(3)
     f_entry = fc1.slider("Entry Score", 10, 100, int(f_strategy.get("entry_score", 20)), 5, key="f_entry")
     f_sl = fc2.slider("Stop Loss (pts)", 20, 200, int(f_risk.get("stop_loss_pts", 60)), 10, key="f_sl")
@@ -465,12 +500,50 @@ with tab_settings:
     o_strategy = options_cfg.get("strategy", {})
     o_risk = options_cfg.get("risk_mgmt", {})
     o_exit = options_cfg.get("exit_strategy", {})
+    o_theta = options_cfg.get("theta_gang", {})
+
+    # ── 選擇權策略切換 ──
+    OPT_STRATEGY_OPTIONS = {
+        "directional": "📈 Directional（買方，買 Call/Put）",
+        "theta_iron_condor": "🦅 Iron Condor（賣方，收 theta）",
+        "theta_bull_put": "🐂 Bull Put Spread（賣方偏多）",
+        "theta_bear_call": "🐻 Bear Call Spread（賣方偏空）",
+        "auto_regime": "🔄 Auto Regime（盤整賣方 / 趨勢買方）",
+    }
+    # Derive current from config
+    if o_theta.get("enabled") and o_theta.get("auto_regime"):
+        current_opt_strat = "auto_regime"
+    elif o_theta.get("enabled"):
+        tg_map = {"iron_condor": "theta_iron_condor", "bull_put_spread": "theta_bull_put", "bear_call_spread": "theta_bear_call"}
+        current_opt_strat = tg_map.get(o_theta.get("strategy", ""), "theta_iron_condor")
+    else:
+        current_opt_strat = "directional"
+    opt_strat_keys = list(OPT_STRATEGY_OPTIONS.keys())
+    opt_strat_idx = opt_strat_keys.index(current_opt_strat) if current_opt_strat in opt_strat_keys else 0
+    selected_opt_strat = st.selectbox(
+        "選擇權策略",
+        opt_strat_keys,
+        index=opt_strat_idx,
+        format_func=lambda k: OPT_STRATEGY_OPTIONS[k],
+        key="o_strat",
+    )
+
+    OPT_STRAT_DESC = {
+        "directional": "**買方策略** — 買 Call（看多）或 Put（看空），靠方向性波動獲利。\n\n⚡ 進場：Score ≥ 60 + Squeeze Fire + 趨勢對齊\n🛑 出場：停損 10% / TP1 30% / Trailing 15% / Score 翻轉\n📊 勝率低但單筆獲利大，適合趨勢行情",
+        "theta_iron_condor": "**Iron Condor（賣方）** — 同時賣 OTM Put Spread + OTM Call Spread，收取權利金。\n\n⚡ 進場：Squeeze ON（盤整壓縮）+ IV ≥ 18%\n🛑 出場：獲利 50% credit / 虧損 100% max_loss / DTE ≤ 3 天 / Squeeze 釋放\n📊 勝率高（~70%），最大虧損固定，適合盤整低波動",
+        "theta_bull_put": "**Bull Put Spread（賣方偏多）** — 賣 OTM Put + 買更 OTM Put，看不跌。\n\n⚡ 進場：Squeeze ON + IV ≥ 18% + 偏多判斷\n🛑 出場：同 Iron Condor\n📊 適合溫和多頭或盤整，下方有保護",
+        "theta_bear_call": "**Bear Call Spread（賣方偏空）** — 賣 OTM Call + 買更 OTM Call，看不漲。\n\n⚡ 進場：Squeeze ON + IV ≥ 18% + 偏空判斷\n🛑 出場：同 Iron Condor\n📊 適合溫和空頭或盤整，上方有保護",
+        "auto_regime": "**自動切換（推薦）** — 根據 Squeeze 狀態自動切換買方/賣方。\n\n🔄 Squeeze ON（盤整）→ 賣 Iron Condor 收 theta\n🔄 Squeeze OFF（趨勢）→ 買 Call/Put 追方向\n📊 兩種行情都能應對，互補性最強",
+    }
+    st.info(OPT_STRAT_DESC.get(selected_opt_strat, ""))
+
     oc1, oc2, oc3 = st.columns(3)
     o_entry = oc1.slider("Entry Score", 50, 100, int(o_strategy.get("entry_score", 90)), 5, key="o_entry")
     o_sl = oc2.slider("Stop Loss %", 5, 50, int(o_risk.get("stop_loss_pct", 0.15) * 100), 5, key="o_sl")
     o_tp = oc3.slider("TP1 %", 30, 300, int(o_exit.get("tp1_pct", 1.2) * 100), 10, key="o_tp")
     oc4, oc5 = st.columns(2)
     o_lots = oc4.slider("Lots/Trade", 1, 3, int(o_risk.get("lots_per_trade", 1)), 1, key="o_lots")
+    o_max = oc5.slider("Max Positions", 0, 5, int(o_risk.get("max_positions", 2)), 1, key="o_max")
     o_force = oc5.checkbox("Force Close at End", value=options_cfg.get("modes", {}).get(options_cfg.get("active_mode", "V2"), {}).get("force_close_at_end", False), key="o_force")
 
     if st.button("✅ 套用參數", type="primary"):
@@ -478,6 +551,7 @@ with tab_settings:
         risk_cfg["allocation"].setdefault("options", {})["max_margin_pct"] = o_pct / 100
         save_yaml(RISK_CFG_PATH, risk_cfg)
         futures_cfg.setdefault("strategy", {})["entry_score"] = f_entry
+        futures_cfg.setdefault("strategy", {})["active_strategy"] = selected_strat
         futures_cfg.setdefault("risk_mgmt", {})["stop_loss_pts"] = f_sl
         futures_cfg.setdefault("strategy", {}).setdefault("partial_exit", {})["tp1_pts"] = f_tp
         futures_cfg.setdefault("trade_mgmt", {})["lots_per_trade"] = f_lots
@@ -487,6 +561,19 @@ with tab_settings:
         options_cfg.setdefault("risk_mgmt", {})["stop_loss_pct"] = o_sl / 100
         options_cfg.setdefault("exit_strategy", {})["tp1_pct"] = o_tp / 100
         options_cfg["risk_mgmt"]["lots_per_trade"] = o_lots
+        options_cfg["risk_mgmt"]["max_positions"] = o_max
+        # Save options strategy selection
+        if selected_opt_strat == "directional":
+            options_cfg.setdefault("theta_gang", {})["enabled"] = False
+        elif selected_opt_strat == "auto_regime":
+            options_cfg.setdefault("theta_gang", {})["enabled"] = True
+            options_cfg["theta_gang"]["auto_regime"] = True
+            options_cfg["theta_gang"]["strategy"] = "iron_condor"
+        else:
+            strat_map = {"theta_iron_condor": "iron_condor", "theta_bull_put": "bull_put_spread", "theta_bear_call": "bear_call_spread"}
+            options_cfg.setdefault("theta_gang", {})["enabled"] = True
+            options_cfg["theta_gang"]["auto_regime"] = False
+            options_cfg["theta_gang"]["strategy"] = strat_map.get(selected_opt_strat, "iron_condor")
         save_yaml(OPTIONS_CFG_PATH, options_cfg)
         st.toast("✅ 參數已套用，下一棒生效")
 
@@ -566,6 +653,10 @@ with st.sidebar:
     st.divider()
     st.write(f"期貨: {mode_badge(f_live)}")
     st.write(f"選擇權: {mode_badge(o_live)}")
+    st.write(f"策略: `{futures_cfg.get('strategy', {}).get('active_strategy', 'squeeze_breakout')}`")
+    _otg = options_cfg.get("theta_gang", {})
+    _olbl = "Auto Regime" if _otg.get("auto_regime") else (_otg.get("strategy", "directional") if _otg.get("enabled") else "Directional")
+    st.write(f"選擇權: `{_olbl}`")
     st.write(f"分配: 期貨 {alloc.get('futures', {}).get('max_margin_pct', 0)*100:.0f}% / 選擇權 {alloc.get('options', {}).get('max_margin_pct', 0)*100:.0f}%")
     st.divider()
     st.caption(f"📁 期貨: {FUTURES_MKT}")

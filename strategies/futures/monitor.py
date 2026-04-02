@@ -111,6 +111,7 @@ class FuturesMonitor:
         self.has_tp1_hit = False
         self.last_processed_bar = None
         self._last_entry_reason = None
+        self._safety_stop_trade = None  # Exchange-side safety stop order
 
     def _load_config(self, path):
         with open(path, encoding="utf-8") as f:
@@ -168,6 +169,51 @@ class FuturesMonitor:
         if cb:
             cb(exchange, tick)
 
+    # ── Safety Stop (exchange-side protection) ──
+    def _place_safety_stop(self, entry_price, direction, lots, stop_loss_pts):
+        """Place a far-limit order at exchange as safety stop for disconnect protection."""
+        if not self.live_trading or self.dry_run or not self.contract or not self.api:
+            return
+        try:
+            import shioaji as sj
+            # Safety stop is wider than strategy stop (2x) to avoid premature fills
+            safety_pts = stop_loss_pts * 2 if stop_loss_pts > 0 else 200
+            if direction == "LONG":
+                safety_price = entry_price - safety_pts
+                action = sj.constant.Action.Sell
+            else:
+                safety_price = entry_price + safety_pts
+                action = sj.constant.Action.Buy
+
+            order = self.api.Order(
+                price=safety_price,
+                quantity=lots,
+                action=action,
+                price_type=sj.constant.FuturesPriceType.LMT,
+                order_type=sj.constant.OrderType.ROD,
+                octype=sj.constant.FuturesOCType.Cover,
+                account=self.api.futopt_account,
+            )
+            trade = self.api.place_order(self.contract, order)
+            if trade and trade.status.status != sj.constant.Status.Failed:
+                self._safety_stop_trade = trade
+                console.print(f"[bold yellow]🛡️ Safety stop placed: {action.value} @ {safety_price:.0f} ({safety_pts:.0f}pts from entry)[/bold yellow]")
+            else:
+                console.print(f"[red]Safety stop failed to place[/red]")
+        except Exception as e:
+            console.print(f"[yellow]Safety stop error: {e}[/yellow]")
+
+    def _cancel_safety_stop(self):
+        """Cancel the exchange-side safety stop after normal exit."""
+        if not self._safety_stop_trade or not self.api:
+            return
+        try:
+            self.api.cancel_order(self._safety_stop_trade)
+            console.print(f"[dim]🛡️ Safety stop cancelled[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]Safety stop cancel error: {e}[/yellow]")
+        self._safety_stop_trade = None
+
     # ── Margin check ──
     def _margin_sufficient(self):
         """Check if account has enough margin before placing entry order."""
@@ -205,12 +251,15 @@ class FuturesMonitor:
                 if not self._margin_sufficient():
                     console.print(f"[red][FuturesMonitor] ⛔ 保證金不足，取消 {signal}[/red]")
                     return None
+            # 出場前先刪 safety stop，避免庫存不足
+            if signal in ("EXIT", "PARTIAL_EXIT"):
+                self._cancel_safety_stop()
             trade = self.client.place_order(self.contract, action=action, quantity=lots)
             if trade is None:
                 console.print(f"[red][FuturesMonitor] Live order failed: {signal} {lots}[/red]")
                 return None
 
-        # 計算 PnL（出場時）
+        # 計算 PnL（出場時，含手續費+稅金）
         pnl_pts = 0
         pnl_cash = 0
         direction = ""
@@ -222,11 +271,12 @@ class FuturesMonitor:
             direction = "LONG" if self.trader.position > 0 else "SHORT"
             sign = 1 if self.trader.position > 0 else -1
             pnl_pts = (price - self.trader.entry_price) * sign
-            pnl_cash = pnl_pts * self.trader.point_value * lots
+            gross = pnl_pts * self.trader.point_value * lots
+            fee = self.trader.fee_per_side * 2 * lots
+            exch_fee = self.trader.exchange_fee_per_side * 2 * lots
+            tax = (self.trader.entry_price + price) * self.trader.point_value * self.trader.tax_rate * lots
+            pnl_cash = gross - fee - exch_fee - tax
 
-        save_trade({"type": signal, "timestamp": ts, "price": price, "lots": lots,
-                    "direction": direction, "pnl_pts": round(pnl_pts, 1),
-                    "pnl_cash": round(pnl_cash, 0), "reason": reason or ""})
         if signal in ("BUY", "SELL"):
             self._last_entry_reason = reason
         result = self.trader.execute_signal(
@@ -234,14 +284,24 @@ class FuturesMonitor:
             max_lots=self.MGMT.get("max_positions", 2),
             stop_loss=stop_loss, break_even_trigger=break_even_trigger, exit_reason=reason,
         )
-        if result:
-            d = "🟢 BUY" if signal == "BUY" else "🔴 SELL" if signal == "SELL" else "⚪ EXIT"
-            console.print(f"[bold green][FuturesMonitor] [{ts}] {d} {lots} lots @ {price:.0f}  {result}[/bold green]")
-            if live_ready and send_email_notification:
-                send_email_notification(
-                    f"[TMF] {signal} {lots} lots @ {price:.0f}",
-                    f"{d} {lots} lots @ {price:.0f}\n{result}",
-                )
+        if not result:
+            return None
+        save_trade({"type": signal, "timestamp": ts, "price": price, "lots": lots,
+                    "direction": direction, "pnl_pts": round(pnl_pts, 1),
+                    "pnl_cash": round(pnl_cash, 0), "reason": reason or ""})
+        d = "🟢 BUY" if signal == "BUY" else "🔴 SELL" if signal == "SELL" else "⚪ EXIT"
+        console.print(f"[bold green][FuturesMonitor] [{ts}] {d} {lots} lots @ {price:.0f}  {result}[/bold green]")
+        # Safety stop management
+        if live_ready:
+            if signal in ("BUY", "SELL"):
+                direction = "LONG" if signal == "BUY" else "SHORT"
+                sl_pts = stop_loss if stop_loss else self.RISK.get("stop_loss_pts", 60)
+                self._place_safety_stop(price, direction, lots, sl_pts)
+            if send_email_notification:
+                    send_email_notification(
+                        f"[TMF] {signal} {lots} lots @ {price:.0f}",
+                        f"{d} {lots} lots @ {price:.0f}\n{result}",
+                    )
         return result
 
     def _check_stop_loss(self, ts, price):
@@ -257,9 +317,9 @@ class FuturesMonitor:
             pass
 
         if self.trader.position > 0 and self.trader.current_stop_loss and price <= self.trader.current_stop_loss:
-            return self._execute_trade("EXIT", self.trader.current_stop_loss, ts, abs(self.trader.position), reason="STOP_LOSS")
+            return self._execute_trade("EXIT", price, ts, abs(self.trader.position), reason="STOP_LOSS")
         if self.trader.position < 0 and self.trader.current_stop_loss and price >= self.trader.current_stop_loss:
-            return self._execute_trade("EXIT", self.trader.current_stop_loss, ts, abs(self.trader.position), reason="STOP_LOSS")
+            return self._execute_trade("EXIT", price, ts, abs(self.trader.position), reason="STOP_LOSS")
         return None
 
     def _detect_squeeze_failure(self, last_5m, df_5m):
@@ -331,7 +391,8 @@ class FuturesMonitor:
         
         # 修正：支援交易日邏輯，凌晨 5 點前算在前一天
         now = datetime.now()
-        date_str = (now - datetime.timedelta(days=1)).strftime('%Y%m%d') if now.hour < 5 else now.strftime('%Y%m%d')
+        from datetime import timedelta
+        date_str = (now - timedelta(days=1)).strftime('%Y%m%d') if now.hour < 5 else now.strftime('%Y%m%d')
         
         tag = "_DRY" if self.dry_run else ("_LIVE" if self.live_trading else "_PAPER")
         path = os.path.join(log_dir, f"{self.ticker}_{date_str}{tag}_indicators.csv")
@@ -383,7 +444,9 @@ class FuturesMonitor:
             try:
                 self._strategy_tick()
             except Exception as e:
+                import traceback; traceback.print_exc()
                 console.print(f"[red][FuturesMonitor] error: {e}[/red]")
+                print(f"[TRACEBACK] {traceback.format_exc()}", flush=True)
             time.sleep(self.POLL_INTERVAL)
 
     def stop(self):
@@ -487,6 +550,10 @@ class FuturesMonitor:
             self.cooldown_until -= 1
             return
 
+        # Prevent re-entering on the same bar
+        if self.last_processed_bar == timestamp and self.trader.position != 0:
+            return
+
         self.has_tp1_hit = False
         stop_loss_pts = self.RISK.get("stop_loss_pts", 60)
         if self.ATR_MULT > 0:
@@ -494,69 +561,50 @@ class FuturesMonitor:
             if atr_val > 0:
                 stop_loss_pts = atr_val * self.ATR_MULT
 
-        # Determine active mode: counter (mean-reversion) vs breakout
-        use_counter = False
-        if self.counter_enabled:
-            if self.counter_auto_regime:
-                use_counter = self._is_ranging_regime(df_5m)
-            else:
-                use_counter = True
+        # ── Pluggable entry strategy ──
+        from strategies.futures.entry_strategies import get_strategy
 
+        # Always track fires for counter mode
+        if self.counter_enabled:
+            self._detect_squeeze_failure(last_5m, df_5m)
+
+        # Counter mode (auto-regime override)
+        use_counter = self.counter_enabled and (
+            self._is_ranging_regime(df_5m) if self.counter_auto_regime else True
+        )
         if use_counter:
-            # ── Squeeze Failure Counter entry ──
             counter_signal = self._detect_squeeze_failure(last_5m, df_5m)
             if counter_signal:
                 atr_val = last_5m.get("atr", 0)
                 counter_sl = atr_val * self.counter_atr_sl_mult if atr_val > 0 else stop_loss_pts
                 lots = self.MGMT.get("lots_per_trade", 2)
                 be = self.RISK.get("break_even_pts", 50)
-                if counter_signal == "COUNTER_BUY" and self.MGMT.get("allow_long", True):
-                    console.print(f"[bold magenta]🔄 COUNTER BUY (failure reversal) SL={counter_sl:.1f}[/bold magenta]")
-                    self._execute_trade("BUY", last_price, timestamp, lots,
+                action = "BUY" if counter_signal == "COUNTER_BUY" else "SELL"
+                if self.MGMT.get(f"allow_{'long' if action == 'BUY' else 'short'}", True):
+                    console.print(f"[bold magenta]🔄 COUNTER {action} SL={counter_sl:.1f}[/bold magenta]")
+                    self._execute_trade(action, last_price, timestamp, lots,
                                         stop_loss=counter_sl, break_even_trigger=be, reason="COUNTER")
-                elif counter_signal == "COUNTER_SELL" and self.MGMT.get("allow_short", True):
-                    console.print(f"[bold magenta]🔄 COUNTER SELL (failure reversal) SL={counter_sl:.1f}[/bold magenta]")
-                    self._execute_trade("SELL", last_price, timestamp, lots,
-                                        stop_loss=counter_sl, break_even_trigger=be, reason="COUNTER")
-        else:
-            # ── Original Breakout entry ──
-            # Still track fires for counter even when not active (seamless switch)
-            if self.counter_enabled:
-                self._detect_squeeze_failure(last_5m, df_5m)
+                return
 
-            entry_score = self.STRATEGY.get("entry_score", 20)
-            sqz_buy = (not last_5m["sqz_on"]) and score >= entry_score and last_5m["mom_state"] >= 2
-            sqz_sell = (not last_5m["sqz_on"]) and score <= -entry_score and last_5m["mom_state"] <= 1
+        # Pluggable strategy from config
+        active = self.STRATEGY.get("active_strategy", "squeeze_breakout")
+        strategy_fn = get_strategy(active)
+        if not strategy_fn or self.trader.position != 0:
+            return
 
-            # Regime filter
-            if self.FILTER_MODE == "loose":
-                can_long = can_short = True
-            elif self.FILTER_MODE == "mid":
-                can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.998
-                can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.002
-                if last_5m.get("bullish_align", False):
-                    can_short = False
-                if last_5m.get("bearish_align", False):
-                    can_long = False
-            else:
-                can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.999
-                can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.001
-
-            trend = _check_trend_breakout_signal(df_5m, df_15m)
-            lots = self.MGMT.get("lots_per_trade", 2)
-            be = self.RISK.get("break_even_pts", 50)
-
-            entry_reason = ""
-            if sqz_buy and can_long and trend["trend_long"]: entry_reason = "SYNERGY"
-            elif sqz_buy and can_long: entry_reason = "SQUEEZE"
-            elif trend["trend_long"]: entry_reason = "BREAKOUT"
-            
-            if entry_reason and self.MGMT.get("allow_long", True):
-                self._execute_trade("BUY", last_price, timestamp, lots, stop_loss=stop_loss_pts, break_even_trigger=be, reason=entry_reason)
-            else:
-                if sqz_sell and can_short and trend["trend_short"]: entry_reason = "SYNERGY"
-                elif sqz_sell and can_short: entry_reason = "SQUEEZE"
-                elif trend["trend_short"]: entry_reason = "BREAKOUT"
-                
-                if entry_reason and self.MGMT.get("allow_short", True):
-                    self._execute_trade("SELL", last_price, timestamp, lots, stop_loss=stop_loss_pts, break_even_trigger=be, reason=entry_reason)
+        trend = _check_trend_breakout_signal(df_5m, df_15m)
+        market_state = {
+            "last_5m": last_5m, "last_15m": last_15m, "df_5m": df_5m,
+            "score": score, "stop_loss_pts": stop_loss_pts,
+            "trend": trend, "hour": datetime.now().hour,
+        }
+        signal = strategy_fn(market_state, self.cfg)
+        if signal:
+            action = signal["action"]
+            if self.MGMT.get(f"allow_{'long' if action == 'BUY' else 'short'}", True):
+                lots = self.MGMT.get("lots_per_trade", 2)
+                be = self.RISK.get("break_even_pts", 50)
+                console.print(f"[bold cyan]📌 [{active}] {action} reason={signal['reason']} SL={signal['stop_loss']:.1f}[/bold cyan]")
+                self._execute_trade(action, last_price, timestamp, lots,
+                                    stop_loss=signal["stop_loss"], break_even_trigger=be,
+                                    reason=signal["reason"])

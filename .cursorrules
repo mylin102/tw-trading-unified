@@ -1,0 +1,18 @@
+# Cursor Rules — tw-trading-unified
+
+You are working on a Taiwan futures + options trading system. Bugs cause real financial loss.
+
+## Mandatory
+- Read RULES.md before any change
+- Run `python3 -m pytest tests/ -v` before and after changes
+- Never write side effects (CSV, log) before validating the operation
+- PaperTrader.position is the single source of truth for position state
+- All PnL must include fees and tax
+- Stop loss >= 10 pts (covers round-trip cost)
+- Paper mode capital limit: 40,000 TWD
+
+## Don't
+- Don't use `from datetime import datetime` in files needing `datetime.timedelta`
+- Don't maintain position state in multiple places
+- Don't show gross PnL without deducting costs
+- Don't skip margin checks in paper mode

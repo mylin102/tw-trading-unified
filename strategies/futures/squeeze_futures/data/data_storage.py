@@ -32,7 +32,7 @@ class DataStorage:
         # 當前數據文件
         # 修正：支援交易日邏輯，凌晨 5 點前算在前一天
         now = datetime.now()
-        self.date_str = (now - datetime.timedelta(days=1)).strftime('%Y%m%d') if now.hour < 5 else now.strftime('%Y%m%d')
+        self.date_str = (now - __import__('datetime').timedelta(days=1)).strftime('%Y%m%d') if now.hour < 5 else now.strftime('%Y%m%d')
         
         self.market_file = self.market_dir / f"{ticker}_{self.date_str}_indicators.csv"
         self.trade_file = self.trade_dir / f"{ticker}_{self.date_str}_trades.json"

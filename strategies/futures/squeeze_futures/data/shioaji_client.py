@@ -193,7 +193,7 @@ class ShioajiClient:
             order = self.api.Order(
                 action=action_value, price=price, quantity=quantity,
                 order_type=sj.constant.OrderType.MTL,
-                price_type=sj.constant.FuturesPriceType.MKT if price == 0 else sj.constant.FuturesPriceType.LMT,
+                price_type=sj.constant.FuturesPriceType.MKP if price == 0 else sj.constant.FuturesPriceType.LMT,
                 market_type=sj.constant.FuturesMarketType.Night if datetime.now().hour >= 15 or datetime.now().hour < 5 else sj.constant.FuturesMarketType.Common,
                 account=self.api.futopt_account,
             )

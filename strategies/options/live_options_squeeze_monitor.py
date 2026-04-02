@@ -46,6 +46,19 @@ except ImportError:
     sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
     from options_engine.engine.greeks import black_scholes, calculate_dte, find_implied_volatility
 
+# QuantLib pricing engine (if configured)
+_use_quantlib = False
+try:
+    from options_engine.engine.greeks_ql import (
+        black_scholes as ql_black_scholes,
+        calculate_dte as ql_calculate_dte,
+        find_implied_volatility as ql_find_implied_volatility,
+    )
+    _use_quantlib = True
+    console.print("[bold green][pricing] QuantLib engine available[/bold green]")
+except ImportError:
+    console.print("[dim][pricing] QuantLib not available, using py_vollib[/dim]")
+
 console.print(f"[bold green][debug][/bold green] calculate_futures_squeeze imported from: [cyan]{calculate_futures_squeeze.__globals__.get('__file__')}[/cyan]")
 
 
@@ -116,10 +129,23 @@ class ShioajiOptionsSmartMonitor:
         self.pricing_cfg = self.full_cfg.get("pricing", {})
         self.max_spread_pct = self.execution_cfg.get("max_spread_pct", 0.05)
         self.paper_lots = self.full_cfg.get("risk_mgmt", {}).get("lots_per_trade", 2)
+        self.max_positions = self.full_cfg.get("risk_mgmt", {}).get("max_positions", self.paper_lots)
         self.fallback_underlying_price = float(self.strategy_cfg.get("fallback_underlying_price", 23000))
         self.monthly_delivery_min_days = int(self.strategy_cfg.get("monthly_delivery_min_days", 7))
         self.strike_rounding = int(self.pricing_cfg.get("strike_rounding", 100))
         self.risk_free_rate = float(self.pricing_cfg.get("risk_free_rate", 0.02))
+        # Select pricing engine
+        self._pricing_model = self.pricing_cfg.get("pricing_model", "black_scholes")
+        if self._pricing_model == "quantlib" and _use_quantlib:
+            self._bs = ql_black_scholes
+            self._iv = ql_find_implied_volatility
+            self._dte = ql_calculate_dte
+            console.print("[bold green][pricing] Using QuantLib engine[/bold green]")
+        else:
+            self._bs = black_scholes
+            self._iv = find_implied_volatility
+            self._dte = calculate_dte
+            console.print(f"[dim][pricing] Using py_vollib ({self._pricing_model})[/dim]")
         self.eod_panic_time = self._parse_hhmm(self.exit_opt.get("eod_panic_time", "13:30"))
         self.eod_passive_window_mins = int(self.exit_opt.get("eod_passive_window_mins", 20))
         self.shutdown_grace_mins = int(self.exit_opt.get("shutdown_grace_mins", 1))
@@ -142,9 +168,21 @@ class ShioajiOptionsSmartMonitor:
         self.cooldown_bars = int(self.strategy_cfg.get("cooldown_bars", 0))
         self.trailing_stop_pct = float(self.m_cfg.get("trailing_stop_pct", 0))
         self.last_signal = None
+
+        # ThetaGang (sell premium) integration
+        self._theta_gang = None
+        self._theta_cfg = self.full_cfg.get("theta_gang", {})
+        if self._theta_cfg.get("enabled", False):
+            try:
+                from theta_gang import ThetaGangManager
+                self._theta_gang = ThetaGangManager(self.full_cfg, self._bs, self.strike_rounding)
+                console.print(f"[bold cyan][ThetaGang] {self._theta_gang.strategy} enabled (auto_regime={self._theta_cfg.get('auto_regime', True)})[/bold cyan]")
+            except Exception as e:
+                console.print(f"[yellow][ThetaGang] init failed: {e}[/yellow]")
         self.last_status_print_at = None
         self.last_kbars_fetch_at = 0.0
         self.latest_score = 0.0
+        self.latest_iv = 0.25
         self.latest_mid_trend = ""
         self.loop_sleep_secs = 60
         self.status_print_secs = 300
@@ -522,11 +560,12 @@ class ShioajiOptionsSmartMonitor:
                 if self.market_data[key]["close"] <= 0 or key == "MTX":
                     self.market_data[key]["close"] = mid
 
-    def log_trade(self, action, side, price, note=""):
+    def log_trade(self, action, side, price, note="", quantity=None):
         pnl = 0
         point_value = self.pricing_cfg.get("point_value", 50)
+        qty = quantity or self.position or 1
         if "EXIT" in action and self.entry_price > 0:
-            pnl = round((price - self.entry_price) * point_value, 0)  # TXO point_value=50
+            pnl = round((price - self.entry_price) * point_value * qty, 0)
         # 從既有 ledger 累計 balance
         balance = 0
         if self.ledger_path.exists():
@@ -539,7 +578,7 @@ class ShioajiOptionsSmartMonitor:
         data = {
             "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "Mode": self.mode, "Action": action, "Side": side,
-            "Price": price, "Quantity": self.position or 1,
+            "Price": price, "Quantity": qty,
             "PnL": pnl, "Balance": balance, "Note": str(note).replace(",", ";"),
         }
         pd.DataFrame([data]).to_csv(self.ledger_path, mode='a', index=False, header=not self.ledger_path.exists())
@@ -653,21 +692,20 @@ class ShioajiOptionsSmartMonitor:
                 contract = self.active_contracts.get(calc_side)
                 strike = float(getattr(contract, "strike_price", resolve_option_strike(price_mtx, self.strike_rounding)))
                 delivery_date = getattr(contract, "delivery_date", None)
-                dte_years = float(calculate_dte(delivery_date) if delivery_date else 3.0 / 365.0)
+                dte_years = float(self._dte(delivery_date) if delivery_date else 3.0 / 365.0)
                 option_price = float(quote["mid"])
                 option_type = 'c' if calc_side == 'C' else 'p'
 
                 if option_price > 0 and strike > 0:
                     try:
-                        iv = float(implied_volatility(option_price, price_mtx, strike, dte_years, self.risk_free_rate, option_type))
-                        delta_val = float(delta(option_type, price_mtx, strike, dte_years, self.risk_free_rate, iv))
-                        gamma_val = float(gamma(option_type, price_mtx, strike, dte_years, self.risk_free_rate, iv))
-                        vega_val = float(vega(option_type, price_mtx, strike, dte_years, self.risk_free_rate, iv))
+                        iv = float(self._iv(option_price, price_mtx, strike, dte_years, self.risk_free_rate, option_type))
+                        res = self._bs(price_mtx, strike, dte_years, self.risk_free_rate, iv, option_type=calc_side)
+                        delta_val, gamma_val, vega_val = res["delta"], res["gamma"], res["vega"]
                     except Exception:
-                        res = black_scholes(price_mtx, strike, dte_years, self.risk_free_rate, 0.25, option_type=calc_side)
+                        res = self._bs(price_mtx, strike, dte_years, self.risk_free_rate, 0.25, option_type=calc_side)
                         iv, delta_val, gamma_val, vega_val = 0.25, res["delta"], res["gamma"], res["vega"]
                 elif strike > 0:
-                    res = black_scholes(price_mtx, strike, dte_years, self.risk_free_rate, 0.25, option_type=calc_side)
+                    res = self._bs(price_mtx, strike, dte_years, self.risk_free_rate, 0.25, option_type=calc_side)
                     iv, delta_val, gamma_val, vega_val = 0.25, res["delta"], res["gamma"], res["vega"]
             except Exception as e:
                 console.print(f"[red]Greeks calculation error:[/red] {e}")
@@ -685,6 +723,8 @@ class ShioajiOptionsSmartMonitor:
             "gamma": round(gamma_val, 6),
             "vega": round(vega_val, 4)
         }
+        if iv > 0:
+            self.latest_iv = iv
         pd.DataFrame([row]).to_csv(self.indicator_log_path, mode="a", index=False, header=not self.indicator_log_path.exists())
 
     def _fetch_today_futures_bars(self):
@@ -847,7 +887,7 @@ class ShioajiOptionsSmartMonitor:
                 elif side == "P" and not row.get("bearish_align", False):
                     side = None
 
-            signal = {"score": score, "side": side, "price_mtx": row["Close"], "mid_trend": mid_trend, "timestamp": timestamp}
+            signal = {"score": score, "side": side, "price_mtx": row["Close"], "mid_trend": mid_trend, "timestamp": timestamp, "squeeze_on": bool(row.get("sqz_on", False))}
             self.last_signal = signal
             self.replay_stats["signals"] += 1
             if side:
@@ -875,6 +915,9 @@ class ShioajiOptionsSmartMonitor:
         return True
 
     def enter_paper_position(self, side, signal):
+        if self.position > 0:
+            console.print(f"[yellow]⚠️ enter_paper_position blocked: already holding {self.position}x {self.active_side}[/yellow]")
+            return
         if not self._dte_allows_entry(side, now=signal.get("timestamp")):
             return
         if not self.spread_is_tradeable(side):
@@ -882,6 +925,8 @@ class ShioajiOptionsSmartMonitor:
         quote = self.current_option_quote(side)
         entry_price = quote["ask"]
         if entry_price <= 0:
+            return
+        if not self._paper_margin_check(entry_price):
             return
         self.position = self.paper_lots
         self.active_side = side
@@ -932,8 +977,9 @@ class ShioajiOptionsSmartMonitor:
     def exit_paper_position(self, action, price, note=""):
         if self.position <= 0 or not self.active_side:
             return
-        self.log_trade(action, self.active_side, price, note)
+        exit_qty = self.position
         self.position = 0
+        self.log_trade(action, self.active_side, price, note, quantity=exit_qty)
         self.active_side = None
         self.entry_price = 0.0
         self.entry_mtx_price = 0.0
@@ -1044,8 +1090,67 @@ class ShioajiOptionsSmartMonitor:
             console.print(f"[yellow]Margin check failed: {e} — allowing order[/yellow]")
             return True
 
+    def _paper_margin_check(self, entry_price):
+        """
+        Paper mode margin check — enforce capital limits.
+        Buyer: need premium × 50 × lots
+        Seller (spread): need wing_width × 50 × lots
+        """
+        risk_cfg = self.full_cfg.get("risk_mgmt", {})
+        initial_capital = float(risk_cfg.get("initial_capital", 40000))
+        reserve_pct = 0.20
+        available = initial_capital * (1 - reserve_pct)
+
+        # Adjust by realized PnL from ledger
+        if self.ledger_path.exists():
+            try:
+                prev = pd.read_csv(self.ledger_path)
+                realized_pnl = pd.to_numeric(prev["PnL"], errors="coerce").fillna(0).sum()
+                available = (initial_capital + realized_pnl) * (1 - reserve_pct)
+            except Exception:
+                pass
+
+        lots = self.paper_lots
+        required = entry_price * 50 * lots if entry_price > 0 else 10000 * lots
+
+        if available < required:
+            console.print(f"[red]⛔ Paper margin: available={available:.0f} < required={required:.0f} (capital={initial_capital:.0f})[/red]")
+            return False
+        console.print(f"[dim]Paper margin OK: available={available:.0f} >= required={required:.0f}[/dim]")
+        return True
+
     def _recover_position_from_api(self):
-        """Recover open position from broker API on restart to prevent duplicate entries."""
+        """Recover open position on restart. Live: from broker API. Paper: from ledger file."""
+        # Paper mode: check ledger for unclosed position
+        if not self.live_trading:
+            try:
+                import csv
+                ledger_path = self.ledger_path
+                if os.path.exists(ledger_path):
+                    with open(ledger_path) as f:
+                        rows = list(csv.DictReader(f))
+                    if rows:
+                        # Find last ENTRY, check no EXIT after it
+                        last_entry = None
+                        last_entry_idx = -1
+                        for i, r in enumerate(rows):
+                            if "ENTRY" in r.get("Action", ""):
+                                last_entry = r
+                                last_entry_idx = i
+                        if last_entry and last_entry_idx >= 0:
+                            has_exit_after = any("EXIT" in r.get("Action", "") or "PANIC" in r.get("Action", "") or "TRAIL" in r.get("Action", "") or "TIME" in r.get("Action", "") for r in rows[last_entry_idx + 1:])
+                            if not has_exit_after:
+                                self.position = int(last_entry.get("Quantity", 0))
+                                self.active_side = last_entry.get("Side")
+                                self.entry_price = float(last_entry.get("Price", 0))
+                                self.stop_loss_price = self.entry_price * (1 - self.stop_loss_pct)
+                                self.peak_premium = self.entry_price
+                                console.print(f"[bold cyan]♻️ Recovered paper position from ledger: {self.active_side} qty={self.position} @ {self.entry_price}[/bold cyan]")
+                                return
+            except Exception as e:
+                console.print(f"[yellow]Paper position recovery failed: {e}[/yellow]")
+            return
+        # Live mode: from broker API
         if not self.api:
             return
         try:
@@ -1092,9 +1197,11 @@ class ShioajiOptionsSmartMonitor:
             return False
 
         # 2. Trailing stop: 追蹤最高權利金，回落超過 trailing_stop_pct 就出場
+        #    浮盈 > 15% 即啟動 trailing，不需等 TP1
         if exit_price > self.peak_premium:
             self.peak_premium = exit_price
-        if self.trailing_stop_pct > 0 and self.has_tp1_hit and self.peak_premium > 0:
+        unrealized_pct = (self.peak_premium - self.entry_price) / self.entry_price if self.entry_price > 0 else 0
+        if self.trailing_stop_pct > 0 and (self.has_tp1_hit or unrealized_pct >= 0.15) and self.peak_premium > 0:
             trail_floor = self.peak_premium * (1 - self.trailing_stop_pct)
             if exit_price <= trail_floor:
                 reason = f"TRAILING_STOP peak={self.peak_premium:.1f} floor={trail_floor:.1f}"
@@ -1105,6 +1212,26 @@ class ShioajiOptionsSmartMonitor:
                 return True
         
         signal_score = signal["score"] if signal else (self.last_signal["score"] if self.last_signal else 999)
+
+        # 3. Score reversal exit: 趨勢翻轉立刻出場
+        #    買 P 時 score 很負，翻正超過 entry_score → 趨勢反轉
+        #    買 C 時 score 很正，翻負超過 entry_score → 趨勢反轉
+        if self.active_side == "P" and signal_score >= self.entry_score:
+            reason = f"SCORE_REVERSAL score={signal_score:.1f} (was bearish, now bullish)"
+            if self.live_trading:
+                self.exit_live_position("LIVE_REVERSAL_SUBMITTED", reason)
+            else:
+                self.exit_paper_position("PAPER_REVERSAL_EXIT", exit_price, reason)
+            return True
+        if self.active_side == "C" and signal_score <= -self.entry_score:
+            reason = f"SCORE_REVERSAL score={signal_score:.1f} (was bullish, now bearish)"
+            if self.live_trading:
+                self.exit_live_position("LIVE_REVERSAL_SUBMITTED", reason)
+            else:
+                self.exit_paper_position("PAPER_REVERSAL_EXIT", exit_price, reason)
+            return True
+
+        # 4. TP1 partial profit
         if should_take_partial_profit(self.position, self.has_tp1_hit, self.entry_price, exit_price, self.m_cfg["tp1_pct"]):
             if self.live_trading:
                 self.exit_live_position("LIVE_TP1_SUBMITTED", f"score={signal_score:.1f}", quantity=1)
@@ -1173,11 +1300,47 @@ class ShioajiOptionsSmartMonitor:
                             self.print_status_summary(signal, force=True)
                             return
 
-            if self.position == 0:
+            if self.position == 0 and self.position < self.max_positions:
                 if self.cooldown_until > 0:
                     self.cooldown_until -= 1
                     console.print(f"[dim]Cooldown: {self.cooldown_until} bars remaining[/dim]")
                 
+                # ThetaGang: sell premium when squeeze is on (ranging market)
+                if self._theta_gang and signal and self.cooldown_until <= 0:
+                    squeeze_on = signal.get("squeeze_on", False) if isinstance(signal, dict) else False
+                    auto_regime = self._theta_cfg.get("auto_regime", True)
+                    use_theta = (auto_regime and squeeze_on) or (not auto_regime)
+
+                    # Manage existing ThetaGang position
+                    if self._theta_gang.position and self._theta_gang.position.is_open:
+                        spot = float(self.market_data["MTX"]["close"])
+                        contract = self.active_contracts.get("C") or self.active_contracts.get("P")
+                        dte_years = float(self._dte(getattr(contract, "delivery_date", None))) if contract else 0.03
+                        iv = self.latest_iv or 0.25
+                        exit_info = self._theta_gang.evaluate_exit(spot, iv, dte_years, squeeze_on)
+                        if exit_info:
+                            pos = self._theta_gang.close_position()
+                            self.log_trade("THETA_EXIT", pos.strategy, exit_info["pnl"],
+                                           f"{exit_info['reason']} credit={pos.net_credit:.0f} pnl={exit_info['pnl']:.0f}")
+                            console.print(f"[bold yellow]🔻 [ThetaGang] EXIT {pos.strategy}: {exit_info['reason']} PnL={exit_info['pnl']:.0f}[/bold yellow]")
+                            self.cooldown_until = self.cooldown_bars
+                        return
+
+                    # Try ThetaGang entry
+                    if use_theta and not (self._theta_gang.position and self._theta_gang.position.is_open):
+                        spot = float(self.market_data["MTX"]["close"])
+                        contract = self.active_contracts.get("C") or self.active_contracts.get("P")
+                        dte_years = float(self._dte(getattr(contract, "delivery_date", None))) if contract else 0.03
+                        iv = self.latest_iv or 0.25
+                        entry_info = self._theta_gang.evaluate_entry(spot, iv, dte_years, squeeze_on)
+                        if entry_info:
+                            pos = self._theta_gang.open_position(entry_info)
+                            legs_str = " | ".join(f"{l.action} {l.side}{l.strike}" for l in pos.legs)
+                            self.log_trade("THETA_ENTRY", pos.strategy, 0,
+                                           f"credit={pos.net_credit:.0f} max_loss={pos.max_loss:.0f} [{legs_str}]")
+                            console.print(f"[bold cyan]🔺 [ThetaGang] ENTRY {pos.strategy}: credit={pos.net_credit:.0f} [{legs_str}][/bold cyan]")
+                            return
+
                 if signal and signal["side"]:
                     if self.cooldown_until > 0:
                         console.print(f"[dim]Signal {signal['side']} ignored during cooldown[/dim]")
