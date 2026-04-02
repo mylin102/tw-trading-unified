@@ -155,7 +155,7 @@ class FuturesMonitor:
             cb(exchange, tick)
 
     # ── Trade execution ──
-    def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, exit_reason=None):
+    def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, reason=None):
         action = None
         if signal == "BUY":
             action = "Buy"
@@ -189,11 +189,11 @@ class FuturesMonitor:
 
         save_trade({"type": signal, "timestamp": ts, "price": price, "lots": lots,
                     "direction": direction, "pnl_pts": round(pnl_pts, 1),
-                    "pnl_cash": round(pnl_cash, 0), "reason": exit_reason or ""})
+                    "pnl_cash": round(pnl_cash, 0), "reason": reason or ""})
         result = self.trader.execute_signal(
             signal, price, ts, lots=lots,
             max_lots=self.MGMT.get("max_positions", 2),
-            stop_loss=stop_loss, break_even_trigger=break_even_trigger, exit_reason=exit_reason,
+            stop_loss=stop_loss, break_even_trigger=break_even_trigger, exit_reason=reason,
         )
         if result:
             d = "🟢 BUY" if signal == "BUY" else "🔴 SELL" if signal == "SELL" else "⚪ EXIT"
@@ -207,9 +207,9 @@ class FuturesMonitor:
 
     def _check_stop_loss(self, ts, price):
         if self.trader.position > 0 and self.trader.current_stop_loss and price <= self.trader.current_stop_loss:
-            return self._execute_trade("EXIT", self.trader.current_stop_loss, ts, abs(self.trader.position), exit_reason="STOP_LOSS")
+            return self._execute_trade("EXIT", self.trader.current_stop_loss, ts, abs(self.trader.position), reason="STOP_LOSS")
         if self.trader.position < 0 and self.trader.current_stop_loss and price >= self.trader.current_stop_loss:
-            return self._execute_trade("EXIT", self.trader.current_stop_loss, ts, abs(self.trader.position), exit_reason="STOP_LOSS")
+            return self._execute_trade("EXIT", self.trader.current_stop_loss, ts, abs(self.trader.position), reason="STOP_LOSS")
         return None
 
     def _save_bar(self, row, score, regime):
@@ -310,7 +310,7 @@ class FuturesMonitor:
             if self.TP.get("enabled") and abs(self.trader.position) == self.MGMT.get("lots_per_trade", 2) and not self.has_tp1_hit:
                 pnl_pts = (last_price - self.trader.entry_price) * (1 if self.trader.position > 0 else -1)
                 if pnl_pts >= self.TP.get("tp1_pts", 50):
-                    msg = self._execute_trade("PARTIAL_EXIT", last_price, timestamp, self.TP.get("tp1_lots", 1), exit_reason="TP1")
+                    msg = self._execute_trade("PARTIAL_EXIT", last_price, timestamp, self.TP.get("tp1_lots", 1), reason="TP1")
                     if msg:
                         self.has_tp1_hit = True
                         self.trader.current_stop_loss = self.trader.entry_price
@@ -319,7 +319,7 @@ class FuturesMonitor:
             stop_msg = self._check_stop_loss(timestamp, last_price)
             if not stop_msg and self.RISK.get("exit_on_vwap"):
                 if (self.trader.position > 0 and last_price < vwap) or (self.trader.position < 0 and last_price > vwap):
-                    stop_msg = self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), exit_reason="VWAP")
+                    stop_msg = self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason="VWAP")
             if stop_msg:
                 self.has_tp1_hit = False
                 self.cooldown_until = self.cooldown_bars # 觸發停損/平倉後進入冷卻
@@ -360,7 +360,18 @@ class FuturesMonitor:
         lots = self.MGMT.get("lots_per_trade", 2)
         be = self.RISK.get("break_even_pts", 50)
 
-        if (sqz_buy and can_long or trend["trend_long"]) and self.MGMT.get("allow_long", True):
-            self._execute_trade("BUY", last_price, timestamp, lots, stop_loss=stop_loss_pts, break_even_trigger=be)
-        elif (sqz_sell and can_short or trend["trend_short"]) and self.MGMT.get("allow_short", True):
-            self._execute_trade("SELL", last_price, timestamp, lots, stop_loss=stop_loss_pts, break_even_trigger=be)
+        # 決定進場原因
+        entry_reason = ""
+        if sqz_buy and can_long and trend["trend_long"]: entry_reason = "SYNERGY"
+        elif sqz_buy and can_long: entry_reason = "SQUEEZE"
+        elif trend["trend_long"]: entry_reason = "BREAKOUT"
+        
+        if entry_reason and self.MGMT.get("allow_long", True):
+            self._execute_trade("BUY", last_price, timestamp, lots, stop_loss=stop_loss_pts, break_even_trigger=be, reason=entry_reason)
+        else:
+            if sqz_sell and can_short and trend["trend_short"]: entry_reason = "SYNERGY"
+            elif sqz_sell and can_short: entry_reason = "SQUEEZE"
+            elif trend["trend_short"]: entry_reason = "BREAKOUT"
+            
+            if entry_reason and self.MGMT.get("allow_short", True):
+                self._execute_trade("SELL", last_price, timestamp, lots, stop_loss=stop_loss_pts, break_even_trigger=be, reason=entry_reason)
