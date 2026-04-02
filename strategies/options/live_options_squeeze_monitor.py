@@ -629,8 +629,8 @@ class ShioajiOptionsSmartMonitor:
     def record_signal_snapshot(self, signal):
         # 即使沒有訊號也用即時報價算 Greeks
         iv, delta_val, gamma_val, vega_val = 0.0, 0.0, 0.0, 0.0
-        price_mtx = self.market_data["MTX"]["close"]
-        score = signal["score"] if signal else 0
+        price_mtx = float(self.market_data["MTX"]["close"])
+        score = float(signal["score"]) if signal else 0.0
         side_label = (signal["side"] or "") if signal else ""
         mid_trend = (signal["mid_trend"] or "") if signal else ""
 
@@ -639,18 +639,18 @@ class ShioajiOptionsSmartMonitor:
                 calc_side = (signal.get("side") if signal and signal.get("side") else "C")
                 quote = self.current_option_quote(calc_side)
                 contract = self.active_contracts.get(calc_side)
-                strike = getattr(contract, "strike_price", resolve_option_strike(price_mtx, self.strike_rounding))
+                strike = float(getattr(contract, "strike_price", resolve_option_strike(price_mtx, self.strike_rounding)))
                 delivery_date = getattr(contract, "delivery_date", None)
-                dte_years = calculate_dte(delivery_date) if delivery_date else 3.0 / 365.0
-                option_price = quote["mid"]
+                dte_years = float(calculate_dte(delivery_date) if delivery_date else 3.0 / 365.0)
+                option_price = float(quote["mid"])
                 option_type = 'c' if calc_side == 'C' else 'p'
 
                 if option_price > 0 and strike > 0:
                     try:
-                        iv = implied_volatility(option_price, price_mtx, strike, dte_years, self.risk_free_rate, option_type)
-                        delta_val = delta(option_type, price_mtx, strike, dte_years, self.risk_free_rate, iv)
-                        gamma_val = gamma(option_type, price_mtx, strike, dte_years, self.risk_free_rate, iv)
-                        vega_val = vega(option_type, price_mtx, strike, dte_years, self.risk_free_rate, iv)
+                        iv = float(implied_volatility(option_price, price_mtx, strike, dte_years, self.risk_free_rate, option_type))
+                        delta_val = float(delta(option_type, price_mtx, strike, dte_years, self.risk_free_rate, iv))
+                        gamma_val = float(gamma(option_type, price_mtx, strike, dte_years, self.risk_free_rate, iv))
+                        vega_val = float(vega(option_type, price_mtx, strike, dte_years, self.risk_free_rate, iv))
                     except Exception:
                         res = black_scholes(price_mtx, strike, dte_years, self.risk_free_rate, 0.25, option_type=calc_side)
                         iv, delta_val, gamma_val, vega_val = 0.25, res["delta"], res["gamma"], res["vega"]
@@ -665,6 +665,8 @@ class ShioajiOptionsSmartMonitor:
             "score": score,
             "side": side_label,
             "price_mtx": price_mtx,
+            "strike": strike,
+            "dte": round(dte_years * 365, 2),
             "mid_trend": mid_trend,
             "iv": round(iv, 4),
             "delta": round(delta_val, 4),

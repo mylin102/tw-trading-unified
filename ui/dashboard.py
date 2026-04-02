@@ -159,13 +159,18 @@ def make_pnl_chart(pnl_df, title):
     return fig
 @st.cache_data(ttl=5)
 def load_futures_indicators():
-    # 1. 優先找今天的檔案
-    for tag in ["", "_LIVE", "_PAPER"]:
+    # 1. 蒐集今天所有可能的檔案並合併
+    all_dfs = []
+    for tag in ["", "_LIVE", "_PAPER", "_DRY"]:
         f = FUTURES_MKT / f"TMF_{DATE_STR}{tag}_indicators.csv"
         if f.exists():
             try:
-                return filter_today(pd.read_csv(f))
+                all_dfs.append(pd.read_csv(f))
             except: pass
+    
+    if all_dfs:
+        merged = pd.concat(all_dfs).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+        return filter_today(merged)
     
     # 2. 備案：找目錄下最新的一個 CSV
     try:

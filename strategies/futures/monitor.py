@@ -222,7 +222,9 @@ class FuturesMonitor:
         path = os.path.join(log_dir, f"{self.ticker}_{date_str}{tag}_indicators.csv")
         
         data = {
-            "timestamp": [row.name], "close": [row["Close"]], "vwap": [row["vwap"]], "score": [score],
+            "timestamp": [row.name], 
+            "open": [row["Open"]], "high": [row["High"]], "low": [row["Low"]], "close": [row["Close"]], 
+            "vwap": [row["vwap"]], "score": [score],
             "sqz_on": [row["sqz_on"]], "mom_state": [row["mom_state"]], "regime": [regime],
             "bull_align": [row["bullish_align"]], "bear_align": [row["bearish_align"]],
             "in_pb_zone": [row.get("in_bull_pb_zone", False) or row.get("in_bear_pb_zone", False)],

@@ -8,6 +8,9 @@ def black_scholes(S, K, T, r, sigma, option_type='C'):
     S: 標的物價格, K: 履約價, T: 到期時間(年), r: 無風險利率, sigma: 隱含波動率
     返回: dict 包含 price, delta, gamma, theta, vega
     """
+    # 強制轉為 float，避免 decimal.Decimal 導致計算錯誤
+    S, K, T, r, sigma = float(S), float(K), float(T), float(r), float(sigma)
+    
     if S <= 0 or K <= 0 or sigma <= 0:
         price = max(0, S - K) if option_type == 'C' else max(0, K - S)
         return {
@@ -68,6 +71,7 @@ def black_scholes(S, K, T, r, sigma, option_type='C'):
 
 def find_implied_volatility(target_price, S, K, T, r, option_type='C'):
     """使用二分法尋找隱含波動率 (IV)"""
+    target_price, S, K, T, r = float(target_price), float(S), float(K), float(T), float(r)
     low, high = 0.0001, 5.0 # 擴大搜尋範圍到 500%
     for _ in range(30): # 增加疊代次數提升精度
         mid = (low + high) / 2
