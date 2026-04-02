@@ -89,100 +89,90 @@ def api_is_healthy(api):
 
 
 def run_system(dry_run=False):
-    """運行交易系統的主進入點，包含自動重連邏輯"""
-    restart_count = 0
-    
-    while restart_count < RESTART_RETRY_LIMIT:
-        api = None
-        try:
-            if not dry_run:
-                api = get_api()
-                console.print("[green]✅ Single Shioaji session established[/green]")
-            else:
-                console.print("[yellow]🔧 Dry-run — no broker login[/yellow]")
+    """運行交易系統，遇到斷線或重啟請求時結束進程，由外部腳本重新拉起"""
+    api = None
+    try:
+        if not dry_run:
+            api = get_api()
+            console.print("[green]✅ Single Shioaji session established[/green]")
+        else:
+            console.print("[yellow]🔧 Dry-run — no broker login[/yellow]")
 
-            from strategies.futures.monitor import FuturesMonitor
-            fm = FuturesMonitor(
-                api=api,
-                config_path=os.path.join(BASE, "config", "futures.yaml"),
-                dry_run=dry_run,
-            )
-            fm.setup()
+        from strategies.futures.monitor import FuturesMonitor
+        fm = FuturesMonitor(
+            api=api,
+            config_path=os.path.join(BASE, "config", "futures.yaml"),
+            dry_run=dry_run,
+        )
+        fm.setup()
 
-            from strategies.options.monitor import OptionsMonitor
-            om = OptionsMonitor(api=api, dry_run=dry_run)
+        from strategies.options.monitor import OptionsMonitor
+        om = OptionsMonitor(api=api, dry_run=dry_run)
 
-            # 先初始化 contracts，再訂閱
-            om.monitor.find_best_contracts()
-            om.monitor.pre_fill_bars()
+        # 先初始化 contracts，再訂閱
+        om.monitor.find_best_contracts()
+        om.monitor.pre_fill_bars()
 
-            if api is not None:
-                import shioaji as sj
-                api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om))
-                api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(om))
+        if api is not None:
+            import shioaji as sj
+            api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om))
+            api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(om))
 
-                # Subscribe TMF tick
-                if fm.contract is not None:
-                    api.quote.subscribe(fm.contract, quote_type='tick')
-                    console.print(f"[green]📡 Subscribed TMF tick: {fm.contract.code}[/green]")
+            # Subscribe TMF tick
+            if fm.contract is not None:
+                api.quote.subscribe(fm.contract, quote_type='tick')
+                console.print(f"[green]📡 Subscribed TMF tick: {fm.contract.code}[/green]")
 
-                # Subscribe options
-                for key in ["MTX", "C", "P"]:
-                    con = om.monitor.active_contracts.get(key)
-                    if con:
-                        api.quote.subscribe(con, quote_type='tick')
-                        api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
-                        console.print(f"[green]📡 Subscribed {key}: {con.code} (tick+bidask)[/green]")
+            # Subscribe options
+            for key in ["MTX", "C", "P"]:
+                con = om.monitor.active_contracts.get(key)
+                if con:
+                    api.quote.subscribe(con, quote_type='tick')
+                    api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
+                    console.print(f"[green]📡 Subscribed {key}: {con.code} (tick+bidask)[/green]")
 
-            ft = threading.Thread(target=fm.run, name="futures", daemon=True)
-            ot = threading.Thread(target=om.run, name="options", daemon=True)
-            ft.start()
-            ot.start()
-            console.print("[bold green]🚀 Both monitors running[/bold green]")
+        ft = threading.Thread(target=fm.run, name="futures", daemon=True)
+        ot = threading.Thread(target=om.run, name="options", daemon=True)
+        ft.start()
+        ot.start()
+        console.print("[bold green]🚀 Both monitors running[/bold green]")
 
-            startup_grace_until = time.time() + 60
-            health_check_at = time.time() + HEALTH_INTERVAL
+        startup_grace_until = time.time() + 60
+        health_check_at = time.time() + HEALTH_INTERVAL
 
-            while ft.is_alive() and ot.is_alive():
-                if RESTART_FLAG.exists():
-                    RESTART_FLAG.unlink()
-                    console.print("[bold yellow]🔄 Restart requested[/bold yellow]")
+        while ft.is_alive() and ot.is_alive():
+            if RESTART_FLAG.exists():
+                RESTART_FLAG.unlink()
+                console.print("[bold yellow]🔄 Restart requested. Exiting for external supervisor...[/bold yellow]")
+                break
+
+            now = time.time()
+            if not dry_run and now > startup_grace_until and now > health_check_at:
+                if not api_is_healthy(api):
+                    console.print("[red]💀 Shioaji session dead — exiting for external supervisor[/red]")
                     break
+                health_check_at = now + HEALTH_INTERVAL
+            time.sleep(2)
 
-                now = time.time()
-                if not dry_run and now > startup_grace_until and now > health_check_at:
-                    if not api_is_healthy(api):
-                        console.print("[red]💀 Shioaji session dead — restarting[/red]")
-                        break
-                    health_check_at = now + HEALTH_INTERVAL
-                time.sleep(2)
-
-        except Exception as exc:
-            console.print(f"[bold red]Critical crash: {exc}[/bold red]")
-        finally:
-            # 關閉流程：先停止策略 -> 再清除回調 -> 最後登出
-            try:
-                if 'fm' in locals(): fm.stop()
-                if 'om' in locals(): om.stop()
-                
-                if api is not None:
-                    # 取消訂閱所有合約，防止報價繼續噴發
-                    console.print("[dim]Cleaning up subscriptions...[/dim]")
-                    # Shioaji 沒提供簡單的 unsubscribe all，至少清掉回調
-                    api.quote.set_on_tick_fop_v1_callback(lambda ex, t: None)
-                    api.quote.set_on_bidask_fop_v1_callback(lambda ex, b: None)
-                
-                logout()
-                console.print("[green]Session logged out cleanly[/green]")
-            except Exception as e:
-                console.print(f"[dim]Cleanup error: {e}[/dim]")
+    except Exception as exc:
+        console.print(f"[bold red]Critical crash: {exc}[/bold red]")
+    finally:
+        # 關閉流程
+        try:
+            if 'fm' in locals(): fm.stop()
+            if 'om' in locals(): om.stop()
             
-            restart_count += 1
-            if restart_count < RESTART_RETRY_LIMIT:
-                console.print(f"[bold cyan]🔄 Re-starting in 15s (attempt {restart_count}/{RESTART_RETRY_LIMIT})...[/bold cyan]")
-                time.sleep(15)
-            else:
-                console.print("[bold red]❌ Max restart attempts reached. Stopping.[/bold red]")
+            if api is not None:
+                api.quote.set_on_tick_fop_v1_callback(lambda ex, t: None)
+                api.quote.set_on_bidask_fop_v1_callback(lambda ex, b: None)
+            
+            logout()
+            console.print("[green]Session logged out. Waiting 5s before exit...[/green]")
+            time.sleep(5) # 給 C++ 執行緒一點時間喘息
+        except Exception:
+            pass
+    
+    sys.exit(0)
 
 def main():
     parser = argparse.ArgumentParser()
