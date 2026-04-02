@@ -88,20 +88,19 @@ def filter_today(df, ts_col="timestamp"):
         df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
         df = df.dropna(subset=[ts_col])
         
-        # 取得資料中的最新日期，而不是硬用系統日期比對 (避免跨日數據斷層)
-        latest_date_in_df = df[ts_col].max().strftime("%Y-%m-%d")
-        filtered_df = df[df[ts_col].dt.strftime("%Y-%m-%d") == latest_date_in_df].copy()
-        
-        # 如果過濾後今天沒數據，回傳原始 df (至少讓使用者看到最後的資料)
-        if filtered_df.empty:
+        if df.empty:
             return df
-            
+
+        # 改進：自動抓取資料中的最新日期
+        latest_date = df[ts_col].dt.date.max()
+        filtered_df = df[df[ts_col].dt.date == latest_date].copy()
+        
         # 過濾 fallback 假資料
         for col in ["close", "price_mtx"]:
             if col in filtered_df.columns and len(filtered_df) > 1:
-                latest = filtered_df[col].iloc[-1]
-                if latest > 0:
-                    filtered_df = filtered_df[filtered_df[col] > latest * 0.5]
+                latest_val = filtered_df[col].iloc[-1]
+                if latest_val > 0:
+                    filtered_df = filtered_df[filtered_df[col] > latest_val * 0.5]
         return filtered_df
     except Exception as e:
         st.error(f"資料過濾錯誤: {e}")

@@ -83,6 +83,8 @@ class FuturesMonitor:
             "pb_buffer": self.PB.get("buffer", 1.002),
         }
         self.live_trading = self.cfg.get("live_trading", False)
+        self.cooldown_bars = self.STRATEGY.get("cooldown_bars", 3)
+        self.cooldown_until = 0
 
         # Trader
         self.trader = PaperTrader(
@@ -312,6 +314,7 @@ class FuturesMonitor:
                     if msg:
                         self.has_tp1_hit = True
                         self.trader.current_stop_loss = self.trader.entry_price
+                        self.cooldown_until = self.cooldown_bars  # 分批平倉也重置冷卻
 
             stop_msg = self._check_stop_loss(timestamp, last_price)
             if not stop_msg and self.RISK.get("exit_on_vwap"):
@@ -319,9 +322,14 @@ class FuturesMonitor:
                     stop_msg = self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), exit_reason="VWAP")
             if stop_msg:
                 self.has_tp1_hit = False
+                self.cooldown_until = self.cooldown_bars # 觸發停損/平倉後進入冷卻
             return  # don't enter same bar as exit
 
-        # 3. Entry logic
+        # 3. Entry logic (with cooldown check)
+        if self.cooldown_until > 0:
+            self.cooldown_until -= 1
+            return
+
         self.has_tp1_hit = False
         stop_loss_pts = self.RISK.get("stop_loss_pts", 60)
         if self.ATR_MULT > 0:

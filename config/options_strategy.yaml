@@ -2,7 +2,7 @@ active_mode: V2
 live_trading: false
 strategy:
   length: 20
-  entry_score: 80
+  entry_score: 60
   score_floor: 20
   regime_filter: mid
   use_opening_logic: true
