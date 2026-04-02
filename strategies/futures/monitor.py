@@ -264,13 +264,30 @@ class FuturesMonitor:
         # 1. Fetch multi-timeframe data
         processed = {}
         if not self.dry_run:
-            for tf in ["5m", "15m", "1h"]:
-                df = self.client.get_kline(self.ticker, interval=tf)
-                if not df.empty:
-                    processed[tf] = calculate_futures_squeeze(df, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+            # 優先使用內部的 tick_bars (如果已經累積足夠)
+            if hasattr(self, "_tick_bars") and len(self._tick_bars) >= 100:
+                df_base = self._tick_bars.copy()
+                processed["5m"] = calculate_futures_squeeze(df_base, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+                
+                # Resample for higher timeframes
+                for tf, rule in [("15m", "15min"), ("1h", "1h")]:
+                    res = df_base.resample(rule).agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
+                    if len(res) >= 20:
+                        processed[tf] = calculate_futures_squeeze(res, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+            
+            # 如果數據不足，才去調用 API (且限制頻率)
+            if "5m" not in processed:
+                try:
+                    if self.api and hasattr(self.api, "kbars"):
+                        df = self.client.get_kline(self.ticker, interval="5m")
+                        if not df.empty:
+                            processed["5m"] = calculate_futures_squeeze(df, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+                except Exception as e:
+                    console.print(f"[yellow][FuturesMonitor] api.kbars failed: {e}[/yellow]")
 
         # Fallback: use tick-built bars if kbars API returns empty
         if "5m" not in processed and hasattr(self, "_tick_bars") and len(self._tick_bars) >= 30:
+...
             df_tick = self._tick_bars.copy()
             processed["5m"] = calculate_futures_squeeze(df_tick, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
             if "15m" not in processed:

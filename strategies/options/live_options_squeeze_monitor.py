@@ -143,6 +143,7 @@ class ShioajiOptionsSmartMonitor:
         self.trailing_stop_pct = float(self.m_cfg.get("trailing_stop_pct", 0))
         self.last_signal = None
         self.last_status_print_at = None
+        self.last_kbars_fetch_at = 0.0
         self.latest_score = 0.0
         self.latest_mid_trend = ""
         self.loop_sleep_secs = 60
@@ -682,14 +683,26 @@ class ShioajiOptionsSmartMonitor:
     def _fetch_today_futures_bars(self):
         if self.dry_run:
             return self._build_dry_run_bars()
+        
+        # 增加頻率限制：每 5 分鐘才調用一次 kbars API
+        now_ts = time.time()
+        if now_ts - self.last_kbars_fetch_at < 300 and not self._mtx_tick_bars.empty:
+            return self._mtx_tick_bars.copy()
+
         if not hasattr(self.api, "kbars") or "MTX" not in self.active_contracts:
             return None
+        
+        # 確保 api.quote 對象存在且健康，避免 NoneType 錯誤
+        if not self.api.quote:
+            return None
+
         today = datetime.datetime.now()
         if today.hour < 5:
             today = today - datetime.timedelta(days=1)
         date_str = today.strftime("%Y-%m-%d")
         try:
             bars = self.api.kbars(self.active_contracts["MTX"], start=date_str, end=date_str)
+            self.last_kbars_fetch_at = now_ts
             frame = pd.DataFrame({**bars})
         except Exception as e:
             console.print(f"[red]Error fetching kbars:[/red] {e}")
