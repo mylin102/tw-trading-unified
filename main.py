@@ -78,18 +78,25 @@ def bidask_dispatcher(options_mon):
 
 
 def api_is_healthy(api):
-    """Quick check if Shioaji session is still usable."""
+    """Quick check if Shioaji session is still usable, with a small retry."""
     if api is None:
         return False
-    try:
-        api.list_positions(api.futopt_account)
-        return True
-    except Exception:
-        return False
+    for _ in range(2): # 兩次機會
+        try:
+            api.list_positions(api.futopt_account)
+            return True
+        except Exception:
+            time.sleep(1)
+    return False
 
 
 def run_system(dry_run=False):
     """運行交易系統，遇到斷線或重啟請求時結束進程，由外部腳本重新拉起"""
+    # 啟動時立即清除重啟旗標，避免循環重啟
+    if RESTART_FLAG.exists():
+        RESTART_FLAG.unlink()
+        console.print("[dim]Old restart flag cleared.[/dim]")
+
     api = None
     try:
         if not dry_run:
@@ -158,28 +165,36 @@ def run_system(dry_run=False):
         console.print(f"[bold red]Critical crash: {exc}[/bold red]")
     finally:
         # 關閉流程
+        console.print("[dim]Stopping monitors and threads...[/dim]")
         try:
             if 'fm' in locals(): fm.stop()
             if 'om' in locals(): om.stop()
+            
+            # 給予執行緒時間結束
+            if 'ft' in locals(): ft.join(timeout=5)
+            if 'ot' in locals(): ot.join(timeout=5)
             
             if api is not None:
                 api.quote.set_on_tick_fop_v1_callback(lambda ex, t: None)
                 api.quote.set_on_bidask_fop_v1_callback(lambda ex, b: None)
             
             logout()
-            console.print("[green]Session logged out. Waiting 5s before exit...[/green]")
-            time.sleep(5) # 給 C++ 執行緒一點時間喘息
-        except Exception:
-            pass
+            console.print("[green]Session logged out cleanly. Exiting...[/green]")
+        except Exception as e:
+            console.print(f"[dim]Cleanup error: {e}[/dim]")
     
-    sys.exit(0)
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Skip broker login entirely")
     args = parser.parse_args()
-    run_system(dry_run=args.dry_run)
-
+    try:
+        run_system(dry_run=args.dry_run)
+    except KeyboardInterrupt:
+        console.print("[yellow]Interrupted by user[/yellow]")
+        sys.exit(0)
+    except Exception as e:
+        console.print(f"[bold red]Unhandled exception in main: {e}[/bold red]")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

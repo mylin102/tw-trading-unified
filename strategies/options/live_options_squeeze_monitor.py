@@ -167,7 +167,14 @@ class ShioajiOptionsSmartMonitor:
         log_sub_dir = "live_trading" if self.live_trading else "paper_trading"
         # Use cwd-based path (main.py runs from tw-trading-unified root)
         log_base = Path(os.getcwd()) / "strategies" / "options" / "logs" / log_sub_dir
-        log_base.mkdir(parents=True, exist_ok=True)
+        try:
+            if log_base.exists() and not log_base.is_dir():
+                log_base.unlink()
+            log_base.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            if "File exists" not in str(e):
+                console.print(f"[yellow]Warning creating log path: {e}[/yellow]")
+        
         now = datetime.datetime.now()
         date_str = (now - datetime.timedelta(days=1)).strftime('%Y%m%d') if now.hour < 5 else now.strftime('%Y%m%d')
         self.indicator_log_path = log_base / f"OPTIONS_{date_str}_indicators.csv"

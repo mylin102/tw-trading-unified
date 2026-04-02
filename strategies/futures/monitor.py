@@ -287,7 +287,6 @@ class FuturesMonitor:
 
         # Fallback: use tick-built bars if kbars API returns empty
         if "5m" not in processed and hasattr(self, "_tick_bars") and len(self._tick_bars) >= 30:
-...
             df_tick = self._tick_bars.copy()
             processed["5m"] = calculate_futures_squeeze(df_tick, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
             if "15m" not in processed:

@@ -85,7 +85,8 @@ def filter_today(df, ts_col="timestamp"):
     try:
         # 統一處理：先轉字串，移除時區偏移 (+HH:MM) 或 UTC 標誌 (Z)
         df[ts_col] = df[ts_col].astype(str).str.replace(r"[+-]\d{2}:\d{2}$", "", regex=True).str.replace("Z", "")
-        df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+        # 強制轉為 datetime 且去時區 (naive)
+        df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce").dt.tz_localize(None)
         df = df.dropna(subset=[ts_col])
         
         if df.empty:
@@ -94,6 +95,9 @@ def filter_today(df, ts_col="timestamp"):
         # 改進：自動抓取資料中的最新日期
         latest_date = df[ts_col].dt.date.max()
         filtered_df = df[df[ts_col].dt.date == latest_date].copy()
+        
+        # 確保排序
+        filtered_df = filtered_df.sort_values(ts_col)
         
         # 過濾 fallback 假資料
         for col in ["close", "price_mtx"]:
@@ -109,12 +113,14 @@ def filter_today(df, ts_col="timestamp"):
 # ── Chart builder (unified style) ──
 def make_price_score_chart(df, price_col, title, ts_col="timestamp"):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
-    fig.add_trace(go.Scatter(x=df[ts_col], y=df[price_col], name=price_col, line=dict(width=1.5)), row=1, col=1)
+    # 再次確保繪圖時使用的是小寫欄位名 (應對 f_df 與 o_df)
+    p_col = price_col.lower() if price_col.lower() in df.columns else price_col
+    fig.add_trace(go.Scatter(x=df[ts_col], y=df[p_col], name=price_col, line=dict(width=1.5)), row=1, col=1)
     if "score" in df.columns:
         colors = ["#00cc66" if s >= 0 else "#ff4444" for s in df["score"]]
         fig.add_trace(go.Bar(x=df[ts_col], y=df["score"], name="Score", marker_color=colors), row=2, col=1)
     fig.update_layout(height=400, margin=dict(t=10, b=10, l=40, r=20), showlegend=False)
-    fig.update_xaxes(range=[df[ts_col].min(), df[ts_col].max()])
+    # 移除手動 range，讓 Plotly 自動縮放
     fig.update_yaxes(tickformat=",.0f")
     return fig
 
@@ -156,16 +162,36 @@ def make_pnl_chart(pnl_df, title):
     fig.add_hline(y=0, line_dash="dash", line_color="gray", line_width=0.5)
     fig.update_layout(height=250, margin=dict(t=10, b=10, l=40, r=20), title_text=title, title_font_size=14, yaxis_tickformat=",.0f")
     return fig
+
 @st.cache_data(ttl=5)
 def load_futures_indicators():
-    # 1. 蒐集今天所有可能的檔案並合併
+    def _read_and_standardize(path):
+        try:
+            df = pd.read_csv(path)
+            # 1. 處理 timestamp
+            if "timestamp" not in df.columns:
+                if df.index.name == "timestamp" or df.index.name == "ts":
+                    df = df.reset_index()
+                elif "ts" in df.columns:
+                    df = df.rename(columns={"ts": "timestamp"})
+                else:
+                    df = df.rename(columns={df.columns[0]: "timestamp"})
+            
+            # 2. 統一 OHLC 欄位為小寫
+            col_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+            df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+            return df
+        except:
+            return None
+
+    # 1. 優先找今天所有可能的檔案並合併
     all_dfs = []
     for tag in ["", "_LIVE", "_PAPER", "_DRY"]:
         f = FUTURES_MKT / f"TMF_{DATE_STR}{tag}_indicators.csv"
         if f.exists():
-            try:
-                all_dfs.append(pd.read_csv(f))
-            except: pass
+            df = _read_and_standardize(f)
+            if df is not None:
+                all_dfs.append(df)
     
     if all_dfs:
         merged = pd.concat(all_dfs).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
@@ -176,7 +202,8 @@ def load_futures_indicators():
         all_files = list(FUTURES_MKT.glob("TMF_*_indicators.csv"))
         if all_files:
             latest_file = max(all_files, key=os.path.getmtime)
-            return filter_today(pd.read_csv(latest_file))
+            df = _read_and_standardize(latest_file)
+            return filter_today(df) if df is not None else None
     except:
         pass
     return None
@@ -261,8 +288,11 @@ with tab_overview:
         if f_df is not None and not f_df.empty:
             last = f_df.iloc[-1]
             c1, c2, c3 = st.columns(3)
-            c1.metric("Close", f"{last.get('close', 0):.0f}")
-            c2.metric("Score", f"{last.get('score', 0):.1f}")
+            # 兼容大小寫
+            cl_val = last.get('close') if 'close' in last else last.get('Close', 0)
+            sc_val = last.get('score', 0)
+            c1.metric("Close", f"{cl_val:.0f}")
+            c2.metric("Score", f"{sc_val:.1f}")
             c3.metric("Bars", len(f_df))
         else:
             st.info("無期貨指標數據")
@@ -294,7 +324,9 @@ with tab_overview:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     has_data = False
     if f_df is not None and not f_df.empty:
-        fig.add_trace(go.Scatter(x=f_df["timestamp"], y=f_df["close"], name="TMF", line=dict(color="#1f77b4", width=1.5)), secondary_y=False)
+        # 兼容大小寫
+        f_close = f_df["close"] if "close" in f_df.columns else f_df["Close"]
+        fig.add_trace(go.Scatter(x=f_df["timestamp"], y=f_close, name="TMF", line=dict(color="#1f77b4", width=1.5)), secondary_y=False)
         has_data = True
     if o_df is not None and not o_df.empty and "price_mtx" in o_df.columns:
         fig.add_trace(go.Scatter(x=o_df["timestamp"], y=o_df["price_mtx"], name="MTX (Options)", line=dict(color="#ff7f0e", width=1.5)), secondary_y=True)
@@ -303,13 +335,6 @@ with tab_overview:
         fig.update_layout(height=350, margin=dict(t=10, b=10, l=40, r=20), legend=dict(orientation="h", y=1.02))
         fig.update_yaxes(title_text="TMF", tickformat=",.0f", secondary_y=False)
         fig.update_yaxes(title_text="MTX", tickformat=",.0f", secondary_y=True)
-        # X 軸自動適應資料範圍
-        all_ts = pd.concat([
-            f_df["timestamp"] if f_df is not None and not f_df.empty else pd.Series(dtype="datetime64[ns]"),
-            o_df["timestamp"] if o_df is not None and not o_df.empty else pd.Series(dtype="datetime64[ns]"),
-        ])
-        if not all_ts.empty:
-            fig.update_xaxes(range=[all_ts.min(), all_ts.max()])
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("等待數據...")
@@ -343,8 +368,11 @@ with tab_futures:
     if f_df is not None and not f_df.empty:
         last = f_df.iloc[-1]
         fc1, fc2, fc3, fc4 = st.columns(4)
-        fc1.metric("Close", f"{last.get('close', 0):.0f}")
-        fc2.metric("Score", f"{last.get('score', 0):.1f}")
+        # 兼容大小寫
+        cl_val = last.get('close') if 'close' in last else last.get('Close', 0)
+        sc_val = last.get('score', 0)
+        fc1.metric("Close", f"{cl_val:.0f}")
+        fc2.metric("Score", f"{sc_val:.1f}")
         bull = last.get("bull_align", False)
         bear = last.get("bear_align", False)
         trend = "🟢 多頭排列" if bull else ("🔴 空頭排列" if bear else "⚪ 中性")
