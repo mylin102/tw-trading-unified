@@ -478,3 +478,126 @@ class TestIsolation:
 - [ ] 匯出 CSV 可下載
 - [ ] 盤中執行回測不影響 monitor 交易
 - [ ] `python3 -m pytest tests/test_backtest_runner.py -v` 全部通過
+
+---
+
+## 回測結果 → Live 策略導入流程
+
+### UI 流程
+
+```
+Tab 3 參數掃描結果：
+
+┌─ 熱力圖 ──────────────────────────────────────────────┐
+│  ATR Mult                                              │
+│       1.5    2.0    3.0    4.0                         │
+│  10 │ -5K │  +2K │ +13K │  +8K                        │
+│  20 │ -3K │  +5K │★+15K │ +10K   ← 點擊任一格         │
+│  30 │ -8K │  +1K │  +9K │  +6K                        │
+│  40 │-12K │  -4K │  +3K │  +1K                        │
+└────────────────────────────────────────────────────────┘
+
+點擊 ★ 後展開：
+┌─ 套用設定 ─────────────────────────────────────────────┐
+│                                                        │
+│  策略: squeeze_breakout                                │
+│  ATR Mult: 3.0  (現有: 1.5)                           │
+│  Entry Score: 20  (現有: 20) ✓ 相同                    │
+│  VWAP Exit: False  (現有: True) ⚠️ 不同                │
+│                                                        │
+│  回測績效: PF=2.21  Win%=8.3%  MaxDD=-11%             │
+│  ⚠️ 注意：回測績效不代表未來表現                         │
+│  ⚠️ 數據期間：2026-04-02 夜盤（僅 1 晚）               │
+│                                                        │
+│  [✅ 套用到 PAPER]  [🔴 套用到 LIVE（需確認）]          │
+│                                                        │
+└────────────────────────────────────────────────────────┘
+```
+
+### 套用邏輯
+
+```python
+# ui/backtest_dashboard.py 中的套用按鈕
+
+def apply_params_to_config(strategy, params, target="paper"):
+    """
+    將回測最佳參數寫入 config，不需重啟。
+    
+    Preconditions:
+      - params 已通過回測驗證
+      - target in ("paper", "live")
+    
+    Postconditions:
+      - config/futures.yaml 更新
+      - monitor 下一個 tick cycle 自動讀取新參數
+    """
+    cfg = load_yaml(FUTURES_CFG_PATH)
+    
+    # 1. 切換策略
+    cfg["strategy"]["active_strategy"] = strategy
+    
+    # 2. 更新策略專屬參數
+    param_map = {
+        "atr_mult": ("risk_mgmt", "atr_multiplier"),
+        "entry_score": ("strategy", "entry_score"),
+        "exit_on_vwap": ("risk_mgmt", "exit_on_vwap"),
+        "stop_loss_pts": ("risk_mgmt", "stop_loss_pts"),
+    }
+    for key, (section, field) in param_map.items():
+        if key in params:
+            cfg.setdefault(section, {})[field] = params[key]
+    
+    # 3. 策略子參數（trend_follow, vwap_bounce 等）
+    strat_params = {k: v for k, v in params.items() if k not in param_map}
+    if strat_params:
+        cfg.setdefault("strategy", {}).setdefault(strategy, {}).update(strat_params)
+    
+    save_yaml(FUTURES_CFG_PATH, cfg)
+    
+    # 4. 記錄變更歷史
+    log_param_change(strategy, params, source="backtest_sweep")
+```
+
+### 安全機制
+
+| 層級 | 機制 |
+|------|------|
+| 顯示差異 | 套用前顯示「現有 vs 新值」對比 |
+| 警告標語 | 回測期間太短（< 5 天）顯示警告 |
+| PAPER 優先 | 預設只套用到 PAPER，LIVE 需二次確認 |
+| 變更日誌 | 每次套用記錄到 `logs/param_changes.csv` |
+| 一鍵還原 | 記錄套用前的舊參數，可一鍵 rollback |
+
+### 變更日誌格式
+
+```csv
+# logs/param_changes.csv
+timestamp,source,strategy,param,old_value,new_value,backtest_pf,backtest_period
+2026-04-03 04:50,backtest_sweep,squeeze_breakout,atr_multiplier,1.5,3.0,2.21,20260402_night
+2026-04-03 04:50,backtest_sweep,squeeze_breakout,exit_on_vwap,true,false,2.21,20260402_night
+```
+
+### 完整流程圖
+
+```
+回測掃描
+    │
+    ▼
+找到最佳參數 (PF=2.21, ATR=3.0)
+    │
+    ▼
+用戶點擊「套用到 PAPER」
+    │
+    ├─ 1. 顯示差異對比 + 警告
+    ├─ 2. 用戶確認
+    ├─ 3. 寫入 config/futures.yaml
+    ├─ 4. 記錄到 param_changes.csv
+    ├─ 5. Toast: "✅ 已套用，下一根 bar 生效"
+    │
+    ▼
+Monitor 下一個 tick cycle
+    │
+    ├─ 讀取 config → active_strategy = squeeze_breakout
+    ├─ 讀取 config → atr_multiplier = 3.0
+    └─ 用新參數產生信號
+```
