@@ -117,7 +117,7 @@ def price_spread(legs, bs_fn, spot, r, sigma, dte_years):
 
     net_credit = total_credit - total_debit
 
-    # Max loss for spreads
+    # Max loss for spreads: take the wider side only (not sum)
     strikes_by_side = {}
     for leg in legs:
         strikes_by_side.setdefault(leg.side, []).append(leg.strike)
@@ -126,9 +126,8 @@ def price_spread(legs, bs_fn, spot, r, sigma, dte_years):
     for side, strikes in strikes_by_side.items():
         if len(strikes) >= 2:
             width = abs(max(strikes) - min(strikes))
-            max_loss += width - net_credit / len(strikes_by_side)
-        else:
-            max_loss = float('inf')  # naked
+            max_loss = max(max_loss, width)  # take wider side
+    max_loss = max_loss - net_credit if max_loss > 0 else float('inf')
 
     return net_credit, max_loss, details
 

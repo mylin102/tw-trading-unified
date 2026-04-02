@@ -133,8 +133,8 @@ def strategy_night_short_only(state, cfg):
     score = state["score"]
     hour = state["hour"]
 
-    # Only active during night session
-    if not (hour >= 15 or hour < 5):
+    # Only active during night session, stop 30 min before close
+    if not (hour >= 15 or hour < 4):
         return None
 
     if not last_5m["sqz_on"] and score <= -min_score and last_5m.get("bearish_align"):
@@ -175,9 +175,10 @@ def strategy_volume_reversal(state, cfg):
     vol_bar2 = v[-3]
     vol_bar3 = v[-4]
 
-    # Long: green→red→red with high volume, price > SMA
+    # Long: green→red→red with high volume vs 20-bar MA, price > SMA
+    vol_ma = df["Volume"].rolling(20).mean().values[-1] if len(df) >= 20 else vol_bar3
     if bar3_green and bar2_red and bar1_red:
-        if vol_bar1 > vol_bar3 * vol_mult and vol_bar2 > vol_bar3 * vol_mult:
+        if vol_bar1 > vol_ma * vol_mult and vol_bar2 > vol_ma * vol_mult:
             if c[-1] > sma[-1]:
                 return {"action": "BUY", "reason": "VOL_REVERSAL", "stop_loss": sl}
 
@@ -186,7 +187,7 @@ def strategy_volume_reversal(state, cfg):
     bar2_green = c[-3] > o[-3]
     bar1_green = c[-2] > o[-2]
     if bar3_red and bar2_green and bar1_green:
-        if vol_bar1 > vol_bar3 * vol_mult and vol_bar2 > vol_bar3 * vol_mult:
+        if vol_bar1 > vol_ma * vol_mult and vol_bar2 > vol_ma * vol_mult:
             if c[-1] < sma[-1]:
                 return {"action": "SELL", "reason": "VOL_REVERSAL", "stop_loss": sl}
     return None
