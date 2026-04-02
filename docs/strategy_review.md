@@ -16,7 +16,10 @@
 - 🟡 **期貨策略有效能優化空間** (MTF alignment 重複計算)
 - 🟢 **多數策略符合指南標準** (MTF 對齊、regime 過濾)
 
-**綜合評分**: 6.4/10
+**審查狀態**:
+- ✅ 已採納：ThetaGang max_loss 修復、Night Short 04:00 截止、Volume Reversal MA 基準
+- ⏳ 待做：Momentum Burst Z-score、Trend Follow trailing stop、Cumulative Delta 價格加權
+- ❌ 不採納：倖存者偏差、Delta 中性監控、滑價模擬、主觀評分
 
 ---
 
@@ -51,15 +54,12 @@ trend = self._check_trend_breakout_signal(self.df_5m.iloc[:-1], self.df_15m.iloc
 ```
 
 ```python
-# 缺陷 2: 倖存者偏差 (Survivorship Bias)
+# 缺陷 2: 倖存者偏差 (Survivorship Bias) — ❌ 不採納
 contract = api.Contracts.Futures.TMF  # 只取最近月份
 # 問題：換月時可能產生跳空缺口，回測結果過於樂觀
+# 備註：TMF 自動換月，此問題不存在
 
-# 修復建議:
-def roll_contract(current_contract, next_contract):
-    if current_contract.delivery_date - datetime.now() < timedelta(days=7):
-        return next_contract
-    return current_contract
+# 修復建議: 不需要修復
 ```
 
 **⚠️ 效能問題 (B 類)**:
@@ -92,10 +92,10 @@ if bar_updated:
 - 3x ATR 寬停損給予趨勢發展空間
 - 強動能過濾 (`bullish_align`/`bearish_align`)
 
-**❌ 邏輯缺陷**:
+**❌ 邏輯缺陷 — ⏳ 待做**:
 
 ```python
-# 缺陷：無退出機制
+# 缺陷：無退出機制 — ⏳ 待做
 def strategy_trend_follow(state, cfg):
     if not last_5m["sqz_on"] and score >= min_score and ema_bullish...
         return {"action": "BUY", "reason": "TREND_FOLLOW", "stop_loss": sl}
@@ -156,10 +156,10 @@ if volume_cumsum < min_volume:
 - 無 regime 過濾，任何市況都可交易
 - 參數簡單 (`min_velocity`、`atr_mult`)
 
-**❌ 邏輯缺陷**:
+**❌ 邏輯缺陷 — ⏳ 待做**:
 
 ```python
-# 問題：velocity 閾值固定，沒有動態調整
+# 問題：velocity 閾值固定，沒有動態調整 — ⏳ 待做
 if fired and abs(mom_velo) >= min_velo:
 
 # 修復建議 (Z-score 標準化):

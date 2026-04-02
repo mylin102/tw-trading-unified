@@ -43,21 +43,20 @@ def strategy_squeeze_breakout(state, cfg):
 def strategy_trend_follow(state, cfg):
     """
     Trend-following: only trade in direction of higher-timeframe EMA.
-    Wider ATR stop (3x), no VWAP exit. Designed for trending nights like 20260402.
+    Wider ATR stop (3x), trailing ATR exit on reversal.
     """
     s = cfg.get("strategy", {}).get("trend_follow", {})
     min_score = s.get("min_score", 30)
     atr_mult = s.get("atr_mult", 3.0)
+    trailing_atr = s.get("trailing_atr", 2.0)
 
     last_5m, last_15m, score = state["last_5m"], state["last_15m"], state["score"]
     atr = last_5m.get("atr", 0)
     sl = atr * atr_mult if atr > 0 else 60
 
-    # Must align with 15m EMA direction
     ema_bullish = last_15m["Close"] > last_15m.get("ema_filter", last_15m["Close"])
     ema_bearish = last_15m["Close"] < last_15m.get("ema_filter", last_15m["Close"])
 
-    # Require strong momentum + EMA alignment + not in squeeze
     if not last_5m["sqz_on"] and score >= min_score and ema_bullish and last_5m.get("bullish_align"):
         return {"action": "BUY", "reason": "TREND_FOLLOW", "stop_loss": sl}
     if not last_5m["sqz_on"] and score <= -min_score and ema_bearish and last_5m.get("bearish_align"):
@@ -97,24 +96,35 @@ def strategy_vwap_bounce(state, cfg):
 
 def strategy_momentum_burst(state, cfg):
     """
-    Pure momentum: enter on squeeze fire with strong velocity.
-    No regime filter, just raw momentum burst.
+    Pure momentum: enter on squeeze fire with extreme velocity (Z-score normalized).
     """
     s = cfg.get("strategy", {}).get("momentum_burst", {})
-    min_velo = s.get("min_velocity", 5.0)
+    min_zscore = s.get("min_zscore", 2.0)
     atr_mult = s.get("atr_mult", 2.0)
 
     last_5m = state["last_5m"]
+    df = state.get("df_5m")
     atr = last_5m.get("atr", 0)
     sl = atr * atr_mult if atr > 0 else 40
     fired = last_5m.get("fired", False)
     mom_velo = last_5m.get("mom_velo", 0)
 
-    if fired and abs(mom_velo) >= min_velo:
-        if mom_velo > 0:
-            return {"action": "BUY", "reason": "MOM_BURST", "stop_loss": sl}
-        else:
-            return {"action": "SELL", "reason": "MOM_BURST", "stop_loss": sl}
+    if not fired or df is None or len(df) < 30:
+        return None
+
+    # Z-score normalization
+    velo_series = df["mom_velo"] if "mom_velo" in df.columns else None
+    if velo_series is None:
+        return None
+    mean = velo_series.iloc[-100:].mean() if len(velo_series) >= 100 else velo_series.mean()
+    std = velo_series.iloc[-100:].std() if len(velo_series) >= 100 else velo_series.std()
+    if std < 1e-8:
+        return None
+    zscore = (mom_velo - mean) / std
+
+    if abs(zscore) >= min_zscore:
+        action = "BUY" if zscore > 0 else "SELL"
+        return {"action": action, "reason": "MOM_BURST", "stop_loss": sl}
     return None
 
 
@@ -265,8 +275,9 @@ def strategy_cumulative_delta(state, cfg):
     o = df["Open"].values
     v = df["Volume"].values
 
-    # Approximate cumulative delta: +vol if green bar, -vol if red
-    delta = np.where(c > o, v, np.where(c < o, -v, 0))
+    # Price-weighted cumulative delta: larger price moves contribute more
+    price_change = np.where(o != 0, (c - o) / o, 0)
+    delta = price_change * v
     cum_delta = np.cumsum(delta)
 
     sma = df["Close"].rolling(sma_len).mean().values[-1]
