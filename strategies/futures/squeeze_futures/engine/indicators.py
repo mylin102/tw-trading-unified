@@ -76,81 +76,41 @@ def _pandas_ta_squeeze(
 
 
 def calculate_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    """
-    計算 ATR (Average True Range)
-
-    Args:
-        df: 包含 High, Low, Close 的 DataFrame
-        length: ATR 計算週期，預設 14
-
-    Returns:
-        ATR Series
-    """
+    """計算 ATR (Average True Range)"""
     if df.empty or len(df) < length:
-        return pd.Series(index=df.index, dtype=float)
-
-    return _true_range(df).rolling(window=length).mean()
+        return pd.Series(0.0, index=df.index)
+    return _true_range(df).rolling(window=length, min_periods=length).mean()
 
 
 def calculate_futures_squeeze(
     df: pd.DataFrame,
-    bb_length=14,
-    bb_std=2.0,
-    kc_length=14,
-    kc_scalar=1.5,
-    ema_fast=20,
-    ema_slow=60,
-    lookback=60,
-    pb_buffer=1.002,
-    ema_macro=200,
+    bb_length: int = 20,
+    bb_std: float = 2.0,
+    kc_length: int = 20,
+    kc_scalar: float = 1.5,
+    pb_buffer: float = 1.002,
+    ema_fast: int = 12,
+    ema_slow: int = 36,
+    ema_macro: int = 200,
 ) -> pd.DataFrame:
     """
-    包含 Squeeze、雙向回測、環境過濾及開盤法判定的指標計算。
+    計算完整的期貨 Squeeze + 趨勢指標
     """
-    df = df.copy()
-    if df.empty:
-        return df
+    if len(df) < bb_length:
+        return pd.DataFrame()
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(-1)
-    df.columns = [c.capitalize() for c in df.columns]
-
-    min_required = max(bb_length, ema_slow, lookback, ema_macro)
-    if len(df) < min_required:
-        df["sqz_on"] = False
-        df["momentum"] = 0.0
-        df["vwap"] = df["Close"]
-        df["price_vs_vwap"] = 0.0
-        df["fired"] = False
-        df["mom_prev"] = 0.0
-        df["mom_state"] = 1
-        df["ema_fast"] = df["Close"]
-        df["ema_slow"] = df["Close"]
-        df["ema_filter"] = df["Close"]
-        df["ema_macro"] = df["Close"]
-        df["bullish_align"] = False
-        df["bearish_align"] = False
-        df["recent_high"] = df["Close"]
-        df["recent_low"] = df["Close"]
-        df["is_new_high"] = False
-        df["is_new_low"] = False
-        df["in_bull_pb_zone"] = False
-        df["in_bear_pb_zone"] = False
-        df["day_open"] = df["Open"]
-        df["day_min"] = df["Low"]
-        df["day_max"] = df["High"]
-        df["opening_bullish"] = False
-        df["opening_bearish"] = False
-        return df
-
-    try:
+    if ta:
         sqz_on, momentum = _pandas_ta_squeeze(df, bb_length, bb_std, kc_length, kc_scalar)
-    except Exception:
+    else:
         sqz_on, momentum = _fallback_squeeze(df, bb_length, bb_std, kc_length, kc_scalar)
 
     res = df.copy()
     res["sqz_on"] = sqz_on
     res["momentum"] = momentum
+    res["atr"] = calculate_atr(df, length=bb_length)
+    
+    # 計算動能斜率 (Velocity): 3 棒變化量的移動平均
+    res["mom_velo"] = res["momentum"].diff(1).rolling(window=3).mean().fillna(0.0)
     
     # 改進 VWAP：使用交易日 (Trading Day) 而非日曆日 (Calendar Day)
     # 台指期規則：15:00 以後屬下一個交易日
@@ -179,6 +139,7 @@ def calculate_futures_squeeze(
         default=1
     )
 
+    # 趨勢與過濾器
     res["ema_fast"] = _ema(res["Close"], ema_fast)
     res["ema_slow"] = _ema(res["Close"], ema_slow)
     res["ema_filter"] = _ema(res["Close"], 60)
@@ -186,8 +147,9 @@ def calculate_futures_squeeze(
     res["bullish_align"] = res["ema_fast"] > res["ema_slow"]
     res["bearish_align"] = res["ema_fast"] < res["ema_slow"]
 
-    res["recent_high"] = res["Close"].rolling(window=lookback).max()
-    res["recent_low"] = res["Close"].rolling(window=lookback).min()
+    # 波動率調整後的 Pullback 區域
+    res["recent_high"] = res["High"].rolling(window=bb_length).max()
+    res["recent_low"] = res["Low"].rolling(window=bb_length).min()
     res["is_new_high"] = res["Close"] >= res["recent_high"].shift(1)
     res["is_new_low"] = res["Close"] <= res["recent_low"].shift(1)
     res["in_bull_pb_zone"] = (
@@ -201,6 +163,7 @@ def calculate_futures_squeeze(
         & res["bearish_align"]
     )
 
+    # 開盤型態
     res["day_open"] = res.groupby("trading_day")["Open"].transform("first")
     res["day_min"] = res.groupby("trading_day")["Low"].cummin()
     res["day_max"] = res.groupby("trading_day")["High"].cummax()
@@ -210,23 +173,20 @@ def calculate_futures_squeeze(
     return res
 
 
-def calculate_mtf_alignment(data_dict: dict[str, pd.DataFrame], weights=None) -> dict:
-    if not data_dict:
-        return {"score": 0, "is_aligned": False}
-    if weights is None:
-        weights = {"1h": 0.2, "15m": 0.4, "5m": 0.4}
+def calculate_mtf_alignment(processed_dfs: dict[str, pd.DataFrame], weights: dict[str, float]) -> dict:
+    """
+    計算多週期對齊分數
+    """
+    if not processed_dfs:
+        return {"score": 0}
+
     latest_states = {}
-    for tf, df in data_dict.items():
-        if df.empty:
-            continue
-        last = df.iloc[-1]
-        momentum = last.get("momentum", 0) if hasattr(last, "get") else (last["momentum"] if "momentum" in last.index else 0)
-        if pd.isna(momentum):
-            momentum = 0
-        direction = 1 if momentum > 0 else -1
-        mom_state = last.get("mom_state", 1) if hasattr(last, "get") else (last["mom_state"] if "mom_state" in last.index else 1)
-        strength = 1.5 if (mom_state in [0, 3]) else 1.0
-        latest_states[tf] = direction * strength
+    for tf, df in processed_dfs.items():
+        if not df.empty:
+            # 使用 mom_state (0-3) 作為基準，轉換為 -1.5 到 +1.5
+            val = df["mom_state"].iloc[-1]
+            latest_states[tf] = val - 1.5
+
     total_score = 0
     available_weight = 0
     for tf, val in latest_states.items():

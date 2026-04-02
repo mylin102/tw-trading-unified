@@ -904,6 +904,10 @@ class ShioajiOptionsSmartMonitor:
             return
         if not self.spread_is_tradeable(side):
             return
+        # 保證金檢查
+        if not self._margin_sufficient():
+            console.print(f"[red]⛔ 保證金不足，取消 {side} entry[/red]")
+            return
         self.sync_contract_quotes()
         contract = self.active_contracts.get(side)
         if contract is None:
@@ -1020,6 +1024,44 @@ class ShioajiOptionsSmartMonitor:
             self._clear_stale_exit("exit timeout cancelled")
             if pending.get("retries", 0) < self.max_order_retries and self.active_side and self.position > 0:
                 self.submit_live_exit(reason or "LIVE_EXIT_RESUBMITTED", note=f"retry={pending.get('retries', 0) + 1}", quantity=pending.get("quantity"), retries=pending.get("retries", 0) + 1)
+
+    def _margin_sufficient(self):
+        """Check account margin before live entry."""
+        if not self.api:
+            return True
+        try:
+            margin = self.api.margin(self.api.futopt_account)
+            equity = margin.equity
+            reserve_pct = 0.20
+            available = equity * (1 - reserve_pct)
+            # 選擇權買方需要權利金，用 order_margin_premium 或 fallback 估算
+            required = margin.order_margin_premium if margin.order_margin_premium > 0 else 10000
+            if available < required:
+                console.print(f"[red]Margin check: equity={equity:.0f} available={available:.0f} < required={required:.0f}[/red]")
+                return False
+            return True
+        except Exception as e:
+            console.print(f"[yellow]Margin check failed: {e} — allowing order[/yellow]")
+            return True
+
+    def _recover_position_from_api(self):
+        """Recover open position from broker API on restart to prevent duplicate entries."""
+        if not self.api:
+            return
+        try:
+            positions = self.api.list_positions(self.api.futopt_account)
+            for p in positions:
+                code = getattr(p, 'code', '')
+                for key in ['C', 'P']:
+                    con = self.active_contracts.get(key)
+                    if con and code == getattr(con, 'code', ''):
+                        self.position = p.quantity
+                        self.active_side = key
+                        self.entry_price = float(p.price)
+                        console.print(f"[bold cyan]♻️ Recovered position: {key} qty={p.quantity} @ {p.price}[/bold cyan]")
+                        return
+        except Exception as e:
+            console.print(f"[yellow]Position recovery failed: {e}[/yellow]")
 
     def manage_open_position(self, signal):
         if self.position <= 0 or not self.active_side:
@@ -1154,8 +1196,9 @@ class ShioajiOptionsSmartMonitor:
             if not self.find_best_contracts(): return
             self.pre_fill_bars()
         if not self.dry_run and self.api is not None:
+            # Recover position from API on startup to prevent duplicate entries
+            self._recover_position_from_api()
             # Don't override callback or subscribe — main.py handles it
-            pass
         console.print(f">>> [{'DRY RUN' if self.dry_run and not self.dry_run_live_orders else self.status_mode_label() + ' MODE'}] [EXIT-SNIPER ENABLED] Monitor Running <<<")
         if self.dry_run_live_orders:
             console.print("[green]Dry live-orders mode active. Mock broker fills will exercise live entry/exit callbacks without real broker login.[/green]")

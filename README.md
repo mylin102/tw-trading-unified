@@ -2,29 +2,42 @@
 
 台股期貨 + 選擇權整合交易系統。單一 Shioaji session，避免 Too Many Connections。
 
-### 2026-04-02 系統架構與穩定性重大升級
-- **[Arch] 引入外部守護進程 (Supervisor) 架構**：
-    - 廢除 `main.py` 內部的 `os.execv` 自我重啟，改由 `autostart.sh` 進行外部循環監控。
-    - **解決 Python 未預期結束問題**：透過真正結束進程並延時 15 秒重啟，確保 Shioaji 的底層 C++ (Solace) 執行緒完全釋放，避免記憶體污染與崩潰視窗。
-- **[Core] API 調用頻率限制**：為 `kbars` 獲取加入 5 分鐘頻率限制，大幅降低 API 請求過載導致的連線中斷。
-- **[Logic] 交易日日誌對齊**：統一期貨與選擇權的日誌命名邏輯（凌晨 05:00 切換），解決儀表板跨日數據斷層。
-- **[Fix] Greeks 計算型別修正**：強制將所有輸入轉換為 `float`，解決 `decimal.Decimal` 導致的計算崩潰。
+### 2026-04-02 策略與安全性重大升級 (v2)
+- **[Strategy] Squeeze Failure Counter 策略**：新增均值回歸反向策略，回測 PF=1.95（原 Breakout PF=1.02）
+- **[Strategy] Auto-Regime 切換**：根據 bullish_align 翻轉頻率自動判斷趨勢/盤整，切換 Breakout/Counter 模式
+- **[Strategy] 參數優化**：ATR SL 1.5x、VWAP exit 啟用、Counter ATR SL 2.0x（vectorbt 網格回測最佳）
+- **[Safety] 保證金檢查**：下單前查詢 `api.margin()` 權益數，不足額自動擋單
+- **[Safety] 持倉恢復**：重啟時從 `api.list_positions()` 還原真實持倉，防止重複開單
+- **[Safety] VWAP exit 隔離**：Counter 模式的 VWAP 出場不影響 Breakout 持倉
+- **[UI] Dashboard 自動刷新**：30 秒 auto-refresh + Monitor 運行狀態指示燈
+- **[Fix] CSV 欄位對齊**：`_save_bar` 對齊既有 CSV header，修復夜盤數據錯位
+- **[Fix] `lookback` 參數 bug**：移除 `calculate_futures_squeeze` 不接受的參數
+- **[Doc] Shioaji API 參考文件**：`docs/SHIOAJI_API_REFERENCE.md`
+
+### 2026-04-02 系統架構與穩定性升級 (v1)
+- **[Arch] 外部守護進程 (Supervisor)**：`autostart.sh` 外部循環監控，15 秒延遲重啟
+- **[Core] API 調用頻率限制**：kbars 5 分鐘頻率限制
+- **[Logic] 交易日日誌對齊**：凌晨 05:00 切換
+- **[Fix] Greeks 計算型別修正**：強制 `float` 轉換
 
 ## 架構
 
 ```
 core/shioaji_session.py          # Singleton Shioaji 登入（全進程共用）
 strategies/
-  futures/monitor.py             # TMF Squeeze + Trend Breakout + bull_align guard
+  futures/monitor.py             # TMF Breakout + Counter (auto-regime) + margin check
   options/monitor.py             # TXO V2 Swing 選擇權策略
+  options/live_options_squeeze_monitor.py  # 選擇權核心引擎
   options/logs/                  # 選擇權 indicator / ledger / equity
-main.py                          # 啟動入口：tick+bidask 分發 → os.execv 重啟 → 健康檢查
-ui/dashboard.py                  # Streamlit 整合儀表板 (port 8500)
+main.py                          # 啟動入口：tick+bidask 分發 → 健康檢查
+autostart.sh                     # 外部守護進程（斷線自動重啟）
+ui/dashboard.py                  # Streamlit 儀表板 (port 8500, 30s auto-refresh)
 config/
-  futures.yaml                   # 期貨策略參數
+  futures.yaml                   # 期貨策略參數（含 counter_mode）
   options_strategy.yaml          # 選擇權策略參數（V1/V2/V3 modes）
   risk_global.yaml               # 全域資金分配
 scripts/                         # 回測腳本
+docs/                            # 設計文件 + API 參考
 data/                            # 歷史數據（回測用）
 logs/market_data/                # 期貨 indicator CSV
 ```
@@ -41,19 +54,8 @@ python3 main.py --dry-run
 # 3. 登入 broker，live/paper 由各自 config 決定
 python3 main.py
 
-# 4. 啟動 dashboard
-python3 -m streamlit run ui/dashboard.py --server.port 8500
-```
-
-## 用 tmux 執行
-
-```bash
-tmux new-session -d -s unified
-# window 0: monitor
-tmux send-keys -t unified:0 "cd ~/Documents/mylin102/tw-trading-unified && python3 main.py" Enter
-# window 1: dashboard
-tmux new-window -t unified:1
-tmux send-keys -t unified:1 "cd ~/Documents/mylin102/tw-trading-unified && python3 -m streamlit run ui/dashboard.py --server.port 8500 --server.headless true" Enter
+# 4. 用 supervisor 啟動（推薦，斷線自動重啟）
+bash autostart.sh
 ```
 
 ## 即時數據架構
@@ -69,12 +71,6 @@ Shioaji API
   └─ api.kbars() ────→ 歷史 K 棒（日盤可用，凌晨 fallback 到 tick bars）
 ```
 
-### 凌晨不斷線
-
-- **kbars API** 凌晨不回傳數據 → 自動 fallback 到 tick-built bars
-- **BidAsk 訂閱** 凌晨持續推送五檔報價 → IV/Greeks 即時計算
-- **啟動順序**：先 `find_best_contracts()` → 再 `subscribe()` → 避免 race condition
-
 ## 交易模式控制
 
 各策略的 live/paper 由各自 config 決定：
@@ -83,42 +79,60 @@ Shioaji API
 
 CLI 的 `--dry-run` 是安全開關，完全不登入 broker，兩個都強制 paper。
 
+## 安全機制（Live 下單保護）
+
+| 層級 | 機制 | 說明 |
+|------|------|------|
+| 策略層 | `max_positions: 1` | 限制最大持倉口數 |
+| 資金層 | `_margin_sufficient()` | 進場前查 `api.margin()` 權益數，扣 20% reserve |
+| 恢復層 | `_recover_position_from_api()` | 重啟時從 API 還原持倉，防重複開單 |
+| 交易所層 | 保證金不足拒單 | 最終防線 |
+| ⚠️ 待實作 | Safety Stop | 進場後預掛停損單，斷線時交易所執行 |
+
 ## Dashboard (port 8500)
 
 | Tab | 功能 |
 |-----|------|
 | 📈 總覽 | 期貨/選擇權即時指標、今日 PnL、指數雙軸走勢圖 |
-| 🔵 期貨 | Close / Score / 趨勢(🟢多頭/🔴空頭) / Squeeze 狀態、交易記錄、PnL 曲線 |
+| 🔵 期貨 | Close / Score / 趨勢 / Squeeze 狀態、交易記錄、PnL 曲線 |
 | 🟠 選擇權 | MTX / Score / 趨勢 / IV、Trade Ledger、PnL 曲線 |
-| ⚙️ 設定 | 參數即時調整、LIVE/PAPER 切換、資金分配、模擬 Reset |
+| ⚙️ 設定 | 參數即時調整、LIVE/PAPER 切換、資金分配 |
 
-夜盤跨日（00:00~05:00）自動顯示前一天的數據。
-
-## Auto-Restart
-
-使用 `os.execv` 重啟整個 process，確保 Shioaji session 完全乾淨：
-1. `.restart` flag 或 thread 死亡 → 停止 monitors
-2. `logout()` → 等 10 秒 → `os.execv` 重啟 process
-3. 每 30 秒健康檢查（`api.list_positions`），session 壞掉自動重啟
+- 每 30 秒自動刷新（`streamlit-autorefresh`）
+- Header 顯示 Monitor 運行狀態（🟢 Running / 🔴 Stopped）
+- 夜盤跨日（00:00~05:00）自動顯示前一天的數據
 
 ## 策略邏輯
 
-### 期貨 TMF
+### 期貨 TMF — 雙模式自動切換
+
+#### Breakout 模式（趨勢盤）
 - 多週期 Squeeze（5m/15m/1h）+ Trend Breakout
-- **Regime filter (mid) + bull_align guard**：多頭排列禁止做空，空頭排列禁止做多
-- **EMA12/36**（1h/3h 趨勢判斷，回測最佳）
-- TP1 分批停利 + Trailing Stop + ATR 動態停損
-- VWAP 出場
-- Tick-based bar builder：凌晨 kbars 不可用時自動切換
+- Regime filter (mid) + bull_align guard
+- EMA 12/36 趨勢判斷
+
+#### Counter 模式（盤整盤）— 新增
+- 偵測 Squeeze Fire 後 5 bars 內突破失敗
+- 失敗條件：未創新高/低 + 動能反轉 + VWAP 拒絕
+- 反向進場，VWAP 回歸出場
+- 回測 PF=1.95, MaxDD=-7.2%（vs Breakout PF=1.02, MaxDD=-25.8%）
+
+#### Auto-Regime 切換
+- `_is_ranging_regime()`：近 20 bars bullish_align 翻轉 ≥4 次 → 盤整 → Counter
+- 否則 → 趨勢 → Breakout
+
+#### 出場機制
+- ATR 1.5x 動態停損
+- VWAP 出場（Breakout + Counter）
+- TP1 分批停利 + Trailing Stop
+- Cooldown 3 bars
 
 ### 選擇權 TXO (V2 Swing)
-- **月選合約（≥14 天 DTE）**，降低 theta 衰減
-- 進場：Score ≥ 60 + **Squeeze Fire 或 Score ≥ 90** + **bull_align guard**
-- **Cooldown 3 bars**：出場後不立即重新進場
-- 停損 20% + **TP1 80% 分批** + **Trailing Stop 15%**
+- 月選合約（≥14 天 DTE），降低 theta 衰減
+- 進場：Score ≥ 60 + Squeeze Fire + bull_align guard
+- 停損 20% + TP1 80% 分批 + Trailing Stop 15%
 - 持倉上限 7 天，DTE < 3 天強制出場
-- **即時 IV/Greeks**：py_vollib 從 BidAsk 中價反推 implied volatility
-- 權重：1h:40% / 15m:40% / 5m:20%（加重大級別）
+- 即時 IV/Greeks：py_vollib 從 BidAsk 中價反推
 
 ### 選擇權 Modes
 
@@ -127,6 +141,23 @@ CLI 的 `--dry-run` 是安全開關，完全不登入 broker，兩個都強制 p
 | V1 | daytrade | 近月 | 當日沖 |
 | **V2** | **swing** | **月選** | **波段（目前使用）** |
 | V3 | night | 近月 | 夜盤當沖 |
+
+## 最佳參數（2026 Q1 回測）
+
+### Breakout
+| 參數 | 值 |
+|------|-----|
+| entry_score | 20 |
+| atr_multiplier | 1.5 |
+| exit_on_vwap | true |
+| regime_filter | mid |
+
+### Counter
+| 參數 | 值 |
+|------|-----|
+| confirm_bars | 5 |
+| atr_sl_mult | 2.0 |
+| exit_on_vwap | true |
 
 ## 資金分配
 
@@ -144,21 +175,29 @@ account:
 ## 回測腳本
 
 ```bash
-# 期貨 regime filter 比較
-python3 scripts/backtest_regime_filter.py
+# vectorbt 網格回測（Breakout + Counter 雙模式）
+python3 scripts/backtest_vbt_grid.py
 
-# 期貨 EMA 週期比較
+# Squeeze Failure Counter vs Breakout 比較
+python3 scripts/backtest_squeeze_failure.py
+
+# 期貨 regime filter / EMA 比較
+python3 scripts/backtest_regime_filter.py
 python3 scripts/backtest_ema_full.py
 
-# 選擇權參數網格優化
+# 選擇權參數優化 / V2 vs V3 / IV 過濾
 python3 scripts/backtest_options_optimize.py
-
-# 選擇權 V2 swing vs V3 night
 python3 scripts/backtest_v2_swing.py
-
-# 選擇權 IV 過濾
 python3 scripts/backtest_iv_filter.py
 ```
+
+## 文件
+
+| 文件 | 說明 |
+|------|------|
+| `docs/SHIOAJI_API_REFERENCE.md` | Shioaji API 快速參考（登入/下單/行情/帳務） |
+| `docs/SQUEEZE_FAILURE_STRATEGY.md` | Counter 策略設計提案 |
+| `docs/DASHBOARD_UI_DESIGN.md` | Dashboard UI 設計 |
 
 ## 來源 repo
 

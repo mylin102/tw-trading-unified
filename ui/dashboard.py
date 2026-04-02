@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 from plotly.subplots import make_subplots
+from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="Trading Unified", page_icon="📊", layout="wide")
 
@@ -34,6 +35,9 @@ def check_password():
 
 if not check_password():
     st.stop()
+
+# 每 30 秒自動刷新（登入後才啟用）
+st_autorefresh(interval=30_000, key="data_refresh")
 
 BASE = Path(__file__).parent.parent
 TODAY = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -270,7 +274,15 @@ hc[4].metric("選擇權分配", f"{alloc.get('options', {}).get('max_margin_pct'
 
 if f_live or o_live:
     st.markdown('<div style="background:#ff4444;color:white;padding:8px;text-align:center;border-radius:4px;font-weight:bold;">⚠️ LIVE TRADING ACTIVE</div>', unsafe_allow_html=True)
-st.caption(f"日期: {TODAY} | 更新: {datetime.datetime.now().strftime('%H:%M:%S')}")
+import subprocess
+def _monitor_status():
+    try:
+        r = subprocess.run(["pgrep", "-f", "main.py"], capture_output=True)
+        return "🟢 Running" if r.returncode == 0 else "🔴 Stopped"
+    except:
+        return "⚪ Unknown"
+
+st.caption(f"日期: {TODAY} | 更新: {datetime.datetime.now().strftime('%H:%M:%S')} | Monitor: {_monitor_status()}")
 
 # ── Tabs ──
 tab_overview, tab_futures, tab_options, tab_settings = st.tabs(["📈 總覽", "🔵 期貨 TMF", "🟠 選擇權 TXO", "⚙️ 設定"])
@@ -373,8 +385,8 @@ with tab_futures:
         sc_val = last.get('score', 0)
         fc1.metric("Close", f"{cl_val:.0f}")
         fc2.metric("Score", f"{sc_val:.1f}")
-        bull = last.get("bull_align", False)
-        bear = last.get("bear_align", False)
+        bull = last.get("bull_align", last.get("bullish_align", False))
+        bear = last.get("bear_align", last.get("bearish_align", False))
         trend = "🟢 多頭排列" if bull else ("🔴 空頭排列" if bear else "⚪ 中性")
         fc3.metric("趨勢", trend)
         fc4.metric("Squeeze", "🔒 壓縮中" if last.get("sqz_on", False) else "🔓 已釋放")

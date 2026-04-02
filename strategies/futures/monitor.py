@@ -79,12 +79,25 @@ class FuturesMonitor:
         self.PB_ARGS = {
             "ema_fast": self.PB.get("ema_fast", 20),
             "ema_slow": self.PB.get("ema_slow", 60),
-            "lookback": self.PB.get("lookback", 60),
             "pb_buffer": self.PB.get("buffer", 1.002),
         }
         self.live_trading = self.cfg.get("live_trading", False)
         self.cooldown_bars = self.STRATEGY.get("cooldown_bars", 3)
         self.cooldown_until = 0
+
+        # Squeeze Failure Counter mode
+        self.COUNTER = self.STRATEGY.get("counter_mode", {})
+        self.counter_enabled = self.COUNTER.get("enabled", False)
+        self.counter_auto_regime = self.COUNTER.get("auto_regime", True)
+        self.counter_confirm_bars = self.COUNTER.get("confirm_bars", 5)
+        self.counter_atr_sl_mult = self.COUNTER.get("atr_sl_mult", 1.0)
+        self.counter_exit_vwap = self.COUNTER.get("exit_on_vwap", True)
+        # Failure detection state: tracks pending squeeze fire
+        self._fire_pending_dir = 0   # +1=bullish fire, -1=bearish fire
+        self._fire_bar_idx = 0
+        self._fire_high = 0.0
+        self._fire_low = 0.0
+        self._bar_counter = 0        # monotonic bar counter for fire tracking
 
         # Trader
         self.trader = PaperTrader(
@@ -97,6 +110,7 @@ class FuturesMonitor:
         )
         self.has_tp1_hit = False
         self.last_processed_bar = None
+        self._last_entry_reason = None
 
     def _load_config(self, path):
         with open(path, encoding="utf-8") as f:
@@ -154,6 +168,24 @@ class FuturesMonitor:
         if cb:
             cb(exchange, tick)
 
+    # ── Margin check ──
+    def _margin_sufficient(self):
+        """Check if account has enough margin before placing entry order."""
+        try:
+            margin = self.api.margin(self.api.futopt_account)
+            equity = margin.equity
+            reserve_pct = 0.20  # 保留 20% 不動用
+            available = equity * (1 - reserve_pct)
+            required = margin.initial_margin if margin.initial_margin > 0 else 17000  # TMF 一口約 17,000
+            if available < required:
+                console.print(f"[red]Margin check: equity={equity:.0f} available={available:.0f} < required={required:.0f}[/red]")
+                return False
+            console.print(f"[dim]Margin OK: equity={equity:.0f} available={available:.0f}[/dim]")
+            return True
+        except Exception as e:
+            console.print(f"[yellow]Margin check failed: {e} — allowing order[/yellow]")
+            return True  # API 查詢失敗不擋單，讓交易所擋
+
     # ── Trade execution ──
     def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, reason=None):
         action = None
@@ -168,6 +200,11 @@ class FuturesMonitor:
 
         live_ready = self.live_trading and not self.dry_run and self.contract is not None
         if live_ready and action is not None:
+            # 進場前檢查保證金（出場不擋）
+            if signal in ("BUY", "SELL"):
+                if not self._margin_sufficient():
+                    console.print(f"[red][FuturesMonitor] ⛔ 保證金不足，取消 {signal}[/red]")
+                    return None
             trade = self.client.place_order(self.contract, action=action, quantity=lots)
             if trade is None:
                 console.print(f"[red][FuturesMonitor] Live order failed: {signal} {lots}[/red]")
@@ -190,6 +227,8 @@ class FuturesMonitor:
         save_trade({"type": signal, "timestamp": ts, "price": price, "lots": lots,
                     "direction": direction, "pnl_pts": round(pnl_pts, 1),
                     "pnl_cash": round(pnl_cash, 0), "reason": reason or ""})
+        if signal in ("BUY", "SELL"):
+            self._last_entry_reason = reason
         result = self.trader.execute_signal(
             signal, price, ts, lots=lots,
             max_lots=self.MGMT.get("max_positions", 2),
@@ -206,11 +245,85 @@ class FuturesMonitor:
         return result
 
     def _check_stop_loss(self, ts, price):
+        if self.trader.position == 0:
+            return None
+            
+        sl_dist = self.RISK.get("stop_loss_pts", 60)
+        # 如果有設定 ATR 倍數，則使用動態停損
+        if self.ATR_MULT > 0:
+            # 這裡需要傳入當前的 df_5m 來算最新的 ATR
+            # 但為了效率，我們可以假設在 _strategy_tick 中已經算好了，或者這裡重新算
+            # 這裡簡單處理：如果 trader 有 current_stop_loss 就用它
+            pass
+
         if self.trader.position > 0 and self.trader.current_stop_loss and price <= self.trader.current_stop_loss:
             return self._execute_trade("EXIT", self.trader.current_stop_loss, ts, abs(self.trader.position), reason="STOP_LOSS")
         if self.trader.position < 0 and self.trader.current_stop_loss and price >= self.trader.current_stop_loss:
             return self._execute_trade("EXIT", self.trader.current_stop_loss, ts, abs(self.trader.position), reason="STOP_LOSS")
         return None
+
+    def _detect_squeeze_failure(self, last_5m, df_5m):
+        """
+        Detect squeeze breakout failure → return counter signal.
+        Returns: "COUNTER_BUY", "COUNTER_SELL", or None
+        """
+        fired = last_5m.get("fired", False)
+        momentum = last_5m.get("momentum", 0)
+        close = last_5m["Close"]
+
+        # New fire event
+        if fired:
+            self._fire_pending_dir = 1 if momentum > 0 else -1
+            self._fire_bar_idx = self._bar_counter
+            self._fire_high = close
+            self._fire_low = close
+            return None
+
+        if self._fire_pending_dir == 0:
+            return None
+
+        bars_since = self._bar_counter - self._fire_bar_idx
+        self._fire_high = max(self._fire_high, close)
+        self._fire_low = min(self._fire_low, close)
+
+        # Expire
+        if bars_since > self.counter_confirm_bars:
+            self._fire_pending_dir = 0
+            return None
+
+        if bars_since < 1:
+            return None
+
+        # Failure validation
+        recent_high = last_5m.get("recent_high", close)
+        recent_low = last_5m.get("recent_low", close)
+        mom_velo = last_5m.get("mom_velo", 0)
+        vwap = last_5m.get("vwap", close)
+
+        if self._fire_pending_dir == 1:  # Bullish fire failed?
+            no_new_high = close < recent_high
+            velo_reversed = mom_velo <= 0
+            vwap_reject = close < vwap
+            if no_new_high and (velo_reversed or vwap_reject):
+                self._fire_pending_dir = 0
+                return "COUNTER_SELL"
+        else:  # Bearish fire failed?
+            no_new_low = close > recent_low
+            velo_reversed = mom_velo >= 0
+            vwap_reject = close > vwap
+            if no_new_low and (velo_reversed or vwap_reject):
+                self._fire_pending_dir = 0
+                return "COUNTER_BUY"
+
+        return None
+
+    def _is_ranging_regime(self, df_5m):
+        """Auto-detect ranging market: recent bars flip bullish_align frequently."""
+        if len(df_5m) < 20:
+            return False
+        recent = df_5m["bullish_align"].iloc[-20:]
+        flips = (recent != recent.shift(1)).sum()
+        return flips >= 4  # 20 bars 內翻轉 4 次以上 → 盤整
 
     def _save_bar(self, row, score, regime):
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs", "market_data")
@@ -224,20 +337,46 @@ class FuturesMonitor:
         path = os.path.join(log_dir, f"{self.ticker}_{date_str}{tag}_indicators.csv")
         
         data = {
-            "timestamp": [row.name], 
-            "open": [row["Open"]], "high": [row["High"]], "low": [row["Low"]], "close": [row["Close"]], 
-            "vwap": [row["vwap"]], "score": [score],
-            "sqz_on": [row["sqz_on"]], "mom_state": [row["mom_state"]], "regime": [regime],
-            "bull_align": [row["bullish_align"]], "bear_align": [row["bearish_align"]],
-            "in_pb_zone": [row.get("in_bull_pb_zone", False) or row.get("in_bear_pb_zone", False)],
+            "timestamp": row.name, 
+            "Open": row["Open"], "High": row["High"], "Low": row["Low"], "Close": row["Close"], 
+            "open": row["Open"], "high": row["High"], "low": row["Low"], "close": row["Close"],
+            "Volume": row.get("Volume", 0), "Amount": row.get("Amount", 0),
+            "volume": row.get("Volume", 0), "amount": row.get("Amount", 0),
+            "vwap": row["vwap"], "score": score, "momentum": row.get("momentum", 0),
+            "sqz_on": row["sqz_on"], "mom_state": row["mom_state"], "regime": regime,
+            "bull_align": row["bullish_align"], "bear_align": row["bearish_align"],
+            "bullish_align": row["bullish_align"], "bearish_align": row["bearish_align"],
+            "in_pb_zone": row.get("in_bull_pb_zone", False) or row.get("in_bear_pb_zone", False),
+            "fired": row.get("fired", False),
         }
-        header = not os.path.exists(path)
-        pd.DataFrame(data).to_csv(path, mode="a", index=False, header=header)
+        
+        file_exists = os.path.exists(path)
+        if file_exists:
+            # 讀取既有 header，對齊欄位（缺的填 NaN）
+            with open(path, 'r') as f:
+                existing_cols = f.readline().strip().split(',')
+            row_dict = {c: data.get(c, '') for c in existing_cols}
+            pd.DataFrame([row_dict]).to_csv(path, mode="a", index=False, header=False)
+        else:
+            pd.DataFrame([data]).to_csv(path, mode="a", index=False, header=True)
 
     # ── Main strategy loop ──
     def run(self):
         self._running = True
         mode = "dry-run" if self.dry_run else ("LIVE" if self.live_trading else "PAPER")
+        # Recover position from API on restart
+        if not self.dry_run and self.api:
+            try:
+                positions = self.api.list_positions(self.api.futopt_account)
+                for p in positions:
+                    if self.contract and getattr(p, 'code', '') == self.contract.code:
+                        qty = p.quantity if str(p.direction) == 'Buy' else -p.quantity
+                        self.trader.position = qty
+                        self.trader.entry_price = float(p.price)
+                        console.print(f"[bold cyan]♻️ Recovered futures position: {qty} @ {p.price}[/bold cyan]")
+                        break
+            except Exception as e:
+                console.print(f"[yellow]Futures position recovery failed: {e}[/yellow]")
         console.print(f"[green][FuturesMonitor] started ({mode})[/green]")
 
         while self._running:
@@ -313,6 +452,7 @@ class FuturesMonitor:
             regime = "STRONG" if last_5m.get("opening_bullish") else ("WEAK" if last_5m.get("opening_bearish") else "NORMAL")
             self._save_bar(last_5m, score, regime)
             self.last_processed_bar = timestamp
+            self._bar_counter += 1
             console.print(f"[dim][FuturesMonitor] {datetime.now().strftime('%H:%M')} close={last_price:.0f} score={score:.1f}[/dim]")
 
         # 如果是 dry_run，計算完指標並存檔後就結束，不執行交易邏輯
@@ -333,8 +473,9 @@ class FuturesMonitor:
                         self.cooldown_until = self.cooldown_bars  # 分批平倉也重置冷卻
 
             stop_msg = self._check_stop_loss(timestamp, last_price)
-            if not stop_msg and self.RISK.get("exit_on_vwap"):
-                if (self.trader.position > 0 and last_price < vwap) or (self.trader.position < 0 and last_price > vwap):
+            if not stop_msg:
+                vwap_exit = self.RISK.get("exit_on_vwap") or (self.counter_exit_vwap and self._last_entry_reason == "COUNTER")
+                if vwap_exit and ((self.trader.position > 0 and last_price < vwap) or (self.trader.position < 0 and last_price > vwap)):
                     stop_msg = self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason="VWAP")
             if stop_msg:
                 self.has_tp1_hit = False
@@ -349,45 +490,73 @@ class FuturesMonitor:
         self.has_tp1_hit = False
         stop_loss_pts = self.RISK.get("stop_loss_pts", 60)
         if self.ATR_MULT > 0:
-            atr_s = calculate_atr(df_5m, length=self.ATR_LENGTH)
-            if not atr_s.empty and not pd.isna(atr_s.iloc[-1]):
-                stop_loss_pts = atr_s.iloc[-1] * self.ATR_MULT
+            atr_val = last_5m.get("atr", 0)
+            if atr_val > 0:
+                stop_loss_pts = atr_val * self.ATR_MULT
 
-        entry_score = self.STRATEGY.get("entry_score", 20)
-        sqz_buy = (not last_5m["sqz_on"]) and score >= entry_score and last_5m["mom_state"] >= 2
-        sqz_sell = (not last_5m["sqz_on"]) and score <= -entry_score and last_5m["mom_state"] <= 1
+        # Determine active mode: counter (mean-reversion) vs breakout
+        use_counter = False
+        if self.counter_enabled:
+            if self.counter_auto_regime:
+                use_counter = self._is_ranging_regime(df_5m)
+            else:
+                use_counter = True
 
-        # Regime filter
-        if self.FILTER_MODE == "loose":
-            can_long = can_short = True
-        elif self.FILTER_MODE == "mid":
-            can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.998
-            can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.002
-            # bull_align guard: 多頭排列時禁止做空，空頭排列時禁止做多
-            if last_5m.get("bullish_align", False):
-                can_short = False
-            if last_5m.get("bearish_align", False):
-                can_long = False
+        if use_counter:
+            # ── Squeeze Failure Counter entry ──
+            counter_signal = self._detect_squeeze_failure(last_5m, df_5m)
+            if counter_signal:
+                atr_val = last_5m.get("atr", 0)
+                counter_sl = atr_val * self.counter_atr_sl_mult if atr_val > 0 else stop_loss_pts
+                lots = self.MGMT.get("lots_per_trade", 2)
+                be = self.RISK.get("break_even_pts", 50)
+                if counter_signal == "COUNTER_BUY" and self.MGMT.get("allow_long", True):
+                    console.print(f"[bold magenta]🔄 COUNTER BUY (failure reversal) SL={counter_sl:.1f}[/bold magenta]")
+                    self._execute_trade("BUY", last_price, timestamp, lots,
+                                        stop_loss=counter_sl, break_even_trigger=be, reason="COUNTER")
+                elif counter_signal == "COUNTER_SELL" and self.MGMT.get("allow_short", True):
+                    console.print(f"[bold magenta]🔄 COUNTER SELL (failure reversal) SL={counter_sl:.1f}[/bold magenta]")
+                    self._execute_trade("SELL", last_price, timestamp, lots,
+                                        stop_loss=counter_sl, break_even_trigger=be, reason="COUNTER")
         else:
-            can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.999
-            can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.001
+            # ── Original Breakout entry ──
+            # Still track fires for counter even when not active (seamless switch)
+            if self.counter_enabled:
+                self._detect_squeeze_failure(last_5m, df_5m)
 
-        trend = _check_trend_breakout_signal(df_5m, df_15m)
-        lots = self.MGMT.get("lots_per_trade", 2)
-        be = self.RISK.get("break_even_pts", 50)
+            entry_score = self.STRATEGY.get("entry_score", 20)
+            sqz_buy = (not last_5m["sqz_on"]) and score >= entry_score and last_5m["mom_state"] >= 2
+            sqz_sell = (not last_5m["sqz_on"]) and score <= -entry_score and last_5m["mom_state"] <= 1
 
-        # 決定進場原因
-        entry_reason = ""
-        if sqz_buy and can_long and trend["trend_long"]: entry_reason = "SYNERGY"
-        elif sqz_buy and can_long: entry_reason = "SQUEEZE"
-        elif trend["trend_long"]: entry_reason = "BREAKOUT"
-        
-        if entry_reason and self.MGMT.get("allow_long", True):
-            self._execute_trade("BUY", last_price, timestamp, lots, stop_loss=stop_loss_pts, break_even_trigger=be, reason=entry_reason)
-        else:
-            if sqz_sell and can_short and trend["trend_short"]: entry_reason = "SYNERGY"
-            elif sqz_sell and can_short: entry_reason = "SQUEEZE"
-            elif trend["trend_short"]: entry_reason = "BREAKOUT"
+            # Regime filter
+            if self.FILTER_MODE == "loose":
+                can_long = can_short = True
+            elif self.FILTER_MODE == "mid":
+                can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.998
+                can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.002
+                if last_5m.get("bullish_align", False):
+                    can_short = False
+                if last_5m.get("bearish_align", False):
+                    can_long = False
+            else:
+                can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.999
+                can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.001
+
+            trend = _check_trend_breakout_signal(df_5m, df_15m)
+            lots = self.MGMT.get("lots_per_trade", 2)
+            be = self.RISK.get("break_even_pts", 50)
+
+            entry_reason = ""
+            if sqz_buy and can_long and trend["trend_long"]: entry_reason = "SYNERGY"
+            elif sqz_buy and can_long: entry_reason = "SQUEEZE"
+            elif trend["trend_long"]: entry_reason = "BREAKOUT"
             
-            if entry_reason and self.MGMT.get("allow_short", True):
-                self._execute_trade("SELL", last_price, timestamp, lots, stop_loss=stop_loss_pts, break_even_trigger=be, reason=entry_reason)
+            if entry_reason and self.MGMT.get("allow_long", True):
+                self._execute_trade("BUY", last_price, timestamp, lots, stop_loss=stop_loss_pts, break_even_trigger=be, reason=entry_reason)
+            else:
+                if sqz_sell and can_short and trend["trend_short"]: entry_reason = "SYNERGY"
+                elif sqz_sell and can_short: entry_reason = "SQUEEZE"
+                elif trend["trend_short"]: entry_reason = "BREAKOUT"
+                
+                if entry_reason and self.MGMT.get("allow_short", True):
+                    self._execute_trade("SELL", last_price, timestamp, lots, stop_loss=stop_loss_pts, break_even_trigger=be, reason=entry_reason)
