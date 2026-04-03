@@ -1,0 +1,23 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.5, pytest-9.0.2, pluggy-1.6.0
+rootdir: /Users/mylin/Documents/mylin102/tw-trading-unified
+plugins: cov-7.1.0, timeout-2.4.0, anyio-4.13.0
+collected 24 items
+
+tests/test_signal_generator.py ..                                        [  8%]
+tests/test_trading_bugs.py ......................                        [100%]
+
+============================== 24 passed in 1.24s ==============================
+F401 [*] `datetime.datetime` imported but unused
+ --> tests/test_signal_generator.py:4:22
+  |
+2 | import pandas as pd
+3 | import numpy as np
+4 | from datetime import datetime
+  |                      ^^^^^^^^
+5 | from backtest.signal_generator import generate_signals
+  |
+help: Remove unused import: `datetime.datetime`
+
+Found 1 error.
+[*] 1 fixable with the `--fix` option.

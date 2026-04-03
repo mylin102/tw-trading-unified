@@ -1,0 +1,9 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.5, pytest-9.0.2, pluggy-1.6.0
+rootdir: /Users/mylin/Documents/mylin102/tw-trading-unified
+plugins: cov-7.1.0, timeout-2.4.0, anyio-4.13.0
+collected 22 items
+
+tests/test_trading_bugs.py ......................                        [100%]
+
+============================== 22 passed in 2.20s ==============================

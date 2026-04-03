@@ -30,3 +30,4 @@ shioaji.log
 .DS_Store
 .venv/
 login/account/
+.gstack/
