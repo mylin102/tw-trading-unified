@@ -10,9 +10,14 @@ import os
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from py_vollib.black_scholes.greeks.numerical import delta, gamma, vega
-from py_vollib.black_scholes.implied_volatility import implied_volatility
 from rich.console import Console
+
+# 依序匯入策略所需組件
+from options_engine.engine.indicators import calculate_futures_squeeze, calculate_mtf_alignment
+from options_engine.engine.broker_adapter import ShioajiBrokerAdapter
+from options_engine.engine.backtest_engine import should_exit_position, should_take_partial_profit, should_exit_by_time_constraints
+from options_engine.engine.backtest_engine import resolve_option_strike
+from options_engine.engine.options_strategy import get_mode_profile, get_score_floor, get_stop_loss_pct, get_strategy_weights, infer_mid_trend, resolve_entry_side
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
@@ -31,13 +36,6 @@ ROOT = Path(__file__).resolve().parent
 CURRENT_SRC = str(ROOT / "src")
 if CURRENT_SRC not in sys.path:
     sys.path.insert(0, CURRENT_SRC)
-
-# 依序匯入策略所需組件
-from options_engine.engine.indicators import calculate_futures_squeeze, calculate_mtf_alignment
-from options_engine.engine.broker_adapter import ShioajiBrokerAdapter
-from options_engine.engine.backtest_engine import should_exit_position, should_take_partial_profit, should_exit_by_time_constraints
-from options_engine.engine.backtest_engine import resolve_option_strike
-from options_engine.engine.options_strategy import get_mode_profile, get_score_floor, get_stop_loss_pct, get_strategy_weights, infer_mid_trend, resolve_entry_side
 
 try:
     from options_engine.engine.greeks import black_scholes, calculate_dte, find_implied_volatility
@@ -220,7 +218,9 @@ class ShioajiOptionsSmartMonitor:
 
     def load_config(self):
         path = Path(__file__).parent / "config" / "options_strategy.yaml"
-        with open(path, 'r') as f: return yaml.safe_load(f)
+        with open(path, 'r') as f:
+            # Load strategy configuration
+            return yaml.safe_load(f)
 
     @staticmethod
     def _parse_hhmm(value):
@@ -352,7 +352,8 @@ class ShioajiOptionsSmartMonitor:
                 # 使用更強健的列表轉換
                 try:
                     all_txo = list(self.api.Contracts.Options["TXO"])
-                except:
+                except Exception:
+                    # Fallback to empty list on error
                     all_txo = []
                     
                 if not all_txo:
@@ -376,7 +377,8 @@ class ShioajiOptionsSmartMonitor:
                     if mtx_group: 
                         console.print(f"[dim]💡 成功在 {symbol} 分類下找到期貨合約[/dim]")
                         break
-                except:
+                except Exception:
+                    # Ignore and try next symbol
                     continue
             
             if not mtx_group:
@@ -833,7 +835,9 @@ class ShioajiOptionsSmartMonitor:
             # Resample correctly and ensure columns are present
             def safe_resample(df, rule):
                 res = df.resample(rule).agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-                if len(res) < 2: return res
+                if len(res) < 2:
+                    # Not enough data to calculate squeeze
+                    return res
                 return calculate_futures_squeeze(res, self.strategy_cfg.get("length", 20))
 
             p15 = safe_resample(df5_raw, "15min")
@@ -853,7 +857,7 @@ class ShioajiOptionsSmartMonitor:
             has_momentum_1h = "momentum" in h1.columns and not h1["momentum"].empty
             
             if not has_momentum_15m:
-                console.print(f"[yellow]15m momentum not available yet, waiting for more data...[/yellow]")
+                console.print("[yellow]15m momentum not available yet, waiting for more data...[/yellow]")
                 return None
             
             # Use available timeframes for alignment score
@@ -861,7 +865,7 @@ class ShioajiOptionsSmartMonitor:
             if has_momentum_1h:
                 available_data["1h"] = h1
             else:
-                console.print(f"[yellow]1h momentum not available (insufficient data), using 5m+15m only[/yellow]")
+                console.print("[yellow]1h momentum not available (insufficient data), using 5m+15m only[/yellow]")
                 # Adjust weights for available timeframes
                 if len(available_data) == 2:
                     available_data["1h"] = m15  # Use 15m as proxy for 1h
@@ -1335,7 +1339,8 @@ class ShioajiOptionsSmartMonitor:
                         entry_info = self._theta_gang.evaluate_entry(spot, iv, dte_years, squeeze_on)
                         if entry_info:
                             pos = self._theta_gang.open_position(entry_info)
-                            legs_str = " | ".join(f"{l.action} {l.side}{l.strike}" for l in pos.legs)
+                            # Create a readable string of position legs
+                            legs_str = " | ".join(f"{leg.action} {leg.side}{leg.strike}" for leg in pos.legs)
                             self.log_trade("THETA_ENTRY", pos.strategy, 0,
                                            f"credit={pos.net_credit:.0f} max_loss={pos.max_loss:.0f} [{legs_str}]")
                             console.print(f"[bold cyan]🔺 [ThetaGang] ENTRY {pos.strategy}: credit={pos.net_credit:.0f} [{legs_str}][/bold cyan]")
@@ -1356,7 +1361,8 @@ class ShioajiOptionsSmartMonitor:
     def run(self):
         # find_best_contracts may already be called from main.py
         if not self.active_contracts:
-            if not self.find_best_contracts(): return
+            if not self.find_best_contracts():
+                return
             self.pre_fill_bars()
         if not self.dry_run and self.api is not None:
             # Recover position from API on startup to prevent duplicate entries

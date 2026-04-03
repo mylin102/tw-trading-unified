@@ -9,7 +9,7 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Dict, Optional, List, Union
+from typing import Dict, List
 from rich.console import Console
 
 console = Console()

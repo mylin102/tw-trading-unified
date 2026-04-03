@@ -8,7 +8,6 @@
 3. 判斷趨勢突破信號
 """
 
-import numpy as np
 import pandas as pd
 from typing import Tuple, Optional
 

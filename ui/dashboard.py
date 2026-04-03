@@ -9,13 +9,16 @@ import pandas as pd
 import yaml
 import datetime
 import os
+import subprocess
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 import plotly.graph_objects as go
-
-load_dotenv(Path(__file__).parent.parent / ".env")
 from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
+
+# Load environment variables early
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 st.set_page_config(page_title="Trading Unified", page_icon="📊", layout="wide")
 
@@ -185,7 +188,7 @@ def load_futures_indicators():
             col_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
             df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
             return df
-        except:
+        except Exception:
             return None
 
     # 1. 優先找今天所有可能的檔案並合併
@@ -208,7 +211,7 @@ def load_futures_indicators():
             latest_file = max(all_files, key=os.path.getmtime)
             df = _read_and_standardize(latest_file)
             return filter_today(df) if df is not None else None
-    except:
+    except Exception:
         pass
     return None
 
@@ -217,8 +220,10 @@ def load_futures_trades():
     for d in [FUTURES_TRADES]:
         f = d / f"TMF_{DATE_STR}_trades.csv"
         if f.exists():
-            try: return pd.read_csv(f)
-            except: pass
+            try:
+                return pd.read_csv(f)
+            except Exception:
+                pass
     return None
 
 OPTIONS_SUB = "live_trading" if o_live else "paper_trading"
@@ -232,8 +237,10 @@ def load_options_indicators():
         if f.exists() and f.stat().st_mtime > (best[1] if best else 0):
             best = (f, f.stat().st_mtime)
     if best:
-        try: return filter_today(pd.read_csv(best[0]), ts_col="timestamp")
-        except: pass
+        try:
+            return filter_today(pd.read_csv(best[0]), ts_col="timestamp")
+        except Exception:
+            pass
     
     # 2. 備案：找目錄下最新的任何指標檔案
     try:
@@ -241,7 +248,7 @@ def load_options_indicators():
         if all_opt_files:
             latest_f = max(all_opt_files, key=os.path.getmtime)
             return filter_today(pd.read_csv(latest_f), ts_col="timestamp")
-    except:
+    except Exception:
         pass
     return None
 
@@ -249,16 +256,20 @@ def load_options_indicators():
 def load_options_ledger():
     f = OPTIONS_REPO / "logs" / OPTIONS_SUB / "options_trade_ledger.csv"
     if f.exists():
-        try: return pd.read_csv(f, parse_dates=["Timestamp"])
-        except: pass
+        try:
+            return pd.read_csv(f, parse_dates=["Timestamp"])
+        except Exception:
+            pass
     return None
 
 @st.cache_data(ttl=5)
 def load_options_equity():
     f = OPTIONS_REPO / "logs" / OPTIONS_SUB / "equity_curve.csv"
     if f.exists():
-        try: return pd.read_csv(f, parse_dates=["timestamp"])
-        except: pass
+        try:
+            return pd.read_csv(f, parse_dates=["timestamp"])
+        except Exception:
+            pass
     return None
 
 # ── Header ──
@@ -274,12 +285,12 @@ hc[4].metric("選擇權分配", f"{alloc.get('options', {}).get('max_margin_pct'
 
 if f_live or o_live:
     st.markdown('<div style="background:#ff4444;color:white;padding:8px;text-align:center;border-radius:4px;font-weight:bold;">⚠️ LIVE TRADING ACTIVE</div>', unsafe_allow_html=True)
-import subprocess
+
 def _monitor_status():
     try:
         r = subprocess.run(["pgrep", "-f", "main.py"], capture_output=True)
         return "🟢 Running" if r.returncode == 0 else "🔴 Stopped"
-    except:
+    except Exception:
         return "⚪ Unknown"
 
 st.caption(f"日期: {TODAY} | 更新: {datetime.datetime.now().strftime('%H:%M:%S')} | Monitor: {_monitor_status()}")
@@ -432,236 +443,7 @@ with tab_options:
         if fig:
             st.plotly_chart(fig, use_container_width=True)
 
-# ════════════════════════════════════════
-# Tab 4: 設定
-# ════════════════════════════════════════
-with tab_settings:
-    st.subheader("⚙️ 策略設定")
-
-    st.markdown("### 💰 資金分配")
-    max_alloc = int((1.0 - reserve_pct) * 100)
-    sc1, sc2, sc3 = st.columns(3)
-    f_pct = sc1.slider("期貨 %", 0, max_alloc, int(alloc.get("futures", {}).get("max_margin_pct", 0.4) * 100), 5)
-    o_pct = sc2.slider("選擇權 %", 0, max_alloc, int(alloc.get("options", {}).get("max_margin_pct", 0.4) * 100), 5)
-    sc3.metric("安全墊", f"{reserve_pct*100:.0f}%")
-    if f_pct + o_pct > max_alloc:
-        st.error(f"⚠️ 期貨 {f_pct}% + 選擇權 {o_pct}% = {f_pct+o_pct}% 超過上限 {max_alloc}%")
-    else:
-        st.progress((f_pct + o_pct) / 100, text=f"已分配 {f_pct+o_pct}% / {max_alloc}%")
-
-    st.markdown("### 🔵 期貨參數")
-    f_strategy = futures_cfg.get("strategy", {})
-    f_risk = futures_cfg.get("risk_mgmt", {})
-    f_mgmt = futures_cfg.get("trade_mgmt", {})
-
-    # ── 策略切換 ──
-    STRATEGY_OPTIONS = {
-        "squeeze_breakout": "🔵 Squeeze Breakout（原版，通用）",
-        "trend_follow": "📈 Trend Follow（單邊趨勢，寬停損）",
-        "vwap_bounce": "🔄 VWAP Bounce（盤整均值回歸）",
-        "momentum_burst": "💥 Momentum Burst（Squeeze Fire 爆發）",
-        "night_short_only": "🌙 Night Short Only（夜盤只做空）",
-        "volume_reversal": "📊 Volume Reversal（量價反轉）",
-        "psar_breakout": "🔺 PSAR Breakout（拋物線翻轉）",
-        "cumulative_delta": "📉 Cumulative Delta（訂單流動能）",
-    }
-    current_strat = f_strategy.get("active_strategy", "squeeze_breakout")
-    strat_keys = list(STRATEGY_OPTIONS.keys())
-    strat_idx = strat_keys.index(current_strat) if current_strat in strat_keys else 0
-    selected_strat = st.selectbox(
-        "進場策略",
-        strat_keys,
-        index=strat_idx,
-        format_func=lambda k: STRATEGY_OPTIONS[k],
-        key="f_strat",
-    )
-
-    FUTURES_STRAT_DESC = {
-        "squeeze_breakout": "**原版策略** — Squeeze 釋放 + 多週期 Score 對齊 + Regime Filter 進場。ATR 1.5x 停損。適合一般行情，但停損偏緊。",
-        "trend_follow": "**趨勢跟隨** — 只在 15m EMA 方向一致時進場，ATR 3.0x 寬停損。適合單邊趨勢行情（如今晚暴跌），能抱住大波段。",
-        "vwap_bounce": "**VWAP 均值回歸** — 價格偏離 VWAP 0.3% 以上 + 動能反轉時反向進場。ATR 1.5x 緊停損。適合盤整震盪行情。",
-        "momentum_burst": "**動能爆發** — Squeeze Fire 瞬間 + 高 Velocity 進場。ATR 2.0x 停損。適合壓縮後的爆發行情，交易頻率低但爆發力強。",
-        "night_short_only": "**夜盤只做空** — 僅在夜盤（15:00~05:00）+ Bearish Align 時做空。ATR 2.0x 停損。適合夜盤偏空的統計優勢。",
-        "volume_reversal": "**量價反轉**（參考 NinjaScript volumeMA）— 連續 2 根紅 K 量 > 前一根綠 K 量 ×2 + 收盤 > SMA50 → 做多（反之做空）。適合放量反轉。",
-        "psar_breakout": "**拋物線翻轉**（參考 NinjaScript PSAR）— 價格突破 Parabolic SAR + 收盤 > SMA50 進場。ATR 2.0x 停損。適合趨勢翻轉點。",
-        "cumulative_delta": "**累積 Delta**（參考 NinjaScript cumStrat）— 用成交量方向近似訂單流，Delta 上升 + 價格回落 + > SMA50 → 做多。適合訂單流動能交易。",
-    }
-    st.info(FUTURES_STRAT_DESC.get(selected_strat, ""))
-
-    fc1, fc2, fc3 = st.columns(3)
-    f_entry = fc1.slider("Entry Score", 10, 100, int(f_strategy.get("entry_score", 20)), 5, key="f_entry")
-    f_sl = fc2.slider("Stop Loss (pts)", 20, 200, int(f_risk.get("stop_loss_pts", 60)), 10, key="f_sl")
-    f_tp = fc3.slider("TP1 (pts)", 20, 200, int(f_strategy.get("partial_exit", {}).get("tp1_pts", 50)), 10, key="f_tp")
-    fc4, fc5 = st.columns(2)
-    f_lots = fc4.slider("Lots/Trade", 1, 5, int(f_mgmt.get("lots_per_trade", 2)), 1, key="f_lots")
-    f_max = fc5.slider("Max Positions", 1, 5, int(f_mgmt.get("max_positions", 2)), 1, key="f_max")
-
-    st.markdown("### 🟠 選擇權參數")
-    o_strategy = options_cfg.get("strategy", {})
-    o_risk = options_cfg.get("risk_mgmt", {})
-    o_exit = options_cfg.get("exit_strategy", {})
-    o_theta = options_cfg.get("theta_gang", {})
-
-    # ── 選擇權策略切換 ──
-    OPT_STRATEGY_OPTIONS = {
-        "directional": "📈 Directional（買方，買 Call/Put）",
-        "theta_iron_condor": "🦅 Iron Condor（賣方，收 theta）",
-        "theta_bull_put": "🐂 Bull Put Spread（賣方偏多）",
-        "theta_bear_call": "🐻 Bear Call Spread（賣方偏空）",
-        "auto_regime": "🔄 Auto Regime（盤整賣方 / 趨勢買方）",
-    }
-    # Derive current from config
-    if o_theta.get("enabled") and o_theta.get("auto_regime"):
-        current_opt_strat = "auto_regime"
-    elif o_theta.get("enabled"):
-        tg_map = {"iron_condor": "theta_iron_condor", "bull_put_spread": "theta_bull_put", "bear_call_spread": "theta_bear_call"}
-        current_opt_strat = tg_map.get(o_theta.get("strategy", ""), "theta_iron_condor")
-    else:
-        current_opt_strat = "directional"
-    opt_strat_keys = list(OPT_STRATEGY_OPTIONS.keys())
-    opt_strat_idx = opt_strat_keys.index(current_opt_strat) if current_opt_strat in opt_strat_keys else 0
-    selected_opt_strat = st.selectbox(
-        "選擇權策略",
-        opt_strat_keys,
-        index=opt_strat_idx,
-        format_func=lambda k: OPT_STRATEGY_OPTIONS[k],
-        key="o_strat",
-    )
-
-    OPT_STRAT_DESC = {
-        "directional": "**買方策略** — 買 Call（看多）或 Put（看空），靠方向性波動獲利。\n\n⚡ 進場：Score ≥ 60 + Squeeze Fire + 趨勢對齊\n🛑 出場：停損 10% / TP1 30% / Trailing 15% / Score 翻轉\n📊 勝率低但單筆獲利大，適合趨勢行情",
-        "theta_iron_condor": "**Iron Condor（賣方）** — 同時賣 OTM Put Spread + OTM Call Spread，收取權利金。\n\n⚡ 進場：Squeeze ON（盤整壓縮）+ IV ≥ 18%\n🛑 出場：獲利 50% credit / 虧損 100% max_loss / DTE ≤ 3 天 / Squeeze 釋放\n📊 勝率高（~70%），最大虧損固定，適合盤整低波動",
-        "theta_bull_put": "**Bull Put Spread（賣方偏多）** — 賣 OTM Put + 買更 OTM Put，看不跌。\n\n⚡ 進場：Squeeze ON + IV ≥ 18% + 偏多判斷\n🛑 出場：同 Iron Condor\n📊 適合溫和多頭或盤整，下方有保護",
-        "theta_bear_call": "**Bear Call Spread（賣方偏空）** — 賣 OTM Call + 買更 OTM Call，看不漲。\n\n⚡ 進場：Squeeze ON + IV ≥ 18% + 偏空判斷\n🛑 出場：同 Iron Condor\n📊 適合溫和空頭或盤整，上方有保護",
-        "auto_regime": "**自動切換（推薦）** — 根據 Squeeze 狀態自動切換買方/賣方。\n\n🔄 Squeeze ON（盤整）→ 賣 Iron Condor 收 theta\n🔄 Squeeze OFF（趨勢）→ 買 Call/Put 追方向\n📊 兩種行情都能應對，互補性最強",
-    }
-    st.info(OPT_STRAT_DESC.get(selected_opt_strat, ""))
-
-    oc1, oc2, oc3 = st.columns(3)
-    o_entry = oc1.slider("Entry Score", 50, 100, int(o_strategy.get("entry_score", 90)), 5, key="o_entry")
-    o_sl = oc2.slider("Stop Loss %", 5, 50, int(o_risk.get("stop_loss_pct", 0.15) * 100), 5, key="o_sl")
-    o_tp = oc3.slider("TP1 %", 30, 300, int(o_exit.get("tp1_pct", 1.2) * 100), 10, key="o_tp")
-    oc4, oc5 = st.columns(2)
-    o_lots = oc4.slider("Lots/Trade", 1, 3, int(o_risk.get("lots_per_trade", 1)), 1, key="o_lots")
-    o_max = oc5.slider("Max Positions", 0, 5, int(o_risk.get("max_positions", 2)), 1, key="o_max")
-    o_force = oc5.checkbox("Force Close at End", value=options_cfg.get("modes", {}).get(options_cfg.get("active_mode", "V2"), {}).get("force_close_at_end", False), key="o_force")
-
-    if st.button("✅ 套用參數", type="primary"):
-        risk_cfg.setdefault("allocation", {}).setdefault("futures", {})["max_margin_pct"] = f_pct / 100
-        risk_cfg["allocation"].setdefault("options", {})["max_margin_pct"] = o_pct / 100
-        save_yaml(RISK_CFG_PATH, risk_cfg)
-        futures_cfg.setdefault("strategy", {})["entry_score"] = f_entry
-        futures_cfg.setdefault("strategy", {})["active_strategy"] = selected_strat
-        futures_cfg.setdefault("risk_mgmt", {})["stop_loss_pts"] = f_sl
-        futures_cfg.setdefault("strategy", {}).setdefault("partial_exit", {})["tp1_pts"] = f_tp
-        futures_cfg.setdefault("trade_mgmt", {})["lots_per_trade"] = f_lots
-        futures_cfg["trade_mgmt"]["max_positions"] = f_max
-        save_yaml(FUTURES_CFG_PATH, futures_cfg)
-        options_cfg.setdefault("strategy", {})["entry_score"] = o_entry
-        options_cfg.setdefault("risk_mgmt", {})["stop_loss_pct"] = o_sl / 100
-        options_cfg.setdefault("exit_strategy", {})["tp1_pct"] = o_tp / 100
-        options_cfg["risk_mgmt"]["lots_per_trade"] = o_lots
-        options_cfg["risk_mgmt"]["max_positions"] = o_max
-        # Save options strategy selection
-        if selected_opt_strat == "directional":
-            options_cfg.setdefault("theta_gang", {})["enabled"] = False
-        elif selected_opt_strat == "auto_regime":
-            options_cfg.setdefault("theta_gang", {})["enabled"] = True
-            options_cfg["theta_gang"]["auto_regime"] = True
-            options_cfg["theta_gang"]["strategy"] = "iron_condor"
-        else:
-            strat_map = {"theta_iron_condor": "iron_condor", "theta_bull_put": "bull_put_spread", "theta_bear_call": "bear_call_spread"}
-            options_cfg.setdefault("theta_gang", {})["enabled"] = True
-            options_cfg["theta_gang"]["auto_regime"] = False
-            options_cfg["theta_gang"]["strategy"] = strat_map.get(selected_opt_strat, "iron_condor")
-        save_yaml(OPTIONS_CFG_PATH, options_cfg)
-        st.toast("✅ 參數已套用，下一棒生效")
-
-    st.markdown("---")
-    st.markdown("### 🔄 交易模式切換")
-    sw1, sw2 = st.columns(2)
-    with sw1:
-        st.write(f"期貨: {mode_badge(f_live)}")
-        if not f_live:
-            if st.button("切換至 LIVE 🔴", key="f_to_live"):
-                st.session_state["f_confirm_step"] = 1
-            if st.session_state.get("f_confirm_step") == 1:
-                st.warning("⚠️ 即將切換至真實交易，訂單將送出至永豐")
-                code = st.text_input("輸入 CONFIRM-LIVE 確認", key="f_code")
-                if code == "CONFIRM-LIVE":
-                    futures_cfg["live_trading"] = True
-                    save_yaml(FUTURES_CFG_PATH, futures_cfg)
-                    st.session_state["f_confirm_step"] = 0
-                    st.toast("🔴 期貨已切換至 LIVE")
-                    trigger_restart()
-                    st.rerun()
-        else:
-            if st.button("切換至 PAPER 📝", key="f_to_paper"):
-                futures_cfg["live_trading"] = False
-                save_yaml(FUTURES_CFG_PATH, futures_cfg)
-                st.toast("📝 期貨已切換至 PAPER")
-                trigger_restart()
-                st.rerun()
-    with sw2:
-        st.write(f"選擇權: {mode_badge(o_live)}")
-        if not o_live:
-            if st.button("切換至 LIVE 🔴", key="o_to_live"):
-                st.session_state["o_confirm_step"] = 1
-            if st.session_state.get("o_confirm_step") == 1:
-                st.warning("⚠️ 即將切換至真實交易，訂單將送出至永豐")
-                code = st.text_input("輸入 CONFIRM-LIVE 確認", key="o_code")
-                if code == "CONFIRM-LIVE":
-                    options_cfg["live_trading"] = True
-                    save_yaml(OPTIONS_CFG_PATH, options_cfg)
-                    st.session_state["o_confirm_step"] = 0
-                    st.toast("🔴 選擇權已切換至 LIVE")
-                    trigger_restart()
-                    st.rerun()
-        else:
-            if st.button("切換至 PAPER 📝", key="o_to_paper"):
-                options_cfg["live_trading"] = False
-                save_yaml(OPTIONS_CFG_PATH, options_cfg)
-                st.toast("📝 選擇權已切換至 PAPER")
-                trigger_restart()
-                st.rerun()
-
-    st.markdown("---")
-    st.markdown("### 🗑️ 模擬交易重置")
-    r1, r2 = st.columns(2)
-    with r1:
-        f_init = st.number_input("期貨期初資金", 10000, 1000000, int(futures_cfg.get("execution", {}).get("initial_balance", 100000)), 10000, key="f_init")
-        if st.button("🔄 重置期貨模擬", key="f_reset"):
-            for f in (BASE / "exports/trades").glob("TMF_*_trades.*"):
-                f.unlink()
-            st.success(f"✅ 期貨模擬已重置，期初資金 {f_init:,.0f}")
-    with r2:
-        o_init = st.number_input("選擇權期初資金", 10000, 1000000, 40000, 10000, key="o_init")
-        if st.button("🔄 重置選擇權模擬", key="o_reset"):
-            paper_dir = OPTIONS_REPO / "logs/paper_trading"
-            ledger_f = paper_dir / "options_trade_ledger.csv"
-            if ledger_f.exists():
-                pd.DataFrame(columns=["Timestamp", "Mode", "Action", "Side", "Price", "Quantity", "PnL", "Balance", "Note"]).to_csv(ledger_f, index=False)
-            for f in paper_dir.glob("OPTIONS_*_indicators.csv"):
-                f.unlink()
-            pd.DataFrame([{"timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "action": "INITIAL", "side": "", "price": 0, "quantity": 0, "pnl": 0, "balance": o_init, "note": "重置"}]).to_csv(paper_dir / "equity_curve.csv", index=False)
-            st.success(f"✅ 選擇權模擬已重置，期初資金 {o_init:,.0f}")
-
-# ── Sidebar ──
-with st.sidebar:
-    st.header("⚙️ 快速資訊")
-    refresh = st.slider("自動刷新 (秒)", 5, 60, 15, 5)
-    st.divider()
-    st.write(f"期貨: {mode_badge(f_live)}")
-    st.write(f"選擇權: {mode_badge(o_live)}")
-    st.write(f"策略: `{futures_cfg.get('strategy', {}).get('active_strategy', 'squeeze_breakout')}`")
-    _otg = options_cfg.get("theta_gang", {})
-    _olbl = "Auto Regime" if _otg.get("auto_regime") else (_otg.get("strategy", "directional") if _otg.get("enabled") else "Directional")
-    st.write(f"選擇權: `{_olbl}`")
-    st.write(f"分配: 期貨 {alloc.get('futures', {}).get('max_margin_pct', 0)*100:.0f}% / 選擇權 {alloc.get('options', {}).get('max_margin_pct', 0)*100:.0f}%")
-    st.divider()
-    st.caption(f"📁 期貨: {FUTURES_MKT}")
-    st.caption(f"📁 選擇權: {OPTIONS_DATA}")
-
-import time
+# ── Footer and Refresh ──
+refresh = 30
 time.sleep(refresh)
 st.rerun()

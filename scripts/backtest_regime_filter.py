@@ -5,11 +5,11 @@
   B) strict     — can_short = close < ema_filter * 1.001
   C) mid + bull_align guard — mid 條件 + bull_align 時禁止做空
 """
-import sys, pathlib
+import sys
+import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import pandas as pd
-import numpy as np
 from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze, calculate_mtf_alignment
 
 # ── 載入數據 ──
@@ -113,12 +113,12 @@ def run_backtest(df, filter_name, can_short_fn):
     print(f"  淨損益: {t['pnl_cash'].sum():+,.0f} TWD")
     print(f"  平均每筆: {t['pnl_cash'].mean():+,.0f} TWD")
     if len(shorts) > 0:
-        print(f"  --- 空單 ---")
+        print("  --- 空單 ---")
         print(f"  空單數: {len(shorts)}")
         print(f"  空單勝率: {(shorts['pnl_pts'] > 0).mean()*100:.1f}%")
         print(f"  空單淨損益: {shorts['pnl_cash'].sum():+,.0f} TWD")
     if len(longs) > 0:
-        print(f"  --- 多單 ---")
+        print("  --- 多單 ---")
         print(f"  多單數: {len(longs)}")
         print(f"  多單勝率: {(longs['pnl_pts'] > 0).mean()*100:.1f}%")
         print(f"  多單淨損益: {longs['pnl_cash'].sum():+,.0f} TWD")
@@ -127,18 +127,22 @@ def run_backtest(df, filter_name, can_short_fn):
 
 # ── A) Mid (現行) ──
 def can_short_mid(row):
-    if pd.isna(row["ema_filter_15m"]): return True
+    if pd.isna(row["ema_filter_15m"]):
+        return True
     return row["close_15m"] < row["ema_filter_15m"] * 1.002
 
 # ── B) Strict ──
 def can_short_strict(row):
-    if pd.isna(row["ema_filter_15m"]): return True
+    if pd.isna(row["ema_filter_15m"]):
+        return True
     return row["close_15m"] < row["ema_filter_15m"] * 1.001
 
 # ── C) Mid + bull_align guard ──
 def can_short_mid_align(row):
-    if row.get("bullish_align", False): return False
-    if pd.isna(row["ema_filter_15m"]): return True
+    if row.get("bullish_align", False):
+        return False
+    if pd.isna(row["ema_filter_15m"]):
+        return True
     return row["close_15m"] < row["ema_filter_15m"] * 1.002
 
 print(f"\n回測期間: {df_5m.index[0].date()} ~ {df_5m.index[-1].date()}")

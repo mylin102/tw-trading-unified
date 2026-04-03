@@ -5,7 +5,6 @@
 """
 
 import pandas as pd
-import numpy as np
 from datetime import datetime
 from pathlib import Path
 import json
@@ -234,6 +233,6 @@ if __name__ == "__main__":
         'lots': 1,
     })
     
-    print(f"✓ 測試完成")
+    print("✓ 測試完成")
     print(f"  K 棒檔案：{storage.market_file}")
     print(f"  交易檔案：{storage.trade_file}")

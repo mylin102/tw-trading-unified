@@ -3,7 +3,7 @@ import logging
 import pandas as pd
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from typing import Callable, Optional, Dict, Any
+from typing import Callable, Dict
 from collections import deque
 
 try:
@@ -30,7 +30,8 @@ class ShioajiClient:
         self._tick_callbacks = {}  # 儲存 tick 回呼函數
         self._kbar_callbacks = {}  # 儲存 K 棒回呼函數
         self._latest_kbars: Dict[str, deque] = {}  # 儲存最新 K 棒數據
-        if sj is None: return
+        if sj is None:
+            return
         self.api = sj.Shioaji()
 
     def login(self, retries: int = 3, retry_delay: int = 10):
@@ -38,7 +39,8 @@ class ShioajiClient:
         secret_key = os.getenv("SHIOAJI_SECRET_KEY")
         cert_path = os.getenv("SHIOAJI_CERT_PATH")
         cert_password = os.getenv("SHIOAJI_CERT_PASSWORD")
-        if not all([api_key, secret_key]): return False
+        if not all([api_key, secret_key]):
+            return False
         for attempt in range(1, retries + 1):
             try:
                 self.api.login(api_key=api_key, secret_key=secret_key, fetch_contract=True)
@@ -61,7 +63,8 @@ class ShioajiClient:
             contract: Shioaji 合約物件
             callback: 回呼函數，接收 (contract, tick) 參數
         """
-        if not self.is_logged_in: return False
+        if not self.is_logged_in:
+            return False
         try:
             self.api.quote.subscribe(
                 contract,
@@ -75,7 +78,8 @@ class ShioajiClient:
 
     def unsubscribe_market_data(self, contract):
         """取消訂閱市場數據"""
-        if not self.is_logged_in: return False
+        if not self.is_logged_in:
+            return False
         try:
             self.api.quote.unsubscribe(contract)
             return True
@@ -108,7 +112,8 @@ class ShioajiClient:
             start_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
             kbars = self.api.kbars(contract, start=start_date)
             df = pd.DataFrame({**kbars})
-            if df.empty: return df
+            if df.empty:
+                return df
             df.ts = pd.to_datetime(df.ts)
             df.set_index('ts', inplace=True)
             rule = INTERVAL_MAP.get(interval, interval)
@@ -141,7 +146,8 @@ class ShioajiClient:
             - Volume: 成交量
             - amount: 成交金額
         """
-        if not self.is_logged_in: return False
+        if not self.is_logged_in:
+            return False
         try:
             # 訂閱 K 棒數據
             self.api.quote.subscribe(
@@ -157,7 +163,8 @@ class ShioajiClient:
 
     def get_available_margin(self):
         """查詢期貨帳戶可用保證金 (TWD)"""
-        if not self.is_logged_in: return 0
+        if not self.is_logged_in:
+            return 0
         try:
             margins = self.api.get_account_margin()
             if margins:
@@ -168,20 +175,25 @@ class ShioajiClient:
             return 0
 
     def get_futures_contract(self, ticker: str):
-        if not self.is_logged_in: return None
+        if not self.is_logged_in:
+            return None
         try:
-            if ticker == 'TXFR1': return self.api.Contracts.Futures.TXF.TXFR1
-            if ticker == 'MXFR1': return self.api.Contracts.Futures.MXF.MXFR1
+            if ticker == 'TXFR1':
+                return self.api.Contracts.Futures.TXF.TXFR1
+            if ticker == 'MXFR1':
+                return self.api.Contracts.Futures.MXF.MXFR1
             if ticker == 'TMF':
                 # 用近月 R1
                 return self.api.Contracts.Futures.TMF.TMFR1
             # 支援直接指定合約代碼如 TMFD6
             category = ticker[:3] if len(ticker) > 3 else ticker
             return self.api.Contracts.Futures[category][ticker]
-        except Exception: return None
+        except Exception:
+            return None
 
     def place_order(self, contract, action: str, quantity: int, price: float = 0):
-        if not self.is_logged_in: return None
+        if not self.is_logged_in:
+            return None
         try:
             action_value = action
             if sj is not None and isinstance(action, str):
@@ -205,7 +217,8 @@ class ShioajiClient:
 
     def update_order(self, trade, price: float, quantity: int = 1):
         """改單（移動停損用，不刪單重下以保留排隊順位）"""
-        if not self.is_logged_in: return False
+        if not self.is_logged_in:
+            return False
         try:
             self.api.update_order(trade, price=price, qty=quantity)
             return True
@@ -215,7 +228,8 @@ class ShioajiClient:
 
     def cancel_order(self, trade):
         """撤單（停利成交後撤銷場上停損單）"""
-        if not self.is_logged_in: return False
+        if not self.is_logged_in:
+            return False
         try:
             self.api.cancel_order(trade)
             return True

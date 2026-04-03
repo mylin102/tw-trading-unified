@@ -1,5 +1,5 @@
 """P0 + P1 tests — every bug from tonight becomes a test case."""
-import sys, os, tempfile, csv
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -134,7 +134,6 @@ class TestPnLIncludesFees:
 class TestStrategyPlugins:
     def _make_state(self, **overrides):
         import pandas as pd
-        import numpy as np
         defaults = {
             "sqz_on": False, "momentum": 50, "mom_state": 3,
             "Close": 32700, "vwap": 32600, "atr": 30,
@@ -193,11 +192,11 @@ class TestThetaGang:
 
     def test_no_entry_when_squeeze_off(self):
         from strategies.options.theta_gang import should_enter_theta
-        assert should_enter_theta(squeeze_on=False, iv=0.30) == False
+        assert not should_enter_theta(squeeze_on=False, iv=0.30)
 
     def test_entry_when_squeeze_on_high_iv(self):
         from strategies.options.theta_gang import should_enter_theta
-        assert should_enter_theta(squeeze_on=True, iv=0.30) == True
+        assert should_enter_theta(squeeze_on=True, iv=0.30)
 
     def test_exit_on_squeeze_release(self):
         from strategies.options.theta_gang import ThetaGangManager
@@ -231,7 +230,6 @@ class TestDateHandling:
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             # The storage should use 20260402, not 20260403
             # (tested via the __import__ workaround)
-            import importlib
             assert True  # Placeholder — actual test needs DataStorage refactor
 
 
@@ -259,7 +257,8 @@ class TestMomentumBurstZScore:
     def test_zscore_fires_on_extreme(self):
         """極端 velocity 應該觸發"""
         from strategies.futures.entry_strategies import strategy_momentum_burst
-        import pandas as pd, numpy as np
+        import pandas as pd
+        import numpy as np
         # 歷史 mom_velo 均值 0, std 2 → 當前 10 → zscore=5 → 觸發
         velos = np.random.normal(0, 2, 99).tolist() + [10.0]
         df = pd.DataFrame({"mom_velo": velos, "Close": [32700] * 100})
@@ -285,7 +284,8 @@ class TestCumulativeDeltaWeighted:
     def test_weighted_delta_differs_from_simple(self):
         """價格加權 delta 與簡單 delta 結果不同"""
         from strategies.futures.entry_strategies import strategy_cumulative_delta
-        import pandas as pd, numpy as np
+        import pandas as pd
+        import numpy as np
         n = 60
         c = np.linspace(32600, 32700, n)
         o = c - 5  # all green bars

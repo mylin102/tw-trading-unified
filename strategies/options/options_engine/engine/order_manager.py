@@ -22,7 +22,7 @@ Shioaji API 參考:
 """
 
 import datetime
-from typing import Dict, Optional, Callable, List
+from typing import Dict, Optional, Callable
 from pathlib import Path
 import sys
 

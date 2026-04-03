@@ -5,7 +5,6 @@ os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 
 
 def calculate_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
@@ -72,7 +71,7 @@ def calculate_futures_squeeze(
     res["vwap"] = typical_price_x_volume.groupby(res["trading_day"]).cumsum() / volume_cumsum
     res["vwap"] = res["vwap"].where(volume_cumsum != 0, res["Close"])
     res["price_vs_vwap"] = np.where(res["vwap"] != 0, (res["Close"] - res["vwap"]) / res["vwap"], 0.0)
-    res["fired"] = (~res["sqz_on"]) & (res["sqz_on"].shift(1) == True)
+    res["fired"] = (~res["sqz_on"]) & (res["sqz_on"].shift(1))
 
     # Calculate mom_state vectorized for better performance
     m = res["momentum"].values

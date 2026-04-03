@@ -2,18 +2,16 @@
 """
 回測比較：原始 Squeeze Breakout vs Squeeze Failure Counter (均值回歸)
 """
-import sys, os
+import sys
 import numpy as np
 import pandas as pd
-import numba as nb
 from pathlib import Path
-from dataclasses import dataclass
 
 sys.path.append(str(Path(__file__).parent.parent))
 from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze
 from strategies.futures.squeeze_futures.engine.vectorized import (
     SimulatorConfig, VectorizedSimulator, simulate_trades_vectorized,
-    calc_costs, calculate_metrics,
+    calculate_metrics,
 )
 from rich.console import Console
 from rich.table import Table

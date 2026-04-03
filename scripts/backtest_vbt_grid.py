@@ -3,17 +3,16 @@
 vectorbt 網格回測：Breakout + Counter 雙模式最佳參數搜尋
 使用現有 VectorizedSimulator 引擎 + vbt 分析指標/熱力圖
 """
-import sys, os
+import sys
 import numpy as np
 import pandas as pd
-import vectorbt as vbt
 from itertools import product
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent.parent))
 from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze
 from strategies.futures.squeeze_futures.engine.vectorized import (
-    SimulatorConfig, simulate_trades_vectorized, calculate_metrics, calc_costs,
+    SimulatorConfig, simulate_trades_vectorized, calculate_metrics,
 )
 from scripts.backtest_squeeze_failure import generate_failure_signals
 from rich.console import Console
@@ -145,7 +144,8 @@ def make_heatmaps(breakout_df, counter_df):
 
 def main():
     if not DATA.exists():
-        console.print(f"[red]❌ {DATA} not found[/red]"); return
+        console.print(f"[red]❌ {DATA} not found[/red]")
+        return
 
     df = load_data()
     config = SimulatorConfig(point_value=10, slippage=1.0, lots_per_trade=1, max_positions=1)

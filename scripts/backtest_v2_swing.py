@@ -3,7 +3,8 @@
 V2 Swing 回測：較長天期 + trailing stop + cooldown + 1h 加權
 vs V3 Night (現行)
 """
-import sys, pathlib
+import sys
+import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "strategies" / "options"))
 
@@ -84,7 +85,8 @@ def run(label, scores, entry_score, sl_pct, tp1_pct, score_floor,
             if not has_tp1 and pos == 2 and (cur_p - entry_p) / entry_p >= tp1_pct:
                 pnl = (cur_p - entry_p) * POINT_VALUE
                 total_pnl += pnl
-                if pnl > 0: wins += 1
+                if pnl > 0:
+                    wins += 1
                 trades += 1
                 reasons["TP1"] = reasons.get("TP1", 0) + 1
                 pos = 1
@@ -95,7 +97,8 @@ def run(label, scores, entry_score, sl_pct, tp1_pct, score_floor,
                 if cur_p <= peak_p * (1 - trailing_pct):
                     pnl = (cur_p - entry_p) * POINT_VALUE * pos
                     total_pnl += pnl
-                    if pnl > 0: wins += 1
+                    if pnl > 0:
+                        wins += 1
                     trades += 1
                     reasons["TRAILING"] = reasons.get("TRAILING", 0) + 1
                     pos = 0
@@ -106,7 +109,8 @@ def run(label, scores, entry_score, sl_pct, tp1_pct, score_floor,
             if should_exit_position(cur_p, entry_p, sl_pct, s, has_tp1, score_floor=score_floor):
                 pnl = (cur_p - entry_p) * POINT_VALUE * pos
                 total_pnl += pnl
-                if pnl > 0: wins += 1
+                if pnl > 0:
+                    wins += 1
                 trades += 1
                 r = "STOP_LOSS" if cur_p <= stop_threshold(entry_p, sl_pct, has_tp1) else "SCORE_FLOOR"
                 reasons[r] = reasons.get(r, 0) + 1

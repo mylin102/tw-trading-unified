@@ -4,12 +4,12 @@ Optimized backtest with vectorbt analytics.
 Strategy logic stays as custom loop (squeeze-specific), 
 but uses vbt for performance metrics, plotting, and parameter heatmap.
 """
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "strategies", "futures"))
 
 import numpy as np
 import pandas as pd
-import vectorbt as vbt
 from itertools import product
 from squeeze_futures.engine.indicators import calculate_futures_squeeze, calculate_mtf_alignment
 
@@ -28,7 +28,8 @@ def load_and_calc(path):
     for ts in df.index:
         p = {"5m": df.loc[:ts]}
         m15 = df_15m.loc[:ts]
-        if len(m15) > 0: p["15m"] = m15
+        if len(m15) > 0:
+            p["15m"] = m15
         scores.append(calculate_mtf_alignment(p, weights={"5m": 0.5, "15m": 0.5})["score"])
     df["score"] = scores
     print(f"Data: {len(df)} bars, {df.index[0]} → {df.index[-1]}")
@@ -45,9 +46,11 @@ def backtest_futures(df, entry_score, sl_pts, tp_pts, pv=10):
         if pos != 0:
             pnl_pts = (price - ep) * pos
             if pnl_pts <= -sl_pts:
-                equity.append(equity[-1] - sl_pts * pv); pos = 0
+                equity.append(equity[-1] - sl_pts * pv)
+                pos = 0
             elif pnl_pts >= tp_pts:
-                equity.append(equity[-1] + tp_pts * pv); pos = 0
+                equity.append(equity[-1] + tp_pts * pv)
+                pos = 0
             else:
                 equity.append(equity[-1] + (pnl_pts - (df.iloc[i-1]["Close"] - ep) * pos) * pv)
                 continue
@@ -71,11 +74,14 @@ def backtest_options(df, entry_score, sl_pct, tp_pct, premium=100, pv=50):
             pts = (price - emtx) * (1 if side == "C" else -1)
             cur = ep * (1 - theta * (i - ebar)) + pts * 0.5
             if cur <= ep * (1 - sl_pct):
-                equity.append(equity[-1] - sl_pct * ep * pv); pos = 0
+                equity.append(equity[-1] - sl_pct * ep * pv)
+                pos = 0
             elif cur >= ep * (1 + tp_pct):
-                equity.append(equity[-1] + tp_pct * ep * pv); pos = 0
+                equity.append(equity[-1] + tp_pct * ep * pv)
+                pos = 0
             elif abs(score) < 20:
-                equity.append(equity[-1] + (cur - ep) * pv); pos = 0
+                equity.append(equity[-1] + (cur - ep) * pv)
+                pos = 0
             else:
                 equity.append(equity[-1])
                 continue
@@ -111,11 +117,10 @@ def main():
 
     # Best futures equity curve
     best_f = fdf.iloc[0]
-    best_eq = backtest_futures(df, int(best_f["entry"]), int(best_f["sl"]), int(best_f["tp"]))
+    backtest_futures(df, int(best_f["entry"]), int(best_f["sl"]), int(best_f["tp"]))
     print(f"\nBest: entry={best_f['entry']} sl={best_f['sl']} tp={best_f['tp']} → PnL={best_f['pnl']:+,.0f} Sharpe={best_f['sharpe']}")
 
     # === Options sweep ===
-    print("\n🟠 OPTIONS TXO — Parameter Sweep")
     o_params = list(product([60, 70, 80, 90], [0.10, 0.15, 0.20], [0.5, 0.8, 1.0, 1.2]))
     o_results = []
     for es, sl, tp in o_params:

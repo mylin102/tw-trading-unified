@@ -1,7 +1,7 @@
 import pandas as pd
 from datetime import datetime
 import os
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, Dict
 
 
 def calculate_ma_stop_price(
@@ -211,7 +211,8 @@ class PaperTrader:
     def execute_signal(self, signal: str, price: float, timestamp: datetime, lots=1, max_lots=1, stop_loss=None, break_even_trigger=None, exit_reason: str = None):
         if signal == "BUY":
             if self.position < max_lots:
-                if self.position < 0: self.execute_signal("EXIT", price, timestamp)
+                if self.position < 0:
+                    self.execute_signal("EXIT", price, timestamp)
                 if self.position == 0:
                     self.entry_price, self.entry_time, self.be_triggered = price, timestamp, False
                     self.current_stop_loss = price - stop_loss if stop_loss else None
@@ -232,7 +233,8 @@ class PaperTrader:
 
         elif signal == "SELL":
             if abs(self.position) < max_lots:
-                if self.position > 0: self.execute_signal("EXIT", price, timestamp)
+                if self.position > 0:
+                    self.execute_signal("EXIT", price, timestamp)
                 if self.position == 0:
                     self.entry_price, self.entry_time, self.be_triggered = price, timestamp, False
                     self.current_stop_loss = price + stop_loss if stop_loss else None
@@ -287,11 +289,13 @@ class PaperTrader:
         return None
 
     def update_trailing_stop(self, current_price: float):
-        if self.position == 0 or not self.be_points or self.be_triggered: return False
+        if self.position == 0 or not self.be_points or self.be_triggered:
+            return False
         pnl = (current_price - self.entry_price) * (1 if self.position > 0 else -1)
         if pnl >= self.be_points:
             self.current_stop_loss = self.entry_price + (10 * (1 if self.position > 0 else -1))
-            self.be_triggered = True; return True
+            self.be_triggered = True
+            return True
         return False
 
     def check_stop_loss(self, price: float, timestamp: datetime):
@@ -302,7 +306,8 @@ class PaperTrader:
         return None
 
     def get_performance_report(self):
-        if not self.trades: return "No trades."
+        if not self.trades:
+            return "No trades."
         df = pd.DataFrame(self.trades)
         return (
             f"# 📊 Report\n"
@@ -315,5 +320,6 @@ class PaperTrader:
     def save_report(self):
         os.makedirs("exports/simulations", exist_ok=True)
         path = f"exports/simulations/report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-        with open(path, "w") as f: f.write(self.get_performance_report())
+        with open(path, "w") as f:
+            f.write(self.get_performance_report())
         return path

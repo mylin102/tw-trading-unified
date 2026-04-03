@@ -4,9 +4,8 @@
 用途：從 Shioaji API 抓取 3/27 至今的完整歷史數據，計算指標並更新日誌。
 """
 import sys
-import os
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 # 加入專案根目錄

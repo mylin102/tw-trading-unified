@@ -167,12 +167,20 @@ def run_system(dry_run=False):
         # 關閉流程
         console.print("[dim]Stopping monitors and threads...[/dim]")
         try:
-            if 'fm' in locals(): fm.stop()
-            if 'om' in locals(): om.stop()
+            if 'fm' in locals():
+                # Stop futures monitor
+                fm.stop()
+            if 'om' in locals():
+                # Stop options monitor
+                om.stop()
             
             # 給予執行緒時間結束
-            if 'ft' in locals(): ft.join(timeout=5)
-            if 'ot' in locals(): ot.join(timeout=5)
+            if 'ft' in locals():
+                # Wait for futures thread
+                ft.join(timeout=5)
+            if 'ot' in locals():
+                # Wait for options thread
+                ot.join(timeout=5)
             
             if api is not None:
                 api.quote.set_on_tick_fop_v1_callback(lambda ex, t: None)

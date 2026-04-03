@@ -2,15 +2,15 @@
 """
 今晚夜盤 (20260402) vectorbt 回測：用 indicator CSV 重建信號，掃描最佳參數
 """
-import sys, os
+import sys
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent.parent))
-from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze, calculate_atr
+from strategies.futures.squeeze_futures.engine.indicators import calculate_atr
 from strategies.futures.squeeze_futures.engine.vectorized import (
-    SimulatorConfig, simulate_trades_vectorized, calculate_metrics, calc_costs,
+    SimulatorConfig, simulate_trades_vectorized, calculate_metrics,
 )
 from scripts.backtest_squeeze_failure import generate_failure_signals
 from rich.console import Console

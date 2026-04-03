@@ -9,22 +9,18 @@ Squeeze Futures 即時交易儀表板
 
 import streamlit as st
 import pandas as pd
-import numpy as np
 import yaml
-from pathlib import Path
-
-# 嘗試載入 Shioaji
-try:
-    import shioaji as sj
-    HAS_SHIOAJI = True
-except:
-    HAS_SHIOAJI = False
-from datetime import datetime, timedelta
-from pathlib import Path
 import time
 import re
 import os
-import yaml
+from pathlib import Path
+from datetime import datetime
+
+# 嘗試載入 Shioaji
+try:
+    HAS_SHIOAJI = True
+except Exception:
+    HAS_SHIOAJI = False
 
 # 頁面配置
 st.set_page_config(
@@ -100,7 +96,7 @@ def load_market_data(date: str = None):
 def parse_trade_log(date: str = None):
     """解析交易日誌"""
     # 始終使用今日日期
-    date = datetime.now().strftime("%Y-%m-%d")
+    datetime.now().strftime("%Y-%m-%d")
     
     trades = []
     if LOG_FILE.exists():
@@ -133,7 +129,7 @@ def parse_trade_log(date: str = None):
                             'price': price,
                             'pnl': pnl,
                         })
-                    except:
+                    except Exception:
                         pass
     
     return pd.DataFrame(trades) if trades else pd.DataFrame()
@@ -151,7 +147,7 @@ def calculate_metrics(trades_df: pd.DataFrame):
             with open(config_file, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
                 display_initial = config.get('execution', {}).get('initial_balance', 40000)
-    except:
+    except Exception:
         pass
     
     if trades_df is None or trades_df.empty:
@@ -218,7 +214,7 @@ try:
         with open(config_file, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
             is_live = config.get('live_trading', False)
-except:
+except Exception:
     pass
 
 # 側邊欄
@@ -245,7 +241,6 @@ with st.sidebar:
     # 自動刷新按鈕
     st.write("**自動刷新：**")
     if st.checkbox("啟用自動刷新 (10 秒)", value=False):
-        import time
         time.sleep(0.1)
         st.rerun()
     
@@ -257,7 +252,6 @@ with st.sidebar:
     config_file = Path("config/trade_config.yaml")
     if config_file.exists():
         try:
-            import yaml
             with open(config_file, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
             
@@ -306,7 +300,6 @@ with st.sidebar:
         
         # 重置按鈕
         if st.button("🗑️ 清空記錄"):
-            from datetime import datetime
             today = datetime.now().strftime("%Y%m%d")
             
             # 清空檔案
@@ -318,7 +311,7 @@ with st.sidebar:
             for f in files:
                 try:
                     Path(f).unlink(missing_ok=True)
-                except:
+                except Exception:
                     pass
             
             # 清空日誌
@@ -329,7 +322,7 @@ with st.sidebar:
                     for line in lines:
                         if today not in line:
                             f.write(line)
-            except:
+            except Exception:
                 pass
             
             st.success("✅ 已清空！請按 F5 刷新頁面")
@@ -357,7 +350,7 @@ live_mode = False
 try:
     config = yaml.safe_load(Path("config/trade_config.yaml").open())
     live_mode = config.get('live_trading', False)
-except:
+except Exception:
     pass
 if live_mode:
     st.success("✅ 實際交易模式")

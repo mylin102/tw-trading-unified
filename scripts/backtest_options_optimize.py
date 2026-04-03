@@ -2,7 +2,8 @@
 """
 選擇權參數網格優化：entry_score × stop_loss × tp1 × score_floor
 """
-import sys, pathlib
+import sys
+import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "strategies" / "options"))
 
@@ -10,7 +11,7 @@ import pandas as pd
 import numpy as np
 from itertools import product
 from strategies.options.options_engine.engine.indicators import calculate_futures_squeeze, calculate_mtf_alignment
-from strategies.options.options_engine.engine.backtest_engine import should_exit_position, stop_threshold
+from strategies.options.options_engine.engine.backtest_engine import should_exit_position
 
 # ── 載入 & 指標 ──
 DATA = pathlib.Path.home() / "Documents/mylin102/tw-option-squeeze-trading/exports/tmf_replay_5min_q1_2026.csv"
@@ -75,7 +76,8 @@ def run(entry_score, sl_pct, tp1_pct, score_floor):
             if not has_tp1 and pos == 2 and (cur_p - entry_p) / entry_p >= tp1_pct:
                 pnl = (cur_p - entry_p) * POINT_VALUE
                 total_pnl += pnl
-                if pnl > 0: wins += 1
+                if pnl > 0:
+                    wins += 1
                 trades += 1
                 pos = 1
                 has_tp1 = True
@@ -83,7 +85,8 @@ def run(entry_score, sl_pct, tp1_pct, score_floor):
             if should_exit_position(cur_p, entry_p, sl_pct, s, has_tp1, score_floor=score_floor):
                 pnl = (cur_p - entry_p) * POINT_VALUE * pos
                 total_pnl += pnl
-                if pnl > 0: wins += 1
+                if pnl > 0:
+                    wins += 1
                 trades += 1
                 pos = 0
                 continue
@@ -131,20 +134,20 @@ df_r = df_r[df_r["trades"] >= 10].copy()
 df_r = df_r.sort_values("net_pnl", ascending=False)
 
 print(f"\n{'='*70}")
-print(f"🏆 Top 10 (by net_pnl, trades >= 10)")
+print("🏆 Top 10 (by net_pnl, trades >= 10)")
 print(f"{'='*70}")
 cols = ["entry_score", "sl_pct", "tp1_pct", "score_floor", "trades", "win_rate", "net_pnl", "avg_pnl"]
 print(df_r[cols].head(10).to_string(index=False, float_format=lambda x: f"{x:,.1f}"))
 
 print(f"\n{'='*70}")
-print(f"🏆 Top 10 (by avg_pnl, trades >= 10)")
+print("🏆 Top 10 (by avg_pnl, trades >= 10)")
 print(f"{'='*70}")
 df_r2 = df_r.sort_values("avg_pnl", ascending=False)
 print(df_r2[cols].head(10).to_string(index=False, float_format=lambda x: f"{x:,.1f}"))
 
 # score_floor 分組比較
 print(f"\n{'='*70}")
-print(f"📊 Score Floor 分組平均 (所有組合)")
+print("📊 Score Floor 分組平均 (所有組合)")
 print(f"{'='*70}")
 grp = df_r.groupby("score_floor")[["trades", "win_rate", "net_pnl", "avg_pnl"]].mean()
 print(grp.to_string(float_format=lambda x: f"{x:,.1f}"))

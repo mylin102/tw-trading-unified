@@ -12,7 +12,7 @@
 import numpy as np
 import pandas as pd
 import numba as nb
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 from dataclasses import dataclass
 from rich.console import Console
 

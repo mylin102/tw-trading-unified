@@ -12,7 +12,7 @@
 
 import numpy as np
 import numba as nb
-from typing import Dict, List, Optional
+from typing import Dict, List
 from functools import lru_cache
 from rich.console import Console
 import time
@@ -345,12 +345,12 @@ def example_usage():
     prices = np.random.randn(10000).cumsum() + 100
     
     start = time.perf_counter()
-    returns = calculate_returns_vectorized(prices)
+    calculate_returns_vectorized(prices)
     elapsed = time.perf_counter() - start
     console.print(f"   Returns calculation: {elapsed*1000:.2f}ms")
     
     start = time.perf_counter()
-    drawdown = calculate_drawdown_vectorized(prices)
+    calculate_drawdown_vectorized(prices)
     elapsed = time.perf_counter() - start
     console.print(f"   Drawdown calculation: {elapsed*1000:.2f}ms")
     
@@ -358,8 +358,8 @@ def example_usage():
     console.print("\n[yellow]2. Memory Pool[/yellow]")
     
     pool = MemoryPool(max_size=100)
-    arr1 = pool.get_array('test1', 1000)
-    arr2 = pool.get_array('test2', 2000)
+    pool.get_array('test1', 1000)
+    pool.get_array('test2', 2000)
     console.print(f"   Allocated arrays: {len(pool.arrays)}")
     
     # 3. 效能分析

@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import sys
 from pathlib import Path
-import matplotlib.pyplot as plt
 
 # Add project root to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -28,7 +27,6 @@ def run_audit():
 
     # 參數網格搜索
     results = []
-    sl_range = [0] # 僅測試 ATR 動態停損
     atr_mult_range = [2.0, 3.0]
     tp_range = [40, 80]
     velo_range = [0.0, 0.5, 1.0, 2.0] # 測試不同斜率門檻
@@ -69,7 +67,7 @@ def run_audit():
     small_sl = df_results[df_results["SL"] <= 30]
     large_sl = df_results[df_results["SL"] > 30]
     if small_sl["Win Rate"].mean() < large_sl["Win Rate"].mean() - 5:
-        print(f"⚠️ 漏洞發現：緊湊停損 (<=30pts) 的勝率顯著低於寬鬆停損。市場雜訊可能頻繁觸發無謂的停損。")
+        print("⚠️ 漏洞發現：緊湊停損 (<=30pts) 的勝率顯著低於寬鬆停損。市場雜訊可能頻繁觸發無謂的停損。")
 
     # 3. 檢查跳空影響
     # (這部分會從 simulator.run 返回的 exit_reasons 中分析，若 reason=0 且成交價 != sl_price 則為跳空)

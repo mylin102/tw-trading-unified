@@ -22,8 +22,10 @@ def strategy_squeeze_breakout(state, cfg):
     elif filter_mode == "mid":
         can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.998
         can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.002
-        if last_5m.get("bullish_align", False): can_short = False
-        if last_5m.get("bearish_align", False): can_long = False
+        if last_5m.get("bullish_align", False):
+            can_short = False
+        if last_5m.get("bearish_align", False):
+            can_long = False
     else:
         can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.999
         can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.001
@@ -48,7 +50,7 @@ def strategy_trend_follow(state, cfg):
     s = cfg.get("strategy", {}).get("trend_follow", {})
     min_score = s.get("min_score", 30)
     atr_mult = s.get("atr_mult", 3.0)
-    trailing_atr = s.get("trailing_atr", 2.0)
+    s.get("trailing_atr", 2.0)
 
     last_5m, last_15m, score = state["last_5m"], state["last_15m"], state["score"]
     atr = last_5m.get("atr", 0)
@@ -236,7 +238,7 @@ def strategy_psar_breakout(state, cfg):
     close = df["Close"].values
     sma = df["Close"].rolling(sma_len).mean().values[-1]
     price = close[-1]
-    prev_price = close[-2]
+    close[-2]
 
     import math
     # Long: price crosses above PSAR + above SMA

@@ -5,7 +5,8 @@
 2. 賣方 credit（score 低迷時賣，收 theta）
 3. 買方 + 反轉過濾（只在 squeeze fire 時進場）
 """
-import sys, pathlib
+import sys
+import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "strategies" / "options"))
 
@@ -60,8 +61,16 @@ THETA = 0.3
 # Strategy 1: 買方 + bull_align guard + squeeze fire 確認
 # ═══════════════════════════════════════
 def strat_buy_filtered(entry_score, sl_pct, tp_pct, cooldown, trail_pct, require_fire):
-    pos = 0; entry_p = 0; entry_mtx = 0; has_tp1 = False; side = None
-    peak = 0; cd = 0; pnl = 0; trades = 0; wins = 0
+    pos = 0
+    entry_p = 0
+    entry_mtx = 0
+    has_tp1 = False
+    side = None
+    peak = 0
+    cd = 0
+    pnl = 0
+    trades = 0
+    wins = 0
 
     for i in range(1, n):
         c, s = close[i], scores[i]
@@ -69,33 +78,53 @@ def strat_buy_filtered(entry_score, sl_pct, tp_pct, cooldown, trail_pct, require
             diff = (c - entry_mtx) * (1 if side == "C" else -1)
             cur = entry_p + diff * DELTA - THETA
             cur = max(cur, 0.1)
-            if cur > peak: peak = cur
+            if cur > peak:
+                peak = cur
             # TP1
             if not has_tp1 and pos == 2 and (cur - entry_p) / entry_p >= tp_pct:
-                pnl += (cur - entry_p) * PV; trades += 1; wins += 1
-                pos = 1; has_tp1 = True
+                pnl += (cur - entry_p) * PV
+                trades += 1
+                wins += 1
+                pos = 1
+                has_tp1 = True
             # Trailing
             if trail_pct > 0 and has_tp1 and cur <= peak * (1 - trail_pct):
-                pnl += (cur - entry_p) * PV * pos; trades += 1
-                if cur > entry_p: wins += 1
-                pos = 0; cd = cooldown; continue
+                pnl += (cur - entry_p) * PV * pos
+                trades += 1
+                if cur > entry_p:
+                    wins += 1
+                pos = 0
+                cd = cooldown
+                continue
             # Stop
             threshold = entry_p if has_tp1 else entry_p * (1 - sl_pct)
             if cur <= threshold:
-                pnl += (cur - entry_p) * PV * pos; trades += 1
-                pos = 0; cd = cooldown; continue
+                pnl += (cur - entry_p) * PV * pos
+                trades += 1
+                pos = 0
+                cd = cooldown
+                continue
 
         if pos == 0:
-            if cd > 0: cd -= 1; continue
+            if cd > 0:
+                cd -= 1
+                continue
             # bull_align guard
             if s >= entry_score and c > vwap[i] and bull_align[i]:
-                if require_fire and not fired[i]: continue
+                if require_fire and not fired[i]:
+                    continue
                 side = "C"
             elif s <= -entry_score and c < vwap[i] and bear_align[i]:
-                if require_fire and not fired[i]: continue
+                if require_fire and not fired[i]:
+                    continue
                 side = "P"
-            else: continue
-            pos = 2; entry_p = ENTRY_P; entry_mtx = c; has_tp1 = False; peak = ENTRY_P
+            else:
+                continue
+            pos = 2
+            entry_p = ENTRY_P
+            entry_mtx = c
+            has_tp1 = False
+            peak = ENTRY_P
 
     wr = wins / trades * 100 if trades > 0 else 0
     return {"trades": trades, "win_rate": wr, "net_pnl": pnl, "avg": pnl / trades if trades else 0}
@@ -106,8 +135,12 @@ def strat_buy_filtered(entry_score, sl_pct, tp_pct, cooldown, trail_pct, require
 # 簡化：每根 bar 收 theta，如果價格大幅移動就虧
 # ═══════════════════════════════════════
 def strat_sell_theta(sell_threshold, max_move_pts, hold_bars):
-    pos = 0; bars_held = 0; entry_mtx = 0
-    pnl = 0; trades = 0; wins = 0
+    pos = 0
+    bars_held = 0
+    entry_mtx = 0
+    pnl = 0
+    trades = 0
+    wins = 0
 
     for i in range(1, n):
         c, s = close[i], scores[i]
@@ -120,19 +153,24 @@ def strat_sell_theta(sell_threshold, max_move_pts, hold_bars):
                 loss = move * DELTA * PV - bars_held * THETA * PV
                 pnl -= abs(loss)
                 trades += 1
-                pos = 0; continue
+                pos = 0
+                continue
             if bars_held >= hold_bars:
                 # 時間到，收 theta 利潤
                 gain = bars_held * THETA * PV - move * DELTA * PV * 0.3  # partial delta loss
                 pnl += gain
                 trades += 1
-                if gain > 0: wins += 1
-                pos = 0; continue
+                if gain > 0:
+                    wins += 1
+                pos = 0
+                continue
 
         if pos == 0:
             # 進場條件：低波動、score 平淡、squeeze on（壓縮中）
             if abs(s) < sell_threshold and sqz_on[i]:
-                pos = 1; entry_mtx = c; bars_held = 0
+                pos = 1
+                entry_mtx = c
+                bars_held = 0
 
     wr = wins / trades * 100 if trades > 0 else 0
     return {"trades": trades, "win_rate": wr, "net_pnl": pnl, "avg": pnl / trades if trades else 0}
@@ -141,38 +179,65 @@ def strat_sell_theta(sell_threshold, max_move_pts, hold_bars):
 # Strategy 3: 只在 squeeze fire 進場（最嚴格）
 # ═══════════════════════════════════════
 def strat_fire_only(sl_pct, tp_pct, cooldown, trail_pct):
-    pos = 0; entry_p = 0; entry_mtx = 0; has_tp1 = False; side = None
-    peak = 0; cd = 0; pnl = 0; trades = 0; wins = 0
+    pos = 0
+    entry_p = 0
+    entry_mtx = 0
+    has_tp1 = False
+    side = None
+    peak = 0
+    cd = 0
+    pnl = 0
+    trades = 0
+    wins = 0
 
     for i in range(1, n):
-        c, s = close[i], scores[i]
+        c, _s = close[i], scores[i]
         if pos > 0:
             diff = (c - entry_mtx) * (1 if side == "C" else -1)
             cur = entry_p + diff * DELTA - THETA
             cur = max(cur, 0.1)
-            if cur > peak: peak = cur
+            if cur > peak:
+                peak = cur
             if not has_tp1 and pos == 2 and (cur - entry_p) / entry_p >= tp_pct:
-                pnl += (cur - entry_p) * PV; trades += 1; wins += 1
-                pos = 1; has_tp1 = True
+                pnl += (cur - entry_p) * PV
+                trades += 1
+                wins += 1
+                pos = 1
+                has_tp1 = True
             if trail_pct > 0 and has_tp1 and cur <= peak * (1 - trail_pct):
-                pnl += (cur - entry_p) * PV * pos; trades += 1
-                if cur > entry_p: wins += 1
-                pos = 0; cd = cooldown; continue
+                pnl += (cur - entry_p) * PV * pos
+                trades += 1
+                if cur > entry_p:
+                    wins += 1
+                pos = 0
+                cd = cooldown
+                continue
             threshold = entry_p if has_tp1 else entry_p * (1 - sl_pct)
             if cur <= threshold:
-                pnl += (cur - entry_p) * PV * pos; trades += 1
-                pos = 0; cd = cooldown; continue
+                pnl += (cur - entry_p) * PV * pos
+                trades += 1
+                pos = 0
+                cd = cooldown
+                continue
 
         if pos == 0:
-            if cd > 0: cd -= 1; continue
-            if not fired[i]: continue
+            if cd > 0:
+                cd -= 1
+                continue
+            if not fired[i]:
+                continue
             # fire 時看 momentum 方向
             if mom_state[i] >= 3 and c > vwap[i] and bull_align[i]:
                 side = "C"
             elif mom_state[i] <= 0 and c < vwap[i] and bear_align[i]:
                 side = "P"
-            else: continue
-            pos = 2; entry_p = ENTRY_P; entry_mtx = c; has_tp1 = False; peak = ENTRY_P
+            else:
+                continue
+            pos = 2
+            entry_p = ENTRY_P
+            entry_mtx = c
+            has_tp1 = False
+            peak = ENTRY_P
 
     wr = wins / trades * 100 if trades > 0 else 0
     return {"trades": trades, "win_rate": wr, "net_pnl": pnl, "avg": pnl / trades if trades else 0}

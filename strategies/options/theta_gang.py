@@ -12,7 +12,7 @@ Exit: target profit %, max loss %, DTE floor, or squeeze release
 """
 import datetime
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, List
 
 
 @dataclass
@@ -49,7 +49,7 @@ def select_strikes(spot, strike_rounding, strategy, wing_width=200, otm_offset=2
     def round_strike(p):
         return round(p / strike_rounding) * strike_rounding
 
-    atm = round_strike(spot)
+    round_strike(spot)
 
     if strategy == "bull_put_spread":
         short_put = round_strike(spot - otm_offset)

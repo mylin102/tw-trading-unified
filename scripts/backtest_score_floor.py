@@ -7,18 +7,17 @@
 
 使用真實 BS 定價引擎 + MTX 5m replay 數據
 """
-import sys, pathlib
+import sys
+import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "strategies" / "options"))
 
 import pandas as pd
-import numpy as np
 from strategies.options.options_engine.engine.indicators import calculate_futures_squeeze, calculate_mtf_alignment
 from strategies.options.options_engine.engine.backtest_engine import (
-    initial_option_premium, mark_option_premium, should_exit_position,
-    should_take_partial_profit, stop_threshold, resolve_option_strike,
+    should_exit_position,
+    stop_threshold,
 )
-from strategies.options.options_engine.engine.options_strategy import resolve_entry_side
 
 # ── 載入數據 ──
 DATA_FILE = pathlib.Path.home() / "Documents/mylin102/tw-option-squeeze-trading/exports/tmf_replay_5min_q1_2026.csv"
@@ -124,7 +123,7 @@ def run_backtest(df, label, score_floor):
     print(f"[{label}]  score_floor={score_floor}")
     print(f"  總交易: {n}  勝率: {wins/n*100:.1f}%")
     print(f"  淨損益: {total_pnl:+,.0f} TWD  平均每筆: {total_pnl/n:+,.0f} TWD")
-    print(f"  出場原因:")
+    print("  出場原因:")
     for reason, row in by_reason.iterrows():
         print(f"    {reason}: {int(row['count'])} 筆, {row['sum']:+,.0f} TWD")
 

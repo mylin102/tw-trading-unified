@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """比較不同 EMA 週期對 bull_align guard 的影響"""
-import sys, pathlib
+import sys
+import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import pandas as pd
@@ -45,29 +46,45 @@ SL_PTS = 60
 PV = 10
 
 def run(label, bull_arr, bear_arr):
-    pos = 0; entry_p = 0; pnl = 0; trades = 0; wins = 0; blocked = 0
+    pos = 0
+    entry_p = 0
+    pnl = 0
+    trades = 0
+    wins = 0
+    blocked = 0
     for i in range(1, n):
         c, s = close[i], score_arr[i]
         if pos != 0:
             pts = (c - entry_p) * pos
             if pts <= -SL_PTS:
-                pnl -= SL_PTS * PV; trades += 1; pos = 0; continue
+                pnl -= SL_PTS * PV
+                trades += 1
+                pos = 0
+                continue
             if pts >= SL_PTS:
-                pnl += pts * PV; trades += 1; wins += 1; pos = 0; continue
+                pnl += pts * PV
+                trades += 1
+                wins += 1
+                pos = 0
+                continue
         if pos == 0:
-            can_long = not bull_arr[i] == False  # allow if bull or neutral
-            can_short = not bear_arr[i] == False  # allow if bear or neutral
+            can_long = bull_arr[i] is not False  # allow if bull or neutral
+            can_short = bear_arr[i] is not False  # allow if bear or neutral
             # bull_align guard
-            if bull_arr[i]: can_short = False
-            if bear_arr[i]: can_long = False
+            if bull_arr[i]:
+                can_short = False
+            if bear_arr[i]:
+                can_long = False
             
             sqz_buy = (not sqz_on[i]) and s >= ENTRY_SCORE and mom_state[i] >= 2 and c > vwap[i]
             sqz_sell = (not sqz_on[i]) and s <= -ENTRY_SCORE and mom_state[i] <= 1 and c < vwap[i]
             
             if sqz_buy and can_long:
-                pos = 1; entry_p = c
+                pos = 1
+                entry_p = c
             elif sqz_sell and can_short:
-                pos = -1; entry_p = c
+                pos = -1
+                entry_p = c
             elif (sqz_buy and not can_long) or (sqz_sell and not can_short):
                 blocked += 1
 

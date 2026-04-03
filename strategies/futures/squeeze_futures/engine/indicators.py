@@ -121,7 +121,7 @@ def calculate_futures_squeeze(
     res["vwap"] = typical_price_x_volume.groupby(res["trading_day"]).cumsum() / volume_cumsum
     res["vwap"] = res["vwap"].where(volume_cumsum != 0, res["Close"])
     res["price_vs_vwap"] = np.where(res["vwap"] != 0, (res["Close"] - res["vwap"]) / res["vwap"], 0.0)
-    res["fired"] = (~res["sqz_on"]) & (res["sqz_on"].shift(1) == True)
+    res["fired"] = (~res["sqz_on"]) & (res["sqz_on"].shift(1))
 
     # 向量化 mom_state 計算，提升效能
     res["mom_prev"] = res["momentum"].shift(1).fillna(0)

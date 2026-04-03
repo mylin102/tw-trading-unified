@@ -6,10 +6,8 @@ import sys
 import os
 import time
 import yaml
-import threading
+import traceback
 from datetime import datetime
-from collections import deque
-from pathlib import Path
 import pandas as pd
 from rich.console import Console
 
@@ -17,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 from squeeze_futures.engine.constants import get_point_value
 from squeeze_futures.engine.simulator import PaperTrader
-from squeeze_futures.engine.indicators import calculate_futures_squeeze, calculate_mtf_alignment, calculate_atr
+from squeeze_futures.engine.indicators import calculate_futures_squeeze, calculate_mtf_alignment
 from squeeze_futures.data.shioaji_client import ShioajiClient
 from squeeze_futures.data.data_storage import save_trade
 
@@ -199,7 +197,7 @@ class FuturesMonitor:
                 self._safety_stop_trade = trade
                 console.print(f"[bold yellow]🛡️ Safety stop placed: {action.value} @ {safety_price:.0f} ({safety_pts:.0f}pts from entry)[/bold yellow]")
             else:
-                console.print(f"[red]Safety stop failed to place[/red]")
+                console.print("[red]Safety stop failed to place[/red]")
         except Exception as e:
             console.print(f"[yellow]Safety stop error: {e}[/yellow]")
 
@@ -209,7 +207,7 @@ class FuturesMonitor:
             return
         try:
             self.api.cancel_order(self._safety_stop_trade)
-            console.print(f"[dim]🛡️ Safety stop cancelled[/dim]")
+            console.print("[dim]🛡️ Safety stop cancelled[/dim]")
         except Exception as e:
             console.print(f"[yellow]Safety stop cancel error: {e}[/yellow]")
         self._safety_stop_trade = None
@@ -308,7 +306,7 @@ class FuturesMonitor:
         if self.trader.position == 0:
             return None
             
-        sl_dist = self.RISK.get("stop_loss_pts", 60)
+        self.RISK.get("stop_loss_pts", 60)
         # 如果有設定 ATR 倍數，則使用動態停損
         if self.ATR_MULT > 0:
             # 這裡需要傳入當前的 df_5m 來算最新的 ATR
@@ -444,7 +442,7 @@ class FuturesMonitor:
             try:
                 self._strategy_tick()
             except Exception as e:
-                import traceback; traceback.print_exc()
+                traceback.print_exc()
                 console.print(f"[red][FuturesMonitor] error: {e}[/red]")
                 print(f"[TRACEBACK] {traceback.format_exc()}", flush=True)
             time.sleep(self.POLL_INTERVAL)

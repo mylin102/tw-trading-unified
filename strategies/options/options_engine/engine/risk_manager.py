@@ -133,11 +133,11 @@ class RiskManager:
         if isinstance(trade, dict):
             quantity = trade.get('quantity', 0)
             action = trade.get('action', '')
-            price = trade.get('price', 0)
+            trade.get('price', 0)
         else:
             quantity = getattr(trade, 'quantity', 0)
             action = getattr(trade, 'action', '')
-            price = getattr(trade, 'price', 0)
+            getattr(trade, 'price', 0)
         
         # 更新部位
         if action == 'Buy':
@@ -201,7 +201,7 @@ class RiskManager:
             return False
         
         if quantity <= 0:
-            console.print(f"[red]❌ 訂單數量必須大於 0[/red]")
+            console.print("[red]❌ 訂單數量必須大於 0[/red]")
             return False
         
         return True
@@ -284,4 +284,4 @@ class RiskManager:
         
         console.print(f"[bold red]🚨 熔斷機制已觸發！連續虧損 {self.consecutive_losses} 次[/bold red]")
         console.print(f"   觸發時間：{self.circuit_breaker_triggered_at.strftime('%Y-%m-%d %H:%M:%S')}")
-        console.print(f"   請立即檢查策略與市場狀況")
+        console.print("   請立即檢查策略與市場狀況")
