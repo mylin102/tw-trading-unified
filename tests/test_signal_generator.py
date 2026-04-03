@@ -1,7 +1,6 @@
 import pytest
 import pandas as pd
 import numpy as np
-from datetime import datetime
 from backtest.signal_generator import generate_signals
 
 def test_signal_generation_logic():

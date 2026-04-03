@@ -140,6 +140,8 @@ class TestStrategyPlugins:
             "bullish_align": True, "bearish_align": False,
             "ema_filter": 32650, "fired": False, "mom_velo": 5,
             "recent_high": 32750, "recent_low": 32600,
+            "Volume": 1000, "Open": 32700, "High": 32710, "Low": 32690,
+            "day_open": 32700, "trading_day": pd.Timestamp("2026-04-02").date()
         }
         defaults.update(overrides)
         last = pd.Series(defaults)
@@ -160,7 +162,8 @@ class TestStrategyPlugins:
         from strategies.futures.entry_strategies import STRATEGIES
         state = self._make_state()
         cfg = {"strategy": {"regime_filter": "mid", "entry_score": 20}}
-        for name, fn in STRATEGIES.items():
+        for name, entry in STRATEGIES.items():
+            fn = entry["func"]
             result = fn(state, cfg)
             if result is not None:
                 assert "action" in result, f"{name} missing 'action'"

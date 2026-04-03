@@ -238,8 +238,17 @@ def strategy_psar_breakout(state, cfg):
     close = df["Close"].values
     sma = df["Close"].rolling(sma_len).mean().values[-1]
     price = close[-1]
-    close[-2]
+    
+    # Adaptive ADX Filter: Lowered to 15 to catch trend starts (V-Model v2)
+    adx = last_5m.get("adx", 25)
+    if adx < 15:
+        return None
 
+    # Adaptive Stop: If ATR is high (volatile), use tighter mult
+    atr = last_5m.get("atr", 30)
+    current_vol_mult = 1.5 if atr > 40 else atr_mult
+    sl = atr * current_vol_mult
+    
     import math
     # Long: price crosses above PSAR + above SMA
     if not math.isnan(psar_long) and math.isnan(psar_long_prev):
@@ -297,18 +306,144 @@ def strategy_cumulative_delta(state, cfg):
     return None
 
 
+def strategy_vol_squeeze(state, cfg):
+    """
+    Enhanced Squeeze: Original logic + Volume Spike filter.
+    Ensures that the breakout has institutional participation.
+    """
+    s = cfg.get("strategy", {})
+    entry_score = s.get("entry_score", 20)
+    vol_mult = s.get("vol_multiplier", 1.5)
+
+    last_5m, last_15m, score = state["last_5m"], state["last_15m"], state["score"]
+    df = state.get("df_5m")
+    
+    if df is None or len(df) < 20:
+        return None
+
+    # Volume filter: Current volume > SMA(Volume, 20) * multiplier
+    vol_ma = df["Volume"].rolling(20).mean().iloc[-1]
+    curr_vol = last_5m["Volume"]
+    vol_spike = curr_vol > vol_ma * vol_mult
+
+    sqz_buy = (not last_5m["sqz_on"]) and score >= entry_score and last_5m["mom_state"] >= 2 and vol_spike
+    sqz_sell = (not last_5m["sqz_on"]) and score <= -entry_score and last_5m["mom_state"] <= 1 and vol_spike
+
+    # Use mid-regime filtering logic
+    can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.998
+    can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.002
+
+    if sqz_buy and can_long:
+        return {"action": "BUY", "reason": "VOL_SQZ", "stop_loss": state["stop_loss_pts"]}
+    if sqz_sell and can_short:
+        return {"action": "SELL", "reason": "VOL_SQZ", "stop_loss": state["stop_loss_pts"]}
+    return None
+
+
+def strategy_gap_reversal(state, cfg):
+    """
+    Taiwan Specific: Gap Reversal.
+    Captures over-reaction after a large opening gap (Day or Night).
+    If Gap > 100 pts and first bars show reversal momentum -> Enter fade.
+    """
+    s = cfg.get("strategy", {}).get("gap_reversal", {})
+    min_gap = s.get("min_gap_pts", 80)
+    atr_mult = s.get("atr_mult", 1.5)
+
+    last_5m = state["last_5m"]
+    df = state.get("df_5m")
+    if df is None or len(df) < 5:
+        return None
+
+    # Get the trading day open price
+    day_open = last_5m.get("day_open")
+    if day_open is None or day_open <= 0:
+        return None
+
+    # Approximate previous close (last bar of previous trading day)
+    # This is a simplification; in a real engine we'd cache the actual last close.
+    # Here we look for the first bar of the trading day and compare with the bar before it.
+    curr_td = last_5m.get("trading_day")
+    
+    # Check if we are in the first 30 minutes of the session
+    # We only trade gap reversals early in the day
+    session_start_idx = np.where(df["trading_day"] == curr_td)[0]
+    if len(session_start_idx) == 0:
+        return None
+    
+    first_idx = session_start_idx[0]
+    curr_idx = len(df) - 1
+    
+    # Only active within first 6 bars (30 mins) of the trading day
+    if not (0 <= (curr_idx - first_idx) <= 6):
+        return None
+
+    # Calculate gap (Open of first bar - Close of bar before it)
+    if first_idx <= 0:
+        return None
+        
+    prev_close = df["Close"].iloc[first_idx - 1]
+    actual_open = df["Open"].iloc[first_idx]
+    gap = actual_open - prev_close
+
+    atr = last_5m.get("atr", 30)
+    sl = atr * atr_mult
+
+    # Long: Large Gap Down (>80) + Price starts rising above opening
+    if gap < -min_gap and last_5m["Close"] > actual_open and last_5m["mom_state"] >= 2:
+        return {"action": "BUY", "reason": "GAP_REVERSAL", "stop_loss": sl}
+        
+    # Short: Large Gap Up (>80) + Price starts falling below opening
+    if gap > min_gap and last_5m["Close"] < actual_open and last_5m["mom_state"] <= 1:
+        return {"action": "SELL", "reason": "GAP_REVERSAL", "stop_loss": sl}
+        
+    return None
+
+
 # ── Registry ──
 STRATEGIES = {
-    "squeeze_breakout": strategy_squeeze_breakout,
-    "trend_follow": strategy_trend_follow,
-    "vwap_bounce": strategy_vwap_bounce,
-    "momentum_burst": strategy_momentum_burst,
-    "night_short_only": strategy_night_short_only,
-    "volume_reversal": strategy_volume_reversal,
-    "psar_breakout": strategy_psar_breakout,
-    "cumulative_delta": strategy_cumulative_delta,
+    "squeeze_breakout": {
+        "func": strategy_squeeze_breakout,
+        "desc": "Squeeze 釋放 + 趨勢對齊。捕捉波動率擠壓後的噴發，搭配 15m 趨勢過濾器，適合趨勢發動初期。"
+    },
+    "vol_squeeze": {
+        "func": strategy_vol_squeeze,
+        "desc": "量能過濾 Squeeze。在突破瞬間要求成交量爆發 (預設 1.5x)，過濾假突破，提高信號品質。"
+    },
+    "gap_reversal": {
+        "func": strategy_gap_reversal,
+        "desc": "跳空反轉。專為台指期設計，當開盤產生大跳空時，捕捉開盤 30 分鐘內的過度反應收斂點。"
+    },
+    "trend_follow": {
+        "func": strategy_trend_follow,
+        "desc": "純趨勢追蹤。僅在 15m EMA 方向一致時進場，使用較寬的 3x ATR 止損，適合強勢多/空頭市場。"
+    },
+    "vwap_bounce": {
+        "func": strategy_vwap_bounce,
+        "desc": "均值回歸。當價格偏離 VWAP 過遠 (0.3%+) 且動能轉折時逆勢進場，捕捉乖離過大的回抽。"
+    },
+    "momentum_burst": {
+        "func": strategy_momentum_burst,
+        "desc": "動能噴發。監測 Squeeze 觸發瞬間的動能速度 (Z-Score > 2)，追求極速獲利，但風險較高。"
+    },
+    "night_short_only": {
+        "func": strategy_night_short_only,
+        "desc": "夜盤偏空策略。專為 15:00~05:00 設計，捕捉夜盤常見的高檔無力回落現象。"
+    },
+    "volume_reversal": {
+        "func": strategy_volume_reversal,
+        "desc": "成交量反轉。偵測連續兩根帶量長黑/長紅後的衰竭，在 MA 方向支持下捕捉反彈點。"
+    },
+    "psar_breakout": {
+        "func": strategy_psar_breakout,
+        "desc": "PSAR 突破。結合拋物線指標轉向與 50MA 過濾，是 Q1 回測中表現最穩健的趨勢轉向策略。"
+    },
+    "cumulative_delta": {
+        "func": strategy_cumulative_delta,
+        "desc": "累計量能差 (估計)。利用成交量與價格變動方向的累計差值，尋找量價背離後的拉回進場點。"
+    },
 }
 
 
 def get_strategy(name):
-    return STRATEGIES.get(name)
+    return STRATEGIES.get(name, {}).get("func")

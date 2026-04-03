@@ -1,3 +1,4 @@
+active_strategy: psar_breakout
 execution:
   broker_fee_per_side: 20.0
   exchange_fee_per_side: 0.0
@@ -35,57 +36,57 @@ risk_mgmt:
   trailing_stop_enabled: true
   trailing_stop_trigger_pts: 60
 strategy:
+  active_strategy: cumulative_delta
+  counter_mode:
+    atr_sl_mult: 2.0
+    auto_regime: true
+    confirm_bars: 5
+    enabled: true
+    exit_on_vwap: true
+  cumulative_delta:
+    atr_mult: 2.0
+    lookback: 20
+    sma_length: 50
   entry_score: 20
   length: 20
+  momentum_burst:
+    atr_mult: 2.0
+    min_zscore: 2.0
+  night_short:
+    atr_mult: 2.0
+    min_score: 20
   partial_exit:
     enabled: true
     tp1_lots: 1
     tp1_pts: 100
+  psar_breakout:
+    acceleration: 0.02
+    acceleration_max: 0.2
+    atr_mult: 2.0
+    sma_length: 50
   pullback:
     buffer: 1.002
     ema_fast: 12
     ema_slow: 36
     lookback: 60
   regime_filter: mid
+  trend_follow:
+    atr_mult: 3.0
+    min_score: 30
+    trailing_atr: 2.0
   use_pullback: true
   use_squeeze: true
+  volume_reversal:
+    atr_mult: 2.0
+    sma_length: 50
+    volume_multiplier: 2.0
+  vwap_bounce:
+    atr_mult: 1.5
+    min_distance_pct: 0.003
   weights:
     15m: 0.4
     1h: 0.2
     5m: 0.4
-  counter_mode:
-    enabled: true
-    auto_regime: true
-    confirm_bars: 5
-    atr_sl_mult: 2.0
-    exit_on_vwap: true
-  active_strategy: cumulative_delta
-  trend_follow:
-    min_score: 30
-    atr_mult: 3.0
-    trailing_atr: 2.0
-  vwap_bounce:
-    min_distance_pct: 0.003
-    atr_mult: 1.5
-  momentum_burst:
-    min_zscore: 2.0
-    atr_mult: 2.0
-  night_short:
-    min_score: 20
-    atr_mult: 2.0
-  volume_reversal:
-    sma_length: 50
-    volume_multiplier: 2.0
-    atr_mult: 2.0
-  psar_breakout:
-    sma_length: 50
-    acceleration: 0.02
-    acceleration_max: 0.2
-    atr_mult: 2.0
-  cumulative_delta:
-    sma_length: 50
-    lookback: 20
-    atr_mult: 2.0
 trade_mgmt:
   allow_long: true
   allow_short: true

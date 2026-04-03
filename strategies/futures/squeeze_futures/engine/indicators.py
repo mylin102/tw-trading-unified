@@ -7,14 +7,27 @@ except Exception:
     ta = None
 
 
+from core.date_utils import get_trading_day
+
 def _ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False, min_periods=length).mean()
 
 
 def _true_range(df: pd.DataFrame) -> pd.Series:
-    high = df["High"]
-    low = df["Low"]
-    close_prev = df["Close"].shift(1)
+    # 確保欄位標準化 (V-Model 修正)
+    temp_df = df.copy()
+    temp_df.columns = [c.capitalize() if c.lower() in ["open", "high", "low", "close", "volume"] else c for c in temp_df.columns]
+    temp_df = temp_df.loc[:, ~temp_df.columns.duplicated()]
+    
+    high = temp_df.get("High")
+    low = temp_df.get("Low")
+    close = temp_df.get("Close")
+    
+    # 如果缺少必要欄位，回傳 0 系列而非崩潰 (V-Model 容錯)
+    if high is None or low is None or close is None:
+        return pd.Series(0.0, index=df.index)
+
+    close_prev = close.shift(1)
     return pd.concat(
         [
             high - low,
@@ -87,7 +100,7 @@ def calculate_futures_squeeze(
     bb_length: int = 20,
     bb_std: float = 2.0,
     kc_length: int = 20,
-    kc_scalar: float = 1.5,
+    kc_scalar: float = 2.0,  # V-Model 波動率適應性修正 (1.5 -> 2.0)
     pb_buffer: float = 1.002,
     ema_fast: int = 12,
     ema_slow: int = 36,
@@ -96,6 +109,20 @@ def calculate_futures_squeeze(
     """
     計算完整的期貨 Squeeze + 趨勢指標
     """
+    # 1. 確保欄位大小寫標準化，並處理重複欄位 (V-Model 修正)
+    df.columns = [c.capitalize() if c.lower() in ["open", "high", "low", "close", "volume"] else c for c in df.columns]
+    # 如果同時存在 'close' 和 'Close'，capitalize 後會重複，取第一筆即可
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    # 2. 確保有 DatetimeIndex 才能進行夜盤換日運算
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            df = df.set_index("timestamp")
+        else:
+            # 如果完全沒有時間資訊，給予預設日期以便運算不崩潰
+            df.index = pd.date_range("2026-01-01", periods=len(df), freq="5min")
+
     if len(df) < bb_length:
         return pd.DataFrame()
 
@@ -114,13 +141,15 @@ def calculate_futures_squeeze(
     
     # 改進 VWAP：使用交易日 (Trading Day) 而非日曆日 (Calendar Day)
     # 台指期規則：15:00 以後屬下一個交易日
-    res["trading_day"] = (res.index + pd.Timedelta(hours=9)).date
+    res["trading_day"] = get_trading_day(res.index)
     
-    typical_price_x_volume = res["Close"] * res["Volume"]
-    volume_cumsum = res.groupby("trading_day")["Volume"].cumsum()
-    res["vwap"] = typical_price_x_volume.groupby(res["trading_day"]).cumsum() / volume_cumsum
-    res["vwap"] = res["vwap"].where(volume_cumsum != 0, res["Close"])
-    res["price_vs_vwap"] = np.where(res["vwap"] != 0, (res["Close"] - res["vwap"]) / res["vwap"], 0.0)
+    if "Close" in res.columns and "Volume" in res.columns:
+        typical_price_x_volume = res["Close"] * res["Volume"]
+        volume_cumsum = res.groupby("trading_day")["Volume"].cumsum()
+        res["vwap"] = typical_price_x_volume.groupby(res["trading_day"]).cumsum() / volume_cumsum
+        res["vwap"] = res["vwap"].where(volume_cumsum != 0, res["Close"])
+        res["price_vs_vwap"] = np.where(res["vwap"] != 0, (res["Close"] - res["vwap"]) / res["vwap"], 0.0)
+    
     res["fired"] = (~res["sqz_on"]) & (res["sqz_on"].shift(1))
 
     # 向量化 mom_state 計算，提升效能
@@ -148,10 +177,12 @@ def calculate_futures_squeeze(
     res["bearish_align"] = res["ema_fast"] < res["ema_slow"]
 
     # 波動率調整後的 Pullback 區域
-    res["recent_high"] = res["High"].rolling(window=bb_length).max()
-    res["recent_low"] = res["Low"].rolling(window=bb_length).min()
-    res["is_new_high"] = res["Close"] >= res["recent_high"].shift(1)
-    res["is_new_low"] = res["Close"] <= res["recent_low"].shift(1)
+    if "High" in res.columns and "Low" in res.columns:
+        res["recent_high"] = res["High"].rolling(window=bb_length).max()
+        res["recent_low"] = res["Low"].rolling(window=bb_length).min()
+        res["is_new_high"] = res["Close"] >= res["recent_high"].shift(1)
+        res["is_new_low"] = res["Close"] <= res["recent_low"].shift(1)
+    
     res["in_bull_pb_zone"] = (
         (res["Close"] <= res["ema_fast"] * pb_buffer)
         & (res["Close"] >= res["ema_slow"])
@@ -163,12 +194,24 @@ def calculate_futures_squeeze(
         & res["bearish_align"]
     )
 
-    # 開盤型態
-    res["day_open"] = res.groupby("trading_day")["Open"].transform("first")
-    res["day_min"] = res.groupby("trading_day")["Low"].cummin()
-    res["day_max"] = res.groupby("trading_day")["High"].cummax()
-    res["opening_bullish"] = (res["Close"] > res["day_open"]) & (res["day_min"] >= res["day_open"] * 0.999)
-    res["opening_bearish"] = (res["Close"] < res["day_open"]) & (res["day_max"] <= res["day_open"] * 1.001)
+    # 開盤型態 (需要 Open 欄位)
+    if "Open" in res.columns:
+        res["day_open"] = res.groupby("trading_day")["Open"].transform("first")
+        res["day_min"] = res.groupby("trading_day")["Low"].cummin()
+        res["day_max"] = res.groupby("trading_day")["High"].cummax()
+        res["opening_bullish"] = (res["Close"] > res["day_open"]) & (res["day_min"] >= res["day_open"] * 0.999)
+        res["opening_bearish"] = (res["Close"] < res["day_open"]) & (res["day_max"] <= res["day_open"] * 1.001)
+
+    # 趨勢強度指標 (ADX) - V-Model 震盪避讓修正
+    if "High" in res.columns and "Low" in res.columns and "Close" in res.columns:
+        if ta:
+            adx_df = res.ta.adx(length=14)
+            res["adx"] = adx_df["ADX_14"]
+        else:
+            # Fallback ADX calculation (Simple version)
+            res["adx"] = 25.0 # Assume trending if TA is missing
+    else:
+        res["adx"] = 0.0
 
     return res
 

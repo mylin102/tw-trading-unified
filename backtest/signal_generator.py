@@ -45,12 +45,16 @@ def generate_signals(
     Uses NumPy optimization to minimize Pandas overhead.
     """
     if strategy_name not in STRATEGIES:
-        raise ValueError(f"Strategy {strategy_name} not found.")
-    
-    strategy_fn = STRATEGIES[strategy_name]
+        raise ValueError(f"Strategy {strategy_name} not found in registry.")
+        
+    strat_entry = STRATEGIES[strategy_name]
+    strategy_fn = strat_entry["func"] if isinstance(strat_entry, dict) else strat_entry
     n = len(df_5m)
     long_signals = np.zeros(n, dtype=bool)
     short_signals = np.zeros(n, dtype=bool)
+
+    if n <= warmup:
+        return long_signals, short_signals
 
     # Pre-extract columns to dict of numpy arrays for speed
     df_5m_np = {col: df_5m[col].values for col in df_5m.columns}

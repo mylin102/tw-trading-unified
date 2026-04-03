@@ -1,0 +1,256 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import yaml
+import shutil
+import os
+import sys
+from pathlib import Path
+from datetime import datetime
+
+# Ensure project root is in path
+ROOT = Path(__file__).parent.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from backtest.signal_generator import generate_signals # noqa: E402
+from strategies.futures.squeeze_futures.engine.vectorized import simulate_trades_vectorized, calculate_metrics # noqa: E402
+from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze # noqa: E402
+from strategies.futures.entry_strategies import STRATEGIES # noqa: E402
+
+# ── Paths ──
+BASE = ROOT
+CONFIG_PATH = BASE / "config" / "futures.yaml"
+FUTURES_MKT = BASE / "logs" / "market_data"
+TAIFEX_RAW = BASE / "data" / "taifex_raw"
+
+# ── Logic ──
+def apply_params_to_config(strategy_name: str, entry_score: int, atr_mult: float):
+    """Update futures.yaml with new params and create a backup."""
+    if not CONFIG_PATH.exists():
+        st.error(f"Config file not found: {CONFIG_PATH}")
+        return False
+    
+    # 1. Create Backup
+    backup_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = CONFIG_PATH.with_suffix(f".backup_{backup_time}")
+    shutil.copy(CONFIG_PATH, backup_path)
+    
+    # 2. Update Content
+    with open(CONFIG_PATH, "r") as f:
+        cfg = yaml.safe_load(f)
+    
+    if "strategy" not in cfg:
+        cfg["strategy"] = {}
+    cfg["strategy"]["entry_score"] = entry_score
+    if strategy_name not in cfg["strategy"]:
+        cfg["strategy"][strategy_name] = {}
+    cfg["strategy"][strategy_name]["atr_mult"] = atr_mult
+    
+    with open(CONFIG_PATH, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False)
+    
+    return backup_path
+
+def rollback_config():
+    """Restore from the latest backup file."""
+    backups = sorted(CONFIG_PATH.parent.glob("futures.yaml.backup_*"))
+    if not backups:
+        st.error("No backups found to rollback.")
+        return False
+    
+    latest_backup = backups[-1]
+    shutil.copy(latest_backup, CONFIG_PATH)
+    os.remove(latest_backup) # Consume the backup
+    return latest_backup
+
+@st.cache_data(ttl=300)
+def load_backtest_data(source_type: str, date_str: str = None):
+    """
+    Load data for backtesting with caching.
+    source_type: 'today', 'specific', 'q1'
+    """
+    def _read_csv(path):
+        if not path.exists():
+            return None
+        df = pd.read_csv(path)
+        
+        if "timestamp" in df.columns or "ts" in df.columns:
+            ts_col = "timestamp" if "timestamp" in df.columns else "ts"
+            # 統一處理：先轉字串，移除時區偏移 (+HH:MM) 或 UTC 標誌 (Z)
+            df[ts_col] = df[ts_col].astype(str).str.replace(r"[+-]\d{2}:\d{2}$", "", regex=True).str.replace("Z", "")
+            df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+            
+            # 只有當確實被轉換為 datetime 類型時，才進行 tz_localize(None)
+            if pd.api.types.is_datetime64_any_dtype(df[ts_col]):
+                if getattr(df[ts_col].dt, "tz", None) is not None:
+                    df[ts_col] = df[ts_col].dt.tz_localize(None)
+            
+            df = df.set_index(ts_col)
+
+        # 標準化 OHLCV 欄位並重算指標
+        df = calculate_futures_squeeze(df)
+                
+        return df
+
+    if source_type == "today":
+        today_str = datetime.now().strftime("%Y%m%d")
+        for tag in ["_PAPER", "_LIVE", ""]:
+            f = FUTURES_MKT / f"TMF_{today_str}{tag}_indicators.csv"
+            df = _read_csv(f)
+            if df is not None:
+                return df
+    elif source_type == "specific" and date_str:
+        f = FUTURES_MKT / f"TMF_{date_str}_indicators.csv"
+        # 兼容 _PAPER 或 _LIVE 後綴
+        if not f.exists():
+            for tag in ["_PAPER", "_LIVE"]:
+                f_alt = FUTURES_MKT / f"TMF_{date_str}{tag}_indicators.csv"
+                if f_alt.exists():
+                    f = f_alt
+                    break
+        return _read_csv(f)
+    elif source_type == "q1":
+        f = TAIFEX_RAW / "TMF_5m_taifex.csv"
+        return _read_csv(f)
+    return None
+
+def main():
+    st.title("📊 Single Strategy Backtest")
+
+    # 1. Sidebar Controls
+    with st.sidebar:
+        st.header("1. Data Source")
+        src = st.radio("Select source", ["Today's Indicators", "Specific Date", "Q1 Full Dataset"])
+        
+        date_val = None
+        if src == "Specific Date":
+            date_val = st.text_input("Enter date (YYYYMMDD)", datetime.now().strftime("%Y%m%d"))
+        
+        source_map = {"Today's Indicators": "today", "Specific Date": "specific", "Q1 Full Dataset": "q1"}
+        df = load_backtest_data(source_map[src], date_val)
+        
+        if df is not None:
+            st.success(f"Loaded {len(df)} bars")
+        else:
+            st.error("Data not found.")
+            st.stop()
+
+        st.divider()
+        st.header("2. Strategy")
+        strat_name = st.selectbox("Select strategy", list(STRATEGIES.keys()))
+        # 顯示策略說明 (打磨)
+        strat_entry = STRATEGIES[strat_name]
+        desc = strat_entry.get("desc", "No description available.") if isinstance(strat_entry, dict) else "No description available."
+        st.info(desc)
+        
+        st.divider()
+        st.header("3. Parameters")
+        atr_mult = st.slider("ATR Multiplier (Exit)", 0.0, 5.0, 2.0, 0.1)
+        entry_score = st.slider("Entry Score Threshold", 0, 100, 20, 5)
+        lots = st.number_input("Lots per trade", 1, 10, 2)
+        initial_bal = st.number_input("Initial Balance (TWD)", 10000, 1000000, 100000)
+
+    # 2. Execution
+    if st.button("▶ Run Backtest", type="primary", use_container_width=True):
+        cfg = {
+            "strategy": {
+                "regime_filter": "mid",
+                "entry_score": entry_score,
+                "squeeze_breakout": {"atr_mult": atr_mult}
+            }
+        }
+        
+        with st.spinner("Generating signals..."):
+            longs, shorts = generate_signals(df, strat_name, cfg)
+        
+        with st.spinner("Simulating trades..."):
+            open_arr = df["Open"].values
+            close_arr = df["Close"].values
+            high_arr = df["High"].values
+            low_arr = df["Low"].values
+            vwap_arr = df["vwap"].values if "vwap" in df.columns else np.zeros(len(df))
+            atr_arr = df["atr"].values if "atr" in df.columns else np.full(len(df), 30.0)
+
+            entries, exits, positions, pnl, reasons = simulate_trades_vectorized(
+                open_arr, close_arr, high_arr, low_arr, vwap_arr, atr_arr,
+                longs, shorts, 
+                initial_balance=initial_bal,
+                point_value=10.0,
+                fee_per_side=10.0,
+                exchange_fee=2.0,
+                tax_rate=0.00002,
+                max_positions=1,
+                lots_per_trade=lots,
+                slippage=1.0,
+                stop_loss_pts=30,
+                atr_mult=atr_mult,
+                tp1_pts=30,
+                tp1_lots=1,
+                exit_on_vwap=True
+            )
+            
+            res = calculate_metrics(pnl, entries, exits, positions, initial_bal)
+
+        # 3. Results Display
+        st.header("Backtest Results")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total PnL", f"{res['total_pnl']:+,.0f} TWD")
+        m2.metric("Win Rate", f"{res['win_rate']:.1f}%")
+        m3.metric("Profit Factor", f"{res['profit_factor']:.2f}")
+        m4.metric("Max Drawdown", f"{res['max_drawdown']:,.0f} TWD")
+        m5.metric("Total Trades", res['total_trades'])
+
+        equity = initial_bal + np.cumsum(pnl)
+        df_equity = pd.DataFrame({"equity": equity}, index=df.index)
+        df_equity["peak"] = df_equity["equity"].cummax()
+        df_equity["drawdown"] = df_equity["peak"] - df_equity["equity"]
+        df_equity["in_dd"] = df_equity["drawdown"] > 0
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df_equity.index, y=df_equity["equity"], name="Equity", line=dict(color="#10B981", width=2)))
+        
+        dd_starts = df_equity[(df_equity["in_dd"]) & (~df_equity["in_dd"].shift(1).fillna(False))].index
+        dd_ends = df_equity[(~df_equity["in_dd"]) & (df_equity["in_dd"].shift(1).fillna(False))].index
+        
+        for i in range(min(len(dd_starts), len(dd_ends))):
+            fig.add_vrect(
+                x0=dd_starts[i], x1=dd_ends[i],
+                fillcolor="red", opacity=0.15, layer="below", line_width=0
+            )
+
+        fig.update_layout(title="Equity Curve", template="plotly_dark", height=450)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("🕵️ Trade Ledger")
+        trade_indices = np.where(pnl != 0)[0]
+        if len(trade_indices) > 0:
+            full_trades_df = pd.DataFrame({
+                "Time": df.index[trade_indices],
+                "PnL": pnl[trade_indices],
+                "Position": positions[trade_indices],
+                "Reason": [["ENTRY", "TP1", "EXIT", "STOP"][r] for r in reasons[trade_indices]]
+            })
+            st.dataframe(full_trades_df, use_container_width=True)
+
+            st.divider()
+            st.header("⚙️ Strategy Deployment")
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                if st.button("🚀 Apply Parameters to PAPER/LIVE", type="primary", use_container_width=True):
+                    backup = apply_params_to_config(strat_name, entry_score, atr_mult)
+                    if backup:
+                        st.success(f"Config updated! Backup: {backup.name}")
+            with sc2:
+                if st.button("⏪ Rollback Last Change", use_container_width=True):
+                    restored = rollback_config()
+                    if restored:
+                        st.warning(f"Restored from {restored.name}")
+        else:
+            st.info("No trades executed.")
+    else:
+        st.info("Adjust parameters and click 'Run Backtest'.")
+
+if __name__ == "__main__":
+    main()
