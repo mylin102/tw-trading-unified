@@ -22,6 +22,28 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 st.set_page_config(page_title="Trading Unified", page_icon="📊", layout="wide")
 
+# ── Custom CSS ──
+st.markdown("""
+    <style>
+    /* Force modern sans-serif font stack */
+    html, body, [class*="css"]  {
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    }
+    /* Ensure numbers are easy to compare vertically */
+    [data-testid="stMetricValue"], .stMarkdown code, .stTable {
+        font-variant-numeric: tabular-nums;
+        font-family: 'Inter', 'Roboto Mono', monospace;
+    }
+    /* Muted divider line style */
+    hr {
+        margin-top: 1rem;
+        margin-bottom: 1rem;
+        border: 0;
+        border-top: 1px solid rgba(49, 51, 63, 0.1);
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
 # ── 密碼保護 ──
 def check_password():
     if "authenticated" not in st.session_state:
@@ -277,7 +299,7 @@ def mode_badge(live):
     return "🔴 LIVE" if live else "📝 PAPER"
 
 hc = st.columns([2, 1, 1, 1, 1])
-hc[0].title("📊 Trading Unified")
+hc[0].title("Trading Unified")
 hc[1].metric("期貨", mode_badge(f_live))
 hc[2].metric("選擇權", mode_badge(o_live))
 hc[3].metric("期貨分配", f"{alloc.get('futures', {}).get('max_margin_pct', 0)*100:.0f}%")
@@ -296,7 +318,7 @@ def _monitor_status():
 st.caption(f"日期: {TODAY} | 更新: {datetime.datetime.now().strftime('%H:%M:%S')} | Monitor: {_monitor_status()}")
 
 # ── Tabs ──
-tab_overview, tab_futures, tab_options, tab_settings = st.tabs(["📈 總覽", "🔵 期貨 TMF", "🟠 選擇權 TXO", "⚙️ 設定"])
+tab_overview, tab_futures, tab_options, tab_settings = st.tabs(["總覽", "期貨 TMF", "選擇權 TXO", "設定"])
 
 # ════════════════════════════════════════
 # Tab 1: 總覽
@@ -307,7 +329,7 @@ with tab_overview:
     o_df = load_options_indicators()
 
     with col1:
-        st.subheader(f"🔵 期貨 TMF ({mode_badge(f_live)})")
+        st.header(f"期貨 TMF ({mode_badge(f_live)})")
         if f_df is not None and not f_df.empty:
             last = f_df.iloc[-1]
             c1, c2, c3 = st.columns(3)
@@ -323,7 +345,7 @@ with tab_overview:
         st.write(f"今日交易: {len(ft) if ft is not None else 0} 筆")
 
     with col2:
-        st.subheader(f"🟠 選擇權 TXO ({mode_badge(o_live)})")
+        st.header(f"選擇權 TXO ({mode_badge(o_live)})")
         if o_df is not None and not o_df.empty:
             last = o_df.iloc[-1]
             c1, c2, c3 = st.columns(3)
@@ -343,7 +365,7 @@ with tab_overview:
             st.write("今日交易: 0 筆")
 
     # ── 總覽圖：指數走勢（雙軸：期貨 + 選擇權 MTX）──
-    st.subheader("📊 今日指數走勢")
+    st.header("今日指數走勢")
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     has_data = False
     if f_df is not None and not f_df.empty:
@@ -363,7 +385,7 @@ with tab_overview:
         st.info("等待數據...")
 
     # ── 總覽 PnL ──
-    st.subheader("💰 今日累計 PnL")
+    st.header("今日累計 PnL")
     pc1, pc2 = st.columns(2)
     ft = load_futures_trades()
     fpnl = calc_futures_pnl(ft)
@@ -386,7 +408,8 @@ with tab_overview:
 # Tab 2: 期貨
 # ════════════════════════════════════════
 with tab_futures:
-    st.subheader(f"🔵 期貨 TMF ({mode_badge(f_live)})")
+    st.header(f"期貨 TMF ({mode_badge(f_live)})")
+
     f_df = load_futures_indicators()
     if f_df is not None and not f_df.empty:
         last = f_df.iloc[-1]
@@ -407,7 +430,7 @@ with tab_futures:
         st.info("無數據")
     ft = load_futures_trades()
     if ft is not None and not ft.empty:
-        st.subheader("交易記錄")
+        st.header("交易記錄")
         st.dataframe(ft, use_container_width=True)
         fpnl = calc_futures_pnl(ft)
         fig = make_pnl_chart(fpnl, "期貨累計 PnL (TWD)")
@@ -418,7 +441,7 @@ with tab_futures:
 # Tab 3: 選擇權
 # ════════════════════════════════════════
 with tab_options:
-    st.subheader(f"🟠 選擇權 TXO ({mode_badge(o_live)})")
+    st.header(f"選擇權 TXO ({mode_badge(o_live)})")
     o_df = load_options_indicators()
     if o_df is not None and not o_df.empty and "price_mtx" in o_df.columns:
         last = o_df.iloc[-1]
@@ -436,7 +459,7 @@ with tab_options:
         st.info("無數據")
     ol = load_options_ledger()
     if ol is not None and not ol.empty:
-        st.subheader("交易記錄")
+        st.header("交易記錄")
         st.dataframe(ol.tail(30), use_container_width=True)
         opnl = calc_options_pnl(ol)
         fig = make_pnl_chart(opnl, "選擇權累計 PnL (TWD)")
