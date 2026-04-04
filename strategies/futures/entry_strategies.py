@@ -5,6 +5,7 @@ Each strategy receives market state and returns a signal dict or None.
 Signal format: {"action": "BUY"|"SELL", "reason": str, "stop_loss": float}
 """
 import numpy as np
+import pandas as pd
 
 
 def strategy_squeeze_breakout(state, cfg):
@@ -207,9 +208,7 @@ def strategy_volume_reversal(state, cfg):
 
 def strategy_psar_breakout(state, cfg):
     """
-    Ref: r-yabyab/Custom-NinjaScript-Files PSAR strat
-    Price just crossed above Parabolic SAR + above SMA50 → long.
-    Price just crossed below PSAR + below SMA50 → short.
+    PSAR 突破。結合拋物線指標轉向與 50MA 過濾。
     """
     s = cfg.get("strategy", {}).get("psar_breakout", {})
     sma_len = s.get("sma_length", 50)
@@ -217,35 +216,76 @@ def strategy_psar_breakout(state, cfg):
     accel_max = s.get("acceleration_max", 0.2)
     atr_mult = s.get("atr_mult", 2.0)
 
-    df = state["df_5m"]
+    # Use the full dataframe passed in state (we need to inject it from signal_generator)
+    # Alternatively, since state["df_5m"] is a slice, we can cache the calculation on the parent df.
+    df = state.get("df_5m_full")
+    if df is None:
+        df = state["df_5m"] # fallback to slice if full not available
+        
     if len(df) < sma_len + 2:
+        return None
+
+    # Optimization: Calculate PSAR once for the whole DF and cache it in cfg or df.attrs
+    cache_key = f"psar_{accel}_{accel_max}"
+    if cache_key not in df.attrs:
+        try:
+            # df.ta.psar returns a DataFrame with columns like 'PSARl_0.02_0.2', 'PSARs_0.02_0.2', 'PSARaf_0.02_0.2', 'PSARr_0.02_0.2'
+            # The column names contain the parameters.
+            psar_df = df.ta.psar(af0=accel, af=accel, max_af=accel_max)
+            df.attrs[cache_key] = psar_df
+        except Exception:
+            return None
+            
+    psar = df.attrs[cache_key]
+    
+    # Now we need the values for the CURRENT index
+    # We are evaluating at the last row of the current slice (state["df_5m"])
+    current_time = state["last_5m"].name
+    
+    try:
+        # Get the row in the full PSAR dataframe corresponding to the current time
+        # For speed, we just use the position. If state has 'idx', use that.
+        idx = state.get("idx")
+        if idx is not None and idx >= 1:
+            psar_long = psar.iloc[idx, 0]
+            psar_short = psar.iloc[idx, 1]
+            psar_long_prev = psar.iloc[idx - 1, 0]
+            psar_short_prev = psar.iloc[idx - 1, 1]
+        else:
+            # Fallback to matching by index label (slower but safe)
+            current_idx_loc = psar.index.get_loc(current_time)
+            psar_long = psar.iloc[current_idx_loc, 0]
+            psar_short = psar.iloc[current_idx_loc, 1]
+            psar_long_prev = psar.iloc[current_idx_loc - 1, 0]
+            psar_short_prev = psar.iloc[current_idx_loc - 1, 1]
+    except Exception:
         return None
 
     last_5m = state["last_5m"]
     atr = last_5m.get("atr", 0)
     sl = atr * atr_mult if atr > 0 else 40
 
-    try:
-        psar = df.ta.psar(af0=accel, af=accel, max_af=accel_max)
-        # psar returns DataFrame with PSARl (long) and PSARs (short)
-        psar_long = psar.iloc[-1, 0]  # PSARl
-        psar_short = psar.iloc[-1, 1]  # PSARs
-        psar_long_prev = psar.iloc[-2, 0]
-        psar_short_prev = psar.iloc[-2, 1]
-    except Exception:
+    # Ensure SMA is pre-calculated or calculate efficiently
+    sma_col = f"sma_{sma_len}"
+    if sma_col not in df.columns:
+        df[sma_col] = df["Close"].rolling(sma_len).mean()
+        
+    price = last_5m["Close"]
+    
+    if idx is not None:
+        sma = df[sma_col].values[idx]
+    else:
+        sma = df[sma_col].loc[current_time]
+        
+    if pd.isna(sma):
         return None
 
-    close = df["Close"].values
-    sma = df["Close"].rolling(sma_len).mean().values[-1]
-    price = close[-1]
-    
     # Adaptive ADX Filter: Lowered to 15 to catch trend starts (V-Model v2)
     adx = last_5m.get("adx", 25)
     if adx < 15:
         return None
 
     # Adaptive Stop: If ATR is high (volatile), use tighter mult
-    atr = last_5m.get("atr", 30)
     current_vol_mult = 1.5 if atr > 40 else atr_mult
     sl = atr * current_vol_mult
     

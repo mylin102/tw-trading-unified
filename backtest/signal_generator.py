@@ -25,6 +25,8 @@ def build_state_optimized(
         "last_5m": last_5m,
         "last_15m": last_15m,
         "df_5m": df_5m_full.iloc[max(0, idx-100):idx+1], # Sliding window for indicators needing history
+        "df_5m_full": df_5m_full,
+        "idx": idx,
         "score": last_5m.get("score", 0),
         "stop_loss_pts": last_5m.get("atr", 30),
         "hour": df_5m_full.index[idx].hour,
