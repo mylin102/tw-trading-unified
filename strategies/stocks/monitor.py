@@ -105,6 +105,25 @@ class StockMonitor:
         except Exception as e:
             console.print(f"[yellow]⚠️ Market regime check failed: {e}[/yellow]")
 
+    def _filter_watchlist_by_strength(self):
+        """第二招：只留成交量大 + 開盤強勢的標的"""
+        if self.api is None:
+            return self.watchlist
+        scored = []
+        for ticker in self.watchlist:
+            try:
+                contract = self.api.Contracts.Stocks[ticker]
+                snap = self.api.snapshots([contract])[0]
+                if snap.total_amount > 0 and snap.close > snap.open:
+                    scored.append((ticker, snap.total_amount))
+            except Exception:
+                pass
+        # 按成交金額排序，取前半
+        scored.sort(key=lambda x: -x[1])
+        max_tickers = max(3, len(self.watchlist) // 2)
+        result = [t for t, _ in scored[:max_tickers]]
+        return result if result else self.watchlist
+
     def run(self):
         self.running = True
         console.print(f"[bold green]🍎 StockMonitor [{self.mode_tag}] Started | Strategy: {self.strat_name} | Watchlist: {len(self.watchlist)}[/bold green]")
@@ -114,6 +133,7 @@ class StockMonitor:
         
         strat_fn = STOCK_STRATEGIES[self.strat_name]["func"]
         last_regime_check = 0
+        active_watchlist = None  # 第二招：每日動態篩選
         
         while self.running:
             now = datetime.now()
@@ -125,10 +145,17 @@ class StockMonitor:
                 self._update_market_regime()
                 last_regime_check = time.time()
             
+            # 第二招：開盤後篩選「成交量前 N + 開盤強勢」
+            if active_watchlist is None and now.hour == 9 and now.minute >= 5:
+                active_watchlist = self._filter_watchlist_by_strength()
+                console.print(f"[cyan]📋 Active watchlist: {len(active_watchlist)} / {len(self.watchlist)} tickers[/cyan]")
+            
             # 定期清理掛不到的單
             self.clean_unfilled_orders()
+            
+            scan_list = active_watchlist if active_watchlist else self.watchlist
                 
-            for ticker in self.watchlist:
+            for ticker in scan_list:
                 if not self.running: break
                 try:
                     contract = self.api.Contracts.Stocks[ticker]
@@ -170,8 +197,13 @@ class StockMonitor:
         pos = self.positions[ticker]
         now = datetime.now()
         
+        # 第三招：13:20 只撤退虧損倉，獲利倉抱到 13:25 trailing stop
         if now.hour == 13 and now.minute >= 20:
-            self.execute_trade(ticker, "SELL", curr_price, "ALL", "TIME_EXIT_CLOSE")
+            pnl_pct = (curr_price - pos["entry_price"]) / pos["entry_price"]
+            if pnl_pct <= 0:
+                self.execute_trade(ticker, "SELL", curr_price, "ALL", "TIME_EXIT_LOSER")
+            elif now.minute >= 25:
+                self.execute_trade(ticker, "SELL", curr_price, "ALL", "TIME_EXIT_FINAL")
             return
             
         sl_pct = self.cfg.get("stocks", {}).get("stop_loss_pct", 0.03)

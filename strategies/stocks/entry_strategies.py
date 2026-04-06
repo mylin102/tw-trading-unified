@@ -26,14 +26,23 @@ def strategy_stock_arbitrage(state, cfg):
     return None
 
 def strategy_stock_momentum(state, cfg):
-    """動能突破：突破今日高點且漲幅 > 2%。"""
+    """
+    動能突破（帶量版）：突破今日高點且漲幅 > 2%。
+    第一招：當前成交量必須 ≥ 過去 20 bars 平均量的 2 倍。
+    """
     last_5m = state["last_5m"]
+    df = state["df_5m"]
     day_open = last_5m.get("day_open", 0)
-    if day_open == 0:
+    if day_open == 0 or len(df) < 20:
         return None
-    
+
+    # 帶量確認
+    vol_avg = df["Volume"].iloc[-21:-1].mean()
+    if vol_avg <= 0 or last_5m["Volume"] < vol_avg * 2:
+        return None
+
     if last_5m["Close"] > day_open * 1.02 and last_5m.get("is_new_high", False):
-        return {"action": "BUY", "reason": "MOM_BREAKOUT", "stop_loss": last_5m["Close"] * 0.985}
+        return {"action": "BUY", "reason": "MOM_BREAKOUT_VOL", "stop_loss": last_5m["Close"] * 0.985}
     return None
 def strategy_stock_scout(state, cfg):
     """
