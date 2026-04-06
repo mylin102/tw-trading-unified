@@ -226,12 +226,28 @@ def main():
 
         # 3. Results Display
         st.header(get_text("results"))
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric(get_text("profit"), f"{res.get('total_pnl', 0):+,.0f}")
-        m2.metric(get_text("win_rate"), f"{res.get('win_rate', 0):.1f}%")
-        m3.metric(get_text("pf"), f"{res.get('profit_factor', 0):.2f}")
-        m4.metric(get_text("mdd"), f"{res.get('max_drawdown', 0):,.0f}")
-        m5.metric(get_text("trades"), int(res.get('total_trades', 0)))
+
+        def compact_num(v):
+            """Compact number formatting for narrow screens."""
+            v = float(v)
+            s = "+" if v >= 0 else ""
+            if abs(v) >= 1_000_000:
+                return f"{s}{v/1_000_000:.2f}M"
+            elif abs(v) >= 1_000:
+                return f"{s}{v/1_000:.1f}K"
+            return f"{s}{v:.0f}"
+
+        pnl_val = res.get('total_pnl', 0)
+        pnl_color = "🟢" if pnl_val >= 0 else "🔴"
+        st.markdown(f"**{pnl_color} 總盈虧: {compact_num(pnl_val)} TWD**")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric(get_text("win_rate"), f"{res.get('win_rate', 0):.1f}%")
+        c2.metric(get_text("pf"), f"{res.get('profit_factor', 0):.2f}")
+        c3.metric(get_text("trades"), int(res.get('total_trades', 0)))
+
+        mdd_val = res.get('max_drawdown', 0)
+        st.markdown(f"**最大回撤 (MDD): {compact_num(mdd_val)} TWD**")
 
         equity = initial_bal + np.cumsum(pnl)
         df_equity = pd.DataFrame({"equity": equity}, index=df.index)
