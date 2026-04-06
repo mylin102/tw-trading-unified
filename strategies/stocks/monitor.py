@@ -216,7 +216,7 @@ class StockMonitor:
 
             self.positions[ticker] = {"stage": qty_mode, "entry_price": price, "qty": self.positions.get(ticker, {}).get("qty", 0) + qty}
             console.print(f"[cyan]🚀 [{self.mode_tag}] BUY {ticker} | Qty: {qty} | Reason: {reason}[/cyan]")
-            self._log_trade(ticker, "BUY", price, qty, reason, 0.0)
+            self._log_trade(ticker, "BUY", price, qty, reason, 0.0, price)
 
         elif action == "SELL":
             if ticker not in self.positions: return
@@ -246,11 +246,33 @@ class StockMonitor:
                 self.consecutive_losses += 1
             else:
                 self.consecutive_losses = 0
-            console.print(f"[green]🏁 [{self.mode_tag}] SELL {ticker} | PnL: {pnl:+.0f} | DayPnL: {self.daily_pnl:+.0f}[/green]")
-            self._log_trade(ticker, "SELL", price, qty, reason, pnl)
+            # 計算手續費
+            buy_amt = pos["entry_price"] * qty
+            sell_amt = price * qty
+            buy_fee = max(20.0, buy_amt * 0.0005)
+            sell_fee = max(20.0, sell_amt * 0.0005)
+            tax = sell_amt * 0.003
+            fees = buy_fee + sell_fee + tax
+            net_pnl = pnl - fees
+            console.print(f"[green]🏁 [{self.mode_tag}] SELL {ticker} | PnL: {net_pnl:+.0f} (gross {pnl:+.0f} - fees {fees:.0f}) | DayPnL: {self.daily_pnl:+.0f}[/green]")
+            self._log_trade(ticker, "SELL", price, qty, reason, pnl, pos["entry_price"], fees, net_pnl)
 
-    def _log_trade(self, ticker, action, price, qty, reason, pnl):
-        trade_df = pd.DataFrame([{"timestamp": datetime.now(), "ticker": ticker, "mode": self.mode_tag, "action": action, "price": price, "qty": qty, "reason": reason, "pnl_cash": pnl}])
+    def _log_trade(self, ticker, action, price, qty, reason, pnl, entry_price=0.0, fees=0.0, net_pnl=0.0):
+        row = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ticker": ticker,
+            "strategy": self.strat_name,
+            "mode": self.mode_tag,
+            "action": action,
+            "price": round(price, 2),
+            "entry_price": round(entry_price, 2),
+            "qty": qty,
+            "reason": reason,
+            "pnl_gross": round(pnl, 0),
+            "fees": round(fees, 0),
+            "pnl_cash": round(net_pnl if action == "SELL" else 0, 0),
+        }
+        trade_df = pd.DataFrame([row])
         trade_df.to_csv(self.ledger_path, mode='a', header=not self.ledger_path.exists(), index=False)
 
     def stop(self): self.running = False

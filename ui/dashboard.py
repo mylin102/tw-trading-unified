@@ -311,8 +311,8 @@ def load_options_equity():
     return None
 
 @st.cache_data(ttl=5)
-def load_stock_trades():
-    f = FUTURES_TRADES / f"STOCK_{DATE_STR}_trades.csv"
+def load_stock_trades(mode="PAPER"):
+    f = FUTURES_TRADES / f"STOCK_{DATE_STR}_{mode}_trades.csv"
     if f.exists():
         try:
             return pd.read_csv(f)
@@ -453,6 +453,40 @@ with tab_overview:
         else:
             st.metric("台股 PnL", "0 TWD")
 
+    # ── 總覽：台股快訊 ──
+    st.header("台股快訊 (Watchlist Quick View)")
+    watchlist = stock_cfg.get("stocks", {}).get("watchlist", [])
+    if watchlist:
+        ov_data = []
+        for ticker in watchlist:
+            s_df = load_stock_indicators(ticker)
+            if s_df is not None and not s_df.empty:
+                last = s_df.iloc[-1]
+                ov_data.append({
+                    "代號": ticker,
+                    "名稱": last.get("name", "Unknown"),
+                    "股價": last.get('close', last.get('Close', 0)),
+                    "成交量": f"{int(last.get('volume', last.get('Volume', 0))):,}",
+                    "Score": round(last.get('score', 0), 1),
+                    "Squeeze": "🔒 壓縮" if last.get("sqz_on", False) else "🔓 釋放",
+                    "200MA": "🟢 向上" if last.get("ema_200_up", False) else "⚪ 走平/向下"
+                })
+        
+        if ov_data:
+            ov_df = pd.DataFrame(ov_data)
+            def style_overview(row):
+                styles = [''] * len(row)
+                if "🔒" in str(row["Squeeze"]):
+                    styles[5] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
+                if "🟢" in str(row["200MA"]):
+                    styles[6] = 'color: #059669; font-weight: bold'
+                return styles
+            st.dataframe(ov_df.style.apply(style_overview, axis=1), use_container_width=True, hide_index=True)
+        else:
+            st.info("等待個股指標數據...")
+    else:
+        st.info("尚未設定監控名單")
+
 # ════════════════════════════════════════
 # Tab 2: 期貨
 # ════════════════════════════════════════
@@ -519,45 +553,184 @@ with tab_options:
 # Tab 4: 台股 Stocks
 # ════════════════════════════════════════
 with tab_stocks:
-    st.header(f"台股 Stocks ({mode_badge(s_live)})")
+    st.header(f"🍎 台股 Stocks ({mode_badge(s_live)})")
     
-    st.subheader("Watchlist 監控")
+    st.subheader("Watchlist 實時監控牆")
     watchlist = stock_cfg.get("stocks", {}).get("watchlist", [])
     
     if not watchlist:
         st.info("Watchlist 為空")
     else:
-        cols = st.columns(len(watchlist) if len(watchlist) <= 4 else 4)
-        for i, ticker in enumerate(watchlist):
-            with cols[i % 4]:
-                s_df = load_stock_indicators(ticker)
-                if s_df is not None and not s_df.empty:
-                    last = s_df.iloc[-1]
-                    cl_val = last.get('close') if 'close' in last else last.get('Close', 0)
-                    sc_val = last.get('score', 0)
-                    sqz_on = last.get("sqz_on", False)
-                    trend = "🔒 壓縮" if sqz_on else "🔓 釋放"
-                    st.metric(f"{ticker} ({trend})", f"{cl_val:.0f}", f"Score: {sc_val:.1f}")
-                else:
-                    st.metric(f"{ticker}", "無數據")
+        monitor_data = []
+        for ticker in watchlist:
+            s_df = load_stock_indicators(ticker)
+            if s_df is not None and not s_df.empty:
+                last = s_df.iloc[-1]
+                monitor_data.append({
+                    "代號": ticker,
+                    "名稱": last.get("name", "Unknown"),
+                    "股價": last.get('close', last.get('Close', 0)),
+                    "成交量": f"{int(last.get('volume', last.get('Volume', 0))):,}",
+                    "Score": round(last.get('score', 0), 1),
+                    "Squeeze": "🔒 壓縮" if last.get("sqz_on", False) else "🔓 釋放",
+                    "200MA 趨勢": "🟢 向上" if last.get("ema_200_up", False) else "⚪ 走平/向下"
+                })
+        
+        if monitor_data:
+            m_df = pd.DataFrame(monitor_data)
+            
+            def style_monitor(row):
+                styles = [''] * len(row)
+                # Squeeze 顏色 (紅底白字代表壓縮)
+                if "🔒" in str(row["Squeeze"]):
+                    styles[5] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
+                # 200MA 顏色 (綠色代表多頭向上)
+                if "🟢" in str(row["200MA 趨勢"]):
+                    styles[6] = 'color: #059669; font-weight: bold'
+                return styles
+
+            st.dataframe(m_df.style.apply(style_monitor, axis=1), use_container_width=True, hide_index=True)
+        else:
+            st.info("等待 Monitor 寫入指標數據...")
     
     st.divider()
-    sl = load_stock_trades()
+    # 讀取目前運行的模式
+    current_mode = "LIVE" if s_live else "PAPER"
+    sl = load_stock_trades(current_mode)
+    
+    st.header(f"交易記錄 ({current_mode} 模式)")
     if sl is not None and not sl.empty:
-        st.header("交易記錄")
-        st.dataframe(sl.sort_values("timestamp", ascending=False).head(30), use_container_width=True)
+        # 摘要指標
+        sells = sl[sl["action"] == "SELL"].copy()
+        if not sells.empty:
+            sells["pnl_cash"] = pd.to_numeric(sells["pnl_cash"], errors="coerce").fillna(0)
+            m1, m2, m3, m4 = st.columns(4)
+            total_pnl = sells["pnl_cash"].sum()
+            total_fees = pd.to_numeric(sells.get("fees", 0), errors="coerce").fillna(0).sum()
+            wins = (sells["pnl_cash"] > 0).sum()
+            total = len(sells)
+            m1.metric("淨損益", f"{total_pnl:+,.0f} TWD")
+            m2.metric("勝率", f"{wins}/{total} ({wins/total*100:.0f}%)" if total > 0 else "—")
+            m3.metric("摩擦成本", f"{total_fees:,.0f} TWD")
+            m4.metric("平均每筆", f"{total_pnl/total:+,.0f} TWD" if total > 0 else "—")
+
+        # 交易明細表
+        display_cols = [c for c in ["timestamp", "ticker", "action", "entry_price", "price", "qty", "reason", "strategy", "pnl_gross", "fees", "pnl_cash"] if c in sl.columns]
+        col_rename = {"timestamp": "時間", "ticker": "代號", "action": "動作", "entry_price": "進場價",
+                      "price": "出場價", "qty": "股數", "reason": "原因", "strategy": "策略",
+                      "pnl_gross": "毛利", "fees": "手續費+稅", "pnl_cash": "淨損益"}
+        display = sl[display_cols].sort_values("timestamp", ascending=False).head(30)
+        display = display.rename(columns={c: col_rename.get(c, c) for c in display.columns})
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
         spnl = calc_stock_pnl(sl)
-        fig = make_pnl_chart(spnl, "台股累計 PnL (TWD)")
+        fig = make_pnl_chart(spnl, f"台股累計 PnL ({current_mode})")
         if fig:
             st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("今日尚無台股交易紀錄")
+        st.info(f"今日尚無 {current_mode} 交易紀錄")
 
 # ════════════════════════════════════════
 # Tab 5: 設定
 # ════════════════════════════════════════
 with tab_settings:
-    st.info("台股設定請編輯 config/stocks.yaml")
+    st.header("⚙️ 系統設定")
+    
+    # ── 1. 期貨 TMF 設定 ──
+    with st.expander("📈 期貨 TMF 設定", expanded=False):
+        with st.form("futures_settings_form"):
+            f_live_new = st.checkbox("啟用期貨實盤交易 (LIVE)", value=futures_cfg.get("live_trading", False))
+            f_regime = st.selectbox("市場濾網 (Regime)", ["low", "mid", "high"], index=["low", "mid", "high"].index(futures_cfg.get("strategy", {}).get("regime_filter", "mid")))
+            
+            fc1, fc2 = st.columns(2)
+            f_score = fc1.slider("進場門檻 (Score)", 10, 100, value=futures_cfg.get("strategy", {}).get("entry_score", 20))
+            f_atr = fc2.slider("ATR 止損倍數", 1.0, 5.0, value=float(futures_cfg.get("risk_mgmt", {}).get("atr_multiplier", 2.0)), step=0.1)
+            
+            if st.form_submit_button("💾 儲存並重啟期貨模組"):
+                futures_cfg["live_trading"] = f_live_new
+                futures_cfg["strategy"]["regime_filter"] = f_regime
+                futures_cfg["strategy"]["entry_score"] = f_score
+                futures_cfg["risk_mgmt"]["atr_multiplier"] = f_atr
+                save_yaml(FUTURES_CFG_PATH, futures_cfg)
+                trigger_restart()
+                st.success("期貨設定已更新！")
+
+    # ── 2. 選擇權 TXO 設定 ──
+    with st.expander("🔮 選擇權 TXO 設定", expanded=False):
+        with st.form("options_settings_form"):
+            o_live_new = st.checkbox("啟用選擇權實盤交易 (LIVE)", value=options_cfg.get("live_trading", False))
+            o_score = st.slider("進場門檻 (Score)", 10, 100, value=options_cfg.get("entry_score", 80))
+            
+            oc1, oc2 = st.columns(2)
+            o_min_iv = oc1.slider("最低 IV 限制", 0.1, 0.5, value=float(options_cfg.get("min_iv", 0.15)), step=0.01)
+            o_max_iv = oc2.slider("最高 IV 限制", 0.3, 1.0, value=float(options_cfg.get("max_iv", 0.60)), step=0.01)
+            
+            if st.form_submit_button("💾 儲存並重啟選擇權模組"):
+                options_cfg["live_trading"] = o_live_new
+                options_cfg["entry_score"] = o_score
+                options_cfg["min_iv"] = o_min_iv
+                options_cfg["max_iv"] = o_max_iv
+                save_yaml(OPTIONS_CFG_PATH, options_cfg)
+                trigger_restart()
+                st.success("選擇權設定已更新！")
+
+    # ── 3. 台股 Stocks 設定 ──
+    with st.expander("🍎 台股 Stocks 設定", expanded=True):
+        stk_inner = stock_cfg.get("stocks", {})
+        
+        # 將同步按鈕與顯示邏輯整合
+        if st.button("🔄 同步 Squeeze Screener 推薦名單"):
+            try:
+                import subprocess
+                subprocess.run(["python3", "scripts/sync_watchlist.py"], check=True)
+                st.success("同步成功！")
+                st.rerun()
+            except Exception as e:
+                st.error(f"同步失敗: {e}")
+
+        with st.form("stock_settings_form"):
+            s_live_new = st.checkbox("啟用台股實盤交易 (LIVE)", value=stock_cfg.get("live_trading", False))
+            
+            # --- 改為直式多行輸入 ---
+            current_watchlist = stk_inner.get("watchlist", ["2330", "2454"])
+            watchlist_area = st.text_area("監控名單 (每行一個代號)", 
+                                         value="\n".join(current_watchlist),
+                                         height=200,
+                                         help="請輸入股票代號，例如 2330。支援一行一個標的。")
+            
+            c1, c2, c2b = st.columns(3)
+            strat_new = c1.selectbox("策略", ["scout_strategy", "mean_reversion", "arbitrage_lite"], index=0)
+            budget_new = c2.number_input("總分配資金 (TWD)", value=stk_inner.get("total_portfolio_budget", 100000), step=10000)
+            capital_new = c2b.number_input("單筆預算 (TWD)", value=stk_inner.get("capital_per_trade", 20000), step=1000)
+            
+            c3, c4, c5 = st.columns(3)
+            score_new = c3.slider("進場門檻 (Score)", 10, 80, value=stk_inner.get("entry_score", 45))
+            atr_new = c4.slider("ATR 乘數", 1.0, 5.0, value=float(stk_inner.get("atr_mult", 2.0)), step=0.1)
+            ts_new = c5.slider("移動停損 (%)", 0.5, 5.0, value=float(stk_inner.get("trailing_stop_pct", 0.03)*100), step=0.1) / 100.0
+            
+            if st.form_submit_button("💾 儲存並重啟台股模組"):
+                # 處理多行輸入，轉回 list
+                new_tickers = [t.strip() for t in watchlist_area.split("\n") if t.strip()]
+                new_stock_cfg = {
+                    "live_trading": s_live_new,
+                    "stocks": {
+                        "watchlist": new_tickers,
+                        "strategy": strat_new,
+                        "total_portfolio_budget": budget_new,
+                        "capital_per_trade": capital_new,
+                        "entry_score": score_new,
+                        "atr_mult": atr_new,
+                        "stop_loss_pct": stk_inner.get("stop_loss_pct", 0.03),
+                        "take_profit_pct": stk_inner.get("take_profit_pct", 0.05),
+                        "trailing_stop_pct": ts_new
+                    }
+                }
+                save_yaml(STOCK_CFG_PATH, new_stock_cfg)
+                trigger_restart()
+                st.success("台股設定已更新，正在重啟系統...")
+
+    st.divider()
+    st.info("期貨與選擇權設定請編輯對應的 YAML 檔案")
 
 # ── Footer and Refresh ──
 refresh = 30
