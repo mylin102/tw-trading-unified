@@ -24,18 +24,20 @@ def main():
     with st.sidebar:
         st.header(get_text("data_source"))
         src_opts = [get_text("today_ind"), get_text("specific_date"), get_text("q1_data")]
-        src = st.radio(get_text("select_source"), src_opts, key="comp_src")
+        # Default to Q1 data (always available)
+        src = st.radio(get_text("select_source"), src_opts, key="comp_src", index=2)
         date_val = None
         if src == get_text("specific_date"):
             date_val = st.text_input(get_text("enter_date"), key="comp_date")
-        
+
         source_map = {get_text("today_ind"): "today", get_text("specific_date"): "specific", get_text("q1_data"): "q1"}
         df = load_backtest_data(source_map[src], date_val)
-        
-        if df is not None:
-            st.success(get_text("loaded_bars", len(df)))
-        else:
+
+        if df is None:
+            st.error("No data available. Try 'Q1 Historical Data'.")
             st.stop()
+
+        st.success(get_text("loaded_bars", len(df)))
 
         st.divider()
         st.header(get_text("params"))
