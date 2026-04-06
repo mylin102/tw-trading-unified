@@ -3,6 +3,9 @@
 tw-trading-unified — 整合儀表板 v2
 4 tabs: 總覽 / 期貨 / 選擇權 / 設定
 """
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).parent.parent))
 
 import streamlit as st
 import pandas as pd
