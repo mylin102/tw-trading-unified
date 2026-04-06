@@ -34,6 +34,7 @@ TRANSLATIONS = {
         "lifetime_stats": "Lifetime Statistics", "cum_equity": "Cumulative Equity",
         "hist_logs": "Historical Trade Logs", "ticker_select": "Target Selection",
         "add_ticker": "Add New Ticker", "adv_tools": "Portfolio Tools",
+        "exit_dist": "Exit Reason Distribution",
         "lang_toggle": "繁體中文"
     },
     "zh": {
@@ -71,6 +72,7 @@ TRANSLATIONS = {
         "lifetime_stats": "終身統計", "cum_equity": "累計權益曲線",
         "hist_logs": "歷史交易日誌", "ticker_select": "1. 標的選擇",
         "add_ticker": "新增標的至資料庫", "adv_tools": "進階分析工具",
+        "exit_dist": "出場原因分佈",
         "lang_toggle": "English"
     }
 }

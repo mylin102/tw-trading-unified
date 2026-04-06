@@ -14,82 +14,66 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ── Custom CSS for Institutional Look ──
+# ── Clean Light Mode CSS (Institutional Look) ──
 st.markdown("""
     <style>
-    /* Dark mode base aesthetic */
+    /* Light mode base aesthetic */
     .stApp {
-        background-color: #0F172A;
-        color: #F8FAFC;
+        background-color: #FFFFFF;
+        color: #0F172A;
     }
-    /* Tabular numbers for all data */
-    [data-testid="stMetricValue"], .stMarkdown code, .stTable, [data-testid="stDataFrame"] {
-        font-variant-numeric: tabular-nums;
-        font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
-    }
-    /* Sidebar styling */
-    section[data-testid="stSidebar"] {
-        background-color: #1E293B;
-        border-right: 1px solid #334155;
-    }
-    /* Sidebar Overall Text */
-    section[data-testid="stSidebar"] {
-        color: #F8FAFC !important;
+    /* Main body text */
+    .stApp p, .stApp span, .stApp label, .stApp h1, .stApp h2, .stApp h3 {
+        color: #0F172A !important;
     }
     
-    /* Force high contrast for language buttons */
-    div[data-testid="stSidebar"] div.stButton > button {
-        background-color: #1E293B !important;
-        border: 1px solid #3B82F6 !important;
-        color: #FFFFFF !important;
+    /* Sidebar styling */
+    section[data-testid="stSidebar"] {
+        background-color: #F8FAFC !important;
+        border-right: 1px solid #E2E8F0;
     }
-    div[data-testid="stSidebar"] div.stButton > button * {
+    section[data-testid="stSidebar"] * {
+        color: #0F172A !important;
+    }
+    
+    /* Language Toggle Button - High Visibility Blue */
+    div[data-testid="stSidebar"] .stButton > button {
+        background-color: #2563EB !important;
         color: #FFFFFF !important;
+        border: none !important;
         font-weight: 700 !important;
+        width: 100%;
     }
-    div[data-testid="stSidebar"] div.stButton > button:hover {
-        background-color: #3B82F6 !important;
+    div[data-testid="stSidebar"] .stButton > button * {
+        color: #FFFFFF !important;
     }
 
-    /* Metric UI Enhancement (Performance stats) */
-    div[data-testid="stMetric"] {
-        background-color: #1E293B !important;
-        border: 1px solid #334155 !important;
-        padding: 15px !important;
-        border-radius: 10px !important;
+    /* Metric UI Enhancement (Light Cards) */
+    [data-testid="stMetric"] {
+        background-color: #F1F5F9 !important;
+        border: 1px solid #E2E8F0 !important;
+        padding: 1rem !important;
+        border-radius: 0.5rem !important;
     }
-    div[data-testid="stMetricLabel"] {
-        color: #94A3B8 !important; /* Muted label */
-        font-size: 0.9rem !important;
+    [data-testid="stMetricLabel"] > div {
+        color: #475569 !important;
+        font-weight: 600 !important;
     }
-    div[data-testid="stMetricValue"] {
-        color: #F8FAFC !important; /* Bright value */
+    [data-testid="stMetricValue"] > div {
+        color: #1E293B !important;
         font-weight: 800 !important;
     }
 
-    /* Input Fields Fix */
+    /* Input Fields Fix: White background, dark text */
     .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] {
-        background-color: #0F172A !important;
-        color: #F8FAFC !important;
-        border: 1px solid #334155 !important;
+        background-color: #FFFFFF !important;
+        color: #0F172A !important;
+        border: 1px solid #CBD5E1 !important;
     }
-    /* Divider in sidebar */
-    section[data-testid="stSidebar"] hr {
-        border-top: 1px solid #334155;
-        margin: 1rem 0;
-    }
-    /* Ensure input fields are readable: dark background + white text */
-    .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] {
-        background-color: #334155 !important;
-        color: #F8FAFC !important;
-        border: 1px solid #475569 !important;
-    }
-    /* Metric Card styling */
-    [data-testid="stMetric"] {
-        background-color: #1E293B;
-        padding: 15px;
-        border-radius: 8px;
-        border: 1px solid #334155;
+    
+    /* Table / DataFrame text */
+    [data-testid="stDataFrame"] * {
+        color: #0F172A !important;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -101,14 +85,13 @@ if "lang" not in st.session_state:
     st.session_state["lang"] = "zh"
 
 with st.sidebar:
-    # 一鍵切換按鈕
     toggle_label = f"🌐 {get_text('lang_toggle')}"
     if st.button(toggle_label, use_container_width=True):
         st.session_state["lang"] = "en" if st.session_state["lang"] == "zh" else "zh"
         st.rerun()
     st.divider()
 
-# ── Navigation (2026 Modular Pattern) ──
+# ── Navigation ──
 pages = {
     get_text("nav_analysis"): [
         st.Page("backtest_pages/single_test.py", title=get_text("nav_single"), icon="📊"),
@@ -131,4 +114,3 @@ with st.sidebar:
     st.caption(f"Root: {ROOT.name}")
 
 pg.run()
-

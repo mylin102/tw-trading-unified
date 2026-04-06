@@ -9,8 +9,8 @@ from strategies.futures.squeeze_futures.engine.vectorized import simulate_trades
 from backtest.stock_engine import simulate_stock_trades
 
 REASON_MAP = {
-    1: "ENTRY", 2: "SCALE", 3: "STOP", 4: "TP", 
-    5: "TRAILING", 6: "SIGNAL", 7: "FINAL"
+    1: "偵察兵進場", 2: "主軍加碼", 3: "硬性止損", 4: "目標止盈", 
+    5: "移動停損", 6: "訊號出場", 7: "收盤平倉"
 }
 
 def update_cfg_with_params(cfg: Dict[str, Any], strategy_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
