@@ -11,7 +11,7 @@ ROOT = Path(__file__).parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backtest.sweep_engine import run_grid_sweep # noqa: E402
+from backtest.sweep_engine import run_portfolio_grid_sweep, run_multi_asset_backtest # noqa: E402
 from backtest.monte_carlo import run_monte_carlo_drawdown # noqa: E402
 from ui.backtest_pages.single_test import load_backtest_data # noqa: E402
 from strategies.futures.entry_strategies import STRATEGIES # noqa: E402
@@ -76,27 +76,19 @@ def main():
         base_cfg = {"strategy": {strat_name: {}}}
         
         with st.spinner(f"Scanning {total_combinations} combinations..."):
-            sweep_data = run_grid_sweep(df, strat_name, sweep_params, base_cfg)
-            
-            # Robust unpacking
-            if isinstance(sweep_data, tuple) and len(sweep_data) >= 2:
-                results_df = sweep_data[0]
-                trades_dict = sweep_data[1]
-            elif isinstance(sweep_data, pd.DataFrame):
-                results_df = sweep_data
-                trades_dict = {} 
-            else:
-                st.error(f"Unexpected return from sweep engine: {type(sweep_data)}")
-                st.stop()
-                
+            # Wrap single ticker as single-asset portfolio for sweep engine
+            single_asset_dfs = {ticker: df}
+            results_df = run_portfolio_grid_sweep(
+                single_asset_dfs, strat_name, sweep_params, base_cfg,
+                capital_per_trade=100000.0
+            )
+
             st.session_state["sweep_results"] = results_df
-            st.session_state["sweep_trades"] = trades_dict
             st.session_state["sweep_strat_used"] = strat_name
 
     # 3. Visualization
     if "sweep_results" in st.session_state and st.session_state.get("sweep_strat_used") == strat_name:
         results_df = st.session_state["sweep_results"]
-        trades_dict = st.session_state["sweep_trades"]
         
         st.header(get_text("perf_heatmap"))
         
