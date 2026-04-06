@@ -55,21 +55,40 @@ def main():
             index=6,  # Default to "custom"
         )
 
-        if squeeze_preset != "custom":
-            params = TW_STRATEGY_PRESETS[squeeze_preset]
-            st.info(f"**{squeeze_preset}**: patterns={params.patterns}, holding={params.holding_days}d")
+        # Start with preset defaults, may be overridden by sliders below
+        params = TW_STRATEGY_PRESETS[squeeze_preset]
 
         strat_name = st.selectbox("Select strategy", list(STOCK_STRATEGIES.keys()))
         st.info(STOCK_STRATEGIES[strat_name]["desc"])
-        
+
         # --- 動態策略參數 ---
         st.subheader("🎯 Entry Thresholds")
         entry_score = 20
         bb_std = 2.0
-        if "scout" in strat_name or "momentum" in strat_name:
-            entry_score = st.slider("Squeeze Score Threshold", 10, 80, 20, 5)
-        elif "mean_reversion" in strat_name:
-            bb_std = st.slider("Bollinger Band StdDev", 1.0, 3.0, 2.0, 0.1)
+
+        # Squeeze preset overrides
+        if squeeze_preset != "custom":
+            st.caption(f"**{squeeze_preset}**: patterns={params.patterns}, holding={params.holding_days}d")
+            if params.min_momentum is not None:
+                min_mom = st.slider("Min Momentum", 0, 5, int(params.min_momentum), 1)
+                params = params.model_copy(update={"min_momentum": float(min_mom)})
+            if params.holding_days:
+                hold_d = st.slider("Holding Days", 1, 30, params.holding_days, 1)
+                params = params.model_copy(update={"holding_days": hold_d})
+            if params.stop_loss_pct is not None:
+                sl_adj = st.slider("Stop Loss %", 0.01, 0.20, params.stop_loss_pct, 0.01)
+                params = params.model_copy(update={"stop_loss_pct": sl_adj})
+            if params.require_squeeze_on:
+                st.info("✅ require_squeeze_on enabled")
+            if params.require_fired:
+                st.info("🔥 require_fired enabled")
+        else:
+            if "scout" in strat_name or "momentum" in strat_name:
+                entry_score = st.slider("Squeeze Score Threshold", 10, 80, 20, 5)
+            elif "mean_reversion" in strat_name:
+                bb_std = st.slider("Bollinger Band StdDev", 1.0, 3.0, 2.0, 0.1)
+            else:
+                st.info("Select a Squeeze 策略模板 above to see adjustable parameters.")
         
         st.divider()
         st.header(get_text("params"))
@@ -100,9 +119,8 @@ def main():
                         if len(tdf) > 30:
                             tdf = calculate_futures_squeeze(tdf, bb_std=bb_std)
                             if not tdf.empty:
-                                # Apply squeeze strategy preset filters
+                                # Apply squeeze strategy preset filters (with user-adjusted params)
                                 if squeeze_preset != "custom":
-                                    params = TW_STRATEGY_PRESETS[squeeze_preset]
                                     tdf = apply_strategy_filters(tdf, params)
                                 if not tdf.empty:
                                     all_dfs[t] = tdf
@@ -139,9 +157,8 @@ def main():
     df_raw = df_raw.set_index(date_col)
     df = calculate_futures_squeeze(df_raw, bb_std=bb_std)
 
-    # Apply squeeze strategy preset filters for single test
+    # Apply squeeze strategy preset filters for single test (with user-adjusted params)
     if squeeze_preset != "custom" and not df.empty:
-        params = TW_STRATEGY_PRESETS[squeeze_preset]
         df = apply_strategy_filters(df, params)
 
     if st.button(get_text("btn_run_single"), type="primary", use_container_width=True):
