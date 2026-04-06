@@ -24,10 +24,9 @@ class StockDownloader:
         if file_path.exists():
             try:
                 existing_df = pd.read_csv(file_path)
-                # 確保 Date 欄位存在並轉為 datetime
-                # 兼容 Date 或 timestamp 命名
                 date_col = "Date" if "Date" in existing_df.columns else "timestamp"
-                existing_df[date_col] = pd.to_datetime(existing_df[date_col])
+                # 強制轉為 datetime 並移除時區資訊 (tz-naive)
+                existing_df[date_col] = pd.to_datetime(existing_df[date_col], errors="coerce").dt.tz_localize(None)
                 last_ts = existing_df[date_col].max()
                 if pd.notna(last_ts):
                     start_date = (last_ts + timedelta(days=1)).strftime("%Y-%m-%d")

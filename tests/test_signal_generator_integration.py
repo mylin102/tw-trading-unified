@@ -32,38 +32,41 @@ def make_signal_df(n=100):
 class TestSignalGeneratorIntegration:
     """Integration tests for squeeze filters in signal_generator."""
 
-    def test_apply_filters_squeeze_only(self):
+    def test_apply_filters_preserves_row_count(self):
+        """Signal suppression must NOT remove rows (time-series continuity)."""
         df = make_signal_df()
         params = TW_STRATEGY_PRESETS["squeeze_only"]
-
         result = apply_strategy_filters(df, params)
-        assert len(result) < len(df)  # Should filter some rows
-        # All remaining rows should have sqz_on=True
-        if len(result) > 0:
-            assert all(result["sqz_on"])
+        assert len(result) == len(df)
+
+    def test_apply_filters_squeeze_only_suppresses_signals(self):
+        df = make_signal_df()
+        params = TW_STRATEGY_PRESETS["squeeze_only"]
+        result = apply_strategy_filters(df, params)
+        # Rows where sqz_on was originally False should have fired=False
+        non_squeeze_mask = ~df["sqz_on"]
+        assert not result.loc[non_squeeze_mask, "fired"].any()
 
     def test_apply_filters_conservative(self):
         df = make_signal_df()
         params = TW_STRATEGY_PRESETS["conservative"]
-
-        result = apply_strategy_filters(df, params)
-        assert len(result) < len(df)
-
-    def test_apply_filters_baseline_no_reduction(self):
-        """Baseline accepts all three patterns, filters out None-pattern rows."""
-        df = make_signal_df()
-        params = TW_STRATEGY_PRESETS["baseline"]
-
-        result = apply_strategy_filters(df, params)
-        # Baseline only filters by patterns (squeeze/houyi/whale), not by momentum/regime
-        # Should only keep rows where pattern was classified
-        assert len(result) > 0
-        assert all(result["pattern"].isin(["squeeze", "houyi", "whale"]))
-
-    def test_apply_filters_custom_no_change(self):
-        """Custom (empty) params should not filter anything."""
-        df = make_signal_df()
-        params = TW_STRATEGY_PRESETS["custom"]
-
         result = apply_strategy_filters(df, params)
         assert len(result) == len(df)
+
+    def test_apply_filters_baseline_suppresses_non_pattern(self):
+        """Baseline suppresses signals on rows with no pattern classification."""
+        df = make_signal_df()
+        params = TW_STRATEGY_PRESETS["baseline"]
+        result = apply_strategy_filters(df, params)
+        # Rows with no pattern should have signals suppressed
+        no_pattern = df["pattern"].isna()
+        if no_pattern.any():
+            assert not result.loc[no_pattern, "fired"].any()
+
+    def test_apply_filters_custom_no_change(self):
+        """Custom (empty) params should not suppress anything."""
+        df = make_signal_df()
+        params = TW_STRATEGY_PRESETS["custom"]
+        result = apply_strategy_filters(df, params)
+        # fired values should be identical
+        assert (result["fired"] == df["fired"]).all()

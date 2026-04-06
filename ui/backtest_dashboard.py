@@ -91,18 +91,21 @@ with st.sidebar:
         st.rerun()
     st.divider()
 
-# ── Navigation ──
+# ── Navigation (Asset-Centric Grouping) ──
 pages = {
-    get_text("nav_analysis"): [
-        st.Page("backtest_pages/single_test.py", title=get_text("nav_single"), icon="📊"),
+    get_text("nav_futures"): [
+        st.Page("backtest_pages/single_test.py", title=get_text("nav_single"), icon="📈"),
         st.Page("backtest_pages/sweep.py", title=get_text("nav_sweep"), icon="🔬"),
-        st.Page("backtest_pages/stock_optimizer.py", title=get_text("nav_stock"), icon="🍎"),
-        st.Page("backtest_pages/comparison.py", title=get_text("nav_leaderboard"), icon="🏆"),
+    ],
+    get_text("nav_stocks"): [
+        st.Page("backtest_pages/stock_optimizer.py", title=get_text("nav_stock_lab"), icon="🍎"),
     ],
     get_text("nav_system"): [
-        st.Page("backtest_pages/history.py", title=get_text("nav_history"), icon="📈"),
+        st.Page("backtest_pages/comparison.py", title=get_text("nav_leaderboard"), icon="🏆"),
+        st.Page("backtest_pages/history.py", title=get_text("nav_history"), icon="📊"),
     ]
 }
+
 
 pg = st.navigation(pages)
 

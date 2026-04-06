@@ -1,24 +1,41 @@
-# SDD: Taiwan Stock Module (Odd-Lot Optimized)
+# SDD: Taiwan Stock Module (v2.0 - Institutional Grade)
 
-## 1. 模組概述 (Overview)
-本模組旨在將台股（特別是零股）交易整合進 `tw-trading-unified`。其核心設計目標是「共用 Session、資金隔離、數據解耦、合規執行」。
+## 1. 核心邏輯：自適應偵察兵 (Scout v2)
+為解決台股極端價差（10元~10000元）與手續費低消問題，採用「雙階段預算制」：
+*   **偵察兵階段 (Scout)**: 投入 `max(2000, 單筆預算 * 10%)` TWD。確保金額足以規避 20 元低消，且在高價股時自動縮減為 1 股。
+*   **主軍階段 (Scale)**: 當獲利 > 1% 且動能持續，補足至 `單筆預算` 上限。
 
-## 2. 核心架構 (Architecture)
-採用「分析與執行分離」架構：
-*   **分析端 (Analysis)**: 使用 Round Lot (整股) K 線資料進行技術指標運算 (Squeeze, SMA, ADX)。
-*   **執行端 (Execution)**: 偵測訊號後，切換至 Odd Lot (零股) 模式進行 Snapshots 報價獲取與 Order 下單。
+## 2. 資金管理：全域曝險鎖定 (Portfolio Cap)
+*   **機制**: 下單前計算 `現有持倉總市值`。
+*   **邏輯**: `剩餘預算 = 總分配資金 - 目前總持倉`。若剩餘預算不足 2,000 元，則自動拒絕任何新進場訊號。
+*   **目的**: 實現多標的自動佔位，避免單一標的過度曝險。
 
-## 3. 關鍵限制與解決方案 (Constraints)
-| 限制條件 | 解決方案 | 實作位置 |
+## 3. 數據架構與 UI 渲染
+*   **數據流**: 監控背景執行緒 (`StockMonitor`) -> 寫入 `STOCK_{ticker}_indicators.csv` -> Dashboard 每 30 秒讀取。
+*   **UI 佈局**: 採用「直式高密度監控牆」，標示 **中文名稱、200MA 長線趨勢、Squeeze 壓縮燈**。
+*   **日誌隔離**: 嚴格區分 `_PAPER_` 與 `_LIVE_` 交易日誌與統計。
+
+## 4. 安全與風控 (The Triple Lock)
+1.  **時間鎖**: 13:20 強制清空所有部位 (當沖防呆)。
+2.  **狀態鎖**: 自動過濾「處置股」與「暫停交易」標的。
+3.  **價格鎖**: 5 分鐘未成交自動撤單，防止追高。
+
+## 5. 策略審計與故障模式 (Strategy Audit & Failure Modes)
+為診斷績效不佳的原因，定義以下「故障模式 (Failure Modes)」指標：
+
+| 故障模式 | 定義 | 隱含意義 |
 | :--- | :--- | :--- |
-| **零股不支援當沖** | 建立 `entry_day` 鎖定機制，強制禁止同一交易日賣出。 | `backtest/stock_engine.py` |
-| **手續費低消 (20 TWD)** | 在成本計算函數中加入 `max(20, amount * rate)` 邏輯。 | `backtest/stock_engine.py` |
-| **API 登入限制** | 透過 `core/shioaji_session.py` 維持單一持久 Session。 | `core/` |
+| **雜訊陷阱 (Noise Trap)** | 持倉時間 < 30 分鐘且死於移動停損。 | 移動停損比例 (1.5%) 設得太緊。 |
+| **加碼崩潰 (Scaling Disaster)** | 偵察兵獲利，但加碼後總損益轉負。 | 加碼門檻 (1%) 太低，或動能不具延續性。 |
+| **手續費吞噬 (Fee Squeeze)** | 毛利為正，但扣除低消手續費後淨利為負。 | 單筆預算太小或試單頻率過高。 |
+| **逆勢突破 (Trendless Breakout)** | 在 200MA 向下或走平時進場。 | 缺乏大趨勢過濾。 |
 
-## 4. 資料流 (Data Flow)
-1.  **Scanner**: 每小時掃描 Watchlist -> 抓取整股 Kbars -> 算出指標 -> 標記狀態 (Squeezing/Fired)。
-2.  **Monitor**: 偵測狀態變化 -> 獲取零股 Snapshot -> 計算可買股數 (Capital / Price) -> 發送 Odd Lot Order。
-3.  **Risk Manager**: 持續檢查「今日買入鎖定」狀態與「13:20 強制出場」邏輯。
+## 7. 策略核心目標：大賺小賠 (Positive Expectancy)
+本模組之所有策略必須符合「大賺小賠」的數學模型，並以此作為 V-Model 驗收之最高準則：
 
-## 5. 數據結構 (Data Structures)
-`StockState`: 包含 `df_5m_round` (分析用), `last_odd_price` (執行用), `entry_day`, `qty`。
+| 指標 (KPI) | 目標值 | 實現機制 |
+| :--- | :--- | :--- |
+| **盈虧比 (R/R Ratio)** | > 3.0 | 透過 3%~5% 的目標止盈，配合 1.5% 的試單止損。 |
+| **平均獲利 / 平均虧損** | > 2.5 | 偵察兵機制：賠錢時僅 10% 資金，賺錢加碼後才投入 100%。 |
+| **最大回撤 (MDD)** | < 總預算 10% | 透過 13:20 強制平倉與全域資金限額 (Portfolio Cap) 控制。 |
+| **進場品質** | 過濾假突破 | 整合 Squeeze + 成交量 (1.5x) + MACD (動能轉強) 三重確認。 |

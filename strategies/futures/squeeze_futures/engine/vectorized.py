@@ -68,11 +68,20 @@ def simulate_trades_vectorized(
     tp1_pts: float = 30,
     tp1_lots: int = 1,
     exit_on_vwap: bool = True,
+    intraday_only: bool = False,
+    eod_bars = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     向量化交易模擬 (順序執行確保狀態正確)
+    
+    Args:
+        intraday_only: If True, force close all positions at end-of-day bars.
+        eod_bars: Boolean array marking bars that are the last bar of a trading day.
     """
     n = len(close)
+    if eod_bars is None:
+        eod_bars = np.zeros(n, dtype=np.bool_)
+    has_eod = len(eod_bars) == n
     entries = np.zeros(n)
     exits = np.zeros(n)
     positions = np.zeros(n)
@@ -131,7 +140,12 @@ def simulate_trades_vectorized(
                 elif exit_on_vwap and close[i] < vwap[i]:
                     exit_price = close[i]
                     exit_reason = 2
-                
+
+                # 日內強制平倉 (不持倉過夜)
+                elif intraday_only and has_eod and eod_bars[i]:
+                    exit_price = close[i]
+                    exit_reason = 4
+
                 elif i == n - 1:
                     exit_price = close[i]
                     exit_reason = 3
@@ -157,7 +171,12 @@ def simulate_trades_vectorized(
                 elif exit_on_vwap and close[i] > vwap[i]:
                     exit_price = close[i]
                     exit_reason = 2
-                
+
+                # 日內強制平倉 (不持倉過夜)
+                elif intraday_only and has_eod and eod_bars[i]:
+                    exit_price = close[i]
+                    exit_reason = 4
+
                 elif i == n - 1:
                     exit_price = close[i]
                     exit_reason = 3

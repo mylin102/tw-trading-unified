@@ -16,10 +16,9 @@ def classify_houyi(df: pd.DataFrame) -> pd.Series:
     後羿射日 pattern: Strong momentum burst after squeeze compression.
 
     Conditions:
-    1. Squeeze was ON recently (within last 20 bars)
-    2. Squeeze just FIRED (transition from compression to expansion)
-    3. Momentum state >= 2 (acceleration phase)
-    4. Momentum velocity > 0 (directional force)
+    1. Squeeze just FIRED (transition from compression to expansion)
+    2. Momentum state >= 2 (acceleration phase)
+    3. Momentum velocity > 0 (directional force)
 
     Returns boolean Series: True where houyi pattern detected.
     """
@@ -52,7 +51,6 @@ def classify_whale(df: pd.DataFrame) -> pd.Series:
     bullish = df.get("bullish_align", pd.Series(False, index=df.index))
     bearish = df.get("bearish_align", pd.Series(False, index=df.index))
     volume = df.get("Volume", pd.Series(0, index=df.index))
-    adx = df.get("adx", pd.Series(0.0, index=df.index))
 
     # Volume confirmation: current volume > 20-bar SMA
     vol_sma = volume.rolling(20, min_periods=20).mean()
@@ -61,9 +59,11 @@ def classify_whale(df: pd.DataFrame) -> pd.Series:
     # Whale: aligned trend + volume confirmation
     is_whale = (bullish | bearish) & vol_confirm
 
-    # ADX filter if available
+    # ADX filter: only apply if column exists and has non-NaN values
     if "adx" in df.columns:
-        is_whale = is_whale & (adx > 15)
+        adx = df["adx"]
+        has_adx = adx.notna()
+        is_whale = is_whale & (~has_adx | (adx > 15))
 
     return is_whale
 

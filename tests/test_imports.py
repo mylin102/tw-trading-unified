@@ -10,7 +10,7 @@ if str(ROOT) not in sys.path:
 def test_sweep_engine_imports():
     """驗證 sweep_engine 是否具備所有必要的公開介面"""
     try:
-        from backtest.sweep_engine import run_grid_sweep, run_multi_asset_backtest
+        from backtest.sweep_engine import run_portfolio_grid_sweep, run_multi_asset_backtest
         print("✅ sweep_engine imports OK")
     except ImportError as e:
         pytest.fail(f"Critical Import Error in sweep_engine: {e}")

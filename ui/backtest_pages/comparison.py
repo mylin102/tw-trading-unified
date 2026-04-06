@@ -43,6 +43,8 @@ def main():
         st.header(get_text("params"))
         atr_mult = st.slider(get_text("atr_mult"), 1.0, 4.0, 2.0, 0.5)
         initial_bal = 100000.0
+        intraday_mode = st.checkbox("🌙 日內交易模式 (不持倉過夜)", value=True,
+            help="勾選後，每個交易日的最後一根 K 線會強制平倉。適合日內策略比較。")
 
     # 2. Execution
     if st.button(get_text("btn_run_comp"), type="primary", use_container_width=True):
@@ -67,11 +69,19 @@ def main():
             # Use base config
             cfg = {"strategy": {"entry_score": 20, "regime_filter": "mid", name: {"atr_mult": atr_mult}}}
             longs, shorts = generate_signals(df, name, cfg)
-            
-            # 2. Simulate with FULL 16 arguments
+
+            # Build end-of-day bars mask
+            eod_bars = np.zeros(len(df), dtype=np.bool_)
+            if intraday_mode and "trading_day" in df.columns:
+                for i in range(1, len(df)):
+                    if df["trading_day"].values[i] != df["trading_day"].values[i - 1]:
+                        eod_bars[i - 1] = True
+                eod_bars[-1] = True
+
+            # 2. Simulate with FULL 16 arguments + intraday params
             entries, exits, positions, pnl, reasons = simulate_trades_vectorized(
                 open_arr, close_arr, high_arr, low_arr, vwap_arr, atr_arr,
-                longs, shorts, 
+                longs, shorts,
                 initial_balance=initial_bal,
                 point_value=10.0,
                 fee_per_side=10.0,
@@ -84,7 +94,9 @@ def main():
                 atr_mult=atr_mult,
                 tp1_pts=30,
                 tp1_lots=1,
-                exit_on_vwap=True
+                exit_on_vwap=True,
+                intraday_only=intraday_mode,
+                eod_bars=eod_bars,
             )
             
             # 3. Metrics

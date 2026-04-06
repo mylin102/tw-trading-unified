@@ -1,76 +1,103 @@
+import os
+import sys
 import pandas as pd
 import numpy as np
-import sys
+import yaml
 from pathlib import Path
+from datetime import datetime
 
-# Add project root to path
-sys.path.append(str(Path(__file__).parent.parent))
+# Ensure project root is in path
+ROOT = Path(__file__).parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
+from backtest.stock_engine import simulate_stock_trades
+from backtest.sweep_engine import run_multi_asset_backtest
 from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze
-from strategies.futures.squeeze_futures.engine.vectorized import VectorizedSimulator, SimulatorConfig
 
-def run_audit():
-    DATA = "data/taifex_raw/TMF_5m_taifex.csv"
-    if not Path(DATA).exists():
-        print(f"❌ Data file {DATA} not found.")
+DATA_DIR = ROOT / "data" / "taifex_raw"
+
+def run_strategy_audit():
+    # 超寬鬆參數：強迫進場以測試引擎
+    audit_cfg = {
+        "stocks": {
+            "strategy": "scout_strategy",
+            "capital_per_trade": 20000,
+            "entry_score": 5, # 極低門檻
+            "trailing_stop_pct": 0.015,
+            "stop_loss_pct": 0.03,
+            "take_profit_pct": 0.05
+        }
+    }
+    stk_cfg = audit_cfg["stocks"]
+    
+    tickers = [f.stem.split("_")[1] for f in DATA_DIR.glob("STOCK_*_5m.csv")]
+    all_dfs = {}
+    
+    print(f"🔍 Diagnostic: Checking Squeeze activity for {len(tickers)} tickers...")
+    
+    activity_log = []
+    for t in tickers:
+        try:
+            path = DATA_DIR / f"STOCK_{t}_5m.csv"
+            df = pd.read_csv(path)
+            date_col = "Date" if "Date" in df.columns else "timestamp"
+            df[date_col] = pd.to_datetime(df[date_col]); df = df.set_index(date_col)
+            df.columns = [c.capitalize() if c.lower() in ["open", "high", "low", "close", "volume"] else c for c in df.columns]
+            
+            df = calculate_futures_squeeze(df)
+            fires = df["fired"].sum()
+            activity_log.append({"Ticker": t, "Fires": fires, "Avg_Volume": df["Volume"].mean()})
+            
+            if fires > 0:
+                all_dfs[t] = df
+        except Exception: continue
+
+    activity_df = pd.DataFrame(activity_log)
+    print("\n📈 Market Activity Snapshot:")
+    print(activity_df.sort_values("Fires", ascending=False).head(10))
+
+    if not all_dfs:
+        print("❌ CRITICAL: No Squeeze Fired signals detected in the entire dataset. Strategy entry conditions may be too strict or indicators are miscalculated.")
         return
 
-    print("Loading data and calculating indicators...")
-    df_raw = pd.read_csv(DATA, parse_dates=["ts"], index_col="ts")
-    df_5m = calculate_futures_squeeze(df_raw)
+    summary, ledger = run_multi_asset_backtest(all_dfs, stk_cfg["strategy"], audit_cfg, capital_per_trade=stk_cfg["capital_per_trade"])
     
-    # 建立一個簡單的模擬分數 (真實情況由多週期決定)
-    df_5m["score"] = np.where(df_5m["momentum"] > 0, 40, -40)
-    
-    config = SimulatorConfig(point_value=10, slippage=1.0)
-    simulator = VectorizedSimulator(df_5m, config)
+    if ledger.empty:
+        print("❌ No trades even with active fires. Scaling/Position logic might be blocking entries.")
+        return
 
-    # 參數網格搜索
-    results = []
-    atr_mult_range = [2.0, 3.0]
-    tp_range = [40, 80]
-    velo_range = [0.0, 0.5, 1.0, 2.0] # 測試不同斜率門檻
+    # 執行原因分析...
+    ledger["時間"] = pd.to_datetime(ledger["時間"])
+    audit_results = []
+    entry_data = {} # {ticker: (time, price)}
 
-    print(f"Starting Final Audit (Total combinations: {len(atr_mult_range)*len(tp_range)*len(velo_range)})...")
-    
-    for mult in atr_mult_range:
-        for tp in tp_range:
-            for velo in velo_range:
-                res = simulator.run(
-                    stop_loss_pts=0, 
-                    atr_mult=mult, 
-                    tp1_pts=tp, 
-                    velo_thresh=velo
-                )
-                m = res["metrics"]
-                results.append({
-                    "ATR_Mult": mult, "TP": tp, "Velo": velo,
-                    "PF": m["profit_factor"], 
-                    "Win%": m["win_rate"], 
-                    "PnL": m["total_pnl"],
-                    "Trades": m["total_trades"]
-                })
+    for _, row in ledger.sort_values(["標的", "時間"]).iterrows():
+        t = row["標的"]
+        if "進場" in row["原因"]:
+            entry_data[t] = (row["時間"], row["進場價"])
+            continue
+        
+        if t in entry_data:
+            e_time, e_price = entry_data[t]
+            duration = (row["時間"] - e_time).total_seconds() / 60
+            pnl = row["損益"]
+            
+            mode = "SUCCESS" if pnl > 0 else "FAILURE"
+            if pnl < 0:
+                if duration < 30: mode = "Noise Trap"
+                elif pnl < -1000: mode = "Deep Loss"
+                else: mode = "Other"
+            
+            audit_results.append({"Ticker": t, "Duration": duration, "PnL": pnl, "Mode": mode})
+            del entry_data[t]
 
-    df_results = pd.DataFrame(results)
-    print("\n=== Final Audit Results (Top 10) ===")
-    print(df_results.sort_values("PF", ascending=False).head(10).to_string(index=False))
-    
-    # 找出漏洞分析
-    print("\n🔍 漏洞分析報告：")
-    
-    # 1. 檢查過度交易
-    high_trades = df_results[df_results["Trades"] > df_results["Trades"].median()]
-    if high_trades["PF"].mean() < 1.0:
-        print("⚠️ 漏洞發現：交易次數過多時獲利能力劇降。這代表策略在盤整期極度脆弱，易受滑價磨損。")
-    
-    # 2. 檢查停損點數
-    small_sl = df_results[df_results["SL"] <= 30]
-    large_sl = df_results[df_results["SL"] > 30]
-    if small_sl["Win Rate"].mean() < large_sl["Win Rate"].mean() - 5:
-        print("⚠️ 漏洞發現：緊湊停損 (<=30pts) 的勝率顯著低於寬鬆停損。市場雜訊可能頻繁觸發無謂的停損。")
+    if audit_results:
+        audit_df = pd.DataFrame(audit_results)
+        print("\n📊 Failure Mode Distribution:")
+        print(audit_df["Mode"].value_counts())
+    else:
+        print("❌ Analysis results are empty.")
 
-    # 3. 檢查跳空影響
-    # (這部分會從 simulator.run 返回的 exit_reasons 中分析，若 reason=0 且成交價 != sl_price 則為跳空)
-    
 if __name__ == "__main__":
-    run_audit()
+    run_strategy_audit()

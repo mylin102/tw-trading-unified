@@ -15,7 +15,9 @@ def apply_strategy_filters(
 ) -> pd.DataFrame:
     """
     Apply squeeze pattern StrategyParams filters to a DataFrame.
-    Returns a filtered DataFrame with only rows matching the criteria.
+    Instead of removing rows (which breaks time-series continuity for Numba engine),
+    this zeros out signal columns (fired, sqz_on, mom_state) on non-matching rows,
+    preserving OHLCV continuity for the backtest engine.
     """
     result = df.copy()
 
@@ -23,27 +25,44 @@ def apply_strategy_filters(
         if "pattern" not in result.columns:
             from strategies.stocks.squeeze_patterns import apply_squeeze_patterns
             result = apply_squeeze_patterns(result)
-        result = result[result["pattern"].isin(params.patterns)]
+        mask = ~result["pattern"].isin(params.patterns)
+        _suppress_signals(result, mask)
 
     if params.min_momentum is not None and "mom_state" in result.columns:
-        result = result[result["mom_state"] >= params.min_momentum]
+        mask = result["mom_state"] < params.min_momentum
+        _suppress_signals(result, mask)
 
     if params.max_momentum is not None and "mom_state" in result.columns:
-        result = result[result["mom_state"] <= params.max_momentum]
+        mask = result["mom_state"] > params.max_momentum
+        _suppress_signals(result, mask)
 
     if params.require_squeeze_on and "sqz_on" in result.columns:
-        result = result[result["sqz_on"]]
+        mask = ~result["sqz_on"]
+        _suppress_signals(result, mask)
 
     if params.require_fired and "fired" in result.columns:
-        result = result[result["fired"]]
+        mask = ~result["fired"]
+        _suppress_signals(result, mask)
 
     if params.min_value_score is not None and "value_score" in result.columns:
-        result = result[result["value_score"] >= params.min_value_score]
+        mask = result["value_score"] < params.min_value_score
+        _suppress_signals(result, mask)
 
     if params.allowed_regimes and "market_regime" in result.columns:
-        result = result[result["market_regime"].isin(params.allowed_regimes)]
+        mask = ~result["market_regime"].isin(params.allowed_regimes)
+        _suppress_signals(result, mask)
 
     return result
+
+
+def _suppress_signals(df: pd.DataFrame, mask: pd.Series) -> None:
+    """Zero out signal columns on masked rows to prevent entry signals."""
+    if "fired" in df.columns:
+        df.loc[mask, "fired"] = False
+    if "sqz_on" in df.columns:
+        df.loc[mask, "sqz_on"] = False
+    if "mom_state" in df.columns:
+        df.loc[mask, "mom_state"] = 0
 
 def build_state_optimized(
     df_5m_np: Dict[str, np.ndarray], 

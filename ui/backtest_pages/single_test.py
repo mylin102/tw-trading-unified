@@ -185,6 +185,10 @@ def main():
             st.error(f"Missing 'Open' column. Available columns: {list(df.columns)[:15]}...")
             st.stop()
 
+        # 日內模式選項
+        intraday_mode = st.checkbox("🌙 日內交易模式 (不持倉過夜)", value=False,
+            help="勾選後，每個交易日的最後一根 K 線會強制平倉。不勾選則允許持倉過夜（適合 Squeeze 趨勢策略）。")
+
         cfg = {
             "strategy": {
                 "regime_filter": "mid",
@@ -204,9 +208,17 @@ def main():
             vwap_arr = df["vwap"].values if "vwap" in df.columns else np.zeros(len(df))
             atr_arr = df["atr"].values if "atr" in df.columns else np.full(len(df), 30.0)
 
+            # Build end-of-day bars mask
+            eod_bars = np.zeros(len(df), dtype=np.bool_)
+            if intraday_mode and "trading_day" in df.columns:
+                for i in range(1, len(df)):
+                    if df["trading_day"].values[i] != df["trading_day"].values[i - 1]:
+                        eod_bars[i - 1] = True
+                eod_bars[-1] = True  # Last bar is always EOD
+
             entries, exits, positions, pnl, reasons = simulate_trades_vectorized(
                 open_arr, close_arr, high_arr, low_arr, vwap_arr, atr_arr,
-                longs, shorts, 
+                longs, shorts,
                 initial_balance=initial_bal,
                 point_value=10.0,
                 fee_per_side=10.0,
@@ -219,7 +231,9 @@ def main():
                 atr_mult=atr_mult,
                 tp1_pts=30,
                 tp1_lots=1,
-                exit_on_vwap=True
+                exit_on_vwap=True,
+                intraday_only=intraday_mode,
+                eod_bars=eod_bars,
             )
             
             res = calculate_metrics(pnl, entries, exits, positions, initial_bal)

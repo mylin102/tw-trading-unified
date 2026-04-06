@@ -1,32 +1,22 @@
 live_trading: false
 stocks:
-  # === 策略設定 ===
-  strategy: momentum_breakout
-  fallback_strategy: kd_mean_reversion
-
-  # === 最佳參數 (2025-06 ~ 2026-04 回測) ===
-  stop_loss_pct: 0.02
-  take_profit_pct: 0.10
-  trailing_stop_pct: 0.01
-  capital_per_trade: 20000
-  total_portfolio_budget: 100000
-  entry_score: 20
   atr_mult: 2.0
-
-  # === 空頭防禦 ===
   bear_defense:
+    bear_max_positions: 1
     enabled: true
-    # 大盤 EMA 濾網：加權指數收在 EMA60 之下 → 停止開新倉
     market_ema_filter: true
     market_ema_length: 60
-    # 單日最大虧損：超過則當日停止交易
-    max_daily_loss: 3000
-    # 連續虧損次數：連虧 N 次暫停 1 天
     max_consecutive_losses: 3
-    # 持倉上限：空頭環境減半
-    bear_max_positions: 1
+    max_daily_loss: 3000
     normal_max_positions: 3
-
+  capital_per_trade: 20000
+  entry_score: 20
+  fallback_strategy: kd_mean_reversion
+  stop_loss_pct: 0.02
+  strategy: momentum_breakout
+  take_profit_pct: 0.1
+  total_portfolio_budget: 100000
+  trailing_stop_pct: 0.01
   watchlist:
   - '2467'
   - '3450'
