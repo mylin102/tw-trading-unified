@@ -699,31 +699,42 @@ with tab_settings:
                                          help="請輸入股票代號，例如 2330。支援一行一個標的。")
             
             c1, c2, c2b = st.columns(3)
-            strat_new = c1.selectbox("策略", ["scout_strategy", "mean_reversion", "arbitrage_lite"], index=0)
+            from strategies.stocks.entry_strategies import STOCK_STRATEGIES
+            strat_options = list(STOCK_STRATEGIES.keys())
+            current_strat = stk_inner.get("strategy", "momentum_breakout")
+            strat_idx = strat_options.index(current_strat) if current_strat in strat_options else 0
+            strat_new = c1.selectbox("策略", strat_options, index=strat_idx,
+                                     help=STOCK_STRATEGIES.get(current_strat, {}).get("desc", ""))
             budget_new = c2.number_input("總分配資金 (TWD)", value=stk_inner.get("total_portfolio_budget", 100000), step=10000)
             capital_new = c2b.number_input("單筆預算 (TWD)", value=stk_inner.get("capital_per_trade", 20000), step=1000)
             
             c3, c4, c5 = st.columns(3)
-            score_new = c3.slider("進場門檻 (Score)", 10, 80, value=stk_inner.get("entry_score", 45))
-            atr_new = c4.slider("ATR 乘數", 1.0, 5.0, value=float(stk_inner.get("atr_mult", 2.0)), step=0.1)
-            ts_new = c5.slider("移動停損 (%)", 0.5, 5.0, value=float(stk_inner.get("trailing_stop_pct", 0.03)*100), step=0.1) / 100.0
+            sl_new = c3.slider("停損 (%)", 1.0, 10.0, value=float(stk_inner.get("stop_loss_pct", 0.02)*100), step=0.5) / 100.0
+            tp_new = c4.slider("停利 (%)", 2.0, 20.0, value=float(stk_inner.get("take_profit_pct", 0.10)*100), step=0.5) / 100.0
+            ts_new = c5.slider("移動停損 (%)", 0.5, 5.0, value=float(stk_inner.get("trailing_stop_pct", 0.01)*100), step=0.1) / 100.0
             
             if st.form_submit_button("💾 儲存並重啟台股模組"):
                 # 處理多行輸入，轉回 list
                 new_tickers = [t.strip() for t in watchlist_area.split("\n") if t.strip()]
+                new_stocks = {
+                    "watchlist": new_tickers,
+                    "strategy": strat_new,
+                    "total_portfolio_budget": budget_new,
+                    "capital_per_trade": capital_new,
+                    "entry_score": stk_inner.get("entry_score", 20),
+                    "atr_mult": stk_inner.get("atr_mult", 2.0),
+                    "stop_loss_pct": sl_new,
+                    "take_profit_pct": tp_new,
+                    "trailing_stop_pct": ts_new,
+                }
+                # 保留 bear_defense 等既有區塊
+                if "bear_defense" in stk_inner:
+                    new_stocks["bear_defense"] = stk_inner["bear_defense"]
+                if "fallback_strategy" in stk_inner:
+                    new_stocks["fallback_strategy"] = stk_inner["fallback_strategy"]
                 new_stock_cfg = {
                     "live_trading": s_live_new,
-                    "stocks": {
-                        "watchlist": new_tickers,
-                        "strategy": strat_new,
-                        "total_portfolio_budget": budget_new,
-                        "capital_per_trade": capital_new,
-                        "entry_score": score_new,
-                        "atr_mult": atr_new,
-                        "stop_loss_pct": stk_inner.get("stop_loss_pct", 0.03),
-                        "take_profit_pct": stk_inner.get("take_profit_pct", 0.05),
-                        "trailing_stop_pct": ts_new
-                    }
+                    "stocks": new_stocks,
                 }
                 save_yaml(STOCK_CFG_PATH, new_stock_cfg)
                 trigger_restart()
