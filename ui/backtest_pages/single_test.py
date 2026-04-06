@@ -157,16 +157,18 @@ def main():
 
         st.success(get_text("loaded_bars", len(df)))
 
+        # Main area controls (always visible, outside sidebar)
+        st.divider()
+        intraday_mode = st.checkbox("🌙 日內交易模式 (不持倉過夜)", value=False,
+            help="勾選後，每個交易日的最後一根 K 線會強制平倉。不勾選則允許持倉過夜（適合 Squeeze 趨勢策略）。")
+
         with st.form("single_backtest_form"):
-            st.divider()
             st.header(get_text("strategy_settings"))
             strat_name = st.selectbox(get_text("select_strategy"), list(STRATEGIES.keys()))
-            # 顯示策略說明 (打磨)
             strat_entry = STRATEGIES[strat_name]
             desc = strat_entry.get("desc", "No description available.") if isinstance(strat_entry, dict) else "No description available."
             st.info(desc)
 
-            st.divider()
             st.header(get_text("params"))
             atr_mult = st.slider(get_text("atr_mult"), 0.0, 5.0, 2.0, 0.1)
             entry_score = st.slider(get_text("entry_score"), 0, 100, 20, 5)

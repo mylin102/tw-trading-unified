@@ -91,16 +91,19 @@ def main():
     # 3. Visualization
     if "sweep_results" in st.session_state and st.session_state.get("sweep_strat_used") == strat_name:
         results_df = st.session_state["sweep_results"]
-        
+
+        # Engine returns PascalCase columns: Total_PnL, Total_Trades, etc.
+        pnl_col = "Total_PnL" if "Total_PnL" in results_df.columns else "total_pnl"
+
         st.header(get_text("perf_heatmap"))
-        
+
         available_params = [k for k in sweep_params.keys() if len(sweep_params[k]) > 1]
-        
+
         if len(available_params) >= 2:
             y_axis = st.selectbox("Y-Axis Param", available_params, index=0)
             x_axis = st.selectbox("X-Axis Param", [p for p in available_params if p != y_axis], index=0)
-            pivot_df = results_df.groupby([y_axis, x_axis])["total_pnl"].mean().reset_index()
-            pivot_pnl = pivot_df.pivot(index=y_axis, columns=x_axis, values="total_pnl")
+            pivot_df = results_df.groupby([y_axis, x_axis])[pnl_col].mean().reset_index()
+            pivot_pnl = pivot_df.pivot(index=y_axis, columns=x_axis, values=pnl_col)
             fig = px.imshow(pivot_pnl, labels=dict(x=x_axis, y=y_axis, color="Avg Total PnL"),
                             x=pivot_pnl.columns, y=pivot_pnl.index, color_continuous_scale="RdYlGn", aspect="auto")
             fig.update_layout(template="plotly_dark")
@@ -112,32 +115,32 @@ def main():
         # 4. Robustness Check (Monte Carlo)
         st.divider()
         st.header(get_text("robustness"))
-        best_idx = results_df["total_pnl"].idxmax()
+        best_idx = results_df[pnl_col].idxmax()
         best_params = results_df.loc[best_idx]
         combo_idx = best_params["combo_idx"]
-        
+
         st.subheader(f"{get_text('best_combo')}: Score={best_params.get('entry_score', 'N/A')}, ATR={best_params['atr_mult']}")
-        
+
         real_trades = trades_dict.get(combo_idx, np.array([]))
-        
+
         if len(real_trades) > 0:
             with st.spinner(get_text("shuffling", len(real_trades))):
                 mc_results = run_monte_carlo_drawdown(real_trades, 100000.0, iterations=1000)
-            
+
             fig_mc = px.histogram(mc_results, nbins=50, title=get_text("mc_dist"))
             fig_mc.update_layout(template="plotly_dark", showlegend=False)
             st.plotly_chart(fig_mc, use_container_width=True)
-            
+
             var_95 = np.percentile(mc_results, 95)
             st.error(get_text("risk_95", f"{var_95:,.0f}"))
         else:
             st.warning("No trades found for the best combination to run Monte Carlo.")
-            
+
         # 5. Stability Score
         st.divider()
         st.header(get_text("plateau"))
-        std_pnl = results_df["total_pnl"].std()
-        avg_pnl = results_df["total_pnl"].mean()
+        std_pnl = results_df[pnl_col].std()
+        avg_pnl = results_df[pnl_col].mean()
         stability = (1 - (std_pnl / abs(avg_pnl))) * 100 if avg_pnl != 0 else 0
         
         c1, c2 = st.columns(2)

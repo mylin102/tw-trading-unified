@@ -43,8 +43,10 @@ def main():
         st.header(get_text("params"))
         atr_mult = st.slider(get_text("atr_mult"), 1.0, 4.0, 2.0, 0.5)
         initial_bal = 100000.0
-        intraday_mode = st.checkbox("🌙 日內交易模式 (不持倉過夜)", value=True,
-            help="勾選後，每個交易日的最後一根 K 線會強制平倉。適合日內策略比較。")
+
+    # Main area controls (always visible)
+    intraday_mode = st.checkbox("🌙 日內交易模式 (不持倉過夜)", value=True,
+        help="勾選後，每個交易日的最後一根 K 線會強制平倉。適合日內策略比較。")
 
     # 2. Execution
     if st.button(get_text("btn_run_comp"), type="primary", use_container_width=True):
