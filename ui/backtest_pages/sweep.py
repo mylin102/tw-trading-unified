@@ -24,19 +24,21 @@ def main():
     with st.sidebar:
         st.header(get_text("data_source"))
         src_opts = [get_text("today_ind"), get_text("specific_date"), get_text("q1_data")]
-        src = st.radio(get_text("select_source"), src_opts, key="sweep_src")
-        
+        # Default to Q1 data (always available)
+        src = st.radio(get_text("select_source"), src_opts, key="sweep_src", index=2)
+
         date_val = None
         if src == get_text("specific_date"):
             date_val = st.text_input(get_text("enter_date"), datetime.now().strftime("%Y%m%d"), key="sweep_date")
-        
+
         source_map = {get_text("today_ind"): "today", get_text("specific_date"): "specific", get_text("q1_data"): "q1"}
         df = load_backtest_data(source_map[src], date_val)
-        
-        if df is not None:
-            st.success(get_text("loaded_bars", len(df)))
-        else:
+
+        if df is None:
+            st.error("No data available. Try 'Q1 Historical Data'.")
             st.stop()
+
+        st.success(get_text("loaded_bars", len(df)))
 
         st.header(get_text("strategy_settings"))
         strat_name = st.selectbox(get_text("select_strategy"), list(STRATEGIES.keys()), key="sweep_strat")
@@ -74,10 +76,10 @@ def main():
     # 2. Execution
     if st.button(get_text("btn_run_sweep"), type="primary", use_container_width=True):
         base_cfg = {"strategy": {strat_name: {}}}
-        
+
         with st.spinner(f"Scanning {total_combinations} combinations..."):
             # Wrap single ticker as single-asset portfolio for sweep engine
-            single_asset_dfs = {ticker: df}
+            single_asset_dfs = {"TMF": df}
             results_df = run_portfolio_grid_sweep(
                 single_asset_dfs, strat_name, sweep_params, base_cfg,
                 capital_per_trade=100000.0
