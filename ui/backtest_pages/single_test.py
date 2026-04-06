@@ -83,18 +83,14 @@ def load_backtest_data(source_type: str, date_str: str = None, _cache_version: s
 
         if "timestamp" in df.columns or "ts" in df.columns:
             ts_col = "timestamp" if "timestamp" in df.columns else "ts"
-            # 統一處理：先轉字串，移除時區偏移 (+HH:MM) 或 UTC 標誌 (Z)
             df[ts_col] = df[ts_col].astype(str).str.replace(r"[+-]\d{2}:\d{2}$", "", regex=True).str.replace("Z", "")
             df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
-
-            # 只有當確實被轉換為 datetime 類型時，才進行 tz_localize(None)
             if pd.api.types.is_datetime64_any_dtype(df[ts_col]):
                 if getattr(df[ts_col].dt, "tz", None) is not None:
                     df[ts_col] = df[ts_col].dt.tz_localize(None)
-
             df = df.set_index(ts_col)
 
-        # 標準化 OHLCV 欄位大小寫（在 calculate_futures_squeeze 之前）
+        # 標準化 OHLCV 欄位大小寫
         col_map = {}
         for c in df.columns:
             cl = c.lower()
@@ -102,6 +98,14 @@ def load_backtest_data(source_type: str, date_str: str = None, _cache_version: s
                 col_map[c] = cl.capitalize()
         if col_map:
             df = df.rename(columns=col_map)
+
+        # 防禦：補缺的 OHLCV 欄位（舊版指標 CSV 可能沒有）
+        if "Open" not in df.columns and "Close" in df.columns:
+            # 用 Close 補齊 Open/High/Low 以便回測能跑
+            df["Open"] = df["Close"]
+            df["High"] = df["Close"]
+            df["Low"] = df["Close"]
+            df["Volume"] = df.get("Volume", pd.Series(0, index=df.index))
 
         # 標準化 OHLCV 欄位並重算指標
         df = calculate_futures_squeeze(df)
