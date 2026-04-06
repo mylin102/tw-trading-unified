@@ -67,8 +67,11 @@ def rollback_config():
     os.remove(latest_backup) # Consume the backup
     return latest_backup
 
-@st.cache_data(ttl=300)
-def load_backtest_data(source_type: str, date_str: str = None):
+# Cache version key — bump this to invalidate all cached data
+_CACHE_VERSION = "v2"
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_backtest_data(source_type: str, date_str: str = None, _cache_version: str = _CACHE_VERSION):
     """
     Load data for backtesting with caching.
     source_type: 'today', 'specific', 'q1'
@@ -77,23 +80,32 @@ def load_backtest_data(source_type: str, date_str: str = None):
         if not path.exists():
             return None
         df = pd.read_csv(path)
-        
+
         if "timestamp" in df.columns or "ts" in df.columns:
             ts_col = "timestamp" if "timestamp" in df.columns else "ts"
             # 統一處理：先轉字串，移除時區偏移 (+HH:MM) 或 UTC 標誌 (Z)
             df[ts_col] = df[ts_col].astype(str).str.replace(r"[+-]\d{2}:\d{2}$", "", regex=True).str.replace("Z", "")
             df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
-            
+
             # 只有當確實被轉換為 datetime 類型時，才進行 tz_localize(None)
             if pd.api.types.is_datetime64_any_dtype(df[ts_col]):
                 if getattr(df[ts_col].dt, "tz", None) is not None:
                     df[ts_col] = df[ts_col].dt.tz_localize(None)
-            
+
             df = df.set_index(ts_col)
+
+        # 標準化 OHLCV 欄位大小寫（在 calculate_futures_squeeze 之前）
+        col_map = {}
+        for c in df.columns:
+            cl = c.lower()
+            if cl in ["open", "high", "low", "close", "volume"] and c != cl.capitalize():
+                col_map[c] = cl.capitalize()
+        if col_map:
+            df = df.rename(columns=col_map)
 
         # 標準化 OHLCV 欄位並重算指標
         df = calculate_futures_squeeze(df)
-                
+
         return df
 
     if source_type == "today":
@@ -121,42 +133,53 @@ def load_backtest_data(source_type: str, date_str: str = None):
 def main():
     st.title(f"📊 {get_text('nav_single')}")
 
-    # 1. Sidebar Controls
+    # 1. Sidebar Controls (wrapped in form for Streamlit 1.45+)
     with st.sidebar:
-        st.header(get_text("data_source"))
-        src_opts = [get_text("today_ind"), get_text("specific_date"), get_text("q1_data")]
-        src = st.radio(get_text("select_source"), src_opts)
-        
-        date_val = None
-        if src == get_text("specific_date"):
-            date_val = st.text_input(get_text("enter_date"), datetime.now().strftime("%Y%m%d"))
-        
-        source_map = {get_text("today_ind"): "today", get_text("specific_date"): "specific", get_text("q1_data"): "q1"}
-        df = load_backtest_data(source_map[src], date_val)
-        
-        if df is not None:
-            st.success(get_text("loaded_bars", len(df)))
-        else:
-            st.error(get_text("data_not_found"))
-            st.stop()
+        with st.form("single_backtest_form"):
+            st.header(get_text("data_source"))
+            src_opts = [get_text("today_ind"), get_text("specific_date"), get_text("q1_data")]
+            src = st.radio(get_text("select_source"), src_opts)
 
-        st.divider()
-        st.header(get_text("strategy_settings"))
-        strat_name = st.selectbox(get_text("select_strategy"), list(STRATEGIES.keys()))
-        # 顯示策略說明 (打磨)
-        strat_entry = STRATEGIES[strat_name]
-        desc = strat_entry.get("desc", "No description available.") if isinstance(strat_entry, dict) else "No description available."
-        st.info(desc)
-        
-        st.divider()
-        st.header(get_text("params"))
-        atr_mult = st.slider(get_text("atr_mult"), 0.0, 5.0, 2.0, 0.1)
-        entry_score = st.slider(get_text("entry_score"), 0, 100, 20, 5)
-        lots = st.number_input(get_text("lots"), 1, 10, 2)
-        initial_bal = st.number_input(get_text("initial_bal"), 10000, 1000000, 100000)
+            date_val = None
+            if src == get_text("specific_date"):
+                date_val = st.text_input(get_text("enter_date"), datetime.now().strftime("%Y%m%d"))
+
+            source_map = {get_text("today_ind"): "today", get_text("specific_date"): "specific", get_text("q1_data"): "q1"}
+            df = load_backtest_data(source_map[src], date_val)
+
+            if df is not None:
+                st.success(get_text("loaded_bars", len(df)))
+            else:
+                st.error(get_text("data_not_found"))
+                st.stop()
+
+            st.divider()
+            st.header(get_text("strategy_settings"))
+            strat_name = st.selectbox(get_text("select_strategy"), list(STRATEGIES.keys()))
+            # 顯示策略說明 (打磨)
+            strat_entry = STRATEGIES[strat_name]
+            desc = strat_entry.get("desc", "No description available.") if isinstance(strat_entry, dict) else "No description available."
+            st.info(desc)
+
+            st.divider()
+            st.header(get_text("params"))
+            atr_mult = st.slider(get_text("atr_mult"), 0.0, 5.0, 2.0, 0.1)
+            entry_score = st.slider(get_text("entry_score"), 0, 100, 20, 5)
+            lots = st.number_input(get_text("lots"), 1, 10, 2)
+            initial_bal = st.number_input(get_text("initial_bal"), 10000, 1000000, 100000)
+
+            run_btn = st.form_submit_button(get_text("btn_run_single"), type="primary", use_container_width=True)
 
     # 2. Execution
-    if st.button(get_text("btn_run_single"), type="primary", use_container_width=True):
+    if run_btn:
+        # Defensive: ensure standard OHLCV column names
+        for lower, upper in [("open", "Open"), ("high", "High"), ("low", "Low"), ("close", "Close"), ("volume", "Volume")]:
+            if lower in df.columns and upper not in df.columns:
+                df = df.rename(columns={lower: upper})
+        if "Open" not in df.columns:
+            st.error(f"Missing 'Open' column. Available columns: {list(df.columns)[:15]}...")
+            st.stop()
+
         cfg = {
             "strategy": {
                 "regime_filter": "mid",
