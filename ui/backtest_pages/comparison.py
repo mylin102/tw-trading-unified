@@ -43,15 +43,15 @@ def main():
         st.header(get_text("params"))
         atr_mult = st.slider(get_text("atr_mult"), 1.0, 4.0, 2.0, 0.5)
         initial_bal = 100000.0
-
-    # Main area controls (always visible)
-    intraday_mode = st.checkbox("🌙 日內交易模式 (不持倉過夜)", value=True,
-        help="勾選後，每個交易日的最後一根 K 線會強制平倉。適合日內策略比較。")
+        intraday_mode = st.checkbox("🌙 日內模式", value=True)
 
     # 2. Execution
     if st.button(get_text("btn_run_comp"), type="primary", use_container_width=True):
         results = []
-        
+
+        # Debug info
+        st.info(f"日內模式: {'✅ 開啟 (強制日終平倉)' if intraday_mode else '❌ 關閉 (允許持倉過夜)'}")
+
         # NumPy extraction
         open_arr = df["Open"].values
         close_arr = df["Close"].values
@@ -79,6 +79,7 @@ def main():
                     if df["trading_day"].values[i] != df["trading_day"].values[i - 1]:
                         eod_bars[i - 1] = True
                 eod_bars[-1] = True
+                st.info(f"📅 已標記 {eod_bars.sum()} 個日終平倉點 / {len(df)} 根 K 線")
 
             # 2. Simulate with FULL 16 arguments + intraday params
             entries, exits, positions, pnl, reasons = simulate_trades_vectorized(
@@ -105,38 +106,51 @@ def main():
             metrics_raw = calculate_metrics(pnl, entries, exits, positions, initial_bal)
             metrics = dict(metrics_raw) # Convert Numba typed dict to regular python dict
             metrics["Strategy"] = name
+
+            # Add exit reason counts for debugging
+            if intraday_mode:
+                eod_exits = int((reasons == 4).sum())  # Reason 4 = EOD exit
+                metrics["eod_exits"] = eod_exits
+
             results.append(metrics)
             
         progress_bar.empty()
         
         # 3. Leaderboard Table
         res_df = pd.DataFrame(results)
-        res_df = res_df[["Strategy", "total_pnl", "win_rate", "max_drawdown", "profit_factor", "total_trades"]]
-        res_df = res_df.sort_values("total_pnl", ascending=False)
-        
+
+        # Engine returns PascalCase: Total_PnL, Total_Trades, etc.
+        pnl_col = "Total_PnL" if "Total_PnL" in res_df.columns else "total_pnl"
+        wr_col = "Win_Rate" if "Win_Rate" in res_df.columns else "win_rate"
+        mdd_col = "Max_Drawdown" if "Max_Drawdown" in res_df.columns else "max_drawdown"
+        pf_col = "Profit_Factor" if "Profit_Factor" in res_df.columns else "profit_factor"
+        trades_col = "Total_Trades" if "Total_Trades" in res_df.columns else "total_trades"
+
+        cols = ["Strategy", pnl_col, wr_col, mdd_col, pf_col, trades_col]
+        if intraday_mode and "eod_exits" in res_df.columns:
+            cols.append("eod_exits")
+
+        res_df = res_df[cols].sort_values(pnl_col, ascending=False)
+
         st.header(get_text("ranking"))
-        
+
         # Styled DataFrame
         def color_pnl(val):
             color = '#10B981' if val > 0 else '#EF4444'
             return f'color: {color}; font-weight: bold'
 
+        fmt = {pnl_col: "{:+,.0f}", wr_col: "{:.1f}%", mdd_col: "{:,.0f}", pf_col: "{:.2f}"}
         st.dataframe(
-            res_df.style.format({
-                "total_pnl": "{:+,.0f}",
-                "win_rate": "{:.1f}%",
-                "max_drawdown": "{:,.0f}",
-                "profit_factor": "{:.2f}"
-            }).map(color_pnl, subset=["total_pnl"]),
+            res_df.style.format(fmt).map(color_pnl, subset=[pnl_col]),
             use_container_width=True
         )
 
         # 4. Bar Chart
         fig = go.Figure()
         fig.add_trace(go.Bar(
-            x=res_df["Strategy"], 
-            y=res_df["total_pnl"],
-            marker_color=np.where(res_df["total_pnl"] > 0, '#10B981', '#EF4444')
+            x=res_df["Strategy"],
+            y=res_df[pnl_col],
+            marker_color=np.where(res_df[pnl_col] > 0, '#10B981', '#EF4444')
         ))
         fig.update_layout(title=get_text("pnl_comp"), template="plotly_dark", height=400)
         st.plotly_chart(fig, use_container_width=True)
