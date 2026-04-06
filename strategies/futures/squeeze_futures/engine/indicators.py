@@ -176,6 +176,12 @@ def calculate_futures_squeeze(
     res["bullish_align"] = res["ema_fast"] > res["ema_slow"]
     res["bearish_align"] = res["ema_fast"] < res["ema_slow"]
 
+    # Bollinger Bands (用於均值回歸策略)
+    bb_basis = res["Close"].rolling(window=bb_length).mean()
+    bb_dev = res["Close"].rolling(window=bb_length).std()
+    res["bb_upper"] = bb_basis + bb_std * bb_dev
+    res["bb_lower"] = bb_basis - bb_std * bb_dev
+
     # 波動率調整後的 Pullback 區域
     if "High" in res.columns and "Low" in res.columns:
         res["recent_high"] = res["High"].rolling(window=bb_length).max()

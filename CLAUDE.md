@@ -4,6 +4,14 @@
 - lint: ruff check .
 - test: python3 -m pytest tests/
 - shell: shellcheck autostart.sh
+- ui: ./scripts/deep_qa_test.sh
+
+## UI Validation Mandate
+
+- NEVER settle for "page loaded" status.
+- ALWAYS simulate user interaction (click "Run Backtest", "Run Comparison").
+- ALWAYS check for runtime errors by scanning page text for "Traceback" or "KeyError".
+- Use `gstack-browse` to capture screenshots AFTER execution completes.
 
 ## Skill routing
 

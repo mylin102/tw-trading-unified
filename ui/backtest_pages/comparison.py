@@ -14,34 +14,36 @@ from backtest.signal_generator import generate_signals # noqa: E402
 from strategies.futures.squeeze_futures.engine.vectorized import simulate_trades_vectorized, calculate_metrics # noqa: E402
 from ui.backtest_pages.single_test import load_backtest_data # noqa: E402
 from strategies.futures.entry_strategies import STRATEGIES # noqa: E402
+from core.i18n import get_text # noqa: E402
 
 def main():
-    st.title("🏆 Strategy Leaderboard")
-    st.caption("Compare all registered strategies side-by-side on the same dataset.")
+    st.title(f"🏆 {get_text('leaderboard_title')}")
+    st.caption(get_text("leaderboard_cap"))
 
     # 1. Sidebar Controls
     with st.sidebar:
-        st.header("1. Dataset")
-        src = st.radio("Select source", ["Today's Indicators", "Specific Date", "Q1 Full Dataset"], key="comp_src")
+        st.header(get_text("data_source"))
+        src_opts = [get_text("today_ind"), get_text("specific_date"), get_text("q1_data")]
+        src = st.radio(get_text("select_source"), src_opts, key="comp_src")
         date_val = None
-        if src == "Specific Date":
-            date_val = st.text_input("Enter date (YYYYMMDD)", key="comp_date")
+        if src == get_text("specific_date"):
+            date_val = st.text_input(get_text("enter_date"), key="comp_date")
         
-        source_map = {"Today's Indicators": "today", "Specific Date": "specific", "Q1 Full Dataset": "q1"}
+        source_map = {get_text("today_ind"): "today", get_text("specific_date"): "specific", get_text("q1_data"): "q1"}
         df = load_backtest_data(source_map[src], date_val)
         
         if df is not None:
-            st.success(f"Loaded {len(df)} bars")
+            st.success(get_text("loaded_bars", len(df)))
         else:
             st.stop()
 
         st.divider()
-        st.header("2. Base Settings")
-        atr_mult = st.slider("ATR Multiplier (Exit)", 1.0, 4.0, 2.0, 0.5)
+        st.header(get_text("params"))
+        atr_mult = st.slider(get_text("atr_mult"), 1.0, 4.0, 2.0, 0.5)
         initial_bal = 100000.0
 
     # 2. Execution
-    if st.button("🏁 Run Comparison", type="primary", use_container_width=True):
+    if st.button(get_text("btn_run_comp"), type="primary", use_container_width=True):
         results = []
         
         # NumPy extraction
@@ -64,17 +66,28 @@ def main():
             cfg = {"strategy": {"entry_score": 20, "regime_filter": "mid", name: {"atr_mult": atr_mult}}}
             longs, shorts = generate_signals(df, name, cfg)
             
-            # 2. Simulate
-            _, _, _, pnl, _ = simulate_trades_vectorized(
+            # 2. Simulate with FULL 16 arguments
+            entries, exits, positions, pnl, reasons = simulate_trades_vectorized(
                 open_arr, close_arr, high_arr, low_arr, vwap_arr, atr_arr,
                 longs, shorts, 
                 initial_balance=initial_bal,
+                point_value=10.0,
+                fee_per_side=10.0,
+                exchange_fee=2.0,
+                tax_rate=0.00002,
+                max_positions=1,
+                lots_per_trade=1,
+                slippage=1.0,
+                stop_loss_pts=30,
                 atr_mult=atr_mult,
+                tp1_pts=30,
+                tp1_lots=1,
                 exit_on_vwap=True
             )
             
             # 3. Metrics
-            metrics = calculate_metrics(pnl, np.zeros(1), np.zeros(1), np.zeros(1), initial_bal)
+            metrics_raw = calculate_metrics(pnl, entries, exits, positions, initial_bal)
+            metrics = dict(metrics_raw) # Convert Numba typed dict to regular python dict
             metrics["Strategy"] = name
             results.append(metrics)
             
@@ -85,7 +98,7 @@ def main():
         res_df = res_df[["Strategy", "total_pnl", "win_rate", "max_drawdown", "profit_factor", "total_trades"]]
         res_df = res_df.sort_values("total_pnl", ascending=False)
         
-        st.header("Ranking")
+        st.header(get_text("ranking"))
         
         # Styled DataFrame
         def color_pnl(val):
@@ -98,7 +111,7 @@ def main():
                 "win_rate": "{:.1f}%",
                 "max_drawdown": "{:,.0f}",
                 "profit_factor": "{:.2f}"
-            }).applymap(color_pnl, subset=["total_pnl"]),
+            }).map(color_pnl, subset=["total_pnl"]),
             use_container_width=True
         )
 
@@ -109,7 +122,7 @@ def main():
             y=res_df["total_pnl"],
             marker_color=np.where(res_df["total_pnl"] > 0, '#10B981', '#EF4444')
         ))
-        fig.update_layout(title="PnL Comparison", template="plotly_dark", height=400)
+        fig.update_layout(title=get_text("pnl_comp"), template="plotly_dark", height=400)
         st.plotly_chart(fig, use_container_width=True)
 
     else:

@@ -9,6 +9,8 @@ ROOT = Path(__file__).parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core.i18n import get_text # noqa: E402
+
 TRADES_DIR = ROOT / "exports" / "trades"
 
 def load_all_history():
@@ -36,8 +38,8 @@ def load_all_history():
     return combined
 
 def main():
-    st.title("📈 Performance History")
-    st.caption("Aggregated analytics from all recorded trading sessions.")
+    st.title(f"📈 {get_text('history_title')}")
+    st.caption(get_text("history_cap"))
 
     df = load_all_history()
 
@@ -49,28 +51,28 @@ def main():
     # Assuming PnL column exists and 0 means no exit yet
     exits = df[df["PnL"] != 0].copy()
     
-    st.header("Lifetime Statistics")
+    st.header(get_text("lifetime_stats"))
     c1, c2, c3, c4 = st.columns(4)
     
     total_pnl = exits["PnL"].sum()
     win_rate = (exits["PnL"] > 0).mean() * 100 if not exits.empty else 0
     pf = exits[exits["PnL"] > 0]["PnL"].sum() / abs(exits[exits["PnL"] < 0]["PnL"].sum()) if (exits["PnL"] < 0).any() else 1.0
     
-    c1.metric("Total PnL", f"{total_pnl:+,.0f} TWD")
-    c2.metric("Win Rate", f"{win_rate:.1f}%")
-    c3.metric("Profit Factor", f"{pf:.2f}")
-    c4.metric("Total Exits", len(exits))
+    c1.metric(get_text("profit"), f"{total_pnl:+,.0f} TWD")
+    c2.metric(get_text("win_rate"), f"{win_rate:.1f}%")
+    c3.metric(get_text("pf"), f"{pf:.2f}")
+    c4.metric(get_text("trades"), len(exits))
 
     # ── Equity Curve ──
     st.divider()
-    st.header("Cumulative Equity")
+    st.header(get_text("cum_equity"))
     exits["cum_pnl"] = exits["PnL"].cumsum()
     
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=exits["Timestamp"], 
         y=exits["cum_pnl"], 
-        name="Total Equity",
+        name=get_text("cum_equity"),
         fill='tozeroy',
         line=dict(color="#3B82F6", width=2)
     ))
@@ -79,7 +81,7 @@ def main():
 
     # ── Detailed Logs ──
     st.divider()
-    st.header("Historical Trade Logs")
+    st.header(get_text("hist_logs"))
     st.dataframe(df.sort_values("Timestamp", ascending=False), use_container_width=True)
 
 if __name__ == "__main__":

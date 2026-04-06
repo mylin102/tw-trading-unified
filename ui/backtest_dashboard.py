@@ -32,15 +32,46 @@ st.markdown("""
         background-color: #1E293B;
         border-right: 1px solid #334155;
     }
-    /* Fix sidebar text contrast */
-    section[data-testid="stSidebar"] p, 
-    section[data-testid="stSidebar"] label,
-    section[data-testid="stSidebar"] span,
-    section[data-testid="stSidebar"] h1,
-    section[data-testid="stSidebar"] h2,
-    section[data-testid="stSidebar"] h3 {
+    /* Sidebar Overall Text */
+    section[data-testid="stSidebar"] {
         color: #F8FAFC !important;
-        font-weight: 600;
+    }
+    
+    /* Force high contrast for language buttons */
+    div[data-testid="stSidebar"] div.stButton > button {
+        background-color: #1E293B !important;
+        border: 1px solid #3B82F6 !important;
+        color: #FFFFFF !important;
+    }
+    div[data-testid="stSidebar"] div.stButton > button * {
+        color: #FFFFFF !important;
+        font-weight: 700 !important;
+    }
+    div[data-testid="stSidebar"] div.stButton > button:hover {
+        background-color: #3B82F6 !important;
+    }
+
+    /* Metric UI Enhancement (Performance stats) */
+    div[data-testid="stMetric"] {
+        background-color: #1E293B !important;
+        border: 1px solid #334155 !important;
+        padding: 15px !important;
+        border-radius: 10px !important;
+    }
+    div[data-testid="stMetricLabel"] {
+        color: #94A3B8 !important; /* Muted label */
+        font-size: 0.9rem !important;
+    }
+    div[data-testid="stMetricValue"] {
+        color: #F8FAFC !important; /* Bright value */
+        font-weight: 800 !important;
+    }
+
+    /* Input Fields Fix */
+    .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] {
+        background-color: #0F172A !important;
+        color: #F8FAFC !important;
+        border: 1px solid #334155 !important;
     }
     /* Divider in sidebar */
     section[data-testid="stSidebar"] hr {
@@ -63,15 +94,30 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
+from core.i18n import get_text # noqa: E402
+
+# ── Language Selection ──
+if "lang" not in st.session_state:
+    st.session_state["lang"] = "zh"
+
+with st.sidebar:
+    # 一鍵切換按鈕
+    toggle_label = f"🌐 {get_text('lang_toggle')}"
+    if st.button(toggle_label, use_container_width=True):
+        st.session_state["lang"] = "en" if st.session_state["lang"] == "zh" else "zh"
+        st.rerun()
+    st.divider()
+
 # ── Navigation (2026 Modular Pattern) ──
 pages = {
-    "Analysis": [
-        st.Page("backtest_pages/single_test.py", title="Single Test", icon="📊"),
-        st.Page("backtest_pages/sweep.py", title="Parameter Sweep", icon="🔬"),
-        st.Page("backtest_pages/comparison.py", title="Strategy Leaderboard", icon="🏆"),
+    get_text("nav_analysis"): [
+        st.Page("backtest_pages/single_test.py", title=get_text("nav_single"), icon="📊"),
+        st.Page("backtest_pages/sweep.py", title=get_text("nav_sweep"), icon="🔬"),
+        st.Page("backtest_pages/stock_optimizer.py", title=get_text("nav_stock"), icon="🍎"),
+        st.Page("backtest_pages/comparison.py", title=get_text("nav_leaderboard"), icon="🏆"),
     ],
-    "System": [
-        st.Page("backtest_pages/history.py", title="Performance History", icon="📈"),
+    get_text("nav_system"): [
+        st.Page("backtest_pages/history.py", title=get_text("nav_history"), icon="📈"),
     ]
 }
 
@@ -85,3 +131,4 @@ with st.sidebar:
     st.caption(f"Root: {ROOT.name}")
 
 pg.run()
+

@@ -1,0 +1,83 @@
+import streamlit as st
+
+TRANSLATIONS = {
+    "en": {
+        "nav_analysis": "Analysis", "nav_system": "System", "nav_single": "Single Test",
+        "nav_sweep": "Parameter Sweep", "nav_stock": "Stock Optimizer",
+        "nav_leaderboard": "Leaderboard", "nav_history": "Performance History",
+        "sidebar_lang": "Language", "sidebar_sys_info": "System Info",
+        "data_source": "1. Data Source", "select_source": "Select source",
+        "today_ind": "Today's Indicators", "specific_date": "Specific Date",
+        "q1_data": "Q1 Full Dataset", "enter_date": "Enter date (YYYYMMDD)",
+        "loaded_bars": "Loaded {} bars", "data_not_found": "Data not found.",
+        "strategy_settings": "2. Strategy", "select_strategy": "Select strategy",
+        "strategy_desc": "Strategy Description", "params": "3. Parameters",
+        "atr_mult": "ATR Multiplier (Exit)", "entry_score": "Entry Score Threshold",
+        "lots": "Lots per trade", "initial_bal": "Initial Balance (TWD)",
+        "btn_run_single": "▶ Run Single Backtest", "btn_run_sweep": "🚀 Run Grid Sweep",
+        "btn_run_comp": "🏁 Run Comparison", "btn_run_global": "Run Global Scan",
+        "btn_apply": "🚀 Apply Parameters to PAPER/LIVE", "btn_rollback": "⏪ Rollback Last Change",
+        "gen_signals": "Generating signals...", "sim_trades": "Simulating trades...",
+        "results": "Backtest Results", "profit": "Total PnL", "win_rate": "Win Rate",
+        "pf": "Profit Factor", "mdd": "Max Drawdown", "trades": "Total Trades",
+        "equity_curve": "Equity Curve", "trade_log": "📋 Trade Log", "no_trades": "No trades executed.",
+        "config_updated": "Config updated! Backup: {}", "config_restored": "Restored from {}",
+        "sweep_ranges": "2. Sweep Ranges", "perf_heatmap": "Performance Heatmap",
+        "robustness": "🛡️ Robustness: Real Trade Monte Carlo", "best_combo": "Best Combination",
+        "shuffling": "Shuffling {} real trades 1,000 times...", "mc_dist": "Max Drawdown Distribution",
+        "risk_95": "⚠️ Real-Trade 95% Risk: Drawdown could reach **{} TWD**.",
+        "plateau": "Plateau vs Peak", "stability": "Neighborhood Stability",
+        "robust_region": "Robust Region Detected", "fragile_peak": "Fragile Peak Warning",
+        "leaderboard_title": "🏆 Strategy Leaderboard", "leaderboard_cap": "Compare all registered strategies.",
+        "ranking": "Ranking", "pnl_comp": "PnL Comparison",
+        "history_title": "📈 Performance History", "history_cap": "Aggregated trade analytics.",
+        "lifetime_stats": "Lifetime Statistics", "cum_equity": "Cumulative Equity",
+        "hist_logs": "Historical Trade Logs", "ticker_select": "Target Selection",
+        "add_ticker": "Add New Ticker", "adv_tools": "Portfolio Tools",
+        "lang_toggle": "繁體中文"
+    },
+    "zh": {
+        "nav_analysis": "策略分析", "nav_system": "系統管理", "nav_single": "單一回測",
+        "nav_sweep": "參數掃描", "nav_stock": "台股優化器",
+        "nav_leaderboard": "策略排行榜", "nav_history": "歷史績效",
+        "sidebar_lang": "語系設定", "sidebar_sys_info": "系統資訊",
+        "data_source": "1. 資料來源", "select_source": "選擇資料源",
+        "today_ind": "今日即時指標", "specific_date": "指定日期",
+        "q1_data": "Q1 歷史大數據", "enter_date": "輸入日期 (YYYYMMDD)",
+        "loaded_bars": "已載入 {} 根 K 棒", "data_not_found": "找不到指定資料。",
+        "strategy_settings": "2. 選擇策略", "select_strategy": "下拉選擇",
+        "strategy_desc": "策略說明", "params": "3. 回測參數",
+        "atr_mult": "ATR 止損/止盈乘數", "entry_score": "進場門檻 (Score)",
+        "lots": "單筆口數", "initial_bal": "初始本金 (TWD)",
+        "btn_run_single": "▶ 執行單一回測", "btn_run_sweep": "🚀 執行參數掃描",
+        "btn_run_comp": "🏁 執行策略對比", "btn_run_global": "全域掃描 (台股全標的)",
+        "btn_apply": "🚀 將參數同步至實戰配置", "btn_rollback": "⏪ 復原上一次參數",
+        "gen_signals": "信號生成中...", "sim_trades": "交易模擬中...",
+        "results": "回測績效總覽", "profit": "總盈虧", "win_rate": "勝率",
+        "pf": "獲利因子", "mdd": "最大回撤 (MDD)", "trades": "總交易筆數",
+        "equity_curve": "權益曲線 (紅色為回撤期，可框選過濾明細)",
+        "trade_log": "📋 交易明細解剖刀", "no_trades": "此參數下無任何交易紀錄。",
+        "config_updated": "實戰設定已更新！備份檔：{}", "config_restored": "已從備份復原：{}",
+        "sweep_ranges": "2. 掃描範圍設定", "perf_heatmap": "效能熱力圖 (Heatmap)",
+        "robustness": "🛡️ 穩健性：真實交易蒙地卡羅", "best_combo": "最佳參數組合",
+        "shuffling": "將 {} 筆真實交易洗牌 1,000 次...",
+        "mc_dist": "極端最大回撤機率分佈 (MC Simulation)",
+        "risk_95": "⚠️ **95% 信心風險:** 若交易順序極端不利，回撤可能達到 **{} TWD**。",
+        "plateau": "參數高原穩定度評估", "stability": "鄰近穩定性",
+        "robust_region": "✅ 偵測到穩健獲利高原", "fragile_peak": "⚠️ 警告：這可能是一個過度擬合的孤峰",
+        "leaderboard_title": "🏆 策略排行榜", "leaderboard_cap": "一鍵測試所有策略在同一資料集下的絕對表現。",
+        "ranking": "績效排行", "pnl_comp": "總盈虧對比",
+        "history_title": "📈 歷史績效總帳", "history_cap": "匯總所有過去模擬與實戰的交易紀錄。",
+        "lifetime_stats": "終身統計", "cum_equity": "累計權益曲線",
+        "hist_logs": "歷史交易日誌", "ticker_select": "1. 標的選擇",
+        "add_ticker": "新增標的至資料庫", "adv_tools": "進階分析工具",
+        "lang_toggle": "English"
+    }
+}
+
+def get_text(key, *args):
+    lang = st.session_state.get("lang", "zh")
+    text = TRANSLATIONS[lang].get(key, key)
+    if args:
+        return text.format(*args)
+    return text

@@ -1,7 +1,11 @@
 import numpy as np
 import pandas as pd
 from typing import Dict, Tuple, Any
-from strategies.futures.entry_strategies import STRATEGIES
+from strategies.futures.entry_strategies import STRATEGIES as FUTURES_STRATEGIES
+from strategies.stocks.entry_strategies import STOCK_STRATEGIES
+
+# Merge registries for universal access
+ALL_STRATEGIES = {**FUTURES_STRATEGIES, **STOCK_STRATEGIES}
 
 def build_state_optimized(
     df_5m_np: Dict[str, np.ndarray], 
@@ -21,6 +25,9 @@ def build_state_optimized(
     # In a real scenario, we'd pre-calculate the mapping
     last_15m = pd.Series({k: v[idx] for k, v in df_15m_np.items()}) 
 
+    # Handle missing price_round for arbitrage strategy
+    price_round = last_5m.get("price_round", last_5m["Close"])
+
     return {
         "last_5m": last_5m,
         "last_15m": last_15m,
@@ -28,6 +35,7 @@ def build_state_optimized(
         "df_5m_full": df_5m_full,
         "idx": idx,
         "score": last_5m.get("score", 0),
+        "price_round": price_round,
         "stop_loss_pts": last_5m.get("atr", 30),
         "hour": df_5m_full.index[idx].hour,
         "trend": {
@@ -46,10 +54,10 @@ def generate_signals(
     Converts strategy dict outputs to boolean arrays for vectorized engine.
     Uses NumPy optimization to minimize Pandas overhead.
     """
-    if strategy_name not in STRATEGIES:
-        raise ValueError(f"Strategy {strategy_name} not found in registry.")
+    if strategy_name not in ALL_STRATEGIES:
+        raise ValueError(f"Strategy {strategy_name} not found in any registry.")
         
-    strat_entry = STRATEGIES[strategy_name]
+    strat_entry = ALL_STRATEGIES[strategy_name]
     strategy_fn = strat_entry["func"] if isinstance(strat_entry, dict) else strat_entry
     n = len(df_5m)
     long_signals = np.zeros(n, dtype=bool)

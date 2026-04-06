@@ -19,6 +19,8 @@ from strategies.futures.squeeze_futures.engine.vectorized import simulate_trades
 from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze # noqa: E402
 from strategies.futures.entry_strategies import STRATEGIES # noqa: E402
 
+from core.i18n import get_text # noqa: E402
+
 # ── Paths ──
 BASE = ROOT
 CONFIG_PATH = BASE / "config" / "futures.yaml"
@@ -117,55 +119,56 @@ def load_backtest_data(source_type: str, date_str: str = None):
     return None
 
 def main():
-    st.title("📊 Single Strategy Backtest")
+    st.title(f"📊 {get_text('nav_single')}")
 
     # 1. Sidebar Controls
     with st.sidebar:
-        st.header("1. Data Source")
-        src = st.radio("Select source", ["Today's Indicators", "Specific Date", "Q1 Full Dataset"])
+        st.header(get_text("data_source"))
+        src_opts = [get_text("today_ind"), get_text("specific_date"), get_text("q1_data")]
+        src = st.radio(get_text("select_source"), src_opts)
         
         date_val = None
-        if src == "Specific Date":
-            date_val = st.text_input("Enter date (YYYYMMDD)", datetime.now().strftime("%Y%m%d"))
+        if src == get_text("specific_date"):
+            date_val = st.text_input(get_text("enter_date"), datetime.now().strftime("%Y%m%d"))
         
-        source_map = {"Today's Indicators": "today", "Specific Date": "specific", "Q1 Full Dataset": "q1"}
+        source_map = {get_text("today_ind"): "today", get_text("specific_date"): "specific", get_text("q1_data"): "q1"}
         df = load_backtest_data(source_map[src], date_val)
         
         if df is not None:
-            st.success(f"Loaded {len(df)} bars")
+            st.success(get_text("loaded_bars", len(df)))
         else:
-            st.error("Data not found.")
+            st.error(get_text("data_not_found"))
             st.stop()
 
         st.divider()
-        st.header("2. Strategy")
-        strat_name = st.selectbox("Select strategy", list(STRATEGIES.keys()))
+        st.header(get_text("strategy_settings"))
+        strat_name = st.selectbox(get_text("select_strategy"), list(STRATEGIES.keys()))
         # 顯示策略說明 (打磨)
         strat_entry = STRATEGIES[strat_name]
         desc = strat_entry.get("desc", "No description available.") if isinstance(strat_entry, dict) else "No description available."
         st.info(desc)
         
         st.divider()
-        st.header("3. Parameters")
-        atr_mult = st.slider("ATR Multiplier (Exit)", 0.0, 5.0, 2.0, 0.1)
-        entry_score = st.slider("Entry Score Threshold", 0, 100, 20, 5)
-        lots = st.number_input("Lots per trade", 1, 10, 2)
-        initial_bal = st.number_input("Initial Balance (TWD)", 10000, 1000000, 100000)
+        st.header(get_text("params"))
+        atr_mult = st.slider(get_text("atr_mult"), 0.0, 5.0, 2.0, 0.1)
+        entry_score = st.slider(get_text("entry_score"), 0, 100, 20, 5)
+        lots = st.number_input(get_text("lots"), 1, 10, 2)
+        initial_bal = st.number_input(get_text("initial_bal"), 10000, 1000000, 100000)
 
     # 2. Execution
-    if st.button("▶ Run Backtest", type="primary", use_container_width=True):
+    if st.button(get_text("btn_run_single"), type="primary", use_container_width=True):
         cfg = {
             "strategy": {
                 "regime_filter": "mid",
                 "entry_score": entry_score,
-                "squeeze_breakout": {"atr_mult": atr_mult}
+                strat_name: {"atr_mult": atr_mult}
             }
         }
         
-        with st.spinner("Generating signals..."):
+        with st.spinner(get_text("gen_signals")):
             longs, shorts = generate_signals(df, strat_name, cfg)
         
-        with st.spinner("Simulating trades..."):
+        with st.spinner(get_text("sim_trades")):
             open_arr = df["Open"].values
             close_arr = df["Close"].values
             high_arr = df["High"].values
@@ -194,13 +197,13 @@ def main():
             res = calculate_metrics(pnl, entries, exits, positions, initial_bal)
 
         # 3. Results Display
-        st.header("Backtest Results")
+        st.header(get_text("results"))
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Total PnL", f"{res['total_pnl']:+,.0f} TWD")
-        m2.metric("Win Rate", f"{res['win_rate']:.1f}%")
-        m3.metric("Profit Factor", f"{res['profit_factor']:.2f}")
-        m4.metric("Max Drawdown", f"{res['max_drawdown']:,.0f} TWD")
-        m5.metric("Total Trades", res['total_trades'])
+        m1.metric(get_text("profit"), f"{res['total_pnl']:+,.0f} TWD")
+        m2.metric(get_text("win_rate"), f"{res['win_rate']:.1f}%")
+        m3.metric(get_text("pf"), f"{res['profit_factor']:.2f}")
+        m4.metric(get_text("mdd"), f"{res['max_drawdown']:,.0f} TWD")
+        m5.metric(get_text("trades"), res['total_trades'])
 
         equity = initial_bal + np.cumsum(pnl)
         df_equity = pd.DataFrame({"equity": equity}, index=df.index)
@@ -220,10 +223,10 @@ def main():
                 fillcolor="red", opacity=0.15, layer="below", line_width=0
             )
 
-        fig.update_layout(title="Equity Curve", template="plotly_dark", height=450)
+        fig.update_layout(title=get_text("equity_curve"), template="plotly_dark", height=450)
         st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("🕵️ Trade Ledger")
+        st.subheader(get_text("trade_log"))
         trade_indices = np.where(pnl != 0)[0]
         if len(trade_indices) > 0:
             full_trades_df = pd.DataFrame({
@@ -238,17 +241,17 @@ def main():
             st.header("⚙️ Strategy Deployment")
             sc1, sc2 = st.columns(2)
             with sc1:
-                if st.button("🚀 Apply Parameters to PAPER/LIVE", type="primary", use_container_width=True):
+                if st.button(get_text("btn_apply"), type="primary", use_container_width=True):
                     backup = apply_params_to_config(strat_name, entry_score, atr_mult)
                     if backup:
-                        st.success(f"Config updated! Backup: {backup.name}")
+                        st.success(get_text("config_updated", backup.name))
             with sc2:
-                if st.button("⏪ Rollback Last Change", use_container_width=True):
+                if st.button(get_text("btn_rollback"), use_container_width=True):
                     restored = rollback_config()
                     if restored:
-                        st.warning(f"Restored from {restored.name}")
+                        st.warning(get_text("config_restored", restored.name))
         else:
-            st.info("No trades executed.")
+            st.info(get_text("no_trades"))
     else:
         st.info("Adjust parameters and click 'Run Backtest'.")
 

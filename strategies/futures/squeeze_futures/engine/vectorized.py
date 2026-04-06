@@ -189,21 +189,21 @@ def calculate_metrics(
     num_trades = len(trades)
     
     if num_trades == 0:
-        return {'total_pnl': 0.0, 'win_rate': 0.0, 'profit_factor': 0.0, 'max_drawdown': 0.0, 'total_trades': 0}
+        return {'total_pnl': 0.0, 'win_rate': 0.0, 'profit_factor': 0.0, 'max_drawdown': 0.0, 'total_trades': 0.0}
     
-    total_pnl = np.sum(trades)
+    total_pnl = float(np.sum(trades))
     winning = trades[trades > 0]
     losing = trades[trades < 0]
-    win_rate = len(winning) / num_trades * 100
-    profit_factor = np.sum(winning) / abs(np.sum(losing)) if len(losing) > 0 else np.inf
+    win_rate = float(len(winning)) / float(num_trades) * 100.0
+    profit_factor = float(np.sum(winning)) / abs(float(np.sum(losing))) if len(losing) > 0 else np.inf
     
     equity = initial_balance + np.cumsum(pnl)
-    peak = initial_balance
+    peak = float(initial_balance)
     max_dd = 0.0
     for val in equity:
         if val > peak:
-            peak = val
-        dd = peak - val
+            peak = float(val)
+        dd = peak - float(val)
         if dd > max_dd:
             max_dd = dd
         
@@ -212,7 +212,7 @@ def calculate_metrics(
         'win_rate': win_rate,
         'profit_factor': profit_factor,
         'max_drawdown': max_dd,
-        'total_trades': num_trades,
+        'total_trades': float(num_trades),
     }
 
 
@@ -251,5 +251,6 @@ class VectorizedSimulator:
             self.config.lots_per_trade, self.config.slippage, stop_loss_pts, atr_mult,
             tp1_pts, tp1_lots, exit_on_vwap
         )
-        metrics = calculate_metrics(pnl, ent, ext, pos, self.config.initial_balance)
+        metrics_raw = calculate_metrics(pnl, ent, ext, pos, self.config.initial_balance)
+        metrics = dict(metrics_raw)
         return {'metrics': metrics, 'params': locals()}
