@@ -1,4 +1,4 @@
-# Version: 2.0.2 (Multi-Asset Reasons)
+# Version: 2.0.4 (Portfolio Grid Sweep)
 import pandas as pd
 import numpy as np
 import copy
@@ -21,58 +21,73 @@ def update_cfg_with_params(cfg: Dict[str, Any], strategy_name: str, params: Dict
         new_cfg["strategy"][strategy_name] = {}
 
     for k, v in params.items():
-        if k == "entry_score":
-            new_cfg["strategy"]["entry_score"] = v
-        elif k == "atr_mult":
-            new_cfg["strategy"][strategy_name]["atr_mult"] = v
+        if k in ["entry_score", "bb_std"]:
+            new_cfg["strategy"][k] = v
         else:
-            new_cfg["strategy"][strategy_name][k] = v
+            new_cfg[k] = v # Stop loss, etc
     return new_cfg
 
-def run_grid_sweep(
-    df: pd.DataFrame,
+def run_portfolio_grid_sweep(
+    all_dfs: Dict[str, pd.DataFrame],
     strategy_name: str,
     sweep_params: Dict[str, List[Any]],
     base_cfg: Dict[str, Any],
-    initial_balance: float = 100000.0
-) -> Tuple[pd.DataFrame, Dict[str, np.ndarray]]:
+    capital_per_trade: float = 10000.0
+) -> pd.DataFrame:
+    """
+    真正的 Vectorbt 風格全域掃描。
+    測試每一組參數對「整個資產組合」的總影響。
+    """
     param_names = list(sweep_params.keys())
     param_values = list(sweep_params.values())
     combinations = list(product(*param_values))
     
-    results = []
-    trades_dict = {} 
-    
-    open_arr = df["Open"].values
-    high_arr = df["High"].values
-    low_arr = df["Low"].values
-    close_arr = df["Close"].values
-    vwap_arr = df["vwap"].values if "vwap" in df.columns else np.zeros(len(df))
-    atr_arr = df["atr"].values if "atr" in df.columns else np.full(len(df), 30.0)
-
-    for i, combo in enumerate(combinations):
-        current_params = dict(zip(param_names, combo))
-        cfg = update_cfg_with_params(base_cfg, strategy_name, current_params)
+    # Pre-compute signals once per ticker (signals don't depend on SL/TP/TS)
+    cached_signals = {}
+    for ticker, df in all_dfs.items():
+        cfg = update_cfg_with_params(base_cfg, strategy_name, {})
         longs, shorts = generate_signals(df, strategy_name, cfg)
-        atr_mult = current_params.get("atr_mult", cfg["strategy"].get(strategy_name, {}).get("atr_mult", 2.0))
+        trading_days = (df.index.year * 10000 + df.index.month * 100 + df.index.day).values
+        cached_signals[ticker] = (longs, shorts, trading_days,
+                                  df["Close"].values, df["High"].values, df["Low"].values)
+
+    results = []
+    
+    for combo in combinations:
+        current_params = dict(zip(param_names, combo))
         
-        entries, exits, positions, pnl, reasons = simulate_trades_vectorized(
-            open_arr, close_arr, high_arr, low_arr, vwap_arr, atr_arr,
-            longs, shorts, initial_balance=initial_balance,
-            point_value=10.0, fee_per_side=10.0, exchange_fee=2.0, tax_rate=0.00002,
-            max_positions=1, lots_per_trade=1, slippage=1.0, stop_loss_pts=30,
-            atr_mult=atr_mult, tp1_pts=30, tp1_lots=1, exit_on_vwap=True
-        )
+        portfolio_pnl = 0.0
+        portfolio_trades = 0
+        winning_assets = 0
         
-        actual_trades = pnl[pnl != 0]
-        trades_dict[str(i)] = actual_trades
-        metrics = calculate_metrics(pnl, np.zeros(1), np.zeros(1), np.zeros(1), initial_balance)
+        for ticker, df in all_dfs.items():
+            longs, shorts, trading_days, close, high, low = cached_signals[ticker]
+            
+            ent, ext, pos, pnl, reasons, qtys = simulate_stock_trades(
+                close, high, low,
+                trading_days, longs, shorts,
+                1000000.0, capital_per_trade,
+                current_params.get("stop_loss_pct", 0.03),
+                current_params.get("take_profit_pct", 0.05),
+                current_params.get("trailing_stop_pct", 0.015)
+            )
+            
+            asset_pnl = np.sum(pnl)
+            portfolio_pnl += asset_pnl
+            portfolio_trades += len(pnl[pnl != 0])
+            if asset_pnl > 0:
+                winning_assets += 1
+        
         row = current_params.copy()
-        row.update(metrics)
-        row["combo_idx"] = str(i)
+        row.update({
+            "Total_PnL": portfolio_pnl,
+            "Total_Trades": portfolio_trades,
+            "Winning_Assets": winning_assets,
+            "Profitable_Ratio": (winning_assets / len(all_dfs)) * 100 if all_dfs else 0
+        })
         results.append(row)
         
-    return pd.DataFrame(results), trades_dict
+    return pd.DataFrame(results)
 
 def run_multi_asset_backtest(
     all_dfs: Dict[str, pd.DataFrame],
@@ -80,46 +95,26 @@ def run_multi_asset_backtest(
     cfg: Dict[str, Any],
     capital_per_trade: float = 10000.0
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    回傳 (標的績效彙整, 完整交易原因明細)
-    """
     all_summary = []
     all_ledger = []
-    
     for ticker, df in all_dfs.items():
-        if df.empty:
-            continue
-        
+        if df.empty: continue
         longs, shorts = generate_signals(df, strategy_name, cfg)
         trading_days = (df.index.year * 10000 + df.index.month * 100 + df.index.day).values
-        
-        ent, ext, pos, pnl, reasons = simulate_stock_trades(
+        ent, ext, pos, pnl, reasons, qtys = simulate_stock_trades(
             df["Close"].values, df["High"].values, df["Low"].values,
             trading_days, longs, shorts,
-            initial_balance=1000000.0,
-            capital_per_trade=capital_per_trade,
-            stop_loss_pct=cfg.get("stop_loss_pct", 0.03),
-            take_profit_pct=cfg.get("take_profit_pct", 0.05),
-            trailing_stop_pct=cfg.get("trailing_stop_pct", 0.015)
+            1000000.0, capital_per_trade,
+            cfg.get("stop_loss_pct", 0.03),
+            cfg.get("take_profit_pct", 0.05),
+            cfg.get("trailing_stop_pct", 0.015)
         )
-        
-        # 紀錄明細
-        trade_idx = np.where(pnl != 0)[0]
-        for idx in trade_idx:
-            all_ledger.append({
-                "ticker": ticker,
-                "time": df.index[idx],
-                "pnl": pnl[idx],
-                "reason": REASON_MAP.get(reasons[idx], "UNKNOWN")
-            })
-            
+        last_entry_price = 0.0
+        for i in range(len(pnl)):
+            if ent[i] > 0: last_entry_price = ent[i]
+            if pnl[i] != 0:
+                all_ledger.append({"標的": ticker, "時間": df.index[i], "進場價": round(last_entry_price, 2), "出場價": round(ext[i], 2), "股數": qtys[i], "損益": round(pnl[i], 0), "原因": REASON_MAP.get(reasons[i], "未知")})
         total_pnl = np.sum(pnl)
         if total_pnl != 0:
-            all_summary.append({
-                "ticker": ticker,
-                "pnl": total_pnl,
-                "trades": len(pnl[pnl != 0]),
-                "win_rate": (np.sum(pnl > 0) / len(pnl[pnl != 0])) * 100 if len(pnl[pnl != 0]) > 0 else 0
-            })
-            
+            all_summary.append({"ticker": ticker, "pnl": total_pnl, "trades": len(pnl[pnl != 0]), "win_rate": (np.sum(pnl > 0) / len(pnl[pnl != 0])) * 100 if len(pnl[pnl != 0]) > 0 else 0})
     return pd.DataFrame(all_summary), pd.DataFrame(all_ledger)
