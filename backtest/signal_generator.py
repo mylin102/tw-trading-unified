@@ -1,11 +1,49 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, Optional
 from strategies.futures.entry_strategies import STRATEGIES as FUTURES_STRATEGIES
 from strategies.stocks.entry_strategies import STOCK_STRATEGIES
+from core.strategy_schema import StrategyParams
 
 # Merge registries for universal access
 ALL_STRATEGIES = {**FUTURES_STRATEGIES, **STOCK_STRATEGIES}
+
+
+def apply_strategy_filters(
+    df: pd.DataFrame,
+    params: StrategyParams,
+) -> pd.DataFrame:
+    """
+    Apply squeeze pattern StrategyParams filters to a DataFrame.
+    Returns a filtered DataFrame with only rows matching the criteria.
+    """
+    result = df.copy()
+
+    if params.patterns:
+        if "pattern" not in result.columns:
+            from strategies.stocks.squeeze_patterns import apply_squeeze_patterns
+            result = apply_squeeze_patterns(result)
+        result = result[result["pattern"].isin(params.patterns)]
+
+    if params.min_momentum is not None and "mom_state" in result.columns:
+        result = result[result["mom_state"] >= params.min_momentum]
+
+    if params.max_momentum is not None and "mom_state" in result.columns:
+        result = result[result["mom_state"] <= params.max_momentum]
+
+    if params.require_squeeze_on and "sqz_on" in result.columns:
+        result = result[result["sqz_on"]]
+
+    if params.require_fired and "fired" in result.columns:
+        result = result[result["fired"]]
+
+    if params.min_value_score is not None and "value_score" in result.columns:
+        result = result[result["value_score"] >= params.min_value_score]
+
+    if params.allowed_regimes and "market_regime" in result.columns:
+        result = result[result["market_regime"].isin(params.allowed_regimes)]
+
+    return result
 
 def build_state_optimized(
     df_5m_np: Dict[str, np.ndarray], 
