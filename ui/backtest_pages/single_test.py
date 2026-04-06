@@ -227,11 +227,11 @@ def main():
         # 3. Results Display
         st.header(get_text("results"))
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric(get_text("profit"), f"{res['total_pnl']:+,.0f} TWD")
-        m2.metric(get_text("win_rate"), f"{res['win_rate']:.1f}%")
-        m3.metric(get_text("pf"), f"{res['profit_factor']:.2f}")
-        m4.metric(get_text("mdd"), f"{res['max_drawdown']:,.0f} TWD")
-        m5.metric(get_text("trades"), res['total_trades'])
+        m1.metric(get_text("profit"), f"{res.get('total_pnl', 0):+,.0f}")
+        m2.metric(get_text("win_rate"), f"{res.get('win_rate', 0):.1f}%")
+        m3.metric(get_text("pf"), f"{res.get('profit_factor', 0):.2f}")
+        m4.metric(get_text("mdd"), f"{res.get('max_drawdown', 0):,.0f}")
+        m5.metric(get_text("trades"), int(res.get('total_trades', 0)))
 
         equity = initial_bal + np.cumsum(pnl)
         df_equity = pd.DataFrame({"equity": equity}, index=df.index)
