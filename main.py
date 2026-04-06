@@ -116,6 +116,13 @@ def run_system(dry_run=False):
         from strategies.options.monitor import OptionsMonitor
         om = OptionsMonitor(api=api, dry_run=dry_run)
 
+        from strategies.stocks.monitor import StockMonitor
+        sm = StockMonitor(
+            api=api,
+            config_path=os.path.join(BASE, "config", "stocks.yaml"),
+            dry_run=dry_run
+        )
+
         # 先初始化 contracts，再訂閱
         om.monitor.find_best_contracts()
         om.monitor.pre_fill_bars()
@@ -140,14 +147,17 @@ def run_system(dry_run=False):
 
         ft = threading.Thread(target=fm.run, name="futures", daemon=True)
         ot = threading.Thread(target=om.run, name="options", daemon=True)
+        st_t = threading.Thread(target=sm.run, name="stocks", daemon=True)
+        
         ft.start()
         ot.start()
-        console.print("[bold green]🚀 Both monitors running[/bold green]")
+        st_t.start()
+        console.print("[bold green]🚀 All monitors running (Futures, Options, Stocks)[/bold green]")
 
         startup_grace_until = time.time() + 60
         health_check_at = time.time() + HEALTH_INTERVAL
 
-        while ft.is_alive() and ot.is_alive():
+        while ft.is_alive() and ot.is_alive() and st_t.is_alive():
             if RESTART_FLAG.exists():
                 RESTART_FLAG.unlink()
                 console.print("[bold yellow]🔄 Restart requested. Exiting for external supervisor...[/bold yellow]")
@@ -168,19 +178,19 @@ def run_system(dry_run=False):
         console.print("[dim]Stopping monitors and threads...[/dim]")
         try:
             if 'fm' in locals():
-                # Stop futures monitor
                 fm.stop()
             if 'om' in locals():
-                # Stop options monitor
                 om.stop()
+            if 'sm' in locals():
+                sm.stop()
             
             # 給予執行緒時間結束
             if 'ft' in locals():
-                # Wait for futures thread
                 ft.join(timeout=5)
             if 'ot' in locals():
-                # Wait for options thread
                 ot.join(timeout=5)
+            if 'st_t' in locals():
+                st_t.join(timeout=5)
             
             if api is not None:
                 api.quote.set_on_tick_fop_v1_callback(lambda ex, t: None)

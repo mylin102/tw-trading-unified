@@ -88,11 +88,14 @@ def save_yaml(path, data):
 FUTURES_CFG_PATH = BASE / "config" / "futures.yaml"
 OPTIONS_CFG_PATH = BASE / "config" / "options_strategy.yaml"
 RISK_CFG_PATH = BASE / "config" / "risk_global.yaml"
+STOCK_CFG_PATH = BASE / "config" / "stocks.yaml"
 futures_cfg = load_yaml(FUTURES_CFG_PATH)
 options_cfg = load_yaml(OPTIONS_CFG_PATH)
 risk_cfg = load_yaml(RISK_CFG_PATH)
+stock_cfg = load_yaml(STOCK_CFG_PATH)
 f_live = futures_cfg.get("live_trading", False)
 o_live = options_cfg.get("live_trading", False)
+s_live = stock_cfg.get("live_trading", False)
 alloc = risk_cfg.get("allocation", {})
 reserve_pct = risk_cfg.get("account", {}).get("margin_reserve_pct", 0.20)
 
@@ -179,6 +182,19 @@ def calc_options_pnl(ledger_df):
         return None
     exits["cum_pnl"] = exits["PnL"].cumsum()
     return exits[["Timestamp", "cum_pnl"]].rename(columns={"Timestamp": "timestamp", "cum_pnl": "pnl"})
+
+def calc_stock_pnl(trades_df):
+    """從台股 trades 的 pnl_cash 欄位累計"""
+    if trades_df is None or trades_df.empty:
+        return None
+    if "pnl_cash" not in trades_df.columns:
+        return None
+    trades_df["pnl_cash"] = pd.to_numeric(trades_df["pnl_cash"], errors="coerce").fillna(0)
+    exits = trades_df[trades_df["pnl_cash"] != 0].copy()
+    if exits.empty:
+        return None
+    exits["cum_pnl"] = exits["pnl_cash"].cumsum()
+    return exits[["timestamp", "cum_pnl"]].rename(columns={"cum_pnl": "pnl"})
 
 
 def make_pnl_chart(pnl_df, title):
@@ -294,18 +310,43 @@ def load_options_equity():
             pass
     return None
 
+@st.cache_data(ttl=5)
+def load_stock_trades():
+    f = FUTURES_TRADES / f"STOCK_{DATE_STR}_trades.csv"
+    if f.exists():
+        try:
+            return pd.read_csv(f)
+        except Exception:
+            pass
+    return None
+
+@st.cache_data(ttl=5)
+def load_stock_indicators(ticker):
+    f = FUTURES_MKT / f"STOCK_{ticker}_{DATE_STR}_indicators.csv"
+    if f.exists():
+        try:
+            df = pd.read_csv(f)
+            if "ts" in df.columns:
+                df = df.rename(columns={"ts": "timestamp"})
+            elif "Date" in df.columns:
+                df = df.rename(columns={"Date": "timestamp"})
+            return df
+        except Exception:
+            pass
+    return None
+
 # ── Header ──
 def mode_badge(live):
     return "🔴 LIVE" if live else "📝 PAPER"
 
-hc = st.columns([2, 1, 1, 1, 1])
+hc = st.columns([1.5, 1, 1, 1, 1.5])
 hc[0].title("Trading Unified")
-hc[1].metric("期貨", mode_badge(f_live))
-hc[2].metric("選擇權", mode_badge(o_live))
-hc[3].metric("期貨分配", f"{alloc.get('futures', {}).get('max_margin_pct', 0)*100:.0f}%")
-hc[4].metric("選擇權分配", f"{alloc.get('options', {}).get('max_margin_pct', 0)*100:.0f}%")
+hc[1].metric("期貨 TMF", mode_badge(f_live))
+hc[2].metric("選擇權 TXO", mode_badge(o_live))
+hc[3].metric("台股 Stocks", mode_badge(s_live))
+hc[4].caption(f"📅 {TODAY}")
 
-if f_live or o_live:
+if f_live or o_live or s_live:
     st.markdown('<div style="background:#ff4444;color:white;padding:8px;text-align:center;border-radius:4px;font-weight:bold;">⚠️ LIVE TRADING ACTIVE</div>', unsafe_allow_html=True)
 
 def _monitor_status():
@@ -315,10 +356,10 @@ def _monitor_status():
     except Exception:
         return "⚪ Unknown"
 
-st.caption(f"日期: {TODAY} | 更新: {datetime.datetime.now().strftime('%H:%M:%S')} | Monitor: {_monitor_status()}")
+st.caption(f"更新: {datetime.datetime.now().strftime('%H:%M:%S')} | Monitor: {_monitor_status()}")
 
 # ── Tabs ──
-tab_overview, tab_futures, tab_options, tab_settings = st.tabs(["總覽", "期貨 TMF", "選擇權 TXO", "設定"])
+tab_overview, tab_futures, tab_options, tab_stocks, tab_settings = st.tabs(["總覽", "期貨 TMF", "選擇權 TXO", "台股 Stocks", "設定"])
 
 # ════════════════════════════════════════
 # Tab 1: 總覽
@@ -386,11 +427,13 @@ with tab_overview:
 
     # ── 總覽 PnL ──
     st.header("今日累計 PnL")
-    pc1, pc2 = st.columns(2)
+    pc1, pc2, pc3 = st.columns(3)
     ft = load_futures_trades()
     fpnl = calc_futures_pnl(ft)
     ol = load_options_ledger()
     opnl = calc_options_pnl(ol)
+    sl = load_stock_trades()
+    spnl = calc_stock_pnl(sl)
     with pc1:
         if fpnl is not None and not fpnl.empty:
             val = fpnl["pnl"].iloc[-1]
@@ -403,6 +446,12 @@ with tab_overview:
             st.metric("選擇權 PnL", f"{val:+,.0f} TWD")
         else:
             st.metric("選擇權 PnL", "0 TWD")
+    with pc3:
+        if spnl is not None and not spnl.empty:
+            val = spnl["pnl"].iloc[-1]
+            st.metric("台股 PnL", f"{val:+,.0f} TWD")
+        else:
+            st.metric("台股 PnL", "0 TWD")
 
 # ════════════════════════════════════════
 # Tab 2: 期貨
@@ -465,6 +514,50 @@ with tab_options:
         fig = make_pnl_chart(opnl, "選擇權累計 PnL (TWD)")
         if fig:
             st.plotly_chart(fig, use_container_width=True)
+
+# ════════════════════════════════════════
+# Tab 4: 台股 Stocks
+# ════════════════════════════════════════
+with tab_stocks:
+    st.header(f"台股 Stocks ({mode_badge(s_live)})")
+    
+    st.subheader("Watchlist 監控")
+    watchlist = stock_cfg.get("stocks", {}).get("watchlist", [])
+    
+    if not watchlist:
+        st.info("Watchlist 為空")
+    else:
+        cols = st.columns(len(watchlist) if len(watchlist) <= 4 else 4)
+        for i, ticker in enumerate(watchlist):
+            with cols[i % 4]:
+                s_df = load_stock_indicators(ticker)
+                if s_df is not None and not s_df.empty:
+                    last = s_df.iloc[-1]
+                    cl_val = last.get('close') if 'close' in last else last.get('Close', 0)
+                    sc_val = last.get('score', 0)
+                    sqz_on = last.get("sqz_on", False)
+                    trend = "🔒 壓縮" if sqz_on else "🔓 釋放"
+                    st.metric(f"{ticker} ({trend})", f"{cl_val:.0f}", f"Score: {sc_val:.1f}")
+                else:
+                    st.metric(f"{ticker}", "無數據")
+    
+    st.divider()
+    sl = load_stock_trades()
+    if sl is not None and not sl.empty:
+        st.header("交易記錄")
+        st.dataframe(sl.sort_values("timestamp", ascending=False).head(30), use_container_width=True)
+        spnl = calc_stock_pnl(sl)
+        fig = make_pnl_chart(spnl, "台股累計 PnL (TWD)")
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("今日尚無台股交易紀錄")
+
+# ════════════════════════════════════════
+# Tab 5: 設定
+# ════════════════════════════════════════
+with tab_settings:
+    st.info("台股設定請編輯 config/stocks.yaml")
 
 # ── Footer and Refresh ──
 refresh = 30

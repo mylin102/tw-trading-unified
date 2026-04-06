@@ -1,0 +1,14 @@
+live_trading: false
+stocks:
+  watchlist:
+    - "2330"
+    - "2454"
+    - "2317"
+    - "2382"
+  strategy: "scout_strategy"
+  capital_per_trade: 20000
+  entry_score: 45
+  atr_mult: 2.0
+  stop_loss_pct: 0.03
+  take_profit_pct: 0.05
+  trailing_stop_pct: 0.03
