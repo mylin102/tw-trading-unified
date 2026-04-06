@@ -135,24 +135,25 @@ def main():
 
     # 1. Sidebar Controls (wrapped in form for Streamlit 1.45+)
     with st.sidebar:
+        st.header(get_text("data_source"))
+        src_opts = [get_text("today_ind"), get_text("specific_date"), get_text("q1_data")]
+        # Default to Q1 data (always available)
+        src = st.radio(get_text("select_source"), src_opts, index=2)
+
+        date_val = None
+        if src == get_text("specific_date"):
+            date_val = st.text_input(get_text("enter_date"), datetime.now().strftime("%Y%m%d"))
+
+        source_map = {get_text("today_ind"): "today", get_text("specific_date"): "specific", get_text("q1_data"): "q1"}
+        df = load_backtest_data(source_map[src], date_val)
+
+        if df is None:
+            st.error("No data available for the selected source. Try 'Q1 Historical Data'.")
+            st.stop()
+
+        st.success(get_text("loaded_bars", len(df)))
+
         with st.form("single_backtest_form"):
-            st.header(get_text("data_source"))
-            src_opts = [get_text("today_ind"), get_text("specific_date"), get_text("q1_data")]
-            src = st.radio(get_text("select_source"), src_opts)
-
-            date_val = None
-            if src == get_text("specific_date"):
-                date_val = st.text_input(get_text("enter_date"), datetime.now().strftime("%Y%m%d"))
-
-            source_map = {get_text("today_ind"): "today", get_text("specific_date"): "specific", get_text("q1_data"): "q1"}
-            df = load_backtest_data(source_map[src], date_val)
-
-            if df is not None:
-                st.success(get_text("loaded_bars", len(df)))
-            else:
-                st.error(get_text("data_not_found"))
-                st.stop()
-
             st.divider()
             st.header(get_text("strategy_settings"))
             strat_name = st.selectbox(get_text("select_strategy"), list(STRATEGIES.keys()))
