@@ -172,15 +172,58 @@ def calculate_futures_squeeze(
     res["ema_fast"] = _ema(res["Close"], ema_fast)
     res["ema_slow"] = _ema(res["Close"], ema_slow)
     res["ema_filter"] = _ema(res["Close"], 60)
-    res["ema_macro"] = _ema(res["Close"], ema_macro)
+    res["ema_macro"] = _ema(res["Close"], ema_macro) # 預設為 200
     res["bullish_align"] = res["ema_fast"] > res["ema_slow"]
     res["bearish_align"] = res["ema_fast"] < res["ema_slow"]
+    
+    # 200日趨勢判斷
+    res["ema_200_up"] = (res["Close"] > res["ema_macro"]) & (res["ema_macro"] > res["ema_macro"].shift(1))
 
-    # Bollinger Bands (用於均值回歸策略)
+    # --- 新增：MACD 計算 ---
+    ema12 = _ema(res["Close"], 12)
+    ema26 = _ema(res["Close"], 26)
+    res["macd_line"] = ema12 - ema26
+    res["macd_signal"] = _ema(res["macd_line"], 9)
+    res["macd_hist"] = res["macd_line"] - res["macd_signal"]
+    # 動能增強判斷
+    res["macd_rising"] = res["macd_hist"] > res["macd_hist"].shift(1)
+
+    # --- 新增：KD (Stochastic) 計算 ---
+    k_period = 9
+    d_period = 3
+    if "Low" in res.columns and "High" in res.columns:
+        low_min = res["Low"].rolling(window=k_period).min()
+        high_max = res["High"].rolling(window=k_period).max()
+        res["rsv"] = (res["Close"] - low_min) / (high_max - low_min) * 100
+        res["k_val"] = res["rsv"].ewm(com=2, adjust=False).mean()
+        res["d_val"] = res["k_val"].ewm(com=2, adjust=False).mean()
+    else:
+        res["rsv"] = 50.0
+        res["k_val"] = 50.0
+        res["d_val"] = 50.0
+    
+    # Bollinger Bands
     bb_basis = res["Close"].rolling(window=bb_length).mean()
     bb_dev = res["Close"].rolling(window=bb_length).std()
     res["bb_upper"] = bb_basis + bb_std * bb_dev
     res["bb_lower"] = bb_basis - bb_std * bb_dev
+
+    # --- Single-timeframe score (for single-test backtest without MTF) ---
+    # Score: normalized momentum + squeeze state + EMA alignment
+    # Range: -100 to +100 (approximate)
+    if "mom_state" in res.columns:
+        # mom_state is 0-4, normalize to -100 to +100
+        mom_score = (res["mom_state"] - 1.5) / 1.5 * 100
+    else:
+        mom_score = res["momentum"] / max(res["momentum"].abs().max(), 1) * 100
+
+    ema_bias = pd.Series(0.0, index=res.index)
+    if "bullish_align" in res.columns:
+        ema_bias = ema_bias + res["bullish_align"].astype(float) * 50
+    if "bearish_align" in res.columns:
+        ema_bias = ema_bias - res["bearish_align"].astype(float) * 50
+
+    res["score"] = mom_score * 0.7 + ema_bias * 0.3
 
     # 波動率調整後的 Pullback 區域
     if "High" in res.columns and "Low" in res.columns:
