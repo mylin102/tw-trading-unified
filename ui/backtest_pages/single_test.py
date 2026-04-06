@@ -188,6 +188,8 @@ def main():
         # 日內模式選項
         intraday_mode = st.checkbox("🌙 日內交易模式 (不持倉過夜)", value=False,
             help="勾選後，每個交易日的最後一根 K 線會強制平倉。不勾選則允許持倉過夜（適合 Squeeze 趨勢策略）。")
+        expiry_mode = st.checkbox("📅 結算日強制平倉", value=True,
+            help="每月第三個週三（期貨結算日）強制平倉。建議開啟以避免交割風險。")
 
         cfg = {
             "strategy": {
@@ -214,7 +216,18 @@ def main():
                 for i in range(1, len(df)):
                     if df["trading_day"].values[i] != df["trading_day"].values[i - 1]:
                         eod_bars[i - 1] = True
-                eod_bars[-1] = True  # Last bar is always EOD
+                eod_bars[-1] = True
+
+            # Build expiry bars mask (3rd Wednesday of each month)
+            expiry_bars = np.zeros(len(df), dtype=np.bool_)
+            if expiry_mode:
+                idx_df = df.index
+                for i in range(len(df)):
+                    dt = idx_df[i]
+                    # Third Wednesday check: weekday 2 (Wednesday) and day 15-21
+                    if dt.weekday() == 2 and 15 <= dt.day <= 21:
+                        # Mark all bars on this day
+                        expiry_bars[i] = True  # Last bar is always EOD
 
             entries, exits, positions, pnl, reasons = simulate_trades_vectorized(
                 open_arr, close_arr, high_arr, low_arr, vwap_arr, atr_arr,
@@ -234,6 +247,7 @@ def main():
                 exit_on_vwap=True,
                 intraday_only=intraday_mode,
                 eod_bars=eod_bars,
+                expiry_bars=expiry_bars,
             )
             
             res = calculate_metrics(pnl, entries, exits, positions, initial_bal)

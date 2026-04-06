@@ -70,18 +70,23 @@ def simulate_trades_vectorized(
     exit_on_vwap: bool = True,
     intraday_only: bool = False,
     eod_bars = None,
+    expiry_bars = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     向量化交易模擬 (順序執行確保狀態正確)
-    
+
     Args:
         intraday_only: If True, force close all positions at end-of-day bars.
         eod_bars: Boolean array marking bars that are the last bar of a trading day.
+        expiry_bars: Boolean array marking bars on futures expiration days (3rd Wed).
     """
     n = len(close)
     if eod_bars is None:
         eod_bars = np.zeros(n, dtype=np.bool_)
+    if expiry_bars is None:
+        expiry_bars = np.zeros(n, dtype=np.bool_)
     has_eod = len(eod_bars) == n
+    has_expiry = len(expiry_bars) == n
     entries = np.zeros(n)
     exits = np.zeros(n)
     positions = np.zeros(n)
@@ -146,6 +151,11 @@ def simulate_trades_vectorized(
                     exit_price = close[i]
                     exit_reason = 4
 
+                # 期貨結算日強制平倉 (每月第三個週三)
+                elif has_expiry and expiry_bars[i]:
+                    exit_price = close[i]
+                    exit_reason = 5
+
                 elif i == n - 1:
                     exit_price = close[i]
                     exit_reason = 3
@@ -176,6 +186,11 @@ def simulate_trades_vectorized(
                 elif intraday_only and has_eod and eod_bars[i]:
                     exit_price = close[i]
                     exit_reason = 4
+
+                # 期貨結算日強制平倉 (每月第三個週三)
+                elif has_expiry and expiry_bars[i]:
+                    exit_price = close[i]
+                    exit_reason = 5
 
                 elif i == n - 1:
                     exit_price = close[i]

@@ -44,6 +44,7 @@ def main():
         atr_mult = st.slider(get_text("atr_mult"), 1.0, 4.0, 2.0, 0.5)
         initial_bal = 100000.0
         intraday_mode = st.checkbox("🌙 日內模式", value=True)
+        expiry_mode = st.checkbox("📅 結算日平倉", value=True)
 
     # 2. Execution
     if st.button(get_text("btn_run_comp"), type="primary", use_container_width=True):
@@ -81,6 +82,15 @@ def main():
                 eod_bars[-1] = True
                 st.info(f"📅 已標記 {eod_bars.sum()} 個日終平倉點 / {len(df)} 根 K 線")
 
+            # Build expiry bars mask (3rd Wednesday of each month)
+            expiry_bars = np.zeros(len(df), dtype=np.bool_)
+            if expiry_mode:
+                idx_df = df.index
+                for i in range(len(df)):
+                    dt = idx_df[i]
+                    if dt.weekday() == 2 and 15 <= dt.day <= 21:
+                        expiry_bars[i] = True
+
             # 2. Simulate with FULL 16 arguments + intraday params
             entries, exits, positions, pnl, reasons = simulate_trades_vectorized(
                 open_arr, close_arr, high_arr, low_arr, vwap_arr, atr_arr,
@@ -100,6 +110,7 @@ def main():
                 exit_on_vwap=True,
                 intraday_only=intraday_mode,
                 eod_bars=eod_bars,
+                expiry_bars=expiry_bars,
             )
             
             # 3. Metrics
