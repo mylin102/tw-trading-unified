@@ -930,6 +930,9 @@ class ShioajiOptionsSmartMonitor:
         if self.position > 0:
             console.print(f"[yellow]⚠️ enter_paper_position blocked: already holding {self.position}x {self.active_side}[/yellow]")
             return
+        if self.position >= self.max_positions:
+            console.print(f"[red]🚫 enter_paper_position blocked: max positions ({self.max_positions}) reached[/red]")
+            return
         if not self._dte_allows_entry(side, now=signal.get("timestamp")):
             return
         if not self.spread_is_tradeable(side):
@@ -1142,23 +1145,33 @@ class ShioajiOptionsSmartMonitor:
                     with open(ledger_path) as f:
                         rows = list(csv.DictReader(f))
                     if rows:
-                        # Find last ENTRY, check no EXIT after it
-                        last_entry = None
-                        last_entry_idx = -1
+                        # 從最後一筆交易計算當前持倉
+                        # 注意: TP1 會減少持倉，必須納入計算
+                        current_qty = 0
+                        last_side = None
+                        last_entry_price = 0
                         for i, r in enumerate(rows):
-                            if "ENTRY" in r.get("Action", ""):
-                                last_entry = r
-                                last_entry_idx = i
-                        if last_entry and last_entry_idx >= 0:
-                            has_exit_after = any("EXIT" in r.get("Action", "") or "PANIC" in r.get("Action", "") or "TRAIL" in r.get("Action", "") or "TIME" in r.get("Action", "") for r in rows[last_entry_idx + 1:])
-                            if not has_exit_after:
-                                self.position = int(last_entry.get("Quantity", 0))
-                                self.active_side = last_entry.get("Side")
-                                self.entry_price = float(last_entry.get("Price", 0))
-                                self.stop_loss_price = self.entry_price * (1 - self.stop_loss_pct)
-                                self.peak_premium = self.entry_price
-                                console.print(f"[bold cyan]♻️ Recovered paper position from ledger: {self.active_side} qty={self.position} @ {self.entry_price}[/bold cyan]")
-                                return
+                            action = r.get("Action", "")
+                            qty = int(r.get("Quantity", 0))
+                            if "ENTRY" in action:
+                                current_qty = qty  # 進場設為該口數
+                                last_side = r.get("Side")
+                                last_entry_price = float(r.get("Price", 0))
+                            elif "TP1" in action:
+                                # TP1 減碼: 從持倉減去該口數
+                                current_qty = max(0, current_qty - qty)
+                            elif "EXIT" in action or "PANIC" in action or "TRAIL" in action or "TIME" in action or "REVERSAL" in action:
+                                current_qty = 0  # 完全出場
+                                last_side = None
+
+                        if current_qty > 0 and last_side:
+                            self.position = current_qty
+                            self.active_side = last_side
+                            self.entry_price = last_entry_price
+                            self.stop_loss_price = self.entry_price * (1 - self.stop_loss_pct)
+                            self.peak_premium = self.entry_price
+                            console.print(f"[bold cyan]♻️ Recovered paper position from ledger: {self.active_side} qty={self.position} @ {self.entry_price}[/bold cyan]")
+                            return
             except Exception as e:
                 console.print(f"[yellow]Paper position recovery failed: {e}[/yellow]")
             return
