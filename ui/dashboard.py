@@ -730,6 +730,33 @@ with tab_options:
         oc3.metric("趨勢", trend_label)
         iv = last.get("iv", 0)
         oc4.metric("IV", f"{iv*100:.1f}%" if iv and iv < 1 else f"{iv:.1f}%")
+
+        # 顯示當前選擇權持倉
+        ol = load_options_ledger()
+        if ol is not None and not ol.empty:
+            # 找最後一筆非 EXIT 的交易
+            active = ol[~ol["Action"].str.contains("EXIT|TP1", na=False)]
+            if not active.empty:
+                last_pos = active.iloc[-1]
+                side = str(last_pos.get("Side", ""))
+                action = str(last_pos.get("Action", ""))
+                if "iron_condor" in side.lower():
+                    pos_label = "🦅 Iron Condor"
+                    # 從 Note 取腿資訊
+                    note = str(last_pos.get("Note", ""))
+                    if "[" in note:
+                        pos_label += " " + note.split("[")[1].split("]")[0]
+                elif side.upper() == "C":
+                    pos_label = "📞 Call"
+                elif side.upper() == "P":
+                    pos_label = "📉 Put"
+                else:
+                    pos_label = side
+                st.caption(f"當前持倉: **{pos_label}** | 進場: {action} @ {last_pos.get('Price', '')}")
+            else:
+                st.caption("目前無持倉")
+        else:
+            st.caption("目前無持倉")
         
         ol = load_options_ledger()
         # Pre-process ledger to match signal expected format if not empty
