@@ -96,6 +96,7 @@ class FuturesMonitor:
         self._fire_high = 0.0
         self._fire_low = 0.0
         self._bar_counter = 0        # monotonic bar counter for fire tracking
+        self.last_tick_at = time.time()  # [gstack] 數據新鮮度追蹤
 
         # Trader
         self.trader = PaperTrader(
@@ -138,6 +139,7 @@ class FuturesMonitor:
         return True
 
     def on_tick(self, exchange, tick):
+        self.last_tick_at = time.time()  # [gstack] 更新數據更新時間
         # Accept tick if it matches contract code OR contract category (TMF)
         if self.contract:
             if tick.code != self.contract.code and not tick.code.startswith("TMF"):
@@ -464,8 +466,8 @@ class FuturesMonitor:
         # 1. Fetch multi-timeframe data
         processed = {}
         if not self.dry_run:
-            # 優先使用內部的 tick_bars (如果已經累積足夠)
-            if hasattr(self, "_tick_bars") and len(self._tick_bars) >= 100:
+            # [gstack] 降低累積門檻，從 100 降到 30，只要能算出指標就顯示
+            if hasattr(self, "_tick_bars") and len(self._tick_bars) >= 30:
                 df_base = self._tick_bars.copy()
                 processed["5m"] = calculate_futures_squeeze(df_base, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
                 
@@ -475,46 +477,52 @@ class FuturesMonitor:
                     if len(res) >= 20:
                         processed[tf] = calculate_futures_squeeze(res, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
             
-            # 如果數據不足，才去調用 API (且限制頻率)
+            # 如果數據不足，才去調用 API
             if "5m" not in processed:
                 try:
-                    if self.api and hasattr(self.api, "kbars"):
-                        df = self.client.get_kline(self.ticker, interval="5m")
-                        if not df.empty:
+                    df = self.client.get_kline(self.ticker, interval="5m")
+                    if not df.empty:
+                        # [gstack] 確保 K 線長度足以計算指標 (BB_Length=20)
+                        if len(df) >= 20:
                             processed["5m"] = calculate_futures_squeeze(df, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+                        else:
+                            processed["5m"] = df # 只有 OHLCV 也行，至少 Dashboard 有畫面
                 except Exception as e:
                     console.print(f"[yellow][FuturesMonitor] api.kbars failed: {e}[/yellow]")
 
-        # Fallback: use tick-built bars if kbars API returns empty
-        if "5m" not in processed and hasattr(self, "_tick_bars") and len(self._tick_bars) >= 30:
-            df_tick = self._tick_bars.copy()
-            processed["5m"] = calculate_futures_squeeze(df_tick, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
-            if "15m" not in processed:
-                r15 = df_tick.resample("15min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-                if len(r15) >= 20:
-                    processed["15m"] = calculate_futures_squeeze(r15, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
-            if "1h" not in processed:
-                r1h = df_tick.resample("1h").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-                if len(r1h) >= 20:
-                    processed["1h"] = calculate_futures_squeeze(r1h, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+        # 只要有 5m 數據，不論有沒有指標，都應該寫入
+        if "5m" not in processed:
+            # 最後一招：如果連 api 都沒有，用目前手上剛湊出的 current_bar 墊檔
+            if self._current_bar["ts"] is not None and self._current_bar["open"] > 0:
+                df_tmp = pd.DataFrame([self._current_bar]).set_index("ts")
+                df_tmp.columns = ["Open", "High", "Low", "Close", "Volume"]
+                processed["5m"] = df_tmp
+            else:
+                return
 
-        if "5m" not in processed or "15m" not in processed:
-            return
+        df_5m = processed["5m"]
+        last_5m = df_5m.iloc[-1]
+        
+        # 指標預設值
+        score = 0.0
+        regime = "NORMAL"
+        
+        # 只有在數據充足時才算 MTF Score
+        if "15m" in processed:
+            score_data = calculate_mtf_alignment(processed, weights=self.STRATEGY.get("weights", {"5m": 0.4, "15m": 0.4, "1h": 0.2}))
+            score = score_data["score"]
+            regime = "STRONG" if last_5m.get("opening_bullish") else ("WEAK" if last_5m.get("opening_bearish") else "NORMAL")
 
-        df_5m, df_15m = processed["5m"], processed["15m"]
-        last_5m, last_15m = df_5m.iloc[-1], df_15m.iloc[-1]
-        score = calculate_mtf_alignment(processed, weights=self.STRATEGY.get("weights", {"5m": 0.4, "15m": 0.4, "1h": 0.2}))["score"]
         last_price = last_5m["Close"]
-        vwap = last_5m["vwap"]
+        vwap = last_5m.get("vwap", last_price)
         timestamp = last_5m.name
 
-        # Log bar
+        # Log bar (即便每分鐘更新也行，存檔邏輯會處理)
         if self.last_processed_bar != timestamp:
-            regime = "STRONG" if last_5m.get("opening_bullish") else ("WEAK" if last_5m.get("opening_bearish") else "NORMAL")
             self._save_bar(last_5m, score, regime)
             self.last_processed_bar = timestamp
             self._bar_counter += 1
-            console.print(f"[dim][FuturesMonitor] {datetime.now().strftime('%H:%M')} close={last_price:.0f} score={score:.1f}[/dim]")
+            console.print(f"[bold blue][FuturesMonitor] New Bar: {timestamp} close={last_price:.0f} score={score:.1f}[/bold blue]")
 
         # 如果是 dry_run，計算完指標並存檔後就結束，不執行交易邏輯
         if self.dry_run:
@@ -559,34 +567,46 @@ class FuturesMonitor:
             if atr_val > 0:
                 stop_loss_pts = atr_val * self.ATR_MULT
 
-        # ── Pluggable entry strategy ──
-        from strategies.futures.entry_strategies import get_strategy
+        # ── Pluggable entry strategy (Elite Strategies) ──
+        from strategies.futures.elite_strategies import get_strategy as get_elite_strategy
+        from strategies.futures.elite_strategies import select_strategy
 
         # Always track fires for counter mode
         if self.counter_enabled:
             self._detect_squeeze_failure(last_5m, df_5m)
 
-        # Counter mode (auto-regime override)
-        use_counter = self.counter_enabled and (
-            self._is_ranging_regime(df_5m) if self.counter_auto_regime else True
-        )
-        if use_counter:
-            counter_signal = self._detect_squeeze_failure(last_5m, df_5m)
-            if counter_signal:
-                atr_val = last_5m.get("atr", 0)
-                counter_sl = atr_val * self.counter_atr_sl_mult if atr_val > 0 else stop_loss_pts
-                lots = self.MGMT.get("lots_per_trade", 2)
-                be = self.RISK.get("break_even_pts", 50)
-                action = "BUY" if counter_signal == "COUNTER_BUY" else "SELL"
-                if self.MGMT.get(f"allow_{'long' if action == 'BUY' else 'short'}", True):
-                    console.print(f"[bold magenta]🔄 COUNTER {action} SL={counter_sl:.1f}[/bold magenta]")
-                    self._execute_trade(action, last_price, timestamp, lots,
-                                        stop_loss=counter_sl, break_even_trigger=be, reason="COUNTER")
-                return
+        # Elite Strategy Auto-Select: 根據市場狀態動態選擇策略
+        auto_select = self.STRATEGY.get("auto_select", False)
+        if auto_select and self.counter_enabled:
+            # 使用 elite_strategies 的自動選擇邏輯
+            regime_name, strategy_fn = select_strategy(df_5m)
+            active = regime_name  # e.g., "counter_vwap", "psar_breakout", "vol_squeeze"
+        else:
+            # Counter mode (auto-regime override)
+            use_counter = self.counter_enabled and (
+                self._is_ranging_regime(df_5m) if self.counter_auto_regime else True
+            )
+            if use_counter:
+                counter_signal = self._detect_squeeze_failure(last_5m, df_5m)
+                if counter_signal:
+                    atr_val = last_5m.get("atr", 0)
+                    counter_sl = atr_val * self.counter_atr_sl_mult if atr_val > 0 else stop_loss_pts
+                    lots = self.MGMT.get("lots_per_trade", 2)
+                    be = self.RISK.get("break_even_pts", 50)
+                    action = "BUY" if counter_signal == "COUNTER_BUY" else "SELL"
+                    if self.MGMT.get(f"allow_{'long' if action == 'BUY' else 'short'}", True):
+                        console.print(f"[bold magenta]🔄 COUNTER {action} SL={counter_sl:.1f}[/bold magenta]")
+                        self._execute_trade(action, last_price, timestamp, lots,
+                                            stop_loss=counter_sl, break_even_trigger=be, reason="COUNTER")
+                    return
 
-        # Pluggable strategy from config
-        active = self.STRATEGY.get("active_strategy", "squeeze_breakout")
-        strategy_fn = get_strategy(active)
+            # Fallback to config active_strategy
+            active = self.STRATEGY.get("active_strategy", "counter_vwap")
+            strategy_fn = get_elite_strategy(active)
+            if strategy_fn is None:
+                # Fallback to old entry_strategies if elite not found
+                strategy_fn = get_strategy(active)
+
         if not strategy_fn or self.trader.position != 0:
             return
 
@@ -595,6 +615,12 @@ class FuturesMonitor:
             "last_5m": last_5m, "last_15m": last_15m, "df_5m": df_5m,
             "score": score, "stop_loss_pts": stop_loss_pts,
             "trend": trend, "hour": datetime.now().hour,
+            # Counter-VWAP 需要的狀態
+            "fire_pending_dir": getattr(self, '_fire_pending_dir', 0),
+            "fire_bar_idx": getattr(self, '_fire_bar_idx', 0),
+            "fire_high": getattr(self, '_fire_high', 0.0),
+            "fire_low": getattr(self, '_fire_low', 0.0),
+            "bar_counter": getattr(self, '_bar_counter', 0),
         }
         signal = strategy_fn(market_state, self.cfg)
         if signal:

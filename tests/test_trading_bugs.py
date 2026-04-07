@@ -275,12 +275,20 @@ class TestMomentumBurstZScore:
 
 class TestTrendFollowExit:
     def test_trailing_exit_on_reversal(self):
-        """Trend follow 應該有 trailing 出場"""
-        # 這個測試驗證 trend_follow 策略有 trailing_atr_exit 參數
-        import yaml
-        cfg = yaml.safe_load(open("config/futures.yaml"))
-        tf_cfg = cfg.get("strategy", {}).get("trend_follow", {})
-        assert "trailing_atr" in tf_cfg, "trend_follow should have trailing_atr param"
+        """ELITE: trend_follow 已淘汰，驗證 elite_strategies 模組正常載入"""
+        # trend_follow 策略已從 elite_strategies 中移除
+        # 這個測試確保精英策略模組可以正確載入
+        from strategies.futures.elite_strategies import get_elite_strategies
+        elite = get_elite_strategies()
+        
+        # 驗證 trend_follow 不在精英策略中
+        assert "trend_follow" not in elite, "trend_follow should be eliminated"
+        
+        # 驗證精英策略都存在
+        assert "counter_vwap" in elite
+        assert "psar_breakout" in elite
+        assert "vol_squeeze" in elite
+        assert len(elite) == 3, "Should have exactly 3 elite strategies"
 
 
 class TestCumulativeDeltaWeighted:
