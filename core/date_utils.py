@@ -48,3 +48,34 @@ def is_day_session(dt: Union[datetime, pd.Timestamp, pd.DatetimeIndex]) -> Union
     else:
         hour = dt.hour
         return (hour >= 8) and (hour <= 14)
+
+
+def get_session_date_str(dt=None):
+    """
+    Get the session date string in YYYYMMDD format.
+
+    Taiwan futures cross-day rule:
+    - 00:00-05:00 belongs to previous calendar day's session
+    - 05:00+ belongs to current calendar day
+
+    Both main.py (writer) and dashboard.py (reader) MUST call this
+    to guarantee filename alignment.
+
+    Returns:
+        str: YYYYMMDD date string for the current session.
+    """
+    if dt is None:
+        from datetime import datetime as _dt
+        dt = _dt.now()
+    if isinstance(dt, pd.Timestamp):
+        dt = dt.to_pydatetime()
+    if isinstance(dt, datetime):
+        if dt.hour < 5:
+            dt = dt - timedelta(days=1)
+        return dt.strftime("%Y%m%d")
+    # Fallback: use current time
+    from datetime import datetime as _dt
+    now = _dt.now()
+    if now.hour < 5:
+        now = now - timedelta(days=1)
+    return now.strftime("%Y%m%d")

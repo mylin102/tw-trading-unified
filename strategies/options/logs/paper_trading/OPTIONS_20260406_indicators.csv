@@ -1,2 +1,0 @@
-timestamp,score,side,price_mtx,strike,dte,mid_trend,iv,delta,gamma,vega,vwap,sqz_on
-2026-04-06 19:16:47,73.33333333333334,,34097.5,33500.0,16.2,BULL,0.25,0.6483,0.000208,26.4898,34097.5,False

@@ -7,7 +7,7 @@ import os
 import time
 import yaml
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 from rich.console import Console
 
@@ -390,7 +390,6 @@ class FuturesMonitor:
         # 凌晨 00:00~05:00 → 算前一天的交易日
         # 日盤 08:45~13:45 → 算今天
         now = datetime.now()
-        from datetime import timedelta
         if now.hour < 5:
             date_str = (now - timedelta(days=1)).strftime('%Y%m%d')
         elif now.hour >= 15:

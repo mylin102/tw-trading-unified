@@ -14,6 +14,7 @@ from rich.console import Console
 
 # 依序匯入策略所需組件
 from options_engine.engine.indicators import calculate_futures_squeeze, calculate_mtf_alignment
+from core.date_utils import get_session_date_str
 from options_engine.engine.broker_adapter import ShioajiBrokerAdapter
 from options_engine.engine.backtest_engine import should_exit_position, should_take_partial_profit, should_exit_by_time_constraints
 from options_engine.engine.backtest_engine import resolve_option_strike
@@ -192,8 +193,9 @@ class ShioajiOptionsSmartMonitor:
         self.max_order_retries = int(self.execution_cfg.get("max_order_retries", 1))
         self.replay_bars = self._load_replay_bars(self.replay_path) if self.replay_path else None
         self.replay_cursor = max(0, self.strategy_cfg.get("length", 20) + 5) if self.replay_bars is not None else None
-        self.replay_stats = {"signals": 0, "directional_signals": 0, "entries": 0, "exits": 0, "tp1_hits": 0}
-        
+        self.replay_stats = {"signals": 0, "directional_signals": 0, "entries": 0, "exits": 0, "tp1_hits": 0, "blocked_entries": 0, "last_summary_at": 0}
+        self._seen_fill_ordnos = set()  # Dedup for live FDeal callbacks
+
         # 設定日誌路徑
         self._update_log_paths()
         if self.api is not None and hasattr(self.api, "set_order_callback"):
@@ -212,7 +214,7 @@ class ShioajiOptionsSmartMonitor:
                 console.print(f"[yellow]Warning creating log path: {e}[/yellow]")
         
         now = datetime.datetime.now()
-        date_str = (now - datetime.timedelta(days=1)).strftime('%Y%m%d') if now.hour < 5 else now.strftime('%Y%m%d')
+        date_str = get_session_date_str(now)
         self.indicator_log_path = log_base / f"OPTIONS_{date_str}_indicators.csv"
         self.ledger_path = log_base / "options_trade_ledger.csv"
 
@@ -582,8 +584,8 @@ class ShioajiOptionsSmartMonitor:
             try:
                 prev = pd.read_csv(self.ledger_path)
                 balance = pd.to_numeric(prev["PnL"], errors="coerce").fillna(0).sum()
-            except Exception:
-                pass
+            except Exception as e:
+                console.print(f"[yellow]⚠️ Ledger read error: {e} — balance reset to 0[/yellow]")
         balance += pnl
         data = {
             "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -603,6 +605,12 @@ class ShioajiOptionsSmartMonitor:
         side = self.active_side
         if self.pending_entry and code == self.pending_entry["contract_code"] and action == "Buy":
             side = self.pending_entry["side"]
+            ordno = msg.get("ordno", "")
+            if ordno and ordno in self._seen_fill_ordnos:
+                console.print(f"[yellow]⚠️ Duplicate fill ignored: ordno={ordno}[/yellow]")
+                return
+            if ordno:
+                self._seen_fill_ordnos.add(ordno)
             self.position += quantity
             self.active_side = side
             self.entry_price = price
@@ -734,7 +742,10 @@ class ShioajiOptionsSmartMonitor:
             "vega": round(vega_val, 4),
             # 進場關鍵欄位 (resolve_entry_side 需要)
             "vwap": price_mtx,
-            "sqz_on": False,
+            "sqz_on": signal.get("squeeze_on", False) if signal else False,
+            "fired": signal.get("fired", False) if signal else False,
+            "bullish_align": signal.get("bullish_align", False) if signal else False,
+            "bearish_align": signal.get("bearish_align", False) if signal else False,
         }
         if iv > 0:
             self.latest_iv = iv
@@ -891,22 +902,57 @@ class ShioajiOptionsSmartMonitor:
             side = resolve_entry_side(row, score, row["Close"], self.entry_score, mid_trend=mid_trend, require_mid_trend=True)
 
             # V2 filters: require_fire and require_align
-            if side and self.strategy_cfg.get("require_fire"):
+            if self.strategy_cfg.get("require_fire"):
                 row_fired = row.get("fired", False)
-                # 放寬：fired 或 score 極端值都允許
                 if not row_fired and abs(score) < 90:
+                    console.print(f"[dim]🚫 FIRE blocked: fired={row_fired} score={score:.1f}<90[/dim]")
                     side = None
             if side and self.strategy_cfg.get("require_align"):
                 if side == "C" and not row.get("bullish_align", False):
+                    console.print(f"[dim]🚫 ALIGN blocked (C): fast={row.get('ema_fast',0):.0f} slow={row.get('ema_slow',0):.0f}[/dim]")
                     side = None
                 elif side == "P" and not row.get("bearish_align", False):
+                    console.print(f"[dim]🚫 ALIGN blocked (P): fast={row.get('ema_fast',0):.0f} slow={row.get('ema_slow',0):.0f}[/dim]")
                     side = None
 
-            signal = {"score": score, "side": side, "price_mtx": row["Close"], "mid_trend": mid_trend, "timestamp": timestamp, "squeeze_on": bool(row.get("sqz_on", False))}
+            signal = {
+                "score": score,
+                "side": side,
+                "price_mtx": row["Close"],
+                "mid_trend": mid_trend,
+                "timestamp": timestamp,
+                "squeeze_on": bool(row.get("sqz_on", False)),
+                "fired": bool(row.get("fired", False)),
+                "bullish_align": bool(row.get("bullish_align", False)),
+                "bearish_align": bool(row.get("bearish_align", False)),
+            }
             self.last_signal = signal
             self.replay_stats["signals"] += 1
             if side:
                 self.replay_stats["directional_signals"] += 1
+
+            if not signal["side"] and self.replay_stats["signals"] % 10 == 0:
+                reasons = []
+                if row.get("sqz_on", True):
+                    reasons.append("SQZ_ON")
+                else:
+                    if abs(score) < self.entry_score:
+                        reasons.append(f"SCORE<{self.entry_score} ({score:.0f})")
+                    if score > 0 and row.get("Close", 0) <= row.get("vwap", 0):
+                        reasons.append("price<=VWAP")
+                    if score < 0 and row.get("Close", 0) >= row.get("vwap", 0):
+                        reasons.append("price>=VWAP")
+                    if not row.get("fired", False) and abs(score) < 90:
+                        reasons.append("not_fired")
+                    if score > 0 and not row.get("bullish_align", False):
+                        reasons.append("!bullish_align")
+                    if score < 0 and not row.get("bearish_align", False):
+                        reasons.append("!bearish_align")
+                    if mid_trend not in ("BULL", "BEAR"):
+                        reasons.append(f"mid_trend={mid_trend}")
+                if reasons:
+                    console.print(f"[dim]⏳ No entry ({', '.join(reasons)})[/dim]")
+
             self.record_signal_snapshot(signal)
             return signal
         except Exception as e:
@@ -939,10 +985,12 @@ class ShioajiOptionsSmartMonitor:
         if not self._dte_allows_entry(side, now=signal.get("timestamp")):
             return
         if not self.spread_is_tradeable(side):
+            console.print(f"[yellow]⚠️ enter_paper_position blocked: spread too wide for {side}[/yellow]")
             return
         quote = self.current_option_quote(side)
         entry_price = quote["ask"]
         if entry_price <= 0:
+            console.print(f"[yellow]⚠️ enter_paper_position blocked: invalid entry price ({entry_price}) for {side}[/yellow]")
             return
         if not self._paper_margin_check(entry_price):
             return
@@ -1155,7 +1203,7 @@ class ShioajiOptionsSmartMonitor:
                         last_entry_price = 0
                         for i, r in enumerate(rows):
                             action = r.get("Action", "")
-                            qty = int(r.get("Quantity", 0))
+                            qty = int(r.get("Quantity", 0) or 0)
                             if "ENTRY" in action:
                                 current_qty = qty  # 進場設為該口數
                                 last_side = r.get("Side")
@@ -1222,6 +1270,7 @@ class ShioajiOptionsSmartMonitor:
                 return True
 
         if exit_price <= 0:
+            console.print(f"[yellow]⚠️ manage_open_position: invalid exit price ({exit_price}) for {self.active_side}, skipping this tick[/yellow]")
             return False
 
         # 2. Trailing stop: 追蹤最高權利金，回落超過 trailing_stop_pct 就出場
@@ -1375,11 +1424,30 @@ class ShioajiOptionsSmartMonitor:
                 if signal and signal["side"]:
                     if self.cooldown_until > 0:
                         console.print(f"[dim]Signal {signal['side']} ignored during cooldown[/dim]")
+                        self.replay_stats["blocked_entries"] += 1
                     elif self.live_trading:
                         console.print(f"[bold green]>>> ENTRY SIGNAL: {signal['side']} score={signal['score']:.1f}[/bold green]")
                         self.enter_live_position(signal["side"], signal)
                     else:
+                        # Track: did paper entry succeed or fail?
+                        before_pos = self.position
                         self.enter_paper_position(signal["side"], signal)
+                        if self.position == before_pos:
+                            self.replay_stats["blocked_entries"] += 1
+
+            # Periodic summary: every 60s print signal stats
+            import time as _time
+            now_ts = _time.time()
+            if self.replay_stats["signals"] > 0 and (now_ts - self.replay_stats.get("last_summary_at", 0)) >= 60:
+                self.replay_stats["last_summary_at"] = now_ts
+                rs = self.replay_stats
+                blocked = rs["blocked_entries"]
+                total_dir = rs["directional_signals"]
+                executed = rs["entries"]
+                if total_dir > 0:
+                    rate = executed / total_dir * 100
+                    console.print(f"[dim]📊 60s summary: {rs['signals']} signals, {total_dir} directional, {executed} entries, {blocked} blocked ({rate:.0f}% exec rate)[/dim]")
+
             self.print_status_summary(signal)
         except Exception as exc:
             console.print(f"[red]Strategy loop error:[/red] {exc}")

@@ -273,17 +273,19 @@ class PaperTrader:
                 "total_cost": total_cost, "pnl_cash": pnl_cash, "type": signal,
                 "exit_reason": exit_reason,
             }
-            self.trades.append(trade_record)
-            self.balance += pnl_cash
-            
-            # 記錄 EXIT 到資料庫
-            if self.db:
-                self._record_trade_to_db(trade_record)
 
+            # SDD: State change BEFORE side effects (DB write, log append)
             if signal == "EXIT" or lots_to_exit == abs(self.position):
                 self.position, self.entry_price, self.current_stop_loss = 0, 0, None
             else:
                 self.position = (abs(self.position) - lots_to_exit) * (1 if self.position > 0 else -1)
+
+            self.trades.append(trade_record)
+            self.balance += pnl_cash
+
+            if self.db:
+                self._record_trade_to_db(trade_record)
+
             return f"{signal} {lots_to_exit} at {price}, PnL: {pnl_cash:.0f}"
 
         return None

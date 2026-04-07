@@ -12,6 +12,7 @@ import pandas as pd
 import yaml
 import datetime
 import os
+from core.date_utils import get_session_date_str
 import subprocess
 import time
 from pathlib import Path
@@ -79,12 +80,7 @@ st_autorefresh(interval=30_000, key="data_refresh")
 
 BASE = Path(__file__).parent.parent
 TODAY = datetime.datetime.now().strftime("%Y-%m-%d")
-DATE_STR = datetime.datetime.now().strftime("%Y%m%d")
-# 夜盤跨日：00:00~05:00 看前一天的檔案
-if datetime.datetime.now().hour < 5:
-    _yesterday = datetime.datetime.now() - datetime.timedelta(days=1)
-    TODAY = _yesterday.strftime("%Y-%m-%d")
-    DATE_STR = _yesterday.strftime("%Y%m%d")
+DATE_STR = get_session_date_str()  # Single source: shared with main.py
 
 # ── YAML helpers ──
 def load_yaml(path):
@@ -360,37 +356,44 @@ def load_futures_indicators():
                         all_dfs.append(df)
     
     if all_dfs:
-        # V-Model fix: Merge on common columns only, avoid duplicates
-        # Find columns that exist in ALL dataframes
         common_cols = set(all_dfs[0].columns)
         for df in all_dfs[1:]:
             common_cols &= set(df.columns)
-        
-        # Keep only common columns + timestamp
         if "timestamp" not in common_cols:
             common_cols.add("timestamp")
-        
         cleaned_dfs = [df[list(common_cols)] for df in all_dfs]
         merged = pd.concat(cleaned_dfs).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
-        return filter_today(merged)
-    
-    # 2. 備案：找目錄下最新的 CSV
-    try:
-        all_files = list(FUTURES_MKT.glob("TMF_*_indicators.csv"))
-        if all_files:
-            # 找今天或明天日期的最新檔案
-            latest_file = max(all_files, key=os.path.getmtime)
-            df = _read_and_standardize(latest_file)
-            if df is not None and "timestamp" in df.columns:
-                if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
-                    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-                # 如果是明天日期，只取 >=15:00
-                if DATE_STR not in str(latest_file) and now.hour >= 15:
-                    df = df[df["timestamp"].dt.hour >= 15]
-                return filter_today(df) if not df.empty else None
-    except Exception:
-        pass
-    return None
+        result = filter_today(merged)
+    else:
+        # 2. 備案：找目錄下最新的 CSV
+        try:
+            all_files = list(FUTURES_MKT.glob("TMF_*_indicators.csv"))
+            if all_files:
+                latest_file = max(all_files, key=os.path.getmtime)
+                df = _read_and_standardize(latest_file)
+                if df is not None and "timestamp" in df.columns:
+                    if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+                        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                    if DATE_STR not in str(latest_file) and now.hour >= 15:
+                        df = df[df["timestamp"].dt.hour >= 15]
+                    result = filter_today(df) if not df.empty else None
+        except Exception:
+            result = None
+
+    # Stale data detection
+    if result is not None and not result.empty and "timestamp" in result.columns:
+        try:
+            result_ts = result["timestamp"].copy()
+            if not pd.api.types.is_datetime64_any_dtype(result_ts):
+                result_ts = pd.to_datetime(result_ts, errors="coerce")
+            result_ts = result_ts.dropna()
+            if not result_ts.empty:
+                age_secs = (pd.Timestamp.now() - result_ts.max()).total_seconds()
+                if age_secs > 600:
+                    st.warning(f"⚠️ 期貨資料停滯 {age_secs/60:.0f} 分鐘")
+        except Exception:
+            pass
+    return result
 
 @st.cache_data(ttl=5)
 def load_futures_trades():
@@ -413,23 +416,40 @@ def load_options_indicators():
         f = OPTIONS_REPO / "logs" / sub / f"OPTIONS_{DATE_STR}_indicators.csv"
         if f.exists() and f.stat().st_mtime > (best[1] if best else 0):
             best = (f, f.stat().st_mtime)
+
+    # 2. 備案：找目錄下最新的任何指標檔案（防斷鍊）
+    if not best:
+        try:
+            all_opt_files = list((OPTIONS_REPO / "logs").rglob("OPTIONS_*_indicators.csv"))
+            if all_opt_files:
+                latest_f = max(all_opt_files, key=os.path.getmtime)
+                best = (latest_f, latest_f.stat().st_mtime)
+        except Exception:
+            pass
+
     if best:
         try:
             df = pd.read_csv(best[0])
             if df.columns.duplicated().any():
                 df = df.loc[:, ~df.columns.duplicated()].copy()
-            return filter_today(df, ts_col="timestamp")
+            result = filter_today(df, ts_col="timestamp")
+
+            # Stale data detection: if latest bar is > 10 min old, warn
+            if result is not None and not result.empty and "timestamp" in result.columns:
+                try:
+                    result["timestamp"] = pd.to_datetime(result["timestamp"], errors="coerce")
+                    result = result.dropna(subset=["timestamp"])
+                    if not result.empty:
+                        latest_bar = result["timestamp"].max()
+                        age_secs = (pd.Timestamp.now() - latest_bar).total_seconds()
+                        if age_secs > 600:  # 10 minutes
+                            st.warning(f"⚠️ 資料停滯 {age_secs/60:.0f} 分鐘 — main.py 可能未運行")
+                except Exception:
+                    pass
+
+            return result
         except Exception:
             pass
-    
-    # 2. 備案：找目錄下最新的任何指標檔案
-    try:
-        all_opt_files = list((OPTIONS_REPO / "logs").rglob("OPTIONS_*_indicators.csv"))
-        if all_opt_files:
-            latest_f = max(all_opt_files, key=os.path.getmtime)
-            return filter_today(pd.read_csv(latest_f), ts_col="timestamp")
-    except Exception:
-        pass
     return None
 
 @st.cache_data(ttl=5)
@@ -688,6 +708,9 @@ with tab_futures:
         trend = "🟢 多頭排列" if bull else ("🔴 空頭排列" if bear else "⚪ 中性")
         fc3.metric("趨勢", trend)
         fc4.metric("Squeeze", "🔒 壓縮中" if last.get("sqz_on", False) else "🔓 已釋放")
+
+        if "fired" in last and last.get("fired", False):
+            st.success("🔥 **FIRE — 壓縮釋放！**")
         
         ft = load_futures_trades()
         st.plotly_chart(make_price_score_chart(f_df, "close", "TMF 價格 & Score", signals=ft), use_container_width=True)
@@ -730,6 +753,9 @@ with tab_options:
         oc3.metric("趨勢", trend_label)
         iv = last.get("iv", 0)
         oc4.metric("IV", f"{iv*100:.1f}%" if iv and iv < 1 else f"{iv:.1f}%")
+
+        if "fired" in last and last.get("fired", False):
+            st.success("🔥 **FIRE — 壓縮釋放！**")
 
         # 顯示當前選擇權持倉
         ol = load_options_ledger()

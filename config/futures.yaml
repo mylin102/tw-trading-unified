@@ -1,4 +1,4 @@
-active_strategy: counter_vwap
+active_strategy: spring_upthrust
 execution:
   broker_fee_per_side: 20.0
   exchange_fee_per_side: 0.0
@@ -36,21 +36,19 @@ risk_mgmt:
 strategy:
   auto_select: true
   active_strategy: counter_vwap
-  # Spring/Upthrust 假突破反向 (ELITE #2 — PF=3.36, 即時確認)
   spring_upthrust:
     bb_mult: 2.0
     kc_mult: 1.0
     atr_mult: 2.0
     bb_length: 20
     kc_length: 20
-  # Counter-VWAP 核心策略 (ELITE #1 — PF=1.95, 5 根確認)
   counter_mode:
     enabled: true
     auto_regime: true
     confirm_bars: 5
     atr_sl_mult: 2.0
     exit_on_vwap: true
-  entry_score: 16
+  entry_score: 21
   regime_filter: mid
   length: 20
   use_squeeze: true

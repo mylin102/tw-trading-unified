@@ -132,7 +132,7 @@ def mark_option_premium_from_cfg(
 
 
 def should_take_partial_profit(position, has_tp1, entry_opt_premium, current_premium, tp1_pct):
-    if has_tp1 or position != 2:
+    if has_tp1 or position < 1:
         return False
     return (current_premium - entry_opt_premium) / entry_opt_premium >= tp1_pct
 

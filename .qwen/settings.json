@@ -43,7 +43,18 @@
       "Bash(git add *)",
       "Bash(git commit *)",
       "Bash(git push)",
-      "Bash(mv *)"
+      "Bash(mv *)",
+      "Bash(sed *)",
+      "Bash(cp *)",
+      "Bash(head *)",
+      "Bash(tmux *)",
+      "Bash(awk *)",
+      "Bash(nohup *)",
+      "Bash(curl *)",
+      "Bash(tr *)",
+      "Bash(do *)",
+      "Bash(done)",
+      "Bash(xargs *)"
     ]
   },
   "$version": 3

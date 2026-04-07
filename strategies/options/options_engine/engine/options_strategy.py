@@ -72,11 +72,11 @@ def infer_mid_trend(m15):
 def resolve_entry_side(row, score, price_mtx, score_thresh, mid_trend=None, require_mid_trend=False):
     if row.get("sqz_on", True):
         return None
-    if score >= score_thresh and price_mtx > row["vwap"]:
+    if score >= score_thresh and price_mtx >= row["vwap"]:
         if require_mid_trend and mid_trend != "BULL":
             return None
         return "C"
-    if score <= -score_thresh and price_mtx < row["vwap"]:
+    if score <= -score_thresh and price_mtx <= row["vwap"]:
         if require_mid_trend and mid_trend != "BEAR":
             return None
         return "P"
