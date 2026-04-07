@@ -69,5 +69,5 @@ trade_mgmt:
   allow_long: true
   allow_short: true
   force_close_at_end: false
-  lots_per_trade: 2
-  max_positions: 2
+  lots_per_trade: 1
+  max_positions: 1

@@ -67,8 +67,8 @@ pricing:
   strike_rounding: 100
 risk_mgmt:
   stop_loss_pct: 0.2  # 20% 停損 (原 10% 太緊，正常波動就被砍)
-  lots_per_trade: 2
-  max_positions: 2
+  lots_per_trade: 1
+  max_positions: 1
   initial_capital: 40000
   max_holding_days: 7
   min_dte_to_exit: 3
