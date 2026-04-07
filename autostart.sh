@@ -1,36 +1,49 @@
 #!/bin/bash
-# tw-trading-unified 守護啟動腳本
-# 職責：在 main.py 退出或崩潰時自動重新啟動，確保 C++ 底層資源完全釋放。
+# tw-trading-unified gstack 加固版管理腳本
+# 1. 隔離核心：期貨/選擇權 與 股票 分開執行
+# 2. 環境自癒：啟動前自動補齊依賴
+# 3. 徹底清理：重啟前殺死所有殘留 C++ 資源
+# 4. macOS 優化：減少 "Python quit unexpectedly" 彈窗
 
 UNIFIED_DIR="/Users/mylin/Documents/mylin102/tw-trading-unified"
-LOG="$UNIFIED_DIR/logs/unified.log"
-DASH_LOG="$UNIFIED_DIR/logs/dashboard.log"
+PYTHON_EXEC="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
 mkdir -p "$UNIFIED_DIR/logs"
+cd "$UNIFIED_DIR"
 
-echo "[$(date)] Supervisor script started." >> "$LOG"
+echo "[$(date)] gstack Supervisor initializing..." >> logs/unified.log
 
-# 1. 啟動 Dashboard (如果沒在跑)
-if ! pgrep -f "streamlit run ui/dashboard.py" > /dev/null; then
-    echo "[$(date)] Starting Dashboard..." >> "$LOG"
-    tmux has-session -t unified 2>/dev/null || tmux new-session -d -s unified
-    tmux new-window -t unified:1 -n "dashboard" 2>/dev/null
-    tmux send-keys -t unified:1 "cd $UNIFIED_DIR && python3 -m streamlit run ui/dashboard.py --server.port 8500 --server.address 127.0.0.1 --server.headless true 2>&1 | tee $DASH_LOG" Enter
-fi
+# --- Layer 1: Pre-flight (環境自癒) ---
+$PYTHON_EXEC -m pip install -q rich streamlit pandas pyyaml shioaji >> logs/unified.log 2>&1
 
-# 2. 主監控循環 (無限重啟)
+# --- Layer 2: Clean up (徹底清理) ---
+# macOS specific: kill all related processes gently first
+pkill -15 -f "main.py" 2>/dev/null  # SIGTERM first
+sleep 3  # Give processes time to cleanup
+pkill -9 -f "main.py" 2>/dev/null  # Force kill if still alive
+pkill -9 -f "streamlit" 2>/dev/null
+sleep 2  # Buffer for C++ resource cleanup
+
+# --- Layer 3: Launch Dashboards (哨兵監控台) ---
+tmux has-session -t unified 2>/dev/null || tmux new-session -d -s unified
+
+# Trading Dashboard (Port 8500)
+tmux select-window -t unified:1 2>/dev/null || tmux new-window -t unified:1 -n "trading"
+tmux send-keys -t unified:1 "$PYTHON_EXEC -m streamlit run ui/dashboard.py --server.port 8500 --server.headless true" Enter
+
+# Backtest Dashboard (Port 8501)
+tmux select-window -t unified:2 2>/dev/null || tmux new-window -t unified:2 -n "backtest"
+tmux send-keys -t unified:2 "$PYTHON_EXEC -m streamlit run ui/backtest_dashboard.py --server.port 8501 --server.headless true" Enter
+
+# --- Layer 4: Main Loop (核心自癒) ---
 while true; do
-    echo "[$(date)] Launching main.py..." >> "$LOG"
+    echo "[$(date)] 🚀 Launching Trading Core (Futures/Options)..." >> logs/unified.log
+
+    # 執行主程式（我們現在把 main.py 定義為期貨核心）
+    $PYTHON_EXEC "$UNIFIED_DIR/main.py" 2>&1 | tee -a logs/unified.log
+
+    EXIT_CODE=$?
+    echo "[$(date)] ⚠️ Core exited with code $EXIT_CODE. Re-booting in 15s..." >> logs/unified.log
     
-    # 確保舊進程清理乾淨
-    pkill -f "main.py" 2>/dev/null
-    
-    # 在 tmux 視窗 0 執行主程式
-    tmux has-session -t unified 2>/dev/null || tmux new-session -d -s unified
-    tmux select-window -t unified:0 2>/dev/null || tmux new-window -t unified:0 -n "monitor"
-    
-    # 執行並等待結束
-    python3 "$UNIFIED_DIR/main.py" 2>&1 | tee -a "$LOG"
-    
-    echo "[$(date)] main.py exited with code $?. Waiting 15s for C++ cleanup before restart..." >> "$LOG"
+    # macOS specific: longer buffer between restarts to reduce C++ crash dialog
     sleep 15
 done

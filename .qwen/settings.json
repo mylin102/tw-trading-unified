@@ -1,7 +1,50 @@
 {
   "permissions": {
     "allow": [
-      "Bash(mkdir *)"
+      "Bash(mkdir *)",
+      "Bash(lsof *)",
+      "Bash(python3 *)",
+      "Bash(find *)",
+      "Bash(tail *)",
+      "Bash(import *)",
+      "Bash(from *)",
+      "Bash(sys.path.insert)",
+      "Bash(futures_mkt *)",
+      "Bash('/users/mylin/documents/mylin102/tw-trading-unified/logs/market_data')",
+      "Bash(date_str *)",
+      "Bash(def *)",
+      "Bash(path)",
+      "Bash(df *)",
+      "Bash(col_map *)",
+      "Bash(return *)",
+      "Bash(f *)",
+      "Bash(f)",
+      "Bash(print)",
+      "Bash(eof)",
+      "Bash(st.cache_data.clear)",
+      "Bash(f_df *)",
+      "Bash(else:)",
+      "Bash(o_df *)",
+      "Bash(cat *)",
+      "Bash(pkill *)",
+      "Read(//Users/mylin/.kiro/skills/**)",
+      "Bash(timeout *)",
+      "Bash(ls *)",
+      "Bash(\")",
+      "Bash(kill *)",
+      "Bash(wait *)",
+      "Bash(cd *)",
+      "Bash(bash *)",
+      "Bash(echo *)",
+      "Bash(sleep *)",
+      "Bash(ps *)",
+      "Bash(grep *)",
+      "Bash(wc *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push)",
+      "Bash(mv *)"
     ]
-  }
+  },
+  "$version": 3
 }

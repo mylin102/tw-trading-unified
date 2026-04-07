@@ -124,6 +124,20 @@ class StockMonitor:
         result = [t for t, _ in scored[:max_tickers]]
         return result if result else self.watchlist
 
+    def setup(self):
+        """Initialize stock monitor - compatible with main.py interface.
+        
+        V-Model fix: StockMonitor was missing setup() method that main.py calls,
+        causing immediate crash on startup (AttributeError).
+        """
+        if self.dry_run:
+            console.print("[yellow][StockMonitor] dry-run: skipping API setup[/yellow]")
+            return True
+        if self.api is None:
+            console.print("[yellow][StockMonitor] no API provided, skipping setup[/yellow]")
+            return True
+        return True
+
     def run(self):
         self.running = True
         console.print(f"[bold green]🍎 StockMonitor [{self.mode_tag}] Started | Strategy: {self.strat_name} | Watchlist: {len(self.watchlist)}[/bold green]")

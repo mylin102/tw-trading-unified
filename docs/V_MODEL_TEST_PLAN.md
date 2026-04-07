@@ -252,13 +252,14 @@ def test_overnight_date_handling():
 
 ### 每次部署前必須通過：
 
-- [ ] `python3 -m pytest tests/ -v` 全部通過
+- [ ] `python3 -m pytest tests/ -v` 全部通過 (83 tests)
 - [ ] `python3 main.py --dry-run` 啟動無 error，indicator CSV 正常寫入
 - [ ] Dashboard 可開啟，策略切換正常
-- [ ] 切換策略後 config 正確寫入
 - [ ] 模擬交易：進場 1 次、出場 1 次、PnL 正確
 - [ ] 重啟後持倉恢復正確
 - [ ] 本金 40,000 限制生效（ATM 被擋）
+- [ ] Ctrl-C 觸發優雅關閉，無 "Python quit unexpectedly" 彈窗
+- [ ] macOS 安全測試通過：`python3 -m pytest tests/test_macos_safety.py -v`
 
 ---
 

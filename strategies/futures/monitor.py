@@ -117,17 +117,13 @@ class FuturesMonitor:
             return yaml.safe_load(f)
 
     def setup(self):
+        # Tick-based bar builder (Initialize always to avoid AttributeError in dry_run)
+        self._tick_bars = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        self._current_bar = {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0, "ts": None}
+
         if self.dry_run:
             console.print("[yellow][FuturesMonitor] dry-run: skipping contract fetch[/yellow]")
             return True
-        self.contract = self.client.get_futures_contract(self.ticker)
-        if self.contract is None:
-            console.print("[red][FuturesMonitor] contract not found[/red]")
-            return False
-        console.print(f"[green][FuturesMonitor] contract: {self.contract.code}[/green]")
-        # Tick-based bar builder
-        self._tick_bars = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
-        self._current_bar = {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0, "ts": None}
         # Pre-fill from kbars if available
         try:
             df = self.client.get_kline(self.ticker, interval="5m")

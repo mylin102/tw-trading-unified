@@ -109,7 +109,8 @@ class ShioajiClient:
             if self.api is None:
                 print("[kbars] api is None")
                 return pd.DataFrame()
-            start_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+            # [gstack] 延長追溯至 7 天，避免長假後抓不到最新數據
+            start_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
             kbars = self.api.kbars(contract, start=start_date)
             df = pd.DataFrame({**kbars})
             if df.empty:

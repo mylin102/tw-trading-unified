@@ -24,10 +24,11 @@ def test_portfolio_grid_sweep_independence():
     }
     base_cfg = {"strategy": {"entry_score": 20, "scout_strategy": {"atr_mult": 2.0}}}
     
-    results = run_portfolio_grid_sweep(all_dfs, "scout_strategy", sweep_params, base_cfg)
-    
+    results, trades = run_portfolio_grid_sweep(all_dfs, "scout_strategy", sweep_params, base_cfg)
+
     # 組合數量應為 3 * 2 = 6
     assert len(results) == 6
+
     assert set(results["stop_loss_pct"].unique()) == {0.02, 0.03, 0.05}
     assert set(results["trailing_stop_pct"].unique()) == {0.01, 0.02}
     # 績效欄位應存在

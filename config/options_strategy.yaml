@@ -100,3 +100,6 @@ theta_gang:
   max_loss_pct: 1.0
   exit_on_squeeze_release: true
   risk_free_rate: 0.02
+entry_score: 80
+min_iv: 0.15
+max_iv: 0.6

@@ -1,4 +1,4 @@
-active_strategy: psar_breakout
+active_strategy: counter_vwap
 execution:
   broker_fee_per_side: 20.0
   exchange_fee_per_side: 0.0
@@ -27,71 +27,40 @@ risk_mgmt:
   ma_stop_multiplier: 1.0
   ma_stop_ticks: 10
   ma_stop_type: below
-  skip_hours: []  # 夜盤模擬交易: 不排除任何時段 (paper mode 測試用)
+  skip_hours: []
   stop_loss_pts: 30
-  time_filter_enabled: false  # 停用時間過濾，允許夜盤交易
+  time_filter_enabled: false
   trailing_stop_distance_pts: 30
   trailing_stop_enabled: true
   trailing_stop_trigger_pts: 60
-# ═══════════════════════════════════════════════════════════
-# ELITE STRATEGIES CONFIG (2026-04-07) — Live for Night Session
-# 去蕪存菁: 只保留 3 個通過回測驗證的策略
-# ═══════════════════════════════════════════════════════════
-# 策略自動切換邏輯:
-#   - 盤整市場 (70% 時間) → counter_vwap (PF=1.95)
-#   - 趨勢市場 (15%) → psar_breakout (PF=1.42)
-#   - 突破行情 (10%) → vol_squeeze (PF~1.3)
-# ═══════════════════════════════════════════════════════════
 strategy:
-  # 自動模式: 根據市場狀態動態選擇策略 (夜盤模擬交易已啟用)
-  auto_select: true  # 啟用自動策略選擇 (根據 bullish_align 翻轉頻率)
-  active_strategy: counter_vwap  # Fallback: 預設使用 Counter-VWAP
-  
-  # Counter-VWAP 核心策略 (ELITE #1)
+  auto_select: true
+  active_strategy: counter_vwap
   counter_mode:
     enabled: true
-    auto_regime: true  # 自動判斷盤整/趨勢
-    confirm_bars: 5    # 等待 5 根 K 棒確認突破失敗
-    atr_sl_mult: 2.0   # 寬停損 (2x ATR)
-    exit_on_vwap: true # ⚠️ 必須啟用，這是核心獲利機制
-
-  # PSAR Breakout 輔助策略 (ELITE #2)
+    auto_regime: true
+    confirm_bars: 5
+    atr_sl_mult: 2.0
+    exit_on_vwap: true
   psar_breakout:
     acceleration: 0.02
     acceleration_max: 0.2
     atr_mult: 2.0
     sma_length: 50
-    min_adx: 15        # 降低 ADX 門檻，捕捉趨勢初期
-
-  # Volume-Filtered Squeeze (ELITE #3)
+    min_adx: 15
   vol_squeeze:
-    vol_multiplier: 1.5  # 量能 > 1.5x 均量才進場
+    vol_multiplier: 1.5
     entry_score: 20
     atr_mult: 1.5
-
-  # 淘汰策略 (已移除，永不使用) ❌
-  # - squeeze_breakout (PF=1.02, 假突破太多)
-  # - trend_follow (PF=0.95, 停損太寬)
-  # - vwap_bounce (PF=0.85, 信號不穩定)
-  # - momentum_burst (PF=0.92, Z-Score 太敏感)
-  # - night_short_only (PF=0.04, 夜盤流動性不足)
-  # - volume_reversal (PF=0.88, 信號太少)
-  # - cumulative_delta (PF=0.78, Delta 估計不準)
-  # - gap_reversal (PF=0.95, 跳空後趨勢延續)
-
-  # 通用參數
   entry_score: 20
   regime_filter: mid
   length: 20
   use_squeeze: true
-  use_pullback: false  # 停用拉回進場 (增加假信號)
-  
-  # 分批停利設定
+  use_pullback: false
   partial_exit:
     enabled: true
     tp1_lots: 1
     tp1_pts: 100
-  
   weights:
     5m: 0.4
     15m: 0.4

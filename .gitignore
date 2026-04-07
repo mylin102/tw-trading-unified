@@ -31,3 +31,4 @@ shioaji.log
 .venv/
 login/account/
 .gstack/
+.aider*
