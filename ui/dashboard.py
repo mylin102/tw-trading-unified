@@ -194,7 +194,7 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
     ), row=1, col=1)
 
     # 2. Add Signal Markers if available
-    if signals is not None and not signals.empty:
+    if signals is not None and not signals.empty and "action" in signals.columns:
         # Buy signals (Green Triangles Up)
         buys = signals[signals["action"].str.contains("BUY", case=False, na=False)]
         if not buys.empty:
@@ -205,7 +205,7 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
                 marker=dict(symbol="triangle-up", size=12, color="#00cc66", line=dict(width=1, color="white")),
                 name="BUY"
             ), row=1, col=1)
-        
+
         # Sell signals (Red Triangles Down)
         sells = signals[signals["action"].str.contains("SELL", case=False, na=False)]
         if not sells.empty:
@@ -216,7 +216,7 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
                 marker=dict(symbol="triangle-down", size=12, color="#ff4444", line=dict(width=1, color="white")),
                 name="SELL"
             ), row=1, col=1)
-            
+
         # Exit signals (Orange Diamonds)
         exits = signals[signals["action"].str.contains("EXIT|COVER", case=False, na=False)]
         if not exits.empty:
