@@ -275,7 +275,7 @@ class TestMomentumBurstZScore:
 
 class TestTrendFollowExit:
     def test_trailing_exit_on_reversal(self):
-        """ELITE: 只剩 Counter-VWAP，驗證 elite_strategies 模組正常載入"""
+        """ELITE: 2 個策略 (Counter-VWAP + Spring/Upthrust)"""
         from strategies.futures.elite_strategies import get_elite_strategies
         elite = get_elite_strategies()
 
@@ -283,9 +283,10 @@ class TestTrendFollowExit:
         for eliminated in ["trend_follow", "psar_breakout", "vol_squeeze", "squeeze_breakout"]:
             assert eliminated not in elite, f"{eliminated} should be eliminated"
 
-        # 驗證唯一精英策略存在
+        # 驗證兩個精英策略都存在
         assert "counter_vwap" in elite
-        assert len(elite) == 1, "Should have exactly 1 elite strategy (Counter-VWAP)"
+        assert "spring_upthrust" in elite
+        assert len(elite) == 2, "Should have exactly 2 elite strategies"
 
 
 class TestCumulativeDeltaWeighted:

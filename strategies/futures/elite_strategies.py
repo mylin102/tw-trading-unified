@@ -130,16 +130,102 @@ def strategy_counter_vwap(state, cfg):
     return None
 
 
-# ── 精英策略註冊表 (只保留 Counter-VWAP) ──
+def strategy_spring_upthrust(state, cfg):
+    """
+    ELITE #2: Spring/Upthrust 假突破反向 (即時確認)
+    
+    TTM Squeeze Spring/Upthrust 模式:
+    - Spring: 假跌破 BB 下軌但收盤彈回 → 做多
+    - Upthrust: 假突破 BB 上軌但收盤跌回 → 做空
+    
+    回測數據: PF=3.36, 勝率 33.3%, 最大虧損 -10.1%, T=33
+    
+    優勢:
+    - 0 延遲 (當下 K 線確認, 不需等 5 根)
+    - 高品質信號 (假突破是 Wyckoff 經典反向模式)
+    - 交易數少 (33 vs Counter 86)
+    """
+    spring_cfg = cfg.get("strategy", {}).get("spring_upthrust", {})
+    bb_mult = spring_cfg.get("bb_mult", 2.0)
+    kc_mult = spring_cfg.get("kc_mult", 1.0)
+    atr_mult = spring_cfg.get("atr_mult", 2.0)
+    bb_len = spring_cfg.get("bb_length", 20)
+    kc_len = spring_cfg.get("kc_length", 20)
+    
+    last_5m = state["last_5m"]
+    df_5m = state.get("df_5m")
+    
+    if df_5m is None or len(df_5m) < max(bb_len, kc_len) + 2:
+        return None
+    
+    # 計算 BB
+    ma = df_5m["Close"].rolling(window=bb_len).mean()
+    std = df_5m["Close"].rolling(window=bb_len).std()
+    bb_up = ma + (bb_mult * std)
+    bb_low = ma - (bb_mult * std)
+    
+    # 計算 KC (ATR 近似)
+    prev_close = df_5m["Close"].shift(1)
+    tr = np.maximum(df_5m["High"] - df_5m["Low"],
+                    np.maximum(np.abs(df_5m["High"] - prev_close),
+                               np.abs(df_5m["Low"] - prev_close)))
+    atr = tr.rolling(window=kc_len).mean()
+    kc_up = ma + (kc_mult * atr)
+    kc_low = ma - (kc_mult * atr)
+    
+    # 擠壓狀態 (BB 在 KC 內)
+    is_squeezing = (bb_up < kc_up) & (bb_low > kc_low)
+    
+    # 檢查前一根是否在擠壓中
+    if len(is_squeezing) < 2 or not is_squeezing.iloc[-2]:
+        return None
+    
+    close = last_5m["Close"]
+    high = last_5m["High"]
+    low = last_5m["Low"]
+    atr_val = last_5m.get("atr", 0)
+    stop_loss = atr_val * atr_mult if atr_val > 0 else 60
+    
+    # Spring (假跌破 → 做多)
+    if low < bb_low.iloc[-1] and close > bb_low.iloc[-1]:
+        return {
+            "action": "BUY",
+            "reason": "SPRING",
+            "stop_loss": stop_loss,
+            "bb_low": bb_low.iloc[-1],
+        }
+    
+    # Upthrust (假突破 → 做空)
+    if high > bb_up.iloc[-1] and close < bb_up.iloc[-1]:
+        return {
+            "action": "SELL",
+            "reason": "UPTHRUST",
+            "stop_loss": stop_loss,
+            "bb_up": bb_up.iloc[-1],
+        }
+    
+    return None
+
+
+# ── 精英策略註冊表 (Counter-VWAP + Spring/Upthrust) ──
 ELITE_STRATEGIES = {
     "counter_vwap": {
         "func": strategy_counter_vwap,
-        "desc": "反向均歸。偵測 Squeeze 突破失敗後反向進場，VWAP 回歸出場。PF=1.95，唯一通過回測驗證的策略。適用盤整市場 (70% 時間)。",
+        "desc": "反向均歸。偵測 Squeeze 突破失敗後反向進場，VWAP 回歸出場。PF=1.95，盤整市場 (70%)。",
         "elite_rank": 1,
         "backtest_pf": 1.95,
         "backtest_wr": 40.7,
         "backtest_maxdd": -7.2,
         "market_regime": "ranging",
+    },
+    "spring_upthrust": {
+        "func": strategy_spring_upthrust,
+        "desc": "假突破反向。Spring/Upthrust 即時確認，不需等待。PF=3.36，高品質信號 (33 筆)。",
+        "elite_rank": 2,
+        "backtest_pf": 3.36,
+        "backtest_wr": 33.3,
+        "backtest_maxdd": -10.1,
+        "market_regime": "squeeze",
     },
 }
 
@@ -156,13 +242,16 @@ def get_elite_strategies():
 
 def detect_market_regime(df_5m, lookback=20):
     """
-    判斷市場狀態 (僅供參考，目前只用 Counter-VWAP)
+    判斷市場狀態 (供參考)
     """
-    return "ranging"  # Counter-VWAP 適用於盤整市場 (70% 時間)
+    return "ranging"  # Counter-VWAP 適用
 
 
 def select_strategy(df_5m):
     """
-    回傳 Counter-VWAP (唯一策略)
+    回傳兩個策略: Counter-VWAP (主) + Spring/Upthrust (輔)
     """
-    return "counter_vwap", get_strategy("counter_vwap")
+    # 先嘗試 Spring/Upthrust (0 延遲, 高品質)
+    spring = get_strategy("spring_upthrust")
+    counter = get_strategy("counter_vwap")
+    return "spring_upthrust+counter_vwap", [spring, counter]

@@ -583,11 +583,28 @@ class FuturesMonitor:
         if self.counter_enabled:
             self._detect_squeeze_failure(last_5m, df_5m)
 
-        # Elite Strategy Auto-Select: 根據市場狀態動態選擇策略
+        # Elite Strategy Auto-Select: 並行嘗試 Spring/Upthrust + Counter-VWAP
         auto_select = self.STRATEGY.get("auto_select", False)
         if auto_select and self.counter_enabled:
-            # auto_select 時, 直接使用監控器的 Counter 邏輯
-            # (因為 elite_strategies.py 的 counter_vwap 無法正確追蹤 fire 狀態)
+            # 1. 先試 Spring/Upthrust (0 延遲, 高品質)
+            from strategies.futures.elite_strategies import strategy_spring_upthrust
+            spring_signal = strategy_spring_upthrust({
+                "last_5m": last_5m, "df_5m": df_5m,
+                "score": score, "stop_loss_pts": stop_loss_pts,
+            }, self.cfg)
+            if spring_signal:
+                atr_val = last_5m.get("atr", 0)
+                spring_sl = spring_signal.get("stop_loss", atr_val * 2.0 if atr_val > 0 else 60)
+                lots = self.MGMT.get("lots_per_trade", 1)
+                be = self.RISK.get("break_even_pts", 50)
+                action = spring_signal["action"]
+                if self.MGMT.get(f"allow_{'long' if action == 'BUY' else 'short'}", True):
+                    console.print(f"[bold cyan]🌊 SPRING/UPTHRUST {action} SL={spring_sl:.1f}[/bold cyan]")
+                    self._execute_trade(action, last_price, timestamp, lots,
+                                        stop_loss=spring_sl, break_even_trigger=be, reason=spring_signal["reason"])
+                    return  # Spring 進場後不嘗試 Counter
+            
+            # 2. 再試 Counter-VWAP (盤整市場)
             use_counter = self.counter_enabled and (
                 self._is_ranging_regime(df_5m) if self.counter_auto_regime else True
             )
@@ -604,7 +621,7 @@ class FuturesMonitor:
                         self._execute_trade(action, last_price, timestamp, lots,
                                             stop_loss=counter_sl, break_even_trigger=be, reason="COUNTER")
                     return
-            # 非盤整時不使用 Counter, 目前只有 Counter-VWAP 可用
+            # 非盤整且無 Spring 信號時 return
             return
         else:
             # Counter mode (auto-regime override)
