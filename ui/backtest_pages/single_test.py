@@ -17,16 +17,9 @@ if str(ROOT) not in sys.path:
 from backtest.signal_generator import generate_signals # noqa: E402
 from strategies.futures.squeeze_futures.engine.vectorized import simulate_trades_vectorized, calculate_metrics # noqa: E402
 from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze # noqa: E402
-from strategies.futures.entry_strategies import STRATEGIES as ALL_STRATEGIES
 from strategies.futures.elite_strategies import ELITE_STRATEGIES
-
-# Merge: elite strategies first, then remaining old ones
-ELITE_KEYS = set(ELITE_STRATEGIES.keys())
-STRATEGIES = {}
-STRATEGIES.update(ELITE_STRATEGIES)  # elite first
-for k, v in ALL_STRATEGIES.items():
-    if k not in ELITE_KEYS:
-        STRATEGIES[k] = v # noqa: E402
+# 回測只用精英策略 (counter_vwap + spring_upthrust)
+STRATEGIES = dict(ELITE_STRATEGIES)
 
 from core.i18n import get_text # noqa: E402
 

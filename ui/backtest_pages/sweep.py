@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 from backtest.sweep_engine import run_portfolio_grid_sweep, run_multi_asset_backtest # noqa: E402
 from backtest.monte_carlo import run_monte_carlo_drawdown # noqa: E402
 from ui.backtest_pages.single_test import load_backtest_data # noqa: E402
-from backtest.signal_generator import ALL_STRATEGIES as STRATEGIES  # noqa: E402
+from strategies.futures.elite_strategies import ELITE_STRATEGIES as STRATEGIES  # noqa: E402
 from core.i18n import get_text # noqa: E402
 
 def main():
@@ -59,19 +59,11 @@ def main():
             atr_sl_range = st.multiselect("ATR SL Mult Range", [1.5, 2.0, 2.5, 3.0], default=[2.0, 2.5])
             sweep_params["confirm_bars"] = confirm_range
             sweep_params["atr_sl_mult"] = atr_sl_range
-        elif strat_name in ["squeeze_breakout", "vol_squeeze", "trend_follow"]:
-            entry_score_range = st.multiselect("Entry Score Range", [10, 15, 20, 25, 30, 40, 50], default=[15, 20, 25])
-            sweep_params["entry_score"] = entry_score_range
-
-        if strat_name == "vol_squeeze":
-            vol_mult_range = st.multiselect("Volume Multiplier Range", [1.0, 1.2, 1.5, 1.8, 2.0, 2.5], default=[1.2, 1.5, 1.8])
-            sweep_params["vol_multiplier"] = vol_mult_range
-
-        if strat_name == "psar_breakout":
-            accel_range = st.multiselect("Acceleration Range", [0.01, 0.02, 0.03, 0.04, 0.05], default=[0.01, 0.02, 0.03])
-            sma_range = st.multiselect("SMA Filter Range", [20, 50, 100, 200], default=[20, 50, 100])
-            sweep_params["acceleration"] = accel_range
-            sweep_params["sma_length"] = sma_range
+        elif strat_name == "spring_upthrust":
+            bb_range = st.multiselect("BB Mult Range", [1.5, 2.0, 2.5], default=[2.0])
+            kc_range = st.multiselect("KC Mult Range", [0.8, 1.0, 1.2], default=[1.0])
+            sweep_params["bb_mult"] = bb_range
+            sweep_params["kc_mult"] = kc_range
 
         total_combinations = np.prod([len(v) for v in sweep_params.values()])
         st.warning(f"Total Combinations: {total_combinations}")
