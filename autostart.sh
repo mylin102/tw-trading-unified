@@ -18,10 +18,12 @@ $PYTHON_EXEC -m pip install -q rich streamlit pandas pyyaml shioaji >> logs/unif
 # --- Layer 2: Clean up (徹底清理) ---
 # macOS specific: kill all related processes gently first
 pkill -15 -f "main.py" 2>/dev/null  # SIGTERM first
-sleep 3  # Give processes time to cleanup
-pkill -9 -f "main.py" 2>/dev/null  # Force kill if still alive
+sleep 10  # Give main.py finally block time (8s cleanup) before SIGKILL
+pkill -15 -f "streamlit" 2>/dev/null  # SIGTERM streamlit too
+sleep 3  # Buffer for C++ resource cleanup
+pkill -9 -f "main.py" 2>/dev/null  # Force kill if still alive (should not happen)
 pkill -9 -f "streamlit" 2>/dev/null
-sleep 2  # Buffer for C++ resource cleanup
+sleep 2  # Final buffer before restart
 
 # --- Layer 3: Launch Dashboards (哨兵監控台) ---
 tmux has-session -t unified 2>/dev/null || tmux new-session -d -s unified

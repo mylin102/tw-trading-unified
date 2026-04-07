@@ -272,12 +272,12 @@ def run_system(dry_run=False):
                     console.print(f"[dim]Callback cleanup error: {e}[/dim]")
 
             # Final sleep before logout - reduces C++ crash risk
-            time.sleep(1)
+            time.sleep(2)
 
             logout()
-            
+
             # Final buffer before process exit - prevents macOS "Python quit unexpectedly" dialog
-            time.sleep(2)
+            time.sleep(3)
             
             console.print("[green]Session logged out cleanly. Exiting...[/green]")
         except Exception as e:
