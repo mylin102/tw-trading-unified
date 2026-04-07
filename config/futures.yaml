@@ -42,16 +42,8 @@ strategy:
     confirm_bars: 5
     atr_sl_mult: 2.0
     exit_on_vwap: true
-  psar_breakout:
-    acceleration: 0.02
-    acceleration_max: 0.2
-    atr_mult: 2.0
-    sma_length: 50
-    min_adx: 10  # 從 15 降到 10，夜盤也能捕捉趨勢初期
-  vol_squeeze:
-    vol_multiplier: 1.5
-    entry_score: 20
-    atr_mult: 1.5
+  # psar_breakout: ❌ 已剔除 (PF=1.13, MaxDD=-63%, 54/54 組合不適用)
+  # vol_squeeze: ❌ 已剔除 (PF=1.23, MaxDD=-55%, 27/27 組合不適用)
   entry_score: 20
   regime_filter: mid
   length: 20

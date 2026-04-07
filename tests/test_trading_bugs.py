@@ -275,20 +275,17 @@ class TestMomentumBurstZScore:
 
 class TestTrendFollowExit:
     def test_trailing_exit_on_reversal(self):
-        """ELITE: trend_follow 已淘汰，驗證 elite_strategies 模組正常載入"""
-        # trend_follow 策略已從 elite_strategies 中移除
-        # 這個測試確保精英策略模組可以正確載入
+        """ELITE: 只剩 Counter-VWAP，驗證 elite_strategies 模組正常載入"""
         from strategies.futures.elite_strategies import get_elite_strategies
         elite = get_elite_strategies()
-        
-        # 驗證 trend_follow 不在精英策略中
-        assert "trend_follow" not in elite, "trend_follow should be eliminated"
-        
-        # 驗證精英策略都存在
+
+        # 驗證淘汰策略不在精英策略中
+        for eliminated in ["trend_follow", "psar_breakout", "vol_squeeze", "squeeze_breakout"]:
+            assert eliminated not in elite, f"{eliminated} should be eliminated"
+
+        # 驗證唯一精英策略存在
         assert "counter_vwap" in elite
-        assert "psar_breakout" in elite
-        assert "vol_squeeze" in elite
-        assert len(elite) == 3, "Should have exactly 3 elite strategies"
+        assert len(elite) == 1, "Should have exactly 1 elite strategy (Counter-VWAP)"
 
 
 class TestCumulativeDeltaWeighted:
