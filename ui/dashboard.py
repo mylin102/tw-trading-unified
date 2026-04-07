@@ -851,39 +851,53 @@ with tab_settings:
     with st.expander("📈 期貨 TMF 設定", expanded=True):
         from strategies.futures.elite_strategies import ELITE_STRATEGIES as FUT_STRATS
         current_fut_strat = futures_cfg.get("active_strategy", "counter_vwap")
-        
+
         with st.form("futures_settings_form"):
             f_live_new = st.checkbox("啟用期貨實盤交易 (LIVE)", value=futures_cfg.get("live_trading", False))
-            
+
             # 策略選擇
             strat_options = list(FUT_STRATS.keys())
             try:
                 strat_idx = strat_options.index(current_fut_strat)
             except ValueError:
                 strat_idx = 0
-            
-            f_strat_new = st.selectbox("核心進場策略", strat_options, index=strat_idx, 
+
+            f_strat_new = st.selectbox("核心進場策略", strat_options, index=strat_idx,
                                        help="系統將使用此策略進行即時信號判斷。")
-            
+
             # 顯示當前策略說明
             st.info(f"💡 **策略說明**: {FUT_STRATS.get(f_strat_new, {}).get('desc', '無說明')}")
-            
+
+            st.divider()
+
+            # ── 口數與持倉限制 ──
+            st.markdown("##### 📦 口數與持倉限制")
+            c1, c2 = st.columns(2)
+            f_lots = c1.number_input("每筆交易口數", min_value=1, max_value=10,
+                                     value=futures_cfg.get("trade_mgmt", {}).get("lots_per_trade", 2),
+                                     help="每次進場的口數。實盤建議從 1 口開始。")
+            f_max_pos = c2.number_input("最大持倉口數", min_value=1, max_value=10,
+                                        value=futures_cfg.get("trade_mgmt", {}).get("max_positions", 2),
+                                        help="同時最大持倉口數。建議 1-2 口控制風險。")
+
             st.divider()
             f_regime = st.selectbox("市場濾網 (Regime)", ["low", "mid", "high"], index=["low", "mid", "high"].index(futures_cfg.get("strategy", {}).get("regime_filter", "mid")))
             
             fc1, fc2 = st.columns(2)
             f_score = fc1.slider("進場門檻 (Score)", 10, 100, value=futures_cfg.get("strategy", {}).get("entry_score", 20))
             f_atr = fc2.slider("ATR 止損倍數", 1.0, 5.0, value=float(futures_cfg.get("risk_mgmt", {}).get("atr_multiplier", 2.0)), step=0.1)
-            
+
             if st.form_submit_button("💾 儲存並重啟期貨模組"):
                 futures_cfg["live_trading"] = f_live_new
                 futures_cfg["active_strategy"] = f_strat_new
                 futures_cfg["strategy"]["regime_filter"] = f_regime
                 futures_cfg["strategy"]["entry_score"] = f_score
                 futures_cfg["risk_mgmt"]["atr_multiplier"] = f_atr
+                futures_cfg["trade_mgmt"]["lots_per_trade"] = f_lots
+                futures_cfg["trade_mgmt"]["max_positions"] = f_max_pos
                 save_yaml(FUTURES_CFG_PATH, futures_cfg)
                 trigger_restart()
-                st.success(f"期貨設定已更新！當前策略: {f_strat_new}")
+                st.success(f"期貨設定已更新！策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
                 st.rerun()
 
     # ── 2. 選擇權 TXO 設定 ──
@@ -904,22 +918,35 @@ with tab_settings:
                 "V3": "專攻夜盤波動，開盤進場收盤前出場。"
             }
             st.info(f"💡 **模式說明**: {mode_desc.get(o_mode_new)}")
-            
+
             o_score = st.slider("進場門檻 (Score)", 10, 100, value=options_cfg.get("entry_score", 80))
-            
+
+            # ── 口數與持倉限制 ──
+            st.markdown("##### 📦 口數與持倉限制")
             oc1, oc2 = st.columns(2)
-            o_min_iv = oc1.slider("最低 IV 限制", 0.1, 0.5, value=float(options_cfg.get("min_iv", 0.15)), step=0.01)
-            o_max_iv = oc2.slider("最高 IV 限制", 0.3, 1.0, value=float(options_cfg.get("max_iv", 0.60)), step=0.01)
-            
+            o_lots = oc1.number_input("每筆交易口數", min_value=1, max_value=10,
+                                     value=options_cfg.get("risk_mgmt", {}).get("lots_per_trade", 2),
+                                     help="每次進場的口數。實盤建議從 1 口開始。")
+            o_max_pos = oc2.number_input("最大持倉口數", min_value=1, max_value=10,
+                                        value=options_cfg.get("risk_mgmt", {}).get("max_positions", 2),
+                                        help="同時最大持倉口數。建議 1-2 口控制風險。")
+
+            st.divider()
+            oc3, oc4 = st.columns(2)
+            o_min_iv = oc3.slider("最低 IV 限制", 0.1, 0.5, value=float(options_cfg.get("min_iv", 0.15)), step=0.01)
+            o_max_iv = oc4.slider("最高 IV 限制", 0.3, 1.0, value=float(options_cfg.get("max_iv", 0.60)), step=0.01)
+
             if st.form_submit_button("💾 儲存並重啟選擇權模組"):
                 options_cfg["live_trading"] = o_live_new
                 options_cfg["mode"] = o_mode_new
                 options_cfg["entry_score"] = o_score
                 options_cfg["min_iv"] = o_min_iv
                 options_cfg["max_iv"] = o_max_iv
+                options_cfg["risk_mgmt"]["lots_per_trade"] = o_lots
+                options_cfg["risk_mgmt"]["max_positions"] = o_max_pos
                 save_yaml(OPTIONS_CFG_PATH, options_cfg)
                 trigger_restart()
-                st.success(f"選擇權設定已更新！當前模式: {o_mode_new}")
+                st.success(f"選擇權設定已更新！模式: {o_mode_new} | 口數: {o_lots} | 最大持倉: {o_max_pos}")
                 st.rerun()
 
     # ── 3. 台股 Stocks 設定 ──
