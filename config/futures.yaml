@@ -47,7 +47,7 @@ strategy:
     acceleration_max: 0.2
     atr_mult: 2.0
     sma_length: 50
-    min_adx: 15
+    min_adx: 10  # 從 15 降到 10，夜盤也能捕捉趨勢初期
   vol_squeeze:
     vol_multiplier: 1.5
     entry_score: 20

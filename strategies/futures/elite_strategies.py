@@ -143,7 +143,7 @@ def strategy_psar_breakout(state, cfg):
     進場邏輯:
     1. PSAR 翻轉 (空翻多或多翻空)
     2. 價格相對 50MA 確認趨勢方向
-    3. ADX >= 15 確保趨勢強度
+    3. ADX >= 10 確保趨勢強度 (夜盤適用)
     4. ATR 停損跟隨 PSAR 移動
     """
     psar_cfg = cfg.get("strategy", {}).get("psar_breakout", {})
@@ -151,7 +151,7 @@ def strategy_psar_breakout(state, cfg):
     accel = psar_cfg.get("acceleration", 0.02)
     accel_max = psar_cfg.get("acceleration_max", 0.2)
     atr_mult = psar_cfg.get("atr_mult", 2.0)
-    min_adx = psar_cfg.get("min_adx", 15)  # 從 25 降到 15，捕捉趨勢初期
+    min_adx = psar_cfg.get("min_adx", 10)  # 夜盤適用
     
     df_5m = state.get("df_5m")
     if df_5m is None or len(df_5m) < sma_len + 2:

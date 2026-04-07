@@ -499,6 +499,10 @@ class FuturesMonitor:
         df_5m = processed["5m"]
         last_5m = df_5m.iloc[-1]
         
+        # fallback for MTF
+        df_15m = processed.get("15m", df_5m)
+        last_15m = df_15m.iloc[-1]
+        
         # 指標預設值
         score = 0.0
         regime = "NORMAL"
@@ -605,6 +609,21 @@ class FuturesMonitor:
 
         if not strategy_fn or self.trader.position != 0:
             return
+
+        # 夜盤備用策略: 美盤開盤後 (20:30~22:00) 如果當前策略沒信號，用量能擠壓
+        hour = datetime.now().hour
+        is_night_peak = (hour == 20 or hour == 21) and last_5m.get("Volume", 0) > 0
+        if is_night_peak and active == "psar_breakout":
+            from strategies.futures.elite_strategies import strategy_vol_squeeze
+            vol_signal = strategy_vol_squeeze({
+                "last_5m": last_5m, "last_15m": last_15m, "df_5m": df_5m,
+                "score": score, "stop_loss_pts": stop_loss_pts,
+                "trend": trend, "hour": hour,
+            }, self.cfg)
+            if vol_signal:
+                active = "vol_squeeze_night"
+                strategy_fn = strategy_vol_squeeze
+                console.print(f"[yellow]🌙 Night session volume spike detected![/yellow]")
 
         trend = _check_trend_breakout_signal(df_5m, df_15m)
         market_state = {
