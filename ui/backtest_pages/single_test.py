@@ -139,6 +139,9 @@ def load_backtest_data(source_type: str, date_str: str = None, _cache_version: s
                 f_night = FUTURES_MKT / f"TMF_{next_str}{tag}_indicators.csv"
                 df_night = _read_csv(f_night)
                 if df_night is not None:
+                    # 確保 index 是 datetime
+                    if not pd.api.types.is_datetime64_any_dtype(df_night.index):
+                        df_night.index = pd.to_datetime(df_night.index, errors="coerce")
                     # 只取 >=15:00 的資料避免重複
                     df_night = df_night[df_night.index.hour >= 15]
                     if not df_night.empty:
