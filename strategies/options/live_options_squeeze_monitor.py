@@ -733,8 +733,8 @@ class ShioajiOptionsSmartMonitor:
             "gamma": round(gamma_val, 6),
             "vega": round(vega_val, 4),
             # 進場關鍵欄位 (resolve_entry_side 需要)
-            "vwap": row_data.get("vwap", price_mtx),
-            "sqz_on": bool(row_data.get("sqz_on", False)),
+            "vwap": price_mtx,
+            "sqz_on": False,
         }
         if iv > 0:
             self.latest_iv = iv
@@ -1367,8 +1367,8 @@ class ShioajiOptionsSmartMonitor:
                             pos = self._theta_gang.open_position(entry_info)
                             # Create a readable string of position legs
                             legs_str = " | ".join(f"{leg.action} {leg.side}{leg.strike}" for leg in pos.legs)
-                            self.log_trade("THETA_ENTRY", pos.strategy, 0,
-                                           f"credit={pos.net_credit:.0f} max_loss={pos.max_loss:.0f} [{legs_str}]")
+                            self.log_trade("THETA_ENTRY", "THETA", 0,
+                                           f"credit={pos.net_credit:.0f} max_loss={pos.max_loss:.0f} strategy={pos.strategy} [{legs_str}]")
                             console.print(f"[bold cyan]🔺 [ThetaGang] ENTRY {pos.strategy}: credit={pos.net_credit:.0f} [{legs_str}][/bold cyan]")
                             return
 
