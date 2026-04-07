@@ -2,6 +2,22 @@
 
 台股期貨 + 選擇權整合交易系統。單一 Shioaji session，避免 Too Many Connections。
 
+### 2026-04-07 macOS 穩定性 + SDD/V-Model 加固 (v4)
+- **[Stability] macOS 優雅關閉**：Signal handlers (SIGTERM/SIGINT) + `_shutdown_event` 協調
+- **[Stability] Dispatcher 安全加固**：`tick_dispatcher` 和 `bidask_dispatcher` 加入：
+  - 關閉事件檢查（shutdown event）
+  - 輸入驗證（None/invalid tick 拒絕）
+  - 執行緒安全鎖（thread-safe `_seen` sets）
+  - 異常隔離（每個 monitor 呼叫獨立 try/except）
+- **[Stability] C++ 彈窗消除**：清理序列加入 time.sleep 緩衝（總計 5 秒）
+  - 停止 monitors → sleep(1)
+  - Thread join → sleep(0.5) × 2（回調清理）
+  - Logout → sleep(2)（C++ 資源穩定）
+- **[Stability] autostart.sh macOS 優化**：SIGTERM 優先 → sleep(3) → SIGKILL
+- **[Test] V-Model Level 1**：17 個新測試覆蓋 macOS 安全性 (`test_macos_safety.py`)
+- **[Doc] SDD 補充**：`docs/SDD_MACOS_SAFETY.md` 完整設計文件
+- **[Test] 總測試數**：83 個測試案例全部通過
+
 ### 2026-04-03 策略插件化 + ThetaGang + 安全性修復 (v3)
 - **[Arch] 策略插件系統**：8 種期貨進場策略，config 一行切換，Dashboard 下拉選單即時切換
   - `squeeze_breakout` / `trend_follow` / `vwap_bounce` / `momentum_burst` / `night_short_only`
@@ -218,6 +234,12 @@ python3 scripts/backtest_iv_filter.py
 
 | 文件 | 說明 |
 |------|------|
+| `docs/ELITE_STRATEGIES.md` | **精英策略完整文檔** (去蕵存菁 3 個策略) |
+| `docs/ELITE_IMPLEMENTATION_SUMMARY.md` | 精英策略實作總結 |
+| `docs/ELITE_QUICK_REFERENCE.md` | 精英策略快速參考卡 |
+| `docs/METHODOLOGIES.md` | GSTACK + SDD + V-Model 方法論參考 |
+| `docs/SDD.md` | 軟體設計文檔 |
+| `docs/V_MODEL_TEST_PLAN.md` | V-Model 測試計畫 |
 | `docs/SHIOAJI_API_REFERENCE.md` | Shioaji API 快速參考（登入/下單/行情/帳務） |
 | `docs/SQUEEZE_FAILURE_STRATEGY.md` | Counter 策略設計提案 |
 | `docs/DASHBOARD_UI_DESIGN.md` | Dashboard UI 設計 |
