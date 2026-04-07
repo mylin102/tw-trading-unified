@@ -235,6 +235,7 @@ python3 scripts/backtest_iv_filter.py
 | 文件 | 說明 |
 |------|------|
 | `docs/ELITE_STRATEGIES.md` | **精英策略完整文檔** (去蕵存菁 3 個策略) |
+| `docs/LIVE_TRADING_GUIDE.md` | **實盤轉換指南** (三階段流程 + 摩擦成本分析) |
 | `docs/ELITE_IMPLEMENTATION_SUMMARY.md` | 精英策略實作總結 |
 | `docs/ELITE_QUICK_REFERENCE.md` | 精英策略快速參考卡 |
 | `docs/METHODOLOGIES.md` | GSTACK + SDD + V-Model 方法論參考 |
