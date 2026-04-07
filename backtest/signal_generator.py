@@ -1,12 +1,20 @@
 import numpy as np
 import pandas as pd
 from typing import Dict, Tuple, Any, Optional
-from strategies.futures.entry_strategies import STRATEGIES as FUTURES_STRATEGIES
+from strategies.futures.entry_strategies import STRATEGIES as ALL_STRATEGIES_ORIG
+from strategies.futures.elite_strategies import ELITE_STRATEGIES
 from strategies.stocks.entry_strategies import STOCK_STRATEGIES
 from core.strategy_schema import StrategyParams
 
-# Merge registries for universal access
-ALL_STRATEGIES = {**FUTURES_STRATEGIES, **STOCK_STRATEGIES}
+# Merge registries: elite first, then remaining old ones
+ELITE_KEYS = set(ELITE_STRATEGIES.keys())
+ALL_STRATEGIES = {}
+ALL_STRATEGIES.update(ELITE_STRATEGIES)
+for k, v in ALL_STRATEGIES_ORIG.items():
+    if k not in ELITE_KEYS:
+        ALL_STRATEGIES[k] = v
+# Also add stock strategies
+ALL_STRATEGIES.update(STOCK_STRATEGIES)
 
 
 def apply_strategy_filters(
@@ -65,27 +73,32 @@ def _suppress_signals(df: pd.DataFrame, mask: pd.Series) -> None:
         df.loc[mask, "mom_state"] = 0
 
 def build_state_optimized(
-    df_5m_np: Dict[str, np.ndarray], 
-    df_15m_np: Dict[str, np.ndarray], 
-    idx: int, 
-    df_5m_full: pd.DataFrame, 
-    cfg: Dict
+    df_5m_np: Dict[str, np.ndarray],
+    df_15m_np: Dict[str, np.ndarray],
+    idx: int,
+    df_5m_full: pd.DataFrame,
+    cfg: Dict,
+    fire_state: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     """
     Fast state builder using pre-extracted NumPy arrays.
     Replaces the expensive pd.DataFrame slicing inside loops.
+
+    Args:
+        fire_state: Dict tracking squeeze fire state for Counter-VWAP.
+            Modified in-place to track fires across bars.
+            Keys: pending_dir, bar_idx, high, low
     """
     # Build Series-like objects for the strategy functions using current index
     last_5m = pd.Series({k: v[idx] for k, v in df_5m_np.items()})
-    
+
     # For 15m, find the closest previous 15m index (simplified alignment)
-    # In a real scenario, we'd pre-calculate the mapping
-    last_15m = pd.Series({k: v[idx] for k, v in df_15m_np.items()}) 
+    last_15m = pd.Series({k: v[idx] for k, v in df_15m_np.items()})
 
     # Handle missing price_round for arbitrage strategy
     price_round = last_5m.get("price_round", last_5m["Close"])
 
-    return {
+    state = {
         "last_5m": last_5m,
         "last_15m": last_15m,
         "df_5m": df_5m_full.iloc[max(0, idx-100):idx+1], # Sliding window for indicators needing history
@@ -94,26 +107,38 @@ def build_state_optimized(
         "score": last_5m.get("score", 0),
         "price_round": price_round,
         "stop_loss_pts": last_5m.get("atr", 30),
-        "hour": df_5m_full.index[idx].hour,
+        "hour": df_5m_full.index[idx].hour if hasattr(df_5m_full.index[idx], 'hour') else 10,
         "trend": {
             "trend_long": last_5m.get("bullish_align", False),
             "trend_short": last_5m.get("bearish_align", False)
         }
     }
 
+    # Inject Counter-VWAP fire state if tracking is enabled
+    if fire_state is not None:
+        state["fire_pending_dir"] = fire_state["pending_dir"]
+        state["fire_bar_idx"] = fire_state["bar_idx"]
+        state["fire_high"] = fire_state["high"]
+        state["fire_low"] = fire_state["low"]
+        state["bar_counter"] = idx
+
+    return state
+
 def generate_signals(
-    df_5m: pd.DataFrame, 
-    strategy_name: str, 
+    df_5m: pd.DataFrame,
+    strategy_name: str,
     cfg: Dict,
     warmup: int = 60
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Converts strategy dict outputs to boolean arrays for vectorized engine.
     Uses NumPy optimization to minimize Pandas overhead.
+
+    Supports Counter-VWAP with multi-bar squeeze fire tracking.
     """
     if strategy_name not in ALL_STRATEGIES:
         raise ValueError(f"Strategy {strategy_name} not found in any registry.")
-        
+
     strat_entry = ALL_STRATEGIES[strategy_name]
     strategy_fn = strat_entry["func"] if isinstance(strat_entry, dict) else strat_entry
     n = len(df_5m)
@@ -125,13 +150,53 @@ def generate_signals(
 
     # Pre-extract columns to dict of numpy arrays for speed
     df_5m_np = {col: df_5m[col].values for col in df_5m.columns}
-    # For now, assuming 15m is same as 5m or pre-calculated in df_5m
-    df_15m_np = df_5m_np 
+    df_15m_np = df_5m_np
+
+    # Counter-VWAP: initialize fire state tracker
+    fire_state = None
+    is_counter = strategy_name == "counter_vwap"
+    counter_cfg = cfg.get("strategy", {}).get("counter_mode", {})
+    confirm_bars = counter_cfg.get("confirm_bars", 5)
+
+    if is_counter:
+        fire_state = {
+            "pending_dir": 0,
+            "bar_idx": 0,
+            "high": 0.0,
+            "low": 0.0,
+        }
 
     for i in range(warmup, n):
-        state = build_state_optimized(df_5m_np, df_15m_np, i, df_5m, cfg)
+        state = build_state_optimized(df_5m_np, df_15m_np, i, df_5m, cfg, fire_state)
         result = strategy_fn(state, cfg)
-        
+
+        # Counter-VWAP: update fire state after strategy call
+        if fire_state is not None:
+            fired = df_5m_np.get("fired", np.zeros(n))[i]
+            momentum = df_5m_np.get("momentum", np.zeros(n))[i]
+            close = df_5m_np["Close"][i]
+
+            # New fire event
+            if fired and fire_state["pending_dir"] == 0:
+                fire_state["pending_dir"] = 1 if momentum > 0 else -1
+                fire_state["bar_idx"] = i
+                fire_state["high"] = close
+                fire_state["low"] = close
+
+            # Update tracking
+            if fire_state["pending_dir"] != 0:
+                fire_state["high"] = max(fire_state["high"], close)
+                fire_state["low"] = min(fire_state["low"], close)
+                bars_since = i - fire_state["bar_idx"]
+
+                # Expire if too many bars without failure confirmation
+                if bars_since > confirm_bars:
+                    fire_state["pending_dir"] = 0
+
+            # Reset fire state after a counter signal
+            if result and result.get("reason") == "COUNTER_VWAP":
+                fire_state["pending_dir"] = 0
+
         if result:
             if result["action"] == "BUY":
                 long_signals[i] = True

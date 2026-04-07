@@ -20,6 +20,11 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 
+# V-Model fix: Clear cache on startup to avoid stale duplicate data
+if "_cache_cleared" not in st.session_state:
+    st.session_state._cache_cleared = True
+    st.cache_data.clear()
+
 # Ensure project root is in sys.path for strategy imports
 ROOT = Path(__file__).parent.parent
 if str(ROOT) not in sys.path:
@@ -123,44 +128,118 @@ def filter_today(df, ts_col="timestamp"):
     if df is None or df.empty:
         return df
     try:
+        # V-Model fix 1: Deduplicate columns first (narwhals/Plotly require unique columns)
+        if df.columns.duplicated().any():
+            seen_cols = set()
+            keep_cols = []
+            for col in df.columns:
+                if col not in seen_cols:
+                    seen_cols.add(col)
+                    keep_cols.append(col)
+            df = df[keep_cols].copy()
+
+        # V-Model fix 2: Ensure ts_col exists and is unique
+        if ts_col not in df.columns:
+            return df
+
         # 統一處理：先轉字串，移除時區偏移 (+HH:MM) 或 UTC 標誌 (Z)
         df[ts_col] = df[ts_col].astype(str).str.replace(r"[+-]\d{2}:\d{2}$", "", regex=True).str.replace("Z", "")
         # 強制轉為 datetime 且去時區 (naive)
         df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce").dt.tz_localize(None)
         df = df.dropna(subset=[ts_col])
-        
+
         if df.empty:
             return df
 
         # 改進：自動抓取資料中的最新日期
         latest_date = df[ts_col].dt.date.max()
         filtered_df = df[df[ts_col].dt.date == latest_date].copy()
-        
+
         # 確保排序
         filtered_df = filtered_df.sort_values(ts_col)
-        
-        # 過濾 fallback 假資料
+
+        # V-Model fix 3: 過濾 fallback 假資料 with full scalar safety
         for col in ["close", "price_mtx"]:
             if col in filtered_df.columns and len(filtered_df) > 1:
-                latest_val = filtered_df[col].iloc[-1]
-                if latest_val > 0:
-                    filtered_df = filtered_df[filtered_df[col] > latest_val * 0.5]
+                # Ensure scalar: use .iat[-1] which always returns scalar
+                latest_val = filtered_df[col].iat[-1]
+                # Convert to float safely
+                try:
+                    latest_val_float = float(latest_val)
+                except (TypeError, ValueError):
+                    continue  # Skip this column if can't convert
+                
+                if pd.notna(latest_val_float) and latest_val_float > 0:
+                    threshold = latest_val_float * 0.5
+                    # Use .gt() for safe Series comparison
+                    mask = filtered_df[col].gt(threshold)
+                    filtered_df = filtered_df[mask].copy()
         return filtered_df
     except Exception as e:
         st.error(f"資料過濾錯誤: {e}")
         return df
 
 # ── Chart builder (unified style) ──
-def make_price_score_chart(df, price_col, title, ts_col="timestamp"):
+def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=None):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
-    # 再次確保繪圖時使用的是小寫欄位名 (應對 f_df 與 o_df)
+    # V-Model fix: Convert to numpy arrays to avoid narwhals duplicate check
     p_col = price_col.lower() if price_col.lower() in df.columns else price_col
-    fig.add_trace(go.Scatter(x=df[ts_col], y=df[p_col], name=price_col, line=dict(width=1.5)), row=1, col=1)
+    
+    # 1. Price Line
+    fig.add_trace(go.Scatter(
+        x=df[ts_col].to_numpy(),
+        y=df[p_col].to_numpy(),
+        name=price_col,
+        line=dict(width=1.5, color="#1f77b4")
+    ), row=1, col=1)
+
+    # 2. Add Signal Markers if available
+    if signals is not None and not signals.empty:
+        # Buy signals (Green Triangles Up)
+        buys = signals[signals["action"].str.contains("BUY", case=False, na=False)]
+        if not buys.empty:
+            fig.add_trace(go.Scatter(
+                x=buys[ts_col],
+                y=buys["price"],
+                mode="markers",
+                marker=dict(symbol="triangle-up", size=12, color="#00cc66", line=dict(width=1, color="white")),
+                name="BUY"
+            ), row=1, col=1)
+        
+        # Sell signals (Red Triangles Down)
+        sells = signals[signals["action"].str.contains("SELL", case=False, na=False)]
+        if not sells.empty:
+            fig.add_trace(go.Scatter(
+                x=sells[ts_col],
+                y=sells["price"],
+                mode="markers",
+                marker=dict(symbol="triangle-down", size=12, color="#ff4444", line=dict(width=1, color="white")),
+                name="SELL"
+            ), row=1, col=1)
+            
+        # Exit signals (Orange Diamonds)
+        exits = signals[signals["action"].str.contains("EXIT|COVER", case=False, na=False)]
+        if not exits.empty:
+            fig.add_trace(go.Scatter(
+                x=exits[ts_col],
+                y=exits["price"],
+                mode="markers",
+                marker=dict(symbol="diamond", size=10, color="#ffa500", line=dict(width=1, color="white")),
+                name="EXIT"
+            ), row=1, col=1)
+
+    # 3. Score Bar Chart
     if "score" in df.columns:
-        colors = ["#00cc66" if s >= 0 else "#ff4444" for s in df["score"]]
-        fig.add_trace(go.Bar(x=df[ts_col], y=df["score"], name="Score", marker_color=colors), row=2, col=1)
+        scores = df["score"].to_numpy()
+        colors = ["#00cc66" if s >= 0 else "#ff4444" for s in scores]
+        fig.add_trace(go.Bar(
+            x=df[ts_col].to_numpy(),
+            y=scores,
+            name="Score",
+            marker_color=colors
+        ), row=2, col=1)
+    
     fig.update_layout(height=400, margin=dict(t=10, b=10, l=40, r=20), showlegend=False)
-    # 移除手動 range，讓 Plotly 自動縮放
     fig.update_yaxes(tickformat=",.0f")
     return fig
 
@@ -211,7 +290,14 @@ def make_pnl_chart(pnl_df, title):
     pnl_df["timestamp"] = pd.to_datetime(pnl_df["timestamp"], format="mixed")
     color = "#00cc66" if pnl_df["pnl"].iloc[-1] >= 0 else "#ff4444"
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=pnl_df["timestamp"], y=pnl_df["pnl"], fill="tozeroy", line=dict(color=color, width=1.5), name="PnL"))
+    # V-Model fix: Convert to numpy arrays to avoid narwhals duplicate check
+    fig.add_trace(go.Scatter(
+        x=pnl_df["timestamp"].to_numpy(),
+        y=pnl_df["pnl"].to_numpy(),
+        fill="tozeroy",
+        line=dict(color=color, width=1.5),
+        name="PnL"
+    ))
     fig.add_hline(y=0, line_dash="dash", line_color="gray", line_width=0.5)
     fig.update_layout(height=250, margin=dict(t=10, b=10, l=40, r=20), title_text=title, title_font_size=14, yaxis_tickformat=",.0f")
     return fig
@@ -221,6 +307,10 @@ def load_futures_indicators():
     def _read_and_standardize(path):
         try:
             df = pd.read_csv(path)
+            # V-Model fix: Immediate deduplication after reading
+            if df.columns.duplicated().any():
+                df = df.loc[:, ~df.columns.duplicated()].copy()
+            
             # 1. 處理 timestamp
             if "timestamp" not in df.columns:
                 if df.index.name == "timestamp" or df.index.name == "ts":
@@ -229,9 +319,16 @@ def load_futures_indicators():
                     df = df.rename(columns={"ts": "timestamp"})
                 else:
                     df = df.rename(columns={df.columns[0]: "timestamp"})
-            
-            # 2. 統一 OHLC 欄位為小寫
-            col_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+
+            # 2. V-Model fix: Remove case-insensitive duplicate columns BEFORE renaming
+            #    CSV files may have BOTH "Open,High,Low,Close" AND "open,high,low,close"
+            col_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume", "Amount": "amount"}
+            for upper, lower in col_map.items():
+                if upper in df.columns and lower in df.columns:
+                    # Drop the uppercase, keep lowercase (they have same data)
+                    df = df.drop(columns=[upper])
+
+            # 3. 統一 OHLC 欄位為小寫
             df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
             return df
         except Exception:
@@ -247,7 +344,18 @@ def load_futures_indicators():
                 all_dfs.append(df)
     
     if all_dfs:
-        merged = pd.concat(all_dfs).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+        # V-Model fix: Merge on common columns only, avoid duplicates
+        # Find columns that exist in ALL dataframes
+        common_cols = set(all_dfs[0].columns)
+        for df in all_dfs[1:]:
+            common_cols &= set(df.columns)
+        
+        # Keep only common columns + timestamp
+        if "timestamp" not in common_cols:
+            common_cols.add("timestamp")
+        
+        cleaned_dfs = [df[list(common_cols)] for df in all_dfs]
+        merged = pd.concat(cleaned_dfs).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
         return filter_today(merged)
     
     # 2. 備案：找目錄下最新的一個 CSV
@@ -284,7 +392,10 @@ def load_options_indicators():
             best = (f, f.stat().st_mtime)
     if best:
         try:
-            return filter_today(pd.read_csv(best[0]), ts_col="timestamp")
+            df = pd.read_csv(best[0])
+            if df.columns.duplicated().any():
+                df = df.loc[:, ~df.columns.duplicated()].copy()
+            return filter_today(df, ts_col="timestamp")
         except Exception:
             pass
     
@@ -334,6 +445,8 @@ def load_stock_indicators(ticker):
     if f.exists():
         try:
             df = pd.read_csv(f)
+            if df.columns.duplicated().any():
+                df = df.loc[:, ~df.columns.duplicated()].copy()
             if "ts" in df.columns:
                 df = df.rename(columns={"ts": "timestamp"})
             elif "Date" in df.columns:
@@ -382,9 +495,17 @@ with tab_overview:
         if f_df is not None and not f_df.empty:
             last = f_df.iloc[-1]
             c1, c2, c3 = st.columns(3)
-            # 兼容大小寫
+            # V-Model fix: Handle duplicate columns by taking first match
             cl_val = last.get('close') if 'close' in last else last.get('Close', 0)
+            if hasattr(cl_val, 'iloc'):
+                cl_val = float(cl_val.iloc[0]) if len(cl_val) > 0 else 0.0
+            else:
+                cl_val = float(cl_val or 0)
             sc_val = last.get('score', 0)
+            if hasattr(sc_val, 'iloc'):
+                sc_val = float(sc_val.iloc[0]) if len(sc_val) > 0 else 0.0
+            else:
+                sc_val = float(sc_val or 0)
             c1.metric("Close", f"{cl_val:.0f}")
             c2.metric("Score", f"{sc_val:.1f}")
             c3.metric("Bars", len(f_df))
@@ -398,8 +519,19 @@ with tab_overview:
         if o_df is not None and not o_df.empty:
             last = o_df.iloc[-1]
             c1, c2, c3 = st.columns(3)
-            c1.metric("MTX", f"{last.get('price_mtx', 0):.0f}")
-            c2.metric("Score", f"{last.get('score', 0):.1f}")
+            # V-Model fix: Handle duplicate columns by taking first match
+            mtx_val = last.get('price_mtx', 0)
+            if hasattr(mtx_val, 'iloc'):
+                mtx_val = float(mtx_val.iloc[0]) if len(mtx_val) > 0 else 0.0
+            else:
+                mtx_val = float(mtx_val or 0)
+            sc_val = last.get('score', 0)
+            if hasattr(sc_val, 'iloc'):
+                sc_val = float(sc_val.iloc[0]) if len(sc_val) > 0 else 0.0
+            else:
+                sc_val = float(sc_val or 0)
+            c1.metric("MTX", f"{mtx_val:.0f}")
+            c2.metric("Score", f"{sc_val:.1f}")
             c3.metric("Bars", len(o_df))
         else:
             st.info("無選擇權指標數據")
@@ -418,12 +550,22 @@ with tab_overview:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     has_data = False
     if f_df is not None and not f_df.empty:
-        # 兼容大小寫
+        # V-Model fix: Convert to numpy arrays to avoid narwhals duplicate check
         f_close = f_df["close"] if "close" in f_df.columns else f_df["Close"]
-        fig.add_trace(go.Scatter(x=f_df["timestamp"], y=f_close, name="TMF", line=dict(color="#1f77b4", width=1.5)), secondary_y=False)
+        fig.add_trace(go.Scatter(
+            x=f_df["timestamp"].to_numpy(),
+            y=f_close.to_numpy(),
+            name="TMF",
+            line=dict(color="#1f77b4", width=1.5)
+        ), secondary_y=False)
         has_data = True
     if o_df is not None and not o_df.empty and "price_mtx" in o_df.columns:
-        fig.add_trace(go.Scatter(x=o_df["timestamp"], y=o_df["price_mtx"], name="MTX (Options)", line=dict(color="#ff7f0e", width=1.5)), secondary_y=True)
+        fig.add_trace(go.Scatter(
+            x=o_df["timestamp"].to_numpy(),
+            y=o_df["price_mtx"].to_numpy(),
+            name="MTX (Options)",
+            line=dict(color="#ff7f0e", width=1.5)
+        ), secondary_y=True)
         has_data = True
     if has_data:
         fig.update_layout(height=350, margin=dict(t=10, b=10, l=40, r=20), legend=dict(orientation="h", y=1.02))
@@ -505,9 +647,17 @@ with tab_futures:
     if f_df is not None and not f_df.empty:
         last = f_df.iloc[-1]
         fc1, fc2, fc3, fc4 = st.columns(4)
-        # 兼容大小寫
+        # V-Model fix: Handle duplicate columns by taking first match
         cl_val = last.get('close') if 'close' in last else last.get('Close', 0)
+        if hasattr(cl_val, 'iloc'):
+            cl_val = float(cl_val.iloc[0]) if len(cl_val) > 0 else 0.0
+        else:
+            cl_val = float(cl_val or 0)
         sc_val = last.get('score', 0)
+        if hasattr(sc_val, 'iloc'):
+            sc_val = float(sc_val.iloc[0]) if len(sc_val) > 0 else 0.0
+        else:
+            sc_val = float(sc_val or 0)
         fc1.metric("Close", f"{cl_val:.0f}")
         fc2.metric("Score", f"{sc_val:.1f}")
         bull = last.get("bull_align", last.get("bullish_align", False))
@@ -515,7 +665,9 @@ with tab_futures:
         trend = "🟢 多頭排列" if bull else ("🔴 空頭排列" if bear else "⚪ 中性")
         fc3.metric("趨勢", trend)
         fc4.metric("Squeeze", "🔒 壓縮中" if last.get("sqz_on", False) else "🔓 已釋放")
-        st.plotly_chart(make_price_score_chart(f_df, "close", "TMF 價格 & Score"), use_container_width=True)
+        
+        ft = load_futures_trades()
+        st.plotly_chart(make_price_score_chart(f_df, "close", "TMF 價格 & Score", signals=ft), use_container_width=True)
         st.dataframe(f_df.tail(20), use_container_width=True)
     else:
         st.info("無數據")
@@ -537,14 +689,32 @@ with tab_options:
     if o_df is not None and not o_df.empty and "price_mtx" in o_df.columns:
         last = o_df.iloc[-1]
         oc1, oc2, oc3, oc4 = st.columns(4)
-        oc1.metric("MTX", f"{last.get('price_mtx', 0):.0f}")
-        oc2.metric("Score", f"{last.get('score', 0):.1f}")
+        # V-Model fix: Handle duplicate columns by taking first match
+        mtx_val = last.get('price_mtx', 0)
+        if hasattr(mtx_val, 'iloc'):
+            mtx_val = float(mtx_val.iloc[0]) if len(mtx_val) > 0 else 0.0
+        else:
+            mtx_val = float(mtx_val or 0)
+        sc_val = last.get('score', 0)
+        if hasattr(sc_val, 'iloc'):
+            sc_val = float(sc_val.iloc[0]) if len(sc_val) > 0 else 0.0
+        else:
+            sc_val = float(sc_val or 0)
+        oc1.metric("MTX", f"{mtx_val:.0f}")
+        oc2.metric("Score", f"{sc_val:.1f}")
         trend = last.get("mid_trend", "")
         trend_label = "🟢 BULL" if trend == "BULL" else ("🔴 BEAR" if trend == "BEAR" else "⚪ —")
         oc3.metric("趨勢", trend_label)
         iv = last.get("iv", 0)
         oc4.metric("IV", f"{iv*100:.1f}%" if iv and iv < 1 else f"{iv:.1f}%")
-        st.plotly_chart(make_price_score_chart(o_df, "price_mtx", "MTX 價格 & Score"), use_container_width=True)
+        
+        ol = load_options_ledger()
+        # Pre-process ledger to match signal expected format if not empty
+        sig_df = None
+        if ol is not None and not ol.empty:
+            sig_df = ol.rename(columns={"Timestamp": "timestamp", "Action": "action", "Price": "price"})
+            
+        st.plotly_chart(make_price_score_chart(o_df, "price_mtx", "MTX 價格 & Score", signals=sig_df), use_container_width=True)
         st.dataframe(o_df.tail(20), use_container_width=True)
     else:
         st.info("無數據")
@@ -645,9 +815,27 @@ with tab_settings:
     st.header("⚙️ 系統設定")
     
     # ── 1. 期貨 TMF 設定 ──
-    with st.expander("📈 期貨 TMF 設定", expanded=False):
+    with st.expander("📈 期貨 TMF 設定", expanded=True):
+        from backtest.signal_generator import ALL_STRATEGIES as FUT_STRATS
+        current_fut_strat = futures_cfg.get("active_strategy", "counter_vwap")
+        
         with st.form("futures_settings_form"):
             f_live_new = st.checkbox("啟用期貨實盤交易 (LIVE)", value=futures_cfg.get("live_trading", False))
+            
+            # 策略選擇
+            strat_options = list(FUT_STRATS.keys())
+            try:
+                strat_idx = strat_options.index(current_fut_strat)
+            except ValueError:
+                strat_idx = 0
+            
+            f_strat_new = st.selectbox("核心進場策略", strat_options, index=strat_idx, 
+                                       help="系統將使用此策略進行即時信號判斷。")
+            
+            # 顯示當前策略說明
+            st.info(f"💡 **策略說明**: {FUT_STRATS.get(f_strat_new, {}).get('desc', '無說明')}")
+            
+            st.divider()
             f_regime = st.selectbox("市場濾網 (Regime)", ["low", "mid", "high"], index=["low", "mid", "high"].index(futures_cfg.get("strategy", {}).get("regime_filter", "mid")))
             
             fc1, fc2 = st.columns(2)
@@ -656,17 +844,34 @@ with tab_settings:
             
             if st.form_submit_button("💾 儲存並重啟期貨模組"):
                 futures_cfg["live_trading"] = f_live_new
+                futures_cfg["active_strategy"] = f_strat_new
                 futures_cfg["strategy"]["regime_filter"] = f_regime
                 futures_cfg["strategy"]["entry_score"] = f_score
                 futures_cfg["risk_mgmt"]["atr_multiplier"] = f_atr
                 save_yaml(FUTURES_CFG_PATH, futures_cfg)
                 trigger_restart()
-                st.success("期貨設定已更新！")
+                st.success(f"期貨設定已更新！當前策略: {f_strat_new}")
+                st.rerun()
 
     # ── 2. 選擇權 TXO 設定 ──
     with st.expander("🔮 選擇權 TXO 設定", expanded=False):
+        # 假設選擇權也有類似的策略結構，目前從 config 讀取
+        current_opt_mode = options_cfg.get("mode", "V2")
+        
         with st.form("options_settings_form"):
             o_live_new = st.checkbox("啟用選擇權實盤交易 (LIVE)", value=options_cfg.get("live_trading", False))
+            
+            o_mode_new = st.selectbox("交易模式", ["V1", "V2", "V3"], index=["V1", "V2", "V3"].index(current_opt_mode),
+                                      help="V1: 當沖, V2: 波段(月選), V3: 夜盤當沖")
+            
+            # 模式說明
+            mode_desc = {
+                "V1": "近月合約當日沖銷，適合高波動行情。",
+                "V2": "月選合約波段持有 (≥14天 DTE)，降低時間價值衰減。",
+                "V3": "專攻夜盤波動，開盤進場收盤前出場。"
+            }
+            st.info(f"💡 **模式說明**: {mode_desc.get(o_mode_new)}")
+            
             o_score = st.slider("進場門檻 (Score)", 10, 100, value=options_cfg.get("entry_score", 80))
             
             oc1, oc2 = st.columns(2)
@@ -675,12 +880,14 @@ with tab_settings:
             
             if st.form_submit_button("💾 儲存並重啟選擇權模組"):
                 options_cfg["live_trading"] = o_live_new
+                options_cfg["mode"] = o_mode_new
                 options_cfg["entry_score"] = o_score
                 options_cfg["min_iv"] = o_min_iv
                 options_cfg["max_iv"] = o_max_iv
                 save_yaml(OPTIONS_CFG_PATH, options_cfg)
                 trigger_restart()
-                st.success("選擇權設定已更新！")
+                st.success(f"選擇權設定已更新！當前模式: {o_mode_new}")
+                st.rerun()
 
     # ── 3. 台股 Stocks 設定 ──
     with st.expander("🍎 台股 Stocks 設定", expanded=True):

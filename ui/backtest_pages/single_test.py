@@ -17,7 +17,16 @@ if str(ROOT) not in sys.path:
 from backtest.signal_generator import generate_signals # noqa: E402
 from strategies.futures.squeeze_futures.engine.vectorized import simulate_trades_vectorized, calculate_metrics # noqa: E402
 from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze # noqa: E402
-from strategies.futures.entry_strategies import STRATEGIES # noqa: E402
+from strategies.futures.entry_strategies import STRATEGIES as ALL_STRATEGIES
+from strategies.futures.elite_strategies import ELITE_STRATEGIES
+
+# Merge: elite strategies first, then remaining old ones
+ELITE_KEYS = set(ELITE_STRATEGIES.keys())
+STRATEGIES = {}
+STRATEGIES.update(ELITE_STRATEGIES)  # elite first
+for k, v in ALL_STRATEGIES.items():
+    if k not in ELITE_KEYS:
+        STRATEGIES[k] = v # noqa: E402
 
 from core.i18n import get_text # noqa: E402
 
@@ -171,7 +180,10 @@ def main():
             entry_score = st.slider(get_text("entry_score"), 0, 100, 20, 5)
             lots = st.number_input(get_text("lots"), 1, 10, 2)
             initial_bal = st.number_input(get_text("initial_bal"), 10000, 1000000, 100000)
-            intraday_mode = st.checkbox("🌙 日內模式", value=False)
+            intraday_mode = st.checkbox("🌙 日內模式", value=False,
+                help="勾選後，每個交易日的最後一根 K 線會強制平倉。")
+            expiry_mode = st.checkbox("📅 結算日平倉", value=True,
+                help="每月第三個週三（期貨結算日）強制平倉。")
 
             run_btn = st.form_submit_button(get_text("btn_run_single"), type="primary", use_container_width=True)
 
@@ -184,12 +196,6 @@ def main():
         if "Open" not in df.columns:
             st.error(f"Missing 'Open' column. Available columns: {list(df.columns)[:15]}...")
             st.stop()
-
-        # 日內模式選項
-        intraday_mode = st.checkbox("🌙 日內交易模式 (不持倉過夜)", value=False,
-            help="勾選後，每個交易日的最後一根 K 線會強制平倉。不勾選則允許持倉過夜（適合 Squeeze 趨勢策略）。")
-        expiry_mode = st.checkbox("📅 結算日強制平倉", value=True,
-            help="每月第三個週三（期貨結算日）強制平倉。建議開啟以避免交割風險。")
 
         cfg = {
             "strategy": {
@@ -210,12 +216,17 @@ def main():
             vwap_arr = df["vwap"].values if "vwap" in df.columns else np.zeros(len(df))
             atr_arr = df["atr"].values if "atr" in df.columns else np.full(len(df), 30.0)
 
+            # Ensure trading_day is available for EOD logic
+            if intraday_mode and "trading_day" not in df.columns:
+                from core.date_utils import get_trading_day
+                df["trading_day"] = get_trading_day(df.index)
+
             # Build end-of-day bars mask
             eod_bars = np.zeros(len(df), dtype=np.bool_)
             if intraday_mode and "trading_day" in df.columns:
-                for i in range(1, len(df)):
-                    if df["trading_day"].values[i] != df["trading_day"].values[i - 1]:
-                        eod_bars[i - 1] = True
+                # Use vectorized comparison for efficiency
+                td_values = df["trading_day"].values
+                eod_bars[:-1] = td_values[:-1] != td_values[1:]
                 eod_bars[-1] = True
 
             # Build expiry bars mask (3rd Wednesday of each month)
@@ -301,11 +312,22 @@ def main():
         st.subheader(get_text("trade_log"))
         trade_indices = np.where(pnl != 0)[0]
         if len(trade_indices) > 0:
+            # Define a robust mapping for exit reasons from engine codes
+            reason_map = {
+                0: "STOP",
+                1: "TP1",   # engine uses tp1_triggered internally but returns reasons for full exits
+                2: "VWAP",
+                3: "EXIT",
+                4: "EOD",
+                5: "EXP"
+            }
+            
             full_trades_df = pd.DataFrame({
                 "Time": df.index[trade_indices],
                 "PnL": pnl[trade_indices],
                 "Position": positions[trade_indices],
-                "Reason": [["ENTRY", "TP1", "EXIT", "STOP"][r] for r in reasons[trade_indices]]
+                "Reason": [reason_map.get(r, "ENTRY") if p > 0 else reason_map.get(r, "EXIT") 
+                           for r, p in zip(reasons[trade_indices], pnl[trade_indices])]
             })
             st.dataframe(full_trades_df, use_container_width=True)
 
