@@ -1,19 +1,19 @@
 """
-Elite Entry Strategies — 去蕪存菁版
-Only 3 proven profitable strategies based on 2026 Q1 backtest data.
+精英策略 — 去蕪存菁版
+從 2026 Q1 回測數據中只保留 3 個通過驗證的策略。
 
-ELITE #1: Counter-VWAP (PF=1.95, WR=40.7%, MaxDD=-7.2%)
-ELITE #2: PSAR Breakout (PF=1.42, WR=35%, MaxDD=-12%)
-ELITE #3: Volume-Filtered Squeeze (PF~1.3, estimated)
+ELITE #1: Counter-VWAP 反向均值回歸 (PF=1.95, 勝率 40.7%, 真實回測)
+ELITE #2: PSAR Breakout 趨勢突破 (PF=1.42, 文獻估計, 待回測)
+ELITE #3: Vol-Filtered Squeeze 量能擠壓 (PF=1.3, 理論估計)
 
-All eliminated strategies removed:
-❌ Night Short Only (PF=0.04, night session illiquidity)
-❌ Pure Breakout (PF=1.02, false breakouts everywhere)
-❌ VWAP Bounce (unstable signals)
-❌ Momentum Burst (Z-Score too sensitive)
-❌ Cumulative Delta (inaccurate delta estimation)
-❌ Volume Reversal (too few signals)
-❌ Gap Reversal (trend continuation after gaps)
+已剔除策略 (永不使用):
+❌ Night Short Only (PF=0.04, 夜盤流動性不足)
+❌ Pure Breakout (PF=1.02, 假突破太多)
+❌ VWAP Bounce (信號不穩定)
+❌ Momentum Burst (Z-Score 太敏感)
+❌ Cumulative Delta (Delta 估計不準)
+❌ Volume Reversal (信號太少)
+❌ Gap Reversal (跳空後趨勢延續)
 """
 import numpy as np
 import pandas as pd
@@ -22,12 +22,12 @@ import math
 
 def strategy_counter_vwap(state, cfg):
     """
-    ELITE #1: Counter-VWAP (核心策略)
+    ELITE #1: Counter-VWAP 反向均值回歸 (核心策略)
     
     台指期 5m 均值回歸特性強烈，Squeeze Fire 後突破失敗 = 反向進場點
     VWAP 出場是核心獲利機制，不是選項
     
-    回測數據: PF=1.95, WR=40.7%, MaxDD=-7.2%, PnL=+32,285
+    回測數據: PF=1.95, 勝率 40.7%, 最大虧損 -7.2%, 獲利 TWD +32,285
     
     進場邏輯:
     1. 偵測 Squeeze Fire (波動率壓縮釋放)
@@ -35,7 +35,7 @@ def strategy_counter_vwap(state, cfg):
     3. 失敗條件: 未創新高/低 + 動能反轉 + VWAP 拒絕
     4. 反向進場，VWAP 回歸出場
     
-    關鍵: exit_on_vwap MUST be True, otherwise catastrophically fails
+    關鍵: exit_on_vwap 必須為 True，否則 catastrophic fail
     """
     counter = cfg.get("strategy", {}).get("counter_mode", {})
     if not counter.get("enabled", False):
@@ -132,7 +132,7 @@ def strategy_counter_vwap(state, cfg):
 
 def strategy_psar_breakout(state, cfg):
     """
-    ELITE #2: PSAR Breakout (輔助趨勢策略)
+    ELITE #2: PSAR Breakout 趨勢突破 (輔助策略)
     
     PSAR 翻轉 + 50MA 趨勢過濾 + ADX 強度確認
     比純價格突破可靠，因為 PSAR 是動態支撐壓力
@@ -230,7 +230,7 @@ def strategy_psar_breakout(state, cfg):
 
 def strategy_vol_squeeze(state, cfg):
     """
-    ELITE #3: Volume-Filtered Squeeze (品質提升版)
+    ELITE #3: Vol-Filtered Squeeze 量能擠壓 (品質提升版)
     
     原始 Breakout PF=1.02 → 加入量能過濾後預估 PF=1.3+
     關鍵: 只交易「有成交量支撐」的突破，過濾假突破
@@ -304,11 +304,11 @@ def strategy_vol_squeeze(state, cfg):
     return None
 
 
-# ── Registry (精簡版: 只保留 3 個有效策略) ──
+# ── 精英策略註冊表 (只保留 3 個有效策略) ──
 ELITE_STRATEGIES = {
     "counter_vwap": {
         "func": strategy_counter_vwap,
-        "desc": "Counter-VWAP 核心策略。偵測 Squeeze 突破失敗後反向進場，VWAP 回歸出場。PF=1.95，唯一通過回測驗證的策略。適用盤整市場 (70% 時間)。",
+        "desc": "反向均歸。偵測 Squeeze 突破失敗後反向進場，VWAP 回歸出場。PF=1.95，唯一通過回測驗證的策略。適用盤整市場 (70% 時間)。",
         "elite_rank": 1,
         "backtest_pf": 1.95,
         "backtest_wr": 40.7,
@@ -317,23 +317,23 @@ ELITE_STRATEGIES = {
     },
     "psar_breakout": {
         "func": strategy_psar_breakout,
-        "desc": "PSAR 突破輔助策略。PSAR 翻轉 + 50MA 趨勢過濾 + ADX 強度確認。PF=1.42* (文獻估計, 待回測)。",
+        "desc": "PSAR 突破。PSAR 翻轉 + 50MA 趨勢過濾 + ADX 強度確認。PF=1.42* (文獻估計, 待回測)。",
         "elite_rank": 2,
         "backtest_pf": 1.42,
         "backtest_wr": 35.0,
         "backtest_maxdd": -12.0,
         "market_regime": "trending",
-        "backtest_status": "estimated",  # NOT actual backtest, pending real data
+        "backtest_status": "estimated",
     },
     "vol_squeeze": {
         "func": strategy_vol_squeeze,
-        "desc": "量能過濾 Squeeze。在突破瞬間要求成交量爆發 (1.5x 均量)，過濾假突破。PF=1.3* (理論估計)。",
+        "desc": "量能擠壓。突破瞬間要求成交量爆發 (1.5x 均量)，過濾假突破。PF=1.3* (理論估計)。",
         "elite_rank": 3,
         "backtest_pf": 1.3,
         "backtest_wr": 35.0,
         "backtest_maxdd": -15.0,
         "market_regime": "breakout",
-        "backtest_status": "theoretical",  # NOT actual backtest, theory only
+        "backtest_status": "theoretical",
     },
 }
 
@@ -352,10 +352,10 @@ def detect_market_regime(df_5m, lookback=20):
     """
     自動判斷當前市場狀態，決定使用哪個策略
     
-    Returns:
-        "ranging" → Counter-VWAP
-        "trending" → PSAR Breakout
-        "breakout" → Volume-Filtered Squeeze
+    回傳:
+        "ranging" → Counter-VWAP 反向均歸
+        "trending" → PSAR Breakout 趨勢突破
+        "breakout" → Vol-Filtered Squeeze 量能擠壓
     """
     if len(df_5m) < lookback:
         return "breakout"  # Default to breakout if not enough data
@@ -381,8 +381,8 @@ def select_strategy(df_5m):
     """
     根據市場狀態自動選擇最合適的策略
     
-    Returns:
-        (strategy_name, strategy_func)
+    回傳:
+        (策略名稱, 策略函數)
     """
     regime = detect_market_regime(df_5m)
     
