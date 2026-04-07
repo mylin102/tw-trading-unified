@@ -21,7 +21,7 @@ monitoring:
 risk_mgmt:
   atr_length: 14
   atr_multiplier: 1.5
-  break_even_pts: 50
+  break_even_pts: 100  # 浮盈 100pts 保本 (原 50 太早，R:R ≈ 1:1 才保本)
   exit_on_vwap: true
   ma_stop_length: 20
   ma_stop_multiplier: 1.0
@@ -30,9 +30,9 @@ risk_mgmt:
   skip_hours: []
   stop_loss_pts: 30
   time_filter_enabled: false
-  trailing_stop_distance_pts: 30
+  trailing_stop_distance_pts: 50  # 追蹤距離 50pts (鎖住 0.5R 利潤)
   trailing_stop_enabled: true
-  trailing_stop_trigger_pts: 60
+  trailing_stop_trigger_pts: 100  # 浮盈 100pts 啟動追蹤 (接近 1:1 R:R)
 strategy:
   auto_select: true
   active_strategy: counter_vwap
@@ -60,7 +60,7 @@ strategy:
   partial_exit:
     enabled: true
     tp1_lots: 1
-    tp1_pts: 100
+    tp1_pts: 200  # TP1 200pts (R:R ≈ 1:2, 原 100pts 比停損 108pts 還近!)
   weights:
     5m: 0.4
     15m: 0.4

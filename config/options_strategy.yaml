@@ -29,7 +29,7 @@ modes:
   V2:
     holding_mode: swing
     delivery_pref: monthly
-    tp1_pct: 0.3
+    tp1_pct: 0.5  # TP1 50% (R:R = 1:2.5, 原 30% 太低)
     bear_boost_pct: 0.8
     force_close_at_end: false
     trailing_stop_pct: 0.15
