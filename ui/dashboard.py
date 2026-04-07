@@ -816,7 +816,7 @@ with tab_settings:
     
     # ── 1. 期貨 TMF 設定 ──
     with st.expander("📈 期貨 TMF 設定", expanded=True):
-        from backtest.signal_generator import ALL_STRATEGIES as FUT_STRATS
+        from strategies.futures.elite_strategies import ELITE_STRATEGIES as FUT_STRATS
         current_fut_strat = futures_cfg.get("active_strategy", "counter_vwap")
         
         with st.form("futures_settings_form"):
