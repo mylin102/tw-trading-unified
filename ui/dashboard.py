@@ -813,7 +813,40 @@ with tab_stocks:
 # ════════════════════════════════════════
 with tab_settings:
     st.header("⚙️ 系統設定")
-    
+
+    # ── 0. 實盤就緒度檢查 ──
+    with st.expander("🚀 實盤就緒度檢查", expanded=True):
+        from core.live_readiness import check_all, get_readiness_summary
+        results = check_all()
+        status, passed, total = get_readiness_summary(results)
+
+        st.markdown(f"### {status} ({passed}/{total} 項通過)")
+
+        # Progress bar
+        pct = passed / total if total > 0 else 0
+        st.progress(pct)
+
+        # Detail table
+        for r in results:
+            icon = "✅" if r.passed else "❌"
+            st.caption(f"{icon} **{r.name}**: {r.value} — {r.detail}")
+
+        # Action recommendation
+        if passed == total:
+            st.success("🎉 所有檢查通過！可以考慮進入 Phase 2 小額實盤測試")
+            st.info("建議: 先用 1 口 TMF 測試 5 個交易日，設定每日最大虧損 2%")
+        elif passed >= total * 0.6:
+            remaining = total - passed
+            st.warning(f"⚠️ 還有 {remaining} 項未通過，建議繼續 Paper 觀察")
+            for r in results:
+                if not r.passed:
+                    st.caption(f"❌ 待解決: {r.name} (目前: {r.value})")
+        else:
+            st.error("❌ 多數檢查未通過，不建議開啟實盤交易")
+
+        st.divider()
+        st.caption("參考文件: `docs/LIVE_TRADING_GUIDE.md`")
+
     # ── 1. 期貨 TMF 設定 ──
     with st.expander("📈 期貨 TMF 設定", expanded=True):
         from strategies.futures.elite_strategies import ELITE_STRATEGIES as FUT_STRATS
