@@ -567,7 +567,15 @@ class ShioajiOptionsSmartMonitor:
         point_value = self.pricing_cfg.get("point_value", 50)
         qty = quantity or self.position or 1
         if "EXIT" in action and self.entry_price > 0:
-            pnl = round((price - self.entry_price) * point_value * qty, 0)
+            gross_pnl = (price - self.entry_price) * point_value * qty
+            # 扣除交易成本 (RULES.md Rule 4: PnL Must Include All Costs)
+            # 期權手續費: 券商佣金 ~20 TWD/口/邊, 交易所費用 ~5 TWD/口/邊
+            broker_fee = 20 * 2 * qty  # 進出各一次
+            exchange_fee = 5 * 2 * qty
+            # 交易稅: 期權約 0.1% 權利金
+            tax_rate = self.pricing_cfg.get("tax_rate", 0.001)
+            tax = (self.entry_price + price) * point_value * tax_rate * qty
+            pnl = round(gross_pnl - broker_fee - exchange_fee - tax, 0)
         # 從既有 ledger 累計 balance
         balance = 0
         if self.ledger_path.exists():
@@ -1201,11 +1209,11 @@ class ShioajiOptionsSmartMonitor:
             return False
 
         # 2. Trailing stop: 追蹤最高權利金，回落超過 trailing_stop_pct 就出場
-        #    浮盈 > 15% 即啟動 trailing，不需等 TP1
+        #    修正: 浮盈 > 8% 即啟動 trailing (原 15% 太高，多數情況沒保護)
         if exit_price > self.peak_premium:
             self.peak_premium = exit_price
         unrealized_pct = (self.peak_premium - self.entry_price) / self.entry_price if self.entry_price > 0 else 0
-        if self.trailing_stop_pct > 0 and (self.has_tp1_hit or unrealized_pct >= 0.15) and self.peak_premium > 0:
+        if self.trailing_stop_pct > 0 and (self.has_tp1_hit or unrealized_pct >= 0.08) and self.peak_premium > 0:
             trail_floor = self.peak_premium * (1 - self.trailing_stop_pct)
             if exit_price <= trail_floor:
                 reason = f"TRAILING_STOP peak={self.peak_premium:.1f} floor={trail_floor:.1f}"
@@ -1217,18 +1225,20 @@ class ShioajiOptionsSmartMonitor:
         
         signal_score = signal["score"] if signal else (self.last_signal["score"] if self.last_signal else 999)
 
-        # 3. Score reversal exit: 趨勢翻轉立刻出場
-        #    買 P 時 score 很負，翻正超過 entry_score → 趨勢反轉
-        #    買 C 時 score 很正，翻負超過 entry_score → 趨勢反轉
-        if self.active_side == "P" and signal_score >= self.entry_score:
-            reason = f"SCORE_REVERSAL score={signal_score:.1f} (was bearish, now bullish)"
+        # 3. Score reversal exit: 趨勢翻轉才出場
+        #    修正: 出場門檻比進場寬 (60% of entry_score)，防止 whipsaw
+        #    買 P 時 score 很負，翻正超過 reversal_threshold → 趨勢反轉
+        #    買 C 時 score 很正，翻負超過 reversal_threshold → 趨勢反轉
+        reversal_threshold = self.entry_score * 0.67  # 60 → 40
+        if self.active_side == "P" and signal_score >= reversal_threshold:
+            reason = f"SCORE_REVERSAL score={signal_score:.1f} >= {reversal_threshold:.0f} (was bearish, now bullish)"
             if self.live_trading:
                 self.exit_live_position("LIVE_REVERSAL_SUBMITTED", reason)
             else:
                 self.exit_paper_position("PAPER_REVERSAL_EXIT", exit_price, reason)
             return True
-        if self.active_side == "C" and signal_score <= -self.entry_score:
-            reason = f"SCORE_REVERSAL score={signal_score:.1f} (was bullish, now bearish)"
+        if self.active_side == "C" and signal_score <= -reversal_threshold:
+            reason = f"SCORE_REVERSAL score={signal_score:.1f} <= -{reversal_threshold:.0f} (was bullish, now bearish)"
             if self.live_trading:
                 self.exit_live_position("LIVE_REVERSAL_SUBMITTED", reason)
             else:
