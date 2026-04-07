@@ -385,10 +385,18 @@ class FuturesMonitor:
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs", "market_data")
         os.makedirs(log_dir, exist_ok=True)
         
-        # 修正：支援交易日邏輯，凌晨 5 點前算在前一天
+        # 交易日日期邏輯:
+        # 夜盤 15:00~23:59 → 算明天的交易日
+        # 凌晨 00:00~05:00 → 算前一天的交易日
+        # 日盤 08:45~13:45 → 算今天
         now = datetime.now()
         from datetime import timedelta
-        date_str = (now - timedelta(days=1)).strftime('%Y%m%d') if now.hour < 5 else now.strftime('%Y%m%d')
+        if now.hour < 5:
+            date_str = (now - timedelta(days=1)).strftime('%Y%m%d')
+        elif now.hour >= 15:
+            date_str = (now + timedelta(days=1)).strftime('%Y%m%d')
+        else:
+            date_str = now.strftime('%Y%m%d')
         
         tag = "_DRY" if self.dry_run else ("_LIVE" if self.live_trading else "_PAPER")
         path = os.path.join(log_dir, f"{self.ticker}_{date_str}{tag}_indicators.csv")
@@ -578,9 +586,26 @@ class FuturesMonitor:
         # Elite Strategy Auto-Select: 根據市場狀態動態選擇策略
         auto_select = self.STRATEGY.get("auto_select", False)
         if auto_select and self.counter_enabled:
-            # 使用 elite_strategies 的自動選擇邏輯
-            regime_name, strategy_fn = select_strategy(df_5m)
-            active = regime_name  # e.g., "counter_vwap", "psar_breakout", "vol_squeeze"
+            # auto_select 時, 直接使用監控器的 Counter 邏輯
+            # (因為 elite_strategies.py 的 counter_vwap 無法正確追蹤 fire 狀態)
+            use_counter = self.counter_enabled and (
+                self._is_ranging_regime(df_5m) if self.counter_auto_regime else True
+            )
+            if use_counter:
+                counter_signal = self._detect_squeeze_failure(last_5m, df_5m)
+                if counter_signal:
+                    atr_val = last_5m.get("atr", 0)
+                    counter_sl = atr_val * self.counter_atr_sl_mult if atr_val > 0 else stop_loss_pts
+                    lots = self.MGMT.get("lots_per_trade", 1)
+                    be = self.RISK.get("break_even_pts", 50)
+                    action = "BUY" if counter_signal == "COUNTER_BUY" else "SELL"
+                    if self.MGMT.get(f"allow_{'long' if action == 'BUY' else 'short'}", True):
+                        console.print(f"[bold magenta]🔄 COUNTER {action} SL={counter_sl:.1f}[/bold magenta]")
+                        self._execute_trade(action, last_price, timestamp, lots,
+                                            stop_loss=counter_sl, break_even_trigger=be, reason="COUNTER")
+                    return
+            # 非盤整時不使用 Counter, 目前只有 Counter-VWAP 可用
+            return
         else:
             # Counter mode (auto-regime override)
             use_counter = self.counter_enabled and (
