@@ -731,7 +731,10 @@ class ShioajiOptionsSmartMonitor:
             "iv": round(iv, 4),
             "delta": round(delta_val, 4),
             "gamma": round(gamma_val, 6),
-            "vega": round(vega_val, 4)
+            "vega": round(vega_val, 4),
+            # 進場關鍵欄位 (resolve_entry_side 需要)
+            "vwap": row_data.get("vwap", price_mtx),
+            "sqz_on": bool(row_data.get("sqz_on", False)),
         }
         if iv > 0:
             self.latest_iv = iv
