@@ -122,12 +122,30 @@ def load_backtest_data(source_type: str, date_str: str = None, _cache_version: s
         return df
 
     if source_type == "today":
-        today_str = datetime.now().strftime("%Y%m%d")
+        now = datetime.now()
+        today_str = now.strftime("%Y%m%d")
+        # 夜盤 15:00 後要讀明天的檔案
+        next_str = (now + __import__('datetime').timedelta(days=1)).strftime("%Y%m%d")
+        
+        dfs = []
         for tag in ["_PAPER", "_LIVE", ""]:
-            f = FUTURES_MKT / f"TMF_{today_str}{tag}_indicators.csv"
-            df = _read_csv(f)
-            if df is not None:
-                return df
+            # 日盤
+            f_day = FUTURES_MKT / f"TMF_{today_str}{tag}_indicators.csv"
+            df_day = _read_csv(f_day)
+            if df_day is not None:
+                dfs.append(df_day)
+            # 夜盤 (15:00 後讀明天的檔案)
+            if now.hour >= 15:
+                f_night = FUTURES_MKT / f"TMF_{next_str}{tag}_indicators.csv"
+                df_night = _read_csv(f_night)
+                if df_night is not None:
+                    # 只取 >=15:00 的資料避免重複
+                    df_night = df_night[df_night.index.hour >= 15]
+                    if not df_night.empty:
+                        dfs.append(df_night)
+        
+        if dfs:
+            return pd.concat(dfs).sort_index().drop_duplicates()
     elif source_type == "specific" and date_str:
         f = FUTURES_MKT / f"TMF_{date_str}_indicators.csv"
         # 兼容 _PAPER 或 _LIVE 後綴

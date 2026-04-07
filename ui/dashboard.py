@@ -335,13 +335,26 @@ def load_futures_indicators():
             return None
 
     # 1. 優先找今天所有可能的檔案並合併
+    #    夜盤 15:00 後也要讀明天的檔案
+    import datetime as dt
+    now = dt.datetime.now()
+    today_files = [DATE_STR]
+    if now.hour >= 15:
+        tomorrow = (now + dt.timedelta(days=1)).strftime("%Y%m%d")
+        today_files.append(tomorrow)
+    
     all_dfs = []
-    for tag in ["", "_LIVE", "_PAPER", "_DRY"]:
-        f = FUTURES_MKT / f"TMF_{DATE_STR}{tag}_indicators.csv"
-        if f.exists():
-            df = _read_and_standardize(f)
-            if df is not None:
-                all_dfs.append(df)
+    for date_part in today_files:
+        for tag in ["", "_LIVE", "_PAPER", "_DRY"]:
+            f = FUTURES_MKT / f"TMF_{date_part}{tag}_indicators.csv"
+            if f.exists():
+                df = _read_and_standardize(f)
+                if df is not None:
+                    # 如果是明天的檔案，只取 >=15:00 的夜盤資料
+                    if date_part != DATE_STR:
+                        df = df[df["timestamp"].dt.hour >= 15]
+                    if not df.empty:
+                        all_dfs.append(df)
     
     if all_dfs:
         # V-Model fix: Merge on common columns only, avoid duplicates
@@ -358,13 +371,18 @@ def load_futures_indicators():
         merged = pd.concat(cleaned_dfs).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
         return filter_today(merged)
     
-    # 2. 備案：找目錄下最新的一個 CSV
+    # 2. 備案：找目錄下最新的 CSV
     try:
         all_files = list(FUTURES_MKT.glob("TMF_*_indicators.csv"))
         if all_files:
+            # 找今天或明天日期的最新檔案
             latest_file = max(all_files, key=os.path.getmtime)
             df = _read_and_standardize(latest_file)
-            return filter_today(df) if df is not None else None
+            if df is not None and "timestamp" in df.columns:
+                # 如果是明天日期，只取 >=15:00
+                if DATE_STR not in str(latest_file) and now.hour >= 15:
+                    df = df[df["timestamp"].dt.hour >= 15]
+                return filter_today(df) if not df.empty else None
     except Exception:
         pass
     return None
