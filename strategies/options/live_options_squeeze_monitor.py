@@ -907,8 +907,9 @@ class ShioajiOptionsSmartMonitor:
             # V2 filters: require_fire and require_align
             if self.strategy_cfg.get("require_fire"):
                 row_fired = row.get("fired", False)
-                if not row_fired and abs(score) < 90:
-                    console.print(f"[dim]🚫 FIRE blocked: fired={row_fired} score={score:.1f}<90[/dim]")
+                fire_threshold = float(self.strategy_cfg.get("fire_score_threshold", 80))
+                if not row_fired and abs(score) < fire_threshold:
+                    console.print(f"[dim]🚫 FIRE blocked: fired={row_fired} score={score:.1f}<{fire_threshold:.0f}[/dim]")
                     side = None
             if side and self.strategy_cfg.get("require_align"):
                 if side == "C" and not row.get("bullish_align", False):

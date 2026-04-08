@@ -7,6 +7,7 @@ strategy:
   regime_filter: mid
   use_opening_logic: true
   require_fire: true
+  fire_score_threshold: 70  # fired=False 但 score≥70 也允許進場 (原 80 太高)
   require_align: true
   fallback_underlying_price: 33500
   monthly_delivery_min_days: 14

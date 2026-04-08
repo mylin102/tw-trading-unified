@@ -1004,6 +1004,10 @@ with tab_settings:
 
             o_score = st.slider("進場門檻 (Score)", 10, 100, value=options_cfg.get("entry_score", 80))
 
+            o_fire_thresh = st.slider("Fire 門檻 (強趨勢 score)", 10, 100,
+                                       value=int(options_cfg.get("strategy", {}).get("fire_score_threshold", 80)),
+                                       help="fired=False 但 score 超過此值也允許進場。降低此值可在趨勢行情中進場。")
+
             # ── 口數與持倉限制 ──
             st.markdown("##### 📦 口數與持倉限制")
             oc1, oc2 = st.columns(2)
@@ -1023,13 +1027,14 @@ with tab_settings:
                 options_cfg["live_trading"] = o_live_new
                 options_cfg["mode"] = o_mode_new
                 options_cfg["entry_score"] = o_score
+                options_cfg["strategy"]["fire_score_threshold"] = o_fire_thresh
                 options_cfg["min_iv"] = o_min_iv
                 options_cfg["max_iv"] = o_max_iv
                 options_cfg["risk_mgmt"]["lots_per_trade"] = o_lots
                 options_cfg["risk_mgmt"]["max_positions"] = o_max_pos
                 save_yaml(OPTIONS_CFG_PATH, options_cfg)
                 trigger_restart()
-                st.success(f"選擇權設定已更新！模式: {o_mode_new} | 口數: {o_lots} | 最大持倉: {o_max_pos}")
+                st.success(f"選擇權設定已更新！模式: {o_mode_new} | 口數: {o_lots} | 最大持倉: {o_max_pos} | Fire閾值: {o_fire_thresh}")
                 st.rerun()
 
     # ── 3. 台股 Stocks 設定 ──

@@ -57,6 +57,7 @@ class StockMonitor:
     def clean_unfilled_orders(self):
         """撤銷超過 5 分鐘未成交的掛單"""
         if self.dry_run: return
+        if not hasattr(self.api, 'trades'): return
         now = datetime.now()
         self.api.update_status()
         
@@ -150,6 +151,7 @@ class StockMonitor:
         active_watchlist = None  # 第二招：每日動態篩選
         
         while self.running:
+          try:
             now = datetime.now()
             if now.hour < 9 or (now.hour == 13 and now.minute > 30) or now.hour >= 14:
                 time.sleep(60); continue
@@ -173,7 +175,9 @@ class StockMonitor:
                 if not self.running: break
                 try:
                     contract = self.api.Contracts.Stocks[ticker]
-                    if contract.notice != sj.constant.StockNotice.Normal: continue
+                    # Skip suspended/warning stocks if notice attribute exists
+                    notice = getattr(contract, 'notice', None)
+                    if notice is not None and str(notice) != "Normal": continue
                     
                     # 1. 指標分析
                     start_date = (now - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
@@ -190,7 +194,7 @@ class StockMonitor:
                     # 代理指標邏輯
                     vol_avg = df['Volume'].rolling(20).mean()
                     is_it_buy = (df['Volume'] > vol_avg * 1.2) & (df['Close'] > df['Open']) & (df['Close'] > df['ma20'])
-                    df['it_buy_rolling_3_min'] = is_it_buy.rolling(3).min().astype(int)
+                    df['it_buy_rolling_3_min'] = is_it_buy.rolling(3).min().fillna(0).astype(int)
                     
                     df["name"] = contract.name
                     df.tail(60).to_csv(MKT_LOGS / f"STOCK_{ticker}_{self.date_str}_indicators.csv")
@@ -216,6 +220,10 @@ class StockMonitor:
                     console.print(f"[red]Error {ticker}: {e}[/red]")
             
             time.sleep(60)
+          except Exception as e:
+            # Thread-level safety net: log and continue instead of dying
+            console.print(f"[bold red]🍎 StockMonitor loop error (recovering): {e}[/bold red]")
+            time.sleep(30)
 
     def check_risk(self, ticker, curr_price):
         if ticker not in self.positions: return

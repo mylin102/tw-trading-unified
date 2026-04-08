@@ -203,12 +203,11 @@ def strategy_it_window_dressing(last_5m, df_5m, cfg):
     if not (close > ma20 > ma60):
         return None
 
-    # 2. 籌碼過濾 (連三買)
-    # 預期由 scanner 或 monitor 注入 daily it_buy 數據到最後一根 K 線
-    it_buy_3d_min = last_5m.get("it_buy_rolling_3_min", -1)
+    # 2. 籌碼過濾 (動能代理)
+    # 優化：不再要求絕對連三根，改為過去 5 根中有 2 根符合機構買盤特徵
+    it_hits = last_5m.get("it_buy_rolling_count", 0)
     
-    # 若數據尚未準備好 (例如盤中或指標未計算)，則不觸發
-    if it_buy_3d_min <= 0:
+    if it_hits < 2:
         return None
 
     sl = close * (1 - cfg.get("stop_loss_pct", 0.05)) # 波段策略給予較大空間 5%
