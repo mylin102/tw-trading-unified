@@ -1070,15 +1070,30 @@ with tab_stocks:
             s_df = load_stock_indicators(ticker)
             if s_df is not None and not s_df.empty:
                 last = s_df.iloc[-1]
+                close = float(last.get('close', last.get('Close', 0)))
+                vol = int(last.get('volume', last.get('Volume', 0)))
+                score = round(last.get('score', 0), 1)
+                bb_lower = float(last.get('bb_lower', 0))
+                sqz = "🔒 壓縮" if last.get("sqz_on", False) else "🔓 釋放"
+                
+                # 計算距布林帶下軌距離 (%)
+                if bb_lower > 0 and close > 0:
+                    dist_bb = ((close - bb_lower) / bb_lower) * 100
+                    if dist_bb < 0:
+                        dist_label = f"🔥 已跌破 {dist_bb:.1f}%"
+                    else:
+                        dist_label = f"{dist_bb:.1f}%"
+                else:
+                    dist_label = "—%"
+
                 monitor_data.append({
                     "代號": ticker,
                     "名稱": last.get("name", "Unknown"),
-                    "股價": last.get('close', last.get('Close', 0)),
-                    "成交量": f"{int(last.get('volume', last.get('Volume', 0))):,}",
-                    "Score": round(last.get('score', 0), 1),
-                    "Squeeze": "🔒 壓縮" if last.get("sqz_on", False) else "🔓 釋放",
-                    "投信動能": "🔥 連買" if last.get("it_buy_rolling_count", 0) >= 2 else "⚪ —",
-                    "200MA 趨勢": "🟢 向上" if last.get("ema_200_up", False) else "⚪ 走平/向下"
+                    "股價": close,
+                    "成交量": f"{vol:,}",
+                    "Score": score,
+                    "距BB下軌": dist_label,
+                    "壓縮": sqz,
                 })
         
         if monitor_data:
@@ -1086,15 +1101,12 @@ with tab_stocks:
             
             def style_monitor(row):
                 styles = [''] * len(row)
-                # Squeeze 顏色 (紅底白字代表壓縮)
-                if "🔒" in str(row["Squeeze"]):
-                    styles[5] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
-                # 投信顏色
-                if "🔥" in str(row["投信動能"]):
-                    styles[6] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
-                # 200MA 顏色 (綠色代表多頭向上)
-                if "🟢" in str(row["200MA 趨勢"]):
-                    styles[7] = 'color: #059669; font-weight: bold'
+                # 壓縮 (紅底白字)
+                if "🔒" in str(row.get("壓縮", "")):
+                    styles[6] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
+                # 距BB下軌 (綠底白字代表已跌破，進場訊號)
+                if "🔥" in str(row.get("距BB下軌", "")):
+                    styles[5] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
                 return styles
 
             st.dataframe(m_df.style.apply(style_monitor, axis=1), use_container_width=True, hide_index=True)
