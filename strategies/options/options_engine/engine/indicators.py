@@ -126,6 +126,74 @@ def calculate_futures_squeeze(
     return res
 
 
+def calculate_stock_squeeze(
+    df: pd.DataFrame,
+    bb_length=14,
+    bb_std=2.0,
+    kc_length=14,
+    kc_scalar=1.5,
+    ema_fast=20,
+    ema_slow=60,
+    ema_macro=200,
+    macd_fast=12,
+    macd_slow=26,
+    macd_signal=9,
+    kd_length=9,
+    adx_length=14,
+) -> pd.DataFrame:
+    """
+    Stock-specific squeeze indicator with MACD, KD, and ADX.
+    Wraps calculate_futures_squeeze and adds extra indicators needed by stock strategies.
+    """
+    res = calculate_futures_squeeze(
+        df, bb_length=bb_length, bb_std=bb_std, kc_length=kc_length,
+        kc_scalar=kc_scalar, ema_fast=ema_fast, ema_slow=ema_slow,
+        lookback=60, pb_buffer=1.002, ema_macro=ema_macro,
+    )
+
+    if len(df) < max(macd_slow, adx_length, kd_length):
+        return res
+
+    # MACD histogram
+    macd = df.ta.macd(close="Close", fast=macd_fast, slow=macd_slow, signal=macd_signal)
+    if macd is not None:
+        macd_cols = [c for c in macd.columns]
+        if len(macd_cols) >= 3:
+            res["macd"] = macd[macd_cols[0]]
+            res["macd_signal"] = macd[macd_cols[1]]
+            res["macd_hist"] = macd[macd_cols[2]]
+            res["macd_rising"] = res["macd_hist"] > res["macd_hist"].shift(1)
+
+    # KD (Stochastic Oscillator)
+    stoch = df.ta.stoch(close="Close", high="High", low="Low", k=kd_length, d=kd_length, smooth_k=3)
+    if stoch is not None:
+        stoch_cols = [c for c in stoch.columns]
+        if len(stoch_cols) >= 2:
+            res["k_val"] = stoch[stoch_cols[0]]
+            res["d_val"] = stoch[stoch_cols[1]]
+
+    # ADX
+    adx = df.ta.adx(high="High", low="Low", close="Close", length=adx_length)
+    if adx is not None:
+        adx_cols = [c for c in adx.columns]
+        if len(adx_cols) >= 1:
+            res["adx"] = adx[adx_cols[0]]
+            if len(adx_cols) >= 3:
+                res["dmp"] = adx[adx_cols[1]]
+                res["dmn"] = adx[adx_cols[2]]
+
+    # BB lower band (for mean reversion strategies)
+    bb = df.ta.bbands(close="Close", length=bb_length, std=bb_std)
+    if bb is not None:
+        bb_cols = [c for c in bb.columns]
+        if len(bb_cols) >= 3:
+            res["bb_lower"] = bb[bb_cols[0]]
+            res["bb_mid"] = bb[bb_cols[1]]
+            res["bb_upper"] = bb[bb_cols[2]]
+
+    return res
+
+
 def calculate_mtf_alignment(data_dict: dict[str, pd.DataFrame], weights=None) -> dict:
     if not data_dict:
         return {"score": 0, "is_aligned": False}

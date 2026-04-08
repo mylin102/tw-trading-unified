@@ -696,6 +696,9 @@ class ShioajiOptionsSmartMonitor:
     def record_signal_snapshot(self, signal):
         # 即使沒有訊號也用即時報價算 Greeks
         iv, delta_val, gamma_val, vega_val = 0.0, 0.0, 0.0, 0.0
+        # Fix: initialize strike/dte_years outside try block to prevent NameError
+        strike = 0.0
+        dte_years = 3.0 / 365.0
         price_mtx = float(self.market_data["MTX"]["close"])
         
         # 優先使用最新計算出的分數與趨勢，若 signal 存在則覆蓋

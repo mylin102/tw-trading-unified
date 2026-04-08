@@ -145,7 +145,85 @@ def strategy_ema_pullback(state, cfg):
     return None
 
 
+def strategy_fakeout_reversal(state, cfg):
+    """
+    假突破反向操作（Squeeze Fire Failure Counter-Trade）。
+    邏輯：壓縮釋放後價格未能延續方向，反向操作。
+    - Bullish fire (sqz_on→False + momentum>0) 但價格 < VWAP → 做空
+    - Bearish fire (sqz_on→False + momentum<0) 但價格 > VWAP → 做多
+
+    類似期貨 Counter-VWAP 策略，但適用於股票。
+    """
+    last = state["last_5m"]
+    df = state["df_5m"]
+    if len(df) < 5:
+        return None
+
+    prev = df.iloc[-2]
+    vwap = last.get("vwap", last["Close"])
+    close = last["Close"]
+    momentum = last.get("momentum", 0)
+    prev_momentum = prev.get("momentum", 0)
+
+    # 偵測 fire: 壓縮剛釋放
+    fired = last.get("fired", False)
+    was_squeezing = prev.get("sqz_on", False)
+    is_release = fired and was_squeezing
+
+    if not is_release:
+        return None
+
+    # Bullish fire 但價格在 VWAP 下方 → 反向做多 (bullish fire failure)
+    if momentum > 0 and prev_momentum <= 0 and close < vwap:
+        sl = close * (1 - cfg.get("stop_loss_pct", 0.03))
+        return {"action": "BUY", "reason": "FAKEOUT_BULL_FAILURE", "stop_loss": sl}
+
+    # Bearish fire 但價格在 VWAP 上方 → 反向做多 (bearish fire failure)
+    if momentum < 0 and prev_momentum >= 0 and close > vwap:
+        sl = close * (1 - cfg.get("stop_loss_pct", 0.03))
+        return {"action": "BUY", "reason": "FAKEOUT_BEAR_FAILURE", "stop_loss": sl}
+
+    return None
+
+
+def strategy_it_window_dressing(last_5m, df_5m, cfg):
+    """
+    投信作帳波段策略。
+    邏輯：投信連續 3 天買超 + 多頭排列 (Close > MA20 > MA60)。
+    這是一個典型的籌碼面濾網搭配趨勢面進場的策略。
+    """
+    if len(df_5m) < 60:  # 確保有足夠均線計算空間
+        return None
+
+    # 1. 均線過濾 (均線通常在 scanner 中預先算出)
+    ma20 = last_5m.get("ma20", 0)
+    ma60 = last_5m.get("ma60", 0)
+    close = last_5m["Close"] if "Close" in last_5m else last_5m.get("close", 0)
+
+    if not (close > ma20 > ma60):
+        return None
+
+    # 2. 籌碼過濾 (連三買)
+    # 預期由 scanner 或 monitor 注入 daily it_buy 數據到最後一根 K 線
+    it_buy_3d_min = last_5m.get("it_buy_rolling_3_min", -1)
+    
+    # 若數據尚未準備好 (例如盤中或指標未計算)，則不觸發
+    if it_buy_3d_min <= 0:
+        return None
+
+    sl = close * (1 - cfg.get("stop_loss_pct", 0.05)) # 波段策略給予較大空間 5%
+    return {
+        "action": "BUY", 
+        "reason": "IT_3DAY_BUY_BULLISH_ALIGN", 
+        "stop_loss": sl
+    }
+
+
 STOCK_STRATEGIES = {
+    "it_window_dressing": {
+        "func": strategy_it_window_dressing,
+        "desc": "投信作帳波段。投信連三買 + 多頭排列，跟隨法人建倉波段。"
+    },
     "mean_reversion": {
         "func": strategy_stock_mean_reversion,
         "desc": "均值回歸。跌破布林下軌時買入，捕捉超跌反彈。"
@@ -173,5 +251,9 @@ STOCK_STRATEGIES = {
     "ema_pullback": {
         "func": strategy_ema_pullback,
         "desc": "EMA回踩策略。多頭排列中回踩EMA slow，趨勢回調買入。"
+    },
+    "fakeout_reversal": {
+        "func": strategy_fakeout_reversal,
+        "desc": "假突破反向。Squeeze fire 失敗時反向操作，類似 Counter-VWAP。"
     },
 }

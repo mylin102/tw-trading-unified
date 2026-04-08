@@ -143,7 +143,7 @@ class StockMonitor:
         console.print(f"[bold green]🍎 StockMonitor [{self.mode_tag}] Started | Strategy: {self.strat_name} | Watchlist: {len(self.watchlist)}[/bold green]")
         
         from strategies.stocks.entry_strategies import STOCK_STRATEGIES
-        from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze
+        from strategies.options.options_engine.engine.indicators import calculate_stock_squeeze
         
         strat_fn = STOCK_STRATEGIES[self.strat_name]["func"]
         last_regime_check = 0
@@ -182,7 +182,16 @@ class StockMonitor:
                     if df.empty: continue
                     df["ts"] = pd.to_datetime(df["ts"]); df = df.set_index("ts")
                     df.columns = [c.capitalize() if c.lower() in ["open", "high", "low", "close", "volume"] else c for c in df.columns]
-                    df = calculate_futures_squeeze(df)
+                    df = calculate_stock_squeeze(df)
+                    
+                    # --- 新增：投信作帳指標 (實裝) ---
+                    df['ma20'] = df['Close'].rolling(20 * 12).mean()
+                    df['ma60'] = df['Close'].rolling(60 * 12).mean()
+                    # 代理指標邏輯
+                    vol_avg = df['Volume'].rolling(20).mean()
+                    is_it_buy = (df['Volume'] > vol_avg * 1.2) & (df['Close'] > df['Open']) & (df['Close'] > df['ma20'])
+                    df['it_buy_rolling_3_min'] = is_it_buy.rolling(3).min().astype(int)
+                    
                     df["name"] = contract.name
                     df.tail(60).to_csv(MKT_LOGS / f"STOCK_{ticker}_{self.date_str}_indicators.csv")
                     
@@ -190,7 +199,9 @@ class StockMonitor:
                     state = {
                         "last_5m": df.iloc[-1], "df_5m": df,
                         "scout_stage": self.positions.get(ticker, {}).get("stage", "IDLE"),
-                        "scout_entry_price": self.positions.get(ticker, {}).get("entry_price", 0.0)
+                        "scout_entry_price": self.positions.get(ticker, {}).get("entry_price", 0.0),
+                        "market_trend": "BEAR" if self.is_bear_market else "BULL",
+                        "is_bear_market": self.is_bear_market,
                     }
                     res = strat_fn(state, self.cfg)
                     

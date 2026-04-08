@@ -662,6 +662,7 @@ with tab_overview:
                     "成交量": f"{int(last.get('volume', last.get('Volume', 0))):,}",
                     "Score": round(last.get('score', 0), 1),
                     "Squeeze": "🔒 壓縮" if last.get("sqz_on", False) else "🔓 釋放",
+                    "投信": "🔥 連買" if last.get("it_buy_rolling_3_min", 0) > 0 else "⚪ —",
                     "200MA": "🟢 向上" if last.get("ema_200_up", False) else "⚪ 走平/向下"
                 })
         
@@ -671,8 +672,10 @@ with tab_overview:
                 styles = [''] * len(row)
                 if "🔒" in str(row["Squeeze"]):
                     styles[5] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
+                if "🔥" in str(row["投信"]):
+                    styles[6] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
                 if "🟢" in str(row["200MA"]):
-                    styles[6] = 'color: #059669; font-weight: bold'
+                    styles[7] = 'color: #059669; font-weight: bold'
                 return styles
             st.dataframe(ov_df.style.apply(style_overview, axis=1), use_container_width=True, hide_index=True)
         else:
@@ -827,6 +830,7 @@ with tab_stocks:
                     "成交量": f"{int(last.get('volume', last.get('Volume', 0))):,}",
                     "Score": round(last.get('score', 0), 1),
                     "Squeeze": "🔒 壓縮" if last.get("sqz_on", False) else "🔓 釋放",
+                    "投信動能": "🔥 連買" if last.get("it_buy_rolling_3_min", 0) > 0 else "⚪ —",
                     "200MA 趨勢": "🟢 向上" if last.get("ema_200_up", False) else "⚪ 走平/向下"
                 })
         
@@ -838,9 +842,12 @@ with tab_stocks:
                 # Squeeze 顏色 (紅底白字代表壓縮)
                 if "🔒" in str(row["Squeeze"]):
                     styles[5] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
+                # 投信顏色
+                if "🔥" in str(row["投信動能"]):
+                    styles[6] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
                 # 200MA 顏色 (綠色代表多頭向上)
                 if "🟢" in str(row["200MA 趨勢"]):
-                    styles[6] = 'color: #059669; font-weight: bold'
+                    styles[7] = 'color: #059669; font-weight: bold'
                 return styles
 
             st.dataframe(m_df.style.apply(style_monitor, axis=1), use_container_width=True, hide_index=True)
