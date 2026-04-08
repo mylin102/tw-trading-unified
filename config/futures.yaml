@@ -1,4 +1,5 @@
 active_strategy: spring_upthrust
+cooldown_bars: 5  # 冷卻 25 分鐘 (5 bars × 5min), 舊值 3→8 太極端
 execution:
   broker_fee_per_side: 20.0
   exchange_fee_per_side: 0.0
@@ -20,15 +21,16 @@ monitoring:
   poll_interval_secs: 30
 risk_mgmt:
   atr_length: 14
-  atr_multiplier: 1.5
+  atr_multiplier: 2.0  # 放寬停損 from 1.5→2.0, 避免被雜訊掃停
   break_even_pts: 100
   exit_on_vwap: true
+  exit_vwap_confirm_bars: 2  # 連續2根K線收在VWAP外才出場
   ma_stop_length: 20
   ma_stop_multiplier: 1.0
   ma_stop_ticks: 10
   ma_stop_type: below
   skip_hours: []
-  stop_loss_pts: 30
+  stop_loss_pts: 60  # 放寬固定停損 from 30→60 (ATR=0時使用)
   time_filter_enabled: false
   trailing_stop_distance_pts: 50
   trailing_stop_enabled: true

@@ -207,6 +207,18 @@ def save_trade(trade: dict, ticker: str = "TMF"):
     storage.save_trade(trade)
 
 
+def save_signal_audit(signal_record: dict, ticker: str = "TMF"):
+    """記錄信號審計軌跡（包含被拒絕的信號）"""
+    from pathlib import Path
+    log_dir = Path("logs/market_data")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.now().strftime("%Y%m%d")
+    audit_file = log_dir / f"{ticker}_{date_str}_signals_audit.csv"
+    header = not audit_file.exists()
+    df = pd.DataFrame([signal_record])
+    df.to_csv(audit_file, mode='a', index=False, header=header)
+
+
 if __name__ == "__main__":
     # 測試
     storage = DataStorage("TMF")

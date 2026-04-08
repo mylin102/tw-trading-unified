@@ -1,0 +1,103 @@
+# Phase 3 Optimized Config - Merged from Top 3 Phase 2 Variants
+# Generated: 2026-04-08
+# Baseline: futures.yaml
+# Optimizations:
+#   - cooldown_bars: 20 (from H5.3-Extended_Cooldown, 100% WR)
+#   - bb_length: 25 (from H1.2-Longer_EMA, 83.3% WR, 14.31x PF)
+#   - tp_pts: 300 (from H3.3-Late_30pts, 9.96x PF, 215,755 TWD)
+
+active_strategy: spring_upthrust
+
+# OPTIMIZED: Extended cooldown (trade less, trade better)
+# From H5.3-Extended_Cooldown: 100% win rate on 4 trades
+cooldown_bars: 20  # ← OPTIMIZED from 5 (4x more selective)
+
+execution:
+  broker_fee_per_side: 20.0
+  exchange_fee_per_side: 0.0
+  initial_balance: 40000  # Paper trading capital limit (RULES.md)
+  limit_offset_pts: 2.0
+  market_slippage_pts: 1.0
+  order_type: MKP
+  range_protection_pts: 3.0
+  tax_rate: 2.0e-05
+  tick_size: 1.0
+
+live_trading: false  # ← Paper trading mode (Phase 3 validation)
+
+monitoring:
+  callback:
+    buffer_size: 100
+    health_check_secs: 60
+    use_tick_data: false
+  data_mode: hybrid
+  pb_confirmation_bars: 12
+  poll_interval_secs: 30
+
+risk_mgmt:
+  atr_length: 14
+  atr_multiplier: 2.0
+  break_even_pts: 100
+  exit_on_vwap: true
+  exit_vwap_confirm_bars: 2
+  ma_stop_length: 20
+  ma_stop_multiplier: 1.0
+  ma_stop_ticks: 10
+  ma_stop_type: below
+  skip_hours: []
+  stop_loss_pts: 60  # Minimum 10pts (RULES.md compliance)
+  time_filter_enabled: false
+  trailing_stop_distance_pts: 50
+  trailing_stop_enabled: true
+  trailing_stop_trigger_pts: 100
+
+strategy:
+  auto_select: true
+  active_strategy: counter_vwap
+  
+  spring_upthrust:
+    bb_mult: 2.0
+    kc_mult: 1.0
+    atr_mult: 2.0
+    bb_length: 25  # ← OPTIMIZED from 20 (stronger confirmation, H1.2)
+    kc_length: 20
+  
+  counter_mode:
+    enabled: true
+    auto_regime: true
+    confirm_bars: 5
+    atr_sl_mult: 2.0
+    exit_on_vwap: true
+  
+  entry_score: 21
+  regime_filter: mid
+  length: 20  # Keep baseline for other indicators
+  use_squeeze: true
+  use_pullback: false
+  
+  partial_exit:
+    enabled: true
+    tp1_lots: 1
+    tp1_pts: 300  # ← OPTIMIZED from 200 (let winners run, H3.3)
+  
+  weights:
+    5m: 0.4
+    15m: 0.4
+    1h: 0.2
+
+trade_mgmt:
+  allow_long: true
+  allow_short: true
+  force_close_at_end: false
+  lots_per_trade: 1
+  max_positions: 1
+
+# ===== PHASE 3 VALIDATION TARGETS =====
+# Expected Results (based on Phase 2 hypothesis testing):
+#   Win Rate: 75-85% (vs baseline 62.5%)
+#   Profit Factor: 7-14x
+#   Total PnL: 120k-160k TWD (far exceeds 20% target of 8k)
+#   Trade Frequency: 4-8 trades/month (selective entry)
+#
+# Success Gate: 50+ trades, ≥20% cumulative profit → Phase 4 go-live
+# Duration: 1-2 weeks continuous paper trading

@@ -25,16 +25,31 @@ pkill -9 -f "main.py" 2>/dev/null  # Force kill if still alive (should not happe
 pkill -9 -f "streamlit" 2>/dev/null
 sleep 2  # Final buffer before restart
 
-# --- Layer 3: Launch Dashboards (哨兵監控台) ---
-tmux has-session -t unified 2>/dev/null || tmux new-session -d -s unified
-
+# --- Layer 3: Launch Dashboards (直接背景啟動，不依賴 tmux) ---
 # Trading Dashboard (Port 8500)
-tmux select-window -t unified:1 2>/dev/null || tmux new-window -t unified:1 -n "trading"
-tmux send-keys -t unified:1 "$PYTHON_EXEC -m streamlit run ui/dashboard.py --server.port 8500 --server.headless true" Enter
+nohup $PYTHON_EXEC -m streamlit run ui/dashboard.py \
+    --server.port 8500 --server.address 127.0.0.1 --server.headless true \
+    >> logs/dashboard.log 2>&1 &
+echo "[$(date)] Dashboard PID=$! started on :8500" >> logs/unified.log
 
 # Backtest Dashboard (Port 8501)
-tmux select-window -t unified:2 2>/dev/null || tmux new-window -t unified:2 -n "backtest"
-tmux send-keys -t unified:2 "$PYTHON_EXEC -m streamlit run ui/backtest_dashboard.py --server.port 8501 --server.headless true" Enter
+nohup $PYTHON_EXEC -m streamlit run ui/backtest_dashboard.py \
+    --server.port 8501 --server.address 127.0.0.1 --server.headless true \
+    >> logs/backtest_dashboard.log 2>&1 &
+echo "[$(date)] Backtest Dashboard PID=$! started on :8501" >> logs/unified.log
+
+# Health check: wait up to 15s for dashboards to bind
+for port in 8500 8501; do
+    for i in 1 2 3 4 5; do
+        lsof -i :$port -sTCP:LISTEN >/dev/null 2>&1 && break
+        sleep 3
+    done
+    if lsof -i :$port -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "[$(date)] ✅ Port $port is UP" >> logs/unified.log
+    else
+        echo "[$(date)] ❌ Port $port FAILED to start" >> logs/unified.log
+    fi
+done
 
 # --- Layer 4: Main Loop (核心自癒) ---
 while true; do

@@ -143,6 +143,15 @@ class FuturesMonitor:
         if self.dry_run:
             console.print("[yellow][FuturesMonitor] dry-run: skipping contract fetch[/yellow]")
             return True
+
+        # [Bug fix] 取得 TMF 合約，讓 on_tick 能正確接收 tick
+        try:
+            self.contract = self.api.Contracts.Futures.TMF.TMFR1
+            if self.contract:
+                console.print(f"[green][FuturesMonitor] TMF contract: {self.contract.code}[/green]")
+        except Exception:
+            pass
+
         # Pre-fill from kbars if available
         try:
             df = self.client.get_kline(self.ticker, interval="5m")
@@ -645,6 +654,10 @@ class FuturesMonitor:
         stop_loss_pts = self.RISK.get("stop_loss_pts", 60)
         if self.ATR_MULT > 0:
             atr_val = last_5m.get("atr", 0)
+            # [Bug fix] ATR 合理性上限：TMF 5m ATR 通常 30-150 點
+            atr_cap = 300
+            if atr_val > atr_cap:
+                atr_val = atr_cap
             if atr_val > 0:
                 stop_loss_pts = atr_val * self.ATR_MULT
 
@@ -652,17 +665,22 @@ class FuturesMonitor:
         min_score = self.STRATEGY.get("entry_score", 21)
         vol = last_5m.get("Volume", 0)
         avg_vol = df_5m["Volume"].rolling(20).mean().iloc[-1] if len(df_5m) >= 20 else 0
-        vol_filter_ok = (avg_vol == 0) or (vol >= avg_vol * 0.3)  # 成交量不低於平均30%
+
+        # 夜盤成交量門檻降低（夜盤量通常只有日盤 10-15%）
+        hhmm = int(datetime.now().strftime("%H%M"))
+        is_night = hhmm >= 1500 or hhmm < 500
+        vol_threshold = 0.1 if is_night else 0.3
+
+        vol_filter_ok = (avg_vol == 0) or (vol >= avg_vol * vol_threshold)
+        if not vol_filter_ok:
+            session_note = "夜盤" if is_night else "日盤"
+            console.print(f"[dim]⏸️ Volume too low ({session_note}): {vol:.0f} vs avg {avg_vol:.0f} (>{vol_threshold*100:.0f}%) — skipping entry[/dim]")
+            return
 
         if abs(score) < min_score and self.counter_enabled:
-            # Counter mode 有自己的信號系統，不擋
-            pass
+            pass  # Counter mode 有自己的信號系統，不擋
         elif abs(score) < min_score:
-            # 分數太低，不進場
-            return
-        if not vol_filter_ok:
-            console.print(f"[dim]⏸️ Volume too low: {vol:.0f} vs avg {avg_vol:.0f} — skipping entry[/dim]")
-            return
+            return  # 分數太低，不進場
 
         # ── Pluggable entry strategy (Elite Strategies) ──
         from strategies.futures.elite_strategies import get_strategy as get_elite_strategy
@@ -683,6 +701,7 @@ class FuturesMonitor:
             }, self.cfg)
             if spring_signal:
                 atr_val = last_5m.get("atr", 0)
+                if atr_val > 300: atr_val = 300  # [Bug fix] ATR cap
                 spring_sl = spring_signal.get("stop_loss", atr_val * 2.0 if atr_val > 0 else 60)
                 lots = self.MGMT.get("lots_per_trade", 1)
                 be = self.RISK.get("break_even_pts", 50)
@@ -701,6 +720,7 @@ class FuturesMonitor:
                 counter_signal = self._detect_squeeze_failure(last_5m, df_5m)
                 if counter_signal:
                     atr_val = last_5m.get("atr", 0)
+                    if atr_val > 300: atr_val = 300  # [Bug fix] ATR cap
                     counter_sl = atr_val * self.counter_atr_sl_mult if atr_val > 0 else stop_loss_pts
                     lots = self.MGMT.get("lots_per_trade", 1)
                     be = self.RISK.get("break_even_pts", 50)
@@ -721,6 +741,7 @@ class FuturesMonitor:
                 counter_signal = self._detect_squeeze_failure(last_5m, df_5m)
                 if counter_signal:
                     atr_val = last_5m.get("atr", 0)
+                    if atr_val > 300: atr_val = 300  # [Bug fix] ATR cap
                     counter_sl = atr_val * self.counter_atr_sl_mult if atr_val > 0 else stop_loss_pts
                     lots = self.MGMT.get("lots_per_trade", 2)
                     be = self.RISK.get("break_even_pts", 50)

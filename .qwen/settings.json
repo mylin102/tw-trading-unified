@@ -55,7 +55,9 @@
       "Bash(do *)",
       "Bash(done)",
       "Bash(xargs *)",
-      "Bash(date *)"
+      "Bash(date *)",
+      "Bash(test *)",
+      "Bash(chmod *)"
     ]
   },
   "$version": 3

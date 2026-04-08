@@ -1,0 +1,12 @@
+{
+  "total_trades": 8,
+  "winning_trades": 5.0,
+  "losing_trades": 3.0,
+  "win_rate": 0.625,
+  "total_pnl_twd": 192920.0914632172,
+  "avg_win_twd": 39959.2,
+  "avg_loss_twd": -2291.969512260932,
+  "profit_factor": 29.057396405316872,
+  "max_drawdown_twd": -6875.908536782779,
+  "avg_bars_held": 20.875
+}

@@ -213,17 +213,14 @@ def run_system(dry_run=False):
                 last_data_at = latest_tick
                 stagnation_warned = False  # tick 恢復，重置警告
             
-            # 哨兵邏輯：二次確認 — 5 分鐘警告，10 分鐘才重啟
-            from datetime import datetime
-            current_hhmm = datetime.now().strftime("%H%M")
-            if "0845" <= current_hhmm <= "1345":
-                stale_secs = now - last_data_at
-                if stale_secs > 600:
-                    console.print("[bold red]🚨 DATA STAGNATION CONFIRMED! No ticks for 10 mins. Force restarting...[/bold red]")
-                    break
-                elif stale_secs > 300 and not stagnation_warned:
-                    console.print("[bold yellow]⚠️ DATA WARNING: No ticks for 5 mins. Watching...[/bold yellow]")
-                    stagnation_warned = True
+            # 哨兵邏輯：二次確認 — 5 分鐘警告，10 分鐘才重啟（全天候監控，含夜盤）
+            stale_secs = now - last_data_at
+            if stale_secs > 600:
+                console.print("[bold red]🚨 DATA STAGNATION CONFIRMED! No ticks for 10 mins. Force restarting...[/bold red]")
+                break
+            elif stale_secs > 300 and not stagnation_warned:
+                console.print("[bold yellow]⚠️ DATA WARNING: No ticks for 5 mins. Watching...[/bold yellow]")
+                stagnation_warned = True
 
             if not st_t.is_alive():
                 console.print("[bold red]⚠️ Stock Monitor died! Futures/Options still active.[/bold red]")

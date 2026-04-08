@@ -184,6 +184,10 @@ def strategy_spring_upthrust(state, cfg):
     high = last_5m["High"]
     low = last_5m["Low"]
     atr_val = last_5m.get("atr", 0)
+    # [Bug fix] ATR 合理性上限：TMF 5m ATR 通常 30-150 點，超過 300 表示數據異常
+    atr_cap = 300
+    if atr_val > atr_cap:
+        atr_val = atr_cap
     stop_loss = atr_val * atr_mult if atr_val > 0 else 60
     
     # Spring (假跌破 → 做多)
