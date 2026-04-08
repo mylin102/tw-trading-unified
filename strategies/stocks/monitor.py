@@ -251,10 +251,10 @@ class StockMonitor:
         if action == "BUY":
             current_exposure = self.get_current_exposure()
             remaining = self.total_budget - current_exposure
-            if remaining <= 2000: return
+            if remaining <= 5000: return
 
             if qty_mode == "SCOUT":
-                scout_cap = min(remaining, max(2000, self.capital_per_trade * 0.1))
+                scout_cap = min(remaining, max(5000, self.capital_per_trade * 0.1))
                 qty = int(scout_cap // (price * 1.002))
             else:
                 # P0 fix: guard against missing position (race condition with check_risk)
