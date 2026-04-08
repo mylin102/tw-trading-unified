@@ -11,7 +11,7 @@ stocks:
   capital_per_trade: 20000
   entry_score: 20
   stop_loss_pct: 0.05
-  strategy: it_window_dressing
+  strategy: mean_reversion
   take_profit_pct: 0.15
   total_portfolio_budget: 100000
   trailing_stop_pct: 0.02

@@ -247,3 +247,38 @@ class TestDatetimeImportSafety:
         # Verify no local `from datetime import timedelta` inside functions
         local_imports = [l for l in lines if "from datetime import timedelta" in l]
         assert len(local_imports) == 0, f"Local timedelta import found: {local_imports}"
+
+
+# ════════════════════════════════════════
+# GSD: Silent PnL=0 Prevention
+# ════════════════════════════════════════
+
+class TestPnLSilentFailurePrevention:
+    """GSD fix: verify all exit action types are recognized for PnL calculation."""
+
+    def test_exit_keywords_in_log_trade(self):
+        """log_trade should recognize all exit action types."""
+        src = Path("strategies/options/live_options_squeeze_monitor.py").read_text()
+        # GSD whitelist
+        assert '"TRAP"' in src, "EOD_TRAP_FILL not recognized"
+        assert '"EOD"' in src, "EOD exits not recognized"
+        assert '"FILL"' in src, "FILL exits not recognized"
+
+    def test_cleared_retry_excluded_from_pnl(self):
+        """Cancelled/retried orders should NOT be treated as exits."""
+        src = Path("strategies/options/live_options_squeeze_monitor.py").read_text()
+        assert '"CLEARED"' in src
+        assert '"SUBMITTED"' in src
+
+    def test_theta_exit_bypasses_log_trade(self):
+        """ThetaGang exit should write PnL directly, not through log_trade."""
+        src = Path("strategies/options/live_options_squeeze_monitor.py").read_text()
+        # ThetaGang should write directly to ledger, not call log_trade
+        theta_exit_section = src[src.find("THETA_EXIT"):]
+        # Should have direct CSV write
+        assert "to_csv" in theta_exit_section[:500]
+
+    def test_exit_pnl_zero_warning(self):
+        """log_trade should warn when exit PnL is 0."""
+        src = Path("strategies/options/live_options_squeeze_monitor.py").read_text()
+        assert "Exit PnL=0" in src

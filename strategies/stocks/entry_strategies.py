@@ -186,12 +186,15 @@ def strategy_fakeout_reversal(state, cfg):
     return None
 
 
-def strategy_it_window_dressing(last_5m, df_5m, cfg):
+def strategy_it_window_dressing(state, cfg):
     """
     投信作帳波段策略。
     邏輯：投信連續 3 天買超 + 多頭排列 (Close > MA20 > MA60)。
     這是一個典型的籌碼面濾網搭配趨勢面進場的策略。
     """
+    last_5m = state["last_5m"]
+    df_5m = state["df_5m"]
+
     if len(df_5m) < 60:  # 確保有足夠均線計算空間
         return None
 
@@ -206,14 +209,14 @@ def strategy_it_window_dressing(last_5m, df_5m, cfg):
     # 2. 籌碼過濾 (動能代理)
     # 優化：不再要求絕對連三根，改為過去 5 根中有 2 根符合機構買盤特徵
     it_hits = last_5m.get("it_buy_rolling_count", 0)
-    
+
     if it_hits < 2:
         return None
 
     sl = close * (1 - cfg.get("stop_loss_pct", 0.05)) # 波段策略給予較大空間 5%
     return {
-        "action": "BUY", 
-        "reason": "IT_3DAY_BUY_BULLISH_ALIGN", 
+        "action": "BUY",
+        "reason": "IT_3DAY_BUY_BULLISH_ALIGN",
         "stop_loss": sl
     }
 

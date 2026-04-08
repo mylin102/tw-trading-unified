@@ -568,7 +568,17 @@ class ShioajiOptionsSmartMonitor:
         pnl = 0
         point_value = self.pricing_cfg.get("point_value", 50)
         qty = quantity or self.position or 1
-        if "EXIT" in action and self.entry_price > 0:
+
+        # GSD fix: Explicit whitelist of exit actions that require PnL calculation
+        # (instead of fragile substring matching)
+        exit_keywords = ["EXIT", "TP1", "TRAIL", "TIME", "REVERSAL", "TRAP", "EOD", "FILL"]
+        is_exit_action = any(kw in action for kw in exit_keywords) and self.entry_price > 0
+
+        # Skip non-trade entries (cancelled orders, retries, etc.)
+        if any(kw in action for kw in ["CLEARED", "RETRY", "SUBMITTED"]):
+            is_exit_action = False
+
+        if is_exit_action:
             gross_pnl = (price - self.entry_price) * point_value * qty
             # 扣除交易成本 (RULES.md Rule 4: PnL Must Include All Costs)
             # 期權手續費: 券商佣金 ~20 TWD/口/邊, 交易所費用 ~5 TWD/口/邊
@@ -578,6 +588,10 @@ class ShioajiOptionsSmartMonitor:
             tax_rate = self.pricing_cfg.get("tax_rate", 0.001)
             tax = (self.entry_price + price) * point_value * tax_rate * qty
             pnl = round(gross_pnl - broker_fee - exchange_fee - tax, 0)
+
+            # GSD validation: warn if exit PnL is 0 (indicates missing action keyword)
+            if pnl == 0 and "ENTRY" not in action:
+                console.print(f"[yellow]⚠️ Exit PnL=0 for {action} {side} @ {price} — check action keyword[/yellow]")
         # 從既有 ledger 累計 balance
         balance = 0
         if self.ledger_path.exists():
@@ -1403,8 +1417,16 @@ class ShioajiOptionsSmartMonitor:
                         exit_info = self._theta_gang.evaluate_exit(spot, iv, dte_years, squeeze_on)
                         if exit_info:
                             pos = self._theta_gang.close_position()
-                            self.log_trade("THETA_EXIT", pos.strategy, exit_info["pnl"],
-                                           f"{exit_info['reason']} credit={pos.net_credit:.0f} pnl={exit_info['pnl']:.0f}")
+                            # GSD fix: ThetaGang has pre-computed PnL, don't recalculate through log_trade
+                            theta_pnl = round(exit_info["pnl"], 0)
+                            theta_row = {
+                                "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "Mode": self.mode, "Action": "THETA_EXIT", "Side": pos.strategy,
+                                "Price": 0, "Quantity": pos.quantity,
+                                "PnL": theta_pnl, "Balance": theta_pnl,
+                                "Note": f"{exit_info['reason']} credit={pos.net_credit:.0f} pnl={exit_info['pnl']:.0f}",
+                            }
+                            pd.DataFrame([theta_row]).to_csv(self.ledger_path, mode='a', index=False, header=not self.ledger_path.exists())
                             console.print(f"[bold yellow]🔻 [ThetaGang] EXIT {pos.strategy}: {exit_info['reason']} PnL={exit_info['pnl']:.0f}[/bold yellow]")
                             self.cooldown_until = self.cooldown_bars
                         return
