@@ -10,6 +10,7 @@ TRANSLATIONS = {
         "nav_single": "Single Backtest",
         "nav_sweep": "Optimization Sweep",
         "nav_stock_lab": "Stock Portfolio Optimizer",
+        "nav_stock_leaderboard": "Stock Strategy Ranking",
         "nav_leaderboard": "Futures Strategy Ranking",
         "nav_history": "Trade History",
         
@@ -37,6 +38,7 @@ TRANSLATIONS = {
         "nav_single": "期貨單策略回測",
         "nav_sweep": "期貨參數掃描",
         "nav_stock_lab": "台股多標的優化",
+        "nav_stock_leaderboard": "台股策略排行榜",
         "nav_leaderboard": "期貨策略排行榜",
         "nav_history": "歷史交易總帳",
         

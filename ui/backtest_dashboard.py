@@ -100,6 +100,7 @@ pages = {
     ],
     get_text("nav_stocks"): [
         st.Page("backtest_pages/stock_optimizer.py", title=get_text("nav_stock_lab"), icon="🍎"),
+        st.Page("backtest_pages/stock_comparison.py", title=get_text("nav_stock_leaderboard"), icon="🏅"),
     ],
     get_text("nav_system"): [
         st.Page("backtest_pages/history.py", title=get_text("nav_history"), icon="📊"),
