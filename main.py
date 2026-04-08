@@ -200,8 +200,9 @@ def run_system(dry_run=False):
         startup_grace_until = time.time() + 60
         health_check_at = time.time() + HEALTH_INTERVAL
         
-        # [gstack Sentinel] 數據新鮮度追蹤
+        # [gstack Sentinel] 數據新鮮度追蹤 — 二次確認防誤判
         last_data_at = time.time()
+        stagnation_warned = False  # 第一次只警告，第二次才重啟
 
         while (ft.is_alive() and ot.is_alive()):
             now = time.time()
@@ -210,14 +211,19 @@ def run_system(dry_run=False):
             latest_tick = max(fm.last_tick_at, om.monitor.last_tick_at if hasattr(om.monitor, 'last_tick_at') else 0)
             if latest_tick > last_data_at:
                 last_data_at = latest_tick
+                stagnation_warned = False  # tick 恢復，重置警告
             
-            # 哨兵邏輯：開盤期間如果 5 分鐘數據沒跳，主動重啟
+            # 哨兵邏輯：二次確認 — 5 分鐘警告，10 分鐘才重啟
             from datetime import datetime
             current_hhmm = datetime.now().strftime("%H%M")
             if "0845" <= current_hhmm <= "1345":
-                if now - last_data_at > 300:
-                    console.print("[bold red]🚨 DATA STAGNATION DETECTED! No ticks for 5 mins. Force restarting...[/bold red]")
+                stale_secs = now - last_data_at
+                if stale_secs > 600:
+                    console.print("[bold red]🚨 DATA STAGNATION CONFIRMED! No ticks for 10 mins. Force restarting...[/bold red]")
                     break
+                elif stale_secs > 300 and not stagnation_warned:
+                    console.print("[bold yellow]⚠️ DATA WARNING: No ticks for 5 mins. Watching...[/bold yellow]")
+                    stagnation_warned = True
 
             if not st_t.is_alive():
                 console.print("[bold red]⚠️ Stock Monitor died! Futures/Options still active.[/bold red]")
