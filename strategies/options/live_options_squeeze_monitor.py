@@ -5,6 +5,7 @@ import pandas as pd
 import yaml
 import shioaji as sj
 from shioaji import TickFOPv1, Exchange
+from collections import deque
 import sys
 import os
 import threading
@@ -155,8 +156,11 @@ class ShioajiOptionsSmartMonitor:
             self.broker = None if self.dry_run else ShioajiBrokerAdapter(self.api, self.execution_cfg)
         
         self.market_data = {"MTX": {"close": 0.0, "bid": 0.0, "ask": 0.0}, "C": {"close": 0.0, "bid": 0.0, "ask": 0.0}, "P": {"close": 0.0, "bid": 0.0, "ask": 0.0}}
-        self._mtx_tick_bars = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        # [Wave 2 optimization] Use deque for O(1) append/trim instead of DataFrame.loc + slicing
+        self._mtx_tick_bars_deque = deque(maxlen=300)
+        self._mtx_tick_bars_cache = None  # Cached DF for indicator calculations
         self._current_mtx_bar = {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0, "ts": None}
+        self._last_mtx_bar_ts = None  # [Wave 1 optimization] Cache MTX bar timestamp to avoid repeated floor() calls
         self.active_contracts = {}
         self.lock = threading.Lock()
         self.last_tick_at = 0  # Sentinel: track tick freshness
@@ -524,14 +528,31 @@ class ShioajiOptionsSmartMonitor:
             if key == "MTX":
                 price = float(tick.close)
                 vol = int(getattr(tick, "volume", 1))
-                ts = pd.Timestamp(tick.datetime).floor("5min")
+                
+                # [Wave 1 optimization] Use integer time bucketing to avoid expensive pd.Timestamp().floor()
+                # Only compute Timestamp when bar changes (every 5 minutes)
+                tick_ts = pd.Timestamp(tick.datetime)
+                ts_int = int(tick_ts.timestamp() / 300) * 300
+                
                 bar = self._current_mtx_bar
-                if bar["ts"] is None or ts > bar["ts"]:
+                if bar["ts"] is None or ts_int != self._last_mtx_bar_ts:
                     if bar["ts"] is not None and bar["open"] > 0:
-                        self._mtx_tick_bars.loc[bar["ts"]] = [bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"]]
-                        if len(self._mtx_tick_bars) > 300:
-                            self._mtx_tick_bars = self._mtx_tick_bars.iloc[-300:]
+                        # [Wave 2 optimization] Use deque for O(1) append/trim instead of DataFrame.loc + slicing
+                        bar_dict = {
+                            "open": bar["open"],
+                            "high": bar["high"],
+                            "low": bar["low"],
+                            "close": bar["close"],
+                            "volume": bar["volume"],
+                            "ts": bar["ts"],
+                        }
+                        self._mtx_tick_bars_deque.append(bar_dict)
+                        # Invalidate DF cache (will be rebuilt lazily on next indicator calc)
+                        self._mtx_tick_bars_cache = None
+                    # Convert to Timestamp only when bar changes
+                    ts = pd.Timestamp(ts_int, unit='s')
                     bar["ts"] = ts
+                    self._last_mtx_bar_ts = ts_int
                     bar["open"] = bar["high"] = bar["low"] = bar["close"] = price
                     bar["volume"] = vol
                 else:
@@ -770,14 +791,29 @@ class ShioajiOptionsSmartMonitor:
             self.latest_iv = iv
         pd.DataFrame([row]).to_csv(self.indicator_log_path, mode="a", index=False, header=not self.indicator_log_path.exists())
 
+    def _get_mtx_tick_bars_df(self):
+        """[Wave 2 optimization] Lazy DF conversion: rebuild cache only on new bar."""
+        if self._mtx_tick_bars_cache is None and len(self._mtx_tick_bars_deque) > 0:
+            # Build DataFrame from deque
+            records = list(self._mtx_tick_bars_deque)
+            self._mtx_tick_bars_cache = pd.DataFrame({
+                "Open": [r["open"] for r in records],
+                "High": [r["high"] for r in records],
+                "Low": [r["low"] for r in records],
+                "Close": [r["close"] for r in records],
+                "Volume": [r["volume"] for r in records],
+            }, index=[r["ts"] for r in records])
+        return self._mtx_tick_bars_cache if self._mtx_tick_bars_cache is not None else pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
     def _fetch_today_futures_bars(self):
         if self.dry_run:
             return self._build_dry_run_bars()
         
         # 增加頻率限制：每 5 分鐘才調用一次 kbars API
+        # [Wave 2 optimization] Use lazy DF conversion from deque
         now_ts = time.time()
-        if now_ts - self.last_kbars_fetch_at < 300 and not self._mtx_tick_bars.empty:
-            return self._mtx_tick_bars.copy()
+        if now_ts - self.last_kbars_fetch_at < 300 and len(self._mtx_tick_bars_deque) > 0:
+            return self._get_mtx_tick_bars_df().copy()
 
         if not hasattr(self.api, "kbars") or "MTX" not in self.active_contracts:
             return None
@@ -815,15 +851,27 @@ class ShioajiOptionsSmartMonitor:
         try:
             bars = self._fetch_today_futures_bars()
             if bars is not None and len(bars) >= 30:
-                self._mtx_tick_bars = bars[["Open", "High", "Low", "Close", "Volume"]].copy()
-                console.print(f"[green]Pre-filled {len(self._mtx_tick_bars)} MTX bars from kbars[/green]")
+                # [Wave 2 optimization] Convert pre-filled bars to deque format
+                for _, row in bars[["Open", "High", "Low", "Close", "Volume"]].iterrows():
+                    bar_dict = {
+                        "open": row["Open"],
+                        "high": row["High"],
+                        "low": row["Low"],
+                        "close": row["Close"],
+                        "volume": row["Volume"],
+                        "ts": row.name,  # DataFrame index is timestamp
+                    }
+                    self._mtx_tick_bars_deque.append(bar_dict)
+                self._mtx_tick_bars_cache = bars[["Open", "High", "Low", "Close", "Volume"]].copy()
+                console.print(f"[green]Pre-filled {len(self._mtx_tick_bars_deque)} MTX bars from kbars[/green]")
         except Exception:
             pass
 
     def _get_tick_bars_fallback(self):
         """Fallback: use tick-built bars when kbars API is unavailable."""
-        if len(self._mtx_tick_bars) >= 30:
-            return self._mtx_tick_bars.copy()
+        df = self._get_mtx_tick_bars_df()
+        if len(df) >= 30:
+            return df.copy()
         return None
 
     def _build_dry_run_bars(self):
@@ -1030,22 +1078,28 @@ class ShioajiOptionsSmartMonitor:
 
     def submit_live_entry(self, side, signal, retries):
         if self.pending_entry is not None:
+            self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "pending_entry_exists")
             return
         if not self._dte_allows_entry(side, now=signal.get("timestamp")):
+            self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "dte_blocked")
             return
         if not self.spread_is_tradeable(side):
+            self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "spread_not_tradeable")
             return
         # 保證金檢查
         if not self._margin_sufficient():
             console.print(f"[red]⛔ 保證金不足，取消 {side} entry[/red]")
+            self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "margin_insufficient")
             return
         self.sync_contract_quotes()
         contract = self.active_contracts.get(side)
         if contract is None:
+            self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "no_contract_for_side")
             return
         trade = self.broker.place_entry_order(contract, self.paper_lots)
         if trade is None:
             console.print("[red]❌ 下單未執行（可能保證金不足）[/red]")
+            self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "place_order_returned_none")
             return
         self.pending_entry = {
             "side": side,
@@ -1056,6 +1110,7 @@ class ShioajiOptionsSmartMonitor:
             "trade": trade,
             "retries": retries,
         }
+        self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "")
         self.log_trade("LIVE_ENTRY_SUBMITTED", side, getattr(contract, "ask_price", 0.0), f"score={signal['score']:.1f} trade={self.broker.describe_trade(trade)}")
         if self.dry_run_live_orders:
             self._simulate_dry_run_fill(trade, contract, "Buy", self.paper_lots)
@@ -1081,16 +1136,19 @@ class ShioajiOptionsSmartMonitor:
 
     def submit_live_exit(self, action, note="", quantity=None, retries=0):
         if not self.active_side or self.position <= 0 or self.pending_exit_qty > 0:
+            self._audit_signal("LIVE_EXIT_SUBMITTED", self.active_side or "", {"action": action, "note": note}, "no_position_or_pending_exit")
             return
         self.sync_contract_quotes()
         contract = self.active_contracts.get(self.active_side)
         if contract is None:
+            self._audit_signal("LIVE_EXIT_SUBMITTED", self.active_side, {"action": action, "note": note}, "no_contract")
             return
         exit_quantity = min(self.position, quantity or self.position)
         bid = self.current_option_quote(self.active_side)["bid"]
         trade = self.broker.place_exit_order(contract, exit_quantity, bid_price=bid)
         if trade is None:
             console.print("[red]❌ 出場下單未執行[/red]")
+            self._audit_signal("LIVE_EXIT_SUBMITTED", self.active_side, {"action": action, "note": note}, "place_order_returned_none")
             return
         self.pending_exit_qty = exit_quantity
         self.pending_exit_reason = action
@@ -1100,9 +1158,30 @@ class ShioajiOptionsSmartMonitor:
             "quantity": exit_quantity,
             "retries": retries,
         }
+        self._audit_signal("LIVE_EXIT_SUBMITTED", self.active_side, {"action": action, "note": note}, "")
         self.log_trade(action, self.active_side, self.current_option_quote(self.active_side)["bid"], f"{note} trade={self.broker.describe_trade(trade)}".strip())
         if self.dry_run_live_orders:
             self._simulate_dry_run_fill(trade, contract, "Sell", exit_quantity)
+
+    def _audit_signal(self, signal_type, side, signal_data, rejection_reason):
+        """記錄信號審計軌跡到 CSV（與期貨系統共用格式）"""
+        from pathlib import Path
+        log_dir = Path("logs/market_data")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        date_str = datetime.datetime.now().strftime("%Y%m%d")
+        audit_file = log_dir / f"MTX_{date_str}_signals_audit.csv"
+        ts = signal_data.get("timestamp", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")) if isinstance(signal_data, dict) else datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        score = signal_data.get("score", 0) if isinstance(signal_data, dict) else 0
+        header = not audit_file.exists()
+        record = {
+            "timestamp": ts,
+            "signal": signal_type,
+            "side": side,
+            "score": score,
+            "rejection": rejection_reason,
+            "note": signal_data.get("note", "") if isinstance(signal_data, dict) else "",
+        }
+        pd.DataFrame([record]).to_csv(audit_file, mode='a', index=False, header=header)
 
     def _simulate_dry_run_fill(self, trade, contract, action, quantity):
         msg = {

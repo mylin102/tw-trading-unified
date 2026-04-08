@@ -7,6 +7,7 @@ import os
 import time
 import yaml
 import traceback
+from collections import deque
 from datetime import datetime, timedelta
 import pandas as pd
 from rich.console import Console
@@ -80,7 +81,7 @@ class FuturesMonitor:
             "pb_buffer": self.PB.get("buffer", 1.002),
         }
         self.live_trading = self.cfg.get("live_trading", False)
-        self.cooldown_bars = self.STRATEGY.get("cooldown_bars", 3)
+        self.cooldown_bars = self.cfg.get("cooldown_bars", self.STRATEGY.get("cooldown_bars", 8))
         self.cooldown_until = 0
 
         # Squeeze Failure Counter mode
@@ -96,6 +97,7 @@ class FuturesMonitor:
         self._fire_high = 0.0
         self._fire_low = 0.0
         self._bar_counter = 0        # monotonic bar counter for fire tracking
+        self._vwap_violation_bars = 0  # VWAP exit debounce counter
         self.last_tick_at = time.time()  # [gstack] 數據新鮮度追蹤
 
         # Trader
@@ -111,14 +113,31 @@ class FuturesMonitor:
         self.last_processed_bar = None
         self._last_entry_reason = None
         self._safety_stop_trade = None  # Exchange-side safety stop order
+        self._last_bar_ts = None  # [Wave 1 optimization] Cache bar timestamp to avoid repeated floor() calls
 
     def _load_config(self, path):
         with open(path, encoding="utf-8") as f:
             return yaml.safe_load(f)
 
+    def _get_tick_bars_df(self):
+        """[Wave 2 optimization] Lazy DF conversion: rebuild cache only on new bar."""
+        if self._tick_bars_cache is None and len(self._tick_bars_deque) > 0:
+            # Build DataFrame from deque
+            records = list(self._tick_bars_deque)
+            self._tick_bars_cache = pd.DataFrame({
+                "Open": [r["open"] for r in records],
+                "High": [r["high"] for r in records],
+                "Low": [r["low"] for r in records],
+                "Close": [r["close"] for r in records],
+                "Volume": [r["volume"] for r in records],
+            }, index=[r["ts"] for r in records])
+        return self._tick_bars_cache if self._tick_bars_cache is not None else pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
     def setup(self):
         # Tick-based bar builder (Initialize always to avoid AttributeError in dry_run)
-        self._tick_bars = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        # [Wave 2 optimization] Use deque for O(1) append/trim instead of DataFrame.loc + slicing
+        self._tick_bars_deque = deque(maxlen=300)
+        self._tick_bars_cache = None  # Cached DF for indicator calculations
         self._current_bar = {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0, "ts": None}
 
         if self.dry_run:
@@ -128,8 +147,19 @@ class FuturesMonitor:
         try:
             df = self.client.get_kline(self.ticker, interval="5m")
             if not df.empty:
-                self._tick_bars = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-                console.print(f"[green][FuturesMonitor] pre-filled {len(self._tick_bars)} bars from kbars[/green]")
+                # Convert pre-filled bars to deque format
+                for _, row in df[["Open", "High", "Low", "Close", "Volume"]].iterrows():
+                    bar_dict = {
+                        "open": row["Open"],
+                        "high": row["High"],
+                        "low": row["Low"],
+                        "close": row["Close"],
+                        "volume": row["Volume"],
+                        "ts": row.name,  # DataFrame index is timestamp
+                    }
+                    self._tick_bars_deque.append(bar_dict)
+                self._tick_bars_cache = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+                console.print(f"[green][FuturesMonitor] pre-filled {len(self._tick_bars_deque)} bars from kbars[/green]")
         except Exception:
             pass
         return True
@@ -143,16 +173,31 @@ class FuturesMonitor:
         # Build 5m bars from ticks
         price = float(tick.close)
         vol = int(getattr(tick, "volume", 1))
-        ts = pd.Timestamp(tick.datetime).floor("5min")
+        
+        # [Wave 1 optimization] Use integer time bucketing to avoid expensive pd.Timestamp().floor()
+        # Only compute Timestamp when bar changes (every 5 minutes)
+        tick_ts = pd.Timestamp(tick.datetime)
+        ts_int = int(tick_ts.timestamp() / 300) * 300
+        
         bar = self._current_bar
-        if bar["ts"] is None or ts > bar["ts"]:
-            # Save previous bar
+        if bar["ts"] is None or ts_int != self._last_bar_ts:
+            # Save previous bar to deque (O(1) append, auto-trims to maxlen=300)
             if bar["ts"] is not None and bar["open"] > 0:
-                self._tick_bars.loc[bar["ts"]] = [bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"]]
-                # Keep last 300 bars (~25 hours)
-                if len(self._tick_bars) > 300:
-                    self._tick_bars = self._tick_bars.iloc[-300:]
+                bar_dict = {
+                    "open": bar["open"],
+                    "high": bar["high"],
+                    "low": bar["low"],
+                    "close": bar["close"],
+                    "volume": bar["volume"],
+                    "ts": bar["ts"],
+                }
+                self._tick_bars_deque.append(bar_dict)
+                # Invalidate DF cache (will be rebuilt lazily on next indicator calc)
+                self._tick_bars_cache = None
+            # Convert to Timestamp only when bar changes
+            ts = pd.Timestamp(ts_int, unit='s')
             bar["ts"] = ts
+            self._last_bar_ts = ts_int
             bar["open"] = bar["high"] = bar["low"] = bar["close"] = price
             bar["volume"] = vol
         else:
@@ -237,6 +282,8 @@ class FuturesMonitor:
             action = "Sell"
         elif signal in ("EXIT", "PARTIAL_EXIT"):
             if self.trader.position == 0:
+                from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
+                save_signal_audit({"timestamp": ts, "signal": signal, "price": price, "reason": reason or "", "rejection": "no_position", "lots": lots})
                 return None
             action = "Sell" if self.trader.position > 0 else "Buy"
 
@@ -246,6 +293,8 @@ class FuturesMonitor:
             if signal in ("BUY", "SELL"):
                 if not self._margin_sufficient():
                     console.print(f"[red][FuturesMonitor] ⛔ 保證金不足，取消 {signal}[/red]")
+                    from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
+                    save_signal_audit({"timestamp": ts, "signal": signal, "price": price, "reason": reason or "", "rejection": "margin_insufficient", "lots": lots})
                     return None
             # 出場前先刪 safety stop，避免庫存不足
             if signal in ("EXIT", "PARTIAL_EXIT"):
@@ -253,11 +302,14 @@ class FuturesMonitor:
             trade = self.client.place_order(self.contract, action=action, quantity=lots)
             if trade is None:
                 console.print(f"[red][FuturesMonitor] Live order failed: {signal} {lots}[/red]")
+                from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
+                save_signal_audit({"timestamp": ts, "signal": signal, "price": price, "reason": reason or "", "rejection": "api_order_failed", "lots": lots})
                 return None
 
         # 計算 PnL（出場時，含手續費+稅金）
         pnl_pts = 0
         pnl_cash = 0
+        friction_cost = 0
         direction = ""
         if signal == "BUY":
             direction = "LONG"
@@ -271,7 +323,8 @@ class FuturesMonitor:
             fee = self.trader.fee_per_side * 2 * lots
             exch_fee = self.trader.exchange_fee_per_side * 2 * lots
             tax = (self.trader.entry_price + price) * self.trader.point_value * self.trader.tax_rate * lots
-            pnl_cash = gross - fee - exch_fee - tax
+            friction_cost = fee + exch_fee + tax
+            pnl_cash = gross - friction_cost
 
         if signal in ("BUY", "SELL"):
             self._last_entry_reason = reason
@@ -281,12 +334,19 @@ class FuturesMonitor:
             stop_loss=stop_loss, break_even_trigger=break_even_trigger, exit_reason=reason,
         )
         if not result:
+            from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
+            save_signal_audit({"timestamp": ts, "signal": signal, "price": price, "reason": reason or "", "rejection": "papertrader_rejected", "lots": lots})
             return None
+        # 信號成功執行，記錄審計軌跡
+        from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
+        save_signal_audit({"timestamp": ts, "signal": signal, "price": price, "reason": reason or "", "rejection": "", "lots": lots, "result": result})
         save_trade({"type": signal, "timestamp": ts, "price": price, "lots": lots,
                     "direction": direction, "pnl_pts": round(pnl_pts, 1),
-                    "pnl_cash": round(pnl_cash, 0), "reason": reason or ""})
+                    "pnl_cash": round(pnl_cash, 0), "friction_cost": round(friction_cost, 0),
+                    "reason": reason or ""})
         d = "🟢 BUY" if signal == "BUY" else "🔴 SELL" if signal == "SELL" else "⚪ EXIT"
-        console.print(f"[bold green][FuturesMonitor] [{ts}] {d} {lots} lots @ {price:.0f}  {result}[/bold green]")
+        friction_note = f" (摩擦成本 {friction_cost:.0f} TWD)" if friction_cost > 0 else ""
+        console.print(f"[bold green][FuturesMonitor] [{ts}] {d} {lots} lots @ {price:.0f}  {result}{friction_note}[/bold green]")
         # Safety stop management
         if live_ready:
             if signal in ("BUY", "SELL"):
@@ -470,8 +530,9 @@ class FuturesMonitor:
         processed = {}
         if not self.dry_run:
             # [gstack] 降低累積門檻，從 100 降到 30，只要能算出指標就顯示
-            if hasattr(self, "_tick_bars") and len(self._tick_bars) >= 30:
-                df_base = self._tick_bars.copy()
+            # [Wave 2 optimization] Use lazy DF conversion from deque
+            df_base = self._get_tick_bars_df()
+            if len(df_base) >= 30:
                 processed["5m"] = calculate_futures_squeeze(df_base, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
                 
                 # Resample for higher timeframes
@@ -551,8 +612,21 @@ class FuturesMonitor:
             stop_msg = self._check_stop_loss(timestamp, last_price)
             if not stop_msg:
                 vwap_exit = self.RISK.get("exit_on_vwap") or (self.counter_exit_vwap and self._last_entry_reason == "COUNTER")
-                if vwap_exit and ((self.trader.position > 0 and last_price < vwap) or (self.trader.position < 0 and last_price > vwap)):
-                    stop_msg = self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason="VWAP")
+                vwap_confirm_needed = self.RISK.get("exit_vwap_confirm_bars", 0)
+                if vwap_exit:
+                    # Check if price is beyond VWAP
+                    vwap_violated = (
+                        (self.trader.position > 0 and last_price < vwap) or
+                        (self.trader.position < 0 and last_price > vwap)
+                    )
+                    if vwap_violated:
+                        self._vwap_violation_bars += 1
+                    else:
+                        self._vwap_violation_bars = 0  # Reset if price returns to favorable side
+
+                    if self._vwap_violation_bars >= vwap_confirm_needed:
+                        stop_msg = self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason="VWAP")
+                        self._vwap_violation_bars = 0  # Reset after exit
             if stop_msg:
                 self.has_tp1_hit = False
                 self.cooldown_until = self.cooldown_bars # 觸發停損/平倉後進入冷卻
@@ -573,6 +647,22 @@ class FuturesMonitor:
             atr_val = last_5m.get("atr", 0)
             if atr_val > 0:
                 stop_loss_pts = atr_val * self.ATR_MULT
+
+        # ── 進場品質過濾 ──
+        min_score = self.STRATEGY.get("entry_score", 21)
+        vol = last_5m.get("Volume", 0)
+        avg_vol = df_5m["Volume"].rolling(20).mean().iloc[-1] if len(df_5m) >= 20 else 0
+        vol_filter_ok = (avg_vol == 0) or (vol >= avg_vol * 0.3)  # 成交量不低於平均30%
+
+        if abs(score) < min_score and self.counter_enabled:
+            # Counter mode 有自己的信號系統，不擋
+            pass
+        elif abs(score) < min_score:
+            # 分數太低，不進場
+            return
+        if not vol_filter_ok:
+            console.print(f"[dim]⏸️ Volume too low: {vol:.0f} vs avg {avg_vol:.0f} — skipping entry[/dim]")
+            return
 
         # ── Pluggable entry strategy (Elite Strategies) ──
         from strategies.futures.elite_strategies import get_strategy as get_elite_strategy
