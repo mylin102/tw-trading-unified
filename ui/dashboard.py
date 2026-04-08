@@ -407,29 +407,32 @@ def format_futures_trades(ledger_df):
 
 
 def format_stock_trades(ledger_df):
-    """Round-trip formatter for stock trades. Matches BUY→SELL pairs."""
+    """Round-trip formatter for stock trades. Matches BUY→SELL pairs per ticker."""
     if ledger_df is None or ledger_df.empty or "action" not in ledger_df.columns:
         return ledger_df
 
     trades = []
-    pending_entry = None
+    # GSD fix: Track pending entries by ticker to support multiple concurrent positions
+    pending_entries = {}
     trade_num = 0
 
     for _, row in ledger_df.iterrows():
         action = str(row.get("action", "")).upper()
+        ticker = str(row.get("ticker", ""))
         if action == "BUY":
-            pending_entry = {
+            pending_entries[ticker] = {
                 "entry_time": str(row.get("timestamp", "")),
-                "ticker": str(row.get("ticker", "")),
+                "ticker": ticker,
                 "entry_price": float(row.get("entry_price", row.get("price", 0)) or 0),
                 "qty": int(row.get("qty", row.get("Quantity", 0)) or 0),
                 "reason": str(row.get("reason", "")),
             }
-        elif pending_entry and action == "SELL":
+        elif action == "SELL" and ticker in pending_entries:
             trade_num += 1
-            entry = pending_entry["entry_price"]
+            pending = pending_entries.pop(ticker)
+            entry = pending["entry_price"]
             exit_p = float(row.get("price", 0) or 0)
-            qty = pending_entry["qty"]
+            qty = pending["qty"]
             gross = float(row.get("pnl_gross", row.get("pnl_cash", 0)) or 0)
             fees = float(row.get("fees", 0) or 0)
             net = float(row.get("pnl_cash", 0) or 0)
@@ -439,9 +442,9 @@ def format_stock_trades(ledger_df):
 
             trades.append({
                 "#": trade_num,
-                "進場時間": pending_entry["entry_time"],
+                "進場時間": pending["entry_time"],
                 "出場時間": str(row.get("timestamp", "")),
-                "代號": pending_entry["ticker"],
+                "代號": pending["ticker"],
                 "進場價": round(entry, 0),
                 "出場價": round(exit_p, 0),
                 "股數": qty,
@@ -450,18 +453,19 @@ def format_stock_trades(ledger_df):
                 "手續費+稅": round(fees, 0),
                 "淨利": round(net, 0),
             })
-            pending_entry = None
+        # If SELL for unknown ticker, ignore (shouldn't happen in valid data)
 
-    if pending_entry:
+    # Remaining open positions
+    for ticker, pending in pending_entries.items():
         trade_num += 1
         trades.append({
             "#": trade_num,
-            "進場時間": pending_entry["entry_time"],
+            "進場時間": pending["entry_time"],
             "出場時間": "⏳ 持倉中",
-            "代號": pending_entry["ticker"],
-            "進場價": round(pending_entry["entry_price"], 0),
+            "代號": pending["ticker"],
+            "進場價": round(pending["entry_price"], 0),
             "出場價": "—",
-            "股數": pending_entry["qty"],
+            "股數": pending["qty"],
             "出場原因": "—",
             "毛利": "—",
             "手續費+稅": "—",
