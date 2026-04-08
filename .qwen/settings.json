@@ -57,7 +57,9 @@
       "Bash(xargs *)",
       "Bash(date *)",
       "Bash(test *)",
-      "Bash(chmod *)"
+      "Bash(chmod *)",
+      "Bash(hexdump *)",
+      "Bash(stat *)"
     ]
   },
   "$version": 3
