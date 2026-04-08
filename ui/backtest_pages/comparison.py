@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
 
 from strategies.futures.elite_strategies import ELITE_STRATEGIES as STRATEGIES  # noqa: E402
 from strategies.futures.squeeze_futures.engine.vectorized import simulate_trades_vectorized, calculate_metrics  # noqa: E402
+from backtest.signal_generator import generate_signals  # noqa: E402
 from ui.backtest_pages.single_test import load_backtest_data  # noqa: E402
 from core.i18n import get_text  # noqa: E402
 
