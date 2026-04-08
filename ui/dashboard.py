@@ -411,16 +411,21 @@ def format_futures_trades(ledger_df):
             "淨利": "—",
         })
 
-    return _format_coerce_ints(pd.DataFrame(trades)) if trades else ledger_df
+    return _format_coerce_floats(pd.DataFrame(trades)) if trades else ledger_df
 
 
-def _format_coerce_ints(df):
-    """Coerce price and PnL columns to Int64 to avoid .000000 display."""
+def _format_coerce_floats(df):
+    """Format price and PnL columns to 2 decimal places."""
     if df is None or df.empty or "#" not in df.columns:
         return df
-    for col in ["進場價", "出場價", "毛利", "摩擦成本", "淨利"]:
+    for col in ["進場價", "出場價"]:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+            df[col] = pd.to_numeric(df[col], errors="coerce").apply(
+                lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+    for col in ["毛利", "摩擦成本", "淨利"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").apply(
+                lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
     return df
 
 
@@ -501,7 +506,7 @@ def format_stock_trades(ledger_df):
             "淨利": "—",
         })
 
-    return _format_coerce_ints(pd.DataFrame(trades)) if trades else ledger_df
+    return _format_coerce_floats(pd.DataFrame(trades)) if trades else ledger_df
 
 
 
