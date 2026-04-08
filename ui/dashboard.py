@@ -411,6 +411,17 @@ def format_stock_trades(ledger_df):
     if ledger_df is None or ledger_df.empty or "action" not in ledger_df.columns:
         return ledger_df
 
+    # GSD: Build ticker→name lookup from indicator CSVs
+    ticker_names = {}
+    for f in FUTURES_MKT.glob("STOCK_*_indicators.csv"):
+        try:
+            tmp = pd.read_csv(f, nrows=1)
+            if "name" in tmp.columns:
+                t = f.stem.split("_")[1]
+                ticker_names[t] = str(tmp["name"].iloc[0])
+        except Exception:
+            pass
+
     trades = []
     # GSD fix: Track pending entries by ticker to support multiple concurrent positions
     pending_entries = {}
@@ -423,6 +434,7 @@ def format_stock_trades(ledger_df):
             pending_entries[ticker] = {
                 "entry_time": str(row.get("timestamp", "")),
                 "ticker": ticker,
+                "name": ticker_names.get(ticker, ""),
                 "entry_price": float(row.get("entry_price", row.get("price", 0)) or 0),
                 "qty": int(row.get("qty", row.get("Quantity", 0)) or 0),
                 "reason": str(row.get("reason", "")),
@@ -444,7 +456,7 @@ def format_stock_trades(ledger_df):
                 "#": trade_num,
                 "進場時間": pending["entry_time"],
                 "出場時間": str(row.get("timestamp", "")),
-                "代號": pending["ticker"],
+                "代號": f"{ticker} {pending['name']}".strip(),
                 "進場價": round(entry, 0),
                 "出場價": round(exit_p, 0),
                 "股數": qty,
@@ -453,7 +465,6 @@ def format_stock_trades(ledger_df):
                 "手續費+稅": round(fees, 0),
                 "淨利": round(net, 0),
             })
-        # If SELL for unknown ticker, ignore (shouldn't happen in valid data)
 
     # Remaining open positions
     for ticker, pending in pending_entries.items():
@@ -462,7 +473,7 @@ def format_stock_trades(ledger_df):
             "#": trade_num,
             "進場時間": pending["entry_time"],
             "出場時間": "⏳ 持倉中",
-            "代號": pending["ticker"],
+            "代號": f"{ticker} {pending['name']}".strip(),
             "進場價": round(pending["entry_price"], 0),
             "出場價": "—",
             "股數": pending["qty"],
