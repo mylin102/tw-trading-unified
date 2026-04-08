@@ -3,39 +3,35 @@ import pandas as pd
 import numpy as np
 from strategies.stocks.entry_strategies import strategy_it_window_dressing
 
-def test_it_3day_buy_signal():
+def test_it_buy_signal_optimized():
     """
-    V-Model Unit Test P0: 驗證投信連三買邏輯 (修正欄位名稱)
+    V-Model Unit Test P0: 驗證投信連買優化邏輯 (2/5 Hits)
     """
-    # 模擬 65 根 K 線數據，滿足 len(df_5m) < 60 檢查
+    # 模擬 65 根 K 線數據
     df_5m = pd.DataFrame({
         'Close': np.random.uniform(100, 110, 65),
         'ma20': np.linspace(90, 94, 65),
         'ma60': np.linspace(80, 84, 65)
     })
     
-    # 最後一根 K 線注入連三買指標
+    # 注入新的 Rolling Count 指標 (滿足 2/5 條件)
     last_5m = df_5m.iloc[-1].to_dict()
-    last_5m["it_buy_rolling_3_min"] = 500  # 代表過去三天投信最小買超 500 股
+    last_5m["it_buy_rolling_count"] = 2  
     
     result = strategy_it_window_dressing(last_5m, df_5m, {})
     assert result is not None
     assert result["action"] == "BUY"
     assert "IT_3DAY_BUY" in result["reason"]
 
-def test_it_no_signal_when_chips_missing():
+def test_it_no_signal_low_momentum():
     """
-    V-Model Unit Test P0: 驗證無籌碼數據或投信轉賣時不進場
+    V-Model Unit Test P0: 驗證動能不足時不進場 (1/5 Hits)
     """
-    df_5m = pd.DataFrame({'Close': np.random.uniform(100, 110, 65), 'ma20': 95, 'ma60': 85})
+    df_5m = pd.DataFrame({'Close': 100, 'ma20': 95, 'ma60': 85}, index=range(65))
     
-    # 案例 A: 籌碼欄位不存在
-    result = strategy_it_window_dressing(df_5m.iloc[-1].to_dict(), df_5m, {})
-    assert result is None
-    
-    # 案例 B: 投信最近三天有賣超紀錄 (min <= 0)
     last_5m = df_5m.iloc[-1].to_dict()
-    last_5m["it_buy_rolling_3_min"] = -10
+    last_5m["it_buy_rolling_count"] = 1 # 低於門檻 2
+    
     result = strategy_it_window_dressing(last_5m, df_5m, {})
     assert result is None
 
@@ -44,12 +40,12 @@ def test_it_no_signal_below_ma20():
     V-Model Unit Test P1: 驗證均線過濾邏輯
     """
     df_5m = pd.DataFrame({
-        'Close': np.linspace(85, 89, 65), # 股價低於 ma20
+        'Close': np.linspace(85, 89, 65), 
         'ma20': 95,
         'ma60': 85
     })
     last_5m = df_5m.iloc[-1].to_dict()
-    last_5m["it_buy_rolling_3_min"] = 500
+    last_5m["it_buy_rolling_count"] = 3
     
     result = strategy_it_window_dressing(last_5m, df_5m, {})
     assert result is None

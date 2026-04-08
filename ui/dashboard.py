@@ -662,7 +662,7 @@ with tab_overview:
                     "成交量": f"{int(last.get('volume', last.get('Volume', 0))):,}",
                     "Score": round(last.get('score', 0), 1),
                     "Squeeze": "🔒 壓縮" if last.get("sqz_on", False) else "🔓 釋放",
-                    "投信": "🔥 連買" if last.get("it_buy_rolling_3_min", 0) > 0 else "⚪ —",
+                    "投信": "🔥 連買" if last.get("it_buy_rolling_count", 0) >= 2 else "⚪ —",
                     "200MA": "🟢 向上" if last.get("ema_200_up", False) else "⚪ 走平/向下"
                 })
         
@@ -830,7 +830,7 @@ with tab_stocks:
                     "成交量": f"{int(last.get('volume', last.get('Volume', 0))):,}",
                     "Score": round(last.get('score', 0), 1),
                     "Squeeze": "🔒 壓縮" if last.get("sqz_on", False) else "🔓 釋放",
-                    "投信動能": "🔥 連買" if last.get("it_buy_rolling_3_min", 0) > 0 else "⚪ —",
+                    "投信動能": "🔥 連買" if last.get("it_buy_rolling_count", 0) >= 2 else "⚪ —",
                     "200MA 趨勢": "🟢 向上" if last.get("ema_200_up", False) else "⚪ 走平/向下"
                 })
         

@@ -1,6 +1,6 @@
 # Project: tw-trading-unified 架構演進計畫
 
-## Milestone 0: 改版前基線 (2026-04-08 Snapshot)
+## Milestone 0: 改版前基線 (2026-04-08)
 
 ### 現狀架構
 ```
@@ -49,7 +49,7 @@ tw-trading-unified/
 
 ---
 
-## Milestone 1: Stock Monitor 獨立化
+## Milestone 1: Stock Monitor 獨立化 (目標: 2026-04-12)
 
 ### 目標
 Stock Monitor 從 main.py thread 拆成獨立 process，期貨/選擇權不受股票模組影響。
@@ -94,7 +94,7 @@ main.py                          main.py
 
 ---
 
-## Milestone 2: squeeze-backtest → 選股信號源
+## Milestone 2: squeeze-backtest → 選股信號源 (目標: 2026-04-19)
 
 ### 目標
 squeeze-backtest 產出 watchlist，tw-trading-unified 只負責執行。
@@ -123,7 +123,7 @@ tw-trading-unified/
 
 ---
 
-## Milestone 3: Shioaji Session Pool (上 live 前)
+## Milestone 3: Shioaji Session Pool (上 live 前, TBD)
 
 ### 目標
 多 process 共用 Shioaji 連線，避免多次 login 被擋。
@@ -144,7 +144,7 @@ tw-trading-unified/
 ## 時程估計
 | Milestone | 預估工時 | 前置條件 |
 |---|---|---|
-| M0 基線 ✅ | 完成 | — |
-| M1 Stock 獨立化 | 2-3 小時 | M0 |
-| M2 選股信號源 | 1-2 小時 | M1 |
-| M3 Session Pool | 需要時再做 | M1 + live 上線前 |
+| M0 基線 ✅ | 完成 (2026-04-08) | — |
+| M1 Stock 獨立化 | 2-3 小時 → 2026-04-12 | M0 |
+| M2 選股信號源 | 1-2 小時 → 2026-04-19 | M1 |
+| M3 Session Pool | TBD → 上 live 前 | M1 + live 上線前 |

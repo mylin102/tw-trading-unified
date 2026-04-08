@@ -180,21 +180,25 @@ class StockMonitor:
                     if notice is not None and str(notice) != "Normal": continue
                     
                     # 1. 指標分析
-                    start_date = (now - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+                    start_date = (now - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
                     kbars = self.api.kbars(contract, start=start_date)
+                    if not kbars: continue
                     df = pd.DataFrame({**kbars})
                     if df.empty: continue
                     df["ts"] = pd.to_datetime(df["ts"]); df = df.set_index("ts")
                     df.columns = [c.capitalize() if c.lower() in ["open", "high", "low", "close", "volume"] else c for c in df.columns]
                     df = calculate_stock_squeeze(df)
                     
-                    # --- 新增：投信作帳指標 (實裝) ---
-                    df['ma20'] = df['Close'].rolling(20 * 12).mean()
-                    df['ma60'] = df['Close'].rolling(60 * 12).mean()
-                    # 代理指標邏輯
+                    # --- 優化：投信作帳指標 (實裝) ---
+                    # 改用更適配 5 分K 的均線窗口 (MA20, MA60)
+                    df['ma20'] = df['Close'].rolling(20).mean()
+                    df['ma60'] = df['Close'].rolling(60).mean()
+                    
+                    # 代理指標邏輯：成交量 > 均量 1.5倍 且 收紅 且 價格 > 均線
                     vol_avg = df['Volume'].rolling(20).mean()
-                    is_it_buy = (df['Volume'] > vol_avg * 1.2) & (df['Close'] > df['Open']) & (df['Close'] > df['ma20'])
-                    df['it_buy_rolling_3_min'] = is_it_buy.rolling(3).min().fillna(0).astype(int)
+                    is_it_buy = (df['Volume'] > vol_avg * 1.5) & (df['Close'] > df['Open']) & (df['Close'] > df['ma20'])
+                    # 計算過去 5 根中有幾根符合
+                    df['it_buy_rolling_count'] = is_it_buy.rolling(5).sum().fillna(0)
                     
                     df["name"] = contract.name
                     df.tail(60).to_csv(MKT_LOGS / f"STOCK_{ticker}_{self.date_str}_indicators.csv")
