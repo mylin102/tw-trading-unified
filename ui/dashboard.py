@@ -324,15 +324,7 @@ def format_options_trades(ledger_df):
             "淨利": "—",
         })
 
-    result = pd.DataFrame(trades) if trades else ledger_df
-    if isinstance(result, pd.DataFrame) and "#" in result.columns:
-        for col in ["進場價", "出場價"]:
-            if col in result.columns:
-                result[col] = pd.to_numeric(result[col], errors="coerce").astype("Int64")
-        for col in ["毛利", "摩擦成本", "淨利"]:
-            if col in result.columns:
-                result[col] = pd.to_numeric(result[col], errors="coerce").astype("Int64")
-    return result
+    return _format_coerce_floats(pd.DataFrame(trades)) if trades else ledger_df
 
 
 def format_futures_trades(ledger_df):
