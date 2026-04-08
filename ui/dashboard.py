@@ -315,7 +315,7 @@ def format_options_trades(ledger_df):
             "進場時間": pending_entry["entry_time"],
             "出場時間": "⏳ 持倉中",
             "方向": pending_entry["side"],
-            "進場價": pending_entry["entry_price"],
+            "進場價": round(pending_entry["entry_price"], 1),
             "出場價": "—",
             "口數": int(pending_entry["quantity"] or 1),
             "出場原因": "—",
@@ -324,7 +324,15 @@ def format_options_trades(ledger_df):
             "淨利": "—",
         })
 
-    return pd.DataFrame(trades) if trades else ledger_df
+    result = pd.DataFrame(trades) if trades else ledger_df
+    if isinstance(result, pd.DataFrame) and "#" in result.columns:
+        for col in ["進場價", "出場價"]:
+            if col in result.columns:
+                result[col] = pd.to_numeric(result[col], errors="coerce").astype("Int64")
+        for col in ["毛利", "摩擦成本", "淨利"]:
+            if col in result.columns:
+                result[col] = pd.to_numeric(result[col], errors="coerce").astype("Int64")
+    return result
 
 
 def format_futures_trades(ledger_df):

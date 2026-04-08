@@ -206,9 +206,10 @@ def run_system(dry_run=False):
         while (ft.is_alive() and ot.is_alive()):
             now = time.time()
             
-            # 檢查 TMF tick 是否有進來 (fm 已更新 last_tick_at)
-            if fm.last_tick_at > last_data_at:
-                last_data_at = fm.last_tick_at
+            # 檢查任何 FOP tick 是否有進來 (TMF 成交量低，單獨追蹤會誤判)
+            latest_tick = max(fm.last_tick_at, om.monitor.last_tick_at if hasattr(om.monitor, 'last_tick_at') else 0)
+            if latest_tick > last_data_at:
+                last_data_at = latest_tick
             
             # 哨兵邏輯：開盤期間如果 5 分鐘數據沒跳，主動重啟
             from datetime import datetime

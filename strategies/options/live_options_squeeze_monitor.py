@@ -159,6 +159,7 @@ class ShioajiOptionsSmartMonitor:
         self._current_mtx_bar = {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0, "ts": None}
         self.active_contracts = {}
         self.lock = threading.Lock()
+        self.last_tick_at = 0  # Sentinel: track tick freshness
         self.position, self.active_side, self.entry_price, self.has_tp1_hit, self.stop_loss_price = 0, None, 0.0, False, 0.0
         self.entry_mtx_price = 0.0
         self.entry_time = None
@@ -500,6 +501,7 @@ class ShioajiOptionsSmartMonitor:
         }
 
     def on_tick(self, exchange: Exchange, tick: TickFOPv1):
+        self.last_tick_at = time.time()  # Sentinel: track tick freshness
         with self.lock:
             code = tick.code
             c_contract = self.active_contracts.get("C")
