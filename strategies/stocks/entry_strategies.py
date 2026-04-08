@@ -254,8 +254,5 @@ STOCK_STRATEGIES = {
         "func": strategy_ema_pullback,
         "desc": "EMA回踩策略。多頭排列中回踩EMA slow，趨勢回調買入。"
     },
-    "fakeout_reversal": {
-        "func": strategy_fakeout_reversal,
-        "desc": "假突破反向。Squeeze fire 失敗時反向操作，類似 Counter-VWAP。"
-    },
+    # fakeout_reversal: 已移除 — 期貨 PF=0.85, 台股 PnL=-3,593, 雙向皆虧損 (2026-04-08 回測)
 }

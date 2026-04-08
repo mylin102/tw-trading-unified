@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 from strategies.stocks.entry_strategies import STOCK_STRATEGIES  # noqa: E402
 from backtest.signal_generator import generate_signals  # noqa: E402
 from backtest.stock_engine import simulate_stock_trades, calculate_stock_metrics  # noqa: E402
+import pandas_ta  # noqa: E402, F401 — registers .ta accessor
 from strategies.options.options_engine.engine.indicators import calculate_stock_squeeze  # noqa: E402
 
 DATA_DIR = ROOT / "data" / "taifex_raw"
