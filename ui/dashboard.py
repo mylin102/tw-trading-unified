@@ -253,6 +253,224 @@ def calc_futures_pnl(trades_df):
     exits["cum_pnl"] = exits["pnl_cash"].cumsum()
     return exits[["timestamp", "cum_pnl"]].rename(columns={"cum_pnl": "pnl"})
 
+def format_options_trades(ledger_df):
+    """
+    將 flat ledger 轉換成 round-trip 格式，方便理解每筆交易。
+    回傳 DataFrame: 序號 | 進場時間 | 出場時間 | Side | 進場價 | 出場價 | 口數 | 出場原因 | 毛利 | 手續費稅 | 淨利
+    """
+    if ledger_df is None or ledger_df.empty or "Action" not in ledger_df.columns:
+        return ledger_df
+
+    trades = []
+    pending_entry = None
+    trade_num = 0
+
+    for _, row in ledger_df.iterrows():
+        action = str(row.get("Action", ""))
+        if "ENTRY" in action and "RETRY" not in action and "SUBMITTED" not in action and "CLEARED" not in action:
+            # 記錄進場
+            pending_entry = {
+                "entry_time": str(row.get("Timestamp", "")),
+                "side": str(row.get("Side", "")),
+                "entry_price": row.get("Price", 0),
+                "quantity": row.get("Quantity", 1),
+                "entry_note": str(row.get("Note", "")),
+            }
+        elif pending_entry and any(kw in action for kw in ["EXIT", "TP1", "TRAIL", "TIME", "REVERSAL", "TRAP", "FILL"]):
+            # 出場 → 結算 round-trip
+            trade_num += 1
+            entry_price = float(pending_entry["entry_price"] or 0)
+            exit_price = float(row.get("Price", 0))
+            qty = int(pending_entry["quantity"] or 1)
+            point_value = 50
+
+            gross_pnl = (exit_price - entry_price) * point_value * qty
+            # 摩擦成本
+            broker_fee = 20 * 2 * qty
+            exchange_fee = 5 * 2 * qty
+            tax = (entry_price + exit_price) * point_value * 0.001 * qty
+            total_cost = broker_fee + exchange_fee + tax
+            net_pnl = gross_pnl - total_cost
+
+            trades.append({
+                "#": trade_num,
+                "進場時間": pending_entry["entry_time"],
+                "出場時間": str(row.get("Timestamp", "")),
+                "方向": pending_entry["side"],
+                "進場價": round(entry_price, 1),
+                "出場價": round(exit_price, 1),
+                "口數": qty,
+                "出場原因": action,
+                "毛利": round(gross_pnl, 0),
+                "摩擦成本": round(total_cost, 0),
+                "淨利": round(net_pnl, 0),
+            })
+            pending_entry = None
+
+    # 如果還有未出場的持倉
+    if pending_entry:
+        trade_num += 1
+        trades.append({
+            "#": trade_num,
+            "進場時間": pending_entry["entry_time"],
+            "出場時間": "⏳ 持倉中",
+            "方向": pending_entry["side"],
+            "進場價": pending_entry["entry_price"],
+            "出場價": "—",
+            "口數": int(pending_entry["quantity"] or 1),
+            "出場原因": "—",
+            "毛利": "—",
+            "摩擦成本": "—",
+            "淨利": "—",
+        })
+
+    return pd.DataFrame(trades) if trades else ledger_df
+
+
+def format_futures_trades(ledger_df):
+    """Round-trip formatter for futures trades. Matches BUY→EXIT pairs."""
+    if ledger_df is None or ledger_df.empty or "type" not in ledger_df.columns and "action" not in ledger_df.columns:
+        return ledger_df
+
+    action_col = "action" if "action" in ledger_df.columns else "type"
+    trades = []
+    pending_entry = None
+    trade_num = 0
+
+    for _, row in ledger_df.iterrows():
+        action = str(row.get(action_col, "")).upper()
+        if action in ("BUY", "SELL", "SHORT"):
+            pending_entry = {
+                "entry_time": str(row.get("timestamp", row.get("Timestamp", ""))),
+                "direction": action,
+                "entry_price": float(row.get("entry_price", row.get("price", 0)) or 0),
+                "lots": int(row.get("lots", row.get("qty", row.get("Quantity", 1)) or 1)),
+            }
+        elif pending_entry and action in ("EXIT", "COVER", "PARTIAL_EXIT"):
+            trade_num += 1
+            entry = pending_entry["entry_price"]
+            exit_p = float(row.get("price", row.get("exit_price", 0)) or 0)
+            lots = pending_entry["lots"]
+            direction = pending_entry["direction"]
+
+            # Try to get PnL from CSV first
+            gross = row.get("gross_pnl", row.get("pnl_cash", row.get("pnl", None)))
+            if gross is not None:
+                try:
+                    gross = float(gross or 0)
+                except (ValueError, TypeError):
+                    gross = None
+            # Fallback: calculate from price difference
+            if gross is None or gross == 0:
+                mult = 1 if direction == "BUY" else -1
+                gross = (exit_p - entry) * 50 * lots * mult
+
+            cost = row.get("total_cost", row.get("fees", 0))
+            try:
+                cost = float(cost or 0)
+            except (ValueError, TypeError):
+                cost = 0
+            net = gross - cost if cost > 0 else gross
+
+            trades.append({
+                "#": trade_num,
+                "進場時間": pending_entry["entry_time"],
+                "出場時間": str(row.get("timestamp", row.get("Timestamp", ""))),
+                "方向": pending_entry["direction"],
+                "進場價": round(entry, 0),
+                "出場價": round(exit_p, 0),
+                "口數": lots,
+                "出場原因": action,
+                "毛利": round(gross, 0),
+                "摩擦成本": round(cost, 0),
+                "淨利": round(net, 0),
+            })
+            pending_entry = None
+
+    if pending_entry:
+        trade_num += 1
+        trades.append({
+            "#": trade_num,
+            "進場時間": pending_entry["entry_time"],
+            "出場時間": "⏳ 持倉中",
+            "方向": pending_entry["direction"],
+            "進場價": round(pending_entry["entry_price"], 0),
+            "出場價": "—",
+            "口數": pending_entry["lots"],
+            "出場原因": "—",
+            "毛利": "—",
+            "摩擦成本": "—",
+            "淨利": "—",
+        })
+
+    return pd.DataFrame(trades) if trades else ledger_df
+
+
+def format_stock_trades(ledger_df):
+    """Round-trip formatter for stock trades. Matches BUY→SELL pairs."""
+    if ledger_df is None or ledger_df.empty or "action" not in ledger_df.columns:
+        return ledger_df
+
+    trades = []
+    pending_entry = None
+    trade_num = 0
+
+    for _, row in ledger_df.iterrows():
+        action = str(row.get("action", "")).upper()
+        if action == "BUY":
+            pending_entry = {
+                "entry_time": str(row.get("timestamp", "")),
+                "ticker": str(row.get("ticker", "")),
+                "entry_price": float(row.get("entry_price", row.get("price", 0)) or 0),
+                "qty": int(row.get("qty", row.get("Quantity", 0)) or 0),
+                "reason": str(row.get("reason", "")),
+            }
+        elif pending_entry and action == "SELL":
+            trade_num += 1
+            entry = pending_entry["entry_price"]
+            exit_p = float(row.get("price", 0) or 0)
+            qty = pending_entry["qty"]
+            gross = float(row.get("pnl_gross", row.get("pnl_cash", 0)) or 0)
+            fees = float(row.get("fees", 0) or 0)
+            net = float(row.get("pnl_cash", 0) or 0)
+            if net == 0 and gross == 0:
+                net = (exit_p - entry) * qty - fees
+                gross = (exit_p - entry) * qty
+
+            trades.append({
+                "#": trade_num,
+                "進場時間": pending_entry["entry_time"],
+                "出場時間": str(row.get("timestamp", "")),
+                "代號": pending_entry["ticker"],
+                "進場價": round(entry, 0),
+                "出場價": round(exit_p, 0),
+                "股數": qty,
+                "出場原因": str(row.get("reason", "")),
+                "毛利": round(gross, 0),
+                "手續費+稅": round(fees, 0),
+                "淨利": round(net, 0),
+            })
+            pending_entry = None
+
+    if pending_entry:
+        trade_num += 1
+        trades.append({
+            "#": trade_num,
+            "進場時間": pending_entry["entry_time"],
+            "出場時間": "⏳ 持倉中",
+            "代號": pending_entry["ticker"],
+            "進場價": round(pending_entry["entry_price"], 0),
+            "出場價": "—",
+            "股數": pending_entry["qty"],
+            "出場原因": "—",
+            "毛利": "—",
+            "手續費+稅": "—",
+            "淨利": "—",
+        })
+
+    return pd.DataFrame(trades) if trades else ledger_df
+
+
 def calc_options_pnl(ledger_df):
     """從選擇權 ledger 的 PnL 欄位累計"""
     if ledger_df is None or ledger_df.empty:
@@ -722,12 +940,25 @@ with tab_futures:
         st.info("無數據")
     ft = load_futures_trades()
     if ft is not None and not ft.empty:
-        st.header("交易記錄")
-        st.dataframe(ft, use_container_width=True)
+        st.header("交易記錄 (Round-Trip)")
+        round_trips = format_futures_trades(ft)
+        if round_trips is not None and not round_trips.empty and "#" in round_trips.columns:
+            def style_trades(row):
+                pnl = row.get("淨利", "—")
+                if pnl != "—" and isinstance(pnl, (int, float)):
+                    color = '#dcfce7' if pnl > 0 else ('#fef2f2' if pnl < 0 else '')
+                    return [f'background-color: {color}; font-weight: bold'] * len(row)
+                return [''] * len(row)
+            st.dataframe(round_trips.style.apply(style_trades, axis=1), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(ft, use_container_width=True)
         fpnl = calc_futures_pnl(ft)
         fig = make_pnl_chart(fpnl, "期貨累計 PnL (TWD)")
         if fig:
             st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("📋 原始 Ledger (進階)"):
+            st.dataframe(ft, use_container_width=True)
 
 # ════════════════════════════════════════
 # Tab 3: 選擇權
@@ -799,12 +1030,28 @@ with tab_options:
         st.info("無數據")
     ol = load_options_ledger()
     if ol is not None and not ol.empty:
-        st.header("交易記錄")
-        st.dataframe(ol.tail(30), use_container_width=True)
+        st.header("交易記錄 (Round-Trip)")
+        round_trips = format_options_trades(ol)
+        if round_trips is not None and not round_trips.empty and "#" in round_trips.columns:
+            # Style with color for profit/loss
+            def style_trades(row):
+                styles = [''] * len(row)
+                pnl = row.get("淨利", "—")
+                if pnl != "—" and isinstance(pnl, (int, float)):
+                    color = '#dcfce7' if pnl > 0 else ('#fef2f2' if pnl < 0 else '')
+                    styles = [f'background-color: {color}; font-weight: bold'] * len(row)
+                return styles
+            st.dataframe(round_trips.style.apply(style_trades, axis=1), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(ol.tail(30), use_container_width=True)
         opnl = calc_options_pnl(ol)
         fig = make_pnl_chart(opnl, "選擇權累計 PnL (TWD)")
         if fig:
             st.plotly_chart(fig, use_container_width=True)
+
+        # 展開原始 Ledger (進階)
+        with st.expander("📋 原始 Ledger (進階)"):
+            st.dataframe(ol, use_container_width=True)
 
 # ════════════════════════════════════════
 # Tab 4: 台股 Stocks
@@ -859,7 +1106,7 @@ with tab_stocks:
     current_mode = "LIVE" if s_live else "PAPER"
     sl = load_stock_trades(current_mode)
     
-    st.header(f"交易記錄 ({current_mode} 模式)")
+    st.header(f"交易記錄 (Round-Trip, {current_mode} 模式)")
     if sl is not None and not sl.empty:
         # 摘要指標
         sells = sl[sl["action"] == "SELL"].copy()
@@ -875,19 +1122,32 @@ with tab_stocks:
             m3.metric("摩擦成本", f"{total_fees:,.0f} TWD")
             m4.metric("平均每筆", f"{total_pnl/total:+,.0f} TWD" if total > 0 else "—")
 
-        # 交易明細表
-        display_cols = [c for c in ["timestamp", "ticker", "action", "entry_price", "price", "qty", "reason", "strategy", "pnl_gross", "fees", "pnl_cash"] if c in sl.columns]
-        col_rename = {"timestamp": "時間", "ticker": "代號", "action": "動作", "entry_price": "進場價",
-                      "price": "出場價", "qty": "股數", "reason": "原因", "strategy": "策略",
-                      "pnl_gross": "毛利", "fees": "手續費+稅", "pnl_cash": "淨損益"}
-        display = sl[display_cols].sort_values("timestamp", ascending=False).head(30)
-        display = display.rename(columns={c: col_rename.get(c, c) for c in display.columns})
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        # Round-trip 明細
+        round_trips = format_stock_trades(sl)
+        if round_trips is not None and not round_trips.empty and "#" in round_trips.columns:
+            def style_stock_trades(row):
+                pnl = row.get("淨利", "—")
+                if pnl != "—" and isinstance(pnl, (int, float)):
+                    color = '#dcfce7' if pnl > 0 else ('#fef2f2' if pnl < 0 else '')
+                    return [f'background-color: {color}; font-weight: bold'] * len(row)
+                return [''] * len(row)
+            st.dataframe(round_trips.style.apply(style_stock_trades, axis=1), use_container_width=True, hide_index=True)
+        else:
+            display_cols = [c for c in ["timestamp", "ticker", "action", "entry_price", "price", "qty", "reason", "strategy", "pnl_gross", "fees", "pnl_cash"] if c in sl.columns]
+            col_rename = {"timestamp": "時間", "ticker": "代號", "action": "動作", "entry_price": "進場價",
+                          "price": "出場價", "qty": "股數", "reason": "原因", "strategy": "策略",
+                          "pnl_gross": "毛利", "fees": "手續費+稅", "pnl_cash": "淨損益"}
+            display = sl[display_cols].sort_values("timestamp", ascending=False).head(30)
+            display = display.rename(columns={c: col_rename.get(c, c) for c in display.columns})
+            st.dataframe(display, use_container_width=True, hide_index=True)
 
         spnl = calc_stock_pnl(sl)
         fig = make_pnl_chart(spnl, f"台股累計 PnL ({current_mode})")
         if fig:
             st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("📋 原始 Ledger (進階)"):
+            st.dataframe(sl, use_container_width=True)
     else:
         st.info(f"今日尚無 {current_mode} 交易紀錄")
 
