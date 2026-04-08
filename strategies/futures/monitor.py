@@ -666,10 +666,10 @@ class FuturesMonitor:
         vol = last_5m.get("Volume", 0)
         avg_vol = df_5m["Volume"].rolling(20).mean().iloc[-1] if len(df_5m) >= 20 else 0
 
-        # 夜盤成交量門檻降低（夜盤量通常只有日盤 10-15%）
+        # 夜盤成交量門檻降低（夜盤 TMF 量通常只有日盤 3-10%）
         hhmm = int(datetime.now().strftime("%H%M"))
         is_night = hhmm >= 1500 or hhmm < 500
-        vol_threshold = 0.1 if is_night else 0.3
+        vol_threshold = 0.05 if is_night else 0.3
 
         vol_filter_ok = (avg_vol == 0) or (vol >= avg_vol * vol_threshold)
         if not vol_filter_ok:
