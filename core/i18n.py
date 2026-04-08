@@ -9,8 +9,8 @@ TRANSLATIONS = {
         
         "nav_single": "Single Backtest",
         "nav_sweep": "Optimization Sweep",
-        "nav_stock_lab": "Portfolio Optimizer",
-        "nav_leaderboard": "Strategy Ranking",
+        "nav_stock_lab": "Stock Portfolio Optimizer",
+        "nav_leaderboard": "Futures Strategy Ranking",
         "nav_history": "Trade History",
         
         "sidebar_lang": "Language",
@@ -34,10 +34,10 @@ TRANSLATIONS = {
         "nav_options": "🔮 選擇權研究",
         "nav_system": "⚙️ 系統與統計",
         
-        "nav_single": "單一策略回測",
-        "nav_sweep": "參數矩陣掃描",
-        "nav_stock_lab": "多標的全域優化",
-        "nav_leaderboard": "全策略排行榜",
+        "nav_single": "期貨單策略回測",
+        "nav_sweep": "期貨參數掃描",
+        "nav_stock_lab": "台股多標的優化",
+        "nav_leaderboard": "期貨策略排行榜",
         "nav_history": "歷史交易總帳",
         
         "sidebar_lang": "語系設定",
