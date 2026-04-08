@@ -971,6 +971,27 @@ with tab_futures:
         st.info("無數據")
     ft = load_futures_trades()
     if ft is not None and not ft.empty:
+        # --- Unrealized PnL ---
+        round_trips = format_futures_trades(ft)
+        open_pos = None
+        if round_trips is not None and "#" in round_trips.columns:
+            open_rows = round_trips[round_trips["出場時間"] == "⏳ 持倉中"]
+            if not open_rows.empty:
+                open_pos = open_rows.iloc[-1]
+
+        if open_pos is not None:
+            cur_price = float(f_df["close"].iloc[-1]) if len(f_df) > 0 else 0
+            entry = float(open_pos.get("進場價", 0))
+            lots = int(open_pos.get("口數", 1))
+            direction = str(open_pos.get("方向", ""))
+            if cur_price > 0 and entry > 0:
+                mult = 1 if direction == "BUY" else -1
+                unrealized = (cur_price - entry) * 50 * lots * mult
+                color = "green" if unrealized >= 0 else "red"
+                st.metric(f"📊 未實現損益 (持倉中)", f"{unrealized:+,.0f} TWD",
+                          delta=f"{unrealized:+,.0f} ({(unrealized/(entry*50*lots)*100):+.1f}%)")
+                st.caption(f"進場價: {entry:.0f} | 目前: {cur_price:.0f} | {direction} {lots}口")
+
         st.header("交易記錄 (Round-Trip)")
         round_trips = format_futures_trades(ft)
         if round_trips is not None and not round_trips.empty and "#" in round_trips.columns:
@@ -1044,6 +1065,14 @@ with tab_options:
                 else:
                     pos_label = side
                 st.caption(f"當前持倉: **{pos_label}** | 進場: {action} @ {last_pos.get('Price', '')}")
+
+                # --- Unrealized PnL (proxy via MTX price change) ---
+                entry_price = float(last_pos.get("Price", 0))
+                qty = int(last_pos.get("Quantity", 1))
+                cur_mtx = float(o_df["price_mtx"].iloc[-1]) if len(o_df) > 0 and "price_mtx" in o_df.columns else 0
+                if entry_price > 0 and cur_mtx > 0:
+                    # 選項權利金變化無法直接取得，用 MTX 價格變化估算方向
+                    st.caption(f"目前 MTX: {cur_mtx:.0f}")
             else:
                 st.caption("目前無持倉")
         else:
@@ -1168,6 +1197,34 @@ with tab_stocks:
         # Round-trip 明細
         round_trips = format_stock_trades(sl)
         if round_trips is not None and not round_trips.empty and "#" in round_trips.columns:
+            # --- Unrealized PnL for open stock positions ---
+            open_rows = round_trips[round_trips["出場時間"] == "⏳ 持倉中"]
+            if not open_rows.empty:
+                st.subheader("📊 未實現損益 (持倉中)")
+                cols = st.columns(min(len(open_rows), 4))
+                for idx, (_, row) in enumerate(open_rows.iterrows()):
+                    ticker = str(row.get("代號", "")).split()[0]  # Extract ticker from "1525 綠電"
+                    entry = float(row.get("進場價", 0))
+                    qty = int(row.get("股數", 0))
+                    # Get current price from indicator CSV
+                    cur_price = 0
+                    ind_path = FUTURES_MKT / f"STOCK_{ticker}_{DATE_STR}_indicators.csv"
+                    if ind_path.exists():
+                        try:
+                            ind_df = pd.read_csv(ind_path, nrows=1)
+                            close_col = [c for c in ind_df.columns if c.lower() in ("close", "close")]
+                            if close_col:
+                                cur_price = float(ind_df[close_col[0]].iloc[0])
+                        except Exception:
+                            pass
+                    if cur_price > 0 and entry > 0 and qty > 0:
+                        unrealized = (cur_price - entry) * qty
+                        color = "green" if unrealized >= 0 else "red"
+                        with cols[idx % 4]:
+                            st.metric(f"{row.get('代號', ticker)}", f"{unrealized:+,.0f} TWD",
+                                      delta=f"{unrealized:+,.0f} ({(unrealized/(entry*qty)*100):+.1f}%)")
+                            st.caption(f"進場: {entry:.0f} | 目前: {cur_price:.0f} | {qty}股")
+
             def style_stock_trades(row):
                 pnl = row.get("淨利", "—")
                 if pnl != "—" and isinstance(pnl, (int, float)):
