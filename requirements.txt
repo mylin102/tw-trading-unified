@@ -1,0 +1,19 @@
+# Core Dependencies
+shioaji
+pandas
+numpy
+numba
+python-dotenv
+pyyaml
+rich
+
+# Dashboard & Visualization
+streamlit
+plotly
+streamlit-autorefresh
+
+# Infrastructure & Testing
+pytest
+pytest-asyncio
+requests
+python-dateutil

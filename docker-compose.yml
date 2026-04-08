@@ -1,0 +1,30 @@
+services:
+  trading-monitor:
+    build: .
+    image: tw-trading-unified:latest
+    container_name: trading-monitor
+    restart: unless-stopped
+    volumes:
+      - ./.env:/app/.env
+      - ./logs:/app/logs
+      - ./exports:/app/exports
+      - ./data:/app/data
+      - ./config:/app/config
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python main.py
+
+  dashboard:
+    build: .
+    image: tw-trading-unified:latest
+    container_name: trading-dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./logs:/app/logs
+      - ./exports:/app/exports
+      - ./config:/app/config
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: streamlit run ui/dashboard.py --server.port 8501 --server.address 0.0.0.0
