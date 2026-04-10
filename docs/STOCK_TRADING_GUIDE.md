@@ -9,11 +9,32 @@
 台股模組整合於現有架構中，共用 Shioaji Session 以避免登入限制。
 
 *   **Scanner (`strategies/stocks/scanner.py`)**:
-    使用 **「整股」** 歷史數據進行指標分析，以確保信號穩定性。
+    使用 **「整股」** 歷史數據進行多週期指標分析 (MTF)。日線負責型態識別，5分K負責進場驗證。
+*   **Pattern Engine (`strategies/stocks/pattern_engine.py`)**:
+    核心幾何型態偵測引擎，識別「杯中帶把」與「雙重底」，並計算 Pivot Point。
 *   **Monitor (`strategies/stocks/monitor.py`)**:
-    實時監控 Watchlist，使用 **「零股」** 快照獲取精確的可成交價。
+    實時監控 Watchlist，緩存每日掃描結果，並在價格突破 Pivot 時執行交易。
 *   **Execution**:
     下單時強制設定 `order_lot=sj.constant.StockOrderLot.Odd`，支援精確到「股」的自動交易。
+
+---
+
+## 📈 CANSLIM 突破策略
+
+系統實作了 William O'Neil 的 CANSLIM 核心技術邏輯：
+
+### 1. 形態識別 (Base Building)
+*   **杯中帶把 (Cup with Handle)**: 
+    *   深度限制：12% - 40%。
+    *   把手要求：回檔不超過杯身的 15%，且長度需大於 3 天。
+*   **雙重底 (Double Bottom)**: (Wave 2 實作)。
+
+### 2. 進場點 (The Pivot)
+*   **價格觸發**: 當前價格必須 **帶量突破** 把手高點 (Pivot Point)。
+*   **量能確認**: 突破時的成交量必須大於過去 20 日平均量的 **1.4 倍**。
+
+### 3. 市場濾網 (Market Direction)
+*   **M 邏輯**: 只有在大盤 (TMF) 指標顯示非強空頭（例如 Close > EMA60）時，才允許個股開倉。
 
 ---
 

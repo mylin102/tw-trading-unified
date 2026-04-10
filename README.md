@@ -1,84 +1,42 @@
 # tw-trading-unified
 
-台股期貨 + 選擇權整合交易系統。單一 Shioaji session，避免 Too Many Connections。
+台股期貨 + 選擇權 + 股票 整合交易系統。單一 Shioaji session，避免 Too Many Connections。
+
+### 2026-04-10 CANSLIM Stock Integration & System Stabilization (v5)
+- **[Strategy] CANSLIM Pattern Engine**：新增 `pattern_engine.py` 幾何型態偵測模組
+  - 支援「杯中帶把 (Cup with Handle)」與「雙重底 (Double Bottom)」識別
+  - 使用 smoothed `argrelextrema` 與 parabolic 擬合提高識別精確度
+- **[Arch] MTF Stock Pipeline**：`StockScanner` 支援雙軌掃描
+  - 日線 (1d)：進行長期型態分析與 Pivot Point 計算
+  - 5分K (5m)：進行即時成交量驗證與進場執行
+- **[Stability] 數據連續性修復**：解決 TMF 夜盤成交量為零導致的指標停滯問題
+  - 透過 MTX (小台) Virtual Ticks 驅動 TMF K棒生成
+  - 修復 `api.kbars` 頻率限制問題（自研 Pandas 高性能 resampling）
+- **[Risk] 開盤尖刺保護**：實裝 `opening_grace_mins` (5m) 與 `entry_premium_limit` (250)
+- **[UI] Dashboard v2.0**：新增三資產 (期貨/選擇權/台股) 整合監控牆與 Round-Trip 交易日誌
+- **[Test] Geometric Test Suite**：新增 `test_pattern_engine.py` 包含幾何型態產生器
 
 ### 2026-04-07 macOS 穩定性 + SDD/V-Model 加固 (v4)
 - **[Stability] macOS 優雅關閉**：Signal handlers (SIGTERM/SIGINT) + `_shutdown_event` 協調
-- **[Stability] Dispatcher 安全加固**：`tick_dispatcher` 和 `bidask_dispatcher` 加入：
-  - 關閉事件檢查（shutdown event）
-  - 輸入驗證（None/invalid tick 拒絕）
-  - 執行緒安全鎖（thread-safe `_seen` sets）
-  - 異常隔離（每個 monitor 呼叫獨立 try/except）
-- **[Stability] C++ 彈窗消除**：清理序列加入 time.sleep 緩衝（總計 5 秒）
-  - 停止 monitors → sleep(1)
-  - Thread join → sleep(0.5) × 2（回調清理）
-  - Logout → sleep(2)（C++ 資源穩定）
-- **[Stability] autostart.sh macOS 優化**：SIGTERM 優先 → sleep(3) → SIGKILL
 - **[Test] V-Model Level 1**：17 個新測試覆蓋 macOS 安全性 (`test_macos_safety.py`)
 - **[Doc] SDD 補充**：`docs/SDD_MACOS_SAFETY.md` 完整設計文件
-- **[Test] 總測試數**：83 個測試案例全部通過
-
-### 2026-04-03 策略插件化 + ThetaGang + 安全性修復 (v3)
-- **[Arch] 策略插件系統**：8 種期貨進場策略，config 一行切換，Dashboard 下拉選單即時切換
-  - `squeeze_breakout` / `trend_follow` / `vwap_bounce` / `momentum_burst` / `night_short_only`
-  - `volume_reversal` / `psar_breakout` / `cumulative_delta`（參考 NinjaScript）
-- **[Strategy] ThetaGang 賣方策略**：Iron Condor / Credit Spread / Short Strangle，Squeeze ON 自動啟用
-- **[Strategy] Options Score 翻轉出場**：持 Put 但 score 翻正 → 立刻出場，防止利潤全部回吐
-- **[Strategy] Options Trailing Stop 提前啟動**：浮盈 ≥15% 即啟動，不需等 TP1
-- **[Pricing] QuantLib 整合**：BS pricing + Brent IV solver + Vol Surface，config 切換 `quantlib`/`black_scholes`
-- **[Safety] Paper 模式資金限制**：40,000 本金檢查，ATM 買方自動擋單
-- **[Safety] 重複下單防護**：`save_trade` 移到 `execute_signal` 成功之後，position guard 在 entry/exit
-- **[Safety] PnL 含手續費**：CSV 顯示淨損益（扣 broker fee + exchange fee + tax）
-- **[Safety] BE offset 10 pts**：Break-even trailing 確保 cover 手續費（原 2 pts）
-- **[Safety] 停損用市場價**：不再用停損線價格出場
-- **[Fix] Options 重複進場**：`enter_paper_position` 加 position guard + recovery 修復
-- **[Fix] Options PnL 乘口數**：`log_trade` 正確計算 qty × point_value
-- **[Fix] EXIT 歸零順序**：先 position=0 再 log，防止重複 EXIT
-- **[Fix] `datetime.timedelta` 命名衝突**：修復 `from datetime import datetime` 覆蓋問題
-- **[UI] Dashboard 策略選擇器**：期貨 8 策略 + 選擇權 5 策略，含即時說明
-- **[UI] Dashboard Options Max Positions**：可設 0 停止開新倉
-- **[Test] V-Model 測試**：18 個測試案例，覆蓋所有已知 bug
-- **[Doc] SDD + V-Model**：`docs/SDD.md` 架構設計 + `docs/V_MODEL_TEST_PLAN.md` 測試計畫
-- **[Doc] AI Rules**：`RULES.md` + `.kiro/` + `.cursorrules` + `AGENTS.md` + `GEMINI.md`
-
-### 2026-04-02 策略與安全性重大升級 (v2)
-- **[Strategy] Squeeze Failure Counter 策略**：新增均值回歸反向策略，回測 PF=1.95（原 Breakout PF=1.02）
-- **[Strategy] Auto-Regime 切換**：根據 bullish_align 翻轉頻率自動判斷趨勢/盤整，切換 Breakout/Counter 模式
-- **[Strategy] 參數優化**：ATR SL 1.5x、VWAP exit 啟用、Counter ATR SL 2.0x（vectorbt 網格回測最佳）
-- **[Safety] 保證金檢查**：下單前查詢 `api.margin()` 權益數，不足額自動擋單
-- **[Safety] 持倉恢復**：重啟時從 `api.list_positions()` 還原真實持倉，防止重複開單
-- **[Safety] VWAP exit 隔離**：Counter 模式的 VWAP 出場不影響 Breakout 持倉
-- **[UI] Dashboard 自動刷新**：30 秒 auto-refresh + Monitor 運行狀態指示燈
-- **[Fix] CSV 欄位對齊**：`_save_bar` 對齊既有 CSV header，修復夜盤數據錯位
-- **[Fix] `lookback` 參數 bug**：移除 `calculate_futures_squeeze` 不接受的參數
-- **[Doc] Shioaji API 參考文件**：`docs/SHIOAJI_API_REFERENCE.md`
-
-### 2026-04-02 系統架構與穩定性升級 (v1)
-- **[Arch] 外部守護進程 (Supervisor)**：`autostart.sh` 外部循環監控，15 秒延遲重啟
-- **[Core] API 調用頻率限制**：kbars 5 分鐘頻率限制
-- **[Logic] 交易日日誌對齊**：凌晨 05:00 切換
-- **[Fix] Greeks 計算型別修正**：強制 `float` 轉換
 
 ## 架構
 
 ```
 core/shioaji_session.py          # Singleton Shioaji 登入（全進程共用）
 strategies/
-  futures/monitor.py             # TMF Breakout + Counter (auto-regime) + margin check
+  futures/monitor.py             # TMF Breakout + Counter (auto-regime)
   options/monitor.py             # TXO V2 Swing 選擇權策略
-  options/live_options_squeeze_monitor.py  # 選擇權核心引擎
-  options/logs/                  # 選擇權 indicator / ledger / equity
-main.py                          # 啟動入口：tick+bidask 分發 → 健康檢查
-autostart.sh                     # 外部守護進程（斷線自動重啟）
-ui/dashboard.py                  # Streamlit 儀表板 (port 8500, 30s auto-refresh)
+  stocks/monitor.py              # 台股監控與零股執行（CANSLIM 支援）
+  stocks/pattern_engine.py       # 幾何型態偵測引擎 (Cup with Handle / W Bottom)
+  stocks/scanner.py              # MTF 掃描器 (Daily Base + 5m Execution)
+main.py                          # 啟動入口：三資產數據分發
+ui/dashboard.py                  # Streamlit 儀表板 (三資產整合)
 config/
-  futures.yaml                   # 期貨策略參數（含 counter_mode）
-  options_strategy.yaml          # 選擇權策略參數（V1/V2/V3 modes）
-  risk_global.yaml               # 全域資金分配
-scripts/                         # 回測腳本
-docs/                            # 設計文件 + API 參考
-data/                            # 歷史數據（回測用）
-logs/market_data/                # 期貨 indicator CSV
+  futures.yaml                   # 期貨策略參數
+  options_strategy.yaml          # 選擇權策略參數
+  stocks.yaml                    # 台股策略參數（含 CANSLIM 設定）
 ```
 
 ## 快速開始
@@ -87,170 +45,46 @@ logs/market_data/                # 期貨 indicator CSV
 # 1. 設定環境變數
 cp .env.example .env   # 填入 Shioaji API Key + DASHBOARD_PASSWORD
 
-# 2. 不登入 broker，純 paper 測試
-python3 main.py --dry-run
+# 2. 下載歷史數據 (用於型態分析)
+python3 strategies/stocks/downloader.py
 
-# 3. 登入 broker，live/paper 由各自 config 決定
-python3 main.py
-
-# 4. 用 supervisor 啟動（推薦，斷線自動重啟）
+# 3. 啟動交易系統
 bash autostart.sh
 ```
-
-## 即時數據架構
-
-```
-Shioaji API
-  ├─ on_tick_fop_v1 ──→ tick_dispatcher ──→ futures monitor (tick bar builder)
-  │                                     └─→ options monitor (MTX price update)
-  ├─ on_bidask_fop_v1 → bidask_dispatcher → options monitor (bid/ask mid-price)
-  │                                        ├─ MTX: 標的價 (S)
-  │                                        ├─ TXO Call: 權利金 + IV 反推
-  │                                        └─ TXO Put: 權利金 + IV 反推
-  └─ api.kbars() ────→ 歷史 K 棒（日盤可用，凌晨 fallback 到 tick bars）
-```
-
-## 交易模式控制
-
-各策略的 live/paper 由各自 config 決定：
-- `config/futures.yaml` → `live_trading: true/false`
-- `config/options_strategy.yaml` → `live_trading: true/false`
-
-CLI 的 `--dry-run` 是安全開關，完全不登入 broker，兩個都強制 paper。
-
-## 安全機制（Live 下單保護）
-
-| 層級 | 機制 | 說明 |
-|------|------|------|
-| 策略層 | `max_positions: 1` | 限制最大持倉口數 |
-| 資金層 | `_margin_sufficient()` | 進場前查 `api.margin()` 權益數，扣 20% reserve |
-| 恢復層 | `_recover_position_from_api()` | 重啟時從 API 還原持倉，防重複開單 |
-| 交易所層 | 保證金不足拒單 | 最終防線 |
-| ⚠️ 待實作 | Safety Stop | 進場後預掛停損單，斷線時交易所執行 |
 
 ## Dashboard (port 8500)
 
 | Tab | 功能 |
 |-----|------|
-| 📈 總覽 | 期貨/選擇權即時指標、今日 PnL、指數雙軸走勢圖 |
-| 🔵 期貨 | Close / Score / 趨勢 / Squeeze 狀態、交易記錄、PnL 曲線 |
-| 🟠 選擇權 | MTX / Score / 趨勢 / IV、Trade Ledger、PnL 曲線 |
-| ⚙️ 設定 | 參數即時調整、LIVE/PAPER 切換、資金分配 |
-
-- 每 30 秒自動刷新（`streamlit-autorefresh`）
-- Header 顯示 Monitor 運行狀態（🟢 Running / 🔴 Stopped）
-- 夜盤跨日（00:00~05:00）自動顯示前一天的數據
+| 📈 總覽 | 三資產即時指標、今日 PnL、指數走勢圖 |
+| 🔵 期貨 | TMF 指標、交易記錄、PnL 曲線 |
+| 🟠 選擇權 | TXO 指標、IV/Greeks、PnL 曲線 |
+| 🍎 台股 | 15 檔標的監控、CUP/W 型態識別、Pivot 標註 |
+| ⚙️ 設定 | 參數即時調整、LIVE/PAPER 切換 |
 
 ## 策略邏輯
 
+### 台股 Stocks — CANSLIM 突破策略
+- **選股 (C/A)**：透過財報或籌碼 API 預篩強勢股 (Watchlist)
+- **形態 (Base)**：`pattern_engine` 偵測日線級別「杯中帶把」或「雙底」
+- **突破 (When)**：價格 > Pivot Point 且 成交量 > 20日均量 1.4倍
+- **市場 (M)**：大盤 (TMF) 非空頭排列時才啟動
+
 ### 期貨 TMF — 雙模式自動切換
-
-#### Breakout 模式（趨勢盤）
-- 多週期 Squeeze（5m/15m/1h）+ Trend Breakout
-- Regime filter (mid) + bull_align guard
-- EMA 12/36 趨勢判斷
-
-#### Counter 模式（盤整盤）— 新增
-- 偵測 Squeeze Fire 後 5 bars 內突破失敗
-- 失敗條件：未創新高/低 + 動能反轉 + VWAP 拒絕
-- 反向進場，VWAP 回歸出場
-- 回測 PF=1.95, MaxDD=-7.2%（vs Breakout PF=1.02, MaxDD=-25.8%）
-
-#### Auto-Regime 切換
-- `_is_ranging_regime()`：近 20 bars bullish_align 翻轉 ≥4 次 → 盤整 → Counter
-- 否則 → 趨勢 → Breakout
-
-#### 出場機制
-- ATR 1.5x 動態停損
-- VWAP 出場（Breakout + Counter）
-- TP1 分批停利 + Trailing Stop
-- Cooldown 3 bars
-
-### 選擇權 TXO (V2 Swing)
-- 月選合約（≥14 天 DTE），降低 theta 衰減
-- 進場：Score ≥ 60 + Squeeze Fire + bull_align guard
-- 停損 20% + TP1 80% 分批 + Trailing Stop 15%
-- 持倉上限 7 天，DTE < 3 天強制出場
-- 即時 IV/Greeks：py_vollib 從 BidAsk 中價反推
-
-### 選擇權 Modes
-
-| Mode | 持倉 | 合約 | 特性 |
-|------|------|------|------|
-| V1 | daytrade | 近月 | 當日沖 |
-| **V2** | **swing** | **月選** | **波段（目前使用）** |
-| V3 | night | 近月 | 夜盤當沖 |
-
-## 最佳參數（2026 Q1 回測）
-
-### Breakout
-| 參數 | 值 |
-|------|-----|
-| entry_score | 20 |
-| atr_multiplier | 1.5 |
-| exit_on_vwap | true |
-| regime_filter | mid |
-
-### Counter
-| 參數 | 值 |
-|------|-----|
-| confirm_bars | 5 |
-| atr_sl_mult | 2.0 |
-| exit_on_vwap | true |
-
-## 資金分配
-
-```yaml
-# config/risk_global.yaml
-allocation:
-  futures:
-    max_margin_pct: 0.40
-  options:
-    max_margin_pct: 0.40
-account:
-  margin_reserve_pct: 0.20
-```
-
-## 回測腳本
-
-```bash
-# vectorbt 網格回測（Breakout + Counter 雙模式）
-python3 scripts/backtest_vbt_grid.py
-
-# Squeeze Failure Counter vs Breakout 比較
-python3 scripts/backtest_squeeze_failure.py
-
-# 期貨 regime filter / EMA 比較
-python3 scripts/backtest_regime_filter.py
-python3 scripts/backtest_ema_full.py
-
-# 選擇權參數優化 / V2 vs V3 / IV 過濾
-python3 scripts/backtest_options_optimize.py
-python3 scripts/backtest_v2_swing.py
-python3 scripts/backtest_iv_filter.py
-```
+- **Breakout**：多週期 Squeeze + Trend Breakout
+- **Counter**：偵測 Squeeze Fire 失敗後反向進場 (Mean Reversion)
+- **Auto-Regime**：根據波動頻率自動切換模式
 
 ## 文件
 
 | 文件 | 說明 |
 |------|------|
-| `docs/ELITE_STRATEGIES.md` | **精英策略完整文檔** (去蕵存菁 3 個策略) |
-| `docs/LIVE_TRADING_GUIDE.md` | **實盤轉換指南** (三階段流程 + 摩擦成本分析) |
-| `docs/ELITE_IMPLEMENTATION_SUMMARY.md` | 精英策略實作總結 |
-| `docs/ELITE_QUICK_REFERENCE.md` | 精英策略快速參考卡 |
-| `docs/METHODOLOGIES.md` | GSTACK + SDD + V-Model 方法論參考 |
+| `docs/STOCK_TRADING_GUIDE.md` | **台股交易指南** (CANSLIM 實作細節) |
+| `docs/ELITE_STRATEGIES.md` | 精英策略完整文檔 |
+| `docs/LIVE_TRADING_GUIDE.md` | 實盤轉換指南 |
+| `docs/CANSLIM_strategy.pdf` | CANSLIM 理論參考 |
 | `docs/SDD.md` | 軟體設計文檔 |
-| `docs/V_MODEL_TEST_PLAN.md` | V-Model 測試計畫 |
-| `docs/SHIOAJI_API_REFERENCE.md` | Shioaji API 快速參考（登入/下單/行情/帳務） |
-| `docs/SQUEEZE_FAILURE_STRATEGY.md` | Counter 策略設計提案 |
-| `docs/DASHBOARD_UI_DESIGN.md` | Dashboard UI 設計 |
-
-## 來源 repo
-
-| 策略 | 原 repo |
-|------|---------|
-| 期貨 TMF | [tw-futures-realtime](https://github.com/mylin102/tw-futures-realtime) |
-| 選擇權 TXO | [tw-option-squeeze-trading](https://github.com/mylin102/tw-option-squeeze-trading) |
+| `docs/V_MODEL_TEST_PLAN.md` | 測試計畫 |
 
 ## ⚠️ 免責聲明
 

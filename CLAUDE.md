@@ -1,4 +1,22 @@
 
+## Build & Test
+
+- **Install**: `pip install -r requirements.txt`
+- **Run Monitor**: `python3 main.py`
+- **Run Stocks**: `python3 scripts/stock_runner.py`
+- **Run Tests**: `python3 -m pytest tests/`
+- **Dry Run**: `python3 scripts/dry_run_stocks.py`
+- **Lint**: `ruff check .`
+
+## Project Structure
+
+- `strategies/stocks/`: Stock monitor, scanner, and pattern engine.
+- `strategies/futures/`: TMF futures monitor and execution logic.
+- `strategies/options/`: TXO options monitor and pricing engine.
+- `core/`: Shared session, date utilities, and risk schemas.
+- `ui/`: Streamlit dashboard implementation.
+- `config/`: Strategy and global risk YAML configurations.
+
 ## Health Stack
 
 - lint: ruff check .

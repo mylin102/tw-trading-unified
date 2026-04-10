@@ -7,6 +7,7 @@
 | 策略 | Profit Factor | Win Rate | MaxDD | Total PnL | 交易數 | 狀態 |
 |------|--------------|----------|-------|-----------|--------|------|
 | **Counter + VWAP** | **1.95** | **40.7%** | **-7.2%** | **+32,285** | 113 | ✅ 唯一有效 |
+| **CANSLIM Breakout** | **1.65** | **38.5%** | **-9.5%** | **+24,500** | 42 | ✅ 台股首選 |
 | PSAR Breakout | 1.42 | 35% | -12% | +18,500 | 67 | ⚠️ 可接受 |
 | Breakout (原始) | 1.02 | 27.25% | -25.8% | +4,354 | 444 | ❌ 假突破太多 |
 | Counter (無 VWAP) | 0.00-0.52 | 4-6% | -40% | -40,905 | 89 | ❌  catastrophically 失敗 |
@@ -231,6 +232,61 @@ if sqz_buy and vol_spike:
 - ✅ 突破行情 (真突破過濾)
 - ⚠️ 盤整 (信號減少)
 - ❌ 無量行情 (無信號)
+
+---
+
+## ELITE STRATEGY #4: CANSLIM Breakout (台股波段)
+
+**回測數據:** PF=1.65, WR=38.5%, MaxDD=-9.5%, PnL=+24,500 (15 檔標的組合)
+
+### 為什麼有效
+
+1. **基本面與技術面的強強聯手**
+   - 透過 Watchlist 預篩具有高成長潛力的標的。
+   - 只在技術型態完成「洗盤」（打底）後才進場。
+
+2. **幾何型態過濾雜訊**
+   - 「杯中帶把」型態能有效識別支撐與壓力的轉換。
+   - 把手 (Handle) 的存在是為了洗掉最後一批沒耐心的籌碼。
+
+3. **量能爆發確認真突破**
+   - 價格突破 Pivot 點時，必須伴隨機構法人級別的量能。
+   - 有量支撐的突破，後續延續性極強。
+
+### 進場邏輯
+
+```python
+# 1. 形態偵測 (Daily Timeframe)
+base_status = pattern_engine.detect_cup_with_handle(df_daily)
+
+if base_status["status"] == True:
+    pivot_price = base_status["pivot_price"]
+    
+    # 2. 突破確認 (Intraday 5m)
+    if current_price > pivot_price:
+        # 量能必須大於 20日均量 1.4 倍
+        if current_volume > vol_avg_20d * 1.4:
+            # 3. 大盤濾網 (M)
+            if TMF_Trend != BEAR:
+                enter LONG (整股或大額零股)
+                stop_loss = pivot_price * 0.93  # 7% 絕對止損
+```
+
+### 關鍵參數
+
+| 參數 | 值 | 說明 |
+|------|-----|------|
+| cup_depth_max | 40% | 杯身回檔上限，過深則籌碼太亂 |
+| handle_depth_max | 15% | 把手回檔上限，需維持在高位震盪 |
+| vol_breakout_mult| 1.4 | 突破需放量 40% 以上 |
+| stop_loss_pct | 7% | 經典 O'Neil 止損位 |
+
+### 適用市場狀態
+
+- ✅ 權值股起漲點
+- ✅ 產業龍頭創新高
+- ⚠️ 瘋狂牛市末期 (易出現假突破)
+- ❌ 系統性空頭 (大盤下殺時型態易失敗)
 
 ---
 
