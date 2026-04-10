@@ -62,8 +62,8 @@ def tick_dispatcher(futures_mon, options_mon):
     return on_tick
 
 
-def bidask_dispatcher(options_mon):
-    """Route BidAsk updates to options monitor for IV calculation with safety checks."""
+def bidask_dispatcher(futures_mon, options_mon):
+    """Route BidAsk updates to monitors for IV calculation and data freshness."""
     _seen = set()
     _lock = threading.Lock()
     
@@ -82,7 +82,7 @@ def bidask_dispatcher(options_mon):
                     ask = bidask.ask_price[0] if hasattr(bidask.ask_price, '__getitem__') else bidask.ask_price
                     console.print(f"[cyan]📥 New bidask: {bidask.code} bid={bid} ask={ask}[/cyan]")
             
-            # Direct update: bypass on_bidask method, write to monitor's market_data directly
+            # Use monitor instance (handle OptionsMonitor wrapper)
             mon = options_mon.monitor if hasattr(options_mon, 'monitor') else options_mon
             code = bidask.code
             
@@ -107,6 +107,16 @@ def bidask_dispatcher(options_mon):
                     mon.market_data[key]["ask"] = float(ask)
                     if mon.market_data[key]["close"] <= 0 or key == "MTX":
                         mon.market_data[key]["close"] = mid
+                    
+                    # 💡 GSD: Update freshness timestamp to prevent watchdog from restarting
+                    mon.last_tick_at = time.time()
+                    if hasattr(futures_mon, 'last_tick_at'):
+                        futures_mon.last_tick_at = time.time()
+                    
+                    # 💡 GSD: Also update FuturesMonitor's internal market price cache if it exists
+                    if key == "MTX" and hasattr(futures_mon, 'market_data'):
+                        futures_mon.market_data["MTX"]["close"] = mid
+                    
                     matched = True
                     if code.startswith("MXF"):
                         console.print(f"[green]✅ MTX updated: {mon.market_data['MTX']['close']:.0f}[/green]")
@@ -151,7 +161,7 @@ def run_system(dry_run=False):
         from strategies.futures.monitor import FuturesMonitor
         fm = FuturesMonitor(
             api=api,
-            config_path=os.path.join(BASE, "config", "futures.yaml"),
+            config_path=os.path.join(BASE, "config", "futures_optimized.yaml"),
             dry_run=dry_run,
         )
         fm.setup()
@@ -159,12 +169,8 @@ def run_system(dry_run=False):
         from strategies.options.monitor import OptionsMonitor
         om = OptionsMonitor(api=api, dry_run=dry_run)
 
-        from strategies.stocks.monitor import StockMonitor
-        sm = StockMonitor(
-            api=api,
-            config_path=os.path.join(BASE, "config", "stocks.yaml"),
-            dry_run=dry_run
-        )
+        # GSD Rationale: Stock module moved to scripts/stock_runner.py for fault isolation.
+        # main.py now only handles Futures + Options which share the FOP callback session.
 
         # 先初始化 contracts，再訂閱
         om.monitor.find_best_contracts()
@@ -173,7 +179,7 @@ def run_system(dry_run=False):
         if api is not None:
             import shioaji as sj
             api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om))
-            api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(om))
+            api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(fm, om))
 
             # Subscribe TMF tick
             if fm.contract is not None:
@@ -190,25 +196,81 @@ def run_system(dry_run=False):
 
         ft = threading.Thread(target=fm.run, name="futures", daemon=True)
         ot = threading.Thread(target=om.run, name="options", daemon=True)
-        st_t = threading.Thread(target=sm.run, name="stocks", daemon=True)
         
         ft.start()
         ot.start()
-        st_t.start()
-        console.print("[bold green]🚀 All monitors running (Futures, Options, Stocks)[/bold green]")
+        console.print("[bold green]🚀 Unified Monitors Running (Futures, Options)[/bold green]")
 
         startup_grace_until = time.time() + 60
         health_check_at = time.time() + HEALTH_INTERVAL
-        
+
         # [gstack Sentinel] 數據新鮮度追蹤 — 二次確認防誤判
         last_data_at = time.time()
         stagnation_warned = False  # 第一次只警告，第二次才重啟
+        max_restarts = 5  # Prevent infinite restart loop
+        restart_count = 0
 
-        while (ft.is_alive() and ot.is_alive()):
+        while restart_count < max_restarts:
+            # [Auto-Restart] Check if threads died unexpectedly
+            if not ft.is_alive() or not ot.is_alive():
+                dead = []
+                if not ft.is_alive(): dead.append("futures")
+                if not ot.is_alive(): dead.append("options")
+                console.print(f"[bold red]💀 Thread died: {', '.join(dead)}. Restarting (attempt {restart_count+1}/{max_restarts})...[/bold red]")
+                restart_count += 1
+
+                # Re-initialize monitors and threads
+                try:
+                    from strategies.futures.monitor import FuturesMonitor
+                    fm = FuturesMonitor(
+                        api=api,
+                        config_path=os.path.join(BASE, "config", "futures_optimized.yaml"),
+                        dry_run=dry_run,
+                    )
+                    fm.setup()
+
+                    from strategies.options.monitor import OptionsMonitor
+                    om = OptionsMonitor(api=api, dry_run=dry_run)
+
+                    # Re-subscribe
+                    if api is not None:
+                        import shioaji as sj
+                        api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om))
+                        api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(fm, om))
+
+                        if fm.contract is not None:
+                            api.quote.subscribe(fm.contract, quote_type='tick')
+
+                        om.monitor.find_best_contracts()
+                        om.monitor.pre_fill_bars()
+                        for key in ["MTX", "C", "P"]:
+                            con = om.monitor.active_contracts.get(key)
+                            if con:
+                                api.quote.subscribe(con, quote_type='tick')
+                                api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
+
+                    ft = threading.Thread(target=fm.run, name="futures", daemon=True)
+                    ot = threading.Thread(target=om.run, name="options", daemon=True)
+                    ft.start()
+                    ot.start()
+                    last_data_at = time.time()  # Reset staleness timer
+                    stagnation_warned = False
+                    console.print(f"[bold green]✅ Restarted threads (attempt {restart_count}/{max_restarts})[/bold green]")
+                    time.sleep(10)  # Grace period after restart
+                    continue
+                except Exception as e:
+                    console.print(f"[bold red]💥 Restart failed: {e}[/bold red]")
+                    import traceback
+                    console.print(traceback.format_exc())
+                    break
+
             now = time.time()
             
             # 檢查任何 FOP tick 是否有進來 (TMF 成交量低，單獨追蹤會誤判)
-            latest_tick = max(fm.last_tick_at, om.monitor.last_tick_at if hasattr(om.monitor, 'last_tick_at') else 0)
+            fm_last = getattr(fm, 'last_tick_at', 0)
+            om_last = getattr(om.monitor, 'last_tick_at', 0)
+            latest_tick = max(fm_last, om_last)
+            
             if latest_tick > last_data_at:
                 last_data_at = latest_tick
                 stagnation_warned = False  # tick 恢復，重置警告
@@ -216,14 +278,11 @@ def run_system(dry_run=False):
             # 哨兵邏輯：二次確認 — 5 分鐘警告，10 分鐘才重啟（全天候監控，含夜盤）
             stale_secs = now - last_data_at
             if stale_secs > 600:
-                console.print("[bold red]🚨 DATA STAGNATION CONFIRMED! No ticks for 10 mins. Force restarting...[/bold red]")
+                console.print(f"[bold red]🚨 DATA STAGNATION CONFIRMED! No data for {stale_secs/60:.1f} mins (fm={now-fm_last:.1f}s, om={now-om_last:.1f}s ago). Force restarting...[/bold red]")
                 break
             elif stale_secs > 300 and not stagnation_warned:
-                console.print("[bold yellow]⚠️ DATA WARNING: No ticks for 5 mins. Watching...[/bold yellow]")
+                console.print(f"[bold yellow]⚠️ DATA WARNING: No data for {stale_secs/60:.1f} mins. Watching...[/bold yellow]")
                 stagnation_warned = True
-
-            if not st_t.is_alive():
-                console.print("[bold red]⚠️ Stock Monitor died! Futures/Options still active.[/bold red]")
             
             if RESTART_FLAG.exists():
                 RESTART_FLAG.unlink()

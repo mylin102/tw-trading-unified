@@ -123,8 +123,26 @@ def calculate_futures_squeeze(
             # 如果完全沒有時間資訊，給予預設日期以便運算不崩潰
             df.index = pd.date_range("2026-01-01", periods=len(df), freq="5min")
 
+    # ── GSD: Always calculate trading_day first (essential for logs/dashboard) ──
+    df = df.copy()
+    df["trading_day"] = get_trading_day(df.index)
+
     if len(df) < bb_length:
-        return pd.DataFrame()
+        # GSD: Ensure required columns exist for short dataframes
+        # This list MUST match the full calculation to avoid concat issues
+        for col in ["sqz_on", "momentum", "atr", "mom_velo", "vwap", "score", "regime", 
+                    "bull_align", "bear_align", "bullish_align", "bearish_align", "in_pb_zone",
+                    "ema_fast", "ema_slow", "ema_filter", "ema_macro", "fired"]:
+            if col not in df.columns:
+                if col in ["sqz_on", "fired", "bull_align", "bear_align", "bullish_align", "bearish_align", "in_pb_zone"]:
+                    df[col] = False
+                elif col == "regime":
+                    df[col] = "NORMAL"
+                elif col == "score":
+                    df[col] = 0.0
+                else:
+                    df[col] = np.nan
+        return df
 
     if ta:
         sqz_on, momentum = _pandas_ta_squeeze(df, bb_length, bb_std, kc_length, kc_scalar)

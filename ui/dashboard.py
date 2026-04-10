@@ -79,8 +79,23 @@ if not check_password():
 st_autorefresh(interval=30_000, key="data_refresh")
 
 BASE = Path(__file__).parent.parent
-TODAY = datetime.datetime.now().strftime("%Y-%m-%d")
 DATE_STR = get_session_date_str()  # Single source: shared with main.py
+TODAY = datetime.datetime.now().strftime("%Y-%m-%d")
+
+# ── Sidebar Info ──
+with st.sidebar:
+    st.title("Trading Unified")
+    st.markdown(f"🗓️ **交易日 (Trading Day)**")
+    # GSD: Always use the latest date string from session helper
+    st.code(f"{DATE_STR[:4]}-{DATE_STR[4:6]}-{DATE_STR[6:]}")
+    
+    # 💡 GSD: Continuous Chart Mode toggle
+    cont_mode = st.toggle("🕒 連續圖表模式", value=True, help="顯示最近 24 小時資料，而非僅今日交易日。")
+    
+    st.markdown(f"🕒 **最後更新**: {datetime.datetime.now().strftime('%H:%M:%S')}")
+    st.divider()
+    if st.button("🔄 強制刷新頁面"):
+        st.rerun()
 
 # ── YAML helpers ──
 def load_yaml(path):
@@ -119,57 +134,53 @@ FUTURES_MKT = BASE / "logs" / "market_data"
 FUTURES_TRADES = BASE / "exports" / "trades"
 OPTIONS_DATA = OPTIONS_REPO / "logs" / ("live_trading" if o_live else "paper_trading")
 
-# ── Filter today only ──
+# ── Filter by latest Trading Day ──
 def filter_today(df, ts_col="timestamp"):
     if df is None or df.empty:
         return df
     try:
-        # V-Model fix 1: Deduplicate columns first (narwhals/Plotly require unique columns)
+        from core.date_utils import get_trading_day
+        
+        # V-Model fix 1: Deduplicate columns first
         if df.columns.duplicated().any():
-            seen_cols = set()
-            keep_cols = []
-            for col in df.columns:
-                if col not in seen_cols:
-                    seen_cols.add(col)
-                    keep_cols.append(col)
-            df = df[keep_cols].copy()
+            df = df.loc[:, ~df.columns.duplicated()].copy()
 
-        # V-Model fix 2: Ensure ts_col exists and is unique
         if ts_col not in df.columns:
             return df
 
-        # 統一處理：先轉字串，移除時區偏移 (+HH:MM) 或 UTC 標誌 (Z)
-        df[ts_col] = df[ts_col].astype(str).str.replace(r"[+-]\d{2}:\d{2}$", "", regex=True).str.replace("Z", "")
-        # 強制轉為 datetime 且去時區 (naive)
+        # Standardize timestamp
         df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce").dt.tz_localize(None)
         df = df.dropna(subset=[ts_col])
 
         if df.empty:
             return df
 
-        # 改進：自動抓取資料中的最新日期
-        latest_date = df[ts_col].dt.date.max()
-        filtered_df = df[df[ts_col].dt.date == latest_date].copy()
+        # GSD Rationale: Group by Trading Day and pick the latest one.
+        # Using .apply ensures each timestamp is handled correctly as a scalar.
+        df["_tday"] = df[ts_col].apply(lambda x: get_trading_day(x))
+        latest_tday = df["_tday"].max()
+        filtered_df = df[df["_tday"] == latest_tday].copy()
+        filtered_df = filtered_df.drop(columns=["_tday"])
 
         # 確保排序
         filtered_df = filtered_df.sort_values(ts_col)
 
-        # V-Model fix 3: 過濾 fallback 假資料 with full scalar safety
+        # V-Model fix 3: 過濾 fallback 假資料
         for col in ["close", "price_mtx"]:
-            if col in filtered_df.columns and len(filtered_df) > 1:
-                # Ensure scalar: use .iat[-1] which always returns scalar
-                latest_val = filtered_df[col].iat[-1]
-                # Convert to float safely
-                try:
-                    latest_val_float = float(latest_val)
-                except (TypeError, ValueError):
-                    continue  # Skip this column if can't convert
+            if col in filtered_df.columns and len(filtered_df) > 0:
+                # 排除 0 或負數 (GSD: Data Integrity)
+                filtered_df = filtered_df[filtered_df[col] > 0].copy()
                 
-                if pd.notna(latest_val_float) and latest_val_float > 0:
-                    threshold = latest_val_float * 0.5
-                    # Use .gt() for safe Series comparison
-                    mask = filtered_df[col].gt(threshold)
-                    filtered_df = filtered_df[mask].copy()
+                if not filtered_df.empty:
+                    latest_val = filtered_df[col].iat[-1]
+                    try:
+                        latest_val_float = float(latest_val)
+                        if latest_val_float > 0:
+                            # 異常過濾：若價格低於最新價的 30%（寬鬆一點），判定為系統初始化假數據
+                            mask = filtered_df[col].gt(latest_val_float * 0.3)
+                            filtered_df = filtered_df[mask].copy()
+                    except (TypeError, ValueError):
+                        continue
         return filtered_df
     except Exception as e:
         st.error(f"資料過濾錯誤: {e}")
@@ -235,8 +246,56 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
             marker_color=colors
         ), row=2, col=1)
     
+    # GSD: Enhanced visuals for continuous trading day
+    # 1. Add vertical line at 15:00 (Start of Trading Day)
+    from core.date_utils import is_night_session
+    ts_series = pd.to_datetime(df[ts_col], errors="coerce")
+    for ts in ts_series:
+        if pd.notna(ts) and hasattr(ts, "hour") and ts.hour == 15 and ts.minute == 0:
+            fig.add_vline(x=ts, line_width=1, line_dash="dash", line_color="gray", row="all", col=1)
+
+    # 2. Shaded background for night session
+    night_mask = is_night_session(df[ts_col])
+    if night_mask.any():
+        # Find continuous night blocks
+        night_starts = df.loc[night_mask & ~night_mask.shift(1).fillna(False), ts_col]
+        night_ends = df.loc[night_mask & ~night_mask.shift(-1).fillna(False), ts_col]
+        for start, end in zip(night_starts, night_ends):
+            fig.add_vrect(
+                x0=start, x1=end,
+                fillcolor="gray", opacity=0.1,
+                layer="below", line_width=0,
+                row="all", col=1
+            )
+
     fig.update_layout(height=400, margin=dict(t=10, b=10, l=40, r=20), showlegend=False)
-    fig.update_yaxes(tickformat=",.0f")
+    
+    # 💡 GSD: Explicitly set Y-axis range to follow data closely
+    if len(df) > 0:
+        p_vals = df[p_col].dropna().to_numpy()
+        if len(p_vals) > 0:
+            p_min, p_max = p_vals.min(), p_vals.max()
+            if p_max > p_min:
+                # Add 5% padding instead of 10% for tighter zoom
+                padding = (p_max - p_min) * 0.05
+                fig.update_yaxes(range=[p_min - padding, p_max + padding], row=1, col=1, autorange=False)
+            else:
+                # Flat line: use normal range mode (don't force zero)
+                fig.update_yaxes(rangemode="normal", row=1, col=1)
+    
+    # Apply format to all Y axes, but don't force autorange here
+    fig.update_yaxes(tickformat=",.0f", fixedrange=False)
+    
+    # 3. Remove non-trading gaps and improve labels
+    fig.update_xaxes(
+        tickformat="%m/%d\n%H:%M",
+        hoverformat="%Y/%m/%d %H:%M",
+        rangebreaks=[
+            dict(bounds=[13.75, 15], pattern="hour"),  # 13:45 - 15:00
+            dict(bounds=[5, 8.75], pattern="hour"),    # 05:00 - 08:45
+            dict(bounds=["sat", "mon"]),               # Weekend
+        ]
+    )
     return fig
 
 # ── PnL helpers ──
@@ -548,7 +607,7 @@ def make_pnl_chart(pnl_df, title):
     return fig
 
 @st.cache_data(ttl=5)
-def load_futures_indicators():
+def load_futures_indicators(full_history=False):
     def _read_and_standardize(path):
         try:
             df = pd.read_csv(path)
@@ -566,11 +625,9 @@ def load_futures_indicators():
                     df = df.rename(columns={df.columns[0]: "timestamp"})
 
             # 2. V-Model fix: Remove case-insensitive duplicate columns BEFORE renaming
-            #    CSV files may have BOTH "Open,High,Low,Close" AND "open,high,low,close"
             col_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume", "Amount": "amount"}
             for upper, lower in col_map.items():
                 if upper in df.columns and lower in df.columns:
-                    # Drop the uppercase, keep lowercase (they have same data)
                     df = df.drop(columns=[upper])
 
             # 3. 統一 OHLC 欄位為小寫
@@ -579,31 +636,29 @@ def load_futures_indicators():
         except Exception:
             return None
 
-    # 1. 優先找今天所有可能的檔案並合併
-    #    夜盤 15:00 後也要讀明天的檔案
+    # 1. 優先找最近 3 天所有可能的檔案並合併 (確保跨交易日資料完整)
     import datetime as dt
     now = dt.datetime.now()
-    today_files = [DATE_STR]
-    if now.hour >= 15:
-        tomorrow = (now + dt.timedelta(days=1)).strftime("%Y%m%d")
-        today_files.append(tomorrow)
+    # GSD: Include tomorrow to cover the active trading session after 15:00 rollover
+    search_days = [
+        (now - dt.timedelta(days=1)).strftime("%Y%m%d"),
+        now.strftime("%Y%m%d"),
+        (now + dt.timedelta(days=1)).strftime("%Y%m%d")
+    ]
     
     all_dfs = []
-    for date_part in today_files:
+    for date_part in search_days:
         for tag in ["", "_LIVE", "_PAPER", "_DRY"]:
             f = FUTURES_MKT / f"TMF_{date_part}{tag}_indicators.csv"
             if f.exists():
                 df = _read_and_standardize(f)
                 if df is not None and "timestamp" in df.columns:
-                    # 確保 timestamp 是 datetime
                     if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
                         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-                    # 如果是明天的檔案，只取 >=15:00 的夜盤資料
-                    if date_part != DATE_STR:
-                        df = df[df["timestamp"].dt.hour >= 15]
                     if not df.empty:
                         all_dfs.append(df)
     
+    result = None
     if all_dfs:
         common_cols = set(all_dfs[0].columns)
         for df in all_dfs[1:]:
@@ -612,7 +667,12 @@ def load_futures_indicators():
             common_cols.add("timestamp")
         cleaned_dfs = [df[list(common_cols)] for df in all_dfs]
         merged = pd.concat(cleaned_dfs).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
-        result = filter_today(merged)
+        
+        if full_history:
+            cutoff = now - dt.timedelta(hours=24)
+            result = merged[merged["timestamp"] >= cutoff].copy()
+        else:
+            result = filter_today(merged)
     else:
         # 2. 備案：找目錄下最新的 CSV
         try:
@@ -623,9 +683,11 @@ def load_futures_indicators():
                 if df is not None and "timestamp" in df.columns:
                     if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
                         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-                    if DATE_STR not in str(latest_file) and now.hour >= 15:
-                        df = df[df["timestamp"].dt.hour >= 15]
-                    result = filter_today(df) if not df.empty else None
+                    if full_history:
+                        cutoff = now - dt.timedelta(hours=24)
+                        result = df[df["timestamp"] >= cutoff].copy()
+                    else:
+                        result = filter_today(df) if not df.empty else None
         except Exception:
             result = None
 
@@ -658,48 +720,72 @@ def load_futures_trades():
 OPTIONS_SUB = "live_trading" if o_live else "paper_trading"
 
 @st.cache_data(ttl=5)
-def load_options_indicators():
-    # 1. 優先找今天的
-    best = None
-    for sub in ["live_trading", "paper_trading"]:
-        f = OPTIONS_REPO / "logs" / sub / f"OPTIONS_{DATE_STR}_indicators.csv"
-        if f.exists() and f.stat().st_mtime > (best[1] if best else 0):
-            best = (f, f.stat().st_mtime)
+def load_options_indicators(full_history=False):
+    # GSD: Load multiple days to cover full trading session
+    import datetime as dt
+    now = dt.datetime.now()
+    # 交易日邏輯：15:00 之後歸屬明天
+    t_day_str = get_session_date_str(now)
+    
+    days = [
+        (now - dt.timedelta(days=1)).strftime("%Y%m%d"),
+        now.strftime("%Y%m%d"),
+        t_day_str
+    ]
+    # Deduplicate days
+    days = sorted(list(set(days)))
+    
+    all_dfs = []
+    for d_str in days:
+        for sub in ["live_trading", "paper_trading"]:
+            f = OPTIONS_REPO / "logs" / sub / f"OPTIONS_{d_str}_indicators.csv"
+            if f.exists():
+                try:
+                    df = pd.read_csv(f)
+                    if not df.empty:
+                        # 確保 timestamp 是 datetime
+                        if "timestamp" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+                            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                        all_dfs.append(df)
+                except Exception:
+                    continue
 
-    # 2. 備案：找目錄下最新的任何指標檔案（防斷鍊）
-    if not best:
+    result = None
+    if all_dfs:
+        try:
+            merged = pd.concat(all_dfs).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+            if merged.columns.duplicated().any():
+                merged = merged.loc[:, ~merged.columns.duplicated()].copy()
+            
+            if full_history:
+                cutoff = now - dt.timedelta(hours=24)
+                result = merged[merged["timestamp"] >= cutoff].copy()
+            else:
+                # 💡 GSD: We want to see data belonging to the CURRENT trading session
+                # If it's 09:00 AM, we want to see data from 15:00 (yesterday) onwards.
+                result = filter_today(merged, ts_col="timestamp")
+        except Exception:
+            pass
+            
+    if result is None or result.empty:
+        # 2. 備案：找目錄下最新的任何指標檔案（防斷鍊）
         try:
             all_opt_files = list((OPTIONS_REPO / "logs").rglob("OPTIONS_*_indicators.csv"))
             if all_opt_files:
                 latest_f = max(all_opt_files, key=os.path.getmtime)
-                best = (latest_f, latest_f.stat().st_mtime)
+                df = pd.read_csv(latest_f)
+                if not df.empty:
+                    if "timestamp" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+                        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                    if full_history:
+                        cutoff = now - dt.timedelta(hours=24)
+                        result = df[df["timestamp"] >= cutoff].copy()
+                    else:
+                        result = filter_today(df, ts_col="timestamp")
         except Exception:
             pass
-
-    if best:
-        try:
-            df = pd.read_csv(best[0])
-            if df.columns.duplicated().any():
-                df = df.loc[:, ~df.columns.duplicated()].copy()
-            result = filter_today(df, ts_col="timestamp")
-
-            # Stale data detection: if latest bar is > 10 min old, warn
-            if result is not None and not result.empty and "timestamp" in result.columns:
-                try:
-                    result["timestamp"] = pd.to_datetime(result["timestamp"], errors="coerce")
-                    result = result.dropna(subset=["timestamp"])
-                    if not result.empty:
-                        latest_bar = result["timestamp"].max()
-                        age_secs = (pd.Timestamp.now() - latest_bar).total_seconds()
-                        if age_secs > 600:  # 10 minutes
-                            st.warning(f"⚠️ 資料停滯 {age_secs/60:.0f} 分鐘 — main.py 可能未運行")
-                except Exception:
-                    pass
-
-            return result
-        except Exception:
-            pass
-    return None
+            
+    return result
 
 @st.cache_data(ttl=5)
 def load_options_ledger():
@@ -779,8 +865,8 @@ tab_overview, tab_futures, tab_options, tab_stocks, tab_settings = st.tabs(["總
 # ════════════════════════════════════════
 with tab_overview:
     col1, col2 = st.columns(2)
-    f_df = load_futures_indicators()
-    o_df = load_options_indicators()
+    f_df = load_futures_indicators(full_history=cont_mode)
+    o_df = load_options_indicators(full_history=cont_mode)
 
     with col1:
         st.header(f"期貨 TMF ({mode_badge(f_live)})")
@@ -938,7 +1024,7 @@ with tab_overview:
 with tab_futures:
     st.header(f"期貨 TMF ({mode_badge(f_live)})")
 
-    f_df = load_futures_indicators()
+    f_df = load_futures_indicators(full_history=cont_mode)
     if f_df is not None and not f_df.empty:
         last = f_df.iloc[-1]
         fc1, fc2, fc3, fc4 = st.columns(4)
@@ -959,9 +1045,9 @@ with tab_futures:
         bear = last.get("bear_align", last.get("bearish_align", False))
         trend = "🟢 多頭排列" if bull else ("🔴 空頭排列" if bear else "⚪ 中性")
         fc3.metric("趨勢", trend)
-        fc4.metric("Squeeze", "🔒 壓縮中" if last.get("sqz_on", False) else "🔓 已釋放")
+        fc4.metric("Squeeze", "🔒 壓縮中" if last.get("sqz_on", False) is True else "🔓 已釋放")
 
-        if "fired" in last and last.get("fired", False):
+        if "fired" in last and last.get("fired", False) is True:
             st.success("🔥 **FIRE — 壓縮釋放！**")
         
         ft = load_futures_trades()
@@ -1017,9 +1103,27 @@ with tab_futures:
 # ════════════════════════════════════════
 with tab_options:
     st.header(f"選擇權 TXO ({mode_badge(o_live)})")
-    o_df = load_options_indicators()
-    if o_df is not None and not o_df.empty and "price_mtx" in o_df.columns:
-        last = o_df.iloc[-1]
+    o_df = load_options_indicators(full_history=cont_mode)
+    if o_df is not None and not o_df.empty:
+        # Debug info (expander)
+        with st.expander("🛠️ 數據狀態 (Debug)"):
+            st.write(f"資料筆數: {len(o_df)}")
+            st.write(f"時間範圍: {o_df['timestamp'].min()} ~ {o_df['timestamp'].max()}")
+            if "price_mtx" in o_df.columns:
+                st.write(f"MTX 範圍: {o_df['price_mtx'].min():.0f} ~ {o_df['price_mtx'].max():.0f}")
+            
+            # GSD: Show which files were loaded
+            import glob
+            st.write("**載入檔案列表:**")
+            for sub in ["live_trading", "paper_trading"]:
+                pattern = str(OPTIONS_REPO / "logs" / sub / "OPTIONS_*_indicators.csv")
+                files = sorted(glob.glob(pattern), reverse=True)[:3]
+                for f in files:
+                    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(f)).strftime('%Y-%m-%d %H:%M:%S')
+                    st.text(f"{os.path.basename(f)} (修改: {mtime})")
+        
+        if "price_mtx" in o_df.columns:
+            last = o_df.iloc[-1]
         oc1, oc2, oc3, oc4 = st.columns(4)
         # V-Model fix: Handle duplicate columns by taking first match
         mtx_val = last.get('price_mtx', 0)
@@ -1040,7 +1144,7 @@ with tab_options:
         iv = last.get("iv", 0)
         oc4.metric("IV", f"{iv*100:.1f}%" if iv and iv < 1 else f"{iv:.1f}%")
 
-        if "fired" in last and last.get("fired", False):
+        if "fired" in last and last.get("fired", False) is True:
             st.success("🔥 **FIRE — 壓縮釋放！**")
 
         # 顯示當前選擇權持倉
@@ -1330,12 +1434,24 @@ with tab_settings:
             f_score = fc1.slider("進場門檻 (Score)", 10, 100, value=futures_cfg.get("strategy", {}).get("entry_score", 20))
             f_atr = fc2.slider("ATR 止損倍數", 1.0, 5.0, value=float(futures_cfg.get("risk_mgmt", {}).get("atr_multiplier", 2.0)), step=0.1)
 
+            st.divider()
+            st.markdown("##### 🛡️ 進階安全與成本設定")
+            fc3, fc4 = st.columns(2)
+            f_stop_fixed = fc3.number_input("固定停損點數 (pts)", min_value=10, max_value=200,
+                                           value=int(futures_cfg.get("risk_mgmt", {}).get("stop_loss_pts", 60)),
+                                           help="ATR 失效或為 0 時使用的保險底線停損點數。")
+            f_fee = fc4.number_input("單邊手續費 (TWD)", min_value=0.0, max_value=100.0,
+                                    value=float(futures_cfg.get("execution", {}).get("broker_fee_per_side", 20.0)),
+                                    help="用於 PnL 計算。請輸入你的真實券商折扣後手續費。")
+
             if st.form_submit_button("💾 儲存並重啟期貨模組"):
                 futures_cfg["live_trading"] = f_live_new
                 futures_cfg["active_strategy"] = f_strat_new
                 futures_cfg["strategy"]["regime_filter"] = f_regime
                 futures_cfg["strategy"]["entry_score"] = f_score
                 futures_cfg["risk_mgmt"]["atr_multiplier"] = f_atr
+                futures_cfg["risk_mgmt"]["stop_loss_pts"] = f_stop_fixed
+                futures_cfg["execution"]["broker_fee_per_side"] = f_fee
                 futures_cfg["trade_mgmt"]["lots_per_trade"] = f_lots
                 futures_cfg["trade_mgmt"]["max_positions"] = f_max_pos
                 save_yaml(FUTURES_CFG_PATH, futures_cfg)
@@ -1383,6 +1499,16 @@ with tab_settings:
             o_min_iv = oc3.slider("最低 IV 限制", 0.1, 0.5, value=float(options_cfg.get("min_iv", 0.15)), step=0.01)
             o_max_iv = oc4.slider("最高 IV 限制", 0.3, 1.0, value=float(options_cfg.get("max_iv", 0.60)), step=0.01)
 
+            st.divider()
+            st.markdown("##### 🛡️ 進階安全與成本設定")
+            oc5, oc6 = st.columns(2)
+            o_fee = oc5.number_input("單邊手續費 (TWD)", min_value=0.0, max_value=100.0,
+                                    value=float(options_cfg.get("execution", {}).get("broker_fee_per_side", 20.0)),
+                                    help="券商收取的單口單邊手續費。")
+            o_exch = oc6.number_input("單邊交易所費 (TWD)", min_value=0.0, max_value=100.0,
+                                     value=float(options_cfg.get("execution", {}).get("exchange_fee_per_side", 5.0)),
+                                     help="期交所收取的單口單邊費用。")
+
             if st.form_submit_button("💾 儲存並重啟選擇權模組"):
                 options_cfg["live_trading"] = o_live_new
                 options_cfg["mode"] = o_mode_new
@@ -1390,6 +1516,8 @@ with tab_settings:
                 options_cfg["strategy"]["fire_score_threshold"] = o_fire_thresh
                 options_cfg["min_iv"] = o_min_iv
                 options_cfg["max_iv"] = o_max_iv
+                options_cfg["execution"]["broker_fee_per_side"] = o_fee
+                options_cfg["execution"]["exchange_fee_per_side"] = o_exch
                 options_cfg["risk_mgmt"]["lots_per_trade"] = o_lots
                 options_cfg["risk_mgmt"]["max_positions"] = o_max_pos
                 save_yaml(OPTIONS_CFG_PATH, options_cfg)
@@ -1461,10 +1589,33 @@ with tab_settings:
                 }
                 save_yaml(STOCK_CFG_PATH, new_stock_cfg)
                 trigger_restart()
+                # GSD Fix: stock_runner is independent process, must be killed separately
+                import subprocess
+                subprocess.run(["pkill", "-f", "stock_runner.py"], capture_output=True)
                 st.success("台股設定已更新，正在重啟系統...")
 
+    # ── 4. 危險區域 ──
     st.divider()
-    st.info("期貨與選擇權設定請編輯對應的 YAML 檔案")
+    with st.expander("🚨 危險區域 (Danger Zone)", expanded=False):
+        st.warning("以下操作將永久刪除數據，請謹慎執行。")
+        col_d1, col_d2 = st.columns([2, 1])
+        with col_d1:
+            st.markdown("##### 🗑️ 清空模擬交易數據")
+            st.caption("這將歸零所有 Paper Trading 的持倉與歷史紀錄 CSV，方便切換實盤前清空數據。")
+        with col_d2:
+            if st.button("執行清空", type="primary", use_container_width=True):
+                try:
+                    import subprocess
+                    result = subprocess.run(["python3", "scripts/clear_simulation_data.py", "--force"], 
+                                         capture_output=True, text=True, check=True)
+                    st.success("✅ 數據已清空！")
+                    st.toast("Simulation data cleared successfully.")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"清空失敗: {e}")
+
+    st.info("💡 提示: 部分進階設定可直接編輯 `config/*.yaml` 檔案。")
 
 # ── Footer and Refresh ──
 refresh = 30

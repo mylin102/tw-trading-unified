@@ -7,7 +7,7 @@ strategy:
   regime_filter: mid
   use_opening_logic: true
   require_fire: true
-  fire_score_threshold: 70  # fired=False 但 score≥70 也允許進場 (原 80 太高)
+  fire_score_threshold: 60
   require_align: true
   fallback_underlying_price: 33500
   monthly_delivery_min_days: 14
@@ -30,7 +30,7 @@ modes:
   V2:
     holding_mode: swing
     delivery_pref: monthly
-    tp1_pct: 0.5  # TP1 50% (R:R = 1:2.5, 原 30% 太低)
+    tp1_pct: 0.5
     bear_boost_pct: 0.8
     force_close_at_end: false
     trailing_stop_pct: 0.15
@@ -48,6 +48,8 @@ exit_optimization:
   opening_spike_capture: true
   opening_target_pct: 0.15
 execution:
+  broker_fee_per_side: 20.0
+  exchange_fee_per_side: 5.0
   order_type: Limit
   aggressive_ticks: 2
   max_spread_pct: 0.05
@@ -67,12 +69,14 @@ pricing:
   expiry_dte_floor_days: 0.35
   strike_rounding: 100
 risk_mgmt:
-  stop_loss_pct: 0.2  # 20% 停損 (原 10% 太緊，正常波動就被砍)
+  stop_loss_pct: 0.2
   lots_per_trade: 1
-  max_positions: 1
+  max_positions: 2
   initial_capital: 40000
   max_holding_days: 7
   min_dte_to_exit: 3
+  entry_premium_limit: 250
+  opening_grace_mins: 5
   max_position_size: 0.05
   max_daily_loss: 0.02
 night_trading:
@@ -100,6 +104,7 @@ theta_gang:
   max_loss_pct: 1.0
   exit_on_squeeze_release: true
   risk_free_rate: 0.02
-# 頂層預設值 (被 strategy.entry_score 覆蓋)
 min_iv: 0.15
 max_iv: 0.6
+mode: V2
+entry_score: 73

@@ -148,6 +148,15 @@ class ShioajiOptionsSmartMonitor:
             console.print(f"[dim][pricing] Using py_vollib ({self._pricing_model})[/dim]")
         self.eod_panic_time = self._parse_hhmm(self.exit_opt.get("eod_panic_time", "13:30"))
         self.eod_passive_window_mins = int(self.exit_opt.get("eod_passive_window_mins", 20))
+        
+        # GSD: New risk management parameters
+        self.risk_mgmt = self.full_cfg.get("risk_mgmt", {})
+        self.entry_premium_limit = float(self.risk_mgmt.get("entry_premium_limit", 250))
+        self.opening_grace_mins = int(self.risk_mgmt.get("opening_grace_mins", 5))
+        
+        # Parameterized fees (GSD enhancement)
+        self.broker_fee_per_side = float(self.execution_cfg.get("broker_fee_per_side", 20.0))
+        self.exchange_fee_per_side = float(self.execution_cfg.get("exchange_fee_per_side", 5.0))
         self.shutdown_grace_mins = int(self.exit_opt.get("shutdown_grace_mins", 1))
         self.api = None if self.dry_run else shioaji_login.login()
         if self.dry_run_live_orders:
@@ -160,10 +169,10 @@ class ShioajiOptionsSmartMonitor:
         self._mtx_tick_bars_deque = deque(maxlen=300)
         self._mtx_tick_bars_cache = None  # Cached DF for indicator calculations
         self._current_mtx_bar = {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0, "ts": None}
-        self._last_mtx_bar_ts = None  # [Wave 1 optimization] Cache MTX bar timestamp to avoid repeated floor() calls
+        self._last_mtx_bar_ts = int(time.time() / 300) * 300
         self.active_contracts = {}
         self.lock = threading.Lock()
-        self.last_tick_at = 0  # Sentinel: track tick freshness
+        self.last_tick_at = time.time()  # [GSD Fix] Initialize to NOW, not 0 — avoids false staleness on restart
         self.position, self.active_side, self.entry_price, self.has_tp1_hit, self.stop_loss_price = 0, None, 0.0, False, 0.0
         self.entry_mtx_price = 0.0
         self.entry_time = None
@@ -401,8 +410,8 @@ class ShioajiOptionsSmartMonitor:
             target_mtx = mtx_cons[0]
             snaps = self.api.snapshots([target_mtx])
             if not snaps:
-                console.print("[yellow]⚠️ snapshots 回傳空，使用 fallback 價格[/yellow]")
-                S = self.fallback_underlying_price or 20000
+                console.print(f"[yellow]⚠️ snapshots 回傳空，使用 fallback 價格: {self.fallback_underlying_price}[/yellow]")
+                S = self.fallback_underlying_price
             else:
                 snap = snaps[0]
                 S = snap.close if snap.close > 0 else self.fallback_underlying_price
@@ -454,13 +463,145 @@ class ShioajiOptionsSmartMonitor:
                 console.print(f"[yellow]⚠️  無法預同步選擇權行情：{e}[/yellow]")
 
             console.print(f"[bold cyan][MODE {self.mode}][/bold cyan] Monitoring {nearest_date} | ATM {atm_strike} | MTX: {target_mtx.code}")
-            return True
             
+            # [Phase 1 Fix] Validate contracts haven't expired
+            today = datetime.date.today()
+            for side, contract in [("C", self.active_contracts["C"]), ("P", self.active_contracts["P"])]:
+                try:
+                    if not hasattr(contract, 'delivery_date') or not contract.delivery_date:
+                        continue
+                    dd = contract.delivery_date
+                    # Shioaji may return str in various formats — normalize
+                    if isinstance(dd, str):
+                        # Try multiple formats Shioaji might use
+                        parsed = None
+                        for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
+                            try:
+                                parsed = datetime.datetime.strptime(dd, fmt).date()
+                                break
+                            except ValueError:
+                                continue
+                        if parsed is None:
+                            console.print(f"[dim]⚠️ Could not parse delivery date '{dd}' for {contract.code}, skipping expiry check[/dim]")
+                            continue
+                        dd = parsed
+                    elif hasattr(dd, 'date'):
+                        dd = dd.date()
+                    if dd <= today:
+                        console.print(f"[red]🚫 Contract {contract.code} expires today or earlier! Rejecting.[/red]")
+                        return False
+                except Exception as e:
+                    console.print(f"[dim]⚠️ Expiry check error for {side}: {e}, allowing contract[/dim]")
+                    continue
+            
+            return True
+
         except Exception as e:
             console.print(f"[red]❌ find_best_contracts 發生異常：[/red] {e}")
             import traceback
             console.print(traceback.format_exc())
             return False
+
+    def _check_options_contract_staleness(self):
+        """[Phase 1 Fix] Check if options ticks are stale and attempt recovery."""
+        if self.dry_run or not self.api:
+            return
+        
+        secs_since_tick = time.time() - self.last_tick_at
+        if secs_since_tick < 120:  # Less than 2 min, all good
+            return
+        
+        console.print(f"[yellow]⚠️ Options data stale for {secs_since_tick/60:.1f} min, checking contracts...[/yellow]")
+        
+        # Check if current contracts have expired
+        today_str = datetime.date.today().strftime("%Y/%m/%d")
+        needs_refresh = False
+
+        for side, contract in [("C", self.active_contracts.get("C")), ("P", self.active_contracts.get("P"))]:
+            if not contract:
+                needs_refresh = True
+                break
+            # GSD: Compare standardized YYYY/MM/DD strings
+            dd = getattr(contract, 'delivery_date', None)
+            if dd and isinstance(dd, str):
+                # Clean Shioaji delivery_date format if needed
+                dd_clean = dd.replace("-", "/")
+                if dd_clean <= today_str:
+                    console.print(f"[yellow]⚠️ {side} contract {contract.code} expired (delivery: {dd})[/yellow]")
+                    needs_refresh = True
+        
+        if needs_refresh:
+            console.print("[bold yellow]🔄 Refreshing options contracts...[/bold yellow]")
+            try:
+                # Clear existing to trigger resolve in next loop or immediate
+                for side in ["C", "P"]:
+                    self.active_contracts[side] = None
+                self.find_best_contracts()
+                
+                # Re-subscribe will happen in the next iteration via run() logic
+                # or we can force it here
+                self.last_tick_at = time.time() # Reset timer to prevent loop
+            except Exception as e:
+                console.print(f"[red]Refresh contracts error:[/red] {e}")
+        else:
+            # Contracts not expired, but no ticks - could be market lull
+            # [GSD Fix] DO NOT re-subscribe — Shioaji C++ crashes on repeated subscribe/unsubscribe
+            # Instead, just log and let the main.py sentinel handle process-level recovery
+            console.print(f"[dim]⚠️ Options ticks quiet but contracts valid — letting sentinel handle if needed[/dim]")
+            # Reset tick timestamp to avoid repeated warnings
+            self.last_tick_at = time.time()
+
+    def _save_options_bar(self):
+        """[GSD Fix] Save options market data to CSV every loop iteration — mirrors futures _save_bar().
+        Ensures data persists even when no signal is generated."""
+        try:
+            from pathlib import Path
+            from core.date_utils import get_session, get_session_date_str
+            import datetime as _dt
+
+            now = _dt.datetime.now()
+            date_str = get_session_date_str(now)
+            log_base = Path("logs/market_data")
+            log_base.mkdir(parents=True, exist_ok=True)
+            csv_path = log_base / f"OPTIONS_{date_str}_indicators.csv"
+
+            md = self.market_data
+            mtx_close = float(md.get("MTX", {}).get("close", 0))
+            c_close = float(md.get("C", {}).get("close", 0))
+            p_close = float(md.get("P", {}).get("close", 0))
+            c_bid = float(md.get("C", {}).get("bid", 0))
+            c_ask = float(md.get("C", {}).get("ask", 0))
+            p_bid = float(md.get("P", {}).get("bid", 0))
+            p_ask = float(md.get("P", {}).get("ask", 0))
+            c_code = getattr(self.active_contracts.get("C"), "code", "")
+            p_code = getattr(self.active_contracts.get("P"), "code", "")
+            mtx_code = getattr(self.active_contracts.get("MTX"), "code", "")
+
+            row = {
+                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "session": get_session(now),
+                "mtx_code": mtx_code, "mtx_close": mtx_close,
+                "call_code": c_code, "call_close": c_close, "call_bid": c_bid, "call_ask": c_ask,
+                "put_code": p_code, "put_close": p_close, "put_bid": p_bid, "put_ask": p_ask,
+                "position": self.position, "side": self.active_side or "",
+                "entry_price": self.entry_price, "stop_loss": self.stop_loss_price,
+                "score": self.latest_score, "trend": self.latest_mid_trend,
+            }
+
+            df_row = pd.DataFrame([row])
+            if csv_path.exists():
+                try:
+                    df_existing = pd.read_csv(csv_path)
+                    df_combined = pd.concat([df_existing, df_row], ignore_index=True)
+                    df_combined.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
+                    df_combined.to_csv(csv_path, index=False)
+                except Exception:
+                    df_row.to_csv(csv_path, mode="a", index=False, header=False)
+            else:
+                df_row.to_csv(csv_path, index=False, header=True)
+        except Exception as e:
+            # Never crash the main loop over saving
+            pass
 
     def _resolve_dry_run_contract_spec(self, current_time=None, underlying_hint=None):
         current_time = current_time or (self.replay_bars.index[0].to_pydatetime() if self.replay_bars is not None else datetime.datetime.now())
@@ -535,7 +676,7 @@ class ShioajiOptionsSmartMonitor:
                 ts_int = int(tick_ts.timestamp() / 300) * 300
                 
                 bar = self._current_mtx_bar
-                if bar["ts"] is None or ts_int != self._last_mtx_bar_ts:
+                if bar["ts"] is None or ts_int > self._last_mtx_bar_ts:
                     if bar["ts"] is not None and bar["open"] > 0:
                         # [Wave 2 optimization] Use deque for O(1) append/trim instead of DataFrame.loc + slicing
                         bar_dict = {
@@ -555,14 +696,17 @@ class ShioajiOptionsSmartMonitor:
                     self._last_mtx_bar_ts = ts_int
                     bar["open"] = bar["high"] = bar["low"] = bar["close"] = price
                     bar["volume"] = vol
-                else:
+                elif ts_int == self._last_mtx_bar_ts:
                     bar["high"] = max(bar["high"], price)
                     bar["low"] = min(bar["low"], price)
                     bar["close"] = price
                     bar["volume"] += vol
+                else:
+                    return
 
     def on_bidask(self, exchange, bidask):
         """Update bid/ask from BidAsk callback — more frequent than Tick in off-hours."""
+        self.last_tick_at = time.time()  # Sentinel: track data freshness
         with self.lock:
             code = bidask.code
             bid = bidask.bid_price[0] if hasattr(bidask.bid_price, '__getitem__') else float(bidask.bid_price)
@@ -604,9 +748,9 @@ class ShioajiOptionsSmartMonitor:
         if is_exit_action:
             gross_pnl = (price - self.entry_price) * point_value * qty
             # 扣除交易成本 (RULES.md Rule 4: PnL Must Include All Costs)
-            # 期權手續費: 券商佣金 ~20 TWD/口/邊, 交易所費用 ~5 TWD/口/邊
-            broker_fee = 20 * 2 * qty  # 進出各一次
-            exchange_fee = 5 * 2 * qty
+            # 期權手續費 (GSD parameterized)
+            broker_fee = self.broker_fee_per_side * 2 * qty  # 進出各一次
+            exchange_fee = self.exchange_fee_per_side * 2 * qty
             # 交易稅: 期權約 0.1% 權利金
             tax_rate = self.pricing_cfg.get("tax_rate", 0.001)
             tax = (self.entry_price + price) * point_value * tax_rate * qty
@@ -743,34 +887,45 @@ class ShioajiOptionsSmartMonitor:
         mid_trend = (signal["mid_trend"] or "") if signal else self.latest_mid_trend
         side_label = (signal["side"] or "") if signal else ""
 
-        if price_mtx > 0:
-            try:
-                calc_side = (signal.get("side") if signal and signal.get("side") else "C")
-                quote = self.current_option_quote(calc_side)
-                contract = self.active_contracts.get(calc_side)
-                strike = float(getattr(contract, "strike_price", resolve_option_strike(price_mtx, self.strike_rounding)))
-                delivery_date = getattr(contract, "delivery_date", None)
-                dte_years = float(self._dte(delivery_date) if delivery_date else 3.0 / 365.0)
-                option_price = float(quote["mid"])
-                option_type = 'c' if calc_side == 'C' else 'p'
+        if price_mtx <= 0:
+            # 💡 GSD: Don't record if price is 0 (initialization spike)
+            return
 
-                if option_price > 0 and strike > 0:
-                    try:
-                        iv = float(self._iv(option_price, price_mtx, strike, dte_years, self.risk_free_rate, option_type))
-                        res = self._bs(price_mtx, strike, dte_years, self.risk_free_rate, iv, option_type=calc_side)
-                        delta_val, gamma_val, vega_val = res["delta"], res["gamma"], res["vega"]
-                    except Exception:
-                        res = self._bs(price_mtx, strike, dte_years, self.risk_free_rate, 0.25, option_type=calc_side)
-                        iv, delta_val, gamma_val, vega_val = 0.25, res["delta"], res["gamma"], res["vega"]
-                elif strike > 0:
+        try:
+            calc_side = (signal.get("side") if signal and signal.get("side") else "C")
+            quote = self.current_option_quote(calc_side)
+            contract = self.active_contracts.get(calc_side)
+            strike = float(getattr(contract, "strike_price", resolve_option_strike(price_mtx, self.strike_rounding)))
+            delivery_date = getattr(contract, "delivery_date", None)
+            dte_years = float(self._dte(delivery_date) if delivery_date else 3.0 / 365.0)
+            option_price = float(quote["mid"])
+            option_type = 'c' if calc_side == 'C' else 'p'
+
+            if option_price > 0 and strike > 0:
+                try:
+                    iv = float(self._iv(option_price, price_mtx, strike, dte_years, self.risk_free_rate, option_type))
+                    res = self._bs(price_mtx, strike, dte_years, self.risk_free_rate, iv, option_type=calc_side)
+                    delta_val, gamma_val, vega_val = res["delta"], res["gamma"], res["vega"]
+                except Exception:
                     res = self._bs(price_mtx, strike, dte_years, self.risk_free_rate, 0.25, option_type=calc_side)
                     iv, delta_val, gamma_val, vega_val = 0.25, res["delta"], res["gamma"], res["vega"]
-            except Exception as e:
-                console.print(f"[red]Greeks calculation error:[/red] {e}")
+            elif strike > 0:
+                res = self._bs(price_mtx, strike, dte_years, self.risk_free_rate, 0.25, option_type=calc_side)
+                iv, delta_val, gamma_val, vega_val = 0.25, res["delta"], res["gamma"], res["vega"]
+        except Exception as e:
+            console.print(f"[red]Greeks calculation error:[/red] {e}")
 
-        row = {
-            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "score": score,
+        from core.date_utils import get_session
+        now = datetime.datetime.now()
+        
+        # GSD: Base on signal data to ensure all indicators are preserved
+        row = signal.copy() if signal else {}
+        
+        # Standardize and add Greeks
+        row.update({
+            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "session": get_session(now),
+            "score": score,  # Use the freshly calculated score
             "side": side_label,
             "price_mtx": price_mtx,
             "strike": strike,
@@ -780,16 +935,29 @@ class ShioajiOptionsSmartMonitor:
             "delta": round(delta_val, 4),
             "gamma": round(gamma_val, 6),
             "vega": round(vega_val, 4),
-            # 進場關鍵欄位 (resolve_entry_side 需要)
+            # Backwards compatibility/aliases for dashboard
             "vwap": price_mtx,
-            "sqz_on": signal.get("squeeze_on", False) if signal else False,
-            "fired": signal.get("fired", False) if signal else False,
-            "bullish_align": signal.get("bullish_align", False) if signal else False,
-            "bearish_align": signal.get("bearish_align", False) if signal else False,
-        }
+            "sqz_on": row.get("sqz_on", row.get("squeeze_on", False)),
+            "fired": row.get("fired", False),
+        })
+        
         if iv > 0:
             self.latest_iv = iv
-        pd.DataFrame([row]).to_csv(self.indicator_log_path, mode="a", index=False, header=not self.indicator_log_path.exists())
+            
+        # GSD Fix: Support dynamic column expansion
+        df_row = pd.DataFrame([row])
+        if self.indicator_log_path.exists():
+            try:
+                df_existing = pd.read_csv(self.indicator_log_path)
+                df_combined = pd.concat([df_existing, df_row], ignore_index=True)
+                # For options, we might have multiple signals per minute if it refreshes frequently
+                # but usually it's once per minute or per tick. Let's keep last by timestamp.
+                df_combined.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
+                df_combined.to_csv(self.indicator_log_path, index=False)
+            except Exception:
+                df_row.to_csv(self.indicator_log_path, mode="a", index=False, header=False)
+        else:
+            df_row.to_csv(self.indicator_log_path, index=False, header=True)
 
     def _get_mtx_tick_bars_df(self):
         """[Wave 2 optimization] Lazy DF conversion: rebuild cache only on new bar."""
@@ -849,6 +1017,25 @@ class ShioajiOptionsSmartMonitor:
     def pre_fill_bars(self):
         """Pre-fill tick bar buffer from kbars on startup."""
         try:
+            # 💡 GSD: Try CSV fallback first or if bars are insufficient
+            csv_path = Path("data/tmf_full_2026.csv")
+            if csv_path.exists():
+                try:
+                    df_hist = pd.read_csv(csv_path)
+                    df_hist["ts"] = pd.to_datetime(df_hist["ts"])
+                    df_hist = df_hist.set_index("ts").sort_index()
+                    df_warm = df_hist.tail(100)
+                    for ts, row in df_warm.iterrows():
+                        self._mtx_tick_bars_deque.append({
+                            "open": row["Open"], "high": row["High"], "low": row["Low"], 
+                            "close": row["Close"], "volume": row["Volume"], "ts": ts
+                        })
+                    self._mtx_tick_bars_cache = df_warm[["Open", "High", "Low", "Close", "Volume"]].copy()
+                    console.print(f"[green][OptionsMonitor] ✓ Pre-filled {len(self._mtx_tick_bars_deque)} MTX bars from local CSV[/green]")
+                except Exception as e:
+                    console.print(f"[dim][OptionsMonitor] CSV pre-fill failed: {e}[/dim]")
+
+            # Attempt API fetch to get most recent bars
             bars = self._fetch_today_futures_bars()
             if bars is not None and len(bars) >= 30:
                 # [Wave 2 optimization] Convert pre-filled bars to deque format
@@ -913,12 +1100,23 @@ class ShioajiOptionsSmartMonitor:
 
     def fetch_live_signal(self):
         df5_raw = self._fetch_today_futures_bars()
-        if df5_raw is None or len(df5_raw) < 30:
+        if df5_raw is None or len(df5_raw) < 2:
             df5_raw = self._get_tick_bars_fallback()
+            
+        if df5_raw is None or len(df5_raw) < 2:
+            # GSD: Still record snapshot with current price even if bars are missing
+            self.record_signal_snapshot(None)
+            return None
+            
         if df5_raw is not None:
             console.print(f"[debug] Raw bars: {len(df5_raw)} rows, from {df5_raw.index[0]} to {df5_raw.index[-1]}")
-        if df5_raw is None or len(df5_raw) < max(30, self.strategy_cfg.get("length", 20) + 5):
+            
+        min_bars = max(30, self.strategy_cfg.get("length", 20) + 5)
+        if len(df5_raw) < min_bars:
+            # Still not enough for full indicators, but maybe enough for a partial snapshot
+            self.record_signal_snapshot(None)
             return None
+
         try:
             p5 = calculate_futures_squeeze(df5_raw, self.strategy_cfg.get("length", 20))
             # Resample correctly and ensure columns are present
@@ -934,12 +1132,38 @@ class ShioajiOptionsSmartMonitor:
 
             row = p5.iloc[-1]
             timestamp = row.name
+            
+            # 💡 GSD: Initialize default signal early to ensure snapshot recording
+            row_data = row.to_dict()
+            
+            def safe_bool(val):
+                if pd.isna(val) or val is None:
+                    return False
+                return bool(val)
+
+            signal = {
+                "score": 0.0,
+                "side": None,
+                "price_mtx": float(row.get("Close", 0)),
+                "mid_trend": "",
+                "timestamp": timestamp,
+                "squeeze_on": safe_bool(row.get("sqz_on")),
+                "fired": safe_bool(row.get("fired")),
+                "bullish_align": safe_bool(row.get("bullish_align")),
+                "bearish_align": safe_bool(row.get("bearish_align")),
+            }
+            # GSD: Include all raw indicators for dashboard visibility
+            for k, v in row_data.items():
+                if k not in signal:
+                    signal[k] = v
+
             m15 = p15[p15.index <= timestamp]
             h1 = p1h[p1h.index <= timestamp]
 
             if m15.empty or h1.empty:
                 console.print(f"[yellow]Insufficient MTF data: 15m={len(m15)}, 1h={len(h1)}[/yellow]")
-                return None
+                self.record_signal_snapshot(signal)
+                return signal
 
             # Check for momentum column availability
             has_momentum_15m = "momentum" in m15.columns and not m15["momentum"].empty
@@ -947,7 +1171,8 @@ class ShioajiOptionsSmartMonitor:
             
             if not has_momentum_15m:
                 console.print("[yellow]15m momentum not available yet, waiting for more data...[/yellow]")
-                return None
+                self.record_signal_snapshot(signal)
+                return signal
             
             # Use available timeframes for alignment score
             available_data = {"5m": p5, "15m": m15}
@@ -983,43 +1208,42 @@ class ShioajiOptionsSmartMonitor:
                     console.print(f"[dim]🚫 ALIGN blocked (P): fast={row.get('ema_fast',0):.0f} slow={row.get('ema_slow',0):.0f}[/dim]")
                     side = None
 
-            signal = {
+            # Update signal with calculated results
+            signal.update({
                 "score": score,
                 "side": side,
-                "price_mtx": row["Close"],
                 "mid_trend": mid_trend,
-                "timestamp": timestamp,
-                "squeeze_on": bool(row.get("sqz_on", False)),
-                "fired": bool(row.get("fired", False)),
-                "bullish_align": bool(row.get("bullish_align", False)),
-                "bearish_align": bool(row.get("bearish_align", False)),
-            }
+            })
+            
             self.last_signal = signal
             self.replay_stats["signals"] += 1
             if side:
                 self.replay_stats["directional_signals"] += 1
 
-            if not signal["side"] and self.replay_stats["signals"] % 10 == 0:
-                reasons = []
-                if row.get("sqz_on", True):
-                    reasons.append("SQZ_ON")
-                else:
-                    if abs(score) < self.entry_score:
-                        reasons.append(f"SCORE<{self.entry_score} ({score:.0f})")
-                    if score > 0 and row.get("Close", 0) <= row.get("vwap", 0):
-                        reasons.append("price<=VWAP")
-                    if score < 0 and row.get("Close", 0) >= row.get("vwap", 0):
-                        reasons.append("price>=VWAP")
-                    if not row.get("fired", False) and abs(score) < 90:
-                        reasons.append("not_fired")
-                    if score > 0 and not row.get("bullish_align", False):
-                        reasons.append("!bullish_align")
-                    if score < 0 and not row.get("bearish_align", False):
-                        reasons.append("!bearish_align")
-                    if mid_trend not in ("BULL", "BEAR"):
-                        reasons.append(f"mid_trend={mid_trend}")
-                if reasons:
-                    console.print(f"[dim]⏳ No entry ({', '.join(reasons)})[/dim]")
+            if not signal["side"]:
+                if abs(score) < 1.0 and self.replay_stats["signals"] % 5 == 0:
+                    console.print(f"[dim]⏳ Waiting for indicators to mature... (Score={score:.1f})[/dim]")
+                elif self.replay_stats["signals"] % 10 == 0:
+                    reasons = []
+                    if row.get("sqz_on", True):
+                        reasons.append("SQZ_ON")
+                    else:
+                        if abs(score) < self.entry_score:
+                            reasons.append(f"SCORE<{self.entry_score} ({score:.1f})")
+                        if score > 0 and row.get("Close", 0) <= row.get("vwap", 0):
+                            reasons.append("price<=VWAP")
+                        if score < 0 and row.get("Close", 0) >= row.get("vwap", 0):
+                            reasons.append("price>=VWAP")
+                        if not row.get("fired", False) and abs(score) < 90:
+                            reasons.append("not_fired")
+                        if score > 0 and not row.get("bullish_align", False):
+                            reasons.append("!bullish_align")
+                        if score < 0 and not row.get("bearish_align", False):
+                            reasons.append("!bearish_align")
+                        if mid_trend not in ("BULL", "BEAR"):
+                            reasons.append(f"mid_trend={mid_trend}")
+                    if reasons:
+                        console.print(f"[dim]⏳ No entry ({', '.join(reasons)})[/dim]")
 
             self.record_signal_snapshot(signal)
             return signal
@@ -1060,6 +1284,12 @@ class ShioajiOptionsSmartMonitor:
         if entry_price <= 0:
             console.print(f"[yellow]⚠️ enter_paper_position blocked: invalid entry price ({entry_price}) for {side}[/yellow]")
             return
+        
+        # 💡 GSD: Premium Cap Protection
+        if entry_price > self.entry_premium_limit:
+            console.print(f"[red]🚫 Entry blocked: premium {entry_price:.1f} exceeds limit {self.entry_premium_limit:.1f}[/red]")
+            return
+            
         if not self._paper_margin_check(entry_price):
             return
         self.position = self.paper_lots
@@ -1394,20 +1624,40 @@ class ShioajiOptionsSmartMonitor:
         #    買 P 時 score 很負，翻正超過 reversal_threshold → 趨勢反轉
         #    買 C 時 score 很正，翻負超過 reversal_threshold → 趨勢反轉
         reversal_threshold = self.entry_score * 0.67  # 60 → 40
+        
+        # 💡 GSD: Opening Grace Period Protection
+        # Avoid reacting to data spikes or gaps in the first N mins of ANY session
+        session_mins = 0
+        h, m = now.hour, now.minute
+        if 8 <= h < 14: # Day
+            session_mins = (h - 8) * 60 + (m - 45)
+        elif h >= 15: # Night start
+            session_mins = (h - 15) * 60 + m
+        elif h < 5: # Night late
+            session_mins = (h + 9) * 60 + m
+            
+        is_in_grace = 0 <= session_mins < self.opening_grace_mins
+        
         if self.active_side == "P" and signal_score >= reversal_threshold:
-            reason = f"SCORE_REVERSAL score={signal_score:.1f} >= {reversal_threshold:.0f} (was bearish, now bullish)"
-            if self.live_trading:
-                self.exit_live_position("LIVE_REVERSAL_SUBMITTED", reason)
+            if is_in_grace:
+                console.print(f"[yellow]🛡️ REVERSAL blocked by opening grace ({session_mins}m < {self.opening_grace_mins}m)[/yellow]")
             else:
-                self.exit_paper_position("PAPER_REVERSAL_EXIT", exit_price, reason)
-            return True
+                reason = f"SCORE_REVERSAL score={signal_score:.1f} >= {reversal_threshold:.0f} (was bearish, now bullish)"
+                if self.live_trading:
+                    self.exit_live_position("LIVE_REVERSAL_SUBMITTED", reason)
+                else:
+                    self.exit_paper_position("PAPER_REVERSAL_EXIT", exit_price, reason)
+                return True
         if self.active_side == "C" and signal_score <= -reversal_threshold:
-            reason = f"SCORE_REVERSAL score={signal_score:.1f} <= -{reversal_threshold:.0f} (was bullish, now bearish)"
-            if self.live_trading:
-                self.exit_live_position("LIVE_REVERSAL_SUBMITTED", reason)
+            if is_in_grace:
+                console.print(f"[yellow]🛡️ REVERSAL blocked by opening grace ({session_mins}m < {self.opening_grace_mins}m)[/yellow]")
             else:
-                self.exit_paper_position("PAPER_REVERSAL_EXIT", exit_price, reason)
-            return True
+                reason = f"SCORE_REVERSAL score={signal_score:.1f} <= -{reversal_threshold:.0f} (was bullish, now bearish)"
+                if self.live_trading:
+                    self.exit_live_position("LIVE_REVERSAL_SUBMITTED", reason)
+                else:
+                    self.exit_paper_position("PAPER_REVERSAL_EXIT", exit_price, reason)
+                return True
 
         # 4. TP1 partial profit
         if should_take_partial_profit(self.position, self.has_tp1_hit, self.entry_price, exit_price, self.m_cfg["tp1_pct"]):
@@ -1435,6 +1685,9 @@ class ShioajiOptionsSmartMonitor:
 
     def run_strategy_logic(self):
         try:
+            # GSD: Update log paths dynamically to handle session rollovers (e.g. 15:00)
+            self._update_log_paths()
+            
             now = self._current_strategy_time()
             eod_state = self._eod_state(now)
             self.refresh_live_orders()
@@ -1597,11 +1850,17 @@ class ShioajiOptionsSmartMonitor:
                     console.print(f"[dim]Market closed ({session}). Waiting for next session...[/dim]")
                     time.sleep(60)
                     continue
-                
-                # 夜盤時的特殊處理
+
+                # 夜盤時後的特殊處理
                 if session == "night":
                     console.print(f"[dim]🌙 夜盤時段 ({now.strftime('%H:%M')})[/dim]")
                 
+                # [Phase 1 Fix] Check options data freshness
+                self._check_options_contract_staleness()
+                
+                # [GSD Fix] Save options kbar data to CSV
+                self._save_options_bar()
+
                 self.run_strategy_logic()
                 if not (self.dry_run and self.replay_bars is not None):
                     time.sleep(self.loop_sleep_secs)

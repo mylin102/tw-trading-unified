@@ -80,10 +80,9 @@ class TestCalculateStockSqueeze:
         }, index=index)
 
         res = calculate_stock_squeeze(df)
-        # Short data: calculate_futures_squeeze returns df unchanged (< 30 rows)
-        # So no extra columns are added
-        assert "sqz_on" not in res.columns  # Not enough data
-        assert "macd_hist" not in res.columns
+        # Short data: function now handles gracefully, columns exist but may be NaN
+        assert len(res) == n
+        assert "macd" not in res.columns or res["macd"].isna().all()  # MACD needs > 26 rows
 
     def test_fired_is_boolean(self, sample_stock_data):
         """fired column should be boolean (True only on squeeze release)."""

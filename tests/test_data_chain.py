@@ -10,6 +10,7 @@ Problem 2: Signals fire but no trades — verify silent blockers are logged,
 import datetime
 import os
 import sys
+import ast
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -18,7 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.date_utils import get_session_date_str
+from core.date_utils import get_session_date_str, get_trading_day, get_session, is_day_session, is_night_session
 
 
 # ════════════════════════════════════════
@@ -26,55 +27,97 @@ from core.date_utils import get_session_date_str
 # ════════════════════════════════════════
 
 class TestSessionDateStr:
-    """Verify get_session_date_str produces consistent filenames."""
+    """Verify get_session_date_str produces correct Taifex trading days (15:00 rollover)."""
 
-    def test_before_5am_uses_yesterday(self):
+    def test_morning_session_same_day(self):
+        # 03:30 AM Wednesday belongs to the Wednesday session (which started 15:00 Tuesday)
         dt = datetime.datetime(2026, 4, 8, 3, 30, 0)
-        assert get_session_date_str(dt) == "20260407"
+        assert get_session_date_str(dt) == "20260408"
 
-    def test_after_5am_uses_today(self):
+    def test_after_5am_still_same_day(self):
+        # 06:00 AM Wednesday still belongs to Wednesday session
         dt = datetime.datetime(2026, 4, 8, 6, 0, 0)
         assert get_session_date_str(dt) == "20260408"
 
-    def test_at_5am_uses_today(self):
-        dt = datetime.datetime(2026, 4, 8, 5, 0, 0)
-        assert get_session_date_str(dt) == "20260408"
+    def test_after_15pm_next_day(self):
+        # 16:00 PM Wednesday belongs to Thursday session
+        dt = datetime.datetime(2026, 4, 8, 16, 0, 0)
+        assert get_session_date_str(dt) == "20260409"
 
-    def test_at_midnight_uses_yesterday(self):
-        dt = datetime.datetime(2026, 4, 8, 0, 0, 0)
-        assert get_session_date_str(dt) == "20260407"
-
-    def test_at_459am_uses_yesterday(self):
-        dt = datetime.datetime(2026, 4, 8, 4, 59, 0)
-        assert get_session_date_str(dt) == "20260407"
-
-    def test_current_time_when_none(self):
-        """When dt is None, should use current time."""
-        result = get_session_date_str(None)
-        now = datetime.datetime.now()
-        expected = now.strftime("%Y%m%d") if now.hour >= 5 else (now - datetime.timedelta(days=1)).strftime("%Y%m%d")
-        assert result == expected
+    def test_friday_night_is_monday(self):
+        # Friday 16:00 PM -> Monday
+        dt = datetime.datetime(2026, 4, 10, 16, 0, 0)
+        assert get_session_date_str(dt) == "20260413"
 
     def test_pd_timestamp_compatible(self):
         dt = pd.Timestamp("2026-04-08 03:00:00")
-        assert get_session_date_str(dt) == "20260407"
+        assert get_session_date_str(dt) == "20260408"
 
     def test_writer_reader_alignment(self):
         """Writer (main.py) and reader (dashboard.py) must produce same filename."""
         # Simulate both started at different times but same session
-        writer_time = datetime.datetime(2026, 4, 8, 4, 0, 0)   # 04:00
-        reader_time = datetime.datetime(2026, 4, 8, 4, 30, 0)  # 04:30
-        assert get_session_date_str(writer_time) == get_session_date_str(reader_time) == "20260407"
+        writer_time = datetime.datetime(2026, 4, 8, 4, 0, 0)   # 04:00 Wed
+        reader_time = datetime.datetime(2026, 4, 8, 4, 30, 0)  # 04:30 Wed
+        assert get_session_date_str(writer_time) == get_session_date_str(reader_time) == "20260408"
 
     def test_cross_midnight_alignment(self):
         """Monitor runs across midnight — both should use same session date."""
-        # Monitor started at 20:00 on Apr 7
+        # Monitor started at 20:00 on Apr 7 (Tue Night -> Wed Trading Day)
         monitor_time = datetime.datetime(2026, 4, 7, 20, 0, 0)
-        # Dashboard starts at 01:00 on Apr 8
+        # Dashboard starts at 01:00 on Apr 8 (Wed Morning -> Wed Trading Day)
         dashboard_time = datetime.datetime(2026, 4, 8, 1, 0, 0)
-        # Both should reference the same session (Apr 7)
-        assert get_session_date_str(monitor_time) == "20260407"
-        assert get_session_date_str(dashboard_time) == "20260407"
+        # Both should reference the same trading day (Apr 8)
+        assert get_session_date_str(monitor_time) == "20260408"
+        assert get_session_date_str(dashboard_time) == "20260408"
+
+    def test_series_input_preserves_index(self):
+        """Vectorized session-date conversion must preserve pandas index alignment."""
+        idx = ["a", "b"]
+        series = pd.Series(
+            pd.to_datetime(["2026-04-07 20:00:00", "2026-04-08 01:00:00"]),
+            index=idx,
+        )
+        result = get_session_date_str(series)
+        assert isinstance(result, pd.Series)
+        assert list(result.index) == idx
+        assert list(result.values) == ["20260408", "20260408"]
+
+    def test_series_trading_day_preserves_index(self):
+        """get_trading_day should return a pandas object for Series input."""
+        idx = ["x", "y"]
+        series = pd.Series(
+            pd.to_datetime(["2026-04-10 16:00:00", "2026-04-13 01:00:00"]),
+            index=idx,
+        )
+        result = get_trading_day(series)
+        assert isinstance(result, pd.Series)
+        assert list(result.index) == idx
+        assert [d.strftime("%Y%m%d") for d in result] == ["20260413", "20260413"]
+
+    def test_custom_holiday_skips_to_next_business_day(self):
+        """Manual holiday override should push night session to the next valid trading day."""
+        dt = datetime.datetime(2026, 4, 10, 16, 0, 0)  # Friday night would normally map to Monday 2026-04-13
+        result = get_trading_day(dt, holidays={"2026-04-13"})
+        assert result.strftime("%Y%m%d") == "20260414"
+
+
+class TestSessionClassification:
+    """Verify day/night session helpers on scalar and vectorized boundaries."""
+
+    def test_scalar_session_boundaries(self):
+        assert get_session("2026-04-08 07:59:00") == 2
+        assert get_session("2026-04-08 08:00:00") == 1
+        assert get_session("2026-04-08 14:59:00") == 1
+        assert get_session("2026-04-08 15:00:00") == 2
+
+    def test_vectorized_day_night_masks(self):
+        series = pd.Series(pd.to_datetime([
+            "2026-04-08 07:59:00",
+            "2026-04-08 08:00:00",
+            "2026-04-08 15:00:00",
+        ]))
+        assert list(is_night_session(series)) == [True, False, True]
+        assert list(is_day_session(series)) == [False, True, False]
 
 
 # ════════════════════════════════════════
@@ -169,6 +212,42 @@ class TestStaleDataDetection:
         # Verify the fallback logic exists (rglob for OPTIONS_*)
         assert "rglob" in src
         assert "OPTIONS_*" in src
+
+
+class TestOptionsContractStalenessSafety:
+    """Freeze GSD stale-contract handling semantics for options monitor."""
+
+    def test_single_staleness_method_definition(self):
+        """Options monitor must not silently override stale handler implementation."""
+        src = Path("strategies/options/live_options_squeeze_monitor.py").read_text()
+        mod = ast.parse(src)
+        cls = next(
+            node for node in mod.body
+            if isinstance(node, ast.ClassDef) and node.name == "ShioajiOptionsSmartMonitor"
+        )
+        count = sum(
+            1 for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_check_options_contract_staleness"
+        )
+        assert count == 1, "duplicate _check_options_contract_staleness silently changes runtime behavior"
+
+    def test_no_resubscribe_in_staleness_handler(self):
+        """Valid-but-quiet options contracts should defer to sentinel, not local re-subscribe."""
+        src = Path("strategies/options/live_options_squeeze_monitor.py").read_text()
+        lines = src.splitlines()
+        mod = ast.parse(src)
+        cls = next(
+            node for node in mod.body
+            if isinstance(node, ast.ClassDef) and node.name == "ShioajiOptionsSmartMonitor"
+        )
+        fn = next(
+            node for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_check_options_contract_staleness"
+        )
+        body_src = "\n".join(lines[fn.lineno - 1: fn.end_lineno])
+        assert "quote.unsubscribe" not in body_src
+        assert "quote.subscribe" not in body_src
+        assert "sentinel handle" in body_src
 
 
 # ════════════════════════════════════════

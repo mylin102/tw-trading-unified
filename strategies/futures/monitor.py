@@ -7,6 +7,7 @@ import os
 import time
 import yaml
 import traceback
+from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
 import pandas as pd
@@ -16,7 +17,25 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 from squeeze_futures.engine.constants import get_point_value
 from squeeze_futures.engine.simulator import PaperTrader
+# 指標計算
+# 指標計算
 from squeeze_futures.engine.indicators import calculate_futures_squeeze, calculate_mtf_alignment
+from squeeze_futures.data.data_storage import save_trade
+
+# GSD: Pluggable Strategy Integration
+from core.strategy_registry import StrategyRegistry
+from core.strategy_context import StrategyContext, PositionView, MarketData
+from core.signal import Signal
+
+# Old imports for backward compatibility (fallback)
+from squeeze_futures.data.shioaji_client import ShioajiClient
+from squeeze_futures.data.data_storage import save_trade
+from squeeze_futures.data.data_storage import save_trade
+
+# GSD: 策略外掛系統
+from core.strategy_registry import StrategyRegistry
+from core.strategy_context import StrategyContext, PositionView, MarketData
+from core.signal import Signal
 from squeeze_futures.data.shioaji_client import ShioajiClient
 from squeeze_futures.data.data_storage import save_trade
 
@@ -98,7 +117,11 @@ class FuturesMonitor:
         self._fire_low = 0.0
         self._bar_counter = 0        # monotonic bar counter for fire tracking
         self._vwap_violation_bars = 0  # VWAP exit debounce counter
+        self._atr_trail_peak = 0.0    # ATR trailing stop: peak price tracker
         self.last_tick_at = time.time()  # [gstack] 數據新鮮度追蹤
+        
+        # 💡 GSD: Market data cache for virtual ticks
+        self.market_data = {"MTX": {"close": 0.0}}
 
         # Trader
         self.trader = PaperTrader(
@@ -111,9 +134,11 @@ class FuturesMonitor:
         )
         self.has_tp1_hit = False
         self.last_processed_bar = None
+        self._last_exit_bar = None  # 防止同根 K bar exit 後再進場
         self._last_entry_reason = None
         self._safety_stop_trade = None  # Exchange-side safety stop order
-        self._last_bar_ts = None  # [Wave 1 optimization] Cache bar timestamp to avoid repeated floor() calls
+        # 💡 GSD: Initialize with current time bucket to prevent immediate flip
+        self._last_bar_ts = int(time.time() / 300) * 300
 
     def _load_config(self, path):
         with open(path, encoding="utf-8") as f:
@@ -134,6 +159,26 @@ class FuturesMonitor:
         return self._tick_bars_cache if self._tick_bars_cache is not None else pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
 
     def setup(self):
+        # ── GSD: Initialize Strategy Registry ────────────────────────
+        self._registry = StrategyRegistry()
+        self._registry.discover()
+        self._active_strategy_name = None  # Track initialized strategy
+
+        # ── Pre-init the active strategy ─────────────────────────────
+        active_name = self.STRATEGY.get("active_strategy", "counter_vwap")
+        strategy = self._registry.get(active_name)
+        if strategy:
+            # Create a minimal context for init
+            dummy_ctx = StrategyContext(
+                market=MarketData(last_bar={}),
+                position=PositionView(),
+                config=self.cfg,
+                bar_counter=0,
+            )
+            strategy.init(dummy_ctx)
+            self._active_strategy_name = active_name
+            console.print(f"[green]🔧 Pre-initialized strategy: {active_name}[/green]")
+
         # Tick-based bar builder (Initialize always to avoid AttributeError in dry_run)
         # [Wave 2 optimization] Use deque for O(1) append/trim instead of DataFrame.loc + slicing
         self._tick_bars_deque = deque(maxlen=300)
@@ -144,13 +189,53 @@ class FuturesMonitor:
             console.print("[yellow][FuturesMonitor] dry-run: skipping contract fetch[/yellow]")
             return True
 
-        # [Bug fix] 取得 TMF 合約，讓 on_tick 能正確接收 tick
+        # [GSD Fix] Correct TMF front-month selection by delivery_date
         try:
-            self.contract = self.api.Contracts.Futures.TMF.TMFR1
-            if self.contract:
-                console.print(f"[green][FuturesMonitor] TMF contract: {self.contract.code}[/green]")
-        except Exception:
-            pass
+            # 💡 GSD: Warm-up from local CSV first to ensure indicators (Score) are available immediately
+            try:
+                csv_path = Path("data/tmf_full_2026.csv")
+                if csv_path.exists():
+                    df_hist = pd.read_csv(csv_path)
+                    df_hist["ts"] = pd.to_datetime(df_hist["ts"])
+                    df_hist = df_hist.set_index("ts").sort_index()
+                    # Take last 100 bars for warm-up
+                    df_warm = df_hist.tail(100)
+                    for ts, row in df_warm.iterrows():
+                        self._tick_bars_deque.append({
+                            "open": row["Open"], "high": row["High"], "low": row["Low"], 
+                            "close": row["Close"], "volume": row["Volume"], "ts": ts
+                        })
+                    console.print(f"[green][FuturesMonitor] ✓ Warmed up with {len(df_warm)} bars from local CSV[/green]")
+            except Exception as e:
+                console.print(f"[dim][FuturesMonitor] CSV warm-up skipped: {e}[/dim]")
+
+            tmf_list = list(self.api.Contracts.Futures.TMF)
+            if tmf_list:
+                # Filter out expired or invalid
+                now_str = datetime.now().strftime("%Y/%m/%d")
+                valid_contracts = [c for c in tmf_list if c.delivery_date >= now_str]
+                
+                # Sort by delivery date (ascending)
+                tmf_sorted = sorted(valid_contracts, key=lambda c: c.delivery_date)
+                
+                if tmf_sorted:
+                    # Pick the first one (nearest delivery)
+                    self.contract = tmf_sorted[0]
+                    console.print(f"[green][FuturesMonitor] ✓ TMF front-month: {self.contract.code} (delivers {self.contract.delivery_date})[/green]")
+                else:
+                    self.contract = tmf_list[0]
+                    console.print(f"[yellow][FuturesMonitor] No future delivery found, using first available: {self.contract.code}[/yellow]")
+                
+                # Log all available codes for verification
+                all_codes = [f"{c.code}({c.delivery_date})" for c in tmf_sorted]
+                console.print(f"[dim][FuturesMonitor] Sorted TMF queue: {', '.join(all_codes)}[/dim]")
+            else:
+                console.print("[red][FuturesMonitor] No TMF contracts found![/red]")
+        except Exception as e:
+            console.print(f"[red][FuturesMonitor] Error selecting TMF contract: {e}[/red]")
+
+        # [Bug Fix] Add contract rollover check
+        self._last_contract_code = self.contract.code if self.contract else None
 
         # Pre-fill from kbars if available
         try:
@@ -169,19 +254,132 @@ class FuturesMonitor:
                     self._tick_bars_deque.append(bar_dict)
                 self._tick_bars_cache = df[["Open", "High", "Low", "Close", "Volume"]].copy()
                 console.print(f"[green][FuturesMonitor] pre-filled {len(self._tick_bars_deque)} bars from kbars[/green]")
+                
+                # [GSD Fix] Backfill night session gaps on startup
+                self._backfill_night_gaps(df)
         except Exception:
             pass
         return True
 
+    def _backfill_night_gaps(self, api_df):
+        """[GSD Fix] On startup, check if today's CSV has night session data.
+        If missing or incomplete, merge API bars with existing CSV."""
+        if self.dry_run or not self.api:
+            return
+        
+        from pathlib import Path
+        today = datetime.now()
+        date_str = today.strftime('%Y%m%d')
+        tag = "_DRY" if self.dry_run else ("_LIVE" if self.live_trading else "_PAPER")
+        csv_path = Path(f"logs/market_data/{self.ticker}_{date_str}{tag}_indicators.csv")
+        
+        # Read existing CSV
+        if csv_path.exists():
+            try:
+                existing = pd.read_csv(csv_path, parse_dates=['timestamp'])
+                existing.set_index('timestamp', inplace=True)
+                last_ts = existing.index.max()
+                console.print(f"[dim][FuturesMonitor] Existing CSV: {len(existing)} bars, latest={last_ts}[/dim]")
+            except Exception:
+                existing = pd.DataFrame()
+                last_ts = None
+        else:
+            existing = pd.DataFrame()
+            last_ts = None
+        
+        # Find bars from API that are newer than CSV
+        if not api_df.empty and last_ts is not None:
+            new_bars = api_df[api_df.index > last_ts]
+            if not new_bars.empty:
+                console.print(f"[bold cyan]🔧 Backfilling {len(new_bars)} missing bars from API ({new_bars.index[0]} → {new_bars.index[-1]})[/bold cyan]")
+                
+                # Append new bars to existing CSV
+                if existing.empty:
+                    combined = new_bars.copy()
+                else:
+                    combined = pd.concat([existing, new_bars])
+                
+                # Add missing columns if needed
+                for col in ['score', 'regime', 'session', 'bull_align', 'bear_align', 'in_pb_zone']:
+                    if col not in combined.columns:
+                        combined[col] = 0 if col in ['score'] else ('NORMAL' if col == 'regime' else (2 if col == 'session' else False))
+                
+                combined.to_csv(csv_path)
+                console.print(f"[green][FuturesMonitor] ✅ Backfill complete: {len(combined)} total bars in CSV[/green]")
+
+    def _check_contract_rollover(self):
+        """[GSD Fix] Check if TMF contract has rolled over and re-subscribe if needed."""
+        if not self.api or self.dry_run or not self.contract:
+            return
+        
+        try:
+            current_code = self.contract.code
+            
+            # Get all available contracts
+            tmf_list = list(self.api.Contracts.Futures.TMF)
+            if not tmf_list:
+                console.print("[yellow]⚠️ No TMF contracts available[/yellow]")
+                return
+            
+            # [GSD Fix] Sort by delivery_date
+            now_str = datetime.now().strftime("%Y/%m/%d")
+            valid_contracts = [c for c in tmf_list if c.delivery_date >= now_str]
+            tmf_sorted = sorted(valid_contracts, key=lambda c: c.delivery_date)
+            
+            if not tmf_sorted:
+                return
+                
+            first_contract = tmf_sorted[0]
+            
+            # Check if we're still on the first (front month) contract
+            if first_contract.code != current_code:
+                console.print(f"[bold yellow]🔄 Contract rollover detected: {current_code} → {first_contract.code}[/bold yellow]")
+                
+                # Unsubscribe from old contract
+                try:
+                    self.api.quote.unsubscribe(self.contract, quote_type='tick')
+                except Exception as e:
+                    console.print(f"[dim]Unsubscribe old {current_code}: {e}[/dim]")
+                
+                # Switch to new contract
+                self.contract = first_contract
+                self._last_contract_code = first_contract.code
+                
+                # Re-subscribe to new contract
+                self.api.quote.subscribe(first_contract, quote_type='tick')
+                console.print(f"[bold green]✅ Re-subscribed to {first_contract.code}[/bold green]")
+                
+                # Reset tick timestamp to force immediate data freshness check
+                self.last_tick_at = time.time()
+            else:
+                # Contract is correct, issue may be API connection
+                # Try re-subscribing to force refresh
+                console.print(f"[dim]⚠️ Contract {current_code} is correct but no ticks, re-subscribing...[/dim]")
+                try:
+                    self.api.quote.unsubscribe(self.contract, quote_type='tick')
+                    time.sleep(0.5)
+                    self.api.quote.subscribe(self.contract, quote_type='tick')
+                    console.print(f"[dim]✅ Re-subscription complete[/dim]")
+                except Exception as e:
+                    console.print(f"[yellow]⚠️ Re-subscription failed: {e}[/yellow]")
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Contract rollover check error: {e}[/yellow]")
+
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()  # [gstack] 更新數據更新時間
-        # Accept tick if it matches contract code OR contract category (TMF)
-        if self.contract:
-            if tick.code != self.contract.code and not tick.code.startswith("TMF"):
-                return
+        
+        # 💡 GSD: Data Continuity Fix
+        # Accept TMF ticks OR MTX/MXF ticks to drive bar building
+        is_tmf = tick.code.startswith("TMF") or (self.contract and tick.code == self.contract.code)
+        is_mtx = tick.code.startswith("MXF") or tick.code.startswith("MTX")
+        
+        if not is_tmf and not is_mtx:
+            return
+            
         # Build 5m bars from ticks
         price = float(tick.close)
-        vol = int(getattr(tick, "volume", 1))
+        # Only count volume for TMF to keep indicators accurate, but use price from both
+        vol = int(getattr(tick, "volume", 0)) if is_tmf else 0
         
         # [Wave 1 optimization] Use integer time bucketing to avoid expensive pd.Timestamp().floor()
         # Only compute Timestamp when bar changes (every 5 minutes)
@@ -189,8 +387,8 @@ class FuturesMonitor:
         ts_int = int(tick_ts.timestamp() / 300) * 300
         
         bar = self._current_bar
-        if bar["ts"] is None or ts_int != self._last_bar_ts:
-            # Save previous bar to deque (O(1) append, auto-trims to maxlen=300)
+        if bar["ts"] is None or ts_int > self._last_bar_ts:
+            # 💡 GSD: Only flip the bar if we have a NEW time bucket
             if bar["ts"] is not None and bar["open"] > 0:
                 bar_dict = {
                     "open": bar["open"],
@@ -201,19 +399,22 @@ class FuturesMonitor:
                     "ts": bar["ts"],
                 }
                 self._tick_bars_deque.append(bar_dict)
-                # Invalidate DF cache (will be rebuilt lazily on next indicator calc)
                 self._tick_bars_cache = None
-            # Convert to Timestamp only when bar changes
+            
+            # Start new bar
             ts = pd.Timestamp(ts_int, unit='s')
             bar["ts"] = ts
             self._last_bar_ts = ts_int
             bar["open"] = bar["high"] = bar["low"] = bar["close"] = price
             bar["volume"] = vol
-        else:
+        elif ts_int == self._last_bar_ts:
+            # Accumulate into current bar
             bar["high"] = max(bar["high"], price)
             bar["low"] = min(bar["low"], price)
             bar["close"] = price
             bar["volume"] += vol
+        else:
+            # Old data packet, ignore
             return
         cb = self.client._tick_callbacks.get(tick.code)
         if cb:
@@ -283,6 +484,23 @@ class FuturesMonitor:
             return True  # API 查詢失敗不擋單，讓交易所擋
 
     # ── Trade execution ──
+    def _audit_signal(self, signal_type, side, score, rejection_reason, note=""):
+        """Record signal audit trail to CSV."""
+        log_dir = Path("logs/market_data")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        date_str = datetime.now().strftime("%Y%m%d")
+        audit_file = log_dir / f"MTX_{date_str}_signals_audit.csv"
+        header = not audit_file.exists()
+        record = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "signal": signal_type,
+            "side": side,
+            "score": score,
+            "rejection": rejection_reason,
+            "note": note,
+        }
+        pd.DataFrame([record]).to_csv(audit_file, mode='a', index=False, header=header)
+
     def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, reason=None):
         action = None
         if signal == "BUY":
@@ -454,44 +672,58 @@ class FuturesMonitor:
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs", "market_data")
         os.makedirs(log_dir, exist_ok=True)
         
-        # 交易日日期邏輯:
-        # 夜盤 15:00~23:59 → 算明天的交易日
-        # 凌晨 00:00~05:00 → 算前一天的交易日
-        # 日盤 08:45~13:45 → 算今天
+        # 統一交易日日期邏輯 (GSD: Align with Taifex session/holidays)
+        from core.date_utils import get_session_date_str, get_session
         now = datetime.now()
-        if now.hour < 5:
-            date_str = (now - timedelta(days=1)).strftime('%Y%m%d')
-        elif now.hour >= 15:
-            date_str = (now + timedelta(days=1)).strftime('%Y%m%d')
-        else:
-            date_str = now.strftime('%Y%m%d')
+        date_str = get_session_date_str(now)
         
         tag = "_DRY" if self.dry_run else ("_LIVE" if self.live_trading else "_PAPER")
         path = os.path.join(log_dir, f"{self.ticker}_{date_str}{tag}_indicators.csv")
-        
-        data = {
-            "timestamp": row.name, 
-            "Open": row["Open"], "High": row["High"], "Low": row["Low"], "Close": row["Close"], 
-            "open": row["Open"], "high": row["High"], "low": row["Low"], "close": row["Close"],
-            "Volume": row.get("Volume", 0), "Amount": row.get("Amount", 0),
-            "volume": row.get("Volume", 0), "amount": row.get("Amount", 0),
-            "vwap": row["vwap"], "score": score, "momentum": row.get("momentum", 0),
-            "sqz_on": row["sqz_on"], "mom_state": row["mom_state"], "regime": regime,
-            "bull_align": row["bullish_align"], "bear_align": row["bearish_align"],
-            "bullish_align": row["bullish_align"], "bearish_align": row["bearish_align"],
-            "in_pb_zone": row.get("in_bull_pb_zone", False) or row.get("in_bear_pb_zone", False),
-            "fired": row.get("fired", False),
-        }
-        
         file_exists = os.path.exists(path)
+        
+        # Convert Series to dict and merge all indicators (GSD: Prevent None fields in dashboard)
+        data = row.to_dict()
+        
+        # Fix: Convert trading_day to string to prevent None/NaN in CSV
+        if "trading_day" in data and data["trading_day"] is not None:
+            td = data["trading_day"]
+            if hasattr(td, "isoformat"):  # date object
+                data["trading_day"] = td.isoformat()
+            else:
+                data["trading_day"] = str(td)
+        
+        data.update({
+            "timestamp": str(row.name),
+            "session": get_session(now),
+            "score": score,
+            "regime": regime,
+            # Lowercase aliases for dashboard compatibility
+            "open": row.get("Open", 0), "high": row.get("High", 0), "low": row.get("Low", 0), "close": row.get("Close", 0),
+            "volume": row.get("Volume", 0), "amount": row.get("Amount", 0),
+            "bull_align": row.get("bullish_align", False), "bear_align": row.get("bearish_align", False),
+            "in_pb_zone": row.get("in_bull_pb_zone", False) or row.get("in_bear_pb_zone", False),
+        })
+        
         if file_exists:
-            # 讀取既有 header，對齊欄位（缺的填 NaN）
-            with open(path, 'r') as f:
-                existing_cols = f.readline().strip().split(',')
-            row_dict = {c: data.get(c, '') for c in existing_cols}
-            pd.DataFrame([row_dict]).to_csv(path, mode="a", index=False, header=False)
+            # GSD Fix: Support dynamic column expansion and deduplication
+            try:
+                # Read existing data
+                df_existing = pd.read_csv(path)
+                # Prepare new row
+                df_new = pd.DataFrame([data])
+                # Combine and deduplicate
+                df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+                df_combined.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
+                # Save back (overwrites with full columns)
+                df_combined.to_csv(path, index=False)
+            except Exception as e:
+                # Fallback to simple append if combined logic fails
+                with open(path, 'r') as f:
+                    existing_cols = f.readline().strip().split(',')
+                row_dict = {c: data.get(c, '') for c in existing_cols}
+                pd.DataFrame([row_dict]).to_csv(path, mode="a", index=False, header=False)
         else:
-            pd.DataFrame([data]).to_csv(path, mode="a", index=False, header=True)
+            pd.DataFrame([data]).to_csv(path, index=False, header=True)
 
     # ── Main strategy loop ──
     def run(self):
@@ -525,15 +757,39 @@ class FuturesMonitor:
         self._running = False
 
     def _strategy_tick(self):
+        # 💡 GSD: Data Continuity - Generate virtual tick if volume is zero but bidask is updating
+        now_ts = time.time()
+        if not self.dry_run and (now_ts - self.last_tick_at > 10):
+            # Use current MTX close/mid if available to drive bar building
+            price = self.market_data.get("MTX", {}).get("close", 0)
+            if price > 0:
+                # Mock a tick object to feed into self.on_tick
+                from types import SimpleNamespace
+                # Use current real time, but ensure we don't skip into next bucket prematurely
+                mock_tick = SimpleNamespace(
+                    code="TMF_VIRTUAL",
+                    close=price,
+                    datetime=datetime.now(),
+                    volume=0
+                )
+                self.on_tick(None, mock_tick)
+
         # 市場時間檢查
         now = datetime.now()
         h = now.hour
         is_day = 8 <= h < 14
         is_night = h >= 15 or h < 5
-        
+
         # 在 dry_run 模式下跳過時間檢查，方便測試
         if not self.dry_run and not (is_day or is_night):
             return
+
+        # [Bug Fix] Check data freshness and attempt reconnection
+        if not self.dry_run:
+            secs_since_tick = time.time() - self.last_tick_at
+            if secs_since_tick > 120:  # 2 minutes without tick
+                console.print(f"[yellow]⚠️ TMF data stale for {secs_since_tick/60:.1f} min, checking contract...[/yellow]")
+                self._check_contract_rollover()
 
         # 1. Fetch multi-timeframe data
         processed = {}
@@ -555,11 +811,8 @@ class FuturesMonitor:
                 try:
                     df = self.client.get_kline(self.ticker, interval="5m")
                     if not df.empty:
-                        # [gstack] 確保 K 線長度足以計算指標 (BB_Length=20)
-                        if len(df) >= 20:
-                            processed["5m"] = calculate_futures_squeeze(df, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
-                        else:
-                            processed["5m"] = df # 只有 OHLCV 也行，至少 Dashboard 有畫面
+                        # GSD: Always calculate indicators (will fill defaults if too short)
+                        processed["5m"] = calculate_futures_squeeze(df, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
                 except Exception as e:
                     console.print(f"[yellow][FuturesMonitor] api.kbars failed: {e}[/yellow]")
 
@@ -569,15 +822,24 @@ class FuturesMonitor:
             if self._current_bar["ts"] is not None and self._current_bar["open"] > 0:
                 df_tmp = pd.DataFrame([self._current_bar]).set_index("ts")
                 df_tmp.columns = ["Open", "High", "Low", "Close", "Volume"]
-                processed["5m"] = df_tmp
+                # GSD: Always calculate indicators (will fill defaults if too short)
+                processed["5m"] = calculate_futures_squeeze(df_tmp, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
             else:
                 return
 
         df_5m = processed["5m"]
+        
+        # ── GSD: Ensure trading_day is always present before any downstream usage ──
+        if "trading_day" not in df_5m.columns or df_5m["trading_day"].iloc[-1] is None or pd.isna(df_5m["trading_day"].iloc[-1]):
+            from core.date_utils import get_trading_day
+            df_5m["trading_day"] = get_trading_day(df_5m.index)
+            
         last_5m = df_5m.iloc[-1]
         
         # fallback for MTF
         df_15m = processed.get("15m", df_5m)
+        if "trading_day" not in df_15m.columns:
+            df_15m["trading_day"] = df_5m["trading_day"].reindex(df_15m.index, method='ffill')
         last_15m = df_15m.iloc[-1]
         
         # 指標預設值
@@ -620,37 +882,60 @@ class FuturesMonitor:
 
             stop_msg = self._check_stop_loss(timestamp, last_price)
             if not stop_msg:
-                vwap_exit = self.RISK.get("exit_on_vwap") or (self.counter_exit_vwap and self._last_entry_reason == "COUNTER")
-                vwap_confirm_needed = self.RISK.get("exit_vwap_confirm_bars", 0)
-                if vwap_exit:
-                    # Check if price is beyond VWAP
-                    vwap_violated = (
-                        (self.trader.position > 0 and last_price < vwap) or
-                        (self.trader.position < 0 and last_price > vwap)
-                    )
-                    if vwap_violated:
-                        self._vwap_violation_bars += 1
-                    else:
-                        self._vwap_violation_bars = 0  # Reset if price returns to favorable side
+                hhmm = int(datetime.now().strftime("%H%M"))
+                _is_night = hhmm >= 1500 or hhmm < 500
 
-                    if self._vwap_violation_bars >= vwap_confirm_needed:
-                        stop_msg = self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason="VWAP")
-                        self._vwap_violation_bars = 0  # Reset after exit
+                if _is_night:
+                    # 夜盤: VWAP exit (回測 PF=2.74)
+                    vwap_exit = self.RISK.get("exit_on_vwap") or (self.counter_exit_vwap and self._last_entry_reason == "COUNTER")
+                    vwap_confirm_needed = self.RISK.get("exit_vwap_confirm_bars", 0)
+                    if vwap_exit:
+                        vwap_violated = (
+                            (self.trader.position > 0 and last_price < vwap) or
+                            (self.trader.position < 0 and last_price > vwap)
+                        )
+                        if vwap_violated:
+                            self._vwap_violation_bars += 1
+                        else:
+                            self._vwap_violation_bars = 0
+                        if self._vwap_violation_bars >= vwap_confirm_needed:
+                            stop_msg = self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason="VWAP")
+                            self._vwap_violation_bars = 0
+                else:
+                    # 日盤: ATR Trail 3x (回測 PF=1.74, VWAP exit 日盤 PF=0.30)
+                    atr_val = last_5m.get("atr", 50) or 50
+                    atr_trail_mult = 3.0
+                    if self.trader.position > 0:
+                        self._atr_trail_peak = max(self._atr_trail_peak, last_price)
+                        trail_floor = self._atr_trail_peak - atr_val * atr_trail_mult
+                        if last_price <= trail_floor:
+                            stop_msg = self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason="ATR_TRAIL")
+                    elif self.trader.position < 0:
+                        if self._atr_trail_peak == 0:
+                            self._atr_trail_peak = last_price
+                        self._atr_trail_peak = min(self._atr_trail_peak, last_price)
+                        trail_ceil = self._atr_trail_peak + atr_val * atr_trail_mult
+                        if last_price >= trail_ceil:
+                            stop_msg = self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason="ATR_TRAIL")
             if stop_msg:
                 self.has_tp1_hit = False
                 self.cooldown_until = self.cooldown_bars # 觸發停損/平倉後進入冷卻
+                self._last_exit_bar = timestamp  # 記錄 exit bar
             return  # don't enter same bar as exit
 
         # 3. Entry logic (with cooldown check)
         if self.cooldown_until > 0:
             self.cooldown_until -= 1
+            self._audit_signal("ENTRY_BLOCKED", "", score, "cooldown_active", f"remaining={self.cooldown_until}")
             return
 
-        # Prevent re-entering on the same bar
-        if self.last_processed_bar == timestamp and self.trader.position != 0:
+        # Prevent re-entering on the same bar as exit
+        if self._last_exit_bar == timestamp:
+            self._audit_signal("ENTRY_BLOCKED", "", score, "same_bar_exit")
             return
 
         self.has_tp1_hit = False
+        self._atr_trail_peak = 0.0  # Reset ATR trail for new position
         stop_loss_pts = self.RISK.get("stop_loss_pts", 60)
         if self.ATR_MULT > 0:
             atr_val = last_5m.get("atr", 0)
@@ -669,31 +954,63 @@ class FuturesMonitor:
         # 夜盤成交量門檻降低（夜盤 TMF 量通常只有日盤 3-10%）
         hhmm = int(datetime.now().strftime("%H%M"))
         is_night = hhmm >= 1500 or hhmm < 500
-        vol_threshold = 0.05 if is_night else 0.3
+        vol_threshold = self.STRATEGY.get("volume_threshold", 0.05 if is_night else 0.3)
 
         vol_filter_ok = (avg_vol == 0) or (vol >= avg_vol * vol_threshold)
         if not vol_filter_ok:
             session_note = "夜盤" if is_night else "日盤"
+            self._audit_signal("ENTRY_BLOCKED", "", score, "low_volume", f"vol={vol:.0f} avg={avg_vol:.0f} thresh={vol_threshold}")
             console.print(f"[dim]⏸️ Volume too low ({session_note}): {vol:.0f} vs avg {avg_vol:.0f} (>{vol_threshold*100:.0f}%) — skipping entry[/dim]")
             return
 
-        if abs(score) < min_score and self.counter_enabled:
-            pass  # Counter mode 有自己的信號系統，不擋
-        elif abs(score) < min_score:
-            return  # 分數太低，不進場
+        if abs(score) < min_score:
+            if self.counter_enabled:
+                pass  # Counter mode 有自己的信號系統，不擋
+            else:
+                self._audit_signal("NO_ENTRY", "", score, "score_too_low", f"threshold={min_score}")
+                return  # 分數太低，不進場
 
-        # ── Pluggable entry strategy (Elite Strategies) ──
-        from strategies.futures.elite_strategies import get_strategy as get_elite_strategy
-        from strategies.futures.elite_strategies import select_strategy
+        # ── GSD: Pluggable Strategy Entry ────────────────────────────
+        # 1. Get active strategy from registry
+        active_name = self.STRATEGY.get("active_strategy", "counter_vwap")
+        strategy = self._registry.get(active_name)
 
-        # Always track fires for counter mode
-        if self.counter_enabled:
-            self._detect_squeeze_failure(last_5m, df_5m)
+        # 2. Fallback to old hardcoded logic if plugin not found (Migration safety)
+        if strategy is None:
+            console.print(f"[yellow]⚠️ Strategy plugin '{active_name}' not found, falling back to legacy logic.[/yellow]")
+            self._legacy_entry_logic(last_5m, df_5m, last_price, timestamp, score, stop_loss_pts)
+            return
 
-        # Elite Strategy Auto-Select: 並行嘗試 Spring/Upthrust + Counter-VWAP
-        auto_select = self.STRATEGY.get("auto_select", False)
-        if auto_select and self.counter_enabled:
-            # 1. 先試 Spring/Upthrust (0 延遲, 高品質)
+        # 3. Build immutable StrategyContext (SDD Rule 1: Read-only view)
+        ctx = StrategyContext(
+            market=MarketData(
+                last_bar=last_5m.to_dict(),
+                df_5m=df_5m,
+                df_15m=df_15m,
+                timestamp=str(timestamp),
+                session=int(last_5m.get("session", 0)),
+            ),
+            position=PositionView(
+                size=self.trader.position,
+                entry_price=self.trader.entry_price,
+                current_stop_loss=getattr(self.trader, "current_stop_loss", None),
+                unrealized_pnl=getattr(self.trader, "unrealized_pnl", 0),
+                has_tp1_hit=self.has_tp1_hit,
+            ),
+            config=self.cfg,  # Pass full config; strategy picks what it needs
+            bar_counter=self._bar_counter,
+        )
+
+        # 3.5. Initialize strategy once (when first loaded or strategy changes)
+        if not hasattr(self, '_active_strategy_name') or self._active_strategy_name != active_name:
+            strategy.init(ctx)
+            self._active_strategy_name = active_name
+
+        # 4. Execute strategy
+        signal = strategy.on_bar(ctx)
+
+        # 4.5 Fallback: try Spring/Upthrust if registry strategy has no signal
+        if signal is None:
             from strategies.futures.elite_strategies import strategy_spring_upthrust
             spring_signal = strategy_spring_upthrust({
                 "last_5m": last_5m, "df_5m": df_5m,
@@ -701,66 +1018,32 @@ class FuturesMonitor:
             }, self.cfg)
             if spring_signal:
                 atr_val = last_5m.get("atr", 0)
-                if atr_val > 300: atr_val = 300  # [Bug fix] ATR cap
+                if atr_val > 300: atr_val = 300
                 spring_sl = spring_signal.get("stop_loss", atr_val * 2.0 if atr_val > 0 else 60)
                 lots = self.MGMT.get("lots_per_trade", 1)
-                be = self.RISK.get("break_even_pts", 50)
                 action = spring_signal["action"]
                 if self.MGMT.get(f"allow_{'long' if action == 'BUY' else 'short'}", True):
                     console.print(f"[bold cyan]🌊 SPRING/UPTHRUST {action} SL={spring_sl:.1f}[/bold cyan]")
                     self._execute_trade(action, last_price, timestamp, lots,
-                                        stop_loss=spring_sl, break_even_trigger=be, reason=spring_signal["reason"])
-                    return  # Spring 進場後不嘗試 Counter
-            
-            # 2. 再試 Counter-VWAP (盤整市場)
-            use_counter = self.counter_enabled and (
-                self._is_ranging_regime(df_5m) if self.counter_auto_regime else True
-            )
-            if use_counter:
-                counter_signal = self._detect_squeeze_failure(last_5m, df_5m)
-                if counter_signal:
-                    atr_val = last_5m.get("atr", 0)
-                    if atr_val > 300: atr_val = 300  # [Bug fix] ATR cap
-                    counter_sl = atr_val * self.counter_atr_sl_mult if atr_val > 0 else stop_loss_pts
-                    lots = self.MGMT.get("lots_per_trade", 1)
-                    be = self.RISK.get("break_even_pts", 50)
-                    action = "BUY" if counter_signal == "COUNTER_BUY" else "SELL"
-                    if self.MGMT.get(f"allow_{'long' if action == 'BUY' else 'short'}", True):
-                        console.print(f"[bold magenta]🔄 COUNTER {action} SL={counter_sl:.1f}[/bold magenta]")
-                        self._execute_trade(action, last_price, timestamp, lots,
-                                            stop_loss=counter_sl, break_even_trigger=be, reason="COUNTER")
-                    return
-            # 非盤整且無 Spring 信號時 return
+                                        stop_loss=spring_sl, reason=spring_signal["reason"])
             return
-        else:
-            # Counter mode (auto-regime override)
-            use_counter = self.counter_enabled and (
-                self._is_ranging_regime(df_5m) if self.counter_auto_regime else True
-            )
-            if use_counter:
-                counter_signal = self._detect_squeeze_failure(last_5m, df_5m)
-                if counter_signal:
-                    atr_val = last_5m.get("atr", 0)
-                    if atr_val > 300: atr_val = 300  # [Bug fix] ATR cap
-                    counter_sl = atr_val * self.counter_atr_sl_mult if atr_val > 0 else stop_loss_pts
-                    lots = self.MGMT.get("lots_per_trade", 2)
-                    be = self.RISK.get("break_even_pts", 50)
-                    action = "BUY" if counter_signal == "COUNTER_BUY" else "SELL"
-                    if self.MGMT.get(f"allow_{'long' if action == 'BUY' else 'short'}", True):
-                        console.print(f"[bold magenta]🔄 COUNTER {action} SL={counter_sl:.1f}[/bold magenta]")
-                        self._execute_trade(action, last_price, timestamp, lots,
-                                            stop_loss=counter_sl, break_even_trigger=be, reason="COUNTER")
-                    return
 
-            # Fallback to config active_strategy
-            active = self.STRATEGY.get("active_strategy", "counter_vwap")
-            strategy_fn = get_elite_strategy(active)
-            if strategy_fn is None:
-                # Fallback to old entry_strategies if elite not found
-                strategy_fn = get_strategy(active)
-
-        if not strategy_fn or self.trader.position != 0:
+        # 5. Validate Signal (Defensive Programming)
+        is_valid, msg = signal.validate()
+        if not is_valid:
+            console.print(f"[red]❌ Invalid signal from {active_name}: {msg}[/red]")
             return
+
+        # 6. Execute Trade
+        lots = self.MGMT.get("lots_per_trade", 1)
+        self._execute_trade(
+            signal.action,
+            last_price,
+            timestamp,
+            lots,
+            stop_loss=signal.stop_loss,
+            reason=signal.reason,
+        )
 
         trend = _check_trend_breakout_signal(df_5m, df_15m)
         market_state = {

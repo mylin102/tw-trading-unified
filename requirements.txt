@@ -6,6 +6,7 @@ numba
 python-dotenv
 pyyaml
 rich
+pandas_market_calendars
 
 # Dashboard & Visualization
 streamlit

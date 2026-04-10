@@ -5,6 +5,7 @@ os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
 
 import numpy as np
 import pandas as pd
+import pandas_ta  # noqa: F401 — registers .ta accessor for df.ta.macd(), df.ta.stoch(), etc.
 
 
 def calculate_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
@@ -36,8 +37,28 @@ def calculate_futures_squeeze(
 ) -> pd.DataFrame:
     # Minimum length required for basic squeeze calculation
     min_req = max(bb_length, kc_length, 30)
+    
+    # ── GSD: Always calculate trading_day first (essential for logs/dashboard) ──
+    from core.date_utils import get_trading_day
+    df = df.copy()
+    if not df.empty:
+        df["trading_day"] = get_trading_day(df.index)
+
     if df.empty or len(df) < min_req:
-        return df
+        # GSD: Ensure columns exist even if empty/short
+        res = df.copy()
+        for col in ["sqz_on", "momentum", "mom_prev", "vwap", "price_vs_vwap", "fired", "mom_state", 
+                    "ema_fast", "ema_slow", "ema_filter", "ema_macro", "bullish_align", "bearish_align",
+                    "recent_high", "recent_low", "is_new_high", "is_new_low", "in_bull_pb_zone", "in_bear_pb_zone",
+                    "day_open", "day_min", "day_max", "opening_bullish", "opening_bearish"]:
+            if col not in res.columns:
+                if col in ["sqz_on", "fired", "bullish_align", "bearish_align", "is_new_high", "is_new_low", "in_bull_pb_zone", "in_bear_pb_zone", "opening_bullish", "opening_bearish"]:
+                    res[col] = False
+                elif col == "mom_state":
+                    res[col] = 0
+                else:
+                    res[col] = np.nan
+        return res
 
     df = df.copy()
     if isinstance(df.columns, pd.MultiIndex):

@@ -51,6 +51,8 @@ def patch_data(ticker="TMF", start_date="2026-03-27"):
     log_dir = Path("logs/market_data")
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    res = res.sort_index()
+
     # 根據 trading_day 分組存檔
     for day, group in res.groupby("trading_day"):
         date_str = day.strftime("%Y%m%d")

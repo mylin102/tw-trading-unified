@@ -55,32 +55,44 @@ class DataStorage:
         elif isinstance(timestamp, datetime):
             timestamp = self.tw_tz.localize(timestamp)
         
-        # 準備數據
-        row = {
+        # 準備數據 (GSD: Include all indicators to prevent None fields in dashboard)
+        row = data.copy()
+        
+        # Fix: Convert trading_day to string to prevent None/NaN in CSV
+        if "trading_day" in row and row["trading_day"] is not None:
+            td = row["trading_day"]
+            if hasattr(td, "isoformat"):  # date object
+                row["trading_day"] = td.isoformat()
+            else:
+                row["trading_day"] = str(td)
+        
+        row.update({
             'timestamp': timestamp.strftime('%Y-%m-%d %H:%M:%S'),
-            'open': data.get('open', 0),
-            'high': data.get('high', 0),
-            'low': data.get('low', 0),
-            'close': data.get('close', 0),
-            'volume': data.get('volume', 0),
-            'vwap': data.get('vwap', 0),
-            'score': data.get('score', 0),
-            'sqz_on': data.get('sqz_on', False),
-            'mom_state': data.get('mom_state', 0),
-            'regime': data.get('regime', 'NORMAL'),
-            'bull_align': data.get('bull_align', False),
-            'bear_align': data.get('bear_align', False),
-            'in_pb_zone': data.get('in_pb_zone', False),
-        }
+            # Ensure basic fields exist for backward compatibility
+            'open': data.get('open', data.get('Open', 0)),
+            'high': data.get('high', data.get('High', 0)),
+            'low': data.get('low', data.get('Low', 0)),
+            'close': data.get('close', data.get('Close', 0)),
+            'volume': data.get('volume', data.get('Volume', 0)),
+            'bull_align': data.get('bullish_align', data.get('bull_align', False)),
+            'bear_align': data.get('bearish_align', data.get('bear_align', False)),
+        })
         
         # 轉換為 DataFrame
         df_row = pd.DataFrame([row])
         
-        # 檢查檔案是否存在
-        header = not self.market_file.exists()
-        
-        # 儲存
-        df_row.to_csv(self.market_file, mode='a', index=False, header=header)
+        # 儲存 (GSD Fix: Support dynamic column expansion)
+        if self.market_file.exists():
+            try:
+                df_existing = pd.read_csv(self.market_file)
+                df_combined = pd.concat([df_existing, df_row], ignore_index=True)
+                df_combined.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
+                df_combined.to_csv(self.market_file, index=False)
+            except Exception:
+                # Fallback to append if read fails
+                df_row.to_csv(self.market_file, mode='a', index=False, header=False)
+        else:
+            df_row.to_csv(self.market_file, index=False, header=True)
     
     def save_trade(self, trade: dict):
         """

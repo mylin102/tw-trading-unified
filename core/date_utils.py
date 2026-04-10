@@ -1,81 +1,188 @@
 import pandas as pd
+import json
 from datetime import datetime, date, timedelta
+from pathlib import Path
 from typing import Union
 
-def get_trading_day(dt: Union[datetime, pd.Timestamp, pd.DatetimeIndex]) -> Union[date, pd.Series]:
+# ── Calendar Library ──
+try:
+    import pandas_market_calendars as mcal
+    _TW_CAL = mcal.get_calendar('XTAI')
+except ImportError:
+    _TW_CAL = None
+
+# ── Holiday Cache (Legacy/Fallback) ──
+HOLIDAYS_PATH = Path(__file__).parent.parent / "config" / "holidays.json"
+CUSTOM_HOLIDAYS_PATH = Path(__file__).parent.parent / "config" / "holidays_custom.json"
+
+def fetch_holidays(api=None):
+    """
+    Fetch holidays from Shioaji API and cache locally.
+    Also merges with config/holidays_custom.json if it exists.
+    """
+    h_set = set()
+    if api:
+        try:
+            holidays = []
+            if hasattr(api, 'get_holidays'):
+                holidays = api.get_holidays()
+            
+            h_list = [h if isinstance(h, str) else h.strftime("%Y-%m-%d") for h in holidays]
+            if h_list:
+                HOLIDAYS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with open(HOLIDAYS_PATH, "w", encoding="utf-8") as f:
+                    json.dump(h_list, f)
+                h_set.update(h_list)
+        except Exception as e:
+            print(f"⚠️ Failed to fetch holidays from API: {e}")
+    
+    if HOLIDAYS_PATH.exists():
+        try:
+            with open(HOLIDAYS_PATH, "r", encoding="utf-8") as f:
+                h_set.update(json.load(f))
+        except:
+            pass
+            
+    # 加載使用者手動維護的假日清單 (GSD enhancement)
+    if CUSTOM_HOLIDAYS_PATH.exists():
+        try:
+            with open(CUSTOM_HOLIDAYS_PATH, "r", encoding="utf-8") as f:
+                custom = json.load(f)
+                if isinstance(custom, list):
+                    h_set.update(custom)
+        except Exception as e:
+            print(f"⚠️ Error loading custom holidays: {e}")
+            
+    return h_set
+
+def get_trading_day(dt: Union[datetime, pd.Timestamp, pd.DatetimeIndex, pd.Series], holidays=None) -> Union[date, pd.Series]:
     """
     獲取台灣期貨的「交易日 (Trading Day)」。
-    台指期規則：
-    - 一般交易時段 (日盤): 08:45 ~ 13:45
-    - 盤後交易時段 (夜盤): 15:00 ~ 05:00 (次日)
+    台指期規則 (Taifex Standard)：
+    - 一般交易時段 (日盤): 08:45 ~ 13:45 -> 歸屬當日
+    - 盤後交易時段 (夜盤): 15:00 ~ 05:00 (次日) -> 歸屬「下一個交易日」
     
-    演算法：將時間加上 9 小時，其所在的日曆日即為交易日。
-    - 15:00 + 9h = 00:00 (次日) -> 歸屬次日
-    - 05:00 + 9h = 14:00 (當日) -> 歸屬當日
-    - 08:45 + 9h = 17:45 (當日) -> 歸屬當日
-    - 13:45 + 9h = 22:45 (當日) -> 歸屬當日
+    GSD Rationale: Using .apply() for Series/Index to guarantee scalar handling and index alignment.
+    """
+    if dt is None:
+        dt = datetime.now()
+
+    # ── Handle Vectorized Inputs (Series/Index) ──
+    if isinstance(dt, pd.Series):
+        return pd.Series(
+            [get_trading_day(x, holidays) for x in dt],
+            index=dt.index,
+            name=dt.name,
+        )
+    if isinstance(dt, pd.DatetimeIndex):
+        return pd.Series(
+            [get_trading_day(x, holidays) for x in dt],
+            index=dt,
+        )
+
+    # ── Handle Scalar Input ──
+    h_set = holidays or fetch_holidays()
+
+    # 1. Convert to standardized datetime object
+    if isinstance(dt, pd.Timestamp):
+        d = dt.to_pydatetime()
+    elif isinstance(dt, datetime):
+        d = dt
+    else:
+        # Fallback for strings or other types (e.g. NaT)
+        try:
+            d = pd.to_datetime(dt).to_pydatetime()
+        except:
+            return dt
+
+    # 2. V2: Professional Calendar Logic ──
+    if _TW_CAL is not None:
+        # 15:00 之後屬於下一個可能的交易日
+        target = d + timedelta(days=1) if d.hour >= 15 else d
+        
+        while True:
+            # GSD: schedule check
+            schedule = _TW_CAL.schedule(start_date=target, end_date=target + timedelta(days=14))
+            if schedule.empty:
+                # V-Model fix: Explicitly return scalar date
+                return pd.Timestamp(target).to_pydatetime().date()
+            
+            # V-Model fix: Explicitly convert to python date to avoid Cython method access issues
+            candidate = schedule.index[0].to_pydatetime().date()
+            if candidate.strftime("%Y-%m-%d") not in h_set:
+                return candidate
+            # 如果剛好是自定義假日，往後推一天再查
+            target = datetime.combine(candidate + timedelta(days=1), datetime.min.time())
+
+    # ── V1: Fallback Manual Logic ──
+    if d.hour >= 15:
+        target = d + timedelta(days=1)
+    else:
+        target = d
+    while True:
+        is_weekend = target.weekday() >= 5
+        is_holiday = target.strftime("%Y-%m-%d") in h_set
+        if not is_weekend and not is_holiday:
+            break
+        target += timedelta(days=1)
+    # V-Model fix: Safe conversion to date
+    return pd.Timestamp(target).to_pydatetime().date()
+
+def get_session(dt: Union[datetime, pd.Timestamp]):
+    """
+    判斷盤別：1=日盤 (08:45-13:45), 2=夜盤 (15:00-05:00)
+    GSD: Only supports scalar input.
+    """
+    # GSD: Absolute type safety check
+    if hasattr(dt, "dt"): # Series
+        return 2 if ((dt.dt.hour >= 15) | (dt.dt.hour < 8)).any() else 1
     
-    支援單一 datetime 或 Pandas DatetimeIndex 的向量化運算。
-    """
-    if isinstance(dt, pd.DatetimeIndex) or isinstance(dt, pd.Series):
-        return (dt + pd.Timedelta(hours=9)).date
-    else:
-        # 單一 datetime 或 Timestamp
-        if isinstance(dt, pd.Timestamp):
-            dt = dt.to_pydatetime()
-        return (dt + timedelta(hours=9)).date()
+    if not hasattr(dt, "hour"):
+        # Not a timestamp object, try converting
+        try:
+            dt = pd.to_datetime(dt)
+        except:
+            return 1 # Default to Day
+            
+    hour = dt.hour
+    if hour >= 15 or hour < 8:
+        return 2  # Night
+    return 1  # Day
 
-def is_night_session(dt: Union[datetime, pd.Timestamp, pd.DatetimeIndex]) -> Union[bool, pd.Series]:
-    """
-    判斷是否為夜盤時段 (15:00 ~ 05:00)。
-    注意：此處判斷是以日曆時間的「小時」為準。
-    """
-    if isinstance(dt, pd.DatetimeIndex) or isinstance(dt, pd.Series):
-        hour = dt.hour
-        # 15:00 (含) 到 23:59，或 00:00 到 05:00 (含，因為可能會有 05:00 的 K 棒收盤)
-        return (hour >= 15) | (hour <= 5)
-    else:
-        hour = dt.hour
-        return (hour >= 15) or (hour <= 5)
+def is_night_session(dt: Union[datetime, pd.Timestamp, pd.DatetimeIndex, pd.Series]) -> Union[bool, pd.Series]:
+    # GSD: Robust attribute check for pandas objects
+    if isinstance(dt, pd.Series):
+        dt = pd.to_datetime(dt, errors="coerce")
+        return (dt.dt.hour >= 15) | (dt.dt.hour < 8)
+    if hasattr(dt, "dt"):
+        return (dt.dt.hour >= 15) | (dt.dt.hour < 8)
+    if hasattr(dt, "hour") and not isinstance(dt, (datetime, pd.Timestamp)):
+        # Likely DatetimeIndex or similar
+        return (dt.hour >= 15) | (dt.hour < 8)
+    # Scalar fallback
+    return get_session(dt) == 2
 
-def is_day_session(dt: Union[datetime, pd.Timestamp, pd.DatetimeIndex]) -> Union[bool, pd.Series]:
-    """
-    判斷是否為日盤時段 (08:45 ~ 13:45)。
-    """
-    if isinstance(dt, pd.DatetimeIndex) or isinstance(dt, pd.Series):
-        hour = dt.hour
-        return (hour >= 8) & (hour <= 14)
-    else:
-        hour = dt.hour
-        return (hour >= 8) and (hour <= 14)
-
+def is_day_session(dt: Union[datetime, pd.Timestamp, pd.DatetimeIndex, pd.Series]) -> Union[bool, pd.Series]:
+    if isinstance(dt, pd.Series):
+        dt = pd.to_datetime(dt, errors="coerce")
+        return (dt.dt.hour >= 8) & (dt.dt.hour < 15)
+    if hasattr(dt, "dt"):
+        return (dt.dt.hour >= 8) & (dt.dt.hour < 15)
+    if hasattr(dt, "hour") and not isinstance(dt, (datetime, pd.Timestamp)):
+        return (dt.hour >= 8) & (dt.hour < 15)
+    return get_session(dt) == 1
 
 def get_session_date_str(dt=None):
     """
-    Get the session date string in YYYYMMDD format.
-
-    Taiwan futures cross-day rule:
-    - 00:00-05:00 belongs to previous calendar day's session
-    - 05:00+ belongs to current calendar day
-
-    Both main.py (writer) and dashboard.py (reader) MUST call this
-    to guarantee filename alignment.
-
-    Returns:
-        str: YYYYMMDD date string for the current session.
+    獲取交易會話日期字串 (YYYYMMDD)。
     """
     if dt is None:
-        from datetime import datetime as _dt
-        dt = _dt.now()
-    if isinstance(dt, pd.Timestamp):
-        dt = dt.to_pydatetime()
-    if isinstance(dt, datetime):
-        if dt.hour < 5:
-            dt = dt - timedelta(days=1)
-        return dt.strftime("%Y%m%d")
-    # Fallback: use current time
-    from datetime import datetime as _dt
-    now = _dt.now()
-    if now.hour < 5:
-        now = now - timedelta(days=1)
-    return now.strftime("%Y%m%d")
+        dt = datetime.now()
+    t_day = get_trading_day(dt)
+    
+    # Handle both scalar and Series returns
+    if isinstance(t_day, pd.Series):
+        # date objects in Series don't have .dt accessor, use apply
+        return t_day.apply(lambda x: x.strftime("%Y%m%d") if hasattr(x, "strftime") else str(x))
+    
+    return t_day.strftime("%Y%m%d")

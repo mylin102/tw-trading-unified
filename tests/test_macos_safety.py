@@ -172,7 +172,7 @@ class TestBidaskDispatcherSafety:
         from main import bidask_dispatcher, _shutdown_event
         
         om = self._make_mock_options_mon()
-        callback = bidask_dispatcher(om)
+        callback = bidask_dispatcher(None, om)
         
         _shutdown_event.set()
         
@@ -194,7 +194,7 @@ class TestBidaskDispatcherSafety:
         from main import bidask_dispatcher, _shutdown_event
         
         om = self._make_mock_options_mon()
-        callback = bidask_dispatcher(om)
+        callback = bidask_dispatcher(None, om)
         
         # Should not crash
         callback("FOP", None)
@@ -204,7 +204,7 @@ class TestBidaskDispatcherSafety:
         from main import bidask_dispatcher, _shutdown_event
         
         om = self._make_mock_options_mon()
-        callback = bidask_dispatcher(om)
+        callback = bidask_dispatcher(None, om)
         
         # Zero prices
         bidask = MagicMock()
@@ -223,7 +223,7 @@ class TestBidaskDispatcherSafety:
         from main import bidask_dispatcher, _shutdown_event
         
         om = self._make_mock_options_mon()
-        callback = bidask_dispatcher(om)
+        callback = bidask_dispatcher(None, om)
         
         bidask = MagicMock()
         bidask.code = "TMF202604C32800"
@@ -241,7 +241,7 @@ class TestBidaskDispatcherSafety:
         from main import bidask_dispatcher, _shutdown_event
         
         om = self._make_mock_options_mon()
-        callback = bidask_dispatcher(om)
+        callback = bidask_dispatcher(None, om)
         
         bidask = MagicMock()
         bidask.code = "TMF202604C32800"
@@ -262,7 +262,7 @@ class TestBidaskDispatcherSafety:
         # Make market_data access fail
         type(om.monitor).market_data = property(lambda self: 1 / 0)
         
-        callback = bidask_dispatcher(om)
+        callback = bidask_dispatcher(None, om)
         
         bidask = MagicMock()
         bidask.code = "TMF202604C32800"

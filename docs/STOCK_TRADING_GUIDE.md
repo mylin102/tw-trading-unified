@@ -8,11 +8,11 @@
 
 台股模組整合於現有架構中，共用 Shioaji Session 以避免登入限制。
 
-*   **Scanner (`strategies/stocks/scanner.py`)**: 
+*   **Scanner (`strategies/stocks/scanner.py`)**:
     使用 **「整股」** 歷史數據進行指標分析，以確保信號穩定性。
-*   **Monitor (`strategies/stocks/monitor.py`)**: 
+*   **Monitor (`strategies/stocks/monitor.py`)**:
     實時監控 Watchlist，使用 **「零股」** 快照獲取精確的可成交價。
-*   **Execution**: 
+*   **Execution**:
     下單時強制設定 `order_lot=sj.constant.StockOrderLot.Odd`，支援精確到「股」的自動交易。
 
 ---
@@ -66,6 +66,3 @@ order = api.Order(
 ```bash
 python3 scripts/dry_run_stocks.py
 ```
-
----
-*Created by Gemini CLI - 2026-04-06*

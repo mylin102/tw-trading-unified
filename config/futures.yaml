@@ -1,5 +1,5 @@
 active_strategy: spring_upthrust
-cooldown_bars: 5  # 冷卻 25 分鐘 (5 bars × 5min), 舊值 3→8 太極端
+cooldown_bars: 5
 execution:
   broker_fee_per_side: 20.0
   exchange_fee_per_side: 0.0
@@ -21,51 +21,52 @@ monitoring:
   poll_interval_secs: 30
 risk_mgmt:
   atr_length: 14
-  atr_multiplier: 2.0  # 放寬停損 from 1.5→2.0, 避免被雜訊掃停
+  atr_multiplier: 1.8
   break_even_pts: 100
   exit_on_vwap: true
-  exit_vwap_confirm_bars: 2  # 連續2根K線收在VWAP外才出場
+  exit_vwap_confirm_bars: 2
   ma_stop_length: 20
   ma_stop_multiplier: 1.0
   ma_stop_ticks: 10
   ma_stop_type: below
   skip_hours: []
-  stop_loss_pts: 60  # 放寬固定停損 from 30→60 (ATR=0時使用)
+  stop_loss_pts: 60
   time_filter_enabled: false
   trailing_stop_distance_pts: 50
   trailing_stop_enabled: true
   trailing_stop_trigger_pts: 100
 strategy:
-  auto_select: true
   active_strategy: counter_vwap
-  spring_upthrust:
-    bb_mult: 2.0
-    kc_mult: 1.0
-    atr_mult: 2.0
-    bb_length: 20
-    kc_length: 20
+  auto_select: true
   counter_mode:
-    enabled: true
-    auto_regime: true
-    confirm_bars: 5
     atr_sl_mult: 2.0
+    auto_regime: true
+    confirm_bars: 7
+    enabled: true
     exit_on_vwap: true
-  entry_score: 21
-  regime_filter: mid
+    min_momentum: 30.0
+  entry_score: 16
   length: 20
-  use_squeeze: true
-  use_pullback: false
   partial_exit:
     enabled: true
     tp1_lots: 1
     tp1_pts: 200
+  regime_filter: low
+  spring_upthrust:
+    atr_mult: 2.0
+    bb_length: 20
+    bb_mult: 2.0
+    kc_length: 20
+    kc_mult: 1.0
+  use_pullback: false
+  use_squeeze: true
   weights:
-    5m: 0.4
     15m: 0.4
     1h: 0.2
+    5m: 0.4
 trade_mgmt:
   allow_long: true
   allow_short: true
   force_close_at_end: false
   lots_per_trade: 1
-  max_positions: 1
+  max_positions: 2
