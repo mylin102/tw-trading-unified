@@ -221,7 +221,48 @@ def strategy_it_window_dressing(state, cfg):
     }
 
 
+def strategy_stock_canslim_breakout(state, cfg):
+    """
+    CANSLIM 突破策略：
+    1. 形態確認：Scanner 已標註為 CUP_WITH_HANDLE 且有 pivot_price。
+    2. 價格突破：當前價格 > pivot_price。
+    3. 成交量爆發：當前成交量 > 20日均量 * 1.4 倍。
+    4. 大盤過濾：TMF 指標顯示非強空頭 (由 state 傳入)。
+    """
+    last_5m = state["last_5m"]
+    df = state["df_5m"]
+    pivot_price = state.get("pivot", 0.0)
+    
+    if pivot_price <= 0:
+        return None
+
+    # 1. 價格突破檢查
+    if last_5m["Close"] <= pivot_price:
+        return None
+
+    # 2. 成交量噴發檢查 (GSD: Volume Confirmation)
+    vol_avg = df["Volume"].rolling(20).mean().iloc[-1]
+    vol_mult = cfg.get("stocks", {}).get("canslim", {}).get("volume_breakout_mult", 1.4)
+    if last_5m["Volume"] < vol_avg * vol_mult:
+        return None
+
+    # 3. 大盤方向過濾 (Market Direction - M)
+    if cfg.get("stocks", {}).get("canslim", {}).get("market_direction_filter", True):
+        if state.get("market_trend") == "BEAR":
+            return None
+
+    return {
+        "action": "BUY", 
+        "reason": f"CANSLIM_BREAKOUT_PIVOT_{pivot_price}", 
+        "qty_mode": "MAIN",
+        "stop_loss": pivot_price * 0.93  # 突破失敗止損設在 pivot 下方 7%
+    }
+
 STOCK_STRATEGIES = {
+    "canslim_breakout": {
+        "func": strategy_stock_canslim_breakout,
+        "desc": "CANSLIM 突破。杯中帶把/雙底型態，帶量突破 Pivot 點時進場。"
+    },
     "it_window_dressing": {
         "func": strategy_it_window_dressing,
         "desc": "投信作帳波段。投信連三買 + 多頭排列，跟隨法人建倉波段。"

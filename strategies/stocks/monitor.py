@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 from rich.console import Console
 import shioaji as sj
+from strategies.stocks.scanner import StockScanner
 
 ROOT = Path(__file__).parent.parent.parent
 MKT_LOGS = ROOT / "logs" / "market_data"
@@ -50,9 +51,113 @@ class StockMonitor:
         self.daily_pnl = 0.0
         self.consecutive_losses = 0
         self.is_bear_market = False
+        
+        # 💡 GSD: Integrated Scanner for Pattern Recognition (CANSLIM)
+        self.scanner = StockScanner(self.api)
+        self.scan_results = {} # {ticker: {"pattern": str, "pivot": float}}
+
+    def _run_daily_scan(self):
+        """執行日線級別型態掃描，更新 Pivot 點"""
+        console.print("[cyan]🔍 Running daily pattern scan for CANSLIM...[/cyan]")
+        df_scan = self.scanner.scan_squeeze(self.watchlist, self.cfg)
+        if not df_scan.empty:
+            for _, row in df_scan.iterrows():
+                self.scan_results[row["ticker"]] = {
+                    "pattern": row["pattern"],
+                    "pivot": row["pivot"]
+                }
+            console.print(f"[green]✅ Pattern scan complete. Tagged {len(self.scan_results)} tickers.[/green]")
 
     def get_current_exposure(self):
         return sum([p["qty"] * p["entry_price"] for p in self.positions.values()])
+
+    def _recover_positions_from_ledger(self):
+        """GSD: Recover overnight positions from previous day's trade ledger.
+        
+        Reads yesterday's trades CSV, calculates net positions (BUY - SELL),
+        and restores them to self.positions so the monitor doesn't double-buy.
+        Also writes BUY records to today's ledger so the dashboard can display them.
+        """
+        # GSD Fix: Skip if already recovered (today's ledger has OVERNIGHT_RECOVERY)
+        if self.ledger_path.exists():
+            try:
+                existing = pd.read_csv(self.ledger_path)
+                if not existing.empty and existing["reason"].str.contains("OVERNIGHT_RECOVERY").any():
+                    # Re-load positions from recovery records but don't write again
+                    recoveries = existing[existing["reason"].str.contains("OVERNIGHT_RECOVERY")]
+                    for _, row in recoveries.drop_duplicates(subset=["ticker"]).iterrows():
+                        self.positions[str(row["ticker"])] = {
+                            "stage": "HOLD", "entry_price": row["entry_price"], "qty": int(row["qty"]),
+                        }
+                    console.print(f"[dim]♻️ Already recovered {len(self.positions)} positions from today's ledger[/dim]")
+                    return
+            except Exception:
+                pass
+
+        # Find yesterday's ledger
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        ledger_file = TRADE_LOGS / f"STOCK_{yesterday}_{self.mode_tag}_trades.csv"
+
+        if not ledger_file.exists():
+            console.print(f"[dim]📂 No previous ledger found: {ledger_file}[/dim]")
+            return
+
+        try:
+            df = pd.read_csv(ledger_file)
+            if df.empty:
+                console.print(f"[dim]📂 Yesterday's ledger is empty[/dim]")
+                return
+
+            # Calculate net positions: BUY qty - SELL qty
+            buys = df[df["action"] == "BUY"].groupby("ticker").agg({"qty": "sum", "entry_price": "mean"})
+            sells = df[df["action"] == "SELL"].groupby("ticker").agg({"qty": "sum"})
+
+            # Merge and calculate net
+            recovered_count = 0
+            for ticker, buy_row in buys.iterrows():
+                buy_qty = buy_row["qty"]
+                sell_qty = sells.loc[ticker, "qty"] if ticker in sells.index else 0
+                net_qty = buy_qty - sell_qty
+
+                if net_qty > 0:
+                    avg_price = buy_row["entry_price"]
+                    self.positions[ticker] = {
+                        "stage": "HOLD",
+                        "entry_price": avg_price,
+                        "qty": int(net_qty),
+                    }
+                    recovered_count += 1
+                    console.print(f"[green]♻️ Recovered position: {ticker} qty={int(net_qty)} @ {avg_price:.2f}[/green]")
+
+                    # GSD Fix: Also write to today's ledger so dashboard can display it
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    recovery_record = {
+                        "timestamp": now,
+                        "ticker": ticker,
+                        "strategy": self.strat_name,
+                        "mode": self.mode_tag,
+                        "action": "BUY",
+                        "price": avg_price,
+                        "entry_price": avg_price,
+                        "qty": int(net_qty),
+                        "reason": f"OVERNIGHT_RECOVERY_{yesterday}",
+                        "pnl_gross": 0.0,
+                        "fees": 0.0,
+                        "pnl_cash": 0.0,
+                    }
+                    rec_df = pd.DataFrame([recovery_record])
+                    today_ledger = TRADE_LOGS / f"STOCK_{datetime.now().strftime('%Y%m%d')}_{self.mode_tag}_trades.csv"
+                    header = not today_ledger.exists()
+                    rec_df.to_csv(today_ledger, mode='a', header=header, index=False)
+
+            if recovered_count > 0:
+                total_value = sum(p["qty"] * p["entry_price"] for p in self.positions.values())
+                console.print(f"[bold green]✅ Recovered {recovered_count} positions (total value: ${total_value:,.0f}) — written to today's ledger for dashboard display[/bold green]")
+            else:
+                console.print(f"[dim]📂 No open positions from yesterday[/dim]")
+
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Position recovery failed: {e}[/yellow]")
 
     def clean_unfilled_orders(self):
         """撤銷超過 5 分鐘未成交的掛單"""
@@ -142,12 +247,19 @@ class StockMonitor:
     def run(self):
         self.running = True
         console.print(f"[bold green]🍎 StockMonitor [{self.mode_tag}] Started | Strategy: {self.strat_name} | Watchlist: {len(self.watchlist)}[/bold green]")
-        
+
+        # ── GSD: Recover positions from yesterday's ledger ────────────
+        self._recover_positions_from_ledger()
+
         from strategies.stocks.entry_strategies import STOCK_STRATEGIES
         from strategies.options.options_engine.engine.indicators import calculate_stock_squeeze
         
+        # 💡 GSD: Run initial scan before entering the loop
+        self._run_daily_scan()
+        
         strat_fn = STOCK_STRATEGIES[self.strat_name]["func"]
         last_regime_check = 0
+        last_daily_scan = time.time()
         active_watchlist = None  # 第二招：每日動態篩選
         
         while self.running:
@@ -160,6 +272,11 @@ class StockMonitor:
             if time.time() - last_regime_check > 1800:
                 self._update_market_regime()
                 last_regime_check = time.time()
+            
+            # 💡 GSD: Refresh daily scan every 4 hours
+            if time.time() - last_daily_scan > 14400:
+                self._run_daily_scan()
+                last_daily_scan = time.time()
             
             # 第二招：開盤後篩選「成交量前 N + 開盤強勢」
             if active_watchlist is None and now.hour == 9 and now.minute >= 5:
@@ -204,12 +321,17 @@ class StockMonitor:
                     df.tail(60).to_csv(MKT_LOGS / f"STOCK_{ticker}_{self.date_str}_indicators.csv")
                     
                     # 2. 策略
+                    # 💡 GSD: Include pattern info in state
+                    scan_info = self.scan_results.get(ticker, {"pattern": "NONE", "pivot": 0.0})
+                    
                     state = {
                         "last_5m": df.iloc[-1], "df_5m": df,
                         "scout_stage": self.positions.get(ticker, {}).get("stage", "IDLE"),
                         "scout_entry_price": self.positions.get(ticker, {}).get("entry_price", 0.0),
                         "market_trend": "BEAR" if self.is_bear_market else "BULL",
                         "is_bear_market": self.is_bear_market,
+                        "pattern": scan_info["pattern"],
+                        "pivot": scan_info["pivot"],
                     }
                     res = strat_fn(state, self.cfg)
                     
@@ -249,6 +371,10 @@ class StockMonitor:
 
     def execute_trade(self, ticker, action, price, qty_mode, reason):
         if action == "BUY":
+            # GSD Fix: Prevent duplicate entry for same ticker
+            if ticker in self.positions and qty_mode == "SCOUT":
+                return
+
             current_exposure = self.get_current_exposure()
             remaining = self.total_budget - current_exposure
             if remaining <= 5000: return
