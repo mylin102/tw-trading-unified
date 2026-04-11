@@ -270,6 +270,25 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
 
     fig.update_layout(height=400, margin=dict(t=10, b=10, l=40, r=20), showlegend=False)
     
+    # ── GSD Enhancement: Remove non-trading gaps from time axis ──
+    # This prevents the chart from showing long flat lines during gaps
+    fig.update_xaxes(
+        rangebreaks=[
+            dict(bounds=["sat", "mon"]), # Remove weekends
+            dict(bounds=[5, 8.75], pattern="hour"),  # 05:00 - 08:45
+            dict(bounds=[13.75, 15], pattern="hour"), # 13:45 - 15:00
+        ],
+        row=1, col=1
+    )
+    fig.update_xaxes(
+        rangebreaks=[
+            dict(bounds=["sat", "mon"]),
+            dict(bounds=[5, 8.75], pattern="hour"),
+            dict(bounds=[13.75, 15], pattern="hour"),
+        ],
+        row=2, col=1
+    )
+    
     # 💡 GSD: Explicitly set Y-axis range to follow data closely
     if len(df) > 0:
         p_vals = df[p_col].dropna().to_numpy()
@@ -643,8 +662,10 @@ def load_futures_indicators(full_history=False):
     search_days = [
         (now - dt.timedelta(days=1)).strftime("%Y%m%d"),
         now.strftime("%Y%m%d"),
-        (now + dt.timedelta(days=1)).strftime("%Y%m%d")
+        (now + dt.timedelta(days=1)).strftime("%Y%m%d"),
+        DATE_STR,  # GSD Fix: Always include the active trading session date
     ]
+    search_days = list(dict.fromkeys(search_days))  # dedupe, preserve order
     
     all_dfs = []
     for date_part in search_days:
@@ -990,28 +1011,64 @@ with tab_overview:
             s_df = load_stock_indicators(ticker)
             if s_df is not None and not s_df.empty:
                 last = s_df.iloc[-1]
+                # 計算趨勢與噴發偏向 (Bias) - 整合趨勢感
+                bull = last.get("bullish_align", False)
+                bear = last.get("bearish_align", False)
+                mom = last.get("momentum", 0)
+                mom_prev = s_df["momentum"].iloc[-2] if len(s_df) > 1 else 0
+                
+                bias = "⚪中性"
+                if mom > 0:
+                    if bull:
+                        bias = "🚀強勢多" if mom >= mom_prev else "↗️多轉弱"
+                    else:
+                        bias = "⚠️空反彈" if mom >= mom_prev else "↗️弱反彈"
+                elif mom < 0:
+                    if bear:
+                        bias = "💀強勢空" if mom <= mom_prev else "↘️空轉弱"
+                    else:
+                        bias = "⚠️多拉回" if mom <= mom_prev else "↘️弱拉回"
+
                 ov_data.append({
                     "代號": ticker,
                     "名稱": last.get("name", "Unknown"),
                     "股價": last.get('close', last.get('Close', 0)),
-                    "成交量": f"{int(last.get('volume', last.get('Volume', 0))):,}",
+                    "量": f"{int(last.get('volume', last.get('Volume', 0))//1000)}k",
                     "Score": round(last.get('score', 0), 1),
-                    "Squeeze": "🔒 壓縮" if last.get("sqz_on", False) else "🔓 釋放",
-                    "投信": "🔥 連買" if last.get("it_buy_rolling_count", 0) >= 2 else "⚪ —",
-                    "200MA": "🟢 向上" if last.get("ema_200_up", False) else "⚪ 走平/向下"
+                    "Sqz": "🔒壓" if last.get("sqz_on", False) else "🔓釋",
+                    "偏向": bias,
+                    "投信": "🔥連買" if last.get("it_buy_rolling_count", 0) >= 2 else "⚪ —",
+                    "200MA": "🟢上" if last.get("ema_200_up", False) else "⚪ —"
                 })
         
         if ov_data:
             ov_df = pd.DataFrame(ov_data)
             def style_overview(row):
                 styles = [''] * len(row)
-                if "🔒" in str(row["Squeeze"]):
+                if "🔒" in str(row["Sqz"]):
                     styles[5] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
+                
+                # 噴發偏向著色
+                if "🚀" in str(row["偏向"]) or "↗️" in str(row["偏向"]):
+                    styles[6] = 'color: #059669; font-weight: bold'
+                elif "💀" in str(row["偏向"]) or "↘️" in str(row["偏向"]):
+                    styles[6] = 'color: #dc2626; font-weight: bold'
+
                 if "🔥" in str(row["投信"]):
-                    styles[6] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
+                    styles[7] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
                 if "🟢" in str(row["200MA"]):
-                    styles[7] = 'color: #059669; font-weight: bold'
+                    styles[8] = 'color: #059669; font-weight: bold'
                 return styles
+            
+            # CSS 縮小字體
+            st.markdown("""
+                <style>
+                [data-testid="stMetricValue"] { font-size: 1.4rem !important; }
+                [data-testid="stMetricLabel"] { font-size: 0.8rem !important; }
+                .styled-table { font-size: 0.8rem !important; }
+                </style>
+            """, unsafe_allow_html=True)
+            
             st.dataframe(ov_df.style.apply(style_overview, axis=1), use_container_width=True, hide_index=True)
         else:
             st.info("等待個股指標數據...")
@@ -1027,25 +1084,47 @@ with tab_futures:
     f_df = load_futures_indicators(full_history=cont_mode)
     if f_df is not None and not f_df.empty:
         last = f_df.iloc[-1]
-        fc1, fc2, fc3, fc4 = st.columns(4)
-        # V-Model fix: Handle duplicate columns by taking first match
+        fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+        
+        # 噴發偏向 (Bias) 計算 - 整合趨勢感
+        bull = last.get("bullish_align", False)
+        bear = last.get("bearish_align", False)
+        mom = last.get("momentum", 0)
+        mom_prev = f_df["momentum"].iloc[-2] if len(f_df) > 1 else 0
+        
+        bias = "⚪中性"
+        if mom > 0:
+            if bull:
+                bias = "🚀強勢多" if mom >= mom_prev else "↗️多轉弱"
+            else:
+                bias = "⚠️空反彈" if mom >= mom_prev else "↗️弱反彈"
+        elif mom < 0:
+            if bear:
+                bias = "💀強勢空" if mom <= mom_prev else "↘️空轉弱"
+            else:
+                bias = "⚠️多拉回" if mom <= mom_prev else "↘️弱拉回"
+
+        # V-Model fix: Handle duplicate columns
         cl_val = last.get('close') if 'close' in last else last.get('Close', 0)
         if hasattr(cl_val, 'iloc'):
             cl_val = float(cl_val.iloc[0]) if len(cl_val) > 0 else 0.0
         else:
             cl_val = float(cl_val or 0)
+        
         sc_val = last.get('score', 0)
         if hasattr(sc_val, 'iloc'):
             sc_val = float(sc_val.iloc[0]) if len(sc_val) > 0 else 0.0
         else:
             sc_val = float(sc_val or 0)
+
         fc1.metric("Close", f"{cl_val:.0f}")
         fc2.metric("Score", f"{sc_val:.1f}")
         bull = last.get("bull_align", last.get("bullish_align", False))
         bear = last.get("bear_align", last.get("bearish_align", False))
-        trend = "🟢 多頭排列" if bull else ("🔴 空頭排列" if bear else "⚪ 中性")
+        trend = "🟢多頭" if bull else ("🔴空頭" if bear else "⚪中性")
         fc3.metric("趨勢", trend)
-        fc4.metric("Squeeze", "🔒 壓縮中" if last.get("sqz_on", False) is True else "🔓 已釋放")
+        fc4.metric("Sqz狀態", "🔒壓縮" if last.get("sqz_on", False) is True else "🔓釋放")
+        fc5.metric("噴發向", bias)
 
         if "fired" in last and last.get("fired", False) is True:
             st.success("🔥 **FIRE — 壓縮釋放！**")
@@ -1124,7 +1203,27 @@ with tab_options:
         
         if "price_mtx" in o_df.columns:
             last = o_df.iloc[-1]
-        oc1, oc2, oc3, oc4 = st.columns(4)
+        
+        # 噴發偏向 (Bias) 計算 - 整合選擇權趨勢感
+        trend_val = last.get("mid_trend", "")
+        bull = (trend_val == "BULL")
+        bear = (trend_val == "BEAR")
+        mom = last.get("momentum", last.get("mom_mtx", 0))
+        mom_prev = o_df["momentum"].iloc[-2] if "momentum" in o_df.columns and len(o_df) > 1 else 0
+        
+        bias = "⚪中性"
+        if mom > 0:
+            if bull:
+                bias = "🚀強勢多" if mom >= mom_prev else "↗️多轉弱"
+            else:
+                bias = "⚠️空反彈" if mom >= mom_prev else "↗️弱反彈"
+        elif mom < 0:
+            if bear:
+                bias = "💀強勢空" if mom <= mom_prev else "↘️空轉弱"
+            else:
+                bias = "⚠️多拉回" if mom <= mom_prev else "↘️弱拉回"
+
+        oc1, oc2, oc3, oc4, oc5, oc6 = st.columns(6)
         # V-Model fix: Handle duplicate columns by taking first match
         mtx_val = last.get('price_mtx', 0)
         if hasattr(mtx_val, 'iloc'):
@@ -1136,13 +1235,15 @@ with tab_options:
             sc_val = float(sc_val.iloc[0]) if len(sc_val) > 0 else 0.0
         else:
             sc_val = float(sc_val or 0)
+        
         oc1.metric("MTX", f"{mtx_val:.0f}")
         oc2.metric("Score", f"{sc_val:.1f}")
-        trend = last.get("mid_trend", "")
-        trend_label = "🟢 BULL" if trend == "BULL" else ("🔴 BEAR" if trend == "BEAR" else "⚪ —")
+        trend_label = "🟢BULL" if trend_val == "BULL" else ("🔴BEAR" if trend_val == "BEAR" else "⚪ —")
         oc3.metric("趨勢", trend_label)
         iv = last.get("iv", 0)
         oc4.metric("IV", f"{iv*100:.1f}%" if iv and iv < 1 else f"{iv:.1f}%")
+        oc5.metric("Sqz狀態", "🔒壓縮" if last.get("sqz_on", False) is True else "🔓釋放")
+        oc6.metric("噴發向", bias)
 
         if "fired" in last and last.get("fired", False) is True:
             st.success("🔥 **FIRE — 壓縮釋放！**")
@@ -1396,24 +1497,33 @@ with tab_settings:
 
     # ── 1. 期貨 TMF 設定 ──
     with st.expander("📈 期貨 TMF 設定", expanded=True):
-        from strategies.futures.elite_strategies import ELITE_STRATEGIES as FUT_STRATS
-        current_fut_strat = futures_cfg.get("active_strategy", "counter_vwap")
+        from core.strategy_registry import StrategyRegistry
+        _reg = StrategyRegistry()
+        _reg.discover()
+        fut_strats = {item["name"]: item for item in _reg.list_all() if item.get("asset_class") == "futures" and item.get("available", False)}
+        current_fut_strat = futures_cfg.get("strategy", {}).get("active_strategy", futures_cfg.get("active_strategy", "counter_vwap"))
 
         with st.form("futures_settings_form"):
             f_live_new = st.checkbox("啟用期貨實盤交易 (LIVE)", value=futures_cfg.get("live_trading", False))
 
-            # 策略選擇
-            strat_options = list(FUT_STRATS.keys())
+            # Strategy selector from Registry
+            strat_options = list(fut_strats.keys())
             try:
                 strat_idx = strat_options.index(current_fut_strat)
             except ValueError:
                 strat_idx = 0
 
-            f_strat_new = st.selectbox("核心進場策略", strat_options, index=strat_idx,
-                                       help="系統將使用此策略進行即時信號判斷。")
+            f_strat_new = st.selectbox("核心進場策略", strat_options, index=strat_idx)
 
-            # 顯示當前策略說明
-            st.info(f"💡 **策略說明**: {FUT_STRATS.get(f_strat_new, {}).get('desc', '無說明')}")
+            # Show strategy metadata
+            meta = fut_strats.get(f_strat_new, {})
+            desc = meta.get("description", "無說明")
+            pf = meta.get("backtest_pf", 0)
+            wr = meta.get("backtest_wr", 0)
+            maxdd = meta.get("backtest_maxdd", 0)
+            regime = meta.get("market_regime", "")
+            st.info(f"💡 **{f_strat_new}**: {desc}  \n"
+                    f"📊 PF={pf:.2f} | WR={wr:.1f}% | MaxDD={maxdd:.1f}% | 適用: {regime}")
 
             st.divider()
 
@@ -1533,7 +1643,7 @@ with tab_settings:
         if st.button("🔄 同步 Squeeze Screener 推薦名單"):
             try:
                 import subprocess
-                subprocess.run(["python3", "scripts/sync_watchlist.py"], check=True)
+                subprocess.run(["python3", "scripts/sync/sync_watchlist.py"], check=True)
                 st.success("同步成功！")
                 st.rerun()
             except Exception as e:
@@ -1606,8 +1716,8 @@ with tab_settings:
             if st.button("執行清空", type="primary", use_container_width=True):
                 try:
                     import subprocess
-                    result = subprocess.run(["python3", "scripts/clear_simulation_data.py", "--force"], 
-                                         capture_output=True, text=True, check=True)
+                    result = subprocess.run(["python3", "scripts/maintenance/clear_simulation_data.py", "--force"], 
+                                                         capture_output=True, text=True)
                     st.success("✅ 數據已清空！")
                     st.toast("Simulation data cleared successfully.")
                     time.sleep(1)

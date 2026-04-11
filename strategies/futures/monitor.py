@@ -709,6 +709,8 @@ class FuturesMonitor:
             try:
                 # Read existing data
                 df_existing = pd.read_csv(path)
+                # GSD Fix: Drop any Unnamed columns from index leakage
+                df_existing = df_existing.loc[:, ~df_existing.columns.str.startswith("Unnamed")]
                 # Prepare new row
                 df_new = pd.DataFrame([data])
                 # Combine and deduplicate
@@ -1044,26 +1046,3 @@ class FuturesMonitor:
             stop_loss=signal.stop_loss,
             reason=signal.reason,
         )
-
-        trend = _check_trend_breakout_signal(df_5m, df_15m)
-        market_state = {
-            "last_5m": last_5m, "last_15m": last_15m, "df_5m": df_5m,
-            "score": score, "stop_loss_pts": stop_loss_pts,
-            "trend": trend, "hour": datetime.now().hour,
-            # Counter-VWAP 需要的狀態
-            "fire_pending_dir": getattr(self, '_fire_pending_dir', 0),
-            "fire_bar_idx": getattr(self, '_fire_bar_idx', 0),
-            "fire_high": getattr(self, '_fire_high', 0.0),
-            "fire_low": getattr(self, '_fire_low', 0.0),
-            "bar_counter": getattr(self, '_bar_counter', 0),
-        }
-        signal = strategy_fn(market_state, self.cfg)
-        if signal:
-            action = signal["action"]
-            if self.MGMT.get(f"allow_{'long' if action == 'BUY' else 'short'}", True):
-                lots = self.MGMT.get("lots_per_trade", 2)
-                be = self.RISK.get("break_even_pts", 50)
-                console.print(f"[bold cyan]📌 [{active}] {action} reason={signal['reason']} SL={signal['stop_loss']:.1f}[/bold cyan]")
-                self._execute_trade(action, last_price, timestamp, lots,
-                                    stop_loss=signal["stop_loss"], break_even_trigger=be,
-                                    reason=signal["reason"])

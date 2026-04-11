@@ -2,7 +2,7 @@ active_mode: V2
 live_trading: false
 strategy:
   length: 20
-  entry_score: 60
+  entry_score: 30
   score_floor: 20
   regime_filter: mid
   use_opening_logic: true
@@ -107,4 +107,4 @@ theta_gang:
 min_iv: 0.15
 max_iv: 0.6
 mode: V2
-entry_score: 73
+entry_score: 30

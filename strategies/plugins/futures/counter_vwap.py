@@ -13,6 +13,10 @@ class CounterVWAP(StrategyBase):
     - Regime filter: only trade when squeeze_on (ranging market)
     - Momentum threshold: |momentum| >= 30 for fire events
     - confirm_bars default: 5 → 7 (fewer but higher quality signals)
+
+    Optimizations (v3.1):
+    - Bias confirmation: momentum acceleration check (噴發偏向)
+    - Confidence boost when Bias aligns with counter direction
     """
 
     @property
@@ -23,12 +27,12 @@ class CounterVWAP(StrategyBase):
     def metadata(self) -> dict:
         return {
             "asset_class": "futures",
-            "version": "3.0",
+            "version": "3.1",
             "backtest_pf": 1.95,
             "backtest_wr": 40.7,
             "backtest_maxdd": -7.2,
             "market_regime": "ranging",
-            "description": "反向均值回歸: 偵測 Squeeze Fire 失敗後反向進場",
+            "description": "反向均值回歸: 偵測 Squeeze Fire 失敗後反向進場 (含 Bias 確認)",
         }
 
     def init(self, context: StrategyContext) -> None:
@@ -55,16 +59,28 @@ class CounterVWAP(StrategyBase):
         squeeze_on = bar.get("squeeze_on", False)
         bar_counter = context.bar_counter
 
+        # ── Bias (噴發偏向): momentum acceleration check ──
+        # Bias tells us if momentum is accelerating or decelerating
+        df = context.market.df_5m
+        momentum_prev = 0.0
+        if df is not None and "momentum" in df.columns and len(df) >= 2:
+            momentum_prev = df["momentum"].iloc[-2]
+        bias = 0.0  # positive = bullish accel, negative = bearish accel
+        if momentum_prev != 0:
+            bias = momentum - momentum_prev
+
         if vwap <= 0:
             return None
 
         # ── Regime Filter: Require squeeze was active recently ────────
         # "fired" means squeeze just turned OFF, so squeeze_on is False at fire bar.
         # Check if squeeze was ON in the last 10 bars (squeeze preceded the fire).
-        df = context.market.df_5m
-        recent_squeeze = False
-        if df is not None and len(df) >= 12:
+        has_squeeze_col = df is not None and "sqz_on" in df.columns
+        if has_squeeze_col and len(df) >= 12:
             recent_squeeze = df["sqz_on"].iloc[-12:-2].any()
+        else:
+            # Fallback: use squeeze_on from last_bar if available
+            recent_squeeze = bar.get("squeeze_on", bar.get("sqz_on", True))
 
         if not recent_squeeze and self._fire_pending_dir == 0:
             return None
@@ -104,8 +120,12 @@ class CounterVWAP(StrategyBase):
             vwap_reject = close < vwap
             if no_new_high and (velo_reversed or vwap_reject):
                 self._fire_pending_dir = 0
+                # Bias check: bearish accel confirms short entry
+                conf = 0.80
+                if bias < 0:  # Momentum accelerating downward
+                    conf = 0.85  # Boost confidence
                 return Signal("SELL", "COUNTER_VWAP", close + sl_pts,
-                              target=vwap, confidence=0.8)
+                              target=vwap, confidence=conf)
 
         # Bearish fire failed → COUNTER_BUY
         elif self._fire_pending_dir == -1:
@@ -114,8 +134,12 @@ class CounterVWAP(StrategyBase):
             vwap_reject = close > vwap
             if no_new_low and (velo_reversed or vwap_reject):
                 self._fire_pending_dir = 0
+                # Bias check: bullish accel confirms long entry
+                conf = 0.80
+                if bias > 0:  # Momentum accelerating upward
+                    conf = 0.85  # Boost confidence
                 return Signal("BUY", "COUNTER_VWAP", close - sl_pts,
-                              target=vwap, confidence=0.8)
+                              target=vwap, confidence=conf)
 
         return None
 

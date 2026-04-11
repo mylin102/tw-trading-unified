@@ -38,6 +38,17 @@ def _true_range(df: pd.DataFrame) -> pd.Series:
     ).max(axis=1)
 
 
+def _linreg(series: pd.Series, length: int) -> pd.Series:
+    """計算線性回歸值 (用於動能平滑)"""
+    x = np.arange(length)
+    def get_linreg(y):
+        if len(y) < length or np.isnan(y).any():
+            return 0.0
+        slope, intercept = np.polyfit(x, y, 1)
+        return slope * (length - 1) + intercept
+    return series.rolling(window=length).apply(get_linreg, raw=True)
+
+
 def _fallback_squeeze(
     df: pd.DataFrame,
     bb_length: int,
@@ -45,19 +56,40 @@ def _fallback_squeeze(
     kc_length: int,
     kc_scalar: float,
 ) -> tuple[pd.Series, pd.Series]:
+    """
+    實作 TTM Squeeze 的經典動能算法 (V-Model 專業版)
+    算法：Linear Regression of Price relative to (SMA + Donchian Mid)/2
+    """
     close = df["Close"]
-    basis = close.rolling(window=bb_length, min_periods=bb_length).mean()
-    deviation = close.rolling(window=bb_length, min_periods=bb_length).std(ddof=0)
+    high = df["High"]
+    low = df["Low"]
+
+    # 1. Bollinger Bands
+    basis = close.rolling(window=bb_length).mean()
+    deviation = close.rolling(window=bb_length).std(ddof=0)
     bb_upper = basis + deviation * bb_std
     bb_lower = basis - deviation * bb_std
 
+    # 2. Keltner Channels
     ema_basis = _ema(close, kc_length)
-    atr = _true_range(df).rolling(window=kc_length, min_periods=kc_length).mean()
+    atr = _true_range(df).rolling(window=kc_length).mean()
     kc_upper = ema_basis + atr * kc_scalar
     kc_lower = ema_basis - atr * kc_scalar
 
+    # 3. Squeeze 狀態
     sqz_on = (bb_lower >= kc_lower) & (bb_upper <= kc_upper)
-    momentum = close - basis
+
+    # 4. 動能直方圖 (Momentum Histogram)
+    # 基準 = (20均線 + 20日高低中點) / 2
+    donchian_mid = (high.rolling(window=bb_length).max() + low.rolling(window=bb_length).min()) / 2
+    combined_basis = (basis + donchian_mid) / 2
+    
+    # 偏離值 = 價格 - 基準
+    raw_momentum = close - combined_basis
+    
+    # 對偏離值做線性回歸平滑 (經典 TTM 做法)
+    momentum = _linreg(raw_momentum, bb_length)
+
     return sqz_on.fillna(False), momentum.fillna(0.0)
 
 

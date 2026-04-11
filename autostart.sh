@@ -139,7 +139,7 @@ while true; do
         STOCK_PID=$(pgrep -f "stock_runner.py" | head -1)
         if [ -z "$STOCK_PID" ] || ! ps -p "$STOCK_PID" >/dev/null 2>&1; then
             echo "[$(date)] 🍎 啟動股票 Runner..." >> "$LOG_DIR/unified.log"
-            $PYTHON_EXEC "$UNIFIED_DIR/scripts/stock_runner.py" >> "$LOG_DIR/stocks.log" 2>&1
+            $PYTHON_EXEC "$UNIFIED_DIR/scripts/runners/stock_runner.py" >> "$LOG_DIR/stocks.log" 2>&1
             record_crash "stock" $? 0
             sleep 10
         else

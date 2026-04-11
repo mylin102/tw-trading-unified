@@ -1,4 +1,4 @@
-active_strategy: spring_upthrust
+active_strategy: vol_squeeze
 cooldown_bars: 5
 execution:
   broker_fee_per_side: 20.0
@@ -36,8 +36,9 @@ risk_mgmt:
   trailing_stop_enabled: true
   trailing_stop_trigger_pts: 100
 strategy:
-  active_strategy: counter_vwap
-  auto_select: true
+  active_strategy: vol_squeeze
+  auto_select: false
+  volume_threshold: 0.001
   counter_mode:
     atr_sl_mult: 2.0
     auto_regime: true
