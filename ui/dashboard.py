@@ -1642,6 +1642,48 @@ with tab_pipeline:
     except Exception as e:
         st.error(f"Error: {e}")
 
+    # ── Hourly Audit Timeline ──
+    st.subheader("🕐 每小時審計時間軸")
+    try:
+        from pathlib import Path
+        audit_dir = Path("logs/market_data")
+        today_str = datetime.now().strftime("%Y%m%d")
+        audit_file = audit_dir / f"TMF_{today_str}_signals_audit.csv"
+
+        if audit_file.exists():
+            df_audit = pd.read_csv(audit_file)
+            # Filter hourly audits
+            df_hourly = df_audit[df_audit.get("signal") == "HOURLY_AUDIT"]
+
+            if not df_hourly.empty:
+                # Verdict color coding
+                verdict_map = {
+                    "NORMAL": "✅",
+                    "COOLDOWN": "🔵",
+                    "NO_VALID_SIGNALS": "⚠️",
+                    "DATA_FAILURE": "🚨",
+                }
+                df_display = pd.DataFrame({
+                    "時間": df_hourly["timestamp"].apply(lambda x: str(x)[-8:]),
+                    "Verdict": df_hourly["reason"].map(lambda r: verdict_map.get(r, "❓")),
+                    "細節": df_hourly["rejection"].apply(lambda x: str(x)[:60] if pd.notna(x) else ""),
+                })
+                st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+                # Summary
+                verdict_counts = df_hourly["reason"].value_counts()
+                cols = st.columns(min(4, len(verdict_counts)))
+                for i, (verdict, count) in enumerate(verdict_counts.items()):
+                    with cols[i % 4]:
+                        emoji = verdict_map.get(verdict, "❓")
+                        st.metric(f"{emoji} {verdict}", f"{count} 次")
+            else:
+                st.info("今日尚無審計記錄（monitor 尚未運行或未到整點）")
+        else:
+            st.info(f"今日審計檔不存在：{audit_file.name}")
+    except Exception as e:
+        st.error(f"審計讀取錯誤: {e}")
+
 # ════════════════════════════════════════
 # Tab 6: 設定
 # ════════════════════════════════════════
