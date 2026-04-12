@@ -158,6 +158,15 @@ class TestCircuitBreaker:
         action = b.check(pnl=-2500, consecutive_losses=1)
         assert action == Action.REDUCE_SIZE
 
+    def test_session_pnl_is_absolute_not_cumulative(self):
+        """Regression: check() should treat pnl as absolute, not delta."""
+        b = CircuitBreaker(session="day", daily_loss_cap=5000)
+        b.check(pnl=-2000, consecutive_losses=0)
+        assert b.state.session_pnl == -2000
+        # Second call replaces, doesn't accumulate
+        b.check(pnl=-1500, consecutive_losses=0)
+        assert b.state.session_pnl == -1500  # NOT -3500
+
     def test_halt_persists_same_day(self):
         b = CircuitBreaker(session="day", daily_loss_cap=5000)
         b.check(pnl=-6000, consecutive_losses=0)

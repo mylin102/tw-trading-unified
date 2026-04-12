@@ -86,8 +86,8 @@ class CircuitBreaker:
             else:
                 return Action.HALT
 
-        # Update state
-        self._state.session_pnl += pnl
+        # Update state (treat pnl as absolute, not delta)
+        self._state.session_pnl = pnl
         self._state.consecutive_losses = consecutive_losses
 
         # Level 1: consecutive losses → diagnose

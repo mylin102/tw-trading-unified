@@ -1652,33 +1652,33 @@ with tab_pipeline:
 
         if audit_file.exists():
             df_audit = pd.read_csv(audit_file)
-            # Filter hourly audits
-            df_hourly = df_audit[df_audit.get("signal") == "HOURLY_AUDIT"]
-
-            if not df_hourly.empty:
-                # Verdict color coding
-                verdict_map = {
-                    "NORMAL": "✅",
-                    "COOLDOWN": "🔵",
-                    "NO_VALID_SIGNALS": "⚠️",
-                    "DATA_FAILURE": "🚨",
-                }
-                df_display = pd.DataFrame({
-                    "時間": df_hourly["timestamp"].apply(lambda x: str(x)[-8:]),
-                    "Verdict": df_hourly["reason"].map(lambda r: verdict_map.get(r, "❓")),
-                    "細節": df_hourly["rejection"].apply(lambda x: str(x)[:60] if pd.notna(x) else ""),
-                })
-                st.dataframe(df_display, use_container_width=True, hide_index=True)
-
-                # Summary
-                verdict_counts = df_hourly["reason"].value_counts()
-                cols = st.columns(min(4, len(verdict_counts)))
-                for i, (verdict, count) in enumerate(verdict_counts.items()):
-                    with cols[i % 4]:
-                        emoji = verdict_map.get(verdict, "❓")
-                        st.metric(f"{emoji} {verdict}", f"{count} 次")
+            if "signal" not in df_audit.columns:
+                st.info("審計檔格式不符（缺少 signal 欄位）")
             else:
-                st.info("今日尚無審計記錄（monitor 尚未運行或未到整點）")
+                df_hourly = df_audit[df_audit["signal"] == "HOURLY_AUDIT"]
+
+                if not df_hourly.empty:
+                    verdict_map = {
+                        "NORMAL": "✅",
+                        "COOLDOWN": "🔵",
+                        "NO_VALID_SIGNALS": "⚠️",
+                        "DATA_FAILURE": "🚨",
+                    }
+                    df_display = pd.DataFrame({
+                        "時間": df_hourly["timestamp"].apply(lambda x: str(x)[-8:]),
+                        "Verdict": df_hourly["reason"].map(lambda r: verdict_map.get(r, "❓")),
+                        "細節": df_hourly["rejection"].apply(lambda x: str(x)[:60] if pd.notna(x) else ""),
+                    })
+                    st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+                    verdict_counts = df_hourly["reason"].value_counts()
+                    cols = st.columns(min(4, len(verdict_counts)))
+                    for i, (verdict, count) in enumerate(verdict_counts.items()):
+                        with cols[i % 4]:
+                            emoji = verdict_map.get(verdict, "❓")
+                            st.metric(f"{emoji} {verdict}", f"{count} 次")
+                else:
+                    st.info("今日尚無審計記錄（monitor 尚未運行或未到整點）")
         else:
             st.info(f"今日審計檔不存在：{audit_file.name}")
     except Exception as e:

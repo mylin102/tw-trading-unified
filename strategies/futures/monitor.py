@@ -542,7 +542,7 @@ class FuturesMonitor:
 
         # Reset counters for next hour
         self._signals_generated = 0
-        self._bars_since_trade = 0
+        self._bars_since_trade = 0  # GAP-2 fix: reset bars counter too
 
     # ── Margin check ──
     def _margin_sufficient(self):
