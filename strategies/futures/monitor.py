@@ -564,21 +564,16 @@ class FuturesMonitor:
 
     # ── Trade execution ──
     def _audit_signal(self, signal_type, side, score, rejection_reason, note=""):
-        """Record signal audit trail to CSV."""
-        log_dir = Path("logs/market_data")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        date_str = datetime.now().strftime("%Y%m%d")
-        audit_file = log_dir / f"MTX_{date_str}_signals_audit.csv"
-        header = not audit_file.exists()
-        record = {
+        """Record signal audit trail to CSV (thread-safe, TMF file)."""
+        from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
+        save_signal_audit({
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "signal": signal_type,
             "side": side,
             "score": score,
             "rejection": rejection_reason,
             "note": note,
-        }
-        pd.DataFrame([record]).to_csv(audit_file, mode='a', index=False, header=header)
+        }, ticker="TMF")
 
     def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, reason=None):
         action = None
