@@ -64,7 +64,52 @@ def check_password():
         st.session_state["authenticated"] = False
     if st.session_state["authenticated"]:
         return True
-    pwd = st.text_input("🔒 請輸入密碼", type="password")
+    
+    # GSD: Large, focused password field for better UX
+    st.markdown("""
+        <style>
+        div[data-baseweb="input"] { height: 60px !important; }
+        input[type="password"] { font-size: 24px !important; }
+        </style>
+        <script>
+        // High-reliability Autofocus: Poll until input renders
+        var focusAttempts = 0;
+        var focusInterval = setInterval(function() {
+            var inputs = window.parent.document.querySelectorAll('input[type="password"]');
+            if (inputs.length > 0) {
+                inputs[0].focus();
+                if (focusAttempts++ > 10) clearInterval(focusInterval);
+            }
+        }, 100);
+        </script>
+    """, unsafe_allow_html=True)
+    
+    pwd = st.text_input("🔒 請輸入密碼", type="password", placeholder="點擊此處或直接輸入...", key="password_input")
+    
+    # JavaScript to auto-focus the password field
+    st.markdown("""
+    <script>
+    // Wait for the page to load, then focus the password input
+    document.addEventListener('DOMContentLoaded', function() {
+        // Find the password input by its data-testid attribute
+        const passwordInput = document.querySelector('input[type="password"]');
+        if (passwordInput) {
+            passwordInput.focus();
+            // Also select all text if there's any
+            passwordInput.select();
+        }
+    });
+    
+    // Also try after a short delay in case the page loads dynamically
+    setTimeout(function() {
+        const passwordInput = document.querySelector('input[type="password"]');
+        if (passwordInput) {
+            passwordInput.focus();
+            passwordInput.select();
+        }
+    }, 100);
+    </script>
+    """, unsafe_allow_html=True)
     if pwd == os.environ.get("DASHBOARD_PASSWORD", "trading2026"):
         st.session_state["authenticated"] = True
         st.rerun()
@@ -394,12 +439,12 @@ def format_options_trades(ledger_df):
             "出場時間": "⏳ 持倉中",
             "方向": pending_entry["side"],
             "進場價": round(pending_entry["entry_price"], 1),
-            "出場價": "—",
+            "出場價": "-",
             "口數": int(pending_entry["quantity"] or 1),
-            "出場原因": "—",
-            "毛利": "—",
-            "摩擦成本": "—",
-            "淨利": "—",
+            "出場原因": "-",
+            "毛利": "-",
+            "摩擦成本": "-",
+            "淨利": "-",
         })
 
     return _format_coerce_floats(pd.DataFrame(trades)) if trades else ledger_df
@@ -473,12 +518,12 @@ def format_futures_trades(ledger_df):
             "出場時間": "⏳ 持倉中",
             "方向": pending_entry["direction"],
             "進場價": round(pending_entry["entry_price"], 0),
-            "出場價": "—",
+            "出場價": "-",
             "口數": pending_entry["lots"],
-            "出場原因": "—",
-            "毛利": "—",
-            "摩擦成本": "—",
-            "淨利": "—",
+            "出場原因": "-",
+            "毛利": "-",
+            "摩擦成本": "-",
+            "淨利": "-",
         })
 
     return _format_coerce_floats(pd.DataFrame(trades)) if trades else ledger_df
@@ -491,11 +536,11 @@ def _format_coerce_floats(df):
     for col in ["進場價", "出場價"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").apply(
-                lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+                lambda x: f"{x:.2f}" if pd.notna(x) else "-")
     for col in ["毛利", "摩擦成本", "淨利"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").apply(
-                lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
+                lambda x: f"{x:,.0f}" if pd.notna(x) else "-")
     return df
 
 
@@ -568,12 +613,12 @@ def format_stock_trades(ledger_df):
             "出場時間": "⏳ 持倉中",
             "代號": f"{ticker} {pending['name']}".strip(),
             "進場價": round(pending["entry_price"], 0),
-            "出場價": "—",
+            "出場價": None,
             "股數": pending["qty"],
-            "出場原因": "—",
-            "毛利": "—",
-            "手續費+稅": "—",
-            "淨利": "—",
+            "出場原因": "⏳",
+            "毛利": None,
+            "手續費+稅": None,
+            "淨利": None,
         })
 
     return _format_coerce_floats(pd.DataFrame(trades)) if trades else ledger_df
@@ -666,7 +711,7 @@ def load_futures_indicators(full_history=False):
         DATE_STR,  # GSD Fix: Always include the active trading session date
     ]
     search_days = list(dict.fromkeys(search_days))  # dedupe, preserve order
-    
+
     all_dfs = []
     for date_part in search_days:
         for tag in ["", "_LIVE", "_PAPER", "_DRY"]:
@@ -678,7 +723,51 @@ def load_futures_indicators(full_history=False):
                         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
                     if not df.empty:
                         all_dfs.append(df)
-    
+
+    # GSD: Parquet Fallback (Wave 18.3)
+    is_fallback = False
+    if not all_dfs:
+        try:
+            from core.data_manager import data_manager
+            df_hist = data_manager.load_historical("TXFR1")
+            if not df_hist.empty:
+                is_fallback = True
+                df_hist = df_hist.tail(100).copy()
+                
+                # V-Model fix: Deduplicate before rename to prevent clashes
+                df_hist = df_hist.loc[:, ~df_hist.columns.duplicated()].copy()
+                
+                # Standardize columns carefully
+                if df_hist.index.name == "timestamp" or df_hist.index.name == "ts":
+                    df_hist = df_hist.reset_index()
+                elif pd.api.types.is_datetime64_any_dtype(df_hist.index):
+                    # If index is datetime but not named 'timestamp', reset and rename
+                    df_hist = df_hist.reset_index()
+                    df_hist = df_hist.rename(columns={"index": "timestamp"})
+                else:
+                    # If index is not datetime, create a timestamp column from index
+                    df_hist = df_hist.reset_index()
+                    if "index" in df_hist.columns:
+                        df_hist = df_hist.rename(columns={"index": "timestamp"})
+                    elif "timestamp" not in df_hist.columns:
+                        # Create a dummy timestamp column if none exists
+                        df_hist["timestamp"] = pd.to_datetime("2023-01-01")
+                
+                rename_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+                # Only rename if source exists AND target doesn't already exist
+                actual_renames = {k: v for k, v in rename_map.items() if k in df_hist.columns and v not in df_hist.columns}
+                df_hist = df_hist.rename(columns=actual_renames)
+                
+                # Ensure timestamp column exists and is datetime
+                if "timestamp" not in df_hist.columns:
+                    df_hist["timestamp"] = pd.to_datetime("2023-01-01")
+                elif not pd.api.types.is_datetime64_any_dtype(df_hist["timestamp"]):
+                    df_hist["timestamp"] = pd.to_datetime(df_hist["timestamp"], errors="coerce")
+                
+                all_dfs.append(df_hist)
+        except Exception:
+            pass
+
     result = None
     if all_dfs:
         common_cols = set(all_dfs[0].columns)
@@ -689,7 +778,13 @@ def load_futures_indicators(full_history=False):
         cleaned_dfs = [df[list(common_cols)] for df in all_dfs]
         merged = pd.concat(cleaned_dfs).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
         
-        if full_history:
+        # FINAL GUARD: Ensure no duplicate columns for PyArrow
+        if merged.columns.duplicated().any():
+            merged = merged.loc[:, ~merged.columns.duplicated()].copy()
+        
+        if is_fallback:
+            result = merged # Skip date filtering if loading from history
+        elif full_history:
             cutoff = now - dt.timedelta(hours=24)
             result = merged[merged["timestamp"] >= cutoff].copy()
         else:
@@ -770,6 +865,19 @@ def load_options_indicators(full_history=False):
                         all_dfs.append(df)
                 except Exception:
                     continue
+
+    # GSD: Parquet Fallback (Wave 18.3)
+    if not all_dfs:
+        try:
+            from core.data_manager import data_manager
+            df_hist = data_manager.load_historical("OPTIONS")
+            if not df_hist.empty:
+                df_hist = df_hist.tail(100).copy()
+                if df_hist.index.name != "timestamp":
+                    df_hist = df_hist.reset_index().rename(columns={"index": "timestamp"})
+                all_dfs.append(df_hist)
+        except Exception:
+            pass
 
     result = None
     if all_dfs:
@@ -879,7 +987,9 @@ def _monitor_status():
 st.caption(f"更新: {datetime.datetime.now().strftime('%H:%M:%S')} | Monitor: {_monitor_status()}")
 
 # ── Tabs ──
-tab_overview, tab_futures, tab_options, tab_stocks, tab_settings = st.tabs(["總覽", "期貨 TMF", "選擇權 TXO", "台股 Stocks", "設定"])
+tab_overview, tab_futures, tab_options, tab_stocks, tab_pipeline, tab_settings = st.tabs([
+    "總覽", "期貨 TMF", "選擇權 TXO", "台股 Stocks", "策略管道", "設定"
+])
 
 # ════════════════════════════════════════
 # Tab 1: 總覽
@@ -1161,8 +1271,8 @@ with tab_futures:
         round_trips = format_futures_trades(ft)
         if round_trips is not None and not round_trips.empty and "#" in round_trips.columns:
             def style_trades(row):
-                pnl = row.get("淨利", "—")
-                if pnl != "—" and isinstance(pnl, (int, float)):
+                pnl = row.get("淨利", "-")
+                if pnl != "-" and isinstance(pnl, (int, float)):
                     color = '#dcfce7' if pnl > 0 else ('#fef2f2' if pnl < 0 else '')
                     return [f'background-color: {color}; font-weight: bold'] * len(row)
                 return [''] * len(row)
@@ -1301,8 +1411,8 @@ with tab_options:
             # Style with color for profit/loss
             def style_trades(row):
                 styles = [''] * len(row)
-                pnl = row.get("淨利", "—")
-                if pnl != "—" and isinstance(pnl, (int, float)):
+                pnl = row.get("淨利", "-")
+                if pnl != "-" and isinstance(pnl, (int, float)):
                     color = '#dcfce7' if pnl > 0 else ('#fef2f2' if pnl < 0 else '')
                     styles = [f'background-color: {color}; font-weight: bold'] * len(row)
                 return styles
@@ -1395,9 +1505,9 @@ with tab_stocks:
             wins = (sells["pnl_cash"] > 0).sum()
             total = len(sells)
             m1.metric("淨損益", f"{total_pnl:+,.0f} TWD")
-            m2.metric("勝率", f"{wins}/{total} ({wins/total*100:.0f}%)" if total > 0 else "—")
+            m2.metric("勝率", f"{wins}/{total} ({wins/total*100:.0f}%)" if total > 0 else "-")
             m3.metric("摩擦成本", f"{total_fees:,.0f} TWD")
-            m4.metric("平均每筆", f"{total_pnl/total:+,.0f} TWD" if total > 0 else "—")
+            m4.metric("平均每筆", f"{total_pnl/total:+,.0f} TWD" if total > 0 else "-")
 
         # Round-trip 明細
         round_trips = format_stock_trades(sl)
@@ -1431,8 +1541,8 @@ with tab_stocks:
                             st.caption(f"進場: {entry:.0f} | 目前: {cur_price:.0f} | {qty}股")
 
             def style_stock_trades(row):
-                pnl = row.get("淨利", "—")
-                if pnl != "—" and isinstance(pnl, (int, float)):
+                pnl = row.get("淨利", "-")
+                if pnl != "-" and isinstance(pnl, (int, float)):
                     color = '#dcfce7' if pnl > 0 else ('#fef2f2' if pnl < 0 else '')
                     return [f'background-color: {color}; font-weight: bold'] * len(row)
                 return [''] * len(row)
@@ -1457,7 +1567,83 @@ with tab_stocks:
         st.info(f"今日尚無 {current_mode} 交易紀錄")
 
 # ════════════════════════════════════════
-# Tab 5: 設定
+# Tab 5: 策略管道 (Pipeline)
+# ════════════════════════════════════════
+with tab_pipeline:
+    st.header("📊 策略管道 (Strategy Pipeline)")
+
+    # Strategy Rankings
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("☀️ 日盤排行榜")
+        try:
+            from core.strategy_registry import get_strategy_ranking
+            day_ranking = get_strategy_ranking("day")
+            for i, (name, pf) in enumerate(day_ranking, 1):
+                emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
+                st.write(f"{emoji} {i}. {name} (PF={pf:.1f})")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+    with col2:
+        st.subheader("🌙 夜盤排行榜")
+        try:
+            night_ranking = get_strategy_ranking("night")
+            for i, (name, pf) in enumerate(night_ranking, 1):
+                emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
+                st.write(f"{emoji} {i}. {name} (PF={pf:.1f})")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+    # Pipeline Status
+    st.subheader("🔄 管道狀態")
+    try:
+        from core.strategy_registry import STRATEGY_PERF
+        pipeline_data = [
+            {"策略": "Counter-VWAP", "日盤 PF": STRATEGY_PERF["counter_vwap"]["day_pf"], "夜盤 PF": STRATEGY_PERF["counter_vwap"]["night_pf"], "狀態": "✅ Paper"},
+            {"策略": "Spring-Upthrust", "日盤 PF": STRATEGY_PERF["spring_upthrust"]["day_pf"], "夜盤 PF": STRATEGY_PERF["spring_upthrust"]["night_pf"], "狀態": "⏳ 回測驗證"},
+            {"策略": "Vol-Squeeze", "日盤 PF": STRATEGY_PERF["vol_squeeze"]["day_pf"], "夜盤 PF": STRATEGY_PERF["vol_squeeze"]["night_pf"], "狀態": "⏳ 觀察中"},
+            {"策略": "PSAR", "日盤 PF": STRATEGY_PERF["psar"]["day_pf"], "夜盤 PF": STRATEGY_PERF["psar"]["night_pf"], "狀態": "🔴 夜盤 PF<1.0"},
+        ]
+        st.table(pd.DataFrame(pipeline_data))
+    except Exception as e:
+        st.error(f"Error loading pipeline: {e}")
+
+    # Circuit Breaker Status
+    st.subheader("🛡️ Circuit Breaker 狀態")
+    try:
+        from core.circuit_breaker import CircuitBreaker
+        day_cb = CircuitBreaker(session="day")
+        night_cb = CircuitBreaker(session="night")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write(f"**日盤**: {day_cb.state.session_pnl:.0f} pts, {day_cb.state.consecutive_losses} 連虧, {'🛑 HALTED' if day_cb.is_halted else '✅ OK'}")
+        with c2:
+            st.write(f"**夜盤**: {night_cb.state.session_pnl:.0f} pts, {night_cb.state.consecutive_losses} 連虧, {'🛑 HALTED' if night_cb.is_halted else '✅ OK'}")
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+    # Recent Decisions
+    st.subheader("📝 最近決策日誌")
+    try:
+        from core.decision_logger import DecisionLogger
+        recent = DecisionLogger.read(limit=10)
+        if recent:
+            df_dec = pd.DataFrame([{
+                "時間": d.timestamp[:19],
+                "類型": d.type,
+                "Session": d.session,
+                "動作": d.action,
+                "細節": d.detail[:50],
+            } for d in recent])
+            st.dataframe(df_dec, use_container_width=True)
+        else:
+            st.info("尚無決策記錄")
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+# ════════════════════════════════════════
+# Tab 6: 設定
 # ════════════════════════════════════════
 with tab_settings:
     st.header("⚙️ 系統設定")

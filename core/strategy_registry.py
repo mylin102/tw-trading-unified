@@ -127,3 +127,87 @@ class StrategyRegistry:
     def errors(self) -> dict[str, str]:
         """Mapping of plugin name → error message for failed imports."""
         return dict(self._errors)
+
+
+# ── Phase 1: Day/Night Performance Lookup ───────────────────────────────
+# Source: backtest results from exports/vbt_counter_sweep.csv and session-specific analysis.
+# Populated from backtests; future: auto-updated from live performance.
+
+STRATEGY_PERF: dict[str, dict[str, float]] = {
+    "counter_vwap":    {"day_pf": 2.1, "night_pf": 1.4},
+    "spring_upthrust": {"day_pf": 1.6, "night_pf": 1.3},
+    "vol_squeeze":     {"day_pf": 1.5, "night_pf": 1.2},
+    "psar":            {"day_pf": 1.4, "night_pf": 0.9},
+}
+
+# Regime → preferred strategy order (same order for day/night, PF filter applied at runtime)
+REGIME_STRATEGY_ORDER: dict[str, list[str]] = {
+    "trending":  ["counter_vwap", "vol_squeeze", "psar"],
+    "ranging":   ["spring_upthrust", "counter_vwap", "vol_squeeze"],
+    "volatile":  ["vol_squeeze", "counter_vwap", "spring_upthrust"],
+    "low_vol":   ["vol_squeeze", "counter_vwap", "spring_upthrust"],
+    "shock":     [],  # No strategies in shock regime
+}
+
+DEFAULT_MIN_PF = 1.0  # Strategies below this PF are excluded from rankings
+
+
+def select_best_strategy(session_type: str, regime: str = "trending", min_pf: float | None = None) -> str:
+    """
+    Select the best strategy for a given session type and market regime.
+
+    Args:
+        session_type: "day" or "night"
+        regime: market regime (trending, ranging, volatile, low_vol, shock)
+        min_pf: minimum PF threshold (default: DEFAULT_MIN_PF)
+
+    Returns:
+        Best strategy name, or "counter_vwap" as fallback.
+    """
+    pf_key = f"{session_type}_pf"
+    threshold = min_pf if min_pf is not None else DEFAULT_MIN_PF
+
+    # Try regime-ordered list first
+    order = REGIME_STRATEGY_ORDER.get(regime, REGIME_STRATEGY_ORDER.get("trending", []))
+
+    candidates = []
+    for strat in order:
+        perf = STRATEGY_PERF.get(strat, {})
+        pf = perf.get(pf_key, 0)
+        if pf >= threshold:
+            candidates.append((strat, pf))
+
+    # Sort by PF descending
+    candidates.sort(key=lambda x: x[1], reverse=True)
+
+    if candidates:
+        return candidates[0][0]
+
+    # Fallback: scan all strategies
+    all_candidates = [
+        (name, perf.get(pf_key, 0))
+        for name, perf in STRATEGY_PERF.items()
+        if perf.get(pf_key, 0) >= threshold
+    ]
+    all_candidates.sort(key=lambda x: x[1], reverse=True)
+
+    return all_candidates[0][0] if all_candidates else "counter_vwap"
+
+
+def get_strategy_ranking(session_type: str, min_pf: float | None = None) -> list[tuple[str, float]]:
+    """
+    Return ranked list of strategies for a session type, sorted by PF.
+
+    Returns:
+        List of (strategy_name, pf) tuples, filtered by min_pf threshold.
+    """
+    pf_key = f"{session_type}_pf"
+    threshold = min_pf if min_pf is not None else DEFAULT_MIN_PF
+
+    ranking = [
+        (name, perf.get(pf_key, 0))
+        for name, perf in STRATEGY_PERF.items()
+        if perf.get(pf_key, 0) >= threshold
+    ]
+    ranking.sort(key=lambda x: x[1], reverse=True)
+    return ranking

@@ -18,7 +18,7 @@ class SpringUpthrust(StrategyBase):
         return "spring_upthrust"
 
     @property
-    def metadata(self) -> dict:
+    def metadata(self) -> dict[str, Any]:
         return {
             "asset_class": "futures",
             "version": "3.0",
@@ -27,6 +27,7 @@ class SpringUpthrust(StrategyBase):
             "backtest_maxdd": -10.1,
             "market_regime": "squeeze",
             "description": "假突破反向: Spring (假跌破做多) / Upthrust (假突破做空)",
+            "indicators": ["squeeze", "atr"],
         }
 
     def init(self, context: StrategyContext) -> None:

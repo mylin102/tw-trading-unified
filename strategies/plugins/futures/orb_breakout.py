@@ -18,7 +18,7 @@ class OpeningRangeBreakout(StrategyBase):
         return "orb_breakout"
 
     @property
-    def metadata(self) -> dict:
+    def metadata(self) -> dict[str, Any]:
         return {
             "asset_class": "futures",
             "version": "2.0",
@@ -27,6 +27,7 @@ class OpeningRangeBreakout(StrategyBase):
             "backtest_maxdd": -8.4,
             "market_regime": "trending",
             "description": "開盤區間突破: 適合趨勢/高波動市場",
+            "indicators": ["atr"],
         }
 
     def init(self, context: StrategyContext) -> None:

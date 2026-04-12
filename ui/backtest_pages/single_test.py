@@ -8,360 +8,247 @@ import os
 import sys
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
 # Ensure project root is in path
 ROOT = Path(__file__).parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backtest.signal_generator import generate_signals # noqa: E402
-from strategies.futures.squeeze_futures.engine.vectorized import simulate_trades_vectorized, calculate_metrics # noqa: E402
-from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze # noqa: E402
-from strategies.futures.elite_strategies import ELITE_STRATEGIES
-# 回測只用精英策略 (counter_vwap + spring_upthrust)
-STRATEGIES = dict(ELITE_STRATEGIES)
-
+from core.strategy_registry import StrategyRegistry # noqa: E402
+from core.backtest_engine import BacktestEngine, AssetProfile, AssetType # noqa: E402
+from core.backtest_storage import tracker # noqa: E402
+from core.data_sentinel import data_sentinel # noqa: E402
+from core.data_manager import data_manager # noqa: E402
+from core.monte_carlo import run_monte_carlo # noqa: E402
 from core.i18n import get_text # noqa: E402
+from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze # noqa: E402
+
+# Initialize Registry
+REGISTRY = StrategyRegistry()
+REGISTRY.discover()
+
+# Asset Profiles
+FUTURES_PROFILE = AssetProfile(
+    asset_type=AssetType.FUTURES,
+    point_value=200,
+    margin_per_lot=170000,
+    fee_rate=0.00002,
+    tax_rate=0.00002
+)
+
+STOCK_PROFILE = AssetProfile(
+    asset_type=AssetType.STOCK,
+    point_value=1,
+    margin_per_lot=0,
+    fee_rate=0.001425,
+    tax_rate=0.003
+)
 
 # ── Paths ──
 BASE = ROOT
-CONFIG_PATH = BASE / "config" / "futures.yaml"
 FUTURES_MKT = BASE / "logs" / "market_data"
 TAIFEX_RAW = BASE / "data" / "taifex_raw"
 
-# ── Logic ──
-def apply_params_to_config(strategy_name: str, entry_score: int, atr_mult: float):
-    """Update futures.yaml with new params and create a backup."""
-    if not CONFIG_PATH.exists():
-        st.error(f"Config file not found: {CONFIG_PATH}")
-        return False
-    
-    # 1. Create Backup
-    backup_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = CONFIG_PATH.with_suffix(f".backup_{backup_time}")
-    shutil.copy(CONFIG_PATH, backup_path)
-    
-    # 2. Update Content
-    with open(CONFIG_PATH, "r") as f:
-        cfg = yaml.safe_load(f)
-    
-    if "strategy" not in cfg:
-        cfg["strategy"] = {}
-    cfg["strategy"]["entry_score"] = entry_score
-    if strategy_name not in cfg["strategy"]:
-        cfg["strategy"][strategy_name] = {}
-    cfg["strategy"][strategy_name]["atr_mult"] = atr_mult
-    
-    with open(CONFIG_PATH, "w") as f:
-        yaml.dump(cfg, f, default_flow_style=False)
-    
-    return backup_path
-
-def rollback_config():
-    """Restore from the latest backup file."""
-    backups = sorted(CONFIG_PATH.parent.glob("futures.yaml.backup_*"))
-    if not backups:
-        st.error("No backups found to rollback.")
-        return False
-    
-    latest_backup = backups[-1]
-    shutil.copy(latest_backup, CONFIG_PATH)
-    os.remove(latest_backup) # Consume the backup
-    return latest_backup
-
-# Cache version key — bump this to invalidate all cached data
-_CACHE_VERSION = "v2"
+# Cache version key
+_CACHE_VERSION = "v7"
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_backtest_data(source_type: str, date_str: str = None, _cache_version: str = _CACHE_VERSION):
-    """
-    Load data for backtesting with caching.
-    source_type: 'today', 'specific', 'q1'
-    """
+def load_backtest_data(source_type: str, ticker: str = "TXFR1", _cache_version: str = _CACHE_VERSION):
+    """Load data for backtesting with caching."""
     def _read_csv(path):
-        if not path.exists():
-            return None
-        df = pd.read_csv(path)
-
-        if "timestamp" in df.columns or "ts" in df.columns:
-            ts_col = "timestamp" if "timestamp" in df.columns else "ts"
-            df[ts_col] = df[ts_col].astype(str).str.replace(r"[+-]\d{2}:\d{2}$", "", regex=True).str.replace("Z", "")
-            df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
-            if pd.api.types.is_datetime64_any_dtype(df[ts_col]):
-                if getattr(df[ts_col].dt, "tz", None) is not None:
-                    df[ts_col] = df[ts_col].dt.tz_localize(None)
-            df = df.set_index(ts_col)
-
-        # 標準化 OHLCV 欄位大小寫
-        col_map = {}
-        for c in df.columns:
-            cl = c.lower()
-            if cl in ["open", "high", "low", "close", "volume"] and c != cl.capitalize():
-                col_map[c] = cl.capitalize()
-        if col_map:
+        if not path.exists(): return None
+        try:
+            df = pd.read_csv(path)
+            if "timestamp" in df.columns or "ts" in df.columns:
+                ts_col = "timestamp" if "timestamp" in df.columns else "ts"
+                df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+                df = df.set_index(ts_col)
+            
+            # Standardize OHLCV
+            col_map = {c: c.capitalize() for c in df.columns if c.lower() in ["open", "high", "low", "close", "volume"]}
             df = df.rename(columns=col_map)
-
-        # 防禦：補缺的 OHLCV 欄位（舊版指標 CSV 可能沒有）
-        if "Open" not in df.columns and "Close" in df.columns:
-            # 用 Close 補齊 Open/High/Low 以便回測能跑
-            df["Open"] = df["Close"]
-            df["High"] = df["Close"]
-            df["Low"] = df["Close"]
-            df["Volume"] = df.get("Volume", pd.Series(0, index=df.index))
-
-        # 標準化 OHLCV 欄位並重算指標
-        df = calculate_futures_squeeze(df)
-
-        return df
+            
+            # Defensive OHLCV
+            for col in ["Open", "High", "Low", "Close"]:
+                if col not in df.columns and "Close" in df.columns:
+                    df[col] = df["Close"]
+            return df
+        except Exception as e:
+            st.error(f"Error loading CSV: {e}")
+            return None
 
     if source_type == "today":
-        now = datetime.now()
-        today_str = now.strftime("%Y%m%d")
-        # 夜盤 15:00 後要讀明天的檔案
-        next_str = (now + __import__('datetime').timedelta(days=1)).strftime("%Y%m%d")
-        
-        dfs = []
-        for tag in ["_PAPER", "_LIVE", ""]:
-            # 日盤
-            f_day = FUTURES_MKT / f"TMF_{today_str}{tag}_indicators.csv"
-            df_day = _read_csv(f_day)
-            if df_day is not None:
-                dfs.append(df_day)
-            # 夜盤 (15:00 後讀明天的檔案)
-            if now.hour >= 15:
-                f_night = FUTURES_MKT / f"TMF_{next_str}{tag}_indicators.csv"
-                df_night = _read_csv(f_night)
-                if df_night is not None:
-                    # 確保 index 是 datetime
-                    if not pd.api.types.is_datetime64_any_dtype(df_night.index):
-                        df_night.index = pd.to_datetime(df_night.index, errors="coerce")
-                    # 只取 >=15:00 的資料避免重複
-                    df_night = df_night[df_night.index.hour >= 15]
-                    if not df_night.empty:
-                        dfs.append(df_night)
-        
-        if dfs:
-            return pd.concat(dfs).sort_index().drop_duplicates()
-    elif source_type == "specific" and date_str:
-        f = FUTURES_MKT / f"TMF_{date_str}_indicators.csv"
-        # 兼容 _PAPER 或 _LIVE 後綴
-        if not f.exists():
-            for tag in ["_PAPER", "_LIVE"]:
-                f_alt = FUTURES_MKT / f"TMF_{date_str}{tag}_indicators.csv"
-                if f_alt.exists():
-                    f = f_alt
-                    break
-        return _read_csv(f)
+        files = sorted(FUTURES_MKT.glob("TMF_*_indicators.csv"), reverse=True)
+        if files: return _read_csv(files[0])
     elif source_type == "q1":
         f = TAIFEX_RAW / "TMF_5m_taifex.csv"
-        return _read_csv(f)
+        df = _read_csv(f)
+        # Auto-calculate indicators for raw Q1 data
+        if df is not None and "ema_filter" not in df.columns:
+            try:
+                df = calculate_futures_squeeze(df, bb_length=20)
+            except Exception:
+                pass  # Return raw data if indicator calculation fails
+        return df
+    elif source_type == "parquet":
+        return data_manager.load_historical(ticker)
     return None
+
+def render_dynamic_params(strategy):
+    """Generate UI inputs based on strategy config_schema or defaults."""
+    st.divider()
+    st.subheader(get_text("params"))
+    
+    params = {}
+    schema = getattr(strategy, "config_schema", None)
+    if schema:
+        for name, field in schema.model_fields.items():
+            label = name.replace("_", " ").title()
+            if field.annotation is bool:
+                params[name] = st.checkbox(label, value=field.default or False)
+            elif field.annotation in [int, float, Optional[int], Optional[float]]:
+                params[name] = st.number_input(label, value=float(field.default or 0.0))
+    else:
+        # Defaults for legacy/common plugins
+        params["entry_score"] = st.slider(get_text("entry_score"), 0, 100, 20, 5)
+        params["atr_mult"] = st.slider(get_text("atr_mult"), 0.0, 5.0, 2.0, 0.1)
+    
+    return params
 
 def main():
     st.title(f"📊 {get_text('nav_single')}")
 
-    # 1. Sidebar Controls (wrapped in form for Streamlit 1.45+)
+    # 1. Sidebar Control
     with st.sidebar:
         st.header(get_text("data_source"))
-        src_opts = [get_text("today_ind"), get_text("specific_date"), get_text("q1_data")]
-        # Default to Q1 data (always available)
-        src = st.radio(get_text("select_source"), src_opts, index=2)
-
-        date_val = None
-        if src == get_text("specific_date"):
-            date_val = st.text_input(get_text("enter_date"), datetime.now().strftime("%Y%m%d"))
-
-        source_map = {get_text("today_ind"): "today", get_text("specific_date"): "specific", get_text("q1_data"): "q1"}
-        df = load_backtest_data(source_map[src], date_val)
-
-        if df is None:
-            st.error("No data available for the selected source. Try 'Q1 Historical Data'.")
-            st.stop()
-
-        st.success(get_text("loaded_bars", len(df)))
-
-        with st.form("single_backtest_form"):
-            st.divider()
-            st.header(get_text("strategy_settings"))
-            strat_name = st.selectbox(get_text("select_strategy"), list(STRATEGIES.keys()))
-            strat_entry = STRATEGIES[strat_name]
-            desc = strat_entry.get("desc", "No description available.") if isinstance(strat_entry, dict) else "No description available."
-            st.info(desc)
-
-            st.divider()
-            st.header(get_text("params"))
-            atr_mult = st.slider(get_text("atr_mult"), 0.0, 5.0, 2.0, 0.1)
-            entry_score = st.slider(get_text("entry_score"), 0, 100, 20, 5)
-            lots = st.number_input(get_text("lots"), 1, 10, 2)
-            initial_bal = st.number_input(get_text("initial_bal"), 10000, 1000000, 100000)
-            intraday_mode = st.checkbox("🌙 日內模式", value=False,
-                help="勾選後，每個交易日的最後一根 K 線會強制平倉。")
-            expiry_mode = st.checkbox("📅 結算日平倉", value=True,
-                help="每月第三個週三（期貨結算日）強制平倉。")
-
-            run_btn = st.form_submit_button(get_text("btn_run_single"), type="primary", use_container_width=True)
-
-    # 2. Execution
-    if run_btn:
-        # Defensive: ensure standard OHLCV column names
-        for lower, upper in [("open", "Open"), ("high", "High"), ("low", "Low"), ("close", "Close"), ("volume", "Volume")]:
-            if lower in df.columns and upper not in df.columns:
-                df = df.rename(columns={lower: upper})
-        if "Open" not in df.columns:
-            st.error(f"Missing 'Open' column. Available columns: {list(df.columns)[:15]}...")
-            st.stop()
-
-        cfg = {
-            "strategy": {
-                "regime_filter": "mid",
-                "entry_score": entry_score,
-                strat_name: {"atr_mult": atr_mult}
-            }
-        }
+        src_options = ["Historical DB (Parquet)", "Q1 (CSV)", "Today (CSV)"]
+        src_label = st.radio(get_text("select_source"), src_options, index=0)
+        source_map = {"Today (CSV)": "today", "Q1 (CSV)": "q1", "Historical DB (Parquet)": "parquet"}
         
-        with st.spinner(get_text("gen_signals")):
-            longs, shorts = generate_signals(df, strat_name, cfg)
+        target_ticker = "TXFR1"
+        if src_label == "Historical DB (Parquet)":
+            inventory = data_manager.get_inventory()
+            if inventory:
+                target_ticker = st.selectbox("Select DB Ticker", list(inventory.keys()))
+            else:
+                st.warning("Historical DB is empty. Use 'Data Management' to expand.")
         
-        with st.spinner(get_text("sim_trades")):
-            open_arr = df["Open"].values
-            close_arr = df["Close"].values
-            high_arr = df["High"].values
-            low_arr = df["Low"].values
-            vwap_arr = df["vwap"].values if "vwap" in df.columns else np.zeros(len(df))
-            atr_arr = df["atr"].values if "atr" in df.columns else np.full(len(df), 30.0)
+        load_btn = st.button("📥 Load Data", type="primary", use_container_width=True)
+        if load_btn or "bt_df" in st.session_state:
+            if load_btn:
+                df = load_backtest_data(source_map[src_label], ticker=target_ticker)
+                st.session_state["bt_df"] = df
+            else:
+                df = st.session_state["bt_df"]
 
-            # Ensure trading_day is available for EOD logic
-            if intraday_mode and "trading_day" not in df.columns:
-                from core.date_utils import get_trading_day
-                df["trading_day"] = get_trading_day(df.index)
+            if df is None or df.empty:
+                st.error("No data loaded. Check files in data/ or logs/market_data/.")
+                st.stop()
 
-            # Build end-of-day bars mask
-            eod_bars = np.zeros(len(df), dtype=np.bool_)
-            if intraday_mode and "trading_day" in df.columns:
-                # Use vectorized comparison for efficiency
-                td_values = df["trading_day"].values
-                eod_bars[:-1] = td_values[:-1] != td_values[1:]
-                eod_bars[-1] = True
+            st.success(get_text("loaded_bars", len(df)))
 
-            # Build expiry bars mask (3rd Wednesday of each month)
-            expiry_bars = np.zeros(len(df), dtype=np.bool_)
-            if expiry_mode:
-                idx_df = df.index
-                for i in range(len(df)):
-                    dt = idx_df[i]
-                    # Third Wednesday check: weekday 2 (Wednesday) and day 15-21
-                    if dt.weekday() == 2 and 15 <= dt.day <= 21:
-                        # Mark all bars on this day
-                        expiry_bars[i] = True  # Last bar is always EOD
+            # --- Data Health Audit ---
+            with st.expander("🛡️ Data Health"):
+                gaps = data_sentinel.audit_gaps(df)
+                if not gaps:
+                    st.success("Data is complete (No gaps)")
+                else:
+                    st.warning(f"Detected {len(gaps)} gaps")
+                    if st.button("🔧 Repair with Backfiller"):
+                        with st.spinner("Repairing gaps via Shioaji..."):
+                            import subprocess
+                            subprocess.run(["python3", "scripts/sync/unified_backfiller.py"], check=True)
+                            st.rerun()
+            st.divider()
 
-            entries, exits, positions, pnl, reasons = simulate_trades_vectorized(
-                open_arr, close_arr, high_arr, low_arr, vwap_arr, atr_arr,
-                longs, shorts,
-                initial_balance=initial_bal,
-                point_value=10.0,
-                fee_per_side=10.0,
-                exchange_fee=2.0,
-                tax_rate=0.00002,
-                max_positions=1,
-                lots_per_trade=lots,
-                slippage=1.0,
-                stop_loss_pts=30,
-                atr_mult=atr_mult,
-                tp1_pts=30,
-                tp1_lots=1,
-                exit_on_vwap=True,
-                intraday_only=intraday_mode,
-                eod_bars=eod_bars,
-                expiry_bars=expiry_bars,
-            )
+            with st.form("backtest_config"):
+                st.header(get_text("strategy_settings"))
+                all_strats = REGISTRY.list_all()
+                available_strats = [s["name"] for s in all_strats if s.get("available")]
+                
+                if not available_strats:
+                    st.error("No available strategies found.")
+                    st.form_submit_button("Retry", disabled=True)
+                    st.stop()
+                    
+                selected_name = st.selectbox(get_text("select_strategy"), available_strats)
+                strat_obj = REGISTRY.get(selected_name)
+                meta = strat_obj.metadata
+                st.info(meta.get("description", "No description"))
+                
+                custom_params = render_dynamic_params(strat_obj)
+                
+                st.divider()
+                initial_bal = st.number_input(get_text("initial_bal"), 10000, 1000000, 100000)
+                
+                run_btn = st.form_submit_button(get_text("btn_run_single"), type="primary", use_container_width=True)
+                
+                # 2. Execution (inside form to access run_btn)
+                if run_btn:
+                    profile = FUTURES_PROFILE if meta.get("asset_class") == "futures" else STOCK_PROFILE
+                    engine = BacktestEngine(profile=profile, initial_capital=initial_bal)
+                    full_config = {"params": custom_params}
+                    
+                    with st.spinner(f"Simulating {selected_name}..."):
+                        result = engine.run(df, strat_obj, config=full_config)
+                    
+                    # 3. Results Display
+                    if result.metrics and result.metrics.get("trade_count", 0) > 0:
+                        m = result.metrics
+                        st.header(get_text("results"))
             
-            res = calculate_metrics(pnl, entries, exits, positions, initial_bal)
+                        # --- Save Experiment ---
+                        with st.expander("💾 Save this Experiment"):
+                            c1, c2 = st.columns([3, 1])
+                            exp_tag = c1.text_input("Tag (optional)", placeholder="e.g. baseline, test_v1", key="exp_tag")
+                            if c2.button("Save", use_container_width=True):
+                                exp_id = tracker.save_experiment(result, params=custom_params, tag=exp_tag)
+                                st.success(f"Saved: {exp_id}")
+                        
+                        st.divider()
+                        c1, c2, c3, c4, c5, c6 = st.columns(6)
+                        c1.metric(get_text("total_pnl"), f"{m['total_pnl']:+,.0f}")
+                        c2.metric(get_text("win_rate"), f"{m['win_rate']:.1%}")
+                        c3.metric("Sharpe", f"{m['sharpe']:.2f}")
+                        c4.metric("MaxDD", f"{m['mdd']:.1%}")
+                        c5.metric("CAGR", f"{m.get('cagr', 0):.1%}")
+                        c6.metric("Profit Factor", f"{m.get('profit_factor', 0):.2f}")
 
-        # 3. Results Display
-        st.header(get_text("results"))
+                        # --- Quick Monte Carlo Preview ---
+                        st.divider()
+                        with st.expander("🎲 Monte Carlo Risk Audit", expanded=True):
+                            mc = run_monte_carlo(result.trades, initial_capital=initial_bal)
+                            if mc:
+                                sc1, sc2, sc3 = st.columns(3)
+                                sc1.metric("Prob. of Ruin", f"{mc['prob_of_ruin']:.1%}")
+                                sc2.metric("95% VaR MDD", f"{mc['mdd_95']:.1%}", 
+                                          delta=f"{mc['mdd_95'] - m['mdd']:.1%}", delta_color="inverse")
+                                sc3.metric("Median MDD", f"{mc['mdd_median']:.1%}")
+                                st.caption("Risk VaR shows how much worse the MDD can get if trade order is unfavorable.")
+                            else:
+                                st.info("Generating more trades will enable deeper risk analysis.")
 
-        def compact_num(v):
-            """Compact number formatting for narrow screens."""
-            v = float(v)
-            s = "+" if v >= 0 else ""
-            if abs(v) >= 1_000_000:
-                return f"{s}{v/1_000_000:.2f}M"
-            elif abs(v) >= 1_000:
-                return f"{s}{v/1_000:.1f}K"
-            return f"{s}{v:.0f}"
+                        # PnL Chart
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=result.equity_curve.index, y=result.equity_curve.values, 
+                                               name="Equity", fill='tozeroy', line=dict(color="#10B981")))
+                        fig.update_layout(title=get_text("equity_curve"), template="plotly_dark", height=450)
+                        st.plotly_chart(fig, use_container_width=True)
 
-        pnl_val = res.get('total_pnl', 0)
-        pnl_color = "🟢" if pnl_val >= 0 else "🔴"
-        st.markdown(f"**{pnl_color} 總盈虧: {compact_num(pnl_val)} TWD**")
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric(get_text("win_rate"), f"{res.get('win_rate', 0):.1f}%")
-        c2.metric(get_text("pf"), f"{res.get('profit_factor', 0):.2f}")
-        c3.metric(get_text("trades"), int(res.get('total_trades', 0)))
-
-        mdd_val = res.get('max_drawdown', 0)
-        st.markdown(f"**最大回撤 (MDD): {compact_num(mdd_val)} TWD**")
-
-        equity = initial_bal + np.cumsum(pnl)
-        df_equity = pd.DataFrame({"equity": equity}, index=df.index)
-        df_equity["peak"] = df_equity["equity"].cummax()
-        df_equity["drawdown"] = df_equity["peak"] - df_equity["equity"]
-        df_equity["in_dd"] = df_equity["drawdown"] > 0
-        
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df_equity.index, y=df_equity["equity"], name="Equity", line=dict(color="#10B981", width=2)))
-        
-        dd_starts = df_equity[(df_equity["in_dd"]) & (~df_equity["in_dd"].shift(1).fillna(False))].index
-        dd_ends = df_equity[(~df_equity["in_dd"]) & (df_equity["in_dd"].shift(1).fillna(False))].index
-        
-        for i in range(min(len(dd_starts), len(dd_ends))):
-            fig.add_vrect(
-                x0=dd_starts[i], x1=dd_ends[i],
-                fillcolor="red", opacity=0.15, layer="below", line_width=0
-            )
-
-        fig.update_layout(title=get_text("equity_curve"), template="plotly_dark", height=450)
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader(get_text("trade_log"))
-        trade_indices = np.where(pnl != 0)[0]
-        if len(trade_indices) > 0:
-            # Define a robust mapping for exit reasons from engine codes
-            reason_map = {
-                0: "STOP",
-                1: "TP1",   # engine uses tp1_triggered internally but returns reasons for full exits
-                2: "VWAP",
-                3: "EXIT",
-                4: "EOD",
-                5: "EXP"
-            }
-            
-            full_trades_df = pd.DataFrame({
-                "Time": df.index[trade_indices],
-                "PnL": pnl[trade_indices],
-                "Position": positions[trade_indices],
-                "Reason": [reason_map.get(r, "ENTRY") if p > 0 else reason_map.get(r, "EXIT") 
-                           for r, p in zip(reasons[trade_indices], pnl[trade_indices])]
-            })
-            st.dataframe(full_trades_df, use_container_width=True)
-
-            st.divider()
-            st.header("⚙️ Strategy Deployment")
-            sc1, sc2 = st.columns(2)
-            with sc1:
-                if st.button(get_text("btn_apply"), type="primary", use_container_width=True):
-                    backup = apply_params_to_config(strat_name, entry_score, atr_mult)
-                    if backup:
-                        st.success(get_text("config_updated", backup.name))
-            with sc2:
-                if st.button(get_text("btn_rollback"), use_container_width=True):
-                    restored = rollback_config()
-                    if restored:
-                        st.warning(get_text("config_restored", restored.name))
+                        # Trade Log
+                        st.subheader(get_text("trade_log"))
+                        st.dataframe(result.trades, use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("⚠️ No trades generated during this period.")
+                        if not result.equity_curve.empty:
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(x=result.equity_curve.index, y=result.equity_curve.values, name="Equity", line=dict(color="#94A3B8")))
+                            fig.update_layout(title="Equity Curve (No Trades)", template="plotly_dark")
+                            st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info(get_text("no_trades"))
-    else:
-        st.info("Adjust parameters and click 'Run Backtest'.")
+            st.info("Click 'Load Data' to begin.")
+            st.stop()
 
 if __name__ == "__main__":
     main()

@@ -24,7 +24,7 @@ class CounterVWAP(StrategyBase):
         return "counter_vwap"
 
     @property
-    def metadata(self) -> dict:
+    def metadata(self) -> dict[str, Any]:
         return {
             "asset_class": "futures",
             "version": "3.1",
@@ -33,6 +33,7 @@ class CounterVWAP(StrategyBase):
             "backtest_maxdd": -7.2,
             "market_regime": "ranging",
             "description": "反向均值回歸: 偵測 Squeeze Fire 失敗後反向進場 (含 Bias 確認)",
+            "indicators": ["squeeze", "vwap"],
         }
 
     def init(self, context: StrategyContext) -> None:

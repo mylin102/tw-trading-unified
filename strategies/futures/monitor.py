@@ -103,6 +103,16 @@ class FuturesMonitor:
         self.cooldown_bars = self.cfg.get("cooldown_bars", self.STRATEGY.get("cooldown_bars", 8))
         self.cooldown_until = 0
 
+        # GSD Phase 0b: Consecutive losses tracker (separate for day/night)
+        self.consecutive_losses = 0
+        self.session_losses = []  # [(timestamp, pnl_pts, exit_reason, session)]
+        self.session_type = None  # "day" or "night", set per bar
+        self._last_bar_context = {}  # Phase 0c: snapshot for entry diagnostic
+
+        # GSD Phase 3: Circuit Breaker integration (Phase 1)
+        self._circuit_breaker = None
+        self._session_pnl = 0.0  # Session PnL for circuit breaker
+
         # Squeeze Failure Counter mode
         self.COUNTER = self.STRATEGY.get("counter_mode", {})
         self.counter_enabled = self.COUNTER.get("enabled", False)
@@ -119,6 +129,14 @@ class FuturesMonitor:
         self._vwap_violation_bars = 0  # VWAP exit debounce counter
         self._atr_trail_peak = 0.0    # ATR trailing stop: peak price tracker
         self.last_tick_at = time.time()  # [gstack] 數據新鮮度追蹤
+
+        # GSD Phase 0d: Hourly no-trade audit tracking
+        self._last_trade_ts = None       # timestamp of last trade
+        self._bars_since_trade = 0       # bars since last trade
+        self._signals_generated = 0      # valid signals this hour
+        self._signals_rejected = 0       # rejected signals this hour (reason, count)
+        self._last_audit_hour = -1       # last hour we ran the audit
+        self._data_stale_bars = 0        # consecutive bars with no new data
         
         # 💡 GSD: Market data cache for virtual ticks
         self.market_data = {"MTX": {"close": 0.0}}
@@ -164,6 +182,20 @@ class FuturesMonitor:
         self._registry.discover()
         self._active_strategy_name = None  # Track initialized strategy
 
+        # ── GSD Phase 3: Circuit Breaker initialization ──────────────
+        try:
+            from core.circuit_breaker import CircuitBreaker
+            # Create two independent breakers (day/night)
+            self._circuit_breaker = CircuitBreaker(
+                session="day",  # Will be used based on session_type at runtime
+                daily_loss_cap=5000,  # 5% of 100k capital
+                max_consecutive=3,
+            )
+            console.print("[green]🛡️ Circuit Breaker initialized[/green]")
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Circuit Breaker init failed: {e}[/yellow]")
+            self._circuit_breaker = None
+
         # ── Pre-init the active strategy ─────────────────────────────
         active_name = self.STRATEGY.get("active_strategy", "counter_vwap")
         strategy = self._registry.get(active_name)
@@ -189,25 +221,22 @@ class FuturesMonitor:
             console.print("[yellow][FuturesMonitor] dry-run: skipping contract fetch[/yellow]")
             return True
 
-        # [GSD Fix] Correct TMF front-month selection by delivery_date
+        # [GSD Fix] Warm-up from Parquet SSOT (Wave 5 Integration)
         try:
-            # 💡 GSD: Warm-up from local CSV first to ensure indicators (Score) are available immediately
-            try:
-                csv_path = Path("data/tmf_full_2026.csv")
-                if csv_path.exists():
-                    df_hist = pd.read_csv(csv_path)
-                    df_hist["ts"] = pd.to_datetime(df_hist["ts"])
-                    df_hist = df_hist.set_index("ts").sort_index()
-                    # Take last 100 bars for warm-up
-                    df_warm = df_hist.tail(100)
-                    for ts, row in df_warm.iterrows():
-                        self._tick_bars_deque.append({
-                            "open": row["Open"], "high": row["High"], "low": row["Low"], 
-                            "close": row["Close"], "volume": row["Volume"], "ts": ts
-                        })
-                    console.print(f"[green][FuturesMonitor] ✓ Warmed up with {len(df_warm)} bars from local CSV[/green]")
-            except Exception as e:
-                console.print(f"[dim][FuturesMonitor] CSV warm-up skipped: {e}[/dim]")
+            from core.data_manager import data_manager
+            df_hist = data_manager.load_historical(self.ticker)
+            if not df_hist.empty:
+                df_warm = df_hist.tail(100)
+                for ts, row in df_warm.iterrows():
+                    self._tick_bars_deque.append({
+                        "open": row["Open"], "high": row["High"], "low": row["Low"], 
+                        "close": row["Close"], "volume": row["Volume"], "ts": ts
+                    })
+                # Initialize cache to prevent immediate indicator re-calc
+                self._tick_bars_cache = df_warm[["Open", "High", "Low", "Close", "Volume"]].copy()
+                console.print(f"[green][FuturesMonitor] ✓ Warmed up with {len(df_warm)} bars from Parquet DB[/green]")
+        except Exception as e:
+            console.print(f"[dim][FuturesMonitor] Parquet warm-up failed: {e}[/dim]")
 
             tmf_list = list(self.api.Contracts.Futures.TMF)
             if tmf_list:
@@ -465,6 +494,56 @@ class FuturesMonitor:
             console.print(f"[yellow]Safety stop cancel error: {e}[/yellow]")
         self._safety_stop_trade = None
 
+    # ── GSD Phase 0d: Hourly No-Trade Audit (V-Model during session) ──
+    def _hourly_no_trade_audit(self, timestamp, df_5m):
+        """
+        Every hour: if no trades in the past hour, diagnose WHY.
+        Three possible verdicts:
+          1. DATA_FAILURE → API down, stale data (alert)
+          2. NO_VALID_SIGNALS → data OK, strategy found no signals (expected)
+          3. COOLDOWN → strategy blocked by cooldown (expected)
+        """
+        now_hour = timestamp.hour if hasattr(timestamp, "hour") else datetime.now().hour
+        if now_hour == self._last_audit_hour:
+            return  # Already audited this hour
+        self._last_audit_hour = now_hour
+
+        bars_in_hour = self._bars_since_trade
+        secs_since_tick = time.time() - self.last_tick_at
+        data_stale = secs_since_tick > 120  # 2+ min without tick
+
+        # Diagnose
+        if data_stale or df_5m is None or len(df_5m) < 30:
+            verdict = "DATA_FAILURE"
+            note = f"Data stale {secs_since_tick/60:.1f}min, bars={len(df_5m) if df_5m is not None else 0}"
+            console.print(f"[red]🚨 {verdict}: {note}[/red]")
+        elif self.cooldown_until > 0:
+            verdict = "COOLDOWN"
+            note = f"Cooldown active (remaining={self.cooldown_until}), signals={self._signals_generated}"
+            console.print(f"[dim]🔵 {verdict}: {note}[/dim]")
+        elif self._signals_generated == 0:
+            verdict = "NO_VALID_SIGNALS"
+            note = f"Data OK, {bars_in_hour} bars, 0 signals generated. Strategy may be too strict for current conditions."
+            console.print(f"[yellow]⚠️  {verdict}: {note}[/yellow]")
+        else:
+            verdict = "NORMAL"
+            note = f"{self._signals_generated} signals, data healthy"
+
+        # Log audit
+        from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
+        save_signal_audit({
+            "timestamp": str(timestamp),
+            "signal": "HOURLY_AUDIT",
+            "price": 0,
+            "reason": verdict,
+            "rejection": note,
+            "lots": 0,
+        })
+
+        # Reset counters for next hour
+        self._signals_generated = 0
+        self._bars_since_trade = 0
+
     # ── Margin check ──
     def _margin_sufficient(self):
         """Check if account has enough margin before placing entry order."""
@@ -553,8 +632,17 @@ class FuturesMonitor:
             friction_cost = fee + exch_fee + tax
             pnl_cash = gross - friction_cost
 
+            # GSD Phase 3: Track session PnL for circuit breaker
+            self._session_pnl += pnl_pts
+
         if signal in ("BUY", "SELL"):
             self._last_entry_reason = reason
+            # GSD Phase 0b: Reset consecutive losses on new entry
+            self.consecutive_losses = 0
+            # GSD Phase 0d: Reset bar counter on new entry
+            self._last_trade_ts = ts
+            self._bars_since_trade = 0
+            self._signals_generated += 1
         result = self.trader.execute_signal(
             signal, price, ts, lots=lots,
             max_lots=self.MGMT.get("max_positions", 2),
@@ -571,6 +659,35 @@ class FuturesMonitor:
                     "direction": direction, "pnl_pts": round(pnl_pts, 1),
                     "pnl_cash": round(pnl_cash, 0), "friction_cost": round(friction_cost, 0),
                     "reason": reason or ""})
+
+        # GSD Phase 0c: Entry diagnostic snapshot
+        if signal in ("BUY", "SELL"):
+            ctx = getattr(self, "_last_bar_context", {})
+            entry_diag = {
+                "momentum": ctx.get("momentum", 0),
+                "mom_velo": ctx.get("mom_velo", 0),
+                "vwap_distance_pts": round(abs(price - ctx.get("vwap", price)), 1),
+                "atr": ctx.get("atr", 0),
+                "squeeze_on_recent": ctx.get("squeeze_on", False),
+                "score": ctx.get("score", 0),
+                "regime": ctx.get("regime", "UNKNOWN"),
+                "session": ctx.get("session", "day"),
+                "stop_loss_pts": round(stop_loss or 0, 1),
+            }
+            save_trade({"type": "ENTRY_DIAG", "timestamp": ts, "signal": signal,
+                        "price": price, "lots": lots, "direction": direction,
+                        "reason": reason or "",
+                        "entry_diag": entry_diag})
+
+        # GSD Phase 0b: Track consecutive losses on exit
+        if signal in ("EXIT", "PARTIAL_EXIT") and pnl_pts < 0:
+            sess = self.session_type or "day"
+            self.consecutive_losses += 1
+            self.session_losses.append((ts, pnl_pts, reason or "UNKNOWN", sess))
+            console.print(f"[yellow]⚠️  Loss #{self.consecutive_losses}: {pnl_pts:.1f} pts ({reason or 'unknown'}) [{sess}][/yellow]")
+        elif signal in ("EXIT", "PARTIAL_EXIT") and pnl_pts >= 0:
+            self.consecutive_losses = 0
+
         d = "🟢 BUY" if signal == "BUY" else "🔴 SELL" if signal == "SELL" else "⚪ EXIT"
         friction_note = f" (摩擦成本 {friction_cost:.0f} TWD)" if friction_cost > 0 else ""
         console.print(f"[bold green][FuturesMonitor] [{ts}] {d} {lots} lots @ {price:.0f}  {result}{friction_note}[/bold green]")
@@ -858,6 +975,28 @@ class FuturesMonitor:
         vwap = last_5m.get("vwap", last_price)
         timestamp = last_5m.name
 
+        # GSD Phase 0b: Determine session type per bar
+        hhmm = int(timestamp.strftime("%H%M")) if hasattr(timestamp, "strftime") else int(datetime.now().strftime("%H%M"))
+        self.session_type = "night" if (hhmm >= 1500 or hhmm < 500) else "day"
+
+        # GSD Phase 0c: Snapshot bar context for entry diagnostic (used by _execute_trade)
+        self._last_bar_context = {
+            "momentum": float(last_5m.get("momentum", 0)),
+            "mom_velo": float(last_5m.get("mom_velo", 0)),
+            "vwap": float(vwap),
+            "atr": float(last_5m.get("atr", 0)),
+            "squeeze_on": bool(last_5m.get("sqz_on", False)),
+            "score": float(score),
+            "regime": str(regime),
+            "session": self.session_type,
+        }
+
+        # GSD Phase 0d: Increment bar counter since last trade
+        self._bars_since_trade += 1
+
+        # GSD Phase 0d: Hourly no-trade audit
+        self._hourly_no_trade_audit(timestamp, df_5m)
+
         # Log bar (即便每分鐘更新也行，存檔邏輯會處理)
         if self.last_processed_bar != timestamp:
             self._save_bar(last_5m, score, regime)
@@ -928,8 +1067,40 @@ class FuturesMonitor:
         # 3. Entry logic (with cooldown check)
         if self.cooldown_until > 0:
             self.cooldown_until -= 1
+            self._signals_rejected += 1  # GSD Phase 0d
             self._audit_signal("ENTRY_BLOCKED", "", score, "cooldown_active", f"remaining={self.cooldown_until}")
             return
+
+        # GSD Phase 3: Circuit Breaker check (Phase 1 integration)
+        if hasattr(self, "_circuit_breaker"):
+            breaker_action = self._circuit_breaker.check(
+                pnl=getattr(self, "_session_pnl", 0),
+                consecutive_losses=self.consecutive_losses,
+            )
+            if breaker_action.value == "HALT":
+                console.print(f"[bold red]🛑 Circuit Breaker HALTED ({self.session_type}): Daily loss cap breached[/bold red]")
+                from core.decision_logger import DecisionLogger
+                DecisionLogger.log(
+                    type="circuit_breaker", session=self.session_type,
+                    action="halt", detail="Daily loss cap breached",
+                    author="system", risk_level="high",
+                )
+                self.cooldown_until = 1000  # Halt until reset
+                return
+            elif breaker_action.value == "DIAGNOSE":
+                # GSD Phase 3: Run diagnostic engine (Phase 2 integration)
+                console.print(f"[bold yellow]⚠️ Circuit Breaker DIAGNOSE ({self.session_type}): {self.consecutive_losses} consecutive losses[/bold yellow]")
+                # Diagnosis will be done in post-session review
+                # For now, log and continue (diagnostic engine is async via daily_review.py)
+                from core.decision_logger import DecisionLogger
+                DecisionLogger.log(
+                    type="circuit_breaker", session=self.session_type,
+                    action="diagnose", detail=f"{self.consecutive_losses} consecutive losses, triggering diagnostic",
+                    author="system", risk_level="medium",
+                )
+            elif breaker_action.value == "REDUCE_SIZE":
+                # Temporarily reduce position size
+                console.print(f"[yellow]⚠️ Circuit Breaker REDUCE_SIZE ({self.session_type}): Daily loss at 40%[/yellow]")
 
         # Prevent re-entering on the same bar as exit
         if self._last_exit_bar == timestamp:
@@ -983,6 +1154,11 @@ class FuturesMonitor:
             self._legacy_entry_logic(last_5m, df_5m, last_price, timestamp, score, stop_loss_pts)
             return
 
+        # ── GSD: Market Regime Detection (Wave 19 Integration) ───────
+        from core.market_regime import classify_regime
+        # We use the current window of bars to classify the regime
+        current_regime = classify_regime(df_5m)
+        
         # 3. Build immutable StrategyContext (SDD Rule 1: Read-only view)
         ctx = StrategyContext(
             market=MarketData(
@@ -991,6 +1167,7 @@ class FuturesMonitor:
                 df_15m=df_15m,
                 timestamp=str(timestamp),
                 session=int(last_5m.get("session", 0)),
+                regime=current_regime, # GSD: Pass live regime
             ),
             position=PositionView(
                 size=self.trader.position,
@@ -1019,6 +1196,18 @@ class FuturesMonitor:
                 "score": score, "stop_loss_pts": stop_loss_pts,
             }, self.cfg)
             if spring_signal:
+                # GSD P4.4: Validate Spring signal (same as registry strategy)
+                from core.signal import Signal
+                spring_obj = Signal(
+                    action=spring_signal["action"],
+                    reason=spring_signal.get("reason", "SPRING"),
+                    stop_loss=spring_signal.get("stop_loss", 0),
+                )
+                is_valid, msg = spring_obj.validate()
+                if not is_valid:
+                    console.print(f"[red]❌ Invalid Spring signal: {msg}[/red]")
+                    return
+
                 atr_val = last_5m.get("atr", 0)
                 if atr_val > 300: atr_val = 300
                 spring_sl = spring_signal.get("stop_loss", atr_val * 2.0 if atr_val > 0 else 60)
