@@ -162,12 +162,16 @@ class StockMonitor:
     def clean_unfilled_orders(self):
         """撤銷超過 5 分鐘未成交的掛單"""
         if self.dry_run: return
-        if not hasattr(self.api, 'trades'): return
         now = datetime.now()
         self.api.update_status()
 
-        # 檢查 api.trades 中屬於我們這個模式的單
-        for trade in self.api.trades:
+        # 檢查 api.list_trades() 中屬於我們這個模式的單
+        try:
+            trades = self.api.list_trades()
+        except Exception:
+            return
+
+        for trade in trades:
             if trade.contract.code in self.watchlist:
                 # 如果是掛單中 (Submitted) 且超過 5 分鐘
                 order_time = datetime.fromtimestamp(trade.status.order_datetime)
@@ -187,12 +191,14 @@ class StockMonitor:
             console.print("[yellow]🚨 [DRY-RUN] Would cancel all pending orders[/yellow]")
             return
 
-        if not hasattr(self.api, 'trades'):
+        self.api.update_status()
+        try:
+            trades = self.api.list_trades()
+        except Exception:
             return
 
-        self.api.update_status()
         cancelled = 0
-        for trade in self.api.trades:
+        for trade in trades:
             if trade.contract.code in self.watchlist:
                 if trade.status.status == sj.constant.Status.Submitted:
                     console.print(f"[yellow]🚨 EOD Cancel: {trade.contract.code} (status={trade.status.status})[/yellow]")

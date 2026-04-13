@@ -765,7 +765,12 @@ class ShioajiOptionsSmartMonitor:
         pd.DataFrame([data]).to_csv(self.ledger_path, mode='a', index=False, header=not self.ledger_path.exists())
 
     def on_order_event(self, stat, msg):
-        if not (self.dry_run_live_orders and stat == "MOCK_FILL") and stat != sj.constant.OrderState.FDeal:
+        # set_order_callback receives OrderState enum:
+        #   OrderState.FuturesDeal / OrderState.StockDeal — actual fills
+        #   OrderState.FuturesOrder / OrderState.StockOrder — order status changes
+        # Only process deal events (actual fills), ignore order status changes
+        is_deal = stat in (sj.constant.OrderState.FuturesDeal, sj.constant.OrderState.StockDeal)
+        if not (self.dry_run_live_orders and stat == "MOCK_FILL") and not is_deal:
             return
         action = str(msg.get("action", ""))
         price = float(msg.get("price", 0.0) or 0.0)

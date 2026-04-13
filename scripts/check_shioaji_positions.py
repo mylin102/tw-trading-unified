@@ -41,7 +41,7 @@ def check_positions():
 
         for contract in stock_contracts:
             try:
-                snap = api.snapshots([contract], odd_lot=True)
+                snap = api.snapshots([contract])
                 if snap and len(snap) > 0:
                     s = snap[0]
                     # Check if we hold shares: odd_lot_shares > 0

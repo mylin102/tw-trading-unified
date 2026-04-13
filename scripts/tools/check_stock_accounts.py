@@ -46,7 +46,7 @@ def check_accounts_final():
                     # 2. 測試零股行情讀取 (使用您提供的建議代碼)
                     try:
                         contract = api.Contracts.Stocks[pos.code]
-                        odd_snapshot = api.snapshots([contract], odd_lot=True)
+                        odd_snapshot = api.snapshots([contract])
                         if odd_snapshot:
                             s = odd_snapshot[0]
                             print(f"  > [零股即時行情] 買: {s.buy_price} | 賣: {s.sell_price} | 現: {s.close}")
