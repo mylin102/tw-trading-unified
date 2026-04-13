@@ -562,19 +562,21 @@ class FuturesMonitor:
         
         [ENHANCED] Also monitors trade records integrity and backups.
         """
-        now_hour = timestamp.hour if hasattr(timestamp, "hour") else datetime.now().hour
+        now_hour = datetime.now().hour  # Use system clock to prevent duplicate audits
         if now_hour == self._last_audit_hour:
             return  # Already audited this hour
         self._last_audit_hour = now_hour
         
-        bars_in_hour = self._bars_since_trade
         secs_since_tick = time.time() - self.last_tick_at
         data_stale = secs_since_tick > 120  # 2+ min without tick
-        
+
+        # Use actual kbar count if available, fallback to _bars_since_trade
+        actual_bars = len(df_5m) if df_5m is not None else 0
+
         # Diagnose
-        if data_stale or df_5m is None or len(df_5m) < 30:
+        if data_stale or df_5m is None or actual_bars < 30:
             verdict = "DATA_FAILURE"
-            note = f"Data stale {secs_since_tick/60:.1f}min, bars={len(df_5m) if df_5m is not None else 0}"
+            note = f"Data stale {secs_since_tick/60:.1f}min, bars={actual_bars}"
             console.print(f"[red]🚨 {verdict}: {note}[/red]")
         elif self.cooldown_until > 0:
             verdict = "COOLDOWN"
@@ -582,7 +584,7 @@ class FuturesMonitor:
             console.print(f"[dim]🔵 {verdict}: {note}[/dim]")
         elif self._signals_generated == 0:
             verdict = "NO_VALID_SIGNALS"
-            note = f"Data OK, {bars_in_hour} bars, 0 signals generated. Strategy may be too strict for current conditions."
+            note = f"Data OK, {actual_bars} bars, 0 signals generated. Strategy may be too strict for current conditions."
             console.print(f"[yellow]⚠️  {verdict}: {note}[/yellow]")
         else:
             verdict = "NORMAL"
