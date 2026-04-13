@@ -1478,11 +1478,8 @@ class ShioajiOptionsSmartMonitor:
         return True
 
     def enter_paper_position(self, side, signal):
-        if self.position > 0:
-            console.print(f"[yellow]⚠️ enter_paper_position blocked: already holding {self.position}x {self.active_side}[/yellow]")
-            return
         if self.position >= self.max_positions:
-            console.print(f"[red]🚫 enter_paper_position blocked: max positions ({self.max_positions}) reached[/red]")
+            console.print(f"[red]🚫 enter_paper_position blocked: max positions ({self.max_positions}) reached (currently {self.position})[/red]")
             return
         if not self._dte_allows_entry(side, now=signal.get("timestamp")):
             return
@@ -1941,7 +1938,7 @@ class ShioajiOptionsSmartMonitor:
                             self.print_status_summary(signal, force=True)
                             return
 
-            if self.position == 0 and self.position < self.max_positions:
+            if self.position < self.max_positions:
                 if self.cooldown_until > 0:
                     self.cooldown_until -= 1
                     console.print(f"[dim]Cooldown: {self.cooldown_until} bars remaining[/dim]")

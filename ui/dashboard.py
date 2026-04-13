@@ -124,7 +124,7 @@ if not check_password():
 st_autorefresh(interval=30_000, key="data_refresh")
 
 BASE = Path(__file__).parent.parent
-DATE_STR = get_session_date_str()  # Single source: shared with main.py
+DATE_STR = datetime.datetime.now().strftime("%Y%m%d")  # Calendar date for display (not trading day)
 TODAY = datetime.datetime.now().strftime("%Y-%m-%d")
 
 # ── Sidebar Info ──

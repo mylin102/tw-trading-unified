@@ -36,9 +36,13 @@ risk_mgmt:
   trailing_stop_enabled: true
   trailing_stop_trigger_pts: 100
 strategy:
-  active_strategy: counter_vwap
+  active_strategy: psar_breakout
   auto_select: false
   volume_threshold: 0.001
+  psar_breakout:
+    min_adx: 10
+    sma_len: 50
+    atr_sl_mult: 3.0
   counter_mode:
     atr_sl_mult: 2.0
     auto_regime: true
