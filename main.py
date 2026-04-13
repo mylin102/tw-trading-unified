@@ -158,7 +158,13 @@ def _setup_event_callback(api, fm, om):
     global _connection_dropped
 
     @api.quote.on_event
-    def event_cb(event_code, event):
+    def event_cb(resp_code, event_code, info, event):
+        """
+        resp_code: Response code (0=ok)
+        event_code: 12=RECONNECTING, 13=RECONNECTED, 16=SUBSCRIPTION_OK, 20=GD_FAIL
+        info: Info string
+        event: Event description
+        """
         global _connection_dropped
 
         if event_code == 12:

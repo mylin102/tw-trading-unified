@@ -1025,29 +1025,44 @@ class ShioajiOptionsSmartMonitor:
         """
         if df is None or df.empty:
             return False, "資料為空"
-        
-        # 檢查最少kbar數量
-        min_bars_required = 30
+
+        # BUG FIX 2026-04-13: Lower bar requirement for night sessions.
+        # Night session may have as few as 10 fresh 5-min bars.
+        from core.date_utils import is_night_session as _is_night
+        is_night = _is_night(datetime.datetime.now())
+        min_bars_required = 10 if is_night else 30
         if len(df) < min_bars_required:
             return False, f"資料不足: {len(df)}根 < {min_bars_required}根"
         
         # 檢查時間間隔連續性
         if len(df) > 1:
             time_diffs = df.index.to_series().diff().dt.total_seconds() / 60  # 轉換為分鐘
-            
+
             # 跳過第一個NaN值
             if len(time_diffs) > 1:
                 valid_diffs = time_diffs.iloc[1:].dropna()
                 if len(valid_diffs) > 0:
                     max_gap = valid_diffs.max()
                     min_gap = valid_diffs.min()
-                    
+
+                    # BUG FIX 2026-04-13: Night session has natural 375-min gap
+                    # (day close 13:45 → night open 15:00 = 75 min, but server
+                    # may return combined data with 300+ min gap).
+                    # Only check max_gap during continuous trading hours.
+                    import datetime as _dt
+                    is_night = _dt.datetime.now().hour >= 15 or _dt.datetime.now().hour < 5
+                    max_allowed_gap = 380 if is_night else 30  # 380 = covers 13:45→15:00 gap
+
                     # 檢查是否有異常間隔
-                    if max_gap > 30:  # 最大允許30分鐘缺口
+                    if max_gap > max_allowed_gap:
                         return False, f"資料缺口過大: {max_gap:.0f}分鐘"
                     
                     # 檢查間隔是否一致（應為5分鐘）
-                    if abs(min_gap - 5) > 1 or abs(max_gap - 5) > 1:
+                    # BUG FIX 2026-04-13: Shioaji kbars() returns 1-min bars at night.
+                    # Don't reject 1-min data during night sessions.
+                    import datetime as _dt2
+                    is_night2 = _dt2.datetime.now().hour >= 15 or _dt2.datetime.now().hour < 5
+                    if not is_night2 and (abs(min_gap - 5) > 1 or abs(max_gap - 5) > 1):
                         console.print(f"[dim]⚠️ Kbar間隔異常: min={min_gap:.1f}min, max={max_gap:.1f}min[/dim]")
         
         # 檢查價格有效性
@@ -1055,17 +1070,17 @@ class ShioajiOptionsSmartMonitor:
         for col in required_columns:
             if col not in df.columns:
                 return False, f"缺少必要欄位: {col}"
-            
+
             # 檢查是否有NaN值
             nan_count = df[col].isna().sum()
             if nan_count > 0:
                 return False, f"欄位 {col} 有 {nan_count} 個NaN值"
-            
+
             # 檢查價格合理性
             if col in ["Open", "High", "Low", "Close"]:
                 if (df[col] <= 0).any():
                     return False, f"欄位 {col} 有非正數值"
-        
+
         return True, "資料完整"
 
     def _fill_small_kbar_gaps(self, df, max_gap_minutes=15):
@@ -1296,6 +1311,10 @@ class ShioajiOptionsSmartMonitor:
 
         if df5_raw is not None:
             console.print(f"[debug] Raw bars: {len(df5_raw)} rows, from {df5_raw.index[0]} to {df5_raw.index[-1]}")
+            # DEBUG: Check time intervals
+            diffs = df5_raw.index.to_series().diff().dropna()
+            if len(diffs) > 0:
+                console.print(f"[debug] Intervals: min={diffs.min()}, median={diffs.median()}, max={diffs.max()}")
 
         # BUG FIX 2026-04-13: Lower bar requirement for night sessions.
         # At session start (15:00), only a few bars exist. 30 is too strict.

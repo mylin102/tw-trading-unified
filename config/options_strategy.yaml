@@ -74,7 +74,7 @@ risk_mgmt:
   max_positions: 2
   initial_capital: 40000
   max_holding_days: 7
-  min_dte_to_exit: 3
+  min_dte_to_exit: 0.5
   entry_premium_limit: 250
   opening_grace_mins: 5
   max_position_size: 0.05
