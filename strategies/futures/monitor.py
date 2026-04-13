@@ -852,7 +852,7 @@ class FuturesMonitor:
             return None
         # 信號成功執行，記錄審計軌跡
         from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
-        save_signal_audit({"timestamp": ts, "signal": signal, "price": price, "reason": reason or "", "rejection": "", "lots": lots, "result": result})
+        save_signal_audit({"timestamp": ts, "signal": signal, "price": price, "reason": reason or "", "rejection": "", "lots": lots})
         save_trade({"type": signal, "timestamp": ts, "price": price, "lots": lots,
                     "direction": direction, "pnl_pts": round(pnl_pts, 1),
                     "pnl_cash": round(pnl_cash, 0), "friction_cost": round(friction_cost, 0),
@@ -1066,10 +1066,10 @@ class FuturesMonitor:
             console.print(f"[cyan][FuturesMonitor] Fetching kbars for contract={self.contract.code}, date={date_str}[/cyan]")
             bars = self.api.kbars(self.contract, start=date_str, end=date_str)
             self._last_kbars_fetch_at = now_ts
-            console.print(f"[green][FuturesMonitor] Successfully fetched {len(bars) if bars else 0} kbars[/green]")
             
             # 轉換為DataFrame
             frame = pd.DataFrame({**bars})
+            console.print(f"[green][FuturesMonitor] Successfully fetched {len(frame) if not frame.empty else 0} kbars[/green]")
             if frame.empty or "ts" not in frame.columns:
                 return None
             
