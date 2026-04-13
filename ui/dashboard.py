@@ -1048,7 +1048,13 @@ with tab_overview:
         if ol is not None and not ol.empty and "Timestamp" in ol.columns:
             ol["Timestamp"] = pd.to_datetime(ol["Timestamp"], errors="coerce")
             ol = ol.dropna(subset=["Timestamp"])
-            today_l = ol[ol["Timestamp"].dt.strftime("%Y%m%d") == DATE_STR]
+            
+            # 使用交易日邏輯，而不是日曆日
+            from core.date_utils import get_trading_day
+            ol["TradingDay"] = ol["Timestamp"].apply(lambda x: get_trading_day(x).strftime("%Y%m%d"))
+            
+            # 比較交易日，而不是日曆日
+            today_l = ol[ol["TradingDay"] == DATE_STR]
             entries = today_l[today_l["Action"].str.contains("ENTRY", na=False)]
             st.write(f"今日進場: {len(entries)} 筆")
         else:
@@ -1651,10 +1657,12 @@ with tab_pipeline:
         audit_file = audit_dir / f"TMF_{today_str}_signals_audit.csv"
 
         if audit_file.exists():
-            df_audit = pd.read_csv(audit_file)
-            if "signal" not in df_audit.columns:
-                st.info("審計檔格式不符（缺少 signal 欄位）")
-            else:
+            try:
+                df_audit = pd.read_csv(audit_file, on_bad_lines='skip')
+            except Exception:
+                df_audit = pd.DataFrame()
+
+            if df_audit is not None and not df_audit.empty and "signal" in df_audit.columns:
                 df_hourly = df_audit[df_audit["signal"] == "HOURLY_AUDIT"]
 
                 if not df_hourly.empty:
