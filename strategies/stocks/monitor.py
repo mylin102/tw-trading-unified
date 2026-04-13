@@ -165,7 +165,7 @@ class StockMonitor:
         if not hasattr(self.api, 'trades'): return
         now = datetime.now()
         self.api.update_status()
-        
+
         # 檢查 api.trades 中屬於我們這個模式的單
         for trade in self.api.trades:
             if trade.contract.code in self.watchlist:
@@ -174,6 +174,36 @@ class StockMonitor:
                 if trade.status.status == sj.constant.OrderState.Submitted and (now - order_time).total_seconds() > 300:
                     console.print(f"[yellow]⏳ Order Timeout: Cancelling {trade.contract.code}...[/yellow]")
                     self.api.cancel_order(trade)
+
+    def cancel_all_pending_orders(self):
+        """BUG FIX 2026-04-13: Cancel ALL pending orders immediately.
+
+        Called at:
+        - 13:25 (end-of-day, before market close at 13:30)
+        - When switching LIVE → PAPER mode
+        Prevents odd-lot / ROD orders from filling after market hours (14:30).
+        """
+        if self.dry_run:
+            console.print("[yellow]🚨 [DRY-RUN] Would cancel all pending orders[/yellow]")
+            return
+
+        if not hasattr(self.api, 'trades'):
+            return
+
+        self.api.update_status()
+        cancelled = 0
+        for trade in self.api.trades:
+            if trade.contract.code in self.watchlist:
+                if trade.status.status == sj.constant.OrderState.Submitted:
+                    console.print(f"[yellow]🚨 EOD Cancel: {trade.contract.code} (status={trade.status.status})[/yellow]")
+                    try:
+                        self.api.cancel_order(trade)
+                        cancelled += 1
+                    except Exception as e:
+                        console.print(f"[red]❌ Failed to cancel {trade.contract.code}: {e}[/red]")
+
+        if cancelled > 0:
+            console.print(f"[bold red]🛑 Cancelled {cancelled} pending order(s) — preventing post-market fill[/bold red]")
 
     def _check_bear_defense(self):
         """大盤空頭防禦：EMA 濾網 + 單日虧損上限 + 連虧暫停"""
@@ -254,6 +284,10 @@ class StockMonitor:
                     console.print("[bold red]🚨 SAFETY OVERRIDE: Config changed to PAPER on disk! Blocking LIVE trade.[/bold red]")
                     self.live_trading = False
                     self.mode_tag = "PAPER"
+                    # BUG FIX 2026-04-13: Cancel ALL pending orders when switching LIVE→PAPER
+                    # Orders already placed remain in market queue — must cancel to prevent post-market fills
+                    console.print("[bold red]🛑 Cancelling ALL pending orders to prevent post-market execution[/bold red]")
+                    self.cancel_all_pending_orders()
                     # We also touch .restart to be safe
                     Path(ROOT / ".restart").touch()
                 return disk_live
@@ -281,8 +315,16 @@ class StockMonitor:
             console.print(f"[bold green]🍎 StockMonitor [{self.mode_tag}] Started | Strategy: {self.strat_name}[/bold green]")
 
         now = datetime.now()
+        # BUG FIX 2026-04-13: Cancel pending orders when trading window closes
         if now.hour < 9 or (now.hour == 13 and now.minute > 30) or now.hour >= 14:
+            # Only cancel once per session end (track with flag)
+            if not getattr(self, '_eod_cancelled_today', False):
+                self.cancel_all_pending_orders()
+                self._eod_cancelled_today = True
             return
+        else:
+            # Reset flag when a new trading day starts
+            self._eod_cancelled_today = False
 
         # Periodically refresh regime and scan
         if time.time() - self._loop_state["last_regime_check"] > 1800:
@@ -367,13 +409,16 @@ class StockMonitor:
         if ticker not in self.positions: return
         pos = self.positions[ticker]
         now = datetime.now()
-        
+
         # 第三招：13:20 只撤退虧損倉，獲利倉抱到 13:25 trailing stop
         if now.hour == 13 and now.minute >= 20:
             pnl_pct = (curr_price - pos["entry_price"]) / pos["entry_price"]
             if pnl_pct <= 0:
                 self.execute_trade(ticker, "SELL", curr_price, "ALL", "TIME_EXIT_LOSER")
             elif now.minute >= 25:
+                # BUG FIX 2026-04-13: Cancel ALL pending orders at 13:25
+                # Prevents ROD/Odd orders from filling at 14:30 post-market
+                self.cancel_all_pending_orders()
                 self.execute_trade(ticker, "SELL", curr_price, "ALL", "TIME_EXIT_FINAL")
             return
             
@@ -404,15 +449,17 @@ class StockMonitor:
                 qty = int(total_target // (price * 1.002)) - pos_qty
             
             if qty <= 0: return
-            
+
             # --- LIVE: 下單後等確認，才更新 position ---
             if self.mode_tag == "LIVE":
                 contract = self.api.Contracts.Stocks[ticker]
+                # POLICY 2026-04-13: Use IntradayOdd — trades during market hours (09:00-13:30),
+                # auto-expires at 13:30 if unfilled. NO post-market 14:30 fill risk.
                 order = self.api.Order(
                     price=price, quantity=qty, action=sj.constant.Action.Buy,
                     price_type=sj.constant.StockPriceType.LMT,
                     order_type=sj.constant.OrderType.ROD,
-                    order_lot=sj.constant.StockOrderLot.Odd
+                    order_lot=sj.constant.StockOrderLot.IntradayOdd
                 )
                 trade = self.api.place_order(contract, order)
                 # 等待委託回報確認 (最多 10 秒)
@@ -432,11 +479,12 @@ class StockMonitor:
             # --- LIVE: 下單後等確認，才更新 position ---
             if self.mode_tag == "LIVE":
                 contract = self.api.Contracts.Stocks[ticker]
+                # POLICY 2026-04-13: Use IntradayOdd — auto-expires at 13:30 if unfilled.
                 order = self.api.Order(
                     price=price, quantity=pos["qty"], action=sj.constant.Action.Sell,
                     price_type=sj.constant.StockPriceType.LMT,
                     order_type=sj.constant.OrderType.ROD,
-                    order_lot=sj.constant.StockOrderLot.Odd
+                    order_lot=sj.constant.StockOrderLot.IntradayOdd
                 )
                 trade = self.api.place_order(contract, order)
                 self.api.update_status()

@@ -15,7 +15,8 @@
 *   **Monitor (`strategies/stocks/monitor.py`)**:
     實時監控 Watchlist，緩存每日掃描結果，並在價格突破 Pivot 時執行交易。
 *   **Execution**:
-    下單時強制設定 `order_lot=sj.constant.StockOrderLot.Odd`，支援精確到「股」的自動交易。
+    下單時強制設定 `order_lot=sj.constant.StockOrderLot.IntradayOdd`（盤中零股）。
+    盤中 09:00-13:30 每 5 秒撮合一次，13:30 未成交自動失效，**不會排隊到 14:30 盤後**。
 
 ---
 
@@ -71,11 +72,11 @@ kbars = api.kbars(contract, start="YYYY-MM-DD")
 # 取得行情 (注意：最新版 API 可能不支援在 snapshots 帶 odd_lot 參數)
 snapshot = api.snapshots([contract])
 
-# 下單時指定零股屬性
+# 下單時指定盤中零股屬性
 order = api.Order(
     ...,
     quantity=shares, # 單位：股
-    order_lot=sj.constant.StockOrderLot.Odd
+    order_lot=sj.constant.StockOrderLot.IntradayOdd  # 盤中零股，13:30 自動失效
 )
 ```
 
