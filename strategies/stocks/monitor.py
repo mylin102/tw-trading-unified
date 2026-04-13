@@ -171,7 +171,7 @@ class StockMonitor:
             if trade.contract.code in self.watchlist:
                 # 如果是掛單中 (Submitted) 且超過 5 分鐘
                 order_time = datetime.fromtimestamp(trade.status.order_datetime)
-                if trade.status.status == sj.constant.OrderState.Submitted and (now - order_time).total_seconds() > 300:
+                if trade.status.status == sj.constant.Status.Submitted and (now - order_time).total_seconds() > 300:
                     console.print(f"[yellow]⏳ Order Timeout: Cancelling {trade.contract.code}...[/yellow]")
                     self.api.cancel_order(trade)
 
@@ -194,7 +194,7 @@ class StockMonitor:
         cancelled = 0
         for trade in self.api.trades:
             if trade.contract.code in self.watchlist:
-                if trade.status.status == sj.constant.OrderState.Submitted:
+                if trade.status.status == sj.constant.Status.Submitted:
                     console.print(f"[yellow]🚨 EOD Cancel: {trade.contract.code} (status={trade.status.status})[/yellow]")
                     try:
                         self.api.cancel_order(trade)
@@ -464,7 +464,7 @@ class StockMonitor:
                 trade = self.api.place_order(contract, order)
                 # 等待委託回報確認 (最多 10 秒)
                 self.api.update_status()
-                if trade.status.status != sj.constant.OrderState.Submitted and trade.status.status != sj.constant.OrderState.Filled:
+                if trade.status.status != sj.constant.Status.Submitted and trade.status.status != sj.constant.Status.Filled:
                     console.print(f"[red]❌ BUY {ticker} order rejected: {trade.status.status}[/red]")
                     return
 
@@ -488,7 +488,7 @@ class StockMonitor:
                 )
                 trade = self.api.place_order(contract, order)
                 self.api.update_status()
-                if trade.status.status != sj.constant.OrderState.Submitted and trade.status.status != sj.constant.OrderState.Filled:
+                if trade.status.status != sj.constant.Status.Submitted and trade.status.status != sj.constant.Status.Filled:
                     console.print(f"[red]❌ SELL {ticker} order rejected: {trade.status.status}[/red]")
                     return
 

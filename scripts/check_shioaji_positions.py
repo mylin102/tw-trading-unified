@@ -84,7 +84,7 @@ def check_positions():
             try:
                 code = t.contract.code if hasattr(t, 'contract') and hasattr(t.contract, 'code') else '?'
                 status = t.status.status if hasattr(t, 'status') else '?'
-                if status == sj.constant.OrderState.Submitted:
+                if status == sj.constant.Status.Submitted:
                     pending.append(t)
             except Exception:
                 continue

@@ -19,6 +19,9 @@ from core.shioaji_session import get_api, logout
 
 console = Console()
 
+# [P0 Fix] Connection state tracking via Shioaji event callback
+_connection_dropped = False
+
 BASE = os.path.dirname(__file__)
 RESTART_FLAG = Path(BASE) / ".restart"
 HEALTH_INTERVAL = 30  # seconds between health checks
@@ -143,6 +146,80 @@ def api_is_healthy(api):
     return False
 
 
+def _setup_event_callback(api, fm, om):
+    """[P0 Fix] Monitor Shioaji connection state via event callback.
+
+    Event codes:
+      12 = RECONNECTING_NOTICE (session dropped, reconnecting)
+      13 = RECONNECTED_NOTICE (reconnected successfully)
+      16 = SUBSCRIPTION_OK (subscription confirmed)
+      20 = REPUBLISH_UNACKED (unknown publisher flow — needs resubscribe)
+    """
+    global _connection_dropped
+
+    @api.quote.on_event
+    def event_cb(event_code, event):
+        global _connection_dropped
+
+        if event_code == 12:
+            console.print("[bold yellow]🔌 Shioaji 斷線！開始自動重連 (最多 50 次)...[/bold yellow]")
+            _connection_dropped = True
+
+        elif event_code == 13:
+            console.print("[bold green]✅ Shioaji 重連成功！恢復資料流[/bold green]")
+            _connection_dropped = False
+            # Re-subscribe to ensure data flow restoration
+            try:
+                if fm and fm.contract:
+                    api.quote.subscribe(fm.contract, quote_type='tick')
+                    console.print(f"[dim]📡 Re-subscribed TMF: {fm.contract.code}[/dim]")
+            except Exception as e:
+                console.print(f"[red]⚠️ Re-subscribe TMF failed: {e}[/red]")
+
+        elif event_code == 16:
+            console.print("[dim]📡 Shioaji 訂閱成功確認[/dim]")
+
+        elif event_code == 20:
+            console.print("[bold red]❌ Shioaji GD flow 失敗 — unknown publisher flow，需重新訂閱所有 contract[/bold red]")
+            _connection_dropped = True
+            # Force resubscribe all
+            try:
+                if fm and fm.contract:
+                    api.quote.subscribe(fm.contract, quote_type='tick')
+                if om:
+                    for key in ["MTX", "C", "P"]:
+                        con = om.monitor.active_contracts.get(key)
+                        if con:
+                            api.quote.subscribe(con, quote_type='tick')
+                            api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
+                console.print("[green]✅ 已完成全部 contract 重新訂閱[/green]")
+            except Exception as e:
+                console.print(f"[red]❌ 重新訂閱失敗: {e}[/red]")
+
+        else:
+            # Log other events at debug level
+            console.print(f"[dim]📋 Shioaji event: code={event_code}, event={event}[/dim]")
+
+
+def _resubscribe_all(api, fm, om):
+    """[P0 Fix] Helper to resubscribe all contracts after connection recovery."""
+    import shioaji as sj
+    try:
+        if fm and fm.contract:
+            api.quote.subscribe(fm.contract, quote_type='tick')
+            console.print(f"[green]📡 Re-subscribed TMF: {fm.contract.code}[/green]")
+
+        if om:
+            for key in ["MTX", "C", "P"]:
+                con = om.monitor.active_contracts.get(key)
+                if con:
+                    api.quote.subscribe(con, quote_type='tick')
+                    api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
+                    console.print(f"[green]📡 Re-subscribed {key}: {con.code}[/green]")
+    except Exception as e:
+        console.print(f"[red]❌ Resubscribe failed: {e}[/red]")
+
+
 def run_system(dry_run=False):
     """運行交易系統，遇到斷線或重啟請求時結束進程，由外部腳本重新拉起"""
     # 啟動時立即清除重啟旗標，避免循環重啟
@@ -193,6 +270,10 @@ def run_system(dry_run=False):
                     api.quote.subscribe(con, quote_type='tick')
                     api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
                     console.print(f"[green]📡 Subscribed {key}: {con.code} (tick+bidask)[/green]")
+
+            # [P0 Fix] Setup connection event monitoring
+            _setup_event_callback(api, fm, om)
+            console.print("[green]✅ Connection event callback registered[/green]")
 
         ft = threading.Thread(target=fm.run, name="futures", daemon=True)
         ot = threading.Thread(target=om.run, name="options", daemon=True)
