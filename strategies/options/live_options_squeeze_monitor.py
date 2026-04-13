@@ -1216,7 +1216,7 @@ class ShioajiOptionsSmartMonitor:
 
             # Attempt API fetch to get most recent bars
             bars = self._fetch_today_futures_bars()
-            if bars is not None and len(bars) >= 30:
+            if bars is not None and not bars.empty and len(bars) >= 30:
                 # [Wave 2 optimization] Convert pre-filled bars to deque format
                 for _, row in bars[["Open", "High", "Low", "Close", "Volume"]].iterrows():
                     bar_dict = {
@@ -1499,9 +1499,11 @@ class ShioajiOptionsSmartMonitor:
             
         if not self._paper_margin_check(entry_price):
             return
-        self.position = self.paper_lots
+        self.position += self.paper_lots
         self.active_side = side
-        self.entry_price = entry_price
+        # Average entry price for multiple positions
+        prev_cost = self.entry_price * (self.position - self.paper_lots) if self.position > self.paper_lots else 0
+        self.entry_price = (prev_cost + entry_price * self.paper_lots) / self.position if self.position > 0 else entry_price
         self.entry_mtx_price = signal["price_mtx"]
         self.entry_time = signal.get("timestamp") or self._current_strategy_time()
         self.has_tp1_hit = False
@@ -1737,19 +1739,21 @@ class ShioajiOptionsSmartMonitor:
                         current_qty = 0
                         last_side = None
                         last_entry_price = 0
+                        total_cost = 0
                         for i, r in enumerate(rows):
                             action = r.get("Action", "")
                             qty = int(r.get("Quantity", 0) or 0)
                             if "ENTRY" in action:
-                                current_qty = qty  # 進場設為該口數
+                                total_cost += float(r.get("Price", 0)) * qty
+                                current_qty += qty  # Accumulate for multi-position
                                 last_side = r.get("Side")
-                                last_entry_price = float(r.get("Price", 0))
+                                last_entry_price = total_cost / current_qty if current_qty > 0 else 0
                             elif "TP1" in action:
-                                # TP1 減碼: 從持倉減去該口數
                                 current_qty = max(0, current_qty - qty)
                             elif "EXIT" in action or "PANIC" in action or "TRAIL" in action or "TIME" in action or "REVERSAL" in action:
-                                current_qty = 0  # 完全出場
+                                current_qty = 0
                                 last_side = None
+                                total_cost = 0
 
                         if current_qty > 0 and last_side:
                             self.position = current_qty
@@ -1871,7 +1875,7 @@ class ShioajiOptionsSmartMonitor:
             if self.live_trading:
                 self.exit_live_position("LIVE_TP1_SUBMITTED", f"score={signal_score:.1f}", quantity=1)
             else:
-                self.position = 1
+                self.position = max(0, self.position - 1)  # Reduce by 1 lot
                 self.has_tp1_hit = True
                 self.replay_stats["tp1_hits"] += 1
                 self.log_trade(f"{self.status_mode_label()}_TP1", self.active_side, exit_price, f"score={signal_score:.1f}")
