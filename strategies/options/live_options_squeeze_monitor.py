@@ -233,7 +233,10 @@ class ShioajiOptionsSmartMonitor:
         self.ledger_path = log_base / "options_trade_ledger.csv"
 
     def load_config(self):
-        path = Path(__file__).parent / "config" / "options_strategy.yaml"
+        # BUG FIX 2026-04-14: Read from project root config (same file dashboard writes to)
+        # Was: Path(__file__).parent / "config" / "options_strategy.yaml"
+        project_root = Path(__file__).parent.parent.parent
+        path = project_root / "config" / "options_strategy.yaml"
         with open(path, 'r') as f:
             # Load strategy configuration
             return yaml.safe_load(f)

@@ -287,14 +287,20 @@ class StockMonitor:
                 current_cfg = yaml.safe_load(f)
                 disk_live = current_cfg.get("live_trading", False)
                 if self.live_trading and not disk_live:
+                    # LIVE → PAPER: block trading, cancel orders, trigger restart
                     console.print("[bold red]🚨 SAFETY OVERRIDE: Config changed to PAPER on disk! Blocking LIVE trade.[/bold red]")
                     self.live_trading = False
                     self.mode_tag = "PAPER"
-                    # BUG FIX 2026-04-13: Cancel ALL pending orders when switching LIVE→PAPER
-                    # Orders already placed remain in market queue — must cancel to prevent post-market fills
                     console.print("[bold red]🛑 Cancelling ALL pending orders to prevent post-market execution[/bold red]")
                     self.cancel_all_pending_orders()
-                    # We also touch .restart to be safe
+                    Path(ROOT / ".restart").touch()
+                elif not self.live_trading and disk_live:
+                    # PAPER → LIVE: promote to live mode, cancel any stale paper positions
+                    console.print("[bold yellow]⚠️ Config changed to LIVE on disk! Switching to LIVE mode.[/bold yellow]")
+                    self.live_trading = True
+                    self.mode_tag = "LIVE"
+                    console.print("[bold yellow]🛑 Cancelling ALL paper orders before going LIVE[/bold yellow]")
+                    self.cancel_all_pending_orders()
                     Path(ROOT / ".restart").touch()
                 return disk_live
         except Exception as e:
@@ -357,8 +363,10 @@ class StockMonitor:
                 # 1. Indicator Analysis
                 start_date = (now - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
                 kbars = self.api.kbars(contract, start=start_date)
-                if not kbars: continue
-                df = pd.DataFrame({**kbars})
+                try:
+                    df = pd.DataFrame({**kbars})
+                except Exception:
+                    continue
                 if df.empty: continue
                 df["ts"] = pd.to_datetime(df["ts"]); df = df.set_index("ts")
                 df.columns = [c.capitalize() if c.lower() in ["open", "high", "low", "close", "volume"] else c for c in df.columns]

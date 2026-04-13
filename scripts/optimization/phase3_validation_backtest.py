@@ -4,7 +4,7 @@ Phase 3: Validation Backtest
 Tests optimized config (merged from Phase 2 top 3 variants)
 against 90-day historical synthetic data before paper trading.
 
-Config: config/futures_optimized.yaml
+Config: config/futures.yaml
 Parameters:
   - cooldown_bars: 20 (from H5.3: 100% WR)
   - bb_length: 25 (from H1.2: 83.3% WR, 14.31x PF)
@@ -199,12 +199,12 @@ def run_phase3_validation():
     print("PHASE 3: VALIDATION BACKTEST")
     print("="*80)
     print(f"Time: {datetime.now().isoformat()}")
-    print(f"Config: config/futures_optimized.yaml")
+    print(f"Config: config/futures.yaml")
     print()
     
     # Load optimized config
     try:
-        with open(CONFIG_DIR / 'futures_optimized.yaml', 'r') as f:
+        with open(CONFIG_DIR / 'futures.yaml', 'r') as f:
             config = yaml.safe_load(f)
     except Exception as e:
         print(f"❌ Failed to load config: {e}")
@@ -292,7 +292,7 @@ def run_phase3_validation():
             print("Configuration validated. Ready to proceed with Phase 3 paper trading.")
             print()
             print("Next Steps:")
-            print("1. Start live paper trading with config/futures_optimized.yaml")
+            print("1. Start live paper trading with config/futures.yaml")
             print("2. Collect minimum 50 real trades over 1-2 weeks")
             print("3. Monitor: Win rate, PnL, execution quality")
             print("4. Gate: If 20%+ cumulative profit achieved → Phase 4 go-live")

@@ -244,7 +244,7 @@ def run_system(dry_run=False):
         from strategies.futures.monitor import FuturesMonitor
         fm = FuturesMonitor(
             api=api,
-            config_path=os.path.join(BASE, "config", "futures_optimized.yaml"),
+            config_path=os.path.join(BASE, "config", "futures.yaml"),
             dry_run=dry_run,
         )
         fm.setup()
@@ -311,7 +311,7 @@ def run_system(dry_run=False):
                     from strategies.futures.monitor import FuturesMonitor
                     fm = FuturesMonitor(
                         api=api,
-                        config_path=os.path.join(BASE, "config", "futures_optimized.yaml"),
+                        config_path=os.path.join(BASE, "config", "futures.yaml"),
                         dry_run=dry_run,
                     )
                     fm.setup()

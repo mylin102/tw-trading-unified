@@ -1,3 +1,4 @@
+active_strategy: spring_upthrust
 cooldown_bars: 5
 execution:
   broker_fee_per_side: 20.0

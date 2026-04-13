@@ -84,7 +84,7 @@ def display_status(trades: pd.DataFrame):
     print("PHASE 3 PAPER TRADING MONITOR")
     print("="*80)
     print(f"Time: {datetime.now().isoformat()}")
-    print(f"Config: config/futures_optimized.yaml")
+    print(f"Config: config/futures.yaml")
     print()
     
     # Current metrics

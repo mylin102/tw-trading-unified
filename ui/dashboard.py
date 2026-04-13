@@ -1857,7 +1857,7 @@ with tab_settings:
 
             if st.form_submit_button("💾 儲存並重啟選擇權模組"):
                 options_cfg["live_trading"] = o_live_new
-                options_cfg["mode"] = o_mode_new
+                options_cfg["active_mode"] = o_mode_new
                 options_cfg["entry_score"] = o_score
                 options_cfg["strategy"]["fire_score_threshold"] = o_fire_thresh
                 options_cfg["min_iv"] = o_min_iv
