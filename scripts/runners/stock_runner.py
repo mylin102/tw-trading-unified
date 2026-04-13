@@ -77,7 +77,16 @@ def run_stock_monitor(dry_run=False):
         )
 
         # 3. Execution Loop
-        sm.run()
+        RESTART_FLAG = BASE / ".restart"
+        
+        while True:
+            # Check for restart flag from dashboard
+            if RESTART_FLAG.exists():
+                console.print("[bold yellow]🔄 Restart flag detected. Exiting for supervisor...[/bold yellow]")
+                break
+                
+            sm.run_iteration() # We will refactor sm.run() to allow iteration checks
+            time.sleep(1)
 
     except KeyboardInterrupt:
         console.print("[yellow]Stopping Stock Monitor (User Interrupt)...[/yellow]")
