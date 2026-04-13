@@ -369,6 +369,30 @@ class FuturesMonitor:
                 combined.to_csv(csv_path)
                 console.print(f"[green][FuturesMonitor] ✅ Backfill complete: {len(combined)} total bars in CSV[/green]")
 
+    def _check_futures_contract_staleness(self):
+        """[Wave 1 Fix] Check if TMF ticks are stale and attempt recovery."""
+        if self.dry_run or not self.api:
+            return
+        
+        secs_since_tick = time.time() - self.last_tick_at
+        if secs_since_tick < 120:  # 2 min threshold
+            return
+            
+        console.print(f"[yellow]⚠️ TMF data stale for {secs_since_tick/60:.1f} min, checking contract...[/yellow]")
+        
+        # Check for expiry/rollover
+        today_str = datetime.now().strftime("%Y/%m/%d")
+        if self.contract and self.contract.delivery_date < today_str:
+            console.print(f"[yellow]⚠️ TMF contract {self.contract.code} expired (delivery: {self.contract.delivery_date})[/yellow]")
+            self._check_contract_rollover()
+            return
+
+        # If contract valid but no ticks, could be session transition or connection drop
+        # We attempt a light re-subscription via rollover logic
+        self._check_contract_rollover()
+        # Reset timer to avoid spamming
+        self.last_tick_at = time.time()
+
     def _check_contract_rollover(self):
         """[GSD Fix] Check if TMF contract has rolled over and re-subscribe if needed."""
         if not self.api or self.dry_run or not self.contract:
@@ -1092,6 +1116,10 @@ class FuturesMonitor:
         console.print(f"[green][FuturesMonitor] started ({mode})[/green]")
 
         while self._running:
+            # [Wave 1 Fix] Check for restart flag from dashboard
+            if os.path.exists(".restart"):
+                console.print("[bold yellow]🔄 Restart flag detected. Exiting Futures Monitor for supervisor...[/bold yellow]")
+                break
             try:
                 self._strategy_tick()
             except Exception as e:
@@ -1122,10 +1150,10 @@ class FuturesMonitor:
                 self.on_tick(None, mock_tick)
 
         # 市場時間檢查
+        from core.date_utils import is_day_session, is_night_session
         now = datetime.now()
-        h = now.hour
-        is_day = 8 <= h < 14
-        is_night = h >= 15 or h < 5
+        is_day = is_day_session(now)
+        is_night = is_night_session(now)
 
         # 在 dry_run 模式下跳過時間檢查，方便測試
         if not self.dry_run and not (is_day or is_night):
@@ -1133,10 +1161,7 @@ class FuturesMonitor:
 
         # [Bug Fix] Check data freshness and attempt reconnection
         if not self.dry_run:
-            secs_since_tick = time.time() - self.last_tick_at
-            if secs_since_tick > 120:  # 2 minutes without tick
-                console.print(f"[yellow]⚠️ TMF data stale for {secs_since_tick/60:.1f} min, checking contract...[/yellow]")
-                self._check_contract_rollover()
+            self._check_futures_contract_staleness()
 
         # 1. Fetch multi-timeframe data (使用選擇權系統的方法)
         processed = {}

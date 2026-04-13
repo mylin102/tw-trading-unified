@@ -253,27 +253,15 @@ class ShioajiOptionsSmartMonitor:
         return datetime.datetime.now()
 
     def _is_market_open(self, current_time):
-        """檢查市場是否開盤 (支援日盤 + 夜盤)"""
-        now_minutes = self._minutes_since_midnight(current_time)
-        
-        # 日盤：08:45 - 13:45
-        day_open = 8 * 60 + 45    # 08:45
-        day_close = 13 * 60 + 45  # 13:45
-        
-        # 夜盤：15:00 - 05:00 (隔天)
-        night_open = 15 * 60      # 15:00
-        night_close = 5 * 60      # 05:00
-        
-        # 檢查是否為日盤
-        if day_open <= now_minutes <= day_close:
+        """檢查市場是否開盤 (支援日盤 + 夜盤) - Wave 1 unified logic"""
+        from core.date_utils import is_day_session, is_night_session
+
+        if is_day_session(current_time):
             return True, "day"
-        
-        # 檢查是否為夜盤 (跨日)
-        if now_minutes >= night_open or now_minutes <= night_close:
+        if is_night_session(current_time):
             return True, "night"
-        
+
         return False, "closed"
-    
     def _eod_state(self, current_time):
         # 夜盤用 force_close 時間，日盤用 eod_panic_time
         h = current_time.hour
@@ -2023,7 +2011,13 @@ class ShioajiOptionsSmartMonitor:
             console.print("[green]Paper mode active. Entries and exits will be simulated in the trade ledger.[/green]")
         self.print_status_summary(force=True)
         try:
-            while True:
+            self._running = True
+            while self._running:
+                # [Wave 1 Fix] Check for restart flag from dashboard
+                if os.path.exists(".restart"):
+                    console.print("[bold yellow]🔄 Restart flag detected. Exiting Options Monitor for supervisor...[/bold yellow]")
+                    break
+
                 if self.dry_run and self.run_once:
                     self.run_strategy_logic()
                     console.print("[bold green]Dry run completed one strategy iteration.[/bold green]")

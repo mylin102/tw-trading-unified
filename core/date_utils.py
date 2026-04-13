@@ -130,46 +130,40 @@ def get_trading_day(dt: Union[datetime, pd.Timestamp, pd.DatetimeIndex, pd.Serie
 
 def get_session(dt: Union[datetime, pd.Timestamp]):
     """
-    判斷盤別：1=日盤 (08:45-13:45), 2=夜盤 (15:00-05:00)
+    判斷盤別：1=日盤 (08:00-14:59), 2=夜盤 (15:00-07:59)
     GSD: Only supports scalar input.
     """
     # GSD: Absolute type safety check
     if hasattr(dt, "dt"): # Series
-        return 2 if ((dt.dt.hour >= 15) | (dt.dt.hour < 8)).any() else 1
+        # Vectorized check via apply if it's a Series to guarantee scalar logic parity
+        return dt.apply(get_session)
     
     if not hasattr(dt, "hour"):
-        # Not a timestamp object, try converting
         try:
             dt = pd.to_datetime(dt)
         except:
-            return 1 # Default to Day
+            return 1
             
     hour = dt.hour
-    if hour >= 15 or hour < 8:
-        return 2  # Night
-    return 1  # Day
+    
+    # 依據測試期待：08:00 ~ 14:59 為日盤
+    if 8 <= hour < 15:
+        return 1
+    # 其餘為夜盤
+    return 2
 
 def is_night_session(dt: Union[datetime, pd.Timestamp, pd.DatetimeIndex, pd.Series]) -> Union[bool, pd.Series]:
-    # GSD: Robust attribute check for pandas objects
     if isinstance(dt, pd.Series):
-        dt = pd.to_datetime(dt, errors="coerce")
-        return (dt.dt.hour >= 15) | (dt.dt.hour < 8)
-    if hasattr(dt, "dt"):
-        return (dt.dt.hour >= 15) | (dt.dt.hour < 8)
-    if hasattr(dt, "hour") and not isinstance(dt, (datetime, pd.Timestamp)):
-        # Likely DatetimeIndex or similar
-        return (dt.hour >= 15) | (dt.hour < 8)
-    # Scalar fallback
+        return dt.apply(lambda x: get_session(x) == 2)
+    if isinstance(dt, pd.DatetimeIndex):
+        return pd.Series([get_session(x) == 2 for x in dt], index=dt)
     return get_session(dt) == 2
 
 def is_day_session(dt: Union[datetime, pd.Timestamp, pd.DatetimeIndex, pd.Series]) -> Union[bool, pd.Series]:
     if isinstance(dt, pd.Series):
-        dt = pd.to_datetime(dt, errors="coerce")
-        return (dt.dt.hour >= 8) & (dt.dt.hour < 15)
-    if hasattr(dt, "dt"):
-        return (dt.dt.hour >= 8) & (dt.dt.hour < 15)
-    if hasattr(dt, "hour") and not isinstance(dt, (datetime, pd.Timestamp)):
-        return (dt.hour >= 8) & (dt.hour < 15)
+        return dt.apply(lambda x: get_session(x) == 1)
+    if isinstance(dt, pd.DatetimeIndex):
+        return pd.Series([get_session(x) == 1 for x in dt], index=dt)
     return get_session(dt) == 1
 
 def get_session_date_str(dt=None):
