@@ -1050,8 +1050,8 @@ with tab_overview:
             ol = ol.dropna(subset=["Timestamp"])
             
             # 使用交易日邏輯，而不是日曆日
-            from core.date_utils import get_trading_day
-            ol["TradingDay"] = ol["Timestamp"].apply(lambda x: get_trading_day(x).strftime("%Y%m%d"))
+            from core.date_utils import get_trade_day
+            ol["TradingDay"] = ol["Timestamp"].apply(lambda x: get_trade_day(x).strftime("%Y%m%d"))
             
             # 比較交易日，而不是日曆日
             today_l = ol[ol["TradingDay"] == DATE_STR]
@@ -1792,7 +1792,7 @@ with tab_settings:
 
             if st.form_submit_button("💾 儲存並重啟期貨模組"):
                 futures_cfg["live_trading"] = f_live_new
-                futures_cfg["active_strategy"] = f_strat_new
+                futures_cfg["strategy"]["active_strategy"] = f_strat_new
                 futures_cfg["strategy"]["regime_filter"] = f_regime
                 futures_cfg["strategy"]["entry_score"] = f_score
                 futures_cfg["risk_mgmt"]["atr_multiplier"] = f_atr
