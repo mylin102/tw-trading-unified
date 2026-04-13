@@ -984,9 +984,12 @@ class ShioajiOptionsSmartMonitor:
             return None
 
         today = datetime.datetime.now()
-        if today.hour < 5:
-            today = today - datetime.timedelta(days=1)
-        date_str = today.strftime("%Y-%m-%d")
+        # BUG FIX 2026-04-13: Use get_trading_day() for correct night session date.
+        # At 18:00 on 4/13, trading day is 4/14 (15:00+ belongs to next trading day).
+        # Without this, kbars fetches yesterday's data → validation fails → all indicators None.
+        from core.date_utils import get_trading_day
+        trade_date = get_trading_day(today)
+        date_str = trade_date.strftime("%Y-%m-%d")
         try:
             bars = self.api.kbars(self.active_contracts["MTX"], start=date_str, end=date_str)
             self.last_kbars_fetch_at = now_ts
@@ -1290,13 +1293,18 @@ class ShioajiOptionsSmartMonitor:
             console.print("[red]✗ 無法獲取有效的kbar資料，跳過信號生成[/red]")
             self.record_signal_snapshot(None)
             return None
-            
+
         if df5_raw is not None:
             console.print(f"[debug] Raw bars: {len(df5_raw)} rows, from {df5_raw.index[0]} to {df5_raw.index[-1]}")
-            
-        min_bars = max(30, self.strategy_cfg.get("length", 20) + 5)
+
+        # BUG FIX 2026-04-13: Lower bar requirement for night sessions.
+        # At session start (15:00), only a few bars exist. 30 is too strict.
+        # Use 10 for night session (15:00-05:00), 30 for day session.
+        from core.date_utils import is_night_session
+        is_night = is_night_session(datetime.datetime.now())
+        min_bars = 10 if is_night else max(30, self.strategy_cfg.get("length", 20) + 5)
         if len(df5_raw) < min_bars:
-            # Still not enough for full indicators, but maybe enough for a partial snapshot
+            console.print(f"[yellow]⚠️ Not enough bars for indicators: {len(df5_raw)} < {min_bars} (night={is_night})[/yellow]")
             self.record_signal_snapshot(None)
             return None
 
