@@ -110,7 +110,7 @@ def check_password():
     }, 100);
     </script>
     """, unsafe_allow_html=True)
-    if pwd == os.environ.get("DASHBOARD_PASSWORD", "trading2026"):
+    if pwd == os.environ.get("DASHBOARD_PASSWORD", "5888"):
         st.session_state["authenticated"] = True
         st.rerun()
     elif pwd:
@@ -1647,7 +1647,7 @@ with tab_pipeline:
     try:
         from pathlib import Path
         audit_dir = Path("logs/market_data")
-        today_str = datetime.now().strftime("%Y%m%d")
+        today_str = datetime.datetime.now().strftime("%Y%m%d")
         audit_file = audit_dir / f"TMF_{today_str}_signals_audit.csv"
 
         if audit_file.exists():
@@ -1871,7 +1871,7 @@ with tab_settings:
         if st.button("🔄 同步 Squeeze Screener 推薦名單"):
             try:
                 import subprocess
-                subprocess.run(["python3", "scripts/sync/sync_watchlist.py"], check=True)
+                subprocess.run(["python3", "scripts/sync/sync_watchlist.py"], check=True, timeout=30)
                 st.success("同步成功！")
                 st.rerun()
             except Exception as e:

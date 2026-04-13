@@ -5,7 +5,9 @@ import os
 
 # --- 路徑設定 ---
 ROOT = Path(__file__).parent.parent.parent
-RECOMMENDATIONS_PATH = Path("/Users/mylin/Documents/mylin102/squeeze-tw-screener/recommendations.csv")
+# 使用相對路徑，避免絕對路徑問題
+SCREENER_ROOT = ROOT.parent / "squeeze-tw-screener"
+RECOMMENDATIONS_PATH = SCREENER_ROOT / "recommendations.csv"
 STOCKS_CFG_PATH = ROOT / "config" / "stocks.yaml"
 
 def sync():

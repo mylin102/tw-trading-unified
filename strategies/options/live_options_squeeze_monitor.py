@@ -1012,7 +1012,169 @@ class ShioajiOptionsSmartMonitor:
         if not required.issubset(frame.columns):
             return None
         frame = frame.set_index("ts")[["Open", "High", "Low", "Close", "Volume"]].sort_index()
+        
+        # [DATA GAP FIX] 驗證並填充資料缺口
+        frame = self._validate_and_fill_kbar_gaps(frame)
+        
         return frame
+
+    def _validate_kbar_data(self, df):
+        """驗證kbar資料完整性
+        
+        Args:
+            df: pandas DataFrame with datetime index
+            
+        Returns:
+            tuple: (is_valid, message)
+        """
+        if df is None or df.empty:
+            return False, "資料為空"
+        
+        # 檢查最少kbar數量
+        min_bars_required = 30
+        if len(df) < min_bars_required:
+            return False, f"資料不足: {len(df)}根 < {min_bars_required}根"
+        
+        # 檢查時間間隔連續性
+        if len(df) > 1:
+            time_diffs = df.index.to_series().diff().dt.total_seconds() / 60  # 轉換為分鐘
+            
+            # 跳過第一個NaN值
+            if len(time_diffs) > 1:
+                valid_diffs = time_diffs.iloc[1:].dropna()
+                if len(valid_diffs) > 0:
+                    max_gap = valid_diffs.max()
+                    min_gap = valid_diffs.min()
+                    
+                    # 檢查是否有異常間隔
+                    if max_gap > 30:  # 最大允許30分鐘缺口
+                        return False, f"資料缺口過大: {max_gap:.0f}分鐘"
+                    
+                    # 檢查間隔是否一致（應為5分鐘）
+                    if abs(min_gap - 5) > 1 or abs(max_gap - 5) > 1:
+                        console.print(f"[dim]⚠️ Kbar間隔異常: min={min_gap:.1f}min, max={max_gap:.1f}min[/dim]")
+        
+        # 檢查價格有效性
+        required_columns = ["Open", "High", "Low", "Close", "Volume"]
+        for col in required_columns:
+            if col not in df.columns:
+                return False, f"缺少必要欄位: {col}"
+            
+            # 檢查是否有NaN值
+            nan_count = df[col].isna().sum()
+            if nan_count > 0:
+                return False, f"欄位 {col} 有 {nan_count} 個NaN值"
+            
+            # 檢查價格合理性
+            if col in ["Open", "High", "Low", "Close"]:
+                if (df[col] <= 0).any():
+                    return False, f"欄位 {col} 有非正數值"
+        
+        return True, "資料完整"
+
+    def _fill_small_kbar_gaps(self, df, max_gap_minutes=15):
+        """填充小間隔的kbar資料缺口
+        
+        Args:
+            df: pandas DataFrame with datetime index
+            max_gap_minutes: 最大允許填充的缺口大小（分鐘）
+            
+        Returns:
+            pandas DataFrame: 填充後的資料
+        """
+        if df is None or df.empty or len(df) < 2:
+            return df
+        
+        try:
+            # 確保索引是DatetimeIndex且已排序
+            df = df.sort_index()
+            
+            # 計算時間間隔
+            time_diffs = df.index.to_series().diff().dt.total_seconds() / 60
+            
+            if len(time_diffs) > 1:
+                # 找到需要填充的缺口
+                gaps = []
+                for i in range(1, len(time_diffs)):
+                    gap = time_diffs.iloc[i]
+                    if gap > 5 and gap <= max_gap_minutes:  # 5分鐘是正常間隔
+                        prev_time = df.index[i-1]
+                        curr_time = df.index[i]
+                        gaps.append((prev_time, curr_time, gap))
+                
+                if gaps:
+                    console.print(f"[dim]🔧 發現 {len(gaps)} 個小資料缺口，進行填充...[/dim]")
+                    
+                    # 重新採樣到5分鐘頻率
+                    start_time = df.index[0]
+                    end_time = df.index[-1]
+                    
+                    # 創建完整的5分鐘時間索引
+                    full_index = pd.date_range(
+                        start=start_time.floor('5min'),
+                        end=end_time.ceil('5min'),
+                        freq='5min'
+                    )
+                    
+                    # 重新索引並填充
+                    df_reindexed = df.reindex(full_index)
+                    
+                    # 前向填充（最多填充3根kbar）
+                    fill_limit = min(3, max_gap_minutes // 5)
+                    df_filled = df_reindexed.ffill(limit=fill_limit)
+                    
+                    # 移除完全為NaN的行（無法填充的大缺口）
+                    df_filled = df_filled.dropna(how='all')
+                    
+                    console.print(f"[green]✓ 資料填充完成: {len(df)} -> {len(df_filled)} 根kbar[/green]")
+                    return df_filled
+            
+            return df
+            
+        except Exception as e:
+            console.print(f"[yellow]⚠️ 資料填充失敗: {e}[/yellow]")
+            return df
+
+    def _validate_and_fill_kbar_gaps(self, df):
+        """驗證並填充kbar資料缺口
+        
+        Args:
+            df: 原始kbar資料
+            
+        Returns:
+            處理後的kbar資料，如果驗證失敗則返回None
+        """
+        if df is None or df.empty:
+            return None
+        
+        # 第一步：驗證資料完整性
+        is_valid, msg = self._validate_kbar_data(df)
+        
+        if not is_valid:
+            console.print(f"[yellow]⚠️ Kbar資料驗證失敗: {msg}[/yellow]")
+            
+            # 嘗試填充小缺口後再驗證
+            df_filled = self._fill_small_kbar_gaps(df)
+            is_valid_filled, msg_filled = self._validate_kbar_data(df_filled)
+            
+            if is_valid_filled:
+                console.print(f"[green]✓ 資料填充後驗證通過[/green]")
+                return df_filled
+            else:
+                console.print(f"[red]✗ 資料填充後仍驗證失敗: {msg_filled}[/red]")
+                return None
+        
+        # 第二步：填充小缺口
+        df_filled = self._fill_small_kbar_gaps(df)
+        
+        # 第三步：最終驗證
+        is_final_valid, final_msg = self._validate_kbar_data(df_filled)
+        
+        if not is_final_valid:
+            console.print(f"[red]✗ 最終資料驗證失敗: {final_msg}[/red]")
+            return None
+        
+        return df_filled
 
     def pre_fill_bars(self):
         """Pre-fill tick bar buffer from kbars on startup."""
@@ -1022,7 +1184,13 @@ class ShioajiOptionsSmartMonitor:
             if csv_path.exists():
                 try:
                     df_hist = pd.read_csv(csv_path)
-                    df_hist["ts"] = pd.to_datetime(df_hist["ts"])
+                    # Handle both 'ts' and 'timestamp' column names
+                    if 'ts' in df_hist.columns:
+                        df_hist["ts"] = pd.to_datetime(df_hist["ts"])
+                    elif 'timestamp' in df_hist.columns:
+                        df_hist["ts"] = pd.to_datetime(df_hist["timestamp"])
+                    else:
+                        raise ValueError("CSV must have 'ts' or 'timestamp' column")
                     df_hist = df_hist.set_index("ts").sort_index()
                     df_warm = df_hist.tail(100)
                     for ts, row in df_warm.iterrows():
@@ -1099,12 +1267,34 @@ class ShioajiOptionsSmartMonitor:
         self.market_data["P"] = {"close": put_mid, "bid": put_mid - 1.0, "ask": put_mid + 1.0}
 
     def fetch_live_signal(self):
+        # [DATA GAP FIX] 獲取並驗證kbar資料
         df5_raw = self._fetch_today_futures_bars()
-        if df5_raw is None or len(df5_raw) < 2:
+        
+        # 如果API資料無效，嘗試備用資料源
+        if df5_raw is None:
+            console.print("[yellow]⚠️ API資料獲取失敗，嘗試備用資料源[/yellow]")
             df5_raw = self._get_tick_bars_fallback()
-            
+        
+        # 驗證資料完整性
+        if df5_raw is not None:
+            is_valid, msg = self._validate_kbar_data(df5_raw)
+            if not is_valid:
+                console.print(f"[yellow]⚠️ Kbar資料驗證失敗: {msg}[/yellow]")
+                
+                # 嘗試填充小缺口
+                df5_filled = self._fill_small_kbar_gaps(df5_raw)
+                is_valid_filled, msg_filled = self._validate_kbar_data(df5_filled)
+                
+                if is_valid_filled:
+                    console.print("[green]✓ 資料填充後驗證通過，使用填充後資料[/green]")
+                    df5_raw = df5_filled
+                else:
+                    console.print(f"[red]✗ 資料無法修復: {msg_filled}[/red]")
+                    df5_raw = None
+        
         if df5_raw is None or len(df5_raw) < 2:
             # GSD: Still record snapshot with current price even if bars are missing
+            console.print("[red]✗ 無法獲取有效的kbar資料，跳過信號生成[/red]")
             self.record_signal_snapshot(None)
             return None
             

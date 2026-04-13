@@ -241,13 +241,27 @@ while true; do
     if [ "$STALE_SECONDS" -gt 300 ]; then
         STATUS="${STATUS}[⚠️日誌停滯${STALE_SECONDS}s]"
     fi
-    
     if [ "$DISK_USAGE" -gt 90 ]; then
         STATUS="${STATUS}[🚨磁碟${DISK_USAGE}%]"
         # Emergency cleanup
         find "$LOG_DIR" -name "*.log" -size +100M -delete 2>/dev/null
     fi
-    
+
+    # --- Maintenance: Auto-Archive ---
+    MM=$(date +%M)
+    # Day Session Close: 13:45 ~ 14:15
+    # Night Session Close: 05:00 ~ 05:30
+    if { [ "$H" -eq 13 ] && [ "$MM" -ge 45 ]; } || { [ "$H" -eq 5 ] && [ "$MM" -le 15 ]; }; then
+        if [ ! -f "/tmp/archive.lock" ]; then
+            echo "[$(date)] 📦 執行每日自動歸檔 (Maintenance Window)..." >> "$LOG_DIR/unified.log"
+            $PYTHON_EXEC "$UNIFIED_DIR/scripts/maintenance/archive_daily_data.py" >> "$LOG_DIR/maintenance.log" 2>&1
+            touch "/tmp/archive.lock"
+            # Lock for 1 hour to prevent re-run within the same window
+            (sleep 3600 && rm -f "/tmp/archive.lock") &
+        fi
+    fi
+
+    # Heartbeat (every 30s)
     # Log status every 5 minutes (not every 30s)
     if [ $((now % 300)) -lt $HEALTH_CHECK_INTERVAL ]; then
         echo "[$(date)] 💓 狀態: $STATUS" >> "$LOG_DIR/unified.log"

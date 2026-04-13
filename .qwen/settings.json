@@ -80,7 +80,15 @@
       "Bash(fi)",
       "Bash(pip install *)",
       "Bash(pgrep *)",
-      "Bash(dmesg)"
+      "Bash(dmesg)",
+      "WebFetch(github.com)",
+      "Bash(git clone *)",
+      "Bash(pip3 install *)",
+      "Bash(uv *)",
+      "Bash(source *)",
+      "Bash(python *)",
+      "Bash(hermes *)",
+      "Bash(git reset *)"
     ]
   },
   "$version": 3

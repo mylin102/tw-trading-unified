@@ -238,6 +238,8 @@ class FuturesMonitor:
         except Exception as e:
             console.print(f"[dim][FuturesMonitor] Parquet warm-up failed: {e}[/dim]")
 
+        # 獲取TMF合約
+        try:
             tmf_list = list(self.api.Contracts.Futures.TMF)
             if tmf_list:
                 # Filter out expired or invalid
@@ -266,26 +268,57 @@ class FuturesMonitor:
         # [Bug Fix] Add contract rollover check
         self._last_contract_code = self.contract.code if self.contract else None
 
-        # Pre-fill from kbars if available
+        # Pre-fill from kbars if available (使用新的方法)
         try:
-            df = self.client.get_kline(self.ticker, interval="5m")
-            if not df.empty:
-                # Convert pre-filled bars to deque format
-                for _, row in df[["Open", "High", "Low", "Close", "Volume"]].iterrows():
-                    bar_dict = {
-                        "open": row["Open"],
-                        "high": row["High"],
-                        "low": row["Low"],
-                        "close": row["Close"],
-                        "volume": row["Volume"],
-                        "ts": row.name,  # DataFrame index is timestamp
-                    }
-                    self._tick_bars_deque.append(bar_dict)
-                self._tick_bars_cache = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-                console.print(f"[green][FuturesMonitor] pre-filled {len(self._tick_bars_deque)} bars from kbars[/green]")
+            # 首先嘗試使用新的方法獲取當天1分鐘K棒
+            df_1min = self._fetch_today_kbars()
+            if df_1min is not None and len(df_1min) >= 1:
+                # 重採樣為5分鐘K棒
+                df = df_1min.resample("5min").agg({
+                    "Open": "first",
+                    "High": "max",
+                    "Low": "min",
+                    "Close": "last",
+                    "Volume": "sum"
+                }).dropna()
                 
-                # [GSD Fix] Backfill night session gaps on startup
-                self._backfill_night_gaps(df)
+                if not df.empty:
+                    # Convert pre-filled bars to deque format
+                    for _, row in df[["Open", "High", "Low", "Close", "Volume"]].iterrows():
+                        bar_dict = {
+                            "open": row["Open"],
+                            "high": row["High"],
+                            "low": row["Low"],
+                            "close": row["Close"],
+                            "volume": row["Volume"],
+                            "ts": row.name,  # DataFrame index is timestamp
+                        }
+                        self._tick_bars_deque.append(bar_dict)
+                    self._tick_bars_cache = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+                    console.print(f"[green][FuturesMonitor] pre-filled {len(self._tick_bars_deque)} bars from today's 1min kbars[/green]")
+                    
+                    # [GSD Fix] Backfill night session gaps on startup
+                    self._backfill_night_gaps(df)
+            else:
+                # 如果新方法失敗，嘗試舊的get_kline方法
+                df = self.client.get_kline(self.ticker, interval="5m")
+                if not df.empty:
+                    # Convert pre-filled bars to deque format
+                    for _, row in df[["Open", "High", "Low", "Close", "Volume"]].iterrows():
+                        bar_dict = {
+                            "open": row["Open"],
+                            "high": row["High"],
+                            "low": row["Low"],
+                            "close": row["Close"],
+                            "volume": row["Volume"],
+                            "ts": row.name,  # DataFrame index is timestamp
+                        }
+                        self._tick_bars_deque.append(bar_dict)
+                    self._tick_bars_cache = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+                    console.print(f"[green][FuturesMonitor] pre-filled {len(self._tick_bars_deque)} bars from get_kline[/green]")
+                    
+                    # [GSD Fix] Backfill night session gaps on startup
+                    self._backfill_night_gaps(df)
         except Exception:
             pass
         return True
@@ -502,16 +535,18 @@ class FuturesMonitor:
           1. DATA_FAILURE → API down, stale data (alert)
           2. NO_VALID_SIGNALS → data OK, strategy found no signals (expected)
           3. COOLDOWN → strategy blocked by cooldown (expected)
+        
+        [ENHANCED] Also monitors trade records integrity and backups.
         """
         now_hour = timestamp.hour if hasattr(timestamp, "hour") else datetime.now().hour
         if now_hour == self._last_audit_hour:
             return  # Already audited this hour
         self._last_audit_hour = now_hour
-
+        
         bars_in_hour = self._bars_since_trade
         secs_since_tick = time.time() - self.last_tick_at
         data_stale = secs_since_tick > 120  # 2+ min without tick
-
+        
         # Diagnose
         if data_stale or df_5m is None or len(df_5m) < 30:
             verdict = "DATA_FAILURE"
@@ -528,7 +563,12 @@ class FuturesMonitor:
         else:
             verdict = "NORMAL"
             note = f"{self._signals_generated} signals, data healthy"
-
+        
+        # [ENHANCED] Monitor trade records integrity
+        trade_check_result = self._monitor_trade_records(timestamp)
+        if trade_check_result:
+            console.print(f"[green]✓ Trade records check: {trade_check_result}[/green]")
+        
         # Log audit
         from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
         save_signal_audit({
@@ -539,10 +579,147 @@ class FuturesMonitor:
             "rejection": note,
             "lots": 0,
         })
-
+        
         # Reset counters for next hour
         self._signals_generated = 0
         self._bars_since_trade = 0  # GAP-2 fix: reset bars counter too
+
+    def _monitor_trade_records(self, timestamp):
+        """
+        Monitor trade records integrity and perform hourly checks.
+        
+        Returns:
+            str: Summary of trade records status
+        """
+        try:
+            from pathlib import Path
+            import pandas as pd
+            from datetime import datetime, timedelta
+            
+            # Get current date for file naming
+            current_date = timestamp.strftime("%Y%m%d") if hasattr(timestamp, "strftime") else datetime.now().strftime("%Y%m%d")
+            
+            # Check futures trade records
+            futures_trade_file = Path(f"logs/market_data/TMF_{current_date}_trades.csv")
+            futures_audit_file = Path(f"logs/market_data/TMF_{current_date}_signals_audit.csv")
+            
+            # Check stock trade records
+            stock_trade_dir = Path("logs/stocks")
+            stock_trade_files = list(stock_trade_dir.glob("*_trades.csv")) if stock_trade_dir.exists() else []
+            
+            # Check options trade records
+            options_trade_file = Path(f"logs/market_data/TXO_{current_date}_trades.csv")
+            
+            results = []
+            
+            # 1. Check futures trade records
+            if futures_trade_file.exists():
+                try:
+                    df = pd.read_csv(futures_trade_file)
+                    futures_trades = len(df)
+                    results.append(f"Futures: {futures_trades} trades")
+                    
+                    # Check for recent trades (last hour)
+                    if 'timestamp' in df.columns:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                        recent_trades = df[df['timestamp'] > timestamp - timedelta(hours=1)]
+                        if len(recent_trades) > 0:
+                            results.append(f"  Recent: {len(recent_trades)} in last hour")
+                except Exception as e:
+                    results.append(f"Futures: Error reading ({str(e)[:50]})")
+            else:
+                results.append("Futures: No trade file")
+            
+            # 2. Check futures audit records
+            if futures_audit_file.exists():
+                try:
+                    df = pd.read_csv(futures_audit_file)
+                    audit_records = len(df)
+                    results.append(f"Audit: {audit_records} records")
+                except:
+                    results.append("Audit: Error reading")
+            
+            # 3. Check stock trade records
+            if stock_trade_files:
+                total_stock_trades = 0
+                for file in stock_trade_files:
+                    try:
+                        df = pd.read_csv(file)
+                        total_stock_trades += len(df)
+                    except:
+                        pass
+                results.append(f"Stocks: {total_stock_trades} trades in {len(stock_trade_files)} files")
+            
+            # 4. Check options trade records
+            if options_trade_file.exists():
+                try:
+                    df = pd.read_csv(options_trade_file)
+                    options_trades = len(df)
+                    results.append(f"Options: {options_trades} trades")
+                except:
+                    results.append("Options: Error reading")
+            
+            # 5. Backup check (create backup if needed)
+            self._backup_trade_records_if_needed(timestamp)
+            
+            return "; ".join(results)
+            
+        except Exception as e:
+            return f"Trade monitor error: {str(e)[:100]}"
+    
+    def _backup_trade_records_if_needed(self, timestamp):
+        """
+        Create backup of trade records if last backup was >6 hours ago.
+        """
+        try:
+            from pathlib import Path
+            import shutil
+            from datetime import datetime
+            
+            backup_dir = Path("logs/backups/trade_records")
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Check last backup time
+            backup_marker = backup_dir / "last_backup.txt"
+            should_backup = True
+            
+            if backup_marker.exists():
+                try:
+                    with open(backup_marker, 'r') as f:
+                        last_backup_str = f.read().strip()
+                        last_backup = datetime.strptime(last_backup_str, "%Y-%m-%d %H:%M:%S")
+                        hours_since = (datetime.now() - last_backup).total_seconds() / 3600
+                        should_backup = hours_since >= 6  # Backup every 6 hours
+                except:
+                    pass
+            
+            if should_backup:
+                # Backup futures trade records
+                current_date = timestamp.strftime("%Y%m%d") if hasattr(timestamp, "strftime") else datetime.now().strftime("%Y%m%d")
+                futures_trade_file = Path(f"logs/market_data/TMF_{current_date}_trades.csv")
+                futures_audit_file = Path(f"logs/market_data/TMF_{current_date}_signals_audit.csv")
+                
+                backup_files = []
+                
+                if futures_trade_file.exists():
+                    backup_path = backup_dir / f"TMF_{current_date}_trades_{timestamp.strftime('%H%M')}.csv"
+                    shutil.copy2(futures_trade_file, backup_path)
+                    backup_files.append("futures_trades")
+                
+                if futures_audit_file.exists():
+                    backup_path = backup_dir / f"TMF_{current_date}_audit_{timestamp.strftime('%H%M')}.csv"
+                    shutil.copy2(futures_audit_file, backup_path)
+                    backup_files.append("futures_audit")
+                
+                # Update backup marker
+                with open(backup_marker, 'w') as f:
+                    f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                
+                if backup_files:
+                    console.print(f"[dim]📂 Trade records backed up: {', '.join(backup_files)}[/dim]")
+                    
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Trade backup failed: {e}[/yellow]")
 
     # ── Margin check ──
     def _margin_sufficient(self):
@@ -840,6 +1017,62 @@ class FuturesMonitor:
             pd.DataFrame([data]).to_csv(path, index=False, header=True)
 
     # ── Main strategy loop ──
+
+    def _fetch_today_kbars(self):
+        """從API獲取當天的1分鐘K棒資料（類似選擇權系統的方法）"""
+        if self.dry_run or not self.api or not self.contract:
+            console.print(f"[yellow][FuturesMonitor] Cannot fetch kbars: dry_run={self.dry_run}, api={self.api is not None}, contract={self.contract}[/yellow]")
+            return None
+        
+        # 頻率限制：每2分鐘才調用一次API（更頻繁更新）
+        now_ts = time.time()
+        if hasattr(self, '_last_kbars_fetch_at') and now_ts - self._last_kbars_fetch_at < 120:
+            return None
+        
+        try:
+            # 獲取當天日期
+            today = datetime.now()
+            if today.hour < 5:  # 凌晨5點前算前一天
+                today = today - timedelta(days=1)
+            date_str = today.strftime("%Y-%m-%d")
+            
+            # 使用api.kbars獲取1分鐘K棒
+            console.print(f"[cyan][FuturesMonitor] Fetching kbars for contract={self.contract.code}, date={date_str}[/cyan]")
+            bars = self.api.kbars(self.contract, start=date_str, end=date_str)
+            self._last_kbars_fetch_at = now_ts
+            console.print(f"[green][FuturesMonitor] Successfully fetched {len(bars) if bars else 0} kbars[/green]")
+            
+            # 轉換為DataFrame
+            frame = pd.DataFrame({**bars})
+            if frame.empty or "ts" not in frame.columns:
+                return None
+            
+            # 處理時間戳
+            frame["ts"] = pd.to_datetime(frame["ts"])
+            frame = frame.set_index("ts")
+            
+            # 確保欄位名稱正確
+            column_map = {
+                "Open": "Open", "open": "Open",
+                "High": "High", "high": "High",
+                "Low": "Low", "low": "Low",
+                "Close": "Close", "close": "Close",
+                "Volume": "Volume", "volume": "Volume"
+            }
+            frame = frame.rename(columns=column_map)
+            
+            # 只保留需要的欄位
+            required_cols = ["Open", "High", "Low", "Close", "Volume"]
+            available_cols = [col for col in required_cols if col in frame.columns]
+            
+            if len(available_cols) < 4:  # 至少需要OHLC
+                return None
+            
+            return frame[available_cols].sort_index()
+            
+        except Exception as e:
+            console.print(f"[yellow][FuturesMonitor] Error fetching today kbars: {e}[/yellow]")
+            return None
     def run(self):
         self._running = True
         mode = "dry-run" if self.dry_run else ("LIVE" if self.live_trading else "PAPER")
@@ -905,27 +1138,54 @@ class FuturesMonitor:
                 console.print(f"[yellow]⚠️ TMF data stale for {secs_since_tick/60:.1f} min, checking contract...[/yellow]")
                 self._check_contract_rollover()
 
-        # 1. Fetch multi-timeframe data
+        # 1. Fetch multi-timeframe data (使用選擇權系統的方法)
         processed = {}
         if not self.dry_run:
-            # [gstack] 降低累積門檻，從 100 降到 30，只要能算出指標就顯示
-            # [Wave 2 optimization] Use lazy DF conversion from deque
-            df_base = self._get_tick_bars_df()
-            if len(df_base) >= 30:
-                processed["5m"] = calculate_futures_squeeze(df_base, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
-                
-                # Resample for higher timeframes
-                for tf, rule in [("15m", "15min"), ("1h", "1h")]:
-                    res = df_base.resample(rule).agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-                    if len(res) >= 20:
-                        processed[tf] = calculate_futures_squeeze(res, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+            # 首先嘗試從API獲取當天的1分鐘K棒資料
+            df_1min = self._fetch_today_kbars()
             
-            # 如果數據不足，才去調用 API
+            if df_1min is not None and len(df_1min) >= 1:
+                # 從1分鐘K棒重採樣為5分鐘K棒
+                df_5m = df_1min.resample("5min").agg({
+                    "Open": "first",
+                    "High": "max", 
+                    "Low": "min",
+                    "Close": "last",
+                    "Volume": "sum"
+                }).dropna()
+                
+                if len(df_5m) >= 2:
+                    processed["5m"] = calculate_futures_squeeze(df_5m, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+                    
+                    # 從1分鐘K棒重採樣為其他時間框架
+                    for tf, rule in [("15m", "15min"), ("1h", "1h")]:
+                        res = df_1min.resample(rule).agg({
+                            "Open": "first",
+                            "High": "max",
+                            "Low": "min", 
+                            "Close": "last",
+                            "Volume": "sum"
+                        }).dropna()
+                        if len(res) >= 2:
+                            processed[tf] = calculate_futures_squeeze(res, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+            
+            # 如果API資料不足，嘗試使用tick累積的資料
+            if "5m" not in processed:
+                df_base = self._get_tick_bars_df()
+                if len(df_base) >= 30:
+                    processed["5m"] = calculate_futures_squeeze(df_base, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+                    
+                    # Resample for higher timeframes
+                    for tf, rule in [("15m", "15min"), ("1h", "1h")]:
+                        res = df_base.resample(rule).agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
+                        if len(res) >= 20:
+                            processed[tf] = calculate_futures_squeeze(res, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+            
+            # 如果還是沒有資料，嘗試舊的get_kline方法作為fallback
             if "5m" not in processed:
                 try:
                     df = self.client.get_kline(self.ticker, interval="5m")
                     if not df.empty:
-                        # GSD: Always calculate indicators (will fill defaults if too short)
                         processed["5m"] = calculate_futures_squeeze(df, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
                 except Exception as e:
                     console.print(f"[yellow][FuturesMonitor] api.kbars failed: {e}[/yellow]")

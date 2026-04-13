@@ -3,6 +3,8 @@ Pluggable entry strategies for StockMonitor.
 Focuses on Odd-Lot specific behaviors like Mean Reversion and Arbitrage.
 """
 
+from strategies.stocks.multi_timeframe import analyze_market_condition, should_trade_based_on_tf
+
 def strategy_stock_mean_reversion(state, cfg):
     """均值回歸：跌破布林下軌買入，回升至中軌賣出。"""
     df = state["df_5m"]
@@ -44,6 +46,7 @@ def strategy_stock_momentum(state, cfg):
     if last_5m["Close"] > day_open * 1.02 and last_5m.get("is_new_high", False):
         return {"action": "BUY", "reason": "MOM_BREAKOUT_VOL", "stop_loss": last_5m["Close"] * 0.985}
     return None
+
 def strategy_stock_scout(state, cfg):
     """
     零股偵察兵 (防禦加強版)：
@@ -145,108 +148,69 @@ def strategy_ema_pullback(state, cfg):
     return None
 
 
-def strategy_fakeout_reversal(state, cfg):
-    """
-    假突破反向操作（Squeeze Fire Failure Counter-Trade）。
-    邏輯：壓縮釋放後價格未能延續方向，反向操作。
-    - Bullish fire (sqz_on→False + momentum>0) 但價格 < VWAP → 做空
-    - Bearish fire (sqz_on→False + momentum<0) 但價格 > VWAP → 做多
-
-    類似期貨 Counter-VWAP 策略，但適用於股票。
-    """
-    last = state["last_5m"]
-    df = state["df_5m"]
-    if len(df) < 5:
-        return None
-
-    prev = df.iloc[-2]
-    vwap = last.get("vwap", last["Close"])
-    close = last["Close"]
-    momentum = last.get("momentum", 0)
-    prev_momentum = prev.get("momentum", 0)
-
-    # 偵測 fire: 壓縮剛釋放
-    fired = last.get("fired", False)
-    was_squeezing = prev.get("sqz_on", False)
-    is_release = fired and was_squeezing
-
-    if not is_release:
-        return None
-
-    # Bullish fire 但價格在 VWAP 下方 → 反向做多 (bullish fire failure)
-    if momentum > 0 and prev_momentum <= 0 and close < vwap:
-        sl = close * (1 - cfg.get("stop_loss_pct", 0.03))
-        return {"action": "BUY", "reason": "FAKEOUT_BULL_FAILURE", "stop_loss": sl}
-
-    # Bearish fire 但價格在 VWAP 上方 → 反向做多 (bearish fire failure)
-    if momentum < 0 and prev_momentum >= 0 and close > vwap:
-        sl = close * (1 - cfg.get("stop_loss_pct", 0.03))
-        return {"action": "BUY", "reason": "FAKEOUT_BEAR_FAILURE", "stop_loss": sl}
-
-    return None
-
-
 def strategy_it_window_dressing(state, cfg):
     """
     投信作帳波段策略。
-    邏輯：投信連續 3 天買超 + 多頭排列 (Close > MA20 > MA60)。
-    這是一個典型的籌碼面濾網搭配趨勢面進場的策略。
+    條件：投信連三買 + 多頭排列 + 股價在月線之上。
+    邏輯：跟隨法人建倉波段，持股 3-5 天。
     """
     last_5m = state["last_5m"]
-    df_5m = state["df_5m"]
+    df = state["df_5m"]
 
-    if len(df_5m) < 60:  # 確保有足夠均線計算空間
-        return None
+    # 投信連三買
+    it_buy_3days = last_5m.get("it_buy_3days", False)
+    # 多頭排列
+    bullish_align = last_5m.get("bullish_align", False)
+    # 月線之上
+    above_monthly = last_5m.get("above_monthly", False)
 
-    # 1. 均線過濾 (均線通常在 scanner 中預先算出)
-    ma20 = last_5m.get("ma20", 0)
-    ma60 = last_5m.get("ma60", 0)
-    close = last_5m["Close"] if "Close" in last_5m else last_5m.get("close", 0)
-
-    if not (close > ma20 > ma60):
-        return None
-
-    # 2. 籌碼過濾 (動能代理)
-    # 優化：不再要求絕對連三根，改為過去 5 根中有 2 根符合機構買盤特徵
-    it_hits = last_5m.get("it_buy_rolling_count", 0)
-
-    if it_hits < 2:
-        return None
-
-    sl = close * (1 - cfg.get("stop_loss_pct", 0.05)) # 波段策略給予較大空間 5%
-    return {
-        "action": "BUY",
-        "reason": "IT_3DAY_BUY_BULLISH_ALIGN",
-        "stop_loss": sl
-    }
+    if it_buy_3days and bullish_align and above_monthly:
+        sl = last_5m["Close"] * (1 - cfg.get("stop_loss_pct", 0.03))
+        return {"action": "BUY", "reason": "IT_WINDOW_DRESSING", "stop_loss": sl}
+    return None
 
 
 def strategy_stock_canslim_breakout(state, cfg):
     """
-    CANSLIM 突破策略：
-    1. 形態確認：Scanner 已標註為 CUP_WITH_HANDLE 且有 pivot_price。
-    2. 價格突破：當前價格 > pivot_price。
-    3. 成交量爆發：當前成交量 > 20日均量 * 1.4 倍。
-    4. 大盤過濾：TMF 指標顯示非強空頭 (由 state 傳入)。
+    CANSLIM 突破策略 (P0 優化版)。
+    條件：
+    1. 型態：杯中帶把 (Cup with Handle) 或雙底 (Double Bottom)
+    2. 突破：帶量突破 Pivot 點 (成交量 ≥ 平均 1.5 倍)
+    3. 基本面：EPS 成長、營收成長、ROE > 15%
+    4. 大盤方向：大盤非空頭
     """
     last_5m = state["last_5m"]
     df = state["df_5m"]
-    pivot_price = state.get("pivot", 0.0)
-    
+
+    # 1. 型態確認
+    pattern = last_5m.get("pattern", "")
+    if pattern not in ["cup_with_handle", "double_bottom"]:
+        return None
+
+    # 2. 突破確認
+    pivot_price = last_5m.get("pivot_price", 0)
     if pivot_price <= 0:
         return None
 
-    # 1. 價格突破檢查
-    if last_5m["Close"] <= pivot_price:
-        return None
-
-    # 2. 成交量噴發檢查 (GSD: Volume Confirmation)
+    # 成交量確認 (帶量突破)
     vol_avg = df["Volume"].rolling(20).mean().iloc[-1]
-    vol_mult = cfg.get("stocks", {}).get("canslim", {}).get("volume_breakout_mult", 1.4)
-    if last_5m["Volume"] < vol_avg * vol_mult:
+    if vol_avg <= 0 or last_5m["Volume"] < vol_avg * 1.5:
         return None
 
-    # 3. 大盤方向過濾 (Market Direction - M)
+    # 價格突破確認
+    if last_5m["Close"] < pivot_price:
+        return None
+
+    # 3. 基本面過濾 (如果數據可用)
+    if cfg.get("stocks", {}).get("canslim", {}).get("fundamental_filter", True):
+        eps_growth = last_5m.get("eps_growth", 0)
+        revenue_growth = last_5m.get("revenue_growth", 0)
+        roe = last_5m.get("roe", 0)
+
+        if eps_growth < 0.2 or revenue_growth < 0.15 or roe < 15:
+            return None
+
+    # 4. 大盤方向過濾 (Market Direction - M)
     if cfg.get("stocks", {}).get("canslim", {}).get("market_direction_filter", True):
         if state.get("market_trend") == "BEAR":
             return None
@@ -256,6 +220,48 @@ def strategy_stock_canslim_breakout(state, cfg):
         "reason": f"CANSLIM_BREAKOUT_PIVOT_{pivot_price}", 
         "qty_mode": "MAIN",
         "stop_loss": pivot_price * 0.93  # 突破失敗止損設在 pivot 下方 7%
+    }
+
+def strategy_stock_mean_reversion_enhanced(state, cfg):
+    """
+    增強版均值回歸：結合多時間框架過濾器。
+    1. 基本條件：價格跌破布林下軌
+    2. 多時間框架過濾：檢查15分/60分趨勢一致性
+    3. 市場狀態過濾：排除空頭市場
+    """
+    # 1. 基本均值回歸條件
+    df = state["df_5m"]
+    if len(df) < 20:
+        return None
+    
+    last = df.iloc[-1]
+    if last["Close"] >= last.get("bb_lower", 0):
+        return None
+    
+    # 2. 多時間框架分析
+    market_analysis = analyze_market_condition(df)
+    if not market_analysis:
+        return None
+    
+    # 3. 檢查是否應該交易
+    should_trade, _ = should_trade_based_on_tf(df)
+    if not should_trade:
+        return None
+    
+    # 4. 計算停損
+    stop_loss = last["Close"] * 0.97
+    
+    return {
+        "action": "BUY",
+        "reason": f"BB_LOWER_BOUNCE_ENHANCED (market_state: {market_analysis['market_state']['primary_trend']})",
+        "stop_loss": stop_loss,
+        "metadata": {
+            "multi_timeframe_used": True,
+            "market_regime": market_analysis['market_state']['market_regime'],
+            "primary_trend": market_analysis['market_state']['primary_trend'],
+            "filters_passed": market_analysis['trading_recommendation'].get('filters_passed', 0),
+            "total_filters": market_analysis['trading_recommendation'].get('total_filters', 0)
+        }
     }
 
 STOCK_STRATEGIES = {
@@ -294,6 +300,10 @@ STOCK_STRATEGIES = {
     "ema_pullback": {
         "func": strategy_ema_pullback,
         "desc": "EMA回踩策略。多頭排列中回踩EMA slow，趨勢回調買入。"
+    },
+    "mean_reversion_enhanced": {
+        "func": strategy_stock_mean_reversion_enhanced,
+        "desc": "增強版均值回歸。結合多時間框架過濾器，避免逆勢交易，提高勝率。"
     },
     # fakeout_reversal: 已移除 — 期貨 PF=0.85, 台股 PnL=-3,593, 雙向皆虧損 (2026-04-08 回測)
 }

@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import timedelta
 import shioaji as sj
 from dotenv import load_dotenv
+import yaml
 
 # Ensure project root is in path
 ROOT = Path(__file__).parent.parent.parent

@@ -33,6 +33,7 @@ class MarketData:
     df_15m: Any | None = None                   # Recent 15m DataFrame
     timestamp: str = ""
     session: int = 0                            # 1=day, 2=night
+    regime: str = "NEUTRAL"                     # GSD: Added for Wave 19
 
 
 @dataclass(frozen=True)

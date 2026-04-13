@@ -2,21 +2,21 @@ live_trading: false
 stocks:
   watchlist:
   - '1590'
+  - '1708'
   - '2049'
-  - '2059'
-  - '2207'
   - '2233'
   - '2360'
-  - '2368'
-  - '3711'
-  - '4583'
-  - '4768'
-  - '1216'
-  - '1525'
-  - '1560'
-  - '1707'
-  - '2330'
-  strategy: mean_reversion
+  - '2630'
+  - '4912'
+  - '4949'
+  - '4979'
+  - '5246'
+  - '3030'
+  - '3034'
+  - '3149'
+  - '3406'
+  - '3416'
+  strategy: mean_reversion_enhanced
   total_portfolio_budget: 100000
   capital_per_trade: 20000
   entry_score: 20

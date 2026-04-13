@@ -48,7 +48,14 @@ class StrategyBase(ABC):
             "backtest_maxdd": 0.0,
             "market_regime": "all",
             "description": "",
+            "indicators": [],  # List of standard indicator names needed (e.g. ["squeeze", "atr"])
         }
+
+    def prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Optional hook to add custom columns to the OHLCV DataFrame 
+        before the backtest loop starts.
+        """
+        return df
 
     # ── Required Lifecycle Hooks ─────────────────────────────────────────
 

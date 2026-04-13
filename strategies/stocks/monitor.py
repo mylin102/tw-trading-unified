@@ -171,7 +171,7 @@ class StockMonitor:
             if trade.contract.code in self.watchlist:
                 # 如果是掛單中 (Submitted) 且超過 5 分鐘
                 order_time = datetime.fromtimestamp(trade.status.order_datetime)
-                if trade.status.status == sj.constant.OrderStatus.Submitted and (now - order_time).total_seconds() > 300:
+                if trade.status.status == sj.constant.OrderState.Submitted and (now - order_time).total_seconds() > 300:
                     console.print(f"[yellow]⏳ Order Timeout: Cancelling {trade.contract.code}...[/yellow]")
                     self.api.cancel_order(trade)
 
@@ -253,6 +253,7 @@ class StockMonitor:
 
         from strategies.stocks.entry_strategies import STOCK_STRATEGIES
         from strategies.options.options_engine.engine.indicators import calculate_stock_squeeze
+        from strategies.stocks.multi_timeframe import analyze_market_condition, should_trade_based_on_tf
         
         # 💡 GSD: Run initial scan before entering the loop
         self._run_daily_scan()
@@ -324,15 +325,43 @@ class StockMonitor:
                     # 💡 GSD: Include pattern info in state
                     scan_info = self.scan_results.get(ticker, {"pattern": "NONE", "pivot": 0.0})
                     
-                    state = {
-                        "last_5m": df.iloc[-1], "df_5m": df,
-                        "scout_stage": self.positions.get(ticker, {}).get("stage", "IDLE"),
-                        "scout_entry_price": self.positions.get(ticker, {}).get("entry_price", 0.0),
-                        "market_trend": "BEAR" if self.is_bear_market else "BULL",
-                        "is_bear_market": self.is_bear_market,
-                        "pattern": scan_info["pattern"],
-                        "pivot": scan_info["pivot"],
-                    }
+                    # P2優化：多時間框架確認
+                    try:
+                        tf_analysis = analyze_market_condition(df)
+                        should_trade, tf_details = should_trade_based_on_tf(df)
+                        
+                        # 如果多時間框架不允許交易，跳過策略執行
+                        if not should_trade:
+                            console.print(f"[yellow]⏸️ {ticker} 多時間框架過濾: {tf_details.get('trading_recommendation', {}).get('reason', 'TF_FILTER')}[/yellow]")
+                            continue
+                            
+                        state = {
+                            "last_5m": df.iloc[-1], "df_5m": df,
+                            "scout_stage": self.positions.get(ticker, {}).get("stage", "IDLE"),
+                            "scout_entry_price": self.positions.get(ticker, {}).get("entry_price", 0.0),
+                            "market_trend": "BEAR" if self.is_bear_market else "BULL",
+                            "is_bear_market": self.is_bear_market,
+                            "pattern": scan_info["pattern"],
+                            "pivot": scan_info["pivot"],
+                            "multi_timeframe": tf_analysis,
+                            "market_state": tf_analysis.get('market_state', {}),
+                            "tf_recommendation": tf_analysis.get('trading_recommendation', {}),
+                            "should_trade_tf": should_trade,
+                            "tf_details": tf_details
+                        }
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️ {ticker} 多時間框架分析錯誤: {e}[/yellow]")
+                        # 錯誤時使用原始state
+                        state = {
+                            "last_5m": df.iloc[-1], "df_5m": df,
+                            "scout_stage": self.positions.get(ticker, {}).get("stage", "IDLE"),
+                            "scout_entry_price": self.positions.get(ticker, {}).get("entry_price", 0.0),
+                            "market_trend": "BEAR" if self.is_bear_market else "BULL",
+                            "is_bear_market": self.is_bear_market,
+                            "pattern": scan_info["pattern"],
+                            "pivot": scan_info["pivot"],
+                        }
+                    
                     res = strat_fn(state, self.cfg)
                     
                     # 3. 執行
@@ -405,7 +434,7 @@ class StockMonitor:
                 trade = self.api.place_order(contract, order)
                 # 等待委託回報確認 (最多 10 秒)
                 self.api.update_status()
-                if trade.status.status != sj.constant.OrderStatus.Submitted and trade.status.status != sj.constant.OrderStatus.Filled:
+                if trade.status.status != sj.constant.OrderState.Submitted and trade.status.status != sj.constant.OrderState.Filled:
                     console.print(f"[red]❌ BUY {ticker} order rejected: {trade.status.status}[/red]")
                     return
 
@@ -428,7 +457,7 @@ class StockMonitor:
                 )
                 trade = self.api.place_order(contract, order)
                 self.api.update_status()
-                if trade.status.status != sj.constant.OrderStatus.Submitted and trade.status.status != sj.constant.OrderStatus.Filled:
+                if trade.status.status != sj.constant.OrderState.Submitted and trade.status.status != sj.constant.OrderState.Filled:
                     console.print(f"[red]❌ SELL {ticker} order rejected: {trade.status.status}[/red]")
                     return
 

@@ -2,6 +2,9 @@
 shioaji
 pandas
 numpy
+scipy
+pyarrow
+fastparquet
 numba
 python-dotenv
 pyyaml
