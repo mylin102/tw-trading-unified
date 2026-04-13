@@ -983,13 +983,13 @@ class ShioajiOptionsSmartMonitor:
         if not self.api.quote:
             return None
 
+        # Shioaji server stores K-bars by calendar date, not trading day.
+        # Night session data (15:00-05:00) is stored under the calendar date when it started.
+        # e.g., 20:00 on 4/13 → server key = 2026-04-13, not 2026-04-14.
         today = datetime.datetime.now()
-        # BUG FIX 2026-04-13: Use get_trading_day() for correct night session date.
-        # At 18:00 on 4/13, trading day is 4/14 (15:00+ belongs to next trading day).
-        # Without this, kbars fetches yesterday's data → validation fails → all indicators None.
-        from core.date_utils import get_trading_day
-        trade_date = get_trading_day(today)
-        date_str = trade_date.strftime("%Y-%m-%d")
+        if today.hour < 5:
+            today = today - datetime.timedelta(days=1)
+        date_str = today.strftime("%Y-%m-%d")
         try:
             bars = self.api.kbars(self.active_contracts["MTX"], start=date_str, end=date_str)
             self.last_kbars_fetch_at = now_ts
