@@ -1834,10 +1834,10 @@ class ShioajiOptionsSmartMonitor:
         signal_score = signal["score"] if signal else (self.last_signal["score"] if self.last_signal else 999)
 
         # 3. Score reversal exit: 趨勢翻轉才出場
-        #    修正: 出場門檻比進場寬 (60% of entry_score)，防止 whipsaw
+        #    修正: 出場門檻比進場寬 (1.5x entry_score)，防止 whipsaw
         #    買 P 時 score 很負，翻正超過 reversal_threshold → 趨勢反轉
         #    買 C 時 score 很正，翻負超過 reversal_threshold → 趨勢反轉
-        reversal_threshold = self.entry_score * 0.67  # 60 → 40
+        reversal_threshold = self.entry_score * 1.5  # 15 → 22.5
         
         # 💡 GSD: Opening Grace Period Protection
         # Avoid reacting to data spikes or gaps in the first N mins of ANY session

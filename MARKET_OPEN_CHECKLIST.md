@@ -41,17 +41,25 @@
 #### 2. OPTIONS TRADING
 **Active Mode:** V2 (Swing)
 - **Strategy Parameters:**
-  - Entry score: 30
+  - Entry score: 15 (was 30 → lowered, was 10 → raised)
+  - Score floor: 15
   - Regime filter: mid
-  - Require fire: ✓
+  - Require fire: ✗ (disabled — was blocking all signals)
+  - Require align: ✗ (disabled — triple filter too strict)
   - Fire score threshold: 60
   - Use opening logic: ✓
 - **Risk Management:**
-  - Stop loss: 20%
+  - Stop loss: 15% (was 20% → tighter)
   - Max positions: 2
   - Initial capital: 40,000 TWD
   - Max daily loss: 2%
   - Max holding days: 7
+  - **Min DTE entry: 7 days** (was 0.5 → DTE too short causes IV crush)
+  - Expiry floor: 7 days
+- **Exit Strategy:**
+  - TP1: 2.0% (was 0.5% → too small to matter)
+  - Trailing stop: 1.5% (was 0.15% → way too tight)
+  - Reversal threshold: entry_score × 1.5 = 22.5 (was × 0.67 = 10 → too sensitive)
 - **Theta Gang Strategy:**
   - Enabled: ✓
   - Strategy: Iron Condor
