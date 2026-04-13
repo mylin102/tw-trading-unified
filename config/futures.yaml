@@ -45,7 +45,7 @@ strategy:
     confirm_bars: 7
     enabled: true
     exit_on_vwap: true
-    min_momentum: 30.0
+    min_momentum: 15.0
   entry_score: 16
   length: 20
   partial_exit:

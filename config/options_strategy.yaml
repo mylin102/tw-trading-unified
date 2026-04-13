@@ -2,13 +2,13 @@ active_mode: V2
 live_trading: false
 strategy:
   length: 20
-  entry_score: 30
-  score_floor: 20
+  entry_score: 10
+  score_floor: 10
   regime_filter: mid
   use_opening_logic: true
-  require_fire: true
+  require_fire: false
   fire_score_threshold: 60
-  require_align: true
+  require_align: false
   fallback_underlying_price: 33500
   monthly_delivery_min_days: 14
   cooldown_bars: 3
