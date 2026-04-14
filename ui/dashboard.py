@@ -1374,7 +1374,12 @@ with tab_futures:
                 orders_data = json.load(f)
 
             if orders_data:
-                import pandas as pd
+                # Get LIVE price from the same data source as charts
+                f_df = load_futures_indicators(full_history=cont_mode)
+                live_price = None
+                if f_df is not None and not f_df.empty and "Close" in f_df.columns:
+                    live_price = float(f_df["Close"].iloc[-1])
+
                 df_orders = pd.DataFrame(orders_data)
 
                 # Status translation map
@@ -1420,8 +1425,25 @@ with tab_futures:
                     display_cols.append("狀態")
                 if "strategy" in df_orders.columns:
                     display_cols.append("strategy")
-                if "unrealized_pnl" in df_orders.columns:
-                    # Color-code unrealized PnL
+
+                # Calculate unrealized PnL using LIVE price
+                if live_price and live_price > 0:
+                    def _calc_unreal(row):
+                        if row.get("status") not in ("filled", "partial_filled"):
+                            return None
+                        entry = row.get("avg_fill_price", 0) or row.get("price", 0)
+                        if not entry or entry <= 0:
+                            return None
+                        side = row.get("side", "")
+                        qty = row.get("filled_quantity", 1) or 1
+                        if side == "buy":
+                            return (live_price - entry) * 50 * qty
+                        elif side == "sell":
+                            return (entry - live_price) * 50 * qty
+                        return None
+
+                    df_orders["unrealized_pnl"] = df_orders.apply(_calc_unreal, axis=1)
+
                     def _format_unreal(x):
                         if x is None or (isinstance(x, float) and pd.isna(x)):
                             return "—"
@@ -1433,7 +1455,9 @@ with tab_futures:
                             return "⚪ 0"
                     df_orders["未實現損益"] = df_orders["unrealized_pnl"].apply(_format_unreal)
                     display_cols.append("未實現損益")
-                if "current_price" in df_orders.columns:
+
+                    # Store live price for display
+                    df_orders["current_price"] = live_price
                     display_cols.append("current_price")
 
                 if display_cols:
@@ -1621,6 +1645,17 @@ with tab_options:
                 orders_data = json.load(f)
 
             if orders_data:
+                # Get LIVE option price from ledger or market data
+                # Try to get current premium from the ledger
+                ol = load_options_ledger()
+                live_premium = None
+                if ol is not None and not ol.empty and "Price" in ol.columns:
+                    last_entry = ol[ol["Action"].str.contains("ENTRY", na=False)]
+                    if not last_entry.empty:
+                        live_premium = float(last_entry["Price"].iloc[-1])
+                    else:
+                        live_premium = float(ol["Price"].iloc[-1])
+
                 df_orders = pd.DataFrame(orders_data)
                 display_cols = []
                 if "order_id" in df_orders.columns:
@@ -1648,6 +1683,33 @@ with tab_options:
                     display_cols.append("狀態")
                 if "strategy" in df_orders.columns:
                     display_cols.append("strategy")
+
+                # Calculate unrealized PnL using LIVE premium
+                if live_premium and live_premium > 0:
+                    def _calc_opt_unreal(row):
+                        if row.get("status") not in ("filled", "partial_filled"):
+                            return None
+                        entry = row.get("avg_fill_price", 0) or row.get("price", 0)
+                        if not entry or entry <= 0:
+                            return None
+                        qty = row.get("filled_quantity", 1) or 1
+                        return (live_premium - entry) * 50 * qty
+
+                    df_orders["unrealized_pnl"] = df_orders.apply(_calc_opt_unreal, axis=1)
+
+                    def _format_unreal(x):
+                        if x is None or (isinstance(x, float) and pd.isna(x)):
+                            return "—"
+                        elif x > 0:
+                            return f"🟢 {x:+,.0f}"
+                        elif x < 0:
+                            return f"🔴 {x:+,.0f}"
+                        else:
+                            return "⚪ 0"
+                    df_orders["未實現損益"] = df_orders["unrealized_pnl"].apply(_format_unreal)
+                    display_cols.append("未實現損益")
+                    df_orders["current_price"] = live_premium
+                    display_cols.append("current_price")
 
                 if display_cols:
                     st.dataframe(df_orders[display_cols], use_container_width=True, hide_index=True,
