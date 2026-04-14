@@ -129,18 +129,21 @@ class FuturesMonitor:
         self._vwap_violation_bars = 0  # VWAP exit debounce counter
         self._atr_trail_peak = 0.0    # ATR trailing stop: peak price tracker
 
-        # ── [L3] Order Lifecycle Manager (optional, feature-flagged) ──
+        # ── [L3] Order Lifecycle Manager (independent of live_trading) ──
         self._use_order_manager = self.MONITOR.get("use_order_manager", False)
         self.order_mgr = None
         self.paper_fill_sim = None
         if self._use_order_manager:
             from core.order_management.order_manager import OrderManager
             from core.order_management.paper_fill import PaperFillSimulator
-            self.order_mgr = OrderManager(mode="paper")
-            self.paper_fill_sim = PaperFillSimulator(self.order_mgr)
-            self.order_mgr.set_simulator(self.paper_fill_sim)
+            _om_mode = "live" if self.live_trading else "paper"
+            broker = self.client if self.live_trading else None
+            self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=broker)
+            if _om_mode == "paper":
+                self.paper_fill_sim = PaperFillSimulator(self.order_mgr)
+                self.order_mgr.set_simulator(self.paper_fill_sim)
             self._wire_order_callbacks()
-            console.print("[green]📋 Order Lifecycle Manager enabled (Paper mode)[/green]")
+            console.print(f"[green]📋 Order Lifecycle Manager enabled ({_om_mode} mode)[/green]")
 
         self.last_tick_at = time.time()  # [gstack] 數據新鮮度追蹤
 
