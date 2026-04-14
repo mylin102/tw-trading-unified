@@ -19,6 +19,8 @@ exit_strategy:
   lots_per_trade: 1
   tp1_pct: 2.0
 live_trading: false
+monitoring:
+  use_order_manager: true
 max_iv: 0.6
 min_iv: 0.15
 mode: V2
