@@ -199,7 +199,15 @@ class FuturesMonitor:
         # ── Pre-init the active strategy ─────────────────────────────
         active_name = self.STRATEGY.get("active_strategy", "counter_vwap")
         strategy = self._registry.get(active_name)
-        if strategy:
+
+        # SAFETY CHECK 2026-04-14: Crash prevention — validate strategy is registered
+        if strategy is None:
+            available = [s["name"] for s in self._registry.list_all() if s.get("available")]
+            console.print(f"[bold red]🚨 Strategy '{active_name}' NOT in registry! Available: {available}[/bold red]")
+            console.print(f"[bold red]   System will run in MONITOR-ONLY mode (no entries) until config is fixed.[/bold red]")
+            # Set a safe fallback so setup() doesn't crash
+            self._active_strategy_name = None
+        else:
             # Create a minimal context for init
             dummy_ctx = StrategyContext(
                 market=MarketData(last_bar={}),
@@ -1432,9 +1440,9 @@ class FuturesMonitor:
 
         # 2. Fallback to old hardcoded logic if plugin not found (Migration safety)
         if strategy is None:
-            console.print(f"[yellow]⚠️ Strategy plugin '{active_name}' not found, falling back to legacy logic.[/yellow]")
-            self._legacy_entry_logic(last_5m, df_5m, last_price, timestamp, score, stop_loss_pts)
-            return
+            console.print(f"[yellow]⚠️ Strategy plugin '{active_name}' not found in registry.[/yellow]")
+            self._audit_signal("NO_ENTRY", "", score, "plugin_not_found", f"active_strategy={active_name}")
+            return  # Don't crash — just skip this bar
 
         # ── GSD: Market Regime Detection (Wave 19 Integration) ───────
         from core.market_regime import classify_regime
