@@ -160,8 +160,9 @@ class StockMonitor:
             console.print(f"[yellow]⚠️ Position recovery failed: {e}[/yellow]")
 
     def clean_unfilled_orders(self):
-        """撤銷超過 5 分鐘未成交的掛單"""
+        """撤銷超過 5 分鐘未成交的掛單 (only in LIVE mode)"""
         if self.dry_run: return
+        if self.mode_tag != "LIVE": return  # PAPER mode: no real orders to cancel
         now = datetime.now()
         self.api.update_status()
 
@@ -174,7 +175,11 @@ class StockMonitor:
         for trade in trades:
             if trade.contract.code in self.watchlist:
                 # 如果是掛單中 (Submitted) 且超過 5 分鐘
-                order_time = datetime.fromtimestamp(trade.status.order_datetime)
+                order_dt = trade.status.order_datetime
+                if isinstance(order_dt, (int, float)):
+                    order_time = datetime.fromtimestamp(order_dt)
+                else:
+                    order_time = order_dt  # Already a datetime
                 if trade.status.status == sj.constant.Status.Submitted and (now - order_time).total_seconds() > 300:
                     console.print(f"[yellow]⏳ Order Timeout: Cancelling {trade.contract.code}...[/yellow]")
                     self.api.cancel_order(trade)
@@ -186,10 +191,13 @@ class StockMonitor:
         - 13:25 (end-of-day, before market close at 13:30)
         - When switching LIVE → PAPER mode
         Prevents odd-lot / ROD orders from filling after market hours (14:30).
+
+        Only runs in LIVE mode — PAPER mode has no real orders to cancel.
         """
         if self.dry_run:
             console.print("[yellow]🚨 [DRY-RUN] Would cancel all pending orders[/yellow]")
             return
+        if self.mode_tag != "LIVE": return  # PAPER mode: no real orders
 
         self.api.update_status()
         try:
