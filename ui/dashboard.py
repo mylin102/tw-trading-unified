@@ -1420,10 +1420,13 @@ with tab_futures:
                     display_cols.append("狀態")
                 if "strategy" in df_orders.columns:
                     display_cols.append("strategy")
-                if "cancel_reason" in df_orders.columns:
-                    display_cols.append("cancel_reason")
-                if "reject_reason" in df_orders.columns:
-                    display_cols.append("reject_reason")
+                if "unrealized_pnl" in df_orders.columns:
+                    # Color-code unrealized PnL
+                    df_orders["未實現損益"] = df_orders["unrealized_pnl"].apply(
+                        lambda x: f"🔴 {x:+,.0f}" if x is not None and x < 0 else (f"🟢 {x:+,.0f}" if x is not None and x > 0 else ("—") if x is None else f"⚪ {x:+,.0f}"))
+                    display_cols.append("未實現損益")
+                if "current_price" in df_orders.columns:
+                    display_cols.append("current_price")
 
                 if display_cols:
                     st.dataframe(df_orders[display_cols], use_container_width=True, hide_index=True,
@@ -1438,6 +1441,8 @@ with tab_futures:
                                      "avg_fill_price": "成交均價",
                                      "狀態": st.column_config.TextColumn("狀態"),
                                      "strategy": "策略",
+                                     "未實現損益": st.column_config.TextColumn("未實現損益"),
+                                     "current_price": "目前價",
                                  })
 
                     # Summary stats
@@ -1649,6 +1654,8 @@ with tab_options:
                                      "avg_fill_price": "成交均價",
                                      "狀態": st.column_config.TextColumn("狀態"),
                                      "strategy": "策略",
+                                     "未實現損益": st.column_config.TextColumn("未實現損益"),
+                                     "current_price": "目前價",
                                  })
 
                     total = len(df_orders)

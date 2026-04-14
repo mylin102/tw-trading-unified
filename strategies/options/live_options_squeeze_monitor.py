@@ -961,12 +961,44 @@ class ShioajiOptionsSmartMonitor:
         from core.order_management.order import OrderStatus
 
         def _save_orders_file():
-            """Export all orders to JSON for dashboard."""
+            """Export all orders to JSON for dashboard with unrealized PnL."""
             if not self.order_mgr:
                 return
             try:
                 all_orders = self.order_mgr.get_completed() + self.order_mgr.get_pending()
-                export_data = [o.to_dict() for o in all_orders]
+                export_data = []
+
+                # Get current option price for unrealized PnL
+                cur_price = None
+                try:
+                    # Try to get current option premium from market data
+                    if hasattr(self, 'active_option_contract') and self.active_option_contract:
+                        code = self.active_option_contract.code
+                        if code in self.market_data:
+                            bid = self.market_data[code].get("bid", 0)
+                            ask = self.market_data[code].get("ask", 0)
+                            if bid > 0 and ask > 0:
+                                cur_price = (bid + ask) / 2
+                except Exception:
+                    pass
+
+                for o in all_orders:
+                    d = o.to_dict()
+                    d["unrealized_pnl"] = None
+                    d["unrealized_pnl_pts"] = None
+                    d["current_price"] = cur_price if cur_price and cur_price > 0 else None
+
+                    if o.status in ("filled", "partial_filled") and self.position > 0:
+                        entry = self.entry_price
+                        if cur_price and cur_price > 0 and entry > 0:
+                            pnl_pts = cur_price - entry
+                            point_value = 50
+                            pnl_cash = pnl_pts * point_value * self.position
+                            d["unrealized_pnl"] = round(pnl_cash, 0)
+                            d["unrealized_pnl_pts"] = round(pnl_pts, 1)
+
+                    export_data.append(d)
+
                 today = datetime.datetime.now().strftime("%Y%m%d")
                 orders_file = Path(f"exports/trades/OPTIONS_{today}_orders.json")
                 orders_file.parent.mkdir(parents=True, exist_ok=True)

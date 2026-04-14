@@ -878,8 +878,42 @@ class FuturesMonitor:
             if not self.order_mgr:
                 return
             try:
+                from core.order_management.order import OrderSide
+                import math
+
+                # Get current market price for unrealized PnL
+                cur_price = None
+                try:
+                    cur_price = float(self.market_data.get("MTX", {}).get("close", 0)) or 0
+                except Exception:
+                    pass
+                if cur_price <= 0:
+                    cur_price = float(self.market_data.get("TMF", {}).get("close", 0)) or 0
+
                 all_orders = self.order_mgr.get_completed() + self.order_mgr.get_pending()
-                export_data = [o.to_dict() for o in all_orders]
+                export_data = []
+                for o in all_orders:
+                    d = o.to_dict()
+                    # Add unrealized PnL for open positions
+                    d["unrealized_pnl"] = None
+                    d["unrealized_pnl_pts"] = None
+                    d["current_price"] = cur_price if cur_price > 0 else None
+
+                    if o.status in ("filled", "partial_filled") and self.trader.position != 0:
+                        entry = self.trader.entry_price
+                        qty = abs(self.trader.position)
+                        if cur_price > 0 and entry > 0:
+                            if self.trader.position > 0:  # LONG
+                                pnl_pts = cur_price - entry
+                            else:  # SHORT
+                                pnl_pts = entry - cur_price
+                            point_value = 50
+                            pnl_cash = pnl_pts * point_value * qty
+                            d["unrealized_pnl"] = round(pnl_cash, 0)
+                            d["unrealized_pnl_pts"] = round(pnl_pts, 1)
+
+                    export_data.append(d)
+
                 today = datetime.now().strftime("%Y%m%d")
                 orders_file = Path(f"exports/trades/TMF_{today}_orders.json")
                 orders_file.parent.mkdir(parents=True, exist_ok=True)
