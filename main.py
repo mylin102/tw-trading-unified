@@ -242,9 +242,15 @@ def run_system(dry_run=False):
             console.print("[yellow]🔧 Dry-run — no broker login[/yellow]")
 
         from strategies.futures.monitor import FuturesMonitor
+
+        # [GSD] Session-aware config: night uses futures_night.yaml (wider stops, longer VWAP confirm)
+        from core.date_utils import is_night_session
+        _config_file = "futures_night.yaml" if is_night_session() else "futures.yaml"
+        console.print(f"[dim]📋 Futures config: {_config_file} (session={'night' if is_night_session() else 'day'})[/dim]")
+
         fm = FuturesMonitor(
             api=api,
-            config_path=os.path.join(BASE, "config", "futures.yaml"),
+            config_path=os.path.join(BASE, "config", _config_file),
             dry_run=dry_run,
         )
         fm.setup()
@@ -309,9 +315,12 @@ def run_system(dry_run=False):
                 # Re-initialize monitors and threads
                 try:
                     from strategies.futures.monitor import FuturesMonitor
+                    # [GSD] Session-aware config on restart too
+                    from core.date_utils import is_night_session
+                    _config_file = "futures_night.yaml" if is_night_session() else "futures.yaml"
                     fm = FuturesMonitor(
                         api=api,
-                        config_path=os.path.join(BASE, "config", "futures.yaml"),
+                        config_path=os.path.join(BASE, "config", _config_file),
                         dry_run=dry_run,
                     )
                     fm.setup()

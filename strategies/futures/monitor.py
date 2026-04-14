@@ -1325,7 +1325,10 @@ class FuturesMonitor:
                             (self.trader.position > 0 and last_price < vwap) or
                             (self.trader.position < 0 and last_price > vwap)
                         )
-                        if vwap_violated:
+                        # [GSD] Ignore trivial VWAP fluctuations — min 30pts distance
+                        vwap_distance = abs(last_price - vwap)
+                        _min_vwap_distance = 30  # pts, round-trip friction ~8pts + buffer
+                        if vwap_violated and vwap_distance >= _min_vwap_distance:
                             self._vwap_violation_bars += 1
                         else:
                             self._vwap_violation_bars = 0
