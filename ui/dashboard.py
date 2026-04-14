@@ -9,6 +9,7 @@ sys.path.insert(0, str(_Path(__file__).parent.parent))
 
 import streamlit as st
 import pandas as pd
+import json
 import yaml
 import datetime
 import os
@@ -1361,6 +1362,99 @@ with tab_futures:
 
         with st.expander("📋 原始 Ledger (進階)"):
             st.dataframe(ft, use_container_width=True)
+
+    # ── Order Status Panel ──
+    with st.expander("📤 委託單狀態 (Order Lifecycle)", expanded=False):
+        orders_path = BASE / "exports" / "trades"
+        order_files = list(orders_path.glob(f"TMF_{DATE_STR}_orders.json")) + list(orders_path.glob("TMF_*_orders.json"))
+        order_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+
+        if order_files and order_files[0].exists():
+            with open(order_files[0], "r", encoding="utf-8") as f:
+                orders_data = json.load(f)
+
+            if orders_data:
+                import pandas as pd
+                df_orders = pd.DataFrame(orders_data)
+
+                # Status translation map
+                status_map = {
+                    "pending_submit": "⏳ 待傳送",
+                    "pre_submitted": "📅 預約單",
+                    "submitted": "📨 已委託",
+                    "partial_filled": "⚡ 部分成交",
+                    "filled": "✅ 完全成交",
+                    "cancelled": "🚫 已取消",
+                    "rejected": "❌ 已退單",
+                    "expired": "⏰ 已過期",
+                }
+                type_map = {
+                    "market": "市價",
+                    "limit": "限價",
+                    "stop": "停損",
+                    "stop_limit": "停損限價",
+                }
+
+                # Display columns
+                display_cols = []
+                if "order_id" in df_orders.columns:
+                    display_cols.append("order_id")
+                if "created_at" in df_orders.columns:
+                    display_cols.append("created_at")
+                if "side" in df_orders.columns:
+                    df_orders["方向"] = df_orders["side"].map({"buy": "買入", "sell": "賣出"})
+                    display_cols.append("方向")
+                if "order_type" in df_orders.columns:
+                    df_orders["委託類型"] = df_orders["order_type"].map(type_map).fillna(df_orders["order_type"])
+                    display_cols.append("委託類型")
+                if "quantity" in df_orders.columns:
+                    display_cols.append("quantity")
+                if "filled_quantity" in df_orders.columns:
+                    display_cols.append("filled_quantity")
+                if "price" in df_orders.columns:
+                    display_cols.append("price")
+                if "avg_fill_price" in df_orders.columns:
+                    display_cols.append("avg_fill_price")
+                if "status" in df_orders.columns:
+                    df_orders["狀態"] = df_orders["status"].map(status_map).fillna(df_orders["status"])
+                    display_cols.append("狀態")
+                if "strategy" in df_orders.columns:
+                    display_cols.append("strategy")
+                if "cancel_reason" in df_orders.columns:
+                    display_cols.append("cancel_reason")
+                if "reject_reason" in df_orders.columns:
+                    display_cols.append("reject_reason")
+
+                if display_cols:
+                    st.dataframe(df_orders[display_cols], use_container_width=True, hide_index=True,
+                                 column_config={
+                                     "order_id": "委託單ID",
+                                     "created_at": "建立時間",
+                                     "方向": "方向",
+                                     "委託類型": st.column_config.TextColumn("委託類型"),
+                                     "quantity": "委託量",
+                                     "filled_quantity": "成交量",
+                                     "price": "限價",
+                                     "avg_fill_price": "成交均價",
+                                     "狀態": st.column_config.TextColumn("狀態"),
+                                     "strategy": "策略",
+                                 })
+
+                    # Summary stats
+                    total = len(df_orders)
+                    filled = len(df_orders[df_orders["status"] == "filled"]) if "status" in df_orders.columns else 0
+                    pending = len(df_orders[df_orders["status"].isin(["submitted", "pending_submit", "pre_submitted"])]) if "status" in df_orders.columns else 0
+                    cancelled = len(df_orders[df_orders["status"] == "cancelled"]) if "status" in df_orders.columns else 0
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("總委託單", total)
+                    c2.metric("✅ 已成交", filled)
+                    c3.metric("⏳ 排隊中", pending)
+                    c4.metric("🚫 已取消/退單", cancelled)
+            else:
+                st.info("今日尚無委託單記錄")
+        else:
+            st.info("委託單檔案尚未建立 (Order Lifecycle 未啟用)")
 
 # ════════════════════════════════════════
 # Tab 3: 選擇權

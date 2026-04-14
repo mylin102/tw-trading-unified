@@ -870,6 +870,23 @@ class FuturesMonitor:
     def _wire_order_callbacks(self):
         """Wire OrderManager callbacks to PaperTrader and audit system."""
         from core.order_management.order import OrderStatus, OrderSide
+        import json
+        from pathlib import Path
+
+        def _save_orders_file():
+            """Export all orders to JSON for dashboard consumption."""
+            if not self.order_mgr:
+                return
+            try:
+                all_orders = self.order_mgr.get_completed() + self.order_mgr.get_pending()
+                export_data = [o.to_dict() for o in all_orders]
+                today = datetime.now().strftime("%Y%m%d")
+                orders_file = Path(f"exports/trades/TMF_{today}_orders.json")
+                orders_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(orders_file, "w", encoding="utf-8") as f:
+                    json.dump(export_data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                console.print(f"[yellow]⚠️ Failed to save orders file: {e}[/yellow]")
 
         def _on_fill_callback(event):
             if event.status == OrderStatus.FILLED:
@@ -898,12 +915,15 @@ class FuturesMonitor:
                     })
                 except Exception:
                     pass
+                _save_orders_file()
 
         def _on_cancel_callback(event):
             console.print(f"[yellow]🚫 Order CANCELLED: {event.order_id} ({event.reason})[/yellow]")
+            _save_orders_file()
 
         def _on_reject_callback(event):
             console.print(f"[red]❌ Order REJECTED: {event.order_id} ({event.reason})[/red]")
+            _save_orders_file()
 
         self.order_mgr.register_callback("on_fill", _on_fill_callback)
         self.order_mgr.register_callback("on_cancel", _on_cancel_callback)
