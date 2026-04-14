@@ -401,6 +401,84 @@ class FuturesMonitor:
         # Reset timer to avoid spamming
         self.last_tick_at = time.time()
 
+    def _is_contract_expired(self, contract_delivery_date):
+        """[GSD Settlement Fix] Check if contract is expired considering settlement time (13:30).
+        
+        Args:
+            contract_delivery_date: Delivery date in "YYYY/MM/DD" format
+            
+        Returns:
+            bool: True if contract is expired (past settlement time on delivery date)
+        """
+        try:
+            # Parse contract delivery date
+            contract_date = datetime.strptime(contract_delivery_date, "%Y/%m/%d").date()
+            now = datetime.now()
+            today = now.date()
+            
+            # If contract date is in the future, it's not expired
+            if contract_date > today:
+                return False
+            
+            # If contract date is before today, it's expired
+            if contract_date < today:
+                return True
+            
+            # Same day: check if past settlement time (13:30)
+            settlement_time = now.replace(hour=13, minute=30, second=0, microsecond=0)
+            return now >= settlement_time
+            
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Error checking contract expiration: {e}[/yellow]")
+            return False
+    
+    def _is_settlement_day(self, contract_delivery_date):
+        """[GSD Settlement Fix] Check if today is settlement day for the given contract.
+        
+        Args:
+            contract_delivery_date: Delivery date in "YYYY/MM/DD" format
+            
+        Returns:
+            bool: True if today is the delivery date (settlement day)
+        """
+        try:
+            contract_date = datetime.strptime(contract_delivery_date, "%Y/%m/%d").date()
+            today = datetime.now().date()
+            return contract_date == today
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Error checking settlement day: {e}[/yellow]")
+            return False
+    
+    def _get_settlement_time_remaining(self):
+        """[GSD Settlement Fix] Calculate time remaining until settlement (13:30).
+        
+        Returns:
+            tuple: (hours_remaining, minutes_remaining) or None if not settlement day
+        """
+        try:
+            now = datetime.now()
+            today = now.date()
+            
+            # Check if current contract expires today
+            if not self.contract or not self._is_settlement_day(self.contract.delivery_date):
+                return None
+            
+            # Calculate time until 13:30
+            settlement_time = now.replace(hour=13, minute=30, second=0, microsecond=0)
+            if now >= settlement_time:
+                return (0, 0)  # Already past settlement time
+            
+            time_diff = settlement_time - now
+            total_minutes = int(time_diff.total_seconds() / 60)
+            hours = total_minutes // 60
+            minutes = total_minutes % 60
+            
+            return (hours, minutes)
+            
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Error calculating settlement time: {e}[/yellow]")
+            return None
+    
     def _check_contract_rollover(self):
         """[GSD Fix] Check if TMF contract has rolled over and re-subscribe if needed."""
         if not self.api or self.dry_run or not self.contract:
@@ -409,18 +487,34 @@ class FuturesMonitor:
         try:
             current_code = self.contract.code
             
+            # [GSD Settlement Fix] Check if today is settlement day
+            if self._is_settlement_day(self.contract.delivery_date):
+                time_remaining = self._get_settlement_time_remaining()
+                if time_remaining:
+                    hours, minutes = time_remaining
+                    if hours == 0 and minutes == 0:
+                        console.print(f"[bold red]⚠️ SETTLEMENT DAY: Contract {current_code} has expired at 13:30[/bold red]")
+                    elif hours > 0 or minutes > 0:
+                        console.print(f"[bold yellow]⚠️ SETTLEMENT DAY: Contract {current_code} expires at 13:30 ({hours}h {minutes}m remaining)[/bold yellow]")
+            
             # Get all available contracts
             tmf_list = list(self.api.Contracts.Futures.TMF)
             if not tmf_list:
                 console.print("[yellow]⚠️ No TMF contracts available[/yellow]")
                 return
             
-            # [GSD Fix] Sort by delivery_date
-            now_str = datetime.now().strftime("%Y/%m/%d")
-            valid_contracts = [c for c in tmf_list if c.delivery_date >= now_str]
+            # [GSD Settlement Fix] Filter out expired contracts considering settlement time
+            now = datetime.now()
+            valid_contracts = []
+            for contract in tmf_list:
+                if not self._is_contract_expired(contract.delivery_date):
+                    valid_contracts.append(contract)
+            
+            # Sort by delivery_date
             tmf_sorted = sorted(valid_contracts, key=lambda c: c.delivery_date)
             
             if not tmf_sorted:
+                console.print("[bold red]⚠️ No valid contracts available after settlement time[/bold red]")
                 return
                 
             first_contract = tmf_sorted[0]
@@ -1356,6 +1450,19 @@ class FuturesMonitor:
                 self.cooldown_until = self.cooldown_bars # 觸發停損/平倉後進入冷卻
                 self._last_exit_bar = timestamp  # 記錄 exit bar
             return  # don't enter same bar as exit
+
+        # ── [P0 Fix] Market Hours Gate: NEVER enter during closed hours ──
+        # TAIFEX TMF trading hours:
+        #   Day:  08:45 - 13:45
+        #   Night: 15:00 - 05:00 (next day)
+        # Closed: 13:45-15:00 (lunch), 05:00-08:45 (early morning)
+        hhmm = int(timestamp.strftime("%H%M")) if hasattr(timestamp, "strftime") else int(datetime.now().strftime("%H%M"))
+        market_open = (845 <= hhmm <= 1345) or (hhmm >= 1500) or (hhmm < 500)
+        if not market_open:
+            self._audit_signal("ENTRY_BLOCKED", "", score, "market_closed", f"hhmm={hhmm}")
+            if self._bar_counter % 12 == 0:  # Log once per hour
+                console.print(f"[dim]⏸️ Market CLOSED (hhmm={hhmm}) — blocking entry[/dim]")
+            return
 
         # 3. Entry logic (with cooldown check)
         if self.cooldown_until > 0:

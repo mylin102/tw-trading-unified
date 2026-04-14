@@ -43,9 +43,9 @@ strategy:
   auto_select: false
   volume_threshold: 0.001
   counter_mode:
-    atr_sl_mult: 2.5
+    atr_sl_mult: 1.5
     auto_regime: true
-    confirm_bars: 10
+    confirm_bars: 3
     enabled: true
     exit_on_vwap: true
     min_momentum: 50.0
