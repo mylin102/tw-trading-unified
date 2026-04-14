@@ -1422,8 +1422,16 @@ with tab_futures:
                     display_cols.append("strategy")
                 if "unrealized_pnl" in df_orders.columns:
                     # Color-code unrealized PnL
-                    df_orders["未實現損益"] = df_orders["unrealized_pnl"].apply(
-                        lambda x: f"🔴 {x:+,.0f}" if x is not None and x < 0 else (f"🟢 {x:+,.0f}" if x is not None and x > 0 else ("—") if x is None else f"⚪ {x:+,.0f}"))
+                    def _format_unreal(x):
+                        if x is None or (isinstance(x, float) and pd.isna(x)):
+                            return "—"
+                        elif x > 0:
+                            return f"🟢 {x:+,.0f}"
+                        elif x < 0:
+                            return f"🔴 {x:+,.0f}"
+                        else:
+                            return "⚪ 0"
+                    df_orders["未實現損益"] = df_orders["unrealized_pnl"].apply(_format_unreal)
                     display_cols.append("未實現損益")
                 if "current_price" in df_orders.columns:
                     display_cols.append("current_price")
