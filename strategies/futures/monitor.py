@@ -128,6 +128,20 @@ class FuturesMonitor:
         self._bar_counter = 0        # monotonic bar counter for fire tracking
         self._vwap_violation_bars = 0  # VWAP exit debounce counter
         self._atr_trail_peak = 0.0    # ATR trailing stop: peak price tracker
+
+        # ── [L3] Order Lifecycle Manager (optional, feature-flagged) ──
+        self._use_order_manager = self.MONITOR.get("use_order_manager", False)
+        self.order_mgr = None
+        self.paper_fill_sim = None
+        if self._use_order_manager:
+            from core.order_management.order_manager import OrderManager
+            from core.order_management.paper_fill import PaperFillSimulator
+            self.order_mgr = OrderManager(mode="paper")
+            self.paper_fill_sim = PaperFillSimulator(self.order_mgr)
+            self.order_mgr.set_simulator(self.paper_fill_sim)
+            self._wire_order_callbacks()
+            console.print("[green]📋 Order Lifecycle Manager enabled (Paper mode)[/green]")
+
         self.last_tick_at = time.time()  # [gstack] 數據新鮮度追蹤
 
         # GSD Phase 0d: Hourly no-trade audit tracking
@@ -849,6 +863,84 @@ class FuturesMonitor:
         except Exception as e:
             console.print(f"[yellow]⚠️ Trade backup failed: {e}[/yellow]")
 
+    # ── Order Lifecycle (L3 Integration) ──
+    def _wire_order_callbacks(self):
+        """Wire OrderManager callbacks to PaperTrader and audit system."""
+        from core.order_management.order import OrderStatus, OrderSide
+
+        def _on_fill_callback(event):
+            if event.status == OrderStatus.FILLED:
+                ts = datetime.now()
+                stop_loss = getattr(self, "_pending_stop_loss", 60)
+                max_lots = self.MGMT.get("max_positions", 1)
+                if event.side == OrderSide.BUY:
+                    msg = self.trader.execute_signal("BUY", event.fill_price, ts,
+                                                      lots=event.fill_qty, max_lots=max_lots, stop_loss=stop_loss)
+                    console.print(f"[green]📦 Order FILLED: BUY {event.fill_qty} @ {event.fill_price:.0f} → {msg}[/green]")
+                else:
+                    msg = self.trader.execute_signal("SELL", event.fill_price, ts,
+                                                      lots=event.fill_qty, max_lots=max_lots, stop_loss=stop_loss)
+                    console.print(f"[red]📦 Order FILLED: SELL {event.fill_qty} @ {event.fill_price:.0f} → {msg}[/red]")
+                # Save to exports
+                try:
+                    from squeeze_futures.data.data_storage import save_trade
+                    save_trade({
+                        "type": "BUY" if event.side == OrderSide.BUY else "SELL",
+                        "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                        "price": event.fill_price,
+                        "lots": event.fill_qty,
+                        "direction": "LONG" if event.side == OrderSide.BUY else "SHORT",
+                        "pnl_pts": 0, "pnl_cash": 0, "friction_cost": 0,
+                        "reason": getattr(self, "_last_entry_reason", "ORDER_MANAGER"),
+                    })
+                except Exception:
+                    pass
+
+        def _on_cancel_callback(event):
+            console.print(f"[yellow]🚫 Order CANCELLED: {event.order_id} ({event.reason})[/yellow]")
+
+        def _on_reject_callback(event):
+            console.print(f"[red]❌ Order REJECTED: {event.order_id} ({event.reason})[/red]")
+
+        self.order_mgr.register_callback("on_fill", _on_fill_callback)
+        self.order_mgr.register_callback("on_cancel", _on_cancel_callback)
+        self.order_mgr.register_callback("on_reject", _on_reject_callback)
+
+    def _submit_order_via_manager(self, signal, price, ts, lots, stop_loss=None, reason=None):
+        """Submit order through OrderManager instead of direct PaperTrader call."""
+        from core.order_management.order import OrderType, OrderSide
+
+        side = OrderSide.BUY if signal == "BUY" else OrderSide.SELL
+        order_type = OrderType.MARKET  # Default to market; can be configured
+
+        order = self.order_mgr.create_order(
+            symbol=self.ticker, side=side, order_type=order_type,
+            quantity=lots, strategy=reason or "UNKNOWN",
+        )
+        self.order_mgr.submit(order, exchange_ordno=f"PAPER-{order.order_id}")
+        self.paper_fill_sim.register(order)
+
+        # Store stop_loss for callback to use
+        self._pending_stop_loss = stop_loss or self.RISK.get("stop_loss_pts", 60)
+
+        console.print(f"[cyan]📤 Order SUBMITTED: {signal} {lots} @ {price:.0f} ({reason}) "
+                      f"[order_id={order.order_id}][/cyan]")
+
+        # Process the current tick immediately for market orders
+        self.paper_fill_sim.process_tick(self._make_synthetic_tick(price, ts))
+        return order.order_id
+
+    def _make_synthetic_tick(self, price, ts):
+        """Create a synthetic tick object from price/timestamp for PaperFillSimulator."""
+        tick = type("Tick", (), {})()
+        tick.datetime = ts if hasattr(ts, "strftime") else datetime.now()
+        tick.close = price
+        tick.open = price
+        tick.high = price
+        tick.low = price
+        tick.volume = 0
+        return tick
+
     # ── Margin check ──
     def _margin_sufficient(self):
         """Check if account has enough margin before placing entry order."""
@@ -943,6 +1035,17 @@ class FuturesMonitor:
             self._last_trade_ts = ts
             self._bars_since_trade = 0
             self._signals_generated += 1
+
+        # ── [L3] Route through OrderManager if enabled ──
+        if self._use_order_manager and self.order_mgr and signal in ("BUY", "SELL"):
+            # Paper mode: submit order → wait for tick fill → callback → PaperTrader
+            return self._submit_order_via_manager(signal, price, ts, lots,
+                                                   stop_loss=stop_loss, reason=reason)
+        elif self._use_order_manager and self.order_mgr and signal in ("EXIT", "PARTIAL_EXIT"):
+            # Exits need immediate execution (no queue in paper mode)
+            self.paper_fill_sim.process_tick(self._make_synthetic_tick(price, ts))
+            # Fall through to direct PaperTrader call for exits
+
         result = self.trader.execute_signal(
             signal, price, ts, lots=lots,
             max_lots=self.MGMT.get("max_positions", 2),
