@@ -127,6 +127,11 @@ BASE = Path(__file__).parent.parent
 DATE_STR = datetime.datetime.now().strftime("%Y%m%d")  # Calendar date for display (not trading day)
 TODAY = datetime.datetime.now().strftime("%Y-%m-%d")
 
+# ── Session detection (used by sidebar + config loading) ──
+from core.date_utils import is_night_session
+_CURRENT_SESSION_NIGHT = is_night_session(datetime.datetime.now())
+FUTURES_CFG_NAME = "futures_night.yaml" if _CURRENT_SESSION_NIGHT else "futures.yaml"
+
 # ── Sidebar Info ──
 with st.sidebar:
     st.title("Trading Unified")
@@ -138,6 +143,10 @@ with st.sidebar:
     cont_mode = st.toggle("🕒 連續圖表模式", value=True, help="顯示最近 24 小時資料，而非僅今日交易日。")
     
     st.markdown(f"🕒 **最後更新**: {datetime.datetime.now().strftime('%H:%M:%S')}")
+    # Session indicator
+    _session_label = "🌙 夜盤" if _CURRENT_SESSION_NIGHT else "☀️ 日盤"
+    _session_color = "#7c3aed" if _CURRENT_SESSION_NIGHT else "#f59e0b"
+    st.markdown(f"<span style='color:{_session_color};font-weight:bold'>{_session_label}</span> — 設定檔: `{FUTURES_CFG_NAME}`", unsafe_allow_html=True)
     st.divider()
     if st.button("🔄 強制刷新頁面"):
         st.rerun()
@@ -154,7 +163,7 @@ def save_yaml(path, data):
         yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 # ── Configs ──
-FUTURES_CFG_PATH = BASE / "config" / "futures.yaml"
+FUTURES_CFG_PATH = BASE / "config" / FUTURES_CFG_NAME
 OPTIONS_CFG_PATH = BASE / "config" / "options_strategy.yaml"
 RISK_CFG_PATH = BASE / "config" / "risk_global.yaml"
 STOCK_CFG_PATH = BASE / "config" / "stocks.yaml"
@@ -954,10 +963,63 @@ def load_stock_indicators(ticker):
             df = pd.read_csv(f)
             if df.columns.duplicated().any():
                 df = df.loc[:, ~df.columns.duplicated()].copy()
-            if "ts" in df.columns:
-                df = df.rename(columns={"ts": "timestamp"})
-            elif "Date" in df.columns:
-                df = df.rename(columns={"Date": "timestamp"})
+            
+            # 處理大小寫不一致的列名
+            column_mapping = {}
+            for col in df.columns:
+                col_lower = col.lower()
+                # 基本價格/成交量列
+                if col_lower == 'close':
+                    column_mapping[col] = 'close'
+                elif col_lower == 'open':
+                    column_mapping[col] = 'open'
+                elif col_lower == 'high':
+                    column_mapping[col] = 'high'
+                elif col_lower == 'low':
+                    column_mapping[col] = 'low'
+                elif col_lower == 'volume':
+                    column_mapping[col] = 'volume'
+                elif col_lower == 'timestamp':
+                    column_mapping[col] = 'timestamp'
+                elif col_lower == 'ts':
+                    column_mapping[col] = 'timestamp'
+                elif col_lower == 'name':
+                    column_mapping[col] = 'name'
+                # 技術指標列
+                elif col_lower == 'score':
+                    column_mapping[col] = 'score'
+                elif col_lower == 'bb_lower':
+                    column_mapping[col] = 'bb_lower'
+                elif col_lower == 'bb_mid':
+                    column_mapping[col] = 'bb_mid'
+                elif col_lower == 'bb_upper':
+                    column_mapping[col] = 'bb_upper'
+                elif col_lower == 'sqz_on':
+                    column_mapping[col] = 'sqz_on'
+                elif col_lower == 'rsi':
+                    column_mapping[col] = 'rsi'
+                elif col_lower == 'macd':
+                    column_mapping[col] = 'macd'
+                elif col_lower == 'macd_signal':
+                    column_mapping[col] = 'macd_signal'
+                elif col_lower == 'macd_hist':
+                    column_mapping[col] = 'macd_hist'
+                elif col_lower == 'k_val':
+                    column_mapping[col] = 'k_val'
+                elif col_lower == 'd_val':
+                    column_mapping[col] = 'd_val'
+                elif col_lower == 'adx':
+                    column_mapping[col] = 'adx'
+            
+            # 重命名列
+            df = df.rename(columns=column_mapping)
+            
+            # 確保必要的列存在
+            required_cols = ['close', 'open', 'high', 'low', 'volume', 'timestamp']
+            for col in required_cols:
+                if col not in df.columns:
+                    df[col] = None
+            
             return df
         except Exception:
             pass
@@ -1145,11 +1207,18 @@ with tab_overview:
                     else:
                         bias = "⚠️多拉回" if mom <= mom_prev else "↘️弱拉回"
 
+                # 處理 volume 值，避免 NaN 錯誤
+                volume_val = last.get('volume', last.get('Volume', 0))
+                if pd.isna(volume_val):
+                    volume_display = "0k"
+                else:
+                    volume_display = f"{int(volume_val // 1000)}k"
+                
                 ov_data.append({
                     "代號": ticker,
                     "名稱": last.get("name", "Unknown"),
                     "股價": last.get('close', last.get('Close', 0)),
-                    "量": f"{int(last.get('volume', last.get('Volume', 0))//1000)}k",
+                    "量": volume_display,
                     "Score": round(last.get('score', 0), 1),
                     "Sqz": "🔒壓" if last.get("sqz_on", False) else "🔓釋",
                     "偏向": bias,
@@ -1452,13 +1521,18 @@ with tab_stocks:
             if s_df is not None and not s_df.empty:
                 last = s_df.iloc[-1]
                 close = float(last.get('close', last.get('Close', 0)))
-                vol = int(last.get('volume', last.get('Volume', 0)))
+                # 處理 volume 值，避免 NaN 錯誤
+                vol_val = last.get('volume', last.get('Volume', 0))
+                if pd.isna(vol_val):
+                    vol = 0
+                else:
+                    vol = int(vol_val)
                 score = round(last.get('score', 0), 1)
                 bb_lower = float(last.get('bb_lower', 0))
                 sqz = "🔒 壓縮" if last.get("sqz_on", False) else "🔓 釋放"
                 
                 # 計算距布林帶下軌距離 (%)
-                if bb_lower > 0 and close > 0:
+                if not pd.isna(bb_lower) and bb_lower > 0 and not pd.isna(close) and close > 0:
                     dist_bb = ((close - bb_lower) / bb_lower) * 100
                     if dist_bb < 0:
                         dist_label = f"🔥 已跌破 {dist_bb:.1f}%"
@@ -1738,6 +1812,20 @@ with tab_settings:
         _reg.discover()
         fut_strats = {item["name"]: item for item in _reg.list_all() if item.get("asset_class") == "futures" and item.get("available", False)}
         current_fut_strat = futures_cfg.get("strategy", {}).get("active_strategy", futures_cfg.get("active_strategy", "counter_vwap"))
+
+        # ── Session indicator: show active vs inactive params ──
+        _night_cfg = load_yaml(BASE / "config" / "futures_night.yaml")
+        _day_cfg = load_yaml(BASE / "config" / "futures.yaml")
+        _day_risk = _day_cfg.get("risk_mgmt", {})
+        _night_risk = _night_cfg.get("risk_mgmt", {})
+        _active_risk = _night_risk if _CURRENT_SESSION_NIGHT else _day_risk
+        st.info(
+            f"**{'🌙 夜盤設定使用中' if _CURRENT_SESSION_NIGHT else '☀️ 日盤設定使用中'}** (`{FUTURES_CFG_NAME}`)  \n"
+            f"停損: **{_active_risk.get('stop_loss_pts', '?')} pts** (日 {_day_risk.get('stop_loss_pts', '?')} / 夜 {_night_risk.get('stop_loss_pts', '?')})  \n"
+            f"ATR 倍數: **{_active_risk.get('atr_multiplier', '?')}x** (日 {_day_risk.get('atr_multiplier', '?')} / 夜 {_night_risk.get('atr_multiplier', '?')})  \n"
+            f"VWAP 確認: **{_active_risk.get('exit_vwap_confirm_bars', '?')} bars** (日 {_day_risk.get('exit_vwap_confirm_bars', '?')} / 夜 {_night_risk.get('exit_vwap_confirm_bars', '?')})  \n"
+            f"追蹤停損距離: **{_active_risk.get('trailing_stop_distance_pts', '?')} pts** (日 {_day_risk.get('trailing_stop_distance_pts', '?')} / 夜 {_night_risk.get('trailing_stop_distance_pts', '?')})"
+        )
 
         with st.form("futures_settings_form"):
             f_live_new = st.checkbox("啟用期貨實盤交易 (LIVE)", value=futures_cfg.get("live_trading", False))
