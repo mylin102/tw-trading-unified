@@ -245,8 +245,10 @@ def run_system(dry_run=False):
 
         # [GSD] Session-aware config: night uses futures_night.yaml (wider stops, longer VWAP confirm)
         from core.date_utils import is_night_session
-        _config_file = "futures_night.yaml" if is_night_session() else "futures.yaml"
-        console.print(f"[dim]📋 Futures config: {_config_file} (session={'night' if is_night_session() else 'day'})[/dim]")
+        from datetime import datetime as _dt
+        _is_night = is_night_session(_dt.now())
+        _config_file = "futures_night.yaml" if _is_night else "futures.yaml"
+        console.print(f"[dim]📋 Futures config: {_config_file} (session={'night' if _is_night else 'day'})[/dim]")
 
         fm = FuturesMonitor(
             api=api,
@@ -317,7 +319,9 @@ def run_system(dry_run=False):
                     from strategies.futures.monitor import FuturesMonitor
                     # [GSD] Session-aware config on restart too
                     from core.date_utils import is_night_session
-                    _config_file = "futures_night.yaml" if is_night_session() else "futures.yaml"
+                    from datetime import datetime as _dt2
+                    _is_night = is_night_session(_dt2.now())
+                    _config_file = "futures_night.yaml" if _is_night else "futures.yaml"
                     fm = FuturesMonitor(
                         api=api,
                         config_path=os.path.join(BASE, "config", _config_file),
