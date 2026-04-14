@@ -210,6 +210,18 @@ class ShioajiOptionsSmartMonitor:
         self.replay_stats = {"signals": 0, "directional_signals": 0, "entries": 0, "exits": 0, "tp1_hits": 0, "blocked_entries": 0, "last_summary_at": 0}
         self._seen_fill_ordnos = set()  # Dedup for live FDeal callbacks
 
+        # ── [L3] Order Lifecycle Manager (independent of live_trading) ──
+        cfg = self.load_config()
+        self._use_order_manager = cfg.get("monitoring", {}).get("use_order_manager", False)
+        self.order_mgr = None
+        if self._use_order_manager:
+            from core.order_management.order_manager import OrderManager
+            _om_mode = "live" if self.live_trading else "paper"
+            broker = self.broker if self.live_trading else None
+            self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=broker)
+            self._wire_order_callbacks()
+            console.print(f"[green]📋 Options Order Lifecycle Manager enabled ({_om_mode} mode)[/green]")
+
         # 設定日誌路徑
         self._update_log_paths()
         if self.api is not None and hasattr(self.api, "set_order_callback"):
@@ -325,20 +337,236 @@ class ShioajiOptionsSmartMonitor:
         # 2. 取得今日日期
         today = datetime.datetime.now().strftime("%Y-%m-%d")
         
-        # 3. 過濾掉已過期合約，並按到期日排序
-        valid_contracts = sorted(
-            [c for c in all_contracts if c.delivery_date >= today],
-            key=lambda x: x.delivery_date
-        )
+        # 3. [GSD Settlement Fix] 過濾掉已過期合約，考慮結算時間 (13:30)
+        now = datetime.datetime.now()
+        valid_contracts = []
+        
+        for contract in all_contracts:
+            try:
+                # 解析合約到期日 - 支援多種格式
+                contract_date = None
+                delivery_date = contract.delivery_date
+                
+                # 嘗試不同格式
+                for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
+                    try:
+                        contract_date = datetime.datetime.strptime(delivery_date, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+                
+                if contract_date is None:
+                    console.print(f"[yellow]⚠️ Cannot parse contract date: {delivery_date}[/yellow]")
+                    continue
+                
+                today_date = now.date()
+                
+                # 如果合約日期在未來，有效
+                if contract_date > today_date:
+                    valid_contracts.append(contract)
+                # 如果合約日期在今天，檢查是否已過結算時間
+                elif contract_date == today_date:
+                    # 結算時間為 13:30
+                    settlement_time = now.replace(hour=13, minute=30, second=0, microsecond=0)
+                    if now < settlement_time:
+                        valid_contracts.append(contract)
+                # 如果合約日期在過去，已過期
+                else:
+                    continue
+                    
+            except Exception as e:
+                console.print(f"[yellow]⚠️ Error parsing contract {contract.code}: {e}[/yellow]")
+                continue
+        
+        # 4. 按到期日排序
+        def get_contract_date(contract):
+            """輔助函數：解析合約日期並返回可排序的日期對象"""
+            delivery_date = contract.delivery_date
+            for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
+                try:
+                    return datetime.datetime.strptime(delivery_date, fmt).date()
+                except ValueError:
+                    continue
+            return datetime.date.max  # 如果無法解析，返回最大日期
+        
+        valid_contracts = sorted(valid_contracts, key=get_contract_date)
         
         if not valid_contracts:
             return None, []
         
-        # 4. 取出最接近的到期日
-        nearest_date = valid_contracts[0].delivery_date
-        nearest_list = [c for c in valid_contracts if c.delivery_date == nearest_date]
+        # 5. 取出最接近的到期日
+        nearest_date_obj = get_contract_date(valid_contracts[0])
+        nearest_date = nearest_date_obj.strftime("%Y-%m-%d")
+        nearest_list = [c for c in valid_contracts if get_contract_date(c) == nearest_date_obj]
         
         return nearest_date, nearest_list
+    
+    def get_futures_contract_month(self, futures_monitor=None):
+        """[GSD Settlement Fix] 從期貨監控器獲取當前期貨合約的月份
+        
+        Args:
+            futures_monitor: FuturesMonitor 實例 (可選)
+            
+        Returns:
+            str: 期貨合約月份，格式 "YYYY-MM" 或 None
+        """
+        try:
+            # 方法1: 如果提供了期貨監控器，直接獲取其合約
+            if futures_monitor and hasattr(futures_monitor, 'contract') and futures_monitor.contract:
+                contract = futures_monitor.contract
+                if hasattr(contract, 'delivery_date'):
+                    # 解析期貨合約的交割日期
+                    import datetime
+                    try:
+                        # Shioaji 期貨合約日期格式可能是 "YYYY/MM/DD"
+                        if "/" in contract.delivery_date:
+                            contract_date = datetime.datetime.strptime(contract.delivery_date, "%Y/%m/%d").date()
+                        else:
+                            contract_date = datetime.datetime.strptime(contract.delivery_date, "%Y-%m-%d").date()
+                        
+                        # 返回月份格式 "YYYY-MM"
+                        return contract_date.strftime("%Y-%m")
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️ Error parsing futures contract date: {e}[/yellow]")
+            
+            # 方法2: 嘗試從 API 獲取 TMF 合約
+            if self.api:
+                try:
+                    tmf_list = list(self.api.Contracts.Futures["TMF"])
+                    if tmf_list:
+                        # 過濾未過期合約並排序
+                        import datetime
+                        now = datetime.datetime.now()
+                        valid_contracts = []
+                        
+                        for contract in tmf_list:
+                            try:
+                                if "/" in contract.delivery_date:
+                                    contract_date = datetime.datetime.strptime(contract.delivery_date, "%Y/%m/%d").date()
+                                else:
+                                    contract_date = datetime.datetime.strptime(contract.delivery_date, "%Y-%m-%d").date()
+                                
+                                today = now.date()
+                                
+                                # 檢查合約是否有效（未過期）
+                                if contract_date > today:
+                                    valid_contracts.append(contract)
+                                elif contract_date == today:
+                                    # 檢查是否已過結算時間
+                                    settlement_time = now.replace(hour=13, minute=30, second=0, microsecond=0)
+                                    if now < settlement_time:
+                                        valid_contracts.append(contract)
+                            except Exception:
+                                continue
+                        
+                        if valid_contracts:
+                            # 按交割日期排序
+                            valid_contracts.sort(key=lambda c: c.delivery_date)
+                            first_contract = valid_contracts[0]
+                            
+                            # 解析並返回月份
+                            if "/" in first_contract.delivery_date:
+                                contract_date = datetime.datetime.strptime(first_contract.delivery_date, "%Y/%m/%d").date()
+                            else:
+                                contract_date = datetime.datetime.strptime(first_contract.delivery_date, "%Y-%m-%d").date()
+                            
+                            return contract_date.strftime("%Y-%m")
+                except Exception as e:
+                    console.print(f"[yellow]⚠️ Error getting TMF contracts: {e}[/yellow]")
+            
+            # 方法3: 使用當前時間推斷
+            import datetime
+            now = datetime.datetime.now()
+            return now.strftime("%Y-%m")
+            
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Error getting futures contract month: {e}[/yellow]")
+            import datetime
+            return datetime.datetime.now().strftime("%Y-%m")
+    
+    def get_options_by_month(self, symbol="TXO", target_month=None):
+        """[GSD Settlement Fix] 根據目標月份獲取選擇權合約
+        
+        Args:
+            symbol: 商品代號 (預設 TXO)
+            target_month: 目標月份字串，格式 "YYYY-MM" 或 "YYYY/MM"
+            
+        Returns:
+            tuple: (target_date, contracts_list) 或 (None, []) 如果找不到
+        """
+        import datetime
+        
+        # 1. 抓取該商品所有履約價合約
+        all_contracts = [c for c in self.api.Contracts.Options[symbol]]
+        
+        # 2. 如果沒有指定目標月份，使用 get_nearest_options
+        if not target_month:
+            return self.get_nearest_options(symbol)
+        
+        # 3. 標準化目標月份格式
+        try:
+            # 嘗試解析不同格式
+            if "/" in target_month:
+                target_date_obj = datetime.datetime.strptime(target_month, "%Y/%m").date()
+            else:
+                target_date_obj = datetime.datetime.strptime(target_month, "%Y-%m").date()
+            
+            target_year_month = target_date_obj.strftime("%Y-%m")
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Error parsing target month {target_month}: {e}[/yellow]")
+            return self.get_nearest_options(symbol)
+        
+        # 4. 過濾符合目標月份的合約
+        month_contracts = []
+        for contract in all_contracts:
+            try:
+                # 解析合約到期日 - 支援多種格式
+                contract_date = None
+                delivery_date = contract.delivery_date
+                
+                # 嘗試不同格式
+                for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
+                    try:
+                        contract_date = datetime.datetime.strptime(delivery_date, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+                
+                if contract_date is None:
+                    console.print(f"[yellow]⚠️ Cannot parse contract date: {delivery_date}[/yellow]")
+                    continue
+                
+                contract_year_month = contract_date.strftime("%Y-%m")
+                
+                if contract_year_month == target_year_month:
+                    month_contracts.append(contract)
+            except Exception as e:
+                console.print(f"[yellow]⚠️ Error parsing contract {contract.code}: {e}[/yellow]")
+                continue
+        
+        if not month_contracts:
+            console.print(f"[yellow]⚠️ No options found for target month {target_year_month}[/yellow]")
+            return self.get_nearest_options(symbol)
+        
+        # 5. 按到期日排序
+        def get_contract_date(contract):
+            """輔助函數：解析合約日期並返回可排序的日期對象"""
+            delivery_date = contract.delivery_date
+            for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
+                try:
+                    return datetime.datetime.strptime(delivery_date, fmt).date()
+                except ValueError:
+                    continue
+            return datetime.date.max  # 如果無法解析，返回最大日期
+        
+        month_contracts = sorted(month_contracts, key=get_contract_date)
+        
+        # 6. 取出該月份的第一個到期日
+        target_date_obj = get_contract_date(month_contracts[0])
+        target_date = target_date_obj.strftime("%Y-%m-%d")
+        target_list = [c for c in month_contracts if get_contract_date(c) == target_date_obj]
+        
+        return target_date, target_list
     
     def get_atm_contracts(self, contracts, spot_price, range_pts=200):
         """根據台指現價，過濾出正負 range_pts 點內的 ATM 合約"""
@@ -349,11 +577,16 @@ class ShioajiOptionsSmartMonitor:
         return atm_list
 
 
-    def find_best_contracts(self):
+    def find_best_contracts(self, futures_monitor=None):
+        """[GSD Settlement Fix] 尋找最佳選擇權合約，與期貨合約同步月份"""
         if self.dry_run:
             return self._setup_dry_run_contracts()
         
         try:
+            # [GSD Settlement Fix] 獲取期貨合約月份
+            futures_month = self.get_futures_contract_month(futures_monitor)
+            console.print(f"[cyan]📅 Futures contract month: {futures_month}[/cyan]")
+            
             # 1. 確保合約資訊是最新的 (特別是夜盤剛開始時)
             if self.api:
                 # 使用更強健的列表轉換
@@ -367,13 +600,13 @@ class ShioajiOptionsSmartMonitor:
                     console.print("[yellow]🔍 正在重新下載合約資訊...[/yellow]")
                     self.api.fetch_contracts()
             
-            # 2. 自動尋找最快到期的選擇權合約 (支援週選/月選)
-            nearest_date, contracts = self.get_nearest_options("TXO")
+            # 2. [GSD Settlement Fix] 根據期貨月份獲取選擇權合約
+            nearest_date, contracts = self.get_options_by_month("TXO", futures_month)
             if not contracts:
                 console.print("[red]❌ 錯誤：找不到任何有效的 TXO 選擇權合約。[/red]")
                 return False
             
-            console.print(f"[green]✅ 找到 {len(contracts)} 筆 {nearest_date} 到期合約[/green]")
+            console.print(f"[green]✅ 找到 {len(contracts)} 筆 {nearest_date} 到期合約 (同步期貨月份)[/green]")
             
             # 3. 獲取標的期貨並取得現價
             # Shioaji 中 小台指可能是 MTX 或 MXF，優先嘗試 MTX
@@ -721,6 +954,42 @@ class ShioajiOptionsSmartMonitor:
                 mid = (bid + ask) / 2
                 if self.market_data[key]["close"] <= 0 or key == "MTX":
                     self.market_data[key]["close"] = mid
+
+    def _wire_order_callbacks(self):
+        """Wire OrderManager callbacks for options (export + logging)."""
+        import json
+        from core.order_management.order import OrderStatus
+
+        def _save_orders_file():
+            """Export all orders to JSON for dashboard."""
+            if not self.order_mgr:
+                return
+            try:
+                all_orders = self.order_mgr.get_completed() + self.order_mgr.get_pending()
+                export_data = [o.to_dict() for o in all_orders]
+                today = datetime.datetime.now().strftime("%Y%m%d")
+                orders_file = Path(f"exports/trades/OPTIONS_{today}_orders.json")
+                orders_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(orders_file, "w", encoding="utf-8") as f:
+                    json.dump(export_data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                console.print(f"[yellow]⚠️ Failed to save options orders: {e}[/yellow]")
+
+        def _on_fill_callback(event):
+            console.print(f"[green]📦 Options Order FILLED: {event.side.value} {event.fill_qty} @ {event.fill_price:.0f}[/green]")
+            _save_orders_file()
+
+        def _on_cancel_callback(event):
+            console.print(f"[yellow]🚫 Options Order CANCELLED: {event.order_id} ({event.reason})[/yellow]")
+            _save_orders_file()
+
+        def _on_reject_callback(event):
+            console.print(f"[red]❌ Options Order REJECTED: {event.order_id} ({event.reason})[/red]")
+            _save_orders_file()
+
+        self.order_mgr.register_callback("on_fill", _on_fill_callback)
+        self.order_mgr.register_callback("on_cancel", _on_cancel_callback)
+        self.order_mgr.register_callback("on_reject", _on_reject_callback)
 
     def log_trade(self, action, side, price, note="", quantity=None):
         pnl = 0
