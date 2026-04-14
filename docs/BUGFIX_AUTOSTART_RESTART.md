@@ -158,6 +158,7 @@ grep "Futures config" logs/unified.log | tail -1   # 應顯示正確設定檔
 | 設定檔正確 | `grep "Futures config" logs/unified.log \| tail -1` | `futures_night.yaml` (夜盤) |
 | 無 crash | `grep "Critical crash" logs/unified.log \| tail -1` | 應是舊記錄 |
 | 數據更新 | `stat -f %m logs/unified.log` | 距今 < 60 秒 |
+| Dashboard session | 開啟 `localhost:8500` 看 sidebar | 顯示 🌙 夜盤 或 ☀️ 日盤 |
 
 ---
 
@@ -207,3 +208,4 @@ stat -f "%m" logs/unified.log  # 最後更新時間
 | cooldown 太長 | 10 分鐘冷卻 + exponential backoff | 降低至 60s，或改為固定 backoff |
 | 遺留狀態沒清理 | `/tmp/trading_crash_count` 重啟時保留 | 在 `autostart.sh` 啟動時清除 |
 | 無警報機制 | 期貨停了只寫日誌 | 加入 LINE/Email 通知 |
+| Dashboard 不顯示 session | 無法確認當前用日盤或夜盤設定 | ✅ **已修復** — sidebar 顯示 🌙/☀️ + 設定檔名 |
