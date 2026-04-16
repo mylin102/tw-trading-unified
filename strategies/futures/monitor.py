@@ -648,6 +648,9 @@ class FuturesMonitor:
             
             # [gstack Safety Guard] Real-time stop loss check on every tick
             if not self.dry_run and self.trader.position != 0:
+                # 1. Update trailing stop peak/floor
+                self.trader.update_trailing_stop(price)
+                # 2. Check for SL breach
                 self._check_stop_loss(tick.datetime, price)
         else:
             # Old data packet, ignore
@@ -1060,7 +1063,7 @@ class FuturesMonitor:
             "note": note,
         }, ticker="TMF")
 
-    def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, reason=None):
+    def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, trail_points=None, reason=None):
         action = None
         if signal == "BUY":
             action = "Buy"
@@ -1136,10 +1139,15 @@ class FuturesMonitor:
             self.paper_fill_sim.process_tick(self._make_synthetic_tick(price, ts))
             # Fall through to direct PaperTrader call for exits
 
+        # Sanitize zero values to None for PaperTrader logic
+        be_trigger = break_even_trigger if break_even_trigger and break_even_trigger > 0 else None
+        tp_trail = trail_points if trail_points and trail_points > 0 else None
+
         result = self.trader.execute_signal(
             signal, price, ts, lots=lots,
             max_lots=self.MGMT.get("max_positions", 2),
-            stop_loss=stop_loss, break_even_trigger=break_even_trigger, exit_reason=reason,
+            stop_loss=stop_loss, break_even_trigger=be_trigger, 
+            trail_points=tp_trail, exit_reason=reason,
         )
         if not result:
             from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
@@ -1889,5 +1897,7 @@ class FuturesMonitor:
             timestamp,
             lots,
             stop_loss=signal.stop_loss,
+            break_even_trigger=signal.break_even_trigger,
+            trail_points=signal.trail_points,
             reason=signal.reason,
         )

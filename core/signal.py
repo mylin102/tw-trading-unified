@@ -9,12 +9,14 @@ _VALID_ACTIONS = {"BUY", "SELL", "EXIT", "PARTIAL_EXIT"}
 
 @dataclass
 class Signal:
-    action: str  # BUY, SELL, EXIT, PARTIAL_EXIT
-    reason: str
+    action: str = ""  # BUY, SELL, EXIT, PARTIAL_EXIT
+    reason: str = ""
     stop_loss: float = 0.0
     target: float = 0.0
     confidence: float = 0.0
     quantity: int = 1
+    trail_points: float = 0.0
+    break_even_trigger: float = 0.0
 
     def validate(self) -> tuple[bool, str]:
         """Return (is_valid, error_message)."""
@@ -38,4 +40,6 @@ class Signal:
             "target": self.target,
             "confidence": self.confidence,
             "quantity": self.quantity,
+            "trail_points": self.trail_points,
+            "break_even_trigger": self.break_even_trigger,
         }

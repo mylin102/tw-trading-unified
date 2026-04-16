@@ -95,6 +95,8 @@ class PaperTrader:
         self.current_stop_loss = None
         self.be_triggered = False
         self.be_points = None
+        self.trail_points = None  # GSD: Points to trail from peak profit
+        self._best_price = 0      # GSD: Tracks peak (long) or floor (short)
         
         # SQLite 持久化
         self.db = None
@@ -208,15 +210,17 @@ class PaperTrader:
             return {}
         return self.db.get_performance_summary(start_date, end_date)
 
-    def execute_signal(self, signal: str, price: float, timestamp: datetime, lots=1, max_lots=1, stop_loss=None, break_even_trigger=None, exit_reason: str = None):
+    def execute_signal(self, signal: str, price: float, timestamp: datetime, lots=1, max_lots=1, stop_loss=None, break_even_trigger=None, trail_points=None, exit_reason: str = None):
         if signal == "BUY":
             if self.position < max_lots:
                 if self.position < 0:
                     self.execute_signal("EXIT", price, timestamp)
                 if self.position == 0:
                     self.entry_price, self.entry_time, self.be_triggered = price, timestamp, False
+                    self._best_price = price
                     self.current_stop_loss = price - stop_loss if stop_loss else None
                     self.be_points = break_even_trigger
+                    self.trail_points = trail_points
                 else:
                     self.entry_price = ((self.entry_price * self.position) + (price * lots)) / (self.position + lots)
                 self.position += lots
@@ -237,8 +241,10 @@ class PaperTrader:
                     self.execute_signal("EXIT", price, timestamp)
                 if self.position == 0:
                     self.entry_price, self.entry_time, self.be_triggered = price, timestamp, False
+                    self._best_price = price
                     self.current_stop_loss = price + stop_loss if stop_loss else None
                     self.be_points = break_even_trigger
+                    self.trail_points = trail_points
                 else:
                     self.entry_price = ((self.entry_price * abs(self.position)) + (price * lots)) / (abs(self.position) + lots)
                 self.position -= lots
@@ -277,6 +283,7 @@ class PaperTrader:
             # SDD: State change BEFORE side effects (DB write, log append)
             if signal == "EXIT" or lots_to_exit == abs(self.position):
                 self.position, self.entry_price, self.current_stop_loss = 0, 0, None
+                self._best_price, self.be_triggered, self.trail_points = 0, False, None
             else:
                 self.position = (abs(self.position) - lots_to_exit) * (1 if self.position > 0 else -1)
 
@@ -291,14 +298,52 @@ class PaperTrader:
         return None
 
     def update_trailing_stop(self, current_price: float):
-        if self.position == 0 or not self.be_points or self.be_triggered:
+        if self.position == 0:
             return False
-        pnl = (current_price - self.entry_price) * (1 if self.position > 0 else -1)
-        if pnl >= self.be_points:
-            self.current_stop_loss = self.entry_price + (10 * (1 if self.position > 0 else -1))
-            self.be_triggered = True
-            return True
-        return False
+            
+        changed = False
+        sign = 1 if self.position > 0 else -1
+        
+        # 1. Update Best Price (Peak for long, Floor for short)
+        if self._best_price == 0:
+            self._best_price = current_price
+        
+        if self.position > 0:
+            if current_price > self._best_price:
+                self._best_price = current_price
+                changed = True
+        else:
+            if current_price < self._best_price:
+                self._best_price = current_price
+                changed = True
+
+        # 2. Breakeven logic (One-time move to entry + buffer)
+        if self.be_points and not self.be_triggered:
+            pnl = (current_price - self.entry_price) * sign
+            if pnl >= self.be_points:
+                # Move SL to entry + 10 pts profit (guarantee win)
+                self.current_stop_loss = self.entry_price + (10 * sign)
+                self.be_triggered = True
+                changed = True
+
+        # 3. Continuous Trailing logic
+        if self.trail_points:
+            new_sl = self._best_price - (self.trail_points * sign)
+            if self.current_stop_loss is None:
+                self.current_stop_loss = new_sl
+                changed = True
+            else:
+                # Long: move SL UP only. Short: move SL DOWN only.
+                if self.position > 0:
+                    if new_sl > self.current_stop_loss:
+                        self.current_stop_loss = new_sl
+                        changed = True
+                else:
+                    if new_sl < self.current_stop_loss:
+                        self.current_stop_loss = new_sl
+                        changed = True
+        
+        return changed
 
     def check_stop_loss(self, price: float, timestamp: datetime):
         if self.position > 0 and self.current_stop_loss and price <= self.current_stop_loss:

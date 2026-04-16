@@ -338,11 +338,17 @@ def strategy_cumulative_delta(state, cfg):
 
     # Long: cum delta rising + price > SMA + price pulled back from lookback ago
     if cd_now > cd_past and price > sma and price < c[-lookback]:
-        return {"action": "BUY", "reason": "CUM_DELTA", "stop_loss": sl}
+        return {
+            "action": "BUY", "reason": "CUM_DELTA", "stop_loss": sl,
+            "break_even_trigger": 20.0, "trail_points": 30.0
+        }
 
     # Short: cum delta falling + price < SMA + price bounced from lookback ago
     if cd_now < cd_past and price < sma and price > c[-lookback]:
-        return {"action": "SELL", "reason": "CUM_DELTA", "stop_loss": sl}
+        return {
+            "action": "SELL", "reason": "CUM_DELTA", "stop_loss": sl,
+            "break_even_trigger": 20.0, "trail_points": 30.0
+        }
     return None
 
 
