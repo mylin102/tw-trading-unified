@@ -645,6 +645,10 @@ class FuturesMonitor:
             bar["low"] = min(bar["low"], price)
             bar["close"] = price
             bar["volume"] += vol
+            
+            # [gstack Safety Guard] Real-time stop loss check on every tick
+            if not self.dry_run and self.trader.position != 0:
+                self._check_stop_loss(tick.datetime, price)
         else:
             # Old data packet, ignore
             return
@@ -1113,6 +1117,8 @@ class FuturesMonitor:
 
         if signal in ("BUY", "SELL"):
             self._last_entry_reason = reason
+            # [Bug Fix] Initialize trail peak to entry price
+            self._atr_trail_peak = price
             # GSD Phase 0b: Reset consecutive losses on new entry
             self.consecutive_losses = 0
             # GSD Phase 0d: Reset bar counter on new entry
@@ -1758,7 +1764,7 @@ class FuturesMonitor:
             return
 
         self.has_tp1_hit = False
-        self._atr_trail_peak = 0.0  # Reset ATR trail for new position
+        # [Bug fix] Only reset trail peak on ACTUAL new entry intent
         stop_loss_pts = self.RISK.get("stop_loss_pts", 60)
         if self.ATR_MULT > 0:
             atr_val = last_5m.get("atr", 0)

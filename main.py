@@ -376,12 +376,12 @@ def run_system(dry_run=False):
                 last_data_at = latest_tick
                 stagnation_warned = False  # tick 恢復，重置警告
             
-            # 哨兵邏輯：二次確認 — 5 分鐘警告，10 分鐘才重啟（全天候監控，含夜盤）
+            # 哨兵邏輯：二次確認 — 3 分鐘警告，5 分鐘就重啟（全天候監控，含夜盤）
             stale_secs = now - last_data_at
-            if stale_secs > 600:
+            if stale_secs > 300:
                 console.print(f"[bold red]🚨 DATA STAGNATION CONFIRMED! No data for {stale_secs/60:.1f} mins (fm={now-fm_last:.1f}s, om={now-om_last:.1f}s ago). Force restarting...[/bold red]")
                 break
-            elif stale_secs > 300 and not stagnation_warned:
+            elif stale_secs > 180 and not stagnation_warned:
                 console.print(f"[bold yellow]⚠️ DATA WARNING: No data for {stale_secs/60:.1f} mins. Watching...[/bold yellow]")
                 stagnation_warned = True
             
