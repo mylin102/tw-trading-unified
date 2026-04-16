@@ -7,7 +7,7 @@
 # 5. 日誌輪轉：保留 7 天，防止磁碟爆滿
 
 UNIFIED_DIR="/Users/mylin/Documents/mylin102/tw-trading-unified"
-PYTHON_EXEC="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
+PYTHON_EXEC="/Library/Frameworks/Python.framework/Versions/3.13/bin/python3"
 LOG_DIR="$UNIFIED_DIR/logs"
 mkdir -p "$LOG_DIR"
 cd "$UNIFIED_DIR"

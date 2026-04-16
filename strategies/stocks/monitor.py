@@ -774,8 +774,7 @@ class StockMonitor:
                             "strategy": self.strat_name,
                             "mode": self.mode_tag
                         }
-                            
-                            orders_data.append(order_dict)
+                        orders_data.append(order_dict)
                 except Exception as e:
                     console.print(f"[yellow]⚠️ Failed to fetch live orders: {e}[/yellow]")
             
