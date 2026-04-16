@@ -33,6 +33,10 @@ class DataManager:
             # Ensure index is datetime and sorted
             if not pd.api.types.is_datetime64_any_dtype(df.index):
                 df.index = pd.to_datetime(df.index)
+            
+            # GSD: Filter out NaT indices which cause 'NaTType' attribute errors
+            df = df[df.index.notnull()]
+            
             return df.sort_index()
         except Exception as e:
             print(f"Error loading {ticker}: {e}")

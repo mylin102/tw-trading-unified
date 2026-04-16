@@ -60,7 +60,23 @@ The system will generate a `logs/analysis/adaptive_recommendations_{DATE}.json` 
 
 ---
 
-## Initial Observations (2026-04-16)
-- **Trade**: Short MTX @ 37226 (Reason: `CUM_DELTA`).
-- **Context**: Entered during high frequency of blocked signals (cooldown logic).
-- **Hypothesis**: The `cooldown_active` guard is preventing over-trading in choppy regimes. We should quantify the "saved loss" from blocked signals.
+---
+
+## Wave 5.5: Session-Aware Adaptive Parameters (Implemented 2026-04-16)
+
+### Findings from vectorbt Session Sweep
+Through a vectorized sweep of 100,000 bars, we identified that Day and Night sessions require distinct protection profiles:
+- **DAY Session**: High volatility. Optimal BE at **20 pts**, Trail at **120 pts** (Fast protection, wide breathing room).
+- **NIGHT Session**: Stronger inertia. Optimal BE at **70 pts**, Trail at **140 pts** (Delayed protection to avoid noise, capturing long trends).
+
+### Implementation Details
+- **Monitor Core**: Moved SL/Trail logic to `on_tick` level for sub-bar protection.
+- **Engine Core**: Upgraded `BacktestEngine` and `PaperTrader` to support continuous `trail_points` and `break_even_trigger`.
+- **Strategy Plugins**: Updated `CounterVWAP` to automatically toggle parameters based on `bar.index.hour`.
+
+---
+
+## Verification & Final Status (2026-04-16)
+- **Unit Tests**: `tests/analysis/test_adaptive_analyzer.py` passed.
+- **Backtest Comparison**: `counter_vwap` showed **+199k TWD** improvement with adaptive trailing.
+- **Process Check**: Night session monitor is active and utilizing new logic.

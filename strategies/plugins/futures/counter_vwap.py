@@ -113,6 +113,11 @@ class CounterVWAP(StrategyBase):
 
         # ── 失敗驗證 (未創新高/低 + 動能反轉 或 VWAP 拒絕) ──
         sl_pts = atr * atr_sl_mult if atr > 0 else 60
+        
+        # Adaptive: Session-Aware Trailing Params (from vbt sweep)
+        is_day = 8 <= bar.index.hour < 15 if hasattr(bar.index, 'hour') else True
+        be_trigger = 20.0 if is_day else 70.0
+        trail_pts = 120.0 if is_day else 140.0
 
         # Bullish fire failed → COUNTER_SELL
         if self._fire_pending_dir == 1:
@@ -127,7 +132,7 @@ class CounterVWAP(StrategyBase):
                     conf = 0.85  # Boost confidence
                 return Signal("SELL", "COUNTER_VWAP", close + sl_pts,
                               target=vwap, confidence=conf,
-                              break_even_trigger=20.0, trail_points=40.0)
+                              break_even_trigger=be_trigger, trail_points=trail_pts)
 
         # Bearish fire failed → COUNTER_BUY
         elif self._fire_pending_dir == -1:
@@ -142,7 +147,7 @@ class CounterVWAP(StrategyBase):
                     conf = 0.85  # Boost confidence
                 return Signal("BUY", "COUNTER_VWAP", close - sl_pts,
                               target=vwap, confidence=conf,
-                              break_even_trigger=20.0, trail_points=40.0)
+                              break_even_trigger=be_trigger, trail_points=trail_pts)
 
         return None
 

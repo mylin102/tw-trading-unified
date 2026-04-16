@@ -44,13 +44,35 @@ class BacktestPosition:
     stop_loss: float = 0.0
     target: float = 0.0
     high_water: float = 0.0
+    break_even_trigger: float = 0.0
+    trail_points: float = 0.0
+    be_triggered: bool = False
 
     def __post_init__(self):
         self.high_water = self.entry_price
 
     def update_high_water(self, current_price: float):
+        sign = 1 if self.qty > 0 else -1
+        # Update high water mark
         if self.qty > 0: self.high_water = max(self.high_water, current_price)
         else: self.high_water = min(self.high_water, current_price)
+        
+        # 1. Breakeven logic
+        if self.break_even_trigger > 0 and not self.be_triggered:
+            pnl = (current_price - self.entry_price) * sign
+            if pnl >= self.break_even_trigger:
+                self.stop_loss = self.entry_price + (10 * sign)
+                self.be_triggered = True
+        
+        # 2. Continuous Trailing logic
+        if self.trail_points > 0:
+            new_sl = self.high_water - (self.trail_points * sign)
+            if self.qty > 0:
+                if self.stop_loss == 0 or new_sl > self.stop_loss:
+                    self.stop_loss = new_sl
+            else:
+                if self.stop_loss == 0 or new_sl < self.stop_loss:
+                    self.stop_loss = new_sl
 
     def check_exit(self, price: float) -> Optional[str]:
         if self.qty > 0:
@@ -168,7 +190,12 @@ class BacktestEngine:
             margin = qty * self.profile.margin_per_lot if self.profile.asset_type == AssetType.FUTURES else price * qty * self.profile.point_value
             if self.cash >= margin + cost:
                 self.cash -= (margin + cost)
-                self.positions[ticker] = BacktestPosition(ticker, price, (1 if signal.action == "BUY" else -1) * qty, ts, stop_loss=signal.stop_loss, target=signal.target)
+                self.positions[ticker] = BacktestPosition(
+                    ticker, price, (1 if signal.action == "BUY" else -1) * qty, ts, 
+                    stop_loss=signal.stop_loss, target=signal.target,
+                    break_even_trigger=signal.break_even_trigger,
+                    trail_points=signal.trail_points
+                )
                 self.trade_log.append({"timestamp": ts, "ticker": ticker, "action": signal.action, "price": price, "qty": qty, "reason": signal.reason, "pnl": 0.0})
         elif signal.action == "EXIT" and ticker in self.positions:
             pos = self.positions.pop(ticker)
