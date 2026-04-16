@@ -64,7 +64,7 @@ pricing:
   risk_free_rate: 0.02
   strike_rounding: 100
 risk_mgmt:
-  entry_premium_limit: 250
+  entry_premium_limit: 1500
   initial_capital: 40000
   lots_per_trade: 1
   max_daily_loss: 0.02

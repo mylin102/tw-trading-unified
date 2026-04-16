@@ -179,19 +179,25 @@ class ShioajiOptionsSmartMonitor:
         self.peak_premium = 0.0
         self.cooldown_until = 0
         self.cooldown_bars = int(self.strategy_cfg.get("cooldown_bars", 0))
-        self.trailing_stop_pct = float(self.m_cfg.get("trailing_stop_pct", 0))
-        self.last_signal = None
-
+        
         # ThetaGang (sell premium) integration
         self._theta_gang = None
         self._theta_cfg = self.full_cfg.get("theta_gang", {})
+        
+        # [GSD Fix] 提高 Theta 交易冷卻優先級
         if self._theta_cfg.get("enabled", False):
+            theta_cd = int(self._theta_cfg.get("cooldown_bars", 0))
+            if theta_cd > self.cooldown_bars:
+                self.cooldown_bars = theta_cd
+                console.print(f"[cyan][ThetaGang] Using extended cooldown: {self.cooldown_bars} bars[/cyan]")
+            
             try:
                 from theta_gang import ThetaGangManager
                 self._theta_gang = ThetaGangManager(self.full_cfg, self._bs, self.strike_rounding)
                 console.print(f"[bold cyan][ThetaGang] {self._theta_gang.strategy} enabled (auto_regime={self._theta_cfg.get('auto_regime', True)})[/bold cyan]")
             except Exception as e:
                 console.print(f"[yellow][ThetaGang] init failed: {e}[/yellow]")
+        self._theta_bars_held = 0
         self.last_status_print_at = None
         self.last_kbars_fetch_at = 0.0
         self.latest_score = 0.0
@@ -2285,13 +2291,22 @@ class ShioajiOptionsSmartMonitor:
 
                     # Manage existing ThetaGang position
                     if self._theta_gang.position and self._theta_gang.position.is_open:
+                        self._theta_bars_held += 1
                         spot = float(self.market_data["MTX"]["close"])
                         contract = self.active_contracts.get("C") or self.active_contracts.get("P")
                         dte_years = float(self._dte(getattr(contract, "delivery_date", None))) if contract else 0.03
                         iv = self.latest_iv or 0.25
                         exit_info = self._theta_gang.evaluate_exit(spot, iv, dte_years, squeeze_on)
+                        
+                        # 💡 GSD: 最小持倉時間檢查
+                        min_hold = int(self._theta_cfg.get("min_holding_bars", 0))
+                        if exit_info and self._theta_bars_held < min_hold:
+                            console.print(f"[dim][ThetaGang] Exit signal deferred: held {self._theta_bars_held}/{min_hold} bars[/dim]")
+                            exit_info = None
+
                         if exit_info:
                             pos = self._theta_gang.close_position()
+                            self._theta_bars_held = 0
                             # GSD fix: ThetaGang has pre-computed PnL, don't recalculate through log_trade
                             theta_pnl = round(exit_info["pnl"], 0)
                             # 計算累計Balance（從現有ledger）
@@ -2331,6 +2346,7 @@ class ShioajiOptionsSmartMonitor:
                         entry_info = self._theta_gang.evaluate_entry(spot, iv, dte_years, squeeze_on)
                         if entry_info:
                             pos = self._theta_gang.open_position(entry_info)
+                            self._theta_bars_held = 0
                             # Create a readable string of position legs
                             legs_str = " | ".join(f"{leg.action} {leg.side}{leg.strike}" for leg in pos.legs)
                             # 記錄實際收取的權利金作為進場價
