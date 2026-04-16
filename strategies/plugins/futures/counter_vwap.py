@@ -126,7 +126,8 @@ class CounterVWAP(StrategyBase):
                 if bias < 0:  # Momentum accelerating downward
                     conf = 0.85  # Boost confidence
                 return Signal("SELL", "COUNTER_VWAP", close + sl_pts,
-                              target=vwap, confidence=conf)
+                              target=vwap, confidence=conf,
+                              break_even_trigger=20.0, trail_points=40.0)
 
         # Bearish fire failed → COUNTER_BUY
         elif self._fire_pending_dir == -1:
@@ -140,7 +141,8 @@ class CounterVWAP(StrategyBase):
                 if bias > 0:  # Momentum accelerating upward
                     conf = 0.85  # Boost confidence
                 return Signal("BUY", "COUNTER_VWAP", close - sl_pts,
-                              target=vwap, confidence=conf)
+                              target=vwap, confidence=conf,
+                              break_even_trigger=20.0, trail_points=40.0)
 
         return None
 
