@@ -179,6 +179,7 @@ class ShioajiOptionsSmartMonitor:
         self.peak_premium = 0.0
         self.cooldown_until = 0
         self.cooldown_bars = int(self.strategy_cfg.get("cooldown_bars", 0))
+        self.last_signal = None
         
         # ThetaGang (sell premium) integration
         self._theta_gang = None
@@ -2298,10 +2299,12 @@ class ShioajiOptionsSmartMonitor:
                         iv = self.latest_iv or 0.25
                         exit_info = self._theta_gang.evaluate_exit(spot, iv, dte_years, squeeze_on)
                         
-                        # 💡 GSD: 最小持倉時間檢查
+                        # 💡 GSD: 最小持倉時間檢查 (停損 SL 必須優先於持倉時間，強制出場)
                         min_hold = int(self._theta_cfg.get("min_holding_bars", 0))
-                        if exit_info and self._theta_bars_held < min_hold:
-                            console.print(f"[dim][ThetaGang] Exit signal deferred: held {self._theta_bars_held}/{min_hold} bars[/dim]")
+                        is_sl = exit_info and "SL" in exit_info.get("reason", "")
+                        
+                        if exit_info and not is_sl and self._theta_bars_held < min_hold:
+                            console.print(f"[dim][ThetaGang] Exit signal ({exit_info['reason']}) deferred: held {self._theta_bars_held}/{min_hold} bars[/dim]")
                             exit_info = None
 
                         if exit_info:
