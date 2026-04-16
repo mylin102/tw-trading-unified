@@ -1,0 +1,15 @@
+{
+  "exp_id": "EXP_20260412_071540_spring_upthrust_audit",
+  "timestamp": "2026-04-12T07:15:40.327020",
+  "strategy": "spring_upthrust",
+  "metrics": {
+    "total_pnl": -644712.255,
+    "win_rate": 0.0,
+    "trade_count": 20,
+    "sharpe": -2.906561133417892,
+    "mdd": -0.8375965499999998
+  },
+  "params": {},
+  "git_hash": "7a8a497",
+  "tag": "audit"
+}

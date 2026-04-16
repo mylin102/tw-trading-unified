@@ -34,7 +34,7 @@ def download_futures_today(api, csv_path):
     print(f"Contract: {target.code}")
 
     kbars = api.kbars(target, start=today, end=today)
-    if not kbars or len(kbars.ts) == 0:
+    if kbars is None or (hasattr(kbars, 'ts') and len(kbars.ts) == 0):
         print("No data returned. Market may be closed.")
         return
 
@@ -79,7 +79,7 @@ def download_stocks_today(api):
         try:
             contract = api.Contracts.Stocks[ticker]
             kbars = api.kbars(contract, start=today, end=today)
-            if not kbars or len(kbars.ts) == 0:
+            if kbars is None or (hasattr(kbars, 'ts') and len(kbars.ts) == 0):
                 print(f"  {ticker}: no data")
                 continue
 

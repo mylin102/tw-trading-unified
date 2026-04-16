@@ -180,16 +180,33 @@ class ShioajiClient:
             return None
         try:
             if ticker == 'TXFR1':
-                return self.api.Contracts.Futures.TXF.TXFR1
+                return self.api.Contracts.Futures["TXF"]["TXFR1"]
             if ticker == 'MXFR1':
-                return self.api.Contracts.Futures.MXF.MXFR1
+                return self.api.Contracts.Futures["MXF"]["MXFR1"]
             if ticker == 'TMF':
-                # 用近月 R1
-                return self.api.Contracts.Futures.TMF.TMFR1
+                # 使用與 FuturesMonitor 相同的邏輯：選擇交割日最近的合約
+                tmf_list = list(self.api.Contracts.Futures.TMF)
+                if not tmf_list:
+                    print("[shioaji_client] 無 TMF 合約可用")
+                    return None
+                
+                # 過濾有效合約
+                from datetime import datetime
+                now_str = datetime.now().strftime("%Y/%m/%d")
+                valid_contracts = [c for c in tmf_list if c.delivery_date >= now_str]
+                
+                if valid_contracts:
+                    # 按交割日排序，選擇最近的
+                    sorted_contracts = sorted(valid_contracts, key=lambda c: c.delivery_date)
+                    return sorted_contracts[0]
+                else:
+                    # 無有效合約，使用第一個
+                    return tmf_list[0]
             # 支援直接指定合約代碼如 TMFD6
             category = ticker[:3] if len(ticker) > 3 else ticker
             return self.api.Contracts.Futures[category][ticker]
-        except Exception:
+        except Exception as e:
+            print(f"[shioaji_client] 獲取合約 {ticker} 錯誤: {e}")
             return None
 
     def place_order(self, contract, action: str, quantity: int, price: float = 0):

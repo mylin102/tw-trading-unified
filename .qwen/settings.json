@@ -88,7 +88,15 @@
       "Bash(source *)",
       "Bash(python *)",
       "Bash(hermes *)",
-      "Bash(git reset *)"
+      "Bash(git reset *)",
+      "Bash(git rm *)",
+      "Bash(crontab *)",
+      "Bash(/library/frameworks/python.framework/versions/3.12/bin/python3 *)",
+      "Bash(pstree *)",
+      "Bash(git stash)",
+      "Bash(git stash *)",
+      "Bash(setsid *)",
+      "Bash(pm2 *)"
     ]
   },
   "$version": 3

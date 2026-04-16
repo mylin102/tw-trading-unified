@@ -172,6 +172,16 @@ def calculate_stock_squeeze(
         lookback=60, pb_buffer=1.002, ema_macro=ema_macro,
     )
 
+    # GSD: Ensure technical indicator columns exist even if DataFrame is short
+    # Add missing technical indicator columns with NaN values
+    tech_indicator_cols = ["macd", "macd_signal", "macd_hist", "macd_rising", 
+                          "k_val", "d_val", "adx", "dmp", "dmn",
+                          "bb_lower", "bb_mid", "bb_upper"]
+    
+    for col in tech_indicator_cols:
+        if col not in res.columns:
+            res[col] = np.nan
+    
     if len(df) < max(macd_slow, adx_length, kd_length):
         return res
 

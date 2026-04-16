@@ -36,7 +36,7 @@ risk_mgmt:
   trailing_stop_enabled: true
   trailing_stop_trigger_pts: 100
 strategy:
-  active_strategy: psar_breakout
+  active_strategy: counter_vwap
   auto_select: false
   counter_mode:
     atr_sl_mult: 2.0
@@ -72,6 +72,6 @@ strategy:
 trade_mgmt:
   allow_long: true
   allow_short: true
-  force_close_at_end: false
+  force_close_at_end: true
   lots_per_trade: 1
   max_positions: 2

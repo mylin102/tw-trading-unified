@@ -1,0 +1,27 @@
+# 選擇權策略配置
+strategy: "v2_squeeze"
+active_mode: "night"  # V3夜盤模式 (Q1回測最佳)
+
+# 進場參數
+entry_score: 80       # Sharpe 2.08
+min_dte_to_exit: 2    # 最小到期日
+
+# 風險參數
+stop_loss_pct: 0.10   # 10%
+tp1_pct: 1.0          # 100%
+
+# 資金管理
+max_position_size: 2  # 最大部位數
+capital_allocation: 0.3  # 30%資金分配
+
+# 監控設定
+monitor_interval: 60  # 監控間隔(秒)
+log_level: "INFO"
+
+# 交易時段
+trading_hours:
+  day_session: "08:45-13:45"
+  night_session: "15:00-05:00"
+  
+# 強制平倉時間
+force_close_time: "04:30"

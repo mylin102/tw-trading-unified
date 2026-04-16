@@ -22,6 +22,7 @@ monitoring:
   data_mode: hybrid
   pb_confirmation_bars: 12
   poll_interval_secs: 30
+  use_order_manager: true
 risk_mgmt:
   atr_length: 14
   atr_multiplier: 2.2
@@ -71,6 +72,6 @@ strategy:
 trade_mgmt:
   allow_long: true
   allow_short: true
-  force_close_at_end: false
+  force_close_at_end: true
   lots_per_trade: 1
   max_positions: 2

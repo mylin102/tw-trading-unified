@@ -30,7 +30,7 @@ def download_all(api, tickers, months=3):
                 continue
 
             kbars = api.kbars(contract, start=start_date)
-            if not kbars or len(kbars.ts) == 0:
+            if kbars is None or (hasattr(kbars, 'ts') and len(kbars.ts) == 0):
                 print(f"  [{i}/{len(tickers)}] {ticker}: No data returned")
                 continue
 

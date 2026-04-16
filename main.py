@@ -105,11 +105,11 @@ def bidask_dispatcher(futures_mon, options_mon):
             matched = False
             for key in ["C", "P", "MTX"]:
                 con = mon.active_contracts.get(key)
-                if con and (code == getattr(con, "code", None) or (key == "MTX" and code.startswith("MXF"))):
+                # [GSD Settlement Fix] Strict code matching to avoid cross-month price contamination
+                if con and code == getattr(con, "code", None):
                     mon.market_data[key]["bid"] = float(bid)
                     mon.market_data[key]["ask"] = float(ask)
-                    if mon.market_data[key]["close"] <= 0 or key == "MTX":
-                        mon.market_data[key]["close"] = mid
+                    mon.market_data[key]["close"] = mid
                     
                     # 💡 GSD: Update freshness timestamp to prevent watchdog from restarting
                     mon.last_tick_at = time.time()
@@ -121,8 +121,9 @@ def bidask_dispatcher(futures_mon, options_mon):
                         futures_mon.market_data["MTX"]["close"] = mid
                     
                     matched = True
-                    if code.startswith("MXF"):
-                        console.print(f"[green]✅ MTX updated: {mon.market_data['MTX']['close']:.0f}[/green]")
+                    # Log MTX updates specifically for visibility
+                    if key == "MTX":
+                        console.print(f"[green]✅ MTX updated ({code}): {mon.market_data['MTX']['close']:.0f}[/green]")
                     break
             
             if not matched and code not in _seen:
@@ -264,7 +265,7 @@ def run_system(dry_run=False):
         # main.py now only handles Futures + Options which share the FOP callback session.
 
         # 先初始化 contracts，再訂閱
-        om.monitor.find_best_contracts()
+        om.monitor.find_best_contracts(fm)  # [GSD Settlement Fix] 傳遞期貨監控器以同步月份
         om.monitor.pre_fill_bars()
 
         if api is not None:

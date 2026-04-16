@@ -107,6 +107,7 @@ class FuturesMonitor:
         self.consecutive_losses = 0
         self.session_losses = []  # [(timestamp, pnl_pts, exit_reason, session)]
         self.session_type = None  # "day" or "night", set per bar
+        self.previous_session_type = None  # Track previous session for transition detection
         self._last_bar_context = {}  # Phase 0c: snapshot for entry diagnostic
 
         # GSD Phase 3: Circuit Breaker integration (Phase 1)
@@ -267,9 +268,23 @@ class FuturesMonitor:
         try:
             tmf_list = list(self.api.Contracts.Futures.TMF)
             if tmf_list:
-                # Filter out expired or invalid
-                now_str = datetime.now().strftime("%Y/%m/%d")
-                valid_contracts = [c for c in tmf_list if c.delivery_date >= now_str]
+                # [GSD Settlement Fix] Filter out expired or invalid
+                # On settlement day (3rd Wednesday), the front-month expires at 13:30.
+                now = datetime.now()
+                now_str = now.strftime("%Y/%m/%d")
+                settlement_time = now.replace(hour=13, minute=30, second=0, microsecond=0)
+                
+                valid_contracts = []
+                for c in tmf_list:
+                    # Shioaji delivery_date format: "YYYY/MM/DD"
+                    if c.delivery_date > now_str:
+                        valid_contracts.append(c)
+                    elif c.delivery_date == now_str:
+                        # If today is settlement day, only use it if before 13:30
+                        if now < settlement_time:
+                            valid_contracts.append(c)
+                        else:
+                            console.print(f"[yellow][FuturesMonitor] Settlement day detected ({now_str}), skipping expired contract {c.code} after 13:30[/yellow]")
                 
                 # Sort by delivery date (ascending)
                 tmf_sorted = sorted(valid_contracts, key=lambda c: c.delivery_date)
@@ -279,12 +294,13 @@ class FuturesMonitor:
                     self.contract = tmf_sorted[0]
                     console.print(f"[green][FuturesMonitor] ✓ TMF front-month: {self.contract.code} (delivers {self.contract.delivery_date})[/green]")
                 else:
-                    self.contract = tmf_list[0]
-                    console.print(f"[yellow][FuturesMonitor] No future delivery found, using first available: {self.contract.code}[/yellow]")
+                    # Fallback to absolute nearest if no valid ones found (shouldn't happen in live)
+                    self.contract = sorted(tmf_list, key=lambda c: c.delivery_date)[0]
+                    console.print(f"[yellow][FuturesMonitor] No future delivery found, using absolute nearest: {self.contract.code}[/yellow]")
                 
                 # Log all available codes for verification
                 all_codes = [f"{c.code}({c.delivery_date})" for c in tmf_sorted]
-                console.print(f"[dim][FuturesMonitor] Sorted TMF queue: {', '.join(all_codes)}[/dim]")
+                console.print(f"[dim][FuturesMonitor] Valid TMF queue: {', '.join(all_codes)}[/dim]")
             else:
                 console.print("[red][FuturesMonitor] No TMF contracts found![/red]")
         except Exception as e:
@@ -574,16 +590,27 @@ class FuturesMonitor:
         self.last_tick_at = time.time()  # [gstack] 更新數據更新時間
         
         # 💡 GSD: Data Continuity Fix
-        # Accept TMF ticks OR MTX/MXF ticks to drive bar building
-        is_tmf = tick.code.startswith("TMF") or (self.contract and tick.code == self.contract.code)
+        # Use strict matching for the primary TMF contract
+        is_tmf = self.contract and tick.code == self.contract.code
+        # For MTX, we still allow startswith for the heartbeat, but we MUST NOT use its price for TMF bars
         is_mtx = tick.code.startswith("MXF") or tick.code.startswith("MTX")
         
         if not is_tmf and not is_mtx:
             return
             
-        # Build 5m bars from ticks
-        price = float(tick.close)
-        # Only count volume for TMF to keep indicators accurate, but use price from both
+        # [GSD Settlement Fix] If it's an MTX tick, it's just a heartbeat to drive timing.
+        # We use the last known TMF price to avoid price contamination (TMF != MTX).
+        if is_tmf:
+            price = float(tick.close)
+            self._last_tmf_price = price # Cache for heartbeat
+        else:
+            # It's an MTX heartbeat tick
+            if not hasattr(self, '_last_tmf_price') or self._last_tmf_price <= 0:
+                # No TMF price yet, can't build bar
+                return
+            price = self._last_tmf_price
+            
+        # Only count volume for TMF to keep indicators accurate
         vol = int(getattr(tick, "volume", 0)) if is_tmf else 0
         
         # [Wave 1 optimization] Use integer time bucketing to avoid expensive pd.Timestamp().floor()
@@ -1395,6 +1422,36 @@ class FuturesMonitor:
     def stop(self):
         self._running = False
 
+    def _cancel_all_pending_orders(self):
+        """Cancel all pending orders (limit/market) when session transitions from night to day."""
+        if self.dry_run:
+            console.print("[dim]dry-run: skipping order cancellation[/dim]")
+            return
+        
+        cancelled_count = 0
+        try:
+            # If order manager is enabled, use it
+            if self.order_mgr:
+                pending = self.order_mgr.get_pending_orders()
+                for order in pending:
+                    try:
+                        self.order_mgr.cancel_order(order.id)
+                        console.print(f"[yellow]✓ Cancelled pending order {order.id}[/yellow]")
+                        cancelled_count += 1
+                    except Exception as e:
+                        console.print(f"[red]Failed to cancel order {order.id}: {e}[/red]")
+            else:
+                # Fallback: direct API cancellation for futures orders
+                # This is a simplistic implementation - may need enhancement
+                console.print("[yellow]⚠️ Order manager not enabled; manual API cancellation not implemented yet[/yellow]")
+        except Exception as e:
+            console.print(f"[red]Error in _cancel_all_pending_orders: {e}[/red]")
+        
+        if cancelled_count == 0:
+            console.print("[dim]No pending orders to cancel[/dim]")
+        else:
+            console.print(f"[bold green]✅ Cancelled {cancelled_count} pending order(s)[/bold green]")
+
     def _strategy_tick(self):
         # 💡 GSD: Data Continuity - Generate virtual tick if volume is zero but bidask is updating
         now_ts = time.time()
@@ -1426,6 +1483,17 @@ class FuturesMonitor:
         # [Bug Fix] Check data freshness and attempt reconnection
         if not self.dry_run:
             self._check_futures_contract_staleness()
+
+        # [GSD Settlement Fix] Force close position on settlement day
+        if self.trader.position != 0 and not self.dry_run:
+            if self._is_settlement_day(self.contract.delivery_date):
+                now = datetime.now()
+                # 13:25 - 13:30 is the panic window for settlement
+                if now.hour == 13 and 25 <= now.minute < 30:
+                    console.print(f"[bold red]🚨 SETTLEMENT FORCE CLOSE: Exiting position {self.trader.position} before 13:30 settlement[/bold red]")
+                    self._execute_trade("EXIT", self.market_data.get("MTX", {}).get("close", 0) or 0, 
+                                        now, abs(self.trader.position), reason="SETTLEMENT_FORCE_CLOSE")
+                    return # Exit this tick after force close
 
         # 1. Fetch multi-timeframe data (使用選擇權系統的方法)
         processed = {}
@@ -1522,6 +1590,13 @@ class FuturesMonitor:
         # GSD Phase 0b: Determine session type per bar
         hhmm = int(timestamp.strftime("%H%M")) if hasattr(timestamp, "strftime") else int(datetime.now().strftime("%H%M"))
         self.session_type = "night" if (hhmm >= 1500 or hhmm < 500) else "day"
+        
+        # GSD Phase 0b-2: Session transition detection (night -> day) - cancel stale pending orders
+        if self.previous_session_type != self.session_type:
+            if self.previous_session_type == "night" and self.session_type == "day":
+                console.print(f"[bold yellow]🔄 Session transition: {self.previous_session_type} -> {self.session_type}. Cancelling pending orders...[/bold yellow]")
+                self._cancel_all_pending_orders()
+            self.previous_session_type = self.session_type
 
         # GSD Phase 0c: Snapshot bar context for entry diagnostic (used by _execute_trade)
         self._last_bar_context = {
@@ -1609,6 +1684,21 @@ class FuturesMonitor:
                 self.has_tp1_hit = False
                 self.cooldown_until = self.cooldown_bars # 觸發停損/平倉後進入冷卻
                 self._last_exit_bar = timestamp  # 記錄 exit bar
+                return
+
+            # [GSD] General EOD Force Close (Enabled by config)
+            if self.MGMT.get("force_close_at_end", False):
+                now = datetime.now()
+                hhmm = int(now.strftime("%H%M"))
+                is_day_eod = (hhmm >= 1325 and hhmm < 1330)
+                is_night_eod = (hhmm >= 425 and hhmm < 430)
+                
+                if is_day_eod or is_night_eod:
+                    exit_price = last_price if last_price > 0 else (self.market_data.get("MTX", {}).get("close", 0))
+                    console.print(f"[bold yellow]🕒 EOD FORCE CLOSE: Time {hhmm} reached. Exiting position...[/bold yellow]")
+                    self._execute_trade("EXIT", exit_price, now, abs(self.trader.position), reason="EOD_FORCE_CLOSE")
+                    return
+
             return  # don't enter same bar as exit
 
         # ── [P0 Fix] Market Hours Gate: NEVER enter during closed hours ──

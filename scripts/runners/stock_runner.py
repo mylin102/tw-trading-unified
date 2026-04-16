@@ -85,7 +85,15 @@ def run_stock_monitor(dry_run=False):
                 console.print("[bold yellow]🔄 Restart flag detected. Exiting for supervisor...[/bold yellow]")
                 break
                 
-            sm.run_iteration() # We will refactor sm.run() to allow iteration checks
+            try:
+                sm.run_iteration() # We will refactor sm.run() to allow iteration checks
+            except Exception as e:
+                console.print(f"[bold red]Error in run_iteration: {e}[/bold red]")
+                import traceback
+                console.print(traceback.format_exc())
+                # 繼續運行，除非是致命錯誤
+                if "KeyboardInterrupt" in str(type(e)):
+                    raise
             time.sleep(1)
 
     except KeyboardInterrupt:

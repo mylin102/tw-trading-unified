@@ -38,6 +38,11 @@ class DataStorage:
         
         # 初始化交易記錄
         self.trades = []
+        self.trade_buffer = []  # 交易緩衝區
+        self.buffer_size = 1000  # 每1000筆寫入一次
+        self.last_flush_time = datetime.now()
+        self.flush_interval = 60  # 每60秒寫入一次
+        
         if not self.trade_file.exists():
             self._save_trades()
     
@@ -111,10 +116,66 @@ class DataStorage:
             trade['timestamp'] = ts.strftime('%Y-%m-%d %H:%M:%S')
         
         self.trades.append(trade)
-        self._save_trades()
+        self.trade_buffer.append(trade)
         
-        # 同時儲存為 CSV (方便回測)
-        self._save_trades_csv()
+        # 檢查是否需要寫入檔案
+        self._check_and_flush_buffer()
+        
+    def _check_and_flush_buffer(self):
+        """檢查並寫入緩衝區"""
+        now = datetime.now()
+        
+        # 檢查緩衝區大小或時間間隔
+        if (len(self.trade_buffer) >= self.buffer_size or 
+            (now - self.last_flush_time).total_seconds() >= self.flush_interval):
+            self._flush_buffer()
+    
+    def _flush_buffer(self):
+        """寫入緩衝區到檔案"""
+        if not self.trade_buffer:
+            return
+        
+        try:
+            # 寫入 JSON
+            self._save_trades()
+            
+            # 寫入 CSV (使用追加模式)
+            self._save_trades_csv_append()
+            
+            # 清空緩衝區
+            self.trade_buffer.clear()
+            self.last_flush_time = datetime.now()
+            
+        except Exception as e:
+            print(f"寫入緩衝區失敗: {e}")
+    
+    def _save_trades_csv_append(self):
+        """使用追加模式儲存交易記錄為 CSV"""
+        if not self.trade_buffer:
+            return
+        
+        csv_file = self.trade_dir / f"{self.ticker}_{self.date_str}_trades.csv"
+        
+        # 標準化欄位
+        standardized = []
+        for t in self.trade_buffer:
+            std = {
+                'timestamp': t.get('timestamp', ''),
+                'type': t.get('type', ''),  # ENTRY, EXIT, PARTIAL_EXIT
+                'direction': t.get('direction', ''),  # LONG, SHORT
+                'price': t.get('price', 0),
+                'lots': t.get('lots', 1),
+                'pnl_pts': t.get('pnl_pts', 0),
+                'pnl_cash': t.get('pnl_cash', 0),
+                'reason': t.get('reason', ''),  # STOP_LOSS, TAKE_PROFIT, VWAP, EOD
+            }
+            standardized.append(std)
+        
+        df = pd.DataFrame(standardized)
+        
+        # 使用追加模式，只在檔案不存在時寫入標題
+        header = not csv_file.exists()
+        df.to_csv(csv_file, mode='a', index=False, header=header)
     
     def _save_trades(self):
         """儲存交易記錄為 JSON"""

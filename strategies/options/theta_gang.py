@@ -13,6 +13,9 @@ Exit: target profit %, max loss %, DTE floor, or squeeze release
 import datetime
 from dataclasses import dataclass, field
 from typing import Optional, List
+from rich.console import Console
+
+console = Console()
 
 
 @dataclass
@@ -218,6 +221,11 @@ class ThetaGangManager:
         min_credit = self.cfg.get("min_credit", 30)
         if net_credit < min_credit:
             return None
+        
+        # GSD fix: 確保net_credit有效
+        if net_credit <= 0:
+            console.print(f"[yellow]⚠️ ThetaGang: net_credit={net_credit} <= 0, rejecting entry[/yellow]")
+            return None
 
         return {
             "strategy": self.strategy,
@@ -264,8 +272,22 @@ class ThetaGangManager:
             reason = "SQUEEZE_RELEASE (vol expanding)"
 
         if should_exit:
+            # 計算淨PnL（包含交易成本）
+            gross_pnl = self.position.net_credit - current_value
+            # 交易成本：進出各一次
+            # 假設每邊手續費20元，交易所費用5元，稅0.1%
+            broker_fee = 20 * 2 * self.position.quantity  # 進出各一次
+            exchange_fee = 5 * 2 * self.position.quantity
+            tax_rate = 0.001
+            tax = (self.position.net_credit + current_value) * 50 * tax_rate * self.position.quantity
+            total_cost = broker_fee + exchange_fee + tax
+            net_pnl = gross_pnl * 50 - total_cost  # 轉換為台幣，減去成本
+            
+            # 轉換回點數（四捨五入）
+            pnl_points = round(net_pnl / 50)
+            
             return {"reason": reason, "current_value": current_value,
-                    "pnl": self.position.net_credit - current_value}
+                    "pnl": pnl_points, "gross_pnl": gross_pnl, "cost": total_cost}
         return None
 
     def close_position(self):

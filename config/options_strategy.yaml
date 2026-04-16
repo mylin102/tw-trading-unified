@@ -110,3 +110,9 @@ theta_gang:
   strategy: iron_condor
   take_profit_pct: 0.5
   wing_width: 200
+  # 新增: 交易頻率控制
+  cooldown_bars: 20          # 增加冷卻時間至20根K線
+  min_holding_bars: 10       # 最小持倉時間10根K線
+  exit_on_theta: true        # 啟用時間衰減出場
+  stop_loss_pct: 0.05        # 5%停損
+  take_profit_pct: 0.3       # 30%停利

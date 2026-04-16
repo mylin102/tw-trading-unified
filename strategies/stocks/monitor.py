@@ -1,12 +1,15 @@
 import os
 import time
 import pandas as pd
+import random
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 import yaml
 from rich.console import Console
 import shioaji as sj
 from strategies.stocks.scanner import StockScanner
+from strategies.stocks.data_storage import StockDataStorage
 
 ROOT = Path(__file__).parent.parent.parent
 MKT_LOGS = ROOT / "logs" / "market_data"
@@ -35,6 +38,7 @@ class StockMonitor:
         self.mode_tag = "LIVE" if (self.live_trading and not dry_run) else "PAPER"
         self.date_str = datetime.now().strftime("%Y%m%d")
         self.ledger_path = TRADE_LOGS / f"STOCK_{self.date_str}_{self.mode_tag}_trades.csv"
+        self.orders_path = TRADE_LOGS / f"STOCK_{self.date_str}_orders.json"
         
         self.positions = {} 
         self.pending_orders = {} # {ticker: {"order_id": str, "time": datetime}}
@@ -55,6 +59,9 @@ class StockMonitor:
         # 💡 GSD: Integrated Scanner for Pattern Recognition (CANSLIM)
         self.scanner = StockScanner(self.api)
         self.scan_results = {} # {ticker: {"pattern": str, "pivot": float}}
+        
+        # 數據儲存管理器
+        self.data_storages = {}  # {ticker: StockDataStorage}
 
     def _run_daily_scan(self):
         """執行日線級別型態掃描，更新 Pivot 點"""
@@ -176,10 +183,23 @@ class StockMonitor:
             if trade.contract.code in self.watchlist:
                 # 如果是掛單中 (Submitted) 且超過 5 分鐘
                 order_dt = trade.status.order_datetime
-                if isinstance(order_dt, (int, float)):
+                # 處理不同類型的時間戳記
+                if isinstance(order_dt, datetime):
+                    order_time = order_dt  # Already a datetime
+                elif isinstance(order_dt, (int, float)):
                     order_time = datetime.fromtimestamp(order_dt)
                 else:
-                    order_time = order_dt  # Already a datetime
+                    # 嘗試轉換為datetime
+                    try:
+                        if hasattr(order_dt, 'timestamp'):
+                            order_time = datetime.fromtimestamp(order_dt.timestamp())
+                        else:
+                            # 如果無法處理，使用當前時間
+                            order_time = now
+                            console.print(f"[yellow]⚠️ 無法解析訂單時間: {order_dt}, 使用當前時間[/yellow]")
+                    except Exception as e:
+                        order_time = now
+                        console.print(f"[yellow]⚠️ 訂單時間解析錯誤: {e}, 使用當前時間[/yellow]")
                 if trade.status.status == sj.constant.Status.Submitted and (now - order_time).total_seconds() > 300:
                     console.print(f"[yellow]⏳ Order Timeout: Cancelling {trade.contract.code}...[/yellow]")
                     self.api.cancel_order(trade)
@@ -218,6 +238,9 @@ class StockMonitor:
 
         if cancelled > 0:
             console.print(f"[bold red]🛑 Cancelled {cancelled} pending order(s) — preventing post-market fill[/bold red]")
+        
+        # 保存更新後的訂單狀態
+        self._save_orders_file()
 
     def _check_bear_defense(self):
         """大盤空頭防禦：EMA 濾網 + 單日虧損上限 + 連虧暫停"""
@@ -335,8 +358,10 @@ class StockMonitor:
             console.print(f"[bold green]🍎 StockMonitor [{self.mode_tag}] Started | Strategy: {self.strat_name}[/bold green]")
 
         now = datetime.now()
+        console.print(f"[dim]🕒 Run iteration at {now.strftime('%H:%M:%S')}[/dim]")
         # BUG FIX 2026-04-13: Cancel pending orders when trading window closes
         if now.hour < 9 or (now.hour == 13 and now.minute > 30) or now.hour >= 14:
+            console.print(f"[dim]⏸️ Outside trading hours, skipping iteration[/dim]")
             # Only cancel once per session end (track with flag)
             if not getattr(self, '_eod_cancelled_today', False):
                 self.cancel_all_pending_orders()
@@ -361,24 +386,106 @@ class StockMonitor:
 
         self.clean_unfilled_orders()
         scan_list = self._loop_state["active_watchlist"] if self._loop_state["active_watchlist"] else self.watchlist
+        console.print(f"[dim]🔍 Scanning {len(scan_list)} tickers: {scan_list[:5]}{'...' if len(scan_list) > 5 else ''}[/dim]")
 
         for ticker in scan_list:
             try:
                 contract = self.api.Contracts.Stocks[ticker]
+                console.print(f"[dim]📋 Contract for {ticker}: {contract}[/dim]")
                 notice = getattr(contract, 'notice', None)
-                if notice is not None and str(notice) != "Normal": continue
+                if notice is not None and str(notice) != "Normal": 
+                    console.print(f"[yellow]⚠️ Skipping {ticker} due to notice: {notice}[/yellow]")
+                    continue
                 
                 # 1. Indicator Analysis
-                start_date = (now - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
-                kbars = self.api.kbars(contract, start=start_date)
+                start_date = (now - pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+                end_date = now.strftime("%Y-%m-%d")
+                console.print(f"[dim]📊 Fetching data for {ticker} from {start_date} to {end_date}[/dim]")
+                
+                df = None
+                data_source = "unknown"
+                
+                # 嘗試 1: 從 API 獲取 kbars
                 try:
-                    df = pd.DataFrame({**kbars})
-                except Exception:
+                    kbars = self.api.kbars(contract, start=start_date, end=end_date)
+                    kbars_dict = {**kbars}
+                    
+                    if kbars_dict and any(len(v) > 0 for v in kbars_dict.values() if hasattr(v, '__len__')):
+                        df = pd.DataFrame(kbars_dict)
+                        data_source = "api_kbars"
+                        console.print(f"[green]✅ Got {len(df)} rows from API kbars for {ticker}[/green]")
+                    else:
+                        console.print(f"[yellow]⚠️ API returned empty data for {ticker}[/yellow]")
+                except Exception as e:
+                    console.print(f"[dim]📋 API kbars failed: {e}[/dim]")
+                
+                # 嘗試 2: 如果 API 數據為空，從本地緩存讀取
+                if df is None or df.empty:
+                    console.print(f"[dim]📊 Trying local cache for {ticker}[/dim]")
+                    try:
+                        # 查找最近的緩存數據文件
+                        cache_pattern = f"STOCK_{ticker}_*_indicators.csv"
+                        cache_files = list(MKT_LOGS.glob(cache_pattern))
+                        
+                        if cache_files:
+                            # 按修改時間排序，獲取最新的文件
+                            cache_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                            latest_cache = cache_files[0]
+                            
+                            # 讀取緩存數據
+                            cache_df = pd.read_csv(latest_cache)
+                            if not cache_df.empty:
+                                # 使用最後一行作為參考數據（僅用於顯示，不用於交易決策）
+                                last_row = cache_df.iloc[-1].to_dict()
+                                current_time = pd.Timestamp.now()
+                                
+                                # 創建一個 DataFrame，但標記為緩存數據
+                                df = pd.DataFrame({
+                                    'ts': [current_time],
+                                    'Open': [last_row.get('open', last_row.get('Close', 0))],
+                                    'High': [last_row.get('high', last_row.get('Close', 0))],
+                                    'Low': [last_row.get('low', last_row.get('Close', 0))],
+                                    'Close': [last_row.get('close', last_row.get('Close', 0))],
+                                    'Volume': [last_row.get('volume', 0)],
+                                    'Amount': [last_row.get('amount', 0)],
+                                    '_data_source': ['cache']  # 標記數據來源
+                                })
+                                data_source = "cache"
+                                console.print(f"[yellow]⚠️ Using cached reference data for {ticker} from {latest_cache.name} (Close: {df['Close'].iloc[0]}) - NOT FOR TRADING[/yellow]")
+                    except Exception as e:
+                        console.print(f"[dim]📋 Cache read failed: {e}[/dim]")
+                
+                # 如果沒有可用的數據，跳過此股票
+                if df is None or df.empty:
+                    console.print(f"[red]❌ No data available for {ticker}, skipping[/red]")
+                    # 但仍然創建一個空的數據存儲，以便dashboard知道此股票存在但無數據
+                    if ticker not in self.data_storages:
+                        self.data_storages[ticker] = StockDataStorage(ticker)
+                        console.print(f"[dim]📊 Created empty data storage for {ticker}[/dim]")
                     continue
-                if df.empty: continue
+                if df.empty: 
+                    console.print(f"[yellow]⚠️ Empty DataFrame for {ticker}[/yellow]")
+                    continue
                 df["ts"] = pd.to_datetime(df["ts"]); df = df.set_index("ts")
                 df.columns = [c.capitalize() if c.lower() in ["open", "high", "low", "close", "volume"] else c for c in df.columns]
+                
+                # 調試：檢查傳遞給 calculate_stock_squeeze 的 DataFrame
+                console.print(f"[dim]📊 DEBUG: Before calculate_stock_squeeze for {ticker}[/dim]")
+                console.print(f"[dim]📊 DEBUG: DataFrame shape: {df.shape}[/dim]")
+                console.print(f"[dim]📊 DEBUG: DataFrame columns: {df.columns.tolist()}[/dim]")
+                
                 df = self._loop_state["calculate_stock_squeeze"](df)
+                
+                # 調試：檢查 calculate_stock_squeeze 的結果
+                console.print(f"[dim]📊 DEBUG: After calculate_stock_squeeze for {ticker}[/dim]")
+                console.print(f"[dim]📊 DEBUG: Result shape: {df.shape}[/dim]")
+                
+                # 檢查技術指標列
+                tech_cols = ["bb_lower", "bb_mid", "bb_upper", "macd", "macd_signal", "macd_hist", "k_val", "d_val", "adx"]
+                for col in tech_cols:
+                    if col in df.columns:
+                        non_nan = df[col].notna().sum()
+                        console.print(f"[dim]📊 DEBUG: {col}: {non_nan}/{len(df)} non-NaN values[/dim]")
                 
                 # Indicator logic... (kept simple here for the edit)
                 df['ma20'] = df['Close'].rolling(20).mean()
@@ -387,10 +494,45 @@ class StockMonitor:
                 is_it_buy = (df['Volume'] > vol_avg * 1.5) & (df['Close'] > df['Open']) & (df['Close'] > df['ma20'])
                 df['it_buy_rolling_count'] = is_it_buy.rolling(5).sum().fillna(0)
                 
+                # 保存指標數據供 Dashboard 顯示
+                if not df.empty:
+                    last_row = df.iloc[-1].to_dict()
+                    # 添加股票名稱
+                    last_row["name"] = contract.name if hasattr(contract, "name") else ticker
+                    
+                    # 標記數據來源
+                    if data_source == "cache":
+                        last_row["_data_source"] = "cache"
+                        last_row["_trading_disabled"] = True
+                        console.print(f"[yellow]⚠️ Indicators for {ticker} marked as CACHE DATA - TRADING DISABLED[/yellow]")
+                    elif data_source == "api_kbars":
+                        last_row["_data_source"] = "api"
+                        last_row["_trading_disabled"] = False
+                    else:
+                        last_row["_data_source"] = "unknown"
+                        last_row["_trading_disabled"] = True
+                    
+                    # 初始化數據存儲器
+                    if ticker not in self.data_storages:
+                        self.data_storages[ticker] = StockDataStorage(ticker)
+                        console.print(f"[dim]📊 Created data storage for {ticker}[/dim]")
+                    
+                    # 保存最新指標
+                    try:
+                        self.data_storages[ticker].save_indicators(df.index[-1], last_row)
+                        console.print(f"[green]✅ Saved indicators for {ticker} to {self.data_storages[ticker].market_file}[/green]")
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️ Failed to save indicators for {ticker}: {e}[/yellow]")
+                
                 scan_info = self.scan_results.get(ticker, {"pattern": "NONE", "pivot": 0.0})
                 
                 # Multi-TF analysis
                 tf_analysis = self._loop_state["analyze_market_condition"](df)
+                # 檢查數據來源，如果是緩存數據則跳過交易
+                if data_source == "cache":
+                    console.print(f"[yellow]⚠️ Skipping trade for {ticker} - using cached data (trading disabled)[/yellow]")
+                    continue
+                
                 should_trade, tf_details = self._loop_state["should_trade_based_on_tf"](df)
                 
                 if not should_trade:
@@ -498,6 +640,38 @@ class StockMonitor:
             if ticker not in self.positions: return
             pos = self.positions[ticker]
             
+            # GSD Fix: 零股禁止當沖檢查
+            # 台灣股市規則：零股（<1000股）禁止當天賣出
+            qty = pos.get("qty", 0)
+            if qty < 1000:
+                # 檢查是否為當天買入的零股
+                is_today_buy = False
+                try:
+                    # 從交易紀錄中查找這個ticker的最近買入時間
+                    if self.ledger_path.exists():
+                        trades_df = pd.read_csv(self.ledger_path)
+                        # 將ticker轉換為整數進行比較（交易紀錄中的ticker是整數）
+                        ticker_int = int(ticker)
+                        ticker_trades = trades_df[trades_df["ticker"] == ticker_int]
+                        buy_trades = ticker_trades[ticker_trades["action"] == "BUY"]
+                        if not buy_trades.empty:
+                            # 獲取最近一筆買入交易的時間
+                            latest_buy = buy_trades.iloc[-1]
+                            buy_timestamp = pd.to_datetime(latest_buy["timestamp"])
+                            buy_date = buy_timestamp.date()
+                            today = datetime.now().date()
+                            is_today_buy = (buy_date == today)
+                except Exception as e:
+                    console.print(f"[yellow]⚠️ Failed to check odd-lot day-trade: {e}[/yellow]")
+                
+                # 如果零股是今天買入的，則禁止賣出（當沖）
+                if is_today_buy:
+                    console.print(f"[yellow]⚠️ 零股禁止當沖: {ticker} ({qty}股) 今天買入，禁止當天賣出[/yellow]")
+                    return
+                else:
+                    # 零股但不是今天買入的（可能是隔夜持倉），允許賣出
+                    console.print(f"[cyan]ℹ️ 零股賣出允許: {ticker} ({qty}股) 非今天買入[/cyan]")
+            
             # --- LIVE: 下單後等確認，才更新 position ---
             if self.mode_tag == "LIVE":
                 contract = self.api.Contracts.Stocks[ticker]
@@ -551,5 +725,151 @@ class StockMonitor:
         }
         trade_df = pd.DataFrame([row])
         trade_df.to_csv(self.ledger_path, mode='a', header=not self.ledger_path.exists(), index=False)
+        
+        # 保存訂單狀態
+        self._save_orders_file()
+
+    def _save_orders_file(self):
+        """Export all stock orders to JSON for dashboard consumption."""
+        try:
+            # 獲取當前市場價格用於計算未實現損益
+            current_prices = {}
+            for ticker in self.watchlist:
+                try:
+                    contract = self.api.Contracts.Stocks[ticker]
+                    snapshot = self.api.snapshots([contract])[0]
+                    current_prices[ticker] = snapshot.close
+                except Exception:
+                    current_prices[ticker] = 0
+            
+            # 從API獲取訂單狀態
+            orders_data = []
+            if self.mode_tag == "LIVE":
+                try:
+                    trades = self.api.list_trades()
+                    for trade in trades:
+                        if trade.contract.code in self.watchlist:
+                            # 映射狀態到dashboard期望的格式
+                            status_map = {
+                                "Submitted": "OPEN",
+                                "Filled": "FILLED", 
+                                "PartialFilled": "PARTIAL",
+                                "Cancelled": "CANCELLED",
+                                "Rejected": "REJECTED"
+                            }
+                            status = trade.status.status.name
+                            status_str = status_map.get(status, status)
+                            
+                        order_dict = {
+                            "order_id": trade.status.id,
+                            "ticker": trade.contract.code,
+                            "side": "BUY" if trade.order.action.name == "Buy" else "SELL",
+                            "order_type": trade.order.price_type.name,  # LMT, MKT, etc.
+                            "qty": trade.order.quantity,
+                            "filled_qty": trade.status.deal_quantity,
+                            "price": trade.order.price,
+                            "filled_price": trade.status.avg_price if trade.status.avg_price > 0 else trade.order.price,
+                            "status": status_str,
+                            "timestamp": trade.status.order_datetime.strftime("%Y-%m-%d %H:%M:%S") if trade.status.order_datetime else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "strategy": self.strat_name,
+                            "mode": self.mode_tag
+                        }
+                            
+                            orders_data.append(order_dict)
+                except Exception as e:
+                    console.print(f"[yellow]⚠️ Failed to fetch live orders: {e}[/yellow]")
+            
+            # 對於PAPER模式，從交易紀錄和pending_orders構建模擬訂單
+            else:
+                # 從今天的交易紀錄創建已成交訂單
+                try:
+                    if self.ledger_path.exists():
+                        trades_df = pd.read_csv(self.ledger_path)
+                        if not trades_df.empty:
+                            # 處理買入交易
+                            buy_trades = trades_df[trades_df["action"] == "BUY"]
+                            for _, trade in buy_trades.iterrows():
+                                order_dict = {
+                                    "order_id": f"PAPER-BUY-{trade['ticker']}-{int(time.time())}",
+                                    "ticker": str(trade["ticker"]).strip(),  # 確保是字符串
+                                    "side": "BUY",
+                                    "order_type": "LMT",  # Paper mode uses limit orders
+                                    "qty": int(trade["qty"]),
+                                    "filled_qty": int(trade["qty"]),
+                                    "price": float(trade["price"]),
+                                    "filled_price": float(trade["price"]),
+                                    "status": "FILLED",
+                                    "timestamp": trade["timestamp"],
+                                    "strategy": self.strat_name,
+                                    "mode": self.mode_tag
+                                }
+                                orders_data.append(order_dict)
+                            
+                            # 處理賣出交易
+                            sell_trades = trades_df[trades_df["action"] == "SELL"]
+                            for _, trade in sell_trades.iterrows():
+                                order_dict = {
+                                    "order_id": f"PAPER-SELL-{trade['ticker']}-{int(time.time())}",
+                                    "ticker": str(trade["ticker"]).strip(),  # 確保是字符串
+                                    "side": "SELL",
+                                    "order_type": "LMT",  # Paper mode uses limit orders
+                                    "qty": int(trade["qty"]),
+                                    "filled_qty": int(trade["qty"]),
+                                    "price": float(trade["price"]),
+                                    "filled_price": float(trade["price"]),
+                                    "status": "FILLED",
+                                    "timestamp": trade["timestamp"],
+                                    "strategy": self.strat_name,
+                                    "mode": self.mode_tag
+                                }
+                                orders_data.append(order_dict)
+                except Exception as e:
+                    console.print(f"[yellow]⚠️ Failed to read trades for orders: {e}[/yellow]")
+                    # 回退到從positions創建（為了向後兼容）
+                    for ticker, pos in self.positions.items():
+                        if pos.get("qty", 0) > 0:
+                            order_dict = {
+                                "order_id": f"PAPER-{ticker}-{int(time.time())}",
+                                "ticker": ticker,
+                                "side": "BUY",
+                                "order_type": "LMT",
+                                "qty": pos["qty"],
+                                "filled_qty": pos["qty"],
+                                "price": pos["entry_price"],
+                                "filled_price": pos["entry_price"],
+                                "status": "FILLED",
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "strategy": self.strat_name,
+                                "mode": self.mode_tag
+                            }
+                            orders_data.append(order_dict)
+                
+                # 從pending_orders創建待處理訂單
+                for ticker, order_info in self.pending_orders.items():
+                    order_dict = {
+                        "order_id": order_info.get("order_id", f"PENDING-{ticker}"),
+                        "ticker": ticker,
+                        "side": "BUY",  # 假設都是買單
+                        "order_type": "LMT",  # Paper mode pending orders are limit orders
+                        "qty": 1000,  # 默認數量
+                        "filled_qty": 0,
+                        "price": 0,
+                        "filled_price": 0,
+                        "status": "OPEN",
+                        "timestamp": order_info.get("time", datetime.now()).strftime("%Y-%m-%d %H:%M:%S"),
+                        "strategy": self.strat_name,
+                        "mode": self.mode_tag
+                    }
+                    orders_data.append(order_dict)
+            
+            # 保存到文件
+            self.orders_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.orders_path, "w", encoding="utf-8") as f:
+                json.dump(orders_data, f, ensure_ascii=False, indent=2)
+                
+            console.print(f"[dim]💾 Saved {len(orders_data)} stock orders to {self.orders_path.name}[/dim]")
+            
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Failed to save orders file: {e}[/yellow]")
 
     def stop(self): self.running = False

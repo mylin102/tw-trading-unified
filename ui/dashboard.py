@@ -13,7 +13,7 @@ import json
 import yaml
 import datetime
 import os
-from core.date_utils import get_session_date_str
+from core.date_utils import get_session_date_str, get_trade_day
 import subprocess
 import time
 from pathlib import Path
@@ -125,7 +125,10 @@ if not check_password():
 st_autorefresh(interval=30_000, key="data_refresh")
 
 BASE = Path(__file__).parent.parent
-DATE_STR = datetime.datetime.now().strftime("%Y%m%d")  # Calendar date for display (not trading day)
+# GSD: Align DATE_STR with the ACTIVE trading session date (e.g. after 15:00 today, it's tomorrow's date)
+DATE_STR = get_session_date_str(datetime.datetime.now())
+# 新增：交易記錄日期，使用 get_trade_day 確保與交易記錄文件一致
+TRADE_DATE_STR = get_trade_day(datetime.datetime.now()).strftime("%Y%m%d")
 TODAY = datetime.datetime.now().strftime("%Y-%m-%d")
 
 # ── Session detection (used by sidebar + config loading) ──
@@ -409,7 +412,7 @@ def format_options_trades(ledger_df):
                 "quantity": row.get("Quantity", 1),
                 "entry_note": str(row.get("Note", "")),
             }
-        elif pending_entry and any(kw in action for kw in ["EXIT", "TP1", "TRAIL", "TIME", "REVERSAL", "TRAP", "FILL"]):
+        elif pending_entry and any(kw in action for kw in ["EXIT", "THETA_EXIT", "TP1", "TRAIL", "TIME", "REVERSAL", "TRAP", "FILL"]):
             # 出場 → 結算 round-trip
             trade_num += 1
             entry_price = float(pending_entry["entry_price"] or 0)
@@ -698,14 +701,32 @@ def load_futures_indicators(full_history=False):
                 else:
                     df = df.rename(columns={df.columns[0]: "timestamp"})
 
-            # 2. V-Model fix: Remove case-insensitive duplicate columns BEFORE renaming
+            # 2. V-Model fix: Remove case-insensitive duplicate columns by COALESCING them
             col_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume", "Amount": "amount"}
             for upper, lower in col_map.items():
                 if upper in df.columns and lower in df.columns:
+                    # Coalesce: use lower if not null, else upper
+                    df[lower] = df[lower].fillna(df[upper])
                     df = df.drop(columns=[upper])
-
-            # 3. 統一 OHLC 欄位為小寫
-            df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+                elif upper in df.columns:
+                    # Just rename if only upper exists
+                    df = df.rename(columns={upper: lower})
+            
+            # 3. Final cleanup: Numeric conversion and drop rows with invalid timestamps
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                df = df.dropna(subset=["timestamp"])
+            
+            # Ensure numeric columns are actually numeric and handle inf
+            numeric_cols = ["open", "high", "low", "close", "volume", "score"]
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            
+            # Global inf fix for Plotly
+            import numpy as np
+            df = df.replace([np.inf, -np.inf], np.nan)
+            
             return df
         except Exception:
             return None
@@ -834,13 +855,16 @@ def load_futures_indicators(full_history=False):
 
 @st.cache_data(ttl=5)
 def load_futures_trades():
+    # 使用交易記錄日期 (get_trade_day) 來尋找今天的交易記錄
     for d in [FUTURES_TRADES]:
-        f = d / f"TMF_{DATE_STR}_trades.csv"
-        if f.exists():
-            try:
-                return pd.read_csv(f)
-            except Exception:
-                pass
+        # 優先使用 TRADE_DATE_STR，如果找不到再嘗試 DATE_STR
+        for date_str in [TRADE_DATE_STR, DATE_STR]:
+            f = d / f"TMF_{date_str}_trades.csv"
+            if f.exists():
+                try:
+                    return pd.read_csv(f)
+                except Exception:
+                    pass
     return None
 
 OPTIONS_SUB = "live_trading" if o_live else "paper_trading"
@@ -893,6 +917,14 @@ def load_options_indicators(full_history=False):
     if all_dfs:
         try:
             merged = pd.concat(all_dfs).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+            
+            # Standardize MTX price column name
+            if "mtx_close" in merged.columns and "price_mtx" not in merged.columns:
+                merged = merged.rename(columns={"mtx_close": "price_mtx"})
+            elif "mtx_close" in merged.columns and "price_mtx" in merged.columns:
+                merged["price_mtx"] = merged["price_mtx"].fillna(merged["mtx_close"])
+                merged = merged.drop(columns=["mtx_close"])
+                
             if merged.columns.duplicated().any():
                 merged = merged.loc[:, ~merged.columns.duplicated()].copy()
             
@@ -1084,7 +1116,10 @@ with tab_overview:
         else:
             st.info("無期貨指標數據")
         ft = load_futures_trades()
-        st.write(f"今日交易: {len(ft) if ft is not None else 0} 筆")
+        # 顯示本交易日交易筆數
+        trading_day_str = TRADE_DATE_STR
+        trading_day_display = f"{trading_day_str[:4]}-{trading_day_str[4:6]}-{trading_day_str[6:8]}"
+        st.write(f"交易日 {trading_day_display} 交易: {len(ft) if ft is not None else 0} 筆")
 
     with col2:
         st.header(f"選擇權 TXO ({mode_badge(o_live)})")
@@ -1118,37 +1153,47 @@ with tab_overview:
             
             # 比較交易日，而不是日曆日
             today_l = ol[ol["TradingDay"] == DATE_STR]
-            entries = today_l[today_l["Action"].str.contains("ENTRY", na=False)]
+            entries = today_l[today_l["Action"].str.contains("ENTRY", na=False) & ~today_l["Action"].str.contains("EXIT", na=False)]
             st.write(f"今日進場: {len(entries)} 筆")
         else:
             st.write("今日交易: 0 筆")
 
-    # ── 總覽圖：指數走勢（雙軸：期貨 + 選擇權 MTX）──
+    # ── 總覽圖：指數走勢（期貨 + 選擇權 MTX 統一 Y 軸）──
     st.header("今日指數走勢")
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig = go.Figure()
     has_data = False
+    
     if f_df is not None and not f_df.empty:
-        # V-Model fix: Convert to numpy arrays to avoid narwhals duplicate check
         f_close = f_df["close"] if "close" in f_df.columns else f_df["Close"]
         fig.add_trace(go.Scatter(
             x=f_df["timestamp"].to_numpy(),
             y=f_close.to_numpy(),
-            name="TMF",
-            line=dict(color="#1f77b4", width=1.5)
-        ), secondary_y=False)
+            name="TMF (期貨)",
+            line=dict(color="#1f77b4", width=2)
+        ))
         has_data = True
-    if o_df is not None and not o_df.empty and "price_mtx" in o_df.columns:
-        fig.add_trace(go.Scatter(
-            x=o_df["timestamp"].to_numpy(),
-            y=o_df["price_mtx"].to_numpy(),
-            name="MTX (Options)",
-            line=dict(color="#ff7f0e", width=1.5)
-        ), secondary_y=True)
-        has_data = True
+        
+    if o_df is not None and not o_df.empty:
+        # Compatibility fix: use mtx_close if price_mtx is missing
+        m_col = "price_mtx" if "price_mtx" in o_df.columns else ("mtx_close" if "mtx_close" in o_df.columns else None)
+        if m_col:
+            fig.add_trace(go.Scatter(
+                x=o_df["timestamp"].to_numpy(),
+                y=o_df[m_col].to_numpy(),
+                name="MTX (選擇權標的)",
+                line=dict(color="#ff7f0e", width=1.5, dash="dot")
+            ))
+            has_data = True
+            
     if has_data:
-        fig.update_layout(height=350, margin=dict(t=10, b=10, l=40, r=20), legend=dict(orientation="h", y=1.02))
-        fig.update_yaxes(title_text="TMF", tickformat=",.0f", secondary_y=False)
-        fig.update_yaxes(title_text="MTX", tickformat=",.0f", secondary_y=True)
+        fig.update_layout(
+            height=400, 
+            margin=dict(t=10, b=10, l=40, r=20), 
+            legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"),
+            hovermode="x unified"
+        )
+        fig.update_yaxes(title_text="指數點位", tickformat=",.0f", gridcolor="rgba(128,128,128,0.1)")
+        fig.update_xaxes(gridcolor="rgba(128,128,128,0.1)")
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("等待數據...")
@@ -1331,6 +1376,15 @@ with tab_futures:
                 open_pos = open_rows.iloc[-1]
 
         if open_pos is not None:
+            # 添加更新按鈕
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.subheader("📊 未實現損益 (持倉中)")
+            with col2:
+                if st.button("🔄 更新", key="update_futures_unrealized"):
+                    st.cache_data.clear()
+                    st.rerun()
+            
             cur_price = float(f_df["close"].iloc[-1]) if len(f_df) > 0 else 0
             entry = float(open_pos.get("進場價", 0))
             lots = int(open_pos.get("口數", 1))
@@ -1339,7 +1393,7 @@ with tab_futures:
                 mult = 1 if direction == "BUY" else -1
                 unrealized = (cur_price - entry) * 50 * lots * mult
                 color = "green" if unrealized >= 0 else "red"
-                st.metric(f"📊 未實現損益 (持倉中)", f"{unrealized:+,.0f} TWD",
+                st.metric("", f"{unrealized:+,.0f} TWD",
                           delta=f"{unrealized:+,.0f} ({(unrealized/(entry*50*lots)*100):+.1f}%)")
                 st.caption(f"進場價: {entry:.0f} | 目前: {cur_price:.0f} | {direction} {lots}口")
 
@@ -1686,6 +1740,15 @@ with tab_options:
 
                 # Calculate unrealized PnL using LIVE premium
                 if live_premium and live_premium > 0:
+                    # 添加更新按鈕
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.subheader("📊 未實現損益計算")
+                    with col2:
+                        if st.button("🔄 更新", key="update_options_unrealized"):
+                            st.cache_data.clear()
+                            st.rerun()
+                    
                     def _calc_opt_unreal(row):
                         if row.get("status") not in ("filled", "partial_filled"):
                             return None
@@ -1882,6 +1945,132 @@ with tab_stocks:
             st.dataframe(sl, use_container_width=True)
     else:
         st.info(f"今日尚無 {current_mode} 交易紀錄")
+
+    # ── Stock Order Status Panel ──
+    with st.expander("📤 台股委託單狀態 (Order Lifecycle)", expanded=False):
+        orders_path = BASE / "exports" / "trades"
+        order_files = list(orders_path.glob(f"STOCK_{DATE_STR}_orders.json")) + list(orders_path.glob("STOCK_*_orders.json"))
+        order_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+
+        if order_files and order_files[0].exists():
+            with open(order_files[0], "r", encoding="utf-8") as f:
+                orders_data = json.load(f)
+
+            if orders_data:
+                # 添加更新按鈕
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.write("**📊 未實現損益計算**")
+                with col2:
+                    if st.button("🔄 更新", key="update_stock_unrealized"):
+                        st.cache_data.clear()
+                        st.rerun()
+                
+                # Get LIVE price from the same data source as charts
+                live_prices = {}
+                for ticker in watchlist:
+                    s_df = load_stock_indicators(ticker)
+                    if s_df is not None and not s_df.empty:
+                        last = s_df.iloc[-1]
+                        close = float(last.get('close', last.get('Close', 0)))
+                        live_prices[ticker] = close
+
+                # Process orders for display
+                order_rows = []
+                for order in orders_data:
+                    ticker = order.get("ticker", "")
+                    status = order.get("status", "")
+                    side = order.get("side", "")
+                    qty = order.get("qty", 0)
+                    price = order.get("price", 0.0)
+                    order_id = order.get("order_id", "")
+                    timestamp = order.get("timestamp", "")
+                    filled_qty = order.get("filled_qty", 0)
+                    filled_price = order.get("filled_price", 0.0)
+                    order_type = order.get("order_type", "LMT")  # Default to LMT
+                    
+                    # Map order type to Chinese
+                    order_type_map = {
+                        "LMT": "限價單",
+                        "MKT": "市價單",
+                        "MKT_RANGE": "範圍市價單"
+                    }
+                    order_type_display = order_type_map.get(order_type, order_type)
+                    
+                    # Calculate unrealized PnL for open orders
+                    unrealized = 0.0
+                    if status == "OPEN" and ticker in live_prices:
+                        current_price = live_prices[ticker]
+                        if side == "BUY":
+                            unrealized = (current_price - price) * qty
+                        elif side == "SELL":
+                            unrealized = (price - current_price) * qty
+                    
+                    order_rows.append({
+                        "委託單號": order_id,
+                        "股票代號": ticker,
+                        "買賣": side,
+                        "委託類型": order_type_display,
+                        "狀態": status,
+                        "委託數量": qty,
+                        "委託價格": price,
+                        "已成交數量": filled_qty,
+                        "成交均價": filled_price,
+                        "未實現損益": f"{unrealized:+,.0f}" if unrealized != 0 else "—",
+                        "時間": timestamp
+                    })
+                
+                if order_rows:
+                    orders_df = pd.DataFrame(order_rows)
+                    
+                    # Style function for order table
+                    def style_orders(row):
+                        styles = [''] * len(row)
+                        # Status colors
+                        status = row.get("狀態", "")
+                        if status == "FILLED":
+                            styles[3] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
+                        elif status == "OPEN":
+                            styles[3] = 'background-color: #fef9c3; color: #854d0e; font-weight: bold'
+                        elif status == "CANCELLED":
+                            styles[3] = 'background-color: #f3f4f6; color: #6b7280; font-weight: bold'
+                        elif status == "REJECTED":
+                            styles[3] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
+                        
+                        # Side colors
+                        side = row.get("買賣", "")
+                        if side == "BUY":
+                            styles[2] = 'background-color: #dbeafe; color: #1e40af; font-weight: bold'
+                        elif side == "SELL":
+                            styles[2] = 'background-color: #fce7f3; color: #9d174d; font-weight: bold'
+                        
+                        # Unrealized PnL colors
+                        unrealized = row.get("未實現損益", "")
+                        if "+" in str(unrealized):
+                            styles[8] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
+                        elif "-" in str(unrealized):
+                            styles[8] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
+                        
+                        return styles
+                    
+                    st.dataframe(orders_df.style.apply(style_orders, axis=1), use_container_width=True, hide_index=True)
+                    
+                    # Summary metrics
+                    open_orders = [o for o in orders_data if o.get("status") == "OPEN"]
+                    filled_orders = [o for o in orders_data if o.get("status") == "FILLED"]
+                    cancelled_orders = [o for o in orders_data if o.get("status") == "CANCELLED"]
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("總委託單數", len(orders_data))
+                    col2.metric("待成交", len(open_orders))
+                    col3.metric("已成交", len(filled_orders))
+                    col4.metric("已取消", len(cancelled_orders))
+                else:
+                    st.info("委託單列表為空")
+            else:
+                st.info("委託單檔案為空")
+        else:
+            st.info("台股委託單檔案尚未建立 (Order Lifecycle 未啟用)")
 
 # ════════════════════════════════════════
 # Tab 5: 策略管道 (Pipeline)

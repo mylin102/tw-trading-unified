@@ -128,11 +128,61 @@ def get_trading_day(dt: Union[datetime, pd.Timestamp, pd.DatetimeIndex, pd.Serie
     # V-Model fix: Safe conversion to date
     return pd.Timestamp(target).to_pydatetime().date()
 
+def get_trade_day(dt):
+    """
+    獲取交易記錄所屬的交易日。
+    基於參考資料的 get_trading_date 邏輯改進：
+    
+    dt: datetime 物件
+    回傳值: yyyymmdd 格式字串
+    
+    規則：
+    - 情況 A：15:00 之後 (夜盤開始)
+        - 週五晚跳週一 (+3天)
+        - 其他日跳隔日 (+1天)
+    - 情況 B：00:00 - 08:00 (夜盤後半段，包含5點收盤前後的緩衝)
+        - 週六凌晨跳週一 (+2天)
+        - 週一凌晨保持週一 (不調整)
+        - 其他日保持當日 (日期已自動跨日)
+    - 情況 C：一般日盤 (08:00-14:59)
+        - 保持當日
+    """
+    if hasattr(dt, 'hour'):
+        hour = dt.hour
+        weekday = dt.weekday()  # 0=Mon, 4=Fri, 5=Sat
+    else:
+        try:
+            dt = pd.to_datetime(dt)
+            hour = dt.hour
+            weekday = dt.weekday()
+        except:
+            return dt
+    
+    # 情況 A：15:00 之後 (夜盤開始)
+    if hour >= 15:
+        if weekday == 4:  # 週五晚跳週一
+            target_date = dt + pd.Timedelta(days=3)
+        else:
+            target_date = dt + pd.Timedelta(days=1)
+    
+    # 情況 B：00:00 - 08:00 (夜盤後半段，包含5點收盤前後的緩衝)
+    elif hour < 8:
+        if weekday == 5:  # 週六凌晨跳週一
+            target_date = dt + pd.Timedelta(days=2)
+        elif weekday == 0 and hour < 8:  # 週一凌晨(極少見但預留)
+            target_date = dt
+        else:
+            # 平日凌晨，日期已自動跨日，但交易記錄屬於前一日
+            # 例如：週四凌晨的交易屬於週三的夜盤
+            target_date = dt - pd.Timedelta(days=1)
+    
+    # 情況 C：一般日盤 (08:00-14:59)
+    else:
+        target_date = dt
+    
+    return target_date.date()
+
 def get_session(dt: Union[datetime, pd.Timestamp]):
-    """
-    判斷盤別：1=日盤 (08:00-14:59), 2=夜盤 (15:00-07:59)
-    GSD: Only supports scalar input.
-    """
     # GSD: Absolute type safety check
     if hasattr(dt, "dt"): # Series
         # Vectorized check via apply if it's a Series to guarantee scalar logic parity

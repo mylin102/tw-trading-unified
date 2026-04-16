@@ -18,7 +18,7 @@ echo "----------------"
 
 # 檢查main.py進程
 echo "1. 交易系統核心 (main.py):"
-MAIN_PID=$(pgrep -f "python.*main.py" 2>/dev/null)
+MAIN_PID=$(pgrep -f "main.py" 2>/dev/null)
 if [ -n "$MAIN_PID" ]; then
     echo "   ✅ 運行中 (PID: $MAIN_PID)"
     ps -p "$MAIN_PID" -o pid,time,%cpu,%mem,command 2>/dev/null | tail -1

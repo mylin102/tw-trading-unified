@@ -326,8 +326,12 @@ def calculate_mtf_alignment(processed_dfs: dict[str, pd.DataFrame], weights: dic
     for tf, df in processed_dfs.items():
         if not df.empty:
             # 使用 mom_state (0-3) 作為基準，轉換為 -1.5 到 +1.5
-            val = df["mom_state"].iloc[-1]
-            latest_states[tf] = val - 1.5
+            if "mom_state" in df.columns:
+                val = df["mom_state"].iloc[-1]
+                latest_states[tf] = val - 1.5
+            else:
+                # 如果沒有 mom_state，使用預設值
+                latest_states[tf] = 0
 
     total_score = 0
     available_weight = 0

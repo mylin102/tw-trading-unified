@@ -135,15 +135,21 @@ def get_today_market_data():
         
         kbars = api.kbars(contract, start=today_str, end=today_str)
         
-        if not kbars:
-            print("⚠️  API沒有返回今天的資料")
+        # Check if kbars is empty by converting to DataFrame first
+        try:
+            df_new = pd.DataFrame({**kbars})
+        except Exception:
+            print("⚠️  API沒有返回今天的資料或資料格式錯誤")
             print("可能原因:")
             print("  1. 市場還沒開盤")
             print("  2. 今天是假日")
             print("  3. API資料延遲")
             return None
         
-        df_new = pd.DataFrame({**kbars})
+        if df_new.empty:
+            print("⚠️  API返回空的資料")
+            return None
+        
         df_new.ts = pd.to_datetime(df_new.ts)
         df_new = df_new.set_index("ts")
         

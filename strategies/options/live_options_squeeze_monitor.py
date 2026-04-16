@@ -625,10 +625,17 @@ class ShioajiOptionsSmartMonitor:
                 console.print("[red]❌ 錯誤：找不到任何有效的台指期貨合約 (MTX/MXF)。[/red]")
                 return False
             
-            # 過濾標準合約並按到期日排序
-            mtx_cons = sorted([c for c in mtx_group if len(c.code) in [5, 6, 7]], key=lambda x: x.delivery_date)
+            # [GSD Settlement Fix] 過濾與期貨月份相符的標準合約
+            # 優先找月份相符的，如果找不到再找最近的 (fallback)
+            all_valid_mtx = sorted([c for c in mtx_group if len(c.code) in [5, 6, 7]], key=lambda x: x.delivery_date)
+            mtx_cons = [c for c in all_valid_mtx if c.delivery_date.replace("/", "-").startswith(futures_month)]
+            
             if not mtx_cons:
-                console.print("[red]❌ 錯誤：找不到任何有效的 MTX 期貨合約 (格式篩選後)。[/red]")
+                console.print(f"[yellow]⚠️  找不到月份 {futures_month} 的 MTX 合約，使用最近可用合約。[/yellow]")
+                mtx_cons = all_valid_mtx
+                
+            if not mtx_cons:
+                console.print("[red]❌ 錯誤：找不到任何有效的 MTX 期貨合約。[/red]")
                 return False
                 
             target_mtx = mtx_cons[0]
@@ -688,32 +695,38 @@ class ShioajiOptionsSmartMonitor:
 
             console.print(f"[bold cyan][MODE {self.mode}][/bold cyan] Monitoring {nearest_date} | ATM {atm_strike} | MTX: {target_mtx.code}")
             
-            # [Phase 1 Fix] Validate contracts haven't expired
-            today = datetime.date.today()
+            # [GSD Settlement Fix] Validate contracts haven't expired
+            # On settlement day, contracts are valid until 13:30.
+            now = datetime.datetime.now()
+            today = now.date()
+            settlement_time = now.replace(hour=13, minute=30, second=0, microsecond=0)
+            
             for side, contract in [("C", self.active_contracts["C"]), ("P", self.active_contracts["P"])]:
                 try:
                     if not hasattr(contract, 'delivery_date') or not contract.delivery_date:
                         continue
-                    dd = contract.delivery_date
-                    # Shioaji may return str in various formats — normalize
-                    if isinstance(dd, str):
-                        # Try multiple formats Shioaji might use
-                        parsed = None
-                        for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
-                            try:
-                                parsed = datetime.datetime.strptime(dd, fmt).date()
-                                break
-                            except ValueError:
-                                continue
-                        if parsed is None:
-                            console.print(f"[dim]⚠️ Could not parse delivery date '{dd}' for {contract.code}, skipping expiry check[/dim]")
+                    dd_str = contract.delivery_date
+                    # Parse contract delivery date
+                    parsed_dd = None
+                    for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
+                        try:
+                            parsed_dd = datetime.datetime.strptime(dd_str, fmt).date()
+                            break
+                        except ValueError:
                             continue
-                        dd = parsed
-                    elif hasattr(dd, 'date'):
-                        dd = dd.date()
-                    if dd <= today:
-                        console.print(f"[red]🚫 Contract {contract.code} expires today or earlier! Rejecting.[/red]")
+                    
+                    if parsed_dd is None:
+                        continue
+                        
+                    if parsed_dd < today:
+                        console.print(f"[red]🚫 Contract {contract.code} has already expired ({dd_str}). Rejecting.[/red]")
                         return False
+                    elif parsed_dd == today:
+                        if now >= settlement_time:
+                            console.print(f"[red]🚫 Contract {contract.code} expired today at 13:30. Rejecting.[/red]")
+                            return False
+                        else:
+                            console.print(f"[yellow]⚠️ Contract {contract.code} expires TODAY at 13:30. Proceeding with caution.[/yellow]")
                 except Exception as e:
                     console.print(f"[dim]⚠️ Expiry check error for {side}: {e}, allowing contract[/dim]")
                     continue
@@ -737,22 +750,35 @@ class ShioajiOptionsSmartMonitor:
         
         console.print(f"[yellow]⚠️ Options data stale for {secs_since_tick/60:.1f} min, checking contracts...[/yellow]")
         
-        # Check if current contracts have expired
-        today_str = datetime.date.today().strftime("%Y/%m/%d")
+        # [GSD Settlement Fix] Check if current contracts have expired
+        now = datetime.datetime.now()
+        today = now.date()
+        settlement_time = now.replace(hour=13, minute=30, second=0, microsecond=0)
         needs_refresh = False
 
         for side, contract in [("C", self.active_contracts.get("C")), ("P", self.active_contracts.get("P"))]:
             if not contract:
                 needs_refresh = True
                 break
-            # GSD: Compare standardized YYYY/MM/DD strings
-            dd = getattr(contract, 'delivery_date', None)
-            if dd and isinstance(dd, str):
-                # Clean Shioaji delivery_date format if needed
-                dd_clean = dd.replace("-", "/")
-                if dd_clean <= today_str:
-                    console.print(f"[yellow]⚠️ {side} contract {contract.code} expired (delivery: {dd})[/yellow]")
-                    needs_refresh = True
+            
+            dd_str = getattr(contract, 'delivery_date', None)
+            if dd_str and isinstance(dd_str, str):
+                # Parse contract delivery date
+                parsed_dd = None
+                for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
+                    try:
+                        parsed_dd = datetime.datetime.strptime(dd_str, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+                
+                if parsed_dd:
+                    if parsed_dd < today:
+                        console.print(f"[yellow]⚠️ {side} contract {contract.code} has expired ({dd_str})[/yellow]")
+                        needs_refresh = True
+                    elif parsed_dd == today and now >= settlement_time:
+                        console.print(f"[yellow]⚠️ {side} contract {contract.code} expired today at 13:30[/yellow]")
+                        needs_refresh = True
         
         if needs_refresh:
             console.print("[bold yellow]🔄 Refreshing options contracts...[/bold yellow]")
@@ -882,7 +908,7 @@ class ShioajiOptionsSmartMonitor:
                 key = "C"
             elif p_contract and code == getattr(p_contract, "code", None):
                 key = "P"
-            elif m_contract and (code == getattr(m_contract, "code", None) or code.startswith("MXF")):
+            elif m_contract and code == getattr(m_contract, "code", None):
                 key = "MTX"
             if key:
                 self.market_data[key]["close"] = float(tick.close)
@@ -1030,7 +1056,7 @@ class ShioajiOptionsSmartMonitor:
 
         # GSD fix: Explicit whitelist of exit actions that require PnL calculation
         # (instead of fragile substring matching)
-        exit_keywords = ["EXIT", "TP1", "TRAIL", "TIME", "REVERSAL", "TRAP", "EOD", "FILL"]
+        exit_keywords = ["EXIT", "THETA_EXIT", "TP1", "TRAIL", "TIME", "REVERSAL", "TRAP", "EOD", "FILL"]
         is_exit_action = any(kw in action for kw in exit_keywords) and self.entry_price > 0
 
         # Skip non-trade entries (cancelled orders, retries, etc.)
@@ -2268,11 +2294,27 @@ class ShioajiOptionsSmartMonitor:
                             pos = self._theta_gang.close_position()
                             # GSD fix: ThetaGang has pre-computed PnL, don't recalculate through log_trade
                             theta_pnl = round(exit_info["pnl"], 0)
+                            # 計算累計Balance（從現有ledger）
+                            current_balance = 0
+                            if self.ledger_path.exists():
+                                try:
+                                    import pandas as pd
+                                    prev = pd.read_csv(self.ledger_path)
+                                    current_balance = pd.to_numeric(prev["PnL"], errors="coerce").fillna(0).sum()
+                                except Exception as e:
+                                    console.print(f"[yellow]⚠️ Ledger read error: {e} — balance reset to 0[/yellow]")
+                            
+                            new_balance = current_balance + theta_pnl
+                            
+                            # GSD fix: 確保exit_price正確記錄
+                            exit_price = float(exit_info.get("current_value", 0))
+                            
                             theta_row = {
                                 "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 "Mode": self.mode, "Action": "THETA_EXIT", "Side": pos.strategy,
-                                "Price": 0, "Quantity": pos.quantity,
-                                "PnL": theta_pnl, "Balance": theta_pnl,
+                                "Price": exit_price,  # 記錄平倉價值
+                                "Quantity": pos.quantity,
+                                "PnL": theta_pnl, "Balance": new_balance,
                                 "Note": f"{exit_info['reason']} credit={pos.net_credit:.0f} pnl={exit_info['pnl']:.0f}",
                             }
                             pd.DataFrame([theta_row]).to_csv(self.ledger_path, mode='a', index=False, header=not self.ledger_path.exists())
@@ -2291,7 +2333,14 @@ class ShioajiOptionsSmartMonitor:
                             pos = self._theta_gang.open_position(entry_info)
                             # Create a readable string of position legs
                             legs_str = " | ".join(f"{leg.action} {leg.side}{leg.strike}" for leg in pos.legs)
-                            self.log_trade("THETA_ENTRY", "THETA", 0,
+                            # 記錄實際收取的權利金作為進場價
+                            # GSD fix: 確保price參數正確傳遞
+                            if pos and hasattr(pos, 'net_credit') and pos.net_credit is not None and pos.net_credit > 0:
+                                entry_price = float(pos.net_credit)
+                            else:
+                                entry_price = 0.0
+                                console.print(f"[yellow]⚠️ THETA_ENTRY: net_credit is None or 0, using price=0[/yellow]")
+                            self.log_trade("THETA_ENTRY", "THETA", entry_price,
                                            f"credit={pos.net_credit:.0f} max_loss={pos.max_loss:.0f} strategy={pos.strategy} [{legs_str}]")
                             console.print(f"[bold cyan]🔺 [ThetaGang] ENTRY {pos.strategy}: credit={pos.net_credit:.0f} [{legs_str}][/bold cyan]")
                             return
