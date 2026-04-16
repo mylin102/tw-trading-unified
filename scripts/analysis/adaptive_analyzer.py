@@ -58,27 +58,51 @@ class AdaptiveAnalyzer:
         return enriched
 
     def analyze_reason_alpha(self, enriched_df: pd.DataFrame) -> Dict:
-        """Quantify win rate and avg PnL per entry reason."""
+        """Quantify win rate and avg PnL per entry reason by linking ENTRY/EXIT."""
         if enriched_df.empty:
             return {}
             
-        # We need to link ENTRY and EXIT to get PnL per reason
-        # Simplified: Use existing pnl_cash in trade records if available
         summary = {}
-        reasons = enriched_df['reason'].unique()
+        # Track open positions to link exits back to entry reasons
+        open_positions = {} # key: ticker, value: entry_reason
         
-        for reason in reasons:
-            if not reason: continue
-            subset = enriched_df[enriched_df['reason'] == reason]
-            # Focus on EXITS to see realized PnL
-            exits = subset[subset['type'].str.contains('EXIT', na=False)]
+        # Sort by timestamp to process sequentially
+        df = enriched_df.sort_values('timestamp')
+        
+        for _, row in df.iterrows():
+            ticker = self.ticker
+            etype = str(row['type'])
+            reason = str(row['reason'])
+            direction = str(row['direction'])
             
-            summary[str(reason)] = {
-                "count": int(len(subset)),
-                "exits": int(len(exits)),
-                "total_pnl": float(exits['pnl_cash'].sum()) if 'pnl_cash' in exits else 0.0,
-                "win_rate": float(len(exits[exits['pnl_cash'] > 0]) / len(exits)) if not exits.empty else 0.0
-            }
+            if etype == 'BUY' or etype == 'SELL':
+                # Determine if this is an ENTRY (from 0 pos) or just increasing pos
+                # For simplified logic, we assume first BUY/SELL after flat is ENTRY
+                # Real implementation would check self.trader.position
+                if ticker not in open_positions:
+                    open_positions[ticker] = reason
+            
+            elif 'EXIT' in etype:
+                entry_reason = open_positions.get(ticker, "UNKNOWN")
+                if entry_reason not in summary:
+                    summary[entry_reason] = {"count": 0, "exits": 0, "total_pnl": 0.0, "wins": 0}
+                
+                summary[entry_reason]["count"] += 1
+                summary[entry_reason]["exits"] += 1
+                pnl = float(row.get('pnl_cash', 0))
+                summary[entry_reason]["total_pnl"] += pnl
+                if pnl > 0:
+                    summary[entry_reason]["wins"] += 1
+                
+                # Close position
+                if etype == 'EXIT':
+                    open_positions.pop(ticker, None)
+
+        # Finalize stats
+        for r in summary:
+            exits = summary[r]["exits"]
+            summary[r]["win_rate"] = float(summary[r]["wins"] / exits) if exits > 0 else 0.0
+            
         return summary
 
     def run(self):

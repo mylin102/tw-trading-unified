@@ -397,8 +397,8 @@ class StockMonitor:
                     console.print(f"[yellow]⚠️ Skipping {ticker} due to notice: {notice}[/yellow]")
                     continue
                 
-                # 1. Indicator Analysis
-                start_date = (now - pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+                # 1. Indicator Analysis (回溯 4 天以確保有足夠的歷史資料算指標，特別是週一)
+                start_date = (now - pd.Timedelta(days=4)).strftime("%Y-%m-%d")
                 end_date = now.strftime("%Y-%m-%d")
                 console.print(f"[dim]📊 Fetching data for {ticker} from {start_date} to {end_date}[/dim]")
                 

@@ -1359,15 +1359,16 @@ class FuturesMonitor:
             return None
         
         try:
-            # 獲取當天日期
+            # 獲取起始日期 (回溯 3 天以確保有足夠的歷史資料算指標)
             today = datetime.now()
+            start_date = (today - timedelta(days=3)).strftime("%Y-%m-%d")
             if today.hour < 5:  # 凌晨5點前算前一天
                 today = today - timedelta(days=1)
             date_str = today.strftime("%Y-%m-%d")
             
             # 使用api.kbars獲取1分鐘K棒
-            console.print(f"[cyan][FuturesMonitor] Fetching kbars for contract={self.contract.code}, date={date_str}[/cyan]")
-            bars = self.api.kbars(self.contract, start=date_str, end=date_str)
+            console.print(f"[cyan][FuturesMonitor] Fetching kbars for contract={self.contract.code}, from {start_date} to {date_str}[/cyan]")
+            bars = self.api.kbars(self.contract, start=start_date, end=date_str)
             self._last_kbars_fetch_at = now_ts
             
             # 轉換為DataFrame

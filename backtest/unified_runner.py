@@ -30,7 +30,7 @@ from core.signal import Signal
 from core.backtest_engine import BacktestEngine, AssetProfile, AssetType
 
 # ==================== Configuration ====================
-START_DATE = '2020-01-01'
+START_DATE = '2025-01-01'
 END_DATE = '2026-04-01'
 INITIAL_CAPITAL = 1_000_000
 

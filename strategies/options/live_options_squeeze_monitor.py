@@ -1314,14 +1314,14 @@ class ShioajiOptionsSmartMonitor:
             return None
 
         # Shioaji server stores K-bars by calendar date, not trading day.
-        # Night session data (15:00-05:00) is stored under the calendar date when it started.
-        # e.g., 20:00 on 4/13 → server key = 2026-04-13, not 2026-04-14.
         today = datetime.datetime.now()
+        start_date = (today - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
         if today.hour < 5:
             today = today - datetime.timedelta(days=1)
         date_str = today.strftime("%Y-%m-%d")
         try:
-            bars = self.api.kbars(self.active_contracts["MTX"], start=date_str, end=date_str)
+            console.print(f"[cyan][OptionsMonitor] Fetching futures kbars from {start_date} to {date_str}[/cyan]")
+            bars = self.api.kbars(self.active_contracts["MTX"], start=start_date, end=date_str)
             self.last_kbars_fetch_at = now_ts
             frame = pd.DataFrame({**bars})
         except Exception as e:
