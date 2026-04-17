@@ -180,6 +180,7 @@ class ShioajiOptionsSmartMonitor:
         self.cooldown_until = 0
         self.cooldown_bars = int(self.strategy_cfg.get("cooldown_bars", 0))
         self.last_signal = None
+        self.trailing_stop_pct = float(self.strategy_cfg.get("trailing_stop_pct", 0))
         
         # ThetaGang (sell premium) integration
         self._theta_gang = None
@@ -988,73 +989,86 @@ class ShioajiOptionsSmartMonitor:
                 if self.market_data[key]["close"] <= 0 or key == "MTX":
                     self.market_data[key]["close"] = mid
 
+    def _save_orders_file_wrapper(self):
+        """Export all orders to JSON for dashboard with unrealized PnL."""
+        if not self.order_mgr:
+            return
+        try:
+            import json
+            from pathlib import Path
+            all_orders = self.order_mgr.get_completed() + self.order_mgr.get_pending()
+            export_data = []
+
+            # Get current option price for unrealized PnL
+            cur_price = None
+            try:
+                # Try to get current option premium from market data
+                if hasattr(self, 'active_option_contract') and self.active_option_contract:
+                    code = self.active_option_contract.code
+                    if code in self.market_data:
+                        bid = self.market_data[code].get("bid", 0)
+                        ask = self.market_data[code].get("ask", 0)
+                        if bid > 0 and ask > 0:
+                            cur_price = (bid + ask) / 2
+            except Exception:
+                pass
+
+            for o in all_orders:
+                d = o.to_dict()
+                d["unrealized_pnl"] = None
+                d["unrealized_pnl_pts"] = None
+                d["current_price"] = cur_price if cur_price and cur_price > 0 else None
+
+                if o.status in ("filled", "partial_filled") and self.position > 0:
+                    entry = self.entry_price
+                    if cur_price and cur_price > 0 and entry > 0:
+                        # GSD Fix: Side-aware PnL
+                        from core.order_management.order import OrderSide
+                        if o.side == OrderSide.SELL:
+                            # Short position: profit if price DROPS
+                            pnl_pts = entry - cur_price
+                        else:
+                            # Long position: profit if price RISES
+                            pnl_pts = cur_price - entry
+                            
+                        point_value = 50
+                        pnl_cash = pnl_pts * point_value * self.position
+                        d["unrealized_pnl"] = round(pnl_cash, 0)
+                        d["unrealized_pnl_pts"] = round(pnl_pts, 1)
+
+                export_data.append(d)
+
+            today = datetime.datetime.now().strftime("%Y%m%d")
+            orders_file = Path(f"exports/trades/OPTIONS_{today}_orders.json")
+            orders_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(orders_file, "w", encoding="utf-8") as f:
+                json.dump(export_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️ Failed to save options orders: {e}")
+
     def _wire_order_callbacks(self):
         """Wire OrderManager callbacks for options (export + logging)."""
         import json
         from core.order_management.order import OrderStatus
 
-        def _save_orders_file():
-            """Export all orders to JSON for dashboard with unrealized PnL."""
-            if not self.order_mgr:
-                return
-            try:
-                all_orders = self.order_mgr.get_completed() + self.order_mgr.get_pending()
-                export_data = []
-
-                # Get current option price for unrealized PnL
-                cur_price = None
-                try:
-                    # Try to get current option premium from market data
-                    if hasattr(self, 'active_option_contract') and self.active_option_contract:
-                        code = self.active_option_contract.code
-                        if code in self.market_data:
-                            bid = self.market_data[code].get("bid", 0)
-                            ask = self.market_data[code].get("ask", 0)
-                            if bid > 0 and ask > 0:
-                                cur_price = (bid + ask) / 2
-                except Exception:
-                    pass
-
-                for o in all_orders:
-                    d = o.to_dict()
-                    d["unrealized_pnl"] = None
-                    d["unrealized_pnl_pts"] = None
-                    d["current_price"] = cur_price if cur_price and cur_price > 0 else None
-
-                    if o.status in ("filled", "partial_filled") and self.position > 0:
-                        entry = self.entry_price
-                        if cur_price and cur_price > 0 and entry > 0:
-                            pnl_pts = cur_price - entry
-                            point_value = 50
-                            pnl_cash = pnl_pts * point_value * self.position
-                            d["unrealized_pnl"] = round(pnl_cash, 0)
-                            d["unrealized_pnl_pts"] = round(pnl_pts, 1)
-
-                    export_data.append(d)
-
-                today = datetime.datetime.now().strftime("%Y%m%d")
-                orders_file = Path(f"exports/trades/OPTIONS_{today}_orders.json")
-                orders_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(orders_file, "w", encoding="utf-8") as f:
-                    json.dump(export_data, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                console.print(f"[yellow]⚠️ Failed to save options orders: {e}[/yellow]")
-
         def _on_fill_callback(event):
             console.print(f"[green]📦 Options Order FILLED: {event.side.value} {event.fill_qty} @ {event.fill_price:.0f}[/green]")
-            _save_orders_file()
+            self._save_orders_file_wrapper()
 
         def _on_cancel_callback(event):
             console.print(f"[yellow]🚫 Options Order CANCELLED: {event.order_id} ({event.reason})[/yellow]")
-            _save_orders_file()
+            self._save_orders_file_wrapper()
 
         def _on_reject_callback(event):
             console.print(f"[red]❌ Options Order REJECTED: {event.order_id} ({event.reason})[/red]")
-            _save_orders_file()
+            self._save_orders_file_wrapper()
 
         self.order_mgr.register_callback("on_fill", _on_fill_callback)
         self.order_mgr.register_callback("on_cancel", _on_cancel_callback)
         self.order_mgr.register_callback("on_reject", _on_reject_callback)
+        
+        # [GSD Fix] 啟動時立即存檔，確保 Dashboard 抓得到檔案 (包含已恢復的部位)
+        self._save_orders_file_wrapper()
 
     def log_trade(self, action, side, price, note="", quantity=None):
         pnl = 0
@@ -1101,6 +1115,25 @@ class ShioajiOptionsSmartMonitor:
         }
         pd.DataFrame([data]).to_csv(self.ledger_path, mode='a', index=False, header=not self.ledger_path.exists())
 
+        # [GSD Phase B] Log outcome attribution
+        if is_exit_action and hasattr(self, "_entry_features") and self._entry_features:
+            from core.decision_logger import DecisionLogger
+            outcome = {
+                "pnl": float(pnl),
+                "exit_price": float(price),
+                "exit_reason": str(action)
+            }
+            DecisionLogger.log_trade_outcome(
+                trade_id=f"OPT-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}",
+                strategy=f"{self.mode}_squeeze",
+                regime=self._entry_features.get("regime", "NORMAL"),
+                features=self._entry_features,
+                outcome=outcome
+            )
+            # Clear features after exit
+            if "TP1" not in action: # Only clear if full exit
+                self._entry_features = {}
+
     def on_order_event(self, stat, msg):
         # set_order_callback receives OrderState enum:
         #   OrderState.FuturesDeal / OrderState.StockDeal — actual fills
@@ -1131,6 +1164,15 @@ class ShioajiOptionsSmartMonitor:
             self.stop_loss_price = price * (1 - self.stop_loss_pct)
             self.peak_premium = price
             self.replay_stats["entries"] += 1
+            
+            # [GSD Phase B] Capture entry features
+            self._entry_features = {
+                "momentum": float(self.latest_score),
+                "regime": str(self.latest_mid_trend),
+                "iv": float(self.latest_iv or 0.25),
+                "entry_price": float(price)
+            }
+            
             self.log_trade("LIVE_ENTRY_FILLED", side, price, f"qty={quantity}")
             if _notify:
                 _notify(f"[TXO] ENTRY {side} @ {price:.1f}", f"🟢 ENTRY {side} qty={quantity} @ {price:.1f}")
@@ -1847,6 +1889,15 @@ class ShioajiOptionsSmartMonitor:
         self.stop_loss_price = entry_price * (1 - self.stop_loss_pct)
         self.peak_premium = entry_price
         self.replay_stats["entries"] += 1
+        
+        # [GSD Phase B] Capture entry features
+        self._entry_features = {
+            "momentum": float(self.latest_score),
+            "regime": str(self.latest_mid_trend),
+            "iv": float(self.latest_iv or 0.25),
+            "entry_price": float(entry_price)
+        }
+        
         self.log_trade("PAPER_ENTRY", side, entry_price, f"score={signal['score']:.1f}")
 
     def enter_live_position(self, side, signal):
@@ -2081,12 +2132,18 @@ class ShioajiOptionsSmartMonitor:
                             action = r.get("Action", "")
                             qty = int(r.get("Quantity", 0) or 0)
                             if "ENTRY" in action:
-                                total_cost += float(r.get("Price", 0)) * qty
-                                current_qty += qty  # Accumulate for multi-position
+                                price = float(r.get("Price", 0))
+                                total_cost += price * qty
+                                current_qty += qty
                                 last_side = r.get("Side")
                                 last_entry_price = total_cost / current_qty if current_qty > 0 else 0
                             elif "TP1" in action:
+                                # TP1 is partial exit, reduce qty but keep average price
                                 current_qty = max(0, current_qty - qty)
+                                if current_qty == 0:
+                                    total_cost = 0
+                                else:
+                                    total_cost = last_entry_price * current_qty
                             elif "EXIT" in action or "PANIC" in action or "TRAIL" in action or "TIME" in action or "REVERSAL" in action:
                                 current_qty = 0
                                 last_side = None
@@ -2096,8 +2153,41 @@ class ShioajiOptionsSmartMonitor:
                             self.position = current_qty
                             self.active_side = last_side
                             self.entry_price = last_entry_price
-                            self.stop_loss_price = self.entry_price * (1 - self.stop_loss_pct)
+                            # SL logic depends on side
+                            if self.active_side in ["C", "P"]:
+                                self.stop_loss_price = self.entry_price * (1 - self.stop_loss_pct)
+                            else: # Theta/Short
+                                self.stop_loss_price = self.entry_price * (1 + self.stop_loss_pct)
+                                
                             self.peak_premium = self.entry_price
+                            
+                            # [GSD Fix] 把恢復的部位加入 OrderManager
+                            if self.order_mgr:
+                                from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
+                                symbol = "TXO"
+                                contract = self.active_contracts.get(self.active_side)
+                                if contract: symbol = contract.code
+                                
+                                # Determine side: Theta/Short strategies are SELL entry
+                                is_short = (self.active_side == "THETA" or self.active_side == "SHORT")
+                                side = OrderSide.SELL if is_short else OrderSide.BUY
+                                
+                                rec_order = Order(
+                                    symbol=symbol,
+                                    side=side,
+                                    order_type=OrderType.MARKET,
+                                    quantity=self.position,
+                                    price=self.entry_price,
+                                    order_id=f"RECOV-{datetime.datetime.now().strftime('%H%M%S')}",
+                                    strategy="RECOVERED"
+                                )
+                                rec_order.status = OrderStatus.FILLED
+                                rec_order.filled_quantity = self.position
+                                rec_order.avg_fill_price = self.entry_price
+                                rec_order.filled_at = datetime.datetime.now()
+                                self.order_mgr.completed.append(rec_order)
+                                self._save_orders_file_wrapper()
+                                
                             console.print(f"[bold cyan]♻️ Recovered paper position from ledger: {self.active_side} qty={self.position} @ {self.entry_price}[/bold cyan]")
                             return
             except Exception as e:
@@ -2240,7 +2330,23 @@ class ShioajiOptionsSmartMonitor:
             eod_state = self._eod_state(now)
             self.refresh_live_orders()
             signal = self.fetch_live_signal()
-            
+
+            # ── [L4] Decision Intelligence: Edge Evaluation ───────────────
+            from core.edge_model import edge_model
+            if signal and signal["side"] and self.position == 0:
+                edge_context = {
+                    "momentum": float(self.latest_score), # latest_score acts as momentum proxy in options
+                    "regime": str(self.latest_mid_trend),
+                    "vwap_dist": 0, # Not easily available for options underlying mid-loop
+                    "volatility": float(self.latest_iv or 0.25)
+                }
+                edge_res = edge_model.evaluate(abs(signal["score"]), edge_context, f"{self.mode}_squeeze")
+                if not edge_res["has_edge"]:
+                    self.replay_stats["blocked_entries"] += 1
+                    if self._bar_counter % 5 == 0: # Reduce log noise
+                        console.print(f"[bold yellow]🛡️ Decision Intelligence: Option {signal['side']} Blocked - {edge_res['reason']}[/bold yellow]")
+                    signal = {"score": 0, "side": None} # Nullify entry signal
+
             if self.position > 0:
                 cur_p = self.market_data[self.active_side]["close"]
                 cur_bid = self.market_data[self.active_side]["bid"]
@@ -2414,6 +2520,11 @@ class ShioajiOptionsSmartMonitor:
             console.print("[yellow]Live mode active. Orders will be submitted through the broker adapter and local state will follow fill callbacks.[/yellow]")
         else:
             console.print("[green]Paper mode active. Entries and exits will be simulated in the trade ledger.[/green]")
+        # [GSD Phase C] Initialize Diagnostic Engine
+        from core.diagnostic_engine import DiagnosticEngine
+        self.diag_engine = DiagnosticEngine(str(self.ledger_path))
+        self._diag_counter = 0
+
         self.print_status_summary(force=True)
         try:
             self._running = True
@@ -2422,11 +2533,27 @@ class ShioajiOptionsSmartMonitor:
                 if os.path.exists(".restart"):
                     console.print("[bold yellow]🔄 Restart flag detected. Exiting Options Monitor for supervisor...[/bold yellow]")
                     break
+                
+                try:
+                    self.run_strategy_logic()
+                    
+                    # [GSD Phase C] Periodic Health Check
+                    self._diag_counter += 1
+                    if self._diag_counter % 10 == 0:
+                        results = self.diag_engine.check_health()
+                        for r in results:
+                            console.print(f"[bold red]🩺 DIAGNOSTIC ALERT (Options): {r.action} - {r.reason}[/bold red]")
+                            if r.action == "COOLDOWN":
+                                self.cooldown_until = 20
+                except Exception as exc:
+                    console.print(f"[red]Options strategy logic error: {exc}[/red]")
+                    import traceback
+                    traceback.print_exc()
 
                 if self.dry_run and self.run_once:
-                    self.run_strategy_logic()
                     console.print("[bold green]Dry run completed one strategy iteration.[/bold green]")
                     break
+                
                 if self.dry_run and self.replay_bars is not None and self.replay_cursor is not None and self.replay_cursor > len(self.replay_bars):
                     console.print("[bold green]Dry run replay completed.[/bold green]")
                     break

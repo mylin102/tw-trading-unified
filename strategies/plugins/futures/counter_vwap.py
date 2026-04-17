@@ -115,7 +115,8 @@ class CounterVWAP(StrategyBase):
         sl_pts = atr * atr_sl_mult if atr > 0 else 60
         
         # Adaptive: Session-Aware Trailing Params (from vbt sweep)
-        is_day = 8 <= bar.index.hour < 15 if hasattr(bar.index, 'hour') else True
+        ts = bar.get("timestamp") or bar.get("name")
+        is_day = 8 <= ts.hour < 15 if hasattr(ts, 'hour') else True
         be_trigger = 20.0 if is_day else 70.0
         trail_pts = 120.0 if is_day else 140.0
 

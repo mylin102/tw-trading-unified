@@ -65,7 +65,7 @@ pricing:
   strike_rounding: 100
 risk_mgmt:
   entry_premium_limit: 1500
-  initial_capital: 40000
+  initial_capital: 100000
   lots_per_trade: 1
   max_daily_loss: 0.02
   max_holding_days: 7

@@ -900,61 +900,65 @@ class FuturesMonitor:
         except Exception as e:
             console.print(f"[yellow]⚠️ Trade backup failed: {e}[/yellow]")
 
+    def _save_orders_file_wrapper(self):
+        """Export all orders to JSON for dashboard consumption."""
+        if not self.order_mgr:
+            return
+        try:
+            from core.order_management.order import OrderSide
+            import math
+            import json
+            from pathlib import Path
+
+            # Get current market price for unrealized PnL
+            cur_price = 0.0
+            try:
+                cur_price = float(self.market_data.get("MTX", {}).get("close", 0))
+            except Exception:
+                cur_price = 0.0
+            
+            if cur_price <= 0:
+                try:
+                    cur_price = float(self.market_data.get("TMF", {}).get("close", 0))
+                except Exception:
+                    cur_price = 0.0
+
+            all_orders = self.order_mgr.get_completed() + self.order_mgr.get_pending()
+            export_data = []
+            for o in all_orders:
+                d = o.to_dict()
+                # Add unrealized PnL for open positions
+                d["unrealized_pnl"] = None
+                d["unrealized_pnl_pts"] = None
+                d["current_price"] = cur_price if cur_price > 0 else None
+
+                if o.status in ("filled", "partial_filled") and self.trader.position != 0:
+                    entry = self.trader.entry_price
+                    qty = abs(self.trader.position)
+                    if cur_price > 0 and entry > 0:
+                        if self.trader.position > 0:  # LONG
+                            pnl_pts = cur_price - entry
+                        else:  # SHORT
+                            pnl_pts = entry - cur_price
+                        point_value = 50
+                        pnl_cash = pnl_pts * point_value * qty
+                        d["unrealized_pnl"] = round(pnl_cash, 0)
+                        d["unrealized_pnl_pts"] = round(pnl_pts, 1)
+
+                export_data.append(d)
+
+            today = datetime.now().strftime("%Y%m%d")
+            orders_file = Path(f"exports/trades/TMF_{today}_orders.json")
+            orders_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(orders_file, "w", encoding="utf-8") as f:
+                json.dump(export_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️ Failed to save futures orders file: {e}")
+
     # ── Order Lifecycle (L3 Integration) ──
     def _wire_order_callbacks(self):
         """Wire OrderManager callbacks to PaperTrader and audit system."""
         from core.order_management.order import OrderStatus, OrderSide
-        import json
-        from pathlib import Path
-
-        def _save_orders_file():
-            """Export all orders to JSON for dashboard consumption."""
-            if not self.order_mgr:
-                return
-            try:
-                from core.order_management.order import OrderSide
-                import math
-
-                # Get current market price for unrealized PnL
-                cur_price = None
-                try:
-                    cur_price = float(self.market_data.get("MTX", {}).get("close", 0)) or 0
-                except Exception:
-                    pass
-                if cur_price <= 0:
-                    cur_price = float(self.market_data.get("TMF", {}).get("close", 0)) or 0
-
-                all_orders = self.order_mgr.get_completed() + self.order_mgr.get_pending()
-                export_data = []
-                for o in all_orders:
-                    d = o.to_dict()
-                    # Add unrealized PnL for open positions
-                    d["unrealized_pnl"] = None
-                    d["unrealized_pnl_pts"] = None
-                    d["current_price"] = cur_price if cur_price > 0 else None
-
-                    if o.status in ("filled", "partial_filled") and self.trader.position != 0:
-                        entry = self.trader.entry_price
-                        qty = abs(self.trader.position)
-                        if cur_price > 0 and entry > 0:
-                            if self.trader.position > 0:  # LONG
-                                pnl_pts = cur_price - entry
-                            else:  # SHORT
-                                pnl_pts = entry - cur_price
-                            point_value = 50
-                            pnl_cash = pnl_pts * point_value * qty
-                            d["unrealized_pnl"] = round(pnl_cash, 0)
-                            d["unrealized_pnl_pts"] = round(pnl_pts, 1)
-
-                    export_data.append(d)
-
-                today = datetime.now().strftime("%Y%m%d")
-                orders_file = Path(f"exports/trades/TMF_{today}_orders.json")
-                orders_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(orders_file, "w", encoding="utf-8") as f:
-                    json.dump(export_data, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                console.print(f"[yellow]⚠️ Failed to save orders file: {e}[/yellow]")
 
         def _on_fill_callback(event):
             if event.status == OrderStatus.FILLED:
@@ -983,19 +987,20 @@ class FuturesMonitor:
                     })
                 except Exception:
                     pass
-                _save_orders_file()
+                self._save_orders_file_wrapper()
 
         def _on_cancel_callback(event):
             console.print(f"[yellow]🚫 Order CANCELLED: {event.order_id} ({event.reason})[/yellow]")
-            _save_orders_file()
+            self._save_orders_file_wrapper()
 
         def _on_reject_callback(event):
             console.print(f"[red]❌ Order REJECTED: {event.order_id} ({event.reason})[/red]")
-            _save_orders_file()
+            self._save_orders_file_wrapper()
 
         self.order_mgr.register_callback("on_fill", _on_fill_callback)
         self.order_mgr.register_callback("on_cancel", _on_cancel_callback)
         self.order_mgr.register_callback("on_reject", _on_reject_callback)
+        self._save_orders_file_wrapper()
 
     def _submit_order_via_manager(self, signal, price, ts, lots, stop_loss=None, reason=None):
         """Submit order through OrderManager instead of direct PaperTrader call."""
@@ -1164,21 +1169,38 @@ class FuturesMonitor:
         # GSD Phase 0c: Entry diagnostic snapshot
         if signal in ("BUY", "SELL"):
             ctx = getattr(self, "_last_bar_context", {})
-            entry_diag = {
+            self._entry_features_futures = {
                 "momentum": ctx.get("momentum", 0),
                 "mom_velo": ctx.get("mom_velo", 0),
                 "vwap_distance_pts": round(abs(price - ctx.get("vwap", price)), 1),
                 "atr": ctx.get("atr", 0),
-                "squeeze_on_recent": ctx.get("squeeze_on", False),
-                "score": ctx.get("score", 0),
                 "regime": ctx.get("regime", "UNKNOWN"),
-                "session": ctx.get("session", "day"),
-                "stop_loss_pts": round(stop_loss or 0, 1),
+                "score": ctx.get("score", 0),
+                "entry_price": float(price)
             }
             save_trade({"type": "ENTRY_DIAG", "timestamp": ts, "signal": signal,
                         "price": price, "lots": lots, "direction": direction,
                         "reason": reason or "",
-                        "entry_diag": entry_diag})
+                        "entry_diag": self._entry_features_futures})
+
+        # [GSD Phase B] Log outcome attribution
+        if signal in ("EXIT", "PARTIAL_EXIT") and hasattr(self, "_entry_features_futures") and self._entry_features_futures:
+            from core.decision_logger import DecisionLogger
+            outcome = {
+                "pnl": float(pnl_cash),
+                "pnl_pts": float(pnl_pts),
+                "exit_price": float(price),
+                "exit_reason": str(reason or "SIGNAL")
+            }
+            DecisionLogger.log_trade_outcome(
+                trade_id=f"FUT-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                strategy=self.active_strategy_name,
+                regime=self._entry_features_futures.get("regime", "NORMAL"),
+                features=self._entry_features_futures,
+                outcome=outcome
+            )
+            if signal == "EXIT":
+                self._entry_features_futures = {}
 
         # GSD Phase 0b: Track consecutive losses on exit
         if signal in ("EXIT", "PARTIAL_EXIT") and pnl_pts < 0:
@@ -1415,10 +1437,34 @@ class FuturesMonitor:
                         qty = p.quantity if str(p.direction) == 'Buy' else -p.quantity
                         self.trader.position = qty
                         self.trader.entry_price = float(p.price)
+                        
+                        # [GSD Fix] 把恢復的部位加入 OrderManager
+                        if self.order_mgr:
+                            from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
+                            rec_order = Order(
+                                symbol=self.contract.code,
+                                side=OrderSide.BUY if qty > 0 else OrderSide.SELL,
+                                order_type=OrderType.MARKET,
+                                quantity=abs(qty),
+                                price=float(p.price),
+                                order_id=f"RECOV-{datetime.now().strftime('%H%M%S')}",
+                                strategy="RECOVERED"
+                            )
+                            rec_order.status = OrderStatus.FILLED
+                            rec_order.filled_quantity = abs(qty)
+                            rec_order.avg_fill_price = float(p.price)
+                            rec_order.filled_at = datetime.now()
+                            self.order_mgr.completed.append(rec_order)
+                            
                         console.print(f"[bold cyan]♻️ Recovered futures position: {qty} @ {p.price}[/bold cyan]")
                         break
             except Exception as e:
                 console.print(f"[yellow]Futures position recovery failed: {e}[/yellow]")
+        # [GSD Phase C] Initialize Diagnostic Engine
+        from core.diagnostic_engine import DiagnosticEngine
+        self.diag_engine = DiagnosticEngine(str(Path("logs/market_data/TMF_trades.csv"))) # Shared trades ledger
+        self._diag_counter = 0
+
         console.print(f"[green][FuturesMonitor] started ({mode})[/green]")
 
         while self._running:
@@ -1428,6 +1474,15 @@ class FuturesMonitor:
                 break
             try:
                 self._strategy_tick()
+                
+                # [GSD Phase C] Periodic Health Check
+                self._diag_counter += 1
+                if self._diag_counter % 10 == 0:
+                    results = self.diag_engine.check_health()
+                    for r in results:
+                        console.print(f"[bold red]🩺 DIAGNOSTIC ALERT: {r.action} - {r.reason}[/bold red]")
+                        if r.action == "COOLDOWN":
+                            self.cooldown_until = 20 # Auto-trigger cooldown
             except Exception as e:
                 traceback.print_exc()
                 console.print(f"[red][FuturesMonitor] error: {e}[/red]")
@@ -1850,8 +1905,26 @@ class FuturesMonitor:
             strategy.init(ctx)
             self._active_strategy_name = active_name
 
+        # ── [L4] Decision Intelligence: Edge Evaluation ───────────────
+        from core.edge_model import edge_model
+        edge_context = {
+            "momentum": float(last_5m.get("momentum", 0)),
+            "regime": str(regime),
+            "vwap_dist": abs(last_price - vwap),
+            "volatility": float(last_5m.get("atr", 50))
+        }
+        
         # 4. Execute strategy
         signal = strategy.on_bar(ctx)
+
+        # 4.1 Global Edge Filter (Bypass for exits, apply to entries)
+        if signal and signal.action in ["BUY", "SELL"]:
+            edge_res = edge_model.evaluate(abs(score), edge_context, active_name)
+            if not edge_res["has_edge"]:
+                self._audit_signal("ENTRY_BLOCKED", signal.action, score, "low_edge", edge_res["reason"])
+                console.print(f"[bold yellow]🛡️ Decision Intelligence: {active_name} {signal.action} Blocked - {edge_res['reason']}[/bold yellow]")
+                self._signals_rejected += 1
+                return
 
         # 4.5 Fallback: try Spring/Upthrust if registry strategy has no signal
         if signal is None:
