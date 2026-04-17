@@ -1,80 +1,141 @@
 """
-Edge Model — Evaluates the expected advantage of a trade before entry.
-Implements "Decision Intelligence" by filtering out low-quality trades.
-
-Instead of blind execution, the system asks: "Does this trade have an edge in the current regime?"
+Edge Model V2 — Standardized Scoring with Exploration (Bandit approach).
+Ensures feature scaling doesn't destroy the score and allows exploration of rejected signals.
 """
 from __future__ import annotations
 import logging
-import numpy as np
+import random
 
 class EdgeModel:
     def __init__(self):
         self.logger = logging.getLogger("EdgeModel")
+        # Per-strategy calibration
+        self.thresholds = {
+            "counter_vwap": 0.35, 
+            "default": 0.5
+        }
+        self._ml_model = None
+        self._scaler = None
+        self._load_ml_model()
         
+    def _load_ml_model(self):
+        """Try to load pre-trained Logistic Regression model."""
+        import joblib
+        from pathlib import Path
+        model_path = Path(__file__).resolve().parent.parent / "models" / "edge_lr.pkl"
+        scaler_path = Path(__file__).resolve().parent.parent / "models" / "scaler.pkl"
+        
+        if model_path.exists() and scaler_path.exists():
+            try:
+                self._ml_model = joblib.load(model_path)
+                self._scaler = joblib.load(scaler_path)
+                self.logger.info("🧠 ML Edge Model (Logistic Regression) loaded.")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Failed to load ML model: {e}")
+
+    def compute_edge(self, features: dict) -> float:
+        """
+        Compute edge score using Top 3 Alpha features only (Selection).
+        """
+        if self._ml_model and self._scaler:
+            try:
+                # Use ONLY the most predictive features
+                vec = np.array([[
+                    features.get("trend_strength", 0.5),
+                    features.get("volatility", 0.5),
+                    features.get("signal_strength", 0.5),
+                    features.get("vwap_distance", 0.0),
+                    features.get("momentum_norm", 0.0),
+                    features.get("breakout_strength", 0.0),
+                    features.get("volume_spike", 1.0),
+                    features.get("trend_strength_raw", 0.0)
+                ]])
+                X_scaled = self._scaler.transform(vec)
+                return float(self._ml_model.predict_proba(X_scaled)[0, 1])
+            except Exception: pass
+
+        # RULE-BASED: Focus on Interaction Alpha
+        score = 0.5
+        # High Breakout + High Volume = High Edge
+        if features.get("breakout_strength", 0) > 1.5 and features.get("volume_spike", 0) > 1.2:
+            score += 0.2
+        # Low Strength + Mean Reversion Context = Edge for Counter
+        if abs(features.get("trend_strength_raw", 0)) < 0.001 and abs(features.get("vwap_distance", 0)) > 0.5:
+            score += 0.1
+            
+        return max(0.0, min(1.0, score))
+
     def evaluate(self, signal_score: float, context: dict, strategy_name: str) -> dict:
-        """
-        Evaluate the trade edge based on current market context and signal strength.
+        """Evaluate with Directional Shield and Probability Bucketing."""
+        # Standardize features
+        price = context.get("price", 20000)
+        atr = context.get("volatility", 50)
+        vol_norm = min(1.0, atr / (price * 0.05)) if price > 0 else 0.5
+        vwap_dist_raw = context.get("vwap_dist", 0)
+        vwap_norm = min(1.0, vwap_dist_raw / 100.0)
         
-        Args:
-            signal_score: The absolute score of the signal (0-100)
-            context: dict containing:
-                - momentum: current momentum value
-                - regime: STRONG, WEAK, or NORMAL
-                - volatility: current ATR or volatility measure
-                - vwap_dist: distance from VWAP in points
-            strategy_name: Name of the strategy (counter_vwap, v2_squeeze, etc.)
-            
-        Returns:
-            dict with 'has_edge', 'edge_score', and 'reason'
-        """
-        momentum = abs(context.get("momentum", 0))
         regime = context.get("regime", "NORMAL")
-        vwap_dist = abs(context.get("vwap_dist", 0))
+        trend_raw = float(context.get("trend_strength_raw", 0))
+
+        features = {
+            "trend_strength": 0.8 if regime == "STRONG" else 0.4,
+            "volatility": vol_norm,
+            "signal_strength": min(1.0, signal_score / 100.0),
+            "vwap_distance": vwap_norm,
+            "momentum_norm": float(context.get("momentum", 0)) / 100.0,
+            "breakout_strength": float(context.get("breakout_strength", 0)),
+            "volume_spike": float(context.get("volume_spike", 1.0)),
+            "trend_strength_raw": trend_raw
+        }
         
-        # Base edge calculation
-        edge_score = 0.5  # Neutral start
+        # --- DIRECTIONAL SHIELD (GSD 4.6) ---
+        # Prevent fighting strong trends
+        shield_blocked = False
+        side = context.get("side", "UNKNOWN") # Injected from monitor/engine
         
-        # Factor 1: Signal Strength
-        if signal_score >= 80:
-            edge_score += 0.2
-        elif signal_score < 30:
-            edge_score -= 0.2
+        if regime == "STRONG":
+            if trend_raw > 0.002 and side == "SHORT": shield_blocked = True # No shorting moon
+            if trend_raw < -0.002 and side == "LONG": shield_blocked = True # No catching falling knives
+
+        if shield_blocked:
+            return {"has_edge": False, "edge_score": 0.0, "pos_scale": 0.0, "rank": "SHIELD_BLOCKED", "reason": f"Shield Blocked: Counter-trend in {regime}"}
+
+        prob = self.compute_edge(features)
+        
+        # --- PROBABILITY BUCKETING (GSD 4.4) ---
+        # Instead of binary, we rank the opportunity
+        if prob >= 0.65:
+            rank = "ALPHA"
+            pos_scale = 1.5  # Heavy weight
+        elif prob >= 0.55:
+            rank = "BETA"
+            pos_scale = 1.0  # Standard
+        elif prob >= 0.48:
+            rank = "GAMMA"
+            pos_scale = 0.5  # Scout
+        else:
+            rank = "NO_EDGE"
+            pos_scale = 0.0
             
-        # Factor 2: Regime vs Strategy Fit
-        if strategy_name == "counter_vwap":
-            # Counter-VWAP thrives in WEAK/NORMAL regimes with high VWAP distance
-            if regime in ["WEAK", "NORMAL"]:
-                edge_score += 0.1
-            elif regime == "STRONG":
-                edge_score -= 0.3 # High risk of being run over in strong trend
-                
-            if vwap_dist > 50: # Significant deviation favors mean reversion
-                edge_score += 0.1
+        # Exploration fallback
+        is_exploring = False
+        if pos_scale == 0 and random.random() < 0.05: # Reduced exploration
+            pos_scale = 0.3
+            rank = "EXPLORE"
+            is_exploring = True
         
-        elif "squeeze" in strategy_name:
-            # Squeeze strategies thrive in STRONG trend regimes
-            if regime == "STRONG":
-                edge_score += 0.2
-            elif regime == "WEAK":
-                edge_score -= 0.2 # Avoid fake-outs in weak sideways markets
-                
-        # Factor 3: Momentum Confirmation
-        if momentum > 40:
-            edge_score += 0.1
-        elif momentum < 10:
-            edge_score -= 0.2
-            
-        # Final Decision
-        # Threshold 0.6: We only take trades where we have a positive bias
-        has_edge = edge_score >= 0.6
-        
-        reason = f"Edge={edge_score:.2f} (Score={signal_score:.0f}, Regime={regime}, Mom={momentum:.0f})"
+        has_edge = pos_scale > 0
+        source = "ML" if self._ml_model else "RULE"
+        reason = f"Rank={rank}, Prob={prob:.2f}, Scale={pos_scale}"
         
         return {
             "has_edge": has_edge,
-            "edge_score": edge_score,
-            "reason": reason if has_edge else f"LOW_EDGE: {reason}"
+            "edge_score": prob,
+            "pos_scale": pos_scale,
+            "rank": rank,
+            "is_exploring": is_exploring,
+            "reason": reason,
+            "features": features
         }
 
 # Global instance

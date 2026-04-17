@@ -1002,14 +1002,12 @@ class ShioajiOptionsSmartMonitor:
             # Get current option price for unrealized PnL
             cur_price = None
             try:
-                # Try to get current option premium from market data
-                if hasattr(self, 'active_option_contract') and self.active_option_contract:
-                    code = self.active_option_contract.code
-                    if code in self.market_data:
-                        bid = self.market_data[code].get("bid", 0)
-                        ask = self.market_data[code].get("ask", 0)
-                        if bid > 0 and ask > 0:
-                            cur_price = (bid + ask) / 2
+                # Try to get current option premium from market data using active_side
+                if self.active_side and self.active_side in self.market_data:
+                    bid = self.market_data[self.active_side].get("bid", 0)
+                    ask = self.market_data[self.active_side].get("ask", 0)
+                    if bid > 0 and ask > 0:
+                        cur_price = (bid + ask) / 2
             except Exception:
                 pass
 
@@ -1085,14 +1083,21 @@ class ShioajiOptionsSmartMonitor:
             is_exit_action = False
 
         if is_exit_action:
-            gross_pnl = (price - self.entry_price) * point_value * qty
+            # GSD Fix: Side-aware gross PnL
+            if side in ["SELL", "THETA", "SHORT"]:
+                # Short: profit if price drops
+                gross_pnl = (self.entry_price - price) * point_value * qty
+            else:
+                # Long: profit if price rises
+                gross_pnl = (price - self.entry_price) * point_value * qty
+
             # 扣除交易成本 (RULES.md Rule 4: PnL Must Include All Costs)
             # 期權手續費 (GSD parameterized)
             broker_fee = self.broker_fee_per_side * 2 * qty  # 進出各一次
             exchange_fee = self.exchange_fee_per_side * 2 * qty
             # 交易稅: 期權約 0.1% 權利金
             tax_rate = self.pricing_cfg.get("tax_rate", 0.001)
-            tax = (self.entry_price + price) * point_value * tax_rate * qty
+            tax = (abs(self.entry_price) + abs(price)) * point_value * tax_rate * qty
             pnl = round(gross_pnl - broker_fee - exchange_fee - tax, 0)
 
             # GSD validation: warn if exit PnL is 0 (indicates missing action keyword)
@@ -2128,31 +2133,38 @@ class ShioajiOptionsSmartMonitor:
                         last_side = None
                         last_entry_price = 0
                         total_cost = 0
+                        last_ts = None
                         for i, r in enumerate(rows):
                             action = r.get("Action", "")
                             qty = int(r.get("Quantity", 0) or 0)
                             if "ENTRY" in action:
                                 price = float(r.get("Price", 0))
-                                total_cost += price * qty
-                                current_qty += qty
+                                # For Theta/Short, we use the specific entry price, not cumulative
+                                total_cost = price * qty 
+                                current_qty = qty
                                 last_side = r.get("Side")
-                                last_entry_price = total_cost / current_qty if current_qty > 0 else 0
+                                last_entry_price = price
+                                last_ts = r.get("Timestamp")
                             elif "TP1" in action:
-                                # TP1 is partial exit, reduce qty but keep average price
                                 current_qty = max(0, current_qty - qty)
-                                if current_qty == 0:
-                                    total_cost = 0
-                                else:
-                                    total_cost = last_entry_price * current_qty
-                            elif "EXIT" in action or "PANIC" in action or "TRAIL" in action or "TIME" in action or "REVERSAL" in action:
+                                # Keep last_entry_price the same
+                            elif any(kw in action for kw in ["EXIT", "PANIC", "TRAIL", "TIME", "REVERSAL", "TRAP", "EOD"]):
                                 current_qty = 0
                                 last_side = None
                                 total_cost = 0
+                                last_entry_price = 0
 
                         if current_qty > 0 and last_side:
                             self.position = current_qty
                             self.active_side = last_side
                             self.entry_price = last_entry_price
+                            
+                            # Parse original timestamp for display
+                            try:
+                                recovery_ts = datetime.datetime.strptime(last_ts, "%Y-%m-%d %H:%M:%S")
+                            except:
+                                recovery_ts = datetime.datetime.now()
+
                             # SL logic depends on side
                             if self.active_side in ["C", "P"]:
                                 self.stop_loss_price = self.entry_price * (1 - self.stop_loss_pct)
@@ -2178,13 +2190,14 @@ class ShioajiOptionsSmartMonitor:
                                     order_type=OrderType.MARKET,
                                     quantity=self.position,
                                     price=self.entry_price,
-                                    order_id=f"RECOV-{datetime.datetime.now().strftime('%H%M%S')}",
+                                    order_id=f"RECOV-{recovery_ts.strftime('%H%M%S')}",
                                     strategy="RECOVERED"
                                 )
                                 rec_order.status = OrderStatus.FILLED
                                 rec_order.filled_quantity = self.position
                                 rec_order.avg_fill_price = self.entry_price
-                                rec_order.filled_at = datetime.datetime.now()
+                                rec_order.filled_at = recovery_ts
+                                rec_order.created_at = recovery_ts
                                 self.order_mgr.completed.append(rec_order)
                                 self._save_orders_file_wrapper()
                                 
@@ -2331,24 +2344,38 @@ class ShioajiOptionsSmartMonitor:
             self.refresh_live_orders()
             signal = self.fetch_live_signal()
 
-            # ── [L4] Decision Intelligence: Edge Evaluation ───────────────
-            from core.edge_model import edge_model
             if signal and signal["side"] and self.position == 0:
-                edge_context = {
-                    "momentum": float(self.latest_score), # latest_score acts as momentum proxy in options
-                    "regime": str(self.latest_mid_trend),
-                    "vwap_dist": 0, # Not easily available for options underlying mid-loop
-                    "volatility": float(self.latest_iv or 0.25)
-                }
-                edge_res = edge_model.evaluate(abs(signal["score"]), edge_context, f"{self.mode}_squeeze")
-                if not edge_res["has_edge"]:
-                    self.replay_stats["blocked_entries"] += 1
-                    if self._bar_counter % 5 == 0: # Reduce log noise
-                        console.print(f"[bold yellow]🛡️ Decision Intelligence: Option {signal['side']} Blocked - {edge_res['reason']}[/bold yellow]")
-                    signal = {"score": 0, "side": None} # Nullify entry signal
+                # [L4] Decision Intelligence: Edge Evaluation
+                from core.edge_model import edge_model
 
-            if self.position > 0:
-                cur_p = self.market_data[self.active_side]["close"]
+                # Context for EdgeModel
+                spot = float(self.market_data["MTX"]["close"])
+                edge_context = {
+                    "momentum": float(self.latest_score),
+                    "regime": str(self.latest_mid_trend),
+                    "vwap_dist": 0, # Not readily available
+                    "volatility": float(self.latest_iv or 0.25),
+                    "price": spot,
+                    "side": "LONG" if signal["side"] == "C" else "SHORT",
+                    # Pass proxies for Alpha features if not directly available
+                    "breakout_strength": 0.0, 
+                    "volume_spike": 1.0,
+                    "trend_strength_raw": 0.005 if self.latest_mid_trend == "BULL" else (-0.005 if self.latest_mid_trend == "BEAR" else 0)
+                }
+
+                edge_res = edge_model.evaluate(abs(signal["score"]), edge_context, f"{self.mode}_squeeze")
+
+                if not edge_res["has_edge"]:
+                    if self._bar_counter % 5 == 0:
+                        console.print(f"[bold yellow]🛡️ Decision Intelligence: Option {signal['side']} Blocked - {edge_res['reason']}[/bold yellow]")
+                    signal = {"score": 0, "side": None}
+                else:
+                    # Apply scaling to quantity
+                    self.paper_lots = max(1, round(self.paper_lots * edge_res["pos_scale"]))
+                    if edge_res["pos_scale"] != 1.0:
+                        console.print(f"[bold cyan]⚖️ Option Position Scaled: {edge_res['rank']} (x{edge_res['pos_scale']}) -> {self.paper_lots} lots[/bold cyan]")
+
+            if self.position > 0:                cur_p = self.market_data[self.active_side]["close"]
                 cur_bid = self.market_data[self.active_side]["bid"]
                 cur_ask = self.market_data[self.active_side]["ask"]
                 if self.manage_open_position(signal):

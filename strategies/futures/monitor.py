@@ -1700,22 +1700,54 @@ class FuturesMonitor:
         # 2. Position management
         if self.trader.position != 0:
             self.trader.update_trailing_stop(last_price)
-            # TP1
-            if self.TP.get("enabled") and abs(self.trader.position) == self.MGMT.get("lots_per_trade", 2) and not self.has_tp1_hit:
-                pnl_pts = (last_price - self.trader.entry_price) * (1 if self.trader.position > 0 else -1)
-                if pnl_pts >= self.TP.get("tp1_pts", 50):
-                    msg = self._execute_trade("PARTIAL_EXIT", last_price, timestamp, self.TP.get("tp1_lots", 1), reason="TP1")
-                    if msg:
-                        self.has_tp1_hit = True
-                        self.trader.current_stop_loss = self.trader.entry_price
-                        self.cooldown_until = self.cooldown_bars  # 分批平倉也重置冷卻
-
-            stop_msg = self._check_stop_loss(timestamp, last_price)
-            if not stop_msg:
-                hhmm = int(datetime.now().strftime("%H%M"))
-                _is_night = hhmm >= 1500 or hhmm < 500
-
-                if _is_night:
+            # ── [L4] Decision Intelligence: Adaptive Exit Engine ─────────
+            from core.exit_engine import should_exit
+            
+            trade_state = {
+                "entry_price": float(self.trader.entry_price),
+                "side": "LONG" if self.trader.position > 0 else "SHORT",
+                "peak_price": float(self.trader.peak_price if self.trader.position > 0 else self.trader.floor_price),
+                "position_age_bars": 0 # TODO: Implement bar tracking
+            }
+            
+            context = {
+                "regime": regime,
+                "momentum": float(last_5m.get("momentum", 0)),
+                "volatility": float(last_5m.get("atr", 50)),
+                "volatility_norm": min(1.0, float(last_5m.get("atr", 50)) / 100.0),
+                "vwap_dist": abs(last_price - vwap),
+                "signal_score": abs(score)
+            }
+            
+            # Calculate time to close for the current session
+            hhmm = int(datetime.now().strftime("%H%M"))
+            is_night_session = hhmm >= 1500 or hhmm < 500
+            target_close = "13:30" if not is_night_session else "05:00"
+            close_dt = datetime.strptime(target_close, "%H:%M").replace(
+                year=datetime.now().year, month=datetime.now().month, day=datetime.now().day
+            )
+            if is_night_session and hhmm >= 1500:
+                from datetime import timedelta
+                close_dt += timedelta(days=1)
+            
+            time_to_close = max(0, (close_dt - datetime.now()).total_seconds() / 60)
+            
+            market = {
+                "price": last_price,
+                "atr": float(last_5m.get("atr", 50)),
+                "time_to_close_mins": time_to_close
+            }
+            
+            exit_triggered, exit_reason = should_exit(trade_state, context, market)
+            
+            if exit_triggered:
+                self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason=exit_reason)
+                return
+            
+            # ── Legacy/Safety Fallbacks ──
+            # VWAP Exit (Secondary check)
+            if not exit_triggered:
+                _is_night = is_night_session
                     # 夜盤: VWAP exit (回測 PF=2.74)
                     vwap_exit = self.RISK.get("exit_on_vwap") or (self.counter_exit_vwap and self._last_entry_reason == "COUNTER")
                     vwap_confirm_needed = self.RISK.get("exit_vwap_confirm_bars", 0)
@@ -1905,26 +1937,40 @@ class FuturesMonitor:
             strategy.init(ctx)
             self._active_strategy_name = active_name
 
-        # ── [L4] Decision Intelligence: Edge Evaluation ───────────────
-        from core.edge_model import edge_model
-        edge_context = {
-            "momentum": float(last_5m.get("momentum", 0)),
-            "regime": str(regime),
-            "vwap_dist": abs(last_price - vwap),
-            "volatility": float(last_5m.get("atr", 50))
-        }
-        
         # 4. Execute strategy
         signal = strategy.on_bar(ctx)
 
         # 4.1 Global Edge Filter (Bypass for exits, apply to entries)
         if signal and signal.action in ["BUY", "SELL"]:
+            # [L4] Decision Intelligence: Edge Evaluation (Re-evaluated with side)
+            from core.edge_model import edge_model
+            edge_context = {
+                "momentum": float(last_5m.get("momentum", 0)),
+                "regime": str(regime),
+                "vwap_dist": abs(last_price - vwap),
+                "volatility": float(last_5m.get("atr", 50)),
+                "price": last_price,
+                "side": "LONG" if signal.action == "BUY" else "SHORT",
+                "breakout_strength": float(last_5m.get("breakout_strength", 0)),
+                "volume_spike": float(last_5m.get("volume_spike", 1.0)),
+                "trend_strength_raw": float(last_5m.get("trend_strength_raw", 0))
+            }
+            
             edge_res = edge_model.evaluate(abs(score), edge_context, active_name)
             if not edge_res["has_edge"]:
                 self._audit_signal("ENTRY_BLOCKED", signal.action, score, "low_edge", edge_res["reason"])
-                console.print(f"[bold yellow]🛡️ Decision Intelligence: {active_name} {signal.action} Blocked - {edge_res['reason']}[/bold yellow]")
-                self._signals_rejected += 1
+                if self._bar_counter % 5 == 0:
+                    console.print(f"[bold yellow]🛡️ Decision Intelligence: {active_name} Blocked - {edge_res['reason']}[/bold yellow]")
                 return
+            
+            # [GSD Upgrade] Apply Dynamic Position Scaling
+            signal.quantity = max(1, round(lots * edge_res["pos_scale"]))
+            signal.reason = f"{signal.reason} ({edge_res['rank']})"
+            if edge_res["pos_scale"] != 1.0:
+                console.print(f"[bold cyan]⚖️ Position Scaled: {edge_res['rank']} (x{edge_res['pos_scale']}) -> {signal.quantity} lots[/bold cyan]")
+            
+            # Update lots for further logic
+            lots = signal.quantity
 
         # 4.5 Fallback: try Spring/Upthrust if registry strategy has no signal
         if signal is None:

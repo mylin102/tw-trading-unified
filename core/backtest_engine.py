@@ -119,10 +119,14 @@ class BacktestEngine:
 
         # 1. Optimized Enrichment: Skip if columns exist
         required_indicators = strategy.metadata.get("indicators", [])
+        # GSD: Always include Alpha features for Edge evaluation
+        if "alpha" not in required_indicators:
+            required_indicators.append("alpha")
+            
         if required_indicators:
             needs_enrich = False
             for ind in required_indicators:
-                col = {"kalman": "kalman_close", "squeeze": "fired", "linreg": "lr_slope"}.get(ind, ind)
+                col = {"kalman": "kalman_close", "squeeze": "fired", "linreg": "lr_slope", "alpha": "breakout_strength"}.get(ind, ind)
                 if col not in df.columns:
                     needs_enrich = True; break
             
@@ -131,6 +135,15 @@ class BacktestEngine:
                 df = enricher.enrich(df, required_indicators, **params)
         
         df = strategy.prepare_data(df)
+        self.strategy_name_current = strategy.name
+
+        # Ensure index is datetime, drop NaT, and handle duplicates (CRITICAL for GSD)
+        df.index = pd.to_datetime(df.index)
+        df = df[df.index.notnull()]
+        if df.index.duplicated().any():
+            self.logger.warning(f"Strategy {strategy.name}: Dropping {df.index.duplicated().sum()} duplicate timestamps")
+            df = df[~df.index.duplicated(keep='last')]
+        df = df.sort_index()
 
         n = len(df)
         if n < 20: return self._empty_result(strategy.name)
@@ -154,18 +167,88 @@ class BacktestEngine:
             # GSD: Detect Market Regime (Wave 19)
             # Use pre-calculated regime for the current trading day
             day_key = ts.normalize()
-            current_regime = regime_map.get(day_key, "NEUTRAL")
+            self.current_regime = regime_map.get(day_key, "NORMAL")
+            current_regime = self.current_regime
 
+            # ── [GSD Upgrade] Adaptive Exit Engine ──────────────────────
             if ticker in self.positions:
                 pos = self.positions[ticker]
                 pos.update_high_water(price)
-                reason = pos.check_exit(price)
-                if reason: self._execute_signal(ticker, Signal(action="EXIT", reason=reason, stop_loss=0), price, ts)
+                
+                # Context for adaptive exit
+                from core.exit_engine import should_exit
+                from core.data_enricher import enricher
+                
+                # Normalize ATR for the model (0-1 range approx)
+                atr = bar.get("atr", 0)
+                vol_norm = min(1.0, atr / (price * 0.05)) if price > 0 else 0.5
+                
+                context = {
+                    "regime": current_regime,
+                    "momentum": bar.get("momentum", 0),
+                    "volatility": atr,
+                    "volatility_norm": vol_norm,
+                    "vwap_dist": abs(price - bar.get("vwap", price)),
+                    "signal_score": 50 # Default middle for exit check
+                }
+                
+                # Dummy time to close (not easy to calculate in backtest without full calendar)
+                market = {"price": price, "atr": atr, "time_to_close_mins": 240}
+                
+                trade_state = {
+                    "entry_price": pos.entry_price,
+                    "side": "LONG" if pos.qty > 0 else "SHORT",
+                    "peak_price": pos.high_water,
+                    "position_age_bars": 0 # TODO
+                }
+                
+                exit_triggered, exit_reason = should_exit(trade_state, context, market)
+                
+                # Check legacy SL/TP as fallback
+                legacy_reason = pos.check_exit(price)
+                
+                final_exit_reason = exit_reason if exit_triggered else legacy_reason
+                
+                if final_exit_reason:
+                    self._execute_signal(ticker, Signal(action="EXIT", reason=final_exit_reason, stop_loss=0), price, ts)
 
             if ticker not in self.positions or self.positions[ticker].qty != 0:
                 ctx = StrategyContext(market=MarketData(last_bar=bar, df_5m=df.iloc[max(0, i-100):i+1], regime=current_regime), 
                                     position=self._get_position_view(ticker), config=config, bar_counter=i)
                 sig = strategy.on_bar(ctx)
+                
+                # ── [GSD Upgrade] Entry Edge Filter ───────────────────────
+                if sig and sig.action in ["BUY", "SELL"] and ticker not in self.positions:
+                    from core.edge_model import edge_model
+                    from core.edge_diagnostics import edge_diag
+                    
+                    edge_context = {
+                        "regime": self.current_regime,
+                        "momentum": bar.get("momentum", 0),
+                        "volatility": bar.get("atr", 50),
+                        "vwap_dist": abs(price - bar.get("vwap", price)),
+                        "price": price,
+                        "side": "LONG" if sig.action == "BUY" else "SHORT",
+                        # [Phase 4.3 Alpha Features]
+                        "breakout_strength": bar.get("breakout_strength", 0.0),
+                        "volume_spike": bar.get("volume_spike", 1.0),
+                        "trend_strength_raw": bar.get("trend_strength_raw", 0.0)
+                    }
+                    # Squeeze strategies often provide score, others might need proxy
+                    score = abs(getattr(sig, "score", 50))
+                    edge_res = edge_model.evaluate(score, edge_context, strategy.name)
+                    
+                    # Record for diagnostics
+                    edge_diag.record_decision(strategy.name, edge_res["edge_score"], edge_res["is_exploring"], edge_res["features"])
+                    
+                    if not edge_res["has_edge"]:
+                        sig = None # Block the entry
+                    else:
+                        # [GSD Upgrade] Apply Dynamic Position Scaling
+                        base_qty = getattr(sig, "quantity", 1)
+                        sig.quantity = max(1, round(base_qty * edge_res["pos_scale"]))
+                        sig.reason = f"{sig.reason} ({edge_res['rank']})"
+                
                 if sig: self._execute_signal(ticker, sig, price, ts)
 
             unrealized = sum((price - p.entry_price) * p.qty * self.profile.point_value for p in self.positions.values())
@@ -203,6 +286,29 @@ class BacktestEngine:
             raw_pnl = (price - pos.entry_price) * pos.qty * mult
             margin = abs(pos.qty) * self.profile.margin_per_lot if self.profile.asset_type == AssetType.FUTURES else pos.entry_price * abs(pos.qty) * mult
             self.cash += (margin + raw_pnl - cost)
+            
+            # [GSD Upgrade] Update diagnostic result and persist attribution
+            from core.edge_diagnostics import edge_diag
+            from core.decision_logger import DecisionLogger
+            
+            # Simple FIFO mapping: find the last entry for this strategy without a PnL
+            found_stat = None
+            for stat in reversed(edge_diag.stats):
+                if stat["strategy"] == self.strategy_name_current and stat["pnl"] is None:
+                    stat["pnl"] = raw_pnl - cost
+                    found_stat = stat
+                    break
+
+            # Persist to disk for ML Training
+            if found_stat:
+                DecisionLogger.log_trade_outcome(
+                    trade_id=f"BT-{ts.strftime('%Y%m%d%H%M%S')}",
+                    strategy=self.strategy_name_current,
+                    regime=self.current_regime,
+                    features=found_stat.get("features", {}), # We need to store features in stats too
+                    outcome={"pnl": raw_pnl - cost, "exit_reason": signal.reason}
+                )
+
             self.trade_log.append({"timestamp": ts, "ticker": ticker, "action": "EXIT", "price": price, "qty": pos.qty, "reason": signal.reason, "pnl": raw_pnl - cost})
 
     def _finalize_result(self, name: str) -> BacktestResult:

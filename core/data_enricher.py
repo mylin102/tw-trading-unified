@@ -71,6 +71,49 @@ def _calc_kalman(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
     df["kalman_close"] = apply_kalman_filter(df["Close"], q=float(q), r=float(r))
     return df
 
+def _calc_alpha_features(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    """Compute advanced Alpha features for Edge calculation."""
+    res = df.copy()
+    
+    # 1. Breakout Strength (Price relative to recent range)
+    high_20 = res["High"].rolling(20).max().shift(1)
+    low_20 = res["Low"].rolling(20).min().shift(1)
+    
+    # Ensure ATR exists
+    if "atr" not in res.columns:
+        res = _calc_atr(res)
+    atr = res["atr"]
+    
+    res["breakout_strength"] = (res["Close"] - high_20) / atr.replace(0, np.nan)
+    
+    # 2. Volume Spike (Relative volume)
+    vol_avg = res["Volume"].rolling(20).mean()
+    res["volume_spike"] = res["Volume"] / vol_avg.replace(0, np.nan)
+    
+    # 3. Normalized VWAP Distance
+    if "vwap" not in res.columns:
+        res = _calc_vwap(res)
+        
+    res["vwap_dist_norm"] = (res["Close"] - res["vwap"]) / atr.replace(0, np.nan)
+    
+    # 4. Trend Structure (MA alignment)
+    ma20 = res["Close"].rolling(20).mean()
+    ma60 = res["Close"].rolling(60).mean()
+    res["trend_strength_raw"] = (ma20 - ma60) / res["Close"]
+
+    # 5. [GSD 4.5] Interaction Features (The Alpha layer)
+    # A. Trend-Volatility Clash (Detecting blow-off tops or panic bottoms)
+    res["trend_vol_interaction"] = res["trend_strength_raw"] * (res["atr"] / res["Close"])
+    
+    # B. Signal-Volume Sync (Only count signals confirmed by volume)
+    if "momentum" in res.columns:
+        res["signal_vol_sync"] = np.sign(res["momentum"]) * res["volume_spike"]
+    
+    # C. Range Position (0 to 1 scaling within recent 20-bar high/low)
+    res["range_pos"] = (res["Close"] - low_20) / (high_20 - low_20).replace(0, np.nan)
+    
+    return res
+
 class DataEnricher:
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.registry: Dict[str, Callable] = {}
@@ -79,6 +122,7 @@ class DataEnricher:
         self.register("vwap", _calc_vwap)
         self.register("linreg", _calc_linreg)
         self.register("kalman", _calc_kalman)
+        self.register("alpha", _calc_alpha_features)
         try:
             from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze
             self.register("squeeze", lambda d, **kw: calculate_futures_squeeze(d))
