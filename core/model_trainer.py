@@ -21,58 +21,63 @@ class EdgeTrainer:
         self.model = LogisticRegression(C=1.0, class_weight='balanced')
         
     def prepare_data(self):
-        """Convert trade_attribution.csv to ML-ready features and labels."""
+        """Convert trade_attribution.csv to ML-ready features and weighted labels."""
         if not self.path.exists():
             return None, None
             
         df = pd.read_csv(self.path)
-        if len(df) < 50: # Need minimum sample size
+        if len(df) < 50:
             return None, None
             
         features_list = []
         labels = []
+        sample_weights = [] # [GSD Phase 4.8] PnL Weighting
         
         for _, row in df.iterrows():
             f = json.loads(row["features"])
             o = json.loads(row["outcome"])
+            pnl = float(o.get("pnl", 0))
             
-            # Feature Vector: Standardize across all strategies
             vec = [
                 f.get("trend_strength", 0.5),
                 f.get("volatility", 0.5),
                 f.get("signal_strength", 0.5),
                 f.get("vwap_distance", 0.0),
                 f.get("momentum_norm", 0.0),
-                # [Phase 4.3] New Alpha Features
                 f.get("breakout_strength", 0.0),
                 f.get("volume_spike", 1.0),
                 f.get("trend_strength_raw", 0.0)
             ]
             features_list.append(vec)
             
-            # Label: 1 if profitable, 0 if loss
-            # Advanced: could use pnl > threshold to ignore noise
-            labels.append(1 if o.get("pnl", 0) > 0 else 0)
+            # Label: High-quality win (1) vs Significant loss (0)
+            # Filter out noise around zero
+            labels.append(1 if pnl > 50 else 0) # Only count wins above cost
             
-        return np.array(features_list), np.array(labels)
+            # Weight: Extreme PnL values are more important to learn
+            weight = min(10.0, abs(pnl) / 100.0) + 1.0
+            sample_weights.append(weight)
+            
+        return np.array(features_list), np.array(labels), np.array(sample_weights)
 
     def train(self, strategy_filter: str | None = None):
-        """Train the model and save it."""
-        X, y = self.prepare_data()
+        """Train the model with sample weights."""
+        X, y, weights = self.prepare_data()
         if X is None:
-            print("❌ Not enough trade data to train ML model.")
+            print("❌ Not enough trade data.")
             return False
             
-        # [GSD Fix] Handle NaN values in X
         X_df = pd.DataFrame(X)
-        if X_df.isnull().any().any():
-            print(f"  ⚠️ Found {X_df.isnull().sum().sum()} NaNs in features. Filling with median.")
-            X_df = X_df.fillna(X_df.median())
-            X = X_df.values
+        X_df = X_df.fillna(X_df.median())
+        X = X_df.values
 
-        # Fit scaler and model
         X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled, y)
+        # Apply Sample Weights to force model to learn the 'big' trades
+        self.model.fit(X_scaled, y, sample_weight=weights)
+        
+        probs = self.model.predict_proba(X_scaled)[:, 1]
+        auc = roc_auc_score(y, probs, sample_weight=weights)
+        print(f"✅ PnL-Weighted Model Trained. Weighted AUC: {auc:.2f}")
         
         # Validate
         probs = self.model.predict_proba(X_scaled)[:, 1]

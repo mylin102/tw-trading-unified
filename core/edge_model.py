@@ -9,10 +9,11 @@ import random
 class EdgeModel:
     def __init__(self):
         self.logger = logging.getLogger("EdgeModel")
-        # Per-strategy calibration
+        # [GSD Force Calibration] Set high thresholds to filter noise
         self.thresholds = {
-            "counter_vwap": 0.35, 
-            "default": 0.5
+            "counter_vwap": 0.65, 
+            "orb_breakout": 0.60,
+            "default": 0.65
         }
         self._ml_model = None
         self._scaler = None
