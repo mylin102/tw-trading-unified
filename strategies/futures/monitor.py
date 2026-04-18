@@ -93,6 +93,9 @@ class FuturesMonitor:
         self.ATR_MULT = self.RISK.get("atr_multiplier", 0.0)
         self.ATR_LENGTH = self.RISK.get("atr_length", 14)
         self.POLL_INTERVAL = self.MONITOR.get("poll_interval_secs", 30)
+        # Data freshness thresholds (seconds)
+        self.STALE_WARN_SECS = self.MONITOR.get("stale_tick_warn_secs", 120)
+        self.STALE_CRITICAL_SECS = self.MONITOR.get("stale_tick_critical_secs", 600)
         self.PB_CONFIRM_BARS = self.MONITOR.get("pb_confirmation_bars", 12)
         self.PB_ARGS = {
             "ema_fast": self.PB.get("ema_fast", 20),
@@ -413,27 +416,80 @@ class FuturesMonitor:
                 console.print(f"[green][FuturesMonitor] ✅ Backfill complete: {len(combined)} total bars in CSV[/green]")
 
     def _check_futures_contract_staleness(self):
-        """[Wave 1 Fix] Check if TMF ticks are stale and attempt recovery."""
+        """[Wave 1 Fix] Check if TMF ticks are stale and attempt recovery.
+
+        Behavior:
+        - If no new tick for < warn_secs: no-op.
+        - If >= warn_secs but < critical_secs: attempt light recovery (rollover/resubscribe) and try fetching kline.
+        - If >= critical_secs: mark monitor not running and raise to trigger supervisor restart.
+        """
         if self.dry_run or not self.api:
             return
         
         secs_since_tick = time.time() - self.last_tick_at
-        if secs_since_tick < 120:  # 2 min threshold
+        warn = getattr(self, 'STALE_WARN_SECS', self.MONITOR.get('stale_tick_warn_secs', 120))
+        critical = getattr(self, 'STALE_CRITICAL_SECS', self.MONITOR.get('stale_tick_critical_secs', 600))
+        if secs_since_tick < warn:
             return
-            
+
         console.print(f"[yellow]⚠️ TMF data stale for {secs_since_tick/60:.1f} min, checking contract...[/yellow]")
-        
+
+        # If we exceed critical threshold, stop the monitor so external supervisor restarts the process
+        if secs_since_tick >= critical:
+            console.print(f"[red]🚨 TMF data stale CRITICAL: {secs_since_tick/60:.1f} min. Shutting down to trigger supervisor restart.[/red]")
+            try:
+                if self.contract:
+                    self.api.quote.unsubscribe(self.contract, quote_type='tick')
+            except Exception:
+                pass
+            # Mark monitor as not running and raise to break out of run loop
+            self._running = False
+            raise RuntimeError(f"TMF tick stale for {secs_since_tick} seconds (>{critical}), exiting monitor.")
+
+        # Between warn and critical: attempt light recovery
+        console.print(f"[dim]Attempting light recovery (re-subscribe / rollover / fetch) after {secs_since_tick/60:.1f} min stale[/dim]")
+
         # Check for expiry/rollover
         today_str = datetime.now().strftime("%Y/%m/%d")
         if self.contract and self.contract.delivery_date < today_str:
             console.print(f"[yellow]⚠️ TMF contract {self.contract.code} expired (delivery: {self.contract.delivery_date})[/yellow]")
             self._check_contract_rollover()
+            # Update last tick time so we don't spam retry immediately
+            self.last_tick_at = time.time()
             return
 
         # If contract valid but no ticks, could be session transition or connection drop
-        # We attempt a light re-subscription via rollover logic
-        self._check_contract_rollover()
-        # Reset timer to avoid spamming
+        # Try contract rollover/resubscribe first
+        try:
+            self._check_contract_rollover()
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Contract rollover attempt failed: {e}[/yellow]")
+
+        # Try a light kline fetch to recover bars if possible
+        try:
+            df = self.client.get_kline(self.ticker, interval="5m")
+            if df is not None and not df.empty:
+                # Replace deque with recent tail to refresh state
+                tail = df.tail(200)
+                self._tick_bars_deque.clear()
+                for _, row in tail.iterrows():
+                    self._tick_bars_deque.append({
+                        "open": row.get('Open', row.get('open', 0)),
+                        "high": row.get('High', row.get('high', 0)),
+                        "low": row.get('Low', row.get('low', 0)),
+                        "close": row.get('Close', row.get('close', 0)),
+                        "volume": row.get('Volume', row.get('volume', 0)),
+                        "ts": row.name,
+                    })
+                self._tick_bars_cache = None
+                console.print(f"[green]✅ Light kline refresh succeeded: loaded {len(self._tick_bars_deque)} bars[/green]")
+                # Update last_tick_at to avoid immediate retry
+                self.last_tick_at = time.time()
+                return
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Light kline refresh failed: {e}[/yellow]")
+
+        # Reset timer to avoid spamming retries; next loop will re-evaluate
         self.last_tick_at = time.time()
 
     def _is_contract_expired(self, contract_delivery_date):
