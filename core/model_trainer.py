@@ -34,21 +34,28 @@ class EdgeTrainer:
         sample_weights = [] # [GSD Phase 4.8] PnL Weighting
         
         for _, row in df.iterrows():
-            f = json.loads(row["features"])
-            o = json.loads(row["outcome"])
-            pnl = float(o.get("pnl", 0))
-            
-            vec = [
-                f.get("trend_strength", 0.5),
-                f.get("volatility", 0.5),
-                f.get("signal_strength", 0.5),
-                f.get("vwap_distance", 0.0),
-                f.get("momentum_norm", 0.0),
-                f.get("breakout_strength", 0.0),
-                f.get("volume_spike", 1.0),
-                f.get("trend_strength_raw", 0.0)
-            ]
-            features_list.append(vec)
+            try:
+                f = json.loads(row["features"])
+                o = json.loads(row["outcome"])
+                
+                # [GSD 4.9] Data Integrity Check: Discard samples from legacy schema
+                essential_alpha = ["breakout_strength", "volume_spike", "trend_strength_raw"]
+                if not all(k in f for k in essential_alpha):
+                    continue # Skip legacy data to prevent model pollution
+                
+                pnl = float(o.get("pnl", 0))
+                
+                vec = [
+                    f.get("trend_strength", 0.5),
+                    f.get("volatility", 0.5),
+                    f.get("signal_strength", 0.5),
+                    f.get("vwap_distance", 0.0),
+                    f.get("momentum_norm", 0.0),
+                    f.get("breakout_strength", 0.0),
+                    f.get("volume_spike", 1.0),
+                    f.get("trend_strength_raw", 0.0)
+                ]
+                features_list.append(vec)
             
             # Label: High-quality win (1) vs Significant loss (0)
             # Filter out noise around zero

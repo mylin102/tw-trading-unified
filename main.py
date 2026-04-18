@@ -481,5 +481,25 @@ def main():
         time.sleep(1)
         sys.exit(1)
 
+def ensure_single_instance():
+    """🛡️ [Pillar 3] Execution Consistency: PID Lock."""
+    import os, psutil
+    lock_file = "/tmp/tw_trading_unified.pid"
+    if os.path.exists(lock_file):
+        try:
+            with open(lock_file, "r") as f:
+                pid = int(f.read().strip())
+            if psutil.pid_exists(pid):
+                # Check if it's actually a python trading process
+                proc = psutil.Process(pid)
+                if "python" in proc.name().lower():
+                    print(f"🚨 [FATAL] Another main.py instance is running (PID: {pid}). Exiting.")
+                    os._exit(1)
+        except Exception: pass
+    
+    with open(lock_file, "w") as f:
+        f.write(str(os.getpid()))
+
 if __name__ == "__main__":
+    ensure_single_instance()
     main()

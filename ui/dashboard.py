@@ -37,6 +37,30 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 st.set_page_config(page_title="Trading Unified", page_icon="📊", layout="wide")
 
+# Helper: robustly coerce possibly-array-like values (Series, ndarray, list) to a float scalar
+import numpy as _np
+import pandas as _pd
+
+def _to_num(val, default=0.0):
+    try:
+        if val is None:
+            return float(default)
+        # pandas Series (row) or Series-like
+        if isinstance(val, _pd.Series):
+            if val.empty:
+                return float(default)
+            return float(val.iloc[-1])
+        # numpy arrays or lists/tuples
+        if isinstance(val, (list, tuple, _np.ndarray)):
+            arr = _np.asarray(val)
+            if arr.size == 0:
+                return float(default)
+            return float(arr.flatten()[-1])
+        # fallback
+        return float(val)
+    except Exception:
+        return float(default)
+
 # ── Custom CSS ──
 st.markdown("""
     <style>
@@ -151,7 +175,32 @@ with st.sidebar:
     _session_label = "🌙 夜盤" if _CURRENT_SESSION_NIGHT else "☀️ 日盤"
     _session_color = "#7c3aed" if _CURRENT_SESSION_NIGHT else "#f59e0b"
     st.markdown(f"<span style='color:{_session_color};font-weight:bold'>{_session_label}</span> — 設定檔: `{FUTURES_CFG_NAME}`", unsafe_allow_html=True)
+    # ── [GSD 4.13] System Readiness Indicators (Pillar 4) ──
+    st.markdown("🚦 **系統狀態 (Readiness)**")
+    
+    try:
+        from core.shioaji_session import get_system_status, SystemReadiness
+        status = get_system_status()
+    except Exception:
+        # Fallback if core is not yet loaded in sys.path
+        status = None
+
+    # Map status to UI labels/colors
+    if status is None:
+        st.info("🕒 BOOTING / INITIALIZING")
+    elif status.name == "BOOTING":
+        st.info("🕒 BOOTING")
+    elif status.name == "MONITORING":
+        st.success("✅ MONITORING")
+        st.warning("⚠️ TRADING: WARMING UP")
+    elif status.name == "TRADING":
+        st.success("✅ MONITORING")
+        st.success("✅ TRADING READY")
+    elif status.name == "DEGRADED":
+        st.error("🚨 DEGRADED")
+    
     st.divider()
+
     if st.button("🔄 強制刷新頁面"):
         st.rerun()
 
@@ -1099,17 +1148,9 @@ with tab_overview:
         if f_df is not None and not f_df.empty:
             last = f_df.iloc[-1]
             c1, c2, c3 = st.columns(3)
-            # V-Model fix: Handle duplicate columns by taking first match
-            cl_val = last.get('close') if 'close' in last else last.get('Close', 0)
-            if hasattr(cl_val, 'iloc'):
-                cl_val = float(cl_val.iloc[0]) if len(cl_val) > 0 else 0.0
-            else:
-                cl_val = float(cl_val or 0)
-            sc_val = last.get('score', 0)
-            if hasattr(sc_val, 'iloc'):
-                sc_val = float(sc_val.iloc[0]) if len(sc_val) > 0 else 0.0
-            else:
-                sc_val = float(sc_val or 0)
+            # Robust coercion to scalar for display
+            cl_val = _to_num(last.get('close') if 'close' in last else last.get('Close', 0))
+            sc_val = _to_num(last.get('score', 0))
             c1.metric("Close", f"{cl_val:.0f}")
             c2.metric("Score", f"{sc_val:.1f}")
             c3.metric("Bars", len(f_df))
@@ -1126,17 +1167,9 @@ with tab_overview:
         if o_df is not None and not o_df.empty:
             last = o_df.iloc[-1]
             c1, c2, c3 = st.columns(3)
-            # V-Model fix: Handle duplicate columns by taking first match
-            mtx_val = last.get('price_mtx', 0)
-            if hasattr(mtx_val, 'iloc'):
-                mtx_val = float(mtx_val.iloc[0]) if len(mtx_val) > 0 else 0.0
-            else:
-                mtx_val = float(mtx_val or 0)
-            sc_val = last.get('score', 0)
-            if hasattr(sc_val, 'iloc'):
-                sc_val = float(sc_val.iloc[0]) if len(sc_val) > 0 else 0.0
-            else:
-                sc_val = float(sc_val or 0)
+            # Robust coercion to scalar for display
+            mtx_val = _to_num(last.get('price_mtx', 0))
+            sc_val = _to_num(last.get('score', 0))
             c1.metric("MTX", f"{mtx_val:.0f}")
             c2.metric("Score", f"{sc_val:.1f}")
             c3.metric("Bars", len(o_df))
@@ -1335,18 +1368,9 @@ with tab_futures:
             else:
                 bias = "⚠️多拉回" if mom <= mom_prev else "↘️弱拉回"
 
-        # V-Model fix: Handle duplicate columns
-        cl_val = last.get('close') if 'close' in last else last.get('Close', 0)
-        if hasattr(cl_val, 'iloc'):
-            cl_val = float(cl_val.iloc[0]) if len(cl_val) > 0 else 0.0
-        else:
-            cl_val = float(cl_val or 0)
-        
-        sc_val = last.get('score', 0)
-        if hasattr(sc_val, 'iloc'):
-            sc_val = float(sc_val.iloc[0]) if len(sc_val) > 0 else 0.0
-        else:
-            sc_val = float(sc_val or 0)
+        # Robust coercion to scalar for display
+        cl_val = _to_num(last.get('close') if 'close' in last else last.get('Close', 0))
+        sc_val = _to_num(last.get('score', 0))
 
         fc1.metric("Close", f"{cl_val:.0f}")
         fc2.metric("Score", f"{sc_val:.1f}")
@@ -1594,18 +1618,10 @@ with tab_options:
                 bias = "⚠️多拉回" if mom <= mom_prev else "↘️弱拉回"
 
         oc1, oc2, oc3, oc4, oc5, oc6 = st.columns(6)
-        # V-Model fix: Handle duplicate columns by taking first match
-        mtx_val = last.get('price_mtx', 0)
-        if hasattr(mtx_val, 'iloc'):
-            mtx_val = float(mtx_val.iloc[0]) if len(mtx_val) > 0 else 0.0
-        else:
-            mtx_val = float(mtx_val or 0)
-        sc_val = last.get('score', 0)
-        if hasattr(sc_val, 'iloc'):
-            sc_val = float(sc_val.iloc[0]) if len(sc_val) > 0 else 0.0
-        else:
-            sc_val = float(sc_val or 0)
-        
+        # Robust coercion to scalar for display
+        mtx_val = _to_num(last.get('price_mtx', 0))
+        sc_val = _to_num(last.get('score', 0))
+
         oc1.metric("MTX", f"{mtx_val:.0f}")
         oc2.metric("Score", f"{sc_val:.1f}")
         trend_label = "🟢BULL" if trend_val == "BULL" else ("🔴BEAR" if trend_val == "BEAR" else "⚪ —")
@@ -1699,16 +1715,18 @@ with tab_options:
                 orders_data = json.load(f)
 
             if orders_data:
-                # Get LIVE option price from ledger or market data
-                # Try to get current premium from the ledger
-                ol = load_options_ledger()
+                # [GSD Fix] Get ACTUAL live premium from indicator data, not ledger
+                opt_df = load_options_indicators()
                 live_premium = None
-                if ol is not None and not ol.empty and "Price" in ol.columns:
-                    last_entry = ol[ol["Action"].str.contains("ENTRY", na=False)]
-                    if not last_entry.empty:
-                        live_premium = float(last_entry["Price"].iloc[-1])
+                if opt_df is not None and not opt_df.empty:
+                    last_row = opt_df.iloc[-1]
+                    # Try to get bid/ask mid if available (some versions log it)
+                    bid = float(last_row.get("bid", 0))
+                    ask = float(last_row.get("ask", 0))
+                    if bid > 0 and ask > 0:
+                        live_premium = (bid + ask) / 2
                     else:
-                        live_premium = float(ol["Price"].iloc[-1])
+                        live_premium = float(last_row.get("Close", last_row.get("close", 0)))
 
                 df_orders = pd.DataFrame(orders_data)
                 display_cols = []
@@ -1756,7 +1774,14 @@ with tab_options:
                         if not entry or entry <= 0:
                             return None
                         qty = row.get("filled_quantity", 1) or 1
-                        return (live_premium - entry) * 50 * qty
+                        
+                        # [GSD Fix] Side-aware PnL (Sell/Theta profits if price drops)
+                        if row.get("side", "").lower() == "sell":
+                            pnl_pts = entry - live_premium
+                        else:
+                            pnl_pts = live_premium - entry
+                            
+                        return pnl_pts * 50 * qty
 
                     df_orders["unrealized_pnl"] = df_orders.apply(_calc_opt_unreal, axis=1)
 
@@ -2133,7 +2158,7 @@ with tab_pipeline:
     st.subheader("📝 最近決策日誌")
     try:
         from core.decision_logger import DecisionLogger
-        recent = DecisionLogger.read(limit=10)
+        recent = DecisionLogger.read_decisions(limit=10)
         if recent:
             df_dec = pd.DataFrame([{
                 "時間": d.timestamp[:19],

@@ -25,6 +25,8 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
 
 import login.shioaji_login as shioaji_login
+from options_engine.engine.broker_adapter import ShioajiBrokerAdapter
+from options_engine.engine.broker_adapter import MockBrokerAdapter # Support mock if needed
 
 try:
     from strategies.futures.squeeze_futures.report.notifier import send_email_notification as _notify
@@ -155,14 +157,13 @@ class ShioajiOptionsSmartMonitor:
         self.opening_grace_mins = int(self.risk_mgmt.get("opening_grace_mins", 5))
         
         # Parameterized fees (GSD enhancement)
-        self.broker_fee_per_side = float(self.execution_cfg.get("broker_fee_per_side", 20.0))
-        self.exchange_fee_per_side = float(self.execution_cfg.get("exchange_fee_per_side", 5.0))
         self.shutdown_grace_mins = int(self.exit_opt.get("shutdown_grace_mins", 1))
-        self.api = None if self.dry_run else shioaji_login.login()
-        if self.dry_run_live_orders:
-            self.broker = MockBrokerAdapter(self.execution_cfg)
-        else:
-            self.broker = None if self.dry_run else ShioajiBrokerAdapter(self.api, self.execution_cfg)
+        
+        # [GSD 4.12] Passive Initialization: Defer API and heavy objects
+        self.api = None 
+        self.broker = None
+        self.order_mgr = None
+        self._use_order_manager = False 
         
         self.market_data = {"MTX": {"close": 0.0, "bid": 0.0, "ask": 0.0}, "C": {"close": 0.0, "bid": 0.0, "ask": 0.0}, "P": {"close": 0.0, "bid": 0.0, "ask": 0.0}}
         # [Wave 2 optimization] Use deque for O(1) append/trim instead of DataFrame.loc + slicing
@@ -207,6 +208,9 @@ class ShioajiOptionsSmartMonitor:
         self.latest_mid_trend = ""
         self.loop_sleep_secs = 60
         self.status_print_secs = 300
+        self._bar_counter = 0  # [GSD Fix] Counter for logging throttling
+        self.is_monitoring_ready = True # [GSD 4.13] Phase A Ready
+        self.is_trading_ready = False   # [GSD 4.13] Phase B Ready
         self.pending_entry = None
         self.pending_exit_qty = 0
         self.pending_exit_reason = None
@@ -1613,7 +1617,10 @@ class ShioajiOptionsSmartMonitor:
                     }
                     self._mtx_tick_bars_deque.append(bar_dict)
                 self._mtx_tick_bars_cache = bars[["Open", "High", "Low", "Close", "Volume"]].copy()
-                console.print(f"[green]Pre-filled {len(self._mtx_tick_bars_deque)} MTX bars from kbars[/green]")
+                self.is_trading_ready = True # [GSD 4.13] Trading Phase Ready
+                from core.shioaji_session import set_system_status, SystemReadiness
+                set_system_status(SystemReadiness.TRADING)
+                console.print(f"[bold green]🔥 [OptionsMonitor] Trading READY: {len(self._mtx_tick_bars_deque)} bars loaded.[/bold green]")
         except Exception:
             pass
 
@@ -1904,6 +1911,51 @@ class ShioajiOptionsSmartMonitor:
         }
         
         self.log_trade("PAPER_ENTRY", side, entry_price, f"score={signal['score']:.1f}")
+        
+        # [GSD Fix] Record in OrderManager so it appears in Dashboard
+        self._record_paper_order(side, "BUY", self.paper_lots, entry_price, f"ENTRY score={signal['score']:.1f}")
+
+    def _record_paper_order(self, side_label, action, quantity, price, note=""):
+        """Helper to create a mock filled order for paper trades."""
+        if not self.order_mgr:
+            return
+            
+        try:
+            from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
+            now = datetime.datetime.now()
+            
+            # Map side: C/P are LONG strategies, THETA/SHORT are SELL entries
+            is_short_entry = (side_label == "THETA" or side_label == "SHORT")
+            
+            if action == "BUY":
+                side = OrderSide.SELL if is_short_entry else OrderSide.BUY
+            else: # EXIT
+                side = OrderSide.BUY if is_short_entry else OrderSide.SELL
+                
+            symbol = "TXO"
+            contract = self.active_contracts.get(side_label)
+            if contract: symbol = contract.code
+            
+            order = Order(
+                symbol=symbol,
+                side=side,
+                order_type=OrderType.MARKET,
+                quantity=quantity,
+                price=price,
+                order_id=f"PAPER-{now.strftime('%H%M%S')}",
+                strategy=self.mode
+            )
+            order.status = OrderStatus.FILLED
+            order.filled_quantity = quantity
+            order.avg_fill_price = price
+            order.filled_at = now
+            order.created_at = now
+            order.note = note
+            
+            self.order_mgr.completed.append(order)
+            self._save_orders_file_wrapper()
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Failed to record paper order: {e}[/yellow]")
 
     def enter_live_position(self, side, signal):
         self.submit_live_entry(side, signal, retries=0)
@@ -1951,8 +2003,13 @@ class ShioajiOptionsSmartMonitor:
         if self.position <= 0 or not self.active_side:
             return
         exit_qty = self.position
+        side = self.active_side
         self.position = 0
-        self.log_trade(action, self.active_side, price, note, quantity=exit_qty)
+        self.log_trade(action, side, price, note, quantity=exit_qty)
+        
+        # [GSD Fix] Record in OrderManager
+        self._record_paper_order(side, "SELL", exit_qty, price, f"{action} {note}")
+
         self.active_side = None
         self.entry_price = 0.0
         self.entry_mtx_price = 0.0
@@ -2345,6 +2402,13 @@ class ShioajiOptionsSmartMonitor:
             signal = self.fetch_live_signal()
 
             if signal and signal["side"] and self.position == 0:
+                # [GSD 4.13] Trading Readiness Gate
+                if not self.is_trading_ready:
+                    if self._bar_counter % 5 == 0:
+                        console.print(f"[bold yellow]🛡️ Trading Not Ready: Option {signal['side']} Entry Blocked (Stabilizing indicators...)[/bold yellow]")
+                    signal = {"score": 0, "side": None}
+                    return
+
                 # [L4] Decision Intelligence: Edge Evaluation
                 from core.edge_model import edge_model
 
@@ -2375,9 +2439,18 @@ class ShioajiOptionsSmartMonitor:
                     if edge_res["pos_scale"] != 1.0:
                         console.print(f"[bold cyan]⚖️ Option Position Scaled: {edge_res['rank']} (x{edge_res['pos_scale']}) -> {self.paper_lots} lots[/bold cyan]")
 
-            if self.position > 0:                cur_p = self.market_data[self.active_side]["close"]
-                cur_bid = self.market_data[self.active_side]["bid"]
-                cur_ask = self.market_data[self.active_side]["ask"]
+            if self.position > 0:
+                # [GSD Fix] Handle non-standard active_side (THETA/SHORT)
+                if self.active_side in self.market_data:
+                    cur_p = self.market_data[self.active_side]["close"]
+                    cur_bid = self.market_data[self.active_side]["bid"]
+                    cur_ask = self.market_data[self.active_side]["ask"]
+                else:
+                    # For ThetaGang/Multi-leg, the manager calculates its own 'value'
+                    cur_p = float(self.market_data["MTX"]["close"]) # Use underlying as proxy if needed
+                    cur_bid = cur_p - 1
+                    cur_ask = cur_p + 1
+
                 if self.manage_open_position(signal):
                     self.print_status_summary(signal, force=True)
                     return
@@ -2519,99 +2592,83 @@ class ShioajiOptionsSmartMonitor:
                 rs = self.replay_stats
                 blocked = rs["blocked_entries"]
                 total_dir = rs["directional_signals"]
-                executed = rs["entries"]
-                if total_dir > 0:
-                    rate = executed / total_dir * 100
-                    console.print(f"[dim]📊 60s summary: {rs['signals']} signals, {total_dir} directional, {executed} entries, {blocked} blocked ({rate:.0f}% exec rate)[/dim]")
-
             self.print_status_summary(signal)
         except Exception as exc:
             console.print(f"[red]Strategy loop error:[/red] {exc}")
 
     def run(self):
-        # find_best_contracts may already be called from main.py
+        self._running = True
+        
+        # [Phase A] Immediate Activation (Moved from __init__)
+        if not self.dry_run:
+            from strategies.options.login import shioaji_login
+            from options_engine.engine.broker_adapter import ShioajiBrokerAdapter, MockBrokerAdapter
+            
+            self.api = shioaji_login.login()
+            if self.dry_run_live_orders:
+                self.broker = MockBrokerAdapter(self.execution_cfg)
+            else:
+                self.broker = ShioajiBrokerAdapter(self.api, self.execution_cfg)
+                
+            if self.api is not None and hasattr(self.api, "set_order_callback"):
+                self.api.set_order_callback(self.on_order_event)
+
+            # Initialize OrderManager
+            cfg = self.load_config()
+            self._use_order_manager = cfg.get("monitoring", {}).get("use_order_manager", False)
+            if self._use_order_manager:
+                from core.order_management.order_manager import OrderManager
+                _om_mode = "live" if self.live_trading else "paper"
+                self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=self.broker)
+                self._wire_order_callbacks()
+                console.print(f"[green]📋 Options Order Lifecycle Manager enabled ({_om_mode} mode)[/green]")
+
+        # Immediate Heartbeat & Status Summary
         if not self.active_contracts:
-            if not self.find_best_contracts():
-                return
-            self.pre_fill_bars()
+            if not self.find_best_contracts(): return
+            
         if not self.dry_run and self.api is not None:
-            # Recover position from API on startup to prevent duplicate entries
             self._recover_position_from_api()
-            # Don't override callback or subscribe — main.py handles it
-        console.print(f">>> [{'DRY RUN' if self.dry_run and not self.dry_run_live_orders else self.status_mode_label() + ' MODE'}] [EXIT-SNIPER ENABLED] Monitor Running <<<")
-        if self.dry_run_live_orders:
-            console.print("[green]Dry live-orders mode active. Mock broker fills will exercise live entry/exit callbacks without real broker login.[/green]")
-        elif self.dry_run:
-            console.print("[green]Dry run active. Broker login, quote subscription, and order placement are skipped.[/green]")
-        elif self.live_trading:
-            console.print("[yellow]Live mode active. Orders will be submitted through the broker adapter and local state will follow fill callbacks.[/yellow]")
-        else:
-            console.print("[green]Paper mode active. Entries and exits will be simulated in the trade ledger.[/green]")
-        # [GSD Phase C] Initialize Diagnostic Engine
+
+        # [Phase B] Async Backfill (4000+ Bars)
+        import threading
+        self._backfill_done = False
+        def _bg_prefill():
+            console.print(f"[cyan]⏳ [Phase B] Options background MTX backfill starting...[/cyan]")
+            self.pre_fill_bars()
+            self._backfill_done = True
+            from core.shioaji_session import set_system_status, SystemReadiness
+            set_system_status(SystemReadiness.TRADING)
+            console.print(f"[bold green]✅ [Phase B] Options backfill complete. Indicators stabilizing...[/bold green]")
+        
+        threading.Thread(target=_bg_prefill, daemon=True).start()
+
+        # Diagnostic Engine
         from core.diagnostic_engine import DiagnosticEngine
         self.diag_engine = DiagnosticEngine(str(self.ledger_path))
         self._diag_counter = 0
 
+        console.print(f"[green]🚀 Options Monitor Running ({self.status_mode_label()}). Status: WARMING_UP[/green]")
         self.print_status_summary(force=True)
+
         try:
-            self._running = True
             while self._running:
-                # [Wave 1 Fix] Check for restart flag from dashboard
-                if os.path.exists(".restart"):
-                    console.print("[bold yellow]🔄 Restart flag detected. Exiting Options Monitor for supervisor...[/bold yellow]")
-                    break
-                
+                if os.path.exists(".restart"): break
                 try:
                     self.run_strategy_logic()
-                    
-                    # [GSD Phase C] Periodic Health Check
                     self._diag_counter += 1
                     if self._diag_counter % 10 == 0:
                         results = self.diag_engine.check_health()
                         for r in results:
-                            console.print(f"[bold red]🩺 DIAGNOSTIC ALERT (Options): {r.action} - {r.reason}[/bold red]")
-                            if r.action == "COOLDOWN":
-                                self.cooldown_until = 20
+                            console.print(f"[bold red]🩺 DIAGNOSTIC ALERT (Options): {r.action}[/bold red]")
                 except Exception as exc:
                     console.print(f"[red]Options strategy logic error: {exc}[/red]")
-                    import traceback
-                    traceback.print_exc()
-
-                if self.dry_run and self.run_once:
-                    console.print("[bold green]Dry run completed one strategy iteration.[/bold green]")
-                    break
-                
-                if self.dry_run and self.replay_bars is not None and self.replay_cursor is not None and self.replay_cursor > len(self.replay_bars):
-                    console.print("[bold green]Dry run replay completed.[/bold green]")
-                    break
-                
-                now = self._current_strategy_time()
-                
-                # 檢查市場是否開盤 (支援日盤 + 夜盤)
-                market_open, session = self._is_market_open(now)
-                if not market_open:
-                    console.print(f"[dim]Market closed ({session}). Waiting for next session...[/dim]")
-                    time.sleep(60)
-                    continue
-
-                # 夜盤時後的特殊處理
-                if session == "night":
-                    console.print(f"[dim]🌙 夜盤時段 ({now.strftime('%H:%M')})[/dim]")
-                
-                # [Phase 1 Fix] Check options data freshness
-                self._check_options_contract_staleness()
-                
-                # [GSD Fix] Save options kbar data to CSV
-                self._save_options_bar()
-
-                self.run_strategy_logic()
-                if not (self.dry_run and self.replay_bars is not None):
-                    time.sleep(self.loop_sleep_secs)
+                time.sleep(self.loop_sleep_secs)
         except KeyboardInterrupt:
             pass
         finally:
-            shioaji_login.logout()
-
+            if self.api:
+                self.api.logout()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run the live options squeeze monitor.")

@@ -67,7 +67,7 @@ class EdgeModel:
         return max(0.0, min(1.0, score))
 
     def evaluate(self, signal_score: float, context: dict, strategy_name: str) -> dict:
-        """Evaluate with Directional Shield and Probability Bucketing."""
+        """Evaluate with Soft Allocation (Expectancy-driven)."""
         # Standardize features
         price = context.get("price", 20000)
         atr = context.get("volatility", 50)
@@ -89,45 +89,51 @@ class EdgeModel:
             "trend_strength_raw": trend_raw
         }
         
-        # --- DIRECTIONAL SHIELD (GSD 4.6) ---
-        # Prevent fighting strong trends
+        # --- DIRECTIONAL SHIELD ---
         shield_blocked = False
-        side = context.get("side", "UNKNOWN") # Injected from monitor/engine
-        
+        side = context.get("side", "UNKNOWN")
         if regime == "STRONG":
-            if trend_raw > 0.002 and side == "SHORT": shield_blocked = True # No shorting moon
-            if trend_raw < -0.002 and side == "LONG": shield_blocked = True # No catching falling knives
+            if trend_raw > 0.002 and side == "SHORT": shield_blocked = True
+            if trend_raw < -0.002 and side == "LONG": shield_blocked = True
 
         if shield_blocked:
-            return {"has_edge": False, "edge_score": 0.0, "pos_scale": 0.0, "rank": "SHIELD_BLOCKED", "reason": f"Shield Blocked: Counter-trend in {regime}"}
+            return {
+                "has_edge": False, 
+                "edge_score": 0.0, 
+                "pos_scale": 0.0, 
+                "rank": "SHIELD_BLOCKED", 
+                "is_exploring": False,
+                "reason": "Shield Blocked",
+                "features": features
+            }
 
         prob = self.compute_edge(features)
         
-        # --- PROBABILITY BUCKETING (GSD 4.4) ---
-        # Instead of binary, we rank the opportunity
-        if prob >= 0.65:
-            rank = "ALPHA"
-            pos_scale = 1.5  # Heavy weight
-        elif prob >= 0.55:
-            rank = "BETA"
-            pos_scale = 1.0  # Standard
-        elif prob >= 0.48:
-            rank = "GAMMA"
-            pos_scale = 0.5  # Scout
-        else:
-            rank = "NO_EDGE"
-            pos_scale = 0.0
-            
-        # Exploration fallback
-        is_exploring = False
-        if pos_scale == 0 and random.random() < 0.05: # Reduced exploration
-            pos_scale = 0.3
-            rank = "EXPLORE"
-            is_exploring = True
+        # --- SOFT ALLOCATION (GSD 4.7) ---
+        # Instead of 'if prob > threshold', we use: size = max(0, (prob - base) * multiplier)
+        # Calibration from previous results:
+        base_configs = {
+            "counter_vwap": {"base": 0.40, "mult": 2.0},
+            "orb_breakout": {"base": 0.45, "mult": 3.0},
+            "default": {"base": 0.50, "mult": 2.0}
+        }
+        cfg = base_configs.get(strategy_name, base_configs["default"])
         
-        has_edge = pos_scale > 0
+        # Linear Ramp Function
+        pos_scale = max(0.0, (prob - cfg["base"]) * cfg["mult"])
+        pos_scale = min(2.0, pos_scale) # Cap at 2x base size
+        
+        # Classification for UX
+        if pos_scale >= 1.2: rank = "ALPHA"
+        elif pos_scale >= 0.7: rank = "BETA"
+        elif pos_scale > 0: rank = "GAMMA"
+        else: rank = "NO_EDGE"
+            
+        has_edge = pos_scale > 0.1 # Minimum viable size
+        is_exploring = (prob < cfg["base"]) and pos_scale > 0
+
         source = "ML" if self._ml_model else "RULE"
-        reason = f"Rank={rank}, Prob={prob:.2f}, Scale={pos_scale}"
+        reason = f"Rank={rank}, Prob={prob:.2f}, Scale={pos_scale:.1f}"
         
         return {
             "has_edge": has_edge,

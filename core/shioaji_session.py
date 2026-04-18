@@ -30,6 +30,27 @@ _api: sj.Shioaji | None = None
 _lock = threading.Lock()
 
 
+from enum import Enum
+class SystemReadiness(Enum):
+    BOOTING = "BOOTING"       # Initializing, logging in
+    MONITORING = "MONITORING" # Connected, receiving ticks, but indicators cold
+    TRADING = "TRADING"       # Indicators ready, Edge model active
+    DEGRADED = "DEGRADED"     # Connection lost or error state
+
+_current_status = SystemReadiness.BOOTING
+_status_lock = threading.Lock()
+
+def set_system_status(status: SystemReadiness):
+    global _current_status
+    with _status_lock:
+        _current_status = status
+        # [Pillar 4] Log state transitions for observability
+        logger.info(f"🚦 [System] State transition: {_current_status.value}")
+
+def get_system_status() -> SystemReadiness:
+    with _status_lock:
+        return _current_status
+
 def get_api() -> sj.Shioaji:
     """Return the shared API instance, logging in if needed."""
     global _api

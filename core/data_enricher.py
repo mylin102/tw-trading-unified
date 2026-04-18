@@ -33,8 +33,10 @@ def _calc_vwap(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
         # Avoid complex transform for speed in large DF
         # Simple cumulative sums for the whole series if only one day, 
         # or grouped cumsum for multi-day.
-        cum_pv = (p * v).groupby(df["trading_day"]).cumsum()
-        cum_v = v.groupby(df["trading_day"]).cumsum()
+        pv = pd.Series(p * v, index=df.index)
+        vol_ser = pd.Series(v, index=df.index)
+        cum_pv = pv.groupby(df["trading_day"]).cumsum()
+        cum_v = vol_ser.groupby(df["trading_day"]).cumsum()
         df["vwap"] = cum_pv / cum_v
     else:
         df["vwap"] = np.cumsum(p * v) / np.cumsum(v)

@@ -15,6 +15,13 @@ stocks:
   take_profit_pct: 0.15
   total_portfolio_budget: 100000
   trailing_stop_pct: 0.02
+  # Adaptive Exit Strategy (Phase 4.3)
+  adaptive_exits:
+    enabled: true
+    atr_sl_mult: 2.5           # Chandelier Exit multiplier
+    profit_target_strong: 0.15 # Target for STRONG bull regime
+    profit_target_weak: 0.05   # Target for WEAK/NORMAL regime
+    rollover_score_threshold: 70 # Exit if score falls after this peak
   watchlist:
   - '2330'
   - '2454'

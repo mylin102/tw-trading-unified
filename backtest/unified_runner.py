@@ -183,6 +183,18 @@ def run_all_strategies():
 
     print(f"  ✅ 報告已儲存: {csv_path}")
     print(f"  ✅ Markdown: {md_path}")
+    
+    # [GSD Upgrade] 輸出 Edge 診斷報告
+    try:
+        from core.edge_diagnostics import edge_diag
+        diag = edge_diag.report()
+        print("\n" + "🧠 " + "=" * 30 + " DECISION INTELLIGENCE DIAGNOSTICS " + "=" * 30)
+        import json
+        print(json.dumps(diag, indent=2))
+        print("=" * 100 + "\n")
+    except Exception as e:
+        print(f"⚠️ Failed to generate edge diagnostics: {e}")
+
     print("\n" + "=" * 70)
     print(df_results[['strategy', 'cagr', 'win_rate', 'trades']].to_string(index=False))
     return df_results

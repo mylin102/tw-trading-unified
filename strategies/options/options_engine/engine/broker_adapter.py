@@ -112,3 +112,42 @@ class ShioajiBrokerAdapter:
         if hasattr(self.api, "cancel_order"):
             return self.api.cancel_order(trade)
         return None
+
+class MockTrade:
+    def __init__(self, contract, action, price, quantity, status="Filled"):
+        self.contract = contract
+        self.order = SimpleNamespace(action=action, price=price, quantity=quantity)
+        self.status = SimpleNamespace(status=status)
+        self.order_id = f"MOCK-{datetime.datetime.now().strftime('%H%M%S')}"
+
+class MockBrokerAdapter:
+    def __init__(self, execution_cfg=None):
+        self.execution_cfg = execution_cfg or {}
+        self.aggressive_ticks = self.execution_cfg.get("aggressive_ticks", 0)
+        self.tick_size = float(self.execution_cfg.get("tick_size", 1.0))
+
+    def aggressive_entry_price(self, ask_price):
+        return max(0.0, float(ask_price) + (self.aggressive_ticks * self.tick_size))
+
+    def aggressive_exit_price(self, bid_price):
+        return max(self.tick_size, float(bid_price) - (self.aggressive_ticks * self.tick_size))
+
+    def place_entry_order(self, contract, quantity):
+        from types import SimpleNamespace
+        return MockTrade(contract, "Buy", self.aggressive_entry_price(getattr(contract, "ask_price", 0.0) or 0.0), quantity)
+
+    def place_exit_order(self, contract, quantity, bid_price=None):
+        from types import SimpleNamespace
+        price = bid_price if bid_price is not None else (getattr(contract, "bid_price", 0.0) or 0.0)
+        return MockTrade(contract, "Sell", self.aggressive_exit_price(price), quantity)
+
+    def describe_trade(self, trade):
+        return {
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "Filled",
+            "order": f"{trade.order.action}@{trade.order.price}x{trade.order.quantity}",
+            "contract": getattr(getattr(trade, "contract", None), "code", None),
+        }
+
+    def refresh_status(self, account=None): return None
+    def cancel_order(self, trade): return None

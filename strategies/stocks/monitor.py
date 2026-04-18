@@ -101,21 +101,29 @@ class StockMonitor:
             except Exception:
                 pass
 
-        # Find yesterday's ledger
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
-        ledger_file = TRADE_LOGS / f"STOCK_{yesterday}_{self.mode_tag}_trades.csv"
+        # Find the most recent ledger within the last 7 days
+        ledger_file = None
+        for i in range(1, 8):
+            check_date = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
+            possible_file = TRADE_LOGS / f"STOCK_{check_date}_{self.mode_tag}_trades.csv"
+            if possible_file.exists():
+                ledger_file = possible_file
+                last_ledger_date = check_date
+                break
 
-        if not ledger_file.exists():
-            console.print(f"[dim]📂 No previous ledger found: {ledger_file}[/dim]")
+        if not ledger_file:
+            console.print(f"[dim]📂 No previous stock ledger found in the last 7 days[/dim]")
             return
 
         try:
             df = pd.read_csv(ledger_file)
             if df.empty:
-                console.print(f"[dim]📂 Yesterday's ledger is empty[/dim]")
+                console.print(f"[dim]📂 Previous ledger ({ledger_file.name}) is empty[/dim]")
                 return
 
             # Calculate net positions: BUY qty - SELL qty
+            # We need to consider that the previous ledger itself might have OVERNIGHT_RECOVERY entries
+            # which represent carry-over from even earlier days.
             buys = df[df["action"] == "BUY"].groupby("ticker").agg({"qty": "sum", "entry_price": "mean"})
             sells = df[df["action"] == "SELL"].groupby("ticker").agg({"qty": "sum"})
 
@@ -128,7 +136,7 @@ class StockMonitor:
 
                 if net_qty > 0:
                     avg_price = buy_row["entry_price"]
-                    self.positions[ticker] = {
+                    self.positions[str(ticker)] = {
                         "stage": "HOLD",
                         "entry_price": avg_price,
                         "qty": int(net_qty),
@@ -147,15 +155,14 @@ class StockMonitor:
                         "price": avg_price,
                         "entry_price": avg_price,
                         "qty": int(net_qty),
-                        "reason": f"OVERNIGHT_RECOVERY_{yesterday}",
+                        "reason": f"OVERNIGHT_RECOVERY_{last_ledger_date}",
                         "pnl_gross": 0.0,
                         "fees": 0.0,
                         "pnl_cash": 0.0,
                     }
                     rec_df = pd.DataFrame([recovery_record])
-                    today_ledger = TRADE_LOGS / f"STOCK_{datetime.now().strftime('%Y%m%d')}_{self.mode_tag}_trades.csv"
-                    header = not today_ledger.exists()
-                    rec_df.to_csv(today_ledger, mode='a', header=header, index=False)
+                    header = not self.ledger_path.exists()
+                    rec_df.to_csv(self.ledger_path, mode='a', header=header, index=False)
 
             if recovered_count > 0:
                 total_value = sum(p["qty"] * p["entry_price"] for p in self.positions.values())
@@ -549,14 +556,70 @@ class StockMonitor:
                 
                 res = self._loop_state["STOCK_STRATEGIES"][self.strat_name]["func"](state, self.cfg)
                 
-                # 3. Execution with SAFETY CHECK
+                # 3. Execution & Risk with Decision Intelligence
                 snapshot = self.api.snapshots([contract])[0]
-                self.check_risk(ticker, snapshot.close)
+                last_bar = df.iloc[-1].to_dict()
+                regime = tf_analysis.get("regime", "NORMAL")
+                last_bar["regime"] = regime
                 
+                # --- A. Risk Check (Adaptive Exit Engine) ---
+                if ticker in self.positions:
+                    pos = self.positions[ticker]
+                    # Update peak for trailing stop
+                    pos["peak_price"] = max(pos.get("peak_price", pos["entry_price"]), snapshot.close)
+                    
+                    from core.exit_engine import should_exit
+                    trade_state = {
+                        "entry_price": pos["entry_price"],
+                        "side": "LONG",
+                        "peak_price": pos["peak_price"],
+                        "position_age_bars": 0 # TODO: Track bars held
+                    }
+                    # Context for edge calculation
+                    context = {
+                        "regime": regime,
+                        "momentum": last_bar.get("momentum", 0),
+                        "volatility": last_bar.get("atr", 0),
+                        "volatility_norm": min(1.0, last_bar.get("atr", 0) / (snapshot.close * 0.05)),
+                        "vwap_dist": abs(snapshot.close - last_bar.get("vwap", snapshot.close)),
+                        "signal_score": abs(last_bar.get("score", 50))
+                    }
+                    
+                    # Calculate time to close
+                    close_time = now.replace(hour=13, minute=30, second=0)
+                    time_to_close = max(0, (close_time - now).total_seconds() / 60)
+                    market = {
+                        "price": snapshot.close,
+                        "atr": last_bar.get("atr", 0),
+                        "time_to_close_mins": time_to_close
+                    }
+                    
+                    exit_triggered, exit_reason = should_exit(trade_state, context, market)
+                    if exit_triggered:
+                        self.execute_trade(ticker, "SELL", snapshot.close, "ALL", exit_reason)
+                    else:
+                        # Fallback for Hard Stop (Circuit Breaker)
+                        sl_pct = self.cfg.get("stocks", {}).get("stop_loss_pct", 0.05)
+                        if snapshot.close <= pos["entry_price"] * (1 - sl_pct):
+                            self.execute_trade(ticker, "SELL", snapshot.close, "ALL", "HARD_STOP_LOSS")
+
+                # --- B. Entry Filter (Edge Model) ---
                 if res and res["action"] == "BUY" and not self._check_bear_defense():
-                    # THE CRITICAL SAFETY CHECK
-                    self._reload_live_flag() 
-                    self.execute_trade(ticker, "BUY", snapshot.close, res.get("qty_mode", "SCOUT"), res.get("reason", "SIGNAL"))
+                    from core.edge_model import edge_model
+                    context = {
+                        "regime": regime,
+                        "momentum": last_bar.get("momentum", 0),
+                        "volatility": last_bar.get("atr", 0),
+                        "vwap_dist": abs(snapshot.close - last_bar.get("vwap", snapshot.close))
+                    }
+                    edge_res = edge_model.evaluate(abs(last_bar.get("score", 50)), context, self.strat_name)
+                    
+                    if edge_res["has_edge"]:
+                        self._reload_live_flag() 
+                        self.execute_trade(ticker, "BUY", snapshot.close, res.get("qty_mode", "SCOUT"), f"{res.get('reason', 'SIGNAL')} (Edge={edge_res['edge_score']:.2f})")
+                    else:
+                        if random.random() < 0.1: # Reduce log noise
+                            console.print(f"[dim]🛡️ Entry blocked: {ticker} {edge_res['reason']}[/dim]")
                         
             except Exception as e:
                 console.print(f"[red]Error {ticker}: {e}[/red]")
@@ -564,29 +627,58 @@ class StockMonitor:
     def run(self):
         """Legacy run method for backward compatibility."""
         self.running = True
+        # GSD Fix: Ensure recovery is called and then save to JSON for dashboard
         self._recover_positions_from_ledger()
+        self._save_orders_file()
+        
         while self.running:
             self.run_iteration()
             time.sleep(60)
 
-    def check_risk(self, ticker, curr_price):
+    def check_risk(self, ticker, curr_price, context=None):
         if ticker not in self.positions: return
         pos = self.positions[ticker]
         now = datetime.now()
+        
+        # ── Layer 1: Adaptive Indicator-Driven Exits ──
+        if context and self.cfg.get("stocks", {}).get("adaptive_exits", {}).get("enabled", False):
+            a_cfg = self.cfg["stocks"]["adaptive_exits"]
+            atr = context.get("atr", 0)
+            score = context.get("score", 0)
+            regime = context.get("regime", "NORMAL")
+            
+            # A. Chandelier ATR Trailing Stop (from Peak)
+            peak = pos.get("peak_price", pos["entry_price"])
+            sl_dist = atr * a_cfg.get("atr_sl_mult", 2.5)
+            if sl_dist > 0 and curr_price <= (peak - sl_dist):
+                self.execute_trade(ticker, "SELL", curr_price, "ALL", f"ADAPTIVE_ATR_STOP (peak={peak:.1f}, dist={sl_dist:.1f})")
+                return
+            
+            # B. Momentum Rollover (Exhaustion)
+            # If high score achieved, but now dropping significantly or mom_state is cooling
+            if score > a_cfg.get("rollover_score_threshold", 70) and context.get("mom_state") == 2:
+                self.execute_trade(ticker, "SELL", curr_price, "ALL", f"MOMENTUM_ROLLOVER (score={score:.1f})")
+                return
+                
+            # C. Regime-Aware Profit Targets
+            profit_pct = (curr_price - pos["entry_price"]) / pos["entry_price"]
+            target = a_cfg.get("profit_target_strong", 0.15) if regime == "STRONG" else a_cfg.get("profit_target_weak", 0.05)
+            if profit_pct >= target:
+                self.execute_trade(ticker, "SELL", curr_price, "ALL", f"REGIME_TARGET_HIT ({regime}: {target:.0%})")
+                return
 
-        # 第三招：13:20 只撤退虧損倉，獲利倉抱到 13:25 trailing stop
+        # ── Layer 2: EOD Smart Exit (Final Safety Window) ──
         if now.hour == 13 and now.minute >= 20:
             pnl_pct = (curr_price - pos["entry_price"]) / pos["entry_price"]
             if pnl_pct <= 0:
                 self.execute_trade(ticker, "SELL", curr_price, "ALL", "TIME_EXIT_LOSER")
             elif now.minute >= 25:
-                # BUG FIX 2026-04-13: Cancel ALL pending orders at 13:25
-                # Prevents ROD/Odd orders from filling at 14:30 post-market
                 self.cancel_all_pending_orders()
                 self.execute_trade(ticker, "SELL", curr_price, "ALL", "TIME_EXIT_FINAL")
             return
             
-        sl_pct = self.cfg.get("stocks", {}).get("stop_loss_pct", 0.03)
+        # ── Layer 3: Hard Stop Loss (Circuit Breaker) ──
+        sl_pct = self.cfg.get("stocks", {}).get("stop_loss_pct", 0.05)
         if curr_price <= pos["entry_price"] * (1 - sl_pct):
             self.execute_trade(ticker, "SELL", curr_price, "ALL", "HARD_STOP_LOSS")
 

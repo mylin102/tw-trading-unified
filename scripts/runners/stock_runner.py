@@ -75,6 +75,10 @@ def run_stock_monitor(dry_run=False):
             config_path=os.path.join(BASE, "config", "stocks.yaml"),
             dry_run=dry_run
         )
+        
+        # [GSD Fix] 啟動時恢復部位並更新 Dashboard 所需的 JSON
+        sm._recover_positions_from_ledger()
+        sm._save_orders_file()
 
         # 3. Execution Loop
         RESTART_FLAG = BASE / ".restart"

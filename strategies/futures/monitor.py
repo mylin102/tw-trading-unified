@@ -127,6 +127,8 @@ class FuturesMonitor:
         self._fire_high = 0.0
         self._fire_low = 0.0
         self._bar_counter = 0        # monotonic bar counter for fire tracking
+        self.is_monitoring_ready = True # [GSD 4.13] Phase A Ready
+        self.is_trading_ready = False   # [GSD 4.13] Phase B Ready
         self._vwap_violation_bars = 0  # VWAP exit debounce counter
         self._atr_trail_peak = 0.0    # ATR trailing stop: peak price tracker
 
@@ -1308,64 +1310,91 @@ class FuturesMonitor:
         flips = (recent != recent.shift(1)).sum()
         return flips >= 4  # 20 bars 內翻轉 4 次以上 → 盤整
 
+    def _ensure_indicator_schema(self, path: Path, new_data_keys: list):
+        """🛡️ [GSD Load-time Normalize] Ensure CSV schema is consistent ONCE at startup."""
+        if not path.exists(): return
+        try:
+            df = pd.read_csv(path)
+            df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+            
+            missing = [c for c in new_data_keys if c not in df.columns]
+            if missing:
+                self.logger.info(f"🛡️ Migrating indicator CSV: adding {missing}")
+                for c in missing: df[c] = np.nan
+                # Sort columns to keep a stable order
+                df = df.reindex(columns=sorted(df.columns))
+                df.to_csv(path, index=False)
+            
+            # Cache the column order for subsequent appends
+            self._indicator_cols = sorted(df.columns)
+            self._indicators_migrated = True
+        except Exception as e:
+            self.logger.error(f"Schema migration failed: {e}")
+
     def _save_bar(self, row, score, regime):
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs", "market_data")
         os.makedirs(log_dir, exist_ok=True)
         
-        # 統一交易日日期邏輯 (GSD: Align with Taifex session/holidays)
         from core.date_utils import get_session_date_str, get_session
         now = datetime.now()
         date_str = get_session_date_str(now)
         
         tag = "_DRY" if self.dry_run else ("_LIVE" if self.live_trading else "_PAPER")
-        path = os.path.join(log_dir, f"{self.ticker}_{date_str}{tag}_indicators.csv")
-        file_exists = os.path.exists(path)
+        path = Path(log_dir) / f"{self.ticker}_{date_str}{tag}_indicators.csv"
         
-        # Convert Series to dict and merge all indicators (GSD: Prevent None fields in dashboard)
+        # 1. Prepare Data
         data = row.to_dict()
-        
-        # Fix: Convert trading_day to string to prevent None/NaN in CSV
         if "trading_day" in data and data["trading_day"] is not None:
             td = data["trading_day"]
-            if hasattr(td, "isoformat"):  # date object
-                data["trading_day"] = td.isoformat()
-            else:
-                data["trading_day"] = str(td)
-        
+            data["trading_day"] = td.isoformat() if hasattr(td, "isoformat") else str(td)
+            
         data.update({
             "timestamp": str(row.name),
             "session": get_session(now),
             "score": score,
             "regime": regime,
-            # Lowercase aliases for dashboard compatibility
+            "breakout_strength": float(getattr(self, "_last_bar_context", {}).get("breakout_strength", 0.0)),
+            "volume_spike": float(getattr(self, "_last_bar_context", {}).get("volume_spike", 1.0)),
+            "trend_strength_raw": float(getattr(self, "_last_bar_context", {}).get("trend_strength_raw", 0.0)),
             "open": row.get("Open", 0), "high": row.get("High", 0), "low": row.get("Low", 0), "close": row.get("Close", 0),
             "volume": row.get("Volume", 0), "amount": row.get("Amount", 0),
             "bull_align": row.get("bullish_align", False), "bear_align": row.get("bearish_align", False),
             "in_pb_zone": row.get("in_bull_pb_zone", False) or row.get("in_bear_pb_zone", False),
         })
-        
-        if file_exists:
-            # GSD Fix: Support dynamic column expansion and deduplication
-            try:
-                # Read existing data
-                df_existing = pd.read_csv(path)
-                # GSD Fix: Drop any Unnamed columns from index leakage
-                df_existing = df_existing.loc[:, ~df_existing.columns.str.startswith("Unnamed")]
-                # Prepare new row
-                df_new = pd.DataFrame([data])
-                # Combine and deduplicate
-                df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-                df_combined.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
-                # Save back (overwrites with full columns)
-                df_combined.to_csv(path, index=False)
-            except Exception as e:
-                # Fallback to simple append if combined logic fails
-                with open(path, 'r') as f:
-                    existing_cols = f.readline().strip().split(',')
-                row_dict = {c: data.get(c, '') for c in existing_cols}
-                pd.DataFrame([row_dict]).to_csv(path, mode="a", index=False, header=False)
-        else:
-            pd.DataFrame([data]).to_csv(path, index=False, header=True)
+
+        # 2. Schema Normalization (Once per session)
+        if not hasattr(self, "_indicators_migrated") or not self._indicators_migrated:
+            self._ensure_indicator_schema(path, list(data.keys()))
+            self._indicators_migrated = True
+
+        # 3. Fast Append with Timestamp Gating
+        try:
+            current_ts = pd.to_datetime(data["timestamp"])
+            if not path.exists():
+                # First time: Write header
+                cols = sorted(data.keys())
+                self._indicator_cols = cols
+                pd.DataFrame([data])[cols].to_csv(path, index=False)
+                self._last_saved_ts = current_ts
+            else:
+                # [GSD Idempotency Fix] Read last TS from file if not in memory
+                if not hasattr(self, "_last_saved_ts") or self._last_saved_ts is None:
+                    try:
+                        # Optimization: read only last line to get last timestamp
+                        last_line = subprocess.check_output(['tail', '-1', str(path)]).decode().split(',')[0]
+                        self._last_saved_ts = pd.to_datetime(last_line)
+                    except:
+                        self._last_saved_ts = pd.Timestamp.min
+
+                # Only append if this is a NEW bar
+                if current_ts > self._last_saved_ts:
+                    cols = getattr(self, "_indicator_cols", sorted(data.keys()))
+                    row_df = pd.DataFrame([data])
+                    row_df.reindex(columns=cols).to_csv(path, mode='a', header=False, index=False)
+                    self._last_saved_ts = current_ts
+                # else: ignore duplicate bar
+        except Exception as e:
+            self.logger.error(f"Fast-append failed: {e}")
 
     # ── Main strategy loop ──
 
@@ -1428,7 +1457,11 @@ class FuturesMonitor:
     def run(self):
         self._running = True
         mode = "dry-run" if self.dry_run else ("LIVE" if self.live_trading else "PAPER")
-        # Recover position from API on restart
+        
+        # [Phase A] Immediate Position Recovery & Heartbeat Start
+        from core.shioaji_session import set_system_status, SystemReadiness
+        set_system_status(SystemReadiness.MONITORING)
+        
         if not self.dry_run and self.api:
             try:
                 positions = self.api.list_positions(self.api.futopt_account)
@@ -1438,7 +1471,6 @@ class FuturesMonitor:
                         self.trader.position = qty
                         self.trader.entry_price = float(p.price)
                         
-                        # [GSD Fix] 把恢復的部位加入 OrderManager
                         if self.order_mgr:
                             from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
                             rec_order = Order(
@@ -1455,38 +1487,42 @@ class FuturesMonitor:
                             rec_order.avg_fill_price = float(p.price)
                             rec_order.filled_at = datetime.now()
                             self.order_mgr.completed.append(rec_order)
-                            
                         console.print(f"[bold cyan]♻️ Recovered futures position: {qty} @ {p.price}[/bold cyan]")
                         break
             except Exception as e:
                 console.print(f"[yellow]Futures position recovery failed: {e}[/yellow]")
-        # [GSD Phase C] Initialize Diagnostic Engine
+
+        # [Phase B] Async Indicator Warm-up
+        import threading
+        self._backfill_done = False
+        def _bg_backfill():
+            console.print(f"[cyan]⏳ [Phase B] Starting background K-bar backfill...[/cyan]")
+            df_hist = self._fetch_today_kbars()
+            if df_hist is not None and not df_hist.empty:
+                self._backfill_done = True
+                console.print(f"[bold green]✅ [Phase B] Backfill complete ({len(df_hist)} bars). Indicators stabilizing...[/bold green]")
+            else:
+                console.print(f"[yellow]⚠️ [Phase B] Backfill returned no data, will rely on tick accumulation.[/yellow]")
+        
+        threading.Thread(target=_bg_backfill, daemon=True).start()
+
         from core.diagnostic_engine import DiagnosticEngine
-        self.diag_engine = DiagnosticEngine(str(Path("logs/market_data/TMF_trades.csv"))) # Shared trades ledger
+        self.diag_engine = DiagnosticEngine(str(Path("logs/market_data/TMF_trades.csv")))
         self._diag_counter = 0
 
-        console.print(f"[green][FuturesMonitor] started ({mode})[/green]")
+        console.print(f"[green][FuturesMonitor] started ({mode}). Status: WARMING_UP[/green]")
 
         while self._running:
-            # [Wave 1 Fix] Check for restart flag from dashboard
-            if os.path.exists(".restart"):
-                console.print("[bold yellow]🔄 Restart flag detected. Exiting Futures Monitor for supervisor...[/bold yellow]")
-                break
+            if os.path.exists(".restart"): break
             try:
                 self._strategy_tick()
-                
-                # [GSD Phase C] Periodic Health Check
                 self._diag_counter += 1
                 if self._diag_counter % 10 == 0:
                     results = self.diag_engine.check_health()
                     for r in results:
-                        console.print(f"[bold red]🩺 DIAGNOSTIC ALERT: {r.action} - {r.reason}[/bold red]")
-                        if r.action == "COOLDOWN":
-                            self.cooldown_until = 20 # Auto-trigger cooldown
+                        console.print(f"[bold red]🩺 DIAGNOSTIC ALERT: {r.action}[/bold red]")
             except Exception as e:
-                traceback.print_exc()
                 console.print(f"[red][FuturesMonitor] error: {e}[/red]")
-                print(f"[TRACEBACK] {traceback.format_exc()}", flush=True)
             time.sleep(self.POLL_INTERVAL)
 
     def stop(self):
@@ -1630,6 +1666,13 @@ class FuturesMonitor:
 
         df_5m = processed["5m"]
         
+        # [GSD 4.13] Trading Readiness Unlock: only allow trading if we have enough bars for indicators
+        if not self.is_trading_ready and len(df_5m) >= self.STRATEGY.get("length", 20):
+            self.is_trading_ready = True
+            from core.shioaji_session import set_system_status, SystemReadiness
+            set_system_status(SystemReadiness.TRADING)
+            console.print(f"[bold green]🔥 [FuturesMonitor] Trading READY: {len(df_5m)} bars loaded.[/bold green]")
+        
         # ── GSD: Ensure trading_day is always present before any downstream usage ──
         if "trading_day" not in df_5m.columns or df_5m["trading_day"].iloc[-1] is None or pd.isna(df_5m["trading_day"].iloc[-1]):
             from core.date_utils import get_trading_day
@@ -1748,6 +1791,7 @@ class FuturesMonitor:
             # VWAP Exit (Secondary check)
             if not exit_triggered:
                 _is_night = is_night_session
+                if _is_night:
                     # 夜盤: VWAP exit (回測 PF=2.74)
                     vwap_exit = self.RISK.get("exit_on_vwap") or (self.counter_exit_vwap and self._last_entry_reason == "COUNTER")
                     vwap_confirm_needed = self.RISK.get("exit_vwap_confirm_bars", 0)
@@ -1942,6 +1986,11 @@ class FuturesMonitor:
 
         # 4.1 Global Edge Filter (Bypass for exits, apply to entries)
         if signal and signal.action in ["BUY", "SELL"]:
+            # [GSD 4.13] Trading Readiness Gate
+            if not self.is_trading_ready:
+                self._audit_signal("ENTRY_BLOCKED", signal.action, score, "not_ready", "Indicators warming up")
+                return
+
             # [L4] Decision Intelligence: Edge Evaluation (Re-evaluated with side)
             from core.edge_model import edge_model
             edge_context = {
