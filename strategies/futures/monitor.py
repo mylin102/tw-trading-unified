@@ -1227,6 +1227,49 @@ class FuturesMonitor:
             self._session_pnl += pnl_pts
 
         if signal in ("BUY", "SELL"):
+            # --- Pre-entry guards (A–D checkpoints) ---
+            # 1) Price sanity
+            if price is None or price <= 0:
+                self._audit_signal("ENTRY_BLOCKED", "", 0, "invalid_price", f"price={price}")
+                console.print(f"[yellow][FuturesMonitor] Block entry: invalid price {price}[/yellow]")
+                return None
+            # 2) Feed freshness (use monitor thresholds)
+            try:
+                if hasattr(self, 'feed_health') and self.feed_health is not None:
+                    tx_age = self.feed_health.age('TX')
+                    tmf_age = self.feed_health.age('TMF')
+                    max_age = getattr(self, 'STALE_WARN_SECS', 120)
+                    if tx_age > max_age or tmf_age > max_age:
+                        self._audit_signal("ENTRY_BLOCKED", "", 0, "feed_stale", f"TX={tx_age:.0f}s TMF={tmf_age:.0f}s")
+                        console.print(f"[yellow][FuturesMonitor] Block entry: feed stale TX={tx_age:.0f}s TMF={tmf_age:.0f}s[/yellow]")
+                        return None
+            except Exception:
+                pass
+            # 3) Do not enter on the same bar as last trade
+            if hasattr(self, '_last_trade_ts') and self._last_trade_ts is not None:
+                try:
+                    if ts == self._last_trade_ts:
+                        self._audit_signal("ENTRY_BLOCKED", "", 0, "same_bar", "same_bar_as_last_trade")
+                        console.print(f"[yellow][FuturesMonitor] Block entry: same bar as last trade ({ts})[/yellow]")
+                        return None
+                except Exception:
+                    pass
+            # 4) Enforce simple position guard: avoid new entry when a position exists (prevent pyramiding)
+            if getattr(self, 'trader', None) is not None and self.trader.position != 0:
+                self._audit_signal("ENTRY_BLOCKED", "", 0, "position_not_zero", f"position={self.trader.position}")
+                console.print(f"[yellow][FuturesMonitor] Block entry: position not zero ({self.trader.position})[/yellow]")
+                return None
+            # 5) Minimum stop loss check (prevent tiny stops)
+            try:
+                min_sl = self.RISK.get('min_stop_loss_pts', 10)
+                if stop_loss is not None and stop_loss < min_sl:
+                    self._audit_signal("ENTRY_BLOCKED", "", 0, "stop_loss_too_small", f"sl={stop_loss}")
+                    console.print(f"[yellow][FuturesMonitor] Block entry: stop_loss {stop_loss} < min {min_sl}[/yellow]")
+                    return None
+            except Exception:
+                pass
+
+            # Passed pre-entry guards — update entry bookkeeping
             self._last_entry_reason = reason
             # [Bug Fix] Initialize trail peak to entry price
             self._atr_trail_peak = price
@@ -1690,6 +1733,17 @@ class FuturesMonitor:
         # [Bug Fix] Check data freshness and attempt reconnection
         if not self.dry_run:
             self._check_futures_contract_staleness()
+            # Strategy-level freshness gate: skip strategy tick if feed ages exceed warn threshold
+            try:
+                if hasattr(self, 'feed_health') and self.feed_health is not None:
+                    tx_age = self.feed_health.age('TX')
+                    tmf_age = self.feed_health.age('TMF')
+                    max_age = getattr(self, 'STALE_WARN_SECS', 120)
+                    if tx_age > max_age or tmf_age > max_age:
+                        console.print(f"[yellow][FuturesMonitor] TMF/TX feed stale (TX={tx_age:.0f}s TMF={tmf_age:.0f}s) - skip strategy tick[/yellow]")
+                        return
+            except Exception:
+                pass
 
         # [GSD Settlement Fix] Force close position on settlement day
         if self.trader.position != 0 and not self.dry_run:
