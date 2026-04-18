@@ -5,6 +5,7 @@
 """
 import sys
 import os
+import glob
 import pandas as pd
 import datetime
 
@@ -23,10 +24,12 @@ def test_1_date_logic():
     print(f"get_trade_day: {trade_day}")
     print(f"get_session_date_str: {session_date_str}")
     
-    # 驗證文件命名一致性
+    # 驗證文件命名一致性（支持 fallback 至 logs/market_data）
     expected_file = f"./exports/trades/TMF_{trade_day}_trades.csv"
+    market_matches = glob.glob(f"./logs/market_data/TMF_{trade_day}*trades.csv")
+    exists = os.path.exists(expected_file) or len(market_matches) > 0
     print(f"預期交易文件: {expected_file}")
-    print(f"文件存在: {os.path.exists(expected_file)}")
+    print(f"文件存在 (exports or market_data): {exists}")
     
     return trade_day, session_date_str
 
@@ -38,10 +41,12 @@ def test_2_dashboard_variables():
     print(f"TRADE_DATE_STR: {TRADE_DATE_STR}")
     print(f"DATE_STR: {DATE_STR}")
     
-    # 驗證Dashboard能找到文件
+    # 驗證Dashboard能找到文件（exports 或 logs/market_data）
     for date_str in [TRADE_DATE_STR, DATE_STR]:
         file_path = f"./exports/trades/TMF_{date_str}_trades.csv"
-        print(f"檢查文件 TMF_{date_str}_trades.csv: {os.path.exists(file_path)}")
+        market_matches = glob.glob(f"./logs/market_data/TMF_{date_str}*trades.csv")
+        exists = os.path.exists(file_path) or len(market_matches) > 0
+        print(f"檢查文件 TMF_{date_str}_trades.csv: {exists} (exports or market_data)")
     
     return TRADE_DATE_STR
 
@@ -117,7 +122,8 @@ def test_5_data_storage_optimization():
             'lots': 1,
             'pnl_pts': 0,
             'pnl_cash': 0,
-            'reason': 'VALIDATION_TEST'
+            'reason': 'VALIDATION_TEST',
+            'cross_policy': {}
         }
         
         storage.save_trade(test_trade)

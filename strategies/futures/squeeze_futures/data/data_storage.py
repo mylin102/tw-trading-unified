@@ -62,7 +62,31 @@ class DataStorage:
         
         # 準備數據 (GSD: Include all indicators to prevent None fields in dashboard)
         row = data.copy()
-        
+
+        # Normalize indicator types to ensure dashboard/backtest consistency
+        # fired/sqz_on/bull_align/bear_align -> int 0/1
+        for _bool_field in ("fired", "sqz_on", "bull_align", "bear_align"):
+            if _bool_field in row:
+                try:
+                    row[_bool_field] = 1 if bool(row[_bool_field]) else 0
+                except Exception:
+                    row[_bool_field] = 0
+
+        # regime -> string (avoid numeric or NaN types)
+        if 'regime' in row and row['regime'] is not None:
+            try:
+                row['regime'] = str(row['regime'])
+            except Exception:
+                row['regime'] = ''
+        else:
+            row['regime'] = ''
+
+        # score -> float (fallback 0.0)
+        try:
+            row['score'] = float(row.get('score', 0.0) or 0.0)
+        except Exception:
+            row['score'] = 0.0
+
         # Fix: Convert trading_day to string to prevent None/NaN in CSV
         if "trading_day" in row and row["trading_day"] is not None:
             td = row["trading_day"]
@@ -150,15 +174,20 @@ class DataStorage:
             print(f"寫入緩衝區失敗: {e}")
     
     def _save_trades_csv_append(self):
-        """使用追加模式儲存交易記錄為 CSV"""
+        """使用追加模式儲存交易記錄為 CSV
+        包含 cross_policy 欄位: allow_trade, orb_weight, vwap_weight, policy_reason
+        同步寫入 exports/trades 與 logs/market_data 以方便 dashboard/diagn斷讀取
+        """
         if not self.trade_buffer:
             return
         
         csv_file = self.trade_dir / f"{self.ticker}_{self.date_str}_trades.csv"
+        market_csv = self.market_dir / f"{self.ticker}_{self.date_str}_trades.csv"
         
         # 標準化欄位
         standardized = []
         for t in self.trade_buffer:
+            cp = t.get('cross_policy', {}) or {}
             std = {
                 'timestamp': t.get('timestamp', ''),
                 'type': t.get('type', ''),  # ENTRY, EXIT, PARTIAL_EXIT
@@ -168,6 +197,11 @@ class DataStorage:
                 'pnl_pts': t.get('pnl_pts', 0),
                 'pnl_cash': t.get('pnl_cash', 0),
                 'reason': t.get('reason', ''),  # STOP_LOSS, TAKE_PROFIT, VWAP, EOD
+                # Cross-policy fields (may be absent)
+                'allow_trade': cp.get('allow_trade', ''),
+                'orb_weight': cp.get('orb_weight', ''),
+                'vwap_weight': cp.get('vwap_weight', ''),
+                'policy_reason': cp.get('reason', '')
             }
             standardized.append(std)
         
@@ -176,6 +210,12 @@ class DataStorage:
         # 使用追加模式，只在檔案不存在時寫入標題
         header = not csv_file.exists()
         df.to_csv(csv_file, mode='a', index=False, header=header)
+        # 同步寫入 market_data 路徑
+        try:
+            header_m = not market_csv.exists()
+            df.to_csv(market_csv, mode='a', index=False, header=header_m)
+        except Exception:
+            pass
     
     def _save_trades(self):
         """儲存交易記錄為 JSON"""
@@ -183,15 +223,20 @@ class DataStorage:
             json.dump(self.trades, f, indent=2, ensure_ascii=False)
     
     def _save_trades_csv(self):
-        """儲存交易記錄為 CSV (回測格式)"""
+        """儲存交易記錄為 CSV (回測格式)
+        包含 cross_policy 欄位以便後續回測審計
+        同步寫入 exports/trades 與 logs/market_data
+        """
         if not self.trades:
             return
         
         csv_file = self.trade_dir / f"{self.ticker}_{self.date_str}_trades.csv"
+        market_csv = self.market_dir / f"{self.ticker}_{self.date_str}_trades.csv"
         
         # 標準化欄位
         standardized = []
         for t in self.trades:
+            cp = t.get('cross_policy', {}) or {}
             std = {
                 'timestamp': t.get('timestamp', ''),
                 'type': t.get('type', ''),  # ENTRY, EXIT, PARTIAL_EXIT
@@ -201,11 +246,22 @@ class DataStorage:
                 'pnl_pts': t.get('pnl_pts', 0),
                 'pnl_cash': t.get('pnl_cash', 0),
                 'reason': t.get('reason', ''),  # STOP_LOSS, TAKE_PROFIT, VWAP, EOD
+                # Cross-policy fields
+                'allow_trade': cp.get('allow_trade', ''),
+                'orb_weight': cp.get('orb_weight', ''),
+                'vwap_weight': cp.get('vwap_weight', ''),
+                'policy_reason': cp.get('reason', '')
             }
             standardized.append(std)
         
         df = pd.DataFrame(standardized)
+        # Write canonical exports file
         df.to_csv(csv_file, index=False)
+        # Also write to market_data for dashboard/diagnostics
+        try:
+            df.to_csv(market_csv, index=False)
+        except Exception:
+            pass
     
     def export_for_backtest(self):
         """
@@ -323,6 +379,7 @@ if __name__ == "__main__":
         'direction': 'LONG',
         'price': 32050,
         'lots': 1,
+        'cross_policy': {}
     })
     
     print("✓ 測試完成")

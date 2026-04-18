@@ -70,10 +70,19 @@ class FeedHealth:
             }
 
 
-def tick_dispatcher(futures_mon, options_mon):
-    """Safely dispatch futures and options ticks with shutdown protection."""
+def tick_dispatcher(futures_mon, options_mon, feed_health=None, tx_bar_builder=None):
+    """Dispatch futures and options ticks, update feed_health, and build TX bars when provided."""
     _seen_codes = set()
     _lock = threading.Lock()
+
+    def classify(code: str) -> str:
+        if not code:
+            return "OPTIONS"
+        if code.startswith(TX_PREFIXES):
+            return "TX"
+        if code.startswith(TMF_PREFIXES):
+            return "TMF"
+        return "OPTIONS"
     
     def on_tick(exchange, tick):
         # Safety checks
@@ -81,25 +90,49 @@ def tick_dispatcher(futures_mon, options_mon):
             return
         if tick is None or not hasattr(tick, 'code'):
             return
-        
+
+        code = getattr(tick, 'code', '') or ''
         try:
             with _lock:
-                if tick.code not in _seen_codes:
-                    _seen_codes.add(tick.code)
-                    console.print(f"[cyan]📥 New tick code: {tick.code} close={tick.close}[/cyan]")
+                if code not in _seen_codes:
+                    _seen_codes.add(code)
+                    try:
+                        close = getattr(tick, 'close', None)
+                        console.print(f"[cyan]📥 New tick code: {code} close={close}[/cyan]")
+                    except Exception:
+                        console.print(f"[cyan]📥 New tick code: {code}[/cyan]")
         except Exception as e:
             console.print(f"[red][tick tracking err] {e}[/red]")
-        
+
+        # Update feed health
+        try:
+            bucket = classify(code)
+            if feed_health is not None:
+                try:
+                    feed_health.mark_tick(bucket, code)
+                except Exception:
+                    pass
+        except Exception:
+            bucket = "OPTIONS"
+
+        # TX bar building (optional)
+        if bucket == "TX" and tx_bar_builder is not None:
+            try:
+                tx_bar_builder.on_tick(tick)
+            except Exception as e:
+                console.print(f"[red][tx tick err] {e}[/red]")
+
+        # Dispatch to monitors
         try:
             futures_mon.on_tick(exchange, tick)
         except Exception as e:
             console.print(f"[red][futures tick err] {e}[/red]")
-        
+
         try:
             options_mon.on_tick(exchange, tick)
         except Exception as e:
             console.print(f"[red][options tick err] {e}[/red]")
-    
+
     return on_tick
 
 
@@ -363,8 +396,15 @@ def run_system(dry_run=False):
             # Initialize feed health tracker
             feed_health = FeedHealth()
 
-            # Register tick/bidask callbacks with feed health
-            api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om, feed_health))
+            # Initialize TX bar builder for cross-regime (optional)
+            try:
+                from strategies.cross_regime import TxBarBuilder
+                tx_bar_builder = TxBarBuilder()
+            except Exception:
+                tx_bar_builder = None
+
+            # Register tick/bidask callbacks with feed health and tx builder
+            api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om, feed_health, tx_bar_builder))
             api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(fm, om))
 
             # Subscribe TMF tick
@@ -398,6 +438,7 @@ def run_system(dry_run=False):
             # Expose feed_health and tx_contract to monitors for policy gating
             fm.feed_health = feed_health
             fm.tx_contract = tx_contract
+            fm.tx_bar_builder = tx_bar_builder
 
         ft = threading.Thread(target=fm.run, name="futures", daemon=True)
         ot = threading.Thread(target=om.run, name="options", daemon=True)
@@ -451,7 +492,17 @@ def run_system(dry_run=False):
                         except NameError:
                             feed_health = FeedHealth()
 
-                        api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om, feed_health))
+                        # Ensure tx_bar_builder exists or create
+                        try:
+                            tx_bar_builder
+                        except NameError:
+                            try:
+                                from strategies.cross_regime import TxBarBuilder
+                                tx_bar_builder = TxBarBuilder()
+                            except Exception:
+                                tx_bar_builder = None
+
+                        api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om, feed_health, tx_bar_builder))
                         api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(fm, om))
 
                         if fm.contract is not None:

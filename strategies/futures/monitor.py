@@ -1087,6 +1087,7 @@ class FuturesMonitor:
                         "direction": "LONG" if event.side == OrderSide.BUY else "SHORT",
                         "pnl_pts": 0, "pnl_cash": 0, "friction_cost": 0,
                         "reason": getattr(self, "_last_entry_reason", "ORDER_MANAGER"),
+                        "cross_policy": getattr(self, '_last_cross_policy', None)
                     })
                 except Exception:
                     pass
@@ -1310,7 +1311,7 @@ class FuturesMonitor:
         save_trade({"type": signal, "timestamp": ts, "price": price, "lots": lots,
                     "direction": direction, "pnl_pts": round(pnl_pts, 1),
                     "pnl_cash": round(pnl_cash, 0), "friction_cost": round(friction_cost, 0),
-                    "reason": reason or ""})
+                    "reason": reason or "", "cross_policy": getattr(self, '_last_cross_policy', None)})
 
         # GSD Phase 0c: Entry diagnostic snapshot
         if signal in ("BUY", "SELL"):
@@ -1327,7 +1328,8 @@ class FuturesMonitor:
             save_trade({"type": "ENTRY_DIAG", "timestamp": ts, "signal": signal,
                         "price": price, "lots": lots, "direction": direction,
                         "reason": reason or "",
-                        "entry_diag": self._entry_features_futures})
+                        "entry_diag": self._entry_features_futures,
+                        "cross_policy": getattr(self, '_last_cross_policy', None)})
 
         # [GSD Phase B] Log outcome attribution
         if signal in ("EXIT", "PARTIAL_EXIT") and hasattr(self, "_entry_features_futures") and self._entry_features_futures:
@@ -1938,6 +1940,8 @@ class FuturesMonitor:
                 "tmf_regime": tmf_regime,
                 "cross_policy": policy,
             })
+            # Persist last cross policy for later use in order callbacks / audit
+            self._last_cross_policy = policy
             console.print(f"[dim][CROSS] tx={tx_regime} tmf={tmf_regime} allow={policy.get('allow_trade', False)} orb_w={policy.get('orb_weight', 0):.2f} vwap_w={policy.get('vwap_weight', 0):.2f} reason={policy.get('reason','')}[/dim]")
 
             if not policy.get('allow_trade', False):

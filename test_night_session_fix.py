@@ -101,7 +101,8 @@ def test_data_storage_optimization():
             'lots': 1,
             'pnl_pts': 0,
             'pnl_cash': 0,
-            'reason': 'TEST'
+            'reason': 'TEST',
+            'cross_policy': {}
         }
         
         storage.save_trade(test_trade)

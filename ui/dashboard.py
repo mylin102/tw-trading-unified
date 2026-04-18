@@ -904,16 +904,48 @@ def load_futures_indicators(full_history=False):
 
 @st.cache_data(ttl=5)
 def load_futures_trades():
-    # 使用交易記錄日期 (get_trade_day) 來尋找今天的交易記錄
-    for d in [FUTURES_TRADES]:
-        # 優先使用 TRADE_DATE_STR，如果找不到再嘗試 DATE_STR
-        for date_str in [TRADE_DATE_STR, DATE_STR]:
-            f = d / f"TMF_{date_str}_trades.csv"
-            if f.exists():
+    """Load today's futures trades CSV.
+    Preference order:
+      1. exports/trades TMF_{TRADE_DATE_STR}_trades.csv
+      2. exports/trades TMF_{DATE_STR}_trades.csv
+      3. logs/market_data TMF_{TRADE_DATE_STR}*_trades.csv
+      4. logs/market_data TMF_{DATE_STR}*_trades.csv
+    Returns a DataFrame or None.
+    """
+    import glob
+    # Try canonical exports location first
+    for date_str in [TRADE_DATE_STR, DATE_STR]:
+        f_exact = FUTURES_TRADES / f"TMF_{date_str}_trades.csv"
+        if f_exact.exists():
+            try:
+                return pd.read_csv(f_exact)
+            except Exception:
+                pass
+    # Fallback: search market_data for any matching pattern (prefer newest)
+    for date_str in [TRADE_DATE_STR, DATE_STR]:
+        pattern = str(FUTURES_MKT / f"TMF_{date_str}*trades.csv")
+        matches = glob.glob(pattern)
+        if matches:
+            # pick newest by mtime
+            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            for m in matches:
                 try:
-                    return pd.read_csv(f)
+                    return pd.read_csv(m)
                 except Exception:
-                    pass
+                    continue
+    # Final fallback: any TMF_*_trades.csv in exports/trades or market_data
+    try:
+        ex_matches = list(FUTURES_TRADES.glob("TMF_*_trades.csv"))
+        m_matches = list(FUTURES_MKT.glob("TMF_*_trades.csv"))
+        all_matches = ex_matches + m_matches
+        if all_matches:
+            latest = max(all_matches, key=os.path.getmtime)
+            try:
+                return pd.read_csv(latest)
+            except Exception:
+                pass
+    except Exception:
+        pass
     return None
 
 OPTIONS_SUB = "live_trading" if o_live else "paper_trading"
