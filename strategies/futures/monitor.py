@@ -73,6 +73,10 @@ class FuturesMonitor:
         self.contract = None
         self._running = False
 
+        # Compatibility placeholders for external integrations
+        self.feed_health = None
+        self.tx_bar_builder = None
+
         # Wrap injected api into ShioajiClient without re-login
         self.client = ShioajiClient.__new__(ShioajiClient)
         self.client.api = api
@@ -1780,28 +1784,52 @@ class FuturesMonitor:
             tmf_regime = "UNKNOWN"
             policy = None
             tx_bars_list = None
-            # Try to fetch TX 5m kline if client supports it
+
+            # Prefer in-memory TX bars built from live ticks when available
             try:
-                tx_df = None
-                if hasattr(self.client, 'get_kline'):
-                    tx_df = self.client.get_kline("TX", interval="5m")
-                if tx_df is not None and not tx_df.empty:
-                    tx_bars_list = [{
-                        "close": float(r.get("Close", 0)),
-                        "high": float(r.get("High", 0)),
-                        "low": float(r.get("Low", 0)),
-                    } for _, r in tx_df.tail(100).iterrows()]
+                if hasattr(self, 'tx_bar_builder') and self.tx_bar_builder is not None:
+                    tx_bars = self.tx_bar_builder.bars()
+                    if tx_bars and len(tx_bars) >= 20:
+                        tx_bars_list = [{
+                            "close": float(b.get("close", 0)),
+                            "high": float(b.get("high", 0)),
+                            "low": float(b.get("low", 0)),
+                        } for b in tx_bars[-100:]]
             except Exception:
                 tx_bars_list = None
 
+            # Fallback: try client kline if no live builder
+            if tx_bars_list is None:
+                try:
+                    tx_df = None
+                    if hasattr(self.client, 'get_kline'):
+                        tx_df = self.client.get_kline("TX", interval="5m")
+                    if tx_df is not None and not tx_df.empty:
+                        tx_bars_list = [{
+                            "close": float(r.get("Close", 0)),
+                            "high": float(r.get("High", 0)),
+                            "low": float(r.get("Low", 0)),
+                        } for _, r in tx_df.tail(100).iterrows()]
+                except Exception:
+                    tx_bars_list = None
+
             tmf_bars_list = bars_list if 'bars_list' in locals() else []
 
-            if hasattr(self, 'tx_detector') and self.tx_detector is not None and tx_bars_list:
+            if getattr(self, 'tx_detector', None) is not None and tx_bars_list:
                 tx_regime = self.tx_detector.detect(tx_bars_list)
-            if hasattr(self, 'tmf_detector') and self.tmf_detector is not None:
+            if getattr(self, 'tmf_detector', None) is not None:
                 tmf_regime = self.tmf_detector.detect(tmf_bars_list)
-            if hasattr(self, 'cross_engine') and self.cross_engine is not None:
-                policy = self.cross_engine.decide(tx_regime, tmf_regime)
+            if getattr(self, 'cross_engine', None) is not None:
+                # Cross engine supports freshness flags; use feed_health if present
+                tx_fresh = True
+                tmf_fresh = True
+                try:
+                    if hasattr(self, 'feed_health') and self.feed_health is not None:
+                        tx_fresh = self.feed_health.age('TX') <= FEED_STALE_SECS
+                        tmf_fresh = self.feed_health.age('TMF') <= FEED_STALE_SECS
+                except Exception:
+                    tx_fresh = tmf_fresh = True
+                policy = self.cross_engine.decide(tx_regime, tmf_regime, tx_fresh=tx_fresh, tmf_fresh=tmf_fresh)
             else:
                 policy = {"allow_trade": True, "orb_weight": 1.0, "vwap_weight": 1.0}
 
@@ -1810,10 +1838,10 @@ class FuturesMonitor:
                 "tmf_regime": tmf_regime,
                 "cross_policy": policy,
             })
-            console.print(f"[dim][CROSS] tx={tx_regime} tmf={tmf_regime} allow={policy.get('allow_trade', False)} orb_w={policy.get('orb_weight', 0):.2f} vwap_w={policy.get('vwap_weight', 0):.2f}[/dim]")
+            console.print(f"[dim][CROSS] tx={tx_regime} tmf={tmf_regime} allow={policy.get('allow_trade', False)} orb_w={policy.get('orb_weight', 0):.2f} vwap_w={policy.get('vwap_weight', 0):.2f} reason={policy.get('reason','')}[/dim]")
 
             if not policy.get('allow_trade', False):
-                console.print(f"[yellow]🔒 CrossPolicy: trading disabled by tx={tx_regime} tmf={tmf_regime}[/yellow]")
+                console.print(f"[yellow]🔒 CrossPolicy: trading disabled by tx={tx_regime} tmf={tmf_regime} reason={policy.get('reason','')}[/yellow]")
                 score = 0.0
             else:
                 mult = max(0.5, min(1.3, 0.6 * policy.get('orb_weight', 1.0) + 0.4 * policy.get('vwap_weight', 1.0)))
