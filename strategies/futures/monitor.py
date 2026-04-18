@@ -221,6 +221,29 @@ class FuturesMonitor:
             }, index=[r["ts"] for r in records])
         return self._tick_bars_cache if self._tick_bars_cache is not None else pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
 
+    def _bars_time_aligned(self, tx_bars, df_5m):
+        """Check that the latest TX bar and TMF 5m bar share the same timestamp bucket.
+
+        Args:
+            tx_bars (list[dict]): list of tx bars from TxBarBuilder.bars()
+            df_5m (pd.DataFrame): processed 5m dataframe for TMF
+
+        Returns:
+            bool: True if aligned, False otherwise
+        """
+        try:
+            if not tx_bars or df_5m is None or len(df_5m) == 0:
+                return False
+            tx_last = tx_bars[-1].get("ts")
+            if tx_last is None:
+                return False
+            # df_5m index's last timestamp
+            tmf_last = df_5m.index[-1]
+            # Compare normalized timestamps (both are pandas.Timestamp)
+            return pd.Timestamp(tx_last) == pd.Timestamp(tmf_last)
+        except Exception:
+            return False
+
     def setup(self):
         # ── GSD: Initialize Strategy Registry ────────────────────────
         self._registry = StrategyRegistry()
@@ -1814,6 +1837,29 @@ class FuturesMonitor:
                     tx_bars_list = None
 
             tmf_bars_list = bars_list if 'bars_list' in locals() else []
+
+            # If we have TX bars built from ticks, ensure time alignment with TMF 5m bars
+            try:
+                if tx_bars_list and df_5m is not None:
+                    aligned = self._bars_time_aligned(tx_bars_list, df_5m)
+                    if not aligned:
+                        console.print(f"[yellow][CROSS] tx/tmf bars not time-aligned (skip cross-regime) [/yellow]")
+                        # Skip cross-regime gating to avoid misaligned decisions
+                        policy = {"allow_trade": True, "orb_weight": 1.0, "vwap_weight": 1.0}
+                        tx_regime = "UNKNOWN"
+                        tmf_regime = "UNKNOWN"
+                        # Continue without invoking cross_engine
+                        # Fallthrough to attach context below
+                        self._last_bar_context.update({
+                            "tx_regime": tx_regime,
+                            "tmf_regime": tmf_regime,
+                            "cross_policy": policy,
+                        })
+                        console.print(f"[dim][CROSS] Skipped cross-regime due to misalignment[/dim]")
+                        # Proceed with reduced policy (no gating)
+                    
+            except Exception:
+                pass
 
             if getattr(self, 'tx_detector', None) is not None and tx_bars_list:
                 tx_regime = self.tx_detector.detect(tx_bars_list)
