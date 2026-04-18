@@ -153,6 +153,13 @@ class FuturesMonitor:
 
         self.last_tick_at = time.time()  # [gstack] 數據新鮮度追蹤
 
+        # Adaptive engine (lightweight regime/threshold adapter)
+        try:
+            from strategies.adaptive_engine import AdaptiveEngine
+            self.adaptive = AdaptiveEngine()
+        except Exception:
+            self.adaptive = None
+
         # GSD Phase 0d: Hourly no-trade audit tracking
         self._last_trade_ts = None       # timestamp of last trade
         self._bars_since_trade = 0       # bars since last trade
@@ -1722,6 +1729,40 @@ class FuturesMonitor:
 
         df_5m = processed["5m"]
         
+        # Adaptive engine: detect regime, adjust thresholds and weights
+        try:
+            bars_list = []
+            # build simple list of dicts for adaptive engine
+            for _, r in df_5m.tail(100).iterrows():
+                bars_list.append({
+                    "close": float(r.get("Close", 0)),
+                    "high": float(r.get("High", 0)),
+                    "low": float(r.get("Low", 0)),
+                })
+            if hasattr(self, 'adaptive') and self.adaptive is not None:
+                adaptive_regime = self.adaptive.detect_regime(bars_list)
+                base_orb = self.STRATEGY.get("base_orb", 0.6)
+                base_vwap = self.STRATEGY.get("base_vwap", 0.8)
+                orb_th, vwap_th = self.adaptive.adjust_threshold(base_orb, base_vwap, bars_list)
+                orb_w, vwap_w = self.adaptive.strategy_weight()
+                # Compute a conservative boost factor for score
+                boost = 1.0 + (((orb_w - 0.5) + (vwap_w - 0.5)) * 0.2)
+                boost = max(0.7, min(boost, 1.3))
+                # Attach adaptive info to context
+                self._last_bar_context.update({
+                    "adaptive_regime": adaptive_regime,
+                    "adaptive_orb_th": float(orb_th),
+                    "adaptive_vwap_th": float(vwap_th),
+                    "adaptive_orb_w": float(orb_w),
+                    "adaptive_vwap_w": float(vwap_w),
+                    "adaptive_boost": float(boost),
+                })
+                console.print(f"[dim][ADAPTIVE] regime={adaptive_regime} orb_th={orb_th:.2f} vwap_th={vwap_th:.2f} orb_w={orb_w:.2f} vwap_w={vwap_w:.2f} boost={boost:.2f}[/dim]")
+                # Apply boost to score (conservative scaling)
+                score = float(score) * boost
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Adaptive engine failed: {e}[/yellow]")
+
         # [GSD 4.13] Trading Readiness Unlock: only allow trading if we have enough bars for indicators
         if not self.is_trading_ready and len(df_5m) >= self.STRATEGY.get("length", 20):
             self.is_trading_ready = True
