@@ -1,3 +1,0 @@
-timestamp,session,mtx_code,mtx_close,call_code,call_close,call_bid,call_ask,put_code,put_close,put_bid,put_ask,position,side,entry_price,stop_loss,score,trend
-2026-04-13 13:45:22,1,MXFD6,35454.0,TXO35400D6,333.0,331.0,335.0,TXO35400P6,275.0,272.0,280.0,0,,0.0,0.0,-66.66666666666669,BEAR
-2026-04-13 13:45:33,1,MXFD6,35454.0,TXO35500D6,276.0,276.0,281.0,TXO35500P6,321.0,316.0,324.0,0,,0.0,0.0,-100.00000000000003,BEAR
