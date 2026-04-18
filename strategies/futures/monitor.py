@@ -160,6 +160,17 @@ class FuturesMonitor:
         except Exception:
             self.adaptive = None
 
+        # Cross-regime: TX / TMF detectors and policy engine
+        try:
+            from strategies.cross_regime import RegimeDetector, TMFLocalDetector, CrossRegimeEngine
+            self.tx_detector = RegimeDetector()
+            self.tmf_detector = TMFLocalDetector()
+            self.cross_engine = CrossRegimeEngine()
+        except Exception:
+            self.tx_detector = None
+            self.tmf_detector = None
+            self.cross_engine = None
+
         # GSD Phase 0d: Hourly no-trade audit tracking
         self._last_trade_ts = None       # timestamp of last trade
         self._bars_since_trade = 0       # bars since last trade
@@ -1762,6 +1773,53 @@ class FuturesMonitor:
                 score = float(score) * boost
         except Exception as e:
             console.print(f"[yellow]⚠️ Adaptive engine failed: {e}[/yellow]")
+
+        # Cross-regime decision (TX macro + TMF local)
+        try:
+            tx_regime = "UNKNOWN"
+            tmf_regime = "UNKNOWN"
+            policy = None
+            tx_bars_list = None
+            # Try to fetch TX 5m kline if client supports it
+            try:
+                tx_df = None
+                if hasattr(self.client, 'get_kline'):
+                    tx_df = self.client.get_kline("TX", interval="5m")
+                if tx_df is not None and not tx_df.empty:
+                    tx_bars_list = [{
+                        "close": float(r.get("Close", 0)),
+                        "high": float(r.get("High", 0)),
+                        "low": float(r.get("Low", 0)),
+                    } for _, r in tx_df.tail(100).iterrows()]
+            except Exception:
+                tx_bars_list = None
+
+            tmf_bars_list = bars_list if 'bars_list' in locals() else []
+
+            if hasattr(self, 'tx_detector') and self.tx_detector is not None and tx_bars_list:
+                tx_regime = self.tx_detector.detect(tx_bars_list)
+            if hasattr(self, 'tmf_detector') and self.tmf_detector is not None:
+                tmf_regime = self.tmf_detector.detect(tmf_bars_list)
+            if hasattr(self, 'cross_engine') and self.cross_engine is not None:
+                policy = self.cross_engine.decide(tx_regime, tmf_regime)
+            else:
+                policy = {"allow_trade": True, "orb_weight": 1.0, "vwap_weight": 1.0}
+
+            self._last_bar_context.update({
+                "tx_regime": tx_regime,
+                "tmf_regime": tmf_regime,
+                "cross_policy": policy,
+            })
+            console.print(f"[dim][CROSS] tx={tx_regime} tmf={tmf_regime} allow={policy.get('allow_trade', False)} orb_w={policy.get('orb_weight', 0):.2f} vwap_w={policy.get('vwap_weight', 0):.2f}[/dim]")
+
+            if not policy.get('allow_trade', False):
+                console.print(f"[yellow]🔒 CrossPolicy: trading disabled by tx={tx_regime} tmf={tmf_regime}[/yellow]")
+                score = 0.0
+            else:
+                mult = max(0.5, min(1.3, 0.6 * policy.get('orb_weight', 1.0) + 0.4 * policy.get('vwap_weight', 1.0)))
+                score = float(score) * mult
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Cross-regime integration failed: {e}[/yellow]")
 
         # [GSD 4.13] Trading Readiness Unlock: only allow trading if we have enough bars for indicators
         if not self.is_trading_ready and len(df_5m) >= self.STRATEGY.get("length", 20):

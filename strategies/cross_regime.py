@@ -1,0 +1,89 @@
+import numpy as np
+
+class RegimeDetector:
+    def __init__(self):
+        pass
+
+    def detect(self, bars, slope_trend=0.8, low_vol_th=5.0):
+        if not bars or len(bars) < 20:
+            return "UNKNOWN"
+        closes = np.array([b.get("close", 0) for b in bars[-20:]], dtype=float)
+        highs = np.array([b.get("high", 0) for b in bars[-20:]], dtype=float)
+        lows = np.array([b.get("low", 0) for b in bars[-20:]], dtype=float)
+        vol = float(np.mean(highs - lows)) if len(highs) > 0 else 0.0
+        x = np.arange(len(closes))
+        try:
+            slope = float(np.polyfit(x, closes, 1)[0])
+        except Exception:
+            slope = 0.0
+        if vol < low_vol_th:
+            return "LOW_VOL"
+        if slope > slope_trend:
+            return "TREND_UP"
+        if slope < -slope_trend:
+            return "TREND_DOWN"
+        return "CHOP"
+
+class TMFLocalDetector:
+    def __init__(self):
+        pass
+
+    def detect(self, bars):
+        if not bars or len(bars) < 20:
+            return "UNKNOWN"
+        closes = np.array([b.get("close", 0) for b in bars[-20:]], dtype=float)
+        highs = np.array([b.get("high", 0) for b in bars[-20:]], dtype=float)
+        lows = np.array([b.get("low", 0) for b in bars[-20:]], dtype=float)
+        recent_range = float(np.mean(highs[-5:] - lows[-5:])) if len(highs) >= 5 else float(np.mean(highs - lows))
+        full_range = float(np.mean(highs - lows)) if len(highs) > 0 else 0.0
+        last_close = float(closes[-1])
+        recent_high = float(np.max(highs[-5:])) if len(highs) >= 5 else float(np.max(highs))
+        recent_low = float(np.min(lows[-5:])) if len(lows) >= 5 else float(np.min(lows))
+        if full_range < 5:
+            return "STALLED"
+        if last_close >= recent_high * 0.999 or last_close <= recent_low * 1.001:
+            return "BREAKOUT_READY"
+        return "MEAN_REVERT"
+
+class CrossRegimeEngine:
+    def __init__(self):
+        pass
+
+    def decide(self, tx_regime, tmf_regime):
+        result = {
+            "allow_trade": False,
+            "orb_weight": 0.0,
+            "vwap_weight": 0.0,
+            "orb_threshold": 0.60,
+            "vwap_threshold": 0.80,
+        }
+        if tx_regime in ("UNKNOWN", "LOW_VOL") or tmf_regime in ("UNKNOWN", "STALLED"):
+            return result
+        if tx_regime in ("TREND_UP", "TREND_DOWN") and tmf_regime == "BREAKOUT_READY":
+            result.update({
+                "allow_trade": True,
+                "orb_weight": 1.0,
+                "vwap_weight": 0.2,
+                "orb_threshold": 0.50,
+                "vwap_threshold": 0.95,
+            })
+            return result
+        if tx_regime == "CHOP" and tmf_regime == "BREAKOUT_READY":
+            result.update({
+                "allow_trade": True,
+                "orb_weight": 0.4,
+                "vwap_weight": 0.8,
+                "orb_threshold": 0.72,
+                "vwap_threshold": 0.75,
+            })
+            return result
+        if tx_regime == "CHOP" and tmf_regime == "MEAN_REVERT":
+            result.update({
+                "allow_trade": True,
+                "orb_weight": 0.2,
+                "vwap_weight": 1.0,
+                "orb_threshold": 0.90,
+                "vwap_threshold": 0.65,
+            })
+            return result
+        return result
