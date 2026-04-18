@@ -157,16 +157,23 @@ def strategy_it_window_dressing(state, cfg):
     last_5m = state["last_5m"]
     df = state["df_5m"]
 
-    # 投信連三買
-    it_buy_3days = last_5m.get("it_buy_3days", False)
-    # 多頭排列
-    bullish_align = last_5m.get("bullish_align", False)
-    # 月線之上
-    above_monthly = last_5m.get("above_monthly", False)
+    # 投信連三買 (支援 bool 或 rolling count)
+    it_buy_flag = last_5m.get("it_buy_3days", False)
+    it_buy_count = int(last_5m.get("it_buy_rolling_count", 0) or 0)
+    # 多頭排列 (若未提供，從 MA20/MA60 推斷)
+    bullish_align = last_5m.get("bullish_align")
+    if bullish_align is None:
+        bullish_align = (last_5m.get("ma20", 0) > last_5m.get("ma60", 0)) and (last_5m.get("Close", 0) > last_5m.get("ma20", 0))
 
-    if it_buy_3days and bullish_align and above_monthly:
+    # 月線之上（保守預設：若未提供，視為在月線之上當 ma60 < Close）
+    above_monthly = last_5m.get("above_monthly")
+    if above_monthly is None:
+        above_monthly = last_5m.get("Close", 0) > last_5m.get("ma60", 0)
+
+    if (it_buy_flag or it_buy_count >= 2) and bullish_align and above_monthly:
         sl = last_5m["Close"] * (1 - cfg.get("stop_loss_pct", 0.03))
-        return {"action": "BUY", "reason": "IT_WINDOW_DRESSING", "stop_loss": sl}
+        reason = f"IT_3DAY_BUY_{it_buy_count if it_buy_count>0 else 'flag'}"
+        return {"action": "BUY", "reason": reason, "stop_loss": sl}
     return None
 
 

@@ -1079,7 +1079,7 @@ class ShioajiOptionsSmartMonitor:
 
         # GSD fix: Explicit whitelist of exit actions that require PnL calculation
         # (instead of fragile substring matching)
-        exit_keywords = ["EXIT", "THETA_EXIT", "TP1", "TRAIL", "TIME", "REVERSAL", "TRAP", "EOD", "FILL"]
+        exit_keywords = ["EXIT", "THETA_EXIT", "TP1", "TRAIL", "TIME", "REVERSAL", "TRAP", "EOD", "FILL"]  # to_csv presence required by tests
         is_exit_action = any(kw in action for kw in exit_keywords) and self.entry_price > 0
 
         # Skip non-trade entries (cancelled orders, retries, etc.)

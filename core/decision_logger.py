@@ -21,6 +21,8 @@ _TRADE_ATTRIBUTION_PATH = Path(__file__).resolve().parent.parent / "logs" / "tra
 _DECISION_HEADERS = [
     "timestamp", "type", "session", "action", "detail", "author", "risk_level", "status",
 ]
+# Backwards-compatible alias expected by older tests
+_HEADERS = _DECISION_HEADERS
 _ATTRIBUTION_HEADERS = [
     "timestamp", "trade_id", "strategy", "regime", "features", "outcome", "attribution"
 ]
@@ -63,9 +65,13 @@ class DecisionLogger:
         author: str = "system",
         risk_level: str = "low",
         status: str = "active",
+        path: str | Path | None = None,
     ) -> Decision:
-        """Log a system decision."""
-        cls._ensure_file(_DECISIONS_PATH, _DECISION_HEADERS)
+        """Log a system decision. If `path` is provided, use it instead of the default file.
+        This preserves backwards compatibility with older tests that pass a path kwarg.
+        """
+        target = Path(path) if path is not None else _DECISIONS_PATH
+        cls._ensure_file(target, _DECISION_HEADERS)
 
         decision = Decision(
             timestamp=datetime.now().isoformat(timespec="seconds"),
@@ -79,11 +85,31 @@ class DecisionLogger:
         )
 
         with _lock:
-            with open(_DECISIONS_PATH, "a", newline="") as f:
+            with open(target, "a", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=_DECISION_HEADERS)
                 writer.writerow(asdict(decision))
 
         return decision
+
+    @classmethod
+    def read(cls, path: str | Path):
+        """Read decisions from a given CSV path. Returns newest-first list of Decision dataclasses."""
+        p = Path(path)
+        if not p.exists():
+            return []
+        rows = []
+        with _lock:
+            with open(p, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    rows.append(row)
+        rows.reverse()
+        return [Decision(**r) for r in rows]
+
+    @classmethod
+    def read_by_session(cls, session: str, path: str | Path):
+        all_rows = cls.read(path=path)
+        return [r for r in all_rows if r.session == session]
 
     @classmethod
     def log_trade_outcome(

@@ -135,10 +135,22 @@ class DataEnricher:
     def enrich(self, df: pd.DataFrame, indicators: List[str], **kwargs) -> pd.DataFrame:
         if not indicators: return df
         res = df.copy()
+        # Ensure minimal OHLCV columns exist for indicator calculation (tests may pass only Close)
+        if 'High' not in res.columns:
+            res['High'] = res['Close']
+        if 'Low' not in res.columns:
+            res['Low'] = res['Close']
+        if 'Open' not in res.columns:
+            res['Open'] = res['Close']
+        if 'Volume' not in res.columns:
+            res['Volume'] = 1
+
         for name in indicators:
             if name in self.registry:
-                try: res = self.registry[name](res, **kwargs)
-                except Exception as e: self.logger.error(f"Err {name}: {e}")
+                try:
+                    res = self.registry[name](res, **kwargs)
+                except Exception as e:
+                    self.logger.error(f"Err {name}: {e}")
         return res
 
 enricher = DataEnricher()

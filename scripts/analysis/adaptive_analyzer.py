@@ -66,37 +66,45 @@ class AdaptiveAnalyzer:
         # Track open positions to link exits back to entry reasons
         open_positions = {} # key: ticker, value: entry_reason
         
-        # Sort by timestamp to process sequentially
-        df = enriched_df.sort_values('timestamp')
+        # Ensure we have a timestamp column to sort by (tests may provide index-only DataFrames)
+        df = enriched_df.copy()
+        if 'timestamp' not in df.columns:
+            # If index is datetime-like, use it. Otherwise create a monotonic placeholder index.
+            if isinstance(df.index, pd.DatetimeIndex):
+                df['timestamp'] = df.index
+            else:
+                df['timestamp'] = pd.to_datetime(pd.Series(pd.RangeIndex(len(df))))
+        df = df.sort_values('timestamp')
         
         for _, row in df.iterrows():
             ticker = self.ticker
-            etype = str(row['type'])
-            reason = str(row['reason'])
-            direction = str(row['direction'])
-            
-            if etype == 'BUY' or etype == 'SELL':
-                # Determine if this is an ENTRY (from 0 pos) or just increasing pos
-                # For simplified logic, we assume first BUY/SELL after flat is ENTRY
-                # Real implementation would check self.trader.position
+            etype = str(row.get('type', '')).upper()
+            reason = str(row.get('reason', 'UNKNOWN'))
+            direction = str(row.get('direction', ''))
+
+            # Normalize ENTRY/EXIT terms used in different data sources
+            is_entry = etype in ('BUY', 'SELL', 'ENTRY')
+            is_exit = 'EXIT' in etype or etype == 'CLOSE'
+
+            if is_entry:
+                # Treat first entry after flat as position opener
                 if ticker not in open_positions:
                     open_positions[ticker] = reason
-            
-            elif 'EXIT' in etype:
+
+            elif is_exit:
                 entry_reason = open_positions.get(ticker, "UNKNOWN")
                 if entry_reason not in summary:
                     summary[entry_reason] = {"count": 0, "exits": 0, "total_pnl": 0.0, "wins": 0}
-                
+
                 summary[entry_reason]["count"] += 1
                 summary[entry_reason]["exits"] += 1
                 pnl = float(row.get('pnl_cash', 0))
                 summary[entry_reason]["total_pnl"] += pnl
                 if pnl > 0:
                     summary[entry_reason]["wins"] += 1
-                
-                # Close position
-                if etype == 'EXIT':
-                    open_positions.pop(ticker, None)
+
+                # Close position record
+                open_positions.pop(ticker, None)
 
         # Finalize stats
         for r in summary:

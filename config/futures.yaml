@@ -19,6 +19,7 @@ monitoring:
   data_mode: hybrid
   pb_confirmation_bars: 12
   poll_interval_secs: 30
+  require_tx: true
 risk_mgmt:
   atr_length: 14
   atr_multiplier: 1.8

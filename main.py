@@ -11,6 +11,8 @@ import signal
 import argparse
 import threading
 from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Dict
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -30,6 +32,42 @@ RESTART_WINDOW_SECS = 300  # 5 minutes
 
 # macOS graceful shutdown flag
 _shutdown_event = threading.Event()
+
+# Feed health tracking (TX/TMF/OPTIONS)
+TX_PREFIXES = ("TXF", "TX", "TXO")
+TMF_PREFIXES = ("TMF",)
+FEED_STALE_SECS = 120
+FEED_WARN_SECS = 45
+
+@dataclass
+class FeedHealth:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    last_tick_ts: Dict[str, float] = field(default_factory=lambda: {
+        "TX": 0.0,
+        "TMF": 0.0,
+        "OPTIONS": 0.0,
+    })
+    last_tick_code: Dict[str, str] = field(default_factory=dict)
+
+    def mark_tick(self, bucket: str, code: str):
+        now = time.time()
+        with self.lock:
+            self.last_tick_ts[bucket] = now
+            self.last_tick_code[bucket] = code
+
+    def age(self, bucket: str) -> float:
+        with self.lock:
+            ts = self.last_tick_ts.get(bucket, 0.0)
+        if ts <= 0:
+            return float("inf")
+        return time.time() - ts
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "ages": {k: (float("inf") if v <= 0 else time.time() - v) for k, v in self.last_tick_ts.items()},
+                "codes": dict(self.last_tick_code),
+            }
 
 
 def tick_dispatcher(futures_mon, options_mon):
@@ -227,6 +265,58 @@ def _resubscribe_all(api, fm, om):
         console.print(f"[red]❌ Resubscribe failed: {e}[/red]")
 
 
+def resolve_tx_contract(api):
+    """Resolve a nearest-month TX contract conservatively (fallbacks)."""
+    try:
+        futures = getattr(api, 'Contracts', None)
+        if futures is None:
+            return None
+        futs = getattr(futures, 'Futures', None)
+        if futs is None:
+            return None
+        # Try common keys
+        for key in ("TXF", "TX"):
+            node = getattr(futs, key, None)
+            if node is None:
+                continue
+            # If mapping-like
+            if hasattr(node, 'items'):
+                for _, con in node.items():
+                    return con
+            # Try common attributes
+            for attr in ("near_month", "current", "front"):
+                con = getattr(node, attr, None)
+                if con is not None:
+                    return con
+        # As a final fallback, try iterating an attribute list
+        try:
+            if hasattr(futs, '__iter__'):
+                for part in futs:
+                    try:
+                        for c in part:
+                            return c
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+
+
+def feeds_are_fresh(feed_health, require_tx=True, require_tmf=True):
+    snap = feed_health.snapshot()
+    ages = snap.get('ages', {})
+    problems = []
+    tmf_age = ages.get('TMF', float('inf'))
+    tx_age = ages.get('TX', float('inf'))
+    if require_tmf and tmf_age > FEED_STALE_SECS:
+        problems.append(f"TMF stale: {tmf_age:.0f}s")
+    if require_tx and tx_age > FEED_STALE_SECS:
+        problems.append(f"TX stale: {tx_age:.0f}s")
+    return (len(problems) == 0), problems, snap
+
+
 def run_system(dry_run=False):
     """運行交易系統，遇到斷線或重啟請求時結束進程，由外部腳本重新拉起"""
     # 啟動時立即清除重啟旗標，避免循環重啟
@@ -270,13 +360,28 @@ def run_system(dry_run=False):
 
         if api is not None:
             import shioaji as sj
-            api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om))
+            # Initialize feed health tracker
+            feed_health = FeedHealth()
+
+            # Register tick/bidask callbacks with feed health
+            api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om, feed_health))
             api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(fm, om))
 
             # Subscribe TMF tick
             if fm.contract is not None:
                 api.quote.subscribe(fm.contract, quote_type='tick')
                 console.print(f"[green]📡 Subscribed TMF tick: {fm.contract.code}[/green]")
+
+            # Subscribe TX tick for cross-regime / freshness
+            tx_contract = resolve_tx_contract(api)
+            if tx_contract is not None:
+                try:
+                    api.quote.subscribe(tx_contract, quote_type='tick')
+                    console.print(f"[green]📡 Subscribed TX tick: {tx_contract.code}[/green]")
+                except Exception as e:
+                    console.print(f"[yellow]⚠️ TX subscribe failed: {e}[/yellow]")
+            else:
+                console.print("[yellow]⚠️ TX contract not resolved; cross-regime freshness will be degraded[/yellow]")
 
             # Subscribe options
             for key in ["MTX", "C", "P"]:
@@ -289,6 +394,10 @@ def run_system(dry_run=False):
             # [P0 Fix] Setup connection event monitoring
             _setup_event_callback(api, fm, om)
             console.print("[green]✅ Connection event callback registered[/green]")
+
+            # Expose feed_health and tx_contract to monitors for policy gating
+            fm.feed_health = feed_health
+            fm.tx_contract = tx_contract
 
         ft = threading.Thread(target=fm.run, name="futures", daemon=True)
         ot = threading.Thread(target=om.run, name="options", daemon=True)
@@ -336,11 +445,26 @@ def run_system(dry_run=False):
                     # Re-subscribe
                     if api is not None:
                         import shioaji as sj
-                        api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om))
+                        # Reuse existing feed_health if present, else create
+                        try:
+                            feed_health
+                        except NameError:
+                            feed_health = FeedHealth()
+
+                        api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om, feed_health))
                         api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(fm, om))
 
                         if fm.contract is not None:
                             api.quote.subscribe(fm.contract, quote_type='tick')
+
+                        # Re-resolve and subscribe TX
+                        tx_contract = resolve_tx_contract(api)
+                        if tx_contract is not None:
+                            try:
+                                api.quote.subscribe(tx_contract, quote_type='tick')
+                                console.print(f"[green]📡 Re-Subscribed TX tick: {tx_contract.code}[/green]")
+                            except Exception as e:
+                                console.print(f"[yellow]⚠️ Re-subscribe TX failed: {e}[/yellow]")
 
                         om.monitor.find_best_contracts()
                         om.monitor.pre_fill_bars()
@@ -392,9 +516,46 @@ def run_system(dry_run=False):
 
             now = time.time()
             if not dry_run and now > startup_grace_until and now > health_check_at:
+                # 1) API session health
                 if not api_is_healthy(api):
                     console.print("[red]💀 Shioaji session dead — exiting for external supervisor[/red]")
                     break
+
+                # 2) Feed freshness health
+                # require_tx controlled by futures monitoring config (monitoring.require_tx)
+                try:
+                    require_tx = bool(getattr(fm, 'MONITOR', {}).get('require_tx', True))
+                except Exception:
+                    require_tx = False
+                try:
+                    require_tmf = True if fm.contract is not None else False
+                except Exception:
+                    require_tmf = False
+
+                ok, problems, snap = feeds_are_fresh(feed_health, require_tx=require_tx, require_tmf=require_tmf)
+                ages = snap.get('ages', {})
+                console.print(
+                    "[dim]"
+                    f"feed health | TX={ages.get('TX', float('inf')):.0f}s "
+                    f"TMF={ages.get('TMF', float('inf')):.0f}s "
+                    f"OPT={ages.get('OPTIONS', float('inf')):.0f}s"
+                    "[/dim]"
+                )
+
+                # Warn before critical
+                if snap['ages'].get('TMF', float('inf')) > FEED_WARN_SECS:
+                    console.print(f"[yellow]Warning: TMF feed quiet for {snap['ages'].get('TMF', 0):.0f}s[/yellow]")
+                if require_tx and snap['ages'].get('TX', float('inf')) > FEED_WARN_SECS:
+                    console.print(f"[yellow]Warning: TX feed quiet for {snap['ages'].get('TX', 0):.0f}s[/yellow]")
+
+                if not ok:
+                    console.print(
+                        "[bold red]Feed stale — exiting for external supervisor: "
+                        + "; ".join(problems)
+                        + "[/bold red]"
+                    )
+                    break
+
                 health_check_at = now + HEALTH_INTERVAL
             time.sleep(2)
 

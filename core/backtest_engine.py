@@ -216,6 +216,9 @@ class BacktestEngine:
                 ctx = StrategyContext(market=MarketData(last_bar=bar, df_5m=df.iloc[max(0, i-100):i+1], regime=current_regime), 
                                     position=self._get_position_view(ticker), config=config, bar_counter=i)
                 sig = strategy.on_bar(ctx)
+                # Debug: log returned signal
+                if sig is not None:
+                    self.logger.debug(f"Signal returned at i={i}: {sig}")
                 
                 # ── [GSD Upgrade] Entry Edge Filter ───────────────────────
                 if sig and sig.action in ["BUY", "SELL"] and ticker not in self.positions:
@@ -236,14 +239,21 @@ class BacktestEngine:
                     }
                     # Squeeze strategies often provide score, others might need proxy
                     score = abs(getattr(sig, "score", 50))
-                    edge_res = edge_model.evaluate(score, edge_context, strategy.name)
-                    
-                    # Record for diagnostics
-                    edge_diag.record_decision(strategy.name, edge_res["edge_score"], edge_res["is_exploring"], edge_res["features"])
-                    
-                    if not edge_res["has_edge"]:
-                        sig = None # Block the entry
+                    # Only apply edge model when strategy opts in via metadata
+                    if strategy.metadata.get("use_edge_model", False):
+                        edge_res = edge_model.evaluate(score, edge_context, strategy.name)
+                        self.logger.debug(f"edge_res at i={i}: {edge_res}")
+                        # Record for diagnostics
+                        edge_diag.record_decision(strategy.name, edge_res["edge_score"], edge_res["is_exploring"], edge_res["features"])
+                        if not edge_res["has_edge"]:
+                            self.logger.debug("entry blocked by edge model")
+                            sig = None # Block the entry
+                        else:
+                            self.logger.debug("entry allowed by edge model")
                     else:
+                        # Default: no filtering
+                        edge_res = {"has_edge": True, "edge_score": 1.0, "pos_scale": 1.0, "is_exploring": False, "features": {}, "rank": "BYPASS"}
+                        edge_diag.record_decision(strategy.name, edge_res["edge_score"], edge_res["is_exploring"], edge_res["features"]) 
                         # [GSD Upgrade] Apply Dynamic Position Scaling
                         base_qty = getattr(sig, "quantity", 1)
                         sig.quantity = max(1, round(base_qty * edge_res["pos_scale"]))
@@ -264,13 +274,18 @@ class BacktestEngine:
         return PositionView(size=pos.qty, entry_price=pos.entry_price)
 
     def _execute_signal(self, ticker: str, signal: Signal, price: float, ts: datetime):
+        self.logger.debug(f"_execute_signal called for {ticker} action={signal.action} price={price} cash={self.cash}")
         if signal.action in ["BUY", "SELL"] and ticker not in self.positions:
             # GSD: Support dynamic sizing from Signal
             qty = getattr(signal, "quantity", 1)
-            if qty <= 0: return
+            self.logger.debug(f"attempting entry qty={qty}")
+            if qty <= 0:
+                self.logger.debug("qty <= 0, abort")
+                return
             
             cost = self._calculate_cost(price, qty, is_entry=True)
             margin = qty * self.profile.margin_per_lot if self.profile.asset_type == AssetType.FUTURES else price * qty * self.profile.point_value
+            self.logger.debug(f"cost={cost} margin={margin}")
             if self.cash >= margin + cost:
                 self.cash -= (margin + cost)
                 self.positions[ticker] = BacktestPosition(
@@ -280,7 +295,11 @@ class BacktestEngine:
                     trail_points=signal.trail_points
                 )
                 self.trade_log.append({"timestamp": ts, "ticker": ticker, "action": signal.action, "price": price, "qty": qty, "reason": signal.reason, "pnl": 0.0})
+                self.logger.debug("entry executed")
+            else:
+                self.logger.debug("insufficient cash for entry")
         elif signal.action == "EXIT" and ticker in self.positions:
+            self.logger.debug("executing exit")
             pos = self.positions.pop(ticker)
             cost, mult = self._calculate_cost(price, abs(pos.qty), is_entry=False), self.profile.point_value
             raw_pnl = (price - pos.entry_price) * pos.qty * mult
@@ -310,6 +329,7 @@ class BacktestEngine:
                 )
 
             self.trade_log.append({"timestamp": ts, "ticker": ticker, "action": "EXIT", "price": price, "qty": pos.qty, "reason": signal.reason, "pnl": raw_pnl - cost})
+            self.logger.debug("exit executed")
 
     def _finalize_result(self, name: str) -> BacktestResult:
         trades_df, equity_ser = pd.DataFrame(self.trade_log), pd.Series(self.equity_history, index=self.time_history)

@@ -849,7 +849,7 @@ class FuturesMonitor:
         try:
             from pathlib import Path
             import pandas as pd
-            from datetime import datetime, timedelta
+            # datetime already imported at module top (datetime, timedelta)
             
             # Get current date for file naming
             current_date = timestamp.strftime("%Y%m%d") if hasattr(timestamp, "strftime") else datetime.now().strftime("%Y%m%d")
@@ -929,7 +929,7 @@ class FuturesMonitor:
         try:
             from pathlib import Path
             import shutil
-            from datetime import datetime
+            # datetime already imported at module top (datetime)
             
             backup_dir = Path("logs/backups/trade_records")
             backup_dir.mkdir(parents=True, exist_ok=True)
@@ -1925,7 +1925,7 @@ class FuturesMonitor:
                 year=datetime.now().year, month=datetime.now().month, day=datetime.now().day
             )
             if is_night_session and hhmm >= 1500:
-                from datetime import timedelta
+                # timedelta already imported at module top
                 close_dt += timedelta(days=1)
             
             time_to_close = max(0, (close_dt - datetime.now()).total_seconds() / 60)
