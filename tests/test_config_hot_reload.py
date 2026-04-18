@@ -81,3 +81,36 @@ def test_trader_params_reload(tmp_path):
     assert monitor.trader.fee_per_side == 15
     assert monitor.trader.margin_per_lot == 46000
     print("✓ Trader params hot-reload verified")
+
+
+def _make_config(tmp_path):
+    """Helper: write minimal futures config and return path."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(exist_ok=True)
+    config_file = config_dir / "futures_test.yaml"
+    cfg = {
+        "strategy": {"length": 20, "cooldown_bars": 8},
+        "risk_mgmt": {"atr_multiplier": 1.5},
+        "execution": {"initial_balance": 100000, "broker_fee_per_side": 20},
+        "monitoring": {"poll_interval_secs": 30, "use_order_manager": False},
+        "trade_mgmt": {"lots_per_trade": 1},
+    }
+    with open(config_file, "w") as f:
+        yaml.dump(cfg, f)
+    return config_file
+
+
+def test_futures_monitor_init_sets_last_tick_at(tmp_path):
+    """__init__ must initialize last_tick_at; missing it causes AttributeError on first
+    _strategy_tick() call (before any real tick arrives via on_tick)."""
+    config_file = _make_config(tmp_path)
+    monitor = FuturesMonitor(api=MockAPI(), config_path=str(config_file), dry_run=True)
+
+    assert hasattr(monitor, "last_tick_at"), (
+        "last_tick_at must be initialized in __init__ — "
+        "it is accessed in _strategy_tick() before any tick arrives"
+    )
+    # Value must be a recent timestamp, not zero / None
+    import time
+    assert isinstance(monitor.last_tick_at, float)
+    assert monitor.last_tick_at <= time.time()

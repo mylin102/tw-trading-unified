@@ -216,8 +216,10 @@ class PaperTrader:
     def execute_signal(self, signal: str, price: float, timestamp: datetime, lots=1, max_lots=1, stop_loss=None, break_even_trigger=None, trail_points=None, exit_reason: str = None):
         if signal == "BUY":
             if self.position < max_lots:
-                # GSD: Margin Check
-                required_margin = (abs(self.position) + lots) * self.margin_per_lot
+                # GSD: Margin Check — reversals (short→long) only need margin for the new lot;
+                # the existing short position will be exited first, freeing its margin.
+                reversing = self.position < 0
+                required_margin = lots * self.margin_per_lot if reversing else (abs(self.position) + lots) * self.margin_per_lot
                 if self.balance < required_margin:
                     msg = f"Insufficient Margin: {self.balance:.0f} < {required_margin:.0f}"
                     if self.db:
@@ -247,9 +249,12 @@ class PaperTrader:
                 return f"Entry LONG {lots} at {price}"
 
         elif signal == "SELL":
-            if abs(self.position) < max_lots:
-                # GSD: Margin Check
-                required_margin = (abs(self.position) + lots) * self.margin_per_lot
+            # Mirror BUY: use signed comparison so LONG→SHORT reversals are allowed
+            if self.position > -max_lots:
+                # GSD: Margin Check — reversals (long→short) only need margin for the new lot;
+                # the existing long position will be exited first, freeing its margin.
+                reversing = self.position > 0
+                required_margin = lots * self.margin_per_lot if reversing else (abs(self.position) + lots) * self.margin_per_lot
                 if self.balance < required_margin:
                     msg = f"Insufficient Margin: {self.balance:.0f} < {required_margin:.0f}"
                     if self.db:
