@@ -4,6 +4,7 @@ execution:
   broker_fee_per_side: 20.0
   exchange_fee_per_side: 0.0
   initial_balance: 100000
+  margin_per_lot: 40000.0
   limit_offset_pts: 2.0
   market_slippage_pts: 1.0
   order_type: MKP

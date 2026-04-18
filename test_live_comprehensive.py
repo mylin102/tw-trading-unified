@@ -336,15 +336,23 @@ def main():
     print("TEST SUMMARY")
     print("="*60)
     
+    def is_valid(r):
+        import pandas as pd
+        if r is None or r is False:
+            return False
+        if isinstance(r, pd.DataFrame):
+            return not r.empty
+        return True
+
     for name, result in results.items():
-        status = "✓ PASS" if result not in [False, None] else "✗ FAIL" if result is False else "⚠ SKIP"
+        status = "✓ PASS" if is_valid(result) else "✗ FAIL" if result is False else "⚠ SKIP"
         print(f"{name.upper():15} {status}")
     
     print("\n" + "="*60)
     print("RECOMMENDATIONS:")
     print("="*60)
     
-    if all(r not in [False, None] for r in results.values()):
+    if all(is_valid(r) for r in results.values()):
         print("✅ System is ready for live trading (in PAPER MODE)")
         print("Next steps:")
         print("1. Monitor dashboard at http://localhost:8500")

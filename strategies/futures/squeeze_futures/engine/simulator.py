@@ -79,6 +79,7 @@ class PaperTrader:
         fee_per_side=20,
         exchange_fee_per_side=0,
         tax_rate=0.0,
+        margin_per_lot=40000,  # GSD: Default margin requirement per lot
         db_path: Optional[str] = None,
         snapshot_interval: int = 1800,  # 30 分鐘
     ):
@@ -92,22 +93,24 @@ class PaperTrader:
         self.fee_per_side = fee_per_side
         self.exchange_fee_per_side = exchange_fee_per_side
         self.tax_rate = tax_rate
+        self.margin_per_lot = margin_per_lot
         self.current_stop_loss = None
         self.be_triggered = False
         self.be_points = None
         self.trail_points = None  # GSD: Points to trail from peak profit
         self._best_price = 0      # GSD: Tracks peak (long) or floor (short)
-        
+
         # SQLite 持久化
         self.db = None
         self.snapshot_interval = snapshot_interval
         self._last_snapshot_time = None
         self._entry_score = None  # 記錄進場時的 MTF score
-        
+
         if db_path:
             self._init_persistence(db_path)
-    
+
     def _init_persistence(self, db_path: str):
+
         """初始化 SQLite 持久化"""
         from squeeze_futures.database.db_manager import DatabaseManager
         self.db = DatabaseManager(db_path)
@@ -213,6 +216,14 @@ class PaperTrader:
     def execute_signal(self, signal: str, price: float, timestamp: datetime, lots=1, max_lots=1, stop_loss=None, break_even_trigger=None, trail_points=None, exit_reason: str = None):
         if signal == "BUY":
             if self.position < max_lots:
+                # GSD: Margin Check
+                required_margin = (abs(self.position) + lots) * self.margin_per_lot
+                if self.balance < required_margin:
+                    msg = f"Insufficient Margin: {self.balance:.0f} < {required_margin:.0f}"
+                    if self.db:
+                        self.db.log_system_event(level='WARN', module='PaperTrader', message=msg)
+                    return msg
+
                 if self.position < 0:
                     self.execute_signal("EXIT", price, timestamp)
                 if self.position == 0:
@@ -237,6 +248,14 @@ class PaperTrader:
 
         elif signal == "SELL":
             if abs(self.position) < max_lots:
+                # GSD: Margin Check
+                required_margin = (abs(self.position) + lots) * self.margin_per_lot
+                if self.balance < required_margin:
+                    msg = f"Insufficient Margin: {self.balance:.0f} < {required_margin:.0f}"
+                    if self.db:
+                        self.db.log_system_event(level='WARN', module='PaperTrader', message=msg)
+                    return msg
+
                 if self.position > 0:
                     self.execute_signal("EXIT", price, timestamp)
                 if self.position == 0:

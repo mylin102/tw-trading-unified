@@ -2,23 +2,47 @@ import numpy as np
 import time
 
 class RegimeDetector:
-    def __init__(self):
-        pass
+    def __init__(self, smoothing=3):
+        self.smoothing = smoothing
+        self._last_slope = 0.0
 
     def detect(self, bars, slope_trend=0.8, low_vol_th=5.0):
         if not bars or len(bars) < 20:
             return "UNKNOWN"
+        
         closes = np.array([b.get("close", 0) for b in bars[-20:]], dtype=float)
         highs = np.array([b.get("high", 0) for b in bars[-20:]], dtype=float)
         lows = np.array([b.get("low", 0) for b in bars[-20:]], dtype=float)
+        
+        # Volatility check
         vol = float(np.mean(highs - lows)) if len(highs) > 0 else 0.0
-        x = np.arange(len(closes))
-        try:
-            slope = float(np.polyfit(x, closes, 1)[0])
-        except Exception:
-            slope = 0.0
         if vol < low_vol_th:
             return "LOW_VOL"
+
+        # Linear regression for slope and R-squared
+        x = np.arange(len(closes))
+        try:
+            # Simple linear regression: y = mx + c
+            A = np.vstack([x, np.ones(len(x))]).T
+            m, c = np.linalg.lstsq(A, closes, rcond=None)[0]
+            
+            # Calculate R-squared (coefficient of determination)
+            y_pred = m * x + c
+            y_mean = np.mean(closes)
+            ss_res = np.sum((closes - y_pred)**2)
+            ss_tot = np.sum((closes - y_mean)**2)
+            r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+            
+            slope = float(m)
+        except Exception:
+            slope = 0.0
+            r_squared = 0.0
+
+        # GSD: Only accept trend if it's statistically significant (R^2 > 0.25)
+        # This prevents "noisy" trends where price flips around but happens to have a slope.
+        if r_squared < 0.25:
+            return "CHOP"
+
         if slope > slope_trend:
             return "TREND_UP"
         if slope < -slope_trend:

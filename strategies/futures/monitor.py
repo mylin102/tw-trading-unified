@@ -67,6 +67,8 @@ def _check_trend_breakout_signal(df_5m, df_15m):
 class FuturesMonitor:
     def __init__(self, api, config_path: str, dry_run: bool = False):
         self.api = api
+        self.config_path = config_path
+        self._config_mtime = 0
         self.dry_run = dry_run
         self.cfg = self._load_config(config_path)
         self.ticker = "TMF"
@@ -85,49 +87,16 @@ class FuturesMonitor:
         self.client._kbar_callbacks = {}
         self.client._latest_kbars = {}
 
-        # Strategy config
-        self.STRATEGY = self.cfg.get("strategy", {})
-        self.RISK = self.cfg.get("risk_mgmt", {})
-        self.MGMT = self.cfg.get("trade_mgmt", {})
-        self.EXEC = self.cfg.get("execution", {})
-        self.MONITOR = self.cfg.get("monitoring", {})
-        self.PB = self.STRATEGY.get("pullback", {})
-        self.TP = self.STRATEGY.get("partial_exit", {})
-        self.FILTER_MODE = self.STRATEGY.get("regime_filter", "mid")
-        self.ATR_MULT = self.RISK.get("atr_multiplier", 0.0)
-        self.ATR_LENGTH = self.RISK.get("atr_length", 14)
-        self.POLL_INTERVAL = self.MONITOR.get("poll_interval_secs", 30)
-        # Data freshness thresholds (seconds)
-        self.STALE_WARN_SECS = self.MONITOR.get("stale_tick_warn_secs", 120)
-        self.STALE_CRITICAL_SECS = self.MONITOR.get("stale_tick_critical_secs", 600)
-        self.PB_CONFIRM_BARS = self.MONITOR.get("pb_confirmation_bars", 12)
-        self.PB_ARGS = {
-            "ema_fast": self.PB.get("ema_fast", 20),
-            "ema_slow": self.PB.get("ema_slow", 60),
-            "pb_buffer": self.PB.get("buffer", 1.002),
-        }
-        self.live_trading = self.cfg.get("live_trading", False)
-        self.cooldown_bars = self.cfg.get("cooldown_bars", self.STRATEGY.get("cooldown_bars", 8))
+        # GSD: Initialize stateful attributes before applying config
         self.cooldown_until = 0
-
-        # GSD Phase 0b: Consecutive losses tracker (separate for day/night)
         self.consecutive_losses = 0
         self.session_losses = []  # [(timestamp, pnl_pts, exit_reason, session)]
         self.session_type = None  # "day" or "night", set per bar
         self.previous_session_type = None  # Track previous session for transition detection
         self._last_bar_context = {}  # Phase 0c: snapshot for entry diagnostic
-
-        # GSD Phase 3: Circuit Breaker integration (Phase 1)
         self._circuit_breaker = None
         self._session_pnl = 0.0  # Session PnL for circuit breaker
-
-        # Squeeze Failure Counter mode
-        self.COUNTER = self.STRATEGY.get("counter_mode", {})
-        self.counter_enabled = self.COUNTER.get("enabled", False)
-        self.counter_auto_regime = self.COUNTER.get("auto_regime", True)
-        self.counter_confirm_bars = self.COUNTER.get("confirm_bars", 5)
-        self.counter_atr_sl_mult = self.COUNTER.get("atr_sl_mult", 1.0)
-        self.counter_exit_vwap = self.COUNTER.get("exit_on_vwap", True)
+        
         # Failure detection state: tracks pending squeeze fire
         self._fire_pending_dir = 0   # +1=bullish fire, -1=bearish fire
         self._fire_bar_idx = 0
@@ -138,42 +107,6 @@ class FuturesMonitor:
         self.is_trading_ready = False   # [GSD 4.13] Phase B Ready
         self._vwap_violation_bars = 0  # VWAP exit debounce counter
         self._atr_trail_peak = 0.0    # ATR trailing stop: peak price tracker
-
-        # ── [L3] Order Lifecycle Manager (independent of live_trading) ──
-        self._use_order_manager = self.MONITOR.get("use_order_manager", False)
-        self.order_mgr = None
-        self.paper_fill_sim = None
-        if self._use_order_manager:
-            from core.order_management.order_manager import OrderManager
-            from core.order_management.paper_fill import PaperFillSimulator
-            _om_mode = "live" if self.live_trading else "paper"
-            broker = self.client if self.live_trading else None
-            self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=broker)
-            if _om_mode == "paper":
-                self.paper_fill_sim = PaperFillSimulator(self.order_mgr)
-                self.order_mgr.set_simulator(self.paper_fill_sim)
-            self._wire_order_callbacks()
-            console.print(f"[green]📋 Order Lifecycle Manager enabled ({_om_mode} mode)[/green]")
-
-        self.last_tick_at = time.time()  # [gstack] 數據新鮮度追蹤
-
-        # Adaptive engine (lightweight regime/threshold adapter)
-        try:
-            from strategies.adaptive_engine import AdaptiveEngine
-            self.adaptive = AdaptiveEngine()
-        except Exception:
-            self.adaptive = None
-
-        # Cross-regime: TX / TMF detectors and policy engine
-        try:
-            from strategies.cross_regime import RegimeDetector, TMFLocalDetector, CrossRegimeEngine
-            self.tx_detector = RegimeDetector()
-            self.tmf_detector = TMFLocalDetector()
-            self.cross_engine = CrossRegimeEngine()
-        except Exception:
-            self.tx_detector = None
-            self.tmf_detector = None
-            self.cross_engine = None
 
         # GSD Phase 0d: Hourly no-trade audit tracking
         self._last_trade_ts = None       # timestamp of last trade
@@ -186,15 +119,12 @@ class FuturesMonitor:
         # 💡 GSD: Market data cache for virtual ticks
         self.market_data = {"MTX": {"close": 0.0}}
 
-        # Trader
-        self.trader = PaperTrader(
-            ticker=self.ticker,
-            initial_balance=self.EXEC.get("initial_balance", 100000),
-            point_value=get_point_value(self.ticker),
-            fee_per_side=self.EXEC.get("broker_fee_per_side", 20),
-            exchange_fee_per_side=self.EXEC.get("exchange_fee_per_side", 0),
-            tax_rate=self.EXEC.get("tax_rate", 0),
-        )
+        # Apply config (Initial create for Trader and OrderMgr happens here)
+        self.order_mgr = None
+        self.paper_fill_sim = None
+        self._apply_config_params()
+        self._config_mtime = os.path.getmtime(self.config_path) if os.path.exists(self.config_path) else 0
+
         self.has_tp1_hit = False
         self.last_processed_bar = None
         self._last_exit_bar = None  # 防止同根 K bar exit 後再進場
@@ -202,6 +132,92 @@ class FuturesMonitor:
         self._safety_stop_trade = None  # Exchange-side safety stop order
         # 💡 GSD: Initialize with current time bucket to prevent immediate flip
         self._last_bar_ts = int(time.time() / 300) * 300
+
+    def _apply_config_params(self):
+        """[GSD] Extract parameters from self.cfg into instance attributes."""
+        # Strategy config
+        self.STRATEGY = self.cfg.get("strategy", {})
+        self.RISK = self.cfg.get("risk_mgmt", {})
+        self.MGMT = self.cfg.get("trade_mgmt", {})
+        self.EXEC = self.cfg.get("execution", {})
+        self.MONITOR = self.cfg.get("monitoring", {})
+        self.PB = self.STRATEGY.get("pullback", {})
+        self.TP = self.STRATEGY.get("partial_exit", {})
+        self.FILTER_MODE = self.STRATEGY.get("regime_filter", "mid")
+        self.ATR_MULT = self.RISK.get("atr_multiplier", 0.0)
+        self.ATR_LENGTH = self.RISK.get("atr_length", 14)
+        self.POLL_INTERVAL = self.MONITOR.get("poll_interval_secs", 30)
+        
+        # Data freshness thresholds (seconds)
+        self.STALE_WARN_SECS = self.MONITOR.get("stale_tick_warn_secs", 120)
+        self.STALE_CRITICAL_SECS = self.MONITOR.get("stale_tick_critical_secs", 600)
+        self.PB_CONFIRM_BARS = self.MONITOR.get("pb_confirmation_bars", 12)
+        
+        self.PB_ARGS = {
+            "ema_fast": self.PB.get("ema_fast", 20),
+            "ema_slow": self.PB.get("ema_slow", 60),
+            "pb_buffer": self.PB.get("buffer", 1.002),
+        }
+        
+        self.live_trading = self.cfg.get("live_trading", False)
+        self.cooldown_bars = self.cfg.get("cooldown_bars", self.STRATEGY.get("cooldown_bars", 8))
+        
+        # Squeeze Failure Counter mode
+        self.COUNTER = self.STRATEGY.get("counter_mode", {})
+        self.counter_enabled = self.COUNTER.get("enabled", False)
+        self.counter_auto_regime = self.COUNTER.get("auto_regime", True)
+        self.counter_confirm_bars = self.COUNTER.get("confirm_bars", 5)
+        self.counter_atr_sl_mult = self.COUNTER.get("atr_sl_mult", 1.0)
+        self.counter_exit_vwap = self.COUNTER.get("exit_on_vwap", True)
+
+        # Update Order Lifecycle settings if needed
+        self._use_order_manager = self.MONITOR.get("use_order_manager", False)
+
+        # ── [L3] Order Lifecycle Manager initialization logic (only if not already set) ──
+        if self._use_order_manager and not getattr(self, 'order_mgr', None):
+            from core.order_management.order_manager import OrderManager
+            from core.order_management.paper_fill import PaperFillSimulator
+            _om_mode = "live" if self.live_trading else "paper"
+            broker = self.client if self.live_trading else None
+            self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=broker)
+            if _om_mode == "paper":
+                self.paper_fill_sim = PaperFillSimulator(self.order_mgr)
+                self.order_mgr.set_simulator(self.paper_fill_sim)
+            self._wire_order_callbacks()
+            console.print(f"[green]📋 Order Lifecycle Manager enabled ({_om_mode} mode)[/green]")
+
+        # Create or update Trader
+        if not hasattr(self, 'trader'):
+            self.trader = PaperTrader(
+                ticker=self.ticker,
+                initial_balance=self.EXEC.get("initial_balance", 100000),
+                point_value=get_point_value(self.ticker),
+                fee_per_side=self.EXEC.get("broker_fee_per_side", 20),
+                exchange_fee_per_side=self.EXEC.get("exchange_fee_per_side", 0),
+                tax_rate=self.EXEC.get("tax_rate", 0),
+                margin_per_lot=self.EXEC.get("margin_per_lot", 40000),
+            )
+        else:
+            # We don't change initial_balance after start, but we can update fees and margin
+            self.trader.fee_per_side = self.EXEC.get("broker_fee_per_side", 20)
+            self.trader.exchange_fee_per_side = self.EXEC.get("exchange_fee_per_side", 0)
+            self.trader.tax_rate = self.EXEC.get("tax_rate", 0)
+            self.trader.margin_per_lot = self.EXEC.get("margin_per_lot", 40000)
+
+    def _reload_config_if_changed(self):
+        """[Rule 9] Hot-reload config if YAML file has been updated."""
+        if not os.path.exists(self.config_path):
+            return
+            
+        mtime = os.path.getmtime(self.config_path)
+        if mtime > self._config_mtime:
+            try:
+                self.cfg = self._load_config(self.config_path)
+                self._apply_config_params()
+                self._config_mtime = mtime
+                console.print(f"[cyan]🔄 Config hot-reloaded from {self.config_path}[/cyan]")
+            except Exception as e:
+                console.print(f"[red]❌ Failed to reload config: {e}[/red]")
 
     def _load_config(self, path):
         with open(path, encoding="utf-8") as f:
@@ -1705,7 +1721,21 @@ class FuturesMonitor:
             console.print(f"[bold green]✅ Cancelled {cancelled_count} pending order(s)[/bold green]")
 
     def _strategy_tick(self):
+        # [Rule 9] Hot-reload config if changed
+        self._reload_config_if_changed()
+
+        # 市場時間檢查
+        from core.date_utils import is_day_session, is_night_session
+        now = datetime.now()
+        is_day = is_day_session(now)
+        is_night = is_night_session(now)
+
+        # 在 dry_run 模式下跳過時間檢查，方便測試
+        if not self.dry_run and not (is_day or is_night):
+            return
+
         # 💡 GSD: Data Continuity - Generate virtual tick if volume is zero but bidask is updating
+        # Moved after session check to prevent building bars outside market hours (e.g. 13:46)
         now_ts = time.time()
         if not self.dry_run and (now_ts - self.last_tick_at > 10):
             # Use current MTX close/mid if available to drive bar building
@@ -1721,16 +1751,6 @@ class FuturesMonitor:
                     volume=0
                 )
                 self.on_tick(None, mock_tick)
-
-        # 市場時間檢查
-        from core.date_utils import is_day_session, is_night_session
-        now = datetime.now()
-        is_day = is_day_session(now)
-        is_night = is_night_session(now)
-
-        # 在 dry_run 模式下跳過時間檢查，方便測試
-        if not self.dry_run and not (is_day or is_night):
-            return
 
         # [Bug Fix] Check data freshness and attempt reconnection
         if not self.dry_run:
