@@ -118,6 +118,7 @@ class FuturesMonitor:
         
         # 💡 GSD: Market data cache for virtual ticks
         self.market_data = {"MTX": {"close": 0.0}}
+        self.last_tick_at = time.time()  # [gstack] 數據新鮮度追蹤 — must init before _strategy_tick()
 
         # Apply config (Initial create for Trader and OrderMgr happens here)
         self.order_mgr = None

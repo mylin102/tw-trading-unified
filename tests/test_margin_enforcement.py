@@ -49,3 +49,37 @@ def test_margin_after_loss():
     r2 = trader.execute_signal("BUY", 19900, datetime.now(), lots=1, max_lots=1)
     assert "Insufficient Margin" in r2
     assert trader.position == 0
+
+
+def test_margin_reversal_short_to_long():
+    """反轉 SHORT→LONG 時，保證金只需計算新倉 1 口，不應將舊倉計入
+    Bug: required_margin = (abs(-1)+1)*margin = 2*margin，導致合法反轉被誤攔截"""
+    # 資金剛好能支付 1 口保證金但不夠 2 口
+    trader = PaperTrader(initial_balance=50000, margin_per_lot=40000)
+
+    r1 = trader.execute_signal("SELL", 20000, datetime.now(), lots=1, max_lots=1)
+    assert "Entry SHORT" in r1
+    assert trader.position == -1
+
+    # 反轉：平 SHORT 後只需 1 口保證金 (40000 <= 50000)，應該成功
+    r2 = trader.execute_signal("BUY", 20010, datetime.now(), lots=1, max_lots=1)
+    assert "Insufficient Margin" not in r2, (
+        "Reversal SHORT→LONG incorrectly rejected: margin check must not double-count existing position"
+    )
+    assert trader.position == 1
+
+
+def test_margin_reversal_long_to_short():
+    """反轉 LONG→SHORT 時，保證金只需計算新倉 1 口，不應將舊倉計入"""
+    trader = PaperTrader(initial_balance=50000, margin_per_lot=40000)
+
+    r1 = trader.execute_signal("BUY", 20000, datetime.now(), lots=1, max_lots=1)
+    assert "Entry LONG" in r1
+    assert trader.position == 1
+
+    # 反轉：平 LONG 後只需 1 口保證金 (40000 <= 50000)，應該成功
+    r2 = trader.execute_signal("SELL", 19990, datetime.now(), lots=1, max_lots=1)
+    assert "Insufficient Margin" not in r2, (
+        "Reversal LONG→SHORT incorrectly rejected: margin check must not double-count existing position"
+    )
+    assert trader.position == -1
