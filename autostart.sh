@@ -247,17 +247,23 @@ while true; do
         find "$LOG_DIR" -name "*.log" -size +100M -delete 2>/dev/null
     fi
 
-    # --- Maintenance: Auto-Archive ---
-    MM=$(date +%M)
-    # Day Session Close: 13:45 ~ 14:15
-    # Night Session Close: 05:00 ~ 05:30
+    # --- Maintenance: Auto-Archive (After sessions) ---
     if { [ "$H" -eq 13 ] && [ "$MM" -ge 45 ]; } || { [ "$H" -eq 5 ] && [ "$MM" -le 15 ]; }; then
         if [ ! -f "/tmp/archive.lock" ]; then
             echo "[$(date)] 📦 執行每日自動歸檔 (Maintenance Window)..." >> "$LOG_DIR/unified.log"
             $PYTHON_EXEC "$UNIFIED_DIR/scripts/maintenance/archive_daily_data.py" >> "$LOG_DIR/maintenance.log" 2>&1
             touch "/tmp/archive.lock"
-            # Lock for 1 hour to prevent re-run within the same window
             (sleep 3600 && rm -f "/tmp/archive.lock") &
+        fi
+    fi
+
+    # --- Pre-Market: Sync Watchlist (08:30) ---
+    if [ "$H" -eq 8 ] && [ "$MM" -ge 30 ] && [ "$MM" -lt 45 ]; then
+        if [ ! -f "/tmp/sync.lock" ]; then
+            echo "[$(date)] 🌐 執行開盤前名單同步 (Pre-Market)..." >> "$LOG_DIR/unified.log"
+            $PYTHON_EXEC "$UNIFIED_DIR/scripts/maintenance/sync_watchlist_daily.py" >> "$LOG_DIR/maintenance.log" 2>&1
+            touch "/tmp/sync.lock"
+            (sleep 1800 && rm -f "/tmp/sync.lock") &
         fi
     fi
 
