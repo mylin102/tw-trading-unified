@@ -10,6 +10,7 @@ import traceback
 from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
+from typing import Any, Dict
 import pandas as pd
 from rich.console import Console
 
@@ -134,6 +135,8 @@ class FuturesMonitor:
         self._last_exit_bar = None  # 防止同根 K bar exit 後再進場
         self._last_entry_reason = None
         self._safety_stop_trade = None  # Exchange-side safety stop order
+        self._pending_lifecycle_orders: Dict[str, Dict[str, Any]] = {}
+        self._applied_lifecycle_deals = set()
         # 💡 GSD: Initialize with current time bucket to prevent immediate flip
         self._last_bar_ts = int(time.time() / 300) * 300
 
@@ -187,6 +190,10 @@ class FuturesMonitor:
             if _om_mode == "paper":
                 self.paper_fill_sim = PaperFillSimulator(self.order_mgr)
                 self.order_mgr.set_simulator(self.paper_fill_sim)
+            
+            # [GSD Fix] Recover orders from trades CSV BEFORE wiring callbacks
+            self._recover_orders_from_trades_csv()
+            
             self._wire_order_callbacks()
             console.print(f"[green]📋 Order Lifecycle Manager enabled ({_om_mode} mode)[/green]")
 
@@ -1158,75 +1165,364 @@ class FuturesMonitor:
         except Exception as e:
             print(f"⚠️ Failed to save futures orders file: {e}")
 
+    def _append_filled_lifecycle_order(self, side, price, ts, lots, *, strategy="futures", comment="", order_id=None):
+        """Append a filled lifecycle order record without re-executing trade logic."""
+        if not self.order_mgr:
+            return None
+        try:
+            from core.order_management.order import Order, OrderStatus, OrderType
+
+            qty = int(lots or 1)
+            fill_price = float(price or 0)
+            order_ts = ts if hasattr(ts, "strftime") else datetime.now()
+            lifecycle_order = Order(
+                symbol=self.ticker,
+                side=side,
+                order_type=OrderType.MARKET,
+                quantity=qty,
+                price=fill_price,
+                order_id=order_id or f"LIFECYCLE-{order_ts.strftime('%Y%m%d-%H%M%S-%f')}",
+                strategy=strategy,
+                comment=comment,
+            )
+            lifecycle_order.status = OrderStatus.FILLED
+            lifecycle_order.filled_quantity = qty
+            lifecycle_order.avg_fill_price = fill_price
+            lifecycle_order.created_at = order_ts
+            lifecycle_order.submitted_at = order_ts
+            lifecycle_order.filled_at = order_ts
+            lifecycle_order.updated_at = order_ts
+            lifecycle_order.exchange_order_id = f"RECOV-{lifecycle_order.order_id}"
+            self.order_mgr.completed.append(lifecycle_order)
+            return lifecycle_order
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Failed to append lifecycle order: {e}[/yellow]")
+            return None
+
+    def _recover_orders_from_trades_csv(self):
+        """Recover all orders from trades CSV to rebuild OrderManager state on startup."""
+        if not self.order_mgr:
+            return
+        
+        try:
+            import csv
+            from pathlib import Path
+            from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
+            
+            # Find today's trades CSV
+            today = datetime.now().strftime("%Y%m%d")
+            trades_file = Path(f"exports/trades/TMF_{today}_trades.csv")
+            
+            if not trades_file.exists():
+                console.print("[dim]No trades file to recover orders from[/dim]")
+                return
+            
+            with open(trades_file) as f:
+                rows = list(csv.DictReader(f))
+            
+            if not rows:
+                return
+            
+            recovered_count = 0
+            for row in rows:
+                try:
+                    trade_type = row.get("type", "")
+                    direction = row.get("direction", "")
+                    price = float(row.get("price", 0))
+                    lots = int(row.get("lots", 0) or 1)
+                    timestamp_str = row.get("timestamp", "")
+                    reason = row.get("reason", "")
+                    
+                    # Parse timestamp
+                    try:
+                        ts = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                    except:
+                        ts = datetime.now()
+                    
+                    # Determine OrderSide from type
+                    if trade_type == "BUY":
+                        order_side = OrderSide.BUY
+                    elif trade_type == "SELL":
+                        order_side = OrderSide.SELL
+                    elif trade_type == "EXIT":
+                        # Exit order side is opposite of direction
+                        order_side = OrderSide.SELL if direction == "LONG" else OrderSide.BUY
+                    else:
+                        continue  # Skip unknown types
+                    
+                    lifecycle_order = self._append_filled_lifecycle_order(
+                        side=order_side,
+                        price=price,
+                        ts=ts,
+                        lots=lots,
+                        strategy="futures",
+                        comment=f"{trade_type} {reason}".strip(),
+                        order_id=f"TRADES-{ts.strftime('%Y%m%d-%H%M%S')}",
+                    )
+                    if lifecycle_order is not None:
+                        recovered_count += 1
+                    
+                except Exception as e:
+                    console.print(f"[yellow]⚠️ Failed to recover order from row: {e}[/yellow]")
+                    continue
+            
+            if recovered_count > 0:
+                console.print(f"[bold cyan]♻️ Recovered {recovered_count} futures orders from trades CSV[/bold cyan]")
+                # Save immediately to orders JSON
+                self._save_orders_file_wrapper()
+            
+        except Exception as e:
+            console.print(f"[yellow]Futures order recovery from trades CSV failed: {e}[/yellow]")
+
     # ── Order Lifecycle (L3 Integration) ──
+    def _get_lifecycle_order(self, order_id):
+        if not self.order_mgr:
+            return None
+        order = self.order_mgr.active_orders.get(order_id)
+        if order is not None:
+            return order
+        for completed in self.order_mgr.completed:
+            if completed.order_id == order_id:
+                return completed
+        return None
+
+    def _clear_pending_lifecycle_order(self, order_id):
+        self._pending_lifecycle_orders.pop(order_id, None)
+
+    def _apply_confirmed_futures_deal(self, event):
+        from core.order_management.order import OrderStatus
+        from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
+
+        pending = self._pending_lifecycle_orders.get(event.order_id)
+        if pending is None or event.fill_qty <= 0:
+            return None
+
+        deal_key = event.deal_id or f"{event.order_id}:{event.fill_qty}:{event.fill_price}"
+        if deal_key in self._applied_lifecycle_deals:
+            return None
+
+        signal = pending.get("signal")
+        if signal not in ("BUY", "SELL", "EXIT", "PARTIAL_EXIT"):
+            return None
+
+        ts = datetime.now()
+        lots = int(event.fill_qty)
+        price = float(event.fill_price or 0)
+        reason = pending.get("reason")
+        stop_loss = pending.get("stop_loss")
+        break_even_trigger = pending.get("break_even_trigger")
+        trail_points = pending.get("trail_points")
+        cross_policy = pending.get("cross_policy")
+
+        pnl_pts = 0.0
+        pnl_cash = 0.0
+        friction_cost = 0.0
+        direction = "LONG" if signal == "BUY" else "SHORT" if signal == "SELL" else ""
+        if signal in ("EXIT", "PARTIAL_EXIT") and self.trader.entry_price > 0 and self.trader.position != 0:
+            direction = "LONG" if self.trader.position > 0 else "SHORT"
+            sign = 1 if self.trader.position > 0 else -1
+            pnl_pts = (price - self.trader.entry_price) * sign
+            gross = pnl_pts * self.trader.point_value * lots
+            fee = self.trader.fee_per_side * 2 * lots
+            exch_fee = self.trader.exchange_fee_per_side * 2 * lots
+            tax = (self.trader.entry_price + price) * self.trader.point_value * self.trader.tax_rate * lots
+            friction_cost = fee + exch_fee + tax
+            pnl_cash = gross - friction_cost
+            self._session_pnl += pnl_pts
+
+        result = self.trader.execute_signal(
+            signal,
+            price,
+            ts,
+            lots=lots,
+            max_lots=self.MGMT.get("max_positions", 2),
+            stop_loss=stop_loss,
+            break_even_trigger=break_even_trigger,
+            trail_points=trail_points,
+            exit_reason=reason,
+        )
+        if not result:
+            save_signal_audit({
+                "timestamp": ts,
+                "signal": signal,
+                "price": price,
+                "reason": reason or "",
+                "rejection": "confirmed_deal_rejected",
+                "lots": lots,
+            })
+            return None
+
+        self._applied_lifecycle_deals.add(deal_key)
+        save_signal_audit({
+            "timestamp": ts,
+            "signal": signal,
+            "price": price,
+            "reason": reason or "",
+            "rejection": "",
+            "lots": lots,
+        })
+        save_trade({
+            "type": signal,
+            "timestamp": ts,
+            "price": price,
+            "lots": lots,
+            "direction": direction,
+            "pnl_pts": round(pnl_pts, 1),
+            "pnl_cash": round(pnl_cash, 0),
+            "friction_cost": round(friction_cost, 0),
+            "reason": reason or "",
+            "cross_policy": cross_policy,
+        })
+
+        if signal in ("BUY", "SELL"):
+            ctx = getattr(self, "_last_bar_context", {})
+            self._entry_features_futures = {
+                "momentum": ctx.get("momentum", 0),
+                "mom_velo": ctx.get("mom_velo", 0),
+                "vwap_distance_pts": round(abs(price - ctx.get("vwap", price)), 1),
+                "atr": ctx.get("atr", 0),
+                "regime": ctx.get("regime", "UNKNOWN"),
+                "score": ctx.get("score", 0),
+                "entry_price": float(price),
+            }
+            save_trade({
+                "type": "ENTRY_DIAG",
+                "timestamp": ts,
+                "signal": signal,
+                "price": price,
+                "lots": lots,
+                "direction": direction,
+                "reason": reason or "",
+                "entry_diag": self._entry_features_futures,
+                "cross_policy": cross_policy,
+            })
+            if self.live_trading and not self.dry_run:
+                fill_direction = "LONG" if signal == "BUY" else "SHORT"
+                sl_pts = stop_loss if stop_loss else self.RISK.get("stop_loss_pts", 60)
+                self._place_safety_stop(price, fill_direction, lots, sl_pts)
+
+        if signal in ("EXIT", "PARTIAL_EXIT") and hasattr(self, "_entry_features_futures") and self._entry_features_futures:
+            from core.decision_logger import DecisionLogger
+
+            outcome = {
+                "pnl": float(pnl_cash),
+                "pnl_pts": float(pnl_pts),
+                "exit_price": float(price),
+                "exit_reason": str(reason or "SIGNAL"),
+            }
+            DecisionLogger.log_trade_outcome(
+                trade_id=f"FUT-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                strategy=self.active_strategy_name,
+                regime=self._entry_features_futures.get("regime", "NORMAL"),
+                features=self._entry_features_futures,
+                outcome=outcome,
+            )
+            if signal == "EXIT":
+                self._entry_features_futures = {}
+
+        if signal in ("EXIT", "PARTIAL_EXIT") and pnl_pts < 0:
+            sess = self.session_type or "day"
+            self.consecutive_losses += 1
+            self.session_losses.append((ts, pnl_pts, reason or "UNKNOWN", sess))
+        elif signal in ("EXIT", "PARTIAL_EXIT"):
+            self.consecutive_losses = 0
+
+        order = self._get_lifecycle_order(event.order_id)
+        if order is not None and order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
+            self._clear_pending_lifecycle_order(event.order_id)
+
+        self._save_orders_file_wrapper()
+        return result
+
     def _wire_order_callbacks(self):
         """Wire OrderManager callbacks to PaperTrader and audit system."""
         from core.order_management.order import OrderStatus, OrderSide
 
         def _on_fill_callback(event):
-            if event.status == OrderStatus.FILLED:
-                ts = datetime.now()
-                stop_loss = getattr(self, "_pending_stop_loss", 60)
-                max_lots = self.MGMT.get("max_positions", 1)
-                if event.side == OrderSide.BUY:
-                    msg = self.trader.execute_signal("BUY", event.fill_price, ts,
-                                                      lots=event.fill_qty, max_lots=max_lots, stop_loss=stop_loss)
-                    console.print(f"[green]📦 Order FILLED: BUY {event.fill_qty} @ {event.fill_price:.0f} → {msg}[/green]")
-                else:
-                    msg = self.trader.execute_signal("SELL", event.fill_price, ts,
-                                                      lots=event.fill_qty, max_lots=max_lots, stop_loss=stop_loss)
-                    console.print(f"[red]📦 Order FILLED: SELL {event.fill_qty} @ {event.fill_price:.0f} → {msg}[/red]")
-                # Save to exports
-                try:
-                    from squeeze_futures.data.data_storage import save_trade
-                    save_trade({
-                        "type": "BUY" if event.side == OrderSide.BUY else "SELL",
-                        "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
-                        "price": event.fill_price,
-                        "lots": event.fill_qty,
-                        "direction": "LONG" if event.side == OrderSide.BUY else "SHORT",
-                        "pnl_pts": 0, "pnl_cash": 0, "friction_cost": 0,
-                        "reason": getattr(self, "_last_entry_reason", "ORDER_MANAGER"),
-                        "cross_policy": getattr(self, '_last_cross_policy', None)
-                    })
-                except Exception:
-                    pass
-                self._save_orders_file_wrapper()
+            if event.status not in (OrderStatus.PARTIAL_FILLED, OrderStatus.FILLED):
+                return
+            msg = self._apply_confirmed_futures_deal(event)
+            if msg:
+                action = "BUY" if event.side == OrderSide.BUY else "SELL"
+                console.print(f"[green]📦 Confirmed deal: {action} {event.fill_qty} @ {event.fill_price:.0f} deal={event.deal_id} → {msg}[/green]")
 
         def _on_cancel_callback(event):
             console.print(f"[yellow]🚫 Order CANCELLED: {event.order_id} ({event.reason})[/yellow]")
+            self._clear_pending_lifecycle_order(event.order_id)
             self._save_orders_file_wrapper()
 
         def _on_reject_callback(event):
             console.print(f"[red]❌ Order REJECTED: {event.order_id} ({event.reason})[/red]")
+            self._clear_pending_lifecycle_order(event.order_id)
+            self._save_orders_file_wrapper()
+
+        def _on_status_change(event):
             self._save_orders_file_wrapper()
 
         self.order_mgr.register_callback("on_fill", _on_fill_callback)
         self.order_mgr.register_callback("on_cancel", _on_cancel_callback)
         self.order_mgr.register_callback("on_reject", _on_reject_callback)
+        self.order_mgr.register_callback("on_status_change", _on_status_change)
         self._save_orders_file_wrapper()
 
-    def _submit_order_via_manager(self, signal, price, ts, lots, stop_loss=None, reason=None):
-        """Submit order through OrderManager instead of direct PaperTrader call."""
+    def _submit_order_via_manager(self, signal, price, ts, lots, stop_loss=None, break_even_trigger=None, trail_points=None, reason=None):
+        """Submit order through OrderManager and wait for confirmed deals to mutate PaperTrader."""
         from core.order_management.order import OrderType, OrderSide
 
-        side = OrderSide.BUY if signal == "BUY" else OrderSide.SELL
+        if signal == "BUY":
+            side = OrderSide.BUY
+            action = "Buy"
+        elif signal == "SELL":
+            side = OrderSide.SELL
+            action = "Sell"
+        elif signal in ("EXIT", "PARTIAL_EXIT"):
+            if self.trader.position == 0:
+                return None
+            side = OrderSide.SELL if self.trader.position > 0 else OrderSide.BUY
+            action = "Sell" if self.trader.position > 0 else "Buy"
+        else:
+            return None
+
         order_type = OrderType.MARKET  # Default to market; can be configured
 
         order = self.order_mgr.create_order(
             symbol=self.ticker, side=side, order_type=order_type,
             quantity=lots, strategy=reason or "UNKNOWN",
+            comment=f"{signal} {reason or ''}".strip(),
         )
-        self.order_mgr.submit(order, exchange_ordno=f"PAPER-{order.order_id}")
-        self.paper_fill_sim.register(order)
-
-        # Store stop_loss for callback to use
-        self._pending_stop_loss = stop_loss or self.RISK.get("stop_loss_pts", 60)
+        self._pending_lifecycle_orders[order.order_id] = {
+            "intent_id": order.intent_id,
+            "signal": signal,
+            "reason": reason,
+            "stop_loss": stop_loss or self.RISK.get("stop_loss_pts", 60),
+            "break_even_trigger": break_even_trigger,
+            "trail_points": trail_points,
+            "ts": ts,
+            "lots": lots,
+            "cross_policy": getattr(self, "_last_cross_policy", None),
+        }
 
         console.print(f"[cyan]📤 Order SUBMITTED: {signal} {lots} @ {price:.0f} ({reason}) "
                       f"[order_id={order.order_id}][/cyan]")
 
-        # Process the current tick immediately for market orders
+        if self.live_trading and not self.dry_run:
+            trade = self.client.place_order(self.contract, action=action, quantity=lots)
+            if trade is None:
+                self._clear_pending_lifecycle_order(order.order_id)
+                self.order_mgr.reject(order.order_id, "api_order_failed")
+                return None
+            self.order_mgr.attach_submission(
+                order.order_id,
+                broker_trade=trade,
+                broker_order_id=getattr(trade, "id", None),
+                seqno=getattr(trade, "seqno", None),
+                ordno=getattr(trade, "ordno", None),
+                raw_status="Submitted",
+            )
+            return order.order_id
+
+        self.order_mgr.submit(order, exchange_ordno=f"PAPER-{order.order_id}")
+        self.paper_fill_sim.register(order)
         self.paper_fill_sim.process_tick(self._make_synthetic_tick(price, ts))
         return order.order_id
 
@@ -1274,6 +1570,7 @@ class FuturesMonitor:
 
     def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, trail_points=None, reason=None):
         action = None
+        exit_order_side = None
         if signal == "BUY":
             action = "Buy"
         elif signal == "SELL":
@@ -1283,10 +1580,12 @@ class FuturesMonitor:
                 from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
                 save_signal_audit({"timestamp": ts, "signal": signal, "price": price, "reason": reason or "", "rejection": "no_position", "lots": lots})
                 return None
+            from core.order_management.order import OrderSide
+            exit_order_side = OrderSide.SELL if self.trader.position > 0 else OrderSide.BUY
             action = "Sell" if self.trader.position > 0 else "Buy"
 
         live_ready = self.live_trading and not self.dry_run and self.contract is not None
-        if live_ready and action is not None:
+        if live_ready and action is not None and not (self._use_order_manager and self.order_mgr):
             # 進場前檢查保證金（出場不擋）
             if signal in ("BUY", "SELL"):
                 if not self._margin_sufficient():
@@ -1382,14 +1681,19 @@ class FuturesMonitor:
             self._signals_generated += 1
 
         # ── [L3] Route through OrderManager if enabled ──
-        if self._use_order_manager and self.order_mgr and signal in ("BUY", "SELL"):
-            # Paper mode: submit order → wait for tick fill → callback → PaperTrader
+        if self._use_order_manager and self.order_mgr and signal in ("BUY", "SELL", "EXIT", "PARTIAL_EXIT"):
+            if live_ready and signal in ("BUY", "SELL") and not self._margin_sufficient():
+                console.print(f"[red][FuturesMonitor] ⛔ 保證金不足，取消 {signal}[/red]")
+                from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
+                save_signal_audit({"timestamp": ts, "signal": signal, "price": price, "reason": reason or "", "rejection": "margin_insufficient", "lots": lots})
+                return None
+            if live_ready and signal in ("EXIT", "PARTIAL_EXIT"):
+                self._cancel_safety_stop()
             return self._submit_order_via_manager(signal, price, ts, lots,
-                                                   stop_loss=stop_loss, reason=reason)
-        elif self._use_order_manager and self.order_mgr and signal in ("EXIT", "PARTIAL_EXIT"):
-            # Exits need immediate execution (no queue in paper mode)
-            self.paper_fill_sim.process_tick(self._make_synthetic_tick(price, ts))
-            # Fall through to direct PaperTrader call for exits
+                                                   stop_loss=stop_loss,
+                                                   break_even_trigger=break_even_trigger,
+                                                   trail_points=trail_points,
+                                                   reason=reason)
 
         # Sanitize zero values to None for PaperTrader logic
         be_trigger = break_even_trigger if break_even_trigger and break_even_trigger > 0 else None
@@ -1412,6 +1716,17 @@ class FuturesMonitor:
                     "direction": direction, "pnl_pts": round(pnl_pts, 1),
                     "pnl_cash": round(pnl_cash, 0), "friction_cost": round(friction_cost, 0),
                     "reason": reason or "", "cross_policy": getattr(self, '_last_cross_policy', None)})
+
+        if self._use_order_manager and self.order_mgr and signal in ("EXIT", "PARTIAL_EXIT") and exit_order_side is not None:
+            self._append_filled_lifecycle_order(
+                side=exit_order_side,
+                price=price,
+                ts=ts,
+                lots=lots,
+                strategy="futures",
+                comment=f"{signal} {reason or ''}".strip(),
+            )
+            self._save_orders_file_wrapper()
 
         # GSD Phase 0c: Entry diagnostic snapshot
         if signal in ("BUY", "SELL"):

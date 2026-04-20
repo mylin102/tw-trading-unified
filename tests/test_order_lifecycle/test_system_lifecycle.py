@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, PropertyMock
 from pathlib import Path
 
@@ -273,3 +274,62 @@ class TestMarketHoursGate:
         assert is_market_open(900) is True    # 09:00 → day open
         assert is_market_open(300) is True    # 03:00 → night ongoing
         assert is_market_open(600) is False   # 06:00 → closed
+
+
+def _build_lifecycle_monitor_for_test():
+    from strategies.futures.monitor import FuturesMonitor
+    from strategies.futures.squeeze_futures.engine.simulator import PaperTrader
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.ticker = "TMF"
+    monitor.contract = SimpleNamespace(code="TMF")
+    monitor.live_trading = True
+    monitor.dry_run = False
+    monitor.client = MagicMock()
+    monitor.client.place_order.return_value = SimpleNamespace(id="TRADE-EXIT", seqno="SEQ-EXIT", ordno="ORD-EXIT")
+    monitor.order_mgr = OrderManager(mode="live")
+    monitor.paper_fill_sim = None
+    monitor._use_order_manager = True
+    monitor.trader = PaperTrader(initial_balance=100000, margin_per_lot=40000)
+    monitor.MGMT = {"max_positions": 2}
+    monitor.RISK = {"stop_loss_pts": 60}
+    monitor._last_cross_policy = {"allow_trade": True}
+    monitor._last_bar_context = {"momentum": 1.0, "mom_velo": 0.5, "vwap": 36440.0, "atr": 20.0, "regime": "NORMAL", "score": 1.0}
+    monitor._entry_features_futures = {"regime": "NORMAL"}
+    monitor.active_strategy_name = "counter_vwap"
+    monitor._save_orders_file_wrapper = lambda: None
+    monitor._cancel_safety_stop = lambda: None
+    monitor._place_safety_stop = lambda *args, **kwargs: None
+    monitor._pending_lifecycle_orders = {}
+    monitor._applied_lifecycle_deals = set()
+    monitor.consecutive_losses = 0
+    monitor.session_losses = []
+    monitor.session_type = "day"
+    monitor._session_pnl = 0.0
+    monitor._last_trade_ts = None
+    monitor._bars_since_trade = 0
+    monitor._signals_generated = 0
+    monitor._atr_trail_peak = 0.0
+    monitor._last_entry_reason = None
+    monitor._wire_order_callbacks()
+    return monitor
+
+
+def test_partial_confirmed_deal_exit_preserves_fee_inclusive_pnl():
+    monitor = _build_lifecycle_monitor_for_test()
+    monitor.trader.execute_signal("BUY", 36400.0, datetime(2026, 4, 21, 9, 0), lots=2, max_lots=2, stop_loss=60)
+
+    with patch("strategies.futures.monitor.save_trade") as save_trade, patch(
+        "strategies.futures.squeeze_futures.data.data_storage.save_signal_audit"
+    ):
+        order_id = monitor._execute_trade("PARTIAL_EXIT", 36500.0, datetime(2026, 4, 21, 9, 10), 1, reason="TP1")
+        order = monitor.order_mgr.active_orders[order_id]
+        intent_id = order.intent_id
+        monitor.order_mgr.apply_deal_fill(order_id, deal_id="deal-exit-001", fill_price=36500.0, fill_qty=1)
+
+    assert monitor.trader.position == 1
+    assert intent_id.startswith("intent_")
+    assert order.intent_id == intent_id
+    assert order.fills[0].deal_id == "deal-exit-001"
+    assert save_trade.call_args_list[0].args[0]["type"] == "PARTIAL_EXIT"
+    assert save_trade.call_args_list[0].args[0]["pnl_cash"] > 0
