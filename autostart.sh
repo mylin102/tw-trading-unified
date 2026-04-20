@@ -6,8 +6,8 @@
 # 4. 主動健康檢查：不等 crash，30 秒檢測一次
 # 5. 日誌輪轉：保留 7 天，防止磁碟爆滿
 
-UNIFIED_DIR="/Users/mingyenlin/Documents/mylin102/tw-trading-unified"
-PYTHON_EXEC="/Library/Frameworks/Python.framework/Versions/3.13/bin/python3"
+UNIFIED_DIR="/Users/mylin/Documents/mylin102/tw-trading-unified"
+PYTHON_EXEC="python3"
 LOG_DIR="$UNIFIED_DIR/logs"
 mkdir -p "$LOG_DIR"
 cd "$UNIFIED_DIR"
@@ -164,7 +164,7 @@ while true; do
     
     # Run main.py and capture output
     $PYTHON_EXEC "$UNIFIED_DIR/main.py" 2>&1 | tee -a "$LOG_DIR/unified.log"
-    EXIT_CODE=$?
+    EXIT_CODE=${PIPESTATUS[0]}
     
     END_TIME=$(date +%s)
     RUNTIME=$((END_TIME - START_TIME))
@@ -224,6 +224,7 @@ while true; do
     fi
     
     H=$(date +%H)
+    MM=$(date +%M)
     if [ "$H" -ge 8 ] && [ "$H" -lt 14 ]; then
         if [ "$STOCK_PIDS" -eq 0 ]; then
             STATUS="${STATUS}[❌股票]"

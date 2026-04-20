@@ -2257,9 +2257,10 @@ with tab_settings:
 
     # ── 0. 實盤就緒度檢查 ──
     with st.expander("🚀 實盤就緒度檢查", expanded=True):
-        from core.live_readiness import check_all, get_readiness_summary
-        results = check_all()
-        status, passed, total = get_readiness_summary(results)
+        from core.live_readiness import check_all, get_readiness_items, get_readiness_summary
+        check_output = check_all()
+        readiness_items = get_readiness_items(check_output)
+        status, passed, total = get_readiness_summary(check_output)
 
         st.markdown(f"### {status} ({passed}/{total} 項通過)")
 
@@ -2268,9 +2269,9 @@ with tab_settings:
         st.progress(pct)
 
         # Detail table
-        for r in results:
+        for r in readiness_items:
             icon = "✅" if r.passed else "❌"
-            st.caption(f"{icon} **{r.name}**: {r.value} — {r.detail}")
+            st.caption(f"{icon} **{r.name}**: {r.detail}")
 
         # Action recommendation
         if passed == total:
@@ -2279,9 +2280,9 @@ with tab_settings:
         elif passed >= total * 0.6:
             remaining = total - passed
             st.warning(f"⚠️ 還有 {remaining} 項未通過，建議繼續 Paper 觀察")
-            for r in results:
+            for r in readiness_items:
                 if not r.passed:
-                    st.caption(f"❌ 待解決: {r.name} (目前: {r.value})")
+                    st.caption(f"❌ 待解決: {r.name} (目前: {r.detail})")
         else:
             st.error("❌ 多數檢查未通過，不建議開啟實盤交易")
 
@@ -2447,11 +2448,11 @@ with tab_settings:
         stk_inner = stock_cfg.get("stocks", {})
         
         # 將同步按鈕與顯示邏輯整合
-        if st.button("🔄 同步 Squeeze Screener 推薦名單"):
+        if st.button("🔄 同步外部 CANSLIM 領頭羊名單"):
             try:
                 import subprocess
-                subprocess.run(["python3", "scripts/sync/sync_watchlist.py"], check=True, timeout=30)
-                st.success("同步成功！")
+                subprocess.run(["python3", "scripts/sync/sync_external_watchlist.py"], check=True, timeout=30)
+                st.success("同步成功！已從雲端獲取最新領頭羊名單。")
                 st.rerun()
             except Exception as e:
                 st.error(f"同步失敗: {e}")

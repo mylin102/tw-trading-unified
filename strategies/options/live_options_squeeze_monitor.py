@@ -156,7 +156,10 @@ class ShioajiOptionsSmartMonitor:
         self.entry_premium_limit = float(self.risk_mgmt.get("entry_premium_limit", 250))
         self.opening_grace_mins = int(self.risk_mgmt.get("opening_grace_mins", 5))
         
-        # Parameterized fees (GSD enhancement)
+        # [Fix] Parameterized fees (GSD enhancement)
+        self.broker_fee_per_side = float(self.execution_cfg.get("broker_fee_per_side", 20.0))
+        self.exchange_fee_per_side = float(self.execution_cfg.get("exchange_fee_per_side", 5.0))
+        self.tax_rate = float(self.execution_cfg.get("tax_rate", 0.00002))
         self.shutdown_grace_mins = int(self.exit_opt.get("shutdown_grace_mins", 1))
         
         # [GSD 4.12] Passive Initialization: Defer API and heavy objects
@@ -1223,12 +1226,19 @@ class ShioajiOptionsSmartMonitor:
         position_desc = f"{self.position}x {self.active_side}" if self.position > 0 and self.active_side else "flat"
         signal_desc = "none"
         if signal:
-            signal_desc = f"score={signal['score']:.1f} side={signal['side'] or '-'} trend={signal['mid_trend'] or '-'}"
+            signal_score = signal.get("score", 0.0)
+            signal_side = signal.get("side") or "-"
+            signal_trend = signal.get("mid_trend") or "-"
+            signal_desc = f"score={signal_score:.1f} side={signal_side} trend={signal_trend}"
         elif self.last_signal:
-            signal_desc = f"score={self.last_signal['score']:.1f} side={self.last_signal['side'] or '-'} trend={self.last_signal['mid_trend'] or '-'}"
+            last_score = self.last_signal.get("score", 0.0)
+            last_side = self.last_signal.get("side") or "-"
+            last_trend = self.last_signal.get("mid_trend") or "-"
+            signal_desc = f"score={last_score:.1f} side={last_side} trend={last_trend}"
+        last_price = self.market_data.get("MTX", {}).get("close", 0.0) or 0.0
         console.print(
             f"[cyan][{self.status_mode_label()}][/cyan] mode={self.mode} position={position_desc} "
-            f"mtx={self.market_data['MTX']['close']:.1f} signal={signal_desc}"
+            f"mtx={last_price:.1f} signal={signal_desc}"
         )
         self.last_status_print_at = now
 
@@ -1264,9 +1274,9 @@ class ShioajiOptionsSmartMonitor:
         price_mtx = float(self.market_data["MTX"]["close"])
         
         # 優先使用最新計算出的分數與趨勢，若 signal 存在則覆蓋
-        score = float(signal["score"]) if signal else self.latest_score
-        mid_trend = (signal["mid_trend"] or "") if signal else self.latest_mid_trend
-        side_label = (signal["side"] or "") if signal else ""
+        score = float(signal.get("score", 0)) if signal else self.latest_score
+        mid_trend = (signal.get("mid_trend") or "") if signal else self.latest_mid_trend
+        side_label = (signal.get("side") or "") if signal else ""
 
         if price_mtx <= 0:
             # 💡 GSD: Don't record if price is 0 (initialization spike)
@@ -1821,7 +1831,7 @@ class ShioajiOptionsSmartMonitor:
             if side:
                 self.replay_stats["directional_signals"] += 1
 
-            if not signal["side"]:
+            if not signal.get("side"):
                 if abs(score) < 1.0 and self.replay_stats["signals"] % 5 == 0:
                     console.print(f"[dim]⏳ Waiting for indicators to mature... (Score={score:.1f})[/dim]")
                 elif self.replay_stats["signals"] % 10 == 0:
@@ -1895,7 +1905,7 @@ class ShioajiOptionsSmartMonitor:
         # Average entry price for multiple positions
         prev_cost = self.entry_price * (self.position - self.paper_lots) if self.position > self.paper_lots else 0
         self.entry_price = (prev_cost + entry_price * self.paper_lots) / self.position if self.position > 0 else entry_price
-        self.entry_mtx_price = signal["price_mtx"]
+        self.entry_mtx_price = signal.get("price_mtx", 0)
         self.entry_time = signal.get("timestamp") or self._current_strategy_time()
         self.has_tp1_hit = False
         self.stop_loss_price = entry_price * (1 - self.stop_loss_pct)
@@ -1910,10 +1920,11 @@ class ShioajiOptionsSmartMonitor:
             "entry_price": float(entry_price)
         }
         
-        self.log_trade("PAPER_ENTRY", side, entry_price, f"score={signal['score']:.1f}")
+        sig_score = signal.get("score", 0)
+        self.log_trade("PAPER_ENTRY", side, entry_price, f"score={sig_score:.1f}")
         
         # [GSD Fix] Record in OrderManager so it appears in Dashboard
-        self._record_paper_order(side, "BUY", self.paper_lots, entry_price, f"ENTRY score={signal['score']:.1f}")
+        self._record_paper_order(side, "BUY", self.paper_lots, entry_price, f"ENTRY score={sig_score:.1f}")
 
     def _record_paper_order(self, side_label, action, quantity, price, note=""):
         """Helper to create a mock filled order for paper trades."""
@@ -1988,14 +1999,15 @@ class ShioajiOptionsSmartMonitor:
         self.pending_entry = {
             "side": side,
             "contract_code": contract.code,
-            "entry_mtx_price": signal["price_mtx"],
+            "entry_mtx_price": signal.get("price_mtx", 0.0),
             "signal_time": signal.get("timestamp"),
             "submitted_at": datetime.datetime.now(),
             "trade": trade,
             "retries": retries,
         }
         self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "")
-        self.log_trade("LIVE_ENTRY_SUBMITTED", side, getattr(contract, "ask_price", 0.0), f"score={signal['score']:.1f} trade={self.broker.describe_trade(trade)}")
+        sig_score = signal.get("score", 0.0)
+        self.log_trade("LIVE_ENTRY_SUBMITTED", side, getattr(contract, "ask_price", 0.0), f"score={sig_score:.1f} trade={self.broker.describe_trade(trade)}")
         if self.dry_run_live_orders:
             self._simulate_dry_run_fill(trade, contract, "Buy", self.paper_lots)
 
@@ -2111,8 +2123,8 @@ class ShioajiOptionsSmartMonitor:
             self._clear_stale_entry("entry timeout cancelled")
             if pending.get("retries", 0) < self.max_order_retries:
                 retry_signal = {
-                    "score": self.last_signal["score"] if self.last_signal else 0,
-                    "price_mtx": pending["entry_mtx_price"],
+                    "score": self.last_signal.get("score", 0.0) if self.last_signal else 0.0,
+                    "price_mtx": pending.get("entry_mtx_price", 0.0),
                 }
                 self.submit_live_entry(pending["side"], retry_signal, retries=pending.get("retries", 0) + 1)
                 self.log_trade("LIVE_ENTRY_RETRY", pending["side"], 0.0, f"retry={pending.get('retries', 0) + 1}")
@@ -2325,7 +2337,7 @@ class ShioajiOptionsSmartMonitor:
                     self.exit_paper_position("PAPER_TRAIL_EXIT", exit_price, reason)
                 return True
         
-        signal_score = signal["score"] if signal else (self.last_signal["score"] if self.last_signal else 999)
+        signal_score = signal.get("score", 0.0) if signal else (self.last_signal.get("score", 0.0) if self.last_signal else 999.0)
 
         # 3. Score reversal exit: 趨勢翻轉才出場
         #    修正: 出場門檻比進場寬 (1.5x entry_score)，防止 whipsaw
@@ -2401,12 +2413,15 @@ class ShioajiOptionsSmartMonitor:
             self.refresh_live_orders()
             signal = self.fetch_live_signal()
 
-            if signal and signal["side"] and self.position == 0:
+            sig_side = signal.get("side") if signal else None
+            sig_score = signal.get("score", 0.0) if signal else 0.0
+
+            if signal and sig_side and self.position == 0:
                 # [GSD 4.13] Trading Readiness Gate
                 if not self.is_trading_ready:
                     if self._bar_counter % 5 == 0:
-                        console.print(f"[bold yellow]🛡️ Trading Not Ready: Option {signal['side']} Entry Blocked (Stabilizing indicators...)[/bold yellow]")
-                    signal = {"score": 0, "side": None}
+                        console.print(f"[bold yellow]🛡️ Trading Not Ready: Option {sig_side} Entry Blocked (Stabilizing indicators...)[/bold yellow]")
+                    signal = {"score": 0.0, "side": None, "mid_trend": "", "price_mtx": 0.0}
                     return
 
                 # [L4] Decision Intelligence: Edge Evaluation
@@ -2420,19 +2435,19 @@ class ShioajiOptionsSmartMonitor:
                     "vwap_dist": 0, # Not readily available
                     "volatility": float(self.latest_iv or 0.25),
                     "price": spot,
-                    "side": "LONG" if signal["side"] == "C" else "SHORT",
+                    "side": "LONG" if sig_side == "C" else "SHORT",
                     # Pass proxies for Alpha features if not directly available
                     "breakout_strength": 0.0, 
                     "volume_spike": 1.0,
                     "trend_strength_raw": 0.005 if self.latest_mid_trend == "BULL" else (-0.005 if self.latest_mid_trend == "BEAR" else 0)
                 }
 
-                edge_res = edge_model.evaluate(abs(signal["score"]), edge_context, f"{self.mode}_squeeze")
+                edge_res = edge_model.evaluate(abs(sig_score), edge_context, f"{self.mode}_squeeze")
 
                 if not edge_res["has_edge"]:
                     if self._bar_counter % 5 == 0:
-                        console.print(f"[bold yellow]🛡️ Decision Intelligence: Option {signal['side']} Blocked - {edge_res['reason']}[/bold yellow]")
-                    signal = {"score": 0, "side": None}
+                        console.print(f"[bold yellow]🛡️ Decision Intelligence: Option {sig_side} Blocked - {edge_res['reason']}[/bold yellow]")
+                    signal = {"score": 0.0, "side": None, "mid_trend": "", "price_mtx": 0.0}
                 else:
                     # Apply scaling to quantity
                     self.paper_lots = max(1, round(self.paper_lots * edge_res["pos_scale"]))
@@ -2570,17 +2585,17 @@ class ShioajiOptionsSmartMonitor:
                             console.print(f"[bold cyan]🔺 [ThetaGang] ENTRY {pos.strategy}: credit={pos.net_credit:.0f} [{legs_str}][/bold cyan]")
                             return
 
-                if signal and signal["side"]:
+                if signal and sig_side:
                     if self.cooldown_until > 0:
-                        console.print(f"[dim]Signal {signal['side']} ignored during cooldown[/dim]")
+                        console.print(f"[dim]Signal {sig_side} ignored during cooldown[/dim]")
                         self.replay_stats["blocked_entries"] += 1
                     elif self.live_trading:
-                        console.print(f"[bold green]>>> ENTRY SIGNAL: {signal['side']} score={signal['score']:.1f}[/bold green]")
-                        self.enter_live_position(signal["side"], signal)
+                        console.print(f"[bold green]>>> ENTRY SIGNAL: {sig_side} score={sig_score:.1f}[/bold green]")
+                        self.enter_live_position(sig_side, signal)
                     else:
                         # Track: did paper entry succeed or fail?
                         before_pos = self.position
-                        self.enter_paper_position(signal["side"], signal)
+                        self.enter_paper_position(sig_side, signal)
                         if self.position == before_pos:
                             self.replay_stats["blocked_entries"] += 1
 
