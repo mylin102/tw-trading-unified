@@ -29,6 +29,7 @@ def test_dashboard_uses_readiness_items_helper():
 
     assert "get_readiness_items" in src
     assert "for r in readiness_items:" in src
+    assert "TRADING: PAUSED (STALE FEED)" in src
 
 
 def test_autostart_no_longer_manages_main_py():

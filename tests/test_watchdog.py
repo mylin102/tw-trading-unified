@@ -1,6 +1,7 @@
 import time
 import pandas as pd
 import pytest
+from core.shioaji_session import SystemReadiness, get_shared_system_status
 from strategies.futures.monitor import FuturesMonitor
 
 
@@ -29,6 +30,7 @@ def test_watchdog_no_action(tmp_path):
     m.STALE_WARN_SECS = 5
     m.STALE_CRITICAL_SECS = 10
     m.last_tick_at = time.time() - 2
+    m._last_real_tmf_tick_at = time.time() - 2
 
     # Should not raise
     m._check_futures_contract_staleness()
@@ -42,6 +44,7 @@ def test_watchdog_light_recovery(tmp_path):
     m.STALE_CRITICAL_SECS = 10
     # Simulate stale beyond warn
     m.last_tick_at = time.time() - 2
+    m._last_real_tmf_tick_at = time.time() - 2
 
     # Monkeypatch rollover and client.get_kline to return a small dataframe
     called = {"rolled": False, "refreshed": False}
@@ -72,6 +75,39 @@ def test_watchdog_light_recovery(tmp_path):
     assert len(m._tick_bars_deque) > 0
 
 
+def test_watchdog_marks_runtime_degraded_on_stale(tmp_path, monkeypatch):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("{}")
+    m = make_monitor(str(cfg))
+    m.STALE_WARN_SECS = 1
+    m.STALE_CRITICAL_SECS = 10
+    m._last_real_tmf_tick_at = time.time() - 2
+    monkeypatch.setattr("core.shioaji_session._system_status_path", lambda: tmp_path / "runtime_status.json")
+    m._check_contract_rollover = lambda: None
+    m.client.get_kline = lambda ticker, interval="5m": None
+
+    m._check_futures_contract_staleness()
+
+    assert get_shared_system_status() == SystemReadiness.DEGRADED
+
+
+def test_refresh_runtime_status_requires_fresh_tmf_for_trading(tmp_path, monkeypatch):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("{}")
+    m = make_monitor(str(cfg))
+    m.STALE_WARN_SECS = 5
+    m.is_trading_ready = True
+    monkeypatch.setattr("core.shioaji_session._system_status_path", lambda: tmp_path / "runtime_status.json")
+
+    m._last_real_tmf_tick_at = time.time() - 10
+    m._refresh_runtime_status()
+    assert get_shared_system_status() == SystemReadiness.DEGRADED
+
+    m._last_real_tmf_tick_at = time.time()
+    m._refresh_runtime_status()
+    assert get_shared_system_status() == SystemReadiness.TRADING
+
+
 def test_watchdog_critical_exit(tmp_path):
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text("{}")
@@ -80,6 +116,7 @@ def test_watchdog_critical_exit(tmp_path):
     m.STALE_CRITICAL_SECS = 5
     # Simulate critical stale
     m.last_tick_at = time.time() - 6
+    m._last_real_tmf_tick_at = time.time() - 6
 
     # api.quote.unsubscribe should exist but we expect RuntimeError
     class API2:

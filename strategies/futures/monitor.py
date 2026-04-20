@@ -123,6 +123,8 @@ class FuturesMonitor:
         # 💡 GSD: Market data cache for virtual ticks
         self.market_data = {"MTX": {"close": 0.0}}
         self.last_tick_at = time.time()  # [gstack] 數據新鮮度追蹤 — must init before _strategy_tick()
+        self._last_real_tmf_tick_at = self.last_tick_at
+        self._runtime_status = None
 
         # Apply config (Initial create for Trader and OrderMgr happens here)
         self.order_mgr = None
@@ -552,6 +554,37 @@ class FuturesMonitor:
                 combined.to_csv(csv_path, index_label="timestamp")
                 console.print(f"[green][FuturesMonitor] ✅ Backfill complete: {len(combined)} total bars in CSV[/green]")
 
+    def _tmf_feed_age_secs(self):
+        """Prefer real TMF feed freshness over synthetic continuity timestamps."""
+        try:
+            if hasattr(self, "feed_health") and self.feed_health is not None:
+                age = self.feed_health.age("TMF")
+                if age is not None:
+                    return max(0.0, float(age))
+        except Exception:
+            pass
+        last_real_tick = getattr(self, "_last_real_tmf_tick_at", self.last_tick_at)
+        return max(0.0, time.time() - last_real_tick)
+
+    def _set_runtime_status(self, status):
+        if getattr(self, "_runtime_status", None) == status:
+            return
+        from core.shioaji_session import set_system_status
+        set_system_status(status)
+        self._runtime_status = status
+
+    def _refresh_runtime_status(self):
+        from core.shioaji_session import SystemReadiness
+
+        warn = getattr(self, "STALE_WARN_SECS", self.MONITOR.get("stale_tick_warn_secs", 120))
+        tmf_age = self._tmf_feed_age_secs()
+        if tmf_age > warn:
+            self._set_runtime_status(SystemReadiness.DEGRADED)
+        elif self.is_trading_ready:
+            self._set_runtime_status(SystemReadiness.TRADING)
+        else:
+            self._set_runtime_status(SystemReadiness.MONITORING)
+
     def _check_futures_contract_staleness(self):
         """[Wave 1 Fix] Check if TMF ticks are stale and attempt recovery.
 
@@ -563,12 +596,14 @@ class FuturesMonitor:
         if self.dry_run or not self.api:
             return
         
-        secs_since_tick = time.time() - self.last_tick_at
+        secs_since_tick = self._tmf_feed_age_secs()
         warn = getattr(self, 'STALE_WARN_SECS', self.MONITOR.get('stale_tick_warn_secs', 120))
         critical = getattr(self, 'STALE_CRITICAL_SECS', self.MONITOR.get('stale_tick_critical_secs', 600))
         if secs_since_tick < warn:
             return
 
+        from core.shioaji_session import SystemReadiness
+        self._set_runtime_status(SystemReadiness.DEGRADED)
         console.print(f"[yellow]⚠️ TMF data stale for {secs_since_tick/60:.1f} min, checking contract...[/yellow]")
 
         # If we exceed critical threshold, stop the monitor so external supervisor restarts the process
@@ -796,8 +831,10 @@ class FuturesMonitor:
         # [GSD Settlement Fix] If it's an MTX tick, it's just a heartbeat to drive timing.
         # We use the last known TMF price to avoid price contamination (TMF != MTX).
         if is_tmf:
+            self._last_real_tmf_tick_at = self.last_tick_at
             price = float(tick.close)
             self._last_tmf_price = price # Cache for heartbeat
+            self._refresh_runtime_status()
         else:
             # It's an MTX heartbeat tick
             if not hasattr(self, '_last_tmf_price') or self._last_tmf_price <= 0:
@@ -915,7 +952,7 @@ class FuturesMonitor:
             return  # Already audited this hour
         self._last_audit_hour = now_hour
         
-        secs_since_tick = time.time() - self.last_tick_at
+        secs_since_tick = self._tmf_feed_age_secs()
         data_stale = secs_since_tick > 120  # 2+ min without tick
 
         # Use actual kbar count if available, fallback to _bars_since_trade
@@ -2026,8 +2063,7 @@ class FuturesMonitor:
         mode = "dry-run" if self.dry_run else ("LIVE" if self.live_trading else "PAPER")
         
         # [Phase A] Immediate Position Recovery & Heartbeat Start
-        from core.shioaji_session import set_system_status, SystemReadiness
-        set_system_status(SystemReadiness.MONITORING)
+        self._refresh_runtime_status()
         
         if not self.dry_run and self.api:
             try:
@@ -2160,6 +2196,7 @@ class FuturesMonitor:
         # [Bug Fix] Check data freshness and attempt reconnection
         if not self.dry_run:
             self._check_futures_contract_staleness()
+            self._refresh_runtime_status()
             # Strategy-level freshness gate: skip strategy tick if feed ages exceed warn threshold
             try:
                 if hasattr(self, 'feed_health') and self.feed_health is not None:
@@ -2376,10 +2413,10 @@ class FuturesMonitor:
             console.print(f"[yellow]⚠️ Cross-regime integration failed: {e}[/yellow]")
 
         # [GSD 4.13] Trading Readiness Unlock: only allow trading if we have enough bars for indicators
-        if not self.is_trading_ready and len(df_5m) >= self.STRATEGY.get("length", 20):
+        feed_is_fresh = self._tmf_feed_age_secs() <= getattr(self, "STALE_WARN_SECS", self.MONITOR.get("stale_tick_warn_secs", 120))
+        if not self.is_trading_ready and len(df_5m) >= self.STRATEGY.get("length", 20) and feed_is_fresh:
             self.is_trading_ready = True
-            from core.shioaji_session import set_system_status, SystemReadiness
-            set_system_status(SystemReadiness.TRADING)
+            self._refresh_runtime_status()
             console.print(f"[bold green]🔥 [FuturesMonitor] Trading READY: {len(df_5m)} bars loaded.[/bold green]")
         
         # ── GSD: Ensure trading_day is always present before any downstream usage ──

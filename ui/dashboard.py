@@ -15,6 +15,13 @@ import datetime
 import os
 from core.date_utils import get_session_date_str, get_trade_day
 from core.dashboard_data import merge_indicator_frames
+from core.dashboard_positions import (
+    count_futures_entries,
+    count_options_entries,
+    estimate_theta_unrealized,
+    find_latest_open_futures_position,
+    find_latest_open_options_position,
+)
 import subprocess
 import time
 from pathlib import Path
@@ -198,6 +205,8 @@ with st.sidebar:
         st.success("✅ MONITORING")
         st.success("✅ TRADING READY")
     elif status.name == "DEGRADED":
+        st.success("✅ MONITORING")
+        st.warning("⚠️ TRADING: PAUSED (STALE FEED)")
         st.error("🚨 DEGRADED")
     
     st.divider()
@@ -558,6 +567,9 @@ def format_futures_trades(ledger_df):
                 cost = 0
             net = gross - cost if cost > 0 else gross
 
+            # GSD Fix: Add cost basis (進場成本) for better visibility
+            cost_basis = entry * 50 * lots
+            
             trades.append({
                 "#": trade_num,
                 "進場時間": pending_entry["entry_time"],
@@ -566,6 +578,7 @@ def format_futures_trades(ledger_df):
                 "進場價": round(entry, 0),
                 "出場價": round(exit_p, 0),
                 "口數": lots,
+                "進場成本": round(cost_basis, 0),
                 "出場原因": action,
                 "毛利": round(gross, 0),
                 "摩擦成本": round(cost, 0),
@@ -575,6 +588,7 @@ def format_futures_trades(ledger_df):
 
     if pending_entry:
         trade_num += 1
+        cost_basis = pending_entry["entry_price"] * 50 * pending_entry["lots"]
         trades.append({
             "#": trade_num,
             "進場時間": pending_entry["entry_time"],
@@ -583,6 +597,7 @@ def format_futures_trades(ledger_df):
             "進場價": round(pending_entry["entry_price"], 0),
             "出場價": "-",
             "口數": pending_entry["lots"],
+            "進場成本": round(cost_basis, 0),
             "出場原因": "-",
             "毛利": "-",
             "摩擦成本": "-",
@@ -600,7 +615,8 @@ def _format_coerce_floats(df):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").apply(
                 lambda x: f"{x:.2f}" if pd.notna(x) else "-")
-    for col in ["毛利", "摩擦成本", "淨利"]:
+    # GSD Fix: Format 進場成本 with thousand separators
+    for col in ["進場成本", "毛利", "摩擦成本", "淨利"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").apply(
                 lambda x: f"{x:,.0f}" if pd.notna(x) else "-")
@@ -906,7 +922,8 @@ def load_futures_trades():
       2. exports/trades TMF_{DATE_STR}_trades.csv
       3. logs/market_data TMF_{TRADE_DATE_STR}*_trades.csv
       4. logs/market_data TMF_{DATE_STR}*_trades.csv
-    Returns a DataFrame or None.
+    Returns a tuple (DataFrame or None, actual_date_str).
+    GSD Fix: Return tuple to show which date's file was actually loaded.
     """
     import glob
     # Try canonical exports location first
@@ -914,7 +931,7 @@ def load_futures_trades():
         f_exact = FUTURES_TRADES / f"TMF_{date_str}_trades.csv"
         if f_exact.exists():
             try:
-                return pd.read_csv(f_exact)
+                return pd.read_csv(f_exact), date_str
             except Exception:
                 pass
     # Fallback: search market_data for any matching pattern (prefer newest)
@@ -926,7 +943,7 @@ def load_futures_trades():
             matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
             for m in matches:
                 try:
-                    return pd.read_csv(m)
+                    return pd.read_csv(m), date_str
                 except Exception:
                     continue
     # Final fallback: any TMF_*_trades.csv in exports/trades or market_data
@@ -937,12 +954,15 @@ def load_futures_trades():
         if all_matches:
             latest = max(all_matches, key=os.path.getmtime)
             try:
-                return pd.read_csv(latest)
+                df = pd.read_csv(latest)
+                # Extract date from filename (TMF_YYYYMMDD_trades.csv)
+                actual_date = latest.stem.split("_")[1] if "_" in latest.stem else "unknown"
+                return df, actual_date
             except Exception:
                 pass
     except Exception:
         pass
-    return None
+    return None, None
 
 OPTIONS_SUB = "live_trading" if o_live else "paper_trading"
 
@@ -1185,11 +1205,18 @@ with tab_overview:
             c3.metric("Bars", len(f_df))
         else:
             st.info("無期貨指標數據")
-        ft = load_futures_trades()
-        # 顯示本交易日交易筆數
+        ft, ft_date = load_futures_trades()
+        # GSD Fix: Show which date's file was actually loaded to avoid confusion during night sessions
         trading_day_str = TRADE_DATE_STR
         trading_day_display = f"{trading_day_str[:4]}-{trading_day_str[4:6]}-{trading_day_str[6:8]}"
-        st.write(f"交易日 {trading_day_display} 交易: {len(ft) if ft is not None else 0} 筆")
+        
+        futures_entry_count = count_futures_entries(ft)
+        if ft is not None and ft_date and ft_date != trading_day_str:
+            # Night session: file date differs from trading day
+            file_date_display = f"{ft_date[:4]}-{ft_date[4:6]}-{ft_date[6:8]}"
+            st.write(f"交易日 {trading_day_display} (檔案日期: {file_date_display}) 交易: {futures_entry_count} 筆")
+        else:
+            st.write(f"交易日 {trading_day_display} 交易: {futures_entry_count} 筆")
 
     with col2:
         st.header(f"選擇權 TXO ({mode_badge(o_live)})")
@@ -1209,14 +1236,8 @@ with tab_overview:
             ol["Timestamp"] = pd.to_datetime(ol["Timestamp"], errors="coerce")
             ol = ol.dropna(subset=["Timestamp"])
             
-            # 使用交易日邏輯，而不是日曆日
-            from core.date_utils import get_trade_day
-            ol["TradingDay"] = ol["Timestamp"].apply(lambda x: get_trade_day(x).strftime("%Y%m%d"))
-            
-            # 比較交易日，而不是日曆日
-            today_l = ol[ol["TradingDay"] == DATE_STR]
-            entries = today_l[today_l["Action"].str.contains("ENTRY", na=False) & ~today_l["Action"].str.contains("EXIT", na=False)]
-            st.write(f"今日進場: {len(entries)} 筆")
+            options_entry_count = count_options_entries(ol, DATE_STR)
+            st.write(f"交易日 {DATE_STR[:4]}-{DATE_STR[4:6]}-{DATE_STR[6:8]} 交易: {options_entry_count} 筆")
         else:
             st.write("今日交易: 0 筆")
 
@@ -1263,7 +1284,7 @@ with tab_overview:
     # ── 總覽 PnL ──
     st.header("今日累計 PnL")
     pc1, pc2, pc3 = st.columns(3)
-    ft = load_futures_trades()
+    ft, _ = load_futures_trades()
     fpnl = calc_futures_pnl(ft)
     ol = load_options_ledger()
     opnl = calc_options_pnl(ol)
@@ -1413,23 +1434,18 @@ with tab_futures:
         if "fired" in last and last.get("fired", False) is True:
             st.success("🔥 **FIRE — 壓縮釋放！**")
         
-        ft = load_futures_trades()
+        ft, _ = load_futures_trades()
         st.plotly_chart(make_price_score_chart(f_df, "close", "TMF 價格 & Score", signals=ft), use_container_width=True)
         st.dataframe(f_df.tail(20), use_container_width=True)
     else:
         st.info("無數據")
-    ft = load_futures_trades()
+    ft, _ = load_futures_trades()
     if ft is not None and not ft.empty:
         # --- Unrealized PnL ---
         round_trips = format_futures_trades(ft)
-        open_pos = None
-        if round_trips is not None and "#" in round_trips.columns:
-            open_rows = round_trips[round_trips["出場時間"] == "⏳ 持倉中"]
-            if not open_rows.empty:
-                open_pos = open_rows.iloc[-1]
+        open_pos = find_latest_open_futures_position(ft)
 
         if open_pos is not None:
-            # 添加更新按鈕
             col1, col2 = st.columns([3, 1])
             with col1:
                 st.subheader("📊 未實現損益 (持倉中)")
@@ -1439,16 +1455,17 @@ with tab_futures:
                     st.rerun()
             
             cur_price = float(f_df["close"].iloc[-1]) if len(f_df) > 0 else 0
-            entry = float(open_pos.get("進場價", 0))
-            lots = int(open_pos.get("口數", 1))
-            direction = str(open_pos.get("方向", ""))
+            entry = float(open_pos.entry_price)
+            lots = int(open_pos.lots)
+            direction = str(open_pos.direction)
             if cur_price > 0 and entry > 0:
                 mult = 1 if direction == "BUY" else -1
                 unrealized = (cur_price - entry) * 50 * lots * mult
-                color = "green" if unrealized >= 0 else "red"
-                st.metric("", f"{unrealized:+,.0f} TWD",
-                          delta=f"{unrealized:+,.0f} ({(unrealized/(entry*50*lots)*100):+.1f}%)")
-                st.caption(f"進場價: {entry:.0f} | 目前: {cur_price:.0f} | {direction} {lots}口")
+                uc1, uc2, uc3 = st.columns(3)
+                uc1.metric("成交成本", f"{open_pos.cost_basis:,.0f} TWD")
+                uc2.metric("未實現損益", f"{unrealized:+,.0f} TWD")
+                uc3.metric("目前價", f"{cur_price:.0f}", delta=f"{cur_price-entry:+.0f} pts")
+                st.caption(f"進場價: {entry:.0f} | 目前: {cur_price:.0f} | {direction} {lots}口 | 報酬率 {(unrealized/(entry*50*lots)*100):+.1f}%")
 
         st.header("交易記錄 (Round-Trip)")
         round_trips = format_futures_trades(ft)
@@ -1663,19 +1680,20 @@ with tab_options:
         if "fired" in last and last.get("fired", False) is True:
             st.success("🔥 **FIRE — 壓縮釋放！**")
 
+        current_spot = float(last.get("price_mtx", 0) or 0)
+        current_iv = float(last.get("iv", 0) or 0)
+        current_dte_years = float(last.get("dte", 0) or 0) / 365.0 if last.get("dte", 0) else 0.0
+
         # 顯示當前選擇權持倉
         ol = load_options_ledger()
         if ol is not None and not ol.empty:
-            # 找最後一筆非 EXIT 的交易
-            active = ol[~ol["Action"].str.contains("EXIT|TP1", na=False)]
-            if not active.empty:
-                last_pos = active.iloc[-1]
-                side = str(last_pos.get("Side", ""))
-                action = str(last_pos.get("Action", ""))
-                if "iron_condor" in side.lower():
+            open_option = find_latest_open_options_position(ol)
+            if open_option is not None:
+                side = str(open_option.side)
+                action = str(open_option.action)
+                note = str(open_option.note)
+                if "iron_condor" in note.lower():
                     pos_label = "🦅 Iron Condor"
-                    # 從 Note 取腿資訊
-                    note = str(last_pos.get("Note", ""))
                     if "[" in note:
                         pos_label += " " + note.split("[")[1].split("]")[0]
                 elif side.upper() == "C":
@@ -1684,15 +1702,30 @@ with tab_options:
                     pos_label = "📉 Put"
                 else:
                     pos_label = side
-                st.caption(f"當前持倉: **{pos_label}** | 進場: {action} @ {last_pos.get('Price', '')}")
+                st.caption(f"當前持倉: **{pos_label}** | 進場: {action} @ {open_option.entry_price:.2f}")
 
-                # --- Unrealized PnL (proxy via MTX price change) ---
-                entry_price = float(last_pos.get("Price", 0))
-                qty = int(last_pos.get("Quantity", 1))
-                cur_mtx = float(o_df["price_mtx"].iloc[-1]) if len(o_df) > 0 and "price_mtx" in o_df.columns else 0
-                if entry_price > 0 and cur_mtx > 0:
-                    # 選項權利金變化無法直接取得，用 MTX 價格變化估算方向
-                    st.caption(f"目前 MTX: {cur_mtx:.0f}")
+                theta_estimate = None
+                if "THETA" in action and current_spot > 0 and current_iv > 0 and current_dte_years > 0:
+                    theta_estimate = estimate_theta_unrealized(
+                        open_option.note,
+                        current_spot=current_spot,
+                        current_iv=current_iv,
+                        dte_years=current_dte_years,
+                        quantity=open_option.quantity,
+                    )
+
+                if theta_estimate is not None:
+                    ocu1, ocu2, ocu3 = st.columns(3)
+                    ocu1.metric("成交成本", f"{theta_estimate['cost_basis']:,.0f} TWD")
+                    ocu2.metric("未實現損益", f"{theta_estimate['unrealized_pnl']:+,.0f} TWD")
+                    ocu3.metric("目前部位價值", f"{theta_estimate['current_value']*50*theta_estimate['quantity']:,.0f} TWD")
+                    st.caption(
+                        f"估算: spot {current_spot:.0f} | IV {current_iv:.3f} | DTE {current_dte_years*365:.1f} | "
+                        f"信用金 {theta_estimate['entry_credit']:.1f} | 策略 {theta_estimate['strategy']}"
+                    )
+                elif open_option.entry_price > 0:
+                    st.metric("成交成本", f"{open_option.cost_basis:,.0f} TWD")
+                    st.caption(f"目前 MTX: {current_spot:.0f}")
             else:
                 st.caption("目前無持倉")
         else:
@@ -1786,6 +1819,14 @@ with tab_options:
                     display_cols.append("strategy")
 
                 # Calculate unrealized PnL using LIVE premium
+                # GSD Fix: Warn about multi-leg strategies
+                has_strategy_col = "strategy" in df_orders.columns
+                has_multi_leg = False
+                if has_strategy_col:
+                    strategies = df_orders["strategy"].dropna().unique()
+                    multi_leg_keywords = ["iron_condor", "bull_put", "bear_call", "butterfly", "condor", "spread"]
+                    has_multi_leg = any(any(kw in str(s).lower() for kw in multi_leg_keywords) for s in strategies)
+                
                 if live_premium and live_premium > 0:
                     # 添加更新按鈕
                     col1, col2 = st.columns([3, 1])
@@ -1795,6 +1836,10 @@ with tab_options:
                         if st.button("🔄 更新", key="update_options_unrealized"):
                             st.cache_data.clear()
                             st.rerun()
+                    
+                    # GSD Fix: Show warning for multi-leg strategies
+                    if has_multi_leg:
+                        st.warning("⚠️ 多腿策略 (如 Iron Condor) 的未實現損益需要計算整體部位，單一標的價格可能不準確。請參考選擇權監控系統的部位損益。")
                     
                     def _calc_opt_unreal(row):
                         if row.get("status") not in ("filled", "partial_filled"):
