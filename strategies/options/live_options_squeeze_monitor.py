@@ -2315,12 +2315,12 @@ class ShioajiOptionsSmartMonitor:
             return
         exit_qty = self.position
         side = self.active_side
-        self.position = 0
-        self.log_trade(action, side, price, note, quantity=exit_qty)
-        
-        # [GSD Fix] Record in OrderManager
-        self._record_paper_order(side, "SELL", exit_qty, price, f"{action} {note}")
+        paper_order = self._record_paper_order(side, "SELL", exit_qty, price, f"{action} {note}".strip())
+        if self.order_mgr and paper_order is None:
+            return
 
+        self.position = max(0, self.position - exit_qty)
+        self.log_trade(action, side, price, note, quantity=exit_qty)
         self.active_side = None
         self.entry_price = 0.0
         self.entry_mtx_price = 0.0
@@ -2330,6 +2330,31 @@ class ShioajiOptionsSmartMonitor:
         self.peak_premium = 0.0
         self.cooldown_until = self.cooldown_bars
         self.replay_stats["exits"] += 1
+
+    def apply_paper_tp1(self, price, note=""):
+        if self.position <= 0 or not self.active_side:
+            return False
+        side = self.active_side
+        exit_qty = min(1, self.position)
+        paper_order = self._record_paper_order(side, "SELL", exit_qty, price, f"{self.status_mode_label()}_TP1 {note}".strip())
+        if self.order_mgr and paper_order is None:
+            return False
+
+        self.position = max(0, self.position - exit_qty)
+        self.has_tp1_hit = True
+        self.replay_stats["tp1_hits"] += 1
+        self.log_trade(f"{self.status_mode_label()}_TP1", side, price, note, quantity=exit_qty)
+        if self.position == 0:
+            self.active_side = None
+            self.entry_price = 0.0
+            self.entry_mtx_price = 0.0
+            self.entry_time = None
+            self.stop_loss_price = 0.0
+            self.peak_premium = 0.0
+            self.cooldown_until = self.cooldown_bars
+            self.replay_stats["exits"] += 1
+            self.has_tp1_hit = False
+        return True
 
     def exit_live_position(self, action, note="", quantity=None):
         self.submit_live_exit(action, note=note, quantity=quantity, retries=0)
@@ -2805,10 +2830,7 @@ class ShioajiOptionsSmartMonitor:
             if self.live_trading:
                 self.exit_live_position("LIVE_TP1_SUBMITTED", f"score={signal_score:.1f}", quantity=1)
             else:
-                self.position = max(0, self.position - 1)  # Reduce by 1 lot
-                self.has_tp1_hit = True
-                self.replay_stats["tp1_hits"] += 1
-                self.log_trade(f"{self.status_mode_label()}_TP1", self.active_side, exit_price, f"score={signal_score:.1f}")
+                self.apply_paper_tp1(exit_price, f"score={signal_score:.1f}")
         if should_exit_position(
             exit_price,
             self.entry_price,

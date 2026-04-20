@@ -47,8 +47,8 @@ def _build_options_monitor():
     monitor.pending_exit_reason = None
     monitor.pending_exit_trade = None
     monitor.active_contracts = {
-        "C": SimpleNamespace(code="TXO-C"),
-        "P": SimpleNamespace(code="TXO-P"),
+        "C": SimpleNamespace(code="TXO-C", delivery_date="2026/05/20"),
+        "P": SimpleNamespace(code="TXO-P", delivery_date="2026/05/20"),
     }
     monitor.market_data = {
         "C": {"bid": 9.0, "ask": 10.0},
@@ -64,6 +64,16 @@ def _build_options_monitor():
     monitor._save_orders_file_wrapper = lambda: None
     monitor._audit_signal = lambda *args, **kwargs: None
     monitor.sync_contract_quotes = lambda: None
+    monitor.status_mode_label = lambda: "PAPER"
+    monitor.live_trading = False
+    monitor.m_cfg = {"tp1_pct": 0.05}
+    monitor.trailing_stop_pct = 0.0
+    monitor.last_signal = None
+    monitor.entry_score = 1.0
+    monitor.opening_grace_mins = 0
+    monitor.score_floor = 0.0
+    monitor.max_holding_days = 5
+    monitor._update_theta_release_confirmation = lambda signal, spot: {"confirmed": True, "reason": "test"}
     return monitor
 
 
@@ -142,3 +152,53 @@ def test_options_callbacks_preserve_intent_order_and_deal_linkage():
     assert order.fills[0].deal_id.startswith("deal_")
     assert order.fills[0].broker_trade_id == "TRADE-003"
     assert monitor.position == 1
+
+
+def test_options_paper_exit_records_mock_deal_before_position_zero():
+    monitor = _build_options_monitor()
+    monitor.enter_paper_position("C", {"side": "C", "score": 1.5, "timestamp": datetime.datetime(2026, 4, 20, 21, 5), "price_mtx": 23010})
+
+    positions_at_record = []
+    original_record = monitor._record_paper_order
+
+    def _wrapped_record(*args, **kwargs):
+        positions_at_record.append(monitor.position)
+        return original_record(*args, **kwargs)
+
+    monitor._record_paper_order = _wrapped_record
+    monitor.exit_paper_position("PAPER_EXIT", 11.0, "reason=test")
+
+    assert positions_at_record == [1]
+    assert monitor.position == 0
+    assert len(monitor.order_mgr.completed) == 2
+    exit_order = monitor.order_mgr.completed[-1]
+    assert exit_order.fills[0].deal_id == f"deal-{exit_order.order_id}"
+
+
+def test_options_paper_tp1_records_partial_exit_lifecycle_before_position_changes():
+    monitor = _build_options_monitor()
+    monitor.enter_paper_position("C", {"side": "C", "score": 1.5, "timestamp": datetime.datetime(2026, 4, 20, 21, 5), "price_mtx": 23010})
+    monitor.position = 2
+    monitor.has_tp1_hit = False
+    monitor.current_option_quote = lambda side: {"bid": 11.0, "ask": 12.0}
+
+    positions_at_record = []
+    original_record = monitor._record_paper_order
+
+    def _wrapped_record(*args, **kwargs):
+        positions_at_record.append(monitor.position)
+        return original_record(*args, **kwargs)
+
+    monitor._record_paper_order = _wrapped_record
+    handled = monitor.manage_open_position({
+        "timestamp": datetime.datetime(2026, 4, 20, 21, 15),
+        "score": 0.0,
+    })
+
+    assert handled is False
+    assert positions_at_record == [2]
+    assert monitor.position == 1
+    assert monitor.has_tp1_hit is True
+    tp1_order = monitor.order_mgr.completed[-1]
+    assert tp1_order.comment.startswith("PAPER_TP1")
+    assert tp1_order.fills[0].deal_id == f"deal-{tp1_order.order_id}"
