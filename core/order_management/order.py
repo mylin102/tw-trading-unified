@@ -9,6 +9,8 @@ from enum import Enum
 from typing import Optional, Dict, Any, List
 import json
 
+from .order_fill import OrderFill
+
 
 class OrderStatus(Enum):
     """委託單狀態枚舉 (對應 Shioaji OrderState + 生命週期)"""
@@ -51,6 +53,7 @@ class Order:
         account: str = "",
         comment: str = "",
         order_id: Optional[str] = None,
+        intent_id: Optional[str] = None,
         parent_order_id: Optional[str] = None,
     ):
         """
@@ -67,9 +70,11 @@ class Order:
             account: 帳戶名稱
             comment: 備註
             order_id: 委託單ID (自動生成如果為None)
+            intent_id: 策略意圖ID (自動生成如果為None)
             parent_order_id: 父委託單ID (用於分批下單)
         """
         self.order_id = order_id or uuid.uuid4().hex[:8]
+        self.intent_id = intent_id or f"intent_{uuid.uuid4().hex[:12]}"
         self.symbol = symbol
         self.side = side
         self.order_type = order_type
@@ -100,14 +105,26 @@ class Order:
         
         # 執行細節
         self.exchange_order_id: Optional[str] = None
+        self.broker_order_id: Optional[str] = None
+        self.seqno: Optional[str] = None
+        self.ordno: Optional[str] = None
         self.reject_reason: Optional[str] = None
         self.cancel_reason: Optional[str] = None
+        self.fills: List[OrderFill] = []
+        self.raw_events: List[Dict[str, Any]] = []
         
         # 執行品質指標
         self.slippage = 0.0
         self.fill_time_ms: Optional[int] = None
         
-    def submit(self, exchange_order_id: str) -> None:
+    def submit(
+        self,
+        exchange_order_id: str,
+        *,
+        broker_order_id: Optional[str] = None,
+        seqno: Optional[str] = None,
+        ordno: Optional[str] = None,
+    ) -> None:
         """提交委託單到交易所"""
         if self.status != OrderStatus.PENDING_SUBMIT:
             raise ValueError(f"Cannot submit order in {self.status.value} state")
@@ -115,10 +132,18 @@ class Order:
         self.status = OrderStatus.SUBMITTED
         self.submitted_at = datetime.now()
         self.exchange_order_id = exchange_order_id
+        self.broker_order_id = broker_order_id or exchange_order_id
+        self.seqno = seqno
+        self.ordno = ordno or exchange_order_id
         self.updated_at = self.submitted_at
         
     def fill(self, fill_price: float, fill_quantity: int, 
-             commission: float = 0.0, tax: float = 0.0) -> None:
+             commission: float = 0.0, tax: float = 0.0,
+             deal_id: Optional[str] = None,
+             exchange_fill_id: Optional[str] = None,
+             broker_trade_id: Optional[str] = None,
+             exchange_seq: Optional[str] = None,
+             fill_time: Optional[datetime] = None) -> None:
         """
         成交委託單（部分或全部）
 
@@ -153,6 +178,18 @@ class Order:
         self.commission += commission
         self.tax += tax
         self.total_fee = self.commission + self.tax
+        self.fills.append(OrderFill(
+            order_id=self.order_id,
+            fill_price=fill_price,
+            fill_quantity=fill_quantity,
+            commission=commission,
+            tax=tax,
+            deal_id=deal_id,
+            exchange_fill_id=exchange_fill_id,
+            broker_trade_id=broker_trade_id,
+            exchange_seq=exchange_seq,
+            fill_time=fill_time,
+        ))
         
         # 更新狀態
         if self.filled_quantity == self.quantity:
@@ -236,6 +273,7 @@ class Order:
         """轉換為字典格式"""
         return {
             "order_id": self.order_id,
+            "intent_id": self.intent_id,
             "symbol": self.symbol,
             "side": self.side.value,
             "order_type": self.order_type.value,
@@ -255,9 +293,14 @@ class Order:
             "slippage": self.slippage,
             "fill_time_ms": self.fill_time_ms,
             "exchange_order_id": self.exchange_order_id,
+            "broker_order_id": self.broker_order_id or self.exchange_order_id,
+            "seqno": self.seqno,
+            "ordno": self.ordno or self.exchange_order_id,
             "reject_reason": self.reject_reason,
             "cancel_reason": self.cancel_reason,
             "parent_order_id": self.parent_order_id,
+            "fills": [fill.to_dict() for fill in self.fills],
+            "raw_events": self.raw_events,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
             "filled_at": self.filled_at.isoformat() if self.filled_at else None,
@@ -286,6 +329,7 @@ class Order:
             account=data.get("account", ""),
             comment=data.get("comment", ""),
             order_id=data["order_id"],
+            intent_id=data.get("intent_id"),
             parent_order_id=data.get("parent_order_id"),
         )
         
@@ -299,8 +343,13 @@ class Order:
         order.slippage = data.get("slippage", 0.0)
         order.fill_time_ms = data.get("fill_time_ms")
         order.exchange_order_id = data.get("exchange_order_id")
+        order.broker_order_id = data.get("broker_order_id") or order.exchange_order_id
+        order.seqno = data.get("seqno")
+        order.ordno = data.get("ordno") or order.exchange_order_id
         order.reject_reason = data.get("reject_reason")
         order.cancel_reason = data.get("cancel_reason")
+        order.fills = [OrderFill.from_dict(item) for item in data.get("fills", [])]
+        order.raw_events = data.get("raw_events", [])
         
         # 恢復時間戳記
         def parse_datetime(dt_str):

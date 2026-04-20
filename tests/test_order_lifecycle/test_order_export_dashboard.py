@@ -51,9 +51,19 @@ class TestOrderExportFormat:
         assert "total_fee" in d     # 總摩擦成本
         assert "slippage" in d      # 滑價
         assert "exchange_order_id" in d  # 交易所委託編號
+        assert "intent_id" in d
+        assert "broker_order_id" in d
+        assert "seqno" in d
+        assert "ordno" in d
+        assert "fills" in d
         assert "created_at" in d    # 建立時間
         assert "submitted_at" in d  # 送出時間
         assert "filled_at" in d     # 成交時間
+
+        assert d["intent_id"].startswith("intent_")
+        assert d["broker_order_id"] == "EXCH-001"
+        assert isinstance(d["fills"], list)
+        assert d["fills"][0]["deal_id"].startswith("deal_")
 
     def test_market_order_export(self):
         """市價單匯出格式"""
