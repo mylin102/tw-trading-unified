@@ -36,6 +36,8 @@ from squeeze_futures.data.data_storage import save_trade
 from core.strategy_registry import StrategyRegistry
 from core.strategy_context import StrategyContext, PositionView, MarketData
 from core.signal import Signal
+from core.bar_utils import attach_bar_metadata, build_preferred_canonical_bar_frames, resample_ohlcv
+from core.date_utils import get_taifex_futures_hhmm, is_taifex_futures_market_open, get_taifex_futures_session_type
 from squeeze_futures.data.shioaji_client import ShioajiClient
 from squeeze_futures.data.data_storage import save_trade
 
@@ -115,6 +117,7 @@ class FuturesMonitor:
         self._signals_rejected = 0       # rejected signals this hour (reason, count)
         self._last_audit_hour = -1       # last hour we ran the audit
         self._data_stale_bars = 0        # consecutive bars with no new data
+        self.options_monitor = None      # shared options monitor for hourly audit / repair
         
         # 💡 GSD: Market data cache for virtual ticks
         self.market_data = {"MTX": {"close": 0.0}}
@@ -382,13 +385,7 @@ class FuturesMonitor:
             df_1min = self._fetch_today_kbars()
             if df_1min is not None and len(df_1min) >= 1:
                 # 重採樣為5分鐘K棒
-                df = df_1min.resample("5min").agg({
-                    "Open": "first",
-                    "High": "max",
-                    "Low": "min",
-                    "Close": "last",
-                    "Volume": "sum"
-                }).dropna()
+                df = resample_ohlcv(df_1min, "5min")
                 
                 if not df.empty:
                     # Convert pre-filled bars to deque format
@@ -433,22 +430,61 @@ class FuturesMonitor:
 
     def _backfill_night_gaps(self, api_df):
         """[GSD Fix] On startup, check if today's CSV has night session data.
-        If missing or incomplete, merge API bars with existing CSV."""
+        If missing or incomplete, merge API bars with existing CSV.
+        
+        [BUG FIX 2026-04-20] Use get_session_date_str() (trading session date) instead of
+        today.strftime('%Y%m%d') (wall-clock date) so the backfill writes to the SAME file
+        as _save_bar.  The old code wrote night-session bars to e.g. TMF_20260420 while
+        _save_bar correctly wrote them to TMF_20260421, and the dashboard's
+        drop_duplicates(keep='first') would then prefer the indicator-less rows from 20260420
+        over the correctly-computed rows from 20260421, making the dashboard show NaN until
+        ~17:10 when the wrong file's last timestamp was exceeded.
+        """
         if self.dry_run or not self.api:
             return
         
         from pathlib import Path
+        from core.date_utils import get_session_date_str
         today = datetime.now()
-        date_str = today.strftime('%Y%m%d')
+        # [BUG FIX] Use session date so backfill writes to the same file as _save_bar.
+        # Previously used today.strftime('%Y%m%d') which causes dual-file contamination
+        # during night session (bar times belong to next trading day).
+        date_str = get_session_date_str(today)
         tag = "_DRY" if self.dry_run else ("_LIVE" if self.live_trading else "_PAPER")
         csv_path = Path(f"logs/market_data/{self.ticker}_{date_str}{tag}_indicators.csv")
         
+        def _load_existing_indicator_csv(path: Path):
+            if not path.exists():
+                return pd.DataFrame(), None
+            try:
+                existing_df = pd.read_csv(path, parse_dates=['timestamp'])
+            except Exception:
+                existing_df = pd.read_csv(path)
+                renamed = False
+                for col in existing_df.columns:
+                    if not str(col).strip() or str(col).startswith("Unnamed"):
+                        if "timestamp" not in existing_df.columns:
+                            existing_df = existing_df.rename(columns={col: "timestamp"})
+                            renamed = True
+                            break
+                if "timestamp" in existing_df.columns:
+                    existing_df["timestamp"] = pd.to_datetime(existing_df["timestamp"], errors="coerce")
+                    existing_df = existing_df.dropna(subset=["timestamp"])
+                if renamed:
+                    console.print("[yellow][FuturesMonitor] Repaired corrupt startup CSV timestamp header[/yellow]")
+            if "timestamp" not in existing_df.columns:
+                return pd.DataFrame(), None
+            existing_df.set_index('timestamp', inplace=True)
+            existing_df.index = pd.to_datetime(existing_df.index, errors="coerce")
+            existing_df = existing_df[~existing_df.index.isna()]
+            existing_df = existing_df[~existing_df.index.duplicated(keep='first')].sort_index()
+            last_existing_ts = existing_df.index.max() if not existing_df.empty else None
+            return existing_df, last_existing_ts
+
         # Read existing CSV
         if csv_path.exists():
             try:
-                existing = pd.read_csv(csv_path, parse_dates=['timestamp'])
-                existing.set_index('timestamp', inplace=True)
-                last_ts = existing.index.max()
+                existing, last_ts = _load_existing_indicator_csv(csv_path)
                 console.print(f"[dim][FuturesMonitor] Existing CSV: {len(existing)} bars, latest={last_ts}[/dim]")
             except Exception:
                 existing = pd.DataFrame()
@@ -457,24 +493,56 @@ class FuturesMonitor:
             existing = pd.DataFrame()
             last_ts = None
         
-        # Find bars from API that are newer than CSV
-        if not api_df.empty and last_ts is not None:
-            new_bars = api_df[api_df.index > last_ts]
-            if not new_bars.empty:
-                console.print(f"[bold cyan]🔧 Backfilling {len(new_bars)} missing bars from API ({new_bars.index[0]} → {new_bars.index[-1]})[/bold cyan]")
+        api_df = api_df.copy()
+        if not api_df.empty:
+            api_df.index = pd.to_datetime(api_df.index, errors="coerce")
+            api_df = api_df[~api_df.index.isna()]
+            api_df = api_df[~api_df.index.duplicated(keep='last')].sort_index()
+        
+        # Find bars from API that are newer than CSV, or rebuild from API if CSV timestamp is corrupt/missing
+        if not api_df.empty:
+            if last_ts is None:
+                new_bars = api_df
+            else:
+                new_bars = api_df[api_df.index > last_ts]
+            if last_ts is None or not new_bars.empty:
+                # [BUG FIX 2026-04-20] Do NOT write raw indicator-less bars to the session file
+                # if _save_bar has already written bars with computed indicators.  The raw OHLCV
+                # bars (no indicators) from the API would contaminate the file: later reads by the
+                # dashboard would see NaN for indicator columns on those rows.  When _save_bar
+                # processes the same bar it only APPENDS (not updates), so the NaN rows persist.
+                #
+                # Heuristic: if the existing file already has indicator data (e.g. has a 'momentum'
+                # column with at least one non-NaN value), skip the raw backfill entirely.
+                # _save_bar will write fully-computed rows going forward.
+                has_indicator_data = (
+                    not existing.empty
+                    and "momentum" in existing.columns
+                    and existing["momentum"].notna().any()
+                )
+                if has_indicator_data:
+                    console.print(f"[dim][FuturesMonitor] Skipping raw backfill — session CSV already has indicator data (last_ts={last_ts})[/dim]")
+                    return
+
+                if last_ts is None:
+                    console.print(f"[bold cyan]🔧 Rebuilding startup CSV from API ({api_df.index[0]} → {api_df.index[-1]})[/bold cyan]")
+                else:
+                    console.print(f"[bold cyan]🔧 Backfilling {len(new_bars)} missing bars from API ({new_bars.index[0]} → {new_bars.index[-1]})[/bold cyan]")
                 
-                # Append new bars to existing CSV
-                if existing.empty:
+                combined = existing.copy() if not existing.empty else pd.DataFrame()
+                if combined.empty:
                     combined = new_bars.copy()
                 else:
-                    combined = pd.concat([existing, new_bars])
+                    combined = pd.concat([combined, new_bars], sort=False)
+                    combined = combined[~combined.index.duplicated(keep='last')].sort_index()
                 
                 # Add missing columns if needed
                 for col in ['score', 'regime', 'session', 'bull_align', 'bear_align', 'in_pb_zone']:
                     if col not in combined.columns:
                         combined[col] = 0 if col in ['score'] else ('NORMAL' if col == 'regime' else (2 if col == 'session' else False))
                 
-                combined.to_csv(csv_path)
+                combined.index.name = "timestamp"
+                combined.to_csv(csv_path, index_label="timestamp")
                 console.print(f"[green][FuturesMonitor] ✅ Backfill complete: {len(combined)} total bars in CSV[/green]")
 
     def _check_futures_contract_staleness(self):
@@ -867,6 +935,12 @@ class FuturesMonitor:
         trade_check_result = self._monitor_trade_records(timestamp)
         if trade_check_result:
             console.print(f"[green]✓ Trade records check: {trade_check_result}[/green]")
+
+        options_audit_result = self._audit_options_data_health(timestamp)
+        if options_audit_result:
+            tone = "green" if options_audit_result.startswith("healthy") else "yellow"
+            console.print(f"[{tone}]🩺 Options data audit: {options_audit_result}[/{tone}]")
+            note = f"{note}; options={options_audit_result}"
         
         # Log audit
         from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
@@ -882,6 +956,15 @@ class FuturesMonitor:
         # Reset counters for next hour
         self._signals_generated = 0
         self._bars_since_trade = 0  # GAP-2 fix: reset bars counter too
+
+    def _audit_options_data_health(self, timestamp):
+        monitor = getattr(self, "options_monitor", None)
+        if monitor is None:
+            return ""
+        try:
+            return monitor.audit_indicator_health_and_repair(timestamp)
+        except Exception as exc:
+            return f"options_audit_error:{type(exc).__name__}:{str(exc)[:80]}"
 
     def _monitor_trade_records(self, timestamp):
         """
@@ -1478,12 +1561,18 @@ class FuturesMonitor:
         if not path.exists(): return
         try:
             df = pd.read_csv(path)
-            df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+            unnamed_cols = [c for c in df.columns if str(c).startswith("Unnamed")]
+            if "timestamp" not in df.columns and unnamed_cols:
+                df = df.rename(columns={unnamed_cols[0]: "timestamp"})
+                unnamed_cols = unnamed_cols[1:]
+            if unnamed_cols:
+                df = df.drop(columns=unnamed_cols)
             
             missing = [c for c in new_data_keys if c not in df.columns]
             if missing:
-                self.logger.info(f"🛡️ Migrating indicator CSV: adding {missing}")
-                for c in missing: df[c] = np.nan
+                console.print(f"[yellow]🛡️ Migrating indicator CSV: adding {missing}[/yellow]")
+                for c in missing:
+                    df[c] = pd.NA
                 # Sort columns to keep a stable order
                 df = df.reindex(columns=sorted(df.columns))
                 df.to_csv(path, index=False)
@@ -1492,7 +1581,7 @@ class FuturesMonitor:
             self._indicator_cols = sorted(df.columns)
             self._indicators_migrated = True
         except Exception as e:
-            self.logger.error(f"Schema migration failed: {e}")
+            console.print(f"[red]Schema migration failed:[/red] {e}")
 
     def _save_bar(self, row, score, regime):
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs", "market_data")
@@ -1557,7 +1646,7 @@ class FuturesMonitor:
                     self._last_saved_ts = current_ts
                 # else: ignore duplicate bar
         except Exception as e:
-            self.logger.error(f"Fast-append failed: {e}")
+            console.print(f"[red]Fast-append failed:[/red] {e}")
 
     # ── Main strategy loop ──
 
@@ -1762,9 +1851,15 @@ class FuturesMonitor:
                     tx_age = self.feed_health.age('TX')
                     tmf_age = self.feed_health.age('TMF')
                     max_age = getattr(self, 'STALE_WARN_SECS', 120)
-                    if tx_age > max_age or tmf_age > max_age:
-                        console.print(f"[yellow][FuturesMonitor] TMF/TX feed stale (TX={tx_age:.0f}s TMF={tmf_age:.0f}s) - skip strategy tick[/yellow]")
+                    
+                    # 💡 GSD: 只有主體 TMF 過期才跳過；TX 過期則僅報警
+                    if tmf_age > max_age:
+                        console.print(f"[yellow][FuturesMonitor] TMF feed stale ({tmf_age:.0f}s) - skip strategy tick[/yellow]")
                         return
+                    
+                    if tx_age > max_age:
+                        if self._bar_counter % 5 == 0: # 減少日誌噪音
+                            console.print(f"[yellow][FuturesMonitor] TX feed quiet ({tx_age:.0f}s) - continuing in degraded mode[/yellow]")
             except Exception:
                 pass
 
@@ -1781,55 +1876,34 @@ class FuturesMonitor:
 
         # 1. Fetch multi-timeframe data (使用選擇權系統的方法)
         processed = {}
+        bar_source = {"source": None, "freshness_minutes": None}
         if not self.dry_run:
-            # 首先嘗試從API獲取當天的1分鐘K棒資料
             df_1min = self._fetch_today_kbars()
-            
-            if df_1min is not None and len(df_1min) >= 1:
-                # 從1分鐘K棒重採樣為5分鐘K棒
-                df_5m = df_1min.resample("5min").agg({
-                    "Open": "first",
-                    "High": "max", 
-                    "Low": "min",
-                    "Close": "last",
-                    "Volume": "sum"
-                }).dropna()
-                
-                if len(df_5m) >= 2:
-                    processed["5m"] = calculate_futures_squeeze(df_5m, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
-                    
-                    # 從1分鐘K棒重採樣為其他時間框架
-                    for tf, rule in [("15m", "15min"), ("1h", "1h")]:
-                        res = df_1min.resample(rule).agg({
-                            "Open": "first",
-                            "High": "max",
-                            "Low": "min", 
-                            "Close": "last",
-                            "Volume": "sum"
-                        }).dropna()
-                        if len(res) >= 2:
-                            processed[tf] = calculate_futures_squeeze(res, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
-            
-            # 如果API資料不足，嘗試使用tick累積的資料
-            if "5m" not in processed:
-                df_base = self._get_tick_bars_df()
-                if len(df_base) >= 30:
-                    processed["5m"] = calculate_futures_squeeze(df_base, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
-                    
-                    # Resample for higher timeframes
-                    for tf, rule in [("15m", "15min"), ("1h", "1h")]:
-                        res = df_base.resample(rule).agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-                        if len(res) >= 20:
-                            processed[tf] = calculate_futures_squeeze(res, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
-            
-            # 如果還是沒有資料，嘗試舊的get_kline方法作為fallback
-            if "5m" not in processed:
-                try:
-                    df = self.client.get_kline(self.ticker, interval="5m")
-                    if not df.empty:
-                        processed["5m"] = calculate_futures_squeeze(df, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
-                except Exception as e:
-                    console.print(f"[yellow][FuturesMonitor] api.kbars failed: {e}[/yellow]")
+            df_tick = self._get_tick_bars_df()
+            df_legacy = None
+            try:
+                df_legacy = self.client.get_kline(self.ticker, interval="5m")
+            except Exception as e:
+                console.print(f"[yellow][FuturesMonitor] api.kbars failed: {e}[/yellow]")
+
+            raw_frames, bar_source = build_preferred_canonical_bar_frames(
+                [
+                    {"name": "api-1m", "frame": df_1min, "source_timeframe": "1min"},
+                    {"name": "tick-5m", "frame": df_tick, "source_timeframe": "5min"},
+                    {"name": "legacy-api-5m", "frame": df_legacy, "source_timeframe": "5min"},
+                ],
+                min_5m_bars=2,
+            )
+
+            for tf, frame in raw_frames.items():
+                if len(frame) >= 2:
+                    processed[tf] = attach_bar_metadata(
+                        calculate_futures_squeeze(
+                            frame,
+                            bb_length=self.STRATEGY.get("length", 20),
+                            **self.PB_ARGS,
+                        )
+                    )
 
         # 只要有 5m 數據，不論有沒有指標，都應該寫入
         if "5m" not in processed:
@@ -1838,11 +1912,23 @@ class FuturesMonitor:
                 df_tmp = pd.DataFrame([self._current_bar]).set_index("ts")
                 df_tmp.columns = ["Open", "High", "Low", "Close", "Volume"]
                 # GSD: Always calculate indicators (will fill defaults if too short)
-                processed["5m"] = calculate_futures_squeeze(df_tmp, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+                processed["5m"] = attach_bar_metadata(
+                    calculate_futures_squeeze(df_tmp, bb_length=self.STRATEGY.get("length", 20), **self.PB_ARGS)
+                )
             else:
                 return
 
+        processed["5m"] = attach_bar_metadata(processed["5m"])
+        if "15m" in processed:
+            processed["15m"] = attach_bar_metadata(processed["15m"])
+        if "1h" in processed:
+            processed["1h"] = attach_bar_metadata(processed["1h"])
+
         df_5m = processed["5m"]
+        
+        # [Fix] Initialize score and regime before adaptive/cross logic
+        score = 0.0
+        regime = "NORMAL"
         
         # Adaptive engine: detect regime, adjust thresholds and weights
         try:
@@ -1983,25 +2069,29 @@ class FuturesMonitor:
         
         # ── GSD: Ensure trading_day is always present before any downstream usage ──
         if "trading_day" not in df_5m.columns or df_5m["trading_day"].iloc[-1] is None or pd.isna(df_5m["trading_day"].iloc[-1]):
-            from core.date_utils import get_trading_day
-            df_5m["trading_day"] = get_trading_day(df_5m.index)
+            df_5m = attach_bar_metadata(df_5m)
+            processed["5m"] = df_5m
             
         last_5m = df_5m.iloc[-1]
         
         # fallback for MTF
         df_15m = processed.get("15m", df_5m)
         if "trading_day" not in df_15m.columns:
-            df_15m["trading_day"] = df_5m["trading_day"].reindex(df_15m.index, method='ffill')
+            df_15m = attach_bar_metadata(df_15m)
         last_15m = df_15m.iloc[-1]
         
-        # 指標預設值
-        score = 0.0
-        regime = "NORMAL"
+        # [Fix] Remove redundant re-initialization of score/regime
+        # We already initialized them at the start of adaptive/cross logic.
         
-        # 只有在數據充足時才算 MTF Score
+        # 只有在數據充足時才算 MTF Score (與之前的 adaptive boost 累加)
         if "15m" in processed:
             score_data = calculate_mtf_alignment(processed, weights=self.STRATEGY.get("weights", {"5m": 0.4, "15m": 0.4, "1h": 0.2}))
-            score = score_data["score"]
+            # 如果之前有 boost (score 已經不是 0)，我們保留其比例影響
+            current_boost = 1.0
+            if hasattr(self, '_last_bar_context') and "adaptive_boost" in self._last_bar_context:
+                current_boost = self._last_bar_context["adaptive_boost"]
+            
+            score = score_data["score"] * current_boost
             regime = "STRONG" if last_5m.get("opening_bullish") else ("WEAK" if last_5m.get("opening_bearish") else "NORMAL")
 
         last_price = last_5m["Close"]
@@ -2009,8 +2099,8 @@ class FuturesMonitor:
         timestamp = last_5m.name
 
         # GSD Phase 0b: Determine session type per bar
-        hhmm = int(timestamp.strftime("%H%M")) if hasattr(timestamp, "strftime") else int(datetime.now().strftime("%H%M"))
-        self.session_type = "night" if (hhmm >= 1500 or hhmm < 500) else "day"
+        current_hhmm = get_taifex_futures_hhmm()
+        self.session_type = get_taifex_futures_session_type()
         
         # GSD Phase 0b-2: Session transition detection (night -> day) - cancel stale pending orders
         if self.previous_session_type != self.session_type:
@@ -2029,6 +2119,8 @@ class FuturesMonitor:
             "score": float(score),
             "regime": str(regime),
             "session": self.session_type,
+            "bar_source": bar_source.get("source"),
+            "bar_freshness_minutes": bar_source.get("freshness_minutes"),
         }
 
         # GSD Phase 0d: Increment bar counter since last trade
@@ -2071,8 +2163,8 @@ class FuturesMonitor:
             }
             
             # Calculate time to close for the current session
-            hhmm = int(datetime.now().strftime("%H%M"))
-            is_night_session = hhmm >= 1500 or hhmm < 500
+            hhmm = get_taifex_futures_hhmm()
+            is_night_session = get_taifex_futures_session_type() == "night"
             target_close = "13:30" if not is_night_session else "05:00"
             close_dt = datetime.strptime(target_close, "%H:%M").replace(
                 year=datetime.now().year, month=datetime.now().month, day=datetime.now().day
@@ -2160,8 +2252,8 @@ class FuturesMonitor:
         #   Day:  08:45 - 13:45
         #   Night: 15:00 - 05:00 (next day)
         # Closed: 13:45-15:00 (lunch), 05:00-08:45 (early morning)
-        hhmm = int(timestamp.strftime("%H%M")) if hasattr(timestamp, "strftime") else int(datetime.now().strftime("%H%M"))
-        market_open = (845 <= hhmm <= 1345) or (hhmm >= 1500) or (hhmm < 500)
+        hhmm = current_hhmm
+        market_open = is_taifex_futures_market_open()
         if not market_open:
             self._audit_signal("ENTRY_BLOCKED", "", score, "market_closed", f"hhmm={hhmm}")
             if self._bar_counter % 12 == 0:  # Log once per hour

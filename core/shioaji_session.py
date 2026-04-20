@@ -7,10 +7,12 @@ Phase 1 enhancements (2026-04-13):
 - check_order_status(): Full order status with deals parsing
 - safe_api_call(): Error handling with retry for Shioaji-specific errors
 """
+import json
 import os
 import time
 import logging
 import threading
+from pathlib import Path
 from typing import Any, Optional
 
 import shioaji as sj
@@ -40,16 +42,41 @@ class SystemReadiness(Enum):
 _current_status = SystemReadiness.BOOTING
 _status_lock = threading.Lock()
 
+
+def _system_status_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "logs" / "runtime_status.json"
+
+
+def _persist_system_status(status: SystemReadiness):
+    path = _system_status_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "status": status.value,
+        "updated_at": time.time(),
+    }
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(tmp_path, path)
+
 def set_system_status(status: SystemReadiness):
     global _current_status
     with _status_lock:
         _current_status = status
+        _persist_system_status(status)
         # [Pillar 4] Log state transitions for observability
         logger.info(f"🚦 [System] State transition: {_current_status.value}")
 
 def get_system_status() -> SystemReadiness:
     with _status_lock:
         return _current_status
+
+
+def get_shared_system_status() -> SystemReadiness:
+    path = _system_status_path()
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return SystemReadiness(payload["status"])
+    return get_system_status()
 
 def get_api() -> sj.Shioaji:
     """Return the shared API instance, logging in if needed."""

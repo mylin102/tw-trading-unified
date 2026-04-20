@@ -216,6 +216,32 @@ def is_day_session(dt: Union[datetime, pd.Timestamp, pd.DatetimeIndex, pd.Series
         return pd.Series([get_session(x) == 1 for x in dt], index=dt)
     return get_session(dt) == 1
 
+
+def get_taifex_futures_hhmm(dt: Union[datetime, pd.Timestamp, str, None] = None) -> int:
+    """Return HHMM trading clock for TAIFEX session gates.
+
+    This helper intentionally represents the *current trading clock* rather than the
+    timestamp of the latest completed bar. Session-boundary entry gates should use
+    wall-clock semantics so a stale 14:55 bar does not keep 15:00 night session closed.
+    """
+    if dt is None:
+        dt = datetime.now()
+    if not hasattr(dt, "strftime"):
+        dt = pd.to_datetime(dt)
+    return int(dt.strftime("%H%M"))
+
+
+def is_taifex_futures_market_open(dt: Union[datetime, pd.Timestamp, str, None] = None) -> bool:
+    """Return whether TAIFEX futures market is open for entry decisions."""
+    hhmm = get_taifex_futures_hhmm(dt)
+    return (845 <= hhmm <= 1345) or (hhmm >= 1500) or (hhmm < 500)
+
+
+def get_taifex_futures_session_type(dt: Union[datetime, pd.Timestamp, str, None] = None) -> str:
+    """Return TAIFEX futures session type using wall-clock semantics."""
+    hhmm = get_taifex_futures_hhmm(dt)
+    return "night" if (hhmm >= 1500 or hhmm < 500) else "day"
+
 def get_session_date_str(dt=None):
     """
     獲取交易會話日期字串 (YYYYMMDD)。

@@ -20,6 +20,16 @@ from options_engine.engine.broker_adapter import ShioajiBrokerAdapter
 from options_engine.engine.backtest_engine import should_exit_position, should_take_partial_profit, should_exit_by_time_constraints
 from options_engine.engine.backtest_engine import resolve_option_strike
 from options_engine.engine.options_strategy import get_mode_profile, get_score_floor, get_stop_loss_pct, get_strategy_weights, infer_mid_trend, resolve_entry_side
+from core.bar_utils import (
+    attach_bar_metadata,
+    build_canonical_bar_frames,
+    build_preferred_canonical_bar_frames,
+    canonicalize_ohlcv,
+    fill_small_ohlcv_gaps,
+    resample_ohlcv,
+    validate_ohlcv_bars,
+)
+from core.options_snapshot import OPTION_SNAPSHOT_COLUMNS, build_options_snapshot_row
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
@@ -1100,8 +1110,10 @@ class ShioajiOptionsSmartMonitor:
 
             # 扣除交易成本 (RULES.md Rule 4: PnL Must Include All Costs)
             # 期權手續費 (GSD parameterized)
-            broker_fee = self.broker_fee_per_side * 2 * qty  # 進出各一次
-            exchange_fee = self.exchange_fee_per_side * 2 * qty
+            broker_fee_per_side = getattr(self, "broker_fee_per_side", float(self.execution_cfg.get("broker_fee_per_side", 20.0)))
+            exchange_fee_per_side = getattr(self, "exchange_fee_per_side", float(self.execution_cfg.get("exchange_fee_per_side", 5.0)))
+            broker_fee = broker_fee_per_side * 2 * qty  # 進出各一次
+            exchange_fee = exchange_fee_per_side * 2 * qty
             # 交易稅: 期權約 0.1% 權利金
             tax_rate = self.pricing_cfg.get("tax_rate", 0.001)
             tax = (abs(self.entry_price) + abs(price)) * point_value * tax_rate * qty
@@ -1306,37 +1318,27 @@ class ShioajiOptionsSmartMonitor:
         except Exception as e:
             console.print(f"[red]Greeks calculation error:[/red] {e}")
 
-        from core.date_utils import get_session
         now = datetime.datetime.now()
-        
-        # GSD: Base on signal data to ensure all indicators are preserved
-        row = signal.copy() if signal else {}
-        
-        # Standardize and add Greeks
-        row.update({
-            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "session": get_session(now),
-            "score": score,  # Use the freshly calculated score
-            "side": side_label,
-            "price_mtx": price_mtx,
-            "strike": strike,
-            "dte": round(dte_years * 365, 2),
-            "mid_trend": mid_trend,
-            "iv": round(iv, 4),
-            "delta": round(delta_val, 4),
-            "gamma": round(gamma_val, 6),
-            "vega": round(vega_val, 4),
-            # Backwards compatibility/aliases for dashboard
-            "vwap": price_mtx,
-            "sqz_on": row.get("sqz_on", row.get("squeeze_on", False)),
-            "fired": row.get("fired", False),
-        })
+        row = build_options_snapshot_row(
+            signal,
+            now=now,
+            price_mtx=price_mtx,
+            score=score,
+            side_label=side_label,
+            strike=strike,
+            dte_days=dte_years * 365,
+            mid_trend=mid_trend,
+            iv=iv,
+            delta_val=delta_val,
+            gamma_val=gamma_val,
+            vega_val=vega_val,
+        )
         
         if iv > 0:
             self.latest_iv = iv
             
-        # GSD Fix: Support dynamic column expansion
-        df_row = pd.DataFrame([row])
+        ordered_columns = OPTION_SNAPSHOT_COLUMNS + [col for col in row if col not in OPTION_SNAPSHOT_COLUMNS]
+        df_row = pd.DataFrame([row], columns=ordered_columns)
         if self.indicator_log_path.exists():
             try:
                 df_existing = pd.read_csv(self.indicator_log_path)
@@ -1363,6 +1365,125 @@ class ShioajiOptionsSmartMonitor:
                 "Volume": [r["volume"] for r in records],
             }, index=[r["ts"] for r in records])
         return self._mtx_tick_bars_cache if self._mtx_tick_bars_cache is not None else pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+    def _normalize_prefill_mtx_bars(self, frame, *, source_timeframe):
+        """Convert raw MTX history into canonical 5m bars before warming the tick fallback cache."""
+        frames = build_canonical_bar_frames(
+            frame,
+            source_timeframe=source_timeframe,
+            max_gap_minutes=15,
+        )
+        return frames.get("5m")
+
+    def _live_min_bars_required(self, now=None):
+        from core.date_utils import is_night_session
+
+        current_time = now or datetime.datetime.now()
+        return 10 if is_night_session(current_time) else max(30, self.strategy_cfg.get("length", 20) + 5)
+
+    def _select_live_bar_frames(self, now=None):
+        current_time = now or datetime.datetime.now()
+        min_bars = self._live_min_bars_required(current_time)
+        return build_preferred_canonical_bar_frames(
+            [
+                {"name": "api-1m", "frame": self._fetch_today_futures_bars(), "source_timeframe": "1min"},
+                {"name": "tick-5m", "frame": self._get_tick_bars_fallback(), "source_timeframe": "5min"},
+            ],
+            min_5m_bars=min_bars,
+            now=pd.Timestamp(current_time),
+            max_gap_minutes=15,
+            validator=lambda df: validate_ohlcv_bars(
+                df,
+                min_bars=min_bars,
+                expected_interval_minutes=5,
+                max_intraday_gap_minutes=30,
+                # [BUG FIX 2026-04-20] 380 min rejects valid Monday/weekend windows.
+                max_session_gap_minutes=7200,
+            ),
+        )
+
+    def _inspect_indicator_log_health(self, now=None):
+        current_time = now or datetime.datetime.now()
+        self._update_log_paths()
+        if not self.indicator_log_path.exists():
+            return "indicator_file_missing"
+
+        try:
+            df = pd.read_csv(self.indicator_log_path)
+        except Exception as exc:
+            return f"indicator_read_error:{type(exc).__name__}"
+
+        if df.empty:
+            return "indicator_file_empty"
+        if "timestamp" not in df.columns:
+            return "indicator_timestamp_missing"
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        recent = df[df["timestamp"] >= pd.Timestamp(current_time) - pd.Timedelta(minutes=20)].tail(3)
+        if recent.empty:
+            return "indicator_rows_stale"
+
+        required_cols = ["trading_day", "Open", "High", "Low", "Close", "Volume"]
+        missing_cols = [col for col in required_cols if col not in recent.columns]
+        if missing_cols:
+            return f"indicator_cols_missing:{','.join(missing_cols)}"
+
+        nan_cols = [col for col in required_cols if recent[col].isna().all()]
+        if nan_cols:
+            return f"indicator_nan:{','.join(nan_cols)}"
+
+        if "mid_trend" in recent.columns and "score" in recent.columns:
+            mid_trend_blank = recent["mid_trend"].fillna("").astype(str).str.strip().eq("").all()
+            score_zero = pd.to_numeric(recent["score"], errors="coerce").fillna(0.0).eq(0.0).all()
+            if mid_trend_blank and score_zero:
+                return "indicator_signal_blank"
+
+        return ""
+
+    def audit_indicator_health_and_repair(self, timestamp=None):
+        current_time = timestamp
+        if isinstance(timestamp, pd.Timestamp):
+            current_time = timestamp.to_pydatetime()
+        if current_time is None:
+            current_time = datetime.datetime.now()
+
+        raw_frames, bar_source = self._select_live_bar_frames(now=current_time)
+        df_5m = raw_frames.get("5m")
+        issues = []
+        repairs = []
+        min_bars = self._live_min_bars_required(current_time)
+
+        if df_5m is None or len(df_5m) < min_bars:
+            rejected = ",".join(bar_source.get("rejected", [])) or "no_bar_source"
+            issues.append(f"bars_unavailable:{rejected}")
+
+        indicator_issue = self._inspect_indicator_log_health(now=current_time)
+        if indicator_issue:
+            issues.append(indicator_issue)
+
+        if not issues:
+            return f"healthy source={bar_source.get('source') or 'unknown'} bars={len(df_5m) if df_5m is not None else 0}"
+
+        missing_contracts = [key for key in ("MTX", "C", "P") if self.active_contracts.get(key) is None]
+        if missing_contracts and self.find_best_contracts():
+            repairs.append(f"refresh_contracts:{','.join(missing_contracts)}")
+
+        self.pre_fill_bars()
+        repairs.append("prefill_bars")
+
+        repaired_frames, repaired_source = self._select_live_bar_frames(now=current_time)
+        repaired_df_5m = repaired_frames.get("5m")
+        if repaired_df_5m is None or len(repaired_df_5m) < min_bars:
+            rejected = ",".join(repaired_source.get("rejected", [])) or "no_bar_source"
+            return (
+                f"repair_failed issues={';'.join(issues)} repairs={','.join(repairs)} "
+                f"after={rejected}"
+            )
+
+        return (
+            f"repair_ok issues={';'.join(issues)} repairs={','.join(repairs)} "
+            f"source={repaired_source.get('source') or 'unknown'} bars={len(repaired_df_5m)}"
+        )
 
     def _fetch_today_futures_bars(self):
         if self.dry_run:
@@ -1406,140 +1527,36 @@ class ShioajiOptionsSmartMonitor:
         if not required.issubset(frame.columns):
             return None
         frame = frame.set_index("ts")[["Open", "High", "Low", "Close", "Volume"]].sort_index()
-        
-        # [DATA GAP FIX] 驗證並填充資料缺口
-        frame = self._validate_and_fill_kbar_gaps(frame)
-        
-        return frame
+        return canonicalize_ohlcv(frame)
 
     def _validate_kbar_data(self, df):
-        """驗證kbar資料完整性
-        
-        Args:
-            df: pandas DataFrame with datetime index
-            
-        Returns:
-            tuple: (is_valid, message)
-        """
-        if df is None or df.empty:
-            return False, "資料為空"
-
-        # BUG FIX 2026-04-13: Lower bar requirement for night sessions.
-        # Night session may have as few as 10 fresh 5-min bars.
+        """Validate 5m kbar data via the shared canonical contract."""
         from core.date_utils import is_night_session as _is_night
+
         is_night = _is_night(datetime.datetime.now())
         min_bars_required = 10 if is_night else 30
-        if len(df) < min_bars_required:
-            return False, f"資料不足: {len(df)}根 < {min_bars_required}根"
-        
-        # 檢查時間間隔連續性
-        if len(df) > 1:
-            time_diffs = df.index.to_series().diff().dt.total_seconds() / 60  # 轉換為分鐘
-
-            # 跳過第一個NaN值
-            if len(time_diffs) > 1:
-                valid_diffs = time_diffs.iloc[1:].dropna()
-                if len(valid_diffs) > 0:
-                    max_gap = valid_diffs.max()
-                    min_gap = valid_diffs.min()
-
-                    # BUG FIX 2026-04-13: Night session has natural 375-min gap
-                    # (day close 13:45 → night open 15:00 = 75 min, but server
-                    # may return combined data with 300+ min gap).
-                    # Only check max_gap during continuous trading hours.
-                    import datetime as _dt
-                    is_night = _dt.datetime.now().hour >= 15 or _dt.datetime.now().hour < 5
-                    max_allowed_gap = 380 if is_night else 30  # 380 = covers 13:45→15:00 gap
-
-                    # 檢查是否有異常間隔
-                    if max_gap > max_allowed_gap:
-                        return False, f"資料缺口過大: {max_gap:.0f}分鐘"
-                    
-                    # 檢查間隔是否一致（應為5分鐘）
-                    # BUG FIX 2026-04-13: Shioaji kbars() returns 1-min bars at night.
-                    # Don't reject 1-min data during night sessions.
-                    import datetime as _dt2
-                    is_night2 = _dt2.datetime.now().hour >= 15 or _dt2.datetime.now().hour < 5
-                    if not is_night2 and (abs(min_gap - 5) > 1 or abs(max_gap - 5) > 1):
-                        console.print(f"[dim]⚠️ Kbar間隔異常: min={min_gap:.1f}min, max={max_gap:.1f}min[/dim]")
-        
-        # 檢查價格有效性
-        required_columns = ["Open", "High", "Low", "Close", "Volume"]
-        for col in required_columns:
-            if col not in df.columns:
-                return False, f"缺少必要欄位: {col}"
-
-            # 檢查是否有NaN值
-            nan_count = df[col].isna().sum()
-            if nan_count > 0:
-                return False, f"欄位 {col} 有 {nan_count} 個NaN值"
-
-            # 檢查價格合理性
-            if col in ["Open", "High", "Low", "Close"]:
-                if (df[col] <= 0).any():
-                    return False, f"欄位 {col} 有非正數值"
-
-        return True, "資料完整"
+        return validate_ohlcv_bars(
+            df,
+            min_bars=min_bars_required,
+            expected_interval_minutes=5,
+            max_intraday_gap_minutes=30,
+            # [BUG FIX 2026-04-20] 380 min (~6.5 h) is too small: the 3-day API window
+            # always spans a weekend on Mondays (Fri night → Mon morning = ~3106 min).
+            # 7200 min (5 days) accommodates weekends and national holidays while still
+            # catching genuine multi-week data gaps that would indicate a real API problem.
+            max_session_gap_minutes=7200,
+        )
 
     def _fill_small_kbar_gaps(self, df, max_gap_minutes=15):
-        """填充小間隔的kbar資料缺口
-        
-        Args:
-            df: pandas DataFrame with datetime index
-            max_gap_minutes: 最大允許填充的缺口大小（分鐘）
-            
-        Returns:
-            pandas DataFrame: 填充後的資料
-        """
+        """Fill small 5m gaps via the shared canonical contract."""
         if df is None or df.empty or len(df) < 2:
             return df
-        
         try:
-            # 確保索引是DatetimeIndex且已排序
-            df = df.sort_index()
-            
-            # 計算時間間隔
-            time_diffs = df.index.to_series().diff().dt.total_seconds() / 60
-            
-            if len(time_diffs) > 1:
-                # 找到需要填充的缺口
-                gaps = []
-                for i in range(1, len(time_diffs)):
-                    gap = time_diffs.iloc[i]
-                    if gap > 5 and gap <= max_gap_minutes:  # 5分鐘是正常間隔
-                        prev_time = df.index[i-1]
-                        curr_time = df.index[i]
-                        gaps.append((prev_time, curr_time, gap))
-                
-                if gaps:
-                    console.print(f"[dim]🔧 發現 {len(gaps)} 個小資料缺口，進行填充...[/dim]")
-                    
-                    # 重新採樣到5分鐘頻率
-                    start_time = df.index[0]
-                    end_time = df.index[-1]
-                    
-                    # 創建完整的5分鐘時間索引
-                    full_index = pd.date_range(
-                        start=start_time.floor('5min'),
-                        end=end_time.ceil('5min'),
-                        freq='5min'
-                    )
-                    
-                    # 重新索引並填充
-                    df_reindexed = df.reindex(full_index)
-                    
-                    # 前向填充（最多填充3根kbar）
-                    fill_limit = min(3, max_gap_minutes // 5)
-                    df_filled = df_reindexed.ffill(limit=fill_limit)
-                    
-                    # 移除完全為NaN的行（無法填充的大缺口）
-                    df_filled = df_filled.dropna(how='all')
-                    
-                    console.print(f"[green]✓ 資料填充完成: {len(df)} -> {len(df_filled)} 根kbar[/green]")
-                    return df_filled
-            
-            return df
-            
+            return fill_small_ohlcv_gaps(
+                df,
+                expected_freq="5min",
+                max_gap_minutes=max_gap_minutes,
+            )
         except Exception as e:
             console.print(f"[yellow]⚠️ 資料填充失敗: {e}[/yellow]")
             return df
@@ -1601,7 +1618,10 @@ class ShioajiOptionsSmartMonitor:
                     else:
                         raise ValueError("CSV must have 'ts' or 'timestamp' column")
                     df_hist = df_hist.set_index("ts").sort_index()
-                    df_warm = df_hist.tail(100)
+                    df_warm = self._normalize_prefill_mtx_bars(df_hist, source_timeframe="1min")
+                    if df_warm is None or df_warm.empty:
+                        raise ValueError("CSV warmup produced no canonical 5m bars")
+                    df_warm = df_warm.tail(100)
                     for ts, row in df_warm.iterrows():
                         self._mtx_tick_bars_deque.append({
                             "open": row["Open"], "high": row["High"], "low": row["Low"], 
@@ -1614,9 +1634,10 @@ class ShioajiOptionsSmartMonitor:
 
             # Attempt API fetch to get most recent bars
             bars = self._fetch_today_futures_bars()
-            if bars is not None and not bars.empty and len(bars) >= 30:
+            bars_5m = self._normalize_prefill_mtx_bars(bars, source_timeframe="1min")
+            if bars_5m is not None and not bars_5m.empty and len(bars_5m) >= 30:
                 # [Wave 2 optimization] Convert pre-filled bars to deque format
-                for _, row in bars[["Open", "High", "Low", "Close", "Volume"]].iterrows():
+                for _, row in bars_5m[["Open", "High", "Low", "Close", "Volume"]].iterrows():
                     bar_dict = {
                         "open": row["Open"],
                         "high": row["High"],
@@ -1626,7 +1647,7 @@ class ShioajiOptionsSmartMonitor:
                         "ts": row.name,  # DataFrame index is timestamp
                     }
                     self._mtx_tick_bars_deque.append(bar_dict)
-                self._mtx_tick_bars_cache = bars[["Open", "High", "Low", "Close", "Volume"]].copy()
+                self._mtx_tick_bars_cache = bars_5m[["Open", "High", "Low", "Close", "Volume"]].copy()
                 self.is_trading_ready = True # [GSD 4.13] Trading Phase Ready
                 from core.shioaji_session import set_system_status, SystemReadiness
                 set_system_status(SystemReadiness.TRADING)
@@ -1636,8 +1657,11 @@ class ShioajiOptionsSmartMonitor:
 
     def _get_tick_bars_fallback(self):
         """Fallback: use tick-built bars when kbars API is unavailable."""
+        from core.date_utils import is_night_session
+
         df = self._get_mtx_tick_bars_df()
-        if len(df) >= 30:
+        min_bars_required = 10 if is_night_session(datetime.datetime.now()) else max(30, self.strategy_cfg.get("length", 20) + 5)
+        if len(df) >= min_bars_required:
             return df.copy()
         return None
 
@@ -1679,31 +1703,8 @@ class ShioajiOptionsSmartMonitor:
         self.market_data["P"] = {"close": put_mid, "bid": put_mid - 1.0, "ask": put_mid + 1.0}
 
     def fetch_live_signal(self):
-        # [DATA GAP FIX] 獲取並驗證kbar資料
-        df5_raw = self._fetch_today_futures_bars()
-        
-        # 如果API資料無效，嘗試備用資料源
-        if df5_raw is None:
-            console.print("[yellow]⚠️ API資料獲取失敗，嘗試備用資料源[/yellow]")
-            df5_raw = self._get_tick_bars_fallback()
-        
-        # 驗證資料完整性
-        if df5_raw is not None:
-            is_valid, msg = self._validate_kbar_data(df5_raw)
-            if not is_valid:
-                console.print(f"[yellow]⚠️ Kbar資料驗證失敗: {msg}[/yellow]")
-                
-                # 嘗試填充小缺口
-                df5_filled = self._fill_small_kbar_gaps(df5_raw)
-                is_valid_filled, msg_filled = self._validate_kbar_data(df5_filled)
-                
-                if is_valid_filled:
-                    console.print("[green]✓ 資料填充後驗證通過，使用填充後資料[/green]")
-                    df5_raw = df5_filled
-                else:
-                    console.print(f"[red]✗ 資料無法修復: {msg_filled}[/red]")
-                    df5_raw = None
-        
+        raw_frames, bar_source = self._select_live_bar_frames()
+        df5_raw = raw_frames.get("5m")
         if df5_raw is None or len(df5_raw) < 2:
             # GSD: Still record snapshot with current price even if bars are missing
             console.print("[red]✗ 無法獲取有效的kbar資料，跳過信號生成[/red]")
@@ -1717,29 +1718,17 @@ class ShioajiOptionsSmartMonitor:
             if len(diffs) > 0:
                 console.print(f"[debug] Intervals: min={diffs.min()}, median={diffs.median()}, max={diffs.max()}")
 
-        # BUG FIX 2026-04-13: Lower bar requirement for night sessions.
-        # At session start (15:00), only a few bars exist. 30 is too strict.
-        # Use 10 for night session (15:00-05:00), 30 for day session.
-        from core.date_utils import is_night_session
-        is_night = is_night_session(datetime.datetime.now())
-        min_bars = 10 if is_night else max(30, self.strategy_cfg.get("length", 20) + 5)
-        if len(df5_raw) < min_bars:
-            console.print(f"[yellow]⚠️ Not enough bars for indicators: {len(df5_raw)} < {min_bars} (night={is_night})[/yellow]")
-            self.record_signal_snapshot(None)
-            return None
-
         try:
-            p5 = calculate_futures_squeeze(df5_raw, self.strategy_cfg.get("length", 20))
-            # Resample correctly and ensure columns are present
-            def safe_resample(df, rule):
-                res = df.resample(rule).agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-                if len(res) < 2:
-                    # Not enough data to calculate squeeze
-                    return res
-                return calculate_futures_squeeze(res, self.strategy_cfg.get("length", 20))
+            p5 = attach_bar_metadata(calculate_futures_squeeze(canonicalize_ohlcv(df5_raw), self.strategy_cfg.get("length", 20)))
 
-            p15 = safe_resample(df5_raw, "15min")
-            p1h = safe_resample(df5_raw, "1h")
+            def safe_indicator_frame(frame):
+                base = canonicalize_ohlcv(frame)
+                if len(base) < 2:
+                    return base
+                return attach_bar_metadata(calculate_futures_squeeze(base, self.strategy_cfg.get("length", 20)))
+
+            p15 = safe_indicator_frame(raw_frames.get("15m"))
+            p1h = safe_indicator_frame(raw_frames.get("1h"))
 
             row = p5.iloc[-1]
             timestamp = row.name
@@ -1762,6 +1751,8 @@ class ShioajiOptionsSmartMonitor:
                 "fired": safe_bool(row.get("fired")),
                 "bullish_align": safe_bool(row.get("bullish_align")),
                 "bearish_align": safe_bool(row.get("bearish_align")),
+                "bar_source": bar_source.get("source"),
+                "bar_freshness_minutes": bar_source.get("freshness_minutes"),
             }
             # GSD: Include all raw indicators for dashboard visibility
             for k, v in row_data.items():
@@ -1879,6 +1870,10 @@ class ShioajiOptionsSmartMonitor:
         return True
 
     def enter_paper_position(self, side, signal):
+        signal_side = signal.get("side") if isinstance(signal, dict) else None
+        if not signal_side or signal_side != side:
+            console.print(f"[yellow]⚠️ enter_paper_position blocked: signal side mismatch/cleared (requested {side}, signal={signal_side})[/yellow]")
+            return
         if self.position >= self.max_positions:
             console.print(f"[red]🚫 enter_paper_position blocked: max positions ({self.max_positions}) reached (currently {self.position})[/red]")
             return
@@ -1972,6 +1967,10 @@ class ShioajiOptionsSmartMonitor:
         self.submit_live_entry(side, signal, retries=0)
 
     def submit_live_entry(self, side, signal, retries):
+        signal_side = signal.get("side") if isinstance(signal, dict) else None
+        if not signal_side or signal_side != side:
+            self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, f"signal_side_mismatch:{signal_side}")
+            return
         if self.pending_entry is not None:
             self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "pending_entry_exists")
             return
@@ -2453,6 +2452,10 @@ class ShioajiOptionsSmartMonitor:
                     self.paper_lots = max(1, round(self.paper_lots * edge_res["pos_scale"]))
                     if edge_res["pos_scale"] != 1.0:
                         console.print(f"[bold cyan]⚖️ Option Position Scaled: {edge_res['rank']} (x{edge_res['pos_scale']}) -> {self.paper_lots} lots[/bold cyan]")
+
+            # Re-read the gated signal so later entry logic cannot use stale side/score values.
+            sig_side = signal.get("side") if signal else None
+            sig_score = signal.get("score", 0.0) if signal else 0.0
 
             if self.position > 0:
                 # [GSD Fix] Handle non-standard active_side (THETA/SHORT)

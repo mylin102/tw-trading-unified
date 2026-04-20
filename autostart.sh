@@ -1,10 +1,9 @@
 #!/bin/bash
-# tw-trading-unified 自愈型監控腳本 (v3.0)
-# 1. 隔離核心：期貨/選擇權 與 股票 分開執行
-# 2. 環境自癒：啟動前自動補齊依賴
-# 3. 徹底清理：重啟前殺死所有殘留 C++ 資源
-# 4. 主動健康檢查：不等 crash，30 秒檢測一次
-# 5. 日誌輪轉：保留 7 天，防止磁碟爆滿
+# tw-trading-unified 自愈型監控腳本 (v3.1)
+# Contract:
+# - PM2 is the sole supervisor for main.py
+# - autostart.sh owns dashboards, stock runner, and maintenance only
+# - main.py duplicate protection remains in main.py via /tmp/tw_trading_unified.pid
 
 UNIFIED_DIR="/Users/mylin/Documents/mylin102/tw-trading-unified"
 PYTHON_EXEC="python3"
@@ -74,7 +73,6 @@ graceful_kill() {
 
 echo "[$(date)] 🧹 清理殘留進程..." >> "$LOG_DIR/unified.log"
 graceful_kill "stock_runner.py" "股票"
-graceful_kill "main.py" "期貨/選擇權"
 graceful_kill "streamlit" "Dashboard"
 rm -f /tmp/stock_runner_*.lock 2>/dev/null
 echo "[$(date)] ✅ 清理完成" >> "$LOG_DIR/unified.log"
@@ -151,51 +149,6 @@ while true; do
 done
 ) &
 
-# --- Futures/Options Monitor (24/7 with health check) ---
-(
-RETRY_COUNT=0
-MAX_RETRIES=10
-BASE_SLEEP=15
-LAST_HEALTH_CHECK=0
-
-while true; do
-    START_TIME=$(date +%s)
-    echo "[$(date)] 🚀 啟動期貨/選擇權核心 (嘗試 $((RETRY_COUNT+1)))..." >> "$LOG_DIR/unified.log"
-    
-    # Run main.py and capture output
-    $PYTHON_EXEC "$UNIFIED_DIR/main.py" 2>&1 | tee -a "$LOG_DIR/unified.log"
-    EXIT_CODE=${PIPESTATUS[0]}
-    
-    END_TIME=$(date +%s)
-    RUNTIME=$((END_TIME - START_TIME))
-    
-    # Track crash
-    record_crash "futures" $EXIT_CODE $RUNTIME
-    
-    # Reset counter if stable for >5 minutes
-    if [ "$RUNTIME" -gt 300 ]; then
-        echo "[$(date)] ✅ 核心穩定運行 ${RUNTIME}s，重置計數器" >> "$LOG_DIR/unified.log"
-        RETRY_COUNT=0
-    else
-        RETRY_COUNT=$((RETRY_COUNT + 1))
-    fi
-    
-    # Circuit breaker
-    if [ "$RETRY_COUNT" -ge "$MAX_RETRIES" ]; then
-        echo "[$(date)] 🛑 熔斷器觸發，等待 10 分鐘後重試..." >> "$LOG_DIR/unified.log"
-        sleep 600
-        RETRY_COUNT=0
-    fi
-    
-    # Exponential backoff
-    SLEEP_TIME=$(( BASE_SLEEP * (2 ** (RETRY_COUNT > 5 ? 5 : RETRY_COUNT)) ))
-    [ "$SLEEP_TIME" -gt 600 ] && SLEEP_TIME=600
-    
-    echo "[$(date)] ⚠️ 核心退出 (code=$EXIT_CODE)。${SLEEP_TIME}s 後重試..." >> "$LOG_DIR/unified.log"
-    sleep $SLEEP_TIME
-done
-) &
-
 # ======================== Layer 7: Health Check Monitor ========================
 (
 echo "[$(date)] 💓 啟動健康檢查監控器 (每 ${HEALTH_CHECK_INTERVAL}s 檢測一次)" >> "$LOG_DIR/unified.log"
@@ -203,8 +156,6 @@ echo "[$(date)] 💓 啟動健康檢查監控器 (每 ${HEALTH_CHECK_INTERVAL}s 
 while true; do
     now=$(date +%s)
     
-    # Check main.py processes
-    MAIN_PIDS=$(pgrep -f "python.*main.py" 2>/dev/null | wc -l)
     STOCK_PIDS=$(pgrep -f "stock_runner.py" 2>/dev/null | wc -l)
     STREAMLIT_PIDS=$(pgrep -f "streamlit" 2>/dev/null | wc -l)
     
@@ -217,12 +168,6 @@ while true; do
     
     # Status report
     STATUS=""
-    if [ "$MAIN_PIDS" -eq 0 ]; then
-        STATUS="${STATUS}[❌期貨停]"
-    else
-        STATUS="${STATUS}[✅期貨]"
-    fi
-    
     H=$(date +%H)
     MM=$(date +%M)
     if [ "$H" -ge 8 ] && [ "$H" -lt 14 ]; then

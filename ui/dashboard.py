@@ -14,6 +14,7 @@ import yaml
 import datetime
 import os
 from core.date_utils import get_session_date_str, get_trade_day
+from core.dashboard_data import merge_indicator_frames
 import subprocess
 import time
 from pathlib import Path
@@ -179,8 +180,8 @@ with st.sidebar:
     st.markdown("🚦 **系統狀態 (Readiness)**")
     
     try:
-        from core.shioaji_session import get_system_status, SystemReadiness
-        status = get_system_status()
+        from core.shioaji_session import get_shared_system_status, SystemReadiness
+        status = get_shared_system_status()
     except Exception:
         # Fallback if core is not yet loaded in sys.path
         status = None
@@ -793,7 +794,7 @@ def load_futures_indicators(full_history=False):
     search_days = list(dict.fromkeys(search_days))  # dedupe, preserve order
 
     all_dfs = []
-    for date_part in search_days:
+    for priority, date_part in enumerate(search_days):
         for tag in ["", "_LIVE", "_PAPER", "_DRY"]:
             f = FUTURES_MKT / f"TMF_{date_part}{tag}_indicators.csv"
             if f.exists():
@@ -802,6 +803,7 @@ def load_futures_indicators(full_history=False):
                     if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
                         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
                     if not df.empty:
+                        df["__source_priority"] = priority
                         all_dfs.append(df)
 
     # GSD: Parquet Fallback (Wave 18.3)
@@ -850,13 +852,7 @@ def load_futures_indicators(full_history=False):
 
     result = None
     if all_dfs:
-        common_cols = set(all_dfs[0].columns)
-        for df in all_dfs[1:]:
-            common_cols &= set(df.columns)
-        if "timestamp" not in common_cols:
-            common_cols.add("timestamp")
-        cleaned_dfs = [df[list(common_cols)] for df in all_dfs]
-        merged = pd.concat(cleaned_dfs).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+        merged = merge_indicator_frames(all_dfs)
         
         # FINAL GUARD: Ensure no duplicate columns for PyArrow
         if merged.columns.duplicated().any():
@@ -967,7 +963,7 @@ def load_options_indicators(full_history=False):
     days = sorted(list(set(days)))
     
     all_dfs = []
-    for d_str in days:
+    for priority, d_str in enumerate(days):
         for sub in ["live_trading", "paper_trading"]:
             f = OPTIONS_REPO / "logs" / sub / f"OPTIONS_{d_str}_indicators.csv"
             if f.exists():
@@ -977,6 +973,7 @@ def load_options_indicators(full_history=False):
                         # 確保 timestamp 是 datetime
                         if "timestamp" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
                             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                        df["__source_priority"] = priority
                         all_dfs.append(df)
                 except Exception:
                     continue
@@ -997,7 +994,7 @@ def load_options_indicators(full_history=False):
     result = None
     if all_dfs:
         try:
-            merged = pd.concat(all_dfs).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+            merged = merge_indicator_frames(all_dfs)
             
             # Standardize MTX price column name
             if "mtx_close" in merged.columns and "price_mtx" not in merged.columns:

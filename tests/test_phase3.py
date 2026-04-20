@@ -52,6 +52,12 @@ class TestMonitorIntegration:
         from strategies.futures.monitor import FuturesMonitor
         assert hasattr(FuturesMonitor, '_hourly_no_trade_audit')
 
+    def test_monitor_tracks_options_monitor_for_hourly_repair(self):
+        import inspect
+        from strategies.futures.monitor import FuturesMonitor
+        src = inspect.getsource(FuturesMonitor.__init__)
+        assert 'self.options_monitor = None' in src
+
     def test_monitor_tick_checks_breaker(self):
         """Verify _strategy_tick has circuit breaker check."""
         import inspect
@@ -64,6 +70,21 @@ class TestMonitorIntegration:
 
 class TestPhase3Integration:
     """Test that Phase 1+2+3 components work together."""
+
+    def test_main_wires_options_monitor_into_futures_audit(self):
+        src = Path("main.py").read_text()
+        assert "fm.options_monitor = om.monitor" in src
+
+    def test_hourly_audit_calls_options_repair(self):
+        from strategies.futures.monitor import FuturesMonitor
+        import inspect
+        src = inspect.getsource(FuturesMonitor._hourly_no_trade_audit)
+        assert "_audit_options_data_health" in src
+
+    def test_options_monitor_exposes_data_repair_audit(self):
+        src = Path("strategies/options/live_options_squeeze_monitor.py").read_text()
+        assert "def audit_indicator_health_and_repair" in src
+        assert "def _select_live_bar_frames" in src
 
     def test_diagnostic_logs_decision(self, tmp_path):
         """When diagnostic returns action, it gets logged."""

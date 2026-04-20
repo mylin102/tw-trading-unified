@@ -307,27 +307,29 @@ def resolve_tx_contract(api):
         futs = getattr(futures, 'Futures', None)
         if futs is None:
             return None
-        # Try common keys
+        # 💡 GSD: 強制優先檢查 TXF (大台)
         for key in ("TXF", "TX"):
             node = getattr(futs, key, None)
             if node is None:
                 continue
+            # Try common attributes first
+            for attr in ("near_month", "current", "front"):
+                con = getattr(node, attr, None)
+                if con is not None and hasattr(con, 'code') and "TXF" in con.code:
+                    return con
             # If mapping-like
             if hasattr(node, 'items'):
                 for _, con in node.items():
-                    return con
-            # Try common attributes
-            for attr in ("near_month", "current", "front"):
-                con = getattr(node, attr, None)
-                if con is not None:
-                    return con
+                    if hasattr(con, 'code') and "TXF" in con.code:
+                        return con
         # As a final fallback, try iterating an attribute list
         try:
             if hasattr(futs, '__iter__'):
                 for part in futs:
                     try:
                         for c in part:
-                            return c
+                            if hasattr(c, 'code') and "TXF" in c.code:
+                                return c
                     except Exception:
                         continue
         except Exception:
@@ -345,8 +347,12 @@ def feeds_are_fresh(feed_health, require_tx=True, require_tmf=True):
     tx_age = ages.get('TX', float('inf'))
     if require_tmf and tmf_age > FEED_STALE_SECS:
         problems.append(f"TMF stale: {tmf_age:.0f}s")
+    # 💡 GSD: TX stale is non-fatal for process survival
     if require_tx and tx_age > FEED_STALE_SECS:
-        problems.append(f"TX stale: {tx_age:.0f}s")
+        if tx_age == float('inf'):
+            console.print("[bold yellow]⚠️ TX data NEVER received - continuing in degraded mode[/bold yellow]")
+        else:
+            console.print(f"[yellow]⚠️ TX stale: {tx_age:.0f}s[/yellow]")
     return (len(problems) == 0), problems, snap
 
 
@@ -383,6 +389,7 @@ def run_system(dry_run=False):
 
         from strategies.options.monitor import OptionsMonitor
         om = OptionsMonitor(api=api, dry_run=dry_run)
+        fm.options_monitor = om.monitor
 
         # GSD Rationale: Stock module moved to scripts/stock_runner.py for fault isolation.
         # main.py now only handles Futures + Options which share the FOP callback session.
@@ -414,6 +421,7 @@ def run_system(dry_run=False):
 
             # Subscribe TX tick for cross-regime / freshness
             tx_contract = resolve_tx_contract(api)
+            # 💡 GSD: 確保訂閱的是 TXF (大台)
             if tx_contract is not None:
                 try:
                     api.quote.subscribe(tx_contract, quote_type='tick')
@@ -421,7 +429,13 @@ def run_system(dry_run=False):
                 except Exception as e:
                     console.print(f"[yellow]⚠️ TX subscribe failed: {e}[/yellow]")
             else:
-                console.print("[yellow]⚠️ TX contract not resolved; cross-regime freshness will be degraded[/yellow]")
+                # 最後嘗試直接使用 TXF 近月
+                try:
+                    target_code = fm.contract.code.replace("TMF", "TXF") if fm.contract else "TXFE6"
+                    api.quote.subscribe(api.Contracts.Futures[target_code], quote_type='tick')
+                    console.print(f"[green]📡 Emergency Subscribed TXF: {target_code}[/green]")
+                except Exception:
+                    console.print("[yellow]⚠️ TX contract resolution failed; proceeding without macro reference[/yellow]")
 
             # Subscribe options
             for key in ["MTX", "C", "P"]:
@@ -482,6 +496,7 @@ def run_system(dry_run=False):
 
                     from strategies.options.monitor import OptionsMonitor
                     om = OptionsMonitor(api=api, dry_run=dry_run)
+                    fm.options_monitor = om.monitor
 
                     # Re-subscribe
                     if api is not None:
@@ -552,11 +567,19 @@ def run_system(dry_run=False):
                 stagnation_warned = False  # tick 恢復，重置警告
             
             # 哨兵邏輯：二次確認 — 3 分鐘警告，5 分鐘就重啟（全天候監控，含夜盤）
+            # 💡 GSD: 在 08:45 開盤前與 05:00 盤後寬限處理
+            import datetime as _dt_inner
+            now_dt = _dt_inner.datetime.now()
+            # 判斷是否在開盤前的空窗期 (05:00 - 08:45)
+            is_pre_market = (now_dt.hour == 8 and now_dt.minute < 45) or (now_dt.hour >= 5 and now_dt.hour < 8)
+            
             stale_secs = now - last_data_at
-            if stale_secs > 300:
+            stale_limit = 3600 if is_pre_market else 300 # 開盤前給一小時寬限
+            
+            if stale_secs > stale_limit:
                 console.print(f"[bold red]🚨 DATA STAGNATION CONFIRMED! No data for {stale_secs/60:.1f} mins (fm={now-fm_last:.1f}s, om={now-om_last:.1f}s ago). Force restarting...[/bold red]")
                 break
-            elif stale_secs > 180 and not stagnation_warned:
+            elif stale_secs > (stale_limit * 0.6) and not stagnation_warned:
                 console.print(f"[bold yellow]⚠️ DATA WARNING: No data for {stale_secs/60:.1f} mins. Watching...[/bold yellow]")
                 stagnation_warned = True
             
