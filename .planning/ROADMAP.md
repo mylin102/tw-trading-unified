@@ -24,9 +24,9 @@ Milestone v1.1 hardens execution reliability in four behavior-safe steps: first 
 **Plans**: 3 plans
 
 Plans:
-- [ ] 01-01: Define the shared lifecycle contract and identifiers across futures/options paper/live paths
-- [ ] 01-02: Separate order-state transitions from deal-driven fill truth
-- [ ] 01-03: Anchor position and cost-basis updates to confirmed deal handling and `PaperTrader.position`
+- [ ] 01-01-PLAN.md — Define traceable lifecycle IDs and compatibility exports across shared order/fill contracts
+- [ ] 01-02-PLAN.md — Separate order-state transitions from deal-driven fill truth in the shared manager and options callback path
+- [ ] 01-03-PLAN.md — Anchor futures position and cost-basis updates to confirmed deal handling and `PaperTrader.position`
 
 ### Phase 2: Broker Reconciliation & Restart Recovery
 **Goal**: The system can rebuild broker-truth lifecycle state after callback gaps or restarts without re-submitting or losing active execution.
