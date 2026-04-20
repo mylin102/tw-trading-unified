@@ -14,7 +14,7 @@ import yaml
 import datetime
 import os
 from core.date_utils import get_session_date_str, get_trade_day
-from core.dashboard_data import merge_indicator_frames
+from core.dashboard_data import merge_indicator_frames, extend_taifex_recess_continuity
 from core.dashboard_positions import (
     count_futures_entries,
     count_options_entries,
@@ -901,6 +901,7 @@ def load_futures_indicators(full_history=False):
 
     # Stale data detection
     if result is not None and not result.empty and "timestamp" in result.columns:
+        result = extend_taifex_recess_continuity(result, timestamp_col="timestamp")
         try:
             result_ts = result["timestamp"].copy()
             if not pd.api.types.is_datetime64_any_dtype(result_ts):

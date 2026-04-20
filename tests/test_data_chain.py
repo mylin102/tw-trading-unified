@@ -38,7 +38,7 @@ from core.bar_utils import (
     resample_ohlcv,
     validate_ohlcv_bars,
 )
-from core.dashboard_data import merge_indicator_frames
+from core.dashboard_data import merge_indicator_frames, extend_taifex_recess_continuity
 from core.options_snapshot import build_options_snapshot_row
 from core.shioaji_session import SystemReadiness, get_shared_system_status, set_system_status
 
@@ -653,10 +653,51 @@ class TestOptionsEntryGateConsistency:
 class TestStaleDataDetection:
     """Verify dashboard detects stale indicator data."""
 
+    def test_futures_recess_continuity_extends_recent_last_row(self):
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-04-21 05:00:00"]),
+                "open": [201.0],
+                "high": [202.0],
+                "low": [199.0],
+                "close": [200.0],
+                "volume": [15.0],
+                "score": [82.0],
+            }
+        )
+
+        extended = extend_taifex_recess_continuity(
+            df,
+            now=pd.Timestamp("2026-04-21 07:26:00"),
+        )
+
+        assert len(extended) == 2
+        assert extended.iloc[-1]["timestamp"] == pd.Timestamp("2026-04-21 07:25:00")
+        assert extended.iloc[-1]["close"] == 200.0
+        assert extended.iloc[-1]["volume"] == 0.0
+        assert bool(extended.iloc[-1]["__synthetic_continuity"]) is True
+
+    def test_futures_recess_continuity_skips_long_weekend_gap(self):
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-04-18 05:00:00"]),
+                "close": [200.0],
+                "volume": [15.0],
+            }
+        )
+
+        extended = extend_taifex_recess_continuity(
+            df,
+            now=pd.Timestamp("2026-04-20 07:26:00"),
+        )
+
+        assert len(extended) == 1
+
     def test_stale_warning_in_dashboard(self):
         """Dashboard should have stale data detection code."""
         src = Path("ui/dashboard.py").read_text()
         assert "資料停滯" in src
+        assert "extend_taifex_recess_continuity" in src
 
     def test_fallback_file_finder(self):
         """Dashboard should fall back to latest file if today's not found."""
