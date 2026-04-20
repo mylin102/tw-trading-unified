@@ -36,7 +36,7 @@ def test_watchdog_no_action(tmp_path):
     m._check_futures_contract_staleness()
 
 
-def test_watchdog_light_recovery(tmp_path):
+def test_watchdog_light_recovery(tmp_path, monkeypatch):
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text("{}")
     m = make_monitor(str(cfg))
@@ -67,6 +67,7 @@ def test_watchdog_light_recovery(tmp_path):
         return df
 
     m.client.get_kline = fake_get_kline
+    monkeypatch.setattr("strategies.futures.monitor.is_taifex_futures_market_open", lambda: True)
     # Ensure deque empty before
     m._tick_bars_deque.clear()
     m._check_futures_contract_staleness()
@@ -108,7 +109,7 @@ def test_refresh_runtime_status_requires_fresh_tmf_for_trading(tmp_path, monkeyp
     assert get_shared_system_status() == SystemReadiness.TRADING
 
 
-def test_watchdog_critical_exit(tmp_path):
+def test_watchdog_critical_exit(tmp_path, monkeypatch):
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text("{}")
     m = make_monitor(str(cfg))
@@ -125,6 +126,20 @@ def test_watchdog_critical_exit(tmp_path):
                 return True
         quote = Quote()
     m.api = API2()
+    monkeypatch.setattr("strategies.futures.monitor.is_taifex_futures_market_open", lambda: True)
 
     with pytest.raises(RuntimeError):
         m._check_futures_contract_staleness()
+
+
+def test_watchdog_does_not_exit_during_scheduled_recess(tmp_path, monkeypatch):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("{}")
+    m = make_monitor(str(cfg))
+    m.STALE_WARN_SECS = 1
+    m.STALE_CRITICAL_SECS = 5
+    m._last_real_tmf_tick_at = time.time() - 60
+
+    monkeypatch.setattr("strategies.futures.monitor.is_taifex_futures_market_open", lambda: False)
+
+    m._check_futures_contract_staleness()

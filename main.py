@@ -17,6 +17,7 @@ from typing import Dict
 sys.path.insert(0, os.path.dirname(__file__))
 
 from rich.console import Console
+from core.date_utils import is_taifex_futures_market_open
 from core.shioaji_session import get_api, logout
 
 console = Console()
@@ -623,6 +624,11 @@ def run_system(dry_run=False):
                     console.print(f"[yellow]Warning: TX feed quiet for {snap['ages'].get('TX', 0):.0f}s[/yellow]")
 
                 if not ok:
+                    if not is_taifex_futures_market_open():
+                        console.print("[dim]Feed stale during scheduled recess — keep process alive[/dim]")
+                        health_check_at = now + HEALTH_INTERVAL
+                        time.sleep(2)
+                        continue
                     console.print(
                         "[bold red]Feed stale — exiting for external supervisor: "
                         + "; ".join(problems)

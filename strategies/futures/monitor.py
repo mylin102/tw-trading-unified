@@ -606,6 +606,10 @@ class FuturesMonitor:
         self._set_runtime_status(SystemReadiness.DEGRADED)
         console.print(f"[yellow]⚠️ TMF data stale for {secs_since_tick/60:.1f} min, checking contract...[/yellow]")
 
+        if not is_taifex_futures_market_open():
+            console.print("[dim]TMF feed quiet during scheduled recess — keeping monitor alive[/dim]")
+            return
+
         # If we exceed critical threshold, stop the monitor so external supervisor restarts the process
         if secs_since_tick >= critical:
             console.print(f"[red]🚨 TMF data stale CRITICAL: {secs_since_tick/60:.1f} min. Shutting down to trigger supervisor restart.[/red]")

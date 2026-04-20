@@ -345,3 +345,10 @@ class TestShutdownEventLifecycle:
         assert _shutdown_event.is_set()
         
         _shutdown_event.clear()
+
+
+class TestPreOpenStaleGuard:
+    def test_run_system_keeps_process_alive_during_scheduled_recess(self):
+        src = Path("main.py").read_text()
+        assert "Feed stale during scheduled recess — keep process alive" in src
+        assert "if not is_taifex_futures_market_open():" in src
