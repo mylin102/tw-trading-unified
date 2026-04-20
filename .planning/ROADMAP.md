@@ -39,9 +39,9 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 02-01: Add reconciliation flows that combine callbacks with `update_status()` broker refresh
-- [ ] 02-02: Make restart recovery rebuild active lifecycle state and position links safely
-- [ ] 02-03: Persist lifecycle transition audit history for reconcile and recovery paths
+- [ ] 02-01-PLAN.md — Build the shared broker reconciliation engine and normalized lifecycle audit entries
+- [ ] 02-02-PLAN.md — Rehydrate futures/options active orders, fills, and pending strategy state safely after restart
+- [ ] 02-03-PLAN.md — Lock callback-gap recovery and duplicate-submit prevention with regression gates
 
 ### Phase 3: Operator Lifecycle Visibility
 **Goal**: Operators can supervise execution from dashboard surfaces that reflect the same lifecycle truth as the trading engine.
