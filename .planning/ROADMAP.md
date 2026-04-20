@@ -83,3 +83,14 @@ Plans:
 | 2. Broker Reconciliation & Restart Recovery | 0/3 | Not started | - |
 | 3. Operator Lifecycle Visibility | 0/3 | Not started | - |
 | 4. V-Model Validation & Runtime Hardening | 0/2 | Not started | - |
+
+## Backlog
+
+### Phase 999.1: Stock lifecycle extension on shared order management (BACKLOG)
+
+**Goal:** [Captured for future planning]
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
