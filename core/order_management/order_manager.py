@@ -21,9 +21,15 @@ class OrderEvent:
     status: OrderStatus
     symbol: str
     side: OrderSide
+    intent_id: Optional[str] = None
+    deal_id: Optional[str] = None
+    broker_order_id: Optional[str] = None
+    seqno: Optional[str] = None
+    ordno: Optional[str] = None
     fill_price: Optional[float] = None
     fill_qty: int = 0
     reason: str = ""
+    raw_status: Optional[str] = None
     timestamp: datetime = field(default_factory=datetime.now)
 
 
@@ -49,6 +55,7 @@ class OrderManager:
             "on_cancel": [],
             "on_reject": [],
             "on_expire": [],
+            "on_status_change": [],
         }
 
         # Simulator reference (for paper mode cleanup)
@@ -91,6 +98,206 @@ class OrderManager:
         self.active_orders[order_id] = order
         return order
 
+    def _resolve_order(
+        self,
+        order_id: Optional[str] = None,
+        *,
+        broker_order_id: Optional[str] = None,
+        ordno: Optional[str] = None,
+    ) -> Optional[Order]:
+        if order_id:
+            order = self.active_orders.get(order_id)
+            if order:
+                return order
+            for completed in self.completed:
+                if completed.order_id == order_id:
+                    return completed
+
+        for candidate in list(self.active_orders.values()) + self.completed:
+            if broker_order_id and candidate.broker_order_id == broker_order_id:
+                return candidate
+            if ordno and candidate.ordno == ordno:
+                return candidate
+            if broker_order_id and candidate.exchange_order_id == broker_order_id:
+                return candidate
+            if ordno and candidate.exchange_order_id == ordno:
+                return candidate
+        return None
+
+    @staticmethod
+    def _normalize_raw_status(raw_status) -> Optional[OrderStatus]:
+        if raw_status is None:
+            return None
+
+        value = getattr(raw_status, "value", raw_status)
+        if isinstance(value, OrderStatus):
+            return value
+
+        normalized = str(value).strip().lower()
+        mapping = {
+            "pendingsubmit": OrderStatus.PENDING_SUBMIT,
+            "pending_submit": OrderStatus.PENDING_SUBMIT,
+            "presubmitted": OrderStatus.PRE_SUBMITTED,
+            "pre_submitted": OrderStatus.PRE_SUBMITTED,
+            "submitted": OrderStatus.SUBMITTED,
+            "accepted": OrderStatus.SUBMITTED,
+            "partfilled": OrderStatus.PARTIAL_FILLED,
+            "partialfilled": OrderStatus.PARTIAL_FILLED,
+            "partial_filled": OrderStatus.PARTIAL_FILLED,
+            "filled": OrderStatus.FILLED,
+            "cancelled": OrderStatus.CANCELLED,
+            "canceled": OrderStatus.CANCELLED,
+            "failed": OrderStatus.REJECTED,
+            "rejected": OrderStatus.REJECTED,
+            "expired": OrderStatus.EXPIRED,
+        }
+        return mapping.get(normalized)
+
+    def attach_submission(
+        self,
+        order_id: str,
+        *,
+        broker_trade=None,
+        broker_order_id: Optional[str] = None,
+        seqno: Optional[str] = None,
+        ordno: Optional[str] = None,
+        raw_status=None,
+    ) -> Order:
+        order = self._resolve_order(order_id)
+        if order is None:
+            raise KeyError(f"Order {order_id} not found")
+
+        broker_order_id = (
+            broker_order_id
+            or getattr(broker_trade, "id", None)
+            or getattr(broker_trade, "ordno", None)
+            or ordno
+        )
+        ordno = ordno or getattr(broker_trade, "ordno", None) or broker_order_id
+        seqno = seqno or getattr(broker_trade, "seqno", None)
+        submit_status = self._normalize_raw_status(raw_status) or OrderStatus.SUBMITTED
+        exchange_id = ordno or broker_order_id or order.exchange_order_id or order.order_id
+
+        if order.status == OrderStatus.PENDING_SUBMIT:
+            order.submit(
+                exchange_id,
+                broker_order_id=broker_order_id,
+                seqno=seqno,
+                ordno=ordno,
+            )
+        else:
+            order.status = submit_status
+            order.exchange_order_id = exchange_id
+            order.broker_order_id = broker_order_id or exchange_id
+            order.seqno = seqno
+            order.ordno = ordno or exchange_id
+            order.submitted_at = order.submitted_at or datetime.now()
+            order.updated_at = datetime.now()
+
+        order.raw_events.append({
+            "type": "submission",
+            "raw_status": getattr(raw_status, "value", raw_status),
+            "broker_order_id": broker_order_id,
+            "seqno": seqno,
+            "ordno": ordno,
+            "timestamp": datetime.now().isoformat(),
+        })
+        self._emit("on_status_change", OrderEvent(
+            order_id=order.order_id,
+            status=order.status,
+            symbol=order.symbol,
+            side=order.side,
+            intent_id=order.intent_id,
+            broker_order_id=order.broker_order_id,
+            seqno=order.seqno,
+            ordno=order.ordno,
+            raw_status=str(submit_status.value),
+        ))
+        return order
+
+    def apply_order_update(
+        self,
+        order_id: Optional[str],
+        *,
+        raw_status,
+        reason: str = "",
+        raw_payload: Optional[Dict[str, Any]] = None,
+        broker_order_id: Optional[str] = None,
+        seqno: Optional[str] = None,
+        ordno: Optional[str] = None,
+    ) -> Optional[Order]:
+        order = self._resolve_order(order_id, broker_order_id=broker_order_id, ordno=ordno)
+        if order is None:
+            return None
+
+        normalized = self._normalize_raw_status(raw_status)
+        if normalized is None:
+            return order
+
+        order.broker_order_id = broker_order_id or order.broker_order_id or order.exchange_order_id
+        order.seqno = seqno or order.seqno
+        order.ordno = ordno or order.ordno or order.exchange_order_id
+        if raw_payload is not None:
+            order.raw_events.append({
+                "type": "order_update",
+                "raw_status": getattr(raw_status, "value", raw_status),
+                "payload": raw_payload,
+                "timestamp": datetime.now().isoformat(),
+            })
+
+        if normalized in (OrderStatus.PENDING_SUBMIT, OrderStatus.PRE_SUBMITTED, OrderStatus.SUBMITTED):
+            order.status = normalized
+            if normalized in (OrderStatus.PRE_SUBMITTED, OrderStatus.SUBMITTED):
+                order.submitted_at = order.submitted_at or datetime.now()
+            order.updated_at = datetime.now()
+            self._emit("on_status_change", OrderEvent(
+                order_id=order.order_id,
+                status=order.status,
+                symbol=order.symbol,
+                side=order.side,
+                intent_id=order.intent_id,
+                broker_order_id=order.broker_order_id,
+                seqno=order.seqno,
+                ordno=order.ordno,
+                reason=reason,
+                raw_status=str(getattr(raw_status, "value", raw_status)),
+            ))
+            return order
+
+        if normalized == OrderStatus.PARTIAL_FILLED:
+            order.status = OrderStatus.PARTIAL_FILLED
+            order.updated_at = datetime.now()
+            self._emit("on_status_change", OrderEvent(
+                order_id=order.order_id,
+                status=order.status,
+                symbol=order.symbol,
+                side=order.side,
+                intent_id=order.intent_id,
+                broker_order_id=order.broker_order_id,
+                seqno=order.seqno,
+                ordno=order.ordno,
+                reason=reason,
+                raw_status=str(getattr(raw_status, "value", raw_status)),
+            ))
+            return order
+
+        if normalized == OrderStatus.CANCELLED:
+            if order.order_id in self.active_orders:
+                self.cancel(order.order_id, reason=reason)
+            return order
+
+        if normalized == OrderStatus.REJECTED:
+            if order.order_id in self.active_orders:
+                self.reject(order.order_id, reason=reason or "rejected")
+            return order
+
+        if normalized == OrderStatus.EXPIRED:
+            if order.order_id in self.active_orders:
+                self.expire(order.order_id)
+            return order
+
+        return order
+
     # ── Submit ──
 
     def submit(self, order: Order, exchange_ordno: Optional[str] = None) -> bool:
@@ -122,18 +329,92 @@ class OrderManager:
             ))
             return False
 
-        order.status = OrderStatus.SUBMITTED
-        order.exchange_order_id = result.ordno if hasattr(result, "ordno") else str(id(result))
-        order.submitted_at = datetime.now()
+        self.attach_submission(
+            order.order_id,
+            broker_trade=result,
+            broker_order_id=getattr(result, "id", None),
+            seqno=getattr(result, "seqno", None),
+            ordno=getattr(result, "ordno", None),
+            raw_status="Submitted",
+        )
         return True
 
     def _submit_paper(self, order: Order, exchange_ordno: Optional[str] = None) -> bool:
-        order.status = OrderStatus.SUBMITTED
-        order.exchange_order_id = exchange_ordno or f"PAPER-{order.order_id}"
-        order.submitted_at = datetime.now()
+        self.attach_submission(
+            order.order_id,
+            broker_order_id=exchange_ordno or f"PAPER-{order.order_id}",
+            ordno=exchange_ordno or f"PAPER-{order.order_id}",
+            raw_status="Submitted",
+        )
         return True
 
     # ── Fill ──
+
+    def apply_deal_fill(
+        self,
+        order_id: Optional[str],
+        *,
+        deal_id: Optional[str] = None,
+        fill_price: float,
+        fill_qty: int,
+        fill_time: Optional[datetime] = None,
+        exchange_fill_id: Optional[str] = None,
+        broker_trade_id: Optional[str] = None,
+        exchange_seq: Optional[str] = None,
+        commission: float = 0.0,
+        tax: float = 0.0,
+        raw_payload: Optional[Dict[str, Any]] = None,
+        broker_order_id: Optional[str] = None,
+        ordno: Optional[str] = None,
+    ) -> Optional[Order]:
+        order = self._resolve_order(order_id, broker_order_id=broker_order_id, ordno=ordno)
+        if order is None:
+            return None
+
+        remaining = order.quantity - order.filled_quantity
+        if fill_qty > remaining:
+            raise ValueError(f"Fill qty {fill_qty} exceeds remaining {remaining} for {order.order_id}")
+        if fill_qty <= 0:
+            raise ValueError("Fill quantity must be positive")
+
+        order.fill(
+            fill_price,
+            fill_qty,
+            commission=commission,
+            tax=tax,
+            deal_id=deal_id,
+            exchange_fill_id=exchange_fill_id,
+            broker_trade_id=broker_trade_id,
+            exchange_seq=exchange_seq,
+            fill_time=fill_time,
+        )
+        if raw_payload is not None:
+            order.raw_events.append({
+                "type": "deal_fill",
+                "payload": raw_payload,
+                "timestamp": datetime.now().isoformat(),
+            })
+
+        if order.status == OrderStatus.FILLED:
+            if order.order_id in self.active_orders:
+                self.completed.append(order)
+                del self.active_orders[order.order_id]
+
+        latest_fill = order.fills[-1] if order.fills else None
+        self._emit("on_fill", OrderEvent(
+            order_id=order.order_id,
+            status=order.status,
+            symbol=order.symbol,
+            side=order.side,
+            intent_id=order.intent_id,
+            deal_id=latest_fill.deal_id if latest_fill else deal_id,
+            broker_order_id=order.broker_order_id,
+            seqno=order.seqno,
+            ordno=order.ordno,
+            fill_price=fill_price,
+            fill_qty=fill_qty,
+        ))
+        return order
 
     def on_fill(
         self,
@@ -157,21 +438,13 @@ class OrderManager:
         if fill_qty <= 0:
             raise ValueError("Fill quantity must be positive")
 
-        order.fill(fill_price, fill_qty, commission=commission, tax=tax)
-
-        if partial or order.status == OrderStatus.PARTIAL_FILLED:
-            order.status = OrderStatus.PARTIAL_FILLED
-        else:
-            order.status = OrderStatus.FILLED
-            order.filled_at = datetime.now()
-            self.completed.append(order)
-            del self.active_orders[order_id]
-
-        self._emit("on_fill", OrderEvent(
-            order_id=order_id, status=order.status,
-            symbol=order.symbol, side=order.side,
-            fill_price=fill_price, fill_qty=fill_qty,
-        ))
+        self.apply_deal_fill(
+            order_id,
+            fill_price=fill_price,
+            fill_qty=fill_qty,
+            commission=commission,
+            tax=tax,
+        )
 
     # ── Cancel (🛑 Gate) ──
 

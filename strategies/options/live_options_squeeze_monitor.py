@@ -17,7 +17,12 @@ from rich.console import Console
 from options_engine.engine.indicators import calculate_futures_squeeze, calculate_mtf_alignment
 from core.date_utils import get_session_date_str
 from options_engine.engine.broker_adapter import ShioajiBrokerAdapter
-from options_engine.engine.backtest_engine import should_exit_position, should_take_partial_profit, should_exit_by_time_constraints
+from options_engine.engine.backtest_engine import (
+    classify_exit_reason,
+    should_exit_position,
+    should_take_partial_profit,
+    should_exit_by_time_constraints,
+)
 from options_engine.engine.backtest_engine import resolve_option_strike
 from options_engine.engine.options_strategy import get_mode_profile, get_score_floor, get_stop_loss_pct, get_strategy_weights, infer_mid_trend, resolve_entry_side
 from core.bar_utils import (
@@ -30,6 +35,12 @@ from core.bar_utils import (
     validate_ohlcv_bars,
 )
 from core.options_snapshot import OPTION_SNAPSHOT_COLUMNS, build_options_snapshot_row
+from core.order_lifecycle_audit import (
+    count_option_ledger_order_events,
+    read_orders_file,
+    rebuild_options_orders_from_ledger,
+    write_orders_file,
+)
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
@@ -214,6 +225,8 @@ class ShioajiOptionsSmartMonitor:
             except Exception as e:
                 console.print(f"[yellow][ThetaGang] init failed: {e}[/yellow]")
         self._theta_bars_held = 0
+        self._theta_release_confirm_count = 0
+        self._theta_release_last_bar_ts = None
         self.last_status_print_at = None
         self.last_kbars_fetch_at = 0.0
         self.latest_score = 0.0
@@ -235,17 +248,12 @@ class ShioajiOptionsSmartMonitor:
         self.replay_stats = {"signals": 0, "directional_signals": 0, "entries": 0, "exits": 0, "tp1_hits": 0, "blocked_entries": 0, "last_summary_at": 0}
         self._seen_fill_ordnos = set()  # Dedup for live FDeal callbacks
 
-        # ── [L3] Order Lifecycle Manager (independent of live_trading) ──
+        # ── [L3] Order Lifecycle Manager ──
+        # [GSD Fix] OrderManager initialization moved to run() to ensure broker is available
+        # and order recovery happens before callbacks are wired
         cfg = self.load_config()
         self._use_order_manager = cfg.get("monitoring", {}).get("use_order_manager", False)
         self.order_mgr = None
-        if self._use_order_manager:
-            from core.order_management.order_manager import OrderManager
-            _om_mode = "live" if self.live_trading else "paper"
-            broker = self.broker if self.live_trading else None
-            self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=broker)
-            self._wire_order_callbacks()
-            console.print(f"[green]📋 Options Order Lifecycle Manager enabled ({_om_mode} mode)[/green]")
 
         # 設定日誌路徑
         self._update_log_paths()
@@ -1053,18 +1061,64 @@ class ShioajiOptionsSmartMonitor:
 
                 export_data.append(d)
 
-            today = datetime.datetime.now().strftime("%Y%m%d")
-            orders_file = Path(f"exports/trades/OPTIONS_{today}_orders.json")
-            orders_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(orders_file, "w", encoding="utf-8") as f:
-                json.dump(export_data, f, ensure_ascii=False, indent=2)
+            orders_file = self._options_orders_file_path()
+            write_orders_file(orders_file, export_data)
         except Exception as e:
             print(f"⚠️ Failed to save options orders: {e}")
+
+    def _options_orders_file_path(self, now=None):
+        current_time = now or datetime.datetime.now()
+        date_str = current_time.strftime("%Y%m%d")
+        return Path(f"exports/trades/OPTIONS_{date_str}_orders.json")
+
+    def audit_order_lifecycle_health_and_repair(self, timestamp=None):
+        current_time = timestamp
+        if isinstance(timestamp, pd.Timestamp):
+            current_time = timestamp.to_pydatetime()
+        if current_time is None:
+            current_time = datetime.datetime.now()
+
+        orders_file = self._options_orders_file_path(current_time)
+        existing_orders = read_orders_file(orders_file)
+
+        ledger_df = None
+        if self.ledger_path.exists():
+            try:
+                ledger_df = pd.read_csv(self.ledger_path)
+            except Exception as exc:
+                return f"order_lifecycle_read_error:{type(exc).__name__}"
+
+        ledger_events = count_option_ledger_order_events(ledger_df)
+        if ledger_events == 0:
+            return "order_lifecycle_idle"
+
+        if len(existing_orders) >= ledger_events:
+            return f"order_lifecycle_healthy orders={len(existing_orders)} ledger={ledger_events}"
+
+        repairs = []
+        if self.order_mgr and (self.order_mgr.get_completed() or self.order_mgr.get_pending()):
+            self._save_orders_file_wrapper()
+            repairs.append("export_from_order_mgr")
+            existing_orders = read_orders_file(orders_file)
+
+        if len(existing_orders) < ledger_events and ledger_df is not None:
+            rebuilt_orders = rebuild_options_orders_from_ledger(ledger_df)
+            if rebuilt_orders:
+                write_orders_file(orders_file, rebuilt_orders)
+                repairs.append("rebuild_from_ledger")
+                existing_orders = rebuilt_orders
+
+        if len(existing_orders) >= ledger_events:
+            return f"order_lifecycle_repair_ok orders={len(existing_orders)} ledger={ledger_events} repairs={','.join(repairs)}"
+        return f"order_lifecycle_repair_failed orders={len(existing_orders)} ledger={ledger_events}"
 
     def _wire_order_callbacks(self):
         """Wire OrderManager callbacks for options (export + logging)."""
         import json
         from core.order_management.order import OrderStatus
+
+        def _on_status_change(event):
+            self._save_orders_file_wrapper()
 
         def _on_fill_callback(event):
             console.print(f"[green]📦 Options Order FILLED: {event.side.value} {event.fill_qty} @ {event.fill_price:.0f}[/green]")
@@ -1078,6 +1132,7 @@ class ShioajiOptionsSmartMonitor:
             console.print(f"[red]❌ Options Order REJECTED: {event.order_id} ({event.reason})[/red]")
             self._save_orders_file_wrapper()
 
+        self.order_mgr.register_callback("on_status_change", _on_status_change)
         self.order_mgr.register_callback("on_fill", _on_fill_callback)
         self.order_mgr.register_callback("on_cancel", _on_cancel_callback)
         self.order_mgr.register_callback("on_reject", _on_reject_callback)
@@ -1162,15 +1217,36 @@ class ShioajiOptionsSmartMonitor:
         # set_order_callback receives OrderState enum:
         #   OrderState.FuturesDeal / OrderState.StockDeal — actual fills
         #   OrderState.FuturesOrder / OrderState.StockOrder — order status changes
-        # Only process deal events (actual fills), ignore order status changes
         is_deal = stat in (sj.constant.OrderState.FuturesDeal, sj.constant.OrderState.StockDeal)
-        if not (self.dry_run_live_orders and stat == "MOCK_FILL") and not is_deal:
+        is_mock_deal = self.dry_run_live_orders and stat == "MOCK_FILL"
+        if not is_mock_deal and not is_deal and stat not in (sj.constant.OrderState.FuturesOrder, sj.constant.OrderState.StockOrder):
             return
         action = str(msg.get("action", ""))
         price = float(msg.get("price", 0.0) or 0.0)
         quantity = int(msg.get("quantity", 0) or 0)
         code = msg.get("code")
+        ordno = msg.get("ordno")
+        broker_order_id = msg.get("id") or ordno
+        seqno = msg.get("seqno")
+        raw_status = msg.get("status") or getattr(stat, "value", stat)
         side = self.active_side
+        if self.order_mgr and not (is_deal or is_mock_deal):
+            tracked_order_id = None
+            if self.pending_entry and code == self.pending_entry.get("contract_code") and action == "Buy":
+                tracked_order_id = self.pending_entry.get("order_id")
+            elif self.pending_exit_trade and action == "Sell":
+                tracked_order_id = self.pending_exit_trade.get("order_id")
+            if tracked_order_id:
+                self.order_mgr.apply_order_update(
+                    tracked_order_id,
+                    raw_status=raw_status,
+                    reason=str(msg.get("errmsg", "") or msg.get("reason", "")),
+                    raw_payload=msg,
+                    broker_order_id=broker_order_id,
+                    seqno=seqno,
+                    ordno=ordno,
+                )
+            return
         if self.pending_entry and code == self.pending_entry["contract_code"] and action == "Buy":
             side = self.pending_entry["side"]
             ordno = msg.get("ordno", "")
@@ -1179,6 +1255,18 @@ class ShioajiOptionsSmartMonitor:
                 return
             if ordno:
                 self._seen_fill_ordnos.add(ordno)
+            if self.order_mgr and self.pending_entry.get("order_id"):
+                self.order_mgr.apply_deal_fill(
+                    self.pending_entry["order_id"],
+                    fill_price=price,
+                    fill_qty=quantity,
+                    broker_order_id=broker_order_id,
+                    ordno=ordno,
+                    exchange_fill_id=msg.get("trade_id"),
+                    broker_trade_id=msg.get("trade_id"),
+                    exchange_seq=msg.get("exchange_seq"),
+                    raw_payload=msg,
+                )
             self.position += quantity
             self.active_side = side
             self.entry_price = price
@@ -1204,6 +1292,18 @@ class ShioajiOptionsSmartMonitor:
                 self.pending_entry = None
             return
         if self.active_side and action == "Sell":
+            if self.order_mgr and self.pending_exit_trade and self.pending_exit_trade.get("order_id"):
+                self.order_mgr.apply_deal_fill(
+                    self.pending_exit_trade["order_id"],
+                    fill_price=price,
+                    fill_qty=quantity,
+                    broker_order_id=broker_order_id,
+                    ordno=ordno,
+                    exchange_fill_id=msg.get("trade_id"),
+                    broker_trade_id=msg.get("trade_id"),
+                    exchange_seq=msg.get("exchange_seq"),
+                    raw_payload=msg,
+                )
             self.position = max(0, self.position - quantity)
             self.log_trade("LIVE_EXIT_FILLED", self.active_side, price, f"qty={quantity} reason={self.pending_exit_reason or ''}".strip())
             if _notify:
@@ -1381,6 +1481,153 @@ class ShioajiOptionsSmartMonitor:
         current_time = now or datetime.datetime.now()
         return 10 if is_night_session(current_time) else max(30, self.strategy_cfg.get("length", 20) + 5)
 
+    def _evaluate_signal_bar_quality(self, signal, reference_price=None):
+        ohlc = {}
+        issues = []
+        aliases = {
+            "Open": ("Open", "open"),
+            "High": ("High", "high"),
+            "Low": ("Low", "low"),
+            "Close": ("Close", "close"),
+        }
+
+        for key, names in aliases.items():
+            value = None
+            for name in names:
+                raw = signal.get(name)
+                if raw is None or pd.isna(raw):
+                    continue
+                value = float(raw)
+                break
+            ohlc[key] = value
+            if value is None:
+                issues.append(f"missing_{key.lower()}")
+            elif value <= 0:
+                issues.append(f"non_positive_{key.lower()}")
+
+        if not issues:
+            if ohlc["High"] < ohlc["Low"]:
+                issues.append("high_below_low")
+            body_low = min(ohlc["Open"], ohlc["Close"])
+            body_high = max(ohlc["Open"], ohlc["Close"])
+            if ohlc["Low"] > body_low:
+                issues.append("low_above_body")
+            if ohlc["High"] < body_high:
+                issues.append("high_below_body")
+
+        reference = float(reference_price or signal.get("price_mtx") or 0.0)
+        max_drift = float(self._theta_cfg.get("max_bar_price_deviation_pts", 250))
+        max_reference_deviation = 0.0
+        if reference > 0 and not issues:
+            max_reference_deviation = max(
+                abs(value - reference) for value in ohlc.values() if value is not None
+            )
+            if max_reference_deviation > max_drift:
+                issues.append(f"price_drift>{max_drift:.0f}")
+
+        return {
+            "quality": "PASS" if not issues else "BLOCK",
+            "issues": issues,
+            "reference_price": reference,
+            "max_reference_deviation": round(max_reference_deviation, 1),
+        }
+
+    def _resolve_futures_squeeze_state(self, bar_ts):
+        bar_time = pd.Timestamp(bar_ts)
+        date_str = get_session_date_str(bar_time.to_pydatetime())
+        market_dir = Path("logs/market_data")
+        patterns = [
+            f"TMF_{date_str}_*_indicators.csv",
+            "TMF_*_indicators.csv",
+        ]
+        candidates = []
+        seen = set()
+        for pattern in patterns:
+            for path in sorted(market_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True):
+                if path in seen:
+                    continue
+                seen.add(path)
+                candidates.append(path)
+
+        for path in candidates:
+            try:
+                df = pd.read_csv(path)
+            except Exception:
+                continue
+
+            if df.empty or "timestamp" not in df.columns or "sqz_on" not in df.columns:
+                continue
+
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+            usable = df[df["timestamp"] <= bar_time].dropna(subset=["timestamp"])
+            if usable.empty:
+                continue
+
+            latest = usable.iloc[-1]
+            matched_ts = pd.Timestamp(latest["timestamp"])
+            if (bar_time - matched_ts) > pd.Timedelta(minutes=10):
+                continue
+
+            raw_sqz = latest.get("sqz_on")
+            if pd.isna(raw_sqz):
+                continue
+            return bool(raw_sqz), f"{path.name}@{matched_ts.isoformat()}"
+
+        return None, "futures_unavailable"
+
+    def _update_theta_release_confirmation(self, signal, reference_price):
+        bar_ts = pd.Timestamp(
+            signal.get("completed_bar_timestamp")
+            or signal.get("timestamp")
+            or datetime.datetime.now()
+        ).floor("5min")
+        quality = self._evaluate_signal_bar_quality(signal, reference_price=reference_price)
+        signal["bar_quality"] = quality["quality"]
+        signal["bar_quality_issues"] = ";".join(quality["issues"])
+        signal["bar_reference_price"] = quality["reference_price"]
+        signal["bar_max_reference_deviation"] = quality["max_reference_deviation"]
+        signal["completed_bar_timestamp"] = bar_ts.isoformat()
+
+        raw_release = not bool(signal.get("squeeze_on", False))
+        futures_sqz_on, futures_source = self._resolve_futures_squeeze_state(bar_ts)
+        signal["futures_sqz_on"] = futures_sqz_on
+        signal["futures_sqz_source"] = futures_source
+
+        release_bar_confirmed = (
+            raw_release
+            and quality["quality"] == "PASS"
+            and futures_sqz_on is not True
+        )
+
+        if self._theta_release_last_bar_ts != bar_ts:
+            self._theta_release_last_bar_ts = bar_ts
+            self._theta_release_confirm_count = (
+                self._theta_release_confirm_count + 1 if release_bar_confirmed else 0
+            )
+
+        confirm_bars = max(1, int(self._theta_cfg.get("squeeze_release_confirm_bars", 2)))
+        confirmed = release_bar_confirmed and self._theta_release_confirm_count >= confirm_bars
+
+        if quality["quality"] != "PASS":
+            reason = f"bar_quality:{signal['bar_quality_issues']}"
+        elif futures_sqz_on is True:
+            reason = "futures_sqz_conflict"
+        elif raw_release and not confirmed:
+            reason = f"waiting_release_confirmation:{self._theta_release_confirm_count}/{confirm_bars}"
+        elif raw_release:
+            reason = f"release_confirmed:{self._theta_release_confirm_count}/{confirm_bars}"
+        else:
+            reason = "squeeze_still_on"
+
+        return {
+            "confirmed": confirmed,
+            "raw_release_candidate": raw_release,
+            "reason": reason,
+            "confirm_count": self._theta_release_confirm_count,
+            "confirm_bars": confirm_bars,
+            "futures_sqz_on": futures_sqz_on,
+        }
+
     def _select_live_bar_frames(self, now=None):
         current_time = now or datetime.datetime.now()
         min_bars = self._live_min_bars_required(current_time)
@@ -1456,13 +1703,30 @@ class ShioajiOptionsSmartMonitor:
         if df_5m is None or len(df_5m) < min_bars:
             rejected = ",".join(bar_source.get("rejected", [])) or "no_bar_source"
             issues.append(f"bars_unavailable:{rejected}")
+        else:
+            latest_bar = df_5m.iloc[-1].to_dict()
+            latest_bar["timestamp"] = df_5m.index[-1]
+            latest_bar["price_mtx"] = float(
+                self.market_data.get("MTX", {}).get("close", 0.0)
+                or latest_bar.get("Close", 0.0)
+            )
+            latest_quality = self._evaluate_signal_bar_quality(
+                latest_bar,
+                reference_price=latest_bar["price_mtx"],
+            )
+            if latest_quality["quality"] != "PASS":
+                issues.append(f"bar_quality:{';'.join(latest_quality['issues'])}")
 
         indicator_issue = self._inspect_indicator_log_health(now=current_time)
         if indicator_issue:
             issues.append(indicator_issue)
 
+        order_issue = self.audit_order_lifecycle_health_and_repair(current_time)
+        if order_issue and not order_issue.endswith("idle") and "healthy" not in order_issue:
+            issues.append(order_issue)
+
         if not issues:
-            return f"healthy source={bar_source.get('source') or 'unknown'} bars={len(df_5m) if df_5m is not None else 0}"
+            return f"healthy source={bar_source.get('source') or 'unknown'} bars={len(df_5m) if df_5m is not None else 0}; {order_issue}"
 
         missing_contracts = [key for key in ("MTX", "C", "P") if self.active_contracts.get(key) is None]
         if missing_contracts and self.find_best_contracts():
@@ -1747,6 +2011,7 @@ class ShioajiOptionsSmartMonitor:
                 "price_mtx": float(row.get("Close", 0)),
                 "mid_trend": "",
                 "timestamp": timestamp,
+                "completed_bar_timestamp": timestamp,
                 "squeeze_on": safe_bool(row.get("sqz_on")),
                 "fired": safe_bool(row.get("fired")),
                 "bullish_align": safe_bool(row.get("bullish_align")),
@@ -1758,6 +2023,15 @@ class ShioajiOptionsSmartMonitor:
             for k, v in row_data.items():
                 if k not in signal:
                     signal[k] = v
+
+            bar_quality = self._evaluate_signal_bar_quality(
+                signal,
+                reference_price=float(self.market_data["MTX"]["close"] or signal.get("price_mtx", 0.0)),
+            )
+            signal["bar_quality"] = bar_quality["quality"]
+            signal["bar_quality_issues"] = ";".join(bar_quality["issues"])
+            signal["bar_reference_price"] = bar_quality["reference_price"]
+            signal["bar_max_reference_deviation"] = bar_quality["max_reference_deviation"]
 
             m15 = p15[p15.index <= timestamp]
             h1 = p1h[p1h.index <= timestamp]
@@ -1895,6 +2169,9 @@ class ShioajiOptionsSmartMonitor:
             
         if not self._paper_margin_check(entry_price):
             return
+        paper_order = self._record_paper_order(side, "BUY", self.paper_lots, entry_price, f"ENTRY score={signal.get('score', 0):.1f}")
+        if self.order_mgr and paper_order is None:
+            return
         self.position += self.paper_lots
         self.active_side = side
         # Average entry price for multiple positions
@@ -1917,14 +2194,11 @@ class ShioajiOptionsSmartMonitor:
         
         sig_score = signal.get("score", 0)
         self.log_trade("PAPER_ENTRY", side, entry_price, f"score={sig_score:.1f}")
-        
-        # [GSD Fix] Record in OrderManager so it appears in Dashboard
-        self._record_paper_order(side, "BUY", self.paper_lots, entry_price, f"ENTRY score={sig_score:.1f}")
 
-    def _record_paper_order(self, side_label, action, quantity, price, note=""):
+    def _record_paper_order(self, side_label, action, quantity, price, note="", strategy_override=None):
         """Helper to create a mock filled order for paper trades."""
         if not self.order_mgr:
-            return
+            return None
             
         try:
             from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
@@ -1942,26 +2216,29 @@ class ShioajiOptionsSmartMonitor:
             contract = self.active_contracts.get(side_label)
             if contract: symbol = contract.code
             
-            order = Order(
+            order = self.order_mgr.create_order(
                 symbol=symbol,
                 side=side,
                 order_type=OrderType.MARKET,
                 quantity=quantity,
                 price=price,
-                order_id=f"PAPER-{now.strftime('%H%M%S')}",
-                strategy=self.mode
+                strategy=strategy_override or self.mode,
+                comment=note,
             )
-            order.status = OrderStatus.FILLED
-            order.filled_quantity = quantity
-            order.avg_fill_price = price
-            order.filled_at = now
-            order.created_at = now
-            order.note = note
-            
-            self.order_mgr.completed.append(order)
+            self.order_mgr.submit(order, exchange_ordno=f"PAPER-{order.order_id}")
+            self.order_mgr.apply_deal_fill(
+                order.order_id,
+                deal_id=f"deal-{order.order_id}",
+                fill_price=price,
+                fill_qty=quantity,
+                fill_time=now,
+                raw_payload={"paper": True, "side_label": side_label, "action": action, "note": note},
+            )
             self._save_orders_file_wrapper()
+            return order
         except Exception as e:
             console.print(f"[yellow]⚠️ Failed to record paper order: {e}[/yellow]")
+            return None
 
     def enter_live_position(self, side, signal):
         self.submit_live_entry(side, signal, retries=0)
@@ -1990,11 +2267,33 @@ class ShioajiOptionsSmartMonitor:
         if contract is None:
             self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "no_contract_for_side")
             return
+        lifecycle_order = None
+        if self.order_mgr:
+            from core.order_management.order import OrderType, OrderSide
+            lifecycle_order = self.order_mgr.create_order(
+                symbol=contract.code,
+                side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                quantity=self.paper_lots,
+                strategy=self.mode,
+                comment=f"ENTRY score={signal.get('score', 0.0):.1f}",
+            )
         trade = self.broker.place_entry_order(contract, self.paper_lots)
         if trade is None:
             console.print("[red]❌ 下單未執行（可能保證金不足）[/red]")
+            if lifecycle_order is not None:
+                self.order_mgr.reject(lifecycle_order.order_id, "place_order_returned_none")
             self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "place_order_returned_none")
             return
+        if lifecycle_order is not None:
+            self.order_mgr.attach_submission(
+                lifecycle_order.order_id,
+                broker_trade=trade,
+                broker_order_id=getattr(trade, "id", None),
+                seqno=getattr(trade, "seqno", None),
+                ordno=getattr(trade, "ordno", None),
+                raw_status="Submitted",
+            )
         self.pending_entry = {
             "side": side,
             "contract_code": contract.code,
@@ -2002,6 +2301,7 @@ class ShioajiOptionsSmartMonitor:
             "signal_time": signal.get("timestamp"),
             "submitted_at": datetime.datetime.now(),
             "trade": trade,
+            "order_id": lifecycle_order.order_id if lifecycle_order is not None else None,
             "retries": retries,
         }
         self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "")
@@ -2045,16 +2345,39 @@ class ShioajiOptionsSmartMonitor:
             return
         exit_quantity = min(self.position, quantity or self.position)
         bid = self.current_option_quote(self.active_side)["bid"]
+        lifecycle_order = None
+        if self.order_mgr:
+            from core.order_management.order import OrderType, OrderSide
+            lifecycle_order = self.order_mgr.create_order(
+                symbol=contract.code,
+                side=OrderSide.SELL,
+                order_type=OrderType.MARKET,
+                quantity=exit_quantity,
+                strategy=self.mode,
+                comment=action,
+            )
         trade = self.broker.place_exit_order(contract, exit_quantity, bid_price=bid)
         if trade is None:
             console.print("[red]❌ 出場下單未執行[/red]")
+            if lifecycle_order is not None:
+                self.order_mgr.reject(lifecycle_order.order_id, "place_order_returned_none")
             self._audit_signal("LIVE_EXIT_SUBMITTED", self.active_side, {"action": action, "note": note}, "place_order_returned_none")
             return
+        if lifecycle_order is not None:
+            self.order_mgr.attach_submission(
+                lifecycle_order.order_id,
+                broker_trade=trade,
+                broker_order_id=getattr(trade, "id", None),
+                seqno=getattr(trade, "seqno", None),
+                ordno=getattr(trade, "ordno", None),
+                raw_status="Submitted",
+            )
         self.pending_exit_qty = exit_quantity
         self.pending_exit_reason = action
         self.pending_exit_trade = {
             "submitted_at": datetime.datetime.now(),
             "trade": trade,
+            "order_id": lifecycle_order.order_id if lifecycle_order is not None else None,
             "quantity": exit_quantity,
             "retries": retries,
         }
@@ -2292,6 +2615,97 @@ class ShioajiOptionsSmartMonitor:
         except Exception as e:
             console.print(f"[yellow]Position recovery failed: {e}[/yellow]")
 
+    def _recover_orders_from_ledger(self):
+        """Recover all orders from ledger CSV to rebuild OrderManager state on startup."""
+        if not self.order_mgr:
+            return
+        
+        try:
+            import csv
+            from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
+            
+            if not os.path.exists(self.ledger_path):
+                console.print("[dim]No ledger file to recover orders from[/dim]")
+                return
+            
+            with open(self.ledger_path) as f:
+                rows = list(csv.DictReader(f))
+            
+            if not rows:
+                return
+            
+            recovered_count = 0
+            for row in rows:
+                try:
+                    action = row.get("Action", "")
+                    side_label = row.get("Side", "")
+                    price = float(row.get("Price", 0))
+                    quantity = int(row.get("Quantity", 0) or 1)
+                    timestamp_str = row.get("Timestamp", "")
+                    note = row.get("Note", "")
+                    
+                    # Parse timestamp
+                    try:
+                        ts = datetime.datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                    except:
+                        ts = datetime.datetime.now()
+                    
+                    # Determine if this is an entry or exit
+                    is_entry = "ENTRY" in action
+                    is_exit = any(kw in action for kw in ["EXIT", "TP1", "TRAIL", "TIME", "REVERSAL", "TRAP", "EOD"])
+                    
+                    if not (is_entry or is_exit):
+                        continue  # Skip non-trade actions (retries, etc.)
+                    
+                    # Determine OrderSide based on side_label and action
+                    # C/P are LONG strategies, THETA/SHORT/iron_condor are SELL entries
+                    is_short_strategy = (side_label in ["THETA", "SHORT"] or "condor" in side_label.lower())
+                    
+                    if is_entry:
+                        order_side = OrderSide.SELL if is_short_strategy else OrderSide.BUY
+                    else:  # Exit
+                        order_side = OrderSide.BUY if is_short_strategy else OrderSide.SELL
+                    
+                    # Determine symbol
+                    symbol = "TXO"
+                    if side_label in ["C", "P"]:
+                        contract = self.active_contracts.get(side_label)
+                        if contract: 
+                            symbol = contract.code
+                    
+                    # Create order
+                    order = Order(
+                        symbol=symbol,
+                        side=order_side,
+                        order_type=OrderType.MARKET,
+                        quantity=quantity,
+                        price=price,
+                        order_id=f"LEDGER-{ts.strftime('%Y%m%d-%H%M%S')}",
+                        strategy=side_label if is_short_strategy else "directional",
+                        comment=f"{action} {note}",
+                    )
+                    order.status = OrderStatus.FILLED
+                    order.filled_quantity = quantity
+                    order.avg_fill_price = price
+                    order.filled_at = ts
+                    order.created_at = ts
+                    
+                    # Add to completed orders
+                    self.order_mgr.completed.append(order)
+                    recovered_count += 1
+                    
+                except Exception as e:
+                    console.print(f"[yellow]⚠️ Failed to recover order from row: {e}[/yellow]")
+                    continue
+            
+            if recovered_count > 0:
+                console.print(f"[bold cyan]♻️ Recovered {recovered_count} orders from ledger[/bold cyan]")
+                # Save immediately to orders JSON
+                self._save_orders_file_wrapper()
+            
+        except Exception as e:
+            console.print(f"[yellow]Order recovery from ledger failed: {e}[/yellow]")
+
     def manage_open_position(self, signal):
         if self.position <= 0 or not self.active_side:
             return False
@@ -2337,6 +2751,10 @@ class ShioajiOptionsSmartMonitor:
                 return True
         
         signal_score = signal.get("score", 0.0) if signal else (self.last_signal.get("score", 0.0) if self.last_signal else 999.0)
+        directional_release_state = {"confirmed": False, "reason": "missing_signal"}
+        if signal:
+            spot = float(self.market_data["MTX"]["close"] or 0.0)
+            directional_release_state = self._update_theta_release_confirmation(signal, spot)
 
         # 3. Score reversal exit: 趨勢翻轉才出場
         #    修正: 出場門檻比進場寬 (1.5x entry_score)，防止 whipsaw
@@ -2360,6 +2778,8 @@ class ShioajiOptionsSmartMonitor:
         if self.active_side == "P" and signal_score >= reversal_threshold:
             if is_in_grace:
                 console.print(f"[yellow]🛡️ REVERSAL blocked by opening grace ({session_mins}m < {self.opening_grace_mins}m)[/yellow]")
+            elif not directional_release_state["confirmed"]:
+                console.print(f"[dim]🛡️ REVERSAL gated: {directional_release_state['reason']}[/dim]")
             else:
                 reason = f"SCORE_REVERSAL score={signal_score:.1f} >= {reversal_threshold:.0f} (was bearish, now bullish)"
                 if self.live_trading:
@@ -2370,6 +2790,8 @@ class ShioajiOptionsSmartMonitor:
         if self.active_side == "C" and signal_score <= -reversal_threshold:
             if is_in_grace:
                 console.print(f"[yellow]🛡️ REVERSAL blocked by opening grace ({session_mins}m < {self.opening_grace_mins}m)[/yellow]")
+            elif not directional_release_state["confirmed"]:
+                console.print(f"[dim]🛡️ REVERSAL gated: {directional_release_state['reason']}[/dim]")
             else:
                 reason = f"SCORE_REVERSAL score={signal_score:.1f} <= -{reversal_threshold:.0f} (was bullish, now bearish)"
                 if self.live_trading:
@@ -2395,10 +2817,21 @@ class ShioajiOptionsSmartMonitor:
             self.has_tp1_hit,
             score_floor=self.score_floor,
         ):
+            exit_reason = classify_exit_reason(
+                exit_price,
+                self.entry_price,
+                self.stop_loss_pct,
+                signal_score,
+                self.has_tp1_hit,
+                score_floor=self.score_floor,
+            )
+            if exit_reason == "score_decay" and not directional_release_state["confirmed"]:
+                console.print(f"[dim]🛡️ SCORE_DECAY gated: {directional_release_state['reason']}[/dim]")
+                return False
             if self.live_trading:
-                self.exit_live_position("LIVE_EXIT_SUBMITTED", f"score={signal_score:.1f}")
+                self.exit_live_position("LIVE_EXIT_SUBMITTED", f"{exit_reason or 'exit'} score={signal_score:.1f}")
             else:
-                self.exit_paper_position("PAPER_EXIT", exit_price, f"score={signal_score:.1f}")
+                self.exit_paper_position("PAPER_EXIT", exit_price, f"{exit_reason or 'exit'} score={signal_score:.1f}")
             return True
         return False
 
@@ -2452,6 +2885,13 @@ class ShioajiOptionsSmartMonitor:
                     self.paper_lots = max(1, round(self.paper_lots * edge_res["pos_scale"]))
                     if edge_res["pos_scale"] != 1.0:
                         console.print(f"[bold cyan]⚖️ Option Position Scaled: {edge_res['rank']} (x{edge_res['pos_scale']}) -> {self.paper_lots} lots[/bold cyan]")
+
+                if signal and signal.get("side"):
+                    directional_release_state = self._update_theta_release_confirmation(signal, spot)
+                    if not directional_release_state["confirmed"]:
+                        if self._bar_counter % 5 == 0:
+                            console.print(f"[bold yellow]🛡️ Directional entry gated: {directional_release_state['reason']}[/bold yellow]")
+                        signal = {"score": 0.0, "side": None, "mid_trend": "", "price_mtx": 0.0}
 
             # Re-read the gated signal so later entry logic cannot use stale side/score values.
             sig_side = signal.get("side") if signal else None
@@ -2512,7 +2952,8 @@ class ShioajiOptionsSmartMonitor:
                 if self._theta_gang and signal and self.cooldown_until <= 0:
                     squeeze_on = signal.get("squeeze_on", False) if isinstance(signal, dict) else False
                     auto_regime = self._theta_cfg.get("auto_regime", True)
-                    use_theta = (auto_regime and squeeze_on) or (not auto_regime)
+                    bar_quality_pass = signal.get("bar_quality") == "PASS"
+                    use_theta = ((auto_regime and squeeze_on) or (not auto_regime)) and bar_quality_pass
 
                     # Manage existing ThetaGang position
                     if self._theta_gang.position and self._theta_gang.position.is_open:
@@ -2521,7 +2962,16 @@ class ShioajiOptionsSmartMonitor:
                         contract = self.active_contracts.get("C") or self.active_contracts.get("P")
                         dte_years = float(self._dte(getattr(contract, "delivery_date", None))) if contract else 0.03
                         iv = self.latest_iv or 0.25
-                        exit_info = self._theta_gang.evaluate_exit(spot, iv, dte_years, squeeze_on)
+                        release_state = self._update_theta_release_confirmation(signal, spot)
+                        exit_info = self._theta_gang.evaluate_exit(
+                            spot,
+                            iv,
+                            dte_years,
+                            squeeze_on,
+                            allow_squeeze_release=release_state["confirmed"],
+                        )
+                        if release_state["raw_release_candidate"] and not release_state["confirmed"]:
+                            console.print(f"[dim][ThetaGang] Release gated: {release_state['reason']}[/dim]")
                         
                         # 💡 GSD: 最小持倉時間檢查 (停損 SL 必須優先於持倉時間，強制出場)
                         min_hold = int(self._theta_cfg.get("min_holding_bars", 0))
@@ -2534,6 +2984,8 @@ class ShioajiOptionsSmartMonitor:
                         if exit_info:
                             pos = self._theta_gang.close_position()
                             self._theta_bars_held = 0
+                            self._theta_release_confirm_count = 0
+                            self._theta_release_last_bar_ts = None
                             # GSD fix: ThetaGang has pre-computed PnL, don't recalculate through log_trade
                             theta_pnl = round(exit_info["pnl"], 0)
                             # 計算累計Balance（從現有ledger）
@@ -2560,6 +3012,14 @@ class ShioajiOptionsSmartMonitor:
                                 "Note": f"{exit_info['reason']} credit={pos.net_credit:.0f} pnl={exit_info['pnl']:.0f}",
                             }
                             pd.DataFrame([theta_row]).to_csv(self.ledger_path, mode='a', index=False, header=not self.ledger_path.exists())
+                            self._record_paper_order(
+                                "THETA",
+                                "EXIT",
+                                pos.quantity,
+                                exit_price,
+                                f"{exit_info['reason']} credit={pos.net_credit:.0f} pnl={exit_info['pnl']:.0f}",
+                                strategy_override=pos.strategy,
+                            )
                             console.print(f"[bold yellow]🔻 [ThetaGang] EXIT {pos.strategy}: {exit_info['reason']} PnL={exit_info['pnl']:.0f}[/bold yellow]")
                             self.cooldown_until = self.cooldown_bars
                         return
@@ -2574,6 +3034,8 @@ class ShioajiOptionsSmartMonitor:
                         if entry_info:
                             pos = self._theta_gang.open_position(entry_info)
                             self._theta_bars_held = 0
+                            self._theta_release_confirm_count = 0
+                            self._theta_release_last_bar_ts = None
                             # Create a readable string of position legs
                             legs_str = " | ".join(f"{leg.action} {leg.side}{leg.strike}" for leg in pos.legs)
                             # 記錄實際收取的權利金作為進場價
@@ -2585,6 +3047,14 @@ class ShioajiOptionsSmartMonitor:
                                 console.print(f"[yellow]⚠️ THETA_ENTRY: net_credit is None or 0, using price=0[/yellow]")
                             self.log_trade("THETA_ENTRY", "THETA", entry_price,
                                            f"credit={pos.net_credit:.0f} max_loss={pos.max_loss:.0f} strategy={pos.strategy} [{legs_str}]")
+                            self._record_paper_order(
+                                "THETA",
+                                "BUY",
+                                pos.quantity,
+                                entry_price,
+                                f"credit={pos.net_credit:.0f} max_loss={pos.max_loss:.0f} strategy={pos.strategy} [{legs_str}]",
+                                strategy_override=pos.strategy,
+                            )
                             console.print(f"[bold cyan]🔺 [ThetaGang] ENTRY {pos.strategy}: credit={pos.net_credit:.0f} [{legs_str}][/bold cyan]")
                             return
 
@@ -2638,6 +3108,10 @@ class ShioajiOptionsSmartMonitor:
                 from core.order_management.order_manager import OrderManager
                 _om_mode = "live" if self.live_trading else "paper"
                 self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=self.broker)
+                
+                # [GSD Fix] Recover orders from ledger BEFORE wiring callbacks (which save immediately)
+                self._recover_orders_from_ledger()
+                
                 self._wire_order_callbacks()
                 console.print(f"[green]📋 Options Order Lifecycle Manager enabled ({_om_mode} mode)[/green]")
 

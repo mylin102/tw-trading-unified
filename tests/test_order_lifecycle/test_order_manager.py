@@ -98,6 +98,20 @@ class TestSubmit:
         with pytest.raises(ValueError, match="already submitted"):
             paper_mgr.submit(order, exchange_ordno="EXCH-002")
 
+    def test_attach_submission_preserves_broker_ids(self, paper_mgr):
+        order = paper_mgr.create_order("TMF", OrderSide.BUY, OrderType.MARKET, 1)
+        attached = paper_mgr.attach_submission(
+            order.order_id,
+            broker_order_id="BROKER-001",
+            seqno="SEQ-001",
+            ordno="ORDNO-001",
+            raw_status="Submitted",
+        )
+        assert attached.broker_order_id == "BROKER-001"
+        assert attached.seqno == "SEQ-001"
+        assert attached.ordno == "ORDNO-001"
+        assert attached.status == OrderStatus.SUBMITTED
+
 
 # ── L1-UT-03: Fill Order (Full) ──
 
