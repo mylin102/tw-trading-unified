@@ -45,9 +45,19 @@ def test_autostart_no_longer_manages_main_py():
 def test_autostart_still_launches_dashboards_and_tracks_minutes():
     src = Path("autostart.sh").read_text()
 
-    assert 'streamlit run ui/dashboard.py' in src
+    assert 'scripts/restart_dashboard.sh' in src
     assert 'streamlit run ui/backtest_dashboard.py' in src
     assert 'MM=$(date +%M)' in src
+
+
+def test_restart_dashboard_script_has_preflight_and_health_check():
+    src = Path("scripts/restart_dashboard.sh").read_text()
+
+    assert "build_stock_orders_from_trades" in src
+    assert "resolve_stock_orders_file" in src
+    assert "latest_indicator_close" in src
+    assert "curl -fsS" in src
+    assert "lsof -ti tcp:$PORT" in src
 
 
 def test_pm2_keeps_trading_system_only():

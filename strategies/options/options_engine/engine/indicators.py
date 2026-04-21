@@ -174,13 +174,56 @@ def calculate_stock_squeeze(
 
     # GSD: Ensure technical indicator columns exist even if DataFrame is short
     # Add missing technical indicator columns with NaN values
-    tech_indicator_cols = ["macd", "macd_signal", "macd_hist", "macd_rising", 
-                          "k_val", "d_val", "adx", "dmp", "dmn",
-                          "bb_lower", "bb_mid", "bb_upper"]
+    tech_indicator_cols = [
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "macd_rising",
+        "k_val",
+        "d_val",
+        "adx",
+        "dmp",
+        "dmn",
+        "bb_lower",
+        "bb_mid",
+        "bb_upper",
+        "money_flow_multiplier",
+        "bar_delta",
+        "cum_bar_delta",
+        "delta_trend",
+        "vwap_std",
+        "z_vwap",
+        "vwap_upper_1",
+        "vwap_lower_1",
+        "vwap_upper_2",
+        "vwap_lower_2",
+    ]
     
     for col in tech_indicator_cols:
         if col not in res.columns:
             res[col] = np.nan
+
+    close = pd.to_numeric(res["Close"], errors="coerce").fillna(0.0)
+    high = pd.to_numeric(res["High"], errors="coerce").fillna(0.0)
+    low = pd.to_numeric(res["Low"], errors="coerce").fillna(0.0)
+    volume = pd.to_numeric(res["Volume"], errors="coerce").fillna(0.0)
+
+    price_range = (high - low).replace(0, np.nan)
+    money_flow_multiplier = (((close - low) - (high - close)) / price_range).clip(-1, 1).fillna(0.0)
+    res["money_flow_multiplier"] = money_flow_multiplier
+    res["bar_delta"] = money_flow_multiplier * volume
+    res["cum_bar_delta"] = res.groupby("trading_day")["bar_delta"].cumsum()
+    res["delta_trend"] = res.groupby("trading_day")["cum_bar_delta"].diff(5).fillna(0.0)
+
+    vwap_deviation = close - pd.to_numeric(res["vwap"], errors="coerce").fillna(close)
+    res["vwap_std"] = (
+        vwap_deviation.groupby(res["trading_day"]).expanding().std(ddof=0).reset_index(level=0, drop=True).fillna(0.0)
+    )
+    res["z_vwap"] = np.where(res["vwap_std"] > 0, vwap_deviation / res["vwap_std"], 0.0)
+    res["vwap_upper_1"] = res["vwap"] + res["vwap_std"]
+    res["vwap_lower_1"] = res["vwap"] - res["vwap_std"]
+    res["vwap_upper_2"] = res["vwap"] + (2 * res["vwap_std"])
+    res["vwap_lower_2"] = res["vwap"] - (2 * res["vwap_std"])
     
     if len(df) < max(macd_slow, adx_length, kd_length):
         return res

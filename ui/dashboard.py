@@ -14,13 +14,21 @@ import yaml
 import datetime
 import os
 from core.date_utils import get_session_date_str, get_trade_day
-from core.dashboard_data import merge_indicator_frames, extend_taifex_recess_continuity
+from core.dashboard_data import (
+    build_stock_orders_from_trades,
+    merge_indicator_frames,
+    extend_taifex_recess_continuity,
+    resolve_preferred_or_latest_file,
+    resolve_stock_orders_file,
+)
 from core.dashboard_positions import (
     count_futures_entries,
     count_options_entries,
     estimate_theta_unrealized,
     find_latest_open_futures_position,
     find_latest_open_options_position,
+    latest_indicator_close,
+    option_order_matches_open_position,
 )
 import subprocess
 import time
@@ -1079,8 +1087,13 @@ def load_options_equity():
 
 @st.cache_data(ttl=5)
 def load_stock_trades(mode="PAPER"):
-    f = FUTURES_TRADES / f"STOCK_{DATE_STR}_{mode}_trades.csv"
-    if f.exists():
+    current_date_str = get_session_date_str(datetime.datetime.now())
+    f = resolve_preferred_or_latest_file(
+        FUTURES_TRADES,
+        f"STOCK_{current_date_str}_{mode}_trades.csv",
+        f"STOCK_*_{mode}_trades.csv",
+    )
+    if f and f.exists():
         try:
             return pd.read_csv(f)
         except Exception:
@@ -1088,9 +1101,29 @@ def load_stock_trades(mode="PAPER"):
     return None
 
 @st.cache_data(ttl=5)
+def load_stock_orders(mode="PAPER"):
+    current_date_str = get_session_date_str(datetime.datetime.now())
+    orders_file = resolve_stock_orders_file(FUTURES_TRADES, current_date_str, mode)
+    if orders_file and orders_file.exists():
+        try:
+            with open(orders_file, "r", encoding="utf-8") as f:
+                orders_data = json.load(f)
+            if orders_data:
+                return orders_data
+        except Exception:
+            pass
+
+    return build_stock_orders_from_trades(load_stock_trades(mode), mode=mode)
+
+@st.cache_data(ttl=5)
 def load_stock_indicators(ticker):
-    f = FUTURES_MKT / f"STOCK_{ticker}_{DATE_STR}_indicators.csv"
-    if f.exists():
+    current_date_str = get_session_date_str(datetime.datetime.now())
+    f = resolve_preferred_or_latest_file(
+        FUTURES_MKT,
+        f"STOCK_{ticker}_{current_date_str}_indicators.csv",
+        f"STOCK_{ticker}_*_indicators.csv",
+    )
+    if f and f.exists():
         try:
             df = pd.read_csv(f)
             if df.columns.duplicated().any():
@@ -1792,6 +1825,7 @@ with tab_options:
                         live_premium = float(last_row.get("Close", last_row.get("close", 0)))
 
                 df_orders = pd.DataFrame(orders_data)
+                open_option_for_orders = find_latest_open_options_position(ol)
                 display_cols = []
                 if "order_id" in df_orders.columns:
                     display_cols.append("order_id")
@@ -1844,6 +1878,8 @@ with tab_options:
                     
                     def _calc_opt_unreal(row):
                         if row.get("status") not in ("filled", "partial_filled"):
+                            return None
+                        if not option_order_matches_open_position(row, open_option_for_orders):
                             return None
                         entry = row.get("avg_fill_price", 0) or row.get("price", 0)
                         if not entry or entry <= 0:
@@ -1927,27 +1963,80 @@ with tab_stocks:
                     vol = 0
                 else:
                     vol = int(vol_val)
-                score = round(last.get('score', 0), 1)
                 bb_lower = float(last.get('bb_lower', 0))
+                bb_upper = float(last.get('bb_upper', 0))
                 sqz = "🔒 壓縮" if last.get("sqz_on", False) else "🔓 釋放"
+                momentum = float(last.get("momentum", 0) or 0)
+                mom_state = int(last.get("mom_state", 1) or 1)
+                price_vs_vwap = float(last.get("price_vs_vwap", 0) or 0) * 100
+                z_vwap = float(last.get("z_vwap", 0) or 0)
+                money_flow_multiplier = float(last.get("money_flow_multiplier", 0) or 0)
+                adx = float(last.get("adx", 0) or 0)
+
+                if mom_state == 3:
+                    momentum_label = f"🟢 增強 {momentum:.2f}"
+                elif mom_state == 2:
+                    momentum_label = f"🟡 轉弱 {momentum:.2f}"
+                elif mom_state == 1:
+                    momentum_label = f"🟠 回升 {momentum:.2f}"
+                else:
+                    momentum_label = f"🔴 走弱 {momentum:.2f}"
+
+                if bool(last.get("bullish_align", False)):
+                    trend_label = "🟢 多頭"
+                elif bool(last.get("bearish_align", False)):
+                    trend_label = "🔴 空頭"
+                else:
+                    trend_label = "⚪ 中性"
+
+                if z_vwap >= 2:
+                    vwap_sigma_label = f"🔥 +{z_vwap:.1f}σ"
+                elif z_vwap <= -2:
+                    vwap_sigma_label = f"🧊 {z_vwap:.1f}σ"
+                elif z_vwap >= 1:
+                    vwap_sigma_label = f"⚠️ +{z_vwap:.1f}σ"
+                elif z_vwap <= -1:
+                    vwap_sigma_label = f"⚠️ {z_vwap:.1f}σ"
+                else:
+                    vwap_sigma_label = f"{z_vwap:+.1f}σ"
+
+                if money_flow_multiplier >= 0.35:
+                    flow_label = f"🟢 偏買 {money_flow_multiplier:+.2f}"
+                elif money_flow_multiplier <= -0.35:
+                    flow_label = f"🔴 偏賣 {money_flow_multiplier:+.2f}"
+                else:
+                    flow_label = f"⚪ 中性 {money_flow_multiplier:+.2f}"
                 
-                # 計算距布林帶下軌距離 (%)
-                if not pd.isna(bb_lower) and bb_lower > 0 and not pd.isna(close) and close > 0:
-                    dist_bb = ((close - bb_lower) / bb_lower) * 100
-                    if dist_bb < 0:
-                        dist_label = f"🔥 已跌破 {dist_bb:.1f}%"
+                # 計算布林帶位置：下軌=0%、中間約=50%、上軌=100%
+                if (
+                    not pd.isna(bb_lower)
+                    and not pd.isna(bb_upper)
+                    and bb_upper > bb_lower
+                    and not pd.isna(close)
+                    and close > 0
+                ):
+                    band_position = ((close - bb_lower) / (bb_upper - bb_lower)) * 100
+                    if band_position < 0:
+                        dist_label = f"🔥 下軌下方 {band_position:.1f}%"
+                    elif band_position > 100:
+                        dist_label = f"🚀 上軌上方 {band_position:.1f}%"
                     else:
-                        dist_label = f"{dist_bb:.1f}%"
+                        dist_label = f"{band_position:.1f}%"
                 else:
                     dist_label = "—%"
 
                 monitor_data.append({
                     "代號": ticker,
                     "名稱": last.get("name", "Unknown"),
-                    "股價": close,
+                    "股價": f"{close:.2f}",
                     "成交量": f"{vol:,}",
-                    "Score": score,
-                    "距BB下軌": dist_label,
+                    "動能": momentum_label,
+                    "VWAP偏離": f"{price_vs_vwap:+.2f}%",
+                    "VWAPσ": vwap_sigma_label,
+                    "資金壓力": flow_label,
+                    "趨勢": trend_label,
+                    "ADX": f"{adx:.1f}",
+                    "布林帶位置": dist_label,
                     "壓縮": sqz,
                 })
         
@@ -1956,12 +2045,25 @@ with tab_stocks:
             
             def style_monitor(row):
                 styles = [''] * len(row)
+                col_idx = {name: idx for idx, name in enumerate(m_df.columns)}
                 # 壓縮 (紅底白字)
                 if "🔒" in str(row.get("壓縮", "")):
-                    styles[6] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
-                # 距BB下軌 (綠底白字代表已跌破，進場訊號)
-                if "🔥" in str(row.get("距BB下軌", "")):
-                    styles[5] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
+                    styles[col_idx["壓縮"]] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
+                # 布林帶位置：跌破下軌標綠、突破上軌標橘
+                if "🔥" in str(row.get("布林帶位置", "")):
+                    styles[col_idx["布林帶位置"]] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
+                elif "🚀" in str(row.get("布林帶位置", "")):
+                    styles[col_idx["布林帶位置"]] = 'background-color: #ffedd5; color: #c2410c; font-weight: bold'
+                if "🔥" in str(row.get("VWAPσ", "")) or "🧊" in str(row.get("VWAPσ", "")):
+                    styles[col_idx["VWAPσ"]] = 'background-color: #fef3c7; color: #92400e; font-weight: bold'
+                if "🟢" in str(row.get("資金壓力", "")):
+                    styles[col_idx["資金壓力"]] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
+                elif "🔴" in str(row.get("資金壓力", "")):
+                    styles[col_idx["資金壓力"]] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
+                if "🟢" in str(row.get("動能", "")):
+                    styles[col_idx["動能"]] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
+                elif "🔴" in str(row.get("動能", "")):
+                    styles[col_idx["動能"]] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
                 return styles
 
             st.dataframe(m_df.style.apply(style_monitor, axis=1), use_container_width=True, hide_index=True)
@@ -2001,17 +2103,7 @@ with tab_stocks:
                     ticker = str(row.get("代號", "")).split()[0]  # Extract ticker from "1525 綠電"
                     entry = float(row.get("進場價", 0))
                     qty = int(row.get("股數", 0))
-                    # Get current price from indicator CSV
-                    cur_price = 0
-                    ind_path = FUTURES_MKT / f"STOCK_{ticker}_{DATE_STR}_indicators.csv"
-                    if ind_path.exists():
-                        try:
-                            ind_df = pd.read_csv(ind_path, nrows=1)
-                            close_col = [c for c in ind_df.columns if c.lower() in ("close", "close")]
-                            if close_col:
-                                cur_price = float(ind_df[close_col[0]].iloc[0])
-                        except Exception:
-                            pass
+                    cur_price = latest_indicator_close(load_stock_indicators(ticker))
                     if cur_price > 0 and entry > 0 and qty > 0:
                         unrealized = (cur_price - entry) * qty
                         color = "green" if unrealized >= 0 else "red"
@@ -2048,129 +2140,121 @@ with tab_stocks:
 
     # ── Stock Order Status Panel ──
     with st.expander("📤 台股委託單狀態 (Order Lifecycle)", expanded=False):
-        orders_path = BASE / "exports" / "trades"
-        order_files = list(orders_path.glob(f"STOCK_{DATE_STR}_orders.json")) + list(orders_path.glob("STOCK_*_orders.json"))
-        order_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        orders_data = load_stock_orders(current_mode)
 
-        if order_files and order_files[0].exists():
-            with open(order_files[0], "r", encoding="utf-8") as f:
-                orders_data = json.load(f)
+        if orders_data:
+            # 添加更新按鈕
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.write("**📊 未實現損益計算**")
+            with col2:
+                if st.button("🔄 更新", key="update_stock_unrealized"):
+                    st.cache_data.clear()
+                    st.rerun()
+            
+            # Get LIVE price from the same data source as charts
+            live_prices = {}
+            for ticker in watchlist:
+                s_df = load_stock_indicators(ticker)
+                if s_df is not None and not s_df.empty:
+                    last = s_df.iloc[-1]
+                    close = float(last.get('close', last.get('Close', 0)))
+                    live_prices[ticker] = close
 
-            if orders_data:
-                # 添加更新按鈕
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.write("**📊 未實現損益計算**")
-                with col2:
-                    if st.button("🔄 更新", key="update_stock_unrealized"):
-                        st.cache_data.clear()
-                        st.rerun()
+            # Process orders for display
+            order_rows = []
+            for order in orders_data:
+                ticker = order.get("ticker", "")
+                status = order.get("status", "")
+                side = order.get("side", "")
+                qty = order.get("qty", 0)
+                price = order.get("price", 0.0)
+                order_id = order.get("order_id", "")
+                timestamp = order.get("timestamp", "")
+                filled_qty = order.get("filled_qty", 0)
+                filled_price = order.get("filled_price", 0.0)
+                order_type = order.get("order_type", "LMT")  # Default to LMT
                 
-                # Get LIVE price from the same data source as charts
-                live_prices = {}
-                for ticker in watchlist:
-                    s_df = load_stock_indicators(ticker)
-                    if s_df is not None and not s_df.empty:
-                        last = s_df.iloc[-1]
-                        close = float(last.get('close', last.get('Close', 0)))
-                        live_prices[ticker] = close
-
-                # Process orders for display
-                order_rows = []
-                for order in orders_data:
-                    ticker = order.get("ticker", "")
-                    status = order.get("status", "")
-                    side = order.get("side", "")
-                    qty = order.get("qty", 0)
-                    price = order.get("price", 0.0)
-                    order_id = order.get("order_id", "")
-                    timestamp = order.get("timestamp", "")
-                    filled_qty = order.get("filled_qty", 0)
-                    filled_price = order.get("filled_price", 0.0)
-                    order_type = order.get("order_type", "LMT")  # Default to LMT
-                    
-                    # Map order type to Chinese
-                    order_type_map = {
-                        "LMT": "限價單",
-                        "MKT": "市價單",
-                        "MKT_RANGE": "範圍市價單"
-                    }
-                    order_type_display = order_type_map.get(order_type, order_type)
-                    
-                    # Calculate unrealized PnL for open orders
-                    unrealized = 0.0
-                    if status == "OPEN" and ticker in live_prices:
-                        current_price = live_prices[ticker]
-                        if side == "BUY":
-                            unrealized = (current_price - price) * qty
-                        elif side == "SELL":
-                            unrealized = (price - current_price) * qty
-                    
-                    order_rows.append({
-                        "委託單號": order_id,
-                        "股票代號": ticker,
-                        "買賣": side,
-                        "委託類型": order_type_display,
-                        "狀態": status,
-                        "委託數量": qty,
-                        "委託價格": price,
-                        "已成交數量": filled_qty,
-                        "成交均價": filled_price,
-                        "未實現損益": f"{unrealized:+,.0f}" if unrealized != 0 else "—",
-                        "時間": timestamp
-                    })
+                # Map order type to Chinese
+                order_type_map = {
+                    "LMT": "限價單",
+                    "MKT": "市價單",
+                    "MKT_RANGE": "範圍市價單"
+                }
+                order_type_display = order_type_map.get(order_type, order_type)
                 
-                if order_rows:
-                    orders_df = pd.DataFrame(order_rows)
+                # Calculate unrealized PnL for open orders
+                unrealized = 0.0
+                if status == "OPEN" and ticker in live_prices:
+                    current_price = live_prices[ticker]
+                    if side == "BUY":
+                        unrealized = (current_price - price) * qty
+                    elif side == "SELL":
+                        unrealized = (price - current_price) * qty
+                
+                order_rows.append({
+                    "委託單號": order_id,
+                    "股票代號": ticker,
+                    "買賣": side,
+                    "委託類型": order_type_display,
+                    "狀態": status,
+                    "委託數量": qty,
+                    "委託價格": price,
+                    "已成交數量": filled_qty,
+                    "成交均價": filled_price,
+                    "未實現損益": f"{unrealized:+,.0f}" if unrealized != 0 else "—",
+                    "時間": timestamp
+                })
+            
+            if order_rows:
+                orders_df = pd.DataFrame(order_rows)
+                
+                # Style function for order table
+                def style_orders(row):
+                    styles = [''] * len(row)
+                    # Status colors
+                    status = row.get("狀態", "")
+                    if status == "FILLED":
+                        styles[3] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
+                    elif status == "OPEN":
+                        styles[3] = 'background-color: #fef9c3; color: #854d0e; font-weight: bold'
+                    elif status == "CANCELLED":
+                        styles[3] = 'background-color: #f3f4f6; color: #6b7280; font-weight: bold'
+                    elif status == "REJECTED":
+                        styles[3] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
                     
-                    # Style function for order table
-                    def style_orders(row):
-                        styles = [''] * len(row)
-                        # Status colors
-                        status = row.get("狀態", "")
-                        if status == "FILLED":
-                            styles[3] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
-                        elif status == "OPEN":
-                            styles[3] = 'background-color: #fef9c3; color: #854d0e; font-weight: bold'
-                        elif status == "CANCELLED":
-                            styles[3] = 'background-color: #f3f4f6; color: #6b7280; font-weight: bold'
-                        elif status == "REJECTED":
-                            styles[3] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
-                        
-                        # Side colors
-                        side = row.get("買賣", "")
-                        if side == "BUY":
-                            styles[2] = 'background-color: #dbeafe; color: #1e40af; font-weight: bold'
-                        elif side == "SELL":
-                            styles[2] = 'background-color: #fce7f3; color: #9d174d; font-weight: bold'
-                        
-                        # Unrealized PnL colors
-                        unrealized = row.get("未實現損益", "")
-                        if "+" in str(unrealized):
-                            styles[8] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
-                        elif "-" in str(unrealized):
-                            styles[8] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
-                        
-                        return styles
+                    # Side colors
+                    side = row.get("買賣", "")
+                    if side == "BUY":
+                        styles[2] = 'background-color: #dbeafe; color: #1e40af; font-weight: bold'
+                    elif side == "SELL":
+                        styles[2] = 'background-color: #fce7f3; color: #9d174d; font-weight: bold'
                     
-                    st.dataframe(orders_df.style.apply(style_orders, axis=1), use_container_width=True, hide_index=True)
+                    # Unrealized PnL colors
+                    unrealized = row.get("未實現損益", "")
+                    if "+" in str(unrealized):
+                        styles[8] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
+                    elif "-" in str(unrealized):
+                        styles[8] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
                     
-                    # Summary metrics
-                    open_orders = [o for o in orders_data if o.get("status") == "OPEN"]
-                    filled_orders = [o for o in orders_data if o.get("status") == "FILLED"]
-                    cancelled_orders = [o for o in orders_data if o.get("status") == "CANCELLED"]
-                    
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("總委託單數", len(orders_data))
-                    col2.metric("待成交", len(open_orders))
-                    col3.metric("已成交", len(filled_orders))
-                    col4.metric("已取消", len(cancelled_orders))
-                else:
-                    st.info("委託單列表為空")
+                    return styles
+                
+                st.dataframe(orders_df.style.apply(style_orders, axis=1), use_container_width=True, hide_index=True)
+                
+                # Summary metrics
+                open_orders = [o for o in orders_data if o.get("status") == "OPEN"]
+                filled_orders = [o for o in orders_data if o.get("status") == "FILLED"]
+                cancelled_orders = [o for o in orders_data if o.get("status") == "CANCELLED"]
+                
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("總委託單數", len(orders_data))
+                col2.metric("待成交", len(open_orders))
+                col3.metric("已成交", len(filled_orders))
+                col4.metric("已取消", len(cancelled_orders))
             else:
-                st.info("委託單檔案為空")
+                st.info("委託單列表為空")
         else:
-            st.info("台股委託單檔案尚未建立 (Order Lifecycle 未啟用)")
+            st.info(f"今日尚無 {current_mode} 台股委託單記錄")
 
 # ════════════════════════════════════════
 # Tab 5: 策略管道 (Pipeline)

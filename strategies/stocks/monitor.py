@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 from rich.console import Console
 import shioaji as sj
+from core.dashboard_data import build_stock_orders_from_trades
 from strategies.stocks.scanner import StockScanner
 from strategies.stocks.data_storage import StockDataStorage
 
@@ -38,7 +39,7 @@ class StockMonitor:
         self.mode_tag = "LIVE" if (self.live_trading and not dry_run) else "PAPER"
         self.date_str = datetime.now().strftime("%Y%m%d")
         self.ledger_path = TRADE_LOGS / f"STOCK_{self.date_str}_{self.mode_tag}_trades.csv"
-        self.orders_path = TRADE_LOGS / f"STOCK_{self.date_str}_orders.json"
+        self.orders_path = TRADE_LOGS / f"STOCK_{self.date_str}_{self.mode_tag}_orders.json"
         
         self.positions = {} 
         self.pending_orders = {} # {ticker: {"order_id": str, "time": datetime}}
@@ -869,51 +870,28 @@ class StockMonitor:
                         orders_data.append(order_dict)
                 except Exception as e:
                     console.print(f"[yellow]⚠️ Failed to fetch live orders: {e}[/yellow]")
+
+                if not orders_data and self.ledger_path.exists():
+                    try:
+                        trades_df = pd.read_csv(self.ledger_path)
+                        orders_data = build_stock_orders_from_trades(
+                            trades_df,
+                            default_strategy=self.strat_name,
+                            mode=self.mode_tag,
+                        )
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️ Failed to recover live orders from ledger: {e}[/yellow]")
             
             # 對於PAPER模式，從交易紀錄和pending_orders構建模擬訂單
             else:
-                # 從今天的交易紀錄創建已成交訂單
                 try:
                     if self.ledger_path.exists():
                         trades_df = pd.read_csv(self.ledger_path)
-                        if not trades_df.empty:
-                            # 處理買入交易
-                            buy_trades = trades_df[trades_df["action"] == "BUY"]
-                            for _, trade in buy_trades.iterrows():
-                                order_dict = {
-                                    "order_id": f"PAPER-BUY-{trade['ticker']}-{int(time.time())}",
-                                    "ticker": str(trade["ticker"]).strip(),  # 確保是字符串
-                                    "side": "BUY",
-                                    "order_type": "LMT",  # Paper mode uses limit orders
-                                    "qty": int(trade["qty"]),
-                                    "filled_qty": int(trade["qty"]),
-                                    "price": float(trade["price"]),
-                                    "filled_price": float(trade["price"]),
-                                    "status": "FILLED",
-                                    "timestamp": trade["timestamp"],
-                                    "strategy": self.strat_name,
-                                    "mode": self.mode_tag
-                                }
-                                orders_data.append(order_dict)
-                            
-                            # 處理賣出交易
-                            sell_trades = trades_df[trades_df["action"] == "SELL"]
-                            for _, trade in sell_trades.iterrows():
-                                order_dict = {
-                                    "order_id": f"PAPER-SELL-{trade['ticker']}-{int(time.time())}",
-                                    "ticker": str(trade["ticker"]).strip(),  # 確保是字符串
-                                    "side": "SELL",
-                                    "order_type": "LMT",  # Paper mode uses limit orders
-                                    "qty": int(trade["qty"]),
-                                    "filled_qty": int(trade["qty"]),
-                                    "price": float(trade["price"]),
-                                    "filled_price": float(trade["price"]),
-                                    "status": "FILLED",
-                                    "timestamp": trade["timestamp"],
-                                    "strategy": self.strat_name,
-                                    "mode": self.mode_tag
-                                }
-                                orders_data.append(order_dict)
+                        orders_data = build_stock_orders_from_trades(
+                            trades_df,
+                            default_strategy=self.strat_name,
+                            mode=self.mode_tag,
+                        )
                 except Exception as e:
                     console.print(f"[yellow]⚠️ Failed to read trades for orders: {e}[/yellow]")
                     # 回退到從positions創建（為了向後兼容）

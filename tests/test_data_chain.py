@@ -38,7 +38,13 @@ from core.bar_utils import (
     resample_ohlcv,
     validate_ohlcv_bars,
 )
-from core.dashboard_data import merge_indicator_frames, extend_taifex_recess_continuity
+from core.dashboard_data import (
+    build_stock_orders_from_trades,
+    merge_indicator_frames,
+    extend_taifex_recess_continuity,
+    resolve_preferred_or_latest_file,
+    resolve_stock_orders_file,
+)
 from core.options_snapshot import build_options_snapshot_row
 from core.shioaji_session import SystemReadiness, get_shared_system_status, set_system_status
 
@@ -278,6 +284,85 @@ class TestDashboardIndicatorMerge:
         assert len(merged) == 1
         assert merged.iloc[0]["score"] == 82.5
         assert merged.iloc[0]["close"] == 22010.0
+
+
+class TestDashboardFileResolution:
+    def test_resolve_preferred_or_latest_file_prefers_current_session_file(self, tmp_path):
+        preferred = tmp_path / "STOCK_2330_20260421_indicators.csv"
+        older = tmp_path / "STOCK_2330_20260420_indicators.csv"
+        older.write_text("older", encoding="utf-8")
+        preferred.write_text("preferred", encoding="utf-8")
+
+        resolved = resolve_preferred_or_latest_file(
+            tmp_path,
+            "STOCK_2330_20260421_indicators.csv",
+            "STOCK_2330_*_indicators.csv",
+        )
+
+        assert resolved == preferred
+
+    def test_resolve_preferred_or_latest_file_falls_back_to_latest_match(self, tmp_path):
+        older = tmp_path / "STOCK_2330_20260420_indicators.csv"
+        newer = tmp_path / "STOCK_2330_20260421_indicators.csv"
+        older.write_text("older", encoding="utf-8")
+        newer.write_text("newer", encoding="utf-8")
+        os.utime(older, (1, 1))
+        os.utime(newer, (2, 2))
+
+        resolved = resolve_preferred_or_latest_file(
+            tmp_path,
+            "STOCK_2330_20260422_indicators.csv",
+            "STOCK_2330_*_indicators.csv",
+        )
+
+        assert resolved == newer
+
+    def test_resolve_stock_orders_file_prefers_mode_specific(self, tmp_path):
+        legacy = tmp_path / "STOCK_20260421_orders.json"
+        mode_scoped = tmp_path / "STOCK_20260421_PAPER_orders.json"
+        legacy.write_text("[]", encoding="utf-8")
+        mode_scoped.write_text("[{}]", encoding="utf-8")
+
+        resolved = resolve_stock_orders_file(tmp_path, "20260421", "PAPER")
+
+        assert resolved == mode_scoped
+
+    def test_resolve_stock_orders_file_falls_back_to_legacy_name(self, tmp_path):
+        legacy = tmp_path / "STOCK_20260421_orders.json"
+        legacy.write_text("[]", encoding="utf-8")
+
+        resolved = resolve_stock_orders_file(tmp_path, "20260421", "LIVE")
+
+        assert resolved == legacy
+
+    def test_build_stock_orders_from_trades_keeps_filled_rows_and_ticker_format(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-04-21 09:15:00",
+                    "ticker": 3017.0,
+                    "action": "BUY",
+                    "price": 2490.0,
+                    "qty": 2,
+                    "strategy": "scout_strategy",
+                },
+                {
+                    "timestamp": "2026-04-21 10:05:00",
+                    "ticker": 3017.0,
+                    "action": "SELL",
+                    "price": 2500.0,
+                    "qty": 2,
+                    "strategy": "scout_strategy",
+                },
+            ]
+        )
+
+        orders = build_stock_orders_from_trades(trades, mode="PAPER")
+
+        assert len(orders) == 2
+        assert orders[0]["ticker"] == "3017"
+        assert orders[0]["status"] == "FILLED"
+        assert orders[1]["side"] == "SELL"
 
 
 class TestOptionsSnapshotSchema:

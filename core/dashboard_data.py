@@ -1,6 +1,15 @@
 from __future__ import annotations
 
 import pandas as pd
+from pathlib import Path
+
+
+def _stable_string_identifier(value) -> str:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
 
 
 def merge_indicator_frames(frames: list[pd.DataFrame], timestamp_col: str = "timestamp") -> pd.DataFrame:
@@ -90,3 +99,87 @@ def extend_taifex_recess_continuity(
     extended = pd.concat([current, pd.DataFrame([last_row])], ignore_index=True, sort=False)
     extended = extended.drop_duplicates(subset=[timestamp_col], keep="last")
     return extended.sort_values(timestamp_col, kind="stable").reset_index(drop=True)
+
+
+def resolve_preferred_or_latest_file(
+    directory: Path,
+    preferred_name: str,
+    fallback_pattern: str,
+) -> Path | None:
+    """Prefer the expected session file, but fall back to the newest matching artifact."""
+    preferred = directory / preferred_name
+    if preferred.exists():
+        return preferred
+
+    candidates = list(directory.glob(fallback_pattern))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def resolve_stock_orders_file(
+    directory: Path,
+    session_date_str: str,
+    mode: str,
+) -> Path | None:
+    """Resolve stock order exports, preferring mode-scoped files and falling back to legacy names."""
+    mode_scoped = resolve_preferred_or_latest_file(
+        directory,
+        f"STOCK_{session_date_str}_{mode}_orders.json",
+        f"STOCK_*_{mode}_orders.json",
+    )
+    if mode_scoped is not None:
+        return mode_scoped
+
+    return resolve_preferred_or_latest_file(
+        directory,
+        f"STOCK_{session_date_str}_orders.json",
+        "STOCK_*_orders.json",
+    )
+
+
+def build_stock_orders_from_trades(
+    trades_df: pd.DataFrame | None,
+    *,
+    default_strategy: str = "",
+    mode: str = "PAPER",
+) -> list[dict]:
+    """Build filled stock-order records from the stock trade ledger."""
+    if trades_df is None or trades_df.empty:
+        return []
+
+    orders_data: list[dict] = []
+    for index, trade in trades_df.iterrows():
+        action = str(trade.get("action", "")).upper()
+        if action not in {"BUY", "SELL"}:
+            continue
+
+        ticker = _stable_string_identifier(trade.get("ticker", ""))
+        timestamp = _stable_string_identifier(trade.get("timestamp", ""))
+        if not ticker or not timestamp:
+            continue
+
+        qty = int(pd.to_numeric(trade.get("qty", 0), errors="coerce") or 0)
+        price = float(pd.to_numeric(trade.get("price", 0.0), errors="coerce") or 0.0)
+        if qty <= 0 or price <= 0:
+            continue
+
+        order_suffix = timestamp.replace("-", "").replace(":", "").replace(" ", "T")
+        orders_data.append(
+            {
+                "order_id": f"{mode}-{action}-{ticker}-{order_suffix}-{index}",
+                "ticker": ticker,
+                "side": action,
+                "order_type": "LMT",
+                "qty": qty,
+                "filled_qty": qty,
+                "price": price,
+                "filled_price": price,
+                "status": "FILLED",
+                "timestamp": timestamp,
+                "strategy": _stable_string_identifier(trade.get("strategy", default_strategy)) or default_strategy,
+                "mode": mode,
+            }
+        )
+
+    return orders_data

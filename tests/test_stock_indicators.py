@@ -66,6 +66,39 @@ class TestCalculateStockSqueeze:
         assert "bb_mid" in res.columns
         assert "bb_upper" in res.columns
 
+    def test_vwap_sigma_and_flow_columns(self, sample_stock_data):
+        """Output should include VWAP sigma bands and approximate flow pressure fields."""
+        res = calculate_stock_squeeze(sample_stock_data)
+        for col in [
+            "money_flow_multiplier",
+            "bar_delta",
+            "cum_bar_delta",
+            "delta_trend",
+            "vwap_std",
+            "z_vwap",
+            "vwap_upper_1",
+            "vwap_lower_1",
+            "vwap_upper_2",
+            "vwap_lower_2",
+        ]:
+            assert col in res.columns, f"Missing column: {col}"
+
+        multiplier = res["money_flow_multiplier"].dropna()
+        assert ((multiplier >= -1) & (multiplier <= 1)).all()
+        assert np.isfinite(res["z_vwap"].dropna()).all()
+
+    def test_flow_pressure_handles_flat_bars(self, sample_stock_data):
+        """High==Low bars should not create inf/NaN pressure explosions."""
+        df = sample_stock_data.copy()
+        df["High"] = df["Close"]
+        df["Low"] = df["Close"]
+
+        res = calculate_stock_squeeze(df)
+
+        assert np.isfinite(res["money_flow_multiplier"].fillna(0)).all()
+        assert (res["money_flow_multiplier"].fillna(0) == 0).all()
+        assert np.isfinite(res["bar_delta"].fillna(0)).all()
+
     def test_short_data_returns_early(self):
         """Data shorter than min_req (30) should return unchanged."""
         n = 20

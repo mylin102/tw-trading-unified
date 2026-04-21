@@ -79,10 +79,12 @@ echo "[$(date)] ✅ 清理完成" >> "$LOG_DIR/unified.log"
 
 # ======================== Layer 4: Launch Services ========================
 # Dashboards
-nohup $PYTHON_EXEC -m streamlit run ui/dashboard.py \
-    --server.port 8500 --server.address 127.0.0.1 --server.headless true \
-    >> "$LOG_DIR/dashboard.log" 2>&1 &
-echo "[$(date)] 📊 Dashboard PID=$! started on :8500" >> "$LOG_DIR/unified.log"
+if DASHBOARD_PORT=8500 DASHBOARD_APP=ui/dashboard.py PYTHON_EXEC="$PYTHON_EXEC" \
+    "$UNIFIED_DIR/scripts/restart_dashboard.sh" >> "$LOG_DIR/unified.log" 2>&1; then
+    echo "[$(date)] 📊 Dashboard restart script completed on :8500" >> "$LOG_DIR/unified.log"
+else
+    echo "[$(date)] ❌ Dashboard restart script failed on :8500" >> "$LOG_DIR/unified.log"
+fi
 
 nohup $PYTHON_EXEC -m streamlit run ui/backtest_dashboard.py \
     --server.port 8501 --server.address 127.0.0.1 --server.headless true \
