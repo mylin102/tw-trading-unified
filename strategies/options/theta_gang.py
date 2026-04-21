@@ -11,11 +11,13 @@ Entry: squeeze_on (low vol compression) → sell premium
 Exit: target profit %, max loss %, DTE floor, or squeeze release
 """
 import datetime
+import re
 from dataclasses import dataclass, field
 from typing import Optional, List
 from rich.console import Console
 
 console = Console()
+SUPPORTED_LIVE_COMBO_STRATEGIES = {"bull_put_spread", "bear_call_spread"}
 
 
 @dataclass
@@ -135,6 +137,19 @@ def price_spread(legs, bs_fn, spot, r, sigma, dte_years):
     return net_credit, max_loss, details
 
 
+def calculate_wing_width(legs):
+    if len(legs) != 2:
+        return 0.0
+    return abs(float(legs[0].strike) - float(legs[1].strike))
+
+
+def calculate_vertical_max_loss(legs, net_credit):
+    wing_width = calculate_wing_width(legs)
+    if wing_width <= 0:
+        return 0.0
+    return max(0.0, wing_width - max(0.0, float(net_credit or 0.0)))
+
+
 def should_enter_theta(squeeze_on, iv, iv_rank_pct=None, min_iv=0.18, min_dte=5):
     """
     ThetaGang entry conditions:
@@ -235,6 +250,49 @@ class ThetaGangManager:
             "details": details,
         }
 
+    def is_live_combo_strategy_supported(self, strategy=None):
+        return (strategy or self.strategy) in SUPPORTED_LIVE_COMBO_STRATEGIES
+
+    def validate_live_combo(self, entry_info):
+        strategy = (entry_info or {}).get("strategy", self.strategy)
+        if not self.is_live_combo_strategy_supported(strategy):
+            return False, f"unsupported_live_strategy:{strategy}"
+
+        legs = list((entry_info or {}).get("legs") or [])
+        if len(legs) != 2:
+            return False, f"live_combo_requires_two_legs:{strategy}"
+
+        actions = {str(getattr(leg, "action", "")).upper() for leg in legs}
+        if actions != {"SELL", "BUY"}:
+            return False, "live_combo_requires_one_sell_one_buy"
+
+        option_sides = {str(getattr(leg, "side", "")).upper() for leg in legs}
+        if len(option_sides) != 1:
+            return False, "live_combo_requires_vertical_wings"
+
+        wing_width = calculate_wing_width(legs)
+        net_credit = float((entry_info or {}).get("net_credit") or 0.0)
+        max_loss = float((entry_info or {}).get("max_loss") or 0.0)
+        if max_loss <= 0:
+            max_loss = calculate_vertical_max_loss(legs, net_credit)
+        if wing_width <= 0 or max_loss <= 0:
+            return False, "live_combo_requires_positive_max_loss"
+
+        return True, {
+            "strategy": strategy,
+            "legs": legs,
+            "net_credit": net_credit,
+            "max_loss": max_loss,
+            "wing_width": wing_width,
+            "quantity": int((entry_info or {}).get("quantity") or self.quantity or 1),
+        }
+
+    def live_combo_margin_required(self, entry_info):
+        valid, payload = self.validate_live_combo(entry_info)
+        if not valid:
+            return 0.0
+        return float(payload["max_loss"]) * 50.0 * int(payload["quantity"])
+
     def open_position(self, entry_info):
         """Record a new ThetaGang position."""
         self.position = SpreadPosition(
@@ -247,7 +305,40 @@ class ThetaGangManager:
         )
         return self.position
 
-    def evaluate_exit(self, spot, iv, dte_years, squeeze_on):
+    def restore_position(self, note: str, *, timestamp: datetime.datetime | None = None, quantity: int | None = None):
+        """Rebuild an open theta position from the paper ledger note on restart."""
+        if not note:
+            return None
+
+        strategy_match = re.search(r"strategy=([a-z_]+)", note)
+        credit_match = re.search(r"credit=([0-9.]+)", note)
+        max_loss_match = re.search(r"max_loss=([0-9.]+)", note)
+        legs_match = re.search(r"\[(.+)\]", note)
+        if not strategy_match or not credit_match or not legs_match:
+            return None
+
+        legs: List[SpreadLeg] = []
+        for part in [segment.strip() for segment in legs_match.group(1).split("|")]:
+            leg_match = re.match(r"(SELL|BUY)\s+([CP])([0-9.]+)", part)
+            if not leg_match:
+                continue
+            action, side, strike_str = leg_match.groups()
+            legs.append(SpreadLeg(side=side, strike=float(strike_str), action=action))
+
+        if not legs:
+            return None
+
+        self.position = SpreadPosition(
+            strategy=strategy_match.group(1),
+            legs=legs,
+            entry_time=timestamp or datetime.datetime.now(),
+            net_credit=float(credit_match.group(1)),
+            max_loss=float(max_loss_match.group(1)) if max_loss_match else 0.0,
+            quantity=int(quantity or self.quantity),
+        )
+        return self.position
+
+    def evaluate_exit(self, spot, iv, dte_years, squeeze_on, *, allow_squeeze_release=True):
         """Check if we should close the ThetaGang position."""
         if not self.position or not self.position.is_open:
             return None
@@ -267,7 +358,11 @@ class ThetaGangManager:
             self.position, current_value, dte_years * 365, exit_cfg)
 
         # Also exit if squeeze releases (vol expanding)
-        if not squeeze_on and self.cfg.get("exit_on_squeeze_release", True):
+        if (
+            not squeeze_on
+            and allow_squeeze_release
+            and self.cfg.get("exit_on_squeeze_release", True)
+        ):
             should_exit = True
             reason = "SQUEEZE_RELEASE (vol expanding)"
 

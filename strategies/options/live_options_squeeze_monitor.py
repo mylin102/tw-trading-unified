@@ -151,8 +151,9 @@ class ShioajiOptionsSmartMonitor:
         self.execution_cfg = self.full_cfg.get("execution", {})
         self.pricing_cfg = self.full_cfg.get("pricing", {})
         self.max_spread_pct = self.execution_cfg.get("max_spread_pct", 0.05)
-        self.paper_lots = self.full_cfg.get("risk_mgmt", {}).get("lots_per_trade", 2)
-        self.max_positions = self.full_cfg.get("risk_mgmt", {}).get("max_positions", self.paper_lots)
+        self.base_lots = int(self.full_cfg.get("risk_mgmt", {}).get("lots_per_trade", 2))
+        self.paper_lots = self.base_lots
+        self.max_positions = self.full_cfg.get("risk_mgmt", {}).get("max_positions", self.base_lots)
         self.fallback_underlying_price = float(self.strategy_cfg.get("fallback_underlying_price", 23000))
         self.monthly_delivery_min_days = int(self.strategy_cfg.get("monthly_delivery_min_days", 7))
         self.strike_rounding = int(self.pricing_cfg.get("strike_rounding", 100))
@@ -222,6 +223,11 @@ class ShioajiOptionsSmartMonitor:
                 from theta_gang import ThetaGangManager
                 self._theta_gang = ThetaGangManager(self.full_cfg, self._bs, self.strike_rounding)
                 console.print(f"[bold cyan][ThetaGang] {self._theta_gang.strategy} enabled (auto_regime={self._theta_cfg.get('auto_regime', True)})[/bold cyan]")
+                if self.live_trading:
+                    if self._theta_gang.is_live_combo_strategy_supported():
+                        console.print("[cyan][ThetaGang] Live combo execution enabled for 2-leg vertical spreads only; local theta state will stay pending until broker fills reconcile.[/cyan]")
+                    else:
+                        console.print(f"[yellow][ThetaGang] Live theta strategy {self._theta_gang.strategy} is unsupported tonight; runtime will block live submits without paper fallback.[/yellow]")
             except Exception as e:
                 console.print(f"[yellow][ThetaGang] init failed: {e}[/yellow]")
         self._theta_bars_held = 0
@@ -241,12 +247,14 @@ class ShioajiOptionsSmartMonitor:
         self.pending_exit_qty = 0
         self.pending_exit_reason = None
         self.pending_exit_trade = None
+        self.pending_theta_combo = None
         self.order_timeout_secs = int(self.execution_cfg.get("order_timeout_secs", 30))
         self.max_order_retries = int(self.execution_cfg.get("max_order_retries", 1))
         self.replay_bars = self._load_replay_bars(self.replay_path) if self.replay_path else None
         self.replay_cursor = max(0, self.strategy_cfg.get("length", 20) + 5) if self.replay_bars is not None else None
         self.replay_stats = {"signals": 0, "directional_signals": 0, "entries": 0, "exits": 0, "tp1_hits": 0, "blocked_entries": 0, "last_summary_at": 0}
         self._seen_fill_ordnos = set()  # Dedup for live FDeal callbacks
+        self._seen_fill_identities = set()
 
         # ── [L3] Order Lifecycle Manager ──
         # [GSD Fix] OrderManager initialization moved to run() to ensure broker is available
@@ -1140,6 +1148,14 @@ class ShioajiOptionsSmartMonitor:
         # [GSD Fix] 啟動時立即存檔，確保 Dashboard 抓得到檔案 (包含已恢復的部位)
         self._save_orders_file_wrapper()
 
+    def _resolve_entry_lots(self, pos_scale: float = 1.0) -> int:
+        base_lots = max(1, int(getattr(self, "base_lots", self.paper_lots)))
+        scaled_lots = max(1, round(base_lots * pos_scale))
+        remaining_capacity = max(0, int(self.max_positions) - int(self.position))
+        if remaining_capacity <= 0:
+            return 0
+        return min(scaled_lots, remaining_capacity)
+
     def log_trade(self, action, side, price, note="", quantity=None):
         pnl = 0
         point_value = self.pricing_cfg.get("point_value", 50)
@@ -1213,6 +1229,71 @@ class ShioajiOptionsSmartMonitor:
             if "TP1" not in action: # Only clear if full exit
                 self._entry_features = {}
 
+    def _find_lifecycle_order(self, order_id):
+        if not self.order_mgr or not order_id:
+            return None
+        order = self.order_mgr.get_order(order_id)
+        if order is not None:
+            return order
+        for completed in self.order_mgr.get_completed():
+            if completed.order_id == order_id:
+                return completed
+        return None
+
+    def _extract_live_fill_identities(self, msg):
+        identities = []
+        trade_id = str(msg.get("trade_id") or "").strip()
+        exchange_seq = str(msg.get("exchange_seq") or "").strip()
+        ordno = str(msg.get("ordno") or "").strip()
+        action = str(msg.get("action") or "").strip()
+        code = str(msg.get("code") or "").strip()
+        price = float(msg.get("price", 0.0) or 0.0)
+        quantity = int(msg.get("quantity", 0) or 0)
+
+        if trade_id:
+            identities.append(("trade_id", trade_id))
+        if exchange_seq:
+            identities.append(("exchange_seq", exchange_seq))
+        if ordno and quantity > 0 and price > 0:
+            identities.append(("ordno_fill", ordno, action, code, quantity, round(price, 6)))
+        return identities
+
+    def _is_duplicate_live_fill(self, order_id, msg):
+        if not hasattr(self, "_seen_fill_identities"):
+            self._seen_fill_identities = set()
+
+        identities = self._extract_live_fill_identities(msg)
+        if not identities:
+            return False
+
+        if any(identity in self._seen_fill_identities for identity in identities):
+            return True
+
+        order = self._find_lifecycle_order(order_id)
+        if order is None or not self.order_mgr:
+            return False
+
+        trade_id = str(msg.get("trade_id") or "").strip() or None
+        exchange_seq = str(msg.get("exchange_seq") or "").strip() or None
+        return self.order_mgr._has_fill_identity(
+            order,
+            deal_id=trade_id,
+            broker_trade_id=trade_id,
+            exchange_fill_id=trade_id,
+            exchange_seq=exchange_seq,
+        )
+
+    def _remember_live_fill(self, msg):
+        if not hasattr(self, "_seen_fill_identities"):
+            self._seen_fill_identities = set()
+
+        for identity in self._extract_live_fill_identities(msg):
+            self._seen_fill_identities.add(identity)
+
+        ordno = msg.get("ordno")
+        if ordno:
+            self._seen_fill_ordnos.add(ordno)
+
     def on_order_event(self, stat, msg):
         # set_order_callback receives OrderState enum:
         #   OrderState.FuturesDeal / OrderState.StockDeal — actual fills
@@ -1230,12 +1311,12 @@ class ShioajiOptionsSmartMonitor:
         seqno = msg.get("seqno")
         raw_status = msg.get("status") or getattr(stat, "value", stat)
         side = self.active_side
+        tracked_order_id = None
+        if self.pending_entry and code == self.pending_entry.get("contract_code") and action == "Buy":
+            tracked_order_id = self.pending_entry.get("order_id")
+        elif self.pending_exit_trade and action == "Sell":
+            tracked_order_id = self.pending_exit_trade.get("order_id")
         if self.order_mgr and not (is_deal or is_mock_deal):
-            tracked_order_id = None
-            if self.pending_entry and code == self.pending_entry.get("contract_code") and action == "Buy":
-                tracked_order_id = self.pending_entry.get("order_id")
-            elif self.pending_exit_trade and action == "Sell":
-                tracked_order_id = self.pending_exit_trade.get("order_id")
             if tracked_order_id:
                 self.order_mgr.apply_order_update(
                     tracked_order_id,
@@ -1250,11 +1331,9 @@ class ShioajiOptionsSmartMonitor:
         if self.pending_entry and code == self.pending_entry["contract_code"] and action == "Buy":
             side = self.pending_entry["side"]
             ordno = msg.get("ordno", "")
-            if ordno and ordno in self._seen_fill_ordnos:
+            if self._is_duplicate_live_fill(tracked_order_id, msg):
                 console.print(f"[yellow]⚠️ Duplicate fill ignored: ordno={ordno}[/yellow]")
                 return
-            if ordno:
-                self._seen_fill_ordnos.add(ordno)
             if self.order_mgr and self.pending_entry.get("order_id"):
                 self.order_mgr.apply_deal_fill(
                     self.pending_entry["order_id"],
@@ -1267,6 +1346,7 @@ class ShioajiOptionsSmartMonitor:
                     exchange_seq=msg.get("exchange_seq"),
                     raw_payload=msg,
                 )
+            self._remember_live_fill(msg)
             self.position += quantity
             self.active_side = side
             self.entry_price = price
@@ -1288,10 +1368,13 @@ class ShioajiOptionsSmartMonitor:
             self.log_trade("LIVE_ENTRY_FILLED", side, price, f"qty={quantity}")
             if _notify:
                 _notify(f"[TXO] ENTRY {side} @ {price:.1f}", f"🟢 ENTRY {side} qty={quantity} @ {price:.1f}")
-            if self.position >= self.paper_lots:
+            if self.position >= int(self.pending_entry.get("requested_qty", self.base_lots)):
                 self.pending_entry = None
             return
         if self.active_side and action == "Sell":
+            if self._is_duplicate_live_fill(tracked_order_id, msg):
+                console.print(f"[yellow]⚠️ Duplicate fill ignored: ordno={ordno}[/yellow]")
+                return
             if self.order_mgr and self.pending_exit_trade and self.pending_exit_trade.get("order_id"):
                 self.order_mgr.apply_deal_fill(
                     self.pending_exit_trade["order_id"],
@@ -1304,6 +1387,7 @@ class ShioajiOptionsSmartMonitor:
                     exchange_seq=msg.get("exchange_seq"),
                     raw_payload=msg,
                 )
+            self._remember_live_fill(msg)
             self.position = max(0, self.position - quantity)
             self.log_trade("LIVE_EXIT_FILLED", self.active_side, price, f"qty={quantity} reason={self.pending_exit_reason or ''}".strip())
             if _notify:
@@ -2148,6 +2232,10 @@ class ShioajiOptionsSmartMonitor:
         if not signal_side or signal_side != side:
             console.print(f"[yellow]⚠️ enter_paper_position blocked: signal side mismatch/cleared (requested {side}, signal={signal_side})[/yellow]")
             return
+        entry_lots = int(signal.get("entry_lots", self.base_lots)) if isinstance(signal, dict) else self.base_lots
+        if entry_lots <= 0:
+            console.print(f"[yellow]⚠️ enter_paper_position blocked: resolved entry_lots={entry_lots}[/yellow]")
+            return
         if self.position >= self.max_positions:
             console.print(f"[red]🚫 enter_paper_position blocked: max positions ({self.max_positions}) reached (currently {self.position})[/red]")
             return
@@ -2167,16 +2255,16 @@ class ShioajiOptionsSmartMonitor:
             console.print(f"[red]🚫 Entry blocked: premium {entry_price:.1f} exceeds limit {self.entry_premium_limit:.1f}[/red]")
             return
             
-        if not self._paper_margin_check(entry_price):
+        if not self._paper_margin_check(entry_price, lots=entry_lots):
             return
-        paper_order = self._record_paper_order(side, "BUY", self.paper_lots, entry_price, f"ENTRY score={signal.get('score', 0):.1f}")
+        paper_order = self._record_paper_order(side, "BUY", entry_lots, entry_price, f"ENTRY score={signal.get('score', 0):.1f}")
         if self.order_mgr and paper_order is None:
             return
-        self.position += self.paper_lots
+        self.position += entry_lots
         self.active_side = side
         # Average entry price for multiple positions
-        prev_cost = self.entry_price * (self.position - self.paper_lots) if self.position > self.paper_lots else 0
-        self.entry_price = (prev_cost + entry_price * self.paper_lots) / self.position if self.position > 0 else entry_price
+        prev_cost = self.entry_price * (self.position - entry_lots) if self.position > entry_lots else 0
+        self.entry_price = (prev_cost + entry_price * entry_lots) / self.position if self.position > 0 else entry_price
         self.entry_mtx_price = signal.get("price_mtx", 0)
         self.entry_time = signal.get("timestamp") or self._current_strategy_time()
         self.has_tp1_hit = False
@@ -2245,6 +2333,10 @@ class ShioajiOptionsSmartMonitor:
 
     def submit_live_entry(self, side, signal, retries):
         signal_side = signal.get("side") if isinstance(signal, dict) else None
+        entry_lots = int(signal.get("entry_lots", self.base_lots)) if isinstance(signal, dict) else self.base_lots
+        if entry_lots <= 0:
+            self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "entry_lots_zero")
+            return
         if not signal_side or signal_side != side:
             self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, f"signal_side_mismatch:{signal_side}")
             return
@@ -2274,11 +2366,11 @@ class ShioajiOptionsSmartMonitor:
                 symbol=contract.code,
                 side=OrderSide.BUY,
                 order_type=OrderType.MARKET,
-                quantity=self.paper_lots,
+                quantity=entry_lots,
                 strategy=self.mode,
                 comment=f"ENTRY score={signal.get('score', 0.0):.1f}",
             )
-        trade = self.broker.place_entry_order(contract, self.paper_lots)
+        trade = self.broker.place_entry_order(contract, entry_lots)
         if trade is None:
             console.print("[red]❌ 下單未執行（可能保證金不足）[/red]")
             if lifecycle_order is not None:
@@ -2302,13 +2394,19 @@ class ShioajiOptionsSmartMonitor:
             "submitted_at": datetime.datetime.now(),
             "trade": trade,
             "order_id": lifecycle_order.order_id if lifecycle_order is not None else None,
+            "requested_qty": entry_lots,
             "retries": retries,
         }
         self._audit_signal("LIVE_ENTRY_SUBMITTED", side, signal, "")
         sig_score = signal.get("score", 0.0)
-        self.log_trade("LIVE_ENTRY_SUBMITTED", side, getattr(contract, "ask_price", 0.0), f"score={sig_score:.1f} trade={self.broker.describe_trade(trade)}")
+        self.log_trade(
+            "LIVE_ENTRY_SUBMITTED",
+            side,
+            getattr(contract, "ask_price", 0.0),
+            f"score={sig_score:.1f} qty={entry_lots} trade={self.broker.describe_trade(trade)}",
+        )
         if self.dry_run_live_orders:
-            self._simulate_dry_run_fill(trade, contract, "Buy", self.paper_lots)
+            self._simulate_dry_run_fill(trade, contract, "Buy", entry_lots)
 
     def exit_paper_position(self, action, price, note=""):
         if self.position <= 0 or not self.active_side:
@@ -2484,7 +2582,7 @@ class ShioajiOptionsSmartMonitor:
             if pending.get("retries", 0) < self.max_order_retries and self.active_side and self.position > 0:
                 self.submit_live_exit(reason or "LIVE_EXIT_RESUBMITTED", note=f"retry={pending.get('retries', 0) + 1}", quantity=pending.get("quantity"), retries=pending.get("retries", 0) + 1)
 
-    def _margin_sufficient(self):
+    def _margin_sufficient(self, combo_entry=None):
         """Check account margin before live entry."""
         if not self.api:
             return True
@@ -2493,8 +2591,11 @@ class ShioajiOptionsSmartMonitor:
             equity = margin.equity
             reserve_pct = 0.20
             available = equity * (1 - reserve_pct)
-            # 選擇權買方需要權利金，用 order_margin_premium 或 fallback 估算
-            required = margin.order_margin_premium if margin.order_margin_premium > 0 else 10000
+            if combo_entry is not None and self._theta_gang is not None:
+                required = self._theta_gang.live_combo_margin_required(combo_entry)
+            else:
+                # 選擇權買方需要權利金，用 order_margin_premium 或 fallback 估算
+                required = margin.order_margin_premium if margin.order_margin_premium > 0 else 10000
             if available < required:
                 console.print(f"[red]Margin check: equity={equity:.0f} available={available:.0f} < required={required:.0f}[/red]")
                 return False
@@ -2503,7 +2604,237 @@ class ShioajiOptionsSmartMonitor:
             console.print(f"[yellow]Margin check failed: {e} — allowing order[/yellow]")
             return True
 
-    def _paper_margin_check(self, entry_price):
+    def _normalize_delivery_date(self, delivery_date):
+        if not delivery_date:
+            return None
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+            try:
+                return datetime.datetime.strptime(str(delivery_date), fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    def _option_right_matches(self, contract, side):
+        option_right = str(getattr(contract, "option_right", "")).upper()
+        expected = str(side).upper()
+        return option_right.startswith(expected) or option_right.endswith("CALL" if expected == "C" else "PUT")
+
+    def _resolve_theta_combo_contract(self, leg):
+        contract = getattr(leg, "contract", None)
+        if contract is not None:
+            return contract
+
+        expected_side = str(getattr(leg, "side", "")).upper()
+        reference_contract = self.active_contracts.get(expected_side)
+        desired_delivery = self._normalize_delivery_date(getattr(reference_contract, "delivery_date", None)) if reference_contract else None
+        try:
+            contracts = list(self.api.Contracts.Options["TXO"]) if self.api and hasattr(self.api, "Contracts") else []
+        except Exception:
+            contracts = []
+
+        for candidate in contracts:
+            if float(getattr(candidate, "strike_price", 0) or 0) != float(getattr(leg, "strike", 0) or 0):
+                continue
+            if not self._option_right_matches(candidate, expected_side):
+                continue
+            if desired_delivery is not None:
+                candidate_delivery = self._normalize_delivery_date(getattr(candidate, "delivery_date", None))
+                if candidate_delivery != desired_delivery:
+                    continue
+            leg.contract = candidate
+            return candidate
+        return None
+
+    def _build_theta_combo_legs(self, legs, *, reverse_actions=False):
+        combo_legs = []
+        for leg in legs:
+            contract = self._resolve_theta_combo_contract(leg)
+            if contract is None:
+                raise ValueError(f"missing_combo_contract:{getattr(leg, 'side', '?')}{getattr(leg, 'strike', '?')}")
+            action = str(getattr(leg, "action", "")).upper()
+            if reverse_actions:
+                action = "BUY" if action == "SELL" else "SELL"
+            combo_legs.append(
+                {
+                    "contract": contract,
+                    "action": action,
+                    "side": getattr(leg, "side", None),
+                    "strike": float(getattr(leg, "strike", 0) or 0),
+                    "code": getattr(contract, "code", None),
+                }
+            )
+        return combo_legs
+
+    def _block_live_theta_combo(self, strategy, reason, payload=None):
+        console.print(f"[yellow]⚠️ [ThetaGang] Live {strategy} blocked: {reason}[/yellow]")
+        self._audit_signal("THETA_LIVE_BLOCKED", strategy or "THETA", payload or {}, reason)
+        return False
+
+    def _create_theta_combo_lifecycle_order(self, strategy, combo_legs, quantity, price, order_side, comment):
+        if not self.order_mgr:
+            return None
+        from core.order_management.order import OrderType
+        return self.order_mgr.create_order(
+            symbol="TXO-COMBO",
+            side=order_side,
+            order_type=OrderType.LIMIT,
+            quantity=int(quantity),
+            price=float(price),
+            strategy=self.mode,
+            comment=comment,
+            truth_source="broker_combo",
+            combo_strategy=strategy,
+            combo_legs=[
+                {
+                    "code": leg.get("code"),
+                    "action": leg.get("action"),
+                    "side": leg.get("side"),
+                    "strike": leg.get("strike"),
+                }
+                for leg in combo_legs
+            ],
+        )
+
+    def _submit_live_theta_combo_entry(self, entry_info):
+        if self.pending_theta_combo is not None:
+            return self._block_live_theta_combo(entry_info.get("strategy"), "pending_theta_combo_exists", entry_info)
+        valid, payload = self._theta_gang.validate_live_combo(entry_info)
+        if not valid:
+            return self._block_live_theta_combo(entry_info.get("strategy"), payload, entry_info)
+        if not self._margin_sufficient(combo_entry=payload):
+            return self._block_live_theta_combo(payload["strategy"], "margin_insufficient", payload)
+        try:
+            combo_legs = self._build_theta_combo_legs(payload["legs"], reverse_actions=False)
+        except ValueError as exc:
+            return self._block_live_theta_combo(payload["strategy"], str(exc), payload)
+
+        from core.order_management.order import OrderSide
+
+        lifecycle_order = self._create_theta_combo_lifecycle_order(
+            payload["strategy"],
+            combo_legs,
+            payload["quantity"],
+            payload["net_credit"],
+            OrderSide.SELL,
+            f"THETA_LIVE_ENTRY strategy={payload['strategy']}",
+        )
+        trade = self.broker.place_comboorder(
+            combo_legs,
+            price=payload["net_credit"],
+            quantity=payload["quantity"],
+            action=sj.constant.Action.Sell,
+        )
+        if trade is None:
+            if lifecycle_order is not None:
+                self.order_mgr.reject(lifecycle_order.order_id, "place_comboorder_returned_none")
+            return self._block_live_theta_combo(payload["strategy"], "place_comboorder_returned_none", payload)
+        if lifecycle_order is not None:
+            self.order_mgr.attach_submission(
+                lifecycle_order.order_id,
+                broker_trade=trade,
+                broker_order_id=getattr(trade, "id", None),
+                seqno=getattr(trade, "seqno", None),
+                ordno=getattr(trade, "ordno", None),
+                raw_status="Submitted",
+                source="broker_combo_submit",
+            )
+        self.pending_theta_combo = {
+            "phase": "entry",
+            "strategy": payload["strategy"],
+            "submitted_at": datetime.datetime.now(),
+            "trade": trade,
+            "order_id": lifecycle_order.order_id if lifecycle_order is not None else None,
+            "requested_qty": payload["quantity"],
+            "combo_legs": combo_legs,
+            "limit_price": payload["net_credit"],
+            "truth_source": "broker_combo",
+        }
+        self._audit_signal("THETA_LIVE_ENTRY_SUBMITTED", "THETA", payload, "")
+        self.log_trade(
+            "THETA_LIVE_ENTRY_SUBMITTED",
+            "THETA",
+            payload["net_credit"],
+            f"strategy={payload['strategy']} qty={payload['quantity']} trade={self.broker.describe_trade(trade)}",
+        )
+        return True
+
+    def _submit_live_theta_combo_exit(self, exit_info):
+        if self.pending_theta_combo is not None:
+            strategy = getattr(getattr(self._theta_gang, "position", None), "strategy", "theta")
+            return self._block_live_theta_combo(strategy, "pending_theta_combo_exists", exit_info)
+        position = getattr(self._theta_gang, "position", None)
+        if position is None or not position.is_open:
+            return self._block_live_theta_combo("theta", "no_open_theta_position", exit_info)
+
+        valid, payload = self._theta_gang.validate_live_combo(
+            {
+                "strategy": position.strategy,
+                "legs": position.legs,
+                "net_credit": position.net_credit,
+                "max_loss": position.max_loss,
+                "quantity": position.quantity,
+            }
+        )
+        if not valid:
+            return self._block_live_theta_combo(position.strategy, payload, exit_info)
+        try:
+            combo_legs = self._build_theta_combo_legs(payload["legs"], reverse_actions=True)
+        except ValueError as exc:
+            return self._block_live_theta_combo(position.strategy, str(exc), exit_info)
+
+        from core.order_management.order import OrderSide
+
+        limit_price = float(exit_info.get("current_value", 0.0) or 0.0)
+        lifecycle_order = self._create_theta_combo_lifecycle_order(
+            position.strategy,
+            combo_legs,
+            payload["quantity"],
+            limit_price,
+            OrderSide.BUY,
+            f"THETA_LIVE_EXIT strategy={position.strategy} reason={exit_info.get('reason', '')}",
+        )
+        trade = self.broker.place_comboorder(
+            combo_legs,
+            price=limit_price,
+            quantity=payload["quantity"],
+            action=sj.constant.Action.Buy,
+        )
+        if trade is None:
+            if lifecycle_order is not None:
+                self.order_mgr.reject(lifecycle_order.order_id, "place_comboorder_returned_none")
+            return self._block_live_theta_combo(position.strategy, "place_comboorder_returned_none", exit_info)
+        if lifecycle_order is not None:
+            self.order_mgr.attach_submission(
+                lifecycle_order.order_id,
+                broker_trade=trade,
+                broker_order_id=getattr(trade, "id", None),
+                seqno=getattr(trade, "seqno", None),
+                ordno=getattr(trade, "ordno", None),
+                raw_status="Submitted",
+                source="broker_combo_submit",
+            )
+        self.pending_theta_combo = {
+            "phase": "exit",
+            "strategy": position.strategy,
+            "submitted_at": datetime.datetime.now(),
+            "trade": trade,
+            "order_id": lifecycle_order.order_id if lifecycle_order is not None else None,
+            "requested_qty": payload["quantity"],
+            "combo_legs": combo_legs,
+            "limit_price": limit_price,
+            "truth_source": "broker_combo",
+            "reason": exit_info.get("reason"),
+        }
+        self._audit_signal("THETA_LIVE_EXIT_SUBMITTED", "THETA", exit_info, "")
+        self.log_trade(
+            "THETA_LIVE_EXIT_SUBMITTED",
+            "THETA",
+            limit_price,
+            f"strategy={position.strategy} qty={payload['quantity']} reason={exit_info.get('reason', '')} trade={self.broker.describe_trade(trade)}",
+        )
+        return True
+
+    def _paper_margin_check(self, entry_price, lots=None):
         """
         Paper mode margin check — enforce capital limits.
         Buyer: need premium × 50 × lots
@@ -2523,7 +2854,7 @@ class ShioajiOptionsSmartMonitor:
             except Exception:
                 pass
 
-        lots = self.paper_lots
+        lots = int(lots or self.base_lots)
         required = entry_price * 50 * lots if entry_price > 0 else 10000 * lots
 
         if available < required:
@@ -2548,6 +2879,7 @@ class ShioajiOptionsSmartMonitor:
                         current_qty = 0
                         last_side = None
                         last_entry_price = 0
+                        last_note = ""
                         total_cost = 0
                         last_ts = None
                         for i, r in enumerate(rows):
@@ -2561,6 +2893,7 @@ class ShioajiOptionsSmartMonitor:
                                 last_side = r.get("Side")
                                 last_entry_price = price
                                 last_ts = r.get("Timestamp")
+                                last_note = r.get("Note", "")
                             elif "TP1" in action:
                                 current_qty = max(0, current_qty - qty)
                                 # Keep last_entry_price the same
@@ -2569,6 +2902,7 @@ class ShioajiOptionsSmartMonitor:
                                 last_side = None
                                 total_cost = 0
                                 last_entry_price = 0
+                                last_note = ""
 
                         if current_qty > 0 and last_side:
                             self.position = current_qty
@@ -2616,6 +2950,9 @@ class ShioajiOptionsSmartMonitor:
                                 rec_order.created_at = recovery_ts
                                 self.order_mgr.completed.append(rec_order)
                                 self._save_orders_file_wrapper()
+
+                            if self.active_side == "THETA" and self._theta_gang:
+                                self._theta_gang.restore_position(last_note, timestamp=recovery_ts, quantity=current_qty)
                                 
                             console.print(f"[bold cyan]♻️ Recovered paper position from ledger: {self.active_side} qty={self.position} @ {self.entry_price}[/bold cyan]")
                             return
@@ -2639,6 +2976,33 @@ class ShioajiOptionsSmartMonitor:
                         return
         except Exception as e:
             console.print(f"[yellow]Position recovery failed: {e}[/yellow]")
+
+    def _recover_live_orders_from_broker(self):
+        """Recover live order lifecycle state directly from broker APIs on startup."""
+        if not self.order_mgr or not self.live_trading or not self.broker:
+            return {"filled": 0, "open": 0, "failed": 0}
+
+        account = getattr(self.api, "futopt_account", None) if self.api else None
+        try:
+            open_orders = list(self.broker.list_open_orders(account=account))
+            filled_trades = list(self.broker.list_trades(account=account))
+            recovered = self.order_mgr.recover_from_api(
+                filled_trades=filled_trades,
+                open_orders=open_orders,
+                source="broker_startup",
+                reason="options_live_startup",
+            )
+            recovered_total = recovered.get("filled", 0) + recovered.get("open", 0)
+            if recovered_total > 0:
+                console.print(
+                    f"[bold cyan]♻️ Recovered live orders from broker: "
+                    f"filled={recovered.get('filled', 0)} open={recovered.get('open', 0)}[/bold cyan]"
+                )
+                self._save_orders_file_wrapper()
+            return recovered
+        except Exception as e:
+            console.print(f"[yellow]Live order recovery from broker failed: {e}[/yellow]")
+            return {"filled": 0, "open": 0, "failed": 1}
 
     def _recover_orders_from_ledger(self):
         """Recover all orders from ledger CSV to rebuild OrderManager state on startup."""
@@ -2903,10 +3267,17 @@ class ShioajiOptionsSmartMonitor:
                         console.print(f"[bold yellow]🛡️ Decision Intelligence: Option {sig_side} Blocked - {edge_res['reason']}[/bold yellow]")
                     signal = {"score": 0.0, "side": None, "mid_trend": "", "price_mtx": 0.0}
                 else:
-                    # Apply scaling to quantity
-                    self.paper_lots = max(1, round(self.paper_lots * edge_res["pos_scale"]))
+                    entry_lots = self._resolve_entry_lots(edge_res["pos_scale"])
+                    if entry_lots <= 0:
+                        signal = {"score": 0.0, "side": None, "mid_trend": "", "price_mtx": 0.0}
+                    elif isinstance(signal, dict):
+                        signal["entry_lots"] = entry_lots
                     if edge_res["pos_scale"] != 1.0:
-                        console.print(f"[bold cyan]⚖️ Option Position Scaled: {edge_res['rank']} (x{edge_res['pos_scale']}) -> {self.paper_lots} lots[/bold cyan]")
+                        console.print(
+                            f"[bold cyan]⚖️ Option Position Scaled: {edge_res['rank']} "
+                            f"(x{edge_res['pos_scale']}) -> {entry_lots} lots "
+                            f"(base {self.base_lots})[/bold cyan]"
+                        )
 
                 if signal and signal.get("side"):
                     directional_release_state = self._update_theta_release_confirmation(signal, spot)
@@ -2977,6 +3348,10 @@ class ShioajiOptionsSmartMonitor:
                     bar_quality_pass = signal.get("bar_quality") == "PASS"
                     use_theta = ((auto_regime and squeeze_on) or (not auto_regime)) and bar_quality_pass
 
+                    if self.pending_theta_combo is not None:
+                        console.print(f"[dim][ThetaGang] Pending combo {self.pending_theta_combo.get('phase')} awaiting broker reconciliation[/dim]")
+                        return
+
                     # Manage existing ThetaGang position
                     if self._theta_gang.position and self._theta_gang.position.is_open:
                         self._theta_bars_held += 1
@@ -3004,10 +3379,20 @@ class ShioajiOptionsSmartMonitor:
                             exit_info = None
 
                         if exit_info:
+                            if self.live_trading:
+                                self._submit_live_theta_combo_exit(exit_info)
+                                return
                             pos = self._theta_gang.close_position()
                             self._theta_bars_held = 0
                             self._theta_release_confirm_count = 0
                             self._theta_release_last_bar_ts = None
+                            self.position = 0
+                            self.active_side = None
+                            self.entry_price = 0.0
+                            self.entry_time = None
+                            self.stop_loss_price = 0.0
+                            self.peak_premium = 0.0
+                            self.has_tp1_hit = False
                             # GSD fix: ThetaGang has pre-computed PnL, don't recalculate through log_trade
                             theta_pnl = round(exit_info["pnl"], 0)
                             # 計算累計Balance（從現有ledger）
@@ -3047,13 +3432,16 @@ class ShioajiOptionsSmartMonitor:
                         return
 
                     # Try ThetaGang entry
-                    if use_theta and not (self._theta_gang.position and self._theta_gang.position.is_open):
+                    if use_theta and self.position == 0 and not (self._theta_gang.position and self._theta_gang.position.is_open):
                         spot = float(self.market_data["MTX"]["close"])
                         contract = self.active_contracts.get("C") or self.active_contracts.get("P")
                         dte_years = float(self._dte(getattr(contract, "delivery_date", None))) if contract else 0.03
                         iv = self.latest_iv or 0.25
                         entry_info = self._theta_gang.evaluate_entry(spot, iv, dte_years, squeeze_on)
                         if entry_info:
+                            if self.live_trading:
+                                self._submit_live_theta_combo_entry(entry_info)
+                                return
                             pos = self._theta_gang.open_position(entry_info)
                             self._theta_bars_held = 0
                             self._theta_release_confirm_count = 0
@@ -3067,6 +3455,13 @@ class ShioajiOptionsSmartMonitor:
                             else:
                                 entry_price = 0.0
                                 console.print(f"[yellow]⚠️ THETA_ENTRY: net_credit is None or 0, using price=0[/yellow]")
+                            self.position = pos.quantity
+                            self.active_side = "THETA"
+                            self.entry_price = entry_price
+                            self.entry_time = datetime.datetime.now()
+                            self.stop_loss_price = entry_price * (1 + self.stop_loss_pct) if entry_price > 0 else 0.0
+                            self.peak_premium = entry_price
+                            self.has_tp1_hit = False
                             self.log_trade("THETA_ENTRY", "THETA", entry_price,
                                            f"credit={pos.net_credit:.0f} max_loss={pos.max_loss:.0f} strategy={pos.strategy} [{legs_str}]")
                             self._record_paper_order(
@@ -3131,8 +3526,12 @@ class ShioajiOptionsSmartMonitor:
                 _om_mode = "live" if self.live_trading else "paper"
                 self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=self.broker)
                 
-                # [GSD Fix] Recover orders from ledger BEFORE wiring callbacks (which save immediately)
-                self._recover_orders_from_ledger()
+                # Prefer broker truth for live startup; fall back to ledger when broker recovery yields nothing.
+                recovered = {"filled": 0, "open": 0, "failed": 0}
+                if self.live_trading:
+                    recovered = self._recover_live_orders_from_broker()
+                if not self.live_trading or (recovered.get("filled", 0) + recovered.get("open", 0) == 0):
+                    self._recover_orders_from_ledger()
                 
                 self._wire_order_callbacks()
                 console.print(f"[green]📋 Options Order Lifecycle Manager enabled ({_om_mode} mode)[/green]")
