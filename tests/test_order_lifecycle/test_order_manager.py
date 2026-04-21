@@ -7,6 +7,7 @@ Covers: create, submit, fill (partial+full), cancel gate, reject, expire, recove
 import pytest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 
 from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
 from core.order_management.order_manager import OrderManager, OrderEvent
@@ -64,6 +65,24 @@ class TestCreateOrder:
         assert order.symbol == "TXO"
         assert order.strategy == "counter_vwap"
 
+    def test_create_accepts_combo_truth_metadata(self, paper_mgr):
+        order = paper_mgr.create_order(
+            symbol="TXO-SPREAD",
+            side=OrderSide.SELL,
+            order_type=OrderType.LIMIT,
+            quantity=1,
+            price=15.5,
+            truth_source="broker_combo",
+            combo_strategy="vertical_spread",
+            combo_legs=[
+                {"code": "TXO22000C", "action": "Sell", "ratio": 1},
+                {"code": "TXO22100C", "action": "Buy", "ratio": 1},
+            ],
+        )
+        assert order.truth_source == "broker_combo"
+        assert order.combo_strategy == "vertical_spread"
+        assert len(order.combo_legs) == 2
+
 
 # ── L1-UT-02: Submit Order ──
 
@@ -111,6 +130,43 @@ class TestSubmit:
         assert attached.seqno == "SEQ-001"
         assert attached.ordno == "ORDNO-001"
         assert attached.status == OrderStatus.SUBMITTED
+
+    def test_attach_submission_persists_combo_payload_on_single_lifecycle_order(self, paper_mgr):
+        order = paper_mgr.create_order(
+            "TXO-SPREAD",
+            OrderSide.SELL,
+            OrderType.LIMIT,
+            1,
+            price=16.0,
+            truth_source="broker_combo",
+            combo_strategy="vertical_spread",
+            combo_legs=[
+                {"code": "TXO22000C", "action": "Sell", "ratio": 1},
+                {"code": "TXO22100C", "action": "Buy", "ratio": 1},
+            ],
+        )
+        broker_trade = SimpleNamespace(
+            id="BROKER-COMBO-001",
+            seqno="SEQ-COMBO-001",
+            ordno="ORDNO-COMBO-001",
+            combo_id="COMBO-001",
+            legs=[{"code": "TXO22000C"}, {"code": "TXO22100C"}],
+        )
+
+        attached = paper_mgr.attach_submission(
+            order.order_id,
+            broker_trade=broker_trade,
+            raw_status="Submitted",
+            source="broker_combo_submit",
+        )
+
+        assert attached.order_id == order.order_id
+        assert len(paper_mgr.active_orders) == 1
+        assert attached.broker_order_id == "BROKER-COMBO-001"
+        assert attached.seqno == "SEQ-COMBO-001"
+        assert attached.ordno == "ORDNO-COMBO-001"
+        assert attached.raw_events[-1]["payload"]["combo_id"] == "COMBO-001"
+        assert len(attached.combo_legs) == 2
 
 
 # ── L1-UT-03: Fill Order (Full) ──
@@ -322,6 +378,101 @@ class TestRecovery:
         pending = live_mgr.get_pending()[0]
         assert pending.status == OrderStatus.SUBMITTED
         assert pending.exchange_order_id == "EXCH-200"
+
+
+class TestComboSerialization:
+    def test_order_round_trip_preserves_truth_source_and_combo_metadata(self, paper_mgr):
+        order = paper_mgr.create_order(
+            symbol="TXO-SPREAD",
+            side=OrderSide.SELL,
+            order_type=OrderType.LIMIT,
+            quantity=1,
+            price=15.5,
+            strategy="theta_gang",
+            comment="combo order",
+            truth_source="broker_combo",
+            combo_strategy="bull_put_spread",
+            combo_legs=[
+                {"code": "TXO21900P", "action": "Sell", "ratio": 1},
+                {"code": "TXO21800P", "action": "Buy", "ratio": 1},
+            ],
+        )
+
+        paper_mgr.attach_submission(
+            order.order_id,
+            broker_trade=SimpleNamespace(id="BROKER-123", seqno="SEQ-123", ordno="ORDNO-123"),
+            raw_status="Submitted",
+            source="broker_combo_submit",
+        )
+        paper_mgr.apply_deal_fill(
+            order.order_id,
+            deal_id="DEAL-123",
+            fill_price=15.0,
+            fill_qty=1,
+            broker_order_id="BROKER-123",
+            ordno="ORDNO-123",
+            source="broker_combo_fill",
+            reason="combo_fill",
+            raw_payload={"legs": [{"code": "TXO21900P"}, {"code": "TXO21800P"}]},
+        )
+
+        exported = order.to_dict()
+        restored = Order.from_dict(exported)
+
+        assert exported["truth_source"] == "broker_combo"
+        assert exported["combo_strategy"] == "bull_put_spread"
+        assert exported["combo_legs"][0]["code"] == "TXO21900P"
+        assert restored.truth_source == "broker_combo"
+        assert restored.combo_strategy == "bull_put_spread"
+        assert restored.combo_legs[1]["action"] == "Buy"
+        assert restored.status == OrderStatus.FILLED
+        assert restored.avg_fill_price == 15.0
+        assert restored.broker_order_id == "BROKER-123"
+        assert restored.ordno == "ORDNO-123"
+        assert restored.raw_events[-1]["payload"]["legs"][0]["code"] == "TXO21900P"
+
+    def test_from_dict_without_combo_fields_remains_backward_compatible(self):
+        restored = Order.from_dict({
+            "order_id": "ORD-LEGACY",
+            "intent_id": "intent-legacy",
+            "symbol": "TMF",
+            "side": "buy",
+            "order_type": "market",
+            "quantity": 1,
+            "filled_quantity": 0,
+            "price": None,
+            "stop_price": None,
+            "avg_fill_price": 0.0,
+            "status": "pending_submit",
+            "strategy": "",
+            "account": "",
+            "comment": "",
+            "commission": 0.0,
+            "tax": 0.0,
+            "total_fee": 0.0,
+            "slippage": 0.0,
+            "fill_time_ms": None,
+            "exchange_order_id": None,
+            "broker_order_id": None,
+            "seqno": None,
+            "ordno": None,
+            "reject_reason": None,
+            "cancel_reason": None,
+            "parent_order_id": None,
+            "fills": [],
+            "raw_events": [],
+            "created_at": datetime.now().isoformat(),
+            "submitted_at": None,
+            "filled_at": None,
+            "cancelled_at": None,
+            "rejected_at": None,
+            "expired_at": None,
+            "updated_at": datetime.now().isoformat(),
+        })
+
+        assert restored.truth_source in ("", None)
+        assert restored.combo_legs == []
+        assert restored.combo_strategy == ""
 
 
 # ── L1-UT-09: Order Events ──
