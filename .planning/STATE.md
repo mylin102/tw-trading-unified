@@ -5,15 +5,15 @@ milestone_name: milestone
 current_phase: 01
 current_plan: 1
 status: executing
-stopped_at: Completed 1000-01-PLAN.md
-last_updated: "2026-04-21T10:30:47.908Z"
+stopped_at: Completed 1000-02-PLAN.md
+last_updated: "2026-04-21T10:50:27.211Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 11
-  completed_plans: 4
-  percent: 36
+  completed_plans: 5
+  percent: 45
 ---
 
 # Session State
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-04-20)
 ## Current Position
 
 Phase: 01 (lifecycle-truth-contract) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 **Milestone:** v1.1 vNext Execution Reliability
 **Current phase:** 01
 **Current plan:** 1
@@ -60,6 +60,7 @@ Progress: [█░░░░░░░░░] 10%
 - Trend: Planning complete
 
 | Phase 1000 P01 | 6m | 2 tasks | 5 files |
+| Phase 1000 P02 | 922 | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -73,6 +74,9 @@ Recent decisions affecting current work:
 - Phase 3: Limit dashboard changes to lifecycle truth exposure, not a broader redesign.
 - [Phase 1000]: Use exact Shioaji combo APIs and keep combo submit separate from single-leg helpers.
 - [Phase 1000]: Persist combo truth on one lifecycle order via truth_source, combo_legs, combo_strategy, and raw_events.
+- [Phase 1000]: Only bull_put_spread and bear_call_spread can submit live combo orders tonight.
+- [Phase 1000]: Live theta submit success now creates pending_theta_combo metadata instead of mutating local open/close state.
+- [Phase 1000]: Live spread capital checks use max_loss and wing-width semantics instead of premium-only math.
 
 ### Roadmap Evolution
 
@@ -92,6 +96,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-21T10:30:47.906Z
-Stopped at: Completed 1000-01-PLAN.md
+Last session: 2026-04-21T10:50:27.209Z
+Stopped at: Completed 1000-02-PLAN.md
 Resume file: None
