@@ -21,14 +21,18 @@ from core.dashboard_data import (
     resolve_preferred_or_latest_file,
     resolve_stock_orders_file,
 )
+from core.order_lifecycle_audit import rebuild_options_orders_from_ledger
 from core.dashboard_positions import (
     count_futures_entries,
     count_options_entries,
+    describe_options_order_truth,
+    estimate_options_order_unrealized,
     estimate_theta_unrealized,
     find_latest_open_futures_position,
     find_latest_open_options_position,
     latest_indicator_close,
     option_order_matches_open_position,
+    summarize_combo_legs,
 )
 import subprocess
 import time
@@ -56,6 +60,8 @@ st.set_page_config(page_title="Trading Unified", page_icon="📊", layout="wide"
 # Helper: robustly coerce possibly-array-like values (Series, ndarray, list) to a float scalar
 import numpy as _np
 import pandas as _pd
+
+OPTIONS_TRUTH_SOURCES = ("broker_combo", "paper_strategy", "ledger_rebuilt")
 
 def _to_num(val, default=0.0):
     try:
@@ -992,20 +998,32 @@ def load_options_indicators(full_history=False):
     days = sorted(list(set(days)))
     
     all_dfs = []
-    for priority, d_str in enumerate(days):
-        for sub in ["live_trading", "paper_trading"]:
+    source_candidates = [OPTIONS_SUB]
+    fallback_sub = "paper_trading" if OPTIONS_SUB == "live_trading" else "live_trading"
+
+    # Prefer the active runtime mode and only fall back to the other mode when
+    # the active mode has no indicator files at all. Mixing both widens the MTX
+    # chart range with stale sessions and makes live charts look zoomed out.
+    for source_index, sub in enumerate(source_candidates):
+        source_dfs = []
+        for priority, d_str in enumerate(days):
             f = OPTIONS_REPO / "logs" / sub / f"OPTIONS_{d_str}_indicators.csv"
             if f.exists():
                 try:
                     df = pd.read_csv(f)
                     if not df.empty:
-                        # 確保 timestamp 是 datetime
                         if "timestamp" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
                             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
                         df["__source_priority"] = priority
-                        all_dfs.append(df)
+                        df["__source_mode"] = sub
+                        source_dfs.append(df)
                 except Exception:
                     continue
+        if source_dfs:
+            all_dfs = source_dfs
+            break
+        if source_index == 0:
+            source_candidates.append(fallback_sub)
 
     # GSD: Parquet Fallback (Wave 18.3)
     if not all_dfs:
@@ -1809,13 +1827,25 @@ with tab_options:
         if order_files and order_files[0].exists():
             with open(order_files[0], "r", encoding="utf-8") as f:
                 orders_data = json.load(f)
+            orders_rebuilt_from_ledger = False
+            if not orders_data:
+                rebuilt_orders = rebuild_options_orders_from_ledger(ol)
+                if rebuilt_orders:
+                    orders_data = rebuilt_orders
+                    orders_rebuilt_from_ledger = True
 
             if orders_data:
                 # [GSD Fix] Get ACTUAL live premium from indicator data, not ledger
                 opt_df = load_options_indicators()
                 live_premium = None
+                current_spot = 0.0
+                current_iv = 0.0
+                current_dte_years = 0.0
                 if opt_df is not None and not opt_df.empty:
                     last_row = opt_df.iloc[-1]
+                    current_spot = float(last_row.get("price_mtx", 0) or 0)
+                    current_iv = float(last_row.get("iv", 0) or 0)
+                    current_dte_years = float(last_row.get("dte", 0) or 0) / 365.0 if last_row.get("dte", 0) else 0.0
                     # Try to get bid/ask mid if available (some versions log it)
                     bid = float(last_row.get("bid", 0))
                     ask = float(last_row.get("ask", 0))
@@ -1826,11 +1856,24 @@ with tab_options:
 
                 df_orders = pd.DataFrame(orders_data)
                 open_option_for_orders = find_latest_open_options_position(ol)
+                truth_results = df_orders.apply(
+                    lambda row: describe_options_order_truth(
+                        row,
+                        orders_rebuilt_from_ledger=orders_rebuilt_from_ledger,
+                    ),
+                    axis=1,
+                )
+                df_orders["truth_source"] = truth_results.apply(lambda result: result["truth_source"])
+                df_orders["真實來源"] = truth_results.apply(lambda result: result["badge"])
+                df_orders["degraded_caption"] = truth_results.apply(lambda result: result["degraded_caption"])
+                df_orders["show_paper_disclaimer"] = truth_results.apply(lambda result: result["show_paper_disclaimer"])
+                df_orders["組合腿摘要"] = df_orders.get("combo_legs", pd.Series([None] * len(df_orders))).apply(summarize_combo_legs)
                 display_cols = []
                 if "order_id" in df_orders.columns:
                     display_cols.append("order_id")
                 if "created_at" in df_orders.columns:
                     display_cols.append("created_at")
+                display_cols.append("真實來源")
                 if "side" in df_orders.columns:
                     df_orders["方向"] = df_orders["side"].map({"buy": "買入", "sell": "賣出"})
                     display_cols.append("方向")
@@ -1852,17 +1895,12 @@ with tab_options:
                     display_cols.append("狀態")
                 if "strategy" in df_orders.columns:
                     display_cols.append("strategy")
+                display_cols.append("組合腿摘要")
+                display_cols.append("degraded_caption")
 
-                # Calculate unrealized PnL using LIVE premium
-                # GSD Fix: Warn about multi-leg strategies
-                has_strategy_col = "strategy" in df_orders.columns
-                has_multi_leg = False
-                if has_strategy_col:
-                    strategies = df_orders["strategy"].dropna().unique()
-                    multi_leg_keywords = ["iron_condor", "bull_put", "bear_call", "butterfly", "condor", "spread"]
-                    has_multi_leg = any(any(kw in str(s).lower() for kw in multi_leg_keywords) for s in strategies)
-                
-                if live_premium and live_premium > 0:
+                has_open_theta = open_option_for_orders is not None and "THETA" in str(open_option_for_orders.action).upper()
+
+                if (live_premium and live_premium > 0) or has_open_theta or (current_spot > 0 and current_iv > 0 and current_dte_years > 0):
                     # 添加更新按鈕
                     col1, col2 = st.columns([3, 1])
                     with col1:
@@ -1871,61 +1909,65 @@ with tab_options:
                         if st.button("🔄 更新", key="update_options_unrealized"):
                             st.cache_data.clear()
                             st.rerun()
-                    
-                    # GSD Fix: Show warning for multi-leg strategies
-                    if has_multi_leg:
-                        st.warning("⚠️ 多腿策略 (如 Iron Condor) 的未實現損益需要計算整體部位，單一標的價格可能不準確。請參考選擇權監控系統的部位損益。")
-                    
-                    def _calc_opt_unreal(row):
-                        if row.get("status") not in ("filled", "partial_filled"):
-                            return None
-                        if not option_order_matches_open_position(row, open_option_for_orders):
-                            return None
-                        entry = row.get("avg_fill_price", 0) or row.get("price", 0)
-                        if not entry or entry <= 0:
-                            return None
-                        qty = row.get("filled_quantity", 1) or 1
-                        
-                        # [GSD Fix] Side-aware PnL (Sell/Theta profits if price drops)
-                        if row.get("side", "").lower() == "sell":
-                            pnl_pts = entry - live_premium
-                        else:
-                            pnl_pts = live_premium - entry
-                            
-                        return pnl_pts * 50 * qty
 
-                    df_orders["unrealized_pnl"] = df_orders.apply(_calc_opt_unreal, axis=1)
+                    if bool(df_orders["show_paper_disclaimer"].any()):
+                        st.info("ℹ️ THETA 策略目前顯示的是策略整體估值／紙上生命週期紀錄，不是券商逐腿即時成交回報。")
+                    if "broker_combo" in set(df_orders["truth_source"].astype(str)):
+                        st.caption("broker_combo 為券商複式單真實來源；paper_strategy / ledger_rebuilt 會保留降級或紙上估值說明。")
+
+                    pricing_results = df_orders.apply(
+                        lambda row: estimate_options_order_unrealized(
+                            row,
+                            open_option_for_orders,
+                            live_premium=live_premium or 0.0,
+                            current_spot=current_spot,
+                            current_iv=current_iv,
+                            dte_years=current_dte_years,
+                        ),
+                        axis=1,
+                    )
+                    df_orders["unrealized_pnl"] = pricing_results.apply(
+                        lambda result: None if result is None else result["unrealized_pnl"]
+                    )
 
                     def _format_unreal(x):
                         if x is None or (isinstance(x, float) and pd.isna(x)):
                             return "—"
                         elif x > 0:
-                            return f"🟢 {x:+,.0f}"
+                            return f"🟢 {x:+,.2f}"
                         elif x < 0:
-                            return f"🔴 {x:+,.0f}"
+                            return f"🔴 {x:+,.2f}"
                         else:
                             return "⚪ 0"
                     df_orders["未實現損益"] = df_orders["unrealized_pnl"].apply(_format_unreal)
                     display_cols.append("未實現損益")
-                    df_orders["current_price"] = live_premium
-                    display_cols.append("current_price")
+                    df_orders["current_price"] = pricing_results.apply(
+                        lambda result: None if result is None else result["current_price"]
+                    )
+                    df_orders["目前組合價值"] = df_orders["current_price"]
+                    display_cols.append("目前組合價值")
 
                 if display_cols:
                     st.dataframe(df_orders[display_cols], use_container_width=True, hide_index=True,
                                  column_config={
-                                     "order_id": "委託單ID",
-                                     "created_at": "建立時間",
-                                     "方向": "方向",
-                                     "委託類型": st.column_config.TextColumn("委託類型"),
-                                     "quantity": "委託量",
-                                     "filled_quantity": "成交量",
-                                     "price": "限價",
-                                     "avg_fill_price": "成交均價",
-                                     "狀態": st.column_config.TextColumn("狀態"),
-                                     "strategy": "策略",
-                                     "未實現損益": st.column_config.TextColumn("未實現損益"),
-                                     "current_price": "目前價",
-                                 })
+                                      "order_id": "委託單ID",
+                                      "created_at": "建立時間",
+                                      "真實來源": st.column_config.TextColumn("真實來源"),
+                                       "方向": "方向",
+                                       "委託類型": st.column_config.TextColumn("委託類型"),
+                                       "quantity": "委託量",
+                                       "filled_quantity": "成交量",
+                                       "price": st.column_config.NumberColumn("限價", format="%.2f"),
+                                       "avg_fill_price": st.column_config.NumberColumn("成交均價", format="%.2f"),
+                                       "狀態": st.column_config.TextColumn("狀態"),
+                                       "strategy": "策略",
+                                       "組合腿摘要": st.column_config.TextColumn("組合腿摘要"),
+                                       "degraded_caption": st.column_config.TextColumn("狀態說明"),
+                                       "未實現損益": st.column_config.TextColumn("未實現損益"),
+                                       "目前組合價值": st.column_config.NumberColumn("目前組合價值", format="%.2f"),
+                                    })
+                    if orders_rebuilt_from_ledger:
+                        st.caption("委託單檔案為空，已暫時從交易 ledger 重建今日選擇權委託單狀態。真實來源已標示為 ledger_rebuilt，表示 broker truth 目前不可用。")
 
                     total = len(df_orders)
                     filled = len(df_orders[df_orders["status"] == "filled"]) if "status" in df_orders.columns else 0
@@ -2506,8 +2548,13 @@ with tab_settings:
 
     # ── 2. 選擇權 TXO 設定 ──
     with st.expander("🔮 選擇權 TXO 設定", expanded=False):
-        # 假設選擇權也有類似的策略結構，目前從 config 讀取
-        current_opt_mode = options_cfg.get("mode", "V2")
+        current_opt_mode = options_cfg.get("active_mode", options_cfg.get("mode", "V2"))
+        opt_strategy_cfg = options_cfg.setdefault("strategy", {})
+        opt_risk_cfg = options_cfg.setdefault("risk_mgmt", {})
+        opt_exec_cfg = options_cfg.setdefault("execution", {})
+        opt_pricing_cfg = options_cfg.setdefault("pricing", {})
+        opt_monitoring_cfg = options_cfg.setdefault("monitoring", {})
+        opt_mode_cfg = options_cfg.setdefault("modes", {}).get(current_opt_mode, {})
         
         with st.form("options_settings_form"):
             o_live_new = st.checkbox("啟用選擇權實盤交易 (LIVE)", value=options_cfg.get("live_trading", False))
@@ -2523,7 +2570,25 @@ with tab_settings:
             }
             st.info(f"💡 **模式說明**: {mode_desc.get(o_mode_new)}")
 
-            o_score = st.slider("進場門檻 (Score)", 10, 100, value=options_cfg.get("entry_score", 80))
+            st.caption(
+                "目前 monitor 生效值："
+                f" entry_score={int(opt_strategy_cfg.get('entry_score', options_cfg.get('entry_score', 80)))}"
+                f" | stop_loss={float(opt_risk_cfg.get('stop_loss_pct', 0.3)):.0%}"
+                f" | tp1={float(opt_mode_cfg.get('tp1_pct', 0.0)):.1f}%"
+                f" | trailing={float(opt_mode_cfg.get('trailing_stop_pct', 0.0)):.2f}"
+                f" | IV={float(opt_pricing_cfg.get('min_iv', options_cfg.get('min_iv', 0.15))):.2f}"
+                f"~{float(opt_pricing_cfg.get('max_iv', options_cfg.get('max_iv', 0.60))):.2f}"
+                f" | pricing={opt_pricing_cfg.get('pricing_model', 'black_scholes')}"
+                f" | order_mgr={'on' if opt_monitoring_cfg.get('use_order_manager', False) else 'off'}"
+            )
+
+            o_score = st.slider(
+                "進場門檻 (Score)",
+                10,
+                100,
+                value=int(opt_strategy_cfg.get("entry_score", options_cfg.get("entry_score", 80))),
+                help="實際對應 strategies/options/live_options_squeeze_monitor.py 讀取的 strategy.entry_score。",
+            )
 
             o_fire_thresh = st.slider("Fire 門檻 (強趨勢 score)", 10, 100,
                                        value=int(options_cfg.get("strategy", {}).get("fire_score_threshold", 80)),
@@ -2533,38 +2598,51 @@ with tab_settings:
             st.markdown("##### 📦 口數與持倉限制")
             oc1, oc2 = st.columns(2)
             o_lots = oc1.number_input("每筆交易口數", min_value=1, max_value=10,
-                                     value=options_cfg.get("risk_mgmt", {}).get("lots_per_trade", 2),
-                                     help="每次進場的口數。實盤建議從 1 口開始。")
+                                     value=opt_risk_cfg.get("lots_per_trade", 2),
+                                     help="基礎進場口數。Runtime 仍可能依 Decision Intelligence 做單次縮放，但不應默默改寫這個基礎值。")
             o_max_pos = oc2.number_input("最大持倉口數", min_value=1, max_value=10,
-                                        value=options_cfg.get("risk_mgmt", {}).get("max_positions", 2),
+                                        value=opt_risk_cfg.get("max_positions", 2),
                                         help="同時最大持倉口數。建議 1-2 口控制風險。")
 
             st.divider()
             oc3, oc4 = st.columns(2)
-            o_min_iv = oc3.slider("最低 IV 限制", 0.1, 0.5, value=float(options_cfg.get("min_iv", 0.15)), step=0.01)
-            o_max_iv = oc4.slider("最高 IV 限制", 0.3, 1.0, value=float(options_cfg.get("max_iv", 0.60)), step=0.01)
+            o_min_iv = oc3.slider(
+                "最低 IV 限制",
+                0.1,
+                0.5,
+                value=float(opt_pricing_cfg.get("min_iv", options_cfg.get("min_iv", 0.15))),
+                step=0.01,
+            )
+            o_max_iv = oc4.slider(
+                "最高 IV 限制",
+                0.3,
+                1.0,
+                value=float(opt_pricing_cfg.get("max_iv", options_cfg.get("max_iv", 0.60))),
+                step=0.01,
+            )
 
             st.divider()
             st.markdown("##### 🛡️ 進階安全與成本設定")
             oc5, oc6 = st.columns(2)
             o_fee = oc5.number_input("單邊手續費 (TWD)", min_value=0.0, max_value=100.0,
-                                    value=float(options_cfg.get("execution", {}).get("broker_fee_per_side", 20.0)),
+                                    value=float(opt_exec_cfg.get("broker_fee_per_side", 20.0)),
                                     help="券商收取的單口單邊手續費。")
             o_exch = oc6.number_input("單邊交易所費 (TWD)", min_value=0.0, max_value=100.0,
-                                     value=float(options_cfg.get("execution", {}).get("exchange_fee_per_side", 5.0)),
+                                     value=float(opt_exec_cfg.get("exchange_fee_per_side", 5.0)),
                                      help="期交所收取的單口單邊費用。")
 
             if st.form_submit_button("💾 儲存並重啟選擇權模組"):
                 options_cfg["live_trading"] = o_live_new
                 options_cfg["active_mode"] = o_mode_new
-                options_cfg["entry_score"] = o_score
-                options_cfg["strategy"]["fire_score_threshold"] = o_fire_thresh
-                options_cfg["min_iv"] = o_min_iv
-                options_cfg["max_iv"] = o_max_iv
-                options_cfg["execution"]["broker_fee_per_side"] = o_fee
-                options_cfg["execution"]["exchange_fee_per_side"] = o_exch
-                options_cfg["risk_mgmt"]["lots_per_trade"] = o_lots
-                options_cfg["risk_mgmt"]["max_positions"] = o_max_pos
+                options_cfg["mode"] = o_mode_new
+                opt_strategy_cfg["entry_score"] = o_score
+                opt_strategy_cfg["fire_score_threshold"] = o_fire_thresh
+                opt_pricing_cfg["min_iv"] = o_min_iv
+                opt_pricing_cfg["max_iv"] = o_max_iv
+                opt_exec_cfg["broker_fee_per_side"] = o_fee
+                opt_exec_cfg["exchange_fee_per_side"] = o_exch
+                opt_risk_cfg["lots_per_trade"] = o_lots
+                opt_risk_cfg["max_positions"] = o_max_pos
                 save_yaml(OPTIONS_CFG_PATH, options_cfg)
                 trigger_restart()
                 st.success(f"選擇權設定已更新！模式: {o_mode_new} | 口數: {o_lots} | 最大持倉: {o_max_pos} | Fire閾值: {o_fire_thresh}")
