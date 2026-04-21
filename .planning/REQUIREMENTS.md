@@ -7,8 +7,8 @@
 
 ### Execution Lifecycle
 
-- [ ] **EXEC-01**: Operator can trace every futures/options, paper/live trade through linked intent, order, and deal records
-- [ ] **EXEC-02**: System can distinguish accepted, partial fill, full fill, cancel, and reject states without collapsing them into a single trade outcome
+- [x] **EXEC-01**: Operator can trace every futures/options, paper/live trade through linked intent, order, and deal records
+- [x] **EXEC-02**: System can distinguish accepted, partial fill, full fill, cancel, and reject states without collapsing them into a single trade outcome
 - [ ] **EXEC-03**: Position and cost basis update only from confirmed deal data, not optimistic order placement state
 
 ### Reconciliation & Recovery
@@ -54,8 +54,8 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| EXEC-01 | Phase 1 | Pending |
-| EXEC-02 | Phase 1 | Pending |
+| EXEC-01 | Phase 1 | Complete |
+| EXEC-02 | Phase 1 | Complete |
 | EXEC-03 | Phase 1 | Pending |
 | RECN-01 | Phase 2 | Pending |
 | RECN-02 | Phase 2 | Pending |
