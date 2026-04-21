@@ -26,6 +26,46 @@ for path in (str(OPTIONS_ROOT), str(OPTIONS_SRC)):
 from strategies.options import live_options_squeeze_monitor as options_module
 
 
+def _build_live_combo_monitor():
+    monitor = options_module.ShioajiOptionsSmartMonitor.__new__(options_module.ShioajiOptionsSmartMonitor)
+    monitor.mode = "live"
+    monitor.live_trading = True
+    monitor.order_mgr = OrderManager(mode="live")
+    monitor.position = 0
+    monitor.active_side = None
+    monitor.entry_price = 0.0
+    monitor.entry_time = None
+    monitor.stop_loss_pct = 0.1
+    monitor.stop_loss_price = 0.0
+    monitor.peak_premium = 0.0
+    monitor.has_tp1_hit = False
+    monitor.pending_entry = None
+    monitor.pending_exit_qty = 0
+    monitor.pending_exit_reason = None
+    monitor.pending_exit_trade = None
+    monitor.pending_theta_combo = None
+    monitor.cooldown_bars = 0
+    monitor.cooldown_until = 0
+    monitor._theta_cfg = {"enabled": True}
+    monitor._theta_bars_held = 0
+    monitor._theta_release_confirm_count = 0
+    monitor._theta_release_last_bar_ts = None
+    monitor._seen_fill_ordnos = set()
+    monitor._seen_fill_identities = set()
+    monitor.sync_contract_quotes = lambda: None
+    monitor._audit_signal = lambda *args, **kwargs: None
+    monitor.log_trade_events = []
+    monitor.log_trade = lambda *args, **kwargs: monitor.log_trade_events.append((args, kwargs))
+    monitor._save_orders_file_wrapper = lambda: None
+    monitor.api = SimpleNamespace(
+        futopt_account="ACC",
+        margin=lambda account: SimpleNamespace(equity=30000, order_margin_premium=50),
+    )
+    monitor._theta_gang = SimpleNamespace(position=None, strategy="bull_put_spread")
+    monitor.broker = None
+    return monitor
+
+
 # ── L2-IT-01: OrderManager + PaperTrader Integration ──
 
 class TestOrderManagerPaperTrader:

@@ -82,6 +82,24 @@ def _build_options_monitor():
     return monitor
 
 
+def _build_live_combo_monitor():
+    monitor = _build_options_monitor()
+    monitor.mode = "live"
+    monitor.live_trading = True
+    monitor.order_mgr = OrderManager(mode="live")
+    monitor.pending_theta_combo = None
+    monitor._theta_cfg = {"enabled": True}
+    monitor._theta_bars_held = 0
+    monitor._theta_release_confirm_count = 0
+    monitor._theta_release_last_bar_ts = None
+    monitor.api = SimpleNamespace(
+        futopt_account="ACC",
+        margin=lambda account: SimpleNamespace(equity=30000, order_margin_premium=50),
+    )
+    monitor._theta_gang = SimpleNamespace(position=None, strategy="bull_put_spread")
+    return monitor
+
+
 def test_order_update_does_not_create_fill():
     order_mgr = OrderManager(mode="paper")
     order = order_mgr.create_order("TXO", OrderSide.BUY, OrderType.MARKET, 1)
