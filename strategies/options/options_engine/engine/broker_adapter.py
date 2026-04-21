@@ -208,6 +208,11 @@ class ShioajiBrokerAdapter:
             return list(self.api.list_combotrades())
         return []
 
+    def list_combo_status_trades(self, account=None, refresh=True):
+        if refresh:
+            self.update_combostatus(account=account)
+        return self.list_combotrades()
+
     def list_open_orders(self, account=None):
         if hasattr(self.api, "list_open_orders"):
             if account is not None:

@@ -844,6 +844,204 @@ class OrderManager:
             "fills_added": fills_added,
         }
 
+    def _normalize_combo_deals(self, deals) -> Dict[str, List[Dict[str, Any]]]:
+        if not deals:
+            return {}
+        if isinstance(deals, dict):
+            normalized = {}
+            for leg_code, leg_deals in deals.items():
+                if isinstance(leg_deals, list):
+                    normalized[str(leg_code)] = [self._payload_to_dict(deal) or {} for deal in leg_deals]
+            return normalized
+        return {}
+
+    def _combo_filled_quantity(self, combo_trade) -> int:
+        status = getattr(combo_trade, "status", None)
+        deals = self._normalize_combo_deals(
+            self._extract_value(status, "deals") or self._extract_value(combo_trade, "deals")
+        )
+        if not deals:
+            return 0
+
+        per_leg_qty = []
+        for leg_deals in deals.values():
+            leg_qty = 0
+            for deal in leg_deals:
+                leg_qty += int(self._extract_value(deal, "quantity", "qty") or 1)
+            per_leg_qty.append(leg_qty)
+        return min(per_leg_qty) if per_leg_qty else 0
+
+    def _combo_fill_price(self, combo_trade, order: Order) -> float:
+        status = getattr(combo_trade, "status", None)
+        price = self._extract_value(status, "price", "avg_price")
+        if price is None:
+            price = self._extract_value(combo_trade, "price", "avg_price")
+        if price is None:
+            price = order.price
+        return float(price or 0.0)
+
+    def _build_combo_fill_identity(self, combo_trade, net_filled_qty: int) -> str:
+        status = getattr(combo_trade, "status", None)
+        deals = self._normalize_combo_deals(
+            self._extract_value(status, "deals") or self._extract_value(combo_trade, "deals")
+        )
+        tokens = []
+        for leg_code in sorted(deals):
+            for deal in deals[leg_code]:
+                token = (
+                    self._extract_value(deal, "deal_id", "trade_id", "fill_id", "seq", "exchange_seq")
+                    or f"{leg_code}:{self._extract_value(deal, 'ordno') or ''}:{self._extract_value(deal, 'quantity', 'qty') or 1}"
+                )
+                tokens.append(str(token))
+        ordno = self._extract_value(combo_trade, "ordno", "exchange_order_id") or "combo"
+        joined = "|".join(sorted(tokens)) or f"net={net_filled_qty}"
+        return f"combo:{ordno}:{joined}"
+
+    def _ensure_recovered_combo_order(
+        self,
+        combo_trade,
+        *,
+        broker_order_id: Optional[str] = None,
+        seqno: Optional[str] = None,
+        ordno: Optional[str] = None,
+    ) -> Order:
+        action = str(self._extract_value(combo_trade, "action") or "Sell").strip().lower()
+        side = OrderSide.BUY if action == "buy" else OrderSide.SELL
+        quantity = int(
+            self._extract_value(getattr(combo_trade, "status", None), "quantity")
+            or self._extract_value(combo_trade, "quantity")
+            or 1
+        )
+        price = float(
+            self._extract_value(getattr(combo_trade, "status", None), "price", "avg_price")
+            or self._extract_value(combo_trade, "price", "avg_price")
+            or 0.0
+        )
+        recovery_key = ordno or broker_order_id or f"{self._next_id:06d}"
+        order = Order(
+            symbol="TXO-COMBO",
+            side=side,
+            order_type=OrderType.LIMIT,
+            quantity=max(1, quantity),
+            price=price,
+            order_id=f"RECOV-{recovery_key}",
+            truth_source="broker_combo",
+            combo_strategy=str(self._extract_value(combo_trade, "strategy") or ""),
+        )
+        order.broker_order_id = broker_order_id
+        order.seqno = seqno
+        order.ordno = ordno
+        order.exchange_order_id = ordno or broker_order_id
+        self.active_orders[order.order_id] = order
+        self.reindex_orders()
+        return order
+
+    def reconcile_combo_trade_snapshot(
+        self,
+        order_id: Optional[str] = None,
+        *,
+        combo_trade=None,
+        broker_order_id: Optional[str] = None,
+        ordno: Optional[str] = None,
+        source: str = "",
+        reason: str = "",
+        create_if_missing: bool = False,
+    ) -> Dict[str, Any]:
+        broker_order_id = broker_order_id or self._extract_value(combo_trade, "id", "broker_order_id", "exchange_order_id")
+        ordno = ordno or self._extract_value(combo_trade, "ordno", "exchange_order_id")
+        seqno = self._extract_value(combo_trade, "seqno")
+        order = self._resolve_order(order_id, broker_order_id=broker_order_id, seqno=seqno, ordno=ordno)
+        created = False
+        if order is None and create_if_missing:
+            order = self._ensure_recovered_combo_order(
+                combo_trade,
+                broker_order_id=broker_order_id,
+                seqno=seqno,
+                ordno=ordno,
+            )
+            created = True
+        if order is None:
+            return {
+                "matched": False,
+                "action": "unmatched_combo_snapshot",
+                "order_id": None,
+                "fills_added": 0,
+                "created": False,
+            }
+
+        raw_status = self._extract_value(getattr(combo_trade, "status", None), "status") or self._extract_value(combo_trade, "status")
+        if (broker_order_id or ordno or seqno) and not order.is_completed():
+            self.attach_submission(
+                order.order_id,
+                broker_trade=combo_trade,
+                broker_order_id=broker_order_id,
+                seqno=seqno,
+                ordno=ordno,
+                raw_status="Submitted",
+                source=source or "combo_reconcile",
+                reason=reason,
+            )
+
+        normalized_status = self._normalize_raw_status(raw_status)
+        if raw_status is not None:
+            self.apply_order_update(
+                order.order_id,
+                raw_status=raw_status,
+                reason=reason,
+                raw_payload=self._payload_to_dict(combo_trade),
+                broker_order_id=broker_order_id,
+                seqno=seqno,
+                ordno=ordno,
+                source=source or "combo_reconcile",
+            )
+
+        fills_added = 0
+        net_filled_qty = self._combo_filled_quantity(combo_trade) if normalized_status in (OrderStatus.PARTIAL_FILLED, OrderStatus.FILLED) else 0
+        fill_delta = max(0, net_filled_qty - order.filled_quantity)
+        if fill_delta > 0:
+            fill_identity = self._build_combo_fill_identity(combo_trade, net_filled_qty)
+            if not self._has_fill_identity(
+                order,
+                deal_id=fill_identity,
+                broker_trade_id=fill_identity,
+                exchange_fill_id=fill_identity,
+            ):
+                self.apply_deal_fill(
+                    order.order_id,
+                    deal_id=fill_identity,
+                    fill_price=self._combo_fill_price(combo_trade, order),
+                    fill_qty=fill_delta,
+                    exchange_fill_id=fill_identity,
+                    broker_trade_id=fill_identity,
+                    raw_payload=self._payload_to_dict(combo_trade),
+                    broker_order_id=broker_order_id,
+                    ordno=ordno,
+                    source=source or "combo_reconcile",
+                    reason=reason,
+                )
+                fills_added += 1
+
+        self._record_audit(
+            order,
+            "combo_reconcile",
+            source=source or "combo_reconcile",
+            reason=reason,
+            to_status=order.status,
+            raw_status=raw_status,
+            payload=combo_trade,
+            broker_order_id=broker_order_id,
+            seqno=seqno,
+            ordno=ordno,
+        )
+        return {
+            "matched": True,
+            "action": "combo_reconciled",
+            "order_id": order.order_id,
+            "fills_added": fills_added,
+            "created": created,
+            "status": order.status.value,
+        }
+
     def reconcile_broker_state(
         self,
         open_orders: Optional[list] = None,
@@ -869,6 +1067,7 @@ class OrderManager:
         self,
         filled_trades: Optional[list] = None,
         open_orders: Optional[list] = None,
+        combo_trades: Optional[list] = None,
         source: str = "",
         reason: str = "",
     ) -> Dict[str, Any]:
@@ -877,6 +1076,27 @@ class OrderManager:
         應在啟動時立即呼叫 api.list_trades() + api.list_open_orders()。
         """
         recovered = {"filled": 0, "open": 0, "failed": 0}
+
+        if combo_trades:
+            for combo_trade in combo_trades:
+                result = self.reconcile_combo_trade_snapshot(
+                    combo_trade=combo_trade,
+                    source=source or "api_recovery",
+                    reason=reason or "recover_from_api",
+                    create_if_missing=True,
+                )
+                if not result["matched"]:
+                    recovered["failed"] += 1
+                    continue
+                order = self._resolve_order(result["order_id"])
+                if order is None:
+                    order = next((candidate for candidate in self.completed if candidate.order_id == result["order_id"]), None)
+                if order is None:
+                    recovered["failed"] += 1
+                elif order.is_completed() and order.status == OrderStatus.FILLED:
+                    recovered["filled"] += 1
+                elif order.is_active():
+                    recovered["open"] += 1
 
         # Rebuild filled orders
         if filled_trades:

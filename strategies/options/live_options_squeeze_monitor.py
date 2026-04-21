@@ -2561,6 +2561,7 @@ class ShioajiOptionsSmartMonitor:
         if not self.live_trading or self.broker is None:
             return
         self.broker.refresh_status(account=getattr(self.api, "futopt_account", None))
+        self._reconcile_theta_combo_orders(source="combo_poll", reason="runtime_refresh")
         if self.pending_entry and self._order_age_secs(self.pending_entry) >= self.order_timeout_secs:
             pending = dict(self.pending_entry)
             trade = pending.get("trade")
@@ -2694,6 +2695,157 @@ class ShioajiOptionsSmartMonitor:
                 for leg in combo_legs
             ],
         )
+
+    def _infer_theta_combo_phase(self, order):
+        if self.pending_theta_combo and self.pending_theta_combo.get("order_id") == order.order_id:
+            return self.pending_theta_combo.get("phase")
+        comment = str(getattr(order, "comment", "") or "").upper()
+        if "EXIT" in comment:
+            return "exit"
+        if "ENTRY" in comment:
+            return "entry"
+        return "exit" if getattr(order.side, "value", "") == "buy" else "entry"
+
+    def _remember_pending_theta_combo(self, order):
+        self.pending_theta_combo = {
+            "phase": self._infer_theta_combo_phase(order),
+            "strategy": order.combo_strategy or getattr(getattr(self._theta_gang, "position", None), "strategy", None),
+            "submitted_at": order.submitted_at or datetime.datetime.now(),
+            "trade": None,
+            "order_id": order.order_id,
+            "requested_qty": max(1, int(order.quantity)),
+            "combo_legs": list(order.combo_legs or []),
+            "limit_price": float(order.price or 0.0),
+            "truth_source": order.truth_source or "broker_combo",
+        }
+        return self.pending_theta_combo
+
+    def _build_theta_entry_info_from_order(self, order):
+        from strategies.options.theta_gang import SpreadLeg, calculate_vertical_max_loss
+
+        legs = [
+            SpreadLeg(
+                side=str(leg.get("side", "")),
+                strike=float(leg.get("strike", 0) or 0.0),
+                action=str(leg.get("action", "")),
+            )
+            for leg in (order.combo_legs or [])
+        ]
+        net_credit = float(order.avg_fill_price or order.price or 0.0)
+        return {
+            "strategy": order.combo_strategy or getattr(self._theta_gang, "strategy", "bull_put_spread"),
+            "legs": legs,
+            "net_credit": net_credit,
+            "max_loss": calculate_vertical_max_loss(legs, net_credit),
+            "quantity": int(order.quantity or 1),
+        }
+
+    def _clear_theta_combo_runtime(self):
+        self.pending_theta_combo = None
+        self._theta_bars_held = 0
+        self._theta_release_confirm_count = 0
+        self._theta_release_last_bar_ts = None
+
+    def _apply_theta_combo_fill_truth(self, order, *, source="", reason=""):
+        if not order or order.symbol != "TXO-COMBO" or order.truth_source != "broker_combo":
+            return False
+
+        phase = self._infer_theta_combo_phase(order)
+        fill_price = float(order.avg_fill_price or order.price or 0.0)
+        fill_time = order.filled_at or datetime.datetime.now()
+
+        if order.status.value == "filled":
+            if phase == "entry":
+                if self._theta_gang and not (self._theta_gang.position and self._theta_gang.position.is_open):
+                    entry_info = self._build_theta_entry_info_from_order(order)
+                    pos = self._theta_gang.open_position(entry_info)
+                    self.position = pos.quantity
+                    self.active_side = "THETA"
+                    self.entry_price = fill_price
+                    self.entry_time = fill_time
+                    self.stop_loss_price = fill_price * (1 + self.stop_loss_pct) if fill_price > 0 else 0.0
+                    self.peak_premium = fill_price
+                    self.has_tp1_hit = False
+                    self.log_trade(
+                        "THETA_LIVE_ENTRY_FILLED",
+                        "THETA",
+                        fill_price,
+                        f"strategy={pos.strategy} source={source} reason={reason}".strip(),
+                        quantity=pos.quantity,
+                    )
+                    self._save_orders_file_wrapper()
+                self._clear_theta_combo_runtime()
+                return True
+
+            if phase == "exit":
+                current_pos = getattr(self._theta_gang, "position", None)
+                if current_pos and current_pos.is_open:
+                    closed = self._theta_gang.close_position()
+                    self.log_trade(
+                        "THETA_LIVE_EXIT_FILLED",
+                        "THETA",
+                        fill_price,
+                        f"strategy={closed.strategy} source={source} reason={reason}".strip(),
+                        quantity=closed.quantity,
+                    )
+                self.position = 0
+                self.active_side = None
+                self.entry_price = 0.0
+                self.entry_time = None
+                self.stop_loss_price = 0.0
+                self.peak_premium = 0.0
+                self.has_tp1_hit = False
+                self.cooldown_until = self.cooldown_bars
+                self._save_orders_file_wrapper()
+                self._clear_theta_combo_runtime()
+                return True
+
+        if order.is_completed():
+            self._clear_theta_combo_runtime()
+            self._save_orders_file_wrapper()
+            return False
+
+        self._remember_pending_theta_combo(order)
+        return False
+
+    def _reconcile_theta_combo_orders(self, *, combo_trades=None, source="combo_poll", reason=""):
+        if not self.live_trading or not self.order_mgr or not self.broker:
+            return {"combo_trades": 0, "matched": 0, "fills_applied": 0}
+
+        account = getattr(self.api, "futopt_account", None) if self.api else None
+        if combo_trades is None:
+            if hasattr(self.broker, "list_combo_status_trades"):
+                combo_trades = list(self.broker.list_combo_status_trades(account=account))
+            else:
+                if hasattr(self.broker, "update_combostatus"):
+                    self.broker.update_combostatus(account=account)
+                combo_trades = list(self.broker.list_combotrades()) if hasattr(self.broker, "list_combotrades") else []
+
+        matched = 0
+        fills_applied = 0
+        for combo_trade in combo_trades or []:
+            result = self.order_mgr.reconcile_combo_trade_snapshot(
+                combo_trade=combo_trade,
+                source=source,
+                reason=reason,
+                create_if_missing=(source == "combo_startup"),
+            )
+            if not result.get("matched"):
+                continue
+            matched += 1
+            fills_applied += int(result.get("fills_added", 0))
+            order = self._find_lifecycle_order(result.get("order_id"))
+            if order is not None:
+                self._apply_theta_combo_fill_truth(order, source=source, reason=reason)
+        return {"combo_trades": len(combo_trades or []), "matched": matched, "fills_applied": fills_applied}
+
+    def _startup_recover_live_order_state(self):
+        recovered = {"filled": 0, "open": 0, "failed": 0}
+        if self.live_trading:
+            recovered = self._recover_live_orders_from_broker()
+        if not self.live_trading or (recovered.get("filled", 0) + recovered.get("open", 0) == 0):
+            self._recover_orders_from_ledger()
+        return recovered
 
     def _submit_live_theta_combo_entry(self, entry_info):
         if self.pending_theta_combo is not None:
@@ -2984,12 +3136,24 @@ class ShioajiOptionsSmartMonitor:
 
         account = getattr(self.api, "futopt_account", None) if self.api else None
         try:
+            if hasattr(self.broker, "list_combo_status_trades"):
+                combo_trades = list(self.broker.list_combo_status_trades(account=account))
+            else:
+                if hasattr(self.broker, "update_combostatus"):
+                    self.broker.update_combostatus(account=account)
+                combo_trades = list(self.broker.list_combotrades()) if hasattr(self.broker, "list_combotrades") else []
             open_orders = list(self.broker.list_open_orders(account=account))
             filled_trades = list(self.broker.list_trades(account=account))
             recovered = self.order_mgr.recover_from_api(
+                combo_trades=combo_trades,
                 filled_trades=filled_trades,
                 open_orders=open_orders,
-                source="broker_startup",
+                source="combo_startup",
+                reason="options_live_startup",
+            )
+            self._reconcile_theta_combo_orders(
+                combo_trades=combo_trades,
+                source="combo_startup",
                 reason="options_live_startup",
             )
             recovered_total = recovered.get("filled", 0) + recovered.get("open", 0)
@@ -3527,11 +3691,7 @@ class ShioajiOptionsSmartMonitor:
                 self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=self.broker)
                 
                 # Prefer broker truth for live startup; fall back to ledger when broker recovery yields nothing.
-                recovered = {"filled": 0, "open": 0, "failed": 0}
-                if self.live_trading:
-                    recovered = self._recover_live_orders_from_broker()
-                if not self.live_trading or (recovered.get("filled", 0) + recovered.get("open", 0) == 0):
-                    self._recover_orders_from_ledger()
+                self._startup_recover_live_order_state()
                 
                 self._wire_order_callbacks()
                 console.print(f"[green]📋 Options Order Lifecycle Manager enabled ({_om_mode} mode)[/green]")
