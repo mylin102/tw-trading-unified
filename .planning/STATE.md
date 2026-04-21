@@ -4,16 +4,16 @@ milestone: v1.1
 milestone_name: milestone
 current_phase: 01
 current_plan: 1
-status: executing
-stopped_at: Completed 1000-02-PLAN.md
-last_updated: "2026-04-21T10:50:27.211Z"
+status: verifying
+stopped_at: Completed 1000-03-PLAN.md
+last_updated: "2026-04-21T11:12:08.194Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 11
-  completed_plans: 5
-  percent: 45
+  completed_plans: 6
+  percent: 55
 ---
 
 # Session State
@@ -32,7 +32,7 @@ Plan: 3 of 3
 **Milestone:** v1.1 vNext Execution Reliability
 **Current phase:** 01
 **Current plan:** 1
-**Status:** Ready to execute
+**Status:** Phase complete — ready for verification
 **Last activity:** 2026-04-21
 
 Progress: [█░░░░░░░░░] 10%
@@ -61,6 +61,7 @@ Progress: [█░░░░░░░░░] 10%
 
 | Phase 1000 P01 | 6m | 2 tasks | 5 files |
 | Phase 1000 P02 | 922 | 2 tasks | 4 files |
+| Phase 1000 P03 | 20m | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -77,6 +78,9 @@ Recent decisions affecting current work:
 - [Phase 1000]: Only bull_put_spread and bear_call_spread can submit live combo orders tonight.
 - [Phase 1000]: Live theta submit success now creates pending_theta_combo metadata instead of mutating local open/close state.
 - [Phase 1000]: Live spread capital checks use max_loss and wing-width semantics instead of premium-only math.
+- [Phase 1000]: Combo startup recovery now loads combo broker status before ordinary order/ledger fallback.
+- [Phase 1000]: Recovered combo fills are deduplicated by one aggregated combo identity and only mutate theta runtime after broker-confirmed fill truth.
+- [Phase 1000]: Open combo recovery rebuilds pending_theta_combo from lifecycle orders so restart never resubmits the broker order.
 
 ### Roadmap Evolution
 
@@ -96,6 +100,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-21T10:50:27.209Z
-Stopped at: Completed 1000-02-PLAN.md
+Last session: 2026-04-21T11:12:08.192Z
+Stopped at: Completed 1000-03-PLAN.md
 Resume file: None

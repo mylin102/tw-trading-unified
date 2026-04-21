@@ -13,9 +13,9 @@
 
 ### Reconciliation & Recovery
 
-- [ ] **RECN-01**: System can rebuild broker-truth lifecycle state through `update_status()` or equivalent reconciliation after callback gaps
-- [ ] **RECN-02**: After process restart, futures/options paper-live execution can recover open orders, fills, and position links without duplicate execution
-- [ ] **RECN-03**: Every lifecycle state transition records an audit trail with timestamp, source, and reason
+- [x] **RECN-01**: System can rebuild broker-truth lifecycle state through `update_status()` or equivalent reconciliation after callback gaps
+- [x] **RECN-02**: After process restart, futures/options paper-live execution can recover open orders, fills, and position links without duplicate execution
+- [x] **RECN-03**: Every lifecycle state transition records an audit trail with timestamp, source, and reason
 
 ### Operator Visibility
 
@@ -57,9 +57,9 @@
 | EXEC-01 | Phase 1 | Complete |
 | EXEC-02 | Phase 1 | Complete |
 | EXEC-03 | Phase 1 | Complete |
-| RECN-01 | Phase 2 | Pending |
-| RECN-02 | Phase 2 | Pending |
-| RECN-03 | Phase 2 | Pending |
+| RECN-01 | Phase 2 | Complete |
+| RECN-02 | Phase 2 | Complete |
+| RECN-03 | Phase 2 | Complete |
 | VIEW-01 | Phase 3 | Pending |
 | VIEW-02 | Phase 3 | Pending |
 | VIEW-03 | Phase 3 | Pending |
