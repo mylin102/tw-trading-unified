@@ -19,10 +19,10 @@
 
 ### Operator Visibility
 
-- [ ] **VIEW-01**: Operator can see entry and exit orders separately from fills in dashboard lifecycle views
-- [ ] **VIEW-02**: Operator can see cost basis, realized PnL, and unrealized PnL from the same lifecycle truth
+- [x] **VIEW-01**: Operator can see entry and exit orders separately from fills in dashboard lifecycle views
+- [x] **VIEW-02**: Operator can see cost basis, realized PnL, and unrealized PnL from the same lifecycle truth
 - [ ] **VIEW-03**: Night-session orders and deals map to the correct trading day in dashboard and review surfaces
-- [ ] **VIEW-04**: Operator can see when local lifecycle state disagrees with broker state or is pending reconciliation
+- [x] **VIEW-04**: Operator can see when local lifecycle state disagrees with broker state or is pending reconciliation
 
 ### V-Model Verification
 
@@ -60,10 +60,10 @@
 | RECN-01 | Phase 2 | Complete |
 | RECN-02 | Phase 2 | Complete |
 | RECN-03 | Phase 2 | Complete |
-| VIEW-01 | Phase 3 | Pending |
-| VIEW-02 | Phase 3 | Pending |
+| VIEW-01 | Phase 3 | Complete |
+| VIEW-02 | Phase 3 | Complete |
 | VIEW-03 | Phase 3 | Pending |
-| VIEW-04 | Phase 3 | Pending |
+| VIEW-04 | Phase 3 | Complete |
 | VMDL-01 | Phase 4 | Pending |
 | VMDL-02 | Phase 4 | Pending |
 

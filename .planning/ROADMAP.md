@@ -105,7 +105,7 @@ Plans:
   2. Unsupported live theta strategies (`iron_condor`, `short_strangle`) fail fast with explicit operator/audit messaging instead of falling back to paper lifecycle rows.
   3. Broker combo lifecycle, restart recovery, and dashboard/order-export truth surfaces preserve one combo order as the broker-truth unit and visibly label non-broker fallbacks.
   4. V-model tests and runtime smoke checks prove the combo path, dashboard truth labels, and current runtime startup path remain regression-safe.
-**Plans:** 3/5 plans executed
+**Plans:** 4/5 plans executed
 
 Plans:
 - [ ] 1000-01-PLAN.md — Add combo-order adapter and lifecycle contract support for broker-truth theta spreads

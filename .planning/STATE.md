@@ -5,15 +5,15 @@ milestone_name: milestone
 current_phase: 01
 current_plan: 1
 status: verifying
-stopped_at: Completed 1000-03-PLAN.md
-last_updated: "2026-04-21T11:12:08.194Z"
+stopped_at: Completed 1000-04-PLAN.md
+last_updated: "2026-04-21T11:24:59.735Z"
 last_activity: 2026-04-21
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 11
-  completed_plans: 6
-  percent: 55
+  completed_plans: 7
+  percent: 64
 ---
 
 # Session State
@@ -62,6 +62,7 @@ Progress: [█░░░░░░░░░] 10%
 | Phase 1000 P01 | 6m | 2 tasks | 5 files |
 | Phase 1000 P02 | 922 | 2 tasks | 4 files |
 | Phase 1000 P03 | 20m | 2 tasks | 5 files |
+| Phase 1000 P04 | 7min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -81,6 +82,8 @@ Recent decisions affecting current work:
 - [Phase 1000]: Combo startup recovery now loads combo broker status before ordinary order/ledger fallback.
 - [Phase 1000]: Recovered combo fills are deduplicated by one aggregated combo identity and only mutate theta runtime after broker-confirmed fill truth.
 - [Phase 1000]: Open combo recovery rebuilds pending_theta_combo from lifecycle orders so restart never resubmits the broker order.
+- [Phase 1000]: Infer dashboard truth badges from truth_source plus ledger rebuild state instead of a global theta disclaimer.
+- [Phase 1000]: Value broker combo lifecycle rows from combo_legs metadata so spread PnL does not depend on ledger open-position matching.
 
 ### Roadmap Evolution
 
@@ -100,6 +103,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-21T11:12:08.192Z
-Stopped at: Completed 1000-03-PLAN.md
+Last session: 2026-04-21T11:24:59.732Z
+Stopped at: Completed 1000-04-PLAN.md
 Resume file: None
