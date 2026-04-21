@@ -94,3 +94,22 @@ Plans:
 
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 1000: Implement truthful live theta execution and complex-order order path
+
+**Goal:** Live ThetaGang vertical spreads submit and reconcile through truthful Shioaji combo orders so live mode cannot silently simulate paper theta fills, combo margin/cost truth matches spread reality, and operator surfaces clearly distinguish broker combo truth from paper/ledger fallbacks.
+**Requirements**: EXEC-01, EXEC-02, EXEC-03, RECN-01, RECN-02, RECN-03, VIEW-01, VIEW-02, VIEW-04, VMDL-01, VMDL-02
+**Depends on:** Phase 999
+**Success Criteria** (what must be TRUE):
+  1. Live `bull_put_spread` and `bear_call_spread` entries/exits use Shioaji combo APIs and never route through `_record_paper_order(...)`.
+  2. Unsupported live theta strategies (`iron_condor`, `short_strangle`) fail fast with explicit operator/audit messaging instead of falling back to paper lifecycle rows.
+  3. Broker combo lifecycle, restart recovery, and dashboard/order-export truth surfaces preserve one combo order as the broker-truth unit and visibly label non-broker fallbacks.
+  4. V-model tests and runtime smoke checks prove the combo path, dashboard truth labels, and current runtime startup path remain regression-safe.
+**Plans:** 5 plans
+
+Plans:
+- [ ] 1000-01-PLAN.md — Add combo-order adapter and lifecycle contract support for broker-truth theta spreads
+- [ ] 1000-02-PLAN.md — Submit truthful live theta vertical spreads and gate unsupported live theta strategies
+- [ ] 1000-03-PLAN.md — Reconcile combo fills and restart recovery from broker combo APIs before any ledger fallback
+- [ ] 1000-04-PLAN.md — Expose broker combo versus paper/ledger truth clearly in dashboard theta/order surfaces
+- [ ] 1000-05-PLAN.md — Lock the combo path with V-model regressions and startup/dashboard smoke coverage
