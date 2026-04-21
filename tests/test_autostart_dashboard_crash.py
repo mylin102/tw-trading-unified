@@ -1,8 +1,10 @@
 import ast
 from pathlib import Path
 from types import SimpleNamespace
+import pandas as pd
 
 from core.live_readiness import get_readiness_items, get_readiness_summary
+from core.dashboard_positions import describe_options_order_truth, summarize_combo_legs
 
 
 def test_get_readiness_items_handles_check_all_tuple():
@@ -100,3 +102,37 @@ def test_options_monitor_initializes_exchange_fee_per_side():
     }
 
     assert "exchange_fee_per_side" in assigned_attrs
+
+
+def test_dashboard_combo_truth_metadata_runtime_path_uses_sample_export():
+    sample_orders = pd.DataFrame(
+        [
+            {
+                "order_id": "ORD-COMBO-001",
+                "status": "filled",
+                "truth_source": "broker_combo",
+                "combo_strategy": "bull_put_spread",
+                "combo_legs": [
+                    {"action": "SELL", "side": "P", "strike": 22800},
+                    {"action": "BUY", "side": "P", "strike": 22600},
+                ],
+            }
+        ]
+    )
+
+    truth_results = sample_orders.apply(
+        lambda row: describe_options_order_truth(row, orders_rebuilt_from_ledger=False),
+        axis=1,
+    )
+    sample_orders["truth_source"] = truth_results.apply(lambda result: result["truth_source"])
+    sample_orders["真實來源"] = truth_results.apply(lambda result: result["badge"])
+    sample_orders["組合腿摘要"] = sample_orders["combo_legs"].apply(summarize_combo_legs)
+
+    src = Path("ui/dashboard.py").read_text()
+
+    assert sample_orders.loc[0, "truth_source"] == "broker_combo"
+    assert sample_orders.loc[0, "真實來源"] == "✅ broker_combo"
+    assert sample_orders.loc[0, "組合腿摘要"] == "SELL P22800 | BUY P22600"
+    assert "describe_options_order_truth" in src
+    assert "summarize_combo_legs" in src
+    assert "broker_combo 為券商複式單真實來源" in src

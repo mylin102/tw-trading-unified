@@ -568,6 +568,45 @@ def test_combo_recovered_fill_is_applied_once_without_resubmit():
     assert monitor.broker.place_comboorder.call_count == 0
 
 
+def test_combo_startup_partial_recovery_stays_pending_without_theta_fill():
+    monitor = _build_live_combo_monitor()
+    monitor.broker = SimpleNamespace(
+        list_combo_status_trades=lambda account=None: [
+            SimpleNamespace(
+                id="BROKER-COMBO-STARTUP-002",
+                seqno="SEQ-COMBO-STARTUP-002",
+                ordno="ORDNO-COMBO-STARTUP-002",
+                action="Sell",
+                quantity=2,
+                strategy="bull_put_spread",
+                price=50.0,
+                status=SimpleNamespace(
+                    status="PartFilled",
+                    quantity=2,
+                    price=50.0,
+                    deals={
+                        "TXO22800P": [{"seq": "LEG1-START", "ordno": "ORDNO-COMBO-STARTUP-002", "quantity": 1, "price": 50.0}],
+                        "TXO22600P": [{"seq": "LEG2-START", "ordno": "ORDNO-COMBO-STARTUP-002", "quantity": 1, "price": 50.0}],
+                    },
+                ),
+            )
+        ],
+        list_open_orders=lambda account=None: [],
+        list_trades=lambda account=None: [],
+    )
+
+    recovered = monitor._recover_live_orders_from_broker()
+    order = monitor.order_mgr.get_pending()[0]
+
+    assert recovered == {"filled": 0, "open": 1, "failed": 0}
+    assert order.status == OrderStatus.PARTIAL_FILLED
+    assert order.truth_source == "broker_combo"
+    assert order.filled_quantity == 1
+    assert monitor.pending_theta_combo["order_id"] == order.order_id
+    assert monitor.position == 0
+    assert monitor._theta_gang.position is None
+
+
 def test_options_paper_exit_records_mock_deal_before_position_zero():
     monitor = _build_options_monitor()
     monitor.enter_paper_position("C", {"side": "C", "score": 1.5, "timestamp": datetime.datetime(2026, 4, 20, 21, 5), "price_mtx": 23010})

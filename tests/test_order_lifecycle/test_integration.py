@@ -7,11 +7,23 @@ and restart recovery.
 import pytest
 import json
 from datetime import datetime
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
 from core.order_management.order_manager import OrderManager
 from core.order_management.paper_fill import PaperFillSimulator
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+OPTIONS_ROOT = PROJECT_ROOT / "strategies" / "options"
+OPTIONS_SRC = OPTIONS_ROOT / "src"
+for path in (str(OPTIONS_ROOT), str(OPTIONS_SRC)):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from strategies.options import live_options_squeeze_monitor as options_module
 
 
 # ── L2-IT-01: OrderManager + PaperTrader Integration ──
@@ -231,3 +243,48 @@ class TestExportFormat:
         parsed = json.loads(j)
         assert parsed["status"] == "filled"
         assert parsed["avg_fill_price"] == 36510
+
+
+class TestComboStartupRecovery:
+    def test_combo_startup_recovery_checks_broker_before_ledger_fallback(self):
+        monitor = options_module.ShioajiOptionsSmartMonitor.__new__(options_module.ShioajiOptionsSmartMonitor)
+        monitor.live_trading = True
+        calls = []
+        monitor._recover_live_orders_from_broker = lambda: calls.append("broker") or {"filled": 0, "open": 0, "failed": 0}
+        monitor._recover_orders_from_ledger = lambda: calls.append("ledger")
+
+        recovered = monitor._startup_recover_live_order_state()
+
+        assert recovered == {"filled": 0, "open": 0, "failed": 0}
+        assert calls == ["broker", "ledger"]
+
+    def test_combo_startup_recovery_restores_pending_combo_without_paper_fallback(self):
+        monitor = _build_live_combo_monitor()
+        monitor._recover_orders_from_ledger = MagicMock()
+        monitor.broker = SimpleNamespace(
+            list_combo_status_trades=lambda account=None: [
+                SimpleNamespace(
+                    id="BROKER-COMBO-START-001",
+                    seqno="SEQ-COMBO-START-001",
+                    ordno="ORDNO-COMBO-START-001",
+                    action="Sell",
+                    quantity=2,
+                    strategy="bull_put_spread",
+                    price=48.0,
+                    status=SimpleNamespace(status="Submitted", quantity=2, price=48.0, deals={}),
+                )
+            ],
+            list_open_orders=lambda account=None: [],
+            list_trades=lambda account=None: [],
+        )
+
+        recovered = monitor._startup_recover_live_order_state()
+        pending_order = monitor.order_mgr.get_pending()[0]
+
+        assert recovered == {"filled": 0, "open": 1, "failed": 0}
+        assert monitor._recover_orders_from_ledger.call_count == 0
+        assert pending_order.symbol == "TXO-COMBO"
+        assert pending_order.truth_source == "broker_combo"
+        assert monitor.pending_theta_combo["phase"] == "entry"
+        assert monitor.pending_theta_combo["order_id"] == pending_order.order_id
+        assert monitor.position == 0
