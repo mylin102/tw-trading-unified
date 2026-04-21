@@ -26,8 +26,8 @@
 
 ### V-Model Verification
 
-- [ ] **VMDL-01**: Regression tests cover partial fill, cancel/reject, restart recovery, and trading-day mapping across futures/options lifecycle flows
-- [ ] **VMDL-02**: Milestone verification proves lifecycle refactor does not break current `main.py` orchestration or the 8500 dashboard's core runtime path
+- [x] **VMDL-01**: Regression tests cover partial fill, cancel/reject, restart recovery, and trading-day mapping across futures/options lifecycle flows
+- [x] **VMDL-02**: Milestone verification proves lifecycle refactor does not break current `main.py` orchestration or the 8500 dashboard's core runtime path
 
 ## v2 Requirements
 
@@ -64,8 +64,8 @@
 | VIEW-02 | Phase 3 | Complete |
 | VIEW-03 | Phase 3 | Pending |
 | VIEW-04 | Phase 3 | Complete |
-| VMDL-01 | Phase 4 | Pending |
-| VMDL-02 | Phase 4 | Pending |
+| VMDL-01 | Phase 4 | Complete |
+| VMDL-02 | Phase 4 | Complete |
 
 **Coverage:**
 - v1 requirements: 12 total
