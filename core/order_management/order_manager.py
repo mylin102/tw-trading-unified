@@ -65,6 +65,112 @@ class OrderManager:
         """連結 PaperFillSimulator，用於 cancel/reject 時同步移除"""
         self._simulator = sim
 
+    @staticmethod
+    def _status_value(status) -> Optional[str]:
+        if status is None:
+            return None
+        if isinstance(status, OrderStatus):
+            return status.value
+        return str(getattr(status, "value", status))
+
+    @staticmethod
+    def _payload_to_dict(payload) -> Optional[Dict[str, Any]]:
+        def serialize(value):
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            if isinstance(value, datetime):
+                return value.isoformat()
+            if isinstance(value, dict):
+                return {key: serialize(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple, set)):
+                return [serialize(item) for item in value]
+            if hasattr(value, "value") and isinstance(getattr(value, "value"), (str, int, float, bool)):
+                return value.value
+            if hasattr(value, "__dict__"):
+                return {
+                    key: serialize(item)
+                    for key, item in vars(value).items()
+                    if not key.startswith("_")
+                }
+            return str(value)
+
+        if payload is None:
+            return None
+        if isinstance(payload, dict):
+            return serialize(payload)
+        if hasattr(payload, "__dict__"):
+            return serialize(payload)
+        return {"value": serialize(payload)}
+
+    @staticmethod
+    def _extract_value(payload, *keys):
+        for key in keys:
+            if isinstance(payload, dict) and payload.get(key) is not None:
+                return payload[key]
+            value = getattr(payload, key, None)
+            if value is not None:
+                return value
+        return None
+
+    def _record_audit(
+        self,
+        order: Order,
+        event_type: str,
+        *,
+        source: str = "",
+        reason: str = "",
+        from_status=None,
+        to_status=None,
+        raw_status=None,
+        payload=None,
+        broker_order_id: Optional[str] = None,
+        seqno: Optional[str] = None,
+        ordno: Optional[str] = None,
+        deal_id: Optional[str] = None,
+        fill_price: Optional[float] = None,
+        fill_qty: int = 0,
+    ) -> Dict[str, Any]:
+        entry = {
+            "type": event_type,
+            "timestamp": datetime.now().isoformat(),
+            "source": source or "local",
+            "reason": reason,
+            "from_status": self._status_value(from_status),
+            "to_status": self._status_value(to_status or order.status),
+            "raw_status": self._status_value(raw_status),
+            "broker_order_id": broker_order_id or order.broker_order_id or order.exchange_order_id,
+            "seqno": seqno or order.seqno,
+            "ordno": ordno or order.ordno or order.exchange_order_id,
+            "deal_id": deal_id,
+            "fill_price": fill_price,
+            "fill_qty": fill_qty,
+        }
+        payload_dict = self._payload_to_dict(payload)
+        if payload_dict is not None:
+            entry["payload"] = payload_dict
+        order.raw_events.append(entry)
+        return entry
+
+    def _has_fill_identity(
+        self,
+        order: Order,
+        *,
+        deal_id: Optional[str] = None,
+        broker_trade_id: Optional[str] = None,
+        exchange_fill_id: Optional[str] = None,
+        exchange_seq: Optional[str] = None,
+    ) -> bool:
+        for fill in order.fills:
+            if deal_id and fill.deal_id == deal_id:
+                return True
+            if broker_trade_id and fill.broker_trade_id == broker_trade_id:
+                return True
+            if exchange_fill_id and fill.exchange_fill_id == exchange_fill_id:
+                return True
+            if exchange_seq and fill.exchange_seq == exchange_seq:
+                return True
+        return False
+
     # ── Create ──
 
     def create_order(
@@ -78,6 +184,9 @@ class OrderManager:
         strategy: str = "",
         account: str = "",
         comment: str = "",
+        truth_source: str = "",
+        combo_legs: Optional[List[Dict[str, Any]]] = None,
+        combo_strategy: str = "",
     ) -> Order:
         """建立新委託單，狀態→ PENDING_SUBMIT"""
         order_id = f"ORD-{self._next_id:06d}"
@@ -94,6 +203,9 @@ class OrderManager:
             account=account,
             comment=comment,
             order_id=order_id,
+            truth_source=truth_source,
+            combo_legs=combo_legs,
+            combo_strategy=combo_strategy,
         )
         self.active_orders[order_id] = order
         return order
@@ -103,6 +215,7 @@ class OrderManager:
         order_id: Optional[str] = None,
         *,
         broker_order_id: Optional[str] = None,
+        seqno: Optional[str] = None,
         ordno: Optional[str] = None,
     ) -> Optional[Order]:
         if order_id:
@@ -115,6 +228,8 @@ class OrderManager:
 
         for candidate in list(self.active_orders.values()) + self.completed:
             if broker_order_id and candidate.broker_order_id == broker_order_id:
+                return candidate
+            if seqno and candidate.seqno == seqno:
                 return candidate
             if ordno and candidate.ordno == ordno:
                 return candidate
@@ -162,11 +277,14 @@ class OrderManager:
         seqno: Optional[str] = None,
         ordno: Optional[str] = None,
         raw_status=None,
+        source: str = "",
+        reason: str = "",
     ) -> Order:
         order = self._resolve_order(order_id)
         if order is None:
             raise KeyError(f"Order {order_id} not found")
 
+        previous_status = order.status
         broker_order_id = (
             broker_order_id
             or getattr(broker_trade, "id", None)
@@ -194,14 +312,19 @@ class OrderManager:
             order.submitted_at = order.submitted_at or datetime.now()
             order.updated_at = datetime.now()
 
-        order.raw_events.append({
-            "type": "submission",
-            "raw_status": getattr(raw_status, "value", raw_status),
-            "broker_order_id": broker_order_id,
-            "seqno": seqno,
-            "ordno": ordno,
-            "timestamp": datetime.now().isoformat(),
-        })
+        self._record_audit(
+            order,
+            "submission",
+            source=source or "submission",
+            reason=reason,
+            from_status=previous_status,
+            to_status=order.status,
+            raw_status=raw_status,
+            payload=broker_trade,
+            broker_order_id=broker_order_id,
+            seqno=seqno,
+            ordno=ordno,
+        )
         self._emit("on_status_change", OrderEvent(
             order_id=order.order_id,
             status=order.status,
@@ -225,8 +348,9 @@ class OrderManager:
         broker_order_id: Optional[str] = None,
         seqno: Optional[str] = None,
         ordno: Optional[str] = None,
+        source: str = "",
     ) -> Optional[Order]:
-        order = self._resolve_order(order_id, broker_order_id=broker_order_id, ordno=ordno)
+        order = self._resolve_order(order_id, broker_order_id=broker_order_id, seqno=seqno, ordno=ordno)
         if order is None:
             return None
 
@@ -234,16 +358,23 @@ class OrderManager:
         if normalized is None:
             return order
 
+        previous_status = order.status
         order.broker_order_id = broker_order_id or order.broker_order_id or order.exchange_order_id
         order.seqno = seqno or order.seqno
         order.ordno = ordno or order.ordno or order.exchange_order_id
-        if raw_payload is not None:
-            order.raw_events.append({
-                "type": "order_update",
-                "raw_status": getattr(raw_status, "value", raw_status),
-                "payload": raw_payload,
-                "timestamp": datetime.now().isoformat(),
-            })
+        self._record_audit(
+            order,
+            "order_update",
+            source=source or "order_update",
+            reason=reason,
+            from_status=previous_status,
+            to_status=normalized,
+            raw_status=raw_status,
+            payload=raw_payload,
+            broker_order_id=order.broker_order_id,
+            seqno=order.seqno,
+            ordno=order.ordno,
+        )
 
         if normalized in (OrderStatus.PENDING_SUBMIT, OrderStatus.PRE_SUBMITTED, OrderStatus.SUBMITTED):
             order.status = normalized
@@ -283,17 +414,17 @@ class OrderManager:
 
         if normalized == OrderStatus.CANCELLED:
             if order.order_id in self.active_orders:
-                self.cancel(order.order_id, reason=reason)
+                self.cancel(order.order_id, reason=reason, source=source or "order_update")
             return order
 
         if normalized == OrderStatus.REJECTED:
             if order.order_id in self.active_orders:
-                self.reject(order.order_id, reason=reason or "rejected")
+                self.reject(order.order_id, reason=reason or "rejected", source=source or "order_update")
             return order
 
         if normalized == OrderStatus.EXPIRED:
             if order.order_id in self.active_orders:
-                self.expire(order.order_id)
+                self.expire(order.order_id, source=source or "order_update", reason=reason)
             return order
 
         return order
@@ -336,6 +467,8 @@ class OrderManager:
             seqno=getattr(result, "seqno", None),
             ordno=getattr(result, "ordno", None),
             raw_status="Submitted",
+            source="broker_submit",
+            reason="submit_live",
         )
         return True
 
@@ -345,6 +478,8 @@ class OrderManager:
             broker_order_id=exchange_ordno or f"PAPER-{order.order_id}",
             ordno=exchange_ordno or f"PAPER-{order.order_id}",
             raw_status="Submitted",
+            source="paper_submit",
+            reason="submit_paper",
         )
         return True
 
@@ -366,6 +501,8 @@ class OrderManager:
         raw_payload: Optional[Dict[str, Any]] = None,
         broker_order_id: Optional[str] = None,
         ordno: Optional[str] = None,
+        source: str = "",
+        reason: str = "",
     ) -> Optional[Order]:
         order = self._resolve_order(order_id, broker_order_id=broker_order_id, ordno=ordno)
         if order is None:
@@ -377,6 +514,7 @@ class OrderManager:
         if fill_qty <= 0:
             raise ValueError("Fill quantity must be positive")
 
+        previous_status = order.status
         order.fill(
             fill_price,
             fill_qty,
@@ -388,12 +526,21 @@ class OrderManager:
             exchange_seq=exchange_seq,
             fill_time=fill_time,
         )
-        if raw_payload is not None:
-            order.raw_events.append({
-                "type": "deal_fill",
-                "payload": raw_payload,
-                "timestamp": datetime.now().isoformat(),
-            })
+        self._record_audit(
+            order,
+            "deal_fill",
+            source=source or "deal_fill",
+            reason=reason,
+            from_status=previous_status,
+            to_status=order.status,
+            payload=raw_payload,
+            broker_order_id=broker_order_id or order.broker_order_id,
+            seqno=order.seqno,
+            ordno=ordno or order.ordno,
+            deal_id=deal_id or broker_trade_id or exchange_fill_id or exchange_seq,
+            fill_price=fill_price,
+            fill_qty=fill_qty,
+        )
 
         if order.status == OrderStatus.FILLED:
             if order.order_id in self.active_orders:
@@ -448,7 +595,7 @@ class OrderManager:
 
     # ── Cancel (🛑 Gate) ──
 
-    def cancel(self, order_id: str, reason: str = "") -> bool:
+    def cancel(self, order_id: str, reason: str = "", source: str = "") -> bool:
         """
         取消委託單。
         🛑 只允許 SUBMITTED / PARTIAL_FILLED / PENDING_SUBMIT / PRE_SUBMITTED
@@ -476,6 +623,7 @@ class OrderManager:
                 if self.broker_adapter:
                     self.broker_adapter.cancel_order(order.exchange_order_id)
 
+        previous_status = order.status
         order.cancel(reason=reason)
         if order_id in self.active_orders:
             self.completed.append(order)
@@ -485,6 +633,14 @@ class OrderManager:
         if self._simulator:
             self._simulator.remove(order_id)
 
+        self._record_audit(
+            order,
+            "cancel",
+            source=source or "cancel",
+            reason=reason,
+            from_status=previous_status,
+            to_status=order.status,
+        )
         self._emit("on_cancel", OrderEvent(
             order_id=order_id, status=OrderStatus.CANCELLED,
             symbol=order.symbol, side=order.side, reason=reason,
@@ -493,7 +649,7 @@ class OrderManager:
 
     # ── Reject ──
 
-    def reject(self, order_id: str, reason: str) -> None:
+    def reject(self, order_id: str, reason: str, source: str = "") -> None:
         order = self.active_orders.get(order_id)
         if order is None:
             for c in self.completed:
@@ -505,9 +661,18 @@ class OrderManager:
                             OrderStatus.REJECTED, OrderStatus.EXPIRED):
             raise ValueError(f"Cannot reject order {order_id}: status={order.status.value} (terminal)")
 
+        previous_status = order.status
         order.reject(reason=reason)
         self.completed.append(order)
         del self.active_orders[order_id]
+        self._record_audit(
+            order,
+            "reject",
+            source=source or "reject",
+            reason=reason,
+            from_status=previous_status,
+            to_status=order.status,
+        )
 
         self._emit("on_reject", OrderEvent(
             order_id=order_id, status=OrderStatus.REJECTED,
@@ -516,14 +681,23 @@ class OrderManager:
 
     # ── Expire ──
 
-    def expire(self, order_id: str) -> None:
+    def expire(self, order_id: str, source: str = "", reason: str = "") -> None:
         order = self.active_orders.get(order_id)
         if order is None:
             raise KeyError(f"Order {order_id} not found")
 
+        previous_status = order.status
         order.expire()
         self.completed.append(order)
         del self.active_orders[order_id]
+        self._record_audit(
+            order,
+            "expire",
+            source=source or "expire",
+            reason=reason,
+            from_status=previous_status,
+            to_status=order.status,
+        )
 
         self._emit("on_expire", OrderEvent(
             order_id=order_id, status=OrderStatus.EXPIRED,
@@ -532,10 +706,171 @@ class OrderManager:
 
     # ── Recovery (重啟恢復) ──
 
+    def restore_orders(self, serialized_orders: Optional[list]) -> Dict[str, int]:
+        restored = {"active": 0, "completed": 0, "failed": 0}
+        if not serialized_orders:
+            return restored
+
+        for item in serialized_orders:
+            try:
+                order = item if isinstance(item, Order) else Order.from_dict(item)
+            except Exception:
+                restored["failed"] += 1
+                continue
+
+            self.active_orders.pop(order.order_id, None)
+            self.completed = [existing for existing in self.completed if existing.order_id != order.order_id]
+            if order.is_completed():
+                self.completed.append(order)
+                restored["completed"] += 1
+            else:
+                self.active_orders[order.order_id] = order
+                restored["active"] += 1
+
+        self.reindex_orders()
+        return restored
+
+    def reindex_orders(self) -> Dict[str, int]:
+        max_order_index = 0
+        for order in list(self.active_orders.values()) + self.completed:
+            if order.order_id.startswith("ORD-"):
+                suffix = order.order_id.split("ORD-", 1)[1]
+                if suffix.isdigit():
+                    max_order_index = max(max_order_index, int(suffix))
+        self._next_id = max(self._next_id, max_order_index + 1)
+        return {"active": len(self.active_orders), "completed": len(self.completed)}
+
+    def reconcile_trade_snapshot(
+        self,
+        order_id: Optional[str] = None,
+        *,
+        trade=None,
+        broker_order_id: Optional[str] = None,
+        ordno: Optional[str] = None,
+        source: str = "",
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        broker_order_id = broker_order_id or self._extract_value(trade, "id", "broker_order_id", "exchange_order_id")
+        ordno = ordno or self._extract_value(trade, "ordno", "exchange_order_id")
+        seqno = self._extract_value(trade, "seqno")
+        order = self._resolve_order(order_id, broker_order_id=broker_order_id, seqno=seqno, ordno=ordno)
+        if order is None:
+            return {
+                "matched": False,
+                "action": "unmatched_snapshot",
+                "order_id": None,
+                "fills_added": 0,
+            }
+
+        raw_status = self._extract_value(getattr(trade, "status", None), "status") or self._extract_value(trade, "status")
+        normalized_status = self._normalize_raw_status(raw_status)
+        deals = self._extract_value(getattr(trade, "status", None), "deals") or self._extract_value(trade, "deals") or []
+        if broker_order_id or ordno or seqno:
+            self.attach_submission(
+                order.order_id,
+                broker_trade=trade,
+                broker_order_id=broker_order_id,
+                seqno=seqno,
+                ordno=ordno,
+                raw_status="Submitted",
+                source=source or "reconcile",
+                reason=reason,
+            )
+
+        if raw_status is not None and not (normalized_status == OrderStatus.FILLED and deals):
+            self.apply_order_update(
+                order.order_id,
+                raw_status=raw_status,
+                reason=reason,
+                raw_payload=self._payload_to_dict(trade),
+                broker_order_id=broker_order_id,
+                seqno=seqno,
+                ordno=ordno,
+                source=source or "reconcile",
+            )
+
+        fills_added = 0
+        for deal in deals:
+            deal_id = self._extract_value(deal, "deal_id", "trade_id", "fill_id")
+            broker_trade_id = self._extract_value(deal, "broker_trade_id", "trade_id")
+            exchange_fill_id = self._extract_value(deal, "exchange_fill_id", "fill_id")
+            exchange_seq = self._extract_value(deal, "exchange_seq")
+            if self._has_fill_identity(
+                order,
+                deal_id=deal_id,
+                broker_trade_id=broker_trade_id,
+                exchange_fill_id=exchange_fill_id,
+                exchange_seq=exchange_seq,
+            ):
+                continue
+
+            fill_price = float(self._extract_value(deal, "price", "avg_price") or 0)
+            fill_qty = int(self._extract_value(deal, "quantity", "qty") or 0)
+            if fill_qty <= 0:
+                continue
+
+            self.apply_deal_fill(
+                order.order_id,
+                deal_id=deal_id,
+                fill_price=fill_price,
+                fill_qty=fill_qty,
+                exchange_fill_id=exchange_fill_id,
+                broker_trade_id=broker_trade_id,
+                exchange_seq=exchange_seq,
+                raw_payload=self._payload_to_dict(deal),
+                broker_order_id=broker_order_id,
+                ordno=ordno or self._extract_value(deal, "ordno"),
+                source=source or "reconcile",
+                reason=reason,
+            )
+            fills_added += 1
+
+        self._record_audit(
+            order,
+            "reconcile",
+            source=source or "reconcile",
+            reason=reason,
+            to_status=order.status,
+            raw_status=raw_status,
+            payload=trade,
+            broker_order_id=broker_order_id,
+            seqno=seqno,
+            ordno=ordno,
+        )
+        return {
+            "matched": True,
+            "action": "reconciled",
+            "order_id": order.order_id,
+            "fills_added": fills_added,
+        }
+
+    def reconcile_broker_state(
+        self,
+        open_orders: Optional[list] = None,
+        filled_trades: Optional[list] = None,
+        source: str = "",
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        reconciled = []
+        unmatched = []
+        for trade in (open_orders or []) + (filled_trades or []):
+            result = self.reconcile_trade_snapshot(
+                trade=trade,
+                source=source,
+                reason=reason,
+            )
+            if result["matched"]:
+                reconciled.append(result)
+            else:
+                unmatched.append(result)
+        return {"reconciled": reconciled, "unmatched": unmatched}
+
     def recover_from_api(
         self,
         filled_trades: Optional[list] = None,
         open_orders: Optional[list] = None,
+        source: str = "",
+        reason: str = "",
     ) -> Dict[str, Any]:
         """
         重啟後從 API 重建訂單狀態表。
@@ -560,9 +895,21 @@ class OrderManager:
                 )
                 order.status = OrderStatus.FILLED
                 order.exchange_order_id = ordno
+                order.broker_order_id = ordno
+                order.ordno = ordno
                 order.filled_quantity = getattr(trade, "quantity", 0)
                 order.avg_fill_price = getattr(trade, "price", 0)
                 order.filled_at = datetime.now()
+                self._record_audit(
+                    order,
+                    "recovery",
+                    source=source or "api_recovery",
+                    reason=reason or "recover_from_api",
+                    to_status=order.status,
+                    payload=trade,
+                    broker_order_id=order.broker_order_id,
+                    ordno=order.ordno,
+                )
                 self.completed.append(order)
                 recovered["filled"] += 1
 
@@ -583,10 +930,23 @@ class OrderManager:
                 )
                 order.status = OrderStatus.SUBMITTED
                 order.exchange_order_id = ordno
+                order.broker_order_id = ordno
+                order.ordno = ordno
                 order.submitted_at = datetime.now()
+                self._record_audit(
+                    order,
+                    "recovery",
+                    source=source or "api_recovery",
+                    reason=reason or "recover_from_api",
+                    to_status=order.status,
+                    payload=oo,
+                    broker_order_id=order.broker_order_id,
+                    ordno=order.ordno,
+                )
                 self.active_orders[order.order_id] = order
                 recovered["open"] += 1
 
+        self.reindex_orders()
         return recovered
 
     # ── Query ──

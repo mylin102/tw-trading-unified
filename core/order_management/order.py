@@ -55,6 +55,9 @@ class Order:
         order_id: Optional[str] = None,
         intent_id: Optional[str] = None,
         parent_order_id: Optional[str] = None,
+        truth_source: str = "",
+        combo_legs: Optional[List[Dict[str, Any]]] = None,
+        combo_strategy: str = "",
     ):
         """
         初始化委託單
@@ -85,6 +88,9 @@ class Order:
         self.account = account
         self.comment = comment
         self.parent_order_id = parent_order_id
+        self.truth_source = truth_source
+        self.combo_legs = [dict(leg) if isinstance(leg, dict) else leg for leg in (combo_legs or [])]
+        self.combo_strategy = combo_strategy
         
         # 狀態追蹤
         self.status = OrderStatus.PENDING_SUBMIT
@@ -287,6 +293,9 @@ class Order:
             "strategy": self.strategy,
             "account": self.account,
             "comment": self.comment,
+            "truth_source": self.truth_source,
+            "combo_legs": self.combo_legs,
+            "combo_strategy": self.combo_strategy,
             "commission": self.commission,
             "tax": self.tax,
             "total_fee": self.total_fee,
@@ -331,6 +340,9 @@ class Order:
             order_id=data["order_id"],
             intent_id=data.get("intent_id"),
             parent_order_id=data.get("parent_order_id"),
+            truth_source=data.get("truth_source", ""),
+            combo_legs=data.get("combo_legs", []),
+            combo_strategy=data.get("combo_strategy", ""),
         )
         
         # 恢復狀態

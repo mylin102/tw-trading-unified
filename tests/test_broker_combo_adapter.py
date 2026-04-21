@@ -46,7 +46,9 @@ def test_place_combo_entry_order_builds_two_leg_combo():
     with patch("strategies.options.options_engine.engine.broker_adapter.sj.contracts.ComboBase") as combo_base_cls, \
          patch("strategies.options.options_engine.engine.broker_adapter.sj.contracts.ComboContract") as combo_contract_cls, \
          patch("strategies.options.options_engine.engine.broker_adapter.sj.order.ComboOrder") as combo_order_cls:
-        combo_base_cls.side_effect = [SimpleNamespace(code="LEG-1"), SimpleNamespace(code="LEG-2")]
+        leg_one = SimpleNamespace(code="LEG-1")
+        leg_two = SimpleNamespace(code="LEG-2")
+        combo_base_cls.side_effect = [leg_one, leg_two]
         combo_contract = SimpleNamespace(legs=["LEG-1", "LEG-2"])
         combo_order = SimpleNamespace(id="combo-order")
         combo_contract_cls.return_value = combo_contract
@@ -61,7 +63,7 @@ def test_place_combo_entry_order_builds_two_leg_combo():
 
     assert trade is combo_trade
     assert combo_base_cls.call_count == 2
-    combo_contract_cls.assert_called_once_with(legs=[combo_base_cls.side_effect[0], combo_base_cls.side_effect[1]])
+    combo_contract_cls.assert_called_once_with(legs=[leg_one, leg_two])
     combo_order_cls.assert_called_once()
     api.place_comboorder.assert_called_once_with(combo_contract, combo_order)
     api.place_order.assert_not_called()
