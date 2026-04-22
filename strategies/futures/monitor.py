@@ -5,12 +5,13 @@ Accepts an injected Shioaji API instance (no internal login).
 import sys
 import os
 import time
+import math
 import yaml
 import traceback
 from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import pandas as pd
 from rich.console import Console
 
@@ -27,6 +28,8 @@ from squeeze_futures.data.data_storage import save_trade
 from core.strategy_registry import StrategyRegistry
 from core.strategy_context import StrategyContext, PositionView, MarketData
 from core.signal import Signal
+from core.futures_bar_regime import classify_futures_bar_regime
+from core.futures_strategy_router import route_futures_signal
 
 # Old imports for backward compatibility (fallback)
 from squeeze_futures.data.shioaji_client import ShioajiClient
@@ -136,6 +139,8 @@ class FuturesMonitor:
         self.last_processed_bar = None
         self._last_exit_bar = None  # 防止同根 K bar exit 後再進場
         self._last_entry_reason = None
+        self.active_strategy_name = None
+        self._initialized_strategy_names = set()
         self._safety_stop_trade = None  # Exchange-side safety stop order
         self._pending_lifecycle_orders: Dict[str, Dict[str, Any]] = {}
         self._applied_lifecycle_deals = set()
@@ -178,6 +183,12 @@ class FuturesMonitor:
         self.counter_confirm_bars = self.COUNTER.get("confirm_bars", 5)
         self.counter_atr_sl_mult = self.COUNTER.get("atr_sl_mult", 1.0)
         self.counter_exit_vwap = self.COUNTER.get("exit_on_vwap", True)
+        self.trend_hold_enabled = self.RISK.get("trend_hold_enabled", True)
+        self.trend_hold_atr_mult = self.RISK.get("trend_hold_atr_mult", 2.5)
+        self.trend_hold_min_score = self.RISK.get("trend_hold_min_score", 40)
+        self.trend_hold_min_trend_strength = self.RISK.get("trend_hold_min_trend_strength", 0.001)
+        self.trend_hold_min_price_vs_vwap = self.RISK.get("trend_hold_min_price_vs_vwap", 0.0003)
+        self.trend_hold_min_time_to_close_mins = self.RISK.get("trend_hold_min_time_to_close_mins", 20)
 
         # Update Order Lifecycle settings if needed
         self._use_order_manager = self.MONITOR.get("use_order_manager", False)
@@ -231,6 +242,68 @@ class FuturesMonitor:
                 console.print(f"[cyan]🔄 Config hot-reloaded from {self.config_path}[/cyan]")
             except Exception as e:
                 console.print(f"[red]❌ Failed to reload config: {e}[/red]")
+
+    def _is_trend_follow_entry(self, reason: Optional[str] = None) -> bool:
+        reason = reason or self._last_entry_reason or ""
+        return (
+            reason.startswith("ADAPTIVE_TREND_V3")
+            or reason.startswith("AI_ORB_V3_")
+            or reason.startswith("ORB_UP_BREAKOUT")
+            or reason.startswith("ORB_DOWN_BREAKOUT")
+            or reason.startswith("LR_ACCEL_")
+        )
+
+    def _trend_hold_active(self, last_5m, last_price: float, score: float, vwap: float, time_to_close: float) -> bool:
+        if not self.trend_hold_enabled or self.trader.position == 0:
+            return False
+        if not self._is_trend_follow_entry():
+            return False
+        if time_to_close <= self.trend_hold_min_time_to_close_mins:
+            return False
+        if abs(score) < self.trend_hold_min_score:
+            return False
+
+        trend_strength = float(last_5m.get("trend_strength_raw", 0.0))
+        price_vs_vwap = float(last_5m.get("price_vs_vwap", 0.0))
+        if price_vs_vwap == 0.0 and vwap:
+            price_vs_vwap = (last_price - vwap) / vwap
+
+        if self.trader.position > 0:
+            bullish_align = bool(last_5m.get("bullish_align", last_5m.get("bull_align", False)))
+            momentum_ok = float(last_5m.get("momentum", 0.0)) >= 0
+            return (
+                bullish_align
+                and momentum_ok
+                and trend_strength >= self.trend_hold_min_trend_strength
+                and price_vs_vwap >= self.trend_hold_min_price_vs_vwap
+            )
+
+        bearish_align = bool(last_5m.get("bearish_align", last_5m.get("bear_align", False)))
+        momentum_ok = float(last_5m.get("momentum", 0.0)) <= 0
+        return (
+            bearish_align
+            and momentum_ok
+            and trend_strength <= -self.trend_hold_min_trend_strength
+            and price_vs_vwap <= -self.trend_hold_min_price_vs_vwap
+        )
+
+    def _apply_trend_hold_trail(self, last_price: float, last_5m, timestamp):
+        atr_val = float(last_5m.get("atr", 50) or 50)
+        if self.trader.position > 0:
+            self._atr_trail_peak = max(self._atr_trail_peak, last_price)
+            trail_floor = self._atr_trail_peak - atr_val * self.trend_hold_atr_mult
+            if last_price <= trail_floor:
+                return self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason="TREND_HOLD_TRAIL")
+
+        elif self.trader.position < 0:
+            if self._atr_trail_peak == 0:
+                self._atr_trail_peak = last_price
+            self._atr_trail_peak = min(self._atr_trail_peak, last_price)
+            trail_ceil = self._atr_trail_peak + atr_val * self.trend_hold_atr_mult
+            if last_price >= trail_ceil:
+                return self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason="TREND_HOLD_TRAIL")
+
+        return None
 
     def _load_config(self, path):
         with open(path, encoding="utf-8") as f:
@@ -312,8 +385,9 @@ class FuturesMonitor:
                 config=self.cfg,
                 bar_counter=0,
             )
-            strategy.init(dummy_ctx)
+            self._ensure_strategy_initialized(active_name, strategy, dummy_ctx)
             self._active_strategy_name = active_name
+            self.active_strategy_name = active_name
             console.print(f"[green]🔧 Pre-initialized strategy: {active_name}[/green]")
 
         # Tick-based bar builder (Initialize always to avoid AttributeError in dry_run)
@@ -559,10 +633,12 @@ class FuturesMonitor:
         try:
             if hasattr(self, "feed_health") and self.feed_health is not None:
                 age = self.feed_health.age("TMF")
-                if age is not None:
+                if age is not None and math.isfinite(float(age)):
                     return max(0.0, float(age))
         except Exception:
             pass
+        # feed_health can report inf before the first real TMF tick arrives after startup.
+        # Fall back to the local TMF timer so watchdog logic keeps its intended grace window.
         last_real_tick = getattr(self, "_last_real_tmf_tick_at", self.last_tick_at)
         return max(0.0, time.time() - last_real_tick)
 
@@ -1609,6 +1685,125 @@ class FuturesMonitor:
             "note": note,
         }, ticker="TMF")
 
+    def _ensure_strategy_initialized(self, strategy_name, strategy, ctx):
+        """Initialize a strategy instance once before the router calls it."""
+        if not hasattr(self, "_initialized_strategy_names"):
+            self._initialized_strategy_names = set()
+        if strategy_name in self._initialized_strategy_names:
+            return
+        strategy.init(ctx)
+        self._initialized_strategy_names.add(strategy_name)
+
+    def _has_active_working_order(self):
+        if not getattr(self, "_use_order_manager", False) or self.order_mgr is None:
+            return False
+        try:
+            return any(order.symbol == self.ticker for order in self.order_mgr.get_pending())
+        except Exception:
+            return False
+
+    def _get_symbol_pending_orders(self):
+        if not getattr(self, "_use_order_manager", False) or self.order_mgr is None:
+            return []
+        try:
+            return [order for order in self.order_mgr.get_pending() if order.symbol == self.ticker]
+        except Exception:
+            return []
+
+    def _has_pending_flattening_order(self, pending_orders=None):
+        pending_orders = pending_orders or []
+        active_order_ids = {
+            getattr(order, "order_id", None) for order in pending_orders if getattr(order, "order_id", None)
+        }
+        for order_id, meta in getattr(self, "_pending_lifecycle_orders", {}).items():
+            signal = str(meta.get("signal", "")).upper()
+            if signal not in {"EXIT", "PARTIAL_EXIT"}:
+                continue
+            if not active_order_ids or order_id in active_order_ids:
+                return True
+        return False
+
+    @staticmethod
+    def _format_router_audit_note(decision, bar_regime):
+        parts = [
+            f"reason={decision.reason}",
+            f"regime={bar_regime.regime}",
+            f"bias={bar_regime.bias}",
+            f"session={bar_regime.session_regime}",
+        ]
+        if decision.selected_strategy:
+            parts.append(f"selected={decision.selected_strategy}")
+        if decision.candidates:
+            parts.append(f"candidates={','.join(decision.candidates)}")
+        if decision.notes:
+            parts.append(f"notes={' | '.join(decision.notes[:3])}")
+        return "; ".join(parts)
+
+    def _route_entry_signal(self, last_5m, df_5m, df_15m, timestamp, active_name, attribution_recorder=None):
+        from core.market_regime import classify_regime
+
+        session_regime = classify_regime(df_5m)
+        bar = last_5m.to_dict()
+        
+        # Use the new _route_signal method with attribution support
+        return self._route_signal(
+            bar=bar,
+            session_regime=session_regime,
+            active_name=active_name,
+            attribution_recorder=attribution_recorder
+        )
+
+    def _build_strategy_context(self, bar, session_regime):
+        """Build strategy context from bar data."""
+        # Get dataframes (simplified for now)
+        df_5m = None
+        df_15m = None
+        
+        ctx = StrategyContext(
+            market=MarketData(
+                last_bar=bar,
+                df_5m=df_5m,
+                df_15m=df_15m,
+                timestamp=bar.get('timestamp', ''),
+                session=int(bar.get('session', 0)),
+                regime=session_regime,
+            ),
+            position=PositionView(
+                size=self.trader.position,
+                entry_price=self.trader.entry_price,
+                current_stop_loss=getattr(self.trader, "current_stop_loss", None),
+                unrealized_pnl=getattr(self.trader, "unrealized_pnl", 0),
+                has_tp1_hit=self.has_tp1_hit,
+            ),
+            config=self.cfg,
+            bar_counter=self._bar_counter,
+        )
+        return ctx
+    def _route_signal(self, bar, session_regime, active_name=None, pending_orders=None, attribution_recorder=None):
+        """Route signal through strategy router with optional attribution."""
+        # Build context
+        ctx = self._build_strategy_context(bar, session_regime)
+        
+        # Get pending orders if not provided
+        if pending_orders is None:
+            pending_orders = self._get_symbol_pending_orders()
+        
+        # Classify bar regime
+        bar_regime = classify_futures_bar_regime(bar, session_regime=session_regime)
+        
+        # Route signal with optional attribution
+        decision = route_futures_signal(
+            registry=self._registry,
+            context=ctx,
+            regime_result=bar_regime,
+            active_strategy_name=active_name,
+            current_working_orders=pending_orders,
+            is_flattening=self._has_pending_flattening_order(pending_orders),
+            prepare_strategy=lambda name, strategy: self._ensure_strategy_initialized(name, strategy, ctx),
+            recorder=attribution_recorder
+        )
+        return decision, ctx, session_regime, bar_regime
+
     def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, trail_points=None, reason=None):
         action = None
         exit_order_side = None
@@ -1714,6 +1909,7 @@ class FuturesMonitor:
             self._last_entry_reason = reason
             # [Bug Fix] Initialize trail peak to entry price
             self._atr_trail_peak = price
+            self._vwap_violation_bars = 0
             # GSD Phase 0b: Reset consecutive losses on new entry
             self.consecutive_losses = 0
             # GSD Phase 0d: Reset bar counter on new entry
@@ -2345,7 +2541,7 @@ class FuturesMonitor:
                 try:
                     tx_df = None
                     if hasattr(self.client, 'get_kline'):
-                        tx_df = self.client.get_kline("TX", interval="5m")
+                        tx_df = self.client.get_kline("TXFR1", interval="5m")
                     if tx_df is not None and not tx_df.empty:
                         tx_bars_list = [{
                             "close": float(r.get("Close", 0)),
@@ -2498,6 +2694,7 @@ class FuturesMonitor:
 
         # 2. Position management
         if self.trader.position != 0:
+            stop_msg = None
             self.trader.update_trailing_stop(last_price)
             # ── [L4] Decision Intelligence: Adaptive Exit Engine ─────────
             from core.exit_engine import should_exit
@@ -2536,18 +2733,25 @@ class FuturesMonitor:
                 "atr": float(last_5m.get("atr", 50)),
                 "time_to_close_mins": time_to_close
             }
-            
-            exit_triggered, exit_reason = should_exit(trade_state, context, market)
-            
-            if exit_triggered:
-                self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason=exit_reason)
-                return
+
+            trend_hold_active = self._trend_hold_active(last_5m, last_price, score, vwap, time_to_close)
+            if trend_hold_active:
+                exit_triggered, exit_reason = False, "TREND_HOLD"
+                self._vwap_violation_bars = 0
+            else:
+                exit_triggered, exit_reason = should_exit(trade_state, context, market)
+
+                if exit_triggered:
+                    self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason=exit_reason)
+                    return
             
             # ── Legacy/Safety Fallbacks ──
             # VWAP Exit (Secondary check)
             if not exit_triggered:
                 _is_night = is_night_session
-                if _is_night:
+                if trend_hold_active:
+                    stop_msg = self._apply_trend_hold_trail(last_price, last_5m, timestamp)
+                elif _is_night:
                     # 夜盤: VWAP exit (回測 PF=2.74)
                     vwap_exit = self.RISK.get("exit_on_vwap") or (self.counter_exit_vwap and self._last_entry_reason == "COUNTER")
                     vwap_confirm_needed = self.RISK.get("exit_vwap_confirm_bars", 0)
@@ -2696,49 +2900,44 @@ class FuturesMonitor:
                 return  # 分數太低，不進場
 
         # ── GSD: Pluggable Strategy Entry ────────────────────────────
-        # 1. Get active strategy from registry
         active_name = self.STRATEGY.get("active_strategy", "counter_vwap")
-        strategy = self._registry.get(active_name)
-
-        # 2. Fallback to old hardcoded logic if plugin not found (Migration safety)
-        if strategy is None:
-            console.print(f"[yellow]⚠️ Strategy plugin '{active_name}' not found in registry.[/yellow]")
-            self._audit_signal("NO_ENTRY", "", score, "plugin_not_found", f"active_strategy={active_name}")
-            return  # Don't crash — just skip this bar
-
-        # ── GSD: Market Regime Detection (Wave 19 Integration) ───────
-        from core.market_regime import classify_regime
-        # We use the current window of bars to classify the regime
-        current_regime = classify_regime(df_5m)
-        
-        # 3. Build immutable StrategyContext (SDD Rule 1: Read-only view)
-        ctx = StrategyContext(
-            market=MarketData(
-                last_bar=last_5m.to_dict(),
-                df_5m=df_5m,
-                df_15m=df_15m,
-                timestamp=str(timestamp),
-                session=int(last_5m.get("session", 0)),
-                regime=current_regime, # GSD: Pass live regime
-            ),
-            position=PositionView(
-                size=self.trader.position,
-                entry_price=self.trader.entry_price,
-                current_stop_loss=getattr(self.trader, "current_stop_loss", None),
-                unrealized_pnl=getattr(self.trader, "unrealized_pnl", 0),
-                has_tp1_hit=self.has_tp1_hit,
-            ),
-            config=self.cfg,  # Pass full config; strategy picks what it needs
-            bar_counter=self._bar_counter,
+        decision, _ctx, session_regime, bar_regime = self._route_entry_signal(
+            last_5m, df_5m, df_15m, timestamp, active_name
         )
 
-        # 3.5. Initialize strategy once (when first loaded or strategy changes)
-        if not hasattr(self, '_active_strategy_name') or self._active_strategy_name != active_name:
-            strategy.init(ctx)
-            self._active_strategy_name = active_name
+        if decision.action == "BLOCKED":
+            self._audit_signal(
+                "ENTRY_BLOCKED",
+                "",
+                score,
+                "router_blocked",
+                self._format_router_audit_note(decision, bar_regime),
+            )
+            return
 
-        # 4. Execute strategy
-        signal = strategy.on_bar(ctx)
+        if not decision.is_trade:
+            note = self._format_router_audit_note(decision, bar_regime)
+            if active_name and self._registry.get(active_name) is None:
+                self._audit_signal(
+                    "NO_ENTRY",
+                    "",
+                    score,
+                    "plugin_not_found",
+                    f"active_strategy={active_name}; {note}",
+                )
+            else:
+                self._audit_signal(
+                    "NO_ENTRY",
+                    "",
+                    score,
+                    "router_no_signal",
+                    note,
+                )
+            return
+
+        signal = decision.signal
+        selected_strategy_name = decision.selected_strategy or active_name
+        self.active_strategy_name = selected_strategy_name
 
         # 4.1 Global Edge Filter (Bypass for exits, apply to entries)
         if signal and signal.action in ["BUY", "SELL"]:
@@ -2751,7 +2950,7 @@ class FuturesMonitor:
             from core.edge_model import edge_model
             edge_context = {
                 "momentum": float(last_5m.get("momentum", 0)),
-                "regime": str(regime),
+                "regime": str(bar_regime.regime),
                 "vwap_dist": abs(last_price - vwap),
                 "volatility": float(last_5m.get("atr", 50)),
                 "price": last_price,
@@ -2761,11 +2960,11 @@ class FuturesMonitor:
                 "trend_strength_raw": float(last_5m.get("trend_strength_raw", 0))
             }
             
-            edge_res = edge_model.evaluate(abs(score), edge_context, active_name)
+            edge_res = edge_model.evaluate(abs(score), edge_context, selected_strategy_name)
             if not edge_res["has_edge"]:
                 self._audit_signal("ENTRY_BLOCKED", signal.action, score, "low_edge", edge_res["reason"])
                 if self._bar_counter % 5 == 0:
-                    console.print(f"[bold yellow]🛡️ Decision Intelligence: {active_name} Blocked - {edge_res['reason']}[/bold yellow]")
+                    console.print(f"[bold yellow]🛡️ Decision Intelligence: {selected_strategy_name} Blocked - {edge_res['reason']}[/bold yellow]")
                 return
             
             # [GSD Upgrade] Apply Dynamic Position Scaling
@@ -2777,41 +2976,10 @@ class FuturesMonitor:
             # Update lots for further logic
             lots = signal.quantity
 
-        # 4.5 Fallback: try Spring/Upthrust if registry strategy has no signal
-        if signal is None:
-            from strategies.futures.elite_strategies import strategy_spring_upthrust
-            spring_signal = strategy_spring_upthrust({
-                "last_5m": last_5m, "df_5m": df_5m,
-                "score": score, "stop_loss_pts": stop_loss_pts,
-            }, self.cfg)
-            if spring_signal:
-                # GSD P4.4: Validate Spring signal (same as registry strategy)
-                from core.signal import Signal
-                spring_obj = Signal(
-                    action=spring_signal["action"],
-                    reason=spring_signal.get("reason", "SPRING"),
-                    stop_loss=spring_signal.get("stop_loss", 0),
-                )
-                is_valid, msg = spring_obj.validate()
-                if not is_valid:
-                    console.print(f"[red]❌ Invalid Spring signal: {msg}[/red]")
-                    return
-
-                atr_val = last_5m.get("atr", 0)
-                if atr_val > 300: atr_val = 300
-                spring_sl = spring_signal.get("stop_loss", atr_val * 2.0 if atr_val > 0 else 60)
-                lots = self.MGMT.get("lots_per_trade", 1)
-                action = spring_signal["action"]
-                if self.MGMT.get(f"allow_{'long' if action == 'BUY' else 'short'}", True):
-                    console.print(f"[bold cyan]🌊 SPRING/UPTHRUST {action} SL={spring_sl:.1f}[/bold cyan]")
-                    self._execute_trade(action, last_price, timestamp, lots,
-                                        stop_loss=spring_sl, reason=spring_signal["reason"])
-            return
-
         # 5. Validate Signal (Defensive Programming)
         is_valid, msg = signal.validate()
         if not is_valid:
-            console.print(f"[red]❌ Invalid signal from {active_name}: {msg}[/red]")
+            console.print(f"[red]❌ Invalid signal from {selected_strategy_name}: {msg}[/red]")
             return
 
         # 6. Execute Trade
