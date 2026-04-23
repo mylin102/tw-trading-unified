@@ -22,40 +22,28 @@ from strategies.stocks.monitor import StockMonitor
 console = Console()
 
 # ── GSD: Singleton Lock ─────────────────────────────────────────────
-LOCKFILE = "/tmp/stock_runner_{}.lock".format(os.getpid() % 100)
+LOCKFILE = "/tmp/stock_runner_singleton.lock"
 
 def check_singleton():
-    """Ensure only ONE stock_runner is running. Returns lock file handle or exits."""
-    # Find and kill any OTHER stock_runner processes
-    import subprocess
+    """Ensure only ONE stock_runner is running using a fixed lockfile."""
     try:
-        result = subprocess.run(
-            ["ps", "aux"], capture_output=True, text=True
-        )
-        my_pid = os.getpid()
-        for line in result.stdout.split('\n'):
-            if 'stock_runner.py' in line and 'grep' not in line:
-                parts = line.split()
-                if len(parts) >= 2:
-                    other_pid = int(parts[1])
-                    if other_pid != my_pid:
-                        try:
-                            os.kill(other_pid, 15)
-                            console.print(f"[dim]🔪 Killed duplicate stock_runner PID={other_pid}[/dim]")
-                        except ProcessLookupError:
-                            pass
-        time.sleep(2)
-    except Exception:
-        pass
-
-    # Acquire our own lock
-    try:
+        # Create lockfile if it doesn't exist
         lock_fd = open(LOCKFILE, 'w')
+        # Try to acquire an exclusive lock
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Write PID to lockfile
+        lock_fd.seek(0)
         lock_fd.write(str(os.getpid()))
+        lock_fd.truncate()
         return lock_fd
     except (IOError, OSError):
-        console.print("[bold red]🔒 Another stock_runner is already running. Exiting.[/bold red]")
+        # Could not acquire lock, another process is running
+        try:
+            with open(LOCKFILE, 'r') as f:
+                existing_pid = f.read().strip()
+            console.print(f"[bold red]🔒 Another stock_runner (PID={existing_pid}) is already running. Exiting.[/bold red]")
+        except:
+            console.print("[bold red]🔒 Another stock_runner is already running. Exiting.[/bold red]")
         sys.exit(1)
 
 def run_stock_monitor(dry_run=False):
@@ -90,14 +78,11 @@ def run_stock_monitor(dry_run=False):
                 break
                 
             try:
-                sm.run_iteration() # We will refactor sm.run() to allow iteration checks
+                sm.run_iteration()
             except Exception as e:
                 console.print(f"[bold red]Error in run_iteration: {e}[/bold red]")
                 import traceback
                 console.print(traceback.format_exc())
-                # 繼續運行，除非是致命錯誤
-                if "KeyboardInterrupt" in str(type(e)):
-                    raise
             time.sleep(1)
 
     except KeyboardInterrupt:

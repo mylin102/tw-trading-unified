@@ -175,14 +175,67 @@ class ShioajiClient:
             logger.error(f"Failed to fetch margin: {e}")
             return 0
 
+    def _resolve_front_month_futures_contract(self, market_keys: tuple[str, ...], code_prefix: str):
+        """Resolve a nearest/front futures contract from Shioaji contract containers."""
+        if self.api is None:
+            return None
+
+        futures = getattr(getattr(self.api, "Contracts", None), "Futures", None)
+        if futures is None:
+            return None
+
+        for key in market_keys:
+            node = getattr(futures, key, None)
+            if node is None:
+                continue
+
+            for attr in ("near_month", "current", "front"):
+                contract = getattr(node, attr, None)
+                if contract is not None and hasattr(contract, "code") and str(contract.code).startswith(code_prefix):
+                    return contract
+
+            if hasattr(node, "items"):
+                for _, contract in node.items():
+                    if contract is not None and hasattr(contract, "code") and str(contract.code).startswith(code_prefix):
+                        return contract
+
+            try:
+                for contract in node:
+                    if contract is not None and hasattr(contract, "code") and str(contract.code).startswith(code_prefix):
+                        return contract
+            except TypeError:
+                continue
+
+        return None
+
     def get_futures_contract(self, ticker: str):
         if not self.is_logged_in:
             return None
         try:
+            if ticker in {'TX', 'TXF'}:
+                return self._resolve_front_month_futures_contract(("TXF", "TX"), "TXF")
             if ticker == 'TXFR1':
-                return self.api.Contracts.Futures["TXF"]["TXFR1"]
+                try:
+                    return self.api.Contracts.Futures["TXF"]["TXFR1"]
+                except Exception:
+                    return self._resolve_front_month_futures_contract(("TXF", "TX"), "TXF")
             if ticker == 'MXFR1':
                 return self.api.Contracts.Futures["MXF"]["MXFR1"]
+            if ticker in {'MXF', 'MX'}:
+                # MXF 每月 rolling (MXFE6→MXFF6→MXFG6)，取近月合約
+                mxf_list = list(self.api.Contracts.Futures.MXF)
+                if not mxf_list:
+                    print("[shioaji_client] 無 MXF 合約可用")
+                    return None
+
+                from datetime import datetime
+                now_str = datetime.now().strftime("%Y/%m/%d")
+                valid_contracts = [c for c in mxf_list if c.delivery_date >= now_str]
+                if valid_contracts:
+                    sorted_contracts = sorted(valid_contracts, key=lambda c: c.delivery_date)
+                    return sorted_contracts[0]
+                else:
+                    return mxf_list[0]
             if ticker == 'TMF':
                 # 使用與 FuturesMonitor 相同的邏輯：選擇交割日最近的合約
                 tmf_list = list(self.api.Contracts.Futures.TMF)
@@ -254,6 +307,51 @@ class ShioajiClient:
         except Exception as e:
             logger.error(f"Cancel order failed: {e}")
             return False
+
+    def refresh_status(self, account=None, trade=None):
+        if not self.is_logged_in or not hasattr(self.api, "update_status"):
+            return None
+        if account is not None:
+            if trade is not None:
+                return self.api.update_status(account=account, trade=trade)
+            return self.api.update_status(account=account)
+        if trade is not None:
+            return self.api.update_status(trade=trade)
+        return self.api.update_status()
+
+    def list_trades(self, account=None):
+        if not self.is_logged_in:
+            return []
+        if hasattr(self.api, "list_trades"):
+            if account is not None:
+                return list(self.api.list_trades(account=account))
+            return list(self.api.list_trades())
+        return []
+
+    def list_open_orders(self, account=None):
+        if not self.is_logged_in:
+            return []
+        if hasattr(self.api, "list_open_orders"):
+            if account is not None:
+                return list(self.api.list_open_orders(account=account))
+            return list(self.api.list_open_orders())
+
+        active_statuses = {"Submitted", "PartFilled", "PartialFilled", "PendingSubmit", "PreSubmitted"}
+        open_orders = []
+        for trade in self.list_trades(account=account):
+            status = getattr(getattr(trade, "status", None), "status", None) or getattr(trade, "status", None)
+            if str(status) in active_statuses:
+                open_orders.append(trade)
+        return open_orders
+
+    def list_positions(self, account=None):
+        if not self.is_logged_in:
+            return []
+        if hasattr(self.api, "list_positions"):
+            if account is not None:
+                return list(self.api.list_positions(account=account))
+            return list(self.api.list_positions())
+        return []
 
     def logout(self):
         """登出並取消所有訂閱"""

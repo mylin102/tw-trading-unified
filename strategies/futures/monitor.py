@@ -77,7 +77,7 @@ class FuturesMonitor:
         self._config_mtime = 0
         self.dry_run = dry_run
         self.cfg = self._load_config(config_path)
-        self.ticker = "TMF"
+        self.ticker = "MXF"
         self.contract = None
         self._running = False
 
@@ -324,11 +324,11 @@ class FuturesMonitor:
         return self._tick_bars_cache if self._tick_bars_cache is not None else pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
 
     def _bars_time_aligned(self, tx_bars, df_5m):
-        """Check that the latest TX bar and TMF 5m bar share the same timestamp bucket.
+        """Check that the latest TX bar and MXF 5m bar share the same timestamp bucket.
 
         Args:
             tx_bars (list[dict]): list of tx bars from TxBarBuilder.bars()
-            df_5m (pd.DataFrame): processed 5m dataframe for TMF
+            df_5m (pd.DataFrame): processed 5m dataframe for MXF
 
         Returns:
             bool: True if aligned, False otherwise
@@ -419,7 +419,7 @@ class FuturesMonitor:
 
         # 獲取TMF合約
         try:
-            tmf_list = list(self.api.Contracts.Futures.TMF)
+            tmf_list = list(self.api.Contracts.Futures.MXF)
             if tmf_list:
                 # [GSD Settlement Fix] Filter out expired or invalid
                 # On settlement day (3rd Wednesday), the front-month expires at 13:30.
@@ -445,7 +445,7 @@ class FuturesMonitor:
                 if tmf_sorted:
                     # Pick the first one (nearest delivery)
                     self.contract = tmf_sorted[0]
-                    console.print(f"[green][FuturesMonitor] ✓ TMF front-month: {self.contract.code} (delivers {self.contract.delivery_date})[/green]")
+                    console.print(f"[green][FuturesMonitor] ✓ MXF front-month: {self.contract.code} (delivers {self.contract.delivery_date})[/green]")
                 else:
                     # Fallback to absolute nearest if no valid ones found (shouldn't happen in live)
                     self.contract = sorted(tmf_list, key=lambda c: c.delivery_date)[0]
@@ -453,11 +453,11 @@ class FuturesMonitor:
                 
                 # Log all available codes for verification
                 all_codes = [f"{c.code}({c.delivery_date})" for c in tmf_sorted]
-                console.print(f"[dim][FuturesMonitor] Valid TMF queue: {', '.join(all_codes)}[/dim]")
+                console.print(f"[dim][FuturesMonitor] Valid MXF queue: {', '.join(all_codes)}[/dim]")
             else:
-                console.print("[red][FuturesMonitor] No TMF contracts found![/red]")
+                console.print("[red][FuturesMonitor] No MXF contracts found![/red]")
         except Exception as e:
-            console.print(f"[red][FuturesMonitor] Error selecting TMF contract: {e}[/red]")
+            console.print(f"[red][FuturesMonitor] Error selecting MXF contract: {e}[/red]")
 
         # [Bug Fix] Add contract rollover check
         self._last_contract_code = self.contract.code if self.contract else None
@@ -629,16 +629,16 @@ class FuturesMonitor:
                 console.print(f"[green][FuturesMonitor] ✅ Backfill complete: {len(combined)} total bars in CSV[/green]")
 
     def _tmf_feed_age_secs(self):
-        """Prefer real TMF feed freshness over synthetic continuity timestamps."""
+        """Prefer real MXF feed freshness over synthetic continuity timestamps."""
         try:
             if hasattr(self, "feed_health") and self.feed_health is not None:
-                age = self.feed_health.age("TMF")
+                age = self.feed_health.age("MXF")
                 if age is not None and math.isfinite(float(age)):
                     return max(0.0, float(age))
         except Exception:
             pass
-        # feed_health can report inf before the first real TMF tick arrives after startup.
-        # Fall back to the local TMF timer so watchdog logic keeps its intended grace window.
+        # feed_health can report inf before the first real MXF tick arrives after startup.
+        # Fall back to the local MXF timer so watchdog logic keeps its intended grace window.
         last_real_tick = getattr(self, "_last_real_tmf_tick_at", self.last_tick_at)
         return max(0.0, time.time() - last_real_tick)
 
@@ -662,7 +662,7 @@ class FuturesMonitor:
             self._set_runtime_status(SystemReadiness.MONITORING)
 
     def _check_futures_contract_staleness(self):
-        """[Wave 1 Fix] Check if TMF ticks are stale and attempt recovery.
+        """[Wave 1 Fix] Check if MXF ticks are stale and attempt recovery.
 
         Behavior:
         - If no new tick for < warn_secs: no-op.
@@ -680,15 +680,15 @@ class FuturesMonitor:
 
         from core.shioaji_session import SystemReadiness
         self._set_runtime_status(SystemReadiness.DEGRADED)
-        console.print(f"[yellow]⚠️ TMF data stale for {secs_since_tick/60:.1f} min, checking contract...[/yellow]")
+        console.print(f"[yellow]⚠️ MXF data stale for {secs_since_tick/60:.1f} min, checking contract...[/yellow]")
 
         if not is_taifex_futures_market_open():
-            console.print("[dim]TMF feed quiet during scheduled recess — keeping monitor alive[/dim]")
+            console.print("[dim]MXF feed quiet during scheduled recess — keeping monitor alive[/dim]")
             return
 
         # If we exceed critical threshold, stop the monitor so external supervisor restarts the process
         if secs_since_tick >= critical:
-            console.print(f"[red]🚨 TMF data stale CRITICAL: {secs_since_tick/60:.1f} min. Shutting down to trigger supervisor restart.[/red]")
+            console.print(f"[red]🚨 MXF data stale CRITICAL: {secs_since_tick/60:.1f} min. Shutting down to trigger supervisor restart.[/red]")
             try:
                 if self.contract:
                     self.api.quote.unsubscribe(self.contract, quote_type='tick')
@@ -696,7 +696,7 @@ class FuturesMonitor:
                 pass
             # Mark monitor as not running and raise to break out of run loop
             self._running = False
-            raise RuntimeError(f"TMF tick stale for {secs_since_tick} seconds (>{critical}), exiting monitor.")
+            raise RuntimeError(f"MXF tick stale for {secs_since_tick} seconds (>{critical}), exiting monitor.")
 
         # Between warn and critical: attempt light recovery
         console.print(f"[dim]Attempting light recovery (re-subscribe / rollover / fetch) after {secs_since_tick/60:.1f} min stale[/dim]")
@@ -704,7 +704,7 @@ class FuturesMonitor:
         # Check for expiry/rollover
         today_str = datetime.now().strftime("%Y/%m/%d")
         if self.contract and self.contract.delivery_date < today_str:
-            console.print(f"[yellow]⚠️ TMF contract {self.contract.code} expired (delivery: {self.contract.delivery_date})[/yellow]")
+            console.print(f"[yellow]⚠️ MXF contract {self.contract.code} expired (delivery: {self.contract.delivery_date})[/yellow]")
             self._check_contract_rollover()
             # Update last tick time so we don't spam retry immediately
             self.last_tick_at = time.time()
@@ -823,7 +823,7 @@ class FuturesMonitor:
             return None
     
     def _check_contract_rollover(self):
-        """[GSD Fix] Check if TMF contract has rolled over and re-subscribe if needed."""
+        """[GSD Fix] Check if MXF contract has rolled over and re-subscribe if needed."""
         if not self.api or self.dry_run or not self.contract:
             return
         
@@ -841,9 +841,9 @@ class FuturesMonitor:
                         console.print(f"[bold yellow]⚠️ SETTLEMENT DAY: Contract {current_code} expires at 13:30 ({hours}h {minutes}m remaining)[/bold yellow]")
             
             # Get all available contracts
-            tmf_list = list(self.api.Contracts.Futures.TMF)
+            tmf_list = list(self.api.Contracts.Futures.MXF)
             if not tmf_list:
-                console.print("[yellow]⚠️ No TMF contracts available[/yellow]")
+                console.print("[yellow]⚠️ No MXF contracts available[/yellow]")
                 return
             
             # [GSD Settlement Fix] Filter out expired contracts considering settlement time
@@ -900,16 +900,16 @@ class FuturesMonitor:
         self.last_tick_at = time.time()  # [gstack] 更新數據更新時間
         
         # 💡 GSD: Data Continuity Fix
-        # Use strict matching for the primary TMF contract
+        # Use strict matching for the primary MXF contract
         is_tmf = self.contract and tick.code == self.contract.code
-        # For MTX, we still allow startswith for the heartbeat, but we MUST NOT use its price for TMF bars
+        # For MTX, we still allow startswith for the heartbeat, but we MUST NOT use its price for MXF bars
         is_mtx = tick.code.startswith("MXF") or tick.code.startswith("MTX")
         
         if not is_tmf and not is_mtx:
             return
             
         # [GSD Settlement Fix] If it's an MTX tick, it's just a heartbeat to drive timing.
-        # We use the last known TMF price to avoid price contamination (TMF != MTX).
+        # We use the last known MXF price to avoid price contamination (MXF != MTX).
         if is_tmf:
             self._last_real_tmf_tick_at = self.last_tick_at
             price = float(tick.close)
@@ -918,11 +918,11 @@ class FuturesMonitor:
         else:
             # It's an MTX heartbeat tick
             if not hasattr(self, '_last_tmf_price') or self._last_tmf_price <= 0:
-                # No TMF price yet, can't build bar
+                # No MXF price yet, can't build bar
                 return
             price = self._last_tmf_price
             
-        # Only count volume for TMF to keep indicators accurate
+        # Only count volume for MXF to keep indicators accurate
         vol = int(getattr(tick, "volume", 0)) if is_tmf else 0
         
         # [Wave 1 optimization] Use integer time bucketing to avoid expensive pd.Timestamp().floor()
@@ -1246,7 +1246,7 @@ class FuturesMonitor:
             
             if cur_price <= 0:
                 try:
-                    cur_price = float(self.market_data.get("TMF", {}).get("close", 0))
+                    cur_price = float(self.market_data.get("MXF", {}).get("close", 0))
                 except Exception:
                     cur_price = 0.0
 
@@ -1662,7 +1662,7 @@ class FuturesMonitor:
             equity = margin.equity
             reserve_pct = 0.20  # 保留 20% 不動用
             available = equity * (1 - reserve_pct)
-            required = margin.initial_margin if margin.initial_margin > 0 else 17000  # TMF 一口約 17,000
+            required = margin.initial_margin if margin.initial_margin > 0 else 17000  # MXF 一口約 17,000
             if available < required:
                 console.print(f"[red]Margin check: equity={equity:.0f} available={available:.0f} < required={required:.0f}[/red]")
                 return False
@@ -1674,7 +1674,7 @@ class FuturesMonitor:
 
     # ── Trade execution ──
     def _audit_signal(self, signal_type, side, score, rejection_reason, note=""):
-        """Record signal audit trail to CSV (thread-safe, TMF file)."""
+        """Record signal audit trail to CSV (thread-safe, MXF file)."""
         from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
         save_signal_audit({
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1683,7 +1683,7 @@ class FuturesMonitor:
             "score": score,
             "rejection": rejection_reason,
             "note": note,
-        }, ticker="TMF")
+        }, ticker="MXF")
 
     def _ensure_strategy_initialized(self, strategy_name, strategy, ctx):
         """Initialize a strategy instance once before the router calls it."""
@@ -1873,11 +1873,11 @@ class FuturesMonitor:
             try:
                 if hasattr(self, 'feed_health') and self.feed_health is not None:
                     tx_age = self.feed_health.age('TX')
-                    tmf_age = self.feed_health.age('TMF')
+                    tmf_age = self.feed_health.age('MXF')
                     max_age = getattr(self, 'STALE_WARN_SECS', 120)
                     if tx_age > max_age or tmf_age > max_age:
-                        self._audit_signal("ENTRY_BLOCKED", "", 0, "feed_stale", f"TX={tx_age:.0f}s TMF={tmf_age:.0f}s")
-                        console.print(f"[yellow][FuturesMonitor] Block entry: feed stale TX={tx_age:.0f}s TMF={tmf_age:.0f}s[/yellow]")
+                        self._audit_signal("ENTRY_BLOCKED", "", 0, "feed_stale", f"TX={tx_age:.0f}s MXF={tmf_age:.0f}s")
+                        console.print(f"[yellow][FuturesMonitor] Block entry: feed stale TX={tx_age:.0f}s MXF={tmf_age:.0f}s[/yellow]")
                         return None
             except Exception:
                 pass
@@ -2022,7 +2022,7 @@ class FuturesMonitor:
                 self._place_safety_stop(price, direction, lots, sl_pts)
             if send_email_notification:
                     send_email_notification(
-                        f"[TMF] {signal} {lots} lots @ {price:.0f}",
+                        f"[MXF] {signal} {lots} lots @ {price:.0f}",
                         f"{d} {lots} lots @ {price:.0f}\n{result}",
                     )
         return result
@@ -2401,12 +2401,12 @@ class FuturesMonitor:
             try:
                 if hasattr(self, 'feed_health') and self.feed_health is not None:
                     tx_age = self.feed_health.age('TX')
-                    tmf_age = self.feed_health.age('TMF')
+                    tmf_age = self.feed_health.age('MXF')
                     max_age = getattr(self, 'STALE_WARN_SECS', 120)
                     
-                    # 💡 GSD: 只有主體 TMF 過期才跳過；TX 過期則僅報警
+                    # 💡 GSD: 只有主體 MXF 過期才跳過；TX 過期則僅報警
                     if tmf_age > max_age:
-                        console.print(f"[yellow][FuturesMonitor] TMF feed stale ({tmf_age:.0f}s) - skip strategy tick[/yellow]")
+                        console.print(f"[yellow][FuturesMonitor] MXF feed stale ({tmf_age:.0f}s) - skip strategy tick[/yellow]")
                         return
                     
                     if tx_age > max_age:
@@ -2516,7 +2516,7 @@ class FuturesMonitor:
         except Exception as e:
             console.print(f"[yellow]⚠️ Adaptive engine failed: {e}[/yellow]")
 
-        # Cross-regime decision (TX macro + TMF local)
+        # Cross-regime decision (TX macro + MXF local)
         try:
             tx_regime = "UNKNOWN"
             tmf_regime = "UNKNOWN"
@@ -2553,54 +2553,57 @@ class FuturesMonitor:
 
             tmf_bars_list = bars_list if 'bars_list' in locals() else []
 
-            # If we have TX bars built from ticks, ensure time alignment with TMF 5m bars
+            # If we have TX bars built from ticks, ensure time alignment with MXF 5m bars
+            cross_skipped = False
             try:
                 if tx_bars_list and df_5m is not None:
                     aligned = self._bars_time_aligned(tx_bars_list, df_5m)
                     if not aligned:
                         console.print(f"[yellow][CROSS] tx/tmf bars not time-aligned (skip cross-regime) [/yellow]")
-                        # Skip cross-regime gating to avoid misaligned decisions
+                        # Skip cross-regime gating entirely: set permissive policy and jump ahead
                         policy = {"allow_trade": True, "orb_weight": 1.0, "vwap_weight": 1.0}
-                        tx_regime = "UNKNOWN"
-                        tmf_regime = "UNKNOWN"
-                        # Continue without invoking cross_engine
-                        # Fallthrough to attach context below
                         self._last_bar_context.update({
-                            "tx_regime": tx_regime,
-                            "tmf_regime": tmf_regime,
+                            "tx_regime": "SKIP",
+                            "tmf_regime": "SKIP",
                             "cross_policy": policy,
                         })
-                        console.print(f"[dim][CROSS] Skipped cross-regime due to misalignment[/dim]")
-                        # Proceed with reduced policy (no gating)
-                    
+                        self._last_cross_policy = policy
+                        console.print(f"[dim][CROSS] Skipped cross-regime due to misalignment; permissive fallback[/dim]")
+                        cross_skipped = True
+                        
             except Exception:
                 pass
 
-            if getattr(self, 'tx_detector', None) is not None and tx_bars_list:
-                tx_regime = self.tx_detector.detect(tx_bars_list)
-            if getattr(self, 'tmf_detector', None) is not None:
-                tmf_regime = self.tmf_detector.detect(tmf_bars_list)
-            if getattr(self, 'cross_engine', None) is not None:
-                # Cross engine supports freshness flags; use feed_health if present
-                tx_fresh = True
-                tmf_fresh = True
-                try:
-                    if hasattr(self, 'feed_health') and self.feed_health is not None:
-                        tx_fresh = self.feed_health.age('TX') <= FEED_STALE_SECS
-                        tmf_fresh = self.feed_health.age('TMF') <= FEED_STALE_SECS
-                except Exception:
-                    tx_fresh = tmf_fresh = True
-                policy = self.cross_engine.decide(tx_regime, tmf_regime, tx_fresh=tx_fresh, tmf_fresh=tmf_fresh)
+            if cross_skipped:
+                # Jump ahead — skip regime detection and cross_engine, use permissive policy
+                tx_regime = "SKIP"
+                tmf_regime = "SKIP"
             else:
-                policy = {"allow_trade": True, "orb_weight": 1.0, "vwap_weight": 1.0}
+                if getattr(self, 'tx_detector', None) is not None and tx_bars_list:
+                    tx_regime = self.tx_detector.detect(tx_bars_list)
+                if getattr(self, 'tmf_detector', None) is not None:
+                    tmf_regime = self.tmf_detector.detect(tmf_bars_list)
+                if getattr(self, 'cross_engine', None) is not None:
+                    # Cross engine supports freshness flags; use feed_health if present
+                    tx_fresh = True
+                    tmf_fresh = True
+                    try:
+                        if hasattr(self, 'feed_health') and self.feed_health is not None:
+                            tx_fresh = self.feed_health.age('TX') <= FEED_STALE_SECS
+                            tmf_fresh = self.feed_health.age('MXF') <= FEED_STALE_SECS
+                    except Exception:
+                        tx_fresh = tmf_fresh = True
+                    policy = self.cross_engine.decide(tx_regime, tmf_regime, tx_fresh=tx_fresh, tmf_fresh=tmf_fresh)
+                else:
+                    policy = {"allow_trade": True, "orb_weight": 1.0, "vwap_weight": 1.0}
 
-            self._last_bar_context.update({
-                "tx_regime": tx_regime,
-                "tmf_regime": tmf_regime,
-                "cross_policy": policy,
-            })
-            # Persist last cross policy for later use in order callbacks / audit
-            self._last_cross_policy = policy
+                self._last_bar_context.update({
+                    "tx_regime": tx_regime,
+                    "tmf_regime": tmf_regime,
+                    "cross_policy": policy,
+                })
+                # Persist last cross policy for later use in order callbacks / audit
+                self._last_cross_policy = policy
             console.print(f"[dim][CROSS] tx={tx_regime} tmf={tmf_regime} allow={policy.get('allow_trade', False)} orb_w={policy.get('orb_weight', 0):.2f} vwap_w={policy.get('vwap_weight', 0):.2f} reason={policy.get('reason','')}[/dim]")
 
             if not policy.get('allow_trade', False):
@@ -2808,7 +2811,7 @@ class FuturesMonitor:
             return  # don't enter same bar as exit
 
         # ── [P0 Fix] Market Hours Gate: NEVER enter during closed hours ──
-        # TAIFEX TMF trading hours:
+        # TAIFEX MXF trading hours:
         #   Day:  08:45 - 13:45
         #   Night: 15:00 - 05:00 (next day)
         # Closed: 13:45-15:00 (lunch), 05:00-08:45 (early morning)
@@ -2868,7 +2871,7 @@ class FuturesMonitor:
         stop_loss_pts = self.RISK.get("stop_loss_pts", 60)
         if self.ATR_MULT > 0:
             atr_val = last_5m.get("atr", 0)
-            # [Bug fix] ATR 合理性上限：TMF 5m ATR 通常 30-150 點
+            # [Bug fix] ATR 合理性上限：MXF 5m ATR 通常 30-150 點
             atr_cap = 300
             if atr_val > atr_cap:
                 atr_val = atr_cap
@@ -2880,7 +2883,7 @@ class FuturesMonitor:
         vol = last_5m.get("Volume", 0)
         avg_vol = df_5m["Volume"].rolling(20).mean().iloc[-1] if len(df_5m) >= 20 else 0
 
-        # 夜盤成交量門檻降低（夜盤 TMF 量通常只有日盤 3-10%）
+        # 夜盤成交量門檻降低（夜盤 MXF 量通常只有日盤 3-10%）
         hhmm = int(datetime.now().strftime("%H%M"))
         is_night = hhmm >= 1500 or hhmm < 500
         vol_threshold = self.STRATEGY.get("volume_threshold", 0.05 if is_night else 0.3)

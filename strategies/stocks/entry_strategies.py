@@ -66,14 +66,20 @@ def strategy_stock_scout(state, cfg):
         vol_avg = df["Volume"].rolling(20).mean().iloc[-1]
         vol_spike = last_5m["Volume"] > (vol_avg * 1.5)
 
-        # 防禦 B: 大盤濾網
-        market_safe = state.get("market_trend", "BULL") != "BEAR"
+        # 防禦 B: 大盤濾網 (GSD Relax: Allow SCOUT in BEAR for technical signals)
+        market_trend = state.get("market_trend", "BULL")
+        market_safe = True # Default to True for SCOUT stage
+        if market_trend == "BEAR":
+            # In BEAR market, require stronger squeeze signal (mom_state >= 3)
+            signal_strength = last_5m["mom_state"] >= 3
+        else:
+            signal_strength = last_5m["mom_state"] >= 2
 
-        # 防禦 C: MACD 動能確認 (新增)
+        # 防禦 C: MACD 動能確認
         macd_confirmed = last_5m.get("macd_rising", True)
 
-        if last_5m["fired"] and last_5m["mom_state"] >= 2 and vol_spike and market_safe and macd_confirmed:
-            return {"action": "BUY", "reason": "SCOUT_CONFIRMED", "qty_mode": "SCOUT", "stop_loss": curr_price * 0.985}
+        if last_5m["fired"] and signal_strength and vol_spike and macd_confirmed:
+            return {"action": "BUY", "reason": f"SCOUT_CONFIRMED_{market_trend}", "qty_mode": "SCOUT", "stop_loss": curr_price * 0.985}
 
 
     # 階段 2: 已持倉，檢查是否加碼
@@ -312,5 +318,9 @@ STOCK_STRATEGIES = {
         "func": strategy_stock_mean_reversion_enhanced,
         "desc": "增強版均值回歸。結合多時間框架過濾器，避免逆勢交易，提高勝率。"
     },
+    # "technical_analysis_enhanced": {
+    #     "func": strategy_technical_analysis_enhanced,
+    #     "desc": "台灣市場增強版技術分析。整合均線系統、支撐壓力、成交量確認、法人指標。"
+    # },
     # fakeout_reversal: 已移除 — 期貨 PF=0.85, 台股 PnL=-3,593, 雙向皆虧損 (2026-04-08 回測)
 }

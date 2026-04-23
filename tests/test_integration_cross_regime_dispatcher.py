@@ -35,8 +35,8 @@ def test_dispatcher_updates_feed_and_builds_tx_bars():
     dispatcher = tick_dispatcher(fm, om, fh, tx_builder)
 
     now = time.time()
-    # send one TMF tick
-    t1 = make_tick('TMF202605', 1000, dt=None)
+    # send one MXF tick
+    t1 = make_tick('MXF202605', 1000, dt=None)
     dispatcher('ex', t1)
 
     # send TX ticks
@@ -47,7 +47,7 @@ def test_dispatcher_updates_feed_and_builds_tx_bars():
 
     snap = fh.snapshot()
     ages = snap.get('ages', {})
-    assert 'TX' in ages and 'TMF' in ages
+    assert 'TX' in ages and 'MXF' in ages
     # tx_builder should have built at least 1 bar (may depend on timestamps); ensure last_tick_time set
     assert tx_builder.last_tick_time > 0
     # monitors received ticks

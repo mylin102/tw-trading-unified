@@ -33,11 +33,10 @@ class StockScanner:
                 }).dropna()
                 df_5m = calculate_futures_squeeze(df_5m)
                 
-                # 3. 抓取整股 1分K 數據 (最近 1 年，用於合成日線)
-                # 💡 GSD: Fetching 1 year of 1min data is VERY slow. 
-                # Shioaji kbars might return limited rows. 
-                # Better to fetch from a dedicated history source if available.
-                start_date_1d = (pd.Timestamp.now() - pd.Timedelta(days=365)).strftime("%Y-%m-%d")
+                # 3. 抓取整股 1分K 數據 (優化：僅抓取最近 14 天用於型態偵測)
+                # 💡 GSD: Fetching 365 days of 1min data is too heavy for Shioaji API.
+                # Reducing to 14 days to keep scan responsive.
+                start_date_1d = (pd.Timestamp.now() - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
                 kbars_raw = self.api.kbars(contract, start=start_date_1d)
                 df_raw = pd.DataFrame({**kbars_raw})
                 

@@ -57,12 +57,23 @@ class EdgeModel:
 
         # RULE-BASED: Focus on Interaction Alpha
         score = 0.5
+        # [GSD 2026-04-24] Enhanced rule scoring: moderate signals produce edge
         # High Breakout + High Volume = High Edge
-        if features.get("breakout_strength", 0) > 1.5 and features.get("volume_spike", 0) > 1.2:
-            score += 0.2
+        if features.get("breakout_strength", 0) > 1.5 and features.get("volume_spike", 1) > 1.2:
+            score += 0.35
+        elif features.get("breakout_strength", 0) > 1.0 and features.get("volume_spike", 1) > 1.0:
+            score += 0.20  # moderate breakout
+        # Strong signal strength = directional edge
+        if features.get("signal_strength", 0.5) > 0.7:
+            score += 0.15
+        elif features.get("signal_strength", 0.5) > 0.5:
+            score += 0.05
         # Low Strength + Mean Reversion Context = Edge for Counter
         if abs(features.get("trend_strength_raw", 0)) < 0.001 and abs(features.get("vwap_distance", 0)) > 0.5:
-            score += 0.1
+            score += 0.15
+        # Trend strength + direction alignment = trend edge
+        if abs(features.get("trend_strength_raw", 0)) > 0.002 and features.get("signal_strength", 0.5) > 0.5:
+            score += 0.20
             
         return max(0.0, min(1.0, score))
 
@@ -113,9 +124,9 @@ class EdgeModel:
         # Instead of 'if prob > threshold', we use: size = max(0, (prob - base) * multiplier)
         # Calibration from previous results:
         base_configs = {
-            "counter_vwap": {"base": 0.40, "mult": 2.0},
-            "orb_breakout": {"base": 0.45, "mult": 3.0},
-            "default": {"base": 0.50, "mult": 2.0}
+            "counter_vwap": {"base": 0.30, "mult": 2.0},
+            "orb_breakout": {"base": 0.35, "mult": 3.0},
+            "default": {"base": 0.35, "mult": 2.0}
         }
         cfg = base_configs.get(strategy_name, base_configs["default"])
         

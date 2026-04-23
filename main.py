@@ -34,9 +34,9 @@ RESTART_WINDOW_SECS = 300  # 5 minutes
 # macOS graceful shutdown flag
 _shutdown_event = threading.Event()
 
-# Feed health tracking (TX/TMF/OPTIONS)
+# Feed health tracking (TX/MXF/OPTIONS)
 TX_PREFIXES = ("TXF", "TX", "TXO")
-TMF_PREFIXES = ("TMF",)
+MXF_PREFIXES = ("MXF",)
 FEED_STALE_SECS = 120
 FEED_WARN_SECS = 45
 
@@ -45,7 +45,7 @@ class FeedHealth:
     lock: threading.Lock = field(default_factory=threading.Lock)
     last_tick_ts: Dict[str, float] = field(default_factory=lambda: {
         "TX": 0.0,
-        "TMF": 0.0,
+        "MXF": 0.0,
         "OPTIONS": 0.0,
     })
     last_tick_code: Dict[str, str] = field(default_factory=dict)
@@ -81,8 +81,8 @@ def tick_dispatcher(futures_mon, options_mon, feed_health=None, tx_bar_builder=N
             return "OPTIONS"
         if code.startswith(TX_PREFIXES):
             return "TX"
-        if code.startswith(TMF_PREFIXES):
-            return "TMF"
+        if code.startswith(MXF_PREFIXES):
+            return "MXF"
         return "OPTIONS"
     
     def on_tick(exchange, tick):
@@ -141,6 +141,8 @@ def bidask_dispatcher(futures_mon, options_mon):
     """Route BidAsk updates to monitors for IV calculation and data freshness."""
     _seen = set()
     _lock = threading.Lock()
+    _last_mtx_update_log_at = {"ts": 0.0}
+    _mtx_update_log_interval_secs = 5.0
     
     def on_bidask(exchange, bidask):
         # Safety checks
@@ -193,9 +195,14 @@ def bidask_dispatcher(futures_mon, options_mon):
                         futures_mon.market_data["MTX"]["close"] = mid
                     
                     matched = True
-                    # Log MTX updates specifically for visibility
+                    # MTX bid/ask updates can arrive at very high frequency near open.
+                    # Throttle visibility logs so callback cost stays bounded without
+                    # changing any market-data mutation or freshness semantics.
                     if key == "MTX":
-                        console.print(f"[green]✅ MTX updated ({code}): {mon.market_data['MTX']['close']:.0f}[/green]")
+                        now = time.time()
+                        if now - _last_mtx_update_log_at["ts"] >= _mtx_update_log_interval_secs:
+                            _last_mtx_update_log_at["ts"] = now
+                            console.print(f"[green]✅ MTX updated ({code}): {mon.market_data['MTX']['close']:.0f}[/green]")
                     break
             
             if not matched and code not in _seen:
@@ -299,15 +306,41 @@ def _resubscribe_all(api, fm, om):
         console.print(f"[red]❌ Resubscribe failed: {e}[/red]")
 
 
-def resolve_tx_contract(api):
+def resolve_tx_contract(api, reference_contract=None):
     """Resolve a nearest-month TX contract conservatively (fallbacks)."""
     try:
+        from datetime import datetime as _dt
+
         futures = getattr(api, 'Contracts', None)
         if futures is None:
             return None
         futs = getattr(futures, 'Futures', None)
         if futs is None:
             return None
+
+        if reference_contract is not None:
+            ref_code = getattr(reference_contract, "code", "")
+            if ref_code.startswith("TMF"):
+                target_code = ref_code.replace("TMF", "TXF", 1)
+                for lookup in (
+                    lambda: api.Contracts.Futures[target_code],
+                    lambda: api.Contracts.Futures["TXF"][target_code],
+                ):
+                    try:
+                        contract = lookup()
+                        if contract is not None and getattr(contract, "code", "").startswith("TXF"):
+                            return contract
+                    except Exception:
+                        continue
+
+        candidates = {}
+
+        def _remember(contract):
+            code = getattr(contract, "code", "")
+            if contract is None or not code.startswith("TXF"):
+                return
+            candidates[code] = contract
+
         # 💡 GSD: 強制優先檢查 TXF (大台)
         for key in ("TXF", "TX"):
             node = getattr(futs, key, None)
@@ -316,13 +349,30 @@ def resolve_tx_contract(api):
             # Try common attributes first
             for attr in ("near_month", "current", "front"):
                 con = getattr(node, attr, None)
-                if con is not None and hasattr(con, 'code') and "TXF" in con.code:
-                    return con
+                _remember(con)
             # If mapping-like
             if hasattr(node, 'items'):
                 for _, con in node.items():
-                    if hasattr(con, 'code') and "TXF" in con.code:
-                        return con
+                    _remember(con)
+            try:
+                for con in node:
+                    _remember(con)
+            except TypeError:
+                continue
+
+        if candidates:
+            today = _dt.now().strftime("%Y/%m/%d")
+
+            def _sort_key(contract):
+                delivery_date = getattr(contract, "delivery_date", "9999/99/99")
+                is_rolling = getattr(contract, "code", "") == getattr(contract, "symbol", None)
+                return (delivery_date, is_rolling, getattr(contract, "code", ""))
+
+            valid = [con for con in candidates.values() if getattr(con, "delivery_date", "") >= today]
+            pool = valid or list(candidates.values())
+            pool.sort(key=_sort_key)
+            return pool[0]
+
         # As a final fallback, try iterating an attribute list
         try:
             if hasattr(futs, '__iter__'):
@@ -340,14 +390,14 @@ def resolve_tx_contract(api):
         return None
 
 
-def feeds_are_fresh(feed_health, require_tx=True, require_tmf=True):
+def feeds_are_fresh(feed_health, require_tx=True, require_mxf=True):
     snap = feed_health.snapshot()
     ages = snap.get('ages', {})
     problems = []
-    tmf_age = ages.get('TMF', float('inf'))
+    mxf_age = ages.get('MXF', float('inf'))
     tx_age = ages.get('TX', float('inf'))
-    if require_tmf and tmf_age > FEED_STALE_SECS:
-        problems.append(f"TMF stale: {tmf_age:.0f}s")
+    if require_mxf and mxf_age > FEED_STALE_SECS:
+        problems.append(f"MXF stale: {mxf_age:.0f}s")
     # 💡 GSD: TX stale is non-fatal for process survival
     if require_tx and tx_age > FEED_STALE_SECS:
         if tx_age == float('inf'):
@@ -421,7 +471,7 @@ def run_system(dry_run=False):
                 console.print(f"[green]📡 Subscribed TMF tick: {fm.contract.code}[/green]")
 
             # Subscribe TX tick for cross-regime / freshness
-            tx_contract = resolve_tx_contract(api)
+            tx_contract = resolve_tx_contract(api, fm.contract)
             # 💡 GSD: 確保訂閱的是 TXF (大台)
             if tx_contract is not None:
                 try:
@@ -525,7 +575,7 @@ def run_system(dry_run=False):
                             api.quote.subscribe(fm.contract, quote_type='tick')
 
                         # Re-resolve and subscribe TX
-                        tx_contract = resolve_tx_contract(api)
+                        tx_contract = resolve_tx_contract(api, fm.contract)
                         if tx_contract is not None:
                             try:
                                 api.quote.subscribe(tx_contract, quote_type='tick')
@@ -603,23 +653,23 @@ def run_system(dry_run=False):
                 except Exception:
                     require_tx = False
                 try:
-                    require_tmf = True if fm.contract is not None else False
+                    require_mxf = True if fm.contract is not None else False
                 except Exception:
-                    require_tmf = False
+                    require_mxf = False
 
-                ok, problems, snap = feeds_are_fresh(feed_health, require_tx=require_tx, require_tmf=require_tmf)
+                ok, problems, snap = feeds_are_fresh(feed_health, require_tx=require_tx, require_mxf=require_mxf)
                 ages = snap.get('ages', {})
                 console.print(
                     "[dim]"
                     f"feed health | TX={ages.get('TX', float('inf')):.0f}s "
-                    f"TMF={ages.get('TMF', float('inf')):.0f}s "
+                    f"MXF={ages.get('MXF', float('inf')):.0f}s "
                     f"OPT={ages.get('OPTIONS', float('inf')):.0f}s"
                     "[/dim]"
                 )
 
                 # Warn before critical
-                if snap['ages'].get('TMF', float('inf')) > FEED_WARN_SECS:
-                    console.print(f"[yellow]Warning: TMF feed quiet for {snap['ages'].get('TMF', 0):.0f}s[/yellow]")
+                if snap['ages'].get('MXF', float('inf')) > FEED_WARN_SECS:
+                    console.print(f"[yellow]Warning: MXF feed quiet for {snap['ages'].get('MXF', 0):.0f}s[/yellow]")
                 if require_tx and snap['ages'].get('TX', float('inf')) > FEED_WARN_SECS:
                     console.print(f"[yellow]Warning: TX feed quiet for {snap['ages'].get('TX', 0):.0f}s[/yellow]")
 

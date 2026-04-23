@@ -1,34 +1,33 @@
-import requests
 import yaml
-import json
-from pathlib import Path
+import sys
 import os
+from pathlib import Path
 from rich.console import Console
 
 # --- 路徑設定 ---
-ROOT = Path(__file__).parent.parent.parent
-STOCKS_CFG_PATH = ROOT / "config" / "stocks.yaml"
-LEADERS_URL = "https://raw.githubusercontent.com/mylin102/tw-canslim-web/master/data/leaders.json"
+ROOT = Path(__file__).resolve().parent.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
 
+from core.external_feature_provider import get_external_feature_provider, load_stock_config
+STOCKS_CFG_PATH = ROOT / "config" / "stocks.yaml"
 console = Console()
 
 def sync():
-    console.print(f"[cyan]🌐 Fetching external watchlist from {LEADERS_URL}...[/cyan]")
-    
-    # 1. 抓取外部資料
+    cfg = load_stock_config(STOCKS_CFG_PATH)
+    provider = get_external_feature_provider(cfg)
+    console.print("[cyan]🌐 Fetching external watchlist via external feature provider...[/cyan]")
+
     try:
-        response = requests.get(LEADERS_URL, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        # 2. 提取 symbol
-        new_tickers = [item["symbol"] for item in data.get("universe", [])]
-        
+        snapshot = provider.get_snapshot(prefer_refresh=True)
+        new_tickers = snapshot.get("watchlist_symbols", [])
         if not new_tickers:
             console.print("[yellow]⚠️ 外部名單為空，取消同步。[/yellow]")
             return
 
-        console.print(f"[green]✅ 成功抓取 {len(new_tickers)} 檔股票。[/green]")
+        if snapshot.get("degraded"):
+            console.print(f"[yellow]⚠️ Using degraded feature snapshot: {snapshot.get('degraded_reason', '')}[/yellow]")
+        console.print(f"[green]✅ 成功取得 {len(new_tickers)} 檔股票。[/green]")
 
     except Exception as e:
         console.print(f"[red]❌ 抓取外部資料失敗: {e}[/red]")
@@ -43,10 +42,7 @@ def sync():
         return
 
     # 4. 更新 Watchlist
-    old_watchlist = cfg.get("stocks", {}).get("watchlist", [])
-    
-    # 直接替換或是合併？
-    # 根據用戶指令「從raw.githubusercontent.com抓清單當sotck的名單使用」，這裡採直接替換
+    # 直接替換 watchlist，保持既有腳本行為
     cfg["stocks"]["watchlist"] = new_tickers
     
     # 5. 寫回設定

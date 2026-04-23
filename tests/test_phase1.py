@@ -100,7 +100,8 @@ class TestStrategyRegistry:
     def test_select_best_shock_returns_fallback(self):
         result = select_best_strategy("day", regime="shock")
         # shock has empty order, falls back to all strategies scan
-        assert result == "counter_vwap"
+        # calendar_condor_v2 has highest PF (7.39) so it should be selected
+        assert result == "calendar_condor_v2"
 
     def test_select_best_invalid_session(self):
         result = select_best_strategy("invalid_session")
@@ -111,7 +112,8 @@ class TestStrategyRegistry:
     def test_get_strategy_ranking_day(self):
         ranking = get_strategy_ranking("day")
         assert len(ranking) >= 3
-        assert ranking[0] == ("counter_vwap", 2.1)
+        # calendar_condor_v2 has highest PF (7.39) so it should be first
+        assert ranking[0] == ("calendar_condor_v2", 7.39)
         # Sorted descending
         assert all(ranking[i][1] >= ranking[i+1][1] for i in range(len(ranking)-1))
 
@@ -123,8 +125,8 @@ class TestStrategyRegistry:
     def test_get_strategy_ranking_with_custom_min_pf(self):
         ranking = get_strategy_ranking("day", min_pf=1.5)
         names = [r[0] for r in ranking]
-        # counter_vwap=2.1, spring_upthrust=1.6, vol_squeeze=1.5 all pass
-        assert set(names) == {"counter_vwap", "spring_upthrust", "vol_squeeze"}
+        # calendar_condor_v2=7.39, counter_vwap=2.1, spring_upthrust=1.6, kbar_feature=2.5, vol_squeeze=1.5 all pass
+        assert set(names) == {"calendar_condor_v2", "counter_vwap", "spring_upthrust", "kbar_feature", "vol_squeeze"}
 
     def test_regime_order_has_all_strategies(self):
         all_strats = set(STRATEGY_PERF.keys())

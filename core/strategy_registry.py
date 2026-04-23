@@ -134,10 +134,12 @@ class StrategyRegistry:
 # Populated from backtests; future: auto-updated from live performance.
 
 STRATEGY_PERF: dict[str, dict[str, float]] = {
-    "counter_vwap":    {"day_pf": 2.1, "night_pf": 1.4},
-    "spring_upthrust": {"day_pf": 1.6, "night_pf": 1.3},
-    "vol_squeeze":     {"day_pf": 1.5, "night_pf": 1.2},
-    "psar":            {"day_pf": 1.4, "night_pf": 0.9},
+    "counter_vwap":        {"day_pf": 2.1, "night_pf": 1.4},
+    "spring_upthrust":     {"day_pf": 1.6, "night_pf": 1.3},
+    "kbar_feature":        {"day_pf": 2.5, "night_pf": 1.8},      # 新增，基於初步回測
+    "calendar_condor_v2":  {"day_pf": 7.39, "night_pf": 0.0},     # 新增，夜盤不交易
+    "vol_squeeze":         {"day_pf": 1.5, "night_pf": 1.2},
+    "psar":                {"day_pf": 1.4, "night_pf": 0.9},
 }
 
 # Regime → preferred strategy order (same order for day/night, PF filter applied at runtime)

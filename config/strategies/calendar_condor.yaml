@@ -1,0 +1,54 @@
+name: calendar_condor
+asset_class: futures
+version: "1.0"
+enabled: true
+
+# ── Strategy-specific parameters ─────────────────────────────────────
+params:
+  # Entry
+  entry_vwap_z: 2.0
+  entry_spread_z: 2.0
+  max_adx: 25.0
+  max_breakout_strength: 0.50
+  max_volume_spike: 1.2
+  continuation_price_vs_vwap: 0.004
+  allow_squeeze: false
+  allow_night_session: false
+  min_bars_from_session_open: 6
+
+  # Exit
+  take_profit_vwap_z: 0.5
+  take_profit_vwap_z_extended: 0.3
+  soft_exit_confirm_vwap_z: 1.0
+  soft_exit_confirm_adx: 25.0
+  soft_exit_confirm_breakout: 0.50
+
+  spread_stop_mult: 1.0
+  max_holding_bars: 8
+  tp_delay_bars: 2
+  peak_pnl_retention: 0.80  # exit if current pnl < peak_pnl * retention
+
+  # Partial exit
+  enable_partial_exit: false
+  partial_exit_fraction: 0.50
+  partial_exit_vwap_z: 0.5
+  final_exit_vwap_z: 0.3
+
+# ── Risk limits (enforced by monitor, NOT the strategy) ──────────────
+risk:
+  max_positions: 1
+  stop_loss_type: atr       # "atr" | "fixed" | "percent"
+  stop_loss_mult: 1.2
+
+# ── Market regime filter ─────────────────────────────────────────────
+regime_filter:
+  allowed: ["weak"]
+  min_adx: 20
+
+# ── Backtest metadata (for dashboard catalog) ────────────────────────
+backtest:
+  pf: 0.0
+  wr: 0.0
+  max_dd: 0.0
+  total_trades: 0
+  period: ""

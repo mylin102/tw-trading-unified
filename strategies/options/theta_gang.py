@@ -166,6 +166,20 @@ def should_enter_theta(squeeze_on, iv, iv_rank_pct=None, min_iv=0.18, min_dte=5)
     return True
 
 
+def has_directional_entry_bias(strategy, score, score_floor=None):
+    if score_floor is None:
+        return True
+    if score is None:
+        return True
+
+    threshold = float(score_floor or 0.0)
+    if strategy == "bull_put_spread":
+        return float(score) >= threshold
+    if strategy == "bear_call_spread":
+        return float(score) <= -threshold
+    return True
+
+
 def should_exit_theta(position, current_value, dte_days, cfg):
     """
     ThetaGang exit conditions:
@@ -213,12 +227,16 @@ class ThetaGangManager:
         self.quantity = self.cfg.get("quantity", 1)
         self.r = self.cfg.get("risk_free_rate", 0.02)
 
-    def evaluate_entry(self, spot, iv, dte_years, squeeze_on):
+    def evaluate_entry(self, spot, iv, dte_years, squeeze_on, *, score=None):
         """Check if we should open a ThetaGang position."""
         if self.position and self.position.is_open:
             return None
 
         if not should_enter_theta(squeeze_on, iv, min_iv=self.cfg.get("min_iv", 0.18)):
+            return None
+
+        directional_floor = self.cfg.get("directional_score_floor")
+        if not has_directional_entry_bias(self.strategy, score, directional_floor):
             return None
 
         if dte_years * 365 < self.cfg.get("min_dte_entry", 7):
@@ -248,6 +266,7 @@ class ThetaGangManager:
             "net_credit": net_credit,
             "max_loss": max_loss,
             "details": details,
+            "score_at_entry": score,
         }
 
     def is_live_combo_strategy_supported(self, strategy=None):

@@ -227,26 +227,69 @@ Each test includes:
 
 ### 4.5 Restart
 
-- [ ] Kill monitor while position==1
-- [ ] Restart → position recovered from ledger
-- [ ] No duplicate entry on same bar
+### 3.4 Attribution System Tests
 
-### 4.6 Backtest Parity
+**File**: `tests/core/test_attribution_recorder.py`
 
-- [ ] Counter-VWAP backtest: PF=1.95, WR=40.7%, 86 trades
-- [ ] Spring/Upthrust backtest: PF=3.36, 33 trades
+| # | Test Name | Precondition | Input | Expected | SDD Rule |
+|---|-----------|-------------|-------|----------|----------|
+| 3.4.1 | `test_attribution_recorder_init` | AttributionRecorder imported | `AttributionRecorder()` | Instance created with empty buffers | Interface contract |
+| 3.4.2 | `test_log_router_row` | Recorder instance | `log_router_row(...)` | Row added to buffer | Data integrity |
+| 3.4.3 | `test_log_signal` | Recorder instance | `log_signal(...)` | Signal row added | Data integrity |
+| 3.4.4 | `test_log_trade` | Recorder instance | `log_trade(...)` | Trade row added | Data integrity |
+| 3.4.5 | `test_export_csv` | Recorder with data | `export_csv("./tmp")` | CSV files created | Side effects after validation |
+| 3.4.6 | `test_buffer_flush_logic` | Recorder with buffer_size=3 | Add 4 rows | Auto-flush triggered | Defensive programming |
+| 3.4.7 | `test_summarize_router` | Sample router data | `summarize_router(df)` | Correct summary stats | Data integrity |
+| 3.4.8 | `test_starvation_report` | Simulated shadowing data | `build_starvation_report(df)` | Correct starvation levels | Business logic |
+| 3.4.9 | `test_priority_impact_calculation` | Shadowed strategy data | `summarize_router(df)` | Correct priority_impact | Business logic |
+| 3.4.10 | `test_merge_router_and_trade` | Router + trade data | `merge_router_and_trade_summary()` | Combined metrics | Data integrity |
 
-### 4.7 Fault Tolerance
+**File**: `tests/core/test_attribution_recorder_integration.py`
 
-- [ ] Rename counter_vwap.py → counter_vwap.py.bak → system continues, logs "plugin unavailable"
-- [ ] Add malformed .py to plugins/ → system continues, logs import error
-- [ ] Config with unknown key → error at startup, clear message
+| # | Test Name | Precondition | Input | Expected | SDD Rule |
+|---|-----------|-------------|-------|----------|----------|
+| 3.4.11 | `test_csv_export_creates_files` | Recorder with output_dir | Add data + export | CSV files with headers | Integration |
+| 3.4.12 | `test_csv_append_mode` | Existing CSV file | Append more data | Combined data preserved | Integration |
+| 3.4.13 | `test_multiple_csv_files` | Recorder with all data types | Export | Router, signal, trade files | Integration |
+| 3.4.14 | `test_buffer_size_respected` | Recorder buffer_size=3 | Add 2 rows, then 3rd | Flush on 3rd row | Integration |
+| 3.4.15 | `test_clear_buffers_after_export` | Recorder with data | Export | Buffers empty after | Integration |
+| 3.4.16 | `test_export_with_no_data` | Empty recorder | Force export | Empty files created | Defensive programming |
 
-### 4.8 Cleanup
+### 3.5 Router Attribution Integration Tests
 
-- [ ] Old `entry_strategies.py` marked as DEPRECATED in comments
-- [ ] Old `elite_strategies.py` marked as DEPRECATED in comments
-- [ ] All new code has docstrings and type hints
+**File**: `tests/core/test_futures_strategy_router.py`
+
+| # | Test Name | Precondition | Input | Expected | SDD Rule |
+|---|-----------|-------------|-------|----------|----------|
+| 3.5.1 | `test_router_with_attribution` | Router + AttributionRecorder | Route signal | Attribution logged | Integration |
+| 3.5.2 | `test_attribution_backward_compat` | Router without recorder | Route signal | No error, normal operation | Backward compatibility |
+| 3.5.3 | `test_attribution_logs_all_candidates` | Router with recorder | Route signal | All candidates logged | Data integrity |
+| 3.5.4 | `test_attribution_shadowed_status` | Multiple candidates, first wins | Route signal | Lower priority marked "shadowed" | Business logic |
+
+---
+
+## Level 4: User Acceptance Tests (UAT)
+
+### 4.1 Attribution Report Generation
+
+**Script**: `scripts/attribution_report.py`
+
+| # | Test Name | Precondition | Input | Expected | SDD Rule |
+|---|-----------|-------------|-------|----------|----------|
+| 4.1.1 | `test_report_generation` | Sample attribution data | Run script | All report files created | End-to-end |
+| 4.1.2 | `test_strategy_detail_report` | Specific strategy filter | `--strategy kbar_feature` | Detailed JSON/CSV created | User workflow |
+| 4.1.3 | `test_regime_filtered_report` | Regime filter | `--regime WEAK` | Filtered analysis | User workflow |
+| 4.1.4 | `test_visualization_generation` | Matplotlib available | Run without `--summary-only` | PNG charts created | User experience |
+
+### 4.2 Production Simulation
+
+**Manual Test**: Run router with attribution in backtest
+
+| # | Test Name | Precondition | Input | Expected | SDD Rule |
+|---|-----------|-------------|-------|----------|----------|
+| 4.2.1 | `test_attribution_in_backtest` | Full backtest dataset | Enable attribution | CSV files with real data | Production readiness |
+| 4.2.2 | `test_starvation_analysis` | Generated attribution data | Run report script | Actionable insights | Business value |
+| 4.2.3 | `test_priority_adjustment` | High starvation detected | Adjust priority order | Improved evaluation rate | Continuous improvement |
 
 ---
 
@@ -258,6 +301,7 @@ Each test includes:
 | **P0** | 1.6, 1.7 | Migrated strategies must work before monitor integration |
 | **P1** | 2.1, 2.2, 2.3, 2.4 | Integration — ensure plugins work with PaperTrader and backtest |
 | **P1** | 3.1, 3.2 | System — full cycle and restart are critical for production |
+| **P1** | 3.4, 3.5 | Attribution — monitoring and optimization capability |
 | **P2** | 3.3 | Stress — important but not blocking |
 | **P2** | Level 4 UAT | Manual verification before deployment |
 
@@ -274,6 +318,7 @@ python3 -m pytest tests/strategies/test_strategy_registry.py -v
 python3 -m pytest tests/strategies/test_strategy_config.py -v
 python3 -m pytest tests/strategies/test_counter_vwap_plugin.py -v
 python3 -m pytest tests/strategies/test_spring_upthrust_plugin.py -v
+python3 -m pytest tests/strategies/test_KbarFeature.py -v
 
 # Level 2: Integration tests
 python3 -m pytest tests/strategies/test_plugin_paper_trader.py -v
@@ -286,11 +331,21 @@ python3 -m pytest tests/strategies/test_full_paper_cycle.py -v
 python3 -m pytest tests/strategies/test_restart_recovery.py -v
 python3 -m pytest tests/strategies/test_stress.py -v
 
+# Level 3.4: Attribution system tests
+python3 -m pytest tests/core/test_attribution_recorder.py -v
+python3 -m pytest tests/core/test_attribution_recorder_integration.py -v
+
+# Level 3.5: Router attribution tests
+python3 -m pytest tests/core/test_futures_strategy_router.py -v
+
 # All strategy tests
 python3 -m pytest tests/strategies/ -v
 
 # Full test suite (including existing tests — regression guard)
 python3 -m pytest tests/ -v
+
+# Attribution report script test
+python3 scripts/test_attribution_report.py
 ```
 
 ---
@@ -300,6 +355,7 @@ python3 -m pytest tests/ -v
 **Phase 1** (Foundation): All Level 1 tests pass (7 files, ~30 tests)  
 **Phase 2** (Migrate): Level 1 + Level 2.2 (backtest parity) pass  
 **Phase 3** (Monitor): Level 1 + Level 2.1 + Level 2.3 pass  
-**Phase 4** (Backtest): All Level 2 tests pass  
-**Phase 5** (Options): Level 1-3 pass for options plugins  
-**Full Release**: All Level 1-3 + Level 4 UAT pass, 0 regressions in existing tests
+**Phase 4** (Attribution): Level 3.4 + 3.5 tests pass  
+**Phase 5** (Backtest): All Level 2 tests pass  
+**Phase 6** (Options): Level 1-3 pass for options plugins  
+**Full Release**: All Level 1-4 + Level 4 UAT pass, 0 regressions in existing tests

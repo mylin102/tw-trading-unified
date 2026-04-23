@@ -2,23 +2,16 @@ import sys
 import logging
 from datetime import datetime
 import os
+from dotenv import load_dotenv
+from types import SimpleNamespace
 
 logger = logging.getLogger("Readiness")
 
-def check_contract_sanity(contract):
-    """檢查合約是否為預期的台指/微台"""
-    if contract is None:
-        return False, "Contract is None"
-    
-    code = getattr(contract, "code", "")
-    # 預防誤訂閱道瓊期 (BRF/UDF)
-    if any(x in code for x in ["BRF", "UDF", "SPF"]):
-        return False, f"Detected non-TAIEX contract: {code}"
-    
-    return True, "OK"
-
 def check_env_vars():
     """檢查關鍵環境變數"""
+    # 加載 .env 檔案
+    load_dotenv(override=True)
+    
     keys = ["SHIOAJI_API_KEY", "SHIOAJI_PERSON_ID"]
     missing = [k for k in keys if not os.getenv(k)]
     if missing:

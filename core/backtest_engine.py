@@ -162,7 +162,7 @@ class BacktestEngine:
         for i in range(20, n):
             ts, price = df.index[i], df.iloc[i]["Close"]
             bar = df.iloc[i].to_dict()
-            ticker = bar.get("ticker", "TMF")
+            ticker = bar.get("ticker", "MXF")
 
             # GSD: Detect Market Regime (Wave 19)
             # Use pre-calculated regime for the current trading day

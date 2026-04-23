@@ -3505,8 +3505,14 @@ class ShioajiOptionsSmartMonitor:
                     self.cooldown_until -= 1
                     console.print(f"[dim]Cooldown: {self.cooldown_until} bars remaining[/dim]")
                 
+                # [GSD 2026-04-24] Directional signal優先於ThetaGang
+                # 當 sig_side 有值（方向性訊號+release確認），直接跳過ThetaGang去做方向性交易
+                skip_theta_for_directional = bool(signal and sig_side)
+                if skip_theta_for_directional:
+                    console.print(f"[dim]方向性訊號優先: {sig_side} score={sig_score:.1f} — 跳過 ThetaGang[/dim]")
+                
                 # ThetaGang: sell premium when squeeze is on (ranging market)
-                if self._theta_gang and signal and self.cooldown_until <= 0:
+                if not skip_theta_for_directional and self._theta_gang and signal and self.cooldown_until <= 0:
                     squeeze_on = signal.get("squeeze_on", False) if isinstance(signal, dict) else False
                     auto_regime = self._theta_cfg.get("auto_regime", True)
                     bar_quality_pass = signal.get("bar_quality") == "PASS"
@@ -3601,7 +3607,13 @@ class ShioajiOptionsSmartMonitor:
                         contract = self.active_contracts.get("C") or self.active_contracts.get("P")
                         dte_years = float(self._dte(getattr(contract, "delivery_date", None))) if contract else 0.03
                         iv = self.latest_iv or 0.25
-                        entry_info = self._theta_gang.evaluate_entry(spot, iv, dte_years, squeeze_on)
+                        entry_info = self._theta_gang.evaluate_entry(
+                            spot,
+                            iv,
+                            dte_years,
+                            squeeze_on,
+                            score=signal.get("score") if isinstance(signal, dict) else None,
+                        )
                         if entry_info:
                             if self.live_trading:
                                 self._submit_live_theta_combo_entry(entry_info)
@@ -3641,8 +3653,13 @@ class ShioajiOptionsSmartMonitor:
 
                 if signal and sig_side:
                     if self.cooldown_until > 0:
-                        console.print(f"[dim]Signal {sig_side} ignored during cooldown[/dim]")
-                        self.replay_stats["blocked_entries"] += 1
+                        # [GSD 2026-04-24] Dynamic cooldown: strong directional signal can exit cooldown early
+                        if abs(sig_score) >= self.entry_score * 1.2:
+                            console.print(f"[yellow][Cooldown] Strong signal score={sig_score:.1f} >= {self.entry_score*1.2:.1f} — breaking cooldown early[/yellow]")
+                            self.cooldown_until = 0
+                        else:
+                            console.print(f"[dim]Signal {sig_side} ignored during cooldown ({self.cooldown_until} bars remaining)[/dim]")
+                            self.replay_stats["blocked_entries"] += 1
                     elif self.live_trading:
                         console.print(f"[bold green]>>> ENTRY SIGNAL: {sig_side} score={sig_score:.1f}[/bold green]")
                         self.enter_live_position(sig_side, signal)

@@ -413,7 +413,7 @@ class StockMonitor:
                 df = None
                 data_source = "unknown"
                 
-                # 嘗試 1: 從 API 獲取 kbars
+                # 嘗試 1: 從 API 獲獲取 kbars
                 try:
                     kbars = self.api.kbars(contract, start=start_date, end=end_date)
                     kbars_dict = {**kbars}
@@ -474,39 +474,53 @@ class StockMonitor:
                 if df.empty: 
                     console.print(f"[yellow]⚠️ Empty DataFrame for {ticker}[/yellow]")
                     continue
-                df["ts"] = pd.to_datetime(df["ts"]); df = df.set_index("ts")
+                
+                df["ts"] = pd.to_datetime(df["ts"])
+                df = df.set_index("ts")
+                
+                # GSD Fix: Resample to 5 minutes if it's from API (which is 1-min by default)
+                # This ensures EMA20/60 reflect a more meaningful timeframe (1.5h/5h)
+                if data_source == "api_kbars":
+                    # Backup original names if they are already capitalized
+                    resample_cols = {
+                        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 
+                        'Volume': 'sum', 'Amount': 'sum'
+                    }
+                    # Handle lowercase if needed
+                    if 'open' in df.columns:
+                        resample_cols = {k.lower(): v for k, v in resample_cols.items()}
+                    
+                    df = df.resample('5min').agg(resample_cols).dropna()
+                    console.print(f"[dim]📊 Resampled {ticker} to 5-minute bars ({len(df)} rows)[/dim]")
+
                 df.columns = [c.capitalize() if c.lower() in ["open", "high", "low", "close", "volume"] else c for c in df.columns]
                 
                 # 調試：檢查傳遞給 calculate_stock_squeeze 的 DataFrame
                 console.print(f"[dim]📊 DEBUG: Before calculate_stock_squeeze for {ticker}[/dim]")
-                console.print(f"[dim]📊 DEBUG: DataFrame shape: {df.shape}[/dim]")
-                console.print(f"[dim]📊 DEBUG: DataFrame columns: {df.columns.tolist()}[/dim]")
                 
                 df = self._loop_state["calculate_stock_squeeze"](df)
                 
-                # 調試：檢查 calculate_stock_squeeze 的結果
-                console.print(f"[dim]📊 DEBUG: After calculate_stock_squeeze for {ticker}[/dim]")
-                console.print(f"[dim]📊 DEBUG: Result shape: {df.shape}[/dim]")
-                
-                # 檢查技術指標列
-                tech_cols = ["bb_lower", "bb_mid", "bb_upper", "macd", "macd_signal", "macd_hist", "k_val", "d_val", "adx"]
-                for col in tech_cols:
-                    if col in df.columns:
-                        non_nan = df[col].notna().sum()
-                        console.print(f"[dim]📊 DEBUG: {col}: {non_nan}/{len(df)} non-NaN values[/dim]")
-                
-                # Indicator logic... (kept simple here for the edit)
+                # Indicator logic
                 df['ma20'] = df['Close'].rolling(20).mean()
                 df['ma60'] = df['Close'].rolling(60).mean()
                 vol_avg = df['Volume'].rolling(20).mean()
                 is_it_buy = (df['Volume'] > vol_avg * 1.5) & (df['Close'] > df['Open']) & (df['Close'] > df['ma20'])
                 df['it_buy_rolling_count'] = is_it_buy.rolling(5).sum().fillna(0)
                 
+                scan_info = self.scan_results.get(ticker, {"pattern": "NONE", "pivot": 0.0})
+                
+                # Multi-TF analysis
+                tf_analysis = self._loop_state["analyze_market_condition"](df)
+                
                 # 保存指標數據供 Dashboard 顯示
                 if not df.empty:
                     last_row = df.iloc[-1].to_dict()
                     # 添加股票名稱
                     last_row["name"] = contract.name if hasattr(contract, "name") else ticker
+                    
+                    # GSD: Include Multi-TF results for more robust Dashboard trend label
+                    last_row["primary_trend"] = tf_analysis.get("market_state", {}).get("primary_trend", "UNKNOWN")
+                    last_row["market_regime"] = tf_analysis.get("market_state", {}).get("market_regime", "UNKNOWN")
                     
                     # 標記數據來源
                     if data_source == "cache":
@@ -528,14 +542,10 @@ class StockMonitor:
                     # 保存最新指標
                     try:
                         self.data_storages[ticker].save_indicators(df.index[-1], last_row)
-                        console.print(f"[green]✅ Saved indicators for {ticker} to {self.data_storages[ticker].market_file}[/green]")
+                        console.print(f"[green]✅ Saved indicators for {ticker} (Trend: {last_row['primary_trend']})[/green]")
                     except Exception as e:
                         console.print(f"[yellow]⚠️ Failed to save indicators for {ticker}: {e}[/yellow]")
-                
-                scan_info = self.scan_results.get(ticker, {"pattern": "NONE", "pivot": 0.0})
-                
-                # Multi-TF analysis
-                tf_analysis = self._loop_state["analyze_market_condition"](df)
+
                 # 檢查數據來源，如果是緩存數據則跳過交易
                 if data_source == "cache":
                     console.print(f"[yellow]⚠️ Skipping trade for {ticker} - using cached data (trading disabled)[/yellow]")

@@ -1,6 +1,13 @@
 import pandas as pd
 import time
+import sys
 from pathlib import Path
+
+# --- 路徑設定 ---
+ROOT = Path(__file__).resolve().parent.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
+
 from core.shioaji_session import get_api, logout
 
 # --- 設定 ---

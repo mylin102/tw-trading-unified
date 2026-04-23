@@ -1,0 +1,142 @@
+# Pre-commit configuration for tw-trading-unified
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+
+repos:
+  # Basic file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(tests/fixtures/|exports/|logs/)
+      - id: end-of-file-fixer
+        exclude: ^(tests/fixtures/|exports/|logs/)
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+
+  # Python formatting
+  - repo: https://github.com/psf/black
+    rev: 23.12.1
+    hooks:
+      - id: black
+        args: ['--line-length=100', '--target-version=py310']
+        exclude: ^(tests/fixtures/|backtest/)
+
+  # Import sorting
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ['--profile=black', '--line-length=100']
+        exclude: ^(tests/fixtures/|backtest/)
+
+  # Python linting
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.6
+    hooks:
+      - id: ruff
+        args: ['--fix', '--exit-non-zero-on-fix']
+        exclude: ^(tests/fixtures/|backtest/)
+      - id: ruff-format
+        exclude: ^(tests/fixtures/|backtest/)
+
+  # Type checking (optional, can be slow)
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.8.0
+    hooks:
+      - id: mypy
+        args: ['--ignore-missing-imports', '--no-strict-optional']
+        exclude: ^(tests/|backtest/)
+        additional_dependencies: ['types-PyYAML', 'types-requests']
+
+  # Security checks
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.7
+    hooks:
+      - id: bandit
+        args: ['-c', 'pyproject.toml']
+        exclude: ^(tests/|backtest/)
+
+  # Trading system specific checks
+  - repo: local
+    hooks:
+      # Check for hardcoded API keys
+      - id: check-api-keys
+        name: Check for hardcoded API keys
+        entry: sh -c 'grep -r "api[_-]key\|secret\|password\|token" --include="*.py" --include="*.yaml" --include="*.yml" --include="*.json" . | grep -v "test_" | grep -v "__pycache__" | grep -v ".git" | grep -v "requirements.txt" | grep -v ".coveragerc" | grep -v "pytest.ini" | grep -v ".pre-commit-config.yaml" && exit 1 || exit 0'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [commit]
+
+      # Check Python syntax
+      - id: python-syntax-check
+        name: Python syntax check
+        entry: sh -c 'python -m py_compile $(find . -name "*.py" -not -path "./tests/fixtures/*" -not -path "./backtest/*" -not -path "./venv/*" -not -path "./.venv/*" -not -path "./__pycache__/*" | head -30)'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [commit]
+
+      # Quick test run (smoke test)
+      - id: quick-test
+        name: Quick smoke test
+        entry: sh -c 'python -m pytest tests/test_ci_smoke.py -xvs'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [commit]
+        verbose: true
+
+      # Check requirements.txt format
+      - id: check-requirements
+        name: Check requirements.txt format
+        entry: sh -c 'python -c "
+import re
+with open(\"requirements.txt\") as f:
+    for i, line in enumerate(f, 1):
+        line = line.strip()
+        if line and not line.startswith(\"#\"):
+            # Check for common issues
+            if \" = \" in line or \"== \" in line or \" ==\" in line:
+                print(f\"Line {i}: Bad spacing in requirement: {line}\")
+                exit(1)
+            if not re.match(r\"^[a-zA-Z0-9._-]+(?:[=<>!~]=?[^\\s]+)?$\", line):
+                print(f\"Line {i}: Invalid requirement format: {line}\")
+                exit(1)
+print(\"✅ Requirements format OK\")
+"'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [commit]
+
+  # Markdown linting
+  - repo: https://github.com/igorshubovych/markdownlint-cli2
+    rev: v0.10.0
+    hooks:
+      - id: markdownlint-cli2
+        args: ['--config', '.markdownlint.json']
+        exclude: ^(docs/incidents/|.planning/)
+
+  # YAML linting
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.33.0
+    hooks:
+      - id: yamllint
+        args: ['-c', '.yamllint.yml']
+        exclude: ^(tests/fixtures/)
+
+# Default stages
+default_stages: [commit, push]
+
+# Skip CI on pre-commit
+ci:
+  skip: [bandit, mypy]  # Skip slow checks in CI, they run in separate workflow

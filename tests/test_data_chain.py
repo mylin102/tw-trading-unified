@@ -791,6 +791,20 @@ class TestStaleDataDetection:
         assert "rglob" in src
         assert "OPTIONS_*" in src
 
+    def test_options_indicator_loader_prefers_active_mode_before_fallback(self):
+        """Dashboard must not merge live + paper option indicators into one chart."""
+        src = Path("ui/dashboard.py").read_text()
+        assert 'source_candidates = [OPTIONS_SUB]' in src
+        assert 'fallback_sub = "paper_trading" if OPTIONS_SUB == "live_trading" else "live_trading"' in src
+        assert 'if source_dfs:' in src and 'all_dfs = source_dfs' in src
+
+    def test_options_order_panel_rebuilds_from_ledger_when_orders_file_empty(self):
+        """Dashboard should still show option lifecycle rows when orders.json is empty but ledger has trades."""
+        src = Path("ui/dashboard.py").read_text()
+        assert "from core.order_lifecycle_audit import rebuild_options_orders_from_ledger" in src
+        assert "if not orders_data:" in src
+        assert "rebuilt_orders = rebuild_options_orders_from_ledger(ol)" in src
+
 
 class TestOptionsContractStalenessSafety:
     """Freeze GSD stale-contract handling semantics for options monitor."""

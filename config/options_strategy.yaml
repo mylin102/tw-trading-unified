@@ -1,23 +1,23 @@
 active_mode: V2
-entry_score: 30
+entry_score: 10
 execution:
-  aggressive_ticks: 2
+  aggressive_ticks: 1
   broker_fee_per_side: 20.0
   exchange_fee_per_side: 5.0
   max_order_retries: 1
-  max_spread_pct: 0.05
-  order_timeout_secs: 30
+  max_spread_pct: 0.10
+  order_timeout_secs: 15
   order_type: Limit
 exit_optimization:
   eod_panic_time: '13:30'
-  eod_passive_ticks: 3
+  eod_passive_ticks: 1
   eod_passive_window_mins: 20
   opening_spike_capture: true
-  opening_target_pct: 0.15
+  opening_target_pct: 0.25
   shutdown_grace_mins: 1
 exit_strategy:
-  lots_per_trade: 1
-  tp1_pct: 2.0
+  lots_per_trade: 2
+  tp1_pct: 3.0
 live_trading: false
 monitoring:
   use_order_manager: true
@@ -31,21 +31,21 @@ modes:
     holding_mode: daytrade
     tp1_pct: 1.0
   V2:
-    bear_boost_pct: 0.8
+    bear_boost_pct: 0.6
     delivery_pref: monthly
     force_close_at_end: false
     holding_mode: swing
-    tp1_pct: 2.0
-    trailing_stop_pct: 1.5
+    tp1_pct: 3.0
+    trailing_stop_pct: 2.0
   V3:
-    bear_boost_pct: 0.8
+    bear_boost_pct: 0.6
     delivery_pref: near
     force_close_at_end: true
     holding_mode: night
     tp1_pct: 1.0
 night_trading:
   enabled: true
-  force_close: 04:30
+  force_close: 04:45
   session_end: 05:00
   session_start: '15:00'
   us_open_summer: '21:30'
@@ -56,8 +56,8 @@ pricing:
   default_iv: 0.25
   entry_premium_mode: model
   expiry_dte_floor_days: 7.0
-  max_iv: 0.32
-  min_iv: 0.18
+  max_iv: 0.40
+  min_iv: 0.12
   near_dte_days: 3.0
   neutral_iv_mult: 1.0
   pricing_model: quantlib
@@ -66,25 +66,25 @@ pricing:
 risk_mgmt:
   entry_premium_limit: 1500
   initial_capital: 100000
-  lots_per_trade: 1
-  max_daily_loss: 0.02
+  lots_per_trade: 2
+  max_daily_loss: 0.03
   max_holding_days: 7
-  max_position_size: 0.05
-  max_positions: 2
+  max_position_size: 0.08
+  max_positions: 15
   min_dte_to_exit: 7.0
   opening_grace_mins: 5
-  stop_loss_pct: 0.15
+  stop_loss_pct: 0.25
 strategy:
-  cooldown_bars: 3
-  entry_score: 15
+  cooldown_bars: 2
+  entry_score: 10
   fallback_underlying_price: 33500
-  fire_score_threshold: 60
+  fire_score_threshold: 40
   length: 20
   monthly_delivery_min_days: 14
   regime_filter: mid
   require_align: false
   require_fire: false
-  score_floor: 15
+  score_floor: 10
   tsm_strategy:
     enabled: true
     nvda_threshold: 0.0
@@ -103,16 +103,16 @@ theta_gang:
   min_credit: 30
   min_dte_entry: 7
   min_dte_exit: 3
-  min_iv: 0.18
+  min_iv: 0.12
   otm_offset: 200
   quantity: 1
   risk_free_rate: 0.02
   strategy: iron_condor
-  take_profit_pct: 0.5
+  take_profit_pct: 0.2
   wing_width: 200
-  # 新增: 交易頻率控制
-  cooldown_bars: 20          # 增加冷卻時間至20根K線
-  min_holding_bars: 10       # 最小持倉時間10根K線
-  exit_on_theta: true        # 啟用時間衰減出場
-  stop_loss_pct: 0.05        # 5%停損
-  take_profit_pct: 0.3       # 30%停利
+  cooldown_bars: 20
+  min_holding_bars: 10
+  squeeze_release_confirm_bars: 2
+  max_bar_price_deviation_pts: 250
+  exit_on_theta: true
+  stop_loss_pct: 0.05

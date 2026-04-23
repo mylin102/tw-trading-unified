@@ -448,6 +448,355 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
     )
     return fig
 
+# ── Futures Dual Contract Chart ──
+def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", signals=None):
+    """繪製期貨雙合約價格圖表
+    
+    顯示近月合約價格，如果提供遠月資料則同時顯示遠月價格
+    
+    Args:
+        near_df: 近月合約資料 (必須包含 'timestamp' 和 'close' 欄位)
+        far_df: 遠月合約資料 (可選，必須包含 'timestamp' 和 'close' 欄位)
+        title: 圖表標題
+        signals: 交易訊號資料
+        
+    Returns:
+        Plotly Figure 物件
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    
+    # 創建子圖 (價格 + 分數)
+    fig = make_subplots(
+        rows=2, cols=1, 
+        shared_xaxes=True, 
+        row_heights=[0.7, 0.3], 
+        vertical_spacing=0.05
+    )
+    
+    # 1. 近月價格線
+    fig.add_trace(
+        go.Scatter(
+            x=near_df["timestamp"],
+            y=near_df["close"],
+            name="近月",
+            line=dict(width=2, color="#1f77b4"),
+            mode="lines"
+        ),
+        row=1, col=1
+    )
+    
+    # 2. 如果有遠月資料，添加遠月價格線
+    if far_df is not None and not far_df.empty:
+        # 確保時間戳對齊
+        far_df_aligned = far_df[far_df["timestamp"].isin(near_df["timestamp"])]
+        if not far_df_aligned.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=far_df_aligned["timestamp"],
+                    y=far_df_aligned["close"],
+                    name="遠月",
+                    line=dict(width=1.5, color="#ff7f0e", dash="dash"),
+                    mode="lines"
+                ),
+                row=1, col=1
+            )
+    
+    # 3. 添加交易訊號
+    if signals is not None and not signals.empty and "action" in signals.columns:
+        # 買入訊號
+        buys = signals[signals["action"].str.contains("BUY", case=False, na=False)]
+        if not buys.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=buys["timestamp"],
+                    y=buys["price"],
+                    mode="markers",
+                    marker=dict(symbol="triangle-up", size=12, color="#00cc66", line=dict(width=1, color="white")),
+                    name="BUY"
+                ),
+                row=1, col=1
+            )
+        
+        # 賣出訊號
+        sells = signals[signals["action"].str.contains("SELL", case=False, na=False)]
+        if not sells.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=sells["timestamp"],
+                    y=sells["price"],
+                    mode="markers",
+                    marker=dict(symbol="triangle-down", size=12, color="#ff4444", line=dict(width=1, color="white")),
+                    name="SELL"
+                ),
+                row=1, col=1
+            )
+        
+        # 出場訊號
+        exits = signals[signals["action"].str.contains("EXIT|COVER", case=False, na=False)]
+        if not exits.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=exits["timestamp"],
+                    y=exits["price"],
+                    mode="markers",
+                    marker=dict(symbol="diamond", size=10, color="#ffa500", line=dict(width=1, color="white")),
+                    name="EXIT"
+                ),
+                row=1, col=1
+            )
+    
+    # 4. 分數條形圖 (如果近月資料有 score 欄位)
+    if "score" in near_df.columns:
+        scores = near_df["score"]
+        colors = ["#00cc66" if s >= 0 else "#ff4444" for s in scores]
+        fig.add_trace(
+            go.Bar(
+                x=near_df["timestamp"],
+                y=scores,
+                name="Score",
+                marker_color=colors
+            ),
+            row=2, col=1
+        )
+    
+    # 5. 添加交易時間標記
+    from core.date_utils import is_night_session
+    import pandas as pd
+    
+    # 垂直線標記交易日開始 (15:00)
+    ts_series = pd.to_datetime(near_df["timestamp"], errors="coerce")
+    for ts in ts_series:
+        if pd.notna(ts) and hasattr(ts, "hour") and ts.hour == 15 and ts.minute == 0:
+            fig.add_vline(x=ts, line_width=1, line_dash="dash", line_color="gray", row="all", col=1)
+    
+    # 夜盤時段背景著色
+    night_mask = is_night_session(near_df["timestamp"])
+    if night_mask.any():
+        night_starts = near_df.loc[night_mask & ~night_mask.shift(1).fillna(False), "timestamp"]
+        night_ends = near_df.loc[night_mask & ~night_mask.shift(-1).fillna(False), "timestamp"]
+        for start, end in zip(night_starts, night_ends):
+            fig.add_vrect(
+                x0=start, x1=end,
+                fillcolor="gray", opacity=0.1,
+                layer="below", line_width=0,
+                row="all", col=1
+            )
+    
+    # 6. 圖表佈局設定
+    fig.update_layout(
+        height=400,
+        margin=dict(t=30, b=10, l=40, r=20),
+        title=dict(text=title, x=0.5, xanchor="center"),
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    # 7. 移除非交易時段間隔
+    fig.update_xaxes(
+        rangebreaks=[
+            dict(bounds=["sat", "mon"]),  # 移除週末
+            dict(bounds=[5, 8.75], pattern="hour"),   # 05:00 - 08:45
+            dict(bounds=[13.75, 15], pattern="hour"), # 13:45 - 15:00
+        ],
+        row=1, col=1
+    )
+    fig.update_xaxes(
+        rangebreaks=[
+            dict(bounds=["sat", "mon"]),
+            dict(bounds=[5, 8.75], pattern="hour"),
+            dict(bounds=[13.75, 15], pattern="hour"),
+        ],
+        row=2, col=1
+    )
+    
+    return fig
+
+# ── Calendar Spread Chart ──
+def make_calendar_spread_chart(spread_df):
+    """繪製日曆價差圖表
+    
+    包含：
+    1. 近月/遠月價格走勢
+    2. 價差 (spread) 走勢
+    3. Spread Z-score 指標
+    4. Calendar Condor 策略進出場條件標記
+    """
+    if spread_df is None or spread_df.empty:
+        return None
+    
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        
+        # 創建 3 行子圖
+        fig = make_subplots(
+            rows=3, cols=1,
+            shared_xaxes=True,
+            row_heights=[0.4, 0.3, 0.3],
+            vertical_spacing=0.05,
+            subplot_titles=("近月/遠月價格", "價差 (Spread)", "Spread Z-score")
+        )
+        
+        # 1. 近月/遠月價格走勢
+        if "Close_near" in spread_df.columns and "Close_far" in spread_df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=spread_df["timestamp"],
+                    y=spread_df["Close_near"],
+                    name="近月",
+                    line=dict(color="#1f77b4", width=2),
+                    mode="lines"
+                ),
+                row=1, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=spread_df["timestamp"],
+                    y=spread_df["Close_far"],
+                    name="遠月",
+                    line=dict(color="#ff7f0e", width=2, dash="dash"),
+                    mode="lines"
+                ),
+                row=1, col=1
+            )
+        
+        # 2. 價差走勢
+        if "spread" in spread_df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=spread_df["timestamp"],
+                    y=spread_df["spread"],
+                    name="價差 (近月-遠月)",
+                    line=dict(color="#2ca02c", width=2),
+                    mode="lines"
+                ),
+                row=2, col=1
+            )
+            
+            # 添加價差移動平均線
+            if "spread_ma" in spread_df.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=spread_df["timestamp"],
+                        y=spread_df["spread_ma"],
+                        name="價差 MA(20)",
+                        line=dict(color="#9467bd", width=1, dash="dot"),
+                        mode="lines"
+                    ),
+                    row=2, col=1
+                )
+            
+            # 添加價差標準差帶
+            if "spread_ma" in spread_df.columns and "spread_std" in spread_df.columns:
+                upper_band = spread_df["spread_ma"] + spread_df["spread_std"]
+                lower_band = spread_df["spread_ma"] - spread_df["spread_std"]
+                
+                # 添加標準差帶（半透明）
+                fig.add_trace(
+                    go.Scatter(
+                        x=spread_df["timestamp"].tolist() + spread_df["timestamp"].tolist()[::-1],
+                        y=upper_band.tolist() + lower_band.tolist()[::-1],
+                        fill="toself",
+                        fillcolor="rgba(128, 128, 128, 0.2)",
+                        line=dict(color="rgba(128, 128, 128, 0)"),
+                        name="±1 Std Dev",
+                        showlegend=True
+                    ),
+                    row=2, col=1
+                )
+        
+        # 3. Spread Z-score
+        if "spread_z" in spread_df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=spread_df["timestamp"],
+                    y=spread_df["spread_z"],
+                    name="Spread Z-score",
+                    line=dict(color="#d62728", width=2),
+                    mode="lines"
+                ),
+                row=3, col=1
+            )
+            
+            # 添加 Calendar Condor 策略的進出場水平線
+            # 進場條件: spread_z > 3.0 (做空價差) 或 spread_z < -3.0 (做多價差)
+            # 出場條件: spread_z < -0.5 (做空價差獲利了結) 或 spread_z > 0.5 (做多價差獲利了結)
+            # 停損條件: spread_z > 3.5 (做空價差停損) 或 spread_z < -3.5 (做多價差停損)
+            
+            # 進場水平線
+            fig.add_hline(
+                y=3.0, line_dash="dash", line_color="red", 
+                annotation_text="做空價差進場", annotation_position="top right",
+                row=3, col=1
+            )
+            fig.add_hline(
+                y=-3.0, line_dash="dash", line_color="green",
+                annotation_text="做多價差進場", annotation_position="bottom right",
+                row=3, col=1
+            )
+            
+            # 出場水平線
+            fig.add_hline(
+                y=-0.5, line_dash="dot", line_color="orange",
+                annotation_text="做空價差出場", annotation_position="bottom right",
+                row=3, col=1
+            )
+            fig.add_hline(
+                y=0.5, line_dash="dot", line_color="orange",
+                annotation_text="做多價差出場", annotation_position="top right",
+                row=3, col=1
+            )
+            
+            # 停損水平線
+            fig.add_hline(
+                y=3.5, line_dash="dash", line_color="darkred",
+                annotation_text="做空價差停損", annotation_position="top right",
+                row=3, col=1
+            )
+            fig.add_hline(
+                y=-3.5, line_dash="dash", line_color="darkgreen",
+                annotation_text="做多價差停損", annotation_position="bottom right",
+                row=3, col=1
+            )
+            
+            # 零線
+            fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=3, col=1)
+        
+        # 更新佈局
+        fig.update_layout(
+            height=700,
+            margin=dict(t=40, b=20, l=40, r=20),
+            legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center"),
+            hovermode="x unified",
+            title_text="日曆價差分析 (Calendar Spread)"
+        )
+        
+        # 移除非交易時段
+        fig.update_xaxes(
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]),  # 移除週末
+                dict(bounds=[5, 8.75], pattern="hour"),   # 05:00 - 08:45
+                dict(bounds=[13.75, 15], pattern="hour"), # 13:45 - 15:00
+            ],
+            tickformat="%m/%d\n%H:%M",
+            hoverformat="%Y/%m/%d %H:%M"
+        )
+        
+        # 設置 Y 軸標籤
+        fig.update_yaxes(title_text="價格", row=1, col=1, tickformat=",.0f")
+        fig.update_yaxes(title_text="價差點數", row=2, col=1, tickformat=",.1f")
+        fig.update_yaxes(title_text="Z-score", row=3, col=1, tickformat=",.2f")
+        
+        return fig
+        
+    except Exception as e:
+        print(f"[Calendar Spread] 繪製圖表錯誤: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 # ── PnL helpers ──
 def calc_futures_pnl(trades_df):
     """從期貨 trades CSV 的 pnl_cash 欄位累計"""
@@ -826,7 +1175,8 @@ def load_futures_indicators(full_history=False):
     all_dfs = []
     for priority, date_part in enumerate(search_days):
         for tag in ["", "_LIVE", "_PAPER", "_DRY"]:
-            f = FUTURES_MKT / f"TMF_{date_part}{tag}_indicators.csv"
+            for prefix in ["TMF", "MXF"]:
+                f = FUTURES_MKT / f"{prefix}_{date_part}{tag}_indicators.csv"
             if f.exists():
                 df = _read_and_standardize(f)
                 if df is not None and "timestamp" in df.columns:
@@ -898,7 +1248,7 @@ def load_futures_indicators(full_history=False):
     else:
         # 2. 備案：找目錄下最新的 CSV
         try:
-            all_files = list(FUTURES_MKT.glob("TMF_*_indicators.csv"))
+            all_files = list(FUTURES_MKT.glob("*_*_indicators.csv"))
             if all_files:
                 latest_file = max(all_files, key=os.path.getmtime)
                 df = _read_and_standardize(latest_file)
@@ -928,6 +1278,205 @@ def load_futures_indicators(full_history=False):
         except Exception:
             pass
     return result
+
+@st.cache_data(ttl=30)
+def load_far_month_data(product="MXF"):
+    """載入遠月合約資料
+    
+    Args:
+        product: 商品代碼 (MXF, TMF)
+        
+    Returns:
+        DataFrame with far month data or None
+    """
+    import pandas as pd
+    import os
+    import datetime as dt
+    import glob
+    
+    # 搜尋遠月資料檔案
+    search_patterns = [
+        f"./data/{product.lower()}_far_*.csv",
+        f"./data/{product.lower()}_far.csv",
+        f"./logs/market_data/{product}_*_far_*.csv",
+        f"./exports/{product.lower()}_far_*.csv",
+    ]
+    
+    far_files = []
+    for pattern in search_patterns:
+        far_files.extend(glob.glob(pattern))
+    
+    # 按修改時間排序，取最新的檔案
+    if far_files:
+        far_files.sort(key=os.path.getmtime, reverse=True)
+        latest_far_file = far_files[0]
+        
+        try:
+            df_far = pd.read_csv(latest_far_file)
+            
+            # 處理 timestamp 欄位
+            if "timestamp" not in df_far.columns:
+                if df_far.index.name == "timestamp" or df_far.index.name == "ts":
+                    df_far = df_far.reset_index()
+                elif "ts" in df_far.columns:
+                    df_far = df_far.rename(columns={"ts": "timestamp"})
+                elif "datetime" in df_far.columns:
+                    df_far = df_far.rename(columns={"datetime": "timestamp"})
+                else:
+                    # 使用第一欄作為 timestamp
+                    df_far = df_far.rename(columns={df_far.columns[0]: "timestamp"})
+            
+            # 確保 timestamp 是 datetime 類型
+            df_far["timestamp"] = pd.to_datetime(df_far["timestamp"], errors="coerce")
+            df_far = df_far.dropna(subset=["timestamp"])
+            
+            # 標準化欄位名稱
+            col_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+            for upper, lower in col_map.items():
+                if upper in df_far.columns and lower not in df_far.columns:
+                    df_far = df_far.rename(columns={upper: lower})
+            
+            # 確保有 close 欄位
+            if "close" not in df_far.columns and "Close" in df_far.columns:
+                df_far = df_far.rename(columns={"Close": "close"})
+            
+            # 按時間排序
+            df_far = df_far.sort_values("timestamp")
+            
+            return df_far
+            
+        except Exception as e:
+            print(f"載入遠月資料失敗: {e}")
+            return None
+    
+    return None
+
+@st.cache_data(ttl=30)
+def load_calendar_spread_data():
+    """載入日曆價差資料 (近月/遠月合約價差)
+    
+    優先載入預先計算的價差檔案，如果不存在則嘗試從近月/遠月資料計算
+    """
+    try:
+        import pandas as pd
+        import numpy as np
+        from pathlib import Path
+        
+        # 優先尋找預先計算的價差檔案
+        spread_files = list(Path("data").glob("*spread*.csv"))
+        if not spread_files:
+            spread_files = list(Path(".").rglob("*calendar*spread*.csv"))
+        
+        if spread_files:
+            # 選擇最新的檔案
+            latest_file = max(spread_files, key=lambda p: p.stat().st_mtime)
+            df = pd.read_csv(latest_file)
+            
+            # 標準化 timestamp 欄位
+            if "timestamp" not in df.columns:
+                if "ts" in df.columns:
+                    df = df.rename(columns={"ts": "timestamp"})
+                elif df.index.name == "timestamp":
+                    df = df.reset_index()
+                elif len(df.columns) > 0:
+                    df = df.rename(columns={df.columns[0]: "timestamp"})
+            
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                df = df.dropna(subset=["timestamp"])
+            
+            # 確保數值欄位是數值類型
+            numeric_cols = ["spread", "spread_z", "spread_ma", "spread_std", 
+                           "vwap_z", "price_vs_vwap", "Close_near", "Close_far"]
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            
+            # 處理無限值
+            df = df.replace([np.inf, -np.inf], np.nan)
+            
+            print(f"[Calendar Spread] 載入價差資料: {len(df)} 筆, 來自 {latest_file.name}")
+            return df
+        
+        # 如果沒有預先計算的檔案，嘗試從近月/遠月資料計算
+        print("[Calendar Spread] 沒有預先計算的價差檔案，嘗試計算...")
+        
+        # 載入近月資料
+        df_near = load_futures_indicators(full_history=True)
+        if df_near is None or df_near.empty:
+            print("[Calendar Spread] 無法載入近月資料")
+            return pd.DataFrame()
+        
+        # 嘗試尋找遠月資料檔案
+        far_files = list(Path("data").glob("*far*.csv"))
+        if not far_files:
+            # 嘗試在 logs/market_data 中尋找
+            far_files = list(Path("logs/market_data").glob("*far*.csv"))
+        if not far_files:
+            # 嘗試在 exports 中尋找
+            far_files = list(Path("exports").glob("*far*.csv"))
+        if not far_files:
+            # 嘗試尋找 MXF 遠月資料
+            far_files = list(Path(".").rglob("*MXF*far*.csv"))
+        if not far_files:
+            # 嘗試尋找任何包含 "far" 的 CSV 檔案
+            far_files = list(Path(".").rglob("*far*.csv"))
+        
+        # 載入遠月資料
+        df_far = pd.read_csv(far_files[0])
+        
+        # 標準化遠月資料
+        if "timestamp" not in df_far.columns:
+            if "ts" in df_far.columns:
+                df_far = df_far.rename(columns={"ts": "timestamp"})
+            elif df_far.index.name == "timestamp":
+                df_far = df_far.reset_index()
+        
+        if "timestamp" in df_far.columns:
+            df_far["timestamp"] = pd.to_datetime(df_far["timestamp"], errors="coerce")
+            df_far = df_far.dropna(subset=["timestamp"])
+        
+        # 合併近月和遠月資料
+        df_merged = pd.merge(
+            df_near[["timestamp", "close"]].rename(columns={"close": "Close_near"}),
+            df_far[["timestamp", "close"]].rename(columns={"close": "Close_far"}),
+            on="timestamp",
+            how="inner"
+        )
+        
+        if df_merged.empty:
+            print("[Calendar Spread] 近月/遠月資料沒有重疊的時間戳記")
+            return pd.DataFrame()
+        
+        # 計算價差
+        df_merged["spread"] = df_merged["Close_near"] - df_merged["Close_far"]
+        
+        # 計算滾動統計量 (20期窗口)
+        window = 20
+        df_merged["spread_ma"] = df_merged["spread"].rolling(window=window, min_periods=window).mean()
+        df_merged["spread_std"] = df_merged["spread"].rolling(window=window, min_periods=window).std()
+        
+        # 計算 Z-score
+        safe_spread_std = df_merged["spread_std"].replace(0, np.nan)
+        df_merged["spread_z"] = (df_merged["spread"] - df_merged["spread_ma"]) / safe_spread_std
+        
+        # 計算 VWAP Z-score (使用近月價格)
+        df_merged["vwap"] = df_merged["Close_near"].rolling(window=window, min_periods=window).mean()
+        df_merged["vwap_std"] = df_merged["Close_near"].rolling(window=window, min_periods=window).std()
+        safe_vwap_std = df_merged["vwap_std"].replace(0, np.nan)
+        df_merged["vwap_z"] = (df_merged["Close_near"] - df_merged["vwap"]) / safe_vwap_std
+        
+        # 計算價格 vs VWAP
+        df_merged["price_vs_vwap"] = df_merged["Close_near"] - df_merged["vwap"]
+        
+        print(f"[Calendar Spread] 計算價差資料完成: {len(df_merged)} 筆")
+        return df_merged
+        
+    except Exception as e:
+        print(f"[Calendar Spread] 載入價差資料錯誤: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
 
 @st.cache_data(ttl=5)
 def load_futures_trades():
@@ -1245,7 +1794,7 @@ with tab_overview:
     o_df = load_options_indicators(full_history=cont_mode)
 
     with col1:
-        st.header(f"期貨 TMF ({mode_badge(f_live)})")
+        st.header(f"期貨 MXF ({mode_badge(f_live)})")
         if f_df is not None and not f_df.empty:
             last = f_df.iloc[-1]
             c1, c2, c3 = st.columns(3)
@@ -1445,7 +1994,7 @@ with tab_overview:
 # Tab 2: 期貨
 # ════════════════════════════════════════
 with tab_futures:
-    st.header(f"期貨 TMF ({mode_badge(f_live)})")
+    st.header(f"期貨 MXF ({mode_badge(f_live)})")
 
     f_df = load_futures_indicators(full_history=cont_mode)
     if f_df is not None and not f_df.empty:
@@ -1487,10 +2036,140 @@ with tab_futures:
             st.success("🔥 **FIRE — 壓縮釋放！**")
         
         ft, _ = load_futures_trades()
-        st.plotly_chart(make_price_score_chart(f_df, "close", "TMF 價格 & Score", signals=ft), use_container_width=True)
+        
+        # 載入遠月資料
+        df_far = load_far_month_data("MXF")
+        
+        # 使用雙合約圖表顯示近月和遠月價格
+        if df_far is not None and not df_far.empty:
+            st.plotly_chart(
+                make_futures_dual_chart(
+                    f_df, 
+                    df_far, 
+                    "MXF 近月/遠月價格 & Score", 
+                    signals=ft
+                ), 
+                use_container_width=True
+            )
+        else:
+            # 如果沒有遠月資料，使用原來的圖表
+            st.plotly_chart(
+                make_price_score_chart(f_df, "close", "MXF 價格 & Score", signals=ft), 
+                use_container_width=True
+            )
+            st.info("⚠️ 未找到遠月資料，僅顯示近月價格")
+        
         st.dataframe(f_df.tail(20), use_container_width=True)
     else:
         st.info("無數據")
+    
+    # ── Calendar Spread 顯示 ──
+    st.header("📊 日曆價差分析 (Calendar Spread)")
+    
+    with st.expander("📈 價差圖表與策略條件", expanded=True):
+        # 載入 calendar spread 資料
+        spread_df = load_calendar_spread_data()
+        
+        if spread_df is not None and not spread_df.empty:
+            # 顯示最新價差狀態
+            last_spread = spread_df.iloc[-1]
+            
+            # 創建指標卡片
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                if "spread" in last_spread:
+                    spread_val = last_spread["spread"]
+                    st.metric("價差 (近月-遠月)", f"{spread_val:.1f} pts")
+            
+            with col2:
+                if "spread_z" in last_spread:
+                    spread_z = last_spread["spread_z"]
+                    # 根據 Z-score 顯示狀態
+                    if spread_z > 3.0:
+                        status = "🔴 做空價差機會"
+                    elif spread_z < -3.0:
+                        status = "🟢 做多價差機會"
+                    elif abs(spread_z) < 0.5:
+                        status = "⚪ 中性區間"
+                    else:
+                        status = "🟡 觀察中"
+                    st.metric("Spread Z-score", f"{spread_z:.2f}", delta=status)
+            
+            with col3:
+                if "Close_near" in last_spread and "Close_far" in last_spread:
+                    near_price = last_spread["Close_near"]
+                    far_price = last_spread["Close_far"]
+                    st.metric("近月價格", f"{near_price:.0f}")
+            
+            with col4:
+                if "Close_far" in last_spread:
+                    st.metric("遠月價格", f"{far_price:.0f}")
+            
+            # 顯示 Calendar Condor 策略條件狀態
+            st.subheader("🎯 Calendar Condor 策略條件")
+            
+            cond_col1, cond_col2, cond_col3 = st.columns(3)
+            
+            with cond_col1:
+                if "spread_z" in last_spread:
+                    spread_z = last_spread["spread_z"]
+                    # 做空價差條件
+                    if spread_z > 3.0:
+                        st.success("✅ 做空價差條件觸發")
+                        st.caption(f"Spread Z-score: {spread_z:.2f} > 3.0")
+                    else:
+                        st.info("⏳ 等待做空價差條件")
+                        st.caption(f"需要 Spread Z-score > 3.0 (目前: {spread_z:.2f})")
+            
+            with cond_col2:
+                if "spread_z" in last_spread:
+                    # 做多價差條件
+                    if spread_z < -3.0:
+                        st.success("✅ 做多價差條件觸發")
+                        st.caption(f"Spread Z-score: {spread_z:.2f} < -3.0")
+                    else:
+                        st.info("⏳ 等待做多價差條件")
+                        st.caption(f"需要 Spread Z-score < -3.0 (目前: {spread_z:.2f})")
+            
+            with cond_col3:
+                if "spread_z" in last_spread:
+                    # 出場條件
+                    if abs(spread_z) < 0.5:
+                        st.success("✅ 出場條件觸發")
+                        st.caption(f"Spread Z-score: {spread_z:.2f} 接近 0")
+                    else:
+                        st.info("⏳ 持倉中")
+                        st.caption(f"等待 Spread Z-score 回歸到 ±0.5 內")
+            
+            # 顯示價差圖表
+            spread_chart = make_calendar_spread_chart(spread_df)
+            if spread_chart:
+                st.plotly_chart(spread_chart, use_container_width=True)
+            
+            # 顯示價差資料表格
+            with st.expander("📋 價差資料明細"):
+                # 只顯示重要欄位
+                display_cols = ["timestamp", "Close_near", "Close_far", "spread", "spread_z", "spread_ma", "spread_std"]
+                available_cols = [col for col in display_cols if col in spread_df.columns]
+                
+                if available_cols:
+                    st.dataframe(spread_df[available_cols].tail(20), use_container_width=True)
+                else:
+                    st.dataframe(spread_df.tail(20), use_container_width=True)
+        else:
+            st.warning("⚠️ 無法載入日曆價差資料")
+            st.info("""
+            可能原因：
+            1. 沒有遠月合約資料檔案
+            2. 近月/遠月資料時間戳記沒有重疊
+            3. 尚未執行 calendar spread 資料收集
+            
+            解決方法：
+            - 執行 `scripts/fetch_calendar_spread_data_fixed.py` 收集遠月資料
+            - 檢查 `data/` 目錄是否有 `*spread*.csv` 或 `*far*.csv` 檔案
+            """)
+    
     ft, _ = load_futures_trades()
     if ft is not None and not ft.empty:
         # --- Unrealized PnL ---
@@ -2510,7 +3189,7 @@ with tab_settings:
             f_lots = c1.number_input("每筆交易口數", min_value=1, max_value=10,
                                      value=futures_cfg.get("trade_mgmt", {}).get("lots_per_trade", 2),
                                      help="每次進場的口數。實盤建議從 1 口開始。")
-            f_max_pos = c2.number_input("最大持倉口數", min_value=1, max_value=10,
+            f_max_pos = c2.number_input("最大持倉口數", min_value=1, max_value=20,
                                         value=futures_cfg.get("trade_mgmt", {}).get("max_positions", 2),
                                         help="同時最大持倉口數。建議 1-2 口控制風險。")
 
@@ -2600,7 +3279,7 @@ with tab_settings:
             o_lots = oc1.number_input("每筆交易口數", min_value=1, max_value=10,
                                      value=opt_risk_cfg.get("lots_per_trade", 2),
                                      help="基礎進場口數。Runtime 仍可能依 Decision Intelligence 做單次縮放，但不應默默改寫這個基礎值。")
-            o_max_pos = oc2.number_input("最大持倉口數", min_value=1, max_value=10,
+            o_max_pos = oc2.number_input("最大持倉口數", min_value=1, max_value=20,
                                         value=opt_risk_cfg.get("max_positions", 2),
                                         help="同時最大持倉口數。建議 1-2 口控制風險。")
 

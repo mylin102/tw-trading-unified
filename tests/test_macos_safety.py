@@ -254,6 +254,39 @@ class TestBidaskDispatcherSafety:
         assert om.monitor.market_data["C"]["ask"] == 105.0
         assert om.monitor.market_data["C"]["close"] == 102.5  # mid price
 
+    def test_bidask_dispatcher_throttles_mtx_visibility_log_without_skipping_updates(self, monkeypatch):
+        """MTX visibility logs are throttled, but market data still updates every callback."""
+        import main
+        from main import bidask_dispatcher
+
+        om = self._make_mock_options_mon()
+        prints = []
+        callback = bidask_dispatcher(None, om)
+
+        time_values = iter([100.0, 100.0, 101.0, 101.0, 106.5, 106.5])
+        monkeypatch.setattr(main.time, "time", lambda: next(time_values))
+        monkeypatch.setattr(main.console, "print", lambda *args, **kwargs: prints.append(args[0] if args else ""))
+
+        bidask = MagicMock()
+        bidask.code = "MXF202604"
+        bidask.bid_price = [100]
+        bidask.ask_price = [104]
+        callback("FOP", bidask)
+        assert om.monitor.market_data["MTX"]["close"] == 102.0
+
+        bidask.bid_price = [101]
+        bidask.ask_price = [105]
+        callback("FOP", bidask)
+        assert om.monitor.market_data["MTX"]["close"] == 103.0
+
+        bidask.bid_price = [102]
+        bidask.ask_price = [106]
+        callback("FOP", bidask)
+        assert om.monitor.market_data["MTX"]["close"] == 104.0
+
+        mtx_logs = [msg for msg in prints if "MTX updated" in msg]
+        assert len(mtx_logs) == 2
+
     def test_bidask_dispatcher_exception_isolation(self):
         """Exception in market data update doesn't crash dispatcher"""
         from main import bidask_dispatcher, _shutdown_event

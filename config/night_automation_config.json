@@ -1,0 +1,37 @@
+{
+  "attribution_dir": "/Users/mylin/Documents/mylin102/tw-trading-unified/data/attribution",
+  "attribution_enabled": true,
+  "attribution_buffer_size": 1000,
+  "attribution_flush_interval": 300,
+  "reports_dir": "/Users/mylin/Documents/mylin102/tw-trading-unified/reports/night_session",
+  "alerts_dir": "/Users/mylin/Documents/mylin102/tw-trading-unified/alerts/night_session",
+  "logs_dir": "/Users/mylin/Documents/mylin102/tw-trading-unified/logs",
+  "starvation_threshold": 0.7,
+  "priority_impact_threshold": 2.0,
+  "low_evaluation_threshold": 10,
+  "reorder_simulation_enabled": true,
+  "reorder_interval_minutes": 120,
+  "default_orders": [
+    [
+      "counter_vwap",
+      "spring_upthrust",
+      "kbar_feature"
+    ],
+    [
+      "kbar_feature",
+      "counter_vwap",
+      "spring_upthrust"
+    ],
+    [
+      "spring_upthrust",
+      "kbar_feature",
+      "counter_vwap"
+    ]
+  ],
+  "email_enabled": false,
+  "email_recipient": "",
+  "dashboard_enabled": true,
+  "dashboard_port": 8500,
+  "night_session_start_hour": 15,
+  "night_session_end_hour": 5
+}

@@ -4,6 +4,7 @@ from __future__ import annotations
 from core.signal import Signal
 from core.strategy_base import StrategyBase
 from core.strategy_context import StrategyContext
+from strategies.futures.elite_strategies import is_spring_long_context_favorable
 
 
 class SpringUpthrust(StrategyBase):
@@ -58,6 +59,8 @@ class SpringUpthrust(StrategyBase):
 
         # Spring: 假跌破 BB 下軌 → 做多（收盤彈回）
         if low < bb_lower and close > bb_lower and context.position.size <= 0:
+            if not is_spring_long_context_favorable(bar):
+                return None
             return Signal(
                 "BUY",
                 "SPRING",

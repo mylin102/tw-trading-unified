@@ -28,7 +28,7 @@ Medium
 Low
 ---
 - scripts/runners/watchdog.sh backoff doubling logic multiplies BEFORE sleep; initial backoff comment mismatches implementation. Minor clarity fix.
-- Several docs mention adaptive components; ensure consolidation to single docs/ location (docs-consolidation-plan.md already exists).
+- Several docs mention adaptive components; ensure consolidation to single docs/ location (`docs/docs-consolidation-plan.md` already exists).
 - Minor naming inconsistencies: decision_logger's read_decisions vs tests expecting read.
 
 Suggested fixes (concrete)

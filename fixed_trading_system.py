@@ -56,7 +56,7 @@ def safe_shioaji_test():
         console.print("[dim]📋 獲取合約中...[/dim]")
         
         # 期貨合約
-        tmf_contracts = _api.Contracts.Futures["TMF"]
+        tmf_contracts = _api.Contracts.Futures["MXF"]
         mxf_contracts = _api.Contracts.Futures["MXF"]
         
         # 選擇最近月合約
@@ -84,7 +84,7 @@ def safe_shioaji_test():
             console.print("[red]❌ 找不到有效合約[/red]")
             return False
         
-        console.print(f"[green]📈 TMF 合約: {tmf_contract.code} (到期日: {tmf_contract.delivery_date})[/green]")
+        console.print(f"[green]📈 MXF 合約: {tmf_contract.code} (到期日: {tmf_contract.delivery_date})[/green]")
         console.print(f"[green]📈 MXF 合約: {mxf_contract.code} (到期日: {mxf_contract.delivery_date})[/green]")
         
         # 定義回調函數

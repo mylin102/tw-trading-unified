@@ -70,6 +70,8 @@ class TestLoadConfig:
         cfg = load_config(Path("config/futures.yaml"))
         assert isinstance(cfg, dict)
         assert "strategy" in cfg or len(cfg) == 0  # might be empty if file missing
+        if "strategy" in cfg:
+            assert cfg.get("active_strategy") == cfg["strategy"].get("active_strategy")
 
     def test_load_nonexistent_config(self):
         cfg = load_config(Path("config/nonexistent.yaml"))

@@ -32,3 +32,38 @@ shioaji.log
 login/account/
 .gstack/
 .aider*
+
+# Coverage
+.coverage
+coverage.xml
+cache/
+
+# Generated / scratch files in root
+test_*.py
+!tests/
+_debug_*
+*.backup*
+*.orig
+*.clean
+*_fixed.py
+stock.jpg
+cron/
+
+# Planning docs (not project code)
+.planning/
+.github/workflows/
+
+# Exports / derived data
+data/archive/
+data/cleaned*/
+data/enriched*/
+data/technical_indicators/
+data/attribution/
+data/mxf_*
+test_kbar_data.csv
+
+# Scratch scripts
+scripts/fixed_night_monitor.py
+scripts/integrate_fixed_solution.py
+scripts/clean_stock_data.py
+scripts/backtest/

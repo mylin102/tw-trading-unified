@@ -1,8 +1,6 @@
 import os
 import sys
 import yaml
-import requests
-import json
 from pathlib import Path
 from dotenv import load_dotenv
 import shioaji as sj
@@ -14,20 +12,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from strategies.stocks.monitor import StockMonitor # noqa: E402
+from core.external_feature_provider import get_external_feature_provider, load_stock_config  # noqa: E402
 
 console = Console()
 
-LEADERS_URL = "https://raw.githubusercontent.com/mylin102/tw-canslim-web/master/data/leaders.json"
-
 def fetch_external_watchlist():
-    console.print(f"[cyan]🌐 Fetching external watchlist from {LEADERS_URL}...[/cyan]")
+    cfg = load_stock_config(ROOT / "config" / "stocks.yaml")
+    provider = get_external_feature_provider(cfg)
+    console.print("[cyan]🌐 Fetching external watchlist via external feature provider...[/cyan]")
     try:
-        response = requests.get(LEADERS_URL, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        # Extract symbols from universe
-        symbols = [item["symbol"] for item in data.get("universe", [])]
+        snapshot = provider.get_snapshot(prefer_refresh=True)
+        symbols = snapshot.get("watchlist_symbols", [])
+        if snapshot.get("degraded"):
+            console.print(f"[yellow]⚠️ Using degraded feature snapshot: {snapshot.get('degraded_reason', '')}[/yellow]")
         console.print(f"[green]✅ Successfully fetched {len(symbols)} stocks from external source.[/green]")
         return symbols
     except Exception as e:

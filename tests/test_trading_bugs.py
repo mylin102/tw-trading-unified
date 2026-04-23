@@ -201,6 +201,21 @@ class TestThetaGang:
         from strategies.options.theta_gang import should_enter_theta
         assert should_enter_theta(squeeze_on=True, iv=0.30)
 
+    def test_bull_put_spread_rejects_negative_directional_score(self):
+        from strategies.options.theta_gang import ThetaGangManager
+        from strategies.options.options_engine.engine.greeks import black_scholes
+        cfg = {"theta_gang": {
+            "strategy": "bull_put_spread", "wing_width": 200, "otm_offset": 200,
+            "quantity": 1, "min_iv": 0.18, "min_credit": 10,
+            "take_profit_pct": 0.50, "max_loss_pct": 1.0,
+            "min_dte_entry": 5, "min_dte_exit": 3,
+            "exit_on_squeeze_release": True, "risk_free_rate": 0.02,
+            "directional_score_floor": 0,
+        }}
+        mgr = ThetaGangManager(cfg, black_scholes, 100)
+        assert mgr.evaluate_entry(32700, 0.40, 12/365, squeeze_on=True, score=-10) is None
+        assert mgr.evaluate_entry(32700, 0.40, 12/365, squeeze_on=True, score=10) is not None
+
     def test_exit_on_squeeze_release(self):
         from strategies.options.theta_gang import ThetaGangManager
         from strategies.options.options_engine.engine.greeks import black_scholes
@@ -308,3 +323,161 @@ class TestCumulativeDeltaWeighted:
         result = strategy_cumulative_delta(state, cfg)
         # Result depends on price pullback condition, just verify no crash
         assert result is None or result["action"] in ("BUY", "SELL")
+
+
+class TestSpringBackgroundGate:
+    def _make_spring_state(self, **bar_overrides):
+        import pandas as pd
+
+        rows = [
+            {"Close": 100.0, "High": 101.0, "Low": 99.0}
+            for _ in range(21)
+        ]
+        rows.append({"Close": 100.5, "High": 101.0, "Low": 95.0})
+        df = pd.DataFrame(rows)
+        df.index = pd.date_range("2026-04-22 00:00", periods=len(df), freq="5min")
+
+        last_5m = df.iloc[-1].copy()
+        last_5m["atr"] = 20.0
+        last_5m["vwap"] = 100.0
+        last_5m["score"] = 10.0
+        last_5m["bullish_align"] = True
+        last_5m["bull_align"] = True
+        last_5m["opening_bearish"] = False
+
+        for key, value in bar_overrides.items():
+            last_5m[key] = value
+
+        cfg = {
+            "strategy": {
+                "spring_upthrust": {
+                    "bb_mult": 2.0,
+                    "kc_mult": 1.0,
+                    "atr_mult": 2.0,
+                    "bb_length": 20,
+                    "kc_length": 20,
+                }
+            }
+        }
+        return {"last_5m": last_5m, "df_5m": df, "score": last_5m["score"]}, cfg
+
+    def test_elite_spring_blocks_bearish_background_buy(self):
+        from strategies.futures.elite_strategies import strategy_spring_upthrust
+
+        state, cfg = self._make_spring_state(
+            score=-10.0,
+            bullish_align=False,
+            bull_align=False,
+            opening_bearish=True,
+            vwap=101.0,
+        )
+
+        assert strategy_spring_upthrust(state, cfg) is None
+
+    def test_elite_spring_allows_supportive_background_buy(self):
+        from strategies.futures.elite_strategies import strategy_spring_upthrust
+
+        state, cfg = self._make_spring_state()
+
+        signal = strategy_spring_upthrust(state, cfg)
+        assert signal is not None
+        assert signal["action"] == "BUY"
+
+    def test_plugin_spring_blocks_bearish_background_buy(self):
+        import pandas as pd
+        from core.strategy_context import MarketData, PositionView, StrategyContext
+        from strategies.plugins.futures.spring_upthrust import SpringUpthrust
+
+        strategy = SpringUpthrust()
+        init_ctx = StrategyContext(
+            market=MarketData(last_bar={}, df_5m=pd.DataFrame()),
+            position=PositionView(),
+            config={"strategy": {"spring_upthrust": {"atr_mult": 2.0}}},
+        )
+        strategy.init(init_ctx)
+
+        ctx = StrategyContext(
+            market=MarketData(
+                last_bar={
+                    "bb_upper": 105.0,
+                    "bb_lower": 100.0,
+                    "sqz_on": True,
+                    "Close": 100.5,
+                    "High": 101.0,
+                    "Low": 95.0,
+                    "atr": 20.0,
+                    "vwap": 101.0,
+                    "score": -10.0,
+                    "bullish_align": False,
+                    "bull_align": False,
+                    "opening_bearish": True,
+                },
+                df_5m=pd.DataFrame([{"Close": 100.5}]),
+            ),
+            position=PositionView(size=0),
+            config={"strategy": {"spring_upthrust": {"atr_mult": 2.0}}},
+        )
+
+        assert strategy.on_bar(ctx) is None
+
+
+class TestFuturesTrendHold:
+    def _make_monitor_stub(self, position=1, reason="ADAPTIVE_TREND_V3"):
+        from strategies.futures.monitor import FuturesMonitor
+
+        monitor = FuturesMonitor.__new__(FuturesMonitor)
+        monitor.trend_hold_enabled = True
+        monitor.trend_hold_atr_mult = 2.5
+        monitor.trend_hold_min_score = 40
+        monitor.trend_hold_min_trend_strength = 0.001
+        monitor.trend_hold_min_price_vs_vwap = 0.0003
+        monitor.trend_hold_min_time_to_close_mins = 20
+        monitor._last_entry_reason = reason
+        monitor._atr_trail_peak = 100.0
+        monitor._vwap_violation_bars = 0
+
+        class Trader:
+            def __init__(self, position):
+                self.position = position
+
+        monitor.trader = Trader(position)
+        return monitor
+
+    def test_trend_hold_activates_for_supported_trend_entry(self):
+        monitor = self._make_monitor_stub(position=1)
+        last_5m = {
+            "trend_strength_raw": 0.002,
+            "price_vs_vwap": 0.001,
+            "momentum": 20.0,
+            "bullish_align": True,
+        }
+
+        assert monitor._trend_hold_active(last_5m, 100.0, 60.0, 99.0, 120.0) is True
+
+    def test_trend_hold_ignores_counter_vwap_entry(self):
+        monitor = self._make_monitor_stub(position=1, reason="COUNTER_VWAP")
+        last_5m = {
+            "trend_strength_raw": 0.002,
+            "price_vs_vwap": 0.001,
+            "momentum": 20.0,
+            "bullish_align": True,
+        }
+
+        assert monitor._trend_hold_active(last_5m, 100.0, 60.0, 99.0, 120.0) is False
+
+    def test_trend_hold_trail_exits_long_when_pullback_breaks_chandelier(self):
+        monitor = self._make_monitor_stub(position=1)
+        exit_calls = []
+
+        def _fake_execute_trade(signal, price, ts, lots, reason=None, **kwargs):
+            exit_calls.append((signal, price, lots, reason))
+            return "ok"
+
+        monitor._execute_trade = _fake_execute_trade
+        monitor._atr_trail_peak = 110.0
+        last_5m = {"atr": 5.0}
+
+        result = monitor._apply_trend_hold_trail(97.0, last_5m, "2026-04-22 09:30:00")
+
+        assert result == "ok"
+        assert exit_calls[-1][3] == "TREND_HOLD_TRAIL"

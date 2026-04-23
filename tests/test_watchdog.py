@@ -109,6 +109,33 @@ def test_refresh_runtime_status_requires_fresh_tmf_for_trading(tmp_path, monkeyp
     assert get_shared_system_status() == SystemReadiness.TRADING
 
 
+def test_tmf_feed_age_falls_back_when_feed_health_reports_infinity(tmp_path):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("{}")
+    m = make_monitor(str(cfg))
+    m.feed_health = type("FeedHealth", (), {"age": lambda self, symbol: float("inf")})()
+    m._last_real_tmf_tick_at = time.time() - 2
+
+    age = m._tmf_feed_age_secs()
+
+    assert 0 <= age < 5
+
+
+def test_watchdog_uses_local_tmf_timer_during_startup_gap(tmp_path, monkeypatch):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("{}")
+    m = make_monitor(str(cfg))
+    m.STALE_WARN_SECS = 5
+    m.STALE_CRITICAL_SECS = 10
+    m.feed_health = type("FeedHealth", (), {"age": lambda self, symbol: float("inf")})()
+    m._last_real_tmf_tick_at = time.time() - 2
+    m._check_contract_rollover = lambda: None
+    m.client.get_kline = lambda ticker, interval="5m": None
+    monkeypatch.setattr("strategies.futures.monitor.is_taifex_futures_market_open", lambda: True)
+
+    m._check_futures_contract_staleness()
+
+
 def test_watchdog_critical_exit(tmp_path, monkeypatch):
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text("{}")

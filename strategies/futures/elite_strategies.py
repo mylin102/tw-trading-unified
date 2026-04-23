@@ -20,6 +20,28 @@ import pandas as pd
 import math
 
 
+def is_spring_long_context_favorable(bar, score=None):
+    """Conservatively allow SPRING longs only in supportive bullish context."""
+    resolved_score = bar.get("score", score if score is not None else 0)
+    bullish_align = bar.get("bullish_align", bar.get("bull_align", False))
+    opening_bearish = bar.get("opening_bearish", False)
+    close = bar.get("Close", bar.get("close", 0))
+    vwap = bar.get("vwap", 0)
+
+    if resolved_score <= 0:
+        return False
+    if not bullish_align:
+        return False
+    if opening_bearish:
+        return False
+    if close <= 0 or vwap <= 0:
+        return False
+    if close < vwap:
+        return False
+
+    return True
+
+
 def strategy_counter_vwap(state, cfg):
     """
     ELITE #1: Counter-VWAP 反向均值回歸 (核心策略)
@@ -192,6 +214,8 @@ def strategy_spring_upthrust(state, cfg):
     
     # Spring (假跌破 → 做多)
     if low < bb_low.iloc[-1] and close > bb_low.iloc[-1]:
+        if not is_spring_long_context_favorable(last_5m, state.get("score")):
+            return None
         return {
             "action": "BUY",
             "reason": "SPRING",
