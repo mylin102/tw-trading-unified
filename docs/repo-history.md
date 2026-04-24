@@ -218,3 +218,16 @@ This historical map suggests a medium-strength cleanup rule:
 - prefer one consolidated history document over many loosely overlapping status reports
 
 This file should be used as the anchor for the next documentation cleanup wave.
+
+## 2026-04-24 — Position sizing reduction (config tuning)
+
+**Context**: After TMF → MXF migration (MXF = 微台指, 10 TWD/pt vs 50 TWD/pt), options and futures position sizing was too aggressive relative to the smaller contract unit. Two config changes reduce per-trade exposure.
+
+**Changes**:
+- `config/futures.yaml`: `lots_per_trade: 2 → 1` — futures now enters 1 lot per signal instead of 2
+- `config/options_strategy.yaml`:
+  - `risk_mgmt.lots_per_trade: 2 → 1` — options enters 1 lot per signal instead of 2
+  - `risk_mgmt.max_positions: 15 → 12` — reduces max concurrent options positions
+  - Trailing zero cleanup on `max_spread_pct: 0.10 → 0.1` and `max_iv: 0.40 → 0.4`
+
+**Rationale**: These are conservative sizing adjustments while the system stabilizes post-migration. Lower lots_per_trade reduces paper loss exposure per signal. Fewer concurrent positions limits portfolio-wide risk during the learning phase. MXF's smaller point value already reduces absolute risk per lot, but keeping lots=2 on top of that was unnecessary.
