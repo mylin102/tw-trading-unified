@@ -3686,7 +3686,8 @@ class ShioajiOptionsSmartMonitor:
         self._running = True
         
         # [Phase A] Immediate Activation (Moved from __init__)
-        if not self.dry_run:
+        # Extra guard: if api was already injected by OptionsMonitor wrapper, skip login.
+        if not self.dry_run and self.api is None:
             from strategies.options.login import shioaji_login
             from options_engine.engine.broker_adapter import ShioajiBrokerAdapter, MockBrokerAdapter
             
