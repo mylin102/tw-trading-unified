@@ -70,13 +70,13 @@ risk_mgmt:
   max_daily_loss: 0.03
   max_holding_days: 7
   max_position_size: 0.08
-  max_positions: 12
+  max_positions: 10
   min_dte_to_exit: 7.0
   opening_grace_mins: 5
   stop_loss_pct: 0.25
 strategy:
   cooldown_bars: 2
-  entry_score: 10
+  entry_score: 15
   fallback_underlying_price: 33500
   fire_score_threshold: 40
   length: 20

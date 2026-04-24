@@ -55,7 +55,7 @@ strategy:
     enabled: true
     exit_on_vwap: true
     min_momentum: 15.0
-  entry_score: 16
+  entry_score: 13
   length: 20
   partial_exit:
     enabled: true
@@ -88,4 +88,4 @@ trade_mgmt:
   allow_short: true
   force_close_at_end: true
   lots_per_trade: 1
-  max_positions: 10
+  max_positions: 5
