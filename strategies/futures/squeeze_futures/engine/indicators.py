@@ -312,6 +312,11 @@ def calculate_futures_squeeze(
         res["adx"] = 0.0
 
     # [Fix] breakout_strength & trend_strength_raw for router
+    if len(res) < 5 or "Close" not in res.columns or "day_open" not in res.columns:
+        res["breakout_strength"] = pd.Series(0.0, index=res.index)
+        res["trend_strength_raw"] = pd.Series(0.0, index=res.index)
+        return res
+
     if len(res) >= 2:
         try:
             _idx = res.index
