@@ -141,7 +141,20 @@ def stop_threshold(entry_opt_premium, stop_loss_pct, has_tp1):
     return entry_opt_premium if has_tp1 else entry_opt_premium * (1 - stop_loss_pct)
 
 
-def should_exit_position(current_premium, entry_opt_premium, stop_loss_pct, score, has_tp1, score_floor=20):
+def should_exit_position(
+    current_premium,
+    entry_opt_premium,
+    stop_loss_pct,
+    score,
+    has_tp1,
+    score_floor=20,
+    hard_stop_pct=None,  # [Fix] fixed % stop on premium (e.g. 0.30 = -30%)
+):
+    """Exit if: stop threshold hit, score decay, or hard stop triggered."""
+    if hard_stop_pct is not None:
+        hard_stop = entry_opt_premium * (1 - hard_stop_pct)
+        if current_premium <= hard_stop:
+            return True
     return current_premium <= stop_threshold(entry_opt_premium, stop_loss_pct, has_tp1) or abs(score) < score_floor
 
 
@@ -160,7 +173,12 @@ def classify_exit_reason(
     current_time=None,
     mode_profile=None,
     score_floor=20,
+    hard_stop_pct=None,
 ):
+    if hard_stop_pct is not None:
+        hard_stop = entry_opt_premium * (1 - hard_stop_pct)
+        if current_premium <= hard_stop:
+            return "hard_stop"
     if current_premium <= stop_threshold(entry_opt_premium, stop_loss_pct, has_tp1):
         return "stop_loss"
     if abs(score) < score_floor:

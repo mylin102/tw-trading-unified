@@ -1,5 +1,5 @@
 active_mode: V2
-entry_score: 10
+entry_score: 30
 execution:
   aggressive_ticks: 1
   broker_fee_per_side: 20.0
@@ -70,10 +70,11 @@ risk_mgmt:
   max_daily_loss: 0.03
   max_holding_days: 7
   max_position_size: 0.08
-  max_positions: 10
+  max_positions: 3
   min_dte_to_exit: 7.0
   opening_grace_mins: 5
   stop_loss_pct: 0.25
+  hard_stop_pct: 0.15  # [Fix] fixed premium % stop: exit when premium drops 15% from entry
 strategy:
   cooldown_bars: 2
   entry_score: 15

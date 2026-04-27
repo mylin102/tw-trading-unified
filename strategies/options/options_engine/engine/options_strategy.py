@@ -34,6 +34,10 @@ def get_stop_loss_pct(cfg, default=0.3):
     return get_risk_cfg(cfg).get("stop_loss_pct", default)
 
 
+def get_hard_stop_pct(cfg, default=None):
+    return get_risk_cfg(cfg).get("hard_stop_pct", default)
+
+
 def get_score_floor(cfg, default=20):
     return get_strategy_cfg(cfg).get("score_floor", default)
 

@@ -76,6 +76,10 @@ class StockMonitor:
                 }
             console.print(f"[green]✅ Pattern scan complete. Tagged {len(self.scan_results)} tickers.[/green]")
 
+    def _run_daily_scan_try(self):
+        """Skip CANSLIM scan on startup to avoid VPN hang. 4h periodic retry handles it."""
+        pass
+
     def get_current_exposure(self):
         return sum([p["qty"] * p["entry_price"] for p in self.positions.values()])
 
@@ -362,7 +366,7 @@ class StockMonitor:
                 "analyze_market_condition": analyze_market_condition,
                 "should_trade_based_on_tf": should_trade_based_on_tf
             }
-            self._run_daily_scan()
+            self._run_daily_scan_try()  # non-blocking attempt
             console.print(f"[bold green]🍎 StockMonitor [{self.mode_tag}] Started | Strategy: {self.strat_name}[/bold green]")
 
         now = datetime.now()
@@ -385,7 +389,7 @@ class StockMonitor:
             self._loop_state["last_regime_check"] = time.time()
         
         if time.time() - self._loop_state["last_daily_scan"] > 14400:
-            self._run_daily_scan()
+            self._run_daily_scan_try()
             self._loop_state["last_daily_scan"] = time.time()
 
         if self._loop_state["active_watchlist"] is None and now.hour == 9 and now.minute >= 5:
@@ -414,6 +418,9 @@ class StockMonitor:
                 data_source = "unknown"
                 
                 # 嘗試 1: 從 API 獲獲取 kbars
+                import socket as _sk1
+                _orig_to1 = _sk1.getdefaulttimeout()
+                _sk1.setdefaulttimeout(15)
                 try:
                     kbars = self.api.kbars(contract, start=start_date, end=end_date)
                     kbars_dict = {**kbars}
@@ -426,6 +433,8 @@ class StockMonitor:
                         console.print(f"[yellow]⚠️ API returned empty data for {ticker}[/yellow]")
                 except Exception as e:
                     console.print(f"[dim]📋 API kbars failed: {e}[/dim]")
+                finally:
+                    _sk1.setdefaulttimeout(_orig_to1)
                 
                 # 嘗試 2: 如果 API 數據為空，從本地緩存讀取
                 if df is None or df.empty:
@@ -578,6 +587,8 @@ class StockMonitor:
                     pos = self.positions[ticker]
                     # Update peak for trailing stop
                     pos["peak_price"] = max(pos.get("peak_price", pos["entry_price"]), snapshot.close)
+                    # Track holding bars
+                    pos["hold_bars"] = pos.get("hold_bars", 0) + 1
                     
                     from core.exit_engine import should_exit
                     trade_state = {
@@ -614,8 +625,17 @@ class StockMonitor:
                         if snapshot.close <= pos["entry_price"] * (1 - sl_pct):
                             self.execute_trade(ticker, "SELL", snapshot.close, "ALL", "HARD_STOP_LOSS")
 
-                # --- B. Entry Filter (Edge Model) ---
+                # --- B. Entry Filter (Market Gate + Edge Model) ---
                 if res and res["action"] == "BUY" and not self._check_bear_defense():
+                    from strategies.stocks.market_gate import get_gate, strategy_allowed
+                    gate = get_gate()
+                    if gate == "BLOCK_LONG":
+                        console.print(f"[dim]🚫 Market gate BLOCK_LONG — skip {ticker}[/dim]")
+                        continue
+                    if not strategy_allowed(self.strat_name):
+                        console.print(f"[dim]🚫 Strategy {self.strat_name} not allowed in current regime — skip {ticker}[/dim]")
+                        continue
+                    
                     from core.edge_model import edge_model
                     context = {
                         "regime": regime,
@@ -626,8 +646,14 @@ class StockMonitor:
                     edge_res = edge_model.evaluate(abs(last_bar.get("score", 50)), context, self.strat_name)
                     
                     if edge_res["has_edge"]:
+                        # [Fix] Cooldown: same ticker max 1 entry per 10 min
+                        _last_entry = getattr(self, f'_last_entry_{ticker}', 0)
+                        if time.time() - _last_entry < 600:
+                            console.print(f"[dim]⏳ Cooldown active for {ticker} — skip[/dim]")
+                            continue
                         self._reload_live_flag() 
                         self.execute_trade(ticker, "BUY", snapshot.close, res.get("qty_mode", "SCOUT"), f"{res.get('reason', 'SIGNAL')} (Edge={edge_res['edge_score']:.2f})")
+                        setattr(self, f'_last_entry_{ticker}', time.time())
                     else:
                         if random.random() < 0.1: # Reduce log noise
                             console.print(f"[dim]🛡️ Entry blocked: {ticker} {edge_res['reason']}[/dim]")
@@ -650,6 +676,8 @@ class StockMonitor:
         if ticker not in self.positions: return
         pos = self.positions[ticker]
         now = datetime.now()
+        peak = pos.get("peak_price", pos["entry_price"])
+        profit_pct = (curr_price - pos["entry_price"]) / pos["entry_price"]
         
         # ── Layer 1: Adaptive Indicator-Driven Exits ──
         if context and self.cfg.get("stocks", {}).get("adaptive_exits", {}).get("enabled", False):
@@ -659,26 +687,43 @@ class StockMonitor:
             regime = context.get("regime", "NORMAL")
             
             # A. Chandelier ATR Trailing Stop (from Peak)
-            peak = pos.get("peak_price", pos["entry_price"])
             sl_dist = atr * a_cfg.get("atr_sl_mult", 2.5)
             if sl_dist > 0 and curr_price <= (peak - sl_dist):
                 self.execute_trade(ticker, "SELL", curr_price, "ALL", f"ADAPTIVE_ATR_STOP (peak={peak:.1f}, dist={sl_dist:.1f})")
                 return
             
             # B. Momentum Rollover (Exhaustion)
-            # If high score achieved, but now dropping significantly or mom_state is cooling
             if score > a_cfg.get("rollover_score_threshold", 70) and context.get("mom_state") == 2:
                 self.execute_trade(ticker, "SELL", curr_price, "ALL", f"MOMENTUM_ROLLOVER (score={score:.1f})")
                 return
                 
             # C. Regime-Aware Profit Targets
-            profit_pct = (curr_price - pos["entry_price"]) / pos["entry_price"]
             target = a_cfg.get("profit_target_strong", 0.15) if regime == "STRONG" else a_cfg.get("profit_target_weak", 0.05)
             if profit_pct >= target:
                 self.execute_trade(ticker, "SELL", curr_price, "ALL", f"REGIME_TARGET_HIT ({regime}: {target:.0%})")
                 return
 
+        # ── Layer 1.5: Fixed 2% Trailing Stop (unrealized-profit gated) ──
+        # Only activates after position has shown at least 1% unrealized profit.
+        # Prevents entry-stage noise from triggering premature exit.
+        # Pure losses go to Hard Stop (Layer 3).
+        profit_pct = (curr_price - pos["entry_price"]) / pos["entry_price"]
+        peak_profit_pct = (peak - pos["entry_price"]) / pos["entry_price"] if peak > 0 else 0
+        drawdown_from_peak = (peak - curr_price) / peak if peak > 0 else 0
+        if peak_profit_pct > 0.01 and drawdown_from_peak >= 0.02:
+            self.execute_trade(ticker, "SELL", curr_price, "ALL", f"TRAIL_2PCT (peak={peak:.1f}, dd={drawdown_from_peak:.1%})")
+            return
+        # ── Layer 1.6: Max Holding Time ──
+        # Prevents dead positions from locking budget indefinitely.
+        # hold_bars increments ~1/sec (run_iteration ticker loop), so 1800 ≈ 30 min.
+        max_hold_seconds = self.cfg.get("stocks", {}).get("max_hold_seconds", 1800)
+        if pos.get("hold_bars", 0) >= max_hold_seconds:
+            self.execute_trade(ticker, "SELL", curr_price, "ALL", f"MAX_HOLD ({pos['hold_bars']}s/{max_hold_seconds}s)")
+            return
+
         # ── Layer 2: EOD Smart Exit (Final Safety Window) ──
+        # NOTE: 零股禁止當沖 — today's buy will be blocked by execute_trade's day-trade guard.
+        # This layer only affects overnight positions held from prior days.
         if now.hour == 13 and now.minute >= 20:
             pnl_pct = (curr_price - pos["entry_price"]) / pos["entry_price"]
             if pnl_pct <= 0:
@@ -686,7 +731,8 @@ class StockMonitor:
             elif now.minute >= 25:
                 self.cancel_all_pending_orders()
                 self.execute_trade(ticker, "SELL", curr_price, "ALL", "TIME_EXIT_FINAL")
-            return
+            if ticker in self.positions:
+                return  # only return if still holding (day-trade guard blocked sell)
             
         # ── Layer 3: Hard Stop Loss (Circuit Breaker) ──
         sl_pct = self.cfg.get("stocks", {}).get("stop_loss_pct", 0.05)

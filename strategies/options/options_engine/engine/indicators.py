@@ -144,6 +144,16 @@ def calculate_futures_squeeze(
     res["opening_bullish"] = (res["Close"] > res["day_open"]) & (res["day_min"] >= res["day_open"] * 0.999)
     res["opening_bearish"] = (res["Close"] < res["day_open"]) & (res["day_max"] <= res["day_open"] * 1.001)
 
+    # [Fix] breakout_strength
+    intraday_return = (res["Close"] - res["day_open"]) / res["day_open"].replace(0, 1)
+    vwap_bias = res["price_vs_vwap"].fillna(0)
+    res["breakout_strength"] = np.maximum(intraday_return * 100, vwap_bias * 100, 0.0)
+    if len(res) >= 2:
+        ema_slope = (res["ema_fast"] - res["ema_fast"].shift(1)) / res["ema_fast"].shift(1).replace(0, 1)
+        res["trend_strength_raw"] = ema_slope.fillna(0) * 100  # scale to % for router threshold
+    else:
+        res["trend_strength_raw"] = 0.0
+
     return res
 
 

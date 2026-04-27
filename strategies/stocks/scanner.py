@@ -21,7 +21,7 @@ class StockScanner:
                 
                 # 2. 抓取整股 1分K 數據 (最近 7 天，用於合成 5分K)
                 start_date_5m = (pd.Timestamp.now() - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
-                kbars_1m = self.api.kbars(contract, start=start_date_5m)
+                kbars_1m = self._kbars_with_timeout(contract, start=start_date_5m)
                 df_1m = pd.DataFrame({**kbars_1m})
                 if df_1m.empty: continue
                 df_1m.ts = pd.to_datetime(df_1m.ts)
@@ -37,7 +37,7 @@ class StockScanner:
                 # 💡 GSD: Fetching 365 days of 1min data is too heavy for Shioaji API.
                 # Reducing to 14 days to keep scan responsive.
                 start_date_1d = (pd.Timestamp.now() - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
-                kbars_raw = self.api.kbars(contract, start=start_date_1d)
+                kbars_raw = self._kbars_with_timeout(contract, start=start_date_1d)
                 df_raw = pd.DataFrame({**kbars_raw})
                 
                 pattern_status = "NONE"
@@ -82,3 +82,16 @@ class StockScanner:
             except Exception as e:
                 print(f"⚠️ Failed to scan {ticker}: {e}")
         return pd.DataFrame(results)
+
+    def _kbars_with_timeout(self, contract, start, timeout=15):
+        """[P0 Fix] kbars fetch with socket timeout. Falls back to empty on failure."""
+        import socket as _sk
+        _orig_to = _sk.getdefaulttimeout()
+        _sk.setdefaulttimeout(timeout)
+        try:
+            return self.api.kbars(contract, start=start)
+        except Exception as e:
+            print(f"[dim]⏱️ kbars timeout for {contract.code}: {e}[/dim]")
+            return {"ts": [], "Open": [], "High": [], "Low": [], "Close": [], "Volume": []}
+        finally:
+            _sk.setdefaulttimeout(_orig_to)

@@ -151,6 +151,25 @@ def classify_futures_bar_regime(
     if normalized_session_regime != "UNKNOWN":
         reasons.append(f"session regime={normalized_session_regime}")
 
+    # [Fix] RegimeDebug: log feature values for diagnostic
+    close = _safe_float(row.get("close") or row.get("Close"))
+    day_open = _safe_float(row.get("day_open"))
+    vwap = _safe_float(row.get("vwap"))
+    ema_fast = _safe_float(row.get("ema_fast"))
+    ema_slow = _safe_float(row.get("ema_slow"))
+    intraday_return = ((close - day_open) / day_open * 100) if day_open > 0 else 0.0
+    import logging
+    logging.getLogger("regime").info(
+        "[RegimeDebug] close=%.2f day_open=%.2f vwap=%.2f "
+        "intraday_return=%.4f%% breakout_strength=%.4f adx=%.2f "
+        "trend_strength_raw=%.6f sqz_on=%s volume_spike=%.2f "
+        "ema_fast=%.2f ema_slow=%.2f",
+        close, day_open, vwap,
+        intraday_return, breakout_strength, adx,
+        trend_strength_raw, sqz_on, volume_spike,
+        ema_fast, ema_slow,
+    )
+
     if sqz_on and adx < cfg.adx_trend_threshold:
         reasons.append("squeeze active while ADX is below trend threshold")
         return FuturesBarRegimeResult(
@@ -195,7 +214,7 @@ def classify_futures_bar_regime(
         bias != "NEUTRAL"
         and adx >= cfg.adx_weak_threshold
         and abs(trend_strength_raw) >= cfg.trend_strength_threshold
-        and volume_spike >= cfg.min_volume_spike
+        # volume_spike gating removed — feature not yet computed (Phase 3)
     )
     if moderate_directional_pressure:
         reasons.append("directional pressure exists, but breakout confirmation is incomplete")

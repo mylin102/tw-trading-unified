@@ -24,7 +24,7 @@ from options_engine.engine.backtest_engine import (
     should_exit_by_time_constraints,
 )
 from options_engine.engine.backtest_engine import resolve_option_strike
-from options_engine.engine.options_strategy import get_mode_profile, get_score_floor, get_stop_loss_pct, get_strategy_weights, infer_mid_trend, resolve_entry_side
+from options_engine.engine.options_strategy import get_mode_profile, get_score_floor, get_stop_loss_pct, get_hard_stop_pct, get_strategy_weights, infer_mid_trend, resolve_entry_side
 from core.bar_utils import (
     attach_bar_metadata,
     build_canonical_bar_frames,
@@ -146,6 +146,7 @@ class ShioajiOptionsSmartMonitor:
         self.entry_score = self.strategy_cfg['entry_score']
         self.score_floor = get_score_floor(self.full_cfg)
         self.stop_loss_pct = get_stop_loss_pct(self.full_cfg)
+        self.hard_stop_pct = get_hard_stop_pct(self.full_cfg)
         self.max_holding_days = self.full_cfg.get("risk_mgmt", {}).get("max_holding_days")
         self.min_dte_to_exit = self.full_cfg.get("risk_mgmt", {}).get("min_dte_to_exit")
         self.execution_cfg = self.full_cfg.get("execution", {})
@@ -646,6 +647,8 @@ class ShioajiOptionsSmartMonitor:
             if not contracts:
                 console.print("[red]❌ 錯誤：找不到任何有效的 TXO 選擇權合約。[/red]")
                 return False
+            # [Skew Integration] Store all month contracts for OTM strike resolution
+            self._all_month_contracts = contracts
             
             console.print(f"[green]✅ 找到 {len(contracts)} 筆 {nearest_date} 到期合約 (同步期貨月份)[/green]")
             
@@ -1857,8 +1860,25 @@ class ShioajiOptionsSmartMonitor:
             today = today - datetime.timedelta(days=1)
         date_str = today.strftime("%Y-%m-%d")
         try:
-            console.print(f"[cyan][OptionsMonitor] Fetching futures kbars from {start_date} to {date_str}[/cyan]")
-            bars = self.api.kbars(self.active_contracts["MTX"], start=start_date, end=date_str)
+            import threading as _th
+            _fut_result = [None]
+            _fut_done = [False]
+            def _kbars_target():
+                try:
+                    _fut_result[0] = self.api.kbars(self.active_contracts["MTX"], start=start_date, end=date_str)
+                except Exception as e:
+                    _fut_result[0] = e
+                finally:
+                    _fut_done[0] = True
+            _t = _th.Thread(target=_kbars_target, daemon=True)
+            _t.start()
+            _t.join(timeout=22)
+            if not _fut_done[0]:
+                console.print("[red]⏱️ kbar fetch timed out (22s) — Shioaji API may be unreachable. Proceeding without API bars.[/red]")
+                return None
+            if isinstance(_fut_result[0], Exception):
+                raise _fut_result[0]
+            bars = _fut_result[0]
             self.last_kbars_fetch_at = now_ts
             frame = pd.DataFrame({**bars})
         except Exception as e:
@@ -2239,6 +2259,13 @@ class ShioajiOptionsSmartMonitor:
         if self.position >= self.max_positions:
             console.print(f"[red]🚫 enter_paper_position blocked: max positions ({self.max_positions}) reached (currently {self.position})[/red]")
             return
+        # [Fix] Max daily entries per direction — prevent rapid re-entry on same side
+        if not hasattr(self, '_daily_entries'):
+            self._daily_entries = 0
+        max_daily = self.full_cfg.get("risk_mgmt", {}).get("max_daily_entries", 3)
+        if self._daily_entries >= max_daily:
+            console.print(f"[red]🚫 enter_paper_position blocked: max daily entries ({max_daily}) reached[/red]")
+            return
         if not self._dte_allows_entry(side, now=signal.get("timestamp")):
             return
         if not self.spread_is_tradeable(side):
@@ -2271,6 +2298,7 @@ class ShioajiOptionsSmartMonitor:
         self.stop_loss_price = entry_price * (1 - self.stop_loss_pct)
         self.peak_premium = entry_price
         self.replay_stats["entries"] += 1
+        self._daily_entries = getattr(self, '_daily_entries', 0) + 1  # [Fix] track daily entry count
         
         # [GSD Phase B] Capture entry features
         self._entry_features = {
@@ -3366,6 +3394,7 @@ class ShioajiOptionsSmartMonitor:
             signal_score,
             self.has_tp1_hit,
             score_floor=self.score_floor,
+            hard_stop_pct=self.hard_stop_pct,
         ):
             exit_reason = classify_exit_reason(
                 exit_price,
@@ -3374,6 +3403,7 @@ class ShioajiOptionsSmartMonitor:
                 signal_score,
                 self.has_tp1_hit,
                 score_floor=self.score_floor,
+                hard_stop_pct=self.hard_stop_pct,
             )
             if exit_reason == "score_decay" and not directional_release_state["confirmed"]:
                 console.print(f"[dim]🛡️ SCORE_DECAY gated: {directional_release_state['reason']}[/dim]")

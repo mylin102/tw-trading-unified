@@ -214,8 +214,8 @@ def strategy_stock_canslim_breakout(state, cfg):
     if last_5m["Close"] < pivot_price:
         return None
 
-    # 3. 基本面過濾 (如果數據可用)
-    if cfg.get("stocks", {}).get("canslim", {}).get("fundamental_filter", True):
+    # 3. 基本面過濾 (如果數據可用，預設關閉)
+    if cfg.get("stocks", {}).get("canslim", {}).get("fundamental_filter", False):
         eps_growth = last_5m.get("eps_growth", 0)
         revenue_growth = last_5m.get("revenue_growth", 0)
         roe = last_5m.get("roe", 0)
