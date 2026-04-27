@@ -39,6 +39,7 @@ from core.strategy_context import StrategyContext, PositionView, MarketData
 from core.signal import Signal
 from core.bar_utils import attach_bar_metadata, build_preferred_canonical_bar_frames, resample_ohlcv
 from core.date_utils import get_taifex_futures_hhmm, is_taifex_futures_market_open, get_taifex_futures_session_type
+from core.spread_loader import get_spread_loader
 from squeeze_futures.data.shioaji_client import ShioajiClient
 from squeeze_futures.data.data_storage import save_trade
 from squeeze_futures.data.tick_writer import RawTickWriter, get_trading_day_str
@@ -168,6 +169,14 @@ class FuturesMonitor:
         self._applied_lifecycle_deals = set()
         # 💡 GSD: Initialize with current time bucket to prevent immediate flip
         self._last_bar_ts = int(time.time() / 300) * 300
+
+        # ── [V-Model] SpreadLoader for calendar spread data (near-far spread_z) ──
+        self._spread_loader = get_spread_loader()
+        self._spread_loaded = self._spread_loader.load_latest_csv()
+        if self._spread_loaded:
+            print(f"[V-Model] SpreadLoader initiated: {self._spread_loader.status()}", flush=True)
+        else:
+            print("[V-Model] SpreadLoader: no calendar spread data found", flush=True)
 
     def _apply_config_params(self):
         """[GSD] Extract parameters from self.cfg into instance attributes."""
@@ -2110,6 +2119,13 @@ class FuturesMonitor:
                         skew_signal = None
             except Exception:
                 skew_signal = None
+
+        # [V-Model] Enrich bar with calendar spread data (spread_z, near_close, far_close)
+        if self._spread_loaded:
+            try:
+                self._spread_loader.enrich_bar(bar)
+            except Exception as e:
+                print(f"[V-Model] enrich_bar failed: {e}", flush=True)
 
         ctx = StrategyContext(
             market=MarketData(

@@ -1,0 +1,4 @@
+timestamp,type,direction,price,lots,pnl_pts,pnl_cash,reason,allow_trade,orb_weight,vwap_weight,policy_reason
+2026-04-22 00:50:14,BUY,LONG,37810.0,1,0.0,0.0,SPRING,True,1.0,1.0,
+2026-04-22 00:50:14,ENTRY_DIAG,LONG,37810.0,1,0.0,0.0,SPRING,True,1.0,1.0,
+2026-04-22 01:12:31,EXIT,LONG,37689.0,1,-121.0,-1265.0,STOP_LOSS,True,1.0,1.0,

@@ -1,0 +1,2 @@
+timestamp,ticker,strategy,mode,action,price,entry_price,qty,reason,pnl_gross,fees,pnl_cash
+2026-04-21 09:34:13,3017,mean_reversion_enhanced,LIVE,BUY,2490.0,2490.0,2,BB_LOWER_BOUNCE_ENHANCED (market_state: NEUTRAL) (Edge=0.60),0.0,0.0,0

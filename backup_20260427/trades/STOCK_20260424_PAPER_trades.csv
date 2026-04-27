@@ -1,0 +1,5 @@
+timestamp,ticker,strategy,mode,action,price,entry_price,qty,reason,pnl_gross,fees,pnl_cash
+2026-04-24 09:00:53,3024,scout_strategy,PAPER,BUY,14.4,14.4,346,SCOUT_CONFIRMED_BEAR (Edge=0.50),0.0,0.0,0
+2026-04-24 10:18:10,3035,scout_strategy,PAPER,BUY,182.5,182.5,27,SCOUT_CONFIRMED_BULL (Edge=0.50),0.0,0.0,0
+2026-04-24 11:31:46,3035,scout_strategy,PAPER,BUY,184.5,184.5,243,SCOUT_SCALE (Edge=0.50),0.0,0.0,0
+2026-04-24 12:07:08,3045,scout_strategy,PAPER,BUY,113.0,113.0,44,SCOUT_CONFIRMED_BULL (Edge=0.50),0.0,0.0,0

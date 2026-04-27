@@ -51,6 +51,12 @@ class ORBAmbush(StrategyBase):
         bar = context.market.last_bar
         if not bar: return None
 
+        # ═══ df_5m guard — prevent NoneType crash when data not ready ═══
+        df = context.market.df_5m
+        if df is None or df.empty:
+            logger.debug("orb_ambush: df_5m None/empty — skipping")
+            return None
+
         close = bar.get("Close", 0.0)
         high = bar.get("High", 0.0)
         low = bar.get("Low", 0.0)
@@ -75,7 +81,6 @@ class ORBAmbush(StrategyBase):
             return None
 
         # 2. Get Kalman Velocity
-        df = context.market.df_5m
         if len(df) < 3: return None
         k_series = df["kalman_close"] if "kalman_close" in df.columns else df["Close"]
         velocity = (k_series.iloc[-1] - k_series.iloc[-2]) / k_series.iloc[-1]

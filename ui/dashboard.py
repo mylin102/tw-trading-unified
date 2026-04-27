@@ -488,19 +488,32 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     
     # 2. 如果有遠月資料，添加遠月價格線
     if far_df is not None and not far_df.empty:
-        # 確保時間戳對齊
-        far_df_aligned = far_df[far_df["timestamp"].isin(near_df["timestamp"])]
-        if not far_df_aligned.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=far_df_aligned["timestamp"],
-                    y=far_df_aligned["close"],
-                    name="遠月",
-                    line=dict(width=1.5, color="#ff7f0e", dash="dash"),
-                    mode="lines"
-                ),
-                row=1, col=1
-            )
+        # 確保時間戳對齊 - 用完整的遠月資料繪製
+        far_min_ts = near_df["timestamp"].min()
+        far_max_ts = near_df["timestamp"].max()
+        far_visible = far_df[(far_df["timestamp"] >= far_min_ts) & (far_df["timestamp"] <= far_max_ts)]
+        if far_visible.empty:
+            # 時間軸不重疊時（如遠月資料還在舊日期），取遠月最後 50 筆
+            # 並擴展 xaxis 範圍以包含遠月資料，確保兩條線都可見
+            far_visible = far_df.tail(50)
+            far_visible_tail = far_df.tail(5)
+            # 延伸 xaxis 範圍到遠月最後一筆資料時間
+            if len(far_visible_tail) > 0:
+                fig.update_xaxes(range=[
+                    min(near_df["timestamp"].min(), far_visible_tail["timestamp"].min()),
+                    max(near_df["timestamp"].max(), far_visible_tail["timestamp"].max())
+                ])
+        fig.add_trace(
+            go.Scatter(
+                x=far_visible["timestamp"],
+                y=far_visible["close"],
+                name="遠月",
+                line=dict(width=1.5, color="#ff7f0e", dash="dash"),
+                mode="lines",
+                connectgaps=False
+            ),
+            row=1, col=1
+        )
     
     # 3. 添加交易訊號
     if signals is not None and not signals.empty and "action" in signals.columns:
@@ -1160,31 +1173,44 @@ def load_futures_indicators(full_history=False):
         except Exception:
             return None
 
-    # 1. 優先找最近 3 天所有可能的檔案並合併 (確保跨交易日資料完整)
+    # 1. 優先找最近 7 天所有可能的檔案並合併 (確保夜盤跨交易日資料完整)
     import datetime as dt
     now = dt.datetime.now()
     # GSD: Include tomorrow to cover the active trading session after 15:00 rollover
-    search_days = [
+    search_days_raw = [
+        (now - dt.timedelta(days=3)).strftime("%Y%m%d"),
+        (now - dt.timedelta(days=2)).strftime("%Y%m%d"),
         (now - dt.timedelta(days=1)).strftime("%Y%m%d"),
         now.strftime("%Y%m%d"),
         (now + dt.timedelta(days=1)).strftime("%Y%m%d"),
+        (now + dt.timedelta(days=2)).strftime("%Y%m%d"),
+        (now + dt.timedelta(days=3)).strftime("%Y%m%d"),
         DATE_STR,  # GSD Fix: Always include the active trading session date
     ]
-    search_days = list(dict.fromkeys(search_days))  # dedupe, preserve order
+    # Also find any existing MXF indicators files on disk (catch cross-weekend session dates)
+    try:
+        from pathlib import Path as _Path
+        for f in sorted(FUTURES_MKT.glob("MXF_*_PAPER_indicators.csv")):
+            parts = f.stem.split("_")
+            if len(parts) >= 2:
+                search_days_raw.append(parts[1])
+    except Exception:
+        pass
+    search_days = list(dict.fromkeys(search_days_raw))  # dedupe, preserve order
 
     all_dfs = []
     for priority, date_part in enumerate(search_days):
         for tag in ["", "_LIVE", "_PAPER", "_DRY"]:
             for prefix in ["TMF", "MXF"]:
                 f = FUTURES_MKT / f"{prefix}_{date_part}{tag}_indicators.csv"
-            if f.exists():
-                df = _read_and_standardize(f)
-                if df is not None and "timestamp" in df.columns:
-                    if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
-                        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-                    if not df.empty:
-                        df["__source_priority"] = priority
-                        all_dfs.append(df)
+                if f.exists():
+                    df = _read_and_standardize(f)
+                    if df is not None and "timestamp" in df.columns:
+                        if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+                            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                        if not df.empty:
+                            df["__source_priority"] = priority
+                            all_dfs.append(df)
 
     # GSD: Parquet Fallback (Wave 18.3)
     is_fallback = False
@@ -1263,18 +1289,46 @@ def load_futures_indicators(full_history=False):
         except Exception:
             result = None
 
-    # Stale data detection
+    # Stale data detection (trading-day-aware)
     if result is not None and not result.empty and "timestamp" in result.columns:
         result = extend_taifex_recess_continuity(result, timestamp_col="timestamp")
         try:
+            # ── Calendar time staleness ──
             result_ts = result["timestamp"].copy()
             if not pd.api.types.is_datetime64_any_dtype(result_ts):
                 result_ts = pd.to_datetime(result_ts, errors="coerce")
             result_ts = result_ts.dropna()
             if not result_ts.empty:
-                age_secs = (pd.Timestamp.now() - result_ts.max()).total_seconds()
-                if age_secs > 600:
+                latest_ts = result_ts.max()
+                age_secs = (pd.Timestamp.now() - latest_ts).total_seconds()
+
+                # ── Trading day staleness ──
+                from core.date_utils import get_trading_day
+                expected_tday = get_trading_day(datetime.datetime.now())
+                if "trading_day" in result.columns:
+                    latest_tday = pd.to_datetime(result["trading_day"]).max()
+                    if pd.notna(latest_tday):
+                        latest_tday_date = latest_tday.date()
+                    else:
+                        latest_tday_date = get_trading_day(latest_ts.to_pydatetime())
+                else:
+                    latest_tday_date = get_trading_day(latest_ts.to_pydatetime())
+
+                # ── Determine stale type ──
+                if latest_tday_date < expected_tday:
+                    # Trading day lag (e.g. still on Apr 23 when Apr 27 night session started)
+                    st.warning(
+                        f"📅 交易日滯後: "
+                        f"目前交易日={expected_tday}, "
+                        f"資料交易日={latest_tday_date}, "
+                        f"最新資料時間={latest_ts.strftime('%m/%d %H:%M')}, "
+                        f"資料停滯 {age_secs/60:.0f} 分鐘"
+                    )
+                elif age_secs > 600:
                     st.warning(f"⚠️ 期貨資料停滯 {age_secs/60:.0f} 分鐘")
+                else:
+                    # Show normal status in an expander or sidebar
+                    pass
         except Exception:
             pass
     return result
@@ -1294,7 +1348,36 @@ def load_far_month_data(product="MXF"):
     import datetime as dt
     import glob
     
-    # 搜尋遠月資料檔案
+    # [Far Month Live] Priority 1: Read from trading-system's live far-month CSV
+    # Format: logs/market_data/MXF_far_YYYYMMDD_PAPER.csv (from _save_far_bar)
+    from pathlib import Path
+    log_dir = Path("logs/market_data")
+    live_far_pattern = f"{product.lower()}_far_*.csv"
+    live_far_files = []
+    if log_dir.exists():
+        # Match any session date + tag combination
+        for f in log_dir.glob(live_far_pattern):
+            if f.stat().st_size > 80:  # At least a few bars
+                live_far_files.append(f)
+    if live_far_files:
+        live_far_files.sort(key=os.path.getmtime, reverse=True)
+        try:
+            df_far = pd.read_csv(live_far_files[0])
+            if "timestamp" in df_far.columns:
+                df_far["timestamp"] = pd.to_datetime(df_far["timestamp"], errors="coerce")
+                df_far = df_far.dropna(subset=["timestamp"])
+                df_far = df_far.sort_values("timestamp")
+                # Standardize column names
+                col_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+                for upper, lower in col_map.items():
+                    if upper in df_far.columns and lower not in df_far.columns:
+                        df_far = df_far.rename(columns={upper: lower})
+                if len(df_far) >= 2:
+                    return df_far
+        except Exception as e:
+            print(f"Live far CSV read failed: {e}")
+    
+    # Priority 2: Search static far-month data files (legacy)
     search_patterns = [
         f"./data/{product.lower()}_far_*.csv",
         f"./data/{product.lower()}_far.csv",

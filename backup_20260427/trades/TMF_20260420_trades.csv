@@ -1,0 +1,3 @@
+timestamp,type,direction,price,lots,pnl_pts,pnl_cash,reason,allow_trade,orb_weight,vwap_weight,policy_reason
+2026-04-20 21:17:37,SELL,SHORT,37495.0,1,0.0,0.0,UPTHRUST,True,1.0,1.0,
+2026-04-20 21:30:01,EXIT,SHORT,37591.0,1,-96.0,-1015.0,STOP_LOSS,True,1.0,1.0,

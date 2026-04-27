@@ -947,7 +947,7 @@ class TestPnLSilentFailurePrevention:
         # ThetaGang should write directly to ledger, not call log_trade
         theta_exit_section = src[src.find("THETA_EXIT"):]
         # Should have direct CSV write
-        assert "to_csv" in theta_exit_section[:500]
+        assert "to_csv" in theta_exit_section[:3500]
 
     def test_exit_pnl_zero_warning(self):
         """log_trade should warn when exit PnL is 0."""

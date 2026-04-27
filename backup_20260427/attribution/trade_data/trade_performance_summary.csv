@@ -1,0 +1,4 @@
+strategy,total_trades,winning_trades,losing_trades,win_rate,total_pnl,avg_pnl,profit_factor
+counter_vwap,17,12,5,0.7058823529411765,180,10.588235294117647,1.6
+spring_upthrust,4,0,4,0.0,-160,-40.0,0.0
+kbar_feature,1,1,0,1.0,10,10.0,inf

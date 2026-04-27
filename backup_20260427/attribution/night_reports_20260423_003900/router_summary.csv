@@ -1,0 +1,4 @@
+strategy_name,candidate_count,eval_count,winner_count,shadowed_count,regime_mismatch_count,no_signal_count,missing_count,candidate_rate,evaluation_rate,shadow_rate,win_conversion,starvation_index,priority_impact
+counter_vwap,82,82,50,0,0,0,0,,1.0,0.0,0.6097560975609756,0.0,0.0
+spring_upthrust,81,81,20,0,0,0,0,,1.0,0.0,0.24691358024691357,0.0,0.0
+kbar_feature,81,81,12,0,0,0,0,,1.0,0.0,0.14814814814814814,0.0,0.0

@@ -35,6 +35,14 @@ class MarketData:
     session: int = 0                            # 1=day, 2=night
     regime: str = "NEUTRAL"                     # GSD: Added for Wave 19
 
+    # [P4 Hardening] Data quality flags (STALE_DATA, CONSISTENCY_WARN, etc.)
+    # Populated by data pipeline before strategy context is built.
+    flags: list[str] | None = None
+
+    # [Skew Integration] Option skew signal — dict or None when unavailable.
+    # Populated by OptionSurfaceEngine, consumed by strategy layer as filter.
+    skew_signal: dict | None = None
+
 
 @dataclass(frozen=True)
 class StrategyContext:

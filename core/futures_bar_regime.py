@@ -18,8 +18,8 @@ class FuturesBarRegimeConfig:
 
     adx_trend_threshold: float = 22.0
     adx_weak_threshold: float = 15.0
-    breakout_strength_trend_threshold: float = 0.35
-    bear_breakout_strength_trend_threshold: float = 0.35
+    breakout_strength_trend_threshold: float = 0.20
+    bear_breakout_strength_trend_threshold: float = 0.20
     stretched_vwap_distance: float = 0.0035
     trend_strength_threshold: float = 0.001
     min_volume_spike: float = 1.0

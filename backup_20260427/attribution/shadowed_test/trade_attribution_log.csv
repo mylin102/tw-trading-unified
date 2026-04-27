@@ -1,0 +1,1 @@
+trade_id,symbol,strategy_name,regime_at_entry,side,entry_time,exit_time,entry_price,exit_price,pnl,mae,mfe,hold_bars,exit_reason

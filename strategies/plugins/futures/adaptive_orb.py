@@ -137,12 +137,18 @@ class AdaptiveORB(StrategyBase):
     def on_bar(self, context: StrategyContext) -> Signal | None:
         bar = context.market.last_bar
         regime = context.market.regime
+
+        # ═══ df_5m guard — prevent NoneType crash when data not ready ═══
+        df = context.market.df_5m
+        if df is None or df.empty:
+            logger.debug("adaptive_orb: df_5m None/empty — skipping")
+            return None
+
         if not bar: return None
 
         # Session Reset
         session_id = bar.get("trading_day", bar.get("session", 1))
         if self._last_session != session_id:
-            df = context.market.df_5m
             if len(df) >= 2:
                 prev_close = df.iloc[-2]['Close']
                 self._gap_p = (bar['Open'] - prev_close) / prev_close
@@ -180,7 +186,7 @@ class AdaptiveORB(StrategyBase):
                 "lr_curve": curve,
                 "atr_n": atr / close,
                 "gap_p": self._gap_p,
-                "hour": context.market.df_5m.index[-1].hour
+                "hour": df.index[-1].hour
             }])
             success_prob = self.model.predict_proba(features)[0][1]
             

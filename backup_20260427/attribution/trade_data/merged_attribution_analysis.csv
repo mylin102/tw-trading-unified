@@ -1,0 +1,4 @@
+strategy,candidate_bars,eval_count,eval_rate,shadowed_count,shadow_rate,starvation_index,winner_count,win_efficiency,trade_count,trade_efficiency,total_pnl,avg_pnl,priority_impact
+counter_vwap,50,50,1.0,0,0.0,0.0,27,0.54,17,0.34,180,10.588235294117647,0.0
+spring_upthrust,50,23,0.46,27,0.54,0.54,6,0.2608695652173913,4,0.17391304347826086,-160,-40.0,4.5
+kbar_feature,50,17,0.34,33,0.66,0.6599999999999999,1,0.058823529411764705,1,0.058823529411764705,10,10.0,33.0

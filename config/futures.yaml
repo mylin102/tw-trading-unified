@@ -23,6 +23,14 @@ monitoring:
   poll_interval_secs: 15
   require_tx: true
   use_order_manager: true
+skew:
+  filter_threshold: 0.70
+spread_gate:
+  enabled: true
+  night_only: true
+  max_age_minutes: 120
+  extreme_z: 2.0
+  stale_action: flat
 risk_mgmt:
   atr_length: 14
   atr_multiplier: 1.8

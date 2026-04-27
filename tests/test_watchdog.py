@@ -73,7 +73,11 @@ def test_watchdog_light_recovery(tmp_path, monkeypatch):
     m._check_futures_contract_staleness()
     assert called["rolled"] is True
     assert called["refreshed"] is True
-    assert len(m._tick_bars_deque) > 0
+    # [Refactored] Recovery kline no longer directly injects into _tick_bars_deque.
+    # Instead it saves raw data to CSV and updates last_tick_at. Data now flows
+    # through the canonical bar pipeline via _periodic_backfill_bars(). Verify
+    # that last_tick_at was updated (so we don't immediately re-enter recovery).
+    assert m.last_tick_at > time.time() - 5  # Should have been refreshed
 
 
 def test_watchdog_marks_runtime_degraded_on_stale(tmp_path, monkeypatch):

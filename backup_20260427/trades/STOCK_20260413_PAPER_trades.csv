@@ -1,0 +1,6 @@
+timestamp,ticker,strategy,mode,action,price,entry_price,qty,reason,pnl_gross,fees,pnl_cash
+2026-04-13 09:01:22,2207,mean_reversion_enhanced,PAPER,BUY,503.0,503.0,9,BB_LOWER_BOUNCE_ENHANCED (market_state: BULL),0.0,0.0,0
+2026-04-13 09:33:23,3149,mean_reversion_enhanced,PAPER,BUY,41.4,41.4,120,BB_LOWER_BOUNCE_ENHANCED (market_state: NEUTRAL),0.0,0.0,0
+2026-04-13 09:38:36,1708,mean_reversion_enhanced,PAPER,BUY,42.0,42.0,118,BB_LOWER_BOUNCE_ENHANCED (market_state: BULL),0.0,0.0,0
+2026-04-13 13:16:34,3030,mean_reversion_enhanced,PAPER,BUY,308.0,308.0,16,BB_LOWER_BOUNCE_ENHANCED (market_state: BULL),0.0,0.0,0
+2026-04-13 13:26:34,3030,mean_reversion_enhanced,PAPER,SELL,310.0,308.0,16,TIME_EXIT_FINAL,32.0,55.0,-23.0

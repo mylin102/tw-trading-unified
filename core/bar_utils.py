@@ -196,7 +196,12 @@ def build_preferred_canonical_bar_frames(
     max_gap_minutes: int = 15,
     validator: Callable[[pd.DataFrame], tuple[bool, str]] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, object]]:
-    """Pick the first usable source and return shared canonical frames plus diagnostics."""
+    """Pick the first usable source and return shared canonical frames plus diagnostics.
+
+    P2 layer: canonical bar selector.
+    Priority: tick-5m > api-1m > legacy-api-5m.
+    Strategy consumes canonical bars only — never raw API responses.
+    """
     rejected: list[str] = []
     for candidate in candidates:
         name = str(candidate.get("name", "unknown"))

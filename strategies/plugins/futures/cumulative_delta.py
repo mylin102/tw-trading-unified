@@ -25,10 +25,19 @@ class CumulativeDeltaStrategy(StrategyBase):
         pass
 
     def on_bar(self, ctx: StrategyContext) -> Signal | None:
+        # Guard: df_5m must exist with sufficient bars
+        df = ctx.market.df_5m
+        if df is None or df.empty:
+            return None
+        s_cfg = ctx.config.get("strategy", {}).get("cumulative_delta", {})
+        min_bars = max(s_cfg.get("sma_length", 50), s_cfg.get("lookback", 20)) + 2
+        if len(df) < min_bars:
+            return None
+
         # Prepare state dict expected by the legacy function
         state = {
             "last_5m": ctx.market.last_bar,
-            "df_5m": ctx.market.df_5m,
+            "df_5m": df,
             "score": ctx.market.last_bar.get("score", 0),
             "stop_loss_pts": ctx.config.get("risk_mgmt", {}).get("stop_loss_pts", 60)
         }

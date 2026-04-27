@@ -117,7 +117,10 @@ class CalendarCondorV2(StrategyBase):
         if not bar:
             return False
         
-        # 檢查必要欄位
+        # 使用 SpreadLoader 補齊缺失的 spread / vwap_z 等欄位
+        self._enrich_bar(bar)
+        
+        # 檢查必要欄位（經 enrichment 後應全部存在）
         required_fields = [
             "regime", "adx", "breakout_strength", "volume_spike",
             "price_vs_vwap", "vwap_z", "spread_z",
@@ -125,8 +128,9 @@ class CalendarCondorV2(StrategyBase):
         ]
         
         for field in required_fields:
-            if field not in bar:
-                print(f"[CalendarCondorV2] Missing field: {field}")
+            val = bar.get(field)
+            if val is None:
+                # enrichment 後仍缺失 → bar 不夠用
                 return False
         
         # 檢查 regime 是否符合
@@ -144,6 +148,89 @@ class CalendarCondorV2(StrategyBase):
             return False
         
         return True
+    
+    def _enrich_bar(self, bar: dict) -> None:
+        """使用 SpreadLoader 補齊 bar 中缺失的 spread / vwap / session 欄位。
+        
+        由 spread_loader 提供 spread_z；剩餘欄位 (vwap_z, price_vs_vwap,
+        bars_from_session_open, is_night_session) 在此計算。
+        """
+        try:
+            from core.spread_loader import get_spread_loader
+            loader = get_spread_loader()
+            if loader._far_df is None:
+                loader.load_latest_csv()
+            loader.enrich_bar(bar)
+        except Exception as exc:
+            # fallback: 自行填入預設值
+            bar.setdefault("spread_z", 0.0)
+            bar.setdefault("near_close", bar.get("Close", 0.0))
+            bar.setdefault("far_close", bar.get("Close", 0.0))
+            bar.setdefault("vwap_z", self._calc_vwap_z(bar))
+            bar.setdefault("price_vs_vwap", self._calc_price_vs_vwap(bar))
+            bar.setdefault("bars_from_session_open", self._calc_bars_from_open(bar))
+            bar.setdefault("is_night_session", self._calc_is_night(bar))
+            bar.setdefault("breakout_strength", 0.0)
+            bar.setdefault("volume_spike", 1.0)
+            bar.setdefault("regime", "WEAK")
+            bar.setdefault("adx", 15.0)
+    
+    def _calc_vwap_z(self, bar: dict) -> float:
+        close = bar.get("Close", 0.0) or 0.0
+        vwap = bar.get("vwap", close) or close
+        atr = bar.get("atr", 1.0) or 1.0
+        if vwap == 0 or atr <= 0:
+            return 0.0
+        return float((close - vwap) / (atr * 5))
+    
+    def _calc_price_vs_vwap(self, bar: dict) -> float:
+        close = bar.get("Close", 0.0) or 0.0
+        vwap = bar.get("vwap", close) or close
+        if close == 0:
+            return 0.0
+        return float((close - vwap) / close * 100)
+    
+    def _calc_bars_from_open(self, bar: dict) -> int:
+        import pandas as pd
+        ts = None
+        for key in ("ts", "timestamp", "datetime", "time"):
+            val = bar.get(key)
+            if val is not None:
+                try:
+                    ts = pd.Timestamp(val)
+                    break
+                except Exception:
+                    continue
+        if ts is None:
+            return 0
+        hour = ts.hour
+        minute = ts.minute
+        if 8 <= hour < 14 or (hour == 8 and minute >= 45):
+            open_minutes = (hour * 60 + minute) - (8 * 60 + 45)
+        elif hour >= 15 or hour < 5:
+            if hour >= 15:
+                open_minutes = (hour * 60 + minute) - (15 * 60)
+            else:
+                open_minutes = (hour * 60 + minute) + (24 * 60 - 15 * 60)
+        else:
+            open_minutes = 0
+        return max(0, int(open_minutes / 5))
+    
+    def _calc_is_night(self, bar: dict) -> bool:
+        import pandas as pd
+        ts = None
+        for key in ("ts", "timestamp", "datetime", "time"):
+            val = bar.get(key)
+            if val is not None:
+                try:
+                    ts = pd.Timestamp(val)
+                    break
+                except Exception:
+                    continue
+        if ts is None:
+            return False
+        hour = ts.hour
+        return hour >= 15 or hour < 5
     
     def _check_entry(self, context: StrategyContext) -> Optional[Signal]:
         """檢查進場條件"""

@@ -137,8 +137,15 @@ def tick_dispatcher(futures_mon, options_mon, feed_health=None, tx_bar_builder=N
     return on_tick
 
 
-def bidask_dispatcher(futures_mon, options_mon):
-    """Route BidAsk updates to monitors for IV calculation and data freshness."""
+def bidask_dispatcher(futures_mon, options_mon, skew_engine=None):
+    """Route BidAsk updates to monitors for IV calculation and data freshness.
+
+    Args:
+        futures_mon: FuturesMonitor instance.
+        options_mon: OptionsMonitor instance.
+        skew_engine: Optional OptionSurfaceEngine — receives OptionQuoteEvent
+                     on every option bidask callback for skew calculation.
+    """
     _seen = set()
     _lock = threading.Lock()
     _last_mtx_update_log_at = {"ts": 0.0}
@@ -195,22 +202,236 @@ def bidask_dispatcher(futures_mon, options_mon):
                         futures_mon.market_data["MTX"]["close"] = mid
                     
                     matched = True
-                    # MTX bid/ask updates can arrive at very high frequency near open.
-                    # Throttle visibility logs so callback cost stays bounded without
-                    # changing any market-data mutation or freshness semantics.
-                    if key == "MTX":
-                        now = time.time()
-                        if now - _last_mtx_update_log_at["ts"] >= _mtx_update_log_interval_secs:
-                            _last_mtx_update_log_at["ts"] = now
-                            console.print(f"[green]✅ MTX updated ({code}): {mon.market_data['MTX']['close']:.0f}[/green]")
+
+                # [Skew Integration] Feed option quote to skew engine
+                if skew_engine is not None and key in ("C", "P"):
+                    try:
+                        from core.derivatives import OptionQuoteEvent
+                        import datetime as _dt
+                        opt_type = "CALL" if key == "C" else "PUT"
+                        strike = float(getattr(con, "strike_price", 0))
+                        ts = _dt.datetime.now()
+                        event = OptionQuoteEvent(
+                            timestamp=ts,
+                            symbol=code,
+                            option_type=opt_type,
+                            strike=strike,
+                            bid=float(bid),
+                            ask=float(ask),
+                            mid=mid,
+                            expiry=str(getattr(con, "delivery_date", "")),
+                        )
+                        skew_engine.on_quote(event)
+                    except Exception as e:
+                        console.print(f"[dim][skew on_quote err] {e}[/dim]")
+
+                # MTX bid/ask updates can arrive at very high frequency near open.
+                # Throttle visibility logs so callback cost stays bounded without
+                # changing any market-data mutation or freshness semantics.
+                if key == "MTX":
+                    now = time.time()
+                    if now - _last_mtx_update_log_at["ts"] >= _mtx_update_log_interval_secs:
+                        _last_mtx_update_log_at["ts"] = now
+                        console.print(f"[green]✅ MTX updated ({code}): {mon.market_data['MTX']['close']:.0f}[/green]")
                     break
             
             if not matched and code not in _seen:
-                console.print(f"[yellow]bidask unmatched: {code}, contracts={list(mon.active_contracts.keys())}[/yellow]")
+                # [Skew Integration] Check if code is an OTM skew contract
+                otm_cons = getattr(futures_mon, '_skew_otm_contracts', {})
+                if skew_engine is not None and otm_cons:
+                    for otm_key, otm_con in otm_cons.items():
+                        if code == getattr(otm_con, "code", None):
+                            opt_type = "CALL" if "CALL" in otm_key.upper() or "_C" in otm_key else "PUT"
+                            try:
+                                from core.derivatives import OptionQuoteEvent
+                                import datetime as _dt
+                                strike = float(getattr(otm_con, "strike_price", 0))
+                                event = OptionQuoteEvent(
+                                    timestamp=_dt.datetime.now(),
+                                    symbol=code,
+                                    option_type=opt_type,
+                                    strike=strike,
+                                    bid=float(bid),
+                                    ask=float(ask),
+                                    mid=mid,
+                                    expiry=str(getattr(otm_con, "delivery_date", "")),
+                                )
+                                skew_engine.on_quote(event)
+                            except Exception as e:
+                                console.print(f"[dim][skew otm on_quote err] {e}[/dim]")
+                            matched = True
+                            break
+                if not matched:
+                    console.print(f"[yellow]bidask unmatched: {code}, contracts={list(mon.active_contracts.keys())}[/yellow]")
         except Exception as e:
             console.print(f"[red][bidask dispatch err] {e}[/red]")
     
     return on_bidask
+
+
+def _safe_contract_strike(contract):
+    """Safely extract strike_price from a Shioaji option contract."""
+    try:
+        return int(float(contract.strike_price))
+    except Exception:
+        return None
+
+
+def _option_strike_step(strikes: list[int]) -> int:
+    """Infer strike step from sorted unique strikes."""
+    if len(strikes) < 2:
+        return 200  # default TXO step
+    diffs = sorted(set(abs(strikes[i + 1] - strikes[i]) for i in range(len(strikes) - 1)))
+    return min(diffs)
+
+
+def _nearest_strike(strikes: list[int], target: int) -> int | None:
+    """Return the strike closest to target, or None if empty."""
+    if not strikes:
+        return None
+    return min(strikes, key=lambda x: abs(x - target))
+
+
+def _subscribe_otm_skew_contracts(api, om, fm, sk_engine, console=None):
+    """Resolve and subscribe OTM option contracts for skew surface.
+
+    Phase 1.5 diagnostic: dumps the full option universe, infers strike step,
+    resolves ATM from the nearest available strike to the anchor, and
+    subscribes OTM puts/calls aligned to the strike grid.
+
+    The anchor *for OTM subscribe* is the ATM call strike (from active_contracts)
+    because we need a subscribe-time value.  The actual ATM anchor *for skew
+    computation* is determined at compute-time from live futures_price and is
+    independent of this function.
+    """
+    otm_contracts = {}
+    if console is None:
+        console = print
+    _log = console.print if hasattr(console, 'print') else console
+
+    try:
+        # --- 1. get the full option universe for the active month ---
+        all_contracts = getattr(om.monitor, "_all_month_contracts", None)
+        if not all_contracts:
+            target_m = om.monitor.get_futures_contract_month(fm)
+            _, all_contracts = om.monitor.get_options_by_month("TXO", target_m)
+
+        if not all_contracts:
+            _log("[yellow][OptionSkew] no contracts found; skip OTM subscribe[/yellow]")
+            fm._skew_otm_contracts = {}
+            return {}
+
+        # Build sorted strike lists for call / put
+        call_strikes = sorted(
+            _safe_contract_strike(c) for c in all_contracts
+            if _safe_contract_strike(c) is not None and "Call" in str(c.option_right)
+        )
+        put_strikes = sorted(
+            _safe_contract_strike(c) for c in all_contracts
+            if _safe_contract_strike(c) is not None and "Put" in str(c.option_right)
+        )
+
+        inferred_step = _option_strike_step(call_strikes + put_strikes)
+
+        # --- 2. resolve subscribe-time anchor ---
+        # Use the ATM call strike from active_contracts as the subscribe anchor.
+        # This is a best-effort anchor for OTM subscribe only.  The compute-time
+        # anchor is resolved from live futures_price inside SurfaceEngine.
+        atm_call = om.monitor.active_contracts.get("C")
+        atm_put = om.monitor.active_contracts.get("P")
+        call_atm_strike = _safe_contract_strike(atm_call)
+        put_atm_strike = _safe_contract_strike(atm_put)
+
+        if call_atm_strike is not None and put_atm_strike is not None:
+            if abs(call_atm_strike - put_atm_strike) <= 100:
+                skew_anchor = int(round((call_atm_strike + put_atm_strike) / 2 / inferred_step) * inferred_step)
+            else:
+                _log(
+                    "[yellow][OptionSkew] ATM C/P mismatch: "
+                    f"call={call_atm_strike}, put={put_atm_strike}; "
+                    "use call strike as temporary anchor[/yellow]"
+                )
+                skew_anchor = call_atm_strike
+        elif call_atm_strike is not None:
+            skew_anchor = call_atm_strike
+        else:
+            _log("[yellow][OptionSkew] Cannot resolve ATM strike; skip OTM subscribe[/yellow]")
+            fm._skew_otm_contracts = {}
+            return {}
+
+        # --- 3. diagnostic dump ---
+        _log(
+            "[OptionSkew][Universe] month=E6 "
+            f"call_strikes={call_strikes[:6]}... (total {len(call_strikes)}) "
+            f"put_strikes={put_strikes[:6]}... (total {len(put_strikes)})"
+        )
+        _log(
+            f"[OptionSkew][Step] inferred_step={inferred_step}"
+        )
+        _log(
+            f"[OptionSkew][ATM] call_atm={call_atm_strike}, put_atm={put_atm_strike}, "
+            f"anchor={skew_anchor}"
+        )
+
+        # --- 4. resolve OTM targets aligned to strike grid ---
+        otm_call_target = skew_anchor + sk_engine.otm_points
+        otm_put_target = skew_anchor - sk_engine.otm_points
+
+        otm_call_strike = _nearest_strike(call_strikes, otm_call_target)
+        otm_put_strike = _nearest_strike(put_strikes, otm_put_target)
+
+        _log(
+            f"[OptionSkew][Targets] put_target={otm_put_target}, "
+            f"call_target={otm_call_target}"
+        )
+        _log(
+            f"[OptionSkew][Resolved] otm_put={otm_put_strike}, "
+            f"otm_call={otm_call_strike}"
+        )
+
+        # --- 5. subscribe the resolved OTM contracts ---
+        import shioaji as sj
+        # Find OTM put
+        if otm_put_strike is not None:
+            for c in all_contracts:
+                strike = _safe_contract_strike(c)
+                if strike == otm_put_strike and "Put" in str(c.option_right):
+                    otm_contracts["OTM_P"] = c
+                    api.quote.subscribe(c, quote_type="tick")
+                    api.quote.subscribe(c, quote_type=sj.constant.QuoteType.BidAsk)
+                    _log(
+                        "[green][OptionSkew] subscribed otm_put: "
+                        f"{c.code} (strike={otm_put_strike})[/green]"
+                    )
+                    break
+        # Find OTM call
+        if otm_call_strike is not None:
+            for c in all_contracts:
+                strike = _safe_contract_strike(c)
+                if strike == otm_call_strike and "Call" in str(c.option_right):
+                    otm_contracts["OTM_C"] = c
+                    api.quote.subscribe(c, quote_type="tick")
+                    api.quote.subscribe(c, quote_type=sj.constant.QuoteType.BidAsk)
+                    _log(
+                        "[green][OptionSkew] subscribed otm_call: "
+                        f"{c.code} (strike={otm_call_strike})[/green]"
+                    )
+                    break
+
+        if not otm_contracts:
+            _log(
+                "[yellow][OptionSkew] No OTM contracts resolved for "
+                f"anchor={skew_anchor} ±{sk_engine.otm_points} "
+                f"(otm_call={otm_call_strike}, otm_put={otm_put_strike})[/yellow]"
+            )
+
+    except Exception as e:
+        _log(f"[yellow]⚠️ _subscribe_otm_skew_contracts error: {e}[/yellow]")
+        import traceback
+        _log(f"[yellow]{traceback.format_exc()}[/yellow]")
+
+    fm._skew_otm_contracts = otm_contracts
+    return otm_contracts
 
 
 def api_is_healthy(api):
@@ -449,6 +670,13 @@ def run_system(dry_run=False):
         om.monitor.find_best_contracts(fm)  # [GSD Settlement Fix] 傳遞期貨監控器以同步月份
         om.monitor.pre_fill_bars()
 
+        # [Skew Integration] Initialize option surface engine
+        try:
+            from core.derivatives import OptionSurfaceEngine
+            sk_engine = OptionSurfaceEngine(otm_points=300)
+        except Exception:
+            sk_engine = None
+
         if api is not None:
             import shioaji as sj
             # Initialize feed health tracker
@@ -463,7 +691,9 @@ def run_system(dry_run=False):
 
             # Register tick/bidask callbacks with feed health and tx builder
             api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om, feed_health, tx_bar_builder))
-            api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(fm, om))
+            api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(fm, om, sk_engine))
+            # [Skew Integration] Wire skew engine into FuturesMonitor for strategy context
+            fm._skew_engine = sk_engine
 
             # Subscribe TMF tick
             if fm.contract is not None:
@@ -488,7 +718,15 @@ def run_system(dry_run=False):
                 except Exception:
                     console.print("[yellow]⚠️ TX contract resolution failed; proceeding without macro reference[/yellow]")
 
-            # Subscribe options
+            # Subscribe far-month MXF tick for dual chart
+            if fm.far_contract is not None:
+                try:
+                    api.quote.subscribe(fm.far_contract, quote_type='tick')
+                    console.print(f"[green]📡 Subscribed far-month MXF tick: {fm.far_contract.code}[/green]")
+                except Exception as e:
+                    console.print(f"[yellow]⚠️ Far-month MXF subscribe failed: {e}[/yellow]")
+
+            # Subscribe options (ATM + OTM for skew)
             for key in ["MTX", "C", "P"]:
                 con = om.monitor.active_contracts.get(key)
                 if con:
@@ -496,14 +734,22 @@ def run_system(dry_run=False):
                     api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
                     console.print(f"[green]📡 Subscribed {key}: {con.code} (tick+bidask)[/green]")
 
-            # [P0 Fix] Setup connection event monitoring
-            _setup_event_callback(api, fm, om)
-            console.print("[green]✅ Connection event callback registered[/green]")
+        if sk_engine is not None:
+            otm_contracts = _subscribe_otm_skew_contracts(
+                api, om, fm, sk_engine,
+                console=console,
+            )
+        else:
+            otm_contracts = {}
 
-            # Expose feed_health and tx_contract to monitors for policy gating
-            fm.feed_health = feed_health
-            fm.tx_contract = tx_contract
-            fm.tx_bar_builder = tx_bar_builder
+        # [P0 Fix] Setup connection event monitoring
+        _setup_event_callback(api, fm, om)
+        console.print("[green]✅ Connection event callback registered[/green]")
+
+        # Expose feed_health and tx_contract to monitors for policy gating
+        fm.feed_health = feed_health
+        fm.tx_contract = tx_contract
+        fm.tx_bar_builder = tx_bar_builder
 
         ft = threading.Thread(target=fm.run, name="futures", daemon=True)
         ot = threading.Thread(target=om.run, name="options", daemon=True)
@@ -569,7 +815,11 @@ def run_system(dry_run=False):
                                 tx_bar_builder = None
 
                         api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om, feed_health, tx_bar_builder))
-                        api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(fm, om))
+                        api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(fm, om, sk_engine))
+                        # [Skew Integration] Re-wire skew engine (might have been reset)
+                        fm._skew_engine = sk_engine
+                        if sk_engine is not None:
+                            sk_engine.reset()
 
                         if fm.contract is not None:
                             api.quote.subscribe(fm.contract, quote_type='tick')
@@ -590,6 +840,14 @@ def run_system(dry_run=False):
                             if con:
                                 api.quote.subscribe(con, quote_type='tick')
                                 api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
+
+                        # Re-subscribe far-month MXF tick for dual chart
+                        if fm.far_contract is not None:
+                            try:
+                                api.quote.subscribe(fm.far_contract, quote_type='tick')
+                                console.print(f"[green]📡 Re-Subscribed far-month MXF tick: {fm.far_contract.code}[/green]")
+                            except Exception as e:
+                                console.print(f"[yellow]⚠️ Re-subscribe far-month MXF failed: {e}[/yellow]")
 
                     ft = threading.Thread(target=fm.run, name="futures", daemon=True)
                     ot = threading.Thread(target=om.run, name="options", daemon=True)

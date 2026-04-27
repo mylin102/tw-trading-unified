@@ -27,7 +27,8 @@ class FuturesRouterConfig:
     """Routing policy for futures entry signals."""
 
     trend_strategies: tuple[str, ...] = ("adaptive_orb",)
-    weak_strategies: tuple[str, ...] = ("adaptive_orb", "counter_vwap", "spring_upthrust", "kbar_feature", "calendar_condor", "calendar_condor_v2")
+    weak_strategies: tuple[str, ...] = ("adaptive_orb", "counter_vwap", "spring_upthrust", "kbar_feature", "calendar_condor_v2")
+    bear_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust")  # [Bear] conservative short — countertrend + upthrust
     stretched_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust")
     squeeze_strategies: tuple[str, ...] = ()
     countertrend_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust")
@@ -110,6 +111,12 @@ def _strategy_order_for_regime(
             base.insert(0, active_strategy_name)
         return _dedupe(base)
 
+    if regime == "BEAR":
+        base = list(config.bear_strategies)
+        if active_strategy_name:
+            base.insert(0, active_strategy_name)
+        return _dedupe(base)
+
     if regime == "STRETCHED":
         base = list(config.stretched_strategies)
         if active_strategy_name:
@@ -162,6 +169,96 @@ def route_futures_signal(
             notes=["router only emits fresh entry decisions while flat"],
         )
 
+    # ── [V-Model] Spread Staleness Gate + Bias Modifier ──
+    # Two config-driven checks for night session:
+    #   1. Staleness gate: if CSV data is too old, FLAT entry
+    #   2. Bias modifier: extreme spread_z adds note (not trade action)
+    #
+    # Config shape (from context.config, typically futures.yaml / futures_night.yaml):
+    #   spread_gate:
+    #     enabled: true
+    #     night_only: true
+    #     max_age_minutes: 120
+    #     extreme_z: 2.0
+    #     stale_action: flat      # 'flat' or 'degrade_only'
+    #
+    spread_cfg = context.config.get("spread_gate", {}) if hasattr(context, "config") and context.config else {}
+    spread_enabled = spread_cfg.get("enabled", False)
+    max_age_minutes = spread_cfg.get("max_age_minutes", 120)
+    extreme_z = spread_cfg.get("extreme_z", 2.0)
+    stale_action = spread_cfg.get("stale_action", "flat")
+    _spread_gate_block_short = False
+    _spread_gate_block_long = False
+
+    if spread_enabled:
+        last_bar = context.market.last_bar or {}
+        spread_age = last_bar.get("spread_age_minutes", None)
+        spread_z = last_bar.get("spread_z", None)
+        is_night = last_bar.get("is_night_session", False)
+
+        # ═══ Spread quality classification ═══
+        # Far-month (MXFF6) has low night liquidity — gaps are normal.
+        # Never forward-fill; quality-aware only.
+        spread_quality = "UNKNOWN"
+        if spread_age is not None:
+            if spread_age <= 60:
+                spread_quality = "FRESH"
+            elif spread_age <= 120:
+                spread_quality = "DEGRADED"
+            else:
+                spread_quality = "STALE"
+
+        if is_night:
+            print(f"[V-Model][SpreadGate] NIGHT spread_age={spread_age}m quality={spread_quality}", flush=True)
+
+            # ═══ 1) Staleness gate (STALE only → flat) ═══
+            if spread_quality == "STALE":
+                if stale_action == "flat":
+                    print(f"[V-Model][SpreadGate] STALE — FLAT entry", flush=True)
+                    if recorder is not None:
+                        recorder.log_router_row(
+                            timestamp=timestamp, symbol=symbol, regime=regime_result.regime,
+                            strategy_name="router", candidate_order=0, status="spread_stale",
+                            evaluated=False, winner=False,
+                            notes=f"NIGHT spread_age={spread_age}m STALE action={stale_action}",
+                        )
+                    return FuturesRouterDecision(
+                        action="FLAT",
+                        reason=f"SPREAD_STALE_NIGHT_age_{spread_age}m",
+                        regime=regime_result.regime, bias=regime_result.bias,
+                        candidates=[],
+                        notes=[f"spread STALE: age={spread_age}m — {stale_action}"],
+                    )
+                notes.append(f"spread_quality=STALE age={spread_age}m (degraded_mode)")
+            elif spread_quality == "DEGRADED":
+                # Log degradation — no bias impact, no flat
+                notes.append(f"spread_quality=DEGRADED age={spread_age}m — log only, no bias")
+
+            # ═══ 2) Spread bias modifier — only when FRESH or DEGRADED (not STALE) ═══
+            if spread_quality in ("FRESH", "DEGRADED") and spread_z is not None and abs(spread_z) >= extreme_z:
+                # bias modifier only applies when quality is FRESH
+                if spread_quality == "FRESH":
+                    spread_bias = "SHORT" if spread_z < 0 else "LONG"
+                    regime_bias = regime_result.bias.upper() if regime_result.bias else ""
+                    print(
+                        f"[V-Model][SpreadBias] night spread_z={spread_z:.2f} FRESH "
+                        f"spread_bias={spread_bias} regime_bias={regime_bias}",
+                        flush=True,
+                    )
+                    if spread_bias == "SHORT" and regime_bias == "LONG":
+                        _spread_gate_block_long = True
+                        notes.append(f"spread_bias_block: spread_z={spread_z:.1f} says SHORT but regime says LONG")
+                    elif spread_bias == "LONG" and regime_bias == "SHORT":
+                        _spread_gate_block_short = True
+                        notes.append(f"spread_bias_block: spread_z={spread_z:.1f} says LONG but regime says SHORT")
+                    else:
+                        notes.append(f"spread_align: spread_z={spread_z:.1f} → {spread_bias}")
+                else:
+                    # DEGRADED: log the extreme_z value but don't influence bias
+                    notes.append(f"spread_extreme: z={spread_z:.1f} (DEGRADED — logged, no bias impact)")
+            elif spread_quality in ("FRESH", "DEGRADED") and spread_z is not None:
+                print(f"[V-Model][SpreadBias] NIGHT spread_z={spread_z:.2f} abs < extreme_z={extreme_z} — no bias mod", flush=True)
+
     candidates = _strategy_order_for_regime(regime_result, active_strategy_name, cfg)
     if regime_result.regime == "SQUEEZE" and not candidates:
         # Log SQUEEZE regime with no candidates
@@ -209,6 +306,16 @@ def route_futures_signal(
             notes=notes,
         )
 
+    # [BearRoute] Log bear routing context
+    if regime_result.regime == "BEAR":
+        _bear_bs = context.market.last_bar.get("bear_breakout_strength", 0) if context.market.last_bar else 0
+        _vwap_dist = context.market.last_bar.get("price_vs_vwap", 0) if context.market.last_bar else 0
+        console.print(
+            f"[yellow][BearRoute] regime=BEAR bias={regime_result.bias} "
+            f"bear_bs={_bear_bs:.3f} vwap_dist={_vwap_dist:.4f} "
+            f"candidates={candidates}[/yellow]"
+        )
+
     # Log all candidates as pre-evaluation (for candidate_count invariant)
     for i, name in enumerate(candidates):
         log_router_event(
@@ -245,7 +352,33 @@ def route_futures_signal(
         if prepare_strategy is not None:
             prepare_strategy(name, strategy)
 
-        signal = strategy.on_bar(context)
+        try:
+            signal = strategy.on_bar(context)
+        except Exception as e:
+            notes.append(f"{name}: error in on_bar ({e})")
+            import traceback
+            console.print(f"[red][Router error] {name}.on_bar: {e}[/red]")
+            console.print(f"[dim]{''.join(traceback.format_exception(type(e), e, e.__traceback__)).strip()}[/dim]")
+            # [StrategyError] Log strategy name, reason, df_5m ready state, bar count
+            df_5m = getattr(context.market, 'df_5m', None)
+            df_5m_ready = f"ready(len={len(df_5m)})" if df_5m is not None and not df_5m.empty else "none/empty"
+            bar_count = getattr(context, 'bar_counter', -1)
+            console.print(f"[bold yellow][StrategyError] name={name} reason={e} df_5m={df_5m_ready} bar_count={bar_count}[/bold yellow]")
+            # Also log to attribution if recorder is present
+            log_router_event(
+                recorder=recorder,
+                timestamp=timestamp,
+                symbol=symbol,
+                regime=regime_result.regime if hasattr(regime_result, 'regime') else context.market.regime,
+                strategy_name=name,
+                candidate_order=i,
+                status="error",
+                evaluated=True,
+                winner=False,
+                note=f"error: {e} | df_5m={df_5m_ready} bar_count={bar_count}",
+            )
+            continue
+
         if signal is None:
             notes.append(f"{name}: no signal")
             # Log no signal

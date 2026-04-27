@@ -52,13 +52,18 @@ class KalmanMomentum(StrategyBase):
         atr = bar.get("atr", 50.0)
         fired = bar.get("fired", False)
         
+        # ═══ df_5m guard — prevent NoneType crash when data not ready ═══
+        df = context.market.df_5m
+        if df is None or df.empty:
+            logger.debug("kalman_momentum: df_5m None/empty — skipping")
+            return None
+        
         # Window Management
         if fired:
             self._fired_timer = self.window
         elif self._fired_timer > 0:
             self._fired_timer -= 1
             
-        df = context.market.df_5m
         if len(df) < 3: return None
             
         k_series = df["kalman_close"] if "kalman_close" in df.columns else df["Close"]

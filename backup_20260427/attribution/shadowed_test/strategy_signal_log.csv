@@ -1,0 +1,7 @@
+timestamp,symbol,regime,strategy_name,candidate_order,side,signal_type,selected,score,notes
+2026-04-23 01:01:00,TX,WEAK,spring_upthrust,1,SELL,entry,True,52,router selected
+2026-04-23 01:05:00,TX,WEAK,counter_vwap,0,SELL,entry,True,68,router selected
+2026-04-23 01:06:00,TX,WEAK,counter_vwap,0,BUY,entry,True,60,router selected
+2026-04-23 01:07:00,TX,WEAK,counter_vwap,0,SELL,entry,True,78,router selected
+2026-04-23 01:08:00,TX,WEAK,counter_vwap,0,BUY,entry,True,71,router selected
+2026-04-23 01:09:00,TX,WEAK,spring_upthrust,1,SELL,entry,True,61,router selected

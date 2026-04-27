@@ -1,0 +1,5 @@
+strategy_name,regime,candidate_count,eval_count,winner_count,shadowed_count,regime_mismatch_count,no_signal_count,evaluation_rate,shadow_rate,win_conversion,starvation_index
+counter_vwap,WEAK,100,50,27,0,0,23,0.5,0.0,0.54,0.5
+kbar_feature,WEAK,67,17,1,33,0,16,0.2537313432835821,0.4925373134328358,0.058823529411764705,0.7462686567164178
+router,WEAK,16,0,0,0,0,0,0.0,0.0,0.0,1.0
+spring_upthrust,WEAK,73,23,6,27,0,17,0.3150684931506849,0.3698630136986301,0.2608695652173913,0.6849315068493151

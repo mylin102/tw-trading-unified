@@ -1,0 +1,73 @@
+{
+  "collection": {
+    "start_time": "2026-04-23T00:03:48.072524",
+    "end_time": "2026-04-23T00:03:48.089075",
+    "duration_hours": 24,
+    "bars_processed": 300,
+    "strategies_evaluated": {
+      "counter_vwap": 300,
+      "spring_upthrust": 300,
+      "kbar_feature": 300
+    }
+  },
+  "requirements": {
+    "min_bars": 300,
+    "min_strategy_evaluations": 10,
+    "min_strategies": 3
+  },
+  "files_generated": {
+    "strategy_signal_log.csv": {
+      "rows": 0,
+      "columns": [
+        "timestamp",
+        "symbol",
+        "regime",
+        "strategy_name",
+        "candidate_order",
+        "side",
+        "signal_type",
+        "selected",
+        "score",
+        "notes"
+      ],
+      "size_kb": 0.08984375
+    },
+    "router_evaluation_log.csv": {
+      "rows": 900,
+      "columns": [
+        "timestamp",
+        "symbol",
+        "regime",
+        "strategy_name",
+        "candidate_order",
+        "status",
+        "evaluated",
+        "winner",
+        "signal_side",
+        "signal_type",
+        "notes"
+      ],
+      "size_kb": 88.2890625
+    },
+    "trade_attribution_log.csv": {
+      "rows": 0,
+      "columns": [
+        "trade_id",
+        "symbol",
+        "strategy_name",
+        "regime_at_entry",
+        "side",
+        "entry_time",
+        "exit_time",
+        "entry_price",
+        "exit_price",
+        "pnl",
+        "mae",
+        "mfe",
+        "hold_bars",
+        "exit_reason"
+      ],
+      "size_kb": 0.1259765625
+    }
+  }
+}

@@ -20,6 +20,14 @@ monitoring:
   data_mode: hybrid
   pb_confirmation_bars: 12
   poll_interval_secs: 30
+skew:
+  filter_threshold: 0.70
+spread_gate:
+  enabled: true
+  night_only: true
+  max_age_minutes: 120
+  extreme_z: 2.0
+  stale_action: flat
 risk_mgmt:
   atr_length: 14
   atr_multiplier: 2.2
@@ -77,4 +85,4 @@ trade_mgmt:
   allow_short: true
   force_close_at_end: true
   lots_per_trade: 1
-  max_positions: 11
+  max_positions: 7

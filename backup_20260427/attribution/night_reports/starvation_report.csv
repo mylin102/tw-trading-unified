@@ -1,0 +1,4 @@
+strategy_name,candidate_count,eval_count,shadowed_count,evaluation_rate,shadow_rate,starvation_index,starvation_level
+counter_vwap,48,48,0,1.0,0.0,0.0,acceptable
+spring_upthrust,48,48,0,1.0,0.0,0.0,acceptable
+kbar_feature,48,48,0,1.0,0.0,0.0,acceptable

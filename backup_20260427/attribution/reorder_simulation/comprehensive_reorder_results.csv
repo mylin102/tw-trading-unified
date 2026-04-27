@@ -1,0 +1,7 @@
+order,change_rate,changed_count,expected_pnl_delta,kbar_exposure,spring_exposure,kbar_position,spring_position
+"kbar_feature,counter_vwap,spring_upthrust",0.6,30,-2.194373401534526,1.0,0.4,1,3
+"counter_vwap,kbar_feature,spring_upthrust",0.68,34,-2.37084398976982,0.7,0.4,2,3
+"kbar_feature,spring_upthrust,counter_vwap",0.74,37,-4.281329923273655,1.0,0.7,1,2
+"counter_vwap,spring_upthrust,kbar_feature",0.56,28,-4.634271099744243,0.4,0.7,3,2
+"spring_upthrust,kbar_feature,counter_vwap",0.54,27,-6.544757033248079,0.7,1.0,2,1
+"spring_upthrust,counter_vwap,kbar_feature",0.62,31,-6.721227621483373,0.4,1.0,3,1

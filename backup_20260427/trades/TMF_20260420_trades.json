@@ -1,0 +1,34 @@
+[
+  {
+    "type": "SELL",
+    "timestamp": "2026-04-20 21:17:37",
+    "price": 37495.0,
+    "lots": 1,
+    "direction": "SHORT",
+    "pnl_pts": 0,
+    "pnl_cash": 0,
+    "friction_cost": 0,
+    "reason": "UPTHRUST",
+    "cross_policy": {
+      "allow_trade": true,
+      "orb_weight": 1.0,
+      "vwap_weight": 1.0
+    }
+  },
+  {
+    "type": "EXIT",
+    "timestamp": "2026-04-20 21:30:01",
+    "price": 37591.0,
+    "lots": 1,
+    "direction": "SHORT",
+    "pnl_pts": -96.0,
+    "pnl_cash": -1015.0,
+    "friction_cost": 55.0,
+    "reason": "STOP_LOSS",
+    "cross_policy": {
+      "allow_trade": true,
+      "orb_weight": 1.0,
+      "vwap_weight": 1.0
+    }
+  }
+]

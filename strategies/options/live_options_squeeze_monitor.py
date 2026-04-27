@@ -1159,52 +1159,69 @@ class ShioajiOptionsSmartMonitor:
             return 0
         return min(scaled_lots, remaining_capacity)
 
-    def log_trade(self, action, side, price, note="", quantity=None):
+    def log_trade(self, action, side, price, note="", quantity=None, entry_price_override=None):
         pnl = 0
         point_value = self.pricing_cfg.get("point_value", 50)
-        qty = quantity or self.position or 1
+        # ── [PnL Fix] Use passed quantity; never fallback to self.position (already cleared) ──
+        qty = quantity if quantity is not None else 1
+
+        # ── [PnL Fix] Use explicit entry_price from snapshot override; never fallback to self.entry_price (may be mixed) ──
+        entry_price_for_pnl = entry_price_override if entry_price_override is not None else self.entry_price
 
         # GSD fix: Explicit whitelist of exit actions that require PnL calculation
-        # (instead of fragile substring matching)
-        exit_keywords = ["EXIT", "THETA_EXIT", "TP1", "TRAIL", "TIME", "REVERSAL", "TRAP", "EOD", "FILL"]  # to_csv presence required by tests
-        is_exit_action = any(kw in action for kw in exit_keywords) and self.entry_price > 0
+        exit_keywords = ["EXIT", "THETA_EXIT", "TP1", "TRAIL", "TIME", "REVERSAL", "TRAP", "EOD", "FILL"]
+        is_exit_action = any(kw in action for kw in exit_keywords) and entry_price_for_pnl > 0
 
         # Skip non-trade entries (cancelled orders, retries, etc.)
         if any(kw in action for kw in ["CLEARED", "RETRY", "SUBMITTED"]):
             is_exit_action = False
 
         if is_exit_action:
-            # GSD Fix: Side-aware gross PnL
-            if side in ["SELL", "THETA", "SHORT"]:
-                # Short: profit if price drops
-                gross_pnl = (self.entry_price - price) * point_value * qty
+            # ── [PnL Fix] Side mapping: C and P are LONG (buy to open, sell to close)
+            # THETA and SHORT are short (sell to open, buy to close)
+            is_long = side in ("C", "P", "CALL", "PUT", "BUY", "LONG")
+            is_short = side in ("SELL", "THETA", "SHORT", "IRON_CONDOR")
+
+            if is_short:
+                # Short: profit if exit price is lower than entry
+                gross_pnl = (entry_price_for_pnl - price) * point_value * qty
+            elif is_long:
+                # Long: profit if exit price is higher than entry
+                gross_pnl = (price - entry_price_for_pnl) * point_value * qty
             else:
-                # Long: profit if price rises
-                gross_pnl = (price - self.entry_price) * point_value * qty
+                # Unknown side — log warning and skip PnL
+                console.print(f"[yellow]⚠️ Unknown side '{side}' — PnL=0 for {action} @ {price}[/yellow]")
+                gross_pnl = 0.0
 
             # 扣除交易成本 (RULES.md Rule 4: PnL Must Include All Costs)
-            # 期權手續費 (GSD parameterized)
             broker_fee_per_side = getattr(self, "broker_fee_per_side", float(self.execution_cfg.get("broker_fee_per_side", 20.0)))
             exchange_fee_per_side = getattr(self, "exchange_fee_per_side", float(self.execution_cfg.get("exchange_fee_per_side", 5.0)))
-            broker_fee = broker_fee_per_side * 2 * qty  # 進出各一次
+            broker_fee = broker_fee_per_side * 2 * qty
             exchange_fee = exchange_fee_per_side * 2 * qty
             # 交易稅: 期權約 0.1% 權利金
             tax_rate = self.pricing_cfg.get("tax_rate", 0.001)
-            tax = (abs(self.entry_price) + abs(price)) * point_value * tax_rate * qty
+            tax = (abs(entry_price_for_pnl) + abs(price)) * point_value * tax_rate * qty
             pnl = round(gross_pnl - broker_fee - exchange_fee - tax, 0)
 
-            # GSD validation: warn if exit PnL is 0 (indicates missing action keyword)
+            # GSD validation: warn if exit PnL is 0
             if pnl == 0 and "ENTRY" not in action:
-                console.print(f"[yellow]⚠️ Exit PnL=0 for {action} {side} @ {price} — check action keyword[/yellow]")
-        # 從既有 ledger 累計 balance
+                console.print(f"[yellow]⚠️ Exit PnL=0 for {action} {side} @ {price} — check entry_price_override or side mapping[/yellow]")
+
+        # ── [PnL Fix] Balance from last Balance row, not from summing PnL column ──
         balance = 0
         if self.ledger_path.exists():
             try:
                 prev = pd.read_csv(self.ledger_path)
-                balance = pd.to_numeric(prev["PnL"], errors="coerce").fillna(0).sum()
+                if "Balance" in prev.columns and not prev["Balance"].empty:
+                    balance = pd.to_numeric(prev["Balance"].iloc[-1], errors="coerce")
+                    if pd.isna(balance):
+                        balance = 0
+                else:
+                    balance = pd.to_numeric(prev["PnL"], errors="coerce").fillna(0).sum()
             except Exception as e:
                 console.print(f"[yellow]⚠️ Ledger read error: {e} — balance reset to 0[/yellow]")
-        balance += pnl
+        balance = (balance if not pd.isna(balance) else 0) + pnl
+        balance = round(balance, 0)
         data = {
             "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "Mode": self.mode, "Action": action, "Side": side,
@@ -2271,6 +2288,30 @@ class ShioajiOptionsSmartMonitor:
         if not self.spread_is_tradeable(side):
             console.print(f"[yellow]⚠️ enter_paper_position blocked: spread too wide for {side}[/yellow]")
             return
+
+        # ── [DirectionLock] Block directional entry against regime bias ──
+        _regime = str(getattr(self, 'latest_mid_trend', 'NORMAL')).upper()
+        _bias = str(getattr(self, 'latest_score', 0.0))
+        # score > 0 = bearish, score < 0 = bullish (from squeeze system convention)
+        _score = float(getattr(self, 'latest_score', 0.0))
+        _is_bearish_bias = _score > 0  # positive score = bearish momentum
+        _is_bullish_bias = _score < 0  # negative score = bullish momentum
+        # side 'C' = long CALL (bullish), side 'P' = long PUT (bearish)
+        _is_long_call = side in ("C", "CALL")
+        _is_long_put = side in ("P", "PUT")
+        # Block: regime is STRETCHED/BEAR + score says bearish + trying to buy CALL
+        if _regime in ("BEAR", "STRETCHED") and _is_bearish_bias and _is_long_call:
+            console.print(f"[bold yellow]🛑 [DirectionLock] Block CALL long in {_regime}/BEARISH (score={_score:.1f}) — direction conflict[/bold yellow]")
+            return
+        # Block: regime is STRETCHED/BULL + score says bullish + trying to buy PUT
+        if _regime in ("BULL", "STRETCHED") and _is_bullish_bias and _is_long_put:
+            console.print(f"[bold yellow]🛑 [DirectionLock] Block PUT long in {_regime}/BULLISH (score={_score:.1f}) — direction conflict[/bold yellow]")
+            return
+        # Also block: STRETCHED + any directional (keep only theta for stretched)
+        if _regime == "STRETCHED" and (_is_long_call or _is_long_put):
+            console.print(f"[bold yellow]🛑 [DirectionLock] Block directional {side} in STRETCHED — theta only[/bold yellow]")
+            return
+
         quote = self.current_option_quote(side)
         entry_price = quote["ask"]
         if entry_price <= 0:
@@ -2439,14 +2480,18 @@ class ShioajiOptionsSmartMonitor:
     def exit_paper_position(self, action, price, note=""):
         if self.position <= 0 or not self.active_side:
             return
+        # ── [PnL Fix] Snapshot exit state BEFORE clearing ──
         exit_qty = self.position
-        side = self.active_side
-        paper_order = self._record_paper_order(side, "SELL", exit_qty, price, f"{action} {note}".strip())
+        exit_side = self.active_side
+        exit_entry_price = self.entry_price
+        paper_order = self._record_paper_order(exit_side, "SELL", exit_qty, price, f"{action} {note}".strip())
         if self.order_mgr and paper_order is None:
             return
 
+        # Compute PnL BEFORE clearing position
+        self.log_trade(action, exit_side, price, note, quantity=exit_qty, entry_price_override=exit_entry_price)
+        # Clear position AFTER logging
         self.position = max(0, self.position - exit_qty)
-        self.log_trade(action, side, price, note, quantity=exit_qty)
         self.active_side = None
         self.entry_price = 0.0
         self.entry_mtx_price = 0.0
@@ -2460,16 +2505,18 @@ class ShioajiOptionsSmartMonitor:
     def apply_paper_tp1(self, price, note=""):
         if self.position <= 0 or not self.active_side:
             return False
-        side = self.active_side
+        # ── [PnL Fix] Snapshot exit state BEFORE clearing ──
+        exit_side = self.active_side
         exit_qty = min(1, self.position)
-        paper_order = self._record_paper_order(side, "SELL", exit_qty, price, f"{self.status_mode_label()}_TP1 {note}".strip())
+        exit_entry_price = self.entry_price
+        paper_order = self._record_paper_order(exit_side, "SELL", exit_qty, price, f"{self.status_mode_label()}_TP1 {note}".strip())
         if self.order_mgr and paper_order is None:
             return False
 
         self.position = max(0, self.position - exit_qty)
         self.has_tp1_hit = True
         self.replay_stats["tp1_hits"] += 1
-        self.log_trade(f"{self.status_mode_label()}_TP1", side, price, note, quantity=exit_qty)
+        self.log_trade(f"{self.status_mode_label()}_TP1", exit_side, price, note, quantity=exit_qty, entry_price_override=exit_entry_price)
         if self.position == 0:
             self.active_side = None
             self.entry_price = 0.0
@@ -3295,6 +3342,21 @@ class ShioajiOptionsSmartMonitor:
         quote = self.current_option_quote(self.active_side)
         exit_price = quote["bid"]
         contract = self.active_contracts.get(self.active_side)
+
+        # ── [QuoteGuard] Validate quote quality before any exit decision ──
+        _ask = quote.get("ask", 0.0)
+        _bid = quote.get("bid", 0.0)
+        _mid = (_bid + _ask) / 2 if _bid > 0 and _ask > _bid else 0.0
+        _quote_valid = _bid > 0 and _ask > _bid and _mid > 0 and (_ask - _bid) / _mid < 0.3
+        if not _quote_valid:
+            console.print(f"[yellow]⚠️ [QuoteGuard] Invalid quote for {self.active_side}: bid={_bid} ask={_ask} mid={_mid:.1f} spread_ratio={((_ask-_bid)/_mid*100) if _mid>0 else 999:.1f}% — skip exit decision[/yellow]")
+            return False
+
+        # ── [SessionGuard] Skip exit during invalid market state ──
+        _market_open, _session = self._is_market_open(now)
+        if not _market_open:
+            console.print(f"[bold yellow]⏰ [SessionGuard] Market closed ({_session}) — skip exit, mark pending[/bold yellow]")
+            return False
         
         # 1. 檢查時間約束 (持有天數與 DTE)
         if contract and self.entry_time:
