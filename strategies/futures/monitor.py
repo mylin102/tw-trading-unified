@@ -2138,6 +2138,8 @@ class FuturesMonitor:
         # Build context
         ctx = self._build_strategy_context(bar, session_regime)
 
+        print(f"[DEBUG_MARK] route_signal entered bar_ts={bar.get('timestamp')}", flush=True)
+
         # [Phase 2 Fix] Skip routing on prefill/warmup bars (old data from Parquet/CSV)
         # Check if bar timestamp is from current trading day
         bar_ts = bar.get("timestamp")
@@ -2146,6 +2148,7 @@ class FuturesMonitor:
             try:
                 bar_td = get_trading_day(pd.Timestamp(bar_ts))
                 current_td = get_trading_day(pd.Timestamp(datetime.now()))
+                print(f"[DEBUG_MARK] prefill_check bar_td={bar_td} current_td={current_td}", flush=True)
                 if bar_td != current_td:
                     console.print(f"[dim][Router] Skip prefill bar: ts={bar_ts} trading_day={bar_td} != current={current_td}[/dim]")
                     return None, ctx, session_regime, None
@@ -2180,11 +2183,20 @@ class FuturesMonitor:
         # Classify bar regime
         bar_regime = classify_futures_bar_regime(bar, session_regime=session_regime)
         
-        # [Phase 2 Debug] Router input features
-        console.print(
-            f"[cyan][RouterInput] breakout={bar.get('breakout_strength', 0):.4f} "
-            f"trend={bar.get('trend_strength_raw', 0):.6f} adx={bar.get('adx', 0):.2f} "
-            f"regime={bar_regime.regime} bias={bar_regime.bias}[/cyan]"
+        # [Phase 2 Debug] Router input features — use raw print to avoid rich truncation
+        print(
+            f"[DEBUG_MARK] classified regime={getattr(bar_regime, 'regime', None)} "
+            f"bias={getattr(bar_regime, 'bias', None)}",
+            flush=True,
+        )
+        print(
+            f"[RouterInput] bull_breakout={bar.get('breakout_strength', 0):.4f} "
+            f"bear_breakout={bar.get('bear_breakout_strength', 0):.4f} "
+            f"trend={bar.get('trend_strength_raw', 0):.6f} "
+            f"adx={bar.get('adx', 0):.2f} "
+            f"regime={getattr(bar_regime, 'regime', 'NONE')} "
+            f"bias={getattr(bar_regime, 'bias', 'NONE')}",
+            flush=True,
         )
 
         # Route signal with optional attribution

@@ -19,6 +19,7 @@ class FuturesBarRegimeConfig:
     adx_trend_threshold: float = 22.0
     adx_weak_threshold: float = 15.0
     breakout_strength_trend_threshold: float = 0.35
+    bear_breakout_strength_trend_threshold: float = 0.35
     stretched_vwap_distance: float = 0.0035
     trend_strength_threshold: float = 0.001
     min_volume_spike: float = 1.0
@@ -141,6 +142,7 @@ def classify_futures_bar_regime(
 
     adx = _safe_float(row.get("adx"))
     breakout_strength = _safe_float(row.get("breakout_strength"))
+    bear_breakout_strength = _safe_float(row.get("bear_breakout_strength"))
     price_vs_vwap = _safe_float(row.get("price_vs_vwap"))
     trend_strength_raw = _safe_float(row.get("trend_strength_raw"))
     sqz_on = _as_bool(row.get("sqz_on"))
@@ -161,13 +163,13 @@ def classify_futures_bar_regime(
     import logging
     logging.getLogger("regime").info(
         "[RegimeDebug] close=%.2f day_open=%.2f vwap=%.2f "
-        "intraday_return=%.4f%% breakout_strength=%.4f adx=%.2f "
+        "intraday_return=%.4f%% bull_bs=%.4f bear_bs=%.4f adx=%.2f "
         "trend_strength_raw=%.6f sqz_on=%s volume_spike=%.2f "
-        "ema_fast=%.2f ema_slow=%.2f",
+        "bias=%s session_regime=%s",
         close, day_open, vwap,
-        intraday_return, breakout_strength, adx,
+        intraday_return, breakout_strength, bear_breakout_strength, adx,
         trend_strength_raw, sqz_on, volume_spike,
-        ema_fast, ema_slow,
+        bias, normalized_session_regime,
     )
 
     if sqz_on and adx < cfg.adx_trend_threshold:
@@ -206,6 +208,24 @@ def classify_futures_bar_regime(
             regime="TREND",
             bias=bias,
             confidence=confidence,
+            reasons=reasons,
+            session_regime=normalized_session_regime,
+        )
+
+    bear_trend_confirmed = (
+        bias == "SHORT"
+        and bear_breakout_strength >= cfg.bear_breakout_strength_trend_threshold
+    )
+    if bear_trend_confirmed:
+        reasons.append(
+            f"bear_breakout_strength={bear_breakout_strength:.2f} confirms bear pressure"
+        )
+        # Use ADX to gauge confidence, not as hard gate
+        _bear_c = 0.80 if adx >= cfg.adx_trend_threshold else 0.65
+        return FuturesBarRegimeResult(
+            regime="BEAR",
+            bias=bias,
+            confidence=_bear_c,
             reasons=reasons,
             session_regime=normalized_session_regime,
         )
