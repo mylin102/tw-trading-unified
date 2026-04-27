@@ -29,13 +29,10 @@ from core.strategy_registry import StrategyRegistry
 from core.strategy_context import StrategyContext, PositionView, MarketData
 from core.signal import Signal
 from core.futures_bar_regime import classify_futures_bar_regime
-from core.futures_strategy_router import route_futures_signal
+from core.futures_strategy_router import FuturesRouterDecision, route_futures_signal
 
-# Old imports for backward compatibility (fallback)
-from squeeze_futures.data.shioaji_client import ShioajiClient
-from squeeze_futures.data.data_storage import save_trade
-from squeeze_futures.data.data_storage import save_trade
-
+# Data ingestion layer — all Shioaji API access is isolated here
+from squeeze_futures.data.ingestion_service import IngestionService
 # GSD: 策略外掛系統
 from core.strategy_registry import StrategyRegistry
 from core.strategy_context import StrategyContext, PositionView, MarketData
@@ -44,6 +41,8 @@ from core.bar_utils import attach_bar_metadata, build_preferred_canonical_bar_fr
 from core.date_utils import get_taifex_futures_hhmm, is_taifex_futures_market_open, get_taifex_futures_session_type
 from squeeze_futures.data.shioaji_client import ShioajiClient
 from squeeze_futures.data.data_storage import save_trade
+from squeeze_futures.data.tick_writer import RawTickWriter, get_trading_day_str
+from squeeze_futures.data.kbar_writer import RawKbarWriter
 
 try:
     from squeeze_futures.report.notifier import send_email_notification
@@ -79,19 +78,42 @@ class FuturesMonitor:
         self.cfg = self._load_config(config_path)
         self.ticker = "MXF"
         self.contract = None
+        self.far_contract = None  # Far-month contract for dual chart
         self._running = False
+
+        # Far-month tick-based bar accumulation (independent from near-month)
+        self._far_tick_bars_deque = deque(maxlen=300)
+        self._far_current_bar = {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0, "ts": None}
+        self._last_far_bar_ts = 0
 
         # Compatibility placeholders for external integrations
         self.feed_health = None
         self.tx_bar_builder = None
+        # [TX Cache] Pre-computed TX bars for cross-regime engine (populated
+        # during backfill/startup, NOT fetched on-demand in strategy tick).
+        self._tx_cached_kbars = None
 
         # Wrap injected api into ShioajiClient without re-login
         self.client = ShioajiClient.__new__(ShioajiClient)
         self.client.api = api
         self.client.is_logged_in = not dry_run
+
+        # [Skew Integration] Option surface engine — populated by bidask
+        # dispatcher via OptionQuoteEvent, consumed in _build_strategy_context.
+        self._skew_engine = None
         self.client._tick_callbacks = {}
         self.client._kbar_callbacks = {}
         self.client._latest_kbars = {}
+
+        # [Phase 2] IngestionService — all Shioaji API access is isolated here.
+        # strategy_tick() and signal generation read from canonical bars only.
+        self._ingestion = IngestionService(
+            api=api,
+            client=self.client,
+            contract=self.contract,
+            ticker=self.ticker,
+            save_raw_kbars_cb=self._save_raw_kbars,
+        )
 
         # GSD: Initialize stateful attributes before applying config
         self.cooldown_until = 0
@@ -323,6 +345,19 @@ class FuturesMonitor:
             }, index=[r["ts"] for r in records])
         return self._tick_bars_cache if self._tick_bars_cache is not None else pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
 
+    def get_far_tick_bars_df(self):
+        """Return far-month tick bars as DataFrame for dashboard consumption."""
+        records = list(self._far_tick_bars_deque)
+        if not records:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        return pd.DataFrame({
+            "Open": [r["open"] for r in records],
+            "High": [r["high"] for r in records],
+            "Low": [r["low"] for r in records],
+            "Close": [r["close"] for r in records],
+            "Volume": [r["volume"] for r in records],
+        }, index=[r["ts"] for r in records])
+
     def _bars_time_aligned(self, tx_bars, df_5m):
         """Check that the latest TX bar and MXF 5m bar share the same timestamp bucket.
 
@@ -396,26 +431,64 @@ class FuturesMonitor:
         self._tick_bars_cache = None  # Cached DF for indicator calculations
         self._current_bar = {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0, "ts": None}
 
+        # [GSD Data Safety] RawTickWriter: every tick lands on CSV before memory
+        self._tick_writer = None  # Initialised lazily on first real tick
+
+        # [GSD Data Safety] RawKbarWriter: every api.kbars() response lands on CSV before computation
+        self._kbar_writer = None  # Initialised lazily on first kbar fetch
+
         if self.dry_run:
             console.print("[yellow][FuturesMonitor] dry-run: skipping contract fetch[/yellow]")
             return True
 
         # [GSD Fix] Warm-up from Parquet SSOT (Wave 5 Integration)
         try:
+            # Try MXF first, then TXFR1 as fallback
             from core.data_manager import data_manager
-            df_hist = data_manager.load_historical(self.ticker)
-            if not df_hist.empty:
+            ticker_warm = self.ticker  # e.g. "MXF"
+            df_hist = data_manager.load_historical(ticker_warm)
+            if df_hist.empty or len(df_hist) < 20:
+                # Fallback: try TXFR1 which has broader coverage
+                df_hist = data_manager.load_historical("TXFR1")
+            if not df_hist.empty and len(df_hist) >= 20:
                 df_warm = df_hist.tail(100)
                 for ts, row in df_warm.iterrows():
                     self._tick_bars_deque.append({
                         "open": row["Open"], "high": row["High"], "low": row["Low"], 
                         "close": row["Close"], "volume": row["Volume"], "ts": ts
                     })
-                # Initialize cache to prevent immediate indicator re-calc
-                self._tick_bars_cache = df_warm[["Open", "High", "Low", "Close", "Volume"]].copy()
-                console.print(f"[green][FuturesMonitor] ✓ Warmed up with {len(df_warm)} bars from Parquet DB[/green]")
+                # Initialize cache to None — _get_tick_bars_df() will rebuild from deque
+                self._tick_bars_cache = None
+                console.print(f"[green][FuturesMonitor] ✓ Warmed up with {len(df_warm)} bars from {ticker_warm} Parquet DB[/green]")
+            else:
+                # [Night Session Fix] Fallback: read from today's indicators CSV for warm-up
+                console.print(f"[yellow][FuturesMonitor] Parquet warm-up empty, trying CSV fallback...[/yellow]")
+                from core.date_utils import get_session_date_str
+                import os as _os
+                log_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(__file__))), "logs", "market_data")
+                date_str = get_session_date_str(datetime.now())
+                tag = "_PAPER" if not self.live_trading else "_LIVE"
+                csv_path = _os.path.join(log_dir, f"{self.ticker}_{date_str}{tag}_indicators.csv")
+                if _os.path.exists(csv_path):
+                    df_csv = pd.read_csv(csv_path)
+                    if "timestamp" in df_csv.columns:
+                        df_csv["timestamp"] = pd.to_datetime(df_csv["timestamp"], errors="coerce")
+                        df_csv = df_csv.set_index("timestamp")
+                        if len(df_csv) >= 20:
+                            df_warm = df_csv.tail(100)
+                            for ts, row in df_warm.iterrows():
+                                self._tick_bars_deque.append({
+                                    "open": row.get("open", row.get("Open", 0)),
+                                    "high": row.get("high", row.get("High", 0)),
+                                    "low": row.get("low", row.get("Low", 0)),
+                                    "close": row.get("close", row.get("Close", 0)),
+                                    "volume": row.get("volume", row.get("Volume", 0)),
+                                    "ts": ts,
+                                })
+                            self._tick_bars_cache = None
+                            console.print(f"[green][FuturesMonitor] ✓ Warmed up with {len(df_warm)} bars from CSV fallback[/green]")
         except Exception as e:
-            console.print(f"[dim][FuturesMonitor] Parquet warm-up failed: {e}[/dim]")
+            console.print(f"[dim][FuturesMonitor] Warm-up failed: {e}[/dim]")
 
         # 獲取TMF合約
         try:
@@ -454,6 +527,19 @@ class FuturesMonitor:
                 # Log all available codes for verification
                 all_codes = [f"{c.code}({c.delivery_date})" for c in tmf_sorted]
                 console.print(f"[dim][FuturesMonitor] Valid MXF queue: {', '.join(all_codes)}[/dim]")
+
+                # [Far Month] Select first contract with DIFFERENT delivery date for dual chart
+                front_delivery = self.contract.delivery_date if self.contract else None
+                self.far_contract = None
+                for c in tmf_sorted[1:]:
+                    if c.delivery_date != front_delivery:
+                        self.far_contract = c
+                        break
+                if self.far_contract is not None:
+                    console.print(f"[green][FuturesMonitor] ✓ MXF far-month: {self.far_contract.code} (delivers {self.far_contract.delivery_date})[/green]")
+                else:
+                    self.far_contract = None
+                    console.print(f"[yellow][FuturesMonitor] No far-month contract available[/yellow]")
             else:
                 console.print("[red][FuturesMonitor] No MXF contracts found![/red]")
         except Exception as e:
@@ -488,25 +574,10 @@ class FuturesMonitor:
                     # [GSD Fix] Backfill night session gaps on startup
                     self._backfill_night_gaps(df)
             else:
-                # 如果新方法失敗，嘗試舊的get_kline方法
-                df = self.client.get_kline(self.ticker, interval="5m")
-                if not df.empty:
-                    # Convert pre-filled bars to deque format
-                    for _, row in df[["Open", "High", "Low", "Close", "Volume"]].iterrows():
-                        bar_dict = {
-                            "open": row["Open"],
-                            "high": row["High"],
-                            "low": row["Low"],
-                            "close": row["Close"],
-                            "volume": row["Volume"],
-                            "ts": row.name,  # DataFrame index is timestamp
-                        }
-                        self._tick_bars_deque.append(bar_dict)
-                    self._tick_bars_cache = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-                    console.print(f"[green][FuturesMonitor] pre-filled {len(self._tick_bars_deque)} bars from get_kline[/green]")
-                    
-                    # [GSD Fix] Backfill night session gaps on startup
-                    self._backfill_night_gaps(df)
+                # [Phase 2] Legacy fallback delegated to IngestionService (startup-only)
+                # If _fetch_today_kbars() is rate-limited or unavailable, the
+                # strategy loop will naturally fill from tick accumulation.
+                console.print("[dim][FuturesMonitor] No kbar data at startup — will fill from live ticks[/dim]")
         except Exception:
             pass
         return True
@@ -668,10 +739,14 @@ class FuturesMonitor:
         - If no new tick for < warn_secs: no-op.
         - If >= warn_secs but < critical_secs: attempt light recovery (rollover/resubscribe) and try fetching kline.
         - If >= critical_secs: mark monitor not running and raise to trigger supervisor restart.
+
+        All watchdog actions log in unified structured format for grep-ability:
+            [IngestionWatchdog] reason=<reason> symbol=<sym> tick_age_secs=<N>
+            last_bar_ts=<ts> canonical_age_secs=<N> action=<action> result=<result>
         """
         if self.dry_run or not self.api:
             return
-        
+
         secs_since_tick = self._tmf_feed_age_secs()
         warn = getattr(self, 'STALE_WARN_SECS', self.MONITOR.get('stale_tick_warn_secs', 120))
         critical = getattr(self, 'STALE_CRITICAL_SECS', self.MONITOR.get('stale_tick_critical_secs', 600))
@@ -680,15 +755,56 @@ class FuturesMonitor:
 
         from core.shioaji_session import SystemReadiness
         self._set_runtime_status(SystemReadiness.DEGRADED)
-        console.print(f"[yellow]⚠️ MXF data stale for {secs_since_tick/60:.1f} min, checking contract...[/yellow]")
+
+        # Gather structured context for watchdog log
+        symbol = getattr(self.contract, 'code', self.ticker) if hasattr(self, 'contract') else self.ticker
+        now_dt = datetime.now()
+        last_bar_ts = "N/A"
+        canonical_age_secs = -1
+        try:
+            df_5m = self._get_tick_bars_df()
+            if df_5m is not None and not df_5m.empty:
+                last_idx = df_5m.index[-1]
+                if isinstance(last_idx, pd.Timestamp):
+                    last_bar_ts = last_idx.strftime('%H:%M:%S')
+                    canonical_age_secs = int((now_dt - last_idx.to_pydatetime()).total_seconds())
+        except Exception:
+            pass
+
+        # ── Feed stale (warn threshold exceeded) ──
+        console.print(
+            f"[yellow][IngestionWatchdog] "
+            f"reason=feed_stale symbol={symbol} "
+            f"tick_age_secs={secs_since_tick:.0f} "
+            f"last_bar_ts={last_bar_ts} "
+            f"canonical_age_secs={canonical_age_secs} "
+            f"action=check_contract "
+            f"result=degraded[/yellow]"
+        )
 
         if not is_taifex_futures_market_open():
-            console.print("[dim]MXF feed quiet during scheduled recess — keeping monitor alive[/dim]")
+            console.print(
+                f"[dim][IngestionWatchdog] "
+                f"reason=market_closed symbol={symbol} "
+                f"tick_age_secs={secs_since_tick:.0f} "
+                f"last_bar_ts={last_bar_ts} "
+                f"canonical_age_secs={canonical_age_secs} "
+                f"action=none "
+                f"result=market_closed_keep_alive[/dim]"
+            )
             return
 
         # If we exceed critical threshold, stop the monitor so external supervisor restarts the process
         if secs_since_tick >= critical:
-            console.print(f"[red]🚨 MXF data stale CRITICAL: {secs_since_tick/60:.1f} min. Shutting down to trigger supervisor restart.[/red]")
+            console.print(
+                f"[red][IngestionWatchdog] "
+                f"reason=feed_stale_critical symbol={symbol} "
+                f"tick_age_secs={secs_since_tick:.0f} "
+                f"last_bar_ts={last_bar_ts} "
+                f"canonical_age_secs={canonical_age_secs} "
+                f"action=shutdown "
+                f"result=trigger_supervisor_restart[/red]"
+            )
             try:
                 if self.contract:
                     self.api.quote.unsubscribe(self.contract, quote_type='tick')
@@ -699,14 +815,29 @@ class FuturesMonitor:
             raise RuntimeError(f"MXF tick stale for {secs_since_tick} seconds (>{critical}), exiting monitor.")
 
         # Between warn and critical: attempt light recovery
-        console.print(f"[dim]Attempting light recovery (re-subscribe / rollover / fetch) after {secs_since_tick/60:.1f} min stale[/dim]")
+        console.print(
+            f"[dim][IngestionWatchdog] "
+            f"reason=feed_stale symbol={symbol} "
+            f"tick_age_secs={secs_since_tick:.0f} "
+            f"last_bar_ts={last_bar_ts} "
+            f"canonical_age_secs={canonical_age_secs} "
+            f"action=light_recovery "
+            f"result=attempting[/dim]"
+        )
 
         # Check for expiry/rollover
         today_str = datetime.now().strftime("%Y/%m/%d")
         if self.contract and self.contract.delivery_date < today_str:
-            console.print(f"[yellow]⚠️ MXF contract {self.contract.code} expired (delivery: {self.contract.delivery_date})[/yellow]")
+            console.print(
+                f"[yellow][IngestionWatchdog] "
+                f"reason=contract_expired symbol={symbol} "
+                f"tick_age_secs={secs_since_tick:.0f} "
+                f"last_bar_ts={last_bar_ts} "
+                f"canonical_age_secs={canonical_age_secs} "
+                f"action=rollover "
+                f"result=triggered[/yellow]"
+            )
             self._check_contract_rollover()
-            # Update last tick time so we don't spam retry immediately
             self.last_tick_at = time.time()
             return
 
@@ -715,31 +846,54 @@ class FuturesMonitor:
         try:
             self._check_contract_rollover()
         except Exception as e:
-            console.print(f"[yellow]⚠️ Contract rollover attempt failed: {e}[/yellow]")
+            console.print(
+                f"[yellow][IngestionWatchdog] "
+                f"reason=rollover_failed symbol={symbol} "
+                f"tick_age_secs={secs_since_tick:.0f} "
+                f"last_bar_ts={last_bar_ts} "
+                f"canonical_age_secs={canonical_age_secs} "
+                f"action=rollover "
+                f"result=exception:{e}[/yellow]"
+            )
 
-        # Try a light kline fetch to recover bars if possible
+        # ═══ STARTUP / RECOVERY-ONLY: Light kline fetch via IngestionService ═══
+        # This recovery path is only triggered when tick data has gone stale.
+        # Delegates to IngestionService which handles rate limiting, CSV persistence,
+        # and TXFR1 pre-fetch. The resulting data goes through the canonical bar pipeline.
         try:
-            df = self.client.get_kline(self.ticker, interval="5m")
-            if df is not None and not df.empty:
-                # Replace deque with recent tail to refresh state
-                tail = df.tail(200)
-                self._tick_bars_deque.clear()
-                for _, row in tail.iterrows():
-                    self._tick_bars_deque.append({
-                        "open": row.get('Open', row.get('open', 0)),
-                        "high": row.get('High', row.get('high', 0)),
-                        "low": row.get('Low', row.get('low', 0)),
-                        "close": row.get('Close', row.get('close', 0)),
-                        "volume": row.get('Volume', row.get('volume', 0)),
-                        "ts": row.name,
-                    })
-                self._tick_bars_cache = None
-                console.print(f"[green]✅ Light kline refresh succeeded: loaded {len(self._tick_bars_deque)} bars[/green]")
-                # Update last_tick_at to avoid immediate retry
+            df_backfill = self._ingestion.fetch_recovery_kline()
+            if df_backfill is not None and not df_backfill.empty:
+                console.print(
+                    f"[green][IngestionWatchdog] "
+                    f"reason=feed_stale symbol={symbol} "
+                    f"tick_age_secs={secs_since_tick:.0f} "
+                    f"last_bar_ts={last_bar_ts} "
+                    f"canonical_age_secs={canonical_age_secs} "
+                    f"action=fetch_recovery_kline "
+                    f"result=success:rows={len(df_backfill)}[/green]"
+                )
                 self.last_tick_at = time.time()
                 return
+            else:
+                console.print(
+                    f"[yellow][IngestionWatchdog] "
+                    f"reason=feed_stale symbol={symbol} "
+                    f"tick_age_secs={secs_since_tick:.0f} "
+                    f"last_bar_ts={last_bar_ts} "
+                    f"canonical_age_secs={canonical_age_secs} "
+                    f"action=fetch_recovery_kline "
+                    f"result=empty_response[/yellow]"
+                )
         except Exception as e:
-            console.print(f"[yellow]⚠️ Light kline refresh failed: {e}[/yellow]")
+            console.print(
+                f"[yellow][IngestionWatchdog] "
+                f"reason=feed_stale symbol={symbol} "
+                f"tick_age_secs={secs_since_tick:.0f} "
+                f"last_bar_ts={last_bar_ts} "
+                f"canonical_age_secs={canonical_age_secs} "
+                f"action=fetch_recovery_kline "
+                f"result=exception:{e}[/yellow]"
+            )
 
         # Reset timer to avoid spamming retries; next loop will re-evaluate
         self.last_tick_at = time.time()
@@ -896,24 +1050,115 @@ class FuturesMonitor:
         except Exception as e:
             console.print(f"[yellow]⚠️ Contract rollover check error: {e}[/yellow]")
 
+    # ── [GSD Data Safety] Raw tick CSV writer ──
+    def _write_raw_tick(self, tick) -> None:
+        """Write a single tick to the raw CSV store BEFORE any in-memory cache.
+
+        The RawTickWriter is lazy-initialised on the first real TMF tick, so it
+        always uses the correct trading-day string.
+        """
+        try:
+            if self._tick_writer is None:
+                from datetime import datetime
+                trading_day = get_trading_day_str(datetime.now())
+                code = getattr(tick, "code", self.ticker)
+                self._tick_writer = RawTickWriter(code, trading_day)
+
+            self._tick_writer.write(tick)
+        except Exception:
+            # Never let a CSV write failure crash the tick callback
+            pass
+
+    def _rebuild_bars_from_raw_ticks(self) -> None:
+        """[GSD Data Safety] Rebuild tick-based 5m bars from raw tick CSV on startup.
+
+        If the process crashed mid-session, the in-memory tick deque is lost.
+        This method reads today's raw tick CSV (if it exists) and rebuilds the
+        5m bars into self._tick_bars_deque so indicators can warm up immediately
+        without waiting for fresh ticks.
+        """
+        try:
+            if self.dry_run:
+                return
+
+            # Determine today's trading day and code
+            trading_day = get_trading_day_str(datetime.now())
+            code = getattr(self.contract, "code", self.ticker) if self.contract else self.ticker
+
+            from squeeze_futures.data.tick_writer import read_raw_ticks
+            df_ticks = read_raw_ticks(code, trading_day)
+            if df_ticks.empty:
+                console.print(f"[dim][FuturesMonitor] No raw tick CSV for {code} / {trading_day}, skipping rebuild[/dim]")
+                return
+
+            console.print(f"[cyan][FuturesMonitor] Rebuilding 5m bars from {len(df_ticks)} raw ticks...[/cyan]")
+
+            # Ensure timestamp is sorted
+            df_ticks = df_ticks.sort_values("timestamp")
+
+            # Bucket into 5-minute bars
+            df_ticks["ts_bucket"] = df_ticks["timestamp"].dt.floor("5min")
+
+            rebuilt_bars = []
+            for ts_bucket, group in df_ticks.groupby("ts_bucket"):
+                bar = {
+                    "open": float(group["price"].iloc[0]),
+                    "high": float(group["price"].max()),
+                    "low": float(group["price"].min()),
+                    "close": float(group["price"].iloc[-1]),
+                    "volume": int(group["volume"].sum()),
+                    "ts": ts_bucket,
+                }
+                rebuilt_bars.append(bar)
+
+            if rebuilt_bars:
+                # Clear and repopulate the deque
+                self._tick_bars_deque.clear()
+                for bar in rebuilt_bars:
+                    self._tick_bars_deque.append(bar)
+                self._tick_bars_cache = None  # Invalidate cache so it rebuilds
+                console.print(f"[bold green]✅ Rebuilt {len(rebuilt_bars)} bars from raw tick CSV[/bold green]")
+
+                # Set the last bar timestamp to the latest bar to prevent re-processing
+                if rebuilt_bars:
+                    last_bar = rebuilt_bars[-1]
+                    if last_bar["ts"] is not None:
+                        self._last_bar_ts = int(last_bar["ts"].timestamp() / 300) * 300
+                        # Also prime the current bar with the last tick's price
+                        self._current_bar["ts"] = None  # Will be set on next incoming tick
+                        self._current_bar["open"] = last_bar["close"]
+                        self._current_bar["high"] = last_bar["close"]
+                        self._current_bar["low"] = last_bar["close"]
+                        self._current_bar["close"] = last_bar["close"]
+                        self._current_bar["volume"] = 0
+
+        except Exception as e:
+            console.print(f"[yellow][FuturesMonitor] Tick CSV rebuild failed (non-fatal): {e}[/yellow]")
+
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()  # [gstack] 更新數據更新時間
-        
+
+        # [Far Month] Handle far-month tick accumulation (independent from near-month)
+        if self.far_contract and tick.code == self.far_contract.code:
+            self._accumulate_far_tick(tick)
+            return
+
         # 💡 GSD: Data Continuity Fix
         # Use strict matching for the primary MXF contract
         is_tmf = self.contract and tick.code == self.contract.code
         # For MTX, we still allow startswith for the heartbeat, but we MUST NOT use its price for MXF bars
         is_mtx = tick.code.startswith("MXF") or tick.code.startswith("MTX")
-        
+
         if not is_tmf and not is_mtx:
             return
             
-        # [GSD Settlement Fix] If it's an MTX tick, it's just a heartbeat to drive timing.
-        # We use the last known MXF price to avoid price contamination (MXF != MTX).
+        # [GSD Data Safety] Write raw tick to CSV FIRST — before any in-memory use
+        # Only write real TMF ticks (not MTX heartbeat ticks which use stale price)
         if is_tmf:
+            self._write_raw_tick(tick)
             self._last_real_tmf_tick_at = self.last_tick_at
             price = float(tick.close)
-            self._last_tmf_price = price # Cache for heartbeat
+            self._last_tmf_price = price  # Cache for heartbeat
             self._refresh_runtime_status()
         else:
             # It's an MTX heartbeat tick
@@ -970,6 +1215,83 @@ class FuturesMonitor:
         cb = self.client._tick_callbacks.get(tick.code)
         if cb:
             cb(exchange, tick)
+
+    # [Far Month] Accumulate far-month ticks into independent 5-min bars
+    def _accumulate_far_tick(self, tick):
+        """Accumulate far-month MXF ticks into _far_tick_bars_deque (5-min bars).
+        Does NOT affect strategy signals, stop loss, or orders."""
+        price = float(tick.close)
+        vol = int(getattr(tick, "volume", 0))
+        tick_ts = pd.Timestamp(tick.datetime)
+        ts_int = int(tick_ts.timestamp() / 300) * 300
+
+        # [Debug] Periodic far tick log (every 30s)
+        now_s = time.time()
+        if not hasattr(self, '_last_far_tick_log') or now_s - self._last_far_tick_log > 30:
+            self._last_far_tick_log = now_s
+            console.print(f"[dim]📥 Far tick: {tick.code} close={price} ts={tick_ts.strftime('%H:%M:%S')}[/dim]")
+
+        bar = self._far_current_bar
+        if bar["ts"] is None or ts_int > self._last_far_bar_ts:
+            # Flip completed bar into deque
+            if bar["ts"] is not None and bar["open"] > 0:
+                self._far_tick_bars_deque.append({
+                    "open": bar["open"],
+                    "high": bar["high"],
+                    "low": bar["low"],
+                    "close": bar["close"],
+                    "volume": bar["volume"],
+                    "ts": bar["ts"],
+                })
+                # [Far Month] Persist completed bar to shared CSV for dashboard consumption
+                self._save_far_bar({
+                    "open": bar["open"],
+                    "high": bar["high"],
+                    "low": bar["low"],
+                    "close": bar["close"],
+                    "volume": bar["volume"],
+                    "ts": bar["ts"],
+                })
+            # Start new bar
+            ts = pd.Timestamp(ts_int, unit='s')
+            bar["ts"] = ts
+            self._last_far_bar_ts = ts_int
+            bar["open"] = bar["high"] = bar["low"] = bar["close"] = price
+            bar["volume"] = vol
+        elif ts_int == self._last_far_bar_ts:
+            bar["high"] = max(bar["high"], price)
+            bar["low"] = min(bar["low"], price)
+            bar["close"] = price
+            bar["volume"] += vol
+        # else: old data, ignore
+
+    def _save_far_bar(self, bar):
+        """Append a completed far-month bar to shared CSV for dashboard consumption.
+        Writes to: logs/market_data/{ticker}_far_{date_str}_{tag}.csv"""
+        try:
+            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs", "market_data")
+            os.makedirs(log_dir, exist_ok=True)
+            from core.date_utils import get_session_date_str
+            date_str = get_session_date_str(datetime.now())
+            tag = "_DRY" if self.dry_run else ("_LIVE" if self.live_trading else "_PAPER")
+            path = Path(log_dir) / f"{self.ticker}_far_{date_str}{tag}.csv"
+
+            ts_str = str(bar["ts"])
+            row_data = {
+                "timestamp": ts_str,
+                "open": bar["open"],
+                "high": bar["high"],
+                "low": bar["low"],
+                "close": bar["close"],
+                "volume": bar["volume"],
+            }
+            cols = ["timestamp", "open", "high", "low", "close", "volume"]
+            if not path.exists():
+                pd.DataFrame([row_data])[cols].to_csv(path, index=False)
+            else:
+                pd.DataFrame([row_data]).reindex(columns=cols).to_csv(path, mode='a', header=False, index=False)
+        except Exception as e:
+            console.print(f"[dim][FuturesMonitor] Far bar save failed (non-fatal): {e}[/dim]")
 
     # ── Safety Stop (exchange-side protection) ──
     def _place_safety_stop(self, entry_price, direction, lots, stop_loss_pts):
@@ -1755,10 +2077,40 @@ class FuturesMonitor:
 
     def _build_strategy_context(self, bar, session_regime):
         """Build strategy context from bar data."""
-        # Get dataframes (simplified for now)
+        # Get dataframes from the current processing pipeline
         df_5m = None
         df_15m = None
+        try:
+            processed = getattr(self, '_last_processed_data', None)
+            if processed is not None:
+                df_5m = processed.get("5m", None)
+                df_15m = processed.get("15m", None)
+        except Exception:
+            pass
         
+        # [Skew Integration] Compute option skew signal from quote store
+        skew_signal = None
+        if self._skew_engine is not None:
+            try:
+                close_price = bar.get("close", 0) or 0
+                if close_price > 0:
+                    skew_signal = self._skew_engine.compute_if_ready(
+                        futures_price=close_price,
+                        force=False,
+                    )
+                    if skew_signal.is_valid():
+                        skew_signal = skew_signal.to_dict()
+                        logger.info(
+                            "[FuturesMonitor] ctx.market.skew_signal injected: "
+                            "direction=%s confidence=%.3f",
+                            skew_signal.get("direction", "?"),
+                            skew_signal.get("confidence", 0),
+                        )
+                    else:
+                        skew_signal = None
+            except Exception:
+                skew_signal = None
+
         ctx = StrategyContext(
             market=MarketData(
                 last_bar=bar,
@@ -1767,6 +2119,8 @@ class FuturesMonitor:
                 timestamp=bar.get('timestamp', ''),
                 session=int(bar.get('session', 0)),
                 regime=session_regime,
+                flags=self._data_flags if hasattr(self, '_data_flags') and self._data_flags else None,
+                skew_signal=skew_signal,
             ),
             position=PositionView(
                 size=self.trader.position,
@@ -1783,7 +2137,42 @@ class FuturesMonitor:
         """Route signal through strategy router with optional attribution."""
         # Build context
         ctx = self._build_strategy_context(bar, session_regime)
-        
+
+        # [Phase 2 Fix] Skip routing on prefill/warmup bars (old data from Parquet/CSV)
+        # Check if bar timestamp is from current trading day
+        bar_ts = bar.get("timestamp")
+        if bar_ts is not None:
+            from core.date_utils import get_trading_day
+            try:
+                bar_td = get_trading_day(pd.Timestamp(bar_ts))
+                current_td = get_trading_day(pd.Timestamp(datetime.now()))
+                if bar_td != current_td:
+                    console.print(f"[dim][Router] Skip prefill bar: ts={bar_ts} trading_day={bar_td} != current={current_td}[/dim]")
+                    return None, ctx, session_regime, None
+            except Exception:
+                pass
+
+        # [Phase 2: Skew Filter] Gate pre-check — block entry when skew signal
+        # indicates extreme downside risk with sufficient confidence.
+        skew_signal = getattr(ctx.market, "skew_signal", None)
+        if skew_signal and isinstance(skew_signal, dict):
+            direction = skew_signal.get("direction", "UNKNOWN")
+            confidence = skew_signal.get("confidence", 0.0)
+            skew_threshold = self.cfg.get("skew", {}).get("filter_threshold", 0.70)
+            if direction == "BEAR" and confidence >= skew_threshold and self.trader.position == 0:
+                console.print(
+                    f"[yellow][SkewGate] BLOCK entry — skew BEAR "
+                    f"confidence={confidence:.2f} >= {skew_threshold:.2f}[/yellow]"
+                )
+                bar_regime = classify_futures_bar_regime(bar, session_regime=session_regime)
+                decision = FuturesRouterDecision(
+                    action="skip",
+                    reason=f"SKEW_GATE_BEAR_conf_{confidence:.2f}",
+                    regime=bar_regime.regime,
+                    bias=bar_regime.bias,
+                )
+                return decision, ctx, session_regime, bar_regime
+
         # Get pending orders if not provided
         if pending_orders is None:
             pending_orders = self._get_symbol_pending_orders()
@@ -1791,6 +2180,13 @@ class FuturesMonitor:
         # Classify bar regime
         bar_regime = classify_futures_bar_regime(bar, session_regime=session_regime)
         
+        # [Phase 2 Debug] Router input features
+        console.print(
+            f"[cyan][RouterInput] breakout={bar.get('breakout_strength', 0):.4f} "
+            f"trend={bar.get('trend_strength_raw', 0):.6f} adx={bar.get('adx', 0):.2f} "
+            f"regime={bar_regime.regime} bias={bar_regime.bias}[/cyan]"
+        )
+
         # Route signal with optional attribution
         decision = route_futures_signal(
             registry=self._registry,
@@ -2200,64 +2596,170 @@ class FuturesMonitor:
         except Exception as e:
             console.print(f"[red]Fast-append failed:[/red] {e}")
 
-    # ── Main strategy loop ──
+    # ── P4 Hardening: Data freshness ──────────────────────────────────
+
+    def _check_canonical_freshness(self, df_5m: pd.DataFrame | None) -> list[str]:
+        """Check if canonical 5m bars are stale (no new bar within SLA).
+
+        SLA: normal = <= 2 × bar interval (10 minutes for 5m bars).
+        If stale, returns ["STALE_DATA"] — does NOT crash, does NOT fetch.
+
+        Returns:
+            list[str]: flags to attach to MarketData (empty list if fresh).
+        """
+        if df_5m is None or df_5m.empty:
+            return []
+
+        last_ts = df_5m.index[-1] if hasattr(df_5m.index, 'dtype') else df_5m.index[-1]
+        now = datetime.now()
+
+        # Normalise to datetime for comparison
+        if isinstance(last_ts, pd.Timestamp):
+            last_bar_dt = last_ts.to_pydatetime()
+        elif isinstance(last_ts, datetime):
+            last_bar_dt = last_ts
+        else:
+            return []  # Can't determine freshness
+
+        elapsed_secs = (now - last_bar_dt).total_seconds()
+
+        # [P4 Hardening] Canonical freshness SLA: warn at 2× bar interval
+        sla_secs = getattr(self, 'CANONICAL_SLA_SECS', 600)  # Default 10 min
+        if elapsed_secs > sla_secs:
+            console.print(
+                f"[yellow][P4] Canonical 5m data stale: last_bar_ts={last_bar_dt.strftime('%H:%M:%S')}, "
+                f"age={elapsed_secs:.0f}s (>SLA {sla_secs}s). Flagging STALE_DATA.[/yellow]"
+            )
+            return ["STALE_DATA"]
+
+        # If previous tick had STALE_DATA and is now fresh again, log recovery
+        if getattr(self, '_was_stale', False) and elapsed_secs <= sla_secs:
+            console.print(
+                f"[green][P4] Canonical 5m data recovered: age={elapsed_secs:.0f}s (within SLA).[/green]"
+            )
+            self._was_stale = False
+
+        return []
+
+    def _check_tick_api_consistency(
+        self,
+        df_tick: pd.DataFrame | None,
+        df_1min: pd.DataFrame | None,
+        bar_source: dict[str, object],
+    ) -> None:
+        """[P4 Hardening] Compare tick-5m vs api-1m close prices at most recent bar.
+
+        Tick-5m is the preferred source (P1). Api-1m (P2 backfill) is the fallback.
+        If both are available and their latest bar's close differs by more than
+        MAX_TICK_POINT_DISCREPANCY (default 5.0 MXF points), log a structured warning.
+
+        Design:
+        - Periodic only (every 30 ticks via _bar_counter guard in caller).
+        - Never fetches, never crashes, never blocks trading.
+        - Only warns when both sources have data and the selected source is NOT the
+          one that looks fresher — indicating the pipeline may have stale data.
+        """
+        max_diff = getattr(self, 'MAX_TICK_POINT_DISCREPANCY', 5.0)
+
+        if df_tick is None or df_tick.empty or df_1min is None or df_1min.empty:
+            return
+
+        # Get last bar Close from each source
+        tick_last_close = None
+        try:
+            tick_idx = df_tick.index[-1] if hasattr(df_tick, 'index') else None
+            if isinstance(tick_idx, pd.Timestamp):
+                tick_last_close = float(df_tick['Close'].iloc[-1])
+        except Exception:
+            pass
+
+        api_last_close = None
+        try:
+            # df_1min is 1-minute bars; sample the last one
+            api_idx = df_1min.index[-1] if hasattr(df_1min, 'index') else None
+            if isinstance(api_idx, pd.Timestamp):
+                api_last_close = float(df_1min['Close'].iloc[-1])
+        except Exception:
+            pass
+
+        if tick_last_close is None or api_last_close is None:
+            return
+
+        diff = abs(tick_last_close - api_last_close)
+        if diff <= max_diff:
+            return  # Within tolerance — no warning
+
+        # Discrepancy detected — log structured warning
+        tick_last_ts = str(df_tick.index[-1]) if hasattr(df_tick, 'index') else 'N/A'
+        api_last_ts = str(df_1min.index[-1]) if hasattr(df_1min, 'index') else 'N/A'
+        source_name = str(bar_source.get('source', 'unknown'))
+
+        console.print(
+            f"[yellow][IngestionWatchdog] "
+            f"reason=tick_api_mismatch "
+            f"tick_close={tick_last_close:.1f} "
+            f"api_close={api_last_close:.1f} "
+            f"diff={diff:.1f} "
+            f"threshold={max_diff:.1f} "
+            f"tick_last_ts={tick_last_ts} "
+            f"api_last_ts={api_last_ts} "
+            f"active_source={source_name} "
+            f"action=none "
+            f"result=warning_only[/yellow]"
+        )
+
+    # ── End P4 Hardening ──────────────────────────────────────────────
+
+    def _periodic_backfill_bars(self):
+        """[Phase 2] Rate-limited periodic backfill via IngestionService.
+
+        Delegates to self._ingestion.fetch_backfill() which handles
+        rate limiting (120s), CSV persistence, and TXFR1 pre-fetch.
+
+        Returns DataFrame or None if rate-limited/unavailable.
+        """
+        if self.dry_run or not self.api or not self.contract:
+            return None
+        return self._ingestion.fetch_backfill()
 
     def _fetch_today_kbars(self):
-        """從API獲取當天的1分鐘K棒資料（類似選擇權系統的方法）"""
-        if self.dry_run or not self.api or not self.contract:
-            console.print(f"[yellow][FuturesMonitor] Cannot fetch kbars: dry_run={self.dry_run}, api={self.api is not None}, contract={self.contract}[/yellow]")
-            return None
-        
-        # 頻率限制：每2分鐘才調用一次API（更頻繁更新）
-        now_ts = time.time()
-        if hasattr(self, '_last_kbars_fetch_at') and now_ts - self._last_kbars_fetch_at < 120:
-            return None
-        
+        """[Phase 2] Fetch today's kbars via IngestionService.
+
+        Delegates to self._ingestion.fetch_backfill() for rate-limited
+        API access with CSV persistence and TXFR1 pre-fetch.
+
+        ═══ RESTRICTION: STARTUP / BACKFILL ONLY ═══
+        This function MUST NOT be called from _strategy_tick().  The
+        runtime guard below enforces this.  strategy_tick() accesses
+        data via _periodic_backfill_bars() only.
+        """
+        # 🛡️ Runtime guard: detect if we are inside _strategy_tick() call stack
+        import traceback
+        for frame in traceback.extract_stack():
+            if frame.name == '_strategy_tick':
+                raise RuntimeError(
+                    "[GUARD] _fetch_today_kbars() called from _strategy_tick() context. "
+                    "Use _periodic_backfill_bars() instead."
+                )
+        return self._ingestion.fetch_backfill()
+
+    def _save_raw_kbars(self, bars) -> None:
+        """[GSD Data Safety] Save raw shioaji kbars response to CSV."""
         try:
-            # 獲取起始日期 (回溯 3 天以確保有足夠的歷史資料算指標)
-            today = datetime.now()
-            start_date = (today - timedelta(days=3)).strftime("%Y-%m-%d")
-            if today.hour < 5:  # 凌晨5點前算前一天
-                today = today - timedelta(days=1)
-            date_str = today.strftime("%Y-%m-%d")
-            
-            # 使用api.kbars獲取1分鐘K棒
-            console.print(f"[cyan][FuturesMonitor] Fetching kbars for contract={self.contract.code}, from {start_date} to {date_str}[/cyan]")
-            bars = self.api.kbars(self.contract, start=start_date, end=date_str)
-            self._last_kbars_fetch_at = now_ts
-            
-            # 轉換為DataFrame
-            frame = pd.DataFrame({**bars})
-            console.print(f"[green][FuturesMonitor] Successfully fetched {len(frame) if not frame.empty else 0} kbars[/green]")
-            if frame.empty or "ts" not in frame.columns:
-                return None
-            
-            # 處理時間戳
-            frame["ts"] = pd.to_datetime(frame["ts"])
-            frame = frame.set_index("ts")
-            
-            # 確保欄位名稱正確
-            column_map = {
-                "Open": "Open", "open": "Open",
-                "High": "High", "high": "High",
-                "Low": "Low", "low": "Low",
-                "Close": "Close", "close": "Close",
-                "Volume": "Volume", "volume": "Volume"
-            }
-            frame = frame.rename(columns=column_map)
-            
-            # 只保留需要的欄位
-            required_cols = ["Open", "High", "Low", "Close", "Volume"]
-            available_cols = [col for col in required_cols if col in frame.columns]
-            
-            if len(available_cols) < 4:  # 至少需要OHLC
-                return None
-            
-            return frame[available_cols].sort_index()
-            
-        except Exception as e:
-            console.print(f"[yellow][FuturesMonitor] Error fetching today kbars: {e}[/yellow]")
-            return None
+            if self._kbar_writer is None:
+                trading_day = get_trading_day_str(datetime.now())
+                code = getattr(self.contract, "code", self.ticker)
+                self._kbar_writer = RawKbarWriter(code, trading_day)
+
+            # Convert bars NamedTuple/list to DataFrame for the writer
+            df_raw = pd.DataFrame({**bars})
+            if df_raw.empty:
+                return
+            self._kbar_writer.write_dataframe(df_raw)
+        except Exception:
+            # Never let a CSV write failure crash the fetch
+            pass
+
     def run(self):
         self._running = True
         mode = "dry-run" if self.dry_run else ("LIVE" if self.live_trading else "PAPER")
@@ -2295,6 +2797,9 @@ class FuturesMonitor:
             except Exception as e:
                 console.print(f"[yellow]Futures position recovery failed: {e}[/yellow]")
 
+        # [Phase A.5] Rebuild tick bars from raw tick CSV (crash recovery)
+        self._rebuild_bars_from_raw_ticks()
+
         # [Phase B] Async Indicator Warm-up
         import threading
         self._backfill_done = False
@@ -2325,7 +2830,13 @@ class FuturesMonitor:
                     for r in results:
                         console.print(f"[bold red]🩺 DIAGNOSTIC ALERT: {r.action}[/bold red]")
             except Exception as e:
+                import traceback, sys
+                tb_str = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
                 console.print(f"[red][FuturesMonitor] error: {e}[/red]")
+                console.print(f"[dim]{tb_str.strip()}[/dim]")
+                with open("/tmp/fm_err.txt", "w") as f:
+                    f.write(f"[{datetime.now()}] {e}\n{tb_str}\n")
+                print(f"DEBUG TB WROTE to /tmp/fm_err.txt: {e}", file=sys.stderr)
             time.sleep(self.POLL_INTERVAL)
 
     def stop(self):
@@ -2426,22 +2937,35 @@ class FuturesMonitor:
                                         now, abs(self.trader.position), reason="SETTLEMENT_FORCE_CLOSE")
                     return # Exit this tick after force close
 
-        # 1. Fetch multi-timeframe data (使用選擇權系統的方法)
+        # 1. Fetch multi-timeframe data (使用 tick-based bars 為主要來源)
+        # ══════════════════════════════════════════════════
+        # [P1] Live tick ingestion / raw tick writer / runtime cache
+        # [P2] Scheduled backfill / canonical bar rebuild
+        # [P3] Recovery watchdog only / no strategy-triggered fetch
+        # ══════════════════════════════════════════════════
         processed = {}
         bar_source = {"source": None, "freshness_minutes": None}
         if not self.dry_run:
-            df_1min = self._fetch_today_kbars()
+            # [P1] Primary source: tick-based bars from RawTickWriter CSV → deque.
+            #      No API call — pure tick accumulation.
             df_tick = self._get_tick_bars_df()
-            df_legacy = None
-            try:
-                df_legacy = self.client.get_kline(self.ticker, interval="5m")
-            except Exception as e:
-                console.print(f"[yellow][FuturesMonitor] api.kbars failed: {e}[/yellow]")
 
+            # [P2] Secondary source: periodic backfill via IngestionService.
+            #      Rate-limited (120s), CSV-persisted before strategy reads.
+            df_1min = self._periodic_backfill_bars()
+
+            # [P3] Legacy fallback: NEVER triggered from strategy_tick.
+            #      Runs on independent watchdog / recovery schedule only.
+            #      strategy_tick is a data consumer, not a fetcher.
+            df_legacy = None
+
+            # [P2] Canonical bar selector: picks best available source.
+            # Priority: tick-5m > api-1m > legacy-api-5m.
+            # Strategy consumes canonical bars only — never raw API responses.
             raw_frames, bar_source = build_preferred_canonical_bar_frames(
                 [
-                    {"name": "api-1m", "frame": df_1min, "source_timeframe": "1min"},
                     {"name": "tick-5m", "frame": df_tick, "source_timeframe": "5min"},
+                    {"name": "api-1m", "frame": df_1min, "source_timeframe": "1min"},
                     {"name": "legacy-api-5m", "frame": df_legacy, "source_timeframe": "5min"},
                 ],
                 min_5m_bars=2,
@@ -2456,6 +2980,22 @@ class FuturesMonitor:
                             **self.PB_ARGS,
                         )
                     )
+
+        # [P4 Hardening] Canonical freshness SLA
+        data_flags: list[str] = []
+        if not self.dry_run:
+            df_5m = processed.get("5m")
+            data_flags = self._check_canonical_freshness(df_5m)
+            if "STALE_DATA" in data_flags:
+                self._was_stale = True
+        self._data_flags = data_flags  # <-- stored for _build_strategy_context()
+
+        # [P4 Hardening] tick-5m vs api-1m consistency check (periodic, warning-only)
+        # Compares close prices between tick-5m and api-1m sources at the most recent bar.
+        # If sources disagree by > tick_threshold, logs a structured warning.
+        # Never fetches data — purely observational.
+        if not self.dry_run and self._bar_counter % 30 == 0:
+            self._check_tick_api_consistency(df_tick, df_1min, bar_source)
 
         # 只要有 5m 數據，不論有沒有指標，都應該寫入
         if "5m" not in processed:
@@ -2477,6 +3017,21 @@ class FuturesMonitor:
             processed["1h"] = attach_bar_metadata(processed["1h"])
 
         df_5m = processed["5m"]
+        self._last_processed_data = processed
+        
+        # [Night Session Debug] Check indicator health
+        if self._bar_counter % 5 == 0 or not hasattr(self, '_debug_indicator_logged'):
+            self._debug_indicator_logged = True
+            ind_cols = ['vwap','ema_fast','atr','momentum','sqz_on']
+            for c in ind_cols:
+                if c in df_5m.columns:
+                    n_null = df_5m[c].isna().sum()
+                    n_total = len(df_5m)
+                    if n_null == n_total:
+                        console.print(f"[yellow][INDICATOR] {c}: ALL NaN ({n_total} bars)[/yellow]")
+                    elif n_null > 0:
+                        console.print(f"[dim][INDICATOR] {c}: {n_null}/{n_total} NaN[/dim]")
+            console.print(f"[dim][INDICATOR] df_5m shape={df_5m.shape}, index range={df_5m.index[0]}~{df_5m.index[-1]}[/dim]")
         
         # [Fix] Initialize score and regime before adaptive/cross logic
         score = 0.0
@@ -2536,18 +3091,22 @@ class FuturesMonitor:
             except Exception:
                 tx_bars_list = None
 
-            # Fallback: try client kline if no live builder
+            # ═══ TX CACHE ONLY (no on-demand API calls) ═══
+            # TX bars for cross-regime engine are populated exclusively
+            # during backfill/startup via IngestionService.fetch_backfill()
+            # (which calls _prefetch_tx_bars() as a side effect).
+            # Access is via self._ingestion.get_tx_cache() or fallback
+            # to _tx_cached_kbars (populated by the old path).
+            # If neither live ticks nor cached TX bars are available,
+            # we skip cross-regime entirely (no fallback API call).
             if tx_bars_list is None:
                 try:
-                    tx_df = None
-                    if hasattr(self.client, 'get_kline'):
-                        tx_df = self.client.get_kline("TXFR1", interval="5m")
-                    if tx_df is not None and not tx_df.empty:
-                        tx_bars_list = [{
-                            "close": float(r.get("Close", 0)),
-                            "high": float(r.get("High", 0)),
-                            "low": float(r.get("Low", 0)),
-                        } for _, r in tx_df.tail(100).iterrows()]
+                    tx_cached = self._ingestion.get_tx_cache()
+                    if tx_cached is None:
+                        tx_cached = getattr(self, '_tx_cached_kbars', None)
+                    if tx_cached is not None and len(tx_cached) >= 20:
+                        tx_bars_list = list(tx_cached[-100:])
+                        console.print(f"[dim][TX] Using {len(tx_bars_list)} cached TX bars for cross-regime[/dim]")
                 except Exception:
                     tx_bars_list = None
 

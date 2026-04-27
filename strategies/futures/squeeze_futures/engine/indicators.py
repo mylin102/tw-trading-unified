@@ -319,20 +319,45 @@ def calculate_futures_squeeze(
 
     if len(res) >= 2:
         try:
-            _idx = res.index
-            _c = pd.to_numeric(res["Close"], errors="coerce") if "Close" in res.columns else pd.Series(0.0, index=_idx)
-            _do = pd.to_numeric(res["day_open"], errors="coerce") if "day_open" in res.columns else pd.Series(np.nan, index=_idx)
-            _do = _do.replace(0, np.nan)
-            _ir = ((_c - _do) / _do).replace([np.inf, -np.inf], np.nan).fillna(0).reindex(res.index).fillna(0)
-            _vb = pd.to_numeric(res["price_vs_vwap"], errors="coerce") if "price_vs_vwap" in res.columns else pd.Series(0.0, index=_idx)
-            _vb = _vb.replace([np.inf, -np.inf], np.nan).fillna(0).reindex(res.index).fillna(0)
-            _combined = _ir.combine(_vb, max, fill_value=0.0)
-            res["breakout_strength"] = _combined * 100.0
+            _close_s = pd.to_numeric(res["Close"], errors="coerce") if "Close" in res.columns else pd.Series(0.0, index=res.index)
+            _open_s = pd.to_numeric(res["day_open"], errors="coerce") if "day_open" in res.columns else pd.Series(0.0, index=res.index)
+            if "price_vs_vwap" in res.columns:
+                _vwap_s = pd.to_numeric(res["price_vs_vwap"], errors="coerce")
+            else:
+                _vwap_s = pd.Series(0.0, index=res.index)
+            _vals = []
+            _bear_vals = []
+            for _c, _o, _v in zip(_close_s.tolist(), _open_s.tolist(), _vwap_s.tolist()):
+                try:
+                    _c, _o, _v = float(_c), float(_o), float(_v)
+                    _ip = ((_c - _o) / _o * 100.0) if _o > 0 else 0.0
+                    _vp = _v * 100.0
+                    _ip = 0.0 if _ip != _ip else _ip
+                    _vp = 0.0 if _vp != _vp else _vp
+                    _vals.append(max(0.0, _ip, _vp))
+                    _bear_vals.append(max(0.0, -_ip, -_vp))
+                except Exception:
+                    _vals.append(0.0)
+                    _bear_vals.append(0.0)
+            if not getattr(calculate_futures_squeeze, "_debug_breakout_once", False):
+                print(
+                    "[BreakoutDebug][FUTURES] "
+                    f"len={len(res)} "
+                    f"Close[-1]={res['Close'].tail(1).values[0] if 'Close' in res.columns else 'NA'} "
+                    f"day_open[-1]={res['day_open'].tail(1).values[0] if 'day_open' in res.columns else 'NA'} "
+                    f"vwap[-1]={res['price_vs_vwap'].tail(1).values[0] if 'price_vs_vwap' in res.columns else 'NA'} "
+                    f"vals[-1]={_vals[-1] if _vals else 'NA'} "
+                    f"bear_vals[-1]={_bear_vals[-1] if _bear_vals else 'NA'}",
+                    flush=True,
+                )
+                calculate_futures_squeeze._debug_breakout_once = True
+            res["breakout_strength"] = _vals
+            res["bear_breakout_strength"] = _bear_vals
         except Exception as e:
             if not getattr(calculate_futures_squeeze, "_warned_breakout", False):
-                print(f"[Indicators] breakout_strength failed: {e}", flush=True)
+                print(f"[Indicators] breakout_strength failed: {type(e).__name__}: {e}", flush=True)
                 calculate_futures_squeeze._warned_breakout = True
-            res["breakout_strength"] = 0.0
+            res["breakout_strength"] = pd.Series(0.0, index=res.index)
     else:
         res["breakout_strength"] = 0.0
     try:
