@@ -144,14 +144,37 @@ def calculate_futures_squeeze(
     res["opening_bullish"] = (res["Close"] > res["day_open"]) & (res["day_min"] >= res["day_open"] * 0.999)
     res["opening_bearish"] = (res["Close"] < res["day_open"]) & (res["day_max"] <= res["day_open"] * 1.001)
 
-    # [Fix] breakout_strength
-    intraday_return = (res["Close"] - res["day_open"]) / res["day_open"].replace(0, 1)
-    vwap_bias = res["price_vs_vwap"].fillna(0)
-    res["breakout_strength"] = np.maximum(intraday_return * 100, vwap_bias * 100, 0.0)
+    # [Fix] breakout_strength — safe via pd.to_numeric + .to_numpy(dtype=float)
     if len(res) >= 2:
-        ema_slope = (res["ema_fast"] - res["ema_fast"].shift(1)) / res["ema_fast"].shift(1).replace(0, 1)
-        res["trend_strength_raw"] = ema_slope.fillna(0) * 100  # scale to % for router threshold
+        try:
+            _idx = res.index
+            _c = pd.to_numeric(res["Close"], errors="coerce") if "Close" in res.columns else pd.Series(0.0, index=_idx)
+            _do = pd.to_numeric(res["day_open"], errors="coerce") if "day_open" in res.columns else pd.Series(np.nan, index=_idx)
+            _do = _do.replace(0, np.nan)
+            _ir = ((_c - _do) / _do).replace([np.inf, -np.inf], np.nan).fillna(0).reindex(res.index).fillna(0)
+            _vb = pd.to_numeric(res["price_vs_vwap"], errors="coerce") if "price_vs_vwap" in res.columns else pd.Series(0.0, index=_idx)
+            _vb = _vb.replace([np.inf, -np.inf], np.nan).fillna(0).reindex(res.index).fillna(0)
+            _combined = _ir.combine(_vb, max, fill_value=0.0)
+            res["breakout_strength"] = _combined * 100.0
+        except Exception as e:
+            if not getattr(calculate_futures_squeeze, "_warned_breakout", False):
+                print(f"[Indicators] breakout_strength failed: {e}", flush=True)
+                calculate_futures_squeeze._warned_breakout = True
+            res["breakout_strength"] = 0.0
     else:
+        res["breakout_strength"] = 0.0
+    try:
+        if len(res) >= 2 and "ema_fast" in res.columns:
+            _ef = pd.to_numeric(res["ema_fast"], errors="coerce") if "ema_fast" in res.columns else pd.Series(np.nan, index=res.index)
+            _ep = _ef.shift(1).replace(0, np.nan)
+            _es = ((_ef - _ep) / _ep).replace([np.inf, -np.inf], np.nan).fillna(0)
+            res["trend_strength_raw"] = pd.Series(_es, index=res.index).to_numpy(dtype=float) * 100
+        else:
+            res["trend_strength_raw"] = 0.0
+    except Exception as e:
+        if not getattr(calculate_futures_squeeze, "_warned_trend_strength", False):
+            print(f"[Indicators] trend_strength_raw failed: {e}", flush=True)
+            calculate_futures_squeeze._warned_trend_strength = True
         res["trend_strength_raw"] = 0.0
 
     return res
