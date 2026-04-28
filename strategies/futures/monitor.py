@@ -106,6 +106,10 @@ class FuturesMonitor:
         self.client._kbar_callbacks = {}
         self.client._latest_kbars = {}
 
+        # [ThetaGate] Latest router decision — consumed by options monitor
+        # to check theta_allowed flag before entering theta positions.
+        self.latest_router_decision: FuturesRouterDecision | None = None
+
         # [Phase 2] IngestionService — all Shioaji API access is isolated here.
         # strategy_tick() and signal generation read from canonical bars only.
         self._ingestion = IngestionService(
@@ -2226,6 +2230,7 @@ class FuturesMonitor:
             prepare_strategy=lambda name, strategy: self._ensure_strategy_initialized(name, strategy, ctx),
             recorder=attribution_recorder
         )
+        self.latest_router_decision = decision
         return decision, ctx, session_regime, bar_regime
 
     def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, trail_points=None, reason=None):

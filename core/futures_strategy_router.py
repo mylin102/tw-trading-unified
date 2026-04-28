@@ -17,7 +17,6 @@ from .futures_bar_regime import FuturesBarRegimeResult
 from core.signal import Signal
 from core.strategy_context import StrategyContext
 
-
 class StrategyLookup(Protocol):
     def get(self, name: str) -> Any: ...
 
@@ -34,6 +33,15 @@ class FuturesRouterConfig:
     countertrend_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust")
     hard_block_countertrend_in_trend: bool = True
 
+    # ── Theta-gate: router decides if market regime is suitable for theta ──
+    theta_enabled: bool = True
+    theta_weak_only: bool = True          # only allow in WEAK/CHOP, not TREND/BEAR
+    theta_max_mom_state: int = 1          # mom_state must be <= 1 (low momentum)
+    theta_max_macd_abs: float = 0.5       # |macd_hist| must be below this
+    theta_block_volume_spike: bool = True # block when volume_spike is True
+    theta_min_hold_seconds: int = 1800
+    theta_min_edge_multiple: float = 2.0
+
 
 @dataclass(frozen=True)
 class FuturesRouterDecision:
@@ -47,6 +55,10 @@ class FuturesRouterDecision:
     signal: Signal | None = None
     candidates: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+    # ── Theta-gate output — consumed by OptionsMonitor ──
+    theta_allowed: bool = False
+    theta_block_reason: str | None = None
 
     @property
     def is_trade(self) -> bool:
@@ -132,6 +144,54 @@ def _strategy_order_for_regime(
     return _dedupe([active_strategy_name] if active_strategy_name else [])
 
 
+def _evaluate_theta_environment(
+    regime_result: FuturesBarRegimeResult,
+    context: StrategyContext,
+    cfg: FuturesRouterConfig,
+) -> tuple[bool, str | None]:
+    """Evaluate whether current bar is suitable for theta (option selling).
+
+    Router decides the *market regime gate* — not quote quality or edge.
+    Those are the OptionsMonitor's responsibility.
+
+    Returns (allowed: bool, block_reason: str | None).
+    """
+    if not cfg.theta_enabled:
+        return False, "THETA_DISABLED_BY_CONFIG"
+
+    bar = context.market.last_bar
+    if not bar:
+        return False, "NO_BAR_DATA"
+
+    regime = regime_result.regime
+
+    # 1. Regime gate — theta_weak_only: only WEAK/SQUEEZE
+    if cfg.theta_weak_only:
+        if regime not in ("WEAK", "SQUEEZE"):
+            return False, f"REGIME_NOT_SUITABLE_THETA_WEAK_ONLY (regime={regime})"
+    else:
+        if regime in ("TREND", "BEAR"):
+            return False, f"REGIME_HAS_DIRECTION (regime={regime})"
+
+    # 2. Momentum gate — low momentum only
+    mom_state = bar.get("mom_state", 999)
+    if isinstance(mom_state, (int, float)):
+        if int(mom_state) > cfg.theta_max_mom_state:
+            return False, f"MOMENTUM_TOO_HIGH mom_state={mom_state} > {cfg.theta_max_mom_state}"
+
+    # 3. Volume gate — block when spike
+    if cfg.theta_block_volume_spike and bar.get("volume_spike", False):
+        return False, "VOLUME_SPIKE"
+
+    # 4. MACD gate — near zero only
+    macd_hist = bar.get("macd_hist", None)
+    if macd_hist is not None and isinstance(macd_hist, (int, float)):
+        if abs(float(macd_hist)) >= cfg.theta_max_macd_abs:
+            return False, f"MACD_NOT_FLAT |macd_hist|={abs(macd_hist):.2f} >= {cfg.theta_max_macd_abs}"
+
+    return True, None
+
+
 def route_futures_signal(
     *,
     registry: StrategyLookup,
@@ -160,6 +220,9 @@ def route_futures_signal(
     timestamp = context.market.timestamp
     symbol = context.market.last_bar.get("symbol", "TX") if context.market.last_bar else "TX"
 
+    # Init theta gate vars before any early return
+    theta_allowed, theta_block_reason = False, "POSITION_OPEN"
+
     if context.position.size != 0:
         return FuturesRouterDecision(
             action="BLOCKED",
@@ -167,6 +230,8 @@ def route_futures_signal(
             regime=regime_result.regime,
             bias=regime_result.bias,
             notes=["router only emits fresh entry decisions while flat"],
+            theta_allowed=theta_allowed,
+            theta_block_reason=theta_block_reason,
         )
 
     # ── [V-Model] Spread Staleness Gate + Bias Modifier ──
@@ -228,6 +293,8 @@ def route_futures_signal(
                         regime=regime_result.regime, bias=regime_result.bias,
                         candidates=[],
                         notes=[f"spread STALE: age={spread_age}m — {stale_action}"],
+                        theta_allowed=theta_allowed,
+                        theta_block_reason=theta_block_reason,
                     )
                 notes.append(f"spread_quality=STALE age={spread_age}m (degraded_mode)")
             elif spread_quality == "DEGRADED":
@@ -259,6 +326,11 @@ def route_futures_signal(
             elif spread_quality in ("FRESH", "DEGRADED") and spread_z is not None:
                 print(f"[V-Model][SpreadBias] NIGHT spread_z={spread_z:.2f} abs < extreme_z={extreme_z} — no bias mod", flush=True)
 
+    # ── [ThetaGate] Evaluate whether theta is allowed on this bar ──
+    theta_allowed, theta_block_reason = _evaluate_theta_environment(regime_result, context, cfg)
+    notes.append(f"theta={'ALLOW' if theta_allowed else 'BLOCK'}:reason={theta_block_reason or 'OK'}")
+    print(f"[ThetaGate] theta={'ALLOW' if theta_allowed else 'BLOCK'} reason={theta_block_reason or 'OK'} regime={regime_result.regime}", flush=True)
+
     candidates = _strategy_order_for_regime(regime_result, active_strategy_name, cfg)
     if regime_result.regime == "SQUEEZE" and not candidates:
         # Log SQUEEZE regime with no candidates
@@ -281,6 +353,8 @@ def route_futures_signal(
             bias=regime_result.bias,
             candidates=[],
             notes=notes,
+            theta_allowed=theta_allowed,
+            theta_block_reason=theta_block_reason,
         )
 
     if not candidates:
@@ -304,6 +378,8 @@ def route_futures_signal(
             bias=regime_result.bias,
             candidates=[],
             notes=notes,
+            theta_allowed=theta_allowed,
+            theta_block_reason=theta_block_reason,
         )
 
     # [BearRoute] Log bear routing context
@@ -471,6 +547,8 @@ def route_futures_signal(
                 signal=signal,
                 candidates=candidates,
                 notes=[*notes, "exit/partial-exit order still resolving"],
+                theta_allowed=theta_allowed,
+                theta_block_reason=theta_block_reason,
             )
 
         if working_orders:
@@ -486,6 +564,8 @@ def route_futures_signal(
                 signal=signal,
                 candidates=candidates,
                 notes=[*notes, reason],
+                theta_allowed=theta_allowed,
+                theta_block_reason=theta_block_reason,
             )
 
         return FuturesRouterDecision(
@@ -497,6 +577,8 @@ def route_futures_signal(
             signal=signal,
             candidates=candidates,
             notes=notes,
+            theta_allowed=theta_allowed,
+            theta_block_reason=theta_block_reason,
         )
 
     # If we get here, no candidate produced a valid signal
@@ -521,4 +603,6 @@ def route_futures_signal(
         bias=regime_result.bias,
         candidates=candidates,
         notes=notes,
+        theta_allowed=theta_allowed,
+        theta_block_reason=theta_block_reason,
     )
