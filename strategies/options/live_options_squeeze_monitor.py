@@ -1470,26 +1470,72 @@ class ShioajiOptionsSmartMonitor:
         mid = (bid + ask) / 2 if bid > 0 and ask > 0 else close
         return {"bid": bid, "ask": ask, "mid": mid, "close": close}
 
-    def spread_is_tradeable(self, side):
+    def validate_quote(self, side, context="GENERIC"):
+        """
+        Single-source-of-truth quote validation for both entry and exit.
+
+        Returns dict:
+            valid: bool
+            reason: str (OK / MISSING_QUOTE / INVALID_QUOTE_CROSSED / INVALID_QUOTE_ZERO_MID / WIDE_SPREAD)
+            bid: float
+            ask: float
+            mid: float
+            spread_ratio: float | None  (None when quote is invalid)
+            max_spread_ratio: float  (threshold used)
+        """
         quote = self.current_option_quote(side)
         _ask = quote.get("ask", 0.0)
         _bid = quote.get("bid", 0.0)
         _mid = quote.get("mid", 0.0)
+        _max_spread = getattr(self, 'max_spread_pct', 0.3)
+        _spread_ratio = None
 
         if _bid <= 0 or _ask <= 0:
-            console.print(f"[yellow]⚠️ [QuoteGuard] MISSING_QUOTE for {side}: bid={_bid} ask={_ask} — block entry[/yellow]")
-            return False
-        if _ask <= _bid:
-            console.print(f"[yellow]⚠️ [QuoteGuard] INVALID_QUOTE_CROSSED for {side}: bid={_bid} ask={_ask} — block entry[/yellow]")
-            return False
-        if _mid <= 0:
-            console.print(f"[yellow]⚠️ [QuoteGuard] INVALID_QUOTE_ZERO_MID for {side}: bid={_bid} ask={_ask} mid={_mid} — block entry[/yellow]")
-            return False
-        spread_pct = max(0.0, _ask - _bid) / _mid
-        tradeable = spread_pct <= self.max_spread_pct
-        if not tradeable:
-            console.print(f"[yellow]⚠️ [QuoteGuard] WIDE_SPREAD (ratio={spread_pct:.1%}) for {side}: bid={_bid} ask={_ask} mid={_mid:.1f} — block entry[/yellow]")
-        return tradeable
+            _reason = "MISSING_QUOTE"
+            _valid = False
+        elif _ask <= _bid:
+            _reason = "INVALID_QUOTE_CROSSED"
+            _valid = False
+        elif _mid <= 0:
+            _reason = "INVALID_QUOTE_ZERO_MID"
+            _valid = False
+        else:
+            _spread_ratio = (_ask - _bid) / _mid
+            assert _spread_ratio is None or _spread_ratio >= 0, \
+                f"spread_ratio={_spread_ratio} must be None or >= 0"
+            if _spread_ratio >= _max_spread:
+                _reason = "WIDE_SPREAD"
+                _valid = False
+            else:
+                _reason = "OK"
+                _valid = True
+
+        result = {
+            "valid": _valid,
+            "reason": _reason,
+            "bid": _bid,
+            "ask": _ask,
+            "mid": _mid,
+            "spread_ratio": _spread_ratio,
+            "max_spread_ratio": _max_spread,
+        }
+
+        if not _valid:
+            sr_str = f"{_spread_ratio:.1%}" if _spread_ratio is not None else "None"
+            console.print(
+                f"[yellow]⚠️ [QUOTE_GUARD][{context}_BLOCK] "
+                f"reason={_reason} "
+                f"side={side} "
+                f"bid={_bid} ask={_ask} mid={_mid:.1f} "
+                f"spread_ratio={sr_str} "
+                f"max_spread={_max_spread:.0%}[/yellow]"
+            )
+
+        return result
+
+    def spread_is_tradeable(self, side):
+        vq = self.validate_quote(side, context="ENTRY")
+        return vq["valid"]
 
     def sync_contract_quotes(self):
         # Shioaji Option 物件不支援動態 setattr，quotes 直接從 market_data 取
@@ -3358,31 +3404,8 @@ class ShioajiOptionsSmartMonitor:
         contract = self.active_contracts.get(self.active_side)
 
         # ── [QuoteGuard] Validate quote quality before any exit decision ──
-        _ask = quote.get("ask", 0.0)
-        _bid = quote.get("bid", 0.0)
-        _mid = (_bid + _ask) / 2 if _bid > 0 and _ask > _bid else 0.0
-
-        # Determine explicit quote error state — never use sentinel 999
-        if _bid <= 0 or _ask <= 0:
-            _quote_state = "MISSING_QUOTE"
-            _quote_valid = False
-        elif _ask <= _bid:
-            _quote_state = "INVALID_QUOTE_CROSSED"
-            _quote_valid = False
-        elif _mid <= 0:
-            _quote_state = "INVALID_QUOTE_ZERO_MID"
-            _quote_valid = False
-        else:
-            _spread_ratio = (_ask - _bid) / _mid
-            if _spread_ratio >= 0.3:
-                _quote_state = f"WIDE_SPREAD (ratio={_spread_ratio:.1%})"
-                _quote_valid = False
-            else:
-                _quote_state = "OK"
-                _quote_valid = True
-
-        if not _quote_valid:
-            console.print(f"[yellow]⚠️ [QuoteGuard] {_quote_state} for {self.active_side}: bid={_bid} ask={_ask} mid={_mid:.1f} — skip exit decision (spread_ratio=None)[/yellow]")
+        vq = self.validate_quote(self.active_side, context="EXIT")
+        if not vq["valid"]:
             return False
 
         # ── [SessionGuard] Skip exit during invalid market state ──
