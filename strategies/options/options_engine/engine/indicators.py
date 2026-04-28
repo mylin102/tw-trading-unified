@@ -48,7 +48,7 @@ def calculate_futures_squeeze(
         # GSD: Ensure columns exist even if empty/short
         res = df.copy()
         for col in ["sqz_on", "momentum", "mom_prev", "vwap", "price_vs_vwap", "fired", "mom_state", 
-                    "ema_fast", "ema_slow", "ema_filter", "ema_macro", "bullish_align", "bearish_align",
+                    "ema_fast", "ema_slow", "ema_filter", "ema_macro", "ema_200_up", "bullish_align", "bearish_align",
                     "recent_high", "recent_low", "is_new_high", "is_new_low", "in_bull_pb_zone", "in_bear_pb_zone",
                     "day_open", "day_min", "day_max", "opening_bullish", "opening_bearish"]:
             if col not in res.columns:
@@ -118,7 +118,10 @@ def calculate_futures_squeeze(
     res["ema_slow"] = safe_ema(ema_slow)
     res["ema_filter"] = safe_ema(60)
     res["ema_macro"] = safe_ema(ema_macro)
-    
+
+    # 200日趨勢判斷 (for stock entry strategies)
+    res["ema_200_up"] = (res["Close"] > res["ema_macro"]) & (res["ema_macro"] > res["ema_macro"].shift(1))
+
     res["bullish_align"] = res["ema_fast"] > res["ema_slow"]
     res["bearish_align"] = res["ema_fast"] < res["ema_slow"]
 
