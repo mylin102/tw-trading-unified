@@ -1472,10 +1472,24 @@ class ShioajiOptionsSmartMonitor:
 
     def spread_is_tradeable(self, side):
         quote = self.current_option_quote(side)
-        if quote["mid"] <= 0:
+        _ask = quote.get("ask", 0.0)
+        _bid = quote.get("bid", 0.0)
+        _mid = quote.get("mid", 0.0)
+
+        if _bid <= 0 or _ask <= 0:
+            console.print(f"[yellow]⚠️ [QuoteGuard] MISSING_QUOTE for {side}: bid={_bid} ask={_ask} — block entry[/yellow]")
             return False
-        spread_pct = max(0.0, quote["ask"] - quote["bid"]) / quote["mid"]
-        return spread_pct <= self.max_spread_pct
+        if _ask <= _bid:
+            console.print(f"[yellow]⚠️ [QuoteGuard] INVALID_QUOTE_CROSSED for {side}: bid={_bid} ask={_ask} — block entry[/yellow]")
+            return False
+        if _mid <= 0:
+            console.print(f"[yellow]⚠️ [QuoteGuard] INVALID_QUOTE_ZERO_MID for {side}: bid={_bid} ask={_ask} mid={_mid} — block entry[/yellow]")
+            return False
+        spread_pct = max(0.0, _ask - _bid) / _mid
+        tradeable = spread_pct <= self.max_spread_pct
+        if not tradeable:
+            console.print(f"[yellow]⚠️ [QuoteGuard] WIDE_SPREAD (ratio={spread_pct:.1%}) for {side}: bid={_bid} ask={_ask} mid={_mid:.1f} — block entry[/yellow]")
+        return tradeable
 
     def sync_contract_quotes(self):
         # Shioaji Option 物件不支援動態 setattr，quotes 直接從 market_data 取
@@ -3347,9 +3361,28 @@ class ShioajiOptionsSmartMonitor:
         _ask = quote.get("ask", 0.0)
         _bid = quote.get("bid", 0.0)
         _mid = (_bid + _ask) / 2 if _bid > 0 and _ask > _bid else 0.0
-        _quote_valid = _bid > 0 and _ask > _bid and _mid > 0 and (_ask - _bid) / _mid < 0.3
+
+        # Determine explicit quote error state — never use sentinel 999
+        if _bid <= 0 or _ask <= 0:
+            _quote_state = "MISSING_QUOTE"
+            _quote_valid = False
+        elif _ask <= _bid:
+            _quote_state = "INVALID_QUOTE_CROSSED"
+            _quote_valid = False
+        elif _mid <= 0:
+            _quote_state = "INVALID_QUOTE_ZERO_MID"
+            _quote_valid = False
+        else:
+            _spread_ratio = (_ask - _bid) / _mid
+            if _spread_ratio >= 0.3:
+                _quote_state = f"WIDE_SPREAD (ratio={_spread_ratio:.1%})"
+                _quote_valid = False
+            else:
+                _quote_state = "OK"
+                _quote_valid = True
+
         if not _quote_valid:
-            console.print(f"[yellow]⚠️ [QuoteGuard] Invalid quote for {self.active_side}: bid={_bid} ask={_ask} mid={_mid:.1f} spread_ratio={((_ask-_bid)/_mid*100) if _mid>0 else 999:.1f}% — skip exit decision[/yellow]")
+            console.print(f"[yellow]⚠️ [QuoteGuard] {_quote_state} for {self.active_side}: bid={_bid} ask={_ask} mid={_mid:.1f} — skip exit decision (spread_ratio=None)[/yellow]")
             return False
 
         # ── [SessionGuard] Skip exit during invalid market state ──
