@@ -621,6 +621,7 @@ class ShioajiOptionsSmartMonitor:
 
     def find_best_contracts(self, futures_monitor=None):
         """[GSD Settlement Fix] 尋找最佳選擇權合約，與期貨合約同步月份"""
+        self.fm = futures_monitor  # Store reference for ThetaGate access
         if self.dry_run:
             return self._setup_dry_run_contracts()
         
@@ -3747,7 +3748,24 @@ class ShioajiOptionsSmartMonitor:
                             )
                             console.print(f"[bold yellow]🔻 [ThetaGang] EXIT {pos.strategy}: {exit_info['reason']} PnL={exit_info['pnl']:.0f}[/bold yellow]")
                             self.cooldown_until = self.cooldown_bars
+                            self._last_theta_exit_at = datetime.datetime.now()
                         return
+
+                    # ── [ThetaGate] Router must allow theta before entry ──
+                    _router_allows_theta = True  # default: allow if no router data (bootstrap)
+                    if hasattr(self, 'fm') and self.fm is not None and hasattr(self.fm, 'latest_router_decision'):
+                        _rd = self.fm.latest_router_decision
+                        if _rd is not None:
+                            _router_allows_theta = _rd.theta_allowed
+                            if not _router_allows_theta:
+                                console.print(f"[yellow]⚠️ [ThetaGate] Router blocks theta: {_rd.theta_block_reason} — skip entry[/yellow]")
+                        else:
+                            console.print(f"[dim][ThetaGate] No router decision yet — allowing theta bootstrap[/dim]")
+                    else:
+                        console.print(f"[dim][ThetaGate] No futures monitor reference — allowing theta bootstrap[/dim]")
+                    if not _router_allows_theta:
+                        if use_theta and self.position == 0:
+                            signal = None  # Force no-op for this tick
 
                     # Try ThetaGang entry
                     if use_theta and self.position == 0 and not (self._theta_gang.position and self._theta_gang.position.is_open):
@@ -3763,6 +3781,25 @@ class ShioajiOptionsSmartMonitor:
                             score=signal.get("score") if isinstance(signal, dict) else None,
                         )
                         if entry_info:
+                            # ── [ThetaGate] Edge gate: expected edge must cover friction × 2 ──
+                            net_credit = entry_info.get("net_credit", 0)
+                            friction = getattr(self, 'theta_friction', 68)  # default ~68 pts round-trip
+                            min_edge = friction * getattr(self, 'theta_min_edge_multiple', 2.0)
+                            if net_credit < min_edge:
+                                console.print(f"[yellow]⚠️ [ThetaGate] Edge too small: credit={net_credit:.0f} < min_edge={min_edge:.0f} (friction={friction}) — skip entry[/yellow]")
+                                if self.live_trading:
+                                    self.exit_live_position("LIVE_EDGE_TOO_SMALL", f"credit={net_credit:.0f}<min={min_edge:.0f}")
+                                return
+
+                            # ── [ThetaGate] Min hold gate — skip if just exited (cooldown) ──
+                            _now = datetime.datetime.now()
+                            if hasattr(self, '_last_theta_exit_at') and self._last_theta_exit_at is not None:
+                                _seconds_since_exit = (_now - self._last_theta_exit_at).total_seconds()
+                                _min_hold = getattr(self, 'theta_min_hold_seconds', 1800)
+                                if _seconds_since_exit < _min_hold:
+                                    console.print(f"[yellow]⚠️ [ThetaGate] Cooldown: {_seconds_since_exit:.0f}s < {_min_hold}s since last exit — skip entry[/yellow]")
+                                    return
+
                             if self.live_trading:
                                 self._submit_live_theta_combo_entry(entry_info)
                                 return
