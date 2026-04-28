@@ -41,6 +41,19 @@ class CounterVWAP(StrategyBase):
         self._fire_bar_idx = 0
         self._fire_high = 0.0
         self._fire_low = 0.0
+        self._last_skip_log_ts = None
+
+    def _debug_skip(self, reason: str, ts, **fields):
+        """Log skip reason at most once per 5 minutes to avoid night session flooding."""
+        if ts is None:
+            return
+        if not hasattr(self, '_last_skip_log_ts') or self._last_skip_log_ts is None:
+            _elapsed = 9999
+        else:
+            _elapsed = (ts - self._last_skip_log_ts).total_seconds()
+        if _elapsed >= 300:
+            print(f"[counter_vwap][SKIP] reason={reason} fields={fields}", flush=True)
+            self._last_skip_log_ts = ts
 
     def on_bar(self, context: StrategyContext) -> Signal | None:
         bar = context.market.last_bar
@@ -60,6 +73,10 @@ class CounterVWAP(StrategyBase):
         squeeze_on = bar.get("squeeze_on", False)
         bar_counter = context.bar_counter
 
+        # ── Derive session from timestamp ──
+        ts = bar.get("timestamp") or bar.get("name")
+        session = "DAY" if (hasattr(ts, 'hour') and 8 <= ts.hour < 15) else "NIGHT"
+
         # ── Bias (噴發偏向): momentum acceleration check ──
         # Bias tells us if momentum is accelerating or decelerating
         df = context.market.df_5m
@@ -71,6 +88,7 @@ class CounterVWAP(StrategyBase):
             bias = momentum - momentum_prev
 
         if vwap <= 0:
+            self._debug_skip("NO_VWAP", ts, session=session)
             return None
 
         # ── Regime Filter: Require squeeze was active recently ────────
@@ -84,11 +102,16 @@ class CounterVWAP(StrategyBase):
             recent_squeeze = bar.get("squeeze_on", bar.get("sqz_on", True))
 
         if not recent_squeeze and self._fire_pending_dir == 0:
+            self._debug_skip("NO_FIRE_EVENT", ts, session=session,
+                             sqz_on=bar.get("sqz_on"), fired=fired,
+                             pending_dir=self._fire_pending_dir)
             return None
 
         # 新 Fire 事件 (with momentum threshold filter)
         if fired and self._fire_pending_dir == 0:
             if abs(momentum) < min_momentum:
+                self._debug_skip("WEAK_FIRE", ts, session=session,
+                                 momentum=momentum, min_momentum=min_momentum)
                 return None  # Weak fire, ignore
             self._fire_pending_dir = 1 if momentum > 0 else -1
             self._fire_bar_idx = bar_counter
@@ -97,6 +120,8 @@ class CounterVWAP(StrategyBase):
             return None
 
         if self._fire_pending_dir == 0:
+            self._debug_skip("NO_PENDING_FIRE", ts, session=session,
+                             recent_squeeze=recent_squeeze, fired=fired)
             return None
 
         # 更新極值
@@ -106,6 +131,9 @@ class CounterVWAP(StrategyBase):
 
         # 過期
         if bars_since > confirm_bars:
+            self._debug_skip("FIRE_EXPIRED", ts, session=session,
+                             bars_since=bars_since, confirm_bars=confirm_bars,
+                             pending_dir=self._fire_pending_dir)
             self._fire_pending_dir = 0
             return None
         if bars_since < 1:
@@ -113,9 +141,8 @@ class CounterVWAP(StrategyBase):
 
         # ── 失敗驗證 (未創新高/低 + 動能反轉 或 VWAP 拒絕) ──
         sl_pts = atr * atr_sl_mult if atr > 0 else 60
-        
+
         # Adaptive: Session-Aware Trailing Params (from vbt sweep)
-        ts = bar.get("timestamp") or bar.get("name")
         is_day = 8 <= ts.hour < 15 if hasattr(ts, 'hour') else True
         be_trigger = 20.0 if is_day else 70.0
         trail_pts = 120.0 if is_day else 140.0
