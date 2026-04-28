@@ -98,7 +98,7 @@ strategy:
     5m: 0.2
 theta_gang:
   auto_regime: true
-  enabled: true
+  enabled: false           # DISABLED: theta gang has no edge vs friction
   exit_on_squeeze_release: true
   max_loss_pct: 1.0
   min_credit: 30

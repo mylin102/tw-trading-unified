@@ -3665,7 +3665,7 @@ class ShioajiOptionsSmartMonitor:
                     squeeze_on = signal.get("squeeze_on", False) if isinstance(signal, dict) else False
                     auto_regime = self._theta_cfg.get("auto_regime", True)
                     bar_quality_pass = signal.get("bar_quality") == "PASS"
-                    use_theta = ((auto_regime and squeeze_on) or (not auto_regime)) and bar_quality_pass
+                    use_theta = False  # DISABLED: theta gang has no edge vs friction (68pts)
 
                     if self.pending_theta_combo is not None:
                         console.print(f"[dim][ThetaGang] Pending combo {self.pending_theta_combo.get('phase')} awaiting broker reconciliation[/dim]")
