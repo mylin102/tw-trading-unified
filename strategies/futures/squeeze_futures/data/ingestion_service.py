@@ -65,6 +65,14 @@ class IngestionService:
     # Public API
     # ──────────────────────────────────────────────
 
+    def set_contract(self, contract) -> None:
+        """Update contract reference after deferred resolution.
+        
+        IngestionService may be constructed before contract is resolved
+        from Shioaji API. Call this once contract becomes available.
+        """
+        self._contract = contract
+
     def fetch_backfill(self) -> Optional[pd.DataFrame]:
         """Primary backfill: api.kbars() for 1m kbar data.
 

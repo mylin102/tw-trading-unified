@@ -532,6 +532,11 @@ class FuturesMonitor:
                     # Pick the first one (nearest delivery)
                     self.contract = tmf_sorted[0]
                     console.print(f"[green][FuturesMonitor] ✓ MXF front-month: {self.contract.code} (delivers {self.contract.delivery_date})[/green]")
+                    # Sync contract to ingestion service (resolved after __init__)
+                    try:
+                        self._ingestion.set_contract(self.contract)
+                    except Exception:
+                        pass
                 else:
                     # Fallback to absolute nearest if no valid ones found (shouldn't happen in live)
                     self.contract = sorted(tmf_list, key=lambda c: c.delivery_date)[0]
@@ -2753,9 +2758,12 @@ class FuturesMonitor:
         """
         if self.dry_run or not self.api or not self.contract:
             return None
-        # [Fix] Sync ingestion contract reference — resolved after __init__
-        if self._ingestion._contract is None and self.contract is not None:
-            self._ingestion._contract = self.contract
+        # [Fix] Safety net: sync ingestion contract (resolved after __init__)
+        try:
+            if self._ingestion._contract is None:
+                self._ingestion.set_contract(self.contract)
+        except Exception:
+            pass
         return self._ingestion.fetch_backfill()
 
     def _fetch_today_kbars(self):
