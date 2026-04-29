@@ -196,7 +196,12 @@ class FuturesMonitor:
         self.ATR_MULT = self.RISK.get("atr_multiplier", 0.0)
         self.ATR_LENGTH = self.RISK.get("atr_length", 14)
         self.POLL_INTERVAL = self.MONITOR.get("poll_interval_secs", 30)
-        
+
+        # Debug flags from config
+        _debug_cfg = self.cfg.get("debug", {})
+        self._debug_tickbar = bool(_debug_cfg.get("tickbar", False))
+        self._debug_feed = bool(_debug_cfg.get("feed", False))
+
         # Data freshness thresholds (seconds)
         self.STALE_WARN_SECS = self.MONITOR.get("stale_tick_warn_secs", 120)
         self.STALE_CRITICAL_SECS = self.MONITOR.get("stale_tick_critical_secs", 600)
@@ -1156,6 +1161,10 @@ class FuturesMonitor:
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()  # [gstack] 更新數據更新時間
 
+        # [Debug] fingerprint every tick (config: debug.feed)
+        if self._debug_feed:
+            console.print(f"[dim][FuturesMonitor][ON_TICK] code={tick.code} close={getattr(tick, 'close', None)} ts={getattr(tick, 'datetime', None)}[/dim]")
+
         # [Far Month] Handle far-month tick accumulation (independent from near-month)
         if self.far_contract and tick.code == self.far_contract.code:
             self._accumulate_far_tick(tick)
@@ -1194,9 +1203,13 @@ class FuturesMonitor:
         ts_int = int(tick_ts.timestamp() / 300) * 300
         
         bar = self._current_bar
+        debug_skip = bar["ts"] is None
         if bar["ts"] is None or ts_int > self._last_bar_ts:
             # 💡 GSD: Only flip the bar if we have a NEW time bucket
             if bar["ts"] is not None and bar["open"] > 0:
+                # [Debug] log bar close (config: debug.tickbar)
+                if self._debug_tickbar:
+                    console.print(f"[dim][TickBar][CLOSE] bucket={pd.Timestamp(self._last_bar_ts, unit='s').strftime('%H:%M')} close={bar['close']:.0f} vol={bar['volume']} deque={len(self._tick_bars_deque)} -> append[/dim]")
                 bar_dict = {
                     "open": bar["open"],
                     "high": bar["high"],
@@ -1210,12 +1223,16 @@ class FuturesMonitor:
             
             # Start new bar
             ts = pd.Timestamp(ts_int, unit='s')
+            if self._debug_tickbar:
+                console.print(f"[dim][TickBar][NEWBAR] bucket={ts.strftime('%H:%M')} price={price:.0f} vol={vol} is_tmf={is_tmf} is_mtx={is_mtx}[/dim]")
             bar["ts"] = ts
             self._last_bar_ts = ts_int
             bar["open"] = bar["high"] = bar["low"] = bar["close"] = price
             bar["volume"] = vol
         elif ts_int == self._last_bar_ts:
             # Accumulate into current bar
+            if self._debug_tickbar and debug_skip:
+                console.print(f"[dim][TickBar][ACCUM-first] bucket={pd.Timestamp(ts_int, unit='s').strftime('%H:%M')} price={price:.0f} vol={vol}[/dim]")
             bar["high"] = max(bar["high"], price)
             bar["low"] = min(bar["low"], price)
             bar["close"] = price

@@ -1,7 +1,7 @@
 active_strategy: counter_vwap
 cooldown_bars: 5
 execution:
-  broker_fee_per_side: 20.0
+  broker_fee_per_side: 50.0
   exchange_fee_per_side: 0.0
   initial_balance: 100000
   limit_offset_pts: 2.0
@@ -21,7 +21,7 @@ monitoring:
   pb_confirmation_bars: 12
   poll_interval_secs: 30
 skew:
-  filter_threshold: 0.70
+  filter_threshold: 0.7
 spread_gate:
   enabled: true
   night_only: true
@@ -61,13 +61,13 @@ strategy:
     enabled: true
     exit_on_vwap: true
     min_momentum: 50.0
-  entry_score: 10
+  entry_score: 13
   length: 20
   partial_exit:
     enabled: true
     tp1_lots: 1
     tp1_pts: 200
-  regime_filter: low
+  regime_filter: mid
   spring_upthrust:
     atr_mult: 2.5
     bb_length: 20
@@ -80,9 +80,12 @@ strategy:
     15m: 0.4
     1h: 0.2
     5m: 0.4
+debug:
+  tickbar: false
+  feed: false
 trade_mgmt:
   allow_long: true
   allow_short: true
   force_close_at_end: true
   lots_per_trade: 1
-  max_positions: 7
+  max_positions: 2

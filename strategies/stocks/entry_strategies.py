@@ -85,9 +85,39 @@ def strategy_stock_scout(state, cfg):
     # 階段 2: 已持倉，檢查是否加碼
     elif stage == "SCOUT":
         profit_pct = (curr_price - entry_price) / entry_price
-        # 獲利確認，觸發加碼 (Scale to Main Force)
-        if profit_pct >= 0.01 and last_5m["mom_state"] == 3:
-            return {"action": "BUY", "reason": "SCOUT_SCALE", "qty_mode": "MAIN", "stop_loss": curr_price * 0.98}
+        # SCOUT has its own lifecycle:
+        # fail fast on structural breakdown,
+        # scale only after at least one tick and intact structure,
+        # bypass generic MOMENTUM_ROLLOVER until promoted to MAIN.
+        constructive = (
+            last_5m["Close"] > last_5m.get("vwap", last_5m["Close"])
+            or last_5m.get("ema_fast", 0) > 0 and last_5m["Close"] > last_5m["ema_fast"]
+            or last_5m.get("breakout_strength", 0) > 0.35
+        )
+        hard_reversal = (
+            last_5m.get("macd_hist", 0) < 0
+            and last_5m["Close"] < last_5m.get("vwap", last_5m["Close"])
+        )
+        # Priority 1: Fail fast on structural breakdown
+        if hard_reversal or profit_pct <= -0.01:
+            print(f"[SCOUT_TRACE] symbol={state.get('ticker', '?')} stage=SCOUT action=FAIL "
+                  f"profit={profit_pct*100:.2f}% hard_reversal={hard_reversal} "
+                  f"reason=SCOUT_FAIL", flush=True)
+            return {"action": "SELL", "reason": "SCOUT_FAIL", "qty_mode": "ALL", "stop_loss": curr_price * 0.99}
+        # Priority 2: Scale after at least 1 tick with intact structure
+        # Soft cap: avoid scaling into already-extended move (>2.5% from entry)
+        if (
+            profit_pct >= 0.008
+            and profit_pct <= 0.025
+            and state.get("hold_bars", 0) >= 1
+            and constructive
+            and not hard_reversal
+        ):
+            print(f"[SCOUT_TRACE] symbol={state.get('ticker', '?')} stage=SCOUT action=SCALE "
+                  f"profit={profit_pct*100:.2f}% hold_bars={state.get('hold_bars', 0)} "
+                  f"constructive={constructive} reason=SCOUT_SCALE_CONFIRMED", flush=True)
+            return {"action": "BUY", "reason": "SCOUT_SCALE_CONFIRMED", "qty_mode": "MAIN", "stop_loss": curr_price * 0.98}
+        # Priority 3: Hold — let SCOUT breathe; generic rollover won't touch it
             
     return None
 

@@ -57,6 +57,38 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 st.set_page_config(page_title="Trading Unified", page_icon="📊", layout="wide")
 
+
+# ── [Audit Debug] Timestamp integrity logger ──
+def _debug_ts_integrity(df, label, timestamp_col="timestamp"):
+    """Print timestamp duplication stats for debugging dashboard time axis issues."""
+    if df is None or df.empty:
+        print(f"[TS_DEBUG][{label}] empty")
+        return
+    if timestamp_col not in df.columns:
+        print(f"[TS_DEBUG][{label}] no '{timestamp_col}' column, cols={list(df.columns)[:10]}")
+        return
+    ts = pd.to_datetime(df[timestamp_col], errors="coerce")
+    dup_count = ts.duplicated().sum()
+    rows_before = len(df)
+    rows_after_dedup = ts.nunique()
+    print(
+        f"[TS_DEBUG][{label}] rows={rows_before} "
+        f"unique_ts={rows_after_dedup} "
+        f"dup_ts={dup_count} "
+        f"min_ts={ts.min()} "
+        f"max_ts={ts.max()}"
+    )
+    if dup_count > 0:
+        dups = df.loc[ts.duplicated(keep=False), [timestamp_col]].head(20)
+        print(f"[TS_DEBUG][{label}] DUP TIMESTAMPS (first 20):")
+        for _, row in dups.iterrows():
+            print(f"    {row[timestamp_col]}")
+    # final safety net: sort + dedup row-by-timestamp
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
+    df.sort_values(timestamp_col, inplace=True)
+    df.drop_duplicates(subset=[timestamp_col], keep="last", inplace=True)
+    print(f"[TS_DEBUG][{label}] after safety dedup: {len(df)} rows")
+
 # Helper: robustly coerce possibly-array-like values (Series, ndarray, list) to a float scalar
 import numpy as _np
 import pandas as _pd
@@ -295,6 +327,9 @@ def filter_today(df, ts_col="timestamp"):
 
         # 確保排序
         filtered_df = filtered_df.sort_values(ts_col)
+
+        # [Audit Debug] Log timestamp integrity after trading day filter
+        _debug_ts_integrity(filtered_df, "filter_today_output", ts_col)
 
         # V-Model fix 3: 過濾 fallback 假資料
         for col in ["close", "price_mtx"]:
@@ -1259,7 +1294,10 @@ def load_futures_indicators(full_history=False):
     result = None
     if all_dfs:
         merged = merge_indicator_frames(all_dfs)
-        
+
+        # [Audit Debug] Timestamp integrity after merge
+        _debug_ts_integrity(merged, "merge_output", "timestamp")
+
         # FINAL GUARD: Ensure no duplicate columns for PyArrow
         if merged.columns.duplicated().any():
             merged = merged.loc[:, ~merged.columns.duplicated()].copy()
@@ -1291,7 +1329,13 @@ def load_futures_indicators(full_history=False):
 
     # Stale data detection (trading-day-aware)
     if result is not None and not result.empty and "timestamp" in result.columns:
+        # [Audit Debug] Timestamp integrity before extend
+        _debug_ts_integrity(result, "pre_extend", "timestamp")
+        
         result = extend_taifex_recess_continuity(result, timestamp_col="timestamp")
+        
+        # [Audit Debug] Timestamp integrity after extend
+        _debug_ts_integrity(result, "post_extend", "timestamp")
         try:
             # ── Calendar time staleness ──
             result_ts = result["timestamp"].copy()
@@ -1331,6 +1375,13 @@ def load_futures_indicators(full_history=False):
                     pass
         except Exception:
             pass
+    
+    # ── [Audit Safety Net] Final sort + dedup before returning ──
+    if result is not None and not result.empty and "timestamp" in result.columns:
+        result["timestamp"] = pd.to_datetime(result["timestamp"], errors="coerce")
+        result = result.dropna(subset=["timestamp"])
+        result = result.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+    
     return result
 
 @st.cache_data(ttl=30)
@@ -1674,6 +1725,9 @@ def load_options_indicators(full_history=False):
     if all_dfs:
         try:
             merged = merge_indicator_frames(all_dfs)
+            
+            # [Audit Debug] Options data — timestamp integrity after merge
+            _debug_ts_integrity(merged, "options_merge_output", "timestamp")
             
             # Standardize MTX price column name
             if "mtx_close" in merged.columns and "price_mtx" not in merged.columns:
@@ -3179,6 +3233,77 @@ with tab_pipeline:
             st.info(f"今日審計檔不存在：{audit_file.name}")
     except Exception as e:
         st.error(f"審計讀取錯誤: {e}")
+
+    # ── Router Trace Dashboard ──
+    st.subheader("🔍 Router Trace — 每根 Bar 的策略決策")
+    try:
+        from pathlib import Path
+        import json
+        trace_dir = Path("logs/router_trace")
+        if trace_dir.exists():
+            trace_files = sorted(trace_dir.glob("router_trace_*.jsonl"), reverse=True)
+            if trace_files:
+                # ── Load + explode ──
+                rows = []
+                with open(trace_files[0]) as f:
+                    for line in f:
+                        trace = json.loads(line)
+                        ts = trace.get("ts", "?")
+                        regime = trace.get("regime", "?")
+                        selected = trace.get("selected")
+                        for s in trace.get("strategies", []):
+                            rows.append({
+                                "ts": ts,
+                                "regime": regime,
+                                "selected": selected,
+                                "strategy": s["name"],
+                                "triggered": s.get("triggered", False),
+                                "edge": s.get("edge_score"),
+                                "reason": s.get("skip_reason", "?") if not s.get("triggered") else "✅ TRADE",
+                            })
+                if rows:
+                    df_rt = pd.DataFrame(rows)
+                    df_rt["ts_dt"] = pd.to_datetime(df_rt["ts"], errors="coerce")
+                    df_rt = df_rt.sort_values("ts_dt")
+
+                    # ── ① 最新狀態 ──
+                    latest = df_rt.sort_values("ts_dt").groupby("strategy").tail(1)
+                    cols = st.columns(len(latest))
+                    for ci, (_, r) in enumerate(latest.iterrows()):
+                        c = cols[ci % len(cols)]
+                        emoji = "✅" if r["triggered"] else ("⏳" if r["reason"] in ("WATCHING", "FIRE_DETECTED_WAITING") else "⛔")
+                        c.metric(f"{r['strategy']}", f"{emoji} {r['reason']}", f"edge={r['edge']}" if pd.notna(r["edge"]) else None)
+
+                    # ── ② Edge Timeline (Plotly) ──
+                    try:
+                        import plotly.express as px
+                        df_plot = df_rt[df_rt["edge"].notna()].copy()
+                        if not df_plot.empty:
+                            fig = px.line(df_plot, x="ts_dt", y="edge", color="strategy",
+                                          title="Edge Score Timeline",
+                                          labels={"ts_dt": "時間", "edge": "Edge", "strategy": "策略"})
+                            fig.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10))
+                            st.plotly_chart(fig, use_container_width=True)
+                    except Exception:
+                        pass
+
+                    # ── ③ Skip Reason 分布 ──
+                    reason_counts = df_rt.groupby(["strategy", "reason"]).size().unstack(fill_value=0)
+                    if not reason_counts.empty:
+                        st.bar_chart(reason_counts, height=200)
+
+                    # ── ④ 原始資料（摺疊） ──
+                    with st.expander("📋 原始 Router Trace 資料", expanded=False):
+                        st.dataframe(df_rt[["ts", "regime", "strategy", "triggered", "edge", "reason"]].tail(50),
+                                     use_container_width=True, hide_index=True)
+                else:
+                    st.info("Router trace 檔案為空")
+            else:
+                st.info("今日尚無 router trace 資料（monitor 尚未運行）")
+        else:
+            st.info("Router trace 目錄不存在")
+    except Exception as e:
+        st.error(f"Router trace 載入錯誤: {e}")
 
 # ════════════════════════════════════════
 # Tab 6: 設定

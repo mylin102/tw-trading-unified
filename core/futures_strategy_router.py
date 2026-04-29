@@ -16,6 +16,7 @@ from .attribution_recorder import AttributionRecorder, log_router_event
 from .futures_bar_regime import FuturesBarRegimeResult
 from core.signal import Signal
 from core.strategy_context import StrategyContext
+from core.strategy_eval import StrategyEval, RouterTrace, write_trace, print_trace_summary
 
 class StrategyLookup(Protocol):
     def get(self, name: str) -> Any: ...
@@ -423,6 +424,9 @@ def route_futures_signal(
             f"candidates={candidates}[/yellow]"
         )
 
+    # Collect strategy evals for RouterTrace
+    _evals: list[dict] = []
+
     # Log all candidates as pre-evaluation (for candidate_count invariant)
     for i, name in enumerate(candidates):
         log_router_event(
@@ -454,6 +458,7 @@ def route_futures_signal(
                 winner=False,
                 note="strategy not registered",
             )
+            _evals.append({"name": name, "enabled": False, "triggered": False, "action": None, "edge_score": None, "skip_reason": "NOT_REGISTERED", "notes": {}})
             continue
 
         if prepare_strategy is not None:
@@ -461,6 +466,20 @@ def route_futures_signal(
 
         try:
             signal = strategy.on_bar(context)
+            # Collect eval from strategy.last_eval (set by _set_eval in each strategy)
+            _eval_dict = {"name": name, "enabled": True}
+            se = getattr(strategy, "last_eval", None)
+            if se is not None:
+                _eval_dict.update({
+                    "triggered": se.triggered,
+                    "action": se.action,
+                    "edge_score": se.edge_score,
+                    "skip_reason": se.skip_reason,
+                    "notes": se.notes,
+                })
+            else:
+                _eval_dict.update({"triggered": False, "action": None, "edge_score": None, "skip_reason": "NO_EVAL", "notes": {}})
+            _evals.append(_eval_dict)
         except Exception as e:
             notes.append(f"{name}: error in on_bar ({e})")
             import traceback
@@ -620,7 +639,20 @@ def route_futures_signal(
                 theta_block_reason=_theta_block_reason,
             )
 
-        return FuturesRouterDecision(
+    # ── Write RouterTrace before TRADE return ──
+    _ts_str = str(timestamp) if timestamp else str(context.market.timestamp)
+    _trace = RouterTrace(
+        ts=_ts_str,
+        regime=regime_result.regime,
+        bias=regime_result.bias,
+        selected=name,
+        selected_action=getattr(signal, "action", None),
+        strategies=_evals,
+    )
+    write_trace(_trace)
+    print_trace_summary(_trace)
+
+    return FuturesRouterDecision(
             action="TRADE",
             reason=f"selected by {name}",
             regime=regime_result.regime,
@@ -647,6 +679,19 @@ def route_futures_signal(
             winner=False,
             notes=f"no eligible signal for regime {regime_result.regime}",
         )
+    
+    # ── Write RouterTrace — every bar gets a decision record ──
+    _ts_str = str(timestamp) if timestamp else str(context.market.timestamp)
+    _trace = RouterTrace(
+        ts=_ts_str,
+        regime=regime_result.regime,
+        bias=regime_result.bias,
+        selected=None,
+        selected_action=None,
+        strategies=_evals,
+    )
+    write_trace(_trace)
+    print_trace_summary(_trace)
     
     return FuturesRouterDecision(
         action="FLAT",

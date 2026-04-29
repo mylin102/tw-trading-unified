@@ -13,6 +13,7 @@ import pandas as pd
 from core.signal import Signal
 from core.strategy_base import StrategyBase
 from core.strategy_context import StrategyContext
+from core.strategy_eval import StrategyEval
 from core.market_regime import MarketRegime
 
 logger = logging.getLogger(__name__)
@@ -142,9 +143,12 @@ class AdaptiveORB(StrategyBase):
         df = context.market.df_5m
         if df is None or df.empty:
             logger.debug("adaptive_orb: df_5m None/empty — skipping")
+            self._set_eval(skip_reason="NO_DATA", df_ready=False)
             return None
 
-        if not bar: return None
+        if not bar:
+            self._set_eval(skip_reason="NO_BAR")
+            return None
 
         # Session Reset
         session_id = bar.get("trading_day", bar.get("session", 1))
@@ -160,10 +164,19 @@ class AdaptiveORB(StrategyBase):
             self._range_high = max(self._range_high, bar['High'])
             self._range_low = min(self._range_low, bar['Low'])
             self._bar_count += 1
-            if self._bar_count >= 6: self._range_built = True
+            if self._bar_count >= 6:
+                self._range_built = True
+                self._set_eval(skip_reason="ORB_BUILDING", bar_count=self._bar_count, range_built=True)
+            else:
+                self._set_eval(skip_reason="ORB_BUILDING", bar_count=self._bar_count, range_built=False)
             return None
 
-        if self._signaled or context.position.size != 0: return None
+        if self._signaled:
+            self._set_eval(skip_reason="ALREADY_SIGNALED", range_high=self._range_high, range_low=self._range_low)
+            return None
+        if context.position.size != 0:
+            self._set_eval(skip_reason="POSITION_OPEN", position=context.position.size)
+            return None
 
         close = bar['Close']
         atr = bar.get("atr", 50.0)
@@ -173,12 +186,15 @@ class AdaptiveORB(StrategyBase):
         direction = 0
         if close > self._range_high: direction = 1
         elif close < self._range_low: direction = -1
-        
-        if direction == 0: return None
+
+        if direction == 0:
+            self._set_eval(skip_reason="NO_BREAKOUT", close=close, range_high=self._range_high, range_low=self._range_low)
+            return None
 
         # 3. Adaptive Logic (V3 Clean)
         if regime == MarketRegime.TRENDING and self.model:
             if not self._has_breakout_quality(context, direction):
+                self._set_eval(skip_reason="BREAKOUT_QUALITY_FAILED", direction=direction, curve=curve, min_curve_abs=self.min_curve_abs)
                 return None
             # V3 Features: dir, lr_curve, atr_n, gap_p, hour
             features = pd.DataFrame([{
@@ -189,23 +205,33 @@ class AdaptiveORB(StrategyBase):
                 "hour": df.index[-1].hour
             }])
             success_prob = self.model.predict_proba(features)[0][1]
-            
+
             if success_prob >= self.prob_threshold:
                 self._signaled = True
                 qty = 3 if success_prob >= 0.85 else (2 if success_prob >= 0.75 else 1)
-                return Signal("BUY" if direction == 1 else "SELL", "ADAPTIVE_TREND_V3",
+                action = "BUY" if direction == 1 else "SELL"
+                self._set_eval(triggered=True, action=action, edge_score=success_prob, quantity=qty, direction=direction)
+                return Signal(action, "ADAPTIVE_TREND_V3",
                             stop_loss=close - direction * (atr * self.atr_mult),
                             target=close + direction * (atr * self.atr_mult * 3),
                             confidence=success_prob, quantity=qty)
+
+            self._set_eval(skip_reason="MODEL_PROB_TOO_LOW", success_prob=success_prob, prob_threshold=self.prob_threshold, direction=direction)
 
         elif regime == MarketRegime.CHOPPY:
             # Ambush Logic
             if (direction == 1 and curve < -0.01) or (direction == -1 and curve > 0.01):
                 self._signaled = True
-                return Signal("SELL" if direction == 1 else "BUY", "ADAPTIVE_AMBUSH",
+                ambush_action = "SELL" if direction == 1 else "BUY"
+                self._set_eval(triggered=True, action=ambush_action, edge_score=0.70, signal="ADAPTIVE_AMBUSH", direction=direction, curve=curve)
+                return Signal(ambush_action, "ADAPTIVE_AMBUSH",
                             stop_loss=close + direction * (atr * 1.5),
                             target=self._range_low if direction == 1 else self._range_high,
                             confidence=0.7, quantity=1)
+            self._set_eval(skip_reason="AMBUSH_CURVE_MISMATCH", direction=direction, curve=curve)
+
+        else:
+            self._set_eval(skip_reason="REGIME_NOT_TRADABLE", regime=str(regime), direction=direction)
 
         return None
 

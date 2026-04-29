@@ -23,6 +23,7 @@ from typing import Any
 
 from core.strategy_base import StrategyBase
 from core.strategy_context import StrategyContext
+from core.strategy_eval import StrategyEval
 from core.signal import Signal
 
 # Columns required in the feature-enriched bar dict

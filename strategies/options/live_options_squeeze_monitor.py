@@ -194,6 +194,8 @@ class ShioajiOptionsSmartMonitor:
         # [Vertical Spread v1] Feature flag: convert single-leg CALL/PUT to debit vertical spreads
         self._enable_vertical_spread = bool(self.full_cfg.get("vertical_spread", {}).get("enabled", False))
         self._spread_width = int(self.full_cfg.get("vertical_spread", {}).get("width", 100))
+        self._current_spread = None  # populated by enter_spread_paper_position
+        self._spread_holding_bars = 0
 
         self.market_data = {"MTX": {"close": 0.0, "bid": 0.0, "ask": 0.0}, "C": {"close": 0.0, "bid": 0.0, "ask": 0.0}, "P": {"close": 0.0, "bid": 0.0, "ask": 0.0}}
         # [Wave 2 optimization] Use deque for O(1) append/trim instead of DataFrame.loc + slicing
@@ -2426,6 +2428,285 @@ class ShioajiOptionsSmartMonitor:
             direction_full, entry_lots, spread.net_debit, spread.max_profit, spread.max_risk
         )
 
+    # ── [Vertical Spread v1] Live trading spread entry ──
+    def enter_spread_live_position(self, direction, signal):
+        """
+        Convert CALL/PUT signal into debit vertical spread and place combo order.
+        Falls back to enter_live_position() if spread selector rejects.
+        """
+        direction_full = "CALL" if direction in ("C", "CALL") else "PUT" if direction in ("P", "PUT") else direction
+        if direction_full not in ("CALL", "PUT"):
+            console.print(f"[yellow][VerticalSpread] enter_spread_live_position: unknown direction {direction}, falling back[/yellow]")
+            self.enter_live_position(direction, signal)
+            return
+
+        from strategies.options.spread_selector import select_vertical_spread, build_combo_legs
+
+        index_price = self.market_data.get("MTX", {}).get("close", 0.0) or signal.get("price_mtx", 0)
+        if index_price <= 0:
+            console.print("[yellow][VerticalSpread] No index price available for live spread, falling back to single-leg[/yellow]")
+            self.enter_live_position(direction, signal)
+            return
+
+        tx_code = self.active_contracts.get("MTX", None)
+        mtx_close = self.market_data.get("MTX", {}).get("close", index_price)
+        option_chain = getattr(self, '_all_month_contracts', [])
+        if not option_chain:
+            console.print("[yellow][VerticalSpread] No option chain available for live spread, falling back to single-leg[/yellow]")
+            self.enter_live_position(direction, signal)
+            return
+
+        # Build market_data dict for spread selector quotes
+        md_for_spread = {}
+        for c in option_chain:
+            code = getattr(c, 'code', '')
+            if code in self.market_data:
+                md_for_spread[code] = self.market_data[code]
+
+        spread, reason = select_vertical_spread(
+            direction=direction_full,
+            index_price=mtx_close,
+            option_chain=option_chain,
+            market_data=md_for_spread,
+            width=self._spread_width,
+        )
+
+        if spread is None:
+            console.print(f"[yellow][VerticalSpread][SKIP] {reason} — falling back to single-leg live entry[/yellow]")
+            self.enter_live_position(direction, signal)
+            return
+
+        entry_lots = int(signal.get("entry_lots", self.base_lots)) if isinstance(signal, dict) else self.base_lots
+        if entry_lots <= 0:
+            console.print(f"[yellow][VerticalSpread] entry_lots={entry_lots}, skipping[/yellow]")
+            return
+
+        console.print(f"[bold green][VerticalSpread][LIVE] {spread.direction} spread: "
+                      f"Buy {spread.long_leg.strike}{spread.long_leg.option_type[0]} "
+                      f"Sell {spread.short_leg.strike}{spread.short_leg.option_type[0]} "
+                      f"net_debit={spread.net_debit:.1f} max_profit={spread.max_profit:.1f}[/bold green]")
+
+        # Place combo order via broker
+        legs = build_combo_legs(spread)
+        trade = self.broker.place_comboorder(
+            legs=legs,
+            price=spread.net_debit,
+            quantity=entry_lots,
+            action=sj.constant.Action.Buy,
+            price_type='LMT',
+        )
+
+        if trade is None:
+            console.print("[red]❌ [VerticalSpread] Live combo order returned None (margin?)[/red]")
+            self._audit_signal("LIVE_SPREAD_ENTRY_SUBMITTED", direction_full, signal, "place_comboorder_returned_none")
+            return
+
+        self._audit_signal("LIVE_SPREAD_ENTRY_SUBMITTED", direction_full, signal, "")
+
+        # Record lifecycle order via OrderManager
+        if self.order_mgr:
+            from core.order_management.order import OrderType, OrderSide
+            lifecycle_order = self.order_mgr.create_order(
+                symbol=f"VERTICAL_{spread.long_leg.strike}/{spread.short_leg.strike}",
+                side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                quantity=entry_lots,
+                strategy=self.mode,
+                comment=f"LIVE_SPREAD score={signal.get('score', 0.0):.1f}",
+            )
+            if lifecycle_order:
+                self.order_mgr.attach_submission(
+                    lifecycle_order.order_id,
+                    broker_trade=trade,
+                    broker_order_id=getattr(trade, "id", None),
+                    seqno=getattr(trade, "seqno", None),
+                    ordno=getattr(trade, "ordno", None),
+                    raw_status="Submitted",
+                )
+
+        # Track position state
+        self.position += entry_lots
+        self.active_side = direction_full
+        prev_cost = self.entry_price * (self.position - entry_lots) if self.position > entry_lots else 0
+        self.entry_price = (prev_cost + spread.net_debit * entry_lots) / self.position if self.position > 0 else spread.net_debit
+        self.entry_mtx_price = mtx_close
+        self.entry_time = signal.get("timestamp") or self._current_strategy_time()
+        self.has_tp1_hit = False
+        self.stop_loss_price = spread.net_debit * (1 - self.stop_loss_pct)
+        self.peak_premium = spread.net_debit
+        self.replay_stats["entries"] += 1
+        self._daily_entries = getattr(self, '_daily_entries', 0) + 1
+
+        # Store spread metadata for exit decisions
+        self._current_spread = {
+            "long_strike": spread.long_leg.strike,
+            "short_strike": spread.short_leg.strike,
+            "option_type": spread.long_leg.option_type,
+            "net_debit": spread.net_debit,
+            "max_profit": spread.max_profit,
+            "max_risk": spread.max_risk,
+            "strike_width": spread.strike_width,
+            "expiration": spread.expiration,
+        }
+
+        logger.info(
+            "[VerticalSpread] LIVE ENTRY %s qty=%d net_debit=%.1f max_profit=%.1f",
+            direction_full, entry_lots, spread.net_debit, spread.max_profit,
+        )
+
+        if self.dry_run_live_orders:
+            self._simulate_dry_run_fill(trade, spread.long_leg.contract, "Buy", entry_lots)
+
+    # ── [Vertical Spread v1] Live trading spread management ──
+    def manage_spread_live_position(self, signal, option_chain=None):
+        """
+        Manage an open vertical spread position in live trading mode.
+        Same logic as manage_spread_paper_position but calls live broker exit.
+        Returns True if position was closed.
+        """
+        if self.position <= 0 or self._current_spread is None:
+            return False
+
+        now = signal.get("timestamp") if signal else self._current_strategy_time()
+        sd = self._current_spread
+        opt_type = sd["option_type"]
+
+        option_chain = option_chain or getattr(self, '_all_month_contracts', [])
+        from strategies.options.spread_selector import _contract_for_strike, _current_quote
+
+        long_contract = _contract_for_strike(option_chain, sd["long_strike"], opt_type)
+        short_contract = _contract_for_strike(option_chain, sd["short_strike"], opt_type)
+
+        if not long_contract or not short_contract:
+            return False
+
+        md = {}
+        lc = getattr(long_contract, 'code', '')
+        sc = getattr(short_contract, 'code', '')
+        if lc in self.market_data:
+            md[lc] = self.market_data[lc]
+        if sc in self.market_data:
+            md[sc] = self.market_data[sc]
+
+        long_bid, long_ask, long_mid = _current_quote(long_contract, md)
+        short_bid, short_ask, short_mid = _current_quote(short_contract, md)
+
+        if long_mid <= 0 or short_mid <= 0:
+            return False
+
+        spread_value = long_bid - short_ask
+        entry_debit = sd["net_debit"]
+        pnl_pts = spread_value - entry_debit
+        pnl_pct = pnl_pts / entry_debit if entry_debit > 0 else 0
+        holding_bars = getattr(self, '_spread_holding_bars', 0)
+
+        # TAKE_PROFIT
+        take_profit_target = entry_debit + sd["max_profit"] * 0.5
+        if spread_value >= take_profit_target:
+            console.print(f"[bold green][VerticalSpread][LIVE] TAKE_PROFIT spread_value={spread_value:.1f} "
+                          f"pnl={pnl_pts:.1f}pts ({pnl_pct*100:.1f}%)[/bold green]")
+            self._exit_spread_live_position("LIVE_SPREAD_TP", spread_value)
+            return True
+
+        # STOP_LOSS
+        stop_loss_target = entry_debit * 0.55
+        if spread_value <= stop_loss_target:
+            console.print(f"[bold red][VerticalSpread][LIVE] STOP_LOSS spread_value={spread_value:.1f} "
+                          f"pnl={pnl_pts:.1f}pts ({pnl_pct*100:.1f}%)[/bold red]")
+            self._exit_spread_live_position("LIVE_SPREAD_SL", spread_value)
+            return True
+
+        # TIME_STOP
+        if holding_bars >= 6 and pnl_pts <= 0:
+            console.print(f"[bold yellow][VerticalSpread][LIVE] TIME_STOP held {holding_bars} bars, pnl={pnl_pts:.1f}pts[/bold yellow]")
+            self._exit_spread_live_position("LIVE_SPREAD_TIME", spread_value)
+            return True
+
+        # EOD_EXIT
+        if hasattr(self, 'm_cfg') and self.m_cfg.get('force_close_at_end', False):
+            eod_state = self._get_eod_state(now)
+            if eod_state["is_panic"]:
+                console.print(f"[bold yellow][VerticalSpread][LIVE] EOD_PANIC exit spread_value={spread_value:.1f}[/bold yellow]")
+                self._exit_spread_live_position("LIVE_SPREAD_EOD", spread_value)
+                return True
+
+        self._spread_holding_bars = holding_bars + 1
+        return False
+
+    def _exit_spread_live_position(self, action, exit_value):
+        """
+        Close a spread position in live mode via combo order.
+        """
+        if self.position <= 0 or self._current_spread is None:
+            return
+
+        qty = self.position
+        sd = self._current_spread
+
+        # Build reverse combo legs (sell long, buy back short)
+        # Look up contracts from option_chain
+        opt_type = sd["option_type"]
+        option_chain = getattr(self, '_all_month_contracts', [])
+        from strategies.options.spread_selector import _contract_for_strike
+
+        long_contract = _contract_for_strike(option_chain, sd["long_strike"], opt_type)
+        short_contract = _contract_for_strike(option_chain, sd["short_strike"], opt_type)
+
+        if not long_contract or not short_contract:
+            console.print("[red][VerticalSpread][LIVE] Cannot close — contracts not found in chain[/red]")
+            return
+
+        legs = [
+            {"contract": long_contract, "action": sj.constant.Action.Sell},
+            {"contract": short_contract, "action": sj.constant.Action.Buy},
+        ]
+
+        console.print(f"[cyan][VerticalSpread][LIVE] Closing spread: {action} qty={qty} exit_value={exit_value:.1f}[/cyan]")
+
+        # Place combo order to close
+        trade = self.broker.place_comboorder(
+            legs=legs,
+            price=exit_value,
+            quantity=qty,
+            action=sj.constant.Action.Sell,
+            price_type='LMT',
+        )
+        if trade is None:
+            console.print("[red]❌ [VerticalSpread][LIVE] Exit combo order returned None[/red]")
+            return
+
+        # Log exit via lifecycle manager
+        if self.order_mgr:
+            from core.order_management.order import OrderType, OrderSide
+            lo = self.order_mgr.create_order(
+                symbol="VERTICAL_SPREAD_EXIT",
+                side=OrderSide.SELL,
+                order_type=OrderType.MARKET,
+                quantity=qty,
+                strategy=self.mode,
+                comment=action,
+            )
+
+        # Compute PnL
+        pnl_cash = (exit_value - sd["net_debit"]) * 50
+        logger.info("[VerticalSpread] LIVE EXIT %s qty=%d entry=%.1f exit=%.1f pnl=%.1f",
+                     action, qty, sd["net_debit"], exit_value, pnl_cash)
+
+        if hasattr(self, 'log_trade'):
+            self.log_trade(
+                "VERTICAL_SPREAD_LIVE", self.active_side or "CALL",
+                sd["net_debit"], exit_value, qty, action,
+            )
+
+        # Clear position state
+        self.position = 0
+        self.active_side = None
+        self._current_spread = None
+        self._spread_holding_bars = 0
+        self.entry_price = 0.0
+        self.entry_mtx_price = 0.0
+        self.replay_stats["exits"] += 1
+
     def enter_paper_position(self, side, signal):
         signal_side = signal.get("side") if isinstance(signal, dict) else None
         if not signal_side or signal_side != side:
@@ -3857,7 +4138,11 @@ class ShioajiOptionsSmartMonitor:
 
                 # ── [Vertical Spread v1] Spread position management ──
                 if self._enable_vertical_spread and self._current_spread is not None:
-                    if self.manage_spread_paper_position(signal, option_chain=option_chain):
+                    if self.live_trading:
+                        exited = self.manage_spread_live_position(signal, option_chain=option_chain)
+                    else:
+                        exited = self.manage_spread_paper_position(signal, option_chain=option_chain)
+                    if exited:
                         self.print_status_summary(signal, force=True)
                         return
                 elif self.manage_open_position(signal):
@@ -4092,7 +4377,10 @@ class ShioajiOptionsSmartMonitor:
                             self.replay_stats["blocked_entries"] += 1
                     elif self.live_trading:
                         console.print(f"[bold green]>>> ENTRY SIGNAL: {sig_side} score={sig_score:.1f}[/bold green]")
-                        self.enter_live_position(sig_side, signal)
+                        if self._enable_vertical_spread:
+                            self.enter_spread_live_position(sig_side, signal)
+                        else:
+                            self.enter_live_position(sig_side, signal)
                     else:
                         # Track: did paper entry succeed or fail?
                         before_pos = self.position

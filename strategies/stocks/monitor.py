@@ -567,8 +567,10 @@ class StockMonitor:
                     
                 state = {
                     "last_5m": df.iloc[-1], "df_5m": df,
+                    "ticker": ticker,
                     "scout_stage": self.positions.get(ticker, {}).get("stage", "IDLE"),
                     "scout_entry_price": self.positions.get(ticker, {}).get("entry_price", 0.0),
+                    "hold_bars": self.positions.get(ticker, {}).get("hold_bars", 0),
                     "market_trend": "BEAR" if self.is_bear_market else "BULL",
                     "pattern": scan_info["pattern"],
                     "pivot": scan_info["pivot"],
@@ -782,6 +784,9 @@ class StockMonitor:
                     return
 
             self.positions[ticker] = {"stage": qty_mode, "entry_price": price, "qty": self.positions.get(ticker, {}).get("qty", 0) + qty}
+            # [SCOUT Lifecycle] MAIN = promoted from SCOUT; lifecycle marks position maturity
+            if qty_mode == "MAIN":
+                self.positions[ticker]["lifecycle"] = "PROMOTED"
             console.print(f"[cyan]🚀 [{self.mode_tag}] BUY {ticker} | Qty: {qty} | Reason: {reason}[/cyan]")
             self._log_trade(ticker, "BUY", price, qty, reason, 0.0, price)
 

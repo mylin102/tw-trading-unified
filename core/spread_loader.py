@@ -41,6 +41,7 @@ class SpreadLoader:
         self._near_df: pd.DataFrame | None = None  # near-month price series (optional override)
         self._last_spread_data: dict[str, Any] = {}  # cached latest spread values
         self._csv_paths: dict[str, str] = {}  # { 'far': path, 'near': path }
+        self._spread_csv_mtime: float | None = None  # for hot-reload detection
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -56,6 +57,10 @@ class SpreadLoader:
         # Try calendar spread CSV first (most complete)
         ok_spread = self._find_and_load("spread")
         if ok_spread:
+            # Record initial mtime for hot-reload detection
+            spread_path = self._csv_paths.get("spread")
+            if spread_path and os.path.exists(spread_path):
+                self._spread_csv_mtime = os.path.getmtime(spread_path)
             return True
 
         # Fallback: far + near
@@ -75,13 +80,17 @@ class SpreadLoader:
 
     def enrich_bar(self, bar: dict[str, Any], timestamp: pd.Timestamp | None = None) -> dict[str, Any]:
         """Enrich a bar dict with spread-related fields.
-
+        
+        Auto-reloads CSV if a newer file is detected (hot-reload support for cron updates).
+        
         Adds these keys (or fills defaults):
           - spread_z, near_close, far_close, price_vs_vwap, vwap_z
           - bars_from_session_open, is_night_session
 
         Returns the same dict (mutated in place + returned).
         """
+        # ── [Hot-reload] Check for newer CSV on every bar ──
+        self._check_reload()
         if self._far_df is None or self._far_df.empty:
             self._fill_default_spread(bar, timestamp)
         else:
@@ -132,6 +141,17 @@ class SpreadLoader:
         return bar
 
     # ── Loading ─────────────────────────────────────────────────────────
+
+    def _check_reload(self) -> None:
+        """Hot-reload: if a newer CSV file exists (mtime changed), re-load it."""
+        spread_path = self._csv_paths.get("spread")
+        if spread_path and os.path.exists(spread_path):
+            current_mtime = os.path.getmtime(spread_path)
+            if current_mtime != getattr(self, '_spread_csv_mtime', None):
+                self._spread_csv_mtime = current_mtime
+                logger.info(f"[SpreadLoader] CSV changed, hot-reloading: {spread_path}")
+                self._far_df = None  # force reload
+                self._find_and_load("spread")
 
     def _find_and_load(self, prefix: str) -> bool:
         """Find CSV matching the prefix and load it.

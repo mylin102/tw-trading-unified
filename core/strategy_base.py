@@ -23,6 +23,30 @@ class StrategyBase(ABC):
     3. ``cleanup()`` — called when strategy is deactivated (optional)
     """
 
+    def __init__(self) -> None:
+        self.last_eval: Optional["StrategyEval"] = None  # set by on_bar()
+
+    def _set_eval(
+        self,
+        triggered: bool = False,
+        action: str | None = None,
+        edge_score: float | None = None,
+        skip_reason: str | None = None,
+        **notes: object,
+    ) -> None:
+        """Set last_eval for RouterTrace.  Call before every return in on_bar()."""
+        from core.strategy_eval import StrategyEval
+
+        self.last_eval = StrategyEval(
+            name=self.name,
+            enabled=True,
+            triggered=triggered,
+            action=action,
+            edge_score=edge_score,
+            skip_reason=skip_reason,
+            notes={k: v for k, v in notes.items()},
+        )
+
     # ── Required Properties ──────────────────────────────────────────────
 
     @property

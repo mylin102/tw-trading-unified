@@ -5,11 +5,11 @@ Calendar Condor Strategy v2.0 - Fixed contract handling
 This version uses proper contract resolution to avoid issues with
 rolling contracts (TMFR1, TMFR2) and handles expiry properly.
 """
+from __future__ import annotations
 
 import os
 import sys
 from datetime import datetime, timedelta
-from dataclasses import dataclass
 from typing import Any, Optional, Dict, Tuple
 import pandas as pd
 
@@ -19,29 +19,46 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.signal import Signal
 from core.strategy_base import StrategyBase
 from core.strategy_context import StrategyContext
+from core.strategy_eval import StrategyEval
 
 
-@dataclass
 class CalendarCondorV2(StrategyBase):
     """期貨日曆跨月策略 v2.0 - 使用正確合約處理"""
-    
-    name = "calendar_condor_v2"
-    description = "期貨日曆跨月策略 v2.0 (正確合約處理 + 近月/遠月價差均值回歸)"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.position_side: str = ""
+        self.entry_bar_idx: int = 0
+        self.entry_spread: float = 0.0
+        self.entry_spread_z: float = 0.0
+        self.peak_unrealized_pnl: float = 0.0
+        self.near_contract_code: str = ""
+        self.far_contract_code: str = ""
+        self.params: dict = None
+        # name/version as class attributes
+        self._name = "calendar_condor_v2"
+        self._desc = "期貨日曆跨月策略 v2.0 (正確合約處理 + 近月/遠月價差均值回歸)"
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def metadata(self) -> dict:
+        return {
+            "asset_class": "futures",
+            "version": "2.0",
+            "backtest_pf": 0.0,
+            "backtest_wr": 0.0,
+            "backtest_maxdd": 0.0,
+            "market_regime": "weak",
+            "description": self._desc,
+            "indicators": ["spread_z", "vwap_z", "adx"],
+        }
+
     version = "2.0"
-    
+
     # 策略狀態
-    position_side: str = ""  # "SHORT_SPREAD" or "LONG_SPREAD"
-    entry_bar_idx: int = 0
-    entry_spread: float = 0.0
-    entry_spread_z: float = 0.0
-    peak_unrealized_pnl: float = 0.0
-    
-    # 合約信息
-    near_contract_code: str = ""
-    far_contract_code: str = ""
-    
-    # 策略參數 (從 config 載入)
-    params: dict = None
     
     def init(self, context: StrategyContext) -> None:
         """初始化策略"""
@@ -101,13 +118,16 @@ class CalendarCondorV2(StrategyBase):
         """處理每個 bar 的數據"""
         if not self._validate_bar(context):
             return None
-        
+
         # 檢查退出條件
         if self.position_side:
             exit_signal = self._check_exit(context)
             if exit_signal:
                 return exit_signal
-        
+            self._set_eval(skip_reason="HOLDING", position_side=self.position_side,
+                           bars_held=context.bar_counter - self.entry_bar_idx)
+            return None
+
         # 檢查進場條件
         return self._check_entry(context)
     
@@ -115,8 +135,9 @@ class CalendarCondorV2(StrategyBase):
         """驗證 bar 數據是否有效"""
         bar = context.market.last_bar
         if not bar:
+            self._set_eval(skip_reason="NO_BAR")
             return False
-        
+
         # 使用 SpreadLoader 補齊缺失的 spread / vwap_z 等欄位
         self._enrich_bar(bar)
         
@@ -131,20 +152,26 @@ class CalendarCondorV2(StrategyBase):
             val = bar.get(field)
             if val is None:
                 # enrichment 後仍缺失 → bar 不夠用
+                self._set_eval(skip_reason=f"MISSING_FIELD:{field}", required_fields=required_fields,
+                               available=[k for k, v in bar.items() if v is not None][:10])
                 return False
-        
+
         # 檢查 regime 是否符合
         regime = bar["regime"]
         if regime != "WEAK":
-            # 只在 WEAK regime 交易
+            self._set_eval(skip_reason=f"REGIME_NOT_WEAK:{regime}", regime=regime)
             return False
-        
+
         # 檢查是否在夜盤交易
         if not self.params["allow_night_session"] and bar["is_night_session"]:
+            self._set_eval(skip_reason="NIGHT_SESSION_DISABLED", is_night_session=bar["is_night_session"])
             return False
-        
+
         # 檢查是否在開盤初期
         if bar["bars_from_session_open"] < self.params["min_bars_from_session_open"]:
+            self._set_eval(skip_reason="SESSION_START_COOLDOWN",
+                           bars_from_open=bar["bars_from_session_open"],
+                           min_bars=self.params["min_bars_from_session_open"])
             return False
         
         return True
@@ -235,49 +262,58 @@ class CalendarCondorV2(StrategyBase):
     def _check_entry(self, context: StrategyContext) -> Optional[Signal]:
         """檢查進場條件"""
         bar = context.market.last_bar
-        
+
         # 檢查是否已有持倉
         if self.position_side:
             return None
-        
+
         # 檢查 regime 條件
         regime = bar["regime"]
         adx = bar["adx"]
         breakout_strength = bar["breakout_strength"]
         volume_spike = bar["volume_spike"]
-        
-        if regime != "WEAK":
-            return None
-        
+
         if adx > self.params["max_adx"]:
+            self._set_eval(skip_reason="ADX_TOO_HIGH", adx=adx, max_adx=self.params["max_adx"])
             return None
-        
+
         if breakout_strength > self.params["max_breakout_strength"]:
+            self._set_eval(skip_reason="BREAKOUT_STRENGTH_TOO_HIGH",
+                           breakout_strength=breakout_strength,
+                           max_breakout=self.params["max_breakout_strength"])
             return None
-        
+
         if volume_spike < self.params["min_volume_spike"]:
+            self._set_eval(skip_reason="VOLUME_TOO_LOW", volume_spike=volume_spike,
+                           min_volume=self.params["min_volume_spike"])
             return None
-        
+
         # 檢查雙重過濾條件
         vwap_z = bar["vwap_z"]
         spread_z = bar["spread_z"]
-        price_vs_vwap = bar["price_vs_vwap"]
-        
-        # 新增：檢查價差波動是否足夠
+
+        # 檢查價差波動是否足夠
         spread_std = bar.get("spread_std", 0.0)
         if spread_std < self.params.get("min_spread_std", 5.0):
+            self._set_eval(skip_reason="SPREAD_STD_TOO_LOW", spread_std=spread_std,
+                           min_spread_std=self.params.get("min_spread_std", 5.0))
             return None
-        
+
         # 計算預期獲利點數
-        # 預期價差從 entry_spread_z 回歸到 exit_spread_z
         expected_spread_change = abs(spread_z - self.params["exit_spread_z"])
         expected_profit_points = expected_spread_change * spread_std
-        
-        # 新增：檢查預期獲利是否足夠覆蓋摩擦成本
+
+        # 檢查預期獲利是否足夠覆蓋摩擦成本
         min_expected_profit = self.params.get("min_expected_profit", 10.0)
         if expected_profit_points < min_expected_profit:
+            self._set_eval(skip_reason="EXPECTED_PROFIT_TOO_LOW",
+                           expected_profit=expected_profit_points,
+                           min_profit=min_expected_profit,
+                           spread_z=spread_z, spread_std=spread_std)
             return None
-        
+
+        edge = abs(spread_z) if spread_z is not None else 0.0
+
         # 條件 1: 價格相對於 VWAP 拉伸
         # 條件 2: 價差拉伸
         if vwap_z > self.params["entry_vwap_z"] and spread_z > self.params["entry_spread_z"]:
@@ -285,30 +321,34 @@ class CalendarCondorV2(StrategyBase):
             self.position_side = "SHORT_SPREAD"
             self.entry_bar_idx = context.bar_counter
             self.entry_spread_z = spread_z
-            
+
             print(f"[CalendarCondorV2] SHORT_SPREAD entry: vwap_z={vwap_z:.2f}, spread_z={spread_z:.2f}, "
                   f"expected_profit={expected_profit_points:.1f} points")
-            
+            self._set_eval(triggered=True, action="SELL", edge_score=edge,
+                           signal="SHORT_SPREAD", vwap_z=vwap_z, spread_z=spread_z)
+
             return Signal(
                 action="SELL",
                 reason="calendar_condor_short_spread",
-                stop_loss=0.0,  # 由監控層計算
-                target=0.0,     # 由監控層計算
+                stop_loss=0.0,
+                target=0.0,
                 confidence=0.8,
                 quantity=self.params["position_size"],
                 trail_points=0.0,
                 break_even_trigger=0.0
             )
-        
+
         elif vwap_z < -self.params["entry_vwap_z"] and spread_z < -self.params["entry_spread_z"]:
             # 做多價差 (買近月賣遠月)
             self.position_side = "LONG_SPREAD"
             self.entry_bar_idx = context.bar_counter
             self.entry_spread_z = spread_z
-            
+
             print(f"[CalendarCondorV2] LONG_SPREAD entry: vwap_z={vwap_z:.2f}, spread_z={spread_z:.2f}, "
                   f"expected_profit={expected_profit_points:.1f} points")
-            
+            self._set_eval(triggered=True, action="BUY", edge_score=edge,
+                           signal="LONG_SPREAD", vwap_z=vwap_z, spread_z=spread_z)
+
             return Signal(
                 action="BUY",
                 reason="calendar_condor_long_spread",
@@ -319,9 +359,13 @@ class CalendarCondorV2(StrategyBase):
                 trail_points=0.0,
                 break_even_trigger=0.0
             )
-        
+
+        # No entry condition matched
+        self._set_eval(skip_reason="SPREAD_Z_NOT_EXTREME", vwap_z=vwap_z, spread_z=spread_z,
+                       entry_vwap_z=self.params["entry_vwap_z"],
+                       entry_spread_z=self.params["entry_spread_z"])
         return None
-    
+
     def _check_exit(self, context: StrategyContext) -> Optional[Signal]:
         """檢查退出條件"""
         bar = context.market.last_bar

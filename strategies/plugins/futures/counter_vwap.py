@@ -4,6 +4,7 @@ from __future__ import annotations
 from core.signal import Signal
 from core.strategy_base import StrategyBase
 from core.strategy_context import StrategyContext
+from core.strategy_eval import StrategyEval
 
 
 class CounterVWAP(StrategyBase):
@@ -89,6 +90,7 @@ class CounterVWAP(StrategyBase):
 
         if vwap <= 0:
             self._debug_skip("NO_VWAP", ts, session=session)
+            self._set_eval(skip_reason="NO_VWAP", vwap=vwap, session=session)
             return None
 
         # ── Regime Filter: Require squeeze was active recently ────────
@@ -105,6 +107,7 @@ class CounterVWAP(StrategyBase):
             self._debug_skip("NO_FIRE_EVENT", ts, session=session,
                              sqz_on=bar.get("sqz_on"), fired=fired,
                              pending_dir=self._fire_pending_dir)
+            self._set_eval(skip_reason="NO_FIRE_EVENT", sqz_on=bool(bar.get("sqz_on")), fired=fired, pending_dir=self._fire_pending_dir)
             return None
 
         # 新 Fire 事件 (with momentum threshold filter)
@@ -112,16 +115,19 @@ class CounterVWAP(StrategyBase):
             if abs(momentum) < min_momentum:
                 self._debug_skip("WEAK_FIRE", ts, session=session,
                                  momentum=momentum, min_momentum=min_momentum)
+                self._set_eval(skip_reason="WEAK_FIRE", momentum=momentum, min_momentum=min_momentum)
                 return None  # Weak fire, ignore
             self._fire_pending_dir = 1 if momentum > 0 else -1
             self._fire_bar_idx = bar_counter
             self._fire_high = close
             self._fire_low = close
+            self._set_eval(skip_reason="FIRE_DETECTED_WAITING", fire_pending_dir=self._fire_pending_dir, momentum=momentum)
             return None
 
         if self._fire_pending_dir == 0:
             self._debug_skip("NO_PENDING_FIRE", ts, session=session,
                              recent_squeeze=recent_squeeze, fired=fired)
+            self._set_eval(skip_reason="NO_PENDING_FIRE", recent_squeeze=recent_squeeze, fired=fired)
             return None
 
         # 更新極值
@@ -135,8 +141,10 @@ class CounterVWAP(StrategyBase):
                              bars_since=bars_since, confirm_bars=confirm_bars,
                              pending_dir=self._fire_pending_dir)
             self._fire_pending_dir = 0
+            self._set_eval(skip_reason="FIRE_EXPIRED", bars_since=bars_since, confirm_bars=confirm_bars)
             return None
         if bars_since < 1:
+            self._set_eval(skip_reason="WAITING_CONFIRM", bars_since=bars_since, confirm_bars=confirm_bars)
             return None
 
         # ── 失敗驗證 (未創新高/低 + 動能反轉 或 VWAP 拒絕) ──
@@ -158,9 +166,22 @@ class CounterVWAP(StrategyBase):
                 conf = 0.80
                 if bias < 0:  # Momentum accelerating downward
                     conf = 0.85  # Boost confidence
+                self._set_eval(triggered=True, action="SELL", edge_score=conf,
+                               fire_dir=1, no_new_high=no_new_high, velo_reversed=velo_reversed,
+                               vwap_reject=vwap_reject, bias=bias)
                 return Signal("SELL", "COUNTER_VWAP", close + sl_pts,
                               target=vwap, confidence=conf,
                               break_even_trigger=be_trigger, trail_points=trail_pts)
+            # ── Still watching — log what's missing ──
+            if not no_new_high:
+                self._set_eval(skip_reason="NO_COUNTER_EXTREME", fire_dir=1,
+                               close=close, recent_high=recent_high,
+                               velo_reversed=velo_reversed, vwap_reject=vwap_reject)
+            else:
+                self._set_eval(skip_reason="VWAP_CONTEXT_INVALID", fire_dir=1,
+                               no_new_high=no_new_high, velo_reversed=velo_reversed,
+                               vwap_reject=vwap_reject, close=close, vwap=vwap, mom_velo=mom_velo)
+            return None
 
         # Bearish fire failed → COUNTER_BUY
         elif self._fire_pending_dir == -1:
@@ -173,10 +194,25 @@ class CounterVWAP(StrategyBase):
                 conf = 0.80
                 if bias > 0:  # Momentum accelerating upward
                     conf = 0.85  # Boost confidence
+                self._set_eval(triggered=True, action="BUY", edge_score=conf,
+                               fire_dir=-1, no_new_low=no_new_low, velo_reversed=velo_reversed,
+                               vwap_reject=vwap_reject, bias=bias)
                 return Signal("BUY", "COUNTER_VWAP", close - sl_pts,
                               target=vwap, confidence=conf,
                               break_even_trigger=be_trigger, trail_points=trail_pts)
+            # ── Still watching — log what's missing ──
+            if not no_new_low:
+                self._set_eval(skip_reason="NO_COUNTER_EXTREME", fire_dir=-1,
+                               close=close, recent_low=recent_low,
+                               velo_reversed=velo_reversed, vwap_reject=vwap_reject)
+            else:
+                self._set_eval(skip_reason="VWAP_CONTEXT_INVALID", fire_dir=-1,
+                               no_new_low=no_new_low, velo_reversed=velo_reversed,
+                               vwap_reject=vwap_reject, close=close, vwap=vwap, mom_velo=mom_velo)
+            return None
 
+        # Unreachable (fire_pending_dir is 1 or -1 at this point)
+        self._set_eval(skip_reason="UNREACHABLE", fire_pending_dir=self._fire_pending_dir)
         return None
 
     def cleanup(self) -> None:

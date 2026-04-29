@@ -91,6 +91,9 @@ strategy:
     15m: 0.4
     1h: 0.2
     5m: 0.4
+debug:
+  tickbar: false
+  feed: false
 trade_mgmt:
   allow_long: true
   allow_short: true
