@@ -2945,7 +2945,8 @@ class FuturesMonitor:
             try:
                 if hasattr(self, 'feed_health') and self.feed_health is not None:
                     tx_age = self.feed_health.age('TX')
-                    tmf_age = self.feed_health.age('MXF')
+                    # [Fix] Use _tmf_feed_age_secs() which has proper fallback for feed_health returning inf
+                    tmf_age = self._tmf_feed_age_secs()
                     max_age = getattr(self, 'STALE_WARN_SECS', 120)
                     
                     # 💡 GSD: 只有主體 MXF 過期才跳過；TX 過期則僅報警
