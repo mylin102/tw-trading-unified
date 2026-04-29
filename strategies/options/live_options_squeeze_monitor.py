@@ -191,6 +191,10 @@ class ShioajiOptionsSmartMonitor:
         self.order_mgr = None
         self._use_order_manager = False 
         
+        # [Vertical Spread v1] Feature flag: convert single-leg CALL/PUT to debit vertical spreads
+        self._enable_vertical_spread = bool(self.full_cfg.get("vertical_spread", {}).get("enabled", False))
+        self._spread_width = int(self.full_cfg.get("vertical_spread", {}).get("width", 100))
+
         self.market_data = {"MTX": {"close": 0.0, "bid": 0.0, "ask": 0.0}, "C": {"close": 0.0, "bid": 0.0, "ask": 0.0}, "P": {"close": 0.0, "bid": 0.0, "ask": 0.0}}
         # [Wave 2 optimization] Use deque for O(1) append/trim instead of DataFrame.loc + slicing
         self._mtx_tick_bars_deque = deque(maxlen=300)
@@ -2325,6 +2329,103 @@ class ShioajiOptionsSmartMonitor:
             return False
         return True
 
+    # ── [Vertical Spread v1] Wrapper: select spread → paper entry ──
+    def enter_spread_paper_position(self, direction, signal):
+        """
+        Wrapper: converts CALL/PUT signal into debit vertical spread via spread_selector.
+        Falls back to enter_paper_position() if spread selector rejects.
+        
+        Args:
+            direction: "CALL" or "PUT" (or "C"/"P")
+            signal: signal dict from fetch_live_signal()
+        """
+        direction_full = "CALL" if direction in ("C", "CALL") else "PUT" if direction in ("P", "PUT") else direction
+        if direction_full not in ("CALL", "PUT"):
+            console.print(f"[yellow][VerticalSpread] enter_spread_paper_position: unknown direction {direction}, falling back[/yellow]")
+            return self.enter_paper_position(direction, signal)
+        
+        # Get option chain and index price
+        from strategies.options.spread_selector import select_vertical_spread, build_combo_legs
+        
+        index_price = self.market_data.get("MTX", {}).get("close", 0.0) or signal.get("price_mtx", 0)
+        if index_price <= 0:
+            console.print("[yellow][VerticalSpread] No index price available, falling back to single-leg[/yellow]")
+            return self.enter_paper_position(direction, signal)
+        
+        # Build market_data dict for all contracts we track
+        tx_code = self.active_contracts.get("MTX", None)
+        mtx_close = self.market_data.get("MTX", {}).get("close", index_price)
+        
+        option_chain = getattr(self, '_all_month_contracts', [])
+        if not option_chain:
+            console.print("[yellow][VerticalSpread] No option chain available, falling back to single-leg[/yellow]")
+            return self.enter_paper_position(direction, signal)
+        
+        spread, reason = select_vertical_spread(
+            direction=direction_full,
+            index_price=mtx_close,
+            option_chain=option_chain,
+            width=self._spread_width,
+        )
+        
+        if spread is None:
+            console.print(f"[yellow][VerticalSpread][SKIP] {reason} — falling back to single-leg[/yellow]")
+            return self.enter_paper_position(direction, signal)
+        
+        # Spread selected — record paper entry for both legs
+        console.print(f"[bold green][VerticalSpread][ALLOW] {spread.direction} spread: "
+                      f"Buy {spread.long_leg.strike}{spread.long_leg.option_type[0]} "
+                      f"Sell {spread.short_leg.strike}{spread.short_leg.option_type[0]} "
+                      f"net_debit={spread.net_debit:.1f} max_profit={spread.max_profit:.1f}[/bold green]")
+        
+        entry_lots = int(signal.get("entry_lots", self.base_lots)) if isinstance(signal, dict) else self.base_lots
+        if entry_lots <= 0:
+            return
+        
+        # Record entry in paper ledger as a combo-style entry
+        note = (f"VERTICAL_SPREAD {direction_full} "
+                f"Buy {spread.long_leg.strike}{spread.long_leg.option_type[0]}@{spread.long_mid:.1f} "
+                f"Sell {spread.short_leg.strike}{spread.short_leg.option_type[0]}@{spread.short_mid:.1f} "
+                f"net_debit={spread.net_debit:.1f}")
+        
+        paper_order = self._record_paper_order(
+            direction_full, "BUY", entry_lots, spread.net_debit,
+            note,
+            strategy_override="VERTICAL_SPREAD",
+        )
+        if self.order_mgr and paper_order is None:
+            return
+        
+        # Track position as spread (use direction as active_side, net_debit as entry_price)
+        self.position += entry_lots
+        self.active_side = direction_full
+        prev_cost = self.entry_price * (self.position - entry_lots) if self.position > entry_lots else 0
+        self.entry_price = (prev_cost + spread.net_debit * entry_lots) / self.position if self.position > 0 else spread.net_debit
+        self.entry_mtx_price = mtx_close
+        self.entry_time = signal.get("timestamp") or self._current_strategy_time()
+        self.has_tp1_hit = False
+        self.stop_loss_price = spread.net_debit * (1 - self.stop_loss_pct)
+        self.peak_premium = spread.net_debit
+        self.replay_stats["entries"] += 1
+        self._daily_entries = getattr(self, '_daily_entries', 0) + 1
+        
+        # Store spread metadata for exit decisions
+        self._current_spread = {
+            "long_strike": spread.long_leg.strike,
+            "short_strike": spread.short_leg.strike,
+            "option_type": spread.long_leg.option_type,
+            "net_debit": spread.net_debit,
+            "max_profit": spread.max_profit,
+            "max_risk": spread.max_risk,
+            "strike_width": spread.strike_width,
+            "expiration": spread.expiration,
+        }
+        
+        logger.info(
+            "[VerticalSpread] ENTRY %s qty=%d net_debit=%.1f max_profit=%.1f max_risk=%.1f",
+            direction_full, entry_lots, spread.net_debit, spread.max_profit, spread.max_risk
+        )
+
     def enter_paper_position(self, side, signal):
         signal_side = signal.get("side") if isinstance(signal, dict) else None
         if not signal_side or signal_side != side:
@@ -3395,6 +3496,145 @@ class ShioajiOptionsSmartMonitor:
         except Exception as e:
             console.print(f"[yellow]Order recovery from ledger failed: {e}[/yellow]")
 
+    # ── [Vertical Spread v1] Paper spread position management ──
+    def manage_spread_paper_position(self, signal, option_chain=None):
+        """
+        Manage an open vertical spread position in paper mode.
+        
+        Calculates current spread value from both legs, then checks:
+        - TAKE_PROFIT: spread value >= entry_debit + max_profit * 0.5
+        - STOP_LOSS: spread value <= entry_debit * 0.55
+        - TIME_STOP: held N bars with no progress
+        - EOD_EXIT: market close
+        
+        Returns True if position was closed.
+        """
+        if self.position <= 0 or self._current_spread is None:
+            return False
+
+        now = signal.get("timestamp") if signal else self._current_strategy_time()
+        sd = self._current_spread  # spread data
+        opt_type = sd["option_type"]  # "Call" or "Put"
+        
+        # ── 1. Get current quotes for both legs ──
+        option_chain = option_chain or getattr(self, '_all_month_contracts', [])
+        
+        from strategies.options.spread_selector import _contract_for_strike, _current_quote
+        
+        long_contract = _contract_for_strike(option_chain, sd["long_strike"], opt_type)
+        short_contract = _contract_for_strike(option_chain, sd["short_strike"], opt_type)
+        
+        if not long_contract or not short_contract:
+            return False
+        
+        # Build temporary market_data from current snapshots
+        md = {}
+        lc = getattr(long_contract, 'code', '')
+        sc = getattr(short_contract, 'code', '')
+        
+        # Check if we have real-time market_data for these contracts
+        if lc in self.market_data:
+            md[lc] = self.market_data[lc]
+        if sc in self.market_data:
+            md[sc] = self.market_data[sc]
+        
+        long_bid, long_ask, long_mid = _current_quote(long_contract, md)
+        short_bid, short_ask, short_mid = _current_quote(short_contract, md)
+        
+        if long_mid <= 0 or short_mid <= 0:
+            return False  # Wait for valid quotes
+        
+        # ── 2. Calculate spread value and PnL ──
+        # Spread value = what we'd get if we closed now
+        # Bull Call Spread: sell long leg (at bid), buy back short leg (at ask)
+        spread_value = long_bid - short_ask  # net credit to close
+        entry_debit = sd["net_debit"]
+        
+        pnl_pts = spread_value - entry_debit
+        pnl_pct = pnl_pts / entry_debit if entry_debit > 0 else 0
+        
+        # Holding duration (in 5-min bars)
+        holding_bars = getattr(self, '_spread_holding_bars', 0)
+        
+        # ── 3. Exit rule checks ──
+        
+        # 3a. TAKE_PROFIT: spread value reached 50% of max_profit
+        take_profit_target = entry_debit + sd["max_profit"] * 0.5
+        if spread_value >= take_profit_target:
+            console.print(f"[bold green][VerticalSpread] TAKE_PROFIT spread_value={spread_value:.1f} >= target={take_profit_target:.1f} "
+                          f"pnl={pnl_pts:.1f}pts ({pnl_pct*100:.1f}%)[/bold green]")
+            self._exit_spread_paper_position("PAPER_SPREAD_TP", spread_value, note=f"take_profit pnl={pnl_pts:.1f}")
+            return True
+        
+        # 3b. STOP_LOSS: loss exceeds 45% of entry_debit
+        stop_loss_target = entry_debit * 0.55  # lose 45%
+        if spread_value <= stop_loss_target:
+            console.print(f"[bold red][VerticalSpread] STOP_LOSS spread_value={spread_value:.1f} <= target={stop_loss_target:.1f} "
+                          f"pnl={pnl_pts:.1f}pts ({pnl_pct*100:.1f}%)[/bold red]")
+            self._exit_spread_paper_position("PAPER_SPREAD_SL", spread_value, note=f"stop_loss pnl={pnl_pts:.1f}")
+            return True
+        
+        # 3c. TIME_STOP: held 6+ bars with no progress
+        if holding_bars >= 6 and pnl_pts <= 0:
+            console.print(f"[bold yellow][VerticalSpread] TIME_STOP held {holding_bars} bars, pnl={pnl_pts:.1f}pts[/bold yellow]")
+            self._exit_spread_paper_position("PAPER_SPREAD_TIME", spread_value, note=f"time_stop bars={holding_bars}")
+            return True
+        
+        # 3d. EOD_EXIT: market closing panic
+        if hasattr(self, 'm_cfg') and self.m_cfg.get('force_close_at_end', False):
+            eod_state = self._get_eod_state(now)
+            if eod_state["is_panic"]:
+                console.print(f"[bold yellow][VerticalSpread] EOD_PANIC exit spread_value={spread_value:.1f}[/bold yellow]")
+                self._exit_spread_paper_position("PAPER_SPREAD_EOD", spread_value, note=f"eod_panic pnl={pnl_pts:.1f}")
+                return True
+        
+        # ── 4. Update holding bars ──
+        self._spread_holding_bars = holding_bars + 1
+        
+        return False
+
+    def _exit_spread_paper_position(self, action, exit_value, note=""):
+        """
+        Close a spread position in paper mode.
+        Records exit for both legs and clears spread state.
+        """
+        if self.position <= 0:
+            return
+        
+        qty = self.position
+        sd = self._current_spread
+        
+        # Record single paper order (net exit value) with spread context
+        self._record_paper_order(
+            sd["option_type"], "SELL", qty, exit_value,
+            f"{action} {note}",
+            strategy_override="VERTICAL_SPREAD",
+        )
+        
+        # Compute PnL
+        pnl_cash = (exit_value - sd["net_debit"]) * 50  # TXO multiplier
+        logger.info("[VerticalSpread] EXIT %s qty=%d entry=%.1f exit=%.1f pnl=%.1f",
+                     action, qty, sd["net_debit"], exit_value, pnl_cash)
+        
+        # Log trade
+        if hasattr(self, 'log_trade'):
+            self.log_trade(
+                "VERTICAL_SPREAD", self.active_side or "CALL",
+                sd["net_debit"], exit_value, qty, note,
+            )
+        
+        # Clear position state
+        self.position = 0
+        self.active_side = None
+        self._current_spread = None
+        self._spread_holding_bars = 0
+        self.entry_price = 0.0
+        self.entry_mtx_price = 0.0
+        self.entry_time = None
+        self.has_tp1_hit = False
+        self.stop_loss_price = 0.0
+        self.peak_premium = 0.0
+
     def manage_open_position(self, signal):
         if self.position <= 0 or not self.active_side:
             return False
@@ -3615,7 +3855,12 @@ class ShioajiOptionsSmartMonitor:
                     cur_bid = cur_p - 1
                     cur_ask = cur_p + 1
 
-                if self.manage_open_position(signal):
+                # ── [Vertical Spread v1] Spread position management ──
+                if self._enable_vertical_spread and self._current_spread is not None:
+                    if self.manage_spread_paper_position(signal, option_chain=option_chain):
+                        self.print_status_summary(signal, force=True)
+                        return
+                elif self.manage_open_position(signal):
                     self.print_status_summary(signal, force=True)
                     return
                 
@@ -3851,7 +4096,10 @@ class ShioajiOptionsSmartMonitor:
                     else:
                         # Track: did paper entry succeed or fail?
                         before_pos = self.position
-                        self.enter_paper_position(sig_side, signal)
+                        if self._enable_vertical_spread:
+                            self.enter_spread_paper_position(sig_side, signal)
+                        else:
+                            self.enter_paper_position(sig_side, signal)
                         if self.position == before_pos:
                             self.replay_stats["blocked_entries"] += 1
 

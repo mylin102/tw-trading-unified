@@ -16,6 +16,19 @@ from typing import Dict
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+# ── [BOOT_FINGERPRINT] Unambiguous identity marker ──
+import core.futures_strategy_router as _boot_fsr
+print(
+    f"[BOOT_FINGERPRINT] pid={os.getpid()} "
+    f"python={sys.executable} "
+    f"cwd={os.getcwd()} "
+    f"router_file={_boot_fsr.__file__} "
+    f"router_mtime={os.path.getmtime(_boot_fsr.__file__):.0f} "
+    f"has_evaluate_theta={hasattr(_boot_fsr, '_evaluate_theta_environment')} "
+    f"has_no_data={hasattr(_boot_fsr, 'route_futures_signal') and 'NO_DATA' in open(_boot_fsr.__file__).read()}",
+    flush=True,
+)
+
 from rich.console import Console
 from core.date_utils import is_taifex_futures_market_open
 from core.shioaji_session import get_api, logout

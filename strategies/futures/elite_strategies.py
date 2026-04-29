@@ -20,6 +20,20 @@ import pandas as pd
 import math
 
 
+def _skip(reason: str):
+    """Return a sentinel dict with _skip_reason for router debugging."""
+    # Use a dict-like object that is falsy (None) but carries metadata
+    # Actually, return None but the function sets a module-level attr
+    # Simplest approach: return a special Marker object
+    class _SkipMarker(dict):
+        _skip_reason = reason
+        def __init__(self):
+            super().__init__()
+        def __bool__(self):
+            return False
+    return _SkipMarker()
+
+
 def is_spring_long_context_favorable(bar, score=None):
     """Conservatively allow SPRING longs only in supportive bullish context."""
     resolved_score = bar.get("score", score if score is not None else 0)
@@ -61,7 +75,7 @@ def strategy_counter_vwap(state, cfg):
     """
     counter = cfg.get("strategy", {}).get("counter_mode", {})
     if not counter.get("enabled", False):
-        return None
+        return _skip("COUNTER_MODE_DISABLED")
     
     confirm_bars = counter.get("confirm_bars", 5)
     atr_sl_mult = counter.get("atr_sl_mult", 2.0)
@@ -70,7 +84,7 @@ def strategy_counter_vwap(state, cfg):
     df_5m = state.get("df_5m")
     
     if df_5m is None or len(df_5m) < confirm_bars + 5:
-        return None
+        return _skip(f"INSUFFICIENT_BARS need={confirm_bars + 5} got={len(df_5m) if df_5m is not None else 0}")
     
     # Get squeeze fire state from monitor (tracked in _detect_squeeze_failure)
     fired = last_5m.get("fired", False)
@@ -80,7 +94,7 @@ def strategy_counter_vwap(state, cfg):
     atr = last_5m.get("atr", 0)
     
     if vwap <= 0:
-        return None
+        return _skip("VWAP_ZERO")
     
     # Track fire state (same logic as _detect_squeeze_failure in monitor)
     # This state should be maintained by the monitor's _fire_pending_* variables
@@ -96,10 +110,10 @@ def strategy_counter_vwap(state, cfg):
         fire_bar_idx = bar_counter
         fire_high = close
         fire_low = close
-        return None
+        return _skip(f"FIRE_DETECTED dir={fire_pending_dir} — waiting for confirmation")
     
     if fire_pending_dir == 0:
-        return None
+        return _skip("NO_FIRE_EVENT")
     
     bars_since = bar_counter - fire_bar_idx
     fire_high = max(fire_high, close)
@@ -107,10 +121,10 @@ def strategy_counter_vwap(state, cfg):
     
     # Expire if too many bars
     if bars_since > confirm_bars:
-        return None
+        return _skip(f"FIRE_EXPIRED bars_since={bars_since} > confirm={confirm_bars}")
     
     if bars_since < 1:
-        return None
+        return _skip(f"WAIT_CONFIRM bars_since={bars_since} < 1")
     
     # Failure validation
     recent_high = last_5m.get("recent_high", close)

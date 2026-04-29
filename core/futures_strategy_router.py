@@ -211,27 +211,58 @@ def route_futures_signal(
     - returns one validated signal from the first allowed strategy, or
     - returns an explicit no-trade / blocked decision with reasons.
     """
+    print("[ROUTE_FINGERPRINT] route_futures_signal ENTERED", flush=True)
 
     cfg = router_config or FuturesRouterConfig()
     notes: list[str] = []
     working_orders = list(current_working_orders or [])
-    
+
     # Extract timestamp and symbol for attribution logging
     timestamp = context.market.timestamp
     symbol = context.market.last_bar.get("symbol", "TX") if context.market.last_bar else "TX"
 
-    # Init theta gate vars before any early return
-    theta_allowed, theta_block_reason = False, "POSITION_OPEN"
+    # ── [ThetaGate] Evaluate theta BEFORE any strategy-specific gate ──
+    # Theta permission is a regime-level decision, not a spread/futures decision.
+    # Must be available on every return so OptionsMonitor never falls into bootstrap.
+    _theta_allowed, _theta_block_reason = False, "NO_BAR_DATA"
+    if context.market.last_bar is not None and regime_result.regime not in ("NO_DATA", "UNKNOWN"):
+        try:
+            _theta_allowed, _theta_block_reason = _evaluate_theta_environment(regime_result, context, cfg)
+        except Exception as _e:
+            _theta_block_reason = f"THETA_EVAL_ERROR:{_e}"
+    print(f"[ThetaGate] theta={'ALLOW' if _theta_allowed else 'BLOCK'} reason={_theta_block_reason or 'OK'} regime={regime_result.regime}", flush=True)
+    notes.append(f"theta={'ALLOW' if _theta_allowed else 'BLOCK'}:reason={_theta_block_reason or 'OK'}")
+
+    # ── [NO_DATA] Gate: bar is None or regime can't be determined ──
+    bar = context.market.last_bar
+    if bar is None or regime_result.regime in ("NO_DATA", "UNKNOWN"):
+        _ts = context.market.timestamp or "?"
+        print(f"[Router] NO_DATA mode — bar={bar is not None} regime={regime_result.regime} ts={_ts}", flush=True)
+        return FuturesRouterDecision(
+            action="HOLD",
+            reason=f"NO_DATA regime={regime_result.regime}",
+            regime=regime_result.regime,
+            bias="",
+            candidates=[],
+            notes=notes,
+            theta_allowed=_theta_allowed,
+            theta_block_reason=_theta_block_reason,
+        )
+
+    # ── Position gate ──
 
     if context.position.size != 0:
+        print(f"[Router][EARLY_RETURN] reason=POSITION_OPEN size={context.position.size} "
+              f"entry_price={context.position.entry_price} "
+              f"bar_ts={context.market.last_bar.get('timestamp','?') if context.market.last_bar else 'None'}", flush=True)
         return FuturesRouterDecision(
             action="BLOCKED",
             reason=f"position already open ({context.position.size})",
             regime=regime_result.regime,
             bias=regime_result.bias,
             notes=["router only emits fresh entry decisions while flat"],
-            theta_allowed=theta_allowed,
-            theta_block_reason=theta_block_reason,
+            theta_allowed=_theta_allowed,
+            theta_block_reason=_theta_block_reason,
         )
 
     # ── [V-Model] Spread Staleness Gate + Bias Modifier ──
@@ -293,8 +324,8 @@ def route_futures_signal(
                         regime=regime_result.regime, bias=regime_result.bias,
                         candidates=[],
                         notes=[f"spread STALE: age={spread_age}m — {stale_action}"],
-                        theta_allowed=theta_allowed,
-                        theta_block_reason=theta_block_reason,
+                        theta_allowed=_theta_allowed,
+                        theta_block_reason=_theta_block_reason,
                     )
                 notes.append(f"spread_quality=STALE age={spread_age}m (degraded_mode)")
             elif spread_quality == "DEGRADED":
@@ -353,8 +384,8 @@ def route_futures_signal(
             bias=regime_result.bias,
             candidates=[],
             notes=notes,
-            theta_allowed=theta_allowed,
-            theta_block_reason=theta_block_reason,
+            theta_allowed=_theta_allowed,
+            theta_block_reason=_theta_block_reason,
         )
 
     if not candidates:
@@ -378,8 +409,8 @@ def route_futures_signal(
             bias=regime_result.bias,
             candidates=[],
             notes=notes,
-            theta_allowed=theta_allowed,
-            theta_block_reason=theta_block_reason,
+            theta_allowed=_theta_allowed,
+            theta_block_reason=_theta_block_reason,
         )
 
     # [BearRoute] Log bear routing context
@@ -457,7 +488,9 @@ def route_futures_signal(
 
         if signal is None:
             notes.append(f"{name}: no signal")
-            # Log no signal
+            # Log no signal with strategy-specific reason
+            strategy_reason = getattr(signal, '_skip_reason', 'no_signal')
+            print(f"[Router][{name}] no signal — {strategy_reason}", flush=True)
             log_router_event(
                 recorder=recorder,
                 timestamp=timestamp,
@@ -469,6 +502,25 @@ def route_futures_signal(
                 evaluated=True,
                 winner=False,
                 note="strategy returned None",
+            )
+            continue
+        
+        # ── Handle _SkipMarker: falsy sentinel with _skip_reason ──
+        skip_reason = getattr(signal, '_skip_reason', None)
+        if skip_reason is not None:
+            notes.append(f"{name}: skip — {skip_reason}")
+            print(f"[Router][{name}] skip — {skip_reason}", flush=True)
+            log_router_event(
+                recorder=recorder,
+                timestamp=timestamp,
+                symbol=symbol,
+                regime=regime_result.regime,
+                strategy_name=name,
+                candidate_order=i,
+                status="skipped",
+                evaluated=True,
+                winner=False,
+                note=skip_reason,
             )
             continue
 
@@ -547,8 +599,8 @@ def route_futures_signal(
                 signal=signal,
                 candidates=candidates,
                 notes=[*notes, "exit/partial-exit order still resolving"],
-                theta_allowed=theta_allowed,
-                theta_block_reason=theta_block_reason,
+                theta_allowed=_theta_allowed,
+                theta_block_reason=_theta_block_reason,
             )
 
         if working_orders:
@@ -564,8 +616,8 @@ def route_futures_signal(
                 signal=signal,
                 candidates=candidates,
                 notes=[*notes, reason],
-                theta_allowed=theta_allowed,
-                theta_block_reason=theta_block_reason,
+                theta_allowed=_theta_allowed,
+                theta_block_reason=_theta_block_reason,
             )
 
         return FuturesRouterDecision(
@@ -577,8 +629,8 @@ def route_futures_signal(
             signal=signal,
             candidates=candidates,
             notes=notes,
-            theta_allowed=theta_allowed,
-            theta_block_reason=theta_block_reason,
+            theta_allowed=_theta_allowed,
+            theta_block_reason=_theta_block_reason,
         )
 
     # If we get here, no candidate produced a valid signal
@@ -603,6 +655,6 @@ def route_futures_signal(
         bias=regime_result.bias,
         candidates=candidates,
         notes=notes,
-        theta_allowed=theta_allowed,
-        theta_block_reason=theta_block_reason,
+        theta_allowed=_theta_allowed,
+        theta_block_reason=_theta_block_reason,
     )

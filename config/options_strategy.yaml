@@ -117,3 +117,10 @@ theta_gang:
   max_bar_price_deviation_pts: 250
   exit_on_theta: true
   stop_loss_pct: 0.05
+# ── [Vertical Spread v1] Convert single-leg CALL/PUT to debit vertical spreads ──
+#   enabled: true  → enter_spread_paper_position() is used instead of enter_paper_position()
+#   enabled: false → fallback to original single-leg entry
+#   width: strike width in points (50 or 100)
+vertical_spread:
+  enabled: true
+  width: 100
