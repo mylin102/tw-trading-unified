@@ -2753,6 +2753,9 @@ class FuturesMonitor:
         """
         if self.dry_run or not self.api or not self.contract:
             return None
+        # [Fix] Sync ingestion contract reference — resolved after __init__
+        if self._ingestion._contract is None and self.contract is not None:
+            self._ingestion._contract = self.contract
         return self._ingestion.fetch_backfill()
 
     def _fetch_today_kbars(self):
