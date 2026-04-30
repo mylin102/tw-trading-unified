@@ -3104,13 +3104,13 @@ with tab_stocks:
                 }
                 order_type_display = order_type_map.get(order_type, order_type)
                 
-                # Calculate unrealized PnL for open orders
+                # Calculate unrealized PnL for open positions (FILLED BUY with no SELL)
                 unrealized = 0.0
-                if status == "OPEN" and ticker in live_prices:
+                if ticker in live_prices:
                     current_price = live_prices[ticker]
-                    if side == "BUY":
+                    if side == "BUY" and status in ("FILLED", "OPEN"):
                         unrealized = (current_price - price) * qty
-                    elif side == "SELL":
+                    elif side == "SELL" and status in ("FILLED", "OPEN"):
                         unrealized = (price - current_price) * qty
                 
                 order_rows.append({
