@@ -116,6 +116,9 @@ def check_bar_freshness():
 
         import pandas as pd
         tday = df["trading_day"].iloc[-1]
+        # Use timestamp-based trading day, not row-based — last CSV row may be old
+        latest_ts = df["timestamp"].max()
+        tday = df[df["timestamp"] == latest_ts]["trading_day"].iloc[0]
         df_tday = df[df["trading_day"] == tday]
         if df_tday.empty:
             fail(f"No bars for trading day {tday}")
