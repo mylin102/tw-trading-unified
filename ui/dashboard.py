@@ -260,6 +260,26 @@ with st.sidebar:
     if st.button("🔄 強制刷新頁面"):
         st.rerun()
 
+    # ── Stock data freshness ──
+    try:
+        import glob
+        from pathlib import Path
+        stock_5m = sorted(Path("data/taifex_raw").glob("STOCK_*_5m.csv"))
+        stock_1d = sorted(Path("data/taifex_raw").glob("STOCK_*_1d.csv"))
+        if stock_5m:
+            # Use file mtime as proxy (fast, no CSV parse)
+            newest = max(stock_5m, key=lambda f: f.stat().st_mtime)
+            age_min = (datetime.datetime.now() - datetime.datetime.fromtimestamp(newest.stat().st_mtime)).total_seconds() / 60
+            ticker = newest.stem.split("_")[-2]
+            age_str = f"{age_min:.0f}分" if age_min < 120 else f"{age_min/60:.0f}小時" if age_min < 2880 else f"{age_min/1440:.0f}天"
+            st.markdown(f"📦 **台股數據**: {len(stock_5m)}檔 5m | 最新: {ticker} ({age_str}前)")
+        else:
+            st.markdown("📦 **台股數據**: 無 5m 資料")
+        if stock_1d:
+            st.markdown(f"📅 **日線**: {len(stock_1d)}檔")
+    except Exception:
+        pass
+
     if st.button("🔍 系統健康診斷"):
         import subprocess
         result = subprocess.run(
