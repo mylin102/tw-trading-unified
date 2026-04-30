@@ -272,6 +272,22 @@ with st.sidebar:
         if result.returncode != 0:
             st.warning(f"診斷腳本回傳碼: {result.returncode}")
 
+    if st.button("📊 更新價差資料 (Spread)"):
+        import subprocess
+        with st.spinner("正在擷取近月/遠月價差資料..."):
+            result = subprocess.run(
+                ["python3", "scripts/fetch_calendar_spread_data.py"],
+                capture_output=True, text=True, timeout=180,
+            )
+        output = result.stdout + result.stderr
+        st.markdown("### 📊 價差更新結果")
+        st.code(output[-2000:] if len(output) > 2000 else output, language="text")
+        if result.returncode == 0:
+            st.success("✅ 價差資料更新完成")
+            st.rerun()
+        else:
+            st.error(f"❌ 更新失敗（回傳碼: {result.returncode}）")
+
 # ── YAML helpers ──
 def load_yaml(path):
     if path.exists():
