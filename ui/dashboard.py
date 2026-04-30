@@ -277,6 +277,21 @@ with st.sidebar:
             st.markdown("📦 **台股數據**: 無 5m 資料")
         if stock_1d:
             st.markdown(f"📅 **日線**: {len(stock_1d)}檔")
+        if st.button("📥 更新台股數據"):
+            import subprocess
+            with st.spinner("正在下載 watchlist K 線數據（約 2-3 分鐘）..."):
+                result = subprocess.run(
+                    ["python3", "-m", "strategies.stocks.downloader"],
+                    capture_output=True, text=True, timeout=300,
+                )
+            output = result.stdout + result.stderr
+            st.markdown("### 📥 更新結果")
+            st.code(output[-2000:] if len(output) > 2000 else output, language="text")
+            if result.returncode == 0:
+                st.success("✅ 台股數據更新完成")
+                st.rerun()
+            else:
+                st.error(f"❌ 更新失敗（回傳碼: {result.returncode}）")
     except Exception:
         pass
 
