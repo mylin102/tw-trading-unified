@@ -260,6 +260,18 @@ with st.sidebar:
     if st.button("🔄 強制刷新頁面"):
         st.rerun()
 
+    if st.button("🔍 系統健康診斷"):
+        import subprocess
+        result = subprocess.run(
+            ["python3", "scripts/diagnose.py"],
+            capture_output=True, text=True, timeout=30,
+        )
+        output = result.stdout + result.stderr
+        st.markdown("### 🔍 診斷結果")
+        st.code(output, language="text")
+        if result.returncode != 0:
+            st.warning(f"診斷腳本回傳碼: {result.returncode}")
+
 # ── YAML helpers ──
 def load_yaml(path):
     if path.exists():
