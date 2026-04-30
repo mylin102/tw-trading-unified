@@ -29,6 +29,13 @@ def sync():
             console.print(f"[yellow]⚠️ Using degraded feature snapshot: {snapshot.get('degraded_reason', '')}[/yellow]")
         console.print(f"[green]✅ 成功取得 {len(new_tickers)} 檔股票。[/green]")
 
+        # ── Trim to max_watchlist_size ──
+        cfg_stocks = cfg.get("stocks", {}) or {}
+        max_size = int(cfg_stocks.get("max_watchlist_size", 20))
+        if len(new_tickers) > max_size:
+            console.print(f"[dim]🔽 外部名單 {len(new_tickers)} 檔，限制至 top {max_size}[/dim]")
+            new_tickers = new_tickers[:max_size]
+
     except Exception as e:
         console.print(f"[red]❌ 抓取外部資料失敗: {e}[/red]")
         return

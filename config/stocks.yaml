@@ -1,4 +1,4 @@
-live_trading: true
+live_trading: false
 stocks:
   watchlist:
   - '0050'
@@ -212,13 +212,14 @@ stocks:
   - '6770'
   - '6805'
   - '8069'
-  strategy: scout_strategy
-  total_portfolio_budget: 200000
+  strategy: mean_reversion
+  total_portfolio_budget: 300000
   capital_per_trade: 100000
   entry_score: 15
+  max_watchlist_size: 20
   atr_mult: 1.8
   stop_loss_pct: 0.05
-  take_profit_pct: 0.15
+  take_profit_pct: 0.125
   trailing_stop_pct: 0.02
   bear_defense:
     bear_max_positions: 1
