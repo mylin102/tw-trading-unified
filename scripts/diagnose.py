@@ -9,7 +9,12 @@ Output:
     Traffic-light status (✅/⚠️/❌) for each subsystem.
     Single actionable conclusion at the end.
 """
-import json, os, sys, time
+import json
+import os
+import sys
+import time
+import subprocess
+import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -19,177 +24,258 @@ ROUTER_TRACE = ROOT / "logs" / "router_trace"
 
 os.chdir(ROOT)
 
+# ── Thresholds (tunable) ──
+BAR_FRESH_OK_SEC = 300
+BAR_FRESH_WARN_SEC = 600
+TICK_FRESH_OK_SEC = 120
 
-def heading(title):
-    print(f"\n{'=' * 50}")
+
+def heading(title: str):
+    print(f"\n{'=' * 56}")
     print(f"  {title}")
-    print(f"{'=' * 50}")
+    print(f"{'=' * 56}")
 
 
-def ok(msg):
+def ok(msg: str):
     print(f"  ✅ {msg}")
 
 
-def warn(msg):
+def warn(msg: str):
     print(f"  ⚠️  {msg}")
 
 
-def fail(msg):
+def fail(msg: str):
     print(f"  ❌ {msg}")
 
 
-# ── 1. PM2 Status ──
-heading("1. PM2 Process Status")
-import subprocess
-result = subprocess.run(["pm2", "status"], capture_output=True, text=True, timeout=10)
-for line in result.stdout.split("\n"):
-    if "trading-system" in line:
-        parts = [p.strip() for p in line.split("│")]
-        if len(parts) >= 9:
-            pid = parts[5]
-            uptime = parts[6]
-            restarts = parts[7]
-            status = parts[8]
-            mem = parts[10]
-            if status == "online":
-                ok(f"trading-system  pid={pid}  uptime={uptime}  restarts={restarts}  mem={mem}")
-            else:
-                fail(f"trading-system  status={status}  restarts={restarts}")
-    if "stock-monitor" in line:
-        parts = [p.strip() for p in line.split("│")]
-        if len(parts) >= 9:
-            uptime = parts[6]
-            restarts = parts[7]
-            ok(f"stock-monitor    uptime={uptime}  restarts={restarts}")
+def safe_read_csv(path: Path, **kwargs):
+    """Read CSV with error handling. Returns (df, error_str)."""
+    try:
+        if not path.exists():
+            return None, f"File not found: {path.name}"
+        import pandas as pd
+        df = pd.read_csv(path, **kwargs)
+        return df, None
+    except Exception as e:
+        return None, f"Read failed: {e}"
 
-# ── 2. Bar Freshness ──
-heading("2. MXF Bar Freshness")
-indicator_files = sorted(MARKET_DATA.glob("MXF_2026*_PAPER_indicators.csv"))
-if not indicator_files:
-    fail("No MXF indicator CSV found")
-else:
-    import pandas as pd
-    latest_file = indicator_files[-1]
-    df = pd.read_csv(latest_file, parse_dates=["timestamp"])
-    # Filter to the latest trading day only
-    latest_tday = df["trading_day"].iloc[-1]
-    df_tday = df[df["trading_day"] == latest_tday]
-    if df_tday.empty:
-        fail(f"No bars for trading day {latest_tday}")
-    else:
+
+# ═══════════════════════════════════════════
+#  Checks
+# ═══════════════════════════════════════════
+
+def check_pm2():
+    heading("1. PM2 Process Status")
+    try:
+        result = subprocess.run(["pm2", "status"], capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            fail(f"pm2 status returned code {result.returncode}")
+            return
+        for line in result.stdout.splitlines():
+            if "trading-system" in line:
+                parts = [p.strip() for p in line.split("│")]
+                if len(parts) >= 11:
+                    status = parts[8]
+                    pid = parts[5]
+                    uptime = parts[6]
+                    restarts = parts[7]
+                    mem = parts[10]
+                    if status == "online":
+                        ok(f"trading-system  pid={pid}  uptime={uptime}  restarts={restarts}  mem={mem}")
+                    else:
+                        fail(f"trading-system  status={status}  restarts={restarts}")
+            elif "stock-monitor" in line:
+                parts = [p.strip() for p in line.split("│")]
+                if len(parts) >= 11:
+                    status = parts[8]
+                    uptime = parts[6]
+                    restarts = parts[7]
+                    if status == "online":
+                        ok(f"stock-monitor    uptime={uptime}  restarts={restarts}")
+    except subprocess.TimeoutExpired:
+        fail("pm2 status timed out")
+    except FileNotFoundError:
+        fail("pm2 not installed or not in PATH")
+    except Exception as e:
+        fail(f"PM2 check error: {e}")
+
+
+def check_bar_freshness():
+    """Returns bar_age_sec or None on failure."""
+    heading("2. MXF Bar Freshness")
+    try:
+        files = sorted(MARKET_DATA.glob("MXF_2026*_PAPER_indicators.csv"))
+        if not files:
+            fail("No MXF indicator CSV found")
+            return None
+
+        df, err = safe_read_csv(files[-1], parse_dates=["timestamp"])
+        if err:
+            fail(err)
+            return None
+
+        import pandas as pd
+        tday = df["trading_day"].iloc[-1]
+        df_tday = df[df["trading_day"] == tday]
+        if df_tday.empty:
+            fail(f"No bars for trading day {tday}")
+            return None
+
         latest_ts = df_tday["timestamp"].max()
         now = pd.Timestamp.now(tz="Asia/Taipei")
-        latest_ts_pd = pd.Timestamp(latest_ts).tz_localize("Asia/Taipei") if pd.Timestamp(latest_ts).tz is None else pd.Timestamp(latest_ts)
-        bar_age_sec = (now - latest_ts_pd).total_seconds()
-        bars_today = len(df_tday)
-        last_close = df_tday.iloc[-1]["close"]
+        ts_pd = pd.Timestamp(latest_ts)
+        if ts_pd.tz is None:
+            ts_pd = ts_pd.tz_localize("Asia/Taipei")
+        age = (now - ts_pd).total_seconds()
+        nbars = len(df_tday)
+        close = df_tday.iloc[-1]["close"]
 
-        if bar_age_sec < 300:
-            ok(f"tday={latest_tday}  bars={bars_today}  latest={latest_ts}  ({bar_age_sec:.0f}s ago)  close={last_close:.0f}")
-        elif bar_age_sec < 600:
-            warn(f"tday={latest_tday}  bars={bars_today}  latest={latest_ts}  ({bar_age_sec:.0f}s ago)  close={last_close:.0f}  — slightly stale")
+        msg = f"tday={tday}  bars={nbars}  latest={latest_ts}  ({age:.0f}s ago)  close={close:.0f}"
+        if age < BAR_FRESH_OK_SEC:
+            ok(msg)
+        elif age < BAR_FRESH_WARN_SEC:
+            warn(f"{msg}  — slightly stale")
         else:
-            fail(f"tday={latest_tday}  bars={bars_today}  latest={latest_ts}  ({bar_age_sec:.0f}s ago)  close={last_close:.0f}  — STALE > 10min")
+            fail(f"{msg}  — STALE > {BAR_FRESH_WARN_SEC // 60}min")
+        return age
+    except Exception as e:
+        fail(f"Bar freshness check error: {e}")
+        return None
 
-# ── 3. Raw Tick Freshness ──
-heading("3. Raw Tick Feed")
-tick_files = sorted(RAW_TICKS.glob("MXFE6_2026*_ticks.csv"))
-if tick_files:
-    latest_tick_file = tick_files[-1]
-    df_ticks = pd.read_csv(latest_tick_file)
-    if not df_ticks.empty:
-        latest_epoch = df_ticks["ts_int"].iloc[-1]
-        tick_age = time.time() - latest_epoch
-        tick_count = len(df_ticks)
-        if tick_age < 120:
-            ok(f"MXFE6  {tick_count} ticks today  last={(time.time() - latest_epoch):.0f}s ago")
+
+def check_raw_ticks():
+    """Returns tick_age_sec or None."""
+    heading("3. Raw Tick Feed")
+    try:
+        files = sorted(RAW_TICKS.glob("MXFE6_2026*_ticks.csv"))
+        if not files:
+            warn("No MXFE6 tick CSV for today")
+            return None
+
+        df, err = safe_read_csv(files[-1])
+        if err:
+            fail(err)
+            return None
+        if df.empty:
+            fail("MXFE6 tick CSV is empty")
+            return None
+
+        n = len(df)
+        last_epoch = df["ts_int"].iloc[-1]
+        age = time.time() - last_epoch
+
+        if age < TICK_FRESH_OK_SEC:
+            ok(f"MXFE6  {n} ticks today  last={age:.0f}s ago")
         else:
-            warn(f"MXFE6  {tick_count} ticks today  last={(time.time() - latest_epoch):.0f}s ago  — ticks stale")
-    else:
-        fail("MXFE6 tick CSV is empty")
-else:
-    warn("No MXFE6 tick CSV for today")
+            warn(f"MXFE6  {n} ticks today  last={age:.0f}s ago  — stale")
+        return age
+    except Exception as e:
+        fail(f"Tick check error: {e}")
+        return None
 
-# ── 4. Router Trace ──
-heading("4. Router Trace (last 5 entries)")
-trace_files = sorted(ROUTER_TRACE.glob("router_trace_*.jsonl"), reverse=True)
-if trace_files:
-    trace_path = trace_files[0]
-    lines = trace_path.read_text().strip().split("\n")
-    # Parse last 5 traces
-    last_traces = []
-    for line in lines[-5:]:
-        try:
-            t = json.loads(line)
-            last_traces.append(t)
-        except json.JSONDecodeError:
-            continue
-    if last_traces:
-        for t in last_traces[-5:]:
-            ts = t.get("ts", "?")[-19:-3]  # trim to HH:MM:SS
+
+def check_router_trace():
+    heading("4. Router Trace (last 5 entries)")
+    try:
+        files = sorted(ROUTER_TRACE.glob("router_trace_*.jsonl"), reverse=True)
+        if not files:
+            warn("No router trace files found")
+            return
+
+        lines = files[0].read_text().strip().split("\n")
+        traces = []
+        for line in lines[-5:]:
+            try:
+                traces.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+        if not traces:
+            warn("Router trace file has no parseable entries")
+            return
+
+        for t in traces[-5:]:
+            ts = str(t.get("ts", "?"))
+            if len(ts) >= 19:
+                ts = ts[-19:-3]  # trim to HH:MM:SS
             regime = t.get("regime", "?")
             selected = t.get("selected")
-            strategies = []
-            for s in t.get("strategies", []):
-                if s.get("triggered"):
-                    strategies.append(f"{s['name']}=✅TRADE")
-                else:
-                    reason = s.get("skip_reason", "?")
-                    strategies.append(f"{s['name']}=⛔{reason}")
             sel_str = f"selected={selected}" if selected else "selected=None"
             print(f"  [{ts}]  regime={regime}  {sel_str}")
-            for st in strategies:
-                print(f"          {st}")
+            for s in t.get("strategies", []):
+                if s.get("triggered"):
+                    print(f"          {s['name']}=✅TRADE")
+                else:
+                    reason = s.get("skip_reason", "?")
+                    print(f"          {s['name']}=⛔{reason}")
+    except Exception as e:
+        fail(f"Router trace error: {e}")
+
+
+def check_recent_errors():
+    heading("5. Recent Errors (last 50 lines)")
+    try:
+        log = Path(os.path.expanduser("~/.pm2/logs/trading-system-out.log"))
+        if not log.exists():
+            fail("PM2 out log not found")
+            return
+
+        result = subprocess.run(["tail", "-50", str(log)], capture_output=True, text=True, timeout=5)
+        keywords = ["error", "traceback", "exception", "reset by peer", "unreachable",
+                     "stale", "stagnant", "oom", "killed"]
+        errors = [l for l in result.stdout.splitlines()
+                  if any(kw in l.lower() for kw in keywords)]
+        if errors:
+            for e in errors[-5:]:
+                print(f"  {e.strip()[:120]}")
+        else:
+            ok("No notable errors in last 50 lines")
+    except subprocess.TimeoutExpired:
+        fail("tail timed out")
+    except Exception as e:
+        fail(f"Error check error: {e}")
+
+
+# ═══════════════════════════════════════════
+#  Main
+# ═══════════════════════════════════════════
+
+def main():
+    heading("Trading System Health Check")
+    print(f"  Run at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    bar_age = None
+    tick_age = None
+
+    try:
+        check_pm2()
+        bar_age = check_bar_freshness()
+        tick_age = check_raw_ticks()
+        check_router_trace()
+        check_recent_errors()
+    except KeyboardInterrupt:
+        print("\n  ⚠️  Interrupted by user.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n  ❌ Unexpected error: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    # ── Conclusion ──
+    heading("Conclusion")
+    if bar_age is None:
+        print("  ❌  No bar data. System may have just started or data pipeline is down.")
+    elif bar_age < BAR_FRESH_OK_SEC:
+        print(f"  ✅  System HEALTHY. Bars fresh ({bar_age:.0f}s), ticks flowing.")
+    elif bar_age < BAR_FRESH_WARN_SEC:
+        print(f"  ⚠️  Bars slightly stale ({bar_age:.0f}s). Likely VPN reconnect — wait for next 5m boundary.")
+    elif tick_age is not None and tick_age < TICK_FRESH_OK_SEC:
+        print(f"  ⚠️  Bars stale ({bar_age:.0f}s) but ticks flowing → bar builder not accumulating.")
+        print("       Check: _strategy_tick running? _tick_bars_deque receiving bars?")
     else:
-        warn("Router trace file has content but no parseable entries")
-else:
-    warn("No router trace files found (monitor may not have run with Phase 5 code yet)")
+        print(f"  ❌  DATA STAGNANT. Bars {bar_age:.0f}s old, ticks not flowing.")
+        print("       Check: VPN → Shioaji subscription → PM2 processes.")
 
-# ── 5. Log Errors (last 24h) ──
-heading("5. Recent Errors (last 50 lines)")
-pm2_log = Path(os.path.expanduser("~/.pm2/logs/trading-system-out.log"))
-if pm2_log.exists():
-    # Read last 50 lines and look for obvious errors
-    result = subprocess.run(
-        ["tail", "-50", str(pm2_log)],
-        capture_output=True, text=True, timeout=5
-    )
-    lines = result.stdout.split("\n")
-    errors = [l for l in lines if any(kw in l.lower() for kw in ["error", "traceback", "exception", "reset by peer", "unreachable", "stale", "stagnant", "oom", "killed"])]
-    if errors:
-        for e in errors[-5:]:
-            print(f"  {e.strip()[:120]}")
-    else:
-        ok("No notable errors in last 50 lines")
-else:
-    fail("PM2 out log not found")
 
-# ── 6. Conclusion ──
-heading("Conclusion")
-bar_age_result = None
-if indicator_files:
-    df = pd.read_csv(indicator_files[-1], parse_dates=["timestamp"])
-    df_tday = df[df["trading_day"] == df["trading_day"].iloc[-1]]
-    if not df_tday.empty:
-        latest_ts = df_tday["timestamp"].max()
-        bar_age_sec = (pd.Timestamp.now(tz="Asia/Taipei") - pd.Timestamp(latest_ts).tz_localize("Asia/Taipei")).total_seconds()
-        bar_age_result = bar_age_sec
-
-tick_age_result = None
-if tick_files:
-    df_ticks = pd.read_csv(tick_files[-1])
-    if not df_ticks.empty:
-        tick_age_result = time.time() - df_ticks["ts_int"].iloc[-1]
-
-if bar_age_result is None:
-    print("  ❌  No bar data available. System may have just started.")
-elif bar_age_result < 300:
-    print(f"  ✅  System healthy. Bars {bar_age_result:.0f}s old, ticks flowing.")
-elif bar_age_result < 600:
-    print(f"  ⚠️  Bars slightly stale ({bar_age_result:.0f}s). Likely VPN reconnect — wait for next 5m boundary.")
-elif bar_age_result > 600 and tick_age_result is not None and tick_age_result < 120:
-    print(f"  ⚠️  Bars stale ({bar_age_result:.0f}s) but ticks flowing → bar builder may not be accumulating.")
-    print(f"       Check: is _strategy_tick running? Is _tick_bars_deque receiving bars?")
-elif bar_age_result > 600:
-    print(f"  ❌  Data STAGNANT. Bars {bar_age_result:.0f}s old, ticks not flowing.")
-    print(f"       Check: VPN, PM2 uptime, Shioaji contract subscription.")
+if __name__ == "__main__":
+    main()
