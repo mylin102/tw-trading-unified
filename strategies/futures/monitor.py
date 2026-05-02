@@ -144,6 +144,7 @@ class FuturesMonitor:
         # GSD Phase 0d: Hourly no-trade audit tracking
         self._last_trade_ts = None       # timestamp of last trade
         self._bars_since_trade = 0       # bars since last trade
+        self._bars_since_session_open = 0 # [V-Model Upgrade] Track session bar count
         self._signals_generated = 0      # valid signals this hour
         self._signals_rejected = 0       # rejected signals this hour (reason, count)
         self._last_audit_hour = -1       # last hour we ran the audit
@@ -2100,7 +2101,7 @@ class FuturesMonitor:
         from core.market_regime import classify_regime
 
         session_regime = classify_regime(df_5m)
-        bar = last_5m.to_dict()
+        bar = last_5m if isinstance(last_5m, dict) else last_5m.to_dict()
         
         # Use the new _route_signal method with attribution support
         return self._route_signal(
@@ -3280,10 +3281,15 @@ class FuturesMonitor:
         
         # GSD Phase 0b-2: Session transition detection (night -> day) - cancel stale pending orders
         if self.previous_session_type != self.session_type:
+            self._bars_since_session_open = 0 # [V-Model Upgrade] Reset bar counter on session change
             if self.previous_session_type == "night" and self.session_type == "day":
                 console.print(f"[bold yellow]🔄 Session transition: {self.previous_session_type} -> {self.session_type}. Cancelling pending orders...[/bold yellow]")
                 self._cancel_all_pending_orders()
             self.previous_session_type = self.session_type
+        
+        self._bars_since_session_open += 1
+        last_5m_dict = last_5m.to_dict()
+        last_5m_dict["bars_since_open"] = self._bars_since_session_open
 
         # GSD Phase 0c: Snapshot bar context for entry diagnostic (used by _execute_trade)
         self._last_bar_context = {
@@ -3526,7 +3532,7 @@ class FuturesMonitor:
         # ── GSD: Pluggable Strategy Entry ────────────────────────────
         active_name = self.STRATEGY.get("active_strategy", "counter_vwap")
         decision, _ctx, session_regime, bar_regime = self._route_entry_signal(
-            last_5m, df_5m, df_15m, timestamp, active_name
+            last_5m_dict, df_5m, df_15m, timestamp, active_name
         )
 
         if decision.action == "BLOCKED":

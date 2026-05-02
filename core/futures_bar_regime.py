@@ -18,8 +18,16 @@ class FuturesBarRegimeConfig:
 
     adx_trend_threshold: float = 22.0
     adx_weak_threshold: float = 15.0
-    breakout_strength_trend_threshold: float = 0.20
-    bear_breakout_strength_trend_threshold: float = 0.20
+    
+    # ATR-normalized thresholds (V-Model Upgrade)
+    breakout_strength_trend_threshold: float = 0.25    # Base threshold (ATR units)
+    bear_breakout_strength_trend_threshold: float = 0.25
+    
+    # Regime-aware sensitivity (multipliers)
+    trend_regime_threshold_mult: float = 0.60         # 0.25 * 0.6 = 0.15 in TRENDING
+    squeeze_regime_threshold_mult: float = 1.0        # Keep 0.25 in SQUEEZE
+    
+    min_volume_spike_confirmation: float = 1.5        # Stage 3: Confirmation
     stretched_vwap_distance: float = 0.0035
     trend_strength_threshold: float = 0.001
     min_volume_spike: float = 1.0
@@ -194,14 +202,48 @@ def classify_futures_bar_regime(
             session_regime=normalized_session_regime,
         )
 
-    trend_confirmed = (
-        bias != "NEUTRAL"
-        and adx >= cfg.adx_trend_threshold
-        and breakout_strength >= cfg.breakout_strength_trend_threshold
+    # [V-Model Upgrade] Dynamic Thresholds & Confirmation
+    bs_threshold = cfg.breakout_strength_trend_threshold
+    if normalized_session_regime == "TRENDING":
+        bs_threshold *= cfg.trend_regime_threshold_mult
+    elif normalized_session_regime == "SQUEEZE":
+        bs_threshold *= cfg.squeeze_regime_threshold_mult
+
+    # ═══ Session Open Buffer (V-Model Safety) ═══
+    # 避免夜盤開盤前幾根 Bar 因量能不穩導致誤判
+    bars_since_open = _safe_float(row.get("bars_since_open", 999))
+    volume_confirmed = volume_spike >= cfg.min_volume_spike_confirmation
+    if bars_since_open < 5:
+        volume_confirmed = False # Early session: disable volume confirmation for safety
+        if volume_spike >= cfg.min_volume_spike_confirmation:
+            reasons.append("SESSION_BUFFER_SKIP: volume spike ignored due to early session (<5 bars)")
+
+    # ═══ Three-Stage Breakout Logic (V2) ═══
+    # 1. Structure: is_structural_breakout != 0 (Close > High20_prev)
+    # 2. Strength:  breakout_strength_atr >= adjusted threshold
+    # 3. Confirm:   Volume Spike (buffered) + VWAP Alignment
+    
+    is_structural = _safe_float(row.get("is_structural_breakout"))
+    
+    # BULL Breakout
+    if bias == "LONG" and is_structural == 1:
+        if breakout_strength < bs_threshold:
+            reasons.append(f"ATR_GATE_FAIL: bull bs_atr={breakout_strength:.2f} < {bs_threshold:.2f}")
+        
+    bull_confirmed = (
+        bias == "LONG"
+        and is_structural == 1
+        and breakout_strength >= bs_threshold
+        and volume_confirmed
+        and (close > vwap if vwap > 0 else True)
     )
-    if trend_confirmed:
+    
+    atr_trace = f"atr[raw={row.get('atr_raw',0):.1f}, floor={row.get('atr_floor',0):.1f}, used={row.get('atr_used',0):.1f}]"
+
+    if bull_confirmed:
         reasons.append(
-            f"ADX={adx:.2f} and breakout_strength={breakout_strength:.2f} confirm trend"
+            f"BULL breakout confirmed (V2): bs_atr={breakout_strength:.2f} >= {bs_threshold:.2f}, "
+            f"vol={volume_spike:.2f} (bars={bars_since_open:.0f}), {atr_trace}"
         )
         confidence = 0.88 if normalized_session_regime == "TRENDING" else 0.85
         return FuturesBarRegimeResult(
@@ -212,15 +254,24 @@ def classify_futures_bar_regime(
             session_regime=normalized_session_regime,
         )
 
-    bear_trend_confirmed = (
+    # BEAR Breakout
+    if bias == "SHORT" and is_structural == -1:
+        if bear_breakout_strength < bs_threshold:
+            reasons.append(f"ATR_GATE_FAIL: bear bs_atr={bear_breakout_strength:.2f} < {bs_threshold:.2f}")
+
+    bear_confirmed = (
         bias == "SHORT"
-        and bear_breakout_strength >= cfg.bear_breakout_strength_trend_threshold
+        and is_structural == -1
+        and bear_breakout_strength >= bs_threshold
+        and volume_confirmed
+        and (close < vwap if vwap > 0 else True)
     )
-    if bear_trend_confirmed:
+    
+    if bear_confirmed:
         reasons.append(
-            f"bear_breakout_strength={bear_breakout_strength:.2f} confirms bear pressure"
+            f"BEAR breakout confirmed (V2): bear_bs_atr={bear_breakout_strength:.2f} >= {bs_threshold:.2f}, "
+            f"vol={volume_spike:.2f} (bars={bars_since_open:.0f}), {atr_trace}"
         )
-        # Use ADX to gauge confidence, not as hard gate
         _bear_c = 0.80 if adx >= cfg.adx_trend_threshold else 0.65
         return FuturesBarRegimeResult(
             regime="BEAR",
@@ -234,7 +285,6 @@ def classify_futures_bar_regime(
         bias != "NEUTRAL"
         and adx >= cfg.adx_weak_threshold
         and abs(trend_strength_raw) >= cfg.trend_strength_threshold
-        # volume_spike gating removed — feature not yet computed (Phase 3)
     )
     if moderate_directional_pressure:
         reasons.append("directional pressure exists, but breakout confirmation is incomplete")

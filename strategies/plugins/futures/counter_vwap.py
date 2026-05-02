@@ -58,7 +58,16 @@ class CounterVWAP(StrategyBase):
 
     def on_bar(self, context: StrategyContext) -> Signal | None:
         bar = context.market.last_bar
-        params = context.config.get("params", {})
+
+        # ── LIVE TRADING DISABLED: paper/report only ──
+        config = context.config or {}
+        if config.get("live_trading", False):
+            ts = bar.get("timestamp") or bar.get("name") if bar else None
+            print(f"[counter_vwap] LIVE_TRADING_BLOCKED — paper/report only mode", flush=True)
+            self._set_eval(skip_reason="LIVE_TRADING_DISABLED", live_trading=True)
+            return None
+
+        params = config.get("params", {})
         confirm_bars = params.get("confirm_bars", 7)  # v3: 5 → 7
         atr_sl_mult = params.get("atr_sl_mult", 2.0)
         min_momentum = params.get("min_momentum", 30.0)  # v3: new filter

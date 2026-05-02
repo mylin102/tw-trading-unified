@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,8 @@ from typing import Any
 
 import requests
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -157,7 +160,14 @@ def _normalize_snapshot(
             normalized_row["symbol"] = symbol
             ranking_by_symbol[symbol] = normalized_row
 
-    watchlist_symbols = _rows_to_symbols(ranking_rows) or _rows_to_symbols(leader_rows) or list(features_by_symbol.keys())
+    # If ranking is empty but leaders exist, use top N from leaders sorted by composite_score
+    if not ranking_rows and leader_rows:
+        max_watchlist = int(settings.get("max_watchlist_size", 20))
+        sorted_leaders = sorted(leader_rows, key=lambda r: r.get("composite_score", 0), reverse=True)
+        watchlist_symbols = _rows_to_symbols(sorted_leaders[:max_watchlist])
+        logger.info(f"ranking empty — using top {len(watchlist_symbols)} from leaders (sorted by composite_score)")
+    else:
+        watchlist_symbols = _rows_to_symbols(ranking_rows) or _rows_to_symbols(leader_rows) or list(features_by_symbol.keys())
 
     generated_at = (
         _extract_generated_at(stock_features_payload)

@@ -9,6 +9,7 @@ This router sits between bar-level regime detection and execution:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, Sequence
 
@@ -22,12 +23,139 @@ class StrategyLookup(Protocol):
     def get(self, name: str) -> Any: ...
 
 
+# ═══════════════════════════════════════════════════════════════
+# Strategy Router v2 — STRATEGY_POLICY
+# ═══════════════════════════════════════════════════════════════
+# Declarative policy per strategy: which regimes, max weight, kill switch.
+# This runs BEFORE per-strategy signal generation — strategies blocked here
+# never have their on_bar() called.
+
+STRATEGY_POLICY: dict[str, dict] = {
+    "adaptive_orb": {
+        "enabled_regimes": ["TREND", "SQUEEZE"],
+        "max_weight": 1.0,
+        "kill_if_cagr_below": -0.02,
+    },
+    "adaptive_orb_v15": {
+        "enabled_regimes": ["TREND", "SQUEEZE"],
+        "max_weight": 1.0,
+        "kill_if_cagr_below": -0.02,
+        "description": "v1 ORB + ATR breakout confirmation gate (observation mode)",
+    },
+    "counter_vwap": {
+        "enabled_regimes": ["WEAK", "CHOP", "SQUEEZE"],
+        "max_weight": 0.2,
+        "kill_if_cagr_below": -0.05,
+    },
+    "cumulative_delta": {
+        "enabled_regimes": [],
+        "max_weight": 0.0,
+        "kill_if_cagr_below": 0.0,
+    },
+    "calendar_condor_v2": {
+        "enabled_regimes": ["WEAK", "CHOP"],
+        "max_weight": 0.3,
+        "kill_if_cagr_below": -999,  # debug only — never kill-switch
+        "debug_skip_reason": True,
+    },
+    "spring_upthrust": {
+        "enabled_regimes": ["WEAK", "CHOP", "SQUEEZE"],
+        "max_weight": 0.8,
+        "kill_if_cagr_below": -0.05,
+    },
+    "kbar_feature": {
+        "enabled_regimes": ["WEAK", "CHOP"],
+        "max_weight": 0.5,
+        "kill_if_cagr_below": -0.05,
+    },
+    "vol_squeeze": {
+        "enabled_regimes": ["SQUEEZE"],
+        "max_weight": 0.5,
+        "kill_if_cagr_below": -0.03,
+    },
+    "psar": {
+        "enabled_regimes": ["TREND"],
+        "max_weight": 0.5,
+        "kill_if_cagr_below": -0.03,
+    },
+}
+
+
+logger = logging.getLogger(__name__)
+
+
+def _check_strategy_policy(
+    strategy_name: str,
+    regime: str,
+    metrics: dict | None = None,
+) -> tuple[bool, str]:
+    """Check if a strategy is allowed by policy.
+
+    Returns (allowed: bool, reason: str).
+    Always returns True + 'ENABLED' for unnamed strategies not in policy.
+    """
+    policy = STRATEGY_POLICY.get(strategy_name)
+    if policy is None:
+        return True, "ENABLED"
+
+    if not policy.get("enabled_regimes"):
+        return False, "DISABLED_BY_POLICY"
+
+    # Normalise regime name
+    regime_normalized = regime.upper() \
+        .replace("BEAR", "TREND") \
+        .replace("WEAK", "CHOP") \
+        .replace("STRETCHED", "CHOP")
+    if regime_normalized not in policy["enabled_regimes"]:
+        return False, f"REGIME_BLOCKED:{regime}"
+
+    # Kill-switch: CAGR below threshold
+    if metrics and isinstance(metrics, dict):
+        strategy_metrics = metrics.get(strategy_name, {})
+        if isinstance(strategy_metrics, dict):
+            cagr = strategy_metrics.get("cagr")
+            kill_below = policy.get("kill_if_cagr_below", -999)
+            if cagr is not None and kill_below is not None and cagr < kill_below:
+                return False, f"KILL_SWITCH_CAGR:{cagr:.2%}"
+
+    return True, "ENABLED"
+
+
+def _apply_strategy_policy(
+    candidates: list[str],
+    regime: str,
+    metrics: dict | None = None,
+) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Apply STRATEGY_POLICY to a list of candidate strategies.
+
+    Returns:
+      checked: list of (name, allowed, reason) — one per candidate
+      keep:    list of names that passed the policy gate
+    """
+    checked: list[tuple[str, str, str]] = []
+    keep: list[str] = []
+
+    for name in candidates:
+        allowed, reason = _check_strategy_policy(name, regime, metrics)
+        status = "ALLOW" if allowed else "BLOCK"
+        if allowed:
+            keep.append(name)
+        else:
+            logger.info(f"[STRATEGY_POLICY] strategy={name} regime={regime} "
+                        f"enabled={allowed} reason={reason}")
+            # Print for console visibility
+            print(f"[STRATEGY_POLICY][{status}] {name}: {reason}", flush=True)
+        checked.append((name, status, reason))
+
+    return checked, keep
+
+
 @dataclass(frozen=True)
 class FuturesRouterConfig:
     """Routing policy for futures entry signals."""
 
-    trend_strategies: tuple[str, ...] = ("adaptive_orb",)
-    weak_strategies: tuple[str, ...] = ("adaptive_orb", "counter_vwap", "spring_upthrust", "kbar_feature", "calendar_condor_v2")
+    trend_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15")
+    weak_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "counter_vwap", "spring_upthrust", "kbar_feature", "calendar_condor_v2")
     bear_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust")  # [Bear] conservative short — countertrend + upthrust
     stretched_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust")
     squeeze_strategies: tuple[str, ...] = ()
@@ -364,6 +492,18 @@ def route_futures_signal(
     print(f"[ThetaGate] theta={'ALLOW' if theta_allowed else 'BLOCK'} reason={theta_block_reason or 'OK'} regime={regime_result.regime}", flush=True)
 
     candidates = _strategy_order_for_regime(regime_result, active_strategy_name, cfg)
+
+    # ═══ [Strategy Router v2] Apply STRATEGY_POLICY to filter candidates ═══
+    # This runs before per-strategy on_bar() — blocked strategies never evaluate.
+    _policy_checked, candidates = _apply_strategy_policy(
+        candidates,
+        regime_result.regime,
+        metrics=None,  # TODO: pass live metrics for kill-switch
+    )
+    # Log all policy checks to notes
+    for name, status, reason in _policy_checked:
+        notes.append(f"policy:{name}={status}({reason})")
+
     if regime_result.regime == "SQUEEZE" and not candidates:
         # Log SQUEEZE regime with no candidates
         if recorder is not None:
@@ -639,31 +779,31 @@ def route_futures_signal(
                 theta_block_reason=_theta_block_reason,
             )
 
-    # ── Write RouterTrace before TRADE return ──
-    _ts_str = str(timestamp) if timestamp else str(context.market.timestamp)
-    _trace = RouterTrace(
-        ts=_ts_str,
-        regime=regime_result.regime,
-        bias=regime_result.bias,
-        selected=name,
-        selected_action=getattr(signal, "action", None),
-        strategies=_evals,
-    )
-    write_trace(_trace)
-    print_trace_summary(_trace)
-
-    return FuturesRouterDecision(
-            action="TRADE",
-            reason=f"selected by {name}",
+        # ── Winner — return TRADE immediately ──
+        _ts_str = str(timestamp) if timestamp else str(context.market.timestamp)
+        _trace = RouterTrace(
+            ts=_ts_str,
             regime=regime_result.regime,
             bias=regime_result.bias,
-            selected_strategy=name,
-            signal=signal,
-            candidates=candidates,
-            notes=notes,
-            theta_allowed=_theta_allowed,
-            theta_block_reason=_theta_block_reason,
+            selected=name,
+            selected_action=getattr(signal, "action", None),
+            strategies=_evals,
         )
+        write_trace(_trace)
+        print_trace_summary(_trace)
+
+        return FuturesRouterDecision(
+                action="TRADE",
+                reason=f"selected by {name}",
+                regime=regime_result.regime,
+                bias=regime_result.bias,
+                selected_strategy=name,
+                signal=signal,
+                candidates=candidates,
+                notes=notes,
+                theta_allowed=_theta_allowed,
+                theta_block_reason=_theta_block_reason,
+            )
 
     # If we get here, no candidate produced a valid signal
     # Log that all candidates were evaluated but no winner

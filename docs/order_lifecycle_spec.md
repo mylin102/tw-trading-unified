@@ -191,6 +191,49 @@ Each symbol should persist:
 - `realized_pnl`
 - `last_broker_sync_time`
 
+### Position PnL Rule
+
+> **庫存用 `Unit.Share.quantity`，損益用 `p.pnl`；自算 PnL 只做內部估算，不拿來覆蓋券商回傳值。**
+
+`list_positions(unit=Unit.Share)` 作為股票完整庫存主來源：
+
+| 欄位 | 意義 |
+|------|------|
+| `quantity` | 股數，`Unit.Share` 下為完整股數 |
+| `yd_quantity` | 昨倉股數 |
+| `price` | 平均成本價 |
+| `last_price` | 現價 |
+| `pnl` | 券商後端回傳的未實現損益 |
+
+重點結論：
+
+> `pnl` 不是 Python 端用 `(last_price - price) × quantity` 即時計算出來的，而是 Shioaji / 券商後端直接回傳的未實現損益欄位。
+
+官方文件也把 `list_positions` 定義為查詢帳戶**未實現損益**，`pnl` 欄位為 unrealized profit / 損益；`StockPositionDetail` 另有 `fee`、`ex_dividends`、`interest` 等欄位，表示後端 PnL 可能已納入券商帳務邏輯，而不是單純價差計算。([sinotrade.github.io][1])
+
+[1]: https://sinotrade.github.io/tutor/accounting/position/
+
+建議工程規則：
+
+```md
+## Position PnL Rule
+
+- Use `Unit.Share` as the source of truth for stock quantity.
+- Use `p.pnl` as the broker-reported unrealized PnL.
+- Do not recalculate broker PnL using `(last_price - price) * quantity`.
+- For internal risk control:
+  - market_value = last_price * quantity
+  - cost_basis_estimate = price * quantity
+  - broker_pnl = p.pnl
+- If detailed reconciliation is needed, query `list_position_detail()` and inspect fee / ex_dividends / interest.
+```
+
+一句話版本：
+
+> **庫存用 `Unit.Share.quantity`，損益用 `p.pnl`；自算 PnL 只做內部估算，不拿來覆蓋券商回傳值。**
+
+See `docs/position_spec.md` for full Shioaji position query spec (Unit.Common vs Unit.Share, cross-validation, caveats).
+
 ---
 
 ## 6. Risk Gates Before Submission

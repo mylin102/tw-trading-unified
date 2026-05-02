@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0.0] - 2026-05-02
+
+### Added
+- **Breakout Engine V2 (v1.5)**: Implemented ATR-normalized breakout strength logic `(Close - High20.shift(1)) / ATR`. Replaced static percentage-based breakout thresholds.
+- **Fail-Safe Entry Mechanism**: Integrated emergency entry logic in `OptionsMonitor` to force trades during primary engine crashes if high-confidence signals are detected.
+- **Automated Audit Tool**: New `scripts/v15_daily_audit.py` for daily performance summarization (ATR gate status, session buffers, PnL).
+- **Market Data Normalizer**: Unified entry point for all API data in options monitor to strictly enforce float casting and detect `Decimal` pollution.
+
+### Changed
+- **Three-Stage Breakout Logic**: Upgraded classification to a multi-axis gate: Structure (Price High) -> Strength (ATR > 0.25) -> Confirmation (Volume Spike >= 1.5 + VWAP Alignment).
+- **Regime-Aware Thresholds**: Dynamic scaling of breakout sensitivity (0.15 ATR in `TRENDING`, 0.25 ATR in `SQUEEZE`).
+- **Dashboard V2**: Expanded futures metrics to 6 columns, adding real-time "Breakout Strength" with directional emojis (🚀/💀).
+
+### Fixed
+- **Critical Type Crash**: Fixed `unsupported operand type` error caused by `decimal.Decimal` objects from Shioaji `on_bidask` callback.
+- **Holiday Detection**: Updated `core/date_utils.py` to correctly identify TAIFEX holidays (e.g., Labor Day) and weekend closures to prevent unnecessary reboots.
+- **Sign Inversion**: Corrected `DirectionLock` logic where positive scores were incorrectly interpreted as bearish.
+- **Session Reset**: Ensured `bars_since_open` counter resets precisely at 15:00 for the night session to prevent opening-bar volume miscalculation.
+
 ## [0.20.0.0] - 2026-04-10
 
 ### Added

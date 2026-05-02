@@ -134,7 +134,11 @@ class CalendarCondorV2(StrategyBase):
     def _validate_bar(self, context: StrategyContext) -> bool:
         """驗證 bar 數據是否有效"""
         bar = context.market.last_bar
+        ts = bar.get("ts") or bar.get("timestamp") or bar.get("name") or "?"
+        ts_str = str(ts)
+
         if not bar:
+            print(f"[CalendarCondorV2][SKIP] NO_BAR ts={ts_str}")
             self._set_eval(skip_reason="NO_BAR")
             return False
 
@@ -152,24 +156,49 @@ class CalendarCondorV2(StrategyBase):
             val = bar.get(field)
             if val is None:
                 # enrichment 後仍缺失 → bar 不夠用
-                self._set_eval(skip_reason=f"MISSING_FIELD:{field}", required_fields=required_fields,
+                reason = f"MISSING_FIELD:{field}"
+                print(f"[CalendarCondorV2][SKIP] {reason} ts={ts_str} field={field}")
+                self._set_eval(skip_reason=reason, required_fields=required_fields,
                                available=[k for k, v in bar.items() if v is not None][:10])
                 return False
 
         # 檢查 regime 是否符合
         regime = bar["regime"]
         if regime != "WEAK":
-            self._set_eval(skip_reason=f"REGIME_NOT_WEAK:{regime}", regime=regime)
+            code = "NO_REGIME"
+            print(f"[CalendarCondorV2][SKIP] {code} ts={ts_str} regime={regime}")
+            self._set_eval(skip_reason=f"{code}:{regime}", regime=regime)
+            return False
+
+        # 檢查遠月合約是否可用
+        far_close = bar.get("far_close")
+        if far_close is None or far_close == 0:
+            code = "NO_FAR_CONTRACT"
+            print(f"[CalendarCondorV2][SKIP] {code} ts={ts_str}")
+            self._set_eval(skip_reason=code, far_close=far_close)
+            return False
+
+        # 檢查 spread_std 是否足夠大
+        spread_std = bar.get("spread_std", 0)
+        min_std = self.params.get("min_spread_std", 5.0)
+        if spread_std < min_std:
+            code = "SPREAD_TOO_SMALL"
+            print(f"[CalendarCondorV2][SKIP] {code} ts={ts_str} spread_std={spread_std:.2f} < {min_std:.2f}")
+            self._set_eval(skip_reason=code, spread_std=spread_std, min_spread_std=min_std)
             return False
 
         # 檢查是否在夜盤交易
         if not self.params["allow_night_session"] and bar["is_night_session"]:
-            self._set_eval(skip_reason="NIGHT_SESSION_DISABLED", is_night_session=bar["is_night_session"])
+            code = "SESSION_BLOCKED"
+            print(f"[CalendarCondorV2][SKIP] {code} ts={ts_str} is_night_session=True")
+            self._set_eval(skip_reason=f"{code}:NIGHT", is_night_session=bar["is_night_session"])
             return False
 
         # 檢查是否在開盤初期
         if bar["bars_from_session_open"] < self.params["min_bars_from_session_open"]:
-            self._set_eval(skip_reason="SESSION_START_COOLDOWN",
+            code = "SESSION_BLOCKED"
+            print(f"[CalendarCondorV2][SKIP] {code} ts={ts_str} bars_from_open={bar['bars_from_session_open']} < {self.params['min_bars_from_session_open']}")
+            self._set_eval(skip_reason=f"{code}:COOLDOWN",
                            bars_from_open=bar["bars_from_session_open"],
                            min_bars=self.params["min_bars_from_session_open"])
             return False

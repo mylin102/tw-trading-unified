@@ -2199,25 +2199,74 @@ with tab_futures:
     f_df = load_futures_indicators(full_history=cont_mode)
     if f_df is not None and not f_df.empty:
         last = f_df.iloc[-1]
-        fc1, fc2, fc3, fc4, fc5 = st.columns(5)
-        
-        # 噴發偏向 (Bias) 計算 - 整合趨勢感
-        bull = last.get("bullish_align", False)
-        bear = last.get("bearish_align", False)
-        mom = last.get("momentum", 0)
-        mom_prev = f_df["momentum"].iloc[-2] if len(f_df) > 1 else 0
-        
-        bias = "⚪中性"
-        if mom > 0:
-            if bull:
-                bias = "🚀強勢多" if mom >= mom_prev else "↗️多轉弱"
+        last_ts = pd.to_datetime(last.get("timestamp"))
+
+        # ── 資料新鮮度判斷 ──
+        import datetime as _dt
+        now_ts = pd.Timestamp.now()
+        age_mins = (now_ts - last_ts).total_seconds() / 60.0 if pd.notna(last_ts) else 999
+
+        # 目前交易時段
+        from core.date_utils import get_taifex_futures_session_type
+        session_type = get_taifex_futures_session_type()
+        session_label = "夜盤" if session_type == "night" else ("日盤" if session_type == "day" else "收盤")
+
+        # 資料新鮮度閾值：日盤 15 分鐘、夜盤 15 分鐘
+        stale_threshold = 15.0
+        data_fresh = age_mins < stale_threshold
+
+        if not data_fresh:
+            last_ts_str = last_ts.strftime("%H:%M") if pd.notna(last_ts) else "?"
+            st.warning(
+                f"⚠️ 資料停滯: 最後一筆 {last_ts_str} ({age_mins:.0f}分鐘前) "
+                f"| 目前 {session_label}"
+            )
+        elif pd.notna(last_ts):
+            st.caption(f"🟢 即時 · {last_ts.strftime('%m/%d %H:%M')} · {session_label}")
+
+        fc1, fc2, fc3, fc4, fc5, fc6 = st.columns(6)
+
+        # 只有在資料新鮮時才顯示 bias/Sqz，否則顯示灰色「待更新」
+        if data_fresh:
+            # 噴發偏向 (Bias) 計算 - 整合趨勢感
+            bull = last.get("bullish_align", False)
+            bear = last.get("bearish_align", False)
+            mom = last.get("momentum", 0)
+            mom_prev = f_df["momentum"].iloc[-2] if len(f_df) > 1 else 0
+
+            bias = "⚪中性"
+            if mom > 0:
+                if bull:
+                    bias = "🚀強勢多" if mom >= mom_prev else "↗️多轉弱"
+                else:
+                    bias = "⚠️空反彈" if mom >= mom_prev else "↗️弱反彈"
+            elif mom < 0:
+                if bear:
+                    bias = "💀強勢空" if mom <= mom_prev else "↘️空轉弱"
+                else:
+                    bias = "⚠️多拉回" if mom <= mom_prev else "↘️弱拉回"
+
+            sqz_label = "🔒壓縮" if last.get("sqz_on", False) is True else "🔓釋放"
+            
+            # [Breakout V2] 突破強度與結構顯示
+            bs_atr = last.get("breakout_strength_atr", 0.0)
+            bear_bs_atr = last.get("bear_breakout_strength_atr", 0.0)
+            is_bull_struct = last.get("is_bull_structural_breakout", 0)
+            is_bear_struct = last.get("is_bear_structural_breakout", 0)
+            
+            if is_bull_struct == 1:
+                bs_label = f"🚀 {bs_atr:.2f} ATR"
+            elif is_bear_struct == 1:
+                bs_label = f"💀 {bear_bs_atr:.2f} ATR"
             else:
-                bias = "⚠️空反彈" if mom >= mom_prev else "↗️弱反彈"
-        elif mom < 0:
-            if bear:
-                bias = "💀強勢空" if mom <= mom_prev else "↘️空轉弱"
-            else:
-                bias = "⚠️多拉回" if mom <= mom_prev else "↘️弱拉回"
+                bs_label = f"{max(bs_atr, bear_bs_atr):.2f} ATR"
+            
+            sqz_color = None
+        else:
+            bias = "⚪待更新"
+            sqz_label = "⚪—"
+            bs_label = "⚪—"
+            sqz_color = "off"
 
         # Robust coercion to scalar for display
         cl_val = _to_num(last.get('close') if 'close' in last else last.get('Close', 0))
@@ -2225,14 +2274,15 @@ with tab_futures:
 
         fc1.metric("Close", f"{cl_val:.0f}")
         fc2.metric("Score", f"{sc_val:.1f}")
-        bull = last.get("bull_align", last.get("bullish_align", False))
-        bear = last.get("bear_align", last.get("bearish_align", False))
-        trend = "🟢多頭" if bull else ("🔴空頭" if bear else "⚪中性")
+        bull_align = last.get("bull_align", last.get("bullish_align", False))
+        bear_align = last.get("bear_align", last.get("bearish_align", False))
+        trend = "🟢多頭" if bull_align else ("🔴空頭" if bear_align else "⚪中性")
         fc3.metric("趨勢", trend)
-        fc4.metric("Sqz狀態", "🔒壓縮" if last.get("sqz_on", False) is True else "🔓釋放")
+        fc4.metric("Sqz狀態", sqz_label)
         fc5.metric("噴發向", bias)
+        fc6.metric("突破強度", bs_label)
 
-        if "fired" in last and last.get("fired", False) is True:
+        if data_fresh and "fired" in last and last.get("fired", False) is True:
             st.success("🔥 **FIRE — 壓縮釋放！**")
         
         ft, _ = load_futures_trades()
@@ -3336,6 +3386,16 @@ with tab_pipeline:
                         c = cols[ci % len(cols)]
                         emoji = "✅" if r["triggered"] else ("⏳" if r["reason"] in ("WATCHING", "FIRE_DETECTED_WAITING") else "⛔")
                         c.metric(f"{r['strategy']}", f"{emoji} {r['reason']}", f"edge={r['edge']}" if pd.notna(r["edge"]) else None)
+                    
+                    # ── Router Trace 資料新鮮度註解 ──
+                    latest_ts = df_rt["ts_dt"].max()
+                    trace_count = len(df_rt)
+                    st.caption(
+                        f"⚠️ RouterTrace 可能包含前一輪 PM2 process 的歷史資料。"
+                        f"「NOT_REGISTERED」不代表當前 runtime 未註冊，"
+                        f"請交叉比對 PM2 日誌確認策略載入狀態。 "
+                        f"共 {trace_count} 筆, 最新: {latest_ts.strftime('%m/%d %H:%M') if pd.notna(latest_ts) else '?'}"
+                    )
 
                     # ── ② Edge Timeline (Plotly) ──
                     try:

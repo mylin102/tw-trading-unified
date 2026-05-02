@@ -961,15 +961,21 @@ class ShioajiOptionsSmartMonitor:
                 key = "P"
             elif m_contract and code == getattr(m_contract, "code", None):
                 key = "MTX"
+            
             if key:
-                self.market_data[key]["close"] = float(tick.close)
-                self.market_data[key]["bid"] = float(getattr(tick, 'bid_price', tick.close))
-                self.market_data[key]["ask"] = float(getattr(tick, 'ask_price', tick.close))
+                # Use normalizer to force float
+                self._normalize_and_update_market_data(
+                    key, 
+                    bid=getattr(tick, 'bid_price', None), 
+                    ask=getattr(tick, 'ask_price', None), 
+                    close=tick.close
+                )
 
             # Build 5m bars from MTX ticks
             if key == "MTX":
                 price = float(tick.close)
                 vol = int(getattr(tick, "volume", 1))
+                # ... (rest of bar logic unchanged)
                 
                 # [Wave 1 optimization] Use integer time bucketing to avoid expensive pd.Timestamp().floor()
                 # Only compute Timestamp when bar changes (every 5 minutes)
@@ -1005,13 +1011,77 @@ class ShioajiOptionsSmartMonitor:
                 else:
                     return
 
+    def _normalize_and_update_market_data(self, key, bid=None, ask=None, close=None):
+        """Unified entry point for market data updates. Force float and detect Decimal pollution."""
+        from decimal import Decimal
+        
+        target = self.market_data.get(key)
+        if not target: return
+        
+        try:
+            if bid is not None:
+                if isinstance(bid, Decimal): self.replay_stats["decimal_detected_count"] = self.replay_stats.get("decimal_detected_count", 0) + 1
+                target["bid"] = float(bid)
+            if ask is not None:
+                if isinstance(ask, Decimal): self.replay_stats["decimal_detected_count"] = self.replay_stats.get("decimal_detected_count", 0) + 1
+                target["ask"] = float(ask)
+            if close is not None:
+                if isinstance(close, Decimal): self.replay_stats["decimal_detected_count"] = self.replay_stats.get("decimal_detected_count", 0) + 1
+                target["close"] = float(close)
+            
+            # Auto-calculate Mid if possible
+            if target["bid"] > 0 and target["ask"] > 0:
+                target["close"] = (target["bid"] + target["ask"]) / 2.0
+                
+        except Exception as e:
+            console.print(f"[red]❌ Data Normalization Error ({key}): {e}[/red]")
+
+    def _failsafe_fallback_entry(self, exc):
+        """
+        Emergency entry logic if primary strategy loop crashes.
+        Triggered only during high-confidence regimes to ensure we don't miss 'the big one'.
+        """
+        self.replay_stats["strategy_loop_error_count"] = self.replay_stats.get("strategy_loop_error_count", 0) + 1
+        
+        # 1. 取得最新指標 (從緩存或直接從 data_manager)
+        try:
+            bs_atr = getattr(self, "latest_bs_atr", 0.0)
+            bear_bs_atr = getattr(self, "latest_bear_bs_atr", 0.0)
+            score = self.latest_score
+            
+            # 2. 定義緊急門檻 (極其嚴格，避免亂進場)
+            # BS > 0.4 ATR 代表絕對突破
+            is_emergency_bull = bs_atr >= 0.4 and score >= 60
+            is_emergency_bear = bear_bs_atr >= 0.4 and score <= -60
+            
+            if (is_emergency_bull or is_emergency_bear) and self.position == 0:
+                side = "C" if is_emergency_bull else "P"
+                reason = f"FAILSAFE_ENTRY: {side} (StrategyCrash: {exc})"
+                console.print(f"[bold red]🆘 [FAILSAFE] Primary engine crashed but HIGH CONFIDENCE detected. Attempting emergency {side} entry...[/bold red]")
+                
+                # Create a minimal mock signal
+                emergency_signal = {
+                    "side": side,
+                    "score": score,
+                    "type": "FAILSAFE",
+                    "price_mtx": self.market_data["MTX"]["close"]
+                }
+                
+                if self._enable_vertical_spread:
+                    self.enter_spread_paper_position(side, emergency_signal)
+                else:
+                    self.enter_paper_position(side, emergency_signal)
+        except Exception as e:
+            console.print(f"[red]❌ Failsafe Fallback failed: {e}[/red]")
+
     def on_bidask(self, exchange, bidask):
         """Update bid/ask from BidAsk callback — more frequent than Tick in off-hours."""
         self.last_tick_at = time.time()  # Sentinel: track data freshness
         with self.lock:
             code = bidask.code
-            bid = bidask.bid_price[0] if hasattr(bidask.bid_price, '__getitem__') else float(bidask.bid_price)
-            ask = bidask.ask_price[0] if hasattr(bidask.ask_price, '__getitem__') else float(bidask.ask_price)
+            bid = bidask.bid_price[0] if hasattr(bidask.bid_price, '__getitem__') else bidask.bid_price
+            ask = bidask.ask_price[0] if hasattr(bidask.ask_price, '__getitem__') else bidask.ask_price
+            
             c_contract = self.active_contracts.get("C")
             p_contract = self.active_contracts.get("P")
             m_contract = self.active_contracts.get("MTX")
@@ -1023,14 +1093,10 @@ class ShioajiOptionsSmartMonitor:
             elif m_contract and (code == getattr(m_contract, "code", None) or code.startswith("MXF")):
                 key = "MTX"
             if not key:
-                console.print(f"[dim]bidask unmatched: {code} vs C={getattr(c_contract,'code',None)} P={getattr(p_contract,'code',None)} MTX={getattr(m_contract,'code',None)}[/dim]")
                 return
-            if bid > 0 and ask > 0:
-                self.market_data[key]["bid"] = float(bid)
-                self.market_data[key]["ask"] = float(ask)
-                mid = (bid + ask) / 2
-                if self.market_data[key]["close"] <= 0 or key == "MTX":
-                    self.market_data[key]["close"] = mid
+            
+            # Use normalizer to force float and calculate mid
+            self._normalize_and_update_market_data(key, bid=bid, ask=ask)
 
     def _save_orders_file_wrapper(self):
         """Export all orders to JSON for dashboard with unrealized PnL."""
@@ -2254,6 +2320,9 @@ class ShioajiOptionsSmartMonitor:
             # 更新最新狀態
             self.latest_score = score
             self.latest_mid_trend = mid_trend or ""
+            # Cache BS for failsafe
+            self.latest_bs_atr = _safe_float(row.get("breakout_strength_atr", 0.0))
+            self.latest_bear_bs_atr = _safe_float(row.get("bear_breakout_strength_atr", 0.0))
             
             side = resolve_entry_side(row, score, row["Close"], self.entry_score, mid_trend=mid_trend, require_mid_trend=True)
 
@@ -2734,19 +2803,20 @@ class ShioajiOptionsSmartMonitor:
 
         # ── [DirectionLock] Block directional entry against regime bias ──
         _regime = str(getattr(self, 'latest_mid_trend', 'NORMAL')).upper()
-        _bias = str(getattr(self, 'latest_score', 0.0))
-        # score > 0 = bearish, score < 0 = bullish (from squeeze system convention)
         _score = float(getattr(self, 'latest_score', 0.0))
-        _is_bearish_bias = _score > 0  # positive score = bearish momentum
-        _is_bullish_bias = _score < 0  # negative score = bullish momentum
+        # [Fix] Naming correction: positive score = bullish, negative score = bearish
+        _is_bullish_bias = _score > 0
+        _is_bearish_bias = _score < 0
         # side 'C' = long CALL (bullish), side 'P' = long PUT (bearish)
         _is_long_call = side in ("C", "CALL")
         _is_long_put = side in ("P", "PUT")
-        # Block: regime is STRETCHED/BEAR + score says bearish + trying to buy CALL
+        # Block: regime is BEARish + score says bullish + trying to buy CALL (wait, no, block Call in Bear market)
+        # Correct logic:
+        # If market is BEAR/STRETCHED, and we have Bearish score, block CALL (Bullish) entry
         if _regime in ("BEAR", "STRETCHED") and _is_bearish_bias and _is_long_call:
             console.print(f"[bold yellow]🛑 [DirectionLock] Block CALL long in {_regime}/BEARISH (score={_score:.1f}) — direction conflict[/bold yellow]")
             return
-        # Block: regime is STRETCHED/BULL + score says bullish + trying to buy PUT
+        # If market is BULL/STRETCHED, and we have Bullish score, block PUT (Bearish) entry
         if _regime in ("BULL", "STRETCHED") and _is_bullish_bias and _is_long_put:
             console.print(f"[bold yellow]🛑 [DirectionLock] Block PUT long in {_regime}/BULLISH (score={_score:.1f}) — direction conflict[/bold yellow]")
             return
@@ -4475,6 +4545,8 @@ class ShioajiOptionsSmartMonitor:
                             console.print(f"[bold red]🩺 DIAGNOSTIC ALERT (Options): {r.action}[/bold red]")
                 except Exception as exc:
                     console.print(f"[red]Options strategy logic error: {exc}[/red]")
+                    # [V-Model] Failsafe fallback entry
+                    self._failsafe_fallback_entry(exc)
                 time.sleep(self.loop_sleep_secs)
         except KeyboardInterrupt:
             pass

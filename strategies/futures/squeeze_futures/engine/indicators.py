@@ -311,55 +311,63 @@ def calculate_futures_squeeze(
     else:
         res["adx"] = 0.0
 
-    # [Fix] breakout_strength & trend_strength_raw for router
-    if len(res) < 5 or "Close" not in res.columns or "day_open" not in res.columns:
-        res["breakout_strength"] = pd.Series(0.0, index=res.index)
-        res["trend_strength_raw"] = pd.Series(0.0, index=res.index)
+    # [V-Model Upgrade] Breakout Engine V2: High-fidelity metric separation & ATR Trace
+    if len(res) < 5 or "Close" not in res.columns:
+        for col in [
+            "breakout_strength_atr", "intraday_strength_pct", "price_vs_vwap_pct", 
+            "is_bull_structural_breakout", "is_bear_structural_breakout",
+            "atr_raw", "atr_floor", "atr_used"
+        ]:
+            res[col] = 0.0
+        res["trend_strength_raw"] = 0.0
         return res
 
-    if len(res) >= 2:
-        try:
-            _close_s = pd.to_numeric(res["Close"], errors="coerce") if "Close" in res.columns else pd.Series(0.0, index=res.index)
-            _open_s = pd.to_numeric(res["day_open"], errors="coerce") if "day_open" in res.columns else pd.Series(0.0, index=res.index)
-            if "price_vs_vwap" in res.columns:
-                _vwap_s = pd.to_numeric(res["price_vs_vwap"], errors="coerce")
-            else:
-                _vwap_s = pd.Series(0.0, index=res.index)
-            _vals = []
-            _bear_vals = []
-            for _c, _o, _v in zip(_close_s.tolist(), _open_s.tolist(), _vwap_s.tolist()):
-                try:
-                    _c, _o, _v = float(_c), float(_o), float(_v)
-                    _ip = ((_c - _o) / _o * 100.0) if _o > 0 else 0.0
-                    _vp = _v * 100.0
-                    _ip = 0.0 if _ip != _ip else _ip
-                    _vp = 0.0 if _vp != _vp else _vp
-                    _vals.append(max(0.0, _ip, _vp))
-                    _bear_vals.append(max(0.0, -_ip, -_vp))
-                except Exception:
-                    _vals.append(0.0)
-                    _bear_vals.append(0.0)
-            if not getattr(calculate_futures_squeeze, "_debug_breakout_once", False):
-                print(
-                    "[BreakoutDebug][FUTURES] "
-                    f"len={len(res)} "
-                    f"Close[-1]={res['Close'].tail(1).values[0] if 'Close' in res.columns else 'NA'} "
-                    f"day_open[-1]={res['day_open'].tail(1).values[0] if 'day_open' in res.columns else 'NA'} "
-                    f"vwap[-1]={res['price_vs_vwap'].tail(1).values[0] if 'price_vs_vwap' in res.columns else 'NA'} "
-                    f"vals[-1]={_vals[-1] if _vals else 'NA'} "
-                    f"bear_vals[-1]={_bear_vals[-1] if _bear_vals else 'NA'}",
-                    flush=True,
-                )
-                calculate_futures_squeeze._debug_breakout_once = True
-            res["breakout_strength"] = _vals
-            res["bear_breakout_strength"] = _bear_vals
-        except Exception as e:
-            if not getattr(calculate_futures_squeeze, "_warned_breakout", False):
-                print(f"[Indicators] breakout_strength failed: {type(e).__name__}: {e}", flush=True)
-                calculate_futures_squeeze._warned_breakout = True
-            res["breakout_strength"] = pd.Series(0.0, index=res.index)
-    else:
-        res["breakout_strength"] = 0.0
+    try:
+        # 1. 準備基礎數據
+        _atr = calculate_atr(res, length=14)
+        _high_n = res["High"].rolling(window=bb_length).max().shift(1)
+        _low_n = res["Low"].rolling(window=bb_length).min().shift(1)
+        _close = res["Close"]
+        _open = res["day_open"] if "day_open" in res.columns else _close
+        _vwap = res["vwap"] if "vwap" in res.columns else _close
+        
+        # 2. ATR Traceability (V-Model requirement)
+        res["atr_raw"] = _atr.fillna(0.0)
+        res["atr_floor"] = (_close * 0.0015).fillna(0.0) # 0.15% dynamic floor
+        res["atr_used"] = res[["atr_raw", "atr_floor"]].max(axis=1).replace(0, np.nan).fillna(50.0)
+        
+        # 3. 原始百分比與偏離度 (Traceability)
+        res["intraday_strength_pct"] = ((_close - _open) / _open * 100.0).fillna(0.0)
+        res["price_vs_vwap_pct"] = ((_close - _vwap) / _vwap * 100.0).fillna(0.0)
+        
+        # 4. 結構突破判定 (Separated Bull/Bear)
+        res["is_bull_structural_breakout"] = (_close > _high_n).astype(int)
+        res["is_bear_structural_breakout"] = (_close < _low_n).astype(int)
+        
+        # 5. ATR 正規化突破強度 (使用 atr_used)
+        res["breakout_strength_atr"] = ((_close - _high_n) / res["atr_used"]).clip(lower=0.0).fillna(0.0)
+        res["bear_breakout_strength_atr"] = ((_low_n - _close) / res["atr_used"]).clip(lower=0.0).fillna(0.0)
+        
+        # 相容舊版欄位名 (Router 使用)
+        res["breakout_strength"] = res["breakout_strength_atr"]
+        res["bear_breakout_strength"] = res["bear_breakout_strength_atr"]
+        res["is_structural_breakout"] = res["is_bull_structural_breakout"] - res["is_bear_structural_breakout"]
+        
+        if not getattr(calculate_futures_squeeze, "_debug_breakout_v2_trace_once", False):
+            print(
+                f"[BreakoutV2] Trace active. "
+                f"ATR_Raw={res['atr_raw'].iloc[-1]:.2f}, Floor={res['atr_floor'].iloc[-1]:.2f}, "
+                f"Used={res['atr_used'].iloc[-1]:.2f}, BS={res['breakout_strength_atr'].iloc[-1]:.4f}",
+                flush=True
+            )
+            calculate_futures_squeeze._debug_breakout_v2_trace_once = True
+            
+    except Exception as e:
+        if not getattr(calculate_futures_squeeze, "_warned_breakout_v2", False):
+            print(f"[Indicators] BreakoutEngineV2 failed: {e}", flush=True)
+            calculate_futures_squeeze._warned_breakout_v2 = True
+        for col in ["breakout_strength", "bear_breakout_strength", "breakout_strength_atr", "is_bull_structural_breakout", "is_bear_structural_breakout"]:
+            res[col] = 0.0
     try:
         if len(res) >= 2 and "ema_fast" in res.columns:
             _ef = pd.to_numeric(res["ema_fast"], errors="coerce") if "ema_fast" in res.columns else pd.Series(np.nan, index=res.index)

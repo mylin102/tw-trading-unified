@@ -232,9 +232,59 @@ def get_taifex_futures_hhmm(dt: Union[datetime, pd.Timestamp, str, None] = None)
 
 
 def is_taifex_futures_market_open(dt: Union[datetime, pd.Timestamp, str, None] = None) -> bool:
-    """Return whether TAIFEX futures market is open for entry decisions."""
-    hhmm = get_taifex_futures_hhmm(dt)
-    return (845 <= hhmm <= 1345) or (hhmm >= 1500) or (hhmm < 500)
+    """Return whether TAIFEX futures market is open for entry decisions.
+    
+    Rules:
+    - Day session (T 08:45-13:45): Open if T is a business day.
+    - Night session (T 15:00 - T+1 05:00): Open if T is a business day AND the next trading day is a business day.
+    """
+    if dt is None:
+        dt = datetime.now()
+    if isinstance(dt, str):
+        dt = pd.to_datetime(dt)
+    if isinstance(dt, pd.Timestamp):
+        dt = dt.to_pydatetime()
+        
+    hhmm = int(dt.strftime("%H%M"))
+    weekday = dt.weekday() # 0=Mon, 6=Sun
+    date_str = dt.strftime("%Y-%m-%d")
+    h_set = fetch_holidays()
+    
+    # 1. Time-only check
+    is_day_time = (845 <= hhmm <= 1345)
+    is_night_time = (hhmm >= 1500) or (hhmm < 500)
+    
+    if not (is_day_time or is_night_time):
+        return False
+        
+    # 2. Weekend/Holiday check
+    if is_day_time:
+        if weekday >= 5 or date_str in h_set:
+            return False
+        return True
+        
+    if is_night_time:
+        # Night session starting TODAY at 15:00
+        if hhmm >= 1500:
+            if weekday >= 5 or date_str in h_set:
+                return False
+            # Also check if NEXT trading day is a business day
+            # If today is a business day but tomorrow is a holiday, there is NO night session
+            t_day = get_trading_day(dt)
+            if t_day.strftime("%Y-%m-%d") in h_set or t_day.weekday() >= 5:
+                return False
+            return True
+        else:
+            # Night session that started YESTERDAY
+            yesterday = dt - timedelta(days=1)
+            if yesterday.weekday() >= 5 or yesterday.strftime("%Y-%m-%d") in h_set:
+                return False
+            # Check today's status as the attributed trading day
+            if weekday >= 5 or date_str in h_set:
+                return False
+            return True
+
+    return False
 
 
 def get_taifex_futures_session_type(dt: Union[datetime, pd.Timestamp, str, None] = None) -> str:
