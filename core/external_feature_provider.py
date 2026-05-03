@@ -25,6 +25,7 @@ DEFAULT_FEATURE_SETTINGS = {
     "stock_features_url": "https://raw.githubusercontent.com/mylin102/tw-canslim-web/master/api/stock_features.json",
     "ranking_url": "https://raw.githubusercontent.com/mylin102/tw-canslim-web/master/api/ranking.json",
     "leaders_url": "https://raw.githubusercontent.com/mylin102/tw-canslim-web/master/data/leaders.json",
+    "regime_url": "https://raw.githubusercontent.com/mylin102/tw-canslim-web/master/data/etf_regime.json",
 }
 
 
@@ -358,6 +359,50 @@ class ExternalFeatureProvider:
         except Exception:
             leaders_payload = {}
         return _normalize_snapshot(stock_features_payload, ranking_payload, leaders_payload, self.settings)
+
+    def fetch_remote_regime(self) -> dict[str, Any]:
+        """Fetch ETF regime snapshot from remote URL.
+
+        Returns raw regime payload with freshness metadata.
+        On failure, returns a degraded copy of the cached regime (if available).
+        """
+        try:
+            payload = self._fetch_json(self.settings["regime_url"])
+            regime_cache_path = self.cache_dir / "regime_latest.json"
+            _atomic_write_json(regime_cache_path, payload)
+            return payload
+        except Exception as exc:
+            cached = self._load_cached_regime()
+            if cached is not None:
+                cached["degraded"] = True
+                cached["degraded_reason"] = f"fetch_failed:{type(exc).__name__}"
+                cached["stale"] = True
+                logger.warning("[Regime] fetch failed, using cached regime: %s", exc)
+                return cached
+            logger.error("[Regime] fetch failed and no cache available: %s", exc)
+            return {
+                "schema_version": 1,
+                "regime": "CHOP",
+                "confidence": 0.0,
+                "features": {},
+                "degraded": True,
+                "degraded_reason": f"no_data:{type(exc).__name__}",
+                "stale": True,
+            }
+
+    def _load_cached_regime(self) -> dict[str, Any] | None:
+        regime_cache_path = self.cache_dir / "regime_latest.json"
+        if not regime_cache_path.exists():
+            return None
+        try:
+            with open(regime_cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def get_regime(self) -> dict[str, Any]:
+        """Get the latest ETF regime, preferring remote refresh over cache."""
+        return self.fetch_remote_regime()
 
     def write_cache(self, snapshot: dict[str, Any]) -> None:
         _atomic_write_json(self.latest_cache_path, snapshot)
