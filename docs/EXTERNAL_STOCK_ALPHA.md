@@ -1,213 +1,249 @@
-# External Stock Alpha Integration
+# External Stock Alpha — Pipeline Contract
 
-**tw-canslim-web → tw-trading-unified** — Data contract and integration rules for daily high-alpha stock leaders.
-
----
-
-## 1. Purpose
-
-Establish a stable, version-controlled data exchange mechanism:
-
-- **tw-canslim-web** → Daily Alpha Provider
-- **tw-trading-unified** → Execution Consumer
-
-Design constraints:
-- Schema changes must not crash the consumer
-- Network / GitHub availability must not block trading
-- All data flow must be traceable and debuggable
+Defines the `tw-canslim-web` → `tw-trading-unified` data pipeline: producer quality rules, consumer defense filters, and observability. This is the single source of truth for the external alpha integration.
 
 ---
 
-## 2. Architecture
+## 1. Architecture
 
 ```
-tw-canslim-web
-  └─ GitHub Actions (daily batch)
-       └─ data/leaders.json
-            │
-            ▼ (GitHub Raw)
-tw-trading-unified
-  └─ external_alpha_provider
-       ├─ fetch from GitHub Raw
-       ├─ store in local cache
-       └─ consumed by decision layer
+tw-canslim-web                     tw-trading-unified
+  (Producer)                          (Consumer)
+  ┌──────────────────┐              ┌──────────────────────┐
+  │ export_canslim.py │──leaders.json──▶ external_feature_  │
+  │ _export_leaders   │  (GitHub Raw) │ provider.py          │
+  │   _json()         │              │ _normalize_snapshot() │
+  │                   │              │ get_snapshot()        │
+  │ A端: 品質提升      │              │ B端: 防禦性過濾       │
+  └──────────────────┘              └──────────────────────┘
+                                            │
+                                            ▼
+                                      config/stocks.yaml
+                                      (watchlist)
 ```
+
+### A端 (Producer) — `tw-canslim-web/export_canslim.py`
+
+負責產出乾淨、可排序的 `leaders.json`。
+
+### B端 (Consumer) — `tw-trading-unified/core/external_feature_provider.py`
+
+負責從 GitHub Raw 抓取、防禦性過濾、排序、快取。
 
 ---
 
-## 3. Data Format (Contract)
+## 2. Data Contract — `leaders.json`
 
-### 3.1 `leaders.json`
+### Format
 
 ```json
 {
   "schema_version": 1,
-  "date": "2026-04-19",
-  "generated_at": "2026-04-19T06:30:00+08:00",
+  "date": "2026-05-03",
+  "generated_at": "2026-05-03T07:48:09Z",
   "universe": [
     {
       "symbol": "2330",
       "name": "TSMC",
-      "rs_rating": 92,
-      "i_rating": 88,
-      "breakout_score": 0.81,
-      "volume_score": 0.73,
-      "composite_score": 0.87,
-      "industry_rank": 4,
+      "rs_rating": 86,
+      "breakout_score": 0.5,
+      "volume_score": 0.5,
+      "composite_score": 0.791,
+      "industry_rank": 1,
       "tags": ["leader", "breakout_candidate"]
     }
   ]
 }
 ```
 
-### 3.2 Field Definitions
+### Fields
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `schema_version` | int | Data contract version |
-| `date` | str | YYYY-MM-DD |
-| `generated_at` | str | ISO 8601 timestamp |
-| `symbol` | str | Taiwan stock ticker (4-6 digits) |
-| `name` | str | Company name |
-| `rs_rating` | int | Relative strength rating (0-99) |
-| `i_rating` | int | Institutional sponsorship rating (0-99) |
-| `breakout_score` | float | Breakout probability (0.0-1.0) |
-| `volume_score` | float | Volume confirmation score (0.0-1.0) |
-| `composite_score` | float | Composite alpha score (0.0-1.0) |
-| `industry_rank` | int | Industry group rank |
-| `tags` | list[str] | Strategy classification tags |
+| Field | Type | Range | Description |
+|-------|------|-------|-------------|
+| `symbol` | str | 4-6 digits | Taiwan stock code |
+| `name` | str | — | Company name |
+| `rs_rating` | int | 0-99 | Relative strength (0 = unknown) |
+| `breakout_score` | float | 0.0-1.0 | 1.0 if N (new-high) is true, else 0.5 |
+| `volume_score` | float | 0.0-1.0 | 1.0 if S (supply/demand) is true, else 0.5 |
+| `composite_score` | float | 0.0-1.0 | **Three-factor blend** (CANSLIM + RS + Revenue) |
+| `industry_rank` | int | 1-999 | 1 = strongest industry; 500 = unknown; 999 = none |
+| `tags` | list[str] | — | `leader`, `breakout_candidate`, `rev_acc`, `rev_strong`, `verified`, `from_excel` |
 
----
-
-## 4. Update Rules
-
-### Producer (tw-canslim-web)
-
-- Run once daily (post-close or pre-market)
-- Overwrite `data/leaders.json` atomically
-- Maintain backward compatibility on schema changes
-- Bump `schema_version` on any non-backward-compatible change
-
-### Consumer (tw-trading-unified)
-
-Startup / refresh sequence:
-1. Attempt to download from GitHub Raw
-2. On success → write to local cache
-3. On failure → use existing cache (never abort trading)
-4. Cache TTL: one trading day
-
-Cache paths:
-```
-cache/external_alpha/latest.json
-cache/external_alpha/leaders_YYYY-MM-DD.json
-```
-
----
-
-## 5. Decision Layer Integration
-
-### 5.1 Universe Filter
+### Composite Score Formula (A端, export_canslim.py ~line 462)
 
 ```python
-if symbol not in leaders_universe:
-    skip_trade()
+rs_weight = min(1.0, max(0.0, rs_rating / 100.0))
+blended_score = (
+    0.4 * (canslim_score / 100.0)   # CANSLIM基本面
+    + 0.3 * rs_weight               # 相對強度 (主要區辨力)
+    + 0.3 * (revenue_score / 6.0)   # 營收品質
+)
+if rs_rating <= 0:
+    blended_score *= 0.7  # 無RS折扣
 ```
 
-### 5.2 Edge Modifier
+預期分布：0.64–0.90（視 rs_rating 而定）。
+
+---
+
+## 3. A端: Quality Rules (`export_canslim.py`)
+
+Applied during `_export_leaders_json()`, before writing to file.
+
+### 3.1 ETF Filter (~line 405)
 
 ```python
-edge += leader_bias.get(symbol, 0.0)
+final_universe_symbols = [s for s in final_universe_symbols if not s.startswith("00")]
 ```
+Excludes 0050, 0056, 00878 and any ETF/warrant-like codes.
 
-### 5.3 Position Sizing Boost
+### 3.2 Excel Fallback Industry Rank (~line 435)
+
+For stocks in Excel but not yet batch-processed: use `ticker_info` to resolve industry. Default to **500** (neutral), never 999 (which would be filtered by B端).
+
+### 3.3 Score Drift Guard (~line 511)
 
 ```python
-position_size *= (1.0 + composite_score * 0.2)
+if cmax - cmin < 0.15:
+    logger.warning("[SCORE DRIFT] composite_score range too flat ...")
+if cmax > 1.0 or cmin < 0.0:
+    logger.error("[SCORE DRIFT] composite_score out of [0,1] range ...")
+```
+
+### 3.4 Summary Log (~line 519)
+
+```
+Leaders export complete: N leaders, avg_rs=XX.X industry_ranked=N/N composite_range=[X.XXX, X.XXX]
 ```
 
 ---
 
-## 6. Safety & Fault Tolerance
+## 4. B端: Defense Filters (`external_feature_provider.py`)
 
-### 6.1 Mandatory Rules
+Applied in `_normalize_snapshot()` when `ranking.json` is empty (current normal state) and data comes from `leaders.json`.
 
-- Never depend on real-time GitHub availability for trade decisions
-- Always read from local cache; treat fetch as an async refresh
-- JSON parsing failure → fallback to previous cache
-- Missing fields → use safe default values
+### 4.1 `_is_valid_leader(row)` (~line 113)
 
-### 6.2 Prohibited Patterns
+Returns `(is_valid: bool, reason: str)`. Three rejection rules:
+
+| Reason | Rule |
+|--------|------|
+| `etf` | Symbol starts with `00` |
+| `rs_zero` | `rs_rating <= 0` |
+| `no_industry` | `industry_rank >= 999` |
+
+### 4.2 Drop Stats (~line 195)
 
 ```python
-# ❌ NOT ALLOWED: raw HTTP response into decision path
-data = requests.get("https://raw.githubusercontent.com/...").json()
+drop_stats = {"etf": 0, "rs_zero": 0, "no_industry": 0}
+```
+Logged in every sync:
+```
+[ExternalAlpha] leaders filter: before=X after=X removed=X → top X
+  | drop: etf=X rs_zero=X no_industry=X | industry_cap=5/per
 ```
 
----
+### 4.3 Score Drift Guard (~line 203)
 
-## 7. Schema Evolution
+Duplicate of A端 check. Applied to filtered leaders before sorting:
+- Range < 0.15 → WARNING
+- Out of [0,1] → ERROR
 
-### Backward Compatibility
+### 4.4 Industry Concentration Cap (~line 215)
 
 ```python
-if "breakout_score" not in row:
-    row["breakout_score"] = 0.5  # default
+MAX_PER_INDUSTRY = 5
 ```
+Limits how many stocks from the same `industry_rank` can enter the watchlist. Prevents single-sector dominance.
 
-### Version Gate
+### 4.5 Floor Guard (~line 231)
 
 ```python
-if schema_version > SUPPORTED_VERSION:
-    log_warning("Schema version %d exceeds supported %d — degrading", schema_version, SUPPORTED_VERSION)
-    degrade_mode()
+MIN_REQUIRED = 5
+if len(sorted_leaders) < MIN_REQUIRED:
+    # Fall back to unfiltered sort
+```
+Prevents "empty universe" scenarios when filters are too aggressive.
+
+### 4.6 Sort Order (~line 240)
+
+```python
+key=lambda r: (
+    int(r.get("industry_rank") or 999),    # lower = stronger industry
+    -float(r.get("rs_rating") or 0),        # higher = stronger stock
+    -float(r.get("composite_score") or 0),  # higher = better blend
+)
+```
+Then take `top N` (configurable via `max_watchlist_size`, default 20).
+
+---
+
+## 5. Data Freshness
+
+Three layers of freshness checking:
+
+| Layer | Method | Location |
+|-------|--------|----------|
+| HTTP header | `curl -sI leaders.json` → `date` header | Manual |
+| `generated_at` field | ISO timestamp in payload | `leaders.json` field |
+| `age_minutes` | Computed by `apply_snapshot_health()` | `external_feature_provider.py` ~line 202 |
+
+The `get_snapshot()` return value includes `generated_at`, `age_minutes`, and `is_stale` flags for the decision layer.
+
+Quick check:
+```bash
+curl -s "https://raw.githubusercontent.com/mylin102/tw-canslim-web/master/data/leaders.json" \
+| python3 -c "
+import json,sys;from datetime import datetime,timezone
+d=json.load(sys.stdin)
+dt=datetime.fromisoformat(d['generated_at'].replace('Z','+00:00'))
+age=(datetime.now(timezone.utc)-dt).total_seconds()/3600
+print(f'產出: {d[\"generated_at\"]} | 距今: {age:.1f}h | {\"🟢\" if age<24 else \"🟡\" if age<48 else \"🔴\"}')"
 ```
 
 ---
 
-## 8. Update Frequency
+## 6. Cache Paths
 
-| Layer | Frequency |
-|-------|-----------|
-| Canslim output | Daily (post-close) |
-| Trading fetch | On startup + once per session |
-| Cache read | Real-time (every decision tick) |
-
----
-
-## 9. Testing Requirements
-
-All integration tests must cover:
-- JSON schema validation (required vs optional fields)
-- Missing field tolerance (default value fallback)
-- Network failure fallback (cache hit on fetch failure)
-- Duplicate symbol handling (dedup by symbol, last-wins)
-- Stale cache behavior (TTL exceeded, graceful degrade)
+```
+cache/external_alpha/latest.json               # Latest successful fetch
+cache/external_alpha/leaders_YYYY-MM-DD.json    # Dated snapshot
+```
 
 ---
 
-## 10. Design Principles
+## 7. Alpha Usage in Trading (SCOUT vs SCALE)
 
-1. **External Alpha = Soft Signal** — never replaces core decision logic
-2. **Non-blocking** — fetch failure must not affect trade execution
-3. **Traceable** — every decision must log its alpha source (cache date, scores)
-4. **Toggle-able** — external alpha must be disable-able via feature flag
+CANSLIM alpha is **not** used to size the first entry.
 
----
+| Phase | Sizing Rule | CANSLIM Influence |
+|-------|------------|-------------------|
+| **SCOUT** (signal validation) | `fixed_scout_cap` | Universe filter only (non-leader = no scout) |
+| **SCALE** (conviction add) | `base_size * (0.6*momentum + 0.4*canslim_alpha)` | Scale bias + risk cap |
 
-## 11. Future Extensions
+CANSLIM does three things:
+1. **Universe filter** — skip stocks not in leaders.json
+2. **Scale bias** — higher composite_score → larger scale size
+3. **Risk cap** — higher ranking allows higher single-position limit
 
-Additional data feeds can be added via the same pattern:
-- `breakout_candidates.json` — pre-screened breakout setups
-- `industry_rank.json` — sector rotation signals
-- `market_breadth.json` — overall market health
-
-Each new feed must:
-- Have its own independent schema (with `schema_version`)
-- Not break existing consumers
-- Support the same cache-and-fallback pattern
+Momentum signals determine entry timing. CanSlim determines whether it's worth scaling. Risk engine caps total exposure.
 
 ---
 
-## 12. Key Takeaway
+## 8. Safety & Failover
 
-**Canslim provides the daily alpha distribution; Trading handles real-time execution.** The two systems are decoupled through a stable data contract with versioned schema, local caching, and graceful degradation on failure.
+- Never block trading on fetch failure (use cache)
+- Never treat stale data as hard truth (is_stale → degrade signals)
+- Every decision logs its alpha source (cache date, scores)
+- External alpha is toggle-able via feature flag (`stocks.external_features.enabled`)
+
+---
+
+## 9. Deprecated Files
+
+| File | Status | Reason |
+|------|--------|--------|
+| `docs/VAN_FEATURE_INTEGRATION.md` | Deprecated | Superseded by this doc (`api/ranking.json` and `api/stock_features.json` are empty) |
+| `docs/ALPHA_TRADING_STRATEGY.md` | Deprecated | Strategy-level content merged into Section 7 above |
+
+These files remain for search compatibility but should not be referenced for new development.

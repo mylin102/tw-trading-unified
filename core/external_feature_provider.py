@@ -110,6 +110,31 @@ def _extract_generated_at(payload: Any) -> str | None:
     return None
 
 
+def _is_valid_leader(row: dict[str, Any]) -> tuple[bool, str]:
+    """Filter out low-quality entries from external alpha leader feed.
+
+    Returns (is_valid: bool, reason: str) so caller can track drop stats.
+
+    Rules:
+    1. Exclude ETFs / warrant-like codes (00-prefix)
+    2. Exclude stocks with no relative strength (rs_rating <= 0)
+    3. Exclude stocks with no industry ranking (industry_rank >= 999)
+    """
+    symbol = str(row.get("symbol") or "").strip()
+    if symbol.startswith("00"):
+        return False, "etf"
+
+    rs_rating = float(row.get("rs_rating") or 0)
+    if rs_rating <= 0:
+        return False, "rs_zero"
+
+    industry_rank = int(row.get("industry_rank") or 999)
+    if industry_rank >= 999:
+        return False, "no_industry"
+
+    return True, ""
+
+
 def _rows_to_symbols(rows: list[dict[str, Any]]) -> list[str]:
     symbols: list[str] = []
     for row in rows:
@@ -160,12 +185,90 @@ def _normalize_snapshot(
             normalized_row["symbol"] = symbol
             ranking_by_symbol[symbol] = normalized_row
 
-    # If ranking is empty but leaders exist, use top N from leaders sorted by composite_score
+    # If ranking is empty but leaders exist, filter + sort by industry_rank/rs/composite
     if not ranking_rows and leader_rows:
         max_watchlist = int(settings.get("max_watchlist_size", 20))
-        sorted_leaders = sorted(leader_rows, key=lambda r: r.get("composite_score", 0), reverse=True)
+        before = len(leader_rows)
+
+        # Drop reason tracking
+        drop_stats: dict[str, int] = {"etf": 0, "rs_zero": 0, "no_industry": 0}
+        filtered: list[dict[str, Any]] = []
+        for r in leader_rows:
+            valid, reason = _is_valid_leader(r)
+            if valid:
+                filtered.append(r)
+            elif reason in drop_stats:
+                drop_stats[reason] += 1
+
+        # Score drift guard: check composite_score distribution before sorting
+        comp_scores = [float(r.get("composite_score") or 0) for r in filtered]
+        if comp_scores:
+            cmin, cmax = min(comp_scores), max(comp_scores)
+            if cmax - cmin < 0.15:
+                logger.warning(
+                    "[ExternalAlpha] SCORE DRIFT: composite_score range too flat "
+                    "(min=%.3f max=%.3f delta=%.3f < 0.15)",
+                    cmin, cmax, cmax - cmin,
+                )
+            if cmax > 1.0 or cmin < 0.0:
+                logger.error(
+                    "[ExternalAlpha] SCORE DRIFT: composite_score out of [0,1] range "
+                    "(min=%.3f max=%.3f)",
+                    cmin, cmax,
+                )
+
+        # Industry concentration guard: max N per industry
+        MAX_PER_INDUSTRY = 5
+        industry_count: dict[int, int] = {}
+        deduped: list[dict[str, Any]] = []
+        for r in filtered:
+            ir = int(r.get("industry_rank") or 999)
+            if industry_count.get(ir, 0) >= MAX_PER_INDUSTRY:
+                continue
+            industry_count[ir] = industry_count.get(ir, 0) + 1
+            deduped.append(r)
+
+        sorted_leaders = sorted(
+            deduped,
+            key=lambda r: (
+                int(r.get("industry_rank") or 999),       # lower = stronger industry
+                -float(r.get("rs_rating") or 0),           # higher = stronger stock
+                -float(r.get("composite_score") or 0),     # higher = better blend
+            ),
+        )
+
+        # Floor guard: if filtered list is too thin, fall back to relaxed filter
+        MIN_REQUIRED = 5
+        if len(sorted_leaders) < MIN_REQUIRED:
+            logger.warning(
+                "[ExternalAlpha] FILTER TOO AGGRESSIVE: only %d leaders remain "
+                "(min_required=%d). Falling back to unfiltered sort.",
+                len(sorted_leaders),
+                MIN_REQUIRED,
+            )
+            sorted_leaders = sorted(
+                leader_rows,
+                key=lambda r: (
+                    int(r.get("industry_rank") or 999),
+                    -float(r.get("rs_rating") or 0),
+                    -float(r.get("composite_score") or 0),
+                ),
+            )
+
         watchlist_symbols = _rows_to_symbols(sorted_leaders[:max_watchlist])
-        logger.info(f"ranking empty — using top {len(watchlist_symbols)} from leaders (sorted by composite_score)")
+        logger.info(
+            "[ExternalAlpha] leaders filter: before=%s after=%s removed=%s → top %s "
+            "| drop: etf=%s rs_zero=%s no_industry=%s "
+            "| industry_cap=%s/per",
+            before,
+            len(filtered),
+            before - len(filtered),
+            len(watchlist_symbols),
+            drop_stats["etf"],
+            drop_stats["rs_zero"],
+            drop_stats["no_industry"],
+            MAX_PER_INDUSTRY,
+        )
     else:
         watchlist_symbols = _rows_to_symbols(ranking_rows) or _rows_to_symbols(leader_rows) or list(features_by_symbol.keys())
 
