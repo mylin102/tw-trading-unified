@@ -492,3 +492,32 @@ No stable version at end of day. More of a scaffold than a production system.
   - Removed debug traceback code (fm_tb.txt, format_exception print) from the main loop except block — this was temporary diagnostic instrumentation from the NoneType investigation and is no longer needed
 
 **Rationale**: Futures needed lower entry threshold after MXF migration (smaller per-tick value means scores are naturally lower). Options raised entry score to filter noise. Stocks config reorganized for maintainability. Monitor.py cleanup restores production-ready state.
+
+## 2026-05-04 — Reliability hardening: ledger durability, notification framework, stock state model
+
+**Context**: Three-axis reliability push triggered by a production incident: email notification for `[TXO] ENTRY C @ 10.0` was sent but dashboard showed no record.
+
+**Changes** (10 commits):
+
+### 1. Ledger durability (1 commit)
+- `1d33e9b` — `log_trade()` now uses `flush()` + `os.fsync()` + post-write integrity check. Old `to_csv(mode='a')` could lose rows on abnormal exit. Every trade row is now guaranteed on disk before any caller proceeds.
+
+### 2. Notification framework (4 commits)
+- `dcf64fa` — `email_formatter.py`: structured, layered email payloads with position PnL, regime context, and trade_id
+- `d4c8357` — Regime names unified with ETF regime engine (RISK_ON/TRANSITION/DEFENSIVE/RISK_OFF/CHOP). Subject includes UPL (ENTRY) or RPL (EXIT)
+- `a04a902` — Extracted to `core/notification/`: notifier.py (transport), schemas.py (contract), formatters/options_formatter.py, formatters/futures_formatter.py (placeholder)
+- `fd2ed18` — Documented three-layer architecture
+
+### 3. Stock paper trading state model (5 commits)
+- `f072117` — `pricing_universe = watchlist ∪ open_positions`: dashboard was only fetching prices for watchlist symbols, missing overnight recovery holdings
+- `79aa47c` — Removed duplicate stock PnL from order lifecycle panel
+- `af630b6` — Freshness gate: stale price (>30min) shows `N/A` with age warning instead of misleading PnL
+- `bab3861` — **P0 fix**: separated position state from trade ledger. `position_state.json` stores recovery data (preserving original entry_ts, strategy, avg_cost). Ledger is now an immutable event log only
+- `37c3b86` — Migration guard: dashboard ignores legacy `OVERNIGHT_RECOVERY` entries in old ledger files
+
+**Rationale**: Ledger durability was the most critical — a trading system that can lose trade records on crash is unsafe. Notification framework standardizes observability across all asset classes. Stock state model correction prevents the "fake entry date" chain that made overnight-recovered positions look like they were entered today.
+
+**Remaining (next session)**:
+- `core/notification/formatters/futures_formatter.py`: implement TX/TMF template with stop, ATR, feed freshness
+- Stock: Shioaji quote fallback for open positions not in watchlist (P3 of state model fix)
+
