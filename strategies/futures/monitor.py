@@ -829,8 +829,13 @@ class FuturesMonitor:
             )
             return
 
+        # ── Session transition buffer: 15:00-15:15 is a scheduled break ──
+        # No ticks are emitted during this window. Don't treat it as a failure.
+        hhmm_now = int(now_dt.strftime("%H%M"))
+        in_transition_break = (1500 <= hhmm_now <= 1515)
+
         # If we exceed critical threshold, stop the monitor so external supervisor restarts the process
-        if secs_since_tick >= critical:
+        if secs_since_tick >= critical and not in_transition_break:
             console.print(
                 f"[red][IngestionWatchdog] "
                 f"reason=feed_stale_critical symbol={symbol} "
