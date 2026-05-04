@@ -3051,9 +3051,9 @@ with tab_stocks:
     current_mode = "LIVE" if s_live else "PAPER"
     sl = load_stock_trades(current_mode)
 
-    # Fallback: if today's ledger is empty (no new trades today), load open positions
-    # from position_state.json so dashboard still shows unrealized PnL.
-    if sl is None or sl.empty:
+    # Fallback: if today's ledger is empty or all rows are OVERNIGHT_RECOVERY
+    # (migration guard), load open positions from position_state.json
+    if sl is None or sl.empty or (not sl.empty and sl["reason"].str.contains("OVERNIGHT_RECOVERY").all()):
         try:
             from core.notification.formatters.options_formatter import OptionsFormatter as _noop
         except ImportError:
