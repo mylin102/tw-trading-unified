@@ -3068,20 +3068,41 @@ with tab_stocks:
             # --- Unrealized PnL for open stock positions ---
             open_rows = round_trips[round_trips["出場時間"] == "⏳ 持倉中"]
             if not open_rows.empty:
+                # Build pricing universe: watchlist ∪ open position symbols
+                open_tickers = set()
+                for _, row in open_rows.iterrows():
+                    t = str(row.get("代號", "")).split()[0]
+                    if t:
+                        open_tickers.add(t)
+                pricing_universe = sorted(set(watchlist) | open_tickers)
+
+                live_prices = {}
+                for ticker in pricing_universe:
+                    s_df = load_stock_indicators(ticker)
+                    if s_df is not None and not s_df.empty:
+                        last = s_df.iloc[-1]
+                        close = float(last.get("close", last.get("Close", 0)))
+                        live_prices[ticker] = close
+
                 st.subheader("📊 未實現損益 (持倉中)")
                 cols = st.columns(min(len(open_rows), 4))
                 for idx, (_, row) in enumerate(open_rows.iterrows()):
                     ticker = str(row.get("代號", "")).split()[0]  # Extract ticker from "1525 綠電"
                     entry = float(row.get("進場價", 0))
                     qty = int(row.get("股數", 0))
-                    cur_price = latest_indicator_close(load_stock_indicators(ticker))
-                    if cur_price > 0 and entry > 0 and qty > 0:
+                    cur_price = live_prices.get(ticker)
+                    if cur_price and cur_price > 0 and entry > 0 and qty > 0:
                         unrealized = (cur_price - entry) * qty
                         color = "green" if unrealized >= 0 else "red"
                         with cols[idx % 4]:
                             st.metric(f"{row.get('代號', ticker)}", f"{unrealized:+,.0f} TWD",
                                       delta=f"{unrealized:+,.0f} ({(unrealized/(entry*qty)*100):+.1f}%)")
                             st.caption(f"進場: {entry:.0f} | 目前: {cur_price:.0f} | {qty}股")
+                    else:
+                        with cols[idx % 4]:
+                            st.metric(f"{row.get('代號', ticker)}", "N/A",
+                                      delta="Price unavailable")
+                            st.caption(f"進場: {entry:.0f} | 目前: N/A | {qty}股")
 
             def style_stock_trades(row):
                 pnl = row.get("淨利", "-")
@@ -3123,9 +3144,15 @@ with tab_stocks:
                     st.cache_data.clear()
                     st.rerun()
             
-            # Get LIVE price from the same data source as charts
+            # Get LIVE price: pricing_universe = watchlist ∪ open position symbols
             live_prices = {}
-            for ticker in watchlist:
+            open_order_tickers = set()
+            for order in orders_data:
+                t = order.get("ticker", "")
+                if t:
+                    open_order_tickers.add(t)
+            pricing_universe = sorted(set(watchlist) | open_order_tickers)
+            for ticker in pricing_universe:
                 s_df = load_stock_indicators(ticker)
                 if s_df is not None and not s_df.empty:
                     last = s_df.iloc[-1]
