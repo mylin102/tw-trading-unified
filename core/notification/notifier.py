@@ -3,7 +3,18 @@ Shared email notification infrastructure.
 
 All trade notifications go through this module regardless of asset class.
 Formatters are registered by name (options, futures, stock) and dispatched
-by the caller. The notifier handles SMTP, retry, and fallback.
+by the caller.
+
+Architecture:
+
+    notifier.py              transport layer — SMTP, retry, dispatch
+        schema               contract — TradeEvent, RegimeContext, PositionSnapshot
+        formatter/*          domain presentation — reads monitor/position/PnL
+
+    Rules:
+      - notifier ONLY delivers. Never touches position, PnL, or product logic.
+      - formatter ONLY formats. Reads domain objects, returns subject + body.
+      - schema is the contract between layers.
 
 Usage:
 
@@ -119,7 +130,10 @@ def notify_trade_event(
         subject = formatter_obj.format_subject(payload)
         body = formatter_obj.format_body(payload)
     except Exception as e:
-        logger.error("Notification formatter '%s' failed: %s", formatter, e, exc_info=True)
+        logger.error(
+            "NOTIFICATION_FORMATTER_FAILURE formatter=%s event=%s error=%s",
+            formatter, event, e, exc_info=True,
+        )
         return False
 
     return _send_email(subject, body)
