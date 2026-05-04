@@ -42,6 +42,12 @@ STRATEGY_POLICY: dict[str, dict] = {
         "kill_if_cagr_below": -0.02,
         "description": "v1 ORB + ATR breakout confirmation gate (observation mode)",
     },
+    "trend_continuation_v1": {
+        "enabled_regimes": ["TREND"],
+        "max_weight": 1.0,
+        "kill_if_cagr_below": -0.02,
+        "description": "Trend continuation 'catch-up' entry for strong bull markets",
+    },
     "counter_vwap": {
         "enabled_regimes": ["WEAK", "CHOP", "SQUEEZE"],
         "max_weight": 0.2,
@@ -154,8 +160,8 @@ def _apply_strategy_policy(
 class FuturesRouterConfig:
     """Routing policy for futures entry signals."""
 
-    trend_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15")
-    weak_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "counter_vwap", "spring_upthrust", "kbar_feature", "calendar_condor_v2")
+    trend_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1")
+    weak_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1", "counter_vwap", "spring_upthrust", "kbar_feature", "calendar_condor_v2")
     bear_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust")  # [Bear] conservative short — countertrend + upthrust
     stretched_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust")
     squeeze_strategies: tuple[str, ...] = ()
