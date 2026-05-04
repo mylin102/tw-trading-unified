@@ -33,6 +33,7 @@ class PositionState:
     avg_cost: float                   # average entry price
     last_price: float                 # current market price
     unrealized_pnl: float             # (last - cost) * qty_point_value - fees
+    realized_pnl: float = 0.0         # set for EXIT events (from log_trade PnL)
     point_value: float = 50.0         # TXO contract multiplier
     entry_price: float = 0.0          # latest entry price (may differ from avg_cost)
 
@@ -51,7 +52,7 @@ class PortfolioSummary:
 @dataclass
 class RegimeContext:
     """Market regime at notification time."""
-    regime: str = ""                  # "BULL", "BEAR", "TRANSITION", etc.
+    regime: str = ""                  # mapped to ETF regime names: RISK_ON, TRANSITION, etc.
     score: float = 0.0
     action_type: str = ""             # "SCOUT", "SCALE", "EXIT"
     momentum: float = 0.0
@@ -81,19 +82,49 @@ class EmailPayload:
 
 
 # ──────────────────────────────────────────────────────────────
+# Regime name map — unify with ETF regime engine names
+# ──────────────────────────────────────────────────────────────
+
+_REGIME_MAP = {
+    "BULL": "RISK_ON",
+    "BULLISH": "RISK_ON",
+    "BEAR": "RISK_OFF",
+    "BEARISH": "RISK_OFF",
+    "WEAK": "DEFENSIVE",
+    "CHOP": "CHOP",
+    "CHOPPY": "CHOP",
+    "TREND": "TRANSITION",
+    "RISK_ON": "RISK_ON",
+    "TRANSITION": "TRANSITION",
+    "RISK_OFF": "RISK_OFF",
+    "DEFENSIVE": "DEFENSIVE",
+}
+
+
+def _map_regime(raw: str) -> str:
+    """Map monitor's mid_trend label to ETF regime names."""
+    return _REGIME_MAP.get(raw.strip().upper(), raw or "")
+
+
+# ──────────────────────────────────────────────────────────────
 # Formatting — subject + body (layered)
 # ──────────────────────────────────────────────────────────────
 
 def format_subject(payload: EmailPayload) -> str:
     e = payload.trade_event
     p = payload.position
-    r = payload.regime
+    is_exit = "EXIT" in e.action
 
-    # [TXO] ENTRY CALL @ 10.0 | trade_20260504_ab12cd34
     side_label = {"C": "CALL", "P": "PUT", "THETA": "THETA"}.get(e.side, e.side)
     action_label = _short_action(e.action)
 
-    return f"[{p.symbol}] {action_label} {side_label} @ {e.price:.1f} | {e.trade_id}"
+    if is_exit:
+        # [TXO] EXIT CALL @ 12.5 | RPL +$125 | trade_xxx
+        rpl = getattr(p, "realized_pnl", 0.0) or 0.0
+        return f"[{p.symbol}] {action_label} {side_label} @ {e.price:.1f} | RPL {_format_pnl(rpl)} | {e.trade_id}"
+    else:
+        # [TXO] ENTRY CALL @ 10.0 | UPL +$15 | trade_xxx
+        return f"[{p.symbol}] {action_label} {side_label} @ {e.price:.1f} | UPL {_format_pnl(p.unrealized_pnl)} | {e.trade_id}"
 
 
 def format_body(payload: EmailPayload) -> str:
@@ -127,23 +158,28 @@ def _core_section(payload: EmailPayload) -> list:
     e = payload.trade_event
     p = payload.position
     r = payload.regime
+    is_exit = "EXIT" in e.action
 
     side_icon = {"C": "🟢", "P": "🔴"}.get(e.side, "⚪")
     action_label = {"ENTRY": "ENTRY", "EXIT": "EXIT", "SCALE": "ADD"}.get(
         _short_action(e.action), _short_action(e.action)
     )
 
-    pnl_str = _format_pnl(p.unrealized_pnl)
+    pnl_label = "Realized PnL" if is_exit else "Unrealized PnL"
+    pnl_value = getattr(p, "realized_pnl", p.unrealized_pnl) if is_exit else p.unrealized_pnl
+    pnl_str = _format_pnl(pnl_value)
     lines = [
         f"{side_icon} {p.symbol} {action_label} {e.side} qty={e.quantity} @ {e.price:.1f}",
         "",
         f"  Position:  {_fmt_signed(p.qty)}{e.side}  (avg cost {p.avg_cost:.1f})",
-        f"  Unrealized PnL: {pnl_str}",
+        f"  {pnl_label}: {pnl_str}",
         f"  Last price:     {p.last_price:.1f}",
     ]
 
-    if r.regime:
-        lines.append(f"  Regime:  {r.regime} ({r.score:.2f})")
+    # Use mapped regime name
+    regime_name = _map_regime(r.regime)
+    if regime_name:
+        lines.append(f"  Regime:  {regime_name} ({r.score:.2f})")
     if r.action_type:
         lines.append(f"  Action:  {r.action_type}")
 
@@ -173,7 +209,7 @@ def _regime_section(payload: EmailPayload) -> list:
     r = payload.regime
     return [
         "── Market Context ──",
-        f"  Regime:      {r.regime or '-'}",
+        f"  Regime:      {_map_regime(r.regime) or '-'}",
         f"  Score:       {r.score:.1f}" if r.score else "  Score:       -",
         f"  Momentum:    {r.momentum:.1f}" if r.momentum else "  Momentum:    -",
         f"  IV:          {r.iv:.3f}" if r.iv else "  IV:          -",

@@ -1597,6 +1597,12 @@ class ShioajiOptionsSmartMonitor:
                                     side=self.active_side or "", price=price, quantity=quantity)
                     payload = build_from_monitor(self, te)
                     payload.position.unrealized_pnl = compute_unrealized_pnl(payload.position)
+                    # Read realized PnL from last ledger row
+                    try:
+                        last = pd.read_csv(self.ledger_path).iloc[-1]
+                        payload.position.realized_pnl = float(last.get("PnL", 0.0) or 0.0)
+                    except Exception:
+                        pass
                     subject = format_subject(payload)
                     body = format_body(payload)
                 else:
