@@ -3082,7 +3082,8 @@ with tab_stocks:
                     if s_df is not None and not s_df.empty:
                         last = s_df.iloc[-1]
                         close = float(last.get("close", last.get("Close", 0)))
-                        live_prices[ticker] = close
+                        ts = str(last.get("timestamp", ""))
+                        live_prices[ticker] = {"price": close, "ts": ts}
 
                 st.subheader("📊 未實現損益 (持倉中)")
                 cols = st.columns(min(len(open_rows), 4))
@@ -3090,8 +3091,22 @@ with tab_stocks:
                     ticker = str(row.get("代號", "")).split()[0]  # Extract ticker from "1525 綠電"
                     entry = float(row.get("進場價", 0))
                     qty = int(row.get("股數", 0))
-                    cur_price = live_prices.get(ticker)
-                    if cur_price and cur_price > 0 and entry > 0 and qty > 0:
+                    price_info = live_prices.get(ticker)
+                    cur_price = price_info["price"] if price_info else None
+                    ts_str = price_info["ts"] if price_info else ""
+                    
+                    # Freshness check: price must be from today's session
+                    is_fresh = False
+                    age_mins = 0
+                    if ts_str and cur_price and cur_price > 0:
+                        try:
+                            price_dt = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                            age_mins = (datetime.datetime.now() - price_dt).total_seconds() / 60.0
+                            is_fresh = age_mins < 30  # 30-min stale threshold
+                        except (ValueError, TypeError):
+                            is_fresh = False
+                    
+                    if cur_price and cur_price > 0 and entry > 0 and qty > 0 and is_fresh:
                         unrealized = (cur_price - entry) * qty
                         color = "green" if unrealized >= 0 else "red"
                         with cols[idx % 4]:
@@ -3099,10 +3114,14 @@ with tab_stocks:
                                       delta=f"{unrealized:+,.0f} ({(unrealized/(entry*qty)*100):+.1f}%)")
                             st.caption(f"進場: {entry:.0f} | 目前: {cur_price:.0f} | {qty}股")
                     else:
+                        reason = "Price unavailable"
+                        if ts_str and cur_price and cur_price > 0:
+                            days_ago = max(1, int(age_mins / 1440))
+                            reason = f"⚠️ 價格過期 ({days_ago} 天前: {ts_str})"
                         with cols[idx % 4]:
                             st.metric(f"{row.get('代號', ticker)}", "N/A",
-                                      delta="Price unavailable")
-                            st.caption(f"進場: {entry:.0f} | 目前: N/A | {qty}股")
+                                      delta=reason)
+                            st.caption(f"進場: {entry:.0f} | 目前: {'N/A' if not cur_price else f'{cur_price:.0f} (過期)'} | {qty}股")
 
             def style_stock_trades(row):
                 pnl = row.get("淨利", "-")
