@@ -944,10 +944,14 @@ class TestPnLSilentFailurePrevention:
     def test_theta_exit_bypasses_log_trade(self):
         """ThetaGang exit should write PnL directly, not through log_trade."""
         src = Path("strategies/options/live_options_squeeze_monitor.py").read_text()
-        # ThetaGang should write directly to ledger, not call log_trade
-        theta_exit_section = src[src.find("THETA_EXIT"):]
-        # Should have direct CSV write
-        assert "to_csv" in theta_exit_section[:3500]
+        # ThetaGang should write directly to ledger using _append_csv_row_durable
+        # Find the *second* THETA_EXIT occurrence (the actual write, not the keyword list)
+        first_idx = src.find("THETA_EXIT")
+        theta_exit_section = src[first_idx + 1:]
+        second_idx = theta_exit_section.find("THETA_EXIT")
+        actual_write_section = theta_exit_section[second_idx:]
+        # Should have direct durable write (not via log_trade)
+        assert "_append_csv_row_durable" in actual_write_section[:3500]
 
     def test_exit_pnl_zero_warning(self):
         """log_trade should warn when exit PnL is 0."""

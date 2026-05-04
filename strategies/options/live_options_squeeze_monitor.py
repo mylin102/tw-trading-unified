@@ -9,6 +9,9 @@ from collections import deque
 import sys
 import os
 import threading
+import logging
+import io
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from rich.console import Console
@@ -55,6 +58,7 @@ except ImportError:
     _notify = None
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 # 🚀 確保優先使用當前專案的 src 目錄，避免讀取到其他專案的舊版本
 ROOT = Path(__file__).resolve().parent
@@ -291,6 +295,14 @@ class ShioajiOptionsSmartMonitor:
         date_str = get_session_date_str(now)
         self.indicator_log_path = log_base / f"OPTIONS_{date_str}_indicators.csv"
         self.ledger_path = log_base / "options_trade_ledger.csv"
+
+        logger.info(
+            "TRADE_LEDGER_PATH mode=%s live_trading=%s dry_run=%s path=%s",
+            "LIVE" if self.live_trading else "PAPER",
+            self.live_trading,
+            getattr(self, "dry_run", None),
+            self.ledger_path.resolve(),
+        )
 
     def load_config(self):
         # BUG FIX 2026-04-14: Read from project root config (same file dashboard writes to)
@@ -1230,9 +1242,66 @@ class ShioajiOptionsSmartMonitor:
         remaining_capacity = max(0, int(self.max_positions) - int(self.position))
         if remaining_capacity <= 0:
             return 0
-        return min(scaled_lots, remaining_capacity)
+
+    # ──────────────────────────────────────────────────────────────
+    # Trade Ledger Durability — append_csv_row_durable + make_trade_id
+    # Ensures every trade row is fsynced to disk before notification.
+    # ──────────────────────────────────────────────────────────────
+    @staticmethod
+    def _make_trade_id() -> str:
+        ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S.%f")
+        return f"trade_{ts}_{uuid.uuid4().hex[:8]}"
+
+    @staticmethod
+    def _append_csv_row_durable(path: Path, row: dict) -> None:
+        """Append one CSV row and force it to disk (flush + fsync).
+
+        This is a durability-safe replacement for
+            pd.DataFrame([row]).to_csv(path, mode='a', header=not exists)
+
+        The old pattern could lose rows on abnormal process exit because
+        pandas to_csv(..., mode='a') writes through a buffered stream
+        without flushing to kernel buffers or disk.
+        """
+        path = Path(path).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        write_header = not path.exists() or path.stat().st_size == 0
+
+        df_row = pd.DataFrame([row])
+        buf = io.StringIO()
+        df_row.to_csv(buf, index=False, header=write_header)
+
+        with open(path, "a", encoding="utf-8", newline="") as f:
+            f.write(buf.getvalue())
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Post-write integrity check
+        if not path.exists() or path.stat().st_size == 0:
+            raise RuntimeError(f"Trade ledger write failed (empty/missing): {path}")
+
+        # Verify last row has the expected trade_id
+        ShioajiOptionsSmartMonitor._verify_last_trade_id(path, row.get("trade_id", ""))
+
+    @staticmethod
+    def _verify_last_trade_id(path: Path, expected_trade_id: str) -> None:
+        """Read back last row and confirm trade_id matches."""
+        try:
+            last_row = pd.read_csv(path).iloc[-1]
+            actual = str(last_row.get("trade_id", "")).strip()
+            if actual != expected_trade_id:
+                raise RuntimeError(
+                    f"Trade ledger last-row trade_id mismatch: "
+                    f"expected={expected_trade_id} actual={actual} path={path}"
+                )
+        except (IndexError, pd.errors.EmptyDataError) as e:
+            raise RuntimeError(
+                f"Trade ledger verify failed (empty/corrupt): {e} path={path}"
+            )
 
     def log_trade(self, action, side, price, note="", quantity=None, entry_price_override=None):
+        trade_id = self._make_trade_id()
         pnl = 0
         point_value = self.pricing_cfg.get("point_value", 50)
         # ── [PnL Fix] Use passed quantity; never fallback to self.position (already cleared) ──
@@ -1296,12 +1365,23 @@ class ShioajiOptionsSmartMonitor:
         balance = (balance if not pd.isna(balance) else 0) + pnl
         balance = round(balance, 0)
         data = {
+            "trade_id": trade_id,
             "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "Mode": self.mode, "Action": action, "Side": side,
             "Price": price, "Quantity": qty,
             "PnL": pnl, "Balance": balance, "Note": str(note).replace(",", ";"),
         }
-        pd.DataFrame([data]).to_csv(self.ledger_path, mode='a', index=False, header=not self.ledger_path.exists())
+        self._append_csv_row_durable(self.ledger_path, data)
+
+        logger.info(
+            "TRADE_LEDGER_WRITTEN path=%s trade_id=%s action=%s side=%s price=%s size=%d",
+            self.ledger_path.resolve(),
+            trade_id,
+            action,
+            side,
+            price,
+            self.ledger_path.stat().st_size,
+        )
 
         # [GSD Phase B] Log outcome attribution
         if is_exit_action and hasattr(self, "_entry_features") and self._entry_features:
@@ -1312,7 +1392,7 @@ class ShioajiOptionsSmartMonitor:
                 "exit_reason": str(action)
             }
             DecisionLogger.log_trade_outcome(
-                trade_id=f"OPT-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}",
+                trade_id=trade_id,
                 strategy=f"{self.mode}_squeeze",
                 regime=self._entry_features.get("regime", "NORMAL"),
                 features=self._entry_features,
@@ -1321,6 +1401,8 @@ class ShioajiOptionsSmartMonitor:
             # Clear features after exit
             if "TP1" not in action: # Only clear if full exit
                 self._entry_features = {}
+
+        return trade_id
 
     def _find_lifecycle_order(self, order_id):
         if not self.order_mgr or not order_id:
@@ -1458,9 +1540,12 @@ class ShioajiOptionsSmartMonitor:
                 "entry_price": float(price)
             }
             
-            self.log_trade("LIVE_ENTRY_FILLED", side, price, f"qty={quantity}")
+            trade_id = self.log_trade("LIVE_ENTRY_FILLED", side, price, f"qty={quantity}")
             if _notify:
-                _notify(f"[TXO] ENTRY {side} @ {price:.1f}", f"🟢 ENTRY {side} qty={quantity} @ {price:.1f}")
+                _notify(
+                    f"[TXO] ENTRY {side} @ {price:.1f} | {trade_id}",
+                    f"🟢 ENTRY {side} qty={quantity} @ {price:.1f}\ntrade_id={trade_id}",
+                )
             if self.position >= int(self.pending_entry.get("requested_qty", self.base_lots)):
                 self.pending_entry = None
             return
@@ -1482,9 +1567,12 @@ class ShioajiOptionsSmartMonitor:
                 )
             self._remember_live_fill(msg)
             self.position = max(0, self.position - quantity)
-            self.log_trade("LIVE_EXIT_FILLED", self.active_side, price, f"qty={quantity} reason={self.pending_exit_reason or ''}".strip())
+            trade_id = self.log_trade("LIVE_EXIT_FILLED", self.active_side, price, f"qty={quantity} reason={self.pending_exit_reason or ''}".strip())
             if _notify:
-                _notify(f"[TXO] EXIT {self.active_side} @ {price:.1f}", f"🔴 EXIT {self.active_side} qty={quantity} @ {price:.1f} reason={self.pending_exit_reason or ''}")
+                _notify(
+                    f"[TXO] EXIT {self.active_side} @ {price:.1f} | {trade_id}",
+                    f"🔴 EXIT {self.active_side} qty={quantity} @ {price:.1f} reason={self.pending_exit_reason or ''}\ntrade_id={trade_id}",
+                )
             if self.pending_exit_reason == "LIVE_TP1_SUBMITTED" and self.position > 0:
                 self.has_tp1_hit = True
                 self.replay_stats["tp1_hits"] += 1
@@ -2321,9 +2409,9 @@ class ShioajiOptionsSmartMonitor:
             self.latest_score = score
             self.latest_mid_trend = mid_trend or ""
             # Cache BS for failsafe
-            self.latest_bs_atr = _safe_float(row.get("breakout_strength_atr", 0.0))
-            self.latest_bear_bs_atr = _safe_float(row.get("bear_breakout_strength_atr", 0.0))
-            
+            self.latest_bs_atr = float(row.get("breakout_strength_atr", 0.0) or 0.0)
+            self.latest_bear_bs_atr = float(row.get("bear_breakout_strength_atr", 0.0) or 0.0)
+
             side = resolve_entry_side(row, score, row["Close"], self.entry_score, mid_trend=mid_trend, require_mid_trend=True)
 
             # V2 filters: require_fire and require_align
@@ -4337,7 +4425,7 @@ class ShioajiOptionsSmartMonitor:
                                 "PnL": theta_pnl, "Balance": new_balance,
                                 "Note": f"{exit_info['reason']} credit={pos.net_credit:.0f} pnl={exit_info['pnl']:.0f}",
                             }
-                            pd.DataFrame([theta_row]).to_csv(self.ledger_path, mode='a', index=False, header=not self.ledger_path.exists())
+                            self._append_csv_row_durable(self.ledger_path, theta_row)
                             self._record_paper_order(
                                 "THETA",
                                 "EXIT",
