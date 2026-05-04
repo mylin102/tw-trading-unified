@@ -3135,30 +3135,6 @@ with tab_stocks:
         orders_data = load_stock_orders(current_mode)
 
         if orders_data:
-            # 添加更新按鈕
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.write("**📊 未實現損益計算**")
-            with col2:
-                if st.button("🔄 更新", key="update_stock_unrealized"):
-                    st.cache_data.clear()
-                    st.rerun()
-            
-            # Get LIVE price: pricing_universe = watchlist ∪ open position symbols
-            live_prices = {}
-            open_order_tickers = set()
-            for order in orders_data:
-                t = order.get("ticker", "")
-                if t:
-                    open_order_tickers.add(t)
-            pricing_universe = sorted(set(watchlist) | open_order_tickers)
-            for ticker in pricing_universe:
-                s_df = load_stock_indicators(ticker)
-                if s_df is not None and not s_df.empty:
-                    last = s_df.iloc[-1]
-                    close = float(last.get('close', last.get('Close', 0)))
-                    live_prices[ticker] = close
-
             # Process orders for display
             order_rows = []
             for order in orders_data:
@@ -3180,16 +3156,7 @@ with tab_stocks:
                     "MKT_RANGE": "範圍市價單"
                 }
                 order_type_display = order_type_map.get(order_type, order_type)
-                
-                # Calculate unrealized PnL for open positions (FILLED BUY with no SELL)
-                unrealized = 0.0
-                if ticker in live_prices:
-                    current_price = live_prices[ticker]
-                    if side == "BUY" and status in ("FILLED", "OPEN"):
-                        unrealized = (current_price - price) * qty
-                    elif side == "SELL" and status in ("FILLED", "OPEN"):
-                        unrealized = (price - current_price) * qty
-                
+
                 order_rows.append({
                     "委託單號": order_id,
                     "股票代號": ticker,
@@ -3200,7 +3167,6 @@ with tab_stocks:
                     "委託價格": price,
                     "已成交數量": filled_qty,
                     "成交均價": filled_price,
-                    "未實現損益": f"{unrealized:+,.0f}" if unrealized != 0 else "—",
                     "時間": timestamp
                 })
             
@@ -3227,13 +3193,6 @@ with tab_stocks:
                         styles[2] = 'background-color: #dbeafe; color: #1e40af; font-weight: bold'
                     elif side == "SELL":
                         styles[2] = 'background-color: #fce7f3; color: #9d174d; font-weight: bold'
-                    
-                    # Unrealized PnL colors
-                    unrealized = row.get("未實現損益", "")
-                    if "+" in str(unrealized):
-                        styles[8] = 'background-color: #dcfce7; color: #065f46; font-weight: bold'
-                    elif "-" in str(unrealized):
-                        styles[8] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
                     
                     return styles
                 
