@@ -11,6 +11,12 @@ import shioaji as sj
 from core.dashboard_data import build_stock_orders_from_trades
 from strategies.stocks.scanner import StockScanner
 from strategies.stocks.data_storage import StockDataStorage
+from strategies.stocks.position_state import (
+    position_state_path,
+    load_position_state,
+    save_position_state,
+    merge_recovery,
+)
 
 ROOT = Path(__file__).parent.parent.parent
 MKT_LOGS = ROOT / "logs" / "market_data"
@@ -84,30 +90,32 @@ class StockMonitor:
         return sum([p["qty"] * p["entry_price"] for p in self.positions.values()])
 
     def _recover_positions_from_ledger(self):
-        """GSD: Recover overnight positions from previous day's trade ledger.
-        
-        Reads yesterday's trades CSV, calculates net positions (BUY - SELL),
-        and restores them to self.positions so the monitor doesn't double-buy.
-        Also writes BUY records to today's ledger so the dashboard can display them.
+        """Recover overnight positions from previous day's trade ledger.
+
+        Restores self.positions and writes to position_state.json.
+        Does NOT write to today's trade ledger — the ledger is an immutable
+        event log and must not contain synthetic entries.
+
+        Dashboard reads position_state.json for open positions instead
+        of scanning the ledger for OVERNIGHT_RECOVERY entries.
         """
-        # GSD Fix: Skip if already recovered (today's ledger has OVERNIGHT_RECOVERY)
-        if self.ledger_path.exists():
-            try:
-                existing = pd.read_csv(self.ledger_path)
-                if not existing.empty and existing["reason"].str.contains("OVERNIGHT_RECOVERY").any():
-                    # Re-load positions from recovery records but don't write again
-                    recoveries = existing[existing["reason"].str.contains("OVERNIGHT_RECOVERY")]
-                    for _, row in recoveries.drop_duplicates(subset=["ticker"]).iterrows():
-                        self.positions[str(row["ticker"])] = {
-                            "stage": "HOLD", "entry_price": row["entry_price"], "qty": int(row["qty"]),
-                        }
-                    console.print(f"[dim]♻️ Already recovered {len(self.positions)} positions from today's ledger[/dim]")
-                    return
-            except Exception:
-                pass
+        # GSD Fix: Skip if already recovered (position_state exists for today)
+        state_file = position_state_path(TRADE_LOGS, self.date_str, self.mode_tag)
+        today_state = load_position_state(state_file)
+        if today_state:
+            for ticker, pos in today_state.items():
+                self.positions[str(ticker)] = {
+                    "stage": "HOLD",
+                    "entry_price": pos.get("avg_cost", 0.0),
+                    "qty": int(pos.get("qty", 0)),
+                }
+            if self.positions:
+                console.print(f"[dim]♻️ Already recovered {len(self.positions)} positions from today's state file[/dim]")
+            return
 
         # Find the most recent ledger within the last 7 days
         ledger_file = None
+        last_ledger_date = None
         for i in range(1, 8):
             check_date = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
             possible_file = TRADE_LOGS / f"STOCK_{check_date}_{self.mode_tag}_trades.csv"
@@ -126,54 +134,61 @@ class StockMonitor:
                 console.print(f"[dim]📂 Previous ledger ({ledger_file.name}) is empty[/dim]")
                 return
 
-            # Calculate net positions: BUY qty - SELL qty
-            # We need to consider that the previous ledger itself might have OVERNIGHT_RECOVERY entries
-            # which represent carry-over from even earlier days.
-            buys = df[df["action"] == "BUY"].groupby("ticker").agg({"qty": "sum", "entry_price": "mean"})
+            # Find earliest BUY entries per ticker (original entry, not recovery)
+            buys = df[df["action"] == "BUY"].copy()
+            if buys.empty:
+                console.print(f"[dim]📂 No BUY entries in previous ledger[/dim]")
+                return
+
             sells = df[df["action"] == "SELL"].groupby("ticker").agg({"qty": "sum"})
 
-            # Merge and calculate net
+            now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             recovered_count = 0
-            for ticker, buy_row in buys.iterrows():
-                buy_qty = buy_row["qty"]
+
+            # Process each ticker: restore original entry info, not recovery-write
+            for ticker, buy_group in buys.groupby("ticker"):
+                buy_qty = buy_group["qty"].sum()
                 sell_qty = sells.loc[ticker, "qty"] if ticker in sells.index else 0
-                net_qty = buy_qty - sell_qty
+                net_qty = int(buy_qty - sell_qty)
 
-                if net_qty > 0:
-                    avg_price = buy_row["entry_price"]
-                    self.positions[str(ticker)] = {
-                        "stage": "HOLD",
-                        "entry_price": avg_price,
-                        "qty": int(net_qty),
-                    }
-                    recovered_count += 1
-                    console.print(f"[green]♻️ Recovered position: {ticker} qty={int(net_qty)} @ {avg_price:.2f}[/green]")
+                if net_qty <= 0:
+                    continue
 
-                    # GSD Fix: Also write to today's ledger so dashboard can display it
-                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    recovery_record = {
-                        "timestamp": now,
-                        "ticker": ticker,
-                        "strategy": self.strat_name,
-                        "mode": self.mode_tag,
-                        "action": "BUY",
-                        "price": avg_price,
-                        "entry_price": avg_price,
-                        "qty": int(net_qty),
-                        "reason": f"OVERNIGHT_RECOVERY_{last_ledger_date}",
-                        "pnl_gross": 0.0,
-                        "fees": 0.0,
-                        "pnl_cash": 0.0,
-                    }
-                    rec_df = pd.DataFrame([recovery_record])
-                    header = not self.ledger_path.exists()
-                    rec_df.to_csv(self.ledger_path, mode='a', header=header, index=False)
+                # Pick the earliest BUY row as the canonical entry
+                first_buy = buy_group.sort_values("timestamp").iloc[0]
+                avg_price = float(first_buy.get("entry_price", first_buy["price"]))
+                original_ts = str(first_buy.get("timestamp", ""))
+                original_strategy = str(first_buy.get("strategy", self.strat_name))
+
+                # Restore in-memory position
+                self.positions[str(ticker)] = {
+                    "stage": "HOLD",
+                    "entry_price": avg_price,
+                    "qty": net_qty,
+                }
+                recovered_count += 1
+                console.print(f"[green]♻️ Recovered position: {ticker} qty={net_qty} @ {avg_price:.2f} (original: {original_ts})[/green]")
+
+                # Write to position_state.json only (NOT to ledger)
+                merge_recovery(
+                    today_state,
+                    ticker=ticker,
+                    original_entry_ts=original_ts,
+                    strategy=original_strategy,
+                    mode=self.mode_tag,
+                    avg_cost=avg_price,
+                    qty=net_qty,
+                    realized_pnl=0.0,
+                    recovered_from=last_ledger_date,
+                    recovery_ts=now_ts,
+                )
 
             if recovered_count > 0:
+                save_position_state(state_file, today_state)
                 total_value = sum(p["qty"] * p["entry_price"] for p in self.positions.values())
-                console.print(f"[bold green]✅ Recovered {recovered_count} positions (total value: ${total_value:,.0f}) — written to today's ledger for dashboard display[/bold green]")
+                console.print(f"[bold green]✅ Recovered {recovered_count} positions → position_state.json (total value: ${total_value:,.0f})[/bold green]")
             else:
-                console.print(f"[dim]📂 No open positions from yesterday[/dim]")
+                console.print(f"[dim]📂 No open positions from previous ledger[/dim]")
 
         except Exception as e:
             console.print(f"[yellow]⚠️ Position recovery failed: {e}[/yellow]")
