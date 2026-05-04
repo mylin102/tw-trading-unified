@@ -57,6 +57,22 @@ try:
 except ImportError:
     _notify = None
 
+# Structured email formatter for post-persist notifications
+try:
+    from strategies.options.email_formatter import (
+        EmailPayload,
+        TradeEvent,
+        PositionState,
+        RegimeContext,
+        format_subject,
+        format_body,
+        compute_unrealized_pnl,
+        build_from_monitor,
+    )
+    _has_email_formatter = True
+except ImportError:
+    _has_email_formatter = False
+
 console = Console()
 logger = logging.getLogger(__name__)
 
@@ -1542,10 +1558,17 @@ class ShioajiOptionsSmartMonitor:
             
             trade_id = self.log_trade("LIVE_ENTRY_FILLED", side, price, f"qty={quantity}")
             if _notify:
-                _notify(
-                    f"[TXO] ENTRY {side} @ {price:.1f} | {trade_id}",
-                    f"🟢 ENTRY {side} qty={quantity} @ {price:.1f}\ntrade_id={trade_id}",
-                )
+                if _has_email_formatter:
+                    te = TradeEvent(trade_id=trade_id, action="LIVE_ENTRY_FILLED",
+                                    side=side, price=price, quantity=quantity)
+                    payload = build_from_monitor(self, te)
+                    payload.position.unrealized_pnl = compute_unrealized_pnl(payload.position)
+                    subject = format_subject(payload)
+                    body = format_body(payload)
+                else:
+                    subject = f"[TXO] ENTRY {side} @ {price:.1f} | {trade_id}"
+                    body = f"🟢 ENTRY {side} qty={quantity} @ {price:.1f}\ntrade_id={trade_id}"
+                _notify(subject, body)
             if self.position >= int(self.pending_entry.get("requested_qty", self.base_lots)):
                 self.pending_entry = None
             return
@@ -1569,10 +1592,17 @@ class ShioajiOptionsSmartMonitor:
             self.position = max(0, self.position - quantity)
             trade_id = self.log_trade("LIVE_EXIT_FILLED", self.active_side, price, f"qty={quantity} reason={self.pending_exit_reason or ''}".strip())
             if _notify:
-                _notify(
-                    f"[TXO] EXIT {self.active_side} @ {price:.1f} | {trade_id}",
-                    f"🔴 EXIT {self.active_side} qty={quantity} @ {price:.1f} reason={self.pending_exit_reason or ''}\ntrade_id={trade_id}",
-                )
+                if _has_email_formatter:
+                    te = TradeEvent(trade_id=trade_id, action="LIVE_EXIT_FILLED",
+                                    side=self.active_side or "", price=price, quantity=quantity)
+                    payload = build_from_monitor(self, te)
+                    payload.position.unrealized_pnl = compute_unrealized_pnl(payload.position)
+                    subject = format_subject(payload)
+                    body = format_body(payload)
+                else:
+                    subject = f"[TXO] EXIT {self.active_side} @ {price:.1f} | {trade_id}"
+                    body = f"🔴 EXIT {self.active_side} qty={quantity} @ {price:.1f} reason={self.pending_exit_reason or ''}\ntrade_id={trade_id}"
+                _notify(subject, body)
             if self.pending_exit_reason == "LIVE_TP1_SUBMITTED" and self.position > 0:
                 self.has_tp1_hit = True
                 self.replay_stats["tp1_hits"] += 1
