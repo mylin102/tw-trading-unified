@@ -1121,6 +1121,11 @@ def format_stock_trades(ledger_df):
     for _, row in ledger_df.iterrows():
         action = str(row.get("action", "")).upper()
         ticker = str(row.get("ticker", ""))
+        reason = str(row.get("reason", ""))
+        # Migration guard: skip OVERNIGHT_RECOVERY entries — they are synthetic
+        # state records from the old recovery logic that polluted the ledger.
+        if "OVERNIGHT_RECOVERY" in reason:
+            continue
         if action == "BUY":
             pending_entries[ticker] = {
                 "entry_time": str(row.get("timestamp", "")),
