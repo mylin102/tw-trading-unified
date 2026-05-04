@@ -46,9 +46,20 @@ from squeeze_futures.data.tick_writer import RawTickWriter, get_trading_day_str
 from squeeze_futures.data.kbar_writer import RawKbarWriter
 
 try:
-    from squeeze_futures.report.notifier import send_email_notification
+    from squeeze_futures.report.notifier import send_email_notification as _legacy_notify
 except ImportError:
-    send_email_notification = None
+    _legacy_notify = None
+
+# Structured notification system (core/notification/)
+try:
+    from core.notification.notifier import notify_trade_event as _notify_trade_event
+    from core.notification.formatters.futures_formatter import (
+        FuturesPositionState,
+        compute_futures_pnl,
+    )
+    _has_notification_system = True
+except ImportError:
+    _has_notification_system = False
 
 console = Console()
 
@@ -2472,11 +2483,21 @@ class FuturesMonitor:
                 direction = "LONG" if signal == "BUY" else "SHORT"
                 sl_pts = stop_loss if stop_loss else self.RISK.get("stop_loss_pts", 60)
                 self._place_safety_stop(price, direction, lots, sl_pts)
-            if send_email_notification:
-                    send_email_notification(
-                        f"[MXF] {signal} {lots} lots @ {price:.0f}",
-                        f"{d} {lots} lots @ {price:.0f}\n{result}",
-                    )
+            if _has_notification_system:
+                from core.notification.schemas import TradeEvent as _TE
+                te = _TE(
+                    trade_id=f"FUT-{datetime.now().strftime('%Y%m%d%H%M%S')}-{int(time.time()*1000)%10000}",
+                    action=f"LIVE_{'ENTRY' if signal in ('BUY','SELL') else 'EXIT'}_FILLED",
+                    side="LONG" if signal == "BUY" else "SHORT" if signal == "SELL" else "",
+                    price=price,
+                    quantity=lots,
+                )
+                _notify_trade_event(event=te, formatter="futures", monitor=self)
+            elif _legacy_notify:
+                _legacy_notify(
+                    f"[MXF] {signal} {lots} lots @ {price:.0f}",
+                    f"{d} {lots} lots @ {price:.0f}\n{result}",
+                )
         return result
 
     def _check_stop_loss(self, ts, price):
