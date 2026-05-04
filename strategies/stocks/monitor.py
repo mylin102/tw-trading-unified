@@ -413,6 +413,11 @@ class StockMonitor:
 
         self.clean_unfilled_orders()
         scan_list = self._loop_state["active_watchlist"] if self._loop_state["active_watchlist"] else self.watchlist
+        # Also scan open positions (may include overnight holdings not in watchlist)
+        position_tickers = [t for t in self.positions.keys() if t not in scan_list]
+        if position_tickers:
+            scan_list = list(scan_list) + position_tickers
+            console.print(f"[dim]📋 Added {len(position_tickers)} open positions to scan: {position_tickers}[/dim]")
         console.print(f"[dim]🔍 Scanning {len(scan_list)} tickers: {scan_list[:5]}{'...' if len(scan_list) > 5 else ''}[/dim]")
 
         for ticker in scan_list:
@@ -903,7 +908,11 @@ class StockMonitor:
         try:
             # 獲取當前市場價格用於計算未實現損益
             current_prices = {}
-            for ticker in self.watchlist:
+            price_tickers = list(self.watchlist)
+            for t in self.positions:
+                if t not in price_tickers:
+                    price_tickers.append(t)
+            for ticker in price_tickers:
                 try:
                     contract = self.api.Contracts.Stocks[ticker]
                     snapshot = self.api.snapshots([contract])[0]
