@@ -3050,6 +3050,46 @@ with tab_stocks:
     # 讀取目前運行的模式
     current_mode = "LIVE" if s_live else "PAPER"
     sl = load_stock_trades(current_mode)
+
+    # Fallback: if today's ledger is empty (no new trades today), load open positions
+    # from position_state.json so dashboard still shows unrealized PnL.
+    if sl is None or sl.empty:
+        try:
+            from core.notification.formatters.options_formatter import OptionsFormatter as _noop
+        except ImportError:
+            pass  # just for fallback
+        from strategies.stocks.position_state import (
+            position_state_path,
+            load_position_state,
+        )
+        state_file = position_state_path(FUTURES_TRADES, datetime.datetime.now().strftime("%Y%m%d"), current_mode)
+        pos_state = load_position_state(state_file)
+        if not pos_state:
+            # Try yesterday's file
+            yesterday = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y%m%d")
+            state_file = position_state_path(FUTURES_TRADES, yesterday, current_mode)
+            pos_state = load_position_state(state_file)
+        if pos_state:
+            rows = []
+            for ticker, pos in pos_state.items():
+                if pos.get("qty", 0) > 0:
+                    rows.append({
+                        "timestamp": pos.get("entry_ts", ""),
+                        "ticker": ticker,
+                        "strategy": pos.get("strategy", ""),
+                        "mode": current_mode,
+                        "action": "BUY",
+                        "price": pos.get("avg_cost", 0),
+                        "entry_price": pos.get("avg_cost", 0),
+                        "qty": pos.get("qty", 0),
+                        "reason": f"POSITION_STATE_RECOVERY",
+                        "pnl_gross": 0.0,
+                        "fees": 0.0,
+                        "pnl_cash": 0.0,
+                    })
+            if rows:
+                sl = pd.DataFrame(rows)
+                st.caption("📋 持倉資料來自 position_state.json（今日尚無新交易）")
     
     st.header(f"交易記錄 (Round-Trip, {current_mode} 模式)")
     if sl is not None and not sl.empty:
