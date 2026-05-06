@@ -161,11 +161,11 @@ class FuturesRouterConfig:
     """Routing policy for futures entry signals."""
 
     trend_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1")
-    weak_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1", "counter_vwap", "spring_upthrust", "kbar_feature", "calendar_condor_v2")
-    bear_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust")  # [Bear] conservative short — countertrend + upthrust
-    stretched_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust")
-    squeeze_strategies: tuple[str, ...] = ()
-    countertrend_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust")
+    weak_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1", "counter_vwap", "spring_upthrust", "kbar_feature", "calendar_condor_v2", "range_mean_reversion_v1")
+    bear_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1")  # [Bear] conservative short — countertrend + upthrust
+    stretched_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1")
+    squeeze_strategies: tuple[str, ...] = ("range_mean_reversion_v1",)
+    countertrend_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1")
     hard_block_countertrend_in_trend: bool = True
 
     # ── Theta-gate: router decides if market regime is suitable for theta ──
@@ -365,8 +365,11 @@ def route_futures_signal(
             _theta_allowed, _theta_block_reason = _evaluate_theta_environment(regime_result, context, cfg)
         except Exception as _e:
             _theta_block_reason = f"THETA_EVAL_ERROR:{_e}"
-    print(f"[ThetaGate] theta={'ALLOW' if _theta_allowed else 'BLOCK'} reason={_theta_block_reason or 'OK'} regime={regime_result.regime}", flush=True)
-    notes.append(f"theta={'ALLOW' if _theta_allowed else 'BLOCK'}:reason={_theta_block_reason or 'OK'}")
+    # ── [ThetaGate] Evaluate theta — only affects options premium selling ──
+    # Theta permission is a regime-level decision, consumed by OptionsMonitor.
+    # Does NOT block futures directional strategies.
+    print(f"[ThetaGate] theta={'ALLOW' if _theta_allowed else 'BLOCK'} reason={_theta_block_reason or 'OK'} — futures directional NOT blocked", flush=True)
+    notes.append(f"theta_premium={'ALLOW' if _theta_allowed else 'BLOCK'}:reason={_theta_block_reason or 'OK'}")
 
     # ── [NO_DATA] Gate: bar is None or regime can't be determined ──
     bar = context.market.last_bar
@@ -401,8 +404,8 @@ def route_futures_signal(
         )
 
     # ── [V-Model] Spread Staleness Gate + Bias Modifier ──
-    # Two config-driven checks for night session:
-    #   1. Staleness gate: if CSV data is too old, FLAT entry
+    # Two config-driven checks:
+    #   1. Staleness gate: if CSV data is too old, block only spread/options strategies
     #   2. Bias modifier: extreme spread_z adds note (not trade action)
     #
     # Config shape (from context.config, typically futures.yaml / futures_night.yaml):
@@ -411,7 +414,7 @@ def route_futures_signal(
     #     night_only: true
     #     max_age_minutes: 120
     #     extreme_z: 2.0
-    #     stale_action: flat      # 'flat' or 'degrade_only'
+    #     stale_action: warn_only      # 'flat' blocks all, 'warn_only' only blocks spread
     #
     spread_cfg = context.config.get("spread_gate", {}) if hasattr(context, "config") and context.config else {}
     spread_enabled = spread_cfg.get("enabled", False)
@@ -442,27 +445,31 @@ def route_futures_signal(
         if is_night:
             print(f"[V-Model][SpreadGate] NIGHT spread_age={spread_age}m quality={spread_quality}", flush=True)
 
-            # ═══ 1) Staleness gate (STALE only → flat) ═══
+            # ═══ 1) Staleness gate (STALE → block only spread/options, not futures) ═══
             if spread_quality == "STALE":
                 if stale_action == "flat":
-                    print(f"[V-Model][SpreadGate] STALE — FLAT entry", flush=True)
+                    # Legacy mode: block everything (historical compat)
+                    print(f"[V-Model][SpreadGate] STALE — FLAT entry (legacy stale_action=flat)", flush=True)
                     if recorder is not None:
                         recorder.log_router_row(
                             timestamp=timestamp, symbol=symbol, regime=regime_result.regime,
                             strategy_name="router", candidate_order=0, status="spread_stale",
                             evaluated=False, winner=False,
-                            notes=f"NIGHT spread_age={spread_age}m STALE action={stale_action}",
+                            notes=f"NIGHT spread_age={spread_age}m STALE action=flat",
                         )
                     return FuturesRouterDecision(
                         action="FLAT",
                         reason=f"SPREAD_STALE_NIGHT_age_{spread_age}m",
                         regime=regime_result.regime, bias=regime_result.bias,
                         candidates=[],
-                        notes=[f"spread STALE: age={spread_age}m — {stale_action}"],
+                        notes=[f"spread STALE: age={spread_age}m — FLAT (legacy)"],
                         theta_allowed=_theta_allowed,
                         theta_block_reason=_theta_block_reason,
                     )
-                notes.append(f"spread_quality=STALE age={spread_age}m (degraded_mode)")
+                # warn_only: block only spread-sensitive strategies, let futures pass
+                print(f"[V-Model][SpreadGate] STALE — warn_only (futures OK, spread blocked)", flush=True)
+                notes.append(f"spread_quality=STALE age={spread_age}m warn_only — spread/options family blocked")
+                _spread_stale_block_families = True
             elif spread_quality == "DEGRADED":
                 # Log degradation — no bias impact, no flat
                 notes.append(f"spread_quality=DEGRADED age={spread_age}m — log only, no bias")
@@ -509,6 +516,16 @@ def route_futures_signal(
     # Log all policy checks to notes
     for name, status, reason in _policy_checked:
         notes.append(f"policy:{name}={status}({reason})")
+
+    # ═══ [SpreadGate warn_only] STALE spread blocks only spread/options families ═══
+    _spread_families = ("calendar", "condor", "theta", "spread")
+    if locals().get("_spread_stale_block_families", False):
+        _pre_count = len(candidates)
+        candidates = [c for c in candidates if not any(f in c.lower() for f in _spread_families)]
+        _blocked = _pre_count - len(candidates)
+        if _blocked:
+            print(f"[V-Model][SpreadGate] Blocked {_blocked} spread-family strategies from candidates", flush=True)
+            notes.append(f"spread_stale_blocked_{_blocked}_strategies")
 
     if regime_result.regime == "SQUEEZE" and not candidates:
         # Log SQUEEZE regime with no candidates

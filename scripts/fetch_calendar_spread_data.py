@@ -9,6 +9,7 @@ import sys
 import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from core.broker.shioaji_compat import kbars_to_dataframe
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -105,25 +106,15 @@ def fetch_kbars_data(client, contract, interval="1min", days=7):
             end=end_str,
         )
         
-        # Shioaji Kbars object has attributes: ts, Open, High, Low, Close, Volume
-        # Each is a list of values
-        if not hasattr(kbars, 'ts') or len(kbars.ts) == 0:
+        # 轉換為DataFrame (使用兼容性助手)
+        df = kbars_to_dataframe(kbars)
+        
+        if df.empty:
             print(f"No data returned for {contract.code}")
             return None
         
-        # Create DataFrame from Kbars object
-        data = []
-        for i in range(len(kbars.ts)):
-            data.append({
-                'ts': kbars.ts[i],
-                'Open': kbars.Open[i] if i < len(kbars.Open) else None,
-                'High': kbars.High[i] if i < len(kbars.High) else None,
-                'Low': kbars.Low[i] if i < len(kbars.Low) else None,
-                'Close': kbars.Close[i] if i < len(kbars.Close) else None,
-                'Volume': kbars.Volume[i] if i < len(kbars.Volume) else None,
-            })
-        
-        df = pd.DataFrame(data)
+        # 將索引 ts 轉換為列
+        df = df.reset_index()
         
         print(f"Fetched {len(df)} bars for {contract.code}")
         return df

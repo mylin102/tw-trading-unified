@@ -8,6 +8,8 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).parent.parent))
 
 import streamlit as st
+import shioaji as sj  # GSD: Display version in sidebar
+from core.broker.shioaji_compat import is_rust_version
 import pandas as pd
 import json
 import yaml
@@ -217,6 +219,8 @@ FUTURES_CFG_NAME = "futures_night.yaml" if _CURRENT_SESSION_NIGHT else "futures.
 # ── Sidebar Info ──
 with st.sidebar:
     st.title("Trading Unified")
+    ver_tag = " (Rust)" if is_rust_version() else " (Legacy)"
+    st.caption(f"🚀 Shioaji API: {sj.__version__}{ver_tag}")  # [Wave B] Version Transparency
     st.markdown(f"🗓️ **交易日 (Trading Day)**")
     # GSD: Always use the latest date string from session helper
     st.code(f"{DATE_STR[:4]}-{DATE_STR[4:6]}-{DATE_STR[6:]}")
@@ -2389,13 +2393,20 @@ with tab_futures:
             
             with cond_col3:
                 if "spread_z" in last_spread:
-                    # 出場條件
+                    # 出場條件 — 只在真有持倉時顯示「持倉中」
+                    _has_condor_pos = ft is not None and not ft.empty and (
+                        (ft["side"].iloc[-1] == "BUY_NEAR_SELL_FAR" and spread_z < 0.5)
+                        or (ft["side"].iloc[-1] == "SELL_NEAR_BUY_FAR" and spread_z > -0.5)
+                    )
                     if abs(spread_z) < 0.5:
                         st.success("✅ 出場條件觸發")
                         st.caption(f"Spread Z-score: {spread_z:.2f} 接近 0")
-                    else:
+                    elif _has_condor_pos:
                         st.info("⏳ 持倉中")
                         st.caption(f"等待 Spread Z-score 回歸到 ±0.5 內")
+                    else:
+                        st.info("⏳ 觀察中")
+                        st.caption(f"Spread Z-score: {spread_z:.2f} — 等待策略觸發")
             
             # 顯示價差圖表
             spread_chart = make_calendar_spread_chart(spread_df)

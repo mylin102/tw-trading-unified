@@ -286,6 +286,30 @@ def classify_futures_bar_regime(
         and adx >= cfg.adx_weak_threshold
         and abs(trend_strength_raw) >= cfg.trend_strength_threshold
     )
+    # ═══ Momentum Override: prevent WEAK when momentum is strong ═══
+    # WEAK + mom_state >= 3 + price above VWAP is a contradiction.
+    # If momentum is high and bias is directional, upgrade to TREND/TRANSITION.
+    _mom_state = int(_safe_float(row.get("mom_state", 0)))
+    _mom_velo = _safe_float(row.get("mom_velo", 0))
+    _mom_val = _safe_float(row.get("momentum", 0))
+    if (moderate_directional_pressure
+        and (_mom_state >= 3 or (_mom_val > 500 and _mom_velo > 100))
+        and bias in ("LONG", "SHORT")
+        and (close > vwap if vwap > 0 else True)
+    ):
+        reasons.append(
+            f"MOMENTUM_OVERRIDE: mom_state={_mom_state} mom={_mom_val:.0f} "
+            f"mom_velo={_mom_velo:.0f} bias={bias} — upgrading from WEAK to TRANSITION"
+        )
+        confidence = 0.75 if normalized_session_regime == "TRENDING" else 0.65
+        return FuturesBarRegimeResult(
+            regime="TRANSITION",
+            bias=bias,
+            confidence=confidence,
+            reasons=reasons,
+            session_regime=normalized_session_regime,
+        )
+
     if moderate_directional_pressure:
         reasons.append("directional pressure exists, but breakout confirmation is incomplete")
         confidence = 0.60 if normalized_session_regime == "TRENDING" else 0.55

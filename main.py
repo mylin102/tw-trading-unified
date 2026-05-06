@@ -902,6 +902,12 @@ def run_system(dry_run=False):
 
             now = time.time()
             
+            # [GSD Hardening] Heartbeat check — FuturesMonitor may be alive but frozen
+            _fm_hb = getattr(fm, 'last_heartbeat_ts', 0)
+            if _fm_hb > 0 and (now - _fm_hb) > 360:
+                console.print(f"[bold red]💀 FuturesMonitor heartbeat stale ({now - _fm_hb:.0f}s). Setting last_tick_at=0 to trigger stale restart...[/bold red]")
+                fm.last_tick_at = 0
+
             # 檢查任何 FOP tick 是否有進來 (TMF 成交量低，單獨追蹤會誤判)
             fm_last = getattr(fm, 'last_tick_at', 0)
             om_last = getattr(om.monitor, 'last_tick_at', 0)

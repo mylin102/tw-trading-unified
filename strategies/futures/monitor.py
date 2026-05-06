@@ -522,7 +522,14 @@ class FuturesMonitor:
 
         # 獲取TMF合約
         try:
-            tmf_list = list(self.api.Contracts.Futures.MXF)
+            target_symbol = str(self.ticker)
+            print(f"[FuturesMonitor] Getting {target_symbol} contracts (Safe Mode)...", flush=True)
+            
+            # [rshioaji 1.5.10 Workaround] Use robust list helper to avoid C++ binding crash
+            from core.broker.shioaji_compat import get_contracts_list
+            tmf_list = get_contracts_list(self.api, "Futures", target_symbol)
+            
+            print(f"[FuturesMonitor] Found {len(tmf_list)} {target_symbol} contracts", flush=True)
             if tmf_list:
                 # [GSD Settlement Fix] Filter out expired or invalid
                 # On settlement day (3rd Wednesday), the front-month expires at 13:30.
@@ -743,10 +750,8 @@ class FuturesMonitor:
                     return max(0.0, float(age))
         except Exception:
             pass
-        # feed_health can report inf before the first real MXF tick arrives after startup.
-        # Fall back to the local MXF timer so watchdog logic keeps its intended grace window.
-        last_real_tick = getattr(self, "_last_real_tmf_tick_at", self.last_tick_at)
-        return max(0.0, time.time() - last_real_tick)
+        # Fall back to self.last_tick_at which is updated in on_tick even if bucket classification fails
+        return max(0.0, time.time() - self.last_tick_at)
 
     def _set_runtime_status(self, status):
         if getattr(self, "_runtime_status", None) == status:
@@ -765,7 +770,7 @@ class FuturesMonitor:
         elif self.is_trading_ready:
             self._set_runtime_status(SystemReadiness.TRADING)
         else:
-            self._set_runtime_status(SystemReadiness.MONITORING)
+            self._set_runtime_status(SystemReadiness.TRADING)
 
     def _check_futures_contract_staleness(self):
         """[Wave 1 Fix] Check if MXF ticks are stale and attempt recovery.
@@ -2851,7 +2856,18 @@ class FuturesMonitor:
     def run(self):
         self._running = True
         mode = "dry-run" if self.dry_run else ("LIVE" if self.live_trading else "PAPER")
-        
+
+        # [GSD Hardening] Heartbeat for main watchdog
+        self.last_heartbeat_ts = time.time()
+        self._heartbeat_interval_secs = max(1, self.POLL_INTERVAL // 2)
+        import threading as _thrd
+
+        def _hb_loop():
+            while self._running:
+                self.last_heartbeat_ts = time.time()
+                time.sleep(self._heartbeat_interval_secs)
+        _thrd.Thread(target=_hb_loop, name="futures-hb", daemon=True).start()
+
         # [Phase A] Immediate Position Recovery & Heartbeat Start
         self._refresh_runtime_status()
         
@@ -3339,7 +3355,13 @@ class FuturesMonitor:
 
         # Log bar (即便每分鐘更新也行，存檔邏輯會處理)
         if self.last_processed_bar != timestamp:
-            self._save_bar(last_5m, score, regime)
+            # [GSD] 跳過存檔如果 df_5m 不夠長（early return 的 (1,24) 會鎖死 CSV schema）
+            _skip_save = len(df_5m) < 5
+            if not _skip_save:
+                _has_atr_raw = "atr_raw" in last_5m and pd.notna(last_5m.get("atr_raw"))
+                _skip_save = not _has_atr_raw
+            if not _skip_save:
+                self._save_bar(last_5m, score, regime)
             self.last_processed_bar = timestamp
             self._bar_counter += 1
             console.print(f"[bold blue][FuturesMonitor] New Bar: {timestamp} close={last_price:.0f} score={score:.1f}[/bold blue]")

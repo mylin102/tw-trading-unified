@@ -27,7 +27,7 @@ spread_gate:
   night_only: true
   max_age_minutes: 120
   extreme_z: 2.0
-  stale_action: flat
+  stale_action: warn_only
 risk_mgmt:
   atr_length: 14
   atr_multiplier: 2.2
