@@ -12,7 +12,7 @@ import argparse
 import threading
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Any
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -25,7 +25,7 @@ print(
     f"router_file={_boot_fsr.__file__} "
     f"router_mtime={os.path.getmtime(_boot_fsr.__file__):.0f} "
     f"has_evaluate_theta={hasattr(_boot_fsr, '_evaluate_theta_environment')} "
-    f"has_no_data={hasattr(_boot_fsr, 'route_futures_signal') and 'NO_DATA' in open(_boot_fsr.__file__).read()}",
+    f"has_no_data={hasattr(_boot_fsr, 'route_futures_signal')}",
     flush=True,
 )
 
@@ -89,16 +89,28 @@ def tick_dispatcher(futures_mon, options_mon, feed_health=None, tx_bar_builder=N
     _seen_codes = set()
     _lock = threading.Lock()
 
-    def classify(code: str) -> str:
+    def classify(code: Any) -> str:
         if not code:
             return "OPTIONS"
-        if code.startswith(TX_PREFIXES):
+        code_str = str(code).upper()
+        if code_str.startswith("TXF") or code_str.startswith("TX"):
+            # Check for TXO (Options)
+            if code_str.startswith("TXO"):
+                return "OPTIONS"
             return "TX"
-        if code.startswith(MXF_PREFIXES):
+        if code_str.startswith("MXF") or code_str.startswith("MX"):
             return "MXF"
         return "OPTIONS"
-    
-    def on_tick(exchange, tick):
+
+    def on_tick(*args):
+        # rshioaji 1.5.10+ uses 1-arg callback (data)
+        # legacy shioaji uses 2-arg callback (exchange, tick)
+        if len(args) == 1:
+            tick = args[0]
+            exchange = None
+        else:
+            exchange, tick = args
+
         # Safety checks
         if _shutdown_event.is_set():
             return
@@ -122,13 +134,11 @@ def tick_dispatcher(futures_mon, options_mon, feed_health=None, tx_bar_builder=N
         try:
             bucket = classify(code)
             if feed_health is not None:
-                try:
-                    feed_health.mark_tick(bucket, code)
-                except Exception:
-                    pass
-        except Exception:
-            bucket = "OPTIONS"
-
+                # Always mark tick, even if classify logic is slightly off
+                feed_health.mark_tick(bucket, str(code))
+        except Exception as e:
+            if feed_health is not None:
+                feed_health.mark_tick("OPTIONS", str(code))
         # TX bar building (optional)
         if bucket == "TX" and tx_bar_builder is not None:
             try:
@@ -410,8 +420,9 @@ def _subscribe_otm_skew_contracts(api, om, fm, sk_engine, console=None):
                 strike = _safe_contract_strike(c)
                 if strike == otm_put_strike and "Put" in str(c.option_right):
                     otm_contracts["OTM_P"] = c
-                    api.quote.subscribe(c, quote_type="tick")
-                    api.quote.subscribe(c, quote_type=sj.constant.QuoteType.BidAsk)
+                    from core.broker.shioaji_compat import safe_subscribe
+                    safe_subscribe(api, c, quote_type="tick")
+                    safe_subscribe(api, c, quote_type="bidask")
                     _log(
                         "[green][OptionSkew] subscribed otm_put: "
                         f"{c.code} (strike={otm_put_strike})[/green]"
@@ -423,8 +434,9 @@ def _subscribe_otm_skew_contracts(api, om, fm, sk_engine, console=None):
                 strike = _safe_contract_strike(c)
                 if strike == otm_call_strike and "Call" in str(c.option_right):
                     otm_contracts["OTM_C"] = c
-                    api.quote.subscribe(c, quote_type="tick")
-                    api.quote.subscribe(c, quote_type=sj.constant.QuoteType.BidAsk)
+                    from core.broker.shioaji_compat import safe_subscribe
+                    safe_subscribe(api, c, quote_type="tick")
+                    safe_subscribe(api, c, quote_type="bidask")
                     _log(
                         "[green][OptionSkew] subscribed otm_call: "
                         f"{c.code} (strike={otm_call_strike})[/green]"
@@ -523,7 +535,6 @@ def _setup_event_callback(api, fm, om):
 
 def _resubscribe_all(api, fm, om):
     """[P0 Fix] Helper to resubscribe all contracts after connection recovery."""
-    import shioaji as sj
     try:
         if fm and fm.contract:
             api.quote.subscribe(fm.contract, quote_type='tick')
@@ -653,6 +664,14 @@ def run_system(dry_run=False):
         if not dry_run:
             api = get_api()
             console.print("[green]✅ Single Shioaji session established[/green]")
+            
+            # [rshioaji 1.5.10+] Ensure contracts are loaded in cache before monitors start
+            from core.broker.shioaji_compat import fetch_all_contracts
+            console.print("[cyan]📡 Synchronizing all broker contracts (this may take 1-5 minutes)...[/cyan]")
+            if fetch_all_contracts(api, timeout=300):
+                console.print("[green]✅ Contracts synchronized successfully.[/green]")
+            else:
+                console.print("[yellow]⚠️ Contract synchronization timed out, continuing with best effort.[/yellow]")
         else:
             console.print("[yellow]🔧 Dry-run — no broker login[/yellow]")
 
@@ -703,22 +722,25 @@ def run_system(dry_run=False):
                 tx_bar_builder = None
 
             # Register tick/bidask callbacks with feed health and tx builder
-            api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om, feed_health, tx_bar_builder))
-            api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(fm, om, sk_engine))
+            from core.broker.shioaji_compat import set_tick_callback, set_bidask_callback, safe_subscribe
+            set_tick_callback(api, tick_dispatcher(fm, om, feed_health, tx_bar_builder))
+            set_bidask_callback(api, bidask_dispatcher(fm, om, sk_engine))
             # [Skew Integration] Wire skew engine into FuturesMonitor for strategy context
             fm._skew_engine = sk_engine
 
             # Subscribe TMF tick
             if fm.contract is not None:
-                api.quote.subscribe(fm.contract, quote_type='tick')
-                console.print(f"[green]📡 Subscribed TMF tick: {fm.contract.code}[/green]")
+                try:
+                    safe_subscribe(api, fm.contract, quote_type='tick')
+                    console.print(f"[green]📡 Subscribed TMF tick: {fm.contract.code}[/green]")
+                except Exception as e:
+                    console.print(f"[yellow]⚠️ TMF subscribe failed: {e}[/yellow]")
 
             # Subscribe TX tick for cross-regime / freshness
             tx_contract = resolve_tx_contract(api, fm.contract)
-            # 💡 GSD: 確保訂閱的是 TXF (大台)
             if tx_contract is not None:
                 try:
-                    api.quote.subscribe(tx_contract, quote_type='tick')
+                    safe_subscribe(api, tx_contract, quote_type='tick')
                     console.print(f"[green]📡 Subscribed TX tick: {tx_contract.code}[/green]")
                 except Exception as e:
                     console.print(f"[yellow]⚠️ TX subscribe failed: {e}[/yellow]")
@@ -726,7 +748,7 @@ def run_system(dry_run=False):
                 # 最後嘗試直接使用 TXF 近月
                 try:
                     target_code = fm.contract.code.replace("TMF", "TXF") if fm.contract else "TXFE6"
-                    api.quote.subscribe(api.Contracts.Futures[target_code], quote_type='tick')
+                    safe_subscribe(api, api.Contracts.Futures[target_code], quote_type='tick')
                     console.print(f"[green]📡 Emergency Subscribed TXF: {target_code}[/green]")
                 except Exception:
                     console.print("[yellow]⚠️ TX contract resolution failed; proceeding without macro reference[/yellow]")
@@ -734,7 +756,7 @@ def run_system(dry_run=False):
             # Subscribe far-month MXF tick for dual chart
             if fm.far_contract is not None:
                 try:
-                    api.quote.subscribe(fm.far_contract, quote_type='tick')
+                    safe_subscribe(api, fm.far_contract, quote_type='tick')
                     console.print(f"[green]📡 Subscribed far-month MXF tick: {fm.far_contract.code}[/green]")
                 except Exception as e:
                     console.print(f"[yellow]⚠️ Far-month MXF subscribe failed: {e}[/yellow]")
@@ -743,8 +765,8 @@ def run_system(dry_run=False):
             for key in ["MTX", "C", "P"]:
                 con = om.monitor.active_contracts.get(key)
                 if con:
-                    api.quote.subscribe(con, quote_type='tick')
-                    api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
+                    safe_subscribe(api, con, quote_type='tick')
+                    safe_subscribe(api, con, quote_type='bidask')
                     console.print(f"[green]📡 Subscribed {key}: {con.code} (tick+bidask)[/green]")
 
         if sk_engine is not None:
@@ -827,8 +849,9 @@ def run_system(dry_run=False):
                             except Exception:
                                 tx_bar_builder = None
 
-                        api.quote.set_on_tick_fop_v1_callback(tick_dispatcher(fm, om, feed_health, tx_bar_builder))
-                        api.quote.set_on_bidask_fop_v1_callback(bidask_dispatcher(fm, om, sk_engine))
+                        from core.broker.shioaji_compat import set_tick_callback, set_bidask_callback
+                        set_tick_callback(api, tick_dispatcher(fm, om, feed_health, tx_bar_builder))
+                        set_bidask_callback(api, bidask_dispatcher(fm, om, sk_engine))
                         # [Skew Integration] Re-wire skew engine (might have been reset)
                         fm._skew_engine = sk_engine
                         if sk_engine is not None:
@@ -961,7 +984,10 @@ def run_system(dry_run=False):
             time.sleep(2)
 
     except Exception as exc:
+        import traceback
         console.print(f"[bold red]Critical crash: {exc}[/bold red]")
+        console.print(traceback.format_exc())
+
     finally:
         # Signal shutdown to all dispatchers
         _shutdown_event.set()
@@ -990,9 +1016,10 @@ def run_system(dry_run=False):
             # Clear callbacks before logout
             if api is not None:
                 try:
-                    api.quote.set_on_tick_fop_v1_callback(lambda ex, t: None)
-                    time.sleep(0.5)  # Buffer for C++ callback cleanup
-                    api.quote.set_on_bidask_fop_v1_callback(lambda ex, b: None)
+                    from core.broker.shioaji_compat import clear_tick_callback, clear_bidask_callback
+                    clear_tick_callback(api)
+                    time.sleep(0.5)
+                    clear_bidask_callback(api)
                     time.sleep(0.5)  # Buffer for C++ callback cleanup
                 except Exception as e:
                     console.print(f"[dim]Callback cleanup error: {e}[/dim]")

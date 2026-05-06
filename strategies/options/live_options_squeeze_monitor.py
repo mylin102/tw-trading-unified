@@ -413,7 +413,16 @@ class ShioajiOptionsSmartMonitor:
         import datetime
         
         # 1. 抓取該商品所有履約價合約
-        all_contracts = [c for c in self.api.Contracts.Options[symbol]]
+        target_symbol = str(symbol)
+        try:
+            # [rshioaji 1.5.10+ Workaround] Use robust list helper to avoid C++ binding crash
+            from core.broker.shioaji_compat import get_contracts_list
+            all_contracts = get_contracts_list(self.api, "Options", target_symbol)
+            if not all_contracts:
+                 return None, []
+        except (KeyError, TypeError, Exception) as e:
+            console.print(f"[yellow]⚠️ Options [{target_symbol}] error: {e}[/yellow]")
+            return None, []
         
         # 2. 取得今日日期
         today = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -510,50 +519,53 @@ class ShioajiOptionsSmartMonitor:
                     except Exception as e:
                         console.print(f"[yellow]⚠️ Error parsing futures contract date: {e}[/yellow]")
             
-            # 方法2: 嘗試從 API 獲取 TMF 合約
+            # 方法2: 嘗試從 API 獲取標的期貨合約 (MXF/TXF)
             if self.api:
-                try:
-                    tmf_list = list(self.api.Contracts.Futures["TMF"])
-                    if tmf_list:
-                        # 過濾未過期合約並排序
-                        import datetime
-                        now = datetime.datetime.now()
-                        valid_contracts = []
-                        
-                        for contract in tmf_list:
-                            try:
-                                if "/" in contract.delivery_date:
-                                    contract_date = datetime.datetime.strptime(contract.delivery_date, "%Y/%m/%d").date()
-                                else:
-                                    contract_date = datetime.datetime.strptime(contract.delivery_date, "%Y-%m-%d").date()
-                                
-                                today = now.date()
-                                
-                                # 檢查合約是否有效（未過期）
-                                if contract_date > today:
-                                    valid_contracts.append(contract)
-                                elif contract_date == today:
-                                    # 檢查是否已過結算時間
-                                    settlement_time = now.replace(hour=13, minute=30, second=0, microsecond=0)
-                                    if now < settlement_time:
+                from core.broker.shioaji_compat import get_contracts_list
+                for symbol in ["MXF", "TXF"]:
+                    try:
+                        tmf_list = get_contracts_list(self.api, "Futures", symbol)
+                        if tmf_list:
+                            # 過濾未過期合約並排序
+                            import datetime
+                            now = datetime.datetime.now()
+                            valid_contracts = []
+                            
+                            for contract in tmf_list:
+                                try:
+                                    if "/" in contract.delivery_date:
+                                        contract_date = datetime.datetime.strptime(contract.delivery_date, "%Y/%m/%d").date()
+                                    else:
+                                        contract_date = datetime.datetime.strptime(contract.delivery_date, "%Y-%m-%d").date()
+                                    
+                                    today = now.date()
+                                    
+                                    # 檢查合約是否有效（未過期）
+                                    if contract_date > today:
                                         valid_contracts.append(contract)
-                            except Exception:
-                                continue
-                        
-                        if valid_contracts:
-                            # 按交割日期排序
-                            valid_contracts.sort(key=lambda c: c.delivery_date)
-                            first_contract = valid_contracts[0]
+                                    elif contract_date == today:
+                                        # 檢查是否已過結算時間
+                                        settlement_time = now.replace(hour=13, minute=30, second=0, microsecond=0)
+                                        if now < settlement_time:
+                                            valid_contracts.append(contract)
+                                except Exception:
+                                    continue
                             
-                            # 解析並返回月份
-                            if "/" in first_contract.delivery_date:
-                                contract_date = datetime.datetime.strptime(first_contract.delivery_date, "%Y/%m/%d").date()
-                            else:
-                                contract_date = datetime.datetime.strptime(first_contract.delivery_date, "%Y-%m-%d").date()
-                            
-                            return contract_date.strftime("%Y-%m")
-                except Exception as e:
-                    console.print(f"[yellow]⚠️ Error getting TMF contracts: {e}[/yellow]")
+                            if valid_contracts:
+                                # 按交割日期排序
+                                valid_contracts.sort(key=lambda c: c.delivery_date)
+                                first_contract = valid_contracts[0]
+                                
+                                # 解析並返回月份
+                                if "/" in first_contract.delivery_date:
+                                    contract_date = datetime.datetime.strptime(first_contract.delivery_date, "%Y/%m/%d").date()
+                                else:
+                                    contract_date = datetime.datetime.strptime(first_contract.delivery_date, "%Y-%m-%d").date()
+                                
+                                console.print(f"[green]✅ 從 {symbol} 成功解析合約月份: {contract_date.strftime('%Y-%m')}[/green]")
+                                return contract_date.strftime("%Y-%m")
+                    except Exception as e:
+                        console.print(f"[dim]Note: {symbol} check skipped: {e}[/dim]")
             
             # 方法3: 使用當前時間推斷
             import datetime
@@ -578,7 +590,14 @@ class ShioajiOptionsSmartMonitor:
         import datetime
         
         # 1. 抓取該商品所有履約價合約
-        all_contracts = [c for c in self.api.Contracts.Options[symbol]]
+        target_symbol = str(symbol)
+        try:
+            # [rshioaji 1.5.10+ Workaround] Use robust list helper to avoid C++ binding crash
+            from core.broker.shioaji_compat import get_contracts_list
+            all_contracts = get_contracts_list(self.api, "Options", target_symbol)
+        except (KeyError, TypeError, Exception) as e:
+            console.print(f"[yellow]⚠️ Options contract [{target_symbol}] not loaded: {e}[/yellow]")
+            return None, []
         
         # 2. 如果沒有指定目標月份，使用 get_nearest_options
         if not target_month:
@@ -669,18 +688,23 @@ class ShioajiOptionsSmartMonitor:
             futures_month = self.get_futures_contract_month(futures_monitor)
             console.print(f"[cyan]📅 Futures contract month: {futures_month}[/cyan]")
             
-            # 1. 確保合約資訊是最新的 (特別是夜盤剛開始時)
+            # 1. 確保合約資訊是最新的
             if self.api:
-                # 使用更強健的列表轉換
+                # [rshioaji 1.5.9+] Use a safer check that doesn't trigger concurrent API call
                 try:
-                    all_txo = list(self.api.Contracts.Options["TXO"])
+                    # Check if property access works
+                    txo = self.api.Contracts.Options["TXO"]
+                    all_txo = list(txo) if txo else []
                 except Exception:
-                    # Fallback to empty list on error
                     all_txo = []
                     
                 if not all_txo:
-                    console.print("[yellow]🔍 正在重新下載合約資訊...[/yellow]")
-                    self.api.fetch_contracts()
+                    console.print("[yellow]🔍 正在檢查合約資訊 (Waiting for background fetch)...[/yellow]")
+                    from core.broker.shioaji_compat import wait_for_contracts
+                    # [Wave 3 Fix] Don't trigger fetch_contracts here as it causes "exclusive access lost"
+                    # main.py already handles the initial sync. Just wait.
+                    if not wait_for_contracts(self.api, "Options", "TXO", timeout=30):
+                        console.print("[yellow]⚠️ Options contracts still not found after 30s wait[/yellow]")
             
             # 2. [GSD Settlement Fix] 根據期貨月份獲取選擇權合約
             nearest_date, contracts = self.get_options_by_month("TXO", futures_month)
@@ -695,14 +719,14 @@ class ShioajiOptionsSmartMonitor:
             # 3. 獲取標的期貨並取得現價
             # Shioaji 中 小台指可能是 MTX 或 MXF，優先嘗試 MTX
             mtx_group = []
+            from core.broker.shioaji_compat import get_contracts_list
             for symbol in ["MTX", "MXF"]:
                 try:
-                    mtx_group = list(self.api.Contracts.Futures[symbol])
+                    mtx_group = get_contracts_list(self.api, "Futures", symbol)
                     if mtx_group: 
                         console.print(f"[dim]💡 成功在 {symbol} 分類下找到期貨合約[/dim]")
                         break
                 except Exception:
-                    # Ignore and try next symbol
                     continue
             
             if not mtx_group:
@@ -711,8 +735,18 @@ class ShioajiOptionsSmartMonitor:
             
             # [GSD Settlement Fix] 過濾與期貨月份相符的標準合約
             # 優先找月份相符的，如果找不到再找最近的 (fallback)
-            all_valid_mtx = sorted([c for c in mtx_group if len(c.code) in [5, 6, 7]], key=lambda x: x.delivery_date)
-            mtx_cons = [c for c in all_valid_mtx if c.delivery_date.replace("/", "-").startswith(futures_month)]
+            all_valid_mtx = []
+            for c in mtx_group:
+                # 💡 GSD: Use safe getattr to avoid Shioaji error on broken objects
+                c_code = getattr(c, "code", "")
+                if c_code and len(c_code) in [5, 6, 7, 8, 9]:
+                    all_valid_mtx.append(c)
+            
+            if not all_valid_mtx:
+                all_valid_mtx = mtx_group # Absolute fallback
+
+            all_valid_mtx = sorted(all_valid_mtx, key=lambda x: getattr(x, "delivery_date", ""))
+            mtx_cons = [c for c in all_valid_mtx if str(getattr(c, "delivery_date", "")).replace("/", "-").startswith(futures_month)]
             
             if not mtx_cons:
                 console.print(f"[yellow]⚠️  找不到月份 {futures_month} 的 MTX 合約，使用最近可用合約。[/yellow]")
@@ -753,8 +787,17 @@ class ShioajiOptionsSmartMonitor:
                 cons_at_strike = atm_contracts
 
             # 5. 鎖定監控合約 (MTX, Call, Put)
-            calls = [c for c in cons_at_strike if c.option_right == "Call" or str(c.option_right).endswith("Call")]
-            puts = [c for c in cons_at_strike if c.option_right == "Put" or str(c.option_right).endswith("Put")]
+            # 💡 GSD: Use case-insensitive string match for option_right to support different Enum/String versions
+            calls = [c for c in cons_at_strike if "call" in str(getattr(c, "option_right", "")).lower()]
+            puts = [c for c in cons_at_strike if "put" in str(getattr(c, "option_right", "")).lower()]
+            
+            # [Wave 3 Fix] Fallback: If pairing fails at specific strike, search full month list
+            if not calls or not puts:
+                console.print(f"[yellow]⚠️  Strike {atm_strike} is missing {'Calls' if not calls else 'Puts'}. Searching full universe...[/yellow]")
+                if not calls:
+                    calls = [c for c in contracts if abs(c.strike_price - atm_strike) < 1 and "call" in str(c.option_right).lower()]
+                if not puts:
+                    puts = [c for c in contracts if abs(c.strike_price - atm_strike) < 1 and "put" in str(c.option_right).lower()]
             
             if not calls or not puts:
                 console.print(f"[red]❌ 錯誤：無法配對 Call/Put 合約 (Strike: {atm_strike})[/red]")
@@ -4275,6 +4318,12 @@ class ShioajiOptionsSmartMonitor:
 
     def run_strategy_logic(self):
         try:
+            # Retry contract loading if not yet available
+            if not self.active_contracts or not self._all_month_contracts:
+                self.find_best_contracts()
+                if not self.active_contracts:
+                    return  # No contracts yet — retry next cycle
+            
             # GSD: Update log paths dynamically to handle session rollovers (e.g. 15:00)
             self._update_log_paths()
             
@@ -4655,7 +4704,11 @@ class ShioajiOptionsSmartMonitor:
 
         # Immediate Heartbeat & Status Summary
         if not self.active_contracts:
-            if not self.find_best_contracts(): return
+            found = self.find_best_contracts()
+            if not found:
+                console.print("[yellow]⏳ Options contracts not loaded yet — will retry in main loop[/yellow]")
+                # Don't return here; let the main loop retry find_best_contracts
+                # Contracts will be available once background fetch completes
             
         if not self.dry_run and self.api is not None:
             self._recover_position_from_api()
