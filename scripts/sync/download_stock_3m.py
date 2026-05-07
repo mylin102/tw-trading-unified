@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import yaml
 import pandas as pd
 from dotenv import load_dotenv
+from core.broker.shioaji_compat import kbars_to_dataframe
 
 ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT))
@@ -30,13 +31,16 @@ def download_all(api, tickers, months=3):
                 continue
 
             kbars = api.kbars(contract, start=start_date)
-            if kbars is None or (hasattr(kbars, 'ts') and len(kbars.ts) == 0):
+            
+            # 轉換為DataFrame (使用兼容性助手)
+            df = kbars_to_dataframe(kbars)
+            
+            if df.empty:
                 print(f"  [{i}/{len(tickers)}] {ticker}: No data returned")
                 continue
 
-            df = pd.DataFrame({"timestamp": kbars.ts, "Open": kbars.Open, "High": kbars.High,
-                               "Low": kbars.Low, "Close": kbars.Close, "Volume": kbars.Volume})
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            # 將索引 ts 轉換為 timestamp 列
+            df = df.reset_index().rename(columns={"ts": "timestamp"})
             df = df.sort_values("timestamp").reset_index(drop=True)
 
             # Standardize column names
@@ -97,3 +101,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+main()

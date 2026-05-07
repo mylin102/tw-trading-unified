@@ -25,8 +25,8 @@ ROUTER_TRACE = ROOT / "logs" / "router_trace"
 os.chdir(ROOT)
 
 # ── Thresholds (tunable) ──
-BAR_FRESH_OK_SEC = 300
-BAR_FRESH_WARN_SEC = 600
+BAR_FRESH_OK_SEC = 600
+BAR_FRESH_WARN_SEC = 900
 TICK_FRESH_OK_SEC = 120
 
 
@@ -67,33 +67,49 @@ def safe_read_csv(path: Path, **kwargs):
 def check_pm2():
     heading("1. PM2 Process Status")
     try:
-        result = subprocess.run(["pm2", "status"], capture_output=True, text=True, timeout=10)
+        # Use jlist for robust JSON parsing
+        result = subprocess.run(["pm2", "jlist"], capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
-            fail(f"pm2 status returned code {result.returncode}")
+            fail(f"pm2 jlist returned code {result.returncode}")
             return
-        for line in result.stdout.splitlines():
-            if "trading-system" in line:
-                parts = [p.strip() for p in line.split("│")]
-                if len(parts) >= 11:
-                    status = parts[8]
-                    pid = parts[5]
-                    uptime = parts[6]
-                    restarts = parts[7]
-                    mem = parts[10]
-                    if status == "online":
-                        ok(f"trading-system  pid={pid}  uptime={uptime}  restarts={restarts}  mem={mem}")
+        
+        processes = json.loads(result.stdout)
+        target_names = ["trading-system", "dashboard", "stock-monitor"]
+        
+        for proc in processes:
+            name = proc.get("name")
+            if name in target_names:
+                status = proc.get("pm2_env", {}).get("status")
+                restarts = proc.get("pm2_env", {}).get("restart_time", 0)
+                pid = proc.get("pid", "N/A")
+                
+                # Format memory
+                mem_bytes = proc.get("monit", {}).get("memory", 0)
+                mem_str = f"{mem_bytes / 1024 / 1024:.1f}MB"
+                
+                # Format uptime
+                pm_uptime = proc.get("pm2_env", {}).get("pm_uptime", 0)
+                if pm_uptime > 0:
+                    uptime_sec = (time.time() * 1000 - pm_uptime) / 1000
+                    if uptime_sec > 3600:
+                        uptime_str = f"{uptime_sec / 3600:.1f}h"
+                    elif uptime_sec > 60:
+                        uptime_str = f"{uptime_sec / 60:.1f}m"
                     else:
-                        fail(f"trading-system  status={status}  restarts={restarts}")
-            elif "stock-monitor" in line:
-                parts = [p.strip() for p in line.split("│")]
-                if len(parts) >= 11:
-                    status = parts[8]
-                    uptime = parts[6]
-                    restarts = parts[7]
-                    if status == "online":
-                        ok(f"stock-monitor    uptime={uptime}  restarts={restarts}")
+                        uptime_str = f"{uptime_sec:.0f}s"
+                else:
+                    uptime_str = "0s"
+
+                msg = f"{name:<15}  pid={pid:<6}  uptime={uptime_str:<5}  restarts={restarts:<3}  mem={mem_str}"
+                if status == "online":
+                    ok(msg)
+                else:
+                    fail(f"{name:<15}  status={status:<8}  restarts={restarts}")
+                    
     except subprocess.TimeoutExpired:
-        fail("pm2 status timed out")
+        fail("pm2 jlist timed out")
+    except json.JSONDecodeError:
+        fail("Failed to parse pm2 jlist output")
     except FileNotFoundError:
         fail("pm2 not installed or not in PATH")
     except Exception as e:

@@ -33,15 +33,14 @@ def download_futures_today(api, csv_path):
         return
     print(f"Contract: {target.code}")
 
-    kbars = api.kbars(target, start=today, end=today)
-    if kbars is None or (hasattr(kbars, 'ts') and len(kbars.ts) == 0):
-        print("No data returned. Market may be closed.")
+    from core.broker.shioaji_compat import kbars_to_dataframe
+    df = kbars_to_dataframe(kbars)
+    
+    if df.empty:
+        print("No data returned or failed to parse. Market may be closed.")
         return
 
-    df = pd.DataFrame({"timestamp": kbars.ts, "Open": kbars.Open, "High": kbars.High,
-                       "Low": kbars.Low, "Close": kbars.Close, "Volume": kbars.Volume,
-                       "Amount": kbars.Amount})
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.reset_index().rename(columns={"ts": "timestamp"})
     print(f"Downloaded {len(df)} bars")
 
     # Load existing data
@@ -79,14 +78,14 @@ def download_stocks_today(api):
         try:
             contract = api.Contracts.Stocks[ticker]
             kbars = api.kbars(contract, start=today, end=today)
-            if kbars is None or (hasattr(kbars, 'ts') and len(kbars.ts) == 0):
+            from core.broker.shioaji_compat import kbars_to_dataframe
+            new_df = kbars_to_dataframe(kbars)
+            
+            if new_df.empty:
                 print(f"  {ticker}: no data")
                 continue
 
-            new_df = pd.DataFrame({"Date": kbars.ts, "Open": kbars.Open, "High": kbars.High,
-                                   "Low": kbars.Low, "Close": kbars.Close, "Volume": kbars.Volume,
-                                   "Amount": kbars.Amount})
-            new_df["Date"] = pd.to_datetime(new_df["Date"])
+            new_df = new_df.reset_index().rename(columns={"ts": "Date"})
 
             csv_path = ROOT / "data" / "taifex_raw" / f"STOCK_{ticker}_5m.csv"
             if csv_path.exists():

@@ -69,6 +69,13 @@ STRATEGY_POLICY: dict[str, dict] = {
         "max_weight": 0.8,
         "kill_if_cagr_below": -0.05,
     },
+    "weak_bear_trend": {
+        "enabled_regimes": ["WEAK", "CHOP"],
+        "max_weight": 0.5,
+        "kill_if_cagr_below": -0.05,
+        "required_bias": "SHORT",
+        "description": "WEAK regime 空头趋势：弱勢反彈失敗後做空",
+    },
     "kbar_feature": {
         "enabled_regimes": ["WEAK", "CHOP"],
         "max_weight": 0.5,
@@ -83,6 +90,12 @@ STRATEGY_POLICY: dict[str, dict] = {
         "enabled_regimes": ["TREND"],
         "max_weight": 0.5,
         "kill_if_cagr_below": -0.03,
+    },
+    "squeeze_fire_scout": {
+        "enabled_regimes": ["SQUEEZE"],
+        "max_weight": 0.25,
+        "kill_if_cagr_below": -999,
+        "description": "Early scout during squeeze release, 0.25x size, tight stop, time-stop 6 bars",
     },
 }
 
@@ -161,19 +174,31 @@ class FuturesRouterConfig:
     """Routing policy for futures entry signals."""
 
     trend_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1")
-    weak_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1", "counter_vwap", "spring_upthrust", "kbar_feature", "calendar_condor_v2", "range_mean_reversion_v1")
-    bear_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1")  # [Bear] conservative short — countertrend + upthrust
+    weak_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1", "counter_vwap", "spring_upthrust", "kbar_feature", "calendar_condor_v2", "range_mean_reversion_v1", "weak_bear_trend")
+    bear_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1", "weak_bear_trend")  # [Bear] conservative short — countertrend + upthrust + weak trend
     stretched_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1")
-    squeeze_strategies: tuple[str, ...] = ("range_mean_reversion_v1",)
+    squeeze_strategies: tuple[str, ...] = ("squeeze_fire_scout", "range_mean_reversion_v1")
     countertrend_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1")
     hard_block_countertrend_in_trend: bool = True
+
+    # ── Squeeze Fire Scout config ──
+    squeeze_fire_scout_enabled: bool = True
+    squeeze_fire_scout_size_multiplier: float = 0.25
+    squeeze_fire_scout_min_mom_state: int = 3
+    squeeze_fire_scout_requires_vwap: bool = True
+    squeeze_fire_scout_requires_bias: bool = True
+    squeeze_fire_scout_max_breakout_strength: float = 0.25
+    squeeze_fire_scout_stop_atr_mult: float = 0.6
+    squeeze_fire_scout_time_stop_bars: int = 6
 
     # ── Theta-gate: router decides if market regime is suitable for theta ──
     theta_enabled: bool = True
     theta_weak_only: bool = True          # only allow in WEAK/CHOP, not TREND/BEAR
-    theta_max_mom_state: int = 1          # mom_state must be <= 1 (low momentum)
-    theta_max_macd_abs: float = 0.5       # |macd_hist| must be below this
-    theta_block_volume_spike: bool = True # block when volume_spike is True
+    theta_max_mom_state: int = 2          # [Patch] relaxed from 1 to 2
+    theta_max_macd_abs: float = 50.0      # [Patch] scale corrected from 0.5 to 50.0
+    theta_max_macd_hist_atr: float = 0.8  # [Patch] new ATR-normalized threshold
+    theta_block_volume_spike: bool = True # block when volume_spike >= threshold
+    theta_volume_spike_threshold: float = 1.5 # [Patch] new threshold to fix truthiness bug
     theta_min_hold_seconds: int = 1800
     theta_min_edge_multiple: float = 2.0
 
@@ -191,9 +216,12 @@ class FuturesRouterDecision:
     candidates: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
-    # ── Theta-gate output — consumed by OptionsMonitor ──
+    # ── Theta-gate — consumed by OptionsMonitor ──
     theta_allowed: bool = False
     theta_block_reason: str | None = None
+
+    # ── Squeeze Fire Scout — size override ──
+    size_multiplier: float = 1.0
 
     @property
     def is_trade(self) -> bool:
@@ -314,15 +342,26 @@ def _evaluate_theta_environment(
         if int(mom_state) > cfg.theta_max_mom_state:
             return False, f"MOMENTUM_TOO_HIGH mom_state={mom_state} > {cfg.theta_max_mom_state}"
 
-    # 3. Volume gate — block when spike
-    if cfg.theta_block_volume_spike and bar.get("volume_spike", False):
-        return False, "VOLUME_SPIKE"
+    # 3. Volume gate — block when spike exceeds threshold (Fixes truthiness bug)
+    volume_spike_ratio = float(bar.get("volume_spike", 0.0) or 0.0)
+    if cfg.theta_block_volume_spike and volume_spike_ratio >= cfg.theta_volume_spike_threshold:
+        return False, f"VOLUME_SPIKE (ratio={volume_spike_ratio:.2f} >= {cfg.theta_volume_spike_threshold})"
 
-    # 4. MACD gate — near zero only
-    macd_hist = bar.get("macd_hist", None)
-    if macd_hist is not None and isinstance(macd_hist, (int, float)):
-        if abs(float(macd_hist)) >= cfg.theta_max_macd_abs:
-            return False, f"MACD_NOT_FLAT |macd_hist|={abs(macd_hist):.2f} >= {cfg.theta_max_macd_abs}"
+    # 4. MACD gate — near zero only (Scale mismatch fix + ATR normalization support)
+    macd_hist = bar.get("macd_hist", 0.0)
+    if macd_hist is not None:
+        macd_hist_abs = abs(float(macd_hist))
+        
+        # Priority 1: ATR-normalized MACD (Recommended)
+        atr_used = bar.get("atr_used", bar.get("atr", 0.0))
+        if atr_used and atr_used > 0:
+            macd_hist_atr = macd_hist_abs / atr_used
+            if macd_hist_atr >= cfg.theta_max_macd_hist_atr:
+                return False, f"MACD_NOT_FLAT (ATR) |macd_hist/atr|={macd_hist_atr:.2f} >= {cfg.theta_max_macd_hist_atr}"
+        
+        # Priority 2: Absolute MACD threshold (Fallback/Patch)
+        if macd_hist_abs >= cfg.theta_max_macd_abs:
+            return False, f"MACD_NOT_FLAT |macd_hist|={macd_hist_abs:.2f} >= {cfg.theta_max_macd_abs}"
 
     return True, None
 

@@ -2291,6 +2291,24 @@ with tab_futures:
         fc5.metric("噴發向", bias)
         fc6.metric("突破強度", bs_label)
 
+        # ATR reference — show calculation chain for breakout_strength debug
+        atr_val = last.get("atr", 0.0) or 0.0
+        atr_raw = last.get("atr_raw", atr_val) or atr_val
+        atr_floor = last.get("atr_floor", 0.0) or 0.0
+        atr_used = last.get("atr_used", atr_val) or atr_val
+
+        # breakout_strength_atr = max(0, close - high_20_prev) / atr_used
+        close = last.get("Close", last.get("close", 0)) or 0
+        high_20_prev = last.get("high_20_prev", 0) or 0
+        _bs_numerator = max(0, close - high_20_prev)
+        _bs_denominator = atr_used if atr_used > 0 else 1.0
+
+        st.caption(
+            f"ATR_raw={atr_raw:.1f} floor(cl×0.0015)={atr_floor:.1f} "
+            f"→ atr_used={atr_used:.1f}  |  "
+            f"BS=({close:.0f}-{high_20_prev:.0f})/{atr_used:.1f}={_bs_numerator/_bs_denominator:.4f}"
+        )
+
         if data_fresh and "fired" in last and last.get("fired", False) is True:
             st.success("🔥 **FIRE — 壓縮釋放！**")
         
@@ -3321,12 +3339,27 @@ with tab_pipeline:
     st.subheader("🔄 管道狀態")
     try:
         from core.strategy_registry import STRATEGY_PERF
-        pipeline_data = [
-            {"策略": "Counter-VWAP", "日盤 PF": STRATEGY_PERF["counter_vwap"]["day_pf"], "夜盤 PF": STRATEGY_PERF["counter_vwap"]["night_pf"], "狀態": "✅ Paper"},
-            {"策略": "Spring-Upthrust", "日盤 PF": STRATEGY_PERF["spring_upthrust"]["day_pf"], "夜盤 PF": STRATEGY_PERF["spring_upthrust"]["night_pf"], "狀態": "⏳ 回測驗證"},
-            {"策略": "Vol-Squeeze", "日盤 PF": STRATEGY_PERF["vol_squeeze"]["day_pf"], "夜盤 PF": STRATEGY_PERF["vol_squeeze"]["night_pf"], "狀態": "⏳ 觀察中"},
-            {"策略": "PSAR", "日盤 PF": STRATEGY_PERF["psar"]["day_pf"], "夜盤 PF": STRATEGY_PERF["psar"]["night_pf"], "狀態": "🔴 夜盤 PF<1.0"},
-        ]
+        pipeline_data = []
+        for name, perf in sorted(STRATEGY_PERF.items()):
+            display_name = {
+                "counter_vwap": "Counter-VWAP",
+                "spring_upthrust": "Spring-Upthrust",
+                "kbar_feature": "KBar Feature",
+                "calendar_condor_v2": "Calendar Condor v2",
+                "vol_squeeze": "Vol-Squeeze",
+                "psar": "PSAR",
+                "weak_bear_trend": "Weak Bear Trend",
+                "squeeze_fire_scout": "Sqz Fire Scout",
+            }.get(name, name)
+            day_pf = perf.get("day_pf", 0)
+            night_pf = perf.get("night_pf", 0)
+            status = "✅ Paper" if day_pf >= 1.5 else ("⏳ 觀察中" if day_pf >= 1.0 else "🔴 PF<1.0")
+            pipeline_data.append({
+                "策略": display_name,
+                "日盤 PF": day_pf,
+                "夜盤 PF": night_pf,
+                "狀態": status,
+            })
         st.table(pd.DataFrame(pipeline_data))
     except Exception as e:
         st.error(f"Error loading pipeline: {e}")

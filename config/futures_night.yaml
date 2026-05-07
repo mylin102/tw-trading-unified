@@ -1,16 +1,18 @@
-active_strategy: adaptive_orb_v15
+active_strategy: null      # 不強制指定，由 regime 自動選擇
+auto_select: true          # 啟用自動切換
 cooldown_bars: 5
 execution:
-  broker_fee_per_side: 50.0
+  broker_fee_per_side: 20.0  # 微台指手續費
   exchange_fee_per_side: 0.0
-  initial_balance: 100000
+  initial_balance: 50000     # 微台指 5 萬足夠
   limit_offset_pts: 2.0
   market_slippage_pts: 2.0
   order_type: MKP
   range_protection_pts: 5.0
   tax_rate: 2.0e-05
   tick_size: 1.0
-live_trading: false
+  point_value: 10.0          # 微台指一點 10 元
+live_trading: false          # Paper Trading
 monitoring:
   use_order_manager: true
   callback:

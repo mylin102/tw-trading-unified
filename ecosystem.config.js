@@ -28,10 +28,9 @@ module.exports = {
     },
     {
       name: "dashboard",
-      script: "streamlit",
-      interpreter: "python3",
+      script: "python3",
       cwd: "/Users/mylin/Documents/mylin102/tw-trading-unified",
-      args: "run ui/dashboard.py --server.port 8500",
+      args: "-m streamlit run ui/dashboard.py --server.port 8500",
       env: {
         PYTHONPATH: "/Users/mylin/Documents/mylin102/tw-trading-unified",
         NODE_ENV: "production"

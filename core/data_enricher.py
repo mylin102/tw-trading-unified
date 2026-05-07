@@ -115,8 +115,51 @@ def _calc_alpha_features(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
     res["range_pos"] = (res["Close"] - low_20) / (high_20 - low_20).replace(0, np.nan)
     
     return res
+def _calc_bbands(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    """Bollinger Bands (20, 2.0)."""
+    length = int(kwargs.get("bb_length", 20))
+    std = float(kwargs.get("bb_std", 2.0))
+    res = df.copy()
+    try:
+        import pandas_ta as ta
+        bb = res.ta.bbands(length=length, std=std)
+        if bb is not None:
+            res["bb_up"] = bb[f"BBU_{length}_{std}"]
+            res["bb_mid"] = bb[f"BBM_{length}_{std}"]
+            res["bb_low"] = bb[f"BBL_{length}_{std}"]
+            return res
+    except ImportError:
+        pass
+
+    # Fallback to manual calculation
+    mid = res["Close"].rolling(window=length).mean()
+    sd = res["Close"].rolling(window=length).std()
+    res["bb_up"] = mid + (std * sd)
+    res["bb_mid"] = mid
+    res["bb_low"] = mid - (std * sd)
+    return res
+
+def _calc_rsi(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    """Relative Strength Index (14)."""
+    length = int(kwargs.get("rsi_length", 14))
+    res = df.copy()
+    try:
+        import pandas_ta as ta
+        res["rsi"] = res.ta.rsi(length=length)
+        return res
+    except ImportError:
+        pass
+
+    # Fallback to manual calculation
+    delta = res["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=length).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=length).mean()
+    rs = gain / loss
+    res["rsi"] = 100 - (100 / (1 + rs))
+    return res
 
 class DataEnricher:
+    """Singleton-ish factory for indicators."""
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.registry: Dict[str, Callable] = {}
         self.logger = logger or logging.getLogger(__name__)
@@ -125,10 +168,13 @@ class DataEnricher:
         self.register("linreg", _calc_linreg)
         self.register("kalman", _calc_kalman)
         self.register("alpha", _calc_alpha_features)
+        self.register("bbands", _calc_bbands)
+        self.register("rsi", _calc_rsi)
         try:
             from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze
             self.register("squeeze", lambda d, **kw: calculate_futures_squeeze(d))
         except ImportError: pass
+
 
     def register(self, name: str, func: Callable): self.registry[name] = func
 

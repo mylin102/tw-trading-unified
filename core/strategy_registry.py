@@ -140,6 +140,8 @@ STRATEGY_PERF: dict[str, dict[str, float]] = {
     "calendar_condor_v2":  {"day_pf": 7.39, "night_pf": 0.0},     # 新增，夜盤不交易
     "vol_squeeze":         {"day_pf": 1.5, "night_pf": 1.2},
     "psar":                {"day_pf": 1.4, "night_pf": 0.9},
+    "weak_bear_trend":     {"day_pf": 1.2, "night_pf": 1.0},  # 新增，WEAK regime 空頭策略
+    "squeeze_fire_scout":  {"day_pf": 1.0, "night_pf": 1.0},  # 新增，SQUEEZE regime scout
 }
 
 # Regime → preferred strategy order (same order for day/night, PF filter applied at runtime)

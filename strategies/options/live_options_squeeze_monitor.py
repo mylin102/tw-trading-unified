@@ -776,33 +776,38 @@ class ShioajiOptionsSmartMonitor:
             
             # 4. 根據標的現價過濾 ATM 合約
             atm_strike = resolve_option_strike(S, self.strike_rounding)
-            cons_at_strike = [c for c in contracts if c.strike_price == atm_strike]
+            cons_at_strike = [c for c in contracts if abs(c.strike_price - atm_strike) < 1]
             
-            if not cons_at_strike:
-                console.print(f"[yellow]⚠️  找不到履約價 {atm_strike} 的 ATM 合約，嘗試最近的合約。[/yellow]")
-                # 如果剛好沒這個履約價，就改用 get_atm_contracts 找最近的
-                atm_contracts = self.get_atm_contracts(contracts, S, range_pts=200)
-                if not atm_contracts:
-                    atm_contracts = contracts # 真的找不到就全用
-                cons_at_strike = atm_contracts
-
-            # 5. 鎖定監控合約 (MTX, Call, Put)
-            # 💡 GSD: Use case-insensitive string match for option_right to support different Enum/String versions
+            # [Wave 3 Fix] Check for BOTH Call and Put presence
             calls = [c for c in cons_at_strike if "call" in str(getattr(c, "option_right", "")).lower()]
             puts = [c for c in cons_at_strike if "put" in str(getattr(c, "option_right", "")).lower()]
-            
-            # [Wave 3 Fix] Fallback: If pairing fails at specific strike, search full month list
+
             if not calls or not puts:
-                console.print(f"[yellow]⚠️  Strike {atm_strike} is missing {'Calls' if not calls else 'Puts'}. Searching full universe...[/yellow]")
-                if not calls:
-                    calls = [c for c in contracts if abs(c.strike_price - atm_strike) < 1 and "call" in str(c.option_right).lower()]
-                if not puts:
-                    puts = [c for c in contracts if abs(c.strike_price - atm_strike) < 1 and "put" in str(c.option_right).lower()]
-            
-            if not calls or not puts:
-                console.print(f"[red]❌ 錯誤：無法配對 Call/Put 合約 (Strike: {atm_strike})[/red]")
-                return False
+                console.print(f"[yellow]⚠️  Strike {atm_strike} is missing {'Calls' if not calls else 'Puts'}. Searching nearby...[/yellow]")
+                # 嘗試在附近範圍內尋找具備雙邊報價的合約
+                atm_contracts = self.get_atm_contracts(contracts, S, range_pts=300)
+                # 依據距離 S 的絕對值排序
+                candidate_strikes = sorted(list(set([c.strike_price for c in atm_contracts])), key=lambda x: abs(x - S))
                 
+                found_pairing = False
+                for candidate_strike in candidate_strikes:
+                    c_at = [c for c in atm_contracts if abs(c.strike_price - candidate_strike) < 1]
+                    c_calls = [c for c in c_at if "call" in str(getattr(c, "option_right", "")).lower()]
+                    c_puts = [c for c in c_at if "put" in str(getattr(c, "option_right", "")).lower()]
+                    if c_calls and c_puts:
+                        atm_strike = candidate_strike
+                        cons_at_strike = c_at
+                        calls = c_calls
+                        puts = c_puts
+                        console.print(f"[green]✅ Found pairing at strike: {atm_strike}[/green]")
+                        found_pairing = True
+                        break
+                
+                if not found_pairing:
+                    console.print(f"[red]❌ 錯誤：無法在附近範圍內找到成對的 Call/Put 合約。[/red]")
+                    return False
+
+            # 5. 鎖定監控合約 (MTX, Call, Put)
             self.active_contracts = {
                 "MTX": target_mtx,
                 "C": calls[0],

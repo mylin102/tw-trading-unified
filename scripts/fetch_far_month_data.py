@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.shioaji_session import get_api
+from core.broker.shioaji_compat import kbars_to_dataframe
 
 
 def get_contracts(api, category="MXF"):
@@ -58,23 +59,15 @@ def fetch_kbars(api, contract, days=7):
     try:
         kbars = api.kbars(contract=contract, start=start_str, end=end_str)
         
-        if not hasattr(kbars, 'ts') or len(kbars.ts) == 0:
+        # 轉換為DataFrame (使用兼容性助手)
+        df = kbars_to_dataframe(kbars)
+        
+        if df.empty:
             print("NO DATA (empty ts)")
             return None
         
-        data = []
-        for i in range(len(kbars.ts)):
-            data.append({
-                'ts': kbars.ts[i],
-                'Open': kbars.Open[i] if i < len(kbars.Open) else None,
-                'High': kbars.High[i] if i < len(kbars.High) else None,
-                'Low': kbars.Low[i] if i < len(kbars.Low) else None,
-                'Close': kbars.Close[i] if i < len(kbars.Close) else None,
-                'Volume': kbars.Volume[i] if i < len(kbars.Volume) else None,
-            })
-        
-        df = pd.DataFrame(data)
-        df['ts'] = pd.to_datetime(df['ts'], unit='ns')
+        # 將索引 ts 轉換為列
+        df = df.reset_index()
         print(f"OK ({len(df)} bars)")
         return df
     
@@ -154,3 +147,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+ain())

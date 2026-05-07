@@ -194,6 +194,7 @@ def build_preferred_canonical_bar_frames(
     min_5m_bars: int = 2,
     now: pd.Timestamp | None = None,
     max_gap_minutes: int = 15,
+    max_stale_minutes: int = 60,
     validator: Callable[[pd.DataFrame], tuple[bool, str]] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, object]]:
     """Pick the first usable source and return shared canonical frames plus diagnostics.
@@ -201,6 +202,9 @@ def build_preferred_canonical_bar_frames(
     P2 layer: canonical bar selector.
     Priority: tick-5m > api-1m > legacy-api-5m.
     Strategy consumes canonical bars only — never raw API responses.
+
+    A candidate is rejected if its latest bar is older than max_stale_minutes
+    (default 60 min) to prevent stale API data from blocking live tick bars.
     """
     rejected: list[str] = []
     for candidate in candidates:
@@ -221,6 +225,12 @@ def build_preferred_canonical_bar_frames(
             rejected.append(f"{name}:insufficient_5m_bars")
             continue
 
+        # [FRESHNESS GATE] Reject if latest bar is too old
+        freshness = get_bar_freshness_minutes(df_5m, now=now)
+        if freshness is not None and freshness > max_stale_minutes:
+            rejected.append(f"{name}:stale_{freshness:.0f}m")
+            continue
+
         if validator is not None:
             is_valid, reason = validator(df_5m)
             if not is_valid:
@@ -230,7 +240,7 @@ def build_preferred_canonical_bar_frames(
         diagnostics = {
             "source": name,
             "source_timeframe": timeframe,
-            "freshness_minutes": get_bar_freshness_minutes(df_5m, now=now),
+            "freshness_minutes": freshness,
             "rejected": rejected,
         }
         return frames, diagnostics

@@ -202,6 +202,42 @@ def calculate_futures_squeeze(
     
     res["fired"] = (~res["sqz_on"]) & (res["sqz_on"].shift(1))
 
+    # [Wave 4 Fix] Add Bollinger Bands and RSI for Mean Reversion
+    # 1. Bollinger Bands
+    basis = res["Close"].rolling(window=bb_length).mean()
+    deviation = res["Close"].rolling(window=bb_length).std(ddof=0)
+    res["bb_up"] = basis + deviation * bb_std
+    res["bb_mid"] = basis
+    res["bb_low"] = basis - deviation * bb_std
+
+    # 2. RSI
+    try:
+        if ta:
+            res["rsi"] = res.ta.rsi(length=14)
+        else:
+            delta = res["Close"].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            res["rsi"] = 100 - (100 / (1 + rs))
+    except Exception:
+        res["rsi"] = 50.0
+
+    # 3. ADX (Trend Strength)
+    try:
+        if ta:
+            adx_df = res.ta.adx(length=14)
+            if adx_df is not None:
+                # pandas_ta ADX column name is usually ADX_14
+                adx_col = [c for c in adx_df.columns if "ADX" in c][0]
+                res["adx"] = adx_df[adx_col]
+            else:
+                res["adx"] = 20.0
+        else:
+            res["adx"] = 20.0
+    except Exception:
+        res["adx"] = 20.0
+
     # 向量化 mom_state 計算，提升效能
     res["mom_prev"] = res["momentum"].shift(1).fillna(0)
     m = res["momentum"].values
@@ -332,9 +368,11 @@ def calculate_futures_squeeze(
         _vwap = res["vwap"] if "vwap" in res.columns else _close
         
         # 2. ATR Traceability (V-Model requirement)
-        res["atr_raw"] = _atr.fillna(0.0)
-        res["atr_floor"] = (_close * 0.0015).fillna(0.0) # 0.15% dynamic floor
-        res["atr_used"] = res[["atr_raw", "atr_floor"]].max(axis=1).replace(0, np.nan).fillna(50.0)
+        res['atr_raw'] = _atr.fillna(0.0)
+        res['atr_floor'] = (_close * 0.0015).fillna(0.0)
+        res['high_20_prev'] = _high_n.fillna(0.0)
+        res['low_20_prev'] = _low_n.fillna(0.0)
+        res['atr_used'] = res[['atr_raw', 'atr_floor']].max(axis=1).replace(0, np.nan).fillna(50.0)
         
         # 3. 原始百分比與偏離度 (Traceability)
         res["intraday_strength_pct"] = ((_close - _open) / _open * 100.0).fillna(0.0)

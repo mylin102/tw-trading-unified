@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import yaml
 import pandas as pd
 from dotenv import load_dotenv
+from core.broker.shioaji_compat import kbars_to_dataframe
 
 # 添加項目根目錄到路徑
 ROOT = Path(__file__).parent.parent
@@ -106,22 +107,15 @@ def download_missing_stocks(missing_tickers, months=3):
                 print(f"  📥 下載5分鐘K線數據...")
                 kbars = api.kbars(contract, start=start_date)
                 
-                if kbars is None or (hasattr(kbars, 'ts') and len(kbars.ts) == 0):
+                # 轉換為DataFrame (使用兼容性助手)
+                df = kbars_to_dataframe(kbars)
+                
+                if df.empty:
                     print(f"  ⚠ {ticker}: 無數據返回")
                     continue
                 
-                # 轉換為DataFrame
-                df = pd.DataFrame({
-                    "timestamp": kbars.ts,
-                    "Open": kbars.Open,
-                    "High": kbars.High,
-                    "Low": kbars.Low,
-                    "Close": kbars.Close,
-                    "Volume": kbars.Volume
-                })
-                
-                # 處理時間戳
-                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                # 將索引 ts 轉換為 timestamp 列
+                df = df.reset_index().rename(columns={"ts": "timestamp"})
                 df = df.sort_values("timestamp").reset_index(drop=True)
                 
                 # 保存到CSV
@@ -203,4 +197,4 @@ if __name__ == "__main__":
         sys.exit(0 if success else 1)
     except KeyboardInterrupt:
         print("\n\n操作被用戶中斷")
-        sys.exit(1)
+        sys.exit(1)exit(1)

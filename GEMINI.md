@@ -29,4 +29,13 @@ Maintain a production-ready codebase through automated verification:
 - **Side Effects**: Write to CSV/logs ONLY after operation success.
 - **Plugin Protocol**: Strategy plugins must return `{"action", "reason", "stop_loss"}` or `None`.
 
-**Mandate**: Read `RULES.md` before every execution wave.
+## 🧠 Cognitive Infrastructure Mandate (CRITICAL)
+To prevent "Context Collapse" and ensure deterministic reasoning, **the Agent MUST read the following files at the start of every session:**
+1.  `AGENTS.md`: Behavioral constraints and cognitive constitution.
+2.  `BOUNDED_CONTEXTS.md`: Ownership boundaries and service layout.
+3.  `ADR/`: Architectural Decision Records (Persistent Memory).
+4.  `RULES.md`: Core trading and safety rules.
+
+**Failure to read these files is a violation of the system's "Digital Constitution".**
+
+**Mandate**: Read ALL Cognitive Infrastructure files listed above before every execution wave.

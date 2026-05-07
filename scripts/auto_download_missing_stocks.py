@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import yaml
 import pandas as pd
 from dotenv import load_dotenv
+from core.broker.shioaji_compat import kbars_to_dataframe
 
 # 添加項目根目錄到路徑
 ROOT = Path(__file__).parent.parent
@@ -121,35 +122,17 @@ def download_missing_stocks(missing_tickers, months=3):
                 print(f"  📥 下載5分鐘K線數據...")
                 kbars = api.kbars(contract, start=start_date)
                 
-                if kbars is None:
-                    print(f"  ❌ {ticker}: API返回None")
+                # 轉換為DataFrame (使用兼容性助手)
+                df = kbars_to_dataframe(kbars)
+                
+                if df.empty:
+                    print(f"  ⚠ {ticker}: 無數據返回")
                     failed_tickers.append(ticker)
                     continue
                 
-                # 檢查數據是否為空
-                if hasattr(kbars, 'ts'):
-                    if len(kbars.ts) == 0:
-                        print(f"  ⚠ {ticker}: 無數據返回")
-                        failed_tickers.append(ticker)
-                        continue
-                else:
-                    print(f"  ❌ {ticker}: 無效的Kbars對象")
-                    failed_tickers.append(ticker)
-                    continue
-                
-                # 轉換為DataFrame
                 print(f"  🔄 轉換數據格式...")
-                df = pd.DataFrame({
-                    "timestamp": kbars.ts,
-                    "Open": kbars.Open,
-                    "High": kbars.High,
-                    "Low": kbars.Low,
-                    "Close": kbars.Close,
-                    "Volume": kbars.Volume
-                })
-                
-                # 處理時間戳
-                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                # 將索引 ts 轉換為 timestamp 列
+                df = df.reset_index().rename(columns={"ts": "timestamp"})
                 df = df.sort_values("timestamp").reset_index(drop=True)
                 
                 # 保存到CSV
@@ -309,4 +292,4 @@ if __name__ == "__main__":
         print(f"\n❌ 程序錯誤: {str(e)}")
         import traceback
         traceback.print_exc()
-        sys.exit(1)
+        sys.exit(1)exit(1)

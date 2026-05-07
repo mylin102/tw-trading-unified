@@ -272,14 +272,22 @@ class ContractResolver:
         data = []
         
         for kb in kbars_list:
-            if hasattr(kb, 'ts') and hasattr(kb, 'open'):
+            # [Compat] Support both lowercase (1.3.3) and Uppercase (1.5.9)
+            ts = getattr(kb, 'Timestamp', getattr(kb, 'ts', None))
+            o = getattr(kb, 'Open', getattr(kb, 'open', 0))
+            h = getattr(kb, 'High', getattr(kb, 'high', 0))
+            l = getattr(kb, 'Low', getattr(kb, 'low', 0))
+            c = getattr(kb, 'Close', getattr(kb, 'close', 0))
+            v = getattr(kb, 'Volume', getattr(kb, 'volume', 0))
+            
+            if ts is not None:
                 data.append({
-                    'ts': kb.ts,
-                    'Open': kb.open,
-                    'High': kb.high,
-                    'Low': kb.low,
-                    'Close': kb.close,
-                    'Volume': kb.volume,
+                    'ts': ts,
+                    'Open': o,
+                    'High': h,
+                    'Low': l,
+                    'Close': c,
+                    'Volume': v,
                 })
         
         df = pd.DataFrame(data)

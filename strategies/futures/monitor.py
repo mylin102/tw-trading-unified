@@ -156,6 +156,9 @@ class FuturesMonitor:
         self._last_trade_ts = None       # timestamp of last trade
         self._bars_since_trade = 0       # bars since last trade
         self._bars_since_session_open = 0 # [V-Model Upgrade] Track session bar count
+        # ── Squeeze Fire Scout time stop tracking ──
+        self._scout_entry_bar: int = -1
+        self._scout_time_stop_bars: int = 0
         self._signals_generated = 0      # valid signals this hour
         self._signals_rejected = 0       # rejected signals this hour (reason, count)
         self._last_audit_hour = -1       # last hour we ran the audit
@@ -2247,6 +2250,11 @@ class FuturesMonitor:
         # Classify bar regime
         bar_regime = classify_futures_bar_regime(bar, session_regime=session_regime)
         
+        # [Patch] Override context.market.regime with bar_regime (not session_regime)
+        # This ensures strategies see the correct bar-level regime (e.g. SQUEEZE)
+        # instead of the broader session-level regime (e.g. NEUTRAL).
+        object.__setattr__(ctx.market, 'regime', bar_regime.regime)
+        
         # [Phase 2 Debug] Router input features — use raw print to avoid rich truncation
         print(
             f"[DEBUG_MARK] classified regime={getattr(bar_regime, 'regime', None)} "
@@ -2389,6 +2397,15 @@ class FuturesMonitor:
             self._last_trade_ts = ts
             self._bars_since_trade = 0
             self._signals_generated += 1
+
+            # ── Squeeze Fire Scout: record entry bar + time_stop_bars ──
+            if reason and "SCOUT" in str(reason).upper():
+                self._scout_entry_bar = self._bar_counter
+                self._scout_time_stop_bars = 6  # default; overridden by signal metadata if available
+                console.print(f"[cyan]🔍 Scout time stop: entry_bar={self._scout_entry_bar} time_stop={self._scout_time_stop_bars} bars[/cyan]")
+            else:
+                self._scout_entry_bar = -1
+                self._scout_time_stop_bars = 0
 
         # ── [L3] Route through OrderManager if enabled ──
         if self._use_order_manager and self.order_mgr and signal in ("BUY", "SELL", "EXIT", "PARTIAL_EXIT"):
@@ -3355,10 +3372,14 @@ class FuturesMonitor:
         # Log bar (即便每分鐘更新也行，存檔邏輯會處理)
         if self.last_processed_bar != timestamp:
             # [GSD] 跳過存檔如果 df_5m 不夠長（early return 的 (1,24) 會鎖死 CSV schema）
-            _skip_save = len(df_5m) < 5
-            if not _skip_save:
+            # 💡 V-Model Correction: 只有在「非剛啟動」且「非換盤」時才嚴格檢查，否則會導致長時間 STALE
+            is_new_session = self._bars_since_session_open < 15
+            _skip_save = len(df_5m) < 5 and not is_new_session
+            
+            if not _skip_save and not is_new_session:
                 _has_atr_raw = "atr_raw" in last_5m and pd.notna(last_5m.get("atr_raw"))
                 _skip_save = not _has_atr_raw
+                
             if not _skip_save:
                 self._save_bar(last_5m, score, regime)
             self.last_processed_bar = timestamp
@@ -3410,6 +3431,33 @@ class FuturesMonitor:
                 "atr": float(last_5m.get("atr", 50)),
                 "time_to_close_mins": time_to_close
             }
+
+            # ── [Squeeze Fire Scout] Time stop check — preempt trend hold ──
+            # Scout entry: if held >= time_stop_bars and not profitable or no breakout,
+            # exit immediately. Scout should NOT ride trend_hold.
+            if self._scout_entry_bar >= 0 and self._scout_time_stop_bars > 0:
+                bars_held = self._bar_counter - self._scout_entry_bar
+                if bars_held >= self._scout_time_stop_bars:
+                    # Check if profitable or structure confirmed
+                    unrealized_pnl = self.trader.unrealized_pnl if hasattr(self.trader, 'unrealized_pnl') else 0
+                    breakout_strength = float(last_5m.get("breakout_strength", 0))
+                    if unrealized_pnl <= 0 or breakout_strength < 0.25:
+                        console.print(
+                            f"[yellow]⏱️ Scout time stop: held {bars_held} bars, "
+                            f"pnl={unrealized_pnl:.0f}, bs={breakout_strength:.3f} — exiting[/yellow]"
+                        )
+                        self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason="SCOUT_TIME_STOP")
+                        self._scout_entry_bar = -1
+                        self._scout_time_stop_bars = 0
+                        return
+                    else:
+                        # Profitable and structure confirmed — promote to full, clear scout
+                        console.print(
+                            f"[green]✅ Scout promoted: held {bars_held} bars, "
+                            f"pnl={unrealized_pnl:.0f}, bs={breakout_strength:.3f} — time stop cleared[/green]"
+                        )
+                        self._scout_entry_bar = -1
+                        self._scout_time_stop_bars = 0
 
             trend_hold_active = self._trend_hold_active(last_5m, last_price, score, vwap, time_to_close)
             if trend_hold_active:
@@ -3659,8 +3707,17 @@ class FuturesMonitor:
             console.print(f"[red]❌ Invalid signal from {selected_strategy_name}: {msg}[/red]")
             return
 
-        # 6. Execute Trade
-        lots = self.MGMT.get("lots_per_trade", 1)
+        # 6. Execute Trade — apply size multiplier from decision (e.g. SQUEEZE_FIRE_SCOUT 0.25x)
+        base_lots = self.MGMT.get("lots_per_trade", 1)
+        size_mult = getattr(decision, "size_multiplier", 1.0)
+        # Also check if signal metadata has an override
+        if signal and hasattr(signal, "metadata") and isinstance(signal.metadata, dict):
+            mult = signal.metadata.get("size_multiplier")
+            if mult is not None and 0 < mult <= 1.0:
+                size_mult = mult
+        lots = max(1, round(base_lots * size_mult))
+        if size_mult != 1.0:
+            console.print(f"[cyan]⚖️ Size scaled: {base_lots} x {size_mult} = {lots} lot(s) ({signal.signal_type})[/cyan]")
         self._execute_trade(
             signal.action,
             last_price,

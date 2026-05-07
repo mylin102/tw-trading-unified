@@ -1,0 +1,115 @@
+# weak_bear_trend Paper Trading 配置 (夜盤)
+# 2026-05-07 夜盤上線測試
+
+active_strategy: weak_bear_trend
+cooldown_bars: 5
+execution:
+  broker_fee_per_side: 20.0  # 微台指手續費較低
+  exchange_fee_per_side: 0.0
+  initial_balance: 50000  # 微台指保證金低，5 萬足夠
+  limit_offset_pts: 2.0
+  market_slippage_pts: 2.0
+  order_type: MKP
+  range_protection_pts: 5.0
+  tax_rate: 2.0e-05
+  tick_size: 1.0
+  point_value: 10.0  # 微台指一點 10 元
+live_trading: false  # Paper Trading Mode
+monitoring:
+  use_order_manager: true
+  callback:
+    buffer_size: 100
+    health_check_secs: 60
+    use_tick_data: false
+  data_mode: hybrid
+  pb_confirmation_bars: 12
+  poll_interval_secs: 30
+skew:
+  filter_threshold: 0.7
+spread_gate:
+  enabled: true
+  night_only: true
+  max_age_minutes: 120
+  extreme_z: 2.0
+  stale_action: warn_only
+risk_mgmt:
+  atr_length: 14
+  atr_multiplier: 2.2
+  break_even_pts: 100
+  exit_on_vwap: true
+  exit_vwap_confirm_bars: 3
+  ma_stop_length: 20
+  ma_stop_multiplier: 1.0
+  ma_stop_ticks: 10
+  ma_stop_type: below
+  skip_hours: []
+  stop_loss_pts: 80
+  time_filter_enabled: false
+  trend_hold_atr_mult: 2.5
+  trend_hold_enabled: true
+  trend_hold_min_price_vs_vwap: 0.0003
+  trend_hold_min_score: 40
+  trend_hold_min_time_to_close_mins: 20
+  trend_hold_min_trend_strength: 0.001
+  trailing_stop_distance_pts: 70
+  trailing_stop_enabled: true
+  trailing_stop_trigger_pts: 120
+strategy:
+  active_strategy: weak_bear_trend
+  auto_select: false
+  volume_threshold: 0.001
+  
+  # weak_bear_trend 專用參數 - 盈虧比 2:1
+  params:
+    shadow_mode: false  # Paper trading 用真實信號
+    
+    # 止損/止盈 - 盈虧比 2:1
+    stop_atr_mult: 1.0      # 緊止損 (小賠)
+    take_profit_atr_mult: 2.0  # 合理止盈 (大賺)
+    
+    # 進場門檻 (更嚴格，確保品質)
+    max_vwap_dist_atr: 0.5    # 必須非常接近 VWAP
+    min_mom_velo_bearish: -8.0  # 要求更強動能
+    max_adx: 20.0            # 更嚴格的 WEAK 定義
+    min_vol_spike: 1.0
+    
+    # 確認參數
+    lookback_bars: 5
+    time_stop_minutes: 15    # 15 分鐘無獲利就走
+  
+  # 其他策略 (備用)
+  counter_mode:
+    atr_sl_mult: 1.5
+    auto_regime: true
+    confirm_bars: 3
+    enabled: false  # 今晚專注測試 weak_bear_trend
+    exit_on_vwap: true
+    min_momentum: 50.0
+  entry_score: 13
+  length: 20
+  partial_exit:
+    enabled: true
+    tp1_lots: 1
+    tp1_pts: 200
+  regime_filter: weak  # 專注 WEAK regime
+  spring_upthrust:
+    atr_mult: 2.5
+    bb_length: 20
+    bb_mult: 2.0
+    kc_length: 20
+    kc_mult: 1.0
+  use_pullback: false
+  use_squeeze: true
+  weights:
+    15m: 0.4
+    1h: 0.2
+    5m: 0.4
+debug:
+  tickbar: false
+  feed: true  # 開啟 feed 日誌，方便監控
+trade_mgmt:
+  allow_long: false  # weak_bear_trend 只做空
+  allow_short: true
+  force_close_at_end: true
+  lots_per_trade: 2  # 微台指建議 2 口起跳
+  max_positions: 2  # 最多 2 口

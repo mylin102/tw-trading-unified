@@ -85,6 +85,7 @@ strategy:
   - counter_vwap
   - spring_upthrust
   - kbar_feature
+  - range_mean_reversion_v1
   use_pullback: false
   use_squeeze: true
   volume_threshold: 0.001
@@ -92,9 +93,23 @@ strategy:
     15m: 0.4
     1h: 0.2
     5m: 0.4
+enrichment:
+  indicators: ["atr", "vwap", "linreg", "bbands", "rsi"]
+  bb_length: 20
+  bb_std: 2.0
+  rsi_length: 14
+squeeze_policy:
+  allow_fire_scout: true
+  fire_scout_size_multiplier: 0.25
+  fire_scout_min_mom_state: 3
+  fire_scout_requires_vwap: true
+  fire_scout_requires_bias: true
+  fire_scout_max_breakout_strength: 0.25
+  fire_scout_stop_atr_mult: 0.6
+  fire_scout_time_stop_bars: 6
 debug:
-  tickbar: false
-  feed: false
+  tickbar: true
+  feed: true
 trade_mgmt:
   allow_long: true
   allow_short: true

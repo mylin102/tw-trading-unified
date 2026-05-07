@@ -102,29 +102,31 @@ class IngestionService:
             bars = self._api.kbars(self._contract, start=start_date, end=date_str)
             self._last_kbars_fetch_at = now_ts
 
-            if bars is None or len(bars) == 0:
+            if bars is None:
+                return None
+                
+            # [rshioaji 1.5.10 Fix] Robust emptiness check for both lowercase and Uppercase attribute names
+            # Handles objects that don't support len(bars)
+            has_data = False
+            for attr in ["close", "Close", "ts", "Timestamp"]:
+                val = getattr(bars, attr, None)
+                if val is not None and hasattr(val, "__len__") and len(val) > 0:
+                    has_data = True
+                    break
+            
+            if not has_data:
                 return None
 
             # [GSD Data Safety] Save raw API response to CSV FIRST
             self._save_raw_kbars(bars)
 
-            # Convert to DataFrame
-            frame = pd.DataFrame({**bars})
-            if frame.empty or "ts" not in frame.columns:
+            from core.broker.shioaji_compat import kbars_to_dataframe
+            frame = kbars_to_dataframe(bars)
+            
+            if frame.empty:
                 return None
 
-            frame["ts"] = pd.to_datetime(frame["ts"])
-            frame = frame.set_index("ts")
-
-            # Normalize column names
-            column_map = {
-                "Open": "Open", "open": "Open",
-                "High": "High", "high": "High",
-                "Low": "Low", "low": "Low",
-                "Close": "Close", "close": "Close",
-                "Volume": "Volume", "volume": "Volume",
-            }
-            frame = frame.rename(columns=column_map)
+            # Standardized column names are already handled by get_kbars_df
             required_cols = ["Open", "High", "Low", "Close", "Volume"]
             available_cols = [col for col in required_cols if col in frame.columns]
             if len(available_cols) < 4:

@@ -157,20 +157,25 @@ def get_contracts_list(api: sj.Shioaji, category: str, symbol: str) -> List[Any]
 
 def fetch_all_contracts(api: sj.Shioaji, timeout: int = 300):
     """Aggressively ensure contracts are available in cache (5 min timeout)."""
-    # Start or join a fetch
     from core.shioaji_session import fetch_contracts
-    fetch_contracts(api)
     
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
             # Check if Futures and Options categories are at least visible in dir()
+            # and contain actual contract data (e.g. MXF)
             cats = dir(api.Contracts)
             if "Futures" in cats and "Options" in cats:
-                return True
+                if "MXF" in dir(api.Contracts.Futures):
+                    return True
         except Exception:
             pass
-        time.sleep(5)
+            
+        # Try/Retry fetching
+        fetch_contracts(api)
+        
+        # If not successful yet, wait a bit before next check/retry
+        time.sleep(10)
     return False
 
 def is_rust_version() -> bool:
