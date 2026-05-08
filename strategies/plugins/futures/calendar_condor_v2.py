@@ -70,7 +70,7 @@ class CalendarCondorV2(StrategyBase):
             # Entry conditions
             "entry_vwap_z": 2.5,           # VWAP Z-score threshold
             "entry_spread_z": 3.0,         # Spread Z-score threshold
-            "min_spread_std": 8.0,         # Minimum spread standard deviation (increased for MXF)
+            "min_spread_std": 5.0,         # Minimum spread standard deviation (relaxed from 8.0 for MXF open)
             "min_expected_profit": 15.0,   # Minimum expected profit points (increased for MXF)
             "max_adx": 25.0,               # Maximum ADX for weak regime
             "max_breakout_strength": 0.5,  # Maximum breakout strength

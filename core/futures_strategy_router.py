@@ -37,7 +37,7 @@ STRATEGY_POLICY: dict[str, dict] = {
         "kill_if_cagr_below": -0.02,
     },
     "adaptive_orb_v15": {
-        "enabled_regimes": ["TREND", "SQUEEZE"],
+        "enabled_regimes": ["TREND", "SQUEEZE", "WEAK", "CHOP", "TRANSITION"],
         "max_weight": 1.0,
         "kill_if_cagr_below": -0.02,
         "description": "v1 ORB + ATR breakout confirmation gate (observation mode)",
@@ -176,8 +176,8 @@ class FuturesRouterConfig:
     trend_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1")
     weak_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1", "counter_vwap", "spring_upthrust", "kbar_feature", "calendar_condor_v2", "range_mean_reversion_v1", "weak_bear_trend")
     bear_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1", "weak_bear_trend")  # [Bear] conservative short — countertrend + upthrust + weak trend
-    stretched_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1")
-    squeeze_strategies: tuple[str, ...] = ("squeeze_fire_scout", "range_mean_reversion_v1")
+    stretched_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1", "weak_bear_trend")
+    squeeze_strategies: tuple[str, ...] = ("squeeze_fire_scout", "range_mean_reversion_v1", "adaptive_orb_v15")
     countertrend_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1")
     hard_block_countertrend_in_trend: bool = True
 
@@ -385,7 +385,7 @@ def route_futures_signal(
     - returns one validated signal from the first allowed strategy, or
     - returns an explicit no-trade / blocked decision with reasons.
     """
-    print("[ROUTE_FINGERPRINT] route_futures_signal ENTERED", flush=True)
+    print(f"[ROUTE_SIGNAL_ENTER] ts={context.market.timestamp} regime={regime_result.regime} bias={regime_result.bias}", flush=True)
 
     cfg = router_config or FuturesRouterConfig()
     notes: list[str] = []
@@ -412,6 +412,20 @@ def route_futures_signal(
 
     # ── [NO_DATA] Gate: bar is None or regime can't be determined ──
     bar = context.market.last_bar
+    print(
+        "[BIAS_TRACE_V20260508] bar_regime_bias=%r bar_bias=%r regime=%r ts=%s"
+        % (getattr(regime_result, "bias", None), bar.get("bias") if bar else None, regime_result.regime, context.market.timestamp),
+        flush=True,
+    )
+    if bar is not None:
+        # [P1] Single Source of Truth Contract: inject into bar dict
+        _b = str(regime_result.bias).strip().upper()
+        _r = str(regime_result.regime).strip().upper()
+        bar["router_bias"] = _b
+        bar["router_regime"] = _r
+        # Legacy compatibility
+        bar["bias"] = _b
+        bar["regime"] = _r
     if bar is None or regime_result.regime in ("NO_DATA", "UNKNOWN"):
         _ts = context.market.timestamp or "?"
         print(f"[Router] NO_DATA mode — bar={bar is not None} regime={regime_result.regime} ts={_ts}", flush=True)
@@ -672,15 +686,26 @@ def route_futures_signal(
             _eval_dict = {"name": name, "enabled": True}
             se = getattr(strategy, "last_eval", None)
             if se is not None:
+                # Enforce skip_reason contract
+                reason = se.skip_reason or "MISSING_REASON"
+                if not se.triggered and not reason.startswith("SKIP:"):
+                    reason = f"SKIP:{reason}"
+                
                 _eval_dict.update({
                     "triggered": se.triggered,
                     "action": se.action,
                     "edge_score": se.edge_score,
-                    "skip_reason": se.skip_reason,
+                    "skip_reason": reason,
                     "notes": se.notes,
                 })
             else:
-                _eval_dict.update({"triggered": False, "action": None, "edge_score": None, "skip_reason": "NO_EVAL", "notes": {}})
+                import logging as _cl
+                _cl.getLogger(__name__).error(
+                    "[STRATEGY_CONTRACT_VIOLATION] %s.on_bar returned None but last_eval is None — "
+                    "a return path in on_bar() is missing _set_eval()",
+                    name,
+                )
+                _eval_dict.update({"triggered": False, "action": None, "edge_score": None, "skip_reason": "SKIP:NO_EVAL_RETURNED", "notes": {}})
             _evals.append(_eval_dict)
         except Exception as e:
             notes.append(f"{name}: error in on_bar ({e})")

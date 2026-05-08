@@ -37,7 +37,7 @@ from squeeze_futures.data.ingestion_service import IngestionService
 from core.strategy_registry import StrategyRegistry
 from core.strategy_context import StrategyContext, PositionView, MarketData
 from core.signal import Signal
-from core.bar_utils import attach_bar_metadata, build_preferred_canonical_bar_frames, resample_ohlcv
+from core.bar_utils import attach_bar_metadata, build_canonical_bar_frames, build_preferred_canonical_bar_frames, resample_ohlcv
 from core.date_utils import get_taifex_futures_hhmm, is_taifex_futures_market_open, get_taifex_futures_session_type
 from core.spread_loader import get_spread_loader
 from squeeze_futures.data.shioaji_client import ShioajiClient
@@ -365,9 +365,8 @@ class FuturesMonitor:
             return yaml.safe_load(f)
 
     def _get_tick_bars_df(self):
-        """[Wave 2 optimization] Lazy DF conversion: rebuild cache only on new bar."""
-        if self._tick_bars_cache is None and len(self._tick_bars_deque) > 0:
-            # Build DataFrame from deque
+        """[Wave 2] Rebuild deque cache on every call so _strategy_tick sees latest bars."""
+        if len(self._tick_bars_deque) > 0:
             records = list(self._tick_bars_deque)
             self._tick_bars_cache = pd.DataFrame({
                 "Open": [r["open"] for r in records],
@@ -431,7 +430,7 @@ class FuturesMonitor:
             )
             console.print("[green]🛡️ Circuit Breaker initialized[/green]")
         except Exception as e:
-            console.print(f"[yellow]⚠️ Circuit Breaker init failed: {e}[/yellow]")
+            console.print(f" [yellow]⚠️ Circuit Breaker init failed: {e}[/yellow] ")
             self._circuit_breaker = None
 
         # ── Pre-init the active strategy ─────────────────────────────
@@ -471,7 +470,7 @@ class FuturesMonitor:
         self._kbar_writer = None  # Initialised lazily on first kbar fetch
 
         if self.dry_run:
-            console.print("[yellow][FuturesMonitor] dry-run: skipping contract fetch[/yellow]")
+            console.print(" [yellow][FuturesMonitor] dry-run: skipping contract fetch[/yellow] ")
             return True
 
         # [GSD Fix] Warm-up from Parquet SSOT (Wave 5 Integration)
@@ -495,7 +494,7 @@ class FuturesMonitor:
                 console.print(f"[green][FuturesMonitor] ✓ Warmed up with {len(df_warm)} bars from {ticker_warm} Parquet DB[/green]")
             else:
                 # [Night Session Fix] Fallback: read from today's indicators CSV for warm-up
-                console.print(f"[yellow][FuturesMonitor] Parquet warm-up empty, trying CSV fallback...[/yellow]")
+                console.print(f" [yellow][FuturesMonitor] Parquet warm-up empty, trying CSV fallback...[/yellow] ")
                 from core.date_utils import get_session_date_str
                 import os as _os
                 log_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(__file__))), "logs", "market_data")
@@ -550,7 +549,7 @@ class FuturesMonitor:
                         if now < settlement_time:
                             valid_contracts.append(c)
                         else:
-                            console.print(f"[yellow][FuturesMonitor] Settlement day detected ({now_str}), skipping expired contract {c.code} after 13:30[/yellow]")
+                            console.print(f" [yellow][FuturesMonitor] Settlement day detected ({now_str}), skipping expired contract {c.code} after 13:30[/yellow] ")
                 
                 # Sort by delivery date (ascending)
                 tmf_sorted = sorted(valid_contracts, key=lambda c: c.delivery_date)
@@ -567,7 +566,7 @@ class FuturesMonitor:
                 else:
                     # Fallback to absolute nearest if no valid ones found (shouldn't happen in live)
                     self.contract = sorted(tmf_list, key=lambda c: c.delivery_date)[0]
-                    console.print(f"[yellow][FuturesMonitor] No future delivery found, using absolute nearest: {self.contract.code}[/yellow]")
+                    console.print(f" [yellow][FuturesMonitor] No future delivery found, using absolute nearest: {self.contract.code}[/yellow] ")
                 
                 # Log all available codes for verification
                 all_codes = [f"{c.code}({c.delivery_date})" for c in tmf_sorted]
@@ -584,7 +583,7 @@ class FuturesMonitor:
                     console.print(f"[green][FuturesMonitor] ✓ MXF far-month: {self.far_contract.code} (delivers {self.far_contract.delivery_date})[/green]")
                 else:
                     self.far_contract = None
-                    console.print(f"[yellow][FuturesMonitor] No far-month contract available[/yellow]")
+                    console.print(f" [yellow][FuturesMonitor] No far-month contract available[/yellow] ")
             else:
                 console.print("[red][FuturesMonitor] No MXF contracts found![/red]")
         except Exception as e:
@@ -670,7 +669,7 @@ class FuturesMonitor:
                     existing_df["timestamp"] = pd.to_datetime(existing_df["timestamp"], errors="coerce")
                     existing_df = existing_df.dropna(subset=["timestamp"])
                 if renamed:
-                    console.print("[yellow][FuturesMonitor] Repaired corrupt startup CSV timestamp header[/yellow]")
+                    console.print(" [yellow][FuturesMonitor] Repaired corrupt startup CSV timestamp header[/yellow] ")
             if "timestamp" not in existing_df.columns:
                 return pd.DataFrame(), None
             existing_df.set_index('timestamp', inplace=True)
@@ -816,13 +815,13 @@ class FuturesMonitor:
 
         # ── Feed stale (warn threshold exceeded) ──
         console.print(
-            f"[yellow][IngestionWatchdog] "
+            f" [yellow][IngestionWatchdog] "
             f"reason=feed_stale symbol={symbol} "
             f"tick_age_secs={secs_since_tick:.0f} "
             f"last_bar_ts={last_bar_ts} "
             f"canonical_age_secs={canonical_age_secs} "
             f"action=check_contract "
-            f"result=degraded[/yellow]"
+            f"result=degraded[/yellow] "
         )
 
         if not is_taifex_futures_market_open():
@@ -877,13 +876,13 @@ class FuturesMonitor:
         today_str = datetime.now().strftime("%Y/%m/%d")
         if self.contract and self.contract.delivery_date < today_str:
             console.print(
-                f"[yellow][IngestionWatchdog] "
+                f" [yellow][IngestionWatchdog] "
                 f"reason=contract_expired symbol={symbol} "
                 f"tick_age_secs={secs_since_tick:.0f} "
                 f"last_bar_ts={last_bar_ts} "
                 f"canonical_age_secs={canonical_age_secs} "
                 f"action=rollover "
-                f"result=triggered[/yellow]"
+                f"result=triggered[/yellow] "
             )
             self._check_contract_rollover()
             self.last_tick_at = time.time()
@@ -895,13 +894,13 @@ class FuturesMonitor:
             self._check_contract_rollover()
         except Exception as e:
             console.print(
-                f"[yellow][IngestionWatchdog] "
+                f" [yellow][IngestionWatchdog] "
                 f"reason=rollover_failed symbol={symbol} "
                 f"tick_age_secs={secs_since_tick:.0f} "
                 f"last_bar_ts={last_bar_ts} "
                 f"canonical_age_secs={canonical_age_secs} "
                 f"action=rollover "
-                f"result=exception:{e}[/yellow]"
+                f"result=exception:{e}[/yellow] "
             )
 
         # ═══ STARTUP / RECOVERY-ONLY: Light kline fetch via IngestionService ═══
@@ -924,23 +923,23 @@ class FuturesMonitor:
                 return
             else:
                 console.print(
-                    f"[yellow][IngestionWatchdog] "
+                    f" [yellow][IngestionWatchdog] "
                     f"reason=feed_stale symbol={symbol} "
                     f"tick_age_secs={secs_since_tick:.0f} "
                     f"last_bar_ts={last_bar_ts} "
                     f"canonical_age_secs={canonical_age_secs} "
                     f"action=fetch_recovery_kline "
-                    f"result=empty_response[/yellow]"
+                    f"result=empty_response[/yellow] "
                 )
         except Exception as e:
             console.print(
-                f"[yellow][IngestionWatchdog] "
+                f" [yellow][IngestionWatchdog] "
                 f"reason=feed_stale symbol={symbol} "
                 f"tick_age_secs={secs_since_tick:.0f} "
                 f"last_bar_ts={last_bar_ts} "
                 f"canonical_age_secs={canonical_age_secs} "
                 f"action=fetch_recovery_kline "
-                f"result=exception:{e}[/yellow]"
+                f"result=exception:{e}[/yellow] "
             )
 
         # Reset timer to avoid spamming retries; next loop will re-evaluate
@@ -974,7 +973,7 @@ class FuturesMonitor:
             return now >= settlement_time
             
         except Exception as e:
-            console.print(f"[yellow]⚠️ Error checking contract expiration: {e}[/yellow]")
+            console.print(f" [yellow]⚠️ Error checking contract expiration: {e}[/yellow] ")
             return False
     
     def _is_settlement_day(self, contract_delivery_date):
@@ -991,7 +990,7 @@ class FuturesMonitor:
             today = datetime.now().date()
             return contract_date == today
         except Exception as e:
-            console.print(f"[yellow]⚠️ Error checking settlement day: {e}[/yellow]")
+            console.print(f" [yellow]⚠️ Error checking settlement day: {e}[/yellow] ")
             return False
     
     def _get_settlement_time_remaining(self):
@@ -1021,7 +1020,7 @@ class FuturesMonitor:
             return (hours, minutes)
             
         except Exception as e:
-            console.print(f"[yellow]⚠️ Error calculating settlement time: {e}[/yellow]")
+            console.print(f" [yellow]⚠️ Error calculating settlement time: {e}[/yellow] ")
             return None
     
     def _check_contract_rollover(self):
@@ -1045,7 +1044,7 @@ class FuturesMonitor:
             # Get all available contracts
             tmf_list = list(self.api.Contracts.Futures.MXF)
             if not tmf_list:
-                console.print("[yellow]⚠️ No MXF contracts available[/yellow]")
+                console.print(" [yellow]⚠️ No MXF contracts available[/yellow] ")
                 return
             
             # [GSD Settlement Fix] Filter out expired contracts considering settlement time
@@ -1094,9 +1093,9 @@ class FuturesMonitor:
                     self.api.quote.subscribe(self.contract, quote_type='tick')
                     console.print(f"[dim]✅ Re-subscription complete[/dim]")
                 except Exception as e:
-                    console.print(f"[yellow]⚠️ Re-subscription failed: {e}[/yellow]")
+                    console.print(f" [yellow]⚠️ Re-subscription failed: {e}[/yellow] ")
         except Exception as e:
-            console.print(f"[yellow]⚠️ Contract rollover check error: {e}[/yellow]")
+            console.print(f" [yellow]⚠️ Contract rollover check error: {e}[/yellow] ")
 
     # ── [GSD Data Safety] Raw tick CSV writer ──
     def _write_raw_tick(self, tick) -> None:
@@ -1181,7 +1180,7 @@ class FuturesMonitor:
                         self._current_bar["volume"] = 0
 
         except Exception as e:
-            console.print(f"[yellow][FuturesMonitor] Tick CSV rebuild failed (non-fatal): {e}[/yellow]")
+            console.print(f" [yellow][FuturesMonitor] Tick CSV rebuild failed (non-fatal): {e}[/yellow] ")
 
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()  # [gstack] 更新數據更新時間
@@ -1385,7 +1384,7 @@ class FuturesMonitor:
             else:
                 console.print("[red]Safety stop failed to place[/red]")
         except Exception as e:
-            console.print(f"[yellow]Safety stop error: {e}[/yellow]")
+            console.print(f" [yellow]Safety stop error: {e}[/yellow] ")
 
     def _cancel_safety_stop(self):
         """Cancel the exchange-side safety stop after normal exit."""
@@ -1395,7 +1394,7 @@ class FuturesMonitor:
             self.api.cancel_order(self._safety_stop_trade)
             console.print("[dim]🛡️ Safety stop cancelled[/dim]")
         except Exception as e:
-            console.print(f"[yellow]Safety stop cancel error: {e}[/yellow]")
+            console.print(f" [yellow]Safety stop cancel error: {e}[/yellow] ")
         self._safety_stop_trade = None
 
     # ── GSD Phase 0d: Hourly No-Trade Audit (V-Model during session) ──
@@ -1432,7 +1431,7 @@ class FuturesMonitor:
         elif self._signals_generated == 0:
             verdict = "NO_VALID_SIGNALS"
             note = f"Data OK, {actual_bars} bars, 0 signals generated. Strategy may be too strict for current conditions."
-            console.print(f"[yellow]⚠️  {verdict}: {note}[/yellow]")
+            console.print(f" [yellow]⚠️  {verdict}: {note}[/yellow] ")
         else:
             verdict = "NORMAL"
             note = f"{self._signals_generated} signals, data healthy"
@@ -1607,7 +1606,7 @@ class FuturesMonitor:
                     console.print(f"[dim]📂 Trade records backed up: {', '.join(backup_files)}[/dim]")
                     
         except Exception as e:
-            console.print(f"[yellow]⚠️ Trade backup failed: {e}[/yellow]")
+            console.print(f" [yellow]⚠️ Trade backup failed: {e}[/yellow] ")
 
     def _save_orders_file_wrapper(self):
         """Export all orders to JSON for dashboard consumption."""
@@ -1695,7 +1694,7 @@ class FuturesMonitor:
             self.order_mgr.completed.append(lifecycle_order)
             return lifecycle_order
         except Exception as e:
-            console.print(f"[yellow]⚠️ Failed to append lifecycle order: {e}[/yellow]")
+            console.print(f" [yellow]⚠️ Failed to append lifecycle order: {e}[/yellow] ")
             return None
 
     def _recover_orders_from_trades_csv(self):
@@ -1762,7 +1761,7 @@ class FuturesMonitor:
                         recovered_count += 1
                     
                 except Exception as e:
-                    console.print(f"[yellow]⚠️ Failed to recover order from row: {e}[/yellow]")
+                    console.print(f" [yellow]⚠️ Failed to recover order from row: {e}[/yellow] ")
                     continue
             
             if recovered_count > 0:
@@ -1771,7 +1770,7 @@ class FuturesMonitor:
                 self._save_orders_file_wrapper()
             
         except Exception as e:
-            console.print(f"[yellow]Futures order recovery from trades CSV failed: {e}[/yellow]")
+            console.print(f" [yellow]Futures order recovery from trades CSV failed: {e}[/yellow] ")
 
     # ── Order Lifecycle (L3 Integration) ──
     def _get_lifecycle_order(self, order_id):
@@ -1946,7 +1945,7 @@ class FuturesMonitor:
                 console.print(f"[green]📦 Confirmed deal: {action} {event.fill_qty} @ {event.fill_price:.0f} deal={event.deal_id} → {msg}[/green]")
 
         def _on_cancel_callback(event):
-            console.print(f"[yellow]🚫 Order CANCELLED: {event.order_id} ({event.reason})[/yellow]")
+            console.print(f" [yellow]🚫 Order CANCELLED: {event.order_id} ({event.reason})[/yellow] ")
             self._clear_pending_lifecycle_order(event.order_id)
             self._save_orders_file_wrapper()
 
@@ -2051,7 +2050,7 @@ class FuturesMonitor:
             console.print(f"[dim]Margin OK: equity={equity:.0f} available={available:.0f}[/dim]")
             return True
         except Exception as e:
-            console.print(f"[yellow]Margin check failed: {e} — allowing order[/yellow]")
+            console.print(f" [yellow]Margin check failed: {e} — allowing order[/yellow] ")
             return True  # API 查詢失敗不擋單，讓交易所擋
 
     # ── Trade execution ──
@@ -2202,6 +2201,8 @@ class FuturesMonitor:
         return ctx
     def _route_signal(self, bar, session_regime, active_name=None, pending_orders=None, attribution_recorder=None):
         """Route signal through strategy router with optional attribution."""
+        _ts = bar.get("timestamp") or (bar.name if hasattr(bar, "name") else "unknown")
+        console.print(f"[ROUTE_SIGNAL_ENTER] ts={_ts} active={active_name}")
         # Build context
         ctx = self._build_strategy_context(bar, session_regime)
 
@@ -2209,7 +2210,11 @@ class FuturesMonitor:
 
         # [Phase 2 Fix] Skip routing on prefill/warmup bars (old data from Parquet/CSV)
         # Check if bar timestamp is from current trading day
-        bar_ts = bar.get("timestamp")
+        _raw_bar_ts = bar.get("timestamp")
+        if _raw_bar_ts is None and hasattr(bar, "name"):
+             _raw_bar_ts = bar.name
+        
+        bar_ts = _raw_bar_ts
         if bar_ts is not None:
             from core.date_utils import get_trading_day
             try:
@@ -2231,8 +2236,8 @@ class FuturesMonitor:
             skew_threshold = self.cfg.get("skew", {}).get("filter_threshold", 0.70)
             if direction == "BEAR" and confidence >= skew_threshold and self.trader.position == 0:
                 console.print(
-                    f"[yellow][SkewGate] BLOCK entry — skew BEAR "
-                    f"confidence={confidence:.2f} >= {skew_threshold:.2f}[/yellow]"
+                    f" [yellow][SkewGate] BLOCK entry — skew BEAR "
+                    f"confidence={confidence:.2f} >= {skew_threshold:.2f}[/yellow] "
                 )
                 bar_regime = classify_futures_bar_regime(bar, session_regime=session_regime)
                 decision = FuturesRouterDecision(
@@ -2254,7 +2259,22 @@ class FuturesMonitor:
         # This ensures strategies see the correct bar-level regime (e.g. SQUEEZE)
         # instead of the broader session-level regime (e.g. NEUTRAL).
         object.__setattr__(ctx.market, 'regime', bar_regime.regime)
-        
+
+        # Inject bias into bar dict so strategies reading bar.get("bias") get it
+        bar["bias"] = bar_regime.bias
+        import logging as _bl
+        _bl.getLogger(__name__).info(
+            "[BIAS_TRACE] session_bias=%s bar_regime_bias=%s injected_bar_bias=%s regime=%s",
+            getattr(session_regime, "bias", None) if hasattr(session_regime, "bias") else session_regime,
+            getattr(bar_regime, "bias", None),
+            bar.get("bias"),
+            getattr(bar_regime, "regime", None),
+        )
+        console.print(
+            "[BIAS_TRACE_V20260508] bar_regime_bias=%r bar_bias=%r regime=%r"
+            % (getattr(bar_regime, "bias", None), bar.get("bias"), getattr(bar_regime, "regime", None)),
+        )
+
         # [Phase 2 Debug] Router input features — use raw print to avoid rich truncation
         print(
             f"[DEBUG_MARK] classified regime={getattr(bar_regime, 'regime', None)} "
@@ -2348,7 +2368,7 @@ class FuturesMonitor:
             # 1) Price sanity
             if price is None or price <= 0:
                 self._audit_signal("ENTRY_BLOCKED", "", 0, "invalid_price", f"price={price}")
-                console.print(f"[yellow][FuturesMonitor] Block entry: invalid price {price}[/yellow]")
+                console.print(f" [yellow][FuturesMonitor] Block entry: invalid price {price}[/yellow] ")
                 return None
             # 2) Feed freshness (use monitor thresholds)
             try:
@@ -2358,7 +2378,7 @@ class FuturesMonitor:
                     max_age = getattr(self, 'STALE_WARN_SECS', 120)
                     if tx_age > max_age or tmf_age > max_age:
                         self._audit_signal("ENTRY_BLOCKED", "", 0, "feed_stale", f"TX={tx_age:.0f}s MXF={tmf_age:.0f}s")
-                        console.print(f"[yellow][FuturesMonitor] Block entry: feed stale TX={tx_age:.0f}s MXF={tmf_age:.0f}s[/yellow]")
+                        console.print(f" [yellow][FuturesMonitor] Block entry: feed stale TX={tx_age:.0f}s MXF={tmf_age:.0f}s[/yellow] ")
                         return None
             except Exception:
                 pass
@@ -2367,21 +2387,21 @@ class FuturesMonitor:
                 try:
                     if ts == self._last_trade_ts:
                         self._audit_signal("ENTRY_BLOCKED", "", 0, "same_bar", "same_bar_as_last_trade")
-                        console.print(f"[yellow][FuturesMonitor] Block entry: same bar as last trade ({ts})[/yellow]")
+                        console.print(f" [yellow][FuturesMonitor] Block entry: same bar as last trade ({ts})[/yellow] ")
                         return None
                 except Exception:
                     pass
             # 4) Enforce simple position guard: avoid new entry when a position exists (prevent pyramiding)
             if getattr(self, 'trader', None) is not None and self.trader.position != 0:
                 self._audit_signal("ENTRY_BLOCKED", "", 0, "position_not_zero", f"position={self.trader.position}")
-                console.print(f"[yellow][FuturesMonitor] Block entry: position not zero ({self.trader.position})[/yellow]")
+                console.print(f" [yellow][FuturesMonitor] Block entry: position not zero ({self.trader.position})[/yellow] ")
                 return None
             # 5) Minimum stop loss check (prevent tiny stops)
             try:
                 min_sl = self.RISK.get('min_stop_loss_pts', 10)
                 if stop_loss is not None and stop_loss < min_sl:
                     self._audit_signal("ENTRY_BLOCKED", "", 0, "stop_loss_too_small", f"sl={stop_loss}")
-                    console.print(f"[yellow][FuturesMonitor] Block entry: stop_loss {stop_loss} < min {min_sl}[/yellow]")
+                    console.print(f" [yellow][FuturesMonitor] Block entry: stop_loss {stop_loss} < min {min_sl}[/yellow] ")
                     return None
             except Exception:
                 pass
@@ -2497,7 +2517,7 @@ class FuturesMonitor:
             sess = self.session_type or "day"
             self.consecutive_losses += 1
             self.session_losses.append((ts, pnl_pts, reason or "UNKNOWN", sess))
-            console.print(f"[yellow]⚠️  Loss #{self.consecutive_losses}: {pnl_pts:.1f} pts ({reason or 'unknown'}) [{sess}][/yellow]")
+            console.print(f" [yellow]⚠️  Loss #{self.consecutive_losses}: {pnl_pts:.1f} pts ({reason or 'unknown'}) [{sess}][/yellow] ")
         elif signal in ("EXIT", "PARTIAL_EXIT") and pnl_pts >= 0:
             self.consecutive_losses = 0
 
@@ -2622,7 +2642,7 @@ class FuturesMonitor:
             
             missing = [c for c in new_data_keys if c not in df.columns]
             if missing:
-                console.print(f"[yellow]🛡️ Migrating indicator CSV: adding {missing}[/yellow]")
+                console.print(f" [yellow]🛡️ Migrating indicator CSV: adding {missing}[/yellow] ")
                 for c in missing:
                     df[c] = pd.NA
                 # Sort columns to keep a stable order
@@ -2730,8 +2750,8 @@ class FuturesMonitor:
         sla_secs = getattr(self, 'CANONICAL_SLA_SECS', 600)  # Default 10 min
         if elapsed_secs > sla_secs:
             console.print(
-                f"[yellow][P4] Canonical 5m data stale: last_bar_ts={last_bar_dt.strftime('%H:%M:%S')}, "
-                f"age={elapsed_secs:.0f}s (>SLA {sla_secs}s). Flagging STALE_DATA.[/yellow]"
+                f" [yellow][P4] Canonical 5m data stale: last_bar_ts={last_bar_dt.strftime('%H:%M:%S')}, "
+                f"age={elapsed_secs:.0f}s (>SLA {sla_secs}s). Flagging STALE_DATA.[/yellow] "
             )
             return ["STALE_DATA"]
 
@@ -2798,7 +2818,7 @@ class FuturesMonitor:
         source_name = str(bar_source.get('source', 'unknown'))
 
         console.print(
-            f"[yellow][IngestionWatchdog] "
+            f" [yellow][IngestionWatchdog] "
             f"reason=tick_api_mismatch "
             f"tick_close={tick_last_close:.1f} "
             f"api_close={api_last_close:.1f} "
@@ -2808,7 +2828,7 @@ class FuturesMonitor:
             f"api_last_ts={api_last_ts} "
             f"active_source={source_name} "
             f"action=none "
-            f"result=warning_only[/yellow]"
+            f"result=warning_only[/yellow] "
         )
 
     # ── End P4 Hardening ──────────────────────────────────────────────
@@ -2915,7 +2935,7 @@ class FuturesMonitor:
                         console.print(f"[bold cyan]♻️ Recovered futures position: {qty} @ {p.price}[/bold cyan]")
                         break
             except Exception as e:
-                console.print(f"[yellow]Futures position recovery failed: {e}[/yellow]")
+                console.print(f" [yellow]Futures position recovery failed: {e}[/yellow] ")
 
         # [Phase A.5] Rebuild tick bars from raw tick CSV (crash recovery)
         self._rebuild_bars_from_raw_ticks()
@@ -2930,7 +2950,7 @@ class FuturesMonitor:
                 self._backfill_done = True
                 console.print(f"[bold green]✅ [Phase B] Backfill complete ({len(df_hist)} bars). Indicators stabilizing...[/bold green]")
             else:
-                console.print(f"[yellow]⚠️ [Phase B] Backfill returned no data, will rely on tick accumulation.[/yellow]")
+                console.print(f" [yellow]⚠️ [Phase B] Backfill returned no data, will rely on tick accumulation.[/yellow] ")
         
         threading.Thread(target=_bg_backfill, daemon=True).start()
 
@@ -2976,14 +2996,14 @@ class FuturesMonitor:
                 for order in pending:
                     try:
                         self.order_mgr.cancel_order(order.id)
-                        console.print(f"[yellow]✓ Cancelled pending order {order.id}[/yellow]")
+                        console.print(f" [yellow]✓ Cancelled pending order {order.id}[/yellow] ")
                         cancelled_count += 1
                     except Exception as e:
                         console.print(f"[red]Failed to cancel order {order.id}: {e}[/red]")
             else:
                 # Fallback: direct API cancellation for futures orders
                 # This is a simplistic implementation - may need enhancement
-                console.print("[yellow]⚠️ Order manager not enabled; manual API cancellation not implemented yet[/yellow]")
+                console.print(" [yellow]⚠️ Order manager not enabled; manual API cancellation not implemented yet[/yellow] ")
         except Exception as e:
             console.print(f"[red]Error in _cancel_all_pending_orders: {e}[/red]")
         
@@ -2993,6 +3013,8 @@ class FuturesMonitor:
             console.print(f"[bold green]✅ Cancelled {cancelled_count} pending order(s)[/bold green]")
 
     def _strategy_tick(self):
+        console.print("[STICK_00_ENTER] dry_run=%s" % self.dry_run)
+
         # [Rule 9] Hot-reload config if changed
         self._reload_config_if_changed()
 
@@ -3038,12 +3060,17 @@ class FuturesMonitor:
                     
                     # 💡 GSD: 只有主體 MXF 過期才跳過；TX 過期則僅報警
                     if tmf_age > max_age:
-                        console.print(f"[yellow][FuturesMonitor] MXF feed stale ({tmf_age:.0f}s) - skip strategy tick[/yellow]")
+                        console.print(f" [yellow][FuturesMonitor] MXF feed stale ({tmf_age:.0f}s) - skip strategy tick[/yellow] ")
                         return
+
+                    console.print(
+                        "[STICK_01_FEED_OK] tmf_age=%s tx_age=%s dry_run=%s"
+                        % (tmf_age, tx_age, self.dry_run),
+                    )
                     
                     if tx_age > max_age:
                         if self._bar_counter % 5 == 0: # 減少日誌噪音
-                            console.print(f"[yellow][FuturesMonitor] TX feed quiet ({tx_age:.0f}s) - continuing in degraded mode[/yellow]")
+                            console.print(f" [yellow][FuturesMonitor] TX feed quiet ({tx_age:.0f}s) - continuing in degraded mode[/yellow] ")
             except Exception:
                 pass
 
@@ -3092,6 +3119,15 @@ class FuturesMonitor:
                 min_5m_bars=2,
             )
 
+            console.print(
+                "[STICK_02_RAW_FRAMES] keys=%s source=%s tick_cache_none=%s"
+                % (
+                    list(raw_frames.keys()) if isinstance(raw_frames, dict) else type(raw_frames).__name__,
+                    bar_source.get("source", "?"),
+                    getattr(self, "_tick_bars_cache", None) is None,
+                ),
+            )
+
             for tf, frame in raw_frames.items():
                 if len(frame) >= 2:
                     processed[tf] = attach_bar_metadata(
@@ -3101,6 +3137,11 @@ class FuturesMonitor:
                             **self.PB_ARGS,
                         )
                     )
+
+        console.print(
+            "[STICK_03_PROCESSED_BEFORE_FALLBACK] keys=%s has_5m=%s"
+            % (list(processed.keys()), "5m" in processed and not processed["5m"].empty),
+        )
 
         # [P4 Hardening] Canonical freshness SLA
         data_flags: list[str] = []
@@ -3149,7 +3190,7 @@ class FuturesMonitor:
                     n_null = df_5m[c].isna().sum()
                     n_total = len(df_5m)
                     if n_null == n_total:
-                        console.print(f"[yellow][INDICATOR] {c}: ALL NaN ({n_total} bars)[/yellow]")
+                        console.print(f" [yellow][INDICATOR] {c}: ALL NaN ({n_total} bars)[/yellow] ")
                     elif n_null > 0:
                         console.print(f"[dim][INDICATOR] {c}: {n_null}/{n_total} NaN[/dim]")
             console.print(f"[dim][INDICATOR] df_5m shape={df_5m.shape}, index range={df_5m.index[0]}~{df_5m.index[-1]}[/dim]")
@@ -3190,7 +3231,7 @@ class FuturesMonitor:
                 # Apply boost to score (conservative scaling)
                 score = float(score) * boost
         except Exception as e:
-            console.print(f"[yellow]⚠️ Adaptive engine failed: {e}[/yellow]")
+            console.print(f" [yellow]⚠️ Adaptive engine failed: {e}[/yellow] ")
 
         # Cross-regime decision (TX macro + MXF local)
         try:
@@ -3239,7 +3280,7 @@ class FuturesMonitor:
                 if tx_bars_list and df_5m is not None:
                     aligned = self._bars_time_aligned(tx_bars_list, df_5m)
                     if not aligned:
-                        console.print(f"[yellow][CROSS] tx/tmf bars not time-aligned (skip cross-regime) [/yellow]")
+                        console.print(f" [yellow][CROSS] tx/tmf bars not time-aligned (skip cross-regime) [/yellow] ")
                         # Skip cross-regime gating entirely: set permissive policy and jump ahead
                         policy = {"allow_trade": True, "orb_weight": 1.0, "vwap_weight": 1.0}
                         self._last_bar_context.update({
@@ -3287,13 +3328,13 @@ class FuturesMonitor:
             console.print(f"[dim][CROSS] tx={tx_regime} tmf={tmf_regime} allow={policy.get('allow_trade', False)} orb_w={policy.get('orb_weight', 0):.2f} vwap_w={policy.get('vwap_weight', 0):.2f} reason={policy.get('reason','')}[/dim]")
 
             if not policy.get('allow_trade', False):
-                console.print(f"[yellow]🔒 CrossPolicy: trading disabled by tx={tx_regime} tmf={tmf_regime} reason={policy.get('reason','')}[/yellow]")
+                console.print(f" [yellow]🔒 CrossPolicy: trading disabled by tx={tx_regime} tmf={tmf_regime} reason={policy.get('reason','')}[/yellow] ")
                 score = 0.0
             else:
                 mult = max(0.5, min(1.3, 0.6 * policy.get('orb_weight', 1.0) + 0.4 * policy.get('vwap_weight', 1.0)))
                 score = float(score) * mult
         except Exception as e:
-            console.print(f"[yellow]⚠️ Cross-regime integration failed: {e}[/yellow]")
+            console.print(f" [yellow]⚠️ Cross-regime integration failed: {e}[/yellow] ")
 
         # [GSD 4.13] Trading Readiness Unlock: only allow trading if we have enough bars for indicators
         feed_is_fresh = self._tmf_feed_age_secs() <= getattr(self, "STALE_WARN_SECS", self.MONITOR.get("stale_tick_warn_secs", 120))
@@ -3348,6 +3389,7 @@ class FuturesMonitor:
         self._bars_since_session_open += 1
         last_5m_dict = last_5m.to_dict()
         last_5m_dict["bars_since_open"] = self._bars_since_session_open
+        last_5m_dict["timestamp"] = last_5m.name # Ensure timestamp is available in dict
 
         # GSD Phase 0c: Snapshot bar context for entry diagnostic (used by _execute_trade)
         self._last_bar_context = {
@@ -3369,7 +3411,49 @@ class FuturesMonitor:
         # GSD Phase 0d: Hourly no-trade audit
         self._hourly_no_trade_audit(timestamp, df_5m)
 
+        # ── [BAR SOURCE ARBITRATION] tick bar stale → fallback to canonical CSV ──
+        if not self.dry_run:
+            _bar_age_minutes = None
+            try:
+                _bar_age_minutes = (datetime.now() - timestamp).total_seconds() / 60.0
+            except Exception:
+                pass
+            if _bar_age_minutes is not None and _bar_age_minutes >= 3.0:
+                try:
+                    _tag = "_PAPER" if not self.live_trading else "_LIVE"
+                    _csv_path = Path(f"logs/market_data/{self.ticker}_{get_session_date_str(datetime.now())}{_tag}_indicators.csv")
+                    if _csv_path.exists():
+                        _csv_df = pd.read_csv(_csv_path)
+                        if "timestamp" in _csv_df.columns:
+                            _csv_df["timestamp"] = pd.to_datetime(_csv_df["timestamp"], errors="coerce")
+                            _csv_df = _csv_df.set_index("timestamp").sort_index()
+                            _csv_last_ts = _csv_df.index[-1]
+                            if _csv_last_ts > timestamp:
+                                console.print(
+                                    f" [yellow][BAR_SOURCE_FALLBACK] tick_bar_stale={timestamp} csv_bar_new={_csv_last_ts} age={_bar_age_minutes:.0f}min source=csv[/yellow] "
+                                )
+                                df_5m = _csv_df
+                                last_5m = df_5m.iloc[-1]
+                                timestamp = df_5m.index[-1]
+                                last_price = float(last_5m.get("Close", last_price))
+                                vwap = float(last_5m.get("vwap", vwap))
+                                processed["5m"] = df_5m
+                                bar_source = {"source": "csv-fallback", "freshness_minutes": 0}
+                                console.print(
+                                    f" [yellow][BarFallback] Switched to CSV: ts={timestamp} "
+                                    f"close={last_price:.0f} bars={len(df_5m)}[/yellow] "
+                                )
+                except Exception as _exc:
+                    console.print(f"[dim][BAR_SOURCE_FALLBACK] CSV read failed: {_exc}[/dim]")
+
         # Log bar (即便每分鐘更新也行，存檔邏輯會處理)
+        if self.last_processed_bar is not None and self.last_processed_bar == timestamp:
+            if self._bar_counter % 5 == 0:
+                _bar_age_s = (datetime.now() - timestamp).total_seconds() if hasattr(timestamp, 'timestamp') else -1
+                console.print(
+                    "[BAR_WAIT] ts=%s last=%s age=%.1fs source=%s"
+                    % (timestamp, self.last_processed_bar, _bar_age_s, bar_source.get("source", "?")),
+                )
         if self.last_processed_bar != timestamp:
             # [GSD] 跳過存檔如果 df_5m 不夠長（early return 的 (1,24) 會鎖死 CSV schema）
             # 💡 V-Model Correction: 只有在「非剛啟動」且「非換盤」時才嚴格檢查，否則會導致長時間 STALE
@@ -3443,8 +3527,8 @@ class FuturesMonitor:
                     breakout_strength = float(last_5m.get("breakout_strength", 0))
                     if unrealized_pnl <= 0 or breakout_strength < 0.25:
                         console.print(
-                            f"[yellow]⏱️ Scout time stop: held {bars_held} bars, "
-                            f"pnl={unrealized_pnl:.0f}, bs={breakout_strength:.3f} — exiting[/yellow]"
+                            f" [yellow]⏱️ Scout time stop: held {bars_held} bars, "
+                            f"pnl={unrealized_pnl:.0f}, bs={breakout_strength:.3f} — exiting[/yellow] "
                         )
                         self._execute_trade("EXIT", last_price, timestamp, abs(self.trader.position), reason="SCOUT_TIME_STOP")
                         self._scout_entry_bar = -1
@@ -3581,7 +3665,7 @@ class FuturesMonitor:
                 )
             elif breaker_action.value == "REDUCE_SIZE":
                 # Temporarily reduce position size
-                console.print(f"[yellow]⚠️ Circuit Breaker REDUCE_SIZE ({self.session_type}): Daily loss at 40%[/yellow]")
+                console.print(f" [yellow]⚠️ Circuit Breaker REDUCE_SIZE ({self.session_type}): Daily loss at 40%[/yellow] ")
 
         # Prevent re-entering on the same bar as exit
         if self._last_exit_bar == timestamp:

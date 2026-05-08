@@ -60,8 +60,13 @@ class RangeMeanReversionV1(StrategyBase):
         
         # ── 2. 獲取指標 ──
         close = bar.get("Close", 0.0)
-        bb_up = bar.get("bb_up", np.nan)
-        bb_low = bar.get("bb_low", np.nan)
+        # [P0] Column name contract: bb_up/bb_low vs bb_upper/bb_lower (indicator engine)
+        bb_up_raw = bar.get("bb_up")
+        bb_up = bb_up_raw if bb_up_raw is not None else bar.get("bb_upper", np.nan)
+        bb_low_raw = bar.get("bb_low")
+        bb_low = bb_low_raw if bb_low_raw is not None else bar.get("bb_lower", np.nan)
+        bb_mid_raw = bar.get("bb_mid")
+        bb_mid = bb_mid_raw if bb_mid_raw is not None else bar.get("bb_middle", np.nan)
         rsi = bar.get("rsi", 50)
         adx = bar.get("adx", 20)
         
@@ -85,7 +90,7 @@ class RangeMeanReversionV1(StrategyBase):
                 action="BUY",
                 reason=f"BB_LOW_OVERSOLD (rsi={rsi:.1f})",
                 stop_loss=close - 30,
-                take_profit=bar.get("bb_mid", close + 60),
+                take_profit=bb_mid if not (isinstance(bb_mid, float) and np.isnan(bb_mid)) else close + 60,
                 confidence=0.75
             )
             
@@ -95,7 +100,7 @@ class RangeMeanReversionV1(StrategyBase):
                 action="SELL",
                 reason=f"BB_UP_OVERBOUGHT (rsi={rsi:.1f})",
                 stop_loss=close + 30,
-                take_profit=bar.get("bb_mid", close - 60),
+                take_profit=bb_mid if not (isinstance(bb_mid, float) and np.isnan(bb_mid)) else close - 60,
                 confidence=0.75
             )
 

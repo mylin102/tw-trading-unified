@@ -1,6 +1,9 @@
 """Spring/Upthrust — 假突破反向 (PF=3.36, 33 筆交易)."""
 from __future__ import annotations
 
+import math
+from typing import Any
+
 from core.signal import Signal
 from core.strategy_base import StrategyBase
 from core.strategy_context import StrategyContext
@@ -23,7 +26,7 @@ class SpringUpthrust(StrategyBase):
     def metadata(self) -> dict[str, Any]:
         return {
             "asset_class": "futures",
-            "version": "3.0",
+            "version": "3.1",
             "backtest_pf": 3.36,
             "backtest_wr": 33.3,
             "backtest_maxdd": -10.1,
@@ -50,6 +53,10 @@ class SpringUpthrust(StrategyBase):
         high = bar.get("High", 0.0)
         low = bar.get("Low", 0.0)
         atr = bar.get("atr", 200.0)
+        
+        # [P1] Single Source of Truth
+        bias = str(bar.get("router_bias") or bar.get("bias") or "NEUTRAL").upper().strip()
+        
         atr_cap = 300
         if atr > atr_cap:
             atr = atr_cap
@@ -62,9 +69,15 @@ class SpringUpthrust(StrategyBase):
 
         # Spring: 假跌破 BB 下軌 → 做多（收盤彈回）
         if low < bb_lower and close > bb_lower and context.position.size <= 0:
+            # [P1] Bias Filter: only Spring if NOT strongly SHORT
+            if bias == "SHORT":
+                self._set_eval(skip_reason="SPRING_BLOCKED_BY_BIAS", bias=bias)
+                return None
+                
             if not is_spring_long_context_favorable(bar):
                 self._set_eval(skip_reason="SPRING_CONTEXT_UNFAVORABLE", low=low, bb_lower=bb_lower, close=close)
                 return None
+            
             self._set_eval(triggered=True, action="BUY", edge_score=0.70, signal="SPRING", low=low, bb_lower=bb_lower)
             return Signal(
                 "BUY",
@@ -76,6 +89,11 @@ class SpringUpthrust(StrategyBase):
 
         # Upthrust: 假突破 BB 上軌 → 做空（收盤跌回）
         if high > bb_upper and close < bb_upper and context.position.size >= 0:
+            # [P1] Bias Filter: only Upthrust if NOT strongly LONG
+            if bias == "LONG":
+                self._set_eval(skip_reason="UPTHRUST_BLOCKED_BY_BIAS", bias=bias)
+                return None
+                
             self._set_eval(triggered=True, action="SELL", edge_score=0.70, signal="UPTHRUST", high=high, bb_upper=bb_upper)
             return Signal(
                 "SELL",
@@ -85,7 +103,7 @@ class SpringUpthrust(StrategyBase):
                 confidence=0.70,
             )
 
-        self._set_eval(skip_reason="NO_PATTERN", sqz_on=True, close=close, bb_upper=bb_upper, bb_lower=bb_lower)
+        self._set_eval(skip_reason="NO_PATTERN", sqz_on=True, close=close, bb_upper=bb_upper, bb_lower=bb_lower, bias=bias)
         return None
 
     def cleanup(self) -> None:
