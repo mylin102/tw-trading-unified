@@ -1311,6 +1311,7 @@ class ShioajiOptionsSmartMonitor:
         remaining_capacity = max(0, int(self.max_positions) - int(self.position))
         if remaining_capacity <= 0:
             return 0
+        return min(scaled_lots, remaining_capacity)
 
     # ──────────────────────────────────────────────────────────────
     # Trade Ledger Durability — append_csv_row_durable + make_trade_id
@@ -3819,10 +3820,14 @@ class ShioajiOptionsSmartMonitor:
                         total_cost = 0
                         last_ts = None
                         for i, r in enumerate(rows):
-                            action = r.get("Action", "")
-                            qty = int(r.get("Quantity", 0) or 0)
+                            action = str(r.get("Action", "")).upper()
+                            try:
+                                qty = int(float(r.get("Quantity", 0) or 0))
+                                price = float(r.get("Price", 0) or 0)
+                            except (ValueError, TypeError):
+                                continue
+
                             if "ENTRY" in action:
-                                price = float(r.get("Price", 0))
                                 # For Theta/Short, we use the specific entry price, not cumulative
                                 total_cost = price * qty 
                                 current_qty = qty
@@ -3832,7 +3837,6 @@ class ShioajiOptionsSmartMonitor:
                                 last_note = r.get("Note", "")
                             elif "TP1" in action:
                                 current_qty = max(0, current_qty - qty)
-                                # Keep last_entry_price the same
                             elif any(kw in action for kw in ["EXIT", "PANIC", "TRAIL", "TIME", "REVERSAL", "TRAP", "EOD"]):
                                 current_qty = 0
                                 last_side = None
