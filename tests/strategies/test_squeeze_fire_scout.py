@@ -22,7 +22,7 @@ from core.futures_strategy_router import (
 from core.strategy_context import StrategyContext, MarketData, PositionView
 from core.strategy_base import StrategyBase
 from core.signal import Signal
-from strategies.plugins.futures.squeeze_fire_scout import SqueezeFireScout
+from strategies.plugins.futures.active.squeeze_fire_scout import SqueezeFireScout
 
 
 # ═════════════════════════════════════════════════════════════════════════════

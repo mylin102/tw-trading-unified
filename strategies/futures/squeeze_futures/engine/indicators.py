@@ -137,6 +137,7 @@ def calculate_futures_squeeze(
     ema_fast: int = 12,
     ema_slow: int = 36,
     ema_macro: int = 200,
+    breakout_lookback: int = 10,  # [GSD] 從 20 縮短至 10，提升反應速度
 ) -> pd.DataFrame:
     """
     計算完整的期貨 Squeeze + 趨勢指標
@@ -164,16 +165,32 @@ def calculate_futures_squeeze(
         # This list MUST match the full calculation to avoid concat issues
         for col in ["sqz_on", "momentum", "atr", "mom_velo", "vwap", "score", "regime", 
                     "bull_align", "bear_align", "bullish_align", "bearish_align", "in_pb_zone",
-                    "ema_fast", "ema_slow", "ema_filter", "ema_macro", "fired"]:
+                    "ema_fast", "ema_slow", "ema_filter", "ema_macro", "fired",
+                    "squeeze_release", "bull_breakout", "bear_breakout", "bb_up", "bb_low",
+                    "day_open", "day_min", "day_max",
+                    "opening_bullish", "opening_bearish",
+                    "adx", "breakout_strength", "bear_breakout_strength",
+                    "breakout_strength_atr", "price_vs_vwap",
+                    "trend_strength_raw", "volume_spike",
+                    "is_structural_breakout",
+                    "atr_raw", "atr_floor", "atr_used",
+                    "mom_state", "mom_prev"]:
             if col not in df.columns:
-                if col in ["sqz_on", "fired", "bull_align", "bear_align", "bullish_align", "bearish_align", "in_pb_zone"]:
+                if col in ["sqz_on", "fired", "squeeze_release", "bull_breakout", "bear_breakout",
+                           "bull_align", "bear_align", "bullish_align", "bearish_align", "in_pb_zone",
+                           "opening_bullish", "opening_bearish"]:
                     df[col] = False
                 elif col == "regime":
                     df[col] = "NORMAL"
                 elif col == "score":
                     df[col] = 0.0
+                elif col in ("day_open", "day_min", "day_max"):
+                    # df may be empty; use Close as fallback
+                    df[col] = df["Close"].iloc[0] if len(df) > 0 else 0.0
+                elif col == "vwap":
+                    df[col] = df["Close"] if len(df) > 0 else np.nan
                 else:
-                    df[col] = np.nan
+                    df[col] = 0.0
         return df
 
     if ta:
@@ -199,6 +216,23 @@ def calculate_futures_squeeze(
         res["vwap"] = typical_price_x_volume.groupby(res["trading_day"]).cumsum() / volume_cumsum
         res["vwap"] = res["vwap"].where(volume_cumsum != 0, res["Close"])
         res["price_vs_vwap"] = np.where(res["vwap"] != 0, (res["Close"] - res["vwap"]) / res["vwap"], 0.0)
+
+    # ═══ [Live Volume Spike] 即時計算，不依賴 Parquet/CSV 舊欄位 ═══
+    # 使用 20 期成交量移動平均作為基準
+    _vol_ma20 = res["Volume"].rolling(20, min_periods=5).mean().ffill().fillna(res["Volume"])
+    res["volume_spike"] = (res["Volume"] / _vol_ma20.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    # Debug log — 只在第一次執行時打，避免刷屏
+    if not getattr(calculate_futures_squeeze, "_vol_spike_logged", False):
+        _last = res.iloc[-1] if len(res) > 0 else None
+        if _last is not None:
+            print(
+                f"[LiveVolumeSpike] vol={_last.get('Volume', '?'):_} "
+                f"vol_ma20={_vol_ma20.iloc[-1]:_.0f} "
+                f"spike={_last.get('volume_spike', '?'):.2f} "
+                f"source=live_calculated",
+                flush=True,
+            )
+        calculate_futures_squeeze._vol_spike_logged = True
     
     res["fired"] = (~res["sqz_on"]) & (res["sqz_on"].shift(1))
 
@@ -209,6 +243,26 @@ def calculate_futures_squeeze(
     res["bb_up"] = basis + deviation * bb_std
     res["bb_mid"] = basis
     res["bb_low"] = basis - deviation * bb_std
+
+    # ── [Night Fix] 方向性突破：squeeze 中脫離 BB ──
+    # squeeze_release: BB 不再被 KC 包住（volatility state transition）
+    res["squeeze_release"] = res["fired"]
+    # bull_breakout: 在 squeeze 中 Close 突破 BB 上緣
+    # breakout_strength 可能尚未存在（例如 BreakoutEngineV2 拋 exception 時）
+    if "breakout_strength" in res.columns and "bear_breakout_strength" in res.columns:
+        res["bull_breakout"] = (
+            res["sqz_on"]
+            & (res["Close"] > res["bb_up"])
+            & (res["breakout_strength"] > 0)
+        )
+        res["bear_breakout"] = (
+            res["sqz_on"]
+            & (res["Close"] < res["bb_low"])
+            & (res["bear_breakout_strength"] > 0)
+        )
+    else:
+        res["bull_breakout"] = False
+        res["bear_breakout"] = False
 
     # 2. RSI
     try:
@@ -361,8 +415,8 @@ def calculate_futures_squeeze(
     try:
         # 1. 準備基礎數據
         _atr = calculate_atr(res, length=14)
-        _high_n = res["High"].rolling(window=bb_length).max().shift(1)
-        _low_n = res["Low"].rolling(window=bb_length).min().shift(1)
+        _high_n = res["High"].rolling(window=breakout_lookback).max().shift(1)
+        _low_n = res["Low"].rolling(window=breakout_lookback).min().shift(1)
         _close = res["Close"]
         _open = res["day_open"] if "day_open" in res.columns else _close
         _vwap = res["vwap"] if "vwap" in res.columns else _close
@@ -370,7 +424,7 @@ def calculate_futures_squeeze(
         # 2. ATR Traceability (V-Model requirement)
         res['atr_raw'] = _atr.fillna(0.0)
         res['atr_floor'] = (_close * 0.0015).fillna(0.0)
-        res['high_20_prev'] = _high_n.fillna(0.0)
+        res['high_20_prev'] = _high_n.fillna(0.0)  # 名稱保留為 20 以相容 Dashboard，但實際週期由 breakout_lookback (10) 決定
         res['low_20_prev'] = _low_n.fillna(0.0)
         res['atr_used'] = res[['atr_raw', 'atr_floor']].max(axis=1).replace(0, np.nan).fillna(50.0)
         

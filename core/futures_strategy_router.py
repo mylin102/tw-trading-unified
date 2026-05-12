@@ -14,10 +14,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, Sequence
 
 from .attribution_recorder import AttributionRecorder, log_router_event
-from .futures_bar_regime import FuturesBarRegimeResult
+from .futures_bar_regime import FuturesBarRegimeResult, FuturesBarRegimeConfig, _safe_float
 from core.signal import Signal
 from core.strategy_context import StrategyContext
 from core.strategy_eval import StrategyEval, RouterTrace, write_trace, print_trace_summary
+from core.replay_engine import replay_engine
+from core.shioaji_session import get_shared_system_status
 
 class StrategyLookup(Protocol):
     def get(self, name: str) -> Any: ...
@@ -70,11 +72,18 @@ STRATEGY_POLICY: dict[str, dict] = {
         "kill_if_cagr_below": -0.05,
     },
     "weak_bear_trend": {
-        "enabled_regimes": ["WEAK", "CHOP"],
+        "enabled_regimes": ["WEAK", "CHOP", "SQUEEZE"],
         "max_weight": 0.5,
         "kill_if_cagr_below": -0.05,
         "required_bias": "SHORT",
-        "description": "WEAK regime 空头趋势：弱勢反彈失敗後做空",
+        "description": "WEAK regime 空头趋势：弱勢反彈失敗後做空 (SQUEEZE fallback)",
+    },
+    "weak_bull_trend": {
+        "enabled_regimes": ["WEAK", "CHOP", "SQUEEZE"],
+        "max_weight": 0.35,
+        "kill_if_cagr_below": -0.05,
+        "required_bias": "BULLISH",
+        "description": "WEAK regime 防守型多頭：價格>VWAP + EMA 多頭排列 + 溫和動能 (SQUEEZE fallback)",
     },
     "kbar_feature": {
         "enabled_regimes": ["WEAK", "CHOP"],
@@ -174,9 +183,9 @@ class FuturesRouterConfig:
     """Routing policy for futures entry signals."""
 
     trend_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1")
-    weak_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1", "counter_vwap", "spring_upthrust", "kbar_feature", "calendar_condor_v2", "range_mean_reversion_v1", "weak_bear_trend")
+    weak_strategies: tuple[str, ...] = ("weak_bear_trend", "weak_bull_trend", "counter_vwap", "spring_upthrust", "kbar_feature", "range_mean_reversion_v1", "adaptive_orb_v15", "trend_continuation_v1", "calendar_condor_v2")
     bear_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1", "weak_bear_trend")  # [Bear] conservative short — countertrend + upthrust + weak trend
-    stretched_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1", "weak_bear_trend")
+    stretched_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1", "weak_bear_trend", "weak_bull_trend")
     squeeze_strategies: tuple[str, ...] = ("squeeze_fire_scout", "range_mean_reversion_v1", "adaptive_orb_v15")
     countertrend_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1")
     hard_block_countertrend_in_trend: bool = True
@@ -282,6 +291,26 @@ def _strategy_order_for_regime(
 
     if regime == "WEAK":
         base = list(config.weak_strategies)
+        # Bias-aware sorting: promote the trend strategy matching current bias to front
+        bias = str(getattr(regime_result, "bias", "")).strip().upper()
+        # Normalize: regime classifier outputs LONG/SHORT, strategies expect BULLISH/SHORT
+        _b = "BULLISH" if bias == "LONG" else bias
+        if _b == "SHORT":
+            # Promote weak_bear_trend to front
+            if "weak_bear_trend" in base:
+                base.remove("weak_bear_trend")
+                base.insert(0, "weak_bear_trend")
+        elif _b == "BULLISH":
+            # Promote weak_bull_trend to front
+            if "weak_bull_trend" in base:
+                base.remove("weak_bull_trend")
+                base.insert(0, "weak_bull_trend")
+        else:
+            # NEUTRAL bias — demote both directional trend strategies to end
+            for _trend_strat in ("weak_bear_trend", "weak_bull_trend"):
+                if _trend_strat in base:
+                    base.remove(_trend_strat)
+                    base.append(_trend_strat)
         if active_strategy_name:
             base.insert(0, active_strategy_name)
         return _dedupe(base)
@@ -294,12 +323,32 @@ def _strategy_order_for_regime(
 
     if regime == "STRETCHED":
         base = list(config.stretched_strategies)
+        # Bias-aware sorting: promote the trend strategy matching current bias to front
+        _st_bias = str(getattr(regime_result, "bias", "")).strip().upper()
+        _st_bias = "BULLISH" if _st_bias == "LONG" else _st_bias
+        if _st_bias == "SHORT":
+            if "weak_bear_trend" in base:
+                base.remove("weak_bear_trend")
+                base.insert(0, "weak_bear_trend")
+        elif _st_bias == "BULLISH":
+            if "weak_bull_trend" in base:
+                base.remove("weak_bull_trend")
+                base.insert(0, "weak_bull_trend")
         if active_strategy_name:
             base.insert(0, active_strategy_name)
         return _dedupe(base)
 
     if regime == "SQUEEZE":
         base = list(config.squeeze_strategies)
+        # Bias-aware fallback: append weak directional strategies when bias is non-neutral
+        # (squeeze專屬策略優先，weak directional作為fallback排最後)
+        _sq_bias = str(getattr(regime_result, "bias", "")).strip().upper()
+        # Normalize: regime classifier outputs LONG/SHORT, strategies expect BULLISH/SHORT
+        _sq_bias = "BULLISH" if _sq_bias == "LONG" else _sq_bias
+        if _sq_bias == "BULLISH" and "weak_bull_trend" in config.weak_strategies:
+            base.append("weak_bull_trend")
+        elif _sq_bias == "SHORT" and "weak_bear_trend" in config.weak_strategies:
+            base.append("weak_bear_trend")
         if active_strategy_name:
             base.insert(0, active_strategy_name)
         return _dedupe(base)
@@ -421,10 +470,13 @@ def route_futures_signal(
         # [P1] Single Source of Truth Contract: inject into bar dict
         _b = str(regime_result.bias).strip().upper()
         _r = str(regime_result.regime).strip().upper()
-        bar["router_bias"] = _b
+        # Normalize bias to BULLISH/BEAR/SHORT for strategy consumption
+        # Regime classifier outputs LONG/SHORT; strategies expect BULLISH/BEAR/SHORT
+        _b_normalized = "BULLISH" if _b == "LONG" else _b
+        bar["router_bias"] = _b_normalized
         bar["router_regime"] = _r
         # Legacy compatibility
-        bar["bias"] = _b
+        bar["bias"] = _b_normalized
         bar["regime"] = _r
     if bar is None or regime_result.regime in ("NO_DATA", "UNKNOWN"):
         _ts = context.market.timestamp or "?"
@@ -579,6 +631,19 @@ def route_futures_signal(
         if _blocked:
             print(f"[V-Model][SpreadGate] Blocked {_blocked} spread-family strategies from candidates", flush=True)
             notes.append(f"spread_stale_blocked_{_blocked}_strategies")
+
+    # ═══ [WEAK Volume Gate] Block entry in WEAK regime without volume confirmation ═══
+    # Data: WEAK/LONG with vol>=1.5 has 62.8% WR (5-bar), vs 57.9% without.
+    # WEAK/SHORT with vol>=1.5 has 57.3% WR, vs 54.5% without.
+    # See scripts/regime_validation_report_v2.txt section 7.
+    if regime_result.regime == "WEAK" and regime_result.bias in ("LONG", "SHORT"):
+        _vol_spike = _safe_float(bar.get("volume_spike", 0.0))
+        _bar_regime_cfg = FuturesBarRegimeConfig()
+        if _vol_spike < _bar_regime_cfg.weak_volume_spike_min:
+            _note = f"WEAK_VOLUME_GATE: volume_spike={_vol_spike:.2f} < {_bar_regime_cfg.weak_volume_spike_min}"
+            print(f"[Router][WEAK_VOLUME_GATE] {_note} — blocking all candidates", flush=True)
+            notes.append(_note)
+            candidates = []
 
     if regime_result.regime == "SQUEEZE" and not candidates:
         # Log SQUEEZE regime with no candidates
@@ -878,6 +943,23 @@ def route_futures_signal(
         )
         write_trace(_trace)
         print_trace_summary(_trace)
+        
+        # ── [GSD Upgrade] P1: Runtime Replay System ──────────────────────
+        try:
+            sys_status = get_shared_system_status().name
+            replay_engine.record_bar_decision(
+                bar=bar,
+                regime=regime_result.regime,
+                bias=regime_result.bias,
+                candidates=candidates,
+                winner=selected_name,
+                winner_action=selected_signal.action if selected_signal else None,
+                strategy_evals=_evals,
+                system_status=sys_status
+            )
+        except Exception as re_err:
+            logger.error(f"[ReplayEngine] failed to record: {re_err}")
+        # ──────────────────────────────────────────────────────────────
 
         return FuturesRouterDecision(
                 action="TRADE",
@@ -919,6 +1001,23 @@ def route_futures_signal(
     )
     write_trace(_trace)
     print_trace_summary(_trace)
+    
+    # ── [GSD Upgrade] P1: Runtime Replay System ──────────────────────
+    try:
+        sys_status = get_shared_system_status().name
+        replay_engine.record_bar_decision(
+            bar=bar,
+            regime=regime_result.regime,
+            bias=regime_result.bias,
+            candidates=candidates,
+            winner=None,
+            winner_action=None,
+            strategy_evals=_evals,
+            system_status=sys_status
+        )
+    except Exception as re_err:
+        logger.error(f"[ReplayEngine] failed to record: {re_err}")
+    # ──────────────────────────────────────────────────────────────
     
     return FuturesRouterDecision(
         action="FLAT",

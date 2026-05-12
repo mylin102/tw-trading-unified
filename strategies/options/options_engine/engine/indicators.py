@@ -92,6 +92,16 @@ def calculate_futures_squeeze(
     res["vwap"] = typical_price_x_volume.groupby(res["trading_day"]).cumsum() / volume_cumsum
     res["vwap"] = res["vwap"].where(volume_cumsum != 0, res["Close"])
     res["price_vs_vwap"] = np.where(res["vwap"] != 0, (res["Close"] - res["vwap"]) / res["vwap"], 0.0)
+
+    # ═══ [Live Volume Spike] 即時計算，不依賴 Parquet/CSV 舊欄位 ═══
+    _vol_ma20 = res["Volume"].rolling(20, min_periods=5).mean().ffill().fillna(res["Volume"])
+    res["volume_spike"] = (res["Volume"] / _vol_ma20.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    if not getattr(calculate_futures_squeeze, "_opt_vol_spike_logged", False):
+        _last = res.iloc[-1] if len(res) > 0 else None
+        if _last is not None:
+            print(f"[OptLiveVol] spike={_last.get('volume_spike','?'):.2f} source=live", flush=True)
+        calculate_futures_squeeze._opt_vol_spike_logged = True
+
     res["fired"] = (~res["sqz_on"]) & (res["sqz_on"].shift(1))
 
     # Calculate mom_state vectorized for better performance

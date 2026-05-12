@@ -34,7 +34,7 @@ class _FakeRegistry:
 
 def _context(position_size: int = 0) -> StrategyContext:
     return StrategyContext(
-        market=MarketData(last_bar={"Close": 100.0}, regime="NEUTRAL"),
+        market=MarketData(last_bar={"Close": 100.0, "volume_spike": 2.0}, regime="NEUTRAL"),
         position=PositionView(size=position_size),
         config={},
         bar_counter=10,
@@ -213,3 +213,161 @@ def test_invalid_signal_is_skipped_and_router_returns_flat_when_no_other_candida
     assert not decision.is_trade
     assert decision.action == "FLAT"
     assert "invalid signal" in " ".join(decision.notes)
+
+
+# ═══════════════════════════════════════════════════════════════
+# WEAK regime bias-aware routing contract tests
+# ═══════════════════════════════════════════════════════════════
+
+
+def test_weak_bullish_promotes_weak_bull_first():
+    """WEAK + BULLISH → weak_bull_trend must appear first in candidates."""
+    bull = _FakeStrategy("weak_bull_trend", None)
+    bear = _FakeStrategy("weak_bear_trend", None)
+    counter = _FakeStrategy("counter_vwap", None)
+    registry = _FakeRegistry({"weak_bull_trend": bull, "weak_bear_trend": bear, "counter_vwap": counter})
+
+    decision = route_futures_signal(
+        registry=registry,
+        context=_context(),
+        regime_result=_regime("WEAK", "BULLISH"),
+        active_strategy_name=None,
+    )
+
+    assert decision.candidates, "must have candidates"
+    first = decision.candidates[0]
+    assert first == "weak_bull_trend", f"expected weak_bull_trend first, got {first}"
+
+
+def test_weak_short_promotes_weak_bear_first():
+    """WEAK + SHORT → weak_bear_trend must appear first in candidates."""
+    bull = _FakeStrategy("weak_bull_trend", None)
+    bear = _FakeStrategy("weak_bear_trend", None)
+    counter = _FakeStrategy("counter_vwap", None)
+    registry = _FakeRegistry({"weak_bull_trend": bull, "weak_bear_trend": bear, "counter_vwap": counter})
+
+    decision = route_futures_signal(
+        registry=registry,
+        context=_context(),
+        regime_result=_regime("WEAK", "SHORT"),
+        active_strategy_name=None,
+    )
+
+    assert decision.candidates, "must have candidates"
+    first = decision.candidates[0]
+    assert first == "weak_bear_trend", f"expected weak_bear_trend first, got {first}"
+
+
+def test_weak_neutral_does_not_promote_either_weak_trend():
+    """WEAK + NEUTRAL → neither weak_bull_trend nor weak_bear_trend gets priority."""
+    bull = _FakeStrategy("weak_bull_trend", None)
+    bear = _FakeStrategy("weak_bear_trend", None)
+    counter = _FakeStrategy(
+        "counter_vwap",
+        Signal("SELL", "COUNTER_VWAP", stop_loss=103.0, confidence=0.8),
+    )
+    registry = _FakeRegistry({"weak_bull_trend": bull, "weak_bear_trend": bear, "counter_vwap": counter})
+
+    decision = route_futures_signal(
+        registry=registry,
+        context=_context(),
+        regime_result=_regime("WEAK", "NEUTRAL"),
+        active_strategy_name=None,
+    )
+
+    assert decision.candidates, "must have candidates"
+    first = decision.candidates[0]
+    assert first not in ("weak_bull_trend", "weak_bear_trend"), \
+        f"weak trend strategy {first} should not be promoted under NEUTRAL bias"
+
+
+# ═══════════════════════════════════════════════════════════════
+# SQUEEZE regime bias-aware fallback contract tests
+# ═══════════════════════════════════════════════════════════════
+
+
+def test_squeeze_bullish_appends_weak_bull_fallback():
+    """SQUEEZE + BULLISH → weak_bull_trend must appear as last fallback candidate."""
+    bull = _FakeStrategy("weak_bull_trend", None)
+    scout = _FakeStrategy("squeeze_fire_scout", None)
+    registry = _FakeRegistry({"weak_bull_trend": bull, "squeeze_fire_scout": scout})
+
+    decision = route_futures_signal(
+        registry=registry,
+        context=_context(),
+        regime_result=_regime("SQUEEZE", "BULLISH"),
+        active_strategy_name=None,
+    )
+
+    assert decision.candidates, "must have candidates"
+    assert "weak_bull_trend" in decision.candidates, \
+        f"weak_bull_trend must appear in SQUEEZE+BULLISH candidates: {decision.candidates}"
+    # weak_bull_trend should be last (fallback after squeeze-native strategies)
+    assert decision.candidates[-1] == "weak_bull_trend", \
+        f"weak_bull_trend should be the last fallback, got {decision.candidates[-1]}"
+
+
+def test_squeeze_short_appends_weak_bear_fallback():
+    """SQUEEZE + SHORT → weak_bear_trend must appear as last fallback candidate."""
+    bear = _FakeStrategy("weak_bear_trend", None)
+    scout = _FakeStrategy("squeeze_fire_scout", None)
+    registry = _FakeRegistry({"weak_bear_trend": bear, "squeeze_fire_scout": scout})
+
+    decision = route_futures_signal(
+        registry=registry,
+        context=_context(),
+        regime_result=_regime("SQUEEZE", "SHORT"),
+        active_strategy_name=None,
+    )
+
+    assert decision.candidates, "must have candidates"
+    assert "weak_bear_trend" in decision.candidates, \
+        f"weak_bear_trend must appear in SQUEEZE+SHORT candidates: {decision.candidates}"
+    assert decision.candidates[-1] == "weak_bear_trend", \
+        f"weak_bear_trend should be the last fallback, got {decision.candidates[-1]}"
+
+
+def test_squeeze_neutral_no_weak_fallback():
+    """SQUEEZE + NEUTRAL → must NOT include weak_bull_trend or weak_bear_trend."""
+    bull = _FakeStrategy("weak_bull_trend", None)
+    bear = _FakeStrategy("weak_bear_trend", None)
+    scout = _FakeStrategy("squeeze_fire_scout", None)
+    registry = _FakeRegistry({"weak_bull_trend": bull, "weak_bear_trend": bear, "squeeze_fire_scout": scout})
+
+    decision = route_futures_signal(
+        registry=registry,
+        context=_context(),
+        regime_result=_regime("SQUEEZE", "NEUTRAL"),
+        active_strategy_name=None,
+    )
+
+    for strat in ("weak_bull_trend", "weak_bear_trend"):
+        assert strat not in decision.candidates, \
+            f"{strat} should NOT appear in SQUEEZE+NEUTRAL candidates: {decision.candidates}"
+
+
+def test_weak_volume_gate_blocks_when_spike_low():
+    """WEAK + volume_spike < 1.5 → candidates must be empty."""
+    bull = _FakeStrategy("weak_bull_trend", None)
+    bear = _FakeStrategy("weak_bear_trend", None)
+    bias_test_cases = ["LONG", "SHORT"]
+    for bias in bias_test_cases:
+        ctx = StrategyContext(
+            market=MarketData(
+                last_bar={"Close": 100.0, "volume_spike": 0.8},
+                regime="NEUTRAL",
+            ),
+            position=PositionView(size=0),
+            config={},
+            bar_counter=10,
+        )
+        decision = route_futures_signal(
+            registry=_FakeRegistry({"weak_bull_trend": bull, "weak_bear_trend": bear}),
+            context=ctx,
+            regime_result=_regime("WEAK", bias),
+            active_strategy_name=None,
+        )
+        assert not decision.candidates, \
+            f"WEAK+{bias} with volume_spike=0.8 should have empty candidates: {decision.candidates}"
+        assert any("WEAK_VOLUME_GATE" in n for n in decision.notes), \
+            f"expected WEAK_VOLUME_GATE in notes: {decision.notes}"

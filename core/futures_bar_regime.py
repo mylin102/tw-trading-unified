@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Mapping
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class FuturesBarRegimeConfig:
     trend_strength_threshold: float = 0.001
     min_volume_spike: float = 1.0
     min_alignment_score: int = 2
+    weak_volume_spike_min: float = 1.5    # WEAK regime: min volume spike to allow entry
 
 
 @dataclass(frozen=True)
@@ -180,6 +182,36 @@ def classify_futures_bar_regime(
         bias, normalized_session_regime,
     )
 
+    # ── [Night Fix] 方向突破優先於 SQUEEZE ──
+    # 使用 indicator engine 產出的 bear_breakout / bull_breakout（Close < BB_low / > BB_up）
+    # 即使 squeeze 還在、ADX 很低，價格脫離 BB 就該反映方向性
+    bear_breakout = _as_bool(row.get("bear_breakout"))
+    bull_breakout = _as_bool(row.get("bull_breakout"))
+    
+    if bear_breakout and bias == "SHORT":
+        reasons.append(
+            f"bear_breakout during squeeze: Close < BB_low, bear_bs={bear_breakout_strength:.4f}"
+        )
+        return FuturesBarRegimeResult(
+            regime="WEAK" if sqz_on else "BEAR",
+            bias=bias,
+            confidence=0.60,
+            reasons=reasons,
+            session_regime=normalized_session_regime,
+        )
+    
+    if bull_breakout and bias == "LONG":
+        reasons.append(
+            f"bull_breakout during squeeze: Close > BB_up, bs={breakout_strength:.4f}"
+        )
+        return FuturesBarRegimeResult(
+            regime="TRANSITION" if sqz_on else "TREND",
+            bias=bias,
+            confidence=0.60,
+            reasons=reasons,
+            session_regime=normalized_session_regime,
+        )
+
     if sqz_on and adx < cfg.adx_trend_threshold:
         reasons.append("squeeze active while ADX is below trend threshold")
         return FuturesBarRegimeResult(
@@ -217,6 +249,19 @@ def classify_futures_bar_regime(
         volume_confirmed = False # Early session: disable volume confirmation for safety
         if volume_spike >= cfg.min_volume_spike_confirmation:
             reasons.append("SESSION_BUFFER_SKIP: volume spike ignored due to early session (<5 bars)")
+    
+    # ── [Night Fix] 夜盤 volume 門檻降低 ──
+    # 夜盤成交量只有日盤 10-20%，volume_spike 很難達到 1.5
+    # 如果 bars_since_open >= 20（非開盤階段）但 volume 仍低，
+    # 放寬 volume confirmation 門檻到 1.05（只要有微量增量即可）
+    if bars_since_open >= 20 and volume_spike < cfg.min_volume_spike_confirmation:
+        night_volume_ok = volume_spike >= 1.05
+        if night_volume_ok:
+            volume_confirmed = True
+            reasons.append(
+                f"NIGHT_VOLUME_RELAXED: vol_spike={volume_spike:.2f} >= 1.05 "
+                f"(night session, {bars_since_open:.0f} bars in)"
+            )
 
     # ═══ Three-Stage Breakout Logic (V2) ═══
     # 1. Structure: is_structural_breakout != 0 (Close > High20_prev)
@@ -286,29 +331,11 @@ def classify_futures_bar_regime(
         and adx >= cfg.adx_weak_threshold
         and abs(trend_strength_raw) >= cfg.trend_strength_threshold
     )
-    # ═══ Momentum Override: prevent WEAK when momentum is strong ═══
-    # WEAK + mom_state >= 3 + price above VWAP is a contradiction.
-    # If momentum is high and bias is directional, upgrade to TREND/TRANSITION.
-    _mom_state = int(_safe_float(row.get("mom_state", 0)))
-    _mom_velo = _safe_float(row.get("mom_velo", 0))
-    _mom_val = _safe_float(row.get("momentum", 0))
-    if (moderate_directional_pressure
-        and (_mom_state >= 3 or (_mom_val > 500 and _mom_velo > 100))
-        and bias in ("LONG", "SHORT")
-        and (close > vwap if vwap > 0 else True)
-    ):
-        reasons.append(
-            f"MOMENTUM_OVERRIDE: mom_state={_mom_state} mom={_mom_val:.0f} "
-            f"mom_velo={_mom_velo:.0f} bias={bias} — upgrading from WEAK to TRANSITION"
-        )
-        confidence = 0.75 if normalized_session_regime == "TRENDING" else 0.65
-        return FuturesBarRegimeResult(
-            regime="TRANSITION",
-            bias=bias,
-            confidence=confidence,
-            reasons=reasons,
-            session_regime=normalized_session_regime,
-        )
+
+    # ═══ [Removed 2026-05-12] MOMENTUM_OVERRIDE — data proved it reduces
+    # predictive power vs leaving as WEAK. 5-bar WR: TRANSITION/LONG 48.2%
+    # vs WEAK/LONG 50.4%; TRANSITION/SHORT 42.0% vs WEAK/SHORT 45.9%.
+    # See scripts/regime_validation_report_v2.txt section 5.
 
     if moderate_directional_pressure:
         reasons.append("directional pressure exists, but breakout confirmation is incomplete")
