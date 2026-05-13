@@ -3106,6 +3106,14 @@ class FuturesMonitor:
             _bar_dict = enriched_bar
             _last_price = float(_bar_dict.get("Close", 0))
             console.print("[dim][MTS] Using enriched bar from pipeline[/dim]")
+            # [BUG FIX 2026-05-13] Spread enrich must run on pipeline path too.
+            # MTS night strategy (tmf_spread) requires near_close/far_close/spread_z.
+            # Fallback-only enrich meant pipeline path always had nc=? fc=?
+            if hasattr(self, '_spread_loader') and self._spread_loaded:
+                try:
+                    self._spread_loader.enrich_bar(_bar_dict)
+                except Exception:
+                    pass
         else:
             df_5m = self._get_tick_bars_df()
             if df_5m is None or df_5m.empty:
