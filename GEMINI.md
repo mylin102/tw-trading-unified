@@ -7,7 +7,7 @@ You are working on a Taiwan futures + options trading system (Shioaji). **BUGS =
 - **Entry Guards**: Check `position == 0`, `margin sufficient`, `price > 0`, and `not same bar`.
 - **Exit Guards**: Zero position BEFORE logging; pass explicit quantity.
 - **Stop Loss**: Offset >= 10 pts (TMF round-trip cost ~8 pts).
-- **Capital Limit**: Paper mode max 40,000 TWD.
+- **Capital Limit**: Paper mode max 100,000 TWD.
 
 ## 🚀 GSD (Get Shit Done) Spirit: Spec-Driven Development
 To prevent "Context Rot" and logic drift in complex trading modules:
@@ -33,8 +33,10 @@ Maintain a production-ready codebase through automated verification:
 To prevent "Context Collapse" and ensure deterministic reasoning, **the Agent MUST read the following files at the start of every session:**
 1.  `AGENTS.md`: Behavioral constraints and cognitive constitution.
 2.  `BOUNDED_CONTEXTS.md`: Ownership boundaries and service layout.
-3.  `ADR/`: Architectural Decision Records (Persistent Memory).
+3.  `docs/decisions/`: Architectural Decision Records (Persistent Memory).
 4.  `RULES.md`: Core trading and safety rules.
+
+**SSOT**: All Architectural Decision Records live in `docs/decisions/`. Do not create a separate `ADR/` directory — `docs/decisions/` is the canonical location.
 
 **Failure to read these files is a violation of the system's "Digital Constitution".**
 
