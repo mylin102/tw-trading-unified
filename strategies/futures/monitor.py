@@ -193,9 +193,9 @@ class FuturesMonitor:
         self._spread_loader = get_spread_loader()
         self._spread_loaded = self._spread_loader.load_latest_csv()
         if self._spread_loaded:
-            print(f"[V-Model] SpreadLoader initiated: {self._spread_loader.status()}", flush=True)
+            print(f"[V-Model] SpreadLoader initiated: {self._spread_loader.status()}")
         else:
-            print("[V-Model] SpreadLoader: no calendar spread data found", flush=True)
+            print("[V-Model] SpreadLoader: no calendar spread data found")
 
     def _apply_config_params(self):
         """[GSD] Extract parameters from self.cfg into instance attributes."""
@@ -274,14 +274,14 @@ class FuturesMonitor:
                 fee_per_side=self.EXEC.get("broker_fee_per_side", 20),
                 exchange_fee_per_side=self.EXEC.get("exchange_fee_per_side", 0),
                 tax_rate=self.EXEC.get("tax_rate", 0),
-                margin_per_lot=self.EXEC.get("margin_per_lot", 40000),
+                margin_per_lot=self.EXEC.get("margin_per_lot", 18000),
             )
         else:
             # We don't change initial_balance after start, but we can update fees and margin
             self.trader.fee_per_side = self.EXEC.get("broker_fee_per_side", 20)
             self.trader.exchange_fee_per_side = self.EXEC.get("exchange_fee_per_side", 0)
             self.trader.tax_rate = self.EXEC.get("tax_rate", 0)
-            self.trader.margin_per_lot = self.EXEC.get("margin_per_lot", 40000)
+            self.trader.margin_per_lot = self.EXEC.get("margin_per_lot", 18000)
 
     def _reload_config_if_changed(self):
         """[Rule 9] Hot-reload config if YAML file has been updated."""
@@ -417,6 +417,12 @@ class FuturesMonitor:
         # ── GSD: Initialize Strategy Registry ────────────────────────
         self._registry = StrategyRegistry()
         self._registry.discover()
+        # [V-Model] Log discovered strategies for startup diagnostics
+        _all = self._registry.list_all()
+        _available = [s["name"] for s in _all if s.get("available")]
+        _names = [s["name"] for s in _all]
+        console.print(f"[dim][StrategyRegistry] discovered={len(_all)} available={len(_available)} "
+                      f"names={_names}[/dim]")
         self._active_strategy_name = None  # Track initialized strategy
 
         # ── GSD Phase 3: Circuit Breaker initialization ──────────────
@@ -525,13 +531,13 @@ class FuturesMonitor:
         # 獲取TMF合約
         try:
             target_symbol = str(self.ticker)
-            print(f"[FuturesMonitor] Getting {target_symbol} contracts (Safe Mode)...", flush=True)
+            print(f"[FuturesMonitor] Getting {target_symbol} contracts (Safe Mode)...")
             
             # [rshioaji 1.5.10 Workaround] Use robust list helper to avoid C++ binding crash
             from core.broker.shioaji_compat import get_contracts_list
             tmf_list = get_contracts_list(self.api, "Futures", target_symbol)
             
-            print(f"[FuturesMonitor] Found {len(tmf_list)} {target_symbol} contracts", flush=True)
+            print(f"[FuturesMonitor] Found {len(tmf_list)} {target_symbol} contracts")
             if tmf_list:
                 # [GSD Settlement Fix] Filter out expired or invalid
                 # On settlement day (3rd Wednesday), the front-month expires at 13:30.
@@ -644,12 +650,18 @@ class FuturesMonitor:
         from pathlib import Path
         from core.date_utils import get_session_date_str
         today = datetime.now()
-        # [BUG FIX] Use session date so backfill writes to the same file as _save_bar.
-        # Previously used today.strftime('%Y%m%d') which causes dual-file contamination
-        # during night session (bar times belong to next trading day).
         date_str = get_session_date_str(today)
         tag = "_DRY" if self.dry_run else ("_LIVE" if self.live_trading else "_PAPER")
         csv_path = Path(f"logs/market_data/{self.ticker}_{date_str}{tag}_indicators.csv")
+        
+        # [ARCHITECTURE FIX 2026-05-13] NEVER write indicator CSV if it doesn't exist yet.
+        # The indicator CSV is an enriched output — only _save_bar should create it.
+        # _backfill_night_gaps must not be the first writer, or the CSV header
+        # will have raw API column ordering (timestamp-as-index) instead of canonical order.
+        # Strategy tick will trigger _save_bar on the next bar boundary anyway.
+        if not csv_path.exists():
+            console.print(f"[dim][FuturesMonitor] Skipping backfill write — CSV doesn't exist yet; _save_bar will create it on next bar[/dim]")
+            return
         
         def _load_existing_indicator_csv(path: Path):
             if not path.exists():
@@ -713,13 +725,24 @@ class FuturesMonitor:
                 # Heuristic: if the existing file already has indicator data (e.g. has a 'momentum'
                 # column with at least one non-NaN value), skip the raw backfill entirely.
                 # _save_bar will write fully-computed rows going forward.
+                #
+                # [BUG FIX 2026-05-13] Check MULTIPLE indicator columns, not just momentum.
+                # The raw API backfill produces NaN for ALL indicator columns. A single column
+                # check (momentum.notna().any()) can return False if a previous backfill already
+                # overwrote the enriched rows with raw data. Checking multiple columns ensures
+                # we only skip when genuine enrichment has been committed to the CSV.
+                _indicator_cols_in_csv = ["momentum", "atr", "vwap"]
+                _present = [c for c in _indicator_cols_in_csv if c in existing.columns]
                 has_indicator_data = (
                     not existing.empty
-                    and "momentum" in existing.columns
-                    and existing["momentum"].notna().any()
+                    and len(_present) >= 2
+                    and all(existing[c].notna().any() for c in _present)
                 )
-                if has_indicator_data:
-                    console.print(f"[dim][FuturesMonitor] Skipping raw backfill — session CSV already has indicator data (last_ts={last_ts})[/dim]")
+                # heuristic: also NEVER overwrite if _save_bar has been called at least once
+                # in this session (tracked via _backfill_has_seen_enriched_row).
+                if has_indicator_data or getattr(self, '_backfill_has_seen_enriched_row', False):
+                    if not has_indicator_data and getattr(self, '_backfill_has_seen_enriched_row', False):
+                        console.print(f"[dim][FuturesMonitor] Skipping raw backfill — _save_bar has written enriched rows this session[/dim]")
                     return
 
                 if last_ts is None:
@@ -2117,22 +2140,8 @@ class FuturesMonitor:
         if decision.candidates:
             parts.append(f"candidates={','.join(decision.candidates)}")
         if decision.notes:
-            parts.append(f"notes={' | '.join(decision.notes[:3])}")
+            parts.append(f"notes={' | '.join(decision.notes)}")
         return "; ".join(parts)
-
-    def _route_entry_signal(self, last_5m, df_5m, df_15m, timestamp, active_name, attribution_recorder=None):
-        from core.market_regime import classify_regime
-
-        session_regime = classify_regime(df_5m)
-        bar = last_5m if isinstance(last_5m, dict) else last_5m.to_dict()
-        
-        # Use the new _route_signal method with attribution support
-        return self._route_signal(
-            bar=bar,
-            session_regime=session_regime,
-            active_name=active_name,
-            attribution_recorder=attribution_recorder
-        )
 
     def _build_strategy_context(self, bar, session_regime):
         """Build strategy context from bar data."""
@@ -2175,7 +2184,7 @@ class FuturesMonitor:
             try:
                 self._spread_loader.enrich_bar(bar)
             except Exception as e:
-                print(f"[V-Model] enrich_bar failed: {e}", flush=True)
+                print(f"[V-Model] enrich_bar failed: {e}")
 
         ctx = StrategyContext(
             market=MarketData(
@@ -2199,14 +2208,14 @@ class FuturesMonitor:
             bar_counter=self._bar_counter,
         )
         return ctx
+
     def _route_signal(self, bar, session_regime, active_name=None, pending_orders=None, attribution_recorder=None):
         """Route signal through strategy router with optional attribution."""
         _ts = bar.get("timestamp") or (bar.name if hasattr(bar, "name") else "unknown")
         console.print(f"[ROUTE_SIGNAL_ENTER] ts={_ts} active={active_name}")
+        
         # Build context
         ctx = self._build_strategy_context(bar, session_regime)
-
-        print(f"[DEBUG_MARK] route_signal entered bar_ts={bar.get('timestamp')}", flush=True)
 
         # [Phase 2 Fix] Skip routing on prefill/warmup bars (old data from Parquet/CSV)
         # Check if bar timestamp is from current trading day
@@ -2220,15 +2229,23 @@ class FuturesMonitor:
             try:
                 bar_td = get_trading_day(pd.Timestamp(bar_ts))
                 current_td = get_trading_day(pd.Timestamp(datetime.now()))
-                print(f"[DEBUG_MARK] prefill_check bar_td={bar_td} current_td={current_td}", flush=True)
                 if bar_td != current_td:
                     console.print(f"[dim][Router] Skip prefill bar: ts={bar_ts} trading_day={bar_td} != current={current_td}[/dim]")
+                    # [V-Model] write_trace for prefill skip
+                    from core.strategy_eval import RouterTrace, write_trace as _wt
+                    _wt(RouterTrace(
+                        ts=str(bar_ts),
+                        regime="PREFILL",
+                        bias="",
+                        selected=None,
+                        selected_action="PREFILL_SKIP",
+                        strategies=[],
+                    ))
                     return None, ctx, session_regime, None
             except Exception:
                 pass
 
-        # [Phase 2: Skew Filter] Gate pre-check — block entry when skew signal
-        # indicates extreme downside risk with sufficient confidence.
+        # [Phase 2: Skew Filter] Gate pre-check
         skew_signal = getattr(ctx.market, "skew_signal", None)
         if skew_signal and isinstance(skew_signal, dict):
             direction = skew_signal.get("direction", "UNKNOWN")
@@ -2240,11 +2257,26 @@ class FuturesMonitor:
                     f"confidence={confidence:.2f} >= {skew_threshold:.2f}[/yellow] "
                 )
                 bar_regime = classify_futures_bar_regime(bar, session_regime=session_regime)
-                decision = FuturesRouterDecision(
-                    action="skip",
-                    reason=f"SKEW_GATE_BEAR_conf_{confidence:.2f}",
+                # [V-Model] write_trace for skew gate block
+                from core.strategy_eval import RouterTrace, write_trace as _wt2
+                _wt2(RouterTrace(
+                    ts=_ts,
                     regime=bar_regime.regime,
                     bias=bar_regime.bias,
+                    selected=None,
+                    selected_action="SKEW_GATE_BLOCK",
+                    strategies=[],
+                ))
+                from core.futures_strategy_router import FuturesRouterDecision
+                decision = FuturesRouterDecision(
+                    is_trade=False,
+                    action="skip",
+                    reason=f"SKEW_GATE_BEAR_conf_{confidence:.2f}",
+                    selected_strategy=None,
+                    signal=None,
+                    regime=bar_regime.regime,
+                    bias=bar_regime.bias,
+                    candidates=[]
                 )
                 return decision, ctx, session_regime, bar_regime
 
@@ -2253,45 +2285,29 @@ class FuturesMonitor:
             pending_orders = self._get_symbol_pending_orders()
         
         # Classify bar regime
+        console.print(f"[dim][ROUTE_SIGNAL_PRE_CLASSIFY] ts={_ts} regime_from_bar={bar.get('regime', '?')} sqz_on={bar.get('sqz_on', '?')}[/dim]")
         bar_regime = classify_futures_bar_regime(bar, session_regime=session_regime)
         
-        # [Patch] Override context.market.regime with bar_regime (not session_regime)
-        # This ensures strategies see the correct bar-level regime (e.g. SQUEEZE)
-        # instead of the broader session-level regime (e.g. NEUTRAL).
+        # [Patch] Override context.market.regime with bar_regime
         object.__setattr__(ctx.market, 'regime', bar_regime.regime)
 
-        # Inject bias into bar dict so strategies reading bar.get("bias") get it
-        bar["bias"] = bar_regime.bias
-        import logging as _bl
-        _bl.getLogger(__name__).info(
-            "[BIAS_TRACE] session_bias=%s bar_regime_bias=%s injected_bar_bias=%s regime=%s",
-            getattr(session_regime, "bias", None) if hasattr(session_regime, "bias") else session_regime,
-            getattr(bar_regime, "bias", None),
-            bar.get("bias"),
-            getattr(bar_regime, "regime", None),
-        )
-        console.print(
-            "[BIAS_TRACE_V20260508] bar_regime_bias=%r bar_bias=%r regime=%r"
-            % (getattr(bar_regime, "bias", None), bar.get("bias"), getattr(bar_regime, "regime", None)),
-        )
+        # [P1] Single Source of Truth Contract: inject into bar dict
+        _b = str(bar_regime.bias).strip().upper()
+        _r = str(bar_regime.regime).strip().upper()
+        bar["router_bias"] = _b
+        bar["router_regime"] = _r
+        bar["bias"] = _b
+        bar["regime"] = _r
 
-        # [Phase 2 Debug] Router input features — use raw print to avoid rich truncation
-        print(
-            f"[DEBUG_MARK] classified regime={getattr(bar_regime, 'regime', None)} "
-            f"bias={getattr(bar_regime, 'bias', None)}",
-            flush=True,
-        )
-        print(
-            f"[RouterInput] bull_breakout={bar.get('breakout_strength', 0):.4f} "
-            f"bear_breakout={bar.get('bear_breakout_strength', 0):.4f} "
-            f"trend={bar.get('trend_strength_raw', 0):.6f} "
-            f"adx={bar.get('adx', 0):.2f} "
-            f"regime={getattr(bar_regime, 'regime', 'NONE')} "
-            f"bias={getattr(bar_regime, 'bias', 'NONE')}",
-            flush=True,
-        )
+        # ── [GSD] Schema Compliance Check ────────────────────────────
+        required_cols = {"Close", "High", "Low", "Open", "Volume", "atr", "vwap", "router_regime", "router_bias"}
+        missing = required_cols - set(bar.keys())
+        if missing:
+            logger.warning(f"[SCHEMA_VIOLATION] Bar is missing required columns: {missing}")
+        # ──────────────────────────────────────────────────────────────
 
-        # Route signal with optional attribution
+        # Route signal
+        from core.futures_strategy_router import route_futures_signal
         decision = route_futures_signal(
             registry=self._registry,
             context=ctx,
@@ -2677,6 +2693,8 @@ class FuturesMonitor:
             "session": get_session(now),
             "score": score,
             "regime": regime,
+            "router_regime": row.get("router_regime", regime),
+            "router_bias": row.get("router_bias", "UNKNOWN"),
             "volume_spike": float(row.get("volume_spike", row.get("volume", 1))),
             "trend_strength_raw": float(row.get("trend_strength_raw", row.get("trend", 0))),
             "open": row.get("Open", 0), "high": row.get("High", 0), "low": row.get("Low", 0), "close": row.get("Close", 0),
@@ -2684,6 +2702,16 @@ class FuturesMonitor:
             "bull_align": row.get("bullish_align", False), "bear_align": row.get("bearish_align", False),
             "in_pb_zone": row.get("in_bull_pb_zone", False) or row.get("in_bear_pb_zone", False),
         })
+
+        # [BUG FIX DIAGNOSTIC] Check what data dict contains before writing
+        console.print(
+            f"[dim][SAVE_BAR_CHECK] ts={data.get('timestamp')} "
+            f"atr_in_data={'atr' in data} atr_val={data.get('atr', 'MISSING')} "
+            f"vwap_in_data={'vwap' in data} vwap_val={data.get('vwap', 'MISSING')} "
+            f"sqz_in_data={'sqz_on' in data} sqz_val={data.get('sqz_on', 'MISSING')} "
+            f"mom_in_data={'momentum' in data} mom_val={data.get('momentum', 'MISSING')} "
+            f"data_keys_sample={list(data.keys())[:5]}...[/dim]"
+        )
 
         # 2. Schema Normalization (Once per session)
         if not hasattr(self, "_indicators_migrated") or not self._indicators_migrated:
@@ -2693,9 +2721,40 @@ class FuturesMonitor:
         # 3. Fast Append with Timestamp Gating
         try:
             current_ts = pd.to_datetime(data["timestamp"])
+            
+            # [BUG FIX 2026-05-13] Canonical column order for indicator CSV.
+            # Never use sorted(data.keys()) — alpha sort puts Close before timestamp,
+            # causing column misalignment between first-time header and subsequent appends.
+            CANONICAL_INDICATOR_COLS = [
+                "timestamp", "Close", "High", "Low", "Open", "Volume", "amount",
+                "atr", "atr_floor", "atr_raw", "atr_used",
+                "bb_low", "bb_lower", "bb_mid", "bb_up", "bb_upper",
+                "bear_align", "bear_breakout", "bear_breakout_strength", "bear_breakout_strength_atr",
+                "bearish_align", "breakout_strength", "breakout_strength_atr",
+                "bull_align", "bull_breakout", "bullish_align",
+                "close", "d_val", "day_max", "day_min", "day_open",
+                "ema_200_up", "ema_fast", "ema_filter", "ema_macro", "ema_slow",
+                "fired",
+                "high", "high_20_prev",
+                "in_bear_pb_zone", "in_bull_pb_zone", "in_pb_zone",
+                "intraday_strength_pct", "is_bear_structural_breakout", "is_bull_structural_breakout",
+                "is_new_high", "is_new_low", "is_structural_breakout",
+                "k_val",
+                "low", "low_20_prev",
+                "macd_hist", "macd_line", "macd_rising", "macd_signal",
+                "mom_prev", "mom_state", "mom_velo", "momentum",
+                "open", "opening_bearish", "opening_bullish",
+                "price_vs_vwap", "price_vs_vwap_pct",
+                "recent_high", "recent_low",
+                "regime", "router_bias", "router_regime", "rsi", "rsv",
+                "score", "session", "squeeze_release", "sqz_on",
+                "trading_day", "trend_strength_raw",
+                "volume", "volume_spike", "vwap",
+            ]
+            
             if not path.exists():
-                # First time: Write header
-                cols = sorted(data.keys())
+                # First time: Write header with canonical column order
+                cols = [c for c in CANONICAL_INDICATOR_COLS if c in data]
                 self._indicator_cols = cols
                 pd.DataFrame([data])[cols].to_csv(path, index=False)
                 self._last_saved_ts = current_ts
@@ -2703,18 +2762,29 @@ class FuturesMonitor:
                 # [GSD Idempotency Fix] Read last TS from file if not in memory
                 if not hasattr(self, "_last_saved_ts") or self._last_saved_ts is None:
                     try:
-                        # Optimization: read only last line to get last timestamp
-                        last_line = subprocess.check_output(['tail', '-1', str(path)]).decode().split(',')[0]
-                        self._last_saved_ts = pd.to_datetime(last_line)
+                        # [BUG FIX 2026-05-13] Read last timestamp from actual timestamp column
+                        # instead of blindly taking split(',')[0] which may be Close, not timestamp.
+                        from core.date_utils import parse_csv_last_timestamp
+                        self._last_saved_ts = parse_csv_last_timestamp(path)
+                        if self._last_saved_ts is None or self._last_saved_ts == pd.NaT:
+                            self._last_saved_ts = pd.Timestamp.min
                     except:
                         self._last_saved_ts = pd.Timestamp.min
 
                 # Only append if this is a NEW bar
                 if current_ts > self._last_saved_ts:
-                    cols = getattr(self, "_indicator_cols", sorted(data.keys()))
+                    cols = getattr(self, "_indicator_cols", None)
+                    if cols is None:
+                        # [BUG FIX 2026-05-13] Read column order from CSV header to avoid
+                        # misalignment between sorted() append and backfill column order.
+                        try:
+                            cols = pd.read_csv(path, nrows=0).columns.tolist()
+                        except Exception:
+                            cols = sorted(data.keys())
                     row_df = pd.DataFrame([data])
                     row_df.reindex(columns=cols).to_csv(path, mode='a', header=False, index=False)
                     self._last_saved_ts = current_ts
+                    self._backfill_has_seen_enriched_row = True
                 # else: ignore duplicate bar
         except Exception as e:
             console.print(f"[red]Fast-append failed:[/red] {e}")
@@ -3012,8 +3082,121 @@ class FuturesMonitor:
         else:
             console.print(f"[bold green]✅ Cancelled {cancelled_count} pending order(s)[/bold green]")
 
+    # ── [V-Model] MTS Mode: Minimal Tradable System ──
+    # Bypass regime/router/policy/gates entirely. Direct path:
+    #   Market → ORB Signal → Risk Check → Execution
+    def _mts_tick(self, enriched_bar: dict | None = None):
+        """MTS minimal execution path. Uses enriched bar from pipeline when available,
+        falls back to building bar from tick deque if none provided."""
+        print("MTS_ALIVE", flush=True)
+        console.print("[dim][MTS] _mts_tick entered[/dim]")
+        _mts = self.cfg.get("mts", {})
+        _strat_name = _mts.get("strategy", "adaptive_orb_v15")
+
+        # 1. Market hours check (only hard gate retained)
+        if not is_taifex_futures_market_open():
+            return
+
+        # 2. Get bar: prefer enriched_bar from pipeline, fall back to tick deque
+        _bar_dict: dict | None = None
+        _df_5m: pd.DataFrame | None = None
+        _last_price = 0.0
+
+        if enriched_bar is not None:
+            _bar_dict = enriched_bar
+            _last_price = float(_bar_dict.get("Close", 0))
+            console.print("[dim][MTS] Using enriched bar from pipeline[/dim]")
+        else:
+            df_5m = self._get_tick_bars_df()
+            if df_5m is None or df_5m.empty:
+                import logging as _ml
+                _ml.getLogger(__name__).info(
+                    "[MTS_HEARTBEAT] market_open=%s bars_empty=True tick_age=0", True,
+                )
+                return
+            _df_5m = df_5m
+            last_5m = df_5m.iloc[-1]
+            _last_price = float(last_5m.get("Close", 0))
+            if _last_price <= 0:
+                return
+            _bar_dict = last_5m.to_dict()
+            _bar_dict["ts"] = last_5m.name if hasattr(last_5m, "name") else None
+            # Fallback: enrich with spread data
+            if hasattr(self, '_spread_loader') and self._spread_loaded:
+                try:
+                    self._spread_loader.enrich_bar(_bar_dict)
+                except Exception:
+                    pass
+
+        if _last_price <= 0:
+            return
+
+        # [MTS] Debug spread bar dict
+        _dbg_sqz = _bar_dict.get('sqz_on', '?')
+        _dbg_sz = _bar_dict.get('spread_z', '?')
+        _dbg_nc = _bar_dict.get('near_close', '?')
+        _dbg_fc = _bar_dict.get('far_close', '?')
+        _dbg_cl = _bar_dict.get('Close', '?')
+        _dbg_ld = getattr(self, '_spread_loaded', 'N/A')
+        _dbg_fe = 'N/A'
+        if hasattr(self, '_spread_loader') and self._spread_loader and hasattr(self._spread_loader, '_far_df'):
+            _fe = self._spread_loader._far_df
+            _dbg_fe = _fe.empty if _fe is not None else 'N/A'
+        console.print(
+            f"[dim][MTS_SPREAD] nc={_dbg_nc} fc={_dbg_fc} sqz={_dbg_sqz} "
+            f"sz={_dbg_sz} cl={_dbg_cl} loaded={_dbg_ld} far_empty={_dbg_fe}[/dim]"
+        )
+        ctx = StrategyContext(
+            market=MarketData(
+                last_bar=_bar_dict,
+                df_5m=_df_5m or pd.DataFrame(),
+                timestamp=_bar_dict.get("ts", ""),
+            ),
+            position=PositionView(size=0, entry_price=0),
+            config=self.cfg,
+            bar_counter=self._bar_counter,
+        )
+
+        # 4. Run MTS strategy directly (no router, no regime, no policy)
+        strategy = self._registry.get(_strat_name)
+        if strategy is None:
+            console.print(f"[red][MTS] Strategy {_strat_name} not registered[/red]")
+            return
+
+        self._ensure_strategy_initialized(_strat_name, strategy, ctx)
+        signal = strategy.on_bar(ctx)
+
+        # Log MTS decision
+        if signal:
+            console.print(f"[bold green][MTS] SIGNAL: {signal.action} reason={signal.reason} stop={signal.stop_loss} conf={signal.confidence}[/bold green]")
+        else:
+            se = getattr(strategy, "last_eval", None)
+            reason = se.skip_reason if se else "NO_EVAL"
+            console.print(f"[dim][MTS] No signal: {reason}[/dim]")
+            return
+
+        # 5. Basic risk check (max position, daily loss)
+        if self.trader.position != 0:
+            console.print(f"[dim][MTS] Position already open ({self.trader.position}) — skip entry[/dim]")
+            return
+
+        # 6. Execute
+        lots = _mts.get("lots", 1)
+        _ts = _bar_dict.get("ts", datetime.now())
+        sl = signal.stop_loss or (_last_price - 1.5 * float(_bar_dict.get("atr", 50)))
+        self._execute_trade(
+            signal.action, _last_price, _ts,
+            lots, stop_loss=sl, reason=f"MTS:{signal.reason}",
+        )
+        console.print(f"[bold cyan][MTS] EXECUTED: {signal.action} {lots}lot(s) @ {_last_price:.0f} SL={sl:.0f}[/bold cyan]")
+
     def _strategy_tick(self):
         console.print("[STICK_00_ENTER] dry_run=%s" % self.dry_run)
+
+        # [V-Model] MTS mode: run shared data pipeline (indicators, CSV, regime)
+        # then bypass position mgmt + router → use direct _mts_tick() for execution
+        _mts_cfg = self.cfg.get("mts", {})
+        _mts_enabled = _mts_cfg.get("enabled", False)
 
         # [Rule 9] Hot-reload config if changed
         self._reload_config_if_changed()
@@ -3338,7 +3521,10 @@ class FuturesMonitor:
 
         # [GSD 4.13] Trading Readiness Unlock: only allow trading if we have enough bars for indicators
         feed_is_fresh = self._tmf_feed_age_secs() <= getattr(self, "STALE_WARN_SECS", self.MONITOR.get("stale_tick_warn_secs", 120))
-        if not self.is_trading_ready and len(df_5m) >= self.STRATEGY.get("length", 20) and feed_is_fresh:
+        # [Fix] Also consider trading ready if we have enough bars regardless of feed age
+        # (covers night session with low tick volume after restart)
+        _has_enough_bars = len(df_5m) >= self.STRATEGY.get("length", 20)
+        if not self.is_trading_ready and _has_enough_bars and (feed_is_fresh or self._bar_counter >= 3):
             self.is_trading_ready = True
             self._refresh_runtime_status()
             console.print(f"[bold green]🔥 [FuturesMonitor] Trading READY: {len(df_5m)} bars loaded.[/bold green]")
@@ -3350,6 +3536,21 @@ class FuturesMonitor:
             
         last_5m = df_5m.iloc[-1]
         
+        # [BUG FIX DIAGNOSTIC] Check last_5m indicator health
+        if hasattr(last_5m, 'get'):
+            _l5_atr = last_5m.get("atr", "MISSING")
+            _l5_vwap = last_5m.get("vwap", "MISSING")
+            _l5_sqz = last_5m.get("sqz_on", "MISSING")
+            _l5_mom = last_5m.get("momentum", "MISSING")
+            _l5_bb = last_5m.get("bb_mid", "MISSING")
+        else:
+            _l5_atr = _l5_vwap = _l5_sqz = _l5_mom = _l5_bb = "N/A"
+        console.print(
+            f"[dim][LAST_5M_DIAG] ts={last_5m.name if hasattr(last_5m, 'name') else 'N/A'} "
+            f"atr={_l5_atr} vwap={_l5_vwap} sqz={_l5_sqz} mom={_l5_mom} bb_mid={_l5_bb} "
+            f"bar_from='{bar_source.get('source', '?')}'[/dim]"
+        )
+        
         # fallback for MTF
         df_15m = processed.get("15m", df_5m)
         if "trading_day" not in df_15m.columns:
@@ -3360,7 +3561,10 @@ class FuturesMonitor:
         # We already initialized them at the start of adaptive/cross logic.
         
         # 只有在數據充足時才算 MTF Score (與之前的 adaptive boost 累加)
-        if "15m" in processed:
+        has_15m = "15m" in processed
+        # [SCORE_TRACE] Force log regardless of 15m availability
+        _mtf_latest = {tf: (df["mom_state"].iloc[-1] if "mom_state" in df.columns else "N/A") for tf, df in processed.items() if not df.empty}
+        if has_15m:
             score_data = calculate_mtf_alignment(processed, weights=self.STRATEGY.get("weights", {"5m": 0.4, "15m": 0.4, "1h": 0.2}))
             # 如果之前有 boost (score 已經不是 0)，我們保留其比例影響
             current_boost = 1.0
@@ -3369,6 +3573,18 @@ class FuturesMonitor:
             
             score = score_data["score"] * current_boost
             regime = "STRONG" if last_5m.get("opening_bullish") else ("WEAK" if last_5m.get("opening_bearish") else "NORMAL")
+            # [SCORE_TRACE] Log MTF alignment details
+            _mtf_score = score_data.get("score", -999)
+            _mtf_boost = current_boost
+            console.print(
+                f"[dim][SCORE_TRACE][MTF] mtf_raw={_mtf_score:.1f} boost={_mtf_boost:.2f} "
+                f"final={score:.1f} mom_states={_mtf_latest} "
+                f"has_15m={has_15m} ts={last_5m.name}[/dim]"
+            )
+        else:
+            console.print(
+                f"[dim][SCORE_TRACE][NO_15M] score={score:.1f} processed_keys={list(processed.keys())} mom_states={_mtf_latest} ts={last_5m.name}[/dim]"
+            )
 
         last_price = last_5m["Close"]
         vwap = last_5m.get("vwap", last_price)
@@ -3390,6 +3606,17 @@ class FuturesMonitor:
         last_5m_dict = last_5m.to_dict()
         last_5m_dict["bars_since_open"] = self._bars_since_session_open
         last_5m_dict["timestamp"] = last_5m.name # Ensure timestamp is available in dict
+        # [V-Model] Explicitly enrich bar dict with indicator fields for route signal
+        last_5m_dict["sqz_on"] = bool(last_5m.get("sqz_on", False))
+        last_5m_dict["bear_breakout"] = bool(last_5m.get("bear_breakout", False))
+        last_5m_dict["bull_breakout"] = bool(last_5m.get("bull_breakout", False))
+        # [V-Model] squeeze_release metadata: sqz_on transitioned False in last N bars
+        _sqz_val = bool(last_5m.get("sqz_on", False))
+        if not hasattr(self, '_prev_sqz_on'):
+            self._prev_sqz_on = False
+        last_5m_dict["squeeze_release"] = _sqz_val == False and self._prev_sqz_on == True
+        last_5m_dict["sqz_on_prev"] = self._prev_sqz_on
+        self._prev_sqz_on = _sqz_val
 
         # GSD Phase 0c: Snapshot bar context for entry diagnostic (used by _execute_trade)
         self._last_bar_context = {
@@ -3433,6 +3660,12 @@ class FuturesMonitor:
                                     f" [yellow][BAR_SOURCE_FALLBACK] tick_bar_stale={timestamp} csv_bar_new={_csv_last_ts} age={_bar_age_minutes:.0f}min source=csv[/yellow] "
                                 )
                                 df_5m = _csv_df
+                                # [V-Model] Recalculate squeeze indicators on CSV fallback to ensure sqz_on etc.
+                                df_5m = calculate_futures_squeeze(
+                                    df_5m,
+                                    bb_length=self.STRATEGY.get("length", 20),
+                                    **getattr(self, "PB_ARGS", {}),
+                                )
                                 last_5m = df_5m.iloc[-1]
                                 timestamp = df_5m.index[-1]
                                 last_price = float(last_5m.get("Close", last_price))
@@ -3472,6 +3705,14 @@ class FuturesMonitor:
 
         # 如果是 dry_run，計算完指標並存檔後就結束，不執行交易邏輯
         if self.dry_run:
+            return
+
+        # [V-Model] MTS mode: data pipeline done, use enriched bar for MTS execution
+        # (skips normal position mgmt, exit engine, strategy router, gates)
+        if _mts_enabled:
+            _mts_bar = last_5m.to_dict()
+            _mts_bar["ts"] = last_5m.name
+            self._mts_tick(enriched_bar=_mts_bar)
             return
 
         # 2. Position management
@@ -3684,8 +3925,25 @@ class FuturesMonitor:
             if atr_val > 0:
                 stop_loss_pts = atr_val * self.ATR_MULT
 
+        # ── PAPER_GATE_BYPASS_DIAGNOSTIC ──
+        # 在 paper mode 下可跳過進場品質過濾，用於診斷策略是否真正產生 trade decision
+        _debug_gate = self.cfg.get("debug_gate_bypass", {})
+        _paper_bypass = _debug_gate.get("enabled", False) and not self.live_trading and not self.dry_run and _debug_gate.get("paper_only", True)
+        console.print(
+            f"[dim][BYPASS_TRACE] enabled={_debug_gate.get('enabled')} "
+            f"paper_only={_debug_gate.get('paper_only')} "
+            f"live_trading={self.live_trading} dry_run={self.dry_run} "
+            f"disable_score={_debug_gate.get('disable_entry_score_gate')} "
+            f"→ bypass={_paper_bypass} "
+            f"entry_score={self.STRATEGY.get('entry_score', '?')} "
+            f"cfg_keys={list(self.cfg.keys())[:5]}[/dim]"
+        )
+
         # ── 進場品質過濾 ──
         min_score = self.STRATEGY.get("entry_score", 21)
+        if _paper_bypass and _debug_gate.get("disable_entry_score_gate", False):
+            min_score = 0
+            console.print(f"[dim][BYPASS][PAPER_ONLY] entry_score disabled (min_score=0)[/dim]")
         vol = last_5m.get("Volume", 0)
         avg_vol = df_5m["Volume"].rolling(20).mean().iloc[-1] if len(df_5m) >= 20 else 0
 
@@ -3695,24 +3953,43 @@ class FuturesMonitor:
         vol_threshold = self.STRATEGY.get("volume_threshold", 0.05 if is_night else 0.3)
 
         vol_filter_ok = (avg_vol == 0) or (vol >= avg_vol * vol_threshold)
+        if _paper_bypass and _debug_gate.get("disable_volume_gate", False):
+            vol_filter_ok = True
+            console.print(f"[dim][BYPASS][PAPER_ONLY] volume gate disabled[/dim]")
         if not vol_filter_ok:
-            session_note = "夜盤" if is_night else "日盤"
+            console.print(f"[ENTRY_GATE] BLOCKED by volume: vol={vol:.0f} avg={avg_vol:.0f} thresh={vol_threshold} night={is_night}")
             self._audit_signal("ENTRY_BLOCKED", "", score, "low_volume", f"vol={vol:.0f} avg={avg_vol:.0f} thresh={vol_threshold}")
             console.print(f"[dim]⏸️ Volume too low ({session_note}): {vol:.0f} vs avg {avg_vol:.0f} (>{vol_threshold*100:.0f}%) — skipping entry[/dim]")
             return
 
         if abs(score) < min_score:
+            console.print(f"[ENTRY_GATE] BLOCKED by score: abs_score={abs(score):.1f} min_score={min_score}")
+            console.print(
+                f"[ENTRY_GATE_TRACE] abs_score={abs(score):.2f} min_score={min_score} "
+                f"score_type={type(score).__name__} score_raw={score} "
+                f"mom_state_5m={last_5m.get('mom_state', '?')} "
+                f"bar_key={bar_source.get('source', '?')} "
+                f"ts={timestamp}"
+            )
             if self.counter_enabled:
                 pass  # Counter mode 有自己的信號系統，不擋
             else:
                 self._audit_signal("NO_ENTRY", "", score, "score_too_low", f"threshold={min_score}")
                 return  # 分數太低，不進場
 
-        # ── GSD: Pluggable Strategy Entry ────────────────────────────
+        # ── GSD: Pluggable Strategy Entry (Unified Route Path) ─────────
+        from core.market_regime import classify_regime
+        session_regime = classify_regime(df_5m)
         active_name = self.STRATEGY.get("active_strategy", "counter_vwap")
-        decision, _ctx, session_regime, bar_regime = self._route_entry_signal(
-            last_5m_dict, df_5m, df_15m, timestamp, active_name
+        decision, _ctx, session_regime, bar_regime = self._route_signal(
+            bar=last_5m_dict,
+            session_regime=session_regime,
+            active_name=active_name
         )
+
+        if decision is None:
+            # Skip path (e.g. prefill bar)
+            return
 
         if decision.action == "BLOCKED":
             self._audit_signal(
@@ -3752,7 +4029,9 @@ class FuturesMonitor:
         if signal and signal.action in ["BUY", "SELL"]:
             # [GSD 4.13] Trading Readiness Gate
             if not self.is_trading_ready:
-                self._audit_signal("ENTRY_BLOCKED", signal.action, score, "not_ready", "Indicators warming up")
+                _msg = f"indicators_warming_up (bars={len(df_5m)})"
+                console.print(f"[ENTRY_GATE] BLOCKED by is_trading_ready=False score={score:.1f} reason={_msg}")
+                self._audit_signal("ENTRY_BLOCKED", signal.action, score, "not_ready", _msg)
                 return
 
             # [L4] Decision Intelligence: Edge Evaluation (Re-evaluated with side)
@@ -3771,9 +4050,11 @@ class FuturesMonitor:
             
             edge_res = edge_model.evaluate(abs(score), edge_context, selected_strategy_name)
             if not edge_res["has_edge"]:
-                self._audit_signal("ENTRY_BLOCKED", signal.action, score, "low_edge", edge_res["reason"])
+                _reason = edge_res.get("reason", "low_edge")
+                console.print(f"[ENTRY_GATE] BLOCKED by edge_model: strategy={selected_strategy_name} score={score:.1f} reason={_reason}")
+                self._audit_signal("ENTRY_BLOCKED", signal.action, score, "low_edge", _reason)
                 if self._bar_counter % 5 == 0:
-                    console.print(f"[bold yellow]🛡️ Decision Intelligence: {selected_strategy_name} Blocked - {edge_res['reason']}[/bold yellow]")
+                    console.print(f"[bold yellow]🛡️ Decision Intelligence: {selected_strategy_name} Blocked - {_reason}[/bold yellow]")
                 return
             
             # [GSD Upgrade] Apply Dynamic Position Scaling

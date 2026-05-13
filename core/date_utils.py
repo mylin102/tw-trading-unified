@@ -249,17 +249,32 @@ def is_taifex_futures_market_open(dt: Union[datetime, pd.Timestamp, str, None] =
     weekday = dt.weekday() # 0=Mon, 6=Sun
     date_str = dt.strftime("%Y-%m-%d")
     h_set = fetch_holidays()
+    _weekday_name = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][weekday]
     
     # 1. Time-only check
     is_day_time = (845 <= hhmm <= 1345)
     is_night_time = (hhmm >= 1500) or (hhmm < 500)
     
     if not (is_day_time or is_night_time):
+        import logging
+        logging.getLogger("regime").warning(
+            "[MARKET_OPEN_TRACE] now=%s weekday=%s(%s) hhmm=%s "
+            "date_str=%s is_open=False reason=NOT_TRADING_HOURS",
+            dt, weekday, _weekday_name, hhmm, date_str,
+        )
         return False
         
     # 2. Weekend/Holiday check
     if is_day_time:
         if weekday >= 5 or date_str in h_set:
+            import logging
+            logging.getLogger("regime").warning(
+                "[MARKET_OPEN_TRACE] now=%s weekday=%s(%s) hhmm=%s "
+                "date_str=%s is_open=False reason=DAY_WEEKEND_OR_HOLIDAY "
+                "weekday_ge5=%s in_h_set=%s",
+                dt, weekday, _weekday_name, hhmm, date_str,
+                weekday >= 5, date_str in h_set,
+            )
             return False
         return True
         
@@ -267,23 +282,49 @@ def is_taifex_futures_market_open(dt: Union[datetime, pd.Timestamp, str, None] =
         # Night session starting TODAY at 15:00
         if hhmm >= 1500:
             if weekday >= 5 or date_str in h_set:
+                import logging
+                logging.getLogger("regime").warning(
+                    "[MARKET_OPEN_TRACE] now=%s weekday=%s(%s) hhmm=%s "
+                    "date_str=%s is_open=False reason=NIGHT_WEEKEND_OR_HOLIDAY",
+                    dt, weekday, _weekday_name, hhmm, date_str,
+                )
                 return False
             # Also check if NEXT trading day is a business day
             # If today is a business day but tomorrow is a holiday, there is NO night session
             t_day = get_trading_day(dt)
             if t_day.strftime("%Y-%m-%d") in h_set or t_day.weekday() >= 5:
+                import logging
+                logging.getLogger("regime").warning(
+                    "[MARKET_OPEN_TRACE] now=%s weekday=%s(%s) hhmm=%s "
+                    "date_str=%s is_open=False reason=NIGHT_TRADING_DAY_WEEKEND_OR_HOLIDAY "
+                    "t_day=%s in_h_set=%s t_day_wday_ge5=%s",
+                    dt, weekday, _weekday_name, hhmm, date_str,
+                    t_day.strftime("%Y-%m-%d"), t_day.strftime("%Y-%m-%d") in h_set, t_day.weekday() >= 5,
+                )
                 return False
             return True
         else:
-            # Night session that started YESTERDAY
-            yesterday = dt - timedelta(days=1)
-            if yesterday.weekday() >= 5 or yesterday.strftime("%Y-%m-%d") in h_set:
-                return False
-            # Check today's status as the attributed trading day
-            if weekday >= 5 or date_str in h_set:
+            # Night session that started YESTERDAY (00:00-05:00)
+            # Trading day is yesterday, NOT today
+            session_date = dt - timedelta(days=1)
+            if session_date.weekday() >= 5 or session_date.strftime("%Y-%m-%d") in h_set:
+                import logging
+                logging.getLogger("regime").warning(
+                    "[MARKET_OPEN_TRACE] now=%s weekday=%s(%s) hhmm=%s "
+                    "date_str=%s is_open=False reason=MIDNIGHT_WEEKEND_OR_HOLIDAY "
+                    "session_date=%s",
+                    dt, weekday, _weekday_name, hhmm, date_str,
+                    session_date.strftime("%Y-%m-%d"),
+                )
                 return False
             return True
 
+    import logging
+    logging.getLogger("regime").warning(
+        "[MARKET_OPEN_TRACE] now=%s weekday=%s(%s) hhmm=%s "
+        "date_str=%s is_open=False reason=FALLTHROUGH",
+        dt, weekday, _weekday_name, hhmm, date_str,
+    )
     return False
 
 
@@ -306,3 +347,25 @@ def get_session_date_str(dt=None):
         return t_day.apply(lambda x: x.strftime("%Y%m%d") if hasattr(x, "strftime") else str(x))
     
     return t_day.strftime("%Y%m%d")
+
+
+def parse_csv_last_timestamp(csv_path) -> pd.Timestamp:
+    """Read the last valid timestamp from an indicator CSV file.
+
+    Uses pandas to correctly identify the timestamp column regardless
+    of column position, unlike subprocess tail+split(',')[0] which
+    assumes timestamp is always the first column.
+
+    Returns pd.NaT if the CSV has no valid timestamp.
+    """
+    try:
+        df = pd.read_csv(csv_path)
+        if "timestamp" not in df.columns:
+            return pd.NaT
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        if df.empty:
+            return pd.NaT
+        return df["timestamp"].iloc[-1]
+    except Exception:
+        return pd.NaT
