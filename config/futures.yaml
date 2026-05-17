@@ -1,5 +1,5 @@
 # Futures Master Config
-active_strategy: adaptive_orb_v15
+active_strategy: squeeze_fire_scout
 cooldown_bars: 5
 execution:
   broker_fee_per_side: 10.0
@@ -55,7 +55,7 @@ risk_mgmt:
   trend_hold_min_time_to_close_mins: 20
   trend_hold_min_trend_strength: 0.001
 strategy:
-  active_strategy: adaptive_orb_v15
+  active_strategy: squeeze_fire_scout
   auto_select: true
   counter_mode:
     atr_sl_mult: 2.0
@@ -110,6 +110,32 @@ squeeze_policy:
 debug:
   tickbar: true
   feed: true
+
+# [V-Model] MTS Mode: Minimal Tradable System — bypass all intelligence layers
+mts:
+  enabled: true
+  strategy: tmf_spread
+  lots: 1
+  params:
+    min_atr: 10.0
+    atr_multiplier_stop: 2.0
+    atr_multiplier_trail: 3.5
+    release_stop_points: 20
+    trail_distance_points: 30
+  # [GSD] Paper Mode Simulation Settings
+  paper:
+    allow_synthetic_price: true
+    synthetic_near_price: 41000.0
+    synthetic_far_price: 41100.0
+
+# [V-Model] PAPER_GATE_BYPASS_DIAGNOSTIC
+# 只在 paper mode 下跳過進場品質過濾，用於診斷策略是否真正產生 trade decision
+# safety_guards（market_open、max_position、duplicate_order、one_order_per_bar）永遠保留
+debug_gate_bypass:
+  enabled: true
+  paper_only: true
+  disable_entry_score_gate: true
+  disable_volume_gate: true
 trade_mgmt:
   allow_long: true
   allow_short: true
