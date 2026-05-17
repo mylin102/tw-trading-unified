@@ -50,12 +50,14 @@ class ORBAdvanced(StrategyBase):
 
     def on_bar(self, context: StrategyContext) -> Signal | None:
         bar = context.market.last_bar
-        if not bar: return None
+        if not bar:
+            self._set_eval(skip_reason="NO_BAR")
+            return None
 
         # ═══ df_5m guard — prevent NoneType crash when data not ready ═══
         df = context.market.df_5m
         if df is None or df.empty:
-            logger.debug("orb_advanced: df_5m None/empty — skipping")
+            self._set_eval(skip_reason="NO_DATA")
             return None
 
         close = bar.get("Close", 0.0)
@@ -81,10 +83,13 @@ class ORBAdvanced(StrategyBase):
             self._bar_count += 1
             if self._bar_count >= self.range_bars:
                 self._range_built = True
+            self._set_eval(skip_reason="ORB_BUILDING", bars=self._bar_count)
             return None
 
         # 2. Get Velocity from Kalman
-        if len(df) < 3: return None
+        if len(df) < 3:
+            self._set_eval(skip_reason="INSUFFICIENT_DATA", bars=len(df))
+            return None
         k_series = df["kalman_close"] if "kalman_close" in df.columns else df["Close"]
         velocity = (k_series.iloc[-1] - k_series.iloc[-2]) / k_series.iloc[-1]
 
@@ -93,6 +98,7 @@ class ORBAdvanced(StrategyBase):
             # LONG: Price > Range AND Kalman rising AND Curvature accelerating
             if close > self._range_high and velocity > self.sens and curve > self.curve_threshold:
                 self._signaled = True
+                self._set_eval(triggered=True, action="BUY", reason="ORB_ADV_LONG")
                 return Signal("BUY", "ORB_ADV_LONG", 
                             stop_loss=close - atr * self.atr_mult,
                             target=close + (self._range_high - self._range_low) * 2,
@@ -101,16 +107,23 @@ class ORBAdvanced(StrategyBase):
             # SHORT: Price < Range AND Kalman falling AND Curvature accelerating down
             elif close < self._range_low and velocity < -self.sens and curve < -self.curve_threshold:
                 self._signaled = True
+                self._set_eval(triggered=True, action="SELL", reason="ORB_ADV_SHORT")
                 return Signal("SELL", "ORB_ADV_SHORT",
                             stop_loss=close + atr * self.atr_mult,
                             target=close - (self._range_high - self._range_low) * 2,
                             confidence=0.85)
+            else:
+                self._set_eval(skip_reason="NO_CONFLUENCE", close=close, range=[self._range_low, self._range_high], velocity=velocity, curve=curve)
 
         # 4. Exhaustion Exit (Physics-based)
         elif context.position.size > 0 and curve < -self.curve_threshold:
+            self._set_eval(triggered=True, action="EXIT", reason="TREND_EXHAUSTION")
             return Signal("EXIT", "TREND_EXHAUSTION", stop_loss=0)
         elif context.position.size < 0 and curve > self.curve_threshold:
+            self._set_eval(triggered=True, action="EXIT", reason="TREND_EXHAUSTION")
             return Signal("EXIT", "TREND_EXHAUSTION", stop_loss=0)
+        else:
+            self._set_eval(skip_reason="ALREADY_SIGNALED" if self._signaled else "POSITION_OPEN")
 
         return None
 

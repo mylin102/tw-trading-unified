@@ -55,7 +55,7 @@ class KalmanMomentum(StrategyBase):
         # ═══ df_5m guard — prevent NoneType crash when data not ready ═══
         df = context.market.df_5m
         if df is None or df.empty:
-            logger.debug("kalman_momentum: df_5m None/empty — skipping")
+            self._set_eval(skip_reason="NO_DATA")
             return None
         
         # Window Management
@@ -64,7 +64,9 @@ class KalmanMomentum(StrategyBase):
         elif self._fired_timer > 0:
             self._fired_timer -= 1
             
-        if len(df) < 3: return None
+        if len(df) < 3:
+            self._set_eval(skip_reason="INSUFFICIENT_DATA", bars=len(df))
+            return None
             
         k_series = df["kalman_close"] if "kalman_close" in df.columns else df["Close"]
         velocity = (k_series.iloc[-1] - k_series.iloc[-2]) / k_series.iloc[-1]
@@ -74,16 +76,26 @@ class KalmanMomentum(StrategyBase):
             if self._fired_timer > 0:
                 if velocity > self.sensitivity:
                     self._fired_timer = 0
+                    self._set_eval(triggered=True, action="BUY", reason="KALMAN_SQZ_UP")
                     return Signal("BUY", "KALMAN_SQZ_UP", stop_loss=close - atr * self.atr_mult, target=close + atr * self.atr_mult * 2, confidence=0.8)
                 elif velocity < -self.sensitivity:
                     self._fired_timer = 0
+                    self._set_eval(triggered=True, action="SELL", reason="KALMAN_SQZ_DOWN")
                     return Signal("SELL", "KALMAN_SQZ_DOWN", stop_loss=close + atr * self.atr_mult, target=close - atr * self.atr_mult * 2, confidence=0.8)
+                else:
+                    self._set_eval(skip_reason="VELOCITY_TOO_LOW", velocity=velocity, timer=self._fired_timer)
+            else:
+                self._set_eval(skip_reason="WAITING_FOR_SQUEEZE_FIRE")
         
         # Exit: Trend Reversal (Optional but recommended for Kalman)
         elif context.position.size > 0 and velocity < -0.000001:
+            self._set_eval(triggered=True, action="EXIT", reason="KALMAN_FLIP")
             return Signal(action="EXIT", reason="KALMAN_FLIP", stop_loss=0)
         elif context.position.size < 0 and velocity > 0.000001:
+            self._set_eval(triggered=True, action="EXIT", reason="KALMAN_FLIP")
             return Signal(action="EXIT", reason="KALMAN_FLIP", stop_loss=0)
+        else:
+            self._set_eval(skip_reason="POSITION_OPEN", velocity=velocity)
 
         return None
 

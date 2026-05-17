@@ -58,11 +58,17 @@ class CounterVWAP(StrategyBase):
 
     def on_bar(self, context: StrategyContext) -> Signal | None:
         bar = context.market.last_bar
+        if not bar:
+            self._set_eval(skip_reason="NO_BAR")
+            return None
+
+        # [P1] SSOT Contract
+        regime = str(bar.get("router_regime") or bar.get("regime", "UNKNOWN")).upper()
+        router_bias = str(bar.get("router_bias") or bar.get("bias", "NEUTRAL")).upper()
 
         # ── LIVE TRADING DISABLED: paper/report only ──
         config = context.config or {}
         if config.get("live_trading", False):
-            ts = bar.get("timestamp") or bar.get("name") if bar else None
             print(f"[counter_vwap] LIVE_TRADING_BLOCKED — paper/report only mode", flush=True)
             self._set_eval(skip_reason="LIVE_TRADING_DISABLED", live_trading=True)
             return None
@@ -85,47 +91,46 @@ class CounterVWAP(StrategyBase):
 
         # ── Derive session from timestamp ──
         ts = bar.get("timestamp") or bar.get("name")
-        session = "DAY" if (hasattr(ts, 'hour') and 8 <= ts.hour < 15) else "NIGHT"
-
+        
         # ── Bias (噴發偏向): momentum acceleration check ──
-        # Bias tells us if momentum is accelerating or decelerating
+        # mom_accel tells us if momentum is accelerating or decelerating
         df = context.market.df_5m
         momentum_prev = 0.0
         if df is not None and "momentum" in df.columns and len(df) >= 2:
             momentum_prev = df["momentum"].iloc[-2]
-        bias = 0.0  # positive = bullish accel, negative = bearish accel
+        
+        mom_accel = 0.0  # Renamed from 'bias' to avoid confusion with router_bias
         if momentum_prev != 0:
-            bias = momentum - momentum_prev
+            mom_accel = momentum - momentum_prev
 
         if vwap <= 0:
-            self._debug_skip("NO_VWAP", ts, session=session)
-            self._set_eval(skip_reason="NO_VWAP", vwap=vwap, session=session)
+            self._debug_skip("NO_VWAP", ts)
+            self._set_eval(skip_reason="NO_VWAP", vwap=vwap)
             return None
 
-        # ── Regime Filter: Require squeeze was active recently ────────
-        # "fired" means squeeze just turned OFF, so squeeze_on is False at fire bar.
-        # Check if squeeze was ON in the last 10 bars (squeeze preceded the fire).
+        # ── Regime Filter ──
+        # [P1] SSOT Check: ensure regime is suitable
+        allowed_regimes = {"WEAK", "CHOP", "SQUEEZE", "STRETCHED"}
+        if regime not in allowed_regimes:
+            self._set_eval(skip_reason="REGIME_NOT_ALLOWED", regime=regime)
+            return None
+
+        # ── Squeeze Context Check ────────
         has_squeeze_col = df is not None and "sqz_on" in df.columns
         if has_squeeze_col and len(df) >= 12:
             recent_squeeze = df["sqz_on"].iloc[-12:-2].any()
         else:
-            # Fallback: use squeeze_on from last_bar if available
             recent_squeeze = bar.get("squeeze_on", bar.get("sqz_on", True))
 
         if not recent_squeeze and self._fire_pending_dir == 0:
-            self._debug_skip("NO_FIRE_EVENT", ts, session=session,
-                             sqz_on=bar.get("sqz_on"), fired=fired,
-                             pending_dir=self._fire_pending_dir)
             self._set_eval(skip_reason="NO_FIRE_EVENT", sqz_on=bool(bar.get("sqz_on")), fired=fired, pending_dir=self._fire_pending_dir)
             return None
 
-        # 新 Fire 事件 (with momentum threshold filter)
+        # 新 Fire 事件
         if fired and self._fire_pending_dir == 0:
             if abs(momentum) < min_momentum:
-                self._debug_skip("WEAK_FIRE", ts, session=session,
-                                 momentum=momentum, min_momentum=min_momentum)
                 self._set_eval(skip_reason="WEAK_FIRE", momentum=momentum, min_momentum=min_momentum)
-                return None  # Weak fire, ignore
+                return None
             self._fire_pending_dir = 1 if momentum > 0 else -1
             self._fire_bar_idx = bar_counter
             self._fire_high = close
@@ -134,8 +139,6 @@ class CounterVWAP(StrategyBase):
             return None
 
         if self._fire_pending_dir == 0:
-            self._debug_skip("NO_PENDING_FIRE", ts, session=session,
-                             recent_squeeze=recent_squeeze, fired=fired)
             self._set_eval(skip_reason="NO_PENDING_FIRE", recent_squeeze=recent_squeeze, fired=fired)
             return None
 
@@ -146,9 +149,6 @@ class CounterVWAP(StrategyBase):
 
         # 過期
         if bars_since > confirm_bars:
-            self._debug_skip("FIRE_EXPIRED", ts, session=session,
-                             bars_since=bars_since, confirm_bars=confirm_bars,
-                             pending_dir=self._fire_pending_dir)
             self._fire_pending_dir = 0
             self._set_eval(skip_reason="FIRE_EXPIRED", bars_since=bars_since, confirm_bars=confirm_bars)
             return None
@@ -156,10 +156,8 @@ class CounterVWAP(StrategyBase):
             self._set_eval(skip_reason="WAITING_CONFIRM", bars_since=bars_since, confirm_bars=confirm_bars)
             return None
 
-        # ── 失敗驗證 (未創新高/低 + 動能反轉 或 VWAP 拒絕) ──
+        # ── 失敗驗證 ──
         sl_pts = atr * atr_sl_mult if atr > 0 else 60
-
-        # Adaptive: Session-Aware Trailing Params (from vbt sweep)
         is_day = 8 <= ts.hour < 15 if hasattr(ts, 'hour') else True
         be_trigger = 20.0 if is_day else 70.0
         trail_pts = 120.0 if is_day else 140.0
@@ -171,25 +169,17 @@ class CounterVWAP(StrategyBase):
             vwap_reject = close < vwap
             if no_new_high and (velo_reversed or vwap_reject):
                 self._fire_pending_dir = 0
-                # Bias check: bearish accel confirms short entry
-                conf = 0.80
-                if bias < 0:  # Momentum accelerating downward
-                    conf = 0.85  # Boost confidence
+                conf = 0.85 if mom_accel < 0 else 0.80
                 self._set_eval(triggered=True, action="SELL", edge_score=conf,
                                fire_dir=1, no_new_high=no_new_high, velo_reversed=velo_reversed,
-                               vwap_reject=vwap_reject, bias=bias)
+                               vwap_reject=vwap_reject, mom_accel=mom_accel)
                 return Signal("SELL", "COUNTER_VWAP", close + sl_pts,
                               target=vwap, confidence=conf,
                               break_even_trigger=be_trigger, trail_points=trail_pts)
-            # ── Still watching — log what's missing ──
-            if not no_new_high:
-                self._set_eval(skip_reason="NO_COUNTER_EXTREME", fire_dir=1,
-                               close=close, recent_high=recent_high,
-                               velo_reversed=velo_reversed, vwap_reject=vwap_reject)
-            else:
-                self._set_eval(skip_reason="VWAP_CONTEXT_INVALID", fire_dir=1,
-                               no_new_high=no_new_high, velo_reversed=velo_reversed,
-                               vwap_reject=vwap_reject, close=close, vwap=vwap, mom_velo=mom_velo)
+            
+            self._set_eval(skip_reason="VWAP_CONTEXT_INVALID", fire_dir=1,
+                           no_new_high=no_new_high, velo_reversed=velo_reversed,
+                           vwap_reject=vwap_reject, close=close, vwap=vwap)
             return None
 
         # Bearish fire failed → COUNTER_BUY
@@ -199,28 +189,19 @@ class CounterVWAP(StrategyBase):
             vwap_reject = close > vwap
             if no_new_low and (velo_reversed or vwap_reject):
                 self._fire_pending_dir = 0
-                # Bias check: bullish accel confirms long entry
-                conf = 0.80
-                if bias > 0:  # Momentum accelerating upward
-                    conf = 0.85  # Boost confidence
+                conf = 0.85 if mom_accel > 0 else 0.80
                 self._set_eval(triggered=True, action="BUY", edge_score=conf,
                                fire_dir=-1, no_new_low=no_new_low, velo_reversed=velo_reversed,
-                               vwap_reject=vwap_reject, bias=bias)
+                               vwap_reject=vwap_reject, mom_accel=mom_accel)
                 return Signal("BUY", "COUNTER_VWAP", close - sl_pts,
                               target=vwap, confidence=conf,
                               break_even_trigger=be_trigger, trail_points=trail_pts)
-            # ── Still watching — log what's missing ──
-            if not no_new_low:
-                self._set_eval(skip_reason="NO_COUNTER_EXTREME", fire_dir=-1,
-                               close=close, recent_low=recent_low,
-                               velo_reversed=velo_reversed, vwap_reject=vwap_reject)
-            else:
-                self._set_eval(skip_reason="VWAP_CONTEXT_INVALID", fire_dir=-1,
-                               no_new_low=no_new_low, velo_reversed=velo_reversed,
-                               vwap_reject=vwap_reject, close=close, vwap=vwap, mom_velo=mom_velo)
+            
+            self._set_eval(skip_reason="VWAP_CONTEXT_INVALID", fire_dir=-1,
+                           no_new_low=no_new_low, velo_reversed=velo_reversed,
+                           vwap_reject=vwap_reject, close=close, vwap=vwap)
             return None
 
-        # Unreachable (fire_pending_dir is 1 or -1 at this point)
         self._set_eval(skip_reason="UNREACHABLE", fire_pending_dir=self._fire_pending_dir)
         return None
 

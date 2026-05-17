@@ -45,7 +45,7 @@ class SqueezeFireScout(StrategyBase):
     def metadata(self) -> dict[str, Any]:
         return {
             "asset_class": "futures",
-            "version": "1.0",
+            "version": "1.1",
             "market_regime": "SQUEEZE",
             "description": "Scout entry during squeeze release, 0.25x size, tight stop, time-stop 6 bars",
             "indicators": ["sqz_fire", "mom_state", "vwap", "breakout_strength_atr"],
@@ -61,10 +61,67 @@ class SqueezeFireScout(StrategyBase):
         self._bar_count = 0
 
     def on_bar(self, context: StrategyContext) -> Signal | None:
+        # ── Default Eval (SDD Compliance) ──
+        self._set_eval(skip_reason="INITIALIZING")
+
         bar = context.market.last_bar
         if not bar:
             self._set_eval(skip_reason="NO_BAR")
             return None
+
+        # ── [SQUEEZE_WATCH] On every bar, print squeeze-readiness snapshot ──
+        _sqz_on = bool(bar.get("sqz_on", False))
+        _sqz_fire = bool(bar.get("fired") or bar.get("sqz_fire", False))
+        _regime = str(getattr(context.market, "regime", "?")).upper()
+        if _sqz_on or _sqz_fire or _regime in ("SQUEEZE", "WEAK", "STRETCHED", "TREND", "BEAR"):
+            _close = bar.get("Close", 0)
+            _vwap = bar.get("vwap", 0)
+            _bs_val = bar.get("breakout_strength_atr", None)
+            _bs_src = "calc"
+            if _bs_val is None:
+                _bs_val = bar.get("breakout_strength", 0)
+                _bs_src = "fallback_bs"
+            if _bs_val is None or _bs_val == 0:
+                _bs_src = "default_zero"
+                _bs_val = 0
+            _bs_val = float(_bs_val)
+            _mom = bar.get("mom_state", 0)
+            _bias_raw = bar.get("router_bias", bar.get("bias", "?"))
+            # Normalize bias: BULLISH/BEARISH → LONG/SHORT
+            _bias_map = {"BULLISH": "LONG", "BEARISH": "SHORT", "BULL": "LONG", "BEAR": "SHORT"}
+            _bias = str(_bias_map.get(str(_bias_raw).upper(), str(_bias_raw).upper()))
+            _vs = bar.get("volume_spike", 0)
+            _pos = context.position.size
+            # Why-no-trade: mirror the first check that would fire
+            if _pos != 0:
+                _why = f"POSITION_OPEN:{_pos}"
+            elif not _sqz_fire:
+                _why = "NO_SQUEEZE_FIRE"
+            elif _bias not in ("LONG", "SHORT"):
+                _why = f"BIAS:{_bias}"
+            elif int(_mom) < 2:
+                _why = f"MOM:{_mom}"
+            elif float(_bs_val) >= 0.25:
+                _why = f"BREAKOUT_CONFIRMED:{_bs_val:.3f}"
+            elif float(_vwap) > 0 and float(_close) > 0 and ((_bias == "LONG" and float(_close) <= float(_vwap)) or (_bias == "SHORT" and float(_close) >= float(_vwap))):
+                _why = "VWAP_MISALIGN"
+            else:
+                _why = "READY"
+            if not hasattr(self, '_sqw_prev'):
+                self._sqw_prev = {"ts": "", "why": ""}
+            _ts = str(bar.get("timestamp", bar.get("ts", "?")))
+            # Throttle: only log when timestamp changes AND (sqz/fire active OR why changed)
+            _has_sqz_activity = _sqz_on or _sqz_fire
+            _why_changed = self._sqw_prev.get("why") != _why
+            if _ts != self._sqw_prev.get("ts") and (_has_sqz_activity or _why_changed):
+                self._sqw_prev = {"ts": _ts, "why": _why}
+                print(
+                    f"[SQUEEZE_WATCH] ts={_ts} sqz={int(_sqz_on)} fire={int(_sqz_fire)} "
+                    f"regime={_regime} bias={_bias} close={_close:.0f} vwap={_vwap:.0f} "
+                    f"bs={_bs_val:.3f}({_bs_src}) mom={_mom} vol_spike={float(_vs):.2f}/{0.8:.1f} "
+                    f"pos={_pos} why={_why}",
+                    flush=True,
+                )
 
         # ── Session reset ──
         session_id = bar.get("trading_day", bar.get("session", 1))
@@ -83,42 +140,36 @@ class SqueezeFireScout(StrategyBase):
             return None
 
         # ═══ Regime guard ═══
+        # [Fix] Relaxed: Squeeze Fire Scout can evaluate in non-SQUEEZE regimes
+        # because 'fired' flag only exists on the bar AFTER squeeze ends (when regime changes).
         regime = str(getattr(context.market, "regime", "UNKNOWN")).upper()
-        if regime != "SQUEEZE":
-            self._set_eval(skip_reason=f"REGIME_NOT_SQUEEZE:{regime}")
+        # [GSD] Also allow STRETCHED and NORMAL to capture fires into any state
+        allowed_regimes = ("SQUEEZE", "WEAK", "TREND", "BEAR", "TRANSITION", "CHOP", "STRETCHED", "NORMAL")
+        if regime not in allowed_regimes:
+            self._set_eval(skip_reason=f"SKIP:REGIME_NOT_ALLOWED:{regime}")
             return None
 
         # ═══ Squeeze fire check ═══
-        sqz_fire = bar.get("sqz_fire", False)
+        # Indicator engine outputs 'fired'; schema also defines 'sqz_fire'
+        sqz_fire = bar.get("fired") or bar.get("sqz_fire", False)
         if not sqz_fire:
             self._set_eval(skip_reason="NO_SQUEEZE_FIRE")
             return None
 
         # ═══ Bias check ═══
-        # Determine directional bias from bar data: mom_state + close vs vwap + breakout direction
-        close = float(bar.get("Close", 0))
-        vwap = float(bar.get("vwap", 0))
-        bias = ""
-        if close > vwap and vwap > 0:
-            bias = "LONG"
-        elif close < vwap and vwap > 0:
-            bias = "SHORT"
-        # If no VWAP, fall back to breakout_strength direction
-        if not bias:
-            bear_bs = float(bar.get("bear_breakout_strength", 0))
-            bull_bs = float(bar.get("breakout_strength", 0))
-            if bull_bs > bear_bs:
-                bias = "LONG"
-            elif bear_bs > bull_bs:
-                bias = "SHORT"
+        # [P1] Single Source of Truth: Use unified bias from router
+        bias = bar.get("router_bias") or bar.get("bias") or "NEUTRAL"
+        bias = str(bias).upper().strip()
+        
         if bias not in ("LONG", "SHORT"):
-            self._set_eval(skip_reason=f"NO_USABLE_BIAS:{bias}")
+            self._set_eval(skip_reason=f"NO_USABLE_BIAS:{bias}", router_bias=bias)
             return None
 
-        # ═══ Momentum check ═══
+        # [TEMP RELAX 2026-05-08] Momentum check — lowered from 3 to 2 for night session
+        # Revert to >= 3 when day session resumes
         mom_state = int(bar.get("mom_state", 0))
-        if mom_state < 3:
-            self._set_eval(skip_reason=f"MOMENTUM_TOO_LOW mom_state={mom_state} < 3")
+        if mom_state < 2:
+            self._set_eval(skip_reason=f"MOMENTUM_TOO_LOW mom_state={mom_state} < 2 (relaxed from 3)")
             return None
 
         # ═══ Breakout strength guard: only scout when < 0.25 (pre-confirmation) ═══
@@ -137,6 +188,9 @@ class SqueezeFireScout(StrategyBase):
             if bias == "SHORT" and close >= vwap:
                 self._set_eval(skip_reason="VWAP_ABOVE", close=close, vwap=vwap)
                 return None
+        else:
+            self._set_eval(skip_reason="NO_VWAP_DATA")
+            return None
 
         # ═══ All conditions met — fire scout ═══
         self._signaled = True
@@ -181,3 +235,6 @@ class SqueezeFireScout(StrategyBase):
         )
 
         return signal
+
+    def cleanup(self) -> None:
+        self._reset_state()

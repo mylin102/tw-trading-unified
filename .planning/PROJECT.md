@@ -8,14 +8,14 @@ This is a Taiwan futures + options trading system built around Shioaji, with pap
 
 The system must preserve broker-truth execution state and capital safety so trading decisions and operator actions are based on correct, recoverable lifecycle data.
 
-## Current Milestone: v1.1 vNext Execution Reliability
+## Current Milestone: v1.2 Adaptive Strategy Optimization
 
-**Goal:** Formalize the Shioaji order lifecycle into a reconcileable execution-truth model and lock it down with V-model validation.
+**Goal:** Transform fixed-parameter spread strategies into volatility-adaptive systems to reduce friction and improve capture quality.
 
 **Target features:**
-- Shared futures/options, paper/live lifecycle contract built around intent, order, and deal records
-- Broker-truth reconciliation flow that combines callback events with `update_status()` recovery after callback gaps or restart
-- Minimal dashboard alignment so entry/exit orders, fills, cost basis, and realized/unrealized PnL all reflect the same lifecycle truth
+- ATR-based dynamic thresholds for release stops and trailing exits in `tmf_spread`
+- Volatility-gate entry filtering (Min ATR) to reduce transaction cost erosion
+- Unified spread backtesting framework for cross-strategy efficiency comparison
 
 ## Requirements
 
@@ -24,44 +24,46 @@ The system must preserve broker-truth execution state and capital safety so trad
 - ✓ Futures/options paper-live trading flows exist with session-aware monitors and operator dashboards — v1.0
 - ✓ Core safety invariants are regression-locked, including duplicate-entry prevention, fee-inclusive PnL, session rollover, and paper capital guards — v1.0
 - ✓ Shared bar-pipeline and readiness-state plumbing now align futures/options runtime and dashboard behavior more closely — v1.0
+- ✓ ATR-based dynamic stop/trail logic implemented in `tmf_spread.py` — v1.2.1
+- ✓ Min ATR entry filter implemented to reduce friction — v1.2.1
+- ✓ Friction-aware backtest framework (`backtest_spread_v2.py`) validated 14.5% profit improvement and 60% cost reduction — v1.2.1
 
 ### Active
 
-- [ ] Formalize one lifecycle state model for futures/options, paper/live execution
-- [ ] Add restart-safe reconciliation so broker truth can be rebuilt after callback gaps or process restarts
-- [ ] Make dashboard lifecycle views reflect separate entry/exit orders, fills, costs, and PnL from the same source of truth
-- [ ] Lock the redesign with V-model tests for partial fills, cancel/reject, trading-day mapping, and recovery behavior
+- [ ] Final production configuration for tomorrow's day session (Min ATR 10, Stop 2.0x, Trail 3.5x)
+- [ ] Comprehensive unit tests for ATR-scaled logic in `tmf_spread.py`
+- [ ] Integration verification: Ensure dashboard correctly reflects dynamic ATR thresholds
+- [ ] Formalize one lifecycle state model for futures/options, paper/live execution (carried over from v1.1)
+- [ ] Add restart-safe reconciliation so broker truth can be rebuilt after callback gaps or process restarts (carried over from v1.1)
 
 ### Out of Scope
 
 - Rust Shioaji rewrite — deferred until the current Python execution path is boring and test-locked
 - GCP migration — deferred until runtime supervision and execution correctness are stable locally
-- Strategy redesign or signal tuning — this milestone is execution reliability hardening, not alpha work
 - Full dashboard redesign — only the lifecycle surfaces required to reflect execution truth belong in this milestone
+- Vertical Spread optimization (Options) — deferred until Futures Spread reliability is proven
 
 ## Context
 
 - The codebase already supports futures, options, and stock workflows, but the highest-risk runtime path is Taiwan futures/options execution.
-- Recent debugging exposed lifecycle gaps: some trades showed fills without matching order history, entry/exit orders were collapsed together, night-session trading-day attribution drifted, and dashboard PnL/cost views were incomplete.
-- `docs/shioaji_訂單生命週期.md` and `docs/example_order_manager.py` confirmed the needed direction: `place_order()` is not broker truth, order events and deal events are separate, and reconciliation via `update_status()` is mandatory.
-- Recent reliability work already hardened shared bar handling, supervisor ownership, and false options squeeze-release exits; this milestone builds on that safer runtime base.
+- Recent backtests showed `tmf_spread` had a 52% friction ratio due to low-volatility noise trading.
+- ADR-006 established the three-phase lifecycle (Entry-Release-Trail); v1.2 makes these phases volatility-adaptive.
+- Using ATR to scale stops ensures the strategy "breathes" with the market, while Min ATR gates ensure entries only happen during tradable volatility.
 
 ## Constraints
 
-- **Financial safety**: Bugs can cause real loss — position, fills, and PnL must remain correct under live/paper execution.
-- **Single source of truth**: Position and lifecycle state must derive from confirmed execution data, not UI assumptions or optimistic order placement.
-- **Compatibility**: `main.py` and the 8500 dashboard must keep working while lifecycle internals are upgraded.
-- **Broker model**: Shioaji callbacks are incomplete on their own — reconciliation and partial-fill handling must be first-class.
+- **Financial safety**: ATR-scaled stops must have hard minimums (5pt stop, 10pt trail) to prevent "stop-loss evaporation" in ultra-low vol.
+- **Single source of truth**: Position and lifecycle state must derive from confirmed execution data.
+- **Complexity management**: Keep ATR logic simple (multipliers) to avoid over-fitting during backtest.
 
 ## Key Decisions
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Keep `PaperTrader.position` as the position truth anchor | Trading invariants already rely on it; lifecycle work must strengthen, not bypass, that contract | — Pending |
-| Model execution as intent → order → deal instead of flattening to one trade record | Shioaji exposes order and deal as separate truth sources and restart recovery depends on that separation | — Pending |
-| Scope v1.1 to futures + options, paper + live, with minimal dashboard changes | This closes the execution correctness gap without destabilizing unrelated UI or infra work | — Pending |
-| Defer Rust and GCP migration | Reliability must be proven in the current stack before platform changes add more variables | ✓ Good |
-| Keep strategy semantics out of this milestone | The current problem is lifecycle truth and recoverability, not signal logic | ✓ Good |
+| Use ATR for stop/trail scaling | Fixed points fail to distinguish between noise and trend in variable volatility | ✓ Implemented |
+| Set Min ATR entry gate | High-frequency noise trading in low vol consumed >50% of gross profit in fees/tax | ✓ Implemented |
+| Proxied ATR with spread_std in backtest | Validates logic using available historical spread volatility data | ✓ Good |
+| Maintain hard floor for stops | Prevents logical errors or extremely tight stops that guarantee loss on slippage | ✓ Guarded |
 
 ## Evolution
 

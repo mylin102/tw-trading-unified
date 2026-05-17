@@ -28,10 +28,12 @@ class CumulativeDeltaStrategy(StrategyBase):
         # Guard: df_5m must exist with sufficient bars
         df = ctx.market.df_5m
         if df is None or df.empty:
+            self._set_eval(skip_reason="NO_DATA")
             return None
         s_cfg = ctx.config.get("strategy", {}).get("cumulative_delta", {})
         min_bars = max(s_cfg.get("sma_length", 50), s_cfg.get("lookback", 20)) + 2
         if len(df) < min_bars:
+            self._set_eval(skip_reason="INSUFFICIENT_DATA", bars=len(df), min_required=min_bars)
             return None
 
         # Prepare state dict expected by the legacy function
@@ -46,6 +48,8 @@ class CumulativeDeltaStrategy(StrategyBase):
         sig_dict = strategy_cumulative_delta(state, ctx.config)
         
         if sig_dict:
+            # Note: strategy_cumulative_delta already returns a dict with 'action' and 'reason'
+            self._set_eval(triggered=True, action=sig_dict["action"], reason=sig_dict["reason"])
             return Signal(
                 action=sig_dict["action"],
                 reason=sig_dict["reason"],
@@ -53,4 +57,6 @@ class CumulativeDeltaStrategy(StrategyBase):
                 break_even_trigger=10.0,
                 trail_points=20.0
             )
+        
+        self._set_eval(skip_reason="NO_SIGNAL")
         return None

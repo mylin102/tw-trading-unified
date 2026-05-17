@@ -47,8 +47,12 @@ class RangeMeanReversionV1(StrategyBase):
         self._last_log_ts = 0.0
 
     def on_bar(self, context: StrategyContext) -> Signal | None:
+        # ── Default Eval (SDD Compliance) ──
+        self._set_eval(skip_reason="INITIALIZING")
+
         bar = context.market.last_bar
         if bar is None or bar.get("Close") is None:
+            self._set_eval(skip_reason="NO_BAR_DATA")
             return None
 
         # ── 1. 獲取參數 ──
@@ -69,6 +73,7 @@ class RangeMeanReversionV1(StrategyBase):
         bb_mid = bb_mid_raw if bb_mid_raw is not None else bar.get("bb_middle", np.nan)
         rsi = bar.get("rsi", 50)
         adx = bar.get("adx", 20)
+        vwap = float(bar.get("vwap", close))
         
         # [Debug]
         if time.time() - self._last_log_ts > 60:
@@ -83,6 +88,18 @@ class RangeMeanReversionV1(StrategyBase):
 
         # ── 4. 進場邏輯 ──
         signal = None
+        
+        # [TEMP RELAX 2026-05-08] For night session: allow entry when close is below VWAP
+        # with moderate RSI, not just BB extreme. Revert when day session resumes.
+        regime = str(getattr(context.market, "regime", "UNKNOWN")).upper()
+        if signal is None and regime in ("SQUEEZE", "WEAK") and close < vwap and rsi <= rsi_oversold + 10:
+            signal = Signal(
+                action="SELL",
+                reason=f"SQUEEZE_RELAXED (close={close:.0f} rsi={rsi:.1f})",
+                stop_loss=close + 30,
+                take_profit=close - 60,
+                confidence=0.6,
+            )
         
         # 做多邏輯：價格破下軌 + RSI 低位
         if close <= bb_low and rsi <= rsi_oversold:

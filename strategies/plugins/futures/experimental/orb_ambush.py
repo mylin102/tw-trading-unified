@@ -49,12 +49,14 @@ class ORBAmbush(StrategyBase):
 
     def on_bar(self, context: StrategyContext) -> Signal | None:
         bar = context.market.last_bar
-        if not bar: return None
+        if not bar:
+            self._set_eval(skip_reason="NO_BAR")
+            return None
 
         # ═══ df_5m guard — prevent NoneType crash when data not ready ═══
         df = context.market.df_5m
         if df is None or df.empty:
-            logger.debug("orb_ambush: df_5m None/empty — skipping")
+            self._set_eval(skip_reason="NO_DATA")
             return None
 
         close = bar.get("Close", 0.0)
@@ -78,10 +80,13 @@ class ORBAmbush(StrategyBase):
             self._bar_count += 1
             if self._bar_count >= self.range_bars:
                 self._range_built = True
+            self._set_eval(skip_reason="ORB_BUILDING", bars=self._bar_count)
             return None
 
         # 2. Get Kalman Velocity
-        if len(df) < 3: return None
+        if len(df) < 3:
+            self._set_eval(skip_reason="INSUFFICIENT_DATA", bars=len(df))
+            return None
         k_series = df["kalman_close"] if "kalman_close" in df.columns else df["Close"]
         velocity = (k_series.iloc[-1] - k_series.iloc[-2]) / k_series.iloc[-1]
 
@@ -90,6 +95,7 @@ class ORBAmbush(StrategyBase):
             # AMBUSH SHORT: Price > High BUT Curvature is bending DOWN (exhaustion)
             if close > self._range_high and curve < -self.curve_threshold and velocity < 0:
                 self._signaled = True
+                self._set_eval(triggered=True, action="SELL", reason="AMBUSH_FAKE_UP")
                 return Signal("SELL", "AMBUSH_FAKE_UP", 
                             stop_loss=close + atr * self.atr_mult,
                             target=self._range_low, # Target the other side of the range
@@ -98,16 +104,23 @@ class ORBAmbush(StrategyBase):
             # AMBUSH LONG: Price < Low BUT Curvature is bending UP
             elif close < self._range_low and curve > self.curve_threshold and velocity > 0:
                 self._signaled = True
+                self._set_eval(triggered=True, action="BUY", reason="AMBUSH_FAKE_DOWN")
                 return Signal("BUY", "AMBUSH_FAKE_DOWN",
                             stop_loss=close - atr * self.atr_mult,
                             target=self._range_high,
                             confidence=0.75)
+            else:
+                self._set_eval(skip_reason="NO_AMBUSH", close=close, range=[self._range_low, self._range_high], curve=curve, velocity=velocity)
 
         # 4. Trailing / Dynamic Exit
         elif context.position.size > 0 and curve < -self.curve_threshold:
+            self._set_eval(triggered=True, action="EXIT", reason="AMBUSH_EXIT")
             return Signal("EXIT", "AMBUSH_EXIT", stop_loss=0)
         elif context.position.size < 0 and curve > self.curve_threshold:
+            self._set_eval(triggered=True, action="EXIT", reason="AMBUSH_EXIT")
             return Signal("EXIT", "AMBUSH_EXIT", stop_loss=0)
+        else:
+            self._set_eval(skip_reason="ALREADY_SIGNALED" if self._signaled else "POSITION_OPEN")
 
         return None
 

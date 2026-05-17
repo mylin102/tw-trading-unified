@@ -79,7 +79,8 @@ class AdaptiveORBv15(StrategyBase):
         self.min_curve_abs = params.get("min_curve_abs", 0.01)
 
         # Load V3 Clean Model (same as v1)
-        project_root = Path(__file__).parents[3]
+        # GSD: plugin is in strategies/plugins/futures/active/ (4 levels deep)
+        project_root = Path(__file__).parents[4]
         model_path = project_root / "models" / "orb_rf_v3_clean.pkl"
         if model_path.exists():
             with open(model_path, "rb") as f:
@@ -171,12 +172,13 @@ class AdaptiveORBv15(StrategyBase):
         close = float(bar.get("Close", 0))
 
         # ── 1. Structure ──
-        if df is None or len(df) < 21:
+        if df is None or len(df) < 11:
             return True, "INSUFFICIENT_DATA"  # skip check if not available
         high_col = "High" if "High" in df.columns else "high"
-        high_20_prev = float(df[high_col].rolling(20).max().shift(1).iloc[-1])
-        if close <= high_20_prev:
-            return False, f"NO_STRUCTURE close={close:.1f} <= High20_prev={high_20_prev:.1f}"
+        # [GSD Upgrade] 從 20 改為 10，提升對突破的靈敏度
+        high_10_prev = float(df[high_col].rolling(10).max().shift(1).iloc[-1])
+        if close <= high_10_prev:
+            return False, f"NO_STRUCTURE close={close:.1f} <= High10_prev={high_10_prev:.1f}"
 
         # ── 2. Behavior: volume spike + VWAP ──
         volume_spike = float(bar.get("volume_spike", 0))

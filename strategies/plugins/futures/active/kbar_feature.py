@@ -52,7 +52,7 @@ class KbarFeature(StrategyBase):
     def metadata(self) -> dict[str, Any]:
         return {
             "asset_class": "futures",
-            "version": "1.0",
+            "version": "1.1",
             "backtest_pf": 0.0,
             "backtest_wr": 0.0,
             "backtest_maxdd": 0.0,
@@ -70,6 +70,10 @@ class KbarFeature(StrategyBase):
     def on_bar(self, context: StrategyContext) -> Signal | None:
         """Called on every new bar. Returns Signal or None."""
         bar = context.market.last_bar
+        if not bar:
+            self._set_eval(skip_reason="NO_BAR")
+            return None
+
         params = context.config.get("params", {})
 
         # ── Read config params ──────────────────────────────────────────
@@ -92,7 +96,11 @@ class KbarFeature(StrategyBase):
         vwap = float(bar.get("vwap", close))
         adx = float(bar.get("adx", 0.0) or 0.0)
         score = float(bar.get("score", 0.0) or 0.0)
-        regime = str(bar.get("regime", "") or "")
+        
+        # [P1] SSOT Contract
+        regime = str(bar.get("router_regime") or bar.get("regime", "")).upper()
+        bias = str(bar.get("router_bias") or bar.get("bias", "")).upper()
+        
         bear_align = bool(bar.get("bear_align", False))
         bull_align = bool(bar.get("bull_align", False))
         bearish_align = bool(bar.get("bearish_align", False))
@@ -113,6 +121,7 @@ class KbarFeature(StrategyBase):
         # ── Validate required columns (debug check) ─────────────────────
         missing = _REQUIRED_COLUMNS - set(bar.keys())
         if missing:
+            self._set_eval(skip_reason=f"MISSING_COLUMNS:{sorted(missing)}")
             return Signal(
                 action="HOLD",
                 reason=f"MISSING_COLUMNS:{sorted(missing)}",
@@ -121,11 +130,12 @@ class KbarFeature(StrategyBase):
             )
 
         if atr <= 0 or math.isnan(atr):
+            self._set_eval(skip_reason="INVALID_ATR", atr=atr)
             return None
 
         # ── ENTRY: flat position ────────────────────────────────────────
         if pos_side == "FLAT":
-            return self._evaluate_entry(
+            signal = self._evaluate_entry(
                 short_enabled=short_enabled,
                 long_enabled=long_enabled,
                 regime=regime,
@@ -154,10 +164,15 @@ class KbarFeature(StrategyBase):
                 adx_raw=adx,
                 score_raw=score,
             )
+            if not signal:
+                last_ev = getattr(self, "_last_eval", None)
+                if not last_ev or last_ev.triggered:
+                    self._set_eval(skip_reason="NO_ENTRY_SIGNAL")
+            return signal
 
         # ── EXIT: has position ──────────────────────────────────────────
         self._bars_held += 1
-        return self._evaluate_exit(
+        signal = self._evaluate_exit(
             pos_side=pos_side,
             close=close,
             high=high,
@@ -172,6 +187,11 @@ class KbarFeature(StrategyBase):
             atr=atr,
             max_hold_bars=max_hold_bars,
         )
+        if signal:
+            self._set_eval(triggered=True, action=signal.action, reason=signal.reason)
+        else:
+            self._set_eval(skip_reason="POSITION_OPEN", bars_held=self._bars_held)
+        return signal
 
     # ── Optional hooks ──────────────────────────────────────────────────
 
@@ -230,21 +250,27 @@ class KbarFeature(StrategyBase):
         # ── SHORT entry ─────────────────────────────────────────────────
         if short_enabled and regime.upper() in {"WEAK", "BEAR", "DOWN"}:
             if not (bear_align and bearish_align):
+                self._set_eval(skip_reason="ALIGNMENT_NOT_BEARISH")
                 return None
             if adx < adx_threshold:
+                self._set_eval(skip_reason="ADX_TOO_LOW", adx=adx, min=adx_threshold)
                 return None
             if close > vwap + vwap_buffer:
+                self._set_eval(skip_reason="ABOVE_VWAP", close=close, vwap=vwap)
                 return None
             if score > score_short_threshold:
+                self._set_eval(skip_reason="SCORE_NOT_BEARISH", score=score)
                 return None
 
             # Momentum trigger
             momentum_ok = macd_hist < 0 and mom_velo < 0
             if not momentum_ok:
+                self._set_eval(skip_reason="MOMENTUM_NOT_BEARISH", macd_hist=macd_hist, mom_velo=mom_velo)
                 return None
 
             # Breakout confirmation
             if require_breakout and close >= recent_low:
+                self._set_eval(skip_reason="NO_BREAKOUT_SHORT", close=close, recent_low=recent_low)
                 return None
 
             # Entry signal
@@ -252,6 +278,9 @@ class KbarFeature(StrategyBase):
             stop = close + stop_atr_mult * atr
             tp = close - take_profit_atr_mult * atr
             self._bars_held = 0
+            
+            self._set_eval(triggered=True, action="SELL", edge_score=0.8, reason="KBAR_FEATURE_SHORT")
+            
             return Signal(
                 action="SELL",
                 reason="KBAR_FEATURE_SHORT",
@@ -265,21 +294,27 @@ class KbarFeature(StrategyBase):
         # ── LONG entry ──────────────────────────────────────────────────
         if long_enabled and regime.upper() in {"STRONG", "BULL", "UP"}:
             if not (bull_align and bullish_align):
+                self._set_eval(skip_reason="ALIGNMENT_NOT_BULLISH")
                 return None
             if adx < adx_threshold:
+                self._set_eval(skip_reason="ADX_TOO_LOW", adx=adx, min=adx_threshold)
                 return None
             if close < vwap - vwap_buffer:
+                self._set_eval(skip_reason="BELOW_VWAP", close=close, vwap=vwap)
                 return None
             if score < score_long_threshold:
+                self._set_eval(skip_reason="SCORE_NOT_BULLISH", score=score)
                 return None
 
             # Momentum trigger
             momentum_ok = macd_hist > 0 and macd_rising and mom_velo > 0
             if not momentum_ok:
+                self._set_eval(skip_reason="MOMENTUM_NOT_BULLISH", macd_hist=macd_hist, mom_velo=mom_velo)
                 return None
 
             # Breakout confirmation
             if require_breakout and close <= recent_high:
+                self._set_eval(skip_reason="NO_BREAKOUT_LONG", close=close, recent_high=recent_high)
                 return None
 
             # Entry signal
@@ -287,6 +322,9 @@ class KbarFeature(StrategyBase):
             stop = close - stop_atr_mult * atr
             tp = close + take_profit_atr_mult * atr
             self._bars_held = 0
+            
+            self._set_eval(triggered=True, action="BUY", edge_score=0.8, reason="KBAR_FEATURE_LONG")
+
             return Signal(
                 action="BUY",
                 reason="KBAR_FEATURE_LONG",

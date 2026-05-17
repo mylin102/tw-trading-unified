@@ -16,6 +16,19 @@ import yaml
 import datetime
 import os
 from core.date_utils import get_session_date_str, get_trade_day
+
+# ═══ Stock Name Mapping (fallback when CSV name column is missing) ═══
+_STOCK_NAMES: dict[str, str] = {
+    "2330": "台積電", "2317": "鴻海", "2454": "聯發科", "2303": "聯電",
+    "2308": "台達電", "2327": "國巨", "2379": "瑞昱", "2382": "廣達",
+    "2881": "富邦金", "2882": "國泰金", "2891": "中信金",
+    "2603": "長榮", "2609": "陽明", "3008": "大立光",
+    "3034": "聯詠", "3231": "緯創", "3661": "世芯-KY",
+    "1216": "統一", "1301": "台塑", "1303": "南亞", "2002": "中鋼",
+    "2301": "光寶科", "2357": "華碩", "2408": "南亞科",
+    "2412": "中華電", "2886": "兆豐金",
+}
+
 from core.dashboard_data import (
     build_stock_orders_from_trades,
     merge_indicator_frames,
@@ -237,10 +250,13 @@ with st.sidebar:
     st.markdown("🚦 **系統狀態 (Readiness)**")
     
     try:
-        from core.shioaji_session import get_shared_system_status, SystemReadiness
+        from core.shioaji_session import get_shared_system_status, SystemReadiness, _STATUS_FILE
+        import os
         status = get_shared_system_status()
-    except Exception:
-        # Fallback if core is not yet loaded in sys.path
+        if status.name == "BOOTING":
+            st.sidebar.warning(f"DEBUG: status={status.name}, file_path={_STATUS_FILE}, exists={_STATUS_FILE.exists()}, cwd={os.getcwd()}")
+    except Exception as e:
+        st.error(f"DEBUG: Status import failed: {e}")
         status = None
 
     # Map status to UI labels/colors
@@ -248,7 +264,9 @@ with st.sidebar:
         st.info("🕒 BOOTING / INITIALIZING")
     elif status.name == "BOOTING":
         st.info("🕒 BOOTING")
-    elif status.name == "MONITORING":
+    elif status.name == "SYNCING":
+        st.info("🔄 SYNCING DATA")
+    elif status.name == "WARMUP":
         st.success("✅ MONITORING")
         st.warning("⚠️ TRADING: WARMING UP")
     elif status.name == "TRADING":
@@ -256,9 +274,61 @@ with st.sidebar:
         st.success("✅ TRADING READY")
     elif status.name == "DEGRADED":
         st.success("✅ MONITORING")
-        st.warning("⚠️ TRADING: PAUSED (STALE FEED)")
-        st.error("🚨 DEGRADED")
+        st.error("🚨 DEGRADED: STALE DATA")
+    elif status.name == "HALTED":
+        st.error("🛑 HALTED: RISK LIMIT HIT")
+    elif status.name == "SHUTDOWN":
+        st.info("🌑 SHUTDOWN")
     
+    st.divider()
+
+    # ── Regime + 自動策略選擇 ──
+    try:
+        import json as _json
+        import glob as _glob
+        _trace_files = sorted(_glob.glob("logs/router_trace/router_trace_*.jsonl"), reverse=True)
+        if _trace_files:
+            with open(_trace_files[0]) as _f:
+                _lines = [l for l in _f if l.strip()]
+            if _lines:
+                _latest = _json.loads(_lines[-1])
+                _regime = _latest.get("regime", "?")
+                _bias = _latest.get("bias", "?")
+                _selected = _latest.get("selected") or "未選中"
+                _strategies = _latest.get("strategies", [])
+
+                # [P1] SSOT: Map emojis from router_bias
+                _bias_map = {"LONG": "🚀強勢多", "SHORT": "💀強勢空", "NEUTRAL": "⚪中性"}
+                _bias_display = _bias_map.get(_bias, f"⚪{_bias}")
+
+                # Regime badge
+                _regime_colors = {"SQUEEZE": "#f59e0b", "WEAK": "#ef4444", "CHOP": "#8b5cf6",
+                                  "TREND": "#22c55e", "BEAR": "#dc2626", "NEUTRAL": "#6b7280"}
+                _rc = _regime_colors.get(_regime, "#6b7280")
+                st.markdown(f"<div style='padding:8px;border-radius:8px;background:#1e293b;border-left:4px solid {_rc}'>"
+                            f"<div style='font-size:14px;font-weight:600;color:{_rc}'>🧠 {_regime}</div>"
+                            f"<div style='font-size:12px;color:#94a3b8'>Bias: {_bias_display} | 選中: {_selected}</div>"
+                            f"</div>", unsafe_allow_html=True)
+
+                # 各策略狀態 (簡潔)
+                for _s in _strategies:
+                    _sn = _s["name"]
+                    _trig = _s.get("triggered", False)
+                    _skip = _s.get("skip_reason", "")
+                    _emoji = "✅" if _trig else "⛔"
+                    _reason = _skip if _skip else ("TRADE" if _trig else "?")
+                    # Truncate long reasons
+                    if len(_reason) > 35:
+                        _reason = _reason[:32] + "..."
+                    st.markdown(f"<div style='font-size:11px;color:#94a3b8;margin:1px 0'>{_emoji} <b>{_sn}</b> — {_reason}</div>",
+                                unsafe_allow_html=True)
+            else:
+                st.caption("🧠 Router Trace 檔案為空")
+        else:
+            st.caption("🧠 無 Router Trace 資料")
+    except Exception:
+        st.caption("🧠 讀取 Router Trace 失敗")
+
     st.divider()
 
     if st.button("🔄 強制刷新頁面"):
@@ -1990,8 +2060,8 @@ def _monitor_status():
 st.caption(f"更新: {datetime.datetime.now().strftime('%H:%M:%S')} | Monitor: {_monitor_status()}")
 
 # ── Tabs ──
-tab_overview, tab_futures, tab_options, tab_stocks, tab_pipeline, tab_settings = st.tabs([
-    "總覽", "期貨 TMF", "選擇權 TXO", "台股 Stocks", "策略管道", "設定"
+tab_overview, tab_futures, tab_options, tab_stocks, tab_pipeline, tab_volatility, tab_settings = st.tabs([
+    "總覽", "期貨 TMF", "選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "設定"
 ])
 
 # ════════════════════════════════════════
@@ -2155,7 +2225,7 @@ with tab_overview:
                 
                 ov_data.append({
                     "代號": ticker,
-                    "名稱": last.get("name", "Unknown"),
+                    "名稱": _STOCK_NAMES.get(ticker) or last.get("name", ticker),
                     "股價": last.get('close', last.get('Close', 0)),
                     "量": volume_display,
                     "Score": round(last.get('score', 0), 1),
@@ -2233,6 +2303,48 @@ with tab_futures:
         elif pd.notna(last_ts):
             st.caption(f"🟢 即時 · {last_ts.strftime('%m/%d %H:%M')} · {session_label}")
 
+        # [V-Model] MTS mode badge
+        try:
+            with open("config/futures.yaml") as _f:
+                _futures_cfg = yaml.safe_load(_f)
+            _mts_enabled = _futures_cfg.get("mts", {}).get("enabled", False) if _futures_cfg else False
+        except Exception:
+            _mts_enabled = False
+        if _mts_enabled:
+            mts_col1, mts_col2 = st.columns([3, 1])
+            with mts_col1:
+                st.markdown(
+                    f"🔧 **MTS MODE**  ·  <span style='font-size:11px;color:#94a3b8'>"
+                    f"ATR 自適應價差系統</span>",
+                    unsafe_allow_html=True,
+                )
+            with mts_col2:
+                # ── Dynamic Spread Judgment ──
+                _sz = last.get("spread_z", 0.0)
+                if pd.isna(_sz): _sz = 0.0
+                
+                # Logic: If z is positive, sell the wide spread. If negative, buy the narrow spread.
+                _side = "SELL_NEAR_BUY_FAR" if _sz >= 0 else "BUY_NEAR_SELL_FAR"
+                _action_name = "賣出" if _sz >= 0 else "買進"
+                _btn_color = "error" if _sz >= 0 else "primary" # Red for sell, blue/green for buy
+                
+                if st.button(f"🔬 強制{_action_name}價差 (Z={_sz:.1f})", key="force_spread_trade", type="primary", use_container_width=True):
+                    _flag_path = "/tmp/futures_manual_trade.flag"
+                    _flag_near = last.get("near_close", 41800)
+                    _flag_far = last.get("far_close", 41900)
+                    _flag = json.dumps({
+                        "action": "spread",
+                        "side": _side,
+                        "ts": datetime.datetime.now().isoformat(),
+                        "near_close": _flag_near,
+                        "far_close": _flag_far,
+                        "spread_z": _sz
+                    })
+                    with open(_flag_path, "w") as _f:
+                        _f.write(_flag)
+                    st.success(f"手動{_action_name}指令已送出 (Z={_sz:.1f})，等待消費...")
+                    st.rerun()
+
         fc1, fc2, fc3, fc4, fc5, fc6 = st.columns(6)
 
         # 只有在資料新鮮時才顯示 bias/Sqz，否則顯示灰色「待更新」
@@ -2291,6 +2403,11 @@ with tab_futures:
         fc5.metric("噴發向", bias)
         fc6.metric("突破強度", bs_label)
 
+        # [P1] Single Source of Truth: Router Perspective
+        r_bias = last.get("router_bias", "N/A")
+        r_regime = last.get("router_regime", "N/A")
+        st.caption(f"🎯 **Router Ground Truth**: Regime=`{r_regime}` | Bias=`{r_bias}`")
+
         # ATR reference — show calculation chain for breakout_strength debug
         atr_val = last.get("atr", 0.0) or 0.0
         atr_raw = last.get("atr_raw", atr_val) or atr_val
@@ -2336,7 +2453,131 @@ with tab_futures:
             )
             st.info("⚠️ 未找到遠月資料，僅顯示近月價格")
         
-        st.dataframe(f_df.tail(20), use_container_width=True)
+        # ═══ Strategy-Annotated Indicator Table ═══════════════════════════
+        # Group indicator columns by which strategy uses them, sort by group.
+        _strategy_indicator_groups = {
+            "📊 Squeeze": {
+                "sqz_on", "sqz_fire", "fired", "momentum",
+                "bb_up", "bb_upper", "bb_low", "bb_lower", "bb_mid", "bb_middle",
+                "lr_curve",
+            },
+            "📈 Trend": {
+                "adx", "ema_fast", "ema_slow", "mom_velo", "mom_state",
+                "breakout_strength", "breakout_strength_atr",
+                "body_size_atr",
+            },
+            "🔁 MeanRev": {
+                "rsi", "bb_up", "bb_upper", "bb_low", "bb_lower", "bb_mid", "bb_middle",
+            },
+            "🧠 ML/Feature": {
+                "macd_hist", "macd_rising", "score",
+                "bearish_align", "bullish_align", "bear_align", "bull_align",
+            },
+            "🌊 Spread": {
+                "spread_z", "spread_std", "vwap_z", "far_close",
+                "is_night_session", "bars_from_session_open", "bars_since_open",
+            },
+        }
+        # Common indicators used by many strategies — group under general
+        _general_cols = {"atr", "vwap", "volume_spike", "price_vs_vwap",
+                         "recent_high", "recent_low"}
+        # Router / meta columns — always at end
+        _meta_cols = {"regime", "router_regime", "bias", "router_bias",
+                      "trading_day", "session", "timestamp", "bars_since_open"}
+
+        def _group_key(col: str) -> int:
+            """Return sort key: general(0) → squeeze(1) → trend(2) → meanrev(3) → ml(4) → spread(5) → meta(6) → other(9)"""
+            if col.lower() in {"open", "high", "low", "close", "volume", "amount"}:
+                return -2
+            if col in _general_cols:
+                return -1
+            for i, (_, cols) in enumerate(_strategy_indicator_groups.items()):
+                if col in cols:
+                    return i
+            if col in _meta_cols:
+                return 6
+            return 9
+
+        def _strategy_label(col: str) -> str:
+            if col.lower() in {"open", "high", "low", "close", "volume", "amount"}:
+                return ""
+            if col in _general_cols:
+                return "共用"
+            for group_name, cols in _strategy_indicator_groups.items():
+                if col in cols:
+                    return group_name
+            if col in _meta_cols:
+                return "📋 Router"
+            return ""
+
+        # Build column order
+        _available_cols = [c for c in f_df.columns]
+        _display_cols = sorted(_available_cols, key=_group_key)
+
+        # Build strategy header row (one label per column)
+        _header_labels = [_strategy_label(c) for c in _display_cols]
+
+        # Render as HTML table with strategy annotation row
+        # Merge consecutive identical labels into colspan blocks
+        _merged_labels = []
+        _merged_spans = []
+        for lbl in _header_labels:
+            if _merged_labels and _merged_labels[-1] == lbl:
+                _merged_spans[-1] += 1
+            else:
+                _merged_labels.append(lbl)
+                _merged_spans.append(1)
+
+        _color_map = {
+            "": "#f5f5f5",
+            "共用": "#e3f2fd",
+            "📊 Squeeze": "#fff3e0",
+            "📈 Trend": "#e8f5e9",
+            "🔁 MeanRev": "#fce4ec",
+            "🧠 ML/Feature": "#f3e5f5",
+            "🌊 Spread": "#e0f7fa",
+            "📋 Router": "#eeeeee",
+        }
+        _html_parts = ["<div style='overflow-x:auto; max-height:600px; overflow-y:auto;'>"
+                       "<table style='border-collapse:collapse; font-family:monospace; font-size:11px;'>"]
+
+        # Row 1: Strategy annotation (merged colspan)
+        _html_parts.append("<tr style='font-size:10px; line-height:1.3;'>")
+        for lbl, span in zip(_merged_labels, _merged_spans):
+            bg = _color_map.get(lbl, "#f5f5f5")
+            txt = f"<b>{lbl}</b>" if lbl else ""
+            _html_parts.append(
+                f"<td colspan='{span}' style='padding:2px 4px; white-space:nowrap; "
+                f"text-align:center; background-color:{bg}; "
+                f"border:1px solid #bbb; font-size:10px;'>{txt}</td>"
+            )
+        _html_parts.append("</tr>")
+
+        # Row 2: Column names
+        _html_parts.append("<tr style='font-size:10px; line-height:1.3;'>")
+        for c in _display_cols:
+            # Shorten column name for display
+            _cn = c.replace("_", " ").title()
+            _html_parts.append(
+                f"<td style='padding:2px 4px; white-space:nowrap; text-align:center; "
+                f"background-color:#fafafa; border:1px solid #bbb; font-weight:bold;'>{_cn}</td>"
+            )
+        _html_parts.append("</tr>")
+
+        # Data rows (last 20, most recent on top)
+        _tail = f_df[_display_cols].tail(20).iloc[::-1]
+        for _, row in _tail.iterrows():
+            _html_parts.append("<tr>")
+            for c in _display_cols:
+                v = row[c] if pd.notna(row[c]) else ""
+                _html_parts.append(
+                    f"<td style='padding:1px 4px; white-space:nowrap; text-align:right; "
+                    f"border:1px solid #ddd;'>{v}</td>"
+                )
+            _html_parts.append("</tr>")
+
+        _html_parts.append("</table></div>")
+        st.markdown("".join(_html_parts), unsafe_allow_html=True)
     else:
         st.info("無數據")
     
@@ -2432,7 +2673,7 @@ with tab_futures:
                 st.plotly_chart(spread_chart, use_container_width=True)
             
             # 顯示價差資料表格
-            with st.expander("📋 價差資料明細"):
+            with st.expander("🔧 Debug: Raw Calendar Spread CSV", expanded=False):
                 # 只顯示重要欄位
                 display_cols = ["timestamp", "Close_near", "Close_far", "spread", "spread_z", "spread_ma", "spread_std"]
                 available_cols = [col for col in display_cols if col in spread_df.columns]
@@ -2453,6 +2694,53 @@ with tab_futures:
             - 執行 `scripts/fetch_calendar_spread_data_fixed.py` 收集遠月資料
             - 檢查 `data/` 目錄是否有 `*spread*.csv` 或 `*far*.csv` 檔案
             """)
+    
+    # ── MTS Position State (from tmf_spread plugin) ──
+    _mts_state_file = "/tmp/mts_position_state.json"
+    if os.path.exists(_mts_state_file):
+        try:
+            with open(_mts_state_file) as _f:
+                _mts_state = json.loads(_f.read())
+            _has_pos = _mts_state.get("has_position", False)
+            if _has_pos:
+                st.header("MTS 價差持倉 (tmf_spread)")
+                _c1, _c2, _c3, _c4 = st.columns(4)
+                _c1.metric("近月進場", f'{_mts_state.get("near_entry", 0):.0f}')
+                _c2.metric("遠月進場", f'{_mts_state.get("far_entry", 0):.0f}')
+                _c3.metric("Spread Z", f'{_mts_state.get("spread_z", 0):.2f}')
+                _rel = _mts_state.get("released_leg")
+                _rel_label = "無" if _rel is None else f'{_rel}已釋放'
+                _c4.metric("釋放狀態", _rel_label)
+                _c5, _c6 = st.columns(2)
+                _direction = _mts_state.get("action", "?")
+                if _direction == "?" or _direction is None:
+                    _direction = "FLAT" if not _has_pos else "?"
+                _c5.metric("方向", _direction)
+                _c6.metric("理由", _mts_state.get("reason", "?"))
+
+                # ── Unrealized PnL Breakdown ──
+                st.markdown("**MTS 未實現損益 (Unrealized PnL)**")
+                _u1, _u2, _u3 = st.columns(3)
+                _nr = _mts_state.get("near_upl", 0)
+                _fr = _mts_state.get("far_upl", 0)
+                _tr = _mts_state.get("total_upl", 0)
+                _u1.metric("近月 UPL", f"{_nr:+,.0f} TWD")
+                _u2.metric("遠月 UPL", f"{_fr:+,.0f} TWD")
+                _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
+
+                st.caption(f'最後更新: {_mts_state.get("_updated", "?")}')
+            else:
+                # ── FLAT / IDLE state: show mts_spread_z (bar-agnostic) and gate status ──
+                _z = _mts_state.get("mts_spread_z") or _mts_state.get("spread_z")
+                _z_str = f"{_z:.2f}" if _z is not None else "N/A"
+                _reason = _mts_state.get("reason", "?")
+                st.caption(
+                    "MTS 狀態: FLAT / WAITING_FOR_SIGNAL  "
+                    f"Spread Z={_z_str}  "
+                    f"原因: {_reason}"
+                )
+        except Exception:
+            pass
     
     ft, _ = load_futures_trades()
     if ft is not None and not ft.empty:
@@ -2509,8 +2797,17 @@ with tab_futures:
         order_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
 
         if order_files and order_files[0].exists():
-            with open(order_files[0], "r", encoding="utf-8") as f:
-                orders_data = json.load(f)
+            try:
+                with open(order_files[0], "r", encoding="utf-8") as f:
+                    orders_data = json.load(f)
+            except (json.JSONDecodeError, UnicodeDecodeError) as _je:
+                st.error(f"📤 Order status JSON 損毀: {_je}")
+                console.print(f"[red][OrderStatus] JSON load failed: {_je} — deleting corrupt file[/red]")
+                try:
+                    os.remove(order_files[0])
+                except Exception:
+                    pass
+                orders_data = []
 
             if orders_data:
                 # Get LIVE price from the same data source as charts
@@ -2628,7 +2925,215 @@ with tab_futures:
                     c3.metric("⏳ 排隊中", pending)
                     c4.metric("🚫 已取消/退單", cancelled)
             else:
-                st.info("今日尚無委託單記錄")
+                # ── Check MTS spread position as fallback ──
+                _mts_fallback_shown = False
+                _mts_state_file = "/tmp/mts_position_state.json"
+                _mts_state = {}  # [Fix] Initialize to prevent NameError if file doesn't exist
+                if os.path.exists(_mts_state_file):
+                    try:
+                        with open(_mts_state_file) as _f:
+                            _mts_state = json.loads(_f.read())
+                        # ── Account equity (from heartbeat) ──
+                        _bal = _mts_state.get("balance")
+                        _init_bal = _mts_state.get("initial_balance", 100000)
+                        _has_pos = _mts_state.get("has_position", False)
+                        # [Fix] FLAT + no position = balance must equal initial_balance
+                        if not _has_pos:
+                            _bal = _init_bal
+                        if _bal is not None:
+                            _equity_row = st.columns([1, 1, 2])
+                            _equity_row[0].metric("初始資金", f"{_init_bal:,.0f}")
+                            _equity_row[1].metric("目前現金", f"{_bal:,.0f}")
+                            _pnl_total = _bal - _init_bal
+                            _equity_row[2].metric("總損益", f"{_pnl_total:+,.0f}", delta=f"{_pnl_total/_init_bal*100:+.1f}%")
+                        if _mts_state.get("has_position", False):
+                            _mts_fallback_shown = True
+                            # Build per-leg status display
+                            _st = _mts_state.get("state", "?")
+                            _rs = _mts_state.get("release_state", "BOTH_HELD")
+                            _rel = _mts_state.get("released_leg")
+                            _rem = _mts_state.get("remaining_leg")
+                            _rems = _mts_state.get("remaining_side", "?")
+                            _nr = _mts_state.get("near_realized_pnl", 0)
+                            _fr = _mts_state.get("far_realized_pnl", 0)
+                            _ne = _mts_state.get("near_entry", 0)
+                            _fe = _mts_state.get("far_entry", 0)
+                            _nl = _mts_state.get("near_last", 0)
+                            _fl = _mts_state.get("far_last", 0)
+                            _nu = _mts_state.get("near_upl", 0)
+                            _fu = _mts_state.get("far_upl", 0)
+                            _tu = _mts_state.get("total_upl", 0)
+                            _tr = _mts_state.get("total_realized_pnl", 0)
+                            _sz = _mts_state.get("spread_z", 0)
+                            _rson = _mts_state.get("reason", "?")
+                            _ts = _mts_state.get("_updated", "?")[-8:] if _mts_state.get("_updated") else "?"
+                            _rs_label = {"BOTH_HELD": "雙腿持倉", "NEAR_RELEASED": "近月已釋放", "FAR_RELEASED": "遠月已釋放"}.get(_rs, _rs)
+                            st.markdown(f"**MTS Calendar Spread** · `{_st}` · `{_rs_label}` · {_ts}")
+                            # Build header explaining release state
+                            if _rel:
+                                st.caption(f"Released leg: {_rel.upper()} | Remaining leg: {_rem} {_rems}")
+                            # Near leg row
+                            _near_label = f"近月"
+                            _near_side = _mts_state.get("near_side") or "—"
+                            _near_val = f"{_ne:.0f}"
+                            _near_now = "—" if _mts_state.get("near_status") == "RELEASED" else f"{_nl:.0f}"
+                            _near_pnl = f"{_nr:+.1f}" if _mts_state.get("near_status") == "RELEASED" else f"{_nu:+.1f}"
+                            _near_pnl_lbl = "已實現" if _mts_state.get("near_status") == "RELEASED" else "未實現"
+                            # Far leg row
+                            _far_label = f"遠月"
+                            _far_side = _mts_state.get("far_side") or "—"
+                            _far_val = f"{_fe:.0f}"
+                            _far_now = "—" if _mts_state.get("far_status") == "RELEASED" else f"{_fl:.0f}"
+                            _far_pnl = f"{_fr:+.1f}" if _mts_state.get("far_status") == "RELEASED" else f"{_fu:+.1f}"
+                            _far_pnl_lbl = "已實現" if _mts_state.get("far_status") == "RELEASED" else "未實現"
+                            _mts_rows = [
+                                {"Leg": _near_label, "方向": _near_side, "進場": _near_val, "現價": _near_now, f"{_near_pnl_lbl}損益": _near_pnl},
+                                {"Leg": _far_label, "方向": _far_side, "進場": _far_val, "現價": _far_now, f"{_far_pnl_lbl}損益": _far_pnl},
+                            ]
+                            st.dataframe(pd.DataFrame(_mts_rows), use_container_width=True, hide_index=True)
+                            _ez = _mts_state.get("entry_spread_z")
+                            _cz = _mts_state.get("current_spread_z")
+                            if _ez is not None:
+                                st.caption(f"Entry Z: {_ez:.2f}  |  Current Z: {float(_cz):.2f}" if _cz is not None else f"Entry Z: {_ez:.2f}")
+                            _trail_s = _mts_state.get("trail_side")
+                            if _trail_s:
+                                _tp = _mts_state.get("trail_peak", 0)
+                                _tn = _mts_state.get("trail_nadir", 0)
+                                _ts_price = _mts_state.get("trail_stop_price", 0)
+                                _dist = _mts_state.get("distance_to_stop", 0)
+                                _ref_last = _fl if _trail_s == "SHORT" else _nl
+                                st.caption(f"Trail: {_trail_s} peak={_tp:.0f} nadir={_tn:.0f} stop={_ts_price:.0f} last={_ref_last:.0f} dist={_dist:.0f}pt")
+                            st.caption(f"Total UPL={_tu:+.1f}  Realized={_tr:+.1f}  Spread Z={_sz:.2f}  Reason: {_rson}")
+                        else:
+                            st.info("MTS 價差: 無持倉")
+                    except Exception:
+                        pass
+
+                # ── MTS Manual Order Status ──
+                st.markdown("**MTS Manual Order Status**")
+                _flag_path = "/tmp/futures_manual_trade.flag"
+                _flag_exists = "YES" if os.path.exists(_flag_path) else "NO"
+                _cmd_status = "RECEIVED" if os.path.exists(_flag_path) else "NONE"
+                _manual_status = _mts_state.get("manual_trade_status", "UNKNOWN")
+                
+                # Metric row 1: Command and Global MTS Status
+                _os1, _os2, _os3, _os4 = st.columns(4)
+                _os1.metric("Command", _cmd_status)
+                _os2.metric("MTS Status", _manual_status)
+                _os3.metric("Trade ID", _mts_state.get("trade_id", "—")[-6:])
+                _os4.metric("Sync Time", _mts_state.get("_updated", "?")[-8:] if _mts_state.get("_updated") else "?")
+                
+                # Metric row 2: Specific Manual Order Details
+                _m_ts = _mts_state.get("manual_order_ts", "—")
+                if _m_ts != "—" and "T" in _m_ts: _m_ts = _m_ts.split("T")[1][:8]
+                _m_type = _mts_state.get("manual_order_type", "—")
+                _m_filled = _mts_state.get("manual_order_filled", "—")
+                
+                _ms1, _ms2, _ms3, _ms4 = st.columns(4)
+                _ms1.metric("Order Time", _m_ts)
+                _ms2.metric("Order Type", _m_type)
+                _ms3.metric("Filled", _m_filled)
+                _ms4.metric("Flag Exists", _flag_exists)
+                
+                st.caption(f"Flag: {_flag_path}")
+
+                # ── MTS Spread Event Ledger ──
+                _event_log_path = os.path.join(BASE, "logs/mts_spread_events.jsonl")
+                if os.path.exists(_event_log_path):
+                    try:
+                        _events = []
+                        with open(_event_log_path) as _f:
+                            for _line in _f:
+                                _line = _line.strip()
+                                if _line:
+                                    _events.append(json.loads(_line))
+                        if _events:
+                            # Show last 10 events, newest first
+                            _events = _events[-10:][::-1]
+                            st.markdown("**MTS Spread Event History**")
+                            _event_rows = []
+                            for _ev in _events:
+                                _et = _ev.get("event", "?")
+                                _ets = _ev.get("ts", "?")[-8:] if _ev.get("ts") else "?"
+                                _detail = "; ".join(f"{k}={v}" for k, v in _ev.items() if k not in ("event", "ts"))
+                                _event_rows.append({"Time": _ets, "Event": _et, "Detail": _detail[:120]})
+                            st.dataframe(pd.DataFrame(_event_rows), use_container_width=True, hide_index=True)
+                    except Exception:
+                        pass
+                if not _mts_fallback_shown:
+                    st.info("MTS 為 FLAT / IDLE 狀態：tick loop 正常，尚未達到進場條件，因此沒有委託或持倉。")
+
+                _fill_log_path = os.path.join(BASE, "logs/mts_trade_fills.jsonl")
+                if os.path.exists(_fill_log_path):
+                    try:
+                        _fills = []
+                        with open(_fill_log_path) as _f:
+                            for _line in _f:
+                                _line = _line.strip()
+                                if not _line: continue
+                                try:
+                                    _fills.append(json.loads(_line))
+                                except:
+                                    continue
+                        if _fills:
+                            _fills = _fills[-40:][::-1]  # Show last 40 for more history
+                            st.markdown("**MTS Trade Fills**")
+                            _fill_rows = []
+                            for _fl in _fills:
+                                try:
+                                    _fl_ts = _fl.get("timestamp", "")
+                                    if _fl_ts:
+                                        try: _fl_ts = _fl_ts[:19].replace("T", " ")
+                                        except: pass
+                                    else:
+                                        _fl_ts = "?"
+                                    
+                                    _fl_ticker = _fl.get("ticker", "?")
+                                    _fl_leg = _fl.get("leg", "?")
+                                    _fl_contract = _fl.get("contract", "")
+                                    
+                                    # Build readable ticker
+                                    _fl_ticker_display = _fl_ticker
+                                    if _fl_contract and _fl_contract not in ("NEAR", "FAR"):
+                                        _fl_ticker_display = f"{_fl_ticker}{_fl_contract}"
+                                    elif _fl_leg == "NEAR":
+                                        _fl_ticker_display = "MXF05"
+                                    elif _fl_leg == "FAR":
+                                        _fl_ticker_display = "MXF06"
+                                    
+                                    _fl_side = _fl.get("side", "?")
+                                    _fl_qty = _fl.get("qty", 0)
+                                    _fl_price = _fl.get("price", 0)
+                                    _fl_pnl = _fl.get("realized_pnl")
+                                    
+                                    # Robust numeric conversion
+                                    try:
+                                        if isinstance(_fl_qty, str): _fl_qty = float(_fl_qty)
+                                        if isinstance(_fl_price, str): _fl_price = float(_fl_price)
+                                        if isinstance(_fl_pnl, str): _fl_pnl = float(_fl_pnl)
+                                    except: pass
+
+                                    _fl_type = _fl.get("fill_type", "?")
+                                    _fl_tid = _fl.get("trade_id", "?")
+                                    
+                                    _fill_rows.append({
+                                        "時間": _fl_ts,
+                                        "Ticker": _fl_ticker_display,
+                                        "Leg": _fl_leg,
+                                        "Side": _fl_side,
+                                        "Qty": int(_fl_qty) if isinstance(_fl_qty, (int, float)) else _fl_qty,
+                                        "Price": f"{_fl_price:.1f}" if isinstance(_fl_price, (int, float)) else _fl_price,
+                                        "Type": _fl_type,
+                                        "損益": f"{_fl_pnl:+.1f}" if isinstance(_fl_pnl, (int, float)) else "",
+                                        "Trade ID": _fl_tid,
+                                    })
+                                except Exception:
+                                    continue
+                                    
+                            if _fill_rows:
+                                st.dataframe(pd.DataFrame(_fill_rows), use_container_width=True, hide_index=True)
+                    except Exception:
+                        pass
         else:
             st.info("委託單檔案尚未建立 (Order Lifecycle 未啟用)")
 
@@ -3843,6 +4348,153 @@ with tab_settings:
                     st.error(f"清空失敗: {e}")
 
     st.info("💡 提示: 部分進階設定可直接編輯 `config/*.yaml` 檔案。")
+
+# ════════════════════════════════════════
+# Tab: 波動率 Vol
+# ════════════════════════════════════════
+with tab_volatility:
+    st.header("📊 Volatility Surface Regime")
+    st.caption("IV curve shape classification + Volatility State Machine")
+
+    try:
+        from core.derivatives.skew_regime_logger import SkewRegimeLogger
+        logger = SkewRegimeLogger()
+        records = logger.read_today()
+    except Exception:
+        records = []
+
+    if not records:
+        st.warning("無 volatility 資料 (市場未開盤或資料尚未就緒)")
+    else:
+        # Latest record
+        latest = records[-1]
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            vol_state = latest.get("vol_state", "UNKNOWN")
+            state_emoji = {
+                "CALM": "🟢", "NORMAL": "🔵", "EXPANDING": "🟡",
+                "PANIC": "🔴", "EUPHORIA": "🟠", "EVENT": "⚫", "UNKNOWN": "⚪",
+            }.get(vol_state, "⚪")
+            st.metric(
+                "Volatility State",
+                f"{state_emoji} {vol_state}",
+                f"{latest.get('vol_state_age_sec', 0)}s persistent={latest.get('vol_state_persistent', False)}",
+            )
+        with col2:
+            st.metric(
+                "Directional Skew",
+                latest.get("directional_skew", "?"),
+                f"slope_ratio={latest.get('slope_ratio', 0):.3f}",
+            )
+        with col3:
+            st.metric(
+                "Tension",
+                latest.get("tension", "?"),
+                f"atm_iv_change={latest.get('atm_iv_change', 0):.3f}",
+            )
+
+        # Detail row
+        col4, col5, col6, col7 = st.columns(4)
+        with col4:
+            st.metric(
+                "IV Percentile",
+                f"{latest.get('iv_percentile', 0):.0%}",
+                f"z={latest.get('iv_zscore', 0):.1f}",
+            )
+        with col5:
+            st.metric(
+                "ATM IV",
+                f"{latest.get('atm_iv', 0):.1%}",
+            )
+        with col6:
+            st.metric(
+                "OTM Put IV",
+                f"{latest.get('otm_put_iv', 0):.1%}",
+            )
+        with col7:
+            st.metric(
+                "OTM Call IV",
+                f"{latest.get('otm_call_iv', 0):.1%}",
+            )
+
+        # Transition info
+        col8, col9 = st.columns(2)
+        with col8:
+            st.metric("Transitions Today", latest.get("vol_state_transition_count", 0))
+        with col9:
+            confidence = latest.get("confidence", 0)
+            if confidence >= 0.7:
+                st.success(f"Confidence: {confidence:.0%}")
+            elif confidence >= 0.4:
+                st.warning(f"Confidence: {confidence:.0%}")
+            else:
+                st.error(f"Confidence: {confidence:.0%}")
+
+        # Time series: last N records
+        st.subheader("State Timeline")
+        n_show = min(50, len(records))
+        timeline_data = []
+        for r in records[-n_show:]:
+            timeline_data.append({
+                "time": r.get("timestamp", "")[:19] if r.get("timestamp") else "",
+                "state": r.get("vol_state", "?"),
+                "skew": r.get("directional_skew", "?"),
+                "tension": r.get("tension", "?"),
+                "pct": r.get("iv_percentile", 0),
+                "conf": r.get("confidence", 0),
+            })
+
+        if timeline_data:
+            st.dataframe(
+                timeline_data,
+                column_config={
+                    "time": "Time",
+                    "state": "State",
+                    "skew": "Skew",
+                    "tension": "Tension",
+                    "pct": st.column_config.ProgressColumn("IV %ile", format="%.0%", max_value=1),
+                    "conf": st.column_config.ProgressColumn("Confidence", format="%.0%", max_value=1),
+                },
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            # Agg stats
+            states = [r.get("state", "?") for r in timeline_data]
+            state_counts = {}
+            for s in states:
+                state_counts[s] = state_counts.get(s, 0) + 1
+            st.caption(f"State distribution (last {n_show} samples): {state_counts}")
+
+    with st.expander("ℹ️ About Volatility Regime"):
+        st.markdown("""
+        **Volatility Surface Regime** 是介於 raw tick stream (P1) 和 strategy layer (P3) 之間的 P1.5 層。
+
+        **Data Flow:**
+        ```
+        bidask callback → OptionQuoteEvent
+                        → IV Calculator (Black-Scholes)
+                        → Surface Snapshot (atm_iv, otm_put_iv, otm_call_iv)
+                        → IVShapeClassifier (directional_skew + tension)
+                        → IVPercentileEngine (rolling percentile + z-score)
+                        → VolatilityStateMachine (hysteresis + state_age)
+                        → MarketData.skew_regime
+        ```
+
+        **State Definitions:**
+        - CALM — Low IV percentile, low tension
+        - NORMAL — Moderate conditions
+        - EXPANDING — Tension rising (pre-cursor)
+        - PANIC — LEFT skew + HIGH tension + high percentile
+        - EUPHORIA — RIGHT skew + HIGH tension + high percentile
+        - EVENT — Extreme tension regardless of direction
+        - UNKNOWN — Insufficient data
+
+        **Hysteresis:** entry=3 samples, exit=5 samples, min dwell=60s
+        """)
+
+    st.divider()
 
 # ── Footer and Refresh ──
 refresh = 30

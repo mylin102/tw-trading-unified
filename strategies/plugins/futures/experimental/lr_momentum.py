@@ -46,6 +46,10 @@ class LRMomentum(StrategyBase):
 
     def on_bar(self, context: StrategyContext) -> Signal | None:
         bar = context.market.last_bar
+        if not bar:
+            self._set_eval(skip_reason="NO_BAR")
+            return None
+
         close = bar.get("Close", 0.0)
         slope = bar.get("lr_slope", 0.0)
         curve = bar.get("lr_curve", 0.0)
@@ -54,6 +58,7 @@ class LRMomentum(StrategyBase):
         # Entry Logic: Accelerating Strength
         if context.position.size == 0:
             if slope > self.slope_threshold and curve > self.curve_threshold:
+                self._set_eval(triggered=True, action="BUY", reason="LR_ACCEL_UP")
                 return Signal(
                     "BUY", "LR_ACCEL_UP", 
                     stop_loss=close - atr * self.atr_mult, 
@@ -61,18 +66,25 @@ class LRMomentum(StrategyBase):
                     confidence=0.75
                 )
             elif slope < -self.slope_threshold and curve < -self.curve_threshold:
+                self._set_eval(triggered=True, action="SELL", reason="LR_ACCEL_DOWN")
                 return Signal(
                     "SELL", "LR_ACCEL_DOWN", 
                     stop_loss=close + atr * self.atr_mult, 
                     target=close - atr * self.atr_mult * 3, 
                     confidence=0.75
                 )
+            else:
+                self._set_eval(skip_reason="NO_ACCEL", slope=slope, curve=curve)
         
         # Exit Logic: Deceleration / Bending Back
         elif context.position.size > 0 and curve < -self.curve_threshold:
+            self._set_eval(triggered=True, action="EXIT", reason="LR_DECEL")
             return Signal(action="EXIT", reason="LR_DECEL", stop_loss=0)
         elif context.position.size < 0 and curve > self.curve_threshold:
+            self._set_eval(triggered=True, action="EXIT", reason="LR_DECEL")
             return Signal(action="EXIT", reason="LR_DECEL", stop_loss=0)
+        else:
+            self._set_eval(skip_reason="POSITION_OPEN", curve=curve)
 
         return None
 

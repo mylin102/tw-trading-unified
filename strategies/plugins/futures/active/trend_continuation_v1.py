@@ -22,6 +22,7 @@ import logging
 from typing import Any
 from datetime import datetime
 
+import pandas as pd
 from core.strategy_base import StrategyBase
 from core.strategy_context import StrategyContext
 from core.signal import Signal
@@ -66,12 +67,23 @@ class TrendContinuationV1(StrategyBase):
     def on_bar(self, context: StrategyContext) -> Signal | None:
         bar = context.market.last_bar
         if not bar:
+            self._set_eval(skip_reason="NO_BAR")
             return None
 
         # ── 1. Position & Time Stop Guard ──
         pos_size = context.position.size
-        ts_str = bar.get("timestamp", "")
-        now = datetime.fromisoformat(ts_str) if ts_str else datetime.now()
+        
+        # Safe timestamp handling
+        ts_raw = bar.get("timestamp")
+        if isinstance(ts_raw, datetime):
+            now = ts_raw
+        elif isinstance(ts_raw, str) and ts_raw:
+            now = datetime.fromisoformat(ts_raw)
+        elif isinstance(ts_raw, pd.Timestamp):
+            now = ts_raw.to_pydatetime()
+        else:
+            now = datetime.now()
+
         close = float(bar.get("Close", 0))
         high = float(bar.get("High", 0))
         low = float(bar.get("Low", 0))
@@ -91,7 +103,10 @@ class TrendContinuationV1(StrategyBase):
             if elapsed_minutes >= self.max_hold_minutes and unrealized_pnl <= 0:
                 logger.info(f"[TREND_CONTINUATION_EXIT] TIME_STOP. elapsed={elapsed_minutes:.1f}m pnl={unrealized_pnl}")
                 self._reset_trade_state()
+                self._set_eval(triggered=True, action="EXIT", reason="TIME_STOP_CONTINUATION")
                 return Signal("EXIT", "TIME_STOP_CONTINUATION", confidence=1.0)
+            
+            self._set_eval(skip_reason="POSITION_OPEN", pnl=unrealized_pnl, elapsed=elapsed_minutes)
             return None
 
         # B. Handle Virtual Position Exit (Calibration 3: Shadow PnL)
@@ -121,7 +136,6 @@ class TrendContinuationV1(StrategyBase):
                 final_pnl = exit_price - v_entry
                 logger.info(f"[TC_SHADOW_RESULT] exit={exit_reason} entry={v_entry:.0f} exit_p={exit_price:.0f} pnl_pts={final_pnl:.1f} elapsed={elapsed:.1f}m")
                 self._virtual_pos = None
-                # Continue to entry check on same bar if exit occurred (optional, but keep it clean)
             else:
                 self._set_eval(skip_reason="VIRTUAL_POSITION_OPEN", pnl=v_pnl)
                 return None
@@ -138,7 +152,10 @@ class TrendContinuationV1(StrategyBase):
         ema_slow = float(bar.get("ema_slow", 0))
         breakout_strength = float(bar.get("breakout_strength", 0))
         volume_spike = float(bar.get("volume_spike", 1.0))
-        regime = str(bar.get("regime", "UNKNOWN")).upper()
+        
+        # [P1] SSOT Contract
+        regime = str(bar.get("router_regime") or bar.get("regime", "UNKNOWN")).upper()
+        
         recent_high = float(bar.get("recent_high", close))
         
         vwap_dist_atr = (close - vwap) / atr if atr > 0 else 999
@@ -159,6 +176,8 @@ class TrendContinuationV1(StrategyBase):
         if regime not in allowed_regimes:
             if score >= self.min_score:
                 log_skip("REGIME_BLOCKED")
+            else:
+                self._set_eval(skip_reason="REGIME_NOT_ALLOWED", regime=regime)
             return None
 
         # ── 4. Core Trend & Momentum Logic ──
@@ -228,7 +247,3 @@ class TrendContinuationV1(StrategyBase):
     def cleanup(self) -> None:
         self._reset_trade_state()
         self._virtual_pos = None
-
-
-    def cleanup(self) -> None:
-        pass

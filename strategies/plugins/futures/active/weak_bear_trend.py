@@ -13,6 +13,7 @@ weak_bear_trend — WEAK Regime 专用空头趋势策略.
 from __future__ import annotations
 
 import logging
+import pandas as pd
 from datetime import datetime
 from typing import Any
 
@@ -53,8 +54,10 @@ class WeakBearTrend(StrategyBase):
         # VWAP 距離門檻
         self.max_vwap_dist_atr = params.get("max_vwap_dist_atr", 0.5)
         
-        # 動能門檻 (更嚴格，確保進場品質)
-        self.min_mom_velo_bearish = params.get("min_mom_velo_bearish", -8.0)
+        # 動能門檻 — 改用 ADX + VWAP 確認趨勢存在且方向正確
+        # [Fix 2026-05-11] mom_velo 是動能加速度，在穩定空頭趨勢中趨近於 0，
+        # 導致 WEAK+SHORT 情境永遠無法進場。改為檢查趨勢強度 + 價格位置。
+        self.min_adx_bearish = params.get("min_adx_bearish", 15.0)  # ADX >= 15 代表有方向性
         
         # ADX 上限 (放寬以覆蓋強夜盤趨勢)
         self.max_adx = params.get("max_adx", 50.0)
@@ -66,7 +69,7 @@ class WeakBearTrend(StrategyBase):
         self.lookback_bars = params.get("lookback_bars", 5)
         
         # Shadow mode
-        self.shadow_mode = params.get("shadow_mode", True)
+        self.shadow_mode = params.get("shadow_mode", False)
         
         # 時間止損
         self.time_stop_minutes = params.get("time_stop_minutes", 15)
@@ -89,7 +92,8 @@ class WeakBearTrend(StrategyBase):
             self.init(context)
 
         # ═══ Warm-up Guard ═══
-        mom_state = int(bar.get("mom_state", 0))
+        _ms = bar.get("mom_state", 0)
+        mom_state = int(_ms) if not pd.isna(_ms) else 0
         if mom_state == 999:
             self._set_eval(skip_reason="INDICATORS_WARMING_UP", mom_state=999)
             return None
@@ -232,17 +236,23 @@ class WeakBearTrend(StrategyBase):
             self._set_eval(skip_reason="TOO_FAR_FROM_VWAP", vwap_dist_atr=vwap_dist_atr, max=self.max_vwap_dist_atr)
             return None
 
-        # ── 8. 動能確認 ──
-        if mom_velo >= self.min_mom_velo_bearish:
-            self._set_eval(skip_reason="MOM_VELO_NOT_BEARISH_ENOUGH", mom_velo=mom_velo, min=self.min_mom_velo_bearish)
+        # ── 8. 趨勢確認 — 取代 mom_velo 加速度檢查 ──
+        # [Fix 2026-05-11] mom_velo = momentum_5.diff() 是加速度，穩定趨勢中 ~0。
+        # 改用 ADX (趨勢強度) + VWAP (價格位置) 確認空頭方向存在。
+        momentum_valid = (adx >= self.min_adx_bearish) and (close < vwap or price_vs_vwap < 0)
+        if not momentum_valid:
+            self._set_eval(skip_reason="TREND_NOT_CONFIRMED", adx=adx, min_adx=self.min_adx_bearish, close_lt_vwap=close < vwap)
             return None
 
         # ── 9. EMA 排列 ──
         ema_bearish = close < ema_fast < ema_slow if ema_fast > 0 and ema_slow > 0 else False
         
         # ── 10. 成交量確認 ──
-        if volume_spike < self.min_vol_spike:
-            self._set_eval(skip_reason="VOLUME_TOO_LOW", volume_spike=volume_spike)
+        # [Night Fix] Relax volume for night session
+        is_night = bar.get("is_night_session", False)
+        _vol_thresh = 0.8 if is_night else self.min_vol_spike
+        if volume_spike < _vol_thresh:
+            self._set_eval(skip_reason="VOLUME_TOO_LOW", volume_spike=volume_spike, threshold=_vol_thresh)
             return None
 
         # ── 11. 信號發射 ──

@@ -47,6 +47,7 @@ class OpeningRangeBreakout(StrategyBase):
     def on_bar(self, context: StrategyContext) -> Signal | None:
         bar = context.market.last_bar
         if not bar:
+            self._set_eval(skip_reason="NO_BAR")
             return None
 
         close = bar.get("Close", 0.0)
@@ -68,14 +69,21 @@ class OpeningRangeBreakout(StrategyBase):
             self._bar_count += 1
             if self._bar_count >= self.range_bars:
                 self._range_built = True
+            self._set_eval(skip_reason="ORB_BUILDING", bars=self._bar_count)
             return None
 
         if self._signaled:
+            self._set_eval(skip_reason="ALREADY_SIGNALED")
+            return None
+        
+        if context.position.size != 0:
+            self._set_eval(skip_reason="POSITION_OPEN", position=context.position.size)
             return None
 
         # Breakout logic
-        if close > self._range_high and context.position.size <= 0:
+        if close > self._range_high:
             self._signaled = True
+            self._set_eval(triggered=True, action="BUY", reason="ORB_UP_BREAKOUT")
             return Signal(
                 "BUY",
                 "ORB_UP_BREAKOUT",
@@ -84,8 +92,9 @@ class OpeningRangeBreakout(StrategyBase):
                 confidence=0.68,
             )
 
-        if close < self._range_low and context.position.size >= 0:
+        if close < self._range_low:
             self._signaled = True
+            self._set_eval(triggered=True, action="SELL", reason="ORB_DOWN_BREAKOUT")
             return Signal(
                 "SELL",
                 "ORB_DOWN_BREAKOUT",
@@ -94,6 +103,7 @@ class OpeningRangeBreakout(StrategyBase):
                 confidence=0.68,
             )
 
+        self._set_eval(skip_reason="NO_BREAKOUT", close=close, range=[self._range_low, self._range_high])
         return None
 
     def cleanup(self) -> None:
