@@ -1,10 +1,12 @@
 """
 OptionQuoteEvent — generic quote event for option surface engine.
 SkewSignal — output signal consumed by strategy layer.
+SurfaceSnapshot — IV surface snapshot for shape classification.
 
 Design: event-driven, not field-specific. Engine only reads symbol, strike,
 option_type, and mid price — adding strikes doesn't change the event schema.
 """
+
 from __future__ import annotations
 
 import datetime
@@ -67,3 +69,25 @@ class SkewSignal:
             "timestamp": str(self.timestamp) if self.timestamp else None,
             "underlying_price": self.underlying_price,
         }
+
+
+@dataclass
+class SurfaceSnapshot:
+    """IV surface snapshot — output of OptionSurfaceEngine.surface_snapshot().
+
+    Contains structured IV data for shape classification and consumption
+    by the SkewRegime pipeline.
+    """
+    atm_iv: float = 0.0
+    otm_put_iv: float = 0.0
+    otm_call_iv: float = 0.0
+    atm_strike: float = 0.0
+    otm_put_strike: float = 0.0
+    otm_call_strike: float = 0.0
+    underlying_price: float = 0.0
+    dte: float = 0.0
+    timestamp: Optional[datetime.datetime] = None
+
+    def is_valid(self) -> bool:
+        """True when all three IV values are positive."""
+        return self.atm_iv > 0 and self.otm_put_iv > 0 and self.otm_call_iv > 0

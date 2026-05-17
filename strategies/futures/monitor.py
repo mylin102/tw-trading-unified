@@ -5,6 +5,7 @@ Accepts an injected Shioaji API instance (no internal login).
 import sys
 import os
 import time
+import json
 import math
 import yaml
 import traceback
@@ -166,10 +167,11 @@ class FuturesMonitor:
         self.options_monitor = None      # shared options monitor for hourly audit / repair
         
         # 💡 GSD: Market data cache for virtual ticks
-        self.market_data = {"MTX": {"close": 0.0}}
+        self.market_data = {"MTX": {"close": None}}
         self.last_tick_at = time.time()  # [gstack] 數據新鮮度追蹤 — must init before _strategy_tick()
         self._last_real_tmf_tick_at = self.last_tick_at
         self._runtime_status = None
+        self._manual_trade_status = "READY"  # [GSD] Track manual trade state (READY, PROCESSING, FILLED, FAILED)
 
         # Apply config (Initial create for Trader and OrderMgr happens here)
         self.order_mgr = None
@@ -2158,6 +2160,7 @@ class FuturesMonitor:
         
         # [Skew Integration] Compute option skew signal from quote store
         skew_signal = None
+        skew_regime = None
         if self._skew_engine is not None:
             try:
                 close_price = bar.get("close", 0) or 0
@@ -2176,8 +2179,110 @@ class FuturesMonitor:
                         )
                     else:
                         skew_signal = None
+
+                    # [Skew Integration / Phase 2] IV curve shape classification
+                    try:
+                        snapshot = self._skew_engine.surface_snapshot(
+                            futures_price=close_price,
+                        )
+                        if snapshot.is_valid():
+                            # Lazily init shape classifier on first valid snapshot
+                            if not hasattr(self, '_skew_shape_classifier') or self._skew_shape_classifier is None:
+                                from core.derivatives.shape_classifier import IVShapeClassifier
+                                self._skew_shape_classifier = IVShapeClassifier()
+                            # Lazily init IV percentile engine
+                            if not hasattr(self, '_skew_percentile') or self._skew_percentile is None:
+                                from core.derivatives.iv_percentile import IVPercentileEngine
+                                self._skew_percentile = IVPercentileEngine(
+                                    window_sec=7200, min_samples=30,
+                                )
+                            # Record ATM IV into rolling percentile window
+                            self._skew_percentile.record(atm_iv=snapshot.atm_iv)
+
+                            regime = self._skew_shape_classifier.classify(
+                                atm_iv=snapshot.atm_iv,
+                                otm_put_iv=snapshot.otm_put_iv,
+                                otm_call_iv=snapshot.otm_call_iv,
+                                underlying_price=snapshot.underlying_price,
+                                timestamp=snapshot.timestamp,
+                            )
+
+                            # Merge IV percentile / z-score into the regime dict
+                            pct = self._skew_percentile.get_percentile(
+                                atm_iv=snapshot.atm_iv,
+                            )
+                            regime.iv_percentile = pct.get("iv_percentile", 0.0)
+                            regime.iv_zscore = pct.get("iv_zscore", 0.0)
+
+                            # [VolStateMachine] Lazy init + update
+                            if not hasattr(self, '_skew_vol_state_machine') or self._skew_vol_state_machine is None:
+                                from core.derivatives.vol_state_machine import VolatilityStateMachine
+                                self._skew_vol_state_machine = VolatilityStateMachine()
+                            vol_state = self._skew_vol_state_machine.update(
+                                directional_skew=regime.directional_skew,
+                                tension=regime.tension,
+                                iv_percentile=regime.iv_percentile,
+                                confidence=regime.confidence,
+                                timestamp=regime.timestamp,
+                            )
+
+                            skew_regime = regime.to_dict()
+                            skew_regime["vol_state"] = str(vol_state.state)
+                            skew_regime["vol_state_age_sec"] = vol_state.age_sec
+                            skew_regime["vol_state_transition_count"] = vol_state.transition_count
+                            skew_regime["vol_state_persistent"] = vol_state.persistent
+
+                            logger.info(
+                                "[VolState] state=%s age=%ds persistent=%s "
+                                "transitions=%d skew=%s tension=%s "
+                                "pct=%.2f z=%.2f conf=%.2f",
+                                skew_regime.get("vol_state", "?"),
+                                skew_regime.get("vol_state_age_sec", 0),
+                                skew_regime.get("vol_state_persistent", False),
+                                skew_regime.get("vol_state_transition_count", 0),
+                                skew_regime.get("directional_skew", "?"),
+                                skew_regime.get("tension", "?"),
+                                skew_regime.get("iv_percentile", 0),
+                                skew_regime.get("iv_zscore", 0),
+                                skew_regime.get("confidence", 0),
+                            )
+
+                            # [SkewRegimeLogger] Persist every decision
+                            if not hasattr(self, '_skew_regime_logger') or self._skew_regime_logger is None:
+                                from core.derivatives.skew_regime_logger import SkewRegimeLogger
+                                self._skew_regime_logger = SkewRegimeLogger()
+                            try:
+                                self._skew_regime_logger.write(skew_regime)
+                            except Exception:
+                                pass
+                        else:
+                            # No option data — indicate UNKNOWN vol state
+                            logger.info(
+                                "[VolState] state=UNKNOWN reason=no_option_data "
+                                "atm_strike=%.0f otm_put_strike=%.0f otm_call_strike=%.0f",
+                                snapshot.atm_strike,
+                                snapshot.otm_put_strike,
+                                snapshot.otm_call_strike,
+                            )
+                            # Write UNKNOWN to JSONL too
+                            if not hasattr(self, '_skew_regime_logger') or self._skew_regime_logger is None:
+                                from core.derivatives.skew_regime_logger import SkewRegimeLogger
+                                self._skew_regime_logger = SkewRegimeLogger()
+                            try:
+                                unknown_record = {
+                                    "vol_state": "UNKNOWN",
+                                    "reason": "no_option_data",
+                                    "timestamp": str(snapshot.timestamp) if snapshot.timestamp else None,
+                                }
+                                self._skew_regime_logger.write(unknown_record)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.warning("[FuturesMonitor] shape_classifier error: %s", e)
+                        skew_regime = None
             except Exception:
                 skew_signal = None
+                skew_regime = None
 
         # [V-Model] Enrich bar with calendar spread data (spread_z, near_close, far_close)
         if self._spread_loaded:
@@ -2196,6 +2301,7 @@ class FuturesMonitor:
                 regime=session_regime,
                 flags=self._data_flags if hasattr(self, '_data_flags') and self._data_flags else None,
                 skew_signal=skew_signal,
+                skew_regime=skew_regime,
             ),
             position=PositionView(
                 size=self.trader.position,
@@ -2320,6 +2426,127 @@ class FuturesMonitor:
         )
         self.latest_router_decision = decision
         return decision, ctx, session_regime, bar_regime
+
+    def _append_mts_event(self, event_type: str, **kwargs):
+        """Append an MTS-specific event to the shared event ledger."""
+        try:
+            _dir = "logs"
+            if not os.path.exists(_dir):
+                os.makedirs(_dir, exist_ok=True)
+            path = os.path.join(_dir, "mts_spread_events.jsonl")
+            event = {"event": event_type, "ts": datetime.now().isoformat()}
+            event.update(kwargs)
+            with open(path, "a") as f:
+                f.write(json.dumps(event, default=str) + "\n")
+        except Exception:
+            pass
+
+    def _submit_mts_order_signal(self, signal, strategy, bar_dict, ts):
+        """Submit order via order_mgr for MTS signals (entry, release, exit)."""
+        if not self.order_mgr or not self.paper_fill_sim:
+            console.print("[red]⚠️ [MTS_ORDER] order_mgr not available — cannot submit order[/red]")
+            return
+        from core.order_management.order import OrderType, OrderSide
+        _action = signal.action
+        _reason = signal.reason
+        _near_close = float(bar_dict.get("near_close", 0))
+        _far_close = float(bar_dict.get("far_close", 0))
+
+        # Helper for common fields in event log
+        def _ev_meta(order):
+            return {
+                "order_id": order.order_id, "symbol": order.symbol,
+                "side": order.side.value, "type": order.order_type.value,
+                "price": order.price, "qty": order.quantity, "strategy": order.strategy
+            }
+
+        _TICK = 1.0
+        _ENTRY_BUFFER = 4
+        _EXIT_BUFFER = 10
+
+        if _action == "PARTIAL_EXIT":
+            # Release one leg — released_leg is in strategy state
+            _released = getattr(strategy, "_released_leg", None)
+            if _released == "near":
+                _side = OrderSide.BUY if getattr(strategy, "_near_side") == "SHORT" else OrderSide.SELL
+                _price = _near_close
+                _price_mkt = _price + _EXIT_BUFFER * _TICK if _side == OrderSide.BUY else _price - _EXIT_BUFFER * _TICK
+                console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_NEAR: {_side} mkt_limit={_price_mkt:.0f} (ref={_price:.0f})[/yellow]")
+                _order = self.order_mgr.create_order(symbol="MXF_NEAR", side=_side, order_type=OrderType.LIMIT, quantity=1, price=_price_mkt, strategy="MTS")
+                self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_order))
+                self.order_mgr.submit(_order)
+                self.paper_fill_sim.register(_order)
+                from types import SimpleNamespace
+                self.paper_fill_sim.process_tick(SimpleNamespace(close=_price, high=_price + 1, low=_price - 1, open=_price, volume=1))
+                console.print(f"[bold green]✅ [MTS_ORDER] RELEASE_NEAR FILLED: {_side} @ {_price:.0f}[/bold green]")
+            elif _released == "far":
+                _side = OrderSide.BUY if getattr(strategy, "_far_side") == "SHORT" else OrderSide.SELL
+                _price = _far_close
+                _price_mkt = _price + _EXIT_BUFFER * _TICK if _side == OrderSide.BUY else _price - _EXIT_BUFFER * _TICK
+                console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_FAR: {_side} mkt_limit={_price_mkt:.0f} (ref={_price:.0f})[/yellow]")
+                _order = self.order_mgr.create_order(symbol="MXF_FAR", side=_side, order_type=OrderType.LIMIT, quantity=1, price=_price_mkt, strategy="MTS")
+                self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_order))
+                self.order_mgr.submit(_order)
+                self.paper_fill_sim.register(_order)
+                from types import SimpleNamespace
+                self.paper_fill_sim.process_tick(SimpleNamespace(close=_price, high=_price + 1, low=_price - 1, open=_price, volume=1))
+                console.print(f"[bold green]✅ [MTS_ORDER] RELEASE_FAR FILLED: {_side} @ {_price:.0f}[/bold green]")
+            else:
+                console.print(f"[red]⚠️ [MTS_ORDER] PARTIAL_EXIT but released_leg is None[/red]")
+            return
+        elif _action == "EXIT":
+            # Exit remaining leg — determine which one it is from strategy state
+            _released = getattr(strategy, "_released_leg", None)
+            _remaining_side = getattr(strategy, "_side", None)
+            if _released == "near":
+                _price = _far_close
+                _symbol = "MXF_FAR"
+                _leg_label = "FAR"
+            else:
+                _price = _near_close
+                _symbol = "MXF_NEAR"
+                _leg_label = "NEAR"
+            
+            _side = OrderSide.SELL if _remaining_side == "LONG" else OrderSide.BUY
+            
+            if _remaining_side:
+                _price_mkt = _price + _EXIT_BUFFER * _TICK if _side == OrderSide.BUY else _price - _EXIT_BUFFER * _TICK
+                console.print(f"[yellow]📝 [MTS_ORDER] Submitting EXIT for {_leg_label}: {_side} mkt_limit={_price_mkt:.0f} (ref={_price:.0f})[/yellow]")
+                _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.LIMIT, quantity=1, price=_price_mkt, strategy="MTS")
+                self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_order))
+                self.order_mgr.submit(_order)
+                self.paper_fill_sim.register(_order)
+                from types import SimpleNamespace
+                self.paper_fill_sim.process_tick(SimpleNamespace(close=_price, high=_price + 1, low=_price - 1, open=_price, volume=1))
+                console.print(f"[bold green]✅ [MTS_ORDER] EXIT_REMAINING ({_symbol}) FILLED: {_side} @ {_price:.0f}[/bold green]")
+            else:
+                console.print(f"[red]⚠️ [MTS_ORDER] EXIT but remaining side is None[/red]")
+            return
+        else:
+            console.print(f"[red]⚠️ [MTS_ORDER] Unknown signal action: {_action}[/red]")
+            return
+
+        # Entry: submit two legs
+        _near_side = OrderSide.SELL if _action == "SELL_NEAR_BUY_FAR" else OrderSide.BUY
+        _far_side = OrderSide.BUY if _action == "SELL_NEAR_BUY_FAR" else OrderSide.SELL
+        _near_price = _near_close - _ENTRY_BUFFER * _TICK if _near_side == OrderSide.SELL else _near_close + _ENTRY_BUFFER * _TICK
+        _far_price = _far_close - _ENTRY_BUFFER * _TICK if _far_side == OrderSide.SELL else _far_close + _ENTRY_BUFFER * _TICK
+
+        console.print(f"[yellow]📝 [MTS_ORDER] Submitting ENTRY orders: NEAR={_near_side} mkt_limit={_near_price:.0f}, FAR={_far_side} mkt_limit={_far_price:.0f}[/yellow]")
+        _o_near = self.order_mgr.create_order(symbol="MXF_NEAR", side=_near_side, order_type=OrderType.LIMIT, quantity=1, price=_near_price, strategy="MTS")
+        self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_o_near))
+        self.order_mgr.submit(_o_near)
+        self.paper_fill_sim.register(_o_near)
+
+        _o_far = self.order_mgr.create_order(symbol="MXF_FAR", side=_far_side, order_type=OrderType.LIMIT, quantity=1, price=_far_price, strategy="MTS")
+        self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_o_far))
+        self.order_mgr.submit(_o_far)
+        self.paper_fill_sim.register(_o_far)
+
+        from types import SimpleNamespace
+        self.paper_fill_sim.process_tick(SimpleNamespace(close=_near_close, high=_near_close + 1, low=_near_close - 1, open=_near_close, volume=1))
+        self.paper_fill_sim.process_tick(SimpleNamespace(close=_far_close, high=_far_close + 1, low=_far_close - 1, open=_far_close, volume=1))
+        console.print(f"[bold green]✅ [MTS_ORDER] ENTRY FILLED: near={_near_side}@{_near_close:.0f} far={_far_side}@{_far_close:.0f}[/bold green]")
 
     def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, trail_points=None, reason=None):
         action = None
@@ -3085,121 +3312,370 @@ class FuturesMonitor:
     # ── [V-Model] MTS Mode: Minimal Tradable System ──
     # Bypass regime/router/policy/gates entirely. Direct path:
     #   Market → ORB Signal → Risk Check → Execution
+    def _sync_mts_status(self):
+        """[GSD] Synchronize MTS position and manual order state to disk for dashboard."""
+        _hb_file = "/tmp/mts_position_state.json"
+        _mts_cfg = self.cfg.get("mts", {})
+        _strat_name = _mts_cfg.get("strategy", "tmf_spread")
+        strategy = self._registry.get(_strat_name)
+        
+        try:
+            # 1. Base Strategy Info
+            _has_pos_in_mem = bool(getattr(strategy, "_has_position", False)) if strategy else False
+            
+            # Read existing to preserve some fields (like last prices)
+            existing = {}
+            if os.path.exists(_hb_file):
+                try:
+                    with open(_hb_file, "r") as f: existing = json.load(f)
+                except: pass
+
+            # 2. Position Details
+            _n_entry = getattr(strategy, "_near_entry", 0) or float(existing.get("near_entry", 0))
+            _f_entry = getattr(strategy, "_far_entry", 0) or float(existing.get("far_entry", 0))
+            _n_side = getattr(strategy, "_near_side", None) or existing.get("near_side")
+            _f_side = getattr(strategy, "_far_side", None) or existing.get("far_side")
+            
+            # Use last known prices
+            _n_last = float(existing.get("near_last", 0))
+            _f_last = float(existing.get("far_last", 0))
+            
+            _n_upl = (_n_last - _n_entry) * (-1 if _n_side == "SHORT" else 1) * 10.0 if _n_entry > 0 and _n_last > 0 and _n_side else 0.0
+            _f_upl = (_f_last - _f_entry) * (-1 if _f_side == "SHORT" else 1) * 10.0 if _f_entry > 0 and _f_last > 0 and _f_side else 0.0
+
+            # 3. Manual Order Details (Enrichment)
+            _manual_order_info = {
+                "manual_order_ts": existing.get("manual_order_ts", "—"),
+                "manual_order_type": existing.get("manual_order_type", "—"),
+                "manual_order_filled": existing.get("manual_order_filled", "—")
+            }
+            
+            if self._pending_lifecycle_orders:
+                # Find the most recent manual order
+                _manual_orders = [
+                    (oid, meta) for oid, meta in self._pending_lifecycle_orders.items() 
+                    if meta.get("reason") == "MTS_MANUAL"
+                ]
+                if _manual_orders:
+                    _manual_orders.sort(key=lambda x: x[1].get("ts", datetime.min), reverse=True)
+                    oid, meta = _manual_orders[0]
+                    _manual_order_info = {
+                        "manual_order_ts": meta.get("ts").isoformat() if isinstance(meta.get("ts"), datetime) else str(meta.get("ts")),
+                        "manual_order_type": "範圍市價 (MKP)",
+                        "manual_order_filled": "NO"
+                    }
+            elif self._manual_trade_status == "FILLED":
+                _manual_order_info["manual_order_filled"] = "YES"
+
+            _hb_state = {
+                "has_position": _has_pos_in_mem,
+                "state": "HEARTBEAT",
+                "reason": "mts_sync_status",
+                "manual_trade_status": self._manual_trade_status,
+                "near_side": _n_side, "far_side": _f_side,
+                "near_entry": round(_n_entry, 1), "far_entry": round(_f_entry, 1),
+                "near_last": round(_n_last, 1), "far_last": round(_f_last, 1),
+                "near_upl": round(_n_upl, 1), "far_upl": round(_f_upl, 1),
+                "total_upl": round(_n_upl + _f_upl, 1),
+                "initial_balance": self.EXEC.get("initial_balance", 100000),
+                "balance": getattr(self.trader, "balance", 0) if hasattr(self, "trader") else 0,
+                "_updated": datetime.now().isoformat(),
+            }
+            _hb_state.update(_manual_order_info)
+            
+            with open(_hb_file, "w") as f:
+                json.dump(_hb_state, f, default=str)
+        except Exception as e:
+            console.print(f"[red]⚠️ MTS Status Sync failed: {e}[/red]")
+
     def _mts_tick(self, enriched_bar: dict | None = None):
         """MTS minimal execution path. Uses enriched bar from pipeline when available,
         falls back to building bar from tick deque if none provided."""
         print("MTS_ALIVE", flush=True)
-        console.print("[dim][MTS] _mts_tick entered[/dim]")
         _mts = self.cfg.get("mts", {})
-        _strat_name = _mts.get("strategy", "adaptive_orb_v15")
+        _strat_name = _mts.get("strategy", "tmf_spread")
 
-        # 1. Market hours check (only hard gate retained)
+        # 1. Market hours check
         if not is_taifex_futures_market_open():
             return
 
-        # 2. Get bar: prefer enriched_bar from pipeline, fall back to tick deque
-        _bar_dict: dict | None = None
-        _df_5m: pd.DataFrame | None = None
-        _last_price = 0.0
-
-        if enriched_bar is not None:
-            _bar_dict = enriched_bar
-            _last_price = float(_bar_dict.get("Close", 0))
-            console.print("[dim][MTS] Using enriched bar from pipeline[/dim]")
-            # [BUG FIX 2026-05-13] Spread enrich must run on pipeline path too.
-            # MTS night strategy (tmf_spread) requires near_close/far_close/spread_z.
-            # Fallback-only enrich meant pipeline path always had nc=? fc=?
-            if hasattr(self, '_spread_loader') and self._spread_loaded:
-                try:
-                    self._spread_loader.enrich_bar(_bar_dict)
-                except Exception:
-                    pass
-        else:
-            df_5m = self._get_tick_bars_df()
-            if df_5m is None or df_5m.empty:
-                import logging as _ml
-                _ml.getLogger(__name__).info(
-                    "[MTS_HEARTBEAT] market_open=%s bars_empty=True tick_age=0", True,
-                )
-                return
-            _df_5m = df_5m
-            last_5m = df_5m.iloc[-1]
-            _last_price = float(last_5m.get("Close", 0))
-            if _last_price <= 0:
-                return
+        # 2. Get bar
+        _bar_dict = enriched_bar
+        _df_5m = None
+        if _bar_dict is None:
+            _df_5m = self._get_tick_bars_df()
+            if _df_5m is None or _df_5m.empty: return
+            last_5m = _df_5m.iloc[-1]
             _bar_dict = last_5m.to_dict()
             _bar_dict["ts"] = last_5m.name if hasattr(last_5m, "name") else None
-            # Fallback: enrich with spread data
-            if hasattr(self, '_spread_loader') and self._spread_loaded:
-                try:
-                    self._spread_loader.enrich_bar(_bar_dict)
-                except Exception:
-                    pass
 
-        if _last_price <= 0:
-            return
+        if not _bar_dict: return
+        if hasattr(self, '_spread_loader') and self._spread_loaded:
+            try: self._spread_loader.enrich_bar(_bar_dict)
+            except: pass
 
-        # [MTS] Debug spread bar dict
-        _dbg_sqz = _bar_dict.get('sqz_on', '?')
-        _dbg_sz = _bar_dict.get('spread_z', '?')
-        _dbg_nc = _bar_dict.get('near_close', '?')
-        _dbg_fc = _bar_dict.get('far_close', '?')
-        _dbg_cl = _bar_dict.get('Close', '?')
-        _dbg_ld = getattr(self, '_spread_loaded', 'N/A')
-        _dbg_fe = 'N/A'
-        if hasattr(self, '_spread_loader') and self._spread_loader and hasattr(self._spread_loader, '_far_df'):
-            _fe = self._spread_loader._far_df
-            _dbg_fe = _fe.empty if _fe is not None else 'N/A'
-        console.print(
-            f"[dim][MTS_SPREAD] nc={_dbg_nc} fc={_dbg_fc} sqz={_dbg_sqz} "
-            f"sz={_dbg_sz} cl={_dbg_cl} loaded={_dbg_ld} far_empty={_dbg_fe}[/dim]"
-        )
-        ctx = StrategyContext(
-            market=MarketData(
-                last_bar=_bar_dict,
-                df_5m=_df_5m or pd.DataFrame(),
-                timestamp=_bar_dict.get("ts", ""),
-            ),
-            position=PositionView(size=0, entry_price=0),
-            config=self.cfg,
-            bar_counter=self._bar_counter,
-        )
-
-        # 4. Run MTS strategy directly (no router, no regime, no policy)
+        # 3. Strategy setup
         strategy = self._registry.get(_strat_name)
         if strategy is None:
             console.print(f"[red][MTS] Strategy {_strat_name} not registered[/red]")
             return
 
-        self._ensure_strategy_initialized(_strat_name, strategy, ctx)
-        signal = strategy.on_bar(ctx)
+        # [MTS Heartbeat] Update state file with latest prices
+        _hb_file = "/tmp/mts_position_state.json"
+        try:
+            _has_pos_in_mem = bool(getattr(strategy, "_has_position", False))
+            existing = {}
+            if os.path.exists(_hb_file):
+                try:
+                    with open(_hb_file, "r") as f: existing = json.load(f)
+                except: pass
+            
+            # Restoration Guard: Don't overwrite valid disk state during restart window
+            if not _has_pos_in_mem and existing.get("has_position") is True:
+                console.print("[dim][MTS] Heartbeat suppressed: awaiting strategy recovery[/dim]")
+                return
 
-        # Log MTS decision
-        if signal:
-            console.print(f"[bold green][MTS] SIGNAL: {signal.action} reason={signal.reason} stop={signal.stop_loss} conf={signal.confidence}[/bold green]")
-        else:
-            se = getattr(strategy, "last_eval", None)
-            reason = se.skip_reason if se else "NO_EVAL"
-            console.print(f"[dim][MTS] No signal: {reason}[/dim]")
-            return
+            _n_entry = getattr(strategy, "_near_entry", 0) or float(existing.get("near_entry", 0))
+            _f_entry = getattr(strategy, "_far_entry", 0) or float(existing.get("far_entry", 0))
+            _n_side = getattr(strategy, "_near_side", None) or existing.get("near_side")
+            _f_side = getattr(strategy, "_far_side", None) or existing.get("far_side")
+            
+            _n_last = float(_bar_dict.get("near_close", 0))
+            _f_last = float(_bar_dict.get("far_close", 0))
+            _n_upl = (_n_last - _n_entry) * (-1 if _n_side == "SHORT" else 1) * 10.0 if _n_entry > 0 and _n_last > 0 and _n_side else 0.0
+            _f_upl = (_f_last - _f_entry) * (-1 if _f_side == "SHORT" else 1) * 10.0 if _f_entry > 0 and _f_last > 0 and _f_side else 0.0
 
-        # 5. Basic risk check (max position, daily loss)
-        if self.trader.position != 0:
-            console.print(f"[dim][MTS] Position already open ({self.trader.position}) — skip entry[/dim]")
-            return
+            _hb_state = {
+                "has_position": _has_pos_in_mem,
+                "state": "HEARTBEAT",
+                "reason": "mts_tick_heartbeat",
+                "manual_trade_status": self._manual_trade_status,
+                "near_side": _n_side, "far_side": _f_side,
+                "near_entry": round(_n_entry, 1), "far_entry": round(_f_entry, 1),
+                "near_last": round(_n_last, 1), "far_last": round(_f_last, 1),
+                "near_upl": round(_n_upl, 1), "far_upl": round(_f_upl, 1),
+                "total_upl": round(_n_upl + _f_upl, 1),
+                "spread_z": _bar_dict.get("spread_z"),
+                "_updated": datetime.now().isoformat(),
+            }
+            # Preserve manual order info from _sync_mts_status
+            for key in ["manual_order_ts", "manual_order_type", "manual_order_filled"]:
+                if key in existing:
+                    _hb_state[key] = existing[key]
 
-        # 6. Execute
-        lots = _mts.get("lots", 1)
-        _ts = _bar_dict.get("ts", datetime.now())
-        sl = signal.stop_loss or (_last_price - 1.5 * float(_bar_dict.get("atr", 50)))
-        self._execute_trade(
-            signal.action, _last_price, _ts,
-            lots, stop_loss=sl, reason=f"MTS:{signal.reason}",
+            with open(_hb_file, "w") as f:
+                json.dump(_hb_state, f, default=str)
+        except Exception as e:
+            console.print(f"[red]⚠️ Heartbeat failed: {e}[/red]")
+
+        ctx = StrategyContext(
+            market=MarketData(last_bar=_bar_dict, timestamp=_bar_dict.get("ts", "")),
+            position=PositionView(size=self.trader.position), 
+            config=_mts
         )
-        console.print(f"[bold cyan][MTS] EXECUTED: {signal.action} {lots}lot(s) @ {_last_price:.0f} SL={sl:.0f}[/bold cyan]")
+        # Ensure strategy initialized
+        if not hasattr(strategy, "_has_position"):
+            strategy.init(ctx)
+
+        signal = strategy.on_bar(ctx)
+        if signal:
+            self._submit_mts_order_signal(signal, strategy, _bar_dict, datetime.now())
+
+    def _process_manual_trade_flag(self) -> bool:
+        """Consume /tmp/futures_manual_trade.flag if present."""
+        _flag_path = "/tmp/futures_manual_trade.flag"
+        if not os.path.exists(_flag_path):
+            return False
+            
+        try:
+            self._manual_trade_status = "PROCESSING"
+            with open(_flag_path) as _f:
+                _flag = json.loads(_f.read())
+            os.remove(_flag_path)
+            console.print(f"[bold magenta]🔬 [MANUAL_TRADE_FLAG] consumed path={_flag_path}[/bold magenta]")
+            
+            _action = _flag.get("action", "")
+            if _action == "spread":
+                # Integrity check: only enter if flat
+                if self.trader.position != 0:
+                    self._manual_trade_status = "FAILED: POS_EXIST"
+                    console.print("[red]⛔ [MANUAL_TRADE] Rejected: Position already exists[/red]")
+                    return True
+
+                # Live mode guard: reject if outside trading hours
+                if not self.dry_run:
+                    from core.date_utils import is_day_session, is_night_session
+                    _now = datetime.now()
+                    if not is_day_session(_now) and not is_night_session(_now):
+                        self._manual_trade_status = "FAILED: MKT_CLOSED"
+                        console.print("[red]⛔ [MANUAL_TRADE_FLAG] Live mode + market closed: rejected[/red]")
+                        return True
+
+                _spread_side = _flag.get("side", "SELL_NEAR_BUY_FAR")
+                
+                # ── Tiered Price Resolution ──
+                _price = None
+                _price_source = None
+                
+                # Tier 1: Live Market Data (MTX)
+                _live_price = self.market_data.get("MTX", {}).get("close")
+                if _live_price is not None and _live_price > 0:
+                    _price = float(_live_price)
+                    _price_source = "LIVE_TICK"
+                
+                # Tier 2: Backfill Data (Last Bar)
+                if _price is None and len(self._tick_bars_deque) > 0:
+                    _last_bar_price = float(self._tick_bars_deque[-1].get("close", 0))
+                    if _last_bar_price > 0:
+                        _price = _last_bar_price
+                        _price_source = "BACKFILL_BAR"
+                
+                # Tier 3: Synthetic Config (Paper Only)
+                if _price is None:
+                    _mts_cfg = self.cfg.get("mts", {})
+                    _paper_cfg = _mts_cfg.get("paper", {})
+                    if (self.dry_run or not self.live_trading) and _paper_cfg.get("allow_synthetic_price"):
+                        _price = float(_paper_cfg.get("synthetic_near_price", 41000))
+                        _price_source = "SYNTHETIC_CONFIG"
+                        console.print(f"[yellow]⚠️ [MANUAL_TRADE] Using synthetic price from config: {_price}[/yellow]")
+                
+                # Final Guard
+                if _price is None or _price <= 0:
+                    if not self.dry_run and self.live_trading:
+                        self._manual_trade_status = "FAILED: LIVE_PRICE_UNAVAILABLE"
+                        raise RuntimeError("LIVE_MTS_PRICE_UNAVAILABLE: Cannot manual enter without real quote")
+                    else:
+                        self._manual_trade_status = "WAITING_MARKET_DATA"
+                        console.print("[yellow]⏳ [MANUAL_TRADE] No market data and synthetic price disabled. Waiting...[/yellow]")
+                        # Re-create flag for retry
+                        with open(_flag_path, "w") as _f_retry:
+                            _f_retry.write(json.dumps(_flag))
+                        return False 
+
+                _near = float(_flag.get("near_close", _flag.get("near", _price - 100)))
+                _far = float(_flag.get("far_close", _flag.get("far", _price)))
+                _ts = datetime.now()
+                _trade_id = f"mts-{_ts.strftime('%Y%m%d-%H%M%S')}"
+
+                # ── Margin check ──
+                _margin_per_lot = float(self.EXEC.get("margin_per_lot", 18000))
+                _required_margin = _margin_per_lot * 2
+                _current_balance = float(getattr(self.trader, "balance", self._mts_initial_balance))
+                if _current_balance < _required_margin:
+                    self._manual_trade_status = "FAILED: MARGIN"
+                    console.print(f"[red]⛔ [MANUAL_TRADE] Margin insufficient: balance={_current_balance:.0f}[/red]")
+                    return True
+
+                # ── Submit via order_mgr ──
+                if self.order_mgr and self.paper_fill_sim:
+                    from core.order_management.order import OrderType, OrderSide
+                    _TICK = 1.0  # MXF tick size
+                    _ENTRY_BUFFER = 4   # ticks
+                    if _spread_side == "SELL_NEAR_BUY_FAR":
+                        _near_side, _far_side = OrderSide.SELL, OrderSide.BUY
+                        _near_label, _far_label = "SHORT", "LONG"
+                    else:
+                        _near_side, _far_side = OrderSide.BUY, OrderSide.SELL
+                        _near_label, _far_label = "LONG", "SHORT"
+
+                    # Helper for metadata
+                    def _ev_meta(order):
+                        return {
+                            "order_id": order.order_id, "symbol": order.symbol,
+                            "side": order.side.value, "type": order.order_type.value,
+                            "price": order.price, "qty": order.quantity, 
+                            "strategy": "MTS_MANUAL", "price_source": _price_source
+                        }
+
+                    _near_mkt = _near + _ENTRY_BUFFER * _TICK if _near_side == OrderSide.BUY else _near - _ENTRY_BUFFER * _TICK
+                    _far_mkt = _far + _ENTRY_BUFFER * _TICK if _far_side == OrderSide.BUY else _far - _ENTRY_BUFFER * _TICK
+                    
+                    console.print(f"[yellow]📝 [MANUAL_TRADE] NEAR={_near_side} ref={_near:.1f} mkt={_near_mkt:.1f} src={_price_source}[/yellow]")
+                    console.print(f"[yellow]📝 [MANUAL_TRADE] FAR={_far_side} ref={_far:.1f} mkt={_far_mkt:.1f} src={_price_source}[/yellow]")
+                    
+                    _near_order = self.order_mgr.create_order(symbol="MXF_NEAR", side=_near_side, order_type=OrderType.LIMIT, quantity=1, price=_near_mkt, strategy="MTS_MANUAL")
+                    self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_near_order))
+                    self._pending_lifecycle_orders[_near_order.order_id] = {
+                        "intent_id": _near_order.intent_id,
+                        "signal": "BUY" if _near_side == OrderSide.BUY else "SELL",
+                        "reason": "MTS_MANUAL", "ts": _ts, "lots": 1,
+                        "stop_loss": 20, "price": _near_mkt
+                    }
+                    self.order_mgr.submit(_near_order)
+                    self.paper_fill_sim.register(_near_order)
+
+                    _far_order = self.order_mgr.create_order(symbol="MXF_FAR", side=_far_side, order_type=OrderType.LIMIT, quantity=1, price=_far_mkt, strategy="MTS_MANUAL")
+                    self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_far_order))
+                    self._pending_lifecycle_orders[_far_order.order_id] = {
+                        "intent_id": _far_order.intent_id,
+                        "signal": "BUY" if _far_side == OrderSide.BUY else "SELL",
+                        "reason": "MTS_MANUAL", "ts": _ts, "lots": 1,
+                        "stop_loss": 20, "price": _far_mkt
+                    }
+                    self.order_mgr.submit(_far_order)
+                    self.paper_fill_sim.register(_far_order)
+
+                    # Force fill in paper mode
+                    if self.dry_run or not self.live_trading:
+                        from types import SimpleNamespace
+                        self.paper_fill_sim.process_tick(SimpleNamespace(symbol="MXF_NEAR", close=_near, high=_near+1, low=_near-1, open=_near, volume=1))
+                        self.paper_fill_sim.process_tick(SimpleNamespace(symbol="MXF_FAR", close=_far, high=_far+1, low=_far-1, open=_far, volume=1))
+
+                    self._manual_trade_status = "FILLED"
+                    console.print(f"[bold green]✅ [MANUAL_TRADE] Orders filled: {_trade_id} (src={_price_source})[/bold green]")
+
+                    # ── Sync strategy state ──
+                    try:
+                        _mts_strat = self._registry.get("tmf_spread")
+                        if _mts_strat:
+                            from core.strategy_context import StrategyContext
+                            from strategies.plugins.futures.active.tmf_spread import _write_mts_state
+                            if not hasattr(_mts_strat, "_has_position"):
+                                _mts_strat.init(StrategyContext(market=MarketData(last_bar={}, timestamp=""), position=PositionView(size=0), config=self.cfg))
+                            
+                            _mts_strat.sync_position(trade_id=_trade_id, side="SHORT" if _spread_side == "SELL_NEAR_BUY_FAR" else "LONG",
+                                                     near_entry=_near, far_entry=_far)
+                            
+                            _write_mts_state(has_position=True, action=_spread_side, reason="MANUAL_ENTRY",
+                                             near_entry=_near, far_entry=_far, near_last=_near, far_last=_far,
+                                             near_side=_near_label, far_side=_far_label,
+                                             spread_z=3.0, released_leg=None, trade_id=_trade_id)
+                    except Exception as _se:
+                        console.print(f"[red]⚠️ [MANUAL_TRADE] Strategy sync failed: {_se}[/red]")
+                else:
+                    self._manual_trade_status = "FAILED: NO_MGR"
+                    console.print("[red]⚠️ [MANUAL_TRADE] order_mgr not available[/red]")
+            return True
+        except Exception as _e:
+            self._manual_trade_status = f"ERROR: {str(_e)[:20]}"
+            console.print(f"[red][MANUAL_TRADE_FLAG] Failed: {_e}[/red]")
+            if os.path.exists(_flag_path):
+                try: os.remove(_flag_path)
+                except Exception: pass
+            return True
 
     def _strategy_tick(self):
         console.print("[STICK_00_ENTER] dry_run=%s" % self.dry_run)
+
+        # ── [MTS Sync] Update position/order status file (Always Run) ──
+        self._sync_mts_status()
+
+        # ── [Manual Trade Flag] Check on every poll cycle ──
+        # Check flag before session gate so we can report "WAITING_MARKET_OPEN"
+        _flag_path = "/tmp/futures_manual_trade.flag"
+        if os.path.exists(_flag_path):
+            from core.date_utils import is_day_session, is_night_session
+            now_dt = datetime.now()
+            if not is_day_session(now_dt) and not is_night_session(now_dt):
+                self._manual_trade_status = "WAITING_MARKET_OPEN"
+                console.print("[yellow]⏳ [MANUAL_TRADE] Flag received during market close, status: WAITING_MARKET_OPEN[/yellow]")
+                # We don't consume/remove the flag yet; wait for market open
+            else:
+                self._process_manual_trade_flag()
+        else:
+            # Only reset if we were previously waiting (or just periodic reset)
+            if self._manual_trade_status == "WAITING_MARKET_OPEN":
+                self._manual_trade_status = "READY"
 
         # [V-Model] MTS mode: run shared data pipeline (indicators, CSV, regime)
         # then bypass position mgmt + router → use direct _mts_tick() for execution
@@ -3224,14 +3700,14 @@ class FuturesMonitor:
         now_ts = time.time()
         if not self.dry_run and (now_ts - self.last_tick_at > 10):
             # Use current MTX close/mid if available to drive bar building
-            price = self.market_data.get("MTX", {}).get("close", 0)
-            if price > 0:
+            price = self.market_data.get("MTX", {}).get("close")
+            if price is not None and price > 0:
                 # Mock a tick object to feed into self.on_tick
                 from types import SimpleNamespace
                 # Use current real time, but ensure we don't skip into next bucket prematurely
                 mock_tick = SimpleNamespace(
                     code="TMF_VIRTUAL",
-                    close=price,
+                    close=float(price),
                     datetime=datetime.now(),
                     volume=0
                 )
@@ -3244,24 +3720,19 @@ class FuturesMonitor:
             # Strategy-level freshness gate: skip strategy tick if feed ages exceed warn threshold
             try:
                 if hasattr(self, 'feed_health') and self.feed_health is not None:
-                    tx_age = self.feed_health.age('TX')
                     # [Fix] Use _tmf_feed_age_secs() which has proper fallback for feed_health returning inf
                     tmf_age = self._tmf_feed_age_secs()
                     max_age = getattr(self, 'STALE_WARN_SECS', 120)
                     
                     # 💡 GSD: 只有主體 MXF 過期才跳過；TX 過期則僅報警
-                    if tmf_age > max_age:
+                    if isinstance(tmf_age, (int, float)) and tmf_age > max_age:
                         console.print(f" [yellow][FuturesMonitor] MXF feed stale ({tmf_age:.0f}s) - skip strategy tick[/yellow] ")
                         return
 
                     console.print(
-                        "[STICK_01_FEED_OK] tmf_age=%s tx_age=%s dry_run=%s"
-                        % (tmf_age, tx_age, self.dry_run),
+                        "[STICK_01_FEED_OK] tmf_age=%s dry_run=%s"
+                        % (tmf_age, self.dry_run),
                     )
-                    
-                    if tx_age > max_age:
-                        if self._bar_counter % 5 == 0: # 減少日誌噪音
-                            console.print(f" [yellow][FuturesMonitor] TX feed quiet ({tx_age:.0f}s) - continuing in degraded mode[/yellow] ")
             except Exception:
                 pass
 

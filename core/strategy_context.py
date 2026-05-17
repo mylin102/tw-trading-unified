@@ -43,6 +43,11 @@ class MarketData:
     # Populated by OptionSurfaceEngine, consumed by strategy layer as filter.
     skew_signal: dict | None = None
 
+    # [Skew Integration] IV curve shape classification regime.
+    # Populated by IVShapeClassifier, consumed by strategy layer.
+    # Dict with keys: shape, slope_ratio, confidence, atm_iv, etc.
+    skew_regime: dict | None = None
+
 
 @dataclass(frozen=True)
 class StrategyContext:

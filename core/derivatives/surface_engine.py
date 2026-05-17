@@ -4,22 +4,26 @@ OptionSurfaceEngine — real-time option surface builder and skew calculator.
 Designed as P1.5 layer between raw tick stream (P1) and strategy layer (P3).
 
 Input:  OptionQuoteEvent (from bidask callback)
-Output: SkewSignal (via compute_if_ready)
+Output: SkewSignal (via compute_if_ready), SurfaceSnapshot (via surface_snapshot)
 
 Architecture
 ------------
 - quote_store holds the latest bid/ask/mid for each (option_type, strike) pair
 - compute_if_ready is called on futures bar / tick, checks if enough strikes
   are available, then calculates skew
+- surface_snapshot computes implied volatility for all stored quotes, enabling
+  IV curve shape classification (see shape_classifier.py)
 - No knowledge of Shioaji contracts — pure model-based
 """
+
 from __future__ import annotations
 
 import datetime
 import logging
 from typing import Optional
 
-from core.derivatives.models import OptionQuoteEvent, SkewSignal
+from core.derivatives.iv_calculator import iv_from_price
+from core.derivatives.models import OptionQuoteEvent, SkewSignal, SurfaceSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +35,7 @@ class OptionSurfaceEngine:
         engine = OptionSurfaceEngine(otm_points=300)
         engine.on_quote(event)          # on every bidask callback
         signal = engine.compute_if_ready(futures_price=34000, timestamp=now)
-        shared_state["skew_signal"] = signal.to_dict()
+        snapshot = engine.surface_snapshot(futures_price=34000, timestamp=now)
     """
 
     def __init__(
@@ -84,7 +88,128 @@ class OptionSurfaceEngine:
         )
 
     # ------------------------------------------------------------------
-    # Computation
+    # Surface Snapshot (IV-based — for shape classification)
+    # ------------------------------------------------------------------
+
+    def surface_snapshot(
+        self,
+        futures_price: float,
+        timestamp: Optional[datetime.datetime] = None,
+    ) -> SurfaceSnapshot:
+        """Compute IV surface snapshot from current quote store.
+
+        Returns a SurfaceSnapshot with ATM IV, OTM put IV, and OTM call IV.
+        When insufficient data is available, returns a snapshot with is_valid()=False.
+        """
+        ts = timestamp or datetime.datetime.utcnow()
+
+        # Find ATM (nearest to futures)
+        atm_put_strike, atm_put_record = self._nearest_quote("PUT", futures_price)
+        atm_call_strike, atm_call_record = self._nearest_quote("CALL", futures_price)
+
+        # Prefer the closer of ATM put/call
+        atm_strike = None
+        atm_record = None
+        if atm_put_record is not None and atm_call_record is not None:
+            put_dist = abs(atm_put_strike - futures_price)
+            call_dist = abs(atm_call_strike - futures_price)
+            if put_dist <= call_dist:
+                atm_strike, atm_record = atm_put_strike, atm_put_record
+            else:
+                atm_strike, atm_record = atm_call_strike, atm_call_record
+        elif atm_put_record is not None:
+            atm_strike, atm_record = atm_put_strike, atm_put_record
+        elif atm_call_record is not None:
+            atm_strike, atm_record = atm_call_strike, atm_call_record
+
+        # Find OTM put and call
+        otm_put_strike, otm_put_record = self._nearest_quote("PUT", futures_price - self.otm_points)
+        otm_call_strike, otm_call_record = self._nearest_quote("CALL", futures_price + self.otm_points)
+
+        # Compute DTE from the first available expiry
+        dte = 0.0
+        for record in [atm_record, otm_put_record, otm_call_record]:
+            if record and record.get("expiry"):
+                try:
+                    expiry = record["expiry"]
+                    # expiry is a delivery date string like "202606" or "2026-06-17"
+                    if "20" in expiry and len(expiry) >= 6:
+                        if "-" in expiry:
+                            expiry_dt = datetime.datetime.strptime(expiry[:10], "%Y-%m-%d")
+                        elif len(expiry) == 6:
+                            # YYYYMM format → use third Wednesday heuristic or last day
+                            year = int(expiry[:4])
+                            month = int(expiry[4:6])
+                            # Approximate: use 15th of month for DTE
+                            expiry_dt = datetime.datetime(year, month, min(15, 28))
+                        else:
+                            continue
+                        dte = max((expiry_dt - ts).total_seconds() / 86400.0, 0.1)
+                        break
+                except (ValueError, OSError):
+                    continue
+
+        # Compute IV for each
+        atm_iv = 0.0
+        if atm_record is not None:
+            iv = iv_from_price(
+                option_type="PUT" if atm_strike == atm_put_strike else "CALL",
+                strike=float(atm_strike),
+                premium=float(atm_record["mid"]),
+                underlying_price=futures_price,
+                dte=dte,
+            )
+            if iv is not None:
+                atm_iv = iv
+
+        otm_put_iv = 0.0
+        if otm_put_record is not None:
+            iv = iv_from_price(
+                option_type="PUT",
+                strike=float(otm_put_strike),
+                premium=float(otm_put_record["mid"]),
+                underlying_price=futures_price,
+                dte=dte,
+            )
+            if iv is not None:
+                otm_put_iv = iv
+
+        otm_call_iv = 0.0
+        if otm_call_record is not None:
+            iv = iv_from_price(
+                option_type="CALL",
+                strike=float(otm_call_strike),
+                premium=float(otm_call_record["mid"]),
+                underlying_price=futures_price,
+                dte=dte,
+            )
+            if iv is not None:
+                otm_call_iv = iv
+
+        snapshot = SurfaceSnapshot(
+            atm_iv=round(atm_iv, 6),
+            otm_put_iv=round(otm_put_iv, 6),
+            otm_call_iv=round(otm_call_iv, 6),
+            atm_strike=float(atm_strike or 0),
+            otm_put_strike=float(otm_put_strike or 0),
+            otm_call_strike=float(otm_call_strike or 0),
+            underlying_price=futures_price,
+            dte=round(dte, 2),
+            timestamp=ts,
+        )
+
+        print(
+            "[SurfaceEngine] snapshot: atm_iv=%.4f otm_put_iv=%.4f otm_call_iv=%.4f "
+            "dte=%.1f valid=%s"
+            % (snapshot.atm_iv, snapshot.otm_put_iv, snapshot.otm_call_iv,
+               snapshot.dte, snapshot.is_valid()),
+            flush=True,
+        )
+
+        return snapshot
+
+    # ------------------------------------------------------------------
+    # Skew Computation (legacy premium-based)
     # ------------------------------------------------------------------
 
     def compute_if_ready(

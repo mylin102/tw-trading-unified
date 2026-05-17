@@ -43,40 +43,69 @@ class SpreadPosition:
         return self.entry_time is not None and self.net_credit > 0
 
 
-def select_strikes(spot, strike_rounding, strategy, wing_width=200, otm_offset=200):
+def select_strikes(spot, strike_rounding, strategy, wing_width=200, otm_offset=200, skew_regime=None):
     """
     Select strikes for spread strategies.
+
+    When skew_regime is provided, adjusts wing widths asymmetrically:
+    - LEFT_SKEW (fear): widen put wing +50%, tighten call wing -50%
+    - RIGHT_SKEW (euphoria): tighten put wing -50%, widen call wing +50%
+    - PARALLEL (tension): reduce position size (handled by caller)
+    - NEUTRAL or None: use defaults
+
     spot: current underlying price
     strike_rounding: TXO strike interval (100 for TXO)
     wing_width: distance between spread legs
     otm_offset: how far OTM to place short strike
+    skew_regime: optional dict from SkewRegime.to_dict()
     """
+    # Apply skew regime adjustments
+    put_offset = otm_offset
+    call_offset = otm_offset
+    put_wing = wing_width
+    call_wing = wing_width
+
+    if skew_regime is not None:
+        shape = skew_regime.get("shape", "NEUTRAL")
+        if shape == "LEFT_SKEW":
+            # Fear: widen put protection, tighten call
+            put_offset = int(otm_offset * 1.5)
+            put_wing = int(wing_width * 1.5)
+            call_offset = int(otm_offset * 0.5)
+            call_wing = int(wing_width * 0.5)
+        elif shape == "RIGHT_SKEW":
+            # Euphoria: widen call protection, tighten put
+            call_offset = int(otm_offset * 1.5)
+            call_wing = int(wing_width * 1.5)
+            put_offset = int(otm_offset * 0.5)
+            put_wing = int(wing_width * 0.5)
+
     def round_strike(p):
         return round(p / strike_rounding) * strike_rounding
 
     round_strike(spot)
 
     if strategy == "bull_put_spread":
-        short_put = round_strike(spot - otm_offset)
-        long_put = short_put - wing_width
+        short_put = round_strike(spot - put_offset)
+        long_put = short_put - put_wing
         return [
             SpreadLeg("P", short_put, "SELL"),
             SpreadLeg("P", long_put, "BUY"),
         ]
 
     elif strategy == "bear_call_spread":
-        short_call = round_strike(spot + otm_offset)
-        long_call = short_call + wing_width
+        short_call = round_strike(spot + call_offset)
+        long_call = short_call + call_wing
         return [
             SpreadLeg("C", short_call, "SELL"),
             SpreadLeg("C", long_call, "BUY"),
         ]
 
     elif strategy == "iron_condor":
-        short_put = round_strike(spot - otm_offset)
-        long_put = short_put - wing_width
-        short_call = round_strike(spot + otm_offset)
-        long_call = short_call + wing_width
+        short_put = round_strike(spot - put_offset)
+        long_put = short_put - put_wing
+        short_call = round_strike(spot + call_offset)
+        long_call = short_call + call_wing
         return [
             SpreadLeg("P", short_put, "SELL"),
             SpreadLeg("P", long_put, "BUY"),
@@ -85,8 +114,8 @@ def select_strikes(spot, strike_rounding, strategy, wing_width=200, otm_offset=2
         ]
 
     elif strategy == "short_strangle":
-        short_put = round_strike(spot - otm_offset)
-        short_call = round_strike(spot + otm_offset)
+        short_put = round_strike(spot - put_offset)
+        short_call = round_strike(spot + call_offset)
         return [
             SpreadLeg("P", short_put, "SELL"),
             SpreadLeg("C", short_call, "SELL"),
@@ -227,12 +256,26 @@ class ThetaGangManager:
         self.quantity = self.cfg.get("quantity", 1)
         self.r = self.cfg.get("risk_free_rate", 0.02)
 
-    def evaluate_entry(self, spot, iv, dte_years, squeeze_on, *, score=None):
-        """Check if we should open a ThetaGang position."""
+    def evaluate_entry(self, spot, iv, dte_years, squeeze_on, *, score=None, skew_regime=None):
+        """Check if we should open a ThetaGang position.
+
+        Args:
+            spot: underlying price
+            iv: implied volatility
+            dte_years: days to expiry in years
+            squeeze_on: bool — vol compression active
+            score: optional directional score
+            skew_regime: optional dict from SkewRegime.to_dict() for asymmetric wings
+        """
         if self.position and self.position.is_open:
             return None
 
         if not should_enter_theta(squeeze_on, iv, min_iv=self.cfg.get("min_iv", 0.18)):
+            return None
+
+        # PARALLEL regime: skip entry (tension = wide vol, not good for theta)
+        if skew_regime is not None and skew_regime.get("shape") == "PARALLEL":
+            console.print("[yellow]ThetaGang: PARALLEL regime — skipping entry (vol tension)[/yellow]")
             return None
 
         directional_floor = self.cfg.get("directional_score_floor")
@@ -243,7 +286,7 @@ class ThetaGangManager:
             return None
 
         legs = select_strikes(spot, self.strike_rounding, self.strategy,
-                              self.wing_width, self.otm_offset)
+                              self.wing_width, self.otm_offset, skew_regime=skew_regime)
         if not legs:
             return None
 
