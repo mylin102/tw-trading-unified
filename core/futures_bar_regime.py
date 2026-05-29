@@ -158,6 +158,23 @@ def classify_futures_bar_regime(
     sqz_on = _as_bool(row.get("sqz_on"))
     volume_spike = _safe_float(row.get("volume_spike"))
 
+    # [REGIME_TRACE] Log decision inputs for diagnostic
+    import logging
+    _regime_logger = logging.getLogger("regime")
+    _regime_logger.info(
+        "[REGIME_TRACE] sqz_on=%s adx=%.2f bs=%.4f bear_bs=%.4f "
+        "pvv=%.4f tsr=%.6f vol_spike=%.2f close=%.2f vwap=%.2f "
+        "bars_open=%s is_struct=%s bear_brk=%s bull_brk=%s",
+        sqz_on, adx, breakout_strength, bear_breakout_strength,
+        price_vs_vwap, trend_strength_raw, volume_spike,
+        _safe_float(row.get("close") or row.get("Close")),
+        _safe_float(row.get("vwap")),
+        row.get("bars_since_open", "?"),
+        row.get("is_structural_breakout", "?"),
+        row.get("bear_breakout", "?"),
+        row.get("bull_breakout", "?"),
+    )
+
     bias, bias_reasons = _infer_bias(row, cfg.min_alignment_score)
     reasons.extend(bias_reasons)
     if normalized_session_regime != "UNKNOWN":
@@ -192,8 +209,10 @@ def classify_futures_bar_regime(
         reasons.append(
             f"bear_breakout during squeeze: Close < BB_low, bear_bs={bear_breakout_strength:.4f}"
         )
+        _regime_label = "WEAK" if sqz_on else "BEAR"
+        reasons.append(f"RETURN_{_regime_label}_BEAR_BREAKOUT")
         return FuturesBarRegimeResult(
-            regime="WEAK" if sqz_on else "BEAR",
+            regime=_regime_label,
             bias=bias,
             confidence=0.60,
             reasons=reasons,
@@ -204,8 +223,10 @@ def classify_futures_bar_regime(
         reasons.append(
             f"bull_breakout during squeeze: Close > BB_up, bs={breakout_strength:.4f}"
         )
+        _regime_label = "TRANSITION" if sqz_on else "TREND"
+        reasons.append(f"RETURN_{_regime_label}_BULL_BREAKOUT")
         return FuturesBarRegimeResult(
-            regime="TRANSITION" if sqz_on else "TREND",
+            regime=_regime_label,
             bias=bias,
             confidence=0.60,
             reasons=reasons,
@@ -214,6 +235,7 @@ def classify_futures_bar_regime(
 
     if sqz_on and adx < cfg.adx_trend_threshold:
         reasons.append("squeeze active while ADX is below trend threshold")
+        reasons.append("RETURN_SQUEEZE_SQZ_ON_ADX_LOW")
         return FuturesBarRegimeResult(
             regime="SQUEEZE",
             bias=bias,
@@ -226,6 +248,7 @@ def classify_futures_bar_regime(
         reasons.append(
             f"price stretched from VWAP ({abs(price_vs_vwap):.4f}) inside pullback zone"
         )
+        reasons.append("RETURN_STRETCHED_VWAP_DIST")
         return FuturesBarRegimeResult(
             regime="STRETCHED",
             bias=bias,
@@ -290,6 +313,7 @@ def classify_futures_bar_regime(
             f"BULL breakout confirmed (V2): bs_atr={breakout_strength:.2f} >= {bs_threshold:.2f}, "
             f"vol={volume_spike:.2f} (bars={bars_since_open:.0f}), {atr_trace}"
         )
+        reasons.append("RETURN_TREND_BULL_CONFIRMED")
         confidence = 0.88 if normalized_session_regime == "TRENDING" else 0.85
         return FuturesBarRegimeResult(
             regime="TREND",
@@ -317,6 +341,7 @@ def classify_futures_bar_regime(
             f"BEAR breakout confirmed (V2): bear_bs_atr={bear_breakout_strength:.2f} >= {bs_threshold:.2f}, "
             f"vol={volume_spike:.2f} (bars={bars_since_open:.0f}), {atr_trace}"
         )
+        reasons.append("RETURN_BEAR_CONFIRMED")
         _bear_c = 0.80 if adx >= cfg.adx_trend_threshold else 0.65
         return FuturesBarRegimeResult(
             regime="BEAR",
@@ -339,6 +364,7 @@ def classify_futures_bar_regime(
 
     if moderate_directional_pressure:
         reasons.append("directional pressure exists, but breakout confirmation is incomplete")
+        reasons.append("RETURN_WEAK_MODERATE_DIR")
         confidence = 0.60 if normalized_session_regime == "TRENDING" else 0.55
         return FuturesBarRegimeResult(
             regime="WEAK",
@@ -352,6 +378,7 @@ def classify_futures_bar_regime(
         reasons.append("session regime is shock; keep bar classification conservative")
 
     reasons.append("defaulted to weak/choppy bar regime")
+    reasons.append("RETURN_WEAK_DEFAULT")
     return FuturesBarRegimeResult(
         regime="WEAK",
         bias=bias,
