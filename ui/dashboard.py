@@ -417,6 +417,8 @@ futures_cfg = load_yaml(FUTURES_CFG_PATH)
 options_cfg = load_yaml(OPTIONS_CFG_PATH)
 risk_cfg = load_yaml(RISK_CFG_PATH)
 stock_cfg = load_yaml(STOCK_CFG_PATH)
+# 2026-05-27 Gemini CLI: Global Ticker Reference (no hardcoding)
+_TICKER = futures_cfg.get("ticker", "TMF")
 f_live = futures_cfg.get("live_trading", False)
 o_live = options_cfg.get("live_trading", False)
 s_live = stock_cfg.get("live_trading", False)
@@ -1106,7 +1108,10 @@ def format_futures_trades(ledger_df):
             # Fallback: calculate from price difference
             if gross is None or gross == 0:
                 mult = 1 if direction == "BUY" else -1
-                gross = (exit_p - entry) * 50 * lots * mult
+                # 2026-05-27 Gemini CLI: Dynamic Point Value multiplier (no hardcoded 50)
+                from strategies.futures.squeeze_futures.engine.constants import get_point_value
+                _mult = get_point_value(futures_cfg.get("ticker", "MXF")[:3])
+                gross = (exit_p - entry) * _mult * lots * mult
 
             cost = row.get("total_cost", row.get("fees", 0))
             try:
@@ -1115,8 +1120,10 @@ def format_futures_trades(ledger_df):
                 cost = 0
             net = gross - cost if cost > 0 else gross
 
-            # GSD Fix: Add cost basis (進場成本) for better visibility
-            cost_basis = entry * 50 * lots
+            # 2026-05-27 Gemini CLI: Dynamic Point Value for cost basis
+            from strategies.futures.squeeze_futures.engine.constants import get_point_value
+            _mult_cb = get_point_value(futures_cfg.get("ticker", "MXF")[:3])
+            cost_basis = entry * _mult_cb * lots
             
             trades.append({
                 "#": trade_num,
@@ -1136,7 +1143,10 @@ def format_futures_trades(ledger_df):
 
     if pending_entry:
         trade_num += 1
-        cost_basis = pending_entry["entry_price"] * 50 * pending_entry["lots"]
+        # 2026-05-27 Gemini CLI: Dynamic Point Value for pending cost basis
+        from strategies.futures.squeeze_futures.engine.constants import get_point_value
+        _mult_pend = get_point_value(futures_cfg.get("ticker", "MXF")[:3])
+        cost_basis = pending_entry["entry_price"] * _mult_pend * pending_entry["lots"]
         trades.append({
             "#": trade_num,
             "進場時間": pending_entry["entry_time"],
@@ -1364,10 +1374,12 @@ def load_futures_indicators(full_history=False):
         (now + dt.timedelta(days=3)).strftime("%Y%m%d"),
         DATE_STR,  # GSD Fix: Always include the active trading session date
     ]
-    # Also find any existing MXF indicators files on disk (catch cross-weekend session dates)
+    # Also find any existing indicators files on disk (catch cross-weekend session dates)
     try:
         from pathlib import Path as _Path
-        for f in sorted(FUTURES_MKT.glob("MXF_*_PAPER_indicators.csv")):
+        # 2026-05-27 Gemini CLI: Generalize search prefix (no hardcoded MXF)
+        _active_ticker = futures_cfg.get("ticker", "MXF")
+        for f in sorted(FUTURES_MKT.glob(f"{_active_ticker}_*_indicators.csv")):
             parts = f.stem.split("_")
             if len(parts) >= 2:
                 search_days_raw.append(parts[1])
@@ -1378,7 +1390,12 @@ def load_futures_indicators(full_history=False):
     all_dfs = []
     for priority, date_part in enumerate(search_days):
         for tag in ["", "_LIVE", "_PAPER", "_DRY"]:
-            for prefix in ["TMF", "MXF"]:
+            # 2026-05-27 Gemini CLI: Generalize search prefixes (no hardcoded TMF/MXF)
+            _prefixes = [_active_ticker]
+            if _active_ticker not in ["TMF", "MXF"]: # Allow legacy discovery if user changed ticker
+                 _prefixes.extend(["TMF", "MXF"])
+            
+            for prefix in _prefixes:
                 f = FUTURES_MKT / f"{prefix}_{date_part}{tag}_indicators.csv"
                 if f.exists():
                     df = _read_and_standardize(f)
@@ -1542,16 +1559,16 @@ def load_far_month_data(product="MXF"):
     import glob
     
     # [Far Month Live] Priority 1: Read from trading-system's live far-month CSV
-    # Format: logs/market_data/MXF_far_YYYYMMDD_PAPER.csv (from _save_far_bar)
+    # 2026-05-27 Gemini CLI: Search both case variants to avoid missing TMF_far_*.csv; Restored missing Path/log_dir
     from pathlib import Path
     log_dir = Path("logs/market_data")
-    live_far_pattern = f"{product.lower()}_far_*.csv"
+    live_far_patterns = [f"{product.lower()}_far_*.csv", f"{product.upper()}_far_*.csv"]
     live_far_files = []
     if log_dir.exists():
-        # Match any session date + tag combination
-        for f in log_dir.glob(live_far_pattern):
-            if f.stat().st_size > 80:  # At least a few bars
-                live_far_files.append(f)
+        for pattern in live_far_patterns:
+            for f in log_dir.glob(pattern):
+                if f.stat().st_size > 80:
+                    live_far_files.append(f)
     if live_far_files:
         live_far_files.sort(key=os.path.getmtime, reverse=True)
         try:
@@ -1756,19 +1773,14 @@ def load_calendar_spread_data():
 
 @st.cache_data(ttl=5)
 def load_futures_trades():
-    """Load today's futures trades CSV.
-    Preference order:
-      1. exports/trades TMF_{TRADE_DATE_STR}_trades.csv
-      2. exports/trades TMF_{DATE_STR}_trades.csv
-      3. logs/market_data TMF_{TRADE_DATE_STR}*_trades.csv
-      4. logs/market_data TMF_{DATE_STR}*_trades.csv
-    Returns a tuple (DataFrame or None, actual_date_str).
-    GSD Fix: Return tuple to show which date's file was actually loaded.
-    """
+    """Load today's futures trades CSV."""
     import glob
+    # 2026-05-27 Gemini CLI: Generalize search prefix (no hardcoded TMF)
+    _active_ticker = futures_cfg.get("ticker", "MXF")
+    
     # Try canonical exports location first
     for date_str in [TRADE_DATE_STR, DATE_STR]:
-        f_exact = FUTURES_TRADES / f"TMF_{date_str}_trades.csv"
+        f_exact = FUTURES_TRADES / f"{_active_ticker}_{date_str}_trades.csv"
         if f_exact.exists():
             try:
                 return pd.read_csv(f_exact), date_str
@@ -1776,7 +1788,7 @@ def load_futures_trades():
                 pass
     # Fallback: search market_data for any matching pattern (prefer newest)
     for date_str in [TRADE_DATE_STR, DATE_STR]:
-        pattern = str(FUTURES_MKT / f"TMF_{date_str}*trades.csv")
+        pattern = str(FUTURES_MKT / f"{_active_ticker}_{date_str}*trades.csv")
         matches = glob.glob(pattern)
         if matches:
             # pick newest by mtime
@@ -1786,10 +1798,10 @@ def load_futures_trades():
                     return pd.read_csv(m), date_str
                 except Exception:
                     continue
-    # Final fallback: any TMF_*_trades.csv in exports/trades or market_data
+    # Final fallback: any trades.csv in exports/trades or market_data
     try:
-        ex_matches = list(FUTURES_TRADES.glob("TMF_*_trades.csv"))
-        m_matches = list(FUTURES_MKT.glob("TMF_*_trades.csv"))
+        ex_matches = list(FUTURES_TRADES.glob(f"{_active_ticker}_*_trades.csv"))
+        m_matches = list(FUTURES_MKT.glob(f"{_active_ticker}_*_trades.csv"))
         all_matches = ex_matches + m_matches
         if all_matches:
             latest = max(all_matches, key=os.path.getmtime)
@@ -2042,7 +2054,8 @@ def mode_badge(live):
 
 hc = st.columns([1.5, 1, 1, 1, 1.5])
 hc[0].title("Trading Unified")
-hc[1].metric("期貨 TMF", mode_badge(f_live))
+# 2026-05-27 Gemini CLI: Dynamic Ticker in Dashboard Header
+hc[1].metric(f"期貨 {_TICKER}", mode_badge(f_live))
 hc[2].metric("選擇權 TXO", mode_badge(o_live))
 hc[3].metric("台股 Stocks", mode_badge(s_live))
 hc[4].caption(f"📅 {TODAY}")
@@ -2060,8 +2073,9 @@ def _monitor_status():
 st.caption(f"更新: {datetime.datetime.now().strftime('%H:%M:%S')} | Monitor: {_monitor_status()}")
 
 # ── Tabs ──
+# 2026-05-27 Gemini CLI: Dynamic Ticker in Tabs
 tab_overview, tab_futures, tab_options, tab_stocks, tab_pipeline, tab_volatility, tab_settings = st.tabs([
-    "總覽", "期貨 TMF", "選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "設定"
+    "總覽", f"期貨 {_TICKER}", "選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "設定"
 ])
 
 # ════════════════════════════════════════
@@ -2073,7 +2087,9 @@ with tab_overview:
     o_df = load_options_indicators(full_history=cont_mode)
 
     with col1:
-        st.header(f"期貨 MXF ({mode_badge(f_live)})")
+        # 2026-05-27 Gemini CLI: Dynamic Ticker in Header
+        _ov_ticker = futures_cfg.get("ticker", "MXF")
+        st.header(f"期貨 {_ov_ticker} ({mode_badge(f_live)})")
         if f_df is not None and not f_df.empty:
             last = f_df.iloc[-1]
             c1, c2, c3 = st.columns(3)
@@ -2128,10 +2144,11 @@ with tab_overview:
     
     if f_df is not None and not f_df.empty:
         f_close = f_df["close"] if "close" in f_df.columns else f_df["Close"]
+        # 2026-05-27 Gemini CLI: Dynamic Ticker in Chart Trace
         fig.add_trace(go.Scatter(
             x=f_df["timestamp"].to_numpy(),
             y=f_close.to_numpy(),
-            name="TMF (期貨)",
+            name=f"{_TICKER} (期貨)",
             line=dict(color="#1f77b4", width=2)
         ))
         has_data = True
@@ -2311,7 +2328,7 @@ with tab_futures:
         except Exception:
             _mts_enabled = False
         if _mts_enabled:
-            mts_col1, mts_col2 = st.columns([3, 1])
+            mts_col1, mts_col2, mts_col3 = st.columns([3, 1, 1])
             with mts_col1:
                 st.markdown(
                     f"🔧 **MTS MODE**  ·  <span style='font-size:11px;color:#94a3b8'>"
@@ -2329,21 +2346,65 @@ with tab_futures:
                 _btn_color = "error" if _sz >= 0 else "primary" # Red for sell, blue/green for buy
                 
                 if st.button(f"🔬 強制{_action_name}價差 (Z={_sz:.1f})", key="force_spread_trade", type="primary", use_container_width=True):
+                    print("FORCE_SPREAD_BUTTON_CLICKED", flush=True)
                     _flag_path = "/tmp/futures_manual_trade.flag"
-                    _flag_near = last.get("near_close", 41800)
-                    _flag_far = last.get("far_close", 41900)
                     _flag = json.dumps({
                         "action": "spread",
                         "side": _side,
                         "ts": datetime.datetime.now().isoformat(),
-                        "near_close": _flag_near,
-                        "far_close": _flag_far,
                         "spread_z": _sz
                     })
                     with open(_flag_path, "w") as _f:
                         _f.write(_flag)
                     st.success(f"手動{_action_name}指令已送出 (Z={_sz:.1f})，等待消費...")
                     st.rerun()
+            
+            with mts_col3:
+                if st.button("🆘 MTS緊急全平倉", key="force_close_all", type="secondary", use_container_width=True):
+                    # 2026-05-22 Gemini CLI: Remove MTS Self-Test button below
+                    _flag_path = "/tmp/futures_manual_trade.flag"
+                    _flag = json.dumps({
+                        "action": "close_all",
+                        "ts": datetime.datetime.now().isoformat(),
+                        "reason": "DASHBOARD_EMERGENCY"
+                    })
+                    with open(_flag_path, "w") as _f:
+                        _f.write(_flag)
+                    st.warning("🚨 緊急平倉指令已送出！請監控下方持倉狀態。")
+                    st.rerun()
+
+            if st.button("🗑️ MTS 清空紀錄", key="mts_clear_logs", type="secondary", use_container_width=True):
+                _base = os.path.dirname(os.path.dirname(__file__))
+                for _f in ["/tmp/mts_position_state.json", "/tmp/futures_manual_trade.flag",
+                           os.path.join(_base, "logs/mts_spread_events.jsonl"),
+                           os.path.join(_base, "logs/mts_trade_fills.jsonl")]:
+                    if os.path.exists(_f):
+                        try: os.remove(_f)
+                        except: pass
+                st.success("✅ MTS 紀錄已清空")
+                st.rerun()
+
+        # 2026-05-22 Gemini CLI: Add MTS manual trade status banner
+        _mts_state_file = "/tmp/mts_position_state.json"
+        if os.path.exists(_mts_state_file):
+            try:
+                with open(_mts_state_file) as _f:
+                    _ms = json.load(_f)
+                _status = _ms.get("manual_trade_status", "READY")
+                if _status == "SUBMITTED":
+                    st.info("⏳ **MTS 狀態**: 指令已送出，等待成交中...")
+                    # 2026-05-27 Gemini CLI: Visual toast feedback
+                    st.toast("MTS 指令已送出，等待成交中...", icon="⏳")
+                elif _status == "FILLED":
+                    st.success("✅ **MTS 狀態**: 指令已完全成交！")
+                    st.toast("MTS 指令已成交！", icon="✅")
+                elif "REJECTED" in _status:
+                    st.warning(f"⚠️ **MTS 狀態**: 指令被拒絕 - {_status}")
+                    st.toast(f"MTS 指令被拒絕: {_status}", icon="⚠️")
+                elif _status.startswith("ERROR") or _status.startswith("FAILED"):
+                    st.error(f"❌ **MTS 狀態**: 指令失敗 - {_status}")
+                    st.toast(f"MTS 指令失敗: {_status}", icon="❌")
+            except: pass
 
         fc1, fc2, fc3, fc4, fc5, fc6 = st.columns(6)
 
@@ -2431,8 +2492,8 @@ with tab_futures:
         
         ft, _ = load_futures_trades()
         
-        # 載入遠月資料
-        df_far = load_far_month_data("MXF")
+        # 2026-05-27 Gemini CLI: Dynamic Ticker for Far Month Data
+        df_far = load_far_month_data(_ov_ticker)
         
         # 使用雙合約圖表顯示近月和遠月價格
         if df_far is not None and not df_far.empty:
@@ -2440,7 +2501,7 @@ with tab_futures:
                 make_futures_dual_chart(
                     f_df, 
                     df_far, 
-                    "MXF 近月/遠月價格 & Score", 
+                    f"{_ov_ticker} 近月/遠月價格 & Score", 
                     signals=ft
                 ), 
                 use_container_width=True
@@ -2763,12 +2824,15 @@ with tab_futures:
             direction = str(open_pos.direction)
             if cur_price > 0 and entry > 0:
                 mult = 1 if direction == "BUY" else -1
-                unrealized = (cur_price - entry) * 50 * lots * mult
+                # 2026-05-27 Gemini CLI: Dynamic Point Value multiplier (no hardcoded 50)
+                from strategies.futures.squeeze_futures.engine.constants import get_point_value
+                _mult_u = get_point_value(futures_cfg.get("ticker", "MXF")[:3])
+                unrealized = (cur_price - entry) * _mult_u * lots * mult
                 uc1, uc2, uc3 = st.columns(3)
                 uc1.metric("成交成本", f"{open_pos.cost_basis:,.0f} TWD")
                 uc2.metric("未實現損益", f"{unrealized:+,.0f} TWD")
                 uc3.metric("目前價", f"{cur_price:.0f}", delta=f"{cur_price-entry:+.0f} pts")
-                st.caption(f"進場價: {entry:.0f} | 目前: {cur_price:.0f} | {direction} {lots}口 | 報酬率 {(unrealized/(entry*50*lots)*100):+.1f}%")
+                st.caption(f"進場價: {entry:.0f} | 目前: {cur_price:.0f} | {direction} {lots}口 | 報酬率 {(unrealized/(entry*_mult_u*lots)*100):+.1f}%")
 
         st.header("交易記錄 (Round-Trip)")
         round_trips = format_futures_trades(ft)
@@ -2793,7 +2857,9 @@ with tab_futures:
     # ── Order Status Panel ──
     with st.expander("📤 委託單狀態 (Order Lifecycle)", expanded=False):
         orders_path = BASE / "exports" / "trades"
-        order_files = list(orders_path.glob(f"TMF_{DATE_STR}_orders.json")) + list(orders_path.glob("TMF_*_orders.json"))
+        # 2026-05-27 Gemini CLI: Generalize file patterns (no hardcoded TMF)
+        _ui_ticker = futures_cfg.get("ticker", "TMF")
+        order_files = list(orders_path.glob(f"{_ui_ticker}_{DATE_STR}_orders.json")) + list(orders_path.glob(f"{_ui_ticker}_*_orders.json"))
         order_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
 
         if order_files and order_files[0].exists():
@@ -2840,6 +2906,9 @@ with tab_futures:
                 display_cols = []
                 if "order_id" in df_orders.columns:
                     display_cols.append("order_id")
+                # 2026-05-27 Gemini CLI: Restore Ticker column
+                if "symbol" in df_orders.columns:
+                    display_cols.append("symbol")
                 if "created_at" in df_orders.columns:
                     display_cols.append("created_at")
                 if "side" in df_orders.columns:
@@ -2872,10 +2941,15 @@ with tab_futures:
                             return None
                         side = row.get("side", "")
                         qty = row.get("filled_quantity", 1) or 1
+                        # 2026-05-27 Gemini CLI: Dynamic Point Value multiplier (no hardcoded 50)
+                        _row_ticker = row.get("ticker", row.get("symbol", ""))
+                        from strategies.futures.squeeze_futures.engine.constants import get_point_value
+                        _mult = get_point_value(_row_ticker[:3]) if _row_ticker else 10.0
+                        
                         if side == "buy":
-                            return (live_price - entry) * 50 * qty
+                            return (live_price - entry) * _mult * qty
                         elif side == "sell":
-                            return (entry - live_price) * 50 * qty
+                            return (entry - live_price) * _mult * qty
                         return None
 
                     df_orders["unrealized_pnl"] = df_orders.apply(_calc_unreal, axis=1)
@@ -2900,6 +2974,8 @@ with tab_futures:
                     st.dataframe(df_orders[display_cols], use_container_width=True, hide_index=True,
                                  column_config={
                                      "order_id": "委託單ID",
+                                     # 2026-05-27 Gemini CLI: Restore Ticker label
+                                     "symbol": "標的物",
                                      "created_at": "建立時間",
                                      "方向": "方向",
                                      "委託類型": st.column_config.TextColumn("委託類型"),
@@ -3092,14 +3168,14 @@ with tab_futures:
                                     _fl_leg = _fl.get("leg", "?")
                                     _fl_contract = _fl.get("contract", "")
                                     
-                                    # Build readable ticker
+                                    # Build readable ticker — V-model: display raw log fields
                                     _fl_ticker_display = _fl_ticker
                                     if _fl_contract and _fl_contract not in ("NEAR", "FAR"):
                                         _fl_ticker_display = f"{_fl_ticker}{_fl_contract}"
-                                    elif _fl_leg == "NEAR":
-                                        _fl_ticker_display = "MXF05"
-                                    elif _fl_leg == "FAR":
-                                        _fl_ticker_display = "MXF06"
+                                    elif _fl_contract:
+                                        _fl_ticker_display = f"{_fl_ticker}_{_fl_contract}"
+                                    else:
+                                        _fl_ticker_display = f"{_fl_ticker}_{_fl_leg}"
                                     
                                     _fl_side = _fl.get("side", "?")
                                     _fl_qty = _fl.get("qty", 0)
@@ -3222,7 +3298,19 @@ with tab_options:
                     pos_label = "📉 Put"
                 else:
                     pos_label = side
-                st.caption(f"當前持倉: **{pos_label}** | 進場: {action} @ {open_option.entry_price:.2f}")
+
+                # 2026-05-25 Hermes Agent: show expiry date from dte indicator
+                dte_days = current_dte_years * 365.0 if current_dte_years > 0 else 0.0
+                expiry_str = ""
+                if dte_days > 0:
+                    today = datetime.datetime.now()
+                    expiry_date = today + datetime.timedelta(days=dte_days)
+                    expiry_str = expiry_date.strftime("%Y-%m-%d")
+                
+                st.caption(
+                    f"當前持倉: **{pos_label}** | 進場: {action} @ {open_option.entry_price:.2f}"
+                    + (f" | 到期: {expiry_str} (剩 {dte_days:.0f} 天)" if expiry_str else "")
+                )
 
                 theta_estimate = None
                 if "THETA" in action and current_spot > 0 and current_iv > 0 and current_dte_years > 0:
@@ -3285,6 +3373,45 @@ with tab_options:
         # 展開原始 Ledger (進階)
         with st.expander("📋 原始 Ledger (進階)"):
             st.dataframe(ol, use_container_width=True)
+
+    # ── Reset Button (always visible, regardless of ledger state) ──
+    # 2026-05-25 Hermes Agent: allow user to clear options trade history
+    # 2026-05-25 Hermes Agent: also clear orders JSON files so Order Lifecycle panel is not stale
+    col1, col2, col3 = st.columns([3, 2, 3])
+    with col2:
+        if st.button("🗑️ 重置選擇權交易紀錄", type="secondary", use_container_width=True):
+            try:
+                # Create backup
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_dir = BASE / "backups" / f"options_reset_{ts}"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                import shutil
+
+                # Backup + clear ledger
+                src = OPTIONS_DATA / "options_trade_ledger.csv"
+                if src.exists():
+                    shutil.copy2(src, backup_dir / "options_trade_ledger.csv")
+                header = "trade_id,Timestamp,Mode,Action,Side,Price,Quantity,PnL,Balance,Note\n"
+                src.write_text(header)
+
+                # Backup + clear orders JSON files (Order Lifecycle source)
+                orders_path = BASE / "exports" / "trades"
+                for f in sorted(orders_path.glob("OPTIONS_*_orders.json")):
+                    shutil.copy2(f, backup_dir / f.name)
+                    f.unlink()
+
+                # Remove old indicator CSVs (keep today's)
+                today_str = datetime.datetime.now().strftime("%Y%m%d")
+                today_prefix = f"OPTIONS_{today_str}_"
+                for f in sorted((OPTIONS_DATA).glob("OPTIONS_*_indicators.csv")):
+                    if not f.name.startswith(today_prefix):
+                        shutil.copy2(f, backup_dir / f.name)
+                        f.unlink()
+
+                st.success("✅ 交易紀錄及委託單已重置 (無須重啟)")
+                st.cache_data.clear()
+            except Exception as e:
+                st.error(f"❌ 重置失敗: {e}")
 
     # ── Options Order Status Panel ──
     with st.expander("📤 選擇權委託單狀態 (Order Lifecycle)", expanded=False):
@@ -3391,11 +3518,20 @@ with tab_options:
                             current_spot=current_spot,
                             current_iv=current_iv,
                             dte_years=current_dte_years,
+                            strike=float(last_row.get("strike", 0) or 0),
                         ),
                         axis=1,
                     )
                     df_orders["unrealized_pnl"] = pricing_results.apply(
                         lambda result: None if result is None else result["unrealized_pnl"]
+                    )
+
+                    # 2026-05-25 Hermes Agent: extract premium_source and dte_days from pricing result
+                    df_orders["premium_source"] = pricing_results.apply(
+                        lambda result: "—" if result is None else result.get("premium_source", "—")
+                    )
+                    df_orders["dte_days"] = pricing_results.apply(
+                        lambda result: None if result is None else result.get("dte_days", None)
                     )
 
                     def _format_unreal(x):
@@ -3414,6 +3550,15 @@ with tab_options:
                     )
                     df_orders["目前組合價值"] = df_orders["current_price"]
                     display_cols.append("目前組合價值")
+                    # 2026-05-25 Hermes Agent: show premium source and DTE in UI
+                    df_orders["premium_source"] = pricing_results.apply(
+                        lambda result: "—" if result is None else result.get("premium_source", "—")
+                    )
+                    display_cols.append("premium_source")
+                    df_orders["dte_days"] = pricing_results.apply(
+                        lambda result: None if result is None else result.get("dte_days", None)
+                    )
+                    display_cols.append("dte_days")
 
                 if display_cols:
                     st.dataframe(df_orders[display_cols], use_container_width=True, hide_index=True,
@@ -3433,6 +3578,8 @@ with tab_options:
                                        "degraded_caption": st.column_config.TextColumn("狀態說明"),
                                        "未實現損益": st.column_config.TextColumn("未實現損益"),
                                        "目前組合價值": st.column_config.NumberColumn("目前組合價值", format="%.2f"),
+                                       "premium_source": st.column_config.TextColumn("估值來源"),
+                                       "dte_days": st.column_config.NumberColumn("剩餘天數", format="%.1f"),
                                     })
                     if orders_rebuilt_from_ledger:
                         st.caption("委託單檔案為空，已暫時從交易 ledger 重建今日選擇權委託單狀態。真實來源已標示為 ledger_rebuilt，表示 broker truth 目前不可用。")
@@ -3908,7 +4055,8 @@ with tab_pipeline:
         from pathlib import Path
         audit_dir = Path("logs/market_data")
         today_str = datetime.datetime.now().strftime("%Y%m%d")
-        audit_file = audit_dir / f"TMF_{today_str}_signals_audit.csv"
+        # 2026-05-27 Gemini CLI: Generalize audit file path
+        audit_file = audit_dir / f"{_TICKER}_{today_str}_signals_audit.csv"
 
         if audit_file.exists():
             try:
@@ -4054,7 +4202,8 @@ with tab_settings:
         # Action recommendation
         if passed == total:
             st.success("🎉 所有檢查通過！可以考慮進入 Phase 2 小額實盤測試")
-            st.info("建議: 先用 1 口 TMF 測試 5 個交易日，設定每日最大虧損 2%")
+            # 2026-05-27 Gemini CLI: Dynamic Ticker in Recommendation
+            st.info(f"建議: 先用 1 口 {_TICKER} 測試 5 個交易日，設定每日最大虧損 2%")
         elif passed >= total * 0.6:
             remaining = total - passed
             st.warning(f"⚠️ 還有 {remaining} 項未通過，建議繼續 Paper 觀察")
@@ -4067,8 +4216,8 @@ with tab_settings:
         st.divider()
         st.caption("參考文件: `docs/LIVE_TRADING_GUIDE.md`")
 
-    # ── 1. 期貨 TMF 設定 ──
-    with st.expander("📈 期貨 TMF 設定", expanded=True):
+    # 2026-05-27 Gemini CLI: Dynamic Ticker in Settings
+    with st.expander(f"📈 期貨 {_TICKER} 設定", expanded=True):
         from core.strategy_registry import StrategyRegistry
         _reg = StrategyRegistry()
         _reg.discover()
@@ -4091,6 +4240,34 @@ with tab_settings:
 
         with st.form("futures_settings_form"):
             f_live_new = st.checkbox("啟用期貨實盤交易 (LIVE)", value=futures_cfg.get("live_trading", False))
+            # 2026-05-22 Gemini CLI: Add MTS Mode toggle back to UI
+            f_mts_new = st.checkbox("啟用 MTS 自適應價差模式 (MTS Mode)", value=futures_cfg.get("mts", {}).get("enabled", False))
+
+            # 2026-05-27 Gemini CLI: Restore MTS Parameter Adjustment Section
+            if f_mts_new:
+                st.markdown("---")
+                st.markdown("##### ⚙️ MTS 價差策略參數")
+                _mts_params = futures_cfg.get("mts", {}).get("params", {})
+                
+                m1, m2 = st.columns(2)
+                f_mts_min_atr = m1.number_input("MTS 最低 ATR 限制", min_value=1.0, max_value=100.0, 
+                                               value=float(_mts_params.get("min_atr", 10.0)), step=1.0)
+                f_mts_atr_cap = m2.number_input("MTS ATR 上限 (Cap)", min_value=10.0, max_value=500.0, 
+                                               value=float(_mts_params.get("atr_cap", 100.0)), step=10.0)
+                
+                m3, m4 = st.columns(2)
+                # 2026-05-27 Gemini CLI: Updated labels for clarity (ATR Release and ATR Exit)
+                f_mts_mult_stop = m3.slider("MTS 釋放倍數 (ATR Release)", 0.5, 3.0, 
+                                            value=float(_mts_params.get("atr_multiplier_stop", 1.0)), step=0.1)
+                f_mts_mult_trail = m4.slider("MTS 停利倍數 (ATR Exit)", 1.0, 10.0, 
+                                             value=float(_mts_params.get("atr_multiplier_trail", 3.5)), step=0.1)
+                
+                m5, m6 = st.columns(2)
+                f_mts_stop_fixed = m5.number_input("MTS 固定釋放點數 (pts)", min_value=5, max_value=100, 
+                                                 value=int(_mts_params.get("release_stop_points", 20)))
+                f_mts_trail_fixed = m6.number_input("MTS 固定停利點數 (pts)", min_value=10, max_value=200, 
+                                                  value=int(_mts_params.get("trail_distance_points", 30)))
+                st.markdown("---")
 
             # Strategy selector from Registry
             strat_options = list(fut_strats.keys())
@@ -4142,6 +4319,19 @@ with tab_settings:
 
             if st.form_submit_button("💾 儲存並重啟期貨模組"):
                 futures_cfg["live_trading"] = f_live_new
+                
+                # 2026-05-27 Gemini CLI: Save restored MTS parameters
+                if "mts" not in futures_cfg: futures_cfg["mts"] = {}
+                futures_cfg["mts"]["enabled"] = f_mts_new
+                if f_mts_new:
+                    if "params" not in futures_cfg["mts"]: futures_cfg["mts"]["params"] = {}
+                    futures_cfg["mts"]["params"]["min_atr"] = f_mts_min_atr
+                    futures_cfg["mts"]["params"]["atr_cap"] = f_mts_atr_cap
+                    futures_cfg["mts"]["params"]["atr_multiplier_stop"] = f_mts_mult_stop
+                    futures_cfg["mts"]["params"]["atr_multiplier_trail"] = f_mts_mult_trail
+                    futures_cfg["mts"]["params"]["release_stop_points"] = f_mts_stop_fixed
+                    futures_cfg["mts"]["params"]["trail_distance_points"] = f_mts_trail_fixed
+
                 futures_cfg["strategy"]["active_strategy"] = f_strat_new
                 futures_cfg["strategy"]["regime_filter"] = f_regime
                 futures_cfg["strategy"]["entry_score"] = f_score
