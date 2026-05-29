@@ -1,5 +1,71 @@
 # tw-trading-unified Development Rules
 
+## Meta Rules — Apply to Every Task (Unless Explicitly Overridden)
+
+These rules govern all work in this project. Bias: caution over speed on non-trivial work. Use judgment on trivial tasks.
+
+### Rule 1 — Think Before Coding
+State assumptions explicitly. If uncertain, ask rather than guess.
+Present multiple interpretations when ambiguity exists.
+Push back when a simpler approach exists.
+Stop when confused. Name what's unclear.
+
+### Rule 2 — Simplicity First
+Minimum code that solves the problem. Nothing speculative.
+No features beyond what was asked. No abstractions for single-use code.
+Test: would a senior engineer say this is overcomplicated? If yes, simplify.
+
+### Rule 3 — Surgical Changes
+Touch only what you must. Clean up only your own mess.
+Don't "improve" adjacent code, comments, or formatting.
+Don't refactor what isn't broken. Match existing style.
+
+### Rule 4 — Goal-Driven Execution
+Define success criteria. Loop until verified.
+Don't follow steps. Define success and iterate.
+Strong success criteria let you loop independently.
+
+### Rule 5 — One Fix Per Change (New 2026-05-20)
+Each patch must fix EXACTLY ONE thing.
+- Before any change: state FIX, SCOPE, and VERIFY.
+- If you discover a second bug during a fix: document it, do NOT fix it. Tell the user.
+- If the fix requires changing 3+ files: stop and ask.
+- After the change: verify ONLY the stated fix.
+- You MAY NOT add extra fixes, refactors, improvements, or style changes to the same change.
+
+### Rule 7 — Surface Conflicts, Don't Average Them
+If two patterns contradict, pick one (more recent / more tested).
+Explain why. Flag the other for cleanup.
+Don't blend conflicting patterns.
+
+### Rule 8 — Read Before You Write
+Before adding code, read exports, immediate callers, shared utilities.
+"Looks orthogonal" is dangerous. If unsure why code is structured a way, ask.
+
+### Rule 9 — Tests Verify Intent, Not Just Behavior
+Tests must encode WHY behavior matters, not just WHAT it does.
+A test that can't fail when business logic changes is wrong.
+
+### Rule 10 — Checkpoint After Every Significant Step
+Summarize what was done, what's verified, what's left.
+Don't continue from a state you can't describe back.
+If you lose track, stop and restate.
+
+### Rule 11 — Match the Codebase's Conventions, Even If You Disagree
+Conformance > taste inside the codebase.
+If you genuinely think a convention is harmful, surface it. Don't fork silently.
+
+### Rule 12 — Fail Loud
+"Completed" is wrong if anything was skipped silently.
+"Tests pass" is wrong if any were skipped.
+Default to surfacing uncertainty, not hiding it.
+
+### Rule 13 — Code Attribution (2026-05-22)
+EVERY code modification MUST include a comment with the timestamp (ISO 8601 or YYYY-MM-DD) and the author ("Hermes Agent"). Applies to all patch/write_file operations. The timestamp in each comment MUST be the actual date the modification is made — do not copy the rule's creation date or any example date.
+Example (correct, written on 2026-05-22): `# 2026-05-22 Hermes Agent: fix feed health pollution from TMF_VIRTUAL`
+
+---
+
 ## CRITICAL: Read Before Any Code Change
 
 This is a live trading system (currently PAPER mode). Bugs cause real financial loss.
@@ -34,12 +100,34 @@ def enter():
     if price <= 0: return           # invalid price
     if same_bar: return             # already traded this bar
 
-# Exit: zero position BEFORE logging
+# Exit Path (Atomic Sequence):
+# 1. Reentrancy Guard: prevent double-processing during IO
+# 2. Freeze Snapshot: capture qty, entry_price, spread_data
+# 3. Create Order Intent: call _record_paper_order or similar
+#    - If FAILED (None): return early, KEEP position for retry on next tick
+# 4. Update SSOT: zero or decrement position immediately AFTER order accepted
+# 5. Side Effects: log_trade, notifications AFTER state change
 def exit():
-    if position == 0: return        # nothing to exit
-    qty = position                  # capture before zeroing
-    position = 0                    # zero FIRST
-    log_trade(qty=qty)              # log AFTER
+    if getattr(self, "_exit_in_progress", False): return
+    self._exit_in_progress = True
+    try:
+        qty = self.position
+        if qty == 0: return
+        
+        # 1. Capture snapshot
+        snapshot = ...
+        
+        # 2. Establish order intent
+        order = self._record_paper_order(...)
+        if order is None: return # Keep position, retry next tick
+        
+        # 3. Update SSOT immediately
+        self.position = 0 
+        
+        # 4. IO / Logging
+        log_trade(qty=qty, snapshot=snapshot, ...)
+    finally:
+        self._exit_in_progress = False
 ```
 
 ## Rule 4: PnL Must Include All Costs
@@ -59,7 +147,7 @@ pnl_cash = gross_pnl - broker_fee - exchange_fee - tax - slippage
 
 ## Rule 6: Paper Mode Capital Limits
 
-- `initial_capital: 40000` in options config
+- `initial_capital: 100000` in options config
 - Buyer: need `premium × 50 × lots` available
 - Seller spread: need `wing_width × 50 × lots` available
 - Reserve 20% always untouched
@@ -105,6 +193,13 @@ python3 -m pytest tests/ -v          # All tests pass
 python3 -c "import py_compile; ..."  # No syntax errors
 python3 main.py --dry-run            # Starts without crash
 ```
+
+## Rule 11: Zero Hardcoding Policy
+
+- NEVER hardcode product tickers (e.g., "TMF", "MXF", "TXO") in core logic, function defaults, or file patterns.
+- Always load current product from `config/futures.yaml` (ticker field) or via `StrategyContext`.
+- If a ticker is needed for a default argument, use `None` and resolve it at runtime from configuration.
+- Rationale: High maintenance cost and high risk of using wrong instrument data when switching markets.
 
 ---
 

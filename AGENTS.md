@@ -3,7 +3,20 @@ You are working on a Taiwan futures + options trading system (Shioaji broker). B
 Read RULES.md in project root before any code change.
 Run `python3 -m pytest tests/ -v` before and after every change.
 
-Key rules:
+# Project Context
+
+## Before Any Change
+
+You MUST output:
+  FIX: <one sentence describing exactly what bug or behavior is being changed>
+  SCOPE: <list of files to be modified>
+  VERIFY: <how to confirm the fix works>
+
+You MAY NOT add extra fixes, refactors, or improvements to the same change.
+If you discover additional issues during a fix: document them, do NOT fix them. Tell the user.
+If the fix requires 3+ modified files: stop and ask.
+
+## Key rules
 - Side effects (CSV/log write) ONLY after operation succeeds, never before
 - PaperTrader.position is the single source of truth for position state
 - All PnL must include broker fees + exchange fees + tax
