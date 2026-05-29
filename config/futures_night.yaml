@@ -1,20 +1,22 @@
-active_strategy: null      # 不強制指定，由 regime 自動選擇
-auto_select: true          # 啟用自動切換
+ticker: TMF
+active_strategy: null
+auto_select: true
 cooldown_bars: 5
 execution:
-  broker_fee_per_side: 20.0  # 微台指手續費
+  broker_fee_per_side: 20.0
   exchange_fee_per_side: 0.0
-  initial_balance: 50000     # 微台指 5 萬足夠
+  initial_balance: 50000
   limit_offset_pts: 2.0
   market_slippage_pts: 2.0
   order_type: MKP
   range_protection_pts: 5.0
   tax_rate: 2.0e-05
   tick_size: 1.0
-  point_value: 10.0          # 微台指一點 10 元
-live_trading: false          # Paper Trading
+  point_value: 10.0
+live_trading: false
 monitoring:
   use_order_manager: true
+  stale_tick_warn_secs: 300
   callback:
     buffer_size: 100
     health_check_secs: 60
@@ -56,6 +58,16 @@ strategy:
   active_strategy: adaptive_orb_v15
   auto_select: false
   volume_threshold: 0.001
+  params:
+    stop_atr_mult: 1.0
+    take_profit_atr_mult: 2.0
+    max_vwap_dist_atr: 0.5
+    min_mom_velo_bearish: -8.0
+    max_adx: 35.0
+    min_vol_spike: 1.0
+    lookback_bars: 5
+    time_stop_minutes: 15
+    shadow_mode: true
   counter_mode:
     atr_sl_mult: 1.5
     auto_regime: true
@@ -85,6 +97,22 @@ strategy:
 debug:
   tickbar: false
   feed: false
+mts:
+  enabled: true
+  strategy: tmf_spread
+  lots: 1
+  params:
+    min_atr: 20.0
+    atr_multiplier_stop: 0.9
+    atr_multiplier_trail: 1.9
+    release_stop_points: 20
+    trail_distance_points: 30
+    atr_cap: 100.0
+debug_gate_bypass:
+  enabled: true
+  paper_only: true
+  disable_entry_score_gate: true
+  disable_volume_gate: true
 trade_mgmt:
   allow_long: true
   allow_short: true

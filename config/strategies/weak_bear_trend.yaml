@@ -2,29 +2,29 @@
 # WEAK Regime 专用空头趋势策略
 # 目標：盈虧比 2:1 (大賺小賠)
 
-[params]
-# 止損/止盈 - 盈虧比 2:1
-stop_atr_mult = 1.0       # 緊止損 (小賠)
-take_profit_atr_mult = 2.0  # 合理止盈 (大賺)
-# 盈虧比 = 2.0 / 1.0 = 2:1
+params:
+  # 止損/止盈 - 盈虧比 2:1
+  stop_atr_mult: 1.0       # 緊止損 (小賠)
+  take_profit_atr_mult: 2.0  # 合理止盈 (大賺)
+  # 盈虧比 = 2.0 / 1.0 = 2:1
 
-# VWAP 距離門檻 (更嚴格，避免被洗出場)
-max_vwap_dist_atr = 0.5   # 0.5 ATR 以內 (必須非常接近 VWAP)
+  # VWAP 距離門檻 (放寬，趨勢確認後允許偏離)
+  max_vwap_dist_atr: 2.0   # 2.0 ATR，允許價格已偏離 VWAP
 
-# 動能門檻 (更嚴格，確保進場品質)
-min_mom_velo_bearish = -8.0  # 要求更強動能向下加速
+  # 動能門檻 (更嚴格，確保進場品質)
+  min_mom_velo_bearish: -8.0  # 要求更強動能向下加速
 
-# ADX 上限 (更嚴格的 WEAK 定義)
-max_adx = 20.0
+  # ADX 上限 (放寬至 50，避免夜盤強趨勢被 gate 鎖死)
+  max_adx: 50.0
 
-# 最小成交量確認
-min_vol_spike = 1.0       # 不需要放量，只要不放大量縮即可
+  # 最小成交量確認
+  min_vol_spike: 1.0       # 不需要放量，只要不放大量縮即可
 
-# 反彈確認 bars
-lookback_bars = 5
+  # 反彈確認 bars (關閉，一路跌不反彈也要能進場)
+  lookback_bars: 0
 
-# Shadow mode (預設開啟，先用虛擬單驗證)
-shadow_mode = true
+  # Shadow mode (paper trading，關閉)
+  shadow_mode: false
 
-# 時間止損 (分鐘) - 縮短時間
-time_stop_minutes = 15    # 15 分鐘無獲利就走
+  # 時間止損 (分鐘) - 縮短時間
+  time_stop_minutes: 15    # 15 分鐘無獲利就走

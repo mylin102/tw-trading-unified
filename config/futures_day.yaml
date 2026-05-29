@@ -24,6 +24,7 @@ monitoring:
 risk_mgmt:
   atr_length: 14
   atr_multiplier: 1.8
+  daily_loss_cap: 5000.0
   break_even_pts: 100
   exit_on_vwap: true
   exit_vwap_confirm_bars: 2
