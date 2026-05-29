@@ -12,7 +12,7 @@ from core.backtest_engine import AssetProfile, AssetType
 def test_grid_search_parallel_execution():
     # 1. Setup dummy data
     dates = [datetime(2026, 1, 1) + timedelta(minutes=5*i) for i in range(100)]
-    df = pd.DataFrame({"Close": np.linspace(100, 110, 100)}, index=dates)
+    df = pd.DataFrame({"Close": np.linspace(100, 110, 100), "ticker": "TMF"}, index=dates)
     
     profile = AssetProfile(asset_type=AssetType.FUTURES, point_value=200, margin_per_lot=100000)
     optimizer = GridSearchOptimizer(profile=profile, initial_capital=1_000_000)

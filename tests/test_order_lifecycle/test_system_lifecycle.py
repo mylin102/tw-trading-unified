@@ -63,6 +63,7 @@ class TestFullLifecycle:
         tick.high = 36460
         tick.low = 36430
         tick.volume = 200
+        tick.symbol = "TMF"  # Required for Symbol Guard
         sim.process_tick(tick)
 
         # Verify full chain
@@ -111,6 +112,7 @@ class TestFullLifecycle:
         tick1.high = 36460
         tick1.low = 36430
         tick1.volume = 200
+        tick1.symbol = "TMF"
         sim.process_tick(tick1)
 
         assert trader.position == 1
@@ -130,6 +132,7 @@ class TestFullLifecycle:
         tick2.high = 36560
         tick2.low = 36530
         tick2.volume = 200
+        tick2.symbol = "TMF"
         sim.process_tick(tick2)
 
         assert trader.position == 0
@@ -169,6 +172,7 @@ class TestConcurrentOrders:
             tick.high = 36470 + i
             tick.low = 36430 + i
             tick.volume = 100
+            tick.symbol = "TMF"
             sim.process_tick(tick)
 
         # All 3 should be filled
@@ -200,6 +204,7 @@ class TestExportDashboardFormat:
         tick.high = 36460
         tick.low = 36430
         tick.volume = 100
+        tick.symbol = "TMF"
         sim.process_tick(tick)
 
         # Export to CSV-ready format
@@ -245,6 +250,7 @@ class TestExportDashboardFormat:
         tick.high = 36460
         tick.low = 36430
         tick.volume = 100
+        tick.symbol = "TMF"
         sim.process_tick(tick)
 
         # Order should still be pending (limit not hit)
@@ -276,13 +282,13 @@ class TestMarketHoursGate:
         assert is_market_open(600) is False   # 06:00 → closed
 
 
-def _build_lifecycle_monitor_for_test():
+def _build_lifecycle_monitor_for_test(ticker: str = "TMF"):
     from strategies.futures.monitor import FuturesMonitor
     from strategies.futures.squeeze_futures.engine.simulator import PaperTrader
 
     monitor = FuturesMonitor.__new__(FuturesMonitor)
-    monitor.ticker = "TMF"
-    monitor.contract = SimpleNamespace(code="TMF")
+    monitor.ticker = ticker
+    monitor.contract = SimpleNamespace(code=ticker)
     monitor.live_trading = True
     monitor.dry_run = False
     monitor.client = MagicMock()

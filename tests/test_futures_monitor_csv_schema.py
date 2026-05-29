@@ -23,7 +23,7 @@ def test_ensure_indicator_schema_repairs_unnamed_timestamp_column(tmp_path):
     assert "score" in repaired.columns
 
 
-def test_backfill_night_gaps_persists_timestamp_header(monkeypatch, tmp_path):
+def test_backfill_night_gaps_persists_timestamp_header(monkeypatch, tmp_path, configured_ticker):
     monkeypatch.chdir(tmp_path)
     market_dir = Path("logs/market_data")
     market_dir.mkdir(parents=True)
@@ -60,7 +60,7 @@ def test_backfill_night_gaps_persists_timestamp_header(monkeypatch, tmp_path):
     monitor.dry_run = False
     monitor.api = object()
     monitor.live_trading = False
-    monitor.ticker = "TMF"
+    monitor.ticker = configured_ticker
 
     monitor._backfill_night_gaps(api_df)
 
@@ -68,7 +68,7 @@ def test_backfill_night_gaps_persists_timestamp_header(monkeypatch, tmp_path):
     assert header.startswith("timestamp,")
 
 
-def test_backfill_night_gaps_repairs_corrupt_csv_and_rebuilds_from_api(monkeypatch, tmp_path):
+def test_backfill_night_gaps_repairs_corrupt_csv_and_rebuilds_from_api(monkeypatch, tmp_path, configured_ticker):
     monkeypatch.chdir(tmp_path)
     market_dir = Path("logs/market_data")
     market_dir.mkdir(parents=True)
@@ -115,7 +115,7 @@ def test_backfill_night_gaps_repairs_corrupt_csv_and_rebuilds_from_api(monkeypat
     monitor.dry_run = False
     monitor.api = object()
     monitor.live_trading = False
-    monitor.ticker = "TMF"
+    monitor.ticker = configured_ticker
 
     monitor._backfill_night_gaps(api_df)
 

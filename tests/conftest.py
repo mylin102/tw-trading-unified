@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 
 import numba as nb
+import pytest
 
 
 def _strip_cache_flag(decorator):
@@ -34,3 +35,19 @@ nb.jit = _strip_cache_flag(nb.jit)
 # environment, writing under the repo root is not allowed, so redirect broker
 # logs to a writable temp location before any module imports `shioaji`.
 os.environ.setdefault("SJ_LOG_PATH", "/tmp/shioaji.log")
+
+
+
+@pytest.fixture
+def configured_ticker():
+    """Read ticker from YAML config. Falls back to 'TMF' if config is missing."""
+    try:
+        from core.session_config import SessionConfig
+
+        cfg = SessionConfig.load("day")
+        val = cfg.get("ticker")
+        if val:
+            return str(val)
+    except Exception:
+        pass
+    return "TMF"

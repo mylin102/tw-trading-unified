@@ -16,27 +16,27 @@ from squeeze_futures.engine.simulator import PaperTrader
 # ═══════════════════════════════════════════
 
 class TestNoDuplicateEntry:
-    def _make_trader(self):
-        return PaperTrader("TMF", 100000, 10, 20, 0, 0.00002)
+    def _make_trader(self, ticker="TMF"):
+        return PaperTrader(ticker, 100000, 10, 20, 0, 0.00002)
 
-    def test_second_buy_blocked_at_max(self):
-        t = self._make_trader()
+    def test_second_buy_blocked_at_max(self, configured_ticker):
+        t = self._make_trader(configured_ticker)
         r1 = t.execute_signal("BUY", 32800, datetime.now(), lots=2, max_lots=2)
         r2 = t.execute_signal("BUY", 32900, datetime.now(), lots=2, max_lots=2)
         assert r1 is not None
         assert r2 is None
         assert t.position == 2
 
-    def test_second_sell_blocked_at_max(self):
-        t = self._make_trader()
+    def test_second_sell_blocked_at_max(self, configured_ticker):
+        t = self._make_trader(configured_ticker)
         r1 = t.execute_signal("SELL", 32800, datetime.now(), lots=2, max_lots=2)
         r2 = t.execute_signal("SELL", 32700, datetime.now(), lots=2, max_lots=2)
         assert r1 is not None
         assert r2 is None
         assert t.position == -2
 
-    def test_buy_after_exit_allowed(self):
-        t = self._make_trader()
+    def test_buy_after_exit_allowed(self, configured_ticker):
+        t = self._make_trader(configured_ticker)
         t.execute_signal("BUY", 32800, datetime.now(), lots=2, max_lots=2)
         t.execute_signal("EXIT", 32900, datetime.now(), lots=2, max_lots=2)
         assert t.position == 0
@@ -50,21 +50,21 @@ class TestNoDuplicateEntry:
 # ═══════════════════════════════════════════
 
 class TestExitClearsPosition:
-    def test_exit_zeroes_long(self):
-        t = PaperTrader("TMF", 100000, 10, 20, 0, 0)
+    def test_exit_zeroes_long(self, configured_ticker):
+        t = PaperTrader(configured_ticker, 100000, 10, 20, 0, 0)
         t.execute_signal("BUY", 32800, datetime.now(), lots=2, max_lots=2)
         t.execute_signal("EXIT", 32900, datetime.now(), lots=2, max_lots=2)
         assert t.position == 0
         assert t.entry_price == 0
 
-    def test_exit_zeroes_short(self):
-        t = PaperTrader("TMF", 100000, 10, 20, 0, 0)
+    def test_exit_zeroes_short(self, configured_ticker):
+        t = PaperTrader(configured_ticker, 100000, 10, 20, 0, 0)
         t.execute_signal("SELL", 32800, datetime.now(), lots=2, max_lots=2)
         t.execute_signal("EXIT", 32700, datetime.now(), lots=2, max_lots=2)
         assert t.position == 0
 
-    def test_double_exit_returns_none(self):
-        t = PaperTrader("TMF", 100000, 10, 20, 0, 0)
+    def test_double_exit_returns_none(self, configured_ticker):
+        t = PaperTrader(configured_ticker, 100000, 10, 20, 0, 0)
         t.execute_signal("BUY", 32800, datetime.now(), lots=2, max_lots=2)
         r1 = t.execute_signal("EXIT", 32900, datetime.now(), lots=2, max_lots=2)
         r2 = t.execute_signal("EXIT", 32900, datetime.now(), lots=2, max_lots=2)
@@ -77,8 +77,8 @@ class TestExitClearsPosition:
 # ═══════════════════════════════════════════
 
 class TestBreakEvenOffset:
-    def test_be_offset_at_least_10(self):
-        t = PaperTrader("TMF", 100000, 10, 20, 0, 0)
+    def test_be_offset_at_least_10(self, configured_ticker):
+        t = PaperTrader(configured_ticker, 100000, 10, 20, 0, 0)
         t.execute_signal("SELL", 32335, datetime.now(), lots=2, max_lots=2,
                          stop_loss=50, break_even_trigger=50)
         # Simulate price moving 50 pts in favor → trigger BE
@@ -87,8 +87,8 @@ class TestBreakEvenOffset:
         # SHORT: stop should be entry - 10 = 32325, not entry - 2
         assert t.current_stop_loss == 32335 - 10
 
-    def test_be_offset_long(self):
-        t = PaperTrader("TMF", 100000, 10, 20, 0, 0)
+    def test_be_offset_long(self, configured_ticker):
+        t = PaperTrader(configured_ticker, 100000, 10, 20, 0, 0)
         t.execute_signal("BUY", 32000, datetime.now(), lots=2, max_lots=2,
                          stop_loss=50, break_even_trigger=50)
         t.update_trailing_stop(32050)
@@ -101,8 +101,8 @@ class TestBreakEvenOffset:
 # ═══════════════════════════════════════════
 
 class TestPnLIncludesFees:
-    def test_pnl_less_than_gross(self):
-        t = PaperTrader("TMF", 100000, 10, 20, 0, 0.00002)
+    def test_pnl_less_than_gross(self, configured_ticker):
+        t = PaperTrader(configured_ticker, 100000, 10, 20, 0, 0.00002)
         t.execute_signal("BUY", 32000, datetime.now(), lots=2, max_lots=2)
         t.execute_signal("EXIT", 32010, datetime.now(), lots=2, max_lots=2)
         trade = t.trades[-1]
@@ -110,16 +110,16 @@ class TestPnLIncludesFees:
         assert trade["pnl_cash"] < gross
         assert trade["total_cost"] > 0
 
-    def test_losing_trade_includes_fees(self):
-        t = PaperTrader("TMF", 100000, 10, 20, 0, 0.00002)
+    def test_losing_trade_includes_fees(self, configured_ticker):
+        t = PaperTrader(configured_ticker, 100000, 10, 20, 0, 0.00002)
         t.execute_signal("BUY", 32000, datetime.now(), lots=2, max_lots=2)
         t.execute_signal("EXIT", 31990, datetime.now(), lots=2, max_lots=2)
         trade = t.trades[-1]
         # Loss should be worse than just -10 pts because of fees
         assert trade["pnl_cash"] < -10 * 10 * 2
 
-    def test_balance_tracks_net_pnl(self):
-        t = PaperTrader("TMF", 100000, 10, 20, 0, 0.00002)
+    def test_balance_tracks_net_pnl(self, configured_ticker):
+        t = PaperTrader(configured_ticker, 100000, 10, 20, 0, 0.00002)
         initial = t.balance
         t.execute_signal("BUY", 32000, datetime.now(), lots=2, max_lots=2)
         t.execute_signal("EXIT", 32000, datetime.now(), lots=2, max_lots=2)
@@ -386,7 +386,7 @@ class TestSpringBackgroundGate:
     def test_plugin_spring_blocks_bearish_background_buy(self):
         import pandas as pd
         from core.strategy_context import MarketData, PositionView, StrategyContext
-        from strategies.plugins.futures.spring_upthrust import SpringUpthrust
+        from strategies.plugins.futures.active.spring_upthrust import SpringUpthrust
 
         strategy = SpringUpthrust()
         init_ctx = StrategyContext(

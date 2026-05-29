@@ -86,7 +86,7 @@ def test_watchdog_marks_runtime_degraded_on_stale(tmp_path, monkeypatch):
     m = make_monitor(str(cfg))
     m.STALE_WARN_SECS = 1
     m.STALE_CRITICAL_SECS = 10
-    m._last_real_tmf_tick_at = time.time() - 2
+    m.last_tick_at = time.time() - 2
     monkeypatch.setattr("core.shioaji_session._system_status_path", lambda: tmp_path / "runtime_status.json")
     m._check_contract_rollover = lambda: None
     m.client.get_kline = lambda ticker, interval="5m": None
@@ -104,11 +104,11 @@ def test_refresh_runtime_status_requires_fresh_tmf_for_trading(tmp_path, monkeyp
     m.is_trading_ready = True
     monkeypatch.setattr("core.shioaji_session._system_status_path", lambda: tmp_path / "runtime_status.json")
 
-    m._last_real_tmf_tick_at = time.time() - 10
+    m.last_tick_at = time.time() - 10
     m._refresh_runtime_status()
     assert get_shared_system_status() == SystemReadiness.DEGRADED
 
-    m._last_real_tmf_tick_at = time.time()
+    m.last_tick_at = time.time()
     m._refresh_runtime_status()
     assert get_shared_system_status() == SystemReadiness.TRADING
 

@@ -8,10 +8,10 @@ from strategies.futures.monitor import FuturesMonitor
 from strategies.futures.squeeze_futures.engine.simulator import PaperTrader
 
 
-def _build_monitor(*, live_trading: bool):
+def _build_monitor(*, live_trading: bool, ticker: str = "TMF"):
     monitor = FuturesMonitor.__new__(FuturesMonitor)
-    monitor.ticker = "TMF"
-    monitor.contract = SimpleNamespace(code="TMF")
+    monitor.ticker = ticker
+    monitor.contract = SimpleNamespace(code=ticker)
     monitor.live_trading = live_trading
     monitor.dry_run = not live_trading
     monitor.client = MagicMock()

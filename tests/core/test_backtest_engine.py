@@ -32,7 +32,7 @@ def test_futures_backtest_math():
     # Setup dummy data: 100 bars, price goes from 10000 to 10100
     dates = [datetime(2026, 1, 1) + timedelta(minutes=5*i) for i in range(100)]
     prices = np.linspace(10000, 10100, 100)
-    df = pd.DataFrame({"Close": prices}, index=dates)
+    df = pd.DataFrame({"Close": prices, "ticker": "TMF"}, index=dates)
     
     profile = AssetProfile(
         asset_type=AssetType.FUTURES,
@@ -62,7 +62,7 @@ def test_stock_backtest_math():
     # Setup dummy data
     dates = [datetime(2026, 1, 1) + timedelta(days=i) for i in range(100)]
     prices = np.linspace(100, 110, 100)
-    df = pd.DataFrame({"Close": prices}, index=dates)
+    df = pd.DataFrame({"Close": prices, "ticker": "TMF"}, index=dates)
     
     profile = AssetProfile(
         asset_type=AssetType.STOCK,

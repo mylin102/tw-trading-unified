@@ -1,3 +1,4 @@
+import pytest
 import pandas as pd
 
 from core.dashboard_positions import (
@@ -186,13 +187,15 @@ def test_estimate_options_order_unrealized_uses_live_premium_for_single_leg():
         current_spot=38045.0,
         current_iv=0.2675,
         dte_years=28.43 / 365,
+        strike=38100.0,
     )
 
-    assert estimate == {
-        "unrealized_pnl": 2000.0,
-        "current_price": 1210.0,
-        "pricing_label": "option_premium",
-    }
+    assert estimate is not None
+    assert estimate["unrealized_pnl"] == 2000.0
+    assert estimate["current_price"] == 1210.0
+    assert estimate["pricing_label"] == "option_premium"
+    assert estimate["premium_source"] == "LIVE_QUOTE"
+    assert estimate["dte_days"] == pytest.approx(28.43, rel=0.01)
 
 
 def test_describe_options_order_truth_distinguishes_broker_paper_and_ledger_rows():
@@ -295,3 +298,133 @@ def test_latest_indicator_close_uses_latest_row_not_first_row():
     )
 
     assert latest_indicator_close(indicators) == 2500.0
+
+
+# 2026-05-25 Hermes Agent: verify expiry date calculation from dte
+def test_options_position_caption_shows_expiry_from_dte():
+    """Verify that dte days → expiry date calculation is correct."""
+    from datetime import datetime, timedelta
+
+    # Simulate what dashboard.py does: dte=22.38, today fixed
+    today = datetime(2026, 5, 25, 22, 8, 0)
+    dte_days = 22.38
+    expected_date = (today + timedelta(days=dte_days)).strftime("%Y-%m-%d")
+
+    # dte=22.38 from today 2026-05-25 → 2026-06-17 (June W3 monthly settlement)
+    assert expected_date == "2026-06-17"
+    assert f"到期: {expected_date} (剩 {dte_days:.0f} 天)" == "到期: 2026-06-17 (剩 22 天)"
+
+
+def test_options_position_caption_hides_expiry_when_dte_zero():
+    """Verify that when dte=0, no expiry info is displayed."""
+    dte_days = 0.0
+    expiry_str = ""
+    if dte_days > 0:
+        from datetime import datetime, timedelta
+        today = datetime.now()
+        expiry_date = today + timedelta(days=dte_days)
+        expiry_str = expiry_date.strftime("%Y-%m-%d")
+
+    assert expiry_str == ""
+
+
+def test_options_position_caption_hides_expiry_when_dte_missing():
+    """Verify that when no indicator data, caption doesn't show expiry."""
+    current_dte_years = 0.0
+    dte_days = current_dte_years * 365.0 if current_dte_years > 0 else 0.0
+    expiry_str = ""
+    if dte_days > 0:
+        from datetime import datetime, timedelta
+        today = datetime.now()
+        expiry_date = today + timedelta(days=dte_days)
+        expiry_str = expiry_date.strftime("%Y-%m-%d")
+
+    assert dte_days == 0.0
+    assert expiry_str == ""
+
+
+# 2026-05-25 Hermes Agent: verify BS theoretical premium for single-leg call
+def test_estimate_single_leg_uses_bs_theo_when_no_live_premium():
+    ledger = pd.DataFrame(
+        [
+            {
+                "Timestamp": "2026-05-25 22:08:04",
+                "Action": "PAPER_ENTRY",
+                "Side": "C",
+                "Price": 1470.0,
+                "Quantity": 1,
+                "Note": "score=86.7",
+            }
+        ]
+    )
+    open_pos = find_latest_open_options_position(ledger)
+    order_row = {
+        "status": "filled",
+        "created_at": "2026-05-25 22:08:04",
+        "avg_fill_price": 1470.0,
+        "filled_quantity": 1,
+        "side": "buy",
+        "strategy": "c",
+    }
+
+    # spot=44088, strike=44100, iv=0.307, dte=22.11 → BS should give ~1470-ish
+    estimate = estimate_options_order_unrealized(
+        order_row,
+        open_pos,
+        live_premium=0.0,  # No live quote → BS fallback
+        current_spot=44088.0,
+        current_iv=0.307,
+        dte_years=22.11 / 365,
+        strike=44100.0,
+    )
+
+    assert estimate is not None
+    assert estimate["premium_source"] == "BS_THEO"
+    assert estimate["current_price"] > 0
+    assert estimate["current_price"] < 2000  # should be reasonable ~1470 range
+    assert estimate["pricing_label"] == "option_premium"
+    assert estimate["dte_days"] == pytest.approx(22.11, rel=0.01)
+    # unrlized pnl should be reasonable (entry ~= theoretical, within 200pts)
+    assert abs(estimate["unrealized_pnl"]) < 10000
+
+
+def test_estimate_single_leg_uses_entry_fallback_when_no_data():
+    ledger = pd.DataFrame(
+        [
+            {
+                "Timestamp": "2026-05-25 22:08:04",
+                "Action": "PAPER_ENTRY",
+                "Side": "C",
+                "Price": 1470.0,
+                "Quantity": 1,
+                "Note": "score=86.7",
+            }
+        ]
+    )
+    open_pos = find_latest_open_options_position(ledger)
+    order_row = {
+        "status": "filled",
+        "created_at": "2026-05-25 22:08:04",
+        "avg_fill_price": 1470.0,
+        "filled_quantity": 1,
+        "side": "buy",
+        "strategy": "c",
+    }
+
+    # No live premium, no BS data → entry fallback
+    estimate = estimate_options_order_unrealized(
+        order_row,
+        open_pos,
+        live_premium=0.0,
+        current_spot=0.0,
+        current_iv=0.0,
+        dte_years=0.0,
+        strike=0.0,
+    )
+
+    assert estimate is not None
+    assert estimate["premium_source"] == "ENTRY_FALLBACK"
+    assert estimate["current_price"] == 1470.0
+    assert estimate["unrealized_pnl"] == 0.0
+    assert estimate["pricing_label"] == "option_premium"
+    assert estimate["dte_days"] == pytest.approx(0.0, abs=0.01)

@@ -1,5 +1,5 @@
 """
-V-Model Verification: strategies/plugins/futures/orb_ml.py
+V-Model Verification: strategies.plugins.futures.experimental.orb_ml.py
 Verifies AI-based position sizing and inference logic with stable session data.
 """
 import pytest
@@ -7,15 +7,15 @@ import pandas as pd
 import numpy as np
 from unittest.mock import MagicMock, patch, mock_open
 from core.strategy_context import StrategyContext, MarketData, PositionView
-from strategies.plugins.futures.orb_ml import ORBML
+from strategies.plugins.futures.experimental.orb_ml import ORBML
 
 def test_orb_ml_position_sizing():
     mock_model = MagicMock()
     strat = ORBML()
     
     with patch("builtins.open", mock_open(read_data=b"dummy")), \
-         patch("strategies.plugins.futures.orb_ml.pickle.load", return_value=mock_model), \
-         patch("strategies.plugins.futures.orb_ml.Path.exists", return_value=True):
+         patch("strategies.plugins.futures.experimental.orb_ml.pickle.load", return_value=mock_model), \
+         patch("strategies.plugins.futures.experimental.orb_ml.Path.exists", return_value=True):
         
         strat.init(StrategyContext(market=None, position=None, config={"params": {}}))
     

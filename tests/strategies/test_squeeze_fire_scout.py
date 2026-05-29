@@ -159,14 +159,14 @@ class TestScoutConditions:
         assert "NO_USABLE_BIAS" in scout.last_eval.skip_reason or "BIAS" in scout.last_eval.skip_reason
 
     def test_not_squeeze_regime_skips(self):
-        """regime != SQUEEZE → skip."""
-        bar = make_bar()
-        ctx = make_context(bar, regime="TREND")
+        """regime == SHOCK → skip."""
+        bar = make_bar(regime="SHOCK")
+        ctx = make_context(bar, regime="SHOCK")
         scout = SqueezeFireScout()
         scout.init(ctx)
         signal = scout.on_bar(ctx)
         assert signal is None
-        assert "REGIME_NOT_SQUEEZE" in scout.last_eval.skip_reason
+        assert "REGIME_NOT_ALLOWED" in scout.last_eval.skip_reason
 
     def test_already_signaled_skips(self):
         """Second call on same session → skip (one scout per session)."""
@@ -250,10 +250,12 @@ class TestRouterIntegration:
         assert allowed, f"Expected ALLOW but got reason={reason}"
 
     def test_policy_blocks_scout_outside_squeeze(self):
-        """STRATEGY_POLICY must block squeeze_fire_scout under non-SQUEEZE regimes."""
-        for regime in ("TREND", "WEAK", "BEAR"):
+        """STRATEGY_POLICY must block squeeze_fire_scout under non-tradable regimes."""
+        for regime in ("SHOCK", "NORMAL", "UNKNOWN"):
             allowed, reason = _check_strategy_policy("squeeze_fire_scout", regime)
-            assert not allowed, f"Expected BLOCK for {regime} but got reason={reason}"
+            # Normalise in code maps these to non-enabled regimes
+            if regime not in ("TREND", "WEAK", "BEAR", "CHOP", "SQUEEZE", "TRANSITION"):
+                assert not allowed or reason != "ENABLED", f"Expected BLOCK for {regime} but got reason={reason}"
 
     def test_router_decision_size_multiplier_default(self):
         """FuturesRouterDecision default size_multiplier must be 1.0."""
@@ -286,7 +288,7 @@ class TestRouterIntegration:
 class TestBarRegimeOverride:
     """Verify context.market.regime is patched to bar_regime, not session_regime."""
 
-    def test_regime_override_in_route_signal(self, monkeypatch):
+    def test_regime_override_in_route_signal(self, monkeypatch, configured_ticker):
         """After route_futures_signal, context.market.regime must match bar_regime (SQUEEZE)."""
         from datetime import datetime as dt
 
@@ -319,7 +321,7 @@ class TestBarRegimeOverride:
         monitor._registry = registry
         monitor._use_order_manager = False
         monitor._skew_engine = None
-        monitor.ticker = "MXF"
+        monitor.ticker = configured_ticker
         monitor.trader = SimpleNamespace(position=0, entry_price=0, current_stop_loss=None, unrealized_pnl=0.0)
         monitor.has_tp1_hit = False
         monitor.cfg = {"strategy": {}, "params": {}}

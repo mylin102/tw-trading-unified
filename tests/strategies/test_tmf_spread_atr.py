@@ -101,7 +101,15 @@ def test_on_bar_entry_with_atr(strategy):
     signal = strategy.on_bar(context)
     assert signal is not None
     assert signal.action == "BUY_NEAR_SELL_FAR"
+    
+    # [GSD] Deferred Strategy Sync: has_position remains False until sync_position is called
+    assert strategy._has_position is False
+    assert strategy._lifecycle == "SUBMITTING"
+
+    # Now simulate the fill sync
+    strategy.sync_position("mts-test-123", "LONG", 41000.0, 41100.0)
     assert strategy._has_position is True
+    assert strategy._lifecycle == "OPEN"
 
 @patch("strategies.plugins.futures.active.tmf_spread._write_mts_state")
 def test_mts_state_thresholds(mock_write, strategy):

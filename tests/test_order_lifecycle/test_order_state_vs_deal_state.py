@@ -21,6 +21,8 @@ def _build_options_monitor():
     monitor = options_module.ShioajiOptionsSmartMonitor.__new__(options_module.ShioajiOptionsSmartMonitor)
     monitor.order_mgr = OrderManager(mode="paper")
     monitor.mode = "paper"
+    monitor.full_cfg = {}  # [GSD Fix] Add missing attribute for test compatibility
+    monitor.hard_stop_pct = 0.05
     monitor.base_lots = 1
     monitor.paper_lots = 1
     monitor.max_positions = 2
@@ -651,7 +653,7 @@ def test_options_paper_tp1_records_partial_exit_lifecycle_before_position_change
     monitor.enter_paper_position("C", {"side": "C", "score": 1.5, "timestamp": datetime.datetime(2026, 4, 20, 21, 5), "price_mtx": 23010})
     monitor.position = 2
     monitor.has_tp1_hit = False
-    monitor.current_option_quote = lambda side: {"bid": 11.0, "ask": 12.0}
+    monitor.current_option_quote = lambda side: {"bid": 11.0, "ask": 12.0, "mid": 11.5}
 
     positions_at_record = []
     original_record = monitor._record_paper_order

@@ -1,5 +1,5 @@
 """
-V-Model Verification: strategies/plugins/futures/orb_ml.py (V3 Clean)
+V-Model Verification: strategies.plugins.futures.experimental.orb_ml.py (V3 Clean)
 Verifies AI V3 logic (No-Kalman) and feature vector alignment.
 """
 import pytest
@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 from unittest.mock import MagicMock, patch, mock_open
 from core.strategy_context import StrategyContext, MarketData, PositionView
-from strategies.plugins.futures.orb_ml import ORBML
+from strategies.plugins.futures.experimental.orb_ml import ORBML
 
 def test_orb_ml_v3_logic():
     mock_model = MagicMock()
@@ -15,8 +15,8 @@ def test_orb_ml_v3_logic():
     
     # 1. Mock V3 Model Loading
     with patch("builtins.open", mock_open(read_data=b"dummy")), \
-         patch("strategies.plugins.futures.orb_ml.pickle.load", return_value=mock_model), \
-         patch("strategies.plugins.futures.orb_ml.Path.exists", return_value=True):
+         patch("strategies.plugins.futures.experimental.orb_ml.pickle.load", return_value=mock_model), \
+         patch("strategies.plugins.futures.experimental.orb_ml.Path.exists", return_value=True):
         
         strat.init(StrategyContext(market=None, position=None, config={"params": {}}))
     
