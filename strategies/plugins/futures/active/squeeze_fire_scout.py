@@ -71,7 +71,7 @@ class SqueezeFireScout(StrategyBase):
 
         # ── [SQUEEZE_WATCH] On every bar, print squeeze-readiness snapshot ──
         _sqz_on = bool(bar.get("sqz_on", False))
-        _sqz_fire = bool(bar.get("fired") or bar.get("sqz_fire", False))
+        _sqz_fire = bool(bar.get("fired") or bar.get("sqz_fire", False) or bar.get("squeeze_release", False))
         _regime = str(getattr(context.market, "regime", "?")).upper()
         if _sqz_on or _sqz_fire or _regime in ("SQUEEZE", "WEAK", "STRETCHED", "TREND", "BEAR"):
             _close = bar.get("Close", 0)
@@ -151,7 +151,7 @@ class SqueezeFireScout(StrategyBase):
 
         # ═══ Squeeze fire check ═══
         # Indicator engine outputs 'fired'; schema also defines 'sqz_fire'
-        sqz_fire = bar.get("fired") or bar.get("sqz_fire", False)
+        sqz_fire = bar.get("fired") or bar.get("sqz_fire", False) or bar.get("squeeze_release", False)
         if not sqz_fire:
             self._set_eval(skip_reason="NO_SQUEEZE_FIRE")
             return None

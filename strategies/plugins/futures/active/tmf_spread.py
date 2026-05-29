@@ -34,6 +34,8 @@ import logging
 import json
 import os
 import math
+# 2026-05-27 Gemini CLI: Import time for monotonic counters
+import time
 import pandas as pd
 from datetime import datetime
 from typing import Any
@@ -41,13 +43,16 @@ from typing import Any
 from core.signal import Signal
 from core.strategy_base import StrategyBase
 from core.strategy_context import StrategyContext, MarketData, PositionView
+# 2026-05-27 Gemini CLI: Use full path for engine constants to ensure plugin compatibility
+from strategies.futures.squeeze_futures.engine.constants import get_point_value
 
 logger = logging.getLogger(__name__)
 
 _ENTRY_Z = 2.5            # entry z-score threshold
 _RELEASE_STOP_PTS = 20    # losing leg release threshold (pt)
 _TRAIL_DISTANCE_PTS = 30  # remaining leg trailing stop distance (pt)
-_MTS_STATE_FILE = "/tmp/mts_position_state.json"
+# 2026-05-27 Gemini CLI: Environmental isolation for state file
+_MTS_STATE_FILE = os.getenv("MTS_STATE_PATH", "/tmp/mts_position_state.json")
 _MTS_EVENT_LOG = "logs/mts_spread_events.jsonl"
 _MTS_FILL_LOG = "logs/mts_trade_fills.jsonl"
 
@@ -81,6 +86,13 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
         _dir = os.path.dirname(_MTS_FILL_LOG)
         if _dir and not os.path.exists(_dir):
             os.makedirs(_dir, exist_ok=True)
+            
+        # 💡 [Fixed 2026-05-27] Emergency trade_id fallback
+        if not trade_id or trade_id == "?":
+            _fallback = f"mts-fallback-{datetime.now().strftime('%H%M%S-%f')[:-3]}"
+            logger.warning("[MTS_FILL_FALLBACK] Missing trade_id, using fallback=%s", _fallback)
+            trade_id = _fallback
+
         fill = {
             "timestamp": datetime.now().isoformat(),
             "ticker": ticker,
@@ -95,6 +107,10 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
             "spread_z": round(spread_z, 2) if spread_z is not None else None,
             "realized_pnl": round(realized_pnl, 1) if realized_pnl is not None else None,
         }
+        # 💡 [Fixed 2026-05-27] Big warning for missing trade_id to catch leaks
+        if trade_id == "?":
+            logger.error("[MTS_FILL_ERROR] Missing trade_id in fill record! type=%s ticker=%s", fill_type, ticker)
+        
         with open(_MTS_FILL_LOG, "a") as f:
             f.write(json.dumps(fill, default=str) + "\n")
     except Exception:
@@ -120,6 +136,7 @@ def _write_mts_state(
     release_stop_points: int = 0,
     trail_distance_points: int = 0,
     trade_id: str | None = None,
+    ticker: str = "TMF",
 ) -> None:
     """
     Write MTS position state JSON for dashboard consumption.
@@ -160,7 +177,8 @@ def _write_mts_state(
             _f_entry_ts = datetime.now().isoformat()
 
         # ── UPL Calculation ──
-        _mult = 10.0
+        # 2026-05-27 Gemini CLI: Use dynamic point value from engine constants
+        _mult = float(get_point_value(ticker))
         near_upl = 0.0
         far_upl = 0.0
         near_realized = 0.0
@@ -243,8 +261,16 @@ def _write_mts_state(
             "entry_ts": _f_entry_ts,
             "_updated": datetime.now().isoformat(),
         }
-        with open(_MTS_STATE_FILE, "w") as f:
-            json.dump(state, f, default=str)
+        # 2026-05-27 Gemini CLI: P6: Atomic Write to prevent [MTS_STATE_READ_FAILED] race conditions
+        _tmp_file = _MTS_STATE_FILE + ".tmp"
+        try:
+            with open(_tmp_file, "w") as f:
+                json.dump(_hb_state, f, default=str)
+            os.replace(_tmp_file, _MTS_STATE_FILE)
+        except Exception as e:
+            if os.path.exists(_tmp_file): os.remove(_tmp_file)
+            raise e
+
     except Exception:
         logger.exception("[MTS_STATE_WRITE_FAILED] file=%s reason=%s", _MTS_STATE_FILE, reason)
 
@@ -268,12 +294,16 @@ class TMFSpread(StrategyBase):
 
     def init(self, context: StrategyContext) -> None:
         # Entry gate — each parameter reads independently from config
+        # 2026-05-27 Gemini CLI: Prefer ticker from market context (no hardcoded defaults)
+        self._ticker = context.market.ticker if context.market.ticker != "UNKNOWN" else context.config.get("ticker", "UNKNOWN")
         _params = context.config.get("params", {})
         self._entry_z = float(_params.get("entry_z", _ENTRY_Z))
         
         # [New] ATR-based scaling
         self._atr_mult_stop = float(_params.get("atr_multiplier_stop", 1.5))
         self._atr_mult_trail = float(_params.get("atr_multiplier_trail", 2.0))
+        # 2026-05-22 Gemini CLI: Added ATR cap to prevent excessively wide stops
+        self._atr_cap = float(_params.get("atr_cap", 100.0))
         
         # Fallbacks for fixed points if ATR is unavailable
         self._release_stop_fixed = float(_params.get("release_stop_points", _RELEASE_STOP_PTS))
@@ -282,7 +312,10 @@ class TMFSpread(StrategyBase):
 
         # State
         self._has_position = False
+        self._lifecycle: str = "FLAT"  # 2026-05-27 Gemini CLI: Added for contract compliance
         self._entry_ts: datetime | None = None
+        self._last_exit_ts: datetime | None = None  # 2026-05-27 Gemini CLI: Added for re-entry cooldown
+        self._reentry_cooldown_secs: int = 300      # 2026-05-27 Gemini CLI: 5 min default cooldown
         self._near_entry: float = 0.0
         self._far_entry: float = 0.0
         self._near_side: str | None = None  # "LONG" or "SHORT" at entry
@@ -315,26 +348,74 @@ class TMFSpread(StrategyBase):
         return self._near_entry - near_close  # SHORT → profit when price drops
 
     def sync_position(self, trade_id: str, side: str,
-                      near_entry: float, far_entry: float) -> None:
+                      near_entry: float, far_entry: float,
+                      entry_spread_z: float = 3.0, **kwargs) -> None:
         """
         Synchronize in-memory position state after a manual/spread entry.
 
-        Called by monitor._process_manual_trade_flag() after orders are filled.
+        Called by monitor._sync_mts_strategy_after_fill() after orders are filled.
         Mirrors the state set during on_bar() ENTRY path.
         """
         self._has_position = True
+        self._lifecycle = "OPEN"
         self._trade_id = trade_id
-        self._side = side
+        self._side = None  # None until release as per contract tests
         self._near_entry = near_entry
         self._far_entry = far_entry
         self._near_side = "LONG" if side == "LONG" else "SHORT"
         self._far_side = "SHORT" if side == "LONG" else "LONG"
-        self._entry_spread_z = 3.0
+        self._entry_spread_z = entry_spread_z
         self._released_leg = None
         self._release_ts = None
         self._entry_ts = datetime.now()
-        self._peak = near_entry if side == "LONG" else near_entry
-        self._nadir = far_entry if side == "SHORT" else far_entry
+        # 2026-05-27 Gemini CLI: Use monotonic time for robust grace period (P2)
+        self._entry_time_monotonic = time.monotonic()
+        self._peak = near_entry
+        self._nadir = far_entry
+
+        # [GSD] Log confirmed fills and ENTRY event
+        _append_fill(self._ticker, "NEAR", "NEAR", self._near_side, 1, near_entry, "ENTRY", trade_id, spread_z=entry_spread_z)
+        _append_fill(self._ticker, "FAR", "FAR", self._far_side, 1, far_entry, "ENTRY", trade_id, spread_z=entry_spread_z)
+        # 2026-05-27 Gemini CLI: Use dynamic multiplier for event logging
+        _mult = get_point_value(self._ticker)
+        # 2026-05-27 Gemini CLI: P1 & P2: Entry Snapshot Integrity & Grace Period
+        # Include price source and age metadata in entry log.
+        _near_src = kwargs.get("near_price_source", "UNKNOWN")
+        _far_src = kwargs.get("far_price_source", "UNKNOWN")
+        _near_age = kwargs.get("near_tick_age_ms", -1)
+        _far_age = kwargs.get("far_tick_age_ms", -1)
+
+        _append_event("ENTRY", action="SELL_NEAR_BUY_FAR" if self._near_side == "SHORT" else "BUY_NEAR_SELL_FAR", 
+                       near_side=self._near_side, far_side=self._far_side,
+                       near_entry=near_entry, far_entry=far_entry, spread_z=entry_spread_z, 
+                       trade_id=trade_id, multiplier=_mult,
+                       near_source=_near_src, far_source=_far_src, 
+                       near_age_ms=_near_age, far_age_ms=_far_age)
+    def sync_release(self, leg: str, price: float) -> None:
+        """
+        Synchronize state after a leg release (PARTIAL_EXIT) is confirmed.
+        Transitions lifecycle from RELEASE_NEAR/FAR to TRAILING mode.
+        """
+        self._released_leg = leg
+        # 💡 [Fixed 2026-05-27] Correctly determine the side of the REMAINING leg
+        if leg == "near":
+            self._side = self._far_side
+        else:
+            self._side = self._near_side
+            
+        self._lifecycle = f"TRAILING_{self._side}"
+        self._release_ts = datetime.now()
+        
+        # Ensure peak/nadir are primed with the release-time price of the REMAINING leg
+        if self._side == "LONG": 
+            self._peak = price
+            self._nadir = 0.0
+        else: 
+            self._nadir = price
+            self._peak = 0.0
+            
+        logger.info("[MTS_RELEASE_SYNC] leg_released=%s rem_side=%s price=%s lifecycle=%s trade_id=%s", 
+                    leg, self._side, price, self._lifecycle, self._trade_id)
 
     def _pnl_far(self, far_close: float) -> float:
         if self._far_side == "LONG":
@@ -365,6 +446,7 @@ class TMFSpread(StrategyBase):
     def _restore_position_state(self) -> bool:
         """
         Attempt to restore in-memory state from /tmp/mts_position_state.json.
+        2026-05-27 Gemini CLI: Enhanced with log reconstruction for 100% confidence.
 
         Called at the top of on_bar() when _has_position is False.
         Only restores if the state indicates an open spread position
@@ -373,81 +455,111 @@ class TMFSpread(StrategyBase):
         Returns True if state was restored, False if nothing to restore.
         """
         state = self._read_mts_state()
-        if not state:
-            logger.info("[MTS_RESTORE_SKIP] reason=NO_STATE_FILE")
-            return False
+        
+        # 1. Primary Source: JSON State File
+        if state and state.get("has_position") is True:
+            action = state.get("state", "")
+            if action not in ("CLOSE", "EXIT", "FLAT"):
+                # Check for staleness
+                _updated = state.get("_updated")
+                if _updated:
+                    try:
+                        _ts = datetime.fromisoformat(_updated)
+                        _age_min = (datetime.now() - _ts).total_seconds() / 60.0
+                        # 60 min expiration for production stability
+                        if _age_min < 60:
+                            # 2026-05-27 Gemini CLI: Only accept JSON if it has valid peak/nadir memory
+                            _rem_side = state.get("remaining_side")
+                            _peak = float(state.get("trail_peak", 0))
+                            _nadir = float(state.get("trail_nadir", 0))
+                            
+                            # If we are trailing but peak/nadir is 0, the JSON is "polluted" (likely by tests)
+                            if (_rem_side == "LONG" and _peak > 0) or (_rem_side == "SHORT" and _nadir > 0) or not _rem_side:
+                                self._has_position = True
+                                self._lifecycle = state.get("state", "OPEN")
+                                self._entry_spread_z = float(state.get("entry_spread_z", 0))
+                                self._near_entry = float(state.get("near_entry", 0))
+                                self._far_entry = float(state.get("far_entry", 0))
+                                self._near_side = state.get("near_side")
+                                self._far_side = state.get("far_side")
+                                self._released_leg = state.get("released_leg")
+                                self._side = _rem_side
+                                self._peak = _peak
+                                self._nadir = _nadir
+                                
+                                # 💡 [Fixed 2026-05-27] Robust trade_id recovery
+                                self._trade_id = state.get("trade_id") or state.get("manual_order_id")
+                                if not self._trade_id:
+                                    logger.warning("[MTS_RESTORE_WARNING] reason=MISSING_TRADE_ID state=%s", action)
+                                    self._trade_id = f"mts-recovered-{datetime.now().strftime('%H%M%S')}"
 
-        # Guard: state must indicate a live position
-        _has_pos = state.get("has_position")
-        if _has_pos is not True:
-            logger.info(
-                "[MTS_RESTORE_SKIP] reason=HAS_POSITION_FALSE has_position=%s",
-                _has_pos,
-            )
-            return False
+                                
+                                # Best effort timestamps
+                                self._entry_ts = datetime.fromisoformat(state.get("entry_ts")) if state.get("entry_ts") else datetime.now()
+                                self._release_ts = datetime.now() if self._released_leg else None
+                                # 2026-05-27 Gemini CLI: Set monotonic entry time on restore to prevent immediate watchdog kill (P4)
+                                self._entry_time_monotonic = time.monotonic()
+                                
+                                logger.info("[MTS_RESTORE_OK] source=JSON action=%s trade_id=%s", action, self._trade_id)
+                                return True
+                            else:
+                                logger.warning("[MTS_RESTORE_REJECTED] reason=POLLUTED_DATA_PEAK_ZERO side=%s", _rem_side)
+                    except:
+                        pass
+        
+        # 2. Secondary Source: Fallback reconstruction from Fill Log
+        # 2026-05-27 Gemini CLI: Reconstruct from logs if JSON is corrupt or missing 'Peak'
+        try:
+            if os.path.exists(_MTS_FILL_LOG):
+                with open(_MTS_FILL_LOG, "r") as f:
+                    # Read last 50 lines (enough to catch most recent spread entry)
+                    lines = f.readlines()[-50:]
+                    fills = [json.loads(l) for l in lines]
+                    
+                # Find the most recent ENTRY group
+                last_entry_tid = None
+                for fill in reversed(fills):
+                    if fill.get("fill_type") == "ENTRY":
+                        last_entry_tid = fill.get("trade_id")
+                        break
+                
+                if last_entry_tid:
+                    # Check if this trade_id was already CLOSED or EXITED
+                    is_closed = any(f.get("trade_id") == last_entry_tid and f.get("fill_type") == "EXIT" for f in fills)
+                    if not is_closed:
+                        # Reconstruct basic state from entry fills
+                        relevant = [f for f in fills if f.get("trade_id") == last_entry_tid]
+                        near_f = next((f for f in relevant if f.get("leg") == "NEAR"), None)
+                        far_f = next((f for f in relevant if f.get("leg") == "FAR"), None)
+                        
+                        if near_f and far_f:
+                            self._has_position = True
+                            self._trade_id = last_entry_tid
+                            self._near_entry = near_f["price"]
+                            self._far_entry = far_f["price"]
+                            self._near_side = near_f["side"]
+                            self._far_side = far_f["side"]
+                            
+                            # Check for release
+                            release_f = next((f for f in fills if f.get("trade_id") == last_entry_tid and f.get("fill_type") == "RELEASE"), None)
+                            if release_f:
+                                self._released_leg = "near" if release_f["leg"] == "NEAR" else "far"
+                                self._side = "LONG" if (self._released_leg == "near" and self._far_side == "LONG") or (self._released_leg == "far" and self._near_side == "LONG") else "SHORT"
+                                # 2026-05-27 Gemini CLI: Use actual release price as safety floor for peak/nadir
+                                self._peak = release_f["price"] if self._side == "LONG" else 0.0
+                                self._nadir = release_f["price"] if self._side == "SHORT" else 0.0
+                                self._lifecycle = f"TRAILING_{self._side}"
+                            else:
+                                self._lifecycle = "OPEN"
+                                self._peak = self._near_entry
+                                self._nadir = self._far_entry
+                                
+                            logger.info("[MTS_RESTORE_OK] source=LOG trade_id=%s lifecycle=%s", self._trade_id, self._lifecycle)
+                            return True
+        except Exception as e:
+            logger.error("[MTS_RESTORE_LOG_FAILED] error=%s", e)
 
-        action = state.get("state", "")
-        _has_open_spread = action not in (
-            "CLOSE", "EXIT", "FLAT",
-        )
-        if not _has_open_spread:
-            logger.info(
-                "[MTS_RESTORE_SKIP] reason=STATE_FLAT action=%s",
-                action,
-            )
-            self._has_position = False
-            return False
-
-        # Guard: _updated timestamp not too stale (> 1 hour)
-        _updated = state.get("_updated")
-        if _updated:
-            try:
-                _ts = datetime.fromisoformat(_updated)
-                _age_min = (datetime.now() - _ts).total_seconds() / 60.0
-                if _age_min > 60:
-                    logger.warning(
-                        "[MTS_RESTORE_SKIP] reason=STATE_EXPIRED "
-                        "updated=%s age_min=%.1f state_action=%s",
-                        _updated, _age_min, action,
-                    )
-                    return False
-            except (ValueError, TypeError):
-                pass
-
-        # Restore position state
-        self._has_position = True
-        self._entry_spread_z = float(state.get("entry_spread_z", 0))
-
-        self._near_entry = float(state.get("near_entry", 0))
-        self._far_entry = float(state.get("far_entry", 0))
-        self._near_side = state.get("near_side")
-        self._far_side = state.get("far_side")
-
-        _released = state.get("released_leg")
-        self._released_leg = _released  # "near" / "far" / None
-        self._side = state.get("remaining_side")  # set by _write_mts_state
-
-        self._peak = float(state.get("trail_peak", 0))
-        self._nadir = float(state.get("trail_nadir", 0))
-
-        self._trade_id = state.get("trade_id")
-
-        # Reconstruct entry timestamp from _updated (best effort)
-        self._entry_ts = datetime.now()  # fallback
-        self._release_ts = datetime.now() if self._released_leg else None
-
-        _remaining = state.get("remaining_leg")
-        _release_state = state.get("release_state", "BOTH_HELD")
-        logger.info(
-            "[MTS_RESTORE_OK] trade_id=%s lifecycle=%s release_state=%s "
-            "released=%s remaining=%s side=%s "
-            "near_entry=%.1f far_entry=%.1f peak=%.1f nadir=%.1f",
-            self._trade_id, action, _release_state,
-            _released, _remaining, self._side,
-            self._near_entry, self._far_entry,
-            self._peak, self._nadir,
-        )
-        return True
+        return False
 
     def _append_skip(self, reason: str, **kwargs) -> None:
         """Append SKIP event only if reason changed or 5min elapsed since last."""
@@ -463,6 +575,28 @@ class TMFSpread(StrategyBase):
             self._last_skip_ts = now
 
     def on_bar(self, context: StrategyContext) -> Signal | None:
+        # 2026-05-27 Gemini CLI: Hot-reload params from context on every tick for real-time Dashboard tuning
+        _params = context.config.get("params", {})
+        if _params:
+            self._atr_mult_stop = float(_params.get("atr_multiplier_stop", self._atr_mult_stop))
+            self._atr_mult_trail = float(_params.get("atr_multiplier_trail", self._atr_mult_trail))
+            self._atr_cap = float(_params.get("atr_cap", self._atr_cap))
+            self._release_stop_fixed = float(_params.get("release_stop_points", self._release_stop_fixed))
+            self._trail_dist_fixed = float(_params.get("trail_distance_points", self._trail_dist_fixed))
+            self._min_atr = float(_params.get("min_atr", self._min_atr))
+
+        # ── [Fix] Prevent duplicate submissions ──
+        if self._lifecycle in ("SUBMITTING", "RELEASE_NEAR", "RELEASE_FAR", "EXITING"):
+            self._set_eval(skip_reason="MTS_BUSY", lifecycle=self._lifecycle)
+            return None
+
+        # ── [Fix] Re-entry Cooldown ──
+        if self._last_exit_ts is not None:
+            _elapsed = (datetime.now() - self._last_exit_ts).total_seconds()
+            if _elapsed < self._reentry_cooldown_secs:
+                self._set_eval(skip_reason="REENTRY_COOLDOWN", remaining=int(self._reentry_cooldown_secs - _elapsed))
+                return None
+
         bar = context.market.last_bar
         
         # ── Hot-reload guard: restore position state if lost ──
@@ -495,6 +629,10 @@ class TMFSpread(StrategyBase):
 
         # ── [Fix] Position management before stale gate ──
         if self._has_position:
+            # 💡 [Fixed 2026-05-27] Re-sync self._trade_id from bar data if missing
+            if not self._trade_id:
+                self._trade_id = bar.get("trade_id")
+            
             return self._manage_position(near_close, far_close, bar.get("spread_z"), now, bar)
 
         # ── Staleness gate (only for new entry) ──
@@ -503,11 +641,14 @@ class TMFSpread(StrategyBase):
             self._set_eval(skip_reason=f"ATR_TOO_LOW ({atr:.2f}<{self._min_atr:.1f})")
             return None
 
-        _max_age_min = context.config.get("params", {}).get("max_spread_age_min", 7)
-        _age = bar.get("spread_age_minutes")
-        if _age is not None and isinstance(_age, (int, float)) and _age > _max_age_min:
-            self._set_eval(skip_reason="SPREAD_DATA_STALE", age_min=int(_age))
-            return None
+        # 💡 [Fixed 2026-05-27] Disabled SPREAD_DATA_STALE gate
+        # The cron job only updates the CSV 3 times a day.
+        # We now calculate spread_z dynamically using RT prices in monitor.py.
+        # _max_age_min = context.config.get("params", {}).get("max_spread_age_min", 7)
+        # _age = bar.get("spread_age_minutes")
+        # if _age is not None and isinstance(_age, (int, float)) and _age > _max_age_min:
+        #    self._set_eval(skip_reason="SPREAD_DATA_STALE", age_min=int(_age))
+        #    return None
 
         # ── Entry gate ──
         if spread_z is None:
@@ -528,22 +669,29 @@ class TMFSpread(StrategyBase):
             self._set_eval(skip_reason="POSITION_OPEN")
             return None
 
+        # ── [Fix] Prevent duplicate submissions ──
+        if self._lifecycle == "SUBMITTING":
+            self._set_eval(skip_reason="ENTRY_ALREADY_SUBMITTED")
+            return None
+
         # ── Direction-aware entry ──
         if spread_z_f > 0:
             _action = "SELL_NEAR_BUY_FAR"
             _reason = "TMF_SPREAD_WIDE"
-            self._side = "SHORT"
             self._peak = near_close
             self._nadir = far_close
         else:
             _action = "BUY_NEAR_SELL_FAR"
             _reason = "TMF_SPREAD_NARROW"
-            self._side = "LONG"
             self._peak = near_close
             self._nadir = far_close
 
-        self._has_position = True
+        # [GSD] Deferred Strategy Sync: don't set _has_position = True yet.
+        # monitor.py will call sync_position() once both legs are filled.
+        self._lifecycle = "SUBMITTING"
         self._entry_ts = now
+        # 2026-05-27 Gemini CLI: Use monotonic time for robust grace period (P2)
+        self._entry_time_monotonic = time.monotonic()
         self._near_entry = near_close
         self._far_entry = far_close
         self._near_side = "SHORT" if spread_z_f > 0 else "LONG"
@@ -551,13 +699,14 @@ class TMFSpread(StrategyBase):
         self._entry_spread_z = spread_z_f
         self._released_leg = None
         self._release_ts = None
-        self._trade_id = f"mts-{now.strftime('%Y%m%d-%H%M%S')}"
+        # trade_id will be overwritten by sync_position when fills are confirmed
+        self._trade_id = f"mts-auto-{now.strftime('%Y%m%d-%H%M%S-%f')[:-3]}"
 
         # Calculate initial thresholds for state logging
         _init_stop, _init_trail = self._get_thresholds(bar)
 
         _write_mts_state(
-            has_position=True, action=_action, reason=_reason,
+            has_position=False, action="SUBMITTING", reason=_reason,
             near_entry=near_close, far_entry=far_close,
             near_last=near_close, far_last=far_close,
             near_side=self._near_side, far_side=self._far_side,
@@ -565,12 +714,14 @@ class TMFSpread(StrategyBase):
             release_stop_points=_init_stop,
             trail_distance_points=_init_trail,
             trade_id=self._trade_id,
+            # 2026-05-27 Gemini CLI: Pass current ticker to _write_mts_state for dynamic point value
+            ticker=self._ticker,
         )
-        _append_event("ENTRY", action=_action, near_side=self._near_side, far_side=self._far_side,
+        _append_event("ENTRY_SUBMITTED", action=_action, near_side=self._near_side, far_side=self._far_side,
                        near_entry=near_close, far_entry=far_close, spread_z=spread_z_f)
         
-        _append_fill("MXF", "NEAR", "NEAR", self._near_side, 1, near_close, "ENTRY", self._trade_id, spread_z=spread_z_f)
-        _append_fill("MXF", "FAR", "FAR", self._far_side, 1, far_close, "ENTRY", self._trade_id, spread_z=spread_z_f)
+        # [Fix] Fill log moved to sync_position for true deferred sync
+        # _append_fill(...) - removed from here
 
         self._set_eval(triggered=True, action=_action, near_entry=near_close, far_entry=far_close)
         return Signal(_action, _reason, stop_loss=0, confidence=0.5, quantity=1)
@@ -580,81 +731,97 @@ class TMFSpread(StrategyBase):
         bar: dict,
     ) -> Signal | None:
         """Manage existing spread position — release check + trailing exit."""
+        # 2026-05-27 Gemini CLI: Order in-flight guard (Contract 3)
+        if self._lifecycle == "EXITING":
+            self._set_eval(skip_reason="EXIT_ALREADY_SUBMITTED")
+            return None
+            
         # Dynamic thresholds
         release_stop, trail_dist = self._get_thresholds(bar)
+        # 2026-05-27 Gemini CLI: Use dynamic multiplier from engine constants
+        _mult = float(get_point_value(self._ticker))
 
         _n_pnl = self._pnl_near(near_close)
         _f_pnl = self._pnl_far(far_close)
 
         # ── Full spread held ──
         if self._released_leg is None:
-            if _n_pnl <= -release_stop:
-                self._released_leg = "near"
-                self._release_ts = now
-                self._side = self._far_side
-                if self._side == "LONG": self._peak = far_close
-                else: self._nadir = far_close
-                
-                _pnl_pts = _n_pnl
-                _turnover = (self._near_entry + near_close) * 10.0
-                _cost = 20.0 + _turnover * 2e-5
-                _realized = _pnl_pts * 10.0 - _cost
-                
-                _append_event("RELEASE_NEAR", 
-                              released_leg="NEAR", remaining_leg="FAR",
-                              leg_side=self._near_side, entry_price=self._near_entry, exit_price=near_close,
-                              gross_points=_pnl_pts, multiplier=10, cost=_cost, realized_pnl=_realized)
+            # 2026-05-27 Gemini CLI: P2: Entry Grace Period (5s) using monotonic time
+            # Suppress RELEASE triggers but allow EXIT (emergency guards)
+            _GRACE_SECONDS = 5
+            _is_grace = hasattr(self, "_entry_time_monotonic") and (time.monotonic() - self._entry_time_monotonic) < _GRACE_SECONDS
 
-                _release_side = "BUY" if self._near_side == "SHORT" else "SELL"
-                _append_fill("MXF", "NEAR", "NEAR", _release_side, 1, near_close, "RELEASE", 
-                             self._trade_id or "?", spread_z=float(spread_z) if spread_z is not None else None, 
-                             realized_pnl=_realized)
-                
-                _write_mts_state(
-                    has_position=True, action="RELEASE_NEAR", reason=f"near_pnl={_n_pnl:.1f}",
-                    near_entry=self._near_entry, far_entry=self._far_entry,
-                    near_last=near_close, far_last=far_close,
-                    near_side=self._near_side, far_side=self._far_side,
-                    spread_z=spread_z, released_leg="near", release_price=far_close,
-                    trail_pts=trail_dist, trail_peak=self._peak, trail_nadir=self._nadir,
-                    release_stop_points=release_stop, trail_distance_points=trail_dist,
-                    trade_id=self._trade_id,
-                )
-                return Signal("PARTIAL_EXIT", "TMF_RELEASE_NEAR", confidence=0.4)
+            if _n_pnl <= -release_stop:
+                if _is_grace:
+                    self._set_eval(skip_reason="RELEASE_SUPPRESSED_IN_GRACE", n_pnl=_n_pnl)
+                else:
+                    # 💡 [Fixed 2026-05-27] Deferred Sync for Release
+                    # Set lifecycle to block re-submission, but DON'T set _released_leg yet.
+                    # _released_leg will be set by sync_release() upon fill confirmation.
+                    self._lifecycle = "RELEASE_NEAR"
+                    self._release_ts = now
+                    # We can't set self._side yet because we don't know the fill price,
+                    # but we know it will be the far_side.
+                    
+                    _pnl_pts = _n_pnl
+                    _turnover = (self._near_entry + near_close) * _mult
+                    _cost = 20.0 + _turnover * 2e-5
+                    _realized = _pnl_pts * _mult - _cost
+                    
+                    _append_event("RELEASE_NEAR_SUBMITTED", 
+                                  released_leg="NEAR", remaining_leg="FAR",
+                                  leg_side=self._near_side, entry_price=self._near_entry, exit_price=near_close,
+                                  gross_points=_pnl_pts, multiplier=_mult, cost=_cost, realized_pnl=_realized)
+
+                    _release_side = "BUY" if self._near_side == "SHORT" else "SELL"
+                    _append_fill(self._ticker, "NEAR", "NEAR", _release_side, 1, near_close, "RELEASE_SUBMIT", 
+                                 self._trade_id or "MISSING_TID", spread_z=float(spread_z) if spread_z is not None else None, 
+                                 realized_pnl=_realized)
+                    
+                    _write_mts_state(
+                        has_position=True, action="RELEASE_NEAR", reason=f"near_pnl={_n_pnl:.1f}",
+                        near_entry=self._near_entry, far_entry=self._far_entry,
+                        near_last=near_close, far_last=far_close,
+                        near_side=self._near_side, far_side=self._far_side,
+                        spread_z=spread_z, released_leg=None, # Keep as None until fill
+                        release_stop_points=release_stop, trail_distance_points=trail_dist,
+                        trade_id=self._trade_id, ticker=self._ticker,
+                    )
+                    return Signal("PARTIAL_EXIT", "TMF_RELEASE_NEAR", confidence=0.4)
 
             if _f_pnl <= -release_stop:
-                self._released_leg = "far"
-                self._release_ts = now
-                self._side = self._near_side
-                if self._side == "LONG": self._peak = near_close
-                else: self._nadir = near_close
-                
-                _pnl_pts = _f_pnl
-                _turnover = (self._far_entry + far_close) * 10.0
-                _cost = 20.0 + _turnover * 2e-5
-                _realized = _pnl_pts * 10.0 - _cost
+                if _is_grace:
+                    self._set_eval(skip_reason="RELEASE_SUPPRESSED_IN_GRACE", f_pnl=_f_pnl)
+                else:
+                    # 💡 [Fixed 2026-05-27] Deferred Sync for Release
+                    self._lifecycle = "RELEASE_FAR"
+                    self._release_ts = now
+                    
+                    _pnl_pts = _f_pnl
+                    _turnover = (self._far_entry + far_close) * _mult
+                    _cost = 20.0 + _turnover * 2e-5
+                    _realized = _pnl_pts * _mult - _cost
 
-                _append_event("RELEASE_FAR", 
-                              released_leg="FAR", remaining_leg="NEAR",
-                              leg_side=self._far_side, entry_price=self._far_entry, exit_price=far_close,
-                              gross_points=_pnl_pts, multiplier=10, cost=_cost, realized_pnl=_realized)
+                    _append_event("RELEASE_FAR_SUBMITTED", 
+                                  released_leg="FAR", remaining_leg="NEAR",
+                                  leg_side=self._far_side, entry_price=self._far_entry, exit_price=far_close,
+                                  gross_points=_pnl_pts, multiplier=_mult, cost=_cost, realized_pnl=_realized)
 
-                _release_side = "BUY" if self._far_side == "SHORT" else "SELL"
-                _append_fill("MXF", "FAR", "FAR", _release_side, 1, far_close, "RELEASE", 
-                             self._trade_id or "?", spread_z=float(spread_z) if spread_z is not None else None, 
-                             realized_pnl=_realized)
+                    _release_side = "BUY" if self._far_side == "SHORT" else "SELL"
+                    _append_fill(self._ticker, "FAR", "FAR", _release_side, 1, far_close, "RELEASE_SUBMIT", 
+                                 self._trade_id or "MISSING_TID", spread_z=float(spread_z) if spread_z is not None else None, 
+                                 realized_pnl=_realized)
 
-                _write_mts_state(
-                    has_position=True, action="RELEASE_FAR", reason=f"far_pnl={_f_pnl:.1f}",
-                    near_entry=self._near_entry, far_entry=self._far_entry,
-                    near_last=near_close, far_last=far_close,
-                    near_side=self._near_side, far_side=self._far_side,
-                    spread_z=spread_z, released_leg="far", release_price=near_close,
-                    trail_pts=trail_dist, trail_peak=self._peak, trail_nadir=self._nadir,
-                    release_stop_points=release_stop, trail_distance_points=trail_dist,
-                    trade_id=self._trade_id,
-                )
-                return Signal("PARTIAL_EXIT", "TMF_RELEASE_FAR", confidence=0.4)
+                    _write_mts_state(
+                        has_position=True, action="RELEASE_FAR", reason=f"far_pnl={_f_pnl:.1f}",
+                        near_entry=self._near_entry, far_entry=self._far_entry,
+                        near_last=near_close, far_last=far_close,
+                        near_side=self._near_side, far_side=self._far_side,
+                        spread_z=spread_z, released_leg=None, # Keep as None until fill
+                        release_stop_points=release_stop, trail_distance_points=trail_dist,
+                        trade_id=self._trade_id, ticker=self._ticker,
+                    )
+                    return Signal("PARTIAL_EXIT", "TMF_RELEASE_FAR", confidence=0.4)
 
             _write_mts_state(
                 has_position=True, action="HOLDING_SPREAD", reason=f"near_pnl={_n_pnl:.1f} far_pnl={_f_pnl:.1f}",
@@ -664,46 +831,63 @@ class TMFSpread(StrategyBase):
                 spread_z=spread_z, released_leg=self._released_leg,
                 trail_pts=trail_dist, release_stop_points=release_stop,
                 trail_distance_points=trail_dist, trade_id=self._trade_id,
+                # 2026-05-27 Gemini CLI: Pass current ticker to _write_mts_state for dynamic point value
+                ticker=self._ticker,
             )
             return None
 
         # ── Trailing mode ──
         if self._released_leg == "near":
             _rem_price, _rem_entry, _rem_leg_label, _released_leg_label = far_close, self._far_entry, "FAR", "NEAR"
+            # 2026-05-27 Gemini CLI: Evaluate intra-bar extremes
+            _rem_high = float(bar.get("far_high", far_close))
+            _rem_low = float(bar.get("far_low", far_close))
         else:
             _rem_price, _rem_entry, _rem_leg_label, _released_leg_label = near_close, self._near_entry, "NEAR", "FAR"
+            # 2026-05-27 Gemini CLI: Evaluate intra-bar extremes
+            _rem_high = float(bar.get("near_high", near_close))
+            _rem_low = float(bar.get("near_low", near_close))
+
+        # 💡 [Fixed 2026-05-27] Guard against zero or invalid prices in trailing mode
+        if _rem_high <= 0 or _rem_low <= 0:
+            self._set_eval(skip_reason="INVALID_TRAILING_PRICE", high=_rem_high, low=_rem_low)
+            return None
 
         if self._side == "LONG":
-            self._peak = max(self._peak, _rem_price)
-            trail_distance = self._peak - _rem_price
+            self._peak = max(self._peak, _rem_high)
+            trail_distance = self._peak - _rem_low
             if trail_distance >= trail_dist:
-                _pnl_pts = (_rem_price - _rem_entry)
-                _turnover = (_rem_entry + _rem_price) * 10.0
+                _pnl_pts = (_rem_low - _rem_entry)
+                _turnover = (_rem_entry + _rem_low) * _mult
                 _cost = 20.0 + _turnover * 2e-5
-                _realized = _pnl_pts * 10.0 - _cost
+                _realized = _pnl_pts * _mult - _cost
                 _append_event("EXIT_REMAINING", reason="TRAIL_LONG", 
                               released_leg=_released_leg_label, remaining_leg=_rem_leg_label,
-                              leg_side="LONG", entry_price=_rem_entry, exit_price=_rem_price,
-                              gross_points=_pnl_pts, multiplier=10, cost=_cost, realized_pnl=_realized)
-                _append_fill("MXF", _rem_leg_label, _rem_leg_label, "SELL", 1, _rem_price, "EXIT", 
-                             self._trade_id or "?", spread_z=float(spread_z) if spread_z is not None else None, realized_pnl=_realized)
-                self._reset()
+                              leg_side="LONG", entry_price=_rem_entry, exit_price=_rem_low,
+                              gross_points=_pnl_pts, multiplier=_mult, cost=_cost, realized_pnl=_realized)
+                _append_fill(self._ticker, _rem_leg_label, _rem_leg_label, "SELL", 1, _rem_low, "EXIT", 
+                             self._trade_id or "MISSING_TID", spread_z=float(spread_z) if spread_z is not None else None, realized_pnl=_realized)
+                # 2026-05-27 Gemini CLI: Change to EXITING state to prevent double submission and missing _side in monitor
+                self._lifecycle = "EXITING"
+                self._exit_start_time = time.monotonic()
                 return Signal("EXIT", "TMF_TRAIL_EXIT_LONG", confidence=0.5, stop_loss=0)
         else: # SHORT
-            self._nadir = min(self._nadir, _rem_price)
-            trail_distance = _rem_price - self._nadir
+            self._nadir = min(self._nadir, _rem_low)
+            trail_distance = _rem_high - self._nadir
             if trail_distance >= trail_dist:
-                _pnl_pts = (_rem_entry - _rem_price)
-                _turnover = (_rem_entry + _rem_price) * 10.0
+                _pnl_pts = (_rem_entry - _rem_high)
+                _turnover = (_rem_entry + _rem_high) * _mult
                 _cost = 20.0 + _turnover * 2e-5
-                _realized = _pnl_pts * 10.0 - _cost
+                _realized = _pnl_pts * _mult - _cost
                 _append_event("EXIT_REMAINING", reason="TRAIL_SHORT", 
                               released_leg=_released_leg_label, remaining_leg=_rem_leg_label,
-                              leg_side="SHORT", entry_price=_rem_entry, exit_price=_rem_price,
-                              gross_points=_pnl_pts, multiplier=10, cost=_cost, realized_pnl=_realized)
-                _append_fill("MXF", _rem_leg_label, _rem_leg_label, "BUY", 1, _rem_price, "EXIT", 
-                             self._trade_id or "?", spread_z=float(spread_z) if spread_z is not None else None, realized_pnl=_realized)
-                self._reset()
+                              leg_side="SHORT", entry_price=_rem_entry, exit_price=_rem_high,
+                              gross_points=_pnl_pts, multiplier=_mult, cost=_cost, realized_pnl=_realized)
+                _append_fill(self._ticker, _rem_leg_label, _rem_leg_label, "BUY", 1, _rem_high, "EXIT", 
+                             self._trade_id or "MISSING_TID", spread_z=float(spread_z) if spread_z is not None else None, realized_pnl=_realized)
+                # 2026-05-27 Gemini CLI: Change to EXITING state to prevent double submission and missing _side in monitor
+                self._lifecycle = "EXITING"
+                self._exit_start_time = time.monotonic()
                 return Signal("EXIT", "TMF_TRAIL_EXIT_SHORT", confidence=0.5, stop_loss=0)
         
         _write_mts_state(
@@ -715,13 +899,18 @@ class TMFSpread(StrategyBase):
             spread_z=spread_z, released_leg=self._released_leg,
             trail_pts=trail_dist, trail_peak=self._peak, trail_nadir=self._nadir,
             release_stop_points=release_stop, trail_distance_points=trail_dist,
-            trade_id=self._trade_id,
+            # 2026-05-27 Gemini CLI: Pass current ticker to _write_mts_state for dynamic point value
+            trade_id=self._trade_id, ticker=self._ticker,
         )
         return None
 
     def _reset(self, reason: str | None = None) -> None:
-        _write_mts_state(has_position=False, action="CLOSE", reason=reason or "trail_exit")
+        # 2026-05-27 Gemini CLI: Corrected lifecycle and reset logic for contract compliance
+        # 2026-05-27 Gemini CLI: Pass current ticker to _write_mts_state for dynamic point value
+        _write_mts_state(has_position=False, action="CLOSE", reason=reason or "trail_exit", ticker=self._ticker)
         self._has_position = False
+        self._lifecycle = "FLAT"
+        self._last_exit_ts = datetime.now()  # 2026-05-27 Gemini CLI: Enforce re-entry cooldown
         self._entry_ts = None
         self._near_entry = 0.0
         self._far_entry = 0.0
@@ -733,6 +922,8 @@ class TMFSpread(StrategyBase):
         self._peak = 0.0
         self._nadir = 0.0
         self._side = None
+        # 2026-05-27 Gemini CLI: Watchdog metrics (P2)
+        self._exit_start_time = 0.0
 
     def cleanup(self) -> None:
         self._reset()
