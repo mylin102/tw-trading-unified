@@ -47,6 +47,7 @@ class OptionsV2Squeeze(StrategyBase):
         df_1h = context.market.df_1h
 
         if df_5m is None or len(df_5m) < 2:
+            self._set_eval(skip_reason="NO_DATA")
             return None
 
         # ── 1. Compute squeeze on 5m bar ─────────────────────────────
@@ -91,15 +92,19 @@ class OptionsV2Squeeze(StrategyBase):
         if params.get("require_fire", True):
             fire_threshold = float(params.get("fire_score_threshold", 60))
             if not fired and abs(score) < fire_threshold:
-                side = None
+                self._set_eval(skip_reason="NO_FIRE", score=score, fire_thresh=fire_threshold)
+                return None
 
         if side and params.get("require_align", True):
             if side == "C" and not bullish_align:
-                side = None
+                self._set_eval(skip_reason="ALIGNMENT_NOT_BULLISH", side="CALL", score=score)
+                return None
             elif side == "P" and not bearish_align:
-                side = None
+                self._set_eval(skip_reason="ALIGNMENT_NOT_BEARISH", side="PUT", score=score)
+                return None
 
         if side is None:
+            self._set_eval(skip_reason="NO_SIDE_RESOLVED", score=score, vwap=vwap, close=close, mid_trend=mid_trend)
             return None
 
         # ── 6. Build Signal ──────────────────────────────────────────
@@ -120,7 +125,10 @@ class OptionsV2Squeeze(StrategyBase):
         sig = Signal(action, reason, stop_loss, confidence=confidence)
         valid, msg = sig.validate()
         if not valid:
+            self._set_eval(skip_reason=f"INVALID_SIGNAL:{msg}", action=action, score=score)
             return None
+            
+        self._set_eval(triggered=True, action=action, reason=reason, score=score)
         return sig
 
     # ── helpers ──────────────────────────────────────────────────────
