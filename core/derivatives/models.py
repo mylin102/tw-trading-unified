@@ -88,6 +88,9 @@ class SurfaceSnapshot:
     dte: float = 0.0
     timestamp: Optional[datetime.datetime] = None
 
+    # Invalid reason when !is_valid()
+    invalid_reason: str = ""
+
     def is_valid(self) -> bool:
         """True when all three IV values are positive."""
         return self.atm_iv > 0 and self.otm_put_iv > 0 and self.otm_call_iv > 0

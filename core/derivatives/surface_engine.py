@@ -100,31 +100,51 @@ class OptionSurfaceEngine:
 
         Returns a SurfaceSnapshot with ATM IV, OTM put IV, and OTM call IV.
         When insufficient data is available, returns a snapshot with is_valid()=False.
+        The invalid_reason field explains why.
         """
         ts = timestamp or datetime.datetime.utcnow()
 
-        # Find ATM (nearest to futures)
-        atm_put_strike, atm_put_record = self._nearest_quote("PUT", futures_price)
-        atm_call_strike, atm_call_record = self._nearest_quote("CALL", futures_price)
+        # Find ATM (nearest to futures, not exact match)
+        all_calls = [(strike, rec) for (otype, strike), rec in self.quote_store.items() if otype == "CALL"]
+        all_puts = [(strike, rec) for (otype, strike), rec in self.quote_store.items() if otype == "PUT"]
 
-        # Prefer the closer of ATM put/call
+        # ATM: nearest strike overall
         atm_strike = None
         atm_record = None
-        if atm_put_record is not None and atm_call_record is not None:
-            put_dist = abs(atm_put_strike - futures_price)
-            call_dist = abs(atm_call_strike - futures_price)
-            if put_dist <= call_dist:
-                atm_strike, atm_record = atm_put_strike, atm_put_record
-            else:
-                atm_strike, atm_record = atm_call_strike, atm_call_record
-        elif atm_put_record is not None:
-            atm_strike, atm_record = atm_put_strike, atm_put_record
-        elif atm_call_record is not None:
-            atm_strike, atm_record = atm_call_strike, atm_call_record
+        atm_is_call = True
+        all_strikes = []
+        for strike, rec in all_calls:
+            all_strikes.append((strike, rec, "CALL"))
+        for strike, rec in all_puts:
+            all_strikes.append((strike, rec, "PUT"))
 
-        # Find OTM put and call
-        otm_put_strike, otm_put_record = self._nearest_quote("PUT", futures_price - self.otm_points)
-        otm_call_strike, otm_call_record = self._nearest_quote("CALL", futures_price + self.otm_points)
+        if all_strikes:
+            best_strike, best_rec, best_type = min(
+                all_strikes, key=lambda x: abs(x[0] - futures_price)
+            )
+            atm_strike = best_strike
+            atm_record = best_rec
+            atm_is_call = best_type == "CALL"
+
+        # OTM put: nearest below futures (or nearest overall if none below)
+        otm_put_strike = None
+        otm_put_record = None
+        if all_puts:
+            below = [(s, r) for s, r in all_puts if s < futures_price]
+            if below:
+                otm_put_strike, otm_put_record = max(below, key=lambda x: x[0])
+            else:
+                otm_put_strike, otm_put_record = min(all_puts, key=lambda x: x[0])
+
+        # OTM call: nearest above futures (or nearest overall if none above)
+        otm_call_strike = None
+        otm_call_record = None
+        if all_calls:
+            above = [(s, r) for s, r in all_calls if s > futures_price]
+            if above:
+                otm_call_strike, otm_call_record = min(above, key=lambda x: x[0])
+            else:
+                otm_call_strike, otm_call_record = max(all_calls, key=lambda x: x[0])
 
         # Compute DTE from the first available expiry
         dte = 0.0
@@ -153,7 +173,7 @@ class OptionSurfaceEngine:
         atm_iv = 0.0
         if atm_record is not None:
             iv = iv_from_price(
-                option_type="PUT" if atm_strike == atm_put_strike else "CALL",
+                option_type="CALL" if atm_is_call else "PUT",
                 strike=float(atm_strike),
                 premium=float(atm_record["mid"]),
                 underlying_price=futures_price,
@@ -186,6 +206,21 @@ class OptionSurfaceEngine:
             if iv is not None:
                 otm_call_iv = iv
 
+        # Determine invalid_reason
+        invalid_reason = ""
+        if atm_record is None:
+            invalid_reason = "NO_ATM_QUOTE"
+        elif otm_put_record is None:
+            invalid_reason = "NO_OTM_PUT"
+        elif otm_call_record is None:
+            invalid_reason = "NO_OTM_CALL"
+        elif atm_iv <= 0:
+            invalid_reason = "INVALID_ATM_IV"
+        elif otm_put_iv <= 0:
+            invalid_reason = "INVALID_OTM_PUT_IV"
+        elif otm_call_iv <= 0:
+            invalid_reason = "INVALID_OTM_CALL_IV"
+
         snapshot = SurfaceSnapshot(
             atm_iv=round(atm_iv, 6),
             otm_put_iv=round(otm_put_iv, 6),
@@ -196,13 +231,18 @@ class OptionSurfaceEngine:
             underlying_price=futures_price,
             dte=round(dte, 2),
             timestamp=ts,
+            invalid_reason=invalid_reason,
         )
 
         print(
             "[SurfaceEngine] snapshot: atm_iv=%.4f otm_put_iv=%.4f otm_call_iv=%.4f "
-            "dte=%.1f valid=%s"
+            "dte=%.1f valid=%s reason=%s "
+            "atm_strike=%.0f otm_put_strike=%.0f otm_call_strike=%.0f "
+            "underlying=%.0f"
             % (snapshot.atm_iv, snapshot.otm_put_iv, snapshot.otm_call_iv,
-               snapshot.dte, snapshot.is_valid()),
+               snapshot.dte, snapshot.is_valid(), snapshot.invalid_reason,
+               snapshot.atm_strike, snapshot.otm_put_strike, snapshot.otm_call_strike,
+               snapshot.underlying_price),
             flush=True,
         )
 
