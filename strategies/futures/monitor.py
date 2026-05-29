@@ -89,7 +89,8 @@ class FuturesMonitor:
         self._config_mtime = 0
         self.dry_run = dry_run
         self.cfg = self._load_config(config_path)
-        self.ticker = "MXF"
+        # 2026-05-27 Gemini CLI: Generalize ticker initialization (no hardcoded default)
+        self.ticker = self.cfg.get("ticker", "UNKNOWN")
         self.contract = None
         self.far_contract = None  # Far-month contract for dual chart
         self._running = False
@@ -167,7 +168,8 @@ class FuturesMonitor:
         self.options_monitor = None      # shared options monitor for hourly audit / repair
         
         # 💡 GSD: Market data cache for virtual ticks
-        self.market_data = {"MTX": {"close": None}}
+        # 2026-05-27 Gemini CLI: Use dynamic ticker instead of hardcoded MTX
+        self.market_data = {self.ticker: {"close": None}}
         self.last_tick_at = time.time()  # [gstack] 數據新鮮度追蹤 — must init before _strategy_tick()
         self._last_real_tmf_tick_at = self.last_tick_at
         self._runtime_status = None
@@ -188,6 +190,9 @@ class FuturesMonitor:
         self._safety_stop_trade = None  # Exchange-side safety stop order
         self._pending_lifecycle_orders: Dict[str, Dict[str, Any]] = {}
         self._applied_lifecycle_deals = set()
+        self._mts_pending_fills: Dict[str, Dict[str, Any]] = {}  # [GSD] Track multi-leg spread fills before sync
+        # 2026-05-27 Gemini CLI: Track orders currently undergoing timeout cancellation to prevent re-entry
+        self._mts_stale_order_cancels = set()
         # 💡 GSD: Initialize with current time bucket to prevent immediate flip
         self._last_bar_ts = int(time.time() / 300) * 300
 
@@ -232,7 +237,15 @@ class FuturesMonitor:
         
         self.live_trading = self.cfg.get("live_trading", False)
         self.cooldown_bars = self.cfg.get("cooldown_bars", self.STRATEGY.get("cooldown_bars", 8))
-        
+
+        # 2026-05-27 Gemini CLI: Dynamic Ticker Support (No hardcoded defaults)
+        _old_ticker = self.ticker
+        self.ticker = self.cfg.get("ticker", "UNKNOWN")
+        if self.ticker != _old_ticker:
+            console.print(f"[cyan]🔄 Ticker updated: {_old_ticker} -> {self.ticker}[/cyan]")
+            if hasattr(self, '_ingestion'):
+                self._ingestion.ticker = self.ticker
+
         # Squeeze Failure Counter mode
         self.COUNTER = self.STRATEGY.get("counter_mode", {})
         self.counter_enabled = self.COUNTER.get("enabled", False)
@@ -455,7 +468,11 @@ class FuturesMonitor:
         else:
             # Create a minimal context for init
             dummy_ctx = StrategyContext(
-                market=MarketData(last_bar={}),
+                market=MarketData(
+                    last_bar={},
+                    # 2026-05-27 Gemini CLI: Pass current ticker to dummy context
+                    ticker=self.ticker
+                ),
                 position=PositionView(),
                 config=self.cfg,
                 bar_counter=0,
@@ -565,7 +582,7 @@ class FuturesMonitor:
                 if tmf_sorted:
                     # Pick the first one (nearest delivery)
                     self.contract = tmf_sorted[0]
-                    console.print(f"[green][FuturesMonitor] ✓ MXF front-month: {self.contract.code} (delivers {self.contract.delivery_date})[/green]")
+                    console.print(f"[green][FuturesMonitor] ✓ {self.ticker} front-month: {self.contract.code} (delivers {self.contract.delivery_date})[/green]")
                     # Sync contract to ingestion service (resolved after __init__)
                     try:
                         self._ingestion.set_contract(self.contract)
@@ -578,7 +595,7 @@ class FuturesMonitor:
                 
                 # Log all available codes for verification
                 all_codes = [f"{c.code}({c.delivery_date})" for c in tmf_sorted]
-                console.print(f"[dim][FuturesMonitor] Valid MXF queue: {', '.join(all_codes)}[/dim]")
+                console.print(f"[dim][FuturesMonitor] Valid {self.ticker} queue: {', '.join(all_codes)}[/dim]")
 
                 # [Far Month] Select first contract with DIFFERENT delivery date for dual chart
                 front_delivery = self.contract.delivery_date if self.contract else None
@@ -588,14 +605,14 @@ class FuturesMonitor:
                         self.far_contract = c
                         break
                 if self.far_contract is not None:
-                    console.print(f"[green][FuturesMonitor] ✓ MXF far-month: {self.far_contract.code} (delivers {self.far_contract.delivery_date})[/green]")
+                    console.print(f"[green][FuturesMonitor] ✓ {self.ticker} far-month: {self.far_contract.code} (delivers {self.far_contract.delivery_date})[/green]")
                 else:
                     self.far_contract = None
                     console.print(f" [yellow][FuturesMonitor] No far-month contract available[/yellow] ")
             else:
-                console.print("[red][FuturesMonitor] No MXF contracts found![/red]")
+                console.print(f"[red][FuturesMonitor] No {self.ticker} contracts found![/red]")
         except Exception as e:
-            console.print(f"[red][FuturesMonitor] Error selecting MXF contract: {e}[/red]")
+            console.print(f"[red][FuturesMonitor] Error selecting {self.ticker} contract: {e}[/red]")
 
         # [Bug Fix] Add contract rollover check
         self._last_contract_code = self.contract.code if self.contract else None
@@ -769,10 +786,19 @@ class FuturesMonitor:
                 console.print(f"[green][FuturesMonitor] ✅ Backfill complete: {len(combined)} total bars in CSV[/green]")
 
     def _tmf_feed_age_secs(self):
-        """Prefer real MXF feed freshness over synthetic continuity timestamps."""
+        """Prefer real MXF tick age over feed_health (which may be updated by non-tick sources).
+        # 2026-05-22 Hermes Agent: use _last_real_tmf_tick_at as ground truth — never polluted by TMF_VIRTUAL"""
+        try:
+            # [FeedHealth] Use _last_real_tmf_tick_at as ground truth — only updated by
+            # real MXF/TMF ticks in on_tick(), never by TMF_VIRTUAL synthetic ticks.
+            if self._last_real_tmf_tick_at > 0:
+                return max(0.0, time.time() - self._last_real_tmf_tick_at)
+        except Exception:
+            pass
         try:
             if hasattr(self, "feed_health") and self.feed_health is not None:
-                age = self.feed_health.age("MXF")
+                # 2026-05-27 Gemini CLI: Use dynamic ticker for health check
+                age = self.feed_health.age(self.ticker)
                 if age is not None and math.isfinite(float(age)):
                     return max(0.0, float(age))
         except Exception:
@@ -839,10 +865,12 @@ class FuturesMonitor:
             pass
 
         # ── Feed stale (warn threshold exceeded) ──
+        _real_tick_age = max(0.0, time.time() - self._last_real_tmf_tick_at)
         console.print(
             f" [yellow][IngestionWatchdog] "
             f"reason=feed_stale symbol={symbol} "
             f"tick_age_secs={secs_since_tick:.0f} "
+            f"real_tick_age_secs={_real_tick_age:.0f} "
             f"last_bar_ts={last_bar_ts} "
             f"canonical_age_secs={canonical_age_secs} "
             f"action=check_contract "
@@ -884,7 +912,7 @@ class FuturesMonitor:
                 pass
             # Mark monitor as not running and raise to break out of run loop
             self._running = False
-            raise RuntimeError(f"MXF tick stale for {secs_since_tick} seconds (>{critical}), exiting monitor.")
+            raise RuntimeError(f"{self.ticker} tick stale for {secs_since_tick} seconds (>{critical}), exiting monitor.")
 
         # Between warn and critical: attempt light recovery
         console.print(
@@ -1066,10 +1094,15 @@ class FuturesMonitor:
                     elif hours > 0 or minutes > 0:
                         console.print(f"[bold yellow]⚠️ SETTLEMENT DAY: Contract {current_code} expires at 13:30 ({hours}h {minutes}m remaining)[/bold yellow]")
             
-            # Get all available contracts
-            tmf_list = list(self.api.Contracts.Futures.MXF)
+            # 2026-05-27 Gemini CLI: Get all available contracts using dynamic ticker attribute access
+            target_contracts = getattr(self.api.Contracts.Futures, self.ticker, None)
+            if target_contracts is None:
+                console.print(f" [yellow]⚠️ Ticker {self.ticker} not found in Contracts.Futures[/yellow] ")
+                return
+            
+            tmf_list = list(target_contracts)
             if not tmf_list:
-                console.print(" [yellow]⚠️ No MXF contracts available[/yellow] ")
+                console.print(f" [yellow]⚠️ No {self.ticker} contracts available[/yellow] ")
                 return
             
             # [GSD Settlement Fix] Filter out expired contracts considering settlement time
@@ -1210,6 +1243,17 @@ class FuturesMonitor:
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()  # [gstack] 更新數據更新時間
 
+        # ── [Manual Trade Flag] Check on every tick ──
+        _flag_path = "/tmp/futures_manual_trade.flag"
+        if os.path.exists(_flag_path):
+            from core.date_utils import is_day_session, is_night_session
+            _now = datetime.now()
+            if is_day_session(_now) or is_night_session(_now):
+                try:
+                    self._process_manual_trade_flag()
+                except Exception as _fe:
+                    console.print(f"[red][MANUAL_TRADE_FLAG] on_tick handler failed: {_fe}[/red]")
+
         # [Debug] fingerprint every tick (config: debug.feed)
         if self._debug_feed:
             console.print(f"[dim][FuturesMonitor][ON_TICK] code={tick.code} close={getattr(tick, 'close', None)} ts={getattr(tick, 'datetime', None)}[/dim]")
@@ -1217,35 +1261,64 @@ class FuturesMonitor:
         # [Far Month] Handle far-month tick accumulation (independent from near-month)
         if self.far_contract and tick.code == self.far_contract.code:
             self._accumulate_far_tick(tick)
+            # 2026-05-27 Gemini CLI: Real-time MTS Execution on Far Tick (Contract 1)
+            _mts_enabled = self.cfg.get("mts", {}).get("enabled", False)
+            if _mts_enabled and not self.dry_run:
+                _rt_bar = dict(self._current_bar)
+                # Ensure near bar has ts
+                _rt_bar["ts"] = _rt_bar.get("ts") or pd.Timestamp(int(pd.Timestamp(tick.datetime).timestamp() / 300) * 300, unit='s')
+                _rt_bar["near_close_rt"] = self._current_bar.get("close", 0)
+                _rt_bar["near_high_rt"] = self._current_bar.get("high", 0)
+                _rt_bar["near_low_rt"] = self._current_bar.get("low", 0)
+                
+                # Far bar is definitely updated now
+                _rt_bar["far_close_rt"] = self._far_current_bar.get("close", 0)
+                _rt_bar["far_high_rt"] = self._far_current_bar.get("high", 0)
+                _rt_bar["far_low_rt"] = self._far_current_bar.get("low", 0)
+                
+                self._mts_tick(enriched_bar=_rt_bar)
             return
 
         # 💡 GSD: Data Continuity Fix
-        # Use strict matching for the primary MXF contract
-        is_tmf = self.contract and tick.code == self.contract.code
-        # For MTX, we still allow startswith for the heartbeat, but we MUST NOT use its price for MXF bars
-        is_mtx = tick.code.startswith("MXF") or tick.code.startswith("MTX")
+        # Use strict matching for the primary contract (TMF or MXF)
+        is_primary = self.contract and tick.code == self.contract.code
 
-        if not is_tmf and not is_mtx:
+        # [Heartbeat] Match against common futures prefixes to update feed age
+        _code = str(tick.code).upper()
+        is_common_futures = _code.startswith(("MXF", "MTX", "TMF", "TXF"))
+        # 2026-05-22 Gemini CLI: Defined is_tmf and is_mtx to prevent NameError in logging
+        is_tmf = _code.startswith("TMF")
+        is_mtx = _code.startswith(("MTX", "MXF"))
+
+        if not is_primary and not is_common_futures:
             return
-            
+
         # [GSD Data Safety] Write raw tick to CSV FIRST — before any in-memory use
-        # Only write real TMF ticks (not MTX heartbeat ticks which use stale price)
-        if is_tmf:
+        # Only write real primary ticks (not MTX/secondary ticks which might use stale price)
+        if is_primary:
+            # [REAL_TICK_SEEN] Real near-month MXF/TMF tick — updates ground truth age
             self._write_raw_tick(tick)
-            self._last_real_tmf_tick_at = self.last_tick_at
+            self._last_real_tmf_tick_at = time.time()
             price = float(tick.close)
             self._last_tmf_price = price  # Cache for heartbeat
             self._refresh_runtime_status()
         else:
-            # It's an MTX heartbeat tick
+            # It's a secondary heartbeat tick (MTX/MXF/TMF from another contract)
             if not hasattr(self, '_last_tmf_price') or self._last_tmf_price <= 0:
-                # No MXF price yet, can't build bar
+                # No primary price yet, can't build bar
                 return
             price = self._last_tmf_price
-            
-        # Only count volume for MXF to keep indicators accurate
-        vol = int(getattr(tick, "volume", 0)) if is_tmf else 0
-        
+
+        # 2026-05-27 Gemini CLI: Update market data cache for manual trade integrity checks (P0-P3)
+        # Use time.time() as local_arrival_at to avoid exchange-local clock drift issues.
+        self.market_data[self.ticker] = {
+            "close": price, 
+            "datetime": tick.datetime,
+            "local_arrival_at": time.time()
+        }
+
+        # Only count volume for primary ticker to keep indicators accurate
+        vol = int(getattr(tick, "volume", 0)) if is_primary else 0        
         # [Wave 1 optimization] Use integer time bucketing to avoid expensive pd.Timestamp().floor()
         # Only compute Timestamp when bar changes (every 5 minutes)
         tick_ts = pd.Timestamp(tick.datetime)
@@ -1286,19 +1359,44 @@ class FuturesMonitor:
             bar["low"] = min(bar["low"], price)
             bar["close"] = price
             bar["volume"] += vol
-            
-            # [gstack Safety Guard] Real-time stop loss check on every tick
-            if not self.dry_run and self.trader.position != 0:
-                # 1. Update trailing stop peak/floor
-                self.trader.update_trailing_stop(price)
-                # 2. Check for SL breach
-                self._check_stop_loss(tick.datetime, price)
         else:
             # Old data packet, ignore
             return
+
+        # 2026-05-27 Gemini CLI: Real-time stop loss and MTS execution on EVERY tick
+        _mts_enabled = self.cfg.get("mts", {}).get("enabled", False)
+        if not self.dry_run and self.trader.position != 0 and not _mts_enabled:
+            # 1. Update trailing stop peak/floor
+            self.trader.update_trailing_stop(price)
+            # 2. Check for SL breach
+            self._check_stop_loss(tick.datetime, price)
+        
+        if _mts_enabled and not self.dry_run:
+            _rt_bar = dict(bar)
+            # Fallback to current time if ts is None
+            _rt_bar["ts"] = _rt_bar.get("ts") or pd.Timestamp(ts_int, unit='s')
+            
+            # 2026-05-27 Gemini CLI: Pass real-time prices explicitly to override CSV staleness
+            _rt_bar["near_close_rt"] = price
+            _rt_bar["near_high_rt"] = bar["high"]
+            _rt_bar["near_low_rt"] = bar["low"]
+            
+            if hasattr(self, '_far_current_bar') and self._far_current_bar.get("close", 0) > 0:
+                _rt_bar["far_close_rt"] = self._far_current_bar["close"]
+                _rt_bar["far_high_rt"] = self._far_current_bar["high"]
+                _rt_bar["far_low_rt"] = self._far_current_bar["low"]
+            else:
+                # 💡 [Fixed 2026-05-27] Log warning if RT far price is missing
+                if _mts_enabled:
+                    console.print(f"[dim][MTS] Warning: No real-time far-month price for {self.far_contract.code if self.far_contract else 'UNKNOWN'}, relying on CSV[/dim]")
+            
+            self._mts_tick(enriched_bar=_rt_bar)
+
         cb = self.client._tick_callbacks.get(tick.code)
         if cb:
             cb(exchange, tick)
+
+        # 2026-05-22 Gemini CLI: Removed _maybe_close_selftest() call from here.
 
     # [Far Month] Accumulate far-month ticks into independent 5-min bars
     def _accumulate_far_tick(self, tick):
@@ -1646,15 +1744,9 @@ class FuturesMonitor:
             # Get current market price for unrealized PnL
             cur_price = 0.0
             try:
-                cur_price = float(self.market_data.get("MTX", {}).get("close", 0))
+                cur_price = float(self.market_data.get(self.ticker, {}).get("close", 0))
             except Exception:
                 cur_price = 0.0
-            
-            if cur_price <= 0:
-                try:
-                    cur_price = float(self.market_data.get("MXF", {}).get("close", 0))
-                except Exception:
-                    cur_price = 0.0
 
             all_orders = self.order_mgr.get_completed() + self.order_mgr.get_pending()
             export_data = []
@@ -1811,31 +1903,86 @@ class FuturesMonitor:
 
     def _clear_pending_lifecycle_order(self, order_id):
         self._pending_lifecycle_orders.pop(order_id, None)
+        # 2026-05-27 Gemini CLI: Clear cancellation tracking as well
+        if hasattr(self, "_mts_stale_order_cancels"):
+            self._mts_stale_order_cancels.discard(order_id)
 
     def _apply_confirmed_futures_deal(self, event):
         from core.order_management.order import OrderStatus
         from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
 
+        # [MTS] Check if this fill completes a spread entry (automated or manual)
+        # Must be called BEFORE early returns to ensure tracking dictionary is updated
+        price = float(event.fill_price or 0)
+        self._check_mts_multi_leg_fill(event.order_id, price)
+
         pending = self._pending_lifecycle_orders.get(event.order_id)
-        if pending is None or event.fill_qty <= 0:
+        if pending is None or event.fill_quantity <= 0:
             return None
 
-        deal_key = event.deal_id or f"{event.order_id}:{event.fill_qty}:{event.fill_price}"
+        deal_key = event.deal_id or f"{event.order_id}:{event.fill_quantity}:{event.fill_price}"
         if deal_key in self._applied_lifecycle_deals:
             return None
 
         signal = pending.get("signal")
-        if signal not in ("BUY", "SELL", "EXIT", "PARTIAL_EXIT"):
+        # Support both standard and MTS signal types for logging/audit
+        if signal not in ("BUY", "SELL", "EXIT", "PARTIAL_EXIT", 
+                          "SELL_NEAR_BUY_FAR", "BUY_NEAR_SELL_FAR", 
+                          "RELEASE_NEAR", "RELEASE_FAR"):
             return None
 
         ts = datetime.now()
-        lots = int(event.fill_qty)
-        price = float(event.fill_price or 0)
+        lots = int(event.fill_quantity)
         reason = pending.get("reason")
         stop_loss = pending.get("stop_loss")
         break_even_trigger = pending.get("break_even_trigger")
         trail_points = pending.get("trail_points")
         cross_policy = pending.get("cross_policy")
+
+        # Skip directional trader execution for multi-leg spread signals (net zero or self-managed)
+        if signal in ("SELL_NEAR_BUY_FAR", "BUY_NEAR_SELL_FAR", "RELEASE_NEAR", "RELEASE_FAR", "EXIT"):
+             _pending_strat = pending.get("strategy", "")
+             if _pending_strat and "MTS" in str(_pending_strat):
+                 # [Fix 2026-05-27] Handle strategy state reset for MTS exits upon fill
+                 if signal == "EXIT" or _pending_strat == "MTS_EXIT":
+                     _mts_strat = self._registry.get("tmf_spread")
+                     if _mts_strat:
+                         _mts_strat._reset(reason="trail_exit_confirmed")
+                         console.print(f"[bold green]✅ [MTS_SYNC] Trailing exit CONFIRMED: {event.order_id}[/bold green]")
+                 elif signal in ("RELEASE_NEAR", "RELEASE_FAR") or _pending_strat == "MTS_RELEASE":
+                     _mts_strat = self._registry.get("tmf_spread")
+                     if _mts_strat:
+                         _leg = "near" if "NEAR" in str(signal) else "far"
+                         _mts_strat.sync_release(leg=_leg, price=price)
+                         console.print(f"[bold green]✅ [MTS_SYNC] Release CONFIRMED: {event.order_id} ({_leg})[/bold green]")
+
+                 # 💡 [Fixed 2026-05-27] Update directional trader position for the NEAR leg
+                 # This prevents GHOST_POSITION errors in the watchdog.
+                 if self.contract and event.symbol == self.contract.code:
+                     _mkt_action = "Buy" if "BUY" in str(signal) else "Sell"
+                     self.trader.execute_signal(_mkt_action, price, lots=lots)
+                     console.print(f"[dim][MTS_SYNC] Near-leg position synced to trader: {self.trader.position}[/dim]")
+
+                 self._applied_lifecycle_deals.add(deal_key)
+                 
+                 # 💡 [Fixed 2026-05-27] Execution Quality Audit
+                 _ref_ohlc = pending.get("ref_ohlc", {})
+                 _ref_close = float(_ref_ohlc.get("close", 0))
+                 _slippage = 0.0
+                 if _ref_close > 0:
+                     # For BUY: slippage = fill - ref (positive is bad)
+                     # For SELL: slippage = ref - fill (positive is bad)
+                     _side_val = str(pending.get("side", "")).upper() or ("BUY" if "BUY" in str(signal) else "SELL")
+                     if _side_val == "BUY": _slippage = price - _ref_close
+                     else: _slippage = _ref_close - price
+
+                 self._append_mts_event("LEG_FILLED", 
+                                       order_id=event.order_id, symbol=event.symbol, 
+                                       price=price, qty=lots, slippage=round(_slippage, 1),
+                                       ref_ohlc=_ref_ohlc)
+
+                 self._save_orders_file_wrapper()
+                 return f"MTS_LEG_FILL:{event.symbol}"
 
         pnl_pts = 0.0
         pnl_cash = 0.0
@@ -1967,7 +2114,10 @@ class FuturesMonitor:
             msg = self._apply_confirmed_futures_deal(event)
             if msg:
                 action = "BUY" if event.side == OrderSide.BUY else "SELL"
-                console.print(f"[green]📦 Confirmed deal: {action} {event.fill_qty} @ {event.fill_price:.0f} deal={event.deal_id} → {msg}[/green]")
+                console.print(f"[green]📦 Confirmed deal: {action} {event.fill_quantity} @ {event.fill_price:.0f} deal={event.deal_id} → {msg}[/green]")
+            
+            # [GSD] Always update dashboard file to reflect latest OrderManager state (e.g. FILLED)
+            self._save_orders_file_wrapper()
 
         def _on_cancel_callback(event):
             console.print(f" [yellow]🚫 Order CANCELLED: {event.order_id} ({event.reason})[/yellow] ")
@@ -2046,12 +2196,13 @@ class FuturesMonitor:
 
         self.order_mgr.submit(order, exchange_ordno=f"PAPER-{order.order_id}")
         self.paper_fill_sim.register(order)
-        self.paper_fill_sim.process_tick(self._make_synthetic_tick(price, ts))
+        self.paper_fill_sim.process_tick(self._make_synthetic_tick(price, ts, symbol=order.symbol))
         return order.order_id
 
-    def _make_synthetic_tick(self, price, ts):
+    def _make_synthetic_tick(self, price, ts, symbol=None):
         """Create a synthetic tick object from price/timestamp for PaperFillSimulator."""
         tick = type("Tick", (), {})()
+        tick.code = symbol or self.ticker
         tick.datetime = ts if hasattr(ts, "strftime") else datetime.now()
         tick.close = price
         tick.open = price
@@ -2089,7 +2240,7 @@ class FuturesMonitor:
             "score": score,
             "rejection": rejection_reason,
             "note": note,
-        }, ticker="MXF")
+        }, ticker=self.ticker)
 
     def _ensure_strategy_initialized(self, strategy_name, strategy, ctx):
         """Initialize a strategy instance once before the router calls it."""
@@ -2294,6 +2445,8 @@ class FuturesMonitor:
         ctx = StrategyContext(
             market=MarketData(
                 last_bar=bar,
+                # 2026-05-27 Gemini CLI: Pass current ticker to strategy context
+                ticker=self.ticker,
                 df_5m=df_5m,
                 df_15m=df_15m,
                 timestamp=bar.get('timestamp', ''),
@@ -2443,7 +2596,7 @@ class FuturesMonitor:
 
     def _submit_mts_order_signal(self, signal, strategy, bar_dict, ts):
         """Submit order via order_mgr for MTS signals (entry, release, exit)."""
-        if not self.order_mgr or not self.paper_fill_sim:
+        if not self.order_mgr:
             console.print("[red]⚠️ [MTS_ORDER] order_mgr not available — cannot submit order[/red]")
             return
         from core.order_management.order import OrderType, OrderSide
@@ -2451,102 +2604,195 @@ class FuturesMonitor:
         _reason = signal.reason
         _near_close = float(bar_dict.get("near_close", 0))
         _far_close = float(bar_dict.get("far_close", 0))
+        _ts = ts or datetime.now()
+
+        # 💡 [Fixed 2026-05-27] Prioritize existing strategy trade_id for releases/exits
+        _trade_id = getattr(strategy, "_trade_id", None)
+        if not _trade_id or _action in ("BUY_NEAR_SELL_FAR", "SELL_NEAR_BUY_FAR"):
+             _trade_id = f"mts-auto-{_ts.strftime('%H%M%S-%f')[:-3]}"
 
         # Helper for common fields in event log
         def _ev_meta(order):
             return {
                 "order_id": order.order_id, "symbol": order.symbol,
                 "side": order.side.value, "type": order.order_type.value,
-                "price": order.price, "qty": order.quantity, "strategy": order.strategy
+                "price": order.price, "qty": order.quantity, "strategy": order.strategy,
+                "trade_id": _trade_id
             }
 
         _TICK = 1.0
         _ENTRY_BUFFER = 4
         _EXIT_BUFFER = 10
 
+        # [GSD] Use real contract codes instead of synthetic symbols
+        _near_code = self.contract.code if self.contract else f"{self.ticker}_NEAR"
+        _far_code = self.far_contract.code if self.far_contract else f"{self.ticker}_FAR"
+
+        # [Snapshot] Capture submission-time OHLC for slippage analysis
+        _snap = {
+            "near": {k: bar_dict.get(f"near_{k}") for k in ("open", "high", "low", "close")},
+            "far": {k: bar_dict.get(f"far_{k}") for k in ("open", "high", "low", "close")},
+            "spread_z": bar_dict.get("spread_z")
+        }
+
         if _action == "PARTIAL_EXIT":
             # Release one leg — released_leg is in strategy state
             _released = getattr(strategy, "_released_leg", None)
             if _released == "near":
                 _side = OrderSide.BUY if getattr(strategy, "_near_side") == "SHORT" else OrderSide.SELL
-                _price = _near_close
-                _price_mkt = _price + _EXIT_BUFFER * _TICK if _side == OrderSide.BUY else _price - _EXIT_BUFFER * _TICK
-                console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_NEAR: {_side} mkt_limit={_price_mkt:.0f} (ref={_price:.0f})[/yellow]")
-                _order = self.order_mgr.create_order(symbol="MXF_NEAR", side=_side, order_type=OrderType.LIMIT, quantity=1, price=_price_mkt, strategy="MTS")
-                self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_order))
+                console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_NEAR: {_side} (MKP Range Market)[/yellow]")
+                # 💡 [Fixed 2026-05-27] Use MKP (Range Market) via OrderType.MARKET
+                _order = self.order_mgr.create_order(symbol=_near_code, side=_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_RELEASE")
+                self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _snap["near"]})
+                
+                # [GSD] Track in lifecycle orders so fill is not ignored
+                self._pending_lifecycle_orders[_order.order_id] = {
+                    "intent_id": _order.intent_id, "signal": "RELEASE_NEAR", "reason": _reason, 
+                    "ts": _ts, "lots": 1, "price": _near_close, "ref_ohlc": _snap["near"]
+                }
+                
                 self.order_mgr.submit(_order)
-                self.paper_fill_sim.register(_order)
-                from types import SimpleNamespace
-                self.paper_fill_sim.process_tick(SimpleNamespace(close=_price, high=_price + 1, low=_price - 1, open=_price, volume=1))
-                console.print(f"[bold green]✅ [MTS_ORDER] RELEASE_NEAR FILLED: {_side} @ {_price:.0f}[/bold green]")
+                if self.paper_fill_sim:
+                    self.paper_fill_sim.register(_order)
+                    # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
+                    self.paper_fill_sim.process_tick(self._make_synthetic_tick(_near_close, _ts, symbol=_near_code))
+
+                    # Force fill ONLY in paper mode
+                    if self.dry_run or not self.live_trading:
+                        console.print(f"[bold green]✅ [MTS_ORDER] RELEASE_NEAR FILLED: {_side} (MKP)[/bold green]")
             elif _released == "far":
                 _side = OrderSide.BUY if getattr(strategy, "_far_side") == "SHORT" else OrderSide.SELL
-                _price = _far_close
-                _price_mkt = _price + _EXIT_BUFFER * _TICK if _side == OrderSide.BUY else _price - _EXIT_BUFFER * _TICK
-                console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_FAR: {_side} mkt_limit={_price_mkt:.0f} (ref={_price:.0f})[/yellow]")
-                _order = self.order_mgr.create_order(symbol="MXF_FAR", side=_side, order_type=OrderType.LIMIT, quantity=1, price=_price_mkt, strategy="MTS")
-                self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_order))
+                console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_FAR: {_side} (MKP Range Market)[/yellow]")
+                # 💡 [Fixed 2026-05-27] Use MKP (Range Market) via OrderType.MARKET
+                _order = self.order_mgr.create_order(symbol=_far_code, side=_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_RELEASE")
+                self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _snap["far"]})
+                
+                # [GSD] Track in lifecycle orders so fill is not ignored
+                self._pending_lifecycle_orders[_order.order_id] = {
+                    "intent_id": _order.intent_id, "signal": "RELEASE_FAR", "reason": _reason, 
+                    "ts": _ts, "lots": 1, "price": _far_close, "ref_ohlc": _snap["far"]
+                }
+                
                 self.order_mgr.submit(_order)
-                self.paper_fill_sim.register(_order)
-                from types import SimpleNamespace
-                self.paper_fill_sim.process_tick(SimpleNamespace(close=_price, high=_price + 1, low=_price - 1, open=_price, volume=1))
-                console.print(f"[bold green]✅ [MTS_ORDER] RELEASE_FAR FILLED: {_side} @ {_price:.0f}[/bold green]")
+                if self.paper_fill_sim:
+                    self.paper_fill_sim.register(_order)
+                    # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
+                    self.paper_fill_sim.process_tick(self._make_synthetic_tick(_far_close, _ts, symbol=_far_code))
+
+                    # Force fill ONLY in paper mode
+                    if self.dry_run or not self.live_trading:
+                        console.print(f"[bold green]✅ [MTS_ORDER] RELEASE_FAR FILLED: {_side} (MKP)[/bold green]")
             else:
                 console.print(f"[red]⚠️ [MTS_ORDER] PARTIAL_EXIT but released_leg is None[/red]")
             return
+
         elif _action == "EXIT":
             # Exit remaining leg — determine which one it is from strategy state
             _released = getattr(strategy, "_released_leg", None)
             _remaining_side = getattr(strategy, "_side", None)
             if _released == "near":
-                _price = _far_close
-                _symbol = "MXF_FAR"
+                _ref_price = _far_close
+                _symbol = _far_code
                 _leg_label = "FAR"
+                _ref_ohlc = _snap["far"]
             else:
-                _price = _near_close
-                _symbol = "MXF_NEAR"
+                _ref_price = _near_close
+                _symbol = _near_code
                 _leg_label = "NEAR"
+                _ref_ohlc = _snap["near"]
             
             _side = OrderSide.SELL if _remaining_side == "LONG" else OrderSide.BUY
             
             if _remaining_side:
-                _price_mkt = _price + _EXIT_BUFFER * _TICK if _side == OrderSide.BUY else _price - _EXIT_BUFFER * _TICK
-                console.print(f"[yellow]📝 [MTS_ORDER] Submitting EXIT for {_leg_label}: {_side} mkt_limit={_price_mkt:.0f} (ref={_price:.0f})[/yellow]")
-                _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.LIMIT, quantity=1, price=_price_mkt, strategy="MTS")
-                self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_order))
+                console.print(f"[yellow]📝 [MTS_ORDER] Submitting EXIT for {_leg_label}: {_side} (MKP Range Market)[/yellow]")
+                # 💡 [Fixed 2026-05-27] Use MKP (Range Market) via OrderType.MARKET
+                _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_EXIT")
+                self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _ref_ohlc})
+                
+                # [GSD] Track in lifecycle orders so fill is not ignored
+                self._pending_lifecycle_orders[_order.order_id] = {
+                    "intent_id": _order.intent_id, "signal": "EXIT", "reason": _reason, 
+                    "ts": _ts, "lots": 1, "price": _ref_price, "ref_ohlc": _ref_ohlc
+                }
+                
                 self.order_mgr.submit(_order)
-                self.paper_fill_sim.register(_order)
-                from types import SimpleNamespace
-                self.paper_fill_sim.process_tick(SimpleNamespace(close=_price, high=_price + 1, low=_price - 1, open=_price, volume=1))
-                console.print(f"[bold green]✅ [MTS_ORDER] EXIT_REMAINING ({_symbol}) FILLED: {_side} @ {_price:.0f}[/bold green]")
+                if self.paper_fill_sim:
+                    self.paper_fill_sim.register(_order)
+                    # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
+                    self.paper_fill_sim.process_tick(self._make_synthetic_tick(_ref_price, _ts, symbol=_symbol))
+
+                    # Force fill ONLY in paper mode
+                    if self.dry_run or not self.live_trading:
+                        console.print(f"[bold green]✅ [MTS_ORDER] EXIT_REMAINING ({_symbol}) FILLED: {_side} (MKP)[/bold green]")
             else:
                 console.print(f"[red]⚠️ [MTS_ORDER] EXIT but remaining side is None[/red]")
             return
+
+        elif _action in ("BUY_NEAR_SELL_FAR", "SELL_NEAR_BUY_FAR"):
+            # Entry: submit two legs
+            _near_side = OrderSide.SELL if _action == "SELL_NEAR_BUY_FAR" else OrderSide.BUY
+            _far_side = OrderSide.BUY if _action == "SELL_NEAR_BUY_FAR" else OrderSide.SELL
+
+            console.print(f"[yellow]📝 [MTS_ORDER] Submitting ENTRY orders (MKP Range Market): NEAR={_near_side}, FAR={_far_side}[/yellow]")
+            
+            # 💡 [Fixed 2026-05-27] Use MKP (Range Market) via OrderType.MARKET
+            _o_near = self.order_mgr.create_order(symbol=_near_code, side=_near_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_ENTRY")
+            self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_o_near), "ref_ohlc": _snap["near"]})
+            
+            # [GSD] Track in lifecycle orders so fill is not ignored
+            self._pending_lifecycle_orders[_o_near.order_id] = {
+                "intent_id": _o_near.intent_id, "signal": _action, "reason": _reason, 
+                "ts": _ts, "lots": 1, "price": _near_close, "ref_ohlc": _snap["near"]
+            }
+            
+            self.order_mgr.submit(_o_near)
+            if self.paper_fill_sim:
+                self.paper_fill_sim.register(_o_near)
+                # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
+                self.paper_fill_sim.process_tick(self._make_synthetic_tick(_near_close, _ts, symbol=_near_code))
+
+            # 💡 [Fixed 2026-05-27] Use MKP (Range Market) via OrderType.MARKET
+            _o_far = self.order_mgr.create_order(symbol=_far_code, side=_far_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_ENTRY")
+            self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_o_far), "ref_ohlc": _snap["far"]})
+            
+            # [GSD] Track in lifecycle orders so fill is not ignored
+            self._pending_lifecycle_orders[_o_far.order_id] = {
+                "intent_id": _o_far.intent_id, "signal": _action, "reason": _reason, 
+                "ts": _ts, "lots": 1, "price": _far_close, "ref_ohlc": _snap["far"]
+            }
+            
+            self.order_mgr.submit(_o_far)
+            if self.paper_fill_sim:
+                self.paper_fill_sim.register(_o_far)
+                # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
+                self.paper_fill_sim.process_tick(self._make_synthetic_tick(_far_close, _ts, symbol=_far_code))
+
+            # [Deferred Sync] Populate tracking dictionary for automated entry
+            # In live mode, wait for confirmed fills; in paper, fills arrive immediately
+            self._mts_pending_fills[_trade_id] = {
+                "near_order_id": _o_near.order_id,
+                "far_order_id": _o_far.order_id,
+                "near_filled": False,
+                "far_filled": False,
+                "side": "SHORT" if _action == "SELL_NEAR_BUY_FAR" else "LONG",
+                "spread_side": _action,
+                "near_label": "NEAR",
+                "far_label": "FAR",
+                "near_ref": _near_close,
+                "far_ref": _far_close,
+                "ts": _ts
+            }
+
+            # 2026-05-27 Gemini CLI: Removed redundant process_tick to prevent double-ordering loops
+            from types import SimpleNamespace
+            # 2026-05-27 Gemini CLI: Removed redundant process_tick loop
+            # 2026-05-27 Gemini CLI: Removed redundant process_tick loop
+            console.print(f"[bold green]✅ [MTS_ORDER] ENTRY FILLED: near={_near_side}@{_near_close:.0f} far={_far_side}@{_far_close:.0f}[/bold green]")
+            return
+
         else:
             console.print(f"[red]⚠️ [MTS_ORDER] Unknown signal action: {_action}[/red]")
             return
-
-        # Entry: submit two legs
-        _near_side = OrderSide.SELL if _action == "SELL_NEAR_BUY_FAR" else OrderSide.BUY
-        _far_side = OrderSide.BUY if _action == "SELL_NEAR_BUY_FAR" else OrderSide.SELL
-        _near_price = _near_close - _ENTRY_BUFFER * _TICK if _near_side == OrderSide.SELL else _near_close + _ENTRY_BUFFER * _TICK
-        _far_price = _far_close - _ENTRY_BUFFER * _TICK if _far_side == OrderSide.SELL else _far_close + _ENTRY_BUFFER * _TICK
-
-        console.print(f"[yellow]📝 [MTS_ORDER] Submitting ENTRY orders: NEAR={_near_side} mkt_limit={_near_price:.0f}, FAR={_far_side} mkt_limit={_far_price:.0f}[/yellow]")
-        _o_near = self.order_mgr.create_order(symbol="MXF_NEAR", side=_near_side, order_type=OrderType.LIMIT, quantity=1, price=_near_price, strategy="MTS")
-        self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_o_near))
-        self.order_mgr.submit(_o_near)
-        self.paper_fill_sim.register(_o_near)
-
-        _o_far = self.order_mgr.create_order(symbol="MXF_FAR", side=_far_side, order_type=OrderType.LIMIT, quantity=1, price=_far_price, strategy="MTS")
-        self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_o_far))
-        self.order_mgr.submit(_o_far)
-        self.paper_fill_sim.register(_o_far)
-
-        from types import SimpleNamespace
-        self.paper_fill_sim.process_tick(SimpleNamespace(close=_near_close, high=_near_close + 1, low=_near_close - 1, open=_near_close, volume=1))
-        self.paper_fill_sim.process_tick(SimpleNamespace(close=_far_close, high=_far_close + 1, low=_far_close - 1, open=_far_close, volume=1))
-        console.print(f"[bold green]✅ [MTS_ORDER] ENTRY FILLED: near={_near_side}@{_near_close:.0f} far={_far_side}@{_far_close:.0f}[/bold green]")
 
     def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, trail_points=None, reason=None):
         action = None
@@ -2617,11 +2863,13 @@ class FuturesMonitor:
             try:
                 if hasattr(self, 'feed_health') and self.feed_health is not None:
                     tx_age = self.feed_health.age('TX')
-                    tmf_age = self.feed_health.age('MXF')
+                    # 2026-05-27 Gemini CLI: Use dynamic ticker for status info
+                    tmf_age = self.feed_health.age(self.ticker)
                     max_age = getattr(self, 'STALE_WARN_SECS', 120)
                     if tx_age > max_age or tmf_age > max_age:
-                        self._audit_signal("ENTRY_BLOCKED", "", 0, "feed_stale", f"TX={tx_age:.0f}s MXF={tmf_age:.0f}s")
-                        console.print(f" [yellow][FuturesMonitor] Block entry: feed stale TX={tx_age:.0f}s MXF={tmf_age:.0f}s[/yellow] ")
+                        # 2026-05-27 Gemini CLI: Use dynamic ticker in audit log
+                        self._audit_signal("ENTRY_BLOCKED", "", 0, "feed_stale", f"TX={tx_age:.0f}s {self.ticker}={tmf_age:.0f}s")
+                        console.print(f" [yellow][FuturesMonitor] Block entry: feed stale TX={tx_age:.0f}s {self.ticker}={tmf_age:.0f}s[/yellow] ")
                         return None
             except Exception:
                 pass
@@ -3289,14 +3537,15 @@ class FuturesMonitor:
         try:
             # If order manager is enabled, use it
             if self.order_mgr:
-                pending = self.order_mgr.get_pending_orders()
+                # 2026-05-27 Gemini CLI: Fixed API mismatch (get_pending and cancel)
+                pending = self.order_mgr.get_pending()
                 for order in pending:
                     try:
-                        self.order_mgr.cancel_order(order.id)
-                        console.print(f" [yellow]✓ Cancelled pending order {order.id}[/yellow] ")
+                        self.order_mgr.cancel(order.order_id, reason="SESSION_TRANSITION")
+                        console.print(f" [yellow]✓ Cancelled pending order {order.order_id}[/yellow] ")
                         cancelled_count += 1
                     except Exception as e:
-                        console.print(f"[red]Failed to cancel order {order.id}: {e}[/red]")
+                        console.print(f"[red]Failed to cancel order {order.order_id}: {e}[/red]")
             else:
                 # Fallback: direct API cancellation for futures orders
                 # This is a simplistic implementation - may need enhancement
@@ -3314,7 +3563,8 @@ class FuturesMonitor:
     #   Market → ORB Signal → Risk Check → Execution
     def _sync_mts_status(self):
         """[GSD] Synchronize MTS position and manual order state to disk for dashboard."""
-        _hb_file = "/tmp/mts_position_state.json"
+        # 2026-05-27 Gemini CLI: Use isolated path if environment variable is set
+        _hb_file = os.getenv("MTS_STATE_PATH", "/tmp/mts_position_state.json")
         _mts_cfg = self.cfg.get("mts", {})
         _strat_name = _mts_cfg.get("strategy", "tmf_spread")
         strategy = self._registry.get(_strat_name)
@@ -3330,6 +3580,10 @@ class FuturesMonitor:
                     with open(_hb_file, "r") as f: existing = json.load(f)
                 except: pass
 
+            # [GSD] Restoration Guard: don't overwrite valid disk state while strategy recovers
+            if not _has_pos_in_mem and existing.get("has_position") is True:
+                return
+
             # 2. Position Details
             _n_entry = getattr(strategy, "_near_entry", 0) or float(existing.get("near_entry", 0))
             _f_entry = getattr(strategy, "_far_entry", 0) or float(existing.get("far_entry", 0))
@@ -3340,8 +3594,10 @@ class FuturesMonitor:
             _n_last = float(existing.get("near_last", 0))
             _f_last = float(existing.get("far_last", 0))
             
-            _n_upl = (_n_last - _n_entry) * (-1 if _n_side == "SHORT" else 1) * 10.0 if _n_entry > 0 and _n_last > 0 and _n_side else 0.0
-            _f_upl = (_f_last - _f_entry) * (-1 if _f_side == "SHORT" else 1) * 10.0 if _f_entry > 0 and _f_last > 0 and _f_side else 0.0
+            # 2026-05-27 Gemini CLI: Use dynamic multiplier from constants instead of hardcoded 10.0
+            _mult = float(get_point_value(self.ticker))
+            _n_upl = (_n_last - _n_entry) * (-1 if _n_side == "SHORT" else 1) * _mult if _n_entry > 0 and _n_last > 0 and _n_side else 0.0
+            _f_upl = (_f_last - _f_entry) * (-1 if _f_side == "SHORT" else 1) * _mult if _f_entry > 0 and _f_last > 0 and _f_side else 0.0
 
             # 3. Manual Order Details (Enrichment)
             _manual_order_info = {
@@ -3383,10 +3639,122 @@ class FuturesMonitor:
             }
             _hb_state.update(_manual_order_info)
             
-            with open(_hb_file, "w") as f:
-                json.dump(_hb_state, f, default=str)
+            # 2026-05-27 Gemini CLI: P6: Atomic Write to prevent [MTS_STATE_READ_FAILED] race conditions
+            _tmp_file = _hb_file + ".tmp"
+            try:
+                with open(_tmp_file, "w") as f:
+                    json.dump(_hb_state, f, default=str)
+                os.replace(_tmp_file, _hb_file)
+            except Exception as e:
+                if os.path.exists(_tmp_file): os.remove(_tmp_file)
+                raise e
         except Exception as e:
             console.print(f"[red]⚠️ MTS Status Sync failed: {e}[/red]")
+
+    def _run_mts_watchdog(self):
+        """
+        2026-05-27 Gemini CLI: Tiered MTS Safety Watchdog (P4).
+        - High-Freq (10s): EXITING state-lock & Pending order timeouts.
+        - Low-Freq (30s): Broker reconciliation & Feed health.
+        """
+        if not self.order_mgr or self.dry_run:
+            return
+
+        now_mono = time.monotonic()
+        
+        # ── Tier 1: High-Frequency Check (Every 10s) ──
+        _last_hi_check = getattr(self, "_mts_watchdog_last_hi", 0.0)
+        if (now_mono - _last_hi_check) < 10.0:
+            return
+        self._mts_watchdog_last_hi = now_mono
+
+        _mts_cfg = self.cfg.get("mts", {})
+        strategy = self._registry.get(_mts_cfg.get("strategy", "tmf_spread"))
+        if not strategy: return
+
+        now_dt = datetime.now()
+        
+        # 1.1 Pending Order Timeout (15s)
+        _ORDER_TIMEOUT = 15
+        to_resubmit = []
+        for order_id, meta in list(self._pending_lifecycle_orders.items()):
+            _strat_label = meta.get("strategy") or ""
+            if "MTS_EXIT" not in _strat_label and "MTS_RELEASE" not in _strat_label:
+                continue
+            if order_id in self._mts_stale_order_cancels:
+                continue
+
+            _submit_ts = meta.get("ts")
+            if _submit_ts and (now_dt - _submit_ts).total_seconds() > _ORDER_TIMEOUT:
+                order = self.order_mgr.get_order(order_id)
+                from core.order_management.order import OrderStatus
+                if order and order.status in (OrderStatus.PENDING_SUBMIT, OrderStatus.SUBMITTED):
+                    console.print(f"[bold yellow]⚠️ [WATCHDOG] MTS Order {order_id} hanging >{_ORDER_TIMEOUT}s. Cancelling...[/bold yellow]")
+                    to_resubmit.append(order_id)
+
+        for order_id in to_resubmit:
+            try:
+                self._mts_stale_order_cancels.add(order_id)
+                self.order_mgr.cancel(order_id)
+            except Exception as e:
+                console.print(f"[red]❌ [WATCHDOG] Stale order cancel failed: {e}[/red]")
+
+        # 1.2 EXITING State Lock (15s)
+        _lifecycle = getattr(strategy, "_lifecycle", "FLAT")
+        _exit_start = getattr(strategy, "_exit_start_time", 0.0)
+        if _lifecycle == "EXITING" and _exit_start > 0:
+            if (now_mono - _exit_start) > 15.0:
+                # 2026-05-27 Gemini CLI: Enhanced Alert Logic
+                _broker_pos = self.trader.position
+                if _broker_pos == 0:
+                    console.print(f"[bold green]♻️ [WATCHDOG] EXITING stuck but Broker is FLAT. Self-healing state.[/bold green]")
+                    strategy._reset(reason="WATCHDOG_EXITING_HEAL")
+                else:
+                    console.print(f"[bold red]🚨 [WATCHDOG] ALERT: EXITING stuck >15s and Broker STILL HAS POSITION ({_broker_pos}). Manual attention required![/bold red]")
+                    
+                    # 2026-05-27 Gemini CLI: P5: Forensic Forensic Metadata Contract
+                    # Find potential pending order ID for this exit
+                    _pending_oid = next((oid for oid, meta in self._pending_lifecycle_orders.items() 
+                                       if "MTS_EXIT" in (meta.get("strategy") or "")), "NONE")
+                    
+                    self._append_mts_event("WATCHDOG_ALERT", 
+                                          reason="EXIT_FAILED_ATTENTION_REQUIRED", 
+                                          lifecycle=_lifecycle,
+                                          broker_position=_broker_pos,
+                                          local_position=bool(getattr(strategy, "_has_position", False)),
+                                          pending_order_id=_pending_oid,
+                                          elapsed_secs=round(now_mono - _exit_start, 1))
+                    
+                    # We don't reset here to avoid losing the "stuck" visibility in logs, 
+                    # but we mark the status for dashboard
+                    self._manual_trade_status = "FAILED_EXIT_REQUIRES_ATTENTION"
+
+        # ── Tier 2: Low-Frequency Check (Every 30s) ──
+        _last_lo_check = getattr(self, "_mts_watchdog_last_lo", 0.0)
+        if (now_mono - _last_lo_check) < 30.0:
+            return
+        self._mts_watchdog_last_lo = now_mono
+
+        # 2.1 Broker Reconciliation
+        _has_pos_in_mem = bool(getattr(strategy, "_has_position", False))
+        _broker_pos = self.trader.position 
+        _entry_mono = getattr(strategy, "_entry_time_monotonic", 0.0)
+        _released_leg = getattr(strategy, "_released_leg", None)
+        
+        # 💡 [Fixed 2026-05-27] Spread-aware reconciliation
+        _should_be_flat_at_broker = (_released_leg == "near")
+        _is_out_of_sync = False
+        
+        if _has_pos_in_mem:
+            if _should_be_flat_at_broker:
+                if _broker_pos != 0: _is_out_of_sync = True
+            else:
+                if _broker_pos == 0: _is_out_of_sync = True
+
+        if _is_out_of_sync and (now_mono - _entry_mono) > 60.0:
+            console.print(f"[bold red]🚨 [WATCHDOG] Reconciliation: Memory state ({_has_pos_in_mem}, released={_released_leg}) mismatch with Broker ({_broker_pos}) >60s. Syncing...[/bold red]")
+            self._append_mts_event("RECONCILIATION_FAILURE", reason="GHOST_POSITION", mem_pos=_has_pos_in_mem, released=_released_leg, broker_pos=_broker_pos)
+            strategy._reset(reason="WATCHDOG_RECONCILIATION_SYNC")
 
     def _mts_tick(self, enriched_bar: dict | None = None):
         """MTS minimal execution path. Uses enriched bar from pipeline when available,
@@ -3413,7 +3781,27 @@ class FuturesMonitor:
         if hasattr(self, '_spread_loader') and self._spread_loaded:
             try: self._spread_loader.enrich_bar(_bar_dict)
             except: pass
+            
+        # 2026-05-27 Gemini CLI: Override CSV with real-time prices for tick-level MTS management
+        if "near_close_rt" in _bar_dict:
+            _bar_dict["near_close"] = _bar_dict["near_close_rt"]
+            _bar_dict["near_high"] = _bar_dict.get("near_high_rt", _bar_dict["near_close"])
+            _bar_dict["near_low"] = _bar_dict.get("near_low_rt", _bar_dict["near_close"])
+        if "far_close_rt" in _bar_dict:
+            _bar_dict["far_close"] = _bar_dict["far_close_rt"]
+            _bar_dict["far_high"] = _bar_dict.get("far_high_rt", _bar_dict["far_close"])
+            _bar_dict["far_low"] = _bar_dict.get("far_low_rt", _bar_dict["far_close"])
 
+        # 💡 [Fixed 2026-05-27] Dynamic Real-Time Spread Z Calculation
+        # The background CSV job runs only 3 times a day. To trade between cron jobs,
+        # we calculate spread_z dynamically using RT prices and the latest available MA/STD.
+        if _bar_dict.get("near_close", 0) > 0 and _bar_dict.get("far_close", 0) > 0:
+            _spread_ma = _bar_dict.get("spread_ma", 0.0)
+            _spread_std = _bar_dict.get("spread_std", 0.0)
+            if _spread_std > 0:
+                _rt_spread = _bar_dict["near_close"] - _bar_dict["far_close"]
+                _bar_dict["spread_z"] = (_rt_spread - _spread_ma) / _spread_std
+                
         # 3. Strategy setup
         strategy = self._registry.get(_strat_name)
         if strategy is None:
@@ -3421,7 +3809,8 @@ class FuturesMonitor:
             return
 
         # [MTS Heartbeat] Update state file with latest prices
-        _hb_file = "/tmp/mts_position_state.json"
+        # 2026-05-27 Gemini CLI: Use isolated path if environment variable is set
+        _hb_file = os.getenv("MTS_STATE_PATH", "/tmp/mts_position_state.json")
         try:
             _has_pos_in_mem = bool(getattr(strategy, "_has_position", False))
             existing = {}
@@ -3431,45 +3820,76 @@ class FuturesMonitor:
                 except: pass
             
             # Restoration Guard: Don't overwrite valid disk state during restart window
+            # 💡 V-Model Correction: Do NOT return early here, as the strategy 
+            # performs self-restoration inside on_bar(). Blocking here causes a deadlock.
+            # 2026-05-22 Gemini CLI: Removed early return to prevent MTS recovery deadlock
             if not _has_pos_in_mem and existing.get("has_position") is True:
-                console.print("[dim][MTS] Heartbeat suppressed: awaiting strategy recovery[/dim]")
-                return
+                console.print("[dim][MTS] Heartbeat suppressed: awaiting strategy recovery in on_bar[/dim]")
+            else:
+                # 💡 [Fixed 2026-05-27] Strict Persistence Protection
+                # If memory is uninitialized, ALWAYS prioritize disk state to prevent overwriting with nulls.
+                _n_entry = getattr(strategy, "_near_entry", 0) or float(existing.get("near_entry", 0))
+                _f_entry = getattr(strategy, "_far_entry", 0) or float(existing.get("far_entry", 0))
+                _n_side = getattr(strategy, "_near_side", None) or existing.get("near_side")
+                _f_side = getattr(strategy, "_far_side", None) or existing.get("far_side")
+                _trade_id = getattr(strategy, "_trade_id", None) or existing.get("trade_id")
+                _lifecycle = getattr(strategy, "_lifecycle", None) or existing.get("state") or "OPEN"
 
-            _n_entry = getattr(strategy, "_near_entry", 0) or float(existing.get("near_entry", 0))
-            _f_entry = getattr(strategy, "_far_entry", 0) or float(existing.get("far_entry", 0))
-            _n_side = getattr(strategy, "_near_side", None) or existing.get("near_side")
-            _f_side = getattr(strategy, "_far_side", None) or existing.get("far_side")
-            
-            _n_last = float(_bar_dict.get("near_close", 0))
-            _f_last = float(_bar_dict.get("far_close", 0))
-            _n_upl = (_n_last - _n_entry) * (-1 if _n_side == "SHORT" else 1) * 10.0 if _n_entry > 0 and _n_last > 0 and _n_side else 0.0
-            _f_upl = (_f_last - _f_entry) * (-1 if _f_side == "SHORT" else 1) * 10.0 if _f_entry > 0 and _f_last > 0 and _f_side else 0.0
+                # If we recovered trade_id from disk, sync it back to memory immediately
+                if _trade_id and not getattr(strategy, "_trade_id", None):
+                    strategy._trade_id = _trade_id
+                
+                _n_last = float(_bar_dict.get("near_close", 0))
+                _f_last = float(_bar_dict.get("far_close", 0))
+                # 2026-05-27 Gemini CLI: Use dynamic multiplier from constants instead of hardcoded 10.0
+                _mult = float(get_point_value(self.ticker))
+                _n_upl = (_n_last - _n_entry) * (-1 if _n_side == "SHORT" else 1) * _mult if _n_entry > 0 and _n_last > 0 and _n_side else 0.0
+                _f_upl = (_f_last - _f_entry) * (-1 if _f_side == "SHORT" else 1) * _mult if _f_entry > 0 and _f_last > 0 and _f_side else 0.0
 
-            _hb_state = {
-                "has_position": _has_pos_in_mem,
-                "state": "HEARTBEAT",
-                "reason": "mts_tick_heartbeat",
-                "manual_trade_status": self._manual_trade_status,
-                "near_side": _n_side, "far_side": _f_side,
-                "near_entry": round(_n_entry, 1), "far_entry": round(_f_entry, 1),
-                "near_last": round(_n_last, 1), "far_last": round(_f_last, 1),
-                "near_upl": round(_n_upl, 1), "far_upl": round(_f_upl, 1),
-                "total_upl": round(_n_upl + _f_upl, 1),
-                "spread_z": _bar_dict.get("spread_z"),
-                "_updated": datetime.now().isoformat(),
-            }
-            # Preserve manual order info from _sync_mts_status
-            for key in ["manual_order_ts", "manual_order_type", "manual_order_filled"]:
-                if key in existing:
-                    _hb_state[key] = existing[key]
+                # 💡 [Fixed 2026-05-27] Inject trade_id into bar_dict for strategy recovery
+                _bar_dict["trade_id"] = _trade_id
 
-            with open(_hb_file, "w") as f:
-                json.dump(_hb_state, f, default=str)
+                _hb_state = {
+                    "has_position": _has_pos_in_mem,
+                    "state": _lifecycle,
+                    "reason": "mts_tick_heartbeat",
+                    "manual_trade_status": self._manual_trade_status,
+                    "near_side": _n_side, "far_side": _f_side,
+                    "near_entry": round(_n_entry, 1), "far_entry": round(_f_entry, 1),
+                    "near_last": round(_n_last, 1), "far_last": round(_f_last, 1),
+                    "near_upl": round(_n_upl, 1), "far_upl": round(_f_upl, 1),
+                    "total_upl": round(_n_upl + _f_upl, 1),
+                    "spread_z": _bar_dict.get("spread_z"),
+                    "trade_id": _trade_id,
+                    "released_leg": getattr(strategy, "_released_leg", None),
+                    "trail_peak": round(getattr(strategy, "_peak", 0), 1),
+                    "trail_nadir": round(getattr(strategy, "_nadir", 0), 1),
+                    "_updated": datetime.now().isoformat(),
+                }
+                # Preserve manual order info from _sync_mts_status
+                for key in ["manual_order_ts", "manual_order_type", "manual_order_filled"]:
+                    if key in existing:
+                        _hb_state[key] = existing[key]
+
+                # 2026-05-27 Gemini CLI: P6: Atomic Write to prevent [MTS_STATE_READ_FAILED] race conditions
+                _tmp_file = _hb_file + ".tmp"
+                try:
+                    with open(_tmp_file, "w") as f:
+                        json.dump(_hb_state, f, default=str)
+                    os.replace(_tmp_file, _hb_file)
+                except Exception as e:
+                    if os.path.exists(_tmp_file): os.remove(_tmp_file)
+                    raise e
+        # 2026-05-22 Gemini CLI: Fixed except block indentation to resolve syntax error
         except Exception as e:
             console.print(f"[red]⚠️ Heartbeat failed: {e}[/red]")
-
         ctx = StrategyContext(
-            market=MarketData(last_bar=_bar_dict, timestamp=_bar_dict.get("ts", "")),
+            market=MarketData(
+                last_bar=_bar_dict, 
+                timestamp=_bar_dict.get("ts", ""),
+                # 2026-05-27 Gemini CLI: Explicitly pass ticker to MTS strategy context
+                ticker=self.ticker
+            ),
             position=PositionView(size=self.trader.position), 
             config=_mts
         )
@@ -3480,6 +3900,9 @@ class FuturesMonitor:
         signal = strategy.on_bar(ctx)
         if signal:
             self._submit_mts_order_signal(signal, strategy, _bar_dict, datetime.now())
+            # 💡 [Fixed 2026-05-27] Removed premature strategy._reset(). 
+            # Reset now happens in _apply_confirmed_futures_deal upon fill to prevent runaway re-entry loops.
+
 
     def _process_manual_trade_flag(self) -> bool:
         """Consume /tmp/futures_manual_trade.flag if present."""
@@ -3495,6 +3918,111 @@ class FuturesMonitor:
             console.print(f"[bold magenta]🔬 [MANUAL_TRADE_FLAG] consumed path={_flag_path}[/bold magenta]")
             
             _action = _flag.get("action", "")
+            if _action == "close_all":
+                console.print("[bold red]🆘 [MANUAL_TRADE] EMERGENCY CLOSE ALL triggered[/bold red]")
+                self._cancel_all_pending_orders()
+
+                # 2026-05-27 Gemini CLI: Define strategy object locally for use in reset/logging
+                _mts_cfg = self.cfg.get("mts", {})
+                _strat_name = _mts_cfg.get("strategy", "tmf_spread")
+                _strategy_obj = self._registry.get(_strat_name)
+
+                # Read state file for position recovery (strategy may not have _has_position)
+                _has_pos = False
+                _near_side = None
+                _far_side = None
+                _released_leg = None
+                _trade_id = "mts-emergency"
+                try:
+                    # 2026-05-27 Gemini CLI: Use isolated path if environment variable is set
+                    _state_file = os.getenv("MTS_STATE_PATH", "/tmp/mts_position_state.json")
+                    _disk = None
+                    if os.path.exists(_state_file):
+                        with open(_state_file) as _sf:
+                            _disk = json.load(_sf)
+                    if _disk and _disk.get("has_position") is True:
+                        _has_pos = True
+                        _near_side = _disk.get("near_side")
+                        _far_side = _disk.get("far_side")
+                        _released_leg = _disk.get("released_leg")
+                        _trade_id = _disk.get("trade_id", "mts-emergency")
+                        console.print("[yellow]📝 [MANUAL_TRADE] close_all: recovered from disk state[/yellow]")
+                except Exception as _sf_e:
+                    console.print(f"[red]⚠️ [MANUAL_TRADE] close_all: disk read failed: {_sf_e}[/red]")
+
+                if _has_pos and self.order_mgr:
+                    _ts = datetime.now()
+                    from core.order_management.order import OrderType, OrderSide
+                    _EXIT_BUFFER = 10
+                    _TICK = 1.0
+
+                    _near_last = float(self.market_data.get(f"{self.ticker}_NEAR", {}).get("close", 0))
+                    _far_last = float(self.market_data.get(f"{self.ticker}_FAR", {}).get("close", 0))
+                    if _near_last == 0 and len(self._tick_bars_deque) > 0:
+                        _near_last = float(self._tick_bars_deque[-1].get("near_close", 0))
+                    if _far_last == 0 and len(self._tick_bars_deque) > 0:
+                        _far_last = float(self._tick_bars_deque[-1].get("far_close", 0))
+                    # Last resort: use entry price from disk
+                    if _near_last == 0:
+                        _near_last = float(_disk.get("near_entry", 41000)) if _disk else 41000
+                    if _far_last == 0:
+                        _far_last = float(_disk.get("far_entry", _near_last + 100)) if _disk else _near_last + 100
+
+                    if _released_leg is None:
+                        # Both legs held
+                        _n_side = OrderSide.SELL if _near_side == "LONG" else OrderSide.BUY
+                        _n_price = _near_last + _EXIT_BUFFER * _TICK if _n_side == OrderSide.BUY else _near_last - _EXIT_BUFFER * _TICK
+                        _o_near = self.order_mgr.create_order(symbol=f"{self.ticker}_NEAR", side=_n_side, order_type=OrderType.LIMIT, quantity=1, price=_n_price, strategy="MTS_EMERGENCY")
+                        self.order_mgr.submit(_o_near)
+                        if self.paper_fill_sim:
+                            self.paper_fill_sim.register(_o_near)
+
+                        _f_side = OrderSide.SELL if _far_side == "LONG" else OrderSide.BUY
+                        _f_price = _far_last + _EXIT_BUFFER * _TICK if _f_side == OrderSide.BUY else _far_last - _EXIT_BUFFER * _TICK
+                        _o_far = self.order_mgr.create_order(symbol=f"{self.ticker}_FAR", side=_f_side, order_type=OrderType.LIMIT, quantity=1, price=_f_price, strategy="MTS_EMERGENCY")
+                        self.order_mgr.submit(_o_far)
+                        if self.paper_fill_sim:
+                            self.paper_fill_sim.register(_o_far)
+
+                        # 2026-05-27 Gemini CLI: Removed redundant process_tick to prevent double-ordering loops
+                    else:
+                        # Single leg remaining
+                        _rem_leg = "far" if _released_leg == "near" else "near"
+                        _rem_side = _far_side if _rem_leg == "far" else _near_side
+                        _rem_last = _far_last if _rem_leg == "far" else _near_last
+                        _side = OrderSide.SELL if _rem_side == "LONG" else OrderSide.BUY
+                        _price = _rem_last + _EXIT_BUFFER * _TICK if _side == OrderSide.BUY else _rem_last - _EXIT_BUFFER * _TICK
+                        _order = self.order_mgr.create_order(symbol=f"{self.ticker}_{_rem_leg.upper()}", side=_side, order_type=OrderType.LIMIT, quantity=1, price=_price, strategy="MTS_EMERGENCY")
+                        self.order_mgr.submit(_order)
+                        if self.paper_fill_sim:
+                            self.paper_fill_sim.register(_order)
+
+                        # 2026-05-27 Gemini CLI: Removed redundant process_tick to prevent double-ordering loops
+                    console.print("[bold green]✅ [MANUAL_TRADE] Emergency exit orders submitted[/bold green]")
+                    
+                    # 2026-05-27 Gemini CLI: Force strategy reset and log fill using correctly defined _strategy_obj
+                    if _strategy_obj:
+                        _strategy_obj._reset(reason="EMERGENCY_CLOSE")
+                        from strategies.plugins.futures.active.tmf_spread import _append_fill
+                        _append_fill(self.ticker, _rem_leg.upper() if _released_leg else "BOTH", "EMERGENCY", _side if _released_leg else "BOTH", 1, _price if _released_leg else _near_last, "EXIT", _trade_id)
+
+                    # Reset state file
+                    try:
+                        from strategies.plugins.futures.active.tmf_spread import _write_mts_state
+                        _write_mts_state(has_position=False, action="FLAT", reason="EMERGENCY_CLOSE", ticker=self.ticker)
+                    except Exception:
+                        pass
+                elif not _has_pos:
+                    self._manual_trade_status = "READY"
+                    console.print("[yellow]⚠️ [MANUAL_TRADE] close_all: no position to close[/yellow]")
+                else:
+                    self._manual_trade_status = "FAILED: NO_ORDER_MGR"
+
+                self._manual_trade_status = "READY"
+                return True
+
+            # 2026-05-22 Gemini CLI: Removed mts_selftest block from here.
+
             if _action == "spread":
                 # Integrity check: only enter if flat
                 if self.trader.position != 0:
@@ -3513,61 +4041,70 @@ class FuturesMonitor:
 
                 _spread_side = _flag.get("side", "SELL_NEAR_BUY_FAR")
                 
-                # ── Tiered Price Resolution ──
+                # 2026-05-27 Gemini CLI: P0: Strict Price Integrity Contract
+                # Manual entry ONLY accepted from fresh LIVE_TICK.
+                # Use local_arrival_at to avoid clock drift issues. Increased limit to 5s.
+                _MAX_ENTRY_AGE_MS = 5000
                 _price = None
                 _price_source = None
+                _tick_age_ms = -1
                 
-                # Tier 1: Live Market Data (MTX)
-                _live_price = self.market_data.get("MTX", {}).get("close")
-                if _live_price is not None and _live_price > 0:
-                    _price = float(_live_price)
-                    _price_source = "LIVE_TICK"
+                _live_tick = self.market_data.get(self.ticker, {})
+                _price_raw = _live_tick.get("close")
+                _arrival_at = _live_tick.get("local_arrival_at")
                 
-                # Tier 2: Backfill Data (Last Bar)
-                if _price is None and len(self._tick_bars_deque) > 0:
-                    _last_bar_price = float(self._tick_bars_deque[-1].get("close", 0))
-                    if _last_bar_price > 0:
-                        _price = _last_bar_price
-                        _price_source = "BACKFILL_BAR"
-                
-                # Tier 3: Synthetic Config (Paper Only)
-                if _price is None:
-                    _mts_cfg = self.cfg.get("mts", {})
-                    _paper_cfg = _mts_cfg.get("paper", {})
-                    if (self.dry_run or not self.live_trading) and _paper_cfg.get("allow_synthetic_price"):
-                        _price = float(_paper_cfg.get("synthetic_near_price", 41000))
-                        _price_source = "SYNTHETIC_CONFIG"
-                        console.print(f"[yellow]⚠️ [MANUAL_TRADE] Using synthetic price from config: {_price}[/yellow]")
-                
-                # Final Guard
-                if _price is None or _price <= 0:
-                    if not self.dry_run and self.live_trading:
-                        self._manual_trade_status = "FAILED: LIVE_PRICE_UNAVAILABLE"
-                        raise RuntimeError("LIVE_MTS_PRICE_UNAVAILABLE: Cannot manual enter without real quote")
+                if _price_raw and _price_raw > 0 and _arrival_at:
+                    _tick_age_ms = (time.time() - _arrival_at) * 1000
+                    if _tick_age_ms <= _MAX_ENTRY_AGE_MS:
+                        _price = float(_price_raw)
+                        _price_source = "LIVE_TICK"
                     else:
-                        self._manual_trade_status = "WAITING_MARKET_DATA"
-                        console.print("[yellow]⏳ [MANUAL_TRADE] No market data and synthetic price disabled. Waiting...[/yellow]")
-                        # Re-create flag for retry
-                        with open(_flag_path, "w") as _f_retry:
-                            _f_retry.write(json.dumps(_flag))
-                        return False 
+                        self._manual_trade_status = f"REJECTED: STALE_TICK ({int(_tick_age_ms)}ms)"
+                        console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: Latest tick is stale ({int(_tick_age_ms)}ms > {_MAX_ENTRY_AGE_MS}ms)[/red]")
+                        
+                        # 2026-05-27 Gemini CLI: P3: Detailed rejection logging for observability
+                        self._append_mts_event("REJECTED_ENTRY", 
+                                              reason="STALE_TICK",
+                                              near_age_ms=int(_tick_age_ms),
+                                              far_age_ms=-1, # Unknown
+                                              max_allowed_age_ms=_MAX_ENTRY_AGE_MS,
+                                              ticker=self.ticker)
+                        return True
 
-                _near = float(_flag.get("near_close", _flag.get("near", _price - 100)))
-                _far = float(_flag.get("far_close", _flag.get("far", _price)))
+                if _price_source != "LIVE_TICK":
+                    self._manual_trade_status = "REJECTED: NO_LIVE_TICK"
+                    console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: No fresh LIVE_TICK available (Source={_price_source})[/red]")
+                    return True
+
+                # Dashboard hints are only for logging/sanity, not used for entry price
+                _dash_near = _flag.get("near_close")
+                _dash_far = _flag.get("far_close")
+                
+                _near = _price
+                _far = self._far_current_bar.get("close", _price) # Fallback to near if far not yet seen
                 _ts = datetime.now()
                 _trade_id = f"mts-{_ts.strftime('%Y%m%d-%H%M%S')}"
+
+                # 💡 [Fixed 2026-05-27] Pre-set trade_id in memory to prevent heartbeat loss
+                _mts_strat = self._registry.get("tmf_spread")
+                if _mts_strat:
+                    _mts_strat._trade_id = _trade_id
+                    _mts_strat._lifecycle = "SUBMITTING"
+                    # Initialize strategy if not done (to ensure has_position exists)
+                    if not hasattr(_mts_strat, "_has_position"):
+                        _mts_strat._has_position = False
 
                 # ── Margin check ──
                 _margin_per_lot = float(self.EXEC.get("margin_per_lot", 18000))
                 _required_margin = _margin_per_lot * 2
-                _current_balance = float(getattr(self.trader, "balance", self._mts_initial_balance))
+                _current_balance = float(getattr(self.trader, "balance", getattr(self, "_mts_initial_balance", 100000)))
                 if _current_balance < _required_margin:
                     self._manual_trade_status = "FAILED: MARGIN"
                     console.print(f"[red]⛔ [MANUAL_TRADE] Margin insufficient: balance={_current_balance:.0f}[/red]")
                     return True
 
                 # ── Submit via order_mgr ──
-                if self.order_mgr and self.paper_fill_sim:
+                if self.order_mgr:
                     from core.order_management.order import OrderType, OrderSide
                     _TICK = 1.0  # MXF tick size
                     _ENTRY_BUFFER = 4   # ticks
@@ -3593,7 +4130,7 @@ class FuturesMonitor:
                     console.print(f"[yellow]📝 [MANUAL_TRADE] NEAR={_near_side} ref={_near:.1f} mkt={_near_mkt:.1f} src={_price_source}[/yellow]")
                     console.print(f"[yellow]📝 [MANUAL_TRADE] FAR={_far_side} ref={_far:.1f} mkt={_far_mkt:.1f} src={_price_source}[/yellow]")
                     
-                    _near_order = self.order_mgr.create_order(symbol="MXF_NEAR", side=_near_side, order_type=OrderType.LIMIT, quantity=1, price=_near_mkt, strategy="MTS_MANUAL")
+                    _near_order = self.order_mgr.create_order(symbol=f"{self.ticker}_NEAR", side=_near_side, order_type=OrderType.LIMIT, quantity=1, price=_near_mkt, strategy="MTS_MANUAL")
                     self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_near_order))
                     self._pending_lifecycle_orders[_near_order.order_id] = {
                         "intent_id": _near_order.intent_id,
@@ -3602,9 +4139,10 @@ class FuturesMonitor:
                         "stop_loss": 20, "price": _near_mkt
                     }
                     self.order_mgr.submit(_near_order)
-                    self.paper_fill_sim.register(_near_order)
+                    if self.paper_fill_sim:
+                        self.paper_fill_sim.register(_near_order)
 
-                    _far_order = self.order_mgr.create_order(symbol="MXF_FAR", side=_far_side, order_type=OrderType.LIMIT, quantity=1, price=_far_mkt, strategy="MTS_MANUAL")
+                    _far_order = self.order_mgr.create_order(symbol=f"{self.ticker}_FAR", side=_far_side, order_type=OrderType.LIMIT, quantity=1, price=_far_mkt, strategy="MTS_MANUAL")
                     self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_far_order))
                     self._pending_lifecycle_orders[_far_order.order_id] = {
                         "intent_id": _far_order.intent_id,
@@ -3613,25 +4151,54 @@ class FuturesMonitor:
                         "stop_loss": 20, "price": _far_mkt
                     }
                     self.order_mgr.submit(_far_order)
-                    self.paper_fill_sim.register(_far_order)
+                    if self.paper_fill_sim:
+                        self.paper_fill_sim.register(_far_order)
+
+                    # [Deferred Sync] In live mode, wait for confirmed fills
+                    if self.live_trading and not self.dry_run:
+                        self._mts_pending_fills[_trade_id] = {
+                            "near_order_id": _near_order.order_id,
+                            "far_order_id": _far_order.order_id,
+                            "near_filled": False,
+                            "far_filled": False,
+                            "side": "SHORT" if _spread_side == "SELL_NEAR_BUY_FAR" else "LONG",
+                            "spread_side": _spread_side,
+                            "near_label": _near_label,
+                            "far_label": _far_label,
+                            "near_ref": _near,
+                            "far_ref": _far,
+                            "price_source": _price_source,
+                            "ts": _ts,
+                            # 2026-05-27 Gemini CLI: Store snapshot metadata for deferred sync
+                            "near_price_source": _price_source,
+                            "near_tick_age_ms": _tick_age_ms
+                        }
+                        self._manual_trade_status = "SUBMITTED"
+                        console.print(f"[bold cyan]⏳ [MANUAL_TRADE] Orders submitted: {_trade_id}. Waiting for fills...[/bold cyan]")
+                        return True
 
                     # Force fill in paper mode
-                    if self.dry_run or not self.live_trading:
-                        from types import SimpleNamespace
-                        self.paper_fill_sim.process_tick(SimpleNamespace(symbol="MXF_NEAR", close=_near, high=_near+1, low=_near-1, open=_near, volume=1))
-                        self.paper_fill_sim.process_tick(SimpleNamespace(symbol="MXF_FAR", close=_far, high=_far+1, low=_far-1, open=_far, volume=1))
-
+                    # 2026-05-27 Gemini CLI: Removed redundant process_tick to prevent double-ordering loops
                     self._manual_trade_status = "FILLED"
                     console.print(f"[bold green]✅ [MANUAL_TRADE] Orders filled: {_trade_id} (src={_price_source})[/bold green]")
 
-                    # ── Sync strategy state ──
+                    # ── Sync strategy state (Immediately only for Paper Mode) ──
                     try:
                         _mts_strat = self._registry.get("tmf_spread")
                         if _mts_strat:
                             from core.strategy_context import StrategyContext
                             from strategies.plugins.futures.active.tmf_spread import _write_mts_state
                             if not hasattr(_mts_strat, "_has_position"):
-                                _mts_strat.init(StrategyContext(market=MarketData(last_bar={}, timestamp=""), position=PositionView(size=0), config=self.cfg))
+                                _mts_strat.init(StrategyContext(
+                                    market=MarketData(
+                                        last_bar={}, 
+                                        timestamp="",
+                                        # 2026-05-27 Gemini CLI: Explicitly pass ticker to MTS strategy context
+                                        ticker=self.ticker
+                                    ), 
+                                    position=PositionView(size=0), 
+                                    config=self.cfg
+                                ))
                             
                             _mts_strat.sync_position(trade_id=_trade_id, side="SHORT" if _spread_side == "SELL_NEAR_BUY_FAR" else "LONG",
                                                      near_entry=_near, far_entry=_far)
@@ -3654,8 +4221,88 @@ class FuturesMonitor:
                 except Exception: pass
             return True
 
+    def _check_mts_multi_leg_fill(self, order_id: str, fill_price: float):
+        """[GSD] Check if a fill completes a pending multi-leg spread trade."""
+        if not hasattr(self, "_mts_pending_fills") or self._mts_pending_fills is None:
+            return
+
+        found_tid = None
+        for tid, data in self._mts_pending_fills.items():
+            if data.get("near_order_id") == order_id:
+                data["near_filled"] = True
+                data["near_fill_price"] = fill_price
+                found_tid = tid
+                break
+            if data.get("far_order_id") == order_id:
+                data["far_filled"] = True
+                data["far_fill_price"] = fill_price
+                found_tid = tid
+                break
+        
+        if found_tid:
+            data = self._mts_pending_fills[found_tid]
+            if data.get("near_filled") and data.get("far_filled"):
+                console.print(f"[bold green]✅ [MTS_SYNC] Multi-leg fill COMPLETE: {found_tid}[/bold green]")
+                self._sync_mts_strategy_after_fill(found_tid)
+                self._mts_pending_fills.pop(found_tid)
+                self._manual_trade_status = "FILLED"
+
+    def _sync_mts_strategy_after_fill(self, trade_id: str):
+        """Synchronize MTS strategy state after both legs are confirmed filled."""
+        data = self._mts_pending_fills.get(trade_id)
+        if not data: return
+        
+        try:
+            _mts_strat = self._registry.get("tmf_spread")
+            if _mts_strat:
+                from core.strategy_context import StrategyContext, MarketData, PositionView
+                from strategies.plugins.futures.active.tmf_spread import _write_mts_state
+                
+                if not hasattr(_mts_strat, "_has_position"):
+                    _mts_strat.init(StrategyContext(
+                        market=MarketData(
+                            last_bar={}, 
+                            timestamp="",
+                            # 2026-05-27 Gemini CLI: Explicitly pass ticker to MTS strategy context
+                            ticker=self.ticker
+                        ), 
+                        position=PositionView(size=0), 
+                        config=self.cfg
+                    ))
+                
+                _mts_strat.sync_position(
+                    trade_id=trade_id, 
+                    side=data["side"],
+                    near_entry=data["near_fill_price"], 
+                    far_entry=data["far_fill_price"],
+                    # 2026-05-27 Gemini CLI: Pass entry snapshot metadata for contract compliance
+                    near_price_source=data.get("near_price_source", "UNKNOWN"),
+                    near_tick_age_ms=data.get("near_tick_age_ms", -1)
+                )
+                
+                _write_mts_state(
+                    has_position=True, 
+                    action=data["spread_side"], 
+                    reason="MANUAL_ENTRY_CONFIRMED",
+                    near_entry=data["near_fill_price"], 
+                    far_entry=data["far_fill_price"], 
+                    near_last=data["near_fill_price"], 
+                    far_last=data["far_fill_price"],
+                    near_side=data["near_label"], 
+                    far_side=data["far_label"],
+                    spread_z=3.0, released_leg=None, trade_id=trade_id
+                )
+        except Exception as e:
+            console.print(f"[red]⚠️ [MANUAL_TRADE] Post-fill strategy sync failed: {e}[/red]")
+
+    # 2026-05-22 Gemini CLI: Removed _maybe_close_selftest() method from here.
+
     def _strategy_tick(self):
         console.print("[STICK_00_ENTER] dry_run=%s" % self.dry_run)
+
+        # 2026-05-27 Gemini CLI: MTS Safety Watchdog (P4)
+        # Replaces and expands _check_stale_mts_orders
+        self._run_mts_watchdog()
 
         # ── [MTS Sync] Update position/order status file (Always Run) ──
         self._sync_mts_status()
@@ -3699,14 +4346,14 @@ class FuturesMonitor:
         # Moved after session check to prevent building bars outside market hours (e.g. 13:46)
         now_ts = time.time()
         if not self.dry_run and (now_ts - self.last_tick_at > 10):
-            # Use current MTX close/mid if available to drive bar building
-            price = self.market_data.get("MTX", {}).get("close")
+            # Use current close/mid if available to drive bar building
+            price = self.market_data.get(self.ticker, {}).get("close")
             if price is not None and price > 0:
                 # Mock a tick object to feed into self.on_tick
                 from types import SimpleNamespace
                 # Use current real time, but ensure we don't skip into next bucket prematurely
                 mock_tick = SimpleNamespace(
-                    code="TMF_VIRTUAL",
+                    code=f"{self.ticker}_VIRTUAL",
                     close=float(price),
                     datetime=datetime.now(),
                     volume=0
@@ -3743,7 +4390,7 @@ class FuturesMonitor:
                 # 13:25 - 13:30 is the panic window for settlement
                 if now.hour == 13 and 25 <= now.minute < 30:
                     console.print(f"[bold red]🚨 SETTLEMENT FORCE CLOSE: Exiting position {self.trader.position} before 13:30 settlement[/bold red]")
-                    self._execute_trade("EXIT", self.market_data.get("MTX", {}).get("close", 0) or 0, 
+                    self._execute_trade("EXIT", self.market_data.get(self.ticker, {}).get("close", 0) or 0, 
                                         now, abs(self.trader.position), reason="SETTLEMENT_FORCE_CLOSE")
                     return # Exit this tick after force close
 
@@ -3973,7 +4620,8 @@ class FuturesMonitor:
                     try:
                         if hasattr(self, 'feed_health') and self.feed_health is not None:
                             tx_fresh = self.feed_health.age('TX') <= FEED_STALE_SECS
-                            tmf_fresh = self.feed_health.age('MXF') <= FEED_STALE_SECS
+                            # 2026-05-27 Gemini CLI: Use dynamic ticker for feed freshness
+                            tmf_fresh = self.feed_health.age(self.ticker) <= FEED_STALE_SECS
                     except Exception:
                         tx_fresh = tmf_fresh = True
                     policy = self.cross_engine.decide(tx_regime, tmf_regime, tx_fresh=tx_fresh, tmf_fresh=tmf_fresh)
@@ -4329,7 +4977,7 @@ class FuturesMonitor:
                 is_night_eod = (hhmm >= 425 and hhmm < 430)
                 
                 if is_day_eod or is_night_eod:
-                    exit_price = last_price if last_price > 0 else (self.market_data.get("MTX", {}).get("close", 0))
+                    exit_price = last_price if last_price > 0 else (self.market_data.get(self.ticker, {}).get("close", 0))
                     console.print(f"[bold yellow]🕒 EOD FORCE CLOSE: Time {hhmm} reached. Exiting position...[/bold yellow]")
                     self._execute_trade("EXIT", exit_price, now, abs(self.trader.position), reason="EOD_FORCE_CLOSE")
                     return

@@ -69,7 +69,7 @@ risk_mgmt:
   stop_loss_pct: 0.1
   lots_per_trade: 2
   max_positions: 2
-  initial_capital: 40000
+  initial_capital: 100000
   max_holding_days: 7
   min_dte_to_exit: 3
   max_position_size: 0.05

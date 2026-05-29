@@ -273,6 +273,17 @@ class ShioajiOptionsSmartMonitor:
         self.loop_sleep_secs = 60
         self.status_print_secs = 300
         self._bar_counter = 0  # [GSD Fix] Counter for logging throttling
+        self._exit_in_progress = False  # [Rule 3] Reentrancy guard for exit paths
+        # 2026-05-26 Hermes Agent: tick-level exit evaluator (60s gap fix)
+        # holds intent set by _option_exit_on_tick, consumed by main loop
+        self._pending_exit_request: dict | None = None
+        # 2026-05-26 Hermes Agent: Options Watchdog (三層防禦)
+        self._watchdog_hi_period = 10.0
+        self._watchdog_lo_period = 30.0
+        self._watchdog_last_hi = 0.0
+        self._watchdog_last_lo = 0.0
+        self._exit_start_time = 0.0
+        self._watchdog_state = "NORMAL"
         self.is_monitoring_ready = True # [GSD 4.13] Phase A Ready
         self.is_trading_ready = False   # [GSD 4.13] Phase B Ready
         self.pending_entry = None
@@ -1089,7 +1100,12 @@ class ShioajiOptionsSmartMonitor:
                     bar["low"] = min(bar["low"], price)
                     bar["close"] = price
                     bar["volume"] += vol
-                else:
+
+                # 2026-05-26 Hermes Agent: tick-level exit evaluation for held option position
+                # Only evaluate on the option tick that matches the position side (C or P)
+                if key in ("C", "P") and key == self.active_side and self.position > 0:
+                    self._option_exit_on_tick(tick)
+            else:
                     return
 
     def _normalize_and_update_market_data(self, key, bid=None, ask=None, close=None):
@@ -1219,8 +1235,7 @@ class ShioajiOptionsSmartMonitor:
                             # Long position: profit if price RISES
                             pnl_pts = cur_price - entry
                             
-                        point_value = 50
-                        pnl_cash = pnl_pts * point_value * self.position
+                        pnl_cash = pnl_pts * self.pricing_cfg.get("point_value", 50) * self.position
                         d["unrealized_pnl"] = round(pnl_cash, 0)
                         d["unrealized_pnl_pts"] = round(pnl_pts, 1)
 
@@ -2598,6 +2613,36 @@ class ShioajiOptionsSmartMonitor:
         return True
 
     # ── [Vertical Spread v1] Wrapper: select spread → paper entry ──
+    # 2026-05-22 Hermes Agent: shared position guard extracted from enter_paper_position
+    # Spread entry paths were bypassing max_positions / _daily_entries / cooldown checks
+    def _can_enter_position(self, side, signal) -> tuple[bool, str]:
+        """Shared guard: check position limits before any entry path.
+
+        Returns (True, "") if allowed, (False, "reason") if blocked.
+        Called by enter_paper_position, enter_spread_paper_position, enter_spread_live_position.
+        """
+        # 1. Entry lots check
+        entry_lots = int(signal.get("entry_lots", self.base_lots)) if isinstance(signal, dict) else self.base_lots
+        if entry_lots <= 0:
+            return False, f"entry_lots={entry_lots}"
+
+        # 2. Max positions cap
+        if self.position >= self.max_positions:
+            return False, f"max positions ({self.max_positions}) reached (currently {self.position})"
+
+        # 3. Max daily entries
+        if not hasattr(self, '_daily_entries'):
+            self._daily_entries = 0
+        max_daily = self.full_cfg.get("risk_mgmt", {}).get("max_daily_entries", 3)
+        if self._daily_entries >= max_daily:
+            return False, f"max daily entries ({max_daily}) reached"
+
+        # 4. DTE check
+        if not self._dte_allows_entry(side, now=signal.get("timestamp")):
+            return False, "dte too low"
+
+        return True, ""
+
     def enter_spread_paper_position(self, direction, signal):
         """
         Wrapper: converts CALL/PUT signal into debit vertical spread via spread_selector.
@@ -2612,6 +2657,12 @@ class ShioajiOptionsSmartMonitor:
             console.print(f"[yellow][VerticalSpread] enter_spread_paper_position: unknown direction {direction}, falling back[/yellow]")
             return self.enter_paper_position(direction, signal)
         
+        # ── [PositionGuard] Check position limits before spread selection ──
+        allowed, reason = self._can_enter_position(direction_full, signal)
+        if not allowed:
+            console.print(f"[red]🚫 [VerticalSpread] Entry blocked: {reason}[/red]")
+            return
+
         # Get option chain and index price
         from strategies.options.spread_selector import select_vertical_spread, build_combo_legs
         
@@ -2704,6 +2755,12 @@ class ShioajiOptionsSmartMonitor:
         if direction_full not in ("CALL", "PUT"):
             console.print(f"[yellow][VerticalSpread] enter_spread_live_position: unknown direction {direction}, falling back[/yellow]")
             self.enter_live_position(direction, signal)
+            return
+
+        # ── [PositionGuard] Check position limits before spread selection ──
+        allowed, reason = self._can_enter_position(direction_full, signal)
+        if not allowed:
+            console.print(f"[red]🚫 [VerticalSpread][LIVE] Entry blocked: {reason}[/red]")
             return
 
         from strategies.options.spread_selector import select_vertical_spread, build_combo_legs
@@ -2954,7 +3011,7 @@ class ShioajiOptionsSmartMonitor:
             )
 
         # Compute PnL
-        pnl_cash = (exit_value - sd["net_debit"]) * 50
+        pnl_cash = (exit_value - sd['net_debit']) * self.pricing_cfg.get("point_value", 50)
         logger.info("[VerticalSpread] LIVE EXIT %s qty=%d entry=%.1f exit=%.1f pnl=%.1f",
                      action, qty, sd["net_debit"], exit_value, pnl_cash)
 
@@ -2982,17 +3039,10 @@ class ShioajiOptionsSmartMonitor:
         if entry_lots <= 0:
             console.print(f"[yellow]⚠️ enter_paper_position blocked: resolved entry_lots={entry_lots}[/yellow]")
             return
-        if self.position >= self.max_positions:
-            console.print(f"[red]🚫 enter_paper_position blocked: max positions ({self.max_positions}) reached (currently {self.position})[/red]")
-            return
-        # [Fix] Max daily entries per direction — prevent rapid re-entry on same side
-        if not hasattr(self, '_daily_entries'):
-            self._daily_entries = 0
-        max_daily = self.full_cfg.get("risk_mgmt", {}).get("max_daily_entries", 3)
-        if self._daily_entries >= max_daily:
-            console.print(f"[red]🚫 enter_paper_position blocked: max daily entries ({max_daily}) reached[/red]")
-            return
-        if not self._dte_allows_entry(side, now=signal.get("timestamp")):
+        # ── [PositionGuard] Use shared guard ──
+        allowed, reason = self._can_enter_position(side, signal)
+        if not allowed:
+            console.print(f"[red]🚫 enter_paper_position blocked: {reason}[/red]")
             return
         if not self.spread_is_tradeable(side):
             console.print(f"[yellow]⚠️ enter_paper_position blocked: spread too wide for {side}[/yellow]")
@@ -3190,54 +3240,84 @@ class ShioajiOptionsSmartMonitor:
     def exit_paper_position(self, action, price, note=""):
         if self.position <= 0 or not self.active_side:
             return
-        # ── [PnL Fix] Snapshot exit state BEFORE clearing ──
-        exit_qty = self.position
-        exit_side = self.active_side
-        exit_entry_price = self.entry_price
-        paper_order = self._record_paper_order(exit_side, "SELL", exit_qty, price, f"{action} {note}".strip())
-        if self.order_mgr and paper_order is None:
+        
+        # ── [Rule 3] Reentrancy Guard ──
+        if getattr(self, "_exit_in_progress", False):
             return
-
-        # Compute PnL BEFORE clearing position
-        self.log_trade(action, exit_side, price, note, quantity=exit_qty, entry_price_override=exit_entry_price)
-        # Clear position AFTER logging
-        self.position = max(0, self.position - exit_qty)
-        self.active_side = None
-        self.entry_price = 0.0
-        self.entry_mtx_price = 0.0
-        self.entry_time = None
-        self.has_tp1_hit = False
-        self.stop_loss_price = 0.0
-        self.peak_premium = 0.0
-        self.cooldown_until = self.cooldown_bars
-        self.replay_stats["exits"] += 1
-
-    def apply_paper_tp1(self, price, note=""):
-        if self.position <= 0 or not self.active_side:
-            return False
-        # ── [PnL Fix] Snapshot exit state BEFORE clearing ──
-        exit_side = self.active_side
-        exit_qty = min(1, self.position)
-        exit_entry_price = self.entry_price
-        paper_order = self._record_paper_order(exit_side, "SELL", exit_qty, price, f"{self.status_mode_label()}_TP1 {note}".strip())
-        if self.order_mgr and paper_order is None:
-            return False
-
-        self.position = max(0, self.position - exit_qty)
-        self.has_tp1_hit = True
-        self.replay_stats["tp1_hits"] += 1
-        self.log_trade(f"{self.status_mode_label()}_TP1", exit_side, price, note, quantity=exit_qty, entry_price_override=exit_entry_price)
-        if self.position == 0:
+        self._exit_in_progress = True
+        
+        try:
+            # ── [Rule 3] 1. Freeze Snapshot ──
+            exit_qty = self.position
+            exit_side = self.active_side
+            exit_entry_p = self.entry_price
+            
+            # ── [Rule 3] 2. Establish order intent ──
+            paper_order = self._record_paper_order(exit_side, "SELL", exit_qty, price, f"{action} {note}".strip())
+            if paper_order is None:
+                return  # Order failed, keep position for next tick retry
+                
+            # ── [Rule 3] 3. Update SSOT immediately AFTER order accepted ──
+            self.position = 0
             self.active_side = None
             self.entry_price = 0.0
             self.entry_mtx_price = 0.0
             self.entry_time = None
+            self.has_tp1_hit = False
             self.stop_loss_price = 0.0
             self.peak_premium = 0.0
+            
+            # ── [Rule 3] 4. Side Effects (IO/Logging) ──
+            self.log_trade(action, exit_side, price, note, quantity=exit_qty, entry_price_override=exit_entry_p)
+            
             self.cooldown_until = self.cooldown_bars
             self.replay_stats["exits"] += 1
-            self.has_tp1_hit = False
-        return True
+            
+        finally:
+            self._exit_in_progress = False
+
+    def apply_paper_tp1(self, price, note=""):
+        if self.position <= 0 or not self.active_side:
+            return False
+        
+        # ── [Rule 3] Reentrancy Guard ──
+        if getattr(self, "_exit_in_progress", False):
+            return False
+        self._exit_in_progress = True
+        
+        try:
+            # ── [Rule 3] 1. Freeze Snapshot ──
+            exit_side = self.active_side
+            exit_qty = min(1, self.position)
+            exit_entry_price = self.entry_price
+            mode_label = self.status_mode_label()
+            
+            # ── [Rule 3] 2. Update Position FIRST (Partial Exit) ──
+            self.position = max(0, self.position - exit_qty)
+            self.has_tp1_hit = True
+            self.replay_stats["tp1_hits"] += 1
+            
+            # If fully closed after partial exit, clear metadata
+            if self.position == 0:
+                self.active_side = None
+                self.entry_price = 0.0
+                self.entry_mtx_price = 0.0
+                self.entry_time = None
+                self.stop_loss_price = 0.0
+                self.peak_premium = 0.0
+                self.cooldown_until = self.cooldown_bars
+                self.replay_stats["exits"] += 1
+                self.has_tp1_hit = False
+
+            # ── [Rule 3] 3. Side Effects (IO/Logging) ──
+            paper_order = self._record_paper_order(exit_side, "SELL", exit_qty, price, f"{mode_label}_TP1 {note}".strip())
+            
+            self.log_trade(f"{mode_label}_TP1", exit_side, price, note, quantity=exit_qty, entry_price_override=exit_entry_price)
+            
+            return True
+            
+        finally:
+            self._exit_in_progress = False
 
     def exit_live_position(self, action, note="", quantity=None):
         self.submit_live_exit(action, note=note, quantity=quantity, retries=0)
@@ -3771,33 +3851,71 @@ class ShioajiOptionsSmartMonitor:
         )
         return True
 
-    def _paper_margin_check(self, entry_price, lots=None):
-        """
-        Paper mode margin check — enforce capital limits.
-        Buyer: need premium × 50 × lots
-        Seller (spread): need wing_width × 50 × lots
+    # ──────────────────────────────────────────────────────────────
+    # Capital Calculation Utilities
+    # 2026-05-25 Hermes Agent: extract from _paper_margin_check for reuse
+    # ──────────────────────────────────────────────────────────────
+
+    def _calc_required_margin(self, entry_price, lots=1):
+        """計算 option 買方資金需求 = 權利金 × 點值 × 張數"""
+        pv = self.pricing_cfg.get("point_value", 50)
+        if entry_price > 0:
+            return entry_price * pv * lots
+        return 10000 * lots  # fallback for zero/invalid price
+
+    def _calc_available_capital(self):
+        """計算可用資金 = (初始資金 + 已實現損益) × (1 - 保留比例)
+
+        保守估計：只用已實現 PnL，不計未實現損益。
         """
         risk_cfg = self.full_cfg.get("risk_mgmt", {})
-        initial_capital = float(risk_cfg.get("initial_capital", 40000))
+        initial_capital = float(risk_cfg.get("initial_capital", 100000))
         reserve_pct = 0.20
-        available = initial_capital * (1 - reserve_pct)
 
-        # Adjust by realized PnL from ledger
+        realized_pnl = 0
         if self.ledger_path.exists():
             try:
                 prev = pd.read_csv(self.ledger_path)
                 realized_pnl = pd.to_numeric(prev["PnL"], errors="coerce").fillna(0).sum()
-                available = (initial_capital + realized_pnl) * (1 - reserve_pct)
             except Exception:
                 pass
 
-        lots = int(lots or self.base_lots)
-        required = entry_price * 50 * lots if entry_price > 0 else 10000 * lots
+        return (initial_capital + realized_pnl) * (1 - reserve_pct)
 
-        if available < required:
-            console.print(f"[red]⛔ Paper margin: available={available:.0f} < required={required:.0f} (capital={initial_capital:.0f})[/red]")
+    def _paper_margin_check(self, entry_price, lots=None):
+        """
+        Paper mode margin check — enforce capital limits.
+        Buyer: need premium × point_value × lots
+        Seller (spread): need wing_width × point_value × lots
+
+        2026-05-25 Hermes Agent: add existing position capital consumption.
+        Previously only checked new entry cost, ignoring accumulated positions.
+        Now total_required = new_entry_cost + existing_position_cost.
+        """
+        available = self._calc_available_capital()
+
+        lots = int(lots or self.base_lots)
+
+        # New entry cost
+        new_required = self._calc_required_margin(entry_price, lots)
+
+        # Existing position capital consumption
+        existing_required = self._calc_required_margin(
+            self.entry_price, self.position
+        ) if self.position > 0 else 0
+
+        total_required = new_required + existing_required
+
+        if available < total_required:
+            console.print(
+                f"[red]⛔ Paper margin: available={available:.0f} < total_required={total_required:.0f} "
+                f"(new={new_required:.0f} + existing={existing_required:.0f})[/red]"
+            )
             return False
-        console.print(f"[dim]Paper margin OK: available={available:.0f} >= required={required:.0f}[/dim]")
+        console.print(
+            f"[dim]Paper margin OK: available={available:.0f} >= total_required={total_required:.0f} "
+            f"(new={new_required:.0f} + existing={existing_required:.0f})[/dim]"
+        )
         return True
 
     def _recover_position_from_api(self):
@@ -3845,6 +3963,31 @@ class ShioajiOptionsSmartMonitor:
                                 last_note = ""
 
                         if current_qty > 0 and last_side:
+                            # ── Capital check before position recovery ──
+                            # 2026-05-25 Hermes Agent: prevent recovery of positions
+                            # that exceed available capital (e.g. after realized losses).
+                            # If capital is insufficient, force-close instead of restoring.
+                            recovery_required = self._calc_required_margin(last_entry_price, current_qty)
+                            recovery_available = self._calc_available_capital()
+                            if recovery_available < recovery_required:
+                                console.print(
+                                    f"[red]⛔ [RECOVERY] Paper position {last_side} qty={current_qty} @ {last_entry_price} "
+                                    f"requires {recovery_required:.0f} but only {recovery_available:.0f} available — "
+                                    f"force closing at open[/red]"
+                                )
+                                self.log_trade(
+                                    "RECOVERY_FORCE_CLOSE_EXIT", last_side, last_entry_price,
+                                    note=(
+                                        f"capital_check_failed "
+                                        f"available={recovery_available:.0f} "
+                                        f"required={recovery_required:.0f}"
+                                    ),
+                                    quantity=current_qty,
+                                )
+                                current_qty = 0
+                                last_side = None
+                                last_entry_price = 0
+
                             self.position = current_qty
                             self.active_side = last_side
                             self.entry_price = last_entry_price
@@ -4151,44 +4294,285 @@ class ShioajiOptionsSmartMonitor:
         """
         if self.position <= 0:
             return
-        
-        qty = self.position
-        sd = self._current_spread
-        
-        # Record single paper order (net exit value) with spread context
-        self._record_paper_order(
-            sd["option_type"], "SELL", qty, exit_value,
-            f"{action} {note}",
-            strategy_override="VERTICAL_SPREAD",
-        )
-        
-        # Compute PnL
-        pnl_cash = (exit_value - sd["net_debit"]) * 50  # TXO multiplier
-        logger.info("[VerticalSpread] EXIT %s qty=%d entry=%.1f exit=%.1f pnl=%.1f",
-                     action, qty, sd["net_debit"], exit_value, pnl_cash)
-        
-        # Log trade
-        if hasattr(self, 'log_trade'):
-            self.log_trade(
-                "VERTICAL_SPREAD", self.active_side or "CALL",
-                sd["net_debit"], exit_value, qty, note,
+
+        # ── [Rule 3] Reentrancy Guard ──
+        if getattr(self, "_exit_in_progress", False):
+            return
+        self._exit_in_progress = True
+
+        try:
+            # ── [Rule 3] 1. Freeze Snapshot ──
+            qty = self.position
+            sd = self._current_spread
+            side = self.active_side or "CALL"
+            entry_p = sd["net_debit"]
+            
+            # ── [Rule 3] 2. Establish order intent ──
+            # Record single paper order (net exit value) with spread context
+            paper_order = self._record_paper_order(
+                sd["option_type"], "SELL", qty, exit_value,
+                f"{action} {note}",
+                strategy_override="VERTICAL_SPREAD",
             )
-        
-        # Clear position state
-        self.position = 0
-        self.active_side = None
-        self._current_spread = None
-        self._spread_holding_bars = 0
-        self.entry_price = 0.0
-        self.entry_mtx_price = 0.0
-        self.entry_time = None
-        self.has_tp1_hit = False
-        self.stop_loss_price = 0.0
-        self.peak_premium = 0.0
+            if paper_order is None:
+                return  # Order failed, keep position for next tick retry
+
+            # ── [Rule 3] 3. Update SSOT immediately AFTER order accepted ──
+            self.position = 0
+            self.active_side = None
+            self._current_spread = None
+            self._spread_holding_bars = 0
+            self.entry_price = 0.0
+            self.entry_mtx_price = 0.0
+            self.entry_time = None
+            self.has_tp1_hit = False
+            self.stop_loss_price = 0.0
+            self.peak_premium = 0.0
+            
+            # ── [Rule 3] 4. Side Effects (IO/Logging) ──
+            # Compute PnL
+            pnl_cash = (exit_value - entry_p) * self.pricing_cfg.get("point_value", 50)
+            logger.info("[VerticalSpread] EXIT %s qty=%d entry=%.1f exit=%.1f pnl=%.1f",
+                         action, qty, entry_p, exit_value, pnl_cash)
+            
+            # Log trade with corrected parameter mapping
+            if hasattr(self, 'log_trade'):
+                self.log_trade(
+                    action="VERTICAL_SPREAD", 
+                    side=side,
+                    price=exit_value, 
+                    note=f"{action} {note}".strip(), 
+                    quantity=qty, 
+                    entry_price_override=entry_p
+                )
+                
+        finally:
+            self._exit_in_progress = False
+
+
+    # ═══════════════════════════════════════════════════════════════
+    # 2026-05-26 Hermes Agent: tick-level exit evaluator (60s gap fix)
+    # ═══════════════════════════════════════════════════════════════
+
+    def _resolve_tick_to_side(self, code: str) -> str | None:
+        """Map a tick's contract code to the position side (C/P/MTX)."""
+        for key in ("C", "P", "MTX"):
+            contract = self.active_contracts.get(key)
+            if contract and code == getattr(contract, "code", None):
+                return key
+        return None
+
+    def _extract_tick_premium(self, tick) -> float:
+        """Get the exit-relevant premium from a tick: bid > close > 0."""
+        bid = float(getattr(tick, "bid_price", 0) or 0)
+        if bid > 0:
+            return bid
+        return float(getattr(tick, "close", 0) or 0)
+
+    def _option_exit_on_tick(self, tick) -> None:
+        """
+        Evaluate exit conditions from a live option tick.
+        No IO, no blocking — only sets pending intent.
+        Must be called inside self.lock.
+        """
+        if self._exit_in_progress:
+            return
+        if self._pending_exit_request is not None:
+            return
+        if self.position <= 0 or not self.active_side:
+            return
+
+        premium = self._extract_tick_premium(tick)
+        if premium <= 0:
+            return
+
+        # Update peak premium for trailing stop
+        if premium > self.peak_premium:
+            self.peak_premium = premium
+
+        # Check 1: Stop loss
+        if self.stop_loss_pct > 0:
+            sl_threshold = self.entry_price * (1 - self.stop_loss_pct)
+            if premium <= sl_threshold:
+                self._exit_in_progress = True
+                self._exit_start_time = time.monotonic()
+                self._pending_exit_request = {
+                    "reason": "PAPER_STOP_LOSS",
+                    "premium": premium,
+                    "source": "OPTION_TICK_EXIT",
+                }
+                return
+
+        # Check 2: Hard stop
+        if self.hard_stop_pct > 0:
+            hs_threshold = self.entry_price * (1 - self.hard_stop_pct)
+            if premium <= hs_threshold:
+                self._exit_in_progress = True
+                self._exit_start_time = time.monotonic()
+                self._pending_exit_request = {
+                    "reason": "PAPER_HARD_STOP",
+                    "premium": premium,
+                    "source": "OPTION_TICK_EXIT",
+                }
+                return
+
+        # Check 3: Trailing stop
+        if self.trailing_stop_pct > 0 and self.peak_premium > 0:
+            unrealized_pct = (self.peak_premium - self.entry_price) / self.entry_price if self.entry_price > 0 else 0
+            if self.has_tp1_hit or unrealized_pct >= 0.08:
+                trail_floor = self.peak_premium * (1 - self.trailing_stop_pct)
+                if premium <= trail_floor:
+                    self._exit_in_progress = True
+                    self._exit_start_time = time.monotonic()
+                    self._pending_exit_request = {
+                        "reason": "PAPER_TRAIL_EXIT",
+                        "premium": premium,
+                        "source": "OPTION_TICK_EXIT",
+                    }
+                    return
+
+    def _drain_pending_option_exit_request(self) -> None:
+        """Consume pending exit intent in main thread (safe for IO)."""
+        req = self._pending_exit_request
+        if not req:
+            return
+        self._pending_exit_request = None
+        reason = req["reason"]
+        premium = req["premium"]
+        note = f"{reason} premium={premium:.1f} source={req.get('source', '?')}"
+        if self.live_trading:
+            self.exit_live_position(reason, note)
+        else:
+            self.exit_paper_position(reason, premium, note)
+
+
+    # ═══════════════════════════════════════════════════════════════
+    # 2026-05-26 Hermes Agent: Options Watchdog (三層防禦)
+    # ═══════════════════════════════════════════════════════════════
+
+    def _log_watchdog_alert(self, reason="", **kwargs):
+        """FORENSIC metadata for watchdog events. Append-only JSONL."""
+        import json
+        from pathlib import Path
+        import datetime as _dt
+        event = {
+            "type": "WATCHDOG_ALERT",
+            "timestamp": _dt.datetime.now().isoformat(),
+            "reason": reason,
+            "position": self.position,
+            "active_side": self.active_side,
+            "exit_in_progress": self._exit_in_progress,
+            "pending_exit": self._pending_exit_request is not None,
+            "watchdog_state": self._watchdog_state,
+        }
+        event.update(kwargs)
+        log_dir = Path("logs/options_watchdog")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / "watchdog_events.jsonl", "a") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _run_options_watchdog(self):
+        """
+        Tiered Options Safety Watchdog.
+
+        Tier 1 (10s): _exit_in_progress stuck detection & self-heal.
+        Tier 2 (30s): memory vs ledger reconciliation (告警 only, 不清倉).
+        """
+        now_mono = time.monotonic()
+
+        # ── Tier 1: High-Frequency (10s) ──
+        if (now_mono - self._watchdog_last_hi) < self._watchdog_hi_period:
+            return
+        self._watchdog_last_hi = now_mono
+
+        if self._exit_in_progress:
+            elapsed = now_mono - self._exit_start_time if self._exit_start_time > 0 else 0.0
+            if elapsed > 15.0:
+                # Case A: pending exit not consumed — retry drain
+                if self._pending_exit_request is not None:
+                    console.print(f"[bold yellow]♻️ [WATCHDOG] Pending exit not consumed after {elapsed:.0f}s. Re-draining.[/bold yellow]")
+                    self._log_watchdog_alert(reason="PENDING_EXIT_RETRY", elapsed_secs=round(elapsed, 1))
+                    self._drain_pending_option_exit_request()
+
+                # Case B: stuck with position — retry by setting a fresh exit request
+                elif self.position > 0:
+                    console.print(f"[bold yellow]♻️ [WATCHDOG] Exit stuck {elapsed:.0f}s. Enqueueing RETRY_EXIT.[/bold yellow]")
+                    self._log_watchdog_alert(
+                        reason="EXIT_STUCK_RETRY",
+                        elapsed_secs=round(elapsed, 1),
+                        position=self.position,
+                    )
+                    self._exit_in_progress = False
+                    self._exit_start_time = 0.0
+                    quote = self.current_option_quote(self.active_side)
+                    retry_price = quote.get("bid", quote.get("close", 0))
+                    if retry_price > 0:
+                        self._pending_exit_request = {
+                            "reason": "PAPER_RETRY_EXIT",
+                            "premium": retry_price,
+                            "source": "WATCHDOG_RETRY",
+                        }
+                        self._exit_in_progress = True
+                        self._exit_start_time = time.monotonic()
+
+                # Case C: no position but stuck flag — clean up
+                else:
+                    self._exit_in_progress = False
+                    self._exit_start_time = 0.0
+                    console.print(f"[dim]🗑️ [WATCHDOG] Cleared stale _exit_in_progress (position=0)[/dim]")
+
+        # ── Tier 2: Low-Frequency (30s) ──
+        if (now_mono - self._watchdog_last_lo) < self._watchdog_lo_period:
+            return
+        self._watchdog_last_lo = now_mono
+
+        # Reconciliation: compare memory position vs ledger (告警 only)
+        if self.position > 0 and hasattr(self, "ledger_path") and self.ledger_path.exists():
+            try:
+                import pandas as _pd
+                ledger_df = _pd.read_csv(self.ledger_path)
+                has_open = False
+                for _, row in ledger_df.iterrows():
+                    action = str(row.get("Action", "")).upper()
+                    if "ENTRY" in action and "EXIT" not in action and "RETRY" not in action:
+                        has_open = True
+                    elif has_open and any(kw in action for kw in ["EXIT", "TP1"]):
+                        has_open = False
+                if not has_open:
+                    self._watchdog_state = "RECONCILIATION_MISMATCH"
+                    self._log_watchdog_alert(
+                        reason="LEDGER_MEMORY_MISMATCH",
+                        action="MARK_REVIEW_ONLY",
+                        local_position=self.position,
+                    )
+                    console.print(f"[bold yellow]📋 [WATCHDOG] RECONCILIATION_MISMATCH: memory has position ({self.position}) but ledger shows none. Review recommended.[/bold yellow]")
+            except Exception:
+                pass
+
 
     def manage_open_position(self, signal):
         if self.position <= 0 or not self.active_side:
             return False
+
+        # 2026-05-27 Hermes Agent: [EXIT_AUDIT] trace entry data
+        import datetime as _dt
+        _now_s = _dt.datetime.now().strftime("%H:%M:%S.%f")[:12]
+        _mc = self.market_data.get(self.active_side, {})
+        _q = self.current_option_quote(self.active_side)
+        _vq = self.validate_quote(self.active_side, context="EXIT")
+        _o = self._is_market_open(_dt.datetime.now())
+        _sig_side = signal.get("side") if signal else "no_signal"
+        _sig_score = signal.get("score", 0.0) if signal else 0.0
+        print(f"[EXIT_AUDIT] {_now_s} position={self.position} side={self.active_side} entry={self.entry_price} "
+              f"bid={_q['bid']} ask={_q['ask']} mid={_q['mid']} close={_q['close']} "
+              f"mc_close={_mc.get('close','?')} mc_bid={_mc.get('bid','?')} mc_ask={_mc.get('ask','?')} "
+              f"peak={self.peak_premium} sl_pct={self.stop_loss_pct} hard_sl={self.hard_stop_pct} "
+              f"trail_pct={self.trailing_stop_pct} has_tp1={self.has_tp1_hit} "
+              f"valid_quote={_vq['valid']} quote_reason={_vq['reason']} "
+              f"market_open={_o[0]} session={_o[1]} "
+              f"_exit_in_progress={self._exit_in_progress} "
+              f"signal_score={_sig_score:.1f} signal_side={_sig_side} "
+              f"contract={self.active_contracts.get(self.active_side)}")
         
         now = signal.get("timestamp") if signal else self._current_strategy_time()
         quote = self.current_option_quote(self.active_side)
@@ -4326,12 +4710,20 @@ class ShioajiOptionsSmartMonitor:
         return False
 
     def run_strategy_logic(self):
+        # 2026-05-26 Hermes Agent: Options Watchdog (三層防禦)
+        self._run_options_watchdog()
+
+        # 2026-05-26 Hermes Agent: consume pending tick-level exit request
+        self._drain_pending_option_exit_request()
+
         try:
             # Retry contract loading if not yet available
             if not self.active_contracts or not self._all_month_contracts:
                 self.find_best_contracts()
                 if not self.active_contracts:
-                    return  # No contracts yet — retry next cycle
+                    # 2026-05-27 Hermes Agent: if holding position, allow exit management even without contracts
+                    if self.position <= 0:
+                        return  # No contracts yet — retry next cycle
             
             # GSD: Update log paths dynamically to handle session rollovers (e.g. 15:00)
             self._update_log_paths()

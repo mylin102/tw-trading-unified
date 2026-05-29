@@ -30,7 +30,7 @@ console = Console()
 class RiskManager:
     """風險管理器"""
     
-    def __init__(self, api=None, config: dict = None, initial_capital: float = 40000.0):
+    def __init__(self, api=None, config: dict = None, initial_capital: float = 100000.0):
         """
         初始化風險管理器
         
