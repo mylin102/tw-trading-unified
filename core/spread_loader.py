@@ -45,17 +45,17 @@ class SpreadLoader:
 
     # ── Public API ──────────────────────────────────────────────────────
 
-    def load_latest_csv(self) -> bool:
+    def load_latest_csv(self, ticker: str | None = None) -> bool:
         """Find and load the latest CSV files.
 
         Priority:
-          1. mxf_calendar_spread_*.csv (has pre-computed spread_z, vwap_z)
-          2. mxf_far_*.csv + mxf_near_*.csv (raw data, compute spread_z at load)
+          1. {ticker}_calendar_spread_*.csv (has pre-computed spread_z, vwap_z)
+          2. {ticker}_far_*.csv + {ticker}_near_*.csv (raw data, compute spread_z at load)
 
         Returns True if at least some data was loaded.
         """
         # Try calendar spread CSV first (most complete)
-        ok_spread = self._find_and_load("spread")
+        ok_spread = self._find_and_load("spread", ticker)
         if ok_spread:
             # Record initial mtime for hot-reload detection
             spread_path = self._csv_paths.get("spread")
@@ -64,8 +64,8 @@ class SpreadLoader:
             return True
 
         # Fallback: far + near
-        ok_far = self._find_and_load("far")
-        ok_near = self._find_and_load("near")
+        ok_far = self._find_and_load("far", ticker)
+        ok_near = self._find_and_load("near", ticker)
         return ok_far is True  # near is optional
 
     def get_spread_z(self, timestamp: pd.Timestamp | None = None) -> float | None:
@@ -98,6 +98,8 @@ class SpreadLoader:
             row = self._get_row_at(ts)
             if row is not None and not pd.isna(row.get("spread_z", np.nan)):
                 bar["spread_z"] = float(row["spread_z"])
+                bar["spread_ma"] = float(row.get("spread_ma", 0.0))
+                bar["spread_std"] = float(row.get("spread_std", 0.0))
                 bar["near_close"] = float(row.get("Close_near", bar.get("Close", 0.0)))
                 bar["far_close"] = float(row.get("Close_far", 0.0))
                 # spread_age_minutes: how old is the CSV data (for staleness gate)
@@ -153,19 +155,20 @@ class SpreadLoader:
                 self._far_df = None  # force reload
                 self._find_and_load("spread")
 
-    def _find_and_load(self, prefix: str) -> bool:
+    def _find_and_load(self, prefix: str, ticker: str | None = None) -> bool:
         """Find CSV matching the prefix and load it.
 
-        For prefix='spread': matches mxf_calendar_spread_*.csv
-        For prefix='far'/'near': matches mxf_{prefix}_*.csv
+        For prefix='spread': matches {ticker}_calendar_spread_*.csv
+        For prefix='far'/'near': matches {ticker}_{prefix}_*.csv
         """
+        _t_prefix = (ticker or "mxf").lower()
         if prefix == "spread":
-            pattern = os.path.join(self.data_dir, "mxf_calendar_spread_*.csv")
+            pattern = os.path.join(self.data_dir, f"{_t_prefix}_calendar_spread_*.csv")
         else:
-            pattern = os.path.join(self.data_dir, f"mxf_{prefix}_*.csv")
+            pattern = os.path.join(self.data_dir, f"{_t_prefix}_{prefix}_*.csv")
         files = sorted(glob.glob(pattern))
         if not files:
-            logger.warning(f"[SpreadLoader] No CSV files found for prefix={prefix} in {self.data_dir}")
+            logger.warning(f"[SpreadLoader] No CSV files found for prefix={prefix}, ticker={_t_prefix} in {self.data_dir}")
             return False
 
         csv_path = files[-1]  # latest by filename sort
@@ -229,13 +232,20 @@ class SpreadLoader:
         idx = self._far_df.index.searchsorted(ts, side="right") - 1
         if idx < 0:
             return None
-        return self._far_df.iloc[idx]
+            
+        row = self._far_df.iloc[idx]
+        return row
 
     def _fill_default_spread(self, bar: dict, ts: pd.Timestamp | None) -> None:
-        """Set spread_z to a safe default (0.0 = neutral)."""
+        """Set spread_z to a safe default (0.0 = neutral).
+        
+        💡 [Fixed 2026-05-27] Keep far_close at 0.0 to signal missing data.
+        """
         bar["spread_z"] = 0.0
         bar["near_close"] = bar.get("Close", 0.0)
-        bar["far_close"] = bar.get("Close", 0.0)
+        bar["far_close"] = 0.0
+        bar["spread_ma"] = 0.0
+        bar["spread_std"] = 0.0
 
     def _calc_vwap_z(self, bar: dict) -> float:
         """Calculate (close - vwap) / atr, a normalized version of vwap_z."""

@@ -39,7 +39,7 @@ STRATEGY_POLICY: dict[str, dict] = {
         "kill_if_cagr_below": -0.02,
     },
     "adaptive_orb_v15": {
-        "enabled_regimes": ["TREND", "SQUEEZE", "WEAK", "CHOP", "TRANSITION"],
+        "enabled_regimes": ["TREND", "SQUEEZE", "WEAK", "CHOP", "TRANSITION", "STRETCHED"],
         "max_weight": 1.0,
         "kill_if_cagr_below": -0.02,
         "description": "v1 ORB + ATR breakout confirmation gate (observation mode)",
@@ -101,10 +101,22 @@ STRATEGY_POLICY: dict[str, dict] = {
         "kill_if_cagr_below": -0.03,
     },
     "squeeze_fire_scout": {
-        "enabled_regimes": ["SQUEEZE"],
+        "enabled_regimes": ["SQUEEZE", "TREND", "BEAR", "WEAK", "CHOP", "TRANSITION"],
         "max_weight": 0.25,
         "kill_if_cagr_below": -999,
         "description": "Early scout during squeeze release, 0.25x size, tight stop, time-stop 6 bars",
+    },
+    "tmf_spread": {
+        "enabled_regimes": ["SQUEEZE", "WEAK", "CHOP", "TREND", "BEAR"],
+        "max_weight": 1.0,
+        "kill_if_cagr_below": -999,
+        "description": "Phase 0 spread: Long Near / Short Far on squeeze, 20pt release, 20pt trail",
+    },
+    "range_mean_reversion_v1": {
+        "enabled_regimes": ["WEAK", "CHOP", "SQUEEZE", "STRETCHED"],
+        "max_weight": 0.5,
+        "kill_if_cagr_below": -0.05,
+        "description": "Mean reversion using BB and RSI for ranging/choppy markets",
     },
 }
 
@@ -116,6 +128,7 @@ def _check_strategy_policy(
     strategy_name: str,
     regime: str,
     metrics: dict | None = None,
+    bias: str | None = None,
 ) -> tuple[bool, str]:
     """Check if a strategy is allowed by policy.
 
@@ -137,6 +150,19 @@ def _check_strategy_policy(
     if regime_normalized not in policy["enabled_regimes"]:
         return False, f"REGIME_BLOCKED:{regime}"
 
+    # [V-Model] Enforce required_bias if set in policy
+    required_bias = policy.get("required_bias")
+    if required_bias and bias:
+        bias_norm = bias.strip().upper()
+        required_norm = required_bias.strip().upper()
+        
+        # Normalize: LONG == BULLISH, SHORT == SHORT
+        bias_norm = "BULLISH" if bias_norm == "LONG" else bias_norm
+        required_norm = "BULLISH" if required_norm == "LONG" else required_norm
+        
+        if bias_norm != required_norm:
+            return False, f"BIAS_MISMATCH: requires {required_bias}, got {bias}"
+
     # Kill-switch: CAGR below threshold
     if metrics and isinstance(metrics, dict):
         strategy_metrics = metrics.get(strategy_name, {})
@@ -153,6 +179,7 @@ def _apply_strategy_policy(
     candidates: list[str],
     regime: str,
     metrics: dict | None = None,
+    bias: str | None = None,
 ) -> tuple[list[tuple[str, str, str]], list[str]]:
     """Apply STRATEGY_POLICY to a list of candidate strategies.
 
@@ -164,7 +191,7 @@ def _apply_strategy_policy(
     keep: list[str] = []
 
     for name in candidates:
-        allowed, reason = _check_strategy_policy(name, regime, metrics)
+        allowed, reason = _check_strategy_policy(name, regime, metrics, bias)
         status = "ALLOW" if allowed else "BLOCK"
         if allowed:
             keep.append(name)
@@ -182,10 +209,10 @@ def _apply_strategy_policy(
 class FuturesRouterConfig:
     """Routing policy for futures entry signals."""
 
-    trend_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1")
-    weak_strategies: tuple[str, ...] = ("weak_bear_trend", "weak_bull_trend", "counter_vwap", "spring_upthrust", "kbar_feature", "range_mean_reversion_v1", "adaptive_orb_v15", "trend_continuation_v1", "calendar_condor_v2")
-    bear_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1", "weak_bear_trend")  # [Bear] conservative short — countertrend + upthrust + weak trend
-    stretched_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1", "weak_bear_trend", "weak_bull_trend")
+    trend_strategies: tuple[str, ...] = ("adaptive_orb", "adaptive_orb_v15", "trend_continuation_v1", "squeeze_fire_scout")
+    weak_strategies: tuple[str, ...] = ("weak_bear_trend", "weak_bull_trend", "counter_vwap", "spring_upthrust", "kbar_feature", "range_mean_reversion_v1", "adaptive_orb_v15", "trend_continuation_v1", "calendar_condor_v2", "squeeze_fire_scout")
+    bear_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1", "weak_bear_trend", "squeeze_fire_scout")  # [Bear] conservative short — countertrend + upthrust + weak trend
+    stretched_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1", "weak_bear_trend", "weak_bull_trend", "squeeze_fire_scout")
     squeeze_strategies: tuple[str, ...] = ("squeeze_fire_scout", "range_mean_reversion_v1", "adaptive_orb_v15")
     countertrend_strategies: tuple[str, ...] = ("counter_vwap", "spring_upthrust", "range_mean_reversion_v1")
     hard_block_countertrend_in_trend: bool = True
@@ -291,6 +318,9 @@ def _strategy_order_for_regime(
 
     if regime == "WEAK":
         base = list(config.weak_strategies)
+        # [V-Model] Insert active_strategy BEFORE bias-aware sorting so natural ordering works
+        if active_strategy_name:
+            base.insert(0, active_strategy_name)
         # Bias-aware sorting: promote the trend strategy matching current bias to front
         bias = str(getattr(regime_result, "bias", "")).strip().upper()
         # Normalize: regime classifier outputs LONG/SHORT, strategies expect BULLISH/SHORT
@@ -311,8 +341,6 @@ def _strategy_order_for_regime(
                 if _trend_strat in base:
                     base.remove(_trend_strat)
                     base.append(_trend_strat)
-        if active_strategy_name:
-            base.insert(0, active_strategy_name)
         return _dedupe(base)
 
     if regime == "BEAR":
@@ -323,6 +351,9 @@ def _strategy_order_for_regime(
 
     if regime == "STRETCHED":
         base = list(config.stretched_strategies)
+        # [V-Model] Insert active_strategy BEFORE bias-aware sorting
+        if active_strategy_name:
+            base.insert(0, active_strategy_name)
         # Bias-aware sorting: promote the trend strategy matching current bias to front
         _st_bias = str(getattr(regime_result, "bias", "")).strip().upper()
         _st_bias = "BULLISH" if _st_bias == "LONG" else _st_bias
@@ -334,12 +365,13 @@ def _strategy_order_for_regime(
             if "weak_bull_trend" in base:
                 base.remove("weak_bull_trend")
                 base.insert(0, "weak_bull_trend")
-        if active_strategy_name:
-            base.insert(0, active_strategy_name)
         return _dedupe(base)
 
     if regime == "SQUEEZE":
         base = list(config.squeeze_strategies)
+        # [V-Model] Insert active_strategy BEFORE bias-aware sorting
+        if active_strategy_name:
+            base.insert(0, active_strategy_name)
         # Bias-aware fallback: append weak directional strategies when bias is non-neutral
         # (squeeze專屬策略優先，weak directional作為fallback排最後)
         _sq_bias = str(getattr(regime_result, "bias", "")).strip().upper()
@@ -349,8 +381,6 @@ def _strategy_order_for_regime(
             base.append("weak_bull_trend")
         elif _sq_bias == "SHORT" and "weak_bear_trend" in config.weak_strategies:
             base.append("weak_bear_trend")
-        if active_strategy_name:
-            base.insert(0, active_strategy_name)
         return _dedupe(base)
 
     return _dedupe([active_strategy_name] if active_strategy_name else [])
@@ -617,6 +647,7 @@ def route_futures_signal(
         candidates,
         regime_result.regime,
         metrics=None,  # TODO: pass live metrics for kill-switch
+        bias=regime_result.bias,
     )
     # Log all policy checks to notes
     for name, status, reason in _policy_checked:
@@ -633,17 +664,41 @@ def route_futures_signal(
             notes.append(f"spread_stale_blocked_{_blocked}_strategies")
 
     # ═══ [WEAK Volume Gate] Block entry in WEAK regime without volume confirmation ═══
-    # Data: WEAK/LONG with vol>=1.5 has 62.8% WR (5-bar), vs 57.9% without.
-    # WEAK/SHORT with vol>=1.5 has 57.3% WR, vs 54.5% without.
-    # See scripts/regime_validation_report_v2.txt section 7.
     if regime_result.regime == "WEAK" and regime_result.bias in ("LONG", "SHORT"):
         _vol_spike = _safe_float(bar.get("volume_spike", 0.0))
         _bar_regime_cfg = FuturesBarRegimeConfig()
-        if _vol_spike < _bar_regime_cfg.weak_volume_spike_min:
-            _note = f"WEAK_VOLUME_GATE: volume_spike={_vol_spike:.2f} < {_bar_regime_cfg.weak_volume_spike_min}"
+        
+        # [Night Fix] Relax volume gate for night session and early day session
+        is_night = bar.get("is_night_session", False)
+        bars_since_open = _safe_float(bar.get("bars_since_open", 999))
+        is_early_day = not is_night and bars_since_open < 6
+        
+        # GSD: 1.3 was still blocking active periods. Lower to 0.8 for all quiet periods.
+        _thresh = 0.8 if (is_night or is_early_day or _vol_spike < 1.0) else 1.0
+        
+        _fired = bar.get("fired") or bar.get("sqz_fire", False)
+        
+        # [Hybrid Phase 2b] Paper debug bypass: let debug_gate_bypass override WEAK_VOLUME_GATE
+        _debug_bypass = False
+        _bar_cfg = bar.get("_config", {}) or {}
+        _gate_cfg = _bar_cfg.get("debug_gate_bypass", {}) or {}
+        if _gate_cfg.get("enabled", False) and _gate_cfg.get("paper_only", True):
+            _debug_bypass = True
+            print(
+                f"[ROUTER_GATE_BYPASS] gate=WEAK_VOLUME_GATE reason=paper_debug "
+                f"vol_spike={_vol_spike:.2f} threshold={_thresh}",
+                flush=True,
+            )
+        
+        if _vol_spike <= _thresh and not _fired and not _debug_bypass:
+            _note = f"WEAK_VOLUME_GATE: vol_spike={_vol_spike:.2f} <= {_thresh} (night={is_night}, early={is_early_day}, fired={_fired})"
             print(f"[Router][WEAK_VOLUME_GATE] {_note} — blocking all candidates", flush=True)
             notes.append(_note)
             candidates = []
+        elif _fired:
+            notes.append(f"WEAK_VOLUME_GATE: bypassed (fired=True)")
+        elif _vol_spike < 1.2:
+             notes.append(f"WEAK_VOLUME_GATE: passed (quiet={_vol_spike:.2f})")
 
     if regime_result.regime == "SQUEEZE" and not candidates:
         # Log SQUEEZE regime with no candidates
@@ -752,9 +807,12 @@ def route_futures_signal(
             se = getattr(strategy, "last_eval", None)
             if se is not None:
                 # Enforce skip_reason contract
-                reason = se.skip_reason or "MISSING_REASON"
-                if not se.triggered and not reason.startswith("SKIP:"):
-                    reason = f"SKIP:{reason}"
+                # When triggered=True, skip_reason is meaningless — leave it as-is
+                reason = se.skip_reason
+                if not se.triggered:
+                    reason = reason or "MISSING_REASON"
+                    if not reason.startswith("SKIP:"):
+                        reason = f"SKIP:{reason}"
                 
                 _eval_dict.update({
                     "triggered": se.triggered,
@@ -798,21 +856,22 @@ def route_futures_signal(
             continue
 
         if signal is None:
-            notes.append(f"{name}: no signal")
-            # Log no signal with strategy-specific reason
-            strategy_reason = getattr(signal, '_skip_reason', 'no_signal')
+            # [Fix] Use se.skip_reason which was populated from strategy.last_eval above
+            strategy_reason = se.skip_reason if se is not None else "SKIP:NO_EVAL"
+            notes.append(f"{name}: {strategy_reason}")
+            
             print(f"[Router][{name}] no signal — {strategy_reason}", flush=True)
             log_router_event(
                 recorder=recorder,
                 timestamp=timestamp,
                 symbol=symbol,
-                regime=regime_result.regime,
+                regime=regime_result.regime if hasattr(regime_result, 'regime') else context.market.regime,
                 strategy_name=name,
                 candidate_order=i,
                 status="no_signal",
                 evaluated=True,
                 winner=False,
-                note="strategy returned None",
+                note=f"strategy returned None | reason={strategy_reason}",
             )
             continue
         
