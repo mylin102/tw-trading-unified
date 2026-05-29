@@ -64,8 +64,8 @@ def run_stock_monitor(dry_run=False):
             dry_run=dry_run
         )
         
-        # [GSD Fix] 啟動時恢復部位並更新 Dashboard 所需的 JSON
-        sm._recover_positions_from_ledger()
+        # [GSD Fix] 啟動時執行標準設置（包含恢復部位與保存狀態）
+        sm.setup()
         sm._save_orders_file()
 
         # 3. Execution Loop

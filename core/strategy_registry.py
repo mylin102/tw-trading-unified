@@ -47,7 +47,8 @@ class StrategyRegistry:
             dir_path = self._plugin_root / asset_dir
             if not dir_path.is_dir():
                 continue
-            for py_file in sorted(dir_path.glob("*.py")):
+            # GSD: Search recursively (rglob) to support subdirectories (active/experimental/deprecated)
+            for py_file in sorted(dir_path.rglob("*.py")):
                 if py_file.name.startswith("_"):
                     continue
                 self._try_register_file(py_file, asset_dir)
@@ -61,12 +62,17 @@ class StrategyRegistry:
     def _try_register_file(self, py_file: Path, asset_class: str) -> None:
         """Import a plugin file directly (no package path needed) and register it."""
         try:
-            spec = importlib.util.spec_from_file_location(py_file.stem, py_file)
+            # GSD: Use unique module name to avoid collision across subdirectories
+            # format: plugin.futures.active.squeeze_fire_scout
+            rel_path = py_file.relative_to(self._plugin_root)
+            module_name = "plugin." + ".".join(rel_path.with_suffix("").parts)
+            
+            spec = importlib.util.spec_from_file_location(module_name, py_file)
             if spec is None or spec.loader is None:
                 self._errors[py_file.stem] = "Could not load spec"
                 return
             mod = importlib.util.module_from_spec(spec)
-            sys.modules[py_file.stem] = mod
+            sys.modules[module_name] = mod
             spec.loader.exec_module(mod)
         except Exception as exc:
             self._errors[py_file.stem] = str(exc)
@@ -83,9 +89,12 @@ class StrategyRegistry:
             ):
                 instance = attr()
                 name = instance.name
+                if name in self._plugins:
+                    logger.warning("Duplicate strategy name '%s' found in %s (ignoring)", name, py_file)
+                    return
                 self._plugins[name] = instance
                 self._metadata[name] = {**instance.metadata, "name": name, "file": str(py_file)}
-                logger.debug("Registered strategy: %s", name)
+                logger.info("Registered strategy: %s from %s", name, rel_path)
                 return
 
         logger.warning("No StrategyBase subclass found in %s", py_file)
@@ -141,6 +150,7 @@ STRATEGY_PERF: dict[str, dict[str, float]] = {
     "vol_squeeze":         {"day_pf": 1.5, "night_pf": 1.2},
     "psar":                {"day_pf": 1.4, "night_pf": 0.9},
     "weak_bear_trend":     {"day_pf": 1.2, "night_pf": 1.0},  # 新增，WEAK regime 空頭策略
+    "weak_bull_trend":     {"day_pf": 1.0, "night_pf": 1.0},  # 新增，WEAK regime 防守型多頭 (初始 PF=1.0，等待 live 驗證)
     "squeeze_fire_scout":  {"day_pf": 1.0, "night_pf": 1.0},  # 新增，SQUEEZE regime scout
 }
 
@@ -151,6 +161,12 @@ REGIME_STRATEGY_ORDER: dict[str, list[str]] = {
     "volatile":  ["vol_squeeze", "counter_vwap", "spring_upthrust"],
     "low_vol":   ["vol_squeeze", "counter_vwap", "spring_upthrust"],
     "shock":     [],  # No strategies in shock regime
+}
+
+# WEAK regime bias-aware routing (used by futures_strategy_router)
+WEAK_BIAS_STRATEGY_MAP: dict[str, str] = {
+    "SHORT":   "weak_bear_trend",
+    "BULLISH": "weak_bull_trend",
 }
 
 DEFAULT_MIN_PF = 1.0  # Strategies below this PF are excluded from rankings

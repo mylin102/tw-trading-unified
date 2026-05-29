@@ -47,7 +47,7 @@ auto_select: true                  # 啟用自動切換
 | Regime | Bias | 首選策略 | 備選策略 |
 |--------|------|---------|---------|
 | **WEAK** | SHORT | weak_bear_trend | counter_vwap, spring_upthrust |
-| **WEAK** | LONG | counter_vwap | spring_upthrust |
+| **WEAK** | BULLISH | weak_bull_trend | counter_vwap, spring_upthrust |
 | **WEAK** | NEUTRAL | range_mean_reversion | kbar_feature |
 | **SQUEEZE** | ANY | squeeze_fire_scout | range_mean_reversion |
 | **TREND** | LONG | adaptive_orb_v15 | trend_continuation_v1 |

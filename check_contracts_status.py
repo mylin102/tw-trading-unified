@@ -6,13 +6,19 @@ from core.shioaji_session import get_api
 api = get_api()
 print("Fetching...")
 api.fetch_contracts()
-print("Categories:", dir(api.Contracts))
-print("Futures content:", repr(api.Contracts.Futures))
-try:
-    print("MXF content:", repr(api.Contracts.Futures.MXF))
-    print("MXF type:", type(api.Contracts.Futures.MXF))
-    print("MXF list:", [c.code for c in api.Contracts.Futures.MXF])
-except Exception as e:
-    print("MXF access failed:", e)
+
+def print_category(name):
+    try:
+        cat = getattr(api.Contracts.Futures, name)
+        print(f"\n=== {name} Contracts ===")
+        print(f"Content: {repr(cat)}")
+        print(f"List: {[c.code for c in cat]}")
+        for c in cat:
+             print(f"  {c.code}: name={c.name}, delivery_date={c.delivery_date}")
+    except Exception as e:
+        print(f"{name} access failed: {e}")
+
+print_category("TMF")
+print_category("MXF")
 
 api.logout()

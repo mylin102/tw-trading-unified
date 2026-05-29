@@ -43,7 +43,7 @@ class ContractResolver:
         """Set Shioaji API instance."""
         self.api = api
         
-    def get_valid_contracts(self, product: str = "MXF", force_refresh: bool = False) -> List[Any]:
+    def get_valid_contracts(self, product: str, force_refresh: bool = False) -> List[Any]:
         """
         Get valid contracts for a product, excluding rolling contracts.
         
@@ -112,13 +112,14 @@ class ContractResolver:
             print(f"Error getting valid contracts for {product}: {e}")
             return []
     
-    def get_near_far_contracts(self, product: str = "MXF", days_to_switch: int = 3) -> Tuple[Optional[Any], Optional[Any]]:
+    def get_near_far_contracts(self, product: str, days_to_switch: int = 3) -> Tuple[Optional[Any], Optional[Any]]:
         """
-        Get near and far month contracts with rollover handling.
-        
+        Get near and far month contracts for a product.
+
         Args:
             product: Product code (TMF, TXF, etc.)
-            days_to_switch: Days before expiry to switch to next contract
+            days_to_switch: Days before expiry to switch to far month
+
             
         Returns:
             Tuple of (near_contract, far_contract) or (None, None) if not enough contracts

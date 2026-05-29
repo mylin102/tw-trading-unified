@@ -29,6 +29,7 @@ class PositionView:
 class MarketData:
     """Current bar data with all pre-computed indicator columns."""
     last_bar: dict                              # Latest bar as dict
+    ticker: str = "UNKNOWN"                     # Ticker symbol (e.g. TMF, MXF)
     df_5m: Any | None = None                    # Recent 5m DataFrame
     df_15m: Any | None = None                   # Recent 15m DataFrame
     timestamp: str = ""

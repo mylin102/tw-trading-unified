@@ -14,10 +14,21 @@ import shioaji as sj
 logger = logging.getLogger(__name__)
 
 def get_attr(obj: Any, *names: str, default: Any = None) -> Any:
-    """Robustly fetch attributes from an object by trying multiple names."""
+    """Robustly fetch attributes from an object by trying multiple names.
+    Supports both attribute access and dict-style key access.
+    """
     for name in names:
+        # Attribute access
         if hasattr(obj, name):
             return getattr(obj, name)
+        # Dict access
+        if isinstance(obj, dict) and name in obj:
+            return obj[name]
+        # Dict access (case-insensitive fallback)
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k.lower() == name.lower():
+                    return v
     return default
 
 def kbars_to_dataframe(kbars: Any) -> pd.DataFrame:
@@ -52,6 +63,12 @@ def kbars_to_dataframe(kbars: Any) -> pd.DataFrame:
             df["ts"] = pd.to_datetime(df["ts"])
             df.set_index("ts", inplace=True)
             df.sort_index(inplace=True)
+            
+        # [Rule 11 Fix] Explicitly cast price columns to float to avoid Decimal vs float math errors
+        for col in ["Open", "High", "Low", "Close", "Volume", "Amount"]:
+            if col in df.columns:
+                df[col] = df[col].astype(float)
+                
         return df
     except Exception as e:
         logger.error(f"[Compat] Failed to convert kbars to DataFrame: {e}")

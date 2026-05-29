@@ -67,3 +67,14 @@ scripts/fixed_night_monitor.py
 scripts/integrate_fixed_solution.py
 scripts/clean_stock_data.py
 scripts/backtest/
+
+# Artifacts, backups, temp
+artifacts/
+backups/
+monitor_snippet_tmp.py
+
+# Agent / IDE config (not project code)
+.agents/
+.gemmacli/
+.hermes/
+.hyperlight/

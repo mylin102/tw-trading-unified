@@ -56,6 +56,8 @@ class EdgeTrainer:
                     f.get("trend_strength_raw", 0.0)
                 ]
                 features_list.append(vec)
+            except Exception:
+                continue # Skip malformed or incompatible rows
             
             # Label: High-quality win (1) vs Significant loss (0)
             # Filter out noise around zero

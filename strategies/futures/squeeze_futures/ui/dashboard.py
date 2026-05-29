@@ -293,7 +293,7 @@ with st.sidebar:
             "期初資金 (TWD)",
             min_value=10000,
             max_value=10000000,
-            value=40000,
+            value=100000,
             step=10000,
             help="LIVE TRADING 模式不顯示此功能"
         )

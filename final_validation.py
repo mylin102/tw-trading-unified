@@ -56,20 +56,25 @@ def test_3_futures_trades():
     
     # 使用Dashboard的加載邏輯
     from ui.dashboard import load_futures_trades
-    ft = load_futures_trades()
+    ft, actual_date = load_futures_trades()
     
     if ft is not None:
-        print(f"找到 {len(ft)} 筆交易記錄")
+        print(f"找到 {len(ft)} 筆交易記錄 (日期: {actual_date})")
         print("交易記錄摘要:")
-        print(f"  時間範圍: {ft['timestamp'].min()} 到 {ft['timestamp'].max()}")
-        print(f"  交易類型: {ft['type'].unique().tolist()}")
-        print(f"  總PnL點數: {ft['pnl_pts'].sum():.1f}")
-        print(f"  總PnL現金: {ft['pnl_cash'].sum():.1f}")
+        if not ft.empty and 'timestamp' in ft.columns:
+            print(f"  時間範圍: {ft['timestamp'].min()} 到 {ft['timestamp'].max()}")
+        if not ft.empty and 'type' in ft.columns:
+            print(f"  交易類型: {ft['type'].unique().tolist()}")
+        if not ft.empty and 'pnl_pts' in ft.columns:
+            print(f"  總PnL點數: {ft['pnl_pts'].sum():.1f}")
+        if not ft.empty and 'pnl_cash' in ft.columns:
+            print(f"  總PnL現金: {ft['pnl_cash'].sum():.1f}")
         
         # 檢查是否有今天的交易
         today = datetime.datetime.now().strftime("%Y-%m-%d")
-        today_trades = ft[ft['timestamp'].str.contains(today)]
-        print(f"  今天({today})的交易: {len(today_trades)}筆")
+        if not ft.empty and 'timestamp' in ft.columns:
+            today_trades = ft[ft['timestamp'].astype(str).str.contains(today)]
+            print(f"  今天({today})的交易: {len(today_trades)}筆")
         
         return len(ft)
     else:

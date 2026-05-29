@@ -162,7 +162,10 @@ class BacktestEngine:
         for i in range(20, n):
             ts, price = df.index[i], df.iloc[i]["Close"]
             bar = df.iloc[i].to_dict()
-            ticker = bar.get("ticker", "MXF")
+            ticker = bar.get("ticker", "UNKNOWN")
+            if ticker == "UNKNOWN":
+                # [P1] Audit: Fail fast if ticker is missing during backtest
+                raise ValueError("Bar data missing 'ticker' field during backtest.")
 
             # GSD: Detect Market Regime (Wave 19)
             # Use pre-calculated regime for the current trading day

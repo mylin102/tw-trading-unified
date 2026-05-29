@@ -449,7 +449,12 @@ class OrderManager:
         if self.broker_adapter is None:
             raise RuntimeError("Live mode requires broker_adapter")
 
-        result = self.broker_adapter.place_order(order)
+        # [GSD] Compatibility bridge for ShioajiClient object-based placement
+        if hasattr(self.broker_adapter, "place_order_object"):
+            result = self.broker_adapter.place_order_object(order)
+        else:
+            result = self.broker_adapter.place_order(order)
+            
         if result is None:
             order.status = OrderStatus.REJECTED
             order.reject_reason = "broker_api_failed"

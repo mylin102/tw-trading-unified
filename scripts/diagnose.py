@@ -15,14 +15,38 @@ import sys
 import time
 import subprocess
 import traceback
+import yaml
 from pathlib import Path
+from datetime import datetime
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 MARKET_DATA = ROOT / "logs" / "market_data"
 RAW_TICKS = ROOT / "logs" / "raw_ticks"
 ROUTER_TRACE = ROOT / "logs" / "router_trace"
 
 os.chdir(ROOT)
+
+# ── Config Loading (GSD: Zero Hardcoding) ──
+def load_yaml(path: Path):
+    if not path.exists(): return {}
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+from core.date_utils import is_night_session
+_IS_NIGHT = is_night_session(datetime.now())
+_CFG_NAME = "futures_night.yaml" if _IS_NIGHT else "futures.yaml"
+_CFG = load_yaml(ROOT / "config" / _CFG_NAME)
+
+TICKER = _CFG.get("ticker")
+if not TICKER:
+    print(f"❌ Error: 'ticker' missing in {_CFG_NAME}")
+    sys.exit(1)
+
+# Map ticker to hot-month tick symbol (e.g., TMF -> TMFE6, MXF -> MXFE6)
+# GSD: In Shioaji, hot month is usually E6 (June), G6 (July) etc.
+# We'll detect it from the filesystem or fallback to E6 for now.
+_TICK_SYMBOL = f"{TICKER}E6" 
 
 # ── Thresholds (tunable) ──
 BAR_FRESH_OK_SEC = 600
@@ -118,11 +142,11 @@ def check_pm2():
 
 def check_bar_freshness():
     """Returns bar_age_sec or None on failure."""
-    heading("2. MXF Bar Freshness")
+    heading(f"2. {TICKER} Bar Freshness")
     try:
-        files = sorted(MARKET_DATA.glob("MXF_2026*_PAPER_indicators.csv"))
+        files = sorted(MARKET_DATA.glob(f"{TICKER}_2026*_PAPER_indicators.csv"))
         if not files:
-            fail("No MXF indicator CSV found")
+            fail(f"No {TICKER} indicator CSV found")
             return None
 
         df, err = safe_read_csv(files[-1], parse_dates=["timestamp"])
@@ -131,7 +155,6 @@ def check_bar_freshness():
             return None
 
         import pandas as pd
-        tday = df["trading_day"].iloc[-1]
         # Use timestamp-based trading day, not row-based — last CSV row may be old
         latest_ts = df["timestamp"].max()
         tday = df[df["timestamp"] == latest_ts]["trading_day"].iloc[0]
@@ -166,17 +189,25 @@ def check_raw_ticks():
     """Returns tick_age_sec or None."""
     heading("3. Raw Tick Feed")
     try:
-        files = sorted(RAW_TICKS.glob("MXFE6_2026*_ticks.csv"))
-        if not files:
-            warn("No MXFE6 tick CSV for today")
+        # Detect the actual symbol used in the filesystem for today
+        # Pattern: {TICKER}??_YYYYMMDD_ticks.csv
+        today_str = time.strftime("%Y%m%d")
+        potential_files = list(RAW_TICKS.glob(f"{TICKER}*_ticks.csv"))
+        if not potential_files:
+            warn(f"No {TICKER}* tick CSV found")
             return None
+        
+        # Sort by modification time to get the most recent one
+        potential_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        target_file = potential_files[0]
+        actual_symbol = target_file.name.split('_')[0]
 
-        df, err = safe_read_csv(files[-1])
+        df, err = safe_read_csv(target_file)
         if err:
             fail(err)
             return None
         if df.empty:
-            fail("MXFE6 tick CSV is empty")
+            fail(f"{actual_symbol} tick CSV is empty")
             return None
 
         n = len(df)
@@ -184,9 +215,9 @@ def check_raw_ticks():
         age = time.time() - last_epoch
 
         if age < TICK_FRESH_OK_SEC:
-            ok(f"MXFE6  {n} ticks today  last={age:.0f}s ago")
+            ok(f"{actual_symbol}  {n} ticks today  last={age:.0f}s ago")
         else:
-            warn(f"MXFE6  {n} ticks today  last={age:.0f}s ago  — stale")
+            warn(f"{actual_symbol}  {n} ticks today  last={age:.0f}s ago  — stale")
         return age
     except Exception as e:
         fail(f"Tick check error: {e}")

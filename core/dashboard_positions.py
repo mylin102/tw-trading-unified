@@ -289,6 +289,7 @@ def estimate_options_order_unrealized(
     current_spot: float = 0.0,
     current_iv: float = 0.0,
     dte_years: float = 0.0,
+    strike: float = 0.0,
 ) -> dict | None:
     if str(order_row.get("status", "")).lower() not in {"filled", "partial_filled"}:
         return None
@@ -336,16 +337,42 @@ def estimate_options_order_unrealized(
             "pricing_label": "spread_value",
         }
 
+    # ── Single-leg (buy Call or buy Put) ──
+    # 2026-05-25 Hermes Agent: BS theoretical premium with hard fallback chain
     entry = float(order_row.get("avg_fill_price", order_row.get("price", 0)) or 0)
-    if entry <= 0 or live_premium <= 0:
+    if entry <= 0:
         return None
 
     side = str(order_row.get("side", "")).lower()
-    pnl_pts = entry - live_premium if side == "sell" else live_premium - entry
+    option_type = "C" if side == "buy" else "P"  # buy call → C, buy put → P
+
+    premium_source = "ENTRY_FALLBACK"
+    current_premium = entry  # default: entry price fallback
+
+    # Priority 1: live premium from bid/ask mid
+    if live_premium > 0:
+        current_premium = live_premium
+        premium_source = "LIVE_QUOTE"
+
+    # Priority 2: BS theoretical (only if live premium unavailable)
+    elif current_spot > 0 and current_iv > 0 and dte_years > 0 and strike > 0:
+        try:
+            rf_rate = 0.02  # Taiwan risk-free rate ~2%
+            bs_result = black_scholes(current_spot, strike, dte_years, rf_rate, current_iv, option_type)
+            bs_price = float(bs_result.get("price", 0) or 0)
+            if bs_price > 0:
+                current_premium = bs_price
+                premium_source = "BS_THEO"
+        except Exception:
+            pass  # fall through to entry fallback
+
+    pnl_pts = entry - current_premium if side == "sell" else current_premium - entry
     return {
         "unrealized_pnl": float(pnl_pts * 50 * quantity),
-        "current_price": float(live_premium),
+        "current_price": float(current_premium),
         "pricing_label": "option_premium",
+        "premium_source": premium_source,
+        "dte_days": round(dte_years * 365.0, 2),
     }
 
 

@@ -49,7 +49,7 @@ _shutdown_event = threading.Event()
 
 # Feed health tracking (TX/MXF/OPTIONS)
 TX_PREFIXES = ("TXF", "TX", "TXO")
-MXF_PREFIXES = ("MXF",)
+MXF_PREFIXES = ("MXF", "TMF")
 FEED_STALE_SECS = 120
 FEED_WARN_SECS = 45
 
@@ -93,12 +93,16 @@ def tick_dispatcher(futures_mon, options_mon, feed_health=None, tx_bar_builder=N
         if not code:
             return "OPTIONS"
         code_str = str(code).upper()
+        # [FeedHealth] Synthetic/virtual ticks (TMF_VIRTUAL) must NEVER update real feed health.
+        # 2026-05-22 Hermes Agent: VIRTUAL detection prevents feed health pollution
+        if "VIRTUAL" in code_str:
+            return "VIRTUAL"
         if code_str.startswith("TXF") or code_str.startswith("TX"):
             # Check for TXO (Options)
             if code_str.startswith("TXO"):
                 return "OPTIONS"
             return "TX"
-        if code_str.startswith("MXF") or code_str.startswith("MX"):
+        if code_str.startswith("MXF") or code_str.startswith("MX") or code_str.startswith("TMF") or code_str.startswith("TM"):
             return "MXF"
         return "OPTIONS"
 
@@ -130,10 +134,15 @@ def tick_dispatcher(futures_mon, options_mon, feed_health=None, tx_bar_builder=N
         except Exception as e:
             console.print(f"[red][tick tracking err] {e}[/red]")
 
-        # Update feed health
+        # Update feed health (skip synthetic/virtual ticks — they must never pollute real feed health)
+        # 2026-05-22 Hermes Agent: skip mark_tick for VIRTUAL bucket; still forward tick to monitors
         try:
             bucket = classify(code)
-            if feed_health is not None:
+            if bucket == "VIRTUAL":
+                # [VIRTUAL_TICK_FEED_HEALTH_SKIP] Synthetic ticks still forwarded to monitors
+                # but must not update feed health buckets (MXF/TX/OPTIONS).
+                pass
+            elif feed_health is not None:
                 # Always mark tick, even if classify logic is slightly off
                 feed_health.mark_tick(bucket, str(code))
         except Exception as e:
@@ -195,8 +204,8 @@ def bidask_dispatcher(futures_mon, options_mon, skew_engine=None):
             
             # Safe price extraction
             try:
-                bid = bidask.bid_price[0] if hasattr(bidask.bid_price, '__getitem__') else float(bidask.bid_price)
-                ask = bidask.ask_price[0] if hasattr(bidask.ask_price, '__getitem__') else float(bidask.ask_price)
+                bid = float(bidask.bid_price[0] if hasattr(bidask.bid_price, '__getitem__') else bidask.bid_price)
+                ask = float(bidask.ask_price[0] if hasattr(bidask.ask_price, '__getitem__') else bidask.ask_price)
             except (ValueError, TypeError, IndexError):
                 return
             
@@ -635,14 +644,14 @@ def resolve_tx_contract(api, reference_contract=None):
         return None
 
 
-def feeds_are_fresh(feed_health, require_tx=True, require_mxf=True):
+def feeds_are_fresh(feed_health, require_tx=True, require_futures=True):
     snap = feed_health.snapshot()
     ages = snap.get('ages', {})
     problems = []
-    mxf_age = ages.get('MXF', float('inf'))
+    fut_age = ages.get('MXF', float('inf'))
     tx_age = ages.get('TX', float('inf'))
-    if require_mxf and mxf_age > FEED_STALE_SECS:
-        problems.append(f"MXF stale: {mxf_age:.0f}s")
+    if require_futures and fut_age > FEED_STALE_SECS:
+        problems.append(f"FUTURES (MXF/TMF) stale: {fut_age:.0f}s")
     # 💡 GSD: TX stale is non-fatal for process survival
     if require_tx and tx_age > FEED_STALE_SECS:
         if tx_age == float('inf'):
@@ -753,13 +762,14 @@ def run_system(dry_run=False):
                 except Exception:
                     console.print("[yellow]⚠️ TX contract resolution failed; proceeding without macro reference[/yellow]")
 
-            # Subscribe far-month MXF tick for dual chart
-            if fm.far_contract is not None:
+            # Subscribe far-month Futures tick for dual chart
+            if fm.far_contract:
                 try:
                     safe_subscribe(api, fm.far_contract, quote_type='tick')
-                    console.print(f"[green]📡 Subscribed far-month MXF tick: {fm.far_contract.code}[/green]")
+                    console.print(f"[green]📡 Subscribed far-month Futures tick: {fm.far_contract.code}[/green]")
                 except Exception as e:
-                    console.print(f"[yellow]⚠️ Far-month MXF subscribe failed: {e}[/yellow]")
+                    console.print(f"[yellow]⚠️ Far-month Futures subscribe failed: {e}[/yellow]")
+
 
             # Subscribe options (ATM + OTM for skew)
             for key in ["MTX", "C", "P"]:
@@ -877,13 +887,14 @@ def run_system(dry_run=False):
                                 api.quote.subscribe(con, quote_type='tick')
                                 api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
 
-                        # Re-subscribe far-month MXF tick for dual chart
-                        if fm.far_contract is not None:
+                        # Re-subscribe far-month Futures tick for dual chart
+                        if fm.far_contract:
                             try:
                                 api.quote.subscribe(fm.far_contract, quote_type='tick')
-                                console.print(f"[green]📡 Re-Subscribed far-month MXF tick: {fm.far_contract.code}[/green]")
+                                console.print(f"[green]📡 Re-Subscribed far-month Futures tick: {fm.far_contract.code}[/green]")
                             except Exception as e:
-                                console.print(f"[yellow]⚠️ Re-subscribe far-month MXF failed: {e}[/yellow]")
+                                console.print(f"[yellow]⚠️ Re-subscribe far-month Futures failed: {e}[/yellow]")
+
 
                     ft = threading.Thread(target=fm.run, name="futures", daemon=True)
                     ot = threading.Thread(target=om.run, name="options", daemon=True)
@@ -953,11 +964,11 @@ def run_system(dry_run=False):
                 except Exception:
                     require_tx = False
                 try:
-                    require_mxf = True if fm.contract is not None else False
+                    require_futures = True if fm.contract is not None else False
                 except Exception:
-                    require_mxf = False
+                    require_futures = False
 
-                ok, problems, snap = feeds_are_fresh(feed_health, require_tx=require_tx, require_mxf=require_mxf)
+                ok, problems, snap = feeds_are_fresh(feed_health, require_tx=require_tx, require_futures=require_futures)
                 ages = snap.get('ages', {})
                 console.print(
                     "[dim]"
@@ -969,7 +980,7 @@ def run_system(dry_run=False):
 
                 # Warn before critical
                 if snap['ages'].get('MXF', float('inf')) > FEED_WARN_SECS:
-                    console.print(f"[yellow]Warning: MXF feed quiet for {snap['ages'].get('MXF', 0):.0f}s[/yellow]")
+                    console.print(f"[yellow]Warning: FUTURES feed quiet for {snap['ages'].get('MXF', 0):.0f}s[/yellow]")
                 if require_tx and snap['ages'].get('TX', float('inf')) > FEED_WARN_SECS:
                     console.print(f"[yellow]Warning: TX feed quiet for {snap['ages'].get('TX', 0):.0f}s[/yellow]")
 
@@ -1097,4 +1108,6 @@ def ensure_single_instance():
 
 if __name__ == "__main__":
     ensure_single_instance()
+    main()
+
     main()

@@ -61,6 +61,11 @@ class PaperFillSimulator:
             if order is None:
                 continue
 
+            # Symbol Guard: ensure tick matches order symbol
+            tick_symbol = getattr(tick, "symbol", getattr(tick, "code", None))
+            if tick_symbol and tick_symbol != order.symbol:
+                continue
+
             remaining = order.quantity - order.filled_quantity
             if remaining <= 0:
                 continue

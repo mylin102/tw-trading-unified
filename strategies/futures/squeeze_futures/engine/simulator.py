@@ -79,12 +79,13 @@ class PaperTrader:
         fee_per_side=20,
         exchange_fee_per_side=0,
         tax_rate=0.0,
-        margin_per_lot=40000,  # GSD: Default margin requirement per lot
+        margin_per_lot=18000,  # GSD: Default margin requirement per lot (MXF standard)
         db_path: Optional[str] = None,
         snapshot_interval: int = 1800,  # 30 分鐘
     ):
         self.ticker = ticker
         self.balance = initial_balance
+        self.initial_balance = initial_balance
         self.position = 0
         self.entry_price = 0
         self.entry_time = None

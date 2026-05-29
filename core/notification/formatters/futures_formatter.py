@@ -24,7 +24,7 @@ class FuturesPositionState:
     """Current futures position."""
     def __init__(
         self,
-        symbol: str = "TX",
+        symbol: str = "UNKNOWN",
         side: str = "",            # "LONG" or "SHORT"
         qty: int = 0,
         avg_cost: float = 0.0,
@@ -192,7 +192,7 @@ class FuturesFormatter:
             sl_pts = float(monitor.RISK.get("stop_loss_pts", 0))
 
         return FuturesPositionState(
-            symbol="MXF",
+            symbol=getattr(monitor, "ticker", "UNKNOWN"),
             side=direction,
             qty=int(pos),
             avg_cost=float(entry_price),

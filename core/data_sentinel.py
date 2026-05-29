@@ -1,6 +1,6 @@
 """
 Data Sentinel — Detect and manage gaps in financial time-series data.
-Specifically tailored for Taiwan Futures (MXF) market hours.
+Specifically tailored for Taiwan Futures (TAIFEX) market hours.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ class DataSentinel:
         self.logger = logger or logging.getLogger(__name__)
 
     def is_market_open(self, dt: datetime) -> bool:
-        """Check if a given datetime is within MXF trading hours."""
+        """Check if a given datetime is within Taiwan Futures trading hours."""
         # 1. Weekend check (Saturday morning is still night session)
         if dt.weekday() == 6:  # Sunday
             return False
