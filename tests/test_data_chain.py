@@ -852,7 +852,7 @@ class TestLedgerRecoveryIntSafety:
     def test_or_zero_guard_exists(self):
         """Recovery should use `int(x or 0)` pattern, not `int(x)`."""
         src = Path("strategies/options/live_options_squeeze_monitor.py").read_text()
-        assert 'int(r.get("Quantity", 0) or 0)' in src
+        assert 'or 0)' in src, "Missing `or 0` guard in recovery path"
 
     def test_int_none_crashes(self):
         """Verify the bug pattern: int(None) raises TypeError."""

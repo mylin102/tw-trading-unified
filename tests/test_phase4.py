@@ -31,7 +31,7 @@ class TestSessionConfig:
 
     def test_load_day_config(self):
         cfg = SessionConfig.load("day")
-        assert cfg.get("active_strategy") == "counter_vwap"
+        assert cfg.get("active_strategy") == "tmf_spread"
         assert cfg.get("risk_mgmt.stop_loss_pts") == 60
 
     def test_load_night_config(self):

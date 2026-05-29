@@ -261,11 +261,11 @@ def _write_mts_state(
             "entry_ts": _f_entry_ts,
             "_updated": datetime.now().isoformat(),
         }
-        # 2026-05-27 Gemini CLI: P6: Atomic Write to prevent [MTS_STATE_READ_FAILED] race conditions
+        # 2026-05-29 Hermes Agent: fix typo _hb_state → state (NameError crash)
         _tmp_file = _MTS_STATE_FILE + ".tmp"
         try:
             with open(_tmp_file, "w") as f:
-                json.dump(_hb_state, f, default=str)
+                json.dump(state, f, default=str)
             os.replace(_tmp_file, _MTS_STATE_FILE)
         except Exception as e:
             if os.path.exists(_tmp_file): os.remove(_tmp_file)
@@ -294,8 +294,10 @@ class TMFSpread(StrategyBase):
 
     def init(self, context: StrategyContext) -> None:
         # Entry gate — each parameter reads independently from config
-        # 2026-05-27 Gemini CLI: Prefer ticker from market context (no hardcoded defaults)
-        self._ticker = context.market.ticker if context.market.ticker != "UNKNOWN" else context.config.get("ticker", "UNKNOWN")
+        # 2026-05-29 Hermes Agent: guard against mock context without ticker
+        self._ticker = getattr(context.market, 'ticker', context.config.get("ticker", "TMF"))
+        if self._ticker == "UNKNOWN":
+            self._ticker = context.config.get("ticker", "TMF")
         _params = context.config.get("params", {})
         self._entry_z = float(_params.get("entry_z", _ENTRY_Z))
         
@@ -472,9 +474,17 @@ class TMFSpread(StrategyBase):
                             _rem_side = state.get("remaining_side")
                             _peak = float(state.get("trail_peak", 0))
                             _nadir = float(state.get("trail_nadir", 0))
-                            
+
                             # If we are trailing but peak/nadir is 0, the JSON is "polluted" (likely by tests)
-                            if (_rem_side == "LONG" and _peak > 0) or (_rem_side == "SHORT" and _nadir > 0) or not _rem_side:
+                            _released_leg_state = state.get("released_leg")
+                            if _released_leg_state is None:
+                                # Both legs held — remaining_side is meaningless for pollute check
+                                _pollute_pass = True
+                            elif (_rem_side == "LONG" and _peak > 0) or (_rem_side == "SHORT" and _nadir > 0) or not _rem_side:
+                                _pollute_pass = True
+                            else:
+                                _pollute_pass = False
+                            if _pollute_pass:
                                 self._has_position = True
                                 self._lifecycle = state.get("state", "OPEN")
                                 self._entry_spread_z = float(state.get("entry_spread_z", 0))

@@ -4557,7 +4557,8 @@ class ShioajiOptionsSmartMonitor:
         # 2026-05-27 Hermes Agent: [EXIT_AUDIT] trace entry data
         import datetime as _dt
         _now_s = _dt.datetime.now().strftime("%H:%M:%S.%f")[:12]
-        _mc = self.market_data.get(self.active_side, {})
+        # 2026-05-29 Hermes Agent: guard for test mock context
+        _mc = getattr(self, 'market_data', {}).get(self.active_side, {})
         _q = self.current_option_quote(self.active_side)
         _vq = self.validate_quote(self.active_side, context="EXIT")
         _o = self._is_market_open(_dt.datetime.now())
