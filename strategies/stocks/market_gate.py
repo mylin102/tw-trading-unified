@@ -23,8 +23,8 @@ DEFAULT_REGIME = "CHOP"  # safest default when no signal available
 REGIME_GATE_MAP = {
     "BULL":      "ALLOW_LONG",
     "STRONG":    "ALLOW_LONG",
-    "WEAK":      "REDUCE_SIZE",
-    "CHOP":      "REDUCE_SIZE",
+    "WEAK":      "ALLOW_LONG",  # 2026-05-31 Gemini CLI: Relaxed to allow trades (size reduces via multiplier)
+    "CHOP":      "ALLOW_LONG",  # 2026-05-31 Gemini CLI: Relaxed to allow trades
     "BEAR":      "BLOCK_LONG",
     "CRASH":     "BLOCK_LONG",
 }
@@ -108,20 +108,15 @@ def classify_strategy(strategy_name: str) -> str:
 def strategy_allowed(strategy_name: str, regime: Optional[str] = None) -> bool:
     """Check if a specific strategy is allowed in the current regime.
 
-    BREAKOUT strategies: only in TREND/BULL regimes
-    REVERSION strategies: only in CHOP/WEAK regimes
-    NEUTRAL strategies: always allowed (but subject to gate)
+    2026-05-31 Gemini CLI: Simplified strategy allowance.
+    Now allows more overlap to prevent 'Gate Deadlock'.
+    Macro regime filters (BEAR/CRASH) still apply via get_gate().
     """
     if regime is None:
         regime = get_market_regime()
-    strategy_type = classify_strategy(strategy_name)
     
-    trend_regimes = {"BULL", "STRONG"}
-    chop_regimes = {"WEAK", "CHOP"}
-    
-    if strategy_type == "breakout":
-        return regime in trend_regimes
-    elif strategy_type == "reversion":
-        return regime in chop_regimes or regime == "NORMAL"
-    else:
-        return True
+    # 2026-05-31 Gemini CLI: Hard-blocked regimes
+    if regime in {"BEAR", "CRASH"}:
+        return False
+
+    return True

@@ -9,6 +9,10 @@ import pandas_ta  # noqa: F401 — registers .ta accessor for df.ta.macd(), df.t
 
 
 def calculate_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    """
+    計算 ATR (Average True Range)
+    2026-05-31 Gemini CLI: Standardized per ADR-008.
+    """
     if df.empty or len(df) < length:
         return pd.Series(index=df.index, dtype=float)
 
@@ -20,7 +24,7 @@ def calculate_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     tr2 = abs(high - close_prev)
     tr3 = abs(low - close_prev)
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.rolling(window=length).mean()
+    return tr.rolling(window=length, min_periods=max(1, length//2)).mean()
 
 
 def calculate_futures_squeeze(
@@ -103,6 +107,15 @@ def calculate_futures_squeeze(
         calculate_futures_squeeze._opt_vol_spike_logged = True
 
     res["fired"] = (~res["sqz_on"]) & (res["sqz_on"].shift(1))
+
+    # 2026-05-31 Gemini CLI: Standardized ATRs per ADR-008
+    res["atr_5"] = calculate_atr(df, length=5)
+    res["atr_10"] = calculate_atr(df, length=10)
+    res["atr_20"] = calculate_atr(df, length=20)
+    res["atr_60"] = calculate_atr(df, length=60)
+    
+    # Backward compatibility: 'atr' defaults to 14 or 20 (bb_length)
+    res["atr"] = calculate_atr(df, length=bb_length)
 
     # Calculate mom_state vectorized for better performance
     m = res["momentum"].values

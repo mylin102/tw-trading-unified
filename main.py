@@ -236,7 +236,10 @@ def bidask_dispatcher(futures_mon, options_mon, skew_engine=None):
                     matched = True
 
                 # [Skew Integration] Feed option quote to skew engine
-                if skew_engine is not None and key in ("C", "P"):
+                # 💡 GSD: Only dispatch if the code matches the contract and price is realistic for an option (< 10,000)
+                # to avoid price contamination (e.g. MTX price in options)
+                # 2026-06-04 Gemini CLI: Added strict code and price validation
+                if skew_engine is not None and key in ("C", "P") and code == getattr(con, "code", None) and float(mid) < 10000:
                     try:
                         from core.derivatives import OptionQuoteEvent
                         import datetime as _dt
@@ -275,6 +278,11 @@ def bidask_dispatcher(futures_mon, options_mon, skew_engine=None):
                         if code == getattr(otm_con, "code", None):
                             opt_type = "CALL" if "CALL" in otm_key.upper() or "_C" in otm_key else "PUT"
                             try:
+                                # 💡 GSD: Only dispatch if price is realistic for an option (< 10,000)
+                                # 2026-06-04 Gemini CLI: Added price validation for OTM contracts
+                                if float(mid) >= 10000:
+                                    continue
+
                                 from core.derivatives import OptionQuoteEvent
                                 import datetime as _dt
                                 strike = float(getattr(otm_con, "strike_price", 0))

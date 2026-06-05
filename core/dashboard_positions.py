@@ -344,7 +344,16 @@ def estimate_options_order_unrealized(
         return None
 
     side = str(order_row.get("side", "")).lower()
-    option_type = "C" if side == "buy" else "P"  # buy call → C, buy put → P
+    strategy_val = str(order_row.get("strategy", "")).lower()
+    
+    # 💡 [Fixed 2026-06-02] Use strategy name to determine option type (Call vs Put) instead of side
+    if "p" in strategy_val or "put" in strategy_val:
+        option_type = "P"
+    elif "c" in strategy_val or "call" in strategy_val:
+        option_type = "C"
+    else:
+        # Fallback if unknown
+        option_type = "C" if side == "buy" else "P"
 
     premium_source = "ENTRY_FALLBACK"
     current_premium = entry  # default: entry price fallback

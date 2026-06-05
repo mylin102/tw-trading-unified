@@ -98,7 +98,7 @@ debug:
   tickbar: false
   feed: false
 mts:
-  enabled: true
+  enabled: false
   strategy: tmf_spread
   lots: 1
   params:
@@ -118,4 +118,4 @@ trade_mgmt:
   allow_short: true
   force_close_at_end: true
   lots_per_trade: 1
-  max_positions: 2
+  max_positions: 4

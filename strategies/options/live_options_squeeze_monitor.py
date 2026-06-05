@@ -1063,50 +1063,50 @@ class ShioajiOptionsSmartMonitor:
                     close=tick.close
                 )
 
-            # Build 5m bars from MTX ticks
-            if key == "MTX":
-                price = float(tick.close)
-                vol = int(getattr(tick, "volume", 1))
-                # ... (rest of bar logic unchanged)
-                
-                # [Wave 1 optimization] Use integer time bucketing to avoid expensive pd.Timestamp().floor()
-                # Only compute Timestamp when bar changes (every 5 minutes)
-                tick_ts = pd.Timestamp(tick.datetime)
-                ts_int = int(tick_ts.timestamp() / 300) * 300
-                
-                bar = self._current_mtx_bar
-                if bar["ts"] is None or ts_int > self._last_mtx_bar_ts:
-                    if bar["ts"] is not None and bar["open"] > 0:
-                        # [Wave 2 optimization] Use deque for O(1) append/trim instead of DataFrame.loc + slicing
-                        bar_dict = {
-                            "open": bar["open"],
-                            "high": bar["high"],
-                            "low": bar["low"],
-                            "close": bar["close"],
-                            "volume": bar["volume"],
-                            "ts": bar["ts"],
-                        }
-                        self._mtx_tick_bars_deque.append(bar_dict)
-                        # Invalidate DF cache (will be rebuilt lazily on next indicator calc)
-                        self._mtx_tick_bars_cache = None
-                    # Convert to Timestamp only when bar changes
-                    ts = pd.Timestamp(ts_int, unit='s')
-                    bar["ts"] = ts
-                    self._last_mtx_bar_ts = ts_int
-                    bar["open"] = bar["high"] = bar["low"] = bar["close"] = price
-                    bar["volume"] = vol
-                elif ts_int == self._last_mtx_bar_ts:
-                    bar["high"] = max(bar["high"], price)
-                    bar["low"] = min(bar["low"], price)
-                    bar["close"] = price
-                    bar["volume"] += vol
+                # Build 5m bars from MTX ticks
+                if key == "MTX":
+                    price = float(tick.close)
+                    vol = int(getattr(tick, "volume", 1))
+                    
+                    # [Wave 1 optimization] Use integer time bucketing to avoid expensive pd.Timestamp().floor()
+                    # Only compute Timestamp when bar changes (every 5 minutes)
+                    tick_ts = pd.Timestamp(tick.datetime)
+                    ts_int = int(tick_ts.timestamp() / 300) * 300
+                    
+                    bar = self._current_mtx_bar
+                    if bar["ts"] is None or ts_int > self._last_mtx_bar_ts:
+                        if bar["ts"] is not None and bar["open"] > 0:
+                            # [Wave 2 optimization] Use deque for O(1) append/trim instead of DataFrame.loc + slicing
+                            bar_dict = {
+                                "open": bar["open"],
+                                "high": bar["high"],
+                                "low": bar["low"],
+                                "close": bar["close"],
+                                "volume": bar["volume"],
+                                "ts": bar["ts"],
+                            }
+                            self._mtx_tick_bars_deque.append(bar_dict)
+                            # Invalidate DF cache (will be rebuilt lazily on next indicator calc)
+                            self._mtx_tick_bars_cache = None
+                        # Convert to Timestamp only when bar changes
+                        ts = pd.Timestamp(ts_int, unit='s')
+                        bar["ts"] = ts
+                        self._last_mtx_bar_ts = ts_int
+                        bar["open"] = bar["high"] = bar["low"] = bar["close"] = price
+                        bar["volume"] = vol
+                    elif ts_int == self._last_mtx_bar_ts:
+                        bar["high"] = max(bar["high"], price)
+                        bar["low"] = min(bar["low"], price)
+                        bar["close"] = price
+                        bar["volume"] += vol
 
                 # 2026-05-26 Hermes Agent: tick-level exit evaluation for held option position
-                # Only evaluate on the option tick that matches the position side (C or P)
+                # 💡 GSD: Evaluate exit on any tick matching our position side
+                # 2026-06-04 Gemini CLI: Fixed indentation to trigger on all ticks
                 if key in ("C", "P") and key == self.active_side and self.position > 0:
                     self._option_exit_on_tick(tick)
             else:
-                    return
+                return
 
     def _normalize_and_update_market_data(self, key, bid=None, ask=None, close=None):
         """Unified entry point for market data updates. Force float and detect Decimal pollution."""
@@ -4383,7 +4383,10 @@ class ShioajiOptionsSmartMonitor:
             return
 
         premium = self._extract_tick_premium(tick)
-        if premium <= 0:
+        # 💡 GSD: If premium is 0 but we have a position, it's a critical stop-loss condition.
+        # Do not return early.
+        # 2026-06-04 Gemini CLI: Allowed zero premium to trigger exits
+        if premium < 0:
             return
 
         # Update peak premium for trailing stop
@@ -4582,7 +4585,11 @@ class ShioajiOptionsSmartMonitor:
 
         # ── [QuoteGuard] Validate quote quality before any exit decision ──
         vq = self.validate_quote(self.active_side, context="EXIT")
-        if not vq["valid"]:
+        # 💡 GSD: If quote is invalid (e.g. bid=0), we still want to evaluate stop-loss 
+        # (because bid=0 is definitely a stop-loss condition if we are LONG).
+        # We only block if the quote is truly missing from market_data.
+        # 2026-06-04 Gemini CLI: Relaxed QuoteGuard for exits
+        if not vq["valid"] and vq["reason"] == "MISSING_QUOTE" and exit_price <= 0:
             return False
 
         # ── [SessionGuard] Skip exit during invalid market state ──

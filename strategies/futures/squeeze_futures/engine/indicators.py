@@ -121,10 +121,13 @@ def _pandas_ta_squeeze(
 
 
 def calculate_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    """計算 ATR (Average True Range)"""
+    """
+    計算 ATR (Average True Range)
+    2026-05-31 Gemini CLI: Standardized per ADR-008.
+    """
     if df.empty or len(df) < length:
         return pd.Series(0.0, index=df.index)
-    return _true_range(df).rolling(window=length, min_periods=length).mean()
+    return _true_range(df).rolling(window=length, min_periods=max(1, length//2)).mean()
 
 
 def calculate_futures_squeeze(
@@ -201,7 +204,16 @@ def calculate_futures_squeeze(
     res = df.copy()
     res["sqz_on"] = sqz_on
     res["momentum"] = momentum
-    res["atr"] = calculate_atr(df, length=bb_length)
+    
+    # 2026-05-31 Gemini CLI: Standardized ATRs per ADR-008
+    # Futures core uses 60-bar sliding window for intraday volatility awareness
+    res["atr_5"] = calculate_atr(df, length=5)
+    res["atr_10"] = calculate_atr(df, length=10)
+    res["atr_20"] = calculate_atr(df, length=20)
+    res["atr_60"] = calculate_atr(df, length=60)
+    
+    # Backward compatibility: 'atr' defaults to bb_length (usually 20) or 60
+    res["atr"] = res["atr_60"] if len(df) >= 60 else res["atr_20"]
     
     # 計算動能斜率 (Velocity): 3 棒變化量的移動平均
     res["mom_velo"] = res["momentum"].diff(1).rolling(window=3).mean().fillna(0.0)

@@ -518,22 +518,41 @@ class TMFSpread(StrategyBase):
                         pass
         
         # 2. Secondary Source: Fallback reconstruction from Fill Log
-        # 2026-05-27 Gemini CLI: Reconstruct from logs if JSON is corrupt or missing 'Peak'
+        # 2026-06-02 Gemini CLI: Enhanced with timestamp expiration to prevent "Ghost Trade" loops
         try:
             if os.path.exists(_MTS_FILL_LOG):
                 with open(_MTS_FILL_LOG, "r") as f:
-                    # Read last 50 lines (enough to catch most recent spread entry)
-                    lines = f.readlines()[-50:]
-                    fills = [json.loads(l) for l in lines]
+                    # Read last 100 lines to ensure we see the full trade lifecycle
+                    lines = f.readlines()[-100:]
+                    fills = []
+                    for l in lines:
+                        try: fills.append(json.loads(l))
+                        except: pass
                     
                 # Find the most recent ENTRY group
-                last_entry_tid = None
+                last_entry = None
                 for fill in reversed(fills):
                     if fill.get("fill_type") == "ENTRY":
-                        last_entry_tid = fill.get("trade_id")
+                        last_entry = fill
                         break
                 
-                if last_entry_tid:
+                if last_entry:
+                    last_entry_tid = last_entry.get("trade_id")
+                    
+                    # 💡 [Fixed 2026-06-02] Expiration Guard: Don't restore trades older than 12 hours
+                    try:
+                        _entry_ts = datetime.fromisoformat(last_entry["timestamp"])
+                        _age_hrs = (datetime.now() - _entry_ts).total_seconds() / 3600.0
+                        if _age_hrs > 12.0:
+                            if self._last_skip_reason != f"RESTORE_EXPIRED_{last_entry_tid}":
+                                logger.warning("[MTS_RESTORE_SKIP] trade_id=%s is too old (age=%.1fh > 12h). Ignoring.", 
+                                               last_entry_tid, _age_hrs)
+                                self._last_skip_reason = f"RESTORE_EXPIRED_{last_entry_tid}"
+                            return False
+                    except (KeyError, ValueError):
+                        logger.error("[MTS_RESTORE_ERROR] Corrupt timestamp in fill log for %s", last_entry_tid)
+                        return False
+
                     # Check if this trade_id was already CLOSED or EXITED
                     is_closed = any(f.get("trade_id") == last_entry_tid and f.get("fill_type") == "EXIT" for f in fills)
                     if not is_closed:
@@ -545,8 +564,8 @@ class TMFSpread(StrategyBase):
                         if near_f and far_f:
                             self._has_position = True
                             self._trade_id = last_entry_tid
-                            self._near_entry = near_f["price"]
-                            self._far_entry = far_f["price"]
+                            self._near_entry = float(near_f["price"])
+                            self._far_entry = float(far_f["price"])
                             self._near_side = near_f["side"]
                             self._far_side = far_f["side"]
                             
@@ -556,15 +575,16 @@ class TMFSpread(StrategyBase):
                                 self._released_leg = "near" if release_f["leg"] == "NEAR" else "far"
                                 self._side = "LONG" if (self._released_leg == "near" and self._far_side == "LONG") or (self._released_leg == "far" and self._near_side == "LONG") else "SHORT"
                                 # 2026-05-27 Gemini CLI: Use actual release price as safety floor for peak/nadir
-                                self._peak = release_f["price"] if self._side == "LONG" else 0.0
-                                self._nadir = release_f["price"] if self._side == "SHORT" else 0.0
+                                self._peak = float(release_f["price"]) if self._side == "LONG" else 0.0
+                                self._nadir = float(release_f["price"]) if self._side == "SHORT" else 0.0
                                 self._lifecycle = f"TRAILING_{self._side}"
                             else:
                                 self._lifecycle = "OPEN"
                                 self._peak = self._near_entry
                                 self._nadir = self._far_entry
                                 
-                            logger.info("[MTS_RESTORE_OK] source=LOG trade_id=%s lifecycle=%s", self._trade_id, self._lifecycle)
+                            logger.info("[MTS_RESTORE_OK] source=LOG trade_id=%s lifecycle=%s age=%.1fh", 
+                                        self._trade_id, self._lifecycle, _age_hrs)
                             return True
         except Exception as e:
             logger.error("[MTS_RESTORE_LOG_FAILED] error=%s", e)

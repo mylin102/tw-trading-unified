@@ -111,7 +111,7 @@ def _extract_generated_at(payload: Any) -> str | None:
     return None
 
 
-def _is_valid_leader(row: dict[str, Any]) -> tuple[bool, str]:
+def _is_valid_leader(row: dict[str, Any], settings: dict[str, Any] = None) -> tuple[bool, str]:
     """Filter out low-quality entries from external alpha leader feed.
 
     Returns (is_valid: bool, reason: str) so caller can track drop stats.
@@ -120,6 +120,7 @@ def _is_valid_leader(row: dict[str, Any]) -> tuple[bool, str]:
     1. Exclude ETFs / warrant-like codes (00-prefix)
     2. Exclude stocks with no relative strength (rs_rating <= 0)
     3. Exclude stocks with no industry ranking (industry_rank >= 999)
+    4. 2026-05-31 Gemini CLI: Exclude stocks with ATR (%) below threshold
     """
     symbol = str(row.get("symbol") or "").strip()
     if symbol.startswith("00"):
@@ -132,6 +133,15 @@ def _is_valid_leader(row: dict[str, Any]) -> tuple[bool, str]:
     industry_rank = int(row.get("industry_rank") or 999)
     if industry_rank >= 999:
         return False, "no_industry"
+
+    # 2026-05-31 Gemini CLI: ATR (%) filter
+    if settings:
+        min_atr_pct = float(settings.get("min_atr_pct", 5.0))
+        atr_pct = float(row.get("atr_pct", 0.0))
+        # Fallback: if atr_pct not directly in row, check features if available
+        # Note: leaders usually have basic fields already.
+        if atr_pct > 0 and atr_pct < min_atr_pct:
+            return False, "low_vol"
 
     return True, ""
 
@@ -191,11 +201,12 @@ def _normalize_snapshot(
         max_watchlist = int(settings.get("max_watchlist_size", 20))
         before = len(leader_rows)
 
-        # Drop reason tracking
-        drop_stats: dict[str, int] = {"etf": 0, "rs_zero": 0, "no_industry": 0}
+        # Drop reason tracking (2026-05-31 Gemini CLI: Added low_vol)
+        drop_stats: dict[str, int] = {"etf": 0, "rs_zero": 0, "no_industry": 0, "low_vol": 0}
         filtered: list[dict[str, Any]] = []
         for r in leader_rows:
-            valid, reason = _is_valid_leader(r)
+            # 2026-05-31 Gemini CLI: Pass settings for ATR% filtering
+            valid, reason = _is_valid_leader(r, settings)
             if valid:
                 filtered.append(r)
             elif reason in drop_stats:

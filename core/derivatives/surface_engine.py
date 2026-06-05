@@ -72,6 +72,11 @@ class OptionSurfaceEngine:
         quote_store is updated by (option_type, strike) — same strike
         overwrites previous quote automatically.
         """
+        # 💡 GSD: Discard contaminated prices (e.g. MTX price leakage)
+        # 2026-06-04 Gemini CLI: Added contamination check and silenced logs
+        if event.mid >= 10000:
+            return
+
         key = (event.option_type.upper(), event.strike)
         self.quote_store[key] = {
             "mid": event.mid,
@@ -81,11 +86,12 @@ class OptionSurfaceEngine:
             "expiry": event.expiry,
             "symbol": event.symbol,
         }
-        print(
-            "[SurfaceEngine] quote updated: %s %.0f bid=%.1f ask=%.1f mid=%.2f"
-            % (event.option_type, event.strike, event.bid, event.ask, event.mid),
-            flush=True,
-        )
+        # 💡 GSD: Silenced log to save CPU/IO resources
+        # print(
+        #     "[SurfaceEngine] quote updated: %s %.0f bid=%.1f ask=%.1f mid=%.2f"
+        #     % (event.option_type, event.strike, event.bid, event.ask, event.mid),
+        #     flush=True,
+        # )
 
     # ------------------------------------------------------------------
     # Surface Snapshot (IV-based — for shape classification)
@@ -234,17 +240,19 @@ class OptionSurfaceEngine:
             invalid_reason=invalid_reason,
         )
 
-        print(
-            "[SurfaceEngine] snapshot: atm_iv=%.4f otm_put_iv=%.4f otm_call_iv=%.4f "
-            "dte=%.1f valid=%s reason=%s "
-            "atm_strike=%.0f otm_put_strike=%.0f otm_call_strike=%.0f "
-            "underlying=%.0f"
-            % (snapshot.atm_iv, snapshot.otm_put_iv, snapshot.otm_call_iv,
-               snapshot.dte, snapshot.is_valid(), snapshot.invalid_reason,
-               snapshot.atm_strike, snapshot.otm_put_strike, snapshot.otm_call_strike,
-               snapshot.underlying_price),
-            flush=True,
-        )
+        # 💡 GSD: Silenced verbose logs to save resources
+        # 2026-06-04 Gemini CLI: Silenced logs
+        # print(
+        #     "[SurfaceEngine] snapshot: atm_iv=%.4f otm_put_iv=%.4f otm_call_iv=%.4f "
+        #     "dte=%.1f valid=%s reason=%s "
+        #     "atm_strike=%.0f otm_put_strike=%.0f otm_call_strike=%.0f "
+        #     "underlying=%.0f"
+        #     % (snapshot.atm_iv, snapshot.otm_put_iv, snapshot.otm_call_iv,
+        #        snapshot.dte, snapshot.is_valid(), snapshot.invalid_reason,
+        #        snapshot.atm_strike, snapshot.otm_put_strike, snapshot.otm_call_strike,
+        #        snapshot.underlying_price),
+        #     flush=True,
+        # )
 
         return snapshot
 
@@ -301,12 +309,14 @@ class OptionSurfaceEngine:
         if put_strike is not None and call_strike is not None:
             strike_gap = abs(put_strike - call_strike)
             if strike_gap > 1000:
-                print(
-                    "[SurfaceEngine] asymmetric strikes put=%.0f call=%.0f "
-                    "gap=%.0f pts > 1000 → NEUTRAL fallthrough"
-                    % (put_strike, call_strike, strike_gap),
-                    flush=True,
-                )
+                # 💡 GSD: Silenced verbose logs to save resources
+                # 2026-06-04 Gemini CLI: Silenced logs
+                # print(
+                #     "[SurfaceEngine] asymmetric strikes put=%.0f call=%.0f "
+                #     "gap=%.0f pts > 1000 → NEUTRAL fallthrough"
+                #     % (put_strike, call_strike, strike_gap),
+                #     flush=True,
+                # )
                 return SkewSignal(
                     direction="NEUTRAL",
                     confidence=0.0,
@@ -385,14 +395,16 @@ class OptionSurfaceEngine:
             underlying_price=underlying_price,
         )
 
-        print(
-            "[SurfaceEngine] skew_signal direction=%s confidence=%.4f "
-            "skew_level=%.2f put=%.2f call=%.2f divergence=%.2f"
-            % (signal.direction, signal.confidence,
-               signal.skew_level, signal.downside_risk, signal.upside_risk,
-               signal.put_call_divergence),
-            flush=True,
-        )
+        # 💡 GSD: Silenced verbose logs to save resources
+        # 2026-06-04 Gemini CLI: Silenced logs
+        # print(
+        #     "[SurfaceEngine] skew_signal direction=%s confidence=%.4f "
+        #     "skew_level=%.2f put=%.2f call=%.2f divergence=%.2f"
+        #     % (signal.direction, signal.confidence,
+        #        signal.skew_level, signal.downside_risk, signal.upside_risk,
+        #        signal.put_call_divergence),
+        #     flush=True,
+        # )
 
         return signal
 

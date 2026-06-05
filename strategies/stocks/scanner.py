@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np  # 2026-05-31 Gemini CLI: Added for ATR calculation
 from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze
 from strategies.stocks.pattern_engine import detect_cup_with_handle
 
@@ -33,15 +34,16 @@ class StockScanner:
                 }).dropna()
                 df_5m = calculate_futures_squeeze(df_5m)
                 
-                # 3. 抓取整股 1分K 數據 (優化：僅抓取最近 14 天用於型態偵測)
+                # 3. 抓取整股 1分K 數據 (優化：抓取最近 30 天以確保有足夠的交易日算 ATR(10))
                 # 💡 GSD: Fetching 365 days of 1min data is too heavy for Shioaji API.
-                # Reducing to 14 days to keep scan responsive.
-                start_date_1d = (pd.Timestamp.now() - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
+                # 2026-05-31 Gemini CLI: Increased to 30 days for ATR(10) calculation.
+                start_date_1d = (pd.Timestamp.now() - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
                 kbars_raw = self._kbars_with_timeout(contract, start=start_date_1d)
                 df_raw = pd.DataFrame({**kbars_raw})
                 
                 pattern_status = "NONE"
                 pivot_price = 0.0
+                atr_10 = 0.0
                 
                 if not df_raw.empty:
                     df_raw.ts = pd.to_datetime(df_raw.ts)
@@ -53,6 +55,18 @@ class StockScanner:
                     }).dropna()
                     df_1d.columns = [c.capitalize() for c in df_1d.columns]
                     
+                    # 2026-05-31 Gemini CLI: 計算 ATR (10)
+                    if len(df_1d) >= 10:
+                        h, l, c = df_1d["High"].values, df_1d["Low"].values, df_1d["Close"].values
+                        tr = np.zeros(len(c))
+                        tr[0] = h[0] - l[0]
+                        tr[1:] = np.maximum(h[1:] - l[1:], 
+                                            np.maximum(np.abs(h[1:] - c[:-1]), 
+                                                       np.abs(l[1:] - c[:-1])))
+                        # 使用 SMA (10)
+                        atr_10_series = pd.Series(tr).rolling(window=10).mean()
+                        atr_10 = float(atr_10_series.iloc[-1])
+
                     # 執行幾何型態偵測
                     base_info = detect_cup_with_handle(df_1d, 
                         cup_depth_min=canslim_cfg.get("cup_depth_min", 0.12),
@@ -75,6 +89,7 @@ class StockScanner:
                     "status": "SQUEEZING" if last["sqz_on"] else "FIRED",
                     "pattern": pattern_status,
                     "pivot": pivot_price,
+                    "atr_10": atr_10,  # 2026-05-31 Gemini CLI: Added ATR(10)
                     "close": last["Close"],
                     "score": last.get("score", 0),
                     "it_buy": "🔥 強力建倉" if last["it_buy_rolling_count"] >= 2 else "⚪ 中性"

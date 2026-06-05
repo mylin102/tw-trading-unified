@@ -64,8 +64,12 @@ def run_portfolio_grid_sweep(
         cfg = update_cfg_with_params(base_cfg, strategy_name, {})
         longs, shorts = generate_signals(df, strategy_name, cfg)
         trading_days = (df.index.year * 10000 + df.index.month * 100 + df.index.day).values
+        # 2026-05-31 Gemini CLI: Extract ATR(10) if available for V5 engine
+        atr_vals = df["atr_10"].values if "atr_10" in df.columns else np.zeros(len(df))
+        
         cached_signals[ticker] = (longs, shorts, trading_days,
-                                  df["Close"].values, df["High"].values, df["Low"].values)
+                                  df["Close"].values, df["High"].values, df["Low"].values,
+                                  atr_vals)
 
     results = []
     trades_dict = {}
@@ -79,15 +83,18 @@ def run_portfolio_grid_sweep(
         all_pnl_vecs = []
         
         for ticker, df in all_dfs.items():
-            longs, shorts, trading_days, close, high, low = cached_signals[ticker]
+            longs, shorts, trading_days, close, high, low, atr_vals = cached_signals[ticker]
             
+            # 2026-05-31 Gemini CLI: Pass ATR parameters to V5 engine
             ent, ext, pos, pnl, reasons, qtys = simulate_stock_trades(
                 close, high, low,
                 trading_days, longs, shorts,
                 1000000.0, capital_per_trade,
                 current_params.get("stop_loss_pct", 0.03),
                 current_params.get("take_profit_pct", 0.05),
-                current_params.get("trailing_stop_pct", 0.015)
+                current_params.get("trailing_stop_pct", 0.015),
+                atr_values=atr_vals,
+                atr_mult=current_params.get("atr_mult", 1.8)
             )
             
             asset_pnl = np.sum(pnl)
@@ -127,13 +134,19 @@ def run_multi_asset_backtest(
         if df.empty: continue
         longs, shorts = generate_signals(df, strategy_name, cfg)
         trading_days = (df.index.year * 10000 + df.index.month * 100 + df.index.day).values
+        
+        # 2026-05-31 Gemini CLI: ATR support for single backtest run
+        atr_vals = df["atr_10"].values if "atr_10" in df.columns else np.zeros(len(df))
+        
         ent, ext, pos, pnl, reasons, qtys = simulate_stock_trades(
             df["Close"].values, df["High"].values, df["Low"].values,
-            trading_days, longs, shorts,
-            1000000.0, capital_per_trade,
-            cfg.get("stop_loss_pct", 0.03),
-            cfg.get("take_profit_pct", 0.05),
-            cfg.get("trailing_stop_pct", 0.015)
+            trading_day=trading_days, longs=longs, shorts=shorts,
+            initial_balance=1000000.0, capital_per_trade=capital_per_trade,
+            stop_loss_pct=cfg.get("stop_loss_pct", 0.03),
+            take_profit_pct=cfg.get("take_profit_pct", 0.05),
+            trailing_stop_pct=cfg.get("trailing_stop_pct", 0.015),
+            atr_values=atr_vals,
+            atr_mult=cfg.get("atr_mult", 1.8)
         )
         last_entry_price = 0.0
         for i in range(len(pnl)):

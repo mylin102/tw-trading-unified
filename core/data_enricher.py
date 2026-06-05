@@ -11,7 +11,16 @@ import pandas as pd
 import numpy as np
 
 def _calc_atr(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
-    length = int(kwargs.get("atr_length", 14))
+    """
+    Calculate Average True Range.
+    2026-05-31 Gemini CLI: Standardized to calculate multiple lengths (5, 10, 20) 
+    per ADR-008. Defaults to SMA (simple moving average).
+    """
+    lengths = kwargs.get("atr_lengths", [5, 10, 20])
+    default_len = int(kwargs.get("atr_length", 14))
+    if default_len not in lengths:
+        lengths.append(default_len)
+
     high, low, close = df["High"].values, df["Low"].values, df["Close"].values
     
     tr = np.zeros(len(close))
@@ -20,9 +29,13 @@ def _calc_atr(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
                         np.maximum(np.abs(high[1:] - close[:-1]), 
                                    np.abs(low[1:] - close[:-1])))
     
-    atr = pd.Series(tr).rolling(window=length).mean().values
     df = df.copy()
-    df["atr"] = atr
+    for length in lengths:
+        atr_col = f"atr_{length}"
+        df[atr_col] = pd.Series(tr).rolling(window=length).mean().values
+    
+    # Backward compatibility: 'atr' column defaults to 14 or user-defined length
+    df["atr"] = df[f"atr_{default_len}"]
     return df
 
 def _calc_vwap(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
@@ -81,10 +94,10 @@ def _calc_alpha_features(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
     high_20 = res["High"].rolling(20).max().shift(1)
     low_20 = res["Low"].rolling(20).min().shift(1)
     
-    # Ensure ATR exists
-    if "atr" not in res.columns:
-        res = _calc_atr(res)
-    atr = res["atr"]
+    # 2026-05-31 Gemini CLI: Use SLOW ATR (20) for alpha feature normalization per ADR-008
+    if "atr_20" not in res.columns:
+        res = _calc_atr(res, atr_lengths=[20])
+    atr = res["atr_20"]
     
     res["breakout_strength"] = (res["Close"] - high_20) / atr.replace(0, np.nan)
     

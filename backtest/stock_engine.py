@@ -1,4 +1,5 @@
-# Version: 4.1.0 (Buy-side fees + stop price fix)
+# Version: 5.0.0 (ATR-based Stop Loss support)
+# 2026-05-31 Gemini CLI: Upgraded to V5 to support dynamic ATR risk boundaries.
 import numpy as np
 import numba as nb
 from typing import Tuple, Dict
@@ -23,9 +24,11 @@ def simulate_stock_trades(
     stop_loss_pct: float = 0.03,
     take_profit_pct: float = 0.05,
     trailing_stop_pct: float = 0.015,
+    atr_values: np.ndarray = np.array([0.0]), # 2026-05-31 Gemini CLI: Added for ATR support
+    atr_mult: float = 1.8                     # 2026-05-31 Gemini CLI: Added for ATR support
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    台股回測引擎 v4: 增加 qty 紀錄
+    台股回測引擎 v5: 增加 ATR 動態停損支援
     回傳: (entries, exits, positions, pnl, reasons, quantities)
     """
     n = len(close)
@@ -45,6 +48,10 @@ def simulate_stock_trades(
     max_price = 0.0
     entry_buy_cost = 0.0  # 累計買方手續費
     
+    # 2026-05-31 Gemini CLI: 當前持倉的絕對停損價
+    current_stop_price = 0.0
+    use_atr_stop = len(atr_values) == n and atr_values.max() > 0
+    
     for i in range(n):
         curr_day = trading_day[i]
         
@@ -59,6 +66,13 @@ def simulate_stock_trades(
                 entries[i] = close[i]
                 reasons[i] = 1 
                 quantities[i] = qty_odd
+                
+                # 2026-05-31 Gemini CLI: 初始化停損價 (優先使用 ATR)
+                if use_atr_stop:
+                    current_stop_price = entry_price_avg - (atr_values[i] * atr_mult)
+                else:
+                    current_stop_price = entry_price_avg * (1 - stop_loss_pct)
+
             elif current_pos == 1:
                 qty_round = int(capital_per_trade // close[i])
                 current_pos = 2
@@ -68,6 +82,13 @@ def simulate_stock_trades(
                 entries[i] = close[i]
                 reasons[i] = 2 
                 quantities[i] = qty_round
+                
+                # 2026-05-31 Gemini CLI: 加碼後更新停損價
+                if use_atr_stop:
+                    # 重新計算 ATR 停損 (可根據需求決定是否使用加碼時的 ATR 或維持原 ATR)
+                    current_stop_price = entry_price_avg - (atr_values[i] * atr_mult)
+                else:
+                    current_stop_price = entry_price_avg * (1 - stop_loss_pct)
 
         elif current_pos > 0:
             exit_price = 0.0
@@ -78,7 +99,8 @@ def simulate_stock_trades(
             
             if can_sell_odd:
                 trailing_price = max_price * (1 - trailing_stop_pct)
-                hard_stop_price = entry_price_avg * (1 - stop_loss_pct)
+                # 2026-05-31 Gemini CLI: 使用已算好的 current_stop_price (可能是 ATR 或 PCT)
+                hard_stop_price = current_stop_price
                 
                 # 取 trailing 和 hard stop 中較高的出場價，限制最大虧損
                 if low[i] <= trailing_price or low[i] <= hard_stop_price:
@@ -112,7 +134,7 @@ def simulate_stock_trades(
                 trade_pnl = (exit_price - entry_price_avg) * total_qty
                 sell_cost = calc_stock_costs(exit_price, total_qty, False)
                 pnl[i] = trade_pnl - entry_buy_cost - sell_cost
-                current_pos = 0; qty_odd = 0; qty_round = 0; entry_price_avg = 0.0; entry_buy_cost = 0.0
+                current_pos = 0; qty_odd = 0; qty_round = 0; entry_price_avg = 0.0; entry_buy_cost = 0.0; current_stop_price = 0.0
         
         positions[i] = current_pos
         

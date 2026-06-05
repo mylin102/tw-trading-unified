@@ -76,9 +76,11 @@ class StockMonitor:
         df_scan = self.scanner.scan_squeeze(self.watchlist, self.cfg)
         if not df_scan.empty:
             for _, row in df_scan.iterrows():
+                # 2026-05-31 Gemini CLI: Store ATR(10) in scan results
                 self.scan_results[row["ticker"]] = {
                     "pattern": row["pattern"],
-                    "pivot": row["pivot"]
+                    "pivot": row["pivot"],
+                    "atr_10": row.get("atr_10", 0.0)
                 }
             console.print(f"[green]✅ Pattern scan complete. Tagged {len(self.scan_results)} tickers.[/green]")
 
@@ -604,17 +606,21 @@ class StockMonitor:
                 is_it_buy = (df['Volume'] > vol_avg * 1.5) & (df['Close'] > df['Open']) & (df['Close'] > df['ma20'])
                 df['it_buy_rolling_count'] = is_it_buy.rolling(5).sum().fillna(0)
                 
-                scan_info = self.scan_results.get(ticker, {"pattern": "NONE", "pivot": 0.0})
-                
+                # 2026-05-31 Gemini CLI: Include atr_10 in default scan_info
+                scan_info = self.scan_results.get(ticker, {"pattern": "NONE", "pivot": 0.0, "atr_10": 0.0})
+
                 # Multi-TF analysis
                 tf_analysis = self._loop_state["analyze_market_condition"](df)
-                
+
                 # 保存指標數據供 Dashboard 顯示
                 if not df.empty:
                     last_row = df.iloc[-1].to_dict()
                     # 添加股票名稱
                     last_row["name"] = contract.name if hasattr(contract, "name") else ticker
-                    
+
+                    # 2026-05-31 Gemini CLI: Add ATR(10) from scan results
+                    last_row["atr_10"] = scan_info.get("atr_10", 0.0)
+
                     # GSD: Include Multi-TF results for more robust Dashboard trend label
                     last_row["primary_trend"] = tf_analysis.get("market_state", {}).get("primary_trend", "UNKNOWN")
                     last_row["market_regime"] = tf_analysis.get("market_state", {}).get("market_regime", "UNKNOWN")
@@ -692,22 +698,38 @@ class StockMonitor:
                         continue
                     
                     from core.edge_model import edge_model
+                    # 2026-05-31 Gemini CLI: Enriched context to prevent underestimated edge scores
                     context = {
                         "regime": regime,
                         "momentum": last_bar.get("momentum", 0),
                         "volatility": last_bar.get("atr", 0),
-                        "vwap_dist": abs(snapshot.close - last_bar.get("vwap", snapshot.close))
+                        "vwap_dist": abs(snapshot.close - last_bar.get("vwap", snapshot.close)),
+                        "breakout_strength": last_bar.get("breakout_strength", 0),
+                        "volume_spike": last_bar.get("volume_spike", 1.0),
+                        "trend_strength_raw": last_bar.get("trend_strength_raw", 0),
+                        "price": snapshot.close,
+                        "side": "LONG" # Most stock strategies are long-only
                     }
-                    edge_res = edge_model.evaluate(abs(last_bar.get("score", 50)), context, self.strat_name)
+                    signal_score = abs(last_bar.get("score", 50))
+                    edge_res = edge_model.evaluate(signal_score, context, self.strat_name)
                     
-                    if edge_res["has_edge"]:
+                    # 2026-05-31 Gemini CLI: Unblocking Gate (Giant Mindset)
+                    # If signal is very strong (score > 80), bypass edge model restriction
+                    is_high_conviction = signal_score >= 80
+                    
+                    if edge_res["has_edge"] or is_high_conviction:
                         # [Fix] Cooldown: same ticker max 1 entry per 10 min
                         _last_entry = getattr(self, f'_last_entry_{ticker}', 0)
                         if time.time() - _last_entry < 600:
                             console.print(f"[dim]⏳ Cooldown active for {ticker} — skip[/dim]")
                             continue
                         self._reload_live_flag() 
-                        self.execute_trade(ticker, "BUY", snapshot.close, res.get("qty_mode", "SCOUT"), f"{res.get('reason', 'SIGNAL')} (Edge={edge_res['edge_score']:.2f})")
+                        
+                        trade_reason = f"{res.get('reason', 'SIGNAL')} (Edge={edge_res['edge_score']:.2f})"
+                        if is_high_conviction and not edge_res["has_edge"]:
+                            trade_reason += " [HIGH_CONVICTION_BYPASS]"
+                            
+                        self.execute_trade(ticker, "BUY", snapshot.close, res.get("qty_mode", "SCOUT"), trade_reason)
                         setattr(self, f'_last_entry_{ticker}', time.time())
                     else:
                         if random.random() < 0.1: # Reduce log noise
