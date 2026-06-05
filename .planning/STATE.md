@@ -1,111 +1,77 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.1
-milestone_name: milestone
-current_phase: 01
-current_plan: 1
-status: verifying
-stopped_at: Completed 1000-05-PLAN.md
-last_updated: "2026-04-21T11:36:46.866Z"
-last_activity: 2026-04-21
+milestone: v1.2
+milestone_name: Adaptive Strategy Optimization
+current_phase: 12-1
+current_plan: 01
+status: planning_complete
+stopped_at: Created .planning/PHASE-1-VERIFICATION.md
+last_updated: "2026-05-13T10:00:00.000Z"
+last_activity: 2026-05-13
 progress:
-  total_phases: 6
-  completed_phases: 2
-  total_plans: 11
-  completed_plans: 8
-  percent: 73
+  total_phases: 7
+  completed_phases: 3
+  total_plans: 17
+  completed_plans: 11
+  percent: 65
 ---
 
 # Session State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-04-20)
+See: .planning/PROJECT.md (updated 2026-05-13)
 
-**Core value:** The system must preserve broker-truth execution state and capital safety so trading decisions and operator actions are based on correct, recoverable lifecycle data.
-**Current focus:** Phase 01 — lifecycle-truth-contract
+**Core value:** Transform fixed-parameter spread strategies into volatility-adaptive systems to reduce friction and improve capture quality.
+**Current focus:** Phase 12-1 — ATR Adaptive Verification
 
 ## Current Position
 
-Phase: 01 (lifecycle-truth-contract) — EXECUTING
-Plan: 3 of 3
-**Milestone:** v1.1 vNext Execution Reliability
-**Current phase:** 01
-**Current plan:** 1
-**Status:** Phase complete — ready for verification
-**Last activity:** 2026-04-21
+Phase: 12-1 (ATR Adaptive Verification) — PLANNING COMPLETE
+Plan: 1 of 1
+**Milestone:** v1.2 Adaptive Strategy Optimization
+**Current phase:** 12-1
+**Current plan:** 01
+**Status:** Planning complete — ready for execution
+**Last activity:** 2026-05-13
 
-Progress: [█░░░░░░░░░] 10%
+Progress: [██████░░░░] 65% (includes v1.1 completed phases)
 
 ## Performance Metrics
 
 **Velocity:**
-
-- Total plans completed: 3
-- Average duration: -
-- Total execution time: 0.0 hours
+- Total plans completed: 11 (historical)
+- Current Milestone: 0/1 plans completed
 
 **By Phase:**
 
-| Phase | Plans | Total | Avg/Plan |
-|-------|-------|-------|----------|
-| 1. Lifecycle Truth Contract | 3/3 | planning complete | - |
-| 2. Broker Reconciliation & Restart Recovery | 0/3 | - | - |
-| 3. Operator Lifecycle Visibility | 0/3 | - | - |
-| 4. V-Model Validation & Runtime Hardening | 0/2 | - | - |
-
-**Recent Trend:**
-
-- Last 5 plans: 01-01, 01-02, 01-03 planned
-- Trend: Planning complete
-
-| Phase 1000 P01 | 6m | 2 tasks | 5 files |
-| Phase 1000 P02 | 922 | 2 tasks | 4 files |
-| Phase 1000 P03 | 20m | 2 tasks | 5 files |
-| Phase 1000 P04 | 7min | 2 tasks | 5 files |
-| Phase 1000 P05 | 3min | 2 tasks | 3 files |
+| Phase | Plans | Status |
+|-------|-------|--------|
+| 12-1. ATR Verification | 0/1 | planning complete |
+| 1. Lifecycle Truth Contract | 3/3 | Complete |
+| 1000. Live Theta Combo | 5/5 | Complete |
 
 ## Accumulated Context
 
 ### Decisions
-
-Decisions are logged in PROJECT.md Key Decisions table.
-Recent decisions affecting current work:
-
-- Phase 1: Keep lifecycle work anchored to intent → order → deal and `PaperTrader.position` truth.
-- Phase 2: Treat callback + `update_status()` reconciliation as mandatory broker-truth recovery.
-- Phase 3: Limit dashboard changes to lifecycle truth exposure, not a broader redesign.
-- [Phase 1000]: Use exact Shioaji combo APIs and keep combo submit separate from single-leg helpers.
-- [Phase 1000]: Persist combo truth on one lifecycle order via truth_source, combo_legs, combo_strategy, and raw_events.
-- [Phase 1000]: Only bull_put_spread and bear_call_spread can submit live combo orders tonight.
-- [Phase 1000]: Live theta submit success now creates pending_theta_combo metadata instead of mutating local open/close state.
-- [Phase 1000]: Live spread capital checks use max_loss and wing-width semantics instead of premium-only math.
-- [Phase 1000]: Combo startup recovery now loads combo broker status before ordinary order/ledger fallback.
-- [Phase 1000]: Recovered combo fills are deduplicated by one aggregated combo identity and only mutate theta runtime after broker-confirmed fill truth.
-- [Phase 1000]: Open combo recovery rebuilds pending_theta_combo from lifecycle orders so restart never resubmits the broker order.
-- [Phase 1000]: Infer dashboard truth badges from truth_source plus ledger rebuild state instead of a global theta disclaimer.
-- [Phase 1000]: Value broker combo lifecycle rows from combo_legs metadata so spread PnL does not depend on ledger open-position matching.
-- [Phase 1000]: Keep wave 5 test-only and validate broker-first combo recovery with regressions instead of late runtime changes.
-- [Phase 1000]: Use the exact ship/no-ship gate: targeted combo/dashboard pytest, py_compile on runtime surfaces, then full pytest tests/.
+- [ADAPT]: Use ATR-scaled dynamic thresholds for `tmf_spread`.
+- [ADAPT]: Implement `min_atr` gate to filter entry in low-volatility sessions.
+- [ADAPT]: Hard floors for stops (5pt) and trails (10pt) are mandatory for capital safety.
 
 ### Roadmap Evolution
-
-- Phase 1000 added: Implement truthful live theta execution and complex-order order path
+- Milestone v1.2 added for Adaptive Strategy Optimization.
+- Phase 12-1 defined for ATR Adaptive Verification.
 
 ### Pending Todos
-
-See `.planning/todos/pending/` for captured follow-ups.
-
-None yet.
+- [ ] Verify final production configuration in `config/futures_day.yaml` and `config/futures.yaml`.
+- [ ] Implement comprehensive unit tests in `tests/strategies/test_tmf_spread_atr.py`.
+- [ ] Verify that `_write_mts_state` correctly captures and logs dynamic thresholds.
 
 ### Blockers/Concerns
-
-- Financial risk remains high until lifecycle contract and restart recovery are implemented and verified.
-- `main.py` and the 8500 dashboard must remain stable while lifecycle internals change.
-- Phase 1 planning is ready, but execution must preserve `deal_id`/`intent_id`/`order_id` continuity across futures/options paper-live paths.
+- None at this time. ATR logic is already in the strategy; verification is the primary bottleneck.
 
 ## Session Continuity
 
-Last session: 2026-04-21T11:36:46.864Z
-Stopped at: Completed 1000-05-PLAN.md
-Resume file: None
+Last session: 2026-05-13
+Stopped at: Created .planning/PHASE-1-VERIFICATION.md
+Resume file: .planning/PHASE-1-VERIFICATION.md

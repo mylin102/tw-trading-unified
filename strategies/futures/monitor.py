@@ -4,6 +4,8 @@ Accepts an injected Shioaji API instance (no internal login).
 """
 import sys
 import os
+import glob
+import hashlib
 import time
 import json
 import math
@@ -174,6 +176,17 @@ class FuturesMonitor:
         self._last_real_tmf_tick_at = self.last_tick_at
         self._runtime_status = None
         self._manual_trade_status = "READY"  # [GSD] Track manual trade state (READY, PROCESSING, FILLED, FAILED)
+        # 2026-06-05 JVS Claw: NO_LIVE_TICK fix — atomic flag lifecycle + idempotency
+        self._processed_flag_ids: set = set()   # C2: idempotency set (in-memory, reset on restart)
+        self._flag_retry_count: int = 0         # C7: retry counter (in-memory)
+        self._current_flag_id: str | None = None  # C2: tracks flag being processed
+        # 2026-06-05 JVS Claw: R1 — startup cleanup of orphaned .processing files
+        for _orph in glob.glob("/tmp/futures_manual_trade.flag.processing"):
+            try:
+                os.rename(_orph, _orph.replace(".processing", ""))
+                console.print(f"[yellow]🔄 [STARTUP] Recovered orphaned flag: {_orph}[/yellow]")
+            except Exception:
+                pass
 
         # Apply config (Initial create for Trader and OrderMgr happens here)
         self.order_mgr = None
@@ -1244,8 +1257,12 @@ class FuturesMonitor:
         self.last_tick_at = time.time()  # [gstack] 更新數據更新時間
 
         # ── [Manual Trade Flag] Check on every tick ──
+        # 2026-06-05 JVS Claw: Step 4 — gate flag check with is_primary (C4).
+        # Only near-month ticks consume the flag. Far-month ticks don't populate
+        # market_data[self.ticker] so they would always trigger NO_LIVE_TICK.
         _flag_path = "/tmp/futures_manual_trade.flag"
-        if os.path.exists(_flag_path):
+        _is_primary_tick = self.contract and tick.code == self.contract.code
+        if _is_primary_tick and os.path.exists(_flag_path):
             from core.date_utils import is_day_session, is_night_session
             _now = datetime.now()
             if is_day_session(_now) or is_night_session(_now):
@@ -3904,18 +3921,146 @@ class FuturesMonitor:
             # Reset now happens in _apply_confirmed_futures_deal upon fill to prevent runaway re-entry loops.
 
 
+    def _resolve_entry_price(self, _flag: dict) -> tuple:
+        """5-tier price fallback chain for dry_run mode only (no Shioaji).
+        
+        2026-06-05 JVS Claw: Step 3 revised — dry_run-only fallback.
+        Paper and live modes receive real ticks via Shioaji — this is NOT called.
+        
+        Returns (price: float | None, source_label: str).
+        Tier 5 is a hard stop — caller must handle None by rejecting.
+        
+        Tiers:
+          1. LIVE_TICK: market_data with local_arrival_at < 5000ms
+          2. BAR_CLOSE: last completed 5m bar from _tick_bars_deque
+          3. FAR_BAR_CLOSE: current far-month bar from _far_current_bar
+          4. FLAG_ADVISORY: dashboard intent (near_close from flag)
+          5. None: all tiers exhausted
+        """
+        # Tier 1: Live tick (only if market_data has fresh local_arrival_at)
+        _live = self.market_data.get(self.ticker, {})
+        _close = _live.get("close")
+        _arrival = _live.get("local_arrival_at")
+        if _close and _close > 0 and _arrival:
+            _age = (time.time() - _arrival) * 1000
+            if _age <= 5000:
+                return (float(_close), "LIVE_TICK")
+        
+        # Tier 2: Last completed 5m bar
+        if hasattr(self, "_tick_bars_deque") and self._tick_bars_deque:
+            _last = self._tick_bars_deque[-1].get("close")
+            if _last and _last > 0:
+                return (float(_last), "BAR_CLOSE")
+        
+        # Tier 3: Current far-month bar
+        _far = self._far_current_bar.get("close")
+        if _far and _far > 0:
+            return (float(_far), "FAR_BAR_CLOSE")
+        
+        # Tier 4: Dashboard flag advisory
+        _dash = _flag.get("near_close")
+        if _dash and _dash > 0:
+            return (float(_dash), "FLAG_ADVISORY")
+        
+        # Tier 5: All tiers exhausted
+        return (None, "NO_PRICE_SOURCE")
+
     def _process_manual_trade_flag(self) -> bool:
-        """Consume /tmp/futures_manual_trade.flag if present."""
+        """Consume /tmp/futures_manual_trade.flag if present.
+        
+        2026-06-05 JVS Claw: NO_LIVE_TICK fix — full refactor of flag lifecycle.
+        
+        Atomic lifecycle (C1): rename → process → delete.
+        On crash: .processing file survives → startup recovery renames back.
+        
+        Validation pipeline:
+          C6: Schema validation (required keys)
+          C5: TTL expiry check (backward compat when created_at=None)
+          C2: Idempotency (md5 hash, excludes created_at)
+          C2: Active order guard (prevents duplicate submission)
+          C7: MAX_RETRIES guard (10 attempts max)
+        
+        Terminal statuses: delete .processing file.
+        Retryable statuses: keep .processing file for next tick.
+        """
         _flag_path = "/tmp/futures_manual_trade.flag"
+        _processing_path = _flag_path + ".processing"
         if not os.path.exists(_flag_path):
+            # 2026-06-05 JVS Claw: clean up stale .processing from crash
+            if os.path.exists(_processing_path):
+                os.remove(_processing_path)
             return False
-            
+
+        # ── C1: Atomic rename (flag → .processing) ──
+        # 2026-06-05 JVS Claw: prevents flag deletion before validation
+        try:
+            os.rename(_flag_path, _processing_path)
+        except OSError:
+            return False  # Another caller already took it
+
         try:
             self._manual_trade_status = "PROCESSING"
-            with open(_flag_path) as _f:
+            with open(_processing_path) as _f:
                 _flag = json.loads(_f.read())
-            os.remove(_flag_path)
             console.print(f"[bold magenta]🔬 [MANUAL_TRADE_FLAG] consumed path={_flag_path}[/bold magenta]")
+
+            # ── C6: Schema validation ──
+            # 2026-06-05 JVS Claw: reject malformed flags early (terminal)
+            _FLAG_REQUIRED = {"action"}
+            if not _FLAG_REQUIRED.issubset(_flag.keys()):
+                self._manual_trade_status = "FAILED: INVALID_FLAG_SCHEMA"
+                console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: Missing required keys (need {_FLAG_REQUIRED})[/red]")
+                os.remove(_processing_path)
+                return True
+
+            # ── C5: TTL check (backward compat: skip if created_at is None) ──
+            # 2026-06-05 JVS Claw: old dashboards that don't write created_at
+            # will pass through; new dashboards get TTL protection.
+            _TTL = int(self.cfg.get("mts", {}).get("flag_ttl_seconds", 3600))
+            _flag_created = _flag.get("created_at")
+            if _flag_created is not None and time.time() - _flag_created > _TTL:
+                self._manual_trade_status = "REJECTED: FLAG_EXPIRED"
+                console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: Flag expired (age={int(time.time() - _flag_created)}s > TTL={_TTL}s)[/red]")
+                os.remove(_processing_path)
+                return True
+
+            # ── C2: Idempotency — md5 hash from flag content (exclude created_at) ──
+            # 2026-06-05 JVS Claw: hash excludes created_at so repeated
+            # dashboard writes (user double-click) produce the same id.
+            # Set is in-memory only; after restart no orders exist → retry is safe.
+            _idempotent_flag = {k: v for k, v in _flag.items() if k != "created_at"}
+            _flag_id = hashlib.md5(json.dumps(_idempotent_flag, sort_keys=True).encode()).hexdigest()[:8]
+            if _flag_id in self._processed_flag_ids:
+                self._manual_trade_status = "SKIPPED: IDEMPOTENT"
+                console.print(f"[yellow]⏭️ [MANUAL_TRADE] Skipped: duplicate flag (id={_flag_id})[/yellow]")
+                os.remove(_processing_path)
+                return True
+            self._current_flag_id = _flag_id
+
+            # ── C7: MAX_RETRIES guard ──
+            # 2026-06-05 JVS Claw: prevents infinite retry loops.
+            # Counter resets on success or new flag.
+            _MAX_RETRIES = 10
+            if self._flag_retry_count >= _MAX_RETRIES:
+                self._manual_trade_status = "FAILED: MAX_RETRIES"
+                console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: exceeded max retries ({_MAX_RETRIES})[/red]")
+                os.remove(_processing_path)
+                self._flag_retry_count = 0
+                return True
+
+            # ── C2: Active order guard ──
+            # 2026-06-05 JVS Claw: prevents duplicate orders after hard crash
+            # (in-memory idempotency set is lost but broker still has pending orders).
+            # Uses Order.strategy (NOT strategy_id) per Order class line 87.
+            # active_orders is Dict[str, Order] → .values() to iterate.
+            if self.order_mgr and getattr(self.order_mgr, 'active_orders', None):
+                _existing = [o for o in self.order_mgr.active_orders.values()
+                             if getattr(o, 'strategy', '') == "MTS_MANUAL"]
+                if _existing:
+                    self._manual_trade_status = "SKIPPED: PENDING_ORDER_EXISTS"
+                    console.print(f"[yellow]⏭️ [MANUAL_TRADE] Skipped: order already in flight[/yellow]")
+                    os.remove(_processing_path)
+                    return True
             
             _action = _flag.get("action", "")
             if _action == "close_all":
@@ -4018,6 +4163,9 @@ class FuturesMonitor:
                 else:
                     self._manual_trade_status = "FAILED: NO_ORDER_MGR"
 
+                # 2026-06-05 JVS Claw: terminal — clean up .processing
+                if os.path.exists(_processing_path):
+                    os.remove(_processing_path)
                 self._manual_trade_status = "READY"
                 return True
 
@@ -4028,6 +4176,9 @@ class FuturesMonitor:
                 if self.trader.position != 0:
                     self._manual_trade_status = "FAILED: POS_EXIST"
                     console.print("[red]⛔ [MANUAL_TRADE] Rejected: Position already exists[/red]")
+                    # 2026-06-05 JVS Claw: terminal — delete .processing
+                    if os.path.exists(_processing_path):
+                        os.remove(_processing_path)
                     return True
 
                 # Live mode guard: reject if outside trading hours
@@ -4035,8 +4186,11 @@ class FuturesMonitor:
                     from core.date_utils import is_day_session, is_night_session
                     _now = datetime.now()
                     if not is_day_session(_now) and not is_night_session(_now):
-                        self._manual_trade_status = "FAILED: MKT_CLOSED"
-                        console.print("[red]⛔ [MANUAL_TRADE_FLAG] Live mode + market closed: rejected[/red]")
+                        self._manual_trade_status = "REJECTED: MKT_CLOSED"
+                        console.print("[red]⛔ [MANUAL_TRADE_FLAG] Live mode + market closed: rejected (retryable)[/red]")
+                        # 2026-06-05 JVS Claw: retryable — keep .processing,
+                        # do NOT increment retry count (market close ≠ processing failure).
+                        # TTL clock still ticks; flag may expire during close.
                         return True
 
                 _spread_side = _flag.get("side", "SELL_NEAR_BUY_FAR")
@@ -4049,32 +4203,54 @@ class FuturesMonitor:
                 _price_source = None
                 _tick_age_ms = -1
                 
-                _live_tick = self.market_data.get(self.ticker, {})
-                _price_raw = _live_tick.get("close")
-                _arrival_at = _live_tick.get("local_arrival_at")
-                
-                if _price_raw and _price_raw > 0 and _arrival_at:
-                    _tick_age_ms = (time.time() - _arrival_at) * 1000
-                    if _tick_age_ms <= _MAX_ENTRY_AGE_MS:
-                        _price = float(_price_raw)
-                        _price_source = "LIVE_TICK"
-                    else:
-                        self._manual_trade_status = f"REJECTED: STALE_TICK ({int(_tick_age_ms)}ms)"
-                        console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: Latest tick is stale ({int(_tick_age_ms)}ms > {_MAX_ENTRY_AGE_MS}ms)[/red]")
-                        
-                        # 2026-05-27 Gemini CLI: P3: Detailed rejection logging for observability
-                        self._append_mts_event("REJECTED_ENTRY", 
-                                              reason="STALE_TICK",
-                                              near_age_ms=int(_tick_age_ms),
-                                              far_age_ms=-1, # Unknown
-                                              max_allowed_age_ms=_MAX_ENTRY_AGE_MS,
-                                              ticker=self.ticker)
+                # 2026-06-05 JVS Claw: Step 3 revised — dry_run-only fallback chain.
+                # Paper and live modes BOTH connect to Shioaji (run_system dry_run=False)
+                # and receive real ticks. Only dry_run (unit tests, no Shioaji) needs fallback.
+                if self.dry_run:
+                    _price, _price_source = self._resolve_entry_price(_flag)
+                    if _price is None:
+                        self._manual_trade_status = "REJECTED: NO_PRICE_SOURCE"
+                        console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: All price tiers exhausted (dry_run)[/red]")
+                        # Retryable: keep .processing, increment retry count
+                        self._flag_retry_count += 1
+                        console.print(f"[dim]🔄 [MANUAL_TRADE] Retry {self._flag_retry_count}/10 (NO_PRICE_SOURCE)[/dim]")
                         return True
+                    # dry_run: price resolved from fallback, skip LIVE_TICK check below
+                else:
+                    # Live and paper: Shioaji connected, ticks arrive via on_tick()
+                    _live_tick = self.market_data.get(self.ticker, {})
+                    _price_raw = _live_tick.get("close")
+                    _arrival_at = _live_tick.get("local_arrival_at")
+                    
+                    if _price_raw and _price_raw > 0 and _arrival_at:
+                        _tick_age_ms = (time.time() - _arrival_at) * 1000
+                        if _tick_age_ms <= _MAX_ENTRY_AGE_MS:
+                            _price = float(_price_raw)
+                            _price_source = "LIVE_TICK"
+                        else:
+                            self._manual_trade_status = f"REJECTED: STALE_TICK ({int(_tick_age_ms)}ms)"
+                            console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: Latest tick is stale ({int(_tick_age_ms)}ms > {_MAX_ENTRY_AGE_MS}ms)[/red]")
+                            
+                            # 2026-05-27 Gemini CLI: P3: Detailed rejection logging for observability
+                            self._append_mts_event("REJECTED_ENTRY", 
+                                                  reason="STALE_TICK",
+                                                  near_age_ms=int(_tick_age_ms),
+                                                  far_age_ms=-1, # Unknown
+                                                  max_allowed_age_ms=_MAX_ENTRY_AGE_MS,
+                                                  ticker=self.ticker)
+                            # 2026-06-05 JVS Claw: retryable — keep .processing for next tick
+                            self._flag_retry_count += 1
+                            console.print(f"[dim]🔄 [MANUAL_TRADE] Retry {self._flag_retry_count}/10 (STALE_TICK)[/dim]")
+                            return True
 
-                if _price_source != "LIVE_TICK":
-                    self._manual_trade_status = "REJECTED: NO_LIVE_TICK"
-                    console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: No fresh LIVE_TICK available (Source={_price_source})[/red]")
-                    return True
+                    # 2026-06-05 JVS Claw: retryable — first tick hasn't arrived yet,
+                    # next tick populates market_data → succeeds
+                    if _price_source != "LIVE_TICK":
+                        self._manual_trade_status = "REJECTED: NO_LIVE_TICK"
+                        console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: No fresh LIVE_TICK available (Source={_price_source})[/red]")
+                        self._flag_retry_count += 1
+                        console.print(f"[dim]🔄 [MANUAL_TRADE] Retry {self._flag_retry_count}/10 (NO_LIVE_TICK)[/dim]")
+                        return True
 
                 # Dashboard hints are only for logging/sanity, not used for entry price
                 _dash_near = _flag.get("near_close")
@@ -4101,6 +4277,9 @@ class FuturesMonitor:
                 if _current_balance < _required_margin:
                     self._manual_trade_status = "FAILED: MARGIN"
                     console.print(f"[red]⛔ [MANUAL_TRADE] Margin insufficient: balance={_current_balance:.0f}[/red]")
+                    # 2026-06-05 JVS Claw: terminal — delete .processing
+                    if os.path.exists(_processing_path):
+                        os.remove(_processing_path)
                     return True
 
                 # ── Submit via order_mgr ──
@@ -4175,12 +4354,24 @@ class FuturesMonitor:
                         }
                         self._manual_trade_status = "SUBMITTED"
                         console.print(f"[bold cyan]⏳ [MANUAL_TRADE] Orders submitted: {_trade_id}. Waiting for fills...[/bold cyan]")
+                        # 2026-06-05 JVS Claw: terminal success — record idempotency, clean up
+                        if self._current_flag_id:
+                            self._processed_flag_ids.add(self._current_flag_id)
+                        if os.path.exists(_processing_path):
+                            os.remove(_processing_path)
+                        self._flag_retry_count = 0
                         return True
 
                     # Force fill in paper mode
                     # 2026-05-27 Gemini CLI: Removed redundant process_tick to prevent double-ordering loops
                     self._manual_trade_status = "FILLED"
                     console.print(f"[bold green]✅ [MANUAL_TRADE] Orders filled: {_trade_id} (src={_price_source})[/bold green]")
+                    # 2026-06-05 JVS Claw: terminal success — record idempotency, clean up
+                    if self._current_flag_id:
+                        self._processed_flag_ids.add(self._current_flag_id)
+                    if os.path.exists(_processing_path):
+                        os.remove(_processing_path)
+                    self._flag_retry_count = 0
 
                     # ── Sync strategy state (Immediately only for Paper Mode) ──
                     try:
@@ -4212,13 +4403,21 @@ class FuturesMonitor:
                 else:
                     self._manual_trade_status = "FAILED: NO_MGR"
                     console.print("[red]⚠️ [MANUAL_TRADE] order_mgr not available[/red]")
+                    # 2026-06-05 JVS Claw: terminal — delete .processing
+                    if os.path.exists(_processing_path):
+                        os.remove(_processing_path)
             return True
         except Exception as _e:
             self._manual_trade_status = f"ERROR: {str(_e)[:20]}"
             console.print(f"[red][MANUAL_TRADE_FLAG] Failed: {_e}[/red]")
-            if os.path.exists(_flag_path):
-                try: os.remove(_flag_path)
-                except Exception: pass
+            # 2026-06-05 JVS Claw: C1 crash recovery — rename .processing back
+            # to .flag so next tick can retry. Previous code deleted the flag
+            # permanently (os.remove), losing the trade request forever.
+            try:
+                if os.path.exists(_processing_path):
+                    os.rename(_processing_path, _flag_path)
+            except Exception:
+                pass
             return True
 
     def _check_mts_multi_leg_fill(self, order_id: str, fill_price: float):

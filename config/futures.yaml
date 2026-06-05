@@ -117,13 +117,13 @@ debug:
   tickbar: true
   feed: true
 mts:
-  enabled: false
+  enabled: true
   strategy: tmf_spread
   lots: 1
   params:
     min_atr: 10.0
-    atr_multiplier_stop: 0.5
-    atr_multiplier_trail: 1.0
+    atr_multiplier_stop: 2.0
+    atr_multiplier_trail: 3.5
     release_stop_points: 20
     trail_distance_points: 30
     atr_cap: 100.0

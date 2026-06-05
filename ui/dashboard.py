@@ -15,6 +15,7 @@ import json
 import yaml
 import datetime
 import os
+import time
 from core.date_utils import get_session_date_str, get_trade_day
 
 # ═══ Stock Name Mapping (fallback when CSV name column is missing) ═══
@@ -2352,7 +2353,11 @@ with tab_futures:
                         "action": "spread",
                         "side": _side,
                         "ts": datetime.datetime.now().isoformat(),
-                        "spread_z": _sz
+                        "spread_z": _sz,
+                        # 2026-06-05 JVS Claw: Step 5 — TTL + price advisory
+                        "created_at": time.time(),
+                        "near_close": float(last.get("close", 0)),
+                        "far_close": float(last.get("far_close", 0))
                     })
                     with open(_flag_path, "w") as _f:
                         _f.write(_flag)
@@ -2366,7 +2371,9 @@ with tab_futures:
                     _flag = json.dumps({
                         "action": "close_all",
                         "ts": datetime.datetime.now().isoformat(),
-                        "reason": "DASHBOARD_EMERGENCY"
+                        "reason": "DASHBOARD_EMERGENCY",
+                        # 2026-06-05 JVS Claw: Step 5 — TTL
+                        "created_at": time.time()
                     })
                     with open(_flag_path, "w") as _f:
                         _f.write(_flag)
@@ -3096,7 +3103,8 @@ with tab_futures:
                 _os1, _os2, _os3, _os4 = st.columns(4)
                 _os1.metric("Command", _cmd_status)
                 _os2.metric("MTS Status", _manual_status)
-                _os3.metric("Trade ID", _mts_state.get("trade_id", "—")[-6:])
+                _trade_id = _mts_state.get("trade_id")
+                _os3.metric("Trade ID", _trade_id[-6:] if _trade_id else "—")
                 _os4.metric("Sync Time", _mts_state.get("_updated", "?")[-8:] if _mts_state.get("_updated") else "?")
                 
                 # Metric row 2: Specific Manual Order Details
@@ -3447,7 +3455,11 @@ with tab_options:
                     if bid > 0 and ask > 0:
                         live_premium = (bid + ask) / 2
                     else:
-                        live_premium = float(last_row.get("Close", last_row.get("close", 0)))
+                        # 💡 [Fixed 2026-06-02] Do NOT use 'Close' or 'close' as fallback, 
+                        # because in the indicators CSV they represent the underlying MTX spot price,
+                        # not the option premium. This causes massive PnL hallucinations.
+                        # Setting to 0.0 forces the system to use Black-Scholes theoretical pricing.
+                        live_premium = 0.0
 
                 df_orders = pd.DataFrame(orders_data)
                 open_option_for_orders = find_latest_open_options_position(ol)
@@ -3682,11 +3694,17 @@ with tab_stocks:
                 else:
                     dist_label = "—%"
 
+                # 2026-05-31 Gemini CLI: Extract ATR (10) and calculate ATR (%)
+                atr_10 = float(last.get("atr_10", 0) or 0)
+                atr_pct = (atr_10 / close * 100) if close > 0 else 0
+
                 monitor_data.append({
                     "代號": ticker,
                     "名稱": last.get("name", "Unknown"),
                     "股價": f"{close:.2f}",
                     "成交量": f"{vol:,}",
+                    "ATR (10)": f"{atr_10:.2f}",  # 2026-05-31 Gemini CLI: Added ATR(10) column
+                    "ATR (%)": f"{atr_pct:.2f}%",  # 2026-05-31 Gemini CLI: Added ATR% column
                     "動能": momentum_label,
                     "VWAP偏離": f"{price_vs_vwap:+.2f}%",
                     "VWAPσ": vwap_sigma_label,

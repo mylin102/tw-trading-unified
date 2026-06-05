@@ -2,16 +2,31 @@
 
 ## Overview
 
-Milestone v1.1 hardens execution reliability in four behavior-safe steps: first the shared lifecycle contract for futures/options paper/live execution, then broker reconciliation and restart recovery, then minimal operator visibility on the 8500 dashboard, and finally V-model validation that proves the refactor preserves the current runtime path. This keeps `main.py` and the existing dashboard stable while broker-truth execution state becomes recoverable and test-locked.
+Milestone v1.2 focuses on adaptive strategy optimization, specifically transforming the `tmf_spread` strategy into a volatility-adaptive system. Milestone v1.1 hardens execution reliability across futures/options lifecycle, reconciliation, and dashboard visibility.
 
 ## Phases
 
-- [ ] **Phase 1: Lifecycle Truth Contract** - Normalize futures/options paper/live execution around linked intent, order, and deal records.
-- [ ] **Phase 2: Broker Reconciliation & Restart Recovery** - Rebuild broker-truth state after callback gaps or process restarts without duplicate execution.
-- [ ] **Phase 3: Operator Lifecycle Visibility** - Expose lifecycle truth in dashboard views without redesigning the dashboard.
-- [ ] **Phase 4: V-Model Validation & Runtime Hardening** - Lock the lifecycle redesign with regression proof and runtime compatibility checks.
+- [ ] **Phase 12-1: ATR Adaptive Verification (v1.2)** - Finalize and verify ATR-based improvements for `tmf_spread` with comprehensive tests and dashboard visibility.
+- [ ] **Phase 1: Lifecycle Truth Contract (v1.1)** - Normalize futures/options paper/live execution around linked intent, order, and deal records.
+- [ ] **Phase 2: Broker Reconciliation & Restart Recovery (v1.1)** - Rebuild broker-truth state after callback gaps or process restarts without duplicate execution.
+- [ ] **Phase 3: Operator Lifecycle Visibility (v1.1)** - Expose lifecycle truth in dashboard views without redesigning the dashboard.
+- [ ] **Phase 4: V-Model Validation & Runtime Hardening (v1.1)** - Lock the lifecycle redesign with regression proof and runtime compatibility checks.
 
 ## Phase Details
+
+### Phase 12-1: ATR Adaptive Verification
+**Goal**: TMF spread strategy successfully adapts its entry, stop, and trail logic to market volatility (ATR) with verified correctness and operator visibility.
+**Depends on**: Nothing (parallel to v1.1 hardening)
+**Requirements**: ADAPT-01, ADAPT-02, ADAPT-03, VMDL-01, VIEW-02
+**Success Criteria** (what must be TRUE):
+  1. Strategy skips entry in low-volatility environments based on `min_atr` gate.
+  2. Release stops and trailing exits scale dynamically with ATR using configured multipliers.
+  3. Dynamic thresholds are visible to operators in the MTS dashboard via state JSON.
+  4. 100% coverage of adaptive logic in unit tests, including safety floors (5pt/10pt).
+**Plans**: 1 plan
+
+Plans:
+- [ ] PHASE-1-VERIFICATION.md — Lock adaptive config, implement ATR unit tests, and verify dashboard visibility
 
 ### Phase 1: Lifecycle Truth Contract
 **Goal**: Futures/options paper/live execution uses one lifecycle model where intent, order, and deal truth stay linked and positions update only from confirmed deals.
@@ -24,9 +39,9 @@ Milestone v1.1 hardens execution reliability in four behavior-safe steps: first 
 **Plans**: 3 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Define traceable lifecycle IDs and compatibility exports across shared order/fill contracts
-- [ ] 01-02-PLAN.md — Separate order-state transitions from deal-driven fill truth in the shared manager and options callback path
-- [ ] 01-03-PLAN.md — Anchor futures position and cost-basis updates to confirmed deal handling and `PaperTrader.position`
+- [x] 01-01-PLAN.md — Define traceable lifecycle IDs and compatibility exports across shared order/fill contracts
+- [x] 01-02-PLAN.md — Separate order-state transitions from deal-driven fill truth in the shared manager and options callback path
+- [x] 01-03-PLAN.md — Anchor futures position and cost-basis updates to confirmed deal handling and `PaperTrader.position`
 
 ### Phase 2: Broker Reconciliation & Restart Recovery
 **Goal**: The system can rebuild broker-truth lifecycle state after callback gaps or restarts without re-submitting or losing active execution.
@@ -79,10 +94,12 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Lifecycle Truth Contract | 0/3 | Not started | - |
-| 2. Broker Reconciliation & Restart Recovery | 0/3 | Not started | - |
-| 3. Operator Lifecycle Visibility | 0/3 | Not started | - |
-| 4. V-Model Validation & Runtime Hardening | 0/2 | Not started | - |
+| 12-1. ATR Verification | 0/1 | In Progress | - |
+| 1. Lifecycle Truth Contract | 3/3 | Complete | 2026-04-21 |
+| 2. Broker Reconciliation | 0/3 | Not started | - |
+| 3. Operator Visibility | 0/3 | Not started | - |
+| 4. V-Model Validation | 0/2 | Not started | - |
+| 1000. Live Theta Combo | 5/5 | Complete | 2026-04-21 |
 
 ## Backlog
 
@@ -108,8 +125,8 @@ Plans:
 **Plans:** 5/5 plans complete
 
 Plans:
-- [ ] 1000-01-PLAN.md — Add combo-order adapter and lifecycle contract support for broker-truth theta spreads
-- [ ] 1000-02-PLAN.md — Submit truthful live theta vertical spreads and gate unsupported live theta strategies
-- [ ] 1000-03-PLAN.md — Reconcile combo fills and restart recovery from broker combo APIs before any ledger fallback
-- [ ] 1000-04-PLAN.md — Expose broker combo versus paper/ledger truth clearly in dashboard theta/order surfaces
-- [ ] 1000-05-PLAN.md — Lock the combo path with V-model regressions and startup/dashboard smoke coverage
+- [x] 1000-01-PLAN.md — Add combo-order adapter and lifecycle contract support for broker-truth theta spreads
+- [x] 1000-02-PLAN.md — Submit truthful live theta vertical spreads and gate unsupported live theta strategies
+- [x] 1000-03-PLAN.md — Reconcile combo fills and restart recovery from broker combo APIs before any ledger fallback
+- [x] 1000-04-PLAN.md — Expose broker combo versus paper/ledger truth clearly in dashboard theta/order surfaces
+- [x] 1000-05-PLAN.md — Lock the combo path with V-model regressions and startup/dashboard smoke coverage
