@@ -4285,8 +4285,6 @@ class FuturesMonitor:
                 # ── Submit via order_mgr ──
                 if self.order_mgr:
                     from core.order_management.order import OrderType, OrderSide
-                    _TICK = 1.0  # MXF tick size
-                    _ENTRY_BUFFER = 4   # ticks
                     if _spread_side == "SELL_NEAR_BUY_FAR":
                         _near_side, _far_side = OrderSide.SELL, OrderSide.BUY
                         _near_label, _far_label = "SHORT", "LONG"
@@ -4303,31 +4301,31 @@ class FuturesMonitor:
                             "strategy": "MTS_MANUAL", "price_source": _price_source
                         }
 
-                    _near_mkt = _near + _ENTRY_BUFFER * _TICK if _near_side == OrderSide.BUY else _near - _ENTRY_BUFFER * _TICK
-                    _far_mkt = _far + _ENTRY_BUFFER * _TICK if _far_side == OrderSide.BUY else _far - _ENTRY_BUFFER * _TICK
+                    # 2026-06-08 JVS Claw: Use MKP (Range Market) via OrderType.MARKET
+                    # Same pattern as _submit_mts_order_signal() ENTRY/RELEASE orders.
+                    # MKP guarantees immediate fill at market price, no LIMIT buffer needed.
+                    console.print(f"[yellow]📝 [MANUAL_TRADE] NEAR={_near_side} ref={_near:.1f} (MKP) src={_price_source}[/yellow]")
+                    console.print(f"[yellow]📝 [MANUAL_TRADE] FAR={_far_side} ref={_far:.1f} (MKP) src={_price_source}[/yellow]")
                     
-                    console.print(f"[yellow]📝 [MANUAL_TRADE] NEAR={_near_side} ref={_near:.1f} mkt={_near_mkt:.1f} src={_price_source}[/yellow]")
-                    console.print(f"[yellow]📝 [MANUAL_TRADE] FAR={_far_side} ref={_far:.1f} mkt={_far_mkt:.1f} src={_price_source}[/yellow]")
-                    
-                    _near_order = self.order_mgr.create_order(symbol=f"{self.ticker}_NEAR", side=_near_side, order_type=OrderType.LIMIT, quantity=1, price=_near_mkt, strategy="MTS_MANUAL")
+                    _near_order = self.order_mgr.create_order(symbol=f"{self.ticker}_NEAR", side=_near_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_MANUAL")
                     self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_near_order))
                     self._pending_lifecycle_orders[_near_order.order_id] = {
                         "intent_id": _near_order.intent_id,
                         "signal": "BUY" if _near_side == OrderSide.BUY else "SELL",
                         "reason": "MTS_MANUAL", "ts": _ts, "lots": 1,
-                        "stop_loss": 20, "price": _near_mkt
+                        "stop_loss": 20, "price": _near
                     }
                     self.order_mgr.submit(_near_order)
                     if self.paper_fill_sim:
                         self.paper_fill_sim.register(_near_order)
 
-                    _far_order = self.order_mgr.create_order(symbol=f"{self.ticker}_FAR", side=_far_side, order_type=OrderType.LIMIT, quantity=1, price=_far_mkt, strategy="MTS_MANUAL")
+                    _far_order = self.order_mgr.create_order(symbol=f"{self.ticker}_FAR", side=_far_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_MANUAL")
                     self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_far_order))
                     self._pending_lifecycle_orders[_far_order.order_id] = {
                         "intent_id": _far_order.intent_id,
                         "signal": "BUY" if _far_side == OrderSide.BUY else "SELL",
                         "reason": "MTS_MANUAL", "ts": _ts, "lots": 1,
-                        "stop_loss": 20, "price": _far_mkt
+                        "stop_loss": 20, "price": _far
                     }
                     self.order_mgr.submit(_far_order)
                     if self.paper_fill_sim:
@@ -4364,11 +4362,9 @@ class FuturesMonitor:
                         self._flag_retry_count = 0
                         return True
 
-                    # 2026-06-05 JVS Claw: Bug fix — force immediate fill via synthetic tick.
-                    # 2026-06-08 JVS Claw: Fix price — use live market price (_near/_far),
-                    # NOT the buffered limit price (_near_mkt/_far_mkt). The entry buffer
-                    # pushes the synthetic tick AWAY from the limit, preventing fill.
-                    # Correct pattern (from _submit_mts_order_signal): use actual close prices.
+                    # 2026-06-08 JVS Claw: Force immediate fill via synthetic tick (paper mode).
+                    # MKP (Market with Protection) orders fill at market price immediately.
+                    # Use live close prices (_near/_far) for synthetic tick.
                     if self.paper_fill_sim:
                         self.paper_fill_sim.process_tick(
                             self._make_synthetic_tick(_near, _ts, symbol=_near_order.symbol))
