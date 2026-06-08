@@ -4333,25 +4333,27 @@ class FuturesMonitor:
                     if self.paper_fill_sim:
                         self.paper_fill_sim.register(_far_order)
 
-                    # [Deferred Sync] In live mode, wait for confirmed fills
+                    # 2026-06-05 JVS Claw: Bug fix — populate _mts_pending_fills for BOTH modes
+                    # so _check_mts_multi_leg_fill() can set FILLED correctly via on_fill callback.
+                    self._mts_pending_fills[_trade_id] = {
+                        "near_order_id": _near_order.order_id,
+                        "far_order_id": _far_order.order_id,
+                        "near_filled": False,
+                        "far_filled": False,
+                        "side": "SHORT" if _spread_side == "SELL_NEAR_BUY_FAR" else "LONG",
+                        "spread_side": _spread_side,
+                        "near_label": _near_label,
+                        "far_label": _far_label,
+                        "near_ref": _near,
+                        "far_ref": _far,
+                        "price_source": _price_source,
+                        "ts": _ts,
+                        "near_price_source": _price_source,
+                        "near_tick_age_ms": _tick_age_ms,
+                    }
+
                     if self.live_trading and not self.dry_run:
-                        self._mts_pending_fills[_trade_id] = {
-                            "near_order_id": _near_order.order_id,
-                            "far_order_id": _far_order.order_id,
-                            "near_filled": False,
-                            "far_filled": False,
-                            "side": "SHORT" if _spread_side == "SELL_NEAR_BUY_FAR" else "LONG",
-                            "spread_side": _spread_side,
-                            "near_label": _near_label,
-                            "far_label": _far_label,
-                            "near_ref": _near,
-                            "far_ref": _far,
-                            "price_source": _price_source,
-                            "ts": _ts,
-                            # 2026-05-27 Gemini CLI: Store snapshot metadata for deferred sync
-                            "near_price_source": _price_source,
-                            "near_tick_age_ms": _tick_age_ms
-                        }
+                        # Live mode: wait for broker fills
                         self._manual_trade_status = "SUBMITTED"
                         console.print(f"[bold cyan]⏳ [MANUAL_TRADE] Orders submitted: {_trade_id}. Waiting for fills...[/bold cyan]")
                         # 2026-06-05 JVS Claw: terminal success — record idempotency, clean up
@@ -4362,10 +4364,25 @@ class FuturesMonitor:
                         self._flag_retry_count = 0
                         return True
 
-                    # Force fill in paper mode
-                    # 2026-05-27 Gemini CLI: Removed redundant process_tick to prevent double-ordering loops
-                    self._manual_trade_status = "FILLED"
-                    console.print(f"[bold green]✅ [MANUAL_TRADE] Orders filled: {_trade_id} (src={_price_source})[/bold green]")
+                    # 2026-06-05 JVS Claw: Bug fix — force immediate fill via synthetic tick.
+                    # 2026-06-08 JVS Claw: Fix price — use live market price (_near/_far),
+                    # NOT the buffered limit price (_near_mkt/_far_mkt). The entry buffer
+                    # pushes the synthetic tick AWAY from the limit, preventing fill.
+                    # Correct pattern (from _submit_mts_order_signal): use actual close prices.
+                    if self.paper_fill_sim:
+                        self.paper_fill_sim.process_tick(
+                            self._make_synthetic_tick(_near, _ts, symbol=_near_order.symbol))
+                        self.paper_fill_sim.process_tick(
+                            self._make_synthetic_tick(_far, _ts, symbol=_far_order.symbol))
+
+                    # Status will be set to FILLED by _check_mts_multi_leg_fill() via on_fill callback.
+                    # If fills didn't trigger (edge case), fall back to SUBMITTED.
+                    if self._manual_trade_status != "FILLED":
+                        self._manual_trade_status = "SUBMITTED"
+                        console.print(f"[yellow]⏳ [MANUAL_TRADE] Orders submitted: {_trade_id}. Pending paper fill...[/yellow]")
+                    else:
+                        console.print(f"[bold green]✅ [MANUAL_TRADE] Orders filled: {_trade_id} (src={_price_source})[/bold green]")
+
                     # 2026-06-05 JVS Claw: terminal success — record idempotency, clean up
                     if self._current_flag_id:
                         self._processed_flag_ids.add(self._current_flag_id)
