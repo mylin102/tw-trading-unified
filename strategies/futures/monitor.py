@@ -4344,11 +4344,13 @@ class FuturesMonitor:
                     
                     _near_order = self.order_mgr.create_order(symbol=f"{self.ticker}_NEAR", side=_near_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_MANUAL")
                     self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_near_order))
+                    # 2026-06-08 JVS Claw: Add trade_id for watchdog partial fill detection
                     self._pending_lifecycle_orders[_near_order.order_id] = {
                         "intent_id": _near_order.intent_id,
                         "signal": "BUY" if _near_side == OrderSide.BUY else "SELL",
                         "reason": "MTS_MANUAL", "ts": _ts, "lots": 1,
-                        "stop_loss": 20, "price": _near
+                        "stop_loss": 20, "price": _near,
+                        "trade_id": _trade_id
                     }
                     self.order_mgr.submit(_near_order)
                     if self.paper_fill_sim:
@@ -4357,11 +4359,13 @@ class FuturesMonitor:
                     # 2026-06-08 JVS Claw: MKP (範圍市價)
                     _far_order = self.order_mgr.create_order(symbol=f"{self.ticker}_FAR", side=_far_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_MANUAL")
                     self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_far_order))
+                    # 2026-06-08 JVS Claw: Add trade_id for watchdog partial fill detection
                     self._pending_lifecycle_orders[_far_order.order_id] = {
                         "intent_id": _far_order.intent_id,
                         "signal": "BUY" if _far_side == OrderSide.BUY else "SELL",
                         "reason": "MTS_MANUAL", "ts": _ts, "lots": 1,
-                        "stop_loss": 20, "price": _far
+                        "stop_loss": 20, "price": _far,
+                        "trade_id": _trade_id
                     }
                     self.order_mgr.submit(_far_order)
                     if self.paper_fill_sim:
