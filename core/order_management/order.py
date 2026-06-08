@@ -26,10 +26,13 @@ class OrderStatus(Enum):
 
 class OrderType(Enum):
     """委託單類型枚舉"""
-    MARKET = "market"            # 市價單
-    LIMIT = "limit"              # 限價單
+    MARKET = "market"            # 市價單 (MKT)
+    LIMIT = "limit"              # 限價單 (LMT)
     STOP = "stop"                # 停損單
     STOP_LIMIT = "stop_limit"    # 停損限價單
+    # 2026-06-08 JVS Claw: MKP (Market with Protection) — 範圍市價單
+    # 以市價送單但有限價保護，避免 MKT 滑價過大，同時避免 LMT 無法成交
+    MKP = "mkp"                  # 範圍市價單 (MKP)
 
 
 class OrderSide(Enum):

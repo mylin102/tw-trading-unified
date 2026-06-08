@@ -2658,8 +2658,8 @@ class FuturesMonitor:
             if _released == "near":
                 _side = OrderSide.BUY if getattr(strategy, "_near_side") == "SHORT" else OrderSide.SELL
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_NEAR: {_side} (MKP Range Market)[/yellow]")
-                # 💡 [Fixed 2026-05-27] Use MKP (Range Market) via OrderType.MARKET
-                _order = self.order_mgr.create_order(symbol=_near_code, side=_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_RELEASE")
+                # 2026-06-08 JVS Claw: Use MKP (範圍市價) instead of MARKET — 避免滑價
+                _order = self.order_mgr.create_order(symbol=_near_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
                 self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _snap["near"]})
                 
                 # [GSD] Track in lifecycle orders so fill is not ignored
@@ -2680,8 +2680,8 @@ class FuturesMonitor:
             elif _released == "far":
                 _side = OrderSide.BUY if getattr(strategy, "_far_side") == "SHORT" else OrderSide.SELL
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_FAR: {_side} (MKP Range Market)[/yellow]")
-                # 💡 [Fixed 2026-05-27] Use MKP (Range Market) via OrderType.MARKET
-                _order = self.order_mgr.create_order(symbol=_far_code, side=_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_RELEASE")
+                # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
+                _order = self.order_mgr.create_order(symbol=_far_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
                 self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _snap["far"]})
                 
                 # [GSD] Track in lifecycle orders so fill is not ignored
@@ -2722,8 +2722,8 @@ class FuturesMonitor:
             
             if _remaining_side:
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting EXIT for {_leg_label}: {_side} (MKP Range Market)[/yellow]")
-                # 💡 [Fixed 2026-05-27] Use MKP (Range Market) via OrderType.MARKET
-                _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_EXIT")
+                # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
+                _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_EXIT")
                 self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _ref_ohlc})
                 
                 # [GSD] Track in lifecycle orders so fill is not ignored
@@ -2752,8 +2752,8 @@ class FuturesMonitor:
 
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting ENTRY orders (MKP Range Market): NEAR={_near_side}, FAR={_far_side}[/yellow]")
             
-            # 💡 [Fixed 2026-05-27] Use MKP (Range Market) via OrderType.MARKET
-            _o_near = self.order_mgr.create_order(symbol=_near_code, side=_near_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_ENTRY")
+            # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
+            _o_near = self.order_mgr.create_order(symbol=_near_code, side=_near_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_ENTRY")
             self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_o_near), "ref_ohlc": _snap["near"]})
             
             # [GSD] Track in lifecycle orders so fill is not ignored
@@ -2768,8 +2768,8 @@ class FuturesMonitor:
                 # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
                 self.paper_fill_sim.process_tick(self._make_synthetic_tick(_near_close, _ts, symbol=_near_code))
 
-            # 💡 [Fixed 2026-05-27] Use MKP (Range Market) via OrderType.MARKET
-            _o_far = self.order_mgr.create_order(symbol=_far_code, side=_far_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_ENTRY")
+            # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
+            _o_far = self.order_mgr.create_order(symbol=_far_code, side=_far_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_ENTRY")
             self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_o_far), "ref_ohlc": _snap["far"]})
             
             # [GSD] Track in lifecycle orders so fill is not ignored
@@ -3691,23 +3691,49 @@ class FuturesMonitor:
 
         now_dt = datetime.now()
         
-        # 1.1 Pending Order Timeout (15s)
-        _ORDER_TIMEOUT = 15
+        # 1.1 Pending Order Timeout
+        # 2026-06-08 JVS Claw: Extended timeout coverage for all MTS order types.
+        # EXIT/RELEASE: 15s (urgent — need to close position quickly)
+        # ENTRY/MANUAL: 30s (single leg) or 60s (one leg filled, waiting for other)
         to_resubmit = []
+        to_cancel_notify = []  # Orders to cancel + notify user (ENTRY/MANUAL)
         for order_id, meta in list(self._pending_lifecycle_orders.items()):
             _strat_label = meta.get("strategy") or ""
-            if "MTS_EXIT" not in _strat_label and "MTS_RELEASE" not in _strat_label:
+            _is_exit = "MTS_EXIT" in _strat_label or "MTS_RELEASE" in _strat_label
+            _is_entry = "MTS_ENTRY" in _strat_label or "MTS_MANUAL" in _strat_label
+            if not _is_exit and not _is_entry:
                 continue
             if order_id in self._mts_stale_order_cancels:
                 continue
 
             _submit_ts = meta.get("ts")
-            if _submit_ts and (now_dt - _submit_ts).total_seconds() > _ORDER_TIMEOUT:
+            if not _submit_ts:
+                continue
+
+            age_secs = (now_dt - _submit_ts).total_seconds()
+
+            # Determine timeout based on order type and partial fill status
+            if _is_exit:
+                _timeout = 15
+            else:
+                # Check if the other leg of the same trade is already filled
+                _trade_id = meta.get("trade_id")
+                _has_partial = False
+                if _trade_id and _trade_id in self._mts_pending_fills:
+                    _fill_data = self._mts_pending_fills[_trade_id]
+                    _has_partial = _fill_data.get("near_filled", False) or _fill_data.get("far_filled", False)
+                _timeout = 60 if _has_partial else 30
+
+            if age_secs > _timeout:
                 order = self.order_mgr.get_order(order_id)
                 from core.order_management.order import OrderStatus
                 if order and order.status in (OrderStatus.PENDING_SUBMIT, OrderStatus.SUBMITTED):
-                    console.print(f"[bold yellow]⚠️ [WATCHDOG] MTS Order {order_id} hanging >{_ORDER_TIMEOUT}s. Cancelling...[/bold yellow]")
-                    to_resubmit.append(order_id)
+                    if _is_exit:
+                        console.print(f"[bold yellow]⚠️ [WATCHDOG] MTS Order {order_id} hanging >{_timeout}s. Cancelling...[/bold yellow]")
+                        to_resubmit.append(order_id)
+                    else:
+                        console.print(f"[bold red]🚨 [WATCHDOG] MTS Order {order_id} timeout >{_timeout}s. Cancelling and notifying...[/bold red]")
+                        to_cancel_notify.append(order_id)
 
         for order_id in to_resubmit:
             try:
@@ -3715,6 +3741,17 @@ class FuturesMonitor:
                 self.order_mgr.cancel(order_id)
             except Exception as e:
                 console.print(f"[red]❌ [WATCHDOG] Stale order cancel failed: {e}[/red]")
+
+        # 2026-06-08 JVS Claw: Cancel + notify for ENTRY/MANUAL timeouts
+        for order_id in to_cancel_notify:
+            try:
+                self._mts_stale_order_cancels.add(order_id)
+                self.order_mgr.cancel(order_id)
+                self._manual_trade_status = f"FAILED: ORDER_TIMEOUT ({order_id})"
+                self._append_mts_event("ORDER_TIMEOUT", order_id=order_id)
+                console.print(f"[bold red]🚨 [MTS_TIMEOUT] Order {order_id} cancelled — exceeded 30/60s timeout[/bold red]")
+            except Exception as e:
+                console.print(f"[red]❌ [WATCHDOG] Entry timeout cancel failed: {e}[/red]")
 
         # 1.2 EXITING State Lock (15s)
         _lifecycle = getattr(strategy, "_lifecycle", "FLAT")
@@ -4301,13 +4338,11 @@ class FuturesMonitor:
                             "strategy": "MTS_MANUAL", "price_source": _price_source
                         }
 
-                    # 2026-06-08 JVS Claw: Use MKP (Range Market) via OrderType.MARKET
-                    # Same pattern as _submit_mts_order_signal() ENTRY/RELEASE orders.
-                    # MKP guarantees immediate fill at market price, no LIMIT buffer needed.
+                    # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免 MKT 滑價 + LMT 卡單
                     console.print(f"[yellow]📝 [MANUAL_TRADE] NEAR={_near_side} ref={_near:.1f} (MKP) src={_price_source}[/yellow]")
                     console.print(f"[yellow]📝 [MANUAL_TRADE] FAR={_far_side} ref={_far:.1f} (MKP) src={_price_source}[/yellow]")
                     
-                    _near_order = self.order_mgr.create_order(symbol=f"{self.ticker}_NEAR", side=_near_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_MANUAL")
+                    _near_order = self.order_mgr.create_order(symbol=f"{self.ticker}_NEAR", side=_near_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_MANUAL")
                     self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_near_order))
                     self._pending_lifecycle_orders[_near_order.order_id] = {
                         "intent_id": _near_order.intent_id,
@@ -4319,7 +4354,8 @@ class FuturesMonitor:
                     if self.paper_fill_sim:
                         self.paper_fill_sim.register(_near_order)
 
-                    _far_order = self.order_mgr.create_order(symbol=f"{self.ticker}_FAR", side=_far_side, order_type=OrderType.MARKET, quantity=1, strategy="MTS_MANUAL")
+                    # 2026-06-08 JVS Claw: MKP (範圍市價)
+                    _far_order = self.order_mgr.create_order(symbol=f"{self.ticker}_FAR", side=_far_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_MANUAL")
                     self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_far_order))
                     self._pending_lifecycle_orders[_far_order.order_id] = {
                         "intent_id": _far_order.intent_id,

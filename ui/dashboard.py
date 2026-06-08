@@ -2902,11 +2902,13 @@ with tab_futures:
                     "rejected": "❌ 已退單",
                     "expired": "⏰ 已過期",
                 }
+                # 2026-06-08 JVS Claw: Added MKP (範圍市價)
                 type_map = {
                     "market": "市價",
                     "limit": "限價",
                     "stop": "停損",
                     "stop_limit": "停損限價",
+                    "mkp": "範圍市價",
                 }
 
                 # Display columns
@@ -3485,7 +3487,8 @@ with tab_options:
                     df_orders["方向"] = df_orders["side"].map({"buy": "買入", "sell": "賣出"})
                     display_cols.append("方向")
                 if "order_type" in df_orders.columns:
-                    type_map_opt = {"market": "市價", "limit": "限價", "stop": "停損", "stop_limit": "停損限價"}
+                    # 2026-06-08 JVS Claw: Added MKP (範圍市價)
+                    type_map_opt = {"market": "市價", "limit": "限價", "stop": "停損", "stop_limit": "停損限價", "mkp": "範圍市價"}
                     df_orders["委託類型"] = df_orders["order_type"].map(type_map_opt).fillna(df_orders["order_type"])
                     display_cols.append("委託類型")
                 if "quantity" in df_orders.columns:
@@ -3913,10 +3916,15 @@ with tab_stocks:
                 order_type = order.get("order_type", "LMT")  # Default to LMT
                 
                 # Map order type to Chinese
+                # 2026-06-08 JVS Claw: Added MKP (範圍市價)
                 order_type_map = {
                     "LMT": "限價單",
                     "MKT": "市價單",
-                    "MKT_RANGE": "範圍市價單"
+                    "MKP": "範圍市價單",
+                    "MKT_RANGE": "範圍市價單",
+                    "mkp": "範圍市價單",
+                    "market": "市價單",
+                    "limit": "限價單",
                 }
                 order_type_display = order_type_map.get(order_type, order_type)
 

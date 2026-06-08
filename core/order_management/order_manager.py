@@ -449,6 +449,16 @@ class OrderManager:
         if self.broker_adapter is None:
             raise RuntimeError("Live mode requires broker_adapter")
 
+        # 2026-06-08 JVS Claw: MKP (範圍市價) translation for Shioaji broker.
+        # Shioaji uses two dimensions: price_type (LMT/MKT/MKP) + order_type (ROD/IOC/FOK).
+        # MKP requires IOC or FOK (not ROD). price=0 signals MKP/MKT to ShioajiClient.
+        # Mapping:
+        #   OrderType.MKP    → price=0, price_type=MKP, order_type=IOC
+        #   OrderType.MARKET → price=0, price_type=MKT, order_type=IOC
+        #   OrderType.LIMIT  → price=N, price_type=LMT, order_type=ROD
+        if order.order_type == OrderType.MKP:
+            order.price = 0  # MKP ignores price; ShioajiClient detects price==0 → MKP
+
         # [GSD] Compatibility bridge for ShioajiClient object-based placement
         if hasattr(self.broker_adapter, "place_order_object"):
             result = self.broker_adapter.place_order_object(order)

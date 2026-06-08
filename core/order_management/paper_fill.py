@@ -77,6 +77,10 @@ class PaperFillSimulator:
                 # 市價單：以 close 成交
                 fill_price = float(tick.close)
 
+            # 2026-06-08 JVS Claw: MKP (範圍市價) — 同 MARKET 邏輯，以 close 成交
+            elif order.order_type == OrderType.MKP:
+                fill_price = float(tick.close)
+
             elif order.order_type == OrderType.LIMIT and order.price is not None:
                 # 限價單：檢查價格是否穿過限價
                 low = float(tick.low)
