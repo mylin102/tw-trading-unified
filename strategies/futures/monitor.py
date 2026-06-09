@@ -3607,9 +3607,9 @@ class FuturesMonitor:
             _n_side = getattr(strategy, "_near_side", None) or existing.get("near_side")
             _f_side = getattr(strategy, "_far_side", None) or existing.get("far_side")
             
-            # Use last known prices
-            _n_last = float(existing.get("near_last", 0))
-            _f_last = float(existing.get("far_last", 0))
+            # 2026-06-09 JVS Claw: Read latest prices from market_data, fallback to existing
+            _n_last = float(self.market_data.get(self.ticker, {}).get("close", 0)) or float(existing.get("near_last", 0))
+            _f_last = float(self.market_data.get(f"{self.ticker}_FAR", {}).get("close", 0)) or float(self._far_current_bar.get("close", 0)) or float(existing.get("far_last", 0))
             
             # 2026-05-27 Gemini CLI: Use dynamic multiplier from constants instead of hardcoded 10.0
             _mult = float(get_point_value(self.ticker))
