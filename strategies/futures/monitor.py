@@ -1973,12 +1973,20 @@ class FuturesMonitor:
                          _mts_strat.sync_release(leg=_leg, price=price)
                          console.print(f"[bold green]✅ [MTS_SYNC] Release CONFIRMED: {event.order_id} ({_leg})[/bold green]")
 
-                 # 💡 [Fixed 2026-05-27] Update directional trader position for the NEAR leg
+                 # 2026-06-09 JVS Claw: Fix symbol matching for NEAR/FAR legs
+                 # Update directional trader position for spread legs.
                  # This prevents GHOST_POSITION errors in the watchdog.
-                 if self.contract and event.symbol == self.contract.code:
+                 # Match both exact contract code AND NEAR/FAR suffix patterns.
+                 _symbol = str(event.symbol or "")
+                 _contract_code = self.contract.code if self.contract else ""
+                 _is_near_leg = "NEAR" in _symbol or _symbol == _contract_code
+                 _is_far_leg = "FAR" in _symbol
+                 
+                 if _is_near_leg:
+                     # NEAR leg: use signal direction directly
                      _mkt_action = "Buy" if "BUY" in str(signal) else "Sell"
                      self.trader.execute_signal(_mkt_action, price, lots=lots)
-                     console.print(f"[dim][MTS_SYNC] Near-leg position synced to trader: {self.trader.position}[/dim]")
+                     console.print(f"[dim][MTS_SYNC] NEAR-leg synced to trader: {self.trader.position} ({_mkt_action})[/dim]")
 
                  self._applied_lifecycle_deals.add(deal_key)
                  
@@ -4011,6 +4019,7 @@ class FuturesMonitor:
         On crash: .processing file survives → startup recovery renames back.
         
         Validation pipeline:
+          C0: State guard (prevent double-click processing)
           C6: Schema validation (required keys)
           C5: TTL expiry check (backward compat when created_at=None)
           C2: Idempotency (md5 hash, excludes created_at)
@@ -4022,6 +4031,15 @@ class FuturesMonitor:
         """
         _flag_path = "/tmp/futures_manual_trade.flag"
         _processing_path = _flag_path + ".processing"
+        
+        # 2026-06-09 JVS Claw: C0 — State guard (prevent double-click processing)
+        # If already processing or recently completed, skip new flags.
+        if self._manual_trade_status in ("PROCESSING", "FILLED", "SUBMITTED"):
+            console.print(f"[yellow]⏭️ [MANUAL_TRADE] Skipped: already in state {self._manual_trade_status}[/yellow]")
+            if os.path.exists(_flag_path):
+                os.remove(_flag_path)  # Clean up stale flag
+            return True
+        
         if not os.path.exists(_flag_path):
             # 2026-06-05 JVS Claw: clean up stale .processing from crash
             if os.path.exists(_processing_path):
@@ -4061,11 +4079,15 @@ class FuturesMonitor:
                 os.remove(_processing_path)
                 return True
 
-            # ── C2: Idempotency — md5 hash from flag content (exclude created_at) ──
-            # 2026-06-05 JVS Claw: hash excludes created_at so repeated
-            # dashboard writes (user double-click) produce the same id.
+            # ── C2: Idempotency — md5 hash from action + side only ──
+            # 2026-06-09 JVS Claw: Simplified hash to use only action + side.
+            # This prevents double-click from creating duplicate orders even when
+            # ts, spread_z, near_close, far_close change between clicks.
             # Set is in-memory only; after restart no orders exist → retry is safe.
-            _idempotent_flag = {k: v for k, v in _flag.items() if k != "created_at"}
+            _idempotent_flag = {
+                "action": _flag.get("action", ""),
+                "side": _flag.get("side", "")
+            }
             _flag_id = hashlib.md5(json.dumps(_idempotent_flag, sort_keys=True).encode()).hexdigest()[:8]
             if _flag_id in self._processed_flag_ids:
                 self._manual_trade_status = "SKIPPED: IDEMPOTENT"
