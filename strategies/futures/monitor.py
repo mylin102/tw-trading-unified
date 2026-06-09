@@ -4032,14 +4032,6 @@ class FuturesMonitor:
         _flag_path = "/tmp/futures_manual_trade.flag"
         _processing_path = _flag_path + ".processing"
         
-        # 2026-06-09 JVS Claw: C0 — State guard (prevent double-click processing)
-        # If already processing or recently completed, skip new flags.
-        if self._manual_trade_status in ("PROCESSING", "FILLED", "SUBMITTED"):
-            console.print(f"[yellow]⏭️ [MANUAL_TRADE] Skipped: already in state {self._manual_trade_status}[/yellow]")
-            if os.path.exists(_flag_path):
-                os.remove(_flag_path)  # Clean up stale flag
-            return True
-        
         if not os.path.exists(_flag_path):
             # 2026-06-05 JVS Claw: clean up stale .processing from crash
             if os.path.exists(_processing_path):
@@ -4122,6 +4114,16 @@ class FuturesMonitor:
                     return True
             
             _action = _flag.get("action", "")
+            
+            # 2026-06-09 JVS Claw: C0 — State guard for spread actions only
+            # Prevent double-click for spread entry, but always allow close_all
+            # Only check for terminal states (FILLED, SUBMITTED), not PROCESSING (current call)
+            if _action == "spread" and self._manual_trade_status in ("FILLED", "SUBMITTED"):
+                self._manual_trade_status = "SKIPPED: C0_STATE_GUARD"
+                console.print(f"[yellow]⏭️ [MANUAL_TRADE] Skipped spread: already in state FILLED/SUBMITTED[/yellow]")
+                os.remove(_processing_path)
+                return True
+            
             if _action == "close_all":
                 console.print("[bold red]🆘 [MANUAL_TRADE] EMERGENCY CLOSE ALL triggered[/bold red]")
                 self._cancel_all_pending_orders()
