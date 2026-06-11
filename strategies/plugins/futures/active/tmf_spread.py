@@ -616,9 +616,23 @@ class TMFSpread(StrategyBase):
             self._min_atr = float(_params.get("min_atr", self._min_atr))
 
         # ── [Fix] Prevent duplicate submissions ──
+        # 2026-06-11 JVS Claw: Add timeout for RELEASE lifecycle states
+        # If release is stuck >60s without fill confirmation, reset to OPEN
+        # so the next on_bar() can retry the release.
         if self._lifecycle in ("SUBMITTING", "RELEASE_NEAR", "RELEASE_FAR", "EXITING"):
-            self._set_eval(skip_reason="MTS_BUSY", lifecycle=self._lifecycle)
-            return None
+            if self._lifecycle in ("RELEASE_NEAR", "RELEASE_FAR") and self._release_ts is not None:
+                _release_age = (datetime.now() - self._release_ts).total_seconds()
+                if _release_age > 60:
+                    console.print(f"[bold yellow]⚠️ [MTS_RELEASE_TIMEOUT] lifecycle={self._lifecycle} stuck for {_release_age:.0f}s. Resetting to OPEN for retry.[/bold yellow]")
+                    self._lifecycle = "OPEN"
+                    self._release_ts = None
+                    # Fall through to continue processing
+                else:
+                    self._set_eval(skip_reason="MTS_BUSY", lifecycle=self._lifecycle)
+                    return None
+            else:
+                self._set_eval(skip_reason="MTS_BUSY", lifecycle=self._lifecycle)
+                return None
 
         # ── [Fix] Re-entry Cooldown ──
         if self._last_exit_ts is not None:
@@ -937,7 +951,9 @@ class TMFSpread(StrategyBase):
     def _reset(self, reason: str | None = None) -> None:
         # 2026-05-27 Gemini CLI: Corrected lifecycle and reset logic for contract compliance
         # 2026-05-27 Gemini CLI: Pass current ticker to _write_mts_state for dynamic point value
-        _write_mts_state(has_position=False, action="CLOSE", reason=reason or "trail_exit", ticker=self._ticker)
+        # 2026-06-09 JVS Claw: Defensive check for _ticker (may not exist if init() not called)
+        _ticker = getattr(self, '_ticker', self.config.get("ticker", "TMF"))
+        _write_mts_state(has_position=False, action="CLOSE", reason=reason or "trail_exit", ticker=_ticker)
         self._has_position = False
         self._lifecycle = "FLAT"
         self._last_exit_ts = datetime.now()  # 2026-05-27 Gemini CLI: Enforce re-entry cooldown
