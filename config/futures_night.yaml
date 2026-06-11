@@ -98,7 +98,7 @@ debug:
   tickbar: false
   feed: false
 mts:
-  enabled: false
+  enabled: true
   strategy: tmf_spread
   lots: 1
   params:
