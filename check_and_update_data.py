@@ -60,7 +60,7 @@ def check_data_continuity():
 
 def check_today_data():
     """檢查今天的資料"""
-    print("\n=== 今天(4月12日)資料檢查 ===")
+    print(f"\n=== 今天({datetime.now().strftime('%m月%d日')})資料檢查 ===")
     
     today = datetime.now().date()
     df = pd.read_csv(DATA_FILE, parse_dates=['timestamp'])
@@ -118,12 +118,28 @@ def get_today_market_data():
             print("❌ 無法取得Shioaji API連線")
             return None
         
+        # 2026-06-18 Gemini CLI: Resolve ticker dynamically from config to avoid hardcoded TXF
+        from core.bar_utils import load_config
+        futures_cfg = load_config("config/futures.yaml")
+        product = futures_cfg.get("ticker", "TMF")
+        
         # 取得合約
         try:
-            contract = api.Contracts.Futures.TXF.TXFR1
-        except:
-            contract = api.Contracts.Futures.TXF.TXF
+            contract = getattr(api.Contracts.Futures, product).TXFR1 if product == "TXF" else getattr(api.Contracts.Futures, product)[f"{product}R1"]
+        except Exception:
+            try:
+                contract = getattr(api.Contracts.Futures, product)[product]
+            except Exception:
+                # Fallback to resolver
+                from core.contract_resolver import ContractResolver
+                resolver = ContractResolver(api)
+                near, _ = resolver.get_near_far_contracts(product)
+                contract = near
         
+        if not contract:
+            print(f"❌ 無法取得 {product} 合約")
+            return None
+
         print(f"✅ 連線成功，使用合約: {contract.code}")
         
         # 取得今天資料

@@ -169,6 +169,26 @@ def tick_dispatcher(futures_mon, options_mon, feed_health=None, tx_bar_builder=N
     return on_tick
 
 
+def order_dispatcher(futures_mon, options_mon):
+    """Dispatch order events to both futures and options monitors."""
+    def on_order_event(order_state, data):
+        # Dispatch to futures monitor
+        try:
+            if hasattr(futures_mon, "on_order_event"):
+                futures_mon.on_order_event(order_state, data)
+        except Exception as e:
+            console.print(f"[red][futures order err] {e}[/red]")
+
+        # Dispatch to options monitor
+        try:
+            if hasattr(options_mon, "on_order_event"):
+                options_mon.on_order_event(order_state, data)
+        except Exception as e:
+            console.print(f"[red][options order err] {e}[/red]")
+
+    return on_order_event
+
+
 def bidask_dispatcher(futures_mon, options_mon, skew_engine=None):
     """Route BidAsk updates to monitors for IV calculation and data freshness.
 
@@ -742,6 +762,11 @@ def run_system(dry_run=False):
             from core.broker.shioaji_compat import set_tick_callback, set_bidask_callback, safe_subscribe
             set_tick_callback(api, tick_dispatcher(fm, om, feed_health, tx_bar_builder))
             set_bidask_callback(api, bidask_dispatcher(fm, om, sk_engine))
+
+            # [P0 Fix] Centralized order dispatcher to avoid "Already borrowed" error
+            api.set_order_callback(order_dispatcher(fm, om))
+            console.print("[green]✅ Order event callback registered[/green]")
+
             # [Skew Integration] Wire skew engine into FuturesMonitor for strategy context
             fm._skew_engine = sk_engine
 
@@ -940,11 +965,12 @@ def run_system(dry_run=False):
             # 💡 GSD: 在 08:45 開盤前與 05:00 盤後寬限處理
             import datetime as _dt_inner
             now_dt = _dt_inner.datetime.now()
-            # 判斷是否在開盤前的空窗期 (05:00 - 08:45)
+            # 判斷是否在開盤前的空窗期 (05:00 - 08:45) 或日盤後至夜盤前的空窗期 (13:45 - 15:00)
             is_pre_market = (now_dt.hour == 8 and now_dt.minute < 45) or (now_dt.hour >= 5 and now_dt.hour < 8)
+            is_market_break = (now_dt.hour == 13 and now_dt.minute >= 45) or (now_dt.hour == 14)
             
             stale_secs = now - last_data_at
-            stale_limit = 3600 if is_pre_market else 300 # 開盤前給一小時寬限
+            stale_limit = 7200 if (is_pre_market or is_market_break) else 300 # 空窗期給予兩小時寬限
             
             if stale_secs > stale_limit:
                 console.print(f"[bold red]🚨 DATA STAGNATION CONFIRMED! No data for {stale_secs/60:.1f} mins (fm={now-fm_last:.1f}s, om={now-om_last:.1f}s ago). Force restarting...[/bold red]")
@@ -1012,6 +1038,9 @@ def run_system(dry_run=False):
         import traceback
         console.print(f"[bold red]Critical crash: {exc}[/bold red]")
         console.print(traceback.format_exc())
+        # 2026-06-15 Hermes Agent: Enforce 15s cooldown on crash to respect Shioaji API limits
+        console.print("[yellow]Sleeping 15s to prevent rapid reconnect bans...[/yellow]")
+        time.sleep(15)
 
     finally:
         # Signal shutdown to all dispatchers
@@ -1116,6 +1145,4 @@ def ensure_single_instance():
 
 if __name__ == "__main__":
     ensure_single_instance()
-    main()
-
     main()

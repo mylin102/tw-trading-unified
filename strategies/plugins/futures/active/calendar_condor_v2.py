@@ -100,11 +100,11 @@ class CalendarCondorV2(StrategyBase):
         # 重置狀態
         self._reset_state()
         
-        # 初始化合約信息 (在實際交易中會從 context 獲取)
-        self.near_contract_code = "TMFE6"  # 示例，實際應從合約解析器獲取
-        self.far_contract_code = "TMFF6"   # 示例，實際應從合約解析器獲取
+        # 2026-06-18 Gemini CLI: Remove hardcoded contracts, will be resolved from context
+        self.near_contract_code = "" 
+        self.far_contract_code = ""
         
-        print(f"[CalendarCondorV2] Initialized with near={self.near_contract_code}, far={self.far_contract_code}")
+        # print(f"[CalendarCondorV2] Initialized, waiting for context to resolve contracts")
     
     def _reset_state(self) -> None:
         """重置策略狀態"""

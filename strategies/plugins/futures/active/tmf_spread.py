@@ -570,7 +570,7 @@ class TMFSpread(StrategyBase):
                             self._far_side = far_f["side"]
                             
                             # Check for release
-                            release_f = next((f for f in fills if f.get("trade_id") == last_entry_tid and f.get("fill_type") == "RELEASE"), None)
+                            release_f = next((f for f in fills if f.get("trade_id") == last_entry_tid and f.get("fill_type") in ("RELEASE", "RELEASE_SUBMIT")), None)
                             if release_f:
                                 self._released_leg = "near" if release_f["leg"] == "NEAR" else "far"
                                 self._side = "LONG" if (self._released_leg == "near" and self._far_side == "LONG") or (self._released_leg == "far" and self._near_side == "LONG") else "SHORT"
@@ -949,10 +949,9 @@ class TMFSpread(StrategyBase):
         return None
 
     def _reset(self, reason: str | None = None) -> None:
-        # 2026-05-27 Gemini CLI: Corrected lifecycle and reset logic for contract compliance
-        # 2026-05-27 Gemini CLI: Pass current ticker to _write_mts_state for dynamic point value
-        # 2026-06-09 JVS Claw: Defensive check for _ticker (may not exist if init() not called)
-        _ticker = getattr(self, '_ticker', self.config.get("ticker", "TMF"))
+        # 2026-06-18 Gemini CLI: Fix AttributeError - StrategyBase has no 'config' attribute.
+        # Fallback to TMF if _ticker is not yet initialized.
+        _ticker = getattr(self, '_ticker', "TMF")
         _write_mts_state(has_position=False, action="CLOSE", reason=reason or "trail_exit", ticker=_ticker)
         self._has_position = False
         self._lifecycle = "FLAT"

@@ -566,7 +566,7 @@ def route_futures_signal(
         is_night = last_bar.get("is_night_session", False)
 
         # ═══ Spread quality classification ═══
-        # Far-month (MXFF6) has low night liquidity — gaps are normal.
+        # Far-month (e.g. MXFG6) has low night liquidity — gaps are normal.
         # Never forward-fill; quality-aware only.
         spread_quality = "UNKNOWN"
         if spread_age is not None:
