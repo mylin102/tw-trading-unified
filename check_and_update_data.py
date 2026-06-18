@@ -118,14 +118,14 @@ def get_today_market_data():
             print("❌ 無法取得Shioaji API連線")
             return None
         
-        # 2026-06-18 Gemini CLI: Resolve ticker dynamically from config to avoid hardcoded TXF
+        # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Standardize dynamic contract lookup
         from core.bar_utils import load_config
         futures_cfg = load_config("config/futures.yaml")
         product = futures_cfg.get("ticker", "TMF")
         
         # 取得合約
         try:
-            contract = getattr(api.Contracts.Futures, product).TXFR1 if product == "TXF" else getattr(api.Contracts.Futures, product)[f"{product}R1"]
+            contract = getattr(api.Contracts.Futures, product)[f"{product}R1"]
         except Exception:
             try:
                 contract = getattr(api.Contracts.Futures, product)[product]

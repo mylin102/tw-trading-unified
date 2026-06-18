@@ -41,7 +41,7 @@ from core.strategy_registry import StrategyRegistry
 from core.strategy_context import StrategyContext, PositionView, MarketData
 from core.signal import Signal
 from core.bar_utils import attach_bar_metadata, build_canonical_bar_frames, build_preferred_canonical_bar_frames, resample_ohlcv
-from core.date_utils import get_taifex_futures_hhmm, is_taifex_futures_market_open, get_taifex_futures_session_type
+from core.date_utils import get_taifex_futures_hhmm, is_taifex_futures_market_open, get_taifex_futures_session_type, get_session_date_str
 from core.spread_loader import get_spread_loader
 from squeeze_futures.data.shioaji_client import ShioajiClient
 from squeeze_futures.data.data_storage import save_trade
@@ -513,13 +513,14 @@ class FuturesMonitor:
 
         # [GSD Fix] Warm-up from Parquet SSOT (Wave 5 Integration)
         try:
-            # Try MXF first, then TXFR1 as fallback
+            # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Disabled TXFR1 fallback
             from core.data_manager import data_manager
-            ticker_warm = self.ticker  # e.g. "MXF"
+            ticker_warm = self.ticker  # e.g. "TMF"
             df_hist = data_manager.load_historical(ticker_warm)
-            if df_hist.empty or len(df_hist) < 20:
-                # Fallback: try TXFR1 which has broader coverage
-                df_hist = data_manager.load_historical("TXFR1")
+            # if df_hist.empty or len(df_hist) < 20:
+            #     # Fallback: try TXFR1 which has broader coverage
+            #     df_hist = data_manager.load_historical("TXFR1")
+            
             if not df_hist.empty and len(df_hist) >= 20:
                 df_warm = df_hist.tail(100)
                 for ts, row in df_warm.iterrows():
@@ -2006,6 +2007,10 @@ class FuturesMonitor:
                                        price=price, qty=lots, slippage=round(_slippage, 1),
                                        ref_ohlc=_ref_ohlc)
 
+                 order = self._get_lifecycle_order(event.order_id)
+                 if order is not None and order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
+                     self._clear_pending_lifecycle_order(event.order_id)
+
                  self._save_orders_file_wrapper()
                  return f"MTS_LEG_FILL:{event.symbol}"
 
@@ -2661,9 +2666,10 @@ class FuturesMonitor:
         }
 
         if _action == "PARTIAL_EXIT":
-            # Release one leg — released_leg is in strategy state
-            _released = getattr(strategy, "_released_leg", None)
-            if _released == "near":
+            # 2026-06-17 Hermes Agent: use signal reason, not strategy._released_leg (still None before sync_release)
+            _is_release_near = _reason and "RELEASE_NEAR" in str(_reason).upper()
+            _is_release_far = _reason and "RELEASE_FAR" in str(_reason).upper()
+            if _is_release_near:
                 _side = OrderSide.BUY if getattr(strategy, "_near_side") == "SHORT" else OrderSide.SELL
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_NEAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) instead of MARKET — 避免滑價
@@ -2685,7 +2691,7 @@ class FuturesMonitor:
                     # Force fill ONLY in paper mode
                     if self.dry_run or not self.live_trading:
                         console.print(f"[bold green]✅ [MTS_ORDER] RELEASE_NEAR FILLED: {_side} (MKP)[/bold green]")
-            elif _released == "far":
+            elif _is_release_far:
                 _side = OrderSide.BUY if getattr(strategy, "_far_side") == "SHORT" else OrderSide.SELL
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_FAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
@@ -2708,7 +2714,7 @@ class FuturesMonitor:
                     if self.dry_run or not self.live_trading:
                         console.print(f"[bold green]✅ [MTS_ORDER] RELEASE_FAR FILLED: {_side} (MKP)[/bold green]")
             else:
-                console.print(f"[red]⚠️ [MTS_ORDER] PARTIAL_EXIT but released_leg is None[/red]")
+                console.print(f"[red]⚠️ [MTS_ORDER] PARTIAL_EXIT but cannot determine released leg from signal reason: {_reason}[/red]")
             return
 
         elif _action == "EXIT":
@@ -4430,10 +4436,22 @@ class FuturesMonitor:
                     # MKP (Market with Protection) orders fill at market price immediately.
                     # Use live close prices (_near/_far) for synthetic tick.
                     if self.paper_fill_sim:
-                        self.paper_fill_sim.process_tick(
-                            self._make_synthetic_tick(_near, _ts, symbol=_near_order.symbol))
-                        self.paper_fill_sim.process_tick(
-                            self._make_synthetic_tick(_far, _ts, symbol=_far_order.symbol))
+                        # 2026-06-11 JVS Claw: Debug log
+                        console.print(f"[dim][PAPER_FILL_DEBUG] pending_orders={list(self.paper_fill_sim._pending_orders.keys())}[/dim]")
+                        console.print(f"[dim][PAPER_FILL_DEBUG] near_order: id={_near_order.order_id}, symbol={_near_order.symbol}, status={_near_order.status}[/dim]")
+                        console.print(f"[dim][PAPER_FILL_DEBUG] far_order: id={_far_order.order_id}, symbol={_far_order.symbol}, status={_far_order.status}[/dim]")
+                        
+                        _near_tick = self._make_synthetic_tick(_near, _ts, symbol=_near_order.symbol)
+                        _far_tick = self._make_synthetic_tick(_far, _ts, symbol=_far_order.symbol)
+                        console.print(f"[dim][PAPER_FILL_DEBUG] near_tick: code={_near_tick.code}, close={_near_tick.close}[/dim]")
+                        console.print(f"[dim][PAPER_FILL_DEBUG] far_tick: code={_far_tick.code}, close={_far_tick.close}[/dim]")
+                        
+                        self.paper_fill_sim.process_tick(_near_tick)
+                        self.paper_fill_sim.process_tick(_far_tick)
+                        
+                        console.print(f"[dim][PAPER_FILL_DEBUG] After process_tick: pending_orders={list(self.paper_fill_sim._pending_orders.keys())}[/dim]")
+                        console.print(f"[dim][PAPER_FILL_DEBUG] near_order filled_qty={_near_order.filled_quantity}, status={_near_order.status}[/dim]")
+                        console.print(f"[dim][PAPER_FILL_DEBUG] far_order filled_qty={_far_order.filled_quantity}, status={_far_order.status}[/dim]")
 
                     # Status will be set to FILLED by _check_mts_multi_leg_fill() via on_fill callback.
                     # If fills didn't trigger (edge case), fall back to SUBMITTED.

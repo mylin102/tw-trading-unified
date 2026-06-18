@@ -134,8 +134,9 @@ class IngestionService:
 
             result = frame[available_cols].sort_index()
 
+            # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Disabled TXFR1 pre-fetch
             # [Side effect] Pre-fetch TXFR1 bars for cross-regime engine
-            self._prefetch_tx_bars()
+            # self._prefetch_tx_bars()
 
             console.print(
                 f"[green][Ingestion] Backfill complete: {len(result)} rows[/green]"
