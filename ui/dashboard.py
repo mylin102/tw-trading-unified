@@ -4720,11 +4720,11 @@ with tab_volatility:
 
     st.divider()
 
-# ── Footer and Refresh ──
+# -- Footer and Refresh --
 refresh = 30
 time.sleep(refresh)
 st.rerun()
-ooter and Refresh ──
+ooter and Refresh --
 refresh = 30
 time.sleep(refresh)
 st.rerun()
