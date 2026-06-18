@@ -4836,26 +4836,20 @@ class FuturesMonitor:
         except Exception as e:
             console.print(f" [yellow]⚠️ Adaptive engine failed: {e}[/yellow] ")
 
-        # Cross-regime decision (TX macro + MXF local)
+        # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Disabled Cross-Regime Macro Engine (TX Macro + TMF Local)
+        # We now rely solely on the configured ticker's native regime.
+        cross_skipped = True
+        tx_regime = "SKIP"
+        tmf_regime = "SKIP"
+        policy = {"allow_trade": True, "orb_weight": 1.0, "vwap_weight": 1.0}
+        self._last_bar_context.update({
+            "tx_regime": "SKIP",
+            "tmf_regime": "SKIP",
+            "cross_policy": policy,
+        })
+        self._last_cross_policy = policy
+        
         try:
-            tx_regime = "UNKNOWN"
-            tmf_regime = "UNKNOWN"
-            policy = None
-            tx_bars_list = None
-
-            # Prefer in-memory TX bars built from live ticks when available
-            try:
-                if hasattr(self, 'tx_bar_builder') and self.tx_bar_builder is not None:
-                    tx_bars = self.tx_bar_builder.bars()
-                    if tx_bars and len(tx_bars) >= 20:
-                        tx_bars_list = [{
-                            "close": float(b.get("close", 0)),
-                            "high": float(b.get("high", 0)),
-                            "low": float(b.get("low", 0)),
-                        } for b in tx_bars[-100:]]
-            except Exception:
-                tx_bars_list = None
-
             # ═══ TX CACHE ONLY (no on-demand API calls) ═══
             # TX bars for cross-regime engine are populated exclusively
             # during backfill/startup via IngestionService.fetch_backfill()
