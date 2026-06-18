@@ -588,88 +588,6 @@ def _resubscribe_all(api, fm, om):
         console.print(f"[red]❌ Resubscribe failed: {e}[/red]")
 
 
-def resolve_tx_contract(api, reference_contract=None):
-    """Resolve a nearest-month TX contract conservatively (fallbacks)."""
-    try:
-        from datetime import datetime as _dt
-
-        futures = getattr(api, 'Contracts', None)
-        if futures is None:
-            return None
-        futs = getattr(futures, 'Futures', None)
-        if futs is None:
-            return None
-
-        if reference_contract is not None:
-            ref_code = getattr(reference_contract, "code", "")
-            if ref_code.startswith("TMF"):
-                target_code = ref_code.replace("TMF", "TXF", 1)
-                for lookup in (
-                    lambda: api.Contracts.Futures[target_code],
-                    lambda: api.Contracts.Futures["TXF"][target_code],
-                ):
-                    try:
-                        contract = lookup()
-                        if contract is not None and getattr(contract, "code", "").startswith("TXF"):
-                            return contract
-                    except Exception:
-                        continue
-
-        candidates = {}
-
-        def _remember(contract):
-            code = getattr(contract, "code", "")
-            if contract is None or not code.startswith("TXF"):
-                return
-            candidates[code] = contract
-
-        # 💡 GSD: 強制優先檢查 TXF (大台)
-        for key in ("TXF", "TX"):
-            node = getattr(futs, key, None)
-            if node is None:
-                continue
-            # Try common attributes first
-            for attr in ("near_month", "current", "front"):
-                con = getattr(node, attr, None)
-                _remember(con)
-            # If mapping-like
-            if hasattr(node, 'items'):
-                for _, con in node.items():
-                    _remember(con)
-            try:
-                for con in node:
-                    _remember(con)
-            except TypeError:
-                continue
-
-        if candidates:
-            today = _dt.now().strftime("%Y/%m/%d")
-
-            def _sort_key(contract):
-                delivery_date = getattr(contract, "delivery_date", "9999/99/99")
-                is_rolling = getattr(contract, "code", "") == getattr(contract, "symbol", None)
-                return (delivery_date, is_rolling, getattr(contract, "code", ""))
-
-            valid = [con for con in candidates.values() if getattr(con, "delivery_date", "") >= today]
-            pool = valid or list(candidates.values())
-            pool.sort(key=_sort_key)
-            return pool[0]
-
-        # As a final fallback, try iterating an attribute list
-        try:
-            if hasattr(futs, '__iter__'):
-                for part in futs:
-                    try:
-                        for c in part:
-                            if hasattr(c, 'code') and "TXF" in c.code:
-                                return c
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-        return None
-    except Exception:
-        return None
 
 
 def feeds_are_fresh(feed_health, require_tx=True, require_futures=True):
@@ -778,28 +696,6 @@ def run_system(dry_run=False):
                 except Exception as e:
                     console.print(f"[yellow]⚠️ TMF subscribe failed: {e}[/yellow]")
 
-            # Subscribe TX tick for cross-regime / freshness
-            tx_contract = resolve_tx_contract(api, fm.contract)
-            if tx_contract is not None:
-                try:
-                    safe_subscribe(api, tx_contract, quote_type='tick')
-                    console.print(f"[green]📡 Subscribed TX tick: {tx_contract.code}[/green]")
-                except Exception as e:
-                    console.print(f"[yellow]⚠️ TX subscribe failed: {e}[/yellow]")
-            else:
-                # 最後嘗試直接使用 TXF 近月
-                try:
-                    target_code = fm.contract.code.replace("TMF", "TXF") if fm.contract else "TXFE6"
-                    safe_subscribe(api, api.Contracts.Futures[target_code], quote_type='tick')
-                    console.print(f"[green]📡 Emergency Subscribed TXF: {target_code}[/green]")
-                except Exception:
-                    console.print("[yellow]⚠️ TX contract resolution failed; proceeding without macro reference[/yellow]")
-
-            # Subscribe far-month Futures tick for dual chart
-            if fm.far_contract:
-                try:
-                    safe_subscribe(api, fm.far_contract, quote_type='tick')
-                    console.print(f"[green]📡 Subscribed far-month Futures tick: {fm.far_contract.code}[/green]")
                 except Exception as e:
                     console.print(f"[yellow]⚠️ Far-month Futures subscribe failed: {e}[/yellow]")
 
@@ -826,7 +722,7 @@ def run_system(dry_run=False):
 
         # Expose feed_health and tx_contract to monitors for policy gating
         fm.feed_health = feed_health
-        fm.tx_contract = tx_contract
+        fm.tx_contract = None
         fm.tx_bar_builder = tx_bar_builder
 
         ft = threading.Thread(target=fm.run, name="futures", daemon=True)
@@ -903,14 +799,7 @@ def run_system(dry_run=False):
                         if fm.contract is not None:
                             api.quote.subscribe(fm.contract, quote_type='tick')
 
-                        # Re-resolve and subscribe TX
-                        tx_contract = resolve_tx_contract(api, fm.contract)
-                        if tx_contract is not None:
-                            try:
-                                api.quote.subscribe(tx_contract, quote_type='tick')
-                                console.print(f"[green]📡 Re-Subscribed TX tick: {tx_contract.code}[/green]")
-                            except Exception as e:
-                                console.print(f"[yellow]⚠️ Re-subscribe TX failed: {e}[/yellow]")
+                        # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Removed TX re-subscription.
 
                         om.monitor.find_best_contracts()
                         om.monitor.pre_fill_bars()
