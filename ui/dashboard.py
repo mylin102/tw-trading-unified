@@ -1380,7 +1380,9 @@ def load_futures_indicators(full_history=False):
         from pathlib import Path as _Path
         # 2026-05-27 Gemini CLI: Generalize search prefix (no hardcoded MXF)
         _active_ticker = futures_cfg.get("ticker", "MXF")
-        for f in sorted(FUTURES_MKT.glob(f"{_active_ticker}_*_indicators.csv")):
+        # Sort by filename descending (newest dates first) and take the first 5 to avoid loading years of history
+        all_files = sorted(FUTURES_MKT.glob(f"{_active_ticker}_*_indicators.csv"), reverse=True)
+        for f in all_files[:5]:
             parts = f.stem.split("_")
             if len(parts) >= 2:
                 search_days_raw.append(parts[1])
@@ -1391,10 +1393,10 @@ def load_futures_indicators(full_history=False):
     all_dfs = []
     for priority, date_part in enumerate(search_days):
         for tag in ["", "_LIVE", "_PAPER", "_DRY"]:
-            # 2026-05-27 Gemini CLI: Generalize search prefixes (no hardcoded TMF/MXF)
+            # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] TMF Default
             _prefixes = [_active_ticker]
-            if _active_ticker not in ["TMF", "MXF"]: # Allow legacy discovery if user changed ticker
-                 _prefixes.extend(["TMF", "MXF"])
+            if _active_ticker not in ["TMF"]:
+                 _prefixes.extend(["TMF"])
             
             for prefix in _prefixes:
                 f = FUTURES_MKT / f"{prefix}_{date_part}{tag}_indicators.csv"
@@ -1544,12 +1546,13 @@ def load_futures_indicators(full_history=False):
     
     return result
 
+# 2026-06-18 Gemini CLI: [Pure TMF Refactoring] TMF Default
 @st.cache_data(ttl=30)
-def load_far_month_data(product="MXF"):
+def load_far_month_data(product="TMF"):
     """載入遠月合約資料
     
     Args:
-        product: 商品代碼 (MXF, TMF)
+        product: 商品代碼 (TMF)
         
     Returns:
         DataFrame with far month data or None
@@ -1710,8 +1713,9 @@ def load_calendar_spread_data():
             # 嘗試在 exports 中尋找
             far_files = list(Path("exports").glob("*far*.csv"))
         if not far_files:
-            # 嘗試尋找 MXF 遠月資料
-            far_files = list(Path(".").rglob("*MXF*far*.csv"))
+            # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Removed hardcoded MXF fallback
+            # 嘗試尋找 TMF 遠月資料
+            far_files = list(Path(".").rglob("*TMF*far*.csv"))
         if not far_files:
             # 嘗試尋找任何包含 "far" 的 CSV 檔案
             far_files = list(Path(".").rglob("*far*.csv"))
@@ -2291,7 +2295,9 @@ with tab_overview:
 # Tab 2: 期貨
 # ════════════════════════════════════════
 with tab_futures:
-    st.header(f"期貨 MXF ({mode_badge(f_live)})")
+    # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Dynamic Ticker
+    _ov_ticker = futures_cfg.get("ticker", "TMF")
+    st.header(f"期貨 {_ov_ticker} ({mode_badge(f_live)})")
 
     f_df = load_futures_indicators(full_history=cont_mode)
     if f_df is not None and not f_df.empty:
@@ -2515,8 +2521,10 @@ with tab_futures:
             )
         else:
             # 如果沒有遠月資料，使用原來的圖表
+            # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Dynamic Ticker
+            _ov_ticker = futures_cfg.get("ticker", "TMF")
             st.plotly_chart(
-                make_price_score_chart(f_df, "close", "MXF 價格 & Score", signals=ft), 
+                make_price_score_chart(f_df, "close", f"{_ov_ticker} 價格 & Score", signals=ft), 
                 use_container_width=True
             )
             st.info("⚠️ 未找到遠月資料，僅顯示近月價格")
@@ -4716,3 +4724,9 @@ with tab_volatility:
 refresh = 30
 time.sleep(refresh)
 st.rerun()
+ooter and Refresh ──
+refresh = 30
+time.sleep(refresh)
+st.rerun()
+rerun()
+n()
