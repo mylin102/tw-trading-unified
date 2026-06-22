@@ -1111,7 +1111,7 @@ def format_futures_trades(ledger_df):
                 mult = 1 if direction == "BUY" else -1
                 # 2026-05-27 Gemini CLI: Dynamic Point Value multiplier (no hardcoded 50)
                 from strategies.futures.squeeze_futures.engine.constants import get_point_value
-                _mult = get_point_value(futures_cfg.get("ticker", "MXF")[:3])
+                _mult = get_point_value(futures_cfg.get("ticker", "TMF")[:3])
                 gross = (exit_p - entry) * _mult * lots * mult
 
             cost = row.get("total_cost", row.get("fees", 0))
@@ -1123,7 +1123,7 @@ def format_futures_trades(ledger_df):
 
             # 2026-05-27 Gemini CLI: Dynamic Point Value for cost basis
             from strategies.futures.squeeze_futures.engine.constants import get_point_value
-            _mult_cb = get_point_value(futures_cfg.get("ticker", "MXF")[:3])
+            _mult_cb = get_point_value(futures_cfg.get("ticker", "TMF")[:3])
             cost_basis = entry * _mult_cb * lots
             
             trades.append({
@@ -1146,7 +1146,7 @@ def format_futures_trades(ledger_df):
         trade_num += 1
         # 2026-05-27 Gemini CLI: Dynamic Point Value for pending cost basis
         from strategies.futures.squeeze_futures.engine.constants import get_point_value
-        _mult_pend = get_point_value(futures_cfg.get("ticker", "MXF")[:3])
+        _mult_pend = get_point_value(futures_cfg.get("ticker", "TMF")[:3])
         cost_basis = pending_entry["entry_price"] * _mult_pend * pending_entry["lots"]
         trades.append({
             "#": trade_num,
@@ -1379,7 +1379,7 @@ def load_futures_indicators(full_history=False):
     try:
         from pathlib import Path as _Path
         # 2026-05-27 Gemini CLI: Generalize search prefix (no hardcoded MXF)
-        _active_ticker = futures_cfg.get("ticker", "MXF")
+        _active_ticker = futures_cfg.get("ticker", "TMF")
         # Sort by filename descending (newest dates first) and take the first 5 to avoid loading years of history
         all_files = sorted(FUTURES_MKT.glob(f"{_active_ticker}_*_indicators.csv"), reverse=True)
         for f in all_files[:5]:
@@ -1781,7 +1781,7 @@ def load_futures_trades():
     """Load today's futures trades CSV."""
     import glob
     # 2026-05-27 Gemini CLI: Generalize search prefix (no hardcoded TMF)
-    _active_ticker = futures_cfg.get("ticker", "MXF")
+    _active_ticker = futures_cfg.get("ticker", "TMF")
     
     # Try canonical exports location first
     for date_str in [TRADE_DATE_STR, DATE_STR]:
@@ -2093,7 +2093,7 @@ with tab_overview:
 
     with col1:
         # 2026-05-27 Gemini CLI: Dynamic Ticker in Header
-        _ov_ticker = futures_cfg.get("ticker", "MXF")
+        _ov_ticker = futures_cfg.get("ticker", "TMF")
         st.header(f"期貨 {_ov_ticker} ({mode_badge(f_live)})")
         if f_df is not None and not f_df.empty:
             last = f_df.iloc[-1]
@@ -2841,7 +2841,7 @@ with tab_futures:
                 mult = 1 if direction == "BUY" else -1
                 # 2026-05-27 Gemini CLI: Dynamic Point Value multiplier (no hardcoded 50)
                 from strategies.futures.squeeze_futures.engine.constants import get_point_value
-                _mult_u = get_point_value(futures_cfg.get("ticker", "MXF")[:3])
+                _mult_u = get_point_value(futures_cfg.get("ticker", "TMF")[:3])
                 unrealized = (cur_price - entry) * _mult_u * lots * mult
                 uc1, uc2, uc3 = st.columns(3)
                 uc1.metric("成交成本", f"{open_pos.cost_basis:,.0f} TWD")

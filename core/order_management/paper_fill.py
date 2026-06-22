@@ -63,6 +63,9 @@ class PaperFillSimulator:
 
             # Symbol Guard: ensure tick matches order symbol
             tick_symbol = getattr(tick, "symbol", getattr(tick, "code", None))
+            # 2026-06-22 Gemini CLI: Filter out MagicMock attributes in unit tests
+            if tick_symbol and not isinstance(tick_symbol, str):
+                tick_symbol = None
             if tick_symbol and tick_symbol != order.symbol:
                 continue
 

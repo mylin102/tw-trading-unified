@@ -1262,8 +1262,10 @@ class FuturesMonitor:
         # Only near-month ticks consume the flag. Far-month ticks don't populate
         # market_data[self.ticker] so they would always trigger NO_LIVE_TICK.
         _flag_path = "/tmp/futures_manual_trade.flag"
+        _processing_path = _flag_path + ".processing"
         _is_primary_tick = self.contract and tick.code == self.contract.code
-        if _is_primary_tick and os.path.exists(_flag_path):
+        # 2026-06-22 Gemini CLI: Check for both new and pending retry flags
+        if _is_primary_tick and (os.path.exists(_flag_path) or os.path.exists(_processing_path)):
             from core.date_utils import is_day_session, is_night_session
             _now = datetime.now()
             if is_day_session(_now) or is_night_session(_now):
@@ -1935,10 +1937,11 @@ class FuturesMonitor:
         self._check_mts_multi_leg_fill(event.order_id, price)
 
         pending = self._pending_lifecycle_orders.get(event.order_id)
-        if pending is None or event.fill_quantity <= 0:
+        # 2026-06-22 Gemini CLI: Use fill_qty to match OrderEvent class definition
+        if pending is None or event.fill_qty <= 0:
             return None
 
-        deal_key = event.deal_id or f"{event.order_id}:{event.fill_quantity}:{event.fill_price}"
+        deal_key = event.deal_id or f"{event.order_id}:{event.fill_qty}:{event.fill_price}"
         if deal_key in self._applied_lifecycle_deals:
             return None
 
@@ -1950,7 +1953,8 @@ class FuturesMonitor:
             return None
 
         ts = datetime.now()
-        lots = int(event.fill_quantity)
+        # 2026-06-22 Gemini CLI: Use fill_qty to match OrderEvent
+        lots = int(event.fill_qty)
         reason = pending.get("reason")
         stop_loss = pending.get("stop_loss")
         break_even_trigger = pending.get("break_even_trigger")
@@ -1984,9 +1988,11 @@ class FuturesMonitor:
                  _is_far_leg = "FAR" in _symbol
                  
                  if _is_near_leg:
-                     # NEAR leg: use signal direction directly
-                     _mkt_action = "Buy" if "BUY" in str(signal) else "Sell"
-                     self.trader.execute_signal(_mkt_action, price, lots=lots)
+                     # 2026-06-22 Gemini CLI: NEAR leg: use actual fill event side directly to avoid signal name string matching issues (uppercase for PaperTrader compatibility)
+                     from core.order_management.order import OrderSide
+                     _mkt_action = "BUY" if event.side == OrderSide.BUY else "SELL"
+                     # 2026-06-22 Gemini CLI: Pass ts variable to execute_signal to fix signature mismatch TypeError
+                     self.trader.execute_signal(_mkt_action, price, ts, lots=lots)
                      console.print(f"[dim][MTS_SYNC] NEAR-leg synced to trader: {self.trader.position} ({_mkt_action})[/dim]")
 
                  self._applied_lifecycle_deals.add(deal_key)
@@ -2144,7 +2150,8 @@ class FuturesMonitor:
             msg = self._apply_confirmed_futures_deal(event)
             if msg:
                 action = "BUY" if event.side == OrderSide.BUY else "SELL"
-                console.print(f"[green]📦 Confirmed deal: {action} {event.fill_quantity} @ {event.fill_price:.0f} deal={event.deal_id} → {msg}[/green]")
+                # 2026-06-22 Gemini CLI: Use fill_qty to match OrderEvent
+                console.print(f"[green]📦 Confirmed deal: {action} {event.fill_qty} @ {event.fill_price:.0f} deal={event.deal_id} → {msg}[/green]")
             
             # [GSD] Always update dashboard file to reflect latest OrderManager state (e.g. FILLED)
             self._save_orders_file_wrapper()
@@ -2679,7 +2686,8 @@ class FuturesMonitor:
                 # [GSD] Track in lifecycle orders so fill is not ignored
                 self._pending_lifecycle_orders[_order.order_id] = {
                     "intent_id": _order.intent_id, "signal": "RELEASE_NEAR", "reason": _reason, 
-                    "ts": _ts, "lots": 1, "price": _near_close, "ref_ohlc": _snap["near"]
+                    "ts": _ts, "lots": 1, "price": _near_close, "ref_ohlc": _snap["near"],
+                    "strategy": "MTS_RELEASE",
                 }
                 
                 self.order_mgr.submit(_order)
@@ -2701,7 +2709,8 @@ class FuturesMonitor:
                 # [GSD] Track in lifecycle orders so fill is not ignored
                 self._pending_lifecycle_orders[_order.order_id] = {
                     "intent_id": _order.intent_id, "signal": "RELEASE_FAR", "reason": _reason, 
-                    "ts": _ts, "lots": 1, "price": _far_close, "ref_ohlc": _snap["far"]
+                    "ts": _ts, "lots": 1, "price": _far_close, "ref_ohlc": _snap["far"],
+                    "strategy": "MTS_RELEASE",
                 }
                 
                 self.order_mgr.submit(_order)
@@ -2743,7 +2752,8 @@ class FuturesMonitor:
                 # [GSD] Track in lifecycle orders so fill is not ignored
                 self._pending_lifecycle_orders[_order.order_id] = {
                     "intent_id": _order.intent_id, "signal": "EXIT", "reason": _reason, 
-                    "ts": _ts, "lots": 1, "price": _ref_price, "ref_ohlc": _ref_ohlc
+                    "ts": _ts, "lots": 1, "price": _ref_price, "ref_ohlc": _ref_ohlc,
+                    "strategy": "MTS_EXIT",
                 }
                 
                 self.order_mgr.submit(_order)
@@ -2773,9 +2783,10 @@ class FuturesMonitor:
             # [GSD] Track in lifecycle orders so fill is not ignored
             self._pending_lifecycle_orders[_o_near.order_id] = {
                 "intent_id": _o_near.intent_id, "signal": _action, "reason": _reason, 
-                "ts": _ts, "lots": 1, "price": _near_close, "ref_ohlc": _snap["near"]
+                "ts": _ts, "lots": 1, "price": _near_close, "ref_ohlc": _snap["near"],
+                "strategy": "MTS_ENTRY",
             }
-            
+
             self.order_mgr.submit(_o_near)
             if self.paper_fill_sim:
                 self.paper_fill_sim.register(_o_near)
@@ -2788,8 +2799,9 @@ class FuturesMonitor:
             
             # [GSD] Track in lifecycle orders so fill is not ignored
             self._pending_lifecycle_orders[_o_far.order_id] = {
-                "intent_id": _o_far.intent_id, "signal": _action, "reason": _reason, 
-                "ts": _ts, "lots": 1, "price": _far_close, "ref_ohlc": _snap["far"]
+                "intent_id": _o_far.intent_id, "signal": _action, "reason": _reason,
+                "ts": _ts, "lots": 1, "price": _far_close, "ref_ohlc": _snap["far"],
+                "strategy": "MTS_ENTRY",
             }
             
             self.order_mgr.submit(_o_far)
@@ -4038,18 +4050,20 @@ class FuturesMonitor:
         _flag_path = "/tmp/futures_manual_trade.flag"
         _processing_path = _flag_path + ".processing"
         
-        if not os.path.exists(_flag_path):
-            # 2026-06-05 JVS Claw: clean up stale .processing from crash
-            if os.path.exists(_processing_path):
-                os.remove(_processing_path)
+        # 2026-06-22 Gemini CLI: Support processing of both new and pending retry flags
+        _has_new = os.path.exists(_flag_path)
+        _has_processing = os.path.exists(_processing_path)
+        
+        if not _has_new and not _has_processing:
             return False
 
-        # ── C1: Atomic rename (flag → .processing) ──
-        # 2026-06-05 JVS Claw: prevents flag deletion before validation
-        try:
-            os.rename(_flag_path, _processing_path)
-        except OSError:
-            return False  # Another caller already took it
+        if _has_new:
+            # ── C1: Atomic rename (flag → .processing) ──
+            # 2026-06-05 JVS Claw: prevents flag deletion before validation
+            try:
+                os.rename(_flag_path, _processing_path)
+            except OSError:
+                return False  # Another caller already took it
 
         try:
             self._manual_trade_status = "PROCESSING"
@@ -4324,7 +4338,7 @@ class FuturesMonitor:
                 _dash_far = _flag.get("far_close")
                 
                 _near = _price
-                _far = self._far_current_bar.get("close", _price) # Fallback to near if far not yet seen
+                _far = self._far_current_bar.get("close") or _price # Fallback to near if far not yet seen or zero
                 _ts = datetime.now()
                 _trade_id = f"mts-{_ts.strftime('%Y%m%d-%H%M%S')}"
 
@@ -4372,30 +4386,34 @@ class FuturesMonitor:
                     console.print(f"[yellow]📝 [MANUAL_TRADE] NEAR={_near_side} ref={_near:.1f} (MKP) src={_price_source}[/yellow]")
                     console.print(f"[yellow]📝 [MANUAL_TRADE] FAR={_far_side} ref={_far:.1f} (MKP) src={_price_source}[/yellow]")
                     
-                    _near_order = self.order_mgr.create_order(symbol=f"{self.ticker}_NEAR", side=_near_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_MANUAL")
+                    _near_order = self.order_mgr.create_order(symbol=f"{self.ticker}_NEAR", side=_near_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_ENTRY")
                     self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_near_order))
                     # 2026-06-08 JVS Claw: Add trade_id for watchdog partial fill detection
+                    # 2026-06-22 Gemini CLI: Map manual trade signal to _spread_side and strategy to MTS_ENTRY
                     self._pending_lifecycle_orders[_near_order.order_id] = {
                         "intent_id": _near_order.intent_id,
-                        "signal": "BUY" if _near_side == OrderSide.BUY else "SELL",
+                        "signal": _spread_side,
                         "reason": "MTS_MANUAL", "ts": _ts, "lots": 1,
                         "stop_loss": 20, "price": _near,
-                        "trade_id": _trade_id
+                        "trade_id": _trade_id,
+                        "strategy": "MTS_ENTRY",
                     }
                     self.order_mgr.submit(_near_order)
                     if self.paper_fill_sim:
                         self.paper_fill_sim.register(_near_order)
 
                     # 2026-06-08 JVS Claw: MKP (範圍市價)
-                    _far_order = self.order_mgr.create_order(symbol=f"{self.ticker}_FAR", side=_far_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_MANUAL")
+                    _far_order = self.order_mgr.create_order(symbol=f"{self.ticker}_FAR", side=_far_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_ENTRY")
                     self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_far_order))
                     # 2026-06-08 JVS Claw: Add trade_id for watchdog partial fill detection
+                    # 2026-06-22 Gemini CLI: Map manual trade signal to _spread_side and strategy to MTS_ENTRY
                     self._pending_lifecycle_orders[_far_order.order_id] = {
                         "intent_id": _far_order.intent_id,
-                        "signal": "BUY" if _far_side == OrderSide.BUY else "SELL",
+                        "signal": _spread_side,
                         "reason": "MTS_MANUAL", "ts": _ts, "lots": 1,
                         "stop_loss": 20, "price": _far,
-                        "trade_id": _trade_id
+                        "trade_id": _trade_id,
+                        "strategy": "MTS_ENTRY",
                     }
                     self.order_mgr.submit(_far_order)
                     if self.paper_fill_sim:
@@ -4468,33 +4486,9 @@ class FuturesMonitor:
                         os.remove(_processing_path)
                     self._flag_retry_count = 0
 
-                    # ── Sync strategy state (Immediately only for Paper Mode) ──
-                    try:
-                        _mts_strat = self._registry.get("tmf_spread")
-                        if _mts_strat:
-                            from core.strategy_context import StrategyContext
-                            from strategies.plugins.futures.active.tmf_spread import _write_mts_state
-                            if not hasattr(_mts_strat, "_has_position"):
-                                _mts_strat.init(StrategyContext(
-                                    market=MarketData(
-                                        last_bar={}, 
-                                        timestamp="",
-                                        # 2026-05-27 Gemini CLI: Explicitly pass ticker to MTS strategy context
-                                        ticker=self.ticker
-                                    ), 
-                                    position=PositionView(size=0), 
-                                    config=self.cfg
-                                ))
-                            
-                            _mts_strat.sync_position(trade_id=_trade_id, side="SHORT" if _spread_side == "SELL_NEAR_BUY_FAR" else "LONG",
-                                                     near_entry=_near, far_entry=_far)
-                            
-                            _write_mts_state(has_position=True, action=_spread_side, reason="MANUAL_ENTRY",
-                                             near_entry=_near, far_entry=_far, near_last=_near, far_last=_far,
-                                             near_side=_near_label, far_side=_far_label,
-                                             spread_z=3.0, released_leg=None, trade_id=_trade_id)
-                    except Exception as _se:
-                        console.print(f"[red]⚠️ [MANUAL_TRADE] Strategy sync failed: {_se}[/red]")
+                    # 2026-06-22 Gemini CLI: Removed immediate strategy sync to avoid duplicate position state logs.
+                    # Updates are handled cleanly by the on_fill callback pipeline (Deferred Strategy Sync).
+                    pass
                 else:
                     self._manual_trade_status = "FAILED: NO_MGR"
                     console.print("[red]⚠️ [MANUAL_TRADE] order_mgr not available[/red]")
@@ -4603,8 +4597,10 @@ class FuturesMonitor:
 
         # ── [Manual Trade Flag] Check on every poll cycle ──
         # Check flag before session gate so we can report "WAITING_MARKET_OPEN"
+        # 2026-06-22 Gemini CLI: Check for both new and pending retry flags
         _flag_path = "/tmp/futures_manual_trade.flag"
-        if os.path.exists(_flag_path):
+        _processing_path = _flag_path + ".processing"
+        if os.path.exists(_flag_path) or os.path.exists(_processing_path):
             from core.date_utils import is_day_session, is_night_session
             now_dt = datetime.now()
             if not is_day_session(now_dt) and not is_night_session(now_dt):
@@ -4848,91 +4844,11 @@ class FuturesMonitor:
             "cross_policy": policy,
         })
         self._last_cross_policy = policy
-        
-        try:
-            # ═══ TX CACHE ONLY (no on-demand API calls) ═══
-            # TX bars for cross-regime engine are populated exclusively
-            # during backfill/startup via IngestionService.fetch_backfill()
-            # (which calls _prefetch_tx_bars() as a side effect).
-            # Access is via self._ingestion.get_tx_cache() or fallback
-            # to _tx_cached_kbars (populated by the old path).
-            # If neither live ticks nor cached TX bars are available,
-            # we skip cross-regime entirely (no fallback API call).
-            if tx_bars_list is None:
-                try:
-                    tx_cached = self._ingestion.get_tx_cache()
-                    if tx_cached is None:
-                        tx_cached = getattr(self, '_tx_cached_kbars', None)
-                    if tx_cached is not None and len(tx_cached) >= 20:
-                        tx_bars_list = list(tx_cached[-100:])
-                        console.print(f"[dim][TX] Using {len(tx_bars_list)} cached TX bars for cross-regime[/dim]")
-                except Exception:
-                    tx_bars_list = None
-
-            tmf_bars_list = bars_list if 'bars_list' in locals() else []
-
-            # If we have TX bars built from ticks, ensure time alignment with MXF 5m bars
-            cross_skipped = False
-            try:
-                if tx_bars_list and df_5m is not None:
-                    aligned = self._bars_time_aligned(tx_bars_list, df_5m)
-                    if not aligned:
-                        console.print(f" [yellow][CROSS] tx/tmf bars not time-aligned (skip cross-regime) [/yellow] ")
-                        # Skip cross-regime gating entirely: set permissive policy and jump ahead
-                        policy = {"allow_trade": True, "orb_weight": 1.0, "vwap_weight": 1.0}
-                        self._last_bar_context.update({
-                            "tx_regime": "SKIP",
-                            "tmf_regime": "SKIP",
-                            "cross_policy": policy,
-                        })
-                        self._last_cross_policy = policy
-                        console.print(f"[dim][CROSS] Skipped cross-regime due to misalignment; permissive fallback[/dim]")
-                        cross_skipped = True
-                        
-            except Exception:
-                pass
-
-            if cross_skipped:
-                # Jump ahead — skip regime detection and cross_engine, use permissive policy
-                tx_regime = "SKIP"
-                tmf_regime = "SKIP"
-            else:
-                if getattr(self, 'tx_detector', None) is not None and tx_bars_list:
-                    tx_regime = self.tx_detector.detect(tx_bars_list)
-                if getattr(self, 'tmf_detector', None) is not None:
-                    tmf_regime = self.tmf_detector.detect(tmf_bars_list)
-                if getattr(self, 'cross_engine', None) is not None:
-                    # Cross engine supports freshness flags; use feed_health if present
-                    tx_fresh = True
-                    tmf_fresh = True
-                    try:
-                        if hasattr(self, 'feed_health') and self.feed_health is not None:
-                            tx_fresh = self.feed_health.age('TX') <= FEED_STALE_SECS
-                            # 2026-05-27 Gemini CLI: Use dynamic ticker for feed freshness
-                            tmf_fresh = self.feed_health.age(self.ticker) <= FEED_STALE_SECS
-                    except Exception:
-                        tx_fresh = tmf_fresh = True
-                    policy = self.cross_engine.decide(tx_regime, tmf_regime, tx_fresh=tx_fresh, tmf_fresh=tmf_fresh)
-                else:
-                    policy = {"allow_trade": True, "orb_weight": 1.0, "vwap_weight": 1.0}
-
-                self._last_bar_context.update({
-                    "tx_regime": tx_regime,
-                    "tmf_regime": tmf_regime,
-                    "cross_policy": policy,
-                })
-                # Persist last cross policy for later use in order callbacks / audit
-                self._last_cross_policy = policy
-            console.print(f"[dim][CROSS] tx={tx_regime} tmf={tmf_regime} allow={policy.get('allow_trade', False)} orb_w={policy.get('orb_weight', 0):.2f} vwap_w={policy.get('vwap_weight', 0):.2f} reason={policy.get('reason','')}[/dim]")
-
-            if not policy.get('allow_trade', False):
-                console.print(f" [yellow]🔒 CrossPolicy: trading disabled by tx={tx_regime} tmf={tmf_regime} reason={policy.get('reason','')}[/yellow] ")
-                score = 0.0
-            else:
-                mult = max(0.5, min(1.3, 0.6 * policy.get('orb_weight', 1.0) + 0.4 * policy.get('vwap_weight', 1.0)))
-                score = float(score) * mult
-        except Exception as e:
-            console.print(f" [yellow]⚠️ Cross-regime integration failed: {e}[/yellow] ")
+        # Pure TMF: cross-regime (TX macro filter) disabled entirely.
+        # The dead try/except block that previously handled TXFR1 cache lookup,
+        # cross-regime detection, and score weighting has been removed.
+        # Score multiplier stays at 1.0 (permissive, no TX-based gating).
+        # 2026-06-18 Hermes Agent
 
         # [GSD 4.13] Trading Readiness Unlock: only allow trading if we have enough bars for indicators
         feed_is_fresh = self._tmf_feed_age_secs() <= getattr(self, "STALE_WARN_SECS", self.MONITOR.get("stale_tick_warn_secs", 120))

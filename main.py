@@ -695,7 +695,14 @@ def run_system(dry_run=False):
                     console.print(f"[green]📡 Subscribed TMF tick: {fm.contract.code}[/green]")
                 except Exception as e:
                     console.print(f"[yellow]⚠️ TMF subscribe failed: {e}[/yellow]")
+                # Pure TMF: orphaned far-month subscribe except block removed.
+                # 2026-06-18 Hermes Agent
 
+            # 2026-06-22 Gemini CLI: Subscribe far-month contract at startup for MTS calendar spread trading
+            if fm.far_contract is not None:
+                try:
+                    safe_subscribe(api, fm.far_contract, quote_type='tick')
+                    console.print(f"[green]📡 Subscribed far-month Futures tick: {fm.far_contract.code}[/green]")
                 except Exception as e:
                     console.print(f"[yellow]⚠️ Far-month Futures subscribe failed: {e}[/yellow]")
 

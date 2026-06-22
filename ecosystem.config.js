@@ -4,7 +4,7 @@ module.exports = {
       // PM2 is the sole owner of the trading core; dashboards are started by autostart.sh.
       name: "trading-system",
       script: "main.py",
-      interpreter: "/usr/local/bin/python3",
+      interpreter: "./venv/bin/python3",
       cwd: "/Users/mylin/Documents/mylin102/tw-trading-unified",
       env: {
         PYTHONPATH: "/Users/mylin/Documents/mylin102/tw-trading-unified",
@@ -28,7 +28,7 @@ module.exports = {
     },
     {
       name: "dashboard",
-      script: "python3",
+      script: "./venv/bin/python3",
       cwd: "/Users/mylin/Documents/mylin102/tw-trading-unified",
       args: "-m streamlit run ui/dashboard.py --server.port 8500",
       env: {

@@ -309,7 +309,13 @@ class ShioajiOptionsSmartMonitor:
         # 設定日誌路徑
         self._update_log_paths()
         if self.api is not None and hasattr(self.api, "set_order_callback"):
-            self.api.set_order_callback(self.on_order_event)
+            try:
+                self.api.set_order_callback(self.on_order_event)
+            except RuntimeError as e:
+                if "Already borrowed" in str(e):
+                    console.print("[dim]🔗 Options order callback already managed by parent session[/dim]")
+                else:
+                    raise
 
     def _update_log_paths(self):
         log_sub_dir = "live_trading" if self.live_trading else "paper_trading"
@@ -4397,7 +4403,6 @@ class ShioajiOptionsSmartMonitor:
         if self.stop_loss_pct > 0:
             sl_threshold = self.entry_price * (1 - self.stop_loss_pct)
             if premium <= sl_threshold:
-                self._exit_in_progress = True
                 self._exit_start_time = time.monotonic()
                 self._pending_exit_request = {
                     "reason": "PAPER_STOP_LOSS",
@@ -4410,7 +4415,6 @@ class ShioajiOptionsSmartMonitor:
         if self.hard_stop_pct > 0:
             hs_threshold = self.entry_price * (1 - self.hard_stop_pct)
             if premium <= hs_threshold:
-                self._exit_in_progress = True
                 self._exit_start_time = time.monotonic()
                 self._pending_exit_request = {
                     "reason": "PAPER_HARD_STOP",
@@ -4425,7 +4429,6 @@ class ShioajiOptionsSmartMonitor:
             if self.has_tp1_hit or unrealized_pct >= 0.08:
                 trail_floor = self.peak_premium * (1 - self.trailing_stop_pct)
                 if premium <= trail_floor:
-                    self._exit_in_progress = True
                     self._exit_start_time = time.monotonic()
                     self._pending_exit_request = {
                         "reason": "PAPER_TRAIL_EXIT",
@@ -4478,7 +4481,7 @@ class ShioajiOptionsSmartMonitor:
         """
         Tiered Options Safety Watchdog.
 
-        Tier 1 (10s): _exit_in_progress stuck detection & self-heal.
+        Tier 1 (10s): _exit_in_progress or _pending_exit_request stuck detection & self-heal.
         Tier 2 (30s): memory vs ledger reconciliation (告警 only, 不清倉).
         """
         now_mono = time.monotonic()
@@ -4488,7 +4491,7 @@ class ShioajiOptionsSmartMonitor:
             return
         self._watchdog_last_hi = now_mono
 
-        if self._exit_in_progress:
+        if self._exit_in_progress or self._pending_exit_request is not None:
             elapsed = now_mono - self._exit_start_time if self._exit_start_time > 0 else 0.0
             if elapsed > 15.0:
                 # Case A: pending exit not consumed — retry drain
@@ -4505,8 +4508,8 @@ class ShioajiOptionsSmartMonitor:
                         elapsed_secs=round(elapsed, 1),
                         position=self.position,
                     )
+                    # Reset state and queue fresh request (don't set _exit_in_progress here)
                     self._exit_in_progress = False
-                    self._exit_start_time = 0.0
                     quote = self.current_option_quote(self.active_side)
                     retry_price = quote.get("bid", quote.get("close", 0))
                     if retry_price > 0:
@@ -4515,7 +4518,6 @@ class ShioajiOptionsSmartMonitor:
                             "premium": retry_price,
                             "source": "WATCHDOG_RETRY",
                         }
-                        self._exit_in_progress = True
                         self._exit_start_time = time.monotonic()
 
                 # Case C: no position but stuck flag — clean up
@@ -5083,33 +5085,45 @@ class ShioajiOptionsSmartMonitor:
         self._running = True
         
         # [Phase A] Immediate Activation (Moved from __init__)
-        # Extra guard: if api was already injected by OptionsMonitor wrapper, skip login.
-        if not self.dry_run and self.api is None:
+        if not self.dry_run:
             from strategies.options.login import shioaji_login
             from options_engine.engine.broker_adapter import ShioajiBrokerAdapter, MockBrokerAdapter
             
-            self.api = shioaji_login.login()
-            if self.dry_run_live_orders:
-                self.broker = MockBrokerAdapter(self.execution_cfg)
-            else:
-                self.broker = ShioajiBrokerAdapter(self.api, self.execution_cfg)
+            # 1. Ensure API is logged in
+            if self.api is None:
+                self.api = shioaji_login.login()
                 
-            if self.api is not None and hasattr(self.api, "set_order_callback"):
-                self.api.set_order_callback(self.on_order_event)
+            # 2. Ensure Broker Adapter is initialized
+            if self.broker is None and self.api is not None:
+                if self.dry_run_live_orders:
+                    self.broker = MockBrokerAdapter(self.execution_cfg)
+                else:
+                    self.broker = ShioajiBrokerAdapter(self.api, self.execution_cfg)
 
-            # Initialize OrderManager
-            cfg = self.load_config()
-            self._use_order_manager = cfg.get("monitoring", {}).get("use_order_manager", False)
-            if self._use_order_manager:
-                from core.order_management.order_manager import OrderManager
-                _om_mode = "live" if self.live_trading else "paper"
-                self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=self.broker)
-                
-                # Prefer broker truth for live startup; fall back to ledger when broker recovery yields nothing.
-                self._startup_recover_live_order_state()
-                
-                self._wire_order_callbacks()
-                console.print(f"[green]📋 Options Order Lifecycle Manager enabled ({_om_mode} mode)[/green]")
+            # 3. Wire API callbacks
+            if self.api is not None and hasattr(self.api, "set_order_callback"):
+                try:
+                    self.api.set_order_callback(self.on_order_event)
+                except RuntimeError as e:
+                    if "Already borrowed" in str(e):
+                        console.print("[dim]🔗 Options order callback already managed by parent session[/dim]")
+                    else:
+                        raise
+
+            # 4. Initialize OrderManager (SSOT for all orders)
+            if self.order_mgr is None:
+                cfg = self.load_config()
+                self._use_order_manager = cfg.get("monitoring", {}).get("use_order_manager", False)
+                if self._use_order_manager:
+                    from core.order_management.order_manager import OrderManager
+                    _om_mode = "live" if self.live_trading else "paper"
+                    self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=self.broker)
+                    
+                    # Prefer broker truth for live startup; fall back to ledger when broker recovery yields nothing.
+                    self._startup_recover_live_order_state()
+                    
+                    self._wire_order_callbacks()
+                    console.print(f"[green]📋 Options Order Lifecycle Manager enabled ({_om_mode} mode)[/green]")
 
         # Immediate Heartbeat & Status Summary
         if not self.active_contracts:

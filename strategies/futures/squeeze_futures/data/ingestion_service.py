@@ -234,8 +234,9 @@ class IngestionService:
             df = self._client.get_kline(self._ticker, interval="5m")
             if df is not None and not df.empty:
                 self._save_raw_kbars(df)
-                # Also pre-fetch TX bars on startup
-                self._prefetch_tx_bars()
+                # Pure TMF: TX pre-fetch disabled — cross-regime engine no longer used.
+                # 2026-06-18 Hermes Agent
+                # self._prefetch_tx_bars()
                 return df
             return None
 
