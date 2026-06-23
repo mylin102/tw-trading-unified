@@ -3628,14 +3628,16 @@ class FuturesMonitor:
                 return
 
             # 2. Position Details
-            _n_entry = getattr(strategy, "_near_entry", 0) or float(existing.get("near_entry", 0))
-            _f_entry = getattr(strategy, "_far_entry", 0) or float(existing.get("far_entry", 0))
+            # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
+            _n_entry = getattr(strategy, "_near_entry", 0.0) or float(existing.get("near_entry") or 0.0)
+            _f_entry = getattr(strategy, "_far_entry", 0.0) or float(existing.get("far_entry") or 0.0)
             _n_side = getattr(strategy, "_near_side", None) or existing.get("near_side")
             _f_side = getattr(strategy, "_far_side", None) or existing.get("far_side")
             
             # 2026-06-09 JVS Claw: Read latest prices from market_data, fallback to existing
-            _n_last = float(self.market_data.get(self.ticker, {}).get("close", 0)) or float(existing.get("near_last", 0))
-            _f_last = float(self.market_data.get(f"{self.ticker}_FAR", {}).get("close", 0)) or float(self._far_current_bar.get("close", 0)) or float(existing.get("far_last", 0))
+            # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
+            _n_last = float(self.market_data.get(self.ticker, {}).get("close") or 0.0) or float(existing.get("near_last") or 0.0)
+            _f_last = float(self.market_data.get(f"{self.ticker}_FAR", {}).get("close") or 0.0) or float(self._far_current_bar.get("close") or 0.0) or float(existing.get("far_last") or 0.0)
             
             # 2026-05-27 Gemini CLI: Use dynamic multiplier from constants instead of hardcoded 10.0
             _mult = float(get_point_value(self.ticker))
@@ -3908,8 +3910,9 @@ class FuturesMonitor:
             else:
                 # 💡 [Fixed 2026-05-27] Strict Persistence Protection
                 # If memory is uninitialized, ALWAYS prioritize disk state to prevent overwriting with nulls.
-                _n_entry = getattr(strategy, "_near_entry", 0) or float(existing.get("near_entry", 0))
-                _f_entry = getattr(strategy, "_far_entry", 0) or float(existing.get("far_entry", 0))
+                # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
+                _n_entry = getattr(strategy, "_near_entry", 0.0) or float(existing.get("near_entry") or 0.0)
+                _f_entry = getattr(strategy, "_far_entry", 0.0) or float(existing.get("far_entry") or 0.0)
                 _n_side = getattr(strategy, "_near_side", None) or existing.get("near_side")
                 _f_side = getattr(strategy, "_far_side", None) or existing.get("far_side")
                 _trade_id = getattr(strategy, "_trade_id", None) or existing.get("trade_id")
@@ -3919,8 +3922,9 @@ class FuturesMonitor:
                 if _trade_id and not getattr(strategy, "_trade_id", None):
                     strategy._trade_id = _trade_id
                 
-                _n_last = float(_bar_dict.get("near_close", 0))
-                _f_last = float(_bar_dict.get("far_close", 0))
+                # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
+                _n_last = float(_bar_dict.get("near_close") or 0.0)
+                _f_last = float(_bar_dict.get("far_close") or 0.0)
                 # 2026-05-27 Gemini CLI: Use dynamic multiplier from constants instead of hardcoded 10.0
                 _mult = float(get_point_value(self.ticker))
                 _n_upl = (_n_last - _n_entry) * (-1 if _n_side == "SHORT" else 1) * _mult if _n_entry > 0 and _n_last > 0 and _n_side else 0.0

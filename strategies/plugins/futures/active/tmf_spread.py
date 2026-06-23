@@ -167,8 +167,9 @@ def _write_mts_state(
 
         # ── Immutable Field Recovery ──
         # If incoming is 0/None but disk has valid data, preserve the disk data
-        _f_near_entry = near_entry if near_entry > 0 else float(existing.get("near_entry", 0))
-        _f_far_entry = far_entry if far_entry > 0 else float(existing.get("far_entry", 0))
+        # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
+        _f_near_entry = near_entry if near_entry > 0 else float(existing.get("near_entry") or 0.0)
+        _f_far_entry = far_entry if far_entry > 0 else float(existing.get("far_entry") or 0.0)
         _f_near_side = near_side or existing.get("near_side")
         _f_far_side = far_side or existing.get("far_side")
         _f_trade_id = trade_id or existing.get("trade_id")
@@ -487,9 +488,10 @@ class TMFSpread(StrategyBase):
                             if _pollute_pass:
                                 self._has_position = True
                                 self._lifecycle = state.get("state", "OPEN")
-                                self._entry_spread_z = float(state.get("entry_spread_z", 0))
-                                self._near_entry = float(state.get("near_entry", 0))
-                                self._far_entry = float(state.get("far_entry", 0))
+                                # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
+                                self._entry_spread_z = float(state.get("entry_spread_z") or 0.0)
+                                self._near_entry = float(state.get("near_entry") or 0.0)
+                                self._far_entry = float(state.get("far_entry") or 0.0)
                                 self._near_side = state.get("near_side")
                                 self._far_side = state.get("far_side")
                                 self._released_leg = state.get("released_leg")
