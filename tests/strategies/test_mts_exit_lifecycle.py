@@ -145,3 +145,57 @@ def test_mts_order_lifecycle_flow():
         # Verify strategy state sync (it should be reset now)
         assert strat._has_position is False
         assert strat._lifecycle == "FLAT"
+
+def test_mts_near_leg_exit_clears_trader_position():
+    """
+    2026-06-23 Gemini CLI: Verify that when the near leg exit order is filled,
+    the trader position is correctly set to 0 (flat), not entered short (-1).
+    """
+    from strategies.futures.monitor import FuturesMonitor
+    from core.order_management.order_manager import OrderManager
+    from core.order_management.order import OrderType, OrderSide, OrderStatus
+    
+    api = MagicMock()
+    api.Contracts.Futures.TMF = [MagicMock(code="TMFF6", delivery_date="2026-06-17")]
+    
+    monitor = FuturesMonitor(api, "config/futures_night.yaml", dry_run=True)
+    monitor.ticker = "TMF"
+    monitor._use_order_manager = True
+    monitor.order_mgr = OrderManager(api)
+    monitor.contract = MagicMock(code="TMFF6")
+    
+    # Setup initial position as LONG (1)
+    monitor.trader.position = 1
+    monitor.trader.entry_price = 44000.0
+    
+    # Create near leg exit order
+    order = monitor.order_mgr.create_order(
+        symbol="TMFF6", 
+        side=OrderSide.SELL, 
+        order_type=OrderType.MKP, 
+        quantity=1, 
+        strategy="MTS_EXIT"
+    )
+    
+    monitor._pending_lifecycle_orders[order.order_id] = {
+        "intent_id": order.intent_id, "signal": "EXIT", "reason": "test_exit",
+        "ts": datetime.now(), "lots": 1, "price": 44000.0, "ref_ohlc": {},
+        "strategy": "MTS_EXIT",
+    }
+    
+    # Simulate the fill event
+    deal_event = MagicMock()
+    deal_event.order_id = order.order_id
+    deal_event.fill_qty = 1
+    deal_event.fill_price = 44050.0
+    deal_event.status = OrderStatus.FILLED
+    deal_event.deal_id = "deal-999"
+    deal_event.symbol = "TMFF6"
+    
+    with patch("strategies.futures.monitor.save_trade"), \
+         patch("strategies.futures.monitor.DecisionLogger", create=True):
+        monitor._apply_confirmed_futures_deal(deal_event)
+        
+    # Verify that the trader's position was zeroed out (0), not set to -1 (short entry)
+    assert monitor.trader.position == 0
+

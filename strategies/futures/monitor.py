@@ -1993,12 +1993,23 @@ class FuturesMonitor:
                  _is_far_leg = "FAR" in _symbol
                  
                  if _is_near_leg:
-                     # 2026-06-22 Gemini CLI: NEAR leg: use actual fill event side directly to avoid signal name string matching issues (uppercase for PaperTrader compatibility)
-                     from core.order_management.order import OrderSide
-                     _mkt_action = "BUY" if event.side == OrderSide.BUY else "SELL"
-                     # 2026-06-22 Gemini CLI: Pass ts variable to execute_signal to fix signature mismatch TypeError
-                     self.trader.execute_signal(_mkt_action, price, ts, lots=lots)
-                     console.print(f"[dim][MTS_SYNC] NEAR-leg synced to trader: {self.trader.position} ({_mkt_action})[/dim]")
+                      # 2026-06-23 Gemini CLI: Determine if this fill is an exit/release/emergency closing transaction
+                      _is_closing = False
+                      if pending:
+                          _pending_strat = pending.get("strategy", "")
+                          _pending_sig = pending.get("signal", "")
+                          if _pending_strat in ("MTS_RELEASE", "MTS_EXIT", "MTS_EMERGENCY") or _pending_sig in ("RELEASE_NEAR", "EXIT"):
+                              _is_closing = True
+                      
+                      if _is_closing:
+                          _mkt_action = "EXIT"
+                      else:
+                          from core.order_management.order import OrderSide
+                          _mkt_action = "BUY" if event.side == OrderSide.BUY else "SELL"
+                      
+                      # 2026-06-22 Gemini CLI: Pass ts variable to execute_signal to fix signature mismatch TypeError
+                      self.trader.execute_signal(_mkt_action, price, ts, lots=lots)
+                      console.print(f"[dim][MTS_SYNC] NEAR-leg synced to trader: {self.trader.position} ({_mkt_action})[/dim]")
 
                  self._applied_lifecycle_deals.add(deal_key)
                  
@@ -4218,6 +4229,12 @@ class FuturesMonitor:
                         self.order_mgr.submit(_o_near)
                         if self.paper_fill_sim:
                             self.paper_fill_sim.register(_o_near)
+                        # 2026-06-23 Gemini CLI: Register emergency order in pending_lifecycle_orders so fill updates position
+                        self._pending_lifecycle_orders[_o_near.order_id] = {
+                            "intent_id": _o_near.intent_id, "signal": "EXIT", "reason": "EMERGENCY_CLOSE",
+                            "ts": _ts, "lots": 1, "price": _n_price, "ref_ohlc": {},
+                            "strategy": "MTS_EMERGENCY",
+                        }
 
                         _f_side = OrderSide.SELL if _far_side == "LONG" else OrderSide.BUY
                         _f_price = _far_last + _EXIT_BUFFER * _TICK if _f_side == OrderSide.BUY else _far_last - _EXIT_BUFFER * _TICK
@@ -4225,6 +4242,12 @@ class FuturesMonitor:
                         self.order_mgr.submit(_o_far)
                         if self.paper_fill_sim:
                             self.paper_fill_sim.register(_o_far)
+                        # 2026-06-23 Gemini CLI: Register emergency order in pending_lifecycle_orders so fill updates position
+                        self._pending_lifecycle_orders[_o_far.order_id] = {
+                            "intent_id": _o_far.intent_id, "signal": "EXIT", "reason": "EMERGENCY_CLOSE",
+                            "ts": _ts, "lots": 1, "price": _f_price, "ref_ohlc": {},
+                            "strategy": "MTS_EMERGENCY",
+                        }
 
                         # 2026-05-27 Gemini CLI: Removed redundant process_tick to prevent double-ordering loops
                     else:
@@ -4238,6 +4261,12 @@ class FuturesMonitor:
                         self.order_mgr.submit(_order)
                         if self.paper_fill_sim:
                             self.paper_fill_sim.register(_order)
+                        # 2026-06-23 Gemini CLI: Register emergency order in pending_lifecycle_orders so fill updates position
+                        self._pending_lifecycle_orders[_order.order_id] = {
+                            "intent_id": _order.intent_id, "signal": "EXIT", "reason": "EMERGENCY_CLOSE",
+                            "ts": _ts, "lots": 1, "price": _price, "ref_ohlc": {},
+                            "strategy": "MTS_EMERGENCY",
+                        }
 
                         # 2026-05-27 Gemini CLI: Removed redundant process_tick to prevent double-ordering loops
                     console.print("[bold green]✅ [MANUAL_TRADE] Emergency exit orders submitted[/bold green]")
@@ -4254,6 +4283,10 @@ class FuturesMonitor:
                         _write_mts_state(has_position=False, action="FLAT", reason="EMERGENCY_CLOSE", ticker=self.ticker)
                     except Exception:
                         pass
+
+                    # 2026-06-23 Gemini CLI: Reset trader position immediately on emergency close to allow subsequent manual trades without getting stuck
+                    if self.trader.position != 0:
+                        self.trader.execute_signal("EXIT", _near_last or 0.0, _ts)
                 elif not _has_pos:
                     self._manual_trade_status = "READY"
                     console.print("[yellow]⚠️ [MANUAL_TRADE] close_all: no position to close[/yellow]")
