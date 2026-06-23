@@ -215,8 +215,8 @@ def check_password():
 if not check_password():
     st.stop()
 
-# 每 30 秒自動刷新（登入後才啟用）
-st_autorefresh(interval=30_000, key="data_refresh")
+# 2026-06-23 Gemini CLI: 每 10 秒自動刷新（登入後才啟用），增加更新頻率並利用客戶端刷新以降低伺服器 CPU 負載
+st_autorefresh(interval=10_000, key="data_refresh")
 
 BASE = Path(__file__).parent.parent
 # GSD: Align DATE_STR with the ACTIVE trading session date (e.g. after 15:00 today, it's tomorrow's date)
@@ -408,6 +408,14 @@ def load_yaml(path):
 def save_yaml(path, data):
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+# 2026-06-23 Gemini CLI: 快取策略註冊表探索流程，避免在每次頁面重整（每 10 秒）都重新掃描並載入 21 個策略 plugin，藉此降低 CPU 使用率
+@st.cache_resource(ttl=300)
+def get_cached_strategy_registry():
+    from core.strategy_registry import StrategyRegistry
+    _reg = StrategyRegistry()
+    _reg.discover()
+    return _reg
 
 # ── Configs ──
 FUTURES_CFG_PATH = BASE / "config" / FUTURES_CFG_NAME
@@ -4252,9 +4260,8 @@ with tab_settings:
 
     # 2026-05-27 Gemini CLI: Dynamic Ticker in Settings
     with st.expander(f"📈 期貨 {_TICKER} 設定", expanded=True):
-        from core.strategy_registry import StrategyRegistry
-        _reg = StrategyRegistry()
-        _reg.discover()
+        # 2026-06-23 Gemini CLI: 使用快取的策略註冊表以避免在每次重整時重複掃描目錄，優化 CPU 使用率
+        _reg = get_cached_strategy_registry()
         fut_strats = {item["name"]: item for item in _reg.list_all() if item.get("asset_class") == "futures" and item.get("available", False)}
         current_fut_strat = futures_cfg.get("strategy", {}).get("active_strategy", futures_cfg.get("active_strategy", "counter_vwap"))
 
@@ -4721,4 +4728,5 @@ with tab_volatility:
     st.divider()
 
 # -- Footer and Refresh --
-    st.rerun()
+    # 2026-06-23 Gemini CLI: 移除伺服器端 time.sleep(5) 與 st.rerun() 的無條件循環，完全由 line 219 的瀏覽器端 st_autorefresh 每 10 秒觸發，使伺服器執行緒能正常結束並釋放 CPU 資源，解決 CPU 99% 與高溫 99°C 的問題
+    pass

@@ -6,7 +6,8 @@
 # - main.py duplicate protection remains in main.py via /tmp/tw_trading_unified.pid
 
 UNIFIED_DIR="/Users/mylin/Documents/mylin102/tw-trading-unified"
-PYTHON_EXEC="python3"
+# 2026-06-23 Gemini CLI: limit CPU usage of python processes in autostart to 50%
+PYTHON_EXEC="$UNIFIED_DIR/scripts/python3-cpulimit.sh"
 LOG_DIR="$UNIFIED_DIR/logs"
 mkdir -p "$LOG_DIR"
 cd "$UNIFIED_DIR"

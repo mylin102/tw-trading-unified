@@ -23,9 +23,9 @@ while true; do
             # 等待 5 秒緩衝
             sleep 5
 
-            # 重新啟動交易系統 (加入路徑確保)
-            nohup python3 main.py >> logs/unified.log 2>&1 &
-            nohup python3 scripts/runners/stock_runner.py >> logs/stock_runner.log 2>&1 &
+            # 2026-06-23 Gemini CLI: limit CPU usage of main.py and stock_runner.py to 50%
+            nohup ./scripts/python3-cpulimit.sh main.py >> logs/unified.log 2>&1 &
+            nohup ./scripts/python3-cpulimit.sh scripts/runners/stock_runner.py >> logs/stock_runner.log 2>&1 &
 
             RESTART_COUNT=$((RESTART_COUNT+1))
             echo "✅ 救援完成。等待系統穩定..." >> $REPORT
@@ -47,7 +47,8 @@ while true; do
              chmod +x scripts/stop_engine_only.sh
              ./scripts/stop_engine_only.sh >> $RESTART_LOG 2>&1
              sleep 2
-             nohup python3 main.py >> logs/unified.log 2>&1 &
+             # 2026-06-23 Gemini CLI: limit CPU usage of main.py to 50%
+             nohup ./scripts/python3-cpulimit.sh main.py >> logs/unified.log 2>&1 &
         fi
     fi
 

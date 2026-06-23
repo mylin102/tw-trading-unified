@@ -101,20 +101,22 @@ case $choice in
     a|A)
         echo ""
         echo "啟動交易系統..."
-        echo "執行: python3 main.py"
+        echo "執行: python3 main.py (限額 50% CPU)"
         echo "按 Ctrl+C 停止"
         echo ""
-        python3 main.py
+        # 2026-06-23 Gemini CLI: limit CPU usage of main.py to 50%
+        ./scripts/python3-cpulimit.sh main.py
         ;;
     b|B)
         echo ""
         echo "啟動監控儀表板..."
         echo "訪問: http://localhost:8500"
         echo "密碼: 5888"
-        echo "執行: streamlit run ui/dashboard.py --server.port 8500"
+        echo "執行: streamlit run ui/dashboard.py (限額 50% CPU)"
         echo "按 Ctrl+C 停止"
         echo ""
-        streamlit run ui/dashboard.py --server.port 8500
+        # 2026-06-23 Gemini CLI: limit CPU usage of streamlit dashboard to 50%
+        ./scripts/python3-cpulimit.sh -m streamlit run ui/dashboard.py --server.port 8500
         ;;
     c|C)
         echo ""

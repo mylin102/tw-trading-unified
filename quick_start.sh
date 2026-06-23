@@ -20,7 +20,8 @@ mkdir -p logs
 # 啟動交易系統
 echo "啟動交易系統..."
 cd "$(dirname "$0")"
-nohup python3 main.py > logs/startup.log 2>&1 &
+# 2026-06-23 Gemini CLI: limit CPU usage of main.py to 50%
+nohup ./scripts/python3-cpulimit.sh main.py > logs/startup.log 2>&1 &
 TRADING_PID=$!
 echo "交易系統PID: $TRADING_PID"
 
@@ -30,7 +31,8 @@ sleep 5
 
 # 啟動儀表板
 echo "啟動監控儀表板..."
-nohup streamlit run ui/dashboard.py --server.port 8500 > logs/dashboard.log 2>&1 &
+# 2026-06-23 Gemini CLI: limit CPU usage of streamlit dashboard to 50%
+nohup ./scripts/python3-cpulimit.sh -m streamlit run ui/dashboard.py --server.port 8500 > logs/dashboard.log 2>&1 &
 DASHBOARD_PID=$!
 echo "儀表板PID: $DASHBOARD_PID"
 

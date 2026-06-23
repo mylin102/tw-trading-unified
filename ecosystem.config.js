@@ -4,7 +4,9 @@ module.exports = {
       // PM2 is the sole owner of the trading core; dashboards are started by autostart.sh.
       name: "trading-system",
       script: "main.py",
-      interpreter: "./venv/bin/python3",
+      // 2026-06-23 Gemini CLI: limit CPU usage of trading-system to 50%
+      interpreter: "./scripts/run-cpulimit.py",
+      interpreter_args: "./venv/bin/python3",
       cwd: "/Users/mylin/Documents/mylin102/tw-trading-unified",
       env: {
         PYTHONPATH: "/Users/mylin/Documents/mylin102/tw-trading-unified",
@@ -28,9 +30,11 @@ module.exports = {
     },
     {
       name: "dashboard",
-      script: "./venv/bin/python3",
+      // 2026-06-23 Gemini CLI: limit CPU usage of dashboard to 50%
+      script: "./scripts/run-cpulimit.py",
+      interpreter: "none",
       cwd: "/Users/mylin/Documents/mylin102/tw-trading-unified",
-      args: "-m streamlit run ui/dashboard.py --server.port 8500",
+      args: "./venv/bin/python3 -m streamlit run ui/dashboard.py --server.port 8500",
       env: {
         PYTHONPATH: "/Users/mylin/Documents/mylin102/tw-trading-unified",
         NODE_ENV: "production"
