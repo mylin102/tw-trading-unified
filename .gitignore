@@ -39,7 +39,7 @@ coverage.xml
 cache/
 
 # Generated / scratch files in root
-test_*.py
+/test_*.py
 !tests/
 _debug_*
 *.backup*

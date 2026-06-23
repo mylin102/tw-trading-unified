@@ -229,7 +229,7 @@ def _write_mts_state(
             "state": action,
             "reason": reason,
             "manual_trade_status": existing.get("manual_trade_status"),
-            "entry_spread_z": round(spread_z, 2) if spread_z != 0 else existing.get("entry_spread_z"),
+            "entry_spread_z": round(spread_z, 2) if (spread_z is not None and spread_z != 0) else existing.get("entry_spread_z"),
             "current_spread_z": existing.get("current_spread_z"),
             "release_state": release_state,
             "released_leg": released_leg,
@@ -249,7 +249,7 @@ def _write_mts_state(
             "far_realized_pnl": round(far_realized, 1),
             "total_upl": round(near_upl + far_upl, 1),
             "total_realized_pnl": round(near_realized + far_realized, 1),
-            "spread_z": round(spread_z, 2),
+            "spread_z": round(spread_z, 2) if spread_z is not None else None,
             "trail_side": _trail_side,
             "trail_mode": _trail_mode,
             "trail_peak": round(trail_peak, 1),
@@ -262,8 +262,9 @@ def _write_mts_state(
             "entry_ts": _f_entry_ts,
             "_updated": datetime.now().isoformat(),
         }
-        # 2026-05-29 Hermes Agent: fix typo _hb_state → state (NameError crash)
-        _tmp_file = _MTS_STATE_FILE + ".tmp"
+        # 2026-06-23 Gemini CLI: Use unique temporary filename to avoid race conditions with other writers
+        import random
+        _tmp_file = f"{_MTS_STATE_FILE}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
         try:
             with open(_tmp_file, "w") as f:
                 json.dump(state, f, default=str)

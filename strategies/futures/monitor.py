@@ -125,6 +125,9 @@ class FuturesMonitor:
         # to check theta_allowed flag before entering theta positions.
         self.latest_router_decision: FuturesRouterDecision | None = None
 
+        # 2026-06-23 Gemini CLI: Initialize strategy registry early to prevent AttributeError in tests/methods called before setup
+        self._registry = StrategyRegistry()
+
         # [Phase 2] IngestionService — all Shioaji API access is isolated here.
         # strategy_tick() and signal generation read from canonical bars only.
         self._ingestion = IngestionService(
@@ -443,7 +446,9 @@ class FuturesMonitor:
 
     def setup(self):
         # ── GSD: Initialize Strategy Registry ────────────────────────
-        self._registry = StrategyRegistry()
+        # 2026-06-23 Gemini CLI: Reuse existing registry instance if already created in __init__
+        if not hasattr(self, "_registry") or self._registry is None:
+            self._registry = StrategyRegistry()
         self._registry.discover()
         # [V-Model] Log discovered strategies for startup diagnostics
         _all = self._registry.list_all()
@@ -3684,8 +3689,9 @@ class FuturesMonitor:
             }
             _hb_state.update(_manual_order_info)
             
-            # 2026-05-27 Gemini CLI: P6: Atomic Write to prevent [MTS_STATE_READ_FAILED] race conditions
-            _tmp_file = _hb_file + ".tmp"
+            # 2026-06-23 Gemini CLI: Use unique temporary filename to avoid race conditions with other writers
+            import random
+            _tmp_file = f"{_hb_file}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
             try:
                 with open(_tmp_file, "w") as f:
                     json.dump(_hb_state, f, default=str)
@@ -3955,8 +3961,9 @@ class FuturesMonitor:
                     if key in existing:
                         _hb_state[key] = existing[key]
 
-                # 2026-05-27 Gemini CLI: P6: Atomic Write to prevent [MTS_STATE_READ_FAILED] race conditions
-                _tmp_file = _hb_file + ".tmp"
+                # 2026-06-23 Gemini CLI: Use unique temporary filename to avoid race conditions with other writers
+                import random
+                _tmp_file = f"{_hb_file}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
                 try:
                     with open(_tmp_file, "w") as f:
                         json.dump(_hb_state, f, default=str)
