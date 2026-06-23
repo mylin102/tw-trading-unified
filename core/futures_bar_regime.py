@@ -48,9 +48,10 @@ class FuturesBarRegimeResult:
 
 
 def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
+    # 2026-06-23 Gemini CLI: Support numpy boolean and numeric types
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, float, np.integer, np.floating)):
         return bool(value)
     if isinstance(value, str):
         return value.strip().lower() in {"true", "1", "yes", "y"}

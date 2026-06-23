@@ -25,6 +25,8 @@ def paper_mgr():
 def live_mgr():
     """Live mode OrderManager (mock broker)"""
     broker = MagicMock()
+    # 2026-06-23 Gemini CLI: Remove place_order_object to prevent MagicMock hasattr resolving True
+    del broker.place_order_object
     return OrderManager(mode="live", broker_adapter=broker)
 
 
@@ -268,6 +270,8 @@ class TestCancelGate:
 
     def test_live_cancel_calls_broker(self):
         broker = MagicMock()
+        # 2026-06-23 Gemini CLI: Remove place_order_object to prevent MagicMock hasattr resolving True
+        del broker.place_order_object
         mgr = OrderManager(mode="live", broker_adapter=broker)
         order = mgr.create_order("TMF", OrderSide.BUY, OrderType.MARKET, 1)
         broker.place_order.return_value = MagicMock(ordno="EXCH-001")

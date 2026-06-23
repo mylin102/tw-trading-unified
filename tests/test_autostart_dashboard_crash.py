@@ -31,7 +31,8 @@ def test_dashboard_uses_readiness_items_helper():
 
     assert "get_readiness_items" in src
     assert "for r in readiness_items:" in src
-    assert "TRADING: PAUSED (STALE FEED)" in src
+    # 2026-06-23 Gemini CLI: Updated assertion to match current status label in ui/dashboard.py
+    assert "DEGRADED: STALE DATA" in src
 
 
 def test_autostart_no_longer_manages_main_py():

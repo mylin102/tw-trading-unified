@@ -104,11 +104,14 @@ def test_refresh_runtime_status_requires_fresh_tmf_for_trading(tmp_path, monkeyp
     m.is_trading_ready = True
     monkeypatch.setattr("core.shioaji_session._system_status_path", lambda: tmp_path / "runtime_status.json")
 
+    # 2026-06-23 Gemini CLI: Set both last_tick_at and _last_real_tmf_tick_at to trigger staleness check correctly
     m.last_tick_at = time.time() - 10
+    m._last_real_tmf_tick_at = time.time() - 10
     m._refresh_runtime_status()
     assert get_shared_system_status() == SystemReadiness.DEGRADED
 
     m.last_tick_at = time.time()
+    m._last_real_tmf_tick_at = time.time()
     m._refresh_runtime_status()
     assert get_shared_system_status() == SystemReadiness.TRADING
 

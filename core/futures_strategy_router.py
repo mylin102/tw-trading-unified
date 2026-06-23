@@ -402,7 +402,8 @@ def _evaluate_theta_environment(
         return False, "THETA_DISABLED_BY_CONFIG"
 
     bar = context.market.last_bar
-    if not bar:
+    # 2026-06-23 Gemini CLI: Safe check bar is None to avoid Series boolean evaluation ValueError
+    if bar is None:
         return False, "NO_BAR_DATA"
 
     regime = regime_result.regime
@@ -472,7 +473,8 @@ def route_futures_signal(
 
     # Extract timestamp and symbol for attribution logging
     timestamp = context.market.timestamp
-    symbol = context.market.last_bar.get("symbol", "TX") if context.market.last_bar else "TX"
+    # 2026-06-23 Gemini CLI: Safe check context.market.last_bar is not None to avoid Series boolean evaluation ValueError
+    symbol = context.market.last_bar.get("symbol", "TX") if context.market.last_bar is not None else "TX"
 
     # ── [ThetaGate] Evaluate theta BEFORE any strategy-specific gate ──
     # Theta permission is a regime-level decision, not a spread/futures decision.
@@ -493,7 +495,8 @@ def route_futures_signal(
     bar = context.market.last_bar
     print(
         "[BIAS_TRACE_V20260508] bar_regime_bias=%r bar_bias=%r regime=%r ts=%s"
-        % (getattr(regime_result, "bias", None), bar.get("bias") if bar else None, regime_result.regime, context.market.timestamp),
+        # 2026-06-23 Gemini CLI: Safe check bar is not None to avoid Series boolean evaluation ValueError
+        % (getattr(regime_result, "bias", None), bar.get("bias") if bar is not None else None, regime_result.regime, context.market.timestamp),
         flush=True,
     )
     if bar is not None:

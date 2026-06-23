@@ -156,13 +156,13 @@ class ShioajiClient:
     def get_futures_contract(self, ticker: str):
         if not self.is_logged_in: return None
         try:
-            # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Disabled TXF/MXF hardcoded fallbacks
-            # if ticker in {'TX', 'TXF'}:
-            #     return self._resolve_front_month_futures_contract(("TXF", "TX"), "TXF")
-            # if ticker == 'TXFR1':
-            #     return self.api.Contracts.Futures["TXF"]["TXFR1"]
-            # if ticker == 'MXFR1':
-            #     return self.api.Contracts.Futures["MXF"]["MXFR1"]
+            # 2026-06-23 Gemini CLI: Restore TXF/MXF contract resolution fallbacks for alias support
+            if ticker in {'TX', 'TXF'}:
+                return self._resolve_front_month_futures_contract(("TXF", "TX"), "TXF")
+            if ticker == 'TXFR1':
+                return self.api.Contracts.Futures["TXF"]["TXFR1"]
+            if ticker == 'MXFR1':
+                return self.api.Contracts.Futures["MXF"]["MXFR1"]
             
             if ticker in {'MXF', 'MX', 'TMF'}:
                 # [rshioaji 1.5.10 Workaround] Use robust list helper to avoid C++ binding crash
