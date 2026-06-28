@@ -688,10 +688,10 @@ class StockMonitor:
 
                 # --- B. Entry Filter (Market Gate + Edge Model) ---
                 if res and res["action"] == "BUY" and not self._check_bear_defense():
-                    from strategies.stocks.market_gate import get_gate, strategy_allowed
-                    gate = get_gate()
-                    if gate == "BLOCK_LONG":
-                        console.print(f"[dim]🚫 Market gate BLOCK_LONG — skip {ticker}[/dim]")
+                    from strategies.stocks.market_gate import get_gate_result, strategy_allowed
+                    gate_res = get_gate_result()
+                    if not gate_res.allowed:
+                        console.print(f"[dim]🚫 Market gate {gate_res.gate} — skip {ticker} ({gate_res.reason})[/dim]")
                         continue
                     if not strategy_allowed(self.strat_name):
                         console.print(f"[dim]🚫 Strategy {self.strat_name} not allowed in current regime — skip {ticker}[/dim]")
