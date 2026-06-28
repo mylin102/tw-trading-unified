@@ -205,7 +205,11 @@ def check_password():
     }, 100);
     </script>
     """, unsafe_allow_html=True)
-    if pwd == os.environ.get("DASHBOARD_PASSWORD", "5888"):
+    dashboard_pwd = os.environ.get("DASHBOARD_PASSWORD")
+    if dashboard_pwd is None:
+        st.error("❌ DASHBOARD_PASSWORD 環境變數未設定。請在 .env 中設定後重啟。")
+        return False
+    if pwd == dashboard_pwd:
         st.session_state["authenticated"] = True
         st.rerun()
     elif pwd:
@@ -649,11 +653,32 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     
-    # 創建子圖 (價格 + 分數)
+    # 2026-06-26 Gemini CLI: Dynamic subplot mapping for Price, Score, and ATR
+    has_score = "score" in near_df.columns
+    has_atr = "atr" in near_df.columns or "atr_60" in near_df.columns
+    
+    rows = 1
+    row_heights = [0.7] # Default height for price subplot
+    score_row = None
+    atr_row = None
+    
+    if has_score:
+        rows += 1
+        row_heights.append(0.15)
+        score_row = rows
+    if has_atr:
+        rows += 1
+        row_heights.append(0.15)
+        atr_row = rows
+        
+    # Standardize heights so they sum to 1.0
+    h_sum = sum(row_heights)
+    row_heights = [h / h_sum for h in row_heights]
+    
     fig = make_subplots(
-        rows=2, cols=1, 
+        rows=rows, cols=1, 
         shared_xaxes=True, 
-        row_heights=[0.7, 0.3], 
+        row_heights=row_heights, 
         vertical_spacing=0.05
     )
     
@@ -743,7 +768,7 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             )
     
     # 4. 分數條形圖 (如果近月資料有 score 欄位)
-    if "score" in near_df.columns:
+    if score_row is not None:
         scores = near_df["score"]
         colors = ["#00cc66" if s >= 0 else "#ff4444" for s in scores]
         fig.add_trace(
@@ -753,7 +778,22 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
                 name="Score",
                 marker_color=colors
             ),
-            row=2, col=1
+            row=score_row, col=1
+        )
+        
+    # 4b. 2026-06-26 Gemini CLI: ATR 折線圖子圖 (Method 1 & 2 視覺化)
+    if atr_row is not None:
+        atr_col = "atr" if "atr" in near_df.columns else "atr_60"
+        atr_vals = near_df[atr_col]
+        fig.add_trace(
+            go.Scatter(
+                x=near_df["timestamp"],
+                y=atr_vals,
+                name="ATR 波動度",
+                line=dict(width=1.5, color="#d62728"), # sleek red
+                mode="lines"
+            ),
+            row=atr_row, col=1
         )
     
     # 5. 添加交易時間標記
@@ -779,32 +819,26 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
                 row="all", col=1
             )
     
-    # 6. 圖表佈局設定
+    # 6. 圖表佈局設定 (2026-06-26 Gemini CLI: 動態增高以適應多個子圖)
+    chart_height = 500 if rows == 3 else 400
     fig.update_layout(
-        height=400,
+        height=chart_height,
         margin=dict(t=30, b=10, l=40, r=20),
         title=dict(text=title, x=0.5, xanchor="center"),
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
     
-    # 7. 移除非交易時段間隔
-    fig.update_xaxes(
-        rangebreaks=[
-            dict(bounds=["sat", "mon"]),  # 移除週末
-            dict(bounds=[5, 8.75], pattern="hour"),   # 05:00 - 08:45
-            dict(bounds=[13.75, 15], pattern="hour"), # 13:45 - 15:00
-        ],
-        row=1, col=1
-    )
-    fig.update_xaxes(
-        rangebreaks=[
-            dict(bounds=["sat", "mon"]),
-            dict(bounds=[5, 8.75], pattern="hour"),
-            dict(bounds=[13.75, 15], pattern="hour"),
-        ],
-        row=2, col=1
-    )
+    # 7. 移除非交易時段間隔 (2026-06-26 Gemini CLI: 遍歷所有子圖以套用 rangebreaks)
+    for r in range(1, rows + 1):
+        fig.update_xaxes(
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]),  # 移除週末
+                dict(bounds=[5, 8.75], pattern="hour"),   # 05:00 - 08:45
+                dict(bounds=[13.75, 15], pattern="hour"), # 13:45 - 15:00
+            ],
+            row=r, col=1
+        )
     
     return fig
 
@@ -2802,6 +2836,16 @@ with tab_futures:
                 _c5.metric("方向", _direction)
                 _c6.metric("理由", _mts_state.get("reason", "?"))
 
+                # 2026-06-26 Gemini CLI: Render active fixed parameters and ATR when in position
+                _stop_pts = _mts_state.get("release_stop_points") or _mts_state.get("release_stop")
+                _trail_pts = _mts_state.get("trail_distance_points") or _mts_state.get("trail_pts")
+                _current_atr = _mts_state.get("atr")
+                _atr_info = f" (ATR: `{_current_atr:.1f}`)" if _current_atr else ""
+                if _stop_pts or _trail_pts:
+                    _p1, _p2 = st.columns(2)
+                    if _stop_pts: _p1.markdown(f"🛑 **單腿釋放停損閾值**: `{_stop_pts}` 點{_atr_info}")
+                    if _trail_pts: _p2.markdown(f"📈 **剩餘腿移動止盈距離**: `{_trail_pts}` 點{_atr_info}")
+
                 # ── Unrealized PnL Breakdown ──
                 st.markdown("**MTS 未實現損益 (Unrealized PnL)**")
                 _u1, _u2, _u3 = st.columns(3)
@@ -2818,10 +2862,17 @@ with tab_futures:
                 _z = _mts_state.get("mts_spread_z") or _mts_state.get("spread_z")
                 _z_str = f"{_z:.2f}" if _z is not None else "N/A"
                 _reason = _mts_state.get("reason", "?")
+                # 2026-06-26 Gemini CLI: Render active fixed parameters and ATR when FLAT
+                _stop_pts = _mts_state.get("release_stop_points") or _mts_state.get("release_stop")
+                _trail_pts = _mts_state.get("trail_distance_points") or _mts_state.get("trail_pts")
+                _current_atr = _mts_state.get("atr")
+                _atr_info = f" (當前 ATR: `{_current_atr:.1f}`)" if _current_atr else ""
+                _params_info = f"  (固定停損: `{_stop_pts}` 點 / 停利: `{_trail_pts}` 點)" if _stop_pts and _trail_pts else ""
                 st.caption(
                     "MTS 狀態: FLAT / WAITING_FOR_SIGNAL  "
-                    f"Spread Z={_z_str}  "
+                    f"Spread Z={_z_str}{_atr_info}  "
                     f"原因: {_reason}"
+                    f"{_params_info}"
                 )
         except Exception:
             pass
@@ -3306,64 +3357,122 @@ with tab_options:
         current_iv = float(last.get("iv", 0) or 0)
         current_dte_years = float(last.get("dte", 0) or 0) / 365.0 if last.get("dte", 0) else 0.0
 
-        # 顯示當前選擇權持倉
+        # 2026-06-25 Gemini CLI: Unified realized/unrealized PnL summary and current position metrics
+        st.subheader("📊 損益與持倉摘要")
+        
         ol = load_options_ledger()
+        realized_pnl = 0.0
+        total_trades = 0
+        win_rate_str = "-"
         if ol is not None and not ol.empty:
-            open_option = find_latest_open_options_position(ol)
-            if open_option is not None:
-                side = str(open_option.side)
-                action = str(open_option.action)
-                note = str(open_option.note)
-                if "iron_condor" in note.lower():
-                    pos_label = "🦅 Iron Condor"
-                    if "[" in note:
-                        pos_label += " " + note.split("[")[1].split("]")[0]
-                elif side.upper() == "C":
-                    pos_label = "📞 Call"
-                elif side.upper() == "P":
-                    pos_label = "📉 Put"
-                else:
-                    pos_label = side
-
-                # 2026-05-25 Hermes Agent: show expiry date from dte indicator
-                dte_days = current_dte_years * 365.0 if current_dte_years > 0 else 0.0
-                expiry_str = ""
-                if dte_days > 0:
-                    today = datetime.datetime.now()
-                    expiry_date = today + datetime.timedelta(days=dte_days)
-                    expiry_str = expiry_date.strftime("%Y-%m-%d")
-                
-                st.caption(
-                    f"當前持倉: **{pos_label}** | 進場: {action} @ {open_option.entry_price:.2f}"
-                    + (f" | 到期: {expiry_str} (剩 {dte_days:.0f} 天)" if expiry_str else "")
-                )
-
-                theta_estimate = None
-                if "THETA" in action and current_spot > 0 and current_iv > 0 and current_dte_years > 0:
-                    theta_estimate = estimate_theta_unrealized(
-                        open_option.note,
-                        current_spot=current_spot,
-                        current_iv=current_iv,
-                        dte_years=current_dte_years,
-                        quantity=open_option.quantity,
-                    )
-
-                if theta_estimate is not None:
-                    ocu1, ocu2, ocu3 = st.columns(3)
-                    ocu1.metric("成交成本", f"{theta_estimate['cost_basis']:,.0f} TWD")
-                    ocu2.metric("未實現損益", f"{theta_estimate['unrealized_pnl']:+,.0f} TWD")
-                    ocu3.metric("目前部位價值", f"{theta_estimate['current_value']*50*theta_estimate['quantity']:,.0f} TWD")
-                    st.caption(
-                        f"估算: spot {current_spot:.0f} | IV {current_iv:.3f} | DTE {current_dte_years*365:.1f} | "
-                        f"信用金 {theta_estimate['entry_credit']:.1f} | 策略 {theta_estimate['strategy']}"
-                    )
-                elif open_option.entry_price > 0:
-                    st.metric("成交成本", f"{open_option.cost_basis:,.0f} TWD")
-                    st.caption(f"目前 MTX: {current_spot:.0f}")
+            if "PnL" in ol.columns:
+                exits = ol[ol["PnL"] != 0].copy()
+                if not exits.empty:
+                    exits["PnL"] = pd.to_numeric(exits["PnL"], errors="coerce").fillna(0)
+                    realized_pnl = float(exits["PnL"].sum())
+                    total_trades = len(exits)
+                    wins = (exits["PnL"] > 0).sum()
+                    if total_trades > 0:
+                        win_rate_str = f"{wins}/{total_trades} ({wins/total_trades*100:.0f}%)"
+        
+        unrealized_pnl = 0.0
+        has_pos = False
+        pos_label = "無持倉"
+        cost_basis = 0.0
+        pos_details_str = ""
+        est = None
+        
+        open_option = find_latest_open_options_position(ol) if ol is not None else None
+        if open_option is not None:
+            has_pos = True
+            side = str(open_option.side)
+            action = str(open_option.action)
+            note = str(open_option.note)
+            qty = int(open_option.quantity)
+            cost_basis = open_option.cost_basis
+            
+            if "iron_condor" in note.lower():
+                pos_label = "🦅 Iron Condor"
+                if "[" in note:
+                    pos_label += " " + note.split("[")[1].split("]")[0]
+            elif side.upper() == "C":
+                pos_label = "📞 Call"
+            elif side.upper() == "P":
+                pos_label = "📉 Put"
             else:
-                st.caption("目前無持倉")
+                pos_label = side
+
+            dte_days = current_dte_years * 365.0 if current_dte_years > 0 else 0.0
+            expiry_str = ""
+            if dte_days > 0:
+                today = datetime.datetime.now()
+                expiry_date = today + datetime.timedelta(days=dte_days)
+                expiry_str = expiry_date.strftime("%Y-%m-%d")
+            
+            pos_details_str = f"方向: **{pos_label}** | 進場: {action} @ {open_option.entry_price:.2f}"
+            if expiry_str:
+                pos_details_str += f" | 到期: {expiry_str} (剩 {dte_days:.0f} 天)"
+
+            if "THETA" in action and current_spot > 0 and current_iv > 0 and current_dte_years > 0:
+                est = estimate_theta_unrealized(
+                    open_option.note,
+                    current_spot=current_spot,
+                    current_iv=current_iv,
+                    dte_years=current_dte_years,
+                    quantity=open_option.quantity,
+                )
+            elif current_spot > 0 and current_iv > 0 and current_dte_years > 0:
+                strike_val = 0.0
+                if "strike" in o_df.columns:
+                    try:
+                        entry_ts = pd.to_datetime(open_option.timestamp)
+                        o_df_ts = pd.to_datetime(o_df["timestamp"])
+                        idx = (o_df_ts - entry_ts).abs().idxmin()
+                        strike_val = float(o_df.loc[idx, "strike"])
+                    except:
+                        strike_val = float(last.get("strike", 0))
+                else:
+                    strike_val = float(last.get("strike", 0))
+                
+                if strike_val > 0:
+                    try:
+                        from strategies.options.options_engine.engine.greeks import black_scholes
+                        entry_price = float(open_option.entry_price)
+                        side_code = str(open_option.side).upper()
+                        act_code = str(open_option.action).upper()
+                        is_buy = "BUY" in act_code or "ENTRY" in act_code
+                        
+                        bs_res = black_scholes(current_spot, strike_val, current_dte_years, 0.02, current_iv, side_code)
+                        curr_prem = float(bs_res.get("price", 0) or 0)
+                        if curr_prem > 0:
+                            pts = curr_prem - entry_price if is_buy else entry_price - curr_prem
+                            total_cost = (20 + 5) * 2 * qty + (entry_price + curr_prem) * 50 * 0.001 * qty
+                            unrealized_pnl = pts * 50 * qty - total_cost
+                            
+                            est = {
+                                "unrealized_pnl": unrealized_pnl,
+                                "cost_basis": entry_price * 50 * qty,
+                                "current_value": curr_prem,
+                            }
+                    except:
+                        pass
+            
+            if est is not None:
+                unrealized_pnl = est["unrealized_pnl"]
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("已實現損益", f"{realized_pnl:+,.0f} TWD")
+        if has_pos:
+            m2.metric("未實現損益", f"{unrealized_pnl:+,.0f} TWD")
+            m3.metric("部位成交成本", f"{cost_basis:,.0f} TWD")
+            m4.metric("目前持倉", pos_label)
+            st.caption(pos_details_str)
+            if open_option is not None and est is None:
+                st.caption("💡 提示: 該部位無法進行 B-S 定價估算，未實現損益僅顯示為 0 TWD。")
         else:
-            st.caption("目前無持倉")
+            m2.metric("未實現損益", "0 TWD")
+            m3.metric("勝率", win_rate_str)
+            m4.metric("當前持倉", "無持倉")
         
         ol = load_options_ledger()
         # Pre-process ledger to match signal expected format if not empty
@@ -4556,6 +4665,80 @@ with tab_settings:
                 import subprocess
                 subprocess.run(["pkill", "-f", "stock_runner.py"], capture_output=True)
                 st.success("台股設定已更新，正在重啟系統...")
+
+    # ── 3.5. 通知設定 ──
+    # 2026-06-26 Gemini CLI: Add email notification toggle in settings tab
+    with st.expander("✉️ 電子郵件通知設定", expanded=True):
+        def get_email_notification_status() -> bool:
+            env_path = Path(os.path.expanduser("~/.config/squeeze-backtest-email.env"))
+            if not env_path.exists():
+                return True
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("ENABLE_EMAIL_NOTIFICATION"):
+                        parts = line.split("=", 1)
+                        if len(parts) == 2:
+                            val = parts[1].strip().lower()
+                            return val not in ("false", "0", "no")
+            return True
+
+        def set_email_notification_status(enabled: bool):
+            env_path = Path(os.path.expanduser("~/.config/squeeze-backtest-email.env"))
+            if not env_path.exists():
+                os.makedirs(env_path.parent, exist_ok=True)
+                with open(env_path, "w", encoding="utf-8") as f:
+                    f.write(f"ENABLE_EMAIL_NOTIFICATION={enabled}\n")
+                return
+            with open(env_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            found = False
+            for i, line in enumerate(lines):
+                if line.strip().startswith("ENABLE_EMAIL_NOTIFICATION"):
+                    lines[i] = f"ENABLE_EMAIL_NOTIFICATION={enabled}\n"
+                    found = True
+                    break
+            if not found:
+                if lines and not lines[-1].endswith("\n"):
+                    lines.append("\n")
+                lines.append(f"ENABLE_EMAIL_NOTIFICATION={enabled}\n")
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+
+        current_email_enabled = get_email_notification_status()
+
+        with st.form("notification_settings_form"):
+            email_notify_enabled = st.checkbox("啟用交易電子郵件通知 (Email Trade Notification)", value=current_email_enabled,
+                                              help="勾選以在每次有交易時發送 Email 到指定的信箱 (mylim304@gmail.com)。")
+            
+            # Show active SMTP user / recipient for visibility if they exist
+            env_path = Path(os.path.expanduser("~/.config/squeeze-backtest-email.env"))
+            smtp_username = ""
+            smtp_recipient = ""
+            if env_path.exists():
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("SMTP_USERNAME"):
+                            parts = line.split("=", 1)
+                            if len(parts) == 2:
+                                smtp_username = parts[1].strip()
+                        elif line.startswith("SMTP_RECIPIENT"):
+                            parts = line.split("=", 1)
+                            if len(parts) == 2:
+                                smtp_recipient = parts[1].strip()
+            
+            if smtp_username or smtp_recipient:
+                st.caption(f"📧 **寄件者**: `{smtp_username}`  \n📩 **收件者**: `{smtp_recipient}`")
+            else:
+                st.warning("⚠️ 尚未配置 SMTP 帳密於 `~/.config/squeeze-backtest-email.env` 中。")
+
+            if st.form_submit_button("💾 儲存通知設定"):
+                set_email_notification_status(email_notify_enabled)
+                os.environ["ENABLE_EMAIL_NOTIFICATION"] = str(email_notify_enabled)
+                st.success(f"通知設定已更新！電子郵件通知: {'已啟用' if email_notify_enabled else '已關閉'}")
+                time.sleep(1)
+                st.rerun()
 
     # ── 4. 危險區域 ──
     st.divider()
