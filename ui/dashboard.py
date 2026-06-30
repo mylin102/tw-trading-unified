@@ -58,6 +58,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 
+st.set_page_config(page_title="Trading Unified", page_icon="📊", layout="wide")
+
 # V-Model fix: Clear cache on startup to avoid stale duplicate data
 if "_cache_cleared" not in st.session_state:
     st.session_state._cache_cleared = True
@@ -71,10 +73,21 @@ if str(ROOT) not in sys.path:
 # Load environment variables early
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-st.set_page_config(page_title="Trading Unified", page_icon="📊", layout="wide")
+
+# ── [weak_bear_trend Monitor] Import auto_select monitoring panel ──
+def render_weak_bear_panel():
+    """Render weak_bear_trend and auto_select monitoring panel."""
+    try:
+        from ui.weak_bear_monitor import render_weak_bear_monitor
+        render_weak_bear_monitor()
+        return True
+    except Exception as e:
+        st.error(f"⚠️ weak_bear 監控面板載入失敗：{e}")
+        return False
 
 
 # ── [Audit Debug] Timestamp integrity logger ──
+
 def _debug_ts_integrity(df, label, timestamp_col="timestamp"):
     """Print timestamp duplication stats for debugging dashboard time axis issues."""
     if df is None or df.empty:
@@ -166,45 +179,9 @@ def check_password():
         div[data-baseweb="input"] { height: 60px !important; }
         input[type="password"] { font-size: 24px !important; }
         </style>
-        <script>
-        // High-reliability Autofocus: Poll until input renders
-        var focusAttempts = 0;
-        var focusInterval = setInterval(function() {
-            var inputs = window.parent.document.querySelectorAll('input[type="password"]');
-            if (inputs.length > 0) {
-                inputs[0].focus();
-                if (focusAttempts++ > 10) clearInterval(focusInterval);
-            }
-        }, 100);
-        </script>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
     
     pwd = st.text_input("🔒 請輸入密碼", type="password", placeholder="點擊此處或直接輸入...", key="password_input")
-    
-    # JavaScript to auto-focus the password field
-    st.markdown("""
-    <script>
-    // Wait for the page to load, then focus the password input
-    document.addEventListener('DOMContentLoaded', function() {
-        // Find the password input by its data-testid attribute
-        const passwordInput = document.querySelector('input[type="password"]');
-        if (passwordInput) {
-            passwordInput.focus();
-            // Also select all text if there's any
-            passwordInput.select();
-        }
-    });
-    
-    // Also try after a short delay in case the page loads dynamically
-    setTimeout(function() {
-        const passwordInput = document.querySelector('input[type="password"]');
-        if (passwordInput) {
-            passwordInput.focus();
-            passwordInput.select();
-        }
-    }, 100);
-    </script>
-    """, unsafe_allow_html=True)
     dashboard_pwd = os.environ.get("DASHBOARD_PASSWORD")
     if dashboard_pwd is None:
         st.error("❌ DASHBOARD_PASSWORD 環境變數未設定。請在 .env 中設定後重啟。")
@@ -219,8 +196,21 @@ def check_password():
 if not check_password():
     st.stop()
 
-# 2026-06-23 Gemini CLI: 每 10 秒自動刷新（登入後才啟用），增加更新頻率並利用客戶端刷新以降低伺服器 CPU 負載
-st_autorefresh(interval=10_000, key="data_refresh")
+# 2026-06-30 Gemini CLI: Replaced auto-refresh with manual + optional auto refresh slider
+if st.sidebar.button("🔄 重新載入資料", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+
+# Optional auto-refresh interval (off by default)
+auto_refresh_sec = st.sidebar.selectbox(
+    "⏱️ 自動更新間隔",
+    options=["關閉", "15秒", "30秒", "60秒", "120秒", "300秒"],
+    index=0,
+    key="auto_refresh_interval",
+)
+if auto_refresh_sec != "關閉":
+    interval_ms = int(auto_refresh_sec.replace("秒", "")) * 1000
+    st_autorefresh(interval=interval_ms, key="auto_refresh_timer")
 
 BASE = Path(__file__).parent.parent
 # GSD: Align DATE_STR with the ACTIVE trading session date (e.g. after 15:00 today, it's tomorrow's date)
@@ -234,9 +224,26 @@ from core.date_utils import is_night_session
 _CURRENT_SESSION_NIGHT = is_night_session(datetime.datetime.now())
 FUTURES_CFG_NAME = "futures_night.yaml" if _CURRENT_SESSION_NIGHT else "futures.yaml"
 
+# Early read _TICKER for sidebar radio before config loading
+try:
+    import yaml as _yaml
+    _early_cfg = _yaml.safe_load((Path(__file__).parent.parent / "config" / FUTURES_CFG_NAME).read_text()) or {}
+    _TICKER = _early_cfg.get("ticker", "TMF")
+except Exception:
+    _TICKER = "TMF"
+
 # ── Sidebar Info ──
 with st.sidebar:
     st.title("Trading Unified")
+
+    # 2026-06-30 Gemini CLI: Page selectbox at top for instant visibility
+    st.selectbox(
+        "📄 頁面",
+        ["總覽", f"期貨 {_TICKER}", "選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "設定"],
+        index=0,
+        key="page_selector",
+    )
+
     ver_tag = " (Rust)" if is_rust_version() else " (Legacy)"
     st.caption(f"🚀 Shioaji API: {sj.__version__}{ver_tag}")  # [Wave B] Version Transparency
     st.markdown(f"🗓️ **交易日 (Trading Day)**")
@@ -374,7 +381,16 @@ with st.sidebar:
     except Exception:
         pass
 
+
+    st.divider()
+    
+    # ── [weak_bear_trend] Quick Access ──
+    st.markdown("##### 🤖 weak_bear 監控")
+    if st.button("📊 auto_select 監控中心", use_container_width=True):
+        st.session_state['show_weak_bear_panel'] = True
+    
     if st.button("🔍 系統健康診斷"):
+
         import subprocess
         result = subprocess.run(
             ["python3", "scripts/diagnose.py"],
@@ -403,6 +419,9 @@ with st.sidebar:
             st.error(f"❌ 更新失敗（回傳碼: {result.returncode}）")
 
 # ── YAML helpers ──
+# Read page selection from session state (set by sidebar selectbox)
+page = st.session_state.get("page_selector", "總覽")
+
 def load_yaml(path):
     if path.exists():
         with open(path, "r", encoding="utf-8") as f:
@@ -505,15 +524,36 @@ def filter_today(df, ts_col="timestamp"):
         return df
 
 # ── Chart builder (unified style) ──
+def _clean_list(series, force_str=False):
+    """2026-06-30 Gemini CLI: Helper to convert Series/Array to list replacing NaN/NaT/inf with None/null for valid JSON"""
+    import pandas as pd
+    import numpy as np
+    if series is None:
+        return []
+    if force_str:
+        return [str(x) if pd.notna(x) else None for x in series]
+    # Check if it is a datetime series
+    if hasattr(series, "dtype") and (pd.api.types.is_datetime64_any_dtype(series) or isinstance(series.dtype, pd.DatetimeTZDtype)):
+        return [str(x) if pd.notna(x) else None for x in series]
+    # For numeric/other series, replace nan/inf with None
+    clean = []
+    for x in series:
+        if pd.notna(x) and not (isinstance(x, (float, np.floating)) and (np.isnan(x) or np.isinf(x))):
+            clean.append(x)
+        else:
+            clean.append(None)
+    return clean
+
 def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=None):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
     # V-Model fix: Convert to numpy arrays to avoid narwhals duplicate check
     p_col = price_col.lower() if price_col.lower() in df.columns else price_col
     
     # 1. Price Line
+    # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
     fig.add_trace(go.Scatter(
-        x=df[ts_col].to_numpy(),
-        y=df[p_col].to_numpy(),
+        x=_clean_list(df[ts_col], force_str=True),
+        y=_clean_list(df[p_col]),
         name=price_col,
         line=dict(width=1.5, color="#1f77b4")
     ), row=1, col=1)
@@ -523,9 +563,10 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
         # Buy signals (Green Triangles Up)
         buys = signals[signals["action"].str.contains("BUY", case=False, na=False)]
         if not buys.empty:
+            # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
             fig.add_trace(go.Scatter(
-                x=buys[ts_col],
-                y=buys["price"],
+                x=_clean_list(buys[ts_col], force_str=True),
+                y=_clean_list(buys["price"]),
                 mode="markers",
                 marker=dict(symbol="triangle-up", size=12, color="#00cc66", line=dict(width=1, color="white")),
                 name="BUY"
@@ -534,9 +575,10 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
         # Sell signals (Red Triangles Down)
         sells = signals[signals["action"].str.contains("SELL", case=False, na=False)]
         if not sells.empty:
+            # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
             fig.add_trace(go.Scatter(
-                x=sells[ts_col],
-                y=sells["price"],
+                x=_clean_list(sells[ts_col], force_str=True),
+                y=_clean_list(sells["price"]),
                 mode="markers",
                 marker=dict(symbol="triangle-down", size=12, color="#ff4444", line=dict(width=1, color="white")),
                 name="SELL"
@@ -545,20 +587,22 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
         # Exit signals (Orange Diamonds)
         exits = signals[signals["action"].str.contains("EXIT|COVER", case=False, na=False)]
         if not exits.empty:
+            # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
             fig.add_trace(go.Scatter(
-                x=exits[ts_col],
-                y=exits["price"],
+                x=_clean_list(exits[ts_col], force_str=True),
+                y=_clean_list(exits["price"]),
                 mode="markers",
                 marker=dict(symbol="diamond", size=10, color="#ffa500", line=dict(width=1, color="white")),
                 name="EXIT"
             ), row=1, col=1)
 
     # 3. Score Bar Chart
+    # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
     if "score" in df.columns:
-        scores = df["score"].to_numpy()
-        colors = ["#00cc66" if s >= 0 else "#ff4444" for s in scores]
+        scores = _clean_list(df["score"])
+        colors = ["#00cc66" if s is not None and s >= 0 else "#ff4444" for s in scores]
         fig.add_trace(go.Bar(
-            x=df[ts_col].to_numpy(),
+            x=_clean_list(df[ts_col], force_str=True),
             y=scores,
             name="Score",
             marker_color=colors
@@ -683,10 +727,11 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     )
     
     # 1. 近月價格線
+    # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
     fig.add_trace(
         go.Scatter(
-            x=near_df["timestamp"],
-            y=near_df["close"],
+            x=_clean_list(near_df["timestamp"], force_str=True),
+            y=_clean_list(near_df["close"]),
             name="近月",
             line=dict(width=2, color="#1f77b4"),
             mode="lines"
@@ -706,15 +751,17 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             far_visible = far_df.tail(50)
             far_visible_tail = far_df.tail(5)
             # 延伸 xaxis 範圍到遠月最後一筆資料時間
+            # 2026-06-30 Gemini CLI: Convert range boundary to string to avoid serialization issue
             if len(far_visible_tail) > 0:
                 fig.update_xaxes(range=[
-                    min(near_df["timestamp"].min(), far_visible_tail["timestamp"].min()),
-                    max(near_df["timestamp"].max(), far_visible_tail["timestamp"].max())
+                    str(min(near_df["timestamp"].min(), far_visible_tail["timestamp"].min())),
+                    str(max(near_df["timestamp"].max(), far_visible_tail["timestamp"].max()))
                 ])
+        # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
         fig.add_trace(
             go.Scatter(
-                x=far_visible["timestamp"],
-                y=far_visible["close"],
+                x=_clean_list(far_visible["timestamp"], force_str=True),
+                y=_clean_list(far_visible["close"]),
                 name="遠月",
                 line=dict(width=1.5, color="#ff7f0e", dash="dash"),
                 mode="lines",
@@ -728,10 +775,11 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
         # 買入訊號
         buys = signals[signals["action"].str.contains("BUY", case=False, na=False)]
         if not buys.empty:
+            # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
             fig.add_trace(
                 go.Scatter(
-                    x=buys["timestamp"],
-                    y=buys["price"],
+                    x=_clean_list(buys["timestamp"], force_str=True),
+                    y=_clean_list(buys["price"]),
                     mode="markers",
                     marker=dict(symbol="triangle-up", size=12, color="#00cc66", line=dict(width=1, color="white")),
                     name="BUY"
@@ -742,10 +790,11 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
         # 賣出訊號
         sells = signals[signals["action"].str.contains("SELL", case=False, na=False)]
         if not sells.empty:
+            # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
             fig.add_trace(
                 go.Scatter(
-                    x=sells["timestamp"],
-                    y=sells["price"],
+                    x=_clean_list(sells["timestamp"], force_str=True),
+                    y=_clean_list(sells["price"]),
                     mode="markers",
                     marker=dict(symbol="triangle-down", size=12, color="#ff4444", line=dict(width=1, color="white")),
                     name="SELL"
@@ -756,10 +805,11 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
         # 出場訊號
         exits = signals[signals["action"].str.contains("EXIT|COVER", case=False, na=False)]
         if not exits.empty:
+            # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
             fig.add_trace(
                 go.Scatter(
-                    x=exits["timestamp"],
-                    y=exits["price"],
+                    x=_clean_list(exits["timestamp"], force_str=True),
+                    y=_clean_list(exits["price"]),
                     mode="markers",
                     marker=dict(symbol="diamond", size=10, color="#ffa500", line=dict(width=1, color="white")),
                     name="EXIT"
@@ -769,11 +819,12 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     
     # 4. 分數條形圖 (如果近月資料有 score 欄位)
     if score_row is not None:
-        scores = near_df["score"]
-        colors = ["#00cc66" if s >= 0 else "#ff4444" for s in scores]
+        scores = _clean_list(near_df["score"])
+        colors = ["#00cc66" if s is not None and s >= 0 else "#ff4444" for s in scores]
+        # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
         fig.add_trace(
             go.Bar(
-                x=near_df["timestamp"],
+                x=_clean_list(near_df["timestamp"], force_str=True),
                 y=scores,
                 name="Score",
                 marker_color=colors
@@ -784,10 +835,11 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     # 4b. 2026-06-26 Gemini CLI: ATR 折線圖子圖 (Method 1 & 2 視覺化)
     if atr_row is not None:
         atr_col = "atr" if "atr" in near_df.columns else "atr_60"
-        atr_vals = near_df[atr_col]
+        atr_vals = _clean_list(near_df[atr_col])
+        # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
         fig.add_trace(
             go.Scatter(
-                x=near_df["timestamp"],
+                x=_clean_list(near_df["timestamp"], force_str=True),
                 y=atr_vals,
                 name="ATR 波動度",
                 line=dict(width=1.5, color="#d62728"), # sleek red
@@ -801,16 +853,18 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     import pandas as pd
     
     # 垂直線標記交易日開始 (15:00)
+    # 2026-06-30 Gemini CLI: Convert x parameter to string to avoid serialization issue
     ts_series = pd.to_datetime(near_df["timestamp"], errors="coerce")
     for ts in ts_series:
         if pd.notna(ts) and hasattr(ts, "hour") and ts.hour == 15 and ts.minute == 0:
-            fig.add_vline(x=ts, line_width=1, line_dash="dash", line_color="gray", row="all", col=1)
+            fig.add_vline(x=str(ts), line_width=1, line_dash="dash", line_color="gray", row="all", col=1)
     
     # 夜盤時段背景著色
+    # 2026-06-30 Gemini CLI: Convert x0/x1 values to string to avoid serialization issue
     night_mask = is_night_session(near_df["timestamp"])
     if night_mask.any():
-        night_starts = near_df.loc[night_mask & ~night_mask.shift(1).fillna(False), "timestamp"]
-        night_ends = near_df.loc[night_mask & ~night_mask.shift(-1).fillna(False), "timestamp"]
+        night_starts = near_df.loc[night_mask & ~night_mask.shift(1).fillna(False), "timestamp"].astype(str).tolist()
+        night_ends = near_df.loc[night_mask & ~night_mask.shift(-1).fillna(False), "timestamp"].astype(str).tolist()
         for start, end in zip(night_starts, night_ends):
             fig.add_vrect(
                 x0=start, x1=end,
@@ -869,11 +923,12 @@ def make_calendar_spread_chart(spread_df):
         )
         
         # 1. 近月/遠月價格走勢
+        # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
         if "Close_near" in spread_df.columns and "Close_far" in spread_df.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=spread_df["timestamp"],
-                    y=spread_df["Close_near"],
+                    x=_clean_list(spread_df["timestamp"], force_str=True),
+                    y=_clean_list(spread_df["Close_near"]),
                     name="近月",
                     line=dict(color="#1f77b4", width=2),
                     mode="lines"
@@ -883,8 +938,8 @@ def make_calendar_spread_chart(spread_df):
             
             fig.add_trace(
                 go.Scatter(
-                    x=spread_df["timestamp"],
-                    y=spread_df["Close_far"],
+                    x=_clean_list(spread_df["timestamp"], force_str=True),
+                    y=_clean_list(spread_df["Close_far"]),
                     name="遠月",
                     line=dict(color="#ff7f0e", width=2, dash="dash"),
                     mode="lines"
@@ -893,11 +948,12 @@ def make_calendar_spread_chart(spread_df):
             )
         
         # 2. 價差走勢
+        # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
         if "spread" in spread_df.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=spread_df["timestamp"],
-                    y=spread_df["spread"],
+                    x=_clean_list(spread_df["timestamp"], force_str=True),
+                    y=_clean_list(spread_df["spread"]),
                     name="價差 (近月-遠月)",
                     line=dict(color="#2ca02c", width=2),
                     mode="lines"
@@ -906,11 +962,12 @@ def make_calendar_spread_chart(spread_df):
             )
             
             # 添加價差移動平均線
+            # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
             if "spread_ma" in spread_df.columns:
                 fig.add_trace(
                     go.Scatter(
-                        x=spread_df["timestamp"],
-                        y=spread_df["spread_ma"],
+                        x=_clean_list(spread_df["timestamp"], force_str=True),
+                        y=_clean_list(spread_df["spread_ma"]),
                         name="價差 MA(20)",
                         line=dict(color="#9467bd", width=1, dash="dot"),
                         mode="lines"
@@ -919,6 +976,7 @@ def make_calendar_spread_chart(spread_df):
                 )
             
             # 添加價差標準差帶
+            # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
             if "spread_ma" in spread_df.columns and "spread_std" in spread_df.columns:
                 upper_band = spread_df["spread_ma"] + spread_df["spread_std"]
                 lower_band = spread_df["spread_ma"] - spread_df["spread_std"]
@@ -926,8 +984,8 @@ def make_calendar_spread_chart(spread_df):
                 # 添加標準差帶（半透明）
                 fig.add_trace(
                     go.Scatter(
-                        x=spread_df["timestamp"].tolist() + spread_df["timestamp"].tolist()[::-1],
-                        y=upper_band.tolist() + lower_band.tolist()[::-1],
+                        x=_clean_list(spread_df["timestamp"], force_str=True) + _clean_list(spread_df["timestamp"], force_str=True)[::-1],
+                        y=_clean_list(upper_band) + _clean_list(lower_band)[::-1],
                         fill="toself",
                         fillcolor="rgba(128, 128, 128, 0.2)",
                         line=dict(color="rgba(128, 128, 128, 0)"),
@@ -938,11 +996,12 @@ def make_calendar_spread_chart(spread_df):
                 )
         
         # 3. Spread Z-score
+        # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
         if "spread_z" in spread_df.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=spread_df["timestamp"],
-                    y=spread_df["spread_z"],
+                    x=_clean_list(spread_df["timestamp"], force_str=True),
+                    y=_clean_list(spread_df["spread_z"]),
                     name="Spread Z-score",
                     line=dict(color="#d62728", width=2),
                     mode="lines"
@@ -1343,10 +1402,10 @@ def make_pnl_chart(pnl_df, title):
     pnl_df["timestamp"] = pd.to_datetime(pnl_df["timestamp"], format="mixed")
     color = "#00cc66" if pnl_df["pnl"].iloc[-1] >= 0 else "#ff4444"
     fig = go.Figure()
-    # V-Model fix: Convert to numpy arrays to avoid narwhals duplicate check
+    # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
     fig.add_trace(go.Scatter(
-        x=pnl_df["timestamp"].to_numpy(),
-        y=pnl_df["pnl"].to_numpy(),
+        x=_clean_list(pnl_df["timestamp"], force_str=True),
+        y=_clean_list(pnl_df["pnl"]),
         fill="tozeroy",
         line=dict(color=color, width=1.5),
         name="PnL"
@@ -1355,7 +1414,7 @@ def make_pnl_chart(pnl_df, title):
     fig.update_layout(height=250, margin=dict(t=10, b=10, l=40, r=20), title_text=title, title_font_size=14, yaxis_tickformat=",.0f")
     return fig
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=30)
 def load_futures_indicators(full_history=False):
     def _read_and_standardize(path):
         try:
@@ -1818,7 +1877,7 @@ def load_calendar_spread_data():
         traceback.print_exc()
         return pd.DataFrame()
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=30)
 def load_futures_trades():
     """Load today's futures trades CSV."""
     import glob
@@ -1865,7 +1924,7 @@ def load_futures_trades():
 
 OPTIONS_SUB = "live_trading" if o_live else "paper_trading"
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=30)
 def load_options_indicators(full_history=False):
     # GSD: Load multiple days to cover full trading session
     import datetime as dt
@@ -1970,7 +2029,7 @@ def load_options_indicators(full_history=False):
             
     return result
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=30)
 def load_options_ledger():
     f = OPTIONS_REPO / "logs" / OPTIONS_SUB / "options_trade_ledger.csv"
     if f.exists():
@@ -1980,7 +2039,7 @@ def load_options_ledger():
             pass
     return None
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=30)
 def load_options_equity():
     f = OPTIONS_REPO / "logs" / OPTIONS_SUB / "equity_curve.csv"
     if f.exists():
@@ -1990,7 +2049,7 @@ def load_options_equity():
             pass
     return None
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=30)
 def load_stock_trades(mode="PAPER"):
     current_date_str = get_session_date_str(datetime.datetime.now())
     f = resolve_preferred_or_latest_file(
@@ -2005,7 +2064,7 @@ def load_stock_trades(mode="PAPER"):
             pass
     return None
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=30)
 def load_stock_orders(mode="PAPER"):
     current_date_str = get_session_date_str(datetime.datetime.now())
     orders_file = resolve_stock_orders_file(FUTURES_TRADES, current_date_str, mode)
@@ -2020,7 +2079,7 @@ def load_stock_orders(mode="PAPER"):
 
     return build_stock_orders_from_trades(load_stock_trades(mode), mode=mode)
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=30)
 def load_stock_indicators(ticker):
     current_date_str = get_session_date_str(datetime.datetime.now())
     f = resolve_preferred_or_latest_file(
@@ -2119,16 +2178,20 @@ def _monitor_status():
 
 st.caption(f"更新: {datetime.datetime.now().strftime('%H:%M:%S')} | Monitor: {_monitor_status()}")
 
-# ── Tabs ──
-# 2026-05-27 Gemini CLI: Dynamic Ticker in Tabs
-tab_overview, tab_futures, tab_options, tab_stocks, tab_pipeline, tab_volatility, tab_settings = st.tabs([
-    "總覽", f"期貨 {_TICKER}", "選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "設定"
-])
+# ── [weak_bear_trend Panel] Modal-like overlay ──
+if st.session_state.get('show_weak_bear_panel', False):
+    st.divider()
+    with st.expander("🤖 auto_select 監控中心", expanded=True):
+        if render_weak_bear_panel():
+            if st.button("❌ 關閉監控面板"):
+                st.session_state['show_weak_bear_panel'] = False
+                st.rerun()
+    st.divider()
 
 # ════════════════════════════════════════
 # Tab 1: 總覽
 # ════════════════════════════════════════
-with tab_overview:
+if page == "總覽":
     col1, col2 = st.columns(2)
     f_df = load_futures_indicators(full_history=cont_mode)
     o_df = load_options_indicators(full_history=cont_mode)
@@ -2191,10 +2254,10 @@ with tab_overview:
     
     if f_df is not None and not f_df.empty:
         f_close = f_df["close"] if "close" in f_df.columns else f_df["Close"]
-        # 2026-05-27 Gemini CLI: Dynamic Ticker in Chart Trace
+        # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
         fig.add_trace(go.Scatter(
-            x=f_df["timestamp"].to_numpy(),
-            y=f_close.to_numpy(),
+            x=_clean_list(f_df["timestamp"], force_str=True),
+            y=_clean_list(f_close),
             name=f"{_TICKER} (期貨)",
             line=dict(color="#1f77b4", width=2)
         ))
@@ -2204,9 +2267,10 @@ with tab_overview:
         # Compatibility fix: use mtx_close if price_mtx is missing
         m_col = "price_mtx" if "price_mtx" in o_df.columns else ("mtx_close" if "mtx_close" in o_df.columns else None)
         if m_col:
+            # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
             fig.add_trace(go.Scatter(
-                x=o_df["timestamp"].to_numpy(),
-                y=o_df[m_col].to_numpy(),
+                x=_clean_list(o_df["timestamp"], force_str=True),
+                y=_clean_list(o_df[m_col]),
                 name="MTX (選擇權標的)",
                 line=dict(color="#ff7f0e", width=1.5, dash="dot")
             ))
@@ -2221,7 +2285,7 @@ with tab_overview:
         )
         fig.update_yaxes(title_text="指數點位", tickformat=",.0f", gridcolor="rgba(128,128,128,0.1)")
         fig.update_xaxes(gridcolor="rgba(128,128,128,0.1)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     else:
         st.info("等待數據...")
 
@@ -2327,7 +2391,7 @@ with tab_overview:
                 </style>
             """, unsafe_allow_html=True)
             
-            st.dataframe(ov_df.style.apply(style_overview, axis=1), use_container_width=True, hide_index=True)
+            st.dataframe(ov_df.style.apply(style_overview, axis=1), width='stretch', hide_index=True)
         else:
             st.info("等待個股指標數據...")
     else:
@@ -2336,7 +2400,7 @@ with tab_overview:
 # ════════════════════════════════════════
 # Tab 2: 期貨
 # ════════════════════════════════════════
-with tab_futures:
+elif page == f"期貨 {_TICKER}":
     # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Dynamic Ticker
     _ov_ticker = futures_cfg.get("ticker", "TMF")
     st.header(f"期貨 {_ov_ticker} ({mode_badge(f_live)})")
@@ -2371,7 +2435,7 @@ with tab_futures:
 
         # [V-Model] MTS mode badge
         try:
-            with open("config/futures.yaml") as _f:
+            with open(FUTURES_CFG_PATH) as _f:
                 _futures_cfg = yaml.safe_load(_f)
             _mts_enabled = _futures_cfg.get("mts", {}).get("enabled", False) if _futures_cfg else False
         except Exception:
@@ -2394,7 +2458,7 @@ with tab_futures:
                 _action_name = "賣出" if _sz >= 0 else "買進"
                 _btn_color = "error" if _sz >= 0 else "primary" # Red for sell, blue/green for buy
                 
-                if st.button(f"🔬 強制{_action_name}價差 (Z={_sz:.1f})", key="force_spread_trade", type="primary", use_container_width=True):
+                if st.button(f"🔬 強制{_action_name}價差 (Z={_sz:.1f})", key="force_spread_trade", type="primary", width='stretch'):
                     print("FORCE_SPREAD_BUTTON_CLICKED", flush=True)
                     _flag_path = "/tmp/futures_manual_trade.flag"
                     _flag = json.dumps({
@@ -2413,7 +2477,7 @@ with tab_futures:
                     st.rerun()
             
             with mts_col3:
-                if st.button("🆘 MTS緊急全平倉", key="force_close_all", type="secondary", use_container_width=True):
+                if st.button("🆘 MTS緊急全平倉", key="force_close_all", type="secondary", width='stretch'):
                     # 2026-05-22 Gemini CLI: Remove MTS Self-Test button below
                     _flag_path = "/tmp/futures_manual_trade.flag"
                     _flag = json.dumps({
@@ -2428,7 +2492,7 @@ with tab_futures:
                     st.warning("🚨 緊急平倉指令已送出！請監控下方持倉狀態。")
                     st.rerun()
 
-            if st.button("🗑️ MTS 清空紀錄", key="mts_clear_logs", type="secondary", use_container_width=True):
+            if st.button("🗑️ MTS 清空紀錄", key="mts_clear_logs", type="secondary", width='stretch'):
                 _base = os.path.dirname(os.path.dirname(__file__))
                 for _f in ["/tmp/mts_position_state.json", "/tmp/futures_manual_trade.flag",
                            os.path.join(_base, "logs/mts_spread_events.jsonl"),
@@ -2559,7 +2623,7 @@ with tab_futures:
                     f"{_ov_ticker} 近月/遠月價格 & Score", 
                     signals=ft
                 ), 
-                use_container_width=True
+                width='stretch'
             )
         else:
             # 如果沒有遠月資料，使用原來的圖表
@@ -2567,7 +2631,7 @@ with tab_futures:
             _ov_ticker = futures_cfg.get("ticker", "TMF")
             st.plotly_chart(
                 make_price_score_chart(f_df, "close", f"{_ov_ticker} 價格 & Score", signals=ft), 
-                use_container_width=True
+                width='stretch'
             )
             st.info("⚠️ 未找到遠月資料，僅顯示近月價格")
         
@@ -2788,7 +2852,7 @@ with tab_futures:
             # 顯示價差圖表
             spread_chart = make_calendar_spread_chart(spread_df)
             if spread_chart:
-                st.plotly_chart(spread_chart, use_container_width=True)
+                st.plotly_chart(spread_chart, width='stretch')
             
             # 顯示價差資料表格
             with st.expander("🔧 Debug: Raw Calendar Spread CSV", expanded=False):
@@ -2797,9 +2861,9 @@ with tab_futures:
                 available_cols = [col for col in display_cols if col in spread_df.columns]
                 
                 if available_cols:
-                    st.dataframe(spread_df[available_cols].tail(20), use_container_width=True)
+                    st.dataframe(spread_df[available_cols].tail(20), width='stretch')
                 else:
-                    st.dataframe(spread_df.tail(20), use_container_width=True)
+                    st.dataframe(spread_df.tail(20), width='stretch')
         else:
             st.warning("⚠️ 無法載入日曆價差資料")
             st.info("""
@@ -2917,16 +2981,16 @@ with tab_futures:
                     color = '#dcfce7' if pnl > 0 else ('#fef2f2' if pnl < 0 else '')
                     return [f'background-color: {color}; font-weight: bold'] * len(row)
                 return [''] * len(row)
-            st.dataframe(round_trips.style.apply(style_trades, axis=1), use_container_width=True, hide_index=True)
+            st.dataframe(round_trips.style.apply(style_trades, axis=1), width='stretch', hide_index=True)
         else:
-            st.dataframe(ft, use_container_width=True)
+            st.dataframe(ft, width='stretch')
         fpnl = calc_futures_pnl(ft)
         fig = make_pnl_chart(fpnl, "期貨累計 PnL (TWD)")
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
         with st.expander("📋 原始 Ledger (進階)"):
-            st.dataframe(ft, use_container_width=True)
+            st.dataframe(ft, width='stretch')
 
     # ── Order Status Panel ──
     with st.expander("📤 委託單狀態 (Order Lifecycle)", expanded=False):
@@ -2942,7 +3006,8 @@ with tab_futures:
                     orders_data = json.load(f)
             except (json.JSONDecodeError, UnicodeDecodeError) as _je:
                 st.error(f"📤 Order status JSON 損毀: {_je}")
-                console.print(f"[red][OrderStatus] JSON load failed: {_je} — deleting corrupt file[/red]")
+                print(f"[OrderStatus] JSON load failed: {_je} — deleting corrupt file")
+                # 2026-06-30 Gemini CLI: Code attribution comment
                 try:
                     os.remove(order_files[0])
                 except Exception:
@@ -3047,7 +3112,7 @@ with tab_futures:
                     display_cols.append("current_price")
 
                 if display_cols:
-                    st.dataframe(df_orders[display_cols], use_container_width=True, hide_index=True,
+                    st.dataframe(df_orders[display_cols], width='stretch', hide_index=True,
                                  column_config={
                                      "order_id": "委託單ID",
                                      # 2026-05-27 Gemini CLI: Restore Ticker label
@@ -3142,7 +3207,7 @@ with tab_futures:
                                 {"Leg": _near_label, "方向": _near_side, "進場": _near_val, "現價": _near_now, f"{_near_pnl_lbl}損益": _near_pnl},
                                 {"Leg": _far_label, "方向": _far_side, "進場": _far_val, "現價": _far_now, f"{_far_pnl_lbl}損益": _far_pnl},
                             ]
-                            st.dataframe(pd.DataFrame(_mts_rows), use_container_width=True, hide_index=True)
+                            st.dataframe(pd.DataFrame(_mts_rows), width='stretch', hide_index=True)
                             _ez = _mts_state.get("entry_spread_z")
                             _cz = _mts_state.get("current_spread_z")
                             if _ez is not None:
@@ -3210,7 +3275,7 @@ with tab_futures:
                                 _ets = _ev.get("ts", "?")[-8:] if _ev.get("ts") else "?"
                                 _detail = "; ".join(f"{k}={v}" for k, v in _ev.items() if k not in ("event", "ts"))
                                 _event_rows.append({"Time": _ets, "Event": _et, "Detail": _detail[:120]})
-                            st.dataframe(pd.DataFrame(_event_rows), use_container_width=True, hide_index=True)
+                            st.dataframe(pd.DataFrame(_event_rows), width='stretch', hide_index=True)
                     except Exception:
                         pass
                 if not _mts_fallback_shown:
@@ -3284,7 +3349,7 @@ with tab_futures:
                                     continue
                                     
                             if _fill_rows:
-                                st.dataframe(pd.DataFrame(_fill_rows), use_container_width=True, hide_index=True)
+                                st.dataframe(pd.DataFrame(_fill_rows), width='stretch', hide_index=True)
                     except Exception:
                         pass
         else:
@@ -3293,7 +3358,7 @@ with tab_futures:
 # ════════════════════════════════════════
 # Tab 3: 選擇權
 # ════════════════════════════════════════
-with tab_options:
+elif page == "選擇權 TXO":
     st.header(f"選擇權 TXO ({mode_badge(o_live)})")
     o_df = load_options_indicators(full_history=cont_mode)
     if o_df is not None and not o_df.empty:
@@ -3480,8 +3545,8 @@ with tab_options:
         if ol is not None and not ol.empty:
             sig_df = ol.rename(columns={"Timestamp": "timestamp", "Action": "action", "Price": "price"})
             
-        st.plotly_chart(make_price_score_chart(o_df, "price_mtx", "MTX 價格 & Score", signals=sig_df), use_container_width=True)
-        st.dataframe(o_df.tail(20), use_container_width=True)
+        st.plotly_chart(make_price_score_chart(o_df, "price_mtx", "MTX 價格 & Score", signals=sig_df), width='stretch')
+        st.dataframe(o_df.tail(20), width='stretch')
     else:
         st.info("無數據")
     ol = load_options_ledger()
@@ -3497,24 +3562,24 @@ with tab_options:
                     color = '#dcfce7' if pnl > 0 else ('#fef2f2' if pnl < 0 else '')
                     styles = [f'background-color: {color}; font-weight: bold'] * len(row)
                 return styles
-            st.dataframe(round_trips.style.apply(style_trades, axis=1), use_container_width=True, hide_index=True)
+            st.dataframe(round_trips.style.apply(style_trades, axis=1), width='stretch', hide_index=True)
         else:
-            st.dataframe(ol.tail(30), use_container_width=True)
+            st.dataframe(ol.tail(30), width='stretch')
         opnl = calc_options_pnl(ol)
         fig = make_pnl_chart(opnl, "選擇權累計 PnL (TWD)")
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
         # 展開原始 Ledger (進階)
         with st.expander("📋 原始 Ledger (進階)"):
-            st.dataframe(ol, use_container_width=True)
+            st.dataframe(ol, width='stretch')
 
     # ── Reset Button (always visible, regardless of ledger state) ──
     # 2026-05-25 Hermes Agent: allow user to clear options trade history
     # 2026-05-25 Hermes Agent: also clear orders JSON files so Order Lifecycle panel is not stale
     col1, col2, col3 = st.columns([3, 2, 3])
     with col2:
-        if st.button("🗑️ 重置選擇權交易紀錄", type="secondary", use_container_width=True):
+        if st.button("🗑️ 重置選擇權交易紀錄", type="secondary", width='stretch'):
             try:
                 # Create backup
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3701,7 +3766,7 @@ with tab_options:
                     display_cols.append("dte_days")
 
                 if display_cols:
-                    st.dataframe(df_orders[display_cols], use_container_width=True, hide_index=True,
+                    st.dataframe(df_orders[display_cols], width='stretch', hide_index=True,
                                  column_config={
                                       "order_id": "委託單ID",
                                       "created_at": "建立時間",
@@ -3739,7 +3804,7 @@ with tab_options:
 # ════════════════════════════════════════
 # Tab 4: 台股 Stocks
 # ════════════════════════════════════════
-with tab_stocks:
+elif page == "台股 Stocks":
     st.header(f"🍎 台股 Stocks ({mode_badge(s_live)})")
     
     st.subheader("Watchlist 實時監控牆")
@@ -3869,7 +3934,7 @@ with tab_stocks:
                     styles[col_idx["動能"]] = 'background-color: #fee2e2; color: #b91c1c; font-weight: bold'
                 return styles
 
-            st.dataframe(m_df.style.apply(style_monitor, axis=1), use_container_width=True, hide_index=True)
+            st.dataframe(m_df.style.apply(style_monitor, axis=1), width='stretch', hide_index=True)
         else:
             st.info("等待 Monitor 寫入指標數據...")
     
@@ -4001,7 +4066,7 @@ with tab_stocks:
                     color = '#dcfce7' if pnl > 0 else ('#fef2f2' if pnl < 0 else '')
                     return [f'background-color: {color}; font-weight: bold'] * len(row)
                 return [''] * len(row)
-            st.dataframe(round_trips.style.apply(style_stock_trades, axis=1), use_container_width=True, hide_index=True)
+            st.dataframe(round_trips.style.apply(style_stock_trades, axis=1), width='stretch', hide_index=True)
         else:
             display_cols = [c for c in ["timestamp", "ticker", "action", "entry_price", "price", "qty", "reason", "strategy", "pnl_gross", "fees", "pnl_cash"] if c in sl.columns]
             col_rename = {"timestamp": "時間", "ticker": "代號", "action": "動作", "entry_price": "進場價",
@@ -4009,15 +4074,15 @@ with tab_stocks:
                           "pnl_gross": "毛利", "fees": "手續費+稅", "pnl_cash": "淨損益"}
             display = sl[display_cols].sort_values("timestamp", ascending=False).head(30)
             display = display.rename(columns={c: col_rename.get(c, c) for c in display.columns})
-            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.dataframe(display, width='stretch', hide_index=True)
 
         spnl = calc_stock_pnl(sl)
         fig = make_pnl_chart(spnl, f"台股累計 PnL ({current_mode})")
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
         with st.expander("📋 原始 Ledger (進階)"):
-            st.dataframe(sl, use_container_width=True)
+            st.dataframe(sl, width='stretch')
     else:
         st.info(f"今日尚無 {current_mode} 交易紀錄")
 
@@ -4092,7 +4157,7 @@ with tab_stocks:
                     
                     return styles
                 
-                st.dataframe(orders_df.style.apply(style_orders, axis=1), use_container_width=True, hide_index=True)
+                st.dataframe(orders_df.style.apply(style_orders, axis=1), width='stretch', hide_index=True)
                 
                 # Summary metrics
                 open_orders = [o for o in orders_data if o.get("status") == "OPEN"]
@@ -4112,7 +4177,7 @@ with tab_stocks:
 # ════════════════════════════════════════
 # Tab 5: 策略管道 (Pipeline)
 # ════════════════════════════════════════
-with tab_pipeline:
+elif page == "策略管道":
     st.header("📊 策略管道 (Strategy Pipeline)")
 
     # Strategy Rankings
@@ -4194,7 +4259,7 @@ with tab_pipeline:
                 "動作": d.action,
                 "細節": d.detail[:50],
             } for d in recent])
-            st.dataframe(df_dec, use_container_width=True)
+            st.dataframe(df_dec, width='stretch')
         else:
             st.info("尚無決策記錄")
     except Exception as e:
@@ -4230,7 +4295,7 @@ with tab_pipeline:
                         "Verdict": df_hourly["reason"].map(lambda r: verdict_map.get(r, "❓")),
                         "細節": df_hourly["rejection"].apply(lambda x: str(x)[:60] if pd.notna(x) else ""),
                     })
-                    st.dataframe(df_display, use_container_width=True, hide_index=True)
+                    st.dataframe(df_display, width='stretch', hide_index=True)
 
                     verdict_counts = df_hourly["reason"].value_counts()
                     cols = st.columns(min(4, len(verdict_counts)))
@@ -4300,11 +4365,13 @@ with tab_pipeline:
                         import plotly.express as px
                         df_plot = df_rt[df_rt["edge"].notna()].copy()
                         if not df_plot.empty:
+                            # 2026-06-30 Gemini CLI: Convert ts_dt to string to avoid serialization issue
+                            df_plot["ts_dt"] = df_plot["ts_dt"].astype(str)
                             fig = px.line(df_plot, x="ts_dt", y="edge", color="strategy",
                                           title="Edge Score Timeline",
                                           labels={"ts_dt": "時間", "edge": "Edge", "strategy": "策略"})
                             fig.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10))
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, width='stretch')
                     except Exception:
                         pass
 
@@ -4316,7 +4383,7 @@ with tab_pipeline:
                     # ── ④ 原始資料（摺疊） ──
                     with st.expander("📋 原始 Router Trace 資料", expanded=False):
                         st.dataframe(df_rt[["ts", "regime", "strategy", "triggered", "edge", "reason"]].tail(50),
-                                     use_container_width=True, hide_index=True)
+                                     width='stretch', hide_index=True)
                 else:
                     st.info("Router trace 檔案為空")
             else:
@@ -4329,7 +4396,7 @@ with tab_pipeline:
 # ════════════════════════════════════════
 # Tab 6: 設定
 # ════════════════════════════════════════
-with tab_settings:
+elif page == "設定":
     st.header("⚙️ 系統設定")
 
     # ── 0. 實盤就緒度檢查 ──
@@ -4409,7 +4476,7 @@ with tab_settings:
                 # 2026-05-27 Gemini CLI: Updated labels for clarity (ATR Release and ATR Exit)
                 f_mts_mult_stop = m3.slider("MTS 釋放倍數 (ATR Release)", 0.5, 3.0, 
                                             value=float(_mts_params.get("atr_multiplier_stop", 1.0)), step=0.1)
-                f_mts_mult_trail = m4.slider("MTS 停利倍數 (ATR Exit)", 1.0, 10.0, 
+                f_mts_mult_trail = m4.slider("MTS 停利倍數 (ATR Exit)", 0.1, 10.0, 
                                              value=float(_mts_params.get("atr_multiplier_trail", 3.5)), step=0.1)
                 
                 m5, m6 = st.columns(2)
@@ -4421,6 +4488,10 @@ with tab_settings:
 
             # Strategy selector from Registry
             strat_options = list(fut_strats.keys())
+            if not strat_options:
+                strat_options = [current_fut_strat, "counter_vwap", "weak_bear_trend", "squeeze_fire_scout"]
+                strat_options = list(dict.fromkeys(strat_options))  # dedupe
+                st.warning("⚠️ 策略註冊表未載入任何期貨策略，使用備用策略清單。")
             try:
                 strat_idx = strat_options.index(current_fut_strat)
             except ValueError:
@@ -4492,7 +4563,8 @@ with tab_settings:
                 futures_cfg["trade_mgmt"]["max_positions"] = f_max_pos
                 save_yaml(FUTURES_CFG_PATH, futures_cfg)
                 trigger_restart()
-                st.success(f"期貨設定已更新！策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
+                st.success(f"✅ 設定已寫入 `{FUTURES_CFG_PATH}`\n策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
+                st.info("🔄 重啟指令已送出，monitor 將在約 30 秒後套用新設定。")
                 st.rerun()
 
     # ── 2. 選擇權 TXO 設定 ──
@@ -4594,7 +4666,8 @@ with tab_settings:
                 opt_risk_cfg["max_positions"] = o_max_pos
                 save_yaml(OPTIONS_CFG_PATH, options_cfg)
                 trigger_restart()
-                st.success(f"選擇權設定已更新！模式: {o_mode_new} | 口數: {o_lots} | 最大持倉: {o_max_pos} | Fire閾值: {o_fire_thresh}")
+                st.success(f"✅ 設定已寫入 `{OPTIONS_CFG_PATH}`\n模式: {o_mode_new} | 口數: {o_lots} | 最大持倉: {o_max_pos} | Fire閾值: {o_fire_thresh}")
+                st.info("🔄 重啟指令已送出，約 30 秒後套用新設定。")
                 st.rerun()
 
     # ── 3. 台股 Stocks 設定 ──
@@ -4624,10 +4697,13 @@ with tab_settings:
             c1, c2, c2b = st.columns(3)
             from strategies.stocks.entry_strategies import STOCK_STRATEGIES
             strat_options = list(STOCK_STRATEGIES.keys())
+            if not strat_options:
+                strat_options = ["momentum_breakout", "mean_reversion"]
+                st.warning("⚠️ 找不到任何台股策略，使用預設策略清單。")
             current_strat = stk_inner.get("strategy", "momentum_breakout")
             strat_idx = strat_options.index(current_strat) if current_strat in strat_options else 0
             strat_new = c1.selectbox("策略", strat_options, index=strat_idx,
-                                     help=STOCK_STRATEGIES.get(current_strat, {}).get("desc", ""))
+                                     help=STOCK_STRATEGIES.get(current_strat, {}).get("desc", "") if current_strat in STOCK_STRATEGIES else "")
             budget_new = c2.number_input("總分配資金 (TWD)", value=stk_inner.get("total_portfolio_budget", 100000), step=10000)
             capital_new = c2b.number_input("單筆預算 (TWD)", value=stk_inner.get("capital_per_trade", 20000), step=1000)
             
@@ -4749,7 +4825,7 @@ with tab_settings:
             st.markdown("##### 🗑️ 清空模擬交易數據")
             st.caption("這將歸零所有 Paper Trading 的持倉與歷史紀錄 CSV，方便切換實盤前清空數據。")
         with col_d2:
-            if st.button("執行清空", type="primary", use_container_width=True):
+            if st.button("執行清空", type="primary", width='stretch'):
                 try:
                     import subprocess
                     result = subprocess.run(["python3", "scripts/maintenance/clear_simulation_data.py", "--force"], 
@@ -4766,7 +4842,7 @@ with tab_settings:
 # ════════════════════════════════════════
 # Tab: 波動率 Vol
 # ════════════════════════════════════════
-with tab_volatility:
+elif page == "波動率 Vol":
     st.header("📊 Volatility Surface Regime")
     st.caption("IV curve shape classification + Volatility State Machine")
 
@@ -4870,7 +4946,7 @@ with tab_volatility:
                     "pct": st.column_config.ProgressColumn("IV %ile", format="%.0%", max_value=1),
                     "conf": st.column_config.ProgressColumn("Confidence", format="%.0%", max_value=1),
                 },
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
             )
 
