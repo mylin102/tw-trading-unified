@@ -623,10 +623,13 @@ def run_system(dry_run=False):
             # [rshioaji 1.5.10+] Ensure contracts are loaded in cache before monitors start
             from core.broker.shioaji_compat import fetch_all_contracts
             console.print("[cyan]📡 Synchronizing all broker contracts (this may take 1-5 minutes)...[/cyan]")
+            print(f"[CONTRACT_SYNC_START] timeout=300s", flush=True)
             if fetch_all_contracts(api, timeout=300):
                 console.print("[green]✅ Contracts synchronized successfully.[/green]")
+                print(f"[CONTRACT_SYNC_PROGRESS] success", flush=True)
             else:
                 console.print("[yellow]⚠️ Contract synchronization timed out, continuing with best effort.[/yellow]")
+                print(f"[CONTRACT_SYNC_TIMEOUT] elapsed>=300s, continuing with partial contracts", flush=True)
         else:
             console.print("[yellow]🔧 Dry-run — no broker login[/yellow]")
 
@@ -712,8 +715,12 @@ def run_system(dry_run=False):
                 con = om.monitor.active_contracts.get(key)
                 if con:
                     safe_subscribe(api, con, quote_type='tick')
-                    safe_subscribe(api, con, quote_type='bidask')
-                    console.print(f"[green]📡 Subscribed {key}: {con.code} (tick+bidask)[/green]")
+                    # 2026-06-26 Gemini CLI: MTX only needs tick data for close reference; do not subscribe to bidask to reduce bandwidth/rate limits
+                    if key != "MTX":
+                        safe_subscribe(api, con, quote_type='bidask')
+                        console.print(f"[green]📡 Subscribed {key}: {con.code} (tick+bidask)[/green]")
+                    else:
+                        console.print(f"[green]📡 Subscribed {key}: {con.code} (tick only)[/green]")
 
         if sk_engine is not None:
             otm_contracts = _subscribe_otm_skew_contracts(
@@ -738,6 +745,7 @@ def run_system(dry_run=False):
         ft.start()
         ot.start()
         console.print("[bold green]🚀 Unified Monitors Running (Futures, Options)[/bold green]")
+        print(f"[RUNTIME_LOOP_STARTED] futures_thread={ft.ident} options_thread={ot.ident}", flush=True)
 
         startup_grace_until = time.time() + 60
         health_check_at = time.time() + HEALTH_INTERVAL
@@ -814,7 +822,9 @@ def run_system(dry_run=False):
                             con = om.monitor.active_contracts.get(key)
                             if con:
                                 api.quote.subscribe(con, quote_type='tick')
-                                api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
+                                # 2026-06-26 Gemini CLI: MTX only needs tick data for close reference; do not subscribe to BidAsk
+                                if key != "MTX":
+                                    api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
 
                         # Re-subscribe far-month Futures tick for dual chart
                         if fm.far_contract:

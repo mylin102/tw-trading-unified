@@ -3,10 +3,10 @@ module.exports = {
     {
       // PM2 is the sole owner of the trading core; dashboards are started by autostart.sh.
       name: "trading-system",
-      script: "main.py",
-      // 2026-06-23 Gemini CLI: limit CPU usage of trading-system to 50%
-      interpreter: "./scripts/run-cpulimit.py",
-      interpreter_args: "./venv/bin/python3",
+      // 2026-06-30 Gemini CLI: Use macOS taskpolicy background to run on E-cores instead of signal-throttling run-cpulimit.py
+      script: "taskpolicy",
+      args: "-c background ./venv/bin/python3 main.py",
+      interpreter: "none",
       cwd: "/Users/mylin/Documents/mylin102/tw-trading-unified",
       env: {
         PYTHONPATH: "/Users/mylin/Documents/mylin102/tw-trading-unified",
@@ -22,7 +22,7 @@ module.exports = {
       exp_backoff_restart_delay: 100,
       min_uptime: "10s",
       kill_timeout: 5000,
-      listen_timeout: 3000,
+      listen_timeout: 600000,
       error_file: "/Users/mylin/Documents/mylin102/tw-trading-unified/logs/pm2-trading-error.log",
       out_file: "/Users/mylin/Documents/mylin102/tw-trading-unified/logs/pm2-trading-out.log",
       log_file: "/Users/mylin/Documents/mylin102/tw-trading-unified/logs/pm2-trading-combined.log",
@@ -30,11 +30,11 @@ module.exports = {
     },
     {
       name: "dashboard",
-      // 2026-06-23 Gemini CLI: limit CPU usage of dashboard to 50%
-      script: "./scripts/run-cpulimit.py",
+      // 2026-06-30 Gemini CLI: Use macOS taskpolicy background to run on E-cores instead of signal-throttling run-cpulimit.py
+      script: "taskpolicy",
+      args: "-c background ./venv/bin/python3 -m streamlit run ui/dashboard.py --server.port 8500",
       interpreter: "none",
       cwd: "/Users/mylin/Documents/mylin102/tw-trading-unified",
-      args: "./venv/bin/python3 -m streamlit run ui/dashboard.py --server.port 8500",
       env: {
         PYTHONPATH: "/Users/mylin/Documents/mylin102/tw-trading-unified",
         NODE_ENV: "production"
