@@ -5092,6 +5092,7 @@ class ShioajiOptionsSmartMonitor:
             # 1. Ensure API is logged in
             if self.api is None:
                 self.api = shioaji_login.login()
+                self._initialized_api = True
                 
             # 2. Ensure Broker Adapter is initialized
             if self.broker is None and self.api is not None:
@@ -5175,7 +5176,10 @@ class ShioajiOptionsSmartMonitor:
         except KeyboardInterrupt:
             pass
         finally:
-            if self.api:
+            # Only logout if we own the session (not injected via OptionsMonitor wrapper)
+            # In wrapper mode, api is injected by OptionsMonitor which sets dry_run=True during construction
+            # then toggles it to False. The safest check: we entered _initialize_api() ourselves.
+            if self.api and getattr(self, '_initialized_api', False):
                 self.api.logout()
 
 def parse_args():
