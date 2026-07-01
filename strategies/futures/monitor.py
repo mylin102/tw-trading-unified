@@ -5327,6 +5327,14 @@ class FuturesMonitor:
         if _mts_enabled:
             _mts_bar = last_5m.to_dict()
             _mts_bar["ts"] = last_5m.name
+            # [FAR_PRICE_FIX] Inject real-time far-month price from _far_current_bar
+            # into _mts_bar so _mts_tick can use far_close_rt instead of CSV stale data.
+            # This covers the _strategy_tick heartbeat path where no new tick has arrived
+            # and _mts_bar lacks far_close_rt.
+            if hasattr(self, '_far_current_bar') and self._far_current_bar.get("close", 0) > 0:
+                _mts_bar["far_close_rt"] = self._far_current_bar["close"]
+                _mts_bar["far_high_rt"] = self._far_current_bar.get("high", _mts_bar["far_close_rt"])
+                _mts_bar["far_low_rt"] = self._far_current_bar.get("low", _mts_bar["far_close_rt"])
             self._mts_tick(enriched_bar=_mts_bar)
             return
 

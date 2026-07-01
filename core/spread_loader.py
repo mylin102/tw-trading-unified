@@ -42,10 +42,12 @@ class SpreadLoader:
         self._last_spread_data: dict[str, Any] = {}  # cached latest spread values
         self._csv_paths: dict[str, str] = {}  # { 'far': path, 'near': path }
         self._spread_csv_mtime: float | None = None  # for hot-reload detection
+        # 2026-06-26 Gemini CLI: Store active ticker to eliminate silent default fallbacks
+        self._ticker: str | None = None
 
     # ── Public API ──────────────────────────────────────────────────────
 
-    def load_latest_csv(self, ticker: str | None = None) -> bool:
+    def load_latest_csv(self, ticker: str) -> bool:
         """Find and load the latest CSV files.
 
         Priority:
@@ -54,8 +56,13 @@ class SpreadLoader:
 
         Returns True if at least some data was loaded.
         """
+        # 2026-06-26 Gemini CLI: enforce explicit non-empty ticker check
+        if not ticker:
+            raise ValueError("[SpreadLoader] Ticker cannot be None or empty. Silent fallbacks are forbidden.")
+        self._ticker = ticker.lower()
+
         # Try calendar spread CSV first (most complete)
-        ok_spread = self._find_and_load("spread", ticker)
+        ok_spread = self._find_and_load("spread", self._ticker)
         if ok_spread:
             # Record initial mtime for hot-reload detection
             spread_path = self._csv_paths.get("spread")
@@ -64,8 +71,8 @@ class SpreadLoader:
             return True
 
         # Fallback: far + near
-        ok_far = self._find_and_load("far", ticker)
-        ok_near = self._find_and_load("near", ticker)
+        ok_far = self._find_and_load("far", self._ticker)
+        ok_near = self._find_and_load("near", self._ticker)
         return ok_far is True  # near is optional
 
     def get_spread_z(self, timestamp: pd.Timestamp | None = None) -> float | None:
@@ -100,8 +107,12 @@ class SpreadLoader:
                 bar["spread_z"] = float(row["spread_z"])
                 bar["spread_ma"] = float(row.get("spread_ma", 0.0))
                 bar["spread_std"] = float(row.get("spread_std", 0.0))
-                bar["near_close"] = float(row.get("Close_near", bar.get("Close", 0.0)))
-                bar["far_close"] = float(row.get("Close_far", 0.0))
+                # 2026-06-26 Gemini CLI: Prioritize the bar's actual Close price over the loaded CSV to prevent stale price overrides
+                bar["near_close"] = float(bar.get("Close", bar.get("close", row.get("Close_near", 0.0))))
+                # 2026-07-02 Hermes Agent: Preserve existing far_close if bar already has one
+                # (e.g. from far_close_rt injected by _strategy_tick), preventing CSV stale data override
+                if "far_close" not in bar or bar["far_close"] is None or bar["far_close"] <= 0:
+                    bar["far_close"] = float(row.get("Close_far", 0.0))
                 # spread_age_minutes: how old is the CSV data (for staleness gate)
                 if self._far_df is not None and not self._far_df.empty:
                     try:
@@ -153,7 +164,10 @@ class SpreadLoader:
                 self._spread_csv_mtime = current_mtime
                 logger.info(f"[SpreadLoader] CSV changed, hot-reloading: {spread_path}")
                 self._far_df = None  # force reload
-                self._find_and_load("spread")
+                # 2026-06-26 Gemini CLI: use stored ticker for hot-reload, fail loud if missing
+                if not self._ticker:
+                    raise ValueError("[SpreadLoader] Cannot hot-reload because no ticker is cached in the loader.")
+                self._find_and_load("spread", self._ticker)
 
     def _find_and_load(self, prefix: str, ticker: str | None = None) -> bool:
         """Find CSV matching the prefix and load it.
@@ -161,7 +175,10 @@ class SpreadLoader:
         For prefix='spread': matches {ticker}_calendar_spread_*.csv
         For prefix='far'/'near': matches {ticker}_{prefix}_*.csv
         """
-        _t_prefix = (ticker or "mxf").lower()
+        # 2026-06-26 Gemini CLI: strictly enforce ticker presence to avoid default "mxf" fallback
+        if not ticker:
+            raise ValueError("[SpreadLoader] Ticker must be explicitly provided. Silent fallbacks are forbidden.")
+        _t_prefix = ticker.lower()
         if prefix == "spread":
             pattern = os.path.join(self.data_dir, f"{_t_prefix}_calendar_spread_*.csv")
         else:
