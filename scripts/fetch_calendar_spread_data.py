@@ -6,13 +6,14 @@ Fixed version that handles Shioaji API properly.
 
 import os
 import sys
+
+# 2026-07-01 Gemini CLI: Insert project root to path before any core/strategy imports to resolve pathing issues.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from core.broker.shioaji_compat import kbars_to_dataframe
-
-# Add project root to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from strategies.futures.squeeze_futures.data.shioaji_client import ShioajiClient
 
@@ -179,35 +180,29 @@ def main():
         print("Failed to login to Shioaji")
         return
     
-    # Get near and far contracts for MXF (excluding rolling contracts)
-    near_contract, far_contract = get_near_far_contracts(client, "MXF")
+    # ── Config Loading (GSD: Zero Hardcoding) ──
+    # 2026-07-01 Gemini CLI: Resolve active ticker dynamically from futures/futures_night.yaml config to prevent MXF hardcoding.
+    import yaml
+    from core.date_utils import is_night_session
+    _is_night = is_night_session(datetime.now())
+    cfg_name = "futures_night.yaml" if _is_night else "futures.yaml"
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg_path = os.path.join(project_root, "config", cfg_name)
+    if os.path.exists(cfg_path):
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    else:
+        cfg = {}
+    ticker = cfg.get("ticker")
+    if not ticker:
+        raise ValueError(f"ERROR: 'ticker' missing in {cfg_name}")
+
+    # Get near and far contracts (excluding rolling contracts)
+    near_contract, far_contract = get_near_far_contracts(client, ticker)
     
-    if not near_contract:
-        print("Failed to get near contract")
+    if not near_contract or not far_contract:
+        print(f"Failed to get near or far contracts for {ticker}")
         return
-    
-    if not far_contract:
-        print("Failed to get far contract - trying to find next month")
-        # Try to get the contract after near contract
-        contracts = list(client.api.Contracts.Futures.TMF)
-        regular_contracts = [c for c in contracts if not c.code.endswith(('R1', 'R2', 'R3'))]
-        sorted_contracts = sorted(regular_contracts, key=lambda c: c.delivery_date)
-        
-        # Find index of near contract
-        near_idx = next((i for i, c in enumerate(sorted_contracts) if c.code == near_contract.code), -1)
-        
-    # Get near and far contracts for MXF
-    print("Getting MXF contracts...")
-    contracts = list(client.api.Contracts.Futures.MXF)
-    regular_contracts = [c for c in contracts if not c.code.endswith(('R1', 'R2', 'R3'))]
-    sorted_contracts = sorted(regular_contracts, key=lambda c: c.delivery_date)
-    
-    if len(sorted_contracts) < 2:
-        print(f"Not enough MXF contracts available: {len(sorted_contracts)}")
-        return
-    
-    near_contract = sorted_contracts[0]
-    far_contract = sorted_contracts[1]
     
     print(f"Near contract: {near_contract.code} (delivery: {near_contract.delivery_date})")
     print(f"Far contract: {far_contract.code} (delivery: {far_contract.delivery_date})")
@@ -233,11 +228,12 @@ def main():
     
     # Save individual contract data
     today = datetime.now().strftime("%Y%m%d")
-    df_near.to_csv(f"{output_dir}/mxf_near_{today}.csv", index=False)
-    df_far.to_csv(f"{output_dir}/mxf_far_{today}.csv", index=False)
+    ticker_lower = ticker.lower()
+    df_near.to_csv(f"{output_dir}/{ticker_lower}_near_{today}.csv", index=False)
+    df_far.to_csv(f"{output_dir}/{ticker_lower}_far_{today}.csv", index=False)
     
     # Save spread data
-    df_spread.to_csv(f"{output_dir}/mxf_calendar_spread_{today}.csv", index=False)
+    df_spread.to_csv(f"{output_dir}/{ticker_lower}_calendar_spread_{today}.csv", index=False)
     
     print(f"\nData saved to {output_dir}/")
     print(f"Near contract: {near_contract.code}")

@@ -1296,13 +1296,15 @@ class FuturesMonitor:
                     last_bar = rebuilt_bars[-1]
                     if last_bar["ts"] is not None:
                         self._last_bar_ts = int(last_bar["ts"].timestamp() / 300) * 300
-                        # Also prime the current bar with the last tick's price
-                        self._current_bar["ts"] = None  # Will be set on next incoming tick
-                        self._current_bar["open"] = last_bar["close"]
-                        self._current_bar["high"] = last_bar["close"]
-                        self._current_bar["low"] = last_bar["close"]
+                        # 2026-07-01 Gemini CLI: Pop the last bar from the deque and make it the current active bar.
+                        # This prevents the last bar from being duplicated on subsequent ticks in the same 5m bucket.
+                        self._tick_bars_deque.pop()
+                        self._current_bar["ts"] = last_bar["ts"]
+                        self._current_bar["open"] = last_bar["open"]
+                        self._current_bar["high"] = last_bar["high"]
+                        self._current_bar["low"] = last_bar["low"]
                         self._current_bar["close"] = last_bar["close"]
-                        self._current_bar["volume"] = 0
+                        self._current_bar["volume"] = last_bar["volume"]
 
         except Exception as e:
             console.print(f" [yellow][FuturesMonitor] Tick CSV rebuild failed (non-fatal): {e}[/yellow] ")
@@ -1408,6 +1410,9 @@ class FuturesMonitor:
                 # No primary price yet, can't build bar
                 return
             price = self._last_tmf_price
+            # [DEGRADED FIX] Refresh runtime status even on non-primary ticks to
+            # prevent stale DEGRADED status when primary tick contract is misaligned
+            self._refresh_runtime_status()
 
         # 2026-05-27 Gemini CLI: Update market data cache for manual trade integrity checks (P0-P3)
         # Use time.time() as local_arrival_at to avoid exchange-local clock drift issues.
