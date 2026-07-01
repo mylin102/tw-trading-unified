@@ -615,6 +615,33 @@ def run_system(dry_run=False):
         console.print("[dim]Old restart flag cleared.[/dim]")
 
     api = None
+    # Login retry with exponential backoff — prevents crash loop when Shioaji server
+    # temporarily blocks rapid reconnects. Retries up to 5x internally so PM2 never
+    # sees the crash and restarts stay at 0.
+    _login_attempt = 0
+    _login_max_attempts = 5
+    while True:
+        try:
+            if not dry_run:
+                api = get_api()
+                console.print("[green]✅ Single Shioaji session established[/green]")
+                break
+            else:
+                break  # dry-run: no login needed
+        except Exception as _login_err:
+            _login_attempt += 1
+            if _login_attempt >= _login_max_attempts:
+                console.print(f"[bold red]🚨 All {_login_max_attempts} login attempts exhausted. Exiting for external supervisor.[/bold red]")
+                import sys
+                sys.exit(1)
+            _delay = min(15 * (2 ** (_login_attempt - 1)), 120)  # 15s, 30s, 60s, 120s capped
+            console.print(
+                f"[bold red]Critical crash: {_login_err}[/bold red]",
+                f"\n[yellow]⏳ Login attempt {_login_attempt}/{_login_max_attempts} failed — "
+                f"retrying in {_delay}s...[/yellow]"
+            )
+            time.sleep(_delay)
+
     try:
         if not dry_run:
             api = get_api()
