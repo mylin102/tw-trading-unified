@@ -4082,6 +4082,19 @@ class FuturesMonitor:
             console.print(f"[red][MTS] Strategy {_strat_name} not registered[/red]")
             return
 
+        # 2026-07-01 Gemini CLI: Ensure strategy is initialized before heartbeat to prevent AttributeError on attributes like _last_atr
+        ctx = StrategyContext(
+            market=MarketData(
+                last_bar=_bar_dict, 
+                timestamp=_bar_dict.get("ts", ""),
+                ticker=self.ticker
+            ),
+            position=PositionView(size=self.trader.position), 
+            config=_mts
+        )
+        if not hasattr(strategy, "_has_position"):
+            strategy.init(ctx)
+
         # [MTS Heartbeat] Update state file with latest prices
         # 2026-05-27 Gemini CLI: Use isolated path if environment variable is set
         _hb_file = os.getenv("MTS_STATE_PATH", "/tmp/mts_position_state.json")
@@ -4179,19 +4192,6 @@ class FuturesMonitor:
         # 2026-05-22 Gemini CLI: Fixed except block indentation to resolve syntax error
         except Exception as e:
             console.print(f"[red]⚠️ Heartbeat failed: {e}[/red]")
-        ctx = StrategyContext(
-            market=MarketData(
-                last_bar=_bar_dict, 
-                timestamp=_bar_dict.get("ts", ""),
-                # 2026-05-27 Gemini CLI: Explicitly pass ticker to MTS strategy context
-                ticker=self.ticker
-            ),
-            position=PositionView(size=self.trader.position), 
-            config=_mts
-        )
-        # Ensure strategy initialized
-        if not hasattr(strategy, "_has_position"):
-            strategy.init(ctx)
 
         signal = strategy.on_bar(ctx)
         if signal:

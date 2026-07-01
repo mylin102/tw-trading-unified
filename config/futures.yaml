@@ -34,7 +34,7 @@ spread_gate:
   stale_action: flat
 risk_mgmt:
   atr_length: 14
-  atr_multiplier: 1.2
+  atr_multiplier: 1.0
   daily_loss_cap: 5000.0
   break_even_pts: 100
   exit_on_vwap: true
@@ -123,10 +123,29 @@ mts:
   params:
     min_atr: 10.0
     atr_multiplier_stop: 2.0
-    atr_multiplier_trail: 3.5
-    release_stop_points: 20
+    atr_multiplier_trail: 0.3
+    release_stop_points: 100
     trail_distance_points: 30
-    atr_cap: 100.0
+    atr_cap: 250.0
+    confirm_ticks: 2
+    confirm_ms: 800
+    max_quote_age_ms: 1000
+    max_spread_width: 3
+    entry_z:
+      low_atr: 2.0
+      normal_atr: 2.5
+      high_atr: 3.0
+    atr_low_threshold: 15.0
+    atr_high_threshold: 30.0
+    mfe_tighten:
+      enabled: true
+      level_1_atr: 2.0
+      level_1_trail_mult: 1.6
+      level_2_atr: 3.0
+      level_2_trail_mult: 1.2
+    post_release:
+      breakeven_after_atr: 1.0
+      force_lock_after_atr: 3.0
   paper:
     allow_synthetic_price: true
     synthetic_near_price: 41000.0
@@ -141,4 +160,4 @@ trade_mgmt:
   allow_short: true
   force_close_at_end: true
   lots_per_trade: 1
-  max_positions: 5
+  max_positions: 4

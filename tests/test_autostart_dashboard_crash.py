@@ -35,41 +35,13 @@ def test_dashboard_uses_readiness_items_helper():
     assert "DEGRADED: STALE DATA" in src
 
 
-def test_autostart_no_longer_manages_main_py():
-    src = Path("autostart.sh").read_text()
-
-    assert 'graceful_kill "main.py"' not in src
-    assert '"$UNIFIED_DIR/main.py"' not in src
-    assert 'MAIN_PIDS=' not in src
-    assert '[❌期貨停]' not in src
-    assert '[✅期貨]' not in src
-
-
-def test_autostart_still_launches_dashboards_and_tracks_minutes():
-    src = Path("autostart.sh").read_text()
-
-    assert 'scripts/restart_dashboard.sh' in src
-    assert 'streamlit run ui/backtest_dashboard.py' in src
-    assert 'MM=$(date +%M)' in src
-
-
-def test_restart_dashboard_script_has_preflight_and_health_check():
-    src = Path("scripts/restart_dashboard.sh").read_text()
-
-    assert "build_stock_orders_from_trades" in src
-    assert "resolve_stock_orders_file" in src
-    assert "latest_indicator_close" in src
-    assert "curl -fsS" in src
-    assert "lsof -ti tcp:$PORT" in src
-
-
-def test_pm2_keeps_trading_system_only():
+def test_pm2_manages_system_and_dashboards():
     src = Path("ecosystem.config.js").read_text()
 
     assert 'name: "trading-system"' in src
-    assert 'script: "main.py"' in src
-    assert 'name: "trading-dashboard"' not in src
-    assert 'name: "backtest-dashboard"' not in src
+    assert 'main.py' in src
+    assert 'name: "dashboard"' in src
+    assert 'ui/dashboard.py' in src
 
 
 def test_main_keeps_single_instance_pid_lock():

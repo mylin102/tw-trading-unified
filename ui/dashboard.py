@@ -696,6 +696,33 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
+    import pandas as _pd
+
+    # 2026-06-30 Hermes Agent: Data cleaning — sort, dedupe, coerce, dropna
+    try:
+        if "timestamp" not in near_df.columns:
+            print("[Dashboard] make_futures_dual_chart: near_df missing 'timestamp', skipping data cleaning")
+        else:
+            near_df = near_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).copy()
+            if far_df is not None and not far_df.empty:
+                far_df = far_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).copy()
+            for _df in [near_df, far_df]:
+                if _df is None or _df.empty:
+                    continue
+                for _col in ["close", "open", "high", "low"]:
+                    if _col in _df.columns:
+                        _df[_col] = _pd.to_numeric(_df[_col], errors="coerce")
+                if "timestamp" in _df.columns:
+                    _df["timestamp"] = _pd.to_datetime(_df["timestamp"], errors="coerce")
+                    _df.dropna(subset=["timestamp", "close"], inplace=True)
+    except Exception as _de:
+        print(f"[Dashboard] make_futures_dual_chart data cleaning error: {_de}")
+
+    if near_df.empty:
+        print("[Dashboard] make_futures_dual_chart called with empty near_df after cleaning")
+        fig = go.Figure()
+        fig.add_annotation(text="近月資料為空", showarrow=False, font=dict(size=16))
+        return fig
     
     # 2026-06-26 Gemini CLI: Dynamic subplot mapping for Price, Score, and ATR
     has_score = "score" in near_df.columns
@@ -1688,7 +1715,19 @@ def load_far_month_data(product="TMF"):
                     if upper in df_far.columns and lower not in df_far.columns:
                         df_far = df_far.rename(columns={upper: lower})
                 if len(df_far) >= 2:
-                    return df_far
+                    # 2026-06-30 Hermes Agent: Freshness filter — drop data older than 3 days
+                    if "timestamp" in df_far.columns:
+                        _now = pd.Timestamp.now(tz=None)
+                        _cutoff = _now - pd.Timedelta(days=3)
+                        _before = len(df_far)
+                        df_far = df_far[df_far["timestamp"] >= _cutoff].copy()
+                        _after = len(df_far)
+                        if _before != _after:
+                            print(f"[Dashboard] far-month freshness filter: dropped {_before - _after}/{_before} stale rows (cutoff={_cutoff.date()})")
+                    if len(df_far) >= 2:
+                        return df_far
+                    else:
+                        print(f"[Dashboard] far-month data too stale after freshness filter ({len(df_far)} rows), falling through to legacy files")
         except Exception as e:
             print(f"Live far CSV read failed: {e}")
     
@@ -1740,7 +1779,19 @@ def load_far_month_data(product="TMF"):
             
             # 按時間排序
             df_far = df_far.sort_values("timestamp")
-            
+
+            # 2026-06-30 Hermes Agent: Freshness filter (legacy files) — drop data older than 3 days
+            _now = pd.Timestamp.now(tz=None)
+            _cutoff = _now - pd.Timedelta(days=3)
+            _before = len(df_far)
+            df_far = df_far[df_far["timestamp"] >= _cutoff].copy()
+            _after = len(df_far)
+            if _before != _after:
+                print(f"[Dashboard] far-month (legacy) freshness filter: dropped {_before - _after}/{_before} stale rows")
+            if len(df_far) < 2:
+                print(f"[Dashboard] far-month legacy data too stale ({len(df_far)} rows), returning None")
+                return None
+
             return df_far
             
         except Exception as e:
@@ -2615,25 +2666,46 @@ elif page == f"期貨 {_TICKER}":
         df_far = load_far_month_data(_ov_ticker)
         
         # 使用雙合約圖表顯示近月和遠月價格
-        if df_far is not None and not df_far.empty:
-            st.plotly_chart(
-                make_futures_dual_chart(
+        try:
+            if df_far is not None and not df_far.empty:
+                _fig = make_futures_dual_chart(
                     f_df, 
                     df_far, 
                     f"{_ov_ticker} 近月/遠月價格 & Score", 
                     signals=ft
-                ), 
-                width='stretch'
-            )
-        else:
-            # 如果沒有遠月資料，使用原來的圖表
-            # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Dynamic Ticker
-            _ov_ticker = futures_cfg.get("ticker", "TMF")
-            st.plotly_chart(
-                make_price_score_chart(f_df, "close", f"{_ov_ticker} 價格 & Score", signals=ft), 
-                width='stretch'
-            )
-            st.info("⚠️ 未找到遠月資料，僅顯示近月價格")
+                )
+            else:
+                _fig = make_price_score_chart(f_df, "close", f"{_ov_ticker} 價格 & Score", signals=ft)
+            st.plotly_chart(_fig, use_container_width=True)
+        except Exception as _ce:
+            # 2026-06-30 Hermes Agent: Chart fallback — log, clean data, retry near-only
+            import logging as _logging
+            _logging.getLogger().exception("Dual chart failed, falling back to near-only")
+            st.warning(f"⚠️ 雙合約圖表異常，已切回近月圖: {_ce}")
+            try:
+                _f_clean = f_df.copy()
+                import pandas as _pd
+                if "timestamp" in _f_clean.columns:
+                    _f_clean["timestamp"] = _pd.to_datetime(_f_clean["timestamp"], errors="coerce")
+                if "close" in _f_clean.columns:
+                    _f_clean["close"] = _pd.to_numeric(_f_clean["close"], errors="coerce")
+                _f_clean = (
+                    _f_clean
+                    .dropna(subset=["timestamp", "close"])
+                    .sort_values("timestamp")
+                    .drop_duplicates(subset=["timestamp"])
+                    .tail(1000)
+                )
+                _fallback = make_price_score_chart(
+                    _f_clean,
+                    "close",
+                    f"{_ov_ticker} 價格 & Score (fallback)",
+                    signals=ft,
+                )
+                st.plotly_chart(_fallback, use_container_width=True)
+            except Exception as _fe:
+                _logging.getLogger().exception("Fallback chart also failed")
+                st.error("❌ 圖表渲染失敗，請檢查期貨指標資料")
         
         # ═══ Strategy-Annotated Indicator Table ═══════════════════════════
         # Group indicator columns by which strategy uses them, sort by group.
@@ -4480,7 +4552,7 @@ elif page == "設定":
                                              value=float(_mts_params.get("atr_multiplier_trail", 3.5)), step=0.1)
                 
                 m5, m6 = st.columns(2)
-                f_mts_stop_fixed = m5.number_input("MTS 固定釋放點數 (pts)", min_value=5, max_value=100, 
+                f_mts_stop_fixed = m5.number_input("MTS 固定釋放點數 (pts)", min_value=5, max_value=500, 
                                                  value=int(_mts_params.get("release_stop_points", 20)))
                 f_mts_trail_fixed = m6.number_input("MTS 固定停利點數 (pts)", min_value=10, max_value=200, 
                                                   value=int(_mts_params.get("trail_distance_points", 30)))
@@ -4540,7 +4612,7 @@ elif page == "設定":
 
             if st.form_submit_button("💾 儲存並重啟期貨模組"):
                 futures_cfg["live_trading"] = f_live_new
-                
+
                 # 2026-05-27 Gemini CLI: Save restored MTS parameters
                 if "mts" not in futures_cfg: futures_cfg["mts"] = {}
                 futures_cfg["mts"]["enabled"] = f_mts_new
@@ -4561,10 +4633,57 @@ elif page == "設定":
                 futures_cfg["execution"]["broker_fee_per_side"] = f_fee
                 futures_cfg["trade_mgmt"]["lots_per_trade"] = f_lots
                 futures_cfg["trade_mgmt"]["max_positions"] = f_max_pos
+
+                # 2026-06-30 Hermes Agent: Show config diff before saving
+                _old_yaml = ""
+                try:
+                    with open(FUTURES_CFG_PATH) as _f:
+                        _old_yaml = _f.read()
+                except Exception:
+                    pass
                 save_yaml(FUTURES_CFG_PATH, futures_cfg)
+                _new_yaml = open(FUTURES_CFG_PATH).read()
+
+                # Build compact diff summary
+                _diff_lines = []
+                if _old_yaml:
+                    _old_lines = _old_yaml.splitlines()
+                    _new_lines = _new_yaml.splitlines()
+                    # Simple key-level diff for the most important changes
+                    import re as _re
+                    _old_kv = {}
+                    for _l in _old_lines:
+                        _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
+                        if _m: _old_kv[_m.group(1)] = _m.group(2).strip()
+                    for _l in _new_lines:
+                        _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
+                        if _m:
+                            _k, _v = _m.group(1), _m.group(2).strip()
+                            _ov = _old_kv.get(_k, '')
+                            if _ov != _v:
+                                _diff_lines.append(f"  `{_k}`: `{_ov}` → `{_v}`")
+                    # Also check nested strategy/risk keys
+                    def _flat_diff(_prefix, _new_d, _old_d):
+                        for _k, _v in _new_d.items():
+                            _pk = f"{_prefix}.{_k}"
+                            if isinstance(_v, dict):
+                                _flat_diff(_pk, _v, _old_d.get(_k, {}))
+                            else:
+                                _ov = _old_d.get(_k, _v)
+                                if _ov != _v:
+                                    _diff_lines.append(f"  `{_pk}`: `{_ov}` → `{_v}`")
+                    _flat_diff("strategy", futures_cfg.get("strategy", {}), yaml.safe_load(_old_yaml).get("strategy", {}) if _old_yaml else {})
+                    _flat_diff("risk_mgmt", futures_cfg.get("risk_mgmt", {}), yaml.safe_load(_old_yaml).get("risk_mgmt", {}) if _old_yaml else {})
+
+                if _diff_lines:
+                    st.success(f"✅ 設定已寫入 `{FUTURES_CFG_PATH}`\n" + "\n".join(_diff_lines))
+                else:
+                    st.success(f"✅ 設定已寫入 `{FUTURES_CFG_PATH}`\n策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
                 trigger_restart()
-                st.success(f"✅ 設定已寫入 `{FUTURES_CFG_PATH}`\n策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
                 st.info("🔄 重啟指令已送出，monitor 將在約 30 秒後套用新設定。")
+                # 2026-06-30 Hermes Agent: Hold success message for 3s before rerun
+                import time as _time
+                _time.sleep(3)
                 st.rerun()
 
     # ── 2. 選擇權 TXO 設定 ──
