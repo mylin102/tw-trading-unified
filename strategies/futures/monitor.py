@@ -4016,6 +4016,15 @@ class FuturesMonitor:
 
         # 2.1 Broker Reconciliation
         _has_pos_in_mem = bool(getattr(strategy, "_has_position", False))
+        
+        # 2026-07-01 Gemini CLI: Sync paper trader position from restored strategy state on startup to prevent immediate reconciliation reset
+        if not self.live_trading and self.trader.position == 0 and _has_pos_in_mem:
+            _released_leg = getattr(strategy, "_released_leg", None)
+            if _released_leg != "near":
+                self.trader.position = 1
+                self.trader.entry_price = getattr(strategy, "_near_entry", 0.0) or getattr(strategy, "_far_entry", 0.0)
+                console.print(f"[bold cyan]♻️ [MTS_SYNC] Initialized paper trader position to 1 from restored strategy state[/bold cyan]")
+                
         _broker_pos = self.trader.position 
         _entry_mono = getattr(strategy, "_entry_time_monotonic", 0.0)
         _released_leg = getattr(strategy, "_released_leg", None)

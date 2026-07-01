@@ -778,6 +778,11 @@ class TMFSpread(StrategyBase):
             return False
             
         state = self._read_mts_state()
+        if state:
+            # 2026-07-01 Gemini CLI: If the state file explicitly says we are FLAT or have no position,
+            # we respect it as the source of truth and do NOT fall back to fill logs (prevents restore loop).
+            if state.get("has_position") is False or state.get("state") in ("CLOSE", "EXIT", "FLAT"):
+                return False
         
         # 1. Primary Source: JSON State File
         if state and state.get("has_position") is True:
