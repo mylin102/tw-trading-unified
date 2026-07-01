@@ -15,8 +15,8 @@ module.exports = {
       max_restarts: 50,
       exp_backoff_restart_delay: 100,
       min_uptime: "10s",
-      kill_timeout: 5000,
-      listen_timeout: 600000,
+      kill_timeout: 30000,        // 30s graceful shutdown
+      // listen_timeout removed — taskpolicy wrapper prevents PM2 readiness detection
       error_file: path.join(PROJECT_ROOT, "logs/pm2-trading-error.log"),
       out_file: path.join(PROJECT_ROOT, "logs/pm2-trading-out.log"),
       log_file: path.join(PROJECT_ROOT, "logs/pm2-trading-combined.log"),

@@ -69,42 +69,48 @@ def _login(api: sj.Shioaji):
         api.activate_ca(ca_path, ca_passwd, os.path.dirname(ca_path))
         logger.info(f"[session] CA activated: {ca_path}")
 
-def _fetch_contracts_subprocess(timeout: int = 120) -> bool:
-    """Run api.fetch_contracts() in a forked subprocess to isolate C extension crashes.
+def _sync_worker(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, q):
+    """Child process worker: logs in and fetches contracts to populate the local disk cache.
+    
+    2026-07-01 Gemini CLI
+    """
+    try:
+        import shioaji as sj
+        import os
+        api = sj.Shioaji()
+        api.login(api_key, secret_key)
+        if ca_path and os.path.exists(ca_path):
+            api.activate_ca(ca_path, ca_passwd, os.path.dirname(ca_path))
+        api.fetch_contracts()
+        q.put(True)
+    except Exception as e:
+        q.put(str(e))
+
+
+def _fetch_contracts_subprocess(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, timeout: int = 120) -> bool:
+    """Run api.fetch_contracts() in a spawned subprocess to isolate C extension crashes.
     
     V-Model Rationale:
     - Shioaji's C extension (api.pyx:851 SolaceAPI._fetch_contracts_cb) has a race
       condition causing IndexError: list assignment index out of range
     - Python try/except does not reliably catch C-level callback crashes
-    - Forking isolates the crash: child dies, parent continues
-    - macOS fork() inherits the authenticated Shioaji session (FDs + connections)
+    - Spawning isolates the crash: child dies, parent continues
+    - Uses spawn mode with credentials serialization to avoid Solace DLL FD/connection conflicts on macOS/Unix.
     
     Returns:
         True if fetch succeeded (child exited 0), False otherwise
     """
     import multiprocessing as _mp
-    from multiprocessing import Process, Queue
+    # 2026-07-01 Gemini CLI: Use spawn mode context as it is macOS default and safer for C extensions
+    ctx = _mp.get_context("spawn")
     
-    _result_queue = Queue()
+    _result_queue = ctx.Queue()
     
-    def _child(q: Queue):
-        """Child process: call api.fetch_contracts() on inherited session.
-        
-        On fork()-based systems (macOS default), the child inherits the
-        parent's full address space including the authenticated Shioaji
-        session (_api). The C extension's socket connection and contract
-        cache are shared. If _fetch_contracts_cb crashes, only this child
-        dies — the parent is unharmed.
-        """
-        try:
-            # _api is the module-level singleton from shioaji_session.py
-            # Inherited via fork() — same authenticated session.
-            _api.fetch_contracts()
-            q.put(True)
-        except Exception as _e:
-            q.put(str(_e))
-    
-    child = Process(target=_child, args=(_result_queue,), name="shioaji-fetch-contracts")
+    child = ctx.Process(
+        target=_sync_worker, 
+        args=(api_key, secret_key, ca_path, ca_passwd, _result_queue), 
+        name="shioaji-fetch-contracts"
+    )
     child.start()
     child.join(timeout)
     
@@ -122,7 +128,7 @@ def _fetch_contracts_subprocess(timeout: int = 120) -> bool:
                 pass
         return False
     
-    # Read result from Queue (IPC-safe, works across fork)
+    # Read result from Queue (IPC-safe, works across spawn/fork)
     try:
         _val = _result_queue.get(timeout=2)
         if _val is True:
@@ -150,10 +156,12 @@ def fetch_contracts(api: sj.Shioaji):
     
     # Check if contracts are already there to avoid concurrent call error
     try:
-        # Use dir() to check for content without triggering expensive logic
-        # GSD: Check for presence of Futures category generally
-        if hasattr(api.Contracts, "Futures") and len(dir(api.Contracts.Futures)) > 5:
-            return 
+        # Use dir() to check for actual contract symbols (fully uppercase) to avoid early return on empty cache
+        if hasattr(api.Contracts, "Futures"):
+            # 2026-07-01 Gemini CLI: Avoid counting Swig helper properties (like 'this') by checking for uppercase tickers
+            has_contracts = any(attr.isupper() for attr in dir(api.Contracts.Futures))
+            if has_contracts:
+                return 
     except Exception:
         pass
 
@@ -166,10 +174,23 @@ def fetch_contracts(api: sj.Shioaji):
             _is_fetching = True
             logger.info("📡 Fetching contracts...")
             
+            # 2026-07-01 Gemini CLI: Load credentials to pass to the spawned sync worker
+            from dotenv import load_dotenv
+            load_dotenv(override=True)
+            api_key = os.getenv("SHIOAJI_API_KEY")
+            secret_key = os.getenv("SHIOAJI_SECRET_KEY")
+            ca_path = os.getenv("SHIOAJI_CA_PATH")
+            ca_passwd = os.getenv("SHIOAJI_CA_PASSWD")
+
+            if not api_key or not secret_key:
+                raise ValueError("Missing Shioaji credentials in .env")
+            
             # [V-Model] Guard C extension against IndexError crash in _fetch_contracts_cb
             # Use subprocess isolation: if the C callback crashes, only the child dies.
-            _ok = _fetch_contracts_subprocess(timeout=120)
+            _ok = _fetch_contracts_subprocess(api_key, secret_key, ca_path or "", ca_passwd or "", timeout=120)
             if _ok:
+                logger.info("✅ Subprocess contract download complete. Loading contracts in parent process...")
+                api.fetch_contracts()
                 logger.info("✅ Contracts fetched successfully.")
             else:
                 logger.error(

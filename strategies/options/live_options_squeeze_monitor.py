@@ -2346,6 +2346,8 @@ class ShioajiOptionsSmartMonitor:
             if csv_path.exists():
                 try:
                     df_hist = pd.read_csv(csv_path)
+                    # 2026-07-01 Gemini CLI: Take tail of historical df to prevent slow python loop in fill_small_ohlcv_gaps
+                    df_hist = df_hist.tail(1000)
                     # Handle both 'ts' and 'timestamp' column names
                     if 'ts' in df_hist.columns:
                         df_hist["ts"] = pd.to_datetime(df_hist["ts"])

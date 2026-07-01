@@ -176,14 +176,31 @@ def fetch_all_contracts(api: sj.Shioaji, timeout: int = 300):
     """Aggressively ensure contracts are available in cache (5 min timeout)."""
     from core.shioaji_session import fetch_contracts
     
+    # 2026-06-26 Gemini CLI: Load the configured ticker dynamically to avoid hardcoded 'MXF' check (Rule 11)
+    from pathlib import Path
+    import yaml
+    
+    ticker = "MXF"
+    try:
+        # 2026-07-01 Gemini CLI: Corrected resolution path to point to root config/ instead of core/config/
+        config_path = Path(__file__).resolve().parent.parent.parent / "config" / "futures.yaml"
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+                if cfg and "ticker" in cfg:
+                    ticker = cfg["ticker"]
+    except Exception:
+        pass
+    
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
             # Check if Futures and Options categories are at least visible in dir()
-            # and contain actual contract data (e.g. MXF)
+            # and contain actual contract data
             cats = dir(api.Contracts)
             if "Futures" in cats and "Options" in cats:
-                if "MXF" in dir(api.Contracts.Futures):
+                # 2026-07-01 Gemini CLI: Swig wrappers do not dynamically expose contract keys in dir(), use hasattr/repr check
+                if hasattr(api.Contracts.Futures, ticker) or ticker in repr(api.Contracts.Futures):
                     return True
         except Exception:
             pass
