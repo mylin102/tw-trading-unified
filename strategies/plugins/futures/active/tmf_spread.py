@@ -1545,9 +1545,10 @@ class TMFSpread(StrategyBase):
                 quote_age_ms=0.0
             )
 
-        _write_mts_state(has_position=False, action="CLOSE", reason=reason or "trail_exit", ticker=_ticker)
+        # 2026-07-01 Gemini CLI: Set in-memory position state to False first to prevent concurrent tick heartbeats from overwriting the file with True.
         self._has_position = False
         self._lifecycle = "FLAT"
+        _write_mts_state(has_position=False, action="CLOSE", reason=reason or "trail_exit", ticker=_ticker)
         self._last_exit_ts = exit_ts or datetime.now()  # 2026-06-25 Gemini CLI: Support passing historical exit timestamp
         self._entry_ts = None
         self._near_entry = 0.0

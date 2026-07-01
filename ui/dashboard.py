@@ -201,11 +201,11 @@ if st.sidebar.button("🔄 重新載入資料", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
-# Optional auto-refresh interval (off by default)
+# Optional auto-refresh interval (60s by default)
 auto_refresh_sec = st.sidebar.selectbox(
     "⏱️ 自動更新間隔",
     options=["關閉", "15秒", "30秒", "60秒", "120秒", "300秒"],
-    index=0,
+    index=3,
     key="auto_refresh_interval",
 )
 if auto_refresh_sec != "關閉":
@@ -2578,6 +2578,21 @@ elif page == f"期貨 {_TICKER}":
 
         fc1, fc2, fc3, fc4, fc5, fc6 = st.columns(6)
 
+        # ─── CSS 改小 Metric 字型 (放在 columns 宣告之後，內容渲染之前) ───
+        st.html("""
+            <style>
+            /* 1. 改小 Metric 的上方標題（例如：Close、Score、趨勢） */
+            [data-testid="stMetricLabel"] p {
+                font-size: 12px !important;
+                font-weight: 500 !important;
+            }
+            /* 2. 改小 Metric 的下方主要數值（例如：價格、分數、🟢多頭） */
+            [data-testid="stMetricValue"] {
+                font-size: 18px !important;
+            }
+            </style>
+        """)
+
         # 只有在資料新鮮時才顯示 bias/Sqz，否則顯示灰色「待更新」
         if data_fresh:
             # 噴發偏向 (Bias) 計算 - 整合趨勢感
@@ -2659,53 +2674,6 @@ elif page == f"期貨 {_TICKER}":
 
         if data_fresh and "fired" in last and last.get("fired", False) is True:
             st.success("🔥 **FIRE — 壓縮釋放！**")
-        
-        ft, _ = load_futures_trades()
-        
-        # 2026-05-27 Gemini CLI: Dynamic Ticker for Far Month Data
-        df_far = load_far_month_data(_ov_ticker)
-        
-        # 使用雙合約圖表顯示近月和遠月價格
-        try:
-            if df_far is not None and not df_far.empty:
-                _fig = make_futures_dual_chart(
-                    f_df, 
-                    df_far, 
-                    f"{_ov_ticker} 近月/遠月價格 & Score", 
-                    signals=ft
-                )
-            else:
-                _fig = make_price_score_chart(f_df, "close", f"{_ov_ticker} 價格 & Score", signals=ft)
-            st.plotly_chart(_fig, use_container_width=True)
-        except Exception as _ce:
-            # 2026-06-30 Hermes Agent: Chart fallback — log, clean data, retry near-only
-            import logging as _logging
-            _logging.getLogger().exception("Dual chart failed, falling back to near-only")
-            st.warning(f"⚠️ 雙合約圖表異常，已切回近月圖: {_ce}")
-            try:
-                _f_clean = f_df.copy()
-                import pandas as _pd
-                if "timestamp" in _f_clean.columns:
-                    _f_clean["timestamp"] = _pd.to_datetime(_f_clean["timestamp"], errors="coerce")
-                if "close" in _f_clean.columns:
-                    _f_clean["close"] = _pd.to_numeric(_f_clean["close"], errors="coerce")
-                _f_clean = (
-                    _f_clean
-                    .dropna(subset=["timestamp", "close"])
-                    .sort_values("timestamp")
-                    .drop_duplicates(subset=["timestamp"])
-                    .tail(1000)
-                )
-                _fallback = make_price_score_chart(
-                    _f_clean,
-                    "close",
-                    f"{_ov_ticker} 價格 & Score (fallback)",
-                    signals=ft,
-                )
-                st.plotly_chart(_fallback, use_container_width=True)
-            except Exception as _fe:
-                _logging.getLogger().exception("Fallback chart also failed")
-                st.error("❌ 圖表渲染失敗，請檢查期貨指標資料")
         
         # ═══ Strategy-Annotated Indicator Table ═══════════════════════════
         # Group indicator columns by which strategy uses them, sort by group.
@@ -2836,6 +2804,7 @@ elif page == f"期貨 {_TICKER}":
         st.info("無數據")
     
     # ── Calendar Spread 顯示 ──
+    ft, _ = load_futures_trades()
     st.header("📊 日曆價差分析 (Calendar Spread)")
     
     with st.expander("📈 價差圖表與策略條件", expanded=True):
@@ -3344,7 +3313,15 @@ elif page == f"期貨 {_TICKER}":
                             _event_rows = []
                             for _ev in _events:
                                 _et = _ev.get("event", "?")
-                                _ets = _ev.get("ts", "?")[-8:] if _ev.get("ts") else "?"
+                                _ts_str = _ev.get("ts", "")
+                                if _ts_str:
+                                    # 2026-07-01 Gemini CLI: Extract HH:MM:SS from ISO format instead of slicing last 8 chars which gets ruined by microseconds
+                                    if "T" in _ts_str:
+                                        _ets = _ts_str.split("T")[1][:8]
+                                    else:
+                                        _ets = _ts_str[:19].replace("T", " ")
+                                else:
+                                    _ets = "?"
                                 _detail = "; ".join(f"{k}={v}" for k, v in _ev.items() if k not in ("event", "ts"))
                                 _event_rows.append({"Time": _ets, "Event": _et, "Detail": _detail[:120]})
                             st.dataframe(pd.DataFrame(_event_rows), width='stretch', hide_index=True)
@@ -3426,6 +3403,49 @@ elif page == f"期貨 {_TICKER}":
                         pass
         else:
             st.info("委託單檔案尚未建立 (Order Lifecycle 未啟用)")
+
+        # ── Futures Dual Contract Chart (移至頁面最下方) ──
+        ft, _ = load_futures_trades()
+        df_far = load_far_month_data(_ov_ticker)
+        try:
+            if df_far is not None and not df_far.empty:
+                _fig = make_futures_dual_chart(
+                    f_df, 
+                    df_far, 
+                    f"{_ov_ticker} 近月/遠月價格 & Score", 
+                    signals=ft
+                )
+            else:
+                _fig = make_price_score_chart(f_df, "close", f"{_ov_ticker} 價格 & Score", signals=ft)
+            st.plotly_chart(_fig, use_container_width=True)
+        except Exception as _ce:
+            import logging as _logging
+            _logging.getLogger().exception("Dual chart failed, falling back to near-only")
+            st.warning(f"⚠️ 雙合約圖表異常，已切回近月圖: {_ce}")
+            try:
+                _f_clean = f_df.copy()
+                import pandas as _pd
+                if "timestamp" in _f_clean.columns:
+                    _f_clean["timestamp"] = _pd.to_datetime(_f_clean["timestamp"], errors="coerce")
+                if "close" in _f_clean.columns:
+                    _f_clean["close"] = _pd.to_numeric(_f_clean["close"], errors="coerce")
+                _f_clean = (
+                    _f_clean
+                    .dropna(subset=["timestamp", "close"])
+                    .sort_values("timestamp")
+                    .drop_duplicates(subset=["timestamp"])
+                    .tail(1000)
+                )
+                _fallback = make_price_score_chart(
+                    _f_clean,
+                    "close",
+                    f"{_ov_ticker} 價格 & Score (fallback)",
+                    signals=ft,
+                )
+                st.plotly_chart(_fallback, use_container_width=True)
+            except Exception as _fe:
+                _logging.getLogger().exception("Fallback chart also failed")
+                st.error("❌ 圖表渲染失敗，請檢查期貨指標資料")
 
 # ════════════════════════════════════════
 # Tab 3: 選擇權
