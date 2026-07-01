@@ -5307,7 +5307,9 @@ class FuturesMonitor:
             _skip_save = len(df_5m) < 5 and not is_new_session
             
             if not _skip_save and not is_new_session:
-                _has_atr_raw = "atr_raw" in last_5m and pd.notna(last_5m.get("atr_raw"))
+                # 2026-07-01 Gemini CLI: Allow saving even if atr_raw is NaN to avoid CSV gaps and dashboard freeze.
+                # Only require the column to exist so schema is correct.
+                _has_atr_raw = "atr_raw" in last_5m
                 _skip_save = not _has_atr_raw
                 
             if not _skip_save:
