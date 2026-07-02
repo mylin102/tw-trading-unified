@@ -767,12 +767,16 @@ def run_system(dry_run=False):
         fm.tx_bar_builder = tx_bar_builder
 
         ft = threading.Thread(target=fm.run, name="futures", daemon=True)
-        ot = threading.Thread(target=om.run, name="options", daemon=True)
+        # 2026-07-02 Hermes Agent: Options strategy disabled — negative PnL (-73k)
+        # Re-enable when futures MTS is stable and options logic is revised.
+        _options_enabled = False
+        if _options_enabled:
+            ot = threading.Thread(target=om.run, name="options", daemon=True)
+            ot.start()
         
         ft.start()
-        ot.start()
-        console.print("[bold green]🚀 Unified Monitors Running (Futures, Options)[/bold green]")
-        print(f"[RUNTIME_LOOP_STARTED] futures_thread={ft.ident} options_thread={ot.ident}", flush=True)
+        console.print("[bold green]🚀 Unified Monitors Running (Futures)[/bold green]")
+        print(f"[RUNTIME_LOOP_STARTED] futures_thread={ft.ident}", flush=True)
 
         startup_grace_until = time.time() + 60
         health_check_at = time.time() + HEALTH_INTERVAL
@@ -785,10 +789,10 @@ def run_system(dry_run=False):
 
         while restart_count < max_restarts:
             # [Auto-Restart] Check if threads died unexpectedly
-            if not ft.is_alive() or not ot.is_alive():
-                dead = []
-                if not ft.is_alive(): dead.append("futures")
-                if not ot.is_alive(): dead.append("options")
+            if not ft.is_alive():
+                dead = ["futures"]
+                if _options_enabled and 'ot' in locals() and not ot.is_alive():
+                    dead.append("options")
                 console.print(f"[bold red]💀 Thread died: {', '.join(dead)}. Restarting (attempt {restart_count+1}/{max_restarts})...[/bold red]")
                 restart_count += 1
 
@@ -863,9 +867,10 @@ def run_system(dry_run=False):
 
 
                     ft = threading.Thread(target=fm.run, name="futures", daemon=True)
-                    ot = threading.Thread(target=om.run, name="options", daemon=True)
+                    if _options_enabled:
+                        ot = threading.Thread(target=om.run, name="options", daemon=True)
+                        ot.start()
                     ft.start()
-                    ot.start()
                     last_data_at = time.time()  # Reset staleness timer
                     stagnation_warned = False
                     console.print(f"[bold green]✅ Restarted threads (attempt {restart_count}/{max_restarts})[/bold green]")
