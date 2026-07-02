@@ -47,6 +47,27 @@ module.exports = {
         PYTHONUNBUFFERED: "1",    // 💡 關鍵：Streamlit 輸出同步不延遲
         NODE_ENV: "production"
       }
+    },
+    {
+      name: "stock-runner",
+      script: "taskpolicy",
+      args: `-c background ${path.join(PROJECT_ROOT, "venv/bin/python3")} scripts/runners/stock_runner.py`,
+      interpreter: "none",
+      cwd: PROJECT_ROOT,
+      restart_delay: 15000,
+      autorestart: true,
+      watch: false,
+      max_restarts: 20,
+      kill_timeout: 15000,
+      error_file: path.join(PROJECT_ROOT, "logs/pm2-stock-error.log"),
+      out_file: path.join(PROJECT_ROOT, "logs/pm2-stock-out.log"),
+      log_file: path.join(PROJECT_ROOT, "logs/pm2-stock-combined.log"),
+      pid_file: path.join(PROJECT_ROOT, "logs/pm2-stock.pid"),
+      env: {
+        PYTHONPATH: PROJECT_ROOT,
+        PYTHONUNBUFFERED: "1",
+        NODE_ENV: "production"
+      }
     }
   ]
 };
