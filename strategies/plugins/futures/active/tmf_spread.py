@@ -31,14 +31,15 @@ Re-entry:
 from __future__ import annotations
 
 import logging
-import json
 import os
+import json
 import math
-# 2026-05-27 Gemini CLI: Import time for monotonic counters
 import time
 import pandas as pd
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeVar
+from enum import Enum
+from dataclasses import dataclass, field
 
 from core.signal import Signal
 from core.strategy_base import StrategyBase
@@ -48,6 +49,229 @@ from strategies.futures.squeeze_futures.engine.constants import get_point_value
 
 logger = logging.getLogger(__name__)
 
+# ═══════════════════════════════════════════════════════════════
+# ADR-009 v1.1: Position Lifecycle — ReleaseGroup + TrailGroup
+# ═══════════════════════════════════════════════════════════════
+
+class Leg(Enum):
+    """Spread leg identifier."""
+    NEAR = "NEAR"
+    FAR = "FAR"
+
+class Side(Enum):
+    """Position side (direction)."""
+    LONG = "LONG"
+    SHORT = "SHORT"
+
+class PositionPhase(Enum):
+    """Shape of the spread position (not order progress)."""
+    FLAT = "FLAT"           # no position
+    SPREAD = "SPREAD"       # both legs held
+    SINGLE_LEG = "SINGLE_LEG"  # one leg released, one remaining
+
+class ReleaseGroupStatus(Enum):
+    """Lifecycle of the release OCO pair."""
+    INACTIVE = "INACTIVE"           # not in spread phase
+    ARMED = "ARMED"                 # spread held, monitoring release_stop
+    TRIGGERED = "TRIGGERED"         # release_stop hit, about to submit
+    SUBMITTED = "SUBMITTED"         # both release orders submitted
+    FILLED = "FILLED"               # one leg filled, sibling cancel pending
+    COMPLETED = "COMPLETED"         # filled + sibling cancel confirmed
+    FAILED = "FAILED"               # terminal failure
+
+class TrailGroupStatus(Enum):
+    """Lifecycle of the post-release single-leg trailing exit."""
+    INACTIVE = "INACTIVE"   # not in single-leg phase
+    ARMED = "ARMED"         # release confirmed, trail not yet active
+    ACTIVE = "ACTIVE"       # trail stop calculated and monitored
+    SUBMITTED = "SUBMITTED" # exit order submitted
+    FILLED = "FILLED"       # exit fill confirmed
+    FAILED = "FAILED"       # terminal failure
+
+class LifecycleAction(Enum):
+    """Action selected by the lifecycle controller."""
+    MANUAL = "MANUAL"
+    STOPLOSS = "STOPLOSS"
+    TIMEOUT = "TIMEOUT"
+    RELEASE = "RELEASE"
+    TRAIL = "TRAIL"
+
+# Priority order for action selection (index = priority, lower = higher)
+_LIFECYCLE_ACTION_PRIORITY: list[LifecycleAction] = [
+    LifecycleAction.MANUAL,
+    LifecycleAction.STOPLOSS,
+    LifecycleAction.TIMEOUT,
+    LifecycleAction.RELEASE,
+    LifecycleAction.TRAIL,
+]
+
+@dataclass
+class ReleaseGroup:
+    """State holder for the release OCO pair (ADR-009 v1.1)."""
+    status: ReleaseGroupStatus = ReleaseGroupStatus.INACTIVE
+    near_order_id: str | None = None
+    far_order_id: str | None = None
+    filled_leg: Leg | None = None
+    filled_order_id: str | None = None
+    canceled_leg: Leg | None = None
+    trigger_ts: str | None = None
+
+@dataclass
+class TrailGroup:
+    """State holder for the post-release trailing exit (ADR-009 v1.1)."""
+    status: TrailGroupStatus = TrailGroupStatus.INACTIVE
+    remaining_leg: Leg | None = None
+    exit_order_id: str | None = None
+    peak_pnl: float | None = None
+    nadir_pnl: float | None = None
+    trail_stop: float | None = None
+    trigger_ts: str | None = None
+
+@dataclass
+class PositionLifecycle:
+    """Aggregate state for the MTS spread position lifecycle (ADR-009 v1.1)."""
+    phase: PositionPhase = PositionPhase.FLAT
+    release_group: ReleaseGroup = field(default_factory=ReleaseGroup)
+    trail_group: TrailGroup = field(default_factory=TrailGroup)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Serialization helpers (ADR-009 v1.1 Task 2)
+# ═══════════════════════════════════════════════════════════════
+
+_EnumT = TypeVar("_EnumT", bound=Enum)
+
+def _enum_from_value(enum_cls: type[_EnumT], value: object, default: _EnumT) -> _EnumT:
+    """Parse an enum from a JSON value with strict validation.
+
+    Raises ValueError on invalid values (ADR-009: strict policy).
+    """
+    if value is None:
+        _warn_fallback(f"{enum_cls.__name__} is None, using {default}")
+        return default
+    try:
+        return enum_cls(value)
+    except (ValueError, TypeError):
+        logger.warning("[LIFECYCLE_ENUM] invalid %s value=%r — raising (strict policy)", enum_cls.__name__, value)
+        raise
+
+def _warn_fallback(msg: str) -> None:
+    logger.warning("[LIFECYCLE_FALLBACK] %s", msg)
+
+def _leg_to_str(leg: Leg | None) -> str | None:
+    return leg.value if leg else None
+
+def _str_to_leg(s: str | None) -> Leg | None:
+    return Leg(s) if s else None
+
+def _release_group_to_dict(rg: ReleaseGroup) -> dict:
+    return {
+        "status": rg.status.value,
+        "near_order_id": rg.near_order_id,
+        "far_order_id": rg.far_order_id,
+        "filled_leg": _leg_to_str(rg.filled_leg),
+        "filled_order_id": rg.filled_order_id,
+        "canceled_leg": _leg_to_str(rg.canceled_leg),
+        "trigger_ts": rg.trigger_ts,
+    }
+
+def _release_group_from_dict(d: dict | None) -> ReleaseGroup:
+    if not d:
+        return ReleaseGroup()
+    return ReleaseGroup(
+        status=_enum_from_value(ReleaseGroupStatus, d.get("status"), ReleaseGroupStatus.INACTIVE),
+        near_order_id=d.get("near_order_id"),
+        far_order_id=d.get("far_order_id"),
+        filled_leg=_str_to_leg(d.get("filled_leg")),
+        filled_order_id=d.get("filled_order_id"),
+        canceled_leg=_str_to_leg(d.get("canceled_leg")),
+        trigger_ts=d.get("trigger_ts"),
+    )
+
+def _trail_group_to_dict(tg: TrailGroup) -> dict:
+    return {
+        "status": tg.status.value,
+        "remaining_leg": _leg_to_str(tg.remaining_leg),
+        "exit_order_id": tg.exit_order_id,
+        "peak_pnl": tg.peak_pnl,
+        "nadir_pnl": tg.nadir_pnl,
+        "trail_stop": tg.trail_stop,
+        "trigger_ts": tg.trigger_ts,
+    }
+
+def _trail_group_from_dict(d: dict | None) -> TrailGroup:
+    if not d:
+        return TrailGroup()
+    return TrailGroup(
+        status=TrailGroupStatus(d.get("status", TrailGroupStatus.INACTIVE.value)),
+        remaining_leg=_str_to_leg(d.get("remaining_leg")),
+        exit_order_id=d.get("exit_order_id"),
+        peak_pnl=d.get("peak_pnl"),
+        nadir_pnl=d.get("nadir_pnl"),
+        trail_stop=d.get("trail_stop"),
+        trigger_ts=d.get("trigger_ts"),
+    )
+
+def lifecycle_to_dict(lc: PositionLifecycle) -> dict:
+    """Serialize PositionLifecycle to a plain dict for JSON state file."""
+    return {
+        "phase": lc.phase.value,
+        "release_group": _release_group_to_dict(lc.release_group),
+        "trail_group": _trail_group_to_dict(lc.trail_group),
+    }
+
+def lifecycle_from_dict(d: dict | None) -> PositionLifecycle:
+    """Deserialize PositionLifecycle from a plain dict. Returns FLAT default if d is None."""
+    if not d:
+        return PositionLifecycle()
+    return PositionLifecycle(
+        phase=PositionPhase(d.get("phase", PositionPhase.FLAT.value)),
+        release_group=_release_group_from_dict(d.get("release_group")),
+        trail_group=_trail_group_from_dict(d.get("trail_group")),
+    )
+
+def infer_lifecycle_from_legacy_state(state: dict | None) -> PositionLifecycle:
+    """Infer PositionLifecycle from legacy state file (no lifecycle block).
+
+    Used for backward compatibility (ADR-009 v1.1 Task 2).
+    Legacy fields: has_position, state, released_leg, release_state.
+    """
+    lc = PositionLifecycle()
+    if not state:
+        return lc  # FLAT
+
+    has_pos = state.get("has_position", False)
+    if not has_pos:
+        return lc  # FLAT
+
+    release_state = state.get("release_state", "BOTH_HELD")
+    released_leg_str = state.get("released_leg")  # "near" or "far" (legacy lowercase)
+
+    if release_state in ("NEAR_RELEASED", "FAR_RELEASED") or released_leg_str:
+        lc.phase = PositionPhase.SINGLE_LEG
+        lc.release_group.status = ReleaseGroupStatus.COMPLETED
+        # Infer which leg was released
+        if released_leg_str:
+            released_leg = Leg.NEAR if released_leg_str.lower() == "near" else Leg.FAR
+            lc.release_group.filled_leg = released_leg
+            lc.release_group.canceled_leg = Leg.FAR if released_leg == Leg.NEAR else Leg.NEAR
+        elif release_state == "NEAR_RELEASED":
+            lc.release_group.filled_leg = Leg.FAR  # remaining leg is NEAR, so FAR was released
+            lc.release_group.canceled_leg = Leg.NEAR
+        else:
+            lc.release_group.filled_leg = Leg.NEAR
+            lc.release_group.canceled_leg = Leg.FAR
+        # TrailGroup starts ARMED (monitor will activate on next tick)
+        lc.trail_group.status = TrailGroupStatus.ARMED
+        lc.trail_group.remaining_leg = Leg.NEAR if lc.release_group.filled_leg == Leg.FAR else Leg.FAR
+    else:
+        # BOTH_HELD → SPREAD
+        lc.phase = PositionPhase.SPREAD
+        lc.release_group.status = ReleaseGroupStatus.ARMED
+
+    return lc
+
+
 _ENTRY_Z = 2.5            # entry z-score threshold
 _RELEASE_STOP_PTS = 20    # losing leg release threshold (pt)
 _TRAIL_DISTANCE_PTS = 30  # remaining leg trailing stop distance (pt)
@@ -56,6 +280,141 @@ _MTS_STATE_FILE = os.getenv("MTS_STATE_PATH", "/tmp/mts_position_state.json")
 # 2026-06-25 Gemini CLI / Hermes Agent: environmental isolation for MTS fill and event logs
 _MTS_EVENT_LOG = os.getenv("MTS_EVENT_LOG_PATH", "logs/mts_spread_events.jsonl")
 _MTS_FILL_LOG = os.getenv("MTS_FILL_LOG_PATH", "logs/mts_trade_fills.jsonl")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Task 3A: Pure Decision Engine (ADR-009 v1.1)
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class LifecycleContext:
+    """Input data for evaluate_lifecycle_actions(). Pure data — no filesystem, no Shioaji."""
+    near_pnl_pts: float
+    far_pnl_pts: float
+    floating_pnl_pts: float
+    entry_age_secs: float
+    release_stop_threshold: float
+    trail_dist: float
+    manual_requested: bool = False
+    max_hold_secs: float | None = None        # None = no timeout
+    max_loss_pts: float | None = None          # None = no stoploss
+    trailing_side: Side | None = None          # LONG/SHORT for remaining leg
+    peak: float = 0.0
+    nadir: float = 0.0
+    rem_high: float = 0.0
+    rem_low: float = 0.0
+    is_backtest: bool = False
+
+
+@dataclass
+class LifecycleDecision:
+    """Result of evaluate_lifecycle_actions()."""
+    action: LifecycleAction
+    release_leg: Leg | None = None  # which leg to release (only for RELEASE)
+
+
+def _check_release_candidates(
+    ctx: LifecycleContext, lifecycle: PositionLifecycle,
+) -> list[LifecycleDecision]:
+    if lifecycle.phase != PositionPhase.SPREAD:
+        return []
+    if lifecycle.release_group.status not in (ReleaseGroupStatus.ARMED, ReleaseGroupStatus.TRIGGERED):
+        return []
+    near_hit = ctx.near_pnl_pts <= -ctx.release_stop_threshold
+    far_hit = ctx.far_pnl_pts <= -ctx.release_stop_threshold
+    if near_hit or far_hit:
+        # If both hit, release the more negative leg
+        if near_hit and far_hit:
+            leg = Leg.NEAR if ctx.near_pnl_pts <= ctx.far_pnl_pts else Leg.FAR
+        elif near_hit:
+            leg = Leg.NEAR
+        else:
+            leg = Leg.FAR
+        return [LifecycleDecision(action=LifecycleAction.RELEASE, release_leg=leg)]
+    return []
+
+
+def _check_trail_candidate(
+    ctx: LifecycleContext, lifecycle: PositionLifecycle,
+) -> list[LifecycleDecision]:
+    if lifecycle.phase != PositionPhase.SINGLE_LEG:
+        return []
+    if lifecycle.trail_group.status not in (TrailGroupStatus.ARMED, TrailGroupStatus.ACTIVE):
+        return []
+    if ctx.trailing_side is None or ctx.rem_high <= 0 or ctx.rem_low <= 0:
+        return []
+    if ctx.trailing_side == Side.LONG:
+        if ctx.rem_low <= ctx.peak - ctx.trail_dist:
+            return [LifecycleDecision(action=LifecycleAction.TRAIL)]
+    else:
+        if ctx.rem_high >= ctx.nadir + ctx.trail_dist:
+            return [LifecycleDecision(action=LifecycleAction.TRAIL)]
+    return []
+
+
+def _check_timeout_candidate(ctx: LifecycleContext) -> list[LifecycleDecision]:
+    if ctx.max_hold_secs is not None and ctx.entry_age_secs > ctx.max_hold_secs:
+        return [LifecycleDecision(action=LifecycleAction.TIMEOUT)]
+    return []
+
+
+def _check_stoploss_candidate(ctx: LifecycleContext) -> list[LifecycleDecision]:
+    if ctx.max_loss_pts is not None and ctx.floating_pnl_pts <= -ctx.max_loss_pts:
+        return [LifecycleDecision(action=LifecycleAction.STOPLOSS)]
+    return []
+
+
+def _check_manual_candidate(ctx: LifecycleContext) -> list[LifecycleDecision]:
+    if ctx.manual_requested:
+        return [LifecycleDecision(action=LifecycleAction.MANUAL)]
+    return []
+
+
+def evaluate_lifecycle_actions(
+    ctx: LifecycleContext,
+    lifecycle: PositionLifecycle,
+) -> LifecycleDecision | None:
+    """Pure decision engine: collect candidates → select by priority → commit.
+
+    Returns LifecycleDecision (action + leg) or None.
+    Mutates lifecycle state for the selected path.
+    No filesystem, no Shioaji, no order submission.
+    """
+    # Do not re-select if release is still in flight
+    if lifecycle.release_group.status in (
+        ReleaseGroupStatus.SUBMITTED, ReleaseGroupStatus.FILLED,
+    ):
+        return None
+    # Do not re-select if trail is still in flight
+    if lifecycle.trail_group.status in (
+        TrailGroupStatus.SUBMITTED, TrailGroupStatus.FILLED,
+    ):
+        return None
+
+    candidates: list[LifecycleDecision] = []
+    candidates.extend(_check_manual_candidate(ctx))
+    candidates.extend(_check_stoploss_candidate(ctx))
+    candidates.extend(_check_timeout_candidate(ctx))
+    candidates.extend(_check_release_candidates(ctx, lifecycle))
+    candidates.extend(_check_trail_candidate(ctx, lifecycle))
+
+    if not candidates:
+        return None
+
+    for priority_action in _LIFECYCLE_ACTION_PRIORITY:
+        for decision in candidates:
+            if decision.action == priority_action:
+                _commit_action(lifecycle, decision)
+                return decision
+    return None
+
+
+def _commit_action(lifecycle: PositionLifecycle, decision: LifecycleDecision) -> None:
+    """Apply lifecycle state transition. No side effects — no filesystem, no Shioaji."""
+    if decision.action == LifecycleAction.RELEASE:
+        lifecycle.release_group.status = ReleaseGroupStatus.TRIGGERED
+    elif decision.action == LifecycleAction.TRAIL:
+        lifecycle.trail_group.status = TrailGroupStatus.SUBMITTED
 
 
 def _append_event(event_type: str, **kwargs) -> None:
@@ -423,6 +782,9 @@ class TMFSpread(StrategyBase):
         self._trail_exit_ticks = 0
         self._trail_exit_start_time = 0.0
 
+        # ADR-009 v1.1: Position Lifecycle OCA
+        self._lifecycle_oca: PositionLifecycle = PositionLifecycle()
+
     def _get_thresholds(self, bar: dict) -> tuple[float, float]:
         """Calculate dynamic thresholds based on ATR, or use fixed fallbacks."""
         atr = bar.get("atr")
@@ -483,6 +845,8 @@ class TMFSpread(StrategyBase):
         self._entry_spread_z = entry_spread_z
         self._released_leg = None
         self._release_ts = None
+        # ADR-009 v1.1: sync lifecycle to SPREAD
+        self._lifecycle_oca = PositionLifecycle(phase=PositionPhase.SPREAD, release_group=ReleaseGroup(status=ReleaseGroupStatus.ARMED))
         # 2026-06-25 Gemini CLI: Support passing a historical entry timestamp for backtests
         self._entry_ts = kwargs.get("entry_ts") or datetime.now()
         # 2026-05-27 Gemini CLI: Use monotonic time for robust grace period (P2)
@@ -534,6 +898,14 @@ class TMFSpread(StrategyBase):
         self._lifecycle = f"TRAILING_{self._side}"
         self._release_ts = datetime.now()
         self._release_mono = time.monotonic()
+        # ADR-009 v1.1: sync lifecycle to SINGLE_LEG + trail armed
+        _rel = Leg.NEAR if leg == "near" else Leg.FAR
+        _rem = Leg.FAR if leg == "near" else Leg.NEAR
+        self._lifecycle_oca = PositionLifecycle(
+            phase=PositionPhase.SINGLE_LEG,
+            release_group=ReleaseGroup(status=ReleaseGroupStatus.COMPLETED, filled_leg=_rel, canceled_leg=_rem),
+            trail_group=TrailGroup(status=TrailGroupStatus.ARMED, remaining_leg=_rem),
+        )
         
         # Ensure peak/nadir are primed with the release-time price of the REMAINING leg
         if self._side == "LONG": 
@@ -622,6 +994,12 @@ class TMFSpread(StrategyBase):
         atr_val = round(float(atr), 2) if has_atr else 0.0
         stop_mult = self._atr_mult_stop if has_atr else 0.0
         trail_mult = self._atr_mult_trail if has_atr else 0.0
+        
+        # 2026-07-03 Hermes Agent: when multiplier is 0, force fixed fallback
+        # (otherwise atr * 0 = 0, making thresholds useless)
+        if has_atr and (stop_mult <= 0 or trail_mult <= 0):
+            risk_mode = "FIXED_FALLBACK"
+            has_atr = False
         
         release_stop = round(atr_val * stop_mult, 2) if has_atr else self._release_stop_fixed
         trail_dist = round(atr_val * trail_mult, 2) if has_atr else self._trail_dist_fixed
@@ -1181,6 +1559,64 @@ class TMFSpread(StrategyBase):
         self._mfe_pts = max(self._mfe_pts, current_pnl)
         self._mae_pts = min(self._mae_pts, current_pnl)
 
+        # ── ADR-009 v1.1 Task 4A: Build LifecycleContext + evaluate lifecycle ──
+        _decision: LifecycleDecision | None = None
+        try:
+            _entry_age = (now - self._entry_ts).total_seconds() if self._entry_ts else 0.0
+            _release_stop, _trail_dist = self._get_thresholds(bar)
+            _n_pnl = self._pnl_near(near_close)
+            _f_pnl = self._pnl_far(far_close)
+            _trailing_side = None
+            _peak = self._peak
+            _nadir = self._nadir
+            # Read released_leg from lifecycle (with legacy fallback)
+            _rg = self._lifecycle_oca.release_group
+            _rel = _rg.filled_leg
+            if _rel is None and self._released_leg:
+                _rel = Leg.FAR if self._released_leg == "far" else Leg.NEAR
+            if _rel is not None and self._side:
+                _trailing_side = Side.LONG if self._side == "LONG" else Side.SHORT
+            # rem_high/rem_low: use opposite leg from released
+            if _rel == Leg.NEAR:
+                _rem_high = float(bar.get("far_high", 0))
+                _rem_low = float(bar.get("far_low", 0))
+            elif _rel == Leg.FAR:
+                _rem_high = float(bar.get("near_high", 0))
+                _rem_low = float(bar.get("near_low", 0))
+            else:
+                _rem_high = _rem_low = 0.0
+            _ctx = LifecycleContext(
+                near_pnl_pts=_n_pnl,
+                far_pnl_pts=_f_pnl,
+                floating_pnl_pts=current_pnl,
+                entry_age_secs=_entry_age,
+                release_stop_threshold=_release_stop,
+                trail_dist=_trail_dist,
+                trailing_side=_trailing_side,
+                peak=_peak,
+                nadir=_nadir,
+                rem_high=_rem_high,
+                rem_low=_rem_low,
+                is_backtest=_is_backtest,
+            )
+            _decision = evaluate_lifecycle_actions(_ctx, self._lifecycle_oca)
+            if _decision is not None:
+                # [ADR-009] Decision committed — persist lifecycle before returning Signal
+                logger.info("[LIFECYCLE_DECISION] action=%s release_leg=%s", _decision.action, _decision.release_leg)
+                _write_mts_state(
+                    has_position=self._has_position, action=f"LIFECYCLE_{_decision.action.value}",
+                    reason=_decision.action.value,
+                    near_entry=self._near_entry, far_entry=self._far_entry,
+                    near_last=near_close, far_last=far_close,
+                    near_side=self._near_side, far_side=self._far_side,
+                    spread_z=spread_z, released_leg=self._released_leg,
+                    trade_id=self._trade_id, ticker=self._ticker,
+                    atr=self._last_atr if self._last_atr is not None else 0.0,
+                    lifecycle=lifecycle_to_dict(self._lifecycle_oca),
+                )
+        except Exception:
+            logger.exception("[LIFECYCLE_EVAL_FAILED]")
+
         # Quote freshness check
         near_age = bar.get("near_tick_age_ms", bar.get("near_age_ms", -1))
         far_age = bar.get("far_tick_age_ms", bar.get("far_age_ms", -1))
@@ -1210,6 +1646,86 @@ class TMFSpread(StrategyBase):
         _n_pnl = self._pnl_near(near_close)
         _f_pnl = self._pnl_far(far_close)
 
+        # ── ADR-009 v1.1 Task 4B-1: decision-to-Signal ──
+        if _decision is not None:
+            if _decision.action == LifecycleAction.RELEASE:
+                _release_leg = _decision.release_leg
+                assert _release_leg is not None, "RELEASE decision must have release_leg"
+                # Maintain tick confirmation state (legacy behavior)
+                if _release_leg == Leg.NEAR:
+                    self._release_near_ticks += 1
+                    if self._release_near_ticks == 1:
+                        self._release_near_start_time = time.monotonic()
+                else:
+                    self._release_far_ticks += 1
+                    if self._release_far_ticks == 1:
+                        self._release_far_start_time = time.monotonic()
+                # Respect tick confirmation
+                if _release_leg == Leg.NEAR:
+                    if not (_is_backtest or (self._release_near_ticks >= self._confirm_ticks and (time.monotonic() - self._release_near_start_time) * 1000 >= self._confirm_ms)):
+                        self._set_eval(skip_reason="LIFECYCLE_RELEASE_PENDING", leg="NEAR")
+                        return None
+                else:
+                    if not (_is_backtest or (self._release_far_ticks >= self._confirm_ticks and (time.monotonic() - self._release_far_start_time) * 1000 >= self._confirm_ms)):
+                        self._set_eval(skip_reason="LIFECYCLE_RELEASE_PENDING", leg="FAR")
+                        return None
+                # RELEASE: use decision.release_leg → build PARTIAL_EXIT Signal
+                _release_leg = _decision.release_leg
+                if _release_leg is None:
+                    logger.error("[LIFECYCLE] RELEASE decision missing release_leg — skipping")
+                    return None
+                _exit_price = near_close if _release_leg == Leg.NEAR else far_close
+                _pnl_pts = _n_pnl if _release_leg == Leg.NEAR else _f_pnl
+                _turnover = (self._near_entry + _exit_price) * _mult
+                _cost = 20.0 + _turnover * 2e-5
+                _realized = _pnl_pts * _mult - _cost
+                _signal_reason = f"TMF_RELEASE_{_release_leg.value}"
+                _rel_leg_str = _release_leg.value.lower()  # "near"/"far" for legacy
+                self._lifecycle = f"RELEASE_{_release_leg.value}"
+                self._release_ts = now
+                self._release_mono = time.monotonic()
+                self._released_leg = _rel_leg_str
+                self._release_price = _exit_price
+                # Anchor capture for remaining leg
+                _anchor = far_close if _release_leg == Leg.NEAR else near_close
+                if _anchor > 0:
+                    self._post_release_anchor_price = _anchor
+                    _append_event("POST_RELEASE_ANCHOR_SET", remaining_leg="FAR" if _release_leg == Leg.NEAR else "NEAR", anchor_price=_anchor)
+                # MFE/MAE
+                _mfe = (self._near_max - self._near_entry) if self._near_side == "LONG" else (self._near_entry - self._near_min)
+                _mae = (self._near_entry - self._near_min) if self._near_side == "LONG" else (self._near_max - self._near_entry)
+                self._log_exit_decision(exit_reason="RELEASE_STOP", pnl=_pnl_pts, bar=bar)
+                _append_event(f"RELEASE_{_release_leg.value}_SUBMITTED", released_leg=_release_leg.value, exit_price=_exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, mfe=round(_mfe,2), mae=round(_mae,2), **_risk_meta)
+                _write_mts_state(has_position=True, action=f"RELEASE_{_release_leg.value}", reason=f"{_release_leg.value}_pnl={_pnl_pts:.1f}", near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=_rel_leg_str, release_price=_exit_price, release_stop_points=int(release_stop), trail_distance_points=int(trail_dist), trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
+                return Signal("PARTIAL_EXIT", _signal_reason, confidence=0.4)
+            elif _decision.action in (LifecycleAction.TRAIL, LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT):
+                # TRAIL / STOPLOSS / TIMEOUT: full exit of remaining leg
+                _exit_reason = _decision.action.name
+                _tg = self._lifecycle_oca.trail_group
+                _rem_leg = _tg.remaining_leg
+                if _rem_leg is None:
+                    _rem_leg = Leg.FAR if self._released_leg == "near" else Leg.NEAR
+                _exit_price = far_close if _rem_leg == Leg.FAR else near_close
+                _rem_entry = self._far_entry if _rem_leg == Leg.FAR else self._near_entry
+                _rem_side = self._far_side if _rem_leg == Leg.FAR else self._near_side
+                _pnl_pts = (_exit_price - _rem_entry) if _rem_side == "LONG" else (_rem_entry - _exit_price)
+                _turnover = (_rem_entry + _exit_price) * _mult
+                _cost = 20.0 + _turnover * 2e-5
+                _realized = _pnl_pts * _mult - _cost
+                self._lifecycle = "EXITING"
+                self._log_exit_decision(exit_reason=_exit_reason, pnl=_pnl_pts, bar=bar)
+                _append_event("EXIT_REMAINING", reason=_exit_reason, remaining_leg=_rem_leg.value, exit_price=_exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, **_risk_meta)
+                _write_mts_state(has_position=True, action=f"EXIT_{_exit_reason}", reason=_exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
+                return Signal("EXIT", f"TMF_{_exit_reason}", confidence=0.5, stop_loss=0)
+            elif _decision.action == LifecycleAction.MANUAL:
+                # MANUAL: full flatten — same as STOPLOSS/TIMEOUT
+                self._lifecycle = "EXITING"
+                self._log_exit_decision(exit_reason="MANUAL", pnl=0, bar=bar)
+                _append_event("MANUAL_EXIT", **_risk_meta)
+                _write_mts_state(has_position=True, action="MANUAL_EXIT", reason="manual", near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
+                return Signal("EXIT", "TMF_MANUAL", confidence=1.0, stop_loss=0)
+
+        # ── Legacy path (fallback when _decision is None) ──
         # ── Full spread held ──
         if self._released_leg is None:
             # 2026-06-29 Gemini CLI: Under Deferred Strategy Sync, if we are in RELEASE_NEAR/FAR
@@ -1242,122 +1758,6 @@ class TMFSpread(StrategyBase):
             else:
                 self._release_far_ticks = 0
                 self._release_far_start_time = 0.0
-
-            # Near trigger decision execution
-            _near_confirmed = (_is_backtest or (self._release_near_ticks >= self._confirm_ticks and (time.monotonic() - self._release_near_start_time) * 1000 >= self._confirm_ms))
-            if near_triggered and _near_confirmed:
-                if _is_grace:
-                    self._set_eval(skip_reason="RELEASE_SUPPRESSED_IN_GRACE", n_pnl=_n_pnl)
-                else:
-                    self._lifecycle = "RELEASE_NEAR"
-                    self._release_ts = now
-                    self._release_mono = time.monotonic()
-                    
-                    _pnl_pts = _n_pnl
-                    _turnover = (self._near_entry + near_close) * _mult
-                    _cost = 20.0 + _turnover * 2e-5
-                    _realized = _pnl_pts * _mult - _cost
-                    
-                    # 2026-06-26 Hermes Agent: capture post-release anchor = remaining leg price at release
-                    _anchor_price = far_close if far_close > 0 else None
-                    _anchor_source = _LIVE_TICK if far_close > 0 else None
-                    _anchor_age = quote_age_ms if far_close > 0 else None
-                    self._post_release_anchor_price = _anchor_price
-                    self._post_release_anchor_source = _anchor_source
-                    self._post_release_anchor_age_ms = _anchor_age
-                    if _anchor_price is not None:
-                        _append_event("POST_RELEASE_ANCHOR_SET",
-                            remaining_leg="FAR", anchor_price=_anchor_price,
-                            price_source=_anchor_source, quote_age_ms=_anchor_age)
-                    else:
-                        _append_event("POST_RELEASE_ANCHOR_SET",
-                            remaining_leg="FAR", anchor_price=None,
-                            price_source=_MISSING, quote_age_ms=quote_age_ms)
-
-                    # 2026-06-26 Hermes Agent: per-leg MFE/MAE for release fill
-                    _near_mfe = (self._near_max - self._near_entry) if self._near_side == "LONG" else (self._near_entry - self._near_min)
-                    _near_mae = (self._near_entry - self._near_min) if self._near_side == "LONG" else (self._near_max - self._near_entry)
-
-                    # 2026-06-26 Gemini CLI: log decision with structured exit metadata
-                    self._log_exit_decision(exit_reason="RELEASE_STOP", pnl=_pnl_pts, bar=bar)
-                    _append_event("RELEASE_NEAR_SUBMITTED", 
-                                  released_leg="NEAR", remaining_leg="FAR",
-                                  leg_side=self._near_side, entry_price=self._near_entry, exit_price=near_close,
-                                  gross_points=_pnl_pts, multiplier=_mult, cost=_cost, realized_pnl=_realized,
-                                  near_mfe=round(_near_mfe, 2), near_mae=round(_near_mae, 2),
-                                  **_risk_meta)
-
-                    _write_mts_state(
-                        has_position=True, action="RELEASE_NEAR", reason=f"near_pnl={_n_pnl:.1f}",
-                        near_entry=self._near_entry, far_entry=self._far_entry,
-                        near_last=near_close, far_last=far_close,
-                        near_side=self._near_side, far_side=self._far_side,
-                        spread_z=spread_z, released_leg=None, # Keep as None until fill
-                        release_price=self._release_price,
-                        release_stop_points=release_stop, trail_distance_points=trail_dist,
-                        trade_id=self._trade_id, ticker=self._ticker,
-                        **_risk_meta
-                    )
-                    return Signal("PARTIAL_EXIT", "TMF_RELEASE_NEAR", confidence=0.4)
-
-            # Far trigger decision execution
-            _far_confirmed = (_is_backtest or (self._release_far_ticks >= self._confirm_ticks and (time.monotonic() - self._release_far_start_time) * 1000 >= self._confirm_ms))
-            if far_triggered and _far_confirmed:
-                if _is_grace:
-                    self._set_eval(skip_reason="RELEASE_SUPPRESSED_IN_GRACE", f_pnl=_f_pnl)
-                else:
-                    self._lifecycle = "RELEASE_FAR"
-                    self._release_ts = now
-                    self._release_mono = time.monotonic()
-                    
-                    _pnl_pts = _f_pnl
-                    _turnover = (self._far_entry + far_close) * _mult
-                    _cost = 20.0 + _turnover * 2e-5
-                    _realized = _pnl_pts * _mult - _cost
-
-                    # 2026-06-26 Hermes Agent: capture post-release anchor = remaining leg price at release
-                    _anchor_price = near_close if near_close > 0 else None
-                    _anchor_source = _LIVE_TICK if near_close > 0 else None
-                    _anchor_age = quote_age_ms if near_close > 0 else None
-                    self._post_release_anchor_price = _anchor_price
-                    self._post_release_anchor_source = _anchor_source
-                    self._post_release_anchor_age_ms = _anchor_age
-                    if _anchor_price is not None:
-                        _append_event("POST_RELEASE_ANCHOR_SET",
-                            remaining_leg="NEAR", anchor_price=_anchor_price,
-                            price_source=_anchor_source, quote_age_ms=_anchor_age)
-                    else:
-                        _append_event("POST_RELEASE_ANCHOR_SET",
-                            remaining_leg="NEAR", anchor_price=None,
-                            price_source=_MISSING, quote_age_ms=quote_age_ms)
-
-                    # 2026-06-26 Hermes Agent: per-leg MFE/MAE for release fill
-                    _fm = self._far_max if self._far_max is not None else self._far_entry
-                    _fn = self._far_min if self._far_min is not None else self._far_entry
-                    _far_mfe = (_fm - self._far_entry) if self._far_side == "LONG" else (self._far_entry - _fn)
-                    _far_mae = (self._far_entry - _fn) if self._far_side == "LONG" else (_fm - self._far_entry)
-
-                    # 2026-06-26 Gemini CLI: log decision with structured exit metadata
-                    self._log_exit_decision(exit_reason="RELEASE_STOP", pnl=_pnl_pts, bar=bar)
-                    _append_event("RELEASE_FAR_SUBMITTED", 
-                                  released_leg="FAR", remaining_leg="NEAR",
-                                  leg_side=self._far_side, entry_price=self._far_entry, exit_price=far_close,
-                                  gross_points=_pnl_pts, multiplier=_mult, cost=_cost, realized_pnl=_realized,
-                                  far_mfe=round(_far_mfe, 2), far_mae=round(_far_mae, 2),
-                                  **_risk_meta)
-
-                    _write_mts_state(
-                        has_position=True, action="RELEASE_FAR", reason=f"far_pnl={_f_pnl:.1f}",
-                        near_entry=self._near_entry, far_entry=self._far_entry,
-                        near_last=near_close, far_last=far_close,
-                        near_side=self._near_side, far_side=self._far_side,
-                        spread_z=spread_z, released_leg=None, # Keep as None until fill
-                        release_price=self._release_price,
-                        release_stop_points=release_stop, trail_distance_points=trail_dist,
-                        trade_id=self._trade_id, ticker=self._ticker,
-                        **_risk_meta
-                    )
-                    return Signal("PARTIAL_EXIT", "TMF_RELEASE_FAR", confidence=0.4)
 
             _write_mts_state(
                 has_position=True, action="HOLDING_SPREAD", reason=f"near_pnl={_n_pnl:.1f} far_pnl={_f_pnl:.1f}",
@@ -1412,12 +1812,15 @@ class TMFSpread(StrategyBase):
         # Post-Release Stage 1: Breakeven Stop-loss Adjustment
         post_release = self._params.get("post_release", {})
         breakeven_atr_mult = post_release.get("breakeven_after_atr")
+        effective_trail_stop = _trail_stop
         if breakeven_atr_mult is not None and atr_val > 0:
             if rem_floating_pnl >= float(breakeven_atr_mult) * atr_val:
                 if self._side == "LONG":
-                    _trail_stop = max(_trail_stop, _rem_entry)
+                    effective_trail_stop = max(effective_trail_stop, _rem_entry)
                 else:
-                    _trail_stop = min(_trail_stop, _rem_entry)
+                    effective_trail_stop = min(effective_trail_stop, _rem_entry)
+
+        # Post-Release Stage 3: Force Lock
 
         # Post-Release Stage 3: Force Lock
         force_lock_mult = post_release.get("force_lock_after_atr")
@@ -1426,54 +1829,52 @@ class TMFSpread(StrategyBase):
             if rem_floating_pnl >= float(force_lock_mult) * atr_val:
                 force_lock_triggered = True
 
-        # Check exit triggers
+        # Re-evaluate lifecycle after peak/nadir + breakeven adjustments
+        if _decision is None:
+            try:
+                _ctx2 = LifecycleContext(
+                    near_pnl_pts=0, far_pnl_pts=0,
+                    floating_pnl_pts=rem_floating_pnl,
+                    entry_age_secs=(now - self._entry_ts).total_seconds() if self._entry_ts else 0.0,
+                    release_stop_threshold=release_stop, trail_dist=trail_dist,
+                    trailing_side=Side.LONG if self._side == "LONG" else Side.SHORT,
+                    peak=self._peak, nadir=self._nadir,
+                    rem_high=_rem_high, rem_low=_rem_low,
+                    is_backtest=_is_backtest,
+                )
+                _decision2 = evaluate_lifecycle_actions(_ctx2, self._lifecycle_oca)
+                if _decision2 is not None:
+                    _decision = _decision2
+            except Exception:
+                logger.exception("[LIFECYCLE_TRAIL_REEVAL_FAILED]")
+
+        # Check exit triggers (legacy fallback for breakeven/force_lock)
+        # TODO ADR-009 Task 5:
+        # breakeven/force_lock remain legacy-only until LifecycleContext supports
+        # breakeven_floor / force_lock_floor. Do not fold into peak/nadir.
         trail_triggered = False
         if self._side == "LONG":
-            if _rem_low <= _trail_stop:
+            if _rem_low <= effective_trail_stop:
                 trail_triggered = True
-        else: # SHORT
-            if _rem_high >= _trail_stop:
+        else:
+            if _rem_high >= effective_trail_stop:
                 trail_triggered = True
 
         exit_triggered = trail_triggered or force_lock_triggered
         exit_reason = "FORCE_LOCK" if force_lock_triggered else "TRAIL_STOP"
 
-        # Trailing Exit confirmation check
         if exit_triggered:
-            if self._trail_exit_ticks == 0:
-                self._trail_exit_start_time = time.monotonic()
-            self._trail_exit_ticks += 1
-        else:
-            self._trail_exit_ticks = 0
-            self._trail_exit_start_time = 0.0
-
-        # 2026-06-30 Gemini CLI: Expected behavior: Bypass trailing exit confirmation check during backtests to prevent monotonic time-lock.
-        _is_backtest = os.getenv("MTS_BACKTEST") == "1"
-        _exit_confirmed = (_is_backtest or (self._trail_exit_ticks >= self._confirm_ticks and (time.monotonic() - self._trail_exit_start_time) * 1000 >= self._confirm_ms))
-        if exit_triggered and _exit_confirmed:
-            # Trailing Exit confirmed
             exit_price = _rem_price if force_lock_triggered else (_rem_low if self._side == "LONG" else _rem_high)
             _pnl_pts = (exit_price - _rem_entry) if self._side == "LONG" else (_rem_entry - exit_price)
             _turnover = (_rem_entry + exit_price) * _mult
             _cost = 20.0 + _turnover * 2e-5
             _realized = _pnl_pts * _mult - _cost
-            
-            # 2026-06-26 Gemini CLI: log decision with structured exit metadata
-            self._log_exit_decision(exit_reason=exit_reason, pnl=_pnl_pts, bar=bar)
-            _append_event("EXIT_REMAINING", reason=f"{exit_reason}_{self._side}", 
-                           released_leg=_released_leg_label, remaining_leg=_rem_leg_label,
-                           leg_side=self._side, entry_price=_rem_entry, exit_price=exit_price,
-                           gross_points=_pnl_pts, multiplier=_mult, cost=_cost, realized_pnl=_realized,
-                           leg_mfe=round((_rem_high - _rem_entry) if self._side == "LONG" else (_rem_entry - _rem_low), 2),
-                           leg_mae=round((_rem_entry - _rem_low) if self._side == "LONG" else (_rem_high - _rem_entry), 2),
-                           **_risk_meta)
-            # _append_fill(...) - removed from here to follow "Side effects only after operation succeeds" rule.
-            # Exit fill will be logged upon confirmation in _reset().
-            
             self._lifecycle = "EXITING"
-            self._exit_start_time = time.monotonic()
+            self._log_exit_decision(exit_reason=exit_reason, pnl=_pnl_pts, bar=bar)
+            _append_event("EXIT_REMAINING", reason=exit_reason, remaining_leg=_rem_leg_label, exit_price=exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, **_risk_meta)
+            _write_mts_state(has_position=True, action=f"EXIT_{exit_reason}", reason=exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
             return Signal("EXIT", f"TMF_{exit_reason}_{self._side}", confidence=0.5, stop_loss=0)
-        
+
         _write_mts_state(
             has_position=True, action=f"TRAILING_{self._side}",
             reason=f'{_rem_leg_label} trail={(self._peak - _rem_low if self._side == "LONG" else _rem_high - self._nadir):.1f}/{trail_dist}',
