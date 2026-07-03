@@ -577,10 +577,39 @@ def route_futures_signal(
                 spread_quality = "FRESH"
             elif spread_age <= 120:
                 spread_quality = "DEGRADED"
-            else:
+            # 2026-06-26 Gemini CLI: standard STALE runs up to 24 hours (1440 mins)
+            elif spread_age <= 1440:
                 spread_quality = "STALE"
+            # 2026-06-26 Gemini CLI: >24h is classified as CRITICAL_STALE
+            else:
+                spread_quality = "CRITICAL_STALE"
 
-        if is_night:
+        # ═══ Day/Night Staleness Gates ═══
+        if spread_quality == "CRITICAL_STALE":
+            # 2026-06-26 Gemini CLI: CRITICAL_STALE blocks spread trading day and night
+            print(f"[V-Model][SpreadGate] CRITICAL_STALE — spread_age={spread_age}m. Blocking spread strategies.", flush=True)
+            if stale_action == "flat":
+                if recorder is not None:
+                    recorder.log_router_row(
+                        timestamp=timestamp, symbol=symbol, regime=regime_result.regime,
+                        strategy_name="router", candidate_order=0, status="spread_critical_stale",
+                        evaluated=False, winner=False,
+                        notes=f"CRITICAL_STALE spread_age={spread_age}m action=flat",
+                    )
+                return FuturesRouterDecision(
+                    action="FLAT",
+                    reason=f"SPREAD_CRITICAL_STALE_age_{spread_age}m",
+                    regime=regime_result.regime, bias=regime_result.bias,
+                    candidates=[],
+                    notes=[f"spread CRITICAL_STALE: age={spread_age}m — FLAT"],
+                    theta_allowed=_theta_allowed,
+                    theta_block_reason=_theta_block_reason,
+                )
+            else:
+                notes.append(f"spread_quality=CRITICAL_STALE age={spread_age}m — spread/options family blocked")
+                _spread_stale_block_families = True
+
+        elif is_night:
             print(f"[V-Model][SpreadGate] NIGHT spread_age={spread_age}m quality={spread_quality}", flush=True)
 
             # ═══ 1) Staleness gate (STALE → block only spread/options, not futures) ═══

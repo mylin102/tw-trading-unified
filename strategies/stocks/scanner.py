@@ -34,10 +34,10 @@ class StockScanner:
                 }).dropna()
                 df_5m = calculate_futures_squeeze(df_5m)
                 
-                # 3. 抓取整股 1分K 數據 (優化：抓取最近 30 天以確保有足夠的交易日算 ATR(10))
+                # 3. 抓取整股 1分K 數據 (優化：抓取最近 28 天以確保有足夠的交易日算 ATR(10))
                 # 💡 GSD: Fetching 365 days of 1min data is too heavy for Shioaji API.
-                # 2026-05-31 Gemini CLI: Increased to 30 days for ATR(10) calculation.
-                start_date_1d = (pd.Timestamp.now() - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+                # 2026-06-26 Gemini CLI: Decreased to 28 days to prevent Shioaji API range limit error
+                start_date_1d = (pd.Timestamp.now() - pd.Timedelta(days=28)).strftime("%Y-%m-%d")
                 kbars_raw = self._kbars_with_timeout(contract, start=start_date_1d)
                 df_raw = pd.DataFrame({**kbars_raw})
                 

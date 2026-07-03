@@ -21,8 +21,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# ── Flag path (matches the hardcoded path in monitor.py) ──
-_FLAG = "/tmp/futures_manual_trade.flag"
+# 2026-06-26 Gemini CLI: Isolate manual trade flag path for test stability
+os.environ["FUTURES_MANUAL_TRADE_FLAG_PATH"] = "/tmp/test_mts_no_live_tick_retry.flag"
+
+# ── Flag path (matches the environment-configured path in monitor.py) ──
+_FLAG = "/tmp/test_mts_no_live_tick_retry.flag"
 _PROCESSING = _FLAG + ".processing"
 
 
@@ -367,8 +370,10 @@ class TestGroupC_FarMonthIsolation:
         When a far-month tick arrives, on_tick() must NOT consume
         the manual trade flag. Only near-month ticks consume flags.
         """
+        # 2026-06-25 Gemini CLI: Debug prints for flag path existence
         mon = _make_live_monitor()
         _write_flag()
+        print(f"\n[DEBUG_TEST] Before on_tick: flag exists={os.path.exists(_FLAG)}, processing exists={os.path.exists(_PROCESSING)}")
 
         with patch("core.date_utils.is_day_session", return_value=True), \
              patch("core.date_utils.is_night_session", return_value=False):
@@ -379,6 +384,7 @@ class TestGroupC_FarMonthIsolation:
                 datetime="2026-06-05 10:00:00", volume=10
             )
             mon.on_tick(None, far_tick)
+            print(f"[DEBUG_TEST] After on_tick: flag exists={os.path.exists(_FLAG)}, processing exists={os.path.exists(_PROCESSING)}")
 
             # Flag should NOT have been consumed (not renamed to .processing)
             assert os.path.exists(_FLAG), (

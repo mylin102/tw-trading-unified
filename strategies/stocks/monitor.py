@@ -3,12 +3,15 @@ import time
 import pandas as pd
 import random
 import json
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 import yaml
 from rich.console import Console
 import shioaji as sj
 from core.dashboard_data import build_stock_orders_from_trades
+
+logger = logging.getLogger(__name__)
 from strategies.stocks.scanner import StockScanner
 from strategies.stocks.data_storage import StockDataStorage
 from strategies.stocks.position_state import (
@@ -115,16 +118,17 @@ class StockMonitor:
                 console.print(f"[dim]♻️ Already recovered {len(self.positions)} positions from today's state file[/dim]")
             return
 
-        # Find the most recent ledger starting from today back to 7 days
+        # Find the most RECENT completed (previous) ledger for recovery.
+        # Skip today's CSV — only prior-day ledgers have stable BUY records.
         ledger_file = None
         last_ledger_date = None
-        for i in range(0, 8):
+        for i in range(1, 30):
             check_date = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
             possible_file = TRADE_LOGS / f"STOCK_{check_date}_{self.mode_tag}_trades.csv"
-            console.print(f"[dim]🔍 Checking recovery ledger: {possible_file} (exists: {possible_file.exists()})[/dim]")
             if possible_file.exists():
                 ledger_file = possible_file
                 last_ledger_date = check_date
+                console.print(f"[dim]🔍 Found recovery ledger: {possible_file.name}[/dim]")
                 break
 
         if not ledger_file:
@@ -199,9 +203,26 @@ class StockMonitor:
                 console.print(f"[bold green]✅ Recovered {recovered_count} positions → position_state.json (total value: ${total_value:,.0f})[/bold green]")
             else:
                 console.print(f"[dim]📂 No open positions from previous ledger[/dim]")
+            # Flush in-memory positions to disk (unconditionally, clears stale state)
+            state_payload = {
+                str(t): {
+                    "entry_ts": p.get("entry_ts", ""),
+                    "strategy": self.strat_name,
+                    "mode": self.mode_tag,
+                    "avg_cost": p.get("entry_price", p.get("avg_cost", 0.0)),
+                    "qty": p.get("qty", 0),
+                    "realized_pnl": p.get("realized_pnl", 0.0),
+                    "recovered_from": last_ledger_date or self.date_str,
+                    "last_recovered_at": now_ts,
+                }
+                for t, p in self.positions.items()
+            }
+            save_position_state(state_file, state_payload)
+            console.print(f"[bold green]💾 Flushed {len(state_payload)} positions to {state_file.name}[/bold green]")
 
         except Exception as e:
             console.print(f"[yellow]⚠️ Position recovery failed: {e}[/yellow]")
+            logger.exception("Position recovery failed")
 
     def clean_unfilled_orders(self):
         """撤銷超過 5 分鐘未成交的掛單 (only in LIVE mode)"""
@@ -818,20 +839,43 @@ class StockMonitor:
 
         # ── Layer 2: EOD Smart Exit (Final Safety Window) ──
         if now.hour == 13 and now.minute >= 20:
-            pnl_pct = (curr_price - pos["entry_price"]) / pos["entry_price"]
+            pnl_pct = (curr_price - pos['entry_price']) / pos['entry_price']
+            # Execute any pending hard stop now
+            if pos.get('stop_pending'):
+                self.execute_trade(ticker, 'SELL', curr_price, 'ALL', f"HARD_STOP_EOD (price={curr_price:.2f})")
+                return
             if pnl_pct <= 0:
-                self.execute_trade(ticker, "SELL", curr_price, "ALL", "TIME_EXIT_LOSER")
+                self.execute_trade(ticker, 'SELL', curr_price, 'ALL', 'TIME_EXIT_LOSER')
+                return
             elif now.minute >= 25:
                 self.cancel_all_pending_orders()
-                self.execute_trade(ticker, "SELL", curr_price, "ALL", "TIME_EXIT_FINAL")
+                self.execute_trade(ticker, 'SELL', curr_price, 'ALL', 'TIME_EXIT_FINAL')
+                return
             if ticker in self.positions:
                 return
             
-        # ── Layer 3: Hard Stop Loss (Last Defense) ──
-        sl_pct = stk_cfg.get("stop_loss_pct", 0.02)
-        hard_stop_price = pos["entry_price"] * (1 - sl_pct)
+        # ── Layer 3: Hard Stop Loss (always detect; odd-lot execution delayed to EOD) ──
+        sl_pct = stk_cfg.get('stop_loss_pct', 0.02)
+        hard_stop_price = pos['entry_price'] * (1 - sl_pct)
         if curr_price <= hard_stop_price:
-            self.execute_trade(ticker, "SELL", curr_price, "ALL", f"HARD_STOP_LOSS (price={curr_price:.2f} <= {hard_stop_price:.2f})")
+            _is_same_trade_date = True
+            entry_ts_str = pos.get('entry_ts')
+            if entry_ts_str:
+                try:
+                    _entry_dt = datetime.fromisoformat(str(entry_ts_str))
+                    _is_same_trade_date = (_entry_dt.date() == now.date())
+                except (ValueError, TypeError):
+                    _is_same_trade_date = False  # unparseable → prior day → allow exit
+            else:
+                _is_same_trade_date = False  # no entry_ts → prior day → allow exit
+            _can_intraday_exit = not _is_same_trade_date
+            if _can_intraday_exit:
+                self.execute_trade(ticker, 'SELL', curr_price, 'ALL', f"HARD_STOP_LOSS (price={curr_price:.2f} <= {hard_stop_price:.2f})")
+                return
+            # Same-day / non-day-tradable: mark pending, exit at EOD
+            pos['stop_pending'] = True
+            pos['stop_pending_reason'] = f'HARD_STOP_PENDING_EOD (price={curr_price:.2f} <= {hard_stop_price:.2f})'
+            console.print(f"[yellow]⚠️ [STOCK_STOP_PENDING] {ticker} stop triggered at {curr_price:.2f}, exit pending EOD[/yellow]")
             return
 
     def execute_trade(self, ticker, action, price, qty_mode, reason):

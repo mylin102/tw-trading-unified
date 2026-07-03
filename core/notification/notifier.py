@@ -149,7 +149,14 @@ def notify_raw(subject: str, body: str) -> bool:
 # ──────────────────────────────────────────────────────────────
 
 def _send_email(subject: str, body_text: str, body_html: Optional[str] = None) -> bool:
+    # 2026-06-26 Gemini CLI: Load SMTP configuration first so .env variables are loaded
     cfg = _load_smtp_config()
+
+    # 2026-06-26 Gemini CLI: Allow disabling email notifications via ENABLE_EMAIL_NOTIFICATION env/config var
+    if os.getenv("ENABLE_EMAIL_NOTIFICATION", "True").lower() in ("false", "0", "no"):
+        logger.info("Email notification disabled by configuration (ENABLE_EMAIL_NOTIFICATION=False)")
+        return True
+
     if cfg is None:
         logger.warning("Email not sent: SMTP not configured")
         return False

@@ -57,7 +57,9 @@ def test_live_stream_flash_spike(monitor):
             "atr_multiplier_stop": 1.0, 
             "atr_multiplier_trail": 2.0, 
             "release_stop_points": 10, 
-            "trail_distance_points": 20
+            "trail_distance_points": 20,
+            "confirm_ticks": 1,
+            "confirm_ms": 0.0
         }
     }
     strat.init(StrategyContext(market=MarketData(last_bar={}, ticker="TMF"), position=PositionView(size=0), config=config))

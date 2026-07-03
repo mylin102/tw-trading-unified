@@ -6,6 +6,7 @@ weak_bear_trend 監控面板 - Dashboard 組件
 import streamlit as st
 import pandas as pd
 import yaml
+import json
 from pathlib import Path
 from datetime import datetime
 
@@ -23,48 +24,59 @@ def load_config(path):
         return yaml.safe_load(f)
 
 
-def parse_router_trace(log_path, lines=50):
-    """解析 Router Trace 日誌."""
-    if not log_path.exists():
+def parse_router_trace(log_path_unused, lines=50):
+    """解析 JSONL 格式的 Router Trace 日誌."""
+    trace_dir = Path(__file__).parent.parent / "logs" / "router_trace"
+    if not trace_dir.exists():
+        return []
+    
+    trace_files = sorted(trace_dir.glob("router_trace_*.jsonl"), reverse=True)
+    if not trace_files:
         return []
     
     traces = []
-    with open(log_path, 'r') as f:
-        for line in f.readlines()[-lines:]:
-            if '[RouterTrace]' in line:
-                # 解析：ts= regime=SQUEEZE selected=None | adaptive_orb_v15=SKIP:...
-                parts = line.split('|')
-                if len(parts) >= 2:
-                    header = parts[0].strip()
-                    # 提取 regime 和 selected
-                    regime = "?"
-                    selected = "?"
-                    if 'regime=' in header:
-                        regime = header.split('regime=')[1].split()[0]
-                    if 'selected=' in header:
-                        selected = header.split('selected=')[1].split()[0]
-                    
-                    # 解析策略評估
-                    strategies = []
-                    for part in parts[1:]:
-                        part = part.strip()
-                        if '=' in part:
-                            strat_name = part.split('=')[0].strip()
-                            status = part.split('=')[1].split()[0].strip()
-                            strategies.append({
-                                'name': strat_name,
-                                'status': status,
-                                'detail': part
-                            })
-                    
-                    traces.append({
-                        'regime': regime,
-                        'selected': selected,
-                        'strategies': strategies,
-                        'timestamp': datetime.now()
+    try:
+        with open(trace_files[0], 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                trace = json.loads(line)
+                
+                # 解析時間戳記
+                ts_str = trace.get("ts", "")
+                try:
+                    ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S.%f")
+                except Exception:
+                    try:
+                        ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        ts = datetime.now()
+                
+                # 解析各策略評估狀態
+                strategies = []
+                for s in trace.get("strategies", []):
+                    status = s.get("skip_reason", "")
+                    if s.get("triggered", False):
+                        status = "ALLOW:TRADE"
+                    elif not status:
+                        status = "SKIP:NO_REASON"
+                        
+                    strategies.append({
+                        'name': s.get("name", "?"),
+                        'status': status,
+                        'detail': f"{s.get('name')}={status}"
                     })
-    
-    return traces
+                
+                traces.append({
+                    'regime': trace.get("regime", "?"),
+                    'selected': trace.get("selected") or "None",
+                    'strategies': strategies,
+                    'timestamp': ts
+                })
+    except Exception as e:
+        print(f"Error parsing router trace JSONL: {e}")
+        
+    return traces[-lines:]
 
 
 def get_regime_strategy_mapping():
@@ -93,15 +105,22 @@ def render_weak_bear_monitor():
     st.title("🤖 auto_select 監控中心")
     st.caption("Regime 驅動的自動策略選擇系統")
     
-    # 載入配置
-    night_cfg = load_config(FUTURES_NIGHT_CFG)
+    # 2026-06-30 Gemini CLI: Dynamically load active configuration based on the session type
+    from core.date_utils import is_night_session
+    is_night = is_night_session(datetime.now())
+    active_cfg_name = "futures_night.yaml" if is_night else "futures.yaml"
+    FUTURES_ACTIVE_CFG = CONFIG_PATH / active_cfg_name
+    
+    active_cfg = load_config(FUTURES_ACTIVE_CFG)
     weak_bear_cfg = load_config(WEAK_BEAR_CFG)
     
     # ── 1. 配置狀態 ──
     st.subheader("⚙️ 配置狀態")
     
-    auto_select = night_cfg.get('auto_select', False)
-    active_strategy = night_cfg.get('active_strategy', '未設置')
+    # 2026-06-30 Gemini CLI: Fix nested key lookup for auto_select and active_strategy
+    strat_cfg = active_cfg.get('strategy', {})
+    auto_select = strat_cfg.get('auto_select', False)
+    active_strategy = strat_cfg.get('active_strategy', '未設置')
     
     col1, col2, col3 = st.columns(3)
     
@@ -122,7 +141,7 @@ def render_weak_bear_monitor():
             st.caption("強制使用單一策略")
     
     with col3:
-        live_trading = night_cfg.get('live_trading', False)
+        live_trading = active_cfg.get('live_trading', False)
         if live_trading:
             st.error("🔴 LIVE TRADING")
         else:
@@ -131,8 +150,8 @@ def render_weak_bear_monitor():
     # ── 2. 微台指設定 ──
     st.subheader("📊 微台指 (TMF) 設定")
     
-    exec_cfg = night_cfg.get('execution', {})
-    trade_cfg = night_cfg.get('trade_mgmt', {})
+    exec_cfg = active_cfg.get('execution', {})
+    trade_cfg = active_cfg.get('trade_mgmt', {})
     
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("一點價值", f"{exec_cfg.get('point_value', 10)} 元")
@@ -185,7 +204,13 @@ def render_weak_bear_monitor():
     # ── 5. 即時 Router Trace ──
     st.subheader("📡 即時 Router Trace")
     
-    log_path = Path(__file__).parent.parent / "logs" / "pm2-trading-out-11.log"
+    # 2026-06-30 Gemini CLI: Dynamically find active PM2 log instead of hardcoded index 11
+    log_dir = Path(__file__).parent.parent / "logs"
+    log_path = log_dir / "pm2-trading-out.log"
+    if not log_path.exists() and log_dir.exists():
+        log_files = list(log_dir.glob("pm2-trading-out-*.log"))
+        if log_files:
+            log_path = max(log_files, key=lambda p: p.stat().st_mtime)
     traces = parse_router_trace(log_path)
     
     if traces:

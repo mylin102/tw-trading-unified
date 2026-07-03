@@ -80,13 +80,14 @@ def _no_spread_bar():
     }
 
 
-def _neutral_context(bar=None):
+def _neutral_context(bar=None, config=None):
     """Return a StrategyContext with given bar (default: spread_z=0)."""
     b = bar if bar is not None else _no_spread_bar()
+    cfg = config if config is not None else {"params": {}}
     return StrategyContext(
         market=SimpleNamespace(last_bar=b),
         position=SimpleNamespace(size=0, entry_price=0, unrealized_pnl=0, current_stop_loss=None),
-        config={"params": {}},
+        config=cfg,
     )
 
 
@@ -95,9 +96,9 @@ def _clean_state_file():
     yield
     if os.path.exists(_TMP_STATE):
         os.remove(_TMP_STATE)
-    # 2026-05-29 Hermes Agent: also clean fill/event logs to prevent test contamination
-    _fill_log = "logs/mts_trade_fills.jsonl"
-    _event_log = "logs/mts_spread_events.jsonl"
+    # 2026-06-25 Gemini CLI / Hermes Agent: read test-isolated environment log paths for cleanup
+    _fill_log = os.getenv("MTS_FILL_LOG_PATH", "logs/mts_trade_fills.jsonl")
+    _event_log = os.getenv("MTS_EVENT_LOG_PATH", "logs/mts_spread_events.jsonl")
     for _f in (_fill_log, _event_log):
         if os.path.exists(_f):
             os.remove(_f)
@@ -197,7 +198,7 @@ class TestMTSStateRestore:
             "far_close": 41900.0,
             "spread_z": 2.5,
             "timestamp": pd.Timestamp("2026-05-15 10:00:00"),
-        })
+        }, config={"params": {"confirm_ticks": 1, "confirm_ms": 0.0}})
 
         with patch(f"{_MODULE}._MTS_STATE_FILE", _TMP_STATE):
             from strategies.plugins.futures.active.tmf_spread import TMFSpread

@@ -1,0 +1,55 @@
+Metadata-Version: 2.1
+Name: cody-special
+Version: 1.0.0
+Summary: High-precision error functions and normal distribution (Cody's algorithm)
+Home-page: https://github.com/vollib/cody-special
+License: MIT
+Keywords: error function,erf,erfc,normal distribution,cdf,statistics
+Author: vollib team
+Requires-Python: >=3.9,<4.0
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Project-URL: Repository, https://github.com/vollib/cody-special
+Description-Content-Type: text/markdown
+
+# cody-special
+
+High-precision error functions and normal distribution implementations based on W.J. Cody's rational Chebyshev approximations.
+
+## Installation
+
+```bash
+pip install cody-special
+```
+
+## Usage
+
+```python
+from cody_special import erf_cody, erfc_cody, erfcx_cody
+from cody_special import norm_pdf, norm_cdf, inverse_norm_cdf
+
+# Error functions
+erf_cody(1.0)      # ~ 0.8427
+erfc_cody(1.0)     # ~ 0.1573
+erfcx_cody(1.0)    # ~ 0.4276
+
+# Normal distribution
+norm_pdf(0.0)           # ~ 0.3989 (standard normal PDF)
+norm_cdf(0.0)           # = 0.5 (standard normal CDF)
+inverse_norm_cdf(0.5)   # = 0.0 (inverse CDF / quantile function)
+```
+
+## References
+
+- W.J. Cody, "Rational Chebyshev approximations for the error function", Math. Comp., 1969, pp. 631-638.
+- Peter Jaeckel, "Let's Be Rational", www.jaeckel.org
+
+## License
+
+MIT License. Original algorithm by W.J. Cody. Python implementation derived from Peter Jaeckel's LetsBeRational.
+
