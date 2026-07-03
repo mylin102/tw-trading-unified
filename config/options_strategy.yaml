@@ -70,14 +70,14 @@ risk_mgmt:
   max_daily_loss: 0.03
   max_holding_days: 7
   max_position_size: 0.08
-  max_positions: 3
+  max_positions: 1
   min_dte_to_exit: 7.0
   opening_grace_mins: 5
   stop_loss_pct: 0.25
-  hard_stop_pct: 0.15  # [Fix] fixed premium % stop: exit when premium drops 15% from entry
+  hard_stop_pct: 0.15
 strategy:
   cooldown_bars: 2
-  entry_score: 15
+  entry_score: 20
   fallback_underlying_price: 33500
   fire_score_threshold: 40
   length: 20
@@ -98,7 +98,7 @@ strategy:
     5m: 0.2
 theta_gang:
   auto_regime: true
-  enabled: false           # DISABLED: theta gang has no edge vs friction
+  enabled: false
   exit_on_squeeze_release: true
   max_loss_pct: 1.0
   min_credit: 30
@@ -117,10 +117,6 @@ theta_gang:
   max_bar_price_deviation_pts: 250
   exit_on_theta: true
   stop_loss_pct: 0.05
-# ── [Vertical Spread v1] Convert single-leg CALL/PUT to debit vertical spreads ──
-#   enabled: true  → enter_spread_paper_position() is used instead of enter_paper_position()
-#   enabled: false → fallback to original single-leg entry
-#   width: strike width in points (50 or 100)
 vertical_spread:
   enabled: true
   width: 100

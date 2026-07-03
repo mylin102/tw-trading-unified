@@ -13,11 +13,17 @@ def send_email_notification(subject: str, body_text: str, body_html: str = None)
     支援純文字 (body_text) 與 HTML (body_html) 格式。
     """
     env_path = os.path.expanduser("~/.config/squeeze-backtest-email.env")
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
+
+    # 2026-06-26 Gemini CLI: Allow disabling email notifications via ENABLE_EMAIL_NOTIFICATION env/config var
+    if os.getenv("ENABLE_EMAIL_NOTIFICATION", "True").lower() in ("false", "0", "no"):
+        logger.info("Email notification disabled by configuration (ENABLE_EMAIL_NOTIFICATION=False)")
+        return True
+
     if not os.path.exists(env_path):
         logger.error(f"Email config not found at {env_path}")
         return False
-        
-    load_dotenv(env_path)
     
     smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
     smtp_port = int(os.getenv("SMTP_PORT", 587))

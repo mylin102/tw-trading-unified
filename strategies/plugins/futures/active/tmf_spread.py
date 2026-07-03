@@ -96,6 +96,12 @@ class LifecycleAction(Enum):
     RELEASE = "RELEASE"
     TRAIL = "TRAIL"
 
+class ReleaseMode(Enum):
+    """MTS release order strategy (ADR-009 Phase 2 placeholder)."""
+    TRIGGERED_MARKET = "triggered_market"
+    TRIGGERED_OCO_LIMIT = "triggered_oco_limit"
+    ENTRY_OCO_LIMIT = "entry_oco_limit"
+
 # Priority order for action selection (index = priority, lower = higher)
 _LIFECYCLE_ACTION_PRIORITY: list[LifecycleAction] = [
     LifecycleAction.MANUAL,
@@ -725,6 +731,14 @@ class TMFSpread(StrategyBase):
         self._release_stop_fixed = float(_params.get("release_stop_points", _RELEASE_STOP_PTS))
         self._trail_dist_fixed = float(_params.get("trail_distance_points", _TRAIL_DISTANCE_PTS))
         self._min_atr = float(_params.get("min_atr", 0.0))
+
+        # Release mode (Phase 1: triggered_market only)
+        _rel_mode_str = _params.get("release_mode", "triggered_market")
+        try:
+            self._release_mode = ReleaseMode(_rel_mode_str)
+        except (ValueError, TypeError):
+            self._release_mode = ReleaseMode.TRIGGERED_MARKET
+            logger.warning("[MTS] Invalid release_mode=%r, falling back to triggered_market", _rel_mode_str)
 
         # State
         self._has_position = False
@@ -1451,13 +1465,32 @@ class TMFSpread(StrategyBase):
         if spread_z_f > 0:
             _action = "SELL_NEAR_BUY_FAR"
             _reason = "TMF_SPREAD_WIDE"
+            _expected_reversion = "SPREAD_TO_NARROW"
+            _near_side = "SHORT"
+            _far_side = "LONG"
             self._peak = near_close
             self._nadir = far_close
         else:
             _action = "BUY_NEAR_SELL_FAR"
             _reason = "TMF_SPREAD_NARROW"
+            _expected_reversion = "SPREAD_TO_WIDEN"
+            _near_side = "LONG"
+            _far_side = "SHORT"
             self._peak = near_close
             self._nadir = far_close
+
+        # ── Entry-side audit log (2026-07-03 Hermes Agent) ──
+        _append_event("ENTRY_AUDIT",
+            action=_action, reason=_reason,
+            entry_z=round(self._entry_z, 2), spread_z=round(spread_z_f, 2),
+            expected_reversion=_expected_reversion,
+            near_side=_near_side, far_side=_far_side,
+            near_price=near_close, far_price=far_close,
+            spread_now=bar.get("spread") or (near_close - far_close),
+            spread_formula="near_minus_far",
+            spread_mean=bar.get("spread_mean"), spread_std=bar.get("spread_std"),
+            atr=atr,
+        )
 
         # [GSD] Deferred Strategy Sync: don't set _has_position = True yet.
         # monitor.py will call sync_position() once both legs are filled.

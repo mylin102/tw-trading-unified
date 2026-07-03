@@ -16,6 +16,13 @@ from typing import Dict, List, Any, Optional
 # Add project root to path
 sys.path.append('.')
 
+# 2026-06-25 Hermes Agent: Isolate backtests from production state and trade logs
+os.environ["MTS_FILL_LOG_PATH"] = "/tmp/backtest_mts_trade_fills.jsonl"
+os.environ["MTS_EVENT_LOG_PATH"] = "/tmp/backtest_mts_spread_events.jsonl"
+os.environ["MTS_STATE_PATH"] = "/tmp/backtest_mts_position_state.json"
+# 2026-06-25 Gemini CLI: Enable backtest flag to disable state recovery and disk I/O in strategy
+os.environ["MTS_BACKTEST"] = "1"
+
 from core.strategy_registry import StrategyRegistry
 from core.strategy_context import StrategyContext, MarketData, PositionView
 from core.signal import Signal
@@ -135,7 +142,20 @@ class SpreadBacktester:
                 
             self.equity_history.append(self.cash + unrealized)
 
-    def _handle_signal(self, signal: Signal, bar: Dict[str, Any], ts: datetime):
+    def _handle_signal(self, signal: Signal, bar: Dict[str, Any], ts: Any):
+        # 2026-06-25 Hermes Agent: Convert ts to pandas Timestamp to prevent strftime errors on raw/numpy types
+        if not isinstance(ts, pd.Timestamp):
+            try:
+                if isinstance(ts, (int, float, np.integer)):
+                    if ts > 1e11:
+                        ts = pd.to_datetime(ts, unit='ns')
+                    else:
+                        ts = pd.to_datetime(ts, unit='s')
+                else:
+                    ts = pd.to_datetime(ts)
+            except:
+                ts = pd.Timestamp.now()
+
         near_price = bar['Close_near']
         far_price = bar['Close_far']
         
@@ -158,6 +178,16 @@ class SpreadBacktester:
                 self.current_entry_price_far = far_price
                 self.released_leg = None
                 self.current_trade_id = f"T-{ts.strftime('%Y%m%d-%H%M%S')}"
+                
+                # 2026-06-25 Gemini CLI: Sync strategy state passing historical entry_ts for grace period tracking
+                self.strategy.sync_position(
+                    trade_id=self.current_trade_id,
+                    side="LONG" if side == 1 else "SHORT",
+                    near_entry=near_price,
+                    far_entry=far_price,
+                    entry_spread_z=bar.get('spread_z', 0.0),
+                    entry_ts=ts
+                )
                 
                 self.trades.append({
                     "ts": ts, "action": "ENTRY", "near": near_price, "far": far_price,
@@ -197,16 +227,23 @@ class SpreadBacktester:
             self.current_entry_price_far = 0
             self.released_leg = None
             
+            # 2026-06-25 Gemini CLI: Reset strategy state with exit_ts to prevent cooldown lock in backtests
+            self.strategy._reset(reason="backtest_exit", exit_ts=ts)
+            
         elif signal.action == "PARTIAL_EXIT" and self.position_size != 0 and self.released_leg is None:
             qty = abs(self.position_size)
             if "NEAR" in signal.reason:
                 self.released_leg = "near"
                 gross_pnl = (near_price - self.current_entry_price_near) * self.position_size * MULTIPLIER
                 cost_details = self._calculate_cost(near_price, 0, qty, is_full=False)
+                # 2026-06-25 Hermes Agent: Sync strategy partial exit release (remaining price is far_price)
+                self.strategy.sync_release(leg="near", price=far_price)
             else:
                 self.released_leg = "far"
                 gross_pnl = (self.current_entry_price_far - far_price) * self.position_size * MULTIPLIER
                 cost_details = self._calculate_cost(0, far_price, qty, is_full=False)
+                # 2026-06-25 Hermes Agent: Sync strategy partial exit release (remaining price is near_price)
+                self.strategy.sync_release(leg="far", price=near_price)
             
             cost = cost_details["total"]
             self.total_gross += gross_pnl
@@ -303,4 +340,7 @@ def main():
     print("Note: ATR is proxied by spread_std from CSV.")
 
 if __name__ == "__main__":
+    # macOS Silicon optimization: Force main and spawned sub-processes to E-Cores
+    if sys.platform == "darwin":
+        os.system(f"taskpolicy -b -p {os.getpid()}")
     main()

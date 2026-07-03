@@ -212,6 +212,27 @@ if auto_refresh_sec != "關閉":
     interval_ms = int(auto_refresh_sec.replace("秒", "")) * 1000
     st_autorefresh(interval=interval_ms, key="auto_refresh_timer")
 
+# ── 全域字體縮小 CSS ──
+st.markdown("""
+<style>
+html, body, [class*="css"] { font-size: 14px !important; }
+[data-testid="stMetricValue"] { font-size: 1.2rem !important; }
+[data-testid="stMetricLabel"] { font-size: 0.75rem !important; }
+.styled-table { font-size: 0.75rem !important; }
+.stDataFrame, .stTable { font-size: 12px !important; }
+.dataframe { font-size: 12px !important; }
+.stMarkdown { font-size: 13px !important; }
+.stCaption, .caption, st.caption { font-size: 11px !important; }
+.stButton button { font-size: 12px !important; }
+.streamlit-expanderHeader { font-size: 13px !important; }
+section[data-testid="stSidebar"] * { font-size: 12px !important; }
+button[data-baseweb="tab"] { font-size: 13px !important; }
+h1 { font-size: 1.4rem !important; }
+h2 { font-size: 1.2rem !important; }
+h3 { font-size: 1.1rem !important; }
+</style>
+""", unsafe_allow_html=True)
+
 BASE = Path(__file__).parent.parent
 # GSD: Align DATE_STR with the ACTIVE trading session date (e.g. after 15:00 today, it's tomorrow's date)
 DATE_STR = get_session_date_str(datetime.datetime.now())
@@ -498,9 +519,6 @@ def filter_today(df, ts_col="timestamp"):
 
         # 確保排序
         filtered_df = filtered_df.sort_values(ts_col)
-
-        # [Audit Debug] Log timestamp integrity after trading day filter
-        _debug_ts_integrity(filtered_df, "filter_today_output", ts_col)
 
         # V-Model fix 3: 過濾 fallback 假資料
         for col in ["close", "price_mtx"]:
@@ -1441,11 +1459,33 @@ def make_pnl_chart(pnl_df, title):
     fig.update_layout(height=250, margin=dict(t=10, b=10, l=40, r=20), title_text=title, title_font_size=14, yaxis_tickformat=",.0f")
     return fig
 
-@st.cache_data(ttl=30)
+# ── Futures indicators column whitelist (load_futures_indicators usecols) ──
+# Only columns actually read by dashboard render/logic.
+_FUTURES_USECOLS = [
+    "timestamp", "Close", "High", "Low", "Open", "Volume",
+    "close", "high", "low", "open", "volume",
+    "atr", "atr_10", "atr_raw", "atr_floor", "atr_used",
+    "vwap", "score", "regime", "momentum", "sqz_on", "fired",
+    "spread_z", "far_close",
+    "bb_up", "bb_low", "bb_mid",
+    "ema_200_up", "ema_fast", "ema_slow",
+    "squeeze_release", "price_vs_vwap", "volume_spike",
+    "trend_strength_raw", "breakout_strength_atr",
+    "bear_breakout_strength_atr",
+    "bull_align", "bear_align",
+    "trading_day",
+    "high_20_prev", "low_20_prev",
+    "session",
+]
+# The minimal set guaranteed to exist in CSV for fast-path usecols
+_FUTURES_USECOLS_ESSENTIAL = ["timestamp", "Close", "High", "Low", "Open", "Volume", "atr", "vwap", "score", "regime", "momentum", "sqz_on", "fired", "trading_day"]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def load_futures_indicators(full_history=False):
-    def _read_and_standardize(path):
+    def _read_and_standardize(path, *, usecols=None):
         try:
-            df = pd.read_csv(path)
+            df = pd.read_csv(path, usecols=usecols)
             # V-Model fix: Immediate deduplication after reading
             if df.columns.duplicated().any():
                 df = df.loc[:, ~df.columns.duplicated()].copy()
@@ -1489,10 +1529,40 @@ def load_futures_indicators(full_history=False):
         except Exception:
             return None
 
-    # 1. 優先找最近 7 天所有可能的檔案並合併 (確保夜盤跨交易日資料完整)
     import datetime as dt
     now = dt.datetime.now()
-    # GSD: Include tomorrow to cover the active trading session after 15:00 rollover
+    _active_ticker = futures_cfg.get("ticker", "TMF")
+
+    # ── FAST PATH (default): read only the single most relevant CSV ──
+    # For full_history=False (today's overview / detail page): find today's
+    # single best file, read with usecols, return immediately — no merge.
+    if not full_history:
+        try:
+            from pathlib import Path as _Path
+            today_str = now.strftime("%Y%m%d")
+            # Priority: _PAPER > _LIVE > _DRY > bare
+            for tag_suffix in ["_PAPER", "_LIVE", "_DRY", ""]:
+                candidates = sorted(
+                    FUTURES_MKT.glob(f"{_active_ticker}_{today_str}{tag_suffix}_indicators.csv"),
+                    reverse=True,
+                )
+                for fp in candidates:
+                    if fp.exists():
+                        df = _read_and_standardize(fp)
+                        if df is not None and not df.empty and "timestamp" in df.columns:
+                            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                            result = filter_today(df)
+                            if result is None or result.empty:
+                                result = df  # 2026-07-03 Hermes Agent: fallback: use raw df if filter_today empties it (prevents empty dashboard on day rollover)
+                            result = extend_taifex_recess_continuity(result, timestamp_col="timestamp")
+                            # Final sort + dedup
+                            result = result.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+                            return result
+        except Exception:
+            pass
+        # Fall through to full path if fast path fails
+
+    # ── FULL PATH (full_history or fast path failed) ──
     search_days_raw = [
         (now - dt.timedelta(days=3)).strftime("%Y%m%d"),
         (now - dt.timedelta(days=2)).strftime("%Y%m%d"),
@@ -1501,14 +1571,10 @@ def load_futures_indicators(full_history=False):
         (now + dt.timedelta(days=1)).strftime("%Y%m%d"),
         (now + dt.timedelta(days=2)).strftime("%Y%m%d"),
         (now + dt.timedelta(days=3)).strftime("%Y%m%d"),
-        DATE_STR,  # GSD Fix: Always include the active trading session date
+        DATE_STR,
     ]
-    # Also find any existing indicators files on disk (catch cross-weekend session dates)
     try:
         from pathlib import Path as _Path
-        # 2026-05-27 Gemini CLI: Generalize search prefix (no hardcoded MXF)
-        _active_ticker = futures_cfg.get("ticker", "TMF")
-        # Sort by filename descending (newest dates first) and take the first 5 to avoid loading years of history
         all_files = sorted(FUTURES_MKT.glob(f"{_active_ticker}_*_indicators.csv"), reverse=True)
         for f in all_files[:5]:
             parts = f.stem.split("_")
@@ -1516,12 +1582,11 @@ def load_futures_indicators(full_history=False):
                 search_days_raw.append(parts[1])
     except Exception:
         pass
-    search_days = list(dict.fromkeys(search_days_raw))  # dedupe, preserve order
+    search_days = list(dict.fromkeys(search_days_raw))
 
     all_dfs = []
     for priority, date_part in enumerate(search_days):
         for tag in ["", "_LIVE", "_PAPER", "_DRY"]:
-            # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] TMF Default
             _prefixes = [_active_ticker]
             if _active_ticker not in ["TMF"]:
                  _prefixes.extend(["TMF"])
@@ -1529,6 +1594,7 @@ def load_futures_indicators(full_history=False):
             for prefix in _prefixes:
                 f = FUTURES_MKT / f"{prefix}_{date_part}{tag}_indicators.csv"
                 if f.exists():
+                    # Full path loads all columns for chart rendering
                     df = _read_and_standardize(f)
                     if df is not None and "timestamp" in df.columns:
                         if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
@@ -1536,8 +1602,10 @@ def load_futures_indicators(full_history=False):
                         if not df.empty:
                             df["__source_priority"] = priority
                             all_dfs.append(df)
+        # Early stop: once we have data from a recent date, stop reading older files
+        if all_dfs:
+            break
 
-    # GSD: Parquet Fallback (Wave 18.3)
     is_fallback = False
     if not all_dfs:
         try:
@@ -1546,37 +1614,25 @@ def load_futures_indicators(full_history=False):
             if not df_hist.empty:
                 is_fallback = True
                 df_hist = df_hist.tail(100).copy()
-                
-                # V-Model fix: Deduplicate before rename to prevent clashes
                 df_hist = df_hist.loc[:, ~df_hist.columns.duplicated()].copy()
-                
-                # Standardize columns carefully
                 if df_hist.index.name == "timestamp" or df_hist.index.name == "ts":
                     df_hist = df_hist.reset_index()
                 elif pd.api.types.is_datetime64_any_dtype(df_hist.index):
-                    # If index is datetime but not named 'timestamp', reset and rename
                     df_hist = df_hist.reset_index()
                     df_hist = df_hist.rename(columns={"index": "timestamp"})
                 else:
-                    # If index is not datetime, create a timestamp column from index
                     df_hist = df_hist.reset_index()
                     if "index" in df_hist.columns:
                         df_hist = df_hist.rename(columns={"index": "timestamp"})
                     elif "timestamp" not in df_hist.columns:
-                        # Create a dummy timestamp column if none exists
                         df_hist["timestamp"] = pd.to_datetime("2023-01-01")
-                
                 rename_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
-                # Only rename if source exists AND target doesn't already exist
                 actual_renames = {k: v for k, v in rename_map.items() if k in df_hist.columns and v not in df_hist.columns}
                 df_hist = df_hist.rename(columns=actual_renames)
-                
-                # Ensure timestamp column exists and is datetime
                 if "timestamp" not in df_hist.columns:
                     df_hist["timestamp"] = pd.to_datetime("2023-01-01")
                 elif not pd.api.types.is_datetime64_any_dtype(df_hist["timestamp"]):
                     df_hist["timestamp"] = pd.to_datetime(df_hist["timestamp"], errors="coerce")
-                
                 all_dfs.append(df_hist)
         except Exception:
             pass
@@ -1584,27 +1640,20 @@ def load_futures_indicators(full_history=False):
     result = None
     if all_dfs:
         merged = merge_indicator_frames(all_dfs)
-
-        # [Audit Debug] Timestamp integrity after merge
-        _debug_ts_integrity(merged, "merge_output", "timestamp")
-
-        # FINAL GUARD: Ensure no duplicate columns for PyArrow
         if merged.columns.duplicated().any():
             merged = merged.loc[:, ~merged.columns.duplicated()].copy()
-        
         if is_fallback:
-            result = merged # Skip date filtering if loading from history
+            result = merged
         elif full_history:
             cutoff = now - dt.timedelta(hours=24)
             result = merged[merged["timestamp"] >= cutoff].copy()
         else:
             result = filter_today(merged)
     else:
-        # 2. 備案：找目錄下最新的 CSV
         try:
-            all_files = list(FUTURES_MKT.glob("*_*_indicators.csv"))
-            if all_files:
-                latest_file = max(all_files, key=os.path.getmtime)
+            all_fp = list(FUTURES_MKT.glob("*_*_indicators.csv"))
+            if all_fp:
+                latest_file = max(all_fp, key=lambda p: os.path.getmtime(str(p)))
                 df = _read_and_standardize(latest_file)
                 if df is not None and "timestamp" in df.columns:
                     if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
@@ -1617,17 +1666,10 @@ def load_futures_indicators(full_history=False):
         except Exception:
             result = None
 
-    # Stale data detection (trading-day-aware)
+    # Stale data detection
     if result is not None and not result.empty and "timestamp" in result.columns:
-        # [Audit Debug] Timestamp integrity before extend
-        _debug_ts_integrity(result, "pre_extend", "timestamp")
-        
         result = extend_taifex_recess_continuity(result, timestamp_col="timestamp")
-        
-        # [Audit Debug] Timestamp integrity after extend
-        _debug_ts_integrity(result, "post_extend", "timestamp")
         try:
-            # ── Calendar time staleness ──
             result_ts = result["timestamp"].copy()
             if not pd.api.types.is_datetime64_any_dtype(result_ts):
                 result_ts = pd.to_datetime(result_ts, errors="coerce")
@@ -1635,8 +1677,6 @@ def load_futures_indicators(full_history=False):
             if not result_ts.empty:
                 latest_ts = result_ts.max()
                 age_secs = (pd.Timestamp.now() - latest_ts).total_seconds()
-
-                # ── Trading day staleness ──
                 from core.date_utils import get_trading_day
                 expected_tday = get_trading_day(datetime.datetime.now())
                 if "trading_day" in result.columns:
@@ -1647,10 +1687,7 @@ def load_futures_indicators(full_history=False):
                         latest_tday_date = get_trading_day(latest_ts.to_pydatetime())
                 else:
                     latest_tday_date = get_trading_day(latest_ts.to_pydatetime())
-
-                # ── Determine stale type ──
                 if latest_tday_date < expected_tday:
-                    # Trading day lag (e.g. still on Apr 23 when Apr 27 night session started)
                     st.warning(
                         f"📅 交易日滯後: "
                         f"目前交易日={expected_tday}, "
@@ -1660,18 +1697,15 @@ def load_futures_indicators(full_history=False):
                     )
                 elif age_secs > 600:
                     st.warning(f"⚠️ 期貨資料停滯 {age_secs/60:.0f} 分鐘")
-                else:
-                    # Show normal status in an expander or sidebar
-                    pass
         except Exception:
             pass
-    
-    # ── [Audit Safety Net] Final sort + dedup before returning ──
+
     if result is not None and not result.empty and "timestamp" in result.columns:
         result["timestamp"] = pd.to_datetime(result["timestamp"], errors="coerce")
         result = result.dropna(subset=["timestamp"])
         result = result.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
-    
+    import sys as _sys
+    print(f"[FUTURES_DEBUG] returning: type={type(result).__name__}, empty={result.empty if result is not None else 'N/A'}, rows={len(result) if result is not None else 0}", file=_sys.stderr, flush=True)
     return result
 
 # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] TMF Default
@@ -2244,8 +2278,8 @@ if st.session_state.get('show_weak_bear_panel', False):
 # ════════════════════════════════════════
 if page == "總覽":
     col1, col2 = st.columns(2)
-    f_df = load_futures_indicators(full_history=cont_mode)
-    o_df = load_options_indicators(full_history=cont_mode)
+    f_df = load_futures_indicators(full_history=False)  # 總覽一率走 fast path，不依賴 toggle
+    o_df = load_options_indicators(full_history=False)
 
     with col1:
         # 2026-05-27 Gemini CLI: Dynamic Ticker in Header
@@ -2261,7 +2295,25 @@ if page == "總覽":
             c2.metric("Score", f"{sc_val:.1f}")
             c3.metric("Bars", len(f_df))
         else:
-            st.info("無期貨指標數據")
+            # ── No indicator data: show live MTS near/far prices ──
+            _mts_f = "/tmp/mts_position_state.json"
+            _nl = None
+            _fl = None
+            try:
+                if os.path.exists(_mts_f):
+                    with open(_mts_f) as _pf:
+                        _ps = json.load(_pf)
+                    _nl = _ps.get("near_last")
+                    _fl = _ps.get("far_last")
+            except Exception:
+                pass
+            if _nl or _fl:
+                _c1, _c2 = st.columns(2)
+                if _nl: _c1.metric("近月 (即時)", f"{_nl:.0f}")
+                if _fl: _c2.metric("遠月 (即時)", f"{_fl:.0f}")
+                st.caption("🟡 指標數據尚未產出，顯示訂閱即時價格")
+            else:
+                st.info("無期貨指標數據")
         ft, ft_date = load_futures_trades()
         # GSD Fix: Show which date's file was actually loaded to avoid confusion during night sessions
         trading_day_str = TRADE_DATE_STR
@@ -2298,44 +2350,63 @@ if page == "總覽":
         else:
             st.write("今日交易: 0 筆")
 
-    # ── 總覽圖：指數走勢（期貨 + 選擇權 MTX 統一 Y 軸）──
-    st.header("今日指數走勢")
-    fig = go.Figure()
+    # ── 總覽圖：指數走勢（TMF 微台指）+ ATR ──
+    st.header("今日指數 (TMF 微台指) 走勢")
+    from plotly.subplots import make_subplots
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
     has_data = False
+    
+    # [DEBUG] Show f_df status
+    _fdf_status = f"f_df: type={type(f_df).__name__}"
+    if f_df is not None:
+        _fdf_status += f", empty={f_df.empty}, rows={len(f_df)}, cols={list(f_df.columns[:5])}"
+    else:
+        _fdf_status += ", f_df=None"
+    st.caption(f"`{_fdf_status}`")
     
     if f_df is not None and not f_df.empty:
         f_close = f_df["close"] if "close" in f_df.columns else f_df["Close"]
-        # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
         fig.add_trace(go.Scatter(
             x=_clean_list(f_df["timestamp"], force_str=True),
             y=_clean_list(f_close),
             name=f"{_TICKER} (期貨)",
             line=dict(color="#1f77b4", width=2)
-        ))
-        has_data = True
-        
-    if o_df is not None and not o_df.empty:
-        # Compatibility fix: use mtx_close if price_mtx is missing
-        m_col = "price_mtx" if "price_mtx" in o_df.columns else ("mtx_close" if "mtx_close" in o_df.columns else None)
-        if m_col:
-            # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
+        ), row=1, col=1)
+        # ATR subplot
+        _atr_col = "atr" if "atr" in f_df.columns else ("atr_20" if "atr_20" in f_df.columns else None)
+        if _atr_col:
             fig.add_trace(go.Scatter(
-                x=_clean_list(o_df["timestamp"], force_str=True),
-                y=_clean_list(o_df[m_col]),
-                name="MTX (選擇權標的)",
-                line=dict(color="#ff7f0e", width=1.5, dash="dot")
-            ))
-            has_data = True
+                x=_clean_list(f_df["timestamp"], force_str=True),
+                y=_clean_list(f_df[_atr_col]),
+                name="ATR",
+                line=dict(color="#ff7f0e", width=1.5),
+                fill="tozeroy", fillcolor="rgba(255,127,14,0.1)"
+            ), row=2, col=1)
+        has_data = True
+    else:
+        # Fallback: show MTS live price as a horizontal line
+        try:
+            _mts_pf = "/tmp/mts_position_state.json"
+            if os.path.exists(_mts_pf):
+                with open(_mts_pf) as _pf:
+                    _ps = json.load(_pf)
+                _nl = _ps.get("near_last")
+                if _nl:
+                    fig.add_hline(y=_nl, line_dash="dot", line_color="#1f77b4", annotation_text=f"近月 {_nl:.0f}")
+                    has_data = True
+        except Exception:
+            pass
             
     if has_data:
         fig.update_layout(
-            height=400, 
+            height=450, 
             margin=dict(t=10, b=10, l=40, r=20), 
             legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"),
             hovermode="x unified"
         )
-        fig.update_yaxes(title_text="指數點位", tickformat=",.0f", gridcolor="rgba(128,128,128,0.1)")
-        fig.update_xaxes(gridcolor="rgba(128,128,128,0.1)")
+        fig.update_yaxes(title_text="指數點位", tickformat=",.0f", gridcolor="rgba(128,128,128,0.1)", row=1, col=1)
+        fig.update_yaxes(title_text="ATR", tickformat=",.1f", gridcolor="rgba(128,128,128,0.1)", row=2, col=1)
+        fig.update_xaxes(gridcolor="rgba(128,128,128,0.1)", row=2, col=1)
         st.plotly_chart(fig, width='stretch')
     else:
         st.info("等待數據...")
@@ -2433,15 +2504,6 @@ if page == "總覽":
                     styles[8] = 'color: #059669; font-weight: bold'
                 return styles
             
-            # CSS 縮小字體
-            st.markdown("""
-                <style>
-                [data-testid="stMetricValue"] { font-size: 1.4rem !important; }
-                [data-testid="stMetricLabel"] { font-size: 0.8rem !important; }
-                .styled-table { font-size: 0.8rem !important; }
-                </style>
-            """, unsafe_allow_html=True)
-            
             st.dataframe(ov_df.style.apply(style_overview, axis=1), width='stretch', hide_index=True)
         else:
             st.info("等待個股指標數據...")
@@ -2456,7 +2518,7 @@ elif page == f"期貨 {_TICKER}":
     _ov_ticker = futures_cfg.get("ticker", "TMF")
     st.header(f"期貨 {_ov_ticker} ({mode_badge(f_live)})")
 
-    f_df = load_futures_indicators(full_history=cont_mode)
+    f_df = load_futures_indicators(full_history=False)  # 期貨頁先走 fast path（參數資料夠用）
     if f_df is not None and not f_df.empty:
         last = f_df.iloc[-1]
         last_ts = pd.to_datetime(last.get("timestamp"))
@@ -2525,7 +2587,9 @@ elif page == f"期貨 {_TICKER}":
                     with open(_flag_path, "w") as _f:
                         _f.write(_flag)
                     st.success(f"手動{_action_name}指令已送出 (Z={_sz:.1f})，等待消費...")
-                    st.rerun()
+                    # No st.rerun() here — autorefresh (60s) picks up the flag change.
+                    # st.rerun() + autorefresh simultaneously causes asyncio sock_send
+                    # buffer full → CPU 100% → grey screen.
             
             with mts_col3:
                 if st.button("🆘 MTS緊急全平倉", key="force_close_all", type="secondary", width='stretch'):
@@ -2801,8 +2865,46 @@ elif page == f"期貨 {_TICKER}":
         _html_parts.append("</table></div>")
         st.markdown("".join(_html_parts), unsafe_allow_html=True)
     else:
-        st.info("無數據")
-    
+        # ── No indicator data: show live MTS near/far prices as fallback ──
+        _mts_price_file = "/tmp/mts_position_state.json"
+        _near_live = None
+        _far_live = None
+        try:
+            if os.path.exists(_mts_price_file):
+                with open(_mts_price_file) as _pf:
+                    _ps = json.load(_pf)
+                _near_live = _ps.get("near_last")
+                _far_live = _ps.get("far_last")
+        except Exception:
+            pass
+        if _near_live or _far_live:
+            _nl1, _nl2 = st.columns(2)
+            if _near_live:
+                _nl1.metric("近月 (TMF 即時)", f"{_near_live:.0f}")
+            if _far_live:
+                _nl2.metric("遠月 (TMF 即時)", f"{_far_live:.0f}")
+            st.caption("🟡 指標數據尚未產出，顯示訂閱即時價格")
+        else:
+            st.info("無數據")
+        # ── MTS buttons (always show when MTS enabled, regardless of f_df) ──
+        try:
+            with open(FUTURES_CFG_PATH) as _f:
+                _mts_on = yaml.safe_load(_f).get("mts", {}).get("enabled", False)
+        except Exception:
+            _mts_on = False
+        if _mts_on:
+            _nc, _ec = st.columns([1, 1])
+            if _nc.button("🔬 強制買進價差", key="force_spread_trade_fallback", type="primary", width='stretch'):
+                _flag = json.dumps({"action": "spread", "side": "BUY_NEAR_SELL_FAR", "ts": datetime.datetime.now().isoformat(), "created_at": time.time()})
+                with open("/tmp/futures_manual_trade.flag", "w") as _f:
+                    _f.write(_flag)
+                st.success("手動買進價差指令已送出，等待消費...")
+            if _ec.button("🆘 MTS緊急全平倉", key="force_close_all_fallback", type="secondary", width='stretch'):
+                _flag = json.dumps({"action": "close_all", "ts": datetime.datetime.now().isoformat(), "reason": "DASHBOARD_EMERGENCY", "created_at": time.time()})
+                with open("/tmp/futures_manual_trade.flag", "w") as _f:
+                    _f.write(_flag)
+                st.warning("🚨 緊急平倉指令已送出！")
+
     # ── Calendar Spread 顯示 ──
     ft, _ = load_futures_trades()
     st.header("📊 日曆價差分析 (Calendar Spread)")
@@ -3244,9 +3346,42 @@ elif page == f"期貨 {_TICKER}":
                             _far_now = "—" if _mts_state.get("far_status") == "RELEASED" else f"{_fl:.0f}"
                             _far_pnl = f"{_fr:+.1f}" if _mts_state.get("far_status") == "RELEASED" else f"{_fu:+.1f}"
                             _far_pnl_lbl = "已實現" if _mts_state.get("far_status") == "RELEASED" else "未實現"
+                            # ── Look up latest release/exit events from event ledger ──
+                            _near_event = ""
+                            _far_event = ""
+                            try:
+                                _el_path = os.path.join(BASE, "logs/mts_spread_events.jsonl")
+                                if os.path.exists(_el_path):
+                                    _recent = []
+                                    with open(_el_path) as _ef:
+                                        for _line in _ef:
+                                            _line = _line.strip()
+                                            if _line:
+                                                _recent.append(json.loads(_line))
+                                    # Scan newest-first for release/exit events matching this trade
+                                    for _ev in reversed(_recent):
+                                        _et = _ev.get("event", "")
+                                        _sig = str(_ev.get("signal", ""))
+                                        if "RELEASE_NEAR" in _sig or _et == "RELEASE_NEAR":
+                                            if not _near_event:
+                                                _near_event = f"釋放 {_ev.get('price','')} {_ev.get('ts','')[:16]}" if "T" in _ev.get('ts','') else ""
+                                        if "RELEASE_FAR" in _sig or _et == "RELEASE_FAR":
+                                            if not _far_event:
+                                                _far_event = f"釋放 {_ev.get('price','')} {_ev.get('ts','')[:16]}"
+                                        # EXIT for remaining leg
+                                        if "MTS_EXIT" in str(_ev.get("strategy","")) and _sig in ("", "EXIT"):
+                                            _leg_label = _ev.get("leg_label", "")
+                                            if _leg_label == "NEAR" and not _near_event:
+                                                _near_event = f"平倉 {_ev.get('price','')} {_ev.get('ts','')[:16]}"
+                                            elif _leg_label == "FAR" and not _far_event:
+                                                _far_event = f"平倉 {_ev.get('price','')} {_ev.get('ts','')[:16]}"
+                                        if _near_event and _far_event:
+                                            break
+                            except Exception:
+                                pass
                             _mts_rows = [
-                                {"Leg": _near_label, "方向": _near_side, "進場": _near_val, "現價": _near_now, f"{_near_pnl_lbl}損益": _near_pnl},
-                                {"Leg": _far_label, "方向": _far_side, "進場": _far_val, "現價": _far_now, f"{_far_pnl_lbl}損益": _far_pnl},
+                                {"Leg": _near_label, "方向": _near_side, "進場": _near_val, "現價": _near_now, f"{_near_pnl_lbl}損益": _near_pnl, "事件": _near_event},
+                                {"Leg": _far_label, "方向": _far_side, "進場": _far_val, "現價": _far_now, f"{_far_pnl_lbl}損益": _far_pnl, "事件": _far_event},
                             ]
                             st.dataframe(pd.DataFrame(_mts_rows), width='stretch', hide_index=True)
                             _ez = _mts_state.get("entry_spread_z")

@@ -42,3 +42,35 @@ pytest tests/strategies/test_squeeze_fire_scout.py -q
 ```
 
 Expected result: `21 passed`
+
+# Role & Environment Context
+- The user is working on a high-performance quantitative backtesting system.
+- The local environment is a Mac with Apple Silicon (M4 chip) running macOS.
+
+# Rule: macOS Resource and Temperature Management
+Whenever generating Python code, execution steps, or terminal commands for running computational heavy tasks (e.g., backtesting, optimizations, multiprocessing), you MUST follow these guidelines to prevent overheating and force execution on Efficiency Cores (E-Cores).
+
+## 1. Terminal Execution Rule
+- DO NOT suggest raw `python <script>.py` commands or `cpulimit` for running scripts.
+- ALWAYS wrap execution commands with `taskpolicy -c background` to restrict the processes to E-Cores.
+- Example pattern to provide:
+  ```bash
+  taskpolicy -c background python your_script.py
+  ```
+
+## 2. Python Script Boilerplate Rule
+- When creating or modifying main Python scripts (`if __name__ == '__main__':`) that utilize `multiprocessing`, `concurrent.futures`, or heavy loops, you MUST inject the following macOS-specific self-throttling snippet at the entry point:
+  ```python
+  import sys
+  import os
+
+  if __name__ == '__main__':
+      # macOS Silicon optimization: Force main and spawned sub-processes to E-Cores
+      if sys.platform == "darwin":
+          os.system(f"taskpolicy -b -p {os.getpid()}")
+  ```
+
+## 3. Explanations and Communication
+- Do not mention `cpulimit` or typical Linux-based throttling utilities, as they are inefficient on Apple Silicon schedulers.
+- Remind the user that this policy applies to all spawned child processes automatically, maintaining a cool device with zero fan noise.
+

@@ -89,7 +89,8 @@ def _make_monitor(registry, *, pending_orders=None, ticker="TMF"):
     # [V-Model] SpreadLoader mock for enrich_bar call
     from core.spread_loader import get_spread_loader
     monitor._spread_loader = get_spread_loader()
-    monitor._spread_loaded = monitor._spread_loader.load_latest_csv()
+    # 2026-06-26 Gemini CLI: Pass active ticker to prevent loading default MXF CSV files
+    monitor._spread_loaded = monitor._spread_loader.load_latest_csv(monitor.ticker)
 
     # 2026-06-23 Gemini CLI: map deprecated _route_entry_signal to _route_signal in tests
     import types

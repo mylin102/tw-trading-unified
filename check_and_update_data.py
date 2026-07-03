@@ -118,9 +118,10 @@ def get_today_market_data():
             print("❌ 無法取得Shioaji API連線")
             return None
         
-        # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Standardize dynamic contract lookup
-        from core.bar_utils import load_config
-        futures_cfg = load_config("config/futures.yaml")
+        # 2026-06-24 Gemini CLI: Correct invalid import of load_config from core.bar_utils to yaml.safe_load.
+        import yaml
+        with open("config/futures.yaml", encoding="utf-8") as f:
+            futures_cfg = yaml.safe_load(f)
         product = futures_cfg.get("ticker", "TMF")
         
         # 取得合約

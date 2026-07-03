@@ -120,11 +120,12 @@ mts:
   enabled: true
   strategy: tmf_spread
   lots: 1
+  release_mode: "triggered_market"  # Phase 1: triggered_market. Phase 2: triggered_oco_limit / entry_oco_limit
   params:
     min_atr: 10.0
     atr_multiplier_stop: 2.0
-    atr_multiplier_trail: 0.3
-    release_stop_points: 100
+    atr_multiplier_trail: 0.1
+    release_stop_points: 200
     trail_distance_points: 30
     atr_cap: 250.0
     confirm_ticks: 2

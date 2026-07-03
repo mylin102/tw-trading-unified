@@ -34,7 +34,7 @@ spread_gate:
   stale_action: warn_only
 risk_mgmt:
   atr_length: 14
-  atr_multiplier: 2.2
+  atr_multiplier: 1.4
   break_even_pts: 100
   exit_on_vwap: true
   exit_vwap_confirm_bars: 3
@@ -103,11 +103,30 @@ mts:
   lots: 1
   params:
     min_atr: 20.0
-    atr_multiplier_stop: 0.9
-    atr_multiplier_trail: 1.9
-    release_stop_points: 20
-    trail_distance_points: 30
+    atr_multiplier_stop: 1.5
+    atr_multiplier_trail: 0.1
+    release_stop_points: 99
+    trail_distance_points: 10
     atr_cap: 100.0
+    confirm_ticks: 2
+    confirm_ms: 800
+    max_quote_age_ms: 1000
+    max_spread_width: 3
+    entry_z:
+      low_atr: 2.0
+      normal_atr: 2.5
+      high_atr: 3.0
+    atr_low_threshold: 15.0
+    atr_high_threshold: 30.0
+    mfe_tighten:
+      enabled: true
+      level_1_atr: 2.0
+      level_1_trail_mult: 1.6
+      level_2_atr: 3.0
+      level_2_trail_mult: 1.2
+    post_release:
+      breakeven_after_atr: 1.0
+      force_lock_after_atr: 3.0
 debug_gate_bypass:
   enabled: true
   paper_only: true

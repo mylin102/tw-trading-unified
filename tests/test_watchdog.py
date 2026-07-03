@@ -162,6 +162,14 @@ def test_watchdog_critical_exit(tmp_path, monkeypatch):
     m.api = API2()
     monkeypatch.setattr("strategies.futures.monitor.is_taifex_futures_market_open", lambda: True)
 
+    # 2026-06-26 Gemini CLI: Mock datetime.now() to be outside afternoon recess break (15:00-15:15)
+    class MockDatetime:
+        @classmethod
+        def now(cls):
+            from datetime import datetime as real_datetime
+            return real_datetime(2026, 6, 26, 10, 0, 0)
+    monkeypatch.setattr("strategies.futures.monitor.datetime", MockDatetime)
+
     with pytest.raises(RuntimeError):
         m._check_futures_contract_staleness()
 

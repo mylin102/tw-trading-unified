@@ -28,7 +28,18 @@ def _true_range(df: pd.DataFrame) -> pd.Series:
         return pd.Series(0.0, index=df.index)
 
     close_prev = close.shift(1)
-    return pd.concat(
+    
+    # 2026-06-26 Gemini CLI: Detect new session open to prevent ATR gap explosion (Method 1)
+    # Check time gaps between index timestamps. A gap > 30 minutes indicates a session change.
+    is_new_session = pd.Series(False, index=df.index)
+    if isinstance(df.index, pd.DatetimeIndex) and len(df.index) > 0:
+        time_diff = pd.Series(df.index).diff()
+        is_new_session_series = (time_diff > pd.Timedelta(minutes=30))
+        is_new_session_series.iloc[0] = True # First element has no previous bar, treat as new session
+        is_new_session = pd.Series(is_new_session_series.values, index=df.index)
+
+    # Calculate standard true range
+    tr_standard = pd.concat(
         [
             high - low,
             (high - close_prev).abs(),
@@ -37,16 +48,30 @@ def _true_range(df: pd.DataFrame) -> pd.Series:
         axis=1,
     ).max(axis=1)
 
+    # For new session open, force to high - low to ignore overnight/session gaps
+    tr_smooth = np.where(is_new_session, high - low, tr_standard)
+    return pd.Series(tr_smooth, index=df.index)
+
 
 def _linreg(series: pd.Series, length: int) -> pd.Series:
     """計算線性回歸值 (用於動能平滑)"""
-    x = np.arange(length)
-    def get_linreg(y):
-        if len(y) < length or np.isnan(y).any():
-            return 0.0
-        slope, intercept = np.polyfit(x, y, 1)
-        return slope * (length - 1) + intercept
-    return series.rolling(window=length).apply(get_linreg, raw=True)
+    # 2026-06-25 Gemini CLI: Optimize rolling linear regression using vectorized NumPy convolution
+    if len(series) < length:
+        return pd.Series(np.nan, index=series.index)
+    
+    # 2026-06-25 Gemini CLI: Calculate analytical weights for the linear regression prediction at the end of the window (x = N-1)
+    i = np.arange(length)
+    w = (6 * i - 2 * length + 4) / (length * (length + 1))
+    
+    # 2026-06-25 Gemini CLI: Use convolution for fast rolling dot product.
+    # If any element in a window is NaN, NumPy convolve results in NaN, which is replaced with 0.0.
+    values = series.values
+    conv = np.convolve(values, w[::-1], mode='valid')
+    conv = np.nan_to_num(conv, nan=0.0)
+    
+    # 2026-06-25 Gemini CLI: Pad the first length-1 elements with NaN to match pandas rolling behavior
+    padded = np.concatenate([np.full(length - 1, np.nan), conv])
+    return pd.Series(padded, index=series.index)
 
 
 def _fallback_squeeze(
@@ -192,6 +217,23 @@ def calculate_futures_squeeze(
                     df[col] = df["Close"].iloc[0] if len(df) > 0 else 0.0
                 elif col == "vwap":
                     df[col] = df["Close"] if len(df) > 0 else np.nan
+                elif col == "atr":
+                    # 2026-07-02 Hermes Agent: Short-path ATR — calculate from available data
+                    # instead of setting 0, so MTS state gets a real volatility estimate
+                    # early in the session (before 20 bars accumulate).
+                    # Use the shortest available ATR that the data supports.
+                    if len(df) >= 5:
+                        df["atr"] = calculate_atr(df, length=5)
+                        df["atr_5"] = df["atr"]
+                    elif len(df) >= 2:
+                        df["atr"] = calculate_atr(df, length=2)
+                    else:
+                        df[col] = 0.0
+                    if "atr_5" not in df.columns:
+                        df["atr_5"] = df["atr"]
+                    df["atr_10"] = df["atr"]
+                    df["atr_20"] = df["atr"]
+                    df["atr_60"] = df["atr"]
                 else:
                     df[col] = 0.0
         return df

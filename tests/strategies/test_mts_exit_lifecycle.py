@@ -18,7 +18,9 @@ def strategy():
                 "min_atr": 5.0, 
                 "trail_distance_points": 35.0,
                 "atr_multiplier_stop": 1.0,
-                "atr_multiplier_trail": 3.5
+                "atr_multiplier_trail": 3.5,
+                "confirm_ticks": 1,
+                "confirm_ms": 0.0
             }
         }
         s.init(StrategyContext(market=MarketData(last_bar={}, ticker="TMF"), position=PositionView(size=0), config=config))
