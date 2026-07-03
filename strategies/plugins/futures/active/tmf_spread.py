@@ -1760,11 +1760,14 @@ class TMFSpread(StrategyBase):
 
         # ── Legacy path (fallback when _decision is None) ──
         # ── Full spread held ──
-        if self._released_leg is None:
-            # 2026-06-29 Gemini CLI: Under Deferred Strategy Sync, if we are in RELEASE_NEAR/FAR
-            # but released_leg is still None, we are awaiting fill confirmation for the released leg.
-            if self._lifecycle in ("RELEASE_NEAR", "RELEASE_FAR"):
-                self._set_eval(skip_reason="AWAITING_RELEASE_FILL", lifecycle=self._lifecycle)
+        if self._lifecycle_oca.phase == PositionPhase.SPREAD:
+            # Awaiting release fill confirmation
+            if self._lifecycle_oca.release_group.status in (
+                ReleaseGroupStatus.TRIGGERED,
+                ReleaseGroupStatus.SUBMITTED,
+                ReleaseGroupStatus.FILLED,
+            ):
+                self._set_eval(skip_reason="AWAITING_RELEASE_FILL", rg_status=self._lifecycle_oca.release_group.status.value)
                 return None
 
             # 2026-06-25 Hermes Agent: Use bar time difference for grace period to ensure correct backtesting and live trading
@@ -1807,10 +1810,9 @@ class TMFSpread(StrategyBase):
             return None
 
         # ── Trailing mode ──
-        if self._released_leg is not None:
-            # 2026-06-29 Gemini CLI: Normalize restored RELEASE_NEAR/FAR lifecycle to TRAILING
-            if self._lifecycle in ("RELEASE_NEAR", "RELEASE_FAR"):
-                self._lifecycle = f"TRAILING_{self._side}"
+        if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG:
+            # Sync legacy _lifecycle string for compat (decision no longer reads it)
+            self._lifecycle = f"TRAILING_{self._side}"
 
         if self._released_leg == "near":
             _rem_price, _rem_entry, _rem_leg_label, _released_leg_label = far_close, self._far_entry, "FAR", "NEAR"
