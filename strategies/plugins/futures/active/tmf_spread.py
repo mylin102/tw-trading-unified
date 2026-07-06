@@ -416,11 +416,15 @@ def evaluate_lifecycle_actions(
 
 
 def _commit_action(lifecycle: PositionLifecycle, decision: LifecycleDecision) -> None:
-    """Apply lifecycle state transition. No side effects — no filesystem, no Shioaji."""
+    """Apply lifecycle state transition. No side effects — no filesystem, no Shioaji.
+
+    ADR-009 Task 9: TRAIL decision no longer pushes trail_group to SUBMITTED.
+    SUBMITTED is now set only after broker order submit succeeds (with exit_order_id).
+    This prevents the orphan SUBMITTED + exit_order_id=null deadlock.
+    """
     if decision.action == LifecycleAction.RELEASE:
         lifecycle.release_group.status = ReleaseGroupStatus.TRIGGERED
-    elif decision.action == LifecycleAction.TRAIL:
-        lifecycle.trail_group.status = TrailGroupStatus.SUBMITTED
+    # TRAIL: status stays ARMED/ACTIVE until monitor confirms order submit
 
 
 def _append_event(event_type: str, **kwargs) -> None:
@@ -1277,6 +1281,22 @@ class TMFSpread(StrategyBase):
                                 # Invariant guard: FLAT phase must not overlay active position
                                 if self._lifecycle_oca.phase == PositionPhase.FLAT:
                                     self._lifecycle_oca = infer_lifecycle_from_legacy_state(state)
+
+                                # ADR-009 Task 9: SUBMITTED requires exit_order_id.
+                                # If trail_group is SUBMITTED but exit_order_id is null,
+                                # the order was never accepted by broker — downgrade to ARMED
+                                # so the lifecycle controller can re-submit.
+                                if (
+                                    self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG
+                                    and self._lifecycle_oca.trail_group.status == TrailGroupStatus.SUBMITTED
+                                    and not self._lifecycle_oca.trail_group.exit_order_id
+                                ):
+                                    self._lifecycle_oca.trail_group.status = TrailGroupStatus.ARMED
+                                    logger.warning(
+                                        "[MTS_RESTORE_TASK9] Orphan SUBMITTED without exit_order_id — "
+                                        "downgraded trail_group to ARMED (trade_id=%s)",
+                                        state.get("trade_id"),
+                                    )
 
                                 # 💡 [Fixed 2026-05-27] Robust trade_id recovery
                                 self._trade_id = state.get("trade_id") or state.get("manual_order_id")

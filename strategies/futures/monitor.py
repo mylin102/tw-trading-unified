@@ -2933,9 +2933,32 @@ class FuturesMonitor:
                 }
                 
                 self.order_mgr.submit(_order)
+
+                # ADR-009 Task 9: confirm order submit before lifecycle SUBMITTED
+                # Backfill exit_order_id + set SUBMITTED + flush state immediately.
+                # Prevents orphan SUBMITTED + exit_order_id=null deadlock.
+                from strategies.plugins.futures.active.tmf_spread import _write_mts_state, lifecycle_to_dict, TrailGroupStatus
+                _exit_lc = getattr(strategy, "_lifecycle_oca", None)
+                if _exit_lc is not None and hasattr(_exit_lc, 'trail_group'):
+                    _exit_lc.trail_group.exit_order_id = _order.order_id
+                    _exit_lc.trail_group.status = TrailGroupStatus.SUBMITTED
+                    _write_mts_state(
+                        has_position=True, action=f"TRAIL_SUBMITTED_{_leg_label}",
+                        reason=f"task9_backfill_{_order.order_id}",
+                        near_entry=getattr(strategy, "_near_entry", 0),
+                        far_entry=getattr(strategy, "_far_entry", 0),
+                        near_side=getattr(strategy, "_near_side", None),
+                        far_side=getattr(strategy, "_far_side", None),
+                        released_leg=getattr(strategy, "_released_leg", None),
+                        trade_id=getattr(strategy, "_trade_id", _trade_id),
+                        ticker=getattr(strategy, "_ticker", self.ticker),
+                        atr=0.0,
+                        lifecycle=lifecycle_to_dict(_exit_lc),
+                    )
+
                 if self.paper_fill_sim:
                     self.paper_fill_sim.register(_order)
-                    # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
+                    # [Fixed 2026-05-27] Force immediate fill in paper mode
                     self.paper_fill_sim.process_tick(self._make_synthetic_tick(_ref_price, _ts, symbol=_symbol))
 
                     # Force fill ONLY in paper mode
