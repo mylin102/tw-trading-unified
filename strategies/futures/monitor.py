@@ -3054,56 +3054,62 @@ class FuturesMonitor:
                 _symbol = _near_code
                 _leg_label = "NEAR"
                 _ref_ohlc = _snap["near"]
-            
-            _side = OrderSide.SELL if _remaining_side == "LONG" else OrderSide.BUY
-            
-            if _remaining_side:
-                # [ADR-010 Guard] Block legacy MTS_EXIT when OCO bracket is active.
-                # Legacy exit path and ADR-010 OCO exit would create duplicate orders.
-                _lc = getattr(strategy, "_lifecycle_oca", None)
-                if _lc is not None:
-                    _phase = getattr(getattr(_lc, "phase", None), "value", None)
-                    _rg_status = getattr(getattr(getattr(_lc, "release_group", None), "status", None), "value", None)
-                    if _phase == "SPREAD" and _rg_status in ("SUBMITTED", "SUBMITTING", "PARTIALLY_FILLED", "CANCELING_SIBLING"):
-                        console.print(f"[yellow]⚠️ [ADR-010_GUARD] Blocked legacy EXIT — OCO bracket active ({_rg_status})[/yellow]")
-                        return
-                console.print(f"[yellow]📝 [MTS_ORDER] Submitting EXIT for {_leg_label}: {_side} (MKP Range Market)[/yellow]")
-                # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
-                _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_EXIT")
-                self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _ref_ohlc})
-                
-                # [GSD] Track in lifecycle orders so fill is not ignored
-                self._pending_lifecycle_orders[_order.order_id] = {
-                    "intent_id": _order.intent_id, "signal": "EXIT", "reason": _reason, 
-                    "ts": _ts, "lots": 1, "price": _ref_price, "ref_ohlc": _ref_ohlc,
-                    "strategy": "MTS_EXIT",
-                }
-                
-                self.order_mgr.submit(_order)
 
-                # ADR-009 Task 9: confirm order submit before lifecycle SUBMITTED
-                # Backfill exit_order_id + set SUBMITTED + flush state immediately.
-                # Prevents orphan SUBMITTED + exit_order_id=null deadlock.
-                from strategies.plugins.futures.active.tmf_spread import _write_mts_state, lifecycle_to_dict, TrailGroupStatus
-                _exit_lc = getattr(strategy, "_lifecycle_oca", None)
-                if _exit_lc is not None and hasattr(_exit_lc, 'trail_group'):
-                    _exit_lc.trail_group.exit_order_id = _order.order_id
-                    _exit_lc.trail_group.status = TrailGroupStatus.SUBMITTED
-                    _write_mts_state(
-                        has_position=True, action=f"TRAIL_SUBMITTED_{_leg_label}",
-                        reason=f"task9_backfill_{_order.order_id}",
-                        near_entry=getattr(strategy, "_near_entry", 0),
-                        far_entry=getattr(strategy, "_far_entry", 0),
-                        near_side=getattr(strategy, "_near_side", None),
-                        far_side=getattr(strategy, "_far_side", None),
-                        released_leg=getattr(strategy, "_released_leg", None),
-                        trade_id=getattr(strategy, "_trade_id", _trade_id),
-                        ticker=getattr(strategy, "_ticker", self.ticker),
-                        atr=0.0,
-                        lifecycle=lifecycle_to_dict(_exit_lc),
+            if not _remaining_side:
+                return
+
+            # [ADR-010 Guard] Block legacy MTS_EXIT when OCO lifecycle is active.
+            # Legacy exit path and ADR-010 OCO exit would create duplicate orders.
+            _lc = getattr(strategy, "_lifecycle_oca", None)
+            if _lc is not None:
+                _phase = getattr(getattr(_lc, "phase", None), "value", None)
+                _rg_status = getattr(getattr(getattr(_lc, "release_group", None), "status", None), "value", None)
+                if _phase in ("SPREAD", "PARTIALLY_FILLED", "CANCELING_SIBLING", "SIBLING_CANCELED"):
+                    console.print(
+                        f"[yellow]⚠️ [ADR-010_GUARD] Blocked legacy EXIT — OCO lifecycle active "
+                        f"(phase={_phase}, release_group={_rg_status})[/yellow]"
                     )
+                    return
 
-                if self.paper_fill_sim:
+            _side = OrderSide.SELL if _remaining_side == "LONG" else OrderSide.BUY
+
+            console.print(f"[yellow]📝 [MTS_ORDER] Submitting EXIT for {_leg_label}: {_side} (MKP Range Market)[/yellow]")
+            # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
+            _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_EXIT")
+            self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _ref_ohlc})
+
+            # [GSD] Track in lifecycle orders so fill is not ignored
+            self._pending_lifecycle_orders[_order.order_id] = {
+                "intent_id": _order.intent_id, "signal": "EXIT", "reason": _reason,
+                "ts": _ts, "lots": 1, "price": _ref_price, "ref_ohlc": _ref_ohlc,
+                "strategy": "MTS_EXIT",
+            }
+
+            self.order_mgr.submit(_order)
+
+            # ADR-009 Task 9: confirm order submit before lifecycle SUBMITTED
+            # Backfill exit_order_id + set SUBMITTED + flush state immediately.
+            # Prevents orphan SUBMITTED + exit_order_id=null deadlock.
+            from strategies.plugins.futures.active.tmf_spread import _write_mts_state, lifecycle_to_dict, TrailGroupStatus
+            _exit_lc = getattr(strategy, "_lifecycle_oca", None)
+            if _exit_lc is not None and hasattr(_exit_lc, 'trail_group'):
+                _exit_lc.trail_group.exit_order_id = _order.order_id
+                _exit_lc.trail_group.status = TrailGroupStatus.SUBMITTED
+                _write_mts_state(
+                    has_position=True, action=f"TRAIL_SUBMITTED_{_leg_label}",
+                    reason=f"task9_backfill_{_order.order_id}",
+                    near_entry=getattr(strategy, "_near_entry", 0),
+                    far_entry=getattr(strategy, "_far_entry", 0),
+                    near_side=getattr(strategy, "_near_side", None),
+                    far_side=getattr(strategy, "_far_side", None),
+                    released_leg=getattr(strategy, "_released_leg", None),
+                    trade_id=getattr(strategy, "_trade_id", _trade_id),
+                    ticker=getattr(strategy, "_ticker", self.ticker),
+                    atr=0.0,
+                    lifecycle=lifecycle_to_dict(_exit_lc),
+                )
+
+            if self.paper_fill_sim:
                     self.paper_fill_sim.register(_order)
                     # [Fixed 2026-05-27] Force immediate fill in paper mode
                     self.paper_fill_sim.process_tick(self._make_synthetic_tick(_ref_price, _ts, symbol=_symbol))
