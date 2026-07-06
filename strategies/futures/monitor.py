@@ -4462,7 +4462,7 @@ class FuturesMonitor:
                     and _rg_far
                 ):
                     self._save_orders_file_wrapper()
-            self._mts_release_orders_flushed = True
+                    self._mts_release_orders_flushed = True
 
         if signal:
             self._submit_mts_order_signal(signal, strategy, _bar_dict, datetime.now())
