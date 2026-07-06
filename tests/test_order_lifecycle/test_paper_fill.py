@@ -233,3 +233,169 @@ class TestPaperFillEdges:
 
         assert order.status == OrderStatus.FILLED
         assert order.avg_fill_price == 36480  # close, which is better than limit 36500
+
+
+# ═════════════════════════════════════════════════════
+# ADR-010 OCO Paper Fill Acceptance Tests (2026-07-06)
+#
+# NOTE: These test the raw PaperFillSimulator without the
+# monitor's OCO callback wiring (_wire_order_callbacks →
+# _check_oco_release_fill). In production, when both MKP
+# orders are polled via _process_pending_paper_fills():
+#   1. First leg fills → on_fill callback fires synchronously
+#   2. _check_oco_release_fill cancels sibling via order_mgr.cancel()
+#   3. cancel → simulator.remove(sibling) → sibling never fills
+# So in production only ONE leg fills, the other is cancelled.
+# ═════════════════════════════════════════════════════
+
+class TestPaperFillSimulatorPolling:
+    """Verify MKP orders fill correctly via process_tick (raw sim, no OCO callbacks)."""
+
+    def test_mkp_orders_fill_on_valid_tick(self, mgr, tick):
+        """Two MKP orders both fill when process_tick called with matching symbols.
+        
+        In production, the OCO callback cancels the sibling synchronously
+        after the first fill, so only one fills. This test verifies the
+        raw fill simulator correctly fills both when no OCO logic is wired.
+        """
+        order_mgr, sim = mgr
+
+        near = order_mgr.create_order("TMF_NEAR", OrderSide.SELL, OrderType.MKP, 1,
+                                       strategy="MTS_RELEASE_OCO")
+        far = order_mgr.create_order("TMF_FAR", OrderSide.BUY, OrderType.MKP, 1,
+                                      strategy="MTS_RELEASE_OCO")
+        order_mgr.submit(near, exchange_ordno="PAPER-ORD-000003")
+        order_mgr.submit(far, exchange_ordno="PAPER-ORD-000004")
+        sim.register(near)
+        sim.register(far)
+
+        assert sim.get_pending_count() == 2
+
+        # Use real objects (not MagicMock) so symbol guard works
+        def _make_tick(code, close):
+            t = type("Tick", (), {})()
+            t.code = code
+            t.datetime = datetime.now()
+            t.close = close
+            t.open = close
+            t.high = close
+            t.low = close
+            t.volume = 50
+            return t
+
+        t_near = _make_tick("TMF_NEAR", 47237)
+        t_far = _make_tick("TMF_FAR", 47473)
+
+        sim.process_tick(t_near)
+        sim.process_tick(t_far)
+
+        # Both MKP orders should have filled (at close price)
+        assert near.status == OrderStatus.FILLED, \
+            f"near order should be FILLED, got {near.status}"
+        assert far.status == OrderStatus.FILLED, \
+            f"far order should be FILLED, got {far.status}"
+        assert near.avg_fill_price == 47237
+        assert far.avg_fill_price == 47473
+
+    def test_mkp_oco_symbol_mismatch_skips(self, mgr):
+        """Orders with mismatched tick symbol are skipped (guard check)."""
+        order_mgr, sim = mgr
+
+        near = order_mgr.create_order("TMF_NEAR", OrderSide.SELL, OrderType.MKP, 1,
+                                       strategy="MTS_RELEASE_OCO")
+        order_mgr.submit(near, exchange_ordno="PAPER-ORD-N1")
+        sim.register(near)
+
+        # Use real object with mismatched symbol
+        def _make_tick(code, close):
+            t = type("Tick", (), {})()
+            t.code = code
+            t.datetime = datetime.now()
+            t.close = close
+            t.open = close
+            t.high = close
+            t.low = close
+            t.volume = 50
+            return t
+
+        t_wrong = _make_tick("TMF_FAR", 47237)  # mismatched
+        sim.process_tick(t_wrong)
+
+        # Order should NOT have filled
+        assert near.status == OrderStatus.SUBMITTED, \
+            f"order should remain SUBMITTED with mismatched symbol, got {near.status}"
+
+    def test_pending_count_zero_skips_polling(self, mgr):
+        """_process_pending_paper_fills returns early when no pending orders."""
+        order_mgr, sim = mgr
+        assert sim.get_pending_count() == 0
+        # No crash expected
+        sim.process_tick(None)
+
+    def test_mkp_oco_first_fill_cancels_sibling_during_polling(self, mgr):
+        """Acceptance: first MKP fill cancels sibling synchronously via OCO callback.
+
+        Simulates the production flow where _wire_order_callbacks →
+        _check_oco_release_fill cancels the sibling on first fill.
+        After cancel, the sibling is removed from the simulator and
+        will NOT fill on a subsequent tick.
+        """
+        order_mgr, sim = mgr
+
+        near = order_mgr.create_order("TMF_NEAR", OrderSide.SELL, OrderType.MKP, 1,
+                                       strategy="MTS_RELEASE_OCO")
+        far = order_mgr.create_order("TMF_FAR", OrderSide.BUY, OrderType.MKP, 1,
+                                      strategy="MTS_RELEASE_OCO")
+        order_mgr.submit(near, exchange_ordno="PAPER-ORD-000003")
+        order_mgr.submit(far, exchange_ordno="PAPER-ORD-000004")
+        sim.register(near)
+        sim.register(far)
+        assert sim.get_pending_count() == 2
+
+        # Wire OCO callback: first fill cancels sibling
+        filled_ids = []
+
+        def _oco_callback(event):
+            filled_ids.append(event.order_id)
+            if event.order_id == near.order_id:
+                order_mgr.cancel(far.order_id, reason="oco_sibling_cancel", source="oco_bracket")
+            elif event.order_id == far.order_id:
+                order_mgr.cancel(near.order_id, reason="oco_sibling_cancel", source="oco_bracket")
+
+        order_mgr.register_callback("on_fill", _oco_callback)
+
+        # --- Poll 1: near tick arrives first ---
+        def _make_tick(code, close):
+            t = type("Tick", (), {})()
+            t.code = code
+            t.datetime = datetime.now()
+            t.close = close
+            t.open = close
+            t.high = close
+            t.low = close
+            t.volume = 50
+            return t
+
+        sim.process_tick(_make_tick("TMF_NEAR", 47237))
+
+        # Near should be FILLED, far should be CANCELLED
+        assert near.status == OrderStatus.FILLED, \
+            f"near should be FILLED, got {near.status}"
+        assert far.status == OrderStatus.CANCELLED, \
+            f"far should be CANCELLED by OCO, got {far.status}"
+        assert len(filled_ids) == 1, \
+            f"exactly one fill event expected, got {len(filled_ids)}: {filled_ids}"
+        assert filled_ids[0] == near.order_id, \
+            f"near should fill first, got {filled_ids[0]}"
+        assert sim.get_pending_count() == 0, \
+            f"both should be cleared from pending, got {sim.get_pending_count()}"
+
+        # --- Poll 2: far tick arrives (should be no-op) ---
+        sim.process_tick(_make_tick("TMF_FAR", 47473))
+
+        # No additional fills — far was already cancelled
+        assert len(filled_ids) == 1, \
+            f"no second fill should occur after cancel, got {len(filled_ids)}"
+        assert far.status == OrderStatus.CANCELLED, \
+            f"far should stay CANCELLED, got {far.status}"
+        assert sim.get_pending_count() == 0

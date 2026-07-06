@@ -2573,6 +2573,41 @@ class FuturesMonitor:
         tick.volume = 0
         return tick
 
+    # ── Paper Fill Polling (ADR-010 OCO) ──
+
+    def _process_pending_paper_fills(self, near_price: float, far_price: float, ts) -> None:
+        """Poll paper fill simulator with live near/far prices during MTS tick.
+        
+        ADR-010 OCO release bracket orders are registered with paper_fill_sim
+        at submission time. Without ongoing polling, they become orphaned and
+        never fill even when the market moves past their levels.
+        
+        Called from _mts_tick() on every poll cycle with real-time prices.
+        """
+        if not self.paper_fill_sim or self.paper_fill_sim.get_pending_count() == 0:
+            return
+
+        _near_symbol = self.contract.code if self.contract else f"{self.ticker}_NEAR"
+        _far_symbol = self.far_contract.code if self.far_contract else f"{self.ticker}_FAR"
+
+        ticks = [
+            self._make_synthetic_tick(near_price, ts, symbol=_near_symbol),
+            self._make_synthetic_tick(far_price, ts, symbol=_far_symbol),
+        ]
+
+        for tick in ticks:
+            try:
+                self.paper_fill_sim.process_tick(tick)
+            except Exception as exc:
+                import logging
+                _log = logging.getLogger("FuturesMonitor")
+                _log.exception("[MTS][PAPER_FILL] process_tick failed for symbol=%s: %s",
+                               getattr(tick, "code", "?"), exc)
+                console.print(
+                    f"[red]⚠️ [PAPER_FILL_ERR] tick={getattr(tick, 'code', '?')} "
+                    f"close={getattr(tick, 'close', 0)} err={exc}[/red]"
+                )
+
     # ── Margin check ──
     def _margin_sufficient(self):
         """Check if account has enough margin before placing entry order."""
@@ -4289,7 +4324,15 @@ class FuturesMonitor:
             if _spread_std > 0:
                 _rt_spread = _bar_dict["near_close"] - _bar_dict["far_close"]
                 _bar_dict["spread_z"] = (_rt_spread - _spread_ma) / _spread_std
-                
+
+        # ── [ADR-010] Poll paper OCO fills with live near/far prices ──
+        _n_close = float(_bar_dict.get("near_close") or 0)
+        _f_close = float(_bar_dict.get("far_close") or 0)
+        if _n_close > 0 and _f_close > 0:
+            self._process_pending_paper_fills(
+                near_price=_n_close, far_price=_f_close, ts=datetime.now(),
+            )
+
         # 3. Strategy setup
         strategy = self._registry.get(_strat_name)
         if strategy is None:
@@ -5222,13 +5265,22 @@ class FuturesMonitor:
                             # Paper mode: register OCO orders for immediate fill simulation
                             if self.paper_fill_sim:
                                 from core.order_management.order import OrderType
+                                # [Fix 2026-07-06] Fail-fast: never silently fallback to 0
+                                _near_fill = float(data.get("near_fill_price") or 0)
+                                _far_fill = float(data.get("far_fill_price") or 0)
+                                if _near_fill <= 0 or _far_fill <= 0:
+                                    raise ValueError(
+                                        f"Invalid release synthetic fill price: "
+                                        f"near={_near_fill}, far={_far_fill} "
+                                        f"(data keys: {sorted(data.keys())})"
+                                    )
                                 _near_order = self.order_mgr.active_orders.get(_near_oid)
                                 _far_order = self.order_mgr.active_orders.get(_far_oid)
                                 if _near_order:
                                     self.paper_fill_sim.register(_near_order)
                                     self.paper_fill_sim.process_tick(
                                         self._make_synthetic_tick(
-                                            data.get("near_fill_price", 0), datetime.now(),
+                                            _near_fill, datetime.now(),
                                             symbol=self.contract.code if self.contract else f"{self.ticker}_NEAR",
                                         )
                                     )
@@ -5236,7 +5288,7 @@ class FuturesMonitor:
                                     self.paper_fill_sim.register(_far_order)
                                     self.paper_fill_sim.process_tick(
                                         self._make_synthetic_tick(
-                                            data.get("far_fill_price", 0), datetime.now(),
+                                            _far_fill, datetime.now(),
                                             symbol=self.far_contract.code if self.far_contract else f"{self.ticker}_FAR",
                                         )
                                     )
