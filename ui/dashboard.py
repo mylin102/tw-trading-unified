@@ -2672,6 +2672,77 @@ elif page == f"期貨 {_TICKER}":
                         st.success("✅ MTS 紀錄已清空")
                 st.rerun()
 
+        # ── MTS Account Settings ──
+        with st.expander("⚙️ MTS 帳戶設定", expanded=False):
+            _state_file = "/tmp/mts_position_state.json"
+            _current_init = 100000
+            if os.path.exists(_state_file):
+                try:
+                    with open(_state_file) as _f:
+                        _sd = json.load(_f)
+                    _current_init = int(_sd.get("initial_balance", 100000))
+                except: pass
+
+            _col_a, _col_b = st.columns([2, 1])
+            with _col_a:
+                _new_bal = st.number_input(
+                    "初始資金 (TWD)", value=_current_init,
+                    min_value=10000, max_value=10000000, step=10000,
+                    key="mts_init_balance_input",
+                    help="修改後會寫入 state file，下次 dashboard 重整即生效。重啟系統後會恢復 config/futures.yaml 設定值。"
+                )
+            with _col_b:
+                st.write("")  # spacer
+                if st.button("💾 儲存", key="mts_save_init_bal", width='stretch'):
+                    _updated = False
+                    if os.path.exists(_state_file):
+                        try:
+                            with open(_state_file, "r") as _f:
+                                _sd = json.load(_f)
+                            _sd["initial_balance"] = int(_new_bal)
+                            with open(_state_file, "w") as _f:
+                                json.dump(_sd, _f, default=str)
+                            _updated = True
+                        except Exception as _e:
+                            st.error(f"儲存失敗: {_e}")
+                    else:
+                        _sd = {"initial_balance": int(_new_bal)}
+                        try:
+                            with open(_state_file, "w") as _f:
+                                json.dump(_sd, _f, default=str)
+                            _updated = True
+                        except Exception as _e:
+                            st.error(f"儲存失敗: {_e}")
+                    if _updated:
+                        st.success(f"✅ 初始資金已更新為 {int(_new_bal):,} 元")
+                        st.rerun()
+                if st.button("🔄 重置", key="mts_reset_init_bal", width='stretch',
+                             help=f"重置為 config/futures.yaml 預設值"):
+                    from pathlib import Path
+                    import yaml
+                    _cfg_path = Path(__file__).parent.parent / "config" / "futures.yaml"
+                    _default = 100000
+                    try:
+                        with open(_cfg_path) as _f:
+                            _cfg = yaml.safe_load(_f)
+                        _default = int(_cfg.get("execution", {}).get("initial_balance", 100000))
+                    except: pass
+                    if os.path.exists(_state_file):
+                        try:
+                            with open(_state_file, "r") as _f:
+                                _sd = json.load(_f)
+                            _sd["initial_balance"] = _default
+                            with open(_state_file, "w") as _f:
+                                json.dump(_sd, _f, default=str)
+                        except: pass
+                    else:
+                        try:
+                            with open(_state_file, "w") as _f:
+                                json.dump({"initial_balance": _default}, _f, default=str)
+                        except: pass
+                    st.success(f"✅ 已重置為 {_default:,} 元")
+                    st.rerun()
+
         # 2026-05-22 Gemini CLI: Add MTS manual trade status banner
         _mts_state_file = "/tmp/mts_position_state.json"
         if os.path.exists(_mts_state_file):
