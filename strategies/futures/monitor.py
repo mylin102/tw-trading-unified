@@ -1961,17 +1961,9 @@ class FuturesMonitor:
                         _release_side_near = "sell" if _side_value(_near_side) == "LONG" else "buy"
                         _release_side_far = "sell" if _side_value(_far_side) == "LONG" else "buy"
 
-                        # Compute reference release price from entry ± ATR-based release_stop
-                        _near_entry = getattr(_strat, "_near_entry", 0) or 0
-                        _far_entry = getattr(_strat, "_far_entry", 0) or 0
-                        _entry_risk = getattr(_rg, "entry_risk", None)
-                        _release_stop_pts = getattr(_entry_risk, "release_stop", 0) if _entry_risk else 0
-                        _ref_price_near = round(_near_entry - _release_stop_pts, 1) if _release_side_near == "sell" else round(_near_entry + _release_stop_pts, 1)
-                        _ref_price_far = round(_far_entry + _release_stop_pts, 1) if _release_side_far == "buy" else round(_far_entry - _release_stop_pts, 1)
-
-                        for _label, _oid, _side, _ref_price in [
-                            ("NEAR", _rg.near_order_id, _release_side_near, _ref_price_near),
-                            ("FAR", _rg.far_order_id, _release_side_far, _ref_price_far),
+                        for _label, _oid, _side in [
+                            ("NEAR", _rg.near_order_id, _release_side_near),
+                            ("FAR", _rg.far_order_id, _release_side_far),
                         ]:
                             if _oid and not any(d.get("order_id") == _oid for d in export_data):
                                 export_data.append({
@@ -1981,7 +1973,7 @@ class FuturesMonitor:
                                     "order_type": "MKP",
                                     "quantity": 1,
                                     "filled_quantity": 0,
-                                "price": _ref_price if _ref_price > 0 else 0,
+                                "price": 0,
                                 "avg_fill_price": 0,
                                 "status": "submitted",
                                 "strategy": "MTS_RELEASE_OCO",
