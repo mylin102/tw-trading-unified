@@ -4442,6 +4442,14 @@ class FuturesMonitor:
                     f"[bold green]✅ [OCO_4C] CANCELING_SIBLING → SIBLING_CANCELED → SINGLE_LEG/{_released} → trail ARMED[/bold green]"
                 )
 
+        # [Fix 2026-07-06] One-shot flush of release orders to orders JSON.
+        # After PM2 restart, lifecycle is restored with SUBMITTED release_group
+        # but the order manager has no record of those orders. Without this,
+        # _save_orders_file_wrapper() would only fire on the next order event.
+        if getattr(self, "_mts_orders_flushed", False) is False:
+            self._save_orders_file_wrapper()
+            self._mts_orders_flushed = True
+
         signal = strategy.on_bar(ctx)
         if signal:
             self._submit_mts_order_signal(signal, strategy, _bar_dict, datetime.now())
