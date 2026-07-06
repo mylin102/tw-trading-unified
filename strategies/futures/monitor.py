@@ -3058,6 +3058,15 @@ class FuturesMonitor:
             _side = OrderSide.SELL if _remaining_side == "LONG" else OrderSide.BUY
             
             if _remaining_side:
+                # [ADR-010 Guard] Block legacy MTS_EXIT when OCO bracket is active.
+                # Legacy exit path and ADR-010 OCO exit would create duplicate orders.
+                _lc = getattr(strategy, "_lifecycle_oca", None)
+                if _lc is not None:
+                    _phase = getattr(getattr(_lc, "phase", None), "value", None)
+                    _rg_status = getattr(getattr(getattr(_lc, "release_group", None), "status", None), "value", None)
+                    if _phase == "SPREAD" and _rg_status in ("SUBMITTED", "SUBMITTING", "PARTIALLY_FILLED", "CANCELING_SIBLING"):
+                        console.print(f"[yellow]⚠️ [ADR-010_GUARD] Blocked legacy EXIT — OCO bracket active ({_rg_status})[/yellow]")
+                        return
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting EXIT for {_leg_label}: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
                 _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_EXIT")
