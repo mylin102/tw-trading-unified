@@ -2076,6 +2076,77 @@ class FuturesMonitor:
         if hasattr(self, "_mts_stale_order_cancels"):
             self._mts_stale_order_cancels.discard(order_id)
 
+    def _check_oco_release_fill(self, event):
+        """ADR-010 Sprint 4A: detect OCO release fill before pending_lifecycle_orders check.
+
+        Matches event.order_id against strategy release_group near/far order ids.
+        On match: mark PARTIALLY_FILLED, cancel sibling, transition to CANCELING_SIBLING.
+        """
+        from strategies.plugins.futures.active.tmf_spread import (
+            ReleaseGroupStatus, CancelStatus, PositionPhase, TrailGroupStatus,
+            Leg, _write_mts_state, lifecycle_to_dict,
+        )
+        _strategy = self._registry.get("tmf_spread")
+        if not _strategy or not hasattr(_strategy, "_lifecycle_oca"):
+            return
+        _rg = _strategy._lifecycle_oca.release_group
+        if _rg.status not in (ReleaseGroupStatus.SUBMITTED,):
+            return
+        _oid = event.order_id
+        if _oid == _rg.near_order_id:
+            _winner = "near"
+            _sibling_oid = _rg.far_order_id
+        elif _oid == _rg.far_order_id:
+            _winner = "far"
+            _sibling_oid = _rg.near_order_id
+        else:
+            return  # not an OCO release fill
+
+        # Dedup by deal_id
+        _deal_key = event.deal_id or f"oco:{_oid}:{event.fill_qty}:{event.fill_price}"
+        if _deal_key in self._applied_lifecycle_deals:
+            return
+        self._applied_lifecycle_deals[_deal_key] = datetime.now().isoformat()
+
+        price = float(event.fill_price or 0)
+        # Mark PARTIALLY_FILLED
+        _rg.status = ReleaseGroupStatus.PARTIALLY_FILLED
+        _rg.filled_leg = Leg.NEAR if _winner == "near" else Leg.FAR
+        _rg.filled_order_id = _oid
+        _rg.canceled_leg = Leg.FAR if _winner == "near" else Leg.NEAR
+        _rem_price = float(self.market_data.get(f"{self.ticker}_{_rg.canceled_leg.name}", {}).get("close") or 0.0)
+        # Cancel sibling
+        if self.order_mgr:
+            try:
+                self.order_mgr.cancel(_sibling_oid, reason=f"oco_winner_{_winner}", source="oco_bracket")
+                _rg.sibling_cancel_order_id = _sibling_oid
+                _rg.sibling_cancel_status = CancelStatus.CONFIRMED  # paper mode: sync confirm
+                _rg.status = ReleaseGroupStatus.SIBLING_CANCELED
+                _strategy._lifecycle_oca.phase = PositionPhase.SINGLE_LEG
+                _strategy._lifecycle_oca.trail_group.status = TrailGroupStatus.ARMED
+                _strategy.sync_release(leg=_winner, price=_rem_price, release_price=price)
+                console.print(
+                    f"[bold green]✅ [OCO_FILL] Winner={_winner} order={_oid} "
+                    f"sibling_canceled={_sibling_oid}[/bold green]"
+                )
+            except (ValueError, RuntimeError) as _e:
+                _rg.sibling_cancel_status = CancelStatus.REJECTED
+                _rg.status = ReleaseGroupStatus.FAILED
+                console.print(f"[red]⚠️ [OCO_FILL] {_winner} filled but sibling cancel failed: {_e}[/red]")
+
+        from strategies.plugins.futures.active.tmf_spread import _write_mts_state, lifecycle_to_dict
+        _write_mts_state(
+            has_position=True, action=f"OCO_{_winner.upper()}_FILLED",
+            reason=f"oco_{_winner}_filled",
+            near_entry=_strategy._near_entry, far_entry=_strategy._far_entry,
+            near_last=price if _winner == "near" else _rem_price,
+            far_last=price if _winner == "far" else _rem_price,
+            near_side=_strategy._near_side, far_side=_strategy._far_side,
+            released_leg=_winner, trade_id=_strategy._trade_id,
+            ticker=self.ticker, atr=float(getattr(_strategy, "_last_atr", 0.0) or 0.0),
+            lifecycle=lifecycle_to_dict(_strategy._lifecycle_oca),
+        )
+
     def _apply_confirmed_futures_deal(self, event):
         from core.order_management.order import OrderStatus
         from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
@@ -2088,6 +2159,9 @@ class FuturesMonitor:
         pending = self._pending_lifecycle_orders.get(event.order_id)
         # 2026-06-22 Gemini CLI: Use fill_qty to match OrderEvent class definition
         if pending is None or event.fill_qty <= 0:
+            # ADR-010 Sprint 4A: check if this fill matches OCO bracket order
+            if pending is None and event.fill_qty > 0:
+                self._check_oco_release_fill(event)
             return None
 
         deal_key = event.deal_id or f"{event.order_id}:{event.fill_qty}:{event.fill_price}"
