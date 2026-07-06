@@ -1941,6 +1941,31 @@ class FuturesMonitor:
 
                 export_data.append(d)
 
+            # [Fix 2026-07-06] Include release OCO orders from lifecycle state.
+            # The order manager is reset on PM2 restart, but release_group persists
+            # in the state file. Without this, release orders are invisible until
+            # the next order_mgr event (fill/cancel) triggers a flush.
+            _strat = self._registry.get("tmf_spread")
+            if _strat and hasattr(_strat, "_lifecycle_oca"):
+                _rg = _strat._lifecycle_oca.release_group
+                if hasattr(_rg, 'status') and getattr(_rg.status, 'value', '') in ("SUBMITTED", "SUBMITTING"):
+                    for _label, _oid in [("NEAR", _rg.near_order_id), ("FAR", _rg.far_order_id)]:
+                        if _oid and not any(d.get("order_id") == _oid for d in export_data):
+                            export_data.append({
+                                "order_id": _oid,
+                                "symbol": f"{self.ticker}_{_label}",
+                                "side": "sell",
+                                "order_type": "MKP",
+                                "quantity": 1,
+                                "filled_quantity": 0,
+                                "price": 0,
+                                "avg_fill_price": 0,
+                                "status": "submitted",
+                                "strategy": "MTS_RELEASE_OCO",
+                                "created_at": datetime.now().isoformat(),
+                                "current_price": cur_price if cur_price > 0 else None,
+                            })
+
             today = datetime.now().strftime("%Y%m%d")
             orders_file = Path(f"exports/trades/TMF_{today}_orders.json")
             orders_file.parent.mkdir(parents=True, exist_ok=True)
