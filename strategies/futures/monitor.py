@@ -2077,14 +2077,16 @@ class FuturesMonitor:
             self._mts_stale_order_cancels.discard(order_id)
 
     def _check_oco_release_fill(self, event):
-        """ADR-010 Sprint 4A: detect OCO release fill before pending_lifecycle_orders check.
+        """ADR-010 Sprint 4A: detect OCO release fill — PARTIALLY_FILLED only.
 
         Matches event.order_id against strategy release_group near/far order ids.
-        On match: mark PARTIALLY_FILLED, cancel sibling, transition to CANCELING_SIBLING.
+        On match: mark PARTIALLY_FILLED without cancel sibling or trail activation.
+        Sibling cancel and SINGLE_LEG transition handled in Sprint 4B/4C.
+
+        Invariant: PARTIALLY_FILLED → trail_group.status must NOT be ARMED.
         """
         from strategies.plugins.futures.active.tmf_spread import (
-            ReleaseGroupStatus, CancelStatus, PositionPhase, TrailGroupStatus,
-            Leg, _write_mts_state, lifecycle_to_dict,
+            ReleaseGroupStatus, Leg, TrailGroupStatus, _write_mts_state, lifecycle_to_dict,
         )
         _strategy = self._registry.get("tmf_spread")
         if not _strategy or not hasattr(_strategy, "_lifecycle_oca"):
@@ -2095,10 +2097,8 @@ class FuturesMonitor:
         _oid = event.order_id
         if _oid == _rg.near_order_id:
             _winner = "near"
-            _sibling_oid = _rg.far_order_id
         elif _oid == _rg.far_order_id:
             _winner = "far"
-            _sibling_oid = _rg.near_order_id
         else:
             return  # not an OCO release fill
 
@@ -2109,38 +2109,27 @@ class FuturesMonitor:
         self._applied_lifecycle_deals[_deal_key] = datetime.now().isoformat()
 
         price = float(event.fill_price or 0)
-        # Mark PARTIALLY_FILLED
+        # PARTIALLY_FILLED — no cancel, no SINGLE_LEG, no trail
         _rg.status = ReleaseGroupStatus.PARTIALLY_FILLED
         _rg.filled_leg = Leg.NEAR if _winner == "near" else Leg.FAR
         _rg.filled_order_id = _oid
         _rg.canceled_leg = Leg.FAR if _winner == "near" else Leg.NEAR
-        _rem_price = float(self.market_data.get(f"{self.ticker}_{_rg.canceled_leg.name}", {}).get("close") or 0.0)
-        # Cancel sibling
-        if self.order_mgr:
-            try:
-                self.order_mgr.cancel(_sibling_oid, reason=f"oco_winner_{_winner}", source="oco_bracket")
-                _rg.sibling_cancel_order_id = _sibling_oid
-                _rg.sibling_cancel_status = CancelStatus.CONFIRMED  # paper mode: sync confirm
-                _rg.status = ReleaseGroupStatus.SIBLING_CANCELED
-                _strategy._lifecycle_oca.phase = PositionPhase.SINGLE_LEG
-                _strategy._lifecycle_oca.trail_group.status = TrailGroupStatus.ARMED
-                _strategy.sync_release(leg=_winner, price=_rem_price, release_price=price)
-                console.print(
-                    f"[bold green]✅ [OCO_FILL] Winner={_winner} order={_oid} "
-                    f"sibling_canceled={_sibling_oid}[/bold green]"
-                )
-            except (ValueError, RuntimeError) as _e:
-                _rg.sibling_cancel_status = CancelStatus.REJECTED
-                _rg.status = ReleaseGroupStatus.FAILED
-                console.print(f"[red]⚠️ [OCO_FILL] {_winner} filled but sibling cancel failed: {_e}[/red]")
 
-        from strategies.plugins.futures.active.tmf_spread import _write_mts_state, lifecycle_to_dict
+        # Invariant: trail must NOT be active in PARTIALLY_FILLED
+        _strategy._lifecycle_oca.trail_group.status = TrailGroupStatus.INACTIVE
+
+        # Log but do NOT transition to SINGLE_LEG yet
+        console.print(
+            f"[bold yellow]🟡 [OCO_4A] PARTIALLY_FILLED winner={_winner} order={_oid} "
+            f"sibling={_rg.canceled_leg.value} — cancel deferred to 4B[/bold yellow]"
+        )
+
         _write_mts_state(
-            has_position=True, action=f"OCO_{_winner.upper()}_FILLED",
-            reason=f"oco_{_winner}_filled",
+            has_position=True, action=f"OCO_{_winner.upper()}_PARTIAL",
+            reason=f"oco_{_winner}_partially_filled",
             near_entry=_strategy._near_entry, far_entry=_strategy._far_entry,
-            near_last=price if _winner == "near" else _rem_price,
-            far_last=price if _winner == "far" else _rem_price,
+            near_last=price if _winner == "near" else float(self.market_data.get(f"{self.ticker}_NEAR", {}).get("close") or 0),
+            far_last=price if _winner == "far" else float(self.market_data.get(f"{self.ticker}_FAR", {}).get("close") or 0),
             near_side=_strategy._near_side, far_side=_strategy._far_side,
             released_leg=_winner, trade_id=_strategy._trade_id,
             ticker=self.ticker, atr=float(getattr(_strategy, "_last_atr", 0.0) or 0.0),
