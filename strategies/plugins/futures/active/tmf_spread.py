@@ -1242,7 +1242,21 @@ class TMFSpread(StrategyBase):
                                 self._side = _rem_side
                                 self._peak = _peak
                                 self._nadir = _nadir
-                                
+
+                                # ── ADR-009 Task 6: Restart Reconciliation ──
+                                # 2026-07-06 Hermes Agent: restore lifecycle from state file
+                                lifecycle_block = state.get("lifecycle")
+                                if lifecycle_block:
+                                    try:
+                                        self._lifecycle_oca = lifecycle_from_dict(lifecycle_block)
+                                    except Exception:
+                                        self._lifecycle_oca = infer_lifecycle_from_legacy_state(state)
+                                else:
+                                    self._lifecycle_oca = infer_lifecycle_from_legacy_state(state)
+                                # Invariant guard: FLAT phase must not overlay active position
+                                if self._lifecycle_oca.phase == PositionPhase.FLAT:
+                                    self._lifecycle_oca = infer_lifecycle_from_legacy_state(state)
+
                                 # 💡 [Fixed 2026-05-27] Robust trade_id recovery
                                 self._trade_id = state.get("trade_id") or state.get("manual_order_id")
                                 if not self._trade_id:
@@ -1325,10 +1339,21 @@ class TMFSpread(StrategyBase):
                                 self._peak = float(release_f["price"]) if self._side == "LONG" else 0.0
                                 self._nadir = float(release_f["price"]) if self._side == "SHORT" else 0.0
                                 self._lifecycle = f"TRAILING_{self._side}"
+                                # ADR-009 Task 6: sync lifecycle from fill-log reconstruction
+                                self._lifecycle_oca = infer_lifecycle_from_legacy_state({
+                                    "has_position": True,
+                                    "released_leg": self._released_leg,
+                                    "release_state": "NEAR_RELEASED" if self._released_leg else "BOTH_HELD",
+                                })
                             else:
                                 self._lifecycle = "OPEN"
                                 self._peak = self._near_entry
                                 self._nadir = self._far_entry
+                                # ADR-009 Task 6: sync lifecycle from fill-log reconstruction
+                                self._lifecycle_oca = infer_lifecycle_from_legacy_state({
+                                    "has_position": True,
+                                    "release_state": "BOTH_HELD",
+                                })
                                 
                             logger.info("[MTS_RESTORE_OK] source=LOG trade_id=%s lifecycle=%s age=%.1fh", 
                                         self._trade_id, self._lifecycle, _age_hrs)
