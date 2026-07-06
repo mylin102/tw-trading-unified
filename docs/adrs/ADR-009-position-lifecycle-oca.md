@@ -15,6 +15,20 @@ Accepted (2026-07-03)
 
 ## Context
 
+### Terminology: Release vs Broker-Level OCO
+
+In ADR-009, "release" means lifecycle-controlled deterministic single-leg release.
+The current implementation selects one leg to release and submits exactly one order
+for that leg. It does not implement broker-level OCO, where two competing orders
+are submitted and the broker cancels the sibling order after one side fills.
+
+Therefore, ReleaseGroup fields such as `filled_leg` and `canceled_leg` are lifecycle
+nomination / outcome records, not evidence of broker-level mutual-exclusion order
+handling.
+
+True broker-level OCO remains a future enhancement and is out of scope for ADR-009
+Phase 2.
+
 MTS spread exit logic currently suffers from:
 - Race conditions between release and trail triggering simultaneously
 - `_released_leg` desync between strategy instance and state file
