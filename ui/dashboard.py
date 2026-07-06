@@ -2628,14 +2628,48 @@ elif page == f"期貨 {_TICKER}":
                     st.rerun()
 
             if st.button("🗑️ MTS 清空紀錄", key="mts_clear_logs", type="secondary", width='stretch'):
-                _base = os.path.dirname(os.path.dirname(__file__))
-                for _f in ["/tmp/mts_position_state.json", "/tmp/futures_manual_trade.flag",
-                           os.path.join(_base, "logs/mts_spread_events.jsonl"),
-                           os.path.join(_base, "logs/mts_trade_fills.jsonl")]:
-                    if os.path.exists(_f):
-                        try: os.remove(_f)
-                        except: pass
-                st.success("✅ MTS 紀錄已清空")
+                # ── Safety guards: only allow when flat + idle ──
+                _state_file = "/tmp/mts_position_state.json"
+                _has_pos = False
+                _has_lifecycle = False
+                if os.path.exists(_state_file):
+                    try:
+                        with open(_state_file) as _sf:
+                            _sd = json.load(_sf)
+                        _has_pos = _sd.get("has_position", False) is True
+                        _lc = _sd.get("lifecycle", {})
+                        _rg = _lc.get("release_group", {}) if _lc else {}
+                        _has_lifecycle = _rg.get("status") not in (None, "INACTIVE")
+                    except: pass
+
+                if _has_pos:
+                    st.error("⛔ 無法清空：目前仍有持倉。請先使用「緊急全平倉」平倉後再試。")
+                elif _has_lifecycle:
+                    st.error("⛔ 無法清空：目前有 active OCO lifecycle。請等待訂單完成或使用「緊急全平倉」。")
+                else:
+                    _base = os.path.dirname(os.path.dirname(__file__))
+                    _archived = 0
+                    # Archive fill/event logs instead of deleting
+                    for _log_name in ["mts_trade_fills.jsonl", "mts_spread_events.jsonl"]:
+                        _log_path = os.path.join(_base, "logs", _log_name)
+                        if os.path.exists(_log_path) and os.path.getsize(_log_path) > 0:
+                            _ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                            _archive_dir = os.path.join(_base, "logs", "archive")
+                            os.makedirs(_archive_dir, exist_ok=True)
+                            _archive_path = os.path.join(_archive_dir, _log_name.replace(".jsonl", f"_{_ts_str}.jsonl"))
+                            try:
+                                os.rename(_log_path, _archive_path)
+                                _archived += 1
+                            except: pass
+                    # Clear state file via close_all flag (safe path)
+                    for _f in ["/tmp/mts_position_state.json", "/tmp/futures_manual_trade.flag"]:
+                        if os.path.exists(_f):
+                            try: os.remove(_f)
+                            except: pass
+                    if _archived > 0:
+                        st.success(f"✅ MTS 紀錄已歸檔（{_archived} 個檔案 → logs/archive/）")
+                    else:
+                        st.success("✅ MTS 紀錄已清空")
                 st.rerun()
 
         # 2026-05-22 Gemini CLI: Add MTS manual trade status banner
