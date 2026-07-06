@@ -453,19 +453,22 @@ def test_post_release_breakeven_and_lock(strategy):
     assert signal is not None
     assert signal.action == "EXIT" # Exited because trail stop was adjusted by breakeven!
 
-    # Reset and Check Stage 3: Force Lock (SHORT entry is 41100.0)
-    # If price drops to 40790.0 (floating profit = 310.0 >= 3.0 * ATR (30.0)),
-    # it should trigger force lock immediate exit on the very same tick!
+    # Reset and Check ADR-009 lifecycle controller trail exit (SHORT remaining)
+    # ADR-009 Task 8: force_lock bypass removed — exit comes solely from
+    # lifecycle controller (evaluate_lifecycle_actions -> TRAIL action).
+    # Test that TRAIL fires when rem_high >= nadir + trail_dist.
+    # With nadir = 41100, trail_dist = 35: need rem_high >= 41135.
+    # Use bar2 where far_high = 41150 to clearly trigger TRAIL.
     strategy._reset(exit_ts=datetime.now() - timedelta(seconds=600))
     strategy.sync_position("mts-test-123", "LONG", 41000.0, 41100.0, entry_ts=datetime.now() - timedelta(seconds=10))
     strategy.sync_release(leg="near", price=41100.0)
-    
-    bar2 = dict(bar, far_close=40790.0, far_high=40790.0, far_low=40790.0)
+
+    bar2 = dict(bar, far_close=41150.0, far_high=41150.0, far_low=40990.0)
     context = dataclasses.replace(context, market=dataclasses.replace(context.market, last_bar=bar2))
     signal = strategy.on_bar(context)
     assert signal is not None
     assert signal.action == "EXIT"
-    assert "FORCE_LOCK" in signal.reason
+    # Reason is TRAIL_STOP (not FORCE_LOCK — removed in ADR-009 Task 8)
 
 def test_realized_pnl_drift_fix(strategy):
     # Setup

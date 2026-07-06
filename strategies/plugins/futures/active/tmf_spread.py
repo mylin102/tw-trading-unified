@@ -1928,6 +1928,9 @@ class TMFSpread(StrategyBase):
             _trail_stop = self._nadir + trail_dist
 
         # Post-Release Stage 1: Breakeven Stop-loss Adjustment
+        # ADR-009 Task 8: breakeven floor retained for potential future lifecycle
+        # controller integration; exit trigger now comes solely from
+        # evaluate_lifecycle_actions().
         post_release = self._params.get("post_release", {})
         breakeven_atr_mult = post_release.get("breakeven_after_atr")
         effective_trail_stop = _trail_stop
@@ -1938,14 +1941,9 @@ class TMFSpread(StrategyBase):
                 else:
                     effective_trail_stop = min(effective_trail_stop, _rem_entry)
 
-        # Post-Release Stage 3: Force Lock
-
-        # Post-Release Stage 3: Force Lock
-        force_lock_mult = post_release.get("force_lock_after_atr")
-        force_lock_triggered = False
-        if force_lock_mult is not None and atr_val > 0:
-            if rem_floating_pnl >= float(force_lock_mult) * atr_val:
-                force_lock_triggered = True
+        # ── Post-Release Stage 3: Force Lock (removed in ADR-009 Task 8) ──
+        # Force_lock_triggered bypass removed: if force_lock is needed,
+        # add to LifecycleContext / evaluate_lifecycle_actions in a separate change.
 
         # Re-evaluate lifecycle after peak/nadir + breakeven adjustments
         if _decision is None:
@@ -1966,28 +1964,25 @@ class TMFSpread(StrategyBase):
             except Exception:
                 logger.exception("[LIFECYCLE_TRAIL_REEVAL_FAILED]")
 
-        # Check exit triggers (legacy fallback for breakeven/force_lock)
-        # TODO ADR-009 Task 5:
-        # breakeven/force_lock remain legacy-only until LifecycleContext supports
-        # breakeven_floor / force_lock_floor. Do not fold into peak/nadir.
-        if self._lifecycle_oca.phase not in (PositionPhase.SPREAD, PositionPhase.SINGLE_LEG):
-            # breakeven/force_lock only valid in SPREAD or SINGLE_LEG; FLAT is no-op
-            trail_triggered = False
-            exit_triggered = False
+        # ADR-009 Task 8: lifecycle controller is the sole exit decision source.
+        # Breakeven floor adjustment (effective_trail_stop) is retained as it only
+        # influences the trailing stop value; the exit trigger itself now comes from
+        # _decision (evaluate_lifecycle_actions -> TRAIL action) rather than a
+        # duplicate trail-stop comparison + separate force_lock check.
+        # Force_lock bypass removed: if force_lock is needed, add to LifecycleContext /
+        # evaluate_lifecycle_actions in a separate change.
+        if _decision is not None and _decision.action in (
+            LifecycleAction.TRAIL, LifecycleAction.STOPLOSS,
+            LifecycleAction.TIMEOUT, LifecycleAction.MANUAL,
+        ):
+            exit_triggered = True
+            exit_reason = _decision.action.value
         else:
-            trail_triggered = False
-            if self._side == "LONG":
-                if _rem_low <= effective_trail_stop:
-                    trail_triggered = True
-            else:
-                if _rem_high >= effective_trail_stop:
-                    trail_triggered = True
-
-            exit_triggered = trail_triggered or force_lock_triggered
-        exit_reason = "FORCE_LOCK" if force_lock_triggered else "TRAIL_STOP"
+            exit_triggered = False
+            exit_reason = "NONE"
 
         if exit_triggered:
-            exit_price = _rem_price if force_lock_triggered else (_rem_low if self._side == "LONG" else _rem_high)
+            exit_price = _rem_low if self._side == "LONG" else _rem_high
             _pnl_pts = (exit_price - _rem_entry) if self._side == "LONG" else (_rem_entry - exit_price)
             _turnover = (_rem_entry + exit_price) * _mult
             _cost = 20.0 + _turnover * 2e-5
