@@ -4938,6 +4938,62 @@ class FuturesMonitor:
                     far_side=data["far_label"],
                     spread_z=3.0, released_leg=None, trade_id=trade_id
                 )
+
+                # ADR-010 Sprint 3: submit release OCO bracket after entry confirmed
+                if self.order_mgr and hasattr(_mts_strat, "_lifecycle_oca"):
+                    from strategies.plugins.futures.active.tmf_spread import (
+                        EntryRiskSnapshot, lifecycle_to_dict,
+                        ReleaseGroupStatus, ReleaseGroup,
+                    )
+                    from core.order_management.order import OrderSide
+                    _lc = _mts_strat._lifecycle_oca
+                    if _lc.phase.value == "SPREAD" and _lc.release_group.status.value == "ARMED":
+                        _near_side_str = data.get("near_label", "")
+                        _far_side_str = data.get("far_label", "")
+                        _release_near_side = (
+                            OrderSide.SELL if _near_side_str == "LONG" else OrderSide.BUY
+                        )
+                        _release_far_side = (
+                            OrderSide.SELL if _far_side_str == "LONG" else OrderSide.BUY
+                        )
+                        try:
+                            _near_oid, _far_oid = self.order_mgr.submit_release_bracket(
+                                symbol_near=self.contract.code if self.contract else f"{self.ticker}_NEAR",
+                                symbol_far=self.far_contract.code if self.far_contract else f"{self.ticker}_FAR",
+                                quantity=1,
+                                side_near=_release_near_side,
+                                side_far=_release_far_side,
+                            )
+                            # Persist OCO state: order ids + SUBMITTED
+                            _lc.release_group.near_order_id = _near_oid
+                            _lc.release_group.far_order_id = _far_oid
+                            _lc.release_group.status = ReleaseGroupStatus.SUBMITTED
+                            _lc.release_group.entry_risk = EntryRiskSnapshot(
+                                atr=_mts_strat._last_atr or 0.0,
+                                release_stop=_mts_strat._release_stop_fixed,
+                                trail_stop=_mts_strat._trail_dist_fixed,
+                                entry_z=_mts_strat._entry_z,
+                                spread=data.get("spread_z", 0.0),
+                                timestamp=datetime.now().isoformat(),
+                            )
+                            _write_mts_state(
+                                has_position=True, action="RELEASE_OCO_SUBMITTED",
+                                reason="oco_bracket_submitted",
+                                near_entry=data["near_fill_price"],
+                                far_entry=data["far_fill_price"],
+                                near_last=data["near_fill_price"],
+                                far_last=data["far_fill_price"],
+                                near_side=data["near_label"],
+                                far_side=data["far_label"],
+                                spread_z=3.0, released_leg=None, trade_id=trade_id,
+                                lifecycle=lifecycle_to_dict(_lc),
+                            )
+                            console.print(
+                                f"[bold green]✅ [OCO_BRACKET] Submitted: NEAR={_near_oid} FAR={_far_oid}[/bold green]"
+                            )
+                        except RuntimeError as _e:
+                            console.print(f"[red]⚠️ [OCO_BRACKET] Submit failed: {_e}[/red]")
+                            # DSLR fallback: lifecycle stays ARMED, controller handles release normally
         except Exception as e:
             console.print(f"[red]⚠️ [MANUAL_TRADE] Post-fill strategy sync failed: {e}[/red]")
 
