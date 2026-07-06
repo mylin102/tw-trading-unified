@@ -5150,6 +5150,8 @@ class FuturesMonitor:
                             console.print(
                                 f"[bold green]✅ [OCO_BRACKET] Submitted: NEAR={_near_oid} FAR={_far_oid}[/bold green]"
                             )
+                            # [Fix 2026-07-06] Flush release orders to orders JSON for dashboard visibility
+                            self._save_orders_file_wrapper()
                         except RuntimeError as _e:
                             console.print(f"[red]⚠️ [OCO_BRACKET] Submit failed: {_e}[/red]")
                             # DSLR fallback: lifecycle stays ARMED, controller handles release normally
