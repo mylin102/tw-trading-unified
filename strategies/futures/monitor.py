@@ -2712,6 +2712,15 @@ class FuturesMonitor:
         Called from _mts_tick() on every poll cycle with real-time prices.
         """
         if not self.paper_fill_sim or self.paper_fill_sim.get_pending_count() == 0:
+            # [DEBUG 2026-07-07] Diagnose why OCO orders aren't filling
+            _pc = self.paper_fill_sim.get_pending_count() if self.paper_fill_sim else -1
+            if _pc == 0:
+                import logging
+                _log = logging.getLogger("FuturesMonitor")
+                _log.info(
+                    "[MTS][PAPER_FILL_DEBUG] pending_count=0 near=%.1f far=%.1f",
+                    near_price, far_price,
+                )
             return
 
         _near_symbol = self.contract.code if self.contract else f"{self.ticker}_NEAR"
