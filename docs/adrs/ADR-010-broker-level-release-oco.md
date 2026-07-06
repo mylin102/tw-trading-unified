@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (2026-07-06)
+Implements ADR-010. All sprints 1-6B complete. (2026-07-06)
 
 ## Context
 
@@ -97,12 +97,12 @@ class EntryRiskSnapshot:
 
 ### Acceptance Criteria (Phase 0)
 
-- [ ] ReleaseGroupStatus expanded with SUBMITTING, PARTIALLY_FILLED, CANCELING_SIBLING, SIBLING_CANCELED
-- [ ] ReleaseGroup has sibling_cancel_order_id, sibling_cancel_status, entry_risk fields
-- [ ] CancelStatus enum defined (PENDING, CONFIRMED, REJECTED)
-- [ ] EntryRiskSnapshot dataclass defined with serialization
-- [ ] All existing ADR-009 tests unchanged
-- [ ] Serialization roundtrip: ReleaseGroup → dict → JSON → dict → ReleaseGroup
+- [x] ReleaseGroupStatus expanded with SUBMITTING, PARTIALLY_FILLED, CANCELING_SIBLING, SIBLING_CANCELED
+- [x] ReleaseGroup has sibling_cancel_order_id, sibling_cancel_status, entry_risk fields
+- [x] CancelStatus enum defined (PENDING, CONFIRMED, REJECTED)
+- [x] EntryRiskSnapshot dataclass defined with serialization
+- [x] All existing ADR-009 tests unchanged
+- [x] Serialization roundtrip: ReleaseGroup → dict → JSON → dict → ReleaseGroup
 
 ### Out of Scope (Phase 0)
 
