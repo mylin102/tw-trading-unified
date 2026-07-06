@@ -2732,7 +2732,15 @@ class FuturesMonitor:
         ]
 
         for tick in ticks:
-            _before = self.paper_fill_sim.get_pending_count()
+            # [ADR-010] Pre-tick guard: don't feed second tick if OCO already resolved
+            _rg = None
+            _strat = self._registry.get("tmf_spread") if hasattr(self, "_registry") else None
+            if _strat and hasattr(_strat, "_lifecycle_oca"):
+                _rg = _strat._lifecycle_oca.release_group
+            if _rg is not None and getattr(_rg, "filled_leg", None) is not None:
+                console.print("[dim][PAPER_FILL] OCO already filled — skipping remaining ticks[/dim]")
+                break
+
             try:
                 self.paper_fill_sim.process_tick(tick)
             except Exception as exc:
@@ -2744,11 +2752,10 @@ class FuturesMonitor:
                     f"[red]⚠️ [PAPER_FILL_ERR] tick={getattr(tick, 'code', '?')} "
                     f"close={getattr(tick, 'close', 0)} err={exc}[/red]"
                 )
-            # [ADR-010] After first tick fills, OCO callback may have cancelled sibling.
-            # Break early to prevent second tick from filling the cancelled sibling.
-            _after = self.paper_fill_sim.get_pending_count()
-            if _after < _before:
-                console.print("[dim][PAPER_FILL] OCO sibling cancelled — breaking poll loop[/dim]")
+            # [ADR-010] Post-tick guard: break if OCO filled_leg is now set
+            # (more reliable than pending_count which may not drop if callback hasn't run)
+            if _rg is not None and getattr(_rg, "filled_leg", None) is not None:
+                console.print("[dim][PAPER_FILL] OCO filled_leg set — breaking poll loop[/dim]")
                 break
 
     # ── Margin check ──
@@ -5461,6 +5468,8 @@ class FuturesMonitor:
                                     )
                                 _near_order = self.order_mgr.active_orders.get(_near_oid)
                                 _far_order = self.order_mgr.active_orders.get(_far_oid)
+                                # [ADR-010] Pre-fill guard: check lifecycle before each synthetic tick
+                                _rg_sub = _lc.release_group
                                 if _near_order:
                                     self.paper_fill_sim.register(_near_order)
                                     self.paper_fill_sim.process_tick(
@@ -5469,7 +5478,10 @@ class FuturesMonitor:
                                             symbol=self.contract.code if self.contract else f"{self.ticker}_NEAR",
                                         )
                                     )
-                                if _far_order:
+                                # [ADR-010] Don't feed far tick if near fill already resolved OCO
+                                if getattr(_rg_sub, "filled_leg", None) is not None:
+                                    console.print("[dim][PAPER_FILL] OCO filled after near tick — skipping far tick[/dim]")
+                                elif _far_order:
                                     self.paper_fill_sim.register(_far_order)
                                     self.paper_fill_sim.process_tick(
                                         self._make_synthetic_tick(
