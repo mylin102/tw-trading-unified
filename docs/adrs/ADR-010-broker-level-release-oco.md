@@ -122,3 +122,50 @@ Negative:
 - Larger state file (new fields in release_group)
 - Backward compat: old state files without OCO fields → None defaults (safe)
 - More complex restart logic (Phase 1+)
+
+## Lessons Learned: Paper Execution Engine Pump Gap (2026-07-06)
+
+### Root Cause
+
+ORD-000003/ORD-000004 were orphaned in `paper_fill_sim._pending_orders` despite
+correct lifecycle state transitions. The OCO state machine correctly handled
+fill events (SUBMITTED → PARTIALLY_FILLED → CANCELING_SIBLING), but **no fill
+events were ever generated** because nobody called `process_tick()` after the
+initial submission-time synthetic tick.
+
+### The 4-Layer Checklist
+
+Future OCO / order lifecycle reviews must verify ALL four layers, not just the
+state machine:
+
+| Layer | Check | Verified By |
+|-------|-------|-------------|
+| 1. Registration | Order enters pending queue (status=SUBMITTED) | Unit test: `sim.register(order)` |
+| 2. Pump | Tick loop calls `process_tick()` with live prices | Integration test: `_mts_tick()` → `_process_pending_paper_fills()` |
+| 3. Callback | Fill triggers `on_fill` → lifecycle transition | Acceptance test: fill event → `_check_oco_release_fill` |
+| 4. Persistence | Transition written to state file | State file assertion: `release_group.status` after fill |
+
+Prior tests covered layers 1, 3, and 4. Layer 2 was the blind spot that caused
+this incident.
+
+### Submission-Time Synthetic Tick = False Safety
+
+The initial `process_tick(synthetic_tick)` at OCO submission time gives the
+illusion that paper fill is connected, but:
+
+- `data.get("near_fill_price", 0)` silently falls back to 0 if the entry
+  fill price is missing
+- The outer `except Exception` swallows errors without `logger.exception`
+- Both cause the order to appear SUBMITTED while never filling
+
+**Fix**: fail-fast guard (`raise ValueError` for price ≤ 0), ongoing polling
+in `_mts_tick()`, and `logger.exception` in all paper fill error paths.
+
+### Acceptance Test Pattern
+
+```text
+submit OCO → leave pending → run _mts_tick() → one leg fills →
+sibling cancels → state persists with correct lifecycle
+```
+
+See `tests/test_order_lifecycle/test_paper_fill.py::TestPaperFillSimulatorPolling`.
