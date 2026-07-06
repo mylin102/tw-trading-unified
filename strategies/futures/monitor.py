@@ -3845,6 +3845,18 @@ class FuturesMonitor:
             if not _has_pos_in_mem and existing.get("has_position") is True:
                 return
 
+            # ADR-009 Task 10: FLAT must not inherit position fields from existing.
+            # When local has_position=False, clear near_entry/far_entry/side to prevent
+            # stale entry prices from self-perpetuating via the fallback chain:
+            #   strategy._near_entry=0 → existing.get("near_entry")=47369 → re-write → loop
+            if not _has_pos_in_mem:
+                existing.pop("near_entry", None)
+                existing.pop("far_entry", None)
+                existing.pop("near_side", None)
+                existing.pop("far_side", None)
+                existing.pop("released_leg", None)
+                existing.pop("remaining_side", None)
+
             # 2. Position Details
             # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
             _n_entry = getattr(strategy, "_near_entry", 0.0) or float(existing.get("near_entry") or 0.0)
@@ -4229,6 +4241,48 @@ class FuturesMonitor:
         # 2026-05-22 Gemini CLI: Fixed except block indentation to resolve syntax error
         except Exception as e:
             console.print(f"[red]⚠️ Heartbeat failed: {e}[/red]")
+
+        # ADR-009 Task 10: broker position reconciliation.
+        # If local lifecycle says FLAT but broker/trader has open spread position,
+        # reconstruct lifecycle from broker state to prevent split-brain.
+        # Guard: only reconcile when local FLAT + broker has position + strategy is MTS-capable.
+        _broker_pos = getattr(self.trader, "position", 0)
+        _has_pos = bool(getattr(strategy, "_has_position", False))
+        _lc = getattr(strategy, "_lifecycle_oca", None)
+        if (
+            not _has_pos
+            and _broker_pos != 0
+            and _lc is not None
+            and hasattr(_lc, 'phase')
+            and str(_lc.phase.value) == "FLAT"
+            and getattr(strategy, "_ticker", "").startswith("TMF")
+        ):
+            from strategies.plugins.futures.active.tmf_spread import (
+                PositionPhase, infer_lifecycle_from_legacy_state,
+                _write_mts_state, lifecycle_to_dict,
+            )
+            strategy._has_position = True
+            strategy._lifecycle = "RECOVERED_BROKER"
+            _legacy_hint = {
+                "has_position": True,
+                "released_leg": None,
+                "release_state": "BOTH_HELD",
+            }
+            strategy._lifecycle_oca = infer_lifecycle_from_legacy_state(_legacy_hint)
+            _write_mts_state(
+                has_position=True, action="BROKER_RECONCILED",
+                reason="broker_position_recovery",
+                near_entry=getattr(strategy, "_near_entry", 0),
+                far_entry=getattr(strategy, "_far_entry", 0),
+                near_side=getattr(strategy, "_near_side", None),
+                far_side=getattr(strategy, "_far_side", None),
+                released_leg=getattr(strategy, "_released_leg", None),
+                trade_id=getattr(strategy, "_trade_id", None),
+                ticker=self.ticker,
+                atr=0.0,
+                lifecycle=lifecycle_to_dict(strategy._lifecycle_oca),
+            )
+            console.print(f"[bold yellow]♻️ [BROKER_RECONCILED] broker_pos={_broker_pos} → lifecycle restored to {strategy._lifecycle_oca.phase.value}[/bold yellow]")
 
         signal = strategy.on_bar(ctx)
         if signal:
