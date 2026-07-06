@@ -4413,15 +4413,6 @@ class FuturesMonitor:
         if not hasattr(strategy, "_has_position"):
             strategy.init(ctx)
 
-        # ── [ADR-010] Reconcile OCO orders into paper_fill_sim after restart ──
-        self._reconcile_paper_oco_orders(strategy)
-
-        # ── [ADR-010] Poll paper OCO fills (after reconciliation) ──
-        if _n_close > 0 and _f_close > 0:
-            self._process_pending_paper_fills(
-                near_price=_n_close, far_price=_f_close, ts=datetime.now(),
-            )
-
         # [MTS Heartbeat] Update state file with latest prices
         # 2026-05-27 Gemini CLI: Use isolated path if environment variable is set
         _hb_file = os.getenv("MTS_STATE_PATH", "/tmp/mts_position_state.json")
@@ -4622,6 +4613,17 @@ class FuturesMonitor:
                 ):
                     self._save_orders_file_wrapper()
                     self._mts_release_orders_flushed = True
+                    # [ADR-010] Re-register OCO orders into paper_fill_sim after restart
+                    # Must run AFTER on_bar() → _restore_position_state() restores lifecycle
+                    self._reconcile_paper_oco_orders(strategy)
+
+        # ── [ADR-010] Poll paper OCO fills with live prices (every tick) ──
+        _n_close = float(_bar_dict.get("near_close") or 0)
+        _f_close = float(_bar_dict.get("far_close") or 0)
+        if _n_close > 0 and _f_close > 0:
+            self._process_pending_paper_fills(
+                near_price=_n_close, far_price=_f_close, ts=datetime.now(),
+            )
 
         if signal:
             self._submit_mts_order_signal(signal, strategy, _bar_dict, datetime.now())
