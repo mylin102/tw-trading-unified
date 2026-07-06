@@ -3418,24 +3418,34 @@ elif page == f"期貨 {_TICKER}":
                     try:
                         with open(_mts_state_file) as _f:
                             _mts_state = json.loads(_f.read())
-                        # ── Account equity: unified MTS + PaperTrader view ──
+                        # ── Account equity: mode-aware (broker / MTS paper / paper trader) ──
                         _init_bal = _mts_state.get("initial_balance", 100000)
                         _has_pos = _mts_state.get("has_position", False)
                         _realized = float(_mts_state.get("total_realized_pnl") or 0)
                         _upl = float(_mts_state.get("total_upl") or 0)
                         _trader_bal = _mts_state.get("balance")
-                        # MTS active: equity = initial + realized + unrealized
-                        # PaperTrader only: equity = trader.balance
-                        if _has_pos or _realized != 0 or _upl != 0:
+                        _live_eq = _mts_state.get("live_equity")
+
+                        if f_live and _live_eq is not None:
+                            _bal = _live_eq
+                            _label = "帳戶權益（券商）"
+                            _source = "broker"
+                        elif _has_pos or _realized != 0 or _upl != 0:
                             _bal = _init_bal + _realized + _upl
+                            _label = "模擬帳戶權益（MTS）"
+                            _source = "mts_state"
                         elif _trader_bal is not None:
                             _bal = _trader_bal
+                            _label = "模擬帳戶權益"
+                            _source = "paper_trader"
                         else:
                             _bal = _init_bal
+                            _label = "帳戶權益"
+                            _source = "initial"
                         if _bal is not None:
                             _equity_row = st.columns([1, 1, 2])
                             _equity_row[0].metric("初始資金", f"{_init_bal:,.0f}")
-                            _equity_row[1].metric("帳戶權益", f"{_bal:,.0f}")
+                            _equity_row[1].metric(_label, f"{_bal:,.0f}")
                             _pnl_total = _bal - _init_bal
                             _equity_row[2].metric("總損益", f"{_pnl_total:+,.0f}", delta=f"{_pnl_total/_init_bal*100:+.1f}%")
                         if _mts_state.get("has_position", False):

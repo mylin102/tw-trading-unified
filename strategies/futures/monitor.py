@@ -4244,6 +4244,12 @@ class FuturesMonitor:
                 "total_upl": round(_n_upl + _f_upl, 1),
                 "initial_balance": self.EXEC.get("initial_balance", 100000),
                 "balance": getattr(self.trader, "balance", 0) if hasattr(self, "trader") else 0,
+                # Live mode: real account equity from Shioaji API
+                "live_equity": (
+                    float(self.api.margin(self.api.futopt_account).equity)
+                    if self.live_trading and self.api and hasattr(self.api, "margin")
+                    else None
+                ),
                 "atr": round(_last_atr, 2), # 2026-06-26 Gemini CLI: pass current ATR to state writer
                 "_updated": datetime.now().isoformat(),
             }
