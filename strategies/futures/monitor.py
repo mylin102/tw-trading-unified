@@ -4442,15 +4442,28 @@ class FuturesMonitor:
                     f"[bold green]✅ [OCO_4C] CANCELING_SIBLING → SIBLING_CANCELED → SINGLE_LEG/{_released} → trail ARMED[/bold green]"
                 )
 
-        # [Fix 2026-07-06] One-shot flush of release orders to orders JSON.
-        # After PM2 restart, lifecycle is restored with SUBMITTED release_group
-        # but the order manager has no record of those orders. Without this,
-        # _save_orders_file_wrapper() would only fire on the next order event.
-        if getattr(self, "_mts_orders_flushed", False) is False:
-            self._save_orders_file_wrapper()
-            self._mts_orders_flushed = True
-
         signal = strategy.on_bar(ctx)
+
+        # [Fix 2026-07-06] Narrow guard: flush release OCO orders to orders JSON
+        # after PM2 restart. Only fires once when SUBMITTED release_group with
+        # both order ids is detected, preventing stale/partial state pollution.
+        if getattr(self, "_mts_release_orders_flushed", False) is False:
+            _rg = getattr(strategy, "_lifecycle_oca", None)
+            if _rg is not None:
+                _rg_rel = getattr(_rg, "release_group", None)
+                _rg_phase = getattr(_rg, "phase", None)
+                _rg_status = getattr(_rg_rel, "status", None) if _rg_rel else None
+                _rg_near = getattr(_rg_rel, "near_order_id", None) if _rg_rel else None
+                _rg_far = getattr(_rg_rel, "far_order_id", None) if _rg_rel else None
+                if (
+                    str(getattr(_rg_phase, "value", "")) == "SPREAD"
+                    and str(getattr(_rg_status, "value", "")) == "SUBMITTED"
+                    and _rg_near
+                    and _rg_far
+                ):
+                    self._save_orders_file_wrapper()
+            self._mts_release_orders_flushed = True
+
         if signal:
             self._submit_mts_order_signal(signal, strategy, _bar_dict, datetime.now())
             # 💡 [Fixed 2026-05-27] Removed premature strategy._reset(). 
