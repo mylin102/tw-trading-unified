@@ -1966,6 +1966,7 @@ class FuturesMonitor:
                             ("FAR", _rg.far_order_id, _release_side_far),
                         ]:
                             if _oid and not any(d.get("order_id") == _oid for d in export_data):
+                                _price = getattr(_rg, "near_price", 0) if _label == "NEAR" else getattr(_rg, "far_price", 0)
                                 export_data.append({
                                     "order_id": _oid,
                                     "symbol": f"{self.ticker}_{_label}",
@@ -1973,7 +1974,7 @@ class FuturesMonitor:
                                     "order_type": "MKP",
                                     "quantity": 1,
                                     "filled_quantity": 0,
-                                "price": 0,
+                                "price": _price if _price > 0 else 0,
                                 "avg_fill_price": 0,
                                 "status": "submitted",
                                 "strategy": "MTS_RELEASE_OCO",
@@ -5166,6 +5167,18 @@ class FuturesMonitor:
                             _lc.release_group.near_order_id = _near_oid
                             _lc.release_group.far_order_id = _far_oid
                             _lc.release_group.status = ReleaseGroupStatus.SUBMITTED
+                            # Persist release prices from entry ± release_stop
+                            _near_entry = float(getattr(_mts_strat, "_near_entry", 0) or 0)
+                            _far_entry = float(getattr(_mts_strat, "_far_entry", 0) or 0)
+                            _rstop = float(getattr(_mts_strat, "_release_stop_fixed", 0.0) or 0.0)
+                            if _near_entry > 0 and _rstop > 0:
+                                _lc.release_group.near_price = round(
+                                    _near_entry - _rstop if str(_near_side).upper().endswith("LONG") else _near_entry + _rstop, 1
+                                )
+                            if _far_entry > 0 and _rstop > 0:
+                                _lc.release_group.far_price = round(
+                                    _far_entry + _rstop if str(_far_side).upper().endswith("SHORT") else _far_entry - _rstop, 1
+                                )
                             _lc.release_group.entry_risk = EntryRiskSnapshot(
                                 atr=float(getattr(_mts_strat, "_last_atr", 0.0) or 0.0),
                                 release_stop=float(getattr(_mts_strat, "_release_stop_fixed", 0.0) or 0.0),

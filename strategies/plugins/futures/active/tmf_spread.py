@@ -156,6 +156,10 @@ class ReleaseGroup:
     # ADR-010: entry risk snapshot
     entry_risk: EntryRiskSnapshot | None = None
 
+    # ADR-010: release order metadata (source of truth for orders export)
+    near_price: float = 0.0
+    far_price: float = 0.0
+
 @dataclass
 class TrailGroup:
     """State holder for the post-release trailing exit (ADR-009 v1.1)."""
@@ -217,6 +221,8 @@ def _release_group_to_dict(rg: ReleaseGroup) -> dict:
         "sibling_cancel_order_id": rg.sibling_cancel_order_id,
         "sibling_cancel_status": rg.sibling_cancel_status.value if rg.sibling_cancel_status else None,
         "entry_risk": _entry_risk_to_dict(rg.entry_risk) if rg.entry_risk else None,
+        "near_price": rg.near_price,
+        "far_price": rg.far_price,
     }
 
 def _release_group_from_dict(d: dict | None) -> ReleaseGroup:
@@ -238,6 +244,8 @@ def _release_group_from_dict(d: dict | None) -> ReleaseGroup:
             if d.get("sibling_cancel_status") else None
         ),
         entry_risk=_entry_risk_from_dict(_er) if _er else None,
+        near_price=float(d.get("near_price", 0.0)),
+        far_price=float(d.get("far_price", 0.0)),
     )
 
 def _entry_risk_to_dict(er: EntryRiskSnapshot) -> dict:
