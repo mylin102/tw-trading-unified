@@ -159,6 +159,9 @@ class ReleaseGroup:
     # ADR-010: release order metadata (source of truth for orders export)
     near_price: float = 0.0
     far_price: float = 0.0
+    near_side: str | None = None
+    far_side: str | None = None
+    order_type: str = "MKP"
 
 @dataclass
 class TrailGroup:
@@ -223,6 +226,9 @@ def _release_group_to_dict(rg: ReleaseGroup) -> dict:
         "entry_risk": _entry_risk_to_dict(rg.entry_risk) if rg.entry_risk else None,
         "near_price": rg.near_price,
         "far_price": rg.far_price,
+        "near_side": rg.near_side,
+        "far_side": rg.far_side,
+        "order_type": rg.order_type,
     }
 
 def _release_group_from_dict(d: dict | None) -> ReleaseGroup:
@@ -246,6 +252,9 @@ def _release_group_from_dict(d: dict | None) -> ReleaseGroup:
         entry_risk=_entry_risk_from_dict(_er) if _er else None,
         near_price=float(d.get("near_price", 0.0)),
         far_price=float(d.get("far_price", 0.0)),
+        near_side=d.get("near_side"),
+        far_side=d.get("far_side"),
+        order_type=str(d.get("order_type", "MKP")),
     )
 
 def _entry_risk_to_dict(er: EntryRiskSnapshot) -> dict:

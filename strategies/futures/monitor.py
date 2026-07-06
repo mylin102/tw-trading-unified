@@ -1949,31 +1949,22 @@ class FuturesMonitor:
             if _strat and hasattr(_strat, "_lifecycle_oca"):
                 _rg = _strat._lifecycle_oca.release_group
                 if hasattr(_rg, 'status') and getattr(_rg.status, 'value', '') in ("SUBMITTED", "SUBMITTING"):
-                    # Resolve release side from entry side: LONG entry → sell release, SHORT entry → buy release
-                    # [Fix 2026-07-06] Use .value for enum safety — str(enum) gives "LegSide.LONG", not "LONG"
-                    def _side_value(side):
-                        return str(getattr(side, "value", side)).upper()
-
-                    _near_side = getattr(_strat, "_near_side", None)
-                    _far_side = getattr(_strat, "_far_side", None)
-
-                    if _side_value(_near_side) in ("LONG", "SHORT") and _side_value(_far_side) in ("LONG", "SHORT"):
-                        _release_side_near = "sell" if _side_value(_near_side) == "LONG" else "buy"
-                        _release_side_far = "sell" if _side_value(_far_side) == "LONG" else "buy"
-
-                        for _label, _oid, _side in [
-                            ("NEAR", _rg.near_order_id, _release_side_near),
-                            ("FAR", _rg.far_order_id, _release_side_far),
-                        ]:
-                            if _oid and not any(d.get("order_id") == _oid for d in export_data):
-                                _price = getattr(_rg, "near_price", 0) if _label == "NEAR" else getattr(_rg, "far_price", 0)
-                                export_data.append({
-                                    "order_id": _oid,
-                                    "symbol": f"{self.ticker}_{_label}",
-                                    "side": _side,
-                                    "order_type": "MKP",
-                                    "quantity": 1,
-                                    "filled_quantity": 0,
+                    # Read release order metadata from ReleaseGroup source of truth
+                    for _label, _oid, _side_attr, _price_attr in [
+                        ("NEAR", _rg.near_order_id, "near_side", "near_price"),
+                        ("FAR", _rg.far_order_id, "far_side", "far_price"),
+                    ]:
+                        if _oid and not any(d.get("order_id") == _oid for d in export_data):
+                            _side = getattr(_rg, _side_attr, None) or "sell"
+                            _price = getattr(_rg, _price_attr, 0) or 0
+                            _otype = getattr(_rg, "order_type", "MKP")
+                            export_data.append({
+                                "order_id": _oid,
+                                "symbol": f"{self.ticker}_{_label}",
+                                "side": _side,
+                                "order_type": _otype,
+                                "quantity": 1,
+                                "filled_quantity": 0,
                                 "price": _price if _price > 0 else 0,
                                 "avg_fill_price": 0,
                                 "status": "submitted",
@@ -5167,18 +5158,20 @@ class FuturesMonitor:
                             _lc.release_group.near_order_id = _near_oid
                             _lc.release_group.far_order_id = _far_oid
                             _lc.release_group.status = ReleaseGroupStatus.SUBMITTED
-                            # Persist release prices from entry ± release_stop
+                            # Persist release order metadata from submit payload
+                            def _release_price(_entry: float, _side) -> float:
+                                _sv = str(getattr(_side, "value", _side)).upper()
+                                if _entry <= 0 or _rstop <= 0:
+                                    return 0.0
+                                return round(_entry - _rstop, 1) if _sv == "LONG" else round(_entry + _rstop, 1)
+                            _rstop = float(getattr(_mts_strat, "_release_stop_fixed", 0.0) or 0.0)
                             _near_entry = float(getattr(_mts_strat, "_near_entry", 0) or 0)
                             _far_entry = float(getattr(_mts_strat, "_far_entry", 0) or 0)
-                            _rstop = float(getattr(_mts_strat, "_release_stop_fixed", 0.0) or 0.0)
-                            if _near_entry > 0 and _rstop > 0:
-                                _lc.release_group.near_price = round(
-                                    _near_entry - _rstop if str(_near_side).upper().endswith("LONG") else _near_entry + _rstop, 1
-                                )
-                            if _far_entry > 0 and _rstop > 0:
-                                _lc.release_group.far_price = round(
-                                    _far_entry + _rstop if str(_far_side).upper().endswith("SHORT") else _far_entry - _rstop, 1
-                                )
+                            _lc.release_group.near_price = _release_price(_near_entry, _near_side)
+                            _lc.release_group.far_price = _release_price(_far_entry, _far_side)
+                            _lc.release_group.near_side = str(getattr(_release_near_side, "value", _release_near_side))
+                            _lc.release_group.far_side = str(getattr(_release_far_side, "value", _release_far_side))
+                            _lc.release_group.order_type = "MKP"
                             _lc.release_group.entry_risk = EntryRiskSnapshot(
                                 atr=float(getattr(_mts_strat, "_last_atr", 0.0) or 0.0),
                                 release_stop=float(getattr(_mts_strat, "_release_stop_fixed", 0.0) or 0.0),
