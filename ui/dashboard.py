@@ -636,6 +636,18 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
 
     # 2. Shaded background for night session
     night_mask = is_night_session(df[ts_col])
+
+    # [Fix 2026-07-06] Normalize night_mask to Series — is_night_session may
+    # return scalar bool if df[ts_col] is not recognized as Series (e.g. empty
+    # DataFrame, datetime64 index, or single value). Without this guard the
+    # .shift() and .loc[] calls below would raise TypeError.
+    if df.empty or ts_col not in df.columns:
+        return fig
+    if not isinstance(night_mask, pd.Series):
+        night_mask = pd.Series(False, index=df.index)
+    else:
+        night_mask = night_mask.reindex(df.index, fill_value=False)
+
     if night_mask.any():
         # Find continuous night blocks
         night_starts = df.loc[night_mask & ~night_mask.shift(1).fillna(False), ts_col]
