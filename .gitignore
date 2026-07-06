@@ -78,3 +78,6 @@ monitor_snippet_tmp.py
 .gemmacli/
 .hermes/
 .hyperlight/
+
+# Runtime checkpoint artifacts (ADR-010 Sprint 6B)
+_oco_checkpoints/

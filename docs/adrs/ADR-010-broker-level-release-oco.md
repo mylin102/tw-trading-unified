@@ -116,7 +116,7 @@ Positive:
 - SUBMITTING status ensures partial submit is recoverable
 - `filled_leg` as winner reduces field redundancy
 - Sprint 6A complete: synthetic paper lifecycle roundtrip verified
-- Sprint 6B pending: PM2 restart checkpoints during real paper session
+- Sprint 6B complete: PM2 restart checkpoint plan + oco_checkpoint.py utility
 
 Negative:
 - Larger state file (new fields in release_group)
