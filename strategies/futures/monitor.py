@@ -1950,14 +1950,23 @@ class FuturesMonitor:
                 _rg = _strat._lifecycle_oca.release_group
                 if hasattr(_rg, 'status') and getattr(_rg.status, 'value', '') in ("SUBMITTED", "SUBMITTING"):
                     # Read release order metadata from ReleaseGroup source of truth
-                    for _label, _oid, _side_attr, _price_attr in [
-                        ("NEAR", _rg.near_order_id, "near_side", "near_price"),
-                        ("FAR", _rg.far_order_id, "far_side", "far_price"),
-                    ]:
-                        if _oid and not any(d.get("order_id") == _oid for d in export_data):
-                            _side = getattr(_rg, _side_attr, None) or ""
-                            if _side not in ("buy", "sell"):
-                                continue
+                    for _label, _oid, _side_attr, _price_attr, _entry_side_attr in [
+                            ("NEAR", _rg.near_order_id, "near_side", "near_price", "_near_side"),
+                            ("FAR", _rg.far_order_id, "far_side", "far_price", "_far_side"),
+                        ]:
+                            if _oid and not any(d.get("order_id") == _oid for d in export_data):
+                                _side = getattr(_rg, _side_attr, None) or ""
+                                # [Backward compat] If ReleaseGroup has no side metadata (old state file),
+                                # derive from entry side: LONG→sell, SHORT→buy
+                                if _side not in ("buy", "sell"):
+                                    _entry_side = getattr(_strat, _entry_side_attr, None)
+                                    _es = str(getattr(_entry_side, "value", _entry_side)).upper()
+                                    if _es == "LONG":
+                                        _side = "sell"
+                                    elif _es == "SHORT":
+                                        _side = "buy"
+                                    else:
+                                        continue  # unknown side, skip
                             _price = getattr(_rg, _price_attr, 0) or 0
                             _otype = getattr(_rg, "order_type", "MKP")
                             export_data.append({
