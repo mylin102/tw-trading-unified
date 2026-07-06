@@ -1950,16 +1950,22 @@ class FuturesMonitor:
                 _rg = _strat._lifecycle_oca.release_group
                 if hasattr(_rg, 'status') and getattr(_rg.status, 'value', '') in ("SUBMITTED", "SUBMITTING"):
                     # Resolve release side from entry side: LONG entry → sell release, SHORT entry → buy release
+                    # [Fix 2026-07-06] Use .value for enum safety — str(enum) gives "LegSide.LONG", not "LONG"
+                    def _side_value(side):
+                        return str(getattr(side, "value", side)).upper()
                     _near_side = getattr(_strat, "_near_side", None)
                     _far_side = getattr(_strat, "_far_side", None)
-                    _release_side_near = "sell" if str(_near_side).upper() == "LONG" else "buy"
-                    _release_side_far = "sell" if str(_far_side).upper() == "LONG" else "buy"
-                    for _label, _oid, _side in [("NEAR", _rg.near_order_id, _release_side_near), ("FAR", _rg.far_order_id, _release_side_far)]:
-                        if _oid and not any(d.get("order_id") == _oid for d in export_data):
-                            export_data.append({
-                                "order_id": _oid,
-                                "symbol": f"{self.ticker}_{_label}",
-                                "side": _side,
+                    if _side_value(_near_side) not in ("LONG", "SHORT") or _side_value(_far_side) not in ("LONG", "SHORT"):
+                        pass  # skip if sides are unknown — better than wrong side
+                    else:
+                        _release_side_near = "sell" if _side_value(_near_side) == "LONG" else "buy"
+                        _release_side_far = "sell" if _side_value(_far_side) == "LONG" else "buy"
+                        for _label, _oid, _side in [("NEAR", _rg.near_order_id, _release_side_near), ("FAR", _rg.far_order_id, _release_side_far)]:
+                            if _oid and not any(d.get("order_id") == _oid for d in export_data):
+                                export_data.append({
+                                    "order_id": _oid,
+                                    "symbol": f"{self.ticker}_{_label}",
+                                    "side": _side,
                                 "order_type": "MKP",
                                 "quantity": 1,
                                 "filled_quantity": 0,
