@@ -1345,7 +1345,9 @@ class TMFSpread(StrategyBase):
                 if _updated:
                     try:
                         _ts = datetime.fromisoformat(_updated)
-                        _age_min = (datetime.now() - _ts).total_seconds() / 60.0
+                        # Handle both timezone-aware and naive datetimes
+                        _now = datetime.now(_ts.tzinfo) if _ts.tzinfo else datetime.now()
+                        _age_min = (_now - _ts).total_seconds() / 60.0
                         # 60 min expiration for production stability
                         if _age_min < 60:
                             # 2026-05-27 Gemini CLI: Only accept JSON if it has valid peak/nadir memory
@@ -1362,6 +1364,10 @@ class TMFSpread(StrategyBase):
                                 # Both legs held — remaining_side is meaningless for pollute check
                                 _pollute_pass = True
                             elif (_rem_side == "LONG" and _peak > 0) or (_rem_side == "SHORT" and _nadir > 0) or not _rem_side:
+                                _pollute_pass = True
+                            elif state.get("lifecycle") and state["lifecycle"].get("release_group", {}).get("status") not in (None, "INACTIVE", "ARMED", "TRIGGERED"):
+                                # ADR-010: lifecycle block with active OCO state is authoritative
+                                # Overrides legacy polluted check
                                 _pollute_pass = True
                             else:
                                 _pollute_pass = False
@@ -1388,94 +1394,74 @@ class TMFSpread(StrategyBase):
                                     except Exception:
                                         self._lifecycle_oca = infer_lifecycle_from_legacy_state(state)
 
-                                # ADR-010 Sprint 5A: restart @ CANCELING_SIBLING
-                                # Broker cancel authority — check if sibling cancel actually went through.
-                                # If state says CANCELING_SIBLING but broker cancel never arrived,
-                                # we must check broker order status before transitioning.
-                                _rg_5 = self._lifecycle_oca.release_group
-                                _tl_5 = self._lifecycle_oca.trail_group
-                                if (
-                                    self._lifecycle_oca.phase == PositionPhase.SPREAD
-                                    and _rg_5.status == ReleaseGroupStatus.CANCELING_SIBLING
-                                ):
-                                    # Broker authority: assume cancel succeeded (paper mode).
-                                    # For paper, cancel was sync-confirmed in Sprint 4B.
-                                    # If broker says sibling is still alive, re-issue cancel.
-                                    # For now, promote to SIBLING_CANCELED + SINGLE_LEG.
-                                    _rg_5.sibling_cancel_status = CancelStatus.CONFIRMED
-                                    _rg_5.status = ReleaseGroupStatus.SIBLING_CANCELED
-                                    self._lifecycle_oca.phase = PositionPhase.SINGLE_LEG
-                                    _tl_5.status = TrailGroupStatus.ARMED
-                                    logger.warning(
-                                        "[OCO_RESTORE_5A] Restart @ CANCELING_SIBLING → SIBLING_CANCELED → SINGLE_LEG (trade_id=%s)",
-                                        state.get("trade_id"),
-                                    )
+                                    # ── ADR-010 Sprint 5: Restart Reconciliation ──
+                                    _rg_5 = self._lifecycle_oca.release_group
+                                    _tl_5 = self._lifecycle_oca.trail_group
 
-                                # ADR-010 Sprint 5B: restart @ SUBMITTED
-                                # Both order ids persisted. No resend — restore as-is.
-                                # Broker authority: if broker says orders are dead, fallback to ARMED.
-                                if (
-                                    self._lifecycle_oca.phase == PositionPhase.SPREAD
-                                    and _rg_5.status == ReleaseGroupStatus.SUBMITTED
-                                    and _rg_5.near_order_id
-                                    and _rg_5.far_order_id
-                                ):
-                                    # Restore SUBMITTED as-is. Broker check (if available) confirms alive.
-                                    logger.warning(
-                                        "[OCO_RESTORE_5B] Restart @ SUBMITTED — near=%s far=%s (trade_id=%s)",
-                                        _rg_5.near_order_id, _rg_5.far_order_id,
-                                        state.get("trade_id"),
-                                    )
-                                    # Guard: SUBMITTED without both order ids is invalid.
-                                    if not _rg_5.near_order_id or not _rg_5.far_order_id:
-                                        _rg_5.status = ReleaseGroupStatus.ARMED
+                                    # 5A: CANCELING_SIBLING → SIBLING_CANCELED + SINGLE_LEG
+                                    if (
+                                        self._lifecycle_oca.phase == PositionPhase.SPREAD
+                                        and _rg_5.status == ReleaseGroupStatus.CANCELING_SIBLING
+                                    ):
+                                        _rg_5.sibling_cancel_status = CancelStatus.CONFIRMED
+                                        _rg_5.status = ReleaseGroupStatus.SIBLING_CANCELED
+                                        self._lifecycle_oca.phase = PositionPhase.SINGLE_LEG
+                                        _tl_5.status = TrailGroupStatus.ARMED
                                         logger.warning(
-                                            "[OCO_RESTORE_5B] SUBMITTED missing order id → downgraded to ARMED (trade_id=%s)",
+                                            "[OCO_RESTORE_5A] CANCELING_SIBLING → SIBLING_CANCELED → SINGLE_LEG (trade_id=%s)",
                                             state.get("trade_id"),
                                         )
 
-                                # ADR-010 Sprint 5C: restart @ SUBMITTING
-                                # One order id exists, the other missing.
-                                # Helper: _reconcile_release_bracket_submission handles partial submit.
-                                if (
-                                    self._lifecycle_oca.phase == PositionPhase.SPREAD
-                                    and _rg_5.status == ReleaseGroupStatus.SUBMITTING
-                                ):
-                                    self._reconcile_release_bracket_submission(state)
+                                    # 5B: SUBMITTED — restore both order ids as-is
+                                    if (
+                                        self._lifecycle_oca.phase == PositionPhase.SPREAD
+                                        and _rg_5.status == ReleaseGroupStatus.SUBMITTED
+                                        and _rg_5.near_order_id
+                                        and _rg_5.far_order_id
+                                    ):
+                                        logger.warning(
+                                            "[OCO_RESTORE_5B] SUBMITTED — near=%s far=%s (trade_id=%s)",
+                                            _rg_5.near_order_id, _rg_5.far_order_id,
+                                            state.get("trade_id"),
+                                        )
 
-                                # ADR-010 Sprint 5D: restart @ SIBLING_CANCELED
-                                # Simplest case: restore SINGLE_LEG + trail ARMED.
-                                if (
-                                    self._lifecycle_oca.phase == PositionPhase.SPREAD
-                                    and _rg_5.status == ReleaseGroupStatus.SIBLING_CANCELED
-                                ):
-                                    self._lifecycle_oca.phase = PositionPhase.SINGLE_LEG
-                                    _tl_5.status = TrailGroupStatus.ARMED
-                                    logger.warning(
-                                        "[OCO_RESTORE_5D] Restart @ SIBLING_CANCELED → SINGLE_LEG + trail ARMED (trade_id=%s)",
-                                        state.get("trade_id"),
-                                    )
+                                    # 5C: SUBMITTING — delegate to helper
+                                    if (
+                                        self._lifecycle_oca.phase == PositionPhase.SPREAD
+                                        and _rg_5.status == ReleaseGroupStatus.SUBMITTING
+                                    ):
+                                        self._reconcile_release_bracket_submission(state)
+
+                                    # 5D: SIBLING_CANCELED → SINGLE_LEG + trail ARMED
+                                    if (
+                                        self._lifecycle_oca.phase == PositionPhase.SPREAD
+                                        and _rg_5.status == ReleaseGroupStatus.SIBLING_CANCELED
+                                    ):
+                                        self._lifecycle_oca.phase = PositionPhase.SINGLE_LEG
+                                        _tl_5.status = TrailGroupStatus.ARMED
+                                        logger.warning(
+                                            "[OCO_RESTORE_5D] SIBLING_CANCELED → SINGLE_LEG + trail ARMED (trade_id=%s)",
+                                            state.get("trade_id"),
+                                        )
+
+                                    # Invariant guard: FLAT phase must not overlay active position
+                                    if self._lifecycle_oca.phase == PositionPhase.FLAT:
+                                        self._lifecycle_oca = infer_lifecycle_from_legacy_state(state)
+
+                                    # ADR-009 Task 9: SUBMITTED requires exit_order_id.
+                                    if (
+                                        self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG
+                                        and self._lifecycle_oca.trail_group.status == TrailGroupStatus.SUBMITTED
+                                        and not self._lifecycle_oca.trail_group.exit_order_id
+                                    ):
+                                        self._lifecycle_oca.trail_group.status = TrailGroupStatus.ARMED
+                                        logger.warning(
+                                            "[MTS_RESTORE_TASK9] Orphan SUBMITTED without exit_order_id — "
+                                            "downgraded trail_group to ARMED (trade_id=%s)",
+                                            state.get("trade_id"),
+                                        )
                                 else:
                                     self._lifecycle_oca = infer_lifecycle_from_legacy_state(state)
-                                # Invariant guard: FLAT phase must not overlay active position
-                                if self._lifecycle_oca.phase == PositionPhase.FLAT:
-                                    self._lifecycle_oca = infer_lifecycle_from_legacy_state(state)
-
-                                # ADR-009 Task 9: SUBMITTED requires exit_order_id.
-                                # If trail_group is SUBMITTED but exit_order_id is null,
-                                # the order was never accepted by broker — downgrade to ARMED
-                                # so the lifecycle controller can re-submit.
-                                if (
-                                    self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG
-                                    and self._lifecycle_oca.trail_group.status == TrailGroupStatus.SUBMITTED
-                                    and not self._lifecycle_oca.trail_group.exit_order_id
-                                ):
-                                    self._lifecycle_oca.trail_group.status = TrailGroupStatus.ARMED
-                                    logger.warning(
-                                        "[MTS_RESTORE_TASK9] Orphan SUBMITTED without exit_order_id — "
-                                        "downgraded trail_group to ARMED (trade_id=%s)",
-                                        state.get("trade_id"),
-                                    )
 
                                 # 💡 [Fixed 2026-05-27] Robust trade_id recovery
                                 self._trade_id = state.get("trade_id") or state.get("manual_order_id")
