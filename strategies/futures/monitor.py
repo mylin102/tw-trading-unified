@@ -4940,21 +4940,25 @@ class FuturesMonitor:
                 )
 
                 # ADR-010 Sprint 3: submit release OCO bracket after entry confirmed
+                # Note: SUBMITTING restart handling deferred to Sprint 5.
                 if self.order_mgr and hasattr(_mts_strat, "_lifecycle_oca"):
                     from strategies.plugins.futures.active.tmf_spread import (
                         EntryRiskSnapshot, lifecycle_to_dict,
-                        ReleaseGroupStatus, ReleaseGroup,
+                        ReleaseGroupStatus,
                     )
                     from core.order_management.order import OrderSide
                     _lc = _mts_strat._lifecycle_oca
                     if _lc.phase.value == "SPREAD" and _lc.release_group.status.value == "ARMED":
-                        _near_side_str = data.get("near_label", "")
-                        _far_side_str = data.get("far_label", "")
+                        # Use strategy as authority for leg sides (not data dict)
+                        _near_side = getattr(_mts_strat, "_near_side", None)
+                        _far_side = getattr(_mts_strat, "_far_side", None)
+                        if not _near_side or not _far_side:
+                            raise RuntimeError("Missing strategy leg sides for release bracket")
                         _release_near_side = (
-                            OrderSide.SELL if _near_side_str == "LONG" else OrderSide.BUY
+                            OrderSide.SELL if str(_near_side).upper().endswith("LONG") else OrderSide.BUY
                         )
                         _release_far_side = (
-                            OrderSide.SELL if _far_side_str == "LONG" else OrderSide.BUY
+                            OrderSide.SELL if str(_far_side).upper().endswith("LONG") else OrderSide.BUY
                         )
                         try:
                             _near_oid, _far_oid = self.order_mgr.submit_release_bracket(
@@ -4969,13 +4973,14 @@ class FuturesMonitor:
                             _lc.release_group.far_order_id = _far_oid
                             _lc.release_group.status = ReleaseGroupStatus.SUBMITTED
                             _lc.release_group.entry_risk = EntryRiskSnapshot(
-                                atr=_mts_strat._last_atr or 0.0,
-                                release_stop=_mts_strat._release_stop_fixed,
-                                trail_stop=_mts_strat._trail_dist_fixed,
-                                entry_z=_mts_strat._entry_z,
-                                spread=data.get("spread_z", 0.0),
+                                atr=float(getattr(_mts_strat, "_last_atr", 0.0) or 0.0),
+                                release_stop=float(getattr(_mts_strat, "_release_stop_fixed", 0.0) or 0.0),
+                                trail_stop=float(getattr(_mts_strat, "_trail_dist_fixed", 0.0) or 0.0),
+                                entry_z=float(getattr(_mts_strat, "_entry_z", 0.0) or 0.0),
+                                spread=float(data.get("entry_spread") or data.get("spread") or 0.0),
                                 timestamp=datetime.now().isoformat(),
                             )
+                            _entry_spread_z = getattr(_mts_strat, "_entry_z", 3.0)
                             _write_mts_state(
                                 has_position=True, action="RELEASE_OCO_SUBMITTED",
                                 reason="oco_bracket_submitted",
@@ -4985,7 +4990,7 @@ class FuturesMonitor:
                                 far_last=data["far_fill_price"],
                                 near_side=data["near_label"],
                                 far_side=data["far_label"],
-                                spread_z=3.0, released_leg=None, trade_id=trade_id,
+                                spread_z=_entry_spread_z, released_leg=None, trade_id=trade_id,
                                 lifecycle=lifecycle_to_dict(_lc),
                             )
                             console.print(
