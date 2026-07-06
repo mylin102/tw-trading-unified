@@ -1955,7 +1955,9 @@ class FuturesMonitor:
                         ("FAR", _rg.far_order_id, "far_side", "far_price"),
                     ]:
                         if _oid and not any(d.get("order_id") == _oid for d in export_data):
-                            _side = getattr(_rg, _side_attr, None) or "sell"
+                            _side = getattr(_rg, _side_attr, None) or ""
+                            if _side not in ("buy", "sell"):
+                                continue
                             _price = getattr(_rg, _price_attr, 0) or 0
                             _otype = getattr(_rg, "order_type", "MKP")
                             export_data.append({
