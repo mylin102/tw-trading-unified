@@ -1951,38 +1951,39 @@ class FuturesMonitor:
                 if hasattr(_rg, 'status') and getattr(_rg.status, 'value', '') in ("SUBMITTED", "SUBMITTING"):
                     # Read release order metadata from ReleaseGroup source of truth
                     for _label, _oid, _side_attr, _price_attr, _entry_side_attr in [
-                            ("NEAR", _rg.near_order_id, "near_side", "near_price", "_near_side"),
-                            ("FAR", _rg.far_order_id, "far_side", "far_price", "_far_side"),
-                        ]:
-                            if _oid and not any(d.get("order_id") == _oid for d in export_data):
-                                _side = getattr(_rg, _side_attr, None) or ""
-                                # [Backward compat] If ReleaseGroup has no side metadata (old state file),
-                                # derive from entry side: LONG→sell, SHORT→buy
-                                if _side not in ("buy", "sell"):
-                                    _entry_side = getattr(_strat, _entry_side_attr, None)
-                                    _es = str(getattr(_entry_side, "value", _entry_side)).upper()
-                                    if _es == "LONG":
-                                        _side = "sell"
-                                    elif _es == "SHORT":
-                                        _side = "buy"
-                                    else:
-                                        continue  # unknown side, skip
-                            _price = getattr(_rg, _price_attr, 0) or 0
-                            _otype = getattr(_rg, "order_type", "MKP")
-                            export_data.append({
-                                "order_id": _oid,
-                                "symbol": f"{self.ticker}_{_label}",
-                                "side": _side,
-                                "order_type": _otype,
-                                "quantity": 1,
-                                "filled_quantity": 0,
-                                "price": _price if _price > 0 else 0,
-                                "avg_fill_price": 0,
-                                "status": "submitted",
-                                "strategy": "MTS_RELEASE_OCO",
-                                "created_at": datetime.now().isoformat(),
-                                "current_price": cur_price if cur_price > 0 else None,
-                            })
+                        ("NEAR", _rg.near_order_id, "near_side", "near_price", "_near_side"),
+                        ("FAR", _rg.far_order_id, "far_side", "far_price", "_far_side"),
+                    ]:
+                        if not _oid or any(d.get("order_id") == _oid for d in export_data):
+                            continue
+
+                        _side = getattr(_rg, _side_attr, None) or ""
+
+                        if _side not in ("buy", "sell"):
+                            _entry_side = getattr(_strat, _entry_side_attr, None)
+                            _es = str(getattr(_entry_side, "value", _entry_side)).upper()
+                            if _es == "LONG":
+                                _side = "sell"
+                            elif _es == "SHORT":
+                                _side = "buy"
+                            else:
+                                continue
+
+                        _price = getattr(_rg, _price_attr, 0) or 0
+                        _otype = getattr(_rg, "order_type", "MKP")
+
+                        export_data.append({
+                            "order_id": _oid,
+                            "symbol": f"{self.ticker}_{_label}",
+                            "side": _side,
+                            "order_type": _otype,
+                            "quantity": 1,
+                            "filled_quantity": 0,
+                            "price": _price if _price > 0 else 0,
+                            "avg_fill_price": 0,
+                            "status": "submitted",
+                            "strategy": "MTS_RELEASE_OCO",
+                        })
 
             today = datetime.now().strftime("%Y%m%d")
             orders_file = Path(f"exports/trades/TMF_{today}_orders.json")
