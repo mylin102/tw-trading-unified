@@ -4378,6 +4378,45 @@ class FuturesMonitor:
             )
             console.print(f"[bold yellow]♻️ [BROKER_RECONCILED] broker_pos={_broker_pos} → lifecycle restored to {strategy._lifecycle_oca.phase.value}[/bold yellow]")
 
+        # ADR-010 Sprint 4C: CANCELING_SIBLING → SIBLING_CANCELED → SINGLE_LEG + trail ARMED
+        # Paper mode: cancel is sync-confirmed, transition immediately on next tick.
+        if (
+            _lc is not None
+            and hasattr(_lc, 'phase')
+            and hasattr(_lc, 'release_group')
+            and _lc.phase.value == "SPREAD"
+            and _lc.release_group.status.value == "CANCELING_SIBLING"
+        ):
+            if _lc.release_group.sibling_cancel_status is not None \
+               and _lc.release_group.sibling_cancel_status.value == "PENDING":
+                # Paper: broker cancel already succeeded; promote CONFIRMED
+                from strategies.plugins.futures.active.tmf_spread import (
+                    CancelStatus, ReleaseGroupStatus, PositionPhase, TrailGroupStatus,
+                    _write_mts_state, lifecycle_to_dict,
+                )
+                _lc.release_group.sibling_cancel_status = CancelStatus.CONFIRMED
+                _lc.release_group.status = ReleaseGroupStatus.SIBLING_CANCELED
+                _lc.phase = PositionPhase.SINGLE_LEG
+                _lc.trail_group.status = TrailGroupStatus.ARMED
+                _released = str(_lc.release_group.filled_leg.value) if _lc.release_group.filled_leg else None
+                _write_mts_state(
+                    has_position=True, action="OCO_SIBLING_CANCELED",
+                    reason=f"oco_sibling_canceled_winner={_released}",
+                    near_entry=getattr(strategy, "_near_entry", 0) or 0,
+                    far_entry=getattr(strategy, "_far_entry", 0) or 0,
+                    near_last=getattr(strategy, "_near_last", 0) or 0,
+                    far_last=getattr(strategy, "_far_last", 0) or 0,
+                    near_side=getattr(strategy, "_near_side", None),
+                    far_side=getattr(strategy, "_far_side", None),
+                    released_leg=_released,
+                    trade_id=getattr(strategy, "_trade_id", None),
+                    ticker=self.ticker,
+                    lifecycle=lifecycle_to_dict(_lc),
+                )
+                console.print(
+                    f"[bold green]✅ [OCO_4C] CANCELING_SIBLING → SIBLING_CANCELED → SINGLE_LEG/{_released} → trail ARMED[/bold green]"
+                )
+
         signal = strategy.on_bar(ctx)
         if signal:
             self._submit_mts_order_signal(signal, strategy, _bar_dict, datetime.now())
