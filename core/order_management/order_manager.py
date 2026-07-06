@@ -608,6 +608,54 @@ class OrderManager:
             tax=tax,
         )
 
+    # ── Release OCO Bracket (ADR-010) ──
+
+    def submit_release_bracket(
+        self,
+        *,
+        symbol_near: str,
+        symbol_far: str,
+        quantity: int = 1,
+        side_near: OrderSide,
+        side_far: OrderSide,
+        strategy: str = "MTS_RELEASE_OCO",
+    ) -> tuple[str, str]:
+        """Submit a two-sided release OCO bracket.
+
+        Creates and submits both near and far release orders with
+        potentially opposite sides (e.g. SELL near, BUY far).
+        Both order ids MUST be returned before any state is persisted
+        (submit-before-commit invariant).
+
+        Paper mode: creates two orders × submit.
+        Live mode (future): broker-native OCO or two orders + auto-cancel.
+
+        Returns (near_order_id, far_order_id).
+        Raises RuntimeError if either submission fails.
+        """
+        near_order = self.create_order(
+            symbol=symbol_near, side=side_near, order_type=OrderType.MKP,
+            quantity=quantity, strategy=strategy,
+        )
+        far_order = self.create_order(
+            symbol=symbol_far, side=side_far, order_type=OrderType.MKP,
+            quantity=quantity, strategy=strategy,
+        )
+
+        near_ok = self.submit(near_order)
+        if not near_ok:
+            # near failed → cancel far (if created) before raising
+            self.reject(far_order.order_id, reason="bracket_near_failed")
+            raise RuntimeError(f"Release bracket: near order {near_order.order_id} submission failed")
+
+        far_ok = self.submit(far_order)
+        if not far_ok:
+            # near submitted, far failed → cancel near, raise
+            self.cancel(near_order.order_id, reason="bracket_far_failed_rollback_near")
+            raise RuntimeError(f"Release bracket: far order {far_order.order_id} submission failed")
+
+        return (near_order.order_id, far_order.order_id)
+
     # ── Cancel (🛑 Gate) ──
 
     def cancel(self, order_id: str, reason: str = "", source: str = "") -> bool:

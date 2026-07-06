@@ -636,6 +636,18 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
 
     # 2. Shaded background for night session
     night_mask = is_night_session(df[ts_col])
+
+    # [Fix 2026-07-06] Normalize night_mask to Series — is_night_session may
+    # return scalar bool if df[ts_col] is not recognized as Series (e.g. empty
+    # DataFrame, datetime64 index, or single value). Without this guard the
+    # .shift() and .loc[] calls below would raise TypeError.
+    if df.empty or ts_col not in df.columns:
+        return fig
+    if not isinstance(night_mask, pd.Series):
+        night_mask = pd.Series(False, index=df.index)
+    else:
+        night_mask = night_mask.reindex(df.index, fill_value=False)
+
     if night_mask.any():
         # Find continuous night blocks
         night_starts = df.loc[night_mask & ~night_mask.shift(1).fillna(False), ts_col]
@@ -1539,7 +1551,12 @@ def load_futures_indicators(full_history=False):
     if not full_history:
         try:
             from pathlib import Path as _Path
-            today_str = now.strftime("%Y%m%d")
+            from core.date_utils import get_session_date_str
+            # [Fix 2026-07-06] Use session date instead of wall-clock date.
+            # During night session (15:00+), _save_bar writes to the next trading day's
+            # file (e.g. TMF_20260707), but strftime("%Y%m%d") returns the wall-clock
+            # date (20260706), causing the dashboard to miss all night session bars.
+            today_str = get_session_date_str(now)
             # Priority: _PAPER > _LIVE > _DRY > bare
             for tag_suffix in ["_PAPER", "_LIVE", "_DRY", ""]:
                 candidates = sorted(
@@ -1563,11 +1580,14 @@ def load_futures_indicators(full_history=False):
         # Fall through to full path if fast path fails
 
     # ── FULL PATH (full_history or fast path failed) ──
+    from core.date_utils import get_session_date_str
+    _session_date = get_session_date_str(now)
     search_days_raw = [
         (now - dt.timedelta(days=3)).strftime("%Y%m%d"),
         (now - dt.timedelta(days=2)).strftime("%Y%m%d"),
         (now - dt.timedelta(days=1)).strftime("%Y%m%d"),
-        now.strftime("%Y%m%d"),
+        _session_date,                                  # [Fix 2026-07-06] session date first (night data)
+        now.strftime("%Y%m%d"),                         # then wall-clock date (day data)
         (now + dt.timedelta(days=1)).strftime("%Y%m%d"),
         (now + dt.timedelta(days=2)).strftime("%Y%m%d"),
         (now + dt.timedelta(days=3)).strftime("%Y%m%d"),

@@ -1941,6 +1941,31 @@ class FuturesMonitor:
 
                 export_data.append(d)
 
+            # [Fix 2026-07-06] Include release OCO orders from lifecycle state.
+            # The order manager is reset on PM2 restart, but release_group persists
+            # in the state file. Without this, release orders are invisible until
+            # the next order_mgr event (fill/cancel) triggers a flush.
+            _strat = self._registry.get("tmf_spread")
+            if _strat and hasattr(_strat, "_lifecycle_oca"):
+                _rg = _strat._lifecycle_oca.release_group
+                if hasattr(_rg, 'status') and getattr(_rg.status, 'value', '') in ("SUBMITTED", "SUBMITTING"):
+                    for _label, _oid in [("NEAR", _rg.near_order_id), ("FAR", _rg.far_order_id)]:
+                        if _oid and not any(d.get("order_id") == _oid for d in export_data):
+                            export_data.append({
+                                "order_id": _oid,
+                                "symbol": f"{self.ticker}_{_label}",
+                                "side": "sell",
+                                "order_type": "MKP",
+                                "quantity": 1,
+                                "filled_quantity": 0,
+                                "price": 0,
+                                "avg_fill_price": 0,
+                                "status": "submitted",
+                                "strategy": "MTS_RELEASE_OCO",
+                                "created_at": datetime.now().isoformat(),
+                                "current_price": cur_price if cur_price > 0 else None,
+                            })
+
             today = datetime.now().strftime("%Y%m%d")
             orders_file = Path(f"exports/trades/TMF_{today}_orders.json")
             orders_file.parent.mkdir(parents=True, exist_ok=True)
@@ -2076,6 +2101,97 @@ class FuturesMonitor:
         if hasattr(self, "_mts_stale_order_cancels"):
             self._mts_stale_order_cancels.discard(order_id)
 
+    def _check_oco_release_fill(self, event):
+        """ADR-010 Sprint 4A: detect OCO release fill — PARTIALLY_FILLED only.
+
+        Matches event.order_id against strategy release_group near/far order ids.
+        On match: mark PARTIALLY_FILLED without cancel sibling or trail activation.
+        Sibling cancel and SINGLE_LEG transition handled in Sprint 4B/4C.
+
+        Invariant: PARTIALLY_FILLED → trail_group.status must NOT be ARMED.
+        """
+        from strategies.plugins.futures.active.tmf_spread import (
+            ReleaseGroupStatus, Leg, TrailGroupStatus, CancelStatus,
+            _write_mts_state, lifecycle_to_dict,
+        )
+        _strategy = self._registry.get("tmf_spread")
+        if not _strategy or not hasattr(_strategy, "_lifecycle_oca"):
+            return
+        _rg = _strategy._lifecycle_oca.release_group
+        if _rg.status not in (ReleaseGroupStatus.SUBMITTED,):
+            return
+        _oid = event.order_id
+        if _oid == _rg.near_order_id:
+            _winner = "near"
+        elif _oid == _rg.far_order_id:
+            _winner = "far"
+        else:
+            return  # not an OCO release fill
+
+        # Dedup by deal_id
+        _deal_key = event.deal_id or f"oco:{_oid}:{event.fill_qty}:{event.fill_price}"
+        if _deal_key in self._applied_lifecycle_deals:
+            return
+        self._applied_lifecycle_deals[_deal_key] = datetime.now().isoformat()
+
+        price = float(event.fill_price or 0)
+        # PARTIALLY_FILLED — no cancel, no SINGLE_LEG, no trail
+        _rg.status = ReleaseGroupStatus.PARTIALLY_FILLED
+        _rg.filled_leg = Leg.NEAR if _winner == "near" else Leg.FAR
+        _rg.filled_order_id = _oid
+        _rg.canceled_leg = Leg.FAR if _winner == "near" else Leg.NEAR
+
+        # Invariant: trail must NOT be active in PARTIALLY_FILLED
+        _strategy._lifecycle_oca.trail_group.status = TrailGroupStatus.INACTIVE
+
+        # Log but do NOT transition to SINGLE_LEG yet
+        console.print(
+            f"[bold yellow]🟡 [OCO_4A] PARTIALLY_FILLED winner={_winner} order={_oid} "
+            f"sibling={_rg.canceled_leg.value} — cancel deferred to 4B[/bold yellow]"
+        )
+
+        _write_mts_state(
+            has_position=True, action=f"OCO_{_winner.upper()}_PARTIAL",
+            reason=f"oco_{_winner}_partially_filled",
+            near_entry=_strategy._near_entry, far_entry=_strategy._far_entry,
+            near_last=price if _winner == "near" else float(self.market_data.get(f"{self.ticker}_NEAR", {}).get("close") or 0),
+            far_last=price if _winner == "far" else float(self.market_data.get(f"{self.ticker}_FAR", {}).get("close") or 0),
+            near_side=_strategy._near_side, far_side=_strategy._far_side,
+            released_leg=_winner, trade_id=_strategy._trade_id,
+            ticker=self.ticker, atr=float(getattr(_strategy, "_last_atr", 0.0) or 0.0),
+            lifecycle=lifecycle_to_dict(_strategy._lifecycle_oca),
+        )
+
+        # ── Sprint 4B: cancel sibling → CANCELING_SIBLING ──
+        _cancel_oid = _rg.far_order_id if _winner == "near" else _rg.near_order_id
+        if self.order_mgr and _cancel_oid:
+            try:
+                self.order_mgr.cancel(_cancel_oid, reason=f"oco_4b_cancel_{_winner}", source="oco_bracket")
+                _rg.sibling_cancel_order_id = _cancel_oid
+                _rg.sibling_cancel_status = CancelStatus.PENDING
+                _rg.status = ReleaseGroupStatus.CANCELING_SIBLING
+                console.print(
+                    f"[bold cyan]🔄 [OCO_4B] CANCELING_SIBLING sent for {_cancel_oid}"
+                    f" (winner={_winner})[/bold cyan]"
+                )
+                _write_mts_state(
+                    has_position=True, action=f"OCO_CANCELING_{_winner.upper()}",
+                    reason=f"oco_4b_cancel_{_winner}",
+                    near_entry=_strategy._near_entry, far_entry=_strategy._far_entry,
+                    near_last=float(getattr(_strategy, "_near_last", 0)),
+                    far_last=float(getattr(_strategy, "_far_last", 0)),
+                    near_side=_strategy._near_side, far_side=_strategy._far_side,
+                    released_leg=_winner, trade_id=_strategy._trade_id,
+                    ticker=self.ticker, atr=float(getattr(_strategy, "_last_atr", 0.0) or 0.0),
+                    lifecycle=lifecycle_to_dict(_strategy._lifecycle_oca),
+                )
+            except (ValueError, RuntimeError) as _e:
+                _rg.sibling_cancel_status = CancelStatus.REJECTED
+                _rg.status = ReleaseGroupStatus.FAILED
+                console.print(
+                    f"[red]⚠️ [OCO_4B] Cancel failed: {_e} — status=FAILED[/red]"
+                )
+
     def _apply_confirmed_futures_deal(self, event):
         from core.order_management.order import OrderStatus
         from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
@@ -2088,6 +2204,9 @@ class FuturesMonitor:
         pending = self._pending_lifecycle_orders.get(event.order_id)
         # 2026-06-22 Gemini CLI: Use fill_qty to match OrderEvent class definition
         if pending is None or event.fill_qty <= 0:
+            # ADR-010 Sprint 4A: check if this fill matches OCO bracket order
+            if pending is None and event.fill_qty > 0:
+                self._check_oco_release_fill(event)
             return None
 
         deal_key = event.deal_id or f"{event.order_id}:{event.fill_qty}:{event.fill_price}"
@@ -4284,6 +4403,45 @@ class FuturesMonitor:
             )
             console.print(f"[bold yellow]♻️ [BROKER_RECONCILED] broker_pos={_broker_pos} → lifecycle restored to {strategy._lifecycle_oca.phase.value}[/bold yellow]")
 
+        # ADR-010 Sprint 4C: CANCELING_SIBLING → SIBLING_CANCELED → SINGLE_LEG + trail ARMED
+        # Paper mode: cancel is sync-confirmed, transition immediately on next tick.
+        if (
+            _lc is not None
+            and hasattr(_lc, 'phase')
+            and hasattr(_lc, 'release_group')
+            and _lc.phase.value == "SPREAD"
+            and _lc.release_group.status.value == "CANCELING_SIBLING"
+        ):
+            if _lc.release_group.sibling_cancel_status is not None \
+               and _lc.release_group.sibling_cancel_status.value == "PENDING":
+                # Paper: broker cancel already succeeded; promote CONFIRMED
+                from strategies.plugins.futures.active.tmf_spread import (
+                    CancelStatus, ReleaseGroupStatus, PositionPhase, TrailGroupStatus,
+                    _write_mts_state, lifecycle_to_dict,
+                )
+                _lc.release_group.sibling_cancel_status = CancelStatus.CONFIRMED
+                _lc.release_group.status = ReleaseGroupStatus.SIBLING_CANCELED
+                _lc.phase = PositionPhase.SINGLE_LEG
+                _lc.trail_group.status = TrailGroupStatus.ARMED
+                _released = str(_lc.release_group.filled_leg.value) if _lc.release_group.filled_leg else None
+                _write_mts_state(
+                    has_position=True, action="OCO_SIBLING_CANCELED",
+                    reason=f"oco_sibling_canceled_winner={_released}",
+                    near_entry=getattr(strategy, "_near_entry", 0) or 0,
+                    far_entry=getattr(strategy, "_far_entry", 0) or 0,
+                    near_last=getattr(strategy, "_near_last", 0) or 0,
+                    far_last=getattr(strategy, "_far_last", 0) or 0,
+                    near_side=getattr(strategy, "_near_side", None),
+                    far_side=getattr(strategy, "_far_side", None),
+                    released_leg=_released,
+                    trade_id=getattr(strategy, "_trade_id", None),
+                    ticker=self.ticker,
+                    lifecycle=lifecycle_to_dict(_lc),
+                )
+                console.print(
+                    f"[bold green]✅ [OCO_4C] CANCELING_SIBLING → SIBLING_CANCELED → SINGLE_LEG/{_released} → trail ARMED[/bold green]"
+                )
+
         signal = strategy.on_bar(ctx)
         if signal:
             self._submit_mts_order_signal(signal, strategy, _bar_dict, datetime.now())
@@ -4938,6 +5096,90 @@ class FuturesMonitor:
                     far_side=data["far_label"],
                     spread_z=3.0, released_leg=None, trade_id=trade_id
                 )
+
+                # ADR-010 Sprint 3: submit release OCO bracket after entry confirmed
+                # Note: SUBMITTING restart handling deferred to Sprint 5.
+                if self.order_mgr and hasattr(_mts_strat, "_lifecycle_oca"):
+                    from strategies.plugins.futures.active.tmf_spread import (
+                        EntryRiskSnapshot, lifecycle_to_dict,
+                        ReleaseGroupStatus,
+                    )
+                    from core.order_management.order import OrderSide
+                    _lc = _mts_strat._lifecycle_oca
+                    if _lc.phase.value == "SPREAD" and _lc.release_group.status.value == "ARMED":
+                        # Use strategy as authority for leg sides (not data dict)
+                        _near_side = getattr(_mts_strat, "_near_side", None)
+                        _far_side = getattr(_mts_strat, "_far_side", None)
+                        if not _near_side or not _far_side:
+                            raise RuntimeError("Missing strategy leg sides for release bracket")
+                        _release_near_side = (
+                            OrderSide.SELL if str(_near_side).upper().endswith("LONG") else OrderSide.BUY
+                        )
+                        _release_far_side = (
+                            OrderSide.SELL if str(_far_side).upper().endswith("LONG") else OrderSide.BUY
+                        )
+                        try:
+                            _near_oid, _far_oid = self.order_mgr.submit_release_bracket(
+                                symbol_near=self.contract.code if self.contract else f"{self.ticker}_NEAR",
+                                symbol_far=self.far_contract.code if self.far_contract else f"{self.ticker}_FAR",
+                                quantity=1,
+                                side_near=_release_near_side,
+                                side_far=_release_far_side,
+                            )
+                            # Persist OCO state: order ids + SUBMITTED
+                            _lc.release_group.near_order_id = _near_oid
+                            _lc.release_group.far_order_id = _far_oid
+                            _lc.release_group.status = ReleaseGroupStatus.SUBMITTED
+                            _lc.release_group.entry_risk = EntryRiskSnapshot(
+                                atr=float(getattr(_mts_strat, "_last_atr", 0.0) or 0.0),
+                                release_stop=float(getattr(_mts_strat, "_release_stop_fixed", 0.0) or 0.0),
+                                trail_stop=float(getattr(_mts_strat, "_trail_dist_fixed", 0.0) or 0.0),
+                                entry_z=float(getattr(_mts_strat, "_entry_z", 0.0) or 0.0),
+                                spread=float(data.get("entry_spread") or data.get("spread") or 0.0),
+                                timestamp=datetime.now().isoformat(),
+                            )
+                            # Paper mode: register OCO orders for immediate fill simulation
+                            if self.paper_fill_sim:
+                                from core.order_management.order import OrderType
+                                _near_order = self.order_mgr.active_orders.get(_near_oid)
+                                _far_order = self.order_mgr.active_orders.get(_far_oid)
+                                if _near_order:
+                                    self.paper_fill_sim.register(_near_order)
+                                    self.paper_fill_sim.process_tick(
+                                        self._make_synthetic_tick(
+                                            data.get("near_fill_price", 0), datetime.now(),
+                                            symbol=self.contract.code if self.contract else f"{self.ticker}_NEAR",
+                                        )
+                                    )
+                                if _far_order:
+                                    self.paper_fill_sim.register(_far_order)
+                                    self.paper_fill_sim.process_tick(
+                                        self._make_synthetic_tick(
+                                            data.get("far_fill_price", 0), datetime.now(),
+                                            symbol=self.far_contract.code if self.far_contract else f"{self.ticker}_FAR",
+                                        )
+                                    )
+                            _entry_spread_z = getattr(_mts_strat, "_entry_z", 3.0)
+                            _write_mts_state(
+                                has_position=True, action="RELEASE_OCO_SUBMITTED",
+                                reason="oco_bracket_submitted",
+                                near_entry=data["near_fill_price"],
+                                far_entry=data["far_fill_price"],
+                                near_last=data["near_fill_price"],
+                                far_last=data["far_fill_price"],
+                                near_side=data["near_label"],
+                                far_side=data["far_label"],
+                                spread_z=_entry_spread_z, released_leg=None, trade_id=trade_id,
+                                lifecycle=lifecycle_to_dict(_lc),
+                            )
+                            console.print(
+                                f"[bold green]✅ [OCO_BRACKET] Submitted: NEAR={_near_oid} FAR={_far_oid}[/bold green]"
+                            )
+                            # [Fix 2026-07-06] Flush release orders to orders JSON for dashboard visibility
+                            self._save_orders_file_wrapper()
+                        except RuntimeError as _e:
+                            console.print(f"[red]⚠️ [OCO_BRACKET] Submit failed: {_e}[/red]")
+                            # DSLR fallback: lifecycle stays ARMED, controller handles release normally
         except Exception as e:
             console.print(f"[red]⚠️ [MANUAL_TRADE] Post-fill strategy sync failed: {e}[/red]")
 
