@@ -1949,16 +1949,13 @@ class FuturesMonitor:
             if _strat and hasattr(_strat, "_lifecycle_oca"):
                 _rg = _strat._lifecycle_oca.release_group
                 if hasattr(_rg, 'status') and getattr(_rg.status, 'value', '') in ("SUBMITTED", "SUBMITTING"):
-                    # Read release order metadata from ReleaseGroup source of truth
                     for _label, _oid, _side_attr, _price_attr, _entry_side_attr in [
                         ("NEAR", _rg.near_order_id, "near_side", "near_price", "_near_side"),
                         ("FAR", _rg.far_order_id, "far_side", "far_price", "_far_side"),
                     ]:
                         if not _oid or any(d.get("order_id") == _oid for d in export_data):
                             continue
-
                         _side = getattr(_rg, _side_attr, None) or ""
-
                         if _side not in ("buy", "sell"):
                             _entry_side = getattr(_strat, _entry_side_attr, None)
                             _es = str(getattr(_entry_side, "value", _entry_side)).upper()
@@ -1968,10 +1965,8 @@ class FuturesMonitor:
                                 _side = "buy"
                             else:
                                 continue
-
                         _price = getattr(_rg, _price_attr, 0) or 0
                         _otype = getattr(_rg, "order_type", "MKP")
-
                         export_data.append({
                             "order_id": _oid,
                             "symbol": f"{self.ticker}_{_label}",
@@ -1984,6 +1979,23 @@ class FuturesMonitor:
                             "status": "submitted",
                             "strategy": "MTS_RELEASE_OCO",
                         })
+                elif hasattr(_rg, 'status') and getattr(_rg.status, 'value', '') in ("PARTIALLY_FILLED", "CANCELING_SIBLING", "SIBLING_CANCELED"):
+                    for _label, _oid in [("NEAR", _rg.near_order_id), ("FAR", _rg.far_order_id)]:
+                        if _oid and not any(d.get("order_id") == _oid for d in export_data):
+                            export_data.append({
+                                "order_id": _oid,
+                                "symbol": f"{self.ticker}_{_label}",
+                                "side": getattr(_rg, f"{_label.lower()}_side", None) or "",
+                                "order_type": getattr(_rg, "order_type", "MKP"),
+                                "quantity": 1,
+                                "filled_quantity": 0,
+                                "price": 0,
+                                "avg_fill_price": 0,
+                                "status": ("filled" if _label == "NEAR" and getattr(_rg, "filled_leg", None)
+                                          and getattr(_rg.filled_leg, "value", "") == "NEAR"
+                                          else "cancelled"),
+                                "strategy": "MTS_RELEASE_OCO",
+                            })
 
             today = datetime.now().strftime("%Y%m%d")
             orders_file = Path(f"exports/trades/TMF_{today}_orders.json")
