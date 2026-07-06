@@ -61,6 +61,13 @@ class PaperFillSimulator:
             if order is None:
                 continue
 
+            # [ADR-010 Hard Guard] Skip orders already cancelled or filled
+            # by OCO callback during this same polling cycle.
+            _status = str(getattr(order, "status", "")).lower()
+            if _status in ("cancelled", "canceled", "filled"):
+                self._pending_orders.pop(order_id, None)
+                continue
+
             # Symbol Guard: ensure tick matches order symbol
             tick_symbol = getattr(tick, "symbol", getattr(tick, "code", None))
             # 2026-06-22 Gemini CLI: Filter out MagicMock attributes in unit tests

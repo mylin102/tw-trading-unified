@@ -399,3 +399,79 @@ class TestPaperFillSimulatorPolling:
         assert far.status == OrderStatus.CANCELLED, \
             f"far should stay CANCELLED, got {far.status}"
         assert sim.get_pending_count() == 0
+
+    def test_oco_first_fill_breaks_before_second_tick(self, mgr):
+        """Acceptance: Guard 1 — pending_count drop prevents second tick from filling.
+
+        Even with OCO callback wired, the early-break guard in
+        _process_pending_paper_fills ensures the second (far) tick is
+        never fed to process_tick. This prevents the cancelled sibling
+        from being filled by a subsequent tick if the callback fires
+        synchronously.
+
+        Verifies: after near fills → pending_count drops → break loop.
+        """
+        order_mgr, sim = mgr
+
+        near = order_mgr.create_order("TMF_NEAR", OrderSide.SELL, OrderType.MKP, 1,
+                                       strategy="MTS_RELEASE_OCO")
+        far = order_mgr.create_order("TMF_FAR", OrderSide.BUY, OrderType.MKP, 1,
+                                      strategy="MTS_RELEASE_OCO")
+        order_mgr.submit(near, exchange_ordno="PAPER-ORD-N1")
+        order_mgr.submit(far, exchange_ordno="PAPER-ORD-F1")
+        sim.register(near)
+        sim.register(far)
+        assert sim.get_pending_count() == 2
+
+        # Wire OCO callback: first fill cancels sibling
+        filled_count = [0]
+
+        def _oco_callback(event):
+            filled_count[0] += 1
+            if event.order_id == near.order_id:
+                order_mgr.cancel(far.order_id, reason="oco_sibling", source="oco_bracket")
+            elif event.order_id == far.order_id:
+                order_mgr.cancel(near.order_id, reason="oco_sibling", source="oco_bracket")
+
+        order_mgr.register_callback("on_fill", _oco_callback)
+
+        def _make_tick(code, close):
+            t = type("Tick", (), {})()
+            t.code = code
+            t.datetime = datetime.now()
+            t.close = close
+            t.open = close
+            t.high = close
+            t.low = close
+            t.volume = 50
+            return t
+
+        # --- Simulate _process_pending_paper_fills with early-break ---
+        ticks = [
+            _make_tick("TMF_NEAR", 47237),
+            _make_tick("TMF_FAR", 47473),
+        ]
+        ticks_processed = 0
+        for tick in ticks:
+            _before = sim.get_pending_count()
+            sim.process_tick(tick)
+            ticks_processed += 1
+            _after = sim.get_pending_count()
+            if _after < _before:  # Guard 1: early break
+                break
+
+        # Only one tick should be processed (near fills, pending drops, break)
+        assert ticks_processed == 1, \
+            f"only first tick should be processed, got {ticks_processed}"
+        assert filled_count[0] == 1, \
+            f"exactly one fill event, got {filled_count[0]}"
+        assert near.status == OrderStatus.FILLED, \
+            f"near should be FILLED, got {near.status}"
+        assert far.status == OrderStatus.CANCELLED, \
+            f"far should be CANCELLED, got {far.status}"
+        assert far.filled_quantity == 0, \
+            f"far should have zero fills, got {far.filled_quantity}"
+        assert far.avg_fill_price in (None, 0), \
+            f"far should have no fill price, got {far.avg_fill_price}"
+        assert sim.get_pending_count() == 0, \
+            f"all orders cleared, got {sim.get_pending_count()}"

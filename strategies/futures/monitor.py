@@ -2723,6 +2723,7 @@ class FuturesMonitor:
         ]
 
         for tick in ticks:
+            _before = self.paper_fill_sim.get_pending_count()
             try:
                 self.paper_fill_sim.process_tick(tick)
             except Exception as exc:
@@ -2734,6 +2735,12 @@ class FuturesMonitor:
                     f"[red]⚠️ [PAPER_FILL_ERR] tick={getattr(tick, 'code', '?')} "
                     f"close={getattr(tick, 'close', 0)} err={exc}[/red]"
                 )
+            # [ADR-010] After first tick fills, OCO callback may have cancelled sibling.
+            # Break early to prevent second tick from filling the cancelled sibling.
+            _after = self.paper_fill_sim.get_pending_count()
+            if _after < _before:
+                console.print("[dim][PAPER_FILL] OCO sibling cancelled — breaking poll loop[/dim]")
+                break
 
     # ── Margin check ──
     def _margin_sufficient(self):
