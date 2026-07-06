@@ -31,15 +31,24 @@ Extend the existing ADR-009 lifecycle controller with broker-level release OCO b
 
 5. **Restart covers SUBMITTING** — Partial submit (one order id persisted, one missing) is a first-class restart scenario.
 
+6. **Atomic state persistence** — `ReleaseGroupStatus` and order ids must be updated atomically with state persistence. A `SUBMITTED` release group without both `near_order_id` and `far_order_id` is invalid.
+
 ### State Machine
 
 ```text
-INACTIVE → ARMED → SUBMITTING → SUBMITTED → PARTIALLY_FILLED → CANCELING_SIBLING → SIBLING_CANCELED → COMPLETED
-                                                                                         ↓
-                                                                                      FAILED
+INACTIVE
+  → ARMED
+  → SUBMITTING
+  → SUBMITTED
+  → PARTIALLY_FILLED
+  → CANCELING_SIBLING
+  → SIBLING_CANCELED
+  → COMPLETED
+
+Any non-terminal state → FAILED
 ```
 
-- `SUBMITTING`: one order submitted, second in flight (restartable)
+- `SUBMITTING`: bracket submission has started but both release order ids are not yet durably persisted (restartable)
 - `SUBMITTED`: both order ids persisted
 - `PARTIALLY_FILLED`: one leg filled, sibling cancel not yet confirmed
 - `CANCELING_SIBLING`: cancel submitted, awaiting confirmation
