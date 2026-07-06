@@ -115,6 +115,8 @@ Positive:
 - EntryRiskSnapshot captures all entry-time risk parameters in one object
 - SUBMITTING status ensures partial submit is recoverable
 - `filled_leg` as winner reduces field redundancy
+- Sprint 6A complete: synthetic paper lifecycle roundtrip verified
+- Sprint 6B pending: PM2 restart checkpoints during real paper session
 
 Negative:
 - Larger state file (new fields in release_group)
