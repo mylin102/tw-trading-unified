@@ -5113,6 +5113,27 @@ class FuturesMonitor:
                                 spread=float(data.get("entry_spread") or data.get("spread") or 0.0),
                                 timestamp=datetime.now().isoformat(),
                             )
+                            # Paper mode: register OCO orders for immediate fill simulation
+                            if self.paper_fill_sim:
+                                from core.order_management.order import OrderType
+                                _near_order = self.order_mgr.active_orders.get(_near_oid)
+                                _far_order = self.order_mgr.active_orders.get(_far_oid)
+                                if _near_order:
+                                    self.paper_fill_sim.register(_near_order)
+                                    self.paper_fill_sim.process_tick(
+                                        self._make_synthetic_tick(
+                                            data.get("near_fill_price", 0), datetime.now(),
+                                            symbol=self.contract.code if self.contract else f"{self.ticker}_NEAR",
+                                        )
+                                    )
+                                if _far_order:
+                                    self.paper_fill_sim.register(_far_order)
+                                    self.paper_fill_sim.process_tick(
+                                        self._make_synthetic_tick(
+                                            data.get("far_fill_price", 0), datetime.now(),
+                                            symbol=self.far_contract.code if self.far_contract else f"{self.ticker}_FAR",
+                                        )
+                                    )
                             _entry_spread_z = getattr(_mts_strat, "_entry_z", 3.0)
                             _write_mts_state(
                                 has_position=True, action="RELEASE_OCO_SUBMITTED",
