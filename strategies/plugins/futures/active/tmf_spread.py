@@ -938,6 +938,10 @@ class TMFSpread(StrategyBase):
         self._release_mono = time.monotonic()
         # ADR-009 v1.1: sync lifecycle to SINGLE_LEG + trail armed
         _rem = Leg.FAR if _rel == Leg.NEAR else Leg.NEAR
+        # ADR-009 Task 7: idempotent guard — skip if already in SINGLE_LEG
+        if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG:
+            logger.info("[LIFECYCLE_TASK7] sync_release skipped: already SINGLE_LEG (leg=%s)", _rel_str)
+            return
         self._lifecycle_oca = PositionLifecycle(
             phase=PositionPhase.SINGLE_LEG,
             release_group=ReleaseGroup(status=ReleaseGroupStatus.COMPLETED, filled_leg=_rel, canceled_leg=_rem),
@@ -1010,6 +1014,23 @@ class TMFSpread(StrategyBase):
 
         logger.info("[MTS_RELEASE_SYNC] leg_released=%s rem_side=%s price=%s release_price=%s realized_pnl=%s lifecycle=%s trade_id=%s",
                     leg, self._side, price, self._release_price, _realized, self._lifecycle, self._trade_id)
+
+        # ADR-009 Task 7: flush lifecycle to state file immediately on release fill callback
+        _write_mts_state(
+            has_position=self._has_position,
+            action="RELEASE",
+            reason=f"release_{_rel_str}",
+            near_entry=self._near_entry,
+            far_entry=self._far_entry,
+            near_side=self._near_side,
+            far_side=self._far_side,
+            released_leg=self._released_leg,
+            release_price=self._release_price,
+            trade_id=self._trade_id,
+            ticker=self._ticker,
+            atr=self._last_atr or 0.0,
+            lifecycle=self._current_lifecycle_state(),
+        )
 
     def _pnl_far(self, far_close: float) -> float:
         if self._far_side == "LONG":
