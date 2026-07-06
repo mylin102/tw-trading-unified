@@ -2575,6 +2575,68 @@ class FuturesMonitor:
 
     # ── Paper Fill Polling (ADR-010 OCO) ──
 
+    def _reconcile_paper_oco_orders_from_state(self) -> None:
+        """Re-register OCO orders from state file (no strategy dependency).
+        
+        Reads /tmp/mts_position_state.json directly for lifecycle.release_group.
+        Used at startup before market open when strategy lifecycle isn't restored yet.
+        """
+        if not self.paper_fill_sim or not self.order_mgr:
+            return
+
+        _state_file = os.getenv("MTS_STATE_PATH", "/tmp/mts_position_state.json")
+        if not os.path.exists(_state_file):
+            return
+
+        try:
+            with open(_state_file) as f:
+                _state = json.load(f)
+        except Exception:
+            return
+
+        _lc = _state.get("lifecycle", {})
+        _rg = _lc.get("release_group", {})
+        if _rg.get("status") != "SUBMITTED":
+            return
+
+        _near_oid = _rg.get("near_order_id")
+        _far_oid = _rg.get("far_order_id")
+        if not _near_oid or not _far_oid:
+            return
+
+        _pending_ids = set(self.paper_fill_sim._pending_orders.keys())
+        _need_near = _near_oid not in _pending_ids and _near_oid not in self.order_mgr.active_orders
+        _need_far = _far_oid not in _pending_ids and _far_oid not in self.order_mgr.active_orders
+        if not _need_near and not _need_far:
+            return
+
+        from core.order_management.order import Order, OrderType, OrderSide
+
+        _near_symbol = self.contract.code if self.contract else f"{self.ticker}_NEAR"
+        _far_symbol = self.far_contract.code if self.far_contract else f"{self.ticker}_FAR"
+        _near_entry = _state.get("near_entry", 0)
+        _far_entry = _state.get("far_entry", 0)
+        _near_side = _state.get("near_side", "")
+        _far_side = _state.get("far_side", "")
+
+        if _need_near:
+            _ns = OrderSide.BUY if str(_near_side).upper() == "SHORT" else OrderSide.SELL
+            _no = Order(symbol=_near_symbol, side=_ns, order_type=OrderType.MKP,
+                        quantity=1, strategy="MTS_RELEASE_OCO", order_id=_near_oid)
+            self.order_mgr.active_orders[_near_oid] = _no
+            self.order_mgr.submit(_no)
+            self.paper_fill_sim.register(_no)
+            console.print(f"[cyan]♻️ [OCO_RECONCILE] near={_near_oid} from state file[/cyan]")
+
+        if _need_far:
+            _fs = OrderSide.BUY if str(_far_side).upper() == "SHORT" else OrderSide.SELL
+            _fo = Order(symbol=_far_symbol, side=_fs, order_type=OrderType.MKP,
+                        quantity=1, strategy="MTS_RELEASE_OCO", order_id=_far_oid)
+            self.order_mgr.active_orders[_far_oid] = _fo
+            self.order_mgr.submit(_fo)
+            self.paper_fill_sim.register(_fo)
+            console.print(f"[cyan]♻️ [OCO_RECONCILE] far={_far_oid} from state file[/cyan]")
+
     def _reconcile_paper_oco_orders(self, strategy) -> None:
         """Re-register OCO release orders with paper_fill_sim after PM2 restart.
         
@@ -4350,6 +4412,15 @@ class FuturesMonitor:
         print("MTS_ALIVE", flush=True)
         _mts = self.cfg.get("mts", {})
         _strat_name = _mts.get("strategy", "tmf_spread")
+
+        # ── [ADR-010] OCO reconciliation: runs even when market closed ──
+        # Must reconcile paper_fill_sim after restart before first market tick,
+        # otherwise SUBMITTED OCO orders from previous session become orphans.
+        # Reads state file directly because strategy lifecycle isn't restored
+        # until on_bar() runs (which requires market open).
+        if not getattr(self, "_oco_reconciled", False):
+            self._reconcile_paper_oco_orders_from_state()
+            self._oco_reconciled = True
 
         # 1. Market hours check
         if not is_taifex_futures_market_open():
