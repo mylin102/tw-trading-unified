@@ -616,12 +616,14 @@ class OrderManager:
         symbol_near: str,
         symbol_far: str,
         quantity: int = 1,
-        side: OrderSide,
+        side_near: OrderSide,
+        side_far: OrderSide,
         strategy: str = "MTS_RELEASE_OCO",
     ) -> tuple[str, str]:
         """Submit a two-sided release OCO bracket.
 
-        Creates and submits both near and far release orders.
+        Creates and submits both near and far release orders with
+        potentially opposite sides (e.g. SELL near, BUY far).
         Both order ids MUST be returned before any state is persisted
         (submit-before-commit invariant).
 
@@ -632,11 +634,11 @@ class OrderManager:
         Raises RuntimeError if either submission fails.
         """
         near_order = self.create_order(
-            symbol=symbol_near, side=side, order_type=OrderType.MKP,
+            symbol=symbol_near, side=side_near, order_type=OrderType.MKP,
             quantity=quantity, strategy=strategy,
         )
         far_order = self.create_order(
-            symbol=symbol_far, side=side, order_type=OrderType.MKP,
+            symbol=symbol_far, side=side_far, order_type=OrderType.MKP,
             quantity=quantity, strategy=strategy,
         )
 
