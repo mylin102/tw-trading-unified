@@ -4769,6 +4769,11 @@ class FuturesMonitor:
                     if _far_last == 0:
                         _far_last = float(_disk.get("far_entry", _near_last + 100)) if _disk else _near_last + 100
 
+                    # ── Emergency exit fill metadata (safe defaults for both-legs case) ──
+                    _rem_leg = "BOTH"
+                    _side = "BOTH"
+                    _price = max(float(_near_last or 0), float(_far_last or 0))
+
                     if _released_leg is None:
                         # Both legs held
                         _n_side = OrderSide.SELL if _near_side == "LONG" else OrderSide.BUY
@@ -4823,14 +4828,29 @@ class FuturesMonitor:
                     if _strategy_obj:
                         _strategy_obj._reset(reason="EMERGENCY_CLOSE")
                         from strategies.plugins.futures.active.tmf_spread import _append_fill
-                        _append_fill(self.ticker, _rem_leg.upper() if _released_leg else "BOTH", "EMERGENCY", _side if _released_leg else "BOTH", 1, _price if _released_leg else _near_last, "EXIT", _trade_id)
+                        # [Fix 2026-07-06] _rem_leg/_side/_price always defined (safe defaults above)
+                        _fill_leg = _rem_leg.upper() if isinstance(_rem_leg, str) else "BOTH"
+                        _append_fill(self.ticker, _fill_leg, "EMERGENCY",
+                                     str(_side), 1, float(_price or 0), "EXIT", _trade_id)
 
                     # Reset state file
                     try:
-                        from strategies.plugins.futures.active.tmf_spread import _write_mts_state
-                        _write_mts_state(has_position=False, action="FLAT", reason="EMERGENCY_CLOSE", ticker=self.ticker)
-                    except Exception:
-                        pass
+                        from strategies.plugins.futures.active.tmf_spread import _write_mts_state, lifecycle_to_dict
+                        # [Fix 2026-07-06] Include lifecycle=FLAT to prevent state overwrite gap
+                        _lc_dict = lifecycle_to_dict(_strategy_obj._lifecycle_oca) if (
+                            _strategy_obj and hasattr(_strategy_obj, '_lifecycle_oca')
+                        ) else {
+                            "phase": "FLAT",
+                            "release_group": {"status": "INACTIVE"},
+                            "trail_group": {"status": "INACTIVE"},
+                        }
+                        _write_mts_state(has_position=False, action="FLAT", reason="EMERGENCY_CLOSE",
+                                         ticker=self.ticker, lifecycle=_lc_dict)
+                    except Exception as exc:
+                        import logging
+                        _log = logging.getLogger("FuturesMonitor")
+                        _log.exception("[MTS][EMERGENCY_CLOSE] failed to write FLAT state: %s", exc)
+                        console.print(f"[red]⚠️ [EMERGENCY_CLOSE] state write failed: {exc}[/red]")
 
                     # 2026-06-23 Gemini CLI: Reset trader position immediately on emergency close to allow subsequent manual trades without getting stuck
                     if self.trader.position != 0:
