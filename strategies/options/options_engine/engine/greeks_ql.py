@@ -8,7 +8,6 @@ Drop-in replacement for greeks.py with more accurate pricing:
 """
 import QuantLib as ql
 from datetime import datetime
-from functools import lru_cache
 
 
 def _ql_date(dt):

@@ -9,8 +9,8 @@ _options_dir = os.path.dirname(os.path.abspath(__file__))
 if _options_dir not in sys.path:
     sys.path.insert(0, _options_dir)
 
-from options_engine.engine.broker_adapter import ShioajiBrokerAdapter
-from live_options_squeeze_monitor import ShioajiOptionsSmartMonitor, MockBrokerAdapter
+from options_engine.engine.broker_adapter import ShioajiBrokerAdapter  # noqa: E402
+from live_options_squeeze_monitor import ShioajiOptionsSmartMonitor, MockBrokerAdapter  # noqa: E402
 
 
 class OptionsMonitor:

@@ -1,0 +1,23 @@
+# Core Dependencies
+shioaji
+pandas
+numpy
+scipy
+pyarrow
+fastparquet
+numba
+python-dotenv
+pyyaml
+rich
+pandas_market_calendars
+
+# Dashboard & Visualization
+streamlit
+plotly
+streamlit-autorefresh
+
+# Infrastructure & Testing
+pytest
+pytest-asyncio
+requests
+python-dateutil

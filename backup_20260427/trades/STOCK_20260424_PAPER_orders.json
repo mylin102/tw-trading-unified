@@ -1,0 +1,58 @@
+[
+  {
+    "order_id": "PAPER-BUY-3024-20260424T090053-0",
+    "ticker": "3024",
+    "side": "BUY",
+    "order_type": "LMT",
+    "qty": 346,
+    "filled_qty": 346,
+    "price": 14.4,
+    "filled_price": 14.4,
+    "status": "FILLED",
+    "timestamp": "2026-04-24 09:00:53",
+    "strategy": "scout_strategy",
+    "mode": "PAPER"
+  },
+  {
+    "order_id": "PAPER-BUY-3035-20260424T101810-1",
+    "ticker": "3035",
+    "side": "BUY",
+    "order_type": "LMT",
+    "qty": 27,
+    "filled_qty": 27,
+    "price": 182.5,
+    "filled_price": 182.5,
+    "status": "FILLED",
+    "timestamp": "2026-04-24 10:18:10",
+    "strategy": "scout_strategy",
+    "mode": "PAPER"
+  },
+  {
+    "order_id": "PAPER-BUY-3035-20260424T113146-2",
+    "ticker": "3035",
+    "side": "BUY",
+    "order_type": "LMT",
+    "qty": 243,
+    "filled_qty": 243,
+    "price": 184.5,
+    "filled_price": 184.5,
+    "status": "FILLED",
+    "timestamp": "2026-04-24 11:31:46",
+    "strategy": "scout_strategy",
+    "mode": "PAPER"
+  },
+  {
+    "order_id": "PAPER-BUY-3045-20260424T120708-3",
+    "ticker": "3045",
+    "side": "BUY",
+    "order_type": "LMT",
+    "qty": 44,
+    "filled_qty": 44,
+    "price": 113.0,
+    "filled_price": 113.0,
+    "status": "FILLED",
+    "timestamp": "2026-04-24 12:07:08",
+    "strategy": "scout_strategy",
+    "mode": "PAPER"
+  }
+]

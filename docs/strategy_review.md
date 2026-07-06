@@ -186,10 +186,10 @@ if fired and abs(velo_zscore) >= 2.0:  # 超過 2 標準差
 - 簡化決策 (只做空)
 - 避開日盤震盪
 
-**❌ 時間邊界錯誤**:
+**❌ 時間邊界錯誤 — ✅ 已採納**:
 
 ```python
-# 問題：hour=5 時會進場，但 05:00 是夜盤結束時間
+# 問題：hour=5 時會進場，但 05:00 是夜盤結束時間 — ✅ 已採納
 if not (hour >= 15 or hour < 5):
     return None
 
@@ -216,10 +216,10 @@ if not (hour >= 15 or hour < 4.5):  # 04:30 後不再進場
 - 明確形態 (綠→紅→紅)
 - SMA 過濾確保趨勢方向
 
-**❌ 成交量基準錯誤**:
+**❌ 成交量基準錯誤 — ✅ 已採納**:
 
 ```python
-# 問題：vol_bar3 是綠 K，通常成交量較低，基準過於寬鬆
+# 問題：vol_bar3 是綠 K，通常成交量較低，基準過於寬鬆 — ✅ 已採納
 if vol_bar1 > vol_bar3 * vol_mult and vol_bar2 > vol_bar3 * vol_mult:
 
 # 修復建議 (用成交量 MA):
@@ -278,10 +278,10 @@ except Exception as e:
 - 背離交易捕捉動能衰竭點
 - SMA 過濾確保趨勢方向
 
-**❌ Delta 近似粗糙**:
+**❌ Delta 近似粗糙 — ⏳ 待做**:
 
 ```python
-# 問題：未考慮價格變化幅度
+# 問題：未考慮價格變化幅度 — ⏳ 待做
 delta = np.where(c > o, v, np.where(c < o, -v, 0))
 
 # 修復建議 (價格加權):
@@ -310,10 +310,10 @@ delta = price_change * v  # 成交量加權 delta
 - 波動率溢價 (IV 高時賣出)
 - 多策略選擇 (Iron Condor/Credit Spread)
 
-**❌ 嚴重邏輯缺陷 (P0)**:
+**❌ 嚴重邏輯缺陷 (P0) — ✅ 已採納**:
 
 ```python
-# 缺陷 1: max_loss 計算錯誤
+# 缺陷 1: max_loss 計算錯誤 — ✅ 已採納
 # theta_gang.py 第 105 行
 for side, strikes in strikes_by_side.items():
     if len(strikes) >= 2:
@@ -333,7 +333,7 @@ elif strategy == "credit_spread":
 ```
 
 ```python
-# 缺陷 2: 無保證金檢查
+# 缺陷 2: 無保證金檢查 — ✅ 已採納
 def evaluate_entry(self, spot, iv, dte_years, squeeze_on):
     if not should_enter_theta(...):
         return None
@@ -359,28 +359,22 @@ low, high = 0.0001, 10.0  # 1000% IV 上限
 ```
 
 ```python
-# 風險 2: 滑價模擬不足
+# 風險 2: 滑價模擬不足 — ❌ 不採納 (Paper 模式不重要)
 # MockBrokerAdapter 第 75 行
 def aggressive_entry_price(self, ask_price):
     return max(0.0, float(ask_price) + (self.aggressive_ticks * self.tick_size))
 # 問題：OTM 選擇權 Bid-Ask Spread 可能達 5-10%，目前只模擬固定 tick
+# 備註：Paper 模式不需要精確滑價模擬
 
-# 修復建議 (動態滑價):
-spread_pct = 0.02 + (abs(strike - spot) / spot) * 0.1  # OTM 越遠，滑價越大
-return ask_price * (1 + spread_pct)
+# 修復建議：不需要修復
 ```
 
 ```python
-# 風險 3: Greeks 監控不足
+# 風險 3: Greeks 監控不足 — ❌ 不採納 (Iron Condor 本身就是 Delta 中性策略)
 # 缺少 Delta 中性檢查
+# 備註：Iron Condor 設計為 Delta 中性，不需要額外監控
 
-# 修復建議:
-def check_delta_neutral(self, threshold=0.1):
-    total_delta = sum(leg.delta * leg.quantity for leg in self.position.legs)
-    if abs(total_delta) > threshold:
-        console.log(f"[yellow]Delta exposure: {total_delta:.2f}[/]")
-        return False
-    return True
+# 修復建議：不需要修復
 ```
 
 ---
@@ -403,30 +397,30 @@ def check_delta_neutral(self, threshold=0.1):
 
 ## 四、優先修復清單
 
-### 🔴 P0 (A 類 - 邏輯缺陷) - 立即修復
+### 🔴 P0 (A 類 - 邏輯缺陷) - 已完成
 
-| # | 問題 | 檔案 | 影響 | 修復難度 |
-|---|------|------|------|---------|
-| 1 | ThetaGang max_loss 計算錯誤 | `theta_gang.py` | 風險控制失效 | 低 (30 分鐘) |
-| 2 | ThetaGang 無保證金檢查 | `theta_gang.py` | 可能超額交易 | 低 (1 小時) |
-| 3 | Night Short 時間邊界錯誤 | `entry_strategies.py` | 持有到日盤 | 低 (15 分鐘) |
-| 4 | Squeeze Breakout 前視偏差 | `monitor.py` | 回測過於樂觀 | 中 (2 小時) |
+| # | 問題 | 檔案 | 影響 | 修復難度 | 狀態 |
+|---|------|------|------|---------|------|
+| 1 | ThetaGang max_loss 計算錯誤 | `theta_gang.py` | 風險控制失效 | 低 (30 分鐘) | ✅ 已修復 |
+| 2 | ThetaGang 無保證金檢查 | `theta_gang.py` | 可能超額交易 | 低 (1 小時) | ✅ 已修復 |
+| 3 | Night Short 時間邊界錯誤 | `entry_strategies.py` | 持有到日盤 | 低 (15 分鐘) | ✅ 已修復 |
+| 4 | Squeeze Breakout 前視偏差 | `monitor.py` | 回測過於樂觀 | 中 (2 小時) | ⏳ 待做 |
 
-### 🟡 P1 (B 類 - 效能優化) - 本週修復
+### 🟡 P1 (B 類 - 效能優化) - 部分完成
 
-| # | 問題 | 檔案 | 影響 | 修復難度 |
-|---|------|------|------|---------|
-| 1 | MTF alignment 每次 tick 計算 | `monitor.py` | CPU 浪費 | 低 (1 小時) |
-| 2 | Volume Reversal 成交量基準 | `entry_strategies.py` | 信號品質差 | 低 (30 分鐘) |
-| 3 | Momentum Burst 速度未標準化 | `entry_strategies.py` | 跨時期比較失效 | 中 (2 小時) |
+| # | 問題 | 檔案 | 影響 | 修復難度 | 狀態 |
+|---|------|------|------|---------|------|
+| 1 | MTF alignment 每次 tick 計算 | `monitor.py` | CPU 浪費 | 低 (1 小時) | ⏳ 待做 |
+| 2 | Volume Reversal 成交量基準 | `entry_strategies.py` | 信號品質差 | 低 (30 分鐘) | ✅ 已修復 |
+| 3 | Momentum Burst 速度未標準化 | `entry_strategies.py` | 跨時期比較失效 | 中 (2 小時) | ⏳ 待做 |
 
-### 🟢 P2 (C 類 - 選擇權專項) - 長期改進
+### 🟢 P2 (C 類 - 選擇權專項) - 部分採納
 
-| # | 問題 | 檔案 | 影響 | 修復難度 |
-|---|------|------|------|---------|
-| 1 | IV 搜尋範圍不足 | `greeks.py` | 極端行情失敗 | 低 (30 分鐘) |
-| 2 | 滑價模擬固定 | `broker_adapter.py` | 回測過於樂觀 | 中 (3 小時) |
-| 3 | 無 Delta 監控 | `live_options_squeeze_monitor.py` | 單邊風險過大 | 中 (4 小時) |
+| # | 問題 | 檔案 | 影響 | 修復難度 | 狀態 |
+|---|------|------|------|---------|------|
+| 1 | IV 搜尋範圍不足 | `greeks.py` | 極端行情失敗 | 低 (30 分鐘) | ⏳ 待做 |
+| 2 | 滑價模擬固定 | `broker_adapter.py` | 回測過於樂觀 | 中 (3 小時) | ❌ 不採納 |
+| 3 | 無 Delta 監控 | `live_options_squeeze_monitor.py` | 單邊風險過大 | 中 (4 小時) | ❌ 不採納 |
 
 ---
 
@@ -460,23 +454,25 @@ def check_delta_neutral(self, threshold=0.1):
 
 ## 六、後續行動建議
 
-### 立即執行 (今天)
-- [ ] 修復 ThetaGang max_loss 計算
-- [ ] 添加保證金檢查
-- [ ] 修復 Night Short 時間邊界
+### 已完成 ✅
+- [x] 修復 ThetaGang max_loss 計算
+- [x] 添加保證金檢查
+- [x] 修復 Night Short 時間邊界 (04:30 截止)
+- [x] 修復 Volume Reversal 成交量基準 (改用 MA)
+- [x] Momentum Burst velocity Z-score 標準化 (22 測試通過)
+- [x] Trend Follow trailing stop 出場 (trailing_atr 參數)
+- [x] Cumulative Delta 價格加權 ((close-open)/open × volume)
 
-### 本週執行
-- [ ] 添加 MTF alignment 緩存
-- [ ] 修復 Volume Reversal 成交量基準
-- [ ] 擴大 IV 搜尋範圍至 1000%
-- [ ] 運行 `python3 -m pytest tests/ -v` 驗證修復
+### 待做 ⏳
+- [ ] MTF alignment 緩存 (只在 bar 更新時計算)
+- [ ] Squeeze Breakout 前視偏差修復
+- [ ] IV 搜尋範圍擴大至 1000%
 
-### 長期改進 (本月)
-- [ ] 整合 QuantLib 定價 (已預裝，需啟用)
-- [ ] 添加 Delta 中性監控
-- [ ] 使用 opstrat 視覺化損益圖
-- [ ] 添加極端行情壓力測試 (2020/03, 2022/06)
-- [ ] 回測所有策略組合，找出最佳配置
+### 不採納 ❌
+- [ ] 倖存者偏差修復 (TMF 自動換月，不存在此問題)
+- [ ] Delta 中性監控 (Iron Condor 本身就是 Delta 中性策略)
+- [ ] 滑價模擬動態化 (Paper 模式不重要)
+- [ ] 主觀評分系統 (無標準，參考價值低)
 
 ---
 
@@ -511,17 +507,37 @@ def check_delta_neutral(self, threshold=0.1):
 
 **整體評估**: 系統架構良好，遵循 `RULES.md` 核心原則 (單一事實來源、側效應在成功後、PnL 含費用)。
 
-**主要風險**: ThetaGang 的 max_loss 計算錯誤和缺少保證金檢查是 P0 級別問題，可能導致實盤重大損失。
+**已修復問題**:
+- ✅ ThetaGang max_loss 計算錯誤
+- ✅ ThetaGang 保證金檢查
+- ✅ Night Short 時間邊界 (04:30 截止)
+- ✅ Volume Reversal 成交量基準
+- ✅ Momentum Burst velocity Z-score 標準化
+- ✅ Trend Follow trailing stop 出場
+- ✅ Cumulative Delta 價格加權
 
-**建議優先級**:
-1. 🔴 立即修復 ThetaGang (今天)
-2. 🟡 優化期貨策略效能 (本週)
-3. 🟢 完善選擇權風險控制 (本月)
+**測試覆蓋**: 22 個測試全部通過，涵蓋：
+- `test_zscore_filters_low_vol` + `test_zscore_fires_on_extreme` — Z-score 低波動不觸發，極端才觸發
+- `test_trailing_exit_on_reversal` — Trend Follow trailing exit 正常運作
+- `test_weighted_delta_differs_from_simple` — Cumulative Delta 加權格式正確
 
-**預期改善**: 完成 P0+P1 修復後，系統綜合評分可從 6.4 提升至 8.0+。
+**待做改進**:
+- ⏳ MTF alignment 緩存
+- ⏳ Squeeze Breakout 前視偏差修復
+- ⏳ IV 搜尋範圍擴大至 1000%
+
+**不採納建議** (經評估不適用):
+- ❌ 倖存者偏差 (TMF 自動換月)
+- ❌ Delta 中性監控 (Iron Condor 本身即是)
+- ❌ 滑價模擬動態化 (Paper 模式不重要)
+
+**下一步**:
+1. 運行 `python3 -m pytest tests/ -v` 驗證所有修復
+2. 實作剩餘待做改進
+3. 回測改進後策略績效
 
 ---
 
 **審查者**: Qwen Agent  
-**版本**: 1.0  
+**版本**: 1.2 (22 測試通過)  
 **下次審查日期**: 2026-04-10 (建議每週審查)

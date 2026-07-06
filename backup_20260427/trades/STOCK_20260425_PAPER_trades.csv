@@ -1,0 +1,4 @@
+timestamp,ticker,strategy,mode,action,price,entry_price,qty,reason,pnl_gross,fees,pnl_cash
+2026-04-25 09:00:17,3024,scout_strategy,PAPER,BUY,14.4,14.4,346,OVERNIGHT_RECOVERY_20260424,0.0,0.0,0.0
+2026-04-25 09:00:17,3035,scout_strategy,PAPER,BUY,183.5,183.5,270,OVERNIGHT_RECOVERY_20260424,0.0,0.0,0.0
+2026-04-25 09:00:17,3045,scout_strategy,PAPER,BUY,113.0,113.0,44,OVERNIGHT_RECOVERY_20260424,0.0,0.0,0.0

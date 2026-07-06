@@ -1,0 +1,16 @@
+{
+  "monitor": {
+    "start_time": "2026-04-23T00:37:42.846887",
+    "end_time": "2026-04-23T00:55:44.929101",
+    "bars_processed": 648,
+    "strategies_evaluated": {
+      "counter_vwap": 648,
+      "spring_upthrust": 648,
+      "kbar_feature": 648
+    }
+  },
+  "files": {
+    "attribution_data": "/Users/mylin/Documents/mylin102/tw-trading-unified/data/attribution/night_session",
+    "log_file": "/Users/mylin/Documents/mylin102/tw-trading-unified/logs/night_monitor.log"
+  }
+}

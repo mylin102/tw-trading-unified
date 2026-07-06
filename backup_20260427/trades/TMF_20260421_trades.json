@@ -1,0 +1,57 @@
+[
+  {
+    "type": "BUY",
+    "timestamp": "2026-04-22 00:50:14",
+    "price": 37810.0,
+    "lots": 1,
+    "direction": "LONG",
+    "pnl_pts": 0.0,
+    "pnl_cash": 0.0,
+    "friction_cost": 0.0,
+    "reason": "SPRING",
+    "cross_policy": {
+      "allow_trade": true,
+      "orb_weight": 1.0,
+      "vwap_weight": 1.0
+    }
+  },
+  {
+    "type": "ENTRY_DIAG",
+    "timestamp": "2026-04-22 00:50:14",
+    "signal": "BUY",
+    "price": 37810.0,
+    "lots": 1,
+    "direction": "LONG",
+    "reason": "SPRING",
+    "entry_diag": {
+      "momentum": -14.666666666666668,
+      "mom_velo": -4.555555555555556,
+      "vwap_distance_pts": 110.7,
+      "atr": 48.25,
+      "regime": "WEAK",
+      "score": -46.66666666666667,
+      "entry_price": 37810.0
+    },
+    "cross_policy": {
+      "allow_trade": true,
+      "orb_weight": 1.0,
+      "vwap_weight": 1.0
+    }
+  },
+  {
+    "type": "EXIT",
+    "timestamp": "2026-04-22 01:12:31",
+    "price": 37689.0,
+    "lots": 1,
+    "direction": "LONG",
+    "pnl_pts": -121.0,
+    "pnl_cash": -1265.0,
+    "friction_cost": 55.0,
+    "reason": "STOP_LOSS",
+    "cross_policy": {
+      "allow_trade": true,
+      "orb_weight": 1.0,
+      "vwap_weight": 1.0
+    }
+  }
+]

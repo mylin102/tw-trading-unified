@@ -1,0 +1,15 @@
+{
+  "exp_id": "EXP_20260412_071537_counter_vwap_audit",
+  "timestamp": "2026-04-12T07:15:37.133276",
+  "strategy": "counter_vwap",
+  "metrics": {
+    "total_pnl": -630114.7499999999,
+    "win_rate": 0.13043478260869565,
+    "trade_count": 23,
+    "sharpe": -2.6275959937147846,
+    "mdd": -0.85614198
+  },
+  "params": {},
+  "git_hash": "7a8a497",
+  "tag": "audit"
+}

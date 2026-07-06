@@ -1,0 +1,12 @@
+params:
+  shadow_mode: false
+  stop_atr_mult: 1.2
+  take_profit_atr_mult: 1.8
+  min_score: 70
+  max_breakout: 0.15
+  min_vol_spike: 1.2
+  max_vwap_dist_atr: 1.2
+  min_pullback_pct: 0.001
+  max_hold_bars: 6
+  max_size_mode: SCOUT
+  allow_scale: false

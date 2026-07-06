@@ -5,7 +5,6 @@
 """
 
 import pandas as pd
-import numpy as np
 from datetime import datetime
 from pathlib import Path
 import json
@@ -39,6 +38,11 @@ class DataStorage:
         
         # 初始化交易記錄
         self.trades = []
+        self.trade_buffer = []  # 交易緩衝區
+        self.buffer_size = 1000  # 每1000筆寫入一次
+        self.last_flush_time = datetime.now()
+        self.flush_interval = 60  # 每60秒寫入一次
+        
         if not self.trade_file.exists():
             self._save_trades()
     
@@ -56,32 +60,68 @@ class DataStorage:
         elif isinstance(timestamp, datetime):
             timestamp = self.tw_tz.localize(timestamp)
         
-        # 準備數據
-        row = {
+        # 準備數據 (GSD: Include all indicators to prevent None fields in dashboard)
+        row = data.copy()
+
+        # Normalize indicator types to ensure dashboard/backtest consistency
+        # fired/sqz_on/bull_align/bear_align -> int 0/1
+        for _bool_field in ("fired", "sqz_on", "bull_align", "bear_align"):
+            if _bool_field in row:
+                try:
+                    row[_bool_field] = 1 if bool(row[_bool_field]) else 0
+                except Exception:
+                    row[_bool_field] = 0
+
+        # regime -> string (avoid numeric or NaN types)
+        if 'regime' in row and row['regime'] is not None:
+            try:
+                row['regime'] = str(row['regime'])
+            except Exception:
+                row['regime'] = ''
+        else:
+            row['regime'] = ''
+
+        # score -> float (fallback 0.0)
+        try:
+            row['score'] = float(row.get('score', 0.0) or 0.0)
+        except Exception:
+            row['score'] = 0.0
+
+        # Fix: Convert trading_day to string to prevent None/NaN in CSV
+        if "trading_day" in row and row["trading_day"] is not None:
+            td = row["trading_day"]
+            if hasattr(td, "isoformat"):  # date object
+                row["trading_day"] = td.isoformat()
+            else:
+                row["trading_day"] = str(td)
+        
+        row.update({
             'timestamp': timestamp.strftime('%Y-%m-%d %H:%M:%S'),
-            'open': data.get('open', 0),
-            'high': data.get('high', 0),
-            'low': data.get('low', 0),
-            'close': data.get('close', 0),
-            'volume': data.get('volume', 0),
-            'vwap': data.get('vwap', 0),
-            'score': data.get('score', 0),
-            'sqz_on': data.get('sqz_on', False),
-            'mom_state': data.get('mom_state', 0),
-            'regime': data.get('regime', 'NORMAL'),
-            'bull_align': data.get('bull_align', False),
-            'bear_align': data.get('bear_align', False),
-            'in_pb_zone': data.get('in_pb_zone', False),
-        }
+            # Ensure basic fields exist for backward compatibility
+            'open': data.get('open', data.get('Open', 0)),
+            'high': data.get('high', data.get('High', 0)),
+            'low': data.get('low', data.get('Low', 0)),
+            'close': data.get('close', data.get('Close', 0)),
+            'volume': data.get('volume', data.get('Volume', 0)),
+            'bull_align': data.get('bullish_align', data.get('bull_align', False)),
+            'bear_align': data.get('bearish_align', data.get('bear_align', False)),
+        })
         
         # 轉換為 DataFrame
         df_row = pd.DataFrame([row])
         
-        # 檢查檔案是否存在
-        header = not self.market_file.exists()
-        
-        # 儲存
-        df_row.to_csv(self.market_file, mode='a', index=False, header=header)
+        # 儲存 (GSD Fix: Support dynamic column expansion)
+        if self.market_file.exists():
+            try:
+                df_existing = pd.read_csv(self.market_file)
+                df_combined = pd.concat([df_existing, df_row], ignore_index=True)
+                df_combined.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
+                df_combined.to_csv(self.market_file, index=False)
+            except Exception:
+                # Fallback to append if read fails
+                df_row.to_csv(self.market_file, mode='a', index=False, header=False)
+        else:
+            df_row.to_csv(self.market_file, index=False, header=True)
     
     def save_trade(self, trade: dict):
         """
@@ -100,26 +140,54 @@ class DataStorage:
             trade['timestamp'] = ts.strftime('%Y-%m-%d %H:%M:%S')
         
         self.trades.append(trade)
-        self._save_trades()
+        self.trade_buffer.append(trade)
         
-        # 同時儲存為 CSV (方便回測)
-        self._save_trades_csv()
+        # 檢查是否需要寫入檔案
+        self._check_and_flush_buffer()
+        
+    def _check_and_flush_buffer(self):
+        """檢查並寫入緩衝區"""
+        now = datetime.now()
+        
+        # 檢查緩衝區大小或時間間隔
+        if (len(self.trade_buffer) >= self.buffer_size or 
+            (now - self.last_flush_time).total_seconds() >= self.flush_interval):
+            self._flush_buffer()
     
-    def _save_trades(self):
-        """儲存交易記錄為 JSON"""
-        with open(self.trade_file, 'w', encoding='utf-8') as f:
-            json.dump(self.trades, f, indent=2, ensure_ascii=False)
+    def _flush_buffer(self):
+        """寫入緩衝區到檔案"""
+        if not self.trade_buffer:
+            return
+        
+        try:
+            # 寫入 JSON
+            self._save_trades()
+            
+            # 寫入 CSV (使用追加模式)
+            self._save_trades_csv_append()
+            
+            # 清空緩衝區
+            self.trade_buffer.clear()
+            self.last_flush_time = datetime.now()
+            
+        except Exception as e:
+            print(f"寫入緩衝區失敗: {e}")
     
-    def _save_trades_csv(self):
-        """儲存交易記錄為 CSV (回測格式)"""
-        if not self.trades:
+    def _save_trades_csv_append(self):
+        """使用追加模式儲存交易記錄為 CSV
+        包含 cross_policy 欄位: allow_trade, orb_weight, vwap_weight, policy_reason
+        同步寫入 exports/trades 與 logs/market_data 以方便 dashboard/diagn斷讀取
+        """
+        if not self.trade_buffer:
             return
         
         csv_file = self.trade_dir / f"{self.ticker}_{self.date_str}_trades.csv"
+        market_csv = self.market_dir / f"{self.ticker}_{self.date_str}_trades.csv"
         
         # 標準化欄位
         standardized = []
-        for t in self.trades:
+        for t in self.trade_buffer:
+            cp = t.get('cross_policy', {}) or {}
             std = {
                 'timestamp': t.get('timestamp', ''),
                 'type': t.get('type', ''),  # ENTRY, EXIT, PARTIAL_EXIT
@@ -129,11 +197,71 @@ class DataStorage:
                 'pnl_pts': t.get('pnl_pts', 0),
                 'pnl_cash': t.get('pnl_cash', 0),
                 'reason': t.get('reason', ''),  # STOP_LOSS, TAKE_PROFIT, VWAP, EOD
+                # Cross-policy fields (may be absent)
+                'allow_trade': cp.get('allow_trade', ''),
+                'orb_weight': cp.get('orb_weight', ''),
+                'vwap_weight': cp.get('vwap_weight', ''),
+                'policy_reason': cp.get('reason', '')
             }
             standardized.append(std)
         
         df = pd.DataFrame(standardized)
+        
+        # 使用追加模式，只在檔案不存在時寫入標題
+        header = not csv_file.exists()
+        df.to_csv(csv_file, mode='a', index=False, header=header)
+        # 同步寫入 market_data 路徑
+        try:
+            header_m = not market_csv.exists()
+            df.to_csv(market_csv, mode='a', index=False, header=header_m)
+        except Exception:
+            pass
+    
+    def _save_trades(self):
+        """儲存交易記錄為 JSON"""
+        with open(self.trade_file, 'w', encoding='utf-8') as f:
+            json.dump(self.trades, f, indent=2, ensure_ascii=False)
+    
+    def _save_trades_csv(self):
+        """儲存交易記錄為 CSV (回測格式)
+        包含 cross_policy 欄位以便後續回測審計
+        同步寫入 exports/trades 與 logs/market_data
+        """
+        if not self.trades:
+            return
+        
+        csv_file = self.trade_dir / f"{self.ticker}_{self.date_str}_trades.csv"
+        market_csv = self.market_dir / f"{self.ticker}_{self.date_str}_trades.csv"
+        
+        # 標準化欄位
+        standardized = []
+        for t in self.trades:
+            cp = t.get('cross_policy', {}) or {}
+            std = {
+                'timestamp': t.get('timestamp', ''),
+                'type': t.get('type', ''),  # ENTRY, EXIT, PARTIAL_EXIT
+                'direction': t.get('direction', ''),  # LONG, SHORT
+                'price': t.get('price', 0),
+                'lots': t.get('lots', 1),
+                'pnl_pts': t.get('pnl_pts', 0),
+                'pnl_cash': t.get('pnl_cash', 0),
+                'reason': t.get('reason', ''),  # STOP_LOSS, TAKE_PROFIT, VWAP, EOD
+                # Cross-policy fields
+                'allow_trade': cp.get('allow_trade', ''),
+                'orb_weight': cp.get('orb_weight', ''),
+                'vwap_weight': cp.get('vwap_weight', ''),
+                'policy_reason': cp.get('reason', '')
+            }
+            standardized.append(std)
+        
+        df = pd.DataFrame(standardized)
+        # Write canonical exports file
         df.to_csv(csv_file, index=False)
+        # Also write to market_data for dashboard/diagnostics
+        try:
+            df.to_csv(market_csv, index=False)
+        except Exception:
+            pass
     
     def export_for_backtest(self):
         """
@@ -208,6 +336,25 @@ def save_trade(trade: dict, ticker: str = "TMF"):
     storage.save_trade(trade)
 
 
+import threading
+
+_audit_lock = threading.Lock()
+
+
+def save_signal_audit(signal_record: dict, ticker: str = "TMF"):
+    """記錄信號審計軌跡（包含被拒絕的信號）— thread-safe"""
+    from pathlib import Path
+    log_dir = Path("logs/market_data")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.now().strftime("%Y%m%d")
+    audit_file = log_dir / f"{ticker}_{date_str}_signals_audit.csv"
+
+    with _audit_lock:
+        header = not audit_file.exists()
+        df = pd.DataFrame([signal_record])
+        df.to_csv(audit_file, mode='a', index=False, header=header)
+
+
 if __name__ == "__main__":
     # 測試
     storage = DataStorage("TMF")
@@ -232,8 +379,9 @@ if __name__ == "__main__":
         'direction': 'LONG',
         'price': 32050,
         'lots': 1,
+        'cross_policy': {}
     })
     
-    print(f"✓ 測試完成")
+    print("✓ 測試完成")
     print(f"  K 棒檔案：{storage.market_file}")
     print(f"  交易檔案：{storage.trade_file}")

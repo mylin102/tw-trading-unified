@@ -1,0 +1,66 @@
+{
+  "timestamp": "2026-04-22T22:22:59.027701",
+  "tests": {
+    "attribution_recorder_import": {
+      "success": true,
+      "message": "Import successful",
+      "timestamp": "2026-04-22T22:22:59.029085"
+    },
+    "attribution_recorder_functionality": {
+      "success": true,
+      "message": "Logged 1 rows successfully",
+      "timestamp": "2026-04-22T22:22:59.031562"
+    },
+    "router_integration": {
+      "success": true,
+      "message": "Router has attribution parameter",
+      "timestamp": "2026-04-22T22:22:59.031761"
+    },
+    "monitor_integration": {
+      "success": true,
+      "message": "Monitor has attribution integration",
+      "timestamp": "2026-04-22T22:22:59.032034"
+    },
+    "attribution_backtest": {
+      "success": true,
+      "message": "Generated 15 CSV files",
+      "timestamp": "2026-04-22T22:23:00.922496"
+    },
+    "attribution_report": {
+      "success": true,
+      "message": "Generated 4 report files",
+      "timestamp": "2026-04-22T22:23:01.484629"
+    },
+    "starvation_alerts": {
+      "success": true,
+      "message": "Alert check completed (return code: 0)",
+      "timestamp": "2026-04-22T22:23:01.820874"
+    },
+    "reorder_simulation": {
+      "success": true,
+      "message": "Generated 5 simulation files",
+      "timestamp": "2026-04-22T22:23:02.392048"
+    },
+    "night_automation": {
+      "success": true,
+      "message": "Automation summary generated",
+      "timestamp": "2026-04-22T22:23:03.063840"
+    },
+    "launcher_script": {
+      "success": true,
+      "message": "Launcher script works",
+      "timestamp": "2026-04-22T22:23:03.077036"
+    },
+    "dashboard_integration": {
+      "success": true,
+      "message": "Dashboard has attribution tab",
+      "timestamp": "2026-04-22T22:23:03.077443"
+    }
+  },
+  "summary": {
+    "total_tests": 11,
+    "passed": 11,
+    "failed": 0,
+    "success_rate": 1.0
+  }
+}

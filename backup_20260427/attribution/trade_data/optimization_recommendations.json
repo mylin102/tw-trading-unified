@@ -1,0 +1,25 @@
+[
+  {
+    "strategy": "counter_vwap",
+    "actions": [
+      "✅ Anchor: Keep as priority 1 (high win rate)"
+    ]
+  },
+  {
+    "strategy": "spring_upthrust",
+    "actions": [
+      "⚠️  Monitor: Current position 2 is acceptable",
+      "🎯 Tuning: Adjust spring detection sensitivity"
+    ]
+  },
+  {
+    "strategy": "kbar_feature",
+    "actions": [
+      "🚨 Priority: Move to position 2 (after counter_vwap)",
+      "🎯 Tuning: Lower score threshold from -20 to -15",
+      "🎯 Tuning: Reduce ADX requirement from 20 to 18",
+      "🎯 Tuning: Add volume spike condition",
+      "⚡ Entry: Add momentum confirmation filter"
+    ]
+  }
+]

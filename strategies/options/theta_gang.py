@@ -11,8 +11,13 @@ Entry: squeeze_on (low vol compression) → sell premium
 Exit: target profit %, max loss %, DTE floor, or squeeze release
 """
 import datetime
+import re
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, List
+from rich.console import Console
+
+console = Console()
+SUPPORTED_LIVE_COMBO_STRATEGIES = {"bull_put_spread", "bear_call_spread"}
 
 
 @dataclass
@@ -38,40 +43,69 @@ class SpreadPosition:
         return self.entry_time is not None and self.net_credit > 0
 
 
-def select_strikes(spot, strike_rounding, strategy, wing_width=200, otm_offset=200):
+def select_strikes(spot, strike_rounding, strategy, wing_width=200, otm_offset=200, skew_regime=None):
     """
     Select strikes for spread strategies.
+
+    When skew_regime is provided, adjusts wing widths asymmetrically:
+    - LEFT_SKEW (fear): widen put wing +50%, tighten call wing -50%
+    - RIGHT_SKEW (euphoria): tighten put wing -50%, widen call wing +50%
+    - PARALLEL (tension): reduce position size (handled by caller)
+    - NEUTRAL or None: use defaults
+
     spot: current underlying price
     strike_rounding: TXO strike interval (100 for TXO)
     wing_width: distance between spread legs
     otm_offset: how far OTM to place short strike
+    skew_regime: optional dict from SkewRegime.to_dict()
     """
+    # Apply skew regime adjustments
+    put_offset = otm_offset
+    call_offset = otm_offset
+    put_wing = wing_width
+    call_wing = wing_width
+
+    if skew_regime is not None:
+        shape = skew_regime.get("shape", "NEUTRAL")
+        if shape == "LEFT_SKEW":
+            # Fear: widen put protection, tighten call
+            put_offset = int(otm_offset * 1.5)
+            put_wing = int(wing_width * 1.5)
+            call_offset = int(otm_offset * 0.5)
+            call_wing = int(wing_width * 0.5)
+        elif shape == "RIGHT_SKEW":
+            # Euphoria: widen call protection, tighten put
+            call_offset = int(otm_offset * 1.5)
+            call_wing = int(wing_width * 1.5)
+            put_offset = int(otm_offset * 0.5)
+            put_wing = int(wing_width * 0.5)
+
     def round_strike(p):
         return round(p / strike_rounding) * strike_rounding
 
-    atm = round_strike(spot)
+    round_strike(spot)
 
     if strategy == "bull_put_spread":
-        short_put = round_strike(spot - otm_offset)
-        long_put = short_put - wing_width
+        short_put = round_strike(spot - put_offset)
+        long_put = short_put - put_wing
         return [
             SpreadLeg("P", short_put, "SELL"),
             SpreadLeg("P", long_put, "BUY"),
         ]
 
     elif strategy == "bear_call_spread":
-        short_call = round_strike(spot + otm_offset)
-        long_call = short_call + wing_width
+        short_call = round_strike(spot + call_offset)
+        long_call = short_call + call_wing
         return [
             SpreadLeg("C", short_call, "SELL"),
             SpreadLeg("C", long_call, "BUY"),
         ]
 
     elif strategy == "iron_condor":
-        short_put = round_strike(spot - otm_offset)
-        long_put = short_put - wing_width
-        short_call = round_strike(spot + otm_offset)
-        long_call = short_call + wing_width
+        short_put = round_strike(spot - put_offset)
+        long_put = short_put - put_wing
+        short_call = round_strike(spot + call_offset)
+        long_call = short_call + call_wing
         return [
             SpreadLeg("P", short_put, "SELL"),
             SpreadLeg("P", long_put, "BUY"),
@@ -80,8 +114,8 @@ def select_strikes(spot, strike_rounding, strategy, wing_width=200, otm_offset=2
         ]
 
     elif strategy == "short_strangle":
-        short_put = round_strike(spot - otm_offset)
-        short_call = round_strike(spot + otm_offset)
+        short_put = round_strike(spot - put_offset)
+        short_call = round_strike(spot + call_offset)
         return [
             SpreadLeg("P", short_put, "SELL"),
             SpreadLeg("C", short_call, "SELL"),
@@ -132,6 +166,19 @@ def price_spread(legs, bs_fn, spot, r, sigma, dte_years):
     return net_credit, max_loss, details
 
 
+def calculate_wing_width(legs):
+    if len(legs) != 2:
+        return 0.0
+    return abs(float(legs[0].strike) - float(legs[1].strike))
+
+
+def calculate_vertical_max_loss(legs, net_credit):
+    wing_width = calculate_wing_width(legs)
+    if wing_width <= 0:
+        return 0.0
+    return max(0.0, wing_width - max(0.0, float(net_credit or 0.0)))
+
+
 def should_enter_theta(squeeze_on, iv, iv_rank_pct=None, min_iv=0.18, min_dte=5):
     """
     ThetaGang entry conditions:
@@ -145,6 +192,20 @@ def should_enter_theta(squeeze_on, iv, iv_rank_pct=None, min_iv=0.18, min_dte=5)
         return False
     if iv_rank_pct is not None and iv_rank_pct < 30:
         return False
+    return True
+
+
+def has_directional_entry_bias(strategy, score, score_floor=None):
+    if score_floor is None:
+        return True
+    if score is None:
+        return True
+
+    threshold = float(score_floor or 0.0)
+    if strategy == "bull_put_spread":
+        return float(score) >= threshold
+    if strategy == "bear_call_spread":
+        return float(score) <= -threshold
     return True
 
 
@@ -195,19 +256,37 @@ class ThetaGangManager:
         self.quantity = self.cfg.get("quantity", 1)
         self.r = self.cfg.get("risk_free_rate", 0.02)
 
-    def evaluate_entry(self, spot, iv, dte_years, squeeze_on):
-        """Check if we should open a ThetaGang position."""
+    def evaluate_entry(self, spot, iv, dte_years, squeeze_on, *, score=None, skew_regime=None):
+        """Check if we should open a ThetaGang position.
+
+        Args:
+            spot: underlying price
+            iv: implied volatility
+            dte_years: days to expiry in years
+            squeeze_on: bool — vol compression active
+            score: optional directional score
+            skew_regime: optional dict from SkewRegime.to_dict() for asymmetric wings
+        """
         if self.position and self.position.is_open:
             return None
 
         if not should_enter_theta(squeeze_on, iv, min_iv=self.cfg.get("min_iv", 0.18)):
             return None
 
+        # PARALLEL regime: skip entry (tension = wide vol, not good for theta)
+        if skew_regime is not None and skew_regime.get("shape") == "PARALLEL":
+            console.print("[yellow]ThetaGang: PARALLEL regime — skipping entry (vol tension)[/yellow]")
+            return None
+
+        directional_floor = self.cfg.get("directional_score_floor")
+        if not has_directional_entry_bias(self.strategy, score, directional_floor):
+            return None
+
         if dte_years * 365 < self.cfg.get("min_dte_entry", 7):
             return None
 
         legs = select_strikes(spot, self.strike_rounding, self.strategy,
-                              self.wing_width, self.otm_offset)
+                              self.wing_width, self.otm_offset, skew_regime=skew_regime)
         if not legs:
             return None
 
@@ -218,6 +297,11 @@ class ThetaGangManager:
         min_credit = self.cfg.get("min_credit", 30)
         if net_credit < min_credit:
             return None
+        
+        # GSD fix: 確保net_credit有效
+        if net_credit <= 0:
+            console.print(f"[yellow]⚠️ ThetaGang: net_credit={net_credit} <= 0, rejecting entry[/yellow]")
+            return None
 
         return {
             "strategy": self.strategy,
@@ -225,7 +309,51 @@ class ThetaGangManager:
             "net_credit": net_credit,
             "max_loss": max_loss,
             "details": details,
+            "score_at_entry": score,
         }
+
+    def is_live_combo_strategy_supported(self, strategy=None):
+        return (strategy or self.strategy) in SUPPORTED_LIVE_COMBO_STRATEGIES
+
+    def validate_live_combo(self, entry_info):
+        strategy = (entry_info or {}).get("strategy", self.strategy)
+        if not self.is_live_combo_strategy_supported(strategy):
+            return False, f"unsupported_live_strategy:{strategy}"
+
+        legs = list((entry_info or {}).get("legs") or [])
+        if len(legs) != 2:
+            return False, f"live_combo_requires_two_legs:{strategy}"
+
+        actions = {str(getattr(leg, "action", "")).upper() for leg in legs}
+        if actions != {"SELL", "BUY"}:
+            return False, "live_combo_requires_one_sell_one_buy"
+
+        option_sides = {str(getattr(leg, "side", "")).upper() for leg in legs}
+        if len(option_sides) != 1:
+            return False, "live_combo_requires_vertical_wings"
+
+        wing_width = calculate_wing_width(legs)
+        net_credit = float((entry_info or {}).get("net_credit") or 0.0)
+        max_loss = float((entry_info or {}).get("max_loss") or 0.0)
+        if max_loss <= 0:
+            max_loss = calculate_vertical_max_loss(legs, net_credit)
+        if wing_width <= 0 or max_loss <= 0:
+            return False, "live_combo_requires_positive_max_loss"
+
+        return True, {
+            "strategy": strategy,
+            "legs": legs,
+            "net_credit": net_credit,
+            "max_loss": max_loss,
+            "wing_width": wing_width,
+            "quantity": int((entry_info or {}).get("quantity") or self.quantity or 1),
+        }
+
+    def live_combo_margin_required(self, entry_info):
+        valid, payload = self.validate_live_combo(entry_info)
+        if not valid:
+            return 0.0
+        return float(payload["max_loss"]) * 50.0 * int(payload["quantity"])
 
     def open_position(self, entry_info):
         """Record a new ThetaGang position."""
@@ -239,7 +367,40 @@ class ThetaGangManager:
         )
         return self.position
 
-    def evaluate_exit(self, spot, iv, dte_years, squeeze_on):
+    def restore_position(self, note: str, *, timestamp: datetime.datetime | None = None, quantity: int | None = None):
+        """Rebuild an open theta position from the paper ledger note on restart."""
+        if not note:
+            return None
+
+        strategy_match = re.search(r"strategy=([a-z_]+)", note)
+        credit_match = re.search(r"credit=([0-9.]+)", note)
+        max_loss_match = re.search(r"max_loss=([0-9.]+)", note)
+        legs_match = re.search(r"\[(.+)\]", note)
+        if not strategy_match or not credit_match or not legs_match:
+            return None
+
+        legs: List[SpreadLeg] = []
+        for part in [segment.strip() for segment in legs_match.group(1).split("|")]:
+            leg_match = re.match(r"(SELL|BUY)\s+([CP])([0-9.]+)", part)
+            if not leg_match:
+                continue
+            action, side, strike_str = leg_match.groups()
+            legs.append(SpreadLeg(side=side, strike=float(strike_str), action=action))
+
+        if not legs:
+            return None
+
+        self.position = SpreadPosition(
+            strategy=strategy_match.group(1),
+            legs=legs,
+            entry_time=timestamp or datetime.datetime.now(),
+            net_credit=float(credit_match.group(1)),
+            max_loss=float(max_loss_match.group(1)) if max_loss_match else 0.0,
+            quantity=int(quantity or self.quantity),
+        )
+        return self.position
+
+    def evaluate_exit(self, spot, iv, dte_years, squeeze_on, *, allow_squeeze_release=True):
         """Check if we should close the ThetaGang position."""
         if not self.position or not self.position.is_open:
             return None
@@ -259,13 +420,31 @@ class ThetaGangManager:
             self.position, current_value, dte_years * 365, exit_cfg)
 
         # Also exit if squeeze releases (vol expanding)
-        if not squeeze_on and self.cfg.get("exit_on_squeeze_release", True):
+        if (
+            not squeeze_on
+            and allow_squeeze_release
+            and self.cfg.get("exit_on_squeeze_release", True)
+        ):
             should_exit = True
             reason = "SQUEEZE_RELEASE (vol expanding)"
 
         if should_exit:
+            # 計算淨PnL（包含交易成本）
+            gross_pnl = self.position.net_credit - current_value
+            # 交易成本：進出各一次
+            # 假設每邊手續費20元，交易所費用5元，稅0.1%
+            broker_fee = 20 * 2 * self.position.quantity  # 進出各一次
+            exchange_fee = 5 * 2 * self.position.quantity
+            tax_rate = 0.001
+            tax = (self.position.net_credit + current_value) * 50 * tax_rate * self.position.quantity
+            total_cost = broker_fee + exchange_fee + tax
+            net_pnl = gross_pnl * 50 - total_cost  # 轉換為台幣，減去成本
+            
+            # 轉換回點數（四捨五入）
+            pnl_points = round(net_pnl / 50)
+            
             return {"reason": reason, "current_value": current_value,
-                    "pnl": self.position.net_credit - current_value}
+                    "pnl": pnl_points, "gross_pnl": gross_pnl, "cost": total_cost}
         return None
 
     def close_position(self):

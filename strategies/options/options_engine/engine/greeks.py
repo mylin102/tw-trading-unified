@@ -76,8 +76,10 @@ def find_implied_volatility(target_price, S, K, T, r, option_type='C'):
     for _ in range(30): # 增加疊代次數提升精度
         mid = (low + high) / 2
         res = black_scholes(S, K, T, r, mid, option_type)
-        if res["price"] < target_price: low = mid
-        else: high = mid
+        if res["price"] < target_price:
+            low = mid
+        else:
+            high = mid
     return mid
 
 def calculate_dte(delivery_date, now=None):

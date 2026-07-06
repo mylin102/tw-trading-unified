@@ -1,0 +1,5 @@
+Timestamp,Mode,Action,Side,Price,Quantity,PnL,Balance,Note
+2026-04-30 13:30:31,V2,PAPER_ENTRY,P,1260.0,1,0,0,score=-93.3
+2026-04-30 16:06:07,V2,PAPER_EXIT,P,1070.0,1,-9666.0,-9666.0,hard_stop score=20.0
+2026-04-30 17:03:03,V2,PAPER_ENTRY,C,1130.0,1,0,-9666.0,score=93.3
+2026-04-30 17:04:04,V2,PAPER_REVERSAL_EXIT,C,1110.0,1,-1162.0,-10828.0,SCORE_REVERSAL score=-80.0 <= -22 (was bullish; now bearish)

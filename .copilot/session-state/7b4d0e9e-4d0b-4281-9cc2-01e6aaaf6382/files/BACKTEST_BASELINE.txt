@@ -1,0 +1,77 @@
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║                                                                            ║
+║               PHASE 1: BASELINE BACKTEST RESULTS                          ║
+║                                                                            ║
+║          Current Squeeze Strategy (config/futures.yaml)                   ║
+║          Historical Period: 90 days                                       ║
+║          Generated: 2026-04-08 16:33:46                                 ║
+║                                                                            ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+PERFORMANCE SUMMARY
+═══════════════════════════════════════════════════════════════════════════════
+
+Total Trades:              8
+  • Winning trades:        5
+  • Losing trades:         3
+
+Win Rate:                  62.5%
+Total PnL:                 192920 TWD
+
+Profit Metrics:
+  • Average Win:           39959 TWD
+  • Average Loss:          -2292 TWD
+  • Profit Factor:         29.06x
+  • Max Drawdown:          -6876 TWD
+
+Trade Duration:
+  • Avg Bars Held:         21 bars (25 mins each)
+
+
+ANALYSIS & INSIGHTS
+═══════════════════════════════════════════════════════════════════════════════
+
+Win Rate Assessment: 62.5%
+  ✅ GOOD: Above 55% → Entry quality acceptable
+
+Profit Factor Assessment: 29.06x
+  ✅ GOOD: Above 2.0 → Wins are 2x+ bigger than losses
+
+Risk/Reward Ratio: 17.43:1
+  ✅ GOOD: Above 2:1 → Healthy risk/reward ratio
+
+
+OPTIMIZATION RECOMMENDATIONS
+═══════════════════════════════════════════════════════════════════════════════
+
+Based on this baseline, the following Phase 2 hypotheses are recommended:
+
+1. ENTRY QUALITY (Win Rate < 55%)
+   → Test: Longer EMA periods (25/75 instead of 20/60)
+   → Test: Tighter regime filter (require multi-TF alignment)
+   → Expected: Reduce false breakouts, improve win rate
+
+2. RISK MANAGEMENT (Profit Factor < 2.0)
+   → Test: ATR-based stops instead of fixed 60pt
+   → Test: Delayed partial exits (let winners run longer)
+   → Expected: Better reward/risk ratio, higher profit factor
+
+3. TRADE MANAGEMENT (Avg Loss High)
+   → Test: Wider initial stops (15-20pts) for reversal room
+   → Test: Increase take profit targets
+   → Expected: Fewer whipsaws, better profitability
+
+
+NEXT STEPS
+═══════════════════════════════════════════════════════════════════════════════
+
+Phase 2: Run hypothesis testing (15 backtest variants)
+  → Hypothesis 1: Stronger squeeze confirmation
+  → Hypothesis 2: ATR-based stop loss
+  → Hypothesis 3: Improved partial exits
+  → Hypothesis 4: Tighter regime filter
+  → Hypothesis 5: Risk/reward ratio
+
+Phase 3: Validate best 2-3 combinations
+Phase 4: Deploy optimized config to paper trading

@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+⚠️ 遺留程式碼 - 選擇權訂單管理器 (Shioaji API 整合版)
+====================================================
+
+⚠️ 注意：此模組已不再使用，系統統一使用 core/order_management/order_manager.py
+⚠️ 保留此檔案僅供歷史參考，請勿在新開發中使用
+
+原始說明：
 真實下單模組 - 訂單管理器 (Shioaji API 整合版)
 
 職責:
@@ -19,10 +26,15 @@ Shioaji API 參考:
 - 選擇權：api.Contracts.Options.TXO
 - 訂單類型：LMT (限價), MKT (市價), STP (停損單)
 - 委託條件：ROD (當日有效), IOC (立即成交否則取消)
+
+⚠️ 遷移說明：
+- 新開發請使用 core/order_management/order_manager.py
+- 此檔案中的功能已整合到核心 OrderManager
+- 如需類似功能，請參考核心系統的實現
 """
 
 import datetime
-from typing import Dict, Optional, Callable, List
+from typing import Dict, Optional, Callable
 from pathlib import Path
 import sys
 

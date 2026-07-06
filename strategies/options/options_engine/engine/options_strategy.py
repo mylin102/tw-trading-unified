@@ -34,6 +34,10 @@ def get_stop_loss_pct(cfg, default=0.3):
     return get_risk_cfg(cfg).get("stop_loss_pct", default)
 
 
+def get_hard_stop_pct(cfg, default=None):
+    return get_risk_cfg(cfg).get("hard_stop_pct", default)
+
+
 def get_score_floor(cfg, default=20):
     return get_strategy_cfg(cfg).get("score_floor", default)
 
@@ -72,11 +76,11 @@ def infer_mid_trend(m15):
 def resolve_entry_side(row, score, price_mtx, score_thresh, mid_trend=None, require_mid_trend=False):
     if row.get("sqz_on", True):
         return None
-    if score >= score_thresh and price_mtx > row["vwap"]:
+    if score >= score_thresh and price_mtx >= row["vwap"]:
         if require_mid_trend and mid_trend != "BULL":
             return None
         return "C"
-    if score <= -score_thresh and price_mtx < row["vwap"]:
+    if score <= -score_thresh and price_mtx <= row["vwap"]:
         if require_mid_trend and mid_trend != "BEAR":
             return None
         return "P"

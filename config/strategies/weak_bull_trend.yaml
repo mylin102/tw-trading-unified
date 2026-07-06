@@ -1,0 +1,42 @@
+# weak_bull_trend 策略配置
+# WEAK Regime 防守型多頭趨勢策略
+# 目標：小倉位 / 快進快出 / 嚴格停損 / 不加碼
+
+params:
+  # 止損/止盈 - 防守型盈虧比 ~1.5:1
+  stop_atr_mult: 0.8       # 緊止損 (0.8 ATR)
+  take_profit_atr_mult: 1.2  # 保守止盈 (1.2 ATR)
+  # 盈虧比 = 1.2 / 0.8 = 1.5:1
+
+  # VWAP 距離門檻 (價格在 VWAP 之上，但不要追太遠)
+  max_vwap_dist_atr: 2.0   # 2.0 ATR，允許合理偏離
+
+  # 動能門檻 (溫和正向，不要過熱)
+  min_mom_velo_bullish: 3.0   # 至少 +3 才有動能
+  max_mom_velo_bullish: 25.0  # 高於 +25 視為過熱不追
+
+  # ADX 上限 (WEAK regime 不應有高 ADX)
+  max_adx: 30.0
+
+  # 最小成交量確認
+  min_vol_spike: 1.0       # 正常量即可，不需要爆量
+
+  # 最小突破強度 (避免弱勢反彈)
+  min_breakout_strength: 0.3
+
+  # VWAP 對齊要求
+  require_vwap_alignment: true  # 價格必須在 VWAP 之上
+
+  # Shadow mode (paper trading，關閉)
+  shadow_mode: false
+
+  # ── 追高防禦 ──
+  # 1. 距離 VWAP 的 ATR 倍數上限 (避免偏離太遠追高)
+  max_distance_from_vwap_atr: 1.2
+  # 2. 前一根 K 棒實體大小上限 (避免追在大陽線之後)
+  block_if_prior_bar_large_body_atr: 1.5
+  # 3. 開盤後最少 bars 數 (至少 N 根 bar 後才進場，讓 ORB 完成)
+  min_bars_since_open: 3
+
+  # 時間止損 (分鐘) - 快進快出
+  time_stop_minutes: 12    # 12 分鐘無獲利就走

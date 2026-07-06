@@ -1,0 +1,33 @@
+# Options V2 Squeeze — Plugin Config
+# Used by strategies/plugins/options/v2_squeeze.py
+
+strategy:
+  # Entry scoring
+  entry_score: 60               # Minimum |score| to consider entry
+  score_floor: 20               # Floor below which exits are suppressed
+
+  # Squeeze fire detection
+  require_fire: true
+  fire_score_threshold: 60      # Minimum |score| to accept unfired squeeze
+
+  # MTF alignment
+  require_align: true
+  require_mid_trend: true
+
+  # Timeframe weights (must sum ~1.0)
+  weights:
+    1h: 0.4
+    15m: 0.4
+    5m: 0.2
+
+  # Stop loss
+  atr_sl_mult: 2.0              # ATR multiplier for stop-loss distance
+
+  # V2 mode specifics
+  trailing_stop_pct: 0.15       # Trail after 8% unrealized gain
+  tp1_pct: 0.5                  # TP1 partial profit at 50%
+  hold_mode: swing              # swing | daytrade | night
+  delivery_pref: monthly        # monthly | near
+
+  # Cooldown after exit
+  cooldown_bars: 3

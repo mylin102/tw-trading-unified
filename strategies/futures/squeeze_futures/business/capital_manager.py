@@ -11,7 +11,7 @@
 """
 
 import numpy as np
-from typing import Dict, Optional, List
+from typing import Dict, List
 from dataclasses import dataclass
 from rich.console import Console
 
@@ -280,7 +280,7 @@ class CapitalManager:
         adjusted_risk = self.config.risk_per_trade * signal_confidence
         
         # 計算建議部位
-        temp_config = CapitalConfig(
+        CapitalConfig(
             initial_capital=self.current_capital,
             risk_per_trade=adjusted_risk,
         )
@@ -318,7 +318,7 @@ class CapitalManager:
         
         # 績效統計
         if self.trade_results:
-            console.print(f"\n[bold]Performance Statistics:[/bold]")
+            console.print("\n[bold]Performance Statistics:[/bold]")
             console.print(f"  Total Trades: {len(self.trade_results)}")
             console.print(f"  Win Rate: {self.win_rate:.1%}")
             console.print(f"  Avg Win: {self.avg_win:,.0f} TWD")
@@ -327,6 +327,6 @@ class CapitalManager:
         
         # 部位建議
         if self.positions:
-            console.print(f"\n[bold]Current Positions:[/bold]")
+            console.print("\n[bold]Current Positions:[/bold]")
             for symbol, pos in self.positions.items():
                 console.print(f"  {symbol}: {pos.lots} lots, {pos.position_value:,.0f} TWD")

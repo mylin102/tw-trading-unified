@@ -1,102 +1,122 @@
 active_mode: V2
+entry_score: 30
+execution:
+  aggressive_ticks: 1
+  broker_fee_per_side: 20.0
+  exchange_fee_per_side: 5.0
+  max_order_retries: 1
+  max_spread_pct: 0.1
+  order_timeout_secs: 15
+  order_type: Limit
+exit_optimization:
+  eod_panic_time: '13:30'
+  eod_passive_ticks: 1
+  eod_passive_window_mins: 20
+  opening_spike_capture: true
+  opening_target_pct: 0.25
+  shutdown_grace_mins: 1
+exit_strategy:
+  lots_per_trade: 2
+  tp1_pct: 3.0
 live_trading: false
-strategy:
-  length: 20
-  entry_score: 60
-  score_floor: 20
-  regime_filter: mid
-  use_opening_logic: true
-  require_fire: true
-  require_align: true
-  fallback_underlying_price: 33500
-  monthly_delivery_min_days: 14
-  cooldown_bars: 3
-  weights:
-    1h: 0.4
-    15m: 0.4
-    5m: 0.2
-  tsm_strategy:
-    enabled: true
-    tsm_threshold: 0.0
-    nvda_threshold: 0.0
-    sox_threshold: 0.0
+monitoring:
+  use_order_manager: true
+max_iv: 0.6
+min_iv: 0.15
+mode: V2
 modes:
   V1:
+    delivery_pref: near
+    force_close_at_end: true
     holding_mode: daytrade
-    delivery_pref: near
     tp1_pct: 1.0
-    force_close_at_end: true
   V2:
-    holding_mode: swing
+    bear_boost_pct: 0.6
     delivery_pref: monthly
-    tp1_pct: 0.3
-    bear_boost_pct: 0.8
     force_close_at_end: false
-    trailing_stop_pct: 0.15
+    holding_mode: swing
+    tp1_pct: 3.0
+    trailing_stop_pct: 2.0
   V3:
-    holding_mode: night
+    bear_boost_pct: 0.6
     delivery_pref: near
-    tp1_pct: 1.0
-    bear_boost_pct: 0.8
     force_close_at_end: true
-exit_optimization:
-  eod_passive_window_mins: 20
-  eod_passive_ticks: 3
-  eod_panic_time: '13:30'
-  shutdown_grace_mins: 1
-  opening_spike_capture: true
-  opening_target_pct: 0.15
-execution:
-  order_type: Limit
-  aggressive_ticks: 2
-  max_spread_pct: 0.05
-  order_timeout_secs: 30
-  max_order_retries: 1
-pricing:
-  pricing_model: quantlib
-  entry_premium_mode: model
-  default_iv: 0.25
-  min_iv: 0.18
-  max_iv: 0.32
-  bull_call_iv_mult: 0.95
-  bear_put_iv_mult: 1.05
-  neutral_iv_mult: 1.0
-  risk_free_rate: 0.02
-  near_dte_days: 3.0
-  expiry_dte_floor_days: 0.35
-  strike_rounding: 100
-risk_mgmt:
-  stop_loss_pct: 0.1
-  lots_per_trade: 2
-  max_positions: 2
-  initial_capital: 40000
-  max_holding_days: 7
-  min_dte_to_exit: 3
-  max_position_size: 0.05
-  max_daily_loss: 0.02
+    holding_mode: night
+    tp1_pct: 1.0
 night_trading:
   enabled: true
-  session_start: '15:00'
+  force_close: 04:45
   session_end: 05:00
-  us_open_winter: '20:30'
+  session_start: '15:00'
   us_open_summer: '21:30'
-  force_close: 04:30
-exit_strategy:
-  stop_loss_pct: 0.2
+  us_open_winter: '20:30'
+pricing:
+  bear_put_iv_mult: 1.05
+  bull_call_iv_mult: 0.95
+  default_iv: 0.25
+  entry_premium_mode: model
+  expiry_dte_floor_days: 7.0
+  max_iv: 0.4
+  min_iv: 0.12
+  near_dte_days: 3.0
+  neutral_iv_mult: 1.0
+  pricing_model: quantlib
+  risk_free_rate: 0.02
+  strike_rounding: 100
+risk_mgmt:
+  entry_premium_limit: 1500
+  initial_capital: 100000
   lots_per_trade: 1
-  tp1_pct: 1.0
+  max_daily_loss: 0.03
+  max_holding_days: 7
+  max_position_size: 0.08
+  max_positions: 1
+  min_dte_to_exit: 7.0
+  opening_grace_mins: 5
+  stop_loss_pct: 0.25
+  hard_stop_pct: 0.15
+strategy:
+  cooldown_bars: 2
+  entry_score: 20
+  fallback_underlying_price: 33500
+  fire_score_threshold: 40
+  length: 20
+  monthly_delivery_min_days: 14
+  regime_filter: mid
+  require_align: false
+  require_fire: false
+  score_floor: 10
+  tsm_strategy:
+    enabled: true
+    nvda_threshold: 0.0
+    sox_threshold: 0.0
+    tsm_threshold: 0.0
+  use_opening_logic: true
+  weights:
+    15m: 0.4
+    1h: 0.4
+    5m: 0.2
 theta_gang:
-  enabled: true
   auto_regime: true
-  strategy: iron_condor
-  wing_width: 200
-  otm_offset: 200
-  quantity: 1
-  min_iv: 0.18
+  enabled: false
+  exit_on_squeeze_release: true
+  max_loss_pct: 1.0
+  min_credit: 30
   min_dte_entry: 7
   min_dte_exit: 3
-  min_credit: 30
-  take_profit_pct: 0.5
-  max_loss_pct: 1.0
-  exit_on_squeeze_release: true
+  min_iv: 0.12
+  otm_offset: 200
+  quantity: 1
   risk_free_rate: 0.02
+  strategy: iron_condor
+  take_profit_pct: 0.2
+  wing_width: 200
+  cooldown_bars: 20
+  min_holding_bars: 10
+  squeeze_release_confirm_bars: 2
+  max_bar_price_deviation_pts: 250
+  exit_on_theta: true
+  stop_loss_pct: 0.05
+vertical_spread:
+  enabled: true
+  width: 100

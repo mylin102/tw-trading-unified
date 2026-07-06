@@ -12,7 +12,7 @@
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Optional, Tuple, List
+from typing import Optional, List
 from dataclasses import dataclass
 from datetime import datetime, time
 from rich.console import Console
@@ -275,7 +275,7 @@ class SignalGenerator:
                         timestamp=df.index[-1],
                         score=row.get('score', 0),
                         confidence=0.7,
-                        reason=f"Bull pullback zone, recent high confirmed",
+                        reason="Bull pullback zone, recent high confirmed",
                     )
                     self._record_signal(signal)
                     console.print(f"[bold green]📉 PULLBACK BUY: {symbol} @ {row['Close']:.0f}[/bold green]")
@@ -295,7 +295,7 @@ class SignalGenerator:
                         timestamp=df.index[-1],
                         score=row.get('score', 0),
                         confidence=0.7,
-                        reason=f"Bear pullback zone, recent low confirmed",
+                        reason="Bear pullback zone, recent low confirmed",
                     )
                     self._record_signal(signal)
                     console.print(f"[bold red]📈 PULLBACK SELL: {symbol} @ {row['Close']:.0f}[/bold red]")

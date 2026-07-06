@@ -1,0 +1,36 @@
+name: kbar_feature
+asset_class: futures
+version: "1.0"
+enabled: true
+
+# ── Strategy-specific parameters ─────────────────────────────────────
+params:
+  adx_threshold: 20.0
+  stop_atr_mult: 1.2
+  take_profit_atr_mult: 2.0
+  max_hold_bars: 12
+  long_enabled: false
+  short_enabled: true
+  require_breakout: true
+  vwap_buffer: 0.0
+  score_short_threshold: -20.0
+  score_long_threshold: 20.0
+
+# ── Risk limits (enforced by monitor, NOT the strategy) ──────────────
+risk:
+  max_positions: 1
+  stop_loss_type: atr       # "atr" | "fixed" | "percent"
+  stop_loss_mult: 1.2
+
+# ── Market regime filter ─────────────────────────────────────────────
+regime_filter:
+  allowed: ["weak", "bear", "down"]
+  min_adx: 20
+
+# ── Backtest metadata (for dashboard catalog) ────────────────────────
+backtest:
+  pf: 0.0
+  wr: 0.0
+  max_dd: 0.0
+  total_trades: 0
+  period: ""

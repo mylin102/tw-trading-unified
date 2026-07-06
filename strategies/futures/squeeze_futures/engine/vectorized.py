@@ -7,8 +7,8 @@
 import numpy as np
 import pandas as pd
 import numba as nb
-from typing import Dict, Tuple, Optional
-from dataclasses import dataclass, field
+from typing import Dict, Tuple
+from dataclasses import dataclass
 from rich.console import Console
 
 console = Console()
@@ -68,11 +68,25 @@ def simulate_trades_vectorized(
     tp1_pts: float = 30,
     tp1_lots: int = 1,
     exit_on_vwap: bool = True,
+    intraday_only: bool = False,
+    eod_bars = None,
+    expiry_bars = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     向量化交易模擬 (順序執行確保狀態正確)
+
+    Args:
+        intraday_only: If True, force close all positions at end-of-day bars.
+        eod_bars: Boolean array marking bars that are the last bar of a trading day.
+        expiry_bars: Boolean array marking bars on futures expiration days (3rd Wed).
     """
     n = len(close)
+    if eod_bars is None:
+        eod_bars = np.zeros(n, dtype=np.bool_)
+    if expiry_bars is None:
+        expiry_bars = np.zeros(n, dtype=np.bool_)
+    has_eod = len(eod_bars) == n
+    has_expiry = len(expiry_bars) == n
     entries = np.zeros(n)
     exits = np.zeros(n)
     positions = np.zeros(n)
@@ -131,7 +145,17 @@ def simulate_trades_vectorized(
                 elif exit_on_vwap and close[i] < vwap[i]:
                     exit_price = close[i]
                     exit_reason = 2
-                
+
+                # 日內強制平倉 (不持倉過夜)
+                elif intraday_only and has_eod and eod_bars[i]:
+                    exit_price = close[i]
+                    exit_reason = 4
+
+                # 期貨結算日強制平倉 (每月第三個週三)
+                elif has_expiry and expiry_bars[i]:
+                    exit_price = close[i]
+                    exit_reason = 5
+
                 elif i == n - 1:
                     exit_price = close[i]
                     exit_reason = 3
@@ -157,7 +181,17 @@ def simulate_trades_vectorized(
                 elif exit_on_vwap and close[i] > vwap[i]:
                     exit_price = close[i]
                     exit_reason = 2
-                
+
+                # 日內強制平倉 (不持倉過夜)
+                elif intraday_only and has_eod and eod_bars[i]:
+                    exit_price = close[i]
+                    exit_reason = 4
+
+                # 期貨結算日強制平倉 (每月第三個週三)
+                elif has_expiry and expiry_bars[i]:
+                    exit_price = close[i]
+                    exit_reason = 5
+
                 elif i == n - 1:
                     exit_price = close[i]
                     exit_reason = 3
@@ -189,28 +223,30 @@ def calculate_metrics(
     num_trades = len(trades)
     
     if num_trades == 0:
-        return {'total_pnl': 0.0, 'win_rate': 0.0, 'profit_factor': 0.0, 'max_drawdown': 0.0, 'total_trades': 0}
+        return {'total_pnl': 0.0, 'win_rate': 0.0, 'profit_factor': 0.0, 'max_drawdown': 0.0, 'total_trades': 0.0}
     
-    total_pnl = np.sum(trades)
+    total_pnl = float(np.sum(trades))
     winning = trades[trades > 0]
     losing = trades[trades < 0]
-    win_rate = len(winning) / num_trades * 100
-    profit_factor = np.sum(winning) / abs(np.sum(losing)) if len(losing) > 0 else np.inf
+    win_rate = float(len(winning)) / float(num_trades) * 100.0
+    profit_factor = float(np.sum(winning)) / abs(float(np.sum(losing))) if len(losing) > 0 else np.inf
     
     equity = initial_balance + np.cumsum(pnl)
-    peak = initial_balance
+    peak = float(initial_balance)
     max_dd = 0.0
     for val in equity:
-        if val > peak: peak = val
-        dd = peak - val
-        if dd > max_dd: max_dd = dd
+        if val > peak:
+            peak = float(val)
+        dd = peak - float(val)
+        if dd > max_dd:
+            max_dd = dd
         
     return {
         'total_pnl': total_pnl,
         'win_rate': win_rate,
         'profit_factor': profit_factor,
         'max_drawdown': max_dd,
-        'total_trades': num_trades,
+        'total_trades': float(num_trades),
     }
 
 
@@ -249,5 +285,6 @@ class VectorizedSimulator:
             self.config.lots_per_trade, self.config.slippage, stop_loss_pts, atr_mult,
             tp1_pts, tp1_lots, exit_on_vwap
         )
-        metrics = calculate_metrics(pnl, ent, ext, pos, self.config.initial_balance)
+        metrics_raw = calculate_metrics(pnl, ent, ext, pos, self.config.initial_balance)
+        metrics = dict(metrics_raw)
         return {'metrics': metrics, 'params': locals()}

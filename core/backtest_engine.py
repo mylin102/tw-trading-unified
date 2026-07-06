@@ -1,0 +1,364 @@
+"""
+Unified Backtest Engine — Event-driven simulator for Stocks and Futures.
+Aligned with PaperTrader logic for high-fidelity backtesting.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+from pydantic import BaseModel
+
+from core.signal import Signal
+from core.strategy_base import StrategyBase
+from core.strategy_context import MarketData, PositionView, StrategyContext
+
+
+class AssetType(str, Enum):
+    STOCK = "stock"
+    FUTURES = "futures"
+    OPTIONS = "options"
+
+
+class AssetProfile(BaseModel):
+    """Configuration for asset-specific trading math."""
+    asset_type: AssetType
+    point_value: float = 1.0
+    margin_per_lot: float = 0.0
+    fee_rate: float = 0.0 # Default 0 to force explicit config
+    tax_rate: float = 0.0 # Default 0
+    min_fee: float = 0.0
+
+
+@dataclass
+class BacktestPosition:
+    ticker: str
+    entry_price: float
+    qty: int
+    entry_time: datetime
+    stop_loss: float = 0.0
+    target: float = 0.0
+    high_water: float = 0.0
+    break_even_trigger: float = 0.0
+    trail_points: float = 0.0
+    be_triggered: bool = False
+
+    def __post_init__(self):
+        self.high_water = self.entry_price
+
+    def update_high_water(self, current_price: float):
+        sign = 1 if self.qty > 0 else -1
+        # Update high water mark
+        if self.qty > 0: self.high_water = max(self.high_water, current_price)
+        else: self.high_water = min(self.high_water, current_price)
+        
+        # 1. Breakeven logic
+        if self.break_even_trigger > 0 and not self.be_triggered:
+            pnl = (current_price - self.entry_price) * sign
+            if pnl >= self.break_even_trigger:
+                self.stop_loss = self.entry_price + (10 * sign)
+                self.be_triggered = True
+        
+        # 2. Continuous Trailing logic
+        if self.trail_points > 0:
+            new_sl = self.high_water - (self.trail_points * sign)
+            if self.qty > 0:
+                if self.stop_loss == 0 or new_sl > self.stop_loss:
+                    self.stop_loss = new_sl
+            else:
+                if self.stop_loss == 0 or new_sl < self.stop_loss:
+                    self.stop_loss = new_sl
+
+    def check_exit(self, price: float) -> Optional[str]:
+        if self.qty > 0:
+            if self.stop_loss > 0 and price <= self.stop_loss: return "STOP_LOSS"
+            if self.target > 0 and price >= self.target: return "TAKE_PROFIT"
+        elif self.qty < 0:
+            if self.stop_loss > 0 and price >= self.stop_loss: return "STOP_LOSS"
+            if self.target > 0 and price <= self.target: return "TAKE_PROFIT"
+        return None
+
+
+@dataclass
+class BacktestResult:
+    strategy_name: str
+    trades: pd.DataFrame
+    equity_curve: pd.Series
+    metrics: Dict[str, Any]
+
+
+class BacktestEngine:
+    def __init__(self, profile: AssetProfile, initial_capital: float = 1_000_000, logger: Optional[logging.Logger] = None):
+        self.profile = profile
+        self.initial_capital = initial_capital
+        self.logger = logger or logging.getLogger(__name__)
+        self.reset()
+
+    def reset(self):
+        self.cash = self.initial_capital
+        self.positions: Dict[str, BacktestPosition] = {}
+        self.trade_log = []
+        self.equity_history = []
+        self.time_history = []
+
+    def _calculate_cost(self, price: float, qty: int, is_entry: bool) -> float:
+        notional = price * abs(qty) * self.profile.point_value
+        fee = notional * self.profile.fee_rate
+        tax = notional * self.profile.tax_rate if not is_entry else 0.0
+        return fee + tax
+
+    def run(self, df: pd.DataFrame, strategy: StrategyBase, config: Optional[Dict[str, Any]] = None) -> BacktestResult:
+        self.reset()
+        config = config or {}
+        params = config.get("params", {})
+
+        # 1. Optimized Enrichment: Skip if columns exist
+        required_indicators = strategy.metadata.get("indicators", [])
+        # GSD: Always include Alpha features for Edge evaluation
+        if "alpha" not in required_indicators:
+            required_indicators.append("alpha")
+            
+        if required_indicators:
+            needs_enrich = False
+            for ind in required_indicators:
+                col = {"kalman": "kalman_close", "squeeze": "fired", "linreg": "lr_slope", "alpha": "breakout_strength"}.get(ind, ind)
+                if col not in df.columns:
+                    needs_enrich = True; break
+            
+            if needs_enrich:
+                from core.data_enricher import enricher
+                df = enricher.enrich(df, required_indicators, **params)
+        
+        df = strategy.prepare_data(df)
+        self.strategy_name_current = strategy.name
+
+        # Ensure index is datetime, drop NaT, and handle duplicates (CRITICAL for GSD)
+        df.index = pd.to_datetime(df.index)
+        df = df[df.index.notnull()]
+        if df.index.duplicated().any():
+            self.logger.warning(f"Strategy {strategy.name}: Dropping {df.index.duplicated().sum()} duplicate timestamps")
+            df = df[~df.index.duplicated(keep='last')]
+        df = df.sort_index()
+
+        n = len(df)
+        if n < 20: return self._empty_result(strategy.name)
+
+        self.equity_history.append(self.initial_capital)
+        self.time_history.append(df.index[19])
+        strategy.init(StrategyContext(market=MarketData(last_bar={}, df_5m=df.iloc[:20]), position=PositionView(), config=config))
+
+        from core.market_regime import calculate_regimes
+        # Pre-calculate daily regimes for the whole dataset
+        daily_regimes = calculate_regimes(df)
+        
+        # Fast lookup: map trading day to regime string
+        regime_map = daily_regimes.to_dict()
+
+        for i in range(20, n):
+            ts, price = df.index[i], df.iloc[i]["Close"]
+            bar = df.iloc[i].to_dict()
+            ticker = bar.get("ticker", "UNKNOWN")
+            if ticker == "UNKNOWN":
+                # [P1] Audit: Fail fast if ticker is missing during backtest
+                raise ValueError("Bar data missing 'ticker' field during backtest.")
+
+            # GSD: Detect Market Regime (Wave 19)
+            # Use pre-calculated regime for the current trading day
+            day_key = ts.normalize()
+            self.current_regime = regime_map.get(day_key, "NORMAL")
+            current_regime = self.current_regime
+
+            # ── [GSD Upgrade] Adaptive Exit Engine ──────────────────────
+            if ticker in self.positions:
+                pos = self.positions[ticker]
+                pos.update_high_water(price)
+                
+                # Context for adaptive exit
+                from core.exit_engine import should_exit
+                from core.data_enricher import enricher
+                
+                # Normalize ATR for the model (0-1 range approx)
+                atr = bar.get("atr", 0)
+                vol_norm = min(1.0, atr / (price * 0.05)) if price > 0 else 0.5
+                
+                context = {
+                    "regime": current_regime,
+                    "momentum": bar.get("momentum", 0),
+                    "volatility": atr,
+                    "volatility_norm": vol_norm,
+                    "vwap_dist": abs(price - bar.get("vwap", price)),
+                    "signal_score": 50 # Default middle for exit check
+                }
+                
+                # Dummy time to close (not easy to calculate in backtest without full calendar)
+                market = {"price": price, "atr": atr, "time_to_close_mins": 240}
+                
+                trade_state = {
+                    "entry_price": pos.entry_price,
+                    "side": "LONG" if pos.qty > 0 else "SHORT",
+                    "peak_price": pos.high_water,
+                    "position_age_bars": 0 # TODO
+                }
+                
+                exit_triggered, exit_reason = should_exit(trade_state, context, market)
+                
+                # Check legacy SL/TP as fallback
+                legacy_reason = pos.check_exit(price)
+                
+                final_exit_reason = exit_reason if exit_triggered else legacy_reason
+                
+                if final_exit_reason:
+                    self._execute_signal(ticker, Signal(action="EXIT", reason=final_exit_reason, stop_loss=0), price, ts)
+
+            if ticker not in self.positions or self.positions[ticker].qty != 0:
+                ctx = StrategyContext(market=MarketData(last_bar=bar, df_5m=df.iloc[max(0, i-100):i+1], regime=current_regime), 
+                                    position=self._get_position_view(ticker), config=config, bar_counter=i)
+                sig = strategy.on_bar(ctx)
+                # Debug: log returned signal
+                if sig is not None:
+                    self.logger.debug(f"Signal returned at i={i}: {sig}")
+                
+                # ── [GSD Upgrade] Entry Edge Filter ───────────────────────
+                if sig and sig.action in ["BUY", "SELL"] and ticker not in self.positions:
+                    from core.edge_model import edge_model
+                    from core.edge_diagnostics import edge_diag
+                    
+                    edge_context = {
+                        "regime": self.current_regime,
+                        "momentum": bar.get("momentum", 0),
+                        "volatility": bar.get("atr", 50),
+                        "vwap_dist": abs(price - bar.get("vwap", price)),
+                        "price": price,
+                        "side": "LONG" if sig.action == "BUY" else "SHORT",
+                        # [Phase 4.3 Alpha Features]
+                        "breakout_strength": bar.get("breakout_strength", 0.0),
+                        "volume_spike": bar.get("volume_spike", 1.0),
+                        "trend_strength_raw": bar.get("trend_strength_raw", 0.0)
+                    }
+                    # Squeeze strategies often provide score, others might need proxy
+                    score = abs(getattr(sig, "score", 50))
+                    # Only apply edge model when strategy opts in via metadata
+                    if strategy.metadata.get("use_edge_model", False):
+                        edge_res = edge_model.evaluate(score, edge_context, strategy.name)
+                        self.logger.debug(f"edge_res at i={i}: {edge_res}")
+                        # Record for diagnostics
+                        edge_diag.record_decision(strategy.name, edge_res["edge_score"], edge_res["is_exploring"], edge_res["features"])
+                        if not edge_res["has_edge"]:
+                            self.logger.debug("entry blocked by edge model")
+                            sig = None # Block the entry
+                        else:
+                            self.logger.debug("entry allowed by edge model")
+                    else:
+                        # Default: no filtering
+                        edge_res = {"has_edge": True, "edge_score": 1.0, "pos_scale": 1.0, "is_exploring": False, "features": {}, "rank": "BYPASS"}
+                        edge_diag.record_decision(strategy.name, edge_res["edge_score"], edge_res["is_exploring"], edge_res["features"]) 
+                        # [GSD Upgrade] Apply Dynamic Position Scaling
+                        base_qty = getattr(sig, "quantity", 1)
+                        sig.quantity = max(1, round(base_qty * edge_res["pos_scale"]))
+                        sig.reason = f"{sig.reason} ({edge_res['rank']})"
+                
+                if sig: self._execute_signal(ticker, sig, price, ts)
+
+            unrealized = sum((price - p.entry_price) * p.qty * self.profile.point_value for p in self.positions.values())
+            margin = sum(abs(p.qty) * self.profile.margin_per_lot for p in self.positions.values())
+            self.equity_history.append(self.cash + margin + unrealized)
+            self.time_history.append(ts)
+
+        return self._finalize_result(strategy.name)
+
+    def _get_position_view(self, ticker: str) -> PositionView:
+        if ticker not in self.positions: return PositionView()
+        pos = self.positions[ticker]
+        return PositionView(size=pos.qty, entry_price=pos.entry_price)
+
+    def _execute_signal(self, ticker: str, signal: Signal, price: float, ts: datetime):
+        self.logger.debug(f"_execute_signal called for {ticker} action={signal.action} price={price} cash={self.cash}")
+        if signal.action in ["BUY", "SELL"] and ticker not in self.positions:
+            # GSD: Support dynamic sizing from Signal
+            qty = getattr(signal, "quantity", 1)
+            self.logger.debug(f"attempting entry qty={qty}")
+            if qty <= 0:
+                self.logger.debug("qty <= 0, abort")
+                return
+            
+            cost = self._calculate_cost(price, qty, is_entry=True)
+            margin = qty * self.profile.margin_per_lot if self.profile.asset_type == AssetType.FUTURES else price * qty * self.profile.point_value
+            self.logger.debug(f"cost={cost} margin={margin}")
+            if self.cash >= margin + cost:
+                self.cash -= (margin + cost)
+                self.positions[ticker] = BacktestPosition(
+                    ticker, price, (1 if signal.action == "BUY" else -1) * qty, ts, 
+                    stop_loss=signal.stop_loss, target=signal.target,
+                    break_even_trigger=signal.break_even_trigger,
+                    trail_points=signal.trail_points
+                )
+                self.trade_log.append({"timestamp": ts, "ticker": ticker, "action": signal.action, "price": price, "qty": qty, "reason": signal.reason, "pnl": 0.0})
+                self.logger.debug("entry executed")
+            else:
+                self.logger.debug("insufficient cash for entry")
+        elif signal.action == "EXIT" and ticker in self.positions:
+            self.logger.debug("executing exit")
+            pos = self.positions.pop(ticker)
+            cost, mult = self._calculate_cost(price, abs(pos.qty), is_entry=False), self.profile.point_value
+            raw_pnl = (price - pos.entry_price) * pos.qty * mult
+            margin = abs(pos.qty) * self.profile.margin_per_lot if self.profile.asset_type == AssetType.FUTURES else pos.entry_price * abs(pos.qty) * mult
+            self.cash += (margin + raw_pnl - cost)
+            
+            # [GSD Upgrade] Update diagnostic result and persist attribution
+            from core.edge_diagnostics import edge_diag
+            from core.decision_logger import DecisionLogger
+            
+            # Simple FIFO mapping: find the last entry for this strategy without a PnL
+            found_stat = None
+            for stat in reversed(edge_diag.stats):
+                if stat["strategy"] == self.strategy_name_current and stat["pnl"] is None:
+                    stat["pnl"] = raw_pnl - cost
+                    found_stat = stat
+                    break
+
+            # Persist to disk for ML Training
+            if found_stat:
+                DecisionLogger.log_trade_outcome(
+                    trade_id=f"BT-{ts.strftime('%Y%m%d%H%M%S')}",
+                    strategy=self.strategy_name_current,
+                    regime=self.current_regime,
+                    features=found_stat.get("features", {}), # We need to store features in stats too
+                    outcome={"pnl": raw_pnl - cost, "exit_reason": signal.reason}
+                )
+
+            self.trade_log.append({"timestamp": ts, "ticker": ticker, "action": "EXIT", "price": price, "qty": pos.qty, "reason": signal.reason, "pnl": raw_pnl - cost})
+            self.logger.debug("exit executed")
+
+    def _finalize_result(self, name: str) -> BacktestResult:
+        trades_df, equity_ser = pd.DataFrame(self.trade_log), pd.Series(self.equity_history, index=self.time_history)
+        metrics = {"total_pnl": 0.0, "win_rate": 0.0, "trade_count": 0, "sharpe": 0.0, "mdd": 0.0, "cagr": 0.0, "profit_factor": 0.0}
+        if not trades_df.empty:
+            pnl_exits = trades_df[trades_df["action"] == "EXIT"]["pnl"]
+            if not pnl_exits.empty:
+                total_return = equity_ser.iloc[-1] / self.initial_capital
+                days = (equity_ser.index[-1] - equity_ser.index[0]).days
+                years = max(days / 365.25, 1/252)
+                metrics = {
+                    "total_pnl": pnl_exits.sum(),
+                    "win_rate": (pnl_exits > 0).mean(),
+                    "trade_count": len(pnl_exits),
+                    "sharpe": self._calc_sharpe(equity_ser),
+                    "mdd": self._calc_mdd(equity_ser),
+                    "cagr": (total_return ** (1/years)) - 1 if total_return > 0 else -1.0,
+                    "profit_factor": pnl_exits[pnl_exits > 0].sum() / abs(pnl_exits[pnl_exits < 0].sum()) if any(pnl_exits < 0) else 99.0
+                }
+        return BacktestResult(name, trades_df, equity_ser, metrics)
+
+    def _empty_result(self, name): return BacktestResult(name, pd.DataFrame(), pd.Series(), {})
+    def _calc_sharpe(self, equity: pd.Series) -> float:
+        rets = equity.pct_change().dropna()
+        return np.sqrt(252 * 54) * (rets.mean() / rets.std()) if rets.std() != 0 else 0.0
+    def _calc_mdd(self, equity: pd.Series) -> float:
+        if equity.empty: return 0.0
+        peak = equity.cummax()
+        return ((equity - peak) / peak.replace(0, np.nan)).min()

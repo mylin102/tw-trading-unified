@@ -9,13 +9,11 @@ TSM 與台指期相關性：
 - 高度相關 (>0.8)
 """
 
-import sys
-import os
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from rich.console import Console
+from rich.panel import Panel
 
 console = Console()
 
@@ -275,7 +273,7 @@ def print_tsm_report(signal_data: dict, correlation_data: dict = None):
     console.print(f"[bold]Trend:[/bold] {'📈 Bullish' if signal_data['trend'] == 1 else '📉 Bearish' if signal_data['trend'] == -1 else '➡️ Neutral'}")
     
     # 信號原因
-    console.print(f"\n[bold]Signal Reasons:[/bold]")
+    console.print("\n[bold]Signal Reasons:[/bold]")
     for reason in signal_data['reasons']:
         console.print(f"  • {reason}")
     

@@ -8,7 +8,7 @@
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 from dataclasses import dataclass
 from rich.console import Console
 from rich.table import Table

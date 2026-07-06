@@ -1,0 +1,100 @@
+================================================================================
+  Futures Regime Classification — Historical Validation Report V2
+  Generated: 2026-05-12 12:48:12
+  Data: TXFR1 5-min bars, 79,940 classified bars
+  Period: 2024-11-06 20:00:00 → 2026-04-23 14:50:00
+================================================================================
+
+─── 1. Regime Distribution ───
+Regime / Bias                   Count      %
+--------------------------------------------
+  WEAK             LONG       20,427  25.6%
+  WEAK             SHORT      19,788  24.8%
+  SQUEEZE          LONG       11,324  14.2%
+  SQUEEZE          SHORT       8,635  10.8%
+  STRETCHED        LONG        8,579  10.7%
+  STRETCHED        SHORT       5,252   6.6%
+  WEAK             NEUTRAL     1,354   1.7%
+  TRANSITION       LONG        1,230   1.5%
+  TREND            LONG        1,214   1.5%
+  BEAR             SHORT       1,179   1.5%
+  SQUEEZE          NEUTRAL       955   1.2%
+  STRETCHED        NEUTRAL         3   0.0%
+
+─── 2. Forward Return by Regime/Bias (signed: + = correct direction) ───
+Label                              N         R1         R3         R5        R10        R20      W1      W3      W5     W10     W20
+------------------------------------------------------------------------------------------------------------------------
+  BEAR             SHORT      1,179    -0.000%    +0.006%    +0.027%    +0.024%    -0.009%   45.6%   46.5%   47.5%   46.3%   46.8%
+  SQUEEZE          LONG      11,324    -0.003%    -0.002%    +0.001%    +0.002%    +0.004%   47.1%   48.4%   49.2%   50.1%   51.1%
+  SQUEEZE          NEUTRAL      955    +0.037%    +0.064%    +0.082%    +0.125%    +0.201%   94.1%   97.6%   97.9%   98.3%   99.0%
+  SQUEEZE          SHORT      8,635    -0.002%    +0.001%    +0.003%    +0.003%    +0.001%   46.6%   47.4%   47.2%   46.8%   46.5%
+  STRETCHED        LONG       8,579    -0.001%    +0.002%    +0.005%    +0.009%    +0.020%   49.2%   50.5%   51.7%   52.4%   54.4%
+  STRETCHED        SHORT      5,252    -0.001%    +0.001%    +0.002%    +0.000%    +0.005%   47.6%   48.2%   48.4%   47.3%   47.1%
+  TRANSITION       LONG       1,230    -0.007%    -0.007%    -0.003%    -0.005%    +0.008%   47.0%   46.3%   44.2%   46.4%   48.1%
+  TREND            LONG       1,214    +0.002%    +0.005%    -0.001%    +0.003%    +0.017%   49.7%   51.4%   50.9%   49.3%   53.3%
+  WEAK             LONG      20,427    -0.004%    -0.003%    -0.003%    +0.001%    +0.011%   47.5%   48.8%   49.9%   50.6%   51.5%
+  WEAK             NEUTRAL    1,354    +0.048%    +0.079%    +0.096%    +0.132%    +0.190%   94.9%   97.3%   97.9%   98.3%   99.3%
+  WEAK             SHORT     19,788    -0.008%    -0.012%    -0.017%    -0.025%    -0.034%   46.4%   45.8%   45.9%   45.0%   45.0%
+
+─── 3. MFE / MAE (5-bar lookahead) ───
+Label                               MFE        MAE    MFE/MAE
+------------------------------------------------------------
+  BEAR             SHORT       -0.193%    +0.322%     0.60x
+  SQUEEZE          LONG        +0.111%    -0.116%     0.95x
+  SQUEEZE          NEUTRAL     +0.000%    +0.000%      infx
+  SQUEEZE          SHORT       -0.122%    +0.138%     0.88x
+  STRETCHED        LONG        +0.130%    -0.416%     0.31x
+  STRETCHED        SHORT       -0.182%    +0.390%     0.47x
+  TRANSITION       LONG        +0.131%    -0.224%     0.58x
+  TREND            LONG        +0.190%    -0.185%     1.03x
+  WEAK             LONG        +0.120%    -0.204%     0.59x
+  WEAK             NEUTRAL     +0.000%    +0.000%      infx
+  WEAK             SHORT       -0.152%    +0.235%     0.65x
+
+─── 4. Regime Transition Probabilities ───
+From → To                   TREND         BEAR      SQUEEZE         WEAK   TRANSITION    STRETCHED
+--------------------------------------------------------------------------------------------
+  TREND                     19.4%         0.0%         0.7%        69.4%         0.8%         9.6%
+  BEAR                       0.0%        19.8%         0.8%        72.0%         0.0%         7.4%
+  SQUEEZE                    0.4%         0.4%        88.1%         7.4%         2.9%         0.7%
+  WEAK                       1.6%         1.8%         4.4%        86.3%         0.7%         5.3%
+  TRANSITION                 7.6%         0.0%        29.9%        34.2%        17.1%        11.1%
+  STRETCHED                  1.1%         0.8%         2.1%        14.8%         0.8%        80.5%
+
+─── 5. MOMENTUM_OVERRIDE Deep-Dive ───
+  [REMOVED 2026-05-12] Data proved it reduced predictive power:
+    TRANSITION/LONG  5-bar WR=48.2% vs WEAK/LONG  50.4%
+    TRANSITION/SHORT 5-bar WR=42.0% vs WEAK/SHORT 45.9%
+  All previously TRANSITION bars now fall through to WEAK.
+  See V2 report section 5.
+
+─── 6. STRETCHED Mean Reversion ───
+  STRETCHED/LONG: 8,579 bars
+    1-bar: R=-0.001% WR=49.2%
+    3-bar: R=+0.002% WR=50.5%
+    5-bar: R=+0.005% WR=51.7%
+    10-bar: R=+0.009% WR=52.4%
+    20-bar: R=+0.020% WR=54.4%
+  STRETCHED/SHORT: 5,252 bars
+    1-bar: R=-0.001% WR=47.6%
+    3-bar: R=+0.001% WR=48.2%
+    5-bar: R=+0.002% WR=48.4%
+    10-bar: R=+0.000% WR=47.3%
+    20-bar: R=+0.005% WR=47.1%
+
+─── 7. Volume Spike Impact (on WEAK regime) ───
+  WEAK/LONG   vol>=1.5  : n=  3186 R=+0.086% WR=64.2% MFE/MAE=0.88x
+  WEAK/LONG   vol<1.5   : n= 17241 R=+0.017% WR=57.4% MFE/MAE=0.65x
+  WEAK/SHORT  vol>=1.5  : n=  3850 R=-0.073% WR=57.2% MFE/MAE=0.77x
+  WEAK/SHORT  vol<1.5   : n= 15938 R=-0.017% WR=54.4% MFE/MAE=0.81x
+
+─── 8. Simulated WEAK Volume Gate (applied post-classification) ───
+  Only WEAK bars with volume_spike >= 1.5 pass through to strategies.
+  WEAK/LONG:
+    Passed (vol>=1.5): 3,186 bars  Blocked (vol<1.5): 17,241 bars (84% filtered)
+        passed (n= 3186): 5-bar R=+0.086% WR=64.2%
+       blocked (n=17241): 5-bar R=+0.017% WR=57.4%
+  WEAK/SHORT:
+    Passed (vol>=1.5): 3,850 bars  Blocked (vol<1.5): 15,938 bars (81% filtered)
+        passed (n= 3850): 5-bar R=-0.073% WR=57.2%
+       blocked (n=15938): 5-bar R=-0.017% WR=54.4%

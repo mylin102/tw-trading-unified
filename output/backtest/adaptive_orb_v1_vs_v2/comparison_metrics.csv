@@ -1,0 +1,3 @@
+strategy,n_trades,pf,net_pf,wr_pct,total_pnl_cash,cagr_pct,max_dd_cash,avg_bars,avg_mfe,avg_mae,mfe_mae_ratio
+v1_adaptive_orb,3012,1.1,0.96,27.4,3247802,61.95,1138000,236.5,113.9,65.3,1.74
+v2_adaptive_orb_v2,7004,1.04,0.56,36.1,635260,17.81,1214900,15.0,25.9,25.5,1.02

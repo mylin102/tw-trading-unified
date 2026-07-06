@@ -1,0 +1,22 @@
+{
+  "symbol": null,
+  "regime": null,
+  "min_trades_per_strategy": 5,
+  "candidate_orders": [
+    [
+      "counter_vwap",
+      "spring_upthrust",
+      "kbar_feature"
+    ],
+    [
+      "kbar_feature",
+      "counter_vwap",
+      "spring_upthrust"
+    ],
+    [
+      "spring_upthrust",
+      "kbar_feature",
+      "counter_vwap"
+    ]
+  ]
+}

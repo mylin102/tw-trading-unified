@@ -1,8 +1,6 @@
 POINT_VALUE_BY_TICKER = {
     "TMF": 10,
-    "MXFR1": 50,
     "MTX": 50,
-    "TXFR1": 200,
 }
 
 

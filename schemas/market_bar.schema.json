@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Market Bar Schema",
+  "description": "Standardized schema for enriched futures/options bars used in trading strategies.",
+  "type": "object",
+  "required": [
+    "timestamp",
+    "Close",
+    "High",
+    "Low",
+    "Open",
+    "Volume",
+    "atr",
+    "vwap",
+    "router_regime",
+    "router_bias"
+  ],
+  "properties": {
+    "timestamp": { "type": "string", "format": "date-time" },
+    "Open": { "type": "number" },
+    "High": { "type": "number" },
+    "Low": { "type": "number" },
+    "Close": { "type": "number" },
+    "Volume": { "type": "number" },
+    "atr": { "type": "number" },
+    "vwap": { "type": "number" },
+    "router_regime": { 
+      "type": "string", 
+      "enum": ["TREND", "SQUEEZE", "WEAK", "CHOP", "TRANSITION", "STRETCHED", "BEAR"] 
+    },
+    "router_bias": { 
+      "type": "string", 
+      "enum": ["LONG", "SHORT", "NEUTRAL"] 
+    },
+    "mom_state": { "type": "integer" },
+    "mom_velo": { "type": "number" },
+    "sqz_on": { "type": "boolean" },
+    "sqz_fire": { "type": "boolean" },
+    "breakout_strength_atr": { "type": "number" },
+    "bear_breakout_strength_atr": { "type": "number" },
+    "volume_spike": { "type": "number" },
+    "adx": { "type": "number" },
+    "score": { "type": "number" },
+    "bb_upper": { "type": "number" },
+    "bb_lower": { "type": "number" },
+    "bb_mid": { "type": "number" },
+    "kc_upper": { "type": "number" },
+    "kc_lower": { "type": "number" }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,53 @@
+[run]
+source =
+    core/order_management
+    strategies/futures/squeeze_futures/data/shioaji_client.py
+    strategies/options/options_engine/engine/broker_adapter.py
+omit = 
+    test_*.py
+    */test_*.py
+    */tests/*
+    */strategies/stocks/*
+    */__pycache__/*
+    */venv/*
+    */.venv/*
+    */build/*
+    */dist/*
+    */.eggs/*
+    */examples/*
+    */docs/*
+    */scripts/*
+    */logs/*
+    */exports/*
+    */data/*
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    if self\.debug
+    if settings\.DEBUG
+    raise AssertionError
+    raise NotImplementedError
+    if 0:
+    if __name__ == .__main__.:
+    @abstractmethod
+    pass
+    if TYPE_CHECKING:
+    if __name__ == "__main__":
+    logger\.
+    print\(
+    PaperTrader\.position
+    self\.position
+    self\._position
+
+ignore_errors = True
+fail_under = 0
+
+[html]
+directory = coverage_html
+title = Trading System Test Coverage
+show_contexts = True
+
+[xml]
+output = coverage.xml

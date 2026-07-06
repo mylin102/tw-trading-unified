@@ -1,0 +1,4 @@
+simulated_order,bars,changed_count,change_rate,actual_expected_pnl_sum,simulated_expected_pnl_sum,expected_pnl_delta_sum
+"counter_vwap,spring_upthrust,kbar_feature",300,0,0.0,0.0,0.0,0.0
+"kbar_feature,counter_vwap,spring_upthrust",300,300,1.0,0.0,0.0,0.0
+"spring_upthrust,kbar_feature,counter_vwap",300,300,1.0,0.0,0.0,0.0

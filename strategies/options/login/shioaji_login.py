@@ -4,7 +4,6 @@ import os
 import time
 import shioaji as sj
 from dotenv import load_dotenv
-from pathlib import Path
 
 _api_instance = None
 _api_lock = threading.Lock()
@@ -95,7 +94,7 @@ def _do_login():
             if(activate):
                 print(f'成功啟用憑證: {ca_full_path}')
             else:
-                print(f'憑證啟用失敗，目前僅支援模擬交易/行情監控。')
+                print('憑證啟用失敗，目前僅支援模擬交易/行情監控。')
         else:
             print(f'找不到憑證檔案 {ca_full_path}，將進入行情監控模式 (不支援下單)。')
     except Exception as e:

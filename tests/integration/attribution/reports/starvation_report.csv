@@ -1,0 +1,5 @@
+strategy_name,candidate_count,eval_count,shadowed_count,evaluation_rate,shadow_rate,starvation_index,starvation_level
+router,1401,0,0,0.0,0.0,1.0,severe
+counter_vwap,2803,1401,0,0.4998216196931859,0.0,0.500178380306814,moderate
+kbar_feature,2802,1401,0,0.5,0.0,0.5,moderate
+spring_upthrust,2802,1401,0,0.5,0.0,0.5,moderate

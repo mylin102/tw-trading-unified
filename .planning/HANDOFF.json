@@ -1,0 +1,76 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-04-20T13:27:03.116Z",
+  "phase": null,
+  "phase_name": null,
+  "phase_dir": null,
+  "plan": null,
+  "task": 1,
+  "total_tasks": 3,
+  "status": "paused",
+  "completed_tasks": [
+    {
+      "id": 1,
+      "name": "Spike 001/002/003 for 8501 adaptive workbench",
+      "status": "done",
+      "progress": "Created .planning/spikes artifacts, verified 8501 code-level isolation, validated standalone prototype boot, and recorded PARTIAL verdicts."
+    }
+  ],
+  "remaining_tasks": [
+    {
+      "id": 2,
+      "name": "Triage dashboard issues",
+      "status": "not_started"
+    },
+    {
+      "id": 3,
+      "name": "Resume adaptive planning after dashboard triage",
+      "status": "not_started"
+    }
+  ],
+  "blockers": [
+    {
+      "description": "Formal GSD roadmap-based phase planning is blocked because .planning/ROADMAP.md does not exist.",
+      "type": "technical",
+      "workaround": "Initialize roadmap/state before using gsd-add-phase or gsd-plan-phase."
+    },
+    {
+      "description": "Current dashboard issue has not been described yet, so no investigation has started.",
+      "type": "human_action",
+      "workaround": "On resume, capture the exact dashboard symptom, page, and reproduction steps first."
+    }
+  ],
+  "human_actions_pending": [
+    {
+      "action": "Describe the dashboard issue precisely",
+      "context": "The user paused adaptive work because the dashboard has small problems, but no exact symptom or page has been recorded yet.",
+      "blocking": true
+    }
+  ],
+  "decisions": [
+    {
+      "decision": "Keep 8501 adaptive work as an isolated review-first console that does not touch main.py or the 8500 live dashboard.",
+      "rationale": "Spike 001 showed code-level isolation is already viable and the live path must remain unaffected.",
+      "phase": null
+    },
+    {
+      "decision": "Do not plan score tuning before the adaptive dataset pipeline exists.",
+      "rationale": "Spike 002 found trade_attribution.csv is too sparse for real threshold tuning: empty feature payloads, no usable score field, and only dummy/NEUTRAL rows.",
+      "phase": null
+    }
+  ],
+  "uncommitted_files": [
+    ".planning/HANDOFF.json",
+    ".planning/.continue-here.md",
+    ".planning/spikes/MANIFEST.md",
+    ".planning/spikes/001-tuning-workbench-ia/README.md",
+    ".planning/spikes/001-tuning-workbench-ia/inspect_8501_isolation.py",
+    ".planning/spikes/002-adaptive-loop-mvp/README.md",
+    ".planning/spikes/002-adaptive-loop-mvp/adaptive_loop_mvp.py",
+    ".planning/spikes/003-tuning-panel-shape/README.md",
+    ".planning/spikes/003-tuning-panel-shape/adaptive_tuning_panel.py",
+    ".planning/todos/pending/adaptive-trade-dataset-pipeline.md"
+  ],
+  "next_action": "Start by capturing the exact dashboard bug symptoms and reproduction steps, then decide whether to investigate the live dashboard or the 8501 backtest dashboard first.",
+  "context_notes": "Adaptive work was intentionally paused after finishing a feasibility spike because dashboard issues became more urgent. The next agent should not continue roadmap/phase planning until the dashboard interruption is triaged."
+}

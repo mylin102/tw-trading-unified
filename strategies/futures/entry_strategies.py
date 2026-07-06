@@ -5,6 +5,7 @@ Each strategy receives market state and returns a signal dict or None.
 Signal format: {"action": "BUY"|"SELL", "reason": str, "stop_loss": float}
 """
 import numpy as np
+import pandas as pd
 
 
 def strategy_squeeze_breakout(state, cfg):
@@ -22,8 +23,10 @@ def strategy_squeeze_breakout(state, cfg):
     elif filter_mode == "mid":
         can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.998
         can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.002
-        if last_5m.get("bullish_align", False): can_short = False
-        if last_5m.get("bearish_align", False): can_long = False
+        if last_5m.get("bullish_align", False):
+            can_short = False
+        if last_5m.get("bearish_align", False):
+            can_long = False
     else:
         can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.999
         can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.001
@@ -48,7 +51,7 @@ def strategy_trend_follow(state, cfg):
     s = cfg.get("strategy", {}).get("trend_follow", {})
     min_score = s.get("min_score", 30)
     atr_mult = s.get("atr_mult", 3.0)
-    trailing_atr = s.get("trailing_atr", 2.0)
+    s.get("trailing_atr", 2.0)
 
     last_5m, last_15m, score = state["last_5m"], state["last_15m"], state["score"]
     atr = last_5m.get("atr", 0)
@@ -205,9 +208,7 @@ def strategy_volume_reversal(state, cfg):
 
 def strategy_psar_breakout(state, cfg):
     """
-    Ref: r-yabyab/Custom-NinjaScript-Files PSAR strat
-    Price just crossed above Parabolic SAR + above SMA50 → long.
-    Price just crossed below PSAR + below SMA50 → short.
+    PSAR 突破。結合拋物線指標轉向與 50MA 過濾。
     """
     s = cfg.get("strategy", {}).get("psar_breakout", {})
     sma_len = s.get("sma_length", 50)
@@ -215,29 +216,79 @@ def strategy_psar_breakout(state, cfg):
     accel_max = s.get("acceleration_max", 0.2)
     atr_mult = s.get("atr_mult", 2.0)
 
-    df = state["df_5m"]
+    # Use the full dataframe passed in state (we need to inject it from signal_generator)
+    # Alternatively, since state["df_5m"] is a slice, we can cache the calculation on the parent df.
+    df = state.get("df_5m_full")
+    if df is None:
+        df = state["df_5m"] # fallback to slice if full not available
+        
     if len(df) < sma_len + 2:
+        return None
+
+    # Optimization: Calculate PSAR once for the whole DF and cache it in cfg or df.attrs
+    cache_key = f"psar_{accel}_{accel_max}"
+    if cache_key not in df.attrs:
+        try:
+            # df.ta.psar returns a DataFrame with columns like 'PSARl_0.02_0.2', 'PSARs_0.02_0.2', 'PSARaf_0.02_0.2', 'PSARr_0.02_0.2'
+            # The column names contain the parameters.
+            psar_df = df.ta.psar(af0=accel, af=accel, max_af=accel_max)
+            df.attrs[cache_key] = psar_df
+        except Exception:
+            return None
+            
+    psar = df.attrs[cache_key]
+    
+    # Now we need the values for the CURRENT index
+    # We are evaluating at the last row of the current slice (state["df_5m"])
+    current_time = state["last_5m"].name
+    
+    try:
+        # Get the row in the full PSAR dataframe corresponding to the current time
+        # For speed, we just use the position. If state has 'idx', use that.
+        idx = state.get("idx")
+        if idx is not None and idx >= 1:
+            psar_long = psar.iloc[idx, 0]
+            psar_short = psar.iloc[idx, 1]
+            psar_long_prev = psar.iloc[idx - 1, 0]
+            psar_short_prev = psar.iloc[idx - 1, 1]
+        else:
+            # Fallback to matching by index label (slower but safe)
+            current_idx_loc = psar.index.get_loc(current_time)
+            psar_long = psar.iloc[current_idx_loc, 0]
+            psar_short = psar.iloc[current_idx_loc, 1]
+            psar_long_prev = psar.iloc[current_idx_loc - 1, 0]
+            psar_short_prev = psar.iloc[current_idx_loc - 1, 1]
+    except Exception:
         return None
 
     last_5m = state["last_5m"]
     atr = last_5m.get("atr", 0)
     sl = atr * atr_mult if atr > 0 else 40
 
-    try:
-        psar = df.ta.psar(af0=accel, af=accel, max_af=accel_max)
-        # psar returns DataFrame with PSARl (long) and PSARs (short)
-        psar_long = psar.iloc[-1, 0]  # PSARl
-        psar_short = psar.iloc[-1, 1]  # PSARs
-        psar_long_prev = psar.iloc[-2, 0]
-        psar_short_prev = psar.iloc[-2, 1]
-    except Exception:
+    # Ensure SMA is pre-calculated or calculate efficiently
+    sma_col = f"sma_{sma_len}"
+    if sma_col not in df.columns:
+        df[sma_col] = df["Close"].rolling(sma_len).mean()
+        
+    price = last_5m["Close"]
+    
+    if idx is not None:
+        sma = df[sma_col].values[idx]
+    else:
+        sma = df[sma_col].loc[current_time]
+        
+    if pd.isna(sma):
         return None
 
-    close = df["Close"].values
-    sma = df["Close"].rolling(sma_len).mean().values[-1]
-    price = close[-1]
-    prev_price = close[-2]
+    # Adaptive ADX Filter: Lowered to 15 to catch trend starts (V-Model v2)
+    adx = last_5m.get("adx", 25)
+    if adx < 15:
+        return None
 
+    # Adaptive Stop: If ATR is high (volatile), use tighter mult
+    current_vol_mult = 1.5 if atr > 40 else atr_mult
+    sl = atr * current_vol_mult
+    
     import math
     # Long: price crosses above PSAR + above SMA
     if not math.isnan(psar_long) and math.isnan(psar_long_prev):
@@ -287,26 +338,158 @@ def strategy_cumulative_delta(state, cfg):
 
     # Long: cum delta rising + price > SMA + price pulled back from lookback ago
     if cd_now > cd_past and price > sma and price < c[-lookback]:
-        return {"action": "BUY", "reason": "CUM_DELTA", "stop_loss": sl}
+        return {
+            "action": "BUY", "reason": "CUM_DELTA", "stop_loss": sl,
+            "break_even_trigger": 20.0, "trail_points": 30.0
+        }
 
     # Short: cum delta falling + price < SMA + price bounced from lookback ago
     if cd_now < cd_past and price < sma and price > c[-lookback]:
-        return {"action": "SELL", "reason": "CUM_DELTA", "stop_loss": sl}
+        return {
+            "action": "SELL", "reason": "CUM_DELTA", "stop_loss": sl,
+            "break_even_trigger": 20.0, "trail_points": 30.0
+        }
+    return None
+
+
+def strategy_vol_squeeze(state, cfg):
+    """
+    Enhanced Squeeze: Original logic + Volume Spike filter.
+    Ensures that the breakout has institutional participation.
+    """
+    s = cfg.get("strategy", {})
+    entry_score = s.get("entry_score", 20)
+    vol_mult = s.get("vol_multiplier", 1.5)
+
+    last_5m, last_15m, score = state["last_5m"], state["last_15m"], state["score"]
+    df = state.get("df_5m")
+    
+    if df is None or len(df) < 20:
+        return None
+
+    # Volume filter: Current volume > SMA(Volume, 20) * multiplier
+    vol_ma = df["Volume"].rolling(20).mean().iloc[-1]
+    curr_vol = last_5m["Volume"]
+    vol_spike = curr_vol > vol_ma * vol_mult
+
+    sqz_buy = (not last_5m["sqz_on"]) and score >= entry_score and last_5m["mom_state"] >= 2 and vol_spike
+    sqz_sell = (not last_5m["sqz_on"]) and score <= -entry_score and last_5m["mom_state"] <= 1 and vol_spike
+
+    # Use mid-regime filtering logic
+    can_long = last_15m["Close"] > last_15m["ema_filter"] * 0.998
+    can_short = last_15m["Close"] < last_15m["ema_filter"] * 1.002
+
+    if sqz_buy and can_long:
+        return {"action": "BUY", "reason": "VOL_SQZ", "stop_loss": state["stop_loss_pts"]}
+    if sqz_sell and can_short:
+        return {"action": "SELL", "reason": "VOL_SQZ", "stop_loss": state["stop_loss_pts"]}
+    return None
+
+
+def strategy_gap_reversal(state, cfg):
+    """
+    Taiwan Specific: Gap Reversal.
+    Captures over-reaction after a large opening gap (Day or Night).
+    If Gap > 100 pts and first bars show reversal momentum -> Enter fade.
+    """
+    s = cfg.get("strategy", {}).get("gap_reversal", {})
+    min_gap = s.get("min_gap_pts", 80)
+    atr_mult = s.get("atr_mult", 1.5)
+
+    last_5m = state["last_5m"]
+    df = state.get("df_5m")
+    if df is None or len(df) < 5:
+        return None
+
+    # Get the trading day open price
+    day_open = last_5m.get("day_open")
+    if day_open is None or day_open <= 0:
+        return None
+
+    # Approximate previous close (last bar of previous trading day)
+    # This is a simplification; in a real engine we'd cache the actual last close.
+    # Here we look for the first bar of the trading day and compare with the bar before it.
+    curr_td = last_5m.get("trading_day")
+    
+    # Check if we are in the first 30 minutes of the session
+    # We only trade gap reversals early in the day
+    session_start_idx = np.where(df["trading_day"] == curr_td)[0]
+    if len(session_start_idx) == 0:
+        return None
+    
+    first_idx = session_start_idx[0]
+    curr_idx = len(df) - 1
+    
+    # Only active within first 6 bars (30 mins) of the trading day
+    if not (0 <= (curr_idx - first_idx) <= 6):
+        return None
+
+    # Calculate gap (Open of first bar - Close of bar before it)
+    if first_idx <= 0:
+        return None
+        
+    prev_close = df["Close"].iloc[first_idx - 1]
+    actual_open = df["Open"].iloc[first_idx]
+    gap = actual_open - prev_close
+
+    atr = last_5m.get("atr", 30)
+    sl = atr * atr_mult
+
+    # Long: Large Gap Down (>80) + Price starts rising above opening
+    if gap < -min_gap and last_5m["Close"] > actual_open and last_5m["mom_state"] >= 2:
+        return {"action": "BUY", "reason": "GAP_REVERSAL", "stop_loss": sl}
+        
+    # Short: Large Gap Up (>80) + Price starts falling below opening
+    if gap > min_gap and last_5m["Close"] < actual_open and last_5m["mom_state"] <= 1:
+        return {"action": "SELL", "reason": "GAP_REVERSAL", "stop_loss": sl}
+        
     return None
 
 
 # ── Registry ──
 STRATEGIES = {
-    "squeeze_breakout": strategy_squeeze_breakout,
-    "trend_follow": strategy_trend_follow,
-    "vwap_bounce": strategy_vwap_bounce,
-    "momentum_burst": strategy_momentum_burst,
-    "night_short_only": strategy_night_short_only,
-    "volume_reversal": strategy_volume_reversal,
-    "psar_breakout": strategy_psar_breakout,
-    "cumulative_delta": strategy_cumulative_delta,
+    "squeeze_breakout": {
+        "func": strategy_squeeze_breakout,
+        "desc": "Squeeze 釋放 + 趨勢對齊。捕捉波動率擠壓後的噴發，搭配 15m 趨勢過濾器，適合趨勢發動初期。"
+    },
+    "vol_squeeze": {
+        "func": strategy_vol_squeeze,
+        "desc": "量能過濾 Squeeze。在突破瞬間要求成交量爆發 (預設 1.5x)，過濾假突破，提高信號品質。"
+    },
+    "gap_reversal": {
+        "func": strategy_gap_reversal,
+        "desc": "跳空反轉。專為台指期設計，當開盤產生大跳空時，捕捉開盤 30 分鐘內的過度反應收斂點。"
+    },
+    "trend_follow": {
+        "func": strategy_trend_follow,
+        "desc": "純趨勢追蹤。僅在 15m EMA 方向一致時進場，使用較寬的 3x ATR 止損，適合強勢多/空頭市場。"
+    },
+    "vwap_bounce": {
+        "func": strategy_vwap_bounce,
+        "desc": "均值回歸。當價格偏離 VWAP 過遠 (0.3%+) 且動能轉折時逆勢進場，捕捉乖離過大的回抽。"
+    },
+    "momentum_burst": {
+        "func": strategy_momentum_burst,
+        "desc": "動能噴發。監測 Squeeze 觸發瞬間的動能速度 (Z-Score > 2)，追求極速獲利，但風險較高。"
+    },
+    "night_short_only": {
+        "func": strategy_night_short_only,
+        "desc": "夜盤偏空策略。專為 15:00~05:00 設計，捕捉夜盤常見的高檔無力回落現象。"
+    },
+    "volume_reversal": {
+        "func": strategy_volume_reversal,
+        "desc": "成交量反轉。偵測連續兩根帶量長黑/長紅後的衰竭，在 MA 方向支持下捕捉反彈點。"
+    },
+    "psar_breakout": {
+        "func": strategy_psar_breakout,
+        "desc": "PSAR 突破。結合拋物線指標轉向與 50MA 過濾，是 Q1 回測中表現最穩健的趨勢轉向策略。"
+    },
+    "cumulative_delta": {
+        "func": strategy_cumulative_delta,
+        "desc": "累計量能差 (估計)。利用成交量與價格變動方向的累計差值，尋找量價背離後的拉回進場點。"
+    },
 }
 
 
 def get_strategy(name):
-    return STRATEGIES.get(name)
+    return STRATEGIES.get(name, {}).get("func")

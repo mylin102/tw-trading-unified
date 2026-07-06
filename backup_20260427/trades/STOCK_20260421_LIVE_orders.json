@@ -1,0 +1,16 @@
+[
+  {
+    "order_id": "LIVE-BUY-3017-20260421T093413-0",
+    "ticker": "3017",
+    "side": "BUY",
+    "order_type": "LMT",
+    "qty": 2,
+    "filled_qty": 2,
+    "price": 2490.0,
+    "filled_price": 2490.0,
+    "status": "FILLED",
+    "timestamp": "2026-04-21 09:34:13",
+    "strategy": "mean_reversion_enhanced",
+    "mode": "LIVE"
+  }
+]
