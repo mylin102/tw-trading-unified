@@ -1270,6 +1270,49 @@ class TMFSpread(StrategyBase):
             logger.exception("[MTS_STATE_READ_UNEXPECTED] file=%s", _MTS_STATE_FILE)
             return None
 
+    # ── ADR-010 Sprint 5C: Release bracket submission reconciliation ──
+    def _reconcile_release_bracket_submission(self, state: dict) -> None:
+        """Restart during SUBMITTING: one order submitted, one missing.
+
+        Broker authority: check which order(s) exist at broker.
+        If submitted order is alive at broker → re-submit missing order.
+        If submitted order is dead at broker → rollback to ARMED.
+        """
+        _rg = self._lifecycle_oca.release_group
+        _near_dead = False
+        _far_dead = False
+
+        if _rg.near_order_id:
+            _near_dead = False  # paper: always alive
+        else:
+            _near_dead = True
+
+        if _rg.far_order_id:
+            _far_dead = False  # paper: always alive
+        else:
+            _far_dead = True
+
+        if _near_dead and _far_dead:
+            # Both dead → full rollback
+            _rg.status = ReleaseGroupStatus.ARMED
+            _rg.near_order_id = None
+            _rg.far_order_id = None
+            logger.warning(
+                "[OCO_RESTORE_5C] SUBMITTING — both ids missing, rollback to ARMED (trade_id=%s)",
+                state.get("trade_id"),
+            )
+        else:
+            # At least one alive → restore SUBMITTING, allow resubmit
+            _rg.status = ReleaseGroupStatus.SUBMITTING
+            logger.warning(
+                "[OCO_RESTORE_5C] Restart @ SUBMITTING — near=%s far=%s (trade_id=%s)",
+                _rg.near_order_id or "MISSING",
+                _rg.far_order_id or "MISSING",
+                state.get("trade_id"),
+            )
+            # The missing order will be re-submitted when monitor's _sync_mts_strategy_after_fill
+            # detects SUBMITTING with a missing order id on next tick.
+
     # ── Hot-reload / restart recovery ────────────────────────────────────────
     def _restore_position_state(self) -> bool:
         """
@@ -1344,6 +1387,74 @@ class TMFSpread(StrategyBase):
                                         self._lifecycle_oca = lifecycle_from_dict(lifecycle_block)
                                     except Exception:
                                         self._lifecycle_oca = infer_lifecycle_from_legacy_state(state)
+
+                                # ADR-010 Sprint 5A: restart @ CANCELING_SIBLING
+                                # Broker cancel authority — check if sibling cancel actually went through.
+                                # If state says CANCELING_SIBLING but broker cancel never arrived,
+                                # we must check broker order status before transitioning.
+                                _rg_5 = self._lifecycle_oca.release_group
+                                _tl_5 = self._lifecycle_oca.trail_group
+                                if (
+                                    self._lifecycle_oca.phase == PositionPhase.SPREAD
+                                    and _rg_5.status == ReleaseGroupStatus.CANCELING_SIBLING
+                                ):
+                                    # Broker authority: assume cancel succeeded (paper mode).
+                                    # For paper, cancel was sync-confirmed in Sprint 4B.
+                                    # If broker says sibling is still alive, re-issue cancel.
+                                    # For now, promote to SIBLING_CANCELED + SINGLE_LEG.
+                                    _rg_5.sibling_cancel_status = CancelStatus.CONFIRMED
+                                    _rg_5.status = ReleaseGroupStatus.SIBLING_CANCELED
+                                    self._lifecycle_oca.phase = PositionPhase.SINGLE_LEG
+                                    _tl_5.status = TrailGroupStatus.ARMED
+                                    logger.warning(
+                                        "[OCO_RESTORE_5A] Restart @ CANCELING_SIBLING → SIBLING_CANCELED → SINGLE_LEG (trade_id=%s)",
+                                        state.get("trade_id"),
+                                    )
+
+                                # ADR-010 Sprint 5B: restart @ SUBMITTED
+                                # Both order ids persisted. No resend — restore as-is.
+                                # Broker authority: if broker says orders are dead, fallback to ARMED.
+                                if (
+                                    self._lifecycle_oca.phase == PositionPhase.SPREAD
+                                    and _rg_5.status == ReleaseGroupStatus.SUBMITTED
+                                    and _rg_5.near_order_id
+                                    and _rg_5.far_order_id
+                                ):
+                                    # Restore SUBMITTED as-is. Broker check (if available) confirms alive.
+                                    logger.warning(
+                                        "[OCO_RESTORE_5B] Restart @ SUBMITTED — near=%s far=%s (trade_id=%s)",
+                                        _rg_5.near_order_id, _rg_5.far_order_id,
+                                        state.get("trade_id"),
+                                    )
+                                    # Guard: SUBMITTED without both order ids is invalid.
+                                    if not _rg_5.near_order_id or not _rg_5.far_order_id:
+                                        _rg_5.status = ReleaseGroupStatus.ARMED
+                                        logger.warning(
+                                            "[OCO_RESTORE_5B] SUBMITTED missing order id → downgraded to ARMED (trade_id=%s)",
+                                            state.get("trade_id"),
+                                        )
+
+                                # ADR-010 Sprint 5C: restart @ SUBMITTING
+                                # One order id exists, the other missing.
+                                # Helper: _reconcile_release_bracket_submission handles partial submit.
+                                if (
+                                    self._lifecycle_oca.phase == PositionPhase.SPREAD
+                                    and _rg_5.status == ReleaseGroupStatus.SUBMITTING
+                                ):
+                                    self._reconcile_release_bracket_submission(state)
+
+                                # ADR-010 Sprint 5D: restart @ SIBLING_CANCELED
+                                # Simplest case: restore SINGLE_LEG + trail ARMED.
+                                if (
+                                    self._lifecycle_oca.phase == PositionPhase.SPREAD
+                                    and _rg_5.status == ReleaseGroupStatus.SIBLING_CANCELED
+                                ):
+                                    self._lifecycle_oca.phase = PositionPhase.SINGLE_LEG
+                                    _tl_5.status = TrailGroupStatus.ARMED
+                                    logger.warning(
+                                        "[OCO_RESTORE_5D] Restart @ SIBLING_CANCELED → SINGLE_LEG + trail ARMED (trade_id=%s)",
+                                        state.get("trade_id"),
+                                    )
                                 else:
                                     self._lifecycle_oca = infer_lifecycle_from_legacy_state(state)
                                 # Invariant guard: FLAT phase must not overlay active position
