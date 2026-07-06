@@ -1953,22 +1953,26 @@ class FuturesMonitor:
                     # [Fix 2026-07-06] Use .value for enum safety — str(enum) gives "LegSide.LONG", not "LONG"
                     def _side_value(side):
                         return str(getattr(side, "value", side)).upper()
+
                     _near_side = getattr(_strat, "_near_side", None)
                     _far_side = getattr(_strat, "_far_side", None)
-                    if _side_value(_near_side) not in ("LONG", "SHORT") or _side_value(_far_side) not in ("LONG", "SHORT"):
-                        pass  # skip if sides are unknown — better than wrong side
-                    else:
+
+                    if _side_value(_near_side) in ("LONG", "SHORT") and _side_value(_far_side) in ("LONG", "SHORT"):
                         _release_side_near = "sell" if _side_value(_near_side) == "LONG" else "buy"
                         _release_side_far = "sell" if _side_value(_far_side) == "LONG" else "buy"
-                        for _label, _oid, _side in [("NEAR", _rg.near_order_id, _release_side_near), ("FAR", _rg.far_order_id, _release_side_far)]:
+
+                        for _label, _oid, _side in [
+                            ("NEAR", _rg.near_order_id, _release_side_near),
+                            ("FAR", _rg.far_order_id, _release_side_far),
+                        ]:
                             if _oid and not any(d.get("order_id") == _oid for d in export_data):
                                 export_data.append({
                                     "order_id": _oid,
                                     "symbol": f"{self.ticker}_{_label}",
                                     "side": _side,
-                                "order_type": "MKP",
-                                "quantity": 1,
-                                "filled_quantity": 0,
+                                    "order_type": "MKP",
+                                    "quantity": 1,
+                                    "filled_quantity": 0,
                                 "price": 0,
                                 "avg_fill_price": 0,
                                 "status": "submitted",
