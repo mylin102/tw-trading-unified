@@ -2575,6 +2575,71 @@ class FuturesMonitor:
 
     # ── Paper Fill Polling (ADR-010 OCO) ──
 
+    def _reconcile_paper_oco_orders(self, strategy) -> None:
+        """Re-register OCO release orders with paper_fill_sim after PM2 restart.
+        
+        After restart, _lifecycle_oca is restored from state file (including
+        near_order_id/far_order_id in SUBMITTED status), but paper_fill_sim
+        is a fresh in-memory queue. Orders exist in the lifecycle but not in
+        the simulator → they become orphans that never fill.
+        
+        Called from _mts_tick() after strategy init, before price polling.
+        """
+        if not self.paper_fill_sim or not self.order_mgr:
+            return
+        if not hasattr(strategy, '_lifecycle_oca'):
+            return
+
+        _lc = strategy._lifecycle_oca
+        _rg = _lc.release_group
+        from strategies.plugins.futures.active.tmf_spread import ReleaseGroupStatus
+
+        if _rg.status != ReleaseGroupStatus.SUBMITTED:
+            return
+        if not _rg.near_order_id or not _rg.far_order_id:
+            return
+
+        # Check if already registered (e.g., after fresh submission in same run)
+        _pending_ids = set(self.paper_fill_sim._pending_orders.keys())
+        _need_near = _rg.near_order_id not in _pending_ids
+        _need_far = _rg.far_order_id not in _pending_ids
+        if not _need_near and not _need_far:
+            return  # both already registered
+
+        # Reconstruct orders in OrderManager if missing
+        from core.order_management.order import OrderType, OrderSide
+
+        _near_side_str = (_rg.near_side or "").upper()
+        _far_side_str = (_rg.far_side or "").upper()
+        _near_symbol = self.contract.code if self.contract else f"{self.ticker}_NEAR"
+        _far_symbol = self.far_contract.code if self.far_contract else f"{self.ticker}_FAR"
+
+        if _need_near and _rg.near_order_id not in self.order_mgr.active_orders:
+            _ns = OrderSide.SELL if _near_side_str == "BUY" else OrderSide.BUY
+            from core.order_management.order import Order
+            _no = Order(
+                symbol=_near_symbol, side=_ns, order_type=OrderType.MKP,
+                quantity=1, strategy="MTS_RELEASE_OCO",
+                order_id=_rg.near_order_id,
+            )
+            self.order_mgr.active_orders[_rg.near_order_id] = _no
+            self.order_mgr.submit(_no)
+            self.paper_fill_sim.register(_no)
+            console.print(f"[cyan]♻️ [OCO_RECONCILE] near order {_rg.near_order_id} re-registered[/cyan]")
+
+        if _need_far and _rg.far_order_id not in self.order_mgr.active_orders:
+            _fs = OrderSide.SELL if _far_side_str == "BUY" else OrderSide.BUY
+            from core.order_management.order import Order
+            _fo = Order(
+                symbol=_far_symbol, side=_fs, order_type=OrderType.MKP,
+                quantity=1, strategy="MTS_RELEASE_OCO",
+                order_id=_rg.far_order_id,
+            )
+            self.order_mgr.active_orders[_rg.far_order_id] = _fo
+            self.order_mgr.submit(_fo)
+            self.paper_fill_sim.register(_fo)
+            console.print(f"[cyan]♻️ [OCO_RECONCILE] far order {_rg.far_order_id} re-registered[/cyan]")
+
     def _process_pending_paper_fills(self, near_price: float, far_price: float, ts) -> None:
         """Poll paper fill simulator with live near/far prices during MTS tick.
         
@@ -4328,10 +4393,6 @@ class FuturesMonitor:
         # ── [ADR-010] Poll paper OCO fills with live near/far prices ──
         _n_close = float(_bar_dict.get("near_close") or 0)
         _f_close = float(_bar_dict.get("far_close") or 0)
-        if _n_close > 0 and _f_close > 0:
-            self._process_pending_paper_fills(
-                near_price=_n_close, far_price=_f_close, ts=datetime.now(),
-            )
 
         # 3. Strategy setup
         strategy = self._registry.get(_strat_name)
@@ -4351,6 +4412,15 @@ class FuturesMonitor:
         )
         if not hasattr(strategy, "_has_position"):
             strategy.init(ctx)
+
+        # ── [ADR-010] Reconcile OCO orders into paper_fill_sim after restart ──
+        self._reconcile_paper_oco_orders(strategy)
+
+        # ── [ADR-010] Poll paper OCO fills (after reconciliation) ──
+        if _n_close > 0 and _f_close > 0:
+            self._process_pending_paper_fills(
+                near_price=_n_close, far_price=_f_close, ts=datetime.now(),
+            )
 
         # [MTS Heartbeat] Update state file with latest prices
         # 2026-05-27 Gemini CLI: Use isolated path if environment variable is set
