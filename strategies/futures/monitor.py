@@ -2086,7 +2086,8 @@ class FuturesMonitor:
         Invariant: PARTIALLY_FILLED → trail_group.status must NOT be ARMED.
         """
         from strategies.plugins.futures.active.tmf_spread import (
-            ReleaseGroupStatus, Leg, TrailGroupStatus, _write_mts_state, lifecycle_to_dict,
+            ReleaseGroupStatus, Leg, TrailGroupStatus, CancelStatus,
+            _write_mts_state, lifecycle_to_dict,
         )
         _strategy = self._registry.get("tmf_spread")
         if not _strategy or not hasattr(_strategy, "_lifecycle_oca"):
@@ -2135,6 +2136,36 @@ class FuturesMonitor:
             ticker=self.ticker, atr=float(getattr(_strategy, "_last_atr", 0.0) or 0.0),
             lifecycle=lifecycle_to_dict(_strategy._lifecycle_oca),
         )
+
+        # ── Sprint 4B: cancel sibling → CANCELING_SIBLING ──
+        _cancel_oid = _rg.far_order_id if _winner == "near" else _rg.near_order_id
+        if self.order_mgr and _cancel_oid:
+            try:
+                self.order_mgr.cancel(_cancel_oid, reason=f"oco_4b_cancel_{_winner}", source="oco_bracket")
+                _rg.sibling_cancel_order_id = _cancel_oid
+                _rg.sibling_cancel_status = CancelStatus.PENDING
+                _rg.status = ReleaseGroupStatus.CANCELING_SIBLING
+                console.print(
+                    f"[bold cyan]🔄 [OCO_4B] CANCELING_SIBLING sent for {_cancel_oid}"
+                    f" (winner={_winner})[/bold cyan]"
+                )
+                _write_mts_state(
+                    has_position=True, action=f"OCO_CANCELING_{_winner.upper()}",
+                    reason=f"oco_4b_cancel_{_winner}",
+                    near_entry=_strategy._near_entry, far_entry=_strategy._far_entry,
+                    near_last=float(getattr(_strategy, "_near_last", 0)),
+                    far_last=float(getattr(_strategy, "_far_last", 0)),
+                    near_side=_strategy._near_side, far_side=_strategy._far_side,
+                    released_leg=_winner, trade_id=_strategy._trade_id,
+                    ticker=self.ticker, atr=float(getattr(_strategy, "_last_atr", 0.0) or 0.0),
+                    lifecycle=lifecycle_to_dict(_strategy._lifecycle_oca),
+                )
+            except (ValueError, RuntimeError) as _e:
+                _rg.sibling_cancel_status = CancelStatus.REJECTED
+                _rg.status = ReleaseGroupStatus.FAILED
+                console.print(
+                    f"[red]⚠️ [OCO_4B] Cancel failed: {_e} — status=FAILED[/red]"
+                )
 
     def _apply_confirmed_futures_deal(self, event):
         from core.order_management.order import OrderStatus
