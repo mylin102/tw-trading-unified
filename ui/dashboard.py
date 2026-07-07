@@ -3352,6 +3352,18 @@ elif page == f"期貨 {_TICKER}":
 
                 df_orders = pd.DataFrame(orders_data)
 
+                # 2026-07-07 Hermes Agent: sort by creation time so the
+                # dashboard always shows the most recent orders first,
+                # regardless of order_id sequence (which can be reset
+                # by PM2 restart or reindex after reconciliation).
+                if "created_at" in df_orders.columns and not df_orders.empty:
+                    df_orders["_created_dt"] = pd.to_datetime(
+                        df_orders["created_at"], errors="coerce"
+                    )
+                    df_orders = df_orders.sort_values(
+                        "_created_dt", ascending=True
+                    ).drop(columns=["_created_dt"])
+
                 # Status translation map
                 status_map = {
                     "pending_submit": "⏳ 待傳送",
