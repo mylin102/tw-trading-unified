@@ -30,6 +30,11 @@ class PaperFillSimulator:
     def __init__(self, order_mgr: "OrderManager"):
         self._order_mgr = order_mgr
         self._pending_orders: Dict[str, "Order"] = {}  # order_id → Order
+        # 2026-07-07 Hermes Agent: P0 — track consumed (filled/cancelled)
+        # order IDs so OCO reconciliation cannot re-register them.
+        # Without this, reconcile→register→fill→reconcile→register→fill
+        # loops forever across ticks, producing runaway duplicate fills.
+        self.consumed_order_ids: set = set()
 
     def register(self, order: "Order") -> None:
         """
@@ -39,6 +44,12 @@ class PaperFillSimulator:
         from core.order_management.order import OrderStatus
 
         if order.status not in (OrderStatus.SUBMITTED, OrderStatus.PRE_SUBMITTED):
+            return
+        # 2026-07-07 Hermes Agent: P0 — refuse to re-register an order
+        # that was already consumed (filled/cancelled) in a previous
+        # poll cycle.  This is the cross-tick idempotency guard that
+        # prevents the OCO reconcile→fill→reconcile→fill infinite loop.
+        if order.order_id in self.consumed_order_ids:
             return
         self._pending_orders[order.order_id] = order
 
@@ -66,6 +77,7 @@ class PaperFillSimulator:
             _status = str(getattr(order, "status", "")).lower()
             if _status in ("cancelled", "canceled", "filled"):
                 self._pending_orders.pop(order_id, None)
+                self.consumed_order_ids.add(order_id)
                 continue
 
             # Symbol Guard: ensure tick matches order symbol
@@ -128,14 +140,17 @@ class PaperFillSimulator:
                     order = self._pending_orders.get(order_id)
                     if order is None or order.status in ("filled", "FILLED"):
                         self._pending_orders.pop(order_id, None)
+                        self.consumed_order_ids.add(order_id)
                     elif order is not None:
                         # Check if filled via on_fill
                         if hasattr(order, "filled_quantity") and order.filled_quantity >= order.quantity:
                             self._pending_orders.pop(order_id, None)
+                            self.consumed_order_ids.add(order_id)
 
     def remove(self, order_id: str) -> None:
         """手動移除委託單（用於 cancel/reject/expire）"""
         self._pending_orders.pop(order_id, None)
+        self.consumed_order_ids.add(order_id)
 
     def get_pending_count(self) -> int:
         return len(self._pending_orders)

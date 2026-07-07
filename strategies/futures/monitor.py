@@ -54,6 +54,21 @@ except ImportError:
     _legacy_notify = None
 
 # Structured notification system (core/notification/)
+
+# 2026-07-07 Hermes Agent: Module-level constant so tests can
+# monkeypatch the path without touching the live state file.
+MTS_POSITION_STATE_PATH = Path("/tmp/mts_position_state.json")
+
+
+def _mts_position_state_path() -> Path:
+    """Return the MTS position state file path.
+
+    Respects MTS_STATE_PATH env var override (used in production for
+    alternate deployments), falling back to the module-level constant.
+    Tests can monkeypatch MTS_POSITION_STATE_PATH to redirect.
+    """
+    return Path(os.getenv("MTS_STATE_PATH", str(MTS_POSITION_STATE_PATH)))
+
 try:
     from core.notification.notifier import notify_trade_event as _notify_trade_event
     from core.notification.formatters.futures_formatter import (
@@ -82,6 +97,17 @@ def _check_trend_breakout_signal(df_5m, df_15m):
             result["trend_short"] = True
             result["reasons"].extend([f"5m: {r}" for r in b["short_reasons"]])
     return result
+
+
+# 2026-07-07 Gemini CLI: Generation tracking dictionary wrapper for pending lifecycle orders
+class GenerationDict(dict):
+    def __init__(self, monitor):
+        self.monitor = monitor
+        super().__init__()
+    def __setitem__(self, key, value):
+        if isinstance(value, dict) and "generation" not in value:
+            value["generation"] = getattr(self.monitor, "_lifecycle_generation", 0)
+        super().__setitem__(key, value)
 
 
 class FuturesMonitor:
@@ -206,7 +232,10 @@ class FuturesMonitor:
         self.active_strategy_name = None
         self._initialized_strategy_names = set()
         self._safety_stop_trade = None  # Exchange-side safety stop order
-        self._pending_lifecycle_orders: Dict[str, Dict[str, Any]] = {}
+        # 2026-07-07 Gemini CLI: Generation token for order lifecycle and stale callback guard
+        self._lifecycle_generation = 0
+        self._emergency_reset_at = None
+        self._pending_lifecycle_orders = GenerationDict(self)
         self._applied_lifecycle_deals = set()
         self._mts_pending_fills: Dict[str, Dict[str, Any]] = {}  # [GSD] Track multi-leg spread fills before sync
         # 2026-05-27 Gemini CLI: Track orders currently undergoing timeout cancellation to prevent re-entry
@@ -229,6 +258,44 @@ class FuturesMonitor:
                     f"[V-Model] Critical error: active strategy is '{active_strat}' but calendar spread CSV "
                     f"data failed to load for ticker '{self.ticker}'. Silent start with missing data is blocked to prevent data pollution."
                 )
+
+    @property
+    def initial_balance(self) -> int:
+        """Get initial balance dynamically. Day and night sessions share the same capital.
+
+        Check order:
+        1. State file (/tmp/mts_position_state.json) if exists and valid.
+        2. Master config (config/futures.yaml) to keep day/night in sync.
+        3. Local session config execution.initial_balance fallback.
+        """
+        # 1. State file check
+        try:
+            _state_path = _mts_position_state_path()
+            if _state_path.exists():
+                with open(_state_path, "r", encoding="utf-8") as _f:
+                    _state = json.load(_f)
+                _val = _state.get("initial_balance")
+                if _val is not None:
+                    return int(_val)
+        except Exception:
+            pass
+
+        # 2. Master config check
+        try:
+            import yaml
+            from pathlib import Path
+            _master_path = Path("/Users/mylin/Documents/mylin102/tw-trading-unified/config/futures.yaml")
+            if not _master_path.exists():
+                _master_path = Path(__file__).parent.parent.parent / "config" / "futures.yaml"
+            if _master_path.exists():
+                with open(_master_path, "r", encoding="utf-8") as _f:
+                    _m_cfg = yaml.safe_load(_f)
+                return int(_m_cfg.get("execution", {}).get("initial_balance", 100000))
+        except Exception:
+            pass
+
+        # 3. Local fallback
+        return int(self.EXEC.get("initial_balance", 100000))
 
     def _apply_config_params(self):
         """[GSD] Extract parameters from self.cfg into instance attributes."""
@@ -263,6 +330,19 @@ class FuturesMonitor:
         
         self.live_trading = self.cfg.get("live_trading", False)
         self.cooldown_bars = self.cfg.get("cooldown_bars", self.STRATEGY.get("cooldown_bars", 8))
+
+        # 2026-07-07 Gemini CLI: Day and night session capital should share the same parameter.
+        # Dynamically adjust trader state if balance changed
+        if hasattr(self, 'trader') and self.trader:
+            _old_init = getattr(self.trader, "initial_balance", 100000)
+            _new_init = self.initial_balance
+            if _new_init != _old_init:
+                self.trader.initial_balance = _new_init
+                self.trader.balance += (_new_init - _old_init)
+            self.trader.fee_per_side = self.EXEC.get("broker_fee_per_side", 20)
+            self.trader.exchange_fee_per_side = self.EXEC.get("exchange_fee_per_side", 0)
+            self.trader.tax_rate = self.EXEC.get("tax_rate", 0)
+            self.trader.margin_per_lot = self.EXEC.get("margin_per_lot", 18000)
 
         # 2026-05-27 Gemini CLI: Dynamic Ticker Support (No hardcoded defaults)
         _old_ticker = self.ticker
@@ -310,7 +390,7 @@ class FuturesMonitor:
         if not hasattr(self, 'trader'):
             self.trader = PaperTrader(
                 ticker=self.ticker,
-                initial_balance=self.EXEC.get("initial_balance", 100000),
+                initial_balance=self.initial_balance,
                 point_value=get_point_value(self.ticker),
                 fee_per_side=self.EXEC.get("broker_fee_per_side", 20),
                 exchange_fee_per_side=self.EXEC.get("exchange_fee_per_side", 0),
@@ -318,7 +398,13 @@ class FuturesMonitor:
                 margin_per_lot=self.EXEC.get("margin_per_lot", 18000),
             )
         else:
-            # We don't change initial_balance after start, but we can update fees and margin
+            # 2026-07-07 Gemini CLI: Day and night session capital should share the same parameter.
+            # Dynamically adjust trader state if balance changed
+            _old_init = getattr(self.trader, "initial_balance", 100000)
+            _new_init = self.initial_balance
+            if _new_init != _old_init:
+                self.trader.initial_balance = _new_init
+                self.trader.balance += (_new_init - _old_init)
             self.trader.fee_per_side = self.EXEC.get("broker_fee_per_side", 20)
             self.trader.exchange_fee_per_side = self.EXEC.get("exchange_fee_per_side", 0)
             self.trader.tax_rate = self.EXEC.get("tax_rate", 0)
@@ -1900,15 +1986,29 @@ class FuturesMonitor:
         except Exception as e:
             console.print(f" [yellow]⚠️ Trade backup failed: {e}[/yellow] ")
 
-    def _save_orders_file_wrapper(self):
-        """Export all orders to JSON for dashboard consumption."""
+    def _save_orders_file_wrapper(self) -> set:
+        """Export all orders to JSON for dashboard consumption.
+
+        Returns the set of OCO release order IDs that were persisted via
+        lifecycle fallbacks (strategy-based or state-file).  Callers can
+        use this to decide whether _mts_release_orders_flushed should be set.
+        """
         if not self.order_mgr:
-            return
+            return set()
         try:
             from core.order_management.order import OrderSide
             import math
             import json
             from pathlib import Path
+
+            # 2026-07-07 Gemini CLI / Hermes Agent: Determine session date consistently
+            _date = getattr(self.order_mgr, "_session_date", None) if self.order_mgr else None
+            if not _date:
+                try:
+                    from core.date_utils import get_session_date_str
+                    _date = get_session_date_str()
+                except Exception:
+                    _date = datetime.now().strftime("%Y%m%d")
 
             # Get current market price for unrealized PnL
             cur_price = 0.0
@@ -1934,12 +2034,18 @@ class FuturesMonitor:
                             pnl_pts = cur_price - entry
                         else:  # SHORT
                             pnl_pts = entry - cur_price
-                        point_value = 50
+                        # 2026-07-07 Gemini CLI: P2: PnL multiplier contract-aware
+                        point_value = get_point_value(self.ticker)
                         pnl_cash = pnl_pts * point_value * qty
                         d["unrealized_pnl"] = round(pnl_cash, 0)
                         d["unrealized_pnl_pts"] = round(pnl_pts, 1)
 
                 export_data.append(d)
+
+            # 2026-07-07 Hermes Agent: Track OCO order IDs persisted via
+            # lifecycle fallbacks so callers can conditionally set
+            # _mts_release_orders_flushed without re-reading files.
+            _persisted_oco_ids: set = set()
 
             # [Fix 2026-07-06] Include release OCO orders from lifecycle state.
             # The order manager is reset on PM2 restart, but release_group persists
@@ -1987,6 +2093,7 @@ class FuturesMonitor:
                             "status": "submitted",
                             "strategy": "MTS_RELEASE_OCO",
                         })
+                        _persisted_oco_ids.add(_oid)
                 elif hasattr(_rg, 'status') and getattr(_rg.status, 'value', '') in ("PARTIALLY_FILLED", "CANCELING_SIBLING", "SIBLING_CANCELED"):
                     for _label, _oid in [("NEAR", _rg.near_order_id), ("FAR", _rg.far_order_id)]:
                         if _oid and not any(d.get("order_id") == _oid for d in export_data):
@@ -2005,13 +2112,94 @@ class FuturesMonitor:
                                 "strategy": "MTS_RELEASE_OCO",
                             })
 
-            today = datetime.now().strftime("%Y%m%d")
-            orders_file = Path(f"exports/trades/TMF_{today}_orders.json")
+            # 2026-07-07 Hermes Agent: State-file fallback — read
+            # /tmp/mts_position_state.json directly as a last resort.
+            # The strategy-based fallback above relies on _lifecycle_oca
+            # being restored on the plugin instance, which may not have
+            # happened yet after a PM2 restart. This fallback guarantees
+            # that OCO release orders are always persisted to the orders
+            # JSON file when release_group.status is SUBMITTED.
+            _existing_ids = {d.get("order_id") for d in export_data if d.get("order_id")}
+            try:
+                # 2026-07-07 Gemini CLI: Risk 5: Use isolated state path instead of module constant to prevent test pollution
+                # 2026-07-07 Gemini CLI / Hermes Agent: Call top-level _mts_position_state_path directly (not as instance method)
+                _state_path = _mts_position_state_path()
+                if _state_path.exists():
+                    _state_data = json.loads(_state_path.read_text())
+                    _lc = _state_data.get("lifecycle", {})
+                    _rg_sf = _lc.get("release_group") or _state_data.get("release_group")
+                    if _rg_sf and isinstance(_rg_sf, dict):
+                        _sf_status = _rg_sf.get("status", "")
+                        if _sf_status in ("SUBMITTED", "PARTIALLY_FILLED", "CANCELING_SIBLING"):
+                            for _leg_key in ("near", "far"):
+                                _leg_oid = _rg_sf.get(f"{_leg_key}_order_id")
+                                if _leg_oid and _leg_oid not in _existing_ids:
+                                    export_data.append({
+                                        "order_id": _leg_oid,
+                                        "symbol": f"{self.ticker}_{_leg_key.upper()}",
+                                        "side": _rg_sf.get(f"{_leg_key}_side", ""),
+                                        "order_type": _rg_sf.get(f"{_leg_key}_order_type", _rg_sf.get("order_type", "MKP")),
+                                        "quantity": 1,
+                                        "filled_quantity": 0,
+                                        "price": _rg_sf.get(f"{_leg_key}_price", 0) or 0,
+                                        "avg_fill_price": 0,
+                                        "status": "submitted",
+                                        "strategy": "MTS_RELEASE_OCO",
+                                    })
+                                    _persisted_oco_ids.add(_leg_oid)
+                                    console.print(
+                                        f"[cyan]📄 [ORDERS_SAVE] state-file fallback: "
+                                        f"{_leg_oid} ({_leg_key}) from position_state[/cyan]"
+                                    )
+            except Exception as _sf_exc:
+                console.print(
+                    f"[dim yellow]⚠️ [ORDERS_SAVE] state-file fallback failed: "
+                    f"{_sf_exc}[/dim yellow]"
+                )
+
+            # 2026-07-07 Gemini CLI / Hermes Agent: Use session-date-aware orders_file path to prevent date boundary mismatch
+            orders_file = Path(f"exports/trades/{self.ticker}_{_date}_orders.json")
             orders_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(orders_file, "w", encoding="utf-8") as f:
-                json.dump(export_data, f, ensure_ascii=False, indent=2)
+
+            # 2026-07-07 Hermes Agent: Deduplicate by order_id against
+            # existing file content.  The state-file fallback adds OCO
+            # orders unconditionally; if _save_orders_file_wrapper is
+            # called repeatedly (e.g. from multiple tick paths), the
+            # file would grow unbounded with duplicate entries.
+            # No size limit — always dedup to prevent corruption when
+            # the file grows large from rapid-fire saves.
+            _seen_ids = {d.get("order_id") for d in export_data if d.get("order_id")}
+            try:
+                if orders_file.exists():
+                    _existing = json.loads(orders_file.read_text())
+                    if isinstance(_existing, list):
+                        for _entry in _existing:
+                            if isinstance(_entry, dict):
+                                _eid = _entry.get("order_id")
+                                if _eid and _eid not in _seen_ids:
+                                    _seen_ids.add(_eid)
+                                    export_data.append(_entry)
+            except Exception:
+                pass  # corrupt existing file → overwrite with fresh data
+
+            # 2026-07-07 Hermes Agent: atomic write via temp + rename.
+            # Dashboard reads this file on every refresh; a direct write
+            # races with the read and produces corrupted JSON.  Writing
+            # to a temp file then atomically renaming avoids truncation.
+            import random
+            _tmp_orders = f"{orders_file}.tmp.{os.getpid()}.{random.randint(1000,9999)}"
+            try:
+                with open(_tmp_orders, "w", encoding="utf-8") as f:
+                    json.dump(export_data, f, ensure_ascii=False, indent=2)
+                os.replace(_tmp_orders, orders_file)
+            except Exception:
+                if os.path.exists(_tmp_orders):
+                    os.remove(_tmp_orders)
+                raise
+            return _persisted_oco_ids
         except Exception as e:
-            print(f"⚠️ Failed to save futures orders file: {e}")
+            console.print(f"[yellow]⚠️ Failed to save futures orders file: {e}[/yellow]")
+            return set()
 
     def _append_filled_lifecycle_order(self, side, price, ts, lots, *, strategy="futures", comment="", order_id=None):
         """Append a filled lifecycle order record without re-executing trade logic."""
@@ -2157,6 +2345,20 @@ class FuturesMonitor:
         if not _strategy or not hasattr(_strategy, "_lifecycle_oca"):
             return
         _rg = _strategy._lifecycle_oca.release_group
+
+        # 2026-07-07 Hermes Agent: Ignore sibling fill when winner already set.
+        # After the first OCO leg fills, _check_oco_release_fill sets filled_leg
+        # and cancels the sibling synchronously.  If the sibling fill arrives
+        # (e.g. from a stale paper_fill_sim entry or duplicate callback), it
+        # must be silently ignored to prevent double-fill state corruption.
+        if _rg.filled_leg is not None:
+            console.print(
+                f"[yellow]⚠️ [OCO_DUPLICATE_FILL_IGNORED] release_group already "
+                f"filled (winner={_rg.filled_leg.value}); ignoring sibling fill "
+                f"for {event.order_id}[/yellow]"
+            )
+            return
+
         if _rg.status not in (ReleaseGroupStatus.SUBMITTED,):
             return
         _oid = event.order_id
@@ -2234,6 +2436,20 @@ class FuturesMonitor:
     def _apply_confirmed_futures_deal(self, event):
         from core.order_management.order import OrderStatus
         from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
+
+        # 2026-07-07 Gemini CLI: P0: Stale callback guard based on lifecycle generation
+        # 2026-07-07 Gemini CLI / Hermes Agent: Handle missing _lifecycle_generation gracefully for unit tests
+        pending = self._pending_lifecycle_orders.get(event.order_id)
+        if pending:
+            _order_gen = pending.get("generation", 0)
+            _curr_gen = getattr(self, "_lifecycle_generation", 0)
+            if _order_gen < _curr_gen:
+                import logging
+                logging.getLogger("FuturesMonitor").warning(
+                    f"[STALE_CALLBACK_IGNORED] Ignored stale fill for order {event.order_id} "
+                    f"(order generation {_order_gen} < current generation {_curr_gen})"
+                )
+                return None
 
         # [MTS] Check if this fill completes a spread entry (automated or manual)
         # Must be called BEFORE early returns to ensure tracking dictionary is updated
@@ -2491,11 +2707,33 @@ class FuturesMonitor:
 
         def _on_cancel_callback(event):
             console.print(f" [yellow]🚫 Order CANCELLED: {event.order_id} ({event.reason})[/yellow] ")
+            # 2026-07-07 Gemini CLI: P0: Stale callback guard based on lifecycle generation
+            # 2026-07-07 Gemini CLI / Hermes Agent: Handle missing _lifecycle_generation gracefully for unit tests
+            pending = self._pending_lifecycle_orders.get(event.order_id)
+            _curr_gen = getattr(self, "_lifecycle_generation", 0)
+            if pending and pending.get("generation", 0) < _curr_gen:
+                import logging
+                logging.getLogger("FuturesMonitor").warning(
+                    f"[STALE_CALLBACK_IGNORED] Ignored stale cancel for order {event.order_id} "
+                    f"(order generation {pending.get('generation', 0)} < current generation {_curr_gen})"
+                )
+                return
             self._clear_pending_lifecycle_order(event.order_id)
             self._save_orders_file_wrapper()
 
         def _on_reject_callback(event):
             console.print(f"[red]❌ Order REJECTED: {event.order_id} ({event.reason})[/red]")
+            # 2026-07-07 Gemini CLI: P0: Stale callback guard based on lifecycle generation
+            # 2026-07-07 Gemini CLI / Hermes Agent: Handle missing _lifecycle_generation gracefully for unit tests
+            pending = self._pending_lifecycle_orders.get(event.order_id)
+            _curr_gen = getattr(self, "_lifecycle_generation", 0)
+            if pending and pending.get("generation", 0) < _curr_gen:
+                import logging
+                logging.getLogger("FuturesMonitor").warning(
+                    f"[STALE_CALLBACK_IGNORED] Ignored stale reject for order {event.order_id} "
+                    f"(order generation {pending.get('generation', 0)} < current generation {_curr_gen})"
+                )
+                return
             self._clear_pending_lifecycle_order(event.order_id)
             self._save_orders_file_wrapper()
 
@@ -2592,19 +2830,23 @@ class FuturesMonitor:
         if not self.paper_fill_sim or not self.order_mgr:
             return
 
-        _state_file = os.getenv("MTS_STATE_PATH", "/tmp/mts_position_state.json")
-        if not os.path.exists(_state_file):
+        _state_path = _mts_position_state_path()
+        if not _state_path.exists():
             return
 
         try:
-            with open(_state_file) as f:
-                _state = json.load(f)
+            _state = json.loads(_state_path.read_text())
         except Exception:
             return
 
         _lc = _state.get("lifecycle", {})
         _rg = _lc.get("release_group", {})
         if _rg.get("status") != "SUBMITTED":
+            return
+        # 2026-07-07 Hermes Agent: P0 — terminal guard (same rationale as
+        # _reconcile_paper_oco_orders at L2850).  If the state file records
+        # that a leg was already filled, do NOT re-register.
+        if _rg.get("filled_leg") is not None:
             return
 
         _near_oid = _rg.get("near_order_id")
@@ -2613,8 +2855,19 @@ class FuturesMonitor:
             return
 
         _pending_ids = set(self.paper_fill_sim._pending_orders.keys())
-        _need_near = _near_oid not in _pending_ids and _near_oid not in self.order_mgr.active_orders
-        _need_far = _far_oid not in _pending_ids and _far_oid not in self.order_mgr.active_orders
+        # 2026-07-07 Hermes Agent: P0 — also check completed orders to
+        # prevent re-registering orders already filled in a prior poll cycle.
+        _completed_ids = {o.order_id for o in (self.order_mgr.completed or [])}
+        _need_near = (
+            _near_oid not in _pending_ids
+            and _near_oid not in self.order_mgr.active_orders
+            and _near_oid not in _completed_ids
+        )
+        _need_far = (
+            _far_oid not in _pending_ids
+            and _far_oid not in self.order_mgr.active_orders
+            and _far_oid not in _completed_ids
+        )
         if not _need_near and not _need_far:
             return
 
@@ -2666,13 +2919,25 @@ class FuturesMonitor:
 
         if _rg.status != ReleaseGroupStatus.SUBMITTED:
             return
+        # 2026-07-07 Hermes Agent: P0 — terminal guard.
+        # If filled_leg is already set, the OCO has been partially or fully
+        # resolved.  Reconciliation must NOT re-register orders that belong
+        # to a resolved release_group.  This is the cross-tick idempotency
+        # guard that prevents the reconcile→fill→reconcile→fill loop.
+        if _rg.filled_leg is not None:
+            return
         if not _rg.near_order_id or not _rg.far_order_id:
             return
 
         # Check if already registered (e.g., after fresh submission in same run)
         _pending_ids = set(self.paper_fill_sim._pending_orders.keys())
-        _need_near = _rg.near_order_id not in _pending_ids
-        _need_far = _rg.far_order_id not in _pending_ids
+        # 2026-07-07 Hermes Agent: P0 — also check completed orders.
+        # After fill, an OCO leg moves from active_orders → completed.
+        # Without this check, the reconciliation loop re-registers the
+        # same order every tick, causing infinite re-fill (runaway loop).
+        _completed_ids = {o.order_id for o in (self.order_mgr.completed or [])}
+        _need_near = _rg.near_order_id not in _pending_ids and _rg.near_order_id not in _completed_ids
+        _need_far = _rg.far_order_id not in _pending_ids and _rg.far_order_id not in _completed_ids
         if not _need_near and not _need_far:
             return  # both already registered
 
@@ -2724,6 +2989,13 @@ class FuturesMonitor:
         never fill even when the market moves past their levels.
         
         Called from _mts_tick() on every poll cycle with real-time prices.
+
+        2026-07-07 Hermes Agent: Atomic OCO guard.  After processing the
+        first tick, if pending_count dropped (an OCO leg was filled or
+        cancelled), break immediately instead of feeding the second tick.
+        This prevents the double-fill bug where both near and far OCO
+        orders fill in the same poll cycle because the callback hasn't
+        had a chance to cancel the sibling yet.
         """
         if not self.paper_fill_sim or self.paper_fill_sim.get_pending_count() == 0:
             # [DEBUG 2026-07-07] Diagnose why OCO orders aren't filling
@@ -2755,6 +3027,11 @@ class FuturesMonitor:
                 console.print("[dim][PAPER_FILL] OCO already filled — skipping remaining ticks[/dim]")
                 break
 
+            # 2026-07-07 Hermes Agent: snapshot pending before processing.
+            # If an OCO leg gets filled/cancelled during process_tick(),
+            # the sibling must not be processed in the same cycle.
+            _before_ids = set(self.paper_fill_sim._pending_orders.keys())
+
             try:
                 self.paper_fill_sim.process_tick(tick)
             except Exception as exc:
@@ -2766,8 +3043,22 @@ class FuturesMonitor:
                     f"[red]⚠️ [PAPER_FILL_ERR] tick={getattr(tick, 'code', '?')} "
                     f"close={getattr(tick, 'close', 0)} err={exc}[/red]"
                 )
+
+            # 2026-07-07 Hermes Agent: Post-tick guard — break if any
+            # OCO order was consumed (filled or cancelled) during this tick.
+            # This is more reliable than checking filled_leg because the
+            # callback may not have propagated to release_group yet.
+            _after_ids = set(self.paper_fill_sim._pending_orders.keys())
+            if _after_ids != _before_ids:
+                _consumed = _before_ids - _after_ids
+                console.print(
+                    f"[bold yellow]🔒 [OCO_ATOMIC] consumed={_consumed} "
+                    f"— breaking poll loop (sibling protected)[/bold yellow]"
+                )
+                break
+
             # [ADR-010] Post-tick guard: break if OCO filled_leg is now set
-            # (more reliable than pending_count which may not drop if callback hasn't run)
+            # (kept as backup even with the snapshot guard above)
             if _rg is not None and getattr(_rg, "filled_leg", None) is not None:
                 console.print("[dim][PAPER_FILL] OCO filled_leg set — breaking poll loop[/dim]")
                 break
@@ -3157,10 +3448,39 @@ class FuturesMonitor:
             pass
 
     def _submit_mts_order_signal(self, signal, strategy, bar_dict, ts):
-        """Submit order via order_mgr for MTS signals (entry, release, exit)."""
+        """Submit order via order_mgr for MTS signals (entry, release, exit).
+
+        This is the P0 safety boundary for all MTS order submissions.
+        Every code path that creates broker/paper orders for MTS must go
+        through this function.  Guard checks here are the LAST line of
+        defense before an order hits the broker or paper_fill_sim.
+        """
         if not self.order_mgr:
             console.print("[red]⚠️ [MTS_ORDER] order_mgr not available — cannot submit order[/red]")
             return
+
+        # 2026-07-07 Hermes Agent: P0 Market-hours guard.
+        # Submitting orders when TAIFEX futures market is closed produces
+        # ghost orders — the broker accepts them as queued but they never
+        # fill, leaving permanent pending_submit/submitted entries in
+        # OrderManager memory and the orders JSON file.
+        #
+        # This guard is the final safety net.  The upstream _mts_tick()
+        # also checks market hours (L4709), but defense-in-depth requires
+        # the guard AT the submission boundary so no future code path can
+        # bypass it.  Emergency flatten has its own direct submission path
+        # that does NOT go through here (see _process_manual_trade_flag
+        # close_all); that is intentionally unguarded for crisis scenarios.
+        _action = getattr(signal, "action", "?")
+        _reason = getattr(signal, "reason", "?")
+        if not is_taifex_futures_market_open():
+            console.print(
+                f"[dim yellow]⛔ [MTS_ORDER_REJECT] market closed; "
+                f"refusing to submit {_action} "
+                f"(reason={_reason})[/dim yellow]"
+            )
+            return
+
         from core.order_management.order import OrderType, OrderSide
         _action = signal.action
         _reason = signal.reason
@@ -3186,9 +3506,27 @@ class FuturesMonitor:
         _ENTRY_BUFFER = 4
         _EXIT_BUFFER = 10
 
+        # 2026-07-07 Hermes Agent: Hard guard — refuse placeholder symbols.
+        # After PM2 restart, self.contract / self.far_contract may be None
+        # until Shioaji resolves the rolling contracts.  Submitting orders
+        # with placeholder codes like "TMF_NEAR" / "TMF_FAR" would send
+        # invalid symbols to the broker or paper_fill_sim.
+        if self.contract is None:
+            console.print(
+                "[red]⛔ [MTS_ORDER_BLOCKED] near contract is None; "
+                "refusing to submit order with placeholder symbol[/red]"
+            )
+            return
+        if self.far_contract is None:
+            console.print(
+                "[red]⛔ [MTS_ORDER_BLOCKED] far_contract is None; "
+                "refusing to submit order with placeholder symbol[/red]"
+            )
+            return
+
         # [GSD] Use real contract codes instead of synthetic symbols
-        _near_code = self.contract.code if self.contract else f"{self.ticker}_NEAR"
-        _far_code = self.far_contract.code if self.far_contract else f"{self.ticker}_FAR"
+        _near_code = self.contract.code
+        _far_code = self.far_contract.code
 
         # [Snapshot] Capture submission-time OHLC for slippage analysis
         _snap = {
@@ -3281,6 +3619,22 @@ class FuturesMonitor:
                         f"(phase={_phase}, release_group={_rg_status})[/yellow]"
                     )
                     return
+
+            # 2026-07-07 Hermes Agent: Restart reconciliation gap guard.
+            # After PM2 restart + emergency flatten, lifecycle may be None or
+            # FLAT while the strategy still holds a position (restored from
+            # state file).  Allowing legacy MTS_EXIT in this window creates
+            # duplicate exits before OCO lifecycle is properly re-established.
+            _has_pos = bool(getattr(strategy, "_has_position", False))
+            _phase_val = getattr(getattr(_lc, "phase", None), "value", None) if _lc else None
+            if _phase_val in (None, "FLAT") and _has_pos:
+                console.print(
+                    f"[yellow]⚠️ [RESTART_GAP_GUARD] Blocked legacy EXIT — "
+                    f"lifecycle={_phase_val} but strategy has position; "
+                    f"waiting for OCO reconciliation "
+                    f"(trade_id={getattr(strategy, '_trade_id', None)})[/yellow]"
+                )
+                return
 
             _side = OrderSide.SELL if _remaining_side == "LONG" else OrderSide.BUY
 
@@ -4179,7 +4533,7 @@ class FuturesMonitor:
     def _sync_mts_status(self):
         """[GSD] Synchronize MTS position and manual order state to disk for dashboard."""
         # 2026-05-27 Gemini CLI: Use isolated path if environment variable is set
-        _hb_file = os.getenv("MTS_STATE_PATH", "/tmp/mts_position_state.json")
+        _hb_path = _mts_position_state_path()
         _mts_cfg = self.cfg.get("mts", {})
         _strat_name = _mts_cfg.get("strategy", "tmf_spread")
         strategy = self._registry.get(_strat_name)
@@ -4200,9 +4554,9 @@ class FuturesMonitor:
             
             # Read existing to preserve some fields (like last prices)
             existing = {}
-            if os.path.exists(_hb_file):
+            if _hb_path.exists():
                 try:
-                    with open(_hb_file, "r") as f: existing = json.load(f)
+                    existing = json.loads(_hb_path.read_text())
                 except: pass
 
             # [GSD] Restoration Guard: don't overwrite valid disk state while strategy recovers
@@ -4272,7 +4626,7 @@ class FuturesMonitor:
                 "near_last": round(_n_last, 1), "far_last": round(_f_last, 1),
                 "near_upl": round(_n_upl, 1), "far_upl": round(_f_upl, 1),
                 "total_upl": round(_n_upl + _f_upl, 1),
-                "initial_balance": self.EXEC.get("initial_balance", 100000),
+                "initial_balance": self.initial_balance,
                 "balance": getattr(self.trader, "balance", 0) if hasattr(self, "trader") else 0,
                 # Live mode: real account equity from Shioaji API
                 "live_equity": (
@@ -4296,11 +4650,11 @@ class FuturesMonitor:
             
             # 2026-06-23 Gemini CLI: Use unique temporary filename to avoid race conditions with other writers
             import random
-            _tmp_file = f"{_hb_file}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
+            _tmp_file = f"{_hb_path}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
             try:
                 with open(_tmp_file, "w") as f:
                     json.dump(_hb_state, f, default=str)
-                os.replace(_tmp_file, _hb_file)
+                os.replace(_tmp_file, str(_hb_path))
             except Exception as e:
                 if os.path.exists(_tmp_file): os.remove(_tmp_file)
                 raise e
@@ -4537,14 +4891,13 @@ class FuturesMonitor:
             strategy.init(ctx)
 
         # [MTS Heartbeat] Update state file with latest prices
-        # 2026-05-27 Gemini CLI: Use isolated path if environment variable is set
-        _hb_file = os.getenv("MTS_STATE_PATH", "/tmp/mts_position_state.json")
+        _hb_path = _mts_position_state_path()
         try:
             _has_pos_in_mem = bool(getattr(strategy, "_has_position", False))
             existing = {}
-            if os.path.exists(_hb_file):
+            if _hb_path.exists():
                 try:
-                    with open(_hb_file, "r") as f: existing = json.load(f)
+                    existing = json.loads(_hb_path.read_text())
                 except: pass
             
             # Restoration Guard: Don't overwrite valid disk state during restart window
@@ -4633,11 +4986,11 @@ class FuturesMonitor:
     
                     # 2026-06-23 Gemini CLI: Use unique temporary filename to avoid race conditions with other writers
                     import random
-                    _tmp_file = f"{_hb_file}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
+                    _tmp_file = f"{_hb_path}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
                     try:
                         with open(_tmp_file, "w") as f:
                             json.dump(_hb_state, f, default=str)
-                        os.replace(_tmp_file, _hb_file)
+                        os.replace(_tmp_file, str(_hb_path))
                     except Exception as e:
                         if os.path.exists(_tmp_file): os.remove(_tmp_file)
                         raise e
@@ -4748,9 +5101,12 @@ class FuturesMonitor:
                     # 2026-07-07 Hermes Agent: Re-register OCO orders BEFORE saving
                     # orders file, so get_pending() returns them and the duplicate
                     # guard in _save_orders_file_wrapper prevents ghost injection.
+                    # _save_orders_file_wrapper() returns the set of OCO release
+                    # order IDs it persisted via lifecycle fallbacks.
                     self._reconcile_paper_oco_orders(strategy)
-                    self._save_orders_file_wrapper()
-                    self._mts_release_orders_flushed = True
+                    _persisted = self._save_orders_file_wrapper()
+                    if _persisted:
+                        self._mts_release_orders_flushed = True
 
         # ── [ADR-010] Poll paper OCO fills with live prices (every tick) ──
         _n_close = float(_bar_dict.get("near_close") or 0)
@@ -4928,6 +5284,9 @@ class FuturesMonitor:
             
             if _action == "close_all":
                 console.print("[bold red]🆘 [MANUAL_TRADE] EMERGENCY CLOSE ALL triggered[/bold red]")
+                # 2026-07-07 Gemini CLI: P0: Increment generation on emergency close to invalidate past callbacks
+                self._lifecycle_generation += 1
+                self._emergency_reset_at = datetime.now()
                 self._cancel_all_pending_orders()
 
                 # 2026-05-27 Gemini CLI: Define strategy object locally for use in reset/logging
@@ -4943,11 +5302,10 @@ class FuturesMonitor:
                 _trade_id = "mts-emergency"
                 try:
                     # 2026-05-27 Gemini CLI: Use isolated path if environment variable is set
-                    _state_file = os.getenv("MTS_STATE_PATH", "/tmp/mts_position_state.json")
+                    _state_path = _mts_position_state_path()
                     _disk = None
-                    if os.path.exists(_state_file):
-                        with open(_state_file) as _sf:
-                            _disk = json.load(_sf)
+                    if _state_path.exists():
+                        _disk = json.loads(_state_path.read_text())
                     if _disk and _disk.get("has_position") is True:
                         _has_pos = True
                         _near_side = _disk.get("near_side")
@@ -4982,6 +5340,15 @@ class FuturesMonitor:
                         _far_last = float(_disk.get("far_entry", _near_last + 100)) if _disk else _near_last + 100
 
                     # ── Emergency exit fill metadata (safe defaults for both-legs case) ──
+                    # 2026-07-07 Hermes Agent: refuse placeholder symbols.
+                    if self.contract is None or self.far_contract is None:
+                        console.print(
+                            "[red]❌ [EMERGENCY_BLOCKED] contract unresolved; "
+                            "refusing placeholder emergency exit[/red]"
+                        )
+                        return
+                    _emerg_near_code = self.contract.code
+                    _emerg_far_code = self.far_contract.code
                     _rem_leg = "BOTH"
                     _side = "BOTH"
                     _price = max(float(_near_last or 0), float(_far_last or 0))
@@ -4990,7 +5357,7 @@ class FuturesMonitor:
                         # Both legs held
                         _n_side = OrderSide.SELL if _near_side == "LONG" else OrderSide.BUY
                         _n_price = _near_last + _EXIT_BUFFER * _TICK if _n_side == OrderSide.BUY else _near_last - _EXIT_BUFFER * _TICK
-                        _o_near = self.order_mgr.create_order(symbol=f"{self.ticker}_NEAR", side=_n_side, order_type=OrderType.LIMIT, quantity=1, price=_n_price, strategy="MTS_EMERGENCY")
+                        _o_near = self.order_mgr.create_order(symbol=_emerg_near_code, side=_n_side, order_type=OrderType.LIMIT, quantity=1, price=_n_price, strategy="MTS_EMERGENCY")
                         self.order_mgr.submit(_o_near)
                         if self.paper_fill_sim:
                             self.paper_fill_sim.register(_o_near)
@@ -5003,7 +5370,7 @@ class FuturesMonitor:
 
                         _f_side = OrderSide.SELL if _far_side == "LONG" else OrderSide.BUY
                         _f_price = _far_last + _EXIT_BUFFER * _TICK if _f_side == OrderSide.BUY else _far_last - _EXIT_BUFFER * _TICK
-                        _o_far = self.order_mgr.create_order(symbol=f"{self.ticker}_FAR", side=_f_side, order_type=OrderType.LIMIT, quantity=1, price=_f_price, strategy="MTS_EMERGENCY")
+                        _o_far = self.order_mgr.create_order(symbol=_emerg_far_code, side=_f_side, order_type=OrderType.LIMIT, quantity=1, price=_f_price, strategy="MTS_EMERGENCY")
                         self.order_mgr.submit(_o_far)
                         if self.paper_fill_sim:
                             self.paper_fill_sim.register(_o_far)
@@ -5022,7 +5389,8 @@ class FuturesMonitor:
                         _rem_last = _far_last if _rem_leg == "far" else _near_last
                         _side = OrderSide.SELL if _rem_side == "LONG" else OrderSide.BUY
                         _price = _rem_last + _EXIT_BUFFER * _TICK if _side == OrderSide.BUY else _rem_last - _EXIT_BUFFER * _TICK
-                        _order = self.order_mgr.create_order(symbol=f"{self.ticker}_{_rem_leg.upper()}", side=_side, order_type=OrderType.LIMIT, quantity=1, price=_price, strategy="MTS_EMERGENCY")
+                        _rem_code = _emerg_far_code if _rem_leg == "far" else _emerg_near_code
+                        _order = self.order_mgr.create_order(symbol=_rem_code, side=_side, order_type=OrderType.LIMIT, quantity=1, price=_price, strategy="MTS_EMERGENCY")
                         self.order_mgr.submit(_order)
                         if self.paper_fill_sim:
                             self.paper_fill_sim.register(_order)
@@ -5078,7 +5446,75 @@ class FuturesMonitor:
                 else:
                     self._manual_trade_status = "FAILED: NO_ORDER_MGR"
 
+                # 2026-07-07 Gemini CLI / Hermes Agent: Save updated orders immediately after emergency close
+                self._save_orders_file_wrapper()
+
                 # 2026-06-05 JVS Claw: terminal — clean up .processing
+                if os.path.exists(_processing_path):
+                    os.remove(_processing_path)
+                return True
+
+            if _action == "clear_records":
+                console.print("[bold red]🗑️ [MANUAL_TRADE] MANUAL CLEAR RECORDS triggered[/bold red]")
+                # 2026-07-07 Gemini CLI: P0: Increment generation and reset everything on manual clear
+                self._lifecycle_generation += 1
+                self._emergency_reset_at = datetime.now()
+                self._cancel_all_pending_orders()
+
+                _mts_cfg = self.cfg.get("mts", {})
+                _strat_name = _mts_cfg.get("strategy", "tmf_spread")
+                _strategy_obj = self._registry.get(_strat_name)
+                if _strategy_obj:
+                    _strategy_obj._reset(reason="MANUAL_CLEAR")
+
+                self._pending_lifecycle_orders.clear()
+                self._mts_pending_fills.clear()
+                self._mts_stale_order_cancels.clear()
+
+                # 2026-07-07 Gemini CLI / Hermes Agent: Clear in-memory OrderManager state and delete orders file from disk
+                if self.order_mgr:
+                    self.order_mgr.clear_session_orders()
+
+                # 2026-07-07 Hermes Agent: P0 — reset consumed_order_ids to prevent
+                # cross-session pollution.  After clear_records, the same order IDs
+                # (starting from ORD-YYYYMMDD-000001) may be reused.  Stale consumed
+                # IDs from the previous session would block legitimate re-registration.
+                _paper_sim = getattr(self, "paper_fill_sim", None)
+                if _paper_sim:
+                    _paper_sim._pending_orders.clear()
+                    _paper_sim.consumed_order_ids.clear()
+
+                try:
+                    from core.date_utils import get_session_date_str
+                    _date = getattr(self.order_mgr, "_session_date", None) if self.order_mgr else None
+                    if not _date:
+                        _date = get_session_date_str()
+                    _orders_file = Path(f"exports/trades/{self.ticker}_{_date}_orders.json")
+                    if _orders_file.exists():
+                        _orders_file.unlink()
+                except Exception as _e:
+                    console.print(f"[red]⚠️ [MANUAL_TRADE] clear_records: orders file delete failed: {_e}[/red]")
+
+                try:
+                    from strategies.plugins.futures.active.tmf_spread import _write_mts_state, lifecycle_to_dict
+                    _lc_dict = {
+                        "phase": "FLAT",
+                        "release_group": {"status": "INACTIVE"},
+                        "trail_group": {"status": "INACTIVE"},
+                    }
+                    self._manual_trade_status = "READY"
+                    _write_mts_state(has_position=False, action="FLAT", reason="MANUAL_CLEAR",
+                                     ticker=self.ticker, lifecycle=_lc_dict,
+                                     manual_trade_status="READY")
+                except Exception as exc:
+                    import logging
+                    logging.getLogger("FuturesMonitor").exception("[MTS][MANUAL_CLEAR] failed to write FLAT state: %s", exc)
+
+                if self.trader.position != 0:
+                    self.trader.execute_signal("EXIT", 0.0, datetime.now())
+
+                self._save_orders_file_wrapper()
+
                 if os.path.exists(_processing_path):
                     os.remove(_processing_path)
                 return True
@@ -5235,10 +5671,22 @@ class FuturesMonitor:
                         }
 
                     # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免 MKT 滑價 + LMT 卡單
-                    console.print(f"[yellow]📝 [MANUAL_TRADE] NEAR={_near_side} ref={_near:.1f} (MKP) src={_price_source}[/yellow]")
-                    console.print(f"[yellow]📝 [MANUAL_TRADE] FAR={_far_side} ref={_far:.1f} (MKP) src={_price_source}[/yellow]")
+                    # 2026-07-07 Hermes Agent: refuse placeholder symbols.
+                    # Manual trade goes through a separate path from
+                    # _submit_mts_order_signal; the contract guard must
+                    # also be enforced here.
+                    if self.contract is None or self.far_contract is None:
+                        console.print(
+                            "[red]❌ [MANUAL_TRADE_BLOCKED] near/far contract "
+                            "unresolved; refusing placeholder manual trade[/red]"
+                        )
+                        return
+                    _near_code = self.contract.code
+                    _far_code = self.far_contract.code
+                    console.print(f"[yellow]📝 [MANUAL_TRADE] NEAR={_near_side} ref={_near:.1f} (MKP) {_near_code}[/yellow]")
+                    console.print(f"[yellow]📝 [MANUAL_TRADE] FAR={_far_side} ref={_far:.1f} (MKP) {_far_code}[/yellow]")
                     
-                    _near_order = self.order_mgr.create_order(symbol=f"{self.ticker}_NEAR", side=_near_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_ENTRY")
+                    _near_order = self.order_mgr.create_order(symbol=_near_code, side=_near_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_ENTRY")
                     self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_near_order))
                     # 2026-06-08 JVS Claw: Add trade_id for watchdog partial fill detection
                     # 2026-06-22 Gemini CLI: Map manual trade signal to _spread_side and strategy to MTS_ENTRY
@@ -5255,7 +5703,7 @@ class FuturesMonitor:
                         self.paper_fill_sim.register(_near_order)
 
                     # 2026-06-08 JVS Claw: MKP (範圍市價)
-                    _far_order = self.order_mgr.create_order(symbol=f"{self.ticker}_FAR", side=_far_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_ENTRY")
+                    _far_order = self.order_mgr.create_order(symbol=_far_code, side=_far_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_ENTRY")
                     self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_far_order))
                     # 2026-06-08 JVS Claw: Add trade_id for watchdog partial fill detection
                     # 2026-06-22 Gemini CLI: Map manual trade signal to _spread_side and strategy to MTS_ENTRY
@@ -5465,31 +5913,63 @@ class FuturesMonitor:
                             OrderSide.SELL if str(_far_side).upper().endswith("LONG") else OrderSide.BUY
                         )
                         try:
-                            _near_oid, _far_oid = self.order_mgr.submit_release_bracket(
-                                symbol_near=self.contract.code if self.contract else f"{self.ticker}_NEAR",
-                                symbol_far=self.far_contract.code if self.far_contract else f"{self.ticker}_FAR",
-                                quantity=1,
-                                side_near=_release_near_side,
-                                side_far=_release_far_side,
-                            )
-                            # Persist OCO state: order ids + SUBMITTED
-                            _lc.release_group.near_order_id = _near_oid
-                            _lc.release_group.far_order_id = _far_oid
-                            _lc.release_group.status = ReleaseGroupStatus.SUBMITTED
-                            # Persist release order metadata from submit payload
+                            # 2026-07-07 Hermes Agent: block OCO bracket when
+                            # contracts are unresolved (PM2 restart gap).
+                            if self.contract is None or self.far_contract is None:
+                                console.print(
+                                    "[red]⛔ [OCO_BLOCKED] contract unresolved; "
+                                    "refusing placeholder OCO bracket[/red]"
+                                )
+                                return  # skip OCO setup, retry next tick
+
+                            # Compute release trigger prices BEFORE submitting
+                            # the bracket, so we can pass them as LIMIT prices.
+                            # This ensures paper_fill_sim only fills when the
+                            # market reaches the ATR-based release threshold
+                            # instead of filling immediately on the next tick.
+                            # 2026-07-07 Gemini CLI: Calculate dynamic release threshold based on ATR if available
+                            _bar = {}
+                            if hasattr(self, "_last_processed_data") and self._last_processed_data:
+                                _df = self._last_processed_data.get("5m")
+                                if _df is not None and not _df.empty:
+                                    _bar = _df.iloc[-1].to_dict()
+                            if not _bar and getattr(self, "_current_bar", None):
+                                _bar = dict(self._current_bar)
+                            
+                            try:
+                                _rstop, _ = _mts_strat._get_thresholds(_bar)
+                            except Exception:
+                                _rstop = float(getattr(_mts_strat, "_release_stop_fixed", 20.0) or 20.0)
+
                             def _release_price(_entry: float, _side) -> float:
                                 _sv = str(getattr(_side, "value", _side)).upper()
                                 if _entry <= 0 or _rstop <= 0:
                                     return 0.0
                                 return round(_entry - _rstop, 1) if _sv == "LONG" else round(_entry + _rstop, 1)
-                            _rstop = float(getattr(_mts_strat, "_release_stop_fixed", 0.0) or 0.0)
                             _near_entry = float(getattr(_mts_strat, "_near_entry", 0) or 0)
                             _far_entry = float(getattr(_mts_strat, "_far_entry", 0) or 0)
-                            _lc.release_group.near_price = _release_price(_near_entry, _near_side)
-                            _lc.release_group.far_price = _release_price(_far_entry, _far_side)
+                            _near_rprice = _release_price(_near_entry, _near_side)
+                            _far_rprice = _release_price(_far_entry, _far_side)
+
+                            _near_oid, _far_oid = self.order_mgr.submit_release_bracket(
+                                symbol_near=self.contract.code,
+                                symbol_far=self.far_contract.code,
+                                quantity=1,
+                                side_near=_release_near_side,
+                                side_far=_release_far_side,
+                                price_near=_near_rprice,
+                                price_far=_far_rprice,
+                            )
+                            # Persist OCO state: order ids + SUBMITTED
+                            _lc.release_group.near_order_id = _near_oid
+                            _lc.release_group.far_order_id = _far_oid
+                            _lc.release_group.status = ReleaseGroupStatus.SUBMITTED
+                            # Persist release order metadata
+                            _lc.release_group.near_price = _near_rprice
+                            _lc.release_group.far_price = _far_rprice
                             _lc.release_group.near_side = str(getattr(_release_near_side, "value", _release_near_side))
                             _lc.release_group.far_side = str(getattr(_release_far_side, "value", _release_far_side))
-                            _lc.release_group.order_type = "MKP"
+                            _lc.release_group.order_type = "LIMIT"
                             _lc.release_group.entry_risk = EntryRiskSnapshot(
                                 atr=float(getattr(_mts_strat, "_last_atr", 0.0) or 0.0),
                                 release_stop=float(getattr(_mts_strat, "_release_stop_fixed", 0.0) or 0.0),
@@ -5498,41 +5978,27 @@ class FuturesMonitor:
                                 spread=float(data.get("entry_spread") or data.get("spread") or 0.0),
                                 timestamp=datetime.now().isoformat(),
                             )
-                            # Paper mode: register OCO orders for immediate fill simulation
+                            # Paper mode: register OCO release orders with paper_fill_sim.
+                            # Both legs are registered so that normal tick polling
+                            # (_process_pending_paper_fills) handles fills based on
+                            # the ATR release threshold.  The OCO atomic guard in
+                            # _process_pending_paper_fills prevents double-fill:
+                            # when the first leg fills, the sibling is cancelled
+                            # by _check_oco_release_fill before the second tick is fed.
                             if self.paper_fill_sim:
                                 from core.order_management.order import OrderType
-                                # [Fix 2026-07-06] Fail-fast: never silently fallback to 0
-                                _near_fill = float(data.get("near_fill_price") or 0)
-                                _far_fill = float(data.get("far_fill_price") or 0)
-                                if _near_fill <= 0 or _far_fill <= 0:
-                                    raise ValueError(
-                                        f"Invalid release synthetic fill price: "
-                                        f"near={_near_fill}, far={_far_fill} "
-                                        f"(data keys: {sorted(data.keys())})"
-                                    )
                                 _near_order = self.order_mgr.active_orders.get(_near_oid)
                                 _far_order = self.order_mgr.active_orders.get(_far_oid)
-                                # [ADR-010] Pre-fill guard: check lifecycle before each synthetic tick
-                                _rg_sub = _lc.release_group
+
                                 if _near_order:
                                     self.paper_fill_sim.register(_near_order)
-                                    self.paper_fill_sim.process_tick(
-                                        self._make_synthetic_tick(
-                                            _near_fill, datetime.now(),
-                                            symbol=self.contract.code if self.contract else f"{self.ticker}_NEAR",
-                                        )
-                                    )
-                                # [ADR-010] Don't feed far tick if near fill already resolved OCO
-                                if getattr(_rg_sub, "filled_leg", None) is not None:
-                                    console.print("[dim][PAPER_FILL] OCO filled after near tick — skipping far tick[/dim]")
-                                elif _far_order:
+                                if _far_order:
                                     self.paper_fill_sim.register(_far_order)
-                                    self.paper_fill_sim.process_tick(
-                                        self._make_synthetic_tick(
-                                            _far_fill, datetime.now(),
-                                            symbol=self.far_contract.code if self.far_contract else f"{self.ticker}_FAR",
-                                        )
-                                    )
+                                console.print(
+                                    f"[bold green]✅ [OCO_BRACKET] Registered: "
+                                    f"NEAR={_near_oid} FAR={_far_oid} — "
+                                    f"waiting for release threshold[/bold green]"
+                                )
                             _entry_spread_z = getattr(_mts_strat, "_entry_z", 3.0)
                             _write_mts_state(
                                 has_position=True, action="RELEASE_OCO_SUBMITTED",

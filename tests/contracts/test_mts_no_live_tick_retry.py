@@ -78,6 +78,10 @@ def _make_minimal_monitor():
     mon._pending_lifecycle_orders = {}
     mon._registry = {}
 
+    # 2026-07-07 Hermes Agent: contract mocks required (placeholder guard)
+    mon.contract = SimpleNamespace(code="TMFF6")
+    mon.far_contract = SimpleNamespace(code="TMFH6")
+
     # market_data init value — the minimal state that triggers NO_LIVE_TICK
     mon.market_data = {mon.ticker: {"close": None}}
     mon._far_current_bar = {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0, "ts": None}

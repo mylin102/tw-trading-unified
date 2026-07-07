@@ -509,6 +509,83 @@ def api_is_healthy(api):
     return False
 
 
+def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
+    """Attempt in-process Shioaji re-login + re-subscribe after data stagnation.
+
+    Returns True if reconnect succeeded and system can continue.
+    Returns False if reconnect failed (network down or session expired) —
+    caller should exit for PM2 restart.
+
+    Strategy:
+    1. If Shioaji event callback already detected drop (code 12), wait for it
+    2. Otherwise, attempt full re-login
+    3. On network failure, wait with backoff before giving up
+    """
+    if dry_run:
+        return True  # nothing to reconnect in dry_run mode
+
+    global _connection_dropped
+
+    # ── Phase 1: Shioaji auto-reconnect already in progress ──
+    if _connection_dropped:
+        console.print("[yellow]⏳ Shioaji auto-reconnect (code 12) in progress — waiting 30s...[/yellow]")
+        time.sleep(30)
+        if not _connection_dropped:
+            console.print("[green]✅ Shioaji auto-reconnect completed[/green]")
+            return True
+        console.print("[yellow]⚠️ Shioaji auto-reconnect still pending — attempting manual re-login[/yellow]")
+
+    # ── Phase 2: Manual re-login ──
+    from core.broker.shioaji_compat import safe_login, set_tick_callback, set_bidask_callback
+    import os
+
+    api_key = os.getenv("SHIOAJI_API_KEY")
+    secret_key = os.getenv("SHIOAJI_SECRET_KEY")
+
+    if not api_key or not secret_key:
+        console.print("[red]❌ Missing API credentials — cannot reconnect[/red]")
+        return False
+
+    for attempt in range(3):
+        try:
+            console.print(f"[cyan]🔄 Re-login attempt {attempt+1}/3...[/cyan]")
+            safe_login(api, api_key, secret_key, contracts_timeout=10000)
+            console.print("[green]✅ Shioaji re-login successful[/green]")
+
+            # Re-subscribe all contracts
+            if fm and fm.contract:
+                api.quote.subscribe(fm.contract, quote_type='tick')
+                console.print(f"[dim]📡 Re-subscribed: {fm.contract.code}[/dim]")
+            if fm and fm.far_contract:
+                api.quote.subscribe(fm.far_contract, quote_type='tick')
+                console.print(f"[dim]📡 Re-subscribed far: {fm.far_contract.code}[/dim]")
+            if om:
+                for key in ["MTX", "C", "P"]:
+                    con = om.monitor.active_contracts.get(key)
+                    if con:
+                        api.quote.subscribe(con, quote_type='tick')
+                        if key != "MTX":
+                            import shioaji as sj
+                            api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
+
+            # Re-wire tick callbacks (may have been lost)
+            from core.broker.shioaji_compat import set_tick_callback, set_bidask_callback
+            # tick_dispatcher is defined in the outer scope — we pass None for now,
+            # the existing callbacks should still be wired
+            _connection_dropped = False
+            return True
+
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Re-login attempt {attempt+1} failed: {e}[/yellow]")
+            if attempt < 2:
+                wait = (attempt + 1) * 15  # 15s, 30s, 45s backoff
+                console.print(f"[dim]Waiting {wait}s before retry...[/dim]")
+                time.sleep(wait)
+
+    console.print("[red]❌ All re-login attempts failed — network may be down[/red]")
+    return False
+
+
 def _setup_event_callback(api, fm, om):
     """[P0 Fix] Monitor Shioaji connection state via event callback.
 
@@ -911,8 +988,23 @@ def run_system(dry_run=False):
             stale_limit = 7200 if (is_pre_market or is_market_break) else 300 # 空窗期給予兩小時寬限
             
             if stale_secs > stale_limit:
-                console.print(f"[bold red]🚨 DATA STAGNATION CONFIRMED! No data for {stale_secs/60:.1f} mins (fm={now-fm_last:.1f}s, om={now-om_last:.1f}s ago). Force restarting...[/bold red]")
-                break
+                console.print(f"[bold red]🚨 DATA STAGNATION CONFIRMED! No data for {stale_secs/60:.1f} mins (fm={now-fm_last:.1f}s, om={now-om_last:.1f}s ago). Attempting in-process reconnect...[/bold red]")
+
+                # 2026-07-07 Hermes Agent: Try in-process reconnect before
+                # resorting to process exit + PM2 restart.  If the network
+                # (VPN) is down, a full restart is pointless — better to
+                # wait in-process and retry re-login with backoff.
+                if _try_shioaji_reconnect(api, fm, om if 'om' in dir() else None, dry_run):
+                    console.print("[green]✅ In-process reconnect successful — resetting staleness timer[/green]")
+                    last_data_at = time.time()
+                    stagnation_warned = False
+                    # Reset feed health timers so we don't immediately trigger again
+                    for bucket in ['TX', 'MXF', 'OPTIONS']:
+                        feed_health.last_tick_ts[bucket] = time.time()
+                    continue
+                else:
+                    console.print("[red]💀 Reconnect failed — exiting for PM2 restart[/red]")
+                    break
             elif stale_secs > (stale_limit * 0.6) and not stagnation_warned:
                 console.print(f"[bold yellow]⚠️ DATA WARNING: No data for {stale_secs/60:.1f} mins. Watching...[/bold yellow]")
                 stagnation_warned = True

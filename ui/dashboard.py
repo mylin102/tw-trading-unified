@@ -1186,7 +1186,10 @@ def format_options_trades(ledger_df):
             entry_price = float(pending_entry["entry_price"] or 0)
             exit_price = float(row.get("Price", 0))
             qty = int(pending_entry["quantity"] or 1)
-            point_value = 50
+            # 2026-07-07 Gemini CLI: P2: PnL multiplier contract-aware for TMF vs default options
+            _note = str(pending_entry.get("entry_note", ""))
+            _side = str(pending_entry.get("side", ""))
+            point_value = 10 if ("TMF" in _side or "TMF" in _note) else 50
 
             gross_pnl = (exit_price - entry_price) * point_value * qty
             # 摩擦成本
@@ -1741,7 +1744,9 @@ def load_futures_indicators(
         and not result.empty
         and "trading_day" in result.columns
     ):
-        _latest_tday = str(result["trading_day"].iloc[-1])
+        # Normalize: CSV trading_day is "2026-07-07" (dashed),
+        # cache_trading_day is "20260707" (compact).  Strip dashes.
+        _latest_tday = str(result["trading_day"].iloc[-1]).replace("-", "")
         if _latest_tday != str(cache_trading_day):
             print(
                 f"[FUTURES_DEBUG] staleness guard: trading_day={_latest_tday} "
@@ -2713,41 +2718,21 @@ elif page == f"期貨 {_TICKER}":
                                 os.rename(_log_path, _archive_path)
                                 _archived += 1
                             except: pass
-                    # Clear state file via close_all flag (safe path)
-                    for _f in ["/tmp/mts_position_state.json", "/tmp/futures_manual_trade.flag"]:
-                        if os.path.exists(_f):
-                            try: os.remove(_f)
-                            except: pass
-                    # 2026-07-07 Hermes Agent: write canonical FLAT state so
-                    # the dashboard never infers state from a missing file.
-                    # Without this the dashboard shows stale cached data or
-                    # errors until the next tick heartbeat recreates the file.
-                    _canonical = {
-                        "has_position": False,
-                        "state": "FLAT",
-                        "reason": "manual_clear_records",
-                        "manual_trade_status": "IDLE",
-                        "near_upl": 0.0, "far_upl": 0.0, "total_upl": 0.0,
-                        "total_realized_pnl": 0.0,
-                        "near_entry": 0.0, "far_entry": 0.0,
-                        "near_side": None, "far_side": None,
-                        "lifecycle": {
-                            "phase": "FLAT",
-                            "release_group": {"status": "INACTIVE"},
-                            "trail_group": {"status": "INACTIVE"},
-                        },
-                        "_updated": datetime.datetime.now().isoformat(),
-                    }
-                    with open("/tmp/mts_position_state.json", "w") as _f:
-                        json.dump(_canonical, _f, default=str)
-                    # 2026-07-07 Hermes Agent: clear Streamlit cache so the
-                    # dashboard picks up the canonical FLAT state immediately.
+                    # 2026-07-07 Gemini CLI: Send clear_records flag to monitor instead of directly modifying state files
+                    _flag_path = "/tmp/futures_manual_trade.flag"
+                    _flag = json.dumps({
+                        "action": "clear_records",
+                        "ts": datetime.datetime.now().isoformat(),
+                        "created_at": time.time()
+                    })
+                    with open(_flag_path, "w") as _f:
+                        _f.write(_flag)
                     st.cache_data.clear()
                     if _archived > 0:
-                        st.success(f"✅ MTS 紀錄已歸檔（{_archived} 個檔案 → logs/archive/）")
+                        st.success(f"✅ MTS 紀錄已歸檔（{_archived} 個檔案 → logs/archive/），清空指令已送出...")
                     else:
-                        st.success("✅ MTS 紀錄已清空")
-                st.rerun()
+                        st.success("✅ MTS 清空指令已送出，等待後端消費...")
+                    st.rerun()
 
         # ── MTS Account Settings ──
         with st.expander("⚙️ MTS 帳戶設定", expanded=False):
@@ -3367,7 +3352,7 @@ elif page == f"期貨 {_TICKER}":
                 _sig = (_lf.name, _lf.stat().st_mtime_ns, _lf.stat().st_size) if _lf.exists() else None
 
                 f_df = load_futures_indicators(
-                    full_history=cont_mode,
+                    full_history=False,
                     cache_trading_day=_today,
                     cache_file_sig=_sig,
                 )

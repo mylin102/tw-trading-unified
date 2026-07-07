@@ -678,27 +678,30 @@ def _write_mts_state(
 
         # ── UPL Calculation ──
         # 2026-05-27 Gemini CLI: Use dynamic point value from engine constants
+        # 2026-07-07 Hermes Agent: Only calculate UPL when has_position=True.
+        # When FLAT, entry prices from disk are stale and produce phantom UPL.
         _mult = float(get_point_value(ticker))
         near_upl = 0.0
         far_upl = 0.0
         near_realized = 0.0
         far_realized = 0.0
 
-        if _f_near_entry > 0 and near_last > 0 and _f_near_side:
-            _n_pts = (near_last - _f_near_entry) * (-1 if _f_near_side == "SHORT" else 1)
-            if near_status == "OPEN":
-                near_upl = _n_pts * _mult
-            else:
-                _p = release_price if release_price > 0 else near_last
-                near_realized = (float(_p) - _f_near_entry) * (-1 if _f_near_side == "SHORT" else 1) * _mult
+        if has_position:
+            if _f_near_entry > 0 and near_last > 0 and _f_near_side:
+                _n_pts = (near_last - _f_near_entry) * (-1 if _f_near_side == "SHORT" else 1)
+                if near_status == "OPEN":
+                    near_upl = _n_pts * _mult
+                else:
+                    _p = release_price if release_price > 0 else near_last
+                    near_realized = (float(_p) - _f_near_entry) * (-1 if _f_near_side == "SHORT" else 1) * _mult
 
-        if _f_far_entry > 0 and far_last > 0 and _f_far_side:
-            _f_pts = (far_last - _f_far_entry) * (-1 if _f_far_side == "SHORT" else 1)
-            if far_status == "OPEN":
-                far_upl = _f_pts * _mult
-            else:
-                _p = release_price if release_price > 0 else far_last
-                far_realized = (float(_p) - _f_far_entry) * (-1 if _f_far_side == "SHORT" else 1) * _mult
+            if _f_far_entry > 0 and far_last > 0 and _f_far_side:
+                _f_pts = (far_last - _f_far_entry) * (-1 if _f_far_side == "SHORT" else 1)
+                if far_status == "OPEN":
+                    far_upl = _f_pts * _mult
+                else:
+                    _p = release_price if release_price > 0 else far_last
+                    far_realized = (float(_p) - _f_far_entry) * (-1 if _f_far_side == "SHORT" else 1) * _mult
 
         # ── Release state label ──
         if released_leg is None:

@@ -6,7 +6,7 @@ cooldown_bars: 5
 execution:
   broker_fee_per_side: 20.0  # 微台指手續費較低
   exchange_fee_per_side: 0.0
-  initial_balance: 50000  # 微台指保證金低，5 萬足夠
+  initial_balance: 100000  # 預設為 100,000 元
   limit_offset_pts: 2.0
   market_slippage_pts: 2.0
   order_type: MKP

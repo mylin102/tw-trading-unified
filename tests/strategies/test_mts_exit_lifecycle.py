@@ -89,6 +89,9 @@ def test_mts_order_lifecycle_flow():
     monitor.ticker = "TMF"
     monitor._use_order_manager = True
     monitor.order_mgr = OrderManager(api)
+    # 2026-07-07 Hermes Agent: contracts must be set (placeholder guard)
+    monitor.contract = MagicMock(code="TMFF6")
+    monitor.far_contract = MagicMock(code="TMFH6")
     
     # Setup Strategy State (Released Near, Remaining FAR LONG)
     strat = TMFSpread()
@@ -101,6 +104,20 @@ def test_mts_order_lifecycle_flow():
     strat._peak = 44100.0
     strat._ticker = "TMF"
     strat._trade_id = "mts-lifecycle-test"
+    # 2026-07-07 Hermes Agent: lifecycle must be SINGLE_LEG (restart gap guard)
+    from strategies.plugins.futures.active.tmf_spread import (
+        PositionPhase, PositionLifecycle, ReleaseGroup, ReleaseGroupStatus,
+        TrailGroup, TrailGroupStatus,
+    )
+    strat._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SINGLE_LEG,
+        release_group=ReleaseGroup(
+            status=ReleaseGroupStatus.SIBLING_CANCELED,
+            near_order_id="ORD-TEST-N", far_order_id="ORD-TEST-F",
+            near_side="buy", far_side="sell",
+        ),
+        trail_group=TrailGroup(status=TrailGroupStatus.ARMED),
+    )
     
     # 2. Trigger Exit via _mts_tick (simulating on_bar signal)
     bar_dict = {
@@ -117,8 +134,8 @@ def test_mts_order_lifecycle_flow():
         # Verify order creation and label
         assert mock_submit.called
         order = mock_submit.call_args[0][0]
-        # In mock env it falls back to TMF_FAR
-        assert order.symbol == "TMF_FAR"
+        # Contract resolved → real code
+        assert order.symbol == "TMFH6"
         assert order.side == OrderSide.SELL
         assert order.strategy == "MTS_EXIT"  # Verification of new label
         

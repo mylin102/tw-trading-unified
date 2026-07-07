@@ -646,6 +646,8 @@ class OrderManager:
         side_near: OrderSide,
         side_far: OrderSide,
         strategy: str = "MTS_RELEASE_OCO",
+        price_near: float | None = None,
+        price_far: float | None = None,
     ) -> tuple[str, str]:
         """Submit a two-sided release OCO bracket.
 
@@ -657,16 +659,23 @@ class OrderManager:
         Paper mode: creates two orders × submit.
         Live mode (future): broker-native OCO or two orders + auto-cancel.
 
+        When price_near/price_far are provided, uses LIMIT order type
+        so the paper_fill_sim only fills when the release threshold
+        is reached.  Omit for MKP (range market) orders.
+
         Returns (near_order_id, far_order_id).
         Raises RuntimeError if either submission fails.
         """
+        _order_type = OrderType.LIMIT if (price_near is not None and price_far is not None) else OrderType.MKP
         near_order = self.create_order(
-            symbol=symbol_near, side=side_near, order_type=OrderType.MKP,
+            symbol=symbol_near, side=side_near, order_type=_order_type,
             quantity=quantity, strategy=strategy,
+            price=price_near,
         )
         far_order = self.create_order(
-            symbol=symbol_far, side=side_far, order_type=OrderType.MKP,
+            symbol=symbol_far, side=side_far, order_type=_order_type,
             quantity=quantity, strategy=strategy,
+            price=price_far,
         )
 
         near_ok = self.submit(near_order)
@@ -868,6 +877,20 @@ class OrderManager:
 
         self._next_id = max(self._next_id, max_order_index + 1)
         return {"active": len(self.active_orders), "completed": len(self.completed)}
+
+    def clear_session_orders(self) -> None:
+        """Clear all active and completed orders for the current session and reset next ID.
+
+        2026-07-07 Gemini CLI / Hermes Agent: Reset session-date-aware state and next_id.
+        """
+        self.active_orders.clear()
+        self.completed = []
+        self._next_id = 1
+        try:
+            from core.date_utils import get_session_date_str
+            self._session_date = get_session_date_str()
+        except Exception:
+            self._session_date = datetime.now().strftime("%Y%m%d")
 
     def reconcile_trade_snapshot(
         self,
