@@ -2718,6 +2718,31 @@ elif page == f"期貨 {_TICKER}":
                         if os.path.exists(_f):
                             try: os.remove(_f)
                             except: pass
+                    # 2026-07-07 Hermes Agent: write canonical FLAT state so
+                    # the dashboard never infers state from a missing file.
+                    # Without this the dashboard shows stale cached data or
+                    # errors until the next tick heartbeat recreates the file.
+                    _canonical = {
+                        "has_position": False,
+                        "state": "FLAT",
+                        "reason": "manual_clear_records",
+                        "manual_trade_status": "IDLE",
+                        "near_upl": 0.0, "far_upl": 0.0, "total_upl": 0.0,
+                        "total_realized_pnl": 0.0,
+                        "near_entry": 0.0, "far_entry": 0.0,
+                        "near_side": None, "far_side": None,
+                        "lifecycle": {
+                            "phase": "FLAT",
+                            "release_group": {"status": "INACTIVE"},
+                            "trail_group": {"status": "INACTIVE"},
+                        },
+                        "_updated": datetime.datetime.now().isoformat(),
+                    }
+                    with open("/tmp/mts_position_state.json", "w") as _f:
+                        json.dump(_canonical, _f, default=str)
+                    # 2026-07-07 Hermes Agent: clear Streamlit cache so the
+                    # dashboard picks up the canonical FLAT state immediately.
+                    st.cache_data.clear()
                     if _archived > 0:
                         st.success(f"✅ MTS 紀錄已歸檔（{_archived} 個檔案 → logs/archive/）")
                     else:

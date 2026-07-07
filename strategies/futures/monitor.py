@@ -5056,8 +5056,13 @@ class FuturesMonitor:
                             "release_group": {"status": "INACTIVE"},
                             "trail_group": {"status": "INACTIVE"},
                         }
+                        # 2026-07-07 Hermes Agent: set manual_trade_status to READY
+                        # BEFORE writing state so the dashboard sees it immediately
+                        # instead of waiting for the next tick heartbeat.
+                        self._manual_trade_status = "READY"
                         _write_mts_state(has_position=False, action="FLAT", reason="EMERGENCY_CLOSE",
-                                         ticker=self.ticker, lifecycle=_lc_dict)
+                                         ticker=self.ticker, lifecycle=_lc_dict,
+                                         manual_trade_status="READY")
                     except Exception as exc:
                         import logging
                         _log = logging.getLogger("FuturesMonitor")
@@ -5076,7 +5081,6 @@ class FuturesMonitor:
                 # 2026-06-05 JVS Claw: terminal — clean up .processing
                 if os.path.exists(_processing_path):
                     os.remove(_processing_path)
-                self._manual_trade_status = "READY"
                 return True
 
             # 2026-05-22 Gemini CLI: Removed mts_selftest block from here.
