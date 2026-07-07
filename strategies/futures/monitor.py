@@ -1945,6 +1945,10 @@ class FuturesMonitor:
             # The order manager is reset on PM2 restart, but release_group persists
             # in the state file. Without this, release orders are invisible until
             # the next order_mgr event (fill/cancel) triggers a flush.
+            # 2026-07-07 Hermes Agent: Also check order_mgr.completed for duplicate
+            # order IDs, preventing ghost OCO entries when both legs already filled
+            # but release_group.status is still SUBMITTED (e.g., after restart).
+            _completed_ids = {o.order_id for o in self.order_mgr.completed} if self.order_mgr else set()
             _strat = self._registry.get("tmf_spread")
             if _strat and hasattr(_strat, "_lifecycle_oca"):
                 _rg = _strat._lifecycle_oca.release_group
@@ -1953,7 +1957,11 @@ class FuturesMonitor:
                         ("NEAR", _rg.near_order_id, "near_side", "near_price", "_near_side"),
                         ("FAR", _rg.far_order_id, "far_side", "far_price", "_far_side"),
                     ]:
-                        if not _oid or any(d.get("order_id") == _oid for d in export_data):
+                        if not _oid:
+                            continue
+                        if any(d.get("order_id") == _oid for d in export_data):
+                            continue
+                        if _oid in _completed_ids:
                             continue
                         _side = getattr(_rg, _side_attr, None) or ""
                         if _side not in ("buy", "sell"):
@@ -2701,6 +2709,12 @@ class FuturesMonitor:
             self.order_mgr.submit(_fo)
             self.paper_fill_sim.register(_fo)
             console.print(f"[cyan]♻️ [OCO_RECONCILE] far order {_rg.far_order_id} re-registered[/cyan]")
+
+        # 2026-07-07 Hermes Agent: Reindex counter after reconcile to prevent
+        # backtracking on PM2 restart. Reconciled orders carry persisted IDs
+        # (e.g., ORD-20260707-000003) — _next_id must resume from max+1.
+        if self.order_mgr:
+            self.order_mgr.reindex_orders()
 
     def _process_pending_paper_fills(self, near_price: float, far_price: float, ts) -> None:
         """Poll paper fill simulator with live near/far prices during MTS tick.
@@ -4269,6 +4283,15 @@ class FuturesMonitor:
                 "atr": round(_last_atr, 2), # 2026-06-26 Gemini CLI: pass current ATR to state writer
                 "_updated": datetime.now().isoformat(),
             }
+            # 2026-07-07 Hermes Agent: Do not write simplified MTS position state
+            # while strategy owns a live position. Full lifecycle-aware state is
+            # written by tick heartbeat / strategy.write_state().
+            # _sync_mts_status writes a flat schema (no lifecycle/release_group/
+            # trail_group) which would strip the state machine fields on every
+            # poll cycle, causing the dashboard to briefly flash a degraded view.
+            if _has_pos_in_mem:
+                return
+
             _hb_state.update(_manual_order_info)
             
             # 2026-06-23 Gemini CLI: Use unique temporary filename to avoid race conditions with other writers
@@ -4567,10 +4590,21 @@ class FuturesMonitor:
                     # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
                     _n_last = float(_bar_dict.get("near_close") or 0.0)
                     _f_last = float(_bar_dict.get("far_close") or 0.0)
-                    # 2026-05-27 Gemini CLI: Use dynamic multiplier from constants instead of hardcoded 10.0
-                    _mult = float(get_point_value(self.ticker))
-                    _n_upl = (_n_last - _n_entry) * (-1 if _n_side == "SHORT" else 1) * _mult if _n_entry > 0 and _n_last > 0 and _n_side else 0.0
-                    _f_upl = (_f_last - _f_entry) * (-1 if _f_side == "SHORT" else 1) * _mult if _f_entry > 0 and _f_last > 0 and _f_side else 0.0
+                    # 2026-07-07 Hermes Agent: When has_position is False or lifecycle
+                    # phase is FLAT, zero out UPL to prevent stale entry prices
+                    # from disk producing phantom PnL on the dashboard.
+                    _lifecycle_phase = None
+                    _lc = getattr(strategy, "_lifecycle_oca", None)
+                    if _lc is not None:
+                        _lifecycle_phase = str(getattr(_lc.phase, "value", ""))
+                    if not _has_pos_in_mem or _lifecycle_phase == "FLAT":
+                        _n_upl = 0.0
+                        _f_upl = 0.0
+                    else:
+                        # 2026-05-27 Gemini CLI: Use dynamic multiplier from constants instead of hardcoded 10.0
+                        _mult = float(get_point_value(self.ticker))
+                        _n_upl = (_n_last - _n_entry) * (-1 if _n_side == "SHORT" else 1) * _mult if _n_entry > 0 and _n_last > 0 and _n_side else 0.0
+                        _f_upl = (_f_last - _f_entry) * (-1 if _f_side == "SHORT" else 1) * _mult if _f_entry > 0 and _f_last > 0 and _f_side else 0.0
     
                     # 💡 [Fixed 2026-05-27] Inject trade_id into bar_dict for strategy recovery
                     _bar_dict["trade_id"] = _trade_id
@@ -4711,11 +4745,12 @@ class FuturesMonitor:
                     and _rg_near
                     and _rg_far
                 ):
+                    # 2026-07-07 Hermes Agent: Re-register OCO orders BEFORE saving
+                    # orders file, so get_pending() returns them and the duplicate
+                    # guard in _save_orders_file_wrapper prevents ghost injection.
+                    self._reconcile_paper_oco_orders(strategy)
                     self._save_orders_file_wrapper()
                     self._mts_release_orders_flushed = True
-                    # [ADR-010] Re-register OCO orders into paper_fill_sim after restart
-                    # Must run AFTER on_bar() → _restore_position_state() restores lifecycle
-                    self._reconcile_paper_oco_orders(strategy)
 
         # ── [ADR-010] Poll paper OCO fills with live prices (every tick) ──
         _n_close = float(_bar_dict.get("near_close") or 0)
