@@ -7,6 +7,8 @@ Paper / Live 共用同一套狀態機。
 """
 from __future__ import annotations
 
+import os
+import json
 from datetime import datetime
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, field
@@ -46,8 +48,21 @@ class OrderManager:
         self.mode = mode
         self.active_orders: Dict[str, Order] = {}
         self.completed: List[Order] = []
+        # 2026-07-07 Hermes Agent: session_date-based counter reset.
+        # Counter resets per trading session, NOT per PM2 restart.
+        # Uses get_session_date_str which handles night session crossing midnight.
+        try:
+            from core.date_utils import get_session_date_str
+            self._session_date = get_session_date_str()
+        except Exception:
+            self._session_date = datetime.now().strftime("%Y%m%d")
         self._next_id = 1
         self.broker_adapter = broker_adapter
+
+        # 2026-07-07 Hermes Agent: reindex from disk immediately after init
+        # so the counter survives PM2 restart even before the first caller
+        # remembers to call reindex_orders().
+        self.reindex_orders()
 
         # Callback 系統
         self._callbacks: Dict[str, List[Callable]] = {
@@ -189,8 +204,20 @@ class OrderManager:
         combo_strategy: str = "",
     ) -> Order:
         """建立新委託單，狀態→ PENDING_SUBMIT"""
-        order_id = f"ORD-{self._next_id:06d}"
+        # 2026-07-07 Hermes Agent: session_date-based order ID.
+        # Format: ORD-{session_date}-{counter:06d}
+        # Counter resets per trading session, persists across PM2 restarts
+        # via reindex_orders() scanning existing orders for current session.
+        order_id = f"ORD-{self._session_date}-{self._next_id:06d}"
         self._next_id += 1
+
+        # 2026-07-07 Hermes Agent: collision guard — skip IDs that already
+        # exist in active_orders or completed (counter may backtrack after
+        # PM2 restart if reindex_orders wasn't called yet).
+        _existing_ids = set(self.active_orders.keys()) | {o.order_id for o in self.completed}
+        while order_id in _existing_ids:
+            order_id = f"ORD-{self._session_date}-{self._next_id:06d}"
+            self._next_id += 1
 
         order = Order(
             symbol=symbol,
@@ -794,12 +821,51 @@ class OrderManager:
         return restored
 
     def reindex_orders(self) -> Dict[str, int]:
+        """Scan existing orders for current session_date, set _next_id to max+1.
+
+        2026-07-07 Hermes Agent: session_date-aware reindex.
+        Supports both old format (ORD-XXXXXX) and new format (ORD-YYYYMMDD-XXXXXX).
+        Scans in-memory orders AND the persisted orders JSON file so the counter
+        survives PM2 restart (when in-memory state is empty but disk has history).
+        On session boundary, _session_date changes → finds no matching orders → resets to 1.
+        """
         max_order_index = 0
+
+        def _scan_id(oid: str) -> int:
+            if not oid or not oid.startswith("ORD-"):
+                return 0
+            suffix = oid[4:]
+            parts = suffix.split("-", 1)
+            if len(parts) == 2:
+                date_part, counter_part = parts
+                if date_part == self._session_date and counter_part.isdigit():
+                    return int(counter_part)
+            elif suffix.isdigit():
+                return int(suffix)
+            return 0
+
         for order in list(self.active_orders.values()) + self.completed:
-            if order.order_id.startswith("ORD-"):
-                suffix = order.order_id.split("ORD-", 1)[1]
-                if suffix.isdigit():
-                    max_order_index = max(max_order_index, int(suffix))
+            max_order_index = max(max_order_index, _scan_id(order.order_id))
+
+        # 2026-07-07 Hermes Agent: also scan persisted orders file.
+        # After PM2 restart the in-memory collections are empty, but the
+        # orders file holds the full history for this session.
+        try:
+            import json, os as _os
+            _orders_file = f"exports/trades/TMF_{self._session_date}_orders.json"
+            if _os.path.exists(_orders_file):
+                with open(_orders_file) as _of:
+                    _orders_data = json.load(_of)
+                if isinstance(_orders_data, list):
+                    for _entry in _orders_data:
+                        if isinstance(_entry, dict):
+                            max_order_index = max(
+                                max_order_index,
+                                _scan_id(_entry.get("order_id", "")),
+                            )
+        except Exception:
+            pass
+
         self._next_id = max(self._next_id, max_order_index + 1)
         return {"active": len(self.active_orders), "completed": len(self.completed)}
 

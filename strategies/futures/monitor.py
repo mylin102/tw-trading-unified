@@ -4959,6 +4959,11 @@ class FuturesMonitor:
                     console.print(f"[red]⚠️ [MANUAL_TRADE] close_all: disk read failed: {_sf_e}[/red]")
 
                 if _has_pos and self.order_mgr:
+                    # 2026-07-07 Hermes Agent: reindex order counter from
+                    # persisted orders to prevent ID collision after PM2
+                    # restart or order_mgr recreation.
+                    self.order_mgr.reindex_orders()
+
                     _ts = datetime.now()
                     from core.order_management.order import OrderType, OrderSide
                     _EXIT_BUFFER = 10
