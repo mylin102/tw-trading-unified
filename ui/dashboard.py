@@ -1494,7 +1494,11 @@ _FUTURES_USECOLS_ESSENTIAL = ["timestamp", "Close", "High", "Low", "Open", "Volu
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_futures_indicators(full_history=False):
+def load_futures_indicators(
+    full_history=False,
+    cache_trading_day=None,
+    cache_file_sig=None,
+):
     def _read_and_standardize(path, *, usecols=None):
         try:
             df = pd.read_csv(path, usecols=usecols)
@@ -1726,6 +1730,26 @@ def load_futures_indicators(full_history=False):
         result = result.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
     import sys as _sys
     print(f"[FUTURES_DEBUG] returning: type={type(result).__name__}, empty={result.empty if result is not None else 'N/A'}, rows={len(result) if result is not None else 0}", file=_sys.stderr, flush=True)
+
+    # 2026-07-07 Hermes Agent: Staleness guard — refuse to return yesterday's
+    # data for today's dashboard.  Without this the stale-data warning fires
+    # but the caller still renders the old chart, confusing the user.
+    if (
+        not full_history
+        and cache_trading_day is not None
+        and result is not None
+        and not result.empty
+        and "trading_day" in result.columns
+    ):
+        _latest_tday = str(result["trading_day"].iloc[-1])
+        if _latest_tday != str(cache_trading_day):
+            print(
+                f"[FUTURES_DEBUG] staleness guard: trading_day={_latest_tday} "
+                f"!= cache_trading_day={cache_trading_day}, returning empty",
+                file=_sys.stderr, flush=True,
+            )
+            return pd.DataFrame()
+
     return result
 
 # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] TMF Default
@@ -1904,8 +1928,17 @@ def load_calendar_spread_data():
         # 如果沒有預先計算的檔案，嘗試從近月/遠月資料計算
         print("[Calendar Spread] 沒有預先計算的價差檔案，嘗試計算...")
         
+        # 2026-07-07 Hermes Agent: cache-busting key
+        _today = get_session_date_str()
+        _lf = FUTURES_MKT / f"TMF_{_today}_PAPER_indicators.csv"
+        _sig = (_lf.name, _lf.stat().st_mtime_ns, _lf.stat().st_size) if _lf.exists() else None
+
         # 載入近月資料
-        df_near = load_futures_indicators(full_history=True)
+        df_near = load_futures_indicators(
+            full_history=True,
+            cache_trading_day=_today,
+            cache_file_sig=_sig,
+        )
         if df_near is None or df_near.empty:
             print("[Calendar Spread] 無法載入近月資料")
             return pd.DataFrame()
@@ -2298,7 +2331,17 @@ if st.session_state.get('show_weak_bear_panel', False):
 # ════════════════════════════════════════
 if page == "總覽":
     col1, col2 = st.columns(2)
-    f_df = load_futures_indicators(full_history=False)  # 總覽一率走 fast path，不依賴 toggle
+
+    # 2026-07-07 Hermes Agent: cache-busting key
+    _today = get_session_date_str()
+    _lf = FUTURES_MKT / f"TMF_{_today}_PAPER_indicators.csv"
+    _sig = (_lf.name, _lf.stat().st_mtime_ns, _lf.stat().st_size) if _lf.exists() else None
+
+    f_df = load_futures_indicators(
+        full_history=False,
+        cache_trading_day=_today,
+        cache_file_sig=_sig,
+    )  # 總覽一率走 fast path，不依賴 toggle
     o_df = load_options_indicators(full_history=False)
 
     with col1:
@@ -2538,7 +2581,16 @@ elif page == f"期貨 {_TICKER}":
     _ov_ticker = futures_cfg.get("ticker", "TMF")
     st.header(f"期貨 {_ov_ticker} ({mode_badge(f_live)})")
 
-    f_df = load_futures_indicators(full_history=False)  # 期貨頁先走 fast path（參數資料夠用）
+    # 2026-07-07 Hermes Agent: cache-busting key
+    _today = get_session_date_str()
+    _lf = FUTURES_MKT / f"TMF_{_today}_PAPER_indicators.csv"
+    _sig = (_lf.name, _lf.stat().st_mtime_ns, _lf.stat().st_size) if _lf.exists() else None
+
+    f_df = load_futures_indicators(
+        full_history=False,
+        cache_trading_day=_today,
+        cache_file_sig=_sig,
+    )  # 期貨頁先走 fast path（參數資料夠用）
     if f_df is not None and not f_df.empty:
         last = f_df.iloc[-1]
         last_ts = pd.to_datetime(last.get("timestamp"))
@@ -3284,7 +3336,16 @@ elif page == f"期貨 {_TICKER}":
 
             if orders_data:
                 # Get LIVE price from the same data source as charts
-                f_df = load_futures_indicators(full_history=cont_mode)
+                # 2026-07-07 Hermes Agent: cache-busting key
+                _today = get_session_date_str()
+                _lf = FUTURES_MKT / f"TMF_{_today}_PAPER_indicators.csv"
+                _sig = (_lf.name, _lf.stat().st_mtime_ns, _lf.stat().st_size) if _lf.exists() else None
+
+                f_df = load_futures_indicators(
+                    full_history=cont_mode,
+                    cache_trading_day=_today,
+                    cache_file_sig=_sig,
+                )
                 live_price = None
                 if f_df is not None and not f_df.empty and "Close" in f_df.columns:
                     live_price = float(f_df["Close"].iloc[-1])
