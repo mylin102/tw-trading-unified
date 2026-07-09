@@ -126,14 +126,9 @@ def calculate_spread_metrics(df_near, df_far):
     safe_std = merged["spread_std"].replace(0, pd.NA)
     merged["spread_z"] = (merged["spread"] - merged["spread_ma"]) / safe_std
 
-    # 2026-07-09 Hermes Agent: Compute EMA-smoothed spread and long-window rolling Z-score
-    merged["spread_ema"] = merged["spread"].ewm(span=5, adjust=False).mean()
-    merged["spread_z_ema"] = (merged["spread_ema"] - merged["spread_ma"]) / safe_std
-    
-    merged["spread_ma_60"] = merged["spread"].rolling(window=60, min_periods=60).mean()
-    merged["spread_std_60"] = merged["spread"].rolling(window=60, min_periods=60).std()
-    safe_std_60 = merged["spread_std_60"].replace(0, pd.NA)
-    merged["spread_z_60"] = (merged["spread"] - merged["spread_ma_60"]) / safe_std_60
+    # 2026-07-09 Hermes Agent: Calculate Spread EMA 20 and EMA 60 for trend direction
+    merged["spread_ema_20"] = merged["spread"].ewm(span=20, adjust=False).mean()
+    merged["spread_ema_60"] = merged["spread"].ewm(span=60, adjust=False).mean()
 
     merged["vwap"] = merged["Close_near"].rolling(window=window, min_periods=window).mean()
     merged["vwap_std"] = merged["Close_near"].rolling(window=window, min_periods=window).std()

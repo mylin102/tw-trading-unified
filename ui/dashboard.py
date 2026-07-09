@@ -1160,18 +1160,17 @@ def make_calendar_spread_chart(spread_df):
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
         
-        # 創建 4 行子圖
-        # 2026-07-09 Hermes Agent: Split Z-score into two subplots (Raw Z-score, Smoothed Z-score) -> 4 rows total
+        # 創建 3 行子圖
+        # 2026-07-09 Hermes Agent: Revert to 3 rows (Price, Spread + EMAs, Raw Z-score)
         fig = make_subplots(
-            rows=4, cols=1,
+            rows=3, cols=1,
             shared_xaxes=True,
-            row_heights=[0.3, 0.22, 0.24, 0.24],
+            row_heights=[0.4, 0.3, 0.3],
             vertical_spacing=0.07,
             subplot_titles=(
                 "近月/遠月價格 (藍線: 近月, 橘虛線: 遠月)", 
-                "價差 (綠線: Spread, 灰陰影: ±1 Std)", 
-                "Raw Z-score (紅線: Raw 20, 橘虛線/綠虛線: 進出場線)", 
-                "Smoothed Z-score (藍線: EMA 5, 紫虛線: Window 60)"
+                "價差 (綠線: Spread, 藍線: EMA 20, 紫線: EMA 60, 灰陰影: ±1 Std)", 
+                "Raw Z-score (紅線: Raw 20, 橘虛線/綠虛線: 進出場線)"
             )
         )
         
@@ -1214,15 +1213,25 @@ def make_calendar_spread_chart(spread_df):
                 row=2, col=1
             )
             
-            # 添加價差移動平均線
-            # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
-            if "spread_ma" in spread_df.columns:
+            # 2026-07-09 Hermes Agent: Add Spread EMA 20 and EMA 60 lines on Row 2
+            if "spread_ema_20" in spread_df.columns:
                 fig.add_trace(
                     go.Scatter(
                         x=_clean_list(spread_df["timestamp"], force_str=True),
-                        y=_clean_list(spread_df["spread_ma"]),
-                        name="價差 MA(20)",
-                        line=dict(color="#9467bd", width=1, dash="dot"),
+                        y=_clean_list(spread_df["spread_ema_20"]),
+                        name="EMA 20",
+                        line=dict(color="#1f77b4", width=1.5), # blue
+                        mode="lines"
+                    ),
+                    row=2, col=1
+                )
+            if "spread_ema_60" in spread_df.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=_clean_list(spread_df["timestamp"], force_str=True),
+                        y=_clean_list(spread_df["spread_ema_60"]),
+                        name="EMA 60",
+                        line=dict(color="#9467bd", width=1.5), # purple
                         mode="lines"
                     ),
                     row=2, col=1
@@ -1301,34 +1310,6 @@ def make_calendar_spread_chart(spread_df):
             
             # 零線 on Row 3
             fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=3, col=1)
-
-        # 4. Smoothed/Long Z-score (Row 4)
-        if "spread_z_ema" in spread_df.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=_clean_list(spread_df["timestamp"], force_str=True),
-                    y=_clean_list(spread_df["spread_z_ema"]),
-                    name="Spread Z-score (EMA 5)",
-                    line=dict(color="#1f77b4", width=2),
-                    mode="lines"
-                ),
-                row=4, col=1
-            )
-            
-        if "spread_z_60" in spread_df.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=_clean_list(spread_df["timestamp"], force_str=True),
-                    y=_clean_list(spread_df["spread_z_60"]),
-                    name="Spread Z-score (Window 60)",
-                    line=dict(color="#9467bd", width=1.5, dash="dash"),
-                    mode="lines"
-                ),
-                row=4, col=1
-            )
-            
-            # 零線 on Row 4
-            fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=4, col=1)
         
         # 2026-07-09 Hermes Agent: Mark session open/close boundaries on X-axis (open = green, close = red)
         import pandas as pd
@@ -1359,7 +1340,7 @@ def make_calendar_spread_chart(spread_df):
 
         # 更新佈局
         fig.update_layout(
-            height=850,
+            height=780,
             margin=dict(t=50, b=20, l=70, r=20),
             showlegend=False,
             hovermode="x unified",
@@ -1368,7 +1349,7 @@ def make_calendar_spread_chart(spread_df):
         
         # 移除非交易時段 & 確保每個子圖都單獨顯示時間軸
         # 2026-07-09 Hermes Agent: Force showticklabels=True on all rows so each subplot has an x-axis
-        for r in range(1, 5):
+        for r in range(1, 4):
             fig.update_xaxes(
                 showticklabels=True,
                 rangebreaks=[
@@ -1385,7 +1366,6 @@ def make_calendar_spread_chart(spread_df):
         fig.update_yaxes(title_text="價格", row=1, col=1, tickformat=",.0f")
         fig.update_yaxes(title_text="價差點數", row=2, col=1, tickformat=",.1f")
         fig.update_yaxes(title_text="Raw Z-score", row=3, col=1, tickformat=",.2f")
-        fig.update_yaxes(title_text="Smoothed Z", row=4, col=1, tickformat=",.2f")
         
         return fig
         
