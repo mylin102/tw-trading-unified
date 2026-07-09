@@ -858,7 +858,7 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
         row=1, col=1
     )
     fig.update_yaxes(
-        title_text="z-score",
+        title_text="MTF Score",
         showgrid=True,
         gridwidth=1,
         gridcolor="rgba(128, 128, 128, 0.2)",
@@ -1127,7 +1127,7 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     )
     if score_row is not None:
         fig.update_yaxes(
-            title_text="z-score",
+            title_text="MTF Score",
             showgrid=True,
             gridwidth=1,
             gridcolor="rgba(128, 128, 128, 0.2)",
