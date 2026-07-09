@@ -157,6 +157,15 @@ def calculate_spread_metrics(df_near, df_far):
     safe_spread_std = df_merged['spread_std'].replace(0, pd.NA)
     df_merged['spread_z'] = (df_merged['spread'] - df_merged['spread_ma']) / safe_spread_std
     
+    # 2026-07-09 Hermes Agent: Compute EMA-smoothed spread and long-window rolling Z-score
+    df_merged['spread_ema'] = df_merged['spread'].ewm(span=5, adjust=False).mean()
+    df_merged['spread_z_ema'] = (df_merged['spread_ema'] - df_merged['spread_ma']) / safe_spread_std
+    
+    df_merged['spread_ma_60'] = df_merged['spread'].rolling(window=60, min_periods=60).mean()
+    df_merged['spread_std_60'] = df_merged['spread'].rolling(window=60, min_periods=60).std()
+    safe_spread_std_60 = df_merged['spread_std_60'].replace(0, pd.NA)
+    df_merged['spread_z_60'] = (df_merged['spread'] - df_merged['spread_ma_60']) / safe_spread_std_60
+    
     # Add VWAP for near month (simplified as rolling mean)
     df_merged['vwap'] = df_near['Close'].rolling(window=window, min_periods=window).mean()
     df_merged['vwap_std'] = df_near['Close'].rolling(window=window, min_periods=window).std()

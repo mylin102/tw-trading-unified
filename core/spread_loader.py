@@ -107,6 +107,9 @@ class SpreadLoader:
                 bar["spread_z"] = float(row["spread_z"])
                 bar["spread_ma"] = float(row.get("spread_ma", 0.0))
                 bar["spread_std"] = float(row.get("spread_std", 0.0))
+                # 2026-07-09 Hermes Agent: Enrich smoothed/long-window Z-score values
+                bar["spread_z_ema"] = float(row.get("spread_z_ema", row["spread_z"]))
+                bar["spread_z_60"] = float(row.get("spread_z_60", row["spread_z"]))
                 # 2026-06-26 Gemini CLI: Prioritize the bar's actual Close price over the loaded CSV to prevent stale price overrides
                 bar["near_close"] = float(bar.get("Close", bar.get("close", row.get("Close_near", 0.0))))
                 # 2026-07-02 Hermes Agent: Preserve existing far_close if bar already has one
@@ -259,6 +262,9 @@ class SpreadLoader:
         💡 [Fixed 2026-05-27] Keep far_close at 0.0 to signal missing data.
         """
         bar["spread_z"] = 0.0
+        # 2026-07-09 Hermes Agent: Default values for smoothed/long-window Z-score versions
+        bar["spread_z_ema"] = 0.0
+        bar["spread_z_60"] = 0.0
         bar["near_close"] = bar.get("Close", 0.0)
         bar["far_close"] = 0.0
         bar["spread_ma"] = 0.0

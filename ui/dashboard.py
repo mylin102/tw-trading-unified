@@ -201,11 +201,11 @@ if st.sidebar.button("🔄 重新載入資料", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
-# Optional auto-refresh interval (60s by default)
+# Optional auto-refresh interval (120s by default — 2026-07-09 Hermes Agent: was 60s, reduced frequency to prevent asyncio buffer contention)
 auto_refresh_sec = st.sidebar.selectbox(
     "⏱️ 自動更新間隔",
     options=["關閉", "15秒", "30秒", "60秒", "120秒", "300秒"],
-    index=3,
+    index=4,
     key="auto_refresh_interval",
 )
 if auto_refresh_sec != "關閉":
@@ -261,7 +261,7 @@ with st.sidebar:
     st.selectbox(
         "📄 頁面",
         ["總覽", f"期貨 {_TICKER}", "選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "設定"],
-        index=0,
+        index=1,
         key="page_selector",
     )
 
@@ -438,6 +438,160 @@ with st.sidebar:
             st.rerun()
         else:
             st.error(f"❌ 更新失敗（回傳碼: {result.returncode}）")
+
+# 2026-07-08 Gemini CLI: Calculate MTS daily performance metrics matching scripts/generate_daily_report.py
+def calculate_mts_daily_performance(fills_path: str, events_path: str, target_trading_day: str) -> dict:
+    import os
+    import json
+    from datetime import datetime, timedelta
+    from collections import defaultdict
+
+    if not os.path.exists(fills_path):
+        return {"completed": [], "active": []}
+
+    def get_trading_day(timestamp_str: str, session: str) -> str:
+        try:
+            dt = datetime.fromisoformat(timestamp_str)
+            if session == "night" and dt.hour >= 15:
+                return (dt + timedelta(days=1)).strftime("%Y-%m-%d")
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            return timestamp_str.split("T")[0]
+
+    trades = defaultdict(lambda: {
+        "entries": [],
+        "release": None,
+        "exit": None,
+        "exit_reason": "UNKNOWN",
+        "entry_ts": None,
+        "exit_ts": None,
+        "risk_mode": "UNKNOWN",
+        "session": "UNKNOWN"
+    })
+    
+    try:
+        with open(fills_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try:
+                    fill = json.loads(line)
+                    trade_id = fill.get("trade_id")
+                    if not trade_id: continue
+                    
+                    fill_type = fill.get("fill_type")
+                    ts_str = fill.get("timestamp", "")
+                    session = fill.get("session", "UNKNOWN")
+                    
+                    if fill_type == "ENTRY":
+                        trades[trade_id]["entries"].append(fill)
+                        if not trades[trade_id]["entry_ts"]:
+                            trades[trade_id]["entry_ts"] = ts_str
+                        trades[trade_id]["session"] = session
+                    elif fill_type == "RELEASE":
+                        trades[trade_id]["release"] = fill
+                    elif fill_type == "EXIT":
+                        trades[trade_id]["exit"] = fill
+                        trades[trade_id]["exit_ts"] = ts_str
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    time_to_trade = {}
+    if os.path.exists(events_path):
+        try:
+            with open(events_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    try:
+                        event = json.loads(line)
+                        trade_id = event.get("trade_id")
+                        ts = event.get("ts", "")
+                        if ts and trade_id:
+                            time_to_trade[ts[:19]] = trade_id
+                    except Exception:
+                        continue
+                        
+            with open(events_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    try:
+                        event = json.loads(line)
+                        ev_type = event.get("event")
+                        ts = event.get("ts", "")
+                        trade_id = event.get("trade_id")
+                        if not trade_id and ts:
+                            trade_id = time_to_trade.get(ts[:19])
+                        
+                        if not trade_id: continue
+                            
+                        if ev_type == "EXIT_REMAINING":
+                            trades[trade_id]["exit_reason"] = event.get("reason", "UNKNOWN")
+                            trades[trade_id]["risk_mode"] = event.get("risk_mode", "UNKNOWN")
+                        elif ev_type in ("RELEASE_NEAR_SUBMITTED", "RELEASE_FAR_SUBMITTED"):
+                            trades[trade_id]["risk_mode"] = event.get("risk_mode", "UNKNOWN")
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    completed = []
+    active = []
+    
+    for trade_id, data in trades.items():
+        if len(data["entries"]) > 0 and not data["exit"]:
+            near_entry = next((e for e in data["entries"] if e["leg"] == "NEAR"), None)
+            far_entry = next((e for e in data["entries"] if e["leg"] == "FAR"), None)
+            entry_ts = data["entry_ts"]
+            session = data["session"]
+            trading_day = get_trading_day(entry_ts, session)
+            
+            if trading_day == target_trading_day:
+                active.append({
+                    "trade_id": trade_id,
+                    "entry_time": entry_ts,
+                    "session": session,
+                    "near_entry": near_entry["price"] if near_entry else 0.0,
+                    "far_entry": far_entry["price"] if far_entry else 0.0,
+                    "spread_z": near_entry.get("spread_z") if near_entry else None,
+                    "atr": near_entry.get("atr") if near_entry else None,
+                })
+        elif len(data["entries"]) > 0 and data["exit"]:
+            exit_ts = data["exit_ts"]
+            session = data["session"]
+            trading_day = get_trading_day(exit_ts, session)
+            
+            if trading_day == target_trading_day:
+                near_entry = next((e for e in data["entries"] if e["leg"] == "NEAR"), None)
+                far_entry = next((e for e in data["entries"] if e["leg"] == "FAR"), None)
+                release_fill = data["release"]
+                exit_fill = data["exit"]
+                
+                release_pnl = release_fill.get("realized_pnl", 0.0) if release_fill else 0.0
+                exit_pnl = exit_fill.get("realized_pnl", 0.0) if exit_fill else 0.0
+                net_pnl = release_pnl + exit_pnl
+                
+                completed.append({
+                    "trade_id": trade_id,
+                    "entry_time": data["entry_ts"],
+                    "exit_time": data["exit_ts"],
+                    "session": session,
+                    "near_entry": near_entry["price"] if near_entry else 0.0,
+                    "far_entry": far_entry["price"] if far_entry else 0.0,
+                    "release_leg": release_fill.get("leg") if release_fill else "UNKNOWN",
+                    "release_price": release_fill.get("price") if release_fill else 0.0,
+                    "release_pnl": release_pnl,
+                    "exit_price": exit_fill.get("price") if exit_fill else 0.0,
+                    "exit_pnl": exit_pnl,
+                    "exit_reason": data["exit_reason"],
+                    "net_pnl": net_pnl,
+                    "risk_mode": data["risk_mode"]
+                })
+                
+    return {"completed": completed, "active": active}
 
 # ── YAML helpers ──
 # Read page selection from session state (set by sidebar selectbox)
@@ -660,26 +814,24 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
                 row="all", col=1
             )
 
-    fig.update_layout(height=400, margin=dict(t=10, b=10, l=40, r=20), showlegend=False)
+    fig.update_layout(height=400, margin=dict(t=30, b=10, l=70, r=20), showlegend=False)
     
-    # ── GSD Enhancement: Remove non-trading gaps from time axis ──
-    # This prevents the chart from showing long flat lines during gaps
-    fig.update_xaxes(
-        rangebreaks=[
-            dict(bounds=["sat", "mon"]), # Remove weekends
-            dict(bounds=[5, 8.75], pattern="hour"),  # 05:00 - 08:45
-            dict(bounds=[13.75, 15], pattern="hour"), # 13:45 - 15:00
-        ],
-        row=1, col=1
-    )
-    fig.update_xaxes(
-        rangebreaks=[
-            dict(bounds=["sat", "mon"]),
-            dict(bounds=[5, 8.75], pattern="hour"),
-            dict(bounds=[13.75, 15], pattern="hour"),
-        ],
-        row=2, col=1
-    )
+    # ── GSD Enhancement & 2026-07-09 Hermes Agent: hourly vertical lines & rangebreaks ──
+    for r in range(1, 3):
+        fig.update_xaxes(
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]), # Remove weekends
+                dict(bounds=[5, 8.75], pattern="hour"),  # 05:00 - 08:45
+                dict(bounds=[13.75, 15], pattern="hour"), # 13:45 - 15:00
+            ],
+            dtick=3600000,                                # Every hour in milliseconds
+            tickformat="%m/%d\n%H:%M",
+            hoverformat="%Y/%m/%d %H:%M",
+            showgrid=True,
+            gridwidth=1,
+            gridcolor="rgba(128, 128, 128, 0.2)",
+            row=r, col=1
+        )
     
     # 💡 GSD: Explicitly set Y-axis range to follow data closely
     if len(df) > 0:
@@ -694,18 +846,22 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
                 # Flat line: use normal range mode (don't force zero)
                 fig.update_yaxes(rangemode="normal", row=1, col=1)
     
-    # Apply format to all Y axes, but don't force autorange here
-    fig.update_yaxes(tickformat=",.0f", fixedrange=False)
-    
-    # 3. Remove non-trading gaps and improve labels
-    fig.update_xaxes(
-        tickformat="%m/%d\n%H:%M",
-        hoverformat="%Y/%m/%d %H:%M",
-        rangebreaks=[
-            dict(bounds=[13.75, 15], pattern="hour"),  # 13:45 - 15:00
-            dict(bounds=[5, 8.75], pattern="hour"),    # 05:00 - 08:45
-            dict(bounds=["sat", "mon"]),               # Weekend
-        ]
+    # 2026-07-09 Hermes Agent: Add y-axis descriptions, raw tick formatting, and 50-point grid intervals for price.
+    fig.update_yaxes(
+        title_text="價格",
+        tickformat=".0f",
+        dtick=50,
+        showgrid=True,
+        gridwidth=1,
+        gridcolor="rgba(128, 128, 128, 0.2)",
+        row=1, col=1
+    )
+    fig.update_yaxes(
+        title_text="z-score",
+        showgrid=True,
+        gridwidth=1,
+        gridcolor="rgba(128, 128, 128, 0.2)",
+        row=2, col=1
     )
     return fig
 
@@ -931,16 +1087,17 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             )
     
     # 6. 圖表佈局設定 (2026-06-26 Gemini CLI: 動態增高以適應多個子圖)
+    # 2026-07-09 Hermes Agent: Adjust margin left to accommodate y-axis titles.
     chart_height = 500 if rows == 3 else 400
     fig.update_layout(
         height=chart_height,
-        margin=dict(t=30, b=10, l=40, r=20),
+        margin=dict(t=30, b=10, l=70, r=20),
         title=dict(text=title, x=0.5, xanchor="center"),
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
     
-    # 7. 移除非交易時段間隔 (2026-06-26 Gemini CLI: 遍歷所有子圖以套用 rangebreaks)
+    # 7. 移除非交易時段間隔 & 時間軸格式與格線 (2026-07-09 Hermes Agent: 每整點一條細直線)
     for r in range(1, rows + 1):
         fig.update_xaxes(
             rangebreaks=[
@@ -948,7 +1105,40 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
                 dict(bounds=[5, 8.75], pattern="hour"),   # 05:00 - 08:45
                 dict(bounds=[13.75, 15], pattern="hour"), # 13:45 - 15:00
             ],
+            dtick=3600000,                                # 1小時 = 3,600,000 毫秒
+            tickformat="%m/%d\n%H:%M",                   # 時間軸顯示格式
+            showgrid=True,
+            gridwidth=1,
+            gridcolor="rgba(128, 128, 128, 0.2)",        # 細垂直線
             row=r, col=1
+        )
+        
+    # ── Y-axis layout styling ──
+    # 2026-07-09 Hermes Agent: Add y-axis descriptions, raw tick formatting, and 50-point grid intervals for price.
+    fig.update_yaxes(
+        title_text="價格",
+        tickformat=".0f",      # Display raw values (46000, 46100...) without metric prefix (k)
+        dtick=50,              # Grid and tick every 50 points
+        showgrid=True,
+        gridwidth=1,
+        gridcolor="rgba(128, 128, 128, 0.2)", # 細水平線
+        row=1, col=1
+    )
+    if score_row is not None:
+        fig.update_yaxes(
+            title_text="z-score",
+            showgrid=True,
+            gridwidth=1,
+            gridcolor="rgba(128, 128, 128, 0.2)",
+            row=score_row, col=1
+        )
+    if atr_row is not None:
+        fig.update_yaxes(
+            title_text="ATR",
+            showgrid=True,
+            gridwidth=1,
+            gridcolor="rgba(128, 128, 128, 0.2)",
+            row=atr_row, col=1
         )
     
     return fig
@@ -970,13 +1160,19 @@ def make_calendar_spread_chart(spread_df):
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
         
-        # 創建 3 行子圖
+        # 創建 4 行子圖
+        # 2026-07-09 Hermes Agent: Split Z-score into two subplots (Raw Z-score, Smoothed Z-score) -> 4 rows total
         fig = make_subplots(
-            rows=3, cols=1,
+            rows=4, cols=1,
             shared_xaxes=True,
-            row_heights=[0.4, 0.3, 0.3],
-            vertical_spacing=0.05,
-            subplot_titles=("近月/遠月價格", "價差 (Spread)", "Spread Z-score")
+            row_heights=[0.3, 0.22, 0.24, 0.24],
+            vertical_spacing=0.07,
+            subplot_titles=(
+                "近月/遠月價格 (藍線: 近月, 橘虛線: 遠月)", 
+                "價差 (綠線: Spread, 灰陰影: ±1 Std)", 
+                "Raw Z-score (紅線: Raw 20, 橘虛線/綠虛線: 進出場線)", 
+                "Smoothed Z-score (藍線: EMA 5, 紫虛線: Window 60)"
+            )
         )
         
         # 1. 近月/遠月價格走勢
@@ -1052,25 +1248,21 @@ def make_calendar_spread_chart(spread_df):
                     row=2, col=1
                 )
         
-        # 3. Spread Z-score
+        # 3. Raw Spread Z-score (Row 3)
         # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
         if "spread_z" in spread_df.columns:
             fig.add_trace(
                 go.Scatter(
                     x=_clean_list(spread_df["timestamp"], force_str=True),
                     y=_clean_list(spread_df["spread_z"]),
-                    name="Spread Z-score",
-                    line=dict(color="#d62728", width=2),
+                    name="Spread Z-score (Raw 20)",
+                    line=dict(color="#d62728", width=1.5),
                     mode="lines"
                 ),
                 row=3, col=1
             )
             
-            # 添加 Calendar Condor 策略的進出場水平線
-            # 進場條件: spread_z > 3.0 (做空價差) 或 spread_z < -3.0 (做多價差)
-            # 出場條件: spread_z < -0.5 (做空價差獲利了結) 或 spread_z > 0.5 (做多價差獲利了結)
-            # 停損條件: spread_z > 3.5 (做空價差停損) 或 spread_z < -3.5 (做多價差停損)
-            
+            # 添加 Calendar Condor 策略的進出場水平線 (Row 3)
             # 進場水平線
             fig.add_hline(
                 y=3.0, line_dash="dash", line_color="red", 
@@ -1107,33 +1299,93 @@ def make_calendar_spread_chart(spread_df):
                 row=3, col=1
             )
             
-            # 零線
+            # 零線 on Row 3
             fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=3, col=1)
+
+        # 4. Smoothed/Long Z-score (Row 4)
+        if "spread_z_ema" in spread_df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=_clean_list(spread_df["timestamp"], force_str=True),
+                    y=_clean_list(spread_df["spread_z_ema"]),
+                    name="Spread Z-score (EMA 5)",
+                    line=dict(color="#1f77b4", width=2),
+                    mode="lines"
+                ),
+                row=4, col=1
+            )
+            
+        if "spread_z_60" in spread_df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=_clean_list(spread_df["timestamp"], force_str=True),
+                    y=_clean_list(spread_df["spread_z_60"]),
+                    name="Spread Z-score (Window 60)",
+                    line=dict(color="#9467bd", width=1.5, dash="dash"),
+                    mode="lines"
+                ),
+                row=4, col=1
+            )
+            
+            # 零線 on Row 4
+            fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=4, col=1)
         
+        # 2026-07-09 Hermes Agent: Mark session open/close boundaries on X-axis (open = green, close = red)
+        import pandas as pd
+        if "timestamp" in spread_df.columns:
+            ts_series = pd.to_datetime(spread_df["timestamp"], errors="coerce")
+            unique_ts = pd.Series(ts_series.dropna().unique())
+            for ts in unique_ts:
+                # Open times: 08:45 and 15:00 -> green
+                if (ts.hour == 8 and ts.minute == 45) or (ts.hour == 15 and ts.minute == 0):
+                    fig.add_vline(
+                        x=str(ts), 
+                        line_width=1, 
+                        line_dash="dot", 
+                        line_color="rgba(0, 128, 0, 0.6)", # Open: green
+                        row="all", 
+                        col=1
+                    )
+                # Close times: 13:45 and 05:00 -> red
+                elif (ts.hour == 13 and ts.minute == 45) or (ts.hour == 5 and ts.minute == 0):
+                    fig.add_vline(
+                        x=str(ts), 
+                        line_width=1, 
+                        line_dash="dot", 
+                        line_color="rgba(255, 0, 0, 0.6)", # Close: red
+                        row="all", 
+                        col=1
+                    )
+
         # 更新佈局
         fig.update_layout(
-            height=700,
-            margin=dict(t=40, b=20, l=40, r=20),
-            legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center"),
+            height=850,
+            margin=dict(t=50, b=20, l=70, r=20),
+            showlegend=False,
             hovermode="x unified",
             title_text="日曆價差分析 (Calendar Spread)"
         )
         
-        # 移除非交易時段
-        fig.update_xaxes(
-            rangebreaks=[
-                dict(bounds=["sat", "mon"]),  # 移除週末
-                dict(bounds=[5, 8.75], pattern="hour"),   # 05:00 - 08:45
-                dict(bounds=[13.75, 15], pattern="hour"), # 13:45 - 15:00
-            ],
-            tickformat="%m/%d\n%H:%M",
-            hoverformat="%Y/%m/%d %H:%M"
-        )
+        # 移除非交易時段 & 確保每個子圖都單獨顯示時間軸
+        # 2026-07-09 Hermes Agent: Force showticklabels=True on all rows so each subplot has an x-axis
+        for r in range(1, 5):
+            fig.update_xaxes(
+                showticklabels=True,
+                rangebreaks=[
+                    dict(bounds=["sat", "mon"]),  # 移除週末
+                    dict(bounds=[5, 8.75], pattern="hour"),   # 05:00 - 08:45
+                    dict(bounds=[13.75, 15], pattern="hour"), # 13:45 - 15:00
+                ],
+                tickformat="%m/%d\n%H:%M",
+                hoverformat="%Y/%m/%d %H:%M",
+                row=r, col=1
+            )
         
         # 設置 Y 軸標籤
         fig.update_yaxes(title_text="價格", row=1, col=1, tickformat=",.0f")
         fig.update_yaxes(title_text="價差點數", row=2, col=1, tickformat=",.1f")
-        fig.update_yaxes(title_text="Z-score", row=3, col=1, tickformat=",.2f")
+        fig.update_yaxes(title_text="Raw Z-score", row=3, col=1, tickformat=",.2f")
+        fig.update_yaxes(title_text="Smoothed Z", row=4, col=1, tickformat=",.2f")
         
         return fig
         
@@ -2582,6 +2834,8 @@ if page == "總覽":
 # Tab 2: 期貨
 # ════════════════════════════════════════
 elif page == f"期貨 {_TICKER}":
+    # 2026-07-09 Hermes Agent: [PERF TRACE] Start timing
+    _pt_start = time.time()
     # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Dynamic Ticker
     _ov_ticker = futures_cfg.get("ticker", "TMF")
     st.header(f"期貨 {_ov_ticker} ({mode_badge(f_live)})")
@@ -2589,13 +2843,17 @@ elif page == f"期貨 {_TICKER}":
     # 2026-07-07 Hermes Agent: cache-busting key
     _today = get_session_date_str()
     _lf = FUTURES_MKT / f"TMF_{_today}_PAPER_indicators.csv"
-    _sig = (_lf.name, _lf.stat().st_mtime_ns, _lf.stat().st_size) if _lf.exists() else None
+    # 2026-07-09 Hermes Agent: use 30s time bucket + st_size to prevent per-tick cache misses;
+    # mtime_ns was changed every time MTS backend wrote the file, causing cache miss on every autorefresh
+    _sig = (_lf.stat().st_size, _lf.stat().st_mtime // 30, _lf.name) if _lf.exists() else None
 
     f_df = load_futures_indicators(
         full_history=False,
         cache_trading_day=_today,
         cache_file_sig=_sig,
     )  # 期貨頁先走 fast path（參數資料夠用）
+    print(f"[PERF] load_futures_indicators: {time.time()-_pt_start:.3f}s")
+    _pt_data = time.time()
     if f_df is not None and not f_df.empty:
         last = f_df.iloc[-1]
         last_ts = pd.to_datetime(last.get("timestamp"))
@@ -3051,6 +3309,7 @@ elif page == f"期貨 {_TICKER}":
 
         _html_parts.append("</table></div>")
         st.markdown("".join(_html_parts), unsafe_allow_html=True)
+        print(f"[PERF] indicator_table: {time.time()-_pt_data:.3f}s")
     else:
         # ── No indicator data: show live MTS near/far prices as fallback ──
         _mts_price_file = "/tmp/mts_position_state.json"
@@ -3270,38 +3529,100 @@ elif page == f"期貨 {_TICKER}":
                 )
         except Exception:
             pass
+        print(f"[PERF] mts_state_section: {time.time()-_pt_data:.3f}s")
+
+    # 2026-07-08 Gemini CLI: Calculate and render MTS daily performance metrics on the dashboard
+    _fills_path = os.path.join(BASE, "logs/mts_trade_fills.jsonl")
+    _events_path = os.path.join(BASE, "logs/mts_spread_events.jsonl")
+    if os.path.exists(_fills_path):
+        _dashed_today = f"{_today[:4]}-{_today[4:6]}-{_today[6:]}"
+        _perf_data = calculate_mts_daily_performance(_fills_path, _events_path, _dashed_today)
+        if _perf_data and (_perf_data["completed"] or _perf_data["active"]):
+            st.markdown("---")
+            st.subheader("📈 MTS 本日績效檢討 (Daily Performance)")
+            _completed = _perf_data["completed"]
+            _total_trades = len(_completed)
+            _total_net = sum(t["net_pnl"] for t in _completed)
+            
+            _wins = sum(1 for t in _completed if t["net_pnl"] > 0)
+            _win_rate = (_wins / _total_trades) if _total_trades > 0 else 0.0
+            
+            _gross_wins = sum(t["net_pnl"] for t in _completed if t["net_pnl"] > 0)
+            _gross_losses = sum(abs(t["net_pnl"]) for t in _completed if t["net_pnl"] <= 0)
+            _pf = (_gross_wins / _gross_losses) if _gross_losses > 0 else (99.9 if _gross_wins > 0 else 0.0)
+            
+            _c1, _c2, _c3, _c4 = st.columns(4)
+            _c1.metric("MTS 本日淨損益", f"{_total_net:+,.0f} TWD")
+            _c2.metric("已完成圈數", _total_trades)
+            _c3.metric("勝率", f"{_win_rate:.1%}")
+            _c4.metric("獲利因子", f"{_pf:.2f}" if _total_trades > 0 else "—")
+            
+            if _completed:
+                with st.expander("📝 已完結交易清單 (Closed Loops)", expanded=True):
+                    _loop_rows = []
+                    for t in _completed:
+                        _loop_rows.append({
+                            "交易 ID": t["trade_id"][-6:],
+                            "時段": "☀️ 日盤" if t["session"].lower() == "day" else "🌙 夜盤",
+                            "進場時間": t["entry_time"].split("T")[1][:8] if "T" in t["entry_time"] else t["entry_time"],
+                            "出場時間": t["exit_time"].split("T")[1][:8] if "T" in t["exit_time"] else t["exit_time"],
+                            "第一腿 PnL": f'{t["release_pnl"]:+,.0f}',
+                            "第二腿 PnL": f'{t["exit_pnl"]:+,.0f}',
+                            "釋放原因": t["exit_reason"],
+                            "淨利 (TWD)": f'{t["net_pnl"]:+,.0f}',
+                            "風控": t["risk_mode"]
+                        })
+                    st.dataframe(pd.DataFrame(_loop_rows), width='stretch', hide_index=True)
+            st.markdown("---")
     
+    # ── PnL & Position Summary (MTS mode: skip — uses tmf_spread state file instead of PaperTrader) ──
     ft, _ = load_futures_trades()
+    _realized_futures_pnl = 0.0
     if ft is not None and not ft.empty:
-        # --- Unrealized PnL ---
-        round_trips = format_futures_trades(ft)
-        open_pos = find_latest_open_futures_position(ft)
+        fpnl = calc_futures_pnl(ft)
+        if fpnl is not None and not fpnl.empty:
+            _realized_futures_pnl = fpnl["pnl"].iloc[-1]
+
+    open_pos = find_latest_open_futures_position(ft) if ft is not None else None
+
+    if not _mts_enabled:
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.subheader("📊 損益與部位狀態 (PnL & Position Summary)")
+        with col2:
+            if st.button("🔄 更新", key="update_futures_unrealized"):
+                st.cache_data.clear()
+                st.rerun()
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("已實現損益", f"{_realized_futures_pnl:+,.0f} TWD")
 
         if open_pos is not None:
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.subheader("📊 未實現損益 (持倉中)")
-            with col2:
-                if st.button("🔄 更新", key="update_futures_unrealized"):
-                    st.cache_data.clear()
-                    st.rerun()
-            
             cur_price = float(f_df["close"].iloc[-1]) if len(f_df) > 0 else 0
             entry = float(open_pos.entry_price)
             lots = int(open_pos.lots)
             direction = str(open_pos.direction)
             if cur_price > 0 and entry > 0:
                 mult = 1 if direction == "BUY" else -1
-                # 2026-05-27 Gemini CLI: Dynamic Point Value multiplier (no hardcoded 50)
                 from strategies.futures.squeeze_futures.engine.constants import get_point_value
                 _mult_u = get_point_value(futures_cfg.get("ticker", "TMF")[:3])
                 unrealized = (cur_price - entry) * _mult_u * lots * mult
-                uc1, uc2, uc3 = st.columns(3)
-                uc1.metric("成交成本", f"{open_pos.cost_basis:,.0f} TWD")
-                uc2.metric("未實現損益", f"{unrealized:+,.0f} TWD")
-                uc3.metric("目前價", f"{cur_price:.0f}", delta=f"{cur_price-entry:+.0f} pts")
-                st.caption(f"進場價: {entry:.0f} | 目前: {cur_price:.0f} | {direction} {lots}口 | 報酬率 {(unrealized/(entry*_mult_u*lots)*100):+.1f}%")
 
+                m2.metric("未實現損益", f"{unrealized:+,.0f} TWD")
+                m3.metric("成交成本", f"{open_pos.cost_basis:,.0f} TWD")
+                m4.metric("目前持倉", f"{direction} {lots}口")
+                st.caption(f"進場價: {entry:.0f} | 目前: {cur_price:.0f} | 報酬率 {(unrealized/(entry*_mult_u*lots)*100):+.1f}%")
+            else:
+                m2.metric("未實現損益", "0 TWD")
+                m3.metric("成交成本", "— TWD")
+                m4.metric("目前持倉", "無持倉")
+        else:
+            m2.metric("未實現損益", "0 TWD")
+            m3.metric("成交成本", "— TWD")
+            m4.metric("目前持倉", "無持倉")
+
+    # Render trade lists and charts only if ft has data
+    if ft is not None and not ft.empty:
         st.header("交易記錄 (Round-Trip)")
         round_trips = format_futures_trades(ft)
         if round_trips is not None and not round_trips.empty and "#" in round_trips.columns:
@@ -3321,6 +3642,7 @@ elif page == f"期貨 {_TICKER}":
 
         with st.expander("📋 原始 Ledger (進階)"):
             st.dataframe(ft, width='stretch')
+
 
     # ── Order Status Panel ──
     with st.expander("📤 委託單狀態 (Order Lifecycle)", expanded=False):
@@ -3349,7 +3671,8 @@ elif page == f"期貨 {_TICKER}":
                 # 2026-07-07 Hermes Agent: cache-busting key
                 _today = get_session_date_str()
                 _lf = FUTURES_MKT / f"TMF_{_today}_PAPER_indicators.csv"
-                _sig = (_lf.name, _lf.stat().st_mtime_ns, _lf.stat().st_size) if _lf.exists() else None
+                # 2026-07-09 Hermes Agent: 30s time bucket cache key
+                _sig = (_lf.stat().st_size, _lf.stat().st_mtime // 30, _lf.name) if _lf.exists() else None
 
                 f_df = load_futures_indicators(
                     full_history=False,
@@ -3764,6 +4087,8 @@ elif page == f"期貨 {_TICKER}":
         else:
             st.info("委託單檔案尚未建立 (Order Lifecycle 未啟用)")
 
+        print(f"[PERF] before_charts: {time.time()-_pt_data:.3f}s")
+
         # ── Futures Dual Contract Chart (移至頁面最下方) ──
         ft, _ = load_futures_trades()
         df_far = load_far_month_data(_ov_ticker)
@@ -3806,6 +4131,8 @@ elif page == f"期貨 {_TICKER}":
             except Exception as _fe:
                 _logging.getLogger().exception("Fallback chart also failed")
                 st.error("❌ 圖表渲染失敗，請檢查期貨指標資料")
+        print(f"[PERF] charts_done: {time.time()-_pt_data:.3f}s")
+        print(f"[PERF] futures page total: {time.time()-_pt_start:.3f}s")
 
 # ════════════════════════════════════════
 # Tab 3: 選擇權
