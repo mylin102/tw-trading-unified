@@ -449,12 +449,13 @@ def calculate_mts_daily_performance(fills_path: str, events_path: str, target_tr
     if not os.path.exists(fills_path):
         return {"completed": [], "active": []}
 
-    def get_trading_day(timestamp_str: str, session: str) -> str:
+    def get_trading_day(timestamp_str: str) -> str:
         try:
-            dt = datetime.fromisoformat(timestamp_str)
-            if session == "night" and dt.hour >= 15:
-                return (dt + timedelta(days=1)).strftime("%Y-%m-%d")
-            return dt.strftime("%Y-%m-%d")
+            from core.date_utils import get_trading_day as get_taifex_trading_day
+            import pandas as pd
+            dt = pd.to_datetime(timestamp_str)
+            t_day = get_taifex_trading_day(dt)
+            return t_day.strftime("%Y-%m-%d")
         except Exception:
             return timestamp_str.split("T")[0]
 
@@ -547,7 +548,7 @@ def calculate_mts_daily_performance(fills_path: str, events_path: str, target_tr
             far_entry = next((e for e in data["entries"] if e["leg"] == "FAR"), None)
             entry_ts = data["entry_ts"]
             session = data["session"]
-            trading_day = get_trading_day(entry_ts, session)
+            trading_day = get_trading_day(entry_ts)
             
             if trading_day == target_trading_day:
                 active.append({
@@ -562,7 +563,7 @@ def calculate_mts_daily_performance(fills_path: str, events_path: str, target_tr
         elif len(data["entries"]) > 0 and data["exit"]:
             exit_ts = data["exit_ts"]
             session = data["session"]
-            trading_day = get_trading_day(exit_ts, session)
+            trading_day = get_trading_day(exit_ts)
             
             if trading_day == target_trading_day:
                 near_entry = next((e for e in data["entries"] if e["leg"] == "NEAR"), None)
