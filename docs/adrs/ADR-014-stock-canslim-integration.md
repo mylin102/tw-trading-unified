@@ -1,4 +1,4 @@
-# ADR 008: Stock CANSLIM & RS Rating Integration Status & Roadmap
+# ADR-014: Stock CANSLIM & RS Rating Integration Status & Roadmap
 
 - **Date**: 2026-07-13
 - **Author**: Gemini CLI

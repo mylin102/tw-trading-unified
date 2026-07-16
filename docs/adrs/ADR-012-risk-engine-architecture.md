@@ -1,4 +1,4 @@
-# ADR 009: MTS Decoupled Risk Engine & Layered Architecture
+# ADR-012: MTS Decoupled Risk Engine & Layered Architecture
 
 - **Date**: 2026-07-14
 - **Author**: Gemini CLI
