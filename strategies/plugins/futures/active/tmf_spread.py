@@ -49,6 +49,16 @@ from strategies.futures.squeeze_futures.engine.constants import get_point_value
 
 logger = logging.getLogger(__name__)
 
+# 2026-07-14 Gemini CLI: Import decoupled risk engines under ADR-009 Phase 2
+from strategies.plugins.futures.active.risk_engine import (
+    ReleaseRiskEngine,
+    SingleLegRiskEngine,
+    ReleaseRiskInput,
+    SingleLegRiskInput,
+    ReleaseRiskDecision,
+    SingleLegRiskDecision
+)
+
 # ═══════════════════════════════════════════════════════════════
 # ADR-009 v1.1: Position Lifecycle — ReleaseGroup + TrailGroup
 # ═══════════════════════════════════════════════════════════════
@@ -211,6 +221,18 @@ def _leg_to_str(leg: Leg | None) -> str | None:
 def _str_to_leg(s: str | None) -> Leg | None:
     return Leg(s) if s else None
 
+def enum_value(value: object) -> str | None:
+    """Helper to extract string value from any enum (including split-brain modules) or string.
+
+    Fail-closed: returns None for unknown/unsupported types instead of guessing.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    raw = getattr(value, "value", None)
+    return raw if isinstance(raw, str) else None
+
 def _release_group_to_dict(rg: ReleaseGroup) -> dict:
     return {
         "status": rg.status.value,
@@ -367,11 +389,51 @@ _ENTRY_Z = 2.5            # entry z-score threshold
 _RELEASE_STOP_PTS = 20    # losing leg release threshold (pt)
 _TRAIL_DISTANCE_PTS = 30  # remaining leg trailing stop distance (pt)
 # 2026-05-27 Gemini CLI: Environmental isolation for state file
-_MTS_STATE_FILE = os.getenv("MTS_STATE_PATH", "/tmp/mts_position_state.json")
+# 2026-07-08 Gemini CLI: Default to test path if running under pytest to prevent state file leakage
+import sys
+_default_state_path = "/tmp/test_mts_position_state.json" if ("pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ) else "/tmp/mts_position_state.json"
+_MTS_STATE_FILE = os.getenv("MTS_STATE_PATH", _default_state_path)
 # 2026-06-25 Gemini CLI / Hermes Agent: environmental isolation for MTS fill and event logs
 _MTS_EVENT_LOG = os.getenv("MTS_EVENT_LOG_PATH", "logs/mts_spread_events.jsonl")
 _MTS_FILL_LOG = os.getenv("MTS_FILL_LOG_PATH", "logs/mts_trade_fills.jsonl")
 
+
+# ═══════════════════════════════════════════════════════════════
+# P0: Recovery state machine + CAS revision guard (2026-07-16)
+# ───── 啟動恢復狀態機 ─────
+# INITIALIZING期間，heartbeat只寫telemetry不寫lifecycle，
+# 避免PM2 restart時init()的預設值誤將持倉洗成FLAT。
+# 恢復順序：fills log → state file → broker (future)。
+# ───── CAS revision ─────
+# 每次lifecycle寫入遞增state_revision。Heartbeat只讀不寫。
+# 舊process/舊heartbeat因revision mismatch被拒絕寫入。
+# ───── Position epoch ─────
+# 每筆交易唯一的epoch (trade_id)，heartbeat若無有效epoch則只能寫telemetry。
+# 舊process的heartbeat若epoch不一致則被拒絕。
+# ═══════════════════════════════════════════════════════════════
+
+class RecoveryState(str, Enum):
+    INITIALIZING = "INITIALIZING"        # startup, no recovery completed
+    RECOVERED = "RECOVERED"              # position restored successfully
+    FLAT_CONFIRMED = "FLAT_CONFIRMED"    # confirmed flat (broker+ledger agree)
+    BROKER_UNKNOWN = "BROKER_UNKNOWN"    # broker query failed
+    SPLIT_BRAIN = "SPLIT_BRAIN"          # ledger/snapshot/broker disagree
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"  # needs manual intervention
+
+class FlatEvidenceType(str, Enum):
+    EXIT_FILL = "EXIT_FILL"
+    BROKER_RECONCILIATION = "BROKER_RECONCILIATION"
+    MANUAL_RECONCILIATION = "MANUAL_RECONCILIATION"
+
+@dataclass
+class FlatEvidence:
+    evidence_type: FlatEvidenceType
+    broker_position_zero: bool = False
+    exit_fill_id: str | None = None
+    reconciliation_reason: str | None = None
+    timestamp: str | None = None
+
+_MTS_STATE_REVISION = 0  # incremented on every lifecycle state write
 
 # ═══════════════════════════════════════════════════════════════
 # Task 3A: Pure Decision Engine (ADR-009 v1.1)
@@ -407,9 +469,23 @@ class LifecycleDecision:
 def _check_release_candidates(
     ctx: LifecycleContext, lifecycle: PositionLifecycle,
 ) -> list[LifecycleDecision]:
-    if lifecycle.phase != PositionPhase.SPREAD:
+    _phase_val = enum_value(lifecycle.phase)
+    if _phase_val != "SPREAD":
+        logger.info(
+            "[CHECK_RELEASE_SKIP] phase=%s expected=SPREAD rg_status=%s near_pnl=%.1f far_pnl=%.1f",
+            _phase_val,
+            enum_value(lifecycle.release_group.status),
+            ctx.near_pnl_pts, ctx.far_pnl_pts,
+        )
         return []
-    if lifecycle.release_group.status not in (ReleaseGroupStatus.ARMED, ReleaseGroupStatus.TRIGGERED):
+    _rg_status = enum_value(lifecycle.release_group.status)
+    if _rg_status not in ("ARMED", "TRIGGERED"):
+        logger.info(
+            "[CHECK_RELEASE_SKIP] phase=%s rg_status=%s expected in (ARMED,TRIGGERED) near_pnl=%.1f far_pnl=%.1f",
+            _phase_val,
+            _rg_status,
+            ctx.near_pnl_pts, ctx.far_pnl_pts,
+        )
         return []
     near_hit = ctx.near_pnl_pts <= -ctx.release_stop_threshold
     far_hit = ctx.far_pnl_pts <= -ctx.release_stop_threshold
@@ -421,16 +497,30 @@ def _check_release_candidates(
             leg = Leg.NEAR
         else:
             leg = Leg.FAR
+        logger.info(
+            "[CHECK_RELEASE_DECISION] near_hit=%s far_hit=%s action=RELEASE leg=%s "
+            "near_pnl=%.1f far_pnl=%.1f threshold=%.1f",
+            near_hit, far_hit, leg.value,
+            ctx.near_pnl_pts, ctx.far_pnl_pts, ctx.release_stop_threshold,
+        )
         return [LifecycleDecision(action=LifecycleAction.RELEASE, release_leg=leg)]
+    logger.info(
+        "[CHECK_RELEASE_SKIP] near_hit=%s far_hit=%s "
+        "near_pnl=%.1f far_pnl=%.1f threshold=%.1f",
+        near_hit, far_hit,
+        ctx.near_pnl_pts, ctx.far_pnl_pts, ctx.release_stop_threshold,
+    )
     return []
 
 
 def _check_trail_candidate(
     ctx: LifecycleContext, lifecycle: PositionLifecycle,
 ) -> list[LifecycleDecision]:
-    if lifecycle.phase != PositionPhase.SINGLE_LEG:
+    _phase_val = enum_value(lifecycle.phase)
+    if _phase_val != "SINGLE_LEG":
         return []
-    if lifecycle.trail_group.status not in (TrailGroupStatus.ARMED, TrailGroupStatus.ACTIVE):
+    _tg_status = enum_value(lifecycle.trail_group.status)
+    if _tg_status not in ("ARMED", "ACTIVE"):
         return []
     if ctx.trailing_side is None or ctx.rem_high <= 0 or ctx.rem_low <= 0:
         return []
@@ -472,14 +562,12 @@ def evaluate_lifecycle_actions(
     No filesystem, no Shioaji, no order submission.
     """
     # Do not re-select if release is still in flight
-    if lifecycle.release_group.status in (
-        ReleaseGroupStatus.SUBMITTED, ReleaseGroupStatus.FILLED,
-    ):
+    _rg_status = enum_value(lifecycle.release_group.status)
+    if _rg_status in ("SUBMITTED", "FILLED"):
         return None
     # Do not re-select if trail is still in flight
-    if lifecycle.trail_group.status in (
-        TrailGroupStatus.SUBMITTED, TrailGroupStatus.FILLED,
-    ):
+    _tg_status = enum_value(lifecycle.trail_group.status)
+    if _tg_status in ("SUBMITTED", "FILLED"):
         return None
 
     candidates: list[LifecycleDecision] = []
@@ -495,7 +583,10 @@ def evaluate_lifecycle_actions(
     for priority_action in _LIFECYCLE_ACTION_PRIORITY:
         for decision in candidates:
             if decision.action == priority_action:
-                _commit_action(lifecycle, decision)
+                # 2026-07-09 Hermes Agent: P0 lifecycle ordering — do NOT commit here.
+                # commit + write_state are deferred to _manage_position() after all
+                # pre-order guards (tick confirmation, BB filter) pass.  Committing
+                # TRIGGERED before guards pass creates state-file/broker divergence.
                 return decision
     return None
 
@@ -703,6 +794,32 @@ def _write_mts_state(
                     _p = release_price if release_price > 0 else far_last
                     far_realized = (float(_p) - _f_far_entry) * (-1 if _f_far_side == "SHORT" else 1) * _mult
 
+        # 2026-07-08 Hermes Agent: Allow caller to override realized with fee-deducted values.
+        # The internal calc is gross (price - entry) * mult; caller may pass net-of-fees.
+        _override_near = kwargs.pop("near_realized_override", None)
+        _override_far = kwargs.pop("far_realized_override", None)
+        if _override_near is not None:
+            near_realized = float(_override_near)
+        if _override_far is not None:
+            far_realized = float(_override_far)
+
+        # 2026-07-08 Hermes Agent: Cumulative realized PnL across all trades.
+        # total_realized_pnl resets per-trade. cumulative_realized_pnl persists.
+        # On close: combine previously-released leg's realized (from state file)
+        # with trail exit realized (passed from _reset via kwargs).
+        _cumulative = float(existing.get("cumulative_realized_pnl") or 0.0)
+        _prev_has_pos = bool(existing.get("has_position", False))
+        if _prev_has_pos and not has_position:
+            _prev_near_realized = float(existing.get("near_realized_pnl") or 0.0)
+            _prev_far_realized = float(existing.get("far_realized_pnl") or 0.0)
+            _trail_exit = float(kwargs.get("trail_exit_realized", 0.0))
+            _trade_realized = _prev_near_realized + _prev_far_realized + _trail_exit
+            _cumulative += _trade_realized
+            logger.info(
+                "[MTS_CUMULATIVE_PNL] trade=%s closed: prev_realized=%.1f trail_exit=%.1f → cumulative=%.1f TWD",
+                _f_trade_id or "?", _prev_near_realized + _prev_far_realized, _trail_exit, _cumulative,
+            )
+
         # ── Release state label ──
         if released_leg is None:
             release_state = "BOTH_HELD"
@@ -751,6 +868,10 @@ def _write_mts_state(
             "far_realized_pnl": round(far_realized, 1),
             "total_upl": round(near_upl + far_upl, 1),
             "total_realized_pnl": round(near_realized + far_realized, 1),
+            # 2026-07-08 Hermes Agent: cumulative PnL persists across all trades
+            "cumulative_realized_pnl": round(_cumulative, 1),
+            # Preserve initial_balance from existing (set via dashboard)
+            "initial_balance": existing.get("initial_balance", 100000),
             "spread_z": round(spread_z, 2) if spread_z is not None else None,
             "trail_side": _trail_side,
             "trail_mode": _trail_mode,
@@ -769,11 +890,37 @@ def _write_mts_state(
         # 2026-06-26 Gemini CLI: merge extra risk metrics / kwargs
         state.update(kwargs)
         # 2026-06-23 Gemini CLI: Use unique temporary filename to avoid race conditions with other writers
+        # ── P0: CAS revision guard ──
+        # 防止舊 process 或延遲的 heartbeat 覆寫較新的 lifecycle state。
+        # 每次 lifecycle 寫入遞增 state_revision，寫入前比對磁碟版本。
+        # 若不符 → 拒絕寫入 (CONCURRENT_STATE_UPDATE)。
+        # ─────────────────────────────────────────────────────────────────────
+        _expected_revision = existing.get("state_revision", 0)
+        _new_revision = _expected_revision + 1
+        state["state_revision"] = _new_revision
+        state["position_epoch"] = existing.get("position_epoch")
+        state["schema_version"] = 3
+
         import random
         _tmp_file = f"{_MTS_STATE_FILE}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
         try:
             with open(_tmp_file, "w") as f:
                 json.dump(state, f, default=str)
+            # CAS: verify expected revision before replacing
+            if os.path.exists(_MTS_STATE_FILE):
+                try:
+                    with open(_MTS_STATE_FILE) as _f_current:
+                        _current_on_disk = json.load(_f_current)
+                    _disk_revision = _current_on_disk.get("state_revision", 0)
+                    if _disk_revision != _expected_revision:
+                        if os.path.exists(_tmp_file): os.remove(_tmp_file)
+                        logger.warning(
+                            "[MTS_CAS_REJECT] revision mismatch: expected=%d disk=%d reason=%s",
+                            _expected_revision, _disk_revision, reason,
+                        )
+                        return
+                except Exception:
+                    pass  # if we can't read disk, proceed with replace
             os.replace(_tmp_file, _MTS_STATE_FILE)
         except Exception as e:
             if os.path.exists(_tmp_file): os.remove(_tmp_file)
@@ -781,6 +928,97 @@ def _write_mts_state(
 
     except Exception:
         logger.exception("[MTS_STATE_WRITE_FAILED] file=%s reason=%s", _MTS_STATE_FILE, reason)
+
+
+def _write_mts_telemetry(
+    ticker: str = "TMF",
+    near_last: float = 0.0,
+    far_last: float = 0.0,
+    near_upl: float = 0.0,
+    far_upl: float = 0.0,
+    total_upl: float = 0.0,
+    atr: float = 0.0,
+    quote_age_ms: float = 0.0,
+    **kwargs,
+) -> None:
+    """P0: Heartbeat-only telemetry update — NEVER writes lifecycle fields.
+
+    ───── 設計原則 ─────
+    Heartbeat 只能更新：
+      - heartbeat_at, pid (心跳標記)
+      - near_last, far_last (最新價格)
+      - near_upl, far_upl, total_upl (未實現損益)
+      - quote_age_ms (報價時效)
+
+    Heartbeat 永遠不能更新：
+      - has_position, state, reason (持倉所有權)
+      - near_entry, far_entry (進場價格)
+      - near_side, far_side (方向)
+      - released_leg, remaining_leg (釋放狀態)
+      - trade_id, entry_ts (交易識別)
+      - lifecycle (生命週期)
+      - 任何位置相關欄位
+
+    所有 lifecycle 欄位從 existing state 原封不動繼承。
+    即使記憶體中 init() 設了錯誤的預設值，
+    heartbeat 也沒有能力把持倉洗掉。
+    ─────────────────────"""
+    if os.getenv("MTS_BACKTEST") == "1":
+        return
+    try:
+        existing = {}
+        if os.path.exists(_MTS_STATE_FILE):
+            try:
+                with open(_MTS_STATE_FILE) as _f:
+                    existing = json.load(_f)
+            except Exception:
+                pass
+
+        # Only touch telemetry fields — preserve ALL lifecycle fields
+        _mult = float(get_point_value(ticker))
+        telemetry = {
+            "has_position": existing.get("has_position", False),
+            "state": existing.get("state", "HEARTBEAT"),
+            "reason": existing.get("reason", "heartbeat"),
+            "near_last": round(near_last, 1),
+            "far_last": round(far_last, 1),
+            "near_upl": round(near_upl, 1),
+            "far_upl": round(far_upl, 1),
+            "total_upl": round(total_upl, 1),
+            "atr": round(atr, 2) if atr else existing.get("atr"),
+            "quote_age_ms": round(float(quote_age_ms), 1),
+            "heartbeat_at": datetime.now().isoformat(),
+            "heartbeat_pid": os.getpid(),
+            "_updated": datetime.now().isoformat(),
+            # CAS revision — read-only for telemetry
+            "state_revision": existing.get("state_revision", 0),
+            "schema_version": existing.get("schema_version", 3),
+            "position_epoch": existing.get("position_epoch"),
+        }
+        # Preserve all lifecycle fields from existing state
+        for _key in ["state", "reason", "has_position", "near_entry", "far_entry",
+                      "near_side", "far_side", "near_status", "far_status",
+                      "released_leg", "remaining_leg", "remaining_side",
+                      "near_realized_pnl", "far_realized_pnl", "total_realized_pnl",
+                      "cumulative_realized_pnl", "initial_balance", "trade_id", "entry_ts",
+                      "trail_side", "trail_mode", "trail_peak", "trail_nadir",
+                      "trail_stop_price", "distance_to_stop", "release_stop_points",
+                      "trail_distance_points", "lifecycle", "manual_trade_status",
+                      "entry_spread_z", "current_spread_z", "release_state",
+                      "release_price", "risk_mode", "session", "stop_mult", "trail_mult",
+                      "final_release_stop", "final_trail_dist", "release_stop",
+                      "release_stop_floor", "trail_dist", "trail_dist_floor",
+                      "confirm_ticks", "near_vwap", "far_vwap"]:
+            if _key in existing:
+                telemetry[_key] = existing[_key]
+
+        import random
+        _tmp = f"{_MTS_STATE_FILE}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
+        with open(_tmp, "w") as f:
+            json.dump(telemetry, f, default=str)
+        os.replace(_tmp, _MTS_STATE_FILE)
+    except Exception:
+        logger.exception("[MTS_TELEMETRY_WRITE_FAILED]")
 
 
 class TMFSpread(StrategyBase):
@@ -813,8 +1051,8 @@ class TMFSpread(StrategyBase):
         else:
             self._entry_z = float(_entry_z_raw)
         
-        # [New] ATR-based scaling
-        self._atr_mult_stop = float(_params.get("atr_multiplier_stop", 1.5))
+        # [New] ATR-based scaling  (2026-07-16 sweep: 2.5x best across 70 days, +67k net / 6.28 PF)
+        self._atr_mult_stop = float(_params.get("atr_multiplier_stop", 2.5))
         self._atr_mult_trail = float(_params.get("atr_multiplier_trail", 2.0))
         # 2026-05-22 Gemini CLI: Added ATR cap to prevent excessively wide stops
         self._atr_cap = float(_params.get("atr_cap", 100.0))
@@ -832,8 +1070,17 @@ class TMFSpread(StrategyBase):
             self._release_mode = ReleaseMode.TRIGGERED_MARKET
             logger.warning("[MTS] Invalid release_mode=%r, falling back to triggered_market", _rel_mode_str)
 
-        # State
-        self._has_position = False
+        # ═══════════════════════════════════════════════════════════════
+        # P0: Recovery state — UNKNOWN by default
+        # 不預設 FLAT。init()只清空易失性狀態，不假設無持倉。
+        # 恢復由 _restore_position_state() 完成，順序：
+        #   fills log → state file → broker query (future)
+        # ═══════════════════════════════════════════════════════════════
+        self._has_position: bool | None = None  # None = UNKNOWN, 不等於 FLAT
+        self._mts_recovery_state: RecoveryState = RecoveryState.INITIALIZING
+        self._mts_state_write_enabled: bool = False  # P0: heartbeat 不可寫 lifecycle
+        self._position_epoch: str | None = None  # 每筆交易唯一識別
+        self._state_revision: int = 0
         self._lifecycle: str = "FLAT"  # 2026-05-27 Gemini CLI: Added for contract compliance
         self._entry_ts: datetime | None = None
         self._last_exit_ts: datetime | None = None  # 2026-05-27 Gemini CLI: Added for re-entry cooldown
@@ -860,6 +1107,21 @@ class TMFSpread(StrategyBase):
         self._max_quote_age_ms = float(_params.get("max_quote_age_ms", 1000.0))
         self._max_spread_width = float(_params.get("max_spread_width", 3.0))
 
+        # Release threshold confirmation
+        self._confirm_ticks = int(_params.get("confirm_ticks", 2))
+        self._confirm_ms = float(_params.get("confirm_ms", 800.0))
+        self._max_quote_age_ms = float(_params.get("max_quote_age_ms", 1000.0))
+        self._max_spread_width = float(_params.get("max_spread_width", 3.0))
+
+        # Emergency quote guard bypass (shared with quote guard, not BB — BB filter removed per ADR-014)
+        self._emergency_bypass_enabled: bool = bool(_params.get("emergency_bypass_enabled", True))
+
+        # BB band cache (computed on each 5m bar, compared on each tick)
+        self._near_bb_upper: float = 0.0
+        self._near_bb_lower: float = 0.0
+        self._far_bb_upper: float = 0.0
+        self._far_bb_lower: float = 0.0
+
         # Dynamic entry Z-score based on ATR
         self._entry_z_cfg = _params.get("entry_z", _ENTRY_Z)
 
@@ -879,6 +1141,7 @@ class TMFSpread(StrategyBase):
         self._post_release_anchor_price: float | None = None  # remaining leg price at release moment
         self._post_release_anchor_source: str | None = None  # e.g. "LIVE_TICK", "BIDASK_BID"
         self._post_release_anchor_age_ms: float | None = None  # quote age at anchor capture
+        self._mtf_score_at_release: float | None = None  # MTF score at release moment
 
         # Tick confirmation state variables
         self._release_near_ticks = 0
@@ -890,6 +1153,36 @@ class TMFSpread(StrategyBase):
 
         # ADR-009 v1.1: Position Lifecycle OCA
         self._lifecycle_oca: PositionLifecycle = PositionLifecycle()
+
+        # 2026-07-14 Gemini CLI: Instantiate decoupled risk engines under ADR-009 Phase 2
+        self._release_risk_engine = ReleaseRiskEngine()
+        self._single_leg_risk_engine = SingleLegRiskEngine()
+
+        # 2026-07-14 Gemini CLI: Initialize MTF shadow tracking variables for counterfactual logging
+        self._shadow_exit_triggered = False
+        self._shadow_exit_ts = None
+        self._shadow_exit_price = None
+        self._shadow_exit_upl = None
+        self._shadow_max_giveback = 0.0
+        self._post_shadow_mfe = None
+        self._post_shadow_mae = None
+        self._formal_max_giveback = 0.0
+
+        # ── ADR-011 Phase 2: Action-scoped timeout timers (2026-07-16) ──
+        # Each exit action type has its own pending timer so RELEASE timeout
+        # cannot bypass quote guard for TRAIL, or vice versa.
+        self._release_pending_mono: float = 0.0   # starts when RELEASE decision first made
+        self._trail_pending_mono: float = 0.0     # starts when TRAIL decision first made (SINGLE_LEG only)
+        # Hard exit actions (STOPLOSS/TIMEOUT/MANUAL) bypass immediately — no timer needed.
+
+        # ── ADR-011 Phase 4: Post-fill warmup (2026-07-16) ──
+        # Prevents immediate EXIT after SINGLE_LEG transition from stale ticks/callbacks.
+        self._single_leg_entered_mono: float = 0.0      # monotonic timestamp when SINGLE_LEG entered
+        self._single_leg_post_fill_ticks: int = 0       # remaining-leg ticks received after fill
+        self._single_leg_last_tick_ts: float = 0.0      # last remaining-leg tick timestamp (dedup)
+        # Config (hot-reloadable via params in on_bar)
+        self._single_leg_warmup_ms: float = 500.0
+        self._single_leg_warmup_ticks: int = 2
 
     def _current_lifecycle_state(self) -> dict:
         """ADR-009: serialize lifecycle block for _write_mts_state. Never raises."""
@@ -921,6 +1214,11 @@ class TMFSpread(StrategyBase):
             atr = self._last_atr
 
         if atr and not pd.isna(atr) and atr > 0:
+            # 2026-07-16 Hermes Agent: Force fixed fallback when multiplier is 0
+            # (same guard pattern as _get_risk_meta at line 1269)
+            if self._atr_mult_stop <= 0 or self._atr_mult_trail <= 0:
+                return self._release_stop_fixed, self._trail_dist_fixed
+
             # 2026-06-29 Gemini CLI: Apply ATR cap to prevent excessively wide stops
             if hasattr(self, "_atr_cap") and self._atr_cap > 0:
                 atr = min(atr, self._atr_cap)
@@ -944,6 +1242,27 @@ class TMFSpread(StrategyBase):
             # Tiered floors: Stop needs 10pt safety, Trail needs 20pt room to breathe
             return max(10.0, stop), max(20.0, trail)
         return self._release_stop_fixed, self._trail_dist_fixed
+
+    def _apply_vwap_exit(self, bar: dict, trail_dist: float) -> float:
+        """2026-07-08 Gemini CLI: Apply dynamic VWAP trailing stop tightening for remaining leg"""
+        _vwap_exit_cfg = self._params.get("vwap_exit", {})
+        if _vwap_exit_cfg.get("enabled", False) and self._released_leg and self._side:
+            _rel = Leg.FAR if self._released_leg == "far" else Leg.NEAR
+            _rem_leg = Leg.FAR if _rel == Leg.NEAR else Leg.NEAR
+            _vwap_key = "far_vwap" if _rem_leg == Leg.FAR else "near_vwap"
+            _rem_vwap = bar.get(_vwap_key, bar.get("vwap"))
+            if _rem_vwap and _rem_vwap > 0:
+                _rem_price = bar.get("far_close" if _rem_leg == Leg.FAR else "near_close", 0.0)
+                if _rem_price > 0:
+                    _violated = False
+                    if self._side == "LONG" and _rem_price < _rem_vwap:
+                        _violated = True
+                    elif self._side == "SHORT" and _rem_price > _rem_vwap:
+                        _violated = True
+                    if _violated:
+                        _tighten_ratio = float(_vwap_exit_cfg.get("tighten_ratio", 0.3))
+                        return max(5.0, trail_dist * _tighten_ratio)
+        return trail_dist
 
     def _pnl_near(self, near_close: float) -> float:
         if self._near_side == "LONG":
@@ -1008,51 +1327,128 @@ class TMFSpread(StrategyBase):
                        near_source=_near_src, far_source=_far_src, 
                        near_age_ms=_near_age, far_age_ms=_far_age)
 
-    def sync_release(self, leg: str | Leg, price: float, release_price: float = 0.0) -> None:
+    # ────────────────────────────────────────────────────────────
+    # ADR-011 Phase 3: Single authoritative SINGLE_LEG entry
+    # ────────────────────────────────────────────────────────────
+
+    def _enter_single_leg_after_release_fill(
+        self,
+        *,
+        released_leg: Leg,
+        remaining_leg_price: float,
+        fill_price: float,
+        order_id: str,
+        source: str,
+    ) -> None:
+        """ADR-011 Phase 3: Single authoritative entry point for SINGLE_LEG transition.
+
+        Only callable after confirmed release fill.
+        Verifies invariants, transitions lifecycle, performs full trail re-arm.
+        """
+        _rem = Leg.FAR if released_leg == Leg.NEAR else Leg.NEAR
+
+        # ── Side determination ──
+        if released_leg == Leg.NEAR:
+            self._side = self._far_side
+        else:
+            self._side = self._near_side
+
+        self._released_leg = released_leg.value.lower()
+        self._release_ts = datetime.now()
+        self._release_mono = time.monotonic()
+        self._release_price = fill_price if fill_price > 0 else remaining_leg_price
+        self._lifecycle = f"TRAILING_{self._side}"
+
+        # ── Lifecycle transition (confirmed fill only) ──
+        self._lifecycle_oca = PositionLifecycle(
+            phase=PositionPhase.SINGLE_LEG,
+            release_group=ReleaseGroup(
+                status=ReleaseGroupStatus.COMPLETED,
+                filled_leg=released_leg,
+                canceled_leg=_rem,
+            ),
+            trail_group=TrailGroup(
+                status=TrailGroupStatus.ARMED,
+                remaining_leg=_rem,
+            ),
+        )
+
+        # ── ADR-011 Phase 2: Reset both timers ──
+        self._release_pending_mono = 0.0
+        self._trail_pending_mono = 0.0
+
+        # ── ADR-011 Phase 4: Post-fill warmup start ──
+        self._single_leg_entered_mono = time.monotonic()
+        self._single_leg_post_fill_ticks = 0
+        self._single_leg_last_tick_ts = 0.0
+
+        # ── ADR-011 Phase 3: Full trail re-arm ──
+        # Peak/nadir start from remaining leg price (clean slate)
+        if self._side == "LONG":
+            self._peak = remaining_leg_price
+            self._nadir = 0.0
+        else:
+            self._nadir = remaining_leg_price
+            self._peak = 0.0
+
+        # Clear ALL pre-release cached state
+        self._near_max = None
+        self._near_min = None
+        self._far_max = None
+        self._far_min = None
+        self._mfe_pts = 0.0
+        self._mae_pts = 0.0
+        self._shadow_exit_triggered = False
+        self._shadow_exit_ts = None
+        self._shadow_exit_price = None
+        self._shadow_exit_upl = None
+        self._shadow_max_giveback = 0.0
+        self._post_shadow_mfe = None
+        self._post_shadow_mae = None
+        self._formal_max_giveback = 0.0
+        self._release_near_ticks = 0
+        self._release_near_start_time = 0.0
+        self._release_far_ticks = 0
+        self._release_far_start_time = 0.0
+
+        logger.warning(
+            "[MTS_SINGLE_LEG_ENTER] released_leg=%s remaining_leg=%s "
+            "fill_price=%.1f rem_price=%.1f source=%s order_id=%s",
+            released_leg.value, _rem.value,
+            fill_price, remaining_leg_price, source, order_id,
+        )
+
+    def sync_release(self, leg: str | Leg, price: float, release_price: float = 0.0,
+                     order_id: str = "") -> None:
         """
         Synchronize state after a leg release (PARTIAL_EXIT) is confirmed.
         Transitions lifecycle from RELEASE_NEAR/FAR to TRAILING mode.
+
+        Delegates to _enter_single_leg_after_release_fill() for the authoritative
+        SINGLE_LEG transition (ADR-011 Phase 3).
         """
         _rel = self._normalize_leg(leg)
         if _rel is None:
             logger.error("[LIFECYCLE] sync_release called with invalid leg=%r", leg)
             return
         _rel_str = _rel.value.lower()  # "near" / "far" for legacy
-        self._released_leg = _rel_str
-        # 💡 [Fixed 2026-05-27] Correctly determine the side of the REMAINING leg
-        if _rel == Leg.NEAR:
-            self._side = self._far_side
-        else:
-            self._side = self._near_side
-            
-        self._lifecycle = f"TRAILING_{self._side}"
-        self._release_ts = datetime.now()
-        self._release_mono = time.monotonic()
-        # ADR-009 v1.1: sync lifecycle to SINGLE_LEG + trail armed
-        _rem = Leg.FAR if _rel == Leg.NEAR else Leg.NEAR
+
         # ADR-009 Task 7: idempotent guard — skip if already in SINGLE_LEG
         if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG:
             logger.info("[LIFECYCLE_TASK7] sync_release skipped: already SINGLE_LEG (leg=%s)", _rel_str)
             return
-        self._lifecycle_oca = PositionLifecycle(
-            phase=PositionPhase.SINGLE_LEG,
-            release_group=ReleaseGroup(status=ReleaseGroupStatus.COMPLETED, filled_leg=_rel, canceled_leg=_rem),
-            trail_group=TrailGroup(status=TrailGroupStatus.ARMED, remaining_leg=_rem),
-        )
-        
-        # Ensure peak/nadir are primed with the release-time price of the REMAINING leg
-        if self._side == "LONG": 
-            self._peak = price
-            self._nadir = 0.0
-        else: 
-            self._nadir = price
-            self._peak = 0.0
 
-        # 2026-06-26 Gemini CLI: Set release price of the released leg
-        if release_price > 0:
-            self._release_price = release_price
-        else:
-            self._release_price = self._near_entry if _rel == Leg.NEAR else self._far_entry
+        # Delegate to authoritative helper (ADR-011 Phase 3)
+        self._enter_single_leg_after_release_fill(
+            released_leg=_rel,
+            remaining_leg_price=price,
+            fill_price=release_price,
+            order_id=order_id,
+            source="sync_release",
+        )
+
+        # Legacy: unify release price (done inside helper, keep for backward compat logging)
+        _released_entry = self._near_entry if _rel == Leg.NEAR else self._far_entry
 
         # 2026-06-29 Gemini CLI: Log the release fill after it succeeded
         _release_side = "BUY" if (self._near_side == "SHORT" if _rel == Leg.NEAR else self._far_side == "SHORT") else "SELL"
@@ -1060,7 +1456,7 @@ class TMFSpread(StrategyBase):
         _released_side_for_pnl = self._near_side if _rel == Leg.NEAR else self._far_side
         _released_pnl_pts = (self._release_price - _released_entry) if _released_side_for_pnl == "LONG" else (_released_entry - self._release_price)
         _mult = float(get_point_value(self._ticker))
-        _cost = 20.0 + (self._release_price + _released_entry) * _mult * 2e-5
+        _cost = 40.0 + (self._release_price + _released_entry) * _mult * 2e-5
         _realized = _released_pnl_pts * _mult - _cost
         
         # MFE/MAE calculation
@@ -1138,6 +1534,11 @@ class TMFSpread(StrategyBase):
         if not atr or pd.isna(atr):
             atr = self._last_atr
             
+        if atr and not pd.isna(atr) and atr > 0:
+            # 2026-07-14 Gemini CLI: Apply _atr_cap to telemetry to align with execution
+            if hasattr(self, "_atr_cap") and self._atr_cap > 0:
+                atr = min(atr, self._atr_cap)
+                
         has_atr = atr and not pd.isna(atr) and atr > 0
         risk_mode = "ATR_DYNAMIC" if has_atr else "FIXED_FALLBACK"
         
@@ -1155,7 +1556,7 @@ class TMFSpread(StrategyBase):
         trail_dist = round(atr_val * trail_mult, 2) if has_atr else self._trail_dist_fixed
         
         release_stop_floor = 10.0
-        trail_dist_floor = 20.0
+        trail_dist_floor = 60.0  # 2026-07-07: 20→60, ~0.82 ATR for TMF night (~73 pt)
         
         final_release_stop = max(release_stop_floor, release_stop) if has_atr else release_stop
         final_trail_dist = max(trail_dist_floor, trail_dist) if has_atr else trail_dist
@@ -1180,7 +1581,12 @@ class TMFSpread(StrategyBase):
             "final_release_stop": final_release_stop,
             "final_trail_dist": final_trail_dist,
             "quote_age_ms": round(float(quote_age_ms), 1),
-            "confirm_ticks": int(confirm_ticks)
+            "confirm_ticks": int(confirm_ticks),
+            # 2026-07-16 Gemini CLI: Record indicators for generate_daily_report.py
+            "vwap": bar.get("vwap"),
+            "near_vwap": bar.get("near_vwap"),
+            "far_vwap": bar.get("far_vwap"),
+            "mtf_score": bar.get("mtf_score")
         }
 
     def write_state(self, action: str, reason: str, **kwargs) -> None:
@@ -1265,10 +1671,149 @@ class TMFSpread(StrategyBase):
             "far_max": round(self._far_max, 2) if self._far_max is not None else None,
             "far_min": round(self._far_min, 2) if self._far_min is not None else None,
             "post_release_anchor": round(self._post_release_anchor_price, 2) if self._post_release_anchor_price is not None else None,
+            # 2026-07-16 Hermes Agent: MTF score at exit time
+            "mtf_score": self._mtf_score_at_release,
         }
         logger.info("[MTS_EXIT_LOG] %s", json.dumps(exit_data))
         _append_event("EXIT_LOG", **exit_data)
         return exit_data
+
+    # ── P0: Fills log recovery ────────────────────────────────────────────────
+    # Fills log 是比 state file 更高權威的持倉真相來源。
+    # state file 可能被舊版 heartbeat 洗成 FLAT，
+    # 但 fills log 的 ENTRY/EXIT/RELEASE 記錄不會因重啟而消失。
+    # ─────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _check_fills_has_open_position(log_path: str | None = None) -> bool:
+        """Check if fills log has an open (unclosed) position by looking for
+        unmatched ENTRY records.  Returns True if at least one ENTRY has no
+        matching EXIT/RELEASE that closes all legs."""
+        _log = log_path or _MTS_FILL_LOG
+        if not os.path.exists(_log):
+            return False
+        _entries = []
+        _exits = []
+        try:
+            with open(_log) as _f:
+                for _line in _f:
+                    try:
+                        rec = json.loads(_line.strip())
+                        tid = rec.get("trade_id")
+                        ft = rec.get("fill_type", "")
+                        if tid and ft == "ENTRY":
+                            _entries.append(tid)
+                        elif tid and ft in ("EXIT", "RELEASE"):
+                            _exits.append(tid)
+                    except Exception:
+                        pass
+        except Exception:
+            return False
+        # An entry is "open" if its trade_id appears more in ENTRY than in EXIT+RELEASE
+        from collections import Counter
+        _entry_counts = Counter(_entries)
+        _exit_counts = Counter(_exits)
+        for tid, ecnt in _entry_counts.items():
+            if ecnt > _exit_counts.get(tid, 0):
+                return True
+        return False
+
+    def _restore_from_fills_log(self) -> bool:
+        """Rebuild position state from fills log. Returns True on success."""
+        if not os.path.exists(_MTS_FILL_LOG):
+            return False
+        try:
+            # Find the most recent open trade
+            _trades: dict[str, list[dict]] = {}
+            with open(_MTS_FILL_LOG) as _f:
+                for _line in _f:
+                    try:
+                        rec = json.loads(_line.strip())
+                        tid = rec.get("trade_id")
+                        if tid:
+                            _trades.setdefault(tid, []).append(rec)
+                    except Exception:
+                        pass
+
+            if not _trades:
+                return False
+
+            # Find the latest open trade by timestamp
+            _latest_open_tid = None
+            _latest_open_entries = []
+            _latest_ts = ""
+            for tid, fills in _trades.items():
+                _entry_count = sum(1 for f in fills if f.get("fill_type") == "ENTRY")
+                _exit_count = sum(1 for f in fills if f.get("fill_type") in ("EXIT", "RELEASE"))
+                if _entry_count > _exit_count:
+                    # Find timestamp of first entry fill
+                    _first_entry_ts = ""
+                    for f in fills:
+                        if f.get("fill_type") == "ENTRY":
+                            _ts = str(f.get("timestamp", ""))
+                            if _ts > _first_entry_ts:
+                                _first_entry_ts = _ts
+                    if _first_entry_ts > _latest_ts:
+                        _latest_ts = _first_entry_ts
+                        _latest_open_tid = tid
+                        _latest_open_entries = fills
+
+            if not _latest_open_tid:
+                return False
+
+            # Restore state from fills
+            _entry_fills = [f for f in _latest_open_entries if f.get("fill_type") == "ENTRY"]
+            _release_fills = [f for f in _latest_open_entries if f.get("fill_type") == "RELEASE"]
+
+            if not _entry_fills:
+                return False
+
+            # Determine near/far from entry fills
+            _near_entry = _far_entry = 0.0
+            _near_side = _far_side = None
+            for ef in _entry_fills:
+                _ef_price = ef.get("price")
+                if ef.get("leg") == "NEAR":
+                    _near_entry = float(_ef_price) if _ef_price is not None else 0.0
+                    _near_side = ef.get("side")
+                elif ef.get("leg") == "FAR":
+                    _far_entry = float(_ef_price) if _ef_price is not None else 0.0
+                    _far_side = ef.get("side")
+
+            if _near_entry <= 0 or _far_entry <= 0:
+                return False
+
+            self._has_position = True
+            self._near_entry = _near_entry
+            self._far_entry = _far_entry
+            self._near_side = "LONG" if _near_side in ("LONG", "BUY") else "SHORT"
+            self._far_side = "LONG" if _far_side in ("LONG", "BUY") else "SHORT"
+            self._released_leg = None
+            self._trade_id = _latest_open_tid
+            self._lifecycle = "OPEN"
+            self._position_epoch = _latest_open_tid
+
+            # Process release fills if any
+            for rf in _release_fills:
+                _rf_price = rf.get("price")
+                if rf.get("leg") == "NEAR":
+                    self._released_leg = "near"
+                    self._side = self._far_side
+                    self._lifecycle = f"TRAILING_{self._side}"
+                    self._release_price = float(_rf_price) if _rf_price is not None else 0.0
+                elif rf.get("leg") == "FAR":
+                    self._released_leg = "far"
+                    self._side = self._near_side
+                    self._lifecycle = f"TRAILING_{self._side}"
+                    self._release_price = float(_rf_price) if _rf_price is not None else 0.0
+
+            logger.warning(
+                "[MTS_FILLS_RECOVERY] Restored trade_id=%s near=%.1f far=%.1f released=%s lifecycle=%s",
+                _latest_open_tid, _near_entry, _far_entry, self._released_leg, self._lifecycle,
+            )
+            return True
+        except Exception:
+            logger.exception("[MTS_FILLS_RECOVERY_FAILED]")
+            return False
 
     # ── State file read ─────────────────────────────────────────────────────
     @staticmethod
@@ -1348,12 +1893,50 @@ class TMFSpread(StrategyBase):
         # 2026-06-25 Gemini CLI: Skip restore during backtesting to prevent stale ghost positions
         if os.getenv("MTS_BACKTEST") == "1":
             return False
-            
+
         state = self._read_mts_state()
+
+        # ═══════════════════════════════════════════════════════════════
+        # P0: Fills log authority check
+        # state file 說 FLAT 不等於真的 FLAT。
+        # fills log 的 ENTRY/EXIT 記錄比 state file 更高權威。
+        # 2026-07-16: 修復前 heartbeat 會把持倉洗成 FLAT，
+        # 而 _restore_position_state 直接 return False 不看 fills，
+        # 導致 split-brain 後永遠無法恢復。
+        # 修復: fills 有 open trade 時用 fills-led recovery。
+        # ═══════════════════════════════════════════════════════════════
+        _fills_open = self._check_fills_has_open_position()
+        if _fills_open and (state is None or not state.get("has_position")):
+            logger.warning(
+                "[MTS_RECOVERY] State file says FLAT/None but fills log has open position. "
+                "Attempting fills-led recovery."
+            )
+            # Rebuild position state from fills log
+            if self._restore_from_fills_log():
+                self._mts_recovery_state = RecoveryState.RECOVERED
+                self._mts_state_write_enabled = True
+                return True
+            else:
+                self._mts_recovery_state = RecoveryState.RECOVERY_REQUIRED
+                logger.warning("[MTS_RECOVERY] Fills log has open trade but recovery failed — RECOVERY_REQUIRED")
+                return False
+
         if state:
-            # 2026-07-01 Gemini CLI: If the state file explicitly says we are FLAT or have no position,
-            # we respect it as the source of truth and do NOT fall back to fill logs (prevents restore loop).
+            # P0: Don't immediately trust FLAT/CLOSE/EXIT state. Cross-check fills log.
             if state.get("has_position") is False or state.get("state") in ("CLOSE", "EXIT", "FLAT"):
+                if _fills_open:
+                    logger.warning(
+                        "[MTS_RECOVERY] State says FLAT but fills has open position. "
+                        "Attempting fills-led recovery."
+                    )
+                    if self._restore_from_fills_log():
+                        self._mts_recovery_state = RecoveryState.RECOVERED
+                        self._mts_state_write_enabled = True
+                        return True
+                    self._mts_recovery_state = RecoveryState.SPLIT_BRAIN
+                    return False
+                self._mts_recovery_state = RecoveryState.FLAT_CONFIRMED
+                self._mts_state_write_enabled = True
                 return False
         
         # 1. Primary Source: JSON State File
@@ -1496,7 +2079,15 @@ class TMFSpread(StrategyBase):
                                 self._release_mono = time.monotonic() if self._released_leg else 0.0
                                 # 2026-05-27 Gemini CLI: Set monotonic entry time on restore to prevent immediate watchdog kill (P4)
                                 self._entry_time_monotonic = time.monotonic()
-                                
+                                # 2026-07-14 Gemini CLI: Set recovery state to RECOVERED to enable correct UPL telemetry
+                                self._mts_recovery_state = RecoveryState.RECOVERED
+                                # ── ADR-011 Phase 5: Restart warmup reset ──
+                                # monotonic timestamps are invalid across process restarts.
+                                # Start a fresh warmup cycle so post-restart EXIT requires
+                                # 500ms/2 fresh ticks before trail can trigger.
+                                self._single_leg_entered_mono = time.monotonic()
+                                self._single_leg_post_fill_ticks = 0
+                                self._single_leg_last_tick_ts = 0.0
                                 logger.info("[MTS_RESTORE_OK] source=JSON action=%s trade_id=%s", action, self._trade_id)
                                 return True
                             else:
@@ -1581,6 +2172,8 @@ class TMFSpread(StrategyBase):
                                     "release_state": "BOTH_HELD",
                                 })
                                 
+                            # 2026-07-14 Gemini CLI: Set recovery state to RECOVERED to enable correct UPL telemetry
+                            self._mts_recovery_state = RecoveryState.RECOVERED
                             logger.info("[MTS_RESTORE_OK] source=LOG trade_id=%s lifecycle=%s age=%.1fh", 
                                         self._trade_id, self._lifecycle, _age_hrs)
                             return True
@@ -1612,6 +2205,19 @@ class TMFSpread(StrategyBase):
             self._release_stop_fixed = float(_params.get("release_stop_points", self._release_stop_fixed))
             self._trail_dist_fixed = float(_params.get("trail_distance_points", self._trail_dist_fixed))
             self._min_atr = float(_params.get("min_atr", self._min_atr))
+
+            # 2026-07-14 Gemini CLI: Hot-reload quote age and tick confirmation configs
+            self._confirm_ticks = int(_params.get("confirm_ticks", self._confirm_ticks))
+            self._confirm_ms = float(_params.get("confirm_ms", self._confirm_ms))
+            self._max_quote_age_ms = float(_params.get("max_quote_age_ms", self._max_quote_age_ms))
+            self._max_spread_width = float(_params.get("max_spread_width", self._max_spread_width))
+
+            # 2026-07-16 Hermes Agent: ADR-011 Phase 4 hot-reload warmup params
+            self._single_leg_warmup_ms = float(_params.get("single_leg_warmup_ms", self._single_leg_warmup_ms))
+            self._single_leg_warmup_ticks = int(_params.get("single_leg_warmup_ticks", self._single_leg_warmup_ticks))
+
+            # 2026-07-16 Hermes Agent: Emergency quote guard bypass hot-reload (shared, not BB per ADR-014)
+            self._emergency_bypass_enabled = bool(_params.get("emergency_bypass_enabled", self._emergency_bypass_enabled))
 
         bar = context.market.last_bar
         if not bar:
@@ -1654,9 +2260,11 @@ class TMFSpread(StrategyBase):
                 return None
 
         # ── Hot-reload guard: restore position state if lost ──
-        if not self._has_position:
+        if self._has_position is None:
             try:
-                self._restore_position_state()
+                _restored = self._restore_position_state()
+                if not _restored:
+                    self._has_position = False
             except Exception:
                 logger.exception("[MTS_RESTORE_FAILED]")
                 self._has_position = False
@@ -1801,7 +2409,10 @@ class TMFSpread(StrategyBase):
             lifecycle=self._current_lifecycle_state(),
         )
         _append_event("ENTRY_SUBMITTED", action=_action, near_side=self._near_side, far_side=self._far_side,
-                       near_entry=near_close, far_entry=far_close, spread_z=spread_z_f)
+                       near_entry=near_close, far_entry=far_close, spread_z=spread_z_f,
+                       # 2026-07-16 Gemini CLI: Record indicators for generate_daily_report.py
+                       mtf_score=bar.get("mtf_score"), vwap=bar.get("vwap"),
+                       near_vwap=bar.get("near_vwap"), far_vwap=bar.get("far_vwap"))
         
         # [Fix] Fill log moved to sync_position for true deferred sync
         # _append_fill(...) - removed from here
@@ -1823,6 +2434,121 @@ class TMFSpread(StrategyBase):
                 return fallback
         return v
 
+    # 2026-07-14 Gemini CLI: Log counterfactual shadow MTF summary at trade exit
+    def _log_shadow_trade_summary(self, _exit_price: float, _exit_reason: str, _pnl_pts: float, now: datetime, bar: dict, near_close: float, far_close: float):
+        if not self._released_leg:
+            return
+            
+        _rg = self._lifecycle_oca.release_group
+        _rel = _rg.filled_leg
+        if _rel is None:
+            _rel = Leg.FAR if self._released_leg == "far" else Leg.NEAR
+        _rem_leg = Leg.FAR if _rel == Leg.NEAR else Leg.NEAR
+        _rem_entry = self._far_entry if _rem_leg == Leg.FAR else self._near_entry
+        _rem_price = far_close if _rem_leg == Leg.FAR else near_close
+        _rem_vwap = bar.get("far_vwap" if _rem_leg == Leg.FAR else "near_vwap", bar.get("vwap"))
+        
+        _shadow_exit_ts = self._shadow_exit_ts.isoformat() if self._shadow_exit_ts else None
+        _shadow_exit_price = self._shadow_exit_price
+        _shadow_hypo_pnl = self._shadow_exit_upl if self._shadow_exit_triggered else _pnl_pts
+        
+        logger.warning(
+            "[MTS_MTF_SHADOW_TRADE_SUMMARY] "
+            "trade_id=%s remaining_leg=%s remaining_side=%s "
+            "single_leg_entry_ts=%s single_leg_entry_price=%.1f "
+            "actual_exit_ts=%s actual_exit_price=%.1f actual_exit_reason=%s actual_realized_pnl=%.1f "
+            "shadow_first_trigger_ts=%s shadow_first_trigger_price=%s shadow_trail_dist_pts=%.1f "
+            "actual_final_trail_dist_pts=%.1f shadow_hypothetical_exit_ts=%s "
+            "shadow_hypothetical_exit_price=%s shadow_hypothetical_pnl=%.1f "
+            "mfe_pts=%.1f mae_pts=%.1f actual_giveback_pts=%.1f shadow_giveback_pts=%.1f "
+            "mtf_score_at_release=%s mtf_score_at_shadow_trigger=%s mtf_score_at_actual_exit=%s "
+            "vwap_relation_at_shadow_trigger=%s price_vs_vwap_pts=%s price_vs_vwap_pct=%s "
+            "shadow_would_exit_earlier=%s post_shadow_mfe=%s post_shadow_mae=%s",
+            self._trade_id, _rem_leg.value, self._side,
+            self._release_ts.isoformat() if self._release_ts else None, _rem_entry,
+            now.isoformat(), _exit_price, _exit_reason, _pnl_pts,
+            _shadow_exit_ts, f"{_shadow_exit_price:.1f}" if _shadow_exit_price is not None else None,
+            getattr(self, "_last_trail_dist_shadow", 20.0),
+            getattr(self, "_last_trail_dist_formal", 20.0),
+            _shadow_exit_ts,
+            f"{_shadow_exit_price:.1f}" if _shadow_exit_price is not None else None,
+            _shadow_hypo_pnl,
+            self._mfe_pts, self._mae_pts, self._formal_max_giveback, self._shadow_max_giveback,
+            getattr(self, "_mtf_score_at_release", None),
+            getattr(self, "_mtf_score_at_shadow_trigger", None),
+            bar.get("mtf_score"),
+            "BELOW" if self._side == "LONG" else "ABOVE",
+            round(_rem_price - _rem_vwap, 1) if _rem_vwap else None,
+            round((_rem_price - _rem_vwap) / _rem_vwap * 100, 3) if _rem_vwap else None,
+            self._shadow_exit_triggered,
+            self._post_shadow_mfe, self._post_shadow_mae
+        )
+
+    # 2026-07-14 Gemini CLI: Decoupled risk engine helper for Release & Single-Leg stops
+    def _evaluate_risk(self, near_close: float, far_close: float, current_pnl: float, bar: dict) -> tuple[float, float, SingleLegRiskDecision | None]:
+        # 1. Base ATR thresholds
+        release_stop_base, trail_dist_base = self._get_thresholds(bar)
+        
+        # 2. Spread/Release Risk (no MTF used)
+        release_input = ReleaseRiskInput(
+            base_release_stop_pts=release_stop_base,
+            near_pnl=self._pnl_near(near_close),
+            far_pnl=self._pnl_far(far_close),
+            spread=bar.get("spread") or (near_close - far_close),
+            spread_atr=bar.get("atr") or self._last_atr,
+            bb_squeeze_on=bool(bar.get("sqz_on", False)),  # SHADOW — not consumed by risk engine per ADR-014
+            tick_confirmed=True
+        )
+        release_decision = self._release_risk_engine.evaluate_release_risk(release_input)
+        release_stop = release_decision.final_release_stop_pts
+        
+        # 3. Single-Leg Risk (MTF evaluated shadow-only)
+        _rg = self._lifecycle_oca.release_group
+        _rel = _rg.filled_leg
+        if _rel is None and self._released_leg:
+            _rel = Leg.FAR if self._released_leg == "far" else Leg.NEAR
+            
+        single_decision = None
+        trail_dist = trail_dist_base
+        if _rel is not None:
+            _rem_leg = Leg.FAR if _rel == Leg.NEAR else Leg.NEAR
+            _rem_price = far_close if _rem_leg == Leg.FAR else near_close
+            _rem_entry = self._far_entry if _rem_leg == Leg.FAR else self._near_entry
+            _vwap_key = "far_vwap" if _rem_leg == Leg.FAR else "near_vwap"
+            _rem_vwap = bar.get(_vwap_key, bar.get("vwap"))
+            
+            # Retrieve MTF snapshot fields injected by monitor
+            mtf_score = bar.get("mtf_score")
+            mtf_valid = bool(bar.get("mtf_valid", False))
+            mtf_age_sec = bar.get("mtf_age_sec")
+            
+            single_input = SingleLegRiskInput(
+                side=self._side or "LONG",
+                current_price=_rem_price,
+                entry_price=_rem_entry,
+                peak_price=self._peak if self._side == "LONG" else self._nadir,
+                base_trail_dist_pts=trail_dist_base,
+                atr_used=bar.get("atr") or self._last_atr,
+                vwap=_rem_vwap,
+                mtf_score=mtf_score,
+                mtf_valid=mtf_valid,
+                mtf_age_sec=mtf_age_sec,
+                unrealized_pnl=current_pnl,
+                mfe_pts=self._mfe_pts
+            )
+            
+            _vwap_cfg = self._params.get("vwap_exit", {})
+            _mtf_cfg = self._params.get("mtf", {})
+            
+            single_decision = self._single_leg_risk_engine.evaluate_single_leg_risk(
+                inputs=single_input,
+                vwap_exit_config=_vwap_cfg,
+                mtf_config=_mtf_cfg
+            )
+            trail_dist = single_decision.final_trail_dist_pts
+            
+        return release_stop, trail_dist, single_decision
+
     def _manage_position(
         self, near_close: float, far_close: float, spread_z: Any, now: datetime,
         bar: dict,
@@ -1834,6 +2560,30 @@ class TMFSpread(StrategyBase):
         if self._lifecycle == "EXITING":
             self._set_eval(skip_reason="EXIT_ALREADY_SUBMITTED")
             return None
+
+        # ── ADR-011 Phase 5: Count remaining-leg fresh ticks for warmup ──
+        # Move tick counting logic here to prevent deadlock where early returns (e.g. TRAIL_WARMUP)
+        # block the tick counter from incrementing.
+        if self._lifecycle_oca and self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG:
+            # Sync legacy _lifecycle string for compat
+            self._lifecycle = f"TRAILING_{self._side}"
+            if self._single_leg_post_fill_ticks < self._single_leg_warmup_ticks:
+                if not _is_backtest:
+                    self._single_leg_post_fill_ticks += 1
+                else:
+                    _bar_ts = bar.get("timestamp") or bar.get("ts")
+                    if _bar_ts is not None:
+                        if hasattr(_bar_ts, "timestamp"):
+                            _ts_float = _bar_ts.timestamp()
+                        elif hasattr(_bar_ts, "tz"):
+                            _ts_float = pd.Timestamp(_bar_ts).timestamp()
+                        else:
+                            _ts_float = float(_bar_ts)
+                    else:
+                        _ts_float = 0.0
+                    if _ts_float > self._single_leg_last_tick_ts:
+                        self._single_leg_post_fill_ticks += 1
+                        self._single_leg_last_tick_ts = _ts_float
             
         # 2026-06-26 Gemini CLI: build dynamic risk metadata
         _risk_meta = self._get_risk_meta(bar)
@@ -1870,9 +2620,10 @@ class TMFSpread(StrategyBase):
 
         # ── ADR-009 v1.1 Task 4A: Build LifecycleContext + evaluate lifecycle ──
         _decision: LifecycleDecision | None = None
+        _single_decision: SingleLegRiskDecision | None = None
         try:
             _entry_age = (now - self._entry_ts).total_seconds() if self._entry_ts else 0.0
-            _release_stop, _trail_dist = self._get_thresholds(bar)
+            _release_stop, _trail_dist, _single_decision = self._evaluate_risk(near_close, far_close, current_pnl, bar)
             _n_pnl = self._pnl_near(near_close)
             _f_pnl = self._pnl_far(far_close)
             _trailing_side = None
@@ -1909,30 +2660,156 @@ class TMFSpread(StrategyBase):
                 is_backtest=_is_backtest,
             )
             _decision = evaluate_lifecycle_actions(_ctx, self._lifecycle_oca)
-            if _decision is not None:
-                # [ADR-009] Decision committed — persist lifecycle before returning Signal
-                logger.info("[LIFECYCLE_DECISION] action=%s release_leg=%s", _decision.action, _decision.release_leg)
-                _write_mts_state(
-                    has_position=self._has_position, action=f"LIFECYCLE_{_decision.action.value}",
-                    reason=_decision.action.value,
-                    near_entry=self._near_entry, far_entry=self._far_entry,
-                    near_last=near_close, far_last=far_close,
-                    near_side=self._near_side, far_side=self._far_side,
-                    spread_z=spread_z, released_leg=self._released_leg,
-                    trade_id=self._trade_id, ticker=self._ticker,
-                    atr=self._last_atr if self._last_atr is not None else 0.0,
-                    lifecycle=lifecycle_to_dict(self._lifecycle_oca),
+            # 2026-07-16 Gemini CLI: P0 Invariant Assertion to detect evaluate_lifecycle_actions regression (Phase 3a)
+            if (
+                _decision is None
+                and self._lifecycle_oca.phase == PositionPhase.SPREAD
+                and self._lifecycle_oca.release_group.status == ReleaseGroupStatus.ARMED
+                and (_n_pnl <= -_release_stop or _f_pnl <= -_release_stop)
+            ):
+                logger.error(
+                    "[MTS_RELEASE_DECISION_INVARIANT_VIOLATION] far_hit/near_hit is True but evaluate_lifecycle_actions returned None — P0"
                 )
+                if not _is_backtest:
+                    raise RuntimeError("MTS_RELEASE_DECISION_INVARIANT_VIOLATION in production")
+            # 2026-07-09 Hermes Agent: P0 lifecycle ordering — commit + write_state
+            # moved below, after tick confirmation and BB filter pass.  The early write
+            # at this location (removed) created state-file/broker divergence by writing
+            # TRIGGERED before pre-order guards completed.
         except Exception:
             logger.exception("[LIFECYCLE_EVAL_FAILED]")
 
+        # ── ADR-011 Phase 2: Action-scoped timeout timers (2026-07-16) ──
+        # Each action has its own pending timer, preventing RELEASE timeout
+        # from leaking into TRAIL and vice versa.
+        _active_action = _decision.action if (_decision is not None) else None
+
+        # RELEASE: start/keep release timer
+        if _active_action == LifecycleAction.RELEASE:
+            if self._release_pending_mono <= 0:
+                self._release_pending_mono = time.monotonic()
+                logger.info("[MTS_ACTION_TIMEOUT_STATE] action=RELEASE event=TIMER_START")
+        elif _active_action == LifecycleAction.TRAIL:
+            # TRAIL: only legal in SINGLE_LEG with confirmed fill
+            _rg = self._lifecycle_oca.release_group
+            if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG and _rg.status in (
+                ReleaseGroupStatus.FILLED, ReleaseGroupStatus.COMPLETED,
+            ):
+                if self._trail_pending_mono <= 0:
+                    self._trail_pending_mono = time.monotonic()
+                    logger.info("[MTS_ACTION_TIMEOUT_STATE] action=TRAIL event=TIMER_START")
+            else:
+                # Trail decision is ILLEGAL — clear timer
+                if self._trail_pending_mono > 0:
+                    logger.warning(
+                        "[MTS_TRAIL_TIMER_RESET] reason=NOT_SINGLE_LEG phase=%s rg_status=%s",
+                        self._lifecycle_oca.phase.value if hasattr(self._lifecycle_oca.phase, 'value') else self._lifecycle_oca.phase,
+                        _rg.status.value if hasattr(_rg.status, 'value') else _rg.status,
+                    )
+                self._trail_pending_mono = 0.0
+        elif _active_action in (LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT, LifecycleAction.MANUAL):
+            # Hard exits: bypass immediately — no timer needed
+            pass
+        else:
+            # No exit action active → reset both timers
+            if self._release_pending_mono > 0:
+                self._release_pending_mono = 0.0
+            if self._trail_pending_mono > 0:
+                # Only reset trail timer if not in a valid SINGLE_LEG state
+                # (trail may persist across ticks within the same exit attempt)
+                _rg = self._lifecycle_oca.release_group
+                if not (self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG and _rg.status in (
+                    ReleaseGroupStatus.FILLED, ReleaseGroupStatus.COMPLETED,
+                )):
+                    self._trail_pending_mono = 0.0
+
         # Quote freshness check
-        near_age = bar.get("near_tick_age_ms", bar.get("near_age_ms", -1))
-        far_age = bar.get("far_tick_age_ms", bar.get("far_age_ms", -1))
-        quote_age_ms = max(0.0, max(float(near_age), float(far_age))) if (near_age > 0 or far_age > 0) else 0.0
+        near_age = float(bar.get("near_tick_age_ms", bar.get("near_age_ms", -1)))
+        far_age = float(bar.get("far_tick_age_ms", bar.get("far_age_ms", -1)))
         
-        if quote_age_ms > self._max_quote_age_ms:
+        # 2026-07-16 Gemini CLI: Decoupled Leg Freshness Check.
+        # Only check the freshness of the leg being actively exited or released.
+        # This prevents a stale quote on leg A from hijacking / blocking a stop loss on leg B.
+        _target_age = -1.0
+        if _decision is not None:
+            if _decision.action == LifecycleAction.RELEASE:
+                _target_leg = _decision.release_leg
+                _target_age = near_age if _target_leg == Leg.NEAR else far_age
+            elif _decision.action == LifecycleAction.TRAIL:
+                _rel = self._lifecycle_oca.release_group.filled_leg
+                if _rel is None and self._released_leg:
+                    _rel = Leg.FAR if self._released_leg == "far" else Leg.NEAR
+                if _rel is not None:
+                    _rem_leg = Leg.FAR if _rel == Leg.NEAR else Leg.NEAR
+                    _target_age = far_age if _rem_leg == Leg.FAR else near_age
+            elif _decision.action in (LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT, LifecycleAction.MANUAL):
+                _rel = self._lifecycle_oca.release_group.filled_leg
+                if _rel is None and self._released_leg:
+                    _rel = Leg.FAR if self._released_leg == "far" else Leg.NEAR
+                if _rel is not None:
+                    _rem_leg = Leg.FAR if _rel == Leg.NEAR else Leg.NEAR
+                    _target_age = far_age if _rem_leg == Leg.FAR else near_age
+                else:
+                    _target_age = max(near_age, far_age)
+
+        if _target_age >= 0:
+            quote_age_ms = max(0.0, _target_age)
+        else:
+            # Default to maximum of both legs for entries / normal monitoring
+            quote_age_ms = max(0.0, max(near_age, far_age)) if (near_age > 0 or far_age > 0) else 0.0
+
+        # 2026-07-16 Gemini CLI: Emergency Quote Guard Bypass (Risk Escalation + Timeout).
+        # If an exit decision is triggered, bypass the freshness check if:
+        # A) Loss exceeds the configured emergency multiplier (defaults to 1.5x stop for early escape).
+        # B) The decision has been pending for more than 500ms (Timeout).
+        _bypass_quote_guard = False
+        if _decision is not None and getattr(self, "_emergency_bypass_enabled", True):
+            _mult = 1.5  # Risk escalation at 1.5x stop
+            _timeout_limit_ms = 500.0  # Force exit if blocked for > 500ms
+            
+            # Check A: Risk Escalation
+            _risk_escalated = False
+            if _decision.action == LifecycleAction.RELEASE:
+                _rel_leg = _decision.release_leg
+                _loss = abs(_n_pnl) if _rel_leg == Leg.NEAR else abs(_f_pnl)
+                if _loss > _release_stop * _mult:
+                    _risk_escalated = True
+            elif _decision.action == LifecycleAction.TRAIL:
+                _rel = self._lifecycle_oca.release_group.filled_leg
+                if _rel is None and self._released_leg:
+                    _rel = Leg.FAR if self._released_leg == "far" else Leg.NEAR
+                if _rel is not None:
+                    _rem_leg = Leg.FAR if _rel == Leg.NEAR else Leg.NEAR
+                    _rem_price = far_close if _rem_leg == Leg.FAR else near_close
+                    _giveback = 0.0
+                    if self._side == "LONG" and self._peak > 0:
+                        _giveback = self._peak - _rem_price
+                    elif self._side == "SHORT" and self._nadir > 0:
+                        _giveback = _rem_price - self._nadir
+                    if _giveback > _trail_dist * _mult:
+                        _risk_escalated = True
+            elif _decision.action in (LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT, LifecycleAction.MANUAL):
+                _risk_escalated = True  # Hard exits bypass immediately
+
+            # Check B: Timeout — action-scoped (ADR-011 Phase 2)
+            _elapsed_ms = 0.0
+            if _decision.action == LifecycleAction.RELEASE:
+                _elapsed_ms = (time.monotonic() - self._release_pending_mono) * 1000 if self._release_pending_mono > 0 else 0.0
+            elif _decision.action == LifecycleAction.TRAIL:
+                _elapsed_ms = (time.monotonic() - self._trail_pending_mono) * 1000 if self._trail_pending_mono > 0 else 0.0
+            elif _decision.action in (LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT, LifecycleAction.MANUAL):
+                _elapsed_ms = _timeout_limit_ms + 1  # immediately bypass
+            _timeout_triggered = _elapsed_ms > _timeout_limit_ms
+            
+            if _risk_escalated or _timeout_triggered:
+                _bypass_quote_guard = True
+                _reason_str = "RISK_ESCALATED" if _risk_escalated else f"TIMEOUT_{_elapsed_ms:.0f}ms"
+                logger.warning("[MTS_QUOTE_GUARD_BYPASS] reason=%s action=%s age=%.0f ms", 
+                               _reason_str, _decision.action.name, quote_age_ms)
+
+        if quote_age_ms > self._max_quote_age_ms and not _bypass_quote_guard:
             self._set_eval(skip_reason="STALE_QUOTE_AGE", age=quote_age_ms)
+            logger.warning("[MTS_RELEASE_BLOCKED] reason=STALE_QUOTE_AGE age=%.0f/%s", quote_age_ms, self._max_quote_age_ms)
             return None
 
         # Check bid-ask spread width
@@ -1945,15 +2822,134 @@ class TMFSpread(StrategyBase):
 
         if near_width > self._max_spread_width or far_width > self._max_spread_width:
             self._set_eval(skip_reason="WIDE_SPREAD_WIDTH", near_width=near_width, far_width=far_width)
+            logger.warning("[MTS_RELEASE_BLOCKED] reason=WIDE_SPREAD_WIDTH near=%.1f far=%.1f max=%.1f", near_width, far_width, self._max_spread_width)
             return None
 
         # Dynamic thresholds
-        release_stop, trail_dist = self._get_thresholds(bar)
+        release_stop, trail_dist, _single_decision = self._evaluate_risk(near_close, far_close, current_pnl, bar)
+
+        # ── MTF Shadow Simulation and Telemetry (ADR-009 Phase 2) ──
+        if _single_decision is not None and _single_decision.shadow_trail_dist_pts is not None:
+            shadow_trail = _single_decision.shadow_trail_dist_pts
+            mtf_score = bar.get("mtf_score")
+            mtf_valid = bool(bar.get("mtf_valid", False))
+            mtf_age_sec = bar.get("mtf_age_sec")
+            
+            # Update peak/nadir and simulate shadow exits
+            _rg = self._lifecycle_oca.release_group
+            _rel = _rg.filled_leg
+            if _rel is None and self._released_leg:
+                _rel = Leg.FAR if self._released_leg == "far" else Leg.NEAR
+            if _rel is not None:
+                _rem_leg = Leg.FAR if _rel == Leg.NEAR else Leg.NEAR
+                _rem_price = far_close if _rem_leg == Leg.FAR else near_close
+                _rem_entry = self._far_entry if _rem_leg == Leg.FAR else self._near_entry
+                _rem_side = self._far_side if _rem_leg == Leg.FAR else self._near_side
+                _rem_high = float(bar.get("far_high" if _rem_leg == Leg.FAR else "near_high", _rem_price))
+                _rem_low = float(bar.get("far_low" if _rem_leg == Leg.FAR else "near_low", _rem_price))
+                rem_floating_pnl = (_rem_price - _rem_entry) if self._side == "LONG" else (_rem_entry - _rem_price)
+                
+                # Check peak/nadir updates
+                if self._side == "LONG":
+                    _shadow_peak = max(self._peak, _rem_high)
+                    _shadow_trigger_price = _shadow_peak - shadow_trail
+                    _giveback = _shadow_peak - _rem_price
+                    self._formal_max_giveback = max(self._formal_max_giveback, _giveback)
+                    if not self._shadow_exit_triggered:
+                        self._shadow_max_giveback = max(self._shadow_max_giveback, _giveback)
+                        if _rem_low <= _shadow_trigger_price:
+                            self._shadow_exit_triggered = True
+                            self._shadow_exit_ts = now
+                            self._shadow_exit_price = _shadow_trigger_price
+                            self._shadow_exit_upl = (_shadow_trigger_price - _rem_entry)
+                            self._post_shadow_mfe = 0.0
+                            self._post_shadow_mae = 0.0
+                            self._mtf_score_at_shadow_trigger = mtf_score
+                            logger.warning(
+                                "[MTS_MTF_SHADOW_TRIGGERED] trade_id=%s side=LONG trigger_price=%.1f price=%.1f peak=%.1f trail=%.1f ts=%s",
+                                self._trade_id, _shadow_trigger_price, _rem_price, _shadow_peak, shadow_trail, now
+                            )
+                else: # SHORT
+                    _shadow_nadir = min(self._nadir, _rem_low)
+                    _shadow_trigger_price = _shadow_nadir + shadow_trail
+                    _giveback = _rem_price - _shadow_nadir
+                    self._formal_max_giveback = max(self._formal_max_giveback, _giveback)
+                    if not self._shadow_exit_triggered:
+                        self._shadow_max_giveback = max(self._shadow_max_giveback, _giveback)
+                        if _rem_high >= _shadow_trigger_price:
+                            self._shadow_exit_triggered = True
+                            self._shadow_exit_ts = now
+                            self._shadow_exit_price = _shadow_trigger_price
+                            self._shadow_exit_upl = (_rem_entry - _shadow_trigger_price)
+                            self._post_shadow_mfe = 0.0
+                            self._post_shadow_mae = 0.0
+                            self._mtf_score_at_shadow_trigger = mtf_score
+                            logger.warning(
+                                "[MTS_MTF_SHADOW_TRIGGERED] trade_id=%s side=SHORT trigger_price=%.1f price=%.1f nadir=%.1f trail=%.1f ts=%s",
+                                self._trade_id, _shadow_trigger_price, _rem_price, _shadow_nadir, shadow_trail, now
+                            )
+                            
+                # Update post-shadow excursions
+                if self._shadow_exit_triggered:
+                    if self._side == "LONG":
+                        _excursion = _rem_price - self._shadow_exit_price
+                        self._post_shadow_mfe = max(self._post_shadow_mfe, _excursion)
+                        self._post_shadow_mae = min(self._post_shadow_mae, _excursion)
+                    else:
+                        _excursion = self._shadow_exit_price - _rem_price
+                        self._post_shadow_mfe = max(self._post_shadow_mfe, _excursion)
+                        self._post_shadow_mae = min(self._post_shadow_mae, _excursion)
+                        
+            # Log tick telemetry
+            delta_pts = shadow_trail - trail_dist
+            formal_modifiers = ",".join(_single_decision.modifiers) if _single_decision.modifiers else "NONE"
+            shadow_modifiers = ",".join(_single_decision.shadow_modifiers) if _single_decision.shadow_modifiers else "NONE"
+            
+            logger.info(
+                "[MTS_MTF_SHADOW_EVAL] side=%s score=%s valid=%s age=%s base_trail=%.1f formal_trail=%.1f shadow_trail=%.1f formal_mod=%s shadow_mod=%s delta=%.1f",
+                self._side, mtf_score, mtf_valid, mtf_age_sec,
+                _single_decision.base_trail_dist_pts, trail_dist, shadow_trail,
+                formal_modifiers, shadow_modifiers, delta_pts
+            )
+            
+            if shadow_trail < trail_dist:
+                logger.info(
+                    "[MTS_MTF_SHADOW_DIFF] trade_id=%s delta=%.1f shadow=%.1f formal=%.1f price=%.1f",
+                    self._trade_id, delta_pts, shadow_trail, trail_dist, _rem_price
+                )
+            else:
+                logger.debug(
+                    "[MTS_MTF_SHADOW_NO_CHANGE] trade_id=%s shadow=%.1f formal=%.1f",
+                    self._trade_id, shadow_trail, trail_dist
+                )
         # 2026-05-27 Gemini CLI: Use dynamic multiplier from engine constants
         _mult = float(get_point_value(self._ticker))
 
         _n_pnl = self._pnl_near(near_close)
         _f_pnl = self._pnl_far(far_close)
+
+        # 2026-07-09 Hermes Agent: release diagnostic eval — fires whenever a leg is at threshold
+        _rel_near_hit = _n_pnl <= -release_stop
+        _rel_far_hit = _f_pnl <= -release_stop
+        if _rel_near_hit or _rel_far_hit:
+            _rg_status = str(self._lifecycle_oca.release_group.status.value) if self._lifecycle_oca and self._lifecycle_oca.release_group else "N/A"
+            _phase = str(self._lifecycle_oca.phase.value) if self._lifecycle_oca else "N/A"
+            _tick_count = (self._release_near_ticks if _decision and getattr(_decision, 'release_leg', None) == Leg.NEAR else self._release_far_ticks)
+            logger.warning(
+                "[MTS_RELEASE_EVAL] has_pos=%s phase=%s rg_status=%s "
+                "near_pnl=%.1f far_pnl=%.1f threshold=%.1f "
+                "near_hit=%s far_hit=%s decision=%s tick_ct=%d/%d "
+                "quote_age=%.0f/%s spread_w=%.1f/%.1f "
+                "near_last=%.0f far_last=%.0f atr=%.1f spread_z=%s",
+                self._has_position, _phase, _rg_status,
+                _n_pnl, _f_pnl, release_stop,
+                _rel_near_hit, _rel_far_hit,
+                _decision.action.name if _decision else None,
+                _tick_count, self._confirm_ticks,
+                quote_age_ms, self._max_quote_age_ms,
+                max(near_width, far_width), self._max_spread_width,
+                near_close, far_close, bar.get("atr", 0), bar.get("spread_z", "N/A"),
+            )
 
         # ── ADR-009 v1.1 Task 4B-1: decision-to-Signal ──
         if _decision is not None:
@@ -1973,11 +2969,25 @@ class TMFSpread(StrategyBase):
                 if _release_leg == Leg.NEAR:
                     if not (_is_backtest or (self._release_near_ticks >= self._confirm_ticks and (time.monotonic() - self._release_near_start_time) * 1000 >= self._confirm_ms)):
                         self._set_eval(skip_reason="LIFECYCLE_RELEASE_PENDING", leg="NEAR")
+                        logger.warning("[MTS_RELEASE_BLOCKED] reason=TICK_CONFIRM_PENDING leg=NEAR ct=%d/%d age_ms=%.0f/%s", self._release_near_ticks, self._confirm_ticks, (time.monotonic() - self._release_near_start_time) * 1000 if self._release_near_start_time > 0 else 0, self._confirm_ms)
                         return None
                 else:
                     if not (_is_backtest or (self._release_far_ticks >= self._confirm_ticks and (time.monotonic() - self._release_far_start_time) * 1000 >= self._confirm_ms)):
                         self._set_eval(skip_reason="LIFECYCLE_RELEASE_PENDING", leg="FAR")
+                        logger.warning("[MTS_RELEASE_BLOCKED] reason=TICK_CONFIRM_PENDING leg=FAR ct=%d/%d age_ms=%.0f/%s", self._release_far_ticks, self._confirm_ticks, (time.monotonic() - self._release_far_start_time) * 1000 if self._release_far_start_time > 0 else 0, self._confirm_ms)
                         return None
+                # 2026-07-08 Hermes Agent: BB filter gate removed per ADR-014.
+                # Squeeze/BB no longer gate release decisions.
+                # Shadow telemetry: bb_position and sqz_on logged for research only.
+                logger.info(
+                    "[MTS_RELEASE_SHADOW] leg=%s sqz_on=%s near_bb_upper=%s near_bb_lower=%s far_bb_upper=%s far_bb_lower=%s release_mode=SHADOW",
+                    _release_leg.value,
+                    bar.get("sqz_on", "N/A"),
+                    bar.get("near_bb_upper", "N/A"),
+                    bar.get("near_bb_lower", "N/A"),
+                    bar.get("far_bb_upper", "N/A"),
+                    bar.get("far_bb_lower", "N/A"),
+                )
                 # RELEASE: use decision.release_leg → build PARTIAL_EXIT Signal
                 _release_leg = _decision.release_leg
                 if _release_leg is None:
@@ -1986,7 +2996,7 @@ class TMFSpread(StrategyBase):
                 _exit_price = near_close if _release_leg == Leg.NEAR else far_close
                 _pnl_pts = _n_pnl if _release_leg == Leg.NEAR else _f_pnl
                 _turnover = (self._near_entry + _exit_price) * _mult
-                _cost = 20.0 + _turnover * 2e-5
+                _cost = 40.0 + _turnover * 2e-5
                 _realized = _pnl_pts * _mult - _cost
                 _signal_reason = f"TMF_RELEASE_{_release_leg.value}"
                 _rel_leg_str = _release_leg.value.lower()  # "near"/"far" for legacy
@@ -1995,6 +3005,17 @@ class TMFSpread(StrategyBase):
                 self._release_mono = time.monotonic()
                 self._released_leg = _rel_leg_str
                 self._release_price = _exit_price
+                
+                # 2026-07-14 Gemini CLI: Reset shadow tracking variables on leg release
+                self._shadow_exit_triggered = False
+                self._shadow_exit_ts = None
+                self._shadow_exit_price = None
+                self._shadow_exit_upl = None
+                self._shadow_max_giveback = 0.0
+                self._post_shadow_mfe = None
+                self._post_shadow_mae = None
+                self._formal_max_giveback = 0.0
+                self._mtf_score_at_release = bar.get("mtf_score")
                 # Anchor capture for remaining leg
                 _anchor = far_close if _release_leg == Leg.NEAR else near_close
                 if _anchor > 0:
@@ -2004,10 +3025,37 @@ class TMFSpread(StrategyBase):
                 _mfe = (self._near_max - self._near_entry) if self._near_side == "LONG" else (self._near_entry - self._near_min)
                 _mae = (self._near_entry - self._near_min) if self._near_side == "LONG" else (self._near_max - self._near_entry)
                 self._log_exit_decision(exit_reason="RELEASE_STOP", pnl=_pnl_pts, bar=bar)
+                _risk_meta["mtf_score"] = self._mtf_score_at_release
                 _append_event(f"RELEASE_{_release_leg.value}_SUBMITTED", released_leg=_release_leg.value, exit_price=_exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, mfe=round(_mfe,2), mae=round(_mae,2), **_risk_meta)
-                _write_mts_state(has_position=True, action=f"RELEASE_{_release_leg.value}", reason=f"{_release_leg.value}_pnl={_pnl_pts:.1f}", near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=_rel_leg_str, release_price=_exit_price, release_stop_points=int(release_stop), trail_distance_points=int(trail_dist), trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
+                # 2026-07-09 Hermes Agent: P0 — commit lifecycle state NOW, after all
+                # pre-order guards (tick confirmation, BB filter) have passed.
+                _commit_action(self._lifecycle_oca, _decision)
+                logger.warning("[LIFECYCLE_DECISION] action=%s release_leg=%s", _decision.action, _decision.release_leg)
+                _write_mts_state(has_position=True, action=f"RELEASE_{_release_leg.value}", reason=f"{_release_leg.value}_pnl={_pnl_pts:.1f}", near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, near_status="RELEASED" if _release_leg == Leg.NEAR else "OPEN", far_status="RELEASED" if _release_leg == Leg.FAR else "OPEN", near_realized_override=_realized if _release_leg == Leg.NEAR else None, far_realized_override=_realized if _release_leg == Leg.FAR else None, spread_z=spread_z, released_leg=_rel_leg_str, release_price=_exit_price, release_stop_points=int(release_stop), trail_distance_points=int(trail_dist), trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
                 return Signal("PARTIAL_EXIT", _signal_reason, confidence=0.4)
             elif _decision.action in (LifecycleAction.TRAIL, LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT):
+                # ── ADR-011 Phase 4: Post-fill warmup guard ──
+                # Blocks TRAIL if warmup (500ms / 2 ticks) hasn't completed.
+                # Prevents immediate EXIT triggered by stale pre-fill prices or
+                # callback-timing races.
+                if _decision.action == LifecycleAction.TRAIL and not _is_backtest:
+                    _warmup_elapsed = (time.monotonic() - self._single_leg_entered_mono) * 1000.0 if self._single_leg_entered_mono > 0 else 0.0
+                    _warmup_ticks = self._single_leg_post_fill_ticks
+                    if _warmup_elapsed < self._single_leg_warmup_ms or _warmup_ticks < self._single_leg_warmup_ticks:
+                        self._trail_pending_mono = 0.0  # prevent timeout bleed
+                        self._set_eval(
+                            skip_reason="TRAIL_WARMUP",
+                            elapsed_ms=round(_warmup_elapsed, 1),
+                            warmup_ms=self._single_leg_warmup_ms,
+                            ticks=_warmup_ticks,
+                            warmup_ticks=self._single_leg_warmup_ticks,
+                        )
+                        logger.warning(
+                            "[MTS_TRAIL_WARMUP] elapsed=%.0f/%s ticks=%s/%s",
+                            _warmup_elapsed, self._single_leg_warmup_ms,
+                            _warmup_ticks, self._single_leg_warmup_ticks,
+                        )
+                        return None
                 # TRAIL / STOPLOSS / TIMEOUT: full exit of remaining leg
                 _exit_reason = _decision.action.name
                 _tg = self._lifecycle_oca.trail_group
@@ -2019,19 +3067,30 @@ class TMFSpread(StrategyBase):
                 _rem_side = self._far_side if _rem_leg == Leg.FAR else self._near_side
                 _pnl_pts = (_exit_price - _rem_entry) if _rem_side == "LONG" else (_rem_entry - _exit_price)
                 _turnover = (_rem_entry + _exit_price) * _mult
-                _cost = 20.0 + _turnover * 2e-5
+                _cost = 40.0 + _turnover * 2e-5
                 _realized = _pnl_pts * _mult - _cost
                 self._lifecycle = "EXITING"
                 self._log_exit_decision(exit_reason=_exit_reason, pnl=_pnl_pts, bar=bar)
                 _append_event("EXIT_REMAINING", reason=_exit_reason, remaining_leg=_rem_leg.value, exit_price=_exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, **_risk_meta)
                 _write_mts_state(has_position=True, action=f"EXIT_{_exit_reason}", reason=_exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
+                self._log_shadow_trade_summary(_exit_price, _exit_reason, _pnl_pts, now, bar, near_close, far_close)
                 return Signal("EXIT", f"TMF_{_exit_reason}", confidence=0.5, stop_loss=0)
             elif _decision.action == LifecycleAction.MANUAL:
                 # MANUAL: full flatten — same as STOPLOSS/TIMEOUT
+                _exit_reason = "MANUAL"
+                _tg = self._lifecycle_oca.trail_group
+                _rem_leg = _tg.remaining_leg
+                if _rem_leg is None:
+                    _rem_leg = Leg.FAR if self._released_leg == "near" else Leg.NEAR
+                _exit_price = far_close if _rem_leg == Leg.FAR else near_close
+                _rem_entry = self._far_entry if _rem_leg == Leg.FAR else self._near_entry
+                _rem_side = self._far_side if _rem_leg == Leg.FAR else self._near_side
+                _pnl_pts = (_exit_price - _rem_entry) if _rem_side == "LONG" else (_rem_entry - _exit_price)
                 self._lifecycle = "EXITING"
-                self._log_exit_decision(exit_reason="MANUAL", pnl=0, bar=bar)
+                self._log_exit_decision(exit_reason="MANUAL", pnl=_pnl_pts, bar=bar)
                 _append_event("MANUAL_EXIT", **_risk_meta)
                 _write_mts_state(has_position=True, action="MANUAL_EXIT", reason="manual", near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
+                self._log_shadow_trade_summary(_exit_price, "MANUAL", _pnl_pts, now, bar, near_close, far_close)
                 return Signal("EXIT", "TMF_MANUAL", confidence=1.0, stop_loss=0)
 
         # ── Legacy path (fallback when _decision is None) ──
@@ -2086,21 +3145,18 @@ class TMFSpread(StrategyBase):
             )
             return None
 
-        # ── Trailing mode ──
-        if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG:
-            # Sync legacy _lifecycle string for compat (decision no longer reads it)
-            self._lifecycle = f"TRAILING_{self._side}"
+        # Warmup tick count logic moved to start of _manage_position to prevent deadlock
         elif self._released_leg is not None and self._lifecycle_oca.phase not in (PositionPhase.SPREAD, PositionPhase.SINGLE_LEG):
-            # Legacy fallback: sync lifecycle from _released_leg if phase is stale
-            _rel = self._normalize_leg(self._released_leg)
-            if _rel:
-                _rem = Leg.FAR if _rel == Leg.NEAR else Leg.NEAR
-                self._lifecycle_oca = PositionLifecycle(
-                    phase=PositionPhase.SINGLE_LEG,
-                    release_group=ReleaseGroup(status=ReleaseGroupStatus.COMPLETED, filled_leg=_rel, canceled_leg=_rem),
-                    trail_group=TrailGroup(status=TrailGroupStatus.ARMED, remaining_leg=_rem),
-                )
-                self._lifecycle = f"TRAILING_{self._side}"
+            # ADR-011 Phase 3: Blocked — SINGLE_LEG only via confirmed fill.
+            # This legacy path set SINGLE_LEG based on _released_leg alone, without
+            # verifying fill confirmation.  This was the root cause of the 38ms
+            # double-order bug (MTS_RELEASE + MTS_EXIT submitted in same tick).
+            logger.error(
+                "[MTS_SINGLE_LEG_TRANSITION_BLOCKED] reason=FILL_NOT_CONFIRMED "
+                "phase=%s _released_leg=%s",
+                self._lifecycle_oca.phase.value if hasattr(self._lifecycle_oca.phase, 'value') else self._lifecycle_oca.phase,
+                self._released_leg,
+            )
 
         if self._released_leg == "near":
             _rem_price, _rem_entry, _rem_leg_label, _released_leg_label = far_close, self._far_entry, "FAR", "NEAR"
@@ -2190,12 +3246,14 @@ class TMFSpread(StrategyBase):
             exit_price = _rem_low if self._side == "LONG" else _rem_high
             _pnl_pts = (exit_price - _rem_entry) if self._side == "LONG" else (_rem_entry - exit_price)
             _turnover = (_rem_entry + exit_price) * _mult
-            _cost = 20.0 + _turnover * 2e-5
+            _cost = 40.0 + _turnover * 2e-5
             _realized = _pnl_pts * _mult - _cost
             self._lifecycle = "EXITING"
             self._log_exit_decision(exit_reason=exit_reason, pnl=_pnl_pts, bar=bar)
             _append_event("EXIT_REMAINING", reason=exit_reason, remaining_leg=_rem_leg_label, exit_price=exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, **_risk_meta)
             _write_mts_state(has_position=True, action=f"EXIT_{exit_reason}", reason=exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
+            # 2026-07-14 Gemini CLI: Log shadow trade summary for legacy path exit
+            self._log_shadow_trade_summary(exit_price, exit_reason, _pnl_pts, now, bar, near_close, far_close)
             return Signal("EXIT", f"TMF_{exit_reason}_{self._side}", confidence=0.5, stop_loss=0)
 
         _write_mts_state(
@@ -2230,7 +3288,7 @@ class TMFSpread(StrategyBase):
             _pnl_pts = (exit_price - _rem_entry) if _rem_side == "LONG" else (_rem_entry - exit_price)
             _mult = float(get_point_value(_ticker))
             _turnover = (_rem_entry + exit_price) * _mult
-            _cost = 20.0 + _turnover * 2e-5
+            _cost = 40.0 + _turnover * 2e-5
             _realized = _pnl_pts * _mult - _cost
             
             # MFE/MAE calculations
@@ -2285,7 +3343,13 @@ class TMFSpread(StrategyBase):
             self._lifecycle_oca.release_group.status = ReleaseGroupStatus.INACTIVE
             if _was_trailing:
                 self._lifecycle_oca.trail_group.status = TrailGroupStatus.FILLED
-        _write_mts_state(has_position=False, action="CLOSE", reason=reason or "trail_exit", ticker=_ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca) if hasattr(self, '_lifecycle_oca') else {})
+        # 2026-07-08 Hermes Agent: pass trail exit realized PnL so cumulative tracking
+        # can combine with the previously-released leg's realized from state file.
+        _trail_exit_realized = _realized if (exit_price is not None and self._released_leg is not None) else 0.0
+        _write_mts_state(has_position=False, action="CLOSE", reason=reason or "trail_exit",
+                         ticker=_ticker,
+                         lifecycle=lifecycle_to_dict(self._lifecycle_oca) if hasattr(self, '_lifecycle_oca') else {},
+                         trail_exit_realized=_trail_exit_realized)
         self._last_exit_ts = exit_ts or datetime.now()  # 2026-06-25 Gemini CLI: Support passing historical exit timestamp
         self._entry_ts = None
         self._near_entry = 0.0
