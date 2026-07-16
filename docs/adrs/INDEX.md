@@ -74,6 +74,35 @@ All ADRs share a sequential numeric namespace. Numbers are permanent identifiers
 
 ---
 
+## System Map
+
+```
+           Governance
+            ADR-016
+                ▲
+                │
+           Theory
+           ADR-015
+                ▲
+                │
+Architecture ───────────────
+ADR-009  ADR-010  ADR-011
+                │
+                ▼
+     Implementation ADRs
+  ADR-005  ADR-006  ADR-007
+  ADR-012  ADR-013  ADR-014
+```
+
+### Reading order
+
+1. **ADR-015** — understand the strategy philosophy (Statistical Arbitrage)
+2. **ADR-016** — understand the evidence standard for change
+3. **ADR-009 → ADR-010 → ADR-011** — understand how the system executes
+4. **Other ADRs** — individual features and decisions
+
+---
+
 ## By Layer
 
 ### Framework (stable methodology documents)
