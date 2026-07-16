@@ -122,7 +122,7 @@ class TestReleaseInvariantSqzBb:
                     result = s.on_bar(ctx)
 
         # Must not be blocked by BB — release should proceed
-        skip = getattr(s, "_eval_skip_reason", "") or ""
+        skip = getattr(getattr(s, "last_eval", None), "skip_reason", "") or ""
         assert "BB" not in skip.upper(), \
             f"Release blocked by BB despite ADR-014: {skip}"
 
@@ -147,7 +147,7 @@ class TestReleaseInvariantSqzBb:
                     result = s.on_bar(ctx)
 
         # Must NOT be blocked by BB_FILTER_WAITING
-        skip = getattr(s, "_eval_skip_reason", "") or ""
+        skip = getattr(getattr(s, "last_eval", None), "skip_reason", "") or ""
         assert "BB" not in skip.upper(), \
             f"BB filter blocked release despite ADR-014. Skip: {skip}"
 
@@ -168,7 +168,7 @@ class TestReleaseInvariantSqzBb:
                     s.on_bar(ctx)
 
         # First tick: should be pending (confirmation not met)
-        skip = getattr(s, "_last_skip_reason", "") or ""
+        skip = getattr(getattr(s, "last_eval", None), "skip_reason", "") or ""
         assert "PENDING" in skip.upper(), \
             f"Expected PENDING (confirmation not met), got: {skip}"
         assert "BB" not in skip.upper(), \
@@ -210,8 +210,8 @@ class TestReleaseInvariantSqzBb:
                 with patch("strategies.plugins.futures.active.tmf_spread._append_fill"):
                     s_high.on_bar(ctx_high)
 
-        skip_low = getattr(s_low, "_eval_skip_reason", "") or ""
-        skip_high = getattr(s_high, "_eval_skip_reason", "") or ""
+        skip_low = getattr(getattr(s_low, "last_eval", None), "skip_reason", "") or ""
+        skip_high = getattr(getattr(s_high, "last_eval", None), "skip_reason", "") or ""
 
         # Neither should be blocked by BB
         assert "BB" not in skip_low.upper(), f"Low pnl blocked by BB: {skip_low}"
