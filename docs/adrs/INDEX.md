@@ -96,10 +96,18 @@ ADR-009  ADR-010  ADR-011
 
 ### Reading order
 
-1. **ADR-015** — understand the strategy philosophy (Statistical Arbitrage)
-2. **ADR-016** — understand the evidence standard for change
-3. **ADR-009 → ADR-010 → ADR-011** — understand how the system executes
-4. **Other ADRs** — individual features and decisions
+#### For developers (recommended)
+1. **INDEX** — overview of what exists
+2. **ADR-009 → ADR-010 → ADR-011** — understand how the system executes (lifecycle, OCO, state)
+3. **ADR-015** — understand why the strategy is designed this way (Statistical Arbitrage)
+4. **ADR-016** — understand what evidence qualifies a change
+5. **Individual implementation ADRs** — specific features and decisions
+
+#### For strategy researchers
+1. **ADR-015** — theoretical framework
+2. **ADR-016** — evidence standard
+3. **Relevant implementation ADRs** — specific feature context
+4. **`docs/research/`** — past experiments and negative results
 
 ---
 
