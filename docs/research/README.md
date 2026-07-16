@@ -31,11 +31,14 @@ Accepted  ────→ Superseded (when replaced by better evidence)
 Rejected
 ```
 
-Research is organized into numbered entries (`R-001`, `R-002`, ...) in three directories:
+A rejected hypothesis is a successful research outcome. Negative results are permanent
+assets — they prevent re-proposal and build institutional knowledge. (See ADR-016.)
 
-- **`in-progress/`** — active research with data collection underway
-- **`accepted/`** — hypothesis supported by sufficient evidence
-- **`rejected/`** — hypothesis not supported; negative results preserved
+Research is organized into numbered entries (R-001, R-002, ...) in three directories:
+
+- in-progress/ — active research with data collection underway
+- accepted/ — hypothesis supported by sufficient evidence
+- rejected/ — hypothesis not supported; negative results preserved
 
 ## Relationship to ADRs
 
