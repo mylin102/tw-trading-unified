@@ -698,7 +698,9 @@ def filter_today(df, ts_col="timestamp"):
 
 # ── Chart builder (unified style) ──
 def _clean_list(series, force_str=False):
-    """2026-06-30 Gemini CLI: Helper to convert Series/Array to list replacing NaN/NaT/inf with None/null for valid JSON"""
+    """2026-07-16 Gemini CLI: Optimized to convert Series/Array to list of standard Python types
+    replacing NaN/NaT/inf with None/null. This prevents Plotly's custom Python-based encoder
+    from running slow checks on numpy types, resolving the CPU 100% / heating issue."""
     import pandas as pd
     import numpy as np
     if series is None:
@@ -708,14 +710,18 @@ def _clean_list(series, force_str=False):
     # Check if it is a datetime series
     if hasattr(series, "dtype") and (pd.api.types.is_datetime64_any_dtype(series) or isinstance(series.dtype, pd.DatetimeTZDtype)):
         return [str(x) if pd.notna(x) else None for x in series]
-    # For numeric/other series, replace nan/inf with None
-    clean = []
-    for x in series:
-        if pd.notna(x) and not (isinstance(x, (float, np.floating)) and (np.isnan(x) or np.isinf(x))):
-            clean.append(x)
-        else:
-            clean.append(None)
-    return clean
+    
+    if isinstance(series, pd.Series):
+        arr = series.to_numpy()
+    else:
+        arr = np.asarray(series)
+        
+    if np.issubdtype(arr.dtype, np.number):
+        # Optimized vectorized check for numeric arrays
+        mask = np.isnan(arr) | np.isinf(arr)
+        return [None if is_bad else float(val) for val, is_bad in zip(arr, mask)]
+    else:
+        return [x if pd.notna(x) else None for x in arr]
 
 def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=None):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
@@ -885,6 +891,8 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     from plotly.subplots import make_subplots
     import pandas as _pd
 
+    # 2026-07-16 Gemini CLI: Print DataFrame lengths for debugging CPU issue
+    print(f"[DEBUG_CHART] near_df raw_size={len(near_df)}, far_df raw_size={len(far_df) if far_df is not None else 0}")
     # 2026-06-30 Hermes Agent: Data cleaning — sort, dedupe, coerce, dropna
     try:
         if "timestamp" not in near_df.columns:
@@ -2776,7 +2784,7 @@ if page == "總覽":
                 
                 ov_data.append({
                     "代號": ticker,
-                    "名稱": _STOCK_NAMES.get(ticker) or last.get("name", ticker),
+                    "名稱": _STOCK_NAMES.get(str(ticker)) or str(last.get("name", ticker)),
                     "股價": last.get('close', last.get('Close', 0)),
                     "量": volume_display,
                     "Score": round(last.get('score', 0), 1),
@@ -2835,6 +2843,15 @@ elif page == f"期貨 {_TICKER}":
     )  # 期貨頁先走 fast path（參數資料夠用）
     print(f"[PERF] load_futures_indicators: {time.time()-_pt_start:.3f}s")
     _pt_data = time.time()
+
+    # [V-Model] MTS mode badge — defined outside if f_df block so it's always available
+    try:
+        with open(FUTURES_CFG_PATH) as _f:
+            _futures_cfg = yaml.safe_load(_f)
+        _mts_enabled = _futures_cfg.get("mts", {}).get("enabled", False) if _futures_cfg else False
+    except Exception:
+        _mts_enabled = False
+
     if f_df is not None and not f_df.empty:
         last = f_df.iloc[-1]
         last_ts = pd.to_datetime(last.get("timestamp"))
@@ -2852,23 +2869,21 @@ elif page == f"期貨 {_TICKER}":
         # 資料新鮮度閾值：日盤 15 分鐘、夜盤 15 分鐘
         stale_threshold = 15.0
         data_fresh = age_mins < stale_threshold
+        _last_date = last_ts.strftime("%Y%m%d") if pd.notna(last_ts) else None
+        _same_trading_day = _last_date == _today
 
-        if not data_fresh:
+        if not data_fresh and _same_trading_day:
             last_ts_str = last_ts.strftime("%H:%M") if pd.notna(last_ts) else "?"
             st.warning(
                 f"⚠️ 資料停滯: 最後一筆 {last_ts_str} ({age_mins:.0f}分鐘前) "
                 f"| 目前 {session_label}"
             )
+        elif not data_fresh and pd.notna(last_ts):
+            st.caption(f"📄 上次資料: {last_ts.strftime('%m/%d %H:%M')} ({age_mins:.0f}分鐘前) · 非交易時段")
         elif pd.notna(last_ts):
             st.caption(f"🟢 即時 · {last_ts.strftime('%m/%d %H:%M')} · {session_label}")
 
         # [V-Model] MTS mode badge
-        try:
-            with open(FUTURES_CFG_PATH) as _f:
-                _futures_cfg = yaml.safe_load(_f)
-            _mts_enabled = _futures_cfg.get("mts", {}).get("enabled", False) if _futures_cfg else False
-        except Exception:
-            _mts_enabled = False
         if _mts_enabled:
             mts_col1, mts_col2, mts_col3 = st.columns([3, 1, 1])
             with mts_col1:
@@ -3491,6 +3506,42 @@ elif page == f"期貨 {_TICKER}":
                 _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
 
                 st.caption(f'最後更新: {_mts_state.get("_updated", "?")}')
+
+                # ── MTS 個別委託 (from mts_trade_fills.jsonl) ──
+                try:
+                    _fills_path = os.path.join(BASE, "logs/mts_trade_fills.jsonl")
+                    _trade_id = _mts_state.get("trade_id", "")
+                    if _trade_id and os.path.exists(_fills_path):
+                        _order_rows = []
+                        with open(_fills_path) as _of:
+                            for _line in _of:
+                                try:
+                                    _fill = json.loads(_line.strip())
+                                    if _fill.get("trade_id") == _trade_id:
+                                        _ft = _fill.get("fill_type", "")
+                                        _side_raw = _fill.get("side", "")
+                                        if _ft == "RELEASE":
+                                            _dir = "買回" if _side_raw == "BUY" else "賣回"
+                                        elif _side_raw in ("SHORT", "SELL"):
+                                            _dir = "賣"
+                                        elif _side_raw in ("LONG", "BUY"):
+                                            _dir = "買"
+                                        else:
+                                            _dir = _side_raw
+                                        _order_rows.append({
+                                            "腿": _fill.get("leg", "?"),
+                                            "商品": f'{_fill.get("ticker", "?")}{_fill.get("contract", "")}',
+                                            "方向": _dir,
+                                            "價格": _fill.get("price", 0),
+                                            "類型": _ft,
+                                            "時間": str(_fill.get("timestamp", ""))[:19],
+                                        })
+                                except: pass
+                        if _order_rows:
+                            st.markdown("**📋 MTS 委託明細**")
+                            st.dataframe(pd.DataFrame(_order_rows), width='stretch', hide_index=True)
+                except Exception:
+                    pass
             else:
                 # ── FLAT / IDLE state: show mts_spread_z (bar-agnostic) and gate status ──
                 _z = _mts_state.get("mts_spread_z") or _mts_state.get("spread_z")
@@ -3508,6 +3559,15 @@ elif page == f"期貨 {_TICKER}":
                     f"原因: {_reason}"
                     f"{_params_info}"
                 )
+                # 2026-07-15 Gemini CLI: Render MTS Unrealized PnL block showing 0 TWD when in FLAT state
+                st.markdown("**MTS 未實現損益 (Unrealized PnL)**")
+                _u1, _u2, _u3 = st.columns(3)
+                _nr = _mts_state.get("near_upl", 0.0) or 0.0
+                _fr = _mts_state.get("far_upl", 0.0) or 0.0
+                _tr = _mts_state.get("total_upl", 0.0) or 0.0
+                _u1.metric("近月 UPL", f"{_nr:+,.0f} TWD")
+                _u2.metric("遠月 UPL", f"{_fr:+,.0f} TWD")
+                _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
         except Exception:
             pass
         print(f"[PERF] mts_state_section: {time.time()-_pt_data:.3f}s")
@@ -4071,8 +4131,16 @@ elif page == f"期貨 {_TICKER}":
         print(f"[PERF] before_charts: {time.time()-_pt_data:.3f}s")
 
         # ── Futures Dual Contract Chart (移至頁面最下方) ──
+        # 2026-07-16 Gemini CLI: Detailed profiling of chart steps to trace 100-second latency
+        t_chart_start = time.time()
         ft, _ = load_futures_trades()
+        print(f"[PERF_CHART] load_futures_trades took {time.time()-t_chart_start:.3f}s")
+        
+        t_far_start = time.time()
         df_far = load_far_month_data(_ov_ticker)
+        print(f"[PERF_CHART] load_far_month_data took {time.time()-t_far_start:.3f}s")
+        
+        t_build_start = time.time()
         try:
             if df_far is not None and not df_far.empty:
                 _fig = make_futures_dual_chart(
@@ -4083,7 +4151,11 @@ elif page == f"期貨 {_TICKER}":
                 )
             else:
                 _fig = make_price_score_chart(f_df, "close", f"{_ov_ticker} 價格 & Score", signals=ft)
+            print(f"[PERF_CHART] build_chart took {time.time()-t_build_start:.3f}s")
+            
+            t_st_start = time.time()
             st.plotly_chart(_fig, use_container_width=True)
+            print(f"[PERF_CHART] st.plotly_chart took {time.time()-t_st_start:.3f}s")
         except Exception as _ce:
             import logging as _logging
             _logging.getLogger().exception("Dual chart failed, falling back to near-only")
