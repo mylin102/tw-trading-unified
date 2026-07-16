@@ -55,10 +55,10 @@ Bias: caution over speed on non-trivial work. Use judgment on trivial tasks.
 To prevent "Context Collapse" and ensure deterministic reasoning, **the Agent MUST read the following files at the start of every session:**
 1.  `AGENTS.md`: Behavioral constraints and cognitive constitution.
 2.  `BOUNDED_CONTEXTS.md`: Ownership boundaries and service layout.
-3.  `docs/decisions/`: Architectural Decision Records (Persistent Memory).
+3.  `docs/adrs/`: Architecture Decision Records (Persistent Memory).
 4.  `RULES.md`: Core trading and safety rules.
 
-**SSOT**: All Architectural Decision Records live in `docs/decisions/`. Do not create a separate `ADR/` directory — `docs/decisions/` is the canonical location.
+**SSOT**: All Architectural Decision Records live in `docs/adrs/`. `docs/adrs/` is the canonical location.
 
 **Failure to read these files is a violation of the system's "Digital Constitution".**
 
