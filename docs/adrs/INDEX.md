@@ -107,7 +107,15 @@ ADR-009  ADR-010  ADR-011
 1. **ADR-015** — theoretical framework
 2. **ADR-016** — evidence standard
 3. **Relevant implementation ADRs** — specific feature context
-4. **`docs/research/`** — past experiments and negative results
+4. **`docs/research/`** — past experiments, negative results, and active research
+
+---
+
+## Related Knowledge
+
+- **`docs/adrs/`** — Architecture Decision Records (stable design decisions)
+- **`docs/research/`** — Research entries (provisional evidence, hypothesis testing)
+- **`docs/plans/`** — Implementation plans and design proposals
 
 ---
 
