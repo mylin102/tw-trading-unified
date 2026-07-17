@@ -273,15 +273,113 @@ def test_export_experiment(tmp_path):
             registry_data = json.load(f)
             assert len(registry_data) == 1
             entry = registry_data[0]
-            assert entry["experiment_id"] == exp_dir.name
             assert entry["experiment_hash"] == result.provenance.experiment_hash
             assert entry["parameter_name"] == "release_stop_threshold"
+            assert entry["run_count"] == 1
+            assert len(entry["runs"]) == 1
+            assert entry["runs"][0]["experiment_id"] == exp_dir.name
             
         # Verify sensitivity ranking aggregation
         ranking = service.get_sensitivity_ranking()
         assert len(ranking) == 1
         assert ranking[0]["parameter_name"] == "release_stop_threshold"
-        assert ranking[0]["experiment_id"] == exp_dir.name
+        assert ranking[0]["experiment_hash"] == result.provenance.experiment_hash[:12]
+
+        # Verify registry validation works and returns VERIFIED
+        val_status = service.validate_experiment_registry()
+        assert val_status["status"] == "VERIFIED"
+        assert result.provenance.experiment_hash in val_status["experiments"]
+        assert val_status["experiments"][result.provenance.experiment_hash]["runs"][0]["status"] == "VERIFIED"
+
+        # Verify registry rebuilding works
+        registry_file.unlink()
+        assert not registry_file.exists()
+        service.rebuild_experiment_registry()
+        assert registry_file.exists()
+        with open(registry_file) as f:
+            registry_data = json.load(f)
+            assert len(registry_data) == 1
+            assert registry_data[0]["experiment_hash"] == result.provenance.experiment_hash
+
+        # Verify inspector rejects corrupted files
+        result_json_file = exp_dir / "result.json"
+        with open(result_json_file, "w") as f:
+            f.write('{"corrupted": true}')
+        val_status = service.validate_experiment_registry()
+        assert val_status["status"] == "UNVERIFIED"
+        assert val_status["experiments"][result.provenance.experiment_hash]["runs"][0]["status"] == "CORRUPTED"
+            
+    finally:
+        os.chdir(orig_cwd)
+
+def test_canonical_experiment_payload_determinism():
+    """Verify that different parameter sorting or types yield identical experiment hashes."""
+    from core.counterfactual_service import CounterfactualService
+    payload_a = CounterfactualService.canonical_experiment_payload(
+        baseline_id="baseline-v1",
+        dataset_content_hash="abc",
+        git_commit="git-1",
+        dirty_diff_hash="diff-1",
+        replay_config_dict={"release_stop_threshold": 14.0, "confirm_ms": 200},
+        parameter_name="release_stop_threshold",
+        parameter_values=[20.0, 10.0, 30.0],
+        methodology_version="v1.0"
+    )
+    
+    # Payload B with different key sorting and values ordering
+    payload_b = CounterfactualService.canonical_experiment_payload(
+        baseline_id="baseline-v1",
+        dataset_content_hash="abc",
+        git_commit="git-1",
+        dirty_diff_hash="diff-1",
+        replay_config_dict={"confirm_ms": 200, "release_stop_threshold": 14.0},
+        parameter_name="release_stop_threshold",
+        parameter_values=[10.0, 30.0, 20.0],
+        methodology_version="v1.0"
+    )
+    
+    assert payload_a == payload_b
+    
+    import hashlib
+    hash_a = hashlib.sha256(payload_a).hexdigest()
+    hash_b = hashlib.sha256(payload_b).hexdigest()
+    assert hash_a == hash_b
+
+def test_local_sensitivity_calculation(tmp_path):
+    """Verify that local sensitivity correctly measures drift inside baseline +/- 10%."""
+    from core.counterfactual_service import SweepParameter, SweepRequest
+    orig_cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        fixture_mock = Path("tests/fixtures/research_baseline_v1")
+        fixture_mock.mkdir(parents=True, exist_ok=True)
+        import shutil
+        for f in (Path(orig_cwd) / FIXTURE_PATH).glob("*"):
+            shutil.copy(f, fixture_mock / f.name)
+            
+        service = CounterfactualService(data_path=fixture_mock)
+        
+        # Baseline stop threshold: 130.0
+        # Sweep values: 1000.0 (wide drift), 140.0 (local +/- 10%, should drift slightly or not), 130.0 (baseline)
+        req = SweepRequest(
+            parameters=(SweepParameter(name="release_stop_threshold", values=(1000.0, 140.0, 130.0)),),
+            baseline_config=ReplayConfig(release_stop_threshold=130.0),
+            dataset_generation_id="test-gen",
+            eligibility_policy_version="v1.0"
+        )
+        result = service.run_parameter_sweep(req)
+        exp_dir = service.export_experiment(result)
+        
+        registry_file = Path("reports/research/counterfactual/registry.json")
+        with open(registry_file) as f:
+            registry_data = json.load(f)
+            entry = registry_data[0]
+            # Baseline is 130.0, +/- 10% is [117, 143].
+            # 1000.0 is outside local range.
+            # 140.0 is inside.
+            # Ensure local_sensitivity tracks drift rate of 140.0, which is likely 0 or very small,
+            # whereas max_drift_rate tracks 1000.0 (which is large).
+            assert entry["max_drift_rate"] >= entry["local_sensitivity"]
             
     finally:
         os.chdir(orig_cwd)

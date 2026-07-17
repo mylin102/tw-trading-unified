@@ -6022,9 +6022,24 @@ elif page == "🔄 反事實研究室":
         ranking = service.get_sensitivity_ranking()
         if ranking:
             ranking_df = pd.DataFrame(ranking)
-            ranking_df.columns = ["參數名稱", "最大決策分歧率 (Max Drift)", "敏感個案數 (Sensitive Cases)", "實驗 ID", "評估時間"]
-            ranking_df["最大決策分歧率 (Max Drift)"] = ranking_df["最大決策分歧率 (Max Drift)"].map(lambda x: f"{x:.1%}")
-            st.dataframe(ranking_df, width='stretch', hide_index=True)
+            # Rename columns
+            ranking_df = ranking_df.rename(columns={
+                "parameter_name": "參數名稱",
+                "max_drift_rate": "最大分歧率 (Global Max Drift)",
+                "local_sensitivity": "基準敏感度 (Local Baseline Sensitivity)",
+                "sensitive_cases_count": "敏感個案數",
+                "experiment_hash": "Experiment Hash",
+                "last_evaluated": "評估時間",
+                "baseline_value": "基準值",
+                "sweep_range": "掃描範圍"
+            })
+            if "最大分歧率 (Global Max Drift)" in ranking_df.columns:
+                ranking_df["最大分歧率 (Global Max Drift)"] = ranking_df["最大分歧率 (Global Max Drift)"].map(lambda x: f"{x:.1%}")
+            if "基準敏感度 (Local Baseline Sensitivity)" in ranking_df.columns:
+                ranking_df["基準敏感度 (Local Baseline Sensitivity)"] = ranking_df["基準敏感度 (Local Baseline Sensitivity)"].map(lambda x: f"{x:.1%}")
+            st.dataframe(ranking_df[[
+                "參數名稱", "基準值", "掃描範圍", "基準敏感度 (Local Baseline Sensitivity)", "最大分歧率 (Global Max Drift)", "敏感個案數", "Experiment Hash", "評估時間"
+            ]], width='stretch', hide_index=True)
         else:
             st.info("尚無完成的掃描實驗。請在下方設定參數並點擊『運行參數掃描』來生成數據。")
 
@@ -6212,87 +6227,137 @@ elif page == "🔄 反事實研究室":
                 pass
                 
         if registry:
+            # 1. Display Validation Status of the entire registry
+            validation_res = service.validate_experiment_registry()
+            status_color = "green" if validation_res["status"] == "VERIFIED" else "red"
+            st.markdown(f"**Registry Integrity Status:** :{status_color}[{validation_res['status']}]")
+
             reg_df = pd.DataFrame(registry)
-            display_cols = {
-                "experiment_id": "實驗 ID (ID)",
-                "parameter_name": "掃描參數",
-                "max_drift_rate": "最大分歧率",
-                "sensitive_cases_count": "敏感個案",
+            # Format display dataframe
+            display_df = reg_df.rename(columns={
                 "experiment_hash": "Experiment Hash",
-                "generated_at": "生成時間"
-            }
-            existing_cols = {k: v for k, v in display_cols.items() if k in reg_df.columns}
-            display_df = reg_df[list(existing_cols.keys())].rename(columns=existing_cols)
-            if "最大分歧率" in display_df.columns:
-                display_df["最大分歧率"] = display_df["最大分歧率"].map(lambda x: f"{x:.1%}")
-            st.dataframe(display_df, width='stretch', hide_index=True)
+                "parameter_name": "掃描參數",
+                "baseline_value": "基準值",
+                "local_sensitivity": "基準敏感度 (Local)",
+                "max_drift_rate": "最大分歧率 (Global)",
+                "sensitive_cases_count": "敏感個案",
+                "run_count": "執行次數",
+                "last_run_at": "最後執行時間"
+            })
+            if "基準敏感度 (Local)" in display_df.columns:
+                display_df["基準敏感度 (Local)"] = display_df["基準敏感度 (Local)"].map(lambda x: f"{x:.1%}")
+            if "最大分歧率 (Global)" in display_df.columns:
+                display_df["最大分歧率 (Global)"] = display_df["最大分歧率 (Global)"].map(lambda x: f"{x:.1%}")
             
-            selected_exp = st.selectbox(
-                "選擇要載入的歷史實驗 (Select Experiment to Inspect)",
-                options=[e["experiment_id"] for e in registry],
-                key="inspect_exp_id"
+            st.dataframe(display_df[[
+                "Experiment Hash", "掃描參數", "基準值", "基準敏感度 (Local)", "最大分歧率 (Global)", "敏感個案", "執行次數", "最後執行時間"
+            ]], width='stretch', hide_index=True)
+            
+            # Select Experiment Hash
+            selected_exp_hash = st.selectbox(
+                "選擇歷史實驗設計 (Select Experiment Hash)",
+                options=[e["experiment_hash"] for e in registry],
+                format_func=lambda x: f"{x[:12]}... (掃描參數: {next(e for e in registry if e['experiment_hash'] == x)['parameter_name']})"
             )
             
+            exp_entry = next(e for e in registry if e["experiment_hash"] == selected_exp_hash)
+            
+            # Select specific Run ID for that experiment design
+            selected_run_id = st.selectbox(
+                "選擇執行版本 (Select Run Version)",
+                options=[r["experiment_id"] for r in exp_entry["runs"]],
+                format_func=lambda x: f"{x} (執行時間: {next(r for r in exp_entry['runs'] if r['experiment_id'] == x)['generated_at']})"
+            )
+            
+            run_entry = next(r for r in exp_entry["runs"] if r["experiment_id"] == selected_run_id)
+            
             if st.button("📂 載入實驗報告 (Inspect Report)"):
-                exp_entry = next(e for e in registry if e["experiment_id"] == selected_exp)
-                result_file = Path(exp_entry["report_path"]) / "result.json"
-                if result_file.exists():
+                report_path = Path(run_entry["report_path"])
+                result_file = report_path / "result.json"
+                
+                # Verify path traversal safety
+                abs_report_path = report_path.resolve()
+                abs_base = Path("reports/research/counterfactual").resolve()
+                
+                if not abs_report_path.is_relative_to(abs_base):
+                    st.error("❌ **路徑安全性警告:** 嘗試載入的實驗路徑不在授權範圍內。")
+                elif not result_file.exists():
+                    st.error(f"❌ **找不到實驗檔案:** {result_file}")
+                else:
                     try:
-                        import json
-                        with open(result_file, "r") as f:
-                            raw_res = json.load(f)
+                        # Verify SHA256 integrity
+                        import hashlib
+                        with open(result_file, "rb") as f:
+                            current_hash = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+                        
+                        expected_hash = run_entry.get("result_hash")
+                        if current_hash != expected_hash:
+                            st.error(f"🚨 **實驗檔案毀損或經篡改 (CORRUPTED):** `result.json` 哈希值與註冊表不吻合！")
+                            st.warning(f"預期哈希: `{expected_hash}` \n\n實際哈希: `{current_hash}`")
+                        else:
+                            st.success(f"✓ **實驗檔案驗證成功 (VERIFIED)**")
                             
-                        st.markdown(f"### 📄 實驗報告: `{selected_exp}`")
-                        st.markdown(f"* **Experiment Hash:** `{raw_res['provenance']['experiment_hash']}`")
-                        st.markdown(f"* **Dataset ID:** `{raw_res['provenance']['dataset_build_id']}`")
-                        st.markdown(f"* **Git Commit:** `{raw_res['provenance']['git_commit']}`")
-                        st.markdown(f"* **Generated At:** `{raw_res['provenance']['generated_time']}`")
-                        
-                        import plotly.graph_objects as go
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(
-                            x=[row["parameter_value"] for row in raw_res["metrics_rows"]],
-                            y=[row["historical_action_match_rate"] for row in raw_res["metrics_rows"]],
-                            mode="lines+markers",
-                            name="歷史決策匹配率 (Historical Match)",
-                            line=dict(color="#2ca02c", width=2)
-                        ))
-                        fig.add_trace(go.Scatter(
-                            x=[row["parameter_value"] for row in raw_res["metrics_rows"]],
-                            y=[row["baseline_action_drift_rate"] for row in raw_res["metrics_rows"]],
-                            mode="lines+markers",
-                            name="基線決策分歧率 (Baseline Drift)",
-                            line=dict(color="#d62728", width=2)
-                        ))
-                        fig.update_layout(
-                            xaxis_title=f"參數值",
-                            yaxis_title="比率",
-                            yaxis=dict(tickformat=".0%"),
-                            height=350,
-                            margin=dict(t=40, b=40, l=60, r=20),
-                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                        
-                        st.markdown("#### 📋 掃描匯總指標")
-                        metrics_list = []
-                        for row in raw_res["metrics_rows"]:
-                            metrics_list.append({
-                                "參數值": row["parameter_value"],
-                                "測試樣本": row["eligible_cases"],
-                                "歷史 Action 匹配": f"{row['historical_action_match_rate']:.1%}",
-                                "歷史 Leg 匹配": f"{row['historical_leg_match_rate']:.1%}",
-                                "基線 Action 分歧": f"{row['baseline_action_drift_rate']:.1%}",
-                                "分歧個案數 (Drift)": row["decision_drift_count"],
-                                "無影響個案數 (Stable)": row["unchanged_count"],
-                            })
-                        st.dataframe(pd.DataFrame(metrics_list), width='stretch', hide_index=True)
+                            with open(result_file, "r") as f:
+                                raw_res = json.load(f)
+                                
+                            st.markdown(f"### 📄 實驗報告: `{selected_run_id}`")
+                            st.markdown(f"* **Experiment Hash:** `{raw_res['provenance']['experiment_hash']}`")
+                            st.markdown(f"* **Dataset ID:** `{raw_res['provenance']['dataset_build_id']}`")
+                            st.markdown(f"* **Git Commit:** `{raw_res['provenance']['git_commit']}`")
+                            st.markdown(f"* **Generated At:** `{raw_res['provenance']['generated_time']}`")
+                            
+                            import plotly.graph_objects as go
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=[row["parameter_value"] for row in raw_res["metrics_rows"]],
+                                y=[row["historical_action_match_rate"] for row in raw_res["metrics_rows"]],
+                                mode="lines+markers",
+                                name="歷史決策匹配率 (Historical Match)",
+                                line=dict(color="#2ca02c", width=2)
+                            ))
+                            fig.add_trace(go.Scatter(
+                                x=[row["parameter_value"] for row in raw_res["metrics_rows"]],
+                                y=[row["baseline_action_drift_rate"] for row in raw_res["metrics_rows"]],
+                                mode="lines+markers",
+                                name="基線決策分歧率 (Baseline Drift)",
+                                line=dict(color="#d62728", width=2)
+                            ))
+                            fig.update_layout(
+                                xaxis_title=f"參數值",
+                                yaxis_title="比率",
+                                yaxis=dict(tickformat=".0%"),
+                                height=350,
+                                margin=dict(t=40, b=40, l=60, r=20),
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                            
+                            st.markdown("#### 📋 掃描匯總指標")
+                            metrics_list = []
+                            for row in raw_res["metrics_rows"]:
+                                metrics_list.append({
+                                    "參數值": row["parameter_value"],
+                                    "測試樣本": row["eligible_cases"],
+                                    "歷史 Action 匹配": f"{row['historical_action_match_rate']:.1%}",
+                                    "歷史 Leg 匹配": f"{row['historical_leg_match_rate']:.1%}",
+                                    "基線 Action 分歧": f"{row['baseline_action_drift_rate']:.1%}",
+                                    "分歧個案數 (Drift)": row["decision_drift_count"],
+                                    "無影響個案數 (Stable)": row["unchanged_count"],
+                                })
+                            st.dataframe(pd.DataFrame(metrics_list), width='stretch', hide_index=True)
                     except Exception as ex:
                         st.error(f"無法解析實驗資料: {ex}")
-                else:
-                    st.error(f"找不到實驗檔案: {result_file}")
+            
+            # Rebuild Registry Trigger
+            if st.button("🔄 重建實驗註冊表索引 (Rebuild Registry Index)"):
+                with st.spinner("正在掃描歷史存檔並重建索引..."):
+                    try:
+                        service.rebuild_experiment_registry()
+                        st.success("🎉 註冊表重建成功！請重新載入頁面。")
+                    except Exception as ex:
+                        st.error(f"重建失敗: {ex}")
         else:
-            st.info("歷史實驗庫為空。請先執行上方掃描並點擊『導出敏感度分析報告與數據』。")
+            st.info("歷史實驗庫為空。")
 
 # -- Footer and Refresh --
     # 2026-06-23 Gemini CLI: 移除伺服器端 time.sleep(5) 與 st.rerun() 的無條件循環，完全由 line 219 的瀏覽器端 st_autorefresh 每 10 秒觸發，使伺服器執行緒能正常結束並釋放 CPU 資源，解決 CPU 99% 與高溫 99°C 的問題

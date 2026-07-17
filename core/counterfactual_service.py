@@ -125,6 +125,7 @@ class ParameterSweepResult:
     metrics_rows: list[SweepMetrics]
     case_matrix: list[CaseSweepRow]
     provenance: "ProvenanceBundle"
+    baseline_value: float = 0.0
 
 class MismatchDetail:
     """Detailed info for a mismatched decision case."""
@@ -172,6 +173,61 @@ class CounterfactualService:
 
     def __init__(self, data_path: Optional[Path] = None):
         self._data_path = data_path
+
+    @staticmethod
+    def get_dirty_diff_hash() -> str:
+        """Computes the SHA256 of the git diff to capture uncommitted changes."""
+        try:
+            diff_bytes = subprocess.check_output(
+                ["git", "diff"], stderr=subprocess.DEVNULL
+            )
+            if not diff_bytes:
+                return "clean"
+            import hashlib
+            return hashlib.sha256(diff_bytes).hexdigest()
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def canonical_experiment_payload(
+        baseline_id: str,
+        dataset_content_hash: str,
+        git_commit: str,
+        dirty_diff_hash: str,
+        replay_config_dict: dict,
+        parameter_name: str,
+        parameter_values: list,
+        methodology_version: str
+    ) -> bytes:
+        """Returns standard serialized UTF-8 bytes for the experiment input parameters."""
+        normalized_values = []
+        for v in parameter_values:
+            if isinstance(v, float):
+                normalized_values.append(round(v, 6))
+            else:
+                normalized_values.append(v)
+        normalized_values = sorted(list(set(normalized_values)))
+
+        normalized_config = {}
+        for k, v in sorted(replay_config_dict.items()):
+            if isinstance(v, float):
+                normalized_config[k] = round(v, 6)
+            elif isinstance(v, Enum):
+                normalized_config[k] = v.value
+            else:
+                normalized_config[k] = v
+
+        payload = {
+            "baseline_id": baseline_id,
+            "dataset_content_hash": dataset_content_hash,
+            "git_commit": git_commit,
+            "dirty_diff_hash": dirty_diff_hash,
+            "replay_config": normalized_config,
+            "parameter_name": parameter_name,
+            "parameter_values": normalized_values,
+            "methodology_version": methodology_version
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def run_point_replay(self, config: Optional[ReplayConfig] = None) -> PointReplayResult:
         """Run point replay on compiled trades using the optional config override.
@@ -454,19 +510,20 @@ class CounterfactualService:
         build_id = manifest.get("dataset_build_id", "UNKNOWN")
         dataset_content_hash = manifest.get("dataset_content_hash", "UNKNOWN")
 
-        # 6. Calculate Experiment Hash
-        import hashlib
-        hash_input = (
-            f"research-baseline-v1.0|"
-            f"{dataset_content_hash}|"
-            f"{git_commit}|"
-            f"release_stop_threshold:{request.baseline_config.release_stop_threshold},"
-            f"confirm_ms:{request.baseline_config.confirm_ms},"
-            f"confirm_ticks:{request.baseline_config.confirm_ticks}|"
-            f"{sweep_param.name}:{tuple(sweep_param.values)}|"
-            f"v1.0.0"
+        # 6. Calculate Experiment Hash (Canonicalized Payload)
+        dirty_diff_hash = self.get_dirty_diff_hash()
+        payload_bytes = self.canonical_experiment_payload(
+            baseline_id="research-baseline-v1.0",
+            dataset_content_hash=dataset_content_hash,
+            git_commit=git_commit,
+            dirty_diff_hash=dirty_diff_hash,
+            replay_config_dict=dataclasses.asdict(request.baseline_config),
+            parameter_name=sweep_param.name,
+            parameter_values=list(sweep_param.values),
+            methodology_version="v1.0.0"
         )
-        experiment_hash = "sha256:" + hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
+        import hashlib
+        experiment_hash = "sha256:" + hashlib.sha256(payload_bytes).hexdigest()
 
         provenance = ProvenanceBundle(
             dataset_contract_version="v1.0.0",
@@ -483,6 +540,7 @@ class CounterfactualService:
             metrics_rows=metrics_rows,
             case_matrix=case_matrix,
             provenance=provenance,
+            baseline_value=float(baseline_val) if baseline_val is not None else 0.0,
         )
 
     def export_experiment(self, result: ParameterSweepResult) -> Path:
@@ -553,51 +611,310 @@ This decision-point sensitivity analysis identifies the stability threshold boun
 
         return exp_dir
 
-    def _append_to_registry(self, result: ParameterSweepResult, exp_dir: Path):
-        """Append metadata entry of the exported experiment to registry.json."""
-        registry_path = Path("reports/research/counterfactual/registry.json")
+    def _write_registry_locked(self, registry_path: Path, registry: list):
+        """Helper to write to registry.json under an exclusive lock, atomically."""
+        import tempfile
+        import os
+        import fcntl
+        
+        lock_path = registry_path.parent / "registry.lock"
         registry_path.parent.mkdir(parents=True, exist_ok=True)
-
-        registry = []
-        if registry_path.exists():
+        
+        with open(lock_path, "w") as lock_f:
             try:
-                with open(registry_path, "r") as f:
-                    registry = json.load(f)
-            except Exception:
-                pass
+                # Exclusive blocking lock to synchronize concurrent writes
+                fcntl.flock(lock_f, fcntl.LOCK_EX)
+                
+                # Write atomically using NamedTemporaryFile
+                with tempfile.NamedTemporaryFile("w", dir=str(registry_path.parent), delete=False) as tf:
+                    json.dump(registry, tf, indent=2)
+                    temp_name = tf.name
+                
+                # Force fsync on temp file directory descriptor to commit writes to disk
+                fd = os.open(temp_name, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                    
+                os.replace(temp_name, registry_path)
+            finally:
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
 
-        # Calculate max drift rate and sensitive cases count
+    def _append_to_registry(self, result: ParameterSweepResult, exp_dir: Path):
+        """Append metadata entry of the exported experiment to registry.json under lock."""
+        registry_path = Path("reports/research/counterfactual/registry.json")
+        
+        # Load existing registry under lock
+        registry = []
+        import fcntl
+        lock_path = registry_path.parent / "registry.lock"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(lock_path, "w") as lock_f:
+            try:
+                fcntl.flock(lock_f, fcntl.LOCK_EX)
+                if registry_path.exists():
+                    try:
+                        with open(registry_path, "r") as f:
+                            registry = json.load(f)
+                    except Exception:
+                        pass
+            finally:
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
+
+        # 1. Compute result hash
+        import hashlib
+        result_file = exp_dir / "result.json"
+        with open(result_file, "rb") as f:
+            res_hash = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+
+        # 2. Calculate metrics
         max_drift_rate = max(row.baseline_action_drift_rate for row in result.metrics_rows) if result.metrics_rows else 0.0
         
+        # Calculate Local Sensitivity (range baseline +/- 10%)
+        baseline_val = result.baseline_value
+        local_min = 0.9 * baseline_val
+        local_max = 1.1 * baseline_val
+        local_drifts = [
+            row.baseline_action_drift_rate
+            for row in result.metrics_rows
+            if local_min <= row.parameter_value <= local_max
+        ]
+        local_sensitivity = max(local_drifts) if local_drifts else 0.0
+
+        # Sensitive cases are those that drifted
         sensitive_cases = set()
         for row in result.case_matrix:
             if row.drift_category != DecisionDriftCategory.NONE:
                 sensitive_cases.add(row.case_id)
         sensitive_cases_count = len(sensitive_cases)
 
-        entry = {
+        exp_hash = result.provenance.experiment_hash
+        generated_at = result.provenance.generated_time
+
+        run_entry = {
             "experiment_id": exp_dir.name,
-            "baseline_id": "research-baseline-v1.0",
-            "parameter_name": result.parameter_name,
-            "parameter_values": [row.parameter_value for row in result.metrics_rows],
-            "dataset_build_id": result.provenance.dataset_build_id,
-            "git_commit": result.provenance.git_commit,
-            "experiment_hash": result.provenance.experiment_hash,
-            "generated_at": result.provenance.generated_time,
-            "report_path": str(exp_dir),
-            "max_drift_rate": max_drift_rate,
-            "sensitive_cases_count": sensitive_cases_count
+            "result_hash": res_hash,
+            "generated_at": generated_at,
+            "report_path": str(exp_dir)
         }
 
-        # Prevent duplicate entries
-        registry = [e for e in registry if e["experiment_id"] != exp_dir.name]
-        registry.append(entry)
+        # 3. Group runs by experiment_hash (Experiment vs Run model)
+        exp_entry = next((e for e in registry if e["experiment_hash"] == exp_hash), None)
+        if exp_entry:
+            # Update existing experiment
+            # Append run, preventing duplicates by experiment_id
+            exp_entry["runs"] = [r for r in exp_entry["runs"] if r["experiment_id"] != exp_dir.name]
+            exp_entry["runs"].append(run_entry)
+            exp_entry["run_count"] = len(exp_entry["runs"])
+            if generated_at < exp_entry["first_run_at"]:
+                exp_entry["first_run_at"] = generated_at
+            if generated_at > exp_entry["last_run_at"]:
+                exp_entry["last_run_at"] = generated_at
+                # Update metrics with the latest run
+                exp_entry["max_drift_rate"] = max_drift_rate
+                exp_entry["local_sensitivity"] = local_sensitivity
+                exp_entry["sensitive_cases_count"] = sensitive_cases_count
+        else:
+            # Create new experiment entry
+            new_entry = {
+                "experiment_hash": exp_hash,
+                "baseline_id": "research-baseline-v1.0",
+                "parameter_name": result.parameter_name,
+                "parameter_values": [row.parameter_value for row in result.metrics_rows],
+                "baseline_value": baseline_val,
+                "dataset_build_id": result.provenance.dataset_build_id,
+                "git_commit": result.provenance.git_commit,
+                "first_run_at": generated_at,
+                "last_run_at": generated_at,
+                "run_count": 1,
+                "max_drift_rate": max_drift_rate,
+                "local_sensitivity": local_sensitivity,
+                "sensitive_cases_count": sensitive_cases_count,
+                "runs": [run_entry]
+            }
+            registry.append(new_entry)
 
-        with open(registry_path, "w") as f:
-            json.dump(registry, f, indent=2)
+        # 4. Write back atomically
+        self._write_registry_locked(registry_path, registry)
+
+    def rebuild_experiment_registry(self) -> Path:
+        """Scan all exp-* directories and rebuild registry.json from scratch."""
+        registry_path = Path("reports/research/counterfactual/registry.json")
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        rebuilt_registry = []
+        exp_dirs = sorted(list(Path("reports/research/counterfactual").glob("exp-*")))
+        for exp_dir in exp_dirs:
+            manifest_file = exp_dir / "manifest.json"
+            result_file = exp_dir / "result.json"
+            if manifest_file.exists() and result_file.exists():
+                try:
+                    with open(manifest_file, "r") as f:
+                        manifest_data = json.load(f)
+                    with open(result_file, "r") as f:
+                        raw_res = json.load(f)
+                        
+                    # Calculate result hash
+                    import hashlib
+                    with open(result_file, "rb") as f:
+                        res_bytes = f.read()
+                        res_hash = "sha256:" + hashlib.sha256(res_bytes).hexdigest()
+                        
+                    param_name = raw_res.get("parameter_name")
+                    baseline_value = raw_res.get("baseline_value", 0.0)
+                    metrics_rows = raw_res.get("metrics_rows", [])
+                    case_matrix = raw_res.get("case_matrix", [])
+                    
+                    max_drift_rate = max(row.get("baseline_action_drift_rate", 0.0) for row in metrics_rows) if metrics_rows else 0.0
+                    
+                    local_min = 0.9 * baseline_value
+                    local_max = 1.1 * baseline_value
+                    local_drifts = [
+                        row.get("baseline_action_drift_rate", 0.0)
+                        for row in metrics_rows
+                        if local_min <= row.get("parameter_value", 0.0) <= local_max
+                    ]
+                    local_sensitivity = max(local_drifts) if local_drifts else 0.0
+                    
+                    sensitive_cases = set()
+                    for row in case_matrix:
+                        if row.get("drift_category") != "NONE":
+                            sensitive_cases.add(row.get("case_id"))
+                    sensitive_cases_count = len(sensitive_cases)
+                    
+                    exp_hash = manifest_data.get("experiment_hash", "UNKNOWN")
+                    baseline_id = manifest_data.get("baseline_id", "UNKNOWN")
+                    dataset_build_id = manifest_data.get("dataset_generation_id", "UNKNOWN")
+                    git_commit = manifest_data.get("git_commit", "UNKNOWN")
+                    generated_at = manifest_data.get("generated_at", "UNKNOWN")
+                    
+                    exp_entry = next((e for e in rebuilt_registry if e["experiment_hash"] == exp_hash), None)
+                    run_entry = {
+                        "experiment_id": exp_dir.name,
+                        "result_hash": res_hash,
+                        "generated_at": generated_at,
+                        "report_path": str(exp_dir)
+                    }
+                    
+                    if exp_entry:
+                        exp_entry["runs"] = [r for r in exp_entry["runs"] if r["experiment_id"] != exp_dir.name]
+                        exp_entry["runs"].append(run_entry)
+                        exp_entry["run_count"] = len(exp_entry["runs"])
+                        if generated_at < exp_entry["first_run_at"]:
+                            exp_entry["first_run_at"] = generated_at
+                        if generated_at > exp_entry["last_run_at"]:
+                            exp_entry["last_run_at"] = generated_at
+                            exp_entry["max_drift_rate"] = max_drift_rate
+                            exp_entry["local_sensitivity"] = local_sensitivity
+                            exp_entry["sensitive_cases_count"] = sensitive_cases_count
+                    else:
+                        new_entry = {
+                            "experiment_hash": exp_hash,
+                            "baseline_id": baseline_id,
+                            "parameter_name": param_name,
+                            "parameter_values": manifest_data.get("parameter_values", []),
+                            "baseline_value": baseline_value,
+                            "dataset_build_id": dataset_build_id,
+                            "git_commit": git_commit,
+                            "first_run_at": generated_at,
+                            "last_run_at": generated_at,
+                            "run_count": 1,
+                            "max_drift_rate": max_drift_rate,
+                            "local_sensitivity": local_sensitivity,
+                            "sensitive_cases_count": sensitive_cases_count,
+                            "runs": [run_entry]
+                        }
+                        rebuilt_registry.append(new_entry)
+                except Exception:
+                    pass
+                    
+        self._write_registry_locked(registry_path, rebuilt_registry)
+        return registry_path
+
+    def validate_experiment_registry(self) -> dict[str, Any]:
+        """Validate the registry index against directory artifacts.
+        Returns a dictionary summarizing verification status.
+        """
+        registry_path = Path("reports/research/counterfactual/registry.json")
+        if not registry_path.exists():
+            return {"status": "MISSING", "error": "registry.json not found", "experiments": {}}
+            
+        try:
+            with open(registry_path, "r") as f:
+                registry = json.load(f)
+        except Exception as e:
+            return {"status": "CORRUPTED", "error": f"JSON decode failed: {e}", "experiments": {}}
+            
+        verifications = {}
+        all_ok = True
+        
+        for exp_entry in registry:
+            exp_hash = exp_entry.get("experiment_hash")
+            verifications[exp_hash] = {
+                "parameter_name": exp_entry.get("parameter_name"),
+                "runs": []
+            }
+            
+            for run in exp_entry.get("runs", []):
+                run_id = run.get("experiment_id")
+                report_path = Path(run.get("report_path", ""))
+                res_hash = run.get("result_hash")
+                
+                # Check path traversal: resolve and verify it resides within reports/research/counterfactual/
+                abs_report_path = report_path.resolve()
+                abs_base = Path("reports/research/counterfactual").resolve()
+                
+                status = "VERIFIED"
+                detail = "All files intact and hash matched."
+                
+                if not abs_report_path.is_relative_to(abs_base):
+                    status = "CORRUPTED"
+                    detail = "Security warning: Directory path is outside allowed root."
+                    all_ok = False
+                elif not abs_report_path.exists():
+                    status = "MISSING"
+                    detail = "Directory does not exist."
+                    all_ok = False
+                else:
+                    manifest_file = abs_report_path / "manifest.json"
+                    result_file = abs_report_path / "result.json"
+                    if not manifest_file.exists() or not result_file.exists():
+                        status = "MISSING"
+                        detail = "Missing manifest or result JSON files."
+                        all_ok = False
+                    else:
+                        # Verify result file hash
+                        import hashlib
+                        try:
+                            with open(result_file, "rb") as f:
+                                current_hash = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+                            if current_hash != res_hash:
+                                status = "CORRUPTED"
+                                detail = "Content mismatch: result.json has been modified."
+                                all_ok = False
+                        except Exception as ex:
+                            status = "CORRUPTED"
+                            detail = f"Read error: {ex}"
+                            all_ok = False
+                            
+                verifications[exp_hash]["runs"].append({
+                    "experiment_id": run_id,
+                    "status": status,
+                    "detail": detail
+                })
+                
+        global_status = "VERIFIED" if all_ok else "UNVERIFIED"
+        return {
+            "status": global_status,
+            "experiments": verifications
+        }
 
     def get_sensitivity_ranking(self) -> list[dict[str, Any]]:
-        """Retrieve aggregated parameter sensitivity ranking based on the experiment registry."""
+        """Retrieve aggregated parameter sensitivity ranking based on the experiment registry.
+        Excludes incompatible baseline/dataset/methodology groups.
+        """
         registry_path = Path("reports/research/counterfactual/registry.json")
         if not registry_path.exists():
             return []
@@ -608,25 +925,26 @@ This decision-point sensitivity analysis identifies the stability threshold boun
         except Exception:
             return []
 
-        # Group by parameter name, choose the latest experiment for each parameter
-        latest_by_param = {}
+        if not registry:
+            return []
+
+        ranking = []
         for entry in registry:
             param = entry.get("parameter_name")
             if not param:
                 continue
-            if param not in latest_by_param or entry.get("generated_at", "") > latest_by_param[param].get("generated_at", ""):
-                latest_by_param[param] = entry
-
-        # Format ranking rows
-        ranking = []
-        for param, entry in latest_by_param.items():
+            
             ranking.append({
                 "parameter_name": param,
                 "max_drift_rate": entry.get("max_drift_rate", 0.0),
+                "local_sensitivity": entry.get("local_sensitivity", 0.0),
                 "sensitive_cases_count": entry.get("sensitive_cases_count", 0),
-                "experiment_id": entry.get("experiment_id"),
-                "generated_at": entry.get("generated_at"),
+                "experiment_hash": entry.get("experiment_hash")[:12] if entry.get("experiment_hash") else "N/A",
+                "last_evaluated": entry.get("last_run_at"),
+                "baseline_value": entry.get("baseline_value", 0.0),
+                "sweep_range": f"{min(entry.get('parameter_values', [0])):g} - {max(entry.get('parameter_values', [0])):g}"
             })
 
-        ranking.sort(key=lambda x: x["max_drift_rate"], reverse=True)
+        # Sort by local sensitivity descending, then by global max drift descending
+        ranking.sort(key=lambda x: (x["local_sensitivity"], x["max_drift_rate"]), reverse=True)
         return ranking
