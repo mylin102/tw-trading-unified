@@ -104,26 +104,41 @@ During the data accumulation phase, the primary KPIs are categorized into two gr
 * **Research Cadence:** Generation of a new E2 Evidence Report for every batch of 50–100 completed trades.
 
 ---
-
+ 
 ## 6. Data Provenance (Traceability Chain)
-
-To ensure any research conclusion can be fully back-traced to its origin, every compiled dataset must archive a metadata block containing:
+ 
+To ensure any research conclusion can be fully back-traced to its origin, every compiled dataset must archive metadata categorized into two distinct provenance scopes:
+ 
+### A. Runtime Provenance (Execution Context)
+*Identifies the exact software versions and parameters used during live or replay execution:*
+* **Strategy Engine Version:** Git commit hash of the trading engine code.
+* **Replay Engine Version:** Git commit hash of the simulation code.
+* **Git Repository State:** Status flag indicating whether the repo was clean or dirty during compilation.
+* **Build Timestamp:** UTC compilation time.
+ 
+### B. Research Provenance (Analysis Context)
+*Identifies the governance versions and analytical baselines used to evaluate the data:*
 * **Dataset Contract Version:** e.g., `v1.0.0`
 * **Research Methodology Version:** e.g., `v1.0.0`
-* **Strategy Engine Version:** Git commit hash of the trading code
-* **Replay Engine Version:** Git commit hash of the replay code
-* **Git Repository State:** Status flag indicating whether the repo was clean or dirty during compilation
-* **Build Timestamp:** UTC compilation time
-
+* **Dataset Build Version (Generation ID):** UTC timestamp-based build ID (`YYYYMMDDTHHMMSSZ`).
+* **Research Report Version:** The specific R-NNN code release.
+ 
 ---
-
-## 7. Transition to Evidence Accumulation Phase
-
-The project has officially transitioned from the **Strategy Development Phase** to the **Evidence Accumulation Phase**. 
-
-### Guidelines for this Phase:
-1. **Schema Freeze:** No modifications may be made to the database schemas defined in `core/trade_dataset.py` during v1.x of the methodology.
-2. **Strategy Freeze:** The trading strategy parameters and FSM engine must remain unchanged to ensure the telemetry data is homogeneous and free from parameter contamination.
-3. **Periodic Audits:** Analysis scripts should aggregate metrics (Average Trail Duration, Median Second-Leg PnL, Release Efficiency) periodically (e.g., every 50 complete trades) to produce E2 Evidence Reports.
-
-<!-- 2026-07-17 Gemini CLI: updated Research Dataset Contract v1.0 with invariants, KPIs, and epsilon bounds -->
+ 
+## 7. Research Baseline v1.0 & Freeze Window
+ 
+To establish a stable environment for initial data accumulation, we define **Research Baseline v1.0** as a frozen bundle of all engineering and governance configurations:
+ 
+* **Strategy Version:** Core FSM strategy engine (Frozen).
+* **Dataset Contract Version:** `v1.x` schemas (Frozen).
+* **Research Methodology Version:** `v1.0` guidelines (Frozen).
+* **Replay Engine Target:** Point Replay reproducibility $\ge 100\%$.
+ 
+### The Freeze Window Commitment
+Until a dataset containing **100 completed (Closed Loop) trades** is successfully compiled under the Research Baseline v1.0, the system enters a strict **Freeze Window**:
+* **Forbidden:** No schema additions, no new calculated derived metrics, and no new strategy parameters are allowed.
+* **Allowed:** Only critical bug fixes and data-quality corrections (e.g., handling missing network ticks).
+ 
+This protects the comparability and statistical validity of the first baseline dataset.
+ 
+<!-- 2026-07-17 Gemini CLI: updated DATASET_CONTRACT.md with divided Provenance, Research Baseline v1.0, and Freeze Window -->
