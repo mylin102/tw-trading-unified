@@ -5945,6 +5945,7 @@ elif page == "🔄 反事實研究室":
     """)
     
     # Expose Service
+    from core.counterfactual_service import DatasetContractError
     service = get_counterfactual_service()
     
     # Page metadata
@@ -5960,11 +5961,21 @@ elif page == "🔄 反事實研究室":
                 result = service.run_point_replay()
                 
                 # Show KPI metrics
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("測試樣本數 (Cases)", result.metrics.total_cases)
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("測試樣本數 (Cases)", result.metrics.eligible_cases)
                 m2.metric("決策匹配率 (Action)", f"{result.metrics.action_match_rate:.1%}")
                 m3.metric("部位匹配率 (Leg)", f"{result.metrics.leg_match_rate:.1%}")
-                m4.metric("分歧筆數 (Mismatches)", result.metrics.mismatch_count)
+                m4.metric("原因匹配率 (Reason)", f"{result.metrics.reason_match_rate:.1%}")
+                m5.metric("分歧筆數 (Mismatches)", result.metrics.mismatch_count)
+                
+                # Show eligibility details
+                st.markdown(f"""
+                📋 **決策篩選統計 (Eligibility Statistics)**
+                * **資料集總決策數 (Total Cases in Dataset):** `{result.metrics.total_cases}` 筆
+                * **合規測試決策數 (Eligible Cases):** `{result.metrics.eligible_cases}` 筆 *(以 `RELEASE` 開頭的動作)*
+                * **排除測試決策數 (Excluded Cases):** `{result.metrics.excluded_cases}` 筆 *(非釋放點決策)*
+                * **篩選策略版本 (Eligibility Policy Version):** `{result.metrics.eligibility_policy_version}`
+                """)
                 
                 # Show provenance
                 st.info(f"""
@@ -5992,7 +6003,16 @@ elif page == "🔄 反事實研究室":
                         })
                     st.dataframe(pd.DataFrame(mismatch_rows), use_container_width=True, hide_index=True)
                 else:
-                    st.success("🎉 決策重播 100% 吻合！當前策略代碼與歷史實戰決策完美相容。")
+                    st.success(f"🎉 在目前資料集納入的 {result.metrics.eligible_cases} 個 eligible decision points 中，當前決策引擎已 100% 重現歷史 Action 與 Leg，未發現決策分歧。此結果僅代表點決策重播一致性，不代表完整交易軌跡、成交結果或績效一致性。")
+            except DatasetContractError as e:
+                st.error(f"""
+                ⚠️ **目前資料集不符合 Replay Dataset Contract。**
+                請先由獨立 Dataset Build Pipeline 發布新的 Generation。
+                
+                * **錯誤代碼 (Code):** `{e.code}`
+                * **缺少欄位 (Missing Columns):** `{e.missing_columns}`
+                * **資料集編譯 ID (Dataset Build ID):** `{e.dataset_build_id}`
+                """)
             except Exception as e:
                 st.error(f"決策重播運行失敗: {e}")
 

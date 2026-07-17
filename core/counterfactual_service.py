@@ -1,4 +1,4 @@
-# 2026-07-17 Gemini CLI: CounterfactualService implementation with side-effect isolation and immutable contracts.
+# 2026-07-17 Gemini CLI: CounterfactualService implementation with fail-fast schema/hash contract verification.
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -6,9 +6,19 @@ from pathlib import Path
 from typing import Any, Optional
 import os
 import subprocess
+import pandas as pd
 
 from core.replay_contracts import build_replay_cases, DecisionReplayCase
 from core.replay_release import replay_batch, build_reproduction_report, ReplayResult
+
+class DatasetContractError(Exception):
+    """Raised when the loaded dataset does not match the required schema or content hash."""
+    def __init__(self, code: str, expected_contract: str, missing_columns: list[str], dataset_build_id: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.expected_contract = expected_contract
+        self.missing_columns = missing_columns
+        self.dataset_build_id = dataset_build_id
 
 @dataclass(frozen=True)
 class ReplayConfig:
@@ -34,6 +44,8 @@ class ReplayMetrics:
     """Aggregated match rates and counts."""
     total_cases: int
     eligible_cases: int
+    excluded_cases: int
+    eligibility_policy_version: str
     action_match_rate: float
     leg_match_rate: float
     reason_match_rate: float
@@ -64,12 +76,60 @@ class CounterfactualService:
         self._data_path = data_path
 
     def run_point_replay(self, config: Optional[ReplayConfig] = None) -> PointReplayResult:
-        """Run point replay on compiled trades using the optional config override."""
+        """Run point replay on compiled trades using the optional config override.
+        Raises DatasetContractError if schema or hash validation fails.
+        """
+        # 0. Fail-fast Contract Validation
+        from core.trade_dataset import load_dataset, load_manifest, _canonical_content_hash
+        
+        ds = load_dataset(self._data_path)
+        snapshots = ds.get("trade_snapshots")
+        manifest = load_manifest(self._data_path)
+        build_id = manifest.get("dataset_build_id", "UNKNOWN")
+        
+        if snapshots is None or snapshots.empty:
+            raise DatasetContractError(
+                code="REPLAY_DATASET_EMPTY",
+                expected_contract="v1.x",
+                missing_columns=["trade_snapshots"],
+                dataset_build_id=build_id,
+                message="Dataset is empty or missing snapshots table.",
+            )
+            
+        missing_cols = []
+        if "is_decision_point" not in snapshots.columns:
+            missing_cols.append("is_decision_point")
+            
+        if missing_cols:
+            raise DatasetContractError(
+                code="REPLAY_DATASET_SCHEMA_MISMATCH",
+                expected_contract="v1.x",
+                missing_columns=missing_cols,
+                dataset_build_id=build_id,
+                message=f"Dataset schema mismatch: missing required columns: {missing_cols}",
+            )
+            
+        declared_hash = manifest.get("dataset_content_hash")
+        if declared_hash:
+            actual_hash = _canonical_content_hash(
+                ds.get("trade_facts", pd.DataFrame()),
+                ds.get("trade_snapshots", pd.DataFrame()),
+                ds.get("trade_decisions", pd.DataFrame()),
+                ds.get("trade_outcomes", pd.DataFrame()),
+            )
+            if actual_hash != declared_hash:
+                raise DatasetContractError(
+                    code="REPLAY_DATASET_HASH_MISMATCH",
+                    expected_contract="v1.x",
+                    missing_columns=[],
+                    dataset_build_id=build_id,
+                    message=f"Dataset content hash mismatch! Expected {declared_hash}, got {actual_hash}",
+                )
+
         # 1. Fetch cases
         cases = build_replay_cases(path=self._data_path)
         
         # 2. Run simulation
-        # In Wave 1 we pass cases to replay_batch (we'll update core/replay_release to support config)
         results = replay_batch(cases, config=config)
         report = build_reproduction_report(results)
         
@@ -104,19 +164,6 @@ class CounterfactualService:
         except Exception:
             pass
 
-        # Load manifest to get build id
-        build_id = "UNKNOWN"
-        try:
-            # Reconstruct default folder if path is None
-            manifest_path = (self._data_path or Path("data/current")) / "trade_dataset_manifest.json"
-            if manifest_path.exists():
-                import json
-                with open(manifest_path, "r", encoding="utf-8") as f:
-                    manifest = json.load(f)
-                    build_id = manifest.get("dataset_build_id", "UNKNOWN")
-        except Exception:
-            pass
-
         provenance = ProvenanceBundle(
             dataset_contract_version="v1.0.0",
             research_methodology_version="v1.0.0",
@@ -126,10 +173,16 @@ class CounterfactualService:
             generated_time=datetime.utcnow().isoformat() + "Z",
         )
 
+        total_cases = len(cases)
+        eligible_cases = len(results)
+        excluded_cases = total_cases - eligible_cases
+
         metrics = ReplayMetrics(
-            total_cases=report.get("total_cases", 0),
-            eligible_cases=report.get("total_cases", 0), # in release, all tested cases are eligible
-            action_match_rate=report.get("action_match_rate", 0.0) / 100.0, # convert 98.2 to 0.982
+            total_cases=total_cases,
+            eligible_cases=eligible_cases,
+            excluded_cases=excluded_cases,
+            eligibility_policy_version="v1.0 (RELEASE ONLY)",
+            action_match_rate=report.get("action_match_rate", 0.0) / 100.0,
             leg_match_rate=report.get("leg_match_rate", 0.0) / 100.0,
             reason_match_rate=report.get("reason_match_rate", 0.0) / 100.0,
             mismatch_count=report.get("mismatch_count", 0),
