@@ -143,7 +143,7 @@ docs/
 | `docs/KBAR_STALENESS_ANALYSIS.md` | archive | `docs/archive/analysis/YYYY-MM-DD-mac-m1-kbar-staleness-analysis.md` |
 | `docs/strategy_review.md` | rename | `docs/archive/reviews/YYYY-MM-DD-mac-m1-strategy-review.md` |
 | `docs/SESSION_REVIEW_20260413.md` | rename | `docs/archive/sessions/2026-04-13-mac-m1-session-review.md` |
-| `docs/METHODOLOGIES.md` | merge into | `docs/strategies.md` or `docs/operations.md` depending on actual scope. |
+| `docs/DEVELOPMENT_STANDARDS.md` | merge into | `docs/strategies.md` or `docs/operations.md` depending on actual scope. |
 | `docs/BUGFIX_AUTOSTART_RESTART.md` | archive | `docs/archive/analysis/YYYY-MM-DD-mac-m1-autostart-restart-bugfix.md` |
 | `docs/GSD_NIGHT_SESSION_FIX.md` | archive | `docs/archive/analysis/YYYY-MM-DD-mac-m1-night-session-fix.md` |
 | `docs/SQUEEZE_FAILURE_STRATEGY.md` | archive | `docs/archive/analysis/YYYY-MM-DD-mac-m1-squeeze-failure-strategy.md` |
