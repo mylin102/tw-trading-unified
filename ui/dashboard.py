@@ -260,7 +260,7 @@ with st.sidebar:
     # 2026-06-30 Gemini CLI: Page selectbox at top for instant visibility
     st.selectbox(
         "📄 頁面",
-        ["總覽", f"期貨 {_TICKER}", "選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "設定"],
+        ["總覽", f"期貨 {_TICKER}", "選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "🔄 反事實研究室", "設定"],
         index=1,
         key="page_selector",
     )
@@ -5924,6 +5924,72 @@ elif page == "波動率 Vol":
         """)
 
     st.divider()
+
+# ════════════════════════════════════════
+# Tab: 🔄 反事實研究室 (Counterfactual Lab)
+# ════════════════════════════════════════
+elif page == "🔄 反事實研究室":
+    st.header("🔄 反事實研究室 (Counterfactual Lab)")
+    st.caption("基於已完結交易的點重播 (Point Replay) 驗證與離線反事實模擬")
+    
+    st.markdown("""
+    > [!IMPORTANT]
+    > **Research-only & Read-only**  
+    > 本分頁為純研究與重播模擬用途。所有計算均在離線沙盒環境進行，**不產生任何實戰交易、不修改策略參數、不寫入生產資料庫或狀態檔**。
+    """)
+    
+    # Expose Service
+    from core.counterfactual_service import CounterfactualService
+    service = CounterfactualService()
+    
+    # Page metadata
+    st.markdown(f"**Research Baseline:** `Research Baseline v1.0` (FROZEN)")
+    
+    # User triggers point replay
+    st.subheader("🎯 基線重播驗證 (Point Replay Validation)")
+    st.write("比對歷史實際決策與當前生產決策引擎 (`evaluate_lifecycle_actions`) 的一致性。")
+    
+    if st.button("運行決策重播驗證 (Run Replay Validation)", key="btn_run_replay"):
+        with st.spinner("正在重播決策歷史..."):
+            try:
+                result = service.run_point_replay()
+                
+                # Show KPI metrics
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("測試樣本數 (Cases)", result.metrics.total_cases)
+                m2.metric("決策匹配率 (Action)", f"{result.metrics.action_match_rate:.1%}")
+                m3.metric("部位匹配率 (Leg)", f"{result.metrics.leg_match_rate:.1%}")
+                m4.metric("分歧筆數 (Mismatches)", result.metrics.mismatch_count)
+                
+                # Show provenance
+                st.info(f"""
+                🧬 **資料來源與運行追溯 (Provenance)**
+                * **Methodology Version:** `{result.provenance.research_methodology_version}`
+                * **Dataset Contract Version:** `{result.provenance.dataset_contract_version}`
+                * **Dataset Build ID:** `{result.provenance.dataset_build_id}`
+                * **Git Commit Hash:** `{result.provenance.git_commit[:8]} ({result.provenance.git_repo_state})`
+                * **Generated At:** `{result.provenance.generated_time}`
+                """)
+                
+                # Show mismatch details
+                if result.metrics.mismatch_count > 0:
+                    st.warning(f"發現 {result.metrics.mismatch_count} 筆決策分歧！請檢查下方列表：")
+                    mismatch_rows = []
+                    for m in result.mismatches:
+                        mismatch_rows.append({
+                            "Trade ID": m.trade_id[-6:],
+                            "Seq": m.decision_seq,
+                            "分歧類型": m.mismatch_category,
+                            "實際動作": m.recorded_action,
+                            "實際部位": m.recorded_leg or "—",
+                            "重播動作": m.replayed_action or "—",
+                            "重播部位": m.replayed_leg or "—",
+                        })
+                    st.dataframe(pd.DataFrame(mismatch_rows), use_container_width=True, hide_index=True)
+                else:
+                    st.success("🎉 決策重播 100% 吻合！當前策略代碼與歷史實戰決策完美相容。")
+            except Exception as e:
+                st.error(f"決策重播運行失敗: {e}")
 
 # -- Footer and Refresh --
     # 2026-06-23 Gemini CLI: 移除伺服器端 time.sleep(5) 與 st.rerun() 的無條件循環，完全由 line 219 的瀏覽器端 st_autorefresh 每 10 秒觸發，使伺服器執行緒能正常結束並釋放 CPU 資源，解決 CPU 99% 與高溫 99°C 的問題
