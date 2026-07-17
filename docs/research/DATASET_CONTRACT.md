@@ -22,48 +22,35 @@ JSONL Audit Logs ──► Rebuild Pipeline (core/trade_dataset.py) ──► Pa
 
 Every completed spread trade is decomposed into four distinct layers of evidence. The pipeline compiles these layers into four corresponding Parquet tables: `trade_facts.parquet`, `trade_snapshots.parquet`, `trade_decisions.parquet`, and `trade_outcomes.parquet`.
 
-```text
-                  MTS Research Dataset Layers
+These layers are separated into **Observed Facts** (immutable historical observations) and **Derived Metrics** (recalculable, versioned analytical properties):
 
-           ┌──────────────────────────────────────┐
-           │ Layer 1: Outcome & Metadata (Facts)  │
-           ├──────────────────────────────────────┤
-           │ Layer 2: Timeline & Durations        │
-           ├──────────────────────────────────────┤
-           │ Layer 3: State Snapshots             │
-           ├──────────────────────────────────────┤
-           │ Layer 4: Outcome Labels (Excursions) │
-           └──────────────────────────────────────┘
+```text
+       Observed Facts (Immutable)       ──►      Derived Metrics (Versioned)
+  (Identity, Prices, Timestamps, MFE/MAE)     (Durations, Snapshots, Efficiency)
 ```
 
-### Layer 1: Outcome & Metadata (Facts)
-*Defines the identity, structural configuration, and raw realized PnL for the trade.*
-* **Trade Identity:** `trade_id`, `session` (Day/Night), `direction` (Long/Short spread).
-* **Execution Contracts:** `near_contract`, `far_contract` tickers.
-* **Direct Outputs:** `near_exit_price`, `far_exit_price`, `release_price`, `pnl_total` (TWD).
-* **Data Quality:** `data_quality` flag (ok, stale_quote, tick_gap).
+### A. Observed Facts (Immutable Observations)
+These values represent objective physical occurrences in the market and broker logs. Once written, they never change and do not depend on future strategy versions:
+* **Layer 1: Outcome & Metadata (Facts)**
+  * Trade Identity: `trade_id`, `session` (Day/Night), `direction`.
+  * Execution Contracts: `near_contract`, `far_contract` tickers.
+  * Direct Outputs: `near_exit_price`, `far_exit_price`, `release_price`, `pnl_total` (TWD).
+  * Data Quality: `data_quality` flag (ok, stale_quote, tick_gap).
+* **Layer 2: Timeline (Raw)**
+  * Raw event timestamps: `entry_time`, `release_time`, `exit_time`.
+* **Layer 4: Outcome Label (Excursions)**
+  * Maximum potential profit/loss Post-Release: `mfe_released_leg`, `mae_released_leg`, `mfe_remaining_leg`, `mae_remaining_leg`.
+  * Combined bounds: `mfe_combined`, `mae_combined` (absolute boundaries).
 
-### Layer 2: Timeline & Durations
-*Logs the timestamps of critical state transitions and calculates phase durations.*
-* **Transition Timestamps:** `entry_time`, `release_time`, `exit_time`.
-* **Derived Durations:**
-  * **Release Delay (Entry → Release):** Duration the trade was held as a dual-leg spread before a leg was released.
-  * **Trail Duration (Release → Exit):** Duration the remaining leg was managed individually.
-  * **Total Holding Time (Entry → Exit):** Total trade lifespan.
-
-### Layer 3: State Snapshot
-*Captures the exact market variables and indicator values observed by the decision engine immediately preceding any action.*
-* **At Entry / Release / Exit:**
-  * Market prices: `price_near`, `price_far`, `spread`.
-  * Spread indicators: `z_score`, `spread_mean`, `spread_std`.
-  * Volatility/Trend indicators: `atr`, `bb_position`, `bb_width`, `sqz_on`, `regime`.
-
-### Layer 4: Outcome Label (Excursions)
-*Logs the maximum potential profit/loss space observed after key decisions, used for strategy optimization.*
-* **Released Leg Excursions (Post-Release):** `mfe_released_leg`, `mae_released_leg` (Maximum Favorable / Adverse Excursion).
-* **Remaining Leg Excursions (Post-Release):** `mfe_remaining_leg`, `mae_remaining_leg`.
-* **Combined Excursions:** `mfe_combined`, `mae_combined` (absolute trade boundary).
-* **Trail Metrics:** `trail_distance` (points between peak and trail exit).
+### B. Derived Metrics (Versioned Analytics)
+These values are computed properties and indicator snapshots derived from raw facts. They may be recalculated or extended under new versions of the dataset contract:
+* **Layer 2: Durations (Computed)**
+  * `Release Delay` (Entry → Release).
+  * `Trail Duration` (Release → Exit).
+  * `Total Holding Time` (Entry → Exit).
+* **Layer 3: State Snapshot (Contextual Indicators)**
+  * Indicators at event triggers: `z_score`, `spread_mean`, `spread_std`, `atr`, `bb_position`, `bb_width`, `sqz_on`, `regime`.
+  * Trail metrics: `trail_distance`.
 
 ---
 
@@ -77,7 +64,7 @@ Measures the efficiency of post-release profit preservation, calculating how eff
 
 $$Release\ Efficiency = \frac{Final\ Net\ PnL}{Second\ Leg\ Peak\ PnL}$$
 
-* **Noise Gating Invariant:** This metric is strictly defined and evaluated only when $\text{Second Leg Peak PnL} > \epsilon$ (where $\epsilon = 100$ TWD). This prevents divide-by-zero errors and excludes low-absolute-value noise.
+* **Noise Gating Invariant:** This metric is strictly defined and evaluated only when $\text{Second Leg Peak PnL} > \epsilon$. (Current default research configuration: $\epsilon = 100$ TWD to prevent divide-by-zero errors and filter low-absolute-value noise).
 * *Case A (High Efficiency):* Peak $PnL = +2,500$ TWD, Final $PnL = +2,400$ TWD $\rightarrow$ **96% Efficiency** (Exit managed optimally).
 * *Case B (Low Efficiency / Profit Leakage):* Peak $PnL = +2,500$ TWD, Final $PnL = +400$ TWD $\rightarrow$ **16% Efficiency** (Exit algorithm gave back too much; trail is too loose or slow).
 * *Case C (No Trend):* Peak $PnL = +400$ TWD, Final $PnL = +300$ TWD $\rightarrow$ **75% Efficiency** (Market had no momentum; the low absolute PnL is a structural regime issue, not an exit management issue).
@@ -105,17 +92,32 @@ To ensure data integrity, any generation of the research database must satisfy t
 
 ## 5. Research KPIs (Evidence-First Metrics)
 
-During the data accumulation phase, the primary KPIs shift from short-term trading PnL to database and research process quality:
+During the data accumulation phase, the primary KPIs are categorized into two groups to track reliability vs. readiness:
 
+### A. Data Quality KPIs (Is the data reliable?)
 * **Dataset Completeness:** Ratio of successfully compiled analytical rows to raw trading log lines (Target: $\ge 99.5\%$).
-* **State Coverage:** Spread of recorded trades across orthogonal regimes and sessions (Target: minimum 5 trades per session/regime combination).
 * **Schema Stability:** Count of breaking changes to `v1.x` schemas (Target: 0).
 * **Replay Reproducibility:** Percentage of past decisions that can be reproduced 100% deterministically by the Point Replay engine (Target: 100%).
+
+### B. Research Readiness KPIs (Are we ready for new analysis?)
+* **State Coverage:** Spread of recorded trades across orthogonal regimes and sessions (Target: minimum 5 trades per session/regime combination).
 * **Research Cadence:** Generation of a new E2 Evidence Report for every batch of 50–100 completed trades.
 
 ---
 
-## 6. Transition to Evidence Accumulation Phase
+## 6. Data Provenance (Traceability Chain)
+
+To ensure any research conclusion can be fully back-traced to its origin, every compiled dataset must archive a metadata block containing:
+* **Dataset Contract Version:** e.g., `v1.0.0`
+* **Research Methodology Version:** e.g., `v1.0.0`
+* **Strategy Engine Version:** Git commit hash of the trading code
+* **Replay Engine Version:** Git commit hash of the replay code
+* **Git Repository State:** Status flag indicating whether the repo was clean or dirty during compilation
+* **Build Timestamp:** UTC compilation time
+
+---
+
+## 7. Transition to Evidence Accumulation Phase
 
 The project has officially transitioned from the **Strategy Development Phase** to the **Evidence Accumulation Phase**. 
 
@@ -124,4 +126,4 @@ The project has officially transitioned from the **Strategy Development Phase** 
 2. **Strategy Freeze:** The trading strategy parameters and FSM engine must remain unchanged to ensure the telemetry data is homogeneous and free from parameter contamination.
 3. **Periodic Audits:** Analysis scripts should aggregate metrics (Average Trail Duration, Median Second-Leg PnL, Release Efficiency) periodically (e.g., every 50 complete trades) to produce E2 Evidence Reports.
 
-<!-- 2026-07-17 Gemini CLI: updated Research Dataset Contract v1.0 with invariants, KPIs, and efficiency bounds -->
+<!-- 2026-07-17 Gemini CLI: updated Research Dataset Contract v1.0 with invariants, KPIs, and epsilon bounds -->
