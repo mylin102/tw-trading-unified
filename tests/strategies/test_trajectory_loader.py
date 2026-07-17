@@ -410,3 +410,165 @@ def test_ordering_hash_stability(valid_event_dict):
         
     assert len(hashes) == 1  # All permutations yield identical ordering hash
 
+
+def test_sandbox_clock_advancement_and_regression():
+    from core.trajectory.clock import ReplayClock
+    from core.trajectory.sandbox_errors import ClockRegressionError
+    
+    clock = ReplayClock(initial_ns=1000)
+    assert clock.now_ns == 1000
+    
+    clock.advance_to(2000)
+    assert clock.now_ns == 2000
+    
+    # Verify regression failure
+    with pytest.raises(ClockRegressionError):
+        clock.advance_to(1500)
+
+
+def test_sandbox_kernel_replay_determinism_and_consumption():
+    from core.trajectory.clock import ReplayClock
+    from core.trajectory.ordering import order_trajectory_events
+    from core.trajectory.sandbox import TrajectoryReplaySandbox
+    from core.trajectory.state import ReplayState, LifecycleSnapshot, MarketSnapshot, TimerSnapshot
+    
+    # 1. Setup events
+    base_time = 1000000
+    events = [
+        TrajectoryEvent(
+            event_id="evt-1",
+            event_type=EventType.MARKET_TICK,
+            event_time_ns=base_time + 100,
+            receive_time_ns=base_time + 105,
+            source_sequence=1,
+            source=EventSource.EXCHANGE,
+            session_id="session-1",
+            trade_id=None,
+            origin=EventOrigin.OBSERVED,
+            authority=EventAuthority.EXCHANGE,
+            causality=EventCausality.EXOGENOUS,
+            mutability=EventMutability.IMMUTABLE,
+            payload_schema_version="v1.0.0",
+            payload={"symbol": "TMF_NEAR", "last_price": 14200.0},
+            quality_flags=(),
+        ),
+        # Oracle event: should not directly mutate reconstructed lifecycle state
+        TrajectoryEvent(
+            event_id="evt-2",
+            event_type=EventType.LIFECYCLE_TRANSITION,
+            event_time_ns=base_time + 200,
+            receive_time_ns=base_time + 205,
+            source_sequence=2,
+            source=EventSource.STRATEGY_ROUTER,
+            session_id="session-1",
+            trade_id="t-1",
+            origin=EventOrigin.OBSERVED,
+            authority=EventAuthority.PRODUCTION_ENGINE,
+            causality=EventCausality.ENDOGENOUS,
+            mutability=EventMutability.REPLACEABLE,
+            payload_schema_version="v1.0.0",
+            payload={"state_before": "IDLE", "state_after": "ARMED", "reason": "test"},
+            quality_flags=(),
+        ),
+        # Input & Oracle event: updates virtual positions
+        TrajectoryEvent(
+            event_id="evt-3",
+            event_type=EventType.BROKER_FILL,
+            event_time_ns=base_time + 300,
+            receive_time_ns=base_time + 305,
+            source_sequence=3,
+            source=EventSource.SHIOAJI_BROKER,
+            session_id="session-1",
+            trade_id="t-1",
+            origin=EventOrigin.OBSERVED,
+            authority=EventAuthority.BROKER,
+            causality=EventCausality.ENDOGENOUS,
+            mutability=EventMutability.REPLACEABLE,
+            payload_schema_version="v1.0.0",
+            payload={"symbol": "TMF_NEAR", "side": "BUY", "price": 14210.0, "quantity": 2},
+            quality_flags=(),
+        )
+    ]
+    
+    ordered = order_trajectory_events(events)
+    
+    # 2. Initial state
+    init_state = ReplayState(
+        session_id="session-1",
+        trade_id=None,
+        lifecycle=LifecycleSnapshot(
+            state="IDLE",
+            armed_timestamp_ns=None,
+            active_timestamp_ns=None,
+            last_transition_reason=None,
+            extra_metadata={},
+        ),
+        positions=(),
+        pending_intents=(),
+        market=MarketSnapshot(last_prices={}, bid_asks={}),
+        timers=TimerSnapshot(active_timers={}),
+        last_event_id=None,
+        event_index=-1,
+    )
+    
+    # Run replay 100 times to verify trace signature determinism
+    hashes = set()
+    for _ in range(100):
+        clock = ReplayClock(initial_ns=base_time)
+        sandbox = TrajectoryReplaySandbox(clock)
+        trace = sandbox.replay_baseline(ordered, init_state)
+        hashes.add(trace.canonical_trace_hash)
+        
+        # Verify final state checks
+        # Market tick updated price
+        assert trace.final_state.market.last_prices["TMF_NEAR"] == 14200.0
+        # Oracle lifecycle transition did NOT modify FSM state (still IDLE)
+        assert trace.final_state.lifecycle.state == "IDLE"
+        # Broker fill updated position size
+        assert len(trace.final_state.positions) == 1
+        assert trace.final_state.positions[0].qty == 2
+        assert trace.final_state.positions[0].avg_price == 14210.0
+        # Trace frames matched
+        assert len(trace.frames) == 3
+        assert trace.frames[1].transitions[0].state_after == "ARMED"
+        
+    assert len(hashes) == 1  # 100% deterministic trace hash
+
+
+def test_sandbox_side_effects_isolation():
+    from core.trajectory.clock import ReplayClock
+    from core.trajectory.ordering import order_trajectory_events
+    from core.trajectory.sandbox import TrajectoryReplaySandbox
+    from core.trajectory.state import ReplayState, LifecycleSnapshot, MarketSnapshot, TimerSnapshot
+    
+    # Ensure executing a baseline replay does not make network calls or touch files
+    clock = ReplayClock(initial_ns=0)
+    sandbox = TrajectoryReplaySandbox(clock)
+    
+    init_state = ReplayState(
+        session_id="session-1",
+        trade_id=None,
+        lifecycle=LifecycleSnapshot(
+            state="IDLE",
+            armed_timestamp_ns=None,
+            active_timestamp_ns=None,
+            last_transition_reason=None,
+            extra_metadata={},
+        ),
+        positions=(),
+        pending_intents=(),
+        market=MarketSnapshot(last_prices={}, bid_asks={}),
+        timers=TimerSnapshot(active_timers={}),
+        last_event_id=None,
+        event_index=-1,
+    )
+    
+    # Empty ordered trajectory
+    ordered = order_trajectory_events([])
+    
+    # Replay should execute seamlessly and side-effect free
+    trace = sandbox.replay_baseline(ordered, init_state)
+    assert trace.final_state.event_index == -1
+    assert len(trace.frames) == 0
+
+

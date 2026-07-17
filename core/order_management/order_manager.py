@@ -7,6 +7,7 @@ Paper / Live 共用同一套狀態機。
 """
 from __future__ import annotations
 
+import logging
 import os
 import json
 from datetime import datetime
@@ -14,6 +15,32 @@ from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, field
 
 from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
+
+
+# ── Live Order Hard Gate ───────────────────────────────────────────────────
+# Import late to avoid circular dependency at module level.
+# ModeTransitionGate is the second layer of defense for all live orders.
+# Strategy-level gate is in monitor._submit_mts_order_signal().
+# ────────────────────────────────────────────────────────────────────────────
+
+_mode_transition_gate = None  # module-level cache
+
+
+def _get_live_gate():
+    """Lazy-import and cache the assert function."""
+    global _mode_transition_gate
+    if _mode_transition_gate is None:
+        try:
+            from core.mode_transition import ExecutionContext
+            _mode_transition_gate = "loaded"
+        except ImportError:
+            _mode_transition_gate = "unavailable"
+    return _mode_transition_gate == "loaded"
+
+
+def _assert_live_allowed(execution_context) -> None:
+    """Thin wrapper: calls execution_context.assert_live_order_allowed()."""
+    execution_context.assert_live_order_allowed()
 
 
 @dataclass
@@ -44,18 +71,35 @@ class OrderManager:
         broker_adapter: Live 模式下需要，Paper 模式下不需要
     """
 
-    def __init__(self, mode: str = "paper", broker_adapter=None):
+    def __init__(self, mode: str = "paper", broker_adapter=None,
+                 execution_context=None):
         self.mode = mode
+        self.execution_context = execution_context
         self.active_orders: Dict[str, Order] = {}
         self.completed: List[Order] = []
         # 2026-07-07 Hermes Agent: session_date-based counter reset.
         # Counter resets per trading session, NOT per PM2 restart.
         # Uses get_session_date_str which handles night session crossing midnight.
+        self._session_degraded = False
+        self._session_source = "TAIFEX_CALENDAR"
         try:
             from core.date_utils import get_session_date_str
             self._session_date = get_session_date_str()
-        except Exception:
+        except Exception as exc:
+            _logger = logging.getLogger("OrderManager")
+            _logger.exception(
+                "[ORDER_SESSION_DATE_DEGRADED] "
+                "get_session_date_str failed; falling back to wall-clock date. "
+                "Order IDs will not reflect the correct TAIFEX trading day.",
+                extra={
+                    "error_type": type(exc).__name__,
+                    "error_args": str(exc.args),
+                    "wall_clock": datetime.now().isoformat(),
+                },
+            )
             self._session_date = datetime.now().strftime("%Y%m%d")
+            self._session_degraded = True
+            self._session_source = "wall_clock_fallback"
         self._next_id = 1
         self.broker_adapter = broker_adapter
 
@@ -464,6 +508,36 @@ class OrderManager:
         - Paper: 直接設為 SUBMITTED
         - Live: 透過 broker_adapter.place_order() 送單
         """
+        # ── P0 Hard Gate: Second layer defense ──
+        if self.mode == "live" and self.execution_context is not None:
+            try:
+                _assert_live_allowed(self.execution_context)
+            except Exception as exc:
+                order.status = OrderStatus.REJECTED
+                order.reject_reason = str(exc)
+                self._emit("on_reject", OrderEvent(
+                    order_id=order.order_id, status=OrderStatus.REJECTED,
+                    symbol=order.symbol, side=order.side,
+                    reason=str(exc),
+                ))
+                return False
+
+        # ── Paper Drain Gate: Block any order during drain ──
+        # Second layer: blocks paper orders when drain is active.
+        # Redundant with strategy-layer guard — defense in depth.
+        if self.execution_context is not None:
+            try:
+                self.execution_context.assert_entry_allowed()
+            except Exception as exc:
+                order.status = OrderStatus.REJECTED
+                order.reject_reason = str(exc)
+                self._emit("on_reject", OrderEvent(
+                    order_id=order.order_id, status=OrderStatus.REJECTED,
+                    symbol=order.symbol, side=order.side,
+                    reason=str(exc),
+                ))
+                return False
+
         if order.status != OrderStatus.PENDING_SUBMIT:
             raise ValueError(f"Order {order.order_id} already submitted (status={order.status.value})")
 

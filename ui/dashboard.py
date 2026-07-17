@@ -260,7 +260,7 @@ with st.sidebar:
     # 2026-06-30 Gemini CLI: Page selectbox at top for instant visibility
     st.selectbox(
         "📄 頁面",
-        ["總覽", f"期貨 {_TICKER}", "選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "🔄 反事實研究室", "設定"],
+        ["總覽", f"期貨 {_TICKER}", "選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "🔄 反事實研究室", "🔐 Real Preflight", "設定"],
         index=1,
         key="page_selector",
     )
@@ -5282,6 +5282,193 @@ elif page == "策略管道":
             st.info("Router trace 目錄不存在")
     except Exception as e:
         st.error(f"Router trace 載入錯誤: {e}")
+
+# ════════════════════════════════════════
+# Tab: 🔐 Real Preflight
+# Read-only broker preflight diagnostic page.
+# Does NOT modify ExecutionContext, does NOT send orders,
+# does NOT transition to LIVE_READY.
+# ════════════════════════════════════════
+elif page == "🔐 Real Preflight":
+    st.header("🔐 Real Trading Preflight")
+    st.caption("Read-only broker diagnostic. Does not send orders or modify execution mode.")
+
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.subheader("📋 Execution State")
+
+        # Read runtime status
+        _rt_path = Path("/tmp/runtime_status.json")
+        _rt = {}
+        if _rt_path.exists():
+            try:
+                _rt = json.loads(_rt_path.read_text())
+            except Exception:
+                pass
+
+        # Read orders file for current session
+        _orders_file = Path(f"exports/trades/{_TICKER}_{DATE_STR}_orders.json")
+        _order_count = 0
+        if _orders_file.exists():
+            try:
+                _orders = json.loads(_orders_file.read_text())
+                _order_count = len(_orders)
+            except Exception:
+                pass
+
+        # Display execution context
+        _req_mode = _rt.get("requested_mode", "paper")
+        _eff_mode = _rt.get("effective_mode", "paper_active")
+        _live_allowed = _rt.get("live_order_allowed", False)
+
+        st.metric("Requested Mode", _req_mode.upper())
+        st.metric("Effective Mode", _eff_mode)
+        st.metric("Live Order Allowed", "✅ YES" if _live_allowed else "❌ NO")
+        st.metric("Session Orders (today)", _order_count)
+
+        if _rt.get("transition_block_reason"):
+            st.error(f"Transition blocked: {_rt['transition_block_reason']}")
+
+    with col_right:
+        st.subheader("📄 Paper Drain Status")
+
+        # Read MTS position state
+        _mts_pos = {}
+        _mts_pos_path = Path("/tmp/mts_position_state.json")
+        if _mts_pos_path.exists():
+            try:
+                _mts_pos = json.loads(_mts_pos_path.read_text())
+            except Exception:
+                pass
+
+        _has_pos = _mts_pos.get("has_position", False)
+        _state = _mts_pos.get("state", "?")
+        _near_status = _mts_pos.get("near_status", "?")
+        _far_status = _mts_pos.get("far_status", "?")
+        st.metric("Has Position", "✅ YES" if _has_pos else "❌ NO")
+        st.metric("State", _state)
+        st.metric("Near Status", _near_status)
+        st.metric("Far Status", _far_status)
+
+        if not _has_pos and _state in ("FLAT", "INACTIVE"):
+            st.success("✅ Paper is flat")
+        else:
+            st.warning("⏳ Paper has open position or lifecycle")
+
+    # ── Broker Snapshot Section ──
+    st.divider()
+    st.subheader("🏦 Broker Preflight")
+
+    _diagnostics_dir = Path("exports/trades/live/diagnostics")
+    _response_file = _diagnostics_dir / "broker_snapshot_latest.json"
+
+    # Request ID tracking for freshness
+    if "_snapshot_request_id" not in st.session_state:
+        st.session_state["_snapshot_request_id"] = 0
+
+    col_btn, col_status = st.columns([1, 3])
+
+    with col_btn:
+        if st.button("📷 Capture Broker Snapshot", type="primary", use_container_width=True):
+            st.session_state["_snapshot_request_id"] += 1
+            _rid = st.session_state["_snapshot_request_id"]
+            _request_id = f"DASHBOARD-PROBE-{DATE_STR}-{_rid:04d}"
+
+            # Write request file
+            _req = {
+                "request_id": _request_id,
+                "requested_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "operation": "CAPTURE_BROKER_SNAPSHOT",
+                "read_only": True,
+            }
+            _req_path = Path("/tmp/mts_broker_snapshot_request.json")
+            _req_path.write_text(json.dumps(_req, indent=2))
+
+            st.session_state["_last_probe_request_id"] = _request_id
+            st.session_state["_last_probe_time"] = datetime.datetime.now()
+            st.success(f"Request sent ({_request_id})")
+            st.caption("Waiting for trading process to process... (~1 tick cycle)")
+
+    with col_status:
+        if st.button("🔄 Refresh", use_container_width=True):
+            st.rerun()
+
+    # ── Display Response ──
+    if _response_file.exists():
+        try:
+            _resp = json.loads(_response_file.read_text())
+            _resp_time_str = _resp.get("captured_at", "")
+            _req_id = _resp.get("request_id", "")
+
+            # Check freshness: response age
+            _is_fresh = False
+            _age_seconds = 999
+            try:
+                _resp_time = datetime.datetime.fromisoformat(_resp_time_str)
+                _age_seconds = (datetime.datetime.now(datetime.timezone.utc) - _resp_time).total_seconds()
+                _is_fresh = _age_seconds <= 30
+            except Exception:
+                pass
+
+            # Check request ID match
+            _last_req_id = st.session_state.get("_last_probe_request_id", "")
+            _id_match = (not _last_req_id) or (_req_id == _last_req_id)
+
+            if not _is_fresh:
+                st.warning(f"⚠️ Response is {_age_seconds:.0f}s old (max 30s). Capture again for current state.")
+
+            # Display snapshot
+            _snap = _resp.get("snapshot", {})
+            if _snap:
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Position Count", _snap.get("position_count", "?"))
+                with col2:
+                    st.metric("Open Orders", _snap.get("open_order_count", "?"))
+                with col3:
+                    st.metric("Connected", "✅" if _snap.get("connected") else "❌")
+                with col4:
+                    st.metric("Authenticated", "✅" if _snap.get("authenticated") else "❌")
+
+                # Position details
+                if _snap.get("_positions"):
+                    with st.expander(f"📋 Positions ({len(_snap['_positions'])})", expanded=False):
+                        st.json(_snap["_positions"])
+
+                if _snap.get("_open_orders"):
+                    with st.expander(f"📋 Open Orders ({len(_snap['_open_orders'])})", expanded=False):
+                        st.json(_snap["_open_orders"])
+
+            # Display preflight result
+            _preflight = _resp.get("preflight", {})
+            if _preflight.get("passed"):
+                st.success("✅ Preflight Result: **PASSED** — broker ready for READY_FOR_COMMIT")
+                st.caption("PR 4 not yet implemented. Live transition not available.")
+            else:
+                st.error("❌ Preflight Result: **FAILED** — transition blocked")
+                for _check in _preflight.get("failed_checks", []):
+                    st.markdown(f"- ✗ `{_check}`")
+
+            # Response metadata
+            with st.expander("📄 Response Metadata", expanded=False):
+                st.json({
+                    "request_id": _req_id,
+                    "captured_at": _resp_time_str,
+                    "age_seconds": _age_seconds,
+                    "process_start_id": _resp.get("process_start_id", "?"),
+                    "read_only": _resp.get("read_only", False),
+                })
+
+        except Exception as e:
+            st.warning(f"Error reading response: {e}")
+    else:
+        st.info("No broker snapshot captured yet. Click 'Capture Broker Snapshot' above.")
+        st.caption("Note: trading-system must be restarted for the new probe code to take effect.")
+
+    # ── Safety Reminder ──
+    st.divider()
+    st.caption("⚠️ **Read-only diagnostic page.** Does not submit orders, cancel orders, flatten positions, or modify execution mode. PR 4 not yet implemented — this page cannot initiate Live trading.")
 
 # ════════════════════════════════════════
 # Tab 6: 設定

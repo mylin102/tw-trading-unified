@@ -367,6 +367,20 @@ class FuturesMonitor:
         self.live_trading = self.cfg.get("live_trading", False)
         self.cooldown_bars = self.cfg.get("cooldown_bars", self.STRATEGY.get("cooldown_bars", 8))
 
+        # ── Execution Context (P0-A Mode Model) ──
+        # Initializes on first run; preserves across config hot-reload.
+        # LIVE starts at LIVE_PREFLIGHT — no orders until transition completes.
+        if not hasattr(self, "_execution_context"):
+            try:
+                from core.mode_transition import live_preflight_context, paper_context, LiveOrderBlocked, EntryBlocked
+                if self.live_trading:
+                    self._execution_context = live_preflight_context()
+                else:
+                    self._execution_context = paper_context()
+            except ImportError:
+                self._execution_context = None
+                print("[MTS_EXEC_CTX] core.mode_transition not available — hard gate disabled")
+
         # 2026-07-07 Gemini CLI: Day and night session capital should share the same parameter.
         # Dynamically adjust trader state if balance changed
         if hasattr(self, 'trader') and self.trader:
@@ -411,7 +425,8 @@ class FuturesMonitor:
             from core.order_management.paper_fill import PaperFillSimulator
             _om_mode = "live" if self.live_trading else "paper"
             broker = self.client if self.live_trading else None
-            self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=broker)
+            self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=broker,
+                                          execution_context=getattr(self, '_execution_context', None))
             if _om_mode == "paper":
                 self.paper_fill_sim = PaperFillSimulator(self.order_mgr)
                 self.order_mgr.set_simulator(self.paper_fill_sim)
@@ -3506,6 +3521,36 @@ class FuturesMonitor:
         through this function.  Guard checks here are the LAST line of
         defense before an order hits the broker or paper_fill_sim.
         """
+        # ── P0 Hard Gate: First layer defense (Strategy Level) ──
+        # Rejects live orders when transition state is not LIVE_READY.
+        # This guard is redundant with OrderManager.submit() — both must pass.
+        _exec_ctx = getattr(self, "_execution_context", None)
+        if _exec_ctx is not None:
+            # Gate 1: Block live orders when transition not complete
+            if self.live_trading:
+                try:
+                    _exec_ctx.assert_live_order_allowed()
+                except LiveOrderBlocked as exc:
+                    console.print(
+                        f"[bold red]⛔ [MTS_ORDER_REJECT_LIVE_GATE] "
+                        f"{exc}[/bold red]"
+                    )
+                    return
+            # Gate 2: Block new entries during paper drain
+            # Even in paper mode, new positions cannot open during drain.
+            # Normalize action: could be str ("ENTRY") or enum (LifecycleAction).
+            _sig_action = getattr(signal, "action", None)
+            _action_value = getattr(_sig_action, "value", _sig_action)
+            if _action_value in ("ENTRY", "BUY", "SELL"):
+                try:
+                    _exec_ctx.assert_entry_allowed()
+                except EntryBlocked as exc:
+                    console.print(
+                        f"[bold yellow]⛔ [MTS_ENTRY_REJECT_DRAIN] "
+                        f"{exc}[/bold yellow]"
+                    )
+                    return
+
         if not self.order_mgr:
             console.print("[red]⚠️ [MTS_ORDER] order_mgr not available — cannot submit order[/red]")
             return
@@ -4907,10 +4952,206 @@ class FuturesMonitor:
             self._append_mts_event("RECONCILIATION_FAILURE", reason="GHOST_POSITION", mem_pos=_has_pos_in_mem, released=_released_leg, broker_pos=_broker_pos)
             strategy._reset(reason="WATCHDOG_RECONCILIATION_SYNC")
 
+    # ── Broker Snapshot Probe ──────────────────────────────────────────
+    # Read-only: captures positions/open-orders using existing Shioaji
+    # session. Triggered by request file at /tmp/mts_broker_snapshot_request.json
+    # Response written to exports/trades/live/diagnostics/
+    # ────────────────────────────────────────────────────────────────────
+
+    _BROKER_SNAPSHOT_REQUEST_PATH = "/tmp/mts_broker_snapshot_request.json"
+
+    def capture_broker_snapshot(self) -> dict:
+        """Capture a read-only BrokerSnapshot using the existing Shioaji session.
+
+        Returns a dict matching BrokerSnapshot schema.
+        Raises RuntimeError on any query failure (never returns partial data).
+        """
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+
+        raw_api = getattr(self, "api", None)
+        if raw_api is None:
+            raise RuntimeError("BROKER_CLIENT_UNAVAILABLE")
+
+        account = getattr(raw_api, "futopt_account", None)
+        if account is None:
+            raise RuntimeError("BROKER_ACCOUNT_UNAVAILABLE")
+
+        # Positions (must succeed)
+        try:
+            positions = list(raw_api.list_positions(account))
+        except Exception as exc:
+            raise RuntimeError(f"BROKER_POSITION_QUERY_FAILED: {exc}") from exc
+
+        pos_time = datetime.now(timezone.utc)
+
+        # Open orders (must succeed, but empty is valid)
+        try:
+            all_trades = list(raw_api.list_trades())
+        except Exception:
+            try:
+                all_trades = list(raw_api.list_trades(account))
+            except Exception as exc:
+                raise RuntimeError(f"BROKER_ORDER_QUERY_FAILED: {exc}") from exc
+
+        ord_time = datetime.now(timezone.utc)
+
+        open_orders = [
+            t for t in all_trades
+            if getattr(t.status, "status", "") not in ("Filled", "Cancelled", "Expired", "Done")
+        ]
+
+        # Account identity (for preflight match check)
+        account_id_raw = f"{account.person_id}:{account.broker_id}:{account.account_id}"
+        import hashlib
+        account_id_hash = hashlib.sha256(account_id_raw.encode()).hexdigest()
+
+        return {
+            "connected": True,
+            "authenticated": True,
+            "account_id_hash": account_id_hash,
+            "position_count": len(positions),
+            "open_order_count": len(open_orders),
+            "position_snapshot_time": pos_time.isoformat(),
+            "order_snapshot_time": ord_time.isoformat(),
+            # Raw data for audit (no PII)
+            "_positions": [
+                {"code": p.code, "qty": p.quantity, "pnl": p.pnl}
+                for p in positions
+            ],
+            "_open_orders": [
+                {"code": t.code, "qty": t.quantity, "status": getattr(t.status, "status", "?")}
+                for t in open_orders
+            ],
+        }
+
+    def _check_broker_snapshot_request(self) -> bool:
+        """Check for a broker snapshot request file and process it.
+
+        Returns True if a request was processed (caller should skip tick),
+        False if no request was present.
+        """
+        import json, os
+        from datetime import timezone
+
+        request_path = self._BROKER_SNAPSHOT_REQUEST_PATH
+        if not os.path.exists(request_path):
+            return False
+
+        try:
+            with open(request_path, "r") as f:
+                request = json.load(f)
+        except Exception:
+            # Malformed request: remove and ignore
+            try:
+                os.remove(request_path)
+            except Exception:
+                pass
+            return False
+
+        request_id = request.get("request_id", "UNKNOWN")
+        operation = request.get("operation", "")
+
+        if operation != "CAPTURE_BROKER_SNAPSHOT":
+            console.print(f"[yellow]⚠️ [BROKER_PROBE] Unknown operation: {operation}[/yellow]")
+            try:
+                os.remove(request_path)
+            except Exception:
+                pass
+            return False
+
+        console.print(f"[cyan]📷 [BROKER_PROBE] {request_id}: capturing snapshot...[/cyan]")
+
+        # Create diagnostic output directory
+        diag_dir = Path("exports/trades/live/diagnostics")
+        diag_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            snapshot = self.capture_broker_snapshot()
+
+            # Evaluate preflight (pure function, no side effects)
+            from core.mode_transition import evaluate_broker_preflight, BrokerSnapshot
+
+            preflight_snapshot = BrokerSnapshot(
+                connected=snapshot["connected"],
+                authenticated=snapshot["authenticated"],
+                account_id_hash=snapshot["account_id_hash"],
+                position_count=snapshot["position_count"],
+                open_order_count=snapshot["open_order_count"],
+                position_snapshot_time=datetime.fromisoformat(snapshot["position_snapshot_time"]),
+                order_snapshot_time=datetime.fromisoformat(snapshot["order_snapshot_time"]),
+            )
+            result = evaluate_broker_preflight(preflight_snapshot)
+
+            # Build response
+            response = {
+                "request_id": request_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "process_start_id": (
+                    getattr(getattr(self, "_execution_context", None), "process_start_id", None)
+                ),
+                "read_only": True,
+                "snapshot": snapshot,
+                "preflight": {
+                    "passed": result.passed,
+                    "failed_checks": list(result.failed_checks),
+                },
+            }
+
+            # Atomic write: tmp → fsync → replace
+            tmp_path = diag_dir / f"broker_snapshot_{request_id}.tmp"
+            final_path = diag_dir / f"broker_snapshot_{request_id}.json"
+            tmp_path.write_text(json.dumps(response, indent=2, default=str))
+            tmp_path.replace(final_path)
+
+            # Also update the canonical response file
+            latest = diag_dir / "broker_snapshot_latest.json"
+            latest_tmp = diag_dir / "broker_snapshot_latest.tmp"
+            latest_tmp.write_text(json.dumps(response, indent=2, default=str))
+            latest_tmp.replace(latest)
+
+            if result.passed:
+                console.print(f"[green]✅ [BROKER_PROBE] {request_id}: PASSED[/green]")
+            else:
+                console.print(f"[yellow]⚠️ [BROKER_PROBE] {request_id}: FAILED - {result.failed_checks}[/yellow]")
+
+        except RuntimeError as exc:
+            failure = {
+                "request_id": request_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "read_only": True,
+                "error": str(exc),
+                "snapshot": None,
+                "preflight": {"passed": False, "failed_checks": [str(exc)]},
+            }
+            final_path = diag_dir / f"broker_snapshot_{request_id}.json"
+            final_path.write_text(json.dumps(failure, indent=2, default=str))
+            console.print(f"[red]❌ [BROKER_PROBE] {request_id}: ERROR - {exc}[/red]")
+
+        except Exception as exc:
+            console.print(f"[red]❌ [BROKER_PROBE] {request_id}: UNEXPECTED ERROR - {type(exc).__name__}: {exc}[/red]")
+            import traceback
+            traceback.print_exc()
+
+        finally:
+            # Always consume the request
+            try:
+                os.remove(request_path)
+            except Exception:
+                pass
+
+        # Signal caller to skip this tick (probe takes priority)
+        return True
+
     def _mts_tick(self, enriched_bar: dict | None = None):
         """MTS minimal execution path. Uses enriched bar from pipeline when available,
         falls back to building bar from tick deque if none provided."""
         print("MTS_ALIVE", flush=True)
+
+        # ── Read-only broker snapshot probe (request file) ──
+        if self._check_broker_snapshot_request():
+            return
+
         _mts = self.cfg.get("mts", {})
         _strat_name = _mts.get("strategy", "tmf_spread")
 
