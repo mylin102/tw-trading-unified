@@ -490,7 +490,7 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
         .opt-item.warning {{
             background-color: rgba(239, 68, 68, 0.05);
             border-left-color: var(--danger);
-        }}
+      }}
     </style>
 </head>
 <body>
@@ -525,8 +525,8 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
                 <span class="kpi-value">{profit_factor:.2f}</span>
             </div>
             <div class="kpi-card">
-                <span class="kpi-title">每筆平均淨損益</span>
-                <span class="kpi-value">{pnl_class}">{pnl_symbol}${avg_net_pnl:,.1f} TWD</span>
+                <span class="kpi-title">每筆平均淨損益 (PnL)</span>
+                <span class="kpi-value {pnl_class}">{pnl_symbol}${avg_net_pnl:,.1f} TWD</span>          
             </div>
         </div>
 

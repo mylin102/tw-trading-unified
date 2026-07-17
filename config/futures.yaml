@@ -115,22 +115,29 @@ squeeze_policy:
   fire_scout_time_stop_bars: 6
 debug:
   tickbar: true
-  feed: true
+  feed: false # 2026-07-16 Gemini CLI: Disabled high-frequency feed logging to save CPU & temperature.
 mts:
   enabled: true
   strategy: tmf_spread
   lots: 1
-  release_mode: "triggered_market"  # Phase 1: triggered_market. Phase 2: triggered_oco_limit / entry_oco_limit
+  release_mode: triggered_market
+  mtf:
+    # 2026-07-14 Gemini CLI: MTF mode and freshness threshold configuration for ADR-009
+    mode: shadow
+    max_age_sec: 420
   params:
     min_atr: 10.0
-    atr_multiplier_stop: 2.0
-    atr_multiplier_trail: 0.1
+    atr_multiplier_stop: 2.1
+    atr_multiplier_trail: 1.1
     release_stop_points: 200
     trail_distance_points: 30
     atr_cap: 250.0
     confirm_ticks: 2
     confirm_ms: 800
-    max_quote_age_ms: 1000
+    max_quote_age_ms: 2000
+    vwap_exit:
+      enabled: true
+      tighten_ratio: 0.3
     max_spread_width: 3
     entry_z:
       low_atr: 2.0
@@ -138,6 +145,14 @@ mts:
       high_atr: 3.0
     atr_low_threshold: 15.0
     atr_high_threshold: 30.0
+    release_filter:
+      bb_enabled: true
+      bb_period: 20
+      bb_std_mult: 2.0
+      sell_within_bb_upper: 0.1
+      buy_within_bb_lower: 0.1
+      emergency_bypass_enabled: true
+      emergency_bypass_mult: 2.0
     mfe_tighten:
       enabled: true
       level_1_atr: 2.0

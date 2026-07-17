@@ -656,12 +656,12 @@ class OrderManager:
         Both order ids MUST be returned before any state is persisted
         (submit-before-commit invariant).
 
-        Paper mode: creates two orders × submit.
-        Live mode (future): broker-native OCO or two orders + auto-cancel.
-
         When price_near/price_far are provided, uses LIMIT order type
         so the paper_fill_sim only fills when the release threshold
         is reached.  Omit for MKP (range market) orders.
+
+        Paper mode: creates two orders × submit.
+        Live mode (future): broker-native OCO or two orders + auto-cancel.
 
         Returns (near_order_id, far_order_id).
         Raises RuntimeError if either submission fails.

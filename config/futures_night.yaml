@@ -55,7 +55,7 @@ risk_mgmt:
   trailing_stop_enabled: true
   trailing_stop_trigger_pts: 120
 strategy:
-  active_strategy: adaptive_orb_v15
+  active_strategy: squeeze_fire_scout
   auto_select: false
   volume_threshold: 0.001
   params:
@@ -96,7 +96,7 @@ strategy:
     5m: 0.4
 debug:
   tickbar: false
-  feed: true
+  feed: false
 mts:
   enabled: true
   strategy: tmf_spread
@@ -104,13 +104,16 @@ mts:
   params:
     min_atr: 20.0
     atr_multiplier_stop: 1.5
-    atr_multiplier_trail: 0.1
+    atr_multiplier_trail: 1.0
     release_stop_points: 99
     trail_distance_points: 10
-    atr_cap: 100.0
+    atr_cap: 200.0
     confirm_ticks: 2
     confirm_ms: 800
-    max_quote_age_ms: 1000
+    max_quote_age_ms: 2000
+    vwap_exit:
+      enabled: true
+      tighten_ratio: 0.5
     max_spread_width: 3
     entry_z:
       low_atr: 2.0
@@ -118,6 +121,14 @@ mts:
       high_atr: 3.0
     atr_low_threshold: 15.0
     atr_high_threshold: 30.0
+    release_filter:
+      bb_enabled: true
+      bb_period: 20
+      bb_std_mult: 2.0
+      sell_within_bb_upper: 0.1
+      buy_within_bb_lower: 0.1
+      emergency_bypass_enabled: true
+      emergency_bypass_mult: 2.0
     mfe_tighten:
       enabled: true
       level_1_atr: 2.0

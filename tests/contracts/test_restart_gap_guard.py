@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from strategies.plugins.futures.active.tmf_spread import (
     PositionPhase, PositionLifecycle, ReleaseGroup, ReleaseGroupStatus,
-    TrailGroup, TrailGroupStatus,
+    TrailGroup, TrailGroupStatus, Leg,
 )
 from core.signal import Signal
 
@@ -65,7 +65,8 @@ def test_blocks_exit_when_lifecycle_none_but_has_position(monitor, strategy, bar
     strategy._lifecycle_oca = None
     signal = Signal("EXIT", "TMF_TRAIL_EXIT_LONG")
 
-    with patch.object(monitor.order_mgr, "submit") as mock_submit:
+    with patch("strategies.futures.monitor._mts_position_state_path", return_value=Path("nonexistent.json")), \
+         patch.object(monitor.order_mgr, "submit") as mock_submit:
         monitor._submit_mts_order_signal(signal, strategy, bar_dict, datetime.now())
         assert not mock_submit.called, "Expected block: lifecycle=None + has_position"
 
@@ -76,41 +77,41 @@ def test_blocks_exit_when_lifecycle_flat_but_has_position(monitor, strategy, bar
     strategy._lifecycle_oca = PositionLifecycle(phase=PositionPhase.FLAT)
     signal = Signal("EXIT", "TMF_TRAIL_EXIT_LONG")
 
-    with patch.object(monitor.order_mgr, "submit") as mock_submit:
+    with patch("strategies.futures.monitor._mts_position_state_path", return_value=Path("nonexistent.json")), \
+         patch.object(monitor.order_mgr, "submit") as mock_submit:
         monitor._submit_mts_order_signal(signal, strategy, bar_dict, datetime.now())
         assert not mock_submit.called, "Expected block: lifecycle=FLAT + has_position"
 
 
 def test_allows_exit_when_lifecycle_single_leg(monitor, strategy, bar_dict):
-    """phase=SINGLE_LEG + has_position=True → allow."""
+    """phase=SINGLE_LEG + rg_status=COMPLETED → allow (sync_release sets COMPLETED)."""
     from datetime import datetime
     strategy._lifecycle_oca = PositionLifecycle(
         phase=PositionPhase.SINGLE_LEG,
         release_group=ReleaseGroup(
-            status=ReleaseGroupStatus.SIBLING_CANCELED,
-            near_order_id="ORD-TEST-NEAR", far_order_id="ORD-TEST-FAR",
-            near_side="buy", far_side="sell",
+            status=ReleaseGroupStatus.COMPLETED,
+            filled_leg=Leg.NEAR, canceled_leg=Leg.FAR,
         ),
         trail_group=TrailGroup(status=TrailGroupStatus.ARMED),
     )
     signal = Signal("EXIT", "TMF_TRAIL_EXIT_LONG")
 
-    with patch.object(monitor.order_mgr, "submit") as mock_submit:
+    with patch("strategies.futures.monitor._mts_position_state_path", return_value=Path("nonexistent.json")), \
+         patch.object(monitor.order_mgr, "submit") as mock_submit:
         monitor._submit_mts_order_signal(signal, strategy, bar_dict, datetime.now())
         assert mock_submit.called, "Expected allow: lifecycle=SINGLE_LEG + has_position"
 
 
 def test_no_effect_when_flat_no_position(monitor, strategy, bar_dict):
-    """phase=FLAT + has_position=False → guard passes, EXIT proceeds normally."""
+    """phase=FLAT + has_position=False → EXIT blocked by Phase 1 guard."""
     from datetime import datetime
     strategy._has_position = False
     strategy._lifecycle_oca = PositionLifecycle(phase=PositionPhase.FLAT)
     signal = Signal("EXIT", "TMF_TRAIL_EXIT_LONG")
 
-    with patch.object(monitor.order_mgr, "submit") as mock_submit:
+    with patch("strategies.futures.monitor._mts_position_state_path", return_value=Path("nonexistent.json")), \
+         patch.object(monitor.order_mgr, "submit") as mock_submit:
         monitor._submit_mts_order_signal(signal, strategy, bar_dict, datetime.now())
-        # Guard doesn't block. Strategy has _released_leg="near" so
-        # _remaining_side is "LONG" → EXIT proceeds and submits.
-        assert mock_submit.called, (
-            "Guard passes for FLAT + no position; EXIT submits normally"
+        assert not mock_submit.called, (
+            "ADR-011 guard blocks EXIT: phase=FLAT != SINGLE_LEG"
         )

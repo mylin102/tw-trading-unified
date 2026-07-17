@@ -369,3 +369,47 @@ def parse_csv_last_timestamp(csv_path) -> pd.Timestamp:
         return df["timestamp"].iloc[-1]
     except Exception:
         return pd.NaT
+
+
+# ═══════════════════════════════════════════════════════════════
+# 2026-07-08 Hermes Agent: session close timing for MTS risk controls
+# ═══════════════════════════════════════════════════════════════
+
+# Session close times (HH:MM in minutes from midnight)
+_DAY_CLOSE_MINUTES = 13 * 60 + 45   # 13:45
+_NIGHT_CLOSE_MINUTES = 5 * 60       # 05:00
+
+
+def _minutes_to_session_close(dt: datetime | None = None) -> float | None:
+    """Return minutes until the current trading session closes.
+
+    Returns None if not currently in a trading session.
+    Day session (08:45-13:45): minutes to 13:45.
+    Night session (15:00-05:00): minutes to 05:00 (next calendar day).
+
+    Args:
+        dt: datetime to check; uses now() if None.
+    """
+    if dt is None:
+        dt = datetime.now()
+    if isinstance(dt, pd.Timestamp):
+        dt = dt.to_pydatetime()
+
+    hhmm = int(dt.strftime("%H%M"))
+    now_minutes = dt.hour * 60 + dt.minute
+
+    # Day session: 08:45 - 13:45
+    if 845 <= hhmm <= 1345:
+        return max(0.0, _DAY_CLOSE_MINUTES - now_minutes)
+
+    # Night session: 15:00 - 23:59 (closes next day 05:00)
+    if hhmm >= 1500:
+        # close is 05:00 tomorrow = (24*60 + 5*60) - now_minutes
+        return max(0.0, (24 * 60 + _NIGHT_CLOSE_MINUTES) - now_minutes)
+
+    # Night session: 00:00 - 05:00 (closes today 05:00)
+    if hhmm < 500:
+        return max(0.0, _NIGHT_CLOSE_MINUTES - now_minutes)
+
+    # Between sessions (05:00-08:44, 13:46-14:59): not in session
+    return None

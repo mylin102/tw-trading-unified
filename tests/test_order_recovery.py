@@ -312,7 +312,8 @@ def test_futures_monitor_records_exit_lifecycle_without_restart(tmp_path, monkey
     assert [o.side.value for o in completed] == ["sell", "buy"]
     assert completed[1].comment == "EXIT STOP_LOSS"
 
-    orders_file = tmp_path / "exports" / "trades" / f"{configured_ticker}_{datetime.datetime.now():%Y%m%d}_orders.json"
+    session_date = getattr(monitor.order_mgr, "_session_date", datetime.datetime.now().strftime("%Y%m%d"))
+    orders_file = tmp_path / "exports" / "trades" / f"{configured_ticker}_{session_date}_orders.json"
     orders_data = json.loads(orders_file.read_text(encoding="utf-8"))
     assert len(orders_data) == 2
     assert [row["side"] for row in orders_data] == ["sell", "buy"]
@@ -373,7 +374,8 @@ def test_futures_monitor_recovers_exit_lifecycle_from_trades_csv(tmp_path, monke
     assert len(completed) == 2
     assert [o.side.value for o in completed] == ["sell", "buy"]
 
-    orders_file = trades_dir / f"{configured_ticker}_{today}_orders.json"
+    session_date = getattr(monitor.order_mgr, "_session_date", today)
+    orders_file = trades_dir / f"{configured_ticker}_{session_date}_orders.json"
     orders_data = json.loads(orders_file.read_text(encoding="utf-8"))
     assert len(orders_data) == 2
     assert [row["side"] for row in orders_data] == ["sell", "buy"]

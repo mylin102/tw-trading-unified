@@ -106,7 +106,7 @@ strategy:
     5m: 0.4
 debug:
   tickbar: false
-  feed: true  # 開啟 feed 日誌，方便監控
+  feed: false  # 2026-07-16 Gemini CLI: Disabled high-frequency feed logging to save CPU & temperature.
 trade_mgmt:
   allow_long: false  # weak_bear_trend 只做空
   allow_short: true

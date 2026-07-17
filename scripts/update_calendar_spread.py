@@ -66,8 +66,12 @@ def _dedup_contracts(contracts):
     return result
 
 
-def get_near_far(api, category=None):
-    """Get near and far month contracts (unique, non-rolling)."""
+def get_near_far(api, category=None, days_to_switch=3):
+    """Get near and far month contracts (unique, non-rolling).
+    
+    Skips contracts within ``days_to_switch`` of expiry, matching
+    ``ContractResolver.get_near_far_contracts()`` logic.
+    """
     if category is None:
         category = TICKER
     
@@ -80,10 +84,27 @@ def get_near_far(api, category=None):
     regular = [c for c in contracts if not c.code.endswith(("R1", "R2", "R3"))]
     unique = _dedup_contracts(regular)
     sorted_c = sorted(unique, key=lambda c: c.delivery_date)
-    if len(sorted_c) < 2:
-        print(f"ERROR: Not enough {category} contracts: {len(sorted_c)}")
+
+    # Filter out contracts within days_to_switch of expiry (may return empty kbars)
+    today = datetime.now()
+    available = []
+    for c in sorted_c:
+        try:
+            ddate = datetime.strptime(c.delivery_date, "%Y/%m/%d")
+            if (ddate - today).days > days_to_switch:
+                available.append(c)
+        except (ValueError, AttributeError):
+            continue
+
+    if len(available) < 2:
+        # Fallback: try without expiry filter — maybe the data API still works
+        print(f"WARN: Only {len(available)} contracts survive expiry filter; falling back to raw sort")
+        available = sorted_c
+
+    if len(available) < 2:
+        print(f"ERROR: Not enough {category} contracts: {len(available)}")
         return None, None
-    return sorted_c[0], sorted_c[1]
+    return available[0], available[1]
 
 
 def fetch_kbars(api, contract, days=2):

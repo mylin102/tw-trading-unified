@@ -42,6 +42,22 @@ def test_mts_exit_trigger_logic(strategy):
     strategy._far_entry = 44000.0
     strategy._peak = 44100.0
     strategy._ticker = "TMF"
+    # ADR-011 Phase 3: Must set lifecycle explicitly (legacy fallback blocked)
+    from strategies.plugins.futures.active.tmf_spread import (
+        PositionPhase, PositionLifecycle, ReleaseGroup, ReleaseGroupStatus,
+        TrailGroup, TrailGroupStatus, Leg,
+    )
+    strategy._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SINGLE_LEG,
+        release_group=ReleaseGroup(
+            status=ReleaseGroupStatus.COMPLETED,
+            filled_leg=Leg.NEAR, canceled_leg=Leg.FAR,
+        ),
+        trail_group=TrailGroup(
+            status=TrailGroupStatus.ARMED,
+            remaining_leg=Leg.FAR,
+        ),
+    )
     
     # 2. Case A: Price is 44075 (Peak 100 - Current 75 = 25 pts drop, < 35 threshold) -> No signal
     bar_no_exit = {
@@ -107,14 +123,13 @@ def test_mts_order_lifecycle_flow():
     # 2026-07-07 Hermes Agent: lifecycle must be SINGLE_LEG (restart gap guard)
     from strategies.plugins.futures.active.tmf_spread import (
         PositionPhase, PositionLifecycle, ReleaseGroup, ReleaseGroupStatus,
-        TrailGroup, TrailGroupStatus,
+        TrailGroup, TrailGroupStatus, Leg,
     )
     strat._lifecycle_oca = PositionLifecycle(
         phase=PositionPhase.SINGLE_LEG,
         release_group=ReleaseGroup(
-            status=ReleaseGroupStatus.SIBLING_CANCELED,
-            near_order_id="ORD-TEST-N", far_order_id="ORD-TEST-F",
-            near_side="buy", far_side="sell",
+            status=ReleaseGroupStatus.COMPLETED,
+            filled_leg=Leg.FAR, canceled_leg=Leg.NEAR,
         ),
         trail_group=TrailGroup(status=TrailGroupStatus.ARMED),
     )
@@ -128,7 +143,10 @@ def test_mts_order_lifecycle_flow():
     # 2026-05-25 Gemini CLI: Pass a Signal object to _submit_mts_order_signal
     signal_obj = Signal("EXIT", "TMF_TRAIL_EXIT_LONG")
     
-    with patch.object(monitor.order_mgr, 'submit') as mock_submit:
+    with patch.object(monitor.order_mgr, 'submit') as mock_submit, \
+         patch("strategies.futures.monitor._mts_position_state_path") as mock_state_path, \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True):
+        mock_state_path.return_value.exists.return_value = False
         monitor._submit_mts_order_signal(signal_obj, strat, bar_dict, datetime.now())
         
         # Verify order creation and label

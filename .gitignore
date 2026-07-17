@@ -81,3 +81,5 @@ monitor_snippet_tmp.py
 
 # Runtime checkpoint artifacts (ADR-010 Sprint 6B)
 _oco_checkpoints/
+# 2026-07-08 Gemini CLI: ignore temp exports trades directory
+tests/temp_exports_trades/

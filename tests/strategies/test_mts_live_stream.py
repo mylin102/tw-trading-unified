@@ -72,11 +72,31 @@ def test_live_stream_flash_spike(monitor):
     strat._released_leg = "near"
     strat._far_entry = 44000.0
     strat._peak = 44000.0
+    # ADR-011 Phase 4: simulate warmup expiry (entered 1s ago)
+    import time as _time
+    strat._single_leg_entered_mono = _time.monotonic() - 1.0
+    # ADR-011 Phase 3: Must set lifecycle explicitly (legacy fallback blocked)
+    from strategies.plugins.futures.active.tmf_spread import (
+        PositionPhase, PositionLifecycle, ReleaseGroup, ReleaseGroupStatus,
+        TrailGroup, TrailGroupStatus, Leg,
+    )
+    strat._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SINGLE_LEG,
+        release_group=ReleaseGroup(
+            status=ReleaseGroupStatus.COMPLETED,
+            filled_leg=Leg.NEAR, canceled_leg=Leg.FAR,
+        ),
+        trail_group=TrailGroup(
+            status=TrailGroupStatus.ARMED,
+            remaining_leg=Leg.FAR,
+        ),
+    )
     
     with open(state_path, "w") as f:
         json.dump({"has_position": True, "near_entry": 43900, "far_entry": 44000, "near_side": "SHORT", "far_side": "LONG"}, f)
 
     dt = datetime(2026, 5, 26, 17, 30, 0)
+    mock_tick_counter = [0]  # mutable closure for unique timestamps
 
     # 2. Simulate the Live Tick Stream
     m._spread_loader = MagicMock()
@@ -86,6 +106,9 @@ def test_live_stream_flash_spike(monitor):
         bar_dict["spread_z"] = 1.0
         if "near_close" not in bar_dict: bar_dict["near_close"] = 43900.0
         if "far_close" not in bar_dict: bar_dict["far_close"] = 44000.0
+        # ADR-011 Phase 5: Provide advancing timestamp for warmup tick dedup
+        mock_tick_counter[0] += 1
+        bar_dict["timestamp"] = datetime(2026, 5, 26, 17, 30, mock_tick_counter[0] * 5)
 
     m._spread_loader.enrich_bar.side_effect = mock_enrich
 

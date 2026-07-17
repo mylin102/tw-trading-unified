@@ -891,10 +891,7 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
         fig.update_xaxes(
             rangebreaks=[
                 dict(bounds=["sat", "mon"]), # Remove weekends
-                dict(bounds=[5, 8.75], pattern="hour"),  # 05:00 - 08:45
-                dict(bounds=[13.75, 15], pattern="hour"), # 13:45 - 15:00
             ],
-            dtick=3600000,                                # Every hour in milliseconds
             tickformat="%m/%d\n%H:%M",
             hoverformat="%Y/%m/%d %H:%M",
             showgrid=True,
@@ -920,7 +917,6 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
     fig.update_yaxes(
         title_text="價格",
         tickformat=".0f",
-        dtick=50,
         showgrid=True,
         gridwidth=1,
         gridcolor="rgba(128, 128, 128, 0.2)",
@@ -1174,10 +1170,7 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
         fig.update_xaxes(
             rangebreaks=[
                 dict(bounds=["sat", "mon"]),  # 移除週末
-                dict(bounds=[5, 8.75], pattern="hour"),   # 05:00 - 08:45
-                dict(bounds=[13.75, 15], pattern="hour"), # 13:45 - 15:00
             ],
-            dtick=3600000,                                # 1小時 = 3,600,000 毫秒
             tickformat="%m/%d\n%H:%M",                   # 時間軸顯示格式
             showgrid=True,
             gridwidth=1,
@@ -1190,7 +1183,6 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     fig.update_yaxes(
         title_text="價格",
         tickformat=".0f",      # Display raw values (46000, 46100...) without metric prefix (k)
-        dtick=50,              # Grid and tick every 50 points
         showgrid=True,
         gridwidth=1,
         gridcolor="rgba(128, 128, 128, 0.2)", # 細水平線

@@ -117,7 +117,7 @@ class TestMTSStateRestore:
 
             strategy = TMFSpread()
             strategy.init(ctx)
-            assert strategy._has_position is False  # fresh instance
+            assert strategy._has_position is None  # fresh instance
 
             result = strategy.on_bar(ctx)
 
@@ -228,7 +228,7 @@ class TestMTSStateRestore:
 
             strategy = TMFSpread()
             strategy.init(ctx)
-            assert strategy._has_position is False
+            assert strategy._has_position is None
             result = strategy.on_bar(ctx)
             assert strategy._has_position is False  # no position opened (spread_z=0)
             assert result is None
@@ -245,7 +245,7 @@ class TestMTSStateRestore:
 
             strategy = TMFSpread()
             strategy.init(ctx)
-            assert strategy._has_position is False
+            assert strategy._has_position is None
             result = strategy.on_bar(ctx)
             # No entry because spread_z=0, so stays flat
             assert strategy._has_position is False
@@ -258,7 +258,7 @@ class TestMTSStateRestore:
 
             strategy = TMFSpread()
             strategy.init(_neutral_context())
-            assert strategy._has_position is False
+            assert strategy._has_position is None
             result = strategy.on_bar(_neutral_context())
             assert strategy._has_position is False
             assert result is None
@@ -280,7 +280,7 @@ class TestMTSStateRestore:
 
             strategy = TMFSpread()
             strategy.init(ctx)
-            assert strategy._has_position is False
+            assert strategy._has_position is None
             result = strategy.on_bar(ctx)
             # Fresh entry succeeds (stale state doesn't block)
             # 2026-05-25 Gemini CLI: Updated for Deferred Strategy Sync

@@ -41,6 +41,8 @@ def mock_orders_dir(monkeypatch, tmp_path):
 
     # Patch cwd so the relative path in reindex_orders resolves
     monkeypatch.chdir(tmp_path)
+    # 2026-07-08 Gemini CLI: Force session date to 20260707 so order manager finds the orders JSON file
+    monkeypatch.setattr("core.date_utils.get_session_date_str", lambda: "20260707")
     return tmp_path
 
 

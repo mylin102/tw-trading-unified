@@ -63,17 +63,21 @@ class StrategyRegistry:
         """Import a plugin file directly (no package path needed) and register it."""
         try:
             # GSD: Use unique module name to avoid collision across subdirectories
-            # format: plugin.futures.active.squeeze_fire_scout
+            # format: strategies.plugins.futures.active.squeeze_fire_scout
             rel_path = py_file.relative_to(self._plugin_root)
-            module_name = "plugin." + ".".join(rel_path.with_suffix("").parts)
+            module_name = "strategies.plugins." + ".".join(rel_path.with_suffix("").parts)
             
-            spec = importlib.util.spec_from_file_location(module_name, py_file)
-            if spec is None or spec.loader is None:
-                self._errors[py_file.stem] = "Could not load spec"
-                return
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = mod
-            spec.loader.exec_module(mod)
+            # Reuse already loaded module to prevent split-brain class/enum identities
+            if module_name in sys.modules:
+                mod = sys.modules[module_name]
+            else:
+                spec = importlib.util.spec_from_file_location(module_name, py_file)
+                if spec is None or spec.loader is None:
+                    self._errors[py_file.stem] = "Could not load spec"
+                    return
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = mod
+                spec.loader.exec_module(mod)
         except Exception as exc:
             self._errors[py_file.stem] = str(exc)
             logger.warning("Plugin import failed — %s: %s", py_file.stem, exc)
