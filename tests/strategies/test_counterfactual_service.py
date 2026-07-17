@@ -5,6 +5,7 @@ import os
 import sys
 import hashlib
 import copy
+import json
 from pathlib import Path
 from core.counterfactual_service import CounterfactualService, ReplayConfig, PointReplayResult, DatasetContractError
 
@@ -138,6 +139,127 @@ def test_dataset_contract_fail_fast(tmp_path):
 
 def test_service_import_has_no_runtime_side_effects():
     """Verify that importing CounterfactualService has no runtime side effects on production systems."""
-    # Ensure key modules like shioaji are not active or connected during load
-    # (Checking sys.modules to see if they're imported but we also check for actual running instances/connections)
     assert "core.counterfactual_service" in sys.modules
+
+def test_run_parameter_sweep_validation():
+    """Verify parameter whitelist and value bounds checks in run_parameter_sweep."""
+    from core.counterfactual_service import SweepParameter, SweepRequest
+    service = CounterfactualService(data_path=FIXTURE_PATH)
+    
+    # 1. Invalid parameter name
+    req_invalid_name = SweepRequest(
+        parameters=(SweepParameter(name="invalid_param", values=(10.0,)),),
+        baseline_config=ReplayConfig(release_stop_threshold=14.0),
+        dataset_generation_id="test-gen",
+        eligibility_policy_version="v1.0"
+    )
+    with pytest.raises(ValueError, match="is not in the sweepable whitelist"):
+        service.run_parameter_sweep(req_invalid_name)
+        
+    # 2. Out of bounds value
+    req_out_of_bounds = SweepRequest(
+        parameters=(SweepParameter(name="release_stop_threshold", values=(2.0,)),), # min is 5.0
+        baseline_config=ReplayConfig(release_stop_threshold=14.0),
+        dataset_generation_id="test-gen",
+        eligibility_policy_version="v1.0"
+    )
+    with pytest.raises(ValueError, match="is out of bounds"):
+        service.run_parameter_sweep(req_out_of_bounds)
+
+def test_run_parameter_sweep_reproduction():
+    """Verify that sweeping at baseline value reproduces certified point replay with zero drift."""
+    from core.counterfactual_service import SweepParameter, SweepRequest, DecisionDriftCategory
+    service = CounterfactualService(data_path=FIXTURE_PATH)
+    
+    # Sweep at baseline value 14.0
+    req = SweepRequest(
+        parameters=(SweepParameter(name="release_stop_threshold", values=(14.0,)),),
+        baseline_config=ReplayConfig(release_stop_threshold=14.0),
+        dataset_generation_id="test-gen",
+        eligibility_policy_version="v1.0"
+    )
+    result = service.run_parameter_sweep(req)
+    
+    assert result.parameter_name == "release_stop_threshold"
+    assert len(result.metrics_rows) == 1
+    metric = result.metrics_rows[0]
+    
+    assert metric.parameter_value == 14.0
+    assert metric.decision_drift_count == 0
+    assert metric.unchanged_count == metric.eligible_cases
+    assert metric.baseline_action_drift_rate == 0.0
+    
+    # Verify case matrix rows have NONE drift category
+    for row in result.case_matrix:
+        assert row.drift_category == DecisionDriftCategory.NONE
+        # Assert that baseline decision equals counterfactual decision
+        assert row.baseline_action == row.counterfactual_action
+        assert row.baseline_leg == row.counterfactual_leg
+
+def test_run_parameter_sweep_drift():
+    """Verify that non-baseline parameter sweep triggers decision drift and categorizes it correctly."""
+    from core.counterfactual_service import SweepParameter, SweepRequest, DecisionDriftCategory
+    service = CounterfactualService(data_path=FIXTURE_PATH)
+    
+    # Sweep at very wide value 1000.0 (which should prevent releases from triggering, i.e., drift)
+    req = SweepRequest(
+        parameters=(SweepParameter(name="release_stop_threshold", values=(1000.0, 130.0)),),
+        baseline_config=ReplayConfig(release_stop_threshold=130.0),
+        dataset_generation_id="test-gen",
+        eligibility_policy_version="v1.0"
+    )
+    result = service.run_parameter_sweep(req)
+    
+    assert len(result.metrics_rows) == 2
+    metric_1000 = next(m for m in result.metrics_rows if m.parameter_value == 1000.0)
+    
+    # At least some decisions should drift at threshold=1000.0 compared to baseline=130.0
+    assert metric_1000.decision_drift_count > 0
+    assert metric_1000.unchanged_count < metric_1000.eligible_cases
+    
+    # Verify that drift categories are correct
+    has_action_drift = any(row.drift_category in (DecisionDriftCategory.TRIGGER_TO_NO_ACTION, DecisionDriftCategory.NO_ACTION_TO_TRIGGER) for row in result.case_matrix if row.parameter_value == 1000.0)
+    assert has_action_drift
+
+def test_export_experiment(tmp_path):
+    """Verify that export_experiment writes all expected files and summaries correctly."""
+    from core.counterfactual_service import SweepParameter, SweepRequest
+    # Change working directory temporarily to test export output directory creation
+    orig_cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        # Create fixtures dir mockup
+        fixture_mock = Path("tests/fixtures/research_baseline_v1")
+        fixture_mock.mkdir(parents=True, exist_ok=True)
+        # Copy fixture files
+        import shutil
+        for f in (Path(orig_cwd) / FIXTURE_PATH).glob("*"):
+            shutil.copy(f, fixture_mock / f.name)
+            
+        service = CounterfactualService(data_path=fixture_mock)
+        req = SweepRequest(
+            parameters=(SweepParameter(name="release_stop_threshold", values=(14.0,)),),
+            baseline_config=ReplayConfig(release_stop_threshold=14.0),
+            dataset_generation_id="test-gen",
+            eligibility_policy_version="v1.0"
+        )
+        result = service.run_parameter_sweep(req)
+        exp_dir = service.export_experiment(result)
+        
+        # Verify files are generated
+        assert exp_dir.exists()
+        assert (exp_dir / "manifest.json").exists()
+        assert (exp_dir / "summary.md").exists()
+        assert (exp_dir / "sweep_metrics.csv").exists()
+        assert (exp_dir / "case_decision_matrix.parquet").exists()
+        assert (exp_dir / "result.json").exists()
+        
+        # Validate manifest content
+        with open(exp_dir / "manifest.json") as f:
+            manifest_data = json.load(f)
+            assert manifest_data["experiment_type"] == "DECISION_POINT_PARAMETER_SWEEP"
+            assert manifest_data["parameter_name"] == "release_stop_threshold"
+            assert manifest_data["parameter_values"] == [14.0]
+            
+    finally:
+        os.chdir(orig_cwd)
