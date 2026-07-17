@@ -158,6 +158,7 @@ class ProvenanceBundle:
     git_commit: str
     git_repo_state: str  # CLEAN or DIRTY
     generated_time: str
+    experiment_hash: str = "N/A"
 
 @dataclass(frozen=True)
 class PointReplayResult:
@@ -447,10 +448,25 @@ class CounterfactualService:
         except Exception:
             pass
 
-        # Use same manifest build id
+        # Use same manifest build id and logic content hash
         from core.trade_dataset import load_manifest
         manifest = load_manifest(self._data_path)
         build_id = manifest.get("dataset_build_id", "UNKNOWN")
+        dataset_content_hash = manifest.get("dataset_content_hash", "UNKNOWN")
+
+        # 6. Calculate Experiment Hash
+        import hashlib
+        hash_input = (
+            f"research-baseline-v1.0|"
+            f"{dataset_content_hash}|"
+            f"{git_commit}|"
+            f"release_stop_threshold:{request.baseline_config.release_stop_threshold},"
+            f"confirm_ms:{request.baseline_config.confirm_ms},"
+            f"confirm_ticks:{request.baseline_config.confirm_ticks}|"
+            f"{sweep_param.name}:{tuple(sweep_param.values)}|"
+            f"v1.0.0"
+        )
+        experiment_hash = "sha256:" + hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
 
         provenance = ProvenanceBundle(
             dataset_contract_version="v1.0.0",
@@ -459,6 +475,7 @@ class CounterfactualService:
             git_commit=git_commit,
             git_repo_state=git_repo_state,
             generated_time=datetime.utcnow().isoformat() + "Z",
+            experiment_hash=experiment_hash,
         )
 
         return ParameterSweepResult(
@@ -482,6 +499,7 @@ class CounterfactualService:
             "dataset_generation_id": result.provenance.dataset_build_id,
             "git_commit": result.provenance.git_commit,
             "repo_state": result.provenance.git_repo_state,
+            "experiment_hash": result.provenance.experiment_hash,
             "methodology_version": result.provenance.research_methodology_version,
             "parameter_name": result.parameter_name,
             "parameter_values": [row.parameter_value for row in result.metrics_rows],
@@ -505,6 +523,7 @@ class CounterfactualService:
 * **Parameter Swept**: `{result.parameter_name}`
 * **Dataset Generation ID**: `{result.provenance.dataset_build_id}`
 * **Git Commit**: `{result.provenance.git_commit} ({result.provenance.git_repo_state})`
+* **Experiment Hash**: `{result.provenance.experiment_hash}`
 * **Methodology Version**: `{result.provenance.research_methodology_version}`
 * **Generated At**: `{result.provenance.generated_time}`
 
@@ -529,4 +548,85 @@ This decision-point sensitivity analysis identifies the stability threshold boun
         with open(exp_dir / "result.json", "w") as f:
             json.dump(dataclasses.asdict(result), f, cls=EnhancedJSONEncoder, indent=2)
 
+        # 6. Append to Experiment Registry
+        self._append_to_registry(result, exp_dir)
+
         return exp_dir
+
+    def _append_to_registry(self, result: ParameterSweepResult, exp_dir: Path):
+        """Append metadata entry of the exported experiment to registry.json."""
+        registry_path = Path("reports/research/counterfactual/registry.json")
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+
+        registry = []
+        if registry_path.exists():
+            try:
+                with open(registry_path, "r") as f:
+                    registry = json.load(f)
+            except Exception:
+                pass
+
+        # Calculate max drift rate and sensitive cases count
+        max_drift_rate = max(row.baseline_action_drift_rate for row in result.metrics_rows) if result.metrics_rows else 0.0
+        
+        sensitive_cases = set()
+        for row in result.case_matrix:
+            if row.drift_category != DecisionDriftCategory.NONE:
+                sensitive_cases.add(row.case_id)
+        sensitive_cases_count = len(sensitive_cases)
+
+        entry = {
+            "experiment_id": exp_dir.name,
+            "baseline_id": "research-baseline-v1.0",
+            "parameter_name": result.parameter_name,
+            "parameter_values": [row.parameter_value for row in result.metrics_rows],
+            "dataset_build_id": result.provenance.dataset_build_id,
+            "git_commit": result.provenance.git_commit,
+            "experiment_hash": result.provenance.experiment_hash,
+            "generated_at": result.provenance.generated_time,
+            "report_path": str(exp_dir),
+            "max_drift_rate": max_drift_rate,
+            "sensitive_cases_count": sensitive_cases_count
+        }
+
+        # Prevent duplicate entries
+        registry = [e for e in registry if e["experiment_id"] != exp_dir.name]
+        registry.append(entry)
+
+        with open(registry_path, "w") as f:
+            json.dump(registry, f, indent=2)
+
+    def get_sensitivity_ranking(self) -> list[dict[str, Any]]:
+        """Retrieve aggregated parameter sensitivity ranking based on the experiment registry."""
+        registry_path = Path("reports/research/counterfactual/registry.json")
+        if not registry_path.exists():
+            return []
+
+        try:
+            with open(registry_path, "r") as f:
+                registry = json.load(f)
+        except Exception:
+            return []
+
+        # Group by parameter name, choose the latest experiment for each parameter
+        latest_by_param = {}
+        for entry in registry:
+            param = entry.get("parameter_name")
+            if not param:
+                continue
+            if param not in latest_by_param or entry.get("generated_at", "") > latest_by_param[param].get("generated_at", ""):
+                latest_by_param[param] = entry
+
+        # Format ranking rows
+        ranking = []
+        for param, entry in latest_by_param.items():
+            ranking.append({
+                "parameter_name": param,
+                "max_drift_rate": entry.get("max_drift_rate", 0.0),
+                "sensitive_cases_count": entry.get("sensitive_cases_count", 0),
+                "experiment_id": entry.get("experiment_id"),
+                "generated_at": entry.get("generated_at"),
+            })
+
+        ranking.sort(key=lambda x: x["max_drift_rate"], reverse=True)
+        return ranking

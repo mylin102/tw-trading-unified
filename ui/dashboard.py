@@ -5937,76 +5937,362 @@ elif page == "🔄 反事實研究室":
     """)
     
     # Expose Service
-    from core.counterfactual_service import DatasetContractError
+    from core.counterfactual_service import (
+        DatasetContractError,
+        ReplayConfig,
+        SweepParameter,
+        SweepRequest,
+        DecisionDriftCategory,
+        SWEEPABLE_PARAMETERS
+    )
     service = get_counterfactual_service()
     
     # Page metadata
     st.markdown(f"**Research Baseline:** `Research Baseline v1.0` (FROZEN)")
     
-    # User triggers point replay
-    st.subheader("🎯 基線重播驗證 (Point Replay Validation)")
-    st.write("比對歷史實際決策與當前生產決策引擎 (`evaluate_lifecycle_actions`) 的一致性。")
+    tab1, tab2 = st.tabs(["🎯 基線重播驗證 (Point Replay)", "🧬 參數敏感度分析 (Sensitivity Sweep)"])
     
-    if st.button("運行決策重播驗證 (Run Replay Validation)", key="btn_run_replay"):
-        with st.spinner("正在重播決策歷史..."):
+    with tab1:
+        st.subheader("🎯 基線重播驗證 (Point Replay Validation)")
+        st.write("比對歷史實際決策與當前生產決策引擎 (`evaluate_lifecycle_actions`) 的一致性。")
+        
+        if st.button("運行決策重播驗證 (Run Replay Validation)", key="btn_run_replay"):
+            with st.spinner("正在重播決策歷史..."):
+                try:
+                    result = service.run_point_replay()
+                    
+                    # Show KPI metrics
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("測試樣本數 (Cases)", result.metrics.eligible_cases)
+                    m2.metric("決策匹配率 (Action)", f"{result.metrics.action_match_rate:.1%}")
+                    m3.metric("部位匹配率 (Leg)", f"{result.metrics.leg_match_rate:.1%}")
+                    m4.metric("原因匹配率 (Reason)", f"{result.metrics.reason_match_rate:.1%}")
+                    m5.metric("分歧筆數 (Mismatches)", result.metrics.mismatch_count)
+                    
+                    # Show eligibility details
+                    st.markdown(f"""
+                    📋 **決策篩選統計 (Eligibility Statistics)**
+                    * **資料集總決策數 (Total Cases in Dataset):** `{result.metrics.total_cases}` 筆
+                    * **合規測試決策數 (Eligible Cases):** `{result.metrics.eligible_cases}` 筆 *(以 `RELEASE` 開頭的動作)*
+                    * **排除測試決策數 (Excluded Cases):** `{result.metrics.excluded_cases}` 筆 *(非釋放點決策)*
+                    * **篩選策略版本 (Eligibility Policy Version):** `{result.metrics.eligibility_policy_version}`
+                    """)
+                    
+                    # Show provenance
+                    st.info(f"""
+                    🧬 **資料來源與運行追溯 (Provenance)**
+                    * **Methodology Version:** `{result.provenance.research_methodology_version}`
+                    * **Dataset Contract Version:** `{result.provenance.dataset_contract_version}`
+                    * **Dataset Build ID:** `{result.provenance.dataset_build_id}`
+                    * **Git Commit Hash:** `{result.provenance.git_commit[:8]} ({result.provenance.git_repo_state})`
+                    * **Generated At:** `{result.provenance.generated_time}`
+                    """)
+                    
+                    # Show mismatch details
+                    if result.metrics.mismatch_count > 0:
+                        st.warning(f"發現 {result.metrics.mismatch_count} 筆決策分歧！請檢查下方列表：")
+                        mismatch_rows = []
+                        for m in result.mismatches:
+                            mismatch_rows.append({
+                                "Trade ID": m.trade_id[-6:],
+                                "Seq": m.decision_seq,
+                                "分歧類型": m.mismatch_category,
+                                "實際動作": m.recorded_action,
+                                "實際部位": m.recorded_leg or "—",
+                                "重播動作": m.replayed_action or "—",
+                                "重播部位": m.replayed_leg or "—",
+                            })
+                        st.dataframe(pd.DataFrame(mismatch_rows), width='stretch', hide_index=True)
+                    else:
+                        st.success(f"🎉 在目前資料集納入的 {result.metrics.eligible_cases} 個 eligible decision points 中，當前決策引擎已 100% 重現歷史 Action 與 Leg，未發現決策分歧。此結果僅代表點決策重播一致性，不代表完整交易軌跡、成交結果或績效一致性。")
+                except DatasetContractError as e:
+                    st.error(f"""
+                    ⚠️ **目前資料集不符合 Replay Dataset Contract。**
+                    請先由獨立 Dataset Build Pipeline 發布新的 Generation。
+                    
+                    * **錯誤代碼 (Code):** `{e.code}`
+                    * **缺少欄位 (Missing Columns):** `{e.missing_columns}`
+                    * **資料集編譯 ID (Dataset Build ID):** `{e.dataset_build_id}`
+                    """)
+                except Exception as e:
+                    st.error(f"決策重播運行失敗: {e}")
+                    
+    with tab2:
+        st.subheader("🏆 參數敏感度排行榜 (Sensitivity Ranking)")
+        ranking = service.get_sensitivity_ranking()
+        if ranking:
+            ranking_df = pd.DataFrame(ranking)
+            ranking_df.columns = ["參數名稱", "最大決策分歧率 (Max Drift)", "敏感個案數 (Sensitive Cases)", "實驗 ID", "評估時間"]
+            ranking_df["最大決策分歧率 (Max Drift)"] = ranking_df["最大決策分歧率 (Max Drift)"].map(lambda x: f"{x:.1%}")
+            st.dataframe(ranking_df, width='stretch', hide_index=True)
+        else:
+            st.info("尚無完成的掃描實驗。請在下方設定參數並點擊『運行參數掃描』來生成數據。")
+
+        st.divider()
+        st.subheader("🧬 參數敏感度分析 (Parameter Sensitivity Sweep)")
+        st.write("比對在不同參數閾值下決策引擎的分歧率與歷史匹配率，辨識決策穩定邊界。")
+        
+        # User controls for sweep parameter selection
+        param_name = st.selectbox(
+            "選擇掃描參數 (Whitelisted Parameter)",
+            options=list(SWEEPABLE_PARAMETERS.keys()),
+            format_func=lambda x: f"{x} ({SWEEPABLE_PARAMETERS[x].description})"
+        )
+        
+        spec = SWEEPABLE_PARAMETERS[param_name]
+        
+        # Slider range based on spec type and values
+        if spec.type == float:
+            # For stop thresholds
+            r_start, r_end = st.slider(
+                f"設定參數掃描範圍 ({spec.unit})",
+                min_value=float(spec.min_val),
+                max_value=float(spec.max_val),
+                value=(80.0, 200.0),
+                step=10.0
+            )
+            step = st.number_input("掃描步長 (Step)", min_value=1.0, max_value=50.0, value=10.0)
+            # Make sure step > 0
+            values = []
+            curr = r_start
+            while curr <= r_end:
+                values.append(round(curr, 2))
+                curr += step
+        else:
+            # Integer params (confirm_ms / confirm_ticks)
+            r_start, r_end = st.slider(
+                f"設定參數掃描範圍 ({spec.unit})",
+                min_value=int(spec.min_val),
+                max_value=int(spec.max_val),
+                value=(int(spec.min_val), int(spec.min_val) + 1000) if param_name == "confirm_ms" else (2, 15),
+                step=100 if param_name == "confirm_ms" else 1
+            )
+            step = st.number_input("掃描步長 (Step)", min_value=1, max_value=1000, value=100 if param_name == "confirm_ms" else 1)
+            values = list(range(r_start, r_end + 1, step))
+
+        # Ask user for baseline parameter override input to enforce reproduction validation
+        default_baseline_val = float(spec.default_val)
+        baseline_override = st.number_input(
+            f"設定基線比對值 (Baseline Value for comparison)",
+            value=default_baseline_val,
+            step=1.0 if spec.type == float else 1
+        )
+        
+        # Insert baseline value into the sweep tuple if not present to run verification
+        if baseline_override not in values:
+            values.append(baseline_override)
+        values = sorted(list(set(values)))
+        
+        st.markdown(f"**掃描點數:** `{len(values)}` 個點 — {values}")
+        
+        st.markdown("""
+        > [!CAUTION]
+        > **決策敏感度分析邊界限制 (Drift Disclaimer)**  
+        > 本掃描結果僅衡量**點決策分歧率與歷史動作匹配率**。反事實重播**無法評估最終交易盈虧、最大回撤、或執行滑價**，請勿將其視為回測績效優化工具。
+        """)
+        
+        if st.button("運行參數掃描 (Run Parameter Sweep)", key="btn_run_sweep"):
+            with st.spinner("正在批次重播掃描參數價格點..."):
+                try:
+                    # Construct config with baseline override
+                    overrides = {param_name: baseline_override}
+                    baseline_config = ReplayConfig(**overrides)
+                    
+                    req = SweepRequest(
+                        parameters=(SweepParameter(name=param_name, values=tuple(values)),),
+                        baseline_config=baseline_config,
+                        dataset_generation_id="N/A",
+                        eligibility_policy_version="v1.0 (RELEASE ONLY)"
+                    )
+                    
+                    # Execute sweep
+                    sweep_result = service.run_parameter_sweep(req)
+                    st.session_state["sweep_result"] = sweep_result
+                    st.success("🎉 參數掃描完成！語意基線重現驗證已通過。")
+                except AssertionError as ae:
+                    st.error(f"⚠️ **語意檢驗失敗 (Semantic Validation Fail):** {ae}")
+                except Exception as ex:
+                    st.error(f"掃描運行失敗: {ex}")
+                    
+        # Render results if present
+        sweep_result = st.session_state.get("sweep_result")
+        if sweep_result is not None and sweep_result.parameter_name == param_name:
+            st.divider()
+            st.subheader(f"📊 {param_name} 敏感度分析曲線")
+            
+            import plotly.graph_objects as go
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=[row.parameter_value for row in sweep_result.metrics_rows],
+                y=[row.historical_action_match_rate for row in sweep_result.metrics_rows],
+                mode="lines+markers",
+                name="歷史決策匹配率 (Historical Match)",
+                line=dict(color="#2ca02c", width=2)
+            ))
+            fig.add_trace(go.Scatter(
+                x=[row.parameter_value for row in sweep_result.metrics_rows],
+                y=[row.baseline_action_drift_rate for row in sweep_result.metrics_rows],
+                mode="lines+markers",
+                name="基線決策分歧率 (Baseline Drift)",
+                line=dict(color="#d62728", width=2)
+            ))
+            fig.update_layout(
+                xaxis_title=f"參數值 ({spec.unit})",
+                yaxis_title="比率",
+                yaxis=dict(tickformat=".0%"),
+                height=400,
+                margin=dict(t=40, b=40, l=60, r=20),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Show summary metrics table
+            st.subheader("📋 掃描匯總指標 (Aggregate Metrics)")
+            metrics_list = []
+            for row in sweep_result.metrics_rows:
+                metrics_list.append({
+                    "參數值": row.parameter_value,
+                    "測試樣本": row.eligible_cases,
+                    "歷史 Action 匹配": f"{row.historical_action_match_rate:.1%}",
+                    "歷史 Leg 匹配": f"{row.historical_leg_match_rate:.1%}",
+                    "基線 Action 分歧": f"{row.baseline_action_drift_rate:.1%}",
+                    "分歧個案數 (Drift)": row.decision_drift_count,
+                    "無影響個案數 (Stable)": row.unchanged_count,
+                })
+            st.dataframe(pd.DataFrame(metrics_list), width='stretch', hide_index=True)
+            
+            # Case-level matrix with filter
+            st.subheader("📋 個案決策分析矩陣 (Case-level Decision Matrix)")
+            drift_filter = st.selectbox(
+                "篩選過濾條件",
+                options=["全部個案 (All)", "僅顯示發生決策分歧的個案 (Drift Only)"],
+                index=0
+            )
+            
+            case_rows = []
+            for row in sweep_result.case_matrix:
+                if drift_filter.startswith("僅顯示") and row.drift_category == DecisionDriftCategory.NONE:
+                    continue
+                case_rows.append({
+                    "Case ID": row.case_id[-6:],
+                    "參數值": row.parameter_value,
+                    "歷史決策": f"{row.historical_action} ({row.historical_leg or '—'})",
+                    "基線決策": f"{row.baseline_action} ({row.baseline_leg or '—'})",
+                    "反事實決策": f"{row.counterfactual_action} ({row.counterfactual_leg or '—'})",
+                    "分歧類別 (Drift Type)": row.drift_category.value,
+                })
+            st.dataframe(pd.DataFrame(case_rows), width='stretch', hide_index=True)
+            
+            # Exporter UI
+            st.subheader("💾 研究成果導出")
+            if st.button("導出敏感度分析報告與數據 (Export Experiment Report)"):
+                with st.spinner("正在匯出報告與 Parquet 決策矩陣..."):
+                    try:
+                        exp_path = service.export_experiment(sweep_result)
+                        st.success(f"""
+                        🎉 **報告匯出成功！**  
+                        * **儲存路徑:** `{exp_path}`
+                        * **包含檔案:** `manifest.json`, `summary.md`, `sweep_metrics.csv`, `case_decision_matrix.parquet`, `result.json`
+                        """)
+                    except Exception as ex:
+                        st.error(f"匯出失敗: {ex}")
+
+        # Registry Inspection UI
+        st.divider()
+        st.subheader("📁 歷史實驗檔案庫 (Experiment Registry)")
+        
+        registry_path = Path("reports/research/counterfactual/registry.json")
+        registry = []
+        if registry_path.exists():
             try:
-                result = service.run_point_replay()
+                import json
+                with open(registry_path, "r") as f:
+                    registry = json.load(f)
+            except Exception:
+                pass
                 
-                # Show KPI metrics
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("測試樣本數 (Cases)", result.metrics.eligible_cases)
-                m2.metric("決策匹配率 (Action)", f"{result.metrics.action_match_rate:.1%}")
-                m3.metric("部位匹配率 (Leg)", f"{result.metrics.leg_match_rate:.1%}")
-                m4.metric("原因匹配率 (Reason)", f"{result.metrics.reason_match_rate:.1%}")
-                m5.metric("分歧筆數 (Mismatches)", result.metrics.mismatch_count)
-                
-                # Show eligibility details
-                st.markdown(f"""
-                📋 **決策篩選統計 (Eligibility Statistics)**
-                * **資料集總決策數 (Total Cases in Dataset):** `{result.metrics.total_cases}` 筆
-                * **合規測試決策數 (Eligible Cases):** `{result.metrics.eligible_cases}` 筆 *(以 `RELEASE` 開頭的動作)*
-                * **排除測試決策數 (Excluded Cases):** `{result.metrics.excluded_cases}` 筆 *(非釋放點決策)*
-                * **篩選策略版本 (Eligibility Policy Version):** `{result.metrics.eligibility_policy_version}`
-                """)
-                
-                # Show provenance
-                st.info(f"""
-                🧬 **資料來源與運行追溯 (Provenance)**
-                * **Methodology Version:** `{result.provenance.research_methodology_version}`
-                * **Dataset Contract Version:** `{result.provenance.dataset_contract_version}`
-                * **Dataset Build ID:** `{result.provenance.dataset_build_id}`
-                * **Git Commit Hash:** `{result.provenance.git_commit[:8]} ({result.provenance.git_repo_state})`
-                * **Generated At:** `{result.provenance.generated_time}`
-                """)
-                
-                # Show mismatch details
-                if result.metrics.mismatch_count > 0:
-                    st.warning(f"發現 {result.metrics.mismatch_count} 筆決策分歧！請檢查下方列表：")
-                    mismatch_rows = []
-                    for m in result.mismatches:
-                        mismatch_rows.append({
-                            "Trade ID": m.trade_id[-6:],
-                            "Seq": m.decision_seq,
-                            "分歧類型": m.mismatch_category,
-                            "實際動作": m.recorded_action,
-                            "實際部位": m.recorded_leg or "—",
-                            "重播動作": m.replayed_action or "—",
-                            "重播部位": m.replayed_leg or "—",
-                        })
-                    st.dataframe(pd.DataFrame(mismatch_rows), use_container_width=True, hide_index=True)
+        if registry:
+            reg_df = pd.DataFrame(registry)
+            display_cols = {
+                "experiment_id": "實驗 ID (ID)",
+                "parameter_name": "掃描參數",
+                "max_drift_rate": "最大分歧率",
+                "sensitive_cases_count": "敏感個案",
+                "experiment_hash": "Experiment Hash",
+                "generated_at": "生成時間"
+            }
+            existing_cols = {k: v for k, v in display_cols.items() if k in reg_df.columns}
+            display_df = reg_df[list(existing_cols.keys())].rename(columns=existing_cols)
+            if "最大分歧率" in display_df.columns:
+                display_df["最大分歧率"] = display_df["最大分歧率"].map(lambda x: f"{x:.1%}")
+            st.dataframe(display_df, width='stretch', hide_index=True)
+            
+            selected_exp = st.selectbox(
+                "選擇要載入的歷史實驗 (Select Experiment to Inspect)",
+                options=[e["experiment_id"] for e in registry],
+                key="inspect_exp_id"
+            )
+            
+            if st.button("📂 載入實驗報告 (Inspect Report)"):
+                exp_entry = next(e for e in registry if e["experiment_id"] == selected_exp)
+                result_file = Path(exp_entry["report_path"]) / "result.json"
+                if result_file.exists():
+                    try:
+                        import json
+                        with open(result_file, "r") as f:
+                            raw_res = json.load(f)
+                            
+                        st.markdown(f"### 📄 實驗報告: `{selected_exp}`")
+                        st.markdown(f"* **Experiment Hash:** `{raw_res['provenance']['experiment_hash']}`")
+                        st.markdown(f"* **Dataset ID:** `{raw_res['provenance']['dataset_build_id']}`")
+                        st.markdown(f"* **Git Commit:** `{raw_res['provenance']['git_commit']}`")
+                        st.markdown(f"* **Generated At:** `{raw_res['provenance']['generated_time']}`")
+                        
+                        import plotly.graph_objects as go
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=[row["parameter_value"] for row in raw_res["metrics_rows"]],
+                            y=[row["historical_action_match_rate"] for row in raw_res["metrics_rows"]],
+                            mode="lines+markers",
+                            name="歷史決策匹配率 (Historical Match)",
+                            line=dict(color="#2ca02c", width=2)
+                        ))
+                        fig.add_trace(go.Scatter(
+                            x=[row["parameter_value"] for row in raw_res["metrics_rows"]],
+                            y=[row["baseline_action_drift_rate"] for row in raw_res["metrics_rows"]],
+                            mode="lines+markers",
+                            name="基線決策分歧率 (Baseline Drift)",
+                            line=dict(color="#d62728", width=2)
+                        ))
+                        fig.update_layout(
+                            xaxis_title=f"參數值",
+                            yaxis_title="比率",
+                            yaxis=dict(tickformat=".0%"),
+                            height=350,
+                            margin=dict(t=40, b=40, l=60, r=20),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        st.markdown("#### 📋 掃描匯總指標")
+                        metrics_list = []
+                        for row in raw_res["metrics_rows"]:
+                            metrics_list.append({
+                                "參數值": row["parameter_value"],
+                                "測試樣本": row["eligible_cases"],
+                                "歷史 Action 匹配": f"{row['historical_action_match_rate']:.1%}",
+                                "歷史 Leg 匹配": f"{row['historical_leg_match_rate']:.1%}",
+                                "基線 Action 分歧": f"{row['baseline_action_drift_rate']:.1%}",
+                                "分歧個案數 (Drift)": row["decision_drift_count"],
+                                "無影響個案數 (Stable)": row["unchanged_count"],
+                            })
+                        st.dataframe(pd.DataFrame(metrics_list), width='stretch', hide_index=True)
+                    except Exception as ex:
+                        st.error(f"無法解析實驗資料: {ex}")
                 else:
-                    st.success(f"🎉 在目前資料集納入的 {result.metrics.eligible_cases} 個 eligible decision points 中，當前決策引擎已 100% 重現歷史 Action 與 Leg，未發現決策分歧。此結果僅代表點決策重播一致性，不代表完整交易軌跡、成交結果或績效一致性。")
-            except DatasetContractError as e:
-                st.error(f"""
-                ⚠️ **目前資料集不符合 Replay Dataset Contract。**
-                請先由獨立 Dataset Build Pipeline 發布新的 Generation。
-                
-                * **錯誤代碼 (Code):** `{e.code}`
-                * **缺少欄位 (Missing Columns):** `{e.missing_columns}`
-                * **資料集編譯 ID (Dataset Build ID):** `{e.dataset_build_id}`
-                """)
-            except Exception as e:
-                st.error(f"決策重播運行失敗: {e}")
+                    st.error(f"找不到實驗檔案: {result_file}")
+        else:
+            st.info("歷史實驗庫為空。請先執行上方掃描並點擊『導出敏感度分析報告與數據』。")
 
 # -- Footer and Refresh --
     # 2026-06-23 Gemini CLI: 移除伺服器端 time.sleep(5) 與 st.rerun() 的無條件循環，完全由 line 219 的瀏覽器端 st_autorefresh 每 10 秒觸發，使伺服器執行緒能正常結束並釋放 CPU 資源，解決 CPU 99% 與高溫 99°C 的問題

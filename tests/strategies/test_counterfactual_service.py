@@ -222,7 +222,7 @@ def test_run_parameter_sweep_drift():
     assert has_action_drift
 
 def test_export_experiment(tmp_path):
-    """Verify that export_experiment writes all expected files and summaries correctly."""
+    """Verify that export_experiment writes all expected files, calculates experiment_hash, appends to registry, and aggregates ranking."""
     from core.counterfactual_service import SweepParameter, SweepRequest
     # Change working directory temporarily to test export output directory creation
     orig_cwd = os.getcwd()
@@ -244,6 +244,10 @@ def test_export_experiment(tmp_path):
             eligibility_policy_version="v1.0"
         )
         result = service.run_parameter_sweep(req)
+        
+        # Verify experiment hash is computed and has sha256 prefix
+        assert result.provenance.experiment_hash.startswith("sha256:")
+        
         exp_dir = service.export_experiment(result)
         
         # Verify files are generated
@@ -254,12 +258,30 @@ def test_export_experiment(tmp_path):
         assert (exp_dir / "case_decision_matrix.parquet").exists()
         assert (exp_dir / "result.json").exists()
         
-        # Validate manifest content
+        # Validate manifest content contains experiment_hash
         with open(exp_dir / "manifest.json") as f:
             manifest_data = json.load(f)
             assert manifest_data["experiment_type"] == "DECISION_POINT_PARAMETER_SWEEP"
             assert manifest_data["parameter_name"] == "release_stop_threshold"
             assert manifest_data["parameter_values"] == [14.0]
+            assert manifest_data["experiment_hash"] == result.provenance.experiment_hash
+
+        # Verify registry was created and contains entry
+        registry_file = Path("reports/research/counterfactual/registry.json")
+        assert registry_file.exists()
+        with open(registry_file) as f:
+            registry_data = json.load(f)
+            assert len(registry_data) == 1
+            entry = registry_data[0]
+            assert entry["experiment_id"] == exp_dir.name
+            assert entry["experiment_hash"] == result.provenance.experiment_hash
+            assert entry["parameter_name"] == "release_stop_threshold"
+            
+        # Verify sensitivity ranking aggregation
+        ranking = service.get_sensitivity_ranking()
+        assert len(ranking) == 1
+        assert ranking[0]["parameter_name"] == "release_stop_threshold"
+        assert ranking[0]["experiment_id"] == exp_dir.name
             
     finally:
         os.chdir(orig_cwd)
