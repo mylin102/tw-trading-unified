@@ -1,17 +1,28 @@
 {
-  "release": "counterfactual-lab-v1.0.0",
-  "git_commit": "a3dc5a62",
-  "baseline_version": "v1.0",
+  "release_version": "counterfactual-lab-v1.0.0",
+  "release_status": "CERTIFIED",
+  "release_tag": "counterfactual-lab-v1.0.0",
+  "source_commit": "2d1fc5c6",
+  "repository_state": "CLEAN",
+  "research_baseline_version": "v1.0",
   "methodology_version": "v1.0.0",
   "canonicalization_version": "v1.0.0",
-  "supported_analysis": [
+  "float_precision_digits": 6,
+  "supported_capabilities": [
     "POINT_REPLAY_REPRODUCTION",
-    "ONE_DIMENSIONAL_DECISION_POINT_SENSITIVITY"
+    "ONE_DIMENSIONAL_DECISION_POINT_SENSITIVITY",
+    "EXPERIMENT_REGISTRY",
+    "HISTORICAL_REPORT_INTEGRITY_VALIDATION"
   ],
-  "unsupported_analysis": [
+  "unsupported_capabilities": [
     "TRAJECTORY_REPLAY",
     "COUNTERFACTUAL_EXECUTION",
     "PERFORMANCE_COUNTERFACTUAL"
   ],
-  "regression_tests": 214
+  "regression_test_count": 214,
+  "dataset_contract_version": "v1.0.0",
+  "certified_dataset_generation_id": "20260717T062615Z",
+  "certified_dataset_content_hash": "fd0e6b1987584cb39a027aea264617c4621c92acad6a1d57538413164e63eec3",
+  "eligibility_policy_version": "v1.0-RELEASE-ONLY",
+  "release_manifest_schema_version": "v1.0.0"
 }
