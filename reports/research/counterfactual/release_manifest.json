@@ -1,0 +1,17 @@
+{
+  "release": "counterfactual-lab-v1.0.0",
+  "git_commit": "944bb46c",
+  "baseline_version": "v1.0",
+  "methodology_version": "v1.0.0",
+  "canonicalization_version": "v1.0.0",
+  "supported_analysis": [
+    "POINT_REPLAY_REPRODUCTION",
+    "ONE_DIMENSIONAL_DECISION_POINT_SENSITIVITY"
+  ],
+  "unsupported_analysis": [
+    "TRAJECTORY_REPLAY",
+    "COUNTERFACTUAL_EXECUTION",
+    "PERFORMANCE_COUNTERFACTUAL"
+  ],
+  "regression_tests": 214
+}
