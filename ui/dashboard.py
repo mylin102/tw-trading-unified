@@ -673,6 +673,12 @@ def get_cached_strategy_registry():
     _reg.discover()
     return _reg
 
+# 2026-07-17 Gemini CLI: Cache counterfactual service to avoid reloading heavy imports on every dashboard refresh.
+@st.cache_resource
+def get_counterfactual_service():
+    from core.counterfactual_service import CounterfactualService
+    return CounterfactualService()
+
 # ── Configs ──
 FUTURES_CFG_PATH = BASE / "config" / FUTURES_CFG_NAME
 OPTIONS_CFG_PATH = BASE / "config" / "options_strategy.yaml"
@@ -5939,8 +5945,7 @@ elif page == "🔄 反事實研究室":
     """)
     
     # Expose Service
-    from core.counterfactual_service import CounterfactualService
-    service = CounterfactualService()
+    service = get_counterfactual_service()
     
     # Page metadata
     st.markdown(f"**Research Baseline:** `Research Baseline v1.0` (FROZEN)")
