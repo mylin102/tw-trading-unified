@@ -8,6 +8,12 @@
   "methodology_version": "v1.0.0",
   "canonicalization_version": "v1.0.0",
   "float_precision_digits": 6,
+  "analysis_scope": {
+    "decision_point": true,
+    "trajectory": false,
+    "execution": false,
+    "performance": false
+  },
   "supported_capabilities": [
     "POINT_REPLAY_REPRODUCTION",
     "ONE_DIMENSIONAL_DECISION_POINT_SENSITIVITY",
