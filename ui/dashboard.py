@@ -535,6 +535,8 @@ def calculate_mts_daily_performance(fills_path: str, events_path: str, target_tr
                             trades[trade_id]["risk_mode"] = event.get("risk_mode", "UNKNOWN")
                         elif ev_type in ("RELEASE_NEAR_SUBMITTED", "RELEASE_FAR_SUBMITTED"):
                             trades[trade_id]["risk_mode"] = event.get("risk_mode", "UNKNOWN")
+                        elif ev_type == "EXIT_LOG":
+                            trades[trade_id]["mfe"] = event.get("mfe")
                     except Exception:
                         continue
         except Exception:
@@ -618,6 +620,15 @@ def calculate_mts_daily_performance(fills_path: str, events_path: str, target_tr
                     except Exception:
                         pass
                 
+                # 2026-07-17 Gemini CLI: Calculate Release Efficiency (Post-Release capture ratio)
+                # Gating Invariant: ε = 100 TWD
+                mfe_pts = data.get("mfe")
+                release_efficiency_str = "—"
+                if mfe_pts is not None:
+                    peak_pnl = float(mfe_pts) * 10.0
+                    if peak_pnl > 100.0:
+                        release_efficiency_str = f"{(net_pnl / peak_pnl):.1%}"
+                
                 completed.append({
                     "trade_id": trade_id,
                     "entry_time": data["entry_ts"],
@@ -634,7 +645,8 @@ def calculate_mts_daily_performance(fills_path: str, events_path: str, target_tr
                     "net_pnl": net_pnl,
                     "risk_mode": data["risk_mode"],
                     "release_duration": release_duration_str,
-                    "trail_duration": trail_duration_str
+                    "trail_duration": trail_duration_str,
+                    "release_efficiency": release_efficiency_str
                 })
                 
     return {"completed": completed, "active": active}
@@ -3647,7 +3659,7 @@ elif page == f"期貨 {_TICKER}":
                 with st.expander("📝 已完結交易清單 (Closed Loops)", expanded=True):
                     _loop_rows = []
                     for t in _completed:
-                        # 2026-07-17 Gemini CLI: Render first/second leg duration columns in closed loops table
+                        # 2026-07-17 Gemini CLI: Render first/second leg duration and release efficiency columns in closed loops table
                         _loop_rows.append({
                             "交易 ID": t["trade_id"][-6:],
                             "時段": "☀️ 日盤" if t["session"].lower() == "day" else "🌙 夜盤",
@@ -3657,6 +3669,7 @@ elif page == f"期貨 {_TICKER}":
                             "第二腿 PnL": f'{t["exit_pnl"]:+,.0f}',
                             "第二腿時間": t.get("trail_duration", "—"),
                             "釋放原因": t["exit_reason"],
+                            "釋放效率": t.get("release_efficiency", "—"),
                             "淨利 (TWD)": f'{t["net_pnl"]:+,.0f}',
                             "風控": t["risk_mode"]
                         })

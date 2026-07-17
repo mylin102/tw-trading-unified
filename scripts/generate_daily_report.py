@@ -137,6 +137,8 @@ def parse_logs(fills_path: str, events_path: str, target_trading_day: str) -> di
                         if ev_type == "EXIT_REMAINING":
                             trades[trade_id]["exit_reason"] = event.get("reason", "UNKNOWN")
                             trades[trade_id]["risk_mode"] = event.get("risk_mode", "UNKNOWN")
+                        if ev_type == "EXIT_LOG":
+                            trades[trade_id]["mfe"] = event.get("mfe")
                         for key in ["mtf_score", "vwap", "near_vwap", "far_vwap"]:
                             val = event.get(key)
                             if val is not None:
@@ -235,6 +237,15 @@ def parse_logs(fills_path: str, events_path: str, target_trading_day: str) -> di
                     except Exception:
                         pass
                 
+                # 2026-07-17 Gemini CLI: Calculate Release Efficiency (Post-Release capture ratio)
+                # Gating Invariant: ε = 100 TWD
+                mfe_pts = data.get("mfe")
+                release_efficiency_str = "—"
+                if mfe_pts is not None:
+                    peak_pnl = float(mfe_pts) * 10.0
+                    if peak_pnl > 100.0:
+                        release_efficiency_str = f"{(net_pnl / peak_pnl):.1%}"
+                
                 report_data["completed"].append({
                     "trade_id": trade_id,
                     "entry_time": data["entry_ts"],
@@ -260,7 +271,8 @@ def parse_logs(fills_path: str, events_path: str, target_trading_day: str) -> di
                     "exit_mtf": data.get("exit_mtf_score"),
                     "exit_vwap": data.get("exit_vwap"),
                     "release_duration": release_duration_str,
-                    "trail_duration": trail_duration_str
+                    "trail_duration": trail_duration_str,
+                    "release_efficiency": release_efficiency_str
                 })
                 
     return report_data
@@ -576,6 +588,7 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
                         <th>第二腿 PnL</th>
                         <th>第二腿時間</th>
                         <th>釋放原因</th>
+                        <th>釋放效率</th>
                         <th>淨損益</th>
                         <th>風控模式</th>
                         <th>MTF (Entry/Rel/Exit)</th>
@@ -594,7 +607,7 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
             mtf_str = format_triplet(t.get('entry_mtf'), t.get('release_mtf'), t.get('exit_mtf'), decimals=1)
             vwap_str = format_triplet(t.get('entry_vwap'), t.get('release_vwap'), t.get('exit_vwap'), decimals=0)
             
-            # 2026-07-17 Gemini CLI: Render first/second leg duration columns in closed loops table
+            # 2026-07-17 Gemini CLI: Render first/second leg duration and release efficiency columns in closed loops table
             html += f"""
                     <tr>
                         <td><code>{t['trade_id']}</code></td>
@@ -606,6 +619,7 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
                         <td class="{ 'text-green' if t['exit_pnl'] >= 0 else 'text-red' }">${t['exit_pnl']:+,.1f}</td>
                         <td style="font-size: 0.85rem;">{t.get('trail_duration', '—')}</td>
                         <td><span class="badge badge-reason">{t['exit_reason']}</span></td>
+                        <td style="font-size: 0.85rem; font-weight: 600;">{t.get('release_efficiency', '—')}</td>
                         <td class="{net_class}" style="font-weight: 600;">{net_symbol}${t['net_pnl']:,.1f}</td>
                         <td style="font-size: 0.85rem; color: var(--text-muted);"><code>{t['risk_mode']}</code></td>
                         <td style="font-size: 0.85rem;"><code>{mtf_str}</code></td>
@@ -614,7 +628,7 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
     else:
         html += """
                     <tr>
-                        <td colspan="13" style="text-align: center; padding: 2rem; color: var(--text-muted);">今日無已完結交易。</td>
+                        <td colspan="14" style="text-align: center; padding: 2rem; color: var(--text-muted);">今日無已完結交易。</td>
                     </tr>"""
 
                     
