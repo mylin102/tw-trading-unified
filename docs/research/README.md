@@ -5,6 +5,8 @@
 This directory contains past experiments, telemetry analysis, backtests, and negative results for the Taiwan Trading Unified system. Every research candidate must comply with the validation gates of [ADR-016](file:///Users/mylin/Documents/mylin102/tw-trading-unified/docs/adrs/ADR-016-evidence-based-indicator-lifecycle.md).
 
 > The full research methodology — including Replay Taxonomy, Counterfactual Identifiability, Evidence Sufficiency, and Evidence Boundary — is defined in [RESEARCH_METHODOLOGY.md](RESEARCH_METHODOLOGY.md). All R-NNN reports cite this document rather than redefining core concepts.
+>
+> The schema, layers, and derived metrics for compiled trading data are specified in the [Research Dataset Contract (DATASET_CONTRACT.md)](DATASET_CONTRACT.md).
 
 ---
 
