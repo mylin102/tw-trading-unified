@@ -244,3 +244,169 @@ def test_valid_parquet_load(valid_event_dict):
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
+
+
+def test_deterministic_ordering_truth_table(valid_event_dict):
+    from core.trajectory.ordering import order_trajectory_events
+    
+    # Create several events at the exact same timestamp with different types
+    base_time = 1784268000000000000
+    
+    types_to_create = [
+        (EventType.PROCESS_RESTART, "system_monitor", EventAuthority.PRODUCTION_ENGINE, EventCausality.EXOGENOUS, EventMutability.IMMUTABLE),
+        (EventType.LIFECYCLE_TRANSITION, "strategy_router", EventAuthority.PRODUCTION_ENGINE, EventCausality.ENDOGENOUS, EventMutability.REPLACEABLE),
+        (EventType.BROKER_FILL, "shioaji_broker", EventAuthority.BROKER, EventCausality.ENDOGENOUS, EventMutability.REPLACEABLE),
+        (EventType.BROKER_ACK, "shioaji_broker", EventAuthority.BROKER, EventCausality.ENDOGENOUS, EventMutability.REPLACEABLE),
+        (EventType.MARKET_TICK, "exchange", EventAuthority.EXCHANGE, EventCausality.EXOGENOUS, EventMutability.IMMUTABLE),
+        (EventType.SESSION_BOUNDARY, "exchange", EventAuthority.EXCHANGE, EventCausality.EXOGENOUS, EventMutability.IMMUTABLE),
+    ]
+    
+    raw_events = []
+    for idx, (etype, src, auth, caus, mut) in enumerate(types_to_create):
+        evt = TrajectoryEvent(
+            event_id=f"evt-{idx}",
+            event_type=etype,
+            event_time_ns=base_time,
+            receive_time_ns=base_time + 1000,
+            source_sequence=0,
+            source=EventSource(src),
+            session_id="session-1",
+            trade_id=None,
+            origin=EventOrigin.OBSERVED,
+            authority=auth,
+            causality=caus,
+            mutability=mut,
+            payload_schema_version="v1.0.0",
+            payload={},
+            quality_flags=(),
+        )
+        raw_events.append(evt)
+        
+    # Order them
+    ordered_trajectory = order_trajectory_events(raw_events)
+    sorted_types = [evt.event_type for evt in ordered_trajectory.events]
+    
+    # Expected order based on ADR-018 type_prio:
+    # 1. SESSION_BOUNDARY
+    # 2. MARKET_TICK
+    # 3. BROKER_ACK (disconnect is 3, ack is 4)
+    # 4. BROKER_FILL (5)
+    # 5. LIFECYCLE_TRANSITION (6)
+    # 6. PROCESS_RESTART (7)
+    expected_order = [
+        EventType.SESSION_BOUNDARY,
+        EventType.MARKET_TICK,
+        EventType.BROKER_ACK,
+        EventType.BROKER_FILL,
+        EventType.LIFECYCLE_TRANSITION,
+        EventType.PROCESS_RESTART,
+    ]
+    assert sorted_types == expected_order
+
+
+def test_deterministic_ordering_duplicates_and_late_events(valid_event_dict):
+    from core.trajectory.ordering import order_trajectory_events
+    
+    base_evt = TrajectoryEvent(
+        event_id="evt-1",
+        event_type=EventType.MARKET_TICK,
+        event_time_ns=1000,
+        receive_time_ns=2000,
+        source_sequence=1,
+        source=EventSource.EXCHANGE,
+        session_id="session-1",
+        trade_id=None,
+        origin=EventOrigin.OBSERVED,
+        authority=EventAuthority.EXCHANGE,
+        causality=EventCausality.EXOGENOUS,
+        mutability=EventMutability.IMMUTABLE,
+        payload_schema_version="v1.0.0",
+        payload={"symbol": "TMF"},
+        quality_flags=(),
+    )
+    
+    # Duplicate semantic event (same time, type, source, payload but different ID)
+    dup_evt = TrajectoryEvent(
+        event_id="evt-2",
+        event_type=EventType.MARKET_TICK,
+        event_time_ns=1000,
+        receive_time_ns=2050,
+        source_sequence=2,
+        source=EventSource.EXCHANGE,
+        session_id="session-1",
+        trade_id=None,
+        origin=EventOrigin.OBSERVED,
+        authority=EventAuthority.EXCHANGE,
+        causality=EventCausality.EXOGENOUS,
+        mutability=EventMutability.IMMUTABLE,
+        payload_schema_version="v1.0.0",
+        payload={"symbol": "TMF"},
+        quality_flags=(),
+    )
+    
+    # Late arriving event (event_time_ns=500, but receive_time_ns=3000)
+    late_evt = TrajectoryEvent(
+        event_id="evt-3",
+        event_type=EventType.MARKET_TICK,
+        event_time_ns=500,
+        receive_time_ns=3000,
+        source_sequence=3,
+        source=EventSource.EXCHANGE,
+        session_id="session-1",
+        trade_id=None,
+        origin=EventOrigin.OBSERVED,
+        authority=EventAuthority.EXCHANGE,
+        causality=EventCausality.EXOGENOUS,
+        mutability=EventMutability.IMMUTABLE,
+        payload_schema_version="v1.0.0",
+        payload={"symbol": "TMF_OTHER"},
+        quality_flags=(),
+    )
+    
+    ordered_trajectory = order_trajectory_events([base_evt, dup_evt, late_evt])
+    
+    assert ordered_trajectory.input_event_count == 3
+    assert ordered_trajectory.output_event_count == 2
+    assert ordered_trajectory.duplicate_count == 1
+    assert ordered_trajectory.late_event_count == 1
+    # Sorted order should be late_evt (time=500) then base_evt (time=1000)
+    assert ordered_trajectory.events[0].event_id == "evt-3"
+    assert ordered_trajectory.events[1].event_id == "evt-1"
+
+
+def test_ordering_hash_stability(valid_event_dict):
+    from core.trajectory.ordering import order_trajectory_events
+    import random
+    
+    # Create 5 distinct events
+    events = []
+    for i in range(5):
+        evt = TrajectoryEvent(
+            event_id=f"evt-{i}",
+            event_type=EventType.MARKET_TICK,
+            event_time_ns=i * 100,
+            receive_time_ns=i * 100 + 5,
+            source_sequence=i,
+            source=EventSource.EXCHANGE,
+            session_id="session-1",
+            trade_id=None,
+            origin=EventOrigin.OBSERVED,
+            authority=EventAuthority.EXCHANGE,
+            causality=EventCausality.EXOGENOUS,
+            mutability=EventMutability.IMMUTABLE,
+            payload_schema_version="v1.0.0",
+            payload={"symbol": f"TMF-{i}"},
+            quality_flags=(),
+        )
+        events.append(evt)
+        
+    # Replay 100 times with randomized input permutations
+    hashes = set()
+    for _ in range(100):
+        shuffled = list(events)
+        random.shuffle(shuffled)
+        res = order_trajectory_events(shuffled)
+        hashes.add(res.ordering_hash)
+        
+    assert len(hashes) == 1  # All permutations yield identical ordering hash
+

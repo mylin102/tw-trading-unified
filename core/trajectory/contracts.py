@@ -63,3 +63,13 @@ class TrajectoryEvent:
     payload_schema_version: str
     payload: Mapping[str, object]
     quality_flags: tuple[str, ...]
+
+@dataclass(frozen=True)
+class OrderedTrajectory:
+    events: tuple[TrajectoryEvent, ...]
+    ordering_policy_version: str
+    input_event_count: int
+    output_event_count: int
+    duplicate_count: int
+    late_event_count: int
+    ordering_hash: str
