@@ -1,6 +1,14 @@
 # MTS Research Methodology v1.0
 
 > A framework for evidence-driven counterfactual research in event-driven trading systems.
+>
+> **Status:** FROZEN (v1.0)
+
+---
+
+> [!IMPORTANT]
+> **Core Axiom:**
+> *“A research conclusion is constrained not only by the replay algorithm, but by the evidence model that defines what counterfactuals are identifiable.”*
 
 ---
 
@@ -383,6 +391,7 @@ Regime gating         ✅             Bar features available
 
 ## 12. Changelog
 
-| Version | Date | Changes |
-|---------|------|---------|
-| v1.0 | 2026-07-17 | Initial methodology. Defines Replay Taxonomy, Evidence Sufficiency, Evidence Boundary, Counterfactual Identifiability. |
+| Version | Date | Status | Changes |
+|---------|------|--------|---------|
+| v1.0 | 2026-07-17 | **FROZEN** | Initial methodology. Defines Replay Taxonomy, Evidence Sufficiency, Evidence Boundary, Counterfactual Identifiability. |
+
