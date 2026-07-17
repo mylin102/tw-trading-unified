@@ -445,6 +445,7 @@ def calculate_mts_daily_performance(fills_path: str, events_path: str, target_tr
     import json
     from datetime import datetime, timedelta
     from collections import defaultdict
+    import pandas as pd
 
     if not os.path.exists(fills_path):
         return {"completed": [], "active": []}
@@ -575,6 +576,48 @@ def calculate_mts_daily_performance(fills_path: str, events_path: str, target_tr
                 exit_pnl = exit_fill.get("realized_pnl", 0.0) if exit_fill else 0.0
                 net_pnl = release_pnl + exit_pnl
                 
+                # 2026-07-17 Gemini CLI: Calculate durations for release and trail phases
+                release_ts = release_fill.get("timestamp") if release_fill else None
+                entry_ts = data["entry_ts"]
+                exit_ts = data["exit_ts"]
+                
+                release_duration_str = "—"
+                trail_duration_str = "—"
+                
+                if entry_ts and release_ts:
+                    try:
+                        t_entry = pd.to_datetime(entry_ts)
+                        t_release = pd.to_datetime(release_ts)
+                        diff = t_release - t_entry
+                        tot_sec = int(diff.total_seconds())
+                        if tot_sec < 0: tot_sec = 0
+                        h = tot_sec // 3600
+                        m = (tot_sec % 3600) // 60
+                        s = tot_sec % 60
+                        if h > 0:
+                            release_duration_str = f"{h}h {m}m"
+                        else:
+                            release_duration_str = f"{m}m {s}s"
+                    except Exception:
+                        pass
+                
+                if release_ts and exit_ts:
+                    try:
+                        t_release = pd.to_datetime(release_ts)
+                        t_exit = pd.to_datetime(exit_ts)
+                        diff = t_exit - t_release
+                        tot_sec = int(diff.total_seconds())
+                        if tot_sec < 0: tot_sec = 0
+                        h = tot_sec // 3600
+                        m = (tot_sec % 3600) // 60
+                        s = tot_sec % 60
+                        if h > 0:
+                            trail_duration_str = f"{h}h {m}m"
+                        else:
+                            trail_duration_str = f"{m}m {s}s"
+                    except Exception:
+                        pass
+                
                 completed.append({
                     "trade_id": trade_id,
                     "entry_time": data["entry_ts"],
@@ -589,7 +632,9 @@ def calculate_mts_daily_performance(fills_path: str, events_path: str, target_tr
                     "exit_pnl": exit_pnl,
                     "exit_reason": data["exit_reason"],
                     "net_pnl": net_pnl,
-                    "risk_mode": data["risk_mode"]
+                    "risk_mode": data["risk_mode"],
+                    "release_duration": release_duration_str,
+                    "trail_duration": trail_duration_str
                 })
                 
     return {"completed": completed, "active": active}
@@ -3602,13 +3647,15 @@ elif page == f"期貨 {_TICKER}":
                 with st.expander("📝 已完結交易清單 (Closed Loops)", expanded=True):
                     _loop_rows = []
                     for t in _completed:
+                        # 2026-07-17 Gemini CLI: Render first/second leg duration columns in closed loops table
                         _loop_rows.append({
                             "交易 ID": t["trade_id"][-6:],
                             "時段": "☀️ 日盤" if t["session"].lower() == "day" else "🌙 夜盤",
                             "進場時間": t["entry_time"].split("T")[1][:8] if "T" in t["entry_time"] else t["entry_time"],
-                            "出場時間": t["exit_time"].split("T")[1][:8] if "T" in t["exit_time"] else t["exit_time"],
                             "第一腿 PnL": f'{t["release_pnl"]:+,.0f}',
+                            "第一腿時間": t.get("release_duration", "—"),
                             "第二腿 PnL": f'{t["exit_pnl"]:+,.0f}',
+                            "第二腿時間": t.get("trail_duration", "—"),
                             "釋放原因": t["exit_reason"],
                             "淨利 (TWD)": f'{t["net_pnl"]:+,.0f}',
                             "風控": t["risk_mode"]
