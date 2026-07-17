@@ -37,6 +37,11 @@ All ADRs share a sequential numeric namespace. Numbers are permanent identifiers
 | ADR-014 | Stock CANSLIM & RS Rating Integration | Stocks | Strategy | Active |
 | ADR-015 | Reframe MTS Calendar Spread as Statistical Arbitrage | Theory | Framework | Active (Stable) |
 | ADR-016 | Evidence-Based Indicator Lifecycle | Governance | Framework | Active |
+| ADR-017 | Trajectory Evidence Model | Theory | Framework | Proposed |
+| ADR-018 | Deterministic Event Ordering | Theory | Framework | Proposed |
+| ADR-019 | Baseline Trajectory Reproduction Certification | Theory | Framework | Proposed |
+| ADR-020 | Historical Truth Boundary and Counterfactual Forking | Theory | Framework | Proposed |
+| ADR-021 | Execution and Fill Model | Theory | Framework | Proposed |
 
 ---
 
@@ -55,6 +60,11 @@ All ADRs share a sequential numeric namespace. Numbers are permanent identifiers
 ### Theory & Governance
 - ADR-015 — Statistical Arbitrage Framework
 - ADR-016 — Evidence-Based Indicator Lifecycle
+- ADR-017 — Trajectory Evidence Model
+- ADR-018 — Deterministic Event Ordering
+- ADR-019 — Baseline Trajectory Reproduction Certification
+- ADR-020 — Historical Truth Boundary and Counterfactual Forking
+- ADR-021 — Execution and Fill Model
 
 ### Options
 - ADR-001 — Disable ThetaGang
@@ -124,6 +134,11 @@ ADR-009  ADR-010  ADR-011
 ### Framework (stable methodology documents)
 - ADR-015 — Statistical Arbitrage Framework
 - ADR-016 — Evidence-Based Indicator Lifecycle
+- ADR-017 — Trajectory Evidence Model
+- ADR-018 — Deterministic Event Ordering
+- ADR-019 — Baseline Trajectory Reproduction Certification
+- ADR-020 — Historical Truth Boundary and Counterfactual Forking
+- ADR-021 — Execution and Fill Model
 
 ### Architecture (system design, decision ownership)
 - ADR-003 — Router Trace
