@@ -6273,11 +6273,12 @@ elif page == "🔄 反事實研究室":
             values = list(range(r_start, r_end + 1, step))
 
         # Ask user for baseline parameter override input to enforce reproduction validation
-        default_baseline_val = float(spec.default_val)
+        _is_float = spec.type == float
+        default_baseline_val = float(spec.default_val) if _is_float else int(spec.default_val)
         baseline_override = st.number_input(
             f"設定基線比對值 (Baseline Value for comparison)",
             value=default_baseline_val,
-            step=1.0 if spec.type == float else 1
+            step=1.0 if _is_float else 1
         )
         
         # Insert baseline value into the sweep tuple if not present to run verification

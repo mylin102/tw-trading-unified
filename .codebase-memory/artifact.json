@@ -1,11 +1,11 @@
 {
     "schema_version": 1,
-    "commit": "217e2d384c6a6060cba7d74d1f9b14bc6809eed4",
-    "indexed_at": "2026-07-08T13:28:25Z",
+    "commit": "bafaea8c1c5201359c30c71fe5831705a2333567",
+    "indexed_at": "2026-07-20T07:33:21Z",
     "project": "Users-mylin-Documents-mylin102-tw-trading-unified",
-    "nodes": 11,
-    "edges": 10,
-    "original_size": 2162688,
-    "compressed_size": 64649,
+    "nodes": 2906,
+    "edges": 7550,
+    "original_size": 11403264,
+    "compressed_size": 1884433,
     "compression_level": 3
 }
