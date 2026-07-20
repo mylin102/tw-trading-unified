@@ -47,6 +47,7 @@ def test_mts_exit_trigger_logic(strategy):
         PositionPhase, PositionLifecycle, ReleaseGroup, ReleaseGroupStatus,
         TrailGroup, TrailGroupStatus, Leg,
     )
+    import time
     strategy._lifecycle_oca = PositionLifecycle(
         phase=PositionPhase.SINGLE_LEG,
         release_group=ReleaseGroup(
@@ -58,6 +59,8 @@ def test_mts_exit_trigger_logic(strategy):
             remaining_leg=Leg.FAR,
         ),
     )
+    strategy._single_leg_entered_mono = time.monotonic() - 10.0
+    strategy._single_leg_post_fill_ticks = 10
     
     # 2. Case A: Price is 44075 (Peak 100 - Current 75 = 25 pts drop, < 35 threshold) -> No signal
     bar_no_exit = {
@@ -236,3 +239,252 @@ def test_mts_near_leg_exit_clears_trader_position():
     # Verify that the trader's position was zeroed out (0), not set to -1 (short entry)
     assert monitor.trader.position == 0
 
+
+def test_ccf4eb77_regression_single_leg_ignores_pre_release_bar_extrema_long(strategy):
+    """
+    Verify that in live/paper mode (non-backtest), the SINGLE_LEG trailing evaluator
+    ignores any pre-release extremes contained in the current bar's high/low for LONG remaining side.
+    """
+    # 2026-07-20 Gemini CLI: Add regression test for Phase-Boundary Lookback Leakage - LONG (ccf4eb77)
+    from strategies.plugins.futures.active.tmf_spread import (
+        PositionPhase, PositionLifecycle, ReleaseGroup, ReleaseGroupStatus,
+        TrailGroup, TrailGroupStatus, Leg,
+    )
+    import time
+    
+    # Setup LONG remaining leg on FAR
+    strategy._has_position = True
+    strategy._released_leg = "near"
+    strategy._side = "LONG"
+    strategy._far_entry = 44000.0
+    strategy._peak = 44000.0 # set peak to exact price at release
+    strategy._ticker = "TMF"
+    
+    strategy._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SINGLE_LEG,
+        release_group=ReleaseGroup(
+            status=ReleaseGroupStatus.COMPLETED,
+            filled_leg=Leg.NEAR, canceled_leg=Leg.FAR,
+        ),
+        trail_group=TrailGroup(
+            status=TrailGroupStatus.ARMED,
+            remaining_leg=Leg.FAR,
+        ),
+    )
+    strategy._single_leg_entered_mono = time.monotonic() - 10.0
+    strategy._single_leg_post_fill_ticks = 10
+    
+    # Bar contains a far_low of 43900.0 (historical extreme from before breakout/release)
+    # and far_high of 44100.0, but current close is 44000.0.
+    bar_polluted = {
+        "near_close": 44100.0,
+        "far_close": 44000.0,
+        "far_high": 44100.0,
+        "far_low": 43900.0,
+        "atr": 10.0,
+        "timestamp": datetime.now()
+    }
+    
+    ctx = StrategyContext(market=MarketData(last_bar=bar_polluted, ticker="TMF"), 
+                          position=PositionView(size=1), config={})
+    
+    # Run strategy logic. In live/paper mode, it must ignore bar_low (43900.0) 
+    # and use the current tick price (44000.0) as _rem_low, so pullback is 0, NOT 100 points.
+    # Therefore, no exit signal should trigger.
+    signal = strategy.on_bar(ctx)
+    assert signal is None
+    assert strategy._peak == 44000.0  # Peak should not jump to the polluted bar_high
+
+
+def test_ccf4eb77_regression_single_leg_ignores_pre_release_bar_extrema_short(strategy):
+    """
+    Verify that in live/paper mode (non-backtest), the SINGLE_LEG trailing evaluator
+    ignores any pre-release extremes contained in the current bar's high/low for SHORT remaining side.
+    """
+    # 2026-07-20 Gemini CLI: Add regression test for Phase-Boundary Lookback Leakage - SHORT (ccf4eb77)
+    from strategies.plugins.futures.active.tmf_spread import (
+        PositionPhase, PositionLifecycle, ReleaseGroup, ReleaseGroupStatus,
+        TrailGroup, TrailGroupStatus, Leg,
+    )
+    import time
+    
+    # Setup SHORT remaining leg on NEAR (FAR was released)
+    strategy._has_position = True
+    strategy._released_leg = "far"
+    strategy._side = "SHORT"
+    strategy._near_entry = 43264.0
+    strategy._nadir = 43050.0 # set nadir to exact price at release
+    strategy._ticker = "TMF"
+    
+    strategy._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SINGLE_LEG,
+        release_group=ReleaseGroup(
+            status=ReleaseGroupStatus.COMPLETED,
+            filled_leg=Leg.FAR, canceled_leg=Leg.NEAR,
+        ),
+        trail_group=TrailGroup(
+            status=TrailGroupStatus.ARMED,
+            remaining_leg=Leg.NEAR,
+        ),
+    )
+    strategy._single_leg_entered_mono = time.monotonic() - 10.0
+    strategy._single_leg_post_fill_ticks = 10
+    
+    # Bar contains a near_high of 43474.0 (historical extreme from before breakout/release)
+    # and near_low of 43000.0, but current close is 43050.0.
+    bar_polluted = {
+        "near_close": 43050.0,
+        "far_close": 43313.0,
+        "near_high": 43474.0,
+        "near_low": 43000.0,
+        "atr": 10.0,
+        "timestamp": datetime.now()
+    }
+    
+    ctx = StrategyContext(market=MarketData(last_bar=bar_polluted, ticker="TMF"), 
+                          position=PositionView(size=1), config={})
+    
+    # Run strategy logic. In live/paper mode, it must ignore bar_high (43474.0) 
+    # and use the current tick price (43050.0) as _rem_high, so pullback/rebound is 0, NOT 424 points.
+    # Therefore, no exit signal should trigger.
+    signal = strategy.on_bar(ctx)
+    assert signal is None
+    assert strategy._nadir == 43050.0  # Nadir should not jump to the polluted bar_low or anything else
+
+
+def test_single_leg_trail_uses_post_release_tick_path_only_long(strategy):
+    """
+    Verify that peak/nadir are dynamically updated sequentially based on close prices
+    received after activation, rather than jumping to pre-activation extremes for LONG remaining side.
+    """
+    # 2026-07-20 Gemini CLI: Add trailing validation test for post-release tick path - LONG
+    from strategies.plugins.futures.active.tmf_spread import (
+        PositionPhase, PositionLifecycle, ReleaseGroup, ReleaseGroupStatus,
+        TrailGroup, TrailGroupStatus, Leg,
+    )
+    import time
+    
+    strategy._has_position = True
+    strategy._released_leg = "near"
+    strategy._side = "LONG"
+    strategy._far_entry = 44000.0
+    strategy._peak = 44000.0
+    strategy._ticker = "TMF"
+    
+    strategy._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SINGLE_LEG,
+        release_group=ReleaseGroup(
+            status=ReleaseGroupStatus.COMPLETED,
+            filled_leg=Leg.NEAR, canceled_leg=Leg.FAR,
+        ),
+        trail_group=TrailGroup(
+            status=TrailGroupStatus.ARMED,
+            remaining_leg=Leg.FAR,
+        ),
+    )
+    strategy._single_leg_entered_mono = time.monotonic() - 10.0
+    strategy._single_leg_post_fill_ticks = 10
+    
+    # Tick 1: Price rises to 44010.0. Peak should update to 44010.0.
+    bar_tick1 = {
+        "near_close": 44100.0, "far_close": 44010.0, "atr": 10.0, "timestamp": datetime.now()
+    }
+    ctx1 = StrategyContext(market=MarketData(last_bar=bar_tick1, ticker="TMF"), 
+                           position=PositionView(size=1), config={})
+    signal1 = strategy.on_bar(ctx1)
+    assert signal1 is None
+    assert strategy._peak == 44010.0
+    
+    # Tick 2: Price drops to 43980.0 (Pullback = 30 pts < 35 threshold). No exit signal.
+    bar_tick2 = {
+        "near_close": 44100.0, "far_close": 43980.0, "atr": 10.0, "timestamp": datetime.now()
+    }
+    ctx2 = StrategyContext(market=MarketData(last_bar=bar_tick2, ticker="TMF"), 
+                           position=PositionView(size=1), config={})
+    signal2 = strategy.on_bar(ctx2)
+    assert signal2 is None
+    assert strategy._peak == 44010.0  # Peak remains 44010.0
+    
+    # Tick 3: Price drops to 43970.0 (Pullback = 40 pts >= 35 threshold). Trigger EXIT.
+    bar_tick3 = {
+        "near_close": 44100.0, "far_close": 43970.0, "atr": 10.0, "timestamp": datetime.now()
+    }
+    ctx3 = StrategyContext(market=MarketData(last_bar=bar_tick3, ticker="TMF"), 
+                           position=PositionView(size=1), config={})
+    
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal3 = strategy.on_bar(ctx3)
+        
+    assert signal3 is not None
+    assert signal3.action == "EXIT"
+
+
+def test_single_leg_trail_uses_post_release_tick_path_only_short(strategy):
+    """
+    Verify that peak/nadir are dynamically updated sequentially based on close prices
+    received after activation, rather than jumping to pre-activation extremes for SHORT remaining side.
+    """
+    # 2026-07-20 Gemini CLI: Add trailing validation test for post-release tick path - SHORT
+    from strategies.plugins.futures.active.tmf_spread import (
+        PositionPhase, PositionLifecycle, ReleaseGroup, ReleaseGroupStatus,
+        TrailGroup, TrailGroupStatus, Leg,
+    )
+    import time
+    
+    strategy._has_position = True
+    strategy._released_leg = "far"
+    strategy._side = "SHORT"
+    strategy._near_entry = 43200.0
+    strategy._nadir = 43200.0
+    strategy._ticker = "TMF"
+    
+    strategy._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SINGLE_LEG,
+        release_group=ReleaseGroup(
+            status=ReleaseGroupStatus.COMPLETED,
+            filled_leg=Leg.FAR, canceled_leg=Leg.NEAR,
+        ),
+        trail_group=TrailGroup(
+            status=TrailGroupStatus.ARMED,
+            remaining_leg=Leg.NEAR,
+        ),
+    )
+    strategy._single_leg_entered_mono = time.monotonic() - 10.0
+    strategy._single_leg_post_fill_ticks = 10
+    
+    # Tick 1: Price drops to 43190.0. Nadir should update to 43190.0.
+    bar_tick1 = {
+        "near_close": 43190.0, "far_close": 43450.0, "atr": 10.0, "timestamp": datetime.now()
+    }
+    ctx1 = StrategyContext(market=MarketData(last_bar=bar_tick1, ticker="TMF"), 
+                           position=PositionView(size=1), config={})
+    signal1 = strategy.on_bar(ctx1)
+    assert signal1 is None
+    assert strategy._nadir == 43190.0
+    
+    # Tick 2: Price rises to 43220.0 (Rebound = 30 pts < 35 threshold). No exit signal.
+    bar_tick2 = {
+        "near_close": 43220.0, "far_close": 43450.0, "atr": 10.0, "timestamp": datetime.now()
+    }
+    ctx2 = StrategyContext(market=MarketData(last_bar=bar_tick2, ticker="TMF"), 
+                           position=PositionView(size=1), config={})
+    signal2 = strategy.on_bar(ctx2)
+    assert signal2 is None
+    assert strategy._nadir == 43190.0  # Nadir remains 43190.0
+    
+    # Tick 3: Price rises to 43230.0 (Rebound = 40 pts >= 35 threshold). Trigger EXIT.
+    bar_tick3 = {
+        "near_close": 43230.0, "far_close": 43450.0, "atr": 10.0, "timestamp": datetime.now()
+    }
+    ctx3 = StrategyContext(market=MarketData(last_bar=bar_tick3, ticker="TMF"), 
+                           position=PositionView(size=1), config={})
+    
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal3 = strategy.on_bar(ctx3)
+        
+    assert signal3 is not None
+    assert signal3.action == "EXIT"

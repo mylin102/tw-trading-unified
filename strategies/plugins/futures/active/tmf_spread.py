@@ -2638,11 +2638,25 @@ class TMFSpread(StrategyBase):
                 _trailing_side = Side.LONG if self._side == "LONG" else Side.SHORT
             # rem_high/rem_low: use opposite leg from released
             if _rel == Leg.NEAR:
-                _rem_high = float(bar.get("far_high", 0))
-                _rem_low = float(bar.get("far_low", 0))
+                if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG and not _is_backtest:
+                    # 2026-07-20 Gemini CLI: SINGLE_LEG may begin mid-bar after a RELEASE fill.
+                    # In live/paper mode, whole-bar high/low can include observations
+                    # from before the phase boundary. Use only the current event price
+                    # so peak/nadir are derived exclusively from post-release ticks.
+                    _rem_high = _rem_low = far_close
+                else:
+                    _rem_high = float(bar.get("far_high", 0))
+                    _rem_low = float(bar.get("far_low", 0))
             elif _rel == Leg.FAR:
-                _rem_high = float(bar.get("near_high", 0))
-                _rem_low = float(bar.get("near_low", 0))
+                if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG and not _is_backtest:
+                    # 2026-07-20 Gemini CLI: SINGLE_LEG may begin mid-bar after a RELEASE fill.
+                    # In live/paper mode, whole-bar high/low can include observations
+                    # from before the phase boundary. Use only the current event price
+                    # so peak/nadir are derived exclusively from post-release ticks.
+                    _rem_high = _rem_low = near_close
+                else:
+                    _rem_high = float(bar.get("near_high", 0))
+                    _rem_low = float(bar.get("near_low", 0))
             else:
                 _rem_high = _rem_low = 0.0
             _ctx = LifecycleContext(
@@ -3158,16 +3172,31 @@ class TMFSpread(StrategyBase):
                 self._released_leg,
             )
 
+        _is_backtest = os.getenv("MTS_BACKTEST") == "1"
         if self._released_leg == "near":
             _rem_price, _rem_entry, _rem_leg_label, _released_leg_label = far_close, self._far_entry, "FAR", "NEAR"
-            # 2026-05-27 Gemini CLI: Evaluate intra-bar extremes
-            _rem_high = float(bar.get("far_high", far_close))
-            _rem_low = float(bar.get("far_low", far_close))
+            if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG and not _is_backtest:
+                # 2026-07-20 Gemini CLI: SINGLE_LEG may begin mid-bar after a RELEASE fill.
+                # In live/paper mode, whole-bar high/low can include observations
+                # from before the phase boundary. Use only the current event price
+                # so peak/nadir are derived exclusively from post-release ticks.
+                _rem_high = _rem_low = far_close
+            else:
+                # 2026-05-27 Gemini CLI: Evaluate intra-bar extremes
+                _rem_high = float(bar.get("far_high", far_close))
+                _rem_low = float(bar.get("far_low", far_close))
         else:
             _rem_price, _rem_entry, _rem_leg_label, _released_leg_label = near_close, self._near_entry, "NEAR", "FAR"
-            # 2026-05-27 Gemini CLI: Evaluate intra-bar extremes
-            _rem_high = float(bar.get("near_high", near_close))
-            _rem_low = float(bar.get("near_low", near_close))
+            if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG and not _is_backtest:
+                # 2026-07-20 Gemini CLI: SINGLE_LEG may begin mid-bar after a RELEASE fill.
+                # In live/paper mode, whole-bar high/low can include observations
+                # from before the phase boundary. Use only the current event price
+                # so peak/nadir are derived exclusively from post-release ticks.
+                _rem_high = _rem_low = near_close
+            else:
+                # 2026-05-27 Gemini CLI: Evaluate intra-bar extremes
+                _rem_high = float(bar.get("near_high", near_close))
+                _rem_low = float(bar.get("near_low", near_close))
 
         # 💡 [Fixed 2026-05-27] Guard against zero or invalid prices in trailing mode
         if _rem_high <= 0 or _rem_low <= 0:
