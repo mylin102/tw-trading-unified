@@ -2575,7 +2575,7 @@ class FuturesMonitor:
                          if _rem_price <= 0:
                              _rem_price = _mts_strat._far_entry if _leg == "near" else _mts_strat._near_entry
                              
-                         _mts_strat.sync_release(leg=_leg, price=_rem_price, release_price=price)
+                         _mts_strat.sync_release(leg=_leg, price=_rem_price, release_price=price, event_time=getattr(event, "timestamp", None))
                          console.print(f"[bold green]✅ [MTS_SYNC] Release CONFIRMED: {event.order_id} ({_leg}) with remaining leg price {_rem_price}[/bold green]")
 
                  # 2026-06-09 JVS Claw: Fix symbol matching for NEAR/FAR legs

@@ -63,81 +63,25 @@ from strategies.plugins.futures.active.risk_engine import (
 # ADR-009 v1.1: Position Lifecycle — ReleaseGroup + TrailGroup
 # ═══════════════════════════════════════════════════════════════
 
-class Leg(Enum):
-    """Spread leg identifier."""
-    NEAR = "NEAR"
-    FAR = "FAR"
-
-class Side(Enum):
-    """Position side (direction)."""
-    LONG = "LONG"
-    SHORT = "SHORT"
-
-class PositionPhase(Enum):
-    """Shape of the spread position (not order progress)."""
-    FLAT = "FLAT"           # no position
-    SPREAD = "SPREAD"       # both legs held
-    SINGLE_LEG = "SINGLE_LEG"  # one leg released, one remaining
-
-class ReleaseGroupStatus(Enum):
-    """Lifecycle of the release OCO pair.
-
-    ADR-010: expanded with SUBMITTING, PARTIALLY_FILLED, CANCELING_SIBLING,
-    SIBLING_CANCELED for broker-level OCO bracket support.
-    """
-    INACTIVE = "INACTIVE"               # not in spread phase
-    ARMED = "ARMED"                     # spread held, monitoring release_stop
-    TRIGGERED = "TRIGGERED"             # release_stop hit, about to submit
-    SUBMITTING = "SUBMITTING"           # one order submitted, second in flight (restartable)
-    SUBMITTED = "SUBMITTED"             # both release orders submitted
-    FILLED = "FILLED"                   # one leg filled, sibling cancel pending
-    PARTIALLY_FILLED = "PARTIALLY_FILLED"  # one leg filled, sibling cancel in flight
-    CANCELING_SIBLING = "CANCELING_SIBLING"  # cancel submitted, awaiting confirmation
-    SIBLING_CANCELED = "SIBLING_CANCELED"    # sibling cancel confirmed, safe to trail
-    COMPLETED = "COMPLETED"             # filled + sibling cancel confirmed
-    FAILED = "FAILED"                   # terminal failure
-
-class TrailGroupStatus(Enum):
-    """Lifecycle of the post-release single-leg trailing exit."""
-    INACTIVE = "INACTIVE"   # not in single-leg phase
-    ARMED = "ARMED"         # release confirmed, trail not yet active
-    ACTIVE = "ACTIVE"       # trail stop calculated and monitored
-    SUBMITTED = "SUBMITTED" # exit order submitted
-    FILLED = "FILLED"       # exit fill confirmed
-    FAILED = "FAILED"       # terminal failure
-
-class LifecycleAction(Enum):
-    """Action selected by the lifecycle controller."""
-    MANUAL = "MANUAL"
-    STOPLOSS = "STOPLOSS"
-    TIMEOUT = "TIMEOUT"
-    RELEASE = "RELEASE"
-    TRAIL = "TRAIL"
+from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+    Leg,
+    Side,
+    PositionPhase,
+    ReleaseGroupStatus,
+    TrailGroupStatus,
+    LifecycleAction,
+    CancelStatus,
+    EntryRiskSnapshot,
+    ReleaseGroup,
+    TrailGroup,
+    PositionLifecycle,
+)
 
 class ReleaseMode(Enum):
     """MTS release order strategy (ADR-009 Phase 2 placeholder)."""
     TRIGGERED_MARKET = "triggered_market"
     TRIGGERED_OCO_LIMIT = "triggered_oco_limit"
     ENTRY_OCO_LIMIT = "entry_oco_limit"
-
-class CancelStatus(Enum):
-    """Status of a sibling cancel order (ADR-010)."""
-    PENDING = "PENDING"
-    CONFIRMED = "CONFIRMED"
-    REJECTED = "REJECTED"
-
-@dataclass
-class EntryRiskSnapshot:
-    """Snapshot of risk parameters at entry time for OCO bracket (ADR-010).
-
-    Immutable after creation. Prevents ATR drift during bracket lifetime.
-    """
-    atr: float = 0.0
-    release_stop: float = 0.0
-    trail_stop: float = 0.0
-    entry_z: float = 0.0
-    spread: float = 0.0
-    timestamp: str = ""  # ISO datetime
 
 # Priority order for action selection (index = priority, lower = higher)
 _LIFECYCLE_ACTION_PRIORITY: list[LifecycleAction] = [
@@ -147,49 +91,6 @@ _LIFECYCLE_ACTION_PRIORITY: list[LifecycleAction] = [
     LifecycleAction.RELEASE,
     LifecycleAction.TRAIL,
 ]
-
-@dataclass
-class ReleaseGroup:
-    """State holder for the release OCO pair (ADR-009 v1.1, expanded ADR-010)."""
-    status: ReleaseGroupStatus = ReleaseGroupStatus.INACTIVE
-    near_order_id: str | None = None
-    far_order_id: str | None = None
-    filled_leg: Leg | None = None       # IS the winner_leg (ADR-010)
-    filled_order_id: str | None = None
-    canceled_leg: Leg | None = None     # IS the loser leg (ADR-010)
-    trigger_ts: str | None = None
-
-    # ADR-010: sibling cancel tracking
-    sibling_cancel_order_id: str | None = None
-    sibling_cancel_status: CancelStatus | None = None
-
-    # ADR-010: entry risk snapshot
-    entry_risk: EntryRiskSnapshot | None = None
-
-    # ADR-010: release order metadata (source of truth for orders export)
-    near_price: float = 0.0
-    far_price: float = 0.0
-    near_side: str | None = None
-    far_side: str | None = None
-    order_type: str = "MKP"
-
-@dataclass
-class TrailGroup:
-    """State holder for the post-release trailing exit (ADR-009 v1.1)."""
-    status: TrailGroupStatus = TrailGroupStatus.INACTIVE
-    remaining_leg: Leg | None = None
-    exit_order_id: str | None = None
-    peak_pnl: float | None = None
-    nadir_pnl: float | None = None
-    trail_stop: float | None = None
-    trigger_ts: str | None = None
-
-@dataclass
-class PositionLifecycle:
-    """Aggregate state for the MTS spread position lifecycle (ADR-009 v1.1)."""
-    phase: PositionPhase = PositionPhase.FLAT
-    release_group: ReleaseGroup = field(default_factory=ReleaseGroup)
-    trail_group: TrailGroup = field(default_factory=TrailGroup)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -439,156 +340,12 @@ _MTS_STATE_REVISION = 0  # incremented on every lifecycle state write
 # Task 3A: Pure Decision Engine (ADR-009 v1.1)
 # ═══════════════════════════════════════════════════════════════
 
-@dataclass
-class LifecycleContext:
-    """Input data for evaluate_lifecycle_actions(). Pure data — no filesystem, no Shioaji."""
-    near_pnl_pts: float
-    far_pnl_pts: float
-    floating_pnl_pts: float
-    entry_age_secs: float
-    release_stop_threshold: float
-    trail_dist: float
-    manual_requested: bool = False
-    max_hold_secs: float | None = None        # None = no timeout
-    max_loss_pts: float | None = None          # None = no stoploss
-    trailing_side: Side | None = None          # LONG/SHORT for remaining leg
-    peak: float = 0.0
-    nadir: float = 0.0
-    rem_high: float = 0.0
-    rem_low: float = 0.0
-    is_backtest: bool = False
-
-
-@dataclass
-class LifecycleDecision:
-    """Result of evaluate_lifecycle_actions()."""
-    action: LifecycleAction
-    release_leg: Leg | None = None  # which leg to release (only for RELEASE)
-
-
-def _check_release_candidates(
-    ctx: LifecycleContext, lifecycle: PositionLifecycle,
-) -> list[LifecycleDecision]:
-    _phase_val = enum_value(lifecycle.phase)
-    if _phase_val != "SPREAD":
-        logger.info(
-            "[CHECK_RELEASE_SKIP] phase=%s expected=SPREAD rg_status=%s near_pnl=%.1f far_pnl=%.1f",
-            _phase_val,
-            enum_value(lifecycle.release_group.status),
-            ctx.near_pnl_pts, ctx.far_pnl_pts,
-        )
-        return []
-    _rg_status = enum_value(lifecycle.release_group.status)
-    if _rg_status not in ("ARMED", "TRIGGERED"):
-        logger.info(
-            "[CHECK_RELEASE_SKIP] phase=%s rg_status=%s expected in (ARMED,TRIGGERED) near_pnl=%.1f far_pnl=%.1f",
-            _phase_val,
-            _rg_status,
-            ctx.near_pnl_pts, ctx.far_pnl_pts,
-        )
-        return []
-    near_hit = ctx.near_pnl_pts <= -ctx.release_stop_threshold
-    far_hit = ctx.far_pnl_pts <= -ctx.release_stop_threshold
-    if near_hit or far_hit:
-        # If both hit, release the more negative leg
-        if near_hit and far_hit:
-            leg = Leg.NEAR if ctx.near_pnl_pts <= ctx.far_pnl_pts else Leg.FAR
-        elif near_hit:
-            leg = Leg.NEAR
-        else:
-            leg = Leg.FAR
-        logger.info(
-            "[CHECK_RELEASE_DECISION] near_hit=%s far_hit=%s action=RELEASE leg=%s "
-            "near_pnl=%.1f far_pnl=%.1f threshold=%.1f",
-            near_hit, far_hit, leg.value,
-            ctx.near_pnl_pts, ctx.far_pnl_pts, ctx.release_stop_threshold,
-        )
-        return [LifecycleDecision(action=LifecycleAction.RELEASE, release_leg=leg)]
-    logger.info(
-        "[CHECK_RELEASE_SKIP] near_hit=%s far_hit=%s "
-        "near_pnl=%.1f far_pnl=%.1f threshold=%.1f",
-        near_hit, far_hit,
-        ctx.near_pnl_pts, ctx.far_pnl_pts, ctx.release_stop_threshold,
-    )
-    return []
-
-
-def _check_trail_candidate(
-    ctx: LifecycleContext, lifecycle: PositionLifecycle,
-) -> list[LifecycleDecision]:
-    _phase_val = enum_value(lifecycle.phase)
-    if _phase_val != "SINGLE_LEG":
-        return []
-    _tg_status = enum_value(lifecycle.trail_group.status)
-    if _tg_status not in ("ARMED", "ACTIVE"):
-        return []
-    if ctx.trailing_side is None or ctx.rem_high <= 0 or ctx.rem_low <= 0:
-        return []
-    if ctx.trailing_side == Side.LONG:
-        if ctx.rem_low <= ctx.peak - ctx.trail_dist:
-            return [LifecycleDecision(action=LifecycleAction.TRAIL)]
-    else:
-        if ctx.rem_high >= ctx.nadir + ctx.trail_dist:
-            return [LifecycleDecision(action=LifecycleAction.TRAIL)]
-    return []
-
-
-def _check_timeout_candidate(ctx: LifecycleContext) -> list[LifecycleDecision]:
-    if ctx.max_hold_secs is not None and ctx.entry_age_secs > ctx.max_hold_secs:
-        return [LifecycleDecision(action=LifecycleAction.TIMEOUT)]
-    return []
-
-
-def _check_stoploss_candidate(ctx: LifecycleContext) -> list[LifecycleDecision]:
-    if ctx.max_loss_pts is not None and ctx.floating_pnl_pts <= -ctx.max_loss_pts:
-        return [LifecycleDecision(action=LifecycleAction.STOPLOSS)]
-    return []
-
-
-def _check_manual_candidate(ctx: LifecycleContext) -> list[LifecycleDecision]:
-    if ctx.manual_requested:
-        return [LifecycleDecision(action=LifecycleAction.MANUAL)]
-    return []
-
-
-def evaluate_lifecycle_actions(
-    ctx: LifecycleContext,
-    lifecycle: PositionLifecycle,
-) -> LifecycleDecision | None:
-    """Pure decision engine: collect candidates → select by priority → commit.
-
-    Returns LifecycleDecision (action + leg) or None.
-    Mutates lifecycle state for the selected path.
-    No filesystem, no Shioaji, no order submission.
-    """
-    # Do not re-select if release is still in flight
-    _rg_status = enum_value(lifecycle.release_group.status)
-    if _rg_status in ("SUBMITTED", "FILLED"):
-        return None
-    # Do not re-select if trail is still in flight
-    _tg_status = enum_value(lifecycle.trail_group.status)
-    if _tg_status in ("SUBMITTED", "FILLED"):
-        return None
-
-    candidates: list[LifecycleDecision] = []
-    candidates.extend(_check_manual_candidate(ctx))
-    candidates.extend(_check_stoploss_candidate(ctx))
-    candidates.extend(_check_timeout_candidate(ctx))
-    candidates.extend(_check_release_candidates(ctx, lifecycle))
-    candidates.extend(_check_trail_candidate(ctx, lifecycle))
-
-    if not candidates:
-        return None
-
-    for priority_action in _LIFECYCLE_ACTION_PRIORITY:
-        for decision in candidates:
-            if decision.action == priority_action:
-                # 2026-07-09 Hermes Agent: P0 lifecycle ordering — do NOT commit here.
-                # commit + write_state are deferred to _manage_position() after all
-                # pre-order guards (tick confirmation, BB filter) pass.  Committing
-                # TRIGGERED before guards pass creates state-file/broker divergence.
-                return decision
-    return None
+# 2026-07-20 Gemini CLI: re-export pure decision model from decoupled adapter module
+from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+    LifecycleContext,
+    LifecycleDecision,
+    evaluate_lifecycle_actions,
+)
 
 
 def _commit_action(lifecycle: PositionLifecycle, decision: LifecycleDecision) -> None:
@@ -1184,6 +941,12 @@ class TMFSpread(StrategyBase):
         self._single_leg_warmup_ms: float = 500.0
         self._single_leg_warmup_ticks: int = 2
 
+        # 2026-07-20 Gemini CLI: Initialize MTS Lifecycle Adapter & temporal guard tracking
+        from strategies.plugins.futures.active.mts_lifecycle_adapter import MtsLifecycleAdapter
+        self._lifecycle_adapter = MtsLifecycleAdapter()
+        self._last_applied_event_time = None
+        self._single_leg_started_at = None
+
     def _current_lifecycle_state(self) -> dict:
         """ADR-009: serialize lifecycle block for _write_mts_state. Never raises."""
         try:
@@ -1339,6 +1102,7 @@ class TMFSpread(StrategyBase):
         fill_price: float,
         order_id: str,
         source: str,
+        event_time: datetime | None = None,
     ) -> None:
         """ADR-011 Phase 3: Single authoritative entry point for SINGLE_LEG transition.
 
@@ -1354,7 +1118,8 @@ class TMFSpread(StrategyBase):
             self._side = self._near_side
 
         self._released_leg = released_leg.value.lower()
-        self._release_ts = datetime.now()
+        self._release_ts = event_time or datetime.now()
+        self._single_leg_started_at = self._release_ts
         self._release_mono = time.monotonic()
         self._release_price = fill_price if fill_price > 0 else remaining_leg_price
         self._lifecycle = f"TRAILING_{self._side}"
@@ -1370,6 +1135,7 @@ class TMFSpread(StrategyBase):
             trail_group=TrailGroup(
                 status=TrailGroupStatus.ARMED,
                 remaining_leg=_rem,
+                trigger_ts=self._release_ts.isoformat() if isinstance(self._release_ts, datetime) else self._release_ts,
             ),
         )
 
@@ -1419,7 +1185,7 @@ class TMFSpread(StrategyBase):
         )
 
     def sync_release(self, leg: str | Leg, price: float, release_price: float = 0.0,
-                     order_id: str = "") -> None:
+                     order_id: str = "", event_time: datetime | None = None) -> None:
         """
         Synchronize state after a leg release (PARTIAL_EXIT) is confirmed.
         Transitions lifecycle from RELEASE_NEAR/FAR to TRAILING mode.
@@ -1445,6 +1211,7 @@ class TMFSpread(StrategyBase):
             fill_price=release_price,
             order_id=order_id,
             source="sync_release",
+            event_time=event_time,
         )
 
         # Legacy: unify release price (done inside helper, keep for backward compat logging)
@@ -2659,21 +2426,37 @@ class TMFSpread(StrategyBase):
                     _rem_low = float(bar.get("near_low", 0))
             else:
                 _rem_high = _rem_low = 0.0
-            _ctx = LifecycleContext(
-                near_pnl_pts=_n_pnl,
-                far_pnl_pts=_f_pnl,
-                floating_pnl_pts=current_pnl,
-                entry_age_secs=_entry_age,
-                release_stop_threshold=_release_stop,
-                trail_dist=_trail_dist,
-                trailing_side=_trailing_side,
-                peak=_peak,
-                nadir=_nadir,
-                rem_high=_rem_high,
-                rem_low=_rem_low,
-                is_backtest=_is_backtest,
+            # 2026-07-20 Gemini CLI: PR 3B Production Decision Core Cutover (first evaluation block)
+            from strategies.plugins.futures.active.mts_lifecycle_adapter import LifecycleEvaluationInput
+            _adapter_input = LifecycleEvaluationInput(
+                strategy_state={
+                    "near_pnl_pts": _n_pnl,
+                    "far_pnl_pts": _f_pnl,
+                    "floating_pnl_pts": current_pnl,
+                    "entry_age_secs": _entry_age,
+                    "release_stop_threshold": _release_stop,
+                    "trail_dist": _trail_dist,
+                    "manual_requested": getattr(self, "_manual_exit_requested", False),
+                    "max_hold_secs": self._params.get("max_hold_secs"),
+                    "max_loss_pts": self._params.get("max_loss_pts"),
+                    "trailing_side": _trailing_side,
+                    "peak": _peak,
+                    "nadir": _nadir,
+                    "rem_high": _rem_high,
+                    "rem_low": _rem_low,
+                    "last_applied_event_time": self._last_applied_event_time.isoformat() if getattr(self, "_last_applied_event_time", None) else None,
+                    "single_leg_started_at": self._single_leg_started_at.isoformat() if getattr(self, "_single_leg_started_at", None) else None,
+                },
+                market_event={
+                    "event_time": now.isoformat(),
+                    "timestamp": now.isoformat(),
+                    "ts": now.isoformat(),
+                },
+                lifecycle=self._lifecycle_oca,
+                execution_mode="BACKTEST" if _is_backtest else "LIVE",
             )
-            _decision = evaluate_lifecycle_actions(_ctx, self._lifecycle_oca)
+            _adapter_res = self._lifecycle_adapter.evaluate(_adapter_input)
+            _decision = _adapter_res.decision
             # 2026-07-16 Gemini CLI: P0 Invariant Assertion to detect evaluate_lifecycle_actions regression (Phase 3a)
             if (
                 _decision is None
@@ -3249,6 +3032,49 @@ class TMFSpread(StrategyBase):
                     is_backtest=_is_backtest,
                 )
                 _decision2 = evaluate_lifecycle_actions(_ctx2, self._lifecycle_oca)
+
+                # 2026-07-20 Gemini CLI: PR 3B Shadow Validation comparison (second evaluation block)
+                _entry_age_secs = (now - self._entry_ts).total_seconds() if self._entry_ts else 0.0
+                _adapter_input2 = LifecycleEvaluationInput(
+                    strategy_state={
+                        "near_pnl_pts": 0.0,
+                        "far_pnl_pts": 0.0,
+                        "floating_pnl_pts": rem_floating_pnl,
+                        "entry_age_secs": _entry_age_secs,
+                        "release_stop_threshold": release_stop,
+                        "trail_dist": trail_dist,
+                        "manual_requested": getattr(self, "_manual_exit_requested", False),
+                        "max_hold_secs": self._params.get("max_hold_secs"),
+                        "max_loss_pts": self._params.get("max_loss_pts"),
+                        "trailing_side": Side.LONG if self._side == "LONG" else Side.SHORT,
+                        "peak": self._peak,
+                        "nadir": self._nadir,
+                        "rem_high": _rem_high,
+                        "rem_low": _rem_low,
+                        "last_applied_event_time": self._last_applied_event_time.isoformat() if getattr(self, "_last_applied_event_time", None) else None,
+                        "single_leg_started_at": self._single_leg_started_at.isoformat() if getattr(self, "_single_leg_started_at", None) else None,
+                    },
+                    market_event={
+                        "event_time": now.isoformat(),
+                        "timestamp": now.isoformat(),
+                        "ts": now.isoformat(),
+                    },
+                    lifecycle=self._lifecycle_oca,
+                    execution_mode="BACKTEST" if _is_backtest else "LIVE",
+                )
+                _adapter_res2 = self._lifecycle_adapter.evaluate(_adapter_input2)
+                _shadow_decision2 = _adapter_res2.decision
+                _legacy_action2 = _decision2.action if _decision2 else None
+                _shadow_action2 = _shadow_decision2.action if _shadow_decision2 else None
+
+                if _legacy_action2 != _shadow_action2:
+                    logger.error(
+                        "[MTS_LIFECYCLE_SHADOW_MISMATCH_2] legacy_action=%s shadow_action=%s diagnostics=%s",
+                        _legacy_action2, _shadow_action2, _adapter_res2.diagnostics
+                    )
+                    if _is_backtest:
+                        raise RuntimeError(f"MTS_LIFECYCLE_SHADOW_MISMATCH_2: legacy={_legacy_action2} shadow={_shadow_action2}")
+
                 if _decision2 is not None:
                     _decision = _decision2
             except Exception:
@@ -3283,6 +3109,7 @@ class TMFSpread(StrategyBase):
             _write_mts_state(has_position=True, action=f"EXIT_{exit_reason}", reason=exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
             # 2026-07-14 Gemini CLI: Log shadow trade summary for legacy path exit
             self._log_shadow_trade_summary(exit_price, exit_reason, _pnl_pts, now, bar, near_close, far_close)
+            self._last_applied_event_time = now
             return Signal("EXIT", f"TMF_{exit_reason}_{self._side}", confidence=0.5, stop_loss=0)
 
         _write_mts_state(
@@ -3299,6 +3126,7 @@ class TMFSpread(StrategyBase):
             lifecycle=self._current_lifecycle_state(),
             **_risk_meta
         )
+        self._last_applied_event_time = now
         return None
 
     # 2026-06-25 Gemini CLI: Support passing exit_ts for backtests to avoid E-Core cooldown block

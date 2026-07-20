@@ -16,6 +16,26 @@ from pathlib import Path
 from types import SimpleNamespace
 from rich.console import Console
 
+# ── Contract date normalization helper ──────────────────────────────
+# Shioaji may return delivery_date as str, datetime.date, or datetime.datetime.
+# This helper safely normalizes to a date object.
+def _normalize_contract_date(value, fmt_list=None):
+    if fmt_list is None:
+        fmt_list = ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]
+    if isinstance(value, str):
+        for fmt in fmt_list:
+            try:
+                return datetime.datetime.strptime(value, fmt).date()
+            except ValueError:
+                continue
+        return None
+    elif isinstance(value, datetime.datetime):
+        return value.date()
+    elif isinstance(value, datetime.date):
+        return value
+    return None
+# ────────────────────────────────────────────────────────────────────
+
 # 依序匯入策略所需組件
 from options_engine.engine.indicators import calculate_futures_squeeze, calculate_mtf_alignment
 from core.date_utils import get_session_date_str
@@ -447,20 +467,28 @@ class ShioajiOptionsSmartMonitor:
         # 3. [GSD Settlement Fix] 過濾掉已過期合約，考慮結算時間 (13:30)
         now = datetime.datetime.now()
         valid_contracts = []
-        
+
         for contract in all_contracts:
             try:
                 # 解析合約到期日 - 支援多種格式
                 contract_date = None
                 delivery_date = contract.delivery_date
-                
-                # 嘗試不同格式
-                for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
-                    try:
-                        contract_date = datetime.datetime.strptime(delivery_date, fmt).date()
-                        break
-                    except ValueError:
-                        continue
+
+                # 接受 str, datetime.date, datetime.datetime
+                if isinstance(delivery_date, str):
+                    for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
+                        try:
+                            contract_date = datetime.datetime.strptime(delivery_date, fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                elif isinstance(delivery_date, datetime.datetime):
+                    contract_date = delivery_date.date()
+                elif isinstance(delivery_date, datetime.date):
+                    contract_date = delivery_date
+                else:
+                    console.print(f"[yellow]⚠️ Cannot parse contract date: {delivery_date} (type={type(delivery_date).__name__})[/yellow]")
+                    continue
                 
                 if contract_date is None:
                     console.print(f"[yellow]⚠️ Cannot parse contract date: {delivery_date}[/yellow]")
@@ -489,11 +517,16 @@ class ShioajiOptionsSmartMonitor:
         def get_contract_date(contract):
             """輔助函數：解析合約日期並返回可排序的日期對象"""
             delivery_date = contract.delivery_date
-            for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
-                try:
-                    return datetime.datetime.strptime(delivery_date, fmt).date()
-                except ValueError:
-                    continue
+            if isinstance(delivery_date, str):
+                for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
+                    try:
+                        return datetime.datetime.strptime(delivery_date, fmt).date()
+                    except ValueError:
+                        continue
+            elif isinstance(delivery_date, datetime.datetime):
+                return delivery_date.date()
+            elif isinstance(delivery_date, datetime.date):
+                return delivery_date
             return datetime.date.max  # 如果無法解析，返回最大日期
         
         valid_contracts = sorted(valid_contracts, key=get_contract_date)
