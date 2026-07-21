@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
@@ -121,6 +122,8 @@ class MarketDataCollector:
         self._far_contract: ContractInfo | None = None
         self._near_last: float | None = None
         self._far_last: float | None = None
+        self._near_updated_at: float | None = None
+        self._far_updated_at: float | None = None
         self._event_time: datetime | None = None
         self._generation: int = 0
         self._resolved: bool = False
@@ -159,6 +162,16 @@ class MarketDataCollector:
     def far_last(self) -> float | None:
         with self._lock:
             return self._far_last
+
+    @property
+    def near_updated_at(self) -> float | None:
+        with self._lock:
+            return self._near_updated_at
+
+    @property
+    def far_updated_at(self) -> float | None:
+        with self._lock:
+            return self._far_updated_at
 
     # ── Resolution ──
 
@@ -225,8 +238,10 @@ class MarketDataCollector:
             self._event_time = datetime.now()
             if leg == "near":
                 self._near_last = price
+                self._near_updated_at = time.time()
             else:
                 self._far_last = price
+                self._far_updated_at = time.time()
 
     @staticmethod
     def _extract_price(tick: Any) -> float | None:

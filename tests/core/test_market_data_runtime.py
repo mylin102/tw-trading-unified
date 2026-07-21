@@ -8,7 +8,8 @@ from core.background_snapshot_writer import BackgroundSnapshotWriter, CsvSnapsho
 from core.global_callback_adapter import GlobalCallbackAdapter
 from core.market_data_contracts import ContractIdentity, ContractRoute
 from core.market_data_registry import MarketDataRegistry
-from core.market_data_runtime import MarketDataRuntime, MarketDataRuntimeHealth, build_mtx_runtime
+from core.market_data_health import MarketDataRuntimeHealth, RuntimeHealthStatus
+from core.market_data_runtime import MarketDataRuntime, build_mtx_runtime
 from strategies.futures.market_data_collector import MarketDataCollector
 
 
@@ -87,8 +88,9 @@ class TestBuildMtxRuntime:
 
         h = runtime.health()
         assert isinstance(h, MarketDataRuntimeHealth)
-        assert h.collector_resolved is False
-        assert h.adapter_installed is False
+        assert h.status == RuntimeHealthStatus.STOPPED
+        assert h.runtime_started is False
+        assert h.collector_generation == 0
 
 
 # ── Runtime Lifecycle ──
@@ -154,10 +156,14 @@ class TestRuntimeLifecycle:
             resolver=_mtx_resolver,
         )
 
-        assert runtime.health().adapter_installed is False
+        assert runtime.health().runtime_started is False
+        assert runtime.health().status == RuntimeHealthStatus.STOPPED
 
         runtime.start()
-        assert runtime.health().adapter_installed is True
+        h = runtime.health()
+        assert h.runtime_started is True
+        assert h.status in (RuntimeHealthStatus.DEGRADED, RuntimeHealthStatus.HEALTHY)
+        assert h.near_contract_code is not None
 
         runtime.stop()
-        assert runtime.health().adapter_installed is False
+        assert runtime.health().runtime_started is False

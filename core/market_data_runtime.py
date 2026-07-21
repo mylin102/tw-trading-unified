@@ -28,20 +28,16 @@ from core.background_snapshot_writer import (
 )
 from core.global_callback_adapter import GlobalCallbackAdapter
 from core.market_data_contracts import ContractIdentity, ContractRoute
+from core.market_data_health import (
+    MarketDataHealthEvaluator,
+    MarketDataRuntimeHealth,
+    RuntimeHealthStatus,
+)
 from core.market_data_registry import MarketDataRegistry
 from strategies.futures.market_data_collector import MarketDataCollector
 
 
-# ── Runtime Health ──
-
-@dataclass(frozen=True)
-class MarketDataRuntimeHealth:
-    """Aggregate health of a market data runtime."""
-    ticker: str
-    collector_resolved: bool
-    collector_generation: int
-    writer_health: SnapshotWriterHealth
-    adapter_installed: bool
+# ── Runtime Health (delegates to MarketDataHealthEvaluator) ──
 
 
 # ── Runtime ──
@@ -67,6 +63,16 @@ class MarketDataRuntime:
     fallback_tick: Callable[..., None]
     fallback_bidask: Callable[..., None] | None = None
     _started: bool = field(default=False, repr=False)
+    _health_evaluator: MarketDataHealthEvaluator | None = field(
+        default=None, repr=False, compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        """Initialise health evaluator after dataclass init."""
+        # Can't use object.__setattr__ on frozen dataclass, so we bypass
+        object.__setattr__(self, "_health_evaluator", MarketDataHealthEvaluator(
+            ticker=self.ticker,
+        ))
 
     # ── Lifecycle ──
 
@@ -172,12 +178,36 @@ class MarketDataRuntime:
     # ── Health ──
 
     def health(self) -> MarketDataRuntimeHealth:
-        return MarketDataRuntimeHealth(
-            ticker=self.ticker,
-            collector_resolved=self.collector.is_resolved,
+        """Return structured health snapshot via the health evaluator."""
+        evaluator = self._health_evaluator
+        if evaluator is None:
+            # Fallback if __post_init__ didn't run (deserialisation edge case)
+            evaluator = MarketDataHealthEvaluator(ticker=self.ticker)
+
+        writer_health = self.writer.health()
+
+        return evaluator.evaluate(
+            runtime_started=self._started,
+            registry_binding_count=self.registry.binding_count,
+            near_contract_code=(
+                self.collector.near_contract.code
+                if self.collector.near_contract else None
+            ),
+            far_contract_code=(
+                self.collector.far_contract.code
+                if self.collector.far_contract else None
+            ),
             collector_generation=self.collector.generation,
-            writer_health=self.writer.health(),
-            adapter_installed=self._started,
+            near_last_updated_at=self.collector.near_updated_at,
+            far_last_updated_at=self.collector.far_updated_at,
+            writer_running=writer_health.running,
+            writer_last_success_at=(
+                writer_health.last_success_at.timestamp()
+                if writer_health.last_success_at is not None else None
+            ),
+            writer_consecutive_failures=writer_health.consecutive_failures,
+            callback_error_count=0,  # GlobalCallbackAdapter error counter — added in future PR
+            market_expected_open=True,  # Session provider — added in future PR
         )
 
     @property
