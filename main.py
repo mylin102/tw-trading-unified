@@ -36,6 +36,9 @@ from strategies.futures.monitor import _thread_local
 
 console = Console()
 
+# ── Lifecycle provenance (module-level for signal handler access) ──
+_lifecycle_recorder: Any = None
+
 # [P0 Fix] Connection state tracking via Shioaji event callback
 _connection_dropped = False
 
@@ -721,6 +724,13 @@ def run_system(dry_run=False, config_name="futures"):
         RESTART_FLAG.unlink()
         console.print("[dim]Old restart flag cleared.[/dim]")
 
+    # ── Lifecycle provenance recorder ──
+    from core.lifecycle_provenance import LifecycleRecorder
+    global _lifecycle_recorder
+    _lifecycle_recorder = LifecycleRecorder()
+    _rec = _lifecycle_recorder
+    _rec.record_event("PROCESS_START", pm2_process_id=os.getpid())
+
     api = None
     # Login retry with exponential backoff — prevents crash loop when Shioaji server
     # temporarily blocks rapid reconnects. Retries up to 5x internally so PM2 never
@@ -753,7 +763,22 @@ def run_system(dry_run=False, config_name="futures"):
         if not dry_run:
             api = get_api()
             console.print("[green]✅ Single Shioaji session established[/green]")
-            
+
+            # ── Shioaji quote event callback (provenance only) ──
+            try:
+                import shioaji as sj  # noqa: used for quote_event typing
+                def _on_quote_event(resp_code: int, event_code: int, info: str, event: str) -> None:
+                    _rec.record_event(
+                        "QUOTE_EVENT",
+                        quote_event_code=event_code,
+                        quote_event_name=event,
+                        quote_info=info[:200] if info else None,
+                    )
+                api.quote_event = _on_quote_event
+                _rec.record_event("QUOTE_CALLBACK_REGISTERED")
+            except Exception as _qc_err:
+                console.print(f"[dim]Quote event callback registration skipped: {_qc_err}[/dim]")
+
             # [rshioaji 1.5.10+] Ensure contracts are loaded in cache before monitors start
             from core.broker.shioaji_compat import fetch_all_contracts
             console.print("[cyan]📡 Synchronizing all broker contracts (this may take 1-5 minutes)...[/cyan]")
@@ -892,6 +917,22 @@ def run_system(dry_run=False, config_name="futures"):
                 # Start MTX runtime (resolves contracts, binds routes, starts writer)
                 if _mtx_runtime.start():
                     console.print("[green]✅ MTX market data runtime started[/green]")
+
+                    # ── Start health evidence sampler ──
+                    try:
+                        from core.health_evidence_exporter import HealthEvidenceSampler
+                        _run_id = _dt.now().strftime("%Y%m%d-%H%M%S")
+                        _mtx_sampler = HealthEvidenceSampler(
+                            health_fn=_mtx_runtime.health,
+                            product_code="MXF",
+                            run_id=_run_id,
+                            interval_sec=30.0,
+                        )
+                        _mtx_sampler.start()
+                        console.print(f"[dim]📊 Health sampler started (run={_run_id})[/dim]")
+                    except Exception as exc:
+                        console.print(f"[yellow]⚠️ Health sampler start failed: {exc}[/yellow]")
+                        _mtx_sampler = None
                 else:
                     console.print("[yellow]⚠️ MTX runtime start failed — contracts may not resolve[/yellow]")
             else:
@@ -1209,10 +1250,20 @@ def run_system(dry_run=False, config_name="futures"):
         time.sleep(15)
 
     finally:
-        # Signal shutdown to all dispatchers
+        console.print("[red]⚠️ Exited main loop[/red]")
         _shutdown_event.set()
-        
-        # Closing sequence
+
+        # Lifecycle: record shutdown
+        _rec = _lifecycle_recorder
+        if _rec is not None:
+            try:
+                _rec.set_shutdown_cause("MAIN_LOOP_RETURNED", "MAIN_LOOP")
+                _rec.record_event("MAIN_LOOP_RETURNED")
+                _rec.record_event("SHUTDOWN_BEGIN")
+            except Exception:
+                pass
+
+        # ── Wait for session to become idle before logout ──
         console.print("[dim]Stopping monitors and threads...[/dim]")
         try:
             if 'futures_mons' in locals():
@@ -1235,6 +1286,14 @@ def run_system(dry_run=False, config_name="futures"):
                     console.print("[dim]MTX market data runtime stopped[/dim]")
                 except Exception as exc:
                     console.print(f"[yellow]⚠️ MTX runtime stop error: {exc}[/yellow]")
+
+            # Stop health sampler
+            if '_mtx_sampler' in dir() and _mtx_sampler is not None:
+                try:
+                    _mtx_sampler.stop(timeout=3.0, final_sample=True)
+                    console.print("[dim]Health sampler stopped[/dim]")
+                except Exception as exc:
+                    console.print(f"[yellow]⚠️ Health sampler stop error: {exc}[/yellow]")
 
             # Join threads with timeout
             if 'futures_threads' in locals():
@@ -1278,14 +1337,24 @@ def main():
     # macOS signal handlers for graceful shutdown
     def signal_handler(signum, frame):
         console.print(f"[yellow]📴 Received signal {signum}. Shutting down gracefully...[/yellow]")
+        # Record lifecycle event
+        _rec = _lifecycle_recorder
+        if _rec is not None:
+            _sig_name = {signal.SIGTERM: "SIGTERM", signal.SIGINT: "SIGINT", signal.SIGHUP: "SIGHUP"}.get(signum, f"SIGNAL_{signum}")
+            try:
+                _rec.set_shutdown_cause(f"SIGNAL_{_sig_name}", "SIGNAL_HANDLER")
+                _rec.record_event("SIGNAL_RECEIVED", signal_name=_sig_name, signal_number=signum)
+            except Exception:
+                pass
         _shutdown_event.set()
         # Give the main loop time to detect the shutdown
         time.sleep(1)
         sys.exit(0)
-    
+
     # Register signal handlers
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGHUP, signal_handler)
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Skip broker login entirely")
@@ -1297,11 +1366,26 @@ def main():
         run_system(dry_run=args.dry_run, config_name=args.config)
     except KeyboardInterrupt:
         console.print("[yellow]Interrupted by user[/yellow]")
+        _rec = _lifecycle_recorder
+        if _rec is not None:
+            try:
+                _rec.set_shutdown_cause("SIGNAL_SIGINT", "SIGNAL_HANDLER")
+                _rec.record_event("SIGNAL_RECEIVED", signal_name="SIGINT", signal_number=2)
+            except Exception:
+                pass
         _shutdown_event.set()
         time.sleep(1)
         sys.exit(0)
     except Exception as e:
         console.print(f"[bold red]Unhandled exception in main: {e}[/bold red]")
+        _rec = _lifecycle_recorder
+        if _rec is not None:
+            try:
+                _rec.set_shutdown_cause("UNHANDLED_EXCEPTION", "EXCEPTION_HOOK")
+                _rec.record_event("SHUTDOWN_BEGIN", shutdown_reason="UNHANDLED_EXCEPTION", shutdown_initiator="EXCEPTION_HOOK",
+                                  exception_message=str(e)[:200])
+            except Exception:
+                pass
         _shutdown_event.set()
         time.sleep(1)
         sys.exit(1)
