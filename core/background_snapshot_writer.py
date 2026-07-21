@@ -266,7 +266,7 @@ class CsvSnapshotPersister:
 class JsonStatePersister:
     """Write a snapshot to a JSON state file via atomic replace.
 
-    Output path: ``/tmp/mts_position_state_{ticker.lower()}.json``
+    Output path: ``{output_dir}/mts_position_state_{ticker.lower()}.json``
     """
 
     def __init__(self, output_dir: str = "/tmp", *, logger: logging.Logger | None = None) -> None:
@@ -274,5 +274,26 @@ class JsonStatePersister:
         self._logger = logger or logging.getLogger(self.__class__.__name__)
 
     def persist(self, snapshot: Any) -> None:
-        """Not yet implemented — placeholder for JSON serialisation logic."""
-        raise NotImplementedError("JsonStatePersister.persist — to be implemented in PR 4")
+        import json
+        data = {
+            "ticker": getattr(snapshot, "ticker", "UNKNOWN"),
+            "captured_at": datetime.now().isoformat(),
+            "near_last": getattr(snapshot, "near_last", None),
+            "far_last": getattr(snapshot, "far_last", None),
+            "near_code": getattr(snapshot, "near_contract_code", None) or (
+                getattr(getattr(snapshot, "near_contract", None), "code", None)
+            ),
+            "far_code": getattr(snapshot, "far_contract_code", None) or (
+                getattr(getattr(snapshot, "far_contract", None), "code", None)
+            ),
+            "generation": getattr(snapshot, "generation", 0),
+            "has_data": getattr(snapshot, "has_data", False),
+        }
+        ticker = data["ticker"].lower()
+        tmp = os.path.join(self._output_dir, f"mts_position_state_{ticker}.json.tmp")
+        final = os.path.join(self._output_dir, f"mts_position_state_{ticker}.json")
+        tmp_content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        with open(tmp, "w") as f:
+            f.write(tmp_content)
+        os.replace(tmp, final)
+        self._logger.debug("Persisted %s → %s (%d bytes)", ticker, final, len(tmp_content))

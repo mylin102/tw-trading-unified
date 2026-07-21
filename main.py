@@ -32,6 +32,7 @@ print(
 from rich.console import Console
 from core.date_utils import is_taifex_futures_market_open
 from core.shioaji_session import get_api, logout
+from strategies.futures.monitor import _thread_local
 
 console = Console()
 
@@ -84,8 +85,13 @@ class FeedHealth:
             }
 
 
-def tick_dispatcher(futures_mon, options_mon, feed_health=None, tx_bar_builder=None):
+def tick_dispatcher(futures_mons, options_mon, feed_health=None, tx_bar_builder=None):
     """Dispatch futures and options ticks, update feed_health, and build TX bars when provided."""
+    if futures_mons is None:
+        futures_mons = []
+    elif not isinstance(futures_mons, (list, tuple)):
+        futures_mons = [futures_mons]
+
     _seen_codes = set()
     _lock = threading.Lock()
 
@@ -156,10 +162,14 @@ def tick_dispatcher(futures_mon, options_mon, feed_health=None, tx_bar_builder=N
                 console.print(f"[red][tx tick err] {e}[/red]")
 
         # Dispatch to monitors
-        try:
-            futures_mon.on_tick(exchange, tick)
-        except Exception as e:
-            console.print(f"[red][futures tick err] {e}[/red]")
+        for f_mon in futures_mons:
+            _thread_local.state_path = getattr(f_mon, "_state_path", None)
+            try:
+                f_mon.on_tick(exchange, tick)
+            except Exception as e:
+                console.print(f"[red][futures tick err] {e}[/red]")
+            finally:
+                _thread_local.state_path = None
 
         try:
             options_mon.on_tick(exchange, tick)
@@ -169,15 +179,24 @@ def tick_dispatcher(futures_mon, options_mon, feed_health=None, tx_bar_builder=N
     return on_tick
 
 
-def order_dispatcher(futures_mon, options_mon):
+def order_dispatcher(futures_mons, options_mon):
     """Dispatch order events to both futures and options monitors."""
+    if futures_mons is None:
+        futures_mons = []
+    elif not isinstance(futures_mons, (list, tuple)):
+        futures_mons = [futures_mons]
+
     def on_order_event(order_state, data):
-        # Dispatch to futures monitor
-        try:
-            if hasattr(futures_mon, "on_order_event"):
-                futures_mon.on_order_event(order_state, data)
-        except Exception as e:
-            console.print(f"[red][futures order err] {e}[/red]")
+        # Dispatch to futures monitors
+        for f_mon in futures_mons:
+            _thread_local.state_path = getattr(f_mon, "_state_path", None)
+            try:
+                if hasattr(f_mon, "on_order_event"):
+                    f_mon.on_order_event(order_state, data)
+            except Exception as e:
+                console.print(f"[red][futures order err] {e}[/red]")
+            finally:
+                _thread_local.state_path = None
 
         # Dispatch to options monitor
         try:
@@ -189,15 +208,19 @@ def order_dispatcher(futures_mon, options_mon):
     return on_order_event
 
 
-def bidask_dispatcher(futures_mon, options_mon, skew_engine=None):
+def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
     """Route BidAsk updates to monitors for IV calculation and data freshness.
 
     Args:
-        futures_mon: FuturesMonitor instance.
+        futures_mons: list of FuturesMonitor instances.
         options_mon: OptionsMonitor instance.
         skew_engine: Optional OptionSurfaceEngine — receives OptionQuoteEvent
                      on every option bidask callback for skew calculation.
     """
+    if futures_mons is None:
+        futures_mons = []
+    elif not isinstance(futures_mons, (list, tuple)):
+        futures_mons = [futures_mons]
     _seen = set()
     _lock = threading.Lock()
     _last_mtx_update_log_at = {"ts": 0.0}
@@ -246,12 +269,15 @@ def bidask_dispatcher(futures_mon, options_mon, skew_engine=None):
                     
                     # 💡 GSD: Update freshness timestamp to prevent watchdog from restarting
                     mon.last_tick_at = time.time()
-                    if hasattr(futures_mon, 'last_tick_at'):
-                        futures_mon.last_tick_at = time.time()
+                    for f_mon in futures_mons:
+                        if hasattr(f_mon, 'last_tick_at'):
+                            f_mon.last_tick_at = time.time()
                     
                     # 💡 GSD: Also update FuturesMonitor's internal market price cache if it exists
-                    if key == "MTX" and hasattr(futures_mon, 'market_data'):
-                        futures_mon.market_data["MTX"]["close"] = mid
+                    if key == "MTX":
+                        for f_mon in futures_mons:
+                            if hasattr(f_mon, 'market_data') and "MTX" in f_mon.market_data:
+                                f_mon.market_data["MTX"]["close"] = mid
                     
                     matched = True
 
@@ -364,6 +390,8 @@ def _subscribe_otm_skew_contracts(api, om, fm, sk_engine, console=None):
     computation* is determined at compute-time from live futures_price and is
     independent of this function.
     """
+    if api is None:
+        return {}
     otm_contracts = {}
     if console is None:
         console = print
@@ -595,6 +623,8 @@ def _setup_event_callback(api, fm, om):
       16 = SUBSCRIPTION_OK (subscription confirmed)
       20 = REPUBLISH_UNACKED (unknown publisher flow — needs resubscribe)
     """
+    if api is None:
+        return
     global _connection_dropped
 
     @api.quote.on_event
@@ -684,7 +714,7 @@ def feeds_are_fresh(feed_health, require_tx=True, require_futures=True):
     return (len(problems) == 0), problems, snap
 
 
-def run_system(dry_run=False):
+def run_system(dry_run=False, config_name="futures"):
     """運行交易系統，遇到斷線或重啟請求時結束進程，由外部腳本重新拉起"""
     # 啟動時立即清除重啟旗標，避免循環重啟
     if RESTART_FLAG.exists():
@@ -740,28 +770,87 @@ def run_system(dry_run=False):
         from strategies.futures.monitor import FuturesMonitor
 
         # [GSD] Session-aware config: night uses futures_night.yaml (wider stops, longer VWAP confirm)
+        # 2026-07-21 Gemini CLI: support comma-separated list of config names (e.g. "futures,futures_mtx")
         from core.date_utils import is_night_session
         from datetime import datetime as _dt
         _is_night = is_night_session(_dt.now())
-        _config_file = "futures_night.yaml" if _is_night else "futures.yaml"
-        console.print(f"[dim]📋 Futures config: {_config_file} (session={'night' if _is_night else 'day'})[/dim]")
+        
+        config_names = [c.strip() for c in config_name.split(",") if c.strip()]
+        futures_mons = []
+        for cfg_item in config_names:
+            _base_cfg = cfg_item.replace(".yaml", "")
+            if _is_night:
+                _config_file = f"{_base_cfg}_night.yaml"
+                if not os.path.exists(os.path.join(BASE, "config", _config_file)):
+                    _config_file = f"{_base_cfg}.yaml"
+            else:
+                _config_file = f"{_base_cfg}.yaml"
+            console.print(f"[dim]📋 Futures config for {cfg_item}: {_config_file} (session={'night' if _is_night else 'day'})[/dim]")
 
-        fm = FuturesMonitor(
-            api=api,
-            config_path=os.path.join(BASE, "config", _config_file),
-            dry_run=dry_run,
-        )
-        fm.setup()
+            fm_inst = FuturesMonitor(
+                api=api,
+                config_path=os.path.join(BASE, "config", _config_file),
+                dry_run=dry_run,
+            )
+            fm_inst.setup()
+            futures_mons.append(fm_inst)
+
+        if not futures_mons:
+            raise RuntimeError("No valid futures configurations loaded")
 
         from strategies.options.monitor import OptionsMonitor
         om = OptionsMonitor(api=api, dry_run=dry_run)
-        fm.options_monitor = om.monitor
+        
+        # Share options monitor reference across all futures monitors
+        # fm.options_monitor = om.monitor
+        for f_mon in futures_mons:
+            f_mon.options_monitor = om.monitor
+
+        # ── MTX Market Data Runtime ──
+        # 被動收集 MTX tick 資料，不下單、不跑策略。
+        # TMF callback 保持原位，GlobalCallbackAdapter 在 callback registration 時安裝。
+        _mtx_runtime: Any = None
+        if not dry_run:
+            from core.market_data_runtime import build_mtx_runtime
+            from core.market_data_registry import MarketDataRegistry
+            from strategies.futures.market_data_collector import MarketDataCollector
+
+            # Build MTX contract resolver using Shioaji API
+            from strategies.futures.contract_resolver import MarketDataContractResolver
+            _mtx_resolver_obj = MarketDataContractResolver(
+                api=api,
+                trading_date_provider=lambda: _dt.now().date(),
+            )
+            # Wrap ResolvedContracts → tuple for collector compatibility
+            def _mtx_resolver_fn(ticker: str) -> tuple[Any | None, Any | None]:
+                result = _mtx_resolver_obj.resolve_near_far(ticker)
+                if result is None:
+                    return None, None
+                return result.near_raw, result.far_raw
+
+            try:
+                _mtx_registry = MarketDataRegistry()
+                _mtx_runtime = build_mtx_runtime(
+                    registry=_mtx_registry,
+                    fallback_tick=lambda *a: None,  # 暫時 no-op，callback registration 時取代
+                    resolver=_mtx_resolver_fn,
+                )
+                console.print("[dim]📊 MTX market data runtime initialized (passive)[/dim]")
+            except Exception as exc:
+                console.print(f"[yellow]⚠️ MTX runtime init failed: {exc} — continuing without MTX[/yellow]")
+                _mtx_runtime = None
+
+        # Create threading.Thread objects for all monitors
+        futures_threads = []
+        for f_mon in futures_mons:
+            ft = threading.Thread(target=f_mon.run, name=f"futures_{f_mon.ticker.lower()}", daemon=True)
+            futures_threads.append((f_mon, ft))
 
         # GSD Rationale: Stock module moved to scripts/stock_runner.py for fault isolation.
         # main.py now only handles Futures + Options which share the FOP callback session.
 
-        # 先初始化 contracts，再訂閱
-        om.monitor.find_best_contracts(fm)  # [GSD Settlement Fix] 傳遞期貨監控器以同步月份
+        # 先初始化 contracts，再訂閱 (使用第一個期貨監控器作為基準同步月份)
+        om.monitor.find_best_contracts(futures_mons[0])
         om.monitor.pre_fill_bars()
 
         # [Skew Integration] Initialize option surface engine
@@ -785,34 +874,69 @@ def run_system(dry_run=False):
 
             # Register tick/bidask callbacks with feed health and tx builder
             from core.broker.shioaji_compat import set_tick_callback, set_bidask_callback, safe_subscribe
-            set_tick_callback(api, tick_dispatcher(fm, om, feed_health, tx_bar_builder))
-            set_bidask_callback(api, bidask_dispatcher(fm, om, sk_engine))
+            _tmf_tick_fn = tick_dispatcher(futures_mons, om, feed_health, tx_bar_builder)
+            _tmf_bidask_fn = bidask_dispatcher(futures_mons, om, sk_engine)
+
+            # Install GlobalCallbackAdapter so MTX ticks are routed to passive collector
+            if _mtx_runtime is not None:
+                from core.global_callback_adapter import GlobalCallbackAdapter
+                _mtx_runtime.adapter = GlobalCallbackAdapter(
+                    registry=_mtx_runtime.registry,
+                    fallback_tick_handler=_tmf_tick_fn,
+                    fallback_bidask_handler=_tmf_bidask_fn,
+                )
+                set_tick_callback(api, _mtx_runtime.adapter.on_tick)
+                set_bidask_callback(api, _mtx_runtime.adapter.on_bidask)
+                console.print("[green]✅ GlobalCallbackAdapter installed (TMF + MTX routing)[/green]")
+
+                # Start MTX runtime (resolves contracts, binds routes, starts writer)
+                if _mtx_runtime.start():
+                    console.print("[green]✅ MTX market data runtime started[/green]")
+                else:
+                    console.print("[yellow]⚠️ MTX runtime start failed — contracts may not resolve[/yellow]")
+            else:
+                set_tick_callback(api, _tmf_tick_fn)
+                set_bidask_callback(api, _tmf_bidask_fn)
 
             # [P0 Fix] Centralized order dispatcher to avoid "Already borrowed" error
-            api.set_order_callback(order_dispatcher(fm, om))
+            api.set_order_callback(order_dispatcher(futures_mons, om))
             console.print("[green]✅ Order event callback registered[/green]")
 
             # [Skew Integration] Wire skew engine into FuturesMonitor for strategy context
-            fm._skew_engine = sk_engine
+            for f_mon in futures_mons:
+                f_mon._skew_engine = sk_engine
 
-            # Subscribe TMF tick
-            if fm.contract is not None:
-                try:
-                    safe_subscribe(api, fm.contract, quote_type='tick')
-                    console.print(f"[green]📡 Subscribed TMF tick: {fm.contract.code}[/green]")
-                except Exception as e:
-                    console.print(f"[yellow]⚠️ TMF subscribe failed: {e}[/yellow]")
-                # Pure TMF: orphaned far-month subscribe except block removed.
-                # 2026-06-18 Hermes Agent
+            # Subscribe ticks for all monitors
+            for f_mon in futures_mons:
+                if f_mon.contract is not None:
+                    try:
+                        safe_subscribe(api, f_mon.contract, quote_type='tick')
+                        console.print(f"[green]📡 Subscribed {f_mon.ticker} tick: {f_mon.contract.code}[/green]")
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️ {f_mon.ticker} subscribe failed: {e}[/yellow]")
 
-            # 2026-06-22 Gemini CLI: Subscribe far-month contract at startup for MTS calendar spread trading
-            if fm.far_contract is not None:
-                try:
-                    safe_subscribe(api, fm.far_contract, quote_type='tick')
-                    console.print(f"[green]📡 Subscribed far-month Futures tick: {fm.far_contract.code}[/green]")
-                except Exception as e:
-                    console.print(f"[yellow]⚠️ Far-month Futures subscribe failed: {e}[/yellow]")
+                if f_mon.far_contract is not None:
+                    try:
+                        safe_subscribe(api, f_mon.far_contract, quote_type='tick')
+                        console.print(f"[green]📡 Subscribed far-month {f_mon.ticker} tick: {f_mon.far_contract.code}[/green]")
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️ Far-month {f_mon.ticker} subscribe failed: {e}[/yellow]")
 
+            # ── Subscribe MTX ticks (passive collection) ──
+            if _mtx_runtime is not None and _mtx_runtime.collector.is_resolved:
+                # Use the raw Shioaji contract objects from the resolver
+                _mtx_result = _mtx_resolver_obj.resolve_near_far("MXF")
+                if _mtx_result is not None:
+                    try:
+                        safe_subscribe(api, _mtx_result.near_raw, quote_type='tick')
+                        console.print(f"[green]📡 Subscribed MTX tick: {_mtx_result.near_code}[/green]")
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️ MTX near subscribe failed: {e}[/yellow]")
+                    try:
+                        safe_subscribe(api, _mtx_result.far_raw, quote_type='tick')
+                        console.print(f"[green]📡 Subscribed MTX far tick: {_mtx_result.far_code}[/green]")
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️ MTX far subscribe failed: {e}[/yellow]")
 
             # Subscribe options (ATM + OTM for skew)
             for key in ["MTX", "C", "P"]:
@@ -827,33 +951,28 @@ def run_system(dry_run=False):
                         console.print(f"[green]📡 Subscribed {key}: {con.code} (tick only)[/green]")
 
         if sk_engine is not None:
+            # Wire OTM skew contracts using the first monitor
             otm_contracts = _subscribe_otm_skew_contracts(
-                api, om, fm, sk_engine,
+                api, om, futures_mons[0], sk_engine,
                 console=console,
             )
         else:
             otm_contracts = {}
 
         # [P0 Fix] Setup connection event monitoring
-        _setup_event_callback(api, fm, om)
+        _setup_event_callback(api, futures_mons, om)
         console.print("[green]✅ Connection event callback registered[/green]")
-
-        # Expose feed_health and tx_contract to monitors for policy gating
-        fm.feed_health = feed_health
-        fm.tx_contract = None
-        fm.tx_bar_builder = tx_bar_builder
-
-        ft = threading.Thread(target=fm.run, name="futures", daemon=True)
-        # 2026-07-02 Hermes Agent: Options strategy disabled — negative PnL (-73k)
         # Re-enable when futures MTS is stable and options logic is revised.
         _options_enabled = False
         if _options_enabled:
             ot = threading.Thread(target=om.run, name="options", daemon=True)
             ot.start()
         
-        ft.start()
-        console.print("[bold green]🚀 Unified Monitors Running (Futures)[/bold green]")
-        print(f"[RUNTIME_LOOP_STARTED] futures_thread={ft.ident}", flush=True)
+        for fm, ft in futures_threads:
+            ft.start()
+        console.print(f"[bold green]🚀 Unified Monitors Running ({', '.join(fm.ticker for fm in futures_mons)})[/bold green]")
+        for fm, ft in futures_threads:
+            print(f"[RUNTIME_LOOP_STARTED] futures_thread={ft.ident} ticker={fm.ticker}", flush=True)
 
         startup_grace_until = time.time() + 60
         health_check_at = time.time() + HEALTH_INTERVAL
@@ -866,31 +985,45 @@ def run_system(dry_run=False):
 
         while restart_count < max_restarts:
             # [Auto-Restart] Check if threads died unexpectedly
-            if not ft.is_alive():
-                dead = ["futures"]
+            dead_futures = [fm.ticker for fm, ft in futures_threads if not ft.is_alive()]
+            if dead_futures:
+                dead = [f"futures_{t.lower()}" for t in dead_futures]
                 if _options_enabled and 'ot' in locals() and not ot.is_alive():
                     dead.append("options")
-                console.print(f"[bold red]💀 Thread died: {', '.join(dead)}. Restarting (attempt {restart_count+1}/{max_restarts})...[/bold red]")
+                console.print(f"[bold red]💀 Thread died: {', '.join(dead)}. Restarting all (attempt {restart_count+1}/{max_restarts})...[/bold red]")
                 restart_count += 1
 
                 # Re-initialize monitors and threads
                 try:
                     from strategies.futures.monitor import FuturesMonitor
                     # [GSD] Session-aware config on restart too
+                    # 2026-07-21 Gemini CLI: support custom config names in restart loop
                     from core.date_utils import is_night_session
                     from datetime import datetime as _dt2
                     _is_night = is_night_session(_dt2.now())
-                    _config_file = "futures_night.yaml" if _is_night else "futures.yaml"
-                    fm = FuturesMonitor(
-                        api=api,
-                        config_path=os.path.join(BASE, "config", _config_file),
-                        dry_run=dry_run,
-                    )
-                    fm.setup()
+                    
+                    futures_mons = []
+                    for cfg_item in config_names:
+                        _base_cfg = cfg_item.replace(".yaml", "")
+                        if _is_night:
+                            _config_file = f"{_base_cfg}_night.yaml"
+                            if not os.path.exists(os.path.join(BASE, "config", _config_file)):
+                                _config_file = f"{_base_cfg}.yaml"
+                        else:
+                            _config_file = f"{_base_cfg}.yaml"
+                        
+                        fm_inst = FuturesMonitor(
+                            api=api,
+                            config_path=os.path.join(BASE, "config", _config_file),
+                            dry_run=dry_run,
+                        )
+                        fm_inst.setup()
+                        futures_mons.append(fm_inst)
 
                     from strategies.options.monitor import OptionsMonitor
                     om = OptionsMonitor(api=api, dry_run=dry_run)
-                    fm.options_monitor = om.monitor
+                    for f_mon in futures_mons:
+                        f_mon.options_monitor = om.monitor
 
                     # Re-subscribe
                     if api is not None:
@@ -912,42 +1045,45 @@ def run_system(dry_run=False):
                                 tx_bar_builder = None
 
                         from core.broker.shioaji_compat import set_tick_callback, set_bidask_callback
-                        set_tick_callback(api, tick_dispatcher(fm, om, feed_health, tx_bar_builder))
-                        set_bidask_callback(api, bidask_dispatcher(fm, om, sk_engine))
+                        set_tick_callback(api, tick_dispatcher(futures_mons, om, feed_health, tx_bar_builder))
+                        set_bidask_callback(api, bidask_dispatcher(futures_mons, om, sk_engine))
+                        
                         # [Skew Integration] Re-wire skew engine (might have been reset)
-                        fm._skew_engine = sk_engine
+                        for f_mon in futures_mons:
+                            f_mon._skew_engine = sk_engine
                         if sk_engine is not None:
                             sk_engine.reset()
 
-                        if fm.contract is not None:
-                            api.quote.subscribe(fm.contract, quote_type='tick')
+                        for f_mon in futures_mons:
+                            if f_mon.contract is not None:
+                                api.quote.subscribe(f_mon.contract, quote_type='tick')
 
-                        # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Removed TX re-subscription.
+                            if f_mon.far_contract is not None:
+                                try:
+                                    api.quote.subscribe(f_mon.far_contract, quote_type='tick')
+                                    console.print(f"[green]📡 Re-Subscribed far-month {f_mon.ticker} Futures tick: {f_mon.far_contract.code}[/green]")
+                                except Exception as e:
+                                    console.print(f"[yellow]⚠️ Re-subscribe far-month {f_mon.ticker} Futures failed: {e}[/yellow]")
 
-                        om.monitor.find_best_contracts()
+                        om.monitor.find_best_contracts(futures_mons[0])
                         om.monitor.pre_fill_bars()
                         for key in ["MTX", "C", "P"]:
                             con = om.monitor.active_contracts.get(key)
                             if con:
                                 api.quote.subscribe(con, quote_type='tick')
-                                # 2026-06-26 Gemini CLI: MTX only needs tick data for close reference; do not subscribe to BidAsk
                                 if key != "MTX":
                                     api.quote.subscribe(con, quote_type=sj.constant.QuoteType.BidAsk)
 
-                        # Re-subscribe far-month Futures tick for dual chart
-                        if fm.far_contract:
-                            try:
-                                api.quote.subscribe(fm.far_contract, quote_type='tick')
-                                console.print(f"[green]📡 Re-Subscribed far-month Futures tick: {fm.far_contract.code}[/green]")
-                            except Exception as e:
-                                console.print(f"[yellow]⚠️ Re-subscribe far-month Futures failed: {e}[/yellow]")
-
-
-                    ft = threading.Thread(target=fm.run, name="futures", daemon=True)
+                    futures_threads = []
+                    for f_mon in futures_mons:
+                        ft = threading.Thread(target=f_mon.run, name=f"futures_{f_mon.ticker.lower()}", daemon=True)
+                        futures_threads.append((f_mon, ft))
+                        ft.start()
+                    
                     if _options_enabled:
                         ot = threading.Thread(target=om.run, name="options", daemon=True)
                         ot.start()
-                    ft.start()
+                    
                     last_data_at = time.time()  # Reset staleness timer
                     stagnation_warned = False
                     console.print(f"[bold green]✅ Restarted threads (attempt {restart_count}/{max_restarts})[/bold green]")
@@ -962,13 +1098,14 @@ def run_system(dry_run=False):
             now = time.time()
             
             # [GSD Hardening] Heartbeat check — FuturesMonitor may be alive but frozen
-            _fm_hb = getattr(fm, 'last_heartbeat_ts', 0)
-            if _fm_hb > 0 and (now - _fm_hb) > 360:
-                console.print(f"[bold red]💀 FuturesMonitor heartbeat stale ({now - _fm_hb:.0f}s). Setting last_tick_at=0 to trigger stale restart...[/bold red]")
-                fm.last_tick_at = 0
+            for fm, ft in futures_threads:
+                _fm_hb = getattr(fm, 'last_heartbeat_ts', 0)
+                if _fm_hb > 0 and (now - _fm_hb) > 360:
+                    console.print(f"[bold red]💀 {fm.ticker} FuturesMonitor heartbeat stale ({now - _fm_hb:.0f}s). Setting last_tick_at=0 to trigger stale restart...[/bold red]")
+                    fm.last_tick_at = 0
 
             # 檢查任何 FOP tick 是否有進來 (TMF 成交量低，單獨追蹤會誤判)
-            fm_last = getattr(fm, 'last_tick_at', 0)
+            fm_last = max(getattr(fm, 'last_tick_at', 0) for fm, ft in futures_threads)
             om_last = getattr(om.monitor, 'last_tick_at', 0)
             latest_tick = max(fm_last, om_last)
             
@@ -994,7 +1131,7 @@ def run_system(dry_run=False):
                 # resorting to process exit + PM2 restart.  If the network
                 # (VPN) is down, a full restart is pointless — better to
                 # wait in-process and retry re-login with backoff.
-                if _try_shioaji_reconnect(api, fm, om if 'om' in dir() else None, dry_run):
+                if _try_shioaji_reconnect(api, futures_mons, om if 'om' in dir() else None, dry_run):
                     console.print("[green]✅ In-process reconnect successful — resetting staleness timer[/green]")
                     last_data_at = time.time()
                     stagnation_warned = False
@@ -1022,13 +1159,12 @@ def run_system(dry_run=False):
                     break
 
                 # 2) Feed freshness health
-                # require_tx controlled by futures monitoring config (monitoring.require_tx)
                 try:
-                    require_tx = bool(getattr(fm, 'MONITOR', {}).get('require_tx', True))
+                    require_tx = any(bool(getattr(fm, 'MONITOR', {}).get('require_tx', True)) for fm, ft in futures_threads)
                 except Exception:
                     require_tx = False
                 try:
-                    require_futures = True if fm.contract is not None else False
+                    require_futures = any(fm.contract is not None for fm, ft in futures_threads)
                 except Exception:
                     require_futures = False
 
@@ -1079,7 +1215,10 @@ def run_system(dry_run=False):
         # Closing sequence
         console.print("[dim]Stopping monitors and threads...[/dim]")
         try:
-            if 'fm' in locals():
+            if 'futures_mons' in locals():
+                for f_mon in futures_mons:
+                    f_mon.stop()
+            elif 'fm' in locals():
                 fm.stop()
             if 'om' in locals():
                 om.stop()
@@ -1089,8 +1228,19 @@ def run_system(dry_run=False):
             # Give threads time to finish current operations
             time.sleep(1)
 
+            # Stop MTX runtime before clearing callbacks
+            if '_mtx_runtime' in dir() and _mtx_runtime is not None:
+                try:
+                    _mtx_runtime.stop(timeout=3.0)
+                    console.print("[dim]MTX market data runtime stopped[/dim]")
+                except Exception as exc:
+                    console.print(f"[yellow]⚠️ MTX runtime stop error: {exc}[/yellow]")
+
             # Join threads with timeout
-            if 'ft' in locals():
+            if 'futures_threads' in locals():
+                for fm, ft in futures_threads:
+                    ft.join(timeout=5)
+            elif 'ft' in locals():
                 ft.join(timeout=5)
             if 'ot' in locals():
                 ot.join(timeout=5)
@@ -1139,10 +1289,12 @@ def main():
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Skip broker login entirely")
+    # 2026-07-21 Gemini CLI: support custom config names (e.g. futures_mtx)
+    parser.add_argument("--config", type=str, default="futures", help="Base config name (e.g. futures_mtx)")
     args = parser.parse_args()
     
     try:
-        run_system(dry_run=args.dry_run)
+        run_system(dry_run=args.dry_run, config_name=args.config)
     except KeyboardInterrupt:
         console.print("[yellow]Interrupted by user[/yellow]")
         _shutdown_event.set()
@@ -1154,10 +1306,17 @@ def main():
         time.sleep(1)
         sys.exit(1)
 
-def ensure_single_instance():
-    """🛡️ [Pillar 3] Execution Consistency: PID Lock."""
+def ensure_single_instance(config_name="futures"):
+    """🛡️ [Pillar 3] Execution Consistency: PID Lock.
+    # lock_file = "/tmp/tw_trading_unified.pid"
+    # Another main.py instance is running
+    # ensure_single_instance()
+    """
     import os, psutil
-    lock_file = "/tmp/tw_trading_unified.pid"
+    # 2026-07-21 Gemini CLI: Use distinct PID lock file per config list to allow concurrent running of different configs
+    config_names = [c.strip() for c in config_name.split(",") if c.strip()]
+    _base_name = "_".join(sorted(config_names)).replace(".yaml", "")
+    lock_file = f"/tmp/tw_trading_unified_{_base_name}.pid"
     if os.path.exists(lock_file):
         try:
             with open(lock_file, "r") as f:
@@ -1166,7 +1325,7 @@ def ensure_single_instance():
                 # Check if it's actually a python trading process
                 proc = psutil.Process(pid)
                 if "python" in proc.name().lower():
-                    print(f"🚨 [FATAL] Another main.py instance is running (PID: {pid}). Exiting.")
+                    print(f"🚨 [FATAL] Another main.py instance for {config_name} is running (PID: {pid}). Exiting.")
                     os._exit(1)
         except Exception: pass
     
@@ -1174,5 +1333,11 @@ def ensure_single_instance():
         f.write(str(os.getpid()))
 
 if __name__ == "__main__":
-    ensure_single_instance()
+    # 2026-07-21 Gemini CLI: Parse arguments early to extract config name for ensure_single_instance
+    import argparse
+    _early_parser = argparse.ArgumentParser(add_help=False)
+    _early_parser.add_argument("--config", type=str, default="futures")
+    _early_args, _ = _early_parser.parse_known_args()
+    
+    ensure_single_instance(_early_args.config)
     main()
