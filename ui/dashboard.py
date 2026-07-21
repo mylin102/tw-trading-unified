@@ -2231,7 +2231,7 @@ def load_calendar_spread_data():
         
         # 2026-07-07 Hermes Agent: cache-busting key
         _today = get_session_date_str()
-        _lf = FUTURES_MKT / f"TMF_{_today}_PAPER_indicators.csv"
+        _lf = FUTURES_MKT / f"{_TICKER}_{_today}_PAPER_indicators.csv"
         _sig = (_lf.name, _lf.stat().st_mtime_ns, _lf.stat().st_size) if _lf.exists() else None
 
         # 載入近月資料
@@ -2635,7 +2635,7 @@ if page == "總覽":
 
     # 2026-07-07 Hermes Agent: cache-busting key
     _today = get_session_date_str()
-    _lf = FUTURES_MKT / f"TMF_{_today}_PAPER_indicators.csv"
+    _lf = FUTURES_MKT / f"{_TICKER}_{_today}_PAPER_indicators.csv"
     _sig = (_lf.name, _lf.stat().st_mtime_ns, _lf.stat().st_size) if _lf.exists() else None
 
     f_df = load_futures_indicators(
@@ -2886,7 +2886,7 @@ elif page == f"期貨 {_TICKER}":
 
     # 2026-07-07 Hermes Agent: cache-busting key
     _today = get_session_date_str()
-    _lf = FUTURES_MKT / f"TMF_{_today}_PAPER_indicators.csv"
+    _lf = FUTURES_MKT / f"{_TICKER}_{_today}_PAPER_indicators.csv"
     # 2026-07-09 Hermes Agent: use 30s time bucket + st_size to prevent per-tick cache misses;
     # mtime_ns was changed every time MTS backend wrote the file, causing cache miss on every autorefresh
     _sig = (_lf.stat().st_size, _lf.stat().st_mtime // 30, _lf.name) if _lf.exists() else None
@@ -3769,7 +3769,7 @@ elif page == f"期貨 {_TICKER}":
                 # Get LIVE price from the same data source as charts
                 # 2026-07-07 Hermes Agent: cache-busting key
                 _today = get_session_date_str()
-                _lf = FUTURES_MKT / f"TMF_{_today}_PAPER_indicators.csv"
+                _lf = FUTURES_MKT / f"{_TICKER}_{_today}_PAPER_indicators.csv"
                 # 2026-07-09 Hermes Agent: 30s time bucket cache key
                 _sig = (_lf.stat().st_size, _lf.stat().st_mtime // 30, _lf.name) if _lf.exists() else None
 
