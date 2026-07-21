@@ -6,6 +6,7 @@ from datetime import datetime
 import pytest
 
 from core.market_data_health import (
+    HealthReason,
     MarketDataHealthEvaluator,
     MarketDataRuntimeHealth,
     RuntimeHealthStatus,
@@ -127,7 +128,8 @@ class TestEvaluatorUnhealthy:
     def test_writer_not_running_is_unhealthy(self, evaluator: MarketDataHealthEvaluator) -> None:
         h = evaluator.evaluate(**_healthy_args(writer_running=False))
         assert h.status == RuntimeHealthStatus.UNHEALTHY
-        assert "writer_thread_not_running" in h.degraded_reasons
+        assert h.status == RuntimeHealthStatus.UNHEALTHY
+        assert HealthReason.WRITER_NOT_RUNNING.value in h.degraded_reasons
 
 
 class TestEvaluatorDegraded:
@@ -136,14 +138,14 @@ class TestEvaluatorDegraded:
             near_last_updated_at=time.time() - 10,  # 10s stale
         ))
         assert h.status == RuntimeHealthStatus.DEGRADED
-        assert "near_tick_stale" in h.degraded_reasons
+        assert HealthReason.NEAR_TICK_STALE.value in h.degraded_reasons
 
     def test_far_tick_stale(self, evaluator: MarketDataHealthEvaluator) -> None:
         h = evaluator.evaluate(**_healthy_args(
             far_last_updated_at=time.time() - 10,
         ))
         assert h.status == RuntimeHealthStatus.DEGRADED
-        assert "far_tick_stale" in h.degraded_reasons
+        assert HealthReason.FAR_TICK_STALE.value in h.degraded_reasons
 
     def test_both_legs_stale(self, evaluator: MarketDataHealthEvaluator) -> None:
         h = evaluator.evaluate(**_healthy_args(
@@ -151,46 +153,45 @@ class TestEvaluatorDegraded:
             far_last_updated_at=time.time() - 15,
         ))
         assert h.status == RuntimeHealthStatus.DEGRADED
-        assert "near_tick_stale" in h.degraded_reasons
-        assert "far_tick_stale" in h.degraded_reasons
+        assert HealthReason.NEAR_TICK_STALE.value in h.degraded_reasons
+        assert HealthReason.FAR_TICK_STALE.value in h.degraded_reasons
 
     def test_market_closed_does_not_degrade_on_stale(self, evaluator: MarketDataHealthEvaluator) -> None:
-        """When market is closed, stale ticks are expected."""
         h = evaluator.evaluate(**_healthy_args(
-            near_last_updated_at=time.time() - 300,  # 5 min stale
+            near_last_updated_at=time.time() - 300,
             far_last_updated_at=time.time() - 300,
             market_expected_open=False,
         ))
         assert h.status == RuntimeHealthStatus.HEALTHY
-        assert "near_tick_stale" not in h.degraded_reasons
+        assert HealthReason.NEAR_TICK_STALE.value not in h.degraded_reasons
 
     def test_writer_consecutive_failures(self, evaluator: MarketDataHealthEvaluator) -> None:
         h = evaluator.evaluate(**_healthy_args(writer_consecutive_failures=3))
         assert h.status == RuntimeHealthStatus.DEGRADED
-        assert "writer_consecutive_failures" in h.degraded_reasons
+        assert HealthReason.WRITER_FAILURES.value in h.degraded_reasons
 
     def test_writer_never_succeeded(self, evaluator: MarketDataHealthEvaluator) -> None:
         h = evaluator.evaluate(**_healthy_args(writer_last_success_at=None))
         assert h.status == RuntimeHealthStatus.DEGRADED
-        assert "writer_never_succeeded" in h.degraded_reasons
+        assert HealthReason.WRITER_NEVER_SUCCEEDED.value in h.degraded_reasons
 
     def test_no_ticks_received(self, evaluator: MarketDataHealthEvaluator) -> None:
         h = evaluator.evaluate(**_healthy_args(collector_generation=0, near_last_updated_at=None))
         assert h.status == RuntimeHealthStatus.DEGRADED
-        assert "no_ticks_received" in h.degraded_reasons
+        assert HealthReason.NO_TICKS_RECEIVED.value in h.degraded_reasons
 
     def test_near_never_received(self, evaluator: MarketDataHealthEvaluator) -> None:
         h = evaluator.evaluate(**_healthy_args(
-            collector_generation=5,  # some activity
+            collector_generation=5,
             near_last_updated_at=None,
         ))
         assert h.status == RuntimeHealthStatus.DEGRADED
-        assert "near_never_received" in h.degraded_reasons
+        assert HealthReason.NEAR_TICK_MISSING.value in h.degraded_reasons
 
     def test_callback_errors_detected(self, evaluator: MarketDataHealthEvaluator) -> None:
         h = evaluator.evaluate(**_healthy_args(callback_error_count=1))
         assert h.status == RuntimeHealthStatus.DEGRADED
-        assert "callback_errors_detected" in h.degraded_reasons
+        assert HealthReason.CALLBACK_ERRORS.value in h.degraded_reasons
 
     def test_degraded_reasons_sorted(self, evaluator: MarketDataHealthEvaluator) -> None:
         """Multiple degradation factors produce a stable sort order."""
@@ -270,7 +271,7 @@ class TestEvaluatorConfig:
             near_last_updated_at=now - 1.5,  # 1500ms > 1000ms
         ))
         assert h.status == RuntimeHealthStatus.DEGRADED
-        assert "near_tick_stale" in h.degraded_reasons
+        assert HealthReason.NEAR_TICK_STALE.value in h.degraded_reasons
 
     def test_low_threshold_not_stale(self) -> None:
         long_window = MarketDataHealthEvaluator(

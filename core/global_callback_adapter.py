@@ -73,6 +73,12 @@ class GlobalCallbackAdapter:
         self._fallback_tick = fallback_tick_handler
         self._fallback_bidask = fallback_bidask_handler or fallback_tick_handler
         self._logger = logger or logging.getLogger(self.__class__.__name__)
+        self._callback_error_count: int = 0
+
+    @property
+    def callback_error_count(self) -> int:
+        """Cumulative count of caught routed-handler exceptions."""
+        return self._callback_error_count
 
     def on_tick(self, exchange: object, tick: Any) -> None:
         """Dispatch a single tick.
@@ -91,6 +97,7 @@ class GlobalCallbackAdapter:
             try:
                 route.handler.on_tick(route.leg, tick)
             except Exception:
+                self._callback_error_count += 1
                 self._logger.exception(
                     "Routed handler failed for %s/%s (leg=%s); "
                     "fallback skipped to prevent double delivery",
@@ -110,6 +117,7 @@ class GlobalCallbackAdapter:
             try:
                 route.handler.on_tick(route.leg, bidask)
             except Exception:
+                self._callback_error_count += 1
                 self._logger.exception(
                     "Routed bidask handler failed for %s/%s (leg=%s); "
                     "fallback skipped",

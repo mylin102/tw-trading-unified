@@ -206,7 +206,7 @@ class MarketDataRuntime:
                 if writer_health.last_success_at is not None else None
             ),
             writer_consecutive_failures=writer_health.consecutive_failures,
-            callback_error_count=0,  # GlobalCallbackAdapter error counter — added in future PR
+            callback_error_count=self.adapter.callback_error_count,  # GlobalCallbackAdapter error counter
             market_expected_open=True,  # Session provider — added in future PR
         )
 

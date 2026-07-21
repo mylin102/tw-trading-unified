@@ -22,6 +22,27 @@ from enum import Enum
 from typing import Any
 
 
+# ── Health Reason Codes ──
+
+class HealthReason(str, Enum):
+    """Deterministic reason codes for degraded/unhealthy status.
+
+    Each code has a fixed string value so that downstream consumers
+    (dashboard, watchdog, soak analyzer) never depend on free-text parsing.
+    """
+    REGISTRY_BINDING_INCOMPLETE = "REGISTRY_BINDING_INCOMPLETE"
+    CONTRACT_BINDING_INCOMPLETE = "CONTRACT_BINDING_INCOMPLETE"
+    NEAR_TICK_MISSING = "NEAR_TICK_MISSING"
+    FAR_TICK_MISSING = "FAR_TICK_MISSING"
+    NEAR_TICK_STALE = "NEAR_TICK_STALE"
+    FAR_TICK_STALE = "FAR_TICK_STALE"
+    WRITER_NOT_RUNNING = "WRITER_NOT_RUNNING"
+    WRITER_FAILURES = "WRITER_FAILURES"
+    CALLBACK_ERRORS = "CALLBACK_ERRORS"
+    NO_TICKS_RECEIVED = "NO_TICKS_RECEIVED"
+    WRITER_NEVER_SUCCEEDED = "WRITER_NEVER_SUCCEEDED"
+
+
 # ── Status ──
 
 class RuntimeHealthStatus(str, Enum):
@@ -179,7 +200,7 @@ class MarketDataHealthEvaluator:
             status = RuntimeHealthStatus.STOPPED
         elif not writer_running:
             status = RuntimeHealthStatus.UNHEALTHY
-            degraded.append("writer_thread_not_running")
+            degraded.append(HealthReason.WRITER_NOT_RUNNING.value)
         else:
             # Evaluate degradation factors
             self._assess_tick_staleness(
@@ -236,9 +257,9 @@ class MarketDataHealthEvaluator:
         if not market_open:
             return
         if near_ts is not None and (now - near_ts) * 1000 > self._tick_stale_after_ms:
-            degraded.append("near_tick_stale")
+            degraded.append(HealthReason.NEAR_TICK_STALE.value)
         if far_ts is not None and (now - far_ts) * 1000 > self._tick_stale_after_ms:
-            degraded.append("far_tick_stale")
+            degraded.append(HealthReason.FAR_TICK_STALE.value)
 
     def _assess_writer_health(
         self,
@@ -247,9 +268,9 @@ class MarketDataHealthEvaluator:
         last_success_at: float | None,
     ) -> None:
         if consecutive_failures >= 3:
-            degraded.append("writer_consecutive_failures")
+            degraded.append(HealthReason.WRITER_FAILURES.value)
         if last_success_at is None:
-            degraded.append("writer_never_succeeded")
+            degraded.append(HealthReason.WRITER_NEVER_SUCCEEDED.value)
 
     def _assess_collector_state(
         self,
@@ -258,13 +279,13 @@ class MarketDataHealthEvaluator:
         near_ts: float | None,
     ) -> None:
         if generation == 0:
-            degraded.append("no_ticks_received")
+            degraded.append(HealthReason.NO_TICKS_RECEIVED.value)
         elif near_ts is None:
-            degraded.append("near_never_received")
+            degraded.append(HealthReason.NEAR_TICK_MISSING.value)
 
     def _assess_callback_errors(self, degraded: list[str], error_count: int) -> None:
         if error_count > 0:
-            degraded.append("callback_errors_detected")
+            degraded.append(HealthReason.CALLBACK_ERRORS.value)
 
     @staticmethod
     def _tick_age_ms(tick_time: float | None, now: float) -> int | None:
