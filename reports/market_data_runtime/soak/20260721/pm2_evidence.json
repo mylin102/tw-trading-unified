@@ -1,0 +1,17 @@
+{
+  "name": "trading-system",
+  "status": "online",
+  "restarts": 23,
+  "unstable_restarts": 0,
+  "exec_interpreter": "none",
+  "watch": null,
+  "autorestart": true,
+  "cron_restart": null,
+  "max_memory_restart": null,
+  "max_restarts": 5,
+  "min_uptime": 30000,
+  "restart_delay": 5000,
+  "kill_timeout": 15000,
+  "memory": 348405760,
+  "cpu": 4.9
+}
