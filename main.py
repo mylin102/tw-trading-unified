@@ -531,12 +531,15 @@ def api_is_healthy(api):
     """Quick check if Shioaji session is still usable, with a small retry."""
     if api is None:
         return False
-    for _ in range(2): # 兩次機會
+    for attempt in range(2):
         try:
             api.list_positions(api.futopt_account)
             return True
-        except Exception:
-            time.sleep(1)
+        except Exception as exc:
+            if attempt == 0:
+                time.sleep(1)
+            else:
+                console.print(f"[dim]api_is_healthy: list_positions failed (2 attempts): {type(exc).__name__}: {exc}[/dim]")
     return False
 
 
