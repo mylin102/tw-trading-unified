@@ -243,6 +243,8 @@ All R-items establish datasets and answer empirical questions. No filter design 
 | R-005 | Delay Sensitivity Study | Does delaying entry (15-60s) improve outcomes? | NOT STARTED | — | — |
 | R-006 | Expansion Velocity Study | Do losing entries exhibit higher dz/dt? | NOT STARTED | — | — |
 | R-007 | Regime Overlay | Is episode frequency/severity regime-dependent? | NOT STARTED | — | — |
+| R-008 | Volatility Regime Shift | **Hypothesis elimination.** Did ATR increase structurally? **Result: Not supported** — ATR was lower in recent period (avg 84.6 vs 98.6), yet spread expansion increased 6-8x. This excludes "overall market volatility" as the cause. | **COMPLETE (negative result)** | — | — |
+| R-009 | Spread Dynamics | Investigate whether spread mean-reversion behavior changed: deviation magnitude, duration, reversion speed, structural drift, roll effects. Not yet designed. | NOT STARTED | — | — |
 
 ### Decision Gate
 
