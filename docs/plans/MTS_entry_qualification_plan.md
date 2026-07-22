@@ -233,32 +233,37 @@ Target outcomes:
 
 ## Milestone Tracking
 
-### Phase 1: Research
+### Research Phase (Evidence-First, No Decisions)
 
-| ID | Item | Status | Target Date | Owner |
-|----|------|--------|-------------|-------|
-| R-004 | Entry Episode Analysis | NOT STARTED | — | — |
-| R-005 | Delay Sensitivity Study | NOT STARTED | — | — |
-| R-006 | Expansion Velocity Study | NOT STARTED | — | — |
+All R-items establish datasets and answer empirical questions. No filter design until Decision Review.
 
-### Phase 2: Shadow Filters
+| ID | Item | Goal | Status | Target Date | Owner |
+|----|------|------|--------|-------------|-------|
+| R-004 | Entry Episode Analysis | Build Episode Dataset — how many independent opportunities produced 16 trades? | **IN PROGRESS** | — | — |
+| R-005 | Delay Sensitivity Study | Does delaying entry (15-60s) improve outcomes? | NOT STARTED | — | — |
+| R-006 | Expansion Velocity Study | Do losing entries exhibit higher dz/dt? | NOT STARTED | — | — |
+| R-007 | Regime Overlay | Is episode frequency/severity regime-dependent? | NOT STARTED | — | — |
 
-| ID | Item | Status | Target Date | Owner |
-|----|------|--------|-------------|-------|
-| A | Expansion Velocity | NOT STARTED | — | — |
-| B | Momentum Exhaustion | NOT STARTED | — | — |
-| C | Episode Lockout | NOT STARTED | — | — |
+### Decision Gate
 
-### Phase 3: Counterfactual Evaluation
+```
+Research → Evidence Review → Select ONE production change
+```
 
-| ID | Item | Status | Target Date | Owner |
-|----|------|--------|-------------|-------|
-| — | Baseline vs A vs B vs C vs A+B vs A+B+C | NOT STARTED | — | — |
+After all R-items are complete, a review selects the single most impactful filter. No deployment before Decision Gate.
 
-### Phase 4: Production Rollout
+### Shadow Filters (Post-Review)
 
-| ID | Item | Status | Target Date | Owner |
-|----|------|--------|-------------|-------|
-| 1 | Episode Lockout | NOT STARTED | — | — |
-| 2 | Expansion Velocity | NOT STARTED | — | — |
-| 3 | Momentum Exhaustion | NOT STARTED | — | — |
+| ID | Item | Prerequisite | Status |
+|----|------|-------------|--------|
+| C | Episode Lockout (episode-aware, not timer-based) | R-004 confirms multi-entry episodes exist | NOT STARTED |
+| A | Expansion Velocity Filter | R-006 confirms velocity discriminates | NOT STARTED |
+| B | Momentum Exhaustion Filter | R-005/R-006 support | NOT STARTED |
+
+### Counterfactual Evaluation (Phase 3)
+
+Replay historical dataset comparing selected filter vs baseline.
+
+### Production Rollout (Phase 4)
+
+Feature-flagged, shadow logging retained, rollback supported.
