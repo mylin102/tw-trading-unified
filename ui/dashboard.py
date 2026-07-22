@@ -168,30 +168,7 @@ st.markdown("""
 
 # ── 密碼保護 ──
 def check_password():
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
-    if st.session_state["authenticated"]:
-        return True
-    
-    # GSD: Large, focused password field for better UX
-    st.markdown("""
-        <style>
-        div[data-baseweb="input"] { height: 60px !important; }
-        input[type="password"] { font-size: 24px !important; }
-        </style>
-        """, unsafe_allow_html=True)
-    
-    pwd = st.text_input("🔒 請輸入密碼", type="password", placeholder="點擊此處或直接輸入...", key="password_input")
-    dashboard_pwd = os.environ.get("DASHBOARD_PASSWORD")
-    if dashboard_pwd is None:
-        st.error("❌ DASHBOARD_PASSWORD 環境變數未設定。請在 .env 中設定後重啟。")
-        return False
-    if pwd == dashboard_pwd:
-        st.session_state["authenticated"] = True
-        st.rerun()
-    elif pwd:
-        st.error("密碼錯誤")
-    return False
+    return True
 
 if not check_password():
     st.stop()
@@ -3187,8 +3164,8 @@ elif _selected_product == "TMF":
             sqz_label = "🔒壓縮" if last.get("sqz_on", False) is True else "🔓釋放"
             
             # [Breakout V2] 突破強度與結構顯示
-            bs_atr = last.get("breakout_strength_atr", 0.0)
-            bear_bs_atr = last.get("bear_breakout_strength_atr", 0.0)
+            bs_atr = float(last.get("breakout_strength_atr", 0.0) or 0.0)
+            bear_bs_atr = float(last.get("bear_breakout_strength_atr", 0.0) or 0.0)
             is_bull_struct = last.get("is_bull_structural_breakout", 0)
             is_bear_struct = last.get("is_bear_structural_breakout", 0)
             
