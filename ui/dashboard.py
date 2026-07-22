@@ -253,22 +253,32 @@ try:
 except Exception:
     _TICKER = "TMF"
 
+# Product display labels — separate from internal product codes
+PRODUCT_LABELS = {
+    "TMF": "微台（TMF）",
+    "MXF": "小台（MXF）",
+}
+PRODUCT_CODES = list(PRODUCT_LABELS.keys())
+
 # ── Sidebar Info ──
 with st.sidebar:
     st.title("Trading Unified")
 
-    # 2026-06-30 Gemini CLI: Page selectbox at top for instant visibility
-    st.selectbox(
+    # 2026-07-22: Product-based futures page selector
+    _product_page = st.selectbox(
         "📄 頁面",
-        ["總覽", f"期貨 {_TICKER}", "選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "🔄 反事實研究室", "🔐 Real Preflight", "設定"],
+        ["總覽"] + list(PRODUCT_LABELS.values()) + ["選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "🔄 反事實研究室", "🔐 Real Preflight", "設定"],
         index=1,
         key="page_selector",
     )
 
+    # Determine selected product from page label
+    _reverse_labels = {v: k for k, v in PRODUCT_LABELS.items()}
+    _selected_product = _reverse_labels.get(_product_page, None)
+    
     ver_tag = " (Rust)" if is_rust_version() else " (Legacy)"
-    st.caption(f"🚀 Shioaji API: {sj.__version__}{ver_tag}")  # [Wave B] Version Transparency
+    st.caption(f"🚀 Shioaji API: {sj.__version__}{ver_tag}")
     st.markdown(f"🗓️ **交易日 (Trading Day)**")
-    # GSD: Always use the latest date string from session helper
     st.code(f"{DATE_STR[:4]}-{DATE_STR[4:6]}-{DATE_STR[6:]}")
     
     # 💡 GSD: Continuous Chart Mode toggle
@@ -2875,9 +2885,10 @@ if page == "總覽":
         st.info("尚未設定監控名單")
 
 # ════════════════════════════════════════
-# Tab 2: 期貨
+# Tab 2: 期貨 — product-based routing
 # ════════════════════════════════════════
-elif page == f"期貨 {_TICKER}":
+elif _selected_product == "TMF":
+    _TICKER = "TMF"
     # 2026-07-09 Hermes Agent: [PERF TRACE] Start timing
     _pt_start = time.time()
     # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Dynamic Ticker
@@ -4244,6 +4255,19 @@ elif page == f"期貨 {_TICKER}":
                 st.error("❌ 圖表渲染失敗，請檢查期貨指標資料")
         print(f"[PERF] charts_done: {time.time()-_pt_data:.3f}s")
         print(f"[PERF] futures page total: {time.time()-_pt_start:.3f}s")
+
+# ════════════════════════════════════════
+# Tab 2b: 小台（MXF）— passive runtime view
+# ════════════════════════════════════════
+elif _selected_product == "MXF":
+    _TICKER = "MXF"
+    st.header("小台（MXF）被動市場資料")
+    st.markdown("""
+    MXF 指標資料尚未啟用。
+
+    目前顯示被動行情 runtime、合約狀態與 health evidence。
+    """)
+    st.info("📊 被動資料收集器已啟動，指標 pipeline 將在後續 PR 加入。")
 
 # ════════════════════════════════════════
 # Tab 3: 選擇權
