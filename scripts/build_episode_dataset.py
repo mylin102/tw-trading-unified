@@ -118,6 +118,31 @@ def detect_episodes(merged: list[dict]) -> list[dict]:
     return episodes
 
 
+def load_config() -> dict:
+    """Load strategy config parameters for episode context."""
+    import yaml
+    params = {}
+    for cfg_name in ["futures.yaml", "futures_night.yaml"]:
+        cfg_path = Path("config") / cfg_name
+        if not cfg_path.exists():
+            continue
+        try:
+            with open(cfg_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            spread = cfg.get("mts", {}).get("params", {})
+            trailing = cfg.get("trailing_stop", {})
+            params[cfg_name] = {
+                "entry_z": spread.get("entry_z", "N/A"),
+                "release_stop_points": spread.get("release_stop_points", "N/A"),
+                "trail_distance_points": spread.get("trail_distance_points", "N/A"),
+                "atr_multiplier_stop": spread.get("atr_multiplier_stop", "N/A"),
+                "atr_multiplier_trail": spread.get("atr_multiplier_trail", "N/A"),
+            }
+        except Exception:
+            params[cfg_name] = {}
+    return params
+
+
 def load_orders(date_str: str) -> list[dict]:
     """Load TMF orders for a given date."""
     order_path = os.path.join(TRADES_DIR, f"TMF_{date_str}_orders.json")
@@ -169,14 +194,40 @@ def match_entries_to_episodes(orders: list[dict], merged: list[dict], episodes: 
     return episodes
 
 
-def build_episode_records(date_str: str, episodes: list[dict]) -> list[dict]:
-    """Build structured episode records for the dataset."""
+def build_episode_records(date_str: str, episodes: list[dict], config: dict, orders: list[dict]) -> list[dict]:
+    """Build structured episode records with config thresholds."""
     records = []
+    # Determine which config was active (night vs day)
+    active_config = config.get("futures_night.yaml", config.get("futures.yaml", {}))
+    day_config = config.get("futures.yaml", {})
+    night_config = config.get("futures_night.yaml", {})
+    
+    # Build release/exit price lookup by entry order_id
+    release_prices = {}
+    exit_prices = {}
+    for o in orders:
+        strat = o.get("strategy", "")
+        if strat == "MTS_RELEASE":
+            pid = (o.get("parent_order_id") or o.get("order_id", ""))[:15]
+            release_prices[pid] = o.get("avg_fill_price")
+        elif strat == "MTS_EXIT":
+            pid = (o.get("parent_order_id") or o.get("order_id", ""))[:15]
+            exit_prices[pid] = o.get("avg_fill_price")
+
     for i, ep in enumerate(episodes):
         if ep["entry_count"] == 0:
             continue
         dur_min = ep["bar_count"] * 5
-        spread_delta = ep["end_spread"] if "end_spread" in ep else ep["max_spread"] - ep["start_spread"]
+        
+        # Determine if episode was during night session
+        is_night = "18:" in ep.get("start_ts", "") or "19:" in ep.get("start_ts", "") or \
+                   "20:" in ep.get("start_ts", "") or "21:" in ep.get("start_ts", "") or \
+                   "22:" in ep.get("start_ts", "") or "23:" in ep.get("start_ts", "") or \
+                   "00:" in ep.get("start_ts", "") or "01:" in ep.get("start_ts", "") or \
+                   "02:" in ep.get("start_ts", "") or "03:" in ep.get("start_ts", "") or \
+                   "04:" in ep.get("start_ts", "")
+        cfg = night_config if is_night else day_config
+        
         records.append({
             "dataset_generation": "v1",
             "trading_date": date_str,
@@ -191,9 +242,14 @@ def build_episode_records(date_str: str, episodes: list[dict]) -> list[dict]:
             "start_spread": ep["start_spread"],
             "max_spread": ep["max_spread"],
             "min_spread": ep["min_spread"],
-            "spread_delta": round(spread_delta, 0),
             "entry_count": ep["entry_count"],
             "entry_ids": ep["entry_ids"],
+            # Config thresholds at time of episode
+            "config_entry_z": cfg.get("entry_z", "N/A"),
+            "config_release_stop_points": cfg.get("release_stop_points", "N/A"),
+            "config_trail_distance_points": cfg.get("trail_distance_points", "N/A"),
+            "config_atr_multiplier_stop": cfg.get("atr_multiplier_stop", "N/A"),
+            "config_atr_multiplier_trail": cfg.get("atr_multiplier_trail", "N/A"),
         })
     return records
 
@@ -226,8 +282,9 @@ def main():
     episodes = detect_episodes(merged)
     orders = load_orders(date_compact)
     episodes = match_entries_to_episodes(orders, merged, episodes)
+    config = load_config()
 
-    records = build_episode_records(date_str, episodes)
+    records = build_episode_records(date_str, episodes, config, orders)
 
     if not records:
         print("  No episodes with entries found")
