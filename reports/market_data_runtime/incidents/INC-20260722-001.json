@@ -1,0 +1,25 @@
+{
+  "incident_id": "INC-20260722-001",
+  "status": "ROOT_CAUSE_CONFIRMED",
+  "process_start": "2026-07-22T08:50:01",
+  "process_pid": 20885,
+  "first_failure": "2026-07-22T10:08:28",
+  "exception_type": "ShioajiConnectionError",
+  "exception_message": "Session error SolClient send request api/v1/portfolio/position_unit, code: NotReady",
+  "retry_result": "FAILED",
+  "restart_time": "2026-07-22T11:01:30",
+  "session_age_seconds": 3139,
+  "last_tick_age_ms": null,
+  "lifecycle_events_file": "logs/lifecycle/lifecycle_events.jsonl",
+
+  "root_cause": {
+    "direct": "Shioaji account/portfolio messaging session entered SolClient NotReady state",
+    "trigger": "Probable transient network interruption or transport-session loss. Wi-Fi instability is the leading hypothesis.",
+    "excluded": ["token expiry", "API server failure", "unhandled exception", "PM2 config"]
+  },
+
+  "fix_priority": [
+    "Mini to wired Ethernet (trigger mitigation)",
+    "Partial Connectivity Fail-Safe PR (systematic recovery)"
+  ]
+}
