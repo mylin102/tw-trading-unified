@@ -534,12 +534,27 @@ def api_is_healthy(api):
     for attempt in range(2):
         try:
             api.list_positions(api.futopt_account)
+            # Success → mark account healthy
+            try:
+                from core.channel_safety import get_safety_state
+                get_safety_state().set_account_healthy()
+            except Exception:
+                pass
             return True
         except Exception as exc:
             if attempt == 0:
                 time.sleep(1)
             else:
-                console.print(f"[dim]api_is_healthy: list_positions failed (2 attempts): {type(exc).__name__}: {exc}[/dim]")
+                msg = f"{type(exc).__name__}: {exc}"
+                console.print(f"[dim]api_is_healthy: list_positions failed (2 attempts): {msg}[/dim]")
+                # Mark account degraded if it's a connection error
+                exc_name = type(exc).__name__
+                if "ConnectionError" in exc_name or "ShioajiConnectionError" in exc_name or "NotReady" in str(exc):
+                    try:
+                        from core.channel_safety import get_safety_state, AccountDegradedReason
+                        get_safety_state().set_account_degraded(AccountDegradedReason.SHIOAJI_CONNECTION_ERROR, msg)
+                    except Exception:
+                        pass
     return False
 
 
@@ -734,6 +749,13 @@ def run_system(dry_run=False, config_name="futures"):
     _rec = _lifecycle_recorder
     _rec.record_event("PROCESS_START", pm2_process_id=os.getpid())
 
+    # ── Reset safety state for new process lifecycle ──
+    try:
+        from core.channel_safety import reset_safety_state, get_safety_state
+        reset_safety_state()
+    except Exception:
+        pass
+
     api = None
     # Login retry with exponential backoff — prevents crash loop when Shioaji server
     # temporarily blocks rapid reconnects. Retries up to 5x internally so PM2 never
@@ -766,6 +788,13 @@ def run_system(dry_run=False, config_name="futures"):
         if not dry_run:
             api = get_api()
             console.print("[green]✅ Single Shioaji session established[/green]")
+
+            # Mark safety state as reconciled (post-restart, fresh login)
+            try:
+                from core.channel_safety import get_safety_state
+                get_safety_state().set_reconciled()
+            except Exception:
+                pass
 
             # ── Shioaji quote event callback (provenance only) ──
             try:

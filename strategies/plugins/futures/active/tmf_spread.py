@@ -341,10 +341,12 @@ _MTS_STATE_REVISION = 0  # incremented on every lifecycle state write
 # ═══════════════════════════════════════════════════════════════
 
 # 2026-07-20 Gemini CLI: re-export pure decision model from decoupled adapter module
+# 2026-07-21 Gemini CLI: re-export _check_release_candidates for test backward compatibility
 from strategies.plugins.futures.active.mts_lifecycle_adapter import (
     LifecycleContext,
     LifecycleDecision,
     evaluate_lifecycle_actions,
+    _check_release_candidates,
 )
 
 
@@ -644,6 +646,8 @@ def _write_mts_state(
             "atr": round(atr, 2) if atr else existing.get("atr"),
             "_updated": datetime.now().isoformat(),
         }
+        # 2026-07-22 Gemini CLI: Extract expected_revision parameter from kwargs
+        _expected_revision_val = kwargs.pop("expected_revision", None)
         # 2026-06-26 Gemini CLI: merge extra risk metrics / kwargs
         state.update(kwargs)
         # 2026-06-23 Gemini CLI: Use unique temporary filename to avoid race conditions with other writers
@@ -652,7 +656,8 @@ def _write_mts_state(
         # 每次 lifecycle 寫入遞增 state_revision，寫入前比對磁碟版本。
         # 若不符 → 拒絕寫入 (CONCURRENT_STATE_UPDATE)。
         # ─────────────────────────────────────────────────────────────────────
-        _expected_revision = existing.get("state_revision", 0)
+        # 2026-07-22 Gemini CLI: Respect expected_revision parameter if passed, otherwise fall back to disk value
+        _expected_revision = _expected_revision_val if _expected_revision_val is not None else existing.get("state_revision", 0)
         _new_revision = _expected_revision + 1
         state["state_revision"] = _new_revision
         state["position_epoch"] = existing.get("position_epoch")
@@ -1121,7 +1126,9 @@ class TMFSpread(StrategyBase):
         self._release_ts = event_time or datetime.now()
         self._single_leg_started_at = self._release_ts
         self._release_mono = time.monotonic()
-        self._release_price = fill_price if fill_price > 0 else remaining_leg_price
+        # 2026-07-22 Gemini CLI: Avoid release price defaulting to 0.0 or remaining_leg_price if invalid
+        _entry_fallback = self._near_entry if released_leg == Leg.NEAR else self._far_entry
+        self._release_price = fill_price if fill_price > 0 else (remaining_leg_price if remaining_leg_price > 0 else _entry_fallback)
         self._lifecycle = f"TRAILING_{self._side}"
 
         # ── Lifecycle transition (confirmed fill only) ──
@@ -1742,8 +1749,29 @@ class TMFSpread(StrategyBase):
                             else:
                                 _pollute_pass = False
                             if _pollute_pass:
+                                # [BUG FIX] Validate entry prices before restore.
+                                # heartbeat 可能寫入不完整的狀態檔，
+                                # 造成 near_entry / far_entry 遺失或為 0。
+                                # 若不檢查，PnL 計算會用 0 當 entry → 假損益。
+                                _near_entry_raw = state.get("near_entry")
+                                _far_entry_raw = state.get("far_entry")
+                                if _near_entry_raw is None or _far_entry_raw is None:
+                                    logger.warning(
+                                        "[MTS_RESTORE_REJECTED] reason=ENTRY_PRICE_MISSING "
+                                        "near=%s far=%s", _near_entry_raw, _far_entry_raw
+                                    )
+                                    _pollute_pass = False
+                                elif float(_near_entry_raw) <= 0 or float(_far_entry_raw) <= 0:
+                                    logger.warning(
+                                        "[MTS_RESTORE_REJECTED] reason=ENTRY_PRICE_ZERO "
+                                        "near=%s far=%s", _near_entry_raw, _far_entry_raw
+                                    )
+                                    _pollute_pass = False
+                            if _pollute_pass:
                                 self._has_position = True
                                 self._lifecycle = state.get("state", "OPEN")
+                                # 2026-07-22 Gemini CLI: Restore state_revision from disk during recovery
+                                self._state_revision = int(state.get("state_revision", 0))
                                 # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
                                 self._entry_spread_z = float(state.get("entry_spread_z") or 0.0)
                                 self._near_entry = float(state.get("near_entry") or 0.0)
@@ -2105,6 +2133,16 @@ class TMFSpread(StrategyBase):
         if context.position.size != 0:
             self._set_eval(skip_reason="POSITION_OPEN")
             return None
+
+        # ── [PCF-1] Account channel degraded — block entry ──
+        try:
+            from core.channel_safety import get_safety_state
+            _safety = get_safety_state()
+            if not _safety.entry_allowed(self._ticker):
+                self._set_eval(skip_reason=f"SAFETY_GATE:{_safety.entry_blocked_reason}")
+                return None
+        except Exception:
+            pass
 
         # ── [Fix] Prevent duplicate submissions ──
         if self._lifecycle == "SUBMITTING":
