@@ -217,3 +217,22 @@ No data loss — SCP snapshot retains all CSVs, logs, state files.
 - Failure Mode Reproduction (separate work package)
 - Consumption provenance instrumentation (separate work package)
 - Historical worktree cleanup (deferred)
+
+---
+
+## Commit Baseline (2026-07-23)
+
+```
+19647db0  docs: finalize INC-001 and Mini Git migration plan
+c54be650  feat(deployment): add multi-host identity preflight
+8277e3ab  fix(data): harden ticker-scoped spread discovery and refresh
+1cf1950b  fix(runtime): restore MTS risk engine and lifecycle adapter deps
+ac7a8a66  test: add contract resolution tests with empty-category guard
+```
+
+**Source note:** `risk_engine.py` and `mts_lifecycle_adapter.py` in `1cf1950b`
+were sourced from the Air4 pre-existing working tree (previously uncommitted).
+Their behavioral equivalence to the Jul 22 Mini runtime is not claimed —
+they restore import-ability of the TMFSpread strategy for the new Git checkout.
+
+**Mini checkout:** `git checkout --detach ac7a8a66`
