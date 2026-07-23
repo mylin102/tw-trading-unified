@@ -64,6 +64,18 @@ Default to surfacing uncertainty, not hiding it.
 EVERY code modification MUST include a comment with the timestamp (ISO 8601 or YYYY-MM-DD) and the author ("Hermes Agent"). Applies to all patch/write_file operations. The timestamp in each comment MUST be the actual date the modification is made — do not copy the rule's creation date or any example date.
 Example (correct, written on 2026-05-22): `# 2026-05-22 Hermes Agent: fix feed health pollution from TMF_VIRTUAL`
 
+### Rule 14 — Multi-Host Change, Synchronization, and Deployment Provenance (2026-07-23)
+BEFORE modifying any repo files, deploying code, updating cron, or restarting PM2, you MUST inspect and enforce `docs/rules/multi_host_synchronization.md`. Establish Target Provenance and Synchronization Evidence between Air4 and Mini. Never assume host identity without mandatory preflight checks.
+
+### Rule 15 — Deployment Identity Rule (2026-07-23)
+BEFORE modifying, running, restarting, or deploying the trading system, you MUST read `<repo-root>/.deployment-target` as the sole authority for host role. Inspect and enforce `docs/rules/deployment_identity_rule.md`. Never copy or commit `.deployment-target` to Git. Fail closed on missing, malformed, or mismatched identity.
+
+### Rule 16 — Mini (Production) vs Air4 (Research SEP) Architecture & Separation (2026-07-23)
+SEP (Strategy Evaluation Platform) is an offline research platform residing exclusively on `Air4`. Mini is dedicated solely to live/paper trading and dataset generation. Enforce strict physical isolation, one-way dataset sync (Mini -> Air4 inbox), SHA-256 manifest verification, and `research/sep` git branching governance per `docs/rules/mini_air4_sep_architecture.md`.
+
+### Rule 17 — SEP Governance & Operational Hardening (2026-07-23)
+Enforce runtime capability gates (`assert_research_allowed()`, `assert_broker_access_allowed()`), atomic READY dataset bundles, 6-state inbox state machine (`DISCOVERED` -> `AVAILABLE_FOR_RESEARCH` / `QUARANTINED`), Air4 pull-only cron without `--delete`, and multi-factor production promotion gate per `docs/rules/sep_governance_hardening.md`.
+
 ---
 
 ## CRITICAL: Read Before Any Code Change

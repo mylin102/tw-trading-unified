@@ -83,3 +83,6 @@ monitor_snippet_tmp.py
 _oco_checkpoints/
 # 2026-07-08 Gemini CLI: ignore temp exports trades directory
 tests/temp_exports_trades/
+# 2026-07-23 Gemini CLI: Deployment Identity File (Rule 5: never commit between hosts)
+.deployment-target
+
