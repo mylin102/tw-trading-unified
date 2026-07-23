@@ -75,9 +75,39 @@ def get_near_far(api, category=None, days_to_switch=3):
     if category is None:
         category = TICKER
     
+    # 2026-07-23 Gemini CLI: Robust contract resolution with fallback scan
+    contracts = []
     try:
-        contracts = list(api.Contracts.Futures[category])
-    except (AttributeError, KeyError):
+        if hasattr(api.Contracts, "Futures") and category in api.Contracts.Futures:
+            contracts = list(api.Contracts.Futures[category])
+        else:
+            # Force contract fetch retry (Shioaji 1.5.5 compat: no kwargs)
+            try:
+                api.fetch_contracts()
+            except Exception:
+                api.fetch_contracts()
+            # Retry direct access after fetch
+            if hasattr(api.Contracts, "Futures") and category in api.Contracts.Futures:
+                contracts = list(api.Contracts.Futures[category])
+    except Exception as err:
+        print(f"WARN: Direct contract fetch failed for {category}: {err}")
+
+    # Group scan fallback (runs regardless of whether direct access succeeded)
+    if not contracts:
+        print(f"WARN: Direct contract access failed for {category}, trying group scan...")
+        try:
+            for grp in api.Contracts.Futures:
+                for c in grp:
+                    code = getattr(c, "code", "") or ""
+                    symbol = getattr(c, "symbol", "") or ""
+                    if code.startswith(category) or symbol.startswith(category):
+                        contracts.append(c)
+        except Exception as err:
+            print(f"WARN: Group scan failed: {err}")
+        if contracts:
+            print(f"Group scan found {len(contracts)} matching contracts for {category}")
+
+    if not contracts:
         print(f"ERROR: Product {category} not found in Shioaji Contracts")
         return None, None
         
@@ -164,9 +194,15 @@ def calculate_spread_metrics(df_near, df_far):
 def main():
     parser = argparse.ArgumentParser(description="Update calendar spread CSV")
     parser.add_argument("--days", type=int, default=2, help="Days of history to fetch")
+    parser.add_argument("--ticker", type=str, default=None,
+                        help="Override ticker from config (e.g. tmf)")
     args = parser.parse_args()
 
-    # 1. Login (reuses existing session if possible)
+    # 1. Override ticker if explicitly provided (GSD: explicit > config default)
+    if args.ticker:
+        global TICKER
+        TICKER = args.ticker.upper()
+        print(f"[CalendarSpread] Ticker overridden to {TICKER} via --ticker")
     try:
         api = get_api()
     except Exception as e:

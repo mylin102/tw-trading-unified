@@ -16,6 +16,7 @@ import yaml
 import datetime
 import os
 import time
+import re
 from core.date_utils import get_session_date_str, get_trade_day
 
 # ═══ Stock Name Mapping (fallback when CSV name column is missing) ═══
@@ -2166,53 +2167,108 @@ def load_far_month_data(product="TMF"):
     
     return None
 
-@st.cache_data(ttl=30)
+# ── Spread CSV discovery helpers (2026-07-22: ticker-scoped, no mtime cross-ticker) ──
+_SPREAD_FILE_RE = re.compile(
+    r"^(?P<ticker>[a-z0-9]+)_calendar_spread_(?P<date>\d{8})\.csv$"
+)
+
+
+def _latest_spread_csv(ticker: str, data_dir: _Path = _Path("data")) -> _Path | None:
+    """Find the latest calendar spread CSV for a specific ticker.
+
+    Selection priority:
+      1. Filename date (YYYYMMDD in ``{ticker}_calendar_spread_{date}.csv``)
+      2. ``st_mtime_ns`` as tiebreaker for same-day rewrites
+
+    Never crosses ticker boundaries, even when filesystem mtime suggests
+    a foreign file is newer. This prevents the accidental recovery pattern:
+    mtx file gets bulk-copied with fresh mtime → dashboard silently picks MTX
+    data for TMF trades.
+    """
+    normalized_ticker = ticker.lower()
+    candidates: list[tuple[str, _Path]] = []
+
+    for path in data_dir.glob(f"{normalized_ticker}_calendar_spread_*.csv"):
+        match = _SPREAD_FILE_RE.fullmatch(path.name)
+        if match is None:
+            continue
+        if match.group("ticker") != normalized_ticker:
+            continue
+        candidates.append((match.group("date"), path))
+
+    if not candidates:
+        return None
+
+    _, latest_path = max(
+        candidates,
+        key=lambda item: (
+            item[0],                    # primary: filename date (string YYYYMMDD)
+            item[1].stat().st_mtime_ns,  # tiebreaker: same-day rewrites
+        ),
+    )
+    return latest_path
+
+
+@st.cache_data
+def _load_spread_csv(path_str: str, mtime_ns: int) -> pd.DataFrame | None:
+    """Load spread CSV, keyed by resolved path + mtime_ns.
+
+    ``mtime_ns`` is not used inside the function — it exists solely as a
+    Streamlit cache invalidation key. When the file is re-written, ``mtime_ns``
+    changes and the cache is automatically bypassed.
+    """
+    del mtime_ns  # cache key only
+    try:
+        df = pd.read_csv(path_str)
+        # Normalize timestamp
+        if "timestamp" not in df.columns:
+            if "ts" in df.columns:
+                df = df.rename(columns={"ts": "timestamp"})
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+            df = df.dropna(subset=["timestamp"])
+        return df
+    except Exception as e:
+        print(f"[Calendar Spread] LOAD FAILED: {e}")
+        return None
+
+
+@st.cache_data(ttl=60)
 def load_calendar_spread_data():
     """載入日曆價差資料 (近月/遠月合約價差)
-    
-    優先載入預先計算的價差檔案，如果不存在則嘗試從近月/遠月資料計算
+
+    優先載入預先計算的價差檔案（ticker-scoped discovery），
+    如果不存在則嘗試從近月/遠月資料計算。
+
+    Cache 由 _load_spread_csv 管理，key 綁定 resolved path + st_mtime_ns。
+    load_calendar_spread_data 每 60 秒重新 discovery，確保新檔案被找到。
     """
     try:
-        import pandas as pd
         import numpy as np
         from pathlib import Path
-        
-        # 優先尋找預先計算的價差檔案
-        spread_files = list(Path("data").glob("*spread*.csv"))
-        if not spread_files:
-            spread_files = list(Path(".").rglob("*calendar*spread*.csv"))
-        
-        if spread_files:
-            # 選擇最新的檔案
-            latest_file = max(spread_files, key=lambda p: p.stat().st_mtime)
-            df = pd.read_csv(latest_file)
-            
-            # 標準化 timestamp 欄位
-            if "timestamp" not in df.columns:
-                if "ts" in df.columns:
-                    df = df.rename(columns={"ts": "timestamp"})
-                elif df.index.name == "timestamp":
-                    df = df.reset_index()
-                elif len(df.columns) > 0:
-                    df = df.rename(columns={df.columns[0]: "timestamp"})
-            
-            if "timestamp" in df.columns:
-                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-                df = df.dropna(subset=["timestamp"])
-            
-            # 確保數值欄位是數值類型
-            numeric_cols = ["spread", "spread_z", "spread_ma", "spread_std", 
-                           "vwap_z", "price_vs_vwap", "Close_near", "Close_far"]
-            for col in numeric_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-            
-            # 處理無限值
-            df = df.replace([np.inf, -np.inf], np.nan)
-            
-            print(f"[Calendar Spread] 載入價差資料: {len(df)} 筆, 來自 {latest_file.name}")
-            return df
-        
+
+        # 優先載入預先計算的價差檔案（ticker-scoped）
+        spread_path = _latest_spread_csv(_TICKER)
+        if spread_path is not None:
+            stat = spread_path.stat()
+            df = _load_spread_csv(str(spread_path.resolve()), stat.st_mtime_ns)
+            if df is not None and not df.empty:
+                # 確保數值欄位是數值類型
+                numeric_cols = ["spread", "spread_z", "spread_ma", "spread_std",
+                               "vwap_z", "price_vs_vwap", "Close_near", "Close_far"]
+                for col in numeric_cols:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                # 處理無限值
+                df = df.replace([np.inf, -np.inf], np.nan)
+                print(f"[Calendar Spread] 載入價差資料: {len(df)} 筆, "
+                      f"來自 {spread_path.name}, "
+                      f"範圍 {df['timestamp'].min()} ~ {df['timestamp'].max()}")
+                return df
+            print(f"[Calendar Spread] 載入失敗或空資料: {spread_path.name}")
+        else:
+            print(f"[Calendar Spread] 找不到 {_TICKER} calendar spread CSV")
+
         # 如果沒有預先計算的檔案，嘗試從近月/遠月資料計算
         print("[Calendar Spread] 沒有預先計算的價差檔案，嘗試計算...")
         
