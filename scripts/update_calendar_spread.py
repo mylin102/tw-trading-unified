@@ -74,6 +74,10 @@ def get_near_far(api, category=None, days_to_switch=3):
     """
     if category is None:
         category = TICKER
+
+    if not category:
+        print(f"ERROR: Empty category provided to get_near_far")
+        return None, None
     
     # 2026-07-23 Gemini CLI: Robust contract resolution with fallback scan
     contracts = []
