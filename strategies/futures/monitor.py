@@ -6384,11 +6384,24 @@ class FuturesMonitor:
                     # 2026-05-27 Gemini CLI: Force strategy reset and log fill using correctly defined _strategy_obj
                     if _strategy_obj:
                         _strategy_obj._reset(reason="EMERGENCY_CLOSE")
-                        from strategies.plugins.futures.active.tmf_spread import _append_fill
-                        # [Fix 2026-07-06] _rem_leg/_side/_price always defined (safe defaults above)
-                        _fill_leg = _rem_leg.upper() if isinstance(_rem_leg, str) else "BOTH"
-                        _append_fill(self.ticker, _fill_leg, "EMERGENCY",
-                                     str(_side), 1, float(_price or 0), "EXIT", _trade_id)
+                        # 2026-07-24 Hermes Agent: Use unified settlement pipeline for PnL computation
+                        from strategies.plugins.futures.active.tmf_spread import settle_mts_trade
+                        _near_entry_disk = float(_disk.get("near_entry", 0)) if _disk else 0
+                        _far_entry_disk = float(_disk.get("far_entry", 0)) if _disk else 0
+                        _near_side_disk = _disk.get("near_side") if _disk else None
+                        _far_side_disk = _disk.get("far_side") if _disk else None
+                        settle_mts_trade(
+                            ticker=self.ticker,
+                            trade_id=_trade_id,
+                            exit_type="EMERGENCY_CLOSE_ALL",
+                            near_entry=_near_entry_disk,
+                            far_entry=_far_entry_disk,
+                            near_side=_near_side_disk,
+                            far_side=_far_side_disk,
+                            near_exit_price=_near_last,
+                            far_exit_price=_far_last,
+                            settlement_source="BROKER_FILLS",
+                        )
 
                     # Reset state file
                     try:

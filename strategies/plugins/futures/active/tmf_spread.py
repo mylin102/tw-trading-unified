@@ -422,7 +422,10 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
                  near_pnl: float | None = None,
                  far_pnl: float | None = None,
                  spread_pnl: float | None = None,
-                 slippage_far: float | None = None) -> None:
+                 slippage_far: float | None = None,
+                 # 2026-07-24 Hermes Agent: settlement tracking
+                 settlement_status: str | None = None,
+                 settled_from: str | None = None) -> None:
     """Append a trade fill record (append-only JSONL)."""
     # 2026-06-25 Gemini CLI: Skip fill logging during backtesting
     if os.getenv("MTS_BACKTEST") == "1":
@@ -465,6 +468,9 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
             'far_pnl': round(far_pnl, 1) if far_pnl is not None else None,
             'spread_pnl': round(spread_pnl, 1) if spread_pnl is not None else None,
             'slippage_far': round(slippage_far, 4) if slippage_far is not None else None,
+            # 2026-07-24 Hermes Agent: settlement tracking
+            'settlement_status': settlement_status,
+            'settled_from': settled_from,
         }
         # 💡 [Fixed 2026-05-27] Big warning for missing trade_id to catch leaks
         if trade_id == "?":
@@ -474,6 +480,224 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
             f.write(json.dumps(fill, default=str) + "\n")
     except Exception:
         pass
+
+
+# ═══════════════════════════════════════════════════════════════
+# MTS Settlement Pipeline (2026-07-24 Hermes Agent)
+# ───── Purpose ─────
+# Unified settlement for both NORMAL_EXIT and EMERGENCY_CLOSE_ALL.
+# Computes realized PnL at the fill level, writes settlement status
+# to fills log and state file, and is idempotent (checks fills log
+# for already-settled fills before appending).
+# ═══════════════════════════════════════════════════════════════
+
+SETTLEMENT_STATUS_PENDING = "PENDING_SETTLEMENT"
+SETTLEMENT_STATUS_PARTIAL = "PARTIALLY_SETTLED"
+SETTLEMENT_STATUS_SETTLED = "SETTLED"
+SETTLEMENT_STATUS_UNRESOLVED = "UNRESOLVED"
+
+
+def _has_settled_exit(
+    trade_id: str,
+    leg: str,
+    log_path: str | None = None,
+) -> bool:
+    """Check if the fills log already has a SETTLED exit for trade_id+leg.
+
+    Idempotency guard: prevents PnL double-counting on replay/retry.
+    """
+    _log = log_path or _MTS_FILL_LOG
+    if not os.path.exists(_log):
+        return False
+    try:
+        with open(_log) as _f:
+            for _line in _f:
+                try:
+                    rec = json.loads(_line.strip())
+                    _tid = rec.get("trade_id")
+                    _leg = rec.get("leg", "")
+                    _ft = rec.get("fill_type", "")
+                    _rp = rec.get("realized_pnl")
+                    if (
+                        _tid == trade_id
+                        and _leg == leg.upper()
+                        and _ft == "EXIT"
+                        and _rp is not None
+                    ):
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
+
+
+def settle_mts_trade(
+    ticker: str,
+    trade_id: str,
+    exit_type: str,  # "EMERGENCY_CLOSE_ALL" or "NORMAL_EXIT"
+    near_entry: float,
+    far_entry: float,
+    near_side: str | None,
+    far_side: str | None,
+    near_exit_price: float,
+    far_exit_price: float,
+    near_exit_qty: int = 1,
+    far_exit_qty: int = 1,
+    fees: float = 0.0,
+    settlement_source: str = "BROKER_FILLS",
+) -> dict:
+    """Unified MTS trade settlement for both normal EXIT and emergency close_all.
+
+    Args:
+        ticker: Instrument ticker (e.g. "TMF").
+        trade_id: Trade identifier.
+        exit_type: "EMERGENCY_CLOSE_ALL" or "NORMAL_EXIT".
+        near_entry: Near-leg entry price.
+        far_entry: Far-leg entry price.
+        near_side: "LONG" or "SHORT" for near leg.
+        far_side: "LONG" or "SHORT" for far leg.
+        near_exit_price: Near-leg exit fill price.
+        far_exit_price: Far-leg exit fill price.
+        near_exit_qty: Near-leg exit quantity (default 1).
+        far_exit_qty: Far-leg exit quantity (default 1).
+        fees: Explicit fee deduction. If 0, default broker+exchange fees
+              (40 TWD + turnover * 2e-5 per leg) are computed automatically.
+        settlement_source: Source label for provenance.
+
+    Returns:
+        dict with keys:
+            near_realized_pnl, far_realized_pnl,
+            gross_realized_pnl, net_realized_pnl,
+            settlement_status, settled_from,
+            near_exit_price, far_exit_price.
+    """
+    _mult = float(get_point_value(ticker))
+
+    # ── Compute per-leg PnL (points) ──
+    def _leg_pnl_pts(entry: float, exit: float, side: str | None) -> float:
+        if side is None:
+            return 0.0
+        if entry <= 0 or exit <= 0:
+            return 0.0
+        if side.upper() == "LONG":
+            return exit - entry
+        else:  # SHORT → profit when price drops
+            return entry - exit
+
+    _near_pts = _leg_pnl_pts(near_entry, near_exit_price, near_side)
+    _far_pts = _leg_pnl_pts(far_entry, far_exit_price, far_side)
+
+    # ── Gross realized PnL (TWD) ──
+    _near_gross = _near_pts * _mult * near_exit_qty
+    _far_gross = _far_pts * _mult * far_exit_qty
+    _gross = _near_gross + _far_gross
+
+    # ── Fees ──
+    if fees > 0:
+        _fees = fees
+    else:
+        # Compute automatic broker+exchange fees matching _reset pattern
+        _near_fee = 40.0 + (near_entry + near_exit_price) * _mult * 2e-5 if near_entry > 0 and near_exit_price > 0 else 40.0
+        _far_fee = 40.0 + (far_entry + far_exit_price) * _mult * 2e-5 if far_entry > 0 and far_exit_price > 0 else 40.0
+        _fees = _near_fee + _far_fee
+
+    _net = _gross - _fees
+
+    # ── Determine settlement status ──
+    _both_valid = near_exit_price > 0 and far_exit_price > 0
+    _near_valid = near_entry > 0 and near_exit_price > 0 and near_side is not None
+    _far_valid = far_entry > 0 and far_exit_price > 0 and far_side is not None
+
+    if _both_valid and _near_valid and _far_valid:
+        _settlement_status = SETTLEMENT_STATUS_SETTLED
+    elif _near_valid or _far_valid:
+        _settlement_status = SETTLEMENT_STATUS_PARTIAL
+    else:
+        _settlement_status = SETTLEMENT_STATUS_UNRESOLVED
+
+    # ── Idempotent fill append ──
+    if _near_valid:
+        if not _has_settled_exit(trade_id, "NEAR"):
+            _near_pnl = _near_gross - (_fees / 2)
+            _append_fill(
+                ticker=ticker,
+                contract="NEAR",
+                leg="NEAR",
+                side="SELL" if near_side and near_side.upper() == "LONG" else "BUY",
+                qty=near_exit_qty,
+                price=near_exit_price,
+                fill_type="EXIT",
+                trade_id=trade_id,
+                realized_pnl=round(_near_pnl, 1),
+                settlement_status=_settlement_status,
+                settled_from=settlement_source,
+            )
+        else:
+            logger.info("[MTS_SETTLE] Skipping NEAR fill for trade_id=%s — already settled", trade_id)
+
+    if _far_valid:
+        if not _has_settled_exit(trade_id, "FAR"):
+            _far_pnl = _far_gross - (_fees / 2)
+            _append_fill(
+                ticker=ticker,
+                contract="FAR",
+                leg="FAR",
+                side="SELL" if far_side and far_side.upper() == "LONG" else "BUY",
+                qty=far_exit_qty,
+                price=far_exit_price,
+                fill_type="EXIT",
+                trade_id=trade_id,
+                realized_pnl=round(_far_pnl, 1),
+                settlement_status=_settlement_status,
+                settled_from=settlement_source,
+            )
+        else:
+            logger.info("[MTS_SETTLE] Skipping FAR fill for trade_id=%s — already settled", trade_id)
+
+    # ── Update state file with settlement status ──
+    try:
+        _target = _get_state_file_path()
+        _state = None
+        if os.path.exists(_target):
+            try:
+                with open(_target) as _f:
+                    _state = json.load(_f)
+            except Exception:
+                pass
+        if _state is not None:
+            _state["settlement_status"] = _settlement_status
+            _state["settled_from"] = settlement_source
+            _state["exit_type"] = exit_type
+            _state["near_exit_price"] = near_exit_price
+            _state["far_exit_price"] = far_exit_price
+            _state["total_realized_pnl"] = round(_gross, 1)
+            _state["near_realized_pnl"] = round(_near_gross, 1)
+            _state["far_realized_pnl"] = round(_far_gross, 1)
+            _tmp = f"{_target}.settle.{os.getpid()}.{id(_state) & 0xFFFF}"
+            with open(_tmp, "w") as _f:
+                json.dump(_state, _f, default=str)
+            os.replace(_tmp, _target)
+    except Exception:
+        logger.exception("[MTS_SETTLE] Failed to update state file with settlement status")
+
+    logger.info(
+        "[MTS_SETTLE] ticker=%s trade_id=%s exit_type=%s status=%s "
+        "near=%.1f far=%.1f gross=%.1f net=%.1f fees=%.1f",
+        ticker, trade_id, exit_type, _settlement_status,
+        _near_gross, _far_gross, _gross, _net, _fees,
+    )
+
+    return {
+        "near_realized_pnl": round(_near_gross, 1),
+        "far_realized_pnl": round(_far_gross, 1),
+        "gross_realized_pnl": round(_gross, 1),
+        "net_realized_pnl": round(_net, 1),
+        "settlement_status": _settlement_status,
+        "settled_from": settlement_source,
+        "near_exit_price": near_exit_price,
+        "far_exit_price": far_exit_price,
+    }
 
 
 def _write_mts_state(
@@ -661,6 +885,10 @@ def _write_mts_state(
             "trail_distance_points": trail_distance_points or existing.get("trail_distance_points"),
             "trade_id": _f_trade_id,
             "entry_ts": _f_entry_ts,
+            # 2026-07-24 Hermes Agent: settlement tracking
+            "settlement_status": existing.get("settlement_status"),
+            "settled_from": existing.get("settled_from"),
+            "exit_type": existing.get("exit_type"),
             # 2026-06-26 Gemini CLI: serialize current atr to state file
             "atr": round(atr, 2) if atr else existing.get("atr"),
             "_updated": datetime.now().isoformat(),
@@ -791,7 +1019,9 @@ def _write_mts_telemetry(
                       "release_price", "risk_mode", "session", "stop_mult", "trail_mult",
                       "final_release_stop", "final_trail_dist", "release_stop",
                       "release_stop_floor", "trail_dist", "trail_dist_floor",
-                      "confirm_ticks", "near_vwap", "far_vwap"]:
+                      "confirm_ticks", "near_vwap", "far_vwap",
+                      # 2026-07-24 Hermes Agent: settlement tracking
+                      "settlement_status", "settled_from", "exit_type"]:
             if _key in existing:
                 telemetry[_key] = existing[_key]
 
