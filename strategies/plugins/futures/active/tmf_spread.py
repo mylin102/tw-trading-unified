@@ -964,6 +964,12 @@ class TMFSpread(StrategyBase):
         self._post_shadow_mae = None
         self._formal_max_giveback = 0.0
 
+        # ── P0: Trail anchor status (default READY for normal flow) ──
+        self._trail_anchor_status: TrailAnchorStatus = TrailAnchorStatus.READY
+        self._trail_warmup_tick_count: int = 0
+        self._trail_started_at: float | None = None
+        self._trail_anchor_source: str | None = None
+
         # ── P1: Single-leg extrema (decision authority in SINGLE_LEG) ──
         self._single_leg_peak: float = 0.0
         self._single_leg_nadir: float = 0.0
