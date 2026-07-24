@@ -284,6 +284,36 @@ def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
                     
                     matched = True
 
+            # P1: Route TMF near/far bidask by exact contract code
+            if not matched:
+                for f_mon in futures_mons:
+                    if not hasattr(f_mon, 'contract') or not hasattr(f_mon, 'far_contract'):
+                        continue
+                    f_ticker = getattr(f_mon, 'ticker', None)
+                    if not f_ticker:
+                        continue
+                    # TMF near
+                    if f_mon.contract and code == f_mon.contract.code:
+                        if f_ticker not in f_mon.market_data:
+                            f_mon.market_data[f_ticker] = {}
+                        f_mon.market_data[f_ticker]["bid"] = float(bid)
+                        f_mon.market_data[f_ticker]["ask"] = float(ask)
+                        f_mon.market_data[f_ticker]["close"] = mid
+                        f_mon.market_data[f_ticker]["bidask_at"] = time.time()
+                        matched = True
+                        break
+                    # TMF far
+                    if f_mon.far_contract and code == f_mon.far_contract.code:
+                        _far_key = f"{f_ticker}_FAR"
+                        if _far_key not in f_mon.market_data:
+                            f_mon.market_data[_far_key] = {}
+                        f_mon.market_data[_far_key]["bid"] = float(bid)
+                        f_mon.market_data[_far_key]["ask"] = float(ask)
+                        f_mon.market_data[_far_key]["close"] = mid
+                        f_mon.market_data[_far_key]["bidask_at"] = time.time()
+                        matched = True
+                        break
+
                 # [Skew Integration] Feed option quote to skew engine
                 # 💡 GSD: Only dispatch if the code matches the contract and price is realistic for an option (< 10,000)
                 # to avoid price contamination (e.g. MTX price in options)
