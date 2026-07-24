@@ -6,6 +6,8 @@ from .economics import ContractEconomics
 from .dispatcher import DispatchResult, NormalReleaseDispatcher, ParityResult
 from .legacy_adapter import LegacyPolicyObservation, LegacyReleaseAdapter, OutcomeKind
 
+from .normal_release_policy import NormalReleasePolicy
+
 __all__ = [
     "ExitFamily",
     "ExitAction",
@@ -15,6 +17,7 @@ __all__ = [
     "ExitEvaluation",
     "ContractEconomics",
     "ExitPolicy",
+    "NormalReleasePolicy",
     "LegacyPolicyObservation",
     "LegacyReleaseAdapter",
     "NormalReleaseDispatcher",

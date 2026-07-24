@@ -35,6 +35,7 @@ class LegacyReleaseAdapter:
     def normalize_legacy_result(
         raw_result: dict[str, Any] | None,
         current_state: NormalReleaseState,
+        event_time_ns: int | None = None,
     ) -> tuple[LegacyPolicyObservation, ExitEvaluation[NormalReleaseState]]:
         """Normalize raw legacy dictionary output into structured observation and ExitEvaluation."""
         if not raw_result:
@@ -102,10 +103,13 @@ class LegacyReleaseAdapter:
         next_released_leg = leg if action == ExitAction.RELEASE else current_state.released_leg
         next_single_leg_active = True if (action in (ExitAction.RELEASE, ExitAction.TRAIL) or current_state.single_leg_active) else False
         
+        warmup_ns = event_time_ns if (action == ExitAction.RELEASE and event_time_ns is not None) else current_state.warmup_started_at_ns
+        release_ns = event_time_ns if (action == ExitAction.RELEASE and event_time_ns is not None) else current_state.release_triggered_at_ns
+
         next_state = NormalReleaseState(
             released_leg=next_released_leg,
-            warmup_started_at_ns=current_state.warmup_started_at_ns,
-            release_triggered_at_ns=current_state.release_triggered_at_ns,
+            warmup_started_at_ns=warmup_ns,
+            release_triggered_at_ns=release_ns,
             single_leg_active=next_single_leg_active,
         )
 

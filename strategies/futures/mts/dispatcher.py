@@ -92,7 +92,7 @@ class NormalReleaseDispatcher:
             raise exception_raised
 
         # Normalize raw legacy result into pure ExitEvaluation contract
-        obs, authoritative_eval = LegacyReleaseAdapter.normalize_legacy_result(raw_result, state)
+        obs, authoritative_eval = LegacyReleaseAdapter.normalize_legacy_result(raw_result, state, context.event_time_ns)
 
         # Shadow Policy Evaluation (diagnostic only, fail-safe)
         shadow_eval: ExitEvaluation[NormalReleaseState] | None = None

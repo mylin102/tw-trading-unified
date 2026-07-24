@@ -21,9 +21,20 @@ def _build_mock_context(
     far_current: Decimal = Decimal("23110"),
 ) -> CharacterizationCase:
     """Helper to build a CharacterizationCase for freezing legacy behaviors."""
+    session_val = "FORCE_EXIT" if scenario == "session_force_exit" else "DAY"
+    quote_valid_val = False if scenario == "stale_quote" else quote_valid
+    if scenario == "near_release":
+        spread_z_val = 2.0
+    elif scenario == "far_release":
+        spread_z_val = -2.0
+    elif scenario == "trail_trigger":
+        spread_z_val = 4.0
+    else:
+        spread_z_val = spread_z
+
     ctx = SpreadContextBuilder.build_context(
         event_time_ns=1770000000000000000,
-        session="DAY",
+        session=session_val,
         ticker="TMF",
         quantity=1,
         near_contract="TMF202608",
@@ -38,9 +49,9 @@ def _build_mock_context(
         far_current_price=far_current,
         far_high_price=Decimal("23130"),
         far_low_price=Decimal("23070"),
-        spread_z=spread_z,
+        spread_z=spread_z_val,
         spread_atr=15.0,
-        quote_valid=quote_valid,
+        quote_valid=quote_valid_val,
     )
 
     if scenario == "no_op":
@@ -59,6 +70,10 @@ def _build_mock_context(
         action = ExitAction.HOLD
         reason = ExitReason.QUOTE_STALE.value
         leg = None
+    elif scenario == "trail_trigger":
+        action = ExitAction.TRAIL
+        reason = ExitReason.THRESHOLD_TRIGGERED.value
+        leg = Leg.NEAR
     elif scenario == "session_force_exit":
         action = ExitAction.EMERGENCY_FLAT
         reason = ExitReason.SESSION_FORCE_FLAT.value
@@ -68,14 +83,16 @@ def _build_mock_context(
         reason = ExitReason.NONE.value
         leg = None
 
+    single_leg = True if scenario == "trail_trigger" else False
+
     return CharacterizationCase(
         case_id=f"golden-{scenario}-001",
         scenario_type=scenario,
         source_trade_id="trade-mock-123",
         event_time_ns=1770000000000000000,
-        session="DAY",
+        session=session_val,
         input_context=ctx,
-        input_lifecycle_state={"phase": "SPREAD", "status": "ARMED"},
+        input_lifecycle_state={"phase": "SPREAD", "status": "ARMED", "single_leg_active": single_leg, "released_leg": "NEAR" if single_leg else None},
         legacy_decision={"action": action.value, "leg": leg.value if leg else None},
         policy_golden=PolicyGoldenAssertion(
             expected_action=action,
