@@ -1330,10 +1330,12 @@ def make_calendar_spread_chart(spread_df):
                 row=3, col=1
             )
             
-            # Z-score 速度 (一階微分) 與加速度 (二階微分)
+            # Z-score 速度 (dz/dt) 與加速度 (d²z/dt²)
+            _t = pd.to_datetime(spread_df["timestamp"])
+            _dt = _t.diff().dt.total_seconds().fillna(1).clip(lower=1)
             _z = spread_df["spread_z"]
-            _z_v = _z.diff().fillna(0)
-            _z_a = _z.diff().diff().fillna(0)
+            _z_v = _z.diff() / _dt  # z/sec
+            _z_a = _z_v.diff() / _dt.shift(-1).fillna(1)  # z/sec²
             fig.add_trace(
                 go.Scatter(
                     x=_clean_list(spread_df["timestamp"], force_str=True),
