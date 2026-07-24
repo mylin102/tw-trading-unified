@@ -1804,6 +1804,40 @@ class FuturesMonitor:
             bar["volume"] += vol
         # else: old data, ignore
 
+
+    def _refresh_far_snapshot(self) -> None:
+        """Periodically refresh far-month price from API snapshot.
+        
+        Far-month futures often have no tick callbacks during day session.
+        This fallback ensures TMF_FAR price stays current even without ticks.
+        Called from the main strategy loop when far data is stale.
+        """
+        if not self.far_contract or not self.api or self.dry_run:
+            return
+        try:
+            _snaps = self.api.snapshots([self.far_contract])
+            if _snaps and len(_snaps) > 0:
+                _s = _snaps[0]
+                if _s.close and float(_s.close) > 0:
+                    _price = float(_s.close)
+                    _now = time.time()
+                    # Update market_data cache
+                    _far_key = f"{self.ticker}_FAR"
+                    if _far_key not in self.market_data:
+                        self.market_data[_far_key] = {}
+                    self.market_data[_far_key]["close"] = _price
+                    self.market_data[_far_key]["snapshot_at"] = _now
+                    self.market_data[_far_key]["local_arrival_at"] = _now
+                    # Also update far_current_bar
+                    if hasattr(self, "_far_current_bar"):
+                        self._far_current_bar["close"] = _price
+                        self._far_current_bar["open"] = _price if self._far_current_bar.get("open", 0) == 0 else self._far_current_bar.get("open", _price)
+                        self._far_current_bar["high"] = max(float(self._far_current_bar.get("high", 0) or 0), _price)
+                        self._far_current_bar["low"] = min(float(self._far_current_bar.get("low", 0) or _price), _price)
+                    logger.info(f"[FAR_SNAP] {self.far_contract.code} price={_price}")
+        except Exception as e:
+            logger.warning(f"[FAR_SNAP] fail: {e}")
+
     def _save_far_bar(self, bar):
         """Append a completed far-month bar to shared CSV for dashboard consumption.
         Writes to: logs/market_data/{ticker}_far_{date_str}_{tag}.csv"""
@@ -5197,6 +5231,15 @@ class FuturesMonitor:
         return True
 
     def _mts_tick(self, enriched_bar: dict | None = None):
+        # [P1] Periodic far snapshot refresh (60s cooldown) for low-volume far months
+        try:
+            _now = time.time()
+            if not hasattr(self, '_last_far_snapshot_ts') or _now - self._last_far_snapshot_ts > 60:
+                self._last_far_snapshot_ts = _now
+                self._refresh_far_snapshot()
+        except Exception:
+            pass
+
         """MTS minimal execution path. Uses enriched bar from pipeline when available,
         falls back to building bar from tick deque if none provided."""
         print("MTS_ALIVE", flush=True)
