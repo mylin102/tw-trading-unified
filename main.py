@@ -994,7 +994,10 @@ def run_system(dry_run=False, config_name="futures"):
                     fallback_bidask_handler=_tmf_bidask_fn,
                     always_call_fallback=True,
                 )
-                set_tick_callback(api, _mtx_runtime.adapter.on_tick)
+                _gca_adapter = _mtx_runtime.adapter
+                def _gca_tick_wrapper(*a):
+                    return _gca_adapter.on_tick(*a)
+                set_tick_callback(api, _gca_tick_wrapper)
                 set_bidask_callback(api, _mtx_runtime.adapter.on_bidask)
                 console.print("[green]✅ GlobalCallbackAdapter installed (TMF + MTX routing with fallback dispatch)[/green]")
 
