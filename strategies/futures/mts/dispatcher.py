@@ -102,13 +102,15 @@ class NormalReleaseDispatcher:
             try:
                 shadow_eval = shadow_policy_fn(context, state, config)
                 
-                # Compute Parity
+                # Compute Parity with deep dataclass state comparison
+                from dataclasses import asdict
                 action_match = (authoritative_eval.action == shadow_eval.action)
                 leg_match = (authoritative_eval.legs == shadow_eval.legs)
                 reason_match = (authoritative_eval.reason == shadow_eval.reason)
                 transition_match = (authoritative_eval.next_state.single_leg_active == shadow_eval.next_state.single_leg_active)
+                state_match = (asdict(authoritative_eval.next_state) == asdict(shadow_eval.next_state))
 
-                is_match = action_match and leg_match and reason_match and transition_match
+                is_match = action_match and leg_match and reason_match and transition_match and state_match
 
                 parity_result = ParityResult(
                     is_match=is_match,
@@ -123,6 +125,9 @@ class NormalReleaseDispatcher:
                         "shadow_legs": [l.name for l in shadow_eval.legs],
                         "auth_reason": authoritative_eval.reason.name,
                         "shadow_reason": shadow_eval.reason.name,
+                        "state_match": state_match,
+                        "auth_state": asdict(authoritative_eval.next_state),
+                        "shadow_state": asdict(shadow_eval.next_state),
                     },
                 )
             except Exception as shadow_exc:
