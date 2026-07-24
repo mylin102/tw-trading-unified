@@ -7,6 +7,7 @@ from .dispatcher import DispatchResult, NormalReleaseDispatcher, ParityResult
 from .legacy_adapter import LegacyPolicyObservation, LegacyReleaseAdapter, OutcomeKind
 
 from .normal_release_policy import NormalReleasePolicy
+from .soak_collector import ShadowSoakCollector
 from .soak_manifest import CoverageMetrics, PerformanceMetrics, ShadowSoakManifest
 from .telemetry import (
     EvaluationAccountingSummary,
@@ -44,4 +45,5 @@ __all__ = [
     "CoverageMetrics",
     "PerformanceMetrics",
     "ShadowSoakManifest",
+    "ShadowSoakCollector",
 ]
