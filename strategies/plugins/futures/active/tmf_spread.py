@@ -336,6 +336,11 @@ class FlatEvidenceType(str, Enum):
     BROKER_RECONCILIATION = "BROKER_RECONCILIATION"
     MANUAL_RECONCILIATION = "MANUAL_RECONCILIATION"
 
+class TrailAnchorStatus(Enum):
+    """Whether the remaining leg has a valid trail anchor after release."""
+    PENDING_REANCHOR = "PENDING_REANCHOR"
+    READY = "READY"
+
 @dataclass
 class FlatEvidence:
     evidence_type: FlatEvidenceType
@@ -1184,15 +1189,23 @@ class TMFSpread(StrategyBase):
         self._single_leg_post_fill_ticks = 0
         self._single_leg_last_tick_ts = 0.0
 
-        # ── ADR-011 Phase 3: Full trail re-arm ──
-        # Peak/nadir start from remaining leg price (clean slate)
-        if self._side == "LONG":
-            self._peak = remaining_leg_price
-            self._nadir = 0.0
+        # ── ADR-011 Phase 3: Full trail re-arm ──        # Peak/nadir start from remaining leg price (clean slate).
+        # If remaining_leg_price is None (restart recovery without fresh quote),
+        # set PENDING_REANCHOR to wait for first valid remaining-leg tick.
+        if remaining_leg_price is not None and remaining_leg_price > 0:
+            if self._side == "LONG":
+                self._peak = remaining_leg_price
+                self._nadir = 0.0
+            else:
+                self._nadir = remaining_leg_price
+                self._peak = 0.0
+            self._trail_anchor_status = TrailAnchorStatus.READY
         else:
-            self._nadir = remaining_leg_price
             self._peak = 0.0
-
+            self._nadir = 0.0
+            self._trail_anchor_status = TrailAnchorStatus.PENDING_REANCHOR
+            self._trail_warmup_tick_count = 0
+            self._trail_started_at = None
         # Clear ALL pre-release cached state
         self._near_max = None
         self._near_min = None
@@ -2002,9 +2015,15 @@ class TMFSpread(StrategyBase):
                             if release_f:
                                 self._released_leg = "near" if release_f["leg"] == "NEAR" else "far"
                                 self._side = "LONG" if (self._released_leg == "near" and self._far_side == "LONG") or (self._released_leg == "far" and self._near_side == "LONG") else "SHORT"
-                                # 2026-05-27 Gemini CLI: Use actual release price as safety floor for peak/nadir
-                                self._peak = float(release_f["price"]) if self._side == "LONG" else 0.0
-                                self._nadir = float(release_f["price"]) if self._side == "SHORT" else 0.0
+                                # [P0 Fix] Restart recovery: released-leg fill price must NOT
+                                # become remaining-leg trail anchor. Set PENDING_REANCHOR instead,
+                                # so the first fresh remaining-leg tick initializes the real anchor.
+                                self._peak = 0.0
+                                self._nadir = 0.0
+                                self._trail_anchor_status = TrailAnchorStatus.PENDING_REANCHOR
+                                self._trail_warmup_tick_count = 0
+                                self._trail_started_at = None
+                                self._trail_anchor_source = "RESTORE_RECONSTRUCTION"
                                 self._lifecycle = f"TRAILING_{self._side}"
                                 # ADR-009 Task 6: sync lifecycle from fill-log reconstruction
                                 self._lifecycle_oca = infer_lifecycle_from_legacy_state({
@@ -2444,7 +2463,42 @@ class TMFSpread(StrategyBase):
                     if _ts_float > self._single_leg_last_tick_ts:
                         self._single_leg_post_fill_ticks += 1
                         self._single_leg_last_tick_ts = _ts_float
-            
+
+        # -- P0 Fix: Trail anchor re-anchor gate (2026-07-24) --
+        # After restart recovery, _trail_anchor_status may be PENDING_REANCHOR.
+        # Wait for a fresh remaining-leg tick before allowing trail evaluation.
+        if self._trail_anchor_status == TrailAnchorStatus.PENDING_REANCHOR:
+            _rem_leg = Leg.FAR if self._released_leg == "near" else Leg.NEAR
+            _rem_price = far_close if _rem_leg == Leg.FAR else near_close
+            _fresh = (
+                _rem_price > 0
+                and not (hasattr(_rem_price, "item") and pd.isna(_rem_price))
+            )
+            if _fresh:
+                if self._side == "LONG":
+                    self._peak = _rem_price
+                    self._nadir = 0.0
+                else:
+                    self._nadir = _rem_price
+                    self._peak = 0.0
+                self._trail_anchor_status = TrailAnchorStatus.READY
+                self._trail_warmup_tick_count = 0
+                self._trail_started_at = None
+                self._trail_anchor_source = "FIRST_FRESH_QUOTE"
+                self._set_eval(skip_reason="TRAIL_REANCHOR_INITIALIZED")
+                logger.info(
+                    "[MTS_REANCHOR] status=READY side=%s anchor=%.2f leg=%s",
+                    self._side, _rem_price, _rem_leg.value,
+                )
+                return None
+            else:
+                self._set_eval(skip_reason="TRAIL_REANCHOR_WAITING_FRESH_QUOTE")
+                logger.info(
+                    "[MTS_REANCHOR] status=PENDING_REANCHOR no_fresh_quote side=%s",
+                    self._side,
+                )
+                return None
+
         # 2026-06-26 Gemini CLI: build dynamic risk metadata
         _risk_meta = self._get_risk_meta(bar)
 
@@ -3210,6 +3264,14 @@ class TMFSpread(StrategyBase):
         # duplicate trail-stop comparison + separate force_lock check.
         # Force_lock bypass removed: if force_lock is needed, add to LifecycleContext /
         # evaluate_lifecycle_actions in a separate change.
+        # [P0 Guard] TRAIL must have READY anchor
+        if _decision is not None and _decision.action == LifecycleAction.TRAIL:
+            assert self._trail_anchor_status == TrailAnchorStatus.READY, (
+                f"[P0_ANCHOR_GUARD] TRAIL without READY anchor: "
+                f"status={self._trail_anchor_status} side={self._side} "
+                f"peak={self._peak} nadir={self._nadir}"
+            )
+
         if _decision is not None and _decision.action in (
             LifecycleAction.TRAIL, LifecycleAction.STOPLOSS,
             LifecycleAction.TIMEOUT, LifecycleAction.MANUAL,

@@ -1,0 +1,207 @@
+ticker: MTX
+active_strategy: tmf_spread
+
+# ── Product Registry (Section 6.1) ──
+# All monetary values in TWD.
+products:
+  TMF:
+    point_value: 10
+    tick_size: 1
+    broker_fee_per_side: 22
+    exchange_fee_per_side: 0
+    tax_rate: 0.00002
+    margin_per_lot: 46000
+    baseline_initial_capital_twd: 100000
+  MTX:
+    point_value: 50
+    tick_size: 1
+    broker_fee_per_side: 35
+    exchange_fee_per_side: 0
+    tax_rate: 0.00002
+    margin_per_lot: 120000
+    baseline_initial_capital_twd: 500000
+
+# ── Capital Policy (Section 7) ──
+capital:
+  policy: same_leverage
+  baseline_product: TMF
+  baseline_initial_capital_twd: 100000
+  max_margin_utilization: 0.40
+
+cooldown_bars: 5
+execution:
+  broker_fee_per_side: 10.0
+  exchange_fee_per_side: 0.0
+  initial_balance: 100000
+  limit_offset_pts: 2.0
+  margin_per_lot: 18000.0
+  market_slippage_pts: 1.0
+  order_type: MKP
+  range_protection_pts: 3.0
+  tax_rate: 2.0e-05
+  tick_size: 1.0
+  point_value: 10.0
+live_trading: false
+monitoring:
+  callback:
+    buffer_size: 100
+    health_check_secs: 60
+    use_tick_data: false
+  data_mode: hybrid
+  pb_confirmation_bars: 12
+  poll_interval_secs: 15
+  require_tx: true
+  use_order_manager: true
+skew:
+  filter_threshold: 0.7
+spread_gate:
+  enabled: true
+  night_only: true
+  max_age_minutes: 120
+  extreme_z: 2.0
+  stale_action: flat
+risk_mgmt:
+  atr_length: 14
+  atr_multiplier: 1.0
+  daily_loss_cap: 5000.0
+  break_even_pts: 100
+  exit_on_vwap: true
+  exit_vwap_confirm_bars: 2
+  ma_stop_length: 20
+  ma_stop_multiplier: 1.0
+  ma_stop_ticks: 10
+  ma_stop_type: below
+  skip_hours: []
+  stop_loss_pts: 50
+  time_filter_enabled: false
+  trailing_stop_distance_pts: 80
+  trailing_stop_enabled: true
+  trailing_stop_trigger_pts: 150
+  trend_hold_atr_mult: 2.5
+  trend_hold_enabled: true
+  trend_hold_min_price_vs_vwap: 0.0003
+  trend_hold_min_score: 40
+  trend_hold_min_time_to_close_mins: 20
+  trend_hold_min_trend_strength: 0.001
+strategy:
+  active_strategy: tmf_spread
+  auto_select: true
+  counter_mode:
+    atr_sl_mult: 2.0
+    auto_regime: true
+    confirm_bars: 7
+    enabled: true
+    exit_on_vwap: true
+    min_momentum: 15.0
+  entry_score: 13
+  length: 20
+  partial_exit:
+    enabled: true
+    tp1_lots: 1
+    tp1_pts: 100
+  psar_breakout:
+    atr_sl_mult: 2.0
+    min_adx: 5
+    sma_len: 20
+  regime_filter: low
+  spring_upthrust:
+    atr_mult: 2.0
+    bb_length: 20
+    bb_mult: 2.0
+    kc_length: 20
+    kc_mult: 1.0
+  strategy_list:
+  - counter_vwap
+  - spring_upthrust
+  - kbar_feature
+  - range_mean_reversion_v1
+  use_pullback: false
+  use_squeeze: true
+  volume_threshold: 0.001
+  weights:
+    15m: 0.4
+    1h: 0.2
+    5m: 0.4
+enrichment:
+  indicators:
+  - atr
+  - vwap
+  - linreg
+  - bbands
+  - rsi
+  bb_length: 20
+  bb_std: 2.0
+  rsi_length: 14
+squeeze_policy:
+  allow_fire_scout: true
+  fire_scout_size_multiplier: 0.25
+  fire_scout_min_mom_state: 3
+  fire_scout_requires_vwap: true
+  fire_scout_requires_bias: true
+  fire_scout_max_breakout_strength: 0.25
+  fire_scout_stop_atr_mult: 0.6
+  fire_scout_time_stop_bars: 6
+debug:
+  tickbar: true
+  feed: false # 2026-07-16 Gemini CLI: Disabled high-frequency feed logging to save CPU & temperature.
+mts:
+  enabled: false  # MTX is passive collection only — MTS runs on TMF monitor
+  strategy: tmf_spread
+  lots: 1
+  release_mode: triggered_market
+  mtf:
+    # 2026-07-14 Gemini CLI: MTF mode and freshness threshold configuration for ADR-009
+    mode: shadow
+    max_age_sec: 420
+  params:
+    min_atr: 10.0
+    atr_multiplier_stop: 2.1
+    atr_multiplier_trail: 1.1
+    release_stop_points: 200
+    trail_distance_points: 30
+    atr_cap: 250.0
+    confirm_ticks: 2
+    confirm_ms: 800
+    max_quote_age_ms: 2000
+    vwap_exit:
+      enabled: true
+      tighten_ratio: 0.3
+    max_spread_width: 3
+    entry_z:
+      low_atr: 2.0
+      normal_atr: 2.5
+      high_atr: 3.0
+    atr_low_threshold: 15.0
+    atr_high_threshold: 30.0
+    release_filter:
+      bb_enabled: true
+      bb_period: 20
+      bb_std_mult: 2.0
+      sell_within_bb_upper: 0.1
+      buy_within_bb_lower: 0.1
+      emergency_bypass_enabled: true
+      emergency_bypass_mult: 2.0
+    mfe_tighten:
+      enabled: true
+      level_1_atr: 2.0
+      level_1_trail_mult: 1.6
+      level_2_atr: 3.0
+      level_2_trail_mult: 1.2
+    post_release:
+      breakeven_after_atr: 1.0
+      force_lock_after_atr: 3.0
+  paper:
+    allow_synthetic_price: true
+    synthetic_near_price: 41000.0
+    synthetic_far_price: 41100.0
+debug_gate_bypass:
+  enabled: true
+  paper_only: true
+  disable_entry_score_gate: true
+  disable_volume_gate: true
+trade_mgmt:
+  allow_long: true
+  allow_short: true
+  force_close_at_end: true
+  lots_per_trade: 1
+  max_positions: 4
