@@ -101,6 +101,27 @@ class ShadowSoakManifest:
         manifest_hash = hashlib.sha256(json.dumps(data_without_hash, sort_keys=True).encode("utf-8")).hexdigest()
         
         data["manifest_hash"] = manifest_hash
+        object.__setattr__(self, "manifest_hash", manifest_hash)
         json_str = json.dumps(data, indent=2, ensure_ascii=False)
         path.write_text(json_str, encoding="utf-8")
         return json_str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ShadowSoakManifest":
+        """Reconstruct ShadowSoakManifest dataclass instance from dictionary."""
+        d = dict(data)
+        d.pop("soak_status", None)
+
+        if "evaluation_accounting" in d and isinstance(d["evaluation_accounting"], dict):
+            d["evaluation_accounting"] = EvaluationAccountingSummary(**d["evaluation_accounting"])
+
+        if "delivery_accounting" in d and isinstance(d["delivery_accounting"], dict):
+            d["delivery_accounting"] = TelemetryDeliveryAccountingSummary(**d["delivery_accounting"])
+
+        if "coverage" in d and isinstance(d["coverage"], dict):
+            d["coverage"] = CoverageMetrics(**d["coverage"])
+
+        if "performance" in d and isinstance(d["performance"], dict):
+            d["performance"] = PerformanceMetrics(**d["performance"])
+
+        return cls(**d)
