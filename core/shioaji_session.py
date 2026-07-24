@@ -40,6 +40,9 @@ def _system_status_path() -> Path:
 
 def get_api() -> sj.Shioaji:
     """Get or create the singleton Shioaji API instance."""
+    from core.deployment_role_gate import assert_broker_access_allowed
+    assert_broker_access_allowed()
+
     global _api
     with _lock:
         if _api is None:

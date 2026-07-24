@@ -1,5 +1,33 @@
 ticker: TMF
 active_strategy: tmf_spread
+
+# ── Product Registry (Section 6.1) ──
+# All monetary values in TWD.
+products:
+  TMF:
+    point_value: 10
+    tick_size: 1
+    broker_fee_per_side: 22
+    exchange_fee_per_side: 0
+    tax_rate: 0.00002
+    margin_per_lot: 46000
+    baseline_initial_capital_twd: 100000
+  MTX:
+    point_value: 50
+    tick_size: 1
+    broker_fee_per_side: 35
+    exchange_fee_per_side: 0
+    tax_rate: 0.00002
+    margin_per_lot: 120000
+    baseline_initial_capital_twd: 500000
+
+# ── Capital Policy (Section 7) ──
+capital:
+  policy: same_leverage
+  baseline_product: TMF
+  baseline_initial_capital_twd: 100000
+  max_margin_utilization: 0.40
+
 cooldown_bars: 5
 execution:
   broker_fee_per_side: 10.0

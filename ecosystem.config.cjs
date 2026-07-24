@@ -4,7 +4,7 @@ module.exports = {
       name: "trading-system",
       cwd: "/Users/myllin_mini/Documents/mylin102/tw-trading-unified",
       script: "/Users/myllin_mini/Documents/mylin102/tw-trading-unified/.venv/bin/python",
-      args: "main.py",
+      args: "main.py --config futures,futures_mtx",
       interpreter: "none",
       autorestart: true,
       restart_delay: 5000,
@@ -28,6 +28,8 @@ module.exports = {
       restart_delay: 3000,
       max_restarts: 10,
       min_uptime: "20s",
+      kill_timeout: 15000,
+      env_file: ".env",
       time: true,
       out_file: "logs/pm2-dashboard-out.log",
       error_file: "logs/pm2-dashboard-error.log"

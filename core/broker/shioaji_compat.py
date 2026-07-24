@@ -260,7 +260,8 @@ def safe_subscribe(api: sj.Shioaji, contract: Any, quote_type: str = 'tick'):
     if is_rust_version():
         # rshioaji 1.5.x
         if quote_type.lower() == 'tick':
-            api.subscribe(contract, quote_type='tick', version=sj.QuoteVersion.v1)
+            # 💡 Gemini CLI: Use sj.QuoteType.Tick enum instead of string 'tick' for rshioaji 1.5+ compatibility
+            api.subscribe(contract, quote_type=sj.QuoteType.Tick, version=sj.QuoteVersion.v1)
         else:
             api.subscribe(contract, quote_type=sj.QuoteType.BidAsk, version=sj.QuoteVersion.v1)
     else:

@@ -1,5 +1,5 @@
 # Core Dependencies
-shioaji
+shioaji==1.5.5
 pandas
 numpy
 scipy
@@ -21,3 +21,6 @@ pytest
 pytest-asyncio
 requests
 python-dateutil
+psutil
+pytz
+pandas-ta

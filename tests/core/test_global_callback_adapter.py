@@ -309,3 +309,24 @@ class TestBidAskRouting:
         # Must not raise
         adapter.on_bidask("TAIFEX", _MockBidAsk("MTXH6"))
         assert fallback.bidasks == []
+
+    # 💡 Gemini CLI: Test always_call_fallback functionality
+    def test_always_call_fallback_delivers_to_both_handler_and_fallback(self) -> None:
+        registry = MarketDataRegistry()
+        handler = _RouteSpy()
+        registry.bind_contract(
+            ContractIdentity("TAIFEX", "MTXH6"),
+            ContractRoute(handler=handler, leg="near"),
+        )
+        fallback = _FallbackSpy()
+        adapter = GlobalCallbackAdapter(
+            registry,
+            fallback.on_tick,
+            fallback.on_bidask,
+            always_call_fallback=True,
+        )
+        tick = _MockTick("MTXH6")
+        adapter.on_tick("TAIFEX", tick)
+
+        assert handler.ticks == [("near", tick)]
+        assert fallback.ticks == [("TAIFEX", tick)]

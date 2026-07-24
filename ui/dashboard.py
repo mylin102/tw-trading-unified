@@ -55,14 +55,15 @@ import subprocess
 import time
 from pathlib import Path
 from dotenv import load_dotenv
-# 2026-07-24 Gemini CLI: Native Streamlit autorefresh mechanism (replaces legacy third-party streamlit_autorefresh component)
-def safe_st_autorefresh(interval_ms: int, key: str) -> None:
+# 2026-07-24 Gemini CLI: Native Streamlit autorefresh mechanism supporting both interval and interval_ms kwargs
+def safe_st_autorefresh(interval_ms: int = 60000, key: str = "auto_refresh_timer", interval: int | None = None, **kwargs) -> None:
     """Native Streamlit autorefresh helper.
     
     Completely eliminates third-party streamlit_autorefresh React component dependency,
     avoiding network latency, proxy blocking, and iframe component loading failures.
     """
-    sec = max(1, interval_ms // 1000)
+    effective_interval = interval if interval is not None else interval_ms
+    sec = max(1, effective_interval // 1000)
     st.markdown(f'<meta http-equiv="refresh" content="{sec}">', unsafe_allow_html=True)
 
 st.set_page_config(page_title="Trading Unified", page_icon="📊", layout="wide")

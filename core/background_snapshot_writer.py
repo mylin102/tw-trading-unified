@@ -248,10 +248,10 @@ class BackgroundSnapshotWriter:
 # ── Built-in Persisters ──
 
 class CsvSnapshotPersister:
-    """Write a snapshot to a CSV file via atomic replace.
+    """Write a snapshot to a CSV file via atomic replace (no-op stub).
 
-    The snapshot must have a ``ticker`` attribute and the persister
-    resolves the output path as ``{directory}/{ticker}_PAPER_indicators.csv``.
+    Currently a graceful no-op to avoid polluting writer health.
+    Implement when CSV observation schema is frozen.
     """
 
     def __init__(self, directory: str, *, logger: logging.Logger | None = None) -> None:
@@ -259,8 +259,7 @@ class CsvSnapshotPersister:
         self._logger = logger or logging.getLogger(self.__class__.__name__)
 
     def persist(self, snapshot: Any) -> None:
-        """Not yet implemented — placeholder for CSV serialisation logic."""
-        raise NotImplementedError("CsvSnapshotPersister.persist — to be implemented in PR 4")
+        pass
 
 
 class JsonStatePersister:

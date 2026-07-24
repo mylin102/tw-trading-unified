@@ -11,7 +11,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 from core.broker.shioaji_compat import kbars_to_dataframe
 
@@ -34,15 +34,21 @@ def get_near_far_contracts(client, category="TMF"):
         return None, None
     
     try:
-        # Get all contracts for the category
-        contracts = list(client.api.Contracts.Futures[category])
+        # 💡 Gemini CLI: Use get_contracts_list helper for rshioaji 1.5+ contract resolution
+        from core.broker.shioaji_compat import get_contracts_list
+        contracts = get_contracts_list(client.api, "Futures", category)
         
-        # Filter out rolling contracts (R1, R2, etc.)
-        regular_contracts = [c for c in contracts if not c.code.endswith(('R1', 'R2', 'R3'))]
+        # Filter out None objects and rolling contracts (R1, R2, etc.)
+        regular_contracts = [c for c in contracts if c and hasattr(c, "code") and not c.code.endswith(('R1', 'R2', 'R3'))]
         
         # Filter valid contracts (delivery date >= today)
         today_str = datetime.now().strftime("%Y/%m/%d")
-        valid_contracts = [c for c in regular_contracts if c.delivery_date >= today_str]
+        valid_contracts = []
+        for c in regular_contracts:
+            d_val = getattr(c, "delivery_date", "")
+            d_str = d_val.strftime("%Y/%m/%d") if isinstance(d_val, (datetime, date)) else str(d_val).replace("-", "/")
+            if d_str >= today_str:
+                valid_contracts.append(c)
         
         if not valid_contracts:
             print(f"No valid regular contracts for {category}")

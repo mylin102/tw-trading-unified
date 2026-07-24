@@ -934,17 +934,19 @@ def run_system(dry_run=False, config_name="futures"):
             _tmf_tick_fn = tick_dispatcher(futures_mons, om, feed_health, tx_bar_builder)
             _tmf_bidask_fn = bidask_dispatcher(futures_mons, om, sk_engine)
 
-            # Install GlobalCallbackAdapter so MTX ticks are routed to passive collector
+            # Install GlobalCallbackAdapter so MTX ticks are routed to passive collector AND tick_dispatcher
             if _mtx_runtime is not None:
                 from core.global_callback_adapter import GlobalCallbackAdapter
+                # 💡 Gemini CLI: Set always_call_fallback=True so tick_dispatcher (TMF + MTX monitors) receives ticks alongside passive collector
                 _mtx_runtime.adapter = GlobalCallbackAdapter(
                     registry=_mtx_runtime.registry,
                     fallback_tick_handler=_tmf_tick_fn,
                     fallback_bidask_handler=_tmf_bidask_fn,
+                    always_call_fallback=True,
                 )
                 set_tick_callback(api, _mtx_runtime.adapter.on_tick)
                 set_bidask_callback(api, _mtx_runtime.adapter.on_bidask)
-                console.print("[green]✅ GlobalCallbackAdapter installed (TMF + MTX routing)[/green]")
+                console.print("[green]✅ GlobalCallbackAdapter installed (TMF + MTX routing with fallback dispatch)[/green]")
 
                 # Start MTX runtime (resolves contracts, binds routes, starts writer)
                 if _mtx_runtime.start():

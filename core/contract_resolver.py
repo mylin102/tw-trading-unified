@@ -12,6 +12,7 @@ Handles:
 import os
 import sys
 from datetime import datetime, timedelta
+from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 import pandas as pd
 
@@ -23,6 +24,37 @@ try:
     SHIOAJI_AVAILABLE = True
 except ImportError:
     SHIOAJI_AVAILABLE = False
+
+
+@dataclass(frozen=True)
+class ContractRef:
+    """Lightweight reference to a futures contract.
+
+    This is the canonical representation of a contract identity
+    used throughout the product-aware runtime.
+    """
+    code: str
+    product: str  # e.g. "TMF" or "MTX"
+    delivery_date: str  # "YYYY/MM/DD"
+    expiry: datetime
+
+
+@dataclass(frozen=True)
+class ContractPair:
+    """Near/far month contract pair for calendar spread trading.
+
+    Invariants:
+        pair.product == requested_product
+        pair.near.product == requested_product
+        pair.far.product == requested_product
+        pair.near.expiry < pair.far.expiry
+        pair.near.code != pair.far.code
+    """
+    product: str
+    near: ContractRef
+    far: ContractRef
+    resolved_for_trading_day: datetime
+    source: str  # e.g. "shioaji", "cache", "fallback"
 
 
 class ContractResolver:
@@ -155,7 +187,49 @@ class ContractResolver:
         print(f"Far contract: {far_contract.code} (delivery: {far_contract.delivery_date})")
         
         return near_contract, far_contract
-    
+
+    def to_contract_pair(
+        self,
+        product: str,
+        near: Any,
+        far: Any,
+        resolved_for_trading_day: Optional[datetime] = None,
+    ) -> ContractPair:
+        """Build a ContractPair from raw Shioaji contract objects.
+
+        Args:
+            product: Product code (TMF, MTX, etc.)
+            near: Near-month Shioaji contract object.
+            far: Far-month Shioaji contract object.
+            resolved_for_trading_day: Optional trading day override.
+
+        Returns:
+            A validated ContractPair.
+        """
+        def _make_ref(code: str, c: Any) -> ContractRef:
+            raw_date = getattr(c, "delivery_date", "")
+            expiry = datetime.strptime(raw_date, "%Y/%m/%d") if raw_date else datetime.max
+            return ContractRef(
+                code=code,
+                product=product,
+                delivery_date=raw_date,
+                expiry=expiry,
+            )
+
+        near_ref = _make_ref(near.code, near)
+        far_ref = _make_ref(far.code, far)
+
+        if resolved_for_trading_day is None:
+            resolved_for_trading_day = datetime.now()
+
+        return ContractPair(
+            product=product,
+            near=near_ref,
+            far=far_ref,
+            resolved_for_trading_day=resolved_for_trading_day,
+            source="shioaji",
+        )
+
     def get_contract_info(self, contract: Any) -> Dict[str, Any]:
         """
         Get detailed information about a contract.

@@ -65,6 +65,7 @@ class HealthEvidenceSampler:
         *,
         product_code: str = "MXF",
         output_dir: str = "exports/market_data",
+        run_id: str | None = None,
         interval_sec: float = 30.0,
         git_commit: str | None = None,
         logger: logging.Logger | None = None,
@@ -72,15 +73,18 @@ class HealthEvidenceSampler:
     ) -> None:
         self._health_fn = health_fn
         self._product = product_code
-        self._output_dir = output_dir
         self._interval = interval_sec
         self._git_commit = git_commit or _detect_git_commit()
         self._logger = logger or logging.getLogger(self.__class__.__name__)
         self._clock = clock or time.time
 
-        # Output path
+        # Output path with optional run subdirectory
+        if run_id:
+            self._output_dir = os.path.join(output_dir, "soak", run_id)
+        else:
+            self._output_dir = output_dir
         self._output_path = os.path.join(
-            output_dir, f"{product_code.lower()}_runtime_health.jsonl",
+            self._output_dir, f"{product_code.lower()}_runtime_health.jsonl",
         )
 
         # Threading

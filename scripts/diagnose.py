@@ -15,8 +15,18 @@ import sys
 import time
 import subprocess
 import traceback
-import yaml
 from pathlib import Path
+try:
+    import yaml
+except ModuleNotFoundError:
+    # Try venv site-packages
+    _venv = Path(__file__).resolve().parent.parent / ".venv"
+    _site = sorted((_venv / "lib").glob("python*/site-packages"))
+    if _site:
+        sys.path.insert(0, str(_site[-1]))
+        import yaml
+    else:
+        raise
 from datetime import datetime
 
 ROOT = Path(__file__).resolve().parent.parent

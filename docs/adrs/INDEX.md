@@ -157,6 +157,7 @@ ADR-009  ADR-010  ADR-011
 
 ### State (consistency, invariants)
 - ADR-013 — Ghost Position Race Condition
+- ADR-022 — Multi-Monitor State Isolation & Identity Defense
 
 ### Governance (testing, research process)
 - ADR-004 — Test Leakage Prevention

@@ -73,6 +73,10 @@ class MtfSnapshot:
 
 
 
+import threading
+_thread_local = threading.local()
+
+
 def _mts_position_state_path() -> Path:
     """Return the MTS position state file path.
 
@@ -80,6 +84,9 @@ def _mts_position_state_path() -> Path:
     alternate deployments), falling back to the module-level constant.
     Tests can monkeypatch MTS_POSITION_STATE_PATH to redirect.
     """
+    # 2026-07-21 Gemini CLI: Support thread-local path override for multi-instance concurrent processes
+    if getattr(_thread_local, "state_path", None) is not None:
+        return Path(_thread_local.state_path)
     # 2026-07-08 Gemini CLI: Allow test injection but fall back to test path to avoid leaking to production /tmp/mts_position_state.json
     import sys
     import os
@@ -146,6 +153,12 @@ class FuturesMonitor:
         self.cfg = self._load_config(config_path)
         # 2026-05-27 Gemini CLI: Generalize ticker initialization (no hardcoded default)
         self.ticker = self.cfg.get("ticker", "UNKNOWN")
+        # 2026-07-21 Gemini CLI: Determine state path based on ticker name for multi-instance isolation
+        _base_name = self.ticker.lower()
+        if _base_name == "tmf":
+            self._state_path = Path("/tmp/mts_position_state.json")
+        else:
+            self._state_path = Path(f"/tmp/mts_position_state_{_base_name}.json")
         self.contract = None
         self.far_contract = None  # Far-month contract for dual chart
         self._running = False
@@ -239,7 +252,16 @@ class FuturesMonitor:
         self._runtime_status = None
         self._manual_trade_status = "READY"  # [GSD] Track manual trade state (READY, PROCESSING, FILLED, FAILED)
         # 2026-06-26 Gemini CLI: Initialize dynamic flag path from environment variable
-        self.manual_trade_flag_path = os.environ.get("FUTURES_MANUAL_TRADE_FLAG_PATH", "/tmp/futures_manual_trade.flag")
+        # 2026-07-21 Gemini CLI: Use ticker-specific manual trade flag path for multi-instance separation
+        _env_flag = os.environ.get("FUTURES_MANUAL_TRADE_FLAG_PATH")
+        if _env_flag:
+            self.manual_trade_flag_path = _env_flag
+        else:
+            _base_name = self.ticker.lower()
+            if _base_name == "tmf":
+                self.manual_trade_flag_path = "/tmp/futures_manual_trade.flag"
+            else:
+                self.manual_trade_flag_path = f"/tmp/futures_manual_trade_{_base_name}.flag"
         # 2026-06-05 JVS Claw: NO_LIVE_TICK fix — atomic flag lifecycle + idempotency
         self._processed_flag_ids: set = set()   # C2: idempotency set (in-memory, reset on restart)
         self._flag_retry_count: int = 0         # C7: retry counter (in-memory)
@@ -713,9 +735,20 @@ class FuturesMonitor:
         except Exception as e:
             console.print(f"[dim][FuturesMonitor] Warm-up failed: {e}[/dim]")
 
-        # 獲取TMF合約
+    def _resolve_contracts(self):
+        """[Safe Mode] Get front/far month contracts to prevent deadlock during login."""
+        # 💡 Gemini CLI: Import datetime and date at top of function to prevent UnboundLocalError in warm-up block
+        from datetime import datetime, date
         try:
-            target_symbol = str(self.ticker)
+            self._warmup_from_local_storage()
+        except Exception as e:
+            console.print(f"[dim][FuturesMonitor] Warm-up failed: {e}[/dim]")
+
+        # 獲取TMF/MTX合約
+        # 💡 Gemini CLI: Added symbol mapping (MTX -> MXF) and type-safe delivery_date handling (datetime.date vs str)
+        try:
+            raw_symbol = str(self.ticker)
+            target_symbol = "MXF" if raw_symbol.upper() == "MTX" else raw_symbol
             print(f"[FuturesMonitor] Getting {target_symbol} contracts (Safe Mode)...")
             
             # [rshioaji 1.5.10 Workaround] Use robust list helper to avoid C++ binding crash
@@ -732,18 +765,36 @@ class FuturesMonitor:
                 
                 valid_contracts = []
                 for c in tmf_list:
-                    # Shioaji delivery_date format: "YYYY/MM/DD"
-                    if c.delivery_date > now_str:
+                    # 💡 Gemini CLI: Filter out None and invalid contract objects returned from Shioaji get_contracts_list
+                    if c is None or not hasattr(c, "code"):
+                        continue
+                    d_val = getattr(c, "delivery_date", "")
+                    if not d_val:
+                        continue
+                    if isinstance(d_val, (date, datetime)):
+                        d_str = d_val.strftime("%Y/%m/%d")
+                    else:
+                        d_str = str(d_val).replace("-", "/")
+                    
+                    if d_str > now_str:
                         valid_contracts.append(c)
-                    elif c.delivery_date == now_str:
+                    elif d_str == now_str:
                         # If today is settlement day, only use it if before 13:30
                         if now < settlement_time:
                             valid_contracts.append(c)
                         else:
-                            console.print(f" [yellow][FuturesMonitor] Settlement day detected ({now_str}), skipping expired contract {c.code} after 13:30[/yellow] ")
+                            console.print(f" [yellow][FuturesMonitor] Settlement day detected ({now_str}), skipping expired contract {getattr(c, 'code', '?')} after 13:30[/yellow] ")
                 
                 # Sort by delivery date (ascending)
-                tmf_sorted = sorted(valid_contracts, key=lambda c: c.delivery_date)
+                def _get_deliv_str(c):
+                    if c is None:
+                        return ""
+                    d = getattr(c, "delivery_date", "")
+                    if isinstance(d, (date, datetime)):
+                        return d.strftime("%Y/%m/%d")
+                    return str(d).replace("-", "/")
+
+                tmf_sorted = sorted(valid_contracts, key=_get_deliv_str)
                 
                 if tmf_sorted:
                     # Pick the first one (nearest delivery)
@@ -756,7 +807,7 @@ class FuturesMonitor:
                         pass
                 else:
                     # Fallback to absolute nearest if no valid ones found (shouldn't happen in live)
-                    self.contract = sorted(tmf_list, key=lambda c: c.delivery_date)[0]
+                    self.contract = sorted(tmf_list, key=_get_deliv_str)[0]
                     console.print(f" [yellow][FuturesMonitor] No future delivery found, using absolute nearest: {self.contract.code}[/yellow] ")
                 
                 # Log all available codes for verification
@@ -4544,6 +4595,8 @@ class FuturesMonitor:
             pass
 
     def run(self):
+        # 2026-07-21 Gemini CLI: Bind thread-local state path for the background thread
+        _thread_local.state_path = getattr(self, "_state_path", None)
         self._running = True
         mode = "dry-run" if self.dry_run else ("LIVE" if self.live_trading else "PAPER")
 
@@ -5233,8 +5286,12 @@ class FuturesMonitor:
                 f"Resetting to FLAT.[/bold yellow]"
             )
             strategy = self._registry.get(self.cfg.get("mts", {}).get("strategy", "tmf_spread"))
-            if strategy and hasattr(strategy, '_mts_recovery_state'):
-                strategy._mts_recovery_state = "FLAT_CONFIRMED"
+            if strategy:
+                if hasattr(strategy, '_mts_recovery_state'):
+                    strategy._mts_recovery_state = "FLAT_CONFIRMED"
+                # 2026-07-21 Gemini CLI: Reset strategy state and trigger reentry cooldown to prevent immediate trading after split-brain recovery
+                if hasattr(strategy, '_reset'):
+                    strategy._reset(reason="MTS_SPLIT_BRAIN_RESET")
             _state_has_pos = False
             _fills_open = False
 
@@ -5465,18 +5522,46 @@ class FuturesMonitor:
         _broker_pos = getattr(self.trader, "position", 0)
         _has_pos = bool(getattr(strategy, "_has_position", False))
         _lc = getattr(strategy, "_lifecycle_oca", None)
+        
+        # 2026-07-21 Gemini CLI: Prevent broker position reconciliation race condition immediately after exit
+        _last_exit = getattr(strategy, "_last_exit_ts", None)
+        _in_cooldown = False
+        if _last_exit:
+            if (datetime.now() - _last_exit).total_seconds() < 10:
+                _in_cooldown = True
+
         if (
             not _has_pos
             and _broker_pos != 0
+            and not _in_cooldown
             and _lc is not None
             and hasattr(_lc, 'phase')
             and str(_lc.phase.value) == "FLAT"
             and getattr(strategy, "_ticker", "").startswith("TMF")
+            # 2026-07-22 Gemini CLI: Only recover if the local fills ledger indicates there is an active trade
+            and self._mts_has_open_position_from_fills()
         ):
             from strategies.plugins.futures.active.tmf_spread import (
                 PositionPhase, infer_lifecycle_from_legacy_state,
                 _write_mts_state, lifecycle_to_dict,
             )
+            # 2026-07-21 Gemini CLI: Load entry prices, sides, trade_id from the state file on disk
+            # to prevent entry prices from remaining 0.0 in memory after recovery.
+            _disk = {}
+            _state_path = _mts_position_state_path()
+            if _state_path.exists():
+                try:
+                    _disk = json.loads(_state_path.read_text())
+                except Exception:
+                    pass
+
+            strategy._near_entry = float(_disk.get("near_entry") or getattr(strategy, "_near_entry", 0) or 0.0)
+            strategy._far_entry = float(_disk.get("far_entry") or getattr(strategy, "_far_entry", 0) or 0.0)
+            strategy._near_side = _disk.get("near_side") or getattr(strategy, "_near_side", None)
+            strategy._far_side = _disk.get("far_side") or getattr(strategy, "_far_side", None)
+            strategy._released_leg = _disk.get("released_leg") or getattr(strategy, "_released_leg", None)
+            strategy._trade_id = _disk.get("trade_id") or getattr(strategy, "_trade_id", None)
+
             strategy._has_position = True
             strategy._lifecycle = "RECOVERED_BROKER"
             _legacy_hint = {
@@ -5488,12 +5573,12 @@ class FuturesMonitor:
             _write_mts_state(
                 has_position=True, action="BROKER_RECONCILED",
                 reason="broker_position_recovery",
-                near_entry=getattr(strategy, "_near_entry", 0),
-                far_entry=getattr(strategy, "_far_entry", 0),
-                near_side=getattr(strategy, "_near_side", None),
-                far_side=getattr(strategy, "_far_side", None),
-                released_leg=getattr(strategy, "_released_leg", None),
-                trade_id=getattr(strategy, "_trade_id", None),
+                near_entry=strategy._near_entry,
+                far_entry=strategy._far_entry,
+                near_side=strategy._near_side,
+                far_side=strategy._far_side,
+                released_leg=strategy._released_leg,
+                trade_id=strategy._trade_id,
                 ticker=self.ticker,
                 atr=0.0,
                 lifecycle=lifecycle_to_dict(strategy._lifecycle_oca),
@@ -5551,8 +5636,19 @@ class FuturesMonitor:
         try:
             if _state_path.exists():
                 _disk = json.loads(_state_path.read_text())
-                _authority_has_pos = bool(_disk.get("has_position", False))
-                _lc_authority = _disk.get("lifecycle", {})
+                # 💡 Gemini CLI: State identity validation — fail-closed on mismatch (block entry, preserve position, require reconciliation)
+                _disk_ticker = _disk.get("ticker")
+                if _disk_ticker and str(_disk_ticker).upper() != str(self.ticker).upper():
+                    console.print(
+                        f"[bold red]⛔ [POSITION_AUTHORITY_MISMATCH] State file ticker ({_disk_ticker}) "
+                        f"mismatches monitor ticker ({self.ticker}) — fail-closed: blocking new entries[/bold red]"
+                    )
+                    self._mts_entry_blocked = True
+                    self._mts_reconciliation_pending = True
+                    _authority_has_pos = True  # Prevent erroneous force-reset of in-memory position
+                else:
+                    _authority_has_pos = bool(_disk.get("has_position", False))
+                    _lc_authority = _disk.get("lifecycle", {})
         except Exception:
             pass
 

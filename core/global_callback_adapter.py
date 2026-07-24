@@ -67,11 +67,13 @@ class GlobalCallbackAdapter:
         fallback_tick_handler: Callable[..., None],
         fallback_bidask_handler: Callable[..., None] | None = None,
         *,
+        always_call_fallback: bool = False,
         logger: logging.Logger | None = None,
     ) -> None:
         self._registry = registry
         self._fallback_tick = fallback_tick_handler
         self._fallback_bidask = fallback_bidask_handler or fallback_tick_handler
+        self._always_call_fallback = always_call_fallback  # 💡 Gemini CLI: allow fallback tick_dispatcher to receive routed ticks
         self._logger = logger or logging.getLogger(self.__class__.__name__)
         self._callback_error_count: int = 0
 
@@ -80,15 +82,24 @@ class GlobalCallbackAdapter:
         """Cumulative count of caught routed-handler exceptions."""
         return self._callback_error_count
 
-    def on_tick(self, exchange: object, tick: Any) -> None:
+    # 💡 Gemini CLI: Accept *args to support both 1-arg (rshioaji 1.5+) and 2-arg (legacy) callback signatures
+    def on_tick(self, *args) -> None:
         """Dispatch a single tick.
 
         1. Exact contract lookup → routed handler.
-        2. Not found → fallback to existing TMF callback.
-
-        Routed handler exceptions are caught and logged; the fallback
-        path is NOT attempted when routing succeeds, even on failure.
+        2. Not found or always_call_fallback=True → fallback to existing TMF callback.
         """
+        if len(args) == 1:
+            tick = args[0]
+            exchange = getattr(tick, "exchange", "TFE")
+        elif len(args) >= 2:
+            exchange, tick = args[0], args[1]
+        else:
+            return
+
+        if tick is None or not hasattr(tick, "code"):
+            return
+
         ex = normalize_exchange(exchange)
         code = normalize_contract_code(tick.code)
         route = self._registry.lookup(ex, code)
@@ -103,12 +114,26 @@ class GlobalCallbackAdapter:
                     "fallback skipped to prevent double delivery",
                     exchange, tick.code, route.leg,
                 )
+            # 💡 Gemini CLI: If always_call_fallback is False, return early; otherwise also deliver to fallback handler
+            if not self._always_call_fallback:
+                return
+
+        self._fallback_tick(*args)
+
+    # 💡 Gemini CLI: Accept *args to support both 1-arg (rshioaji 1.5+) and 2-arg (legacy) callback signatures
+    def on_bidask(self, *args) -> None:
+        """Dispatch a single bidask update.  Same delegation logic as on_tick."""
+        if len(args) == 1:
+            bidask = args[0]
+            exchange = getattr(bidask, "exchange", "TFE")
+        elif len(args) >= 2:
+            exchange, bidask = args[0], args[1]
+        else:
             return
 
-        self._fallback_tick(exchange, tick)
+        if bidask is None or not hasattr(bidask, "code"):
+            return
 
-    def on_bidask(self, exchange: object, bidask: Any) -> None:
-        """Dispatch a single bidask update.  Same delegation logic as on_tick."""
         ex = normalize_exchange(exchange)
         code = normalize_contract_code(bidask.code)
         route = self._registry.lookup(ex, code)
@@ -123,6 +148,8 @@ class GlobalCallbackAdapter:
                     "fallback skipped",
                     exchange, bidask.code, route.leg,
                 )
-            return
+            # 💡 Gemini CLI: If always_call_fallback is False, return early; otherwise also deliver to fallback handler
+            if not self._always_call_fallback:
+                return
 
-        self._fallback_bidask(exchange, bidask)
+        self._fallback_bidask(*args)

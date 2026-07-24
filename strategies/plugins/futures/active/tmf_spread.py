@@ -294,7 +294,17 @@ _TRAIL_DISTANCE_PTS = 30  # remaining leg trailing stop distance (pt)
 import sys
 _default_state_path = "/tmp/test_mts_position_state.json" if ("pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ) else "/tmp/mts_position_state.json"
 _MTS_STATE_FILE = os.getenv("MTS_STATE_PATH", _default_state_path)
-# 2026-06-25 Gemini CLI / Hermes Agent: environmental isolation for MTS fill and event logs
+
+# 💡 Gemini CLI: Dynamic state file path supporting thread-local overrides for multi-instance monitors
+def _get_state_file_path() -> Path:
+    from pathlib import Path
+    if "pytest" in sys.modules and _MTS_STATE_FILE != _default_state_path and _MTS_STATE_FILE != os.getenv("MTS_STATE_PATH"):
+        return Path(_MTS_STATE_FILE)
+    try:
+        from strategies.futures.monitor import _mts_position_state_path
+        return _mts_position_state_path()
+    except Exception:
+        return Path(os.getenv("MTS_STATE_PATH", _default_state_path))
 _MTS_EVENT_LOG = os.getenv("MTS_EVENT_LOG_PATH", "logs/mts_spread_events.jsonl")
 _MTS_FILL_LOG = os.getenv("MTS_FILL_LOG_PATH", "logs/mts_trade_fills.jsonl")
 
@@ -494,11 +504,13 @@ def _write_mts_state(
     if os.getenv("MTS_BACKTEST") == "1":
         return
     try:
+        # 💡 Gemini CLI: Dynamic state file resolution for multi-instance monitors (TMF vs MTX)
+        _target_state_file = _get_state_file_path()
         # 1. Load existing state to preserve immutable fields if they exist
         existing = {}
-        if os.path.exists(_MTS_STATE_FILE):
+        if os.path.exists(_target_state_file):
             try:
-                with open(_MTS_STATE_FILE, "r") as _f:
+                with open(_target_state_file, "r") as _f:
                     existing = json.load(_f)
             except:
                 pass
@@ -606,6 +618,8 @@ def _write_mts_state(
             "has_position": has_position,
             "state": action,
             "reason": reason,
+            "ticker": ticker,
+            "monitor_id": f"futures_{ticker.lower()}",
             "manual_trade_status": existing.get("manual_trade_status"),
             "entry_spread_z": round(spread_z, 2) if (spread_z is not None and spread_z != 0) else existing.get("entry_spread_z"),
             "current_spread_z": existing.get("current_spread_z"),
@@ -664,14 +678,14 @@ def _write_mts_state(
         state["schema_version"] = 3
 
         import random
-        _tmp_file = f"{_MTS_STATE_FILE}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
+        _tmp_file = f"{_target_state_file}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
         try:
             with open(_tmp_file, "w") as f:
                 json.dump(state, f, default=str)
-            # CAS: verify expected revision before replacing
-            if os.path.exists(_MTS_STATE_FILE):
+            # 💡 Gemini CLI: CAS check against dynamic target state file
+            if os.path.exists(_target_state_file):
                 try:
-                    with open(_MTS_STATE_FILE) as _f_current:
+                    with open(_target_state_file) as _f_current:
                         _current_on_disk = json.load(_f_current)
                     _disk_revision = _current_on_disk.get("state_revision", 0)
                     if _disk_revision != _expected_revision:
@@ -683,13 +697,13 @@ def _write_mts_state(
                         return
                 except Exception:
                     pass  # if we can't read disk, proceed with replace
-            os.replace(_tmp_file, _MTS_STATE_FILE)
+            os.replace(_tmp_file, _target_state_file)
         except Exception as e:
             if os.path.exists(_tmp_file): os.remove(_tmp_file)
             raise e
 
     except Exception:
-        logger.exception("[MTS_STATE_WRITE_FAILED] file=%s reason=%s", _MTS_STATE_FILE, reason)
+        logger.exception("[MTS_STATE_WRITE_FAILED] file=%s reason=%s", _target_state_file, reason)
 
 
 def _write_mts_telemetry(
@@ -728,10 +742,12 @@ def _write_mts_telemetry(
     if os.getenv("MTS_BACKTEST") == "1":
         return
     try:
+        # 💡 Gemini CLI: Dynamic state file resolution for multi-instance monitors (TMF vs MTX)
+        _target_state_file = _get_state_file_path()
         existing = {}
-        if os.path.exists(_MTS_STATE_FILE):
+        if os.path.exists(_target_state_file):
             try:
-                with open(_MTS_STATE_FILE) as _f:
+                with open(_target_state_file) as _f:
                     existing = json.load(_f)
             except Exception:
                 pass
@@ -775,10 +791,10 @@ def _write_mts_telemetry(
                 telemetry[_key] = existing[_key]
 
         import random
-        _tmp = f"{_MTS_STATE_FILE}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
+        _tmp = f"{_target_state_file}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
         with open(_tmp, "w") as f:
             json.dump(telemetry, f, default=str)
-        os.replace(_tmp, _MTS_STATE_FILE)
+        os.replace(_tmp, _target_state_file)
     except Exception:
         logger.exception("[MTS_TELEMETRY_WRITE_FAILED]")
 
@@ -863,6 +879,13 @@ class TMFSpread(StrategyBase):
         self._last_skip_ts: datetime | None = None  # throttle SKIP events
         self._last_atr: float | None = None
 
+        # 2026-07-23 Gemini CLI: Work Package A & B - Lifecycle provenance & separated risk modes
+        self._risk_mode_at_entry: str = ""
+        self._risk_mode_at_release: str = ""
+        self._risk_mode_at_single_leg: str = ""
+        self._risk_mode_at_exit: str = ""
+        self._risk_mode_transitions: list[dict] = []
+
         # 2026-06-26 Gemini CLI: tick confirmation and quote age
         self._confirm_ticks = int(_params.get("confirm_ticks", 2))
         self._confirm_ms = float(_params.get("confirm_ms", 800.0))
@@ -919,6 +942,12 @@ class TMFSpread(StrategyBase):
         # 2026-07-14 Gemini CLI: Instantiate decoupled risk engines under ADR-009 Phase 2
         self._release_risk_engine = ReleaseRiskEngine()
         self._single_leg_risk_engine = SingleLegRiskEngine()
+
+        # 💡 Gemini CLI: Perform immediate position state recovery on startup (zero-wait before first 5m bar)
+        try:
+            self._restore_position_state()
+        except Exception as e:
+            logger.warning("[MTS_STARTUP_RECOVERY_ERR] Failed to restore position on startup: %s", e)
 
         # 2026-07-14 Gemini CLI: Initialize MTF shadow tracking variables for counterfactual logging
         self._shadow_exit_triggered = False
@@ -1314,26 +1343,27 @@ class TMFSpread(StrategyBase):
                 atr = min(atr, self._atr_cap)
                 
         has_atr = atr and not pd.isna(atr) and atr > 0
-        risk_mode = "ATR_DYNAMIC" if has_atr else "FIXED_FALLBACK"
         
         atr_val = round(float(atr), 2) if has_atr else 0.0
         stop_mult = self._atr_mult_stop if has_atr else 0.0
         trail_mult = self._atr_mult_trail if has_atr else 0.0
         
-        # 2026-07-03 Hermes Agent: when multiplier is 0, force fixed fallback
-        # (otherwise atr * 0 = 0, making thresholds useless)
-        if has_atr and (stop_mult <= 0 or trail_mult <= 0):
-            risk_mode = "FIXED_FALLBACK"
-            has_atr = False
+        # 2026-07-23 Gemini CLI: Work Package B - Separated Risk Modes for release stop vs trailing stop
+        has_release_atr = has_atr and stop_mult > 0
+        has_trail_atr = has_atr and trail_mult > 0
         
-        release_stop = round(atr_val * stop_mult, 2) if has_atr else self._release_stop_fixed
-        trail_dist = round(atr_val * trail_mult, 2) if has_atr else self._trail_dist_fixed
+        release_stop_mode = "ATR_DYNAMIC" if has_release_atr else "FIXED_FALLBACK"
+        trail_distance_mode = "ATR_DYNAMIC" if has_trail_atr else "FIXED_FALLBACK"
+        risk_mode = "ATR_DYNAMIC" if (has_release_atr and has_trail_atr) else "FIXED_FALLBACK"
+        
+        release_stop = round(atr_val * stop_mult, 2) if has_release_atr else self._release_stop_fixed
+        trail_dist = round(atr_val * trail_mult, 2) if has_trail_atr else self._trail_dist_fixed
         
         release_stop_floor = 10.0
         trail_dist_floor = 60.0  # 2026-07-07: 20→60, ~0.82 ATR for TMF night (~73 pt)
         
-        final_release_stop = max(release_stop_floor, release_stop) if has_atr else release_stop
-        final_trail_dist = max(trail_dist_floor, trail_dist) if has_atr else trail_dist
+        final_release_stop = max(release_stop_floor, release_stop) if has_release_atr else release_stop
+        final_trail_dist = max(trail_dist_floor, trail_dist) if has_trail_atr else trail_dist
         
         # 2026-06-26 Gemini CLI: retrieve quote age in ms safely
         near_age = bar.get("near_tick_age_ms", bar.get("near_age_ms", -1))
@@ -1342,8 +1372,17 @@ class TMFSpread(StrategyBase):
         
         confirm_ticks = bar.get("confirm_ticks", 2)
         
+        # 2026-07-23 Gemini CLI: Work Package A & B - Instrumentation & Provenance Metadata
+        peak_or_nadir = None
+        if self._side == "LONG" and hasattr(self, "_peak") and self._peak > 0:
+            peak_or_nadir = round(float(self._peak), 2)
+        elif self._side == "SHORT" and hasattr(self, "_nadir") and self._nadir > 0:
+            peak_or_nadir = round(float(self._nadir), 2)
+
         return {
             "risk_mode": risk_mode,
+            "release_stop_mode": release_stop_mode,
+            "trail_distance_mode": trail_distance_mode,
             "session": _session_label(),
             "atr": atr_val,
             "stop_mult": stop_mult,
@@ -1354,8 +1393,15 @@ class TMFSpread(StrategyBase):
             "trail_dist_floor": trail_dist_floor,
             "final_release_stop": final_release_stop,
             "final_trail_dist": final_trail_dist,
+            "effective_trail_dist": final_trail_dist,
             "quote_age_ms": round(float(quote_age_ms), 1),
             "confirm_ticks": int(confirm_ticks),
+            "single_leg_peak_or_nadir": peak_or_nadir,
+            "risk_mode_at_entry": getattr(self, "_risk_mode_at_entry", ""),
+            "risk_mode_at_release": getattr(self, "_risk_mode_at_release", ""),
+            "risk_mode_at_single_leg": getattr(self, "_risk_mode_at_single_leg", ""),
+            "risk_mode_at_exit": getattr(self, "_risk_mode_at_exit", ""),
+            "risk_mode_transition_count": len(getattr(self, "_risk_mode_transitions", [])),
             # 2026-07-16 Gemini CLI: Record indicators for generate_daily_report.py
             "vwap": bar.get("vwap"),
             "near_vwap": bar.get("near_vwap"),
@@ -1594,19 +1640,21 @@ class TMFSpread(StrategyBase):
     def _read_mts_state() -> dict | None:
         """Read and return MTS position state from JSON file, or None."""
         try:
-            if not os.path.exists(_MTS_STATE_FILE):
+            # 💡 Gemini CLI: Dynamic state file resolution for multi-instance monitors
+            _state_file = _get_state_file_path()
+            if not os.path.exists(_state_file):
                 return None
             # [Fix] Handle empty file case to avoid JSONDecodeError
-            if os.path.getsize(_MTS_STATE_FILE) == 0:
+            if os.path.getsize(_state_file) == 0:
                 return None
-            with open(_MTS_STATE_FILE) as f:
+            with open(_state_file) as f:
                 return json.load(f)
         except (json.JSONDecodeError, ValueError, OSError):
             # Log as warning instead of exception to reduce noise in backtest
-            logger.warning("[MTS_STATE_READ_FAILED] file=%s", _MTS_STATE_FILE)
+            logger.warning("[MTS_STATE_READ_FAILED] file=%s", _get_state_file_path())
             return None
         except Exception:
-            logger.exception("[MTS_STATE_READ_UNEXPECTED] file=%s", _MTS_STATE_FILE)
+            logger.exception("[MTS_STATE_READ_UNEXPECTED] file=%s", _get_state_file_path())
             return None
 
     # ── ADR-010 Sprint 5C: Release bracket submission reconciliation ──
@@ -1790,6 +1838,13 @@ class TMFSpread(StrategyBase):
                                     try:
                                         self._lifecycle_oca = lifecycle_from_dict(lifecycle_block)
                                     except Exception:
+                                        self._lifecycle_oca = infer_lifecycle_from_legacy_state(state)
+
+                                    # 💡 Gemini CLI: If state has has_position=True but lifecycle.phase=FLAT (stale block), re-infer FSM from state
+                                    if self._lifecycle_oca.phase == PositionPhase.FLAT:
+                                        logger.warning(
+                                            "[MTS_RESTORE_LIFECYCLE_OVERRIDE] State has position=True but lifecycle phase is FLAT. Re-inferring from state."
+                                        )
                                         self._lifecycle_oca = infer_lifecycle_from_legacy_state(state)
 
                                     # ── ADR-010 Sprint 5: Restart Reconciliation ──
@@ -2763,6 +2818,20 @@ class TMFSpread(StrategyBase):
         _n_pnl = self._pnl_near(near_close)
         _f_pnl = self._pnl_far(far_close)
 
+        # 💡 Gemini CLI: Update position telemetry (near_last, far_last, UPL, _updated) on live ticks
+        if self._has_position:
+            _total_upl = _n_pnl * _mult + _f_pnl * _mult
+            _write_mts_telemetry(
+                ticker=self._ticker,
+                near_last=near_close,
+                far_last=far_close,
+                near_upl=_n_pnl,
+                far_upl=_f_pnl,
+                total_upl=_total_upl,
+                atr=float(bar.get("atr", 0.0) or 0.0),
+                quote_age_ms=quote_age_ms,
+            )
+
         # 2026-07-09 Hermes Agent: release diagnostic eval — fires whenever a leg is at threshold
         _rel_near_hit = _n_pnl <= -release_stop
         _rel_far_hit = _f_pnl <= -release_stop
@@ -2906,6 +2975,22 @@ class TMFSpread(StrategyBase):
                 _realized = _pnl_pts * _mult - _cost
                 self._lifecycle = "EXITING"
                 self._log_exit_decision(exit_reason=_exit_reason, pnl=_pnl_pts, bar=bar)
+
+                # 2026-07-23 Gemini CLI: Work Package A - Instrumentation & Provenance Metadata
+                _peak_or_nadir = self._peak if _rem_side == "LONG" else self._nadir
+                _retracement = (_peak_or_nadir - _exit_price) if _rem_side == "LONG" else (_exit_price - _peak_or_nadir)
+                _warmup_elapsed = round((time.monotonic() - self._single_leg_entered_mono) * 1000.0, 1) if self._single_leg_entered_mono > 0 else 0.0
+                _warmup_ticks = int(self._single_leg_post_fill_ticks)
+                
+                self._risk_mode_at_exit = _risk_meta.get("risk_mode", "FIXED_FALLBACK")
+                _risk_meta["risk_mode_at_exit"] = self._risk_mode_at_exit
+                _risk_meta["single_leg_peak_or_nadir"] = round(float(_peak_or_nadir), 2) if _peak_or_nadir > 0 else None
+                _risk_meta["effective_trail_dist"] = _risk_meta.get("final_trail_dist")
+                _risk_meta["calculated_retracement"] = round(float(_retracement), 2) if _peak_or_nadir > 0 else None
+                _risk_meta["trigger_price"] = _exit_price
+                _risk_meta["warmup_elapsed_ms"] = _warmup_elapsed
+                _risk_meta["warmup_tick_count"] = _warmup_ticks
+
                 _append_event("EXIT_REMAINING", reason=_exit_reason, remaining_leg=_rem_leg.value, exit_price=_exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, **_risk_meta)
                 _write_mts_state(has_position=True, action=f"EXIT_{_exit_reason}", reason=_exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
                 self._log_shadow_trade_summary(_exit_price, _exit_reason, _pnl_pts, now, bar, near_close, far_close)
@@ -3150,8 +3235,9 @@ class TMFSpread(StrategyBase):
             self._last_applied_event_time = now
             return Signal("EXIT", f"TMF_{exit_reason}_{self._side}", confidence=0.5, stop_loss=0)
 
+        _action_label = "SPREAD" if self._released_leg is None else f"TRAILING_{self._side}"
         _write_mts_state(
-            has_position=True, action=f"TRAILING_{self._side}",
+            has_position=True, action=_action_label,
             reason=f'{_rem_leg_label} trail={(self._peak - _rem_low if self._side == "LONG" else _rem_high - self._nadir):.1f}/{trail_dist}',
             near_entry=self._near_entry, far_entry=self._far_entry,
             near_last=near_close, far_last=far_close,

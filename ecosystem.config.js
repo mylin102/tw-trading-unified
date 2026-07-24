@@ -1,12 +1,16 @@
+const fs = require('fs');
 const path = require('path');
 const PROJECT_ROOT = __dirname; // 自動獲取當前專案目錄，避免寫死絕對路徑
+
+const venvDir = fs.existsSync(path.join(PROJECT_ROOT, ".venv")) ? ".venv" : "venv";
+const pythonPath = path.join(PROJECT_ROOT, venvDir, "bin/python3");
 
 module.exports = {
   apps: [
     {
       name: "trading-system",
       script: "taskpolicy",
-      args: `-c background ${path.join(PROJECT_ROOT, "venv/bin/python3")} main.py`,
+      args: `-c background ${pythonPath} main.py --config futures,futures_mtx`,
       interpreter: "none",
       cwd: PROJECT_ROOT,
       restart_delay: 15000,        // 💡 關鍵：15秒延遲重啟，對齊原設計並保護券商連線
@@ -30,7 +34,7 @@ module.exports = {
     {
       name: "dashboard",
       script: "taskpolicy",
-      args: `-c background ${path.join(PROJECT_ROOT, "venv/bin/python3")} -m streamlit run ui/dashboard.py --server.port 8500 --server.fileWatcherType none`,
+      args: `-c background ${pythonPath} -m streamlit run ui/dashboard.py --server.port 8500 --server.fileWatcherType none`,
       interpreter: "none",
       cwd: PROJECT_ROOT,
       restart_delay: 5000,
@@ -51,7 +55,7 @@ module.exports = {
     {
       name: "stock-runner",
       script: "taskpolicy",
-      args: `-c background ${path.join(PROJECT_ROOT, "venv/bin/python3")} scripts/runners/stock_runner.py`,
+      args: `-c background ${pythonPath} scripts/runners/stock_runner.py`,
       interpreter: "none",
       cwd: PROJECT_ROOT,
       restart_delay: 15000,

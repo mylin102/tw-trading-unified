@@ -169,6 +169,20 @@ OUTCOMES_COLUMNS = {
     "final_exit_reason": "str",                  # reason for the final (remaining leg) exit (e.g. TRAIL)
     "risk_mode": "str",                          # FIXED_FALLBACK | ATR_DYNAMIC
     "realized_pnl_total": "float64",             # TWD (duplicated from facts for convenience)
+    # 2026-07-23 Gemini CLI: Work Package A & B - Instrumentation & Provenance
+    "single_leg_peak_or_nadir": "float64",       # peak/nadir of remaining leg during single leg phase
+    "effective_trail_dist": "float64",           # final effective trail distance used
+    "calculated_retracement": "float64",         # exact retracement from peak/nadir at exit
+    "trigger_price": "float64",                  # exit trigger price
+    "warmup_elapsed_ms": "float64",              # warmup elapsed milliseconds at exit
+    "warmup_tick_count": "int64",                # warmup tick count at exit
+    "release_stop_mode": "str",                  # ATR_DYNAMIC | FIXED_FALLBACK for release
+    "trail_distance_mode": "str",                # ATR_DYNAMIC | FIXED_FALLBACK for trail
+    "risk_mode_at_entry": "str",                 # risk mode snapshot at trade entry
+    "risk_mode_at_release": "str",               # risk mode snapshot at leg release
+    "risk_mode_at_single_leg": "str",            # risk mode snapshot at single leg start
+    "risk_mode_at_exit": "str",                  # risk mode snapshot at final exit
+    "risk_mode_transition_count": "int64",       # number of risk mode transitions during trade
 }
 
 
@@ -693,6 +707,7 @@ def _build_outcomes(
             final_exit_reason = ""
 
         risk_mode = exit_logs[-1].get("risk_mode", "") if exit_logs else ""
+        last_exit = exit_logs[-1] if exit_logs else {}
 
         row = {
             "trade_id": trade_id,
@@ -712,6 +727,21 @@ def _build_outcomes(
             "final_exit_reason": final_exit_reason,
             "risk_mode": risk_mode,
             "realized_pnl_total": round(realized_pnl_total, 2),
+            # Work Package A: Instrumentation
+            "single_leg_peak_or_nadir": last_exit.get("single_leg_peak_or_nadir"),
+            "effective_trail_dist": last_exit.get("effective_trail_dist") or trail_distance,
+            "calculated_retracement": last_exit.get("calculated_retracement"),
+            "trigger_price": last_exit.get("trigger_price") or last_exit.get("exit_price"),
+            "warmup_elapsed_ms": last_exit.get("warmup_elapsed_ms"),
+            "warmup_tick_count": last_exit.get("warmup_tick_count"),
+            # Work Package B: Provenance & Separated Modes
+            "release_stop_mode": last_exit.get("release_stop_mode") or (release_submitted[0].get("risk_mode") if release_submitted else None),
+            "trail_distance_mode": last_exit.get("trail_distance_mode") or (trail_logs[0].get("risk_mode") if trail_logs else None),
+            "risk_mode_at_entry": last_exit.get("risk_mode_at_entry"),
+            "risk_mode_at_release": last_exit.get("risk_mode_at_release") or (release_submitted[0].get("risk_mode") if release_submitted else None),
+            "risk_mode_at_single_leg": last_exit.get("risk_mode_at_single_leg"),
+            "risk_mode_at_exit": last_exit.get("risk_mode_at_exit") or risk_mode,
+            "risk_mode_transition_count": last_exit.get("risk_mode_transition_count", 0),
         }
         rows.append(row)
 

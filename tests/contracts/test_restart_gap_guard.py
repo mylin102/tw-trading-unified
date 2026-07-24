@@ -97,6 +97,7 @@ def test_allows_exit_when_lifecycle_single_leg(monitor, strategy, bar_dict):
     signal = Signal("EXIT", "TMF_TRAIL_EXIT_LONG")
 
     with patch("strategies.futures.monitor._mts_position_state_path", return_value=Path("nonexistent.json")), \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True), \
          patch.object(monitor.order_mgr, "submit") as mock_submit:
         monitor._submit_mts_order_signal(signal, strategy, bar_dict, datetime.now())
         assert mock_submit.called, "Expected allow: lifecycle=SINGLE_LEG + has_position"

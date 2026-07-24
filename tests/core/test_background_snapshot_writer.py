@@ -316,10 +316,11 @@ class TestLifecycle:
 # ── Built-in Persisters (placeholders) ──
 
 class TestBuiltinPersisters:
-    def test_csv_persister_not_implemented(self) -> None:
+    def test_csv_persister_noop(self) -> None:
         p = CsvSnapshotPersister(directory="/tmp")
-        with pytest.raises(NotImplementedError):
-            p.persist(_FakeSnapshot(ticker="MTX"))
+        # Should not raise
+        p.persist(_FakeSnapshot(ticker="MTX"))
+        assert True
 
     def test_json_persister_not_implemented(self) -> None:
         p = JsonStatePersister()

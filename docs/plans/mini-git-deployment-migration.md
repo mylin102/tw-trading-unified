@@ -73,20 +73,21 @@ git clone "$REPO_URL" tw-trading-unified-git
 cd tw-trading-unified-git
 ```
 
-### Phase 3 — Deploy specific commit
+### Phase 3 — Deploy specific commit (Detached HEAD)
 
 ```bash
-# Fetch all branches/tags
+# Fetch all branches/tags without merging into working tree
 git fetch --all --prune
 
-# Checkout the exact commit Air4 has confirmed and tested
-# (To be specified by Air4 at migration time)
-git checkout <AIR4_CONFIRMED_COMMIT>
+# Switch to explicit detached HEAD for approved production commit SHA
+git switch --detach <APPROVED_PRODUCTION_COMMIT_SHA>
 
-# Verify
-git rev-parse --short HEAD
+# Verify Detached HEAD status (git branch --show-current should return empty)
+git branch --show-current
+git rev-parse HEAD
 git status --short
 ```
+
 
 ### Phase 4 — Restore host-local config
 
@@ -95,6 +96,20 @@ cd ~/Documents/tw-trading-unified-git
 
 # Restore identity file (must NOT be in git)
 cp ~/migration-backup-$TS/.deployment-target .
+
+# Record production deployment manifest evidence
+mkdir -p .runtime
+cat << 'EOF' > .runtime/production_deployment.json
+{
+  "host_role": "production_trading",
+  "deployed_commit": "$(git rev-parse HEAD)",
+  "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "approved_by": "manual",
+  "source_branch": "master",
+  "deployment_mode": "detached_commit",
+  "deployment_reason": "Approved Production Migration / Proposal P-003"
+}
+EOF
 
 # Restore runtime config
 cp ~/migration-backup-$TS/.env . 2>/dev/null || echo "NO_ENV"
