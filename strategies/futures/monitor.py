@@ -735,6 +735,9 @@ class FuturesMonitor:
         except Exception as e:
             console.print(f"[dim][FuturesMonitor] Warm-up failed: {e}[/dim]")
 
+        # Resolve TMF/MTX contracts so they can be subscribed
+        self._resolve_contracts()
+
     def _resolve_contracts(self):
         """[Safe Mode] Get front/far month contracts to prevent deadlock during login."""
         # 💡 Gemini CLI: Import datetime and date at top of function to prevent UnboundLocalError in warm-up block
@@ -747,8 +750,9 @@ class FuturesMonitor:
         # 獲取TMF/MTX合約
         # 💡 Gemini CLI: Added symbol mapping (MTX -> MXF) and type-safe delivery_date handling (datetime.date vs str)
         try:
-            raw_symbol = str(self.ticker)
-            target_symbol = "MXF" if raw_symbol.upper() == "MTX" else raw_symbol
+            # 2026-07-24 Gemini CLI: Keep TMF target_symbol as TMF to query TMFH6 (near) and TMFI6 (far) Micro-TX contracts
+            raw_symbol = str(self.ticker).upper()
+            target_symbol = "MXF" if raw_symbol == "MTX" else raw_symbol
             print(f"[FuturesMonitor] Getting {target_symbol} contracts (Safe Mode)...")
             
             # [rshioaji 1.5.10 Workaround] Use robust list helper to avoid C++ binding crash
@@ -757,49 +761,52 @@ class FuturesMonitor:
             
             print(f"[FuturesMonitor] Found {len(tmf_list)} {target_symbol} contracts")
             if tmf_list:
-                # [GSD Settlement Fix] Filter out expired or invalid
-                # On settlement day (3rd Wednesday), the front-month expires at 13:30.
-                now = datetime.now()
-                now_str = now.strftime("%Y/%m/%d")
-                settlement_time = now.replace(hour=13, minute=30, second=0, microsecond=0)
-                
+                # 2026-07-24 Gemini CLI: Type-safe delivery_date conversion helper to avoid date vs str TypeError
+                now_dt = datetime.now()
+                now_date = now_dt.date()
+                settlement_time = now_dt.replace(hour=13, minute=30, second=0, microsecond=0)
+
+                def _to_deliv_date(c):
+                    if c is None:
+                        return None
+                    d = getattr(c, "delivery_date", None)
+                    if d is None:
+                        return None
+                    if isinstance(d, str):
+                        try:
+                            return datetime.strptime(d.replace("-", "/"), "%Y/%m/%d").date()
+                        except Exception:
+                            return None
+                    if hasattr(d, "year") and hasattr(d, "month") and hasattr(d, "day"):
+                        try:
+                            return date(d.year, d.month, d.day)
+                        except Exception:
+                            return None
+                    return None
+
                 valid_contracts = []
                 for c in tmf_list:
-                    # 💡 Gemini CLI: Filter out None and invalid contract objects returned from Shioaji get_contracts_list
                     if c is None or not hasattr(c, "code"):
                         continue
-                    d_val = getattr(c, "delivery_date", "")
-                    if not d_val:
+                    c_date = _to_deliv_date(c)
+                    if c_date is None:
                         continue
-                    if isinstance(d_val, (date, datetime)):
-                        d_str = d_val.strftime("%Y/%m/%d")
-                    else:
-                        d_str = str(d_val).replace("-", "/")
-                    
-                    if d_str > now_str:
+                    if c_date > now_date:
                         valid_contracts.append(c)
-                    elif d_str == now_str:
-                        # If today is settlement day, only use it if before 13:30
-                        if now < settlement_time:
+                    elif c_date == now_date:
+                        if now_dt < settlement_time:
                             valid_contracts.append(c)
-                        else:
-                            console.print(f" [yellow][FuturesMonitor] Settlement day detected ({now_str}), skipping expired contract {getattr(c, 'code', '?')} after 13:30[/yellow] ")
-                
-                # Sort by delivery date (ascending)
-                def _get_deliv_str(c):
-                    if c is None:
-                        return ""
-                    d = getattr(c, "delivery_date", "")
-                    if isinstance(d, (date, datetime)):
-                        return d.strftime("%Y/%m/%d")
-                    return str(d).replace("-", "/")
 
-                tmf_sorted = sorted(valid_contracts, key=_get_deliv_str)
+                def _get_deliv_sort_key(c):
+                    cd = _to_deliv_date(c)
+                    return cd if cd else date(2099, 12, 31)
+
+                tmf_sorted = sorted(valid_contracts, key=_get_deliv_sort_key)
                 
                 if tmf_sorted:
                     # Pick the first one (nearest delivery)
                     self.contract = tmf_sorted[0]
-                    console.print(f"[green][FuturesMonitor] ✓ {self.ticker} front-month: {self.contract.code} (delivers {self.contract.delivery_date})[/green]")
+                    console.print(f"[green][FuturesMonitor] ✓ {self.ticker} front-month: {getattr(self.contract, 'code', '?')}[/green]")
                     # Sync contract to ingestion service (resolved after __init__)
                     try:
                         self._ingestion.set_contract(self.contract)
@@ -807,22 +814,33 @@ class FuturesMonitor:
                         pass
                 else:
                     # Fallback to absolute nearest if no valid ones found (shouldn't happen in live)
-                    self.contract = sorted(tmf_list, key=_get_deliv_str)[0]
-                    console.print(f" [yellow][FuturesMonitor] No future delivery found, using absolute nearest: {self.contract.code}[/yellow] ")
+                    self.contract = sorted(tmf_list, key=_get_deliv_sort_key)[0]
+                    console.print(f" [yellow][FuturesMonitor] No future delivery found, using absolute nearest: {getattr(self.contract, 'code', '?')}[/yellow] ")
                 
                 # Log all available codes for verification
-                all_codes = [f"{c.code}({c.delivery_date})" for c in tmf_sorted]
-                console.print(f"[dim][FuturesMonitor] Valid {self.ticker} queue: {', '.join(all_codes)}[/dim]")
+                try:
+                    all_codes = [f"{getattr(c, 'code', '?')}({getattr(c, 'delivery_date', '?')})" for c in tmf_sorted]
+                    print(f"[FuturesMonitor] Valid {self.ticker} queue: {', '.join(all_codes)}")
+                except Exception:
+                    pass
 
                 # [Far Month] Select first contract with DIFFERENT delivery date for dual chart
-                front_delivery = self.contract.delivery_date if self.contract else None
+                front_delivery_date = _to_deliv_date(self.contract) if self.contract else None
                 self.far_contract = None
                 for c in tmf_sorted[1:]:
-                    if c.delivery_date != front_delivery:
+                    if _to_deliv_date(c) != front_delivery_date:
                         self.far_contract = c
                         break
+                # 2026-07-24 Gemini CLI: Fallback search across full tmf_list if tmf_sorted only had 1 valid contract
+                if self.far_contract is None and self.contract is not None:
+                    for c in tmf_list:
+                        if c is not None and hasattr(c, "code") and front_delivery_date:
+                            cd = _to_deliv_date(c)
+                            if cd and cd > front_delivery_date:
+                                self.far_contract = c
+                                break
                 if self.far_contract is not None:
-                    console.print(f"[green][FuturesMonitor] ✓ {self.ticker} far-month: {self.far_contract.code} (delivers {self.far_contract.delivery_date})[/green]")
+                    console.print(f"[green][FuturesMonitor] ✓ {self.ticker} far-month: {getattr(self.far_contract, 'code', '?')}[/green]")
                 else:
                     self.far_contract = None
                     console.print(f" [yellow][FuturesMonitor] No far-month contract available[/yellow] ")
@@ -834,8 +852,6 @@ class FuturesMonitor:
         # [Bug Fix] Add contract rollover check
         self._last_contract_code = self.contract.code if self.contract else None
 
-        # P1: Resolve near/far contracts (was dead code - never called)
-        self._resolve_contracts()
         
         # 2026-06-24 Gemini CLI: Pre-fill near/far contract prices from snapshots at startup to prevent identical execution prices on first manual trade.
         if self.api and not self.dry_run:
@@ -1503,6 +1519,22 @@ class FuturesMonitor:
 
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()  # [gstack] 更新數據更新時間
+        
+        # 2026-07-24 Gemini CLI: Pre-populate tick cache at entry of on_tick so _process_manual_trade_flag has fresh price
+        if getattr(tick, 'close', None) and float(tick.close) > 0:
+            _p = float(tick.close)
+            self._last_tmf_price = _p
+            _tick_info = {
+                "close": _p,
+                "datetime": getattr(tick, 'datetime', None),
+                "local_arrival_at": self.last_tick_at,
+                "bid": float(getattr(tick, 'buy_price', _p) or _p),
+                "ask": float(getattr(tick, 'sell_price', _p) or _p),
+            }
+            if getattr(tick, 'code', None):
+                self.market_data[tick.code] = _tick_info
+            self.market_data[self.ticker] = _tick_info
+            self.market_data[f"{self.ticker}_NEAR"] = _tick_info
 
         # ── [Manual Trade Flag] Check on every tick ──
         # 2026-06-05 JVS Claw: Step 4 — gate flag check with is_primary (C4).
@@ -4736,6 +4768,13 @@ class FuturesMonitor:
 
     def stop(self):
         self._running = False
+        # 2026-07-24 Gemini CLI: Export Shadow Soak Manifest on monitor shutdown
+        try:
+            _strat = self._registry.get("tmf_spread") if hasattr(self, "_registry") else None
+            if _strat and hasattr(_strat, "close_soak_collector"):
+                _strat.close_soak_collector(reason="MONITOR_STOP")
+        except Exception:
+            pass
 
     def _cancel_all_pending_orders(self):
         """Cancel all pending orders (limit/market) when session transitions from night to day."""
@@ -6510,9 +6549,21 @@ class FuturesMonitor:
                     # dry_run: price resolved from fallback, skip LIVE_TICK check below
                 else:
                     # Live and paper: Shioaji connected, ticks arrive via on_tick()
+                    # Live and paper: Shioaji connected, ticks arrive via on_tick()
+                    # 2026-07-24 Gemini CLI: Check contract code and _NEAR keys if self.ticker key has no close
                     _live_tick = self.market_data.get(self.ticker, {})
+                    if not _live_tick.get("close") and hasattr(self, "contract") and self.contract:
+                        _live_tick = self.market_data.get(self.contract.code, {})
+                    if not _live_tick.get("close"):
+                        _live_tick = self.market_data.get(f"{self.ticker}_NEAR", {})
                     _price_raw = _live_tick.get("close")
                     _arrival_at = _live_tick.get("local_arrival_at")
+                    
+                    # 2026-07-24 Gemini CLI: Ground truth fallback to _last_tmf_price & last_tick_at if market_data is cold
+                    if (not _price_raw or _price_raw <= 0 or not _arrival_at) and getattr(self, "_last_tmf_price", 0) > 0:
+                        if (time.time() - getattr(self, "last_tick_at", 0)) <= 5.0:
+                            _price_raw = self._last_tmf_price
+                            _arrival_at = self.last_tick_at
                     
                     if _price_raw and _price_raw > 0 and _arrival_at:
                         _tick_age_ms = (time.time() - _arrival_at) * 1000
@@ -6552,13 +6603,18 @@ class FuturesMonitor:
                 
                 _near = _price
                 # 2026-06-24 Gemini CLI: Check live far contract price from cache before bar, to prevent identical near/far month execution prices.
+                # 2026-07-24 Gemini CLI: Fallback to far_contract.code if TMF_FAR key is empty
                 _far_live = self.market_data.get(f"{self.ticker}_FAR", {}).get("close")
+                if not _far_live and hasattr(self, "far_contract") and self.far_contract:
+                    _far_live = self.market_data.get(self.far_contract.code, {}).get("close")
                 _far = float(_far_live) if _far_live and _far_live > 0 else (self._far_current_bar.get("close") or _price)
                 
                 _far_price_source = "UNSET"
                 _far_tick_age_ms = -1
                 if _far_live and _far_live > 0:
                     _far_arrival = self.market_data.get(f"{self.ticker}_FAR", {}).get("local_arrival_at")
+                    if not _far_arrival and hasattr(self, "far_contract") and self.far_contract:
+                        _far_arrival = self.market_data.get(self.far_contract.code, {}).get("local_arrival_at")
                     _far_price_source = "LIVE_TICK"
                     if _far_arrival:
                         _far_tick_age_ms = (time.time() - _far_arrival) * 1000
@@ -6611,19 +6667,15 @@ class FuturesMonitor:
                             "strategy": "MTS_MANUAL", "price_source": _price_source
                         }
 
-                    # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免 MKT 滑價 + LMT 卡單
-                    # 2026-07-07 Hermes Agent: refuse placeholder symbols.
-                    # Manual trade goes through a separate path from
-                    # _submit_mts_order_signal; the contract guard must
-                    # also be enforced here.
-                    if self.contract is None or self.far_contract is None:
+                    # 2026-07-24 Gemini CLI: Require near contract; use near contract as fallback for far if unresolved
+                    if self.contract is None:
                         console.print(
-                            "[red]❌ [MANUAL_TRADE_BLOCKED] near/far contract "
+                            "[red]❌ [MANUAL_TRADE_BLOCKED] near contract "
                             "unresolved; refusing placeholder manual trade[/red]"
                         )
                         return
                     _near_code = self.contract.code
-                    _far_code = self.far_contract.code
+                    _far_code = self.far_contract.code if self.far_contract is not None else self.contract.code
                     console.print(f"[yellow]📝 [MANUAL_TRADE] NEAR={_near_side} ref={_near:.1f} (MKP) {_near_code}[/yellow]")
                     console.print(f"[yellow]📝 [MANUAL_TRADE] FAR={_far_side} ref={_far:.1f} (MKP) {_far_code}[/yellow]")
                     

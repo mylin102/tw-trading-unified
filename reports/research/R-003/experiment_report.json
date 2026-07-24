@@ -1,0 +1,192 @@
+{
+  "experiment_id": "R-003A_20260717T090546",
+  "parameter": "release_threshold",
+  "levels": [
+    6,
+    8,
+    10,
+    12,
+    14,
+    16,
+    18,
+    20
+  ],
+  "total_cells": 272,
+  "total_cases": 34,
+  "analysis": {
+    "per_level": [
+      {
+        "level": 6,
+        "total_cases": 34,
+        "decision_changed": 0,
+        "decision_stability": 1.0,
+        "decision_change_rate": 0.0,
+        "historical_margin_mean": -413.91,
+        "historical_margin_median": -327.88,
+        "flip_count": 0
+      },
+      {
+        "level": 8,
+        "total_cases": 34,
+        "decision_changed": 0,
+        "decision_stability": 1.0,
+        "decision_change_rate": 0.0,
+        "historical_margin_mean": -413.91,
+        "historical_margin_median": -327.88,
+        "flip_count": 0
+      },
+      {
+        "level": 10,
+        "total_cases": 34,
+        "decision_changed": 0,
+        "decision_stability": 1.0,
+        "decision_change_rate": 0.0,
+        "historical_margin_mean": -413.91,
+        "historical_margin_median": -327.88,
+        "flip_count": 0
+      },
+      {
+        "level": 12,
+        "total_cases": 34,
+        "decision_changed": 0,
+        "decision_stability": 1.0,
+        "decision_change_rate": 0.0,
+        "historical_margin_mean": -413.91,
+        "historical_margin_median": -327.88,
+        "flip_count": 0
+      },
+      {
+        "level": 14,
+        "total_cases": 34,
+        "decision_changed": 0,
+        "decision_stability": 1.0,
+        "decision_change_rate": 0.0,
+        "historical_margin_mean": -413.91,
+        "historical_margin_median": -327.88,
+        "flip_count": 0
+      },
+      {
+        "level": 16,
+        "total_cases": 34,
+        "decision_changed": 0,
+        "decision_stability": 1.0,
+        "decision_change_rate": 0.0,
+        "historical_margin_mean": -413.91,
+        "historical_margin_median": -327.88,
+        "flip_count": 0
+      },
+      {
+        "level": 18,
+        "total_cases": 34,
+        "decision_changed": 0,
+        "decision_stability": 1.0,
+        "decision_change_rate": 0.0,
+        "historical_margin_mean": -413.91,
+        "historical_margin_median": -327.88,
+        "flip_count": 0
+      },
+      {
+        "level": 20,
+        "total_cases": 34,
+        "decision_changed": 0,
+        "decision_stability": 1.0,
+        "decision_change_rate": 0.0,
+        "historical_margin_mean": -413.91,
+        "historical_margin_median": -327.88,
+        "flip_count": 0
+      }
+    ],
+    "decision_boundary": [],
+    "dimensions": {
+      "decision_stability": {
+        "description": "How stable is the decision across parameter changes?",
+        "overall_stability": 1.0,
+        "total_flips": 0,
+        "total_cells": 272
+      },
+      "pnl_sensitivity": {
+        "description": "How much does PnL change? (Requires outcome tracking \u2014 partial)",
+        "note": "PnL tracking requires outcome data integration (Phase 3C+)"
+      },
+      "boundary_distance": {
+        "description": "How close are decisions to the flip boundary?",
+        "cases_with_boundary": 0,
+        "cases_without_boundary": 272
+      },
+      "case_clustering": {
+        "description": "Which cases are most/least sensitive?",
+        "sensitive_cases": 0,
+        "stable_cases": 34
+      }
+    },
+    "most_sensitive_cases": [
+      {
+        "case_id": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf:mts-20260709-085624:0",
+        "flip_count": 0,
+        "trade_id": "mts-20260709-085624",
+        "historical_margin": -460.0
+      },
+      {
+        "case_id": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf:mts-auto-183042-480:1",
+        "flip_count": 0,
+        "trade_id": "mts-auto-183042-480",
+        "historical_margin": -498.0
+      },
+      {
+        "case_id": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf:mts-auto-133741-001:1",
+        "flip_count": 0,
+        "trade_id": "mts-auto-133741-001",
+        "historical_margin": -467.84000000000003
+      },
+      {
+        "case_id": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf:mts-auto-150001-119:1",
+        "flip_count": 0,
+        "trade_id": "mts-auto-150001-119",
+        "historical_margin": -1115.68
+      },
+      {
+        "case_id": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf:mts-auto-152003-393:1",
+        "flip_count": 0,
+        "trade_id": "mts-auto-152003-393",
+        "historical_margin": -333.4
+      }
+    ],
+    "most_stable_cases": [
+      {
+        "case_id": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf:mts-20260709-085624:0",
+        "flip_count": 0,
+        "trade_id": "mts-20260709-085624",
+        "historical_margin": -460.0
+      },
+      {
+        "case_id": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf:mts-auto-183042-480:1",
+        "flip_count": 0,
+        "trade_id": "mts-auto-183042-480",
+        "historical_margin": -498.0
+      },
+      {
+        "case_id": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf:mts-auto-133741-001:1",
+        "flip_count": 0,
+        "trade_id": "mts-auto-133741-001",
+        "historical_margin": -467.84000000000003
+      },
+      {
+        "case_id": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf:mts-auto-150001-119:1",
+        "flip_count": 0,
+        "trade_id": "mts-auto-150001-119",
+        "historical_margin": -1115.68
+      },
+      {
+        "case_id": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf:mts-auto-152003-393:1",
+        "flip_count": 0,
+        "trade_id": "mts-auto-152003-393",
+        "historical_margin": -333.4
+      }
+    ]
+  },
+  "metadata": {
+    "dataset_generation": "parity-final-v6",
+    "dataset_content_hash": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf",
+    "analysis_timestamp_utc": "2026-07-17T01:05:46.276891+00:00"
+  }
+}

@@ -1,0 +1,245 @@
+{
+  "parity_timestamp_utc": "2026-07-16T22:50:36.871822+00:00",
+  "frozen_source": {
+    "fills_path": "data/frozen/parity_final/mts_trade_fills.jsonl",
+    "fills_sha256": "5c705f7891943bbba637b2e5c3ef70810e47f48beba737cb0591e4c9a7f9286f",
+    "fills_size": 74096,
+    "events_path": "data/frozen/parity_final/mts_spread_events.jsonl",
+    "events_sha256": "335b117be5787f3d919e7d978cf0c844f8fe34a0599f30d2c7f39d4e0b628a4f",
+    "events_size": 170753
+  },
+  "legacy": {
+    "label": "legacy_jsonl",
+    "trade_count": 34,
+    "winner_count": 21,
+    "loser_count": 13,
+    "breakeven_count": 0,
+    "win_rate": 0.6176,
+    "total_pnl": 7142.6,
+    "avg_pnl": 210.08,
+    "median_pnl": 169.1,
+    "session_day": 14,
+    "session_night": 20,
+    "exit_reason_counts": {},
+    "final_exit_reason_counts": {},
+    "trade_ids": [
+      "mts-20260709-085624",
+      "mts-20260709-125527",
+      "mts-20260709-170042",
+      "mts-20260713-085856",
+      "mts-20260713-150331",
+      "mts-20260713-175629",
+      "mts-20260714-203416",
+      "mts-20260716-131700",
+      "mts-auto-001713-248",
+      "mts-auto-005252-372",
+      "mts-auto-085335-236",
+      "mts-auto-085837-764",
+      "mts-auto-090244-130",
+      "mts-auto-094447-171",
+      "mts-auto-095417-769",
+      "mts-auto-101709-433",
+      "mts-auto-105607-780",
+      "mts-auto-114904-854",
+      "mts-auto-131539-634",
+      "mts-auto-133741-001",
+      "mts-auto-150001-119",
+      "mts-auto-152003-393",
+      "mts-auto-160857-726",
+      "mts-auto-161229-714",
+      "mts-auto-165644-850",
+      "mts-auto-183042-480",
+      "mts-auto-183154-722",
+      "mts-auto-202908-887",
+      "mts-auto-212849-633",
+      "mts-auto-213700-512",
+      "mts-auto-214943-083",
+      "mts-auto-215657-960",
+      "mts-auto-221230-855",
+      "mts-auto-224409-884"
+    ]
+  },
+  "dataset": {
+    "label": "parquet_dataset",
+    "trade_count": 34,
+    "winner_count": 21,
+    "loser_count": 13,
+    "breakeven_count": 0,
+    "win_rate": 0.6176,
+    "total_pnl": 7142.6,
+    "avg_pnl": 210.08,
+    "median_pnl": 169.1,
+    "session_day": 14,
+    "session_night": 20,
+    "exit_reason_counts": {
+      "ATR_DYNAMIC": 22,
+      "FIXED_FALLBACK": 12
+    },
+    "final_exit_reason_counts": {
+      "TRAIL": 33,
+      "RELEASE_STOP": 1
+    },
+    "trade_ids": [
+      "mts-20260709-085624",
+      "mts-20260709-125527",
+      "mts-20260709-170042",
+      "mts-20260713-085856",
+      "mts-20260713-150331",
+      "mts-20260713-175629",
+      "mts-20260714-203416",
+      "mts-20260716-131700",
+      "mts-auto-001713-248",
+      "mts-auto-005252-372",
+      "mts-auto-085335-236",
+      "mts-auto-085837-764",
+      "mts-auto-090244-130",
+      "mts-auto-094447-171",
+      "mts-auto-095417-769",
+      "mts-auto-101709-433",
+      "mts-auto-105607-780",
+      "mts-auto-114904-854",
+      "mts-auto-131539-634",
+      "mts-auto-133741-001",
+      "mts-auto-150001-119",
+      "mts-auto-152003-393",
+      "mts-auto-160857-726",
+      "mts-auto-161229-714",
+      "mts-auto-165644-850",
+      "mts-auto-183042-480",
+      "mts-auto-183154-722",
+      "mts-auto-202908-887",
+      "mts-auto-212849-633",
+      "mts-auto-213700-512",
+      "mts-auto-214943-083",
+      "mts-auto-215657-960",
+      "mts-auto-221230-855",
+      "mts-auto-224409-884"
+    ]
+  },
+  "comparisons": [
+    {
+      "metric": "trade_count",
+      "legacy_value": 34,
+      "dataset_value": 34,
+      "absolute_difference": 0,
+      "tolerance": 0,
+      "status": "PASS"
+    },
+    {
+      "metric": "winner_count",
+      "legacy_value": 21,
+      "dataset_value": 21,
+      "absolute_difference": 0,
+      "tolerance": 0,
+      "status": "PASS"
+    },
+    {
+      "metric": "loser_count",
+      "legacy_value": 13,
+      "dataset_value": 13,
+      "absolute_difference": 0,
+      "tolerance": 0,
+      "status": "PASS"
+    },
+    {
+      "metric": "breakeven_count",
+      "legacy_value": 0,
+      "dataset_value": 0,
+      "absolute_difference": 0,
+      "tolerance": 0,
+      "status": "PASS"
+    },
+    {
+      "metric": "session_day",
+      "legacy_value": 14,
+      "dataset_value": 14,
+      "absolute_difference": 0,
+      "tolerance": 0,
+      "status": "PASS"
+    },
+    {
+      "metric": "session_night",
+      "legacy_value": 20,
+      "dataset_value": 20,
+      "absolute_difference": 0,
+      "tolerance": 0,
+      "status": "PASS"
+    },
+    {
+      "metric": "win_rate",
+      "legacy_value": 0.6176,
+      "dataset_value": 0.6176,
+      "absolute_difference": 0.0,
+      "tolerance": 0.0001,
+      "status": "PASS"
+    },
+    {
+      "metric": "total_pnl",
+      "legacy_value": 7142.6,
+      "dataset_value": 7142.6,
+      "absolute_difference": 0.0,
+      "tolerance": 0.1,
+      "status": "PASS"
+    },
+    {
+      "metric": "avg_pnl",
+      "legacy_value": 210.08,
+      "dataset_value": 210.08,
+      "absolute_difference": 0.0,
+      "tolerance": 0.01,
+      "status": "PASS"
+    },
+    {
+      "metric": "median_pnl",
+      "legacy_value": 169.1,
+      "dataset_value": 169.1,
+      "absolute_difference": 0.0,
+      "tolerance": 0.01,
+      "status": "PASS"
+    },
+    {
+      "metric": "trade_id_set",
+      "legacy_value": 34,
+      "dataset_value": 34,
+      "absolute_difference": 0,
+      "tolerance": 0,
+      "status": "PASS",
+      "details": null
+    },
+    {
+      "metric": "exit_reason_counts",
+      "legacy_value": {},
+      "dataset_value": {
+        "ATR_DYNAMIC": 22,
+        "FIXED_FALLBACK": 12
+      },
+      "absolute_difference": null,
+      "tolerance": 0,
+      "status": "EXPECTED_DIFF",
+      "details": {
+        "note": "exit_reason semantics differ: legacy extracts from correlated EXIT_LOG events, dataset uses RELEASE_SUBMITTED events with risk_mode. Both are valid but represent different lifecycle stages."
+      }
+    },
+    {
+      "metric": "final_exit_reason_counts",
+      "legacy_value": null,
+      "dataset_value": {
+        "TRAIL": 33,
+        "RELEASE_STOP": 1
+      },
+      "absolute_difference": null,
+      "tolerance": null,
+      "status": "NOT_COMPARABLE",
+      "details": {
+        "note": "New dataset splits exit_reason into release_reason + final_exit_reason. Legacy did not compute final_exit_reason. This is a new capability, not a regression."
+      }
+    }
+  ],
+  "summary": {
+    "total_metrics": 13,
+    "passed": 11,
+    "failed": 0,
+    "expected_diff": 1,
+    "overall_status": "PASS"
+  }
+}

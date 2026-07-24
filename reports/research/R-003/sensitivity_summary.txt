@@ -1,0 +1,38 @@
+Experiment: release_threshold Sensitivity Analysis
+Levels: [6, 8, 10, 12, 14, 16, 18, 20]
+------------------------------------------------------------
+
+Decision Stability: 100.0%
+  Total flips: 0 / 272 cells
+
+Boundary Distance:
+  Cases with known flip threshold: 0
+  Cases without flips: 272
+
+Case Clustering:
+  Sensitive cases (flipped at least once): 0
+  Stable cases (never flipped): 34
+
+Per-level summary:
+  level=6     : change_rate=  0.0%  stability=100.0%  flips=0
+  level=8     : change_rate=  0.0%  stability=100.0%  flips=0
+  level=10    : change_rate=  0.0%  stability=100.0%  flips=0
+  level=12    : change_rate=  0.0%  stability=100.0%  flips=0
+  level=14    : change_rate=  0.0%  stability=100.0%  flips=0
+  level=16    : change_rate=  0.0%  stability=100.0%  flips=0
+  level=18    : change_rate=  0.0%  stability=100.0%  flips=0
+  level=20    : change_rate=  0.0%  stability=100.0%  flips=0
+
+Most sensitive cases (flipped at most levels):
+  mts-20260709-085624            flips=0 margin=-460.0
+  mts-auto-183042-480            flips=0 margin=-498.0
+  mts-auto-133741-001            flips=0 margin=-467.84000000000003
+  mts-auto-150001-119            flips=0 margin=-1115.68
+  mts-auto-152003-393            flips=0 margin=-333.4
+
+Most stable cases (never flipped):
+  mts-20260709-085624            margin=-460.0
+  mts-auto-183042-480            margin=-498.0
+  mts-auto-133741-001            margin=-467.84000000000003
+  mts-auto-150001-119            margin=-1115.68
+  mts-auto-152003-393            margin=-333.4

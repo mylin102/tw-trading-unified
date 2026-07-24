@@ -1,0 +1,23 @@
+R-001: BB Position at Release — Analysis Summary
+Dataset: 20260716T092248Z (aa8cc036f031...)
+Schema:  0.2.0
+Git:     93a789e5
+Analyzed: 2026-07-16T09:23:48.134770+00:00
+--------------------------------------------------
+
+Trades: 25 closed
+  Win/Loss/BE: 14 / 11 / 0
+  Win rate: 56.0%
+  Total PnL: 3385.8
+  Avg PnL: 135.4
+  Avg MFE/MAE: 7452.0 / -3651.9
+  Avg holding: 8.7h
+  Sessions: {'day': 14, 'night': 11}
+  Exit reasons: {'RELEASE_STOP': 25}
+
+Decisions: 68 total
+  Types: {'ENTRY': 18, 'RELEASE_NEAR': 14, 'EXIT_FAR': 13, 'RELEASE_FAR': 12, 'EXIT_NEAR': 11}
+  Snapshots: 68 rows, 18 with z_score
+
+==================================================
+Output: /Users/mylin/Documents/mylin102/tw-trading-unified/reports/research/R-001

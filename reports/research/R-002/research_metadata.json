@@ -1,0 +1,26 @@
+{
+  "research_id": "R-002",
+  "phase": "2A-1",
+  "title": "Release Decision Replay \u2014 Eligibility Classification",
+  "dataset_generation": "parity-final-v5",
+  "dataset_content_hash": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf",
+  "dataset_git_commit": "93a789e5",
+  "analysis_timestamp_utc": "2026-07-16T23:01:07.660952+00:00",
+  "total_cases": 93,
+  "in_scope_release": 34,
+  "eligible": 34,
+  "ineligible": 59,
+  "eligibility_rate": 100.0,
+  "scope_counts": {
+    "IN_SCOPE_RELEASE": 34,
+    "OUT_OF_SCOPE_FINAL_EXIT": 33,
+    "OUT_OF_SCOPE_ENTRY": 26
+  },
+  "status_counts": {
+    "ELIGIBLE": 34,
+    "UNSUPPORTED_ACTION": 59
+  },
+  "qualified_denominator": 34,
+  "release_action_match_target": "100%",
+  "release_leg_match_target": "100%"
+}

@@ -1,0 +1,29 @@
+{
+  "total_decisions": 93,
+  "in_scope_release": 34,
+  "eligible": 34,
+  "ineligible": 59,
+  "eligibility_rate": 100.0,
+  "status_counts": {
+    "ELIGIBLE": 34,
+    "UNSUPPORTED_ACTION": 59
+  },
+  "scope_counts": {
+    "IN_SCOPE_RELEASE": 34,
+    "OUT_OF_SCOPE_FINAL_EXIT": 33,
+    "OUT_OF_SCOPE_ENTRY": 26
+  },
+  "reason_breakdown": {
+    "Deferred to remaining-leg exit reproduction phase": 33,
+    "Deferred to entry reproduction phase": 26
+  },
+  "eligible_release_count": 34,
+  "ineligible_release_count": 0,
+  "missing_fields_summary": {
+    "lifecycle_phase_before": 34,
+    "release_group_status_before": 34
+  },
+  "dataset_generation": "parity-final-v5",
+  "dataset_content_hash": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf",
+  "build_timestamp_utc": "2026-07-16T23:01:07.660841+00:00"
+}

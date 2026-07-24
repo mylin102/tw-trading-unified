@@ -1,0 +1,66 @@
+{
+  "research_manifest": {
+    "schema_version": "SEP-Governance-1.0",
+    "research_id": "R-004.5-Validation-Gate",
+    "generated_at": "2026-07-23T10:00:55.835483+08:00",
+    "deployment_identity": {
+      "deployment_id": "air4",
+      "instance_id": "agent-development",
+      "host_role": "development-control"
+    },
+    "version_provenance": {
+      "git_commit": "97deacc50e816c481b200ff9e06c11333b593da3",
+      "git_dirty": true,
+      "dataset_version": "mts_spread_events.jsonl",
+      "dataset_sha256": "a6f7283cee0c6b0ac403d453b3cf46c3e3e4dde09ecf4a8838ff29e4736d3c0d",
+      "replay_engine_version": "R-004.5-SEP",
+      "policy_version": "v1.0",
+      "execution_semantics_version": "ADR-011",
+      "statistical_method_version": "Bootstrap-Wilcoxon-v1"
+    },
+    "reproducibility_seeds": {
+      "random_seed": 42,
+      "bootstrap_seed": 42,
+      "doe_seed": 42
+    },
+    "extra_metadata": {}
+  },
+  "fidelity": {
+    "Exit Price Reconstruction": 100.0,
+    "Trigger Reconstruction": 100.0,
+    "Trail Distance Reconstruction": 100.0,
+    "Warmup Reconstruction": 100.0,
+    "Retracement Reconstruction": 0.0,
+    "Policy Decision Match": 100.0
+  },
+  "coverage": {
+    "total_exit_episodes": 26,
+    "risk_modes": {
+      "ATR_DYNAMIC": 17,
+      "FIXED_FALLBACK": 9
+    },
+    "exit_reasons": {
+      "TRAIL": 26,
+      "TIMEOUT": 0,
+      "PROFIT_LOCK": 0,
+      "SETTLEMENT": 0,
+      "STOPLOSS": 0
+    },
+    "coverage_entropy_bits": 0.9306
+  },
+  "statistical_inference": {
+    "sample_size_n": 26,
+    "mean_diff_twd": 237.51,
+    "median_diff_twd": 173.88,
+    "bootstrap_resamples_B": 10000,
+    "bootstrap_95_ci": [
+      164.26,
+      323.85
+    ],
+    "wilcoxon_p_value_formatted": "p < 0.0001",
+    "wilcoxon_raw_p_value": 5.960464477539063e-08,
+    "cohens_d": 1.1254,
+    "statistically_significant_p05": true,
+    "evidence_level": "E2 (Counterfactual Replay)"
+  }
+}

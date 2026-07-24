@@ -1,0 +1,13 @@
+{
+  "notification_id": "NOTIF_P2_REPORT_20260723_104955_ce1849ebdcda",
+  "priority": "P2_REPORT",
+  "subject": "[SEP Daily] Operational Brief 2026-07-23 - 439 episodes",
+  "body": "SEP Daily Research Brief\nDate: 2026-07-23 | Execution: SEP-DAILY-20260723-104954-air4\nLatest Dataset Build: mts_spread_events.jsonl\nValidation Status: PASS (Fidelity 100%)\n\n1. Trading Summary\n- Total Episodes Evaluated: 439\n- Risk Mode Breakdown: {'ATR_DYNAMIC': 17, 'FIXED_FALLBACK': 9}\n\n2. Data Quality & Fidelity\n- Replay Fidelity: {'Exit Price Reconstruction': 100.0, 'Trigger Reconstruction': 100.0, 'Trail Distance Reconstruction': 100.0, 'Warmup Reconstruction': 100.0, 'Retracement Reconstruction': 0.0, 'Policy Decision Match': 100.0}\n- Coverage Entropy: 0.9306 bits\n\n3. Baseline Counterfactual\n- Mean ATR Advantage: +237.51 TWD\n- Median ATR Advantage: +173.88 TWD\n- Wilcoxon p-value: p < 0.0001\n- Cohen's d: 1.1254 (Evidence Level E2 (Counterfactual Replay))\n",
+  "report_execution_id": "SEP-DAILY-20260723-104954-air4",
+  "queued_at": "2026-07-23T10:49:55.283785+08:00",
+  "attempt_count": 1,
+  "max_attempts": 5,
+  "status": "SENT",
+  "last_error": null,
+  "sent_at": "2026-07-23T10:50:02.164443+08:00"
+}

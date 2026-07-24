@@ -1,0 +1,27 @@
+{
+  "experiment_id": "exp-20260720T073620Z",
+  "experiment_type": "DECISION_POINT_PARAMETER_SWEEP",
+  "baseline_id": "research-baseline-v1.0",
+  "dataset_generation_id": "20260718T221405Z",
+  "git_commit": "6ced450e4271c074da539e2233ee9b6a210a0f81",
+  "repo_state": "DIRTY",
+  "experiment_hash": "sha256:3928228920049f752431ea2258259870b9471b7f2e2ade51b694dae8553c6120",
+  "methodology_version": "v1.0.0",
+  "parameter_name": "release_stop_threshold",
+  "parameter_values": [
+    80.0,
+    90.0,
+    100.0,
+    110.0,
+    120.0,
+    130.0,
+    140.0,
+    150.0,
+    160.0,
+    170.0,
+    180.0,
+    190.0,
+    200.0
+  ],
+  "generated_at": "2026-07-20T07:36:02.045557Z"
+}

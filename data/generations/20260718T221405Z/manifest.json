@@ -1,0 +1,35 @@
+{
+  "dataset_build_id": "20260718T221405Z",
+  "schema_version": "0.2.0",
+  "builder_version": "0.2.0",
+  "git_commit": "b416bfd8",
+  "build_timestamp_utc": "2026-07-18T22:14:06.135510+00:00",
+  "dataset_content_hash": "91535fae0f1c370376e25f9fd96f185d3414f14cab246fd5b6f42d4bf7b0cac4",
+  "source_files": [
+    {
+      "path": "logs/mts_trade_fills.jsonl",
+      "size": 119169,
+      "sha256": "0ab9b07f93eb47a5642308bf876c07886026c1c2c14a4887d2f7a319ca6103fa"
+    },
+    {
+      "path": "logs/mts_spread_events.jsonl",
+      "size": 283140,
+      "sha256": "f1bdcef1eac7247a7222ed65028e619ad25e5b5dd28224905d0723f8d004aaf2"
+    }
+  ],
+  "row_counts": {
+    "trade_facts": 56,
+    "trade_snapshots": 265,
+    "trade_decisions": 156,
+    "trade_outcomes": 55
+  },
+  "trade_counts": {
+    "all": 56,
+    "closed": 55,
+    "open": 1,
+    "partial": 0,
+    "outcome_complete": 55
+  },
+  "min_timestamp": "2026-07-08T09:02:44.167000",
+  "max_timestamp": "2026-07-18T00:27:47.307000"
+}

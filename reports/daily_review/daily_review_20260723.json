@@ -1,0 +1,63 @@
+{
+  "execution_id": "SEP-DAILY-20260723-104954-air4",
+  "date": "2026-07-23",
+  "manifest": {
+    "schema_version": "SEP-Governance-1.0",
+    "research_id": "Daily-Review-20260723",
+    "generated_at": "2026-07-23T10:49:55.281669+08:00",
+    "deployment_identity": {
+      "deployment_id": "air4",
+      "instance_id": "agent-development",
+      "host_role": "development-control"
+    },
+    "version_provenance": {
+      "git_commit": "8277e3ab662bec5b76b942883db032728ebc03c9",
+      "git_dirty": true,
+      "dataset_version": "mts_spread_events.jsonl",
+      "dataset_sha256": "a6f7283cee0c6b0ac403d453b3cf46c3e3e4dde09ecf4a8838ff29e4736d3c0d",
+      "replay_engine_version": "R-004.5-SEP",
+      "policy_version": "v1.0",
+      "execution_semantics_version": "ADR-011",
+      "statistical_method_version": "Bootstrap-Wilcoxon-v1"
+    },
+    "reproducibility_seeds": {
+      "random_seed": 42,
+      "bootstrap_seed": 42,
+      "doe_seed": 42
+    },
+    "extra_metadata": {}
+  },
+  "trading_summary": {
+    "total_episodes": 439,
+    "exit_reasons": {
+      "TRAIL": 26,
+      "TIMEOUT": 0,
+      "PROFIT_LOCK": 0,
+      "SETTLEMENT": 0,
+      "STOPLOSS": 0
+    },
+    "risk_modes": {
+      "ATR_DYNAMIC": 17,
+      "FIXED_FALLBACK": 9
+    }
+  },
+  "data_health": {
+    "fidelity": {
+      "Exit Price Reconstruction": 100.0,
+      "Trigger Reconstruction": 100.0,
+      "Trail Distance Reconstruction": 100.0,
+      "Warmup Reconstruction": 100.0,
+      "Retracement Reconstruction": 0.0,
+      "Policy Decision Match": 100.0
+    },
+    "coverage_entropy": 0.9306
+  },
+  "baseline_replay": {
+    "sample_size_n": 26,
+    "mean_diff_twd": 237.51,
+    "median_diff_twd": 173.88,
+    "wilcoxon": "p < 0.0001",
+    "cohens_d": 1.1254,
+    "evidence_level": "E2 (Counterfactual Replay)"
+  }
+}

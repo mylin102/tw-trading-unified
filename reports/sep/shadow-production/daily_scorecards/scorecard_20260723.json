@@ -1,0 +1,41 @@
+{
+  "schema_version": "SEP-Shadow-Scorecard-1.0",
+  "date": "2026-07-23",
+  "deployment_id": "air4",
+  "host_role": "offline_research",
+  "observation_window": {
+    "start_date": "2026-07-23",
+    "end_date": "2026-08-06",
+    "state": "SHADOW_PRODUCTION_ACTIVE"
+  },
+  "ingestion": {
+    "expected_runs": 24,
+    "completed_runs": 24,
+    "failed_runs": 0,
+    "latest_bundle_latency_minutes": 15
+  },
+  "reports": {
+    "daily_expected": true,
+    "daily_generated": true,
+    "daily_generated_at": "2026-07-23T11:07:08.371315+08:00",
+    "on_time": true,
+    "duplicate_count": 0
+  },
+  "notifications": {
+    "pending_count": 0,
+    "oldest_pending_minutes": 0,
+    "sent_count": 1,
+    "failed_count": 0
+  },
+  "datasets": {
+    "hash_validation_rate": 1.0,
+    "quarantined_unresolved": 0
+  },
+  "security": {
+    "broker_access_success_on_air4": 0,
+    "research_execution_success_on_mini": 0
+  },
+  "replay": {
+    "fidelity_rate": 1.0
+  }
+}

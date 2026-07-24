@@ -1,0 +1,9 @@
+{
+  "schema_version": "0.1.0",
+  "git_commit": "93a789e5",
+  "build_timestamp": "2026-07-16T16:58:45.416802",
+  "fills_path": "logs/mts_trade_fills.jsonl",
+  "events_path": "logs/mts_spread_events.jsonl",
+  "num_trades": 26,
+  "num_decisions": 67
+}

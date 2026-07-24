@@ -170,10 +170,21 @@ class ShioajiClient:
                 mxf_list = get_contracts_list(self.api, "Futures", "MXF")
 
                 if not mxf_list: return None
-                now_str = datetime.now().strftime("%Y/%m/%d")
-                valid = [c for c in mxf_list if c.delivery_date >= now_str]
+                # 2026-07-24 Gemini CLI: Normalize delivery_date to datetime.date to prevent str vs datetime.date TypeError
+                now_date = datetime.now().date()
+                def _to_date(c):
+                    d = getattr(c, "delivery_date", None)
+                    if d is None: return now_date
+                    if isinstance(d, str):
+                        try:
+                            return datetime.strptime(d.replace("-", "/"), "%Y/%m/%d").date()
+                        except Exception:
+                            return now_date
+                    return d if hasattr(d, "year") else now_date
+
+                valid = [c for c in mxf_list if _to_date(c) >= now_date]
                 if valid:
-                    return sorted(valid, key=lambda c: c.delivery_date)[0]
+                    return sorted(valid, key=_to_date)[0]
                 return mxf_list[0]
                 
             category = ticker[:3] if len(ticker) > 3 else ticker

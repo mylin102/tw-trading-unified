@@ -1,0 +1,22 @@
+{
+  "total_cases": 34,
+  "action_match": 34,
+  "action_match_rate": 100.0,
+  "leg_match": 34,
+  "leg_match_rate": 100.0,
+  "reason_match": 34,
+  "reason_match_rate": 100.0,
+  "mismatch_count": 0,
+  "mismatch_rate": 0.0,
+  "category_counts": {
+    "MATCH": 34
+  },
+  "exception_count": 0,
+  "dataset_generation": "parity-final-v6",
+  "dataset_content_hash": "f370cc1794f1208b7be1cf3ff1c5b6e67cfe3481e184ed2bbaf619c2e0688cbf",
+  "build_timestamp_utc": "2026-07-16T23:06:31.579949+00:00",
+  "side_effects_detected": false,
+  "order_independent": true,
+  "reproduction_content_hash": "24a11d30ca1f0537a3cb30b29455f4bb7feb194792ede147f427ceddaf089b56",
+  "analysis_git_commit": "93a789e5"
+}

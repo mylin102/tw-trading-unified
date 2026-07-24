@@ -1,0 +1,51 @@
+    return None
+
+# Spread CSV discovery helpers (2026-07-22: ticker-scoped, no mtime cross-ticker)
+import re as _re_spread
+_SPREAD_FILE_RE = _re_spread.compile(
+    r"^(?P<ticker>[a-z0-9]+)_calendar_spread_(?P<date>\d{8})\.csv$"
+)
+
+
+def _latest_spread_csv(ticker: str, data_dir=None):
+    from pathlib import Path
+    if data_dir is None:
+        data_dir = Path("data")
+    normalized_ticker = ticker.lower()
+    candidates = []
+    for path in data_dir.glob(f"{normalized_ticker}_calendar_spread_*.csv"):
+        m = _SPREAD_FILE_RE.fullmatch(path.name)
+        if m is None:
+            continue
+        if m.group("ticker") != normalized_ticker:
+            continue
+        candidates.append((m.group("date"), path))
+    if not candidates:
+        return None
+    _, latest_path = max(
+        candidates,
+        key=lambda item: (item[0], item[1].stat().st_mtime_ns),
+    )
+    return latest_path
+
+
+@st.cache_data
+def _load_spread_csv(path_str: str, mtime_ns: int):
+    del mtime_ns
+    import pandas as pd
+    try:
+        df = pd.read_csv(path_str)
+        if "timestamp" not in df.columns:
+            if "ts" in df.columns:
+                df = df.rename(columns={"ts": "timestamp"})
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+            df = df.dropna(subset=["timestamp"])
+        return df
+    except Exception as e:
+        print(f"[Calendar Spread] LOAD FAILED: {e}")
+        return None
+
+
+@st.cache_data(ttl=60)
+def load_calendar_spread_data():

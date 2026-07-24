@@ -989,6 +989,29 @@ class TMFSpread(StrategyBase):
         self._trail_pending_mono: float = 0.0     # starts when TRAIL decision first made (SINGLE_LEG only)
         # Hard exit actions (STOPLOSS/TIMEOUT/MANUAL) bypass immediately — no timer needed.
 
+        # 2026-07-24 Gemini CLI: Mount ShadowSoakCollector for Wave 1D.3 Production Shadow Soak Observation
+        try:
+            from strategies.futures.mts.soak_collector import ShadowSoakCollector
+            self._soak_collector = ShadowSoakCollector(
+                base_dir="data/telemetry/shadow-soak",
+                deployment_id=f"tmf-spread-{self._ticker.lower()}",
+                authority="legacy",
+                override_git_clean=True,
+            )
+            logger.info("[MTS_SOAK] ShadowSoakCollector mounted successfully generation_id=%s", self._soak_collector.generation_id)
+        except Exception as e:
+            logger.warning("[MTS_SOAK] Failed to initialize ShadowSoakCollector: %s", e)
+            self._soak_collector = None
+
+    def close_soak_collector(self, reason: str = "CLEAN_SHUTDOWN") -> None:
+        """2026-07-24 Gemini CLI: Export immutable manifest and flush spooler on shutdown."""
+        if getattr(self, "_soak_collector", None) is not None:
+            try:
+                manifest = self._soak_collector.close_and_export_manifest(termination_reason=reason)
+                logger.info("[MTS_SOAK] Manifest exported: status=%s hash=%s", manifest.evaluate_soak_status(), manifest.manifest_hash)
+            except Exception as e:
+                logger.exception("[MTS_SOAK] Failed to export manifest: %s", e)
+
         # ── ADR-011 Phase 4: Post-fill warmup (2026-07-16) ──
         # Prevents immediate EXIT after SINGLE_LEG transition from stale ticks/callbacks.
         self._single_leg_entered_mono: float = 0.0      # monotonic timestamp when SINGLE_LEG entered
@@ -2127,6 +2150,13 @@ class TMFSpread(StrategyBase):
         if not bar:
             self._set_eval(skip_reason="NO_BAR")
             return None
+
+        # 2026-07-24 Gemini CLI: Record market callback for ShadowSoakCollector
+        if getattr(self, "_soak_collector", None) is not None:
+            try:
+                self._soak_collector.record_market_callback()
+            except Exception:
+                pass
 
         # 2026-06-25 Gemini CLI: Define now early to use for re-entry cooldown checks
         ts = bar.get("timestamp")

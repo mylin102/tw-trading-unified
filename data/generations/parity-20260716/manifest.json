@@ -1,0 +1,35 @@
+{
+  "dataset_build_id": "parity-20260716",
+  "schema_version": "0.2.0",
+  "builder_version": "0.2.0",
+  "git_commit": "93a789e5",
+  "build_timestamp_utc": "2026-07-16T13:14:30.213748+00:00",
+  "dataset_content_hash": "367aa3ece1173fdd1ccd4258ea85e77be30ff7e4e9320ce134543fdf996e9443",
+  "source_files": [
+    {
+      "path": "data/frozen/parity_20260716/mts_trade_fills.jsonl",
+      "size": 59053,
+      "sha256": "9a0782fedd34e4846089a2cefcbbd6fe45521f582ba4cfbdcca4e21a676835fe"
+    },
+    {
+      "path": "data/frozen/parity_20260716/mts_spread_events.jsonl",
+      "size": 133397,
+      "sha256": "a6f7283cee0c6b0ac403d453b3cf46c3e3e4dde09ecf4a8838ff29e4736d3c0d"
+    }
+  ],
+  "row_counts": {
+    "trade_facts": 28,
+    "trade_snapshots": 99,
+    "trade_decisions": 72,
+    "trade_outcomes": 27
+  },
+  "trade_counts": {
+    "all": 28,
+    "closed": 27,
+    "open": 1,
+    "partial": 0,
+    "outcome_complete": 27
+  },
+  "min_timestamp": "2026-07-08T09:02:44.167000",
+  "max_timestamp": "2026-07-16T20:29:08.971000"
+}

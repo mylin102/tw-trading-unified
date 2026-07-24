@@ -1,0 +1,30 @@
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[[package]]
+name = "shioaji"
+version = "1.5.5"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3b/1f/bb3f7f760179f7867227314716f5b03ae16fe92cac48057e72aabf7a79e2/shioaji-1.5.5-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:7694e3b42447778521ebc9c9d1937b7c98ea537444985eb711a5934d84e00c2c", size = 36671098, upload-time = "2026-07-02T09:35:38.679Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/00/ad4d42b2f6df9ba45b25eb3d64ceeea38e9b4e5bace591015a40f8f79300/shioaji-1.5.5-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:cc2bf630f62073fd50b8b19eab9f615d76e08b123dfb27071b9dbfa37ca5e4f3", size = 33873565, upload-time = "2026-07-02T09:43:42.261Z" },
+    { url = "https://files.pythonhosted.org/packages/11/7d/43fcdef60e94a65d12f1eafadbc57dd18915217d50766f8e482ab83c7799/shioaji-1.5.5-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4e2a03193ec5e711f66ca8933feacb3dbf0c31c819ccf93f5103c45639cf344d", size = 38356210, upload-time = "2026-07-02T09:33:33.997Z" },
+    { url = "https://files.pythonhosted.org/packages/95/23/a5e8a641e635474bba15a18268067a6ad9fce1f6448f67af66c60a946df3/shioaji-1.5.5-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:d9276beaeb0110a904e40724cdfd0e4bd88ae28934776c5d874a579ba3f97a79", size = 35933859, upload-time = "2026-07-02T09:32:34.696Z" },
+    { url = "https://files.pythonhosted.org/packages/ff/53/7aa3582d3f25a47786920d59bac2123a58d001eebf0a9a89025f04f79dcc/shioaji-1.5.5-cp37-abi3-macosx_10_15_x86_64.whl", hash = "sha256:87492650e54c3818191ceaf05931c9e60c04e023db50c278fa55ad0b5c156659", size = 36700303, upload-time = "2026-07-02T09:36:53.675Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/e2/f5fe1ffe21d27a57e296ca3ae7ed76795e62d1e441716ebce3f6ec66c38c/shioaji-1.5.5-cp37-abi3-macosx_11_0_arm64.whl", hash = "sha256:d8c1e4616ab9f6363ac5c242fddb999c5aeb49cf481a967887309d2de37e6712", size = 33888435, upload-time = "2026-07-02T09:38:01.958Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/76/db4dac7252c27197a01d10a701fe2ff803d8d15cbf39cdd2c0c319ce7b7c/shioaji-1.5.5-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c93583f84a96d968802e1d3bfb4609f43013134d1e988c40143e28ba316b95e1", size = 38351144, upload-time = "2026-07-02T09:29:38.213Z" },
+    { url = "https://files.pythonhosted.org/packages/62/dc/3551bd983ab9435a56a9ed68772411f1eb41a05fdf435232dafa3e15cf66/shioaji-1.5.5-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:94505fad27f1aa1e59e950349597cb3b99a77b37f95e32c490d43062be55071c", size = 35928013, upload-time = "2026-07-02T09:41:24.017Z" },
+    { url = "https://files.pythonhosted.org/packages/84/cd/52341197cabd9f9b26088df12931e419170de79382aa70fdd0ae1e3fec2a/shioaji-1.5.5-cp37-abi3-win_amd64.whl", hash = "sha256:4d67fa313ba09a392781ee9e5d0933f6d4e1439e5cdfe75722468a7dd912df8e", size = 40363468, upload-time = "2026-07-02T09:39:56.47Z" },
+]
+
+[[package]]
+name = "tw-trading-unified"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "shioaji" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "shioaji", specifier = "==1.5.5" }]

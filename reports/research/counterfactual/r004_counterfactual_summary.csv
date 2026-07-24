@@ -1,0 +1,6 @@
+Policy,Trades,Total Realized PnL (TWD),Avg PnL (TWD),Avg PED (TWD),MFE+ Final- Count,MFE+ Final- Rate (%),Avg MFE Retention Ratio
+ATR_DYNAMIC_With_Profit_Protection,25,70623.53,2824.94,3.53,0,0.0,0.92
+Baseline,25,70623.53,2824.94,3.53,0,0.0,0.92
+FIXED_FALLBACK_With_Profit_Protection,25,70623.53,2824.94,3.53,0,0.0,0.92
+Pure_ATR_DYNAMIC,25,69303.29,2772.13,56.34,0,0.0,0.902
+Pure_FIXED_FALLBACK,25,66201.69,2648.07,180.4,0,0.0,0.86
