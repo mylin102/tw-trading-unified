@@ -1216,6 +1216,7 @@ def make_calendar_spread_chart(spread_df):
         return None
     
     try:
+        import pandas as pd
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
         
