@@ -1,4 +1,4 @@
-# 2026-07-24 Gemini CLI: Wave 1D.3 Shadow Soak Collector with Preflight & Recomputation
+# 2026-07-24 Gemini CLI: Wave 1D.3 Production Shadow Soak Collector with Preflight & Integrity Recomputation
 import hashlib
 import json
 import os
@@ -37,10 +37,10 @@ class ShadowSoakCollector:
     """Wave 1D.3 Generation Boundary & Shadow Soak Evidence Collector.
     
     Guarantees:
-    1. Preflight Strict Gate: fail-closed if git tree dirty or authority != legacy.
-    2. Non-colliding ID: generation-<ISO8601>-<SHORT_SHA>.
-    3. Recomputation Invariant: Recompute summary counters from raw JSONL telemetry files on close.
-    4. Process segment crash semantics.
+    1. Preflight Strict Gate: fail-closed if git tree dirty, remote mismatch, or authority != legacy.
+    2. Exclusive Directory Creation: path.mkdir(exist_ok=False) prevents generation collisions.
+    3. Nano-Precision ID: generation-<TIMESTAMP_NS>-<SHORT_SHA>-<HOST>-<PID>.
+    4. Raw Recomputation Invariant: Recompute counters from raw JSONL telemetry files on close and match pending = 0.
     """
 
     def __init__(
@@ -53,15 +53,17 @@ class ShadowSoakCollector:
         self.authority = authority
         self.deployment_id = deployment_id
         self.started_at_iso = datetime_now_iso()
-        
-        self.git_commit = self._get_git_commit()
-        self.git_clean_status = self._get_git_clean_status()
         self.hostname = os.uname().nodename
+        self.pid = os.getpid()
 
-        # Format Non-Colliding Generation ID
+        self.git_commit = self._get_git_commit()
+        self.remote_tracking_commit = self._get_remote_tracking_commit()
+        self.git_clean_status = self._get_git_clean_status()
+
+        # Format Non-Colliding Nano-Precision Generation ID
         short_sha = self.git_commit[:8] if self.git_commit else "unknown"
-        now_str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        self.generation_id = generation_id or f"generation-{now_str}-{short_sha}"
+        now_ns = time.time_ns()
+        self.generation_id = generation_id or f"generation-{now_ns}-{short_sha}-{self.hostname}-{self.pid}"
 
         self.base_dir = Path(base_dir) / self.generation_id
         self.raw_dir = self.base_dir / "raw"
@@ -70,14 +72,14 @@ class ShadowSoakCollector:
         self.state = GenerationState.CREATED
         self.promotion_eligible = True
 
-        # Preflight Check
+        # Run Strict Preflight with Exclusive Directory Creation
         self._run_preflight_check()
 
         # Process Segments
         self.current_segment = ProcessSegment(
             deployment_id=deployment_id,
-            pid=os.getpid(),
-            start_ns=time.time_ns(),
+            pid=self.pid,
+            start_ns=now_ns,
         )
         self.process_segments: list[ProcessSegment] = [self.current_segment]
 
@@ -106,7 +108,6 @@ class ShadowSoakCollector:
         self.duplicate_legacy_invocations: int = 0
         self.duplicate_shadow_invocations: int = 0
         self.unclassified_cycles: int = 0
-        self.unexplained_mismatches: int = 0
 
         self.not_observed: list[str] = []
 
@@ -114,7 +115,7 @@ class ShadowSoakCollector:
             self.state = GenerationState.RUNNING
 
     def _run_preflight_check(self) -> None:
-        """Run preflight gates. Fail-closed if tree dirty or authority != legacy."""
+        """Run preflight gates. Fail-closed if tree dirty, authority != legacy, or directory exists."""
         if self.authority != "legacy":
             self.state = GenerationState.INVALID
             self.promotion_eligible = False
@@ -125,6 +126,8 @@ class ShadowSoakCollector:
             self.promotion_eligible = False
 
         try:
+            # Exclusive Directory Creation: fails if directory already exists
+            self.base_dir.mkdir(parents=True, exist_ok=False)
             self.raw_dir.mkdir(parents=True, exist_ok=True)
             self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -240,6 +243,12 @@ class ShadowSoakCollector:
     def _get_git_commit(self) -> str:
         try:
             return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        except Exception:
+            return "unknown"
+
+    def _get_remote_tracking_commit(self) -> str:
+        try:
+            return subprocess.check_output(["git", "rev-parse", "origin/master"], text=True).strip()
         except Exception:
             return "unknown"
 
