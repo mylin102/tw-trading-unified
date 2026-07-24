@@ -419,10 +419,10 @@ with st.sidebar:
             st.warning(f"診斷腳本回傳碼: {result.returncode}")
 
     if st.button("📊 更新價差資料 (Spread)"):
-        import subprocess
+        import subprocess, sys
         with st.spinner("正在擷取近月/遠月價差資料..."):
             result = subprocess.run(
-                ["python3", "scripts/fetch_calendar_spread_data.py"],
+                [sys.executable, "scripts/fetch_calendar_spread_data.py"],
                 capture_output=True, text=True, timeout=180,
             )
         output = result.stdout + result.stderr
