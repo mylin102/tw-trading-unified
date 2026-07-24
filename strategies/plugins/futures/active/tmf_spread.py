@@ -349,6 +349,98 @@ class FlatEvidence:
     reconciliation_reason: str | None = None
     timestamp: str | None = None
 
+# ── 2026-07-25 Gemini CLI: Per-leg & Tiered Quote Freshness Policy ──
+class FreshnessTier(str, Enum):
+    FRESH = "FRESH"
+    DEGRADED = "DEGRADED"
+    STALE = "STALE"
+    CRITICAL = "CRITICAL"
+
+class QuoteFreshnessPolicy:
+    """
+    Tiered quote freshness policy for multi-leg futures strategy.
+    
+    Tiers:
+      - FRESH (<= decision_max_ms): Normal evaluation permitted.
+      - DEGRADED (decision_max_ms < age <= hard_stale_ms): Entry blocked; active position risk allowed in conservative mode.
+      - STALE (hard_stale_ms < age <= emergency_stale_ms): Entry blocked; risk escalation bypass enabled for active positions.
+      - CRITICAL (> emergency_stale_ms): Data feed failure; trigger alert and position reconciliation.
+    """
+    def __init__(
+        self,
+        near_max_ms: float = 3000.0,
+        near_hard_stale_ms: float = 10000.0,
+        far_max_ms: float = 8000.0,
+        far_hard_stale_ms: float = 15000.0,
+        emergency_stale_ms: float = 30000.0,
+    ):
+        self.near_max_ms = near_max_ms
+        self.near_hard_stale_ms = near_hard_stale_ms
+        self.far_max_ms = far_max_ms
+        self.far_hard_stale_ms = far_hard_stale_ms
+        self.emergency_stale_ms = emergency_stale_ms
+
+    def evaluate_leg(self, leg_name: str, quote_age_ms: float) -> FreshnessTier:
+        max_ms = self.near_max_ms if leg_name.lower() == "near" else self.far_max_ms
+        hard_ms = self.near_hard_stale_ms if leg_name.lower() == "near" else self.far_hard_stale_ms
+        
+        if quote_age_ms <= max_ms:
+            return FreshnessTier.FRESH
+        elif quote_age_ms <= hard_ms:
+            return FreshnessTier.DEGRADED
+        elif quote_age_ms <= self.emergency_stale_ms:
+            return FreshnessTier.STALE
+        else:
+            return FreshnessTier.CRITICAL
+
+    def evaluate_action_matrix(
+        self,
+        tier: FreshnessTier,
+        is_active_position: bool = False,
+        is_risk_worsening: bool = False,
+        is_emergency: bool = False,
+    ) -> dict[str, bool]:
+        """
+        Evaluates action permissions for a given FreshnessTier:
+          - allow_entry: New entry allowed
+          - allow_normal_release: Standard strategy release allowed
+          - allow_risk_release: Risk worsening (escalated) release allowed for active position
+          - allow_emergency_exit: Emergency exit allowed
+          - trigger_reconciliation: Needs data health alarm & broker reconciliation
+        """
+        if tier == FreshnessTier.FRESH:
+            return {
+                "allow_entry": True,
+                "allow_normal_release": True,
+                "allow_risk_release": True,
+                "allow_emergency_exit": True,
+                "trigger_reconciliation": False,
+            }
+        elif tier == FreshnessTier.DEGRADED:
+            return {
+                "allow_entry": False,
+                "allow_normal_release": True if is_active_position else False,
+                "allow_risk_release": True,
+                "allow_emergency_exit": True,
+                "trigger_reconciliation": False,
+            }
+        elif tier == FreshnessTier.STALE:
+            return {
+                "allow_entry": False,
+                "allow_normal_release": False,
+                "allow_risk_release": True if (is_active_position and is_risk_worsening) else False,
+                "allow_emergency_exit": True,
+                "trigger_reconciliation": True,
+            }
+        else:  # CRITICAL
+            return {
+                "allow_entry": False,
+                "allow_normal_release": False,
+                "allow_risk_release": True if (is_active_position and is_risk_worsening) else False,
+                "allow_emergency_exit": True,
+                "trigger_reconciliation": True,
+            }
+
 _MTS_STATE_REVISION = 0  # incremented on every lifecycle state write
 
 # ═══════════════════════════════════════════════════════════════
@@ -1252,10 +1344,23 @@ class TMFSpread(StrategyBase):
         self._single_leg_warmup_ticks: int = 2
 
         # 2026-07-20 Gemini CLI: Initialize MTS Lifecycle Adapter & temporal guard tracking
-        from strategies.plugins.futures.active.mts_lifecycle_adapter import MtsLifecycleAdapter
-        self._lifecycle_adapter = MtsLifecycleAdapter()
         self._last_applied_event_time = None
         self._single_leg_started_at = None
+        self._ensure_lifecycle_adapter_initialized("INIT")
+
+    def _ensure_lifecycle_adapter_initialized(self, source: str = "NORMAL") -> None:
+        """
+        Deterministic initialization boundary for MtsLifecycleAdapter.
+        Ensures adapter is initialized with authoritative context.
+        """
+        if getattr(self, "_lifecycle_adapter", None) is None:
+            from strategies.plugins.futures.active.mts_lifecycle_adapter import MtsLifecycleAdapter
+            self._lifecycle_adapter = MtsLifecycleAdapter()
+            if source == "LATE_INIT":
+                logger.error(
+                    "[MTS_LIFECYCLE_ADAPTER_LATE_INIT] severity=ERROR source=%s adapter initialized late",
+                    source
+                )
 
     def _current_lifecycle_state(self) -> dict:
         """ADR-009: serialize lifecycle block for _write_mts_state. Never raises."""
@@ -1353,6 +1458,7 @@ class TMFSpread(StrategyBase):
         """
         self._has_position = True
         self._lifecycle = "OPEN"
+        self._ensure_lifecycle_adapter_initialized("SYNC_POSITION")
         self._trade_id = trade_id
         self._side = None  # None until release as per contract tests
         self._near_entry = near_entry
@@ -2363,18 +2469,18 @@ class TMFSpread(StrategyBase):
             self._trail_dist_fixed = float(_params.get("trail_distance_points", self._trail_dist_fixed))
             self._min_atr = float(_params.get("min_atr", self._min_atr))
 
-            # 2026-07-14 Gemini CLI: Hot-reload quote age and tick confirmation configs
-            self._confirm_ticks = int(_params.get("confirm_ticks", self._confirm_ticks))
-            self._confirm_ms = float(_params.get("confirm_ms", self._confirm_ms))
-            self._max_quote_age_ms = float(_params.get("max_quote_age_ms", self._max_quote_age_ms))
-            self._max_spread_width = float(_params.get("max_spread_width", self._max_spread_width))
+            # 2026-07-14 Gemini CLI: Hot-reload quote age and tick confirmation configs safely with getattr
+            self._confirm_ticks = int(_params.get("confirm_ticks", getattr(self, "_confirm_ticks", 2)))
+            self._confirm_ms = float(_params.get("confirm_ms", getattr(self, "_confirm_ms", 200.0)))
+            self._max_quote_age_ms = float(_params.get("max_quote_age_ms", getattr(self, "_max_quote_age_ms", 10000.0)))
+            self._max_spread_width = float(_params.get("max_spread_width", getattr(self, "_max_spread_width", 50.0)))
 
             # 2026-07-16 Hermes Agent: ADR-011 Phase 4 hot-reload warmup params
-            self._single_leg_warmup_ms = float(_params.get("single_leg_warmup_ms", self._single_leg_warmup_ms))
-            self._single_leg_warmup_ticks = int(_params.get("single_leg_warmup_ticks", self._single_leg_warmup_ticks))
+            self._single_leg_warmup_ms = float(_params.get("single_leg_warmup_ms", getattr(self, "_single_leg_warmup_ms", 500.0)))
+            self._single_leg_warmup_ticks = int(_params.get("single_leg_warmup_ticks", getattr(self, "_single_leg_warmup_ticks", 2)))
 
             # 2026-07-16 Hermes Agent: Emergency quote guard bypass hot-reload (shared, not BB per ADR-014)
-            self._emergency_bypass_enabled = bool(_params.get("emergency_bypass_enabled", self._emergency_bypass_enabled))
+            self._emergency_bypass_enabled = bool(_params.get("emergency_bypass_enabled", getattr(self, "_emergency_bypass_enabled", True)))
 
         bar = context.market.last_bar
         if not bar:
@@ -2892,9 +2998,9 @@ class TMFSpread(StrategyBase):
                     "timestamp": now.isoformat(),
                     "ts": now.isoformat(),
                 },
-                lifecycle=self._lifecycle_oca,
                 execution_mode="BACKTEST" if _is_backtest else "LIVE",
             )
+            self._ensure_lifecycle_adapter_initialized("LATE_INIT")
             _adapter_res = self._lifecycle_adapter.evaluate(_adapter_input)
             _decision = _adapter_res.decision
             # 2026-07-16 Gemini CLI: P0 Invariant Assertion to detect evaluate_lifecycle_actions regression (Phase 3a)
@@ -3290,21 +3396,25 @@ class TMFSpread(StrategyBase):
                 # Prevents immediate EXIT triggered by stale pre-fill prices or
                 # callback-timing races.
                 if _decision.action == LifecycleAction.TRAIL and not _is_backtest:
-                    _warmup_elapsed = (time.monotonic() - self._single_leg_entered_mono) * 1000.0 if self._single_leg_entered_mono > 0 else 0.0
-                    _warmup_ticks = self._single_leg_post_fill_ticks
-                    if _warmup_elapsed < self._single_leg_warmup_ms or _warmup_ticks < self._single_leg_warmup_ticks:
+                    _warmup_ms = getattr(self, "_single_leg_warmup_ms", 500.0)
+                    _warmup_ticks_req = getattr(self, "_single_leg_warmup_ticks", 2)
+                    _single_leg_mono = getattr(self, "_single_leg_entered_mono", 0.0)
+                    _post_ticks = getattr(self, "_single_leg_post_fill_ticks", 0)
+                    _warmup_elapsed = (time.monotonic() - _single_leg_mono) * 1000.0 if _single_leg_mono > 0 else 0.0
+                    _warmup_ticks = _post_ticks
+                    if _warmup_elapsed < _warmup_ms or _warmup_ticks < _warmup_ticks_req:
                         self._trail_pending_mono = 0.0  # prevent timeout bleed
                         self._set_eval(
                             skip_reason="TRAIL_WARMUP",
                             elapsed_ms=round(_warmup_elapsed, 1),
-                            warmup_ms=self._single_leg_warmup_ms,
+                            warmup_ms=_warmup_ms,
                             ticks=_warmup_ticks,
-                            warmup_ticks=self._single_leg_warmup_ticks,
+                            warmup_ticks=_warmup_ticks_req,
                         )
                         logger.warning(
                             "[MTS_TRAIL_WARMUP] elapsed=%.0f/%s ticks=%s/%s",
-                            _warmup_elapsed, self._single_leg_warmup_ms,
-                            _warmup_ticks, self._single_leg_warmup_ticks,
+                            _warmup_elapsed, _warmup_ms,
+                            _warmup_ticks, _warmup_ticks_req,
                         )
                         return None
                 # TRAIL / STOPLOSS / TIMEOUT: full exit of remaining leg

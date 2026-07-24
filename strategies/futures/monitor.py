@@ -5575,9 +5575,20 @@ class FuturesMonitor:
                     _f_pts = (_f_last_calc - _f_entry) * (-1 if _f_side == "SHORT" else 1)
                     _f_upl = _f_pts * _mult
 
-            # 2026-07-25 Gemini CLI: Handle RecoveryState enum (e.g. RecoveryState.FLAT_CONFIRMED) properly via .value / .name
-            _rec_val = getattr(_recovery_state, "value", getattr(_recovery_state, "name", str(_recovery_state)))
-            if _recovery_state is not None and _rec_val not in ("RECOVERED", "FLAT_CONFIRMED") and str(_recovery_state) not in ("RECOVERED", "FLAT_CONFIRMED"):
+            # 2026-07-25 Gemini CLI: Typed Enum comparison for RecoveryState — eliminate string guessing
+            from strategies.plugins.futures.active.tmf_spread import RecoveryState
+            _recovery_state = getattr(strategy, "_mts_recovery_state", None)
+            _is_active_state = False
+            if _recovery_state is None:
+                _is_active_state = True
+            elif isinstance(_recovery_state, RecoveryState):
+                _is_active_state = _recovery_state in (RecoveryState.RECOVERED, RecoveryState.FLAT_CONFIRMED)
+            elif isinstance(_recovery_state, str):
+                _is_active_state = _recovery_state.upper() in ("RECOVERED", "FLAT_CONFIRMED")
+            elif hasattr(_recovery_state, "name"):
+                _is_active_state = _recovery_state.name.upper() in ("RECOVERED", "FLAT_CONFIRMED")
+
+            if not _is_active_state:
                 # Allow telemetry (prices, UPL) but don't write lifecycle
                 try:
                     from strategies.plugins.futures.active.tmf_spread import _write_mts_telemetry as _hb_telemetry
