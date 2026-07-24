@@ -1330,6 +1330,31 @@ def make_calendar_spread_chart(spread_df):
                 row=3, col=1
             )
             
+            # Z-score 速度 (一階微分) 與加速度 (二階微分)
+            _z = spread_df["spread_z"]
+            _z_v = _z.diff().fillna(0)
+            _z_a = _z.diff().diff().fillna(0)
+            fig.add_trace(
+                go.Scatter(
+                    x=_clean_list(spread_df["timestamp"], force_str=True),
+                    y=_clean_list(_z_v),
+                    name="z-score_V (速度)",
+                    line=dict(color="#9467bd", width=1.2, dash="dash"),
+                    mode="lines"
+                ),
+                row=3, col=1
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=_clean_list(spread_df["timestamp"], force_str=True),
+                    y=_clean_list(_z_a),
+                    name="z-score_A (加速度)",
+                    line=dict(color="#8c564b", width=1.0, dash="dot"),
+                    mode="lines"
+                ),
+                row=3, col=1
+            )
+            
             # 添加 Calendar Condor 策略的進出場水平線 (Row 3)
             # 進場水平線
             fig.add_hline(
