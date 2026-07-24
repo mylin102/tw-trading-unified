@@ -47,3 +47,18 @@ def test_trade_economic_quality_calculation_short():
     assert trade_eq.mfe == Decimal("200")
     assert trade_eq.mae == Decimal("50")
     assert trade_eq.capture_ratio > 0
+
+
+def test_economic_stability_summary():
+    """Verify statistical distribution metrics (mean, median, std, p10, p90, iqr)."""
+    from strategies.futures.mts.economic_quality import EconomicStabilitySummary
+
+    capture_ratios = [0.40, 0.50, 0.60, 0.70, 0.80]
+    summary = EconomicStabilitySummary.compute(capture_ratios)
+
+    assert summary.mean == pytest.approx(0.60, rel=1e-3)
+    assert summary.median == pytest.approx(0.60, rel=1e-3)
+    assert summary.p10 == pytest.approx(0.44, rel=1e-2)
+    assert summary.p90 == pytest.approx(0.76, rel=1e-2)
+    assert summary.std > 0.10
+    assert summary.iqr == pytest.approx(0.20, rel=1e-2)

@@ -1,97 +1,139 @@
-# ADR-0016: MTS Outcome Evaluation Framework & The Four-Tier Evidence Ladder
+# ADR-0016: MTS Outcome Evaluation Framework, The Five-Tier Evidence Ladder & Dual-Track Governance
 
 **Status**: ACCEPTED  
 **Date**: 2026-07-24  
 **Author**: Gemini CLI & Quantitative Trading System Architecture Team  
-**Scope**: MTS Strategy Analytics, Economic Quality, & Counterfactual Strategy Evolution  
+**Scope**: MTS Strategy Analytics, Economic Stability, Dataset Versioning, and Dual-Track Governance  
 
 ---
 
 ## Context & Problem Statement
 
-Decision Parity (`Wave 1C`/`Wave 1D`) proves that a newly extracted policy does not alter legacy decision logic. However, parity alone does not guarantee trading profitability or optimal execution. 
+Decision Parity (`Wave 1C`/`Wave 1D`) proves system safety (0% logic drift). However, strategy evolution requires proving **Economic Value** and establishing **Evidence Confidence**. 
 
-To bridge the gap between **System Parity** ("did we avoid breaking things?") and **Economic Value** ("are we systematically improving trading performance?"), we establish the **MTS Outcome Evaluation Framework** and **The Four-Tier Evidence Ladder**.
+We establish the **MTS Outcome Evaluation Framework**, **The Five-Tier Evidence Ladder**, and **Dual-Track Governance System** to unify Engineering Safety and Research Science.
 
 ---
 
-## The Four-Tier Evidence Ladder
+## The Five-Tier Evidence Ladder
 
 ```text
 Live Trade
     │
     ▼
-Level 1: Execution Quality (System Reliability & Fill Metrics)
+Level 1: Execution Quality (System Reliability, Ghost Orders = 0)
     │
     ▼
-Level 2: Decision Quality (Snapshot, Features, Context & Parity)
+Level 2: Decision Quality (Context Snapshot, Feature Vector, Parity = 100%)
     │
     ▼
-Level 3: Economic Quality (MFE, MAE, PED, Capture Ratio)
+Level 3: Economic Quality (MFE, MAE, PED, Capture Ratio, Stability Distribution)
     │
     ▼
-Level 4: Strategy Evolution & Counterfactual Replay
+Level 4: Counterfactual Strategy Evolution (Replay across candidate policies)
     │
     ▼
-Hypothesis Testing & ADR Registration
+Level 5: Evidence Confidence (Statistical Sample Size, Replay Coverage, Confidence Tag)
     │
     ▼
-Production Deployment
+ADR Registration & Production Deployment
 ```
 
 ### Level 1: Execution Quality
-- **Focus**: System reliability, network latency, order fill rates, state consistency.
-- **KPIs**: Fill rate, reject rate, reconnect count, ghost orders (=0), state sync latency.
+- **Focus**: Network stability, order fill rate, state consistency.
+- **KPIs**: Fill rate, reject rate, reconnect count, ghost orders (=0).
 
 ### Level 2: Decision Quality
-- **Focus**: Decision rationality, context snapshotting, and parity comparison.
-- **KPIs**: Decision Parity (100%), context snapshot completeness, feature vector validity.
+- **Focus**: Context snapshot completeness and decision parity.
+- **KPIs**: Parity = 100%, feature vector validity.
 
-### Level 3: Economic Quality
-- **Focus**: Trade profitability and efficiency metrics.
-- **KPIs**:
-  - **MFE (Maximum Favorable Excursion)**: Peak unrealized profit.
-  - **MAE (Maximum Adverse Excursion)**: Peak unrealized loss.
-  - **PED (Profit Excursion Decay)**: $MFE - \text{Net PnL}$ (Profit giveback from peak).
-  - **Capture Ratio**: $\text{Net PnL} / MFE$ (Efficiency of profit retention, Target > 60%).
-  - **Release Efficiency**: $MFE_{\text{release}} / MFE_{\text{peak}}$.
+### Level 3: Economic Quality & Stability
+- **Focus**: Trade profitability, giveback, and distribution stability.
+- **Metrics**:
+  - **MFE / MAE**: Peak favorable / adverse excursion.
+  - **PED (Profit Excursion Decay)**: $MFE - \text{Net PnL}$ (Profit giveback).
+  - **Capture Ratio**: $\text{Net PnL} / MFE$ (Retention efficiency, Target > 60%).
+  - **Stability Distribution Summary**: Compute `mean`, `median`, `std`, `p10`, `p90`, and `iqr` to detect performance volatility and tail risks.
 
-### Level 4: Strategy Evolution & Counterfactual Replay
-- **Focus**: Empirical strategy improvement via counterfactual replay across alternative policies.
-- **Methodology**: Replay live trade datasets against alternative exit policies (`ProfitLock`, `ATRDynamic`, `ImmediateExit`), compute delta metrics (Win Rate, Profit Factor, PED Reduction), and record empirical evidence before registering an ADR for production deployment.
+### Level 4: Counterfactual Strategy Evolution
+- **Focus**: Replaying live trade datasets against alternative policies (`PL-01`, `PL-02`, `ATRDynamic`).
+
+### Level 5: Evidence Confidence
+- **Focus**: Quantifying statistical significance of research findings based on sample sizes.
+- **Confidence Rating Scale**:
+  - **`LOW`**: $N < 30$ trade samples (Exploratory hypothesis).
+  - **`MEDIUM`**: $30 \le N < 100$ trade samples (Preliminary evidence).
+  - **`HIGH`**: $N \ge 100$ trade samples across multiple market regimes (Production Ready).
 
 ---
 
-## Permanent Data Warehouse Architecture (`data/trade_dataset/`)
+## Versioned Dataset Architecture (`data/trade_dataset/`) & Evidence Freeze
 
 ```text
 data/trade_dataset/
-├── execution/       # Level 1: Raw event timelines & order fill logs
-├── decisions/       # Level 2: Decision snapshots & context feature vectors
-├── outcomes/        # Level 3: Economic quality metrics (MFE, MAE, PED, Capture Ratio)
-├── replay/          # Level 4: Counterfactual policy replay datasets & diffs
-├── manifests/       # Immutable soak and replay manifests
-├── reviews/         # Qualitative trade reviews & market regime tags
-└── research/        # Empirical papers & hypothesis test evidence
+└── v2026.07.24/                 # Immutable Versioned Dataset
+    ├── manifest.json            # SHA-256 Digest & Trade Sample Count
+    ├── execution/               # Level 1: Event timeline logs
+    ├── decisions/               # Level 2: Decision context snapshots
+    ├── outcomes/                # Level 3: Economic quality & stability metrics
+    ├── replay/                  # Level 4: Counterfactual replay outputs
+    ├── reviews/
+    │   ├── trade/               # Per-trade root cause & PED reviews
+    │   └── market/              # Market episode & regime shift reviews
+    └── research/                # Empirical papers & hypothesis tests
 ```
+
+### Evidence Freeze Rule
+When a research hypothesis (e.g. `R-008`) is completed and registered into an ADR, its underlying dataset directory (`v2026.07.24`) is **FROZEN** with a SHA-256 digest manifest. New live trade data creates a new versioned dataset directory (`v2026.07.25`) to prevent polluting existing evidence.
 
 ---
 
-## Evolution Scorecard
+## Evolution Scorecard: Baseline vs Candidates
 
-Every strategy release MUST export an Evolution Scorecard comparing performance across versions:
+Baseline is defined as `Baseline = Legacy = Pure Policy` (0% decision drift). Candidates (`PL-01`, `PL-02`) are evaluated against the Baseline:
 
-| Metric Category | Metric | Legacy v1.0 | Pure Policy v1.1 | Candidate v1.2 (Target) |
+| Category | Metric | Baseline (Legacy) | Candidate PL-01 | Candidate PL-02 (Target) |
 | :--- | :--- | :---: | :---: | :---: |
-| **Execution** | Reliability / Ghost Orders | 99.9% / 0 | 100% / 0 | 100% / 0 |
-| **Decision** | Decision Parity | 100% | 100% | 100% |
-| **Economics** | Avg PED (Giveback) | +2,450 TWD | +2,450 TWD | < 1,200 TWD |
-| **Economics** | Capture Ratio ($\text{PnL}/MFE$) | 41% | 41% | > 65% |
-| **Economics** | Profit Factor | 1.08 | 1.08 | > 1.35 |
+| **Execution** | Ghost Orders / Latency | 0 / 12ms | 0 / 12ms | 0 / 12ms |
+| **Decision** | Decision Parity | 100% | N/A (New Policy) | N/A (New Policy) |
+| **Economics** | Avg PED (Giveback) | +2,450 TWD | +1,850 TWD | **+1,220 TWD** |
+| **Economics** | Capture Ratio (Mean / Median) | 41% / 38% | 58% / 56% | **71% / 70%** |
+| **Economics** | Capture Std Dev | 45% | 28% | **18%** |
+| **Confidence**| Sample Count / Level | N/A (Baseline) | N=45 (MEDIUM) | **N=120 (HIGH)** |
+
+---
+
+## Dual-Track Governance System
+
+```text
+  Engineering Track                             Research Track
+  -----------------                             --------------
+        ADR                                       Live Dataset
+         │                                             │
+         ▼                                             ▼
+  Characterization                             Economic Metrics
+         │                                             │
+         ▼                                             ▼
+   Decision Parity                           Counterfactual Replay
+         │                                             │
+         ▼                                             ▼
+    Shadow Soak                                 Hypothesis Test
+         │                                             │
+         ▼                                             ▼
+  Promotion Gate                                Evidence Confidence
+         │                                             │
+         └──────────────────────┬──────────────────────┘
+                                ▼
+                       Production Deployment
+```
+
+- **Engineering Track**: Answers "Is this change safe and non-breaking?"
+- **Research Track**: Answers "Does this change bring proven economic value?"
+- Both tracks MUST pass and converge at the **ADR** before Production Deployment.
 
 ---
 
 ## Consequences
 
-- **Positive**: Establishes a scientific, empirical foundation for quantitative strategy evolution. Eliminates "vibe-fixing" or intuition-based parameter tuning.
-- **Negative**: Requires persistent storage and computation of MFE/MAE/PED metrics for every completed trade.
+- **Positive**: Unifies engineering rigor and financial science; eliminates unverified parameter tuning; ensures reproducible research with immutable versioned datasets.
+- **Negative**: Adds formal dataset versioning overhead.
