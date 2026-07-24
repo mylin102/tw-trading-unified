@@ -569,8 +569,8 @@ def calculate_mts_daily_performance(fills_path: str, events_path: str, target_tr
                 release_fill = data["release"]
                 exit_fill = data["exit"]
                 
-                release_pnl = release_fill.get("realized_pnl", 0.0) if release_fill else 0.0
-                exit_pnl = exit_fill.get("realized_pnl", 0.0) if exit_fill else 0.0
+                release_pnl = float(release_fill.get("realized_pnl") or 0.0) if release_fill else 0.0
+                exit_pnl = float(exit_fill.get("realized_pnl") or 0.0) if exit_fill else 0.0
                 net_pnl = release_pnl + exit_pnl
                 
                 # 2026-07-17 Gemini CLI: Calculate durations for release and trail phases
