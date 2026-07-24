@@ -7,6 +7,7 @@ from .dispatcher import DispatchResult, NormalReleaseDispatcher, ParityResult
 from .legacy_adapter import LegacyPolicyObservation, LegacyReleaseAdapter, OutcomeKind
 
 from .normal_release_policy import NormalReleasePolicy
+from .telemetry import MismatchDimension, ParityStatus, ParityTelemetryRecord, ShadowTelemetryLogger, compute_payload_hash
 
 __all__ = [
     "ExitFamily",
@@ -24,4 +25,9 @@ __all__ = [
     "DispatchResult",
     "ParityResult",
     "OutcomeKind",
+    "ShadowTelemetryLogger",
+    "ParityTelemetryRecord",
+    "ParityStatus",
+    "MismatchDimension",
+    "compute_payload_hash",
 ]
