@@ -5232,13 +5232,10 @@ class FuturesMonitor:
 
     def _mts_tick(self, enriched_bar: dict | None = None):
         # [P1] Periodic far snapshot refresh (60s cooldown) for low-volume far months
-        try:
-            _now = time.time()
-            if not hasattr(self, '_last_far_snapshot_ts') or _now - self._last_far_snapshot_ts > 60:
-                self._last_far_snapshot_ts = _now
-                self._refresh_far_snapshot()
-        except Exception:
-            pass
+        _now = time.time()
+        if not hasattr(self, '_last_far_snapshot_ts') or _now - self._last_far_snapshot_ts > 60:
+            self._last_far_snapshot_ts = _now
+            self._refresh_far_snapshot()
 
         """MTS minimal execution path. Uses enriched bar from pipeline when available,
         falls back to building bar from tick deque if none provided."""
