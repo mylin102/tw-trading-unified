@@ -1,8 +1,10 @@
-# 2026-07-24 Gemini CLI: Wave 1D Non-Blocking Telemetry & Parity Spooler
+# 2026-07-24 Gemini CLI: Wave 1D Dual-Track Accounting & Process-Safe Telemetry Logger
 import hashlib
 import json
+import os
+import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from queue import Full, Queue
@@ -11,20 +13,19 @@ from typing import Any
 
 
 class ParityStatus(str, Enum):
-    """Categorization of decision cycle parity outcome."""
+    """Categorization of decision cycle evaluation parity outcome."""
     MATCH = "MATCH"
     MISMATCH = "MISMATCH"
-    LEGACY_RAISED = "LEGACY_RAISED"
-    POLICY_RAISED = "POLICY_RAISED"
+    LEGACY_RAISED_ONLY = "LEGACY_RAISED_ONLY"
+    POLICY_RAISED_ONLY = "POLICY_RAISED_ONLY"
     BOTH_RAISED_SAME = "BOTH_RAISED_SAME"
     BOTH_RAISED_DIFFERENT = "BOTH_RAISED_DIFFERENT"
     SHADOW_SKIPPED = "SHADOW_SKIPPED"
     CONTEXT_BUILD_FAILED = "CONTEXT_BUILD_FAILED"
-    TELEMETRY_DROPPED = "TELEMETRY_DROPPED"
 
 
 class MismatchDimension(str, Enum):
-    """Specific field breakdown when a parity mismatch occurs."""
+    """Field breakdown when a parity mismatch occurs."""
     ACTION_MISMATCH = "ACTION_MISMATCH"
     LEG_MISMATCH = "LEG_MISMATCH"
     REASON_MISMATCH = "REASON_MISMATCH"
@@ -33,27 +34,60 @@ class MismatchDimension(str, Enum):
 
 
 @dataclass(frozen=True)
-class TelemetryCounterSummary:
-    """Accounting counters guaranteeing total denominator verifiability."""
+class EvaluationAccountingSummary:
+    """Accounting counters for evaluation outcomes.
+    
+    Invariant Equation 1:
+    cycles_seen == matches + mismatches + legacy_raised_only + policy_raised_only +
+                  both_raised_same + both_raised_different + shadow_skipped + context_build_failed
+    """
     cycles_seen: int = 0
     matches: int = 0
     mismatches: int = 0
-    legacy_raised: int = 0
-    policy_raised: int = 0
+    legacy_raised_only: int = 0
+    policy_raised_only: int = 0
+    both_raised_same: int = 0
+    both_raised_different: int = 0
     shadow_skipped: int = 0
-    telemetry_dropped: int = 0
+    context_build_failed: int = 0
 
     @property
     def is_accounted(self) -> bool:
-        """Verify invariant: cycles_seen == matches + mismatches + legacy_raised + policy_raised + shadow_skipped."""
-        return self.cycles_seen == (
-            self.matches + self.mismatches + self.legacy_raised + self.policy_raised + self.shadow_skipped
+        """Verify Equation 1 invariant: every decision cycle enters EXACTLY ONE evaluation category."""
+        expected_total = (
+            self.matches
+            + self.mismatches
+            + self.legacy_raised_only
+            + self.policy_raised_only
+            + self.both_raised_same
+            + self.both_raised_different
+            + self.shadow_skipped
+            + self.context_build_failed
         )
+        return self.cycles_seen == expected_total
+
+
+@dataclass(frozen=True)
+class TelemetryDeliveryAccountingSummary:
+    """Accounting counters for non-blocking telemetry log delivery.
+    
+    Invariant Equation 2:
+    telemetry_enqueued == telemetry_written + telemetry_dropped + telemetry_pending
+    """
+    telemetry_enqueued: int = 0
+    telemetry_written: int = 0
+    telemetry_dropped: int = 0
+    telemetry_pending: int = 0
+
+    @property
+    def is_accounted(self) -> bool:
+        """Verify Equation 2 invariant: enqueued == written + dropped + pending."""
+        return self.telemetry_enqueued == (self.telemetry_written + self.telemetry_dropped + self.telemetry_pending)
 
 
 @dataclass(frozen=True)
 class ParityTelemetryRecord:
-    """Immutable, non-sensitive Telemetry Record for append-only JSONL spool."""
+    """Immutable, sanitized Telemetry Record for append-only JSONL spool."""
     record_type: str  # "MATCH" | "MISMATCH" | "EXCEPTION" | "SKIPPED" | "CHECKPOINT"
     schema_version: str = "1.0"
     event_id: str = ""
@@ -75,58 +109,101 @@ class ParityTelemetryRecord:
     details: dict[str, Any] = field(default_factory=dict)
 
     def to_json_line(self) -> str:
-        """Serialize payload to compact canonical JSON string (without line breaks)."""
-        data = asdict(self)
+        """Serialize payload to compact canonical JSON string without line breaks."""
+        data = canonicalize(asdict(self))
         return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
 
 
-class ShadowTelemetryLogger:
-    """Non-blocking background thread logger for append-only JSONL telemetry spool.
+def canonicalize(obj: Any) -> Any:
+    """Recursively convert object into canonical representation (Decimal -> str, Enum -> str, dict sorted)."""
+    if isinstance(obj, Decimal):
+        return str(obj)
+    elif isinstance(obj, Enum):
+        return obj.value
+    elif isinstance(obj, dict):
+        return {k: canonicalize(v) for k, v in sorted(obj.items())}
+    elif isinstance(obj, (list, tuple)):
+        return [canonicalize(item) for item in obj]
+    return obj
+
+
+def compute_canonical_hash(obj: Any) -> str:
+    """Compute sha256 hex digest of a canonicalized payload."""
+    canonical_data = canonicalize(obj)
+    serialized = json.dumps(canonical_data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+
+class ProcessSafeTelemetryLogger:
+    """Process-safe, non-blocking telemetry spooler with process-isolated file naming and dual-track accounting.
     
-    Guarantees:
-    1. Zero hot-path disk I/O blocking (bounded memory queue).
-    2. Rate-limited drop counter accounting when queue overflows.
-    3. Non-sensitive data sanitization (removes broker objects & secrets).
+    File Naming:
+    data/telemetry/mts_parity/raw/<deployment_id>_<pid>_<start_ns>.jsonl
     """
 
-    def __init__(self, spool_file_path: Path | str, queue_maxsize: int = 10000) -> None:
-        self.spool_path = Path(spool_file_path)
-        self.spool_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(
+        self,
+        base_dir: Path | str,
+        deployment_id: str = "default-deploy",
+        queue_maxsize: int = 10000,
+    ) -> None:
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.deployment_id = deployment_id
+        self.start_ns = time.time_ns()
+        self.pid = os.getpid()
+
+        self.spool_path = self.base_dir / f"{self.deployment_id}_{self.pid}_{self.start_ns}.jsonl"
+
         self._queue: Queue[ParityTelemetryRecord | None] = Queue(maxsize=queue_maxsize)
         
+        # Evaluation Counters (Equation 1)
         self.cycles_seen: int = 0
         self.matches: int = 0
         self.mismatches: int = 0
-        self.legacy_raised: int = 0
-        self.policy_raised: int = 0
+        self.legacy_raised_only: int = 0
+        self.policy_raised_only: int = 0
+        self.both_raised_same: int = 0
+        self.both_raised_different: int = 0
         self.shadow_skipped: int = 0
-        self.telemetry_dropped: int = 0
-        self._sequence_number: int = 0
+        self.context_build_failed: int = 0
 
+        # Delivery Counters (Equation 2)
+        self.telemetry_enqueued: int = 0
+        self.telemetry_written: int = 0
+        self.telemetry_dropped: int = 0
+
+        self._sequence_number: int = 0
         self._running: bool = True
         self._worker_thread = Thread(target=self._flusher_loop, daemon=True)
         self._worker_thread.start()
 
     def record_cycle(self, record: ParityTelemetryRecord) -> bool:
-        """Enqueue telemetry record without blocking main decision loop.
-        
-        Returns True if successfully enqueued, False if dropped due to queue overflow.
-        """
+        """Record decision cycle evaluation and enqueue telemetry record without blocking main loop."""
         self.cycles_seen += 1
         self._sequence_number += 1
 
-        if record.parity_status == ParityStatus.MATCH:
+        # Increment Equation 1 evaluation counter
+        status = record.parity_status
+        if status == ParityStatus.MATCH:
             self.matches += 1
-        elif record.parity_status == ParityStatus.MISMATCH:
+        elif status == ParityStatus.MISMATCH:
             self.mismatches += 1
-        elif record.parity_status == ParityStatus.LEGACY_RAISED:
-            self.legacy_raised += 1
-        elif record.parity_status == ParityStatus.POLICY_RAISED:
-            self.policy_raised += 1
-        elif record.parity_status == ParityStatus.SHADOW_SKIPPED:
+        elif status == ParityStatus.LEGACY_RAISED_ONLY:
+            self.legacy_raised_only += 1
+        elif status == ParityStatus.POLICY_RAISED_ONLY:
+            self.policy_raised_only += 1
+        elif status == ParityStatus.BOTH_RAISED_SAME:
+            self.both_raised_same += 1
+        elif status == ParityStatus.BOTH_RAISED_DIFFERENT:
+            self.both_raised_different += 1
+        elif status == ParityStatus.SHADOW_SKIPPED:
             self.shadow_skipped += 1
+        elif status == ParityStatus.CONTEXT_BUILD_FAILED:
+            self.context_build_failed += 1
 
-        # Attach sequence number
+        # Enqueue for delivery
+        self.telemetry_enqueued += 1
         seq_record = ParityTelemetryRecord(
             record_type=record.record_type,
             schema_version=record.schema_version,
@@ -156,16 +233,28 @@ class ShadowTelemetryLogger:
             self.telemetry_dropped += 1
             return False
 
-    def get_summary(self) -> TelemetryCounterSummary:
-        """Get snapshot of current accounting counters."""
-        return TelemetryCounterSummary(
+    def get_evaluation_summary(self) -> EvaluationAccountingSummary:
+        """Get snapshot of Equation 1 Evaluation Accounting Summary."""
+        return EvaluationAccountingSummary(
             cycles_seen=self.cycles_seen,
             matches=self.matches,
             mismatches=self.mismatches,
-            legacy_raised=self.legacy_raised,
-            policy_raised=self.policy_raised,
+            legacy_raised_only=self.legacy_raised_only,
+            policy_raised_only=self.policy_raised_only,
+            both_raised_same=self.both_raised_same,
+            both_raised_different=self.both_raised_different,
             shadow_skipped=self.shadow_skipped,
+            context_build_failed=self.context_build_failed,
+        )
+
+    def get_delivery_summary(self) -> TelemetryDeliveryAccountingSummary:
+        """Get snapshot of Equation 2 Delivery Accounting Summary."""
+        pending = self._queue.qsize()
+        return TelemetryDeliveryAccountingSummary(
+            telemetry_enqueued=self.telemetry_enqueued,
+            telemetry_written=self.telemetry_written,
             telemetry_dropped=self.telemetry_dropped,
+            telemetry_pending=pending,
         )
 
     def _flusher_loop(self) -> None:
@@ -178,19 +267,14 @@ class ShadowTelemetryLogger:
                         break
                     f.write(record.to_json_line() + "\n")
                     f.flush()
+                    self.telemetry_written += 1
                     self._queue.task_done()
                 except Exception:
                     continue
 
     def stop(self) -> None:
-        """Stop background worker thread gracefully and flush queue."""
+        """Stop background worker thread gracefully and flush pending records."""
         self._running = False
         self._queue.put(None)
         if self._worker_thread.is_alive():
             self._worker_thread.join(timeout=2.0)
-
-
-def compute_payload_hash(obj: Any) -> str:
-    """Compute sha256 hex digest of a dataclass or dictionary payload."""
-    serialized = json.dumps(obj, sort_keys=True, default=str)
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]

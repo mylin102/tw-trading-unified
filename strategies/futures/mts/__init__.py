@@ -7,7 +7,16 @@ from .dispatcher import DispatchResult, NormalReleaseDispatcher, ParityResult
 from .legacy_adapter import LegacyPolicyObservation, LegacyReleaseAdapter, OutcomeKind
 
 from .normal_release_policy import NormalReleasePolicy
-from .telemetry import MismatchDimension, ParityStatus, ParityTelemetryRecord, ShadowTelemetryLogger, compute_payload_hash
+from .soak_manifest import CoverageMetrics, PerformanceMetrics, ShadowSoakManifest
+from .telemetry import (
+    EvaluationAccountingSummary,
+    MismatchDimension,
+    ParityStatus,
+    ParityTelemetryRecord,
+    ProcessSafeTelemetryLogger,
+    TelemetryDeliveryAccountingSummary,
+    compute_canonical_hash,
+)
 
 __all__ = [
     "ExitFamily",
@@ -25,9 +34,14 @@ __all__ = [
     "DispatchResult",
     "ParityResult",
     "OutcomeKind",
-    "ShadowTelemetryLogger",
+    "ProcessSafeTelemetryLogger",
     "ParityTelemetryRecord",
     "ParityStatus",
     "MismatchDimension",
-    "compute_payload_hash",
+    "compute_canonical_hash",
+    "EvaluationAccountingSummary",
+    "TelemetryDeliveryAccountingSummary",
+    "CoverageMetrics",
+    "PerformanceMetrics",
+    "ShadowSoakManifest",
 ]
