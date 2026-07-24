@@ -1219,17 +1219,17 @@ def make_calendar_spread_chart(spread_df):
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
         
-        # 創建 3 行子圖
-        # 2026-07-09 Hermes Agent: Revert to 3 rows (Price, Spread + EMAs, Raw Z-score)
+        # 創建 4 行子圖 (新增第4行: 速度/加速度)
         fig = make_subplots(
-            rows=3, cols=1,
+            rows=4, cols=1,
             shared_xaxes=True,
-            row_heights=[0.4, 0.3, 0.3],
-            vertical_spacing=0.07,
+            row_heights=[0.35, 0.25, 0.2, 0.2],
+            vertical_spacing=0.06,
             subplot_titles=(
                 "近月/遠月價格 (藍線: 近月, 橘虛線: 遠月)", 
                 "價差 (綠線: Spread, 藍線: EMA 20, 紫線: EMA 60, 灰陰影: ±1 Std)", 
-                "Raw Z-score (紅線: Raw 20, 橘虛線/綠虛線: 進出場線)"
+                "Raw Z-score (紅線: Raw 20, 橘虛線/綠虛線: 進出場線)",
+                "Z-score 速度 (紫虛: dz/dt) / 加速度 (棕點: d²z/dt²)"
             )
         )
         
@@ -1344,7 +1344,7 @@ def make_calendar_spread_chart(spread_df):
                     line=dict(color="#9467bd", width=1.2, dash="dash"),
                     mode="lines"
                 ),
-                row=3, col=1
+                row=4, col=1
             )
             fig.add_trace(
                 go.Scatter(
@@ -1354,7 +1354,7 @@ def make_calendar_spread_chart(spread_df):
                     line=dict(color="#8c564b", width=1.0, dash="dot"),
                     mode="lines"
                 ),
-                row=3, col=1
+                row=4, col=1
             )
             
             # 添加 Calendar Condor 策略的進出場水平線 (Row 3)
@@ -1396,6 +1396,8 @@ def make_calendar_spread_chart(spread_df):
             
             # 零線 on Row 3
             fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=3, col=1)
+            # 零線 on Row 4
+            fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=4, col=1)
         
         # 2026-07-09 Hermes Agent: Mark session open/close boundaries on X-axis (open = green, close = red)
         import pandas as pd
