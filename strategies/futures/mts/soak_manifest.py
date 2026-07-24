@@ -50,7 +50,10 @@ class ShadowSoakManifest:
     unexplained_mismatches: int = 0
     shadow_caused_orders: int = 0
     shadow_caused_state_commits: int = 0
+    shadow_caused_lifecycle_appends: int = 0
     duplicate_legacy_invocations: int = 0
+    duplicate_shadow_invocations: int = 0
+    unclassified_cycles: int = 0
     not_observed: list[str] = field(default_factory=list)
     manifest_hash: str = ""
 
@@ -60,7 +63,10 @@ class ShadowSoakManifest:
             self.unexplained_mismatches > 0
             or self.shadow_caused_orders > 0
             or self.shadow_caused_state_commits > 0
+            or self.shadow_caused_lifecycle_appends > 0
             or self.duplicate_legacy_invocations > 0
+            or self.duplicate_shadow_invocations > 0
+            or self.unclassified_cycles > 0
             or not self.evaluation_accounting.is_accounted
             or not self.delivery_accounting.is_accounted
         ):

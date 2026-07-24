@@ -8,19 +8,19 @@ from strategies.futures.mts.telemetry import ParityStatus, ParityTelemetryRecord
 
 
 def test_soak_collector_generation_directory_isolation(tmp_path: Path):
-    """Verify collector creates isolated directory generation-001/ under base dir."""
-    collector = ShadowSoakCollector(generation_id="001", base_dir=tmp_path / "shadow-soak", deployment_id="deploy-v1")
+    """Verify collector creates isolated directory generation-<id> under base dir."""
+    collector = ShadowSoakCollector(generation_id="gen-test-001", base_dir=tmp_path / "shadow-soak", deployment_id="deploy-v1")
 
     assert collector.base_dir.exists()
-    assert collector.base_dir.name == "generation-001"
+    assert collector.base_dir.name == "gen-test-001"
     assert collector.raw_dir.exists()
 
     collector.close_and_export_manifest()
 
 
 def test_soak_collector_manifest_export_and_sha256(tmp_path: Path):
-    """Verify manifest.json and manifest.sha256 signature are correctly generated."""
-    collector = ShadowSoakCollector(generation_id="002", base_dir=tmp_path / "shadow-soak", deployment_id="deploy-v2")
+    """Verify manifest.json and manifest.sha256 digest are correctly generated and recomputed from raw files."""
+    collector = ShadowSoakCollector(generation_id="gen-test-002", base_dir=tmp_path / "shadow-soak", deployment_id="deploy-v2")
 
     collector.record_market_callback()
     collector.record_coverage_scenario("no_op", session="DAY")
@@ -49,8 +49,14 @@ def test_soak_collector_manifest_export_and_sha256(tmp_path: Path):
 
 def test_soak_collector_fail_closed_validation(tmp_path: Path):
     """Verify manifest evaluates to FAIL when unexplained mismatches or shadow order attempts occur."""
-    collector = ShadowSoakCollector(generation_id="003", base_dir=tmp_path / "shadow-soak")
+    collector = ShadowSoakCollector(generation_id="gen-test-003", base_dir=tmp_path / "shadow-soak")
     collector.shadow_caused_orders = 1  # Non-interference violation
 
     manifest = collector.close_and_export_manifest()
     assert manifest.evaluate_soak_status() == "FAIL"
+
+
+def test_soak_collector_preflight_rejection(tmp_path: Path):
+    """Verify preflight rejects authority != legacy."""
+    with pytest.raises(ValueError, match="authority='legacy' only"):
+        ShadowSoakCollector(generation_id="gen-test-004", base_dir=tmp_path / "shadow-soak", authority="policy")

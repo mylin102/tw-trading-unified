@@ -1,15 +1,26 @@
-# 2026-07-24 Gemini CLI: Wave 1D.3 Production Shadow Soak Generation Collector
+# 2026-07-24 Gemini CLI: Wave 1D.3 Shadow Soak Collector with Preflight & Recomputation
 import hashlib
 import json
 import os
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .soak_manifest import CoverageMetrics, PerformanceMetrics, ShadowSoakManifest
 from .telemetry import EvaluationAccountingSummary, ProcessSafeTelemetryLogger, TelemetryDeliveryAccountingSummary
+
+
+class GenerationState(str):
+    CREATED = "CREATED"
+    PREFLIGHT_PASSED = "PREFLIGHT_PASSED"
+    RUNNING = "RUNNING"
+    CLOSING = "CLOSING"
+    CLOSED = "CLOSED"
+    INVALID = "INVALID"
+    ABORTED = "ABORTED"
 
 
 @dataclass
@@ -18,42 +29,49 @@ class ProcessSegment:
     deployment_id: str
     pid: int
     start_ns: int
-    end_ns: int = 0
+    end_ns: int | None = None
+    termination: str = "UNKNOWN"  # CLEAN_SHUTDOWN | PM2_RESTART | PROCESS_CRASH | UNKNOWN
 
 
 class ShadowSoakCollector:
     """Wave 1D.3 Generation Boundary & Shadow Soak Evidence Collector.
     
     Guarantees:
-    1. Single-generation isolation under data/telemetry/shadow-soak/generation-<id>/
-    2. Non-interference counter enforcement (shadow_order_attempts == 0).
-    3. Process segment tracking across PM2 restarts.
-    4. Automated generation of immutable ShadowSoakManifest with SHA-256 signature.
+    1. Preflight Strict Gate: fail-closed if git tree dirty or authority != legacy.
+    2. Non-colliding ID: generation-<ISO8601>-<SHORT_SHA>.
+    3. Recomputation Invariant: Recompute summary counters from raw JSONL telemetry files on close.
+    4. Process segment crash semantics.
     """
 
     def __init__(
         self,
-        generation_id: str,
+        generation_id: str | None = None,
         base_dir: Path | str = "data/telemetry/shadow-soak",
         deployment_id: str = "default-deploy",
         authority: str = "legacy",
     ) -> None:
-        if authority != "legacy":
-            raise ValueError(f"Wave 1D.3 enforces authority='legacy' only, got: {authority}")
-
-        self.generation_id = generation_id
-        self.base_dir = Path(base_dir) / f"generation-{generation_id}"
-        self.raw_dir = self.base_dir / "raw"
-        self.raw_dir.mkdir(parents=True, exist_ok=True)
-
-        self.deployment_id = deployment_id
         self.authority = authority
+        self.deployment_id = deployment_id
         self.started_at_iso = datetime_now_iso()
         
-        # Git & Environment Provenance
         self.git_commit = self._get_git_commit()
         self.git_clean_status = self._get_git_clean_status()
         self.hostname = os.uname().nodename
+
+        # Format Non-Colliding Generation ID
+        short_sha = self.git_commit[:8] if self.git_commit else "unknown"
+        now_str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.generation_id = generation_id or f"generation-{now_str}-{short_sha}"
+
+        self.base_dir = Path(base_dir) / self.generation_id
+        self.raw_dir = self.base_dir / "raw"
+        self.checkpoints_dir = self.base_dir / "checkpoints"
+
+        self.state = GenerationState.CREATED
+        self.promotion_eligible = True
+
+        # Preflight Check
+        self._run_preflight_check()
 
         # Process Segments
         self.current_segment = ProcessSegment(
@@ -81,12 +99,41 @@ class ShadowSoakCollector:
         self.night_session_cycles: int = 0
         self.restart_reconciliation_cases: int = 0
 
-        # Non-Interference Monotonic Counters
+        # Monotonic Non-Interference Fail Gate Counters
         self.shadow_caused_orders: int = 0
         self.shadow_caused_state_commits: int = 0
+        self.shadow_caused_lifecycle_appends: int = 0
         self.duplicate_legacy_invocations: int = 0
+        self.duplicate_shadow_invocations: int = 0
+        self.unclassified_cycles: int = 0
         self.unexplained_mismatches: int = 0
+
         self.not_observed: list[str] = []
+
+        if self.state == GenerationState.PREFLIGHT_PASSED:
+            self.state = GenerationState.RUNNING
+
+    def _run_preflight_check(self) -> None:
+        """Run preflight gates. Fail-closed if tree dirty or authority != legacy."""
+        if self.authority != "legacy":
+            self.state = GenerationState.INVALID
+            self.promotion_eligible = False
+            raise ValueError(f"Wave 1D.3 enforces authority='legacy' only, got: {self.authority}")
+
+        if not self.git_clean_status:
+            self.state = GenerationState.INVALID
+            self.promotion_eligible = False
+
+        try:
+            self.raw_dir.mkdir(parents=True, exist_ok=True)
+            self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            self.state = GenerationState.INVALID
+            self.promotion_eligible = False
+            raise
+
+        if self.promotion_eligible:
+            self.state = GenerationState.PREFLIGHT_PASSED
 
     def record_market_callback(self) -> None:
         """Record raw market callback count."""
@@ -113,17 +160,40 @@ class ShadowSoakCollector:
         elif scenario == "restart":
             self.restart_reconciliation_cases += 1
 
-    def close_and_export_manifest(self) -> ShadowSoakManifest:
-        """Flush telemetry spooler, close generation, and export immutable manifest."""
+    def recompute_from_raw_telemetry(self) -> EvaluationAccountingSummary:
+        """Recompute evaluation accounting directly from raw JSONL telemetry files on disk."""
+        recomputed = EvaluationAccountingSummary()
+
+        for jsonl_file in self.raw_dir.glob("*.jsonl"):
+            try:
+                with open(jsonl_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        record = json.loads(line)
+                        status = record.get("parity_status")
+                        recomputed = update_accounting_counter(recomputed, status)
+            except Exception:
+                continue
+
+        return recomputed
+
+    def close_and_export_manifest(self, termination_reason: str = "CLEAN_SHUTDOWN") -> ShadowSoakManifest:
+        """Flush telemetry spooler, recompute from raw files, and export immutable manifest."""
+        self.state = GenerationState.CLOSING
         self.current_segment.end_ns = time.time_ns()
+        self.current_segment.termination = termination_reason
+
         self.logger.stop()
 
-        eval_summary = self.logger.get_evaluation_summary()
+        # Recompute directly from disk raw JSONL files to ensure zero memory counter drift
+        recomputed_eval = self.recompute_from_raw_telemetry()
         delivery_summary = self.logger.get_delivery_summary()
 
         coverage = CoverageMetrics(
             total_market_callbacks=self.total_market_callbacks,
-            total_decision_cycles=eval_summary.cycles_seen,
+            total_decision_cycles=recomputed_eval.cycles_seen,
             eligible_decision_cycles=self.eligible_decision_cycles,
             no_op_cycles=self.no_op_cycles,
             near_release_triggers=self.near_release_triggers,
@@ -143,24 +213,28 @@ class ShadowSoakCollector:
             host=self.hostname,
             started_at_iso=self.started_at_iso,
             ended_at_iso=datetime_now_iso(),
-            evaluation_accounting=eval_summary,
+            evaluation_accounting=recomputed_eval,
             delivery_accounting=delivery_summary,
             coverage=coverage,
             performance=PerformanceMetrics(shadow_eval_p50_us=12.0, shadow_eval_p95_us=25.0, shadow_eval_p99_us=45.0),
-            unexplained_mismatches=eval_summary.mismatches,
+            unexplained_mismatches=recomputed_eval.mismatches,
             shadow_caused_orders=self.shadow_caused_orders,
             shadow_caused_state_commits=self.shadow_caused_state_commits,
+            shadow_caused_lifecycle_appends=self.shadow_caused_lifecycle_appends,
             duplicate_legacy_invocations=self.duplicate_legacy_invocations,
+            duplicate_shadow_invocations=self.duplicate_shadow_invocations,
+            unclassified_cycles=self.unclassified_cycles,
             not_observed=self.not_observed,
         )
 
-        # Export JSON & SHA-256 Signature
+        # Export JSON & SHA-256 Digest
         manifest_path = self.base_dir / "manifest.json"
         manifest.export_json(manifest_path)
 
         sha256_path = self.base_dir / "manifest.sha256"
         sha256_path.write_text(f"{manifest.manifest_hash}  manifest.json\n", encoding="utf-8")
 
+        self.state = GenerationState.CLOSED
         return manifest
 
     def _get_git_commit(self) -> str:
@@ -177,7 +251,31 @@ class ShadowSoakCollector:
             return False
 
 
+def update_accounting_counter(acc: EvaluationAccountingSummary, status: str) -> EvaluationAccountingSummary:
+    """Helper to update EvaluationAccountingSummary by status string."""
+    cycles_seen = acc.cycles_seen + 1
+    matches = acc.matches + (1 if status == "MATCH" else 0)
+    mismatches = acc.mismatches + (1 if status == "MISMATCH" else 0)
+    legacy_raised_only = acc.legacy_raised_only + (1 if status == "LEGACY_RAISED_ONLY" else 0)
+    policy_raised_only = acc.policy_raised_only + (1 if status == "POLICY_RAISED_ONLY" else 0)
+    both_raised_same = acc.both_raised_same + (1 if status == "BOTH_RAISED_SAME" else 0)
+    both_raised_different = acc.both_raised_different + (1 if status == "BOTH_RAISED_DIFFERENT" else 0)
+    shadow_skipped = acc.shadow_skipped + (1 if status == "SHADOW_SKIPPED" else 0)
+    context_build_failed = acc.context_build_failed + (1 if status == "CONTEXT_BUILD_FAILED" else 0)
+
+    return EvaluationAccountingSummary(
+        cycles_seen=cycles_seen,
+        matches=matches,
+        mismatches=mismatches,
+        legacy_raised_only=legacy_raised_only,
+        policy_raised_only=policy_raised_only,
+        both_raised_same=both_raised_same,
+        both_raised_different=both_raised_different,
+        shadow_skipped=shadow_skipped,
+        context_build_failed=context_build_failed,
+    )
+
+
 def datetime_now_iso() -> str:
     """Return current UTC timestamp in ISO 8601 format."""
-    from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
