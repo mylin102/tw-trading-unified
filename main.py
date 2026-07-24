@@ -334,41 +334,6 @@ def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
                         matched = True
                         break
 
-                # [Skew Integration] Feed option quote to skew engine
-                # 💡 GSD: Only dispatch if the code matches the contract and price is realistic for an option (< 10,000)
-                # to avoid price contamination (e.g. MTX price in options)
-                # 2026-06-04 Gemini CLI: Added strict code and price validation
-                if skew_engine is not None and key in ("C", "P") and code == getattr(con, "code", None) and float(mid) < 10000:
-                    try:
-                        from core.derivatives import OptionQuoteEvent
-                        import datetime as _dt
-                        opt_type = "CALL" if key == "C" else "PUT"
-                        strike = float(getattr(con, "strike_price", 0))
-                        ts = _dt.datetime.now()
-                        event = OptionQuoteEvent(
-                            timestamp=ts,
-                            symbol=code,
-                            option_type=opt_type,
-                            strike=strike,
-                            bid=float(bid),
-                            ask=float(ask),
-                            mid=mid,
-                            expiry=str(getattr(con, "delivery_date", "")),
-                        )
-                        skew_engine.on_quote(event)
-                    except Exception as e:
-                        console.print(f"[dim][skew on_quote err] {e}[/dim]")
-
-                # MTX bid/ask updates can arrive at very high frequency near open.
-                # Throttle visibility logs so callback cost stays bounded without
-                # changing any market-data mutation or freshness semantics.
-                if key == "MTX":
-                    now = time.time()
-                    if now - _last_mtx_update_log_at["ts"] >= _mtx_update_log_interval_secs:
-                        _last_mtx_update_log_at["ts"] = now
-                        console.print(f"[green]✅ MTX updated ({code}): {mon.market_data['MTX']['close']:.0f}[/green]")
-                    break
-            
             if not matched and code not in _seen:
                 # [Skew Integration] Check if code is an OTM skew contract
                 otm_cons = getattr(futures_mon, '_skew_otm_contracts', {})
