@@ -89,6 +89,13 @@ class GlobalCallbackAdapter:
         1. Exact contract lookup → routed handler.
         2. Not found or always_call_fallback=True → fallback to existing TMF callback.
         """
+        # ── P1: Three-stage diagnostic ──
+        _tick_code = None
+        if args:
+            _last = args[-1]
+            _tick_code = getattr(_last, "code", None) if hasattr(_last, "code") else None
+        print(f"[GCA_TICK] ENTER adapter_id={id(self)} args={len(args)} code={_tick_code}", flush=True)
+
         if len(args) == 1:
             tick = args[0]
             exchange = getattr(tick, "exchange", "TFE")
@@ -98,27 +105,46 @@ class GlobalCallbackAdapter:
             return
 
         if tick is None or not hasattr(tick, "code"):
+            print(f"[GCA_TICK] EXIT no_code adapter_id={id(self)}", flush=True)
             return
 
         ex = normalize_exchange(exchange)
         code = normalize_contract_code(tick.code)
-        route = self._registry.lookup(ex, code)
 
-        if route is not None:
+        _disp_id = id(self._fallback_tick) if self._fallback_tick else 0
+        _route = self._registry.lookup(ex, code)
+        _has_route = _route is not None
+        print(f"[GCA_TICK] BEFORE_DISPATCH adapter_id={id(self)} code={code} has_route={_has_route} "
+              f"always_fallback={self._always_call_fallback} fallback_id={_disp_id}",
+              flush=True)
+
+        if _route is not None:
             try:
-                route.handler.on_tick(route.leg, tick)
+                _route.handler.on_tick(_route.leg, tick)
+                print(f"[GCA_TICK] ROUTE_OK adapter_id={id(self)} code={code} leg={_route.leg}", flush=True)
             except Exception:
                 self._callback_error_count += 1
                 self._logger.exception(
                     "Routed handler failed for %s/%s (leg=%s); "
                     "fallback skipped to prevent double delivery",
-                    exchange, tick.code, route.leg,
+                    exchange, tick.code, _route.leg,
                 )
-            # 💡 Gemini CLI: If always_call_fallback is False, return early; otherwise also deliver to fallback handler
+                print(f"[GCA_TICK] ROUTE_EXCEPTION adapter_id={id(self)} code={code}", flush=True)
             if not self._always_call_fallback:
+                print(f"[GCA_TICK] EXIT routed_only adapter_id={id(self)} code={code}", flush=True)
                 return
 
-        self._fallback_tick(*args)
+        if self._fallback_tick:
+            try:
+                print(f"[GCA_TICK] FALLBACK_CALL adapter_id={id(self)} code={code}", flush=True)
+                self._fallback_tick(*args)
+                print(f"[GCA_TICK] FALLBACK_OK adapter_id={id(self)} code={code}", flush=True)
+            except Exception:
+                self._callback_error_count += 1
+                self._logger.exception("Fallback handler failed for %s/%s", exchange, tick.code)
+                print(f"[GCA_TICK] FALLBACK_EXCEPTION adapter_id={id(self)} code={code}", flush=True)
+        else:
+            print(f"[GCA_TICK] EXIT no_fallback adapter_id={id(self)} code={code}", flush=True)
 
     # 💡 Gemini CLI: Accept *args to support both 1-arg (rshioaji 1.5+) and 2-arg (legacy) callback signatures
     def on_bidask(self, *args) -> None:
