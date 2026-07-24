@@ -221,6 +221,8 @@ def is_rust_version() -> bool:
     except Exception:
         return False
 def set_tick_callback(api: sj.Shioaji, callback: Callable):
+    import traceback
+    print(f"[CB_REG] set_tick_callback api_id={id(api)} cb_type={type(callback).__name__} cb={repr(callback)[:120]} stack={traceback.format_stack()[-2].strip()}", flush=True)
     """Register tick callback for the installed shioaji version.
     v1.3.3: use decorator pattern
     rshioaji: api.set_on_tick_fop_v1_callback(callback)
