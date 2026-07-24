@@ -120,7 +120,7 @@ def get_near_far(api, category=None, days_to_switch=3):
     available = []
     for c in sorted_c:
         try:
-            ddate = datetime.strptime(c.delivery_date, "%Y/%m/%d")
+            ddate = datetime.strptime(str(c.delivery_date).replace("-", "/"), "%Y/%m/%d")
             if (ddate - today).days > days_to_switch:
                 available.append(c)
         except (ValueError, AttributeError):
