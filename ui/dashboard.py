@@ -55,9 +55,15 @@ import subprocess
 import time
 from pathlib import Path
 from dotenv import load_dotenv
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from streamlit_autorefresh import st_autorefresh
+# 2026-07-24 Gemini CLI: Native Streamlit autorefresh mechanism (replaces legacy third-party streamlit_autorefresh component)
+def safe_st_autorefresh(interval_ms: int, key: str) -> None:
+    """Native Streamlit autorefresh helper.
+    
+    Completely eliminates third-party streamlit_autorefresh React component dependency,
+    avoiding network latency, proxy blocking, and iframe component loading failures.
+    """
+    sec = max(1, interval_ms // 1000)
+    st.markdown(f'<meta http-equiv="refresh" content="{sec}">', unsafe_allow_html=True)
 
 st.set_page_config(page_title="Trading Unified", page_icon="📊", layout="wide")
 
@@ -188,7 +194,7 @@ auto_refresh_sec = st.sidebar.selectbox(
 )
 if auto_refresh_sec != "關閉":
     interval_ms = int(auto_refresh_sec.replace("秒", "")) * 1000
-    st_autorefresh(interval=interval_ms, key="auto_refresh_timer")
+    safe_st_autorefresh(interval=interval_ms, key="auto_refresh_timer")
 
 # ── 全域字體縮小 CSS ──
 st.markdown("""
@@ -1873,15 +1879,13 @@ def load_futures_indicators(
     # ── FULL PATH (full_history or fast path failed) ──
     from core.date_utils import get_session_date_str
     _session_date = get_session_date_str(now)
+    # 💡 Gemini CLI: Prioritize newest session and wall-clock dates first to prevent loading stale 3-day-old data
     search_days_raw = [
-        (now - dt.timedelta(days=3)).strftime("%Y%m%d"),
-        (now - dt.timedelta(days=2)).strftime("%Y%m%d"),
+        _session_date,                                  # session date first (night/next trading day data)
+        now.strftime("%Y%m%d"),                         # wall-clock date (current day data)
         (now - dt.timedelta(days=1)).strftime("%Y%m%d"),
-        _session_date,                                  # [Fix 2026-07-06] session date first (night data)
-        now.strftime("%Y%m%d"),                         # then wall-clock date (day data)
-        (now + dt.timedelta(days=1)).strftime("%Y%m%d"),
-        (now + dt.timedelta(days=2)).strftime("%Y%m%d"),
-        (now + dt.timedelta(days=3)).strftime("%Y%m%d"),
+        (now - dt.timedelta(days=2)).strftime("%Y%m%d"),
+        (now - dt.timedelta(days=3)).strftime("%Y%m%d"),
         DATE_STR,
     ]
     try:
@@ -2960,24 +2964,26 @@ elif _selected_product == "TMF":
         now_ts = pd.Timestamp.now()
         age_mins = (now_ts - last_ts).total_seconds() / 60.0 if pd.notna(last_ts) else 999
 
-        # 目前交易時段
-        from core.date_utils import get_taifex_futures_session_type
+        # 目前交易時段與交易日解析
+        # 💡 Gemini CLI: Use get_session_date_str and is_taifex_futures_market_open to accurately map night session to trading day
+        from core.date_utils import get_taifex_futures_session_type, get_session_date_str, is_taifex_futures_market_open
         session_type = get_taifex_futures_session_type()
         session_label = "夜盤" if session_type == "night" else ("日盤" if session_type == "day" else "收盤")
 
         # 資料新鮮度閾值：日盤 15 分鐘、夜盤 15 分鐘
         stale_threshold = 15.0
         data_fresh = age_mins < stale_threshold
-        _last_date = last_ts.strftime("%Y%m%d") if pd.notna(last_ts) else None
-        _same_trading_day = _last_date == _today
+        _last_trading_day = get_session_date_str(last_ts.to_pydatetime()) if pd.notna(last_ts) else None
+        _same_trading_day = _last_trading_day == _today
+        _market_open = is_taifex_futures_market_open() or session_type in ("day", "night")
 
-        if not data_fresh and _same_trading_day:
+        if not data_fresh and _market_open:
             last_ts_str = last_ts.strftime("%H:%M") if pd.notna(last_ts) else "?"
             st.warning(
                 f"⚠️ 資料停滯: 最後一筆 {last_ts_str} ({age_mins:.0f}分鐘前) "
                 f"| 目前 {session_label}"
             )
-        elif not data_fresh and pd.notna(last_ts):
+        elif not _market_open and pd.notna(last_ts):
             st.caption(f"📄 上次資料: {last_ts.strftime('%m/%d %H:%M')} ({age_mins:.0f}分鐘前) · 非交易時段")
         elif pd.notna(last_ts):
             st.caption(f"🟢 即時 · {last_ts.strftime('%m/%d %H:%M')} · {session_label}")
