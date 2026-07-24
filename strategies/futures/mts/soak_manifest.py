@@ -54,12 +54,36 @@ class ShadowSoakManifest:
     not_observed: list[str] = field(default_factory=list)
     manifest_hash: str = ""
 
+    def evaluate_soak_status(self) -> str:
+        """Evaluate status: PASS, FAIL, or INCOMPLETE based on fail-closed rules."""
+        if (
+            self.unexplained_mismatches > 0
+            or self.shadow_caused_orders > 0
+            or self.shadow_caused_state_commits > 0
+            or self.duplicate_legacy_invocations > 0
+            or not self.evaluation_accounting.is_accounted
+            or not self.delivery_accounting.is_accounted
+        ):
+            return "FAIL"
+
+        if (
+            self.coverage.eligible_decision_cycles == 0
+            or self.coverage.day_session_cycles == 0
+            or self.coverage.night_session_cycles == 0
+        ):
+            return "INCOMPLETE"
+
+        return "PASS"
+
     def export_json(self, target_path: Path | str) -> str:
         """Export manifest to formatted JSON file and return JSON string."""
         path = Path(target_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         
         data = asdict(self)
+        # Attach evaluated soak status
+        data["soak_status"] = self.evaluate_soak_status()
+
         # Compute sha256 hash of contents (excluding manifest_hash itself)
         data_without_hash = dict(data)
         data_without_hash["manifest_hash"] = ""
