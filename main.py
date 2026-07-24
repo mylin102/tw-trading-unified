@@ -98,6 +98,11 @@ def tick_dispatcher(futures_mons, options_mon, feed_health=None, tx_bar_builder=
     _seen_codes = set()
     _lock = threading.Lock()
 
+    # P1: Raw ingress counters per code
+    _ingress_counters = {}
+    _ingress_log_ts = [0.0]
+
+
     def classify(code: Any) -> str:
         if not code:
             return "OPTIONS"
@@ -143,6 +148,18 @@ def tick_dispatcher(futures_mons, options_mon, feed_health=None, tx_bar_builder=
         except Exception as e:
             console.print(f"[red][tick tracking err] {e}[/red]")
 
+        # P1: Raw ingress counter (before any filter)
+        try:
+            _ingress_counters[code] = _ingress_counters.get(code, 0) + 1
+            _now_t = time.time()
+            if _now_t - _ingress_log_ts[0] >= 10:
+                _ingress_log_ts[0] = _now_t
+                _sum = sorted(_ingress_counters.items(), key=lambda x: -x[1])
+                _top = ", ".join(f"{k}={v}" for k, v in _sum[:6])
+                print(f"[TICK_INGRESS] {_top}", flush=True)
+        except Exception:
+            pass
+
         # Update feed health (skip synthetic/virtual ticks — they must never pollute real feed health)
         # 2026-05-22 Hermes Agent: skip mark_tick for VIRTUAL bucket; still forward tick to monitors
         try:
@@ -167,6 +184,9 @@ def tick_dispatcher(futures_mons, options_mon, feed_health=None, tx_bar_builder=
         # Dispatch to monitors
         for f_mon in futures_mons:
             _thread_local.state_path = getattr(f_mon, "_state_path", None)
+            # P1: Route check for far-contract ticks
+            if code and hasattr(f_mon, 'far_contract') and f_mon.far_contract and code == f_mon.far_contract.code:
+                print(f"[TICK_ROUTE] code={code} -> {f_mon.ticker}_FAR", flush=True)
             try:
                 f_mon.on_tick(exchange, tick)
             except Exception as e:

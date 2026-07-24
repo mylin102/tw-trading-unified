@@ -834,6 +834,9 @@ class FuturesMonitor:
         # [Bug Fix] Add contract rollover check
         self._last_contract_code = self.contract.code if self.contract else None
 
+        # P1: Resolve near/far contracts (was dead code - never called)
+        self._resolve_contracts()
+        
         # 2026-06-24 Gemini CLI: Pre-fill near/far contract prices from snapshots at startup to prevent identical execution prices on first manual trade.
         if self.api and not self.dry_run:
             try:
@@ -1834,9 +1837,10 @@ class FuturesMonitor:
                         self._far_current_bar["open"] = _price if self._far_current_bar.get("open", 0) == 0 else self._far_current_bar.get("open", _price)
                         self._far_current_bar["high"] = max(float(self._far_current_bar.get("high", 0) or 0), _price)
                         self._far_current_bar["low"] = min(float(self._far_current_bar.get("low", 0) or _price), _price)
-                    logger.info(f"[FAR_SNAP] {self.far_contract.code} price={_price}")
+                    self._last_far_snapshot_ts = time.time()
+                    print(f"[FAR_SNAP] {self.far_contract.code} price={_price}")
         except Exception as e:
-            logger.warning(f"[FAR_SNAP] fail: {e}")
+            print(f"[yellow][FAR_SNAP] fail: {e}")
 
     def _save_far_bar(self, bar):
         """Append a completed far-month bar to shared CSV for dashboard consumption.
@@ -5231,12 +5235,20 @@ class FuturesMonitor:
         return True
 
     def _mts_tick(self, enriched_bar: dict | None = None):
-        # [P1] Periodic far snapshot refresh (60s cooldown) for low-volume far months
+        # [P1] Periodic far snapshot refresh (60s cooldown) - inline
         _now = time.time()
-        if not hasattr(self, '_last_far_snapshot_ts') or _now - self._last_far_snapshot_ts > 60:
-            self._last_far_snapshot_ts = _now
-            self._refresh_far_snapshot()
-
+        if not hasattr(self, '_last_far_snap_ts') or _now - self._last_far_snap_ts > 60:
+            try:
+                if self.far_contract and self.api and not self.dry_run:
+                    _s = self.api.snapshots([self.far_contract])
+                    if _s and len(_s) > 0 and _s[0].close and float(_s[0].close) > 0:
+                        _p = float(_s[0].close)
+                        print(f"[FAR_SNAP] {self.far_contract.code} price={_p}", flush=True)
+                        self.market_data[f'{self.ticker}_FAR']['close'] = _p
+                        self._last_far_snap_ts = _now
+            except Exception as e:
+                print(f"[FAR_SNAP_ERR] {e}", flush=True)
+        
         """MTS minimal execution path. Uses enriched bar from pipeline when available,
         falls back to building bar from tick deque if none provided."""
         print("MTS_ALIVE", flush=True)
