@@ -3,7 +3,8 @@
 
 from .contracts import ExitAction, ExitDiagnostics, ExitEvaluation, ExitFamily, Leg, Side
 from .economics import ContractEconomics
-from .policy import ExitPolicy
+from .dispatcher import DispatchResult, NormalReleaseDispatcher, ParityResult
+from .legacy_adapter import LegacyPolicyObservation, LegacyReleaseAdapter, OutcomeKind
 
 __all__ = [
     "ExitFamily",
@@ -14,4 +15,10 @@ __all__ = [
     "ExitEvaluation",
     "ContractEconomics",
     "ExitPolicy",
+    "LegacyPolicyObservation",
+    "LegacyReleaseAdapter",
+    "NormalReleaseDispatcher",
+    "DispatchResult",
+    "ParityResult",
+    "OutcomeKind",
 ]

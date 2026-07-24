@@ -12,6 +12,12 @@ class NormalReleaseConfig:
     release_atr_ratio: float = 1.0
     warmup_ms: int = 800
     warmup_ticks: int = 2
+    authority: str = "legacy"
+
+    def __post_init__(self) -> None:
+        """Validate Wave 1B configuration bounds."""
+        if self.authority != "legacy":
+            raise ValueError(f"Wave 1B enforces authority='legacy' only, got: {self.authority}")
 
 
 @dataclass(frozen=True)
