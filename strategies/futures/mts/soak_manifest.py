@@ -56,9 +56,14 @@ class ShadowSoakManifest:
     unclassified_cycles: int = 0
     not_observed: list[str] = field(default_factory=list)
     manifest_hash: str = ""
+    git_clean_status: bool = True
+    preflight_passed: bool = True
 
     def evaluate_soak_status(self) -> str:
-        """Evaluate status: PASS, FAIL, or INCOMPLETE based on fail-closed rules."""
+        """Evaluate status: PASS, FAIL, INCOMPLETE, or INVALID based on fail-closed rules."""
+        if not self.preflight_passed or not self.git_clean_status or self.authority != "legacy":
+            return "INVALID"
+
         if (
             self.unexplained_mismatches > 0
             or self.shadow_caused_orders > 0

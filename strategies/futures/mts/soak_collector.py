@@ -49,6 +49,7 @@ class ShadowSoakCollector:
         base_dir: Path | str = "data/telemetry/shadow-soak",
         deployment_id: str = "default-deploy",
         authority: str = "legacy",
+        override_git_clean: bool | None = None,
     ) -> None:
         self.authority = authority
         self.deployment_id = deployment_id
@@ -58,7 +59,7 @@ class ShadowSoakCollector:
 
         self.git_commit = self._get_git_commit()
         self.remote_tracking_commit = self._get_remote_tracking_commit()
-        self.git_clean_status = self._get_git_clean_status()
+        self.git_clean_status = override_git_clean if override_git_clean is not None else self._get_git_clean_status()
 
         # Format Non-Colliding Nano-Precision Generation ID
         short_sha = self.git_commit[:8] if self.git_commit else "unknown"
@@ -228,6 +229,8 @@ class ShadowSoakCollector:
             duplicate_shadow_invocations=self.duplicate_shadow_invocations,
             unclassified_cycles=self.unclassified_cycles,
             not_observed=self.not_observed,
+            git_clean_status=self.git_clean_status,
+            preflight_passed=self.promotion_eligible,
         )
 
         # Export JSON & SHA-256 Digest
