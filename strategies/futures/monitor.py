@@ -871,6 +871,7 @@ class FuturesMonitor:
                                     "local_arrival_at": time.time(),
                                     "datetime": datetime.now()
                                 }
+                                print(f"[WRITER_AUDIT] slot=far code={_snap.code} old_price={_old_far} new_price={_snap.close} source=FuturesMonitor.snapshot_prefill event_time={datetime.now().isoformat()} caller=FuturesMonitor._init_market_data", flush=True)
                                 console.print(f"[green][FuturesMonitor] Pre-filled far-month price from snapshot: {_snap.close}[/green]")
             except Exception as _snap_err:
                 console.print(f"[yellow][FuturesMonitor] Failed to pre-fill prices from snapshot: {_snap_err}[/yellow]")
@@ -1525,7 +1526,16 @@ class FuturesMonitor:
             console.print(f"[dim][FuturesMonitor][ON_TICK] code={tick.code} close={getattr(tick, 'close', None)} ts={getattr(tick, 'datetime', None)}[/dim]")
 
         # [Far Month] Handle far-month tick accumulation (independent from near-month)
+        is_primary_tick = self.contract and tick.code == self.contract.code
+        is_far_tick = False
         if self.far_contract and tick.code == self.far_contract.code:
+            is_far_tick = True
+        elif not is_primary_tick and self.contract and tick.code != self.contract.code:
+            _target_prefix = "MXF" if str(self.ticker).upper() == "MTX" else str(self.ticker).upper()
+            if str(tick.code).upper().startswith(_target_prefix):
+                is_far_tick = True
+
+        if is_far_tick:
             self._accumulate_far_tick(tick)
             # 2026-05-27 Gemini CLI: Real-time MTS Execution on Far Tick (Contract 1)
             _mts_enabled = self.cfg.get("mts", {}).get("enabled", False)
