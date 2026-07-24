@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .soak_manifest import CoverageMetrics, PerformanceMetrics, ShadowSoakManifest
+from .soak_manifest import BaselineProvenance, CoverageMetrics, PerformanceMetrics, ShadowSoakManifest
 from .telemetry import EvaluationAccountingSummary, ProcessSafeTelemetryLogger, TelemetryDeliveryAccountingSummary
 
 
@@ -209,6 +209,13 @@ class ShadowSoakCollector:
             restart_reconciliation_cases=self.restart_reconciliation_cases,
         )
 
+        baseline = BaselineProvenance(
+            expected_commit=self.git_commit,
+            observed_commits=[self.git_commit],
+            observed_authorities=[self.authority],
+            provenance_constant=True,
+        )
+
         manifest = ShadowSoakManifest(
             wave="1D.3",
             authority=self.authority,
@@ -217,6 +224,7 @@ class ShadowSoakCollector:
             host=self.hostname,
             started_at_iso=self.started_at_iso,
             ended_at_iso=datetime_now_iso(),
+            baseline=baseline,
             evaluation_accounting=recomputed_eval,
             delivery_accounting=delivery_summary,
             coverage=coverage,

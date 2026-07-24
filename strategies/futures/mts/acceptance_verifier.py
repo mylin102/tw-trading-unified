@@ -262,11 +262,13 @@ class IndependentAcceptanceVerifier:
 
     def _verify_g1_preflight(self, manifest: ShadowSoakManifest) -> tuple[bool, dict[str, Any]]:
         commit_match = manifest.git_commit.startswith(self.expected_rc_commit) or self.expected_rc_commit.startswith(manifest.git_commit)
+        provenance_ok = manifest.baseline.provenance_constant if manifest.baseline else True
         passed = (
             manifest.preflight_passed
             and manifest.git_clean_status
             and manifest.authority == "legacy"
             and commit_match
+            and provenance_ok
         )
         return passed, {
             "preflight_passed": manifest.preflight_passed,
@@ -274,6 +276,7 @@ class IndependentAcceptanceVerifier:
             "authority": manifest.authority,
             "git_commit": manifest.git_commit,
             "expected_rc_commit": self.expected_rc_commit,
+            "provenance_constant": provenance_ok,
         }
 
     def _verify_g2_non_interference(self, manifest: ShadowSoakManifest) -> tuple[bool, dict[str, Any]]:

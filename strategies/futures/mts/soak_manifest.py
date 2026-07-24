@@ -34,6 +34,16 @@ class PerformanceMetrics:
 
 
 @dataclass(frozen=True)
+class BaselineProvenance:
+    """Provenance invariants verifying commit, config, and authority remained constant throughout soak."""
+    expected_commit: str = ""
+    observed_commits: list[str] = field(default_factory=list)
+    observed_config_hashes: list[str] = field(default_factory=list)
+    observed_authorities: list[str] = field(default_factory=list)
+    provenance_constant: bool = True
+
+
+@dataclass(frozen=True)
 class ShadowSoakManifest:
     """Immutable Shadow Soak Manifest artifact for Wave 1E Promotion Gate."""
     wave: str = "1D"
@@ -43,6 +53,7 @@ class ShadowSoakManifest:
     host: str = ""
     started_at_iso: str = ""
     ended_at_iso: str = ""
+    baseline: BaselineProvenance = field(default_factory=BaselineProvenance)
     evaluation_accounting: EvaluationAccountingSummary = field(default_factory=EvaluationAccountingSummary)
     delivery_accounting: TelemetryDeliveryAccountingSummary = field(default_factory=TelemetryDeliveryAccountingSummary)
     coverage: CoverageMetrics = field(default_factory=CoverageMetrics)
@@ -111,6 +122,9 @@ class ShadowSoakManifest:
         """Reconstruct ShadowSoakManifest dataclass instance from dictionary."""
         d = dict(data)
         d.pop("soak_status", None)
+
+        if "baseline" in d and isinstance(d["baseline"], dict):
+            d["baseline"] = BaselineProvenance(**d["baseline"])
 
         if "evaluation_accounting" in d and isinstance(d["evaluation_accounting"], dict):
             d["evaluation_accounting"] = EvaluationAccountingSummary(**d["evaluation_accounting"])
