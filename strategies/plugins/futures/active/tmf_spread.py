@@ -964,6 +964,18 @@ class TMFSpread(StrategyBase):
         self._post_shadow_mae = None
         self._formal_max_giveback = 0.0
 
+        # ── P1: Single-leg extrema (decision authority in SINGLE_LEG) ──
+        self._single_leg_peak: float = 0.0
+        self._single_leg_nadir: float = 0.0
+        self._single_leg_anchor_price: float = 0.0
+        self._single_leg_anchor_event_time_ns: float = 0.0
+
+        # P1: Spread-level excursions (telemetry only)
+        self._spread_near_high: float = 0.0
+        self._spread_near_low: float = 0.0
+        self._spread_far_high: float = 0.0
+        self._spread_far_low: float = 0.0
+
         # ── ADR-011 Phase 2: Action-scoped timeout timers (2026-07-16) ──
         # Each exit action type has its own pending timer so RELEASE timeout
         # cannot bypass quote guard for TRAIL, or vice versa.
@@ -1097,8 +1109,11 @@ class TMFSpread(StrategyBase):
         self._entry_ts = kwargs.get("entry_ts") or datetime.now()
         # 2026-05-27 Gemini CLI: Use monotonic time for robust grace period (P2)
         self._entry_time_monotonic = time.monotonic()
-        self._peak = near_entry
-        self._nadir = far_entry
+        self._set_single_leg_extrema(peak=near_entry, nadir=far_entry)
+        self._spread_near_high = near_entry
+        self._spread_near_low = near_entry
+        self._spread_far_high = far_entry
+        self._spread_far_low = far_entry
 
         # 2026-06-26 Gemini CLI: Initialize/reset MFE/MAE on sync
         self._mfe_pts = 0.0
@@ -1193,16 +1208,14 @@ class TMFSpread(StrategyBase):
         # If remaining_leg_price is None (restart recovery without fresh quote),
         # set PENDING_REANCHOR to wait for first valid remaining-leg tick.
         if remaining_leg_price is not None and remaining_leg_price > 0:
-            if self._side == "LONG":
-                self._peak = remaining_leg_price
-                self._nadir = 0.0
-            else:
-                self._nadir = remaining_leg_price
-                self._peak = 0.0
+            _anchor = remaining_leg_price
+            self._set_single_leg_extrema(peak=_anchor, nadir=_anchor)
+            self._single_leg_anchor_price = _anchor
+            self._single_leg_anchor_event_time_ns = time.monotonic_ns()
             self._trail_anchor_status = TrailAnchorStatus.READY
         else:
-            self._peak = 0.0
-            self._nadir = 0.0
+            self._set_single_leg_extrema(peak=0.0, nadir=0.0)
+            self._single_leg_anchor_price = 0.0
             self._trail_anchor_status = TrailAnchorStatus.PENDING_REANCHOR
             self._trail_warmup_tick_count = 0
             self._trail_started_at = None
@@ -1387,10 +1400,10 @@ class TMFSpread(StrategyBase):
         
         # 2026-07-23 Gemini CLI: Work Package A & B - Instrumentation & Provenance Metadata
         peak_or_nadir = None
-        if self._side == "LONG" and hasattr(self, "_peak") and self._peak > 0:
-            peak_or_nadir = round(float(self._peak), 2)
-        elif self._side == "SHORT" and hasattr(self, "_nadir") and self._nadir > 0:
-            peak_or_nadir = round(float(self._nadir), 2)
+        if self._side == "LONG" and hasattr(self, "_single_leg_peak") and self._single_leg_peak > 0:
+            peak_or_nadir = round(float(self._single_leg_peak), 2)
+        elif self._side == "SHORT" and hasattr(self, "_single_leg_nadir") and self._single_leg_nadir > 0:
+            peak_or_nadir = round(float(self._single_leg_nadir), 2)
 
         return {
             "risk_mode": risk_mode,
@@ -1458,8 +1471,8 @@ class TMFSpread(StrategyBase):
             released_leg=self._released_leg,
             release_price=self._release_price,
             trail_pts=_trail_pts,
-            trail_peak=self._peak,
-            trail_nadir=self._nadir,
+            trail_peak=self._single_leg_peak,
+            trail_nadir=self._single_leg_nadir,
             release_stop_points=_release_stop,
             trail_distance_points=_trail_dist,
             trade_id=self._trade_id,
@@ -1841,8 +1854,7 @@ class TMFSpread(StrategyBase):
                                 self._far_side = state.get("far_side")
                                 self._released_leg = state.get("released_leg")
                                 self._side = _rem_side
-                                self._peak = _peak
-                                self._nadir = _nadir
+                                self._set_single_leg_extrema(peak=_peak, nadir=_nadir)
 
                                 # ── ADR-009 Task 6: Restart Reconciliation ──
                                 # 2026-07-06 Hermes Agent: restore lifecycle from state file
@@ -2018,8 +2030,8 @@ class TMFSpread(StrategyBase):
                                 # [P0 Fix] Restart recovery: released-leg fill price must NOT
                                 # become remaining-leg trail anchor. Set PENDING_REANCHOR instead,
                                 # so the first fresh remaining-leg tick initializes the real anchor.
-                                self._peak = 0.0
-                                self._nadir = 0.0
+                                self._set_single_leg_extrema(peak=0.0, nadir=0.0)
+                                self._single_leg_anchor_price = 0.0
                                 self._trail_anchor_status = TrailAnchorStatus.PENDING_REANCHOR
                                 self._trail_warmup_tick_count = 0
                                 self._trail_started_at = None
@@ -2033,8 +2045,7 @@ class TMFSpread(StrategyBase):
                                 })
                             else:
                                 self._lifecycle = "OPEN"
-                                self._peak = self._near_entry
-                                self._nadir = self._far_entry
+                                self._set_single_leg_extrema(peak=self._near_entry, nadir=self._far_entry)
                                 # ADR-009 Task 6: sync lifecycle from fill-log reconstruction
                                 self._lifecycle_oca = infer_lifecycle_from_legacy_state({
                                     "has_position": True,
@@ -2050,6 +2061,24 @@ class TMFSpread(StrategyBase):
             logger.error("[MTS_RESTORE_LOG_FAILED] error=%s", e)
 
         return False
+
+    def _set_single_leg_extrema(self, *, peak: float, nadir: float) -> None:
+        """P1: Single authority for single-leg extrema mutations.
+        Sets both decision fields and legacy telemetry mirrors.
+        """
+        self._single_leg_peak = peak
+        self._single_leg_nadir = nadir
+        # Legacy mirror (telemetry only — not read by TRAIL decision)
+        self._peak = peak
+        self._nadir = nadir
+
+    def _is_same_bar_as_release(self, bar_ts) -> bool:
+        """P1: True if bar_ts is in the same 5-min bucket as the release event."""
+        if bar_ts is None or not getattr(self, "_release_ts", None):
+            return True  # conservative
+        _bar_ts = pd.Timestamp(bar_ts) if not isinstance(bar_ts, pd.Timestamp) else bar_ts
+        _rel_ts = pd.Timestamp(self._release_ts) if not isinstance(self._release_ts, pd.Timestamp) else self._release_ts
+        return int(_bar_ts.timestamp() / 300) == int(_rel_ts.timestamp() / 300)
 
     def _append_skip(self, reason: str, **kwargs) -> None:
         """Append SKIP event only if reason changed or 5min elapsed since last."""
@@ -2230,16 +2259,14 @@ class TMFSpread(StrategyBase):
             _expected_reversion = "SPREAD_TO_NARROW"
             _near_side = "SHORT"
             _far_side = "LONG"
-            self._peak = near_close
-            self._nadir = far_close
+            self._set_single_leg_extrema(peak=near_close, nadir=far_close)
         else:
             _action = "BUY_NEAR_SELL_FAR"
             _reason = "TMF_SPREAD_NARROW"
             _expected_reversion = "SPREAD_TO_WIDEN"
             _near_side = "LONG"
             _far_side = "SHORT"
-            self._peak = near_close
-            self._nadir = far_close
+            self._set_single_leg_extrema(peak=near_close, nadir=far_close)
 
         # ── Entry-side audit log (2026-07-03 Hermes Agent) ──
         _append_event("ENTRY_AUDIT",
@@ -2475,12 +2502,9 @@ class TMFSpread(StrategyBase):
                 and not (hasattr(_rem_price, "item") and pd.isna(_rem_price))
             )
             if _fresh:
-                if self._side == "LONG":
-                    self._peak = _rem_price
-                    self._nadir = 0.0
-                else:
-                    self._nadir = _rem_price
-                    self._peak = 0.0
+                self._set_single_leg_extrema(peak=_rem_price, nadir=_rem_price)
+                self._single_leg_anchor_price = _rem_price
+                self._single_leg_anchor_event_time_ns = time.monotonic_ns()
                 self._trail_anchor_status = TrailAnchorStatus.READY
                 self._trail_warmup_tick_count = 0
                 self._trail_started_at = None
@@ -2553,21 +2577,24 @@ class TMFSpread(StrategyBase):
             # rem_high/rem_low: use opposite leg from released
             if _rel == Leg.NEAR:
                 if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG and not _is_backtest:
-                    # 2026-07-20 Gemini CLI: SINGLE_LEG may begin mid-bar after a RELEASE fill.
-                    # In live/paper mode, whole-bar high/low can include observations
-                    # from before the phase boundary. Use only the current event price
-                    # so peak/nadir are derived exclusively from post-release ticks.
-                    _rem_high = _rem_low = far_close
+                    # P1: Same-bar release check — if release in this bar,
+                    # bar OHLC includes pre-release data and cannot be used.
+                    if self._is_same_bar_as_release(bar.get("timestamp", bar.get("ts"))):
+                        _rem_high = _rem_low = far_close
+                    else:
+                        _rem_high = float(bar.get("far_high", 0))
+                        _rem_low = float(bar.get("far_low", 0))
                 else:
                     _rem_high = float(bar.get("far_high", 0))
                     _rem_low = float(bar.get("far_low", 0))
             elif _rel == Leg.FAR:
                 if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG and not _is_backtest:
-                    # 2026-07-20 Gemini CLI: SINGLE_LEG may begin mid-bar after a RELEASE fill.
-                    # In live/paper mode, whole-bar high/low can include observations
-                    # from before the phase boundary. Use only the current event price
-                    # so peak/nadir are derived exclusively from post-release ticks.
-                    _rem_high = _rem_low = near_close
+                    # P1: Same-bar release check
+                    if self._is_same_bar_as_release(bar.get("timestamp", bar.get("ts"))):
+                        _rem_high = _rem_low = near_close
+                    else:
+                        _rem_high = float(bar.get("near_high", 0))
+                        _rem_low = float(bar.get("near_low", 0))
                 else:
                     _rem_high = float(bar.get("near_high", 0))
                     _rem_low = float(bar.get("near_low", 0))
@@ -2726,10 +2753,10 @@ class TMFSpread(StrategyBase):
                     _rem_leg = Leg.FAR if _rel == Leg.NEAR else Leg.NEAR
                     _rem_price = far_close if _rem_leg == Leg.FAR else near_close
                     _giveback = 0.0
-                    if self._side == "LONG" and self._peak > 0:
-                        _giveback = self._peak - _rem_price
-                    elif self._side == "SHORT" and self._nadir > 0:
-                        _giveback = _rem_price - self._nadir
+                    if self._side == "LONG" and self._single_leg_peak > 0:
+                        _giveback = self._single_leg_peak - _rem_price
+                    elif self._side == "SHORT" and self._single_leg_nadir > 0:
+                        _giveback = _rem_price - self._single_leg_nadir
                     if _giveback > _trail_dist * _mult:
                         _risk_escalated = True
             elif _decision.action in (LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT, LifecycleAction.MANUAL):
@@ -3136,25 +3163,25 @@ class TMFSpread(StrategyBase):
         if self._released_leg == "near":
             _rem_price, _rem_entry, _rem_leg_label, _released_leg_label = far_close, self._far_entry, "FAR", "NEAR"
             if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG and not _is_backtest:
-                # 2026-07-20 Gemini CLI: SINGLE_LEG may begin mid-bar after a RELEASE fill.
-                # In live/paper mode, whole-bar high/low can include observations
-                # from before the phase boundary. Use only the current event price
-                # so peak/nadir are derived exclusively from post-release ticks.
-                _rem_high = _rem_low = far_close
+                # P1: Same-bar release check
+                if self._is_same_bar_as_release(bar.get("timestamp", bar.get("ts"))):
+                    _rem_high = _rem_low = far_close
+                else:
+                    _rem_high = float(bar.get("far_high", far_close))
+                    _rem_low = float(bar.get("far_low", far_close))
             else:
-                # 2026-05-27 Gemini CLI: Evaluate intra-bar extremes
                 _rem_high = float(bar.get("far_high", far_close))
                 _rem_low = float(bar.get("far_low", far_close))
         else:
             _rem_price, _rem_entry, _rem_leg_label, _released_leg_label = near_close, self._near_entry, "NEAR", "FAR"
             if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG and not _is_backtest:
-                # 2026-07-20 Gemini CLI: SINGLE_LEG may begin mid-bar after a RELEASE fill.
-                # In live/paper mode, whole-bar high/low can include observations
-                # from before the phase boundary. Use only the current event price
-                # so peak/nadir are derived exclusively from post-release ticks.
-                _rem_high = _rem_low = near_close
+                # P1: Same-bar release check
+                if self._is_same_bar_as_release(bar.get("timestamp", bar.get("ts"))):
+                    _rem_high = _rem_low = near_close
+                else:
+                    _rem_high = float(bar.get("near_high", near_close))
+                    _rem_low = float(bar.get("near_low", near_close))
             else:
-                # 2026-05-27 Gemini CLI: Evaluate intra-bar extremes
                 _rem_high = float(bar.get("near_high", near_close))
                 _rem_low = float(bar.get("near_low", near_close))
 
@@ -3171,11 +3198,22 @@ class TMFSpread(StrategyBase):
         rem_floating_pnl = (_rem_price - _rem_entry) if self._side == "LONG" else (_rem_entry - _rem_price)
 
         if self._side == "LONG":
-            self._peak = max(self._peak, _rem_high)
-            _trail_stop = self._peak - trail_dist
+            # P1: Only update single-leg extrema in SINGLE_LEG phase
+            if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG:
+                self._set_single_leg_extrema(
+                    peak=max(self._single_leg_peak, _rem_high),
+                    nadir=self._single_leg_nadir,
+                )
+            _trail_stop = self._single_leg_peak - trail_dist
         else: # SHORT
-            self._nadir = min(self._nadir, _rem_low)
-            _trail_stop = self._nadir + trail_dist
+            # P1: Only update single-leg extrema in SINGLE_LEG phase
+            if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG:
+                _new_nadir = min(self._single_leg_nadir, _rem_low) if self._single_leg_nadir > 0 else _rem_low
+                self._set_single_leg_extrema(
+                    peak=self._single_leg_peak,
+                    nadir=_new_nadir,
+                )
+            _trail_stop = self._single_leg_nadir + trail_dist
 
         # Post-Release Stage 1: Breakeven Stop-loss Adjustment
         # ADR-009 Task 8: breakeven floor retained for potential future lifecycle
@@ -3204,7 +3242,7 @@ class TMFSpread(StrategyBase):
                     entry_age_secs=(now - self._entry_ts).total_seconds() if self._entry_ts else 0.0,
                     release_stop_threshold=release_stop, trail_dist=trail_dist,
                     trailing_side=Side.LONG if self._side == "LONG" else Side.SHORT,
-                    peak=self._peak, nadir=self._nadir,
+                    peak=self._single_leg_peak, nadir=self._single_leg_nadir,
                     rem_high=_rem_high, rem_low=_rem_low,
                     is_backtest=_is_backtest,
                 )
@@ -3224,8 +3262,8 @@ class TMFSpread(StrategyBase):
                         "max_hold_secs": self._params.get("max_hold_secs"),
                         "max_loss_pts": self._params.get("max_loss_pts"),
                         "trailing_side": Side.LONG if self._side == "LONG" else Side.SHORT,
-                        "peak": self._peak,
-                        "nadir": self._nadir,
+                        "peak": self._single_leg_peak,
+                        "nadir": self._single_leg_nadir,
                         "rem_high": _rem_high,
                         "rem_low": _rem_low,
                         "last_applied_event_time": self._last_applied_event_time.isoformat() if getattr(self, "_last_applied_event_time", None) else None,
