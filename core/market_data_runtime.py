@@ -26,6 +26,7 @@ from core.background_snapshot_writer import (
     JsonStatePersister,
     SnapshotWriterHealth,
 )
+from core.dynamics_capture import DynamicsCaptureHook
 from core.global_callback_adapter import GlobalCallbackAdapter
 from core.market_data_contracts import ContractIdentity, ContractRoute
 from core.market_data_health import (
@@ -225,6 +226,7 @@ def build_mtx_runtime(
     data_output_dir: str = "data",
     snapshot_interval_sec: float = 15.0,
     resolver: Callable[[str], tuple[Any | None, Any | None]] | None = None,
+    dynamics_capture_config: dict | None = None,
 ) -> MarketDataRuntime:
     """Build a fully-assembled MTX market data runtime.
 
@@ -258,10 +260,29 @@ def build_mtx_runtime(
         interval_sec=snapshot_interval_sec,
     )
 
+    # DTI-001B: dynamics capture hook (instrumentation only)
+    _capture_hook = None
+    if dynamics_capture_config and dynamics_capture_config.get("enabled", False):
+        _exec_enabled = dynamics_capture_config.get("execution_enabled", False)
+        if _exec_enabled:
+            print("[DTI-001B] WARN: execution_enabled=True is BLOCKED. Forcing False.", flush=True)
+            _exec_enabled = False
+        _capture_log_dir = dynamics_capture_config.get("log_dir", "logs/ticks/dynamics")
+        try:
+            _capture_hook = DynamicsCaptureHook(log_dir=_capture_log_dir)
+            _capture_hook.start()
+            print(f"[DTI-001B] DynamicsCaptureHook enabled | execution_enabled={_exec_enabled} | "
+                  f"generation={_capture_hook.active_generation_id} | output={_capture_log_dir}", flush=True)
+        except Exception as ex:
+            import logging
+            logging.getLogger("market_data_runtime").exception("Failed to start DynamicsCaptureHook")
+            _capture_hook = None
+
     adapter = GlobalCallbackAdapter(
         registry=registry,
         fallback_tick_handler=fallback_tick,
         fallback_bidask_handler=fallback_bidask,
+        capture_hook=_capture_hook,
     )
 
     return MarketDataRuntime(

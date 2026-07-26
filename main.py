@@ -906,6 +906,8 @@ def run_system(dry_run=False, config_name="futures"):
                     registry=_mtx_registry,
                     fallback_tick=lambda *a: None,  # 暫時 no-op，callback registration 時取代
                     resolver=_mtx_resolver_fn,
+                    # DTI-001B: instrumentation-only tick capture (no execution impact)
+                    dynamics_capture_config={"enabled": True, "execution_enabled": False},
                 )
                 console.print("[dim]📊 MTX market data runtime initialized (passive)[/dim]")
             except Exception as exc:
