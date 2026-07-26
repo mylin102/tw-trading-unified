@@ -17,7 +17,8 @@ def test_multipage_folder_structure_exists():
         "02_positions_orders.py",
         "03_trade_review.py",
         "04_attribution.py",
-        "05_configuration.py",
+        "05_policy_j_shadow.py",
+        "06_configuration.py",
     ]
 
     for page in expected_pages:
