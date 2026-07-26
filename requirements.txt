@@ -10,6 +10,7 @@ python-dotenv
 pyyaml
 rich
 pandas_market_calendars
+pydantic
 
 # Dashboard & Visualization
 streamlit
