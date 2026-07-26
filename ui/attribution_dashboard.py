@@ -14,6 +14,13 @@ from datetime import datetime, timedelta
 import streamlit as st
 
 
+# 2026-07-26 Gemini CLI: Deprecated wrapper notice for Port 8501 migration to Port 8500
+try:
+    if hasattr(st, "runtime") and st.runtime.exists():
+        st.warning("⚠️ **Notice**: Attribution Dashboard 已整合至 Port 8500 Operations Dashboard (頁面 `04_attribution`)。請直接訪問 **http://localhost:8500**。")
+except Exception:
+    pass
+
 class AttributionDashboard:
     """Dashboard module for attribution analysis."""
     
