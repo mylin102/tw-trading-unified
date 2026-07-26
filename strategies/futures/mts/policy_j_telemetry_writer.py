@@ -21,6 +21,9 @@ class PolicyJTelemetryWriter:
         self.export_dir = Path(export_dir)
         self.write_error_count = 0
         self.records_written = 0
+        self.consecutive_failures = 0
+        self.last_success_time: Optional[str] = None
+        self.last_error_time: Optional[str] = None
 
     def resolve_target_file(self, date_str: str) -> Path:
         """Resolve session date-based target file path (e.g. policy_j_shadow_20260726.jsonl)."""
@@ -32,6 +35,8 @@ class PolicyJTelemetryWriter:
         Append a single canonical PolicyJShadowSnapshot JSON line to the target session file.
         Returns True on success, False on failure (with zero exception propagation).
         """
+        from datetime import datetime
+        now_str = datetime.now().isoformat()
         try:
             target_file = self.resolve_target_file(date_str)
             json_line = snapshot.to_json() + "\n"
@@ -41,11 +46,32 @@ class PolicyJTelemetryWriter:
                 f.flush()
                 
             self.records_written += 1
+            self.consecutive_failures = 0
+            self.last_success_time = now_str
             return True
         except Exception as e:
             self.write_error_count += 1
+            self.consecutive_failures += 1
+            self.last_error_time = now_str
             logger.error(
                 f"[POLICY_J_TELEMETRY_WRITE_FAILED] Failed to append telemetry snapshot (id={snapshot.snapshot_id}): {e}",
                 exc_info=True
             )
             return False
+
+    def get_health_status(self) -> dict:
+        """Return operational health status dictionary."""
+        status = "HEALTHY"
+        if self.consecutive_failures >= 5:
+            status = "FAILED"
+        elif self.consecutive_failures >= 1:
+            status = "DEGRADED"
+
+        return {
+            "status": status,
+            "records_written": self.records_written,
+            "total_failures": self.write_error_count,
+            "consecutive_failures": self.consecutive_failures,
+            "last_success_time": self.last_success_time,
+            "last_error_time": self.last_error_time,
+        }

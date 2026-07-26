@@ -59,6 +59,7 @@ class PolicyJShadowSnapshot:
     far_quote_age_ms: int | None = None
     config_hash: str = ""
     shadow_signal: str = PolicyJShadowSignal.NO_SIGNAL.value
+    first_trigger_event: bool = False
 
     def __post_init__(self):
         """Auto-generate snapshot_id and enforce eligibility constructor invariants."""

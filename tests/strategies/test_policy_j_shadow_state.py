@@ -38,3 +38,21 @@ def test_shadow_state_trade_lifecycle_reset():
     assert new_state.sequence_no == 0
     assert new_state.peak_net_exit_pnl_twd is None
     assert new_state.armed is False
+
+
+def test_shadow_state_restart_restoration_from_jsonl(tmp_path):
+    jsonl_file = tmp_path / "policy_j_shadow_20260726.jsonl"
+    jsonl_file.write_text(
+        '{"trade_id": "T1", "sequence_no": 48, "peak_net_exit_pnl_twd": 520.0, "shadow_signal": "ARMED", "would_trigger": false}\n'
+        'CORRUPTED_PARTIAL_LINE_HERE...\n',
+        encoding="utf-8"
+    )
+
+    restored = PolicyJShadowState.restore_from_jsonl(jsonl_file, "T1")
+
+    assert restored.trade_id == "T1"
+    assert restored.peak_net_exit_pnl_twd == 520.0
+    assert restored.sequence_no == 48
+    assert restored.armed is True
+    assert restored.would_trigger_emitted is False
+

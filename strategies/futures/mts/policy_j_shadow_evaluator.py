@@ -28,6 +28,7 @@ class PolicyJShadowObservation:
     event_time: str = ""
     processed_at: str = ""
     config_hash: str = ""
+    event_key: str | None = None
 
 
 class PolicyJShadowEvaluator:
@@ -47,6 +48,28 @@ class PolicyJShadowEvaluator:
         """
         # Ensure state corresponds to active trade_id (resets sequence_no to 0 if trade_id changed)
         current_state = state.with_trade(obs.trade_id)
+
+        # Gate 0.1: Idempotency Check (Duplicate Event Key)
+        event_key = obs.event_key or (f"{obs.trade_id}_{obs.event_time}" if obs.trade_id and obs.event_time else None)
+        if event_key and event_key == current_state.last_event_key:
+            # Retain previous sequence_no and state without bumping or re-evaluating
+            snapshot = PolicyJShadowSnapshot(
+                sequence_no=current_state.sequence_no,
+                trade_id=obs.trade_id,
+                event_time=obs.event_time,
+                processed_at=obs.processed_at,
+                mode="SHADOW_ONLY",
+                eligible=current_state.armed,
+                eligibility_reason=EligibilityReason.HEDGED_PAIR_SPREAD.value if current_state.armed else EligibilityReason.NOT_SPREAD_PHASE.value,
+                peak_net_exit_pnl_twd=current_state.peak_net_exit_pnl_twd,
+                would_trigger=current_state.would_trigger_emitted,
+                execution_blocked=True,
+                config_hash=obs.config_hash,
+                shadow_signal=PolicyJShadowSignal.WOULD_EXIT_BOTH.value if current_state.would_trigger_emitted else PolicyJShadowSignal.MONITORING.value,
+                first_trigger_event=False,
+            )
+            return snapshot, current_state
+
         next_seq = current_state.sequence_no + 1
 
         activation_twd = float(config.get("activation_net_pnl_twd", 300.0))
@@ -230,6 +253,7 @@ class PolicyJShadowEvaluator:
                 signal = PolicyJShadowSignal.WOULD_EXIT_BOTH.value
 
         # Emitted status tracking
+        is_first_trigger = would_trigger and not current_state.would_trigger_emitted
         already_emitted = current_state.would_trigger_emitted or would_trigger
 
         snapshot = PolicyJShadowSnapshot(
@@ -252,6 +276,7 @@ class PolicyJShadowEvaluator:
             far_quote_age_ms=obs.far_quote_age_ms,
             config_hash=obs.config_hash,
             shadow_signal=signal,
+            first_trigger_event=is_first_trigger,
         )
 
         new_state = PolicyJShadowState(
@@ -260,7 +285,7 @@ class PolicyJShadowEvaluator:
             sequence_no=next_seq,
             armed=is_armed,
             would_trigger_emitted=already_emitted,
-            last_event_key=f"{obs.trade_id}_{next_seq}",
+            last_event_key=event_key or f"{obs.trade_id}_{next_seq}",
         )
 
         return snapshot, new_state

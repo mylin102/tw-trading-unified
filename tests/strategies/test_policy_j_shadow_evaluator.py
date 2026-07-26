@@ -143,10 +143,32 @@ def test_evaluator_activation_and_giveback_trigger_sequence(default_config):
         gross_liquidation_pnl_twd=390.0,
         near_quote_age_ms=10,
         far_quote_age_ms=10,
+        event_time="10:00:03",
     )
     snap3, state3 = PolicyJShadowEvaluator.evaluate(obs3, state2, default_config)
     assert snap3.eligible is True
-    assert snap3.peak_net_exit_pnl_twd == 500.0  # Peak stays at 500
+    assert snap3.peak_net_exit_pnl_twd == 500.0
     assert snap3.would_trigger is True
     assert snap3.shadow_signal == PolicyJShadowSignal.WOULD_EXIT_BOTH.value
-    assert snap3.execution_blocked is True  # Hardlocked True!
+    assert snap3.execution_blocked is True
+    assert snap3.first_trigger_event is True  # Edge transition!
+
+    # Tick 4: Net PnL = 380 (Slightly lower, would_trigger still True, but NOT first_trigger_event!)
+    obs4 = PolicyJShadowObservation(
+        trade_id="T001",
+        is_spread_phase=True,
+        is_hedged_pair=True,
+        exit_inflight=False,
+        gross_liquidation_pnl_twd=380.0,
+        near_quote_age_ms=10,
+        far_quote_age_ms=10,
+        event_time="10:00:04",
+    )
+    snap4, state4 = PolicyJShadowEvaluator.evaluate(obs4, state3, default_config)
+    assert snap4.would_trigger is True
+    assert snap4.first_trigger_event is False  # Already emitted!
+
+    # Tick 5: Duplicate Event Key (T001_10:00:04) -> Idempotency check!
+    snap5, state5 = PolicyJShadowEvaluator.evaluate(obs4, state4, default_config)
+    assert snap5.sequence_no == snap4.sequence_no  # Sequence number is NOT bumped!
+    assert state5 == state4  # State is unmodified!
