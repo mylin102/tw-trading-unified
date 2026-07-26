@@ -213,3 +213,53 @@ def test_adapter_recovery_facts():
     )
     proj = adapter.recover(facts_unrecoverable)
     assert proj.recovery_status == RecoveryStatus.UNRECOVERABLE
+
+
+def test_policy_j_primary_exit_and_fallback():
+    """Verify Policy J COMBINED_EXIT triggers first on total UPL peak giveback, and falls back to RELEASE if UPL target not reached."""
+    from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+        LifecycleContext,
+        evaluate_lifecycle_actions,
+        ReleaseGroup,
+    )
+
+    lc = PositionLifecycle(
+        phase=PositionPhase.SPREAD,
+        release_group=ReleaseGroup(status=ReleaseGroupStatus.ARMED)
+    )
+
+    # 1. Policy J Primary Trigger: Target peak 35.0 reached, current UPL drops to 20.0 (giveback 15.0 >= 10.0)
+    ctx_policy_j = LifecycleContext(
+        near_pnl_pts=10.0,
+        far_pnl_pts=10.0,
+        floating_pnl_pts=20.0,
+        entry_age_secs=100.0,
+        release_stop_threshold=80.0,
+        trail_dist=48.9,
+        enable_combined_upl_trail=True,
+        combined_upl_target_pts=30.0,
+        combined_upl_giveback_pts=10.0,
+        peak_total_upl=35.0,
+    )
+    decision = evaluate_lifecycle_actions(ctx_policy_j, lc)
+    assert decision is not None
+    assert decision.action == LifecycleAction.COMBINED_EXIT
+
+    # 2. Secondary Fallback: Target peak not reached (peak = 15.0 < 30.0), but single leg hits release threshold (-80.0)
+    ctx_fallback = LifecycleContext(
+        near_pnl_pts=-85.0,
+        far_pnl_pts=10.0,
+        floating_pnl_pts=-75.0,
+        entry_age_secs=100.0,
+        release_stop_threshold=80.0,
+        trail_dist=48.9,
+        enable_combined_upl_trail=True,
+        combined_upl_target_pts=30.0,
+        combined_upl_giveback_pts=10.0,
+        peak_total_upl=15.0,
+    )
+    decision_fallback = evaluate_lifecycle_actions(ctx_fallback, lc)
+    assert decision_fallback is not None
+    assert decision_fallback.action == LifecycleAction.RELEASE
+    assert decision_fallback.release_leg == Leg.NEAR
+

@@ -56,6 +56,7 @@ class LifecycleAction(Enum):
     MANUAL = "MANUAL"
     STOPLOSS = "STOPLOSS"
     TIMEOUT = "TIMEOUT"
+    COMBINED_EXIT = "COMBINED_EXIT"  # 2026-07-26 Gemini CLI: Policy J Primary Exit (Both Legs Simultaneous)
     RELEASE = "RELEASE"
     TRAIL = "TRAIL"
 
@@ -163,6 +164,11 @@ class LifecycleContext:
     rem_high: float = 0.0
     rem_low: float = 0.0
     is_backtest: bool = False
+    # 2026-07-26 Gemini CLI: Policy J Primary Exit - Total UPL Combined Trailing parameters (Default FALSE for safety)
+    enable_combined_upl_trail: bool = False
+    combined_upl_target_pts: float = 30.0
+    combined_upl_giveback_pts: float = 10.0
+    peak_total_upl: float = 0.0
 
 @dataclass(frozen=True)
 class LifecycleEvaluationInput:
@@ -235,6 +241,29 @@ def _check_timeout_candidate(ctx: LifecycleContext) -> list[LifecycleDecision]:
         return [LifecycleDecision(action=LifecycleAction.TIMEOUT)]
     return []
 
+def _check_combined_upl_trail_candidate(
+    ctx: LifecycleContext, lifecycle: PositionLifecycle,
+) -> list[LifecycleDecision]:
+    """2026-07-26 Gemini CLI: Policy J Primary Exit - Total UPL Combined Trailing Exit."""
+    if not ctx.enable_combined_upl_trail:
+        return []
+    _phase_val = enum_value(lifecycle.phase)
+    if _phase_val != "SPREAD":
+        return []
+    _rg_status = enum_value(lifecycle.release_group.status)
+    if _rg_status not in ("ARMED", "TRIGGERED"):
+        return []
+
+    total_upl_pts = ctx.near_pnl_pts + ctx.far_pnl_pts
+    if ctx.peak_total_upl >= ctx.combined_upl_target_pts:
+        if total_upl_pts <= (ctx.peak_total_upl - ctx.combined_upl_giveback_pts):
+            logger.info(
+                "[POLICY_J_TRIGGERED] Total UPL peak=%.1f current=%.1f giveback=%.1f -> COMBINED_EXIT",
+                ctx.peak_total_upl, total_upl_pts, ctx.combined_upl_giveback_pts,
+            )
+            return [LifecycleDecision(action=LifecycleAction.COMBINED_EXIT)]
+    return []
+
 def _check_release_candidates(
     ctx: LifecycleContext, lifecycle: PositionLifecycle,
 ) -> list[LifecycleDecision]:
@@ -304,6 +333,7 @@ _LIFECYCLE_ACTION_PRIORITY = [
     LifecycleAction.MANUAL,
     LifecycleAction.STOPLOSS,
     LifecycleAction.TIMEOUT,
+    LifecycleAction.COMBINED_EXIT, # 2026-07-26 Gemini CLI: Policy J Primary Exit priority over Release
     LifecycleAction.RELEASE,
     LifecycleAction.TRAIL,
 ]
@@ -324,7 +354,8 @@ def evaluate_lifecycle_actions(
     candidates.extend(_check_manual_candidate(ctx))
     candidates.extend(_check_stoploss_candidate(ctx))
     candidates.extend(_check_timeout_candidate(ctx))
-    candidates.extend(_check_release_candidates(ctx, lifecycle))
+    candidates.extend(_check_combined_upl_trail_candidate(ctx, lifecycle)) # Policy J Primary Exit
+    candidates.extend(_check_release_candidates(ctx, lifecycle))           # ADR-011 Secondary Fallback
     candidates.extend(_check_trail_candidate(ctx, lifecycle))
 
     if not candidates:
