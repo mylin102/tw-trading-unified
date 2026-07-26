@@ -20,6 +20,14 @@ class EligibilityReason(str, Enum):
     POLICY_DISABLED = "POLICY_DISABLED"
 
 
+class PolicyJShadowSignal(str, Enum):
+    """Enumeration of Policy J Shadow Signals."""
+    NO_SIGNAL = "NO_SIGNAL"
+    MONITORING = "MONITORING"
+    ARMED = "ARMED"
+    WOULD_EXIT_BOTH = "WOULD_EXIT_BOTH"
+
+
 @dataclass(frozen=True)
 class PolicyJShadowSnapshot:
     """
@@ -30,7 +38,7 @@ class PolicyJShadowSnapshot:
     - 1.x: Backward compatible schema additions.
     - 2.x: Breaking schema changes requiring major Dashboard update.
     """
-    schema_version: str = "1.0"
+    schema_version: str = "1.1"
     snapshot_id: str = ""               # Unique snapshot UUID / identifier
     sequence_no: int = 0                # Monotonic sequence counter per trade lifecycle
     trade_id: str | None = None
@@ -50,12 +58,23 @@ class PolicyJShadowSnapshot:
     near_quote_age_ms: int | None = None
     far_quote_age_ms: int | None = None
     config_hash: str = ""
+    shadow_signal: str = PolicyJShadowSignal.NO_SIGNAL.value
 
     def __post_init__(self):
-        """Auto-generate snapshot_id if not explicitly provided."""
+        """Auto-generate snapshot_id and enforce eligibility constructor invariants."""
         if not self.snapshot_id:
-            # Dataclass is frozen, use object.__setattr__ during initialization
             object.__setattr__(self, "snapshot_id", str(uuid.uuid4()))
+
+        # Constructor validation: eligible=True MUST map to HEDGED_PAIR_SPREAD, and vice versa
+        if self.eligible and self.eligibility_reason != EligibilityReason.HEDGED_PAIR_SPREAD.value:
+            raise ValueError(
+                f"Invalid snapshot: eligible=True requires eligibility_reason={EligibilityReason.HEDGED_PAIR_SPREAD.value}, "
+                f"got '{self.eligibility_reason}'"
+            )
+        if not self.eligible and self.eligibility_reason == EligibilityReason.HEDGED_PAIR_SPREAD.value:
+            raise ValueError(
+                f"Invalid snapshot: eligible=False cannot have eligibility_reason={EligibilityReason.HEDGED_PAIR_SPREAD.value}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert snapshot to dictionary for JSON serialization."""
