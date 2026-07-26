@@ -257,19 +257,27 @@ with st.sidebar:
         key="page_selector",
     )
 
-    # 2026-07-26 Gemini CLI: On-demand 8502 Research Lab launcher in sidebar
+    # 2026-07-26 Gemini CLI: On-demand 8502 Research Lab launcher & shutdown toggle in sidebar
     st.divider()
     st.markdown("🧪 **量化實驗室 (Port 8502)**")
     is_8502_running = False
     try:
-        res = subprocess.run(["pgrep", "-f", "8502"], capture_output=True, text=True)
-        is_8502_running = (res.returncode == 0)
+        res = subprocess.run(["pgrep", "-f", "ui/backtest_dashboard.py"], capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout.strip():
+            is_8502_running = True
     except Exception:
         pass
 
     if is_8502_running:
         st.success("🟢 8502 實驗室執行中")
-        st.markdown('<a href="http://localhost:8502" target="_blank" style="text-decoration:none;"><button style="width:100%;padding:8px;background-color:#2e7d32;color:white;border:none;border-radius:4px;cursor:pointer;font-weight:bold;">🚀 開啟 8502 實驗室</button></a>', unsafe_allow_html=True)
+        st.markdown('<a href="http://localhost:8502" target="_blank" style="text-decoration:none;"><button style="width:100%;padding:8px;background-color:#2e7d32;color:white;border:none;border-radius:4px;cursor:pointer;font-weight:bold;margin-bottom:6px;">🚀 開啟 8502 實驗室</button></a>', unsafe_allow_html=True)
+        if st.button("⏹️ 關閉 8502 實驗室 (釋放資源)", use_container_width=True):
+            try:
+                subprocess.run(["pkill", "-f", "ui/backtest_dashboard.py"])
+                st.info("🛑 8502 實驗室已關閉並釋放資源！")
+                st.rerun()
+            except Exception as ex:
+                st.error(f"關閉失敗: {ex}")
     else:
         st.caption("⚪ 8502 實驗室未啟動 (按需省資源)")
         if st.button("▶️ 啟動 8502 實驗室", use_container_width=True):
@@ -278,8 +286,8 @@ with st.sidebar:
                     sys.executable, "-m", "streamlit", "run", "ui/backtest_dashboard.py",
                     "--server.port", "8502", "--server.address", "0.0.0.0", "--server.headless", "true"
                 ])
-                st.success("🎉 8502 實驗室已啟動！點擊下方按鈕前往：")
-                st.markdown('<a href="http://localhost:8502" target="_blank" style="text-decoration:none;"><button style="width:100%;padding:8px;background-color:#2e7d32;color:white;border:none;border-radius:4px;cursor:pointer;font-weight:bold;">🚀 開啟 8502 實驗室</button></a>', unsafe_allow_html=True)
+                st.success("🎉 8502 實驗室已啟動！")
+                st.rerun()
             except Exception as ex:
                 st.error(f"啟動失敗: {ex}")
     st.divider()
