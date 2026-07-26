@@ -68,12 +68,14 @@ class GlobalCallbackAdapter:
         fallback_bidask_handler: Callable[..., None] | None = None,
         *,
         always_call_fallback: bool = False,
+        capture_hook: Any = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._registry = registry
         self._fallback_tick = fallback_tick_handler
         self._fallback_bidask = fallback_bidask_handler or fallback_tick_handler
-        self._always_call_fallback = always_call_fallback  # 💡 Gemini CLI: allow fallback tick_dispatcher to receive routed ticks
+        self._always_call_fallback = always_call_fallback
+        self._capture_hook = capture_hook  # DTI-001A: instrumentation only, None = disabled
         self._logger = logger or logging.getLogger(self.__class__.__name__)
         self._callback_error_count: int = 0
 
@@ -146,6 +148,13 @@ class GlobalCallbackAdapter:
         else:
             print(f"[GCA_TICK] EXIT no_fallback adapter_id={id(self)} code={code}", flush=True)
 
+        # ── DTI-001A: instrumentation-only tick capture ──
+        if self._capture_hook is not None:
+            try:
+                self._capture_hook.observe(exchange, tick)
+            except Exception:
+                self._logger.exception("Capture hook observe failed (non-blocking)")
+
     # 💡 Gemini CLI: Accept *args to support both 1-arg (rshioaji 1.5+) and 2-arg (legacy) callback signatures
     def on_bidask(self, *args) -> None:
         """Dispatch a single bidask update.  Same delegation logic as on_tick."""
@@ -179,3 +188,10 @@ class GlobalCallbackAdapter:
                 return
 
         self._fallback_bidask(*args)
+
+        # ── DTI-001A: instrumentation-only bidask capture ──
+        if self._capture_hook is not None:
+            try:
+                self._capture_hook.observe(exchange, bidask)
+            except Exception:
+                self._logger.exception("Capture hook observe failed (non-blocking, bidask)")
