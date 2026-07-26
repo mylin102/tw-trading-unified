@@ -158,8 +158,16 @@ def main():
                     if st.button("🔧 Repair with Backfiller"):
                         with st.spinner("Repairing gaps via Shioaji..."):
                             import subprocess
-                            subprocess.run(["python3", "scripts/sync/unified_backfiller.py"], check=True)
-                            st.rerun()
+                            import sys
+                            try:
+                                res = subprocess.run([sys.executable, "scripts/sync/unified_backfiller.py"], capture_output=True, text=True)
+                                if res.returncode == 0:
+                                    st.success("✅ Backfill completed successfully!")
+                                    st.rerun()
+                                else:
+                                    st.error(f"⚠️ Backfill failed (code {res.returncode}):\n{res.stderr or res.stdout}")
+                            except Exception as ex:
+                                st.error(f"⚠️ Backfill execution error: {ex}")
             st.divider()
 
             with st.form("backtest_config"):
