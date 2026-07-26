@@ -50,8 +50,12 @@ def _get_git_commit_short() -> str:
 
 
 def _compute_generation_id() -> str:
-    """<process_start_utc>-pid<pid>-<short_commit>"""
-    proc_start = datetime.fromtimestamp(time.monotonic(), tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    """<process_start_utc>-pid<pid>-<short_commit>
+
+    Uses datetime.now() — NOT time.monotonic() — so the timestamp reflects
+    actual UTC clock time, enabling restart boundary detection.
+    """
+    proc_start = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     pid = os.getpid()
     commit = _get_git_commit_short()
     return f"{proc_start}-pid{pid}-{commit}"
