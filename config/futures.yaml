@@ -155,7 +155,7 @@ mts:
     max_age_sec: 420
   params:
     min_atr: 10.0
-    atr_multiplier_stop: 1.0
+    atr_multiplier_stop: 2.1
     atr_multiplier_trail: 1.1
     release_stop_points: 200
     trail_distance_points: 30

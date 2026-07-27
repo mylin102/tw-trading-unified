@@ -5817,27 +5817,36 @@ elif page == "設定":
                 save_yaml(FUTURES_CFG_PATH, futures_cfg)
                 _new_yaml = open(FUTURES_CFG_PATH).read()
 
-                # 2026-07-27 Gemini CLI: Dual-config sync to ensure day/night session switches retain updated MTS params
+                # 2026-07-27 Gemini CLI: Dual-config sync with explicit SESSION_SPECIFIC_MTS_PARAMS taxonomy
                 _counterpart_cfg_name = "futures.yaml" if _CURRENT_SESSION_NIGHT else "futures_night.yaml"
                 _counterpart_cfg_path = BASE / "config" / _counterpart_cfg_name
+                SESSION_SPECIFIC_MTS_PARAMS = {"atr_multiplier_stop", "atr_multiplier_trail"}
+
                 if _counterpart_cfg_path.exists():
                     _counterpart_cfg = load_yaml(_counterpart_cfg_path)
                     if "mts" not in _counterpart_cfg: _counterpart_cfg["mts"] = {}
                     _counterpart_cfg["mts"]["enabled"] = f_mts_new
                     if f_mts_new:
                         if "params" not in _counterpart_cfg["mts"]: _counterpart_cfg["mts"]["params"] = {}
-                        _counterpart_cfg["mts"]["params"]["min_atr"] = f_mts_min_atr
-                        _counterpart_cfg["mts"]["params"]["atr_cap"] = f_mts_atr_cap
-                        # Preserve session-specific ATR multipliers if already defined in counterpart config
-                        if "atr_multiplier_stop" not in _counterpart_cfg["mts"]["params"]:
-                            _counterpart_cfg["mts"]["params"]["atr_multiplier_stop"] = f_mts_mult_stop
-                        if "atr_multiplier_trail" not in _counterpart_cfg["mts"]["params"]:
-                            _counterpart_cfg["mts"]["params"]["atr_multiplier_trail"] = f_mts_mult_trail
-                        _counterpart_cfg["mts"]["params"]["release_stop_points"] = f_mts_stop_fixed
-                        _counterpart_cfg["mts"]["params"]["trail_distance_points"] = f_mts_trail_fixed
-                        _counterpart_cfg["mts"]["params"]["enable_combined_upl_trail"] = f_policy_j_enable
-                        _counterpart_cfg["mts"]["params"]["combined_upl_activation_net_pnl_twd"] = f_policy_j_activation
-                        _counterpart_cfg["mts"]["params"]["combined_upl_giveback_twd"] = f_policy_j_giveback
+                        _incoming_params = {
+                            "min_atr": f_mts_min_atr,
+                            "atr_cap": f_mts_atr_cap,
+                            "atr_multiplier_stop": f_mts_mult_stop,
+                            "atr_multiplier_trail": f_mts_mult_trail,
+                            "release_stop_points": f_mts_stop_fixed,
+                            "trail_distance_points": f_mts_trail_fixed,
+                            "enable_combined_upl_trail": f_policy_j_enable,
+                            "combined_upl_activation_net_pnl_twd": f_policy_j_activation,
+                            "combined_upl_giveback_twd": f_policy_j_giveback,
+                        }
+                        for _pkey, _pval in _incoming_params.items():
+                            if _pkey in SESSION_SPECIFIC_MTS_PARAMS:
+                                # Preserve session-specific params in counterpart if already defined
+                                if _pkey not in _counterpart_cfg["mts"]["params"]:
+                                    _counterpart_cfg["mts"]["params"][_pkey] = _pval
+                            else:
+                                # Synchronize shared parameters across sessions
+                                _counterpart_cfg["mts"]["params"][_pkey] = _pval
                     save_yaml(_counterpart_cfg_path, _counterpart_cfg)
 
                 # Build compact diff summary
