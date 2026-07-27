@@ -3496,6 +3496,32 @@ elif _selected_product == "TMF":
                 _u2.metric("遠月 UPL", f"{_fr:+,.0f} TWD")
                 _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
 
+                # 2026-07-27 Gemini CLI: Policy J (Combined UPL Trail) Live Notification Banner
+                _mts_params = futures_cfg.get("mts", {}).get("params", {})
+                _pj_enabled = bool(_mts_params.get("enable_combined_upl_trail", True))
+                if _pj_enabled:
+                    _pj_act_twd = float(_mts_params.get("combined_upl_activation_net_pnl_twd", 200.0))
+                    _pj_giveback_twd = float(_mts_params.get("combined_upl_giveback_twd", 50.0))
+                    _net_exit_twd = _tr - 92.0  # 10 TWD/pt minus 92 TWD friction
+                    _peak_exit_twd = max(float(_mts_state.get("peak_net_exit_pnl_twd", 0.0)), _net_exit_twd)
+                    
+                    if _peak_exit_twd >= _pj_act_twd:
+                        _trigger_line = _peak_exit_twd - _pj_giveback_twd
+                        st.success(
+                            f"🛡️ **Policy J 組合停利已啟動 (ARMED & TRACKING)**  \n"
+                            f"• **啟動門檻**: `{_pj_act_twd:,.0f} TWD` (已超越)  \n"
+                            f"• **最高淨利 Peak PnL**: `{_peak_exit_twd:+,.0f} TWD`  \n"
+                            f"• **平倉觸發線 (Peak - {_pj_giveback_twd:.0f} TWD)**: `{_trigger_line:+,.0f} TWD`  \n"
+                            f"*(當前淨損益自 Peak 回撤達 `{_pj_giveback_twd:.0f} TWD` 時將立即下單觸發 COMBINED_EXIT 雙腿組合平倉)*"
+                        )
+                    else:
+                        _diff = _pj_act_twd - _net_exit_twd
+                        st.info(
+                            f"🛡️ **Policy J 組合停利監控中 (MONITORING)**  \n"
+                            f"• **啟動門檻**: `{_pj_act_twd:,.0f} TWD` (當前純淨利 `{_net_exit_twd:+,.0f} TWD`，尚差 `{_diff:,.0f} TWD` 啟動)  \n"
+                            f"• **回吐門檻**: `{_pj_giveback_twd:.0f} TWD`"
+                        )
+
                 st.caption(f'最後更新: {_mts_state.get("_updated", "?")}')
 
                 # ── MTS 個別委託 (from mts_trade_fills.jsonl) ──
