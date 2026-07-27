@@ -277,6 +277,7 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
             
             release_pnl = release_fill.get("realized_pnl", 0.0) if release_fill else 0.0
             exit_pnl = exit_fill.get("realized_pnl", 0.0) if exit_fill else 0.0
+            net_pnl = release_pnl + exit_pnl
             report_data["completed"].append({
                 "trade_id": trade_id,
                 "entry_time": data["entry_ts"],
