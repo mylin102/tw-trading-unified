@@ -6992,11 +6992,13 @@ class FuturesMonitor:
         return self._combined_exit_trackers[execution_id]
 
     def _apply_combined_exit_fill(self, event, pending: dict, signal: str, price: float) -> None:
+        console.print(f"[dim]DBG [COMBINED_EXIT_FILL_ENTERED] signal={signal} order_id={event.order_id}[/dim]")
         """Process a COMBINED_EXIT leg fill. Tracks both legs; only resets strategy to FLAT when both fully filled."""
         from core.order_management.order import OrderStatus
         from strategies.plugins.futures.active.tmf_spread import PositionPhase, _write_mts_state
 
-        trade_id = event.deal_id or pending.get("reason", "COMBINED_EXIT")
+        # Shared key so near + far fills use the same tracker
+        trade_id = pending.get("reason", "COMBINED_EXIT")
         lots = int(event.fill_qty)
         leg = "NEAR" if "NEAR" in str(signal) else "FAR"
         tracker = self._get_combined_exit_tracker(trade_id)
