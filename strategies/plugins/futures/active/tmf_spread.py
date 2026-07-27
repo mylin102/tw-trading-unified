@@ -497,6 +497,106 @@ _LIVE_TICK = "LIVE_TICK"
 _MISSING = "MISSING"
 _UNSET = "UNSET"
 
+# ADR-024E.1: Durable JSONL append with flush + fsync
+_SETTLEMENT_FAILURE_LATCH = os.getenv(
+    "MTS_SETTLEMENT_FAILURE_LATCH",
+    "data/runtime/mts_settlement_failure.json",
+)
+
+
+def _append_jsonl_durable(path: str, record: dict) -> None:
+    """Append JSONL record with flush + fsync for durability."""
+    _dir = os.path.dirname(path)
+    if _dir and not os.path.exists(_dir):
+        os.makedirs(_dir, exist_ok=True)
+    payload = json.dumps(record, default=str, ensure_ascii=False) + "\n"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _write_settlement_failure_latch(
+    trade_id: str,
+    execution_id: str,
+    *,
+    near_filled_qty: int = 0,
+    near_expected_qty: int = 0,
+    far_filled_qty: int = 0,
+    far_expected_qty: int = 0,
+    failure_reason: str = "COMBINED_EXIT_LEDGER_APPEND_FAILED",
+) -> None:
+    """Atomically write a persistent settlement failure latch."""
+    state = {
+        "schema_version": 1,
+        "active": True,
+        "phase": "SETTLEMENT_PERSISTENCE_FAILED",
+        "trade_id": trade_id,
+        "execution_id": execution_id,
+        "failure_reason": failure_reason,
+        "failed_at": datetime.now().isoformat(),
+        "near_filled_qty": near_filled_qty,
+        "near_expected_qty": near_expected_qty,
+        "far_filled_qty": far_filled_qty,
+        "far_expected_qty": far_expected_qty,
+        "entry_enabled": False,
+        "combined_exit_resubmit_enabled": False,
+        "reconciliation_required": True,
+    }
+    _tmp = _SETTLEMENT_FAILURE_LATCH + ".tmp"
+    try:
+        with open(_tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(state, default=str, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_tmp, _SETTLEMENT_FAILURE_LATCH)
+        # Directory fsync for atomic rename
+        _dir_fd = os.open(os.path.dirname(_SETTLEMENT_FAILURE_LATCH), os.O_RDONLY)
+        try:
+            os.fsync(_dir_fd)
+        finally:
+            os.close(_dir_fd)
+    except Exception:
+        # Failure latch itself failed to persist — this is a critical durability failure.
+        # Remove the partial temp file, then hard-terminate.
+        try:
+            if os.path.exists(_tmp):
+                os.remove(_tmp)
+        except Exception:
+            pass
+        logger.critical(
+            "[CRITICAL_DURABILITY_FAILURE] Cannot persist settlement failure latch for "
+            "trade_id=%s execution_id=%s. Terminating process.",
+            trade_id, execution_id,
+        )
+        os._exit(1)
+
+
+def _clear_settlement_failure_latch() -> bool:
+    """Remove the failure latch if it exists. Returns True if latch was present."""
+    if os.path.exists(_SETTLEMENT_FAILURE_LATCH):
+        try:
+            os.remove(_SETTLEMENT_FAILURE_LATCH)
+            return True
+        except Exception:
+            logger.error("[FAILURE_LATCH] Failed to remove latch: %s", _SETTLEMENT_FAILURE_LATCH)
+            return False
+    return False
+
+
+def _load_settlement_failure_latch() -> dict | None:
+    """Load the persistent failure latch, returning None if absent or invalid."""
+    if not os.path.exists(_SETTLEMENT_FAILURE_LATCH):
+        return None
+    try:
+        with open(_SETTLEMENT_FAILURE_LATCH) as f:
+            state = json.loads(f.read())
+        if state.get("active") is True:
+            return state
+    except Exception:
+        pass
+    return None
+
 
 def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
                  price: float, fill_type: str, trade_id: str,
@@ -568,10 +668,9 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
         if trade_id == "?":
             logger.error("[MTS_FILL_ERROR] Missing trade_id in fill record! type=%s ticker=%s", fill_type, ticker)
         
-        with open(_MTS_FILL_LOG, "a") as f:
-            f.write(json.dumps(fill, default=str) + "\n")
-    except Exception:
-        pass
+        _append_jsonl_durable(_MTS_FILL_LOG, fill)
+    except Exception as _ae:
+        logger.error("[MTS_FILL_APPEND_FAILED] trade_id=%s fill_type=%s error=%s", trade_id, fill_type, _ae)
 
 
 # ═══════════════════════════════════════════════════════════════

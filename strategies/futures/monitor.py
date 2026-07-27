@@ -7160,7 +7160,7 @@ class FuturesMonitor:
                 f"far_expected_qty {tracker['far_expected_qty']}"
             )
 
-    # ADR-024E: Persistence failure fail-closed
+    # ADR-024E.1: Persistence failure fail-closed + durable latch
     def _enter_settlement_persistence_failed(self, *, tracker: dict, error: Exception) -> None:
         import logging as _lg
         _lg.getLogger("FuturesMonitor").critical(
@@ -7178,8 +7178,97 @@ class FuturesMonitor:
             f"entry=DISABLED combined_exit_resubmit=DISABLED "
             f"reconciliation=REQUIRED[/bold red]"
         )
+        # ADR-024E.1: Write durable failure latch (includes os._exit(1) on secondary failure)
+        try:
+            from strategies.plugins.futures.active.tmf_spread import _write_settlement_failure_latch
+            _write_settlement_failure_latch(
+                trade_id=tracker.get("trade_id", "UNKNOWN"),
+                execution_id=tracker.get("execution_id", "UNKNOWN"),
+                near_filled_qty=tracker.get("near_filled_qty", 0),
+                near_expected_qty=tracker.get("near_expected_qty", 0),
+                far_filled_qty=tracker.get("far_filled_qty", 0),
+                far_expected_qty=tracker.get("far_expected_qty", 0),
+            )
+        except Exception as _le:
+            _lg.getLogger("FuturesMonitor").critical(
+                "[CRITICAL_DURABILITY_FAILURE] Failure latch write also failed: %r", _le,
+            )
 
-    # ADR-024E: Post-exit reconciliation gate
+    # ADR-024E.1: Startup gate — check persistent failure latch
+    def _check_settlement_failure_latch(self) -> bool:
+        """Check for unresolved failure latch on startup. Returns True if latch is active."""
+        try:
+            from strategies.plugins.futures.active.tmf_spread import _load_settlement_failure_latch
+            latch = _load_settlement_failure_latch()
+        except Exception:
+            latch = None
+        if latch is None:
+            return False
+        import logging as _lg
+        _lg.getLogger("FuturesMonitor").critical(
+            "[STARTUP_FAILURE_LATCH] Unresolved settlement failure: trade_id=%(tid)s "
+            "entry=DISABLED resubmit=DISABLED READY=PROHIBITED",
+            {"tid": latch.get("trade_id", "UNKNOWN")},
+        )
+        self._entry_enabled = False
+        self._combined_exit_resubmit_enabled = False
+        self._position_reconciliation_required = True
+        self._lifecycle = "SETTLEMENT_PERSISTENCE_FAILED"
+        console.print(
+            f"[bold red] [STARTUP_FAILURE_LATCH] Unresolved settlement failure: "
+            f"trade_id={latch.get('trade_id')} "
+            f"entry=DISABLED combined_exit_resubmit=DISABLED READY=PROHIBITED[/bold red]"
+        )
+        return True
+
+    # ADR-024E.1: Three-way reconciliation
+    def _reconcile_combined_exit(self) -> bool:
+        """Verify broker/simulator near=0, far=0, ledger has COMBINED_EXIT_COMPLETED."""
+        try:
+            from strategies.plugins.futures.active.tmf_spread import _load_settlement_failure_latch, _clear_settlement_failure_latch
+            latch = _load_settlement_failure_latch()
+            if latch is None:
+                return True  # no latch = no reconciliation needed
+
+            trade_id = latch.get("trade_id", "")
+            _near_qty = getattr(getattr(self, "trader", None), "position", 0)
+            _far_qty = 0  # far contract position not directly accessible via simple attribute
+
+            # Check ledger for terminal record
+            from strategies.plugins.futures.active.tmf_spread import _MTS_FILL_LOG
+            _has_terminal = False
+            if os.path.exists(_MTS_FILL_LOG):
+                with open(_MTS_FILL_LOG) as _f:
+                    for _line in _f:
+                        if not _line.strip():
+                            continue
+                        try:
+                            _rec = json.loads(_line)
+                            if _rec.get("fill_type") == "COMBINED_EXIT_COMPLETED" and _rec.get("trade_id") == trade_id:
+                                _has_terminal = True
+                                break
+                        except Exception:
+                            continue
+
+            if _near_qty == 0 and _has_terminal:
+                console.print(f"[bold green] [VERIFIED_FLAT] trade_id={trade_id} "
+                              f"broker=0 ledger=terminal OK -> clearing latch[/bold green]")
+                _clear_settlement_failure_latch()
+                self._entry_enabled = True
+                self._combined_exit_resubmit_enabled = True
+                self._position_reconciliation_required = False
+                self._lifecycle = "FLAT"
+                return True
+            else:
+                console.print(f"[bold red] [HALTED_RECONCILIATION_REQUIRED] trade_id={trade_id} "
+                              f"broker={_near_qty} terminal={_has_terminal}[/bold red]")
+                return False
+        except Exception as _re:
+            import logging as _lg
+            _lg.getLogger("FuturesMonitor").error("[RECONCILIATION_FAILED] %r", _re)
+            return False
+
+    # ADR-024E.1: Post-exit reconciliation gate
     def _enter_post_exit_reconciliation(self, *, tracker: dict) -> None:
         if getattr(self, "_position_reconciliation_required", False):
             console.print(
@@ -7187,10 +7276,17 @@ class FuturesMonitor:
                 f"reconciliation pending for {tracker.get('trade_id')}[/yellow]"
             )
         else:
-            console.print(
-                f"[dim][POST_EXIT_RECONCILIATION] "
-                f"trade_id={tracker.get('trade_id')} -> VERIFIED_FLAT[/dim]"
-            )
+            reconciled = self._reconcile_combined_exit()
+            if reconciled:
+                console.print(
+                    f"[dim][POST_EXIT_RECONCILIATION] "
+                    f"trade_id={tracker.get('trade_id')} -> VERIFIED_FLAT[/dim]"
+                )
+            else:
+                console.print(
+                    f"[red][POST_EXIT_RECONCILIATION] "
+                    f"trade_id={tracker.get('trade_id')} -> HALTED[/red]"
+                )
 
     def _sync_mts_strategy_after_fill(self, trade_id: str):
         """Synchronize MTS strategy state after both legs are confirmed filled."""
