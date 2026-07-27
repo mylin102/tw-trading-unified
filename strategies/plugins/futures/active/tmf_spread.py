@@ -2998,6 +2998,7 @@ class TMFSpread(StrategyBase):
                     "timestamp": now.isoformat(),
                     "ts": now.isoformat(),
                 },
+                lifecycle=self._lifecycle_oca,
                 execution_mode="BACKTEST" if _is_backtest else "LIVE",
             )
             self._ensure_lifecycle_adapter_initialized("LATE_INIT")
