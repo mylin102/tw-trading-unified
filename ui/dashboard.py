@@ -5824,12 +5824,13 @@ elif page == "設定":
                     _counterpart_cfg = load_yaml(_counterpart_cfg_path)
                     if "mts" not in _counterpart_cfg: _counterpart_cfg["mts"] = {}
                     _counterpart_cfg["mts"]["enabled"] = f_mts_new
-                    if f_mts_new:
-                        if "params" not in _counterpart_cfg["mts"]: _counterpart_cfg["mts"]["params"] = {}
                         _counterpart_cfg["mts"]["params"]["min_atr"] = f_mts_min_atr
                         _counterpart_cfg["mts"]["params"]["atr_cap"] = f_mts_atr_cap
-                        _counterpart_cfg["mts"]["params"]["atr_multiplier_stop"] = f_mts_mult_stop
-                        _counterpart_cfg["mts"]["params"]["atr_multiplier_trail"] = f_mts_mult_trail
+                        # Preserve session-specific ATR multipliers if already defined in counterpart config
+                        if "atr_multiplier_stop" not in _counterpart_cfg["mts"]["params"]:
+                            _counterpart_cfg["mts"]["params"]["atr_multiplier_stop"] = f_mts_mult_stop
+                        if "atr_multiplier_trail" not in _counterpart_cfg["mts"]["params"]:
+                            _counterpart_cfg["mts"]["params"]["atr_multiplier_trail"] = f_mts_mult_trail
                         _counterpart_cfg["mts"]["params"]["release_stop_points"] = f_mts_stop_fixed
                         _counterpart_cfg["mts"]["params"]["trail_distance_points"] = f_mts_trail_fixed
                         _counterpart_cfg["mts"]["params"]["enable_combined_upl_trail"] = f_policy_j_enable
