@@ -239,7 +239,7 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
             session = data["session"]
             trading_day = get_trading_day(entry_ts, session)
 
-            if target_trading_day and trading_day != target_trading_day:
+            if target_date and trading_day != target_date:
                 continue
 
             report_data["active"].append({
@@ -267,104 +267,47 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
             session = data["session"]
             trading_day = get_trading_day(exit_ts, session)
             
-            if trading_day == target_trading_day:
-                near_entry = next((e for e in data["entries"] if e["leg"] == "NEAR"), None)
-                far_entry = next((e for e in data["entries"] if e["leg"] == "FAR"), None)
-                
-                release_fill = data["release"]
-                exit_fill = data["exit"]
-                
-                release_pnl = release_fill.get("realized_pnl", 0.0) if release_fill else 0.0
-                exit_pnl = exit_fill.get("realized_pnl", 0.0) if exit_fill else 0.0
-                net_pnl = release_pnl + exit_pnl
-                
-                # 2026-07-17 Gemini CLI: Calculate durations for release and trail phases
-                import pandas as pd
-                release_ts = release_fill.get("timestamp") if release_fill else None
-                entry_ts = data["entry_ts"]
-                exit_ts = data["exit_ts"]
-                
-                release_duration_str = "—"
-                trail_duration_str = "—"
-                
-                if entry_ts and release_ts:
-                    try:
-                        t_entry = pd.to_datetime(entry_ts)
-                        t_release = pd.to_datetime(release_ts)
-                        diff = t_release - t_entry
-                        tot_sec = int(diff.total_seconds())
-                        if tot_sec < 0: tot_sec = 0
-                        h = tot_sec // 3600
-                        m = (tot_sec % 3600) // 60
-                        s = tot_sec % 60
-                        if h > 0:
-                            release_duration_str = f"{h}h {m}m"
-                        else:
-                            release_duration_str = f"{m}m {s}s"
-                    except Exception:
-                        pass
-                
-                if release_ts and exit_ts:
-                    try:
-                        t_release = pd.to_datetime(release_ts)
-                        t_exit = pd.to_datetime(exit_ts)
-                        diff = t_exit - t_release
-                        tot_sec = int(diff.total_seconds())
-                        if tot_sec < 0: tot_sec = 0
-                        h = tot_sec // 3600
-                        m = (tot_sec % 3600) // 60
-                        s = tot_sec % 60
-                        if h > 0:
-                            trail_duration_str = f"{h}h {m}m"
-                        else:
-                            trail_duration_str = f"{m}m {s}s"
-                    except Exception:
-                        pass
-                
-                # 2026-07-17 Gemini CLI: Calculate Release Efficiency (Post-Release capture ratio)
-                # Gating Invariant: ε = 100 TWD
-                mfe_pts = data.get("mfe")
-                release_efficiency_str = "—"
-                if mfe_pts is not None:
-                    peak_pnl = float(mfe_pts) * 10.0
-                    if peak_pnl > 100.0:
-                        release_efficiency_str = f"{(net_pnl / peak_pnl):.1%}"
-                
-                report_data["completed"].append({
-                    "trade_id": trade_id,
-                    "entry_time": data["entry_ts"],
-                    "exit_time": data["exit_ts"],
-                    "session": session,
-                    "entry_session": entry_session,
-                    "release_session": release_session,
-                    "exit_session": exit_session,
-                    "cross_session_trade": cross_session_trade,
-                    "action": f"SELL Near / BUY Far" if near_entry and near_entry.get("side") == "SHORT" else "BUY Near / SELL Far",
-                    "near_entry": near_entry["price"] if near_entry else 0.0,
-                    "far_entry": far_entry["price"] if far_entry else 0.0,
-                    "release_leg": release_fill.get("leg") if release_fill else "UNKNOWN",
-                    "release_price": release_fill.get("price") if release_fill else 0.0,
-                    "release_pnl": release_pnl,
-                    "release_reason": rel_r,
-                    "release_reason_source": rel_src,
-                    "exit_price": exit_fill.get("price") if exit_fill else 0.0,
-                    "exit_pnl": exit_pnl,
-                    "exit_reason": exit_r,
-                    "exit_reason_source": exit_src,
-                    "net_pnl": net_pnl,
-                    "risk_mode": data["risk_mode"],
-                    "mtf_score": data.get("mtf_score"),
-                    # 2026-07-16 Gemini CLI: MTF and VWAP indicators at key points
-                    "entry_mtf": data.get("entry_mtf_score"),
-                    "entry_vwap": data.get("entry_vwap"),
-                    "release_mtf": data.get("release_mtf_score"),
-                    "release_vwap": data.get("release_vwap"),
-                    "exit_mtf": data.get("exit_mtf_score"),
-                    "exit_vwap": data.get("exit_vwap"),
-                    "release_duration": release_duration_str,
-                    "trail_duration": trail_duration_str,
-                    "release_efficiency": release_efficiency_str
-                })
+            if target_date and trading_day != target_date:
+                continue
+            near_entry = next((e for e in data["entries"] if e["leg"] == "NEAR"), None)
+            far_entry = next((e for e in data["entries"] if e["leg"] == "FAR"), None)
+            
+            release_fill = data["release"]
+            exit_fill = data["exit"]
+            
+            release_pnl = release_fill.get("realized_pnl", 0.0) if release_fill else 0.0
+            exit_pnl = exit_fill.get("realized_pnl", 0.0) if exit_fill else 0.0
+            report_data["completed"].append({
+                "trade_id": trade_id,
+                "entry_time": data["entry_ts"],
+                "exit_time": data["exit_ts"],
+                "session": session,
+                "entry_session": entry_session,
+                "release_session": release_session,
+                "exit_session": exit_session,
+                "cross_session_trade": cross_session_trade,
+                "action": f"SELL Near / BUY Far" if near_entry and near_entry.get("side") == "SHORT" else "BUY Near / SELL Far",
+                "near_entry": near_entry["price"] if near_entry else 0.0,
+                "far_entry": far_entry["price"] if far_entry else 0.0,
+                "release_leg": release_fill.get("leg") if release_fill else "UNKNOWN",
+                "release_price": release_fill.get("price") if release_fill else 0.0,
+                "release_pnl": release_pnl,
+                "release_reason": rel_r,
+                "release_reason_source": rel_src,
+                "exit_price": exit_fill.get("price") if exit_fill else 0.0,
+                "exit_pnl": exit_pnl,
+                "exit_reason": exit_r,
+                "exit_reason_source": exit_src,
+                "net_pnl": net_pnl,
+                "risk_mode": data["risk_mode"],
+                "mtf_score": data.get("mtf_score"),
+                "entry_mtf": data.get("entry_mtf_score"),
+                "entry_vwap": data.get("entry_vwap"),
+                "release_mtf": data.get("release_mtf_score"),
+                "release_vwap": data.get("release_vwap"),
+                "exit_mtf": data.get("exit_mtf_score"),
+                "exit_vwap": data.get("exit_vwap"),
+            })
                 
     return report_data
 
