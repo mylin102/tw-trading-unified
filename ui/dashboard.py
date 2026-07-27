@@ -3569,9 +3569,24 @@ elif _selected_product == "TMF":
     if os.path.exists(_fills_path):
         _dashed_today = f"{_today[:4]}-{_today[4:6]}-{_today[6:]}"
         _perf_data = calculate_mts_daily_performance(_fills_path, _events_path, _dashed_today)
+        _display_day = _dashed_today
+        
+        # 2026-07-27 Gemini CLI: Fallback to calendar date or recent trades if current trading day has 0 completed trades (e.g. night session rollover)
+        if not _perf_data or not _perf_data.get("completed"):
+            _cal_today = datetime.now().strftime("%Y-%m-%d")
+            _fb_perf = calculate_mts_daily_performance(_fills_path, _events_path, _cal_today)
+            if _fb_perf and _fb_perf.get("completed"):
+                _perf_data = _fb_perf
+                _display_day = f"{_cal_today} (日盤暨歷史對沖)"
+            else:
+                _fb_all = calculate_mts_daily_performance(_fills_path, _events_path, None)
+                if _fb_all and _fb_all.get("completed"):
+                    _perf_data = _fb_all
+                    _display_day = "近期歷史 (Recent)"
+                    
         if _perf_data and (_perf_data["completed"] or _perf_data["active"]):
             st.markdown("---")
-            st.subheader("📈 MTS 本日績效檢討 (Daily Performance)")
+            st.subheader(f"📈 MTS 績效檢討 (Daily Performance: {_display_day})")
             _completed = _perf_data["completed"]
             _total_trades = len(_completed)
             _total_net = sum(t["net_pnl"] for t in _completed)
