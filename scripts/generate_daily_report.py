@@ -126,17 +126,22 @@ def parse_logs(fills_path: str, events_path: str, target_trading_day: str) -> di
                             if val is not None:
                                 trades[trade_id][f"entry_{key}"] = val
                     elif ev_type in ("RELEASE_NEAR_SUBMITTED", "RELEASE_FAR_SUBMITTED"):
-                        trades[trade_id]["risk_mode"] = event.get("risk_mode", "UNKNOWN")
+                        trades[trade_id]["risk_mode"] = event.get("risk_mode", trades[trade_id].get("risk_mode", "UNKNOWN"))
                         for key in ["mtf_score", "vwap", "near_vwap", "far_vwap"]:
                             val = event.get(key)
                             if val is not None:
                                 trades[trade_id][f"release_{key}"] = val
                                 if key == "mtf_score":
                                     trades[trade_id]["mtf_score"] = val
-                    elif ev_type in ("EXIT_REMAINING", "EXIT_LOG"):
+                    elif ev_type in ("EXIT_REMAINING", "EXIT_LOG", "ORDER_SUBMITTED"):
                         if ev_type == "EXIT_REMAINING":
-                            trades[trade_id]["exit_reason"] = event.get("reason", "UNKNOWN")
-                            trades[trade_id]["risk_mode"] = event.get("risk_mode", "UNKNOWN")
+                            trades[trade_id]["exit_reason"] = event.get("reason", trades[trade_id].get("exit_reason", "UNKNOWN"))
+                            trades[trade_id]["risk_mode"] = event.get("risk_mode", trades[trade_id].get("risk_mode", "UNKNOWN"))
+                        elif ev_type == "ORDER_SUBMITTED":
+                            strat = event.get("strategy")
+                            if strat in ("MTS_EXIT", "EXIT"):
+                                if trades[trade_id].get("exit_reason") in ("UNKNOWN", "", None):
+                                    trades[trade_id]["exit_reason"] = event.get("reason") or "TRAIL"
                         if ev_type == "EXIT_LOG":
                             trades[trade_id]["mfe"] = event.get("mfe")
                         for key in ["mtf_score", "vwap", "near_vwap", "far_vwap"]:
@@ -259,7 +264,7 @@ def parse_logs(fills_path: str, events_path: str, target_trading_day: str) -> di
                     "release_pnl": release_pnl,
                     "exit_price": exit_fill.get("price") if exit_fill else 0.0,
                     "exit_pnl": exit_pnl,
-                    "exit_reason": data["exit_reason"],
+                    "exit_reason": data["exit_reason"] if data.get("exit_reason") not in ("UNKNOWN", "", None) else ("TRAIL" if exit_fill else "UNKNOWN"),
                     "net_pnl": net_pnl,
                     "risk_mode": data["risk_mode"],
                     "mtf_score": data.get("mtf_score"),
