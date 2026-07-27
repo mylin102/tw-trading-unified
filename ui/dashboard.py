@@ -3064,34 +3064,61 @@ elif _selected_product == "TMF":
                     unsafe_allow_html=True,
                 )
             with mts_col2:
-                # ── Dynamic Spread Judgment ──
+                # ── Dynamic Spread Judgment & MTS Manual Entry ──
                 _sz = last.get("spread_z", 0.0)
                 if pd.isna(_sz): _sz = 0.0
                 
-                # Logic: If z is positive, sell the wide spread. If negative, buy the narrow spread.
+                # Logic: If z >= 0, sell the wide spread (Near SELL / Far BUY). If z < 0, buy the narrow spread (Near BUY / Far SELL).
                 _side = "SELL_NEAR_BUY_FAR" if _sz >= 0 else "BUY_NEAR_SELL_FAR"
-                _action_name = "賣出" if _sz >= 0 else "買進"
-                _btn_color = "error" if _sz >= 0 else "primary" # Red for sell, blue/green for buy
+                _action_label = "賣出價差 (SELL_SPREAD)" if _sz >= 0 else "買進價差 (BUY_SPREAD)"
+                _near_action = "SELL" if _sz >= 0 else "BUY"
+                _far_action = "BUY" if _sz >= 0 else "SELL"
+                _near_sym = str(last.get("near_contract", "近月"))
+                _far_sym = str(last.get("far_contract", "遠月"))
                 
-                if st.button(f"🔬 強制{_action_name}價差 (Z={_sz:.1f})", key="force_spread_trade", type="primary", width='stretch'):
-                    print("FORCE_SPREAD_BUTTON_CLICKED", flush=True)
-                    _flag_path = "/tmp/futures_manual_trade.flag"
-                    _flag = json.dumps({
-                        "action": "spread",
-                        "side": _side,
-                        "ts": datetime.datetime.now().isoformat(),
-                        "spread_z": _sz,
-                        # 2026-06-05 JVS Claw: Step 5 — TTL + price advisory
-                        "created_at": time.time(),
-                        "near_close": float(last.get("close", 0)),
-                        "far_close": float(last.get("far_close", 0))
-                    })
-                    with open(_flag_path, "w") as _f:
-                        _f.write(_flag)
-                    st.success(f"手動{_action_name}指令已送出 (Z={_sz:.1f})，等待消費...")
-                    # No st.rerun() here — autorefresh (60s) picks up the flag change.
-                    # st.rerun() + autorefresh simultaneously causes asyncio sock_send
-                    # buffer full → CPU 100% → grey screen.
+                # Display explicit dual-leg direction info
+                st.caption(f"Z={_sz:+.2f} | 方向: {_action_label} | 近月: {_near_sym} {_near_action} 1 | 遠月: {_far_sym} {_far_action} 1")
+                
+                # Use popover for safe 2-step confirmation
+                if hasattr(st, "popover"):
+                    with st.popover(f"🔬 MTS 手動建倉 (Z={_sz:+.1f})", type="primary", use_container_width=True):
+                        st.markdown(f"### 📋 MTS 手動建倉確認\n"
+                                    f"- **方向**: `{_side}` ({_action_label})\n"
+                                    f"- **近月**: `{_near_sym} {_near_action} 1`\n"
+                                    f"- **遠月**: `{_far_sym} {_far_action} 1`\n"
+                                    f"- **Spread 定義**: `Near - Far`\n"
+                                    f"- **Z-score**: `{_sz:+.2f}`")
+                        if st.button("確認執行 MTS 手動建倉", key="confirm_force_spread_trade", type="primary", use_container_width=True):
+                            print("FORCE_SPREAD_BUTTON_CLICKED", flush=True)
+                            _flag_path = "/tmp/futures_manual_trade.flag"
+                            _flag = json.dumps({
+                                "action": "spread",
+                                "side": _side,
+                                "ts": datetime.datetime.now().isoformat(),
+                                "spread_z": _sz,
+                                "created_at": time.time(),
+                                "near_close": float(last.get("close", 0)),
+                                "far_close": float(last.get("far_close", 0))
+                            })
+                            with open(_flag_path, "w") as _f:
+                                _f.write(_flag)
+                            st.success(f"✅ 手動建倉指令已送出 ({_side}, Z={_sz:+.2f})，等待消費...")
+                else:
+                    if st.button(f"🔬 MTS 手動建倉 (Z={_sz:+.1f})", key="force_spread_trade", type="primary", width='stretch'):
+                        print("FORCE_SPREAD_BUTTON_CLICKED", flush=True)
+                        _flag_path = "/tmp/futures_manual_trade.flag"
+                        _flag = json.dumps({
+                            "action": "spread",
+                            "side": _side,
+                            "ts": datetime.datetime.now().isoformat(),
+                            "spread_z": _sz,
+                            "created_at": time.time(),
+                            "near_close": float(last.get("close", 0)),
+                            "far_close": float(last.get("far_close", 0))
+                        })
+                        with open(_flag_path, "w") as _f:
+                            _f.write(_flag)
+                        st.success(f"✅ 手動建倉指令已送出 ({_side}, Z={_sz:+.2f})，等待消費...")
             
             with mts_col3:
                 if st.button("🆘 MTS緊急全平倉", key="force_close_all", type="secondary", width='stretch'):
@@ -3507,11 +3534,11 @@ elif _selected_product == "TMF":
             _mts_on = False
         if _mts_on:
             _nc, _ec = st.columns([1, 1])
-            if _nc.button("🔬 強制買進價差", key="force_spread_trade_fallback", type="primary", width='stretch'):
+            if _nc.button("🔬 MTS 手動建倉", key="force_spread_trade_fallback", type="primary", width='stretch'):
                 _flag = json.dumps({"action": "spread", "side": "BUY_NEAR_SELL_FAR", "ts": datetime.datetime.now().isoformat(), "created_at": time.time()})
                 with open("/tmp/futures_manual_trade.flag", "w") as _f:
                     _f.write(_flag)
-                st.success("手動買進價差指令已送出，等待消費...")
+                st.success("✅ 手動建倉指令已送出，等待消費...")
             if _ec.button("🆘 MTS緊急全平倉", key="force_close_all_fallback", type="secondary", width='stretch'):
                 _flag = json.dumps({"action": "close_all", "ts": datetime.datetime.now().isoformat(), "reason": "DASHBOARD_EMERGENCY", "created_at": time.time()})
                 with open("/tmp/futures_manual_trade.flag", "w") as _f:
