@@ -31,56 +31,113 @@ def format_triplet(val1, val2, val3, decimals=0) -> str:
                 parts.append(str(val))
     return "/".join(parts)
 
-def parse_logs(fills_path: str, events_path: str, target_trading_day: str) -> dict:
-    if not os.path.exists(fills_path):
-        print(f"Error: Fills log file not found at {fills_path}", file=sys.stderr)
-        return {}
+def resolve_exit_reason(data: dict, events: list) -> tuple[str, str]:
+    """Resolve final exit reason using 5-level evidence hierarchy.
+    Returns (exit_reason, reason_source).
+    """
+    events_list = list(events) if events is not None else []
 
+    # Level 1: Explicit event reason
+    for ev in events_list:
+        if ev.get("event") in ("EXIT_REMAINING", "EXIT_LOG", "EMERGENCY_FLATTEN", "MANUAL_CLOSE"):
+            r = ev.get("reason") or ev.get("exit_reason")
+            if r and r not in ("UNKNOWN", ""):
+                return str(r), "EXPLICIT_EVENT"
+    
+    # Level 2: Order metadata
+    for ev in events_list:
+        if ev.get("event") == "ORDER_SUBMITTED" and ev.get("strategy") in ("MTS_EXIT", "EXIT"):
+            r = ev.get("exit_reason") or ev.get("reason")
+            if r and r not in ("UNKNOWN", ""):
+                return str(r), "ORDER_METADATA"
+
+    # Level 3: Lifecycle state / shadow summary
+    for ev in events_list:
+        r = ev.get("actual_exit_reason") or ev.get("lifecycle_exit_type")
+        if r and r not in ("UNKNOWN", ""):
+            return str(r), "LIFECYCLE_STATE"
+
+    # Level 4: Narrowly constrained trail inference
+    for ev in events_list:
+        if ev.get("trail_triggered") is True and ev.get("trail_warmed_up") is True:
+            return "TRAIL", "NARROW_TRAIL_INFERENCE"
+
+    # Level 5: Unresolved
+    return "UNKNOWN", "INSUFFICIENT_EVIDENCE"
+
+
+def resolve_release_reason(data: dict, events: list) -> tuple[str, str]:
+    """Resolve first leg release reason using 5-level evidence hierarchy.
+    Returns (release_reason, reason_source).
+    """
+    events_list = list(events) if events is not None else []
+
+    for ev in events_list:
+        if ev.get("event") in ("RELEASE_NEAR_SUBMITTED", "RELEASE_FAR_SUBMITTED"):
+            r = ev.get("release_reason") or ev.get("reason") or ev.get("risk_mode")
+            if r and r not in ("UNKNOWN", ""):
+                return str(r), "EXPLICIT_EVENT"
+    for ev in events_list:
+        if ev.get("event") == "ORDER_SUBMITTED" and ev.get("strategy") in ("MTS_RELEASE", "RELEASE"):
+            r = ev.get("release_reason") or ev.get("reason")
+            if r and r not in ("UNKNOWN", ""):
+                return str(r), "ORDER_METADATA"
+    if data.get("release"):
+        return "RELEASE_STOP", "DEFAULT_FALLBACK"
+    return "UNKNOWN", "INSUFFICIENT_EVIDENCE"
+
+
+def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> dict:
+    """Parse fills and events JSONL logs to aggregate trade data."""
     trades = defaultdict(lambda: {
         "entries": [],
         "release": None,
         "exit": None,
-        "exit_reason": "UNKNOWN",
         "entry_ts": None,
         "exit_ts": None,
-        "risk_mode": "UNKNOWN",
-        "session": "UNKNOWN"
+        "session": "UNKNOWN",
+        "events": [],
+        "exit_reason": "UNKNOWN",
+        "exit_reason_source": "INSUFFICIENT_EVIDENCE",
+        "release_reason": "UNKNOWN",
+        "release_reason_source": "INSUFFICIENT_EVIDENCE",
+        "risk_mode": "UNKNOWN"
     })
     
     # 1. Parse fills log (primary data source for PnL and execution)
-    with open(fills_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                fill = json.loads(line)
-                trade_id = fill.get("trade_id")
-                if not trade_id:
+    if os.path.exists(fills_path):
+        with open(fills_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
                     continue
-                
-                fill_type = fill.get("fill_type")
-                ts_str = fill.get("timestamp", "")
-                session = fill.get("session", "UNKNOWN")
-                
-                if fill_type == "ENTRY":
-                    trades[trade_id]["entries"].append(fill)
-                    if not trades[trade_id]["entry_ts"]:
-                        trades[trade_id]["entry_ts"] = ts_str
-                    trades[trade_id]["session"] = session
-                elif fill_type == "RELEASE":
-                    trades[trade_id]["release"] = fill
-                elif fill_type == "EXIT":
-                    trades[trade_id]["exit"] = fill
-                    trades[trade_id]["exit_ts"] = ts_str
-            except Exception as e:
-                print(f"Warning: Failed to parse fill line: {e}", file=sys.stderr)
-                continue
+                try:
+                    fill = json.loads(line)
+                    trade_id = fill.get("trade_id")
+                    if not trade_id:
+                        continue
+                    
+                    fill_type = fill.get("fill_type")
+                    ts_str = fill.get("timestamp", "")
+                    session = fill.get("session", "UNKNOWN")
+                    
+                    if fill_type == "ENTRY":
+                        trades[trade_id]["entries"].append(fill)
+                        if not trades[trade_id]["entry_ts"]:
+                            trades[trade_id]["entry_ts"] = ts_str
+                        trades[trade_id]["session"] = session
+                    elif fill_type == "RELEASE":
+                        trades[trade_id]["release"] = fill
+                    elif fill_type == "EXIT":
+                        trades[trade_id]["exit"] = fill
+                        trades[trade_id]["exit_ts"] = ts_str
+                except Exception as e:
+                    print(f"Warning: Failed to parse fill line: {e}", file=sys.stderr)
+                    continue
 
     # 2. Parse events log to map timestamps/orders to trade_ids, and extract details
     order_to_trade = {}
     time_to_trade = {}
-    trade_mtf_scores = {}  # trade_id -> mtf_score (from RELEASE_SUBMITTED or EXIT_LOG event)
     
     if os.path.exists(events_path):
         # First pass: Build mappings
@@ -119,6 +176,8 @@ def parse_logs(fills_path: str, events_path: str, target_trading_day: str) -> di
                     
                     if not trade_id:
                         continue
+                    
+                    trades[trade_id]["events"].append(event)
                         
                     if ev_type == "ENTRY_SUBMITTED":
                         for key in ["mtf_score", "vwap", "near_vwap", "far_vwap"]:
@@ -134,14 +193,6 @@ def parse_logs(fills_path: str, events_path: str, target_trading_day: str) -> di
                                 if key == "mtf_score":
                                     trades[trade_id]["mtf_score"] = val
                     elif ev_type in ("EXIT_REMAINING", "EXIT_LOG", "ORDER_SUBMITTED"):
-                        if ev_type == "EXIT_REMAINING":
-                            trades[trade_id]["exit_reason"] = event.get("reason", trades[trade_id].get("exit_reason", "UNKNOWN"))
-                            trades[trade_id]["risk_mode"] = event.get("risk_mode", trades[trade_id].get("risk_mode", "UNKNOWN"))
-                        elif ev_type == "ORDER_SUBMITTED":
-                            strat = event.get("strategy")
-                            if strat in ("MTS_EXIT", "EXIT"):
-                                if trades[trade_id].get("exit_reason") in ("UNKNOWN", "", None):
-                                    trades[trade_id]["exit_reason"] = event.get("reason") or "TRAIL"
                         if ev_type == "EXIT_LOG":
                             trades[trade_id]["mfe"] = event.get("mfe")
                         for key in ["mtf_score", "vwap", "near_vwap", "far_vwap"]:
@@ -160,6 +211,25 @@ def parse_logs(fills_path: str, events_path: str, target_trading_day: str) -> di
     }
     
     for trade_id, data in trades.items():
+        # Resolve exit and release reason with provenance
+        exit_r, exit_src = resolve_exit_reason(data, data["events"])
+        rel_r, rel_src = resolve_release_reason(data, data["events"])
+        data["exit_reason"] = exit_r
+        data["exit_reason_source"] = exit_src
+        data["release_reason"] = rel_r
+        data["release_reason_source"] = rel_src
+
+        # Resolve cross-session taxonomy
+        entry_session = data["entries"][0].get("session", "UNKNOWN") if data["entries"] else "UNKNOWN"
+        release_session = data["release"].get("session", "UNKNOWN") if data.get("release") else "UNKNOWN"
+        exit_session = data["exit"].get("session", "UNKNOWN") if data.get("exit") else "UNKNOWN"
+        cross_session_trade = len({s for s in (entry_session, release_session, exit_session) if s != "UNKNOWN"}) > 1
+
+        data["entry_session"] = entry_session
+        data["release_session"] = release_session
+        data["exit_session"] = exit_session
+        data["cross_session_trade"] = cross_session_trade
+
         # Check if the trade is active (has entries but no exit fill)
         if len(data["entries"]) > 0 and not data["exit"]:
             near_entry = next((e for e in data["entries"] if e["leg"] == "NEAR"), None)
@@ -168,21 +238,30 @@ def parse_logs(fills_path: str, events_path: str, target_trading_day: str) -> di
             entry_ts = data["entry_ts"]
             session = data["session"]
             trading_day = get_trading_day(entry_ts, session)
-            
-            if trading_day == target_trading_day:
-                report_data["active"].append({
-                    "trade_id": trade_id,
-                    "entry_time": entry_ts,
-                    "session": session,
-                    "near_entry": near_entry["price"] if near_entry else 0.0,
-                    "far_entry": far_entry["price"] if far_entry else 0.0,
-                    "spread_z": near_entry.get("spread_z") if near_entry else None,
-                    "atr": near_entry.get("atr") if near_entry else None,
-                    "action": f"SELL Near / BUY Far" if near_entry and near_entry.get("side") == "SHORT" else "BUY Near / SELL Far",
-                    # 2026-07-16 Gemini CLI: MTF and VWAP indicators at entry
-                    "entry_mtf": data.get("entry_mtf_score"),
-                    "entry_vwap": data.get("entry_vwap"),
-                })
+
+            if target_trading_day and trading_day != target_trading_day:
+                continue
+
+            report_data["active"].append({
+                "trade_id": trade_id,
+                "entry_time": entry_ts,
+                "session": session,
+                "entry_session": entry_session,
+                "release_session": release_session,
+                "cross_session_trade": cross_session_trade,
+                "action": "SELL Near / BUY Far" if near_entry and near_entry.get("side") == "SHORT" else "BUY Near / SELL Far",
+                "near_entry": near_entry["price"] if near_entry else 0.0,
+                "far_entry": far_entry["price"] if far_entry else 0.0,
+                "release_leg": data["release"].get("leg") if data["release"] else "NONE",
+                "release_price": data["release"].get("price") if data["release"] else 0.0,
+                "release_pnl": data["release"].get("realized_pnl") if data["release"] else 0.0,
+                "release_reason": rel_r,
+                "release_reason_source": rel_src,
+                "risk_mode": data["risk_mode"],
+                "mtf_score": data.get("mtf_score"),
+                "entry_mtf": data.get("entry_mtf_score"),
+                "entry_vwap": data.get("entry_vwap"),
+            })
         elif len(data["entries"]) > 0 and data["exit"]:
             exit_ts = data["exit_ts"]
             session = data["session"]
@@ -256,15 +335,22 @@ def parse_logs(fills_path: str, events_path: str, target_trading_day: str) -> di
                     "entry_time": data["entry_ts"],
                     "exit_time": data["exit_ts"],
                     "session": session,
+                    "entry_session": entry_session,
+                    "release_session": release_session,
+                    "exit_session": exit_session,
+                    "cross_session_trade": cross_session_trade,
                     "action": f"SELL Near / BUY Far" if near_entry and near_entry.get("side") == "SHORT" else "BUY Near / SELL Far",
                     "near_entry": near_entry["price"] if near_entry else 0.0,
                     "far_entry": far_entry["price"] if far_entry else 0.0,
                     "release_leg": release_fill.get("leg") if release_fill else "UNKNOWN",
                     "release_price": release_fill.get("price") if release_fill else 0.0,
                     "release_pnl": release_pnl,
+                    "release_reason": rel_r,
+                    "release_reason_source": rel_src,
                     "exit_price": exit_fill.get("price") if exit_fill else 0.0,
                     "exit_pnl": exit_pnl,
-                    "exit_reason": data["exit_reason"] if data.get("exit_reason") not in ("UNKNOWN", "", None) else ("TRAIL" if exit_fill else "UNKNOWN"),
+                    "exit_reason": exit_r,
+                    "exit_reason_source": exit_src,
                     "net_pnl": net_pnl,
                     "risk_mode": data["risk_mode"],
                     "mtf_score": data.get("mtf_score"),

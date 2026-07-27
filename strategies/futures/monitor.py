@@ -3790,7 +3790,14 @@ class FuturesMonitor:
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_NEAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) instead of MARKET — 避免滑價
                 _order = self.order_mgr.create_order(symbol=_near_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
-                self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _snap["near"]})
+                self._append_mts_event("ORDER_SUBMITTED", **{
+                    **_ev_meta(_order),
+                    "ref_ohlc": _snap["near"],
+                    "leg_role": "RELEASED",
+                    "exit_stage": "FIRST_LEG_RELEASE",
+                    "release_reason": _reason or "RELEASE_STOP",
+                    "reason_source": "LIFECYCLE_DECISION",
+                })
                 
                 # [GSD] Track in lifecycle orders so fill is not ignored
                 self._pending_lifecycle_orders[_order.order_id] = {
@@ -3813,7 +3820,14 @@ class FuturesMonitor:
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_FAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
                 _order = self.order_mgr.create_order(symbol=_far_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
-                self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _snap["far"]})
+                self._append_mts_event("ORDER_SUBMITTED", **{
+                    **_ev_meta(_order),
+                    "ref_ohlc": _snap["far"],
+                    "leg_role": "RELEASED",
+                    "exit_stage": "FIRST_LEG_RELEASE",
+                    "release_reason": _reason or "RELEASE_STOP",
+                    "reason_source": "LIFECYCLE_DECISION",
+                })
                 
                 # [GSD] Track in lifecycle orders so fill is not ignored
                 self._pending_lifecycle_orders[_order.order_id] = {
