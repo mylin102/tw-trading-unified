@@ -975,6 +975,8 @@ def _write_mts_state(
             "distance_to_stop": round(max(0, _dist_stop), 1),
             "release_stop_points": release_stop_points or existing.get("release_stop_points"),
             "trail_distance_points": trail_distance_points or existing.get("trail_distance_points"),
+            # 2026-07-27 Gemini CLI: P0 Peak Persistence — Persist Policy J peak UPL across restarts
+            "peak_net_exit_pnl_twd": round(float(kwargs.get("peak_net_exit_pnl_twd", getattr(kwargs.get("strategy"), "_peak_net_exit_pnl_twd", 0.0)) or existing.get("peak_net_exit_pnl_twd", 0.0)), 1),
             "trade_id": _f_trade_id,
             "entry_ts": _f_entry_ts,
             # 2026-07-24 Hermes Agent: settlement tracking
@@ -2017,9 +2019,14 @@ class TMFSpread(StrategyBase):
                     self._lifecycle = f"TRAILING_{self._side}"
                     self._release_price = float(_rf_price) if _rf_price is not None else 0.0
 
+            # Restore Policy J peak UPL across restarts
+            _st = self._read_mts_state()
+            if _st and _st.get("trade_id") == _latest_open_tid:
+                self._peak_net_exit_pnl_twd = float(_st.get("peak_net_exit_pnl_twd") or 0.0)
+
             logger.warning(
-                "[MTS_FILLS_RECOVERY] Restored trade_id=%s near=%.1f far=%.1f released=%s lifecycle=%s",
-                _latest_open_tid, _near_entry, _far_entry, self._released_leg, self._lifecycle,
+                "[MTS_FILLS_RECOVERY] Restored trade_id=%s near=%.1f far=%.1f released=%s lifecycle=%s peak_pnl=%.1f",
+                _latest_open_tid, _near_entry, _far_entry, self._released_leg, self._lifecycle, getattr(self, "_peak_net_exit_pnl_twd", 0.0),
             )
             return True
         except Exception:
