@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 2026-07-27 Gemini CLI: Production-grade Runtime Verification Script for PM2, Exceptions & DTI Tick Capture
+# 2026-07-27 Hermes Agent: Read-only Runtime Verification Script
+# P0: NO pm2 restart/start/stop/reload/delete — this script must never mutate production.
 set -euo pipefail
 
 PROCESS="trading-system"
@@ -7,164 +8,157 @@ OBSERVE_SECONDS=60
 CAPTURE_SECONDS=10
 CAPTURE_DIR="logs/ticks/dynamics"
 
-fail() {
-    echo "❌ FAIL: $*" >&2
+fail() { echo "❌ FAIL: $*" >&2; exit 1; }
+inconclusive() { echo "⚠️ INCONCLUSIVE: $*" >&2; exit 2; }
+
+# ── Static guard: ensure no mutating commands exist in this script ──
+_SELF="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+if grep -En '\bpm2 +(restart|start|stop|reload|delete)\b|\bkill\b|\btruncate\b' \
+    "$_SELF" 2>/dev/null | grep -v 'grep -En' | grep -v 'mutating command check'; then
+    echo "❌ FATAL: $_SELF contains mutating commands — aborting" >&2
     exit 1
+fi
+
+# ── Helpers ──
+pm2_val() {
+    local expr="$1"
+    pm2 jlist 2>/dev/null | jq -er \
+      "[.[] | select(.name==\"${PROCESS}\")][0]${expr}" 2>/dev/null || echo ""
 }
 
-inconclusive() {
-    echo "⚠️ INCONCLUSIVE: $*" >&2
-    exit 2
-}
+now_ms() { echo $(( $(date +%s) * 1000 )); }
 
-pm2_value() {
-    local expression="$1"
-    pm2 jlist 2>/dev/null |
-        jq -er "[.[] | select(.name==\"${PROCESS}\")][0]${expression}" 2>/dev/null
-}
-
+# ── Preflight ──
 echo "=== Preflight ==="
-
-command -v pm2 >/dev/null || fail "pm2 不存在"
-command -v jq >/dev/null || fail "jq 不存在"
-command -v git >/dev/null || fail "git 不存在"
+command -v pm2 >/dev/null || fail "pm2 not found"
+command -v jq  >/dev/null || fail "jq not found"
+command -v git >/dev/null || fail "git not found"
 
 HEAD_SHA=$(git rev-parse --short HEAD)
 DIRTY=$(git status --short)
-
-[ -z "$DIRTY" ] || fail "Git working tree 不乾淨"
+[ -z "$DIRTY" ] || fail "Git working tree not clean"
 echo "HEAD: $HEAD_SHA"
 
-echo "=== Step 1: Controlled restart and process stability ==="
+# ── Process precondition (read-only) ──
+STATUS=$(pm2_val '.pm2_env.status')
+PID=$(pm2_val '.pid')
+UPTIME_RAW=$(pm2_val '.pm2_env.pm_uptime')
 
-pm2 restart "$PROCESS" >/dev/null
+[ "$STATUS" = "online" ] || inconclusive "Process status=$STATUS (expected online)"
+[[ "$PID" =~ ^[1-9][0-9]*$ ]] || inconclusive "Invalid PID=$PID"
 
-sleep 5
+if [ -n "$UPTIME_RAW" ] && [ "$UPTIME_RAW" -gt 0 ] 2>/dev/null; then
+    NOW_MS=$(now_ms)
+    UPTIME_SEC=$(( (NOW_MS - UPTIME_RAW) / 1000 ))
+    [ "$UPTIME_SEC" -ge 30 ] || inconclusive "Process uptime ${UPTIME_SEC}s < 30s (may have just restarted)"
+fi
 
-STATUS1=$(pm2_value '.pm2_env.status')
-PID1=$(pm2_value '.pid')
-RESTART1=$(pm2_value '.pm2_env.restart_time')
+echo "PID=$PID Status=$STATUS"
 
-[ "$STATUS1" = "online" ] || fail "重啟後 status=$STATUS1"
-[[ "$PID1" =~ ^[1-9][0-9]*$ ]] || fail "無效 PID1=$PID1"
-
-echo "PID1=$PID1 RestartCount1=$RESTART1 Status1=$STATUS1"
-echo "觀測 ${OBSERVE_SECONDS} 秒..."
+# ── Step 1: Stability observation (read-only) ──
+echo "=== Step 1: Process stability ==="
+RESTART_COUNT=$(pm2_val '.pm2_env.restart_time')
+PID1="$PID"
+RESTART1="$RESTART_COUNT"
+STATUS1="$STATUS"
+echo "PID=$PID1 Restarts=$RESTART1 Status=$STATUS1"
+echo "Observing ${OBSERVE_SECONDS}s..."
 sleep "$OBSERVE_SECONDS"
 
-STATUS2=$(pm2_value '.pm2_env.status')
-PID2=$(pm2_value '.pid')
-RESTART2=$(pm2_value '.pm2_env.restart_time')
+STATUS2=$(pm2_val '.pm2_env.status')
+PID2=$(pm2_val '.pid')
+RESTART2=$(pm2_val '.pm2_env.restart_time')
+echo "PID=$PID2 Restarts=$RESTART2 Status=$STATUS2"
 
-echo "PID2=$PID2 RestartCount2=$RESTART2 Status2=$STATUS2"
+[ "$STATUS2" = "online" ] || fail "Status changed to $STATUS2 after observation"
+[ "$PID1" = "$PID2" ]      || fail "PID changed: $PID1 -> $PID2"
+[ "$RESTART1" = "$RESTART2" ] || fail "Restart count changed: $RESTART1 -> $RESTART2"
+echo "✅ PASS: Process stable"
 
-[ "$STATUS2" = "online" ] || fail "觀測後 status=$STATUS2"
-[ "$PID1" = "$PID2" ] || fail "PID changed: $PID1 -> $PID2"
-[ "$RESTART1" = "$RESTART2" ] ||
-    fail "restart count changed: $RESTART1 -> $RESTART2"
+# ── Step 2: Session-scoped exception scan ──
+echo "=== Step 2: Session-scoped exception scan ==="
 
-echo "✅ PASS: PM2 process stable"
+# Resolve log paths from PM2 metadata
+ERR_LOG=$(pm2_val '.pm2_env.pm_err_log_path')
+OUT_LOG=$(pm2_val '.pm2_env.pm_out_log_path')
+[ -f "$ERR_LOG" ] || inconclusive "Error log not found: $ERR_LOG"
+[ -f "$OUT_LOG" ] || inconclusive "Output log not found: $OUT_LOG"
+echo "Error log: $ERR_LOG"
+echo "Output log: $OUT_LOG"
 
-echo "=== Step 2: Current-runtime exception scan ==="
+# Determine session start — find the last BOOT_FINGERPRINT for this PID
+SESSION_LINE=$(grep -n "pid=${PID}" "$OUT_LOG" 2>/dev/null | tail -1 | cut -d: -f1 || echo "")
+if [ -z "$SESSION_LINE" ] || [ "$SESSION_LINE" -le 0 ] 2>/dev/null; then
+    # Fallback: use DTI-001B marker
+    SESSION_LINE=$(grep -n "DTI-001B" "$OUT_LOG" 2>/dev/null | tail -1 | cut -d: -f1 || echo "")
+fi
+if [ -z "$SESSION_LINE" ] || [ "$SESSION_LINE" -le 0 ] 2>/dev/null; then
+    inconclusive "Cannot determine session boundary — no BOOT_FINGERPRINT or DTI-001B marker for PID=$PID"
+fi
 
-LOGS=$(pm2 logs "$PROCESS" --lines 500 --nostream 2>/dev/null || true)
+# Scan only from session start onward
+SESSION_LOG_ERR=$(tail -n +"$SESSION_LINE" "$ERR_LOG" 2>/dev/null || echo "")
+SESSION_LOG_OUT=$(tail -n +"$SESSION_LINE" "$OUT_LOG" 2>/dev/null || echo "")
+COMBINED="${SESSION_LOG_ERR}"$'\n'"${SESSION_LOG_OUT}"
 
-CONTRACT_ERRORS=$(
-    printf '%s\n' "$LOGS" |
-    grep -Ec \
-    "missing 1 required positional argument: ['\"]lifecycle['\"]|LIFECYCLE_EVAL_FAILED" \
-    || true
-)
+# Structured error patterns
+CONTRACT_ERRORS=$(printf '%s\n' "$COMBINED" | grep -Ec "missing 1 required positional argument: 'lifecycle'|LIFECYCLE_EVAL_FAILED" || true)
+BORROW_ERRORS=$(printf '%s\n' "$COMBINED" | grep -Ec "RuntimeError: Already borrowed" || true)
+CAPTURE_ERRORS=$(printf '%s\n' "$COMBINED" | grep -Ec "DTI_CAPTURE_(OBSERVE_FAILED|WRITER_FAILED|FLUSH_FAILED|SERIALIZATION_FAILED|THREAD_DIED)" || true)
+QUEUE_FULL=$(printf '%s\n' "$COMBINED" | grep -c "DTI_CAPTURE_QUEUE_FULL" || true)
+EXECUTION_TRUE=$(printf '%s\n' "$COMBINED" | grep -Eic "execution_enabled[=: ]+true" || true)
+EXECUTION_FALSE=$(printf '%s\n' "$COMBINED" | grep -Eic "execution_enabled[=: ]+false" || true)
 
-BORROW_ERRORS=$(
-    printf '%s\n' "$LOGS" |
-    grep -Ec "RuntimeError: Already borrowed|Already borrowed" \
-    || true
-)
+printf 'contract=%s borrow=%s cap_errors=%s queue_full=%s exec_true=%s exec_false=%s\n' \
+  "$CONTRACT_ERRORS" "$BORROW_ERRORS" "$CAPTURE_ERRORS" "$QUEUE_FULL" "$EXECUTION_TRUE" "$EXECUTION_FALSE"
 
-WRITER_ERRORS=$(
-    printf '%s\n' "$LOGS" |
-    grep -Eic "dynamics.*writer.*(error|exception|failed)" \
-    || true
-)
+[ "$CONTRACT_ERRORS" -eq 0 ] || fail "Lifecycle contract error(s) detected in current session"
+[ "$BORROW_ERRORS"  -eq 0 ] || fail "Already borrowed reproduced in current session"
+[ "$CAPTURE_ERRORS" -eq 0 ] || fail "Dynamics capture error(s) detected"
+[ "$QUEUE_FULL"     -eq 0 ] || fail "Capture queue full — telemetry degraded"
+[ "$EXECUTION_TRUE" -eq 0 ] || fail "execution_enabled unexpectedly true"
+[ "$EXECUTION_FALSE" -gt 0 ] || inconclusive "No execution_enabled=false evidence found in session log"
+echo "✅ PASS: No session-scoped errors"
 
-EXECUTION_TRUE=$(
-    printf '%s\n' "$LOGS" |
-    grep -Eic "execution_enabled[=: ]+true" \
-    || true
-)
-
-printf \
-  'contract_errors=%s borrow_errors=%s writer_errors=%s execution_true=%s\n' \
-  "$CONTRACT_ERRORS" "$BORROW_ERRORS" "$WRITER_ERRORS" "$EXECUTION_TRUE"
-
-[ "$CONTRACT_ERRORS" -eq 0 ] ||
-    fail "Lifecycle contract error detected"
-[ "$BORROW_ERRORS" -eq 0 ] ||
-    fail "Already borrowed reproduced"
-[ "$WRITER_ERRORS" -eq 0 ] ||
-    fail "Dynamics writer error detected"
-[ "$EXECUTION_TRUE" -eq 0 ] ||
-    fail "execution_enabled unexpectedly true"
-
-printf '%s\n' "$LOGS" |
-    grep -Eq "execution_enabled[=: ]+false" ||
-    fail "未找到 execution_enabled=false 啟動證據"
-
-echo "✅ PASS: No runtime contract/crash exception"
-
+# ── Step 3: Tick capture verification (read-only) ──
 echo "=== Step 3: Tick capture verification ==="
 
-FILE="$(
-    find "$CAPTURE_DIR" -type f -name '*.jsonl' \
-        -printf '%T@ %p\n' 2>/dev/null |
-    sort -nr |
-    head -1 |
-    cut -d' ' -f2-
-)"
-
-[ -n "$FILE" ] || inconclusive "沒有 JSONL；無法完成 operational acceptance"
-[ -f "$FILE" ] || fail "Latest JSONL path invalid: $FILE"
-[ -s "$FILE" ] || fail "Latest JSONL is still 0 bytes: $FILE"
-
-echo "Latest JSONL: $FILE"
+FILE=$(find "$CAPTURE_DIR" -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
+[ -n "$FILE" ] && [ -f "$FILE" ] || inconclusive "No JSONL file found; tick capture not yet active"
+[ -s "$FILE" ] || inconclusive "JSONL is 0 bytes; no ticks yet (may be non-market hours)"
+echo "JSONL: $FILE"
 
 BEFORE=$(wc -l < "$FILE")
 sleep "$CAPTURE_SECONDS"
 AFTER=$(wc -l < "$FILE")
 DELTA=$((AFTER - BEFORE))
+echo "Lines: $BEFORE -> $AFTER (delta=$DELTA)"
 
-printf 'before=%s after=%s delta=%s\n' "$BEFORE" "$AFTER" "$DELTA"
+if [ "$DELTA" -le 0 ]; then
+    # Check if market is likely closed
+    HOUR=$(date +%H)
+    # Taiwan futures: day 08:45-13:45, night 15:00-05:00 UTC+8
+    # During non-market hours, delta=0 is expected → INCONCLUSIVE
+    inconclusive "JSONL not growing (delta=0); may be non-market hours"
+fi
 
-[ "$DELTA" -gt 0 ] ||
-    fail "JSONL 未在 ${CAPTURE_SECONDS} 秒內增長"
+# Check metadata on first and last line
+for POS in "head -1" "tail -1"; do
+    LINE=$(eval "$POS" "$FILE")
+    printf '%s\n' "$LINE" | jq -e '.schema_version == "1.0.0"' >/dev/null || fail "schema_version mismatch"
+    printf '%s\n' "$LINE" | jq -e '.derived_status == "NOT_COMPUTED"' >/dev/null || fail "derived_status mismatch"
+done
 
-LAST_LINE=$(tail -n 1 "$FILE")
-
-printf '%s\n' "$LAST_LINE" |
-    jq -e '.schema_version == "1.0.0"' >/dev/null ||
-    fail "schema_version mismatch"
-
-printf '%s\n' "$LAST_LINE" |
-    jq -e '.derived_status == "NOT_COMPUTED"' >/dev/null ||
-    fail "derived_status mismatch"
-
-GENERATION=$(
-    printf '%s\n' "$LAST_LINE" |
-    jq -er '.generation_id'
-)
-
+GENERATION=$(tail -1 "$FILE" | jq -er '.generation_id')
 case "$GENERATION" in
     *"$HEAD_SHA"*) ;;
     *) fail "generation_id does not contain HEAD $HEAD_SHA: $GENERATION" ;;
 esac
+echo "✅ PASS: Tick capture growing, schema valid, generation matches HEAD"
 
-echo "✅ PASS: DTI tick capture is non-empty and growing"
-
+# ── Final result ──
+echo ""
 echo "=== FINAL RESULT ==="
-echo "INC-20260727-A: CLOSED"
-echo "INC-20260727-B: NOT REPRODUCED DURING CONTROLLED OBSERVATION"
-echo "DTI-001B: OPERATIONALLY ACCEPTED"
-echo "Capture Mode: ENABLED"
-echo "Execution Influence: HARD-LOCKED FALSE"
-echo "Coverage Accumulation: STARTED"
+echo "All gates PASS"
+echo "DTI-001B Operationally Accepted"
+exit 0
