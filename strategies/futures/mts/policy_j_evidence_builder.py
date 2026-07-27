@@ -118,6 +118,7 @@ class PolicyJEvidenceBuilder:
 
             if first_trigger_snap:
                 triggered_count += 1
+                exclusion_counts[ExclusionReason.NONE.value] += 1
                 trigger_time = first_trigger_snap.get("event_time")
                 hyp_net_pnl = first_trigger_snap.get("estimated_net_exit_pnl_twd")
 
@@ -156,6 +157,7 @@ class PolicyJEvidenceBuilder:
                 )
             else:
                 untriggered_count += 1
+                exclusion_counts[ExclusionReason.NONE.value] += 1
                 tf = CounterfactualTradeFact(
                     trade_id=tid,
                     session_date=outcome.get("session_date", "UNKNOWN"),
@@ -198,7 +200,7 @@ class PolicyJEvidenceBuilder:
             triggered_trade_count=triggered_count,
             untriggered_trade_count=untriggered_count,
             excluded_trade_count=excluded_count,
-            exclusion_distribution=exclusion_counts,
+            exclusion_reason_distribution=exclusion_counts,
             reproduction_hash=repro_hash,
         )
 

@@ -20,7 +20,7 @@ class PolicyJEvidenceManifest:
     triggered_trade_count: int = 0
     untriggered_trade_count: int = 0
     excluded_trade_count: int = 0
-    exclusion_distribution: Dict[str, int] = None
+    exclusion_reason_distribution: Dict[str, int] = None
     reproduction_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
