@@ -3851,21 +3851,51 @@ class FuturesMonitor:
 
         elif _action == "COMBINED_EXIT" or _reason in ("TMF_COMBINED_EXIT", "COMBINED_EXIT"):
             # 2026-07-27 Gemini CLI: Policy J Combined Exit — Exits BOTH legs simultaneously from SPREAD phase
+            # Item 5: Execution Idempotency Claim
+            _claim_key = f"{_trade_id}:POLICY_J:COMBINED_EXIT"
+            if not hasattr(self, "_claimed_execution_keys"):
+                self._claimed_execution_keys = set()
+
+            if _claim_key in self._claimed_execution_keys:
+                console.print(f"[yellow]⚠️ [COMBINED_EXIT_DUPLICATE_SUPPRESSED] trade_id={_trade_id} key={_claim_key}[/yellow]")
+                return
+
+            # Item 3: Fail-Closed Side Mapping
+            CLOSE_SIDE = {
+                "LONG": OrderSide.SELL,
+                "SHORT": OrderSide.BUY,
+            }
             _near_side_raw = getattr(strategy, "_near_side", None)
             _far_side_raw = getattr(strategy, "_far_side", None)
-            
-            if not _near_side_raw or not _far_side_raw:
-                console.print(f"[bold red]⛔ [MTS_COMBINED_EXIT_BLOCKED] Missing leg sides: near={_near_side_raw} far={_far_side_raw}[/bold red]")
+            _near_side_str = str(_near_side_raw).upper() if _near_side_raw else ""
+            _far_side_str = str(_far_side_raw).upper() if _far_side_raw else ""
+
+            if _near_side_str not in CLOSE_SIDE:
+                console.print(f"[bold red]⛔ [MTS_COMBINED_EXIT_BLOCKED] INVALID_NEAR_POSITION_SIDE: {_near_side_raw}[/bold red]")
                 return
-                
-            _near_order_side = OrderSide.BUY if _near_side_raw == "SHORT" else OrderSide.SELL
-            _far_order_side = OrderSide.SELL if _far_side_raw == "LONG" else OrderSide.BUY
-            
-            console.print(f"[yellow]📝 [MTS_ORDER] Submitting Policy J COMBINED_EXIT: NEAR ({_near_order_side}) & FAR ({_far_order_side})[/yellow]")
-            
-            _near_order = self.order_mgr.create_order(symbol=_near_code, side=_near_order_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_EXIT")
-            _far_order = self.order_mgr.create_order(symbol=_far_code, side=_far_order_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_EXIT")
-            
+
+            if _far_side_str not in CLOSE_SIDE:
+                console.print(f"[bold red]⛔ [MTS_COMBINED_EXIT_BLOCKED] INVALID_FAR_POSITION_SIDE: {_far_side_raw}[/bold red]")
+                return
+
+            _near_order_side = CLOSE_SIDE[_near_side_str]
+            _far_order_side = CLOSE_SIDE[_far_side_str]
+
+            # Item 4: Dynamic Quantity Derivation & Holding Verification
+            _near_qty = int(getattr(strategy, "_near_qty", getattr(strategy, "_lots", 1)) or 1)
+            _far_qty = int(getattr(strategy, "_far_qty", getattr(strategy, "_lots", 1)) or 1)
+            if _near_qty <= 0 or _far_qty <= 0:
+                console.print(f"[bold red]⛔ [MTS_COMBINED_EXIT_BLOCKED] INVALID_POSITION_QUANTITY: near={_near_qty} far={_far_qty}[/bold red]")
+                return
+
+            # Claim idempotency key atomically before order creation
+            self._claimed_execution_keys.add(_claim_key)
+
+            console.print(f"[yellow]📝 [MTS_ORDER] Submitting Policy J COMBINED_EXIT: NEAR ({_near_order_side} x{_near_qty}) & FAR ({_far_order_side} x{_far_qty})[/yellow]")
+
+            _near_order = self.order_mgr.create_order(symbol=_near_code, side=_near_order_side, order_type=OrderType.MKP, quantity=_near_qty, strategy="MTS_EXIT")
+            _far_order = self.order_mgr.create_order(symbol=_far_code, side=_far_order_side, order_type=OrderType.MKP, quantity=_far_qty, strategy="MTS_EXIT")
+
             self._append_mts_event("ORDER_SUBMITTED", **{
                 **_ev_meta(_near_order),
                 "ref_ohlc": _snap["near"],
@@ -3882,27 +3912,27 @@ class FuturesMonitor:
                 "exit_reason": "COMBINED_EXIT",
                 "reason_source": "LIFECYCLE_DECISION",
             })
-            
+
             self._pending_lifecycle_orders[_near_order.order_id] = {
                 "intent_id": _near_order.intent_id, "signal": "COMBINED_EXIT_NEAR", "reason": "COMBINED_EXIT", 
-                "ts": _ts, "lots": 1, "price": _near_close, "ref_ohlc": _snap["near"],
+                "ts": _ts, "lots": _near_qty, "price": _near_close, "ref_ohlc": _snap["near"],
                 "strategy": "MTS_EXIT",
             }
             self._pending_lifecycle_orders[_far_order.order_id] = {
                 "intent_id": _far_order.intent_id, "signal": "COMBINED_EXIT_FAR", "reason": "COMBINED_EXIT", 
-                "ts": _ts, "lots": 1, "price": _far_close, "ref_ohlc": _snap["far"],
+                "ts": _ts, "lots": _far_qty, "price": _far_close, "ref_ohlc": _snap["far"],
                 "strategy": "MTS_EXIT",
             }
-            
+
             self.order_mgr.submit(_near_order)
             self.order_mgr.submit(_far_order)
-            
+
             if self.paper_fill_sim:
                 self.paper_fill_sim.register(_near_order)
                 self.paper_fill_sim.register(_far_order)
                 self.paper_fill_sim.process_tick(self._make_synthetic_tick(_near_close, _ts, symbol=_near_code))
                 self.paper_fill_sim.process_tick(self._make_synthetic_tick(_far_close, _ts, symbol=_far_code))
-                
+
                 if self.dry_run or not self.live_trading:
                     console.print(f"[bold green]✅ [MTS_ORDER] COMBINED_EXIT FILLED: NEAR ({_near_order_side}) & FAR ({_far_order_side})[/bold green]")
             return

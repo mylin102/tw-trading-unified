@@ -44,6 +44,7 @@ All ADRs share a sequential numeric namespace. Numbers are permanent identifiers
 | ADR-021 | Execution and Fill Model | Theory | Framework | Proposed |
 | ADR-022 | Multi-Monitor State Isolation and Identity Defense | MTS | State | Active |
 | ADR-023 | Reporting Attribution Governance, Dual-Config Taxonomy, and Dashboard Sync | Governance | Reporting/UI | Active |
+| ADR-024 | Policy J Combined Exit Execution, Idempotency, and Legging Defense Governance | Governance | Execution | Active |
 
 ---
 
@@ -59,6 +60,7 @@ All ADRs share a sequential numeric namespace. Numbers are permanent identifiers
 - ADR-012 — Decoupled Risk Engine Architecture
 - ADR-013 — Ghost Position Race Condition
 - ADR-022 — Multi-Monitor State Isolation and Identity Defense
+- ADR-024 — Policy J Combined Exit Execution and Legging Defense Governance
 
 ### Theory & Governance
 - ADR-015 — Statistical Arbitrage Framework
