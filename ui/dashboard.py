@@ -3513,23 +3513,26 @@ elif _selected_product == "TMF":
                         st.warning(
                             f"🚨 **Policy J 組合停利已觸發平倉中 (EXECUTING COMBINED EXIT)**  \n"
                             f"• **執行狀態**: `雙腿平倉委託已送出 (MKP 範圍市價)`  \n"
-                            f"• **最高淨利 Peak PnL**: `{_peak_exit_twd:+,.0f} TWD`  \n"
+                            f"• **當前損益**: `毛利 {_tr:+,.0f} TWD` \| `扣除成本淨利 {_net_exit_twd:+,.0f} TWD` (摩擦成本 92 TWD)  \n"
+                            f"• **最高淨利 Peak Net PnL**: `{_peak_exit_twd:+,.0f} TWD`  \n"
                             f"• **觸發時淨損益**: `{_net_exit_twd:+,.0f} TWD` (已跨越平倉線 `{_trigger_line:+,.0f} TWD`)  \n"
                             f"*(正在等待券商成交 Callback 回傳對齊中...)*"
                         )
                     elif _peak_exit_twd >= _pj_act_twd:
                         st.success(
                             f"🛡️ **Policy J 組合停利已啟動 (ARMED & TRACKING)**  \n"
+                            f"• **當前損益**: `毛利 {_tr:+,.0f} TWD` \| `扣除成本淨利 {_net_exit_twd:+,.0f} TWD` (摩擦成本 92 TWD)  \n"
                             f"• **啟動門檻**: `{_pj_act_twd:,.0f} TWD` (已超越)  \n"
-                            f"• **最高淨利 Peak PnL**: `{_peak_exit_twd:+,.0f} TWD`  \n"
-                            f"• **平倉觸發線 (Peak - {_pj_giveback_twd:.0f} TWD)**: `{_trigger_line:+,.0f} TWD`  \n"
+                            f"• **最高淨利 Peak Net PnL**: `{_peak_exit_twd:+,.0f} TWD`  \n"
+                            f"• **平倉觸發線 (Peak 淨利 - {_pj_giveback_twd:.0f} TWD)**: `{_trigger_line:+,.0f} TWD`  \n"
                             f"*(當前淨損益自 Peak 回撤達 `{_pj_giveback_twd:.0f} TWD` 時將立即下單觸發 COMBINED_EXIT 雙腿組合平倉)*"
                         )
                     else:
                         _diff = _pj_act_twd - _net_exit_twd
                         st.info(
                             f"🛡️ **Policy J 組合停利監控中 (MONITORING)**  \n"
-                            f"• **啟動門檻**: `{_pj_act_twd:,.0f} TWD` (當前純淨利 `{_net_exit_twd:+,.0f} TWD`，尚差 `{_diff:,.0f} TWD` 啟動)  \n"
+                            f"• **當前損益**: `毛利 {_tr:+,.0f} TWD` \| `扣除成本淨利 {_net_exit_twd:+,.0f} TWD` (摩擦成本 92 TWD)  \n"
+                            f"• **啟動門檻**: `{_pj_act_twd:,.0f} TWD` (尚差 `{_diff:,.0f} TWD` 啟動)  \n"
                             f"• **回吐門檻**: `{_pj_giveback_twd:.0f} TWD`"
                         )
 
