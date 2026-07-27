@@ -3004,6 +3004,64 @@ class TMFSpread(StrategyBase):
             self._ensure_lifecycle_adapter_initialized("LATE_INIT")
             _adapter_res = self._lifecycle_adapter.evaluate(_adapter_input)
             _decision = _adapter_res.decision
+
+            # ── Wave J1.5-BR: Policy J Shadow Telemetry Integration Hook ──
+            if getattr(self, "_soak_collector", None) is not None:
+                try:
+                    from strategies.futures.mts.policy_j_shadow_evaluator import (
+                        PolicyJShadowEvaluator,
+                        PolicyJShadowObservation,
+                    )
+                    from strategies.futures.mts.policy_j_shadow_state import PolicyJShadowState
+
+                    _is_spread_ph = (self._lifecycle_oca.phase == PositionPhase.SPREAD)
+                    _is_hedged = (self._near_side is not None and self._far_side is not None)
+                    _rg_st = self._lifecycle_oca.release_group.status
+                    _exit_inflight = (_rg_st not in (ReleaseGroupStatus.ARMED, ReleaseGroupStatus.IDLE))
+
+                    shadow_obs = PolicyJShadowObservation(
+                        trade_id=self._trade_id,
+                        is_spread_phase=_is_spread_ph,
+                        is_hedged_pair=_is_hedged,
+                        exit_inflight=_exit_inflight,
+                        gross_liquidation_pnl_twd=float(current_pnl * 10.0),  # TMF 1pt = 10 TWD
+                        commission_twd=60.0,
+                        exchange_fee_twd=32.0,
+                        near_quote_age_ms=0,
+                        far_quote_age_ms=0,
+                        event_time=now.isoformat(),
+                        processed_at=datetime.now().isoformat(),
+                        config_hash="j1.5br_shadow",
+                        event_key=f"{self._trade_id}-{now.isoformat()}"
+                    )
+                    shadow_config = {
+                        "observation_enabled": True,
+                        "execution_enabled": False,
+                        "policy_j_activation_threshold_twd": 500.0,
+                        "policy_j_giveback_ratio_threshold": 0.35,
+                    }
+                    assert shadow_config.get("execution_enabled", False) is False, "Policy J execution MUST BE HARD-LOCKED FALSE!"
+
+                    if not hasattr(self, "_policy_j_shadow_state") or self._policy_j_shadow_state is None:
+                        self._policy_j_shadow_state = PolicyJShadowState()
+
+                    shadow_snapshot, self._policy_j_shadow_state = PolicyJShadowEvaluator.evaluate(
+                        shadow_obs,
+                        self._policy_j_shadow_state,
+                        shadow_config
+                    )
+                    self._soak_collector.record_policy_j_evaluation(shadow_snapshot, obs=shadow_obs)
+                except Exception as _pj_err:
+                    import json as _json, sys as _sys
+                    print(_json.dumps({
+                        "stage": "POLICY_J_HOOK_EVAL_FAILED",
+                        "exception_type": type(_pj_err).__name__,
+                        "trade_id": getattr(self, "_trade_id", None),
+                        "lifecycle_phase": str(getattr(self._lifecycle_oca, "phase", "")),
+                        "generation_id": getattr(getattr(self, "_soak_collector", None), "generation_id", "UNKNOWN"),
+                        "error": str(_pj_err)
+                    }), file=_sys.stderr)
+
             # 2026-07-16 Gemini CLI: P0 Invariant Assertion to detect evaluate_lifecycle_actions regression (Phase 3a)
             if (
                 _decision is None

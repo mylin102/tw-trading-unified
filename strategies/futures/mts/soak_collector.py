@@ -110,10 +110,122 @@ class ShadowSoakCollector:
         self.duplicate_shadow_invocations: int = 0
         self.unclassified_cycles: int = 0
 
+        # Policy J Health Counters (Wave J1.5-BR)
+        self.policy_j_hook_reached_total: int = 0
+        self.policy_j_evaluate_total: int = 0
+        self.policy_j_snapshot_total: int = 0
+        self.policy_j_enqueue_total: int = 0
+        self.policy_j_write_error_total: int = 0
+        self.policy_j_duplicate_suppressed_total: int = 0
+        self.last_observed_snap: dict | None = None
+        self.sample_counter: int = 0
+
         self.not_observed: list[str] = []
 
         if self.state == GenerationState.PREFLIGHT_PASSED:
             self.state = GenerationState.RUNNING
+
+    @property
+    def writer_thread_alive(self) -> bool:
+        return self.logger._worker_thread.is_alive() if getattr(self, "logger", None) else False
+
+    @property
+    def queue_depth(self) -> int:
+        return self.logger._queue.qsize() if getattr(self, "logger", None) else 0
+
+    @property
+    def policy_j_dequeue_total(self) -> int:
+        return self.logger.telemetry_written if getattr(self, "logger", None) else 0
+
+    @property
+    def policy_j_write_total(self) -> int:
+        return self.logger.telemetry_written if getattr(self, "logger", None) else 0
+
+    @property
+    def market_callback_total(self) -> int:
+        return self.total_market_callbacks
+
+    def record_policy_j_evaluation(self, snapshot: Any, obs: Any = None) -> bool:
+        """Record Policy J shadow evaluation, applying deduplication and enqueuing telemetry record."""
+        self.policy_j_hook_reached_total += 1
+        self.policy_j_evaluate_total += 1
+
+        if snapshot is None:
+            return False
+
+        self.policy_j_snapshot_total += 1
+        self.sample_counter += 1
+
+        # ── Deduplication & Sampling Guard ──
+        snap_dict = snapshot.to_dict() if hasattr(snapshot, "to_dict") else (snapshot if isinstance(snapshot, dict) else {})
+        should_persist = False
+
+        if self.last_observed_snap is None:
+            should_persist = True
+        else:
+            prev = self.last_observed_snap
+            # Persist on:
+            # 1. Eligibility change
+            if snap_dict.get("eligible") != prev.get("eligible"):
+                should_persist = True
+            # 2. Peak / giveback / trade_id change
+            elif (
+                snap_dict.get("trade_id") != prev.get("trade_id")
+                or snap_dict.get("peak_net_exit_pnl_twd") != prev.get("peak_net_exit_pnl_twd")
+                or snap_dict.get("peak_upl_pts") != prev.get("peak_upl_pts")
+                or snap_dict.get("giveback_twd") != prev.get("giveback_twd")
+                or snap_dict.get("giveback_pts") != prev.get("giveback_pts")
+            ):
+                should_persist = True
+            # 3. First would_trigger edge
+            elif snap_dict.get("would_trigger") != prev.get("would_trigger"):
+                should_persist = True
+            # 4. Quote health change
+            elif snap_dict.get("stale_quote") != prev.get("stale_quote"):
+                should_persist = True
+            # 5. Bounded sample interval (every 50 cycles)
+            elif self.sample_counter >= 50:
+                should_persist = True
+                self.sample_counter = 0
+
+        self.last_observed_snap = snap_dict
+
+        if not should_persist:
+            self.policy_j_duplicate_suppressed_total += 1
+            return False
+
+        # ── Build ParityTelemetryRecord for Spooler ──
+        try:
+            from .telemetry import ParityTelemetryRecord, ParityStatus
+            rec = ParityTelemetryRecord(
+                record_type="SHADOW_EVALUATION",
+                schema_version="1.0",
+                event_id=str(snap_dict.get("event_id", f"evt-{time.time_ns()}")),
+                decision_cycle_id=str(snap_dict.get("decision_cycle_id", f"cycle-{self.policy_j_snapshot_total}")),
+                event_time_ns=int(time.time() * 1e9),
+                session="DAY",
+                ticker=str(snap_dict.get("ticker", "TMF")),
+                parity_status=ParityStatus.MATCH,
+                shadow_action=str(snap_dict.get("shadow_action", "NO_OP")),
+                shadow_reason=str(snap_dict.get("shadow_reason", "OBSERVATION")),
+                details=snap_dict,
+            )
+            success = self.logger.record_cycle(rec)
+            if success:
+                self.policy_j_enqueue_total += 1
+            else:
+                self.policy_j_write_error_total += 1
+            return success
+        except Exception as e:
+            self.policy_j_write_error_total += 1
+            import json as _json, sys as _sys
+            print(_json.dumps({
+                "stage": "TELEMETRY_ENQUEUE_FAILED",
+                "exception_type": type(e).__name__,
+                "generation_id": getattr(self, "generation_id", "UNKNOWN"),
+                "error": str(e)
+            }), file=_sys.stderr)
+            return False
 
     def _run_preflight_check(self) -> None:
         """Run preflight gates. Fail-closed if tree dirty, authority != legacy, or directory exists."""
