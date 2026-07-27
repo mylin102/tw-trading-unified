@@ -42,6 +42,8 @@ All ADRs share a sequential numeric namespace. Numbers are permanent identifiers
 | ADR-019 | Baseline Trajectory Reproduction Certification | Theory | Framework | Proposed |
 | ADR-020 | Historical Truth Boundary and Counterfactual Forking | Theory | Framework | Proposed |
 | ADR-021 | Execution and Fill Model | Theory | Framework | Proposed |
+| ADR-022 | Multi-Monitor State Isolation and Identity Defense | MTS | State | Active |
+| ADR-023 | Reporting Attribution Governance, Dual-Config Taxonomy, and Dashboard Sync | Governance | Reporting/UI | Active |
 
 ---
 
@@ -56,6 +58,7 @@ All ADRs share a sequential numeric namespace. Numbers are permanent identifiers
 - ADR-011 — OCO Ghost Order Export
 - ADR-012 — Decoupled Risk Engine Architecture
 - ADR-013 — Ghost Position Race Condition
+- ADR-022 — Multi-Monitor State Isolation and Identity Defense
 
 ### Theory & Governance
 - ADR-015 — Statistical Arbitrage Framework
@@ -65,6 +68,7 @@ All ADRs share a sequential numeric namespace. Numbers are permanent identifiers
 - ADR-019 — Baseline Trajectory Reproduction Certification
 - ADR-020 — Historical Truth Boundary and Counterfactual Forking
 - ADR-021 — Execution and Fill Model
+- ADR-023 — Reporting Attribution Governance, Dual-Config Taxonomy, and Dashboard Sync
 
 ### Options
 - ADR-001 — Disable ThetaGang
