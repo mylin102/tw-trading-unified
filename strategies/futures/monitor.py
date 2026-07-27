@@ -2686,7 +2686,11 @@ class FuturesMonitor:
              _pending_strat = pending.get("strategy", "")
              if _pending_strat and "MTS" in str(_pending_strat):
                  # [Fix 2026-05-27] Handle strategy state reset for MTS exits upon fill
-                 if signal == "EXIT" or _pending_strat == "MTS_EXIT":
+                 # 2026-07-27 Hermes Agent: COMBINED_EXIT must be checked BEFORE
+                 # the MTS_EXIT catch-all (COMBINED_EXIT orders use strategy=MTS_EXIT).
+                 if signal in ("COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"):
+                     self._apply_combined_exit_fill(event, pending, signal, price)
+                 elif signal == "EXIT" or _pending_strat == "MTS_EXIT":
                      _mts_strat = self._registry.get("tmf_spread")
                      if _mts_strat:
                          _mts_strat._reset(reason="trail_exit_confirmed", exit_price=price)
@@ -2696,8 +2700,6 @@ class FuturesMonitor:
                      _reason = pending.get("reason", "") if pending else ""
                      if "SESSION_CLOSE_FORCE" in str(_reason) or "SETTLEMENT_FORCE_FLAT" in str(_reason):
                          self._mts_force_exit_inflight = False
-                 elif signal in ("COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"):
-                     self._apply_combined_exit_fill(event, pending, signal, price)
                  elif signal in ("RELEASE_NEAR", "RELEASE_FAR") or _pending_strat == "MTS_RELEASE":
                      _mts_strat = self._registry.get("tmf_spread")
                      if _mts_strat:
