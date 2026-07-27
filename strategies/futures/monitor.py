@@ -6981,10 +6981,14 @@ class FuturesMonitor:
         if execution_id not in self._combined_exit_trackers:
             self._combined_exit_trackers[execution_id] = {
                 "status": "CLAIMED",
+                "trade_id": execution_id,
+                "execution_id": execution_id,
                 "near_filled_qty": 0,
                 "far_filled_qty": 0,
                 "near_expected_qty": 0,
                 "far_expected_qty": 0,
+                "near_price": None,
+                "far_price": None,
                 "near_complete": False,
                 "far_complete": False,
                 "settlement_completed": False,
@@ -7056,7 +7060,14 @@ class FuturesMonitor:
             return
 
         tracker["status"] = "BOTH_FILLED"
-        tracker["settlement_completed"] = True
+
+        # ADR-024E: Validate tracker schema before durable commit
+        try:
+            self._validate_combined_exit_tracker(tracker)
+        except Exception as _ve:
+            console.print(f"[red] [COMBINED_EXIT_TRACKER_SCHEMA_INVALID] trade_id={trade_id} error={_ve}[/red]")
+            self._enter_settlement_persistence_failed(tracker=tracker, error=_ve)
+            return
 
         # Append COMBINED_EXIT fill records to persistent _MTS_FILL_LOG so recovery reads state correctly
         try:
@@ -7092,7 +7103,12 @@ class FuturesMonitor:
                 trade_id=trade_id,
             )
         except Exception as _e:
-            console.print(f"[red]⚠️ [COMBINED_EXIT_FILL_LOG_ERROR] Failed to write exit fills: {_e}[/red]")
+            console.print(f"[red] [SETTLEMENT_PERSISTENCE_FAILED] trade_id={trade_id} error={_e}[/red]")
+            self._enter_settlement_persistence_failed(tracker=tracker, error=_e)
+            return
+
+        # ADR-024E: Durable commit succeeded -> now safe
+        tracker["settlement_completed"] = True
 
         # Finalize: reset strategy position to FLAT
         _mts_strat = pending.get("strategy") or getattr(self, "_registry", {}).get("tmf_spread")
@@ -7111,6 +7127,9 @@ class FuturesMonitor:
             )
             console.print(f"[bold green]✅ [COMBINED_EXIT_COMPLETED] Trade {trade_id} settled -> FLAT[/bold green]")
 
+        # ADR-024E: Post-exit reconciliation gate
+        self._enter_post_exit_reconciliation(tracker=tracker)
+
         # Clear related pending lifecycle orders
         for oid in list(self._pending_lifecycle_orders.keys()):
             _p = self._pending_lifecycle_orders.get(oid)
@@ -7119,6 +7138,59 @@ class FuturesMonitor:
 
         tracker["status"] = "CLOSED"
         self._save_orders_file_wrapper()
+
+    # ADR-024E: Schema validation before settlement
+    def _validate_combined_exit_tracker(self, tracker: dict) -> None:
+        required_fields = (
+            "trade_id", "execution_id",
+            "near_expected_qty", "near_filled_qty",
+            "far_expected_qty", "far_filled_qty",
+        )
+        missing = [k for k in required_fields if tracker.get(k) is None]
+        if missing:
+            raise ValueError(f"missing required tracker fields: {missing}")
+        if tracker["near_filled_qty"] < tracker["near_expected_qty"]:
+            raise ValueError(
+                f"near_filled_qty {tracker['near_filled_qty']} < "
+                f"near_expected_qty {tracker['near_expected_qty']}"
+            )
+        if tracker["far_filled_qty"] < tracker["far_expected_qty"]:
+            raise ValueError(
+                f"far_filled_qty {tracker['far_filled_qty']} < "
+                f"far_expected_qty {tracker['far_expected_qty']}"
+            )
+
+    # ADR-024E: Persistence failure fail-closed
+    def _enter_settlement_persistence_failed(self, *, tracker: dict, error: Exception) -> None:
+        import logging as _lg
+        _lg.getLogger("FuturesMonitor").critical(
+            "[SETTLEMENT_PERSISTENCE_FAILED] trade_id=%(tid)s exec_id=%(eid)s error=%(err)r",
+            {"tid": tracker.get("trade_id"), "eid": tracker.get("execution_id"), "err": error},
+        )
+        self._entry_enabled = False
+        self._combined_exit_resubmit_enabled = False
+        self._position_reconciliation_required = True
+        if hasattr(self, "_lifecycle"):
+            self._lifecycle = "SETTLEMENT_PERSISTENCE_FAILED"
+        console.print(
+            f"[bold red] [SETTLEMENT_PERSISTENCE_FAILED] "
+            f"trade_id={tracker.get('trade_id')} "
+            f"entry=DISABLED combined_exit_resubmit=DISABLED "
+            f"reconciliation=REQUIRED[/bold red]"
+        )
+
+    # ADR-024E: Post-exit reconciliation gate
+    def _enter_post_exit_reconciliation(self, *, tracker: dict) -> None:
+        if getattr(self, "_position_reconciliation_required", False):
+            console.print(
+                f"[yellow] [POST_EXIT_RECONCILIATION] "
+                f"reconciliation pending for {tracker.get('trade_id')}[/yellow]"
+            )
+        else:
+            console.print(
+                f"[dim][POST_EXIT_RECONCILIATION] "
+                f"trade_id={tracker.get('trade_id')} -> VERIFIED_FLAT[/dim]"
+            )
 
     def _sync_mts_strategy_after_fill(self, trade_id: str):
         """Synchronize MTS strategy state after both legs are confirmed filled."""
