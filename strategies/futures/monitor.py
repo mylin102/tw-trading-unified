@@ -2682,7 +2682,7 @@ class FuturesMonitor:
         cross_policy = pending.get("cross_policy")
 
         # Skip directional trader execution for multi-leg spread signals (net zero or self-managed)
-        if signal in ("SELL_NEAR_BUY_FAR", "BUY_NEAR_SELL_FAR", "RELEASE_NEAR", "RELEASE_FAR", "EXIT"):
+        if signal in ("SELL_NEAR_BUY_FAR", "BUY_NEAR_SELL_FAR", "RELEASE_NEAR", "RELEASE_FAR", "EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"):
              _pending_strat = pending.get("strategy", "")
              if _pending_strat and "MTS" in str(_pending_strat):
                  # [Fix 2026-05-27] Handle strategy state reset for MTS exits upon fill
