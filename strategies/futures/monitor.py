@@ -7043,6 +7043,32 @@ class FuturesMonitor:
         tracker["status"] = "BOTH_FILLED"
         tracker["settlement_completed"] = True
 
+        # Append COMBINED_EXIT fill records to persistent _MTS_FILL_LOG so recovery reads state correctly
+        try:
+            from strategies.plugins.futures.active.tmf_spread import _append_fill
+            _append_fill(
+                ticker=getattr(self, "ticker", "TMF"),
+                contract=self.contract.code if getattr(self, "contract", None) else "NEAR",
+                leg="NEAR",
+                side="SELL",
+                qty=tracker["near_filled_qty"],
+                price=tracker["near_price"] or price,
+                fill_type="COMBINED_EXIT",
+                trade_id=trade_id,
+            )
+            _append_fill(
+                ticker=getattr(self, "ticker", "TMF"),
+                contract=self.far_contract.code if getattr(self, "far_contract", None) else "FAR",
+                leg="FAR",
+                side="BUY",
+                qty=tracker["far_filled_qty"],
+                price=tracker["far_price"] or price,
+                fill_type="COMBINED_EXIT",
+                trade_id=trade_id,
+            )
+        except Exception as _e:
+            console.print(f"[red]⚠️ [COMBINED_EXIT_FILL_LOG_ERROR] Failed to write exit fills: {_e}[/red]")
+
         # Finalize: reset strategy position to FLAT
         _mts_strat = self._registry.get("tmf_spread")
         if _mts_strat:

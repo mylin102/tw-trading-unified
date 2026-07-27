@@ -1913,7 +1913,7 @@ class TMFSpread(StrategyBase):
                         ft = rec.get("fill_type", "")
                         if tid and ft == "ENTRY":
                             _entries.append(tid)
-                        elif tid and ft in ("EXIT", "RELEASE"):
+                        elif tid and ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"):
                             _exits.append(tid)
                     except Exception:
                         pass
@@ -1954,7 +1954,7 @@ class TMFSpread(StrategyBase):
             _latest_ts = ""
             for tid, fills in _trades.items():
                 _entry_count = sum(1 for f in fills if f.get("fill_type") == "ENTRY")
-                _exit_count = sum(1 for f in fills if f.get("fill_type") in ("EXIT", "RELEASE"))
+                _exit_count = sum(1 for f in fills if f.get("fill_type") in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"))
                 if _entry_count > _exit_count:
                     # Find timestamp of first entry fill
                     _first_entry_ts = ""
