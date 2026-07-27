@@ -3505,8 +3505,19 @@ elif _selected_product == "TMF":
                     _net_exit_twd = _tr - 92.0  # 10 TWD/pt minus 92 TWD friction
                     _peak_exit_twd = max(float(_mts_state.get("peak_net_exit_pnl_twd", 0.0)), _net_exit_twd)
                     
-                    if _peak_exit_twd >= _pj_act_twd:
-                        _trigger_line = _peak_exit_twd - _pj_giveback_twd
+                    _curr_state = str(_mts_state.get("state", "")).upper()
+                    _curr_reason = str(_mts_state.get("reason", "")).upper()
+                    _trigger_line = _peak_exit_twd - _pj_giveback_twd
+                    
+                    if _curr_state == "COMBINED_EXIT" or _curr_reason == "COMBINED_EXIT":
+                        st.warning(
+                            f"🚨 **Policy J 組合停利已觸發平倉中 (EXECUTING COMBINED EXIT)**  \n"
+                            f"• **執行狀態**: `雙腿平倉委託已送出 (MKP 範圍市價)`  \n"
+                            f"• **最高淨利 Peak PnL**: `{_peak_exit_twd:+,.0f} TWD`  \n"
+                            f"• **觸發時淨損益**: `{_net_exit_twd:+,.0f} TWD` (已跨越平倉線 `{_trigger_line:+,.0f} TWD`)  \n"
+                            f"*(正在等待券商成交 Callback 回傳對齊中...)*"
+                        )
+                    elif _peak_exit_twd >= _pj_act_twd:
                         st.success(
                             f"🛡️ **Policy J 組合停利已啟動 (ARMED & TRACKING)**  \n"
                             f"• **啟動門檻**: `{_pj_act_twd:,.0f} TWD` (已超越)  \n"
