@@ -3599,7 +3599,8 @@ elif _selected_product == "TMF":
         
         # 2026-07-27 Gemini CLI: Fallback to calendar date or recent trades if current trading day has 0 completed trades (e.g. night session rollover)
         if not _perf_data or not _perf_data.get("completed"):
-            _cal_today = datetime.now().strftime("%Y-%m-%d")
+            import datetime as _dt_mod
+            _cal_today = _dt_mod.datetime.now().strftime("%Y-%m-%d")
             _fb_perf = calculate_mts_daily_performance(_fills_path, _events_path, _cal_today)
             if _fb_perf and _fb_perf.get("completed"):
                 _perf_data = _fb_perf
