@@ -3017,7 +3017,7 @@ class TMFSpread(StrategyBase):
                     _is_spread_ph = (self._lifecycle_oca.phase == PositionPhase.SPREAD)
                     _is_hedged = (self._near_side is not None and self._far_side is not None)
                     _rg_st = self._lifecycle_oca.release_group.status
-                    _exit_inflight = (_rg_st not in (ReleaseGroupStatus.ARMED, ReleaseGroupStatus.IDLE))
+                    _exit_inflight = (_rg_st not in (ReleaseGroupStatus.ARMED, ReleaseGroupStatus.INACTIVE))
 
                     shadow_obs = PolicyJShadowObservation(
                         trade_id=self._trade_id,
