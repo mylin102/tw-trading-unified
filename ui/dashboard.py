@@ -5824,6 +5824,8 @@ elif page == "設定":
                     _counterpart_cfg = load_yaml(_counterpart_cfg_path)
                     if "mts" not in _counterpart_cfg: _counterpart_cfg["mts"] = {}
                     _counterpart_cfg["mts"]["enabled"] = f_mts_new
+                    if f_mts_new:
+                        if "params" not in _counterpart_cfg["mts"]: _counterpart_cfg["mts"]["params"] = {}
                         _counterpart_cfg["mts"]["params"]["min_atr"] = f_mts_min_atr
                         _counterpart_cfg["mts"]["params"]["atr_cap"] = f_mts_atr_cap
                         # Preserve session-specific ATR multipliers if already defined in counterpart config
