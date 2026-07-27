@@ -2658,9 +2658,18 @@ class FuturesMonitor:
 
         signal = pending.get("signal")
         # Support both standard and MTS signal types for logging/audit
-        if signal not in ("BUY", "SELL", "EXIT", "PARTIAL_EXIT", 
-                          "SELL_NEAR_BUY_FAR", "BUY_NEAR_SELL_FAR", 
-                          "RELEASE_NEAR", "RELEASE_FAR"):
+        MTS_CONFIRMED_FILL_SIGNALS = {
+    "BUY", "SELL", "EXIT", "PARTIAL_EXIT",
+    "SELL_NEAR_BUY_FAR", "BUY_NEAR_SELL_FAR",
+    "RELEASE_NEAR", "RELEASE_FAR",
+    "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR",
+}
+        if signal not in MTS_CONFIRMED_FILL_SIGNALS:
+            import logging as _lg
+            _lg.getLogger("FuturesMonitor").error(
+                "[CONFIRMED_FILL_REJECTED_UNKNOWN_SIGNAL] signal=%s order_id=%s trade_id=%s fill_qty=%s fill_price=%s",
+                signal, event.order_id, event.deal_id or "?", event.fill_qty, event.fill_price,
+            )
             return None
 
         ts = datetime.now()
@@ -2687,6 +2696,8 @@ class FuturesMonitor:
                      _reason = pending.get("reason", "") if pending else ""
                      if "SESSION_CLOSE_FORCE" in str(_reason) or "SETTLEMENT_FORCE_FLAT" in str(_reason):
                          self._mts_force_exit_inflight = False
+                 elif signal in ("COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"):
+                     self._apply_combined_exit_fill(event, pending, signal, price)
                  elif signal in ("RELEASE_NEAR", "RELEASE_FAR") or _pending_strat == "MTS_RELEASE":
                      _mts_strat = self._registry.get("tmf_spread")
                      if _mts_strat:
@@ -6958,6 +6969,100 @@ class FuturesMonitor:
                 self._sync_mts_strategy_after_fill(found_tid)
                 self._mts_pending_fills.pop(found_tid)
                 self._manual_trade_status = "FILLED"
+
+    # 2026-07-27 Hermes Agent: Combined Exit fill tracker
+    # Tracks per-leg fill state for Policy J COMBINED_EXIT.
+    # Only transitions to FLAT when BOTH legs fully filled.
+    def _get_combined_exit_tracker(self, execution_id: str) -> dict:
+        if not hasattr(self, "_combined_exit_trackers"):
+            self._combined_exit_trackers: dict[str, dict] = {}
+        if execution_id not in self._combined_exit_trackers:
+            self._combined_exit_trackers[execution_id] = {
+                "status": "CLAIMED",
+                "near_filled_qty": 0,
+                "far_filled_qty": 0,
+                "near_expected_qty": 0,
+                "far_expected_qty": 0,
+                "near_complete": False,
+                "far_complete": False,
+                "settlement_completed": False,
+            }
+        return self._combined_exit_trackers[execution_id]
+
+    def _apply_combined_exit_fill(self, event, pending: dict, signal: str, price: float) -> None:
+        """Process a COMBINED_EXIT leg fill. Tracks both legs; only resets strategy to FLAT when both fully filled."""
+        from core.order_management.order import OrderStatus
+        from strategies.plugins.futures.active.tmf_spread import PositionPhase, _write_mts_state
+
+        trade_id = event.deal_id or pending.get("reason", "COMBINED_EXIT")
+        lots = int(event.fill_qty)
+        leg = "NEAR" if "NEAR" in str(signal) else "FAR"
+        tracker = self._get_combined_exit_tracker(trade_id)
+
+        # Update expected qty from pending metadata (first fill for each leg sets this)
+        if leg == "NEAR":
+            if tracker["near_expected_qty"] == 0:
+                tracker["near_expected_qty"] = int(pending.get("lots", lots))
+            tracker["near_filled_qty"] += lots
+        else:
+            if tracker["far_expected_qty"] == 0:
+                tracker["far_expected_qty"] = int(pending.get("lots", lots))
+            tracker["far_filled_qty"] += lots
+
+        # Check leg completion
+        if leg == "NEAR" and tracker["near_filled_qty"] >= tracker["near_expected_qty"]:
+            tracker["near_complete"] = True
+        elif leg == "FAR" and tracker["far_filled_qty"] >= tracker["far_expected_qty"]:
+            tracker["far_complete"] = True
+
+        # Advance state
+        if tracker["near_complete"] and not tracker["far_complete"]:
+            tracker["status"] = "NEAR_ONLY_FILLED"
+        elif tracker["far_complete"] and not tracker["near_complete"]:
+            tracker["status"] = "FAR_ONLY_FILLED"
+
+        console.print(
+            f"[dim]📊 [COMBINED_EXIT_FILL] leg={leg} signal={signal} filled={lots} "
+            f"near={tracker['near_filled_qty']}/{tracker['near_expected_qty']} "
+            f"far={tracker['far_filled_qty']}/{tracker['far_expected_qty']} "
+            f"status={tracker['status']}[/dim]"
+        )
+
+        # Guard: only finalize when BOTH legs fully filled
+        if not tracker["near_complete"] or not tracker["far_complete"]:
+            return
+
+        if tracker["settlement_completed"]:
+            console.print(f"[yellow]⚠️ [COMBINED_EXIT_DUPLICATE_SETTLEMENT_SUPPRESSED] trade_id={trade_id}[/yellow]")
+            return
+
+        tracker["status"] = "BOTH_FILLED"
+        tracker["settlement_completed"] = True
+
+        # Finalize: reset strategy position to FLAT
+        _mts_strat = self._registry.get("tmf_spread")
+        if _mts_strat:
+            _mts_strat._reset(reason="combined_exit_confirmed", exit_price=price)
+            _mts_strat._lifecycle_oca.phase = PositionPhase.FLAT
+            _mts_strat._peak_net_exit_pnl_twd = 0.0
+            _write_mts_state(
+                has_position=False, action="COMBINED_EXIT_COMPLETED",
+                reason="combined_exit_confirmed",
+                near_entry=0, far_entry=0, near_last=price, far_last=price,
+                near_side=None, far_side=None, spread_z=0,
+                trade_id=trade_id, ticker=getattr(self, "ticker", "TMF"),
+                lifecycle={},
+            )
+            console.print(f"[bold green]✅ [COMBINED_EXIT_COMPLETED] Trade {trade_id} settled -> FLAT[/bold green]")
+
+        # Clear related pending lifecycle orders
+        for oid in list(self._pending_lifecycle_orders.keys()):
+            _p = self._pending_lifecycle_orders.get(oid)
+            if _p and _p.get("reason") == "COMBINED_EXIT":
+                self._clear_pending_lifecycle_order(oid)
+
+        tracker["status"] = "CLOSED"
+        self._save_orders_file_wrapper()
 
     def _sync_mts_strategy_after_fill(self, trade_id: str):
         """Synchronize MTS strategy state after both legs are confirmed filled."""
