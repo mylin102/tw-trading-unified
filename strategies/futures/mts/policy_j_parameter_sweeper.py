@@ -48,12 +48,19 @@ class DatasetCCell:
     eligible_for_analysis: bool
     exclusion_reason: str
     triggered: bool
-    first_trigger_time: str
-    hypothetical_net_exit_pnl_twd: float
-    actual_final_net_pnl_twd: float
-    delta_net_pnl_twd: float
-    actual_mfe_net_pnl_twd: float
-    ped_improvement_twd: float
+    activation_event_time: str = ""
+    activation_net_pnl_twd: float = 0.0
+    peak_net_pnl_twd: float = 0.0
+    trigger_event_time: str = ""
+    trigger_net_pnl_twd: float = 0.0
+    hypothetical_fill_time: str = ""
+    hypothetical_exit_price_near: float = 0.0
+    hypothetical_exit_price_far: float = 0.0
+    counterfactual_net_pnl_twd: float = 0.0
+    actual_net_pnl_twd: float = 0.0
+    delta_net_pnl_twd: float = 0.0
+    actual_mfe_net_pnl_twd: float = 0.0
+    ped_improvement_twd: float = 0.0
     fill_model: str = FillModel.EXECUTABLE.value
 
     def to_dict(self) -> dict[str, Any]:
@@ -67,12 +74,15 @@ class ConfigLandscapeSummary:
     activation_twd: float
     giveback_twd: float
     giveback_ratio: float
+    source_trades: int
     eligible_trades: int
     triggered_trades: int
     trigger_rate: float
-    mean_delta_net_pnl: float
-    median_delta_net_pnl: float
     total_delta_net_pnl: float
+    mean_delta_per_source_trade: float   # PRIMARY ENDPOINT: Total Delta / Source Trades
+    mean_delta_per_triggered_trade: float
+    median_delta_net_pnl: float
+    worst_delta_net_pnl: float
     win_rate: float
     ped_improvement_total: float
     p10_delta_net_pnl: float
@@ -151,7 +161,7 @@ class PolicyJParameterSweeper:
 
                 # Replay PolicyJShadowEvaluator over snaps for candidate act/gb
                 candidate_config = {
-                    "enabled": True,
+                    "shadow_enabled": True,
                     "activation_net_pnl_twd": act,
                     "giveback_twd": gb,
                     "max_quote_age_ms": 1000.0,
@@ -159,34 +169,48 @@ class PolicyJParameterSweeper:
                 state = PolicyJShadowState(trade_id=tid)
 
                 first_trig_snap = None
+                act_time = ""
+                act_pnl_val = 0.0
+                peak_pnl_val = 0.0
+
                 for snap in snaps:
                     obs = PolicyJShadowObservation(
                         trade_id=tid,
-                        is_spread_phase=(snap.get("eligibility_reason") == "HEDGED_PAIR_SPREAD"),
+                        is_spread_phase=(snap.get("eligibility_reason") == "HEDGED_PAIR_SPREAD" or snap.get("eligibility_reason") is None or snap.get("is_spread_phase", True)),
                         is_hedged_pair=True,
                         exit_inflight=False,
                         gross_liquidation_pnl_twd=snap.get("gross_liquidation_pnl_twd", 0.0),
-                        commission_twd=snap.get("estimated_friction_twd", 92.0),
+                        commission_twd=0.0,  # Pure net pnl passed in gross
                         near_quote_age_ms=snap.get("near_quote_age_ms", 10.0),
                         far_quote_age_ms=snap.get("far_quote_age_ms", 10.0),
                         event_time=snap.get("event_time", ""),
                     )
                     eval_snap, state = PolicyJShadowEvaluator.evaluate(obs, state, candidate_config)
-                    if eval_snap.first_trigger_event and first_trig_snap is None:
+
+                    if state.armed and not act_time:
+                        act_time = eval_snap.event_time
+                        act_pnl_val = eval_snap.estimated_net_exit_pnl_twd
+
+                    if eval_snap.peak_net_exit_pnl_twd:
+                        peak_pnl_val = eval_snap.peak_net_exit_pnl_twd
+
+                    if eval_snap.would_trigger and first_trig_snap is None:
                         first_trig_snap = eval_snap
 
                 if first_trig_snap:
                     trig = True
                     trig_time = first_trig_snap.event_time
-                    hyp_pnl = first_trig_snap.estimated_net_exit_pnl_twd
-                    delta_pnl = round(hyp_pnl - act_pnl, 2)
-                    ped_imp = round((mfe_pnl - act_pnl) - (mfe_pnl - hyp_pnl), 2) if mfe_pnl else 0.0
+                    trig_pnl = first_trig_snap.estimated_net_exit_pnl_twd
+                    counterfactual_pnl = trig_pnl
+                    delta_pnl = round(counterfactual_pnl - act_pnl, 2)
+                    ped_imp = round((mfe_pnl - act_pnl) - (mfe_pnl - counterfactual_pnl), 2) if mfe_pnl else 0.0
                 else:
                     trig = False
                     trig_time = ""
-                    hyp_pnl = None
-                    delta_pnl = None
-                    ped_imp = None
+                    trig_pnl = 0.0
+                    counterfactual_pnl = act_pnl
+                    delta_pnl = 0.0
+                    ped_imp = 0.0
 
                 cell = DatasetCCell(
                     trade_id=tid,
@@ -198,9 +222,16 @@ class PolicyJParameterSweeper:
                     eligible_for_analysis=True,
                     exclusion_reason=ExclusionReason.NONE.value,
                     triggered=trig,
-                    first_trigger_time=trig_time,
-                    hypothetical_net_exit_pnl_twd=hyp_pnl,
-                    actual_final_net_pnl_twd=act_pnl,
+                    activation_event_time=act_time,
+                    activation_net_pnl_twd=act_pnl_val,
+                    peak_net_pnl_twd=peak_pnl_val,
+                    trigger_event_time=trig_time,
+                    trigger_net_pnl_twd=trig_pnl,
+                    hypothetical_fill_time=trig_time,
+                    hypothetical_exit_price_near=0.0,
+                    hypothetical_exit_price_far=0.0,
+                    counterfactual_net_pnl_twd=counterfactual_pnl,
+                    actual_net_pnl_twd=act_pnl,
                     delta_net_pnl_twd=delta_pnl,
                     actual_mfe_net_pnl_twd=mfe_pnl,
                     ped_improvement_twd=ped_imp,
@@ -223,45 +254,47 @@ class PolicyJParameterSweeper:
                 continue
 
             eligible_n = len(cells)
-            trig_cells = [c for c in cells if c.triggered and c.delta_net_pnl_twd is not None]
+            trig_cells = [c for c in cells if c.triggered]
             trig_n = len(trig_cells)
             trig_rate = round(trig_n / eligible_n, 4) if eligible_n > 0 else 0.0
 
-            if trig_cells:
-                deltas = [c.delta_net_pnl_twd for c in trig_cells]
-                peds = [c.ped_improvement_twd for c in trig_cells if c.ped_improvement_twd is not None]
+            deltas = [c.delta_net_pnl_twd for c in cells]
+            peds = [c.ped_improvement_twd for c in cells]
 
-                sorted_deltas = sorted(deltas)
-                total_delta = round(sum(deltas), 2)
-                mean_delta = round(total_delta / trig_n, 2)
-                median_delta = round(sorted_deltas[trig_n // 2], 2)
-                win_n = sum(1 for d in deltas if d > 0)
-                win_rate = round(win_n / trig_n, 4)
-                ped_total = round(sum(peds), 2)
+            sorted_deltas = sorted(deltas)
+            total_delta = round(sum(deltas), 2)
+            mean_delta_source = round(total_delta / n_trades, 2) if n_trades > 0 else 0.0
+            mean_delta_trig = round(total_delta / trig_n, 2) if trig_n > 0 else 0.0
+            median_delta = round(sorted_deltas[eligible_n // 2], 2) if eligible_n > 0 else 0.0
+            worst_delta = sorted_deltas[0] if sorted_deltas else 0.0
 
-                p10_idx = int(trig_n * 0.1)
-                p05_idx = int(trig_n * 0.05)
-                p10_delta = sorted_deltas[p10_idx]
-                p05_delta = sorted_deltas[p05_idx]
+            win_n = sum(1 for d in deltas if d > 0)
+            win_rate = round(win_n / eligible_n, 4) if eligible_n > 0 else 0.0
+            ped_total = round(sum(peds), 2)
 
-                max_single = max(deltas)
-                top1_ratio = round(max_single / total_delta, 4) if total_delta > 0 else 0.0
-                loto_min = round(total_delta - max_single, 2)
-            else:
-                mean_delta = median_delta = total_delta = win_rate = ped_total = 0.0
-                p10_delta = p05_delta = top1_ratio = loto_min = 0.0
+            p10_idx = int(eligible_n * 0.1)
+            p05_idx = int(eligible_n * 0.05)
+            p10_delta = sorted_deltas[p10_idx] if eligible_n > 0 else 0.0
+            p05_delta = sorted_deltas[p05_idx] if eligible_n > 0 else 0.0
+
+            max_single = max(deltas) if deltas else 0.0
+            top1_ratio = round(max_single / total_delta, 4) if total_delta > 0 else 0.0
+            loto_min = round(total_delta - max_single, 2)
 
             summary = ConfigLandscapeSummary(
                 config_hash=cfg_hash,
                 activation_twd=act,
                 giveback_twd=gb,
                 giveback_ratio=gb_ratio,
+                source_trades=n_trades,
                 eligible_trades=eligible_n,
                 triggered_trades=trig_n,
                 trigger_rate=trig_rate,
-                mean_delta_net_pnl=mean_delta,
-                median_delta_net_pnl=median_delta,
                 total_delta_net_pnl=total_delta,
+                mean_delta_per_source_trade=mean_delta_source,
+                mean_delta_per_triggered_trade=mean_delta_trig,
+                median_delta_net_pnl=median_delta,
+                worst_delta_net_pnl=worst_delta,
                 win_rate=win_rate,
                 ped_improvement_total=ped_total,
                 p10_delta_net_pnl=p10_delta,
@@ -270,5 +303,7 @@ class PolicyJParameterSweeper:
                 leave_one_out_min_delta=loto_min,
             )
             summaries.append(summary)
+
+        return dataset_c_cells, summaries
 
         return dataset_c_cells, summaries
