@@ -960,6 +960,7 @@ def run_system(dry_run=False, config_name="futures"):
                     fallback_tick_handler=_tmf_tick_fn,
                     fallback_bidask_handler=_tmf_bidask_fn,
                     always_call_fallback=True,
+                    capture_hook=getattr(_mtx_runtime, '_capture_hook', None),
                 )
                 _gca_adapter = _mtx_runtime.adapter
                 def _gca_tick_wrapper(*a):
