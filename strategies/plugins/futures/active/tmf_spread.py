@@ -1009,6 +1009,8 @@ def _write_mts_state(
         try:
             with open(_tmp_file, "w") as f:
                 json.dump(state, f, default=str)
+                f.flush()
+                os.fsync(f.fileno())
             # 💡 Gemini CLI: CAS check against dynamic target state file
             if os.path.exists(_target_state_file):
                 try:
@@ -1025,6 +1027,15 @@ def _write_mts_state(
                 except Exception:
                     pass  # if we can't read disk, proceed with replace
             os.replace(_tmp_file, _target_state_file)
+            # 2026-07-27 Gemini CLI: Directory fsync for POSIX entry durability
+            try:
+                _dir_fd = os.open(os.path.dirname(_target_state_file), os.O_RDONLY)
+                try:
+                    os.fsync(_dir_fd)
+                finally:
+                    os.close(_dir_fd)
+            except Exception:
+                pass
         except Exception as e:
             if os.path.exists(_tmp_file): os.remove(_tmp_file)
             raise e
@@ -1993,6 +2004,8 @@ class TMFSpread(StrategyBase):
                         _latest_ts = _first_entry_ts
                         _latest_open_tid = tid
                         _latest_open_entries = fills
+                        _latest_open_near_qty = near_open_qty
+                        _latest_open_far_qty = far_open_qty
 
             if not _latest_open_tid:
                 return False
@@ -2023,6 +2036,8 @@ class TMFSpread(StrategyBase):
             self._far_entry = _far_entry
             self._near_side = "LONG" if _near_side in ("LONG", "BUY") else "SHORT"
             self._far_side = "LONG" if _far_side in ("LONG", "BUY") else "SHORT"
+            self._near_open_qty = _latest_open_near_qty
+            self._far_open_qty = _latest_open_far_qty
             self._released_leg = None
             self._trade_id = _latest_open_tid
             self._lifecycle = "OPEN"
@@ -2044,7 +2059,21 @@ class TMFSpread(StrategyBase):
             # Restore Policy J peak UPL across restarts
             _st = self._read_mts_state()
             if _st and _st.get("trade_id") == _latest_open_tid:
-                self._peak_net_exit_pnl_twd = float(_st.get("peak_net_exit_pnl_twd") or 0.0)
+                _raw_peak = _st.get("peak_net_exit_pnl_twd")
+                try:
+                    _val = float(_raw_peak) if _raw_peak is not None else 0.0
+                    import math
+                    if math.isnan(_val) or math.isinf(_val):
+                        logger.warning("[MTS_PEAK_STATE_CORRUPTED] Recovered peak invalid: NaN or Inf value (%s). Safe initialization to 0.0", _raw_peak)
+                        self._peak_net_exit_pnl_twd = 0.0
+                    else:
+                        self._peak_net_exit_pnl_twd = _val
+                except (ValueError, TypeError):
+                    logger.warning("[MTS_PEAK_STATE_CORRUPTED] Recovered peak invalid: non-numeric value (%s). Safe initialization to 0.0", _raw_peak)
+                    self._peak_net_exit_pnl_twd = 0.0
+            elif _st is None:
+                logger.info("[MTS_PEAK_STATE_DEFAULT] No state file found during recovery. Initializing peak_net_exit_pnl_twd to 0.0")
+                self._peak_net_exit_pnl_twd = 0.0
 
             logger.warning(
                 "[MTS_FILLS_RECOVERY] Restored trade_id=%s near=%.1f far=%.1f released=%s lifecycle=%s peak_pnl=%.1f",

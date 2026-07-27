@@ -444,3 +444,40 @@ def test_atomic_durable_file_write(tmp_path):
             data = json.load(f)
             assert data["trade_id"] == "trade-108"
             assert data["peak_net_exit_pnl_twd"] == 1850.0
+
+
+# --- Case 26: Restart between Near Fill and Far Fill, then Far Fill arrives and settles once ---
+def test_restart_between_near_fill_and_far_fill_then_far_fill_settles_once(tmp_path):
+    log_file = str(tmp_path / "mts_fills.jsonl")
+    from strategies.plugins.futures.active.tmf_spread import _append_fill, TMFSpread as TmfSpreadStrategy
+
+    # 1. Simulate entry + Near Fill before restart
+    with patch("strategies.plugins.futures.active.tmf_spread._MTS_FILL_LOG", log_file):
+        _append_fill("TMF", "TMFH6", "NEAR", "BUY", 1, 44000.0, "ENTRY", "trade-109")
+        _append_fill("TMF", "TMFI6", "FAR", "SELL", 1, 44100.0, "ENTRY", "trade-109")
+        _append_fill("TMF", "TMFH6", "NEAR", "SELL", 1, 44050.0, "COMBINED_EXIT_NEAR", "trade-109")
+
+    # 2. Restart strategy and restore state
+    with patch("strategies.plugins.futures.active.tmf_spread._MTS_FILL_LOG", log_file):
+        strat = TmfSpreadStrategy()
+        res = strat._restore_from_fills_log()
+        assert res is True
+        assert strat._has_position is True
+
+        # 3. Simulate Monitor receiving Far Fill callback post-restart
+        mon = make_mock_monitor()
+        class DummyEvent:
+            order_id = "ord-far-109"
+            fill_qty = 1
+
+        dummy_event = DummyEvent()
+        pending = {"reason": "trade-109", "lots": 1, "strategy": strat}
+
+        # Apply Far Fill to Monitor fill tracking
+        with patch("strategies.plugins.futures.active.tmf_spread._MTS_FILL_LOG", log_file):
+            mon._apply_combined_exit_fill(dummy_event, pending, "COMBINED_EXIT_FAR", 44050.0)
+
+        # 4. Verify completion and zero duplicate settlement
+        assert mon._combined_exit_trackers["trade-109"]["settlement_completed"] is True
+        assert getattr(strat, "_has_position", False) is False
+

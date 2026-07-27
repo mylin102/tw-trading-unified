@@ -7004,19 +7004,32 @@ class FuturesMonitor:
         tracker = self._get_combined_exit_tracker(trade_id)
 
         # Update expected qty from pending metadata (first fill for each leg sets this)
+        strategy = pending.get("strategy")
         if leg == "NEAR":
             if tracker["near_expected_qty"] == 0:
                 tracker["near_expected_qty"] = int(pending.get("lots", lots))
             tracker["near_filled_qty"] += lots
+            if tracker["far_expected_qty"] == 0 and strategy is not None:
+                _far_qty = getattr(strategy, "_far_open_qty", None)
+                if _far_qty == 0:
+                    tracker["far_expected_qty"] = tracker["near_expected_qty"]
+                    tracker["far_filled_qty"] = tracker["far_expected_qty"]
+                    tracker["far_complete"] = True
         else:
             if tracker["far_expected_qty"] == 0:
                 tracker["far_expected_qty"] = int(pending.get("lots", lots))
             tracker["far_filled_qty"] += lots
+            if tracker["near_expected_qty"] == 0 and strategy is not None:
+                _near_qty = getattr(strategy, "_near_open_qty", None)
+                if _near_qty == 0:
+                    tracker["near_expected_qty"] = tracker["far_expected_qty"]
+                    tracker["near_filled_qty"] = tracker["near_expected_qty"]
+                    tracker["near_complete"] = True
 
         # Check leg completion
-        if leg == "NEAR" and tracker["near_filled_qty"] >= tracker["near_expected_qty"]:
+        if tracker["near_expected_qty"] > 0 and tracker["near_filled_qty"] >= tracker["near_expected_qty"]:
             tracker["near_complete"] = True
-        elif leg == "FAR" and tracker["far_filled_qty"] >= tracker["far_expected_qty"]:
+        if tracker["far_expected_qty"] > 0 and tracker["far_filled_qty"] >= tracker["far_expected_qty"]:
             tracker["far_complete"] = True
 
         # Advance state
@@ -7052,7 +7065,7 @@ class FuturesMonitor:
                 leg="NEAR",
                 side="SELL",
                 qty=tracker["near_filled_qty"],
-                price=tracker["near_price"] or price,
+                price=tracker.get("near_price") or price,
                 fill_type="COMBINED_EXIT",
                 trade_id=trade_id,
             )
@@ -7062,7 +7075,7 @@ class FuturesMonitor:
                 leg="FAR",
                 side="BUY",
                 qty=tracker["far_filled_qty"],
-                price=tracker["far_price"] or price,
+                price=tracker.get("far_price") or price,
                 fill_type="COMBINED_EXIT",
                 trade_id=trade_id,
             )
@@ -7070,10 +7083,11 @@ class FuturesMonitor:
             console.print(f"[red]⚠️ [COMBINED_EXIT_FILL_LOG_ERROR] Failed to write exit fills: {_e}[/red]")
 
         # Finalize: reset strategy position to FLAT
-        _mts_strat = self._registry.get("tmf_spread")
+        _mts_strat = pending.get("strategy") or getattr(self, "_registry", {}).get("tmf_spread")
         if _mts_strat:
             _mts_strat._reset(reason="combined_exit_confirmed", exit_price=price)
-            _mts_strat._lifecycle_oca.phase = PositionPhase.FLAT
+            if hasattr(_mts_strat, "_lifecycle_oca") and _mts_strat._lifecycle_oca is not None:
+                _mts_strat._lifecycle_oca.phase = PositionPhase.FLAT
             _mts_strat._peak_net_exit_pnl_twd = 0.0
             _write_mts_state(
                 has_position=False, action="COMBINED_EXIT_COMPLETED",
