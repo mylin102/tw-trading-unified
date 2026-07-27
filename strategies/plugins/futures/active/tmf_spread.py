@@ -2972,6 +2972,13 @@ class TMFSpread(StrategyBase):
                     _rem_low = float(bar.get("near_low", 0))
             else:
                 _rem_high = _rem_low = 0.0
+            # ── Track Peak Net Exit PnL TWD for Policy J Live Combined Exit ──
+            _current_net_exit_twd = float(current_pnl * 10.0 - 92.0)
+            if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None:
+                self._peak_net_exit_pnl_twd = 0.0
+            if _current_net_exit_twd > self._peak_net_exit_pnl_twd:
+                self._peak_net_exit_pnl_twd = _current_net_exit_twd
+
             # 2026-07-20 Gemini CLI: PR 3B Production Decision Core Cutover (first evaluation block)
             from strategies.plugins.futures.active.mts_lifecycle_adapter import LifecycleEvaluationInput
             _adapter_input = LifecycleEvaluationInput(
@@ -2990,6 +2997,10 @@ class TMFSpread(StrategyBase):
                     "nadir": _nadir,
                     "rem_high": _rem_high,
                     "rem_low": _rem_low,
+                    "enable_combined_upl_trail": self._params.get("enable_combined_upl_trail", False),
+                    "combined_upl_activation_net_pnl_twd": float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
+                    "combined_upl_giveback_twd": float(self._params.get("combined_upl_giveback_twd", 100.0)),
+                    "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
                     "last_applied_event_time": self._last_applied_event_time.isoformat() if getattr(self, "_last_applied_event_time", None) else None,
                     "single_leg_started_at": self._single_leg_started_at.isoformat() if getattr(self, "_single_leg_started_at", None) else None,
                 },
@@ -3511,6 +3522,16 @@ class TMFSpread(StrategyBase):
                 _write_mts_state(has_position=True, action=f"EXIT_{_exit_reason}", reason=_exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
                 self._log_shadow_trade_summary(_exit_price, _exit_reason, _pnl_pts, now, bar, near_close, far_close)
                 return Signal("EXIT", f"TMF_{_exit_reason}", confidence=0.5, stop_loss=0)
+            elif _decision.action == LifecycleAction.COMBINED_EXIT:
+                _exit_reason = "COMBINED_EXIT"
+                logger.info("[POLICY_J_LIVE_TRIGGERED] Executing COMBINED_EXIT (SPREAD -> FLAT)")
+                self._lifecycle = "EXITING"
+                self._log_exit_decision(exit_reason=_exit_reason, pnl=current_pnl, bar=bar)
+                _append_event("COMBINED_EXIT_SUBMITTED", exit_reason=_exit_reason, gross_points=current_pnl, **_risk_meta)
+                _commit_action(self._lifecycle_oca, _decision)
+                _write_mts_state(has_position=True, action="COMBINED_EXIT", reason=_exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
+                self._peak_net_exit_pnl_twd = 0.0
+                return Signal("EXIT", "TMF_COMBINED_EXIT", confidence=1.0, stop_loss=0)
             elif _decision.action == LifecycleAction.MANUAL:
                 # MANUAL: full flatten — same as STOPLOSS/TIMEOUT
                 _exit_reason = "MANUAL"

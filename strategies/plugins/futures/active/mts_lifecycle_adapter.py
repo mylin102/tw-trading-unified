@@ -164,11 +164,11 @@ class LifecycleContext:
     rem_high: float = 0.0
     rem_low: float = 0.0
     is_backtest: bool = False
-    # 2026-07-26 Gemini CLI: Policy J Primary Exit - Total UPL Combined Trailing parameters (Default FALSE for safety)
+    # 2026-07-27 Gemini CLI: Policy J Primary Exit - Net Exit PnL TWD Combined Trailing parameters
     enable_combined_upl_trail: bool = False
-    combined_upl_target_pts: float = 30.0
-    combined_upl_giveback_pts: float = 10.0
-    peak_total_upl: float = 0.0
+    combined_upl_activation_net_pnl_twd: float = 300.0
+    combined_upl_giveback_twd: float = 100.0
+    peak_net_exit_pnl_twd: float = 0.0
 
 @dataclass(frozen=True)
 class LifecycleEvaluationInput:
@@ -244,22 +244,23 @@ def _check_timeout_candidate(ctx: LifecycleContext) -> list[LifecycleDecision]:
 def _check_combined_upl_trail_candidate(
     ctx: LifecycleContext, lifecycle: PositionLifecycle,
 ) -> list[LifecycleDecision]:
-    """2026-07-26 Gemini CLI: Policy J Primary Exit - Total UPL Combined Trailing Exit."""
+    """2026-07-27 Gemini CLI: Policy J Primary Exit - Net Exit PnL TWD Combined Trailing Exit."""
     if not ctx.enable_combined_upl_trail:
         return []
     _phase_val = enum_value(lifecycle.phase)
     if _phase_val != "SPREAD":
         return []
     _rg_status = enum_value(lifecycle.release_group.status)
-    if _rg_status not in ("ARMED", "TRIGGERED"):
+    if _rg_status not in ("ARMED", "INACTIVE"):
         return []
 
-    total_upl_pts = ctx.near_pnl_pts + ctx.far_pnl_pts
-    if ctx.peak_total_upl >= ctx.combined_upl_target_pts:
-        if total_upl_pts <= (ctx.peak_total_upl - ctx.combined_upl_giveback_pts):
+    # Calculate net exit PnL TWD (1pt = 10 TWD for TMF, minus friction 92 TWD)
+    total_net_pnl_twd = (ctx.near_pnl_pts + ctx.far_pnl_pts) * 10.0 - 92.0
+    if ctx.peak_net_exit_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd:
+        if total_net_pnl_twd <= (ctx.peak_net_exit_pnl_twd - ctx.combined_upl_giveback_twd):
             logger.info(
-                "[POLICY_J_TRIGGERED] Total UPL peak=%.1f current=%.1f giveback=%.1f -> COMBINED_EXIT",
-                ctx.peak_total_upl, total_upl_pts, ctx.combined_upl_giveback_pts,
+                "[POLICY_J_TRIGGERED] Net Exit PnL TWD peak=%.1f current=%.1f giveback=%.1f -> COMBINED_EXIT",
+                ctx.peak_net_exit_pnl_twd, total_net_pnl_twd, ctx.combined_upl_giveback_twd,
             )
             return [LifecycleDecision(action=LifecycleAction.COMBINED_EXIT)]
     return []
@@ -505,6 +506,11 @@ class MtsLifecycleAdapter:
         nadir = float(state.get("nadir", 0.0))
         rem_high = float(state.get("rem_high", 0.0))
         rem_low = float(state.get("rem_low", 0.0))
+
+        enable_combined = bool(state.get("enable_combined_upl_trail", False))
+        activation_twd = float(state.get("combined_upl_activation_net_pnl_twd", 300.0))
+        giveback_twd = float(state.get("combined_upl_giveback_twd", 100.0))
+        peak_net_exit_pnl = float(state.get("peak_net_exit_pnl_twd", 0.0))
         
         ctx = LifecycleContext(
             near_pnl_pts=near_pnl,
@@ -522,6 +528,10 @@ class MtsLifecycleAdapter:
             rem_high=rem_high,
             rem_low=rem_low,
             is_backtest=is_backtest,
+            enable_combined_upl_trail=enable_combined,
+            combined_upl_activation_net_pnl_twd=activation_twd,
+            combined_upl_giveback_twd=giveback_twd,
+            peak_net_exit_pnl_twd=peak_net_exit_pnl,
         )
         
         # Calculate time above breakeven

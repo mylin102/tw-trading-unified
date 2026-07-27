@@ -228,7 +228,7 @@ def test_policy_j_primary_exit_and_fallback():
         release_group=ReleaseGroup(status=ReleaseGroupStatus.ARMED)
     )
 
-    # 1. Policy J Primary Trigger: Target peak 35.0 reached, current UPL drops to 20.0 (giveback 15.0 >= 10.0)
+    # 1. Policy J Primary Trigger: Target peak 400.0 TWD reached, current net exit UPL drops to 108.0 TWD (giveback 292.0 >= 100.0)
     ctx_policy_j = LifecycleContext(
         near_pnl_pts=10.0,
         far_pnl_pts=10.0,
@@ -237,15 +237,15 @@ def test_policy_j_primary_exit_and_fallback():
         release_stop_threshold=80.0,
         trail_dist=48.9,
         enable_combined_upl_trail=True,
-        combined_upl_target_pts=30.0,
-        combined_upl_giveback_pts=10.0,
-        peak_total_upl=35.0,
+        combined_upl_activation_net_pnl_twd=300.0,
+        combined_upl_giveback_twd=100.0,
+        peak_net_exit_pnl_twd=400.0,
     )
     decision = evaluate_lifecycle_actions(ctx_policy_j, lc)
     assert decision is not None
     assert decision.action == LifecycleAction.COMBINED_EXIT
 
-    # 2. Secondary Fallback: Target peak not reached (peak = 15.0 < 30.0), but single leg hits release threshold (-80.0)
+    # 2. Secondary Fallback: Target peak not reached (peak = 150.0 < 300.0), but single leg hits release threshold (-80.0)
     ctx_fallback = LifecycleContext(
         near_pnl_pts=-85.0,
         far_pnl_pts=10.0,
@@ -254,9 +254,9 @@ def test_policy_j_primary_exit_and_fallback():
         release_stop_threshold=80.0,
         trail_dist=48.9,
         enable_combined_upl_trail=True,
-        combined_upl_target_pts=30.0,
-        combined_upl_giveback_pts=10.0,
-        peak_total_upl=15.0,
+        combined_upl_activation_net_pnl_twd=300.0,
+        combined_upl_giveback_twd=100.0,
+        peak_net_exit_pnl_twd=150.0,
     )
     decision_fallback = evaluate_lifecycle_actions(ctx_fallback, lc)
     assert decision_fallback is not None
