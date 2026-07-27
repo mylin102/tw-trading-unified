@@ -135,8 +135,8 @@ mts:
     release_stop_points: 99
     trail_distance_points: 10
     enable_combined_upl_trail: true
-    combined_upl_activation_net_pnl_twd: 300.0
-    combined_upl_giveback_twd: 100.0
+    combined_upl_activation_net_pnl_twd: 200.0
+    combined_upl_giveback_twd: 50.0
     atr_cap: 200.0
     confirm_ticks: 2
     confirm_ms: 800
