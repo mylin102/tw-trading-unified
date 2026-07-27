@@ -471,215 +471,8 @@ with st.sidebar:
 
 # 2026-07-08 Gemini CLI: Calculate MTS daily performance metrics matching scripts/generate_daily_report.py
 def calculate_mts_daily_performance(fills_path: str, events_path: str, target_trading_day: str) -> dict:
-    import os
-    import json
-    from datetime import datetime, timedelta
-    from collections import defaultdict
-    import pandas as pd
-
-    if not os.path.exists(fills_path):
-        return {"completed": [], "active": []}
-
-    def get_trading_day(timestamp_str: str) -> str:
-        try:
-            from core.date_utils import get_trading_day as get_taifex_trading_day
-            import pandas as pd
-            dt = pd.to_datetime(timestamp_str)
-            t_day = get_taifex_trading_day(dt)
-            return t_day.strftime("%Y-%m-%d")
-        except Exception:
-            return timestamp_str.split("T")[0]
-
-    trades = defaultdict(lambda: {
-        "entries": [],
-        "release": None,
-        "exit": None,
-        "exit_reason": "UNKNOWN",
-        "entry_ts": None,
-        "exit_ts": None,
-        "risk_mode": "UNKNOWN",
-        "session": "UNKNOWN"
-    })
-    
-    try:
-        with open(fills_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line: continue
-                try:
-                    fill = json.loads(line)
-                    trade_id = fill.get("trade_id")
-                    if not trade_id: continue
-                    
-                    fill_type = fill.get("fill_type")
-                    ts_str = fill.get("timestamp", "")
-                    session = fill.get("session", "UNKNOWN")
-                    
-                    if fill_type == "ENTRY":
-                        trades[trade_id]["entries"].append(fill)
-                        if not trades[trade_id]["entry_ts"]:
-                            trades[trade_id]["entry_ts"] = ts_str
-                        trades[trade_id]["session"] = session
-                    elif fill_type == "RELEASE":
-                        trades[trade_id]["release"] = fill
-                    elif fill_type == "EXIT":
-                        trades[trade_id]["exit"] = fill
-                        trades[trade_id]["exit_ts"] = ts_str
-                except Exception:
-                    continue
-    except Exception:
-        pass
-
-    time_to_trade = {}
-    if os.path.exists(events_path):
-        try:
-            with open(events_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line: continue
-                    try:
-                        event = json.loads(line)
-                        trade_id = event.get("trade_id")
-                        ts = event.get("ts", "")
-                        if ts and trade_id:
-                            time_to_trade[ts[:19]] = trade_id
-                    except Exception:
-                        continue
-                        
-            with open(events_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line: continue
-                    try:
-                        event = json.loads(line)
-                        ev_type = event.get("event")
-                        ts = event.get("ts", "")
-                        trade_id = event.get("trade_id")
-                        if not trade_id and ts:
-                            trade_id = time_to_trade.get(ts[:19])
-                        
-                        if not trade_id: continue
-                            
-                        if ev_type == "EXIT_REMAINING":
-                            trades[trade_id]["exit_reason"] = event.get("reason", "UNKNOWN")
-                            trades[trade_id]["risk_mode"] = event.get("risk_mode", "UNKNOWN")
-                        elif ev_type in ("RELEASE_NEAR_SUBMITTED", "RELEASE_FAR_SUBMITTED"):
-                            trades[trade_id]["risk_mode"] = event.get("risk_mode", "UNKNOWN")
-                        elif ev_type == "EXIT_LOG":
-                            trades[trade_id]["mfe"] = event.get("mfe")
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-    completed = []
-    active = []
-    
-    for trade_id, data in trades.items():
-        if len(data["entries"]) > 0 and not data["exit"]:
-            near_entry = next((e for e in data["entries"] if e["leg"] == "NEAR"), None)
-            far_entry = next((e for e in data["entries"] if e["leg"] == "FAR"), None)
-            entry_ts = data["entry_ts"]
-            session = data["session"]
-            trading_day = get_trading_day(entry_ts)
-            
-            if trading_day == target_trading_day:
-                active.append({
-                    "trade_id": trade_id,
-                    "entry_time": entry_ts,
-                    "session": session,
-                    "near_entry": near_entry["price"] if near_entry else 0.0,
-                    "far_entry": far_entry["price"] if far_entry else 0.0,
-                    "spread_z": near_entry.get("spread_z") if near_entry else None,
-                    "atr": near_entry.get("atr") if near_entry else None,
-                })
-        elif len(data["entries"]) > 0 and data["exit"]:
-            exit_ts = data["exit_ts"]
-            session = data["session"]
-            trading_day = get_trading_day(exit_ts)
-            
-            if trading_day == target_trading_day:
-                near_entry = next((e for e in data["entries"] if e["leg"] == "NEAR"), None)
-                far_entry = next((e for e in data["entries"] if e["leg"] == "FAR"), None)
-                release_fill = data["release"]
-                exit_fill = data["exit"]
-                
-                release_pnl = float(release_fill.get("realized_pnl") or 0.0) if release_fill else 0.0
-                exit_pnl = float(exit_fill.get("realized_pnl") or 0.0) if exit_fill else 0.0
-                net_pnl = release_pnl + exit_pnl
-                
-                # 2026-07-17 Gemini CLI: Calculate durations for release and trail phases
-                release_ts = release_fill.get("timestamp") if release_fill else None
-                entry_ts = data["entry_ts"]
-                exit_ts = data["exit_ts"]
-                
-                release_duration_str = "—"
-                trail_duration_str = "—"
-                
-                if entry_ts and release_ts:
-                    try:
-                        t_entry = pd.to_datetime(entry_ts)
-                        t_release = pd.to_datetime(release_ts)
-                        diff = t_release - t_entry
-                        tot_sec = int(diff.total_seconds())
-                        if tot_sec < 0: tot_sec = 0
-                        h = tot_sec // 3600
-                        m = (tot_sec % 3600) // 60
-                        s = tot_sec % 60
-                        if h > 0:
-                            release_duration_str = f"{h}h {m}m"
-                        else:
-                            release_duration_str = f"{m}m {s}s"
-                    except Exception:
-                        pass
-                
-                if release_ts and exit_ts:
-                    try:
-                        t_release = pd.to_datetime(release_ts)
-                        t_exit = pd.to_datetime(exit_ts)
-                        diff = t_exit - t_release
-                        tot_sec = int(diff.total_seconds())
-                        if tot_sec < 0: tot_sec = 0
-                        h = tot_sec // 3600
-                        m = (tot_sec % 3600) // 60
-                        s = tot_sec % 60
-                        if h > 0:
-                            trail_duration_str = f"{h}h {m}m"
-                        else:
-                            trail_duration_str = f"{m}m {s}s"
-                    except Exception:
-                        pass
-                
-                # 2026-07-17 Gemini CLI: Calculate Release Efficiency (Post-Release capture ratio)
-                # Gating Invariant: ε = 100 TWD
-                mfe_pts = data.get("mfe")
-                release_efficiency_str = "—"
-                if mfe_pts is not None:
-                    peak_pnl = float(mfe_pts) * 10.0
-                    if peak_pnl > 100.0:
-                        release_efficiency_str = f"{(net_pnl / peak_pnl):.1%}"
-                
-                completed.append({
-                    "trade_id": trade_id,
-                    "entry_time": data["entry_ts"],
-                    "exit_time": data["exit_ts"],
-                    "session": session,
-                    "near_entry": near_entry["price"] if near_entry else 0.0,
-                    "far_entry": far_entry["price"] if far_entry else 0.0,
-                    "release_leg": release_fill.get("leg") if release_fill else "UNKNOWN",
-                    "release_price": release_fill.get("price") if release_fill else 0.0,
-                    "release_pnl": release_pnl,
-                    "exit_price": exit_fill.get("price") if exit_fill else 0.0,
-                    "exit_pnl": exit_pnl,
-                    "exit_reason": data["exit_reason"],
-                    "net_pnl": net_pnl,
-                    "risk_mode": data["risk_mode"],
-                    "release_duration": release_duration_str,
-                    "trail_duration": trail_duration_str,
-                    "release_efficiency": release_efficiency_str
-                })
-                
-    return {"completed": completed, "active": active}
+    from scripts.generate_daily_report import parse_logs
+    return parse_logs(fills_path, events_path, target_trading_day)
 
 # ── YAML helpers ──
 # Read page selection from session state (set by sidebar selectbox)
@@ -3800,17 +3593,17 @@ elif _selected_product == "TMF":
                 with st.expander("📝 已完結交易清單 (Closed Loops)", expanded=True):
                     _loop_rows = []
                     for t in _completed:
-                        # 2026-07-17 Gemini CLI: Render first/second leg duration and release efficiency columns in closed loops table
                         _loop_rows.append({
                             "交易 ID": t["trade_id"][-6:],
-                            "時段": "☀️ 日盤" if t["session"].lower() == "day" else "🌙 夜盤",
+                            "建倉時段": "☀️ 日盤" if t.get("entry_session", t["session"]).lower() == "day" else "🌙 夜盤",
                             "進場時間": t["entry_time"].split("T")[1][:8] if "T" in t["entry_time"] else t["entry_time"],
                             "第一腿 PnL": f'{t["release_pnl"]:+,.0f}',
-                            "第一腿時間": t.get("release_duration", "—"),
+                            "第一腿原因": f'{t.get("release_reason", "—")}',
+                            "第一腿來源": f'{t.get("release_reason_source", "—")}',
                             "第二腿 PnL": f'{t["exit_pnl"]:+,.0f}',
-                            "第二腿時間": t.get("trail_duration", "—"),
-                            "釋放原因": t["exit_reason"],
-                            "釋放效率": t.get("release_efficiency", "—"),
+                            "第二腿原因": f'{t.get("exit_reason", "—")}',
+                            "第二腿來源": f'{t.get("exit_reason_source", "—")}',
+                            "跨時段": "🔄 跨盤" if t.get("cross_session_trade") else "單盤",
                             "淨利 (TWD)": f'{t["net_pnl"]:+,.0f}',
                             "風控": t["risk_mode"]
                         })
