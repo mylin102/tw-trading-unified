@@ -5717,6 +5717,7 @@ elif page == "設定":
                                                  value=int(_mts_params.get("release_stop_points", 20)))
                 f_mts_trail_fixed = m6.number_input("MTS 固定停利點數 (pts)", min_value=10, max_value=200, 
                                                   value=int(_mts_params.get("trail_distance_points", 30)))
+                st.caption("💡 提示：儲存時將自動同步更新日盤 (`futures.yaml`) 與夜盤 (`futures_night.yaml`) 設定檔。在有 ATR 數據時，系統優先採用 `(ATR × 釋放倍數)` 動態停損；若無 ATR 則自動使用上述固定點數。")
                 st.markdown("---")
 
             # Strategy selector from Registry
@@ -5804,6 +5805,23 @@ elif page == "設定":
                     pass
                 save_yaml(FUTURES_CFG_PATH, futures_cfg)
                 _new_yaml = open(FUTURES_CFG_PATH).read()
+
+                # 2026-07-27 Gemini CLI: Dual-config sync to ensure day/night session switches retain updated MTS params
+                _counterpart_cfg_name = "futures.yaml" if _CURRENT_SESSION_NIGHT else "futures_night.yaml"
+                _counterpart_cfg_path = BASE / "config" / _counterpart_cfg_name
+                if _counterpart_cfg_path.exists():
+                    _counterpart_cfg = load_yaml(_counterpart_cfg_path)
+                    if "mts" not in _counterpart_cfg: _counterpart_cfg["mts"] = {}
+                    _counterpart_cfg["mts"]["enabled"] = f_mts_new
+                    if f_mts_new:
+                        if "params" not in _counterpart_cfg["mts"]: _counterpart_cfg["mts"]["params"] = {}
+                        _counterpart_cfg["mts"]["params"]["min_atr"] = f_mts_min_atr
+                        _counterpart_cfg["mts"]["params"]["atr_cap"] = f_mts_atr_cap
+                        _counterpart_cfg["mts"]["params"]["atr_multiplier_stop"] = f_mts_mult_stop
+                        _counterpart_cfg["mts"]["params"]["atr_multiplier_trail"] = f_mts_mult_trail
+                        _counterpart_cfg["mts"]["params"]["release_stop_points"] = f_mts_stop_fixed
+                        _counterpart_cfg["mts"]["params"]["trail_distance_points"] = f_mts_trail_fixed
+                    save_yaml(_counterpart_cfg_path, _counterpart_cfg)
 
                 # Build compact diff summary
                 _diff_lines = []

@@ -55,3 +55,11 @@ def test_dashboard_no_hardcoded_misleading_button_text():
     assert "強制賣出價差" not in content
     assert "強制買進價差" not in content
     assert "MTS 手動建倉" in content
+
+
+def test_dashboard_dual_config_sync():
+    dashboard_path = Path(__file__).parent.parent.parent / "ui" / "dashboard.py"
+    content = dashboard_path.read_text(encoding="utf-8")
+    assert "_counterpart_cfg_name" in content
+    assert "futures_night.yaml" in content
+    assert "release_stop_points" in content
