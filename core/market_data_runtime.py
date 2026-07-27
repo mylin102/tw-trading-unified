@@ -285,8 +285,7 @@ def build_mtx_runtime(
         capture_hook=_capture_hook,
     )
 
-    runtime._capture_hook = _capture_hook
-    return MarketDataRuntime(
+    _runtime = MarketDataRuntime(
         ticker="MTX",
         registry=registry,
         adapter=adapter,
@@ -295,5 +294,7 @@ def build_mtx_runtime(
         fallback_tick=fallback_tick,
         fallback_bidask=fallback_bidask,
     )
+    _runtime._capture_hook = _capture_hook
+    return _runtime
 
     
