@@ -5717,7 +5717,15 @@ elif page == "設定":
                                                  value=int(_mts_params.get("release_stop_points", 20)))
                 f_mts_trail_fixed = m6.number_input("MTS 固定停利點數 (pts)", min_value=10, max_value=200, 
                                                   value=int(_mts_params.get("trail_distance_points", 30)))
-                st.caption("💡 提示：儲存時將自動同步更新日盤 (`futures.yaml`) 與夜盤 (`futures_night.yaml`) 設定檔。在有 ATR 數據時，系統優先採用 `(ATR × 釋放倍數)` 動態停損；若無 ATR 則自動使用上述固定點數。")
+                
+                st.markdown("###### 🛡️ Policy J 組合移動停利 (Combined UPL Trailing Exit)")
+                pj1, pj2, pj3 = st.columns(3)
+                f_policy_j_enable = pj1.checkbox("啟用 Policy J 組合停利", value=bool(_mts_params.get("enable_combined_upl_trail", True)))
+                f_policy_j_activation = pj2.number_input("啟動淨利金額 (TWD)", min_value=50.0, max_value=5000.0,
+                                                        value=float(_mts_params.get("combined_upl_activation_net_pnl_twd", 300.0)), step=50.0)
+                f_policy_j_giveback = pj3.number_input("回吐門檻金額 (TWD)", min_value=10.0, max_value=2000.0,
+                                                     value=float(_mts_params.get("combined_upl_giveback_twd", 100.0)), step=10.0)
+                st.caption("💡 提示：儲存時將自動同步更新日盤 (`futures.yaml`) 與夜盤 (`futures_night.yaml`) 設定檔。Policy J 啟動後若自最高淨利回吐指定 TWD 金額將觸發 COMBINED_EXIT 雙腿全平倉。")
                 st.markdown("---")
 
             # Strategy selector from Registry
@@ -5786,6 +5794,9 @@ elif page == "設定":
                     futures_cfg["mts"]["params"]["atr_multiplier_trail"] = f_mts_mult_trail
                     futures_cfg["mts"]["params"]["release_stop_points"] = f_mts_stop_fixed
                     futures_cfg["mts"]["params"]["trail_distance_points"] = f_mts_trail_fixed
+                    futures_cfg["mts"]["params"]["enable_combined_upl_trail"] = f_policy_j_enable
+                    futures_cfg["mts"]["params"]["combined_upl_activation_net_pnl_twd"] = f_policy_j_activation
+                    futures_cfg["mts"]["params"]["combined_upl_giveback_twd"] = f_policy_j_giveback
 
                 futures_cfg["strategy"]["active_strategy"] = f_strat_new
                 futures_cfg["strategy"]["regime_filter"] = f_regime
@@ -5821,6 +5832,9 @@ elif page == "設定":
                         _counterpart_cfg["mts"]["params"]["atr_multiplier_trail"] = f_mts_mult_trail
                         _counterpart_cfg["mts"]["params"]["release_stop_points"] = f_mts_stop_fixed
                         _counterpart_cfg["mts"]["params"]["trail_distance_points"] = f_mts_trail_fixed
+                        _counterpart_cfg["mts"]["params"]["enable_combined_upl_trail"] = f_policy_j_enable
+                        _counterpart_cfg["mts"]["params"]["combined_upl_activation_net_pnl_twd"] = f_policy_j_activation
+                        _counterpart_cfg["mts"]["params"]["combined_upl_giveback_twd"] = f_policy_j_giveback
                     save_yaml(_counterpart_cfg_path, _counterpart_cfg)
 
                 # Build compact diff summary
