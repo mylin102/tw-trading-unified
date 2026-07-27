@@ -1931,11 +1931,10 @@ class TMFSpread(StrategyBase):
         return False
 
     def _restore_from_fills_log(self) -> bool:
-        """Rebuild position state from fills log. Returns True on success."""
+        """Rebuild position state from fills log using exact leg quantity accounting."""
         if not os.path.exists(_MTS_FILL_LOG):
             return False
         try:
-            # Find the most recent open trade
             _trades: dict[str, list[dict]] = {}
             with open(_MTS_FILL_LOG) as _f:
                 for _line in _f:
@@ -1950,15 +1949,40 @@ class TMFSpread(StrategyBase):
             if not _trades:
                 return False
 
-            # Find the latest open trade by timestamp
             _latest_open_tid = None
             _latest_open_entries = []
             _latest_ts = ""
+
             for tid, fills in _trades.items():
-                _entry_count = sum(1 for f in fills if f.get("fill_type") == "ENTRY")
-                _exit_count = sum(1 for f in fills if f.get("fill_type") in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"))
-                if _entry_count > _exit_count:
-                    # Find timestamp of first entry fill
+                near_open_qty = sum(int(f.get("qty", 1)) for f in fills if f.get("fill_type") == "ENTRY" and f.get("leg") == "NEAR")
+                far_open_qty = sum(int(f.get("qty", 1)) for f in fills if f.get("fill_type") == "ENTRY" and f.get("leg") == "FAR")
+
+                for f in fills:
+                    ft = f.get("fill_type", "")
+                    leg = f.get("leg", "")
+                    qty = int(f.get("qty", 1))
+                    if ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR") and leg == "NEAR":
+                        near_open_qty -= qty
+                    elif ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_FAR") and leg == "FAR":
+                        far_open_qty -= qty
+
+                # Check for over-close underflow anomaly
+                if near_open_qty < 0 or far_open_qty < 0:
+                    logger.error(
+                        "[COMBINED_EXIT_RECOVERY_QTY_UNDERFLOW] Anomaly detected for trade_id=%s: near_qty=%d far_qty=%d",
+                        tid, near_open_qty, far_open_qty,
+                    )
+
+                # Check if terminal completion event is present
+                has_terminal_completed = any(f.get("fill_type") in ("COMBINED_EXIT_COMPLETED", "TRADE_SETTLED") for f in fills)
+                if has_terminal_completed and (near_open_qty != 0 or far_open_qty != 0):
+                    logger.error(
+                        "[RECOVERY_TERMINAL_EVENT_POSITION_MISMATCH] Terminal completion event seen but remaining open qty != 0 for trade_id=%s (near=%d far=%d)",
+                        tid, near_open_qty, far_open_qty,
+                    )
+                    continue
+
+                if (near_open_qty > 0 or far_open_qty > 0) and not has_terminal_completed:
                     _first_entry_ts = ""
                     for f in fills:
                         if f.get("fill_type") == "ENTRY":
@@ -1980,7 +2004,6 @@ class TMFSpread(StrategyBase):
             if not _entry_fills:
                 return False
 
-            # Determine near/far from entry fills
             _near_entry = _far_entry = 0.0
             _near_side = _far_side = None
             for ef in _entry_fills:
@@ -2005,7 +2028,6 @@ class TMFSpread(StrategyBase):
             self._lifecycle = "OPEN"
             self._position_epoch = _latest_open_tid
 
-            # Process release fills if any
             for rf in _release_fills:
                 _rf_price = rf.get("price")
                 if rf.get("leg") == "NEAR":

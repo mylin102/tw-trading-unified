@@ -287,3 +287,160 @@ def test_order_events_include_policy_j_reason_and_leg_role():
     assert args0["exit_reason"] == "COMBINED_EXIT"
     assert args0["exit_stage"] == "FINAL_EXIT"
     assert args0["reason_source"] == "LIFECYCLE_DECISION"
+
+
+# --- Case 16: Completed combined exit + restart remains FLAT ---
+def test_completed_combined_exit_restart_remains_flat(tmp_path):
+    log_file = str(tmp_path / "mts_fills.jsonl")
+    from strategies.plugins.futures.active.tmf_spread import _append_fill, TMFSpread as TmfSpreadStrategy
+    with patch("strategies.plugins.futures.active.tmf_spread._MTS_FILL_LOG", log_file):
+        _append_fill("TMF", "TMFH6", "NEAR", "BUY", 1, 44000.0, "ENTRY", "trade-100")
+        _append_fill("TMF", "TMFI6", "FAR", "SELL", 1, 44100.0, "ENTRY", "trade-100")
+        _append_fill("TMF", "TMFH6", "NEAR", "SELL", 1, 44050.0, "COMBINED_EXIT_NEAR", "trade-100")
+        _append_fill("TMF", "TMFI6", "FAR", "BUY", 1, 44050.0, "COMBINED_EXIT_FAR", "trade-100")
+        _append_fill("TMF", "TMFH6", "NEAR", "NONE", 0, 0.0, "COMBINED_EXIT_COMPLETED", "trade-100")
+
+        strat = TmfSpreadStrategy()
+        res = strat._restore_from_fills_log()
+        assert res is False
+        assert getattr(strat, "_has_position", False) is False
+
+
+# --- Case 17: Near-only fill + restart remains partially open ---
+def test_near_only_fill_restart_remains_partially_open(tmp_path):
+    log_file = str(tmp_path / "mts_fills.jsonl")
+    from strategies.plugins.futures.active.tmf_spread import _append_fill, TMFSpread as TmfSpreadStrategy
+    with patch("strategies.plugins.futures.active.tmf_spread._MTS_FILL_LOG", log_file):
+        _append_fill("TMF", "TMFH6", "NEAR", "BUY", 1, 44000.0, "ENTRY", "trade-101")
+        _append_fill("TMF", "TMFI6", "FAR", "SELL", 1, 44100.0, "ENTRY", "trade-101")
+        _append_fill("TMF", "TMFH6", "NEAR", "SELL", 1, 44050.0, "COMBINED_EXIT_NEAR", "trade-101")
+
+        strat = TmfSpreadStrategy()
+        res = strat._restore_from_fills_log()
+        assert res is True
+        assert strat._has_position is True
+
+
+# --- Case 18: Far-only fill + restart remains partially open ---
+def test_far_only_fill_restart_remains_partially_open(tmp_path):
+    log_file = str(tmp_path / "mts_fills.jsonl")
+    from strategies.plugins.futures.active.tmf_spread import _append_fill, TMFSpread as TmfSpreadStrategy
+    with patch("strategies.plugins.futures.active.tmf_spread._MTS_FILL_LOG", log_file):
+        _append_fill("TMF", "TMFH6", "NEAR", "BUY", 1, 44000.0, "ENTRY", "trade-102")
+        _append_fill("TMF", "TMFI6", "FAR", "SELL", 1, 44100.0, "ENTRY", "trade-102")
+        _append_fill("TMF", "TMFI6", "FAR", "BUY", 1, 44050.0, "COMBINED_EXIT_FAR", "trade-102")
+
+        strat = TmfSpreadStrategy()
+        res = strat._restore_from_fills_log()
+        assert res is True
+        assert strat._has_position is True
+
+
+# --- Case 19: Quantity = 2 closes only after cumulative qty = 2 ---
+def test_quantity_2_closes_only_after_cumulative_qty_2(tmp_path):
+    log_file = str(tmp_path / "mts_fills.jsonl")
+    from strategies.plugins.futures.active.tmf_spread import _append_fill, TMFSpread as TmfSpreadStrategy
+    with patch("strategies.plugins.futures.active.tmf_spread._MTS_FILL_LOG", log_file):
+        _append_fill("TMF", "TMFH6", "NEAR", "BUY", 2, 44000.0, "ENTRY", "trade-103")
+        _append_fill("TMF", "TMFI6", "FAR", "SELL", 2, 44100.0, "ENTRY", "trade-103")
+        _append_fill("TMF", "TMFH6", "NEAR", "SELL", 1, 44050.0, "COMBINED_EXIT_NEAR", "trade-103")
+        _append_fill("TMF", "TMFI6", "FAR", "BUY", 2, 44050.0, "COMBINED_EXIT_FAR", "trade-103")
+
+        strat = TmfSpreadStrategy()
+        res = strat._restore_from_fills_log()
+        assert res is True
+        assert strat._has_position is True
+
+
+# --- Case 20: Terminal event with non-zero leg qty fails closed ---
+def test_terminal_event_with_nonzero_qty_fails_closed(tmp_path):
+    log_file = str(tmp_path / "mts_fills.jsonl")
+    from strategies.plugins.futures.active.tmf_spread import _append_fill, TMFSpread as TmfSpreadStrategy
+    with patch("strategies.plugins.futures.active.tmf_spread._MTS_FILL_LOG", log_file):
+        _append_fill("TMF", "TMFH6", "NEAR", "BUY", 1, 44000.0, "ENTRY", "trade-104")
+        _append_fill("TMF", "TMFI6", "FAR", "SELL", 1, 44100.0, "ENTRY", "trade-104")
+        _append_fill("TMF", "TMFH6", "NEAR", "SELL", 1, 44050.0, "COMBINED_EXIT_NEAR", "trade-104")
+        _append_fill("TMF", "TMFH6", "NEAR", "NONE", 0, 0.0, "COMBINED_EXIT_COMPLETED", "trade-104")
+
+        strat = TmfSpreadStrategy()
+        res = strat._restore_from_fills_log()
+        assert res is False
+
+
+# --- Case 21: Persisted peak = 1800 restored correctly ---
+def test_persisted_peak_restored_correctly(tmp_path):
+    state_file = str(tmp_path / "mts_position_state.json")
+    log_file = str(tmp_path / "mts_fills.jsonl")
+    import json
+    with open(state_file, "w") as f:
+        json.dump({"trade_id": "trade-105", "peak_net_exit_pnl_twd": 1800.0}, f)
+
+    from strategies.plugins.futures.active.tmf_spread import _append_fill, TMFSpread as TmfSpreadStrategy
+    with patch("strategies.plugins.futures.active.tmf_spread._MTS_FILL_LOG", log_file), \
+         patch("strategies.plugins.futures.active.tmf_spread._get_state_file_path", return_value=state_file):
+        _append_fill("TMF", "TMFH6", "NEAR", "BUY", 1, 44000.0, "ENTRY", "trade-105")
+        _append_fill("TMF", "TMFI6", "FAR", "SELL", 1, 44100.0, "ENTRY", "trade-105")
+
+        strat = TmfSpreadStrategy()
+        res = strat._restore_from_fills_log()
+        assert res is True
+        assert strat._peak_net_exit_pnl_twd == 1800.0
+
+
+# --- Case 22: Missing peak state defaults safely ---
+def test_missing_peak_state_defaults_safely(tmp_path):
+    log_file = str(tmp_path / "mts_fills.jsonl")
+    from strategies.plugins.futures.active.tmf_spread import _append_fill, TMFSpread as TmfSpreadStrategy
+    with patch("strategies.plugins.futures.active.tmf_spread._MTS_FILL_LOG", log_file), \
+         patch("strategies.plugins.futures.active.tmf_spread.TMFSpread._read_mts_state", return_value=None):
+        _append_fill("TMF", "TMFH6", "NEAR", "BUY", 1, 44000.0, "ENTRY", "trade-106")
+        _append_fill("TMF", "TMFI6", "FAR", "SELL", 1, 44100.0, "ENTRY", "trade-106")
+
+        strat = TmfSpreadStrategy()
+        res = strat._restore_from_fills_log()
+        assert res is True
+        assert getattr(strat, "_peak_net_exit_pnl_twd", 0.0) == 0.0
+
+
+# --- Case 23: Corrupted state file fails safe ---
+def test_corrupted_state_file_fails_safe(tmp_path):
+    state_file = str(tmp_path / "mts_position_state.json")
+    with open(state_file, "w") as f:
+        f.write("{corrupted json...")
+
+    from strategies.plugins.futures.active.tmf_spread import TMFSpread as TmfSpreadStrategy
+    with patch("strategies.plugins.futures.active.tmf_spread._get_state_file_path", return_value=state_file):
+        res = TmfSpreadStrategy._read_mts_state()
+        assert res is None
+
+
+# --- Case 24: Duplicate completion records handled idempotently ---
+def test_duplicate_completion_records_handled_idempotently(tmp_path):
+    log_file = str(tmp_path / "mts_fills.jsonl")
+    from strategies.plugins.futures.active.tmf_spread import _append_fill, TMFSpread as TmfSpreadStrategy
+    with patch("strategies.plugins.futures.active.tmf_spread._MTS_FILL_LOG", log_file):
+        _append_fill("TMF", "TMFH6", "NEAR", "BUY", 1, 44000.0, "ENTRY", "trade-107")
+        _append_fill("TMF", "TMFI6", "FAR", "SELL", 1, 44100.0, "ENTRY", "trade-107")
+        _append_fill("TMF", "TMFH6", "NEAR", "SELL", 1, 44050.0, "COMBINED_EXIT_NEAR", "trade-107")
+        _append_fill("TMF", "TMFI6", "FAR", "BUY", 1, 44050.0, "COMBINED_EXIT_FAR", "trade-107")
+        _append_fill("TMF", "TMFH6", "NEAR", "NONE", 0, 0.0, "COMBINED_EXIT_COMPLETED", "trade-107")
+        _append_fill("TMF", "TMFH6", "NEAR", "NONE", 0, 0.0, "COMBINED_EXIT_COMPLETED", "trade-107")
+
+        strat = TmfSpreadStrategy()
+        res = strat._restore_from_fills_log()
+        assert res is False
+        assert getattr(strat, "_has_position", False) is False
+
+
+# --- Case 25: Atomic durable file write ---
+def test_atomic_durable_file_write(tmp_path):
+    state_file = str(tmp_path / "mts_position_state.json")
+    from strategies.plugins.futures.active.tmf_spread import _write_mts_state
+    with patch("strategies.plugins.futures.active.tmf_spread._get_state_file_path", return_value=state_file):
+        _write_mts_state(has_position=True, action="TEST", reason="test_write", trade_id="trade-108", peak_net_exit_pnl_twd=1850.0)
+        import os, json
+        assert os.path.exists(state_file)
+        with open(state_file) as f:
+            data = json.load(f)
+            assert data["trade_id"] == "trade-108"
+            assert data["peak_net_exit_pnl_twd"] == 1850.0
