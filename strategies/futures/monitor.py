@@ -7006,6 +7006,7 @@ class FuturesMonitor:
         # Update expected qty from pending metadata (first fill for each leg sets this)
         strategy = pending.get("strategy")
         if leg == "NEAR":
+            tracker["near_price"] = price
             if tracker["near_expected_qty"] == 0:
                 tracker["near_expected_qty"] = int(pending.get("lots", lots))
             tracker["near_filled_qty"] += lots
@@ -7016,6 +7017,7 @@ class FuturesMonitor:
                     tracker["far_filled_qty"] = tracker["far_expected_qty"]
                     tracker["far_complete"] = True
         else:
+            tracker["far_price"] = price
             if tracker["far_expected_qty"] == 0:
                 tracker["far_expected_qty"] = int(pending.get("lots", lots))
             tracker["far_filled_qty"] += lots
@@ -7077,6 +7079,16 @@ class FuturesMonitor:
                 qty=tracker["far_filled_qty"],
                 price=tracker.get("far_price") or price,
                 fill_type="COMBINED_EXIT",
+                trade_id=trade_id,
+            )
+            _append_fill(
+                ticker=getattr(self, "ticker", "TMF"),
+                contract=self.contract.code if getattr(self, "contract", None) else "NEAR",
+                leg="NEAR",
+                side="NONE",
+                qty=0,
+                price=0.0,
+                fill_type="COMBINED_EXIT_COMPLETED",
                 trade_id=trade_id,
             )
         except Exception as _e:

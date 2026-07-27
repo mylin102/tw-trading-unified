@@ -83,7 +83,8 @@ def make_mock_monitor():
 
 @pytest.fixture(autouse=True)
 def patch_state_path():
-    with patch("strategies.futures.monitor._mts_position_state_path") as mock_path:
+    with patch("strategies.futures.monitor._mts_position_state_path") as mock_path, \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True):
         mock_path.return_value.exists.return_value = False
         yield mock_path
 
