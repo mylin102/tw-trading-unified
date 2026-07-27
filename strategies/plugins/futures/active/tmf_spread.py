@@ -502,6 +502,10 @@ _SETTLEMENT_FAILURE_LATCH = os.getenv(
     "MTS_SETTLEMENT_FAILURE_LATCH",
     "data/runtime/mts_settlement_failure.json",
 )
+_CRITICAL_FAILURE_SENTINEL = os.getenv(
+    "MTS_CRITICAL_FAILURE_SENTINEL",
+    "data/runtime/mts_critical_failure.sentinel",
+)
 
 
 def _append_jsonl_durable(path: str, record: dict) -> None:

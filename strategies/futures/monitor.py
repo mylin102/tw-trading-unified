@@ -7231,8 +7231,23 @@ class FuturesMonitor:
                 return True  # no latch = no reconciliation needed
 
             trade_id = latch.get("trade_id", "")
-            _near_qty = getattr(getattr(self, "trader", None), "position", 0)
-            _far_qty = 0  # far contract position not directly accessible via simple attribute
+            # ADR-024E.1b: Broker query failure -> INDETERMINATE, keep latch
+            _broker_query_ok = True
+            try:
+                _near_qty = getattr(getattr(self, "trader", None), "position", None)
+                if _near_qty is None:
+                    _broker_query_ok = False
+                    _near_qty = -1
+                else:
+                    _near_qty = int(_near_qty)
+            except Exception:
+                _broker_query_ok = False
+                _near_qty = -1
+            if not _broker_query_ok:
+                console.print(f"[bold red] [RECONCILIATION_INDETERMINATE] trade_id={trade_id} "
+                              f"broker query failed - latch retained[/bold red]")
+                return False
+            _far_qty = 0
 
             # Check ledger for terminal record
             from strategies.plugins.futures.active.tmf_spread import _MTS_FILL_LOG
