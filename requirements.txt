@@ -11,6 +11,7 @@ pyyaml
 rich
 pandas_market_calendars
 pydantic
+scikit-learn
 
 # Dashboard & Visualization
 streamlit
