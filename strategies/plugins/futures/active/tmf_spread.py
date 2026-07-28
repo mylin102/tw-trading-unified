@@ -3321,6 +3321,7 @@ class TMFSpread(StrategyBase):
                     "combined_upl_activation_net_pnl_twd": float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
                     "combined_upl_giveback_twd": float(self._params.get("combined_upl_giveback_twd", 100.0)),
                     "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
+                    "combined_exit_execution_enabled": bool(self._params.get("execution_enabled", False)),
                     "last_applied_event_time": self._last_applied_event_time.isoformat() if getattr(self, "_last_applied_event_time", None) else None,
                     "single_leg_started_at": self._single_leg_started_at.isoformat() if getattr(self, "_single_leg_started_at", None) else None,
                 },

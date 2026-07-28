@@ -169,6 +169,7 @@ class LifecycleContext:
     combined_upl_activation_net_pnl_twd: float = 300.0
     combined_upl_giveback_twd: float = 100.0
     peak_net_exit_pnl_twd: float = 0.0
+    combined_exit_execution_enabled: bool = False    # 2026-07-28 Hermes Agent: P0 gate — disableable decision cannot preempt RELEASE
 
 @dataclass(frozen=True)
 class LifecycleEvaluationInput:
@@ -355,7 +356,19 @@ def evaluate_lifecycle_actions(
     candidates.extend(_check_manual_candidate(ctx))
     candidates.extend(_check_stoploss_candidate(ctx))
     candidates.extend(_check_timeout_candidate(ctx))
-    candidates.extend(_check_combined_upl_trail_candidate(ctx, lifecycle)) # Policy J Primary Exit
+
+    # P0: Policy J COMBINED_EXIT must be actionable to preempt downstream exits.
+    # Shadow/non-executable decisions fall through to RELEASE/TRAIL.
+    combined_candidates = _check_combined_upl_trail_candidate(ctx, lifecycle)
+    if combined_candidates and ctx.combined_exit_execution_enabled:
+        candidates.extend(combined_candidates)
+    elif combined_candidates:
+        # Record shadow decision for telemetry but DO NOT block RELEASE/TRAIL
+        logger.info(
+            "[POLICY_J_SHADOW] Combined exit condition met but execution disabled. "
+            "Allowing downstream exit evaluation to proceed."
+        )
+
     candidates.extend(_check_release_candidates(ctx, lifecycle))           # ADR-011 Secondary Fallback
     candidates.extend(_check_trail_candidate(ctx, lifecycle))
 
@@ -511,7 +524,8 @@ class MtsLifecycleAdapter:
         activation_twd = float(state.get("combined_upl_activation_net_pnl_twd", 300.0))
         giveback_twd = float(state.get("combined_upl_giveback_twd", 100.0))
         peak_net_exit_pnl = float(state.get("peak_net_exit_pnl_twd", 0.0))
-        
+        combined_exit_exec_enabled = bool(state.get("combined_exit_execution_enabled", False))
+
         ctx = LifecycleContext(
             near_pnl_pts=near_pnl,
             far_pnl_pts=far_pnl,
@@ -532,6 +546,7 @@ class MtsLifecycleAdapter:
             combined_upl_activation_net_pnl_twd=activation_twd,
             combined_upl_giveback_twd=giveback_twd,
             peak_net_exit_pnl_twd=peak_net_exit_pnl,
+            combined_exit_execution_enabled=combined_exit_exec_enabled,
         )
         
         # Calculate time above breakeven

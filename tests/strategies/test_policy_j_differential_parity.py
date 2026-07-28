@@ -366,3 +366,89 @@ class TestIncidentGoldenVectors:
             if prod_activated and shadow_armed:
                 assert prod_state.peak_net_exit_pnl_twd == shadow_state.peak_net_exit_pnl_twd, \
                     f"seq={seq_num} Activated peak mismatch: prod={prod_state.peak_net_exit_pnl_twd} shadow={shadow_state.peak_net_exit_pnl_twd}"
+
+
+class TestShadowPolicyJMustNotPreemptRelease:
+    """P0: Non-actionable shadow COMBINED_EXIT must never block RELEASE.
+
+    Incident: mts-auto-173516-929. Policy J triggered COMBINED_EXIT but
+    execution_enabled=false. The non-actionable decision preempted RELEASE
+    even though near PnL was -164pt (threshold 85pt).
+    """
+
+    def _make_ctx(self, near_pnl, enable_combined, execution_enabled, peak):
+        from strategies.plugins.futures.active.mts_lifecycle_adapter import LifecycleContext
+        return LifecycleContext(
+            near_pnl_pts=near_pnl,
+            far_pnl_pts=10.0,
+            floating_pnl_pts=near_pnl + 10.0,
+            entry_age_secs=100.0,
+            release_stop_threshold=85.06666666666666,
+            trail_dist=53.16,
+            enable_combined_upl_trail=enable_combined,
+            combined_upl_activation_net_pnl_twd=200.0,
+            combined_upl_giveback_twd=50.0,
+            peak_net_exit_pnl_twd=peak,
+            combined_exit_execution_enabled=execution_enabled,
+            is_backtest=True,
+        )
+
+    def _spread_lifecycle(self):
+        from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+            PositionLifecycle, PositionPhase, ReleaseGroup, ReleaseGroupStatus,
+        )
+        return PositionLifecycle(
+            phase=PositionPhase.SPREAD,
+            release_group=ReleaseGroup(status=ReleaseGroupStatus.ARMED),
+        )
+
+    def test_shadow_policy_j_must_not_preempt_release(self):
+        """Near=-164pt, threshold=85pt, Policy J shadow=True → must return RELEASE."""
+        from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+            LifecycleAction, evaluate_lifecycle_actions,
+        )
+        ctx = self._make_ctx(near_pnl=-164.0, enable_combined=True,
+                             execution_enabled=False, peak=348.0)
+        lc = self._spread_lifecycle()
+        decision = evaluate_lifecycle_actions(ctx, lc)
+        assert decision is not None, "Must produce a decision (RELEASE)"
+        assert decision.action == LifecycleAction.RELEASE, \
+            f"Expected RELEASE, got {decision.action}"
+
+    def test_executable_policy_j_preempts_release(self):
+        """When execution_enabled=True, COMBINED_EXIT has priority."""
+        from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+            LifecycleAction, evaluate_lifecycle_actions,
+        )
+        ctx = self._make_ctx(near_pnl=-164.0, enable_combined=True,
+                             execution_enabled=True, peak=348.0)
+        lc = self._spread_lifecycle()
+        decision = evaluate_lifecycle_actions(ctx, lc)
+        assert decision is not None
+        assert decision.action == LifecycleAction.COMBINED_EXIT, \
+            f"Expected COMBINED_EXIT when executable, got {decision.action}"
+
+    def test_shadow_policy_j_no_release_breach_returns_none(self):
+        """Shadow + no release breach → no actionable decision."""
+        from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+            evaluate_lifecycle_actions,
+        )
+        ctx = self._make_ctx(near_pnl=-50.0, enable_combined=True,
+                             execution_enabled=False, peak=348.0)
+        lc = self._spread_lifecycle()
+        decision = evaluate_lifecycle_actions(ctx, lc)
+        assert decision is None, \
+            f"Expected None when no actionable exit, got {decision}"
+
+    def test_no_policy_j_release_proceeds(self):
+        """Policy J disabled — release check proceeds normally."""
+        from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+            LifecycleAction, evaluate_lifecycle_actions,
+        )
+        ctx = self._make_ctx(near_pnl=-164.0, enable_combined=False,
+                             execution_enabled=False, peak=0.0)
+        lc = self._spread_lifecycle()
+        decision = evaluate_lifecycle_actions(ctx, lc)
+        assert decision is not None
+        assert decision.action == LifecycleAction.RELEASE, \
+            f"Expected RELEASE with no Policy J, got {decision.action}"
