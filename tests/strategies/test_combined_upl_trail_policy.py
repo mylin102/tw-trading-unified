@@ -231,3 +231,102 @@ def test_policy_j_disabled_decision_parity():
         action, new_state = CombinedUplTrailPolicy.evaluate(ctx, state_disabled, config_disabled)
         assert action == CombinedUplTrailAction.NO_ACTION
         assert new_state == state_disabled
+
+
+class TestActivationInvariants:
+    """Verify activation latch and trigger invariants (PR 2)."""
+
+    def test_activation_latches_across_evaluations(self):
+        """activated=True must remain True after PnL falls below threshold."""
+        config = CombinedUplTrailConfig(enabled=True, activation_net_pnl_twd=300.0, giveback_twd=500.0)
+        state = CombinedUplTrailState()
+
+        # Step 1: Net 350 → activates, peak=350
+        ctx = CombinedUplTrailContext(
+            estimated_gross_liquidation_pnl_twd=400.0, estimated_exit_friction_twd=50.0,
+            phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
+            has_exit_inflight=False, quotes_fresh=True,
+        )
+        action, state = CombinedUplTrailPolicy.evaluate(ctx, state, config)
+        assert action == CombinedUplTrailAction.NO_ACTION
+        assert state.activated
+        assert state.peak_net_exit_pnl_twd == 350.0
+
+        # Step 2: Net 50 (well below 300) → activated must remain True
+        ctx_low = CombinedUplTrailContext(
+            estimated_gross_liquidation_pnl_twd=100.0, estimated_exit_friction_twd=50.0,
+            phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
+            has_exit_inflight=False, quotes_fresh=True,
+        )
+        action, state = CombinedUplTrailPolicy.evaluate(ctx_low, state, config)
+        assert action == CombinedUplTrailAction.NO_ACTION
+        assert state.activated, "activation must latch — cannot regress after PnL falls"
+
+    def test_activation_does_not_regress_across_cycles(self):
+        """Multiple evaluations after PnL drop must all preserve activated=True."""
+        config = CombinedUplTrailConfig(enabled=True, activation_net_pnl_twd=300.0, giveback_twd=100.0)
+        state = CombinedUplTrailState()
+
+        # Activate
+        ctx = CombinedUplTrailContext(
+            estimated_gross_liquidation_pnl_twd=400.0, estimated_exit_friction_twd=50.0,
+            phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
+            has_exit_inflight=False, quotes_fresh=True,
+        )
+        _, state = CombinedUplTrailPolicy.evaluate(ctx, state, config)
+        assert state.activated
+
+        # 5 cycles at low PnL — each must preserve activated=True
+        for i in range(5):
+            ctx_low = CombinedUplTrailContext(
+                estimated_gross_liquidation_pnl_twd=100.0, estimated_exit_friction_twd=50.0,
+                phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
+                has_exit_inflight=False, quotes_fresh=True,
+            )
+            _, state = CombinedUplTrailPolicy.evaluate(ctx_low, state, config)
+            assert state.activated, f"activation regressed at cycle {i}"
+
+    def test_trigger_implies_activated(self):
+        """Invariant: would_trigger=True ⇒ activated=True."""
+        config = CombinedUplTrailConfig(enabled=True, activation_net_pnl_twd=200.0, giveback_twd=50.0)
+        state = CombinedUplTrailState()
+
+        # Activate at peak 300
+        ctx_activate = CombinedUplTrailContext(
+            estimated_gross_liquidation_pnl_twd=350.0, estimated_exit_friction_twd=50.0,
+            phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
+            has_exit_inflight=False, quotes_fresh=True,
+        )
+        _, state = CombinedUplTrailPolicy.evaluate(ctx_activate, state, config)
+        assert state.activated
+        assert state.peak_net_exit_pnl_twd == 300.0
+
+        # Trigger at net 200 (giveback = 100 > 50)
+        ctx_trigger = CombinedUplTrailContext(
+            estimated_gross_liquidation_pnl_twd=250.0, estimated_exit_friction_twd=50.0,
+            phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
+            has_exit_inflight=False, quotes_fresh=True,
+        )
+        action, state = CombinedUplTrailPolicy.evaluate(ctx_trigger, state, config)
+        assert action == CombinedUplTrailAction.TRIGGER_COMBINED_EXIT
+        assert state.activated, "Invariant violated: would_trigger=True but activated=False"
+        assert state.triggered
+
+    def test_peak_never_decreases_within_trade(self):
+        """Peak must be monotonic non-decreasing for same trade."""
+        config = CombinedUplTrailConfig(enabled=True, activation_net_pnl_twd=100.0, giveback_twd=200.0)
+        state = CombinedUplTrailState()
+        peaks_seen = []
+
+        for gross in [150.0, 300.0, 450.0, 200.0, 500.0, 100.0]:
+            ctx = CombinedUplTrailContext(
+                estimated_gross_liquidation_pnl_twd=gross, estimated_exit_friction_twd=50.0,
+                phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
+                has_exit_inflight=False, quotes_fresh=True,
+            )
+            _, state = CombinedUplTrailPolicy.evaluate(ctx, state, config)
+            if state.peak_net_exit_pnl_twd is not None:
+                peaks_seen.append(state.peak_net_exit_pnl_twd)
+                if len(peaks_seen) >= 2:
+                    assert peaks_seen[-1] >= peaks_seen[-2], \
+                        f"peak decreased: {peaks_seen[-2]} → {peaks_seen[-1]}"

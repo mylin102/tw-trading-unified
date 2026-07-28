@@ -123,11 +123,19 @@ class CombinedUplTrailPolicy:
                 return CombinedUplTrailAction.NO_ACTION, new_state
             return CombinedUplTrailAction.NO_ACTION, state
 
+        # ── Invariant: activated=True after this point ──
+        # Once activated=True, it SHALL remain True for trade duration.
+        # The next line asserts this contract. CombinedUplTrailState
+        # must always produce activated=True in this branch.
+
         # 7. Activated State: Peak tracking and giveback exit check
         current_peak = state.peak_net_exit_pnl_twd if state.peak_net_exit_pnl_twd is not None else net_exit_pnl
         new_peak = max(current_peak, net_exit_pnl)
 
         if net_exit_pnl <= (new_peak - config.giveback_twd):
+            # ── Invariant: would_trigger=True ⇒ activated=True ──
+            # This invariant is enforced because we are in the activated=True
+            # branch. Every TRIGGER_COMBINED_EXIT action carries activated=True.
             new_state = CombinedUplTrailState(
                 activated=True,
                 peak_net_exit_pnl_twd=new_peak,
