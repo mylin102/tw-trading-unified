@@ -2744,7 +2744,10 @@ class TMFSpread(StrategyBase):
             if not self._trade_id:
                 self._trade_id = bar.get("trade_id")
             
-            return self._manage_position(near_close, far_close, bar.get("spread_z"), now, bar)
+            # ── PR 6.5: Policy J evaluation driver (tick-level, decoupled from _manage_position cadence) ──
+            self._evaluate_policy_j(context)
+            
+            return self._manage_position(near_close, far_close, spread_z, now, bar)
 
         # ── Staleness gate (only for new entry) ──
         atr = bar.get("atr", 0.0)
@@ -3011,6 +3014,124 @@ class TMFSpread(StrategyBase):
             trail_dist = single_decision.final_trail_dist_pts
             
         return release_stop, trail_dist, single_decision
+
+    def _evaluate_policy_j(self, context) -> None:
+        """PR 6.5: Tick-level Policy J evaluation driver.
+        
+        Runs independently of _manage_position cadence. Evaluates on every
+        coherent tick when position is in SPREAD phase with both legs open.
+        Updates strategy-level Policy J state, writes snapshot, persists state.
+        """
+        _now = datetime.now()
+        _bar = context.market.last_bar
+        if _bar is None:
+            return
+        _near_close_val = _bar.get("near_close")
+        _far_close_val = _bar.get("far_close")
+        if _near_close_val is None or _far_close_val is None:
+            return
+        _near_close = float(_near_close_val)
+        _far_close = float(_far_close_val)
+        
+        # Determine phase and leg status
+        _phase = self._lifecycle_oca.phase if self._lifecycle_oca else None
+        _both_legs_open = (getattr(self, "_near_open_qty", 0) > 0
+                          and getattr(self, "_far_open_qty", 0) > 0)
+        
+        # Lazy-init counters
+        if not hasattr(self, "_pj_evaluation_count"):
+            self._pj_evaluation_count = 0
+        
+        # Always increment the evaluation counter (heartbeat evidence)
+        self._pj_evaluation_count += 1
+        self._pj_last_evaluation_at = _now
+        
+        # Only evaluate Policy J when in SPREAD with both legs open
+        if _phase != PositionPhase.SPREAD or not _both_legs_open:
+            return
+        
+        try:
+            _current_pnl = self._get_current_pnl_pts(_near_close, _far_close)
+            _current_net_exit_twd = float(_current_pnl * 10.0 - 92.0)
+            
+            _prev_peak = getattr(self, "_peak_net_exit_pnl_twd", 0.0) or 0.0
+            _new_peak = max(_prev_peak, _current_net_exit_twd)
+            self._peak_net_exit_pnl_twd = _new_peak
+            
+            # Lazy-init PJ state attributes
+            for attr in ["_pj_activated", "_pj_triggered"]:
+                if not hasattr(self, attr):
+                    setattr(self, attr, False)
+            if not hasattr(self, "_pj_trigger_event_id"):
+                self._pj_trigger_event_id = None
+            
+            # Determine activated/triggered from peak vs threshold
+            _activation_twd = float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0))
+            _giveback_twd = float(self._params.get("combined_upl_giveback_twd", 100.0))
+            
+            _activated = self._pj_activated or (_new_peak >= _activation_twd)
+            self._pj_activated = _activated
+            
+            _would_trigger = False
+            if _activated and _current_net_exit_twd <= (_new_peak - _giveback_twd):
+                _would_trigger = True
+                if self._pj_trigger_event_id is None:
+                    self._pj_trigger_event_id = f"{getattr(self, '_trade_id', '?')}:{self._pj_evaluation_count}"
+                self._pj_triggered = True
+            
+            # Build snapshot
+            import json as _pj_json
+            import os as _pj_os
+            
+            _snap = {
+                "snapshot_id": _now.isoformat(),
+                "trade_id": getattr(self, "_trade_id", ""),
+                "event_time": _now.isoformat(),
+                "processed_at": _now.isoformat(),
+                "lifecycle_phase": str(_phase.value) if hasattr(_phase, "value") else "",
+                "evaluator_invoked": True,
+                "position_ready": True,
+                "peak_net_exit_pnl_twd": _new_peak,
+                "current_net_exit_twd": _current_net_exit_twd,
+                "activation_net_pnl_twd": _activation_twd,
+                "giveback_twd": _giveback_twd,
+                "exit_line_twd": max(0.0, _new_peak - _giveback_twd),
+                "enabled": self._params.get("enable_combined_upl_trail", False),
+                "eligible": True,
+                "activated": _activated,
+                "would_trigger": _would_trigger,
+                "evaluation_count": self._pj_evaluation_count,
+            }
+            
+            _tmp = "/tmp/policy_j_snapshot.json"
+            _tmp2 = _tmp + ".tmp"
+            with open(_tmp2, "w") as _f:
+                _pj_json.dump(_snap, _f, default=str, indent=2)
+            _pj_os.replace(_tmp2, _tmp)
+            
+            self._pj_last_snapshot_at = _now
+            
+            # Persist to MTS state file
+            try:
+                _state_path = _get_state_file_path()
+                if _state_path and os.path.exists(_state_path):
+                    with open(_state_path, "r") as _sf:
+                        _mts = _pj_json.load(_sf)
+                    _mts["policy_j"] = {
+                        "activated": _activated,
+                        "peak_net_exit_pnl_twd": _new_peak,
+                        "triggered": _would_trigger,
+                        "trade_id": getattr(self, "_trade_id", ""),
+                        "evaluation_count": self._pj_evaluation_count,
+                    }
+                    _mts_tmp = str(_state_path) + ".pj_tmp"
+                    with open(_mts_tmp, "w") as _sfw:
+                        _pj_json.dump(_mts, _sfw, indent=2)
+                    _pj_os.replace(_mts_tmp, _state_path)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _manage_position(
         self, near_close: float, far_close: float, spread_z: Any, now: datetime,
