@@ -3360,7 +3360,31 @@ elif _selected_product == "TMF":
             st.caption("🟡 指標數據尚未產出，顯示訂閱即時價格")
         else:
             st.info("無數據")
-        # ── MTS buttons (always show when MTS enabled, regardless of f_df) ──
+
+    # ── MTS live near/far prices (always show when position open) ──
+    # 2026-07-28 Hermes Agent: Moved outside fallback else-branch
+    _mts_price_file = "/tmp/mts_position_state.json"
+    _near_live = None
+    _far_live = None
+    _has_position = False
+    try:
+        if os.path.exists(_mts_price_file):
+            with open(_mts_price_file) as _pf:
+                _ps = json.load(_pf)
+            _near_live = _ps.get("near_last")
+            _far_live = _ps.get("far_last")
+            _has_position = _ps.get("has_position", False)
+    except Exception:
+        pass
+    if _has_position and (_near_live or _far_live):
+        _nl1, _nl2 = st.columns(2)
+        if _near_live:
+            _nl1.metric("近月 (TMF 即時)", f"{_near_live:.0f}")
+        if _far_live:
+            _nl2.metric("遠月 (TMF 即時)", f"{_far_live:.0f}")
+        st.caption("🟡 MTS 即時行情")
+
+    # ── MTS buttons (always show when MTS enabled, regardless of f_df) ──
         try:
             with open(FUTURES_CFG_PATH) as _f:
                 _mts_on = yaml.safe_load(_f).get("mts", {}).get("enabled", False)
