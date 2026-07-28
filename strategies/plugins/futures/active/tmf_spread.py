@@ -1528,19 +1528,8 @@ class TMFSpread(StrategyBase):
 
             stop = atr * self._atr_mult_stop
             
-            # 2026-06-26 Gemini CLI: Dynamic MFE-based trail multiplier adjustment
-            trail_mult = self._atr_mult_trail
-            mfe_tighten = self._params.get("mfe_tighten", {})
-            if mfe_tighten.get("enabled", False):
-                mfe_pts = getattr(self, "_mfe_pts", 0.0)
-                level_2_atr = float(mfe_tighten.get("level_2_atr", 3.0))
-                level_1_atr = float(mfe_tighten.get("level_1_atr", 2.0))
-                if mfe_pts >= level_2_atr * atr:
-                    trail_mult = float(mfe_tighten.get("level_2_trail_mult", 1.2))
-                elif mfe_pts >= level_1_atr * atr:
-                    trail_mult = float(mfe_tighten.get("level_1_trail_mult", 1.6))
-            
-            trail = atr * trail_mult
+            # 2026-06-26 Gemini CLI: Trail multiplier — single source of truth is atr_multiplier_trail
+            trail = atr * self._atr_mult_trail
             # Ensure sensible bounds for TMF (Micro Taiwan Index)
             # Tiered floors: Stop needs 10pt safety, Trail needs 20pt room to breathe
             return max(10.0, stop), max(20.0, trail)

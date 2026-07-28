@@ -1,49 +1,60 @@
-"""Regression tests: MFE trail baseline and mfe_tighten disablement.
+"""Regression tests: remaining-leg trail must respect config atr_multiplier_trail.
 
-2026-07-28: PR 6.6B — rollback unvalidated MFE adaptive trail widening.
-mfe_tighten introduced at commit 8a4897ae without ADR, tests, or replay.
-Production trail must default to base atr_multiplier_trail (0.2 × ATR).
+2026-07-28: PR 6.6B — remove unvalidated MFE adaptive trail widening.
+mfe_tighten introduced at 8a4897ae (AI-generated, no ADR/tests/replay)
+overrode atr_multiplier_trail with 1.2-1.6× ATR after MFE >= 2-3 ATR.
+
+Rollback target:  MFE-based multiplier override
+Retained:         Config-driven remaining-leg trailing stop (atr_multiplier_trail)
+Not allowed:      Hard-coded ATR multiplier
 """
 import pytest
 
 
-def test_default_trail_uses_base_atr_multiplier():
-    """With mfe_tighten disabled, trail must be atr * base_mult (0.2)."""
-    import pandas as pd
+def _make_strategy(atr_mult_trail: float = 0.2,
+                   atr_mult_stop: float = 0.8):
+    """Construct a minimal TMFSpread instance for threshold testing."""
+    import pandas as pd  # noqa: F401 — tmf_spread imports it at module level
     from strategies.plugins.futures.active.tmf_spread import TMFSpread
 
     strategy = TMFSpread.__new__(TMFSpread)
-    strategy._atr_mult_trail = 0.2
-    strategy._atr_mult_stop = 0.8
-    strategy._params = {"mfe_tighten": {"enabled": False}}
-    strategy._last_atr = 113.9
+    strategy._atr_mult_trail = atr_mult_trail
+    strategy._atr_mult_stop = atr_mult_stop
+    strategy._params = {}
+    strategy._last_atr = 100.0
     strategy._release_stop_fixed = 88.0
     strategy._trail_dist_fixed = 60.0
-
-    bar = {"atr": 113.9}
-    stop, trail = strategy._get_thresholds(bar)
-
-    expected_trail = 113.9 * 0.2  # = 22.78
-    assert trail == pytest.approx(expected_trail, rel=0.01), \
-        f"Expected trail={expected_trail:.2f}, got {trail:.2f}"
-    assert stop == pytest.approx(113.9 * 0.8, rel=0.01)
+    strategy._mfe_pts = 0.0
+    strategy._atr_cap = 0.0
+    return strategy
 
 
-def test_disabled_mfe_adaptation_cannot_change_trail():
-    """MFE adaptation must not affect trail when enabled=false."""
-    import pandas as pd
-    from strategies.plugins.futures.active.tmf_spread import TMFSpread
+@pytest.mark.parametrize("configured_mult", [0.2, 0.5, 0.8])
+@pytest.mark.parametrize("mfe_atr", [0.0, 2.0, 3.0, 10.0])
+def test_remaining_leg_trail_always_uses_configured_multiplier(
+    configured_mult: float, mfe_atr: float,
+):
+    """Remaining-leg trail must equal atr * configured atr_multiplier_trail,
+    regardless of MFE level (no mfe_tighten override)."""
+    atr = 100.0
+    strategy = _make_strategy(atr_mult_trail=configured_mult)
+    strategy._mfe_pts = mfe_atr * atr
 
-    strategy = TMFSpread.__new__(TMFSpread)
-    strategy._atr_mult_trail = 0.2
+    _, trail = strategy._get_thresholds({"atr": atr})
+
+    assert trail == pytest.approx(atr * configured_mult, rel=0.01), \
+        f"configured_mult={configured_mult} mfe_atr={mfe_atr}: " \
+        f"expected trail={atr * configured_mult:.2f}, got {trail:.2f}"
+
+
+@pytest.mark.parametrize("configured_mult", [0.2, 0.5, 0.8])
+def test_stop_unaffected_by_trail_mult(configured_mult: float):
+    """Release stop must remain atr * atr_mult_stop regardless of trail_mult."""
+    atr = 100.0
+    strategy = _make_strategy(atr_mult_trail=configured_mult)
     strategy._atr_mult_stop = 0.8
-    strategy._params = {"mfe_tighten": {"enabled": False}}
-    strategy._last_atr = 113.9
-    strategy._release_stop_fixed = 88.0
-    strategy._trail_dist_fixed = 60.0
 
-    for mfe_pts in [0, 2 * 113.9, 3 * 113.9, 10 * 113.9]:
-        strategy._mfe_pts = mfe_pts
-        _, trail = strategy._get_thresholds({"atr": 113.9})
-        assert trail == pytest.approx(22.78, rel=0.01), \
-            f"MFE={mfe_pts:.0f} changed trail to {trail:.2f} (expected 22.78)"
+    stop, _ = strategy._get_thresholds({"atr": atr})
+
+    assert stop == pytest.approx(80.0, rel=0.01), \
+        f"expected stop=80.0, got {stop:.2f} (configured_mult={configured_mult})"
