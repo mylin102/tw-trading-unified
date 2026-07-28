@@ -3548,8 +3548,8 @@ elif _selected_product == "TMF":
                 _atr_info = f" (ATR: `{_current_atr:.1f}`)" if _current_atr else ""
                 if _stop_pts or _trail_pts:
                     _p1, _p2 = st.columns(2)
-                    if _stop_pts: _p1.markdown(f"🛑 **單腿釋放停損閾值**: `{_stop_pts}` 點{_atr_info}")
-                    if _trail_pts: _p2.markdown(f"📈 **剩餘腿移動止盈距離**: `{_trail_pts}` 點{_atr_info}")
+                    if _stop_pts: _p1.markdown(f"🛑 **第一腿 ATR 停損**: `{_stop_pts}` 點{_atr_info}")
+                    if _trail_pts: _p2.markdown(f"📈 **剩餘腿 ATR 移動停利**: `{_trail_pts}` 點{_atr_info}")
 
                 # ── Unrealized PnL Breakdown ──
                 st.markdown("**MTS 未實現損益 (Unrealized PnL)**")
@@ -5690,22 +5690,22 @@ elif page == "設定":
                 _mts_params = futures_cfg.get("mts", {}).get("params", {})
                 
                 m1, m2 = st.columns(2)
-                f_mts_min_atr = m1.number_input("MTS 最低 ATR 限制", min_value=1.0, max_value=100.0, 
+                f_mts_min_atr = m1.number_input("MTS 進場最低 ATR", min_value=1.0, max_value=100.0, 
                                                value=float(_mts_params.get("min_atr", 10.0)), step=1.0)
                 f_mts_atr_cap = m2.number_input("MTS ATR 上限 (Cap)", min_value=10.0, max_value=500.0, 
                                                value=float(_mts_params.get("atr_cap", 100.0)), step=10.0)
                 
                 m3, m4 = st.columns(2)
                 # 2026-05-27 Gemini CLI: Updated labels for clarity (ATR Release and ATR Exit)
-                f_mts_mult_stop = m3.slider("MTS 釋放倍數 (ATR Release)", 0.5, 3.0, 
+                f_mts_mult_stop = m3.slider("MTS 停損倍數 (×ATR)", 0.5, 3.0, 
                                             value=float(_mts_params.get("atr_multiplier_stop", 1.0)), step=0.1)
-                f_mts_mult_trail = m4.slider("MTS 停利倍數 (ATR Exit)", 0.1, 10.0, 
+                f_mts_mult_trail = m4.slider("MTS 停利倍數 (×ATR)", 0.1, 10.0, 
                                              value=float(_mts_params.get("atr_multiplier_trail", 3.5)), step=0.1)
                 
                 m5, m6 = st.columns(2)
-                f_mts_stop_fixed = m5.number_input("MTS 固定釋放點數 (pts)", min_value=5, max_value=500, 
+                f_mts_stop_fixed = m5.number_input("MTS 固定停損點數", min_value=5, max_value=500, 
                                                  value=int(_mts_params.get("release_stop_points", 20)))
-                f_mts_trail_fixed = m6.number_input("MTS 固定停利點數 (pts)", min_value=10, max_value=200, 
+                f_mts_trail_fixed = m6.number_input("MTS 固定停利點數 + floor", min_value=10, max_value=200, 
                                                   value=int(_mts_params.get("trail_distance_points", 30)))
                 
                 st.markdown("###### 🛡️ Policy J 組合移動停利 (Combined UPL Trailing Exit)")
