@@ -258,6 +258,12 @@ def clear_bidask_callback(api: sj.Shioaji):
         api.set_on_bidask_fop_v1_callback(None)
 
 def safe_subscribe(api: sj.Shioaji, contract: Any, quote_type: str = 'tick'):
+    from core.market_data_health_registry import record_subscribe
+    try:
+        code = contract.code if hasattr(contract, "code") else str(contract)
+        record_subscribe(code, quote_type, "ATTEMPTED")
+    except Exception:
+        pass
     """Subscribe to market data using version-appropriate method."""
     if is_rust_version():
         # rshioaji 1.5.x
