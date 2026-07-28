@@ -5,6 +5,11 @@ from enum import Enum
 from typing import Any
 
 from strategies.plugins.futures.active.mts_lifecycle_adapter import PositionPhase
+from strategies.futures.mts.quote_coherence import (
+    QuoteCoherenceInput,
+    QuoteCoherenceReason,
+    evaluate_quote_coherence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +63,10 @@ class CombinedUplTrailContext:
     near_open_qty: int
     far_open_qty: int
     has_exit_inflight: bool
-    quotes_fresh: bool
+    near_quote_age_ms: int | None = None
+    far_quote_age_ms: int | None = None
+    max_quote_age_ms: int = 1000
+    max_pair_skew_ms: int = 500
 
 
 def estimate_net_exit_pnl_twd(
@@ -101,8 +109,19 @@ class CombinedUplTrailPolicy:
         if ctx.phase != PositionPhase.SPREAD or ctx.near_open_qty <= 0 or ctx.far_open_qty <= 0:
             return CombinedUplTrailAction.NO_ACTION, state
 
-        # 4. Market & Execution Quality Guards
-        if ctx.has_exit_inflight or not ctx.quotes_fresh:
+        # 4. Market & Execution Quality Guards (Shared quote coherence contract)
+        _qc_input = QuoteCoherenceInput(
+            near_quote_age_ms=ctx.near_quote_age_ms,
+            far_quote_age_ms=ctx.far_quote_age_ms,
+            max_quote_age_ms=ctx.max_quote_age_ms,
+            near_open_qty=ctx.near_open_qty,
+            far_open_qty=ctx.far_open_qty,
+            is_spread_phase=(ctx.phase == PositionPhase.SPREAD),
+            has_exit_inflight=ctx.has_exit_inflight,
+            gross_pnl=ctx.estimated_gross_liquidation_pnl_twd,
+        )
+        _qc = evaluate_quote_coherence(_qc_input)
+        if not _qc.fresh or not _qc.coherent:
             return CombinedUplTrailAction.NO_ACTION, state
 
         # 5. Calculate Net Exit PnL

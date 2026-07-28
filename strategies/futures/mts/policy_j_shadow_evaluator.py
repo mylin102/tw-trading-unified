@@ -8,6 +8,11 @@ from strategies.futures.mts.policy_j_telemetry_schema import (
     PolicyJShadowSignal,
     PolicyJShadowSnapshot,
 )
+from strategies.futures.mts.quote_coherence import (
+    QuoteCoherenceInput,
+    QuoteCoherenceReason,
+    evaluate_quote_coherence,
+)
 
 
 @dataclass(frozen=True)
@@ -192,42 +197,44 @@ class PolicyJShadowEvaluator:
             )
             return snapshot, new_state
 
-        # Gate 4: Quote Freshness Check (Stale quotes MUST NOT update peak or trigger)
-        near_stale = (obs.near_quote_age_ms is None) or (obs.near_quote_age_ms > obs.max_quote_age_ms)
-        far_stale = (obs.far_quote_age_ms is None) or (obs.far_quote_age_ms > obs.max_quote_age_ms)
+        # Gate 4: Quote Freshness & Coherence (shared contract with production evaluator)
+        _qc_input = QuoteCoherenceInput(
+            near_quote_age_ms=obs.near_quote_age_ms,
+            far_quote_age_ms=obs.far_quote_age_ms,
+            max_quote_age_ms=obs.max_quote_age_ms,
+            has_exit_inflight=obs.exit_inflight,
+            gross_pnl=obs.gross_liquidation_pnl_twd,
+        )
+        _qc = evaluate_quote_coherence(_qc_input)
 
-        if near_stale or far_stale:
-            reason = (
-                EligibilityReason.BOTH_QUOTES_STALE if (near_stale and far_stale)
-                else (EligibilityReason.NEAR_QUOTE_STALE if near_stale else EligibilityReason.FAR_QUOTE_STALE)
-            )
-            snapshot = PolicyJShadowSnapshot(
-                sequence_no=next_seq,
-                trade_id=obs.trade_id,
-                event_time=obs.event_time,
-                processed_at=obs.processed_at,
-                mode="SHADOW_ONLY",
-                eligible=False,
-                eligibility_reason=reason.value,
-                activation_net_pnl_twd=activation_twd,
-                giveback_twd=giveback_twd,
-                would_trigger=False,
-                execution_blocked=True,
-                near_quote_age_ms=obs.near_quote_age_ms,
-                far_quote_age_ms=obs.far_quote_age_ms,
-                config_hash=obs.config_hash,
-                shadow_signal=PolicyJShadowSignal.NO_SIGNAL.value,
-            )
-            # Retain previous peak without updating
-            new_state = PolicyJShadowState(
-                trade_id=current_state.trade_id,
-                peak_net_exit_pnl_twd=current_state.peak_net_exit_pnl_twd,
-                sequence_no=next_seq,
-                armed=current_state.armed,
-                would_trigger_emitted=current_state.would_trigger_emitted,
-                last_event_key=current_state.last_event_key,
-            )
-            return snapshot, new_state
+        if not _qc.fresh or not _qc.coherent:
+            if _qc.reason not in (QuoteCoherenceReason.READY.value,):
+                snapshot = PolicyJShadowSnapshot(
+                    sequence_no=next_seq,
+                    trade_id=obs.trade_id,
+                    event_time=obs.event_time,
+                    processed_at=obs.processed_at,
+                    mode="SHADOW_ONLY",
+                    eligible=False,
+                    eligibility_reason=_qc.reason,
+                    activation_net_pnl_twd=activation_twd,
+                    giveback_twd=giveback_twd,
+                    would_trigger=False,
+                    execution_blocked=True,
+                    near_quote_age_ms=obs.near_quote_age_ms,
+                    far_quote_age_ms=obs.far_quote_age_ms,
+                    config_hash=obs.config_hash,
+                    shadow_signal=PolicyJShadowSignal.NO_SIGNAL.value,
+                )
+                new_state = PolicyJShadowState(
+                    trade_id=current_state.trade_id,
+                    peak_net_exit_pnl_twd=current_state.peak_net_exit_pnl_twd,
+                    sequence_no=next_seq,
+                    armed=current_state.armed,
+                    would_trigger_emitted=current_state.would_trigger_emitted,
+                    last_event_key=current_state.last_event_key,
+                )
+                return snapshot, new_state
 
         # Step 5 & 6 & 7: Liquidation Valuation, Friction, Net Exit PnL
         gross = obs.gross_liquidation_pnl_twd if obs.gross_liquidation_pnl_twd is not None else 0.0

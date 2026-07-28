@@ -48,7 +48,7 @@ def test_policy_j_disabled_by_default_safety_gate():
         near_open_qty=1,
         far_open_qty=1,
         has_exit_inflight=False,
-        quotes_fresh=True,
+        near_quote_age_ms=0, far_quote_age_ms=0,
     )
     action, new_state = CombinedUplTrailPolicy.evaluate(ctx, state, config)
     assert action == CombinedUplTrailAction.NO_ACTION
@@ -69,7 +69,7 @@ def test_policy_j_non_spread_phase_guard():
             near_open_qty=1 if phase == PositionPhase.SINGLE_LEG else 0,
             far_open_qty=0,
             has_exit_inflight=False,
-            quotes_fresh=True,
+            near_quote_age_ms=0, far_quote_age_ms=0,
         )
         action, new_state = CombinedUplTrailPolicy.evaluate(ctx, state, config)
         assert action == CombinedUplTrailAction.NO_ACTION
@@ -89,7 +89,7 @@ def test_policy_j_market_quality_guards():
         near_open_qty=1,
         far_open_qty=1,
         has_exit_inflight=True,
-        quotes_fresh=True,
+        near_quote_age_ms=0, far_quote_age_ms=0,
     )
     action, new_state = CombinedUplTrailPolicy.evaluate(ctx_inflight, state, config)
     assert action == CombinedUplTrailAction.NO_ACTION
@@ -103,7 +103,7 @@ def test_policy_j_market_quality_guards():
         near_open_qty=1,
         far_open_qty=1,
         has_exit_inflight=False,
-        quotes_fresh=False,
+        near_quote_age_ms=9999, far_quote_age_ms=0,
     )
     action, new_state = CombinedUplTrailPolicy.evaluate(ctx_stale, state, config)
     assert action == CombinedUplTrailAction.NO_ACTION
@@ -123,7 +123,7 @@ def test_policy_j_activation_and_peak_tracking():
         near_open_qty=1,
         far_open_qty=1,
         has_exit_inflight=False,
-        quotes_fresh=True,
+        near_quote_age_ms=0, far_quote_age_ms=0,
     )
     action, state = CombinedUplTrailPolicy.evaluate(ctx_below, state, config)
     assert action == CombinedUplTrailAction.NO_ACTION
@@ -137,7 +137,7 @@ def test_policy_j_activation_and_peak_tracking():
         near_open_qty=1,
         far_open_qty=1,
         has_exit_inflight=False,
-        quotes_fresh=True,
+        near_quote_age_ms=0, far_quote_age_ms=0,
     )
     action, state = CombinedUplTrailPolicy.evaluate(ctx_activate, state, config)
     assert action == CombinedUplTrailAction.NO_ACTION
@@ -152,7 +152,7 @@ def test_policy_j_activation_and_peak_tracking():
         near_open_qty=1,
         far_open_qty=1,
         has_exit_inflight=False,
-        quotes_fresh=True,
+        near_quote_age_ms=0, far_quote_age_ms=0,
     )
     action, state = CombinedUplTrailPolicy.evaluate(ctx_high, state, config)
     assert action == CombinedUplTrailAction.NO_ACTION
@@ -166,7 +166,7 @@ def test_policy_j_activation_and_peak_tracking():
         near_open_qty=1,
         far_open_qty=1,
         has_exit_inflight=False,
-        quotes_fresh=True,
+        near_quote_age_ms=0, far_quote_age_ms=0,
     )
     action, state = CombinedUplTrailPolicy.evaluate(ctx_minor_drop, state, config)
     assert action == CombinedUplTrailAction.NO_ACTION
@@ -181,7 +181,7 @@ def test_policy_j_activation_and_peak_tracking():
         near_open_qty=1,
         far_open_qty=1,
         has_exit_inflight=False,
-        quotes_fresh=True,
+        near_quote_age_ms=0, far_quote_age_ms=0,
     )
     action, state = CombinedUplTrailPolicy.evaluate(ctx_trigger, state, config)
     assert action == CombinedUplTrailAction.TRIGGER_COMBINED_EXIT
@@ -199,7 +199,7 @@ def test_policy_j_idempotency_and_serialization():
         near_open_qty=1,
         far_open_qty=1,
         has_exit_inflight=False,
-        quotes_fresh=True,
+        near_quote_age_ms=0, far_quote_age_ms=0,
     )
 
     # Idempotency
@@ -225,8 +225,7 @@ def test_policy_j_disabled_decision_parity():
             phase=PositionPhase.SPREAD,
             near_open_qty=1,
             far_open_qty=1,
-            has_exit_inflight=False,
-            quotes_fresh=True,
+            has_exit_inflight=False, near_quote_age_ms=0, far_quote_age_ms=0,
         )
         action, new_state = CombinedUplTrailPolicy.evaluate(ctx, state_disabled, config_disabled)
         assert action == CombinedUplTrailAction.NO_ACTION
@@ -245,7 +244,7 @@ class TestActivationInvariants:
         ctx = CombinedUplTrailContext(
             estimated_gross_liquidation_pnl_twd=400.0, estimated_exit_friction_twd=50.0,
             phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
-            has_exit_inflight=False, quotes_fresh=True,
+            has_exit_inflight=False, near_quote_age_ms=0, far_quote_age_ms=0,
         )
         action, state = CombinedUplTrailPolicy.evaluate(ctx, state, config)
         assert action == CombinedUplTrailAction.NO_ACTION
@@ -256,7 +255,7 @@ class TestActivationInvariants:
         ctx_low = CombinedUplTrailContext(
             estimated_gross_liquidation_pnl_twd=100.0, estimated_exit_friction_twd=50.0,
             phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
-            has_exit_inflight=False, quotes_fresh=True,
+            has_exit_inflight=False, near_quote_age_ms=0, far_quote_age_ms=0,
         )
         action, state = CombinedUplTrailPolicy.evaluate(ctx_low, state, config)
         assert action == CombinedUplTrailAction.NO_ACTION
@@ -271,7 +270,7 @@ class TestActivationInvariants:
         ctx = CombinedUplTrailContext(
             estimated_gross_liquidation_pnl_twd=400.0, estimated_exit_friction_twd=50.0,
             phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
-            has_exit_inflight=False, quotes_fresh=True,
+            has_exit_inflight=False, near_quote_age_ms=0, far_quote_age_ms=0,
         )
         _, state = CombinedUplTrailPolicy.evaluate(ctx, state, config)
         assert state.activated
@@ -281,7 +280,7 @@ class TestActivationInvariants:
             ctx_low = CombinedUplTrailContext(
                 estimated_gross_liquidation_pnl_twd=100.0, estimated_exit_friction_twd=50.0,
                 phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
-                has_exit_inflight=False, quotes_fresh=True,
+                has_exit_inflight=False, near_quote_age_ms=0, far_quote_age_ms=0,
             )
             _, state = CombinedUplTrailPolicy.evaluate(ctx_low, state, config)
             assert state.activated, f"activation regressed at cycle {i}"
@@ -295,7 +294,7 @@ class TestActivationInvariants:
         ctx_activate = CombinedUplTrailContext(
             estimated_gross_liquidation_pnl_twd=350.0, estimated_exit_friction_twd=50.0,
             phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
-            has_exit_inflight=False, quotes_fresh=True,
+            has_exit_inflight=False, near_quote_age_ms=0, far_quote_age_ms=0,
         )
         _, state = CombinedUplTrailPolicy.evaluate(ctx_activate, state, config)
         assert state.activated
@@ -305,7 +304,7 @@ class TestActivationInvariants:
         ctx_trigger = CombinedUplTrailContext(
             estimated_gross_liquidation_pnl_twd=250.0, estimated_exit_friction_twd=50.0,
             phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
-            has_exit_inflight=False, quotes_fresh=True,
+            has_exit_inflight=False, near_quote_age_ms=0, far_quote_age_ms=0,
         )
         action, state = CombinedUplTrailPolicy.evaluate(ctx_trigger, state, config)
         assert action == CombinedUplTrailAction.TRIGGER_COMBINED_EXIT
@@ -322,7 +321,7 @@ class TestActivationInvariants:
             ctx = CombinedUplTrailContext(
                 estimated_gross_liquidation_pnl_twd=gross, estimated_exit_friction_twd=50.0,
                 phase=PositionPhase.SPREAD, near_open_qty=1, far_open_qty=1,
-                has_exit_inflight=False, quotes_fresh=True,
+                has_exit_inflight=False, near_quote_age_ms=0, far_quote_age_ms=0,
             )
             _, state = CombinedUplTrailPolicy.evaluate(ctx, state, config)
             if state.peak_net_exit_pnl_twd is not None:
