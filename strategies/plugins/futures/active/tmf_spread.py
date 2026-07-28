@@ -3143,21 +3143,21 @@ class TMFSpread(StrategyBase):
             else:
                 _rem_high = _rem_low = 0.0
             # ── P0: Policy J Peak Update Readiness ──
-            # Peak updates begin immediately when position is fully established.
-            # No time-based warmup — readiness is determined by:
-            # both legs open + SPREAD phase.
-            _ce_eligible = False
+            # Peak tracking eligibility:
+            # - SPREAD phase with both legs filled
+            # - Not exit inflight (checked earlier in pipeline)
+            # - Quote coherence is enforced by the Policy J evaluator
+            _peak_eligible = False
             _phase = self._lifecycle_oca.phase if self._lifecycle_oca else None
             _both_legs_open = (getattr(self, "_near_open_qty", 0) > 0
                               and getattr(self, "_far_open_qty", 0) > 0)
             if _phase == PositionPhase.SPREAD and _both_legs_open:
-                _ce_eligible = True
+                _peak_eligible = True
             elif _phase == PositionPhase.SINGLE_LEG:
-                # Single-leg: peak is always eligible (entry already established)
-                _ce_eligible = True
-            
+                _peak_eligible = True
+
             _current_net_exit_twd = float(current_pnl * 10.0 - 92.0)
-            if _ce_eligible:
+            if _peak_eligible:
                 if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None:
                     self._peak_net_exit_pnl_twd = 0.0
                 if _current_net_exit_twd > self._peak_net_exit_pnl_twd:
@@ -3210,8 +3210,8 @@ class TMFSpread(StrategyBase):
                     "processed_at": datetime.now().isoformat(),
                     "lifecycle_phase": str(self._lifecycle_oca.phase.value) if self._lifecycle_oca and hasattr(self._lifecycle_oca.phase, "value") else "",
                     "entry_fully_established": _both_legs_open if "_both_legs_open" in dir() else False,
-                    "warmup_complete": _ce_eligible if "_ce_eligible" in dir() else False,
-                    "position_ready": _ce_eligible if "_ce_eligible" in dir() else False,
+                    "warmup_complete": _peak_eligible if "_peak_eligible" in dir() else False,
+                    "position_ready": _peak_eligible if "_peak_eligible" in dir() else False,
                     "evaluator_invoked": True,
                     "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
                     "current_net_exit_twd": _current_net_exit_twd if "_current_net_exit_twd" in dir() else 0.0,
@@ -3219,7 +3219,7 @@ class TMFSpread(StrategyBase):
                     "giveback_twd": float(self._params.get("combined_upl_giveback_twd", 100.0)),
                     "exit_line_twd": max(0.0, getattr(self, "_peak_net_exit_pnl_twd", 0.0) - float(self._params.get("combined_upl_giveback_twd", 100.0))),
                     "enabled": self._params.get("enable_combined_upl_trail", False),
-                    "eligible": _ce_eligible if "_ce_eligible" in dir() else False,
+                    "eligible": _peak_eligible if "_peak_eligible" in dir() else False,
                     "activated": getattr(self, "_peak_net_exit_pnl_twd", 0.0) >= float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
                     "would_trigger": False,
                     "giveback_trigger": False,
