@@ -2183,9 +2183,24 @@ class TMFSpread(StrategyBase):
                 except (ValueError, TypeError):
                     logger.warning("[MTS_PEAK_STATE_CORRUPTED] Recovered peak invalid: non-numeric value (%s). Safe initialization to 0.0", _raw_peak)
                     self._peak_net_exit_pnl_twd = 0.0
+
+                # Restore Policy J activation state from policy_j sub-object
+                _pj_st = _st.get("policy_j", {})
+                if _pj_st.get("trade_id") == _latest_open_tid:
+                    self._pj_activated = bool(_pj_st.get("activated", False))
+                    self._pj_triggered = bool(_pj_st.get("triggered", False))
+                    logger.info(
+                        "[MTS_POLICY_J_RESTORE] trade=%s activated=%s triggered=%s peak=%.1f",
+                        _latest_open_tid, self._pj_activated, self._pj_triggered, self._peak_net_exit_pnl_twd,
+                    )
+                else:
+                    self._pj_activated = False
+                    self._pj_triggered = False
             elif _st is None:
                 logger.info("[MTS_PEAK_STATE_DEFAULT] No state file found during recovery. Initializing peak_net_exit_pnl_twd to 0.0")
                 self._peak_net_exit_pnl_twd = 0.0
+                self._pj_activated = False
+                self._pj_triggered = False
 
             logger.warning(
                 "[MTS_FILLS_RECOVERY] Restored trade_id=%s near=%.1f far=%.1f released=%s lifecycle=%s peak_pnl=%.1f",
@@ -3241,6 +3256,25 @@ class TMFSpread(StrategyBase):
                     _pj_json.dump(_snap, _pjf, default=str, indent=2)
                 import os as _pj_os
                 _pj_os.replace(_tmp2, _tmp)
+
+                # ── PR 4: Persist Policy J state to MTS state file ──
+                try:
+                    _mts_state_path = _get_state_file_path()
+                    if _mts_state_path and os.path.exists(_mts_state_path):
+                        with open(_mts_state_path, "r") as _pjf_read:
+                            _mts_state = _pj_json.load(_pjf_read)
+                        _mts_state["policy_j"] = {
+                            "activated": _snap["activated"],
+                            "peak_net_exit_pnl_twd": _snap["peak_net_exit_pnl_twd"],
+                            "triggered": _snap["would_trigger"],
+                            "trade_id": _snap["trade_id"],
+                        }
+                        _mts_tmp = _mts_state_path + ".pj_tmp"
+                        with open(_mts_tmp, "w") as _pjf_write:
+                            _pj_json.dump(_mts_state, _pjf_write, indent=2)
+                        _pj_os.replace(_mts_tmp, _mts_state_path)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
