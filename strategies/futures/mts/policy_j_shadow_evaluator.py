@@ -202,6 +202,9 @@ class PolicyJShadowEvaluator:
             near_quote_age_ms=obs.near_quote_age_ms,
             far_quote_age_ms=obs.far_quote_age_ms,
             max_quote_age_ms=obs.max_quote_age_ms,
+            near_open_qty=1 if obs.is_hedged_pair else 0,
+            far_open_qty=1 if obs.is_hedged_pair else 0,
+            is_spread_phase=obs.is_spread_phase,
             has_exit_inflight=obs.exit_inflight,
             gross_pnl=obs.gross_liquidation_pnl_twd,
         )
