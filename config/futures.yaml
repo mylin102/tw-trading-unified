@@ -1,15 +1,12 @@
 ticker: TMF
 active_strategy: tmf_spread
-
-# ── Product Registry (Section 6.1) ──
-# All monetary values in TWD.
 products:
   TMF:
     point_value: 10
     tick_size: 1
     broker_fee_per_side: 22
     exchange_fee_per_side: 0
-    tax_rate: 0.00002
+    tax_rate: 2.0e-05
     margin_per_lot: 46000
     baseline_initial_capital_twd: 100000
   MTX:
@@ -17,17 +14,14 @@ products:
     tick_size: 1
     broker_fee_per_side: 35
     exchange_fee_per_side: 0
-    tax_rate: 0.00002
+    tax_rate: 2.0e-05
     margin_per_lot: 120000
     baseline_initial_capital_twd: 500000
-
-# ── Capital Policy (Section 7) ──
 capital:
   policy: same_leverage
   baseline_product: TMF
   baseline_initial_capital_twd: 100000
-  max_margin_utilization: 0.40
-
+  max_margin_utilization: 0.4
 cooldown_bars: 5
 execution:
   broker_fee_per_side: 10.0
@@ -84,7 +78,7 @@ risk_mgmt:
   trend_hold_min_time_to_close_mins: 20
   trend_hold_min_trend_strength: 0.001
 strategy:
-  active_strategy: tmf_spread
+  active_strategy: adaptive_orb_v15
   auto_select: true
   counter_mode:
     atr_sl_mult: 2.0
@@ -143,25 +137,25 @@ squeeze_policy:
   fire_scout_time_stop_bars: 6
 debug:
   tickbar: true
-  feed: false # 2026-07-16 Gemini CLI: Disabled high-frequency feed logging to save CPU & temperature.
+  feed: false
 mts:
   enabled: true
   strategy: tmf_spread
   lots: 1
   release_mode: triggered_market
   mtf:
-    # 2026-07-14 Gemini CLI: MTF mode and freshness threshold configuration for ADR-009
     mode: shadow
     max_age_sec: 420
   params:
     min_atr: 10.0
-    atr_multiplier_stop: 2.1
-    atr_multiplier_trail: 1.1
-    release_stop_points: 200
-    trail_distance_points: 30
+    atr_multiplier_stop: 0.6
+    atr_multiplier_trail: 0.2
+    release_stop_points: 88
+    trail_distance_points: 66
     enable_combined_upl_trail: true
     combined_upl_activation_net_pnl_twd: 200.0
     combined_upl_giveback_twd: 50.0
+    policy_j_entry_warmup_ms: 3000
     atr_cap: 250.0
     confirm_ticks: 2
     confirm_ms: 800
@@ -206,5 +200,5 @@ trade_mgmt:
   allow_long: true
   allow_short: true
   force_close_at_end: true
-  lots_per_trade: 1
-  max_positions: 4
+  lots_per_trade: 2
+  max_positions: 8

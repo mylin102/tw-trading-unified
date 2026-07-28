@@ -1,14 +1,12 @@
 ticker: TMF
 active_strategy: null
-
-# ── Product Registry (Section 6.1) ──
 products:
   TMF:
     point_value: 10
     tick_size: 1
     broker_fee_per_side: 22
     exchange_fee_per_side: 0
-    tax_rate: 0.00002
+    tax_rate: 2.0e-05
     margin_per_lot: 46000
     baseline_initial_capital_twd: 100000
   MTX:
@@ -16,17 +14,14 @@ products:
     tick_size: 1
     broker_fee_per_side: 35
     exchange_fee_per_side: 0
-    tax_rate: 0.00002
+    tax_rate: 2.0e-05
     margin_per_lot: 120000
     baseline_initial_capital_twd: 500000
-
-# ── Capital Policy (Section 7) ──
 capital:
   policy: same_leverage
   baseline_product: TMF
   baseline_initial_capital_twd: 100000
-  max_margin_utilization: 0.40
-
+  max_margin_utilization: 0.4
 auto_select: true
 cooldown_bars: 5
 execution:
@@ -129,15 +124,15 @@ mts:
   strategy: tmf_spread
   lots: 1
   params:
-    min_atr: 20.0
+    min_atr: 10.0
     atr_multiplier_stop: 1.2
     atr_multiplier_trail: 0.5
-    release_stop_points: 99
-    trail_distance_points: 10
+    release_stop_points: 88
+    trail_distance_points: 66
     enable_combined_upl_trail: true
     combined_upl_activation_net_pnl_twd: 200.0
     combined_upl_giveback_twd: 50.0
-    atr_cap: 200.0
+    atr_cap: 250.0
     confirm_ticks: 2
     confirm_ms: 800
     max_quote_age_ms: 30000
