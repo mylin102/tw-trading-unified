@@ -5705,7 +5705,7 @@ elif page == "設定":
                 m5, m6 = st.columns(2)
                 f_mts_stop_fixed = m5.number_input("MTS 固定停損點數", min_value=5, max_value=500, 
                                                  value=int(_mts_params.get("release_stop_points", 20)))
-                f_mts_trail_fixed = m6.number_input("MTS 固定停利點數 + floor", min_value=10, max_value=200, 
+                f_mts_trail_fixed = m6.number_input("MTS 固定停利點數最小值", min_value=10, max_value=200, 
                                                   value=int(_mts_params.get("trail_distance_points", 30)))
                 
                 st.markdown("###### 🛡️ Policy J 組合移動停利 (Combined UPL Trailing Exit)")
