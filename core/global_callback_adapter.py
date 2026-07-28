@@ -124,6 +124,12 @@ class GlobalCallbackAdapter:
             try:
                 _route.handler.on_tick(_route.leg, tick)
                 print(f"[GCA_TICK] ROUTE_OK adapter_id={id(self)} code={code} leg={_route.leg}", flush=True)
+                try:
+                    from core.market_data_health_registry import record_route, record_callback
+                    record_callback(code, "tick")
+                    record_route(code, _route.leg)
+                except Exception:
+                    pass
             except Exception:
                 self._callback_error_count += 1
                 self._logger.exception(
@@ -139,8 +145,13 @@ class GlobalCallbackAdapter:
         if self._fallback_tick:
             try:
                 print(f"[GCA_TICK] FALLBACK_CALL adapter_id={id(self)} code={code}", flush=True)
-                self._fallback_tick(*args)
+                self._fallback_tick(exchange, tick)
                 print(f"[GCA_TICK] FALLBACK_OK adapter_id={id(self)} code={code}", flush=True)
+                try:
+                    from core.market_data_health_registry import record_callback
+                    record_callback(code, "tick")
+                except Exception:
+                    pass
             except Exception:
                 self._callback_error_count += 1
                 self._logger.exception("Fallback handler failed for %s/%s", exchange, tick.code)
@@ -187,7 +198,7 @@ class GlobalCallbackAdapter:
             if not self._always_call_fallback:
                 return
 
-        self._fallback_bidask(*args)
+        self._fallback_bidask(exchange, bidask)
 
         # ── DTI-001A: instrumentation-only bidask capture ──
         if self._capture_hook is not None:
