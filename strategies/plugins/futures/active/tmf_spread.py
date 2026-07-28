@@ -674,7 +674,7 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
         
         _append_jsonl_durable(_MTS_FILL_LOG, fill)
     except Exception as _ae:
-        logger.error("[MTS_FILL_APPEND_FAILED] trade_id=%s fill_type=%s error=%s", trade_id, fill_type, _ae)
+        logger.error("[MTS_FILL_APPEND_FAILED] trade_id=%s fill_type=%s error=%s", trade_id, fill_type, _ae); raise
 
 
 # ═══════════════════════════════════════════════════════════════
