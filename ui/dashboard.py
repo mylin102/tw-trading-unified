@@ -248,14 +248,14 @@ PRODUCT_CODES = list(PRODUCT_LABELS.keys())
 # ── Sidebar Info ──
 with st.sidebar:
     st.title("Trading Unified")
-
     # 2026-07-26 Gemini CLI: Product-based futures page selector
     _product_page = st.selectbox(
         "📄 頁面",
-        ["總覽"] + list(PRODUCT_LABELS.values()) + ["選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "🔄 反事實研究室", "🔐 Real Preflight", "設定"],
-        index=1,
+        ["總覽", "設定"] + list(PRODUCT_LABELS.values()) + ["選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "🔄 反事實研究室", "🔐 Real Preflight"],
+        index=2,
         key="page_selector",
     )
+
 
     # 2026-07-26 Gemini CLI: On-demand 8502 Research Lab launcher & shutdown toggle in sidebar
     st.divider()
@@ -799,8 +799,8 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
         print(f"[Dashboard] make_futures_dual_chart data cleaning error: {_de}")
 
     _t_chart_start = perf_counter()
-    _t_near_ctor = 0
-    _t_far_ctor = 0
+    _t_near_ctor = perf_counter()
+    _t_far_ctor = perf_counter()
     _near_rows_in = len(near_df) if near_df is not None else 0
     _far_rows_in = len(far_df) if far_df is not None else 0
     _ds_near = 1
@@ -814,6 +814,7 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             print(f"[CHART] Downsampled to {len(_df_ref)} rows (step={_step})")
     _near_rows_out = len(near_df) if near_df is not None else 0
     _far_rows_out = len(far_df) if far_df is not None else 0
+    print(f"[PERF_CHART] after_ds: {perf_counter()-_t_near_ctor:.3f}s")
     print(f"[CHART_INPUT] near_rows_in={_near_rows_in} far_rows_in={_far_rows_in} ds_near={_ds_near} ds_far={_ds_far} near_out={_near_rows_out} far_out={_far_rows_out}")
 
     if near_df.empty:
@@ -843,6 +844,7 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     # Standardize heights so they sum to 1.0
     h_sum = sum(row_heights)
     row_heights = [h / h_sum for h in row_heights]
+    print(f"[PERF_CHART] prep_done: {perf_counter()-_t_near_ctor:.3f}s")
     
     _t_sub = perf_counter()
     fig = make_subplots(
@@ -3535,47 +3537,123 @@ elif _selected_product == "TMF":
                 _u2.metric("遠月 UPL", f"{_fr:+,.0f} TWD")
                 _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
 
-                # 2026-07-27 Gemini CLI: Policy J (Combined UPL Trail) Live Notification Banner
-                _mts_params = futures_cfg.get("mts", {}).get("params", {})
-                _pj_enabled = bool(_mts_params.get("enable_combined_upl_trail", True))
-                if _pj_enabled:
-                    _pj_act_twd = float(_mts_params.get("combined_upl_activation_net_pnl_twd", 200.0))
-                    _pj_giveback_twd = float(_mts_params.get("combined_upl_giveback_twd", 50.0))
-                    _net_exit_twd = _tr - 92.0  # 10 TWD/pt minus 92 TWD friction
-                    _peak_exit_twd = max(float(_mts_state.get("peak_net_exit_pnl_twd", 0.0)), _net_exit_twd)
-                    
-                    _curr_state = str(_mts_state.get("state", "")).upper()
-                    _curr_reason = str(_mts_state.get("reason", "")).upper()
-                    _trigger_line = _peak_exit_twd - _pj_giveback_twd
-                    
-                    if _curr_state == "COMBINED_EXIT" or _curr_reason == "COMBINED_EXIT":
-                        st.warning(
-                            f"🚨 **Policy J 組合停利已觸發平倉中 (EXECUTING COMBINED EXIT)**  \n"
-                            f"• **執行狀態**: `雙腿平倉委託已送出 (MKP 範圍市價)`  \n"
-                            f"• **當前損益**: `毛利 {_tr:+,.0f} TWD` \| `扣除成本淨利 {_net_exit_twd:+,.0f} TWD` (摩擦成本 92 TWD)  \n"
-                            f"• **最高淨利 Peak Net PnL**: `{_peak_exit_twd:+,.0f} TWD`  \n"
-                            f"• **觸發時淨損益**: `{_net_exit_twd:+,.0f} TWD` (已跨越平倉線 `{_trigger_line:+,.0f} TWD`)  \n"
-                            f"*(正在等待券商成交 Callback 回傳對齊中...)*"
-                        )
-                    elif _peak_exit_twd >= _pj_act_twd:
-                        st.success(
-                            f"🛡️ **Policy J 組合停利已啟動 (ARMED & TRACKING)**  \n"
-                            f"• **當前損益**: `毛利 {_tr:+,.0f} TWD` \| `扣除成本淨利 {_net_exit_twd:+,.0f} TWD` (摩擦成本 92 TWD)  \n"
-                            f"• **啟動門檻**: `{_pj_act_twd:,.0f} TWD` (已超越)  \n"
-                            f"• **最高淨利 Peak Net PnL**: `{_peak_exit_twd:+,.0f} TWD`  \n"
-                            f"• **平倉觸發線 (Peak 淨利 - {_pj_giveback_twd:.0f} TWD)**: `{_trigger_line:+,.0f} TWD`  \n"
-                            f"*(當前淨損益自 Peak 回撤達 `{_pj_giveback_twd:.0f} TWD` 時將立即下單觸發 COMBINED_EXIT 雙腿組合平倉)*"
-                        )
+                # P1: Policy J Authority Display — reads single evaluator snapshot. No local recompute.
+                try:
+                    _pj_snap_path = Path("/tmp/policy_j_snapshot.json")
+                    if _pj_snap_path.exists():
+                        _pj = json.loads(_pj_snap_path.read_text())
+                        _snap_age = (time.time() - _pj_snap_path.stat().st_mtime) if _pj_snap_path.exists() else 999
                     else:
-                        _diff = _pj_act_twd - _net_exit_twd
+                        _pj = None
+                        _snap_age = 999
+                    
+                    _snap_stale = _snap_age > 30.0  # stale after 30s
+                    
+                    if _pj and not _snap_stale:
+                        _pj_eligible = _pj.get("eligible", False)
+                        _pj_activated = _pj.get("activated", False)
+                        _pj_would_trigger = _pj.get("would_trigger", False)
+                        _pj_decision = _pj.get("decision", "NONE")
+                        
+                        if _pj_decision == "COMBINED_EXIT":
+                            st.warning(
+                                f"🚨 **Policy J 組合停利已觸發平倉中 (EXECUTING COMBINED EXIT)**  \n"
+                                f"• **決策來源**: `evaluator snapshot`  \n"
+                                f"• **Snap ID**: `{_pj.get('snapshot_id','?')[:20]}`  \n"
+                                f"• **Trade ID**: `{_pj.get('trade_id','?')}`  \n"
+                                f"• **當前淨利**: `{_pj.get('current_net_exit_twd',0):+,.0f} TWD`  \n"
+                                f"• **最高淨利 Peak**: `{_pj.get('peak_net_exit_pnl_twd',0):+,.0f} TWD`  \n"
+                                f"• **平倉線**: `{_pj.get('exit_line_twd',0):+,.0f} TWD`  \n"
+                                f"*(Snapshot age: {_snap_age:.1f}s)*"
+                            )
+                        elif _pj_eligible and _pj_activated:
+                            _trigger_line = max(0.0, _pj.get("peak_net_exit_pnl_twd", 0) - _pj.get("giveback_twd", 50))
+                            st.success(
+                                f"🛡️ **Policy J 組合停利已啟動 (ARMED & TRACKING)**  \n"
+                                f"• **決策來源**: `evaluator snapshot`  \n"
+                                f"• **當前淨利**: `{_pj.get('current_net_exit_twd',0):+,.0f} TWD`  \n"
+                                f"• **最高淨利 Peak**: `{_pj.get('peak_net_exit_pnl_twd',0):+,.0f} TWD`  \n"
+                                f"• **啟動門檻**: `{_pj.get('activation_net_pnl_twd',200):,.0f} TWD` (已超越)  \n"
+                                f"• **平倉觸發線**: `{_trigger_line:+,.0f} TWD` (Peak - {_pj.get('giveback_twd',50):.0f} TWD)  \n"
+                                f"*(Snapshot age: {_snap_age:.1f}s)*"
+                            )
+                        elif _pj_eligible:
+                            _diff = _pj.get("activation_net_pnl_twd", 200) - _pj.get("current_net_exit_twd", 0)
+                            st.info(
+                                f"🛡️ **Policy J 組合停利監控中 (MONITORING)**  \n"
+                                f"• **當前淨利**: `{_pj.get('current_net_exit_twd',0):+,.0f} TWD`  \n"
+                                f"• **啟動門檻**: `{_pj.get('activation_net_pnl_twd',200):,.0f} TWD` (尚差 {_diff:,.0f} TWD)  \n"
+                                f"• **Warmup**: `{'完成' if _pj.get('warmup_complete') else '進行中'}`  \n"
+                                f"*(Snapshot age: {_snap_age:.1f}s)*"
+                            )
+                        else:
+                            _reason = "Warmup 未完成" if not _pj.get("warmup_complete") else "進場未穩定" if not _pj.get("entry_fully_established") else "未達門檻"
+                            st.info(
+                                f"🛡️ **Policy J 組合停利待命中 (WAITING)**  \n"
+                                f"• **原因**: `{_reason}`  \n"
+                                f"• **Eligible**: `{_pj_eligible}`  \n"
+                                f"• **Warmup**: `{_pj.get('warmup_complete',False)}`  \n"
+                                f"*(Snapshot age: {_snap_age:.1f}s)*"
+                            )
+                    else:
                         st.info(
-                            f"🛡️ **Policy J 組合停利監控中 (MONITORING)**  \n"
-                            f"• **當前損益**: `毛利 {_tr:+,.0f} TWD` \| `扣除成本淨利 {_net_exit_twd:+,.0f} TWD` (摩擦成本 92 TWD)  \n"
-                            f"• **啟動門檻**: `{_pj_act_twd:,.0f} TWD` (尚差 `{_diff:,.0f} TWD` 啟動)  \n"
-                            f"• **回吐門檻**: `{_pj_giveback_twd:.0f} TWD`"
+                            f"🛡️ **Policy J 狀態**: `{'UNKNOWN — 無快照' if _pj is None else 'STALE — 快照過期 (' + str(int(_snap_age)) + 's)'}`  \n"
+                            f"• **Snapshot age**: `{_snap_age:.1f}s`  \n"
+                            f"• **Fallback**: `停用 — Dashboard 不自行計算 Policy J 決策`"
                         )
-
-                st.caption(f'最後更新: {_mts_state.get("_updated", "?")}')
+                except Exception:
+                    st.info("🛡️ **Policy J 狀態**: `UNKNOWN — 讀取快照失敗`")
+                
+                # P1 Authority split panel
+                try:
+                    _pj2 = json.loads(Path("/tmp/policy_j_snapshot.json").read_text()) if Path("/tmp/policy_j_snapshot.json").exists() else {}
+                except Exception:
+                    _pj2 = {}
+                
+                _mts_params_pj = futures_cfg.get("mts", {}).get("params", {})
+                st.markdown("---")
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.markdown("**設定值 (Configured)**")
+                    st.code(
+                        f"啟用: {_mts_params_pj.get('enable_combined_upl_trail', False)}\n"
+                        f"啟動門檻: {_mts_params_pj.get('combined_upl_activation_net_pnl_twd', '?')} TWD\n"
+                        f"回吐門檻: {_mts_params_pj.get('combined_upl_giveback_twd', '?')} TWD\n"
+                        f"Warmup: {_mts_params_pj.get('policy_j_entry_warmup_ms', '?')} ms\n"
+                        f"來源: futures.yaml",
+                        language=""
+                    )
+                with c2:
+                    st.markdown("**Runtime (策略實例)**")
+                    _r_peak = _pj2.get("peak_net_exit_pnl_twd", "?")
+                    _r_curr = _pj2.get("current_net_exit_twd", "?")
+                    _r_eligible = _pj2.get("eligible", "?")
+                    _r_warmup = _pj2.get("warmup_complete", "?")
+                    st.code(
+                        f"Peak: {_r_peak}\n"
+                        f"Current: {_r_curr}\n"
+                        f"Eligible: {_r_eligible}\n"
+                        f"Warmup: {_r_warmup}\n"
+                        f"Activated: {_pj2.get('activated','?')}",
+                        language=""
+                    )
+                with c3:
+                    st.markdown("**Evaluator Snapshot**")
+                    _s_id = _pj2.get("snapshot_id", "?")
+                    _s_time = _pj2.get("event_time", "?")[:19] if _pj2.get("event_time") else "?"
+                    _s_trade = _pj2.get("trade_id", "?")
+                    _s_trigger = _pj2.get("would_trigger", "?")
+                    _s_decision = _pj2.get("decision", "?")
+                    st.code(
+                        f"Snapshot: {_s_id[:20] if len(str(_s_id))>20 else _s_id}\n"
+                        f"Event: {_s_time}\n"
+                        f"Trade: {_s_trade}\n"
+                        f"Would trigger: {_s_trigger}\n"
+                        f"Decision: {_s_decision}",
+                        language=""
+                    )
+                
+                st.caption(f'Snapshot age: {_snap_age:.1f}s | Policy J 決策僅以 Evaluator Snapshot 為權威來源，Dashboard 不自行計算')
 
                 # ── MTS 個別委託 (from mts_trade_fills.jsonl) ──
                 try:
