@@ -754,6 +754,8 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
     )
     return fig
 
+MAX_CHART_POINTS = 2000
+
 # ── Futures Dual Contract Chart ──
 def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", signals=None):
     """繪製期貨雙合約價格圖表
@@ -795,6 +797,16 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     except Exception as _de:
         print(f"[Dashboard] make_futures_dual_chart data cleaning error: {_de}")
 
+    _t_prep = time.time()
+    for _df_ref in [near_df, far_df]:
+        if _df_ref is None or _df_ref.empty or "timestamp" not in _df_ref.columns:
+            continue
+        if len(_df_ref) > MAX_CHART_POINTS:
+            _step = math.ceil(len(_df_ref) / MAX_CHART_POINTS)
+            _df_ref = _df_ref.iloc[::_step].copy()
+            print(f"[CHART] Downsampled to {len(_df_ref)} rows (step={_step})")
+    print(f"[PERF_CHART] make_futures_dual_chart.prepare: {time.time()-_t_prep:.3f}s")
+
     if near_df.empty:
         print("[Dashboard] make_futures_dual_chart called with empty near_df after cleaning")
         fig = go.Figure()
@@ -823,17 +835,20 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     h_sum = sum(row_heights)
     row_heights = [h / h_sum for h in row_heights]
     
+    _t_sub = time.time()
     fig = make_subplots(
         rows=rows, cols=1, 
         shared_xaxes=True, 
         row_heights=row_heights, 
         vertical_spacing=0.05
     )
+    print(f"[PERF_CHART] make_futures_dual_chart.make_subplots: {time.time()-_t_sub:.3f}s")
     
     # 1. 近月價格線
     # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
+    _t_near = time.time()
     fig.add_trace(
-        go.Scatter(
+        go.Scattergl(
             x=_clean_list(near_df["timestamp"], force_str=True),
             y=_clean_list(near_df["close"]),
             name="近月",
@@ -862,8 +877,9 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
                     str(max(near_df["timestamp"].max(), far_visible_tail["timestamp"].max()))
                 ])
         # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
+        _t_far = time.time()
         fig.add_trace(
-            go.Scatter(
+            go.Scattergl(
                 x=_clean_list(far_visible["timestamp"], force_str=True),
                 y=_clean_list(far_visible["close"]),
                 name="遠月",
@@ -1028,6 +1044,8 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             row=atr_row, col=1
         )
     
+    print(f"[PERF_CHART] make_futures_dual_chart.traces: {time.time()-_t_near:.3f}s")
+    print(f"[PERF_CHART] make_futures_dual_chart.total: {time.time()-_t_prep:.3f}s")
     return fig
 
 # ── Calendar Spread Chart ──
@@ -1170,7 +1188,7 @@ def make_calendar_spread_chart(spread_df):
                     x=_clean_list(spread_df["timestamp"], force_str=True),
                     y=_clean_list(_z_v),
                     name="z-score_V (速度)",
-                    line=dict(color="#9467bd", width=1.2, dash="dash"),
+                    line=dict(color="#9467bd", width=1.2),
                     mode="lines"
                 ),
                 row=4, col=1
@@ -1180,7 +1198,7 @@ def make_calendar_spread_chart(spread_df):
                     x=_clean_list(spread_df["timestamp"], force_str=True),
                     y=_clean_list(_z_a),
                     name="z-score_A (加速度)",
-                    line=dict(color="#8c564b", width=1.0, dash="dot"),
+                    line=dict(color="#00bfff", width=1.0),
                     mode="lines"
                 ),
                 row=4, col=1
