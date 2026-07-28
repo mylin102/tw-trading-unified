@@ -1506,34 +1506,37 @@ class TMFSpread(StrategyBase):
         except (ValueError, TypeError, KeyError):
             return None
 
+    def _calculate_effective_thresholds(self, atr: float | None) -> tuple[float, float]:
+        """Single authority for ATR-based stop/trail with config-driven floors.
+
+        Used by both _get_thresholds (runtime decision) and _get_risk_meta (state file).
+        Eliminates hardcoded floor divergence between the two callers.
+        """
+        if atr is None or atr <= 0:
+            return self._release_stop_fixed, self._trail_dist_fixed
+
+        if self._atr_mult_stop <= 0 or self._atr_mult_trail <= 0:
+            return self._release_stop_fixed, self._trail_dist_fixed
+
+        effective_atr = min(atr, self._atr_cap) if hasattr(self, "_atr_cap") and self._atr_cap > 0 else atr
+
+        stop = effective_atr * self._atr_mult_stop
+        trail = effective_atr * self._atr_mult_trail
+
+        return (
+            max(self._release_stop_fixed, stop),      # floor = configured release_stop_points
+            max(self._trail_dist_fixed, trail),        # floor = configured trail_distance_points
+        )
+
     def _get_thresholds(self, bar: dict) -> tuple[float, float]:
         """Calculate dynamic thresholds based on ATR, or use fixed fallbacks."""
         atr = bar.get("atr")
         if atr and not pd.isna(atr) and atr > 0:
-            # 2026-06-26 Gemini CLI: Backup the latest stable ATR (Method 2)
             self._last_atr = atr
         else:
-            # If current ATR is NaN (e.g. warm-up), carry over the last stable ATR or fallback
             atr = self._last_atr
 
-        if atr and not pd.isna(atr) and atr > 0:
-            # 2026-07-16 Hermes Agent: Force fixed fallback when multiplier is 0
-            # (same guard pattern as _get_risk_meta at line 1269)
-            if self._atr_mult_stop <= 0 or self._atr_mult_trail <= 0:
-                return self._release_stop_fixed, self._trail_dist_fixed
-
-            # 2026-06-29 Gemini CLI: Apply ATR cap to prevent excessively wide stops
-            if hasattr(self, "_atr_cap") and self._atr_cap > 0:
-                atr = min(atr, self._atr_cap)
-
-            stop = atr * self._atr_mult_stop
-            
-            # 2026-06-26 Gemini CLI: Trail multiplier — single source of truth is atr_multiplier_trail
-            trail = atr * self._atr_mult_trail
-            # Ensure sensible bounds for TMF (Micro Taiwan Index)
-            # Tiered floors: Stop needs 10pt safety, Trail needs 20pt room to breathe
-            return max(10.0, stop), max(20.0, trail)
-        return self._release_stop_fixed, self._trail_dist_fixed
+        return self._calculate_effective_thresholds(atr)
 
     def _apply_vwap_exit(self, bar: dict, trail_dist: float) -> float:
         """2026-07-08 Gemini CLI: Apply dynamic VWAP trailing stop tightening for remaining leg"""
@@ -1848,27 +1851,28 @@ class TMFSpread(StrategyBase):
                 atr = min(atr, self._atr_cap)
                 
         has_atr = atr and not pd.isna(atr) and atr > 0
-        
         atr_val = round(float(atr), 2) if has_atr else 0.0
+
+        # Use shared threshold calculator (single authority for stop/trail floors)
+        _calc_stop, _calc_trail = self._calculate_effective_thresholds(atr)
+
         stop_mult = self._atr_mult_stop if has_atr else 0.0
         trail_mult = self._atr_mult_trail if has_atr else 0.0
-        
-        # 2026-07-23 Gemini CLI: Work Package B - Separated Risk Modes for release stop vs trailing stop
+
         has_release_atr = has_atr and stop_mult > 0
         has_trail_atr = has_atr and trail_mult > 0
-        
+
         release_stop_mode = "ATR_DYNAMIC" if has_release_atr else "FIXED_FALLBACK"
         trail_distance_mode = "ATR_DYNAMIC" if has_trail_atr else "FIXED_FALLBACK"
         risk_mode = "ATR_DYNAMIC" if (has_release_atr and has_trail_atr) else "FIXED_FALLBACK"
-        
-        release_stop = round(atr_val * stop_mult, 2) if has_release_atr else self._release_stop_fixed
-        trail_dist = round(atr_val * trail_mult, 2) if has_trail_atr else self._trail_dist_fixed
-        
-        release_stop_floor = 10.0
-        trail_dist_floor = 60.0  # 2026-07-07: 20→60, ~0.82 ATR for TMF night (~73 pt)
-        
-        final_release_stop = max(release_stop_floor, release_stop) if has_release_atr else release_stop
-        final_trail_dist = max(trail_dist_floor, trail_dist) if has_trail_atr else trail_dist
+
+        # Pre-floor components (for telemetry)
+        release_stop_raw = round(atr_val * stop_mult, 2) if has_release_atr else self._release_stop_fixed
+        trail_dist_raw = round(atr_val * trail_mult, 2) if has_trail_atr else self._trail_dist_fixed
+
+        # final_release_stop / final_trail_dist come from the shared calculator
+        final_release_stop = round(_calc_stop, 2) if has_release_atr else release_stop_raw
+        final_trail_dist = round(_calc_trail, 2) if has_trail_atr else trail_dist_raw
         
         # 2026-06-26 Gemini CLI: retrieve quote age in ms safely
         near_age = bar.get("near_tick_age_ms", bar.get("near_age_ms", -1))
@@ -1892,10 +1896,10 @@ class TMFSpread(StrategyBase):
             "atr": atr_val,
             "stop_mult": stop_mult,
             "trail_mult": trail_mult,
-            "release_stop": release_stop,
-            "release_stop_floor": release_stop_floor,
-            "trail_dist": trail_dist,
-            "trail_dist_floor": trail_dist_floor,
+            "release_stop": release_stop_raw,
+            "release_stop_floor": self._release_stop_fixed,
+            "trail_dist": trail_dist_raw,
+            "trail_dist_floor": self._trail_dist_fixed,
             "final_release_stop": final_release_stop,
             "final_trail_dist": final_trail_dist,
             "effective_trail_dist": final_trail_dist,
