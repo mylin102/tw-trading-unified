@@ -3142,21 +3142,16 @@ class TMFSpread(StrategyBase):
                     _rem_low = float(bar.get("near_low", 0))
             else:
                 _rem_high = _rem_low = 0.0
-            # ── P0: Policy J Entry-Initialization Peak Warmup Gate ──
-            # Do not update peak until position is fully established
-            # and warmup period has elapsed. Prevents transient valuation
-            # during two-leg entry from contaminating peak tracking.
+            # ── P0: Policy J Peak Update Readiness ──
+            # Peak updates begin immediately when position is fully established.
+            # No time-based warmup — readiness is determined by:
+            # both legs open + SPREAD phase.
             _ce_eligible = False
-            _warmup_ms = float(self._params.get("policy_j_entry_warmup_ms", 3000.0))
             _phase = self._lifecycle_oca.phase if self._lifecycle_oca else None
             _both_legs_open = (getattr(self, "_near_open_qty", 0) > 0
                               and getattr(self, "_far_open_qty", 0) > 0)
             if _phase == PositionPhase.SPREAD and _both_legs_open:
-                if self._entry_established_at is None:
-                    self._entry_established_at = time.time()
-                _elapsed_ms = (time.time() - self._entry_established_at) * 1000.0
-                if _elapsed_ms >= _warmup_ms:
-                    _ce_eligible = True
+                _ce_eligible = True
             elif _phase == PositionPhase.SINGLE_LEG:
                 # Single-leg: peak is always eligible (entry already established)
                 _ce_eligible = True
@@ -3216,6 +3211,8 @@ class TMFSpread(StrategyBase):
                     "lifecycle_phase": str(self._lifecycle_oca.phase.value) if self._lifecycle_oca and hasattr(self._lifecycle_oca.phase, "value") else "",
                     "entry_fully_established": _both_legs_open if "_both_legs_open" in dir() else False,
                     "warmup_complete": _ce_eligible if "_ce_eligible" in dir() else False,
+                    "position_ready": _ce_eligible if "_ce_eligible" in dir() else False,
+                    "evaluator_invoked": True,
                     "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
                     "current_net_exit_twd": _current_net_exit_twd if "_current_net_exit_twd" in dir() else 0.0,
                     "activation_net_pnl_twd": float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
