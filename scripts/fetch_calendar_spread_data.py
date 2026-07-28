@@ -78,7 +78,7 @@ def get_near_far_contracts(client, category="TMF"):
         print(f"Error getting contracts: {e}")
         return None, None
 
-def fetch_kbars_data(client, contract, interval="1min", days=7):
+def fetch_kbars_data(client, contract, interval="1min", days=8):
     """
     Fetch K-line data from Shioaji API.
     
@@ -219,10 +219,10 @@ def main():
     
     # Fetch data for both contracts
     print("\nFetching near-month data...")
-    df_near = fetch_kbars_data(client, near_contract, interval="1min", days=7)
+    df_near = fetch_kbars_data(client, near_contract, interval="1min", days=8)
     
     print("\nFetching far-month data...")
-    df_far = fetch_kbars_data(client, far_contract, interval="1min", days=7)
+    df_far = fetch_kbars_data(client, far_contract, interval="1min", days=8)
     
     if df_near is None or df_far is None:
         print("Failed to fetch data")
