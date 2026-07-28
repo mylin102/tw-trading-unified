@@ -771,6 +771,7 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     Returns:
         Plotly Figure 物件
     """
+    from time import perf_counter
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     import pandas as _pd
@@ -797,7 +798,11 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     except Exception as _de:
         print(f"[Dashboard] make_futures_dual_chart data cleaning error: {_de}")
 
-    _t_prep = time.time()
+    _t_chart_start = perf_counter()
+    _near_rows_in = len(near_df) if near_df is not None else 0
+    _far_rows_in = len(far_df) if far_df is not None else 0
+    _ds_near = 1
+    _ds_far = 1
     for _df_ref in [near_df, far_df]:
         if _df_ref is None or _df_ref.empty or "timestamp" not in _df_ref.columns:
             continue
@@ -805,7 +810,9 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             _step = math.ceil(len(_df_ref) / MAX_CHART_POINTS)
             _df_ref = _df_ref.iloc[::_step].copy()
             print(f"[CHART] Downsampled to {len(_df_ref)} rows (step={_step})")
-    print(f"[PERF_CHART] make_futures_dual_chart.prepare: {time.time()-_t_prep:.3f}s")
+    _near_rows_out = len(near_df) if near_df is not None else 0
+    _far_rows_out = len(far_df) if far_df is not None else 0
+    print(f"[CHART_INPUT] near_rows_in={_near_rows_in} far_rows_in={_far_rows_in} ds_near={_ds_near} ds_far={_ds_far} near_out={_near_rows_out} far_out={_far_rows_out}")
 
     if near_df.empty:
         print("[Dashboard] make_futures_dual_chart called with empty near_df after cleaning")
@@ -835,28 +842,28 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     h_sum = sum(row_heights)
     row_heights = [h / h_sum for h in row_heights]
     
-    _t_sub = time.time()
+    _t_sub = perf_counter()
     fig = make_subplots(
         rows=rows, cols=1, 
         shared_xaxes=True, 
         row_heights=row_heights, 
         vertical_spacing=0.05
     )
-    print(f"[PERF_CHART] make_futures_dual_chart.make_subplots: {time.time()-_t_sub:.3f}s")
+    print(f"[PERF_CHART] make_subplots: {perf_counter()-_t_sub:.3f}s")
     
     # 1. 近月價格線
     # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
     _t_near = time.time()
-    fig.add_trace(
-        go.Scattergl(
+    _near_trace = go.Scattergl(
             x=_clean_list(near_df["timestamp"], force_str=True),
             y=_clean_list(near_df["close"]),
             name="近月",
             line=dict(width=2, color="#1f77b4"),
             mode="lines"
-        ),
-        row=1, col=1
-    )
+        )
+    _t_near_add = perf_counter()
+    fig.add_trace(_near_trace, row=1, col=1)
+    print(f"[PERF_CHART] near_ctor: {_t_near_add-_t_near_ctor:.3f}s add: {perf_counter()-_t_near_add:.3f}s")
     
     # 2. 如果有遠月資料，添加遠月價格線
     if far_df is not None and not far_df.empty:
@@ -877,18 +884,18 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
                     str(max(near_df["timestamp"].max(), far_visible_tail["timestamp"].max()))
                 ])
         # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
-        _t_far = time.time()
-        fig.add_trace(
-            go.Scattergl(
+        _t_far_ctor = perf_counter()
+        _far_trace = go.Scattergl(
                 x=_clean_list(far_visible["timestamp"], force_str=True),
                 y=_clean_list(far_visible["close"]),
                 name="遠月",
                 line=dict(width=1.5, color="#ff7f0e", dash="dash"),
                 mode="lines",
                 connectgaps=False
-            ),
-            row=1, col=1
-        )
+            )
+        _t_far_add = perf_counter()
+        fig.add_trace(_far_trace, row=1, col=1)
+        print(f"[PERF_CHART] far_ctor: {_t_far_add-_t_far_ctor:.3f}s add: {perf_counter()-_t_far_add:.3f}s")
     
     # 3. 添加交易訊號
     if signals is not None and not signals.empty and "action" in signals.columns:
@@ -1044,8 +1051,20 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             row=atr_row, col=1
         )
     
-    print(f"[PERF_CHART] make_futures_dual_chart.traces: {time.time()-_t_near:.3f}s")
-    print(f"[PERF_CHART] make_futures_dual_chart.total: {time.time()-_t_prep:.3f}s")
+    _t_layout_end = perf_counter()
+    _shapes = len(fig.layout.shapes or [])
+    _anns = len(fig.layout.annotations or [])
+    print(f"[CHART_META] shapes={_shapes} annotations={_anns}")
+    _t_ser = perf_counter()
+    try:
+        import plotly.io as _pio
+        _json_bytes = len(_pio.to_json(fig, validate=False))
+        print(f"[PERF_CHART] serialize: {perf_counter()-_t_ser:.3f}s json_bytes={_json_bytes}")
+    except Exception:
+        print("[PERF_CHART] serialize: SKIP")
+    _t_end = perf_counter()
+    print(f"[PERF_CHART] total: {_t_end-_t_chart_start:.3f}s")
+    print(f"[CHART_SOURCE] func={make_futures_dual_chart.__qualname__} file={__file__}")
     return fig
 
 # ── Calendar Spread Chart ──
