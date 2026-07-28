@@ -76,7 +76,24 @@ class NightSessionConfig:
                 ["kbar_feature", "counter_vwap", "spring_upthrust"],
                 ["spring_upthrust", "kbar_feature", "counter_vwap"]
             ]
-        
+
+        # Environment variable overrides (must check here, not in field defaults,
+        # because dataclass field defaults are evaluated once at class definition time)
+        if "NIGHT_ATTRIBUTION_DIR" in os.environ:
+            self.attribution_dir = Path(os.environ["NIGHT_ATTRIBUTION_DIR"])
+        if "NIGHT_REPORTS_DIR" in os.environ:
+            self.reports_dir = Path(os.environ["NIGHT_REPORTS_DIR"])
+        if "NIGHT_ALERTS_DIR" in os.environ:
+            self.alerts_dir = Path(os.environ["NIGHT_ALERTS_DIR"])
+        if "NIGHT_LOGS_DIR" in os.environ:
+            self.logs_dir = Path(os.environ["NIGHT_LOGS_DIR"])
+
+        # Resolve relative paths against project_root (not os.getcwd())
+        self.attribution_dir = self._resolve_path(self.attribution_dir)
+        self.reports_dir = self._resolve_path(self.reports_dir)
+        self.alerts_dir = self._resolve_path(self.alerts_dir)
+        self.logs_dir = self._resolve_path(self.logs_dir)
+
         # Create directories
         self.attribution_dir.mkdir(parents=True, exist_ok=True)
         self.reports_dir.mkdir(parents=True, exist_ok=True)
