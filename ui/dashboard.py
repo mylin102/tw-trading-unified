@@ -799,6 +799,8 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
         print(f"[Dashboard] make_futures_dual_chart data cleaning error: {_de}")
 
     _t_chart_start = perf_counter()
+    _t_near_ctor = 0
+    _t_far_ctor = 0
     _near_rows_in = len(near_df) if near_df is not None else 0
     _far_rows_in = len(far_df) if far_df is not None else 0
     _ds_near = 1
