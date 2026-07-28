@@ -2754,8 +2754,43 @@ class FuturesMonitor:
                       console.print(f"[dim][MTS_SYNC] NEAR-leg synced to trader: {self.trader.position} ({_mkt_action})[/dim]")
 
                  self._applied_lifecycle_deals.add(deal_key)
-                 
-                 # 💡 [Fixed 2026-05-27] Execution Quality Audit
+
+                 # Check Combined Exit group completion
+                 _ce_group_id = pending.get("combined_exit_group_id")
+                 if _ce_group_id and hasattr(self, "_combined_exit_groups"):
+                     _ceg = self._combined_exit_groups.get(_ce_group_id)
+                     if _ceg and not _ceg.get("completed"):
+                         if signal == "COMBINED_EXIT_NEAR":
+                             _ceg["near_filled"] = True
+                             _ceg["near_fill_price"] = price
+                         elif signal == "COMBINED_EXIT_FAR":
+                             _ceg["far_filled"] = True
+                             _ceg["far_fill_price"] = price
+
+                         if _ceg.get("near_filled") and _ceg.get("far_filled"):
+                             _ceg["completed"] = True
+                             _mts_strat = self._registry.get("tmf_spread")
+                             if _mts_strat:
+                                 np = _ceg.get("near_fill_price", 0)
+                                 fp = _ceg.get("far_fill_price", 0)
+                                 _mts_strat._reset(reason="combined_exit_filled", exit_price=max(np, fp))
+                                 lc = {"phase": "FLAT"}
+                                 _mts_strat._write_mts_state(has_position=False, action="COMBINED_EXIT_COMPLETED",
+                                     reason="COMBINED_EXIT",
+                                     near_entry=_mts_strat._near_entry, far_entry=_mts_strat._far_entry,
+                                     near_last=np, far_last=fp,
+                                     near_side=_mts_strat._near_side, far_side=_mts_strat._far_side,
+                                     trade_id=_trade_id, ticker=self.ticker,
+                                     lifecycle=lc)
+                                 console.print("[bold green]\u2705 [MTS_ORDER] COMBINED_EXIT COMPLETED: group=" + str(_ce_group_id) + " near=" + str(np) + " far=" + str(fp) + "[/bold green]")
+                             self._append_mts_event("COMBINED_EXIT_COMPLETED",
+                                 group_id=_ce_group_id,
+                                 near_fill_price=np if '_ceg' in dir() else 0,
+                                 far_fill_price=fp if '_ceg' in dir() else 0,
+                                 trade_id=_trade_id)
+
+                 # Execution Quality Audit
+                 _ref_ohlc = pending.get("ref_ohlc", {})
                  _ref_ohlc = pending.get("ref_ohlc", {})
                  _ref_close = float(_ref_ohlc.get("close", 0))
                  _slippage = 0.0
@@ -3863,30 +3898,26 @@ class FuturesMonitor:
             return
 
         elif _action == "COMBINED_EXIT" or _reason in ("TMF_COMBINED_EXIT", "COMBINED_EXIT"):
-            # 2026-07-27 Gemini CLI: Policy J Combined Exit — Exits BOTH legs simultaneously from SPREAD phase
+            # 2026-07-28: Canonical COMBINED_EXIT path — both orders go through
+            # OrderManager and fill callback pipeline. No inline paper_fill_sim.
+            
             # Item 5: Execution Idempotency Claim
             _claim_key = f"{_trade_id}:POLICY_J:COMBINED_EXIT"
             if not hasattr(self, "_claimed_execution_keys"):
                 self._claimed_execution_keys = set()
-
             if _claim_key in self._claimed_execution_keys:
                 console.print(f"[yellow]⚠️ [COMBINED_EXIT_DUPLICATE_SUPPRESSED] trade_id={_trade_id} key={_claim_key}[/yellow]")
                 return
 
             # Item 3: Fail-Closed Side Mapping
-            CLOSE_SIDE = {
-                "LONG": OrderSide.SELL,
-                "SHORT": OrderSide.BUY,
-            }
+            CLOSE_SIDE = {"LONG": OrderSide.SELL, "SHORT": OrderSide.BUY}
             _near_side_raw = getattr(strategy, "_near_side", None)
             _far_side_raw = getattr(strategy, "_far_side", None)
             _near_side_str = str(_near_side_raw).upper() if _near_side_raw else ""
             _far_side_str = str(_far_side_raw).upper() if _far_side_raw else ""
-
             if _near_side_str not in CLOSE_SIDE:
                 console.print(f"[bold red]⛔ [MTS_COMBINED_EXIT_BLOCKED] INVALID_NEAR_POSITION_SIDE: {_near_side_raw}[/bold red]")
                 return
-
             if _far_side_str not in CLOSE_SIDE:
                 console.print(f"[bold red]⛔ [MTS_COMBINED_EXIT_BLOCKED] INVALID_FAR_POSITION_SIDE: {_far_side_raw}[/bold red]")
                 return
@@ -3901,55 +3932,69 @@ class FuturesMonitor:
                 console.print(f"[bold red]⛔ [MTS_COMBINED_EXIT_BLOCKED] INVALID_POSITION_QUANTITY: near={_near_qty} far={_far_qty}[/bold red]")
                 return
 
-            # Claim idempotency key atomically before order creation
+            # Claim idempotency key
             self._claimed_execution_keys.add(_claim_key)
 
-            console.print(f"[yellow]📝 [MTS_ORDER] Submitting Policy J COMBINED_EXIT: NEAR ({_near_order_side} x{_near_qty}) & FAR ({_far_order_side} x{_far_qty})[/yellow]")
+            # Create combined_exit_group_id for correlation
+            _ce_group_id = f"CE-{_trade_id}-{uuid.uuid4().hex[:8]}"
+            console.print(f"[yellow]📝 [MTS_ORDER] Submitting COMBINED_EXIT group={_ce_group_id}: NEAR ({_near_order_side} x{_near_qty}) & FAR ({_far_order_side} x{_far_qty})[/yellow]")
 
             _near_order = self.order_mgr.create_order(symbol=_near_code, side=_near_order_side, order_type=OrderType.MKP, quantity=_near_qty, strategy="MTS_EXIT")
             _far_order = self.order_mgr.create_order(symbol=_far_code, side=_far_order_side, order_type=OrderType.MKP, quantity=_far_qty, strategy="MTS_EXIT")
 
-            self._append_mts_event("ORDER_SUBMITTED", **{
-                **_ev_meta(_near_order),
-                "ref_ohlc": _snap["near"],
-                "leg_role": "REMAINING",
-                "exit_stage": "FINAL_EXIT",
-                "exit_reason": "COMBINED_EXIT",
-                "reason_source": "LIFECYCLE_DECISION",
-            })
-            self._append_mts_event("ORDER_SUBMITTED", **{
-                **_ev_meta(_far_order),
-                "ref_ohlc": _snap["far"],
-                "leg_role": "REMAINING",
-                "exit_stage": "FINAL_EXIT",
-                "exit_reason": "COMBINED_EXIT",
-                "reason_source": "LIFECYCLE_DECISION",
-            })
-
-            self._pending_lifecycle_orders[_near_order.order_id] = {
-                "intent_id": _near_order.intent_id, "signal": "COMBINED_EXIT_NEAR", "reason": "COMBINED_EXIT", 
-                "ts": _ts, "lots": _near_qty, "price": _near_close, "ref_ohlc": _snap["near"],
-                "strategy": "MTS_EXIT",
-            }
-            self._pending_lifecycle_orders[_far_order.order_id] = {
-                "intent_id": _far_order.intent_id, "signal": "COMBINED_EXIT_FAR", "reason": "COMBINED_EXIT", 
-                "ts": _ts, "lots": _far_qty, "price": _far_close, "ref_ohlc": _snap["far"],
-                "strategy": "MTS_EXIT",
-            }
-
+            # Submit both orders
             self.order_mgr.submit(_near_order)
             self.order_mgr.submit(_far_order)
 
+            # Register in pending lifecycle with group_id
+            self._pending_lifecycle_orders[_near_order.order_id] = {
+                "intent_id": _near_order.intent_id, "signal": "COMBINED_EXIT_NEAR", "reason": "COMBINED_EXIT",
+                "ts": _ts, "lots": _near_qty, "price": _near_close, "ref_ohlc": _snap["near"],
+                "strategy": "MTS_EXIT", "combined_exit_group_id": _ce_group_id,
+            }
+            self._pending_lifecycle_orders[_far_order.order_id] = {
+                "intent_id": _far_order.intent_id, "signal": "COMBINED_EXIT_FAR", "reason": "COMBINED_EXIT",
+                "ts": _ts, "lots": _far_qty, "price": _far_close, "ref_ohlc": _snap["far"],
+                "strategy": "MTS_EXIT", "combined_exit_group_id": _ce_group_id,
+            }
+
+            # Append MTS events for audit trail
+            self._append_mts_event("ORDER_SUBMITTED", **{
+                **_ev_meta(_near_order), "ref_ohlc": _snap["near"],
+                "leg_role": "NEAR", "exit_stage": "COMBINED_EXIT",
+                "exit_reason": "COMBINED_EXIT", "combined_exit_group_id": _ce_group_id,
+                "reason_source": "LIFECYCLE_DECISION",
+            })
+            self._append_mts_event("ORDER_SUBMITTED", **{
+                **_ev_meta(_far_order), "ref_ohlc": _snap["far"],
+                "leg_role": "FAR", "exit_stage": "COMBINED_EXIT",
+                "exit_reason": "COMBINED_EXIT", "combined_exit_group_id": _ce_group_id,
+                "reason_source": "LIFECYCLE_DECISION",
+            })
+
+            # Register with paper fill simulator (fill happens in normal tick loop)
             if self.paper_fill_sim:
                 self.paper_fill_sim.register(_near_order)
                 self.paper_fill_sim.register(_far_order)
-                self.paper_fill_sim.process_tick(self._make_synthetic_tick(_near_close, _ts, symbol=_near_code))
-                self.paper_fill_sim.process_tick(self._make_synthetic_tick(_far_close, _ts, symbol=_far_code))
 
-                if self.dry_run or not self.live_trading:
-                    console.print(f"[bold green]✅ [MTS_ORDER] COMBINED_EXIT FILLED: NEAR ({_near_order_side}) & FAR ({_far_order_side})[/bold green]")
+            # Persist orders to Dashboard-readable file
+            self._save_orders_file_wrapper()
+
+            # Track the group for fill completion monitoring
+            if not hasattr(self, "_combined_exit_groups"):
+                self._combined_exit_groups = {}
+            self._combined_exit_groups[_ce_group_id] = {
+                "trade_id": _trade_id,
+                "near_order_id": _near_order.order_id,
+                "far_order_id": _far_order.order_id,
+                "near_filled": False, "near_fill_price": None,
+                "far_filled": False, "far_fill_price": None,
+                "completed": False,
+                "created_at": _ts,
+            }
+
+            console.print(f"[green]📝 [MTS_ORDER] COMBINED_EXIT submitted: NEAR={_near_order.order_id} FAR={_far_order.order_id} group={_ce_group_id}[/green]")
             return
-
         elif _action == "EXIT":
             # Exit remaining leg — determine which one it is from strategy state
             _released = getattr(strategy, "_released_leg", None)
@@ -7017,9 +7062,14 @@ class FuturesMonitor:
             if tracker["far_expected_qty"] == 0 and strategy is not None:
                 _far_qty = getattr(strategy, "_far_open_qty", None)
                 if _far_qty == 0:
-                    tracker["far_expected_qty"] = tracker["near_expected_qty"]
-                    tracker["far_filled_qty"] = tracker["far_expected_qty"]
-                    tracker["far_complete"] = True
+                    # FAIL-CLOSED: Do NOT infer far completion from strategy state.
+                    # Only order/fill evidence can confirm a leg is filled.
+                    # Incident 2026-07-28 Defect B.
+                    console.print(
+                        "[red]\u26d4 [COMBINED_EXIT_FAR_INFERRED_EMPTY] "
+                        f"trade_id={trade_id} far_expected_qty=0 far_open_qty={_far_qty} "
+                        "-- blocking premature completion[/red]"
+                    )
         else:
             tracker["far_price"] = price
             if tracker["far_expected_qty"] == 0:
