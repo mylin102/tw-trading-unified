@@ -77,6 +77,12 @@ from strategies.plugins.futures.active.mts_lifecycle_adapter import (
     PositionLifecycle,
 )
 
+# 2026-07-28 Gemini CLI: Phase 1B Combined Exit Experiment instrumentation
+from strategies.futures.mts.experiment_telemetry.experiment_hook import (
+    observe_release_decision,
+    initialize_experiment,
+)
+
 class ReleaseMode(Enum):
     """MTS release order strategy (ADR-009 Phase 2 placeholder)."""
     TRIGGERED_MARKET = "triggered_market"
@@ -1312,6 +1318,8 @@ class TMFSpread(StrategyBase):
         self._far_side: str | None = None   # "LONG" or "SHORT" at entry
         self._entry_spread_z: float = 0.0   # snapshot at entry, not hot-reloaded
         self._released_leg: str | None = None  # "near" or "far"
+        # 2026-07-28 Gemini CLI: Phase 1B experiment dedup guard
+        self._release_event_id_observed: str | None = None
         self._release_ts: datetime | None = None
         self._release_mono: float = 0.0
         self._peak: float = 0.0  # for long trailing (highest)
@@ -1405,6 +1413,7 @@ class TMFSpread(StrategyBase):
         # ── P0: Trail anchor status (default READY for normal flow) ──
         self._trail_anchor_status: TrailAnchorStatus = TrailAnchorStatus.READY
         self._trail_warmup_tick_count: int = 0
+        self._entry_established_at: float | None = None  # P0: Policy J warmup timestamp
         self._trail_started_at: float | None = None
         self._trail_anchor_source: str | None = None
 
@@ -3133,12 +3142,31 @@ class TMFSpread(StrategyBase):
                     _rem_low = float(bar.get("near_low", 0))
             else:
                 _rem_high = _rem_low = 0.0
-            # ── Track Peak Net Exit PnL TWD for Policy J Live Combined Exit ──
+            # ── P0: Policy J Entry-Initialization Peak Warmup Gate ──
+            # Do not update peak until position is fully established
+            # and warmup period has elapsed. Prevents transient valuation
+            # during two-leg entry from contaminating peak tracking.
+            _ce_eligible = False
+            _warmup_ms = float(self._params.get("policy_j_entry_warmup_ms", 3000.0))
+            _phase = self._lifecycle_oca.phase if self._lifecycle_oca else None
+            _both_legs_open = (getattr(self, "_near_open_qty", 0) > 0
+                              and getattr(self, "_far_open_qty", 0) > 0)
+            if _phase == PositionPhase.SPREAD and _both_legs_open:
+                if self._entry_established_at is None:
+                    self._entry_established_at = time.time()
+                _elapsed_ms = (time.time() - self._entry_established_at) * 1000.0
+                if _elapsed_ms >= _warmup_ms:
+                    _ce_eligible = True
+            elif _phase == PositionPhase.SINGLE_LEG:
+                # Single-leg: peak is always eligible (entry already established)
+                _ce_eligible = True
+            
             _current_net_exit_twd = float(current_pnl * 10.0 - 92.0)
-            if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None:
-                self._peak_net_exit_pnl_twd = 0.0
-            if _current_net_exit_twd > self._peak_net_exit_pnl_twd:
-                self._peak_net_exit_pnl_twd = _current_net_exit_twd
+            if _ce_eligible:
+                if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None:
+                    self._peak_net_exit_pnl_twd = 0.0
+                if _current_net_exit_twd > self._peak_net_exit_pnl_twd:
+                    self._peak_net_exit_pnl_twd = _current_net_exit_twd
 
             # 2026-07-20 Gemini CLI: PR 3B Production Decision Core Cutover (first evaluation block)
             from strategies.plugins.futures.active.mts_lifecycle_adapter import LifecycleEvaluationInput
@@ -3176,6 +3204,48 @@ class TMFSpread(StrategyBase):
             self._ensure_lifecycle_adapter_initialized("LATE_INIT")
             _adapter_res = self._lifecycle_adapter.evaluate(_adapter_input)
             _decision = _adapter_res.decision
+
+            # P1: Write Policy J evaluator snapshot for Dashboard (fail-open)
+            try:
+                import json as _pj_json
+                _snap = {
+                    "snapshot_id": getattr(self, "_last_applied_event_time", datetime.now()).isoformat() if hasattr(datetime, "isoformat") else str(datetime.now()),
+                    "trade_id": getattr(self, "_trade_id", ""),
+                    "event_time": now.isoformat(),
+                    "processed_at": datetime.now().isoformat(),
+                    "lifecycle_phase": str(self._lifecycle_oca.phase.value) if self._lifecycle_oca and hasattr(self._lifecycle_oca.phase, "value") else "",
+                    "entry_fully_established": _both_legs_open if "_both_legs_open" in dir() else False,
+                    "warmup_complete": _ce_eligible if "_ce_eligible" in dir() else False,
+                    "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
+                    "current_net_exit_twd": _current_net_exit_twd if "_current_net_exit_twd" in dir() else 0.0,
+                    "activation_net_pnl_twd": float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
+                    "giveback_twd": float(self._params.get("combined_upl_giveback_twd", 100.0)),
+                    "exit_line_twd": max(0.0, getattr(self, "_peak_net_exit_pnl_twd", 0.0) - float(self._params.get("combined_upl_giveback_twd", 100.0))),
+                    "enabled": self._params.get("enable_combined_upl_trail", False),
+                    "eligible": _ce_eligible if "_ce_eligible" in dir() else False,
+                    "activated": getattr(self, "_peak_net_exit_pnl_twd", 0.0) >= float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
+                    "would_trigger": False,
+                    "giveback_trigger": False,
+                    "decision": str(_decision.action.value) if _decision and hasattr(_decision.action, "value") else ("COMBINED_EXIT" if _decision and _decision.action == LifecycleAction.COMBINED_EXIT else str(_decision.action) if _decision else "NONE"),
+                }
+                _net = getattr(self, "_peak_net_exit_pnl_twd", 0.0) - float(self._params.get("combined_upl_giveback_twd", 100.0))
+                _curr = _current_net_exit_twd if "_current_net_exit_twd" in dir() else 0.0
+                if _net > 0 and _curr < _net:
+                    _snap["giveback_trigger"] = True
+                    _snap["would_trigger"] = True
+                    _snap["trigger_reason"] = "GIVEBACK"
+                elif _snap["activated"] and _snap["eligible"]:
+                    _snap["would_trigger"] = True
+                    _snap["trigger_reason"] = "ACTIVATION"
+                _snap["exit_line_twd"] = max(0.0, _net)
+                _tmp = "/tmp/policy_j_snapshot.json"
+                _tmp2 = _tmp + ".tmp"
+                with open(_tmp2, "w") as _pjf:
+                    _pj_json.dump(_snap, _pjf, default=str, indent=2)
+                import os as _pj_os
+                _pj_os.replace(_tmp2, _tmp)
+            except Exception:
+                pass
 
             # ── Wave J1.5-BR: Policy J Shadow Telemetry Integration Hook ──
             if getattr(self, "_soak_collector", None) is not None:
@@ -3593,6 +3663,44 @@ class TMFSpread(StrategyBase):
                 self._release_mono = time.monotonic()
                 self._released_leg = _rel_leg_str
                 self._release_price = _exit_price
+                
+                # 2026-07-28 Gemini CLI: Phase 1B experiment instrumentation
+                if self._release_event_id_observed is None:
+                    import uuid
+                    _rid = uuid.uuid4().hex[:20]
+                    self._release_event_id_observed = _rid
+                    try:
+                        observe_release_decision(
+                            trade_id=self._trade_id or "",
+                            release_leg=_release_leg.value.upper(),
+                            release_reason=_signal_reason,
+                            release_event_id=_rid,
+                            position_direction="WIDE" if self._near_side == "SHORT" else "NARROW",
+                            near_entry=self._near_entry,
+                            far_entry=self._far_entry,
+                            near_side=self._near_side or "",
+                            far_side=self._far_side or "",
+                            near_bid=near_close,
+                            near_ask=far_close,
+                            near_last=near_close,
+                            far_bid=far_close,
+                            far_ask=far_close,
+                            far_last=far_close,
+                            near_quote_age_ms=0,
+                            far_quote_age_ms=0,
+                            spread_value=near_close - far_close,
+                            spread_z=_risk_meta.get("spread_z"),
+                            atr=_risk_meta.get("atr"),
+                            stop_mult=_risk_meta.get("stop_mult"),
+                            trail_mult=_risk_meta.get("trail_mult"),
+                            release_price=_exit_price,
+                        )
+                    except Exception:
+                        import logging
+                        logging.getLogger(__name__).exception(
+                            "[COMBINED_EXIT_EXPERIMENT_HOOK_FAILED] trade_id=%s release_leg=%s",
+                            self._trade_id, _release_leg.value,
+                        )
                 
                 # 2026-07-14 Gemini CLI: Reset shadow tracking variables on leg release
                 self._shadow_exit_triggered = False
