@@ -33,18 +33,18 @@ import logging
 class NightSessionConfig:
     """Configuration for night session automation."""
     # Paths
-    project_root: Path = Path("/Users/mylin/Documents/mylin102/tw-trading-unified")
+    project_root: Path = Path(__file__).resolve().parents[1]
     
     # Attribution system
-    attribution_dir: Path = project_root / "data" / "attribution"
+    attribution_dir: Path = Path("data/attribution")
     attribution_enabled: bool = True
     attribution_buffer_size: int = 1000
     attribution_flush_interval: int = 300  # 5 minutes
     
     # Monitoring
-    reports_dir: Path = project_root / "reports" / "night_session"
-    alerts_dir: Path = project_root / "alerts" / "night_session"
-    logs_dir: Path = project_root / "logs"
+    reports_dir: Path = Path("reports/night_session")
+    alerts_dir: Path = Path("alerts/night_session")
+    logs_dir: Path = Path("logs")
     
     # Alert thresholds
     starvation_threshold: float = 0.7
@@ -69,7 +69,7 @@ class NightSessionConfig:
     night_session_end_hour: int = 5
     
     def __post_init__(self):
-        """Initialize default values and create directories."""
+        """Initialize default values, resolve paths, and create directories."""
         if self.default_orders is None:
             self.default_orders = [
                 ["counter_vwap", "spring_upthrust", "kbar_feature"],
@@ -82,6 +82,13 @@ class NightSessionConfig:
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self.alerts_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _resolve_path(p: Path) -> Path:
+        """If path is relative, make it absolute relative to project_root."""
+        if not p.is_absolute():
+            return NightSessionConfig.project_root / p
+        return p
 
 
 class NightSessionAutomation:
@@ -498,13 +505,13 @@ def create_default_config():
     config = NightSessionConfig()
     
     config_dict = {
-        "attribution_dir": str(config.attribution_dir),
+        "attribution_dir": "data/attribution",
         "attribution_enabled": config.attribution_enabled,
         "attribution_buffer_size": config.attribution_buffer_size,
         "attribution_flush_interval": config.attribution_flush_interval,
-        "reports_dir": str(config.reports_dir),
-        "alerts_dir": str(config.alerts_dir),
-        "logs_dir": str(config.logs_dir),
+        "reports_dir": "reports/night_session",
+        "alerts_dir": "alerts/night_session",
+        "logs_dir": "logs",
         "starvation_threshold": config.starvation_threshold,
         "priority_impact_threshold": config.priority_impact_threshold,
         "low_evaluation_threshold": config.low_evaluation_threshold,
@@ -556,7 +563,15 @@ def main():
                 config_data = json.load(f)
                 for key, value in config_data.items():
                     if hasattr(config, key):
+                        # Convert path-like strings to Path objects
+                        if key.endswith("_dir") or key == "project_root":
+                            value = Path(value)
                         setattr(config, key, value)
+            # Resolve any relative paths from JSON against project_root
+            config.attribution_dir = NightSessionConfig._resolve_path(config.attribution_dir)
+            config.reports_dir = NightSessionConfig._resolve_path(config.reports_dir)
+            config.alerts_dir = NightSessionConfig._resolve_path(config.alerts_dir)
+            config.logs_dir = NightSessionConfig._resolve_path(config.logs_dir)
         except Exception as e:
             print(f"Error loading config: {e}")
             return
