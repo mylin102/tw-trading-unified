@@ -3599,8 +3599,11 @@ elif _selected_product == "TMF":
                         _pj_activated = _pj.get("activated", False)
                         _pj_would_trigger = _pj.get("would_trigger", False)
                         _pj_decision = _pj.get("decision", "NONE")
-                        _phase_applicable = _snap_phase == "SPREAD"
-                        _suppression_reason = _pj.get("trigger_reason", "")
+                        _phase_applicable = _pj.get("phase_applicable", _snap_phase == "SPREAD")
+                        _execution_eligible = _pj.get("execution_eligible", False)
+                        _suppression_reason = _pj.get("suppression_reason", "")
+                        _entry_filled = _pj.get("entry_fully_established", False)
+                        _both_legs = _pj.get("both_legs_open_now", False)
                         
                         # Build unified display fields
                         _peak_val = _pj.get("peak_net_exit_pnl_twd", 0)
@@ -3610,17 +3613,19 @@ elif _selected_product == "TMF":
                         _giveback_threshold = _pj.get("giveback_twd", 50)
                         _exit_line = _pj.get("exit_line_twd", 0)
                         
-                        # Header: effective status not raw state
+                        # Header: derive from suppression_reason, not raw booleans
                         if _pj_decision == "COMBINED_EXIT":
                             _header = "🚨 **Policy J 組合停利已觸發 (COMBINED EXIT EXECUTING)**"
-                        elif _phase_applicable and _pj_eligible and _pj_activated:
+                        elif _execution_eligible and _pj_activated:
                             _header = "🛡️ **Policy J 組合停利已啟動 (ARMED & TRACKING)**"
-                        elif _phase_applicable and _pj_eligible:
+                        elif _execution_eligible:
                             _header = "🛡️ **Policy J 組合停利監控中 (MONITORING)**"
-                        elif not _phase_applicable and _has_position:
+                        elif _has_position and not _phase_applicable:
                             _header = "ℹ️ **Policy J**: 不適用於目前階段"
+                        elif _suppression_reason == "WARMUP_INCOMPLETE":
+                            _header = "🛡️ **Policy J**: Warmup 進行中"
                         else:
-                            _header = "🛡️ **Policy J 組合停利待命中 (WAITING)**"
+                            _header = "🛡️ **Policy J 狀態**: `WAITING`"
                         
                         _detail_lines = [
                             f"• **決策來源**: `evaluator snapshot`",
@@ -3629,8 +3634,11 @@ elif _selected_product == "TMF":
                             f"• **Lifecycle Phase**: `{_snap_phase}` {'(COMBINED_EXIT 適用)' if _phase_applicable else '(COMBINED_EXIT 不適用)'}",
                             f"",
                             f"**狀態**:",
+                            f"• **Entry Established**: `{_entry_filled}` | **Both Legs Now**: `{_both_legs}`",
                             f"• **Eligible**: `{_pj_eligible}` | **Activated**: `{_pj_activated}`",
+                            f"• **Exec Eligible**: `{_execution_eligible}` | **Phase Applicable**: `{_phase_applicable}`",
                             f"• **Warmup**: `{'完成' if _pj.get('warmup_complete') else '進行中'}`",
+                            f"• **Suppression**: `{_suppression_reason or '-'}`",
                             f"• **Peak Net PnL**: `{_peak_val:+,.0f} TWD`",
                             f"• **Current Net PnL**: `{_current_val:+,.0f} TWD`",
                             f"• **Giveback**: `{_giveback_val:+,.0f} TWD`",
@@ -3640,14 +3648,13 @@ elif _selected_product == "TMF":
                             _detail_lines.extend([
                                 f"• **Activation Threshold**: `{_activation_threshold:,.0f} TWD` {'✅' if _peak_val >= _activation_threshold else '❌'}",
                                 f"• **Exit Line** (Peak - {_giveback_threshold:.0f}): `{_exit_line:+,.0f} TWD`",
-                                f"• **Would Trigger**: `{_pj_would_trigger}` ({_suppression_reason})",
+                                f"• **Would Trigger**: `{_pj_would_trigger}` ({_pj.get('trigger_reason','')})",
                                 f"• **Effective Decision**: `{_pj_decision}`",
                             ])
                         else:
                             _detail_lines.extend([
                                 f"• **Would Trigger** (counterfactual): `{_pj_would_trigger}`",
                                 f"• **Effective Decision**: `{_pj_decision}`",
-                                f"• **Not actionable**: `COMBINED_EXIT only applies during SPREAD phase`",
                             ])
                         
                         _detail_lines.append(f"*(Snapshot age: {_snap_age:.1f}s)*")

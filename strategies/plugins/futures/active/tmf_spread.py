@@ -1414,6 +1414,7 @@ class TMFSpread(StrategyBase):
         self._trail_anchor_status: TrailAnchorStatus = TrailAnchorStatus.READY
         self._trail_warmup_tick_count: int = 0
         self._entry_established_at: float | None = None  # P0: Policy J warmup timestamp
+        self._entry_fully_established: bool = False      # latched once both legs confirmed filled
         self._trail_started_at: float | None = None
         self._trail_anchor_source: str | None = None
 
@@ -3291,6 +3292,10 @@ class TMFSpread(StrategyBase):
                     self._peak_net_exit_pnl_twd = 0.0
                 if _current_net_exit_twd > self._peak_net_exit_pnl_twd:
                     self._peak_net_exit_pnl_twd = _current_net_exit_twd
+            
+            # Latch entry_fully_established: once both legs confirmed, stays True
+            if _both_legs_open and _phase == PositionPhase.SPREAD:
+                self._entry_fully_established = True
 
             # 2026-07-20 Gemini CLI: PR 3B Production Decision Core Cutover (first evaluation block)
             from strategies.plugins.futures.active.mts_lifecycle_adapter import LifecycleEvaluationInput
@@ -3339,9 +3344,13 @@ class TMFSpread(StrategyBase):
                     "event_time": now.isoformat(),
                     "processed_at": datetime.now().isoformat(),
                     "lifecycle_phase": str(self._lifecycle_oca.phase.value) if self._lifecycle_oca and hasattr(self._lifecycle_oca.phase, "value") else "",
-                    "entry_fully_established": (_both_legs_open or _phase == PositionPhase.SINGLE_LEG) if "_both_legs_open" in dir() and "_phase" in dir() else False,
+                    "entry_fully_established": getattr(self, "_entry_fully_established", False),  # latched once both legs confirmed
+                    "both_legs_open_now": _both_legs_open if "_both_legs_open" in dir() else False,
                     "warmup_complete": _peak_eligible if "_peak_eligible" in dir() else False,
                     "position_ready": _peak_eligible if "_peak_eligible" in dir() else False,
+                    "phase_applicable": (_phase == PositionPhase.SPREAD) if "_phase" in dir() and _phase is not None else False,
+                    "execution_eligible": (_peak_eligible and _phase == PositionPhase.SPREAD) if "_peak_eligible" in dir() and "_phase" in dir() and _phase is not None else False,
+                    "suppression_reason": "",  # set below
                     "evaluator_invoked": True,
                     "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
                     "current_net_exit_twd": _current_net_exit_twd if "_current_net_exit_twd" in dir() else 0.0,
@@ -3365,6 +3374,16 @@ class TMFSpread(StrategyBase):
                     _snap["would_trigger"] = True
                     _snap["trigger_reason"] = "ACTIVATION"
                 _snap["exit_line_twd"] = max(0.0, _net)
+                
+                # Suppression reason: why execution_eligible might be False
+                if _snap.get("lifecycle_phase") != "SPREAD":
+                    _snap["suppression_reason"] = "PHASE_" + (_snap.get("lifecycle_phase", "UNKNOWN") or "UNKNOWN")
+                elif not _snap.get("warmup_complete"):
+                    _snap["suppression_reason"] = "WARMUP_INCOMPLETE"
+                elif not _snap.get("both_legs_open_now"):
+                    _snap["suppression_reason"] = "SINGLE_LEG_REMAINING"
+                else:
+                    _snap["suppression_reason"] = ""
                 _tmp = "/tmp/policy_j_snapshot.json"
                 _tmp2 = _tmp + ".tmp"
                 with open(_tmp2, "w") as _pjf:
