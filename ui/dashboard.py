@@ -1099,8 +1099,8 @@ def make_calendar_spread_chart(spread_df):
                 "近月/遠月價格 (藍線: 近月, 橘虛線: 遠月)", 
                 "價差 (綠線: Spread, 藍線: EMA 20, 紫線: EMA 60, 灰陰影: ±1 Std)", 
                 "Raw Z-score (紅線: Raw 20, 橘虛線/綠虛線: 進出場線)",
-                "Z-score 速度 (紫虛: dz/dt, 橙: EMA10)",
-                "Z-score 加速度 (藍: d²z/dt², 橙: EMA10)"
+                "Z-score 速度 (紫: dz/dt) + 加速度×10 (青: d²z/dt²×10)",
+                "Spread Velocity (pts/sec)"
             )
         )
         
@@ -1209,7 +1209,8 @@ def make_calendar_spread_chart(spread_df):
             _z_v_ema = _z_v.ewm(span=10, adjust=False).mean()
             _z_a = _z_v.diff() / _dt.shift(-1).fillna(1)  # z/sec²
             _z_a_ema = _z_a.ewm(span=10, adjust=False).mean()
-            # Row 4: velocity + EMA10
+            _spread_v = spread_df["spread"].diff() / _dt  # pts/sec
+            # Row 4: z-velocity + z-acceleration×10
             fig.add_trace(
                 go.Scatter(
                     x=_clean_list(spread_df["timestamp"], force_str=True),
@@ -1223,30 +1224,20 @@ def make_calendar_spread_chart(spread_df):
             fig.add_trace(
                 go.Scatter(
                     x=_clean_list(spread_df["timestamp"], force_str=True),
-                    y=_clean_list(_z_v_ema * 10),
-                    name="z-score_V EMA10×10",
-                    line=dict(color="#ff7f0e", width=1.5),
+                    y=_clean_list(_z_a * 10),
+                    name="z-score_A×10 (加速度×10)",
+                    line=dict(color="#00bfff", width=1.0),
                     mode="lines"
                 ),
                 row=4, col=1
             )
-            # Row 5: acceleration + EMA10
+            # Row 5: spread velocity (pts/sec)
             fig.add_trace(
                 go.Scatter(
                     x=_clean_list(spread_df["timestamp"], force_str=True),
-                    y=_clean_list(_z_a),
-                    name="z-score_A (加速度)",
-                    line=dict(color="#00bfff", width=1.0),
-                    mode="lines"
-                ),
-                row=5, col=1
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=_clean_list(spread_df["timestamp"], force_str=True),
-                    y=_clean_list(_z_a_ema * 10),
-                    name="z-score_A EMA10×10",
-                    line=dict(color="#ff7f0e", width=1.5),
+                    y=_clean_list(_spread_v),
+                    name="Spread_V (pts/sec)",
+                    line=dict(color="#2ca02c", width=1.2),
                     mode="lines"
                 ),
                 row=5, col=1
@@ -1351,7 +1342,7 @@ def make_calendar_spread_chart(spread_df):
         fig.update_yaxes(title_text="價差點數", row=2, col=1, tickformat=",.1f")
         fig.update_yaxes(title_text="Raw Z-score", row=3, col=1, tickformat=",.2f")
         fig.update_yaxes(title_text="Z Velocity", row=4, col=1, tickformat=",.4f")
-        fig.update_yaxes(title_text="Z Acceleration", row=5, col=1, tickformat=",.4f")
+        fig.update_yaxes(title_text="Spread Velocity (pts/sec)", row=5, col=1, tickformat=",.2f")
         
         return fig
         
