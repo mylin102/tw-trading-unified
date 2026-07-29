@@ -153,7 +153,7 @@ mts:
     release_stop_points: 88
     trail_distance_points: 66
     enable_combined_upl_trail: true
-    combined_upl_activation_net_pnl_twd: 200.0
+    execution_enabled: true    combined_upl_activation_net_pnl_twd: 200.0
     combined_upl_giveback_twd: 50.0
     policy_j_entry_warmup_ms: 3000
     atr_cap: 250.0
