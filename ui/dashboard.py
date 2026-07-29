@@ -1098,8 +1098,8 @@ def make_calendar_spread_chart(spread_df):
             subplot_titles=(
                 "近月/遠月價格 (藍線: 近月, 橘虛線: 遠月)", 
                 "價差 (綠線: Spread, 藍線: EMA 20, 紫線: EMA 60, 灰陰影: ±1 Std)", 
-                "Raw Z-score (紅線: Raw 20, 橘虛線/綠虛線: 進出場線)",
-                "Z-score 速度 (紫虛: dz/dt) / 加速度 (棕點: d²z/dt²)"
+                "Z-score (紅: Rolling 20, 綠點虛: Kalman, 橘/綠虛: 進出場)",
+                "Z-score 速度 (紫虛: dz/dt) / 加速度 (青: d²z/dt²)"
             )
         )
         
@@ -1141,6 +1141,19 @@ def make_calendar_spread_chart(spread_df):
                 ),
                 row=2, col=1
             )
+
+            # Kalman equilibrium estimate
+            if "kalman_mu" in spread_df.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=_clean_list(spread_df["timestamp"], force_str=True),
+                        y=_clean_list(spread_df["kalman_mu"]),
+                        name="Kalman Equilibrium",
+                        line=dict(color="#ff7f0e", width=1.5, dash="dot"),
+                        mode="lines"
+                    ),
+                    row=2, col=1
+                )
             
             # 2026-07-09 Hermes Agent: Add Spread EMA 20 and EMA 60 lines on Row 2
             if "spread_ema_20" in spread_df.columns:
@@ -1199,6 +1212,19 @@ def make_calendar_spread_chart(spread_df):
                 ),
                 row=3, col=1
             )
+
+            # Kalman Z-score (standardized innovation)
+            if "kalman_z" in spread_df.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=_clean_list(spread_df["timestamp"], force_str=True),
+                        y=_clean_list(spread_df["kalman_z"]),
+                        name="Kalman Z (Standardized Innovation)",
+                        line=dict(color="#2ca02c", width=1.5, dash="dot"),
+                        mode="lines"
+                    ),
+                    row=3, col=1
+                )
             
             # Z-score 速度 (dz/dt) 與加速度 (d²z/dt²)
             _t = pd.to_datetime(spread_df["timestamp"])
