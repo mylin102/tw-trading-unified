@@ -1156,12 +1156,12 @@ def make_calendar_spread_chart(spread_df):
                 )
             
             # 2026-07-09 Hermes Agent: Add Spread EMA 20 and EMA 60 lines on Row 2
-            if "spread_ema_20" in spread_df.columns:
+            if "spread_ema_5" in spread_df.columns:
                 fig.add_trace(
                     go.Scatter(
                         x=_clean_list(spread_df["timestamp"], force_str=True),
-                        y=_clean_list(spread_df["spread_ema_20"]),
-                        name="EMA 20",
+                        y=_clean_list(spread_df["spread_ema_5"]),
+                        name="EMA 5",
                         line=dict(color="#1f77b4", width=1.5), # blue
                         mode="lines"
                     ),
@@ -2194,6 +2194,16 @@ def load_calendar_spread_data():
                 print(f"[Calendar Spread] 載入價差資料: {len(df)} 筆, "
                       f"來自 {spread_path.name}, "
                       f"範圍 {df['timestamp'].min()} ~ {df['timestamp'].max()}")
+                # Kalman filter + EMA5 for spread equilibrium
+                try:
+                    from ui.kalman_spread import kalman_local_level
+                    _kf = kalman_local_level(df["spread"], Q=0.01, R=1.0)
+                    for _col in ["kalman_mu", "kalman_z", "kalman_innovation", "kalman_sigma"]:
+                        df[_col] = _kf[_col].values
+                except Exception:
+                    pass
+                if "spread" in df.columns:
+                    df["spread_ema_5"] = df["spread"].ewm(span=5, adjust=False).mean()
                 return df
             print(f"[Calendar Spread] 載入失敗或空資料: {spread_path.name}")
         else:
@@ -2281,6 +2291,15 @@ def load_calendar_spread_data():
         df_merged["price_vs_vwap"] = df_merged["Close_near"] - df_merged["vwap"]
         
         print(f"[Calendar Spread] 計算價差資料完成: {len(df_merged)} 筆")
+        # Kalman filter + EMA5 for spread equilibrium (fallback path)
+        try:
+            from ui.kalman_spread import kalman_local_level
+            _kf = kalman_local_level(df_merged["spread"], Q=0.01, R=1.0)
+            for _col in ["kalman_mu", "kalman_z", "kalman_innovation", "kalman_sigma"]:
+                df_merged[_col] = _kf[_col].values
+        except Exception:
+            pass
+        df_merged["spread_ema_5"] = df_merged["spread"].ewm(span=5, adjust=False).mean()
         return df_merged
         
     except Exception as e:
