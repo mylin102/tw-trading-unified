@@ -3295,9 +3295,10 @@ class TMFSpread(StrategyBase):
             # - Quote coherence is enforced by the Policy J evaluator
             _peak_eligible = False
             _phase = self._lifecycle_oca.phase if self._lifecycle_oca else None
-            _both_legs_open = (getattr(self, "_near_open_qty", 0) > 0
-                              and getattr(self, "_far_open_qty", 0) > 0)
-            if _phase == PositionPhase.SPREAD and _both_legs_open:
+            _entry_ok = getattr(self, "_entry_fully_established", False)
+            _both_legs = (getattr(self, "_near_open_qty", 0) > 0
+                          and getattr(self, "_far_open_qty", 0) > 0)
+            if _phase == PositionPhase.SPREAD and (_entry_ok or _both_legs):
                 _peak_eligible = True
             elif _phase == PositionPhase.SINGLE_LEG:
                 _peak_eligible = True
@@ -3310,7 +3311,7 @@ class TMFSpread(StrategyBase):
                     self._peak_net_exit_pnl_twd = _current_net_exit_twd
             
             # Latch entry_fully_established: once both legs confirmed, stays True
-            if _both_legs_open and _phase == PositionPhase.SPREAD:
+            if _both_legs and _phase == PositionPhase.SPREAD:
                 self._entry_fully_established = True
 
             # 2026-07-20 Gemini CLI: PR 3B Production Decision Core Cutover (first evaluation block)
@@ -3361,7 +3362,7 @@ class TMFSpread(StrategyBase):
                     "processed_at": datetime.now().isoformat(),
                     "lifecycle_phase": str(self._lifecycle_oca.phase.value) if self._lifecycle_oca and hasattr(self._lifecycle_oca.phase, "value") else "",
                     "entry_fully_established": getattr(self, "_entry_fully_established", False),  # latched once both legs confirmed
-                    "both_legs_open_now": _both_legs_open if "_both_legs_open" in dir() else False,
+                    "both_legs_open_now": _both_legs if "_both_legs" in dir() else False,
                     "warmup_complete": _peak_eligible if "_peak_eligible" in dir() else False,
                     "position_ready": _peak_eligible if "_peak_eligible" in dir() else False,
                     "phase_applicable": (_phase == PositionPhase.SPREAD) if "_phase" in dir() and _phase is not None else False,
