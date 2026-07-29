@@ -1098,8 +1098,8 @@ def make_calendar_spread_chart(spread_df):
             subplot_titles=(
                 "近月/遠月價格 (藍線: 近月, 橘虛線: 遠月)", 
                 "價差 (綠線: Spread, 藍線: EMA 20, 紫線: EMA 60, 灰陰影: ±1 Std)", 
-                "Z-score (紅: Rolling 20, 綠點虛: Kalman, 橘/綠虛: 進出場)",
-                "Raw Z (紅: Rolling 20) + 速度 (紫虛: dz/dt) / 加速度×10 (青)"
+                "Raw Z-score (紅線: Raw 20, 橘虛線/綠虛線: 進出場線)",
+                "Z-score 速度 (紫虛: dz/dt) / 加速度 (棕點: d²z/dt²)"
             )
         )
         
@@ -1141,27 +1141,14 @@ def make_calendar_spread_chart(spread_df):
                 ),
                 row=2, col=1
             )
-
-            # Kalman equilibrium estimate
-            if "kalman_mu" in spread_df.columns:
-                fig.add_trace(
-                    go.Scatter(
-                        x=_clean_list(spread_df["timestamp"], force_str=True),
-                        y=_clean_list(spread_df["kalman_mu"]),
-                        name="Kalman Equilibrium",
-                        line=dict(color="#ff6600", width=2),
-                        mode="lines"
-                    ),
-                    row=2, col=1
-                )
             
             # 2026-07-09 Hermes Agent: Add Spread EMA 20 and EMA 60 lines on Row 2
-            if "spread_ema_5" in spread_df.columns:
+            if "spread_ema_20" in spread_df.columns:
                 fig.add_trace(
                     go.Scatter(
                         x=_clean_list(spread_df["timestamp"], force_str=True),
-                        y=_clean_list(spread_df["spread_ema_5"]),
-                        name="EMA 5",
+                        y=_clean_list(spread_df["spread_ema_20"]),
+                        name="EMA 20",
                         line=dict(color="#1f77b4", width=1.5), # blue
                         mode="lines"
                     ),
@@ -1210,21 +1197,8 @@ def make_calendar_spread_chart(spread_df):
                     line=dict(color="#d62728", width=1.5),
                     mode="lines"
                 ),
-                row=4, col=1
+                row=3, col=1
             )
-
-            # Kalman Z-score (standardized innovation)
-            if "kalman_z" in spread_df.columns:
-                fig.add_trace(
-                    go.Scatter(
-                        x=_clean_list(spread_df["timestamp"], force_str=True),
-                        y=_clean_list(spread_df["kalman_z"]),
-                        name="Kalman Z (Standardized Innovation)",
-                        line=dict(color="#00cc00", width=2),  # bright green, solid
-                        mode="lines"
-                    ),
-                    row=3, col=1
-                )
             
             # Z-score 速度 (dz/dt) 與加速度 (d²z/dt²)
             _t = pd.to_datetime(spread_df["timestamp"])
@@ -1245,14 +1219,52 @@ def make_calendar_spread_chart(spread_df):
             fig.add_trace(
                 go.Scatter(
                     x=_clean_list(spread_df["timestamp"], force_str=True),
-                    y=_clean_list(_z_a * 10),
-                    name="z-score_A×10 (加速度×10)",
+                    y=_clean_list(_z_a),
+                    name="z-score_A (加速度)",
                     line=dict(color="#00bfff", width=1.0),
                     mode="lines"
                 ),
                 row=4, col=1
             )
             
+            # 添加 Calendar Condor 策略的進出場水平線 (Row 3)
+            # 進場水平線
+            fig.add_hline(
+                y=3.0, line_dash="dash", line_color="red", 
+                annotation_text="做空價差進場", annotation_position="top right",
+                row=3, col=1
+            )
+            fig.add_hline(
+                y=-3.0, line_dash="dash", line_color="green",
+                annotation_text="做多價差進場", annotation_position="bottom right",
+                row=3, col=1
+            )
+            
+            # 出場水平線
+            fig.add_hline(
+                y=-0.5, line_dash="dot", line_color="orange",
+                annotation_text="做空價差出場", annotation_position="bottom right",
+                row=3, col=1
+            )
+            fig.add_hline(
+                y=0.5, line_dash="dot", line_color="orange",
+                annotation_text="做多價差出場", annotation_position="top right",
+                row=3, col=1
+            )
+            
+            # 停損水平線
+            fig.add_hline(
+                y=3.5, line_dash="dash", line_color="darkred",
+                annotation_text="做空價差停損", annotation_position="top right",
+                row=3, col=1
+            )
+            fig.add_hline(
+                y=-3.5, line_dash="dash", line_color="darkgreen",
+                annotation_text="做多價差停損", annotation_position="bottom right",
+                row=3, col=1
+            )
+            
+            # 零線 on Row 3
             fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=3, col=1)
             # 零線 on Row 4
             fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=4, col=1)
@@ -2156,16 +2168,6 @@ def load_calendar_spread_data():
                 print(f"[Calendar Spread] 載入價差資料: {len(df)} 筆, "
                       f"來自 {spread_path.name}, "
                       f"範圍 {df['timestamp'].min()} ~ {df['timestamp'].max()}")
-                # Kalman filter + EMA5 for spread equilibrium
-                try:
-                    from ui.kalman_spread import kalman_local_level
-                    _kf = kalman_local_level(df["spread"], Q=0.01, R=1.0)
-                    for _col in ["kalman_mu", "kalman_z", "kalman_innovation", "kalman_sigma"]:
-                        df[_col] = _kf[_col].values
-                except Exception:
-                    pass
-                if "spread" in df.columns:
-                    df["spread_ema_5"] = df["spread"].ewm(span=5, adjust=False).mean()
                 return df
             print(f"[Calendar Spread] 載入失敗或空資料: {spread_path.name}")
         else:
@@ -2253,15 +2255,6 @@ def load_calendar_spread_data():
         df_merged["price_vs_vwap"] = df_merged["Close_near"] - df_merged["vwap"]
         
         print(f"[Calendar Spread] 計算價差資料完成: {len(df_merged)} 筆")
-        # Kalman filter + EMA5 for spread equilibrium (fallback path)
-        try:
-            from ui.kalman_spread import kalman_local_level
-            _kf = kalman_local_level(df_merged["spread"], Q=0.01, R=1.0)
-            for _col in ["kalman_mu", "kalman_z", "kalman_innovation", "kalman_sigma"]:
-                df_merged[_col] = _kf[_col].values
-        except Exception:
-            pass
-        df_merged["spread_ema_5"] = df_merged["spread"].ewm(span=5, adjust=False).mean()
         return df_merged
         
     except Exception as e:
