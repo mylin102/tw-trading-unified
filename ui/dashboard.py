@@ -1223,8 +1223,8 @@ def make_calendar_spread_chart(spread_df):
             fig.add_trace(
                 go.Scatter(
                     x=_clean_list(spread_df["timestamp"], force_str=True),
-                    y=_clean_list(_z_v_ema),
-                    name="z-score_V EMA10",
+                    y=_clean_list(_z_v_ema * 10),
+                    name="z-score_V EMA10×10",
                     line=dict(color="#ff7f0e", width=1.5),
                     mode="lines"
                 ),
@@ -1244,8 +1244,8 @@ def make_calendar_spread_chart(spread_df):
             fig.add_trace(
                 go.Scatter(
                     x=_clean_list(spread_df["timestamp"], force_str=True),
-                    y=_clean_list(_z_a_ema),
-                    name="z-score_A EMA10",
+                    y=_clean_list(_z_a_ema * 10),
+                    name="z-score_A EMA10×10",
                     line=dict(color="#ff7f0e", width=1.5),
                     mode="lines"
                 ),
