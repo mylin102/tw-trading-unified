@@ -1253,44 +1253,6 @@ def make_calendar_spread_chart(spread_df):
                 row=4, col=1
             )
             
-            # 添加 Calendar Condor 策略的進出場水平線 (Row 3)
-            # 進場水平線
-            fig.add_hline(
-                y=3.0, line_dash="dash", line_color="red", 
-                annotation_text="做空價差進場", annotation_position="top right",
-                row=3, col=1
-            )
-            fig.add_hline(
-                y=-3.0, line_dash="dash", line_color="green",
-                annotation_text="做多價差進場", annotation_position="bottom right",
-                row=3, col=1
-            )
-            
-            # 出場水平線
-            fig.add_hline(
-                y=-0.5, line_dash="dot", line_color="orange",
-                annotation_text="做空價差出場", annotation_position="bottom right",
-                row=3, col=1
-            )
-            fig.add_hline(
-                y=0.5, line_dash="dot", line_color="orange",
-                annotation_text="做多價差出場", annotation_position="top right",
-                row=3, col=1
-            )
-            
-            # 停損水平線
-            fig.add_hline(
-                y=3.5, line_dash="dash", line_color="darkred",
-                annotation_text="做空價差停損", annotation_position="top right",
-                row=3, col=1
-            )
-            fig.add_hline(
-                y=-3.5, line_dash="dash", line_color="darkgreen",
-                annotation_text="做多價差停損", annotation_position="bottom right",
-                row=3, col=1
-            )
-            
-            # 零線 on Row 3
             fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=3, col=1)
             # 零線 on Row 4
             fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=4, col=1)
