@@ -3648,33 +3648,38 @@ elif _selected_product == "TMF":
                         
                         _detail_lines = [
                             f"• **決策來源**: `evaluator snapshot`",
-                            f"• **Snap ID**: `{_pj.get('snapshot_id','?')[:20]}`",
-                            f"• **Trade ID**: `{_snap_trade}` {'⚠️ 與持倉不匹配' if not _same_trade else '✅' }",
-                            f"• **Lifecycle Phase**: `{_snap_phase}` {'(COMBINED_EXIT 適用)' if _phase_applicable else '(COMBINED_EXIT 不適用)'}",
-                            f"",
-                            f"**狀態**:",
-                            f"• **Entry Established**: `{_entry_filled}` | **Both Legs Now**: `{_both_legs}`",
-                            f"• **Eligible**: `{_pj_eligible}` | **Activated**: `{_pj_activated}`",
-                            f"• **Exec Eligible**: `{_execution_eligible}` | **Phase Applicable**: `{_phase_applicable}`",
-                            f"• **Warmup**: `{'完成' if _pj.get('warmup_complete') else '進行中'}`",
-                            f"• **Suppression**: `{_suppression_reason or '-'}`",
-                            f"• **Peak Net PnL**: `{_peak_val:+,.0f} TWD`",
-                            f"• **Current Net PnL**: `{_current_val:+,.0f} TWD`",
-                            f"• **Giveback**: `{_giveback_val:+,.0f} TWD`",
+                            f"• **Trade ID**: `{_snap_trade}` {'⚠️ 與持倉不匹配' if not _same_trade else ''}  |  "
+                            f"**Phase**: `{_snap_phase}` {'(COMBINED_EXIT 適用)' if _phase_applicable else '(不適用)'}",
                         ]
                         
+                        # Key metrics in columns
+                        _m1, _m2, _m3 = st.columns(3)
+                        _m1.metric("Peak PnL", f"{_peak_val:+,.0f}")
+                        _m2.metric("Current PnL", f"{_current_val:+,.0f}")
+                        _m3.metric("Giveback", f"{_giveback_val:+,.0f}")
+                        
                         if _phase_applicable:
+                            _trigger_reason = _pj.get("trigger_reason", "")
                             _detail_lines.extend([
-                                f"• **Activation Threshold**: `{_activation_threshold:,.0f} TWD` {'✅' if _peak_val >= _activation_threshold else '❌'}",
-                                f"• **Exit Line** (Peak - {_giveback_threshold:.0f}): `{_exit_line:+,.0f} TWD`",
-                                f"• **Would Trigger**: `{_pj_would_trigger}` ({_pj.get('trigger_reason','')})",
-                                f"• **Effective Decision**: `{_pj_decision}`",
+                                f"• **Activation**: `{_peak_val:+,.0f} / {_activation_threshold:+,.0f} TWD` {'✅' if _peak_val >= _activation_threshold else '❌'}  |  "
+                                f"**Exit Line**: `{_exit_line:+,.0f} TWD`  |  "
+                                f"**Would Trigger**: `{_pj_would_trigger}` ({_trigger_reason})" if _trigger_reason else f"**Would Trigger**: `{_pj_would_trigger}`",
                             ])
                         else:
                             _detail_lines.extend([
                                 f"• **Would Trigger** (counterfactual): `{_pj_would_trigger}`",
-                                f"• **Effective Decision**: `{_pj_decision}`",
                             ])
+                        
+                        
+                        # Suppression info as caption
+                        if _suppression_reason:
+                            _reason_map = {
+                                "WARMUP_INCOMPLETE": "Warmup 未完成 — 等待進場穩定",
+                                "PHASE_SINGLE_LEG": "單腿階段，COMBINED_EXIT 不適用",
+                                "PHASE_FLAT": "無持倉",
+                            }
+                            _reason_text = _reason_map.get(_suppression_reason, _suppression_reason)
+                            _detail_lines.append(f"📎 **{_reason_text}**")
                         
                         _detail_lines.append(f"*(Snapshot age: {_snap_age:.1f}s)*")
                         
