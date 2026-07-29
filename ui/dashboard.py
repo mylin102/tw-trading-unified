@@ -1099,7 +1099,7 @@ def make_calendar_spread_chart(spread_df):
                 "近月/遠月價格 (藍線: 近月, 橘虛線: 遠月)", 
                 "價差 (綠線: Spread, 藍線: EMA 20, 紫線: EMA 60, 灰陰影: ±1 Std)", 
                 "Z-score (紅: Rolling 20, 綠點虛: Kalman, 橘/綠虛: 進出場)",
-                "Z-score 速度 (紫虛: dz/dt) / 加速度 (青: d²z/dt²)"
+                "Raw Z (紅: Rolling 20) + 速度 (紫虛: dz/dt) / 加速度×10 (青)"
             )
         )
         
@@ -1210,7 +1210,7 @@ def make_calendar_spread_chart(spread_df):
                     line=dict(color="#d62728", width=1.5),
                     mode="lines"
                 ),
-                row=3, col=1
+                row=4, col=1
             )
 
             # Kalman Z-score (standardized innovation)
@@ -1245,8 +1245,8 @@ def make_calendar_spread_chart(spread_df):
             fig.add_trace(
                 go.Scatter(
                     x=_clean_list(spread_df["timestamp"], force_str=True),
-                    y=_clean_list(_z_a),
-                    name="z-score_A (加速度)",
+                    y=_clean_list(_z_a * 10),
+                    name="z-score_A×10 (加速度×10)",
                     line=dict(color="#00bfff", width=1.0),
                     mode="lines"
                 ),
