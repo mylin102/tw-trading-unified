@@ -1091,15 +1091,16 @@ def make_calendar_spread_chart(spread_df):
         
         # 創建 4 行子圖 (新增第4行: 速度/加速度)
         fig = make_subplots(
-            rows=4, cols=1,
+            rows=5, cols=1,
             shared_xaxes=True,
-            row_heights=[0.35, 0.25, 0.2, 0.2],
+            row_heights=[0.3, 0.2, 0.2, 0.15, 0.15],
             vertical_spacing=0.06,
             subplot_titles=(
                 "近月/遠月價格 (藍線: 近月, 橘虛線: 遠月)", 
                 "價差 (綠線: Spread, 藍線: EMA 20, 紫線: EMA 60, 灰陰影: ±1 Std)", 
                 "Raw Z-score (紅線: Raw 20, 橘虛線/綠虛線: 進出場線)",
-                "Z-score 速度 (紫虛: dz/dt) / 加速度 (棕點: d²z/dt²)"
+                "Z-score 速度 (紫虛: dz/dt, 橙: EMA10)",
+                "Z-score 加速度 (藍: d²z/dt², 橙: EMA10)"
             )
         )
         
@@ -1205,7 +1206,10 @@ def make_calendar_spread_chart(spread_df):
             _dt = _t.diff().dt.total_seconds().fillna(1).clip(lower=1)
             _z = spread_df["spread_z"]
             _z_v = _z.diff() / _dt  # z/sec
+            _z_v_ema = _z_v.ewm(span=10, adjust=False).mean()
             _z_a = _z_v.diff() / _dt.shift(-1).fillna(1)  # z/sec²
+            _z_a_ema = _z_a.ewm(span=10, adjust=False).mean()
+            # Row 4: velocity + EMA10
             fig.add_trace(
                 go.Scatter(
                     x=_clean_list(spread_df["timestamp"], force_str=True),
@@ -1219,12 +1223,33 @@ def make_calendar_spread_chart(spread_df):
             fig.add_trace(
                 go.Scatter(
                     x=_clean_list(spread_df["timestamp"], force_str=True),
+                    y=_clean_list(_z_v_ema),
+                    name="z-score_V EMA10",
+                    line=dict(color="#ff7f0e", width=1.5),
+                    mode="lines"
+                ),
+                row=4, col=1
+            )
+            # Row 5: acceleration + EMA10
+            fig.add_trace(
+                go.Scatter(
+                    x=_clean_list(spread_df["timestamp"], force_str=True),
                     y=_clean_list(_z_a),
                     name="z-score_A (加速度)",
                     line=dict(color="#00bfff", width=1.0),
                     mode="lines"
                 ),
-                row=4, col=1
+                row=5, col=1
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=_clean_list(spread_df["timestamp"], force_str=True),
+                    y=_clean_list(_z_a_ema),
+                    name="z-score_A EMA10",
+                    line=dict(color="#ff7f0e", width=1.5),
+                    mode="lines"
+                ),
+                row=5, col=1
             )
             
             # 添加 Calendar Condor 策略的進出場水平線 (Row 3)
@@ -1268,6 +1293,7 @@ def make_calendar_spread_chart(spread_df):
             fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=3, col=1)
             # 零線 on Row 4
             fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=4, col=1)
+            fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=5, col=1)
         
         # 2026-07-09 Hermes Agent: Mark session open/close boundaries on X-axis (open = green, close = red)
         import pandas as pd
@@ -1307,7 +1333,7 @@ def make_calendar_spread_chart(spread_df):
         
         # 移除非交易時段 & 確保每個子圖都單獨顯示時間軸
         # 2026-07-09 Hermes Agent: Force showticklabels=True on all rows so each subplot has an x-axis
-        for r in range(1, 4):
+        for r in range(1, 6):
             fig.update_xaxes(
                 showticklabels=True,
                 rangebreaks=[
@@ -1324,6 +1350,8 @@ def make_calendar_spread_chart(spread_df):
         fig.update_yaxes(title_text="價格", row=1, col=1, tickformat=",.0f")
         fig.update_yaxes(title_text="價差點數", row=2, col=1, tickformat=",.1f")
         fig.update_yaxes(title_text="Raw Z-score", row=3, col=1, tickformat=",.2f")
+        fig.update_yaxes(title_text="Z Velocity", row=4, col=1, tickformat=",.4f")
+        fig.update_yaxes(title_text="Z Acceleration", row=5, col=1, tickformat=",.4f")
         
         return fig
         
