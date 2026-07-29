@@ -1149,7 +1149,7 @@ def make_calendar_spread_chart(spread_df):
                         x=_clean_list(spread_df["timestamp"], force_str=True),
                         y=_clean_list(spread_df["kalman_mu"]),
                         name="Kalman Equilibrium",
-                        line=dict(color="#ff7f0e", width=1.5, dash="dot"),
+                        line=dict(color="#ff6600", width=2),
                         mode="lines"
                     ),
                     row=2, col=1
@@ -1220,7 +1220,7 @@ def make_calendar_spread_chart(spread_df):
                         x=_clean_list(spread_df["timestamp"], force_str=True),
                         y=_clean_list(spread_df["kalman_z"]),
                         name="Kalman Z (Standardized Innovation)",
-                        line=dict(color="#2ca02c", width=1.5, dash="dot"),
+                        line=dict(color="#00cc00", width=2),  # bright green, solid
                         mode="lines"
                     ),
                     row=3, col=1
