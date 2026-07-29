@@ -2152,10 +2152,18 @@ class TMFSpread(StrategyBase):
             self._far_side = "LONG" if _far_side in ("LONG", "BUY") else "SHORT"
             self._near_open_qty = _latest_open_near_qty
             self._far_open_qty = _latest_open_far_qty
+            self._entry_fully_established = True  # both legs confirmed by fills
+            self._peak_net_exit_pnl_twd = 0.0    # reset peak for fresh tracking
             self._released_leg = None
             self._trade_id = _latest_open_tid
             self._lifecycle = "OPEN"
             self._position_epoch = _latest_open_tid
+            # Ensure lifecycle OCA is in SPREAD for Policy J eligibility
+            if not hasattr(self, "_lifecycle_oca") or self._lifecycle_oca is None:
+                self._lifecycle_oca = PositionLifecycle(phase=PositionPhase.SPREAD)
+            else:
+                self._lifecycle_oca.phase = PositionPhase.SPREAD
+                self._lifecycle_oca.release_group.status = ReleaseGroupStatus.ARMED
 
             for rf in _release_fills:
                 _rf_price = rf.get("price")
