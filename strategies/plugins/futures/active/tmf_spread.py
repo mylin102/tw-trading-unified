@@ -3339,7 +3339,7 @@ class TMFSpread(StrategyBase):
                     "event_time": now.isoformat(),
                     "processed_at": datetime.now().isoformat(),
                     "lifecycle_phase": str(self._lifecycle_oca.phase.value) if self._lifecycle_oca and hasattr(self._lifecycle_oca.phase, "value") else "",
-                    "entry_fully_established": _both_legs_open if "_both_legs_open" in dir() else False,
+                    "entry_fully_established": (_both_legs_open or _phase == PositionPhase.SINGLE_LEG) if "_both_legs_open" in dir() and "_phase" in dir() else False,
                     "warmup_complete": _peak_eligible if "_peak_eligible" in dir() else False,
                     "position_ready": _peak_eligible if "_peak_eligible" in dir() else False,
                     "evaluator_invoked": True,

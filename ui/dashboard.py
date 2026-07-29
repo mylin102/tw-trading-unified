@@ -3561,70 +3561,103 @@ elif _selected_product == "TMF":
                 _u2.metric("遠月 UPL", f"{_fr:+,.0f} TWD")
                 _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
 
-                # P1: Policy J Authority Display — reads single evaluator snapshot. No local recompute.
+                # P1: Policy J Authority Display — reads evaluator snapshot, validated against position state.
                 try:
+                    # Load position state for identity matching
+                    _pos_state = _mts_state if isinstance(_mts_state, dict) else {}
+                    _pos_trade_id = _pos_state.get("trade_id") or _pos_state.get("trade_id_auto")
+                    _pos_phase = _pos_state.get("lifecycle_phase") or _pos_state.get("phase")
+                    _has_position = _pos_state.get("has_position", False)
+                    
+                    # Load Policy J evaluator snapshot (authoritative decision source)
                     _pj_snap_path = Path("/tmp/policy_j_snapshot.json")
                     if _pj_snap_path.exists():
                         _pj = json.loads(_pj_snap_path.read_text())
-                        _snap_age = (time.time() - _pj_snap_path.stat().st_mtime) if _pj_snap_path.exists() else 999
+                        _snap_age = time.time() - _pj_snap_path.stat().st_mtime
+                        _snap_stale = _snap_age > 30.0
                     else:
                         _pj = None
                         _snap_age = 999
+                        _snap_stale = True
                     
-                    _snap_stale = _snap_age > 30.0  # stale after 30s
-                    
-                    if _pj and not _snap_stale:
+                    if not _pj or _snap_stale:
+                        # No valid snapshot
+                        _cause = "無快照" if _pj is None else f"快照過期 ({int(_snap_age)}s)"
+                        st.info(
+                            f"🛡️ **Policy J 狀態**: `UNKNOWN — {_cause}`  \\n"
+                            f"• **Snapshot**: `{'不存在' if _pj is None else _pj.get('snapshot_id','?')[:20]}`  \\n"
+                            f"• **Age**: `{_snap_age:.1f}s`  \\n"
+                            f"• **Fallback**: `Dashboard 不自行計算 Policy J 決策`"
+                        )
+                    else:
+                        # Cross-validate: snapshot trade_id must match position
+                        _snap_trade = _pj.get("trade_id", "")
+                        _snap_phase = _pj.get("lifecycle_phase", "")
+                        _same_trade = not _has_position or (_pos_trade_id and _snap_trade == _pos_trade_id)
+                        
                         _pj_eligible = _pj.get("eligible", False)
                         _pj_activated = _pj.get("activated", False)
                         _pj_would_trigger = _pj.get("would_trigger", False)
                         _pj_decision = _pj.get("decision", "NONE")
+                        _phase_applicable = _snap_phase == "SPREAD"
+                        _suppression_reason = _pj.get("trigger_reason", "")
+                        
+                        # Build unified display fields
+                        _peak_val = _pj.get("peak_net_exit_pnl_twd", 0)
+                        _current_val = _pj.get("current_net_exit_twd", 0)
+                        _giveback_val = _peak_val - _current_val
+                        _activation_threshold = _pj.get("activation_net_pnl_twd", 200)
+                        _giveback_threshold = _pj.get("giveback_twd", 50)
+                        _exit_line = _pj.get("exit_line_twd", 0)
+                        
+                        # Header: effective status not raw state
+                        if _pj_decision == "COMBINED_EXIT":
+                            _header = "🚨 **Policy J 組合停利已觸發 (COMBINED EXIT EXECUTING)**"
+                        elif _phase_applicable and _pj_eligible and _pj_activated:
+                            _header = "🛡️ **Policy J 組合停利已啟動 (ARMED & TRACKING)**"
+                        elif _phase_applicable and _pj_eligible:
+                            _header = "🛡️ **Policy J 組合停利監控中 (MONITORING)**"
+                        elif not _phase_applicable and _has_position:
+                            _header = "ℹ️ **Policy J**: 不適用於目前階段"
+                        else:
+                            _header = "🛡️ **Policy J 組合停利待命中 (WAITING)**"
+                        
+                        _detail_lines = [
+                            f"• **決策來源**: `evaluator snapshot`",
+                            f"• **Snap ID**: `{_pj.get('snapshot_id','?')[:20]}`",
+                            f"• **Trade ID**: `{_snap_trade}` {'⚠️ 與持倉不匹配' if not _same_trade else '✅' }",
+                            f"• **Lifecycle Phase**: `{_snap_phase}` {'(COMBINED_EXIT 適用)' if _phase_applicable else '(COMBINED_EXIT 不適用)'}",
+                            f"",
+                            f"**狀態**:",
+                            f"• **Eligible**: `{_pj_eligible}` | **Activated**: `{_pj_activated}`",
+                            f"• **Warmup**: `{'完成' if _pj.get('warmup_complete') else '進行中'}`",
+                            f"• **Peak Net PnL**: `{_peak_val:+,.0f} TWD`",
+                            f"• **Current Net PnL**: `{_current_val:+,.0f} TWD`",
+                            f"• **Giveback**: `{_giveback_val:+,.0f} TWD`",
+                        ]
+                        
+                        if _phase_applicable:
+                            _detail_lines.extend([
+                                f"• **Activation Threshold**: `{_activation_threshold:,.0f} TWD` {'✅' if _peak_val >= _activation_threshold else '❌'}",
+                                f"• **Exit Line** (Peak - {_giveback_threshold:.0f}): `{_exit_line:+,.0f} TWD`",
+                                f"• **Would Trigger**: `{_pj_would_trigger}` ({_suppression_reason})",
+                                f"• **Effective Decision**: `{_pj_decision}`",
+                            ])
+                        else:
+                            _detail_lines.extend([
+                                f"• **Would Trigger** (counterfactual): `{_pj_would_trigger}`",
+                                f"• **Effective Decision**: `{_pj_decision}`",
+                                f"• **Not actionable**: `COMBINED_EXIT only applies during SPREAD phase`",
+                            ])
+                        
+                        _detail_lines.append(f"*(Snapshot age: {_snap_age:.1f}s)*")
                         
                         if _pj_decision == "COMBINED_EXIT":
-                            st.warning(
-                                f"🚨 **Policy J 組合停利已觸發平倉中 (EXECUTING COMBINED EXIT)**  \n"
-                                f"• **決策來源**: `evaluator snapshot`  \n"
-                                f"• **Snap ID**: `{_pj.get('snapshot_id','?')[:20]}`  \n"
-                                f"• **Trade ID**: `{_pj.get('trade_id','?')}`  \n"
-                                f"• **當前淨利**: `{_pj.get('current_net_exit_twd',0):+,.0f} TWD`  \n"
-                                f"• **最高淨利 Peak**: `{_pj.get('peak_net_exit_pnl_twd',0):+,.0f} TWD`  \n"
-                                f"• **平倉線**: `{_pj.get('exit_line_twd',0):+,.0f} TWD`  \n"
-                                f"*(Snapshot age: {_snap_age:.1f}s)*"
-                            )
-                        elif _pj_eligible and _pj_activated:
-                            _trigger_line = max(0.0, _pj.get("peak_net_exit_pnl_twd", 0) - _pj.get("giveback_twd", 50))
-                            st.success(
-                                f"🛡️ **Policy J 組合停利已啟動 (ARMED & TRACKING)**  \n"
-                                f"• **決策來源**: `evaluator snapshot`  \n"
-                                f"• **當前淨利**: `{_pj.get('current_net_exit_twd',0):+,.0f} TWD`  \n"
-                                f"• **最高淨利 Peak**: `{_pj.get('peak_net_exit_pnl_twd',0):+,.0f} TWD`  \n"
-                                f"• **啟動門檻**: `{_pj.get('activation_net_pnl_twd',200):,.0f} TWD` (已超越)  \n"
-                                f"• **平倉觸發線**: `{_trigger_line:+,.0f} TWD` (Peak - {_pj.get('giveback_twd',50):.0f} TWD)  \n"
-                                f"*(Snapshot age: {_snap_age:.1f}s)*"
-                            )
-                        elif _pj_eligible:
-                            _diff = _pj.get("activation_net_pnl_twd", 200) - _pj.get("current_net_exit_twd", 0)
-                            st.info(
-                                f"🛡️ **Policy J 組合停利監控中 (MONITORING)**  \n"
-                                f"• **當前淨利**: `{_pj.get('current_net_exit_twd',0):+,.0f} TWD`  \n"
-                                f"• **啟動門檻**: `{_pj.get('activation_net_pnl_twd',200):,.0f} TWD` (尚差 {_diff:,.0f} TWD)  \n"
-                                f"• **Warmup**: `{'完成' if _pj.get('warmup_complete') else '進行中'}`  \n"
-                                f"*(Snapshot age: {_snap_age:.1f}s)*"
-                            )
+                            st.warning("\n".join(["🚨 **Policy J 組合停利已觸發平倉中 (EXECUTING COMBINED EXIT)**  \\n"] + _detail_lines))
+                        elif _phase_applicable and _pj_eligible and _pj_activated:
+                            st.success("\n".join([_header + "  \\n"] + _detail_lines))
                         else:
-                            _reason = "Warmup 未完成" if not _pj.get("warmup_complete") else "進場未穩定" if not _pj.get("entry_fully_established") else "未達門檻"
-                            st.info(
-                                f"🛡️ **Policy J 組合停利待命中 (WAITING)**  \n"
-                                f"• **原因**: `{_reason}`  \n"
-                                f"• **Eligible**: `{_pj_eligible}`  \n"
-                                f"• **Warmup**: `{_pj.get('warmup_complete',False)}`  \n"
-                                f"*(Snapshot age: {_snap_age:.1f}s)*"
-                            )
-                    else:
-                        st.info(
-                            f"🛡️ **Policy J 狀態**: `{'UNKNOWN — 無快照' if _pj is None else 'STALE — 快照過期 (' + str(int(_snap_age)) + 's)'}`  \n"
-                            f"• **Snapshot age**: `{_snap_age:.1f}s`  \n"
-                            f"• **Fallback**: `停用 — Dashboard 不自行計算 Policy J 決策`"
-                        )
+                            st.info("\n".join([_header + "  \\n"] + _detail_lines))
                 except Exception:
                     st.info("🛡️ **Policy J 狀態**: `UNKNOWN — 讀取快照失敗`")
                 
