@@ -1314,6 +1314,8 @@ class TMFSpread(StrategyBase):
         self._reentry_cooldown_secs: int = 300      # 2026-05-27 Gemini CLI: 5 min default cooldown
         self._near_entry: float = 0.0
         self._far_entry: float = 0.0
+        self._near_open_qty: int = 0          # live qty tracking (not just recovery)
+        self._far_open_qty: int = 0
         self._near_side: str | None = None  # "LONG" or "SHORT" at entry
         self._far_side: str | None = None   # "LONG" or "SHORT" at entry
         self._entry_spread_z: float = 0.0   # snapshot at entry, not hot-reloaded
@@ -1581,6 +1583,8 @@ class TMFSpread(StrategyBase):
         self._side = None  # None until release as per contract tests
         self._near_entry = near_entry
         self._far_entry = far_entry
+        self._near_open_qty = 1
+        self._far_open_qty = 1
         self._near_side = "LONG" if side == "LONG" else "SHORT"
         self._far_side = "SHORT" if side == "LONG" else "LONG"
         self._entry_spread_z = entry_spread_z
@@ -1656,6 +1660,10 @@ class TMFSpread(StrategyBase):
 
         self._released_leg = released_leg.value.lower()
         self._release_ts = event_time or datetime.now()
+        if released_leg == Leg.NEAR:
+            self._near_open_qty = 0
+        else:
+            self._far_open_qty = 0
         self._single_leg_started_at = self._release_ts
         self._release_mono = time.monotonic()
         # 2026-07-22 Gemini CLI: Avoid release price defaulting to 0.0 or remaining_leg_price if invalid
@@ -4307,6 +4315,8 @@ class TMFSpread(StrategyBase):
         # 2026-07-01 Gemini CLI: Set in-memory position state to False first to prevent concurrent tick heartbeats from overwriting the file with True.
         self._has_position = False
         self._lifecycle = "FLAT"
+        self._near_open_qty = 0
+        self._far_open_qty = 0
         # ADR-009 Phase 2 / Task 7: sync lifecycle to FLAT after exit fill
         if hasattr(self, '_lifecycle_oca'):
             _was_trailing = self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG
