@@ -7175,6 +7175,24 @@ class FuturesMonitor:
                 trade_id=trade_id, ticker=getattr(self, "ticker", "TMF"),
                 lifecycle={},
             )
+            # 2026-07-30: Append TRADE_SETTLED to spread events log for dashboard closed-loops display
+            try:
+                from strategies.plugins.futures.active.tmf_spread import _append_event
+                _append_event("TRADE_SETTLED",
+                    trade_id=trade_id,
+                    session=tracker.get("entry_session", "day"),
+                    entry_price=tracker.get("entry_price", 0),
+                    exit_price=price,
+                    net_pnl=tracker.get("net_pnl", 0),
+                    near_pnl=tracker.get("near_realized_pnl", 0),
+                    far_pnl=tracker.get("far_realized_pnl", 0),
+                    exit_reason="COMBINED_EXIT",
+                    risk_mode="COMBINED_EXIT",
+                )
+            except Exception:
+                import logging
+                logging.getLogger().warning("[COMBINED_EXIT_SETTLEMENT_EVENT_FAILED] trade_id=%s", trade_id)
+
             console.print(f"[bold green]✅ [COMBINED_EXIT_COMPLETED] Trade {trade_id} settled -> FLAT[/bold green]")
 
         # ADR-024E: Post-exit reconciliation gate

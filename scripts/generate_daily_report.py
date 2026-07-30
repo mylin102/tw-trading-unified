@@ -128,7 +128,7 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
                         trades[trade_id]["session"] = session
                     elif fill_type == "RELEASE":
                         trades[trade_id]["release"] = fill
-                    elif fill_type == "EXIT":
+                    elif fill_type in ("EXIT", "COMBINED_EXIT"):
                         trades[trade_id]["exit"] = fill
                         trades[trade_id]["exit_ts"] = ts_str
                 except Exception as e:
