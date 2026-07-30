@@ -1710,6 +1710,7 @@ class TMFSpread(StrategyBase):
             ticker=self._ticker,
             atr=self._last_atr or 0.0,
             lifecycle=self._current_lifecycle_state(),
+            peak_net_exit_pnl_twd=getattr(self, _peak_net_exit_pnl_twd, 0.0),
         )
 
     def _pnl_far(self, far_close: float) -> float:
@@ -1842,6 +1843,7 @@ class TMFSpread(StrategyBase):
             ticker=self._ticker,
             atr=self._last_atr,
             lifecycle=self._current_lifecycle_state(),
+            peak_net_exit_pnl_twd=getattr(self, _peak_net_exit_pnl_twd, 0.0),
             **kw
         )
 
@@ -2701,6 +2703,7 @@ class TMFSpread(StrategyBase):
             ticker=self._ticker,
             atr=self._last_atr, # 2026-06-26 Gemini CLI: pass current ATR to state writer
             lifecycle=self._current_lifecycle_state(),
+            peak_net_exit_pnl_twd=getattr(self, _peak_net_exit_pnl_twd, 0.0),
         )
         _append_event("ENTRY_SUBMITTED", action=_action, near_side=self._near_side, far_side=self._far_side,
                        near_entry=near_close, far_entry=far_close, spread_z=spread_z_f,
@@ -3625,6 +3628,7 @@ class TMFSpread(StrategyBase):
                 trail_distance_points=trail_dist, trade_id=self._trade_id,
                 ticker=self._ticker,
                 lifecycle=self._current_lifecycle_state(),
+            peak_net_exit_pnl_twd=getattr(self, _peak_net_exit_pnl_twd, 0.0),
                 **_risk_meta
             )
             return None
@@ -3831,6 +3835,7 @@ class TMFSpread(StrategyBase):
             release_stop_points=release_stop, trail_distance_points=trail_dist,
             trade_id=self._trade_id, ticker=self._ticker,
             lifecycle=self._current_lifecycle_state(),
+            peak_net_exit_pnl_twd=getattr(self, _peak_net_exit_pnl_twd, 0.0),
             **_risk_meta
         )
         self._last_applied_event_time = now
