@@ -3963,6 +3963,17 @@ class FuturesMonitor:
             # Submit both orders
             self.order_mgr.submit(_near_order)
             self.order_mgr.submit(_far_order)
+            # 2026-07-30: Write state to COMBINED_EXIT only AFTER successful submission
+            try:
+                from strategies.plugins.futures.active.tmf_spread import _write_mts_state
+                _write_mts_state(
+                    has_position=True, action="COMBINED_EXIT",
+                    reason="COMBINED_EXIT",
+                    trade_id=_trade_id, ticker=getattr(self, "ticker", "TMF"),
+                )
+            except Exception:
+                import logging
+                logging.getLogger().warning("[COMBINED_EXIT_STATE_WRITE_FAILED] trade_id=%s", _trade_id)
 
             # Register in pending lifecycle with group_id
             self._pending_lifecycle_orders[_near_order.order_id] = {

@@ -77,12 +77,6 @@ from strategies.plugins.futures.active.mts_lifecycle_adapter import (
     PositionLifecycle,
 )
 
-# 2026-07-28 Gemini CLI: Phase 1B Combined Exit Experiment instrumentation
-from strategies.futures.mts.experiment_telemetry.experiment_hook import (
-    observe_release_decision,
-    initialize_experiment,
-)
-
 class ReleaseMode(Enum):
     """MTS release order strategy (ADR-009 Phase 2 placeholder)."""
     TRIGGERED_MARKET = "triggered_market"
@@ -464,15 +458,13 @@ from strategies.plugins.futures.active.mts_lifecycle_adapter import (
 
 
 def _commit_action(lifecycle: PositionLifecycle, decision: LifecycleDecision) -> None:
-    """Apply lifecycle state transition. No side effects — no filesystem, no Shioaji.
-
-    ADR-009 Task 9: TRAIL decision no longer pushes trail_group to SUBMITTED.
-    SUBMITTED is now set only after broker order submit succeeds (with exit_order_id).
-    This prevents the orphan SUBMITTED + exit_order_id=null deadlock.
-    """
-    if decision.action == LifecycleAction.RELEASE:
+    """Apply lifecycle state transition. No side effects — no filesystem, no Shioaji."""
+    if decision.action in (LifecycleAction.RELEASE, LifecycleAction.COMBINED_EXIT):
         lifecycle.release_group.status = ReleaseGroupStatus.TRIGGERED
-    # TRAIL: status stays ARMED/ACTIVE until monitor confirms order submit
+        if decision.action == LifecycleAction.COMBINED_EXIT:
+            lifecycle.exit_owner = "POLICY_J"
+        elif decision.action == LifecycleAction.RELEASE:
+            lifecycle.exit_owner = "RELEASE"
 
 
 def _append_event(event_type: str, **kwargs) -> None:
@@ -502,110 +494,6 @@ def _session_label() -> str:
 _LIVE_TICK = "LIVE_TICK"
 _MISSING = "MISSING"
 _UNSET = "UNSET"
-
-# ADR-024E.1: Durable JSONL append with flush + fsync
-_SETTLEMENT_FAILURE_LATCH = os.getenv(
-    "MTS_SETTLEMENT_FAILURE_LATCH",
-    "data/runtime/mts_settlement_failure.json",
-)
-_CRITICAL_FAILURE_SENTINEL = os.getenv(
-    "MTS_CRITICAL_FAILURE_SENTINEL",
-    "data/runtime/mts_critical_failure.sentinel",
-)
-
-
-def _append_jsonl_durable(path: str, record: dict) -> None:
-    """Append JSONL record with flush + fsync for durability."""
-    _dir = os.path.dirname(path)
-    if _dir and not os.path.exists(_dir):
-        os.makedirs(_dir, exist_ok=True)
-    payload = json.dumps(record, default=str, ensure_ascii=False) + "\n"
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(payload)
-        f.flush()
-        os.fsync(f.fileno())
-
-
-def _write_settlement_failure_latch(
-    trade_id: str,
-    execution_id: str,
-    *,
-    near_filled_qty: int = 0,
-    near_expected_qty: int = 0,
-    far_filled_qty: int = 0,
-    far_expected_qty: int = 0,
-    failure_reason: str = "COMBINED_EXIT_LEDGER_APPEND_FAILED",
-) -> None:
-    """Atomically write a persistent settlement failure latch."""
-    state = {
-        "schema_version": 1,
-        "active": True,
-        "phase": "SETTLEMENT_PERSISTENCE_FAILED",
-        "trade_id": trade_id,
-        "execution_id": execution_id,
-        "failure_reason": failure_reason,
-        "failed_at": datetime.now().isoformat(),
-        "near_filled_qty": near_filled_qty,
-        "near_expected_qty": near_expected_qty,
-        "far_filled_qty": far_filled_qty,
-        "far_expected_qty": far_expected_qty,
-        "entry_enabled": False,
-        "combined_exit_resubmit_enabled": False,
-        "reconciliation_required": True,
-    }
-    _tmp = _SETTLEMENT_FAILURE_LATCH + ".tmp"
-    try:
-        with open(_tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(state, default=str, ensure_ascii=False) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(_tmp, _SETTLEMENT_FAILURE_LATCH)
-        # Directory fsync for atomic rename
-        _dir_fd = os.open(os.path.dirname(_SETTLEMENT_FAILURE_LATCH), os.O_RDONLY)
-        try:
-            os.fsync(_dir_fd)
-        finally:
-            os.close(_dir_fd)
-    except Exception:
-        # Failure latch itself failed to persist — this is a critical durability failure.
-        # Remove the partial temp file, then hard-terminate.
-        try:
-            if os.path.exists(_tmp):
-                os.remove(_tmp)
-        except Exception:
-            pass
-        logger.critical(
-            "[CRITICAL_DURABILITY_FAILURE] Cannot persist settlement failure latch for "
-            "trade_id=%s execution_id=%s. Terminating process.",
-            trade_id, execution_id,
-        )
-        os._exit(1)
-
-
-def _clear_settlement_failure_latch() -> bool:
-    """Remove the failure latch if it exists. Returns True if latch was present."""
-    if os.path.exists(_SETTLEMENT_FAILURE_LATCH):
-        try:
-            os.remove(_SETTLEMENT_FAILURE_LATCH)
-            return True
-        except Exception:
-            logger.error("[FAILURE_LATCH] Failed to remove latch: %s", _SETTLEMENT_FAILURE_LATCH)
-            return False
-    return False
-
-
-def _load_settlement_failure_latch() -> dict | None:
-    """Load the persistent failure latch, returning None if absent or invalid."""
-    if not os.path.exists(_SETTLEMENT_FAILURE_LATCH):
-        return None
-    try:
-        with open(_SETTLEMENT_FAILURE_LATCH) as f:
-            state = json.loads(f.read())
-        if state.get("active") is True:
-            return state
-    except Exception:
-        pass
-    return None
 
 
 def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
@@ -678,9 +566,10 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
         if trade_id == "?":
             logger.error("[MTS_FILL_ERROR] Missing trade_id in fill record! type=%s ticker=%s", fill_type, ticker)
         
-        _append_jsonl_durable(_MTS_FILL_LOG, fill)
-    except Exception as _ae:
-        logger.error("[MTS_FILL_APPEND_FAILED] trade_id=%s fill_type=%s error=%s", trade_id, fill_type, _ae); raise
+        with open(_MTS_FILL_LOG, "a") as f:
+            f.write(json.dumps(fill, default=str) + "\n")
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1084,8 +973,6 @@ def _write_mts_state(
             "distance_to_stop": round(max(0, _dist_stop), 1),
             "release_stop_points": release_stop_points or existing.get("release_stop_points"),
             "trail_distance_points": trail_distance_points or existing.get("trail_distance_points"),
-            # 2026-07-27 Gemini CLI: P0 Peak Persistence — Persist Policy J peak UPL across restarts
-            "peak_net_exit_pnl_twd": round(float(kwargs.get("peak_net_exit_pnl_twd", getattr(kwargs.get("strategy"), "_peak_net_exit_pnl_twd", 0.0)) or existing.get("peak_net_exit_pnl_twd", 0.0)), 1),
             "trade_id": _f_trade_id,
             "entry_ts": _f_entry_ts,
             # 2026-07-24 Hermes Agent: settlement tracking
@@ -1118,8 +1005,6 @@ def _write_mts_state(
         try:
             with open(_tmp_file, "w") as f:
                 json.dump(state, f, default=str)
-                f.flush()
-                os.fsync(f.fileno())
             # 💡 Gemini CLI: CAS check against dynamic target state file
             if os.path.exists(_target_state_file):
                 try:
@@ -1136,15 +1021,6 @@ def _write_mts_state(
                 except Exception:
                     pass  # if we can't read disk, proceed with replace
             os.replace(_tmp_file, _target_state_file)
-            # 2026-07-27 Gemini CLI: Directory fsync for POSIX entry durability
-            try:
-                _dir_fd = os.open(os.path.dirname(_target_state_file), os.O_RDONLY)
-                try:
-                    os.fsync(_dir_fd)
-                finally:
-                    os.close(_dir_fd)
-            except Exception:
-                pass
         except Exception as e:
             if os.path.exists(_tmp_file): os.remove(_tmp_file)
             raise e
@@ -1314,14 +1190,10 @@ class TMFSpread(StrategyBase):
         self._reentry_cooldown_secs: int = 300      # 2026-05-27 Gemini CLI: 5 min default cooldown
         self._near_entry: float = 0.0
         self._far_entry: float = 0.0
-        self._near_open_qty: int = 0          # live qty tracking (not just recovery)
-        self._far_open_qty: int = 0
         self._near_side: str | None = None  # "LONG" or "SHORT" at entry
         self._far_side: str | None = None   # "LONG" or "SHORT" at entry
         self._entry_spread_z: float = 0.0   # snapshot at entry, not hot-reloaded
         self._released_leg: str | None = None  # "near" or "far"
-        # 2026-07-28 Gemini CLI: Phase 1B experiment dedup guard
-        self._release_event_id_observed: str | None = None
         self._release_ts: datetime | None = None
         self._release_mono: float = 0.0
         self._peak: float = 0.0  # for long trailing (highest)
@@ -1415,8 +1287,6 @@ class TMFSpread(StrategyBase):
         # ── P0: Trail anchor status (default READY for normal flow) ──
         self._trail_anchor_status: TrailAnchorStatus = TrailAnchorStatus.READY
         self._trail_warmup_tick_count: int = 0
-        self._entry_established_at: float | None = None  # P0: Policy J warmup timestamp
-        self._entry_fully_established: bool = False      # latched once both legs confirmed filled
         self._trail_started_at: float | None = None
         self._trail_anchor_source: str | None = None
 
@@ -1509,37 +1379,45 @@ class TMFSpread(StrategyBase):
         except (ValueError, TypeError, KeyError):
             return None
 
-    def _calculate_effective_thresholds(self, atr: float | None) -> tuple[float, float]:
-        """Single authority for ATR-based stop/trail with config-driven floors.
-
-        Used by both _get_thresholds (runtime decision) and _get_risk_meta (state file).
-        Eliminates hardcoded floor divergence between the two callers.
-        """
-        if atr is None or atr <= 0:
-            return self._release_stop_fixed, self._trail_dist_fixed
-
-        if self._atr_mult_stop <= 0 or self._atr_mult_trail <= 0:
-            return self._release_stop_fixed, self._trail_dist_fixed
-
-        effective_atr = min(atr, self._atr_cap) if hasattr(self, "_atr_cap") and self._atr_cap > 0 else atr
-
-        stop = effective_atr * self._atr_mult_stop
-        trail = effective_atr * self._atr_mult_trail
-
-        return (
-            max(self._release_stop_fixed, stop),      # floor = configured release_stop_points
-            max(self._trail_dist_fixed, trail),        # floor = configured trail_distance_points
-        )
-
     def _get_thresholds(self, bar: dict) -> tuple[float, float]:
         """Calculate dynamic thresholds based on ATR, or use fixed fallbacks."""
         atr = bar.get("atr")
         if atr and not pd.isna(atr) and atr > 0:
+            # 2026-06-26 Gemini CLI: Backup the latest stable ATR (Method 2)
             self._last_atr = atr
         else:
+            # If current ATR is NaN (e.g. warm-up), carry over the last stable ATR or fallback
             atr = self._last_atr
 
-        return self._calculate_effective_thresholds(atr)
+        if atr and not pd.isna(atr) and atr > 0:
+            # 2026-07-16 Hermes Agent: Force fixed fallback when multiplier is 0
+            # (same guard pattern as _get_risk_meta at line 1269)
+            if self._atr_mult_stop <= 0 or self._atr_mult_trail <= 0:
+                return self._release_stop_fixed, self._trail_dist_fixed
+
+            # 2026-06-29 Gemini CLI: Apply ATR cap to prevent excessively wide stops
+            if hasattr(self, "_atr_cap") and self._atr_cap > 0:
+                atr = min(atr, self._atr_cap)
+
+            stop = atr * self._atr_mult_stop
+            
+            # 2026-06-26 Gemini CLI: Dynamic MFE-based trail multiplier adjustment
+            trail_mult = self._atr_mult_trail
+            mfe_tighten = self._params.get("mfe_tighten", {})
+            if mfe_tighten.get("enabled", False):
+                mfe_pts = getattr(self, "_mfe_pts", 0.0)
+                level_2_atr = float(mfe_tighten.get("level_2_atr", 3.0))
+                level_1_atr = float(mfe_tighten.get("level_1_atr", 2.0))
+                if mfe_pts >= level_2_atr * atr:
+                    trail_mult = float(mfe_tighten.get("level_2_trail_mult", 1.2))
+                elif mfe_pts >= level_1_atr * atr:
+                    trail_mult = float(mfe_tighten.get("level_1_trail_mult", 1.6))
+            
+            trail = atr * trail_mult
+            # Ensure sensible bounds for TMF (Micro Taiwan Index)
+            # Tiered floors: Stop needs 10pt safety, Trail needs 20pt room to breathe
+            return max(10.0, stop), max(20.0, trail)
+        return self._release_stop_fixed, self._trail_dist_fixed
 
     def _apply_vwap_exit(self, bar: dict, trail_dist: float) -> float:
         """2026-07-08 Gemini CLI: Apply dynamic VWAP trailing stop tightening for remaining leg"""
@@ -1583,8 +1461,6 @@ class TMFSpread(StrategyBase):
         self._side = None  # None until release as per contract tests
         self._near_entry = near_entry
         self._far_entry = far_entry
-        self._near_open_qty = 1
-        self._far_open_qty = 1
         self._near_side = "LONG" if side == "LONG" else "SHORT"
         self._far_side = "SHORT" if side == "LONG" else "LONG"
         self._entry_spread_z = entry_spread_z
@@ -1660,10 +1536,6 @@ class TMFSpread(StrategyBase):
 
         self._released_leg = released_leg.value.lower()
         self._release_ts = event_time or datetime.now()
-        if released_leg == Leg.NEAR:
-            self._near_open_qty = 0
-        else:
-            self._far_open_qty = 0
         self._single_leg_started_at = self._release_ts
         self._release_mono = time.monotonic()
         # 2026-07-22 Gemini CLI: Avoid release price defaulting to 0.0 or remaining_leg_price if invalid
@@ -1860,28 +1732,27 @@ class TMFSpread(StrategyBase):
                 atr = min(atr, self._atr_cap)
                 
         has_atr = atr and not pd.isna(atr) and atr > 0
+        
         atr_val = round(float(atr), 2) if has_atr else 0.0
-
-        # Use shared threshold calculator (single authority for stop/trail floors)
-        _calc_stop, _calc_trail = self._calculate_effective_thresholds(atr)
-
         stop_mult = self._atr_mult_stop if has_atr else 0.0
         trail_mult = self._atr_mult_trail if has_atr else 0.0
-
+        
+        # 2026-07-23 Gemini CLI: Work Package B - Separated Risk Modes for release stop vs trailing stop
         has_release_atr = has_atr and stop_mult > 0
         has_trail_atr = has_atr and trail_mult > 0
-
+        
         release_stop_mode = "ATR_DYNAMIC" if has_release_atr else "FIXED_FALLBACK"
         trail_distance_mode = "ATR_DYNAMIC" if has_trail_atr else "FIXED_FALLBACK"
         risk_mode = "ATR_DYNAMIC" if (has_release_atr and has_trail_atr) else "FIXED_FALLBACK"
-
-        # Pre-floor components (for telemetry)
-        release_stop_raw = round(atr_val * stop_mult, 2) if has_release_atr else self._release_stop_fixed
-        trail_dist_raw = round(atr_val * trail_mult, 2) if has_trail_atr else self._trail_dist_fixed
-
-        # final_release_stop / final_trail_dist come from the shared calculator
-        final_release_stop = round(_calc_stop, 2) if has_release_atr else release_stop_raw
-        final_trail_dist = round(_calc_trail, 2) if has_trail_atr else trail_dist_raw
+        
+        release_stop = round(atr_val * stop_mult, 2) if has_release_atr else self._release_stop_fixed
+        trail_dist = round(atr_val * trail_mult, 2) if has_trail_atr else self._trail_dist_fixed
+        
+        release_stop_floor = 10.0
+        trail_dist_floor = 60.0  # 2026-07-07: 20→60, ~0.82 ATR for TMF night (~73 pt)
+        
+        final_release_stop = max(release_stop_floor, release_stop) if has_release_atr else release_stop
+        final_trail_dist = max(trail_dist_floor, trail_dist) if has_trail_atr else trail_dist
         
         # 2026-06-26 Gemini CLI: retrieve quote age in ms safely
         near_age = bar.get("near_tick_age_ms", bar.get("near_age_ms", -1))
@@ -1905,10 +1776,10 @@ class TMFSpread(StrategyBase):
             "atr": atr_val,
             "stop_mult": stop_mult,
             "trail_mult": trail_mult,
-            "release_stop": release_stop_raw,
-            "release_stop_floor": self._release_stop_fixed,
-            "trail_dist": trail_dist_raw,
-            "trail_dist_floor": self._trail_dist_fixed,
+            "release_stop": release_stop,
+            "release_stop_floor": release_stop_floor,
+            "trail_dist": trail_dist,
+            "trail_dist_floor": trail_dist_floor,
             "final_release_stop": final_release_stop,
             "final_trail_dist": final_trail_dist,
             "effective_trail_dist": final_trail_dist,
@@ -2056,10 +1927,11 @@ class TMFSpread(StrategyBase):
         return False
 
     def _restore_from_fills_log(self) -> bool:
-        """Rebuild position state from fills log using exact leg quantity accounting."""
+        """Rebuild position state from fills log. Returns True on success."""
         if not os.path.exists(_MTS_FILL_LOG):
             return False
         try:
+            # Find the most recent open trade
             _trades: dict[str, list[dict]] = {}
             with open(_MTS_FILL_LOG) as _f:
                 for _line in _f:
@@ -2074,40 +1946,15 @@ class TMFSpread(StrategyBase):
             if not _trades:
                 return False
 
+            # Find the latest open trade by timestamp
             _latest_open_tid = None
             _latest_open_entries = []
             _latest_ts = ""
-
             for tid, fills in _trades.items():
-                near_open_qty = sum(int(f.get("qty", 1)) for f in fills if f.get("fill_type") == "ENTRY" and f.get("leg") == "NEAR")
-                far_open_qty = sum(int(f.get("qty", 1)) for f in fills if f.get("fill_type") == "ENTRY" and f.get("leg") == "FAR")
-
-                for f in fills:
-                    ft = f.get("fill_type", "")
-                    leg = f.get("leg", "")
-                    qty = int(f.get("qty", 1))
-                    if ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR") and leg == "NEAR":
-                        near_open_qty -= qty
-                    elif ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_FAR") and leg == "FAR":
-                        far_open_qty -= qty
-
-                # Check for over-close underflow anomaly
-                if near_open_qty < 0 or far_open_qty < 0:
-                    logger.error(
-                        "[COMBINED_EXIT_RECOVERY_QTY_UNDERFLOW] Anomaly detected for trade_id=%s: near_qty=%d far_qty=%d",
-                        tid, near_open_qty, far_open_qty,
-                    )
-
-                # Check if terminal completion event is present
-                has_terminal_completed = any(f.get("fill_type") in ("COMBINED_EXIT_COMPLETED", "TRADE_SETTLED") for f in fills)
-                if has_terminal_completed and (near_open_qty != 0 or far_open_qty != 0):
-                    logger.error(
-                        "[RECOVERY_TERMINAL_EVENT_POSITION_MISMATCH] Terminal completion event seen but remaining open qty != 0 for trade_id=%s (near=%d far=%d)",
-                        tid, near_open_qty, far_open_qty,
-                    )
-                    continue
-
-                if (near_open_qty > 0 or far_open_qty > 0) and not has_terminal_completed:
+                _entry_count = sum(1 for f in fills if f.get("fill_type") == "ENTRY")
+                _exit_count = sum(1 for f in fills if f.get("fill_type") in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"))
+                if _entry_count > _exit_count:
+                    # Find timestamp of first entry fill
                     _first_entry_ts = ""
                     for f in fills:
                         if f.get("fill_type") == "ENTRY":
@@ -2118,8 +1965,6 @@ class TMFSpread(StrategyBase):
                         _latest_ts = _first_entry_ts
                         _latest_open_tid = tid
                         _latest_open_entries = fills
-                        _latest_open_near_qty = near_open_qty
-                        _latest_open_far_qty = far_open_qty
 
             if not _latest_open_tid:
                 return False
@@ -2131,6 +1976,7 @@ class TMFSpread(StrategyBase):
             if not _entry_fills:
                 return False
 
+            # Determine near/far from entry fills
             _near_entry = _far_entry = 0.0
             _near_side = _far_side = None
             for ef in _entry_fills:
@@ -2150,21 +1996,18 @@ class TMFSpread(StrategyBase):
             self._far_entry = _far_entry
             self._near_side = "LONG" if _near_side in ("LONG", "BUY") else "SHORT"
             self._far_side = "LONG" if _far_side in ("LONG", "BUY") else "SHORT"
-            self._near_open_qty = _latest_open_near_qty
-            self._far_open_qty = _latest_open_far_qty
-            self._entry_fully_established = True  # both legs confirmed by fills
-            self._peak_net_exit_pnl_twd = 0.0    # reset peak for fresh tracking
             self._released_leg = None
             self._trade_id = _latest_open_tid
             self._lifecycle = "OPEN"
             self._position_epoch = _latest_open_tid
-            # Ensure lifecycle OCA is in SPREAD for Policy J eligibility
-            if not hasattr(self, "_lifecycle_oca") or self._lifecycle_oca is None:
-                self._lifecycle_oca = PositionLifecycle(phase=PositionPhase.SPREAD)
-            else:
-                self._lifecycle_oca.phase = PositionPhase.SPREAD
-                self._lifecycle_oca.release_group.status = ReleaseGroupStatus.ARMED
 
+            # 2026-07-30 Gemini CLI: Preserve peak_net_exit_pnl_twd across fills-led recovery
+            _prev_state = self._read_mts_state()
+            _prev_peak = float(_prev_state.get("peak_net_exit_pnl_twd") or 0.0) if _prev_state else 0.0
+            if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None or self._peak_net_exit_pnl_twd < _prev_peak:
+                self._peak_net_exit_pnl_twd = _prev_peak
+
+            # Process release fills if any
             for rf in _release_fills:
                 _rf_price = rf.get("price")
                 if rf.get("leg") == "NEAR":
@@ -2178,43 +2021,20 @@ class TMFSpread(StrategyBase):
                     self._lifecycle = f"TRAILING_{self._side}"
                     self._release_price = float(_rf_price) if _rf_price is not None else 0.0
 
-            # Restore Policy J peak UPL across restarts
-            _st = self._read_mts_state()
-            if _st and _st.get("trade_id") == _latest_open_tid:
-                _raw_peak = _st.get("peak_net_exit_pnl_twd")
-                try:
-                    _val = float(_raw_peak) if _raw_peak is not None else 0.0
-                    import math
-                    if math.isnan(_val) or math.isinf(_val):
-                        logger.warning("[MTS_PEAK_STATE_CORRUPTED] Recovered peak invalid: NaN or Inf value (%s). Safe initialization to 0.0", _raw_peak)
-                        self._peak_net_exit_pnl_twd = 0.0
-                    else:
-                        self._peak_net_exit_pnl_twd = _val
-                except (ValueError, TypeError):
-                    logger.warning("[MTS_PEAK_STATE_CORRUPTED] Recovered peak invalid: non-numeric value (%s). Safe initialization to 0.0", _raw_peak)
-                    self._peak_net_exit_pnl_twd = 0.0
-
-                # Restore Policy J activation state from policy_j sub-object
-                _pj_st = _st.get("policy_j", {})
-                if _pj_st.get("trade_id") == _latest_open_tid:
-                    self._pj_activated = bool(_pj_st.get("activated", False))
-                    self._pj_triggered = bool(_pj_st.get("triggered", False))
-                    logger.info(
-                        "[MTS_POLICY_J_RESTORE] trade=%s activated=%s triggered=%s peak=%.1f",
-                        _latest_open_tid, self._pj_activated, self._pj_triggered, self._peak_net_exit_pnl_twd,
-                    )
+            # Restore lifecycle OCA phase and group status
+            if hasattr(self, "_lifecycle_oca"):
+                self._lifecycle_oca.phase = PositionPhase.SPREAD if self._released_leg is None else PositionPhase.SINGLE_LEG
+                if self._released_leg is None:
+                    self._lifecycle_oca.release_group.status = ReleaseGroupStatus.ARMED
                 else:
-                    self._pj_activated = False
-                    self._pj_triggered = False
-            elif _st is None:
-                logger.info("[MTS_PEAK_STATE_DEFAULT] No state file found during recovery. Initializing peak_net_exit_pnl_twd to 0.0")
-                self._peak_net_exit_pnl_twd = 0.0
-                self._pj_activated = False
-                self._pj_triggered = False
+                    self._lifecycle_oca.release_group.status = ReleaseGroupStatus.FILLED
+                    self._lifecycle_oca.release_group.filled_leg = Leg.NEAR if self._released_leg == "near" else Leg.FAR
+                    self._lifecycle_oca.trail_group.status = TrailGroupStatus.ARMED
+                    self._lifecycle_oca.trail_group.remaining_leg = Leg.FAR if self._released_leg == "near" else Leg.NEAR
 
             logger.warning(
-                "[MTS_FILLS_RECOVERY] Restored trade_id=%s near=%.1f far=%.1f released=%s lifecycle=%s peak_pnl=%.1f",
-                _latest_open_tid, _near_entry, _far_entry, self._released_leg, self._lifecycle, getattr(self, "_peak_net_exit_pnl_twd", 0.0),
+                "[MTS_FILLS_RECOVERY] Restored trade_id=%s near=%.1f far=%.1f released=%s lifecycle=%s",
+                _latest_open_tid, _near_entry, _far_entry, self._released_leg, self._lifecycle,
             )
             return True
         except Exception:
@@ -2414,6 +2234,7 @@ class TMFSpread(StrategyBase):
                                 self._far_side = state.get("far_side")
                                 self._released_leg = state.get("released_leg")
                                 self._side = _rem_side
+                                self._peak_net_exit_pnl_twd = float(state.get("peak_net_exit_pnl_twd") or 0.0)
                                 self._set_single_leg_extrema(peak=_peak, nadir=_nadir)
 
                                 # ── ADR-009 Task 6: Restart Reconciliation ──
@@ -2754,10 +2575,7 @@ class TMFSpread(StrategyBase):
             if not self._trade_id:
                 self._trade_id = bar.get("trade_id")
             
-            # ── PR 6.5: Policy J evaluation driver (tick-level, decoupled from _manage_position cadence) ──
-            self._evaluate_policy_j(context)
-            
-            return self._manage_position(near_close, far_close, spread_z, now, bar)
+            return self._manage_position(near_close, far_close, bar.get("spread_z"), now, bar)
 
         # ── Staleness gate (only for new entry) ──
         atr = bar.get("atr", 0.0)
@@ -3025,124 +2843,6 @@ class TMFSpread(StrategyBase):
             
         return release_stop, trail_dist, single_decision
 
-    def _evaluate_policy_j(self, context) -> None:
-        """PR 6.5: Tick-level Policy J evaluation driver.
-        
-        Runs independently of _manage_position cadence. Evaluates on every
-        coherent tick when position is in SPREAD phase with both legs open.
-        Updates strategy-level Policy J state, writes snapshot, persists state.
-        """
-        _now = datetime.now()
-        _bar = context.market.last_bar
-        if _bar is None:
-            return
-        _near_close_val = _bar.get("near_close")
-        _far_close_val = _bar.get("far_close")
-        if _near_close_val is None or _far_close_val is None:
-            return
-        _near_close = float(_near_close_val)
-        _far_close = float(_far_close_val)
-        
-        # Determine phase and leg status
-        _phase = self._lifecycle_oca.phase if self._lifecycle_oca else None
-        _both_legs_open = (getattr(self, "_near_open_qty", 0) > 0
-                          and getattr(self, "_far_open_qty", 0) > 0)
-        
-        # Lazy-init counters
-        if not hasattr(self, "_pj_evaluation_count"):
-            self._pj_evaluation_count = 0
-        
-        # Always increment the evaluation counter (heartbeat evidence)
-        self._pj_evaluation_count += 1
-        self._pj_last_evaluation_at = _now
-        
-        # Only evaluate Policy J when in SPREAD with both legs open
-        if _phase != PositionPhase.SPREAD or not _both_legs_open:
-            return
-        
-        try:
-            _current_pnl = self._get_current_pnl_pts(_near_close, _far_close)
-            _current_net_exit_twd = float(_current_pnl * 10.0 - 92.0)
-            
-            _prev_peak = getattr(self, "_peak_net_exit_pnl_twd", 0.0) or 0.0
-            _new_peak = max(_prev_peak, _current_net_exit_twd)
-            self._peak_net_exit_pnl_twd = _new_peak
-            
-            # Lazy-init PJ state attributes
-            for attr in ["_pj_activated", "_pj_triggered"]:
-                if not hasattr(self, attr):
-                    setattr(self, attr, False)
-            if not hasattr(self, "_pj_trigger_event_id"):
-                self._pj_trigger_event_id = None
-            
-            # Determine activated/triggered from peak vs threshold
-            _activation_twd = float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0))
-            _giveback_twd = float(self._params.get("combined_upl_giveback_twd", 100.0))
-            
-            _activated = self._pj_activated or (_new_peak >= _activation_twd)
-            self._pj_activated = _activated
-            
-            _would_trigger = False
-            if _activated and _current_net_exit_twd <= (_new_peak - _giveback_twd):
-                _would_trigger = True
-                if self._pj_trigger_event_id is None:
-                    self._pj_trigger_event_id = f"{getattr(self, '_trade_id', '?')}:{self._pj_evaluation_count}"
-                self._pj_triggered = True
-            
-            # Build snapshot
-            import json as _pj_json
-            import os as _pj_os
-            
-            _snap = {
-                "snapshot_id": _now.isoformat(),
-                "trade_id": getattr(self, "_trade_id", ""),
-                "event_time": _now.isoformat(),
-                "processed_at": _now.isoformat(),
-                "lifecycle_phase": str(_phase.value) if hasattr(_phase, "value") else "",
-                "evaluator_invoked": True,
-                "position_ready": True,
-                "peak_net_exit_pnl_twd": _new_peak,
-                "current_net_exit_twd": _current_net_exit_twd,
-                "activation_net_pnl_twd": _activation_twd,
-                "giveback_twd": _giveback_twd,
-                "exit_line_twd": max(0.0, _new_peak - _giveback_twd),
-                "enabled": self._params.get("enable_combined_upl_trail", False),
-                "eligible": True,
-                "activated": _activated,
-                "would_trigger": _would_trigger,
-                "evaluation_count": self._pj_evaluation_count,
-            }
-            
-            _tmp = "/tmp/policy_j_snapshot.json"
-            _tmp2 = _tmp + ".tmp"
-            with open(_tmp2, "w") as _f:
-                _pj_json.dump(_snap, _f, default=str, indent=2)
-            _pj_os.replace(_tmp2, _tmp)
-            
-            self._pj_last_snapshot_at = _now
-            
-            # Persist to MTS state file
-            try:
-                _state_path = _get_state_file_path()
-                if _state_path and os.path.exists(_state_path):
-                    with open(_state_path, "r") as _sf:
-                        _mts = _pj_json.load(_sf)
-                    _mts["policy_j"] = {
-                        "activated": _activated,
-                        "peak_net_exit_pnl_twd": _new_peak,
-                        "triggered": _would_trigger,
-                        "trade_id": getattr(self, "_trade_id", ""),
-                        "evaluation_count": self._pj_evaluation_count,
-                    }
-                    _mts_tmp = str(_state_path) + ".pj_tmp"
-                    with open(_mts_tmp, "w") as _sfw:
-                        _pj_json.dump(_mts, _sfw, indent=2)
-                    _pj_os.replace(_mts_tmp, _state_path)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
     def _manage_position(
         self, near_close: float, far_close: float, spread_z: Any, now: datetime,
         bar: dict,
@@ -3288,31 +2988,23 @@ class TMFSpread(StrategyBase):
                     _rem_low = float(bar.get("near_low", 0))
             else:
                 _rem_high = _rem_low = 0.0
-            # ── P0: Policy J Peak Update Readiness ──
-            # Peak tracking eligibility:
-            # - SPREAD phase with both legs filled
-            # - Not exit inflight (checked earlier in pipeline)
-            # - Quote coherence is enforced by the Policy J evaluator
-            _peak_eligible = False
-            _phase = self._lifecycle_oca.phase if self._lifecycle_oca else None
-            _entry_ok = getattr(self, "_entry_fully_established", False)
-            _both_legs = (getattr(self, "_near_open_qty", 0) > 0
-                          and getattr(self, "_far_open_qty", 0) > 0)
-            if _phase == PositionPhase.SPREAD and (_entry_ok or _both_legs):
-                _peak_eligible = True
-            elif _phase == PositionPhase.SINGLE_LEG:
-                _peak_eligible = True
-
+            # ── Track Peak Net Exit PnL TWD for Policy J Live Combined Exit ──
             _current_net_exit_twd = float(current_pnl * 10.0 - 92.0)
-            if _peak_eligible:
-                if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None:
-                    self._peak_net_exit_pnl_twd = 0.0
-                if _current_net_exit_twd > self._peak_net_exit_pnl_twd:
-                    self._peak_net_exit_pnl_twd = _current_net_exit_twd
-            
-            # Latch entry_fully_established: once both legs confirmed, stays True
-            if _both_legs and _phase == PositionPhase.SPREAD:
-                self._entry_fully_established = True
+            if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None:
+                self._peak_net_exit_pnl_twd = 0.0
+            if _current_net_exit_twd > self._peak_net_exit_pnl_twd:
+                self._peak_net_exit_pnl_twd = _current_net_exit_twd
+
+            # Auto-repair stale lifecycle phase if state has_position=True but phase is FLAT
+            if hasattr(self, "_lifecycle_oca") and self._lifecycle_oca.phase == PositionPhase.FLAT:
+                if self._released_leg is None:
+                    self._lifecycle_oca.phase = PositionPhase.SPREAD
+                    self._lifecycle_oca.release_group.status = ReleaseGroupStatus.ARMED
+                    logger.warning("[MTS_REPAIR] has_position=True but phase was FLAT -> Repaired to SPREAD")
+                else:
+                    self._lifecycle_oca.phase = PositionPhase.SINGLE_LEG
+                    self._lifecycle_oca.trail_group.status = TrailGroupStatus.ARMED
+                    logger.warning("[MTS_REPAIR] has_position=True but phase was FLAT -> Repaired to SINGLE_LEG")
 
             # 2026-07-20 Gemini CLI: PR 3B Production Decision Core Cutover (first evaluation block)
             from strategies.plugins.futures.active.mts_lifecycle_adapter import LifecycleEvaluationInput
@@ -3336,7 +3028,6 @@ class TMFSpread(StrategyBase):
                     "combined_upl_activation_net_pnl_twd": float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
                     "combined_upl_giveback_twd": float(self._params.get("combined_upl_giveback_twd", 100.0)),
                     "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
-                    "combined_exit_execution_enabled": bool(self._params.get("execution_enabled", False)),
                     "last_applied_event_time": self._last_applied_event_time.isoformat() if getattr(self, "_last_applied_event_time", None) else None,
                     "single_leg_started_at": self._single_leg_started_at.isoformat() if getattr(self, "_single_leg_started_at", None) else None,
                 },
@@ -3351,83 +3042,6 @@ class TMFSpread(StrategyBase):
             self._ensure_lifecycle_adapter_initialized("LATE_INIT")
             _adapter_res = self._lifecycle_adapter.evaluate(_adapter_input)
             _decision = _adapter_res.decision
-
-            # P1: Write Policy J evaluator snapshot for Dashboard (fail-open)
-            try:
-                import json as _pj_json
-                _snap = {
-                    "snapshot_id": getattr(self, "_last_applied_event_time", datetime.now()).isoformat() if hasattr(datetime, "isoformat") else str(datetime.now()),
-                    "trade_id": getattr(self, "_trade_id", ""),
-                    "event_time": now.isoformat(),
-                    "processed_at": datetime.now().isoformat(),
-                    "lifecycle_phase": str(self._lifecycle_oca.phase.value) if self._lifecycle_oca and hasattr(self._lifecycle_oca.phase, "value") else "",
-                    "entry_fully_established": getattr(self, "_entry_fully_established", False),  # latched once both legs confirmed
-                    "both_legs_open_now": _both_legs if "_both_legs" in dir() else False,
-                    "warmup_complete": _peak_eligible if "_peak_eligible" in dir() else False,
-                    "position_ready": _peak_eligible if "_peak_eligible" in dir() else False,
-                    "phase_applicable": (_phase == PositionPhase.SPREAD) if "_phase" in dir() and _phase is not None else False,
-                    "execution_eligible": (_peak_eligible and _phase == PositionPhase.SPREAD) if "_peak_eligible" in dir() and "_phase" in dir() and _phase is not None else False,
-                    "suppression_reason": "",  # set below
-                    "evaluator_invoked": True,
-                    "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
-                    "current_net_exit_twd": _current_net_exit_twd if "_current_net_exit_twd" in dir() else 0.0,
-                    "activation_net_pnl_twd": float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
-                    "giveback_twd": float(self._params.get("combined_upl_giveback_twd", 100.0)),
-                    "exit_line_twd": max(0.0, getattr(self, "_peak_net_exit_pnl_twd", 0.0) - float(self._params.get("combined_upl_giveback_twd", 100.0))),
-                    "enabled": self._params.get("enable_combined_upl_trail", False),
-                    "eligible": _peak_eligible if "_peak_eligible" in dir() else False,
-                    "activated": getattr(self, "_peak_net_exit_pnl_twd", 0.0) >= float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
-                    "would_trigger": False,
-                    "giveback_trigger": False,
-                    "decision": str(_decision.action.value) if _decision and hasattr(_decision.action, "value") else ("COMBINED_EXIT" if _decision and _decision.action == LifecycleAction.COMBINED_EXIT else str(_decision.action) if _decision else "NONE"),
-                }
-                _net = getattr(self, "_peak_net_exit_pnl_twd", 0.0) - float(self._params.get("combined_upl_giveback_twd", 100.0))
-                _curr = _current_net_exit_twd if "_current_net_exit_twd" in dir() else 0.0
-                if _net > 0 and _curr < _net:
-                    _snap["giveback_trigger"] = True
-                    _snap["would_trigger"] = True
-                    _snap["trigger_reason"] = "GIVEBACK"
-                elif _snap["activated"] and _snap["eligible"]:
-                    _snap["would_trigger"] = True
-                    _snap["trigger_reason"] = "ACTIVATION"
-                _snap["exit_line_twd"] = max(0.0, _net)
-                
-                # Suppression reason: why execution_eligible might be False
-                if _snap.get("lifecycle_phase") != "SPREAD":
-                    _snap["suppression_reason"] = "PHASE_" + (_snap.get("lifecycle_phase", "UNKNOWN") or "UNKNOWN")
-                elif not _snap.get("warmup_complete"):
-                    _snap["suppression_reason"] = "WARMUP_INCOMPLETE"
-                elif not _snap.get("both_legs_open_now"):
-                    _snap["suppression_reason"] = "SINGLE_LEG_REMAINING"
-                else:
-                    _snap["suppression_reason"] = ""
-                _tmp = "/tmp/policy_j_snapshot.json"
-                _tmp2 = _tmp + ".tmp"
-                with open(_tmp2, "w") as _pjf:
-                    _pj_json.dump(_snap, _pjf, default=str, indent=2)
-                import os as _pj_os
-                _pj_os.replace(_tmp2, _tmp)
-
-                # ── PR 4: Persist Policy J state to MTS state file ──
-                try:
-                    _mts_state_path = _get_state_file_path()
-                    if _mts_state_path and os.path.exists(_mts_state_path):
-                        with open(_mts_state_path, "r") as _pjf_read:
-                            _mts_state = _pj_json.load(_pjf_read)
-                        _mts_state["policy_j"] = {
-                            "activated": _snap["activated"],
-                            "peak_net_exit_pnl_twd": _snap["peak_net_exit_pnl_twd"],
-                            "triggered": _snap["would_trigger"],
-                            "trade_id": _snap["trade_id"],
-                        }
-                        _mts_tmp = _mts_state_path + ".pj_tmp"
-                        with open(_mts_tmp, "w") as _pjf_write:
-                            _pj_json.dump(_mts_state, _pjf_write, indent=2)
-                        _pj_os.replace(_mts_tmp, _mts_state_path)
-                except Exception:
-                    pass
-            except Exception:
-                pass
 
             # ── Wave J1.5-BR: Policy J Shadow Telemetry Integration Hook ──
             if getattr(self, "_soak_collector", None) is not None:
@@ -3846,44 +3460,6 @@ class TMFSpread(StrategyBase):
                 self._released_leg = _rel_leg_str
                 self._release_price = _exit_price
                 
-                # 2026-07-28 Gemini CLI: Phase 1B experiment instrumentation
-                if self._release_event_id_observed is None:
-                    import uuid
-                    _rid = uuid.uuid4().hex[:20]
-                    self._release_event_id_observed = _rid
-                    try:
-                        observe_release_decision(
-                            trade_id=self._trade_id or "",
-                            release_leg=_release_leg.value.upper(),
-                            release_reason=_signal_reason,
-                            release_event_id=_rid,
-                            position_direction="WIDE" if self._near_side == "SHORT" else "NARROW",
-                            near_entry=self._near_entry,
-                            far_entry=self._far_entry,
-                            near_side=self._near_side or "",
-                            far_side=self._far_side or "",
-                            near_bid=near_close,
-                            near_ask=far_close,
-                            near_last=near_close,
-                            far_bid=far_close,
-                            far_ask=far_close,
-                            far_last=far_close,
-                            near_quote_age_ms=0,
-                            far_quote_age_ms=0,
-                            spread_value=near_close - far_close,
-                            spread_z=_risk_meta.get("spread_z"),
-                            atr=_risk_meta.get("atr"),
-                            stop_mult=_risk_meta.get("stop_mult"),
-                            trail_mult=_risk_meta.get("trail_mult"),
-                            release_price=_exit_price,
-                        )
-                    except Exception:
-                        import logging
-                        logging.getLogger(__name__).exception(
-                            "[COMBINED_EXIT_EXPERIMENT_HOOK_FAILED] trade_id=%s release_leg=%s",
-                            self._trade_id, _release_leg.value,
-                        )
-                
                 # 2026-07-14 Gemini CLI: Reset shadow tracking variables on leg release
                 self._shadow_exit_triggered = False
                 self._shadow_exit_ts = None
@@ -3978,10 +3554,10 @@ class TMFSpread(StrategyBase):
                 logger.info("[POLICY_J_LIVE_TRIGGERED] Executing COMBINED_EXIT (SPREAD -> FLAT)")
                 self._lifecycle = "EXITING"
                 self._log_exit_decision(exit_reason=_exit_reason, pnl=current_pnl, bar=bar)
+                self._combined_exit_in_flight = True
                 _append_event("COMBINED_EXIT_SUBMITTED", exit_reason=_exit_reason, gross_points=current_pnl, **_risk_meta)
                 _commit_action(self._lifecycle_oca, _decision)
-                _write_mts_state(has_position=True, action="COMBINED_EXIT", reason=_exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
-                self._peak_net_exit_pnl_twd = 0.0
+                # 2026-07-30: State write moved to monitor.py after successful order submission
                 return Signal("EXIT", "TMF_COMBINED_EXIT", confidence=1.0, stop_loss=0)
             elif _decision.action == LifecycleAction.MANUAL:
                 # MANUAL: full flatten — same as STOPLOSS/TIMEOUT
@@ -4324,8 +3900,8 @@ class TMFSpread(StrategyBase):
         # 2026-07-01 Gemini CLI: Set in-memory position state to False first to prevent concurrent tick heartbeats from overwriting the file with True.
         self._has_position = False
         self._lifecycle = "FLAT"
-        self._near_open_qty = 0
-        self._far_open_qty = 0
+        self._combined_exit_in_flight = False
+        self._peak_net_exit_pnl_twd = 0.0
         # ADR-009 Phase 2 / Task 7: sync lifecycle to FLAT after exit fill
         if hasattr(self, '_lifecycle_oca'):
             _was_trailing = self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG
