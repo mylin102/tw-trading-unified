@@ -228,7 +228,7 @@ TODAY = datetime.datetime.now().strftime("%Y-%m-%d")
 # ── Session detection (used by sidebar + config loading) ──
 from core.date_utils import is_night_session
 _CURRENT_SESSION_NIGHT = is_night_session(datetime.datetime.now())
-FUTURES_CFG_NAME = futures.yaml
+FUTURES_CFG_NAME = "futures.yaml"
 
 # Early read _TICKER for sidebar radio before config loading
 try:
