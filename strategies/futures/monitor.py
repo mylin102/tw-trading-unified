@@ -3754,6 +3754,24 @@ class FuturesMonitor:
                 f"refusing to submit {_action} "
                 f"(reason={_reason})[/dim yellow]"
             )
+            # 2026-07-30: Clean up COMBINED_EXIT contaminated state when orders can't be submitted
+            if _action == "EXIT" and "COMBINED_EXIT" in str(_reason).upper():
+                try:
+                    _mts_strat = strategy if hasattr(strategy, "_has_position") else None
+                    if _mts_strat and getattr(_mts_strat, "_has_position", False):
+                        from strategies.plugins.futures.active.tmf_spread import _write_mts_state
+                        _mts_strat._reset(reason="combined_exit_rejected_market_closed")
+                        _write_mts_state(
+                            has_position=False, action="COMBINED_EXIT_REJECTED",
+                            reason="market_closed",
+                            trade_id=getattr(_mts_strat, "_trade_id", ""),
+                            ticker=getattr(self, "ticker", "TMF"),
+                            lifecycle={},
+                        )
+                        console.print(f"[yellow]⚠️ [COMBINED_EXIT_CLEANUP] Reset strategy state to FLAT (market closed)[/yellow]")
+                except Exception as _ce:
+                    import logging
+                    logging.getLogger().warning("[COMBINED_EXIT_CLEANUP_FAILED] %s", _ce)
             return
 
         # 2026-07-07 Hermes Agent: P0 — Position authority guard.
