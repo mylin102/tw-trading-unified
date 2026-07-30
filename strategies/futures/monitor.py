@@ -6127,7 +6127,7 @@ class FuturesMonitor:
                         continue
                     if _ft == "ENTRY":
                         _entry_ids.add(_tid)
-                    elif _ft == "EXIT":
+                    elif _ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"):
                         _exit_ids.add(_tid)
             _open_ids = _entry_ids - _exit_ids
             return bool(_open_ids)
