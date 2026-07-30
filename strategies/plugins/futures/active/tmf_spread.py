@@ -1710,7 +1710,7 @@ class TMFSpread(StrategyBase):
             ticker=self._ticker,
             atr=self._last_atr or 0.0,
             lifecycle=self._current_lifecycle_state(),
-            peak_net_exit_pnl_twd=getattr(self, _peak_net_exit_pnl_twd, 0.0),
+            peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
         )
 
     def _pnl_far(self, far_close: float) -> float:
@@ -1843,7 +1843,7 @@ class TMFSpread(StrategyBase):
             ticker=self._ticker,
             atr=self._last_atr,
             lifecycle=self._current_lifecycle_state(),
-            peak_net_exit_pnl_twd=getattr(self, _peak_net_exit_pnl_twd, 0.0),
+            peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
             **kw
         )
 
@@ -2703,7 +2703,7 @@ class TMFSpread(StrategyBase):
             ticker=self._ticker,
             atr=self._last_atr, # 2026-06-26 Gemini CLI: pass current ATR to state writer
             lifecycle=self._current_lifecycle_state(),
-            peak_net_exit_pnl_twd=getattr(self, _peak_net_exit_pnl_twd, 0.0),
+            peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
         )
         _append_event("ENTRY_SUBMITTED", action=_action, near_side=self._near_side, far_side=self._far_side,
                        near_entry=near_close, far_entry=far_close, spread_z=spread_z_f,
@@ -2864,7 +2864,7 @@ class TMFSpread(StrategyBase):
         if self._lifecycle_oca and self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG:
             # Sync legacy _lifecycle string for compat
             self._lifecycle = f"TRAILING_{self._side}"
-            if self._single_leg_post_fill_ticks < self._single_leg_warmup_ticks:
+            if self._single_leg_post_fill_ticks < getattr(self, "_single_leg_warmup_ticks", 2):
                 if not _is_backtest:
                     self._single_leg_post_fill_ticks += 1
                 else:
@@ -3628,7 +3628,7 @@ class TMFSpread(StrategyBase):
                 trail_distance_points=trail_dist, trade_id=self._trade_id,
                 ticker=self._ticker,
                 lifecycle=self._current_lifecycle_state(),
-            peak_net_exit_pnl_twd=getattr(self, _peak_net_exit_pnl_twd, 0.0),
+            peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
                 **_risk_meta
             )
             return None
@@ -3835,7 +3835,7 @@ class TMFSpread(StrategyBase):
             release_stop_points=release_stop, trail_distance_points=trail_dist,
             trade_id=self._trade_id, ticker=self._ticker,
             lifecycle=self._current_lifecycle_state(),
-            peak_net_exit_pnl_twd=getattr(self, _peak_net_exit_pnl_twd, 0.0),
+            peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
             **_risk_meta
         )
         self._last_applied_event_time = now
@@ -3903,6 +3903,21 @@ class TMFSpread(StrategyBase):
             )
 
         # 2026-07-01 Gemini CLI: Set in-memory position state to False first to prevent concurrent tick heartbeats from overwriting the file with True.
+    def _is_trade_settled_flat(self) -> bool:
+        """ADR-025: Strict settlement gate to prevent premature Policy J reset."""
+        if self._has_position:
+            return False
+        if getattr(self, "_near_status", "") in ("SUBMITTED", "PARTIALLY_FILLED", "PENDING"):
+            return False
+        if getattr(self, "_far_status", "") in ("SUBMITTED", "PARTIALLY_FILLED", "PENDING"):
+            return False
+        if hasattr(self, "_lifecycle_oca") and self._lifecycle_oca:
+            if self._lifecycle_oca.release_group.status in (
+                ReleaseGroupStatus.SUBMITTING, ReleaseGroupStatus.SUBMITTED, ReleaseGroupStatus.PARTIALLY_FILLEC
+            ):
+                return False
+        return True
+
         self._has_position = False
         self._lifecycle = "FLAT"
         self._combined_exit_in_flight = False
