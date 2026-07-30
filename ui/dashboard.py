@@ -248,14 +248,14 @@ PRODUCT_CODES = list(PRODUCT_LABELS.keys())
 # ── Sidebar Info ──
 with st.sidebar:
     st.title("Trading Unified")
+
     # 2026-07-26 Gemini CLI: Product-based futures page selector
     _product_page = st.selectbox(
         "📄 頁面",
-        ["總覽", "設定"] + list(PRODUCT_LABELS.values()) + ["選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "🔄 反事實研究室", "🔐 Real Preflight"],
-        index=2,
+        ["總覽"] + list(PRODUCT_LABELS.values()) + ["選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "🔄 反事實研究室", "🔐 Real Preflight", "設定"],
+        index=1,
         key="page_selector",
     )
-
 
     # 2026-07-26 Gemini CLI: On-demand 8502 Research Lab launcher & shutdown toggle in sidebar
     st.divider()
@@ -754,8 +754,6 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
     )
     return fig
 
-MAX_CHART_POINTS = 2000
-
 # ── Futures Dual Contract Chart ──
 def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", signals=None):
     """繪製期貨雙合約價格圖表
@@ -771,7 +769,6 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     Returns:
         Plotly Figure 物件
     """
-    from time import perf_counter
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     import pandas as _pd
@@ -789,33 +786,23 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             for _df in [near_df, far_df]:
                 if _df is None or _df.empty:
                     continue
+                _col_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+                for _u, _l in _col_map.items():
+                    if _u in _df.columns and _l not in _df.columns:
+                        _df[_l] = _df[_u]
+                    elif _u in _df.columns and _l in _df.columns:
+                        _df[_l] = _df[_l].fillna(_df[_u])
                 for _col in ["close", "open", "high", "low"]:
                     if _col in _df.columns:
                         _df[_col] = _pd.to_numeric(_df[_col], errors="coerce")
                 if "timestamp" in _df.columns:
                     _df["timestamp"] = _pd.to_datetime(_df["timestamp"], errors="coerce")
-                    _df.dropna(subset=["timestamp", "close"], inplace=True)
+                    if "close" in _df.columns:
+                        _df.dropna(subset=["timestamp", "close"], inplace=True)
+                    else:
+                        _df.dropna(subset=["timestamp"], inplace=True)
     except Exception as _de:
         print(f"[Dashboard] make_futures_dual_chart data cleaning error: {_de}")
-
-    _t_chart_start = perf_counter()
-    _t_near_ctor = perf_counter()
-    _t_far_ctor = perf_counter()
-    _near_rows_in = len(near_df) if near_df is not None else 0
-    _far_rows_in = len(far_df) if far_df is not None else 0
-    _ds_near = 1
-    _ds_far = 1
-    for _df_ref in [near_df, far_df]:
-        if _df_ref is None or _df_ref.empty or "timestamp" not in _df_ref.columns:
-            continue
-        if len(_df_ref) > MAX_CHART_POINTS:
-            _step = math.ceil(len(_df_ref) / MAX_CHART_POINTS)
-            _df_ref = _df_ref.iloc[::_step].copy()
-            print(f"[CHART] Downsampled to {len(_df_ref)} rows (step={_step})")
-    _near_rows_out = len(near_df) if near_df is not None else 0
-    _far_rows_out = len(far_df) if far_df is not None else 0
-    print(f"[PERF_CHART] after_ds: {perf_counter()-_t_near_ctor:.3f}s")
-    print(f"[CHART_INPUT] near_rows_in={_near_rows_in} far_rows_in={_far_rows_in} ds_near={_ds_near} ds_far={_ds_far} near_out={_near_rows_out} far_out={_far_rows_out}")
 
     if near_df.empty:
         print("[Dashboard] make_futures_dual_chart called with empty near_df after cleaning")
@@ -844,30 +831,26 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     # Standardize heights so they sum to 1.0
     h_sum = sum(row_heights)
     row_heights = [h / h_sum for h in row_heights]
-    print(f"[PERF_CHART] prep_done: {perf_counter()-_t_near_ctor:.3f}s")
     
-    _t_sub = perf_counter()
     fig = make_subplots(
         rows=rows, cols=1, 
         shared_xaxes=True, 
         row_heights=row_heights, 
         vertical_spacing=0.05
     )
-    print(f"[PERF_CHART] make_subplots: {perf_counter()-_t_sub:.3f}s")
     
     # 1. 近月價格線
     # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
-    _t_near = time.time()
-    _near_trace = go.Scattergl(
+    fig.add_trace(
+        go.Scatter(
             x=_clean_list(near_df["timestamp"], force_str=True),
             y=_clean_list(near_df["close"]),
             name="近月",
             line=dict(width=2, color="#1f77b4"),
             mode="lines"
-        )
-    _t_near_add = perf_counter()
-    fig.add_trace(_near_trace, row=1, col=1)
-    print(f"[PERF_CHART] near_ctor: {_t_near_add-_t_near_ctor:.3f}s add: {perf_counter()-_t_near_add:.3f}s")
+        ),
+        row=1, col=1
+    )
     
     # 2. 如果有遠月資料，添加遠月價格線
     if far_df is not None and not far_df.empty:
@@ -888,18 +871,17 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
                     str(max(near_df["timestamp"].max(), far_visible_tail["timestamp"].max()))
                 ])
         # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
-        _t_far_ctor = perf_counter()
-        _far_trace = go.Scattergl(
+        fig.add_trace(
+            go.Scatter(
                 x=_clean_list(far_visible["timestamp"], force_str=True),
                 y=_clean_list(far_visible["close"]),
                 name="遠月",
                 line=dict(width=1.5, color="#ff7f0e", dash="dash"),
                 mode="lines",
                 connectgaps=False
-            )
-        _t_far_add = perf_counter()
-        fig.add_trace(_far_trace, row=1, col=1)
-        print(f"[PERF_CHART] far_ctor: {_t_far_add-_t_far_ctor:.3f}s add: {perf_counter()-_t_far_add:.3f}s")
+            ),
+            row=1, col=1
+        )
     
     # 3. 添加交易訊號
     if signals is not None and not signals.empty and "action" in signals.columns:
@@ -1055,20 +1037,6 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             row=atr_row, col=1
         )
     
-    _t_layout_end = perf_counter()
-    _shapes = len(fig.layout.shapes or [])
-    _anns = len(fig.layout.annotations or [])
-    print(f"[CHART_META] shapes={_shapes} annotations={_anns}")
-    _t_ser = perf_counter()
-    try:
-        import plotly.io as _pio
-        _json_bytes = len(_pio.to_json(fig, validate=False))
-        print(f"[PERF_CHART] serialize: {perf_counter()-_t_ser:.3f}s json_bytes={_json_bytes}")
-    except Exception:
-        print("[PERF_CHART] serialize: SKIP")
-    _t_end = perf_counter()
-    print(f"[PERF_CHART] total: {_t_end-_t_chart_start:.3f}s")
-    print(f"[CHART_SOURCE] func={make_futures_dual_chart.__qualname__} file={__file__}")
     return fig
 
 # ── Calendar Spread Chart ──
@@ -1091,16 +1059,15 @@ def make_calendar_spread_chart(spread_df):
         
         # 創建 4 行子圖 (新增第4行: 速度/加速度)
         fig = make_subplots(
-            rows=5, cols=1,
+            rows=4, cols=1,
             shared_xaxes=True,
-            row_heights=[0.3, 0.2, 0.2, 0.15, 0.15],
+            row_heights=[0.35, 0.25, 0.2, 0.2],
             vertical_spacing=0.06,
             subplot_titles=(
                 "近月/遠月價格 (藍線: 近月, 橘虛線: 遠月)", 
                 "價差 (綠線: Spread, 藍線: EMA 20, 紫線: EMA 60, 灰陰影: ±1 Std)", 
                 "Raw Z-score (紅線: Raw 20, 橘虛線/綠虛線: 進出場線)",
-                "Z-score 速度 (紫: dz/dt) + 加速度×10 (青: d²z/dt²×10)",
-                "Spread Velocity (pts/sec)"
+                "Z-score 速度 (紫虛: dz/dt) / 加速度 (棕點: d²z/dt²)"
             )
         )
         
@@ -1206,11 +1173,7 @@ def make_calendar_spread_chart(spread_df):
             _dt = _t.diff().dt.total_seconds().fillna(1).clip(lower=1)
             _z = spread_df["spread_z"]
             _z_v = _z.diff() / _dt  # z/sec
-            _z_v_ema = _z_v.ewm(span=10, adjust=False).mean()
             _z_a = _z_v.diff() / _dt.shift(-1).fillna(1)  # z/sec²
-            _z_a_ema = _z_a.ewm(span=10, adjust=False).mean()
-            _spread_v = spread_df["spread"].diff() / _dt  # pts/sec
-            # Row 4: z-velocity + z-acceleration×10
             fig.add_trace(
                 go.Scatter(
                     x=_clean_list(spread_df["timestamp"], force_str=True),
@@ -1224,23 +1187,12 @@ def make_calendar_spread_chart(spread_df):
             fig.add_trace(
                 go.Scatter(
                     x=_clean_list(spread_df["timestamp"], force_str=True),
-                    y=_clean_list(_z_a * 10),
-                    name="z-score_A×10 (加速度×10)",
-                    line=dict(color="#00bfff", width=1.0),
+                    y=_clean_list(_z_a),
+                    name="z-score_A (加速度)",
+                    line=dict(color="#00bfff", width=1.5),
                     mode="lines"
                 ),
                 row=4, col=1
-            )
-            # Row 5: spread velocity (pts/sec)
-            fig.add_trace(
-                go.Scatter(
-                    x=_clean_list(spread_df["timestamp"], force_str=True),
-                    y=_clean_list(_spread_v),
-                    name="Spread_V (pts/sec)",
-                    line=dict(color="#2ca02c", width=1.2),
-                    mode="lines"
-                ),
-                row=5, col=1
             )
             
             # 添加 Calendar Condor 策略的進出場水平線 (Row 3)
@@ -1284,7 +1236,6 @@ def make_calendar_spread_chart(spread_df):
             fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=3, col=1)
             # 零線 on Row 4
             fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=4, col=1)
-            fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1, row=5, col=1)
         
         # 2026-07-09 Hermes Agent: Mark session open/close boundaries on X-axis (open = green, close = red)
         import pandas as pd
@@ -1324,7 +1275,7 @@ def make_calendar_spread_chart(spread_df):
         
         # 移除非交易時段 & 確保每個子圖都單獨顯示時間軸
         # 2026-07-09 Hermes Agent: Force showticklabels=True on all rows so each subplot has an x-axis
-        for r in range(1, 6):
+        for r in range(1, 4):
             fig.update_xaxes(
                 showticklabels=True,
                 rangebreaks=[
@@ -1341,8 +1292,6 @@ def make_calendar_spread_chart(spread_df):
         fig.update_yaxes(title_text="價格", row=1, col=1, tickformat=",.0f")
         fig.update_yaxes(title_text="價差點數", row=2, col=1, tickformat=",.1f")
         fig.update_yaxes(title_text="Raw Z-score", row=3, col=1, tickformat=",.2f")
-        fig.update_yaxes(title_text="Z Velocity", row=4, col=1, tickformat=",.4f")
-        fig.update_yaxes(title_text="Spread Velocity (pts/sec)", row=5, col=1, tickformat=",.2f")
         
         return fig
         
@@ -3379,31 +3328,7 @@ elif _selected_product == "TMF":
             st.caption("🟡 指標數據尚未產出，顯示訂閱即時價格")
         else:
             st.info("無數據")
-
-    # ── MTS live near/far prices (always show when position open) ──
-    # 2026-07-28 Hermes Agent: Moved outside fallback else-branch
-    _mts_price_file = "/tmp/mts_position_state.json"
-    _near_live = None
-    _far_live = None
-    _has_position = False
-    try:
-        if os.path.exists(_mts_price_file):
-            with open(_mts_price_file) as _pf:
-                _ps = json.load(_pf)
-            _near_live = _ps.get("near_last")
-            _far_live = _ps.get("far_last")
-            _has_position = _ps.get("has_position", False)
-    except Exception:
-        pass
-    if _has_position and (_near_live or _far_live):
-        _nl1, _nl2 = st.columns(2)
-        if _near_live:
-            _nl1.metric("近月 (TMF 即時)", f"{_near_live:.0f}")
-        if _far_live:
-            _nl2.metric("遠月 (TMF 即時)", f"{_far_live:.0f}")
-        st.caption("🟡 MTS 即時行情")
-
-    # ── MTS buttons (always show when MTS enabled, regardless of f_df) ──
+        # ── MTS buttons (always show when MTS enabled, regardless of f_df) ──
         try:
             with open(FUTURES_CFG_PATH) as _f:
                 _mts_on = yaml.safe_load(_f).get("mts", {}).get("enabled", False)
@@ -3567,8 +3492,8 @@ elif _selected_product == "TMF":
                 _atr_info = f" (ATR: `{_current_atr:.1f}`)" if _current_atr else ""
                 if _stop_pts or _trail_pts:
                     _p1, _p2 = st.columns(2)
-                    if _stop_pts: _p1.markdown(f"🛑 **第一腿 ATR 停損**: `{_stop_pts}` 點{_atr_info}")
-                    if _trail_pts: _p2.markdown(f"📈 **剩餘腿 ATR 移動停利**: `{_trail_pts}` 點{_atr_info}")
+                    if _stop_pts: _p1.markdown(f"🛑 **單腿釋放停損閾值**: `{_stop_pts}` 點{_atr_info}")
+                    if _trail_pts: _p2.markdown(f"📈 **剩餘腿移動止盈距離**: `{_trail_pts}` 點{_atr_info}")
 
                 # ── Unrealized PnL Breakdown ──
                 st.markdown("**MTS 未實現損益 (Unrealized PnL)**")
@@ -3580,168 +3505,44 @@ elif _selected_product == "TMF":
                 _u2.metric("遠月 UPL", f"{_fr:+,.0f} TWD")
                 _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
 
-                # P1: Policy J Authority Display — reads evaluator snapshot, validated against position state.
-                try:
-                    # Load position state for identity matching
-                    _pos_state = _mts_state if isinstance(_mts_state, dict) else {}
-                    _pos_trade_id = _pos_state.get("trade_id") or _pos_state.get("trade_id_auto")
-                    _pos_phase = _pos_state.get("lifecycle_phase") or _pos_state.get("phase")
-                    _has_position = _pos_state.get("has_position", False)
+                # 2026-07-27 Gemini CLI: Policy J (Combined UPL Trail) Live Notification Banner
+                _mts_params = futures_cfg.get("mts", {}).get("params", {})
+                _pj_enabled = bool(_mts_params.get("enable_combined_upl_trail", True))
+                if _pj_enabled:
+                    _pj_act_twd = float(_mts_params.get("combined_upl_activation_net_pnl_twd", 200.0))
+                    _pj_giveback_twd = float(_mts_params.get("combined_upl_giveback_twd", 50.0))
+                    _net_exit_twd = _tr - 92.0  # 10 TWD/pt minus 92 TWD friction
+                    _peak_exit_twd = max(float(_mts_state.get("peak_net_exit_pnl_twd", 0.0)), _net_exit_twd)
                     
-                    # Load Policy J evaluator snapshot (authoritative decision source)
-                    _pj_snap_path = Path("/tmp/policy_j_snapshot.json")
-                    if _pj_snap_path.exists():
-                        _pj = json.loads(_pj_snap_path.read_text())
-                        _snap_age = time.time() - _pj_snap_path.stat().st_mtime
-                        _snap_stale = _snap_age > 30.0
-                    else:
-                        _pj = None
-                        _snap_age = 999
-                        _snap_stale = True
+                    _curr_state = str(_mts_state.get("state", "")).upper()
+                    _curr_reason = str(_mts_state.get("reason", "")).upper()
+                    _trigger_line = _peak_exit_twd - _pj_giveback_twd
                     
-                    if not _pj or _snap_stale:
-                        # No valid snapshot
-                        _cause = "無快照" if _pj is None else f"快照過期 ({int(_snap_age)}s)"
-                        st.info(
-                            f"🛡️ **Policy J 狀態**: `UNKNOWN — {_cause}`  \\n"
-                            f"• **Snapshot**: `{'不存在' if _pj is None else _pj.get('snapshot_id','?')[:20]}`  \\n"
-                            f"• **Age**: `{_snap_age:.1f}s`  \\n"
-                            f"• **Fallback**: `Dashboard 不自行計算 Policy J 決策`"
+                    if _curr_state == "COMBINED_EXIT" or _curr_reason == "COMBINED_EXIT":
+                        st.warning(
+                            f"🚨 **Policy J 組合停利已觸發平倉中 (EXECUTING COMBINED EXIT)**  \n"
+                            f"• **執行狀態**: `雙腿平倉委託已送出 (MKP 範圍市價)`  \n"
+                            f"• **最高淨利 Peak PnL**: `{_peak_exit_twd:+,.0f} TWD`  \n"
+                            f"• **觸發時淨損益**: `{_net_exit_twd:+,.0f} TWD` (已跨越平倉線 `{_trigger_line:+,.0f} TWD`)  \n"
+                            f"*(正在等待券商成交 Callback 回傳對齊中...)*"
+                        )
+                    elif _peak_exit_twd >= _pj_act_twd:
+                        st.success(
+                            f"🛡️ **Policy J 組合停利已啟動 (ARMED & TRACKING)**  \n"
+                            f"• **啟動門檻**: `{_pj_act_twd:,.0f} TWD` (已超越)  \n"
+                            f"• **最高淨利 Peak PnL**: `{_peak_exit_twd:+,.0f} TWD`  \n"
+                            f"• **平倉觸發線 (Peak - {_pj_giveback_twd:.0f} TWD)**: `{_trigger_line:+,.0f} TWD`  \n"
+                            f"*(當前淨損益自 Peak 回撤達 `{_pj_giveback_twd:.0f} TWD` 時將立即下單觸發 COMBINED_EXIT 雙腿組合平倉)*"
                         )
                     else:
-                        # Cross-validate: snapshot trade_id must match position
-                        _snap_trade = _pj.get("trade_id", "")
-                        _snap_phase = _pj.get("lifecycle_phase", "")
-                        _same_trade = not _has_position or (_pos_trade_id and _snap_trade == _pos_trade_id)
-                        
-                        _pj_eligible = _pj.get("eligible", False)
-                        _pj_activated = _pj.get("activated", False)
-                        _pj_would_trigger = _pj.get("would_trigger", False)
-                        _pj_decision = _pj.get("decision", "NONE")
-                        _phase_applicable = _pj.get("phase_applicable", _snap_phase == "SPREAD")
-                        _execution_eligible = _pj.get("execution_eligible", False)
-                        _suppression_reason = _pj.get("suppression_reason", "")
-                        _entry_filled = _pj.get("entry_fully_established", False)
-                        _both_legs = _pj.get("both_legs_open_now", False)
-                        
-                        # Build unified display fields
-                        _peak_val = _pj.get("peak_net_exit_pnl_twd", 0)
-                        _current_val = _pj.get("current_net_exit_twd", 0)
-                        _giveback_val = _peak_val - _current_val
-                        _activation_threshold = _pj.get("activation_net_pnl_twd", 200)
-                        _giveback_threshold = _pj.get("giveback_twd", 50)
-                        _exit_line = _pj.get("exit_line_twd", 0)
-                        
-                        # Header: derive from suppression_reason, not raw booleans
-                        if _pj_decision == "COMBINED_EXIT":
-                            _header = "🚨 **Policy J 組合停利已觸發 (COMBINED EXIT EXECUTING)**"
-                        elif _execution_eligible and _pj_activated:
-                            _header = "🛡️ **Policy J 組合停利已啟動 (ARMED & TRACKING)**"
-                        elif _execution_eligible:
-                            _header = "🛡️ **Policy J 組合停利監控中 (MONITORING)**"
-                        elif _has_position and not _phase_applicable:
-                            _header = "ℹ️ **Policy J**: 不適用於目前階段"
-                        elif _suppression_reason == "WARMUP_INCOMPLETE":
-                            _header = "🛡️ **Policy J**: Warmup 進行中"
-                        else:
-                            _header = "🛡️ **Policy J 狀態**: `WAITING`"
-                        
-                        _detail_lines = [
-                            f"• **決策來源**: `evaluator snapshot`",
-                            f"• **Trade ID**: `{_snap_trade}` {'⚠️ 與持倉不匹配' if not _same_trade else ''}  |  "
-                            f"**Phase**: `{_snap_phase}` {'(COMBINED_EXIT 適用)' if _phase_applicable else '(不適用)'}",
-                        ]
-                        
-                        # Key metrics in columns
-                        _m1, _m2, _m3 = st.columns(3)
-                        _m1.metric("Peak PnL", f"{_peak_val:+,.0f}")
-                        _m2.metric("Current PnL", f"{_current_val:+,.0f}")
-                        _m3.metric("Giveback", f"{_giveback_val:+,.0f}")
-                        
-                        if _phase_applicable:
-                            _trigger_reason = _pj.get("trigger_reason", "")
-                            _detail_lines.extend([
-                                f"• **Activation**: `{_peak_val:+,.0f} / {_activation_threshold:+,.0f} TWD` {'✅' if _peak_val >= _activation_threshold else '❌'}  |  "
-                                f"**Exit Line**: `{_exit_line:+,.0f} TWD`  |  "
-                                f"**Would Trigger**: `{_pj_would_trigger}` ({_trigger_reason})" if _trigger_reason else f"**Would Trigger**: `{_pj_would_trigger}`",
-                            ])
-                        else:
-                            _detail_lines.extend([
-                                f"• **Would Trigger** (counterfactual): `{_pj_would_trigger}`",
-                            ])
-                        
-                        
-                        # Suppression info as caption
-                        if _suppression_reason:
-                            _reason_map = {
-                                "WARMUP_INCOMPLETE": "Warmup 未完成 — 等待進場穩定",
-                                "PHASE_SINGLE_LEG": "單腿階段，COMBINED_EXIT 不適用",
-                                "PHASE_FLAT": "無持倉",
-                            }
-                            _reason_text = _reason_map.get(_suppression_reason, _suppression_reason)
-                            _detail_lines.append(f"📎 **{_reason_text}**")
-                        
-                        _detail_lines.append(f"*(Snapshot age: {_snap_age:.1f}s)*")
-                        
-                        if _pj_decision == "COMBINED_EXIT":
-                            st.warning("\n".join(["🚨 **Policy J 組合停利已觸發平倉中 (EXECUTING COMBINED EXIT)**  \\n"] + _detail_lines))
-                        elif _phase_applicable and _pj_eligible and _pj_activated:
-                            st.success("\n".join([_header + "  \\n"] + _detail_lines))
-                        else:
-                            st.info("\n".join([_header + "  \\n"] + _detail_lines))
-                except Exception:
-                    st.info("🛡️ **Policy J 狀態**: `UNKNOWN — 讀取快照失敗`")
-                
-                # P1 Authority split panel
-                try:
-                    _pj2 = json.loads(Path("/tmp/policy_j_snapshot.json").read_text()) if Path("/tmp/policy_j_snapshot.json").exists() else {}
-                except Exception:
-                    _pj2 = {}
-                
-                _mts_params_pj = futures_cfg.get("mts", {}).get("params", {})
-                st.markdown("---")
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    st.markdown("**設定值 (Configured)**")
-                    st.code(
-                        f"啟用: {_mts_params_pj.get('enable_combined_upl_trail', False)}\n"
-                        f"啟動門檻: {_mts_params_pj.get('combined_upl_activation_net_pnl_twd', '?')} TWD\n"
-                        f"回吐門檻: {_mts_params_pj.get('combined_upl_giveback_twd', '?')} TWD\n"
-                        f"Warmup: {_mts_params_pj.get('policy_j_entry_warmup_ms', '?')} ms\n"
-                        f"來源: futures.yaml",
-                        language=""
-                    )
-                with c2:
-                    st.markdown("**Runtime (策略實例)**")
-                    _r_peak = _pj2.get("peak_net_exit_pnl_twd", "?")
-                    _r_curr = _pj2.get("current_net_exit_twd", "?")
-                    _r_eligible = _pj2.get("eligible", "?")
-                    _r_warmup = _pj2.get("warmup_complete", "?")
-                    st.code(
-                        f"Peak: {_r_peak}\n"
-                        f"Current: {_r_curr}\n"
-                        f"Eligible: {_r_eligible}\n"
-                        f"Warmup: {_r_warmup}\n"
-                        f"Activated: {_pj2.get('activated','?')}",
-                        language=""
-                    )
-                with c3:
-                    st.markdown("**Evaluator Snapshot**")
-                    _s_id = _pj2.get("snapshot_id", "?")
-                    _s_time = _pj2.get("event_time", "?")[:19] if _pj2.get("event_time") else "?"
-                    _s_trade = _pj2.get("trade_id", "?")
-                    _s_trigger = _pj2.get("would_trigger", "?")
-                    _s_decision = _pj2.get("decision", "?")
-                    st.code(
-                        f"Snapshot: {_s_id[:20] if len(str(_s_id))>20 else _s_id}\n"
-                        f"Event: {_s_time}\n"
-                        f"Trade: {_s_trade}\n"
-                        f"Would trigger: {_s_trigger}\n"
-                        f"Decision: {_s_decision}",
-                        language=""
-                    )
-                
-                st.caption(f'Snapshot age: {_snap_age:.1f}s | Policy J 決策僅以 Evaluator Snapshot 為權威來源，Dashboard 不自行計算')
+                        _diff = _pj_act_twd - _net_exit_twd
+                        st.info(
+                            f"🛡️ **Policy J 組合停利監控中 (MONITORING)**  \n"
+                            f"• **啟動門檻**: `{_pj_act_twd:,.0f} TWD` (當前純淨利 `{_net_exit_twd:+,.0f} TWD`，尚差 `{_diff:,.0f} TWD` 啟動)  \n"
+                            f"• **回吐門檻**: `{_pj_giveback_twd:.0f} TWD`"
+                        )
+
+                st.caption(f'最後更新: {_mts_state.get("_updated", "?")}')
 
                 # ── MTS 個別委託 (from mts_trade_fills.jsonl) ──
                 try:
@@ -5754,22 +5555,22 @@ elif page == "設定":
                 _mts_params = futures_cfg.get("mts", {}).get("params", {})
                 
                 m1, m2 = st.columns(2)
-                f_mts_min_atr = m1.number_input("MTS 進場最低 ATR", min_value=1.0, max_value=100.0, 
+                f_mts_min_atr = m1.number_input("MTS 最低 ATR 限制", min_value=1.0, max_value=100.0, 
                                                value=float(_mts_params.get("min_atr", 10.0)), step=1.0)
                 f_mts_atr_cap = m2.number_input("MTS ATR 上限 (Cap)", min_value=10.0, max_value=500.0, 
                                                value=float(_mts_params.get("atr_cap", 100.0)), step=10.0)
                 
                 m3, m4 = st.columns(2)
                 # 2026-05-27 Gemini CLI: Updated labels for clarity (ATR Release and ATR Exit)
-                f_mts_mult_stop = m3.slider("MTS 停損倍數 (×ATR)", 0.5, 3.0, 
+                f_mts_mult_stop = m3.slider("MTS 釋放倍數 (ATR Release)", 0.5, 3.0, 
                                             value=float(_mts_params.get("atr_multiplier_stop", 1.0)), step=0.1)
-                f_mts_mult_trail = m4.slider("MTS 停利倍數 (×ATR)", 0.1, 10.0, 
+                f_mts_mult_trail = m4.slider("MTS 停利倍數 (ATR Exit)", 0.1, 10.0, 
                                              value=float(_mts_params.get("atr_multiplier_trail", 3.5)), step=0.1)
                 
                 m5, m6 = st.columns(2)
-                f_mts_stop_fixed = m5.number_input("MTS 固定停損點數", min_value=5, max_value=500, 
+                f_mts_stop_fixed = m5.number_input("MTS 固定釋放點數 (pts)", min_value=5, max_value=500, 
                                                  value=int(_mts_params.get("release_stop_points", 20)))
-                f_mts_trail_fixed = m6.number_input("MTS 固定停利點數最小值", min_value=10, max_value=200, 
+                f_mts_trail_fixed = m6.number_input("MTS 固定停利點數 (pts)", min_value=10, max_value=200, 
                                                   value=int(_mts_params.get("trail_distance_points", 30)))
                 
                 st.markdown("###### 🛡️ Policy J 組合移動停利 (Combined UPL Trailing Exit)")
