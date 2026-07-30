@@ -153,7 +153,8 @@ mts:
     release_stop_points: 88
     trail_distance_points: 66
     enable_combined_upl_trail: true
-    execution_enabled: true    combined_upl_activation_net_pnl_twd: 200.0
+    execution_enabled: true
+    combined_upl_activation_net_pnl_twd: 200.0
     combined_upl_giveback_twd: 50.0
     policy_j_entry_warmup_ms: 3000
     atr_cap: 250.0
@@ -200,5 +201,16 @@ trade_mgmt:
   allow_long: true
   allow_short: true
   force_close_at_end: true
-  lots_per_trade: 2
-  max_positions: 8
+  lots_per_trade: 1
+  max_positions: 4
+session_overrides:
+  night:
+    risk_mgmt:
+      atr_multiplier: 1.4
+      stop_loss_pts: 80
+      trailing_stop_distance_pts: 70
+      trailing_stop_trigger_pts: 120
+    execution:
+      broker_fee_per_side: 20.0
+      market_slippage_pts: 2.0
+      range_protection_pts: 5.0

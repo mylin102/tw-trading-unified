@@ -560,9 +560,42 @@ class FuturesMonitor:
 
         return None
 
+    @staticmethod
+    def _deep_merge_dict(base: dict, override: dict) -> dict:
+        res = dict(base)
+        for key, val in override.items():
+            if key in res and isinstance(res[key], dict) and isinstance(val, dict):
+                res[key] = FuturesMonitor._deep_merge_dict(res[key], val)
+            else:
+                res[key] = val
+        return res
+
     def _load_config(self, path):
-        with open(path, encoding="utf-8") as f:
-            return yaml.safe_load(f)
+        actual_path = str(path)
+        if not os.path.exists(actual_path) and os.path.exists("config/futures.yaml"):
+            actual_path = "config/futures.yaml"
+            console.print(f"[cyan]ℹ️ Config file {path} redirected to primary config/futures.yaml[/cyan]")
+        elif os.path.exists("config/futures.yaml") and ("futures_night" in actual_path or "futures_day" in actual_path or "futures_mtx" in actual_path):
+            actual_path = "config/futures.yaml"
+
+        with open(actual_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        session_key = "night" if "night" in str(path).lower() else "day"
+        overrides = cfg.get("session_overrides", {})
+        if session_key in overrides and isinstance(overrides[session_key], dict):
+            cfg = self._deep_merge_dict(cfg, overrides[session_key])
+
+        local_path = actual_path.replace(".yaml", ".local.yaml") if actual_path.endswith(".yaml") else actual_path + ".local"
+        if os.path.exists(local_path):
+            try:
+                with open(local_path, encoding="utf-8") as lf:
+                    local_cfg = yaml.safe_load(lf) or {}
+                cfg = self._deep_merge_dict(cfg, local_cfg)
+                console.print(f"[cyan]ℹ️ Applied local config override from {local_path}[/cyan]")
+            except Exception as e:
+                console.print(f"[yellow]⚠️ Failed to load local config override {local_path}: {e}[/yellow]")
+        return cfg
 
     def _get_tick_bars_df(self):
         """[Wave 2] Rebuild deque cache on every call so _strategy_tick sees latest bars."""
