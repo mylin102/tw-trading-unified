@@ -1691,21 +1691,33 @@ class FuturesMonitor:
         # 2026-05-27 Gemini CLI: Update market data cache for manual trade integrity checks (P0-P3)
         # Use time.time() as local_arrival_at to avoid exchange-local clock drift issues.
         # 2026-06-24 Gemini CLI: Maintain near/far/code-specific market data caches for spread execution price integrity.
-        self.market_data[self.ticker] = {
-            "close": price, 
-            "datetime": tick.datetime,
-            "local_arrival_at": time.time(),
-            # 2026-06-26 Gemini CLI: cache bid/ask prices
-            "bid": float(getattr(tick, 'buy_price', price) or price),
-            "ask": float(getattr(tick, 'sell_price', price) or price)
-        }
-        self.market_data[f"{self.ticker}_NEAR"] = {
-            "close": price,
-            "datetime": tick.datetime,
-            "local_arrival_at": time.time(),
-            "bid": float(getattr(tick, 'buy_price', price) or price),
-            "ask": float(getattr(tick, 'sell_price', price) or price)
-        }
+        # 2026-07-31 Antigravity P0 Guard Phase 2: Gate NEAR slot updates strictly on is_primary tick.
+        # Prevent far-month/secondary ticks from contaminating NEAR bid/ask/close cache at Line 1693.
+        if is_primary:
+            self.market_data[self.ticker] = {
+                "close": price, 
+                "datetime": tick.datetime,
+                "local_arrival_at": time.time(),
+                # 2026-06-26 Gemini CLI: cache bid/ask prices
+                "bid": float(getattr(tick, 'buy_price', price) or price),
+                "ask": float(getattr(tick, 'sell_price', price) or price)
+            }
+            self.market_data[f"{self.ticker}_NEAR"] = {
+                "close": price,
+                "datetime": tick.datetime,
+                "local_arrival_at": time.time(),
+                "bid": float(getattr(tick, 'buy_price', price) or price),
+                "ask": float(getattr(tick, 'sell_price', price) or price)
+            }
+        elif is_far_tick:
+            self.market_data[f"{self.ticker}_FAR"] = {
+                "close": float(getattr(tick, 'close', price) or price),
+                "datetime": tick.datetime,
+                "local_arrival_at": time.time(),
+                "bid": float(getattr(tick, 'buy_price', price) or price),
+                "ask": float(getattr(tick, 'sell_price', price) or price)
+            }
+
         if getattr(tick, 'code', None):
             self.market_data[tick.code] = {
                 "close": price,
@@ -5825,6 +5837,15 @@ class FuturesMonitor:
                 pass  # BB unavailable → strategy will bypass filter
         _n_close = float(_bar_dict.get("near_close") or 0)
         _f_close = float(_bar_dict.get("far_close") or 0)
+        # [TEMP-DEBUG-20260731] pollution source identification
+        if _n_close > 0 and hasattr(self, "_dbg_last_near") and abs(_n_close - self._dbg_last_near) > 50:
+            print("[POLLUTE_DEBUG] near=%.1f prev=%.1f near_close_rt=%s near_high_rt=%s near_low_rt=%s far_close_rt=%s ts=%s keys=%s"
+                  % (_n_close, self._dbg_last_near,
+                     _bar_dict.get("near_close_rt"), _bar_dict.get("near_high_rt"),
+                     _bar_dict.get("near_low_rt"), _bar_dict.get("far_close_rt"),
+                     _bar_dict.get("ts"),
+                     [k for k in ("near_close_rt", "near_high_rt", "near_low_rt", "far_close_rt", "near_close") if k in _bar_dict]), flush=True)
+        self._dbg_last_near = _n_close
 
         # 2026-07-14 Gemini CLI: Inject MTF snapshot into the bar dictionary for ADR-009 Phase 1
         self._inject_mtf_snapshot(_bar_dict)
