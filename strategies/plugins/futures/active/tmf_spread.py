@@ -515,7 +515,12 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
                  slippage_far: float | None = None,
                  # 2026-07-24 Hermes Agent: settlement tracking
                  settlement_status: str | None = None,
-                 settled_from: str | None = None) -> None:
+                 settled_from: str | None = None,
+                 # 2026-07-31 Hermes Agent: ADR-024E — durable (fsync) writes
+                 # propagate failures instead of swallowing them. Used by the
+                 # COMBINED_EXIT settlement path so a lost fill cannot be
+                 # silently marked complete (fail-closed).
+                 durable: bool = False) -> None:
     """Append a trade fill record (append-only JSONL)."""
     # 2026-06-25 Gemini CLI: Skip fill logging during backtesting
     if os.getenv("MTS_BACKTEST") == "1":
@@ -566,10 +571,137 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
         if trade_id == "?":
             logger.error("[MTS_FILL_ERROR] Missing trade_id in fill record! type=%s ticker=%s", fill_type, ticker)
         
-        with open(_MTS_FILL_LOG, "a") as f:
-            f.write(json.dumps(fill, default=str) + "\n")
+        if durable:
+            _append_jsonl_durable(_MTS_FILL_LOG, fill)
+        else:
+            with open(_MTS_FILL_LOG, "a") as f:
+                f.write(json.dumps(fill, default=str) + "\n")
     except Exception:
+        if durable:
+            raise  # settlement-path writes must not be silently lost
         pass
+
+
+# ═══════════════════════════════════════════════════════════════
+# ADR-024E: Settlement persistence failure latch / sentinel
+# 2026-07-31 Hermes Agent: implemented to match monitor.py call sites
+# (_enter_settlement_persistence_failed / _check_settlement_failure_latch
+# / _reconcile_combined_exit). Previously referenced but never defined,
+# so failures were silently swallowed -> fail-OPEN (restart forgot the
+# failed settlement, risking phantom positions / double settlement).
+# ═══════════════════════════════════════════════════════════════
+_SETTLEMENT_FAILURE_LATCH = os.path.join(
+    os.path.dirname(_MTS_FILL_LOG), "runtime", "settlement_failure_latch.json"
+)
+_CRITICAL_FAILURE_SENTINEL = os.path.join(
+    os.path.dirname(_SETTLEMENT_FAILURE_LATCH), "critical.sentinel"
+)
+
+
+def _append_jsonl_durable(path: str, record: dict) -> None:
+    """Append one JSONL record with fsync. Raises OSError on failure."""
+    _dir = os.path.dirname(path)
+    if _dir and not os.path.exists(_dir):
+        os.makedirs(_dir, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as _f:
+        _f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        _f.flush()
+        os.fsync(_f.fileno())
+
+
+def _write_critical_sentinel() -> None:
+    """Write the CRITICAL sentinel via os.open so it survives open() failures
+    (and builtins.open mocks). This is the last-resort marker."""
+    _dir = os.path.dirname(_CRITICAL_FAILURE_SENTINEL)
+    if _dir and not os.path.exists(_dir):
+        os.makedirs(_dir, exist_ok=True)
+    _fd = os.open(_CRITICAL_FAILURE_SENTINEL, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(_fd, b"CRITICAL_DURABILITY_FAILURE\n")
+        os.fsync(_fd)
+    finally:
+        os.close(_fd)
+
+
+def _write_settlement_failure_latch(
+    *,
+    trade_id: str,
+    execution_id: str,
+    near_filled_qty: int = 0,
+    near_expected_qty: int = 0,
+    far_filled_qty: int = 0,
+    far_expected_qty: int = 0,
+) -> None:
+    """ADR-024E.1: persist the failure latch durably. On secondary (latch
+    write) failure, write the CRITICAL sentinel and hard-exit (SystemExit —
+    uncaught in production terminates the process; tests may catch it)."""
+    _latch = {
+        "type": "SETTLEMENT_FAILURE_LATCH",
+        "trade_id": trade_id,
+        "execution_id": execution_id,
+        "near_filled_qty": near_filled_qty,
+        "near_expected_qty": near_expected_qty,
+        "far_filled_qty": far_filled_qty,
+        "far_expected_qty": far_expected_qty,
+        "entry_enabled": False,
+        "combined_exit_resubmit_enabled": False,
+        "reconciliation_required": True,
+        "timestamp": datetime.now().isoformat(),
+    }
+    try:
+        _append_jsonl_durable(_SETTLEMENT_FAILURE_LATCH, _latch)
+    except Exception as _le:  # noqa: BLE001 — secondary failure path
+        logger.critical(
+            "[CRITICAL_DURABILITY_FAILURE] latch write failed: %r — writing sentinel", _le,
+        )
+        try:
+            _write_critical_sentinel()
+        except Exception:  # noqa: BLE001
+            pass
+        raise SystemExit(1)
+
+
+def _load_settlement_failure_latch() -> dict | None:
+    """Load the latest latch record. If the CRITICAL sentinel exists without
+    a readable latch, synthesize a HALT latch (fail-closed)."""
+    # sentinel lives alongside the latch file — derive dynamically so tests
+    # that override only _SETTLEMENT_FAILURE_LATCH still find it.
+    _sentinel = os.path.join(os.path.dirname(_SETTLEMENT_FAILURE_LATCH), "critical.sentinel")
+    if os.path.exists(_sentinel):
+        return {
+            "type": "SYNTHETIC_HALT",
+            "entry_enabled": False,
+            "combined_exit_resubmit_enabled": False,
+            "reconciliation_required": True,
+            "sentinel": _sentinel,
+        }
+    if os.path.exists(_SETTLEMENT_FAILURE_LATCH):
+        try:
+            with open(_SETTLEMENT_FAILURE_LATCH, encoding="utf-8") as _f:
+                _last = None
+                for _line in _f:
+                    if not _line.strip():
+                        continue
+                    try:
+                        _last = json.loads(_line)
+                    except Exception:  # noqa: BLE001
+                        continue
+                if _last:
+                    return _last
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
+def _clear_settlement_failure_latch() -> None:
+    """Remove latch + sentinel after verified reconciliation."""
+    _sentinel = os.path.join(os.path.dirname(_SETTLEMENT_FAILURE_LATCH), "critical.sentinel")
+    for _p in (_SETTLEMENT_FAILURE_LATCH, _sentinel):
+        try:
+            if os.path.exists(_p):
+                os.remove(_p)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -788,6 +920,13 @@ def settle_mts_trade(
         "near_exit_price": near_exit_price,
         "far_exit_price": far_exit_price,
     }
+
+
+# 2026-07-31 Hermes Agent: Projection integrity — when a CAS reject occurs, the
+# projection (disk state) is stale but execution state (RAM) is already correct.
+# Enqueue a rewrite here; the next telemetry heartbeat replays the snapshot with
+# the CURRENT disk revision. Projection failure must never roll back RAM.
+_PENDING_STATE_REWRITE = None  # dict | None: snapshot awaiting replay
 
 
 def _write_mts_state(
@@ -1014,13 +1153,21 @@ def _write_mts_state(
                     if _disk_revision != _expected_revision:
                         if os.path.exists(_tmp_file): os.remove(_tmp_file)
                         logger.warning(
-                            "[MTS_CAS_REJECT] revision mismatch: expected=%d disk=%d reason=%s",
+                            "[MTS_CAS_REJECT] revision mismatch: expected=%d disk=%d reason=%s "
+                            "-> STATE_WRITE_RETRY enqueued (RAM untouched)",
                             _expected_revision, _disk_revision, reason,
                         )
+                        # Layer 2: enqueue projection repair. Execution state (RAM)
+                        # is authoritative and must NOT be rolled back; the disk
+                        # projection is replayed by the next heartbeat instead.
+                        global _PENDING_STATE_REWRITE
+                        _PENDING_STATE_REWRITE = dict(state)
                         return
                 except Exception:
                     pass  # if we can't read disk, proceed with replace
             os.replace(_tmp_file, _target_state_file)
+            # Projection converged — clear any pending rewrite
+            _PENDING_STATE_REWRITE = None
         except Exception as e:
             if os.path.exists(_tmp_file): os.remove(_tmp_file)
             raise e
@@ -1042,6 +1189,10 @@ def _write_mts_telemetry(
 ) -> None:
     """P0: Heartbeat-only telemetry update — NEVER writes lifecycle fields.
 
+    Layer 2 (projection repair): if a previous lifecycle write was CAS-rejected,
+    replay the enqueued snapshot here using the CURRENT disk revision, so the
+    projection converges without touching execution state.
+
     ───── 設計原則 ─────
     Heartbeat 只能更新：
       - heartbeat_at, pid (心跳標記)
@@ -1061,7 +1212,32 @@ def _write_mts_telemetry(
     所有 lifecycle 欄位從 existing state 原封不動繼承。
     即使記憶體中 init() 設了錯誤的預設值，
     heartbeat 也沒有能力把持倉洗掉。
-    ─────────────────────"""
+    """
+    global _PENDING_STATE_REWRITE
+    if _PENDING_STATE_REWRITE is not None:
+        try:
+            from pathlib import Path as _Path
+            _pp = _Path(_get_state_file_path())
+            _disk = {}
+            if _pp.exists():
+                import json as _json
+                _disk = _json.loads(_pp.read_text())
+            _disk_rev = _disk.get("state_revision", 0)
+            _snap = dict(_PENDING_STATE_REWRITE)
+            _snap["state_revision"] = _disk_rev + 1
+            _snap["_updated"] = datetime.now().isoformat()
+            _tmpf = f"{_pp}.tmp.retry.{os.getpid()}"
+            with open(_tmpf, "w") as _f:
+                _json.dump(_snap, _f, default=str)
+            os.replace(_tmpf, _pp)
+            _PENDING_STATE_REWRITE = None
+            logger.warning(
+                "[STATE_WRITE_RETRY] projection replayed (rev=%d) state=%s reason=%s",
+                _disk_rev + 1, _snap.get("state"), _snap.get("reason"),
+            )
+        except Exception as _e:
+            logger.warning("[STATE_WRITE_RETRY] replay failed: %s (retained)", _e)
+
     if os.getenv("MTS_BACKTEST") == "1":
         return
     try:
@@ -1076,6 +1252,14 @@ def _write_mts_telemetry(
                 pass
 
         # Only touch telemetry fields — preserve ALL lifecycle fields
+        # 2026-07-31 Hermes Agent: if the authoritative disk state is FLAT, the
+        # in-memory position is stale (e.g. after emergency close / clear_records
+        # where strategy memory was not reset). Never write phantom UPL into a
+        # FLAT state file — the dashboard would render it as open-position PnL.
+        if not existing.get("has_position", False):
+            near_upl = 0.0
+            far_upl = 0.0
+            total_upl = 0.0
         _mult = float(get_point_value(ticker))
         telemetry = {
             "has_position": existing.get("has_position", False),
@@ -1291,8 +1475,8 @@ class TMFSpread(StrategyBase):
         self._trail_anchor_source: str | None = None
 
         # ── P1: Single-leg extrema (decision authority in SINGLE_LEG) ──
-        self._single_leg_peak: float = 0.0
-        self._single_leg_nadir: float = 0.0
+        # (_single_leg_peak/nadir initialized before _restore_position_state;
+        #  kept here only for anchor fields)
         self._single_leg_anchor_price: float = 0.0
         self._single_leg_anchor_event_time_ns: float = 0.0
 
@@ -1414,9 +1598,12 @@ class TMFSpread(StrategyBase):
                     trail_mult = float(mfe_tighten.get("level_1_trail_mult", 1.6))
             
             trail = atr * trail_mult
-            # Ensure sensible bounds for TMF (Micro Taiwan Index)
-            # Tiered floors: Stop needs 10pt safety, Trail needs 20pt room to breathe
-            return max(10.0, stop), max(20.0, trail)
+            # 2026-07-31 Hermes Agent: floor = configured fixed values so
+            # runtime (_get_thresholds) and risk-meta (_get_risk_meta) agree:
+            # effective = max(configured_fixed, ATR*mult). Previously
+            # _get_thresholds used hardcoded 10/20 (later 60) while
+            # _get_risk_meta used 10/60 and tests expected config floors.
+            return max(self._release_stop_fixed, stop), max(self._trail_dist_fixed, trail)
         return self._release_stop_fixed, self._trail_dist_fixed
 
     def _apply_vwap_exit(self, bar: dict, trail_dist: float) -> float:
@@ -1749,8 +1936,10 @@ class TMFSpread(StrategyBase):
         release_stop = round(atr_val * stop_mult, 2) if has_release_atr else self._release_stop_fixed
         trail_dist = round(atr_val * trail_mult, 2) if has_trail_atr else self._trail_dist_fixed
         
-        release_stop_floor = 10.0
-        trail_dist_floor = 60.0  # 2026-07-07: 20→60, ~0.82 ATR for TMF night (~73 pt)
+        # 2026-07-31 Hermes Agent: floors = configured fixed values (same rule as
+        # _get_thresholds) so runtime decision and state-file risk meta agree.
+        release_stop_floor = self._release_stop_fixed
+        trail_dist_floor = self._trail_dist_fixed
         
         final_release_stop = max(release_stop_floor, release_stop) if has_release_atr else release_stop
         final_trail_dist = max(trail_dist_floor, trail_dist) if has_trail_atr else trail_dist
@@ -1953,9 +2142,39 @@ class TMFSpread(StrategyBase):
             _latest_open_entries = []
             _latest_ts = ""
             for tid, fills in _trades.items():
-                _entry_count = sum(1 for f in fills if f.get("fill_type") == "ENTRY")
-                _exit_count = sum(1 for f in fills if f.get("fill_type") in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"))
-                if _entry_count > _exit_count:
+                # 2026-07-31 Hermes Agent: qty-aware + terminal-aware open
+                # detection. Previously counted fill ROWS (not qty) and ignored
+                # COMBINED_EXIT_COMPLETED — a qty=2 entry with one 1-lot exit
+                # was wrongly seen as closed, and a COMPLETED event with
+                # unclosed legs was wrongly restored (fail-open).
+                _terminal_present = any(f.get("fill_type") == "COMBINED_EXIT_COMPLETED" for f in fills)
+                _near_open = 0.0
+                _far_open = 0.0
+                for _f in fills:
+                    _ft = _f.get("fill_type")
+                    _qty = float(_f.get("qty") or 0)
+                    _leg = _f.get("leg")
+                    if _ft == "ENTRY":
+                        if _leg == "NEAR":
+                            _near_open += _qty
+                        elif _leg == "FAR":
+                            _far_open += _qty
+                    elif _ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"):
+                        if _leg == "NEAR":
+                            _near_open -= _qty
+                        elif _leg == "FAR":
+                            _far_open -= _qty
+                _any_open = _near_open > 0 or _far_open > 0
+                if _terminal_present and _any_open:
+                    # COMPLETED marker exists but a leg still shows open qty —
+                    # data inconsistency. Fail-closed: do NOT restore (let the
+                    # monitor reconciliation path own the verdict).
+                    logger.warning(
+                        "[MTS_RESTORE_FAIL_CLOSED] trade=%s COMPLETED present but near_open=%.0f far_open=%.0f",
+                        tid, _near_open, _far_open,
+                    )
+                    _any_open = False
+                if _any_open:
                     # Find timestamp of first entry fill
                     _first_entry_ts = ""
                     for f in fills:
@@ -2004,8 +2223,23 @@ class TMFSpread(StrategyBase):
             self._position_epoch = _latest_open_tid
 
             # 2026-07-30 Gemini CLI: Preserve peak_net_exit_pnl_twd across fills-led recovery
+            # 2026-07-31 Hermes Agent: ADR-025 compliance — NO Disk->RAM backfill unless
+            # the state file belongs to the SAME trade_id AND is schema-valid. This is
+            # STARTUP_RECOVERY only; a stale/foreign trade snapshot must never resurrect
+            # the old combined peak into a new or single-leg position.
             _prev_state = self._read_mts_state()
-            _prev_peak = float(_prev_state.get("peak_net_exit_pnl_twd") or 0.0) if _prev_state else 0.0
+            _prev_peak = 0.0
+            if _prev_state and str(_prev_state.get("trade_id") or "") == str(_latest_open_tid):
+                _prev_schema = _prev_state.get("schema_version")
+                try:
+                    _schema_ok = (_prev_schema is None) or (int(_prev_schema) >= 3)
+                except (ValueError, TypeError):
+                    _schema_ok = False
+                if _schema_ok:
+                    try:
+                        _prev_peak = float(_prev_state.get("peak_net_exit_pnl_twd") or 0.0)
+                    except (ValueError, TypeError):
+                        _prev_peak = 0.0
             if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None or self._peak_net_exit_pnl_twd < _prev_peak:
                 self._peak_net_exit_pnl_twd = _prev_peak
 
@@ -2109,6 +2343,40 @@ class TMFSpread(StrategyBase):
             # detects SUBMITTING with a missing order id on next tick.
 
     # ── Hot-reload / restart recovery ────────────────────────────────────────
+    @staticmethod
+    def _fills_trade_is_terminal(trade_id: str) -> bool:
+        """True when fills log shows trade ENTRY count <= EXIT/RELEASE count.
+
+        ADR-025: the fills log (broker-confirmed, append-only) is the runtime
+        authority over the state snapshot. A trade whose entries are all
+        matched by EXIT/RELEASE fills is fully closed — the state file must
+        not resurrect it as an open position.
+        """
+        if not trade_id:
+            return False
+        _log = _MTS_FILL_LOG
+        if not os.path.exists(_log):
+            return False
+        _entry_cnt = 0
+        _exit_cnt = 0
+        try:
+            with open(_log) as _f:
+                for _line in _f:
+                    try:
+                        rec = json.loads(_line.strip())
+                        if str(rec.get("trade_id") or "") != str(trade_id):
+                            continue
+                        ft = rec.get("fill_type", "")
+                        if ft == "ENTRY":
+                            _entry_cnt += 1
+                        elif ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"):
+                            _exit_cnt += 1
+                    except Exception:
+                        pass
+        except Exception:
+            return False
+        return _entry_cnt > 0 and _entry_cnt <= _exit_cnt
+
     def _restore_position_state(self) -> bool:
         """
         Attempt to restore in-memory state from /tmp/mts_position_state.json.
@@ -2169,6 +2437,22 @@ class TMFSpread(StrategyBase):
                 self._mts_state_write_enabled = True
                 return False
         
+        # 2026-07-31 Hermes Agent: ADR-025 reverse authority check.
+        # State snapshot says OPEN, but the fills log (broker-confirmed runtime
+        # authority) proves this trade_id is terminal (all ENTRYs matched by
+        # EXIT/RELEASE). A stale snapshot must NOT resurrect a closed trade —
+        # force FLAT so dashboard/UPL/Policy J all agree with reality.
+        if state and state.get("has_position") is True and state.get("trade_id"):
+            if self._fills_trade_is_terminal(str(state.get("trade_id"))):
+                logger.warning(
+                    "[MTS_RECOVERY] State says OPEN but fills log confirms trade %s is terminal (fully closed). Forcing FLAT.",
+                    state.get("trade_id"),
+                )
+                self._has_position = False
+                self._mts_recovery_state = RecoveryState.FLAT_CONFIRMED
+                self._mts_state_write_enabled = True
+                return False
+
         # 1. Primary Source: JSON State File
         if state and state.get("has_position") is True:
             action = state.get("state", "")
@@ -2225,7 +2509,26 @@ class TMFSpread(StrategyBase):
                                     _pollute_pass = False
                             if _pollute_pass:
                                 self._has_position = True
-                                self._lifecycle = state.get("state", "OPEN")
+                                # 2026-07-31 Hermes Agent: sync legacy _lifecycle
+                                # string with OCA phase. Raw state value like
+                                # "RELEASE_NEAR" would keep on_bar's RELEASE_*
+                                # guard active forever after restart
+                                # (_release_mono=0 never expires) and block
+                                # _manage_position -> restored SINGLE_LEG stuck.
+                                if state.get("released_leg") is not None:
+                                    self._lifecycle = f"TRAILING_{_rem_side}"
+                                    # 2026-07-31 Hermes Agent: restored SINGLE_LEG
+                                    # must NOT re-enter trail warmup (release
+                                    # happened pre-restart). Without this the
+                                    # TRAIL_WARMUP gate blocks exit forever
+                                    # (_single_leg_entered_mono=0 -> elapsed 0 <
+                                    # warmup 500ms -> never evaluates trail).
+                                    self._single_leg_entered_mono = time.monotonic() - 10.0
+                                    self._single_leg_post_fill_ticks = getattr(
+                                        self, "_single_leg_warmup_ticks", 2
+                                    )
+                                else:
+                                    self._lifecycle = state.get("state", "OPEN")
                                 # 2026-07-22 Gemini CLI: Restore state_revision from disk during recovery
                                 self._state_revision = int(state.get("state_revision", 0))
                                 # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
@@ -2236,7 +2539,14 @@ class TMFSpread(StrategyBase):
                                 self._far_side = state.get("far_side")
                                 self._released_leg = state.get("released_leg")
                                 self._side = _rem_side
-                                self._peak_net_exit_pnl_twd = float(state.get("peak_net_exit_pnl_twd") or 0.0)
+                                # 2026-07-31 Hermes Agent: ADR-025 — combined peak is only
+                                # meaningful for a full 2-leg position. In SINGLE_LEG the
+                                # combined peak is frozen: restore 0.0, never the stale
+                                # disk value (which was inflated by single-leg PnL).
+                                if state.get("released_leg") is None:
+                                    self._peak_net_exit_pnl_twd = float(state.get("peak_net_exit_pnl_twd") or 0.0)
+                                else:
+                                    self._peak_net_exit_pnl_twd = 0.0
                                 self._set_single_leg_extrema(peak=_peak, nadir=_nadir)
 
                                 # ── ADR-009 Task 6: Restart Reconciliation ──
@@ -2457,11 +2767,21 @@ class TMFSpread(StrategyBase):
 
     def _is_same_bar_as_release(self, bar_ts) -> bool:
         """P1: True if bar_ts is in the same 5-min bucket as the release event."""
+        # 2026-07-31 Antigravity: Normalize timezones between bar_ts and _release_ts to prevent tz-offset guard bypass
         if bar_ts is None or not getattr(self, "_release_ts", None):
             return True  # conservative
-        _bar_ts = pd.Timestamp(bar_ts) if not isinstance(bar_ts, pd.Timestamp) else bar_ts
-        _rel_ts = pd.Timestamp(self._release_ts) if not isinstance(self._release_ts, pd.Timestamp) else self._release_ts
-        return int(_bar_ts.timestamp() / 300) == int(_rel_ts.timestamp() / 300)
+        try:
+            _bar_ts = pd.Timestamp(bar_ts) if not isinstance(bar_ts, pd.Timestamp) else bar_ts
+            _rel_ts = pd.Timestamp(self._release_ts) if not isinstance(self._release_ts, pd.Timestamp) else self._release_ts
+            
+            if _bar_ts.tzinfo is None:
+                _bar_ts = _bar_ts.tz_localize("Asia/Taipei")
+            if _rel_ts.tzinfo is None:
+                _rel_ts = _rel_ts.tz_localize("Asia/Taipei")
+
+            return int(_bar_ts.timestamp() / 300) == int(_rel_ts.timestamp() / 300)
+        except Exception:
+            return True  # conservative fallback
 
     def _append_skip(self, reason: str, **kwargs) -> None:
         """Append SKIP event only if reason changed or 5min elapsed since last."""
@@ -2992,11 +3312,16 @@ class TMFSpread(StrategyBase):
             else:
                 _rem_high = _rem_low = 0.0
             # ── Track Peak Net Exit PnL TWD for Policy J Live Combined Exit ──
-            _current_net_exit_twd = float(current_pnl * 10.0 - 92.0)
-            if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None:
-                self._peak_net_exit_pnl_twd = 0.0
-            if _current_net_exit_twd > self._peak_net_exit_pnl_twd:
-                self._peak_net_exit_pnl_twd = _current_net_exit_twd
+            # 2026-07-31 Hermes Agent: Item 3 — only update combined peak in SPREAD phase.
+            # In SINGLE_LEG the combined peak is frozen; single-leg PnL must NOT
+            # re-inflate it (observed 434668 -> 434738 after leg release).
+            _lc_phase = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
+            if _lc_phase == PositionPhase.SPREAD:
+                _current_net_exit_twd = float(current_pnl * 10.0 - 92.0)
+                if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None:
+                    self._peak_net_exit_pnl_twd = 0.0
+                if _current_net_exit_twd > self._peak_net_exit_pnl_twd:
+                    self._peak_net_exit_pnl_twd = _current_net_exit_twd
 
             # Auto-repair stale lifecycle phase if state has_position=True but phase is FLAT
             if hasattr(self, "_lifecycle_oca") and self._lifecycle_oca.phase == PositionPhase.FLAT:
@@ -3477,7 +3802,24 @@ class TMFSpread(StrategyBase):
                 _anchor = far_close if _release_leg == Leg.NEAR else near_close
                 if _anchor > 0:
                     self._post_release_anchor_price = _anchor
-                    _append_event("POST_RELEASE_ANCHOR_SET", remaining_leg="FAR" if _release_leg == Leg.NEAR else "NEAR", anchor_price=_anchor)
+                    # 2026-07-31 Hermes Agent: reset remaining-leg trail extrema to
+                    # the release anchor. Previously _single_leg_nadir kept the
+                    # entry-time extreme (e.g. 43600), so any bounce past
+                    # nadir+trail_dist after release fired TRAIL exit within 1s
+                    # (observed 11:46:21 release -> 11:46:22 exit, ~151 pts
+                    # giveback). Post-release trail must restart from anchor.
+                    _rem_leg_s = "FAR" if _release_leg == Leg.NEAR else "NEAR"
+                    if self._side == "LONG":
+                        self._set_single_leg_extrema(peak=_anchor, nadir=self._single_leg_nadir)
+                    else:  # SHORT remaining leg
+                        self._set_single_leg_extrema(peak=self._single_leg_peak, nadir=_anchor)
+                    _append_event(
+                        "POST_RELEASE_TRAIL_RESET",
+                        remaining_leg=_rem_leg_s,
+                        anchor_price=_anchor,
+                        old_nadir=self._single_leg_nadir,
+                    )
+                    _append_event("POST_RELEASE_ANCHOR_SET", remaining_leg=_rem_leg_s, anchor_price=_anchor)
                 # MFE/MAE
                 _mfe = (self._near_max - self._near_entry) if self._near_side == "LONG" else (self._near_entry - self._near_min)
                 _mae = (self._near_entry - self._near_min) if self._near_side == "LONG" else (self._near_max - self._near_entry)
@@ -3903,20 +4245,6 @@ class TMFSpread(StrategyBase):
             )
 
         # 2026-07-01 Gemini CLI: Set in-memory position state to False first to prevent concurrent tick heartbeats from overwriting the file with True.
-    def _is_trade_settled_flat(self) -> bool:
-        """ADR-025: Strict settlement gate to prevent premature Policy J reset."""
-        if self._has_position:
-            return False
-        if getattr(self, "_near_status", "") in ("SUBMITTED", "PARTIALLY_FILLED", "PENDING"):
-            return False
-        if getattr(self, "_far_status", "") in ("SUBMITTED", "PARTIALLY_FILLED", "PENDING"):
-            return False
-        if hasattr(self, "_lifecycle_oca") and self._lifecycle_oca:
-            if self._lifecycle_oca.release_group.status in (
-                ReleaseGroupStatus.SUBMITTING, ReleaseGroupStatus.SUBMITTED, ReleaseGroupStatus.PARTIALLY_FILLEC
-            ):
-                return False
-        return True
 
         self._has_position = False
         self._lifecycle = "FLAT"
@@ -3962,6 +4290,27 @@ class TMFSpread(StrategyBase):
         self._mfe_pts = 0.0
         self._mae_pts = 0.0
         self._release_price = 0.0
+        # 2026-07-31 Hermes Agent: Item 4 — reset single-leg trail peak/nadir on
+        # trade settle so stale extrema never leak into a new trade.
+        self._single_leg_peak = 0.0
+        self._single_leg_nadir = 0.0
+
+
+    def _is_trade_settled_flat(self) -> bool:
+        """ADR-025: Strict settlement gate to prevent premature Policy J reset."""
+        if self._has_position:
+            return False
+        if getattr(self, "_near_status", "") in ("SUBMITTED", "PARTIALLY_FILLED", "PENDING"):
+            return False
+        if getattr(self, "_far_status", "") in ("SUBMITTED", "PARTIALLY_FILLED", "PENDING"):
+            return False
+        if hasattr(self, "_lifecycle_oca") and self._lifecycle_oca:
+            if self._lifecycle_oca.release_group.status in (
+                ReleaseGroupStatus.SUBMITTING, ReleaseGroupStatus.SUBMITTED, ReleaseGroupStatus.PARTIALLY_FILLEC
+            ):
+                return False
+        return True
+
 
     def cleanup(self) -> None:
         self._reset()

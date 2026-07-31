@@ -750,12 +750,28 @@ def feeds_are_fresh(feed_health, require_tx=True, require_futures=True):
     return (len(problems) == 0), problems, snap
 
 
+def update_startup_progress(step: str, progress_pct: int, message: str, status: str = "IN_PROGRESS"):
+    try:
+        import json, time
+        data = {
+            "status": status,
+            "step": step,
+            "progress_pct": progress_pct,
+            "message": message,
+            "timestamp": time.time()
+        }
+        with open("/tmp/futures_system_startup.json", "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
 def run_system(dry_run=False, config_name="futures"):
     """運行交易系統，遇到斷線或重啟請求時結束進程，由外部腳本重新拉起"""
     # 啟動時立即清除重啟旗標，避免循環重啟
     if RESTART_FLAG.exists():
         RESTART_FLAG.unlink()
         console.print("[dim]Old restart flag cleared.[/dim]")
+    update_startup_progress("SHIOAJI_CONNECTING", 30, "📡 正在與 永豐期貨 建立安全連線與 Session...", status="STARTING")
 
     # ── Lifecycle provenance recorder ──
     from core.lifecycle_provenance import LifecycleRecorder
@@ -828,10 +844,12 @@ def run_system(dry_run=False, config_name="futures"):
 
             # [rshioaji 1.5.10+] Ensure contracts are loaded in cache before monitors start
             from core.broker.shioaji_compat import fetch_all_contracts
+            update_startup_progress("CONTRACT_SYNC", 55, "📡 正在向永豐期貨下載與同步全場期貨/選擇權契約規格 (約需 10-20 秒)...", status="STARTING")
             console.print("[cyan]📡 Synchronizing all broker contracts (this may take 1-5 minutes)...[/cyan]")
             print(f"[CONTRACT_SYNC_START] timeout=300s", flush=True)
             if fetch_all_contracts(api, timeout=300):
                 console.print("[green]✅ Contracts synchronized successfully.[/green]")
+                update_startup_progress("MONITOR_INIT", 80, "🛡️ 契約載入完成，正在進行 LIVE_PREFLIGHT 風控與賬戶檢測...", status="PREFLIGHT")
                 print(f"[CONTRACT_SYNC_PROGRESS] success", flush=True)
             else:
                 console.print("[yellow]⚠️ Contract synchronization timed out, continuing with best effort.[/yellow]")
@@ -1067,6 +1085,7 @@ def run_system(dry_run=False, config_name="futures"):
         for fm, ft in futures_threads:
             ft.start()
         console.print(f"[bold green]🚀 Unified Monitors Running ({', '.join(fm.ticker for fm in futures_mons)})[/bold green]")
+        update_startup_progress("SYSTEM_READY", 100, "✅ 系統與 Preflight 檢查完成，實時交易監控運作中！", status="READY")
         for fm, ft in futures_threads:
             print(f"[RUNTIME_LOOP_STARTED] futures_thread={ft.ident} ticker={fm.ticker}", flush=True)
 

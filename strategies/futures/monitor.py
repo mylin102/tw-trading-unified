@@ -11,6 +11,7 @@ import json
 import math
 import yaml
 import traceback
+import uuid
 from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
@@ -1553,10 +1554,11 @@ class FuturesMonitor:
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()  # [gstack] 更新數據更新時間
         
-        # 2026-07-24 Gemini CLI: Pre-populate tick cache at entry of on_tick so _process_manual_trade_flag has fresh price
+        # 2026-07-31 Antigravity P0 Guard: Only near-month primary ticks (tick.code == self.contract.code)
+        # update _last_tmf_price and NEAR market_data slots to prevent far-month tick price pollution.
         if getattr(tick, 'close', None) and float(tick.close) > 0:
             _p = float(tick.close)
-            self._last_tmf_price = _p
+            _t_code = getattr(tick, 'code', None)
             _tick_info = {
                 "close": _p,
                 "datetime": getattr(tick, 'datetime', None),
@@ -1564,10 +1566,16 @@ class FuturesMonitor:
                 "bid": float(getattr(tick, 'buy_price', _p) or _p),
                 "ask": float(getattr(tick, 'sell_price', _p) or _p),
             }
-            if getattr(tick, 'code', None):
-                self.market_data[tick.code] = _tick_info
-            self.market_data[self.ticker] = _tick_info
-            self.market_data[f"{self.ticker}_NEAR"] = _tick_info
+            if _t_code:
+                self.market_data[_t_code] = _tick_info
+            
+            _is_near_tick = (self.contract and _t_code == self.contract.code) or (not self.contract and _t_code and not _t_code.endswith("I6") and not _t_code.endswith("J6"))
+            if _is_near_tick:
+                self._last_tmf_price = _p
+                self.market_data[self.ticker] = _tick_info
+                self.market_data[f"{self.ticker}_NEAR"] = _tick_info
+            elif self.far_contract and _t_code == self.far_contract.code:
+                self.market_data[f"{self.ticker}_FAR"] = _tick_info
 
         # ── [Manual Trade Flag] Check on every tick ──
         # 2026-06-05 JVS Claw: Step 4 — gate flag check with is_primary (C4).
@@ -3000,6 +3008,14 @@ class FuturesMonitor:
 
         def _on_reject_callback(event):
             console.print(f"[red]❌ Order REJECTED: {event.order_id} ({event.reason})[/red]")
+            # 2026-07-31: COMBINED_EXIT leg rejected -> repair path, never pretend completed
+            try:
+                _rp = self._pending_lifecycle_orders.get(event.order_id)
+                if _rp and str(_rp.get("signal", "")).startswith("COMBINED_EXIT"):
+                    self._handle_combined_exit_leg_rejected(event, _rp)
+            except Exception as _re:
+                import logging
+                logging.getLogger().warning("[COMBINED_EXIT_REJECT_HANDLER_FAILED] %s", _re)
             # 2026-07-07 Gemini CLI: P0: Stale callback guard based on lifecycle generation
             # 2026-07-07 Gemini CLI / Hermes Agent: Handle missing _lifecycle_generation gracefully for unit tests
             pending = self._pending_lifecycle_orders.get(event.order_id)
@@ -3329,11 +3345,25 @@ class FuturesMonitor:
             _after_ids = set(self.paper_fill_sim._pending_orders.keys())
             if _after_ids != _before_ids:
                 _consumed = _before_ids - _after_ids
-                console.print(
-                    f"[bold yellow]🔒 [OCO_ATOMIC] consumed={_consumed} "
-                    f"— breaking poll loop (sibling protected)[/bold yellow]"
+                # 2026-07-31: COMBINED_EXIT legs are INDEPENDENT closes — both must
+                # fill. OCO sibling protection only applies to release brackets
+                # (first leg filled => cancel sibling). Breaking here would starve
+                # the second CE leg's tick in this cycle.
+                _ce_consumed = any(
+                    str(self._pending_lifecycle_orders.get(oid, {}).get("signal", "")).startswith("COMBINED_EXIT")
+                    for oid in _consumed
                 )
-                break
+                if _ce_consumed:
+                    console.print(
+                        f"[dim][PAPER_FILL] COMBINED_EXIT leg consumed={_consumed} "
+                        f"— continuing to feed sibling (both legs must fill)[/dim]"
+                    )
+                else:
+                    console.print(
+                        f"[bold yellow]🔒 [OCO_ATOMIC] consumed={_consumed} "
+                        f"— breaking poll loop (sibling protected)[/bold yellow]"
+                    )
+                    break
 
             # [ADR-010] Post-tick guard: break if OCO filled_leg is now set
             # (kept as backup even with the snapshot guard above)
@@ -3725,6 +3755,66 @@ class FuturesMonitor:
         except Exception:
             pass
 
+    def _mts_ledger_reconstructed_open_qty(self, trade_id: str) -> dict[str, int] | None:
+        """Rebuild per-leg open quantity from the append-only fills ledger.
+
+        Source of truth: logs/mts_trade_fills.jsonl (every confirmed fill).
+        For each (trade_id, leg): ENTRY adds qty, RELEASE/EXIT/COMBINED_EXIT*
+        subtracts qty. A leg is FLAT when reconstructed open qty <= 0.
+
+        This is the INDEPENDENT hard gate for COMBINED_EXIT: it does NOT trust
+        strategy in-memory state (phase / _near_qty / _far_qty), which can be
+        stale if the release-fill callback failed to sync.
+
+        Returns dict {"NEAR": int, "FAR": int} when the ledger exists and was
+        scanned, or None when the ledger is absent/unreadable (caller must
+        fall back to strategy-level gates — do not block on missing evidence).
+        """
+        if not trade_id:
+            return None
+        _fills_path = os.environ.get("MTS_FILL_LOG_PATH") or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "logs", "mts_trade_fills.jsonl",
+        )
+        if not os.path.exists(_fills_path):
+            return None
+        _open_qty = {"NEAR": 0, "FAR": 0}
+        _found_entry = False  # any ENTRY fill for this trade_id in the ledger
+        _TERMINAL_TYPES = {"RELEASE", "EXIT", "COMBINED_EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"}
+        try:
+            with open(_fills_path) as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    try:
+                        _rec = json.loads(_line)
+                    except Exception:
+                        continue
+                    if str(_rec.get("trade_id") or "") != str(trade_id):
+                        continue
+                    _leg = str(_rec.get("leg") or _rec.get("contract") or "").upper()
+                    if _leg not in ("NEAR", "FAR"):
+                        continue
+                    try:
+                        _qty = int(_rec.get("qty") or 0)
+                    except (ValueError, TypeError):
+                        continue
+                    _ft = str(_rec.get("fill_type", "")).upper()
+                    if _ft == "ENTRY":
+                        _found_entry = True
+                        _open_qty[_leg] += _qty
+                    elif _ft in _TERMINAL_TYPES:
+                        _open_qty[_leg] -= _qty
+        except Exception:
+            logger.exception("[MTS_LEDGER_SCAN_FAILED] fills ledger unreadable")
+            return None
+        # No ENTRY evidence for this trade -> cannot reconstruct -> caller must
+        # fall back to strategy-level gates (do NOT block on missing evidence).
+        if not _found_entry:
+            return None
+        return _open_qty
+
     def _submit_mts_order_signal(self, signal, strategy, bar_dict, ts):
         """Submit order via order_mgr for MTS signals (entry, release, exit).
 
@@ -3983,6 +4073,21 @@ class FuturesMonitor:
                 console.print(f"[bold red]⛔ [MTS_COMBINED_EXIT_BLOCKED] INVALID_POSITION_QUANTITY: near={_near_qty} far={_far_qty}[/bold red]")
                 return
 
+            # 2026-07-31 Hermes Agent: Independent release-ledger hard gate (ADR-025).
+            # Strategy in-memory phase/qty can be stale if release-fill sync failed.
+            # Rebuild per-leg open qty from the broker-confirmed fills ledger:
+            # a leg with reconstructed open qty <= 0 is FLAT and COMBINED_EXIT must
+            # be blocked — otherwise we would re-enter/flip the flat leg.
+            # (Ledger absent/unreadable -> None -> fall back to strategy gates.)
+            _ledger_qty = self._mts_ledger_reconstructed_open_qty(_trade_id)
+            if _ledger_qty is not None and (_ledger_qty["NEAR"] <= 0 or _ledger_qty["FAR"] <= 0):
+                console.print(
+                    f"[bold red]⛔ [MTS_COMBINED_EXIT_BLOCKED] LEDGER_RECONSTRUCTED_LEG_FLAT: "
+                    f"trade_id={_trade_id} near_open={_ledger_qty['NEAR']} far_open={_ledger_qty['FAR']}. "
+                    f"COMBINED_EXIT requires BOTH legs open — refusing to submit.[/bold red]"
+                )
+                return
+
             # Claim idempotency key
             self._claimed_execution_keys.add(_claim_key)
 
@@ -4011,11 +4116,13 @@ class FuturesMonitor:
             # Register in pending lifecycle with group_id
             self._pending_lifecycle_orders[_near_order.order_id] = {
                 "intent_id": _near_order.intent_id, "signal": "COMBINED_EXIT_NEAR", "reason": "COMBINED_EXIT",
+                "trade_id": _trade_id,  # 2026-07-31: real trade_id for fills-ledger correlation
                 "ts": _ts, "lots": _near_qty, "price": _near_close, "ref_ohlc": _snap["near"],
                 "strategy": "MTS_EXIT", "combined_exit_group_id": _ce_group_id,
             }
             self._pending_lifecycle_orders[_far_order.order_id] = {
                 "intent_id": _far_order.intent_id, "signal": "COMBINED_EXIT_FAR", "reason": "COMBINED_EXIT",
+                "trade_id": _trade_id,  # 2026-07-31: real trade_id for fills-ledger correlation
                 "ts": _ts, "lots": _far_qty, "price": _far_close, "ref_ohlc": _snap["far"],
                 "strategy": "MTS_EXIT", "combined_exit_group_id": _ce_group_id,
             }
@@ -6172,8 +6279,14 @@ class FuturesMonitor:
         if not os.path.exists(_fills_path):
             return False
         try:
-            _entry_ids: set = set()
-            _exit_ids: set = set()
+            # 2026-07-31: Counter-based, consistent with strategy
+            # _check_fills_has_open_position. The old set-based logic removed a
+            # trade from the open set after ANY single EXIT/RELEASE fill — even
+            # when one leg remained open (e.g. 2 ENTRY + 1 RELEASE), which fired
+            # a bogus SPLIT_BRAIN reset loop (10k+ iterations observed).
+            from collections import Counter
+            _entry_counts: Counter = Counter()
+            _exit_counts: Counter = Counter()
             with open(_fills_path) as _f:
                 for _line in _f:
                     _line = _line.strip()
@@ -6188,11 +6301,13 @@ class FuturesMonitor:
                     if not _tid or not _ft:
                         continue
                     if _ft == "ENTRY":
-                        _entry_ids.add(_tid)
+                        _entry_counts[_tid] += 1
                     elif _ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"):
-                        _exit_ids.add(_tid)
-            _open_ids = _entry_ids - _exit_ids
-            return bool(_open_ids)
+                        _exit_counts[_tid] += 1
+            for _tid, _ecnt in _entry_counts.items():
+                if _ecnt > _exit_counts.get(_tid, 0):
+                    return True
+            return False
         except Exception:
             return False
 
@@ -6279,6 +6394,27 @@ class FuturesMonitor:
 
         return False
 
+
+    def _write_manual_command_status(self, command_id, status, message, **extra) -> None:
+        """2026-07-31: Write manual-command audit status for the dashboard.
+
+        Status machine: COMMAND_SENT (dashboard) -> RECEIVED (monitor consumed
+        flag) -> PROCESSING -> COMPLETED | FAILED. Every transition carries a
+        timestamp; COMPLETED carries position_before/position_after/order_ids.
+        """
+        try:
+            _path = "/tmp/futures_manual_trade_status.json"
+            _data = {
+                "command_id": command_id,
+                "status": status,
+                "ts": datetime.now().isoformat(),
+                "message": message,
+            }
+            _data.update(extra)
+            with open(_path, "w") as _f:
+                json.dump(_data, _f, default=str)
+        except Exception as _e:
+            console.print(f"[red]⚠️ [CMD_STATUS] write failed: {_e}[/red]")
 
     def _emergency_flatten_mts(self, strategy) -> None:
         """Emergency flatten all MTS positions. Used by settlement gate and manual close_all.
@@ -6478,6 +6614,11 @@ class FuturesMonitor:
             
             if _action == "close_all":
                 console.print("[bold red]🆘 [MANUAL_TRADE] EMERGENCY CLOSE ALL triggered[/bold red]")
+                # 2026-07-31 Hermes Agent: audit trail — command_id + status machine
+                _command_id = _flag.get("command_id") or f"CMD-{datetime.now():%Y%m%d%H%M%S}"
+                self._write_manual_command_status(
+                    _command_id, "RECEIVED", "monitor 已接收緊急平倉指令", action="close_all",
+                )
                 # 2026-07-07 Gemini CLI: P0: Increment generation on emergency close to invalidate past callbacks
                 self._lifecycle_generation += 1
                 self._emergency_reset_at = datetime.now()
@@ -6510,6 +6651,16 @@ class FuturesMonitor:
                 except Exception as _sf_e:
                     console.print(f"[red]⚠️ [MANUAL_TRADE] close_all: disk read failed: {_sf_e}[/red]")
 
+                self._write_manual_command_status(
+                    _command_id, "PROCESSING", "正在送出平倉單",
+                    has_pos=_has_pos,
+                    position_before={
+                        "near_side": _near_side, "far_side": _far_side,
+                        "released_leg": _released_leg,
+                        "near_entry": float(_disk.get("near_entry", 0)) if _disk else 0,
+                        "far_entry": float(_disk.get("far_entry", 0)) if _disk else 0,
+                    },
+                )
                 if _has_pos and self.order_mgr:
                     # 2026-07-07 Hermes Agent: reindex order counter from
                     # persisted orders to prevent ID collision after PM2
@@ -6668,6 +6819,33 @@ class FuturesMonitor:
                 elif not _has_pos:
                     self._manual_trade_status = "READY"
                     console.print("[yellow]⚠️ [MANUAL_TRADE] close_all: no position to close[/yellow]")
+                    self._write_manual_command_status(
+                        _command_id, "COMPLETED",
+                        "無持倉可平；已清理 stale lifecycle",
+                        position_after={"near_qty": 0, "far_qty": 0}, order_ids=[],
+                    )
+                    # 2026-07-31 Hermes Agent: also clean stale lifecycle residue
+                    # (release_group.status=ARMED with no orders) so the dashboard
+                    # clear-records guard can pass. Emergency flatten must leave
+                    # the state clean, not just log "nothing to close".
+                    try:
+                        from strategies.plugins.futures.active.tmf_spread import _write_mts_state
+                        _write_mts_state(
+                            has_position=False, action="FLAT", reason="EMERGENCY_CLOSE_NO_POS",
+                            ticker=self.ticker,
+                            lifecycle={
+                                "phase": "FLAT",
+                                "release_group": {"status": "INACTIVE"},
+                                "trail_group": {"status": "INACTIVE"},
+                            },
+                            manual_trade_status="READY",
+                        )
+                        console.print("[dim]✅ [MANUAL_TRADE] close_all: stale lifecycle cleaned (FLAT/INACTIVE)[/dim]")
+                    except Exception as _ce:
+                        import logging
+                        logging.getLogger("FuturesMonitor").warning(
+                            "[EMERGENCY_CLOSE] no-pos state cleanup failed: %s", _ce
+                        )
                 else:
                     self._manual_trade_status = "FAILED: NO_ORDER_MGR"
 
@@ -7100,7 +7278,71 @@ class FuturesMonitor:
                 "far_complete": False,
                 "settlement_completed": False,
             }
+            # 2026-07-31 Hermes Agent: initialize from fills log — after a
+            # restart mid-COMBINED_EXIT, legs filled before restart must count
+            # (test_restart_between_near_fill_and_far_fill...). Without this the
+            # tracker starts empty and the surviving-leg fill never completes
+            # settlement (stuck half-flat).
+            try:
+                from strategies.plugins.futures.active.tmf_spread import _MTS_FILL_LOG as _FILL_LOG
+                if os.path.exists(_FILL_LOG):
+                    with open(_FILL_LOG, encoding="utf-8") as _f:
+                        for _line in _f:
+                            try:
+                                _rec = json.loads(_line.strip())
+                            except Exception:
+                                continue
+                            if _rec.get("trade_id") != execution_id:
+                                continue
+                            _ft = _rec.get("fill_type")
+                            _qty = int(_rec.get("qty") or 0)
+                            _price = _rec.get("price")
+                            _tr = self._combined_exit_trackers[execution_id]
+                            if _ft == "COMBINED_EXIT_NEAR" and _qty > 0:
+                                _tr["near_filled_qty"] += _qty
+                                _tr["near_price"] = float(_price) if _price is not None else _tr["near_price"]
+                            elif _ft == "COMBINED_EXIT_FAR" and _qty > 0:
+                                _tr["far_filled_qty"] += _qty
+                                _tr["far_price"] = float(_price) if _price is not None else _tr["far_price"]
+                    _tr = self._combined_exit_trackers[execution_id]
+                    if _tr["near_filled_qty"] > 0:
+                        _tr["near_expected_qty"] = _tr["near_filled_qty"]
+                        _tr["near_complete"] = True
+                    if _tr["far_filled_qty"] > 0:
+                        _tr["far_expected_qty"] = _tr["far_filled_qty"]
+                        _tr["far_complete"] = True
+            except Exception:
+                pass
         return self._combined_exit_trackers[execution_id]
+
+    def _handle_combined_exit_leg_rejected(self, event, pending: dict) -> None:
+        """2026-07-31: One COMBINED_EXIT leg was REJECTED.
+
+        The position may be half-flat (sibling filled). We must NOT pretend the
+        combined exit completed: mark the tracker REPAIR_REQUIRED, keep the
+        position state intact, and let the strategy's next lifecycle evaluation
+        re-attempt the exit (position is still held -> a new signal will fire).
+        This prevents both the half-flat ghost state and a false FLAT.
+        """
+        _gid = pending.get("combined_exit_group_id")
+        _trade_id = pending.get("trade_id") or pending.get("reason", "COMBINED_EXIT")
+        _rejected_leg = "NEAR" if "NEAR" in str(pending.get("signal", "")) else "FAR"
+        tracker = self._get_combined_exit_tracker(_trade_id)
+        tracker["status"] = "REPAIR_REQUIRED"
+        tracker["rejected_leg"] = _rejected_leg
+        tracker["reject_reason"] = getattr(event, "reason", "")
+        # Find the sibling order in the same group (for diagnostics)
+        _sibling_oid = None
+        for oid, _p in (self._pending_lifecycle_orders or {}).items():
+            if oid != event.order_id and _p.get("combined_exit_group_id") == _gid:
+                _sibling_oid = oid
+                break
+        tracker["sibling_order_id"] = _sibling_oid
+        console.print(
+            f"[bold red]⛔ [COMBINED_EXIT_LEG_REJECTED] group={_gid} trade_id={_trade_id} "
+            f"leg={_rejected_leg} reason={getattr(event, 'reason', '?')} "
+            f"sibling={_sibling_oid or 'none'} -> REPAIR_REQUIRED (NOT completed)[/bold red]"
+        )
 
     def _apply_combined_exit_fill(self, event, pending: dict, signal: str, price: float) -> None:
         console.print(f"[dim]DBG [COMBINED_EXIT_FILL_ENTERED] signal={signal} order_id={event.order_id}[/dim]")
@@ -7108,8 +7350,11 @@ class FuturesMonitor:
         from core.order_management.order import OrderStatus
         from strategies.plugins.futures.active.tmf_spread import PositionPhase, _write_mts_state
 
-        # Shared key so near + far fills use the same tracker
-        trade_id = pending.get("reason", "COMBINED_EXIT")
+        # Shared key so near + far fills use the same tracker.
+        # 2026-07-31: use the REAL trade_id (stored at submission); the literal
+        # "COMBINED_EXIT" fallback broke fills-ledger correlation and let closed
+        # trades resurrect after restart.
+        trade_id = pending.get("trade_id") or pending.get("reason", "COMBINED_EXIT")
         lots = int(event.fill_qty)
         leg = "NEAR" if "NEAR" in str(signal) else "FAR"
         tracker = self._get_combined_exit_tracker(trade_id)
@@ -7189,6 +7434,10 @@ class FuturesMonitor:
                 contract=self.contract.code if getattr(self, "contract", None) else "NEAR",
                 leg="NEAR",
                 side="SELL",
+                # 2026-07-31 Hermes Agent: ADR-024E durable settlement fill —
+                # fsync + propagate failure so lost writes hit the fail-closed
+                # branch below instead of silently marking settlement complete.
+                durable=True,
                 qty=tracker["near_filled_qty"],
                 price=tracker.get("near_price") or price,
                 fill_type="COMBINED_EXIT",
@@ -7199,6 +7448,7 @@ class FuturesMonitor:
                 contract=self.far_contract.code if getattr(self, "far_contract", None) else "FAR",
                 leg="FAR",
                 side="BUY",
+                durable=True,
                 qty=tracker["far_filled_qty"],
                 price=tracker.get("far_price") or price,
                 fill_type="COMBINED_EXIT",
@@ -7211,6 +7461,7 @@ class FuturesMonitor:
                 side="NONE",
                 qty=0,
                 price=0.0,
+                durable=True,
                 fill_type="COMBINED_EXIT_COMPLETED",
                 trade_id=trade_id,
             )
@@ -7222,8 +7473,16 @@ class FuturesMonitor:
         # ADR-024E: Durable commit succeeded -> now safe
         tracker["settlement_completed"] = True
 
-        # Finalize: reset strategy position to FLAT
-        _mts_strat = pending.get("strategy") or getattr(self, "_registry", {}).get("tmf_spread")
+        # Finalize: reset strategy position to FLAT.
+        # 2026-07-31: pending["strategy"] may be the STRING "MTS_EXIT" (order tag)
+        # in production — calling ._reset() on it raised AttributeError and aborted
+        # settlement. Prefer a real strategy object from pending (tests / tagged
+        # path), otherwise resolve from the registry.
+        _mts_strat = pending.get("strategy")
+        if not hasattr(_mts_strat, "_reset"):
+            _mts_strat = None
+            if hasattr(self, "_registry"):
+                _mts_strat = getattr(self, "_registry", {}).get("tmf_spread")
         if _mts_strat:
             _mts_strat._reset(reason="combined_exit_confirmed", exit_price=price)
             if hasattr(_mts_strat, "_lifecycle_oca") and _mts_strat._lifecycle_oca is not None:

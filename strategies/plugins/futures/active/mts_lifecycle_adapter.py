@@ -121,6 +121,7 @@ class PositionLifecycle:
     phase: PositionPhase = PositionPhase.FLAT
     release_group: ReleaseGroup = field(default_factory=ReleaseGroup)
     trail_group: TrailGroup = field(default_factory=TrailGroup)
+    exit_owner: str | None = None
 
 @dataclass
 class LifecycleDecision:
@@ -169,7 +170,6 @@ class LifecycleContext:
     combined_upl_activation_net_pnl_twd: float = 300.0
     combined_upl_giveback_twd: float = 100.0
     peak_net_exit_pnl_twd: float = 0.0
-    combined_exit_execution_enabled: bool = False    # 2026-07-28 Hermes Agent: P0 gate — disableable decision cannot preempt RELEASE
 
 @dataclass(frozen=True)
 class LifecycleEvaluationInput:
@@ -252,6 +252,16 @@ def _check_combined_upl_trail_candidate(
     if _phase_val != "SPREAD":
         return []
     _rg_status = enum_value(lifecycle.release_group.status)
+    _owner = getattr(lifecycle, "exit_owner", None)
+
+    # 1. Exit Ownership & In-Flight Guard:
+    # If Policy J (or another exit policy) already holds exit ownership, or if release_group is in-flight,
+    # do NOT re-evaluate or re-emit duplicate COMBINED_EXIT candidates.
+    if _owner == "POLICY_J" or _rg_status in (
+        "TRIGGERED", "SUBMITTING", "SUBMITTED", "PARTIALLY_FILLED", "FILLED", "COMPLETED"
+    ):
+        return []
+
     if _rg_status not in ("ARMED", "INACTIVE"):
         return []
 
@@ -264,6 +274,19 @@ def _check_combined_upl_trail_candidate(
                 ctx.peak_net_exit_pnl_twd, total_net_pnl_twd, ctx.combined_upl_giveback_twd,
             )
             return [LifecycleDecision(action=LifecycleAction.COMBINED_EXIT)]
+
+    # 2. Release-Stop Intercept Rule (Combined-First Protection)
+    # If a single leg hits release stop AND total net exit PnL is in profit / ARMED (>= activation threshold),
+    # intercept with COMBINED_EXIT to lock in total spread profit instead of splitting into single leg.
+    near_hit = ctx.near_pnl_pts <= -ctx.release_stop_threshold
+    far_hit = ctx.far_pnl_pts <= -ctx.release_stop_threshold
+    if (near_hit or far_hit) and (ctx.peak_net_exit_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd or total_net_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd):
+        logger.info(
+            "[POLICY_J_RELEASE_INTERCEPT] Single leg hit release stop (near_hit=%s far_hit=%s) "
+            "but Total Net PnL (%.1f TWD) >= Activation (%.1f TWD) -> Intercept with COMBINED_EXIT",
+            near_hit, far_hit, total_net_pnl_twd, ctx.combined_upl_activation_net_pnl_twd,
+        )
+        return [LifecycleDecision(action=LifecycleAction.COMBINED_EXIT)]
     return []
 
 def _check_release_candidates(
@@ -279,9 +302,23 @@ def _check_release_candidates(
         )
         return []
     _rg_status = enum_value(lifecycle.release_group.status)
-    if _rg_status not in ("ARMED", "TRIGGERED"):
+    _owner = getattr(lifecycle, "exit_owner", None)
+
+    # 2. Exit Ownership Preemption & In-Flight Suppression Guard:
+    # If Policy J (or any primary exit) holds exit ownership, or if release_group is in-flight/triggered,
+    # STRICTLY BLOCK single-leg release candidates!
+    if _owner == "POLICY_J" or _rg_status in (
+        "TRIGGERED", "SUBMITTING", "SUBMITTED", "PARTIALLY_FILLED", "FILLED", "COMPLETED"
+    ):
         logger.info(
-            "[CHECK_RELEASE_SKIP] phase=%s rg_status=%s expected in (ARMED,TRIGGERED) near_pnl=%.1f far_pnl=%.1f",
+            "[CHECK_RELEASE_SUPPRESSED] Single-leg release suppressed by Exit Ownership/In-Flight status: owner=%s rg_status=%s",
+            _owner, _rg_status,
+        )
+        return []
+
+    if _rg_status != "ARMED":
+        logger.info(
+            "[CHECK_RELEASE_SKIP] phase=%s rg_status=%s expected=ARMED near_pnl=%.1f far_pnl=%.1f",
             _phase_val,
             _rg_status,
             ctx.near_pnl_pts, ctx.far_pnl_pts,
@@ -356,19 +393,7 @@ def evaluate_lifecycle_actions(
     candidates.extend(_check_manual_candidate(ctx))
     candidates.extend(_check_stoploss_candidate(ctx))
     candidates.extend(_check_timeout_candidate(ctx))
-
-    # P0: Policy J COMBINED_EXIT must be actionable to preempt downstream exits.
-    # Shadow/non-executable decisions fall through to RELEASE/TRAIL.
-    combined_candidates = _check_combined_upl_trail_candidate(ctx, lifecycle)
-    if combined_candidates and ctx.combined_exit_execution_enabled:
-        candidates.extend(combined_candidates)
-    elif combined_candidates:
-        # Record shadow decision for telemetry but DO NOT block RELEASE/TRAIL
-        logger.info(
-            "[POLICY_J_SHADOW] Combined exit condition met but execution disabled. "
-            "Allowing downstream exit evaluation to proceed."
-        )
-
+    candidates.extend(_check_combined_upl_trail_candidate(ctx, lifecycle)) # Policy J Primary Exit
     candidates.extend(_check_release_candidates(ctx, lifecycle))           # ADR-011 Secondary Fallback
     candidates.extend(_check_trail_candidate(ctx, lifecycle))
 
@@ -524,8 +549,7 @@ class MtsLifecycleAdapter:
         activation_twd = float(state.get("combined_upl_activation_net_pnl_twd", 300.0))
         giveback_twd = float(state.get("combined_upl_giveback_twd", 100.0))
         peak_net_exit_pnl = float(state.get("peak_net_exit_pnl_twd", 0.0))
-        combined_exit_exec_enabled = bool(state.get("combined_exit_execution_enabled", False))
-
+        
         ctx = LifecycleContext(
             near_pnl_pts=near_pnl,
             far_pnl_pts=far_pnl,
@@ -546,7 +570,6 @@ class MtsLifecycleAdapter:
             combined_upl_activation_net_pnl_twd=activation_twd,
             combined_upl_giveback_twd=giveback_twd,
             peak_net_exit_pnl_twd=peak_net_exit_pnl,
-            combined_exit_execution_enabled=combined_exit_exec_enabled,
         )
         
         # Calculate time above breakeven
