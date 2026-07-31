@@ -8,12 +8,19 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 def get_trading_day(timestamp_str: str, session: str) -> str:
-    """Resolve the trading day based on calendar timestamp and trading session."""
+    """Resolve the trading day based on calendar timestamp and trading session.
+
+    2026-07-31 Hermes Agent: delegate to core/date_utils.get_trading_day so the
+    night-session rule is IDENTICAL to the dashboard's (night 15:00+ -> next
+    TRADING day, skipping weekends/holidays). Previously this local simplified
+    version used dt+1 (no holiday skip), which mis-bucketed Friday-night trades
+    to Saturday and made the dashboard's performance review appear stale.
+    """
     try:
+        from core.date_utils import get_trading_day as _core_get_trading_day
         dt = datetime.fromisoformat(timestamp_str)
-        if session == "night" and dt.hour >= 15:
-            return (dt + timedelta(days=1)).strftime("%Y-%m-%d")
-        return dt.strftime("%Y-%m-%d")
+        _d = _core_get_trading_day(dt)
+        return _d.strftime("%Y-%m-%d") if hasattr(_d, "strftime") else str(_d)
     except Exception:
         return timestamp_str.split("T")[0]
 
@@ -31,6 +38,13 @@ def format_triplet(val1, val2, val3, decimals=0) -> str:
                 parts.append(str(val))
     return "/".join(parts)
 
+def _format_exit_reason_label(reason_str: str) -> str:
+    if not reason_str or reason_str == "UNKNOWN":
+        return "UNKNOWN"
+    if "COMBINED_EXIT" in reason_str.upper() or "POLICY_J" in reason_str.upper():
+        return "Policy J (COMBINED_EXIT)"
+    return reason_str
+
 def resolve_exit_reason(data: dict, events: list) -> tuple[str, str]:
     """Resolve final exit reason using 5-level evidence hierarchy.
     Returns (exit_reason, reason_source).
@@ -42,20 +56,20 @@ def resolve_exit_reason(data: dict, events: list) -> tuple[str, str]:
         if ev.get("event") in ("EXIT_REMAINING", "EXIT_LOG", "EMERGENCY_FLATTEN", "MANUAL_CLOSE"):
             r = ev.get("reason") or ev.get("exit_reason")
             if r and r not in ("UNKNOWN", ""):
-                return str(r), "EXPLICIT_EVENT"
+                return _format_exit_reason_label(str(r)), "EXPLICIT_EVENT"
     
     # Level 2: Order metadata
     for ev in events_list:
         if ev.get("event") == "ORDER_SUBMITTED" and ev.get("strategy") in ("MTS_EXIT", "EXIT"):
             r = ev.get("exit_reason") or ev.get("reason")
             if r and r not in ("UNKNOWN", ""):
-                return str(r), "ORDER_METADATA"
+                return _format_exit_reason_label(str(r)), "ORDER_METADATA"
 
     # Level 3: Lifecycle state / shadow summary
     for ev in events_list:
         r = ev.get("actual_exit_reason") or ev.get("lifecycle_exit_type")
         if r and r not in ("UNKNOWN", ""):
-            return str(r), "LIFECYCLE_STATE"
+            return _format_exit_reason_label(str(r)), "LIFECYCLE_STATE"
 
     # Level 4: Narrowly constrained trail inference
     for ev in events_list:
@@ -76,12 +90,12 @@ def resolve_release_reason(data: dict, events: list) -> tuple[str, str]:
         if ev.get("event") in ("RELEASE_NEAR_SUBMITTED", "RELEASE_FAR_SUBMITTED"):
             r = ev.get("release_reason") or ev.get("reason") or ev.get("risk_mode")
             if r and r not in ("UNKNOWN", ""):
-                return str(r), "EXPLICIT_EVENT"
+                return _format_exit_reason_label(str(r)), "EXPLICIT_EVENT"
     for ev in events_list:
         if ev.get("event") == "ORDER_SUBMITTED" and ev.get("strategy") in ("MTS_RELEASE", "RELEASE"):
             r = ev.get("release_reason") or ev.get("reason")
             if r and r not in ("UNKNOWN", ""):
-                return str(r), "ORDER_METADATA"
+                return _format_exit_reason_label(str(r)), "ORDER_METADATA"
     if data.get("release"):
         return "RELEASE_STOP", "DEFAULT_FALLBACK"
     return "UNKNOWN", "INSUFFICIENT_EVIDENCE"
@@ -278,6 +292,19 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
             release_pnl = float(release_fill.get("realized_pnl") or 0.0) if release_fill else 0.0
             exit_pnl = float(exit_fill.get("realized_pnl") or 0.0) if exit_fill else 0.0
             net_pnl = release_pnl + exit_pnl
+            
+            # 2026-07-31 Antigravity: Resolve Net PnL for Policy J COMBINED_EXIT trades when realized_pnl is None
+            if net_pnl == 0.0:
+                _ce_pnl_pts = None
+                for ev in data.get("events", []):
+                    if ev.get("event") in ("COMBINED_EXIT_SUBMITTED", "EXIT_LOG"):
+                        _pts = ev.get("gross_points") if ev.get("gross_points") is not None else ev.get("pnl")
+                        if _pts is not None:
+                            _ce_pnl_pts = float(_pts)
+                            break
+                if _ce_pnl_pts is not None:
+                    net_pnl = _ce_pnl_pts * 10.0  # 10 TWD/pt for TMF futures
+                    exit_pnl = net_pnl
             report_data["completed"].append({
                 "trade_id": trade_id,
                 "entry_time": data["entry_ts"],

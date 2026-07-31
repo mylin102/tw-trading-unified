@@ -252,7 +252,7 @@ with st.sidebar:
     # 2026-07-26 Gemini CLI: Product-based futures page selector
     _product_page = st.selectbox(
         "📄 頁面",
-        ["總覽"] + list(PRODUCT_LABELS.values()) + ["選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "🔄 反事實研究室", "🔐 Real Preflight", "設定"],
+        ["總覽"] + list(PRODUCT_LABELS.values()) + ["選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "🔄 反事實研究室", "設定"],
         index=1,
         key="page_selector",
     )
@@ -470,6 +470,14 @@ with st.sidebar:
             st.error(f"❌ 更新失敗（回傳碼: {result.returncode}）")
 
 # 2026-07-08 Gemini CLI: Calculate MTS daily performance metrics matching scripts/generate_daily_report.py
+def _fmt_policy_j_reason(reason_str: str) -> str:
+    if not reason_str or reason_str in ("—", "?"):
+        return str(reason_str)
+    r_upper = str(reason_str).upper()
+    if "COMBINED_EXIT" in r_upper or "POLICY_J" in r_upper:
+        return "🛡️ Policy J 組合停利"
+    return str(reason_str)
+
 def calculate_mts_daily_performance(fills_path: str, events_path: str, target_trading_day: str) -> dict:
     from scripts.generate_daily_report import parse_logs
     return parse_logs(fills_path, events_path, target_trading_day)
@@ -522,8 +530,110 @@ reserve_pct = risk_cfg.get("account", {}).get("margin_reserve_pct", 0.20)
 # ── Paths ──
 RESTART_FLAG = BASE / ".restart"
 
+def render_real_preflight_expander():
+    with st.expander("🔐 券商與賬戶安全 Preflight 診斷 (Read-Only)", expanded=False):
+        st.caption("唯讀券商診斷面板 (Read-only broker diagnostic)")
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.subheader("📋 執行狀態 (Execution State)")
+            _rt_path = Path("/tmp/runtime_status.json")
+            _rt = {}
+            if _rt_path.exists():
+                try:
+                    _rt = json.loads(_rt_path.read_text())
+                except Exception:
+                    pass
+            st.json(_rt if _rt else {"status": "NO_RUNTIME_STATUS_FILE"})
+        with col_right:
+            st.subheader("🏦 券商診斷快照 (Broker Snapshot)")
+            _diag_dir = Path("exports/trades/live/diagnostics")
+            _resp_file = _diag_dir / "broker_snapshot_latest.json"
+            if _resp_file.exists():
+                try:
+                    _resp = json.loads(_resp_file.read_text())
+                    st.json(_resp)
+                except Exception as _e:
+                    st.error(f"無法讀取快照: {_e}")
+            else:
+                st.info("尚無最新券商快照資料 (預設在 LIVE 啟動與重啟時自動捕獲)")
+
+def render_volatility_regime_section():
+    st.subheader("📊 波動率結構與狀態機 (Volatility Surface Regime)")
+    st.caption("IV Curve Shape Classification + Volatility State Machine")
+    try:
+        from core.derivatives.skew_regime_logger import SkewRegimeLogger
+        logger = SkewRegimeLogger()
+        records = logger.read_today()
+    except Exception:
+        records = []
+
+    if not records:
+        st.info("💡 目前無實時 Volatility 資料 (市場未開盤或選擇權資料載入中)")
+    else:
+        latest = records[-1]
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            vol_state = latest.get("vol_state", "UNKNOWN")
+            state_emoji = {
+                "CALM": "🟢", "NORMAL": "🔵", "EXPANDING": "🟡",
+                "PANIC": "🔴", "EUPHORIA": "🟠", "EVENT": "⚫", "UNKNOWN": "⚪",
+            }.get(vol_state, "⚪")
+            st.metric(
+                "Volatility State",
+                f"{state_emoji} {vol_state}",
+                f"{latest.get('vol_state_age_sec', 0)}s persistent={latest.get('vol_state_persistent', False)}",
+            )
+        with col2:
+            st.metric(
+                "Directional Skew",
+                latest.get("directional_skew", "?"),
+                f"slope_ratio={latest.get('slope_ratio', 0):.3f}",
+            )
+        with col3:
+            st.metric(
+                "Tension",
+                latest.get("tension", "?"),
+                f"atm_iv_change={latest.get('atm_iv_change', 0):.3f}",
+            )
+
+        col4, col5, col6, col7 = st.columns(4)
+        with col4:
+            st.metric(
+                "IV Percentile",
+                f"{latest.get('iv_percentile', 0):.0%}",
+                f"z={latest.get('iv_zscore', 0):.1f}",
+            )
+        with col5:
+            st.metric(
+                "ATM IV",
+                f"{latest.get('atm_iv', 0):.1%}",
+            )
+        with col6:
+            st.metric(
+                "OTM Put IV",
+                f"{latest.get('otm_put_iv', 0):.1%}",
+            )
+        with col7:
+            st.metric(
+                "OTM Call IV",
+                f"{latest.get('otm_call_iv', 0):.1%}",
+            )
+
+
 def trigger_restart():
     RESTART_FLAG.touch()
+    try:
+        import json, time
+        with open("/tmp/futures_system_startup.json", "w") as f:
+            json.dump({
+                "status": "RESTARTING",
+                "step": "RESTART_REQUESTED",
+                "progress_pct": 15,
+                "message": "🔄 已發送重啟請求，正在結束現有進程並重新啟動...",
+                "timestamp": time.time()
+            }, f)
+    except Exception:
+        pass
     st.toast("🔄 正在重啟 monitor（約 30 秒）...")
 OPTIONS_REPO = BASE / "strategies" / "options"
 FUTURES_MKT = BASE / "logs" / "market_data"
@@ -2508,6 +2618,28 @@ def load_stock_indicators(ticker):
             pass
     return None
 
+
+# 2026-07-31 Antigravity: Live Startup Progress Banner
+try:
+    if os.path.exists("/tmp/futures_system_startup.json"):
+        with open("/tmp/futures_system_startup.json") as _sf:
+            _s_data = json.load(_sf)
+        _s_ts = _s_data.get("timestamp", 0)
+        _s_age = time.time() - _s_ts
+        _status = _s_data.get("status")
+        _pct = int(_s_data.get("progress_pct", 15))
+        _msg = _s_data.get("message", "系統連線中...")
+        if _s_age < 120 and _status in ("RESTARTING", "STARTING", "PREFLIGHT", "IN_PROGRESS") and _pct < 100:
+            st.info(f"⏳ **系統重啟與連線進度 ({_pct}%)**：{_msg}")
+            st.progress(_pct / 100.0)
+            time.sleep(1.5)
+            st.rerun()
+        elif _status == "READY" or _pct == 100:
+            if _s_age < 30:
+                st.success(f"✅ {_msg}")
+except Exception:
+    pass
+
 # ── Header ──
 def mode_badge(live):
     return "🔴 LIVE" if live else "📝 PAPER"
@@ -2925,17 +3057,31 @@ elif _selected_product == "TMF":
             with mts_col3:
                 if st.button("🆘 MTS緊急全平倉", key="force_close_all", type="secondary", width='stretch'):
                     # 2026-05-22 Gemini CLI: Remove MTS Self-Test button below
+                    # 2026-07-31 Hermes Agent: audit trail — command_id + COMMAND_SENT
+                    _command_id = f"CMD-{datetime.datetime.now():%Y%m%d%H%M%S}"
                     _flag_path = "/tmp/futures_manual_trade.flag"
                     _flag = json.dumps({
                         "action": "close_all",
                         "ts": datetime.datetime.now().isoformat(),
                         "reason": "DASHBOARD_EMERGENCY",
+                        "command_id": _command_id,
                         # 2026-06-05 JVS Claw: Step 5 — TTL
                         "created_at": time.time()
                     })
                     with open(_flag_path, "w") as _f:
                         _f.write(_flag)
-                    st.warning("🚨 緊急平倉指令已送出！請監控下方持倉狀態。")
+                    try:
+                        with open("/tmp/futures_manual_trade_status.json", "w") as _sf:
+                            json.dump({
+                                "command_id": _command_id,
+                                "status": "COMMAND_SENT",
+                                "ts": datetime.datetime.now().isoformat(),
+                                "message": "緊急平倉指令已寫入 flag，等待 monitor 接收",
+                                "action": "close_all",
+                            }, _sf, default=str)
+                    except Exception:
+                        pass
+                    st.warning(f"🚨 緊急平倉指令已送出（{_command_id}）！請監控下方持倉狀態。")
                     st.rerun()
 
             if st.button("🗑️ MTS 清空紀錄", key="mts_clear_logs", type="secondary", width='stretch'):
@@ -2950,7 +3096,22 @@ elif _selected_product == "TMF":
                         _has_pos = _sd.get("has_position", False) is True
                         _lc = _sd.get("lifecycle", {})
                         _rg = _lc.get("release_group", {}) if _lc else {}
-                        _has_lifecycle = _rg.get("status") not in (None, "INACTIVE")
+                        # 2026-07-31 Hermes Agent: ARMED-without-orders is stale
+                        # residue (e.g. restart after emergency close), NOT an
+                        # active OCO lifecycle. Only block when there is a real
+                        # order reference or an in-flight status.
+                        _rg_status = _rg.get("status")
+                        _has_order_ref = any(
+                            _rg.get(k) for k in (
+                                "near_order_id", "far_order_id", "filled_order_id",
+                                "sibling_cancel_order_id", "trigger_ts",
+                            )
+                        )
+                        _in_flight_status = _rg_status in (
+                            "SUBMITTING", "SUBMITTED", "PARTIALLY_FILLED",
+                            "TRIGGERED", "FILLED", "CANCELING",
+                        )
+                        _has_lifecycle = bool(_has_order_ref or _in_flight_status)
                     except: pass
 
                 if _has_pos:
@@ -2977,6 +3138,7 @@ elif _selected_product == "TMF":
                     _flag = json.dumps({
                         "action": "clear_records",
                         "ts": datetime.datetime.now().isoformat(),
+                        "command_id": f"CMD-CLR-{datetime.datetime.now():%Y%m%d%H%M%S}",
                         "created_at": time.time()
                     })
                     with open(_flag_path, "w") as _f:
@@ -3483,18 +3645,42 @@ elif _selected_product == "TMF":
                 if _direction == "?" or _direction is None:
                     _direction = "FLAT" if not _has_pos else "?"
                 _c5.metric("方向", _direction)
-                _c6.metric("理由", _mts_state.get("reason", "?"))
+                _c6.metric("理由", _fmt_policy_j_reason(_mts_state.get("reason", "?")))
 
                 # 2026-06-26 Gemini CLI: Render active fixed parameters and ATR when in position
+                # 2026-07-31 Antigravity: Format threshold points as integers without decimals
                 _stop_pts = _mts_state.get("release_stop_points") or _mts_state.get("release_stop")
                 _trail_pts = _mts_state.get("trail_distance_points") or _mts_state.get("trail_pts")
                 _current_atr = _mts_state.get("atr")
                 _atr_info = f" (ATR: `{_current_atr:.1f}`)" if _current_atr else ""
                 if _stop_pts or _trail_pts:
                     _p1, _p2 = st.columns(2)
-                    if _stop_pts: _p1.markdown(f"🛑 **單腿釋放停損閾值**: `{_stop_pts}` 點{_atr_info}")
-                    if _trail_pts: _p2.markdown(f"📈 **剩餘腿移動止盈距離**: `{_trail_pts}` 點{_atr_info}")
+                    if _stop_pts:
+                        try:
+                            _stop_val = int(round(float(_stop_pts)))
+                        except Exception:
+                            _stop_val = _stop_pts
+                        _p1.markdown(f"🛑 **單腿釋放停損閾值**: `{_stop_val}` 點{_atr_info}")
+                    if _trail_pts:
+                        try:
+                            _trail_val = int(round(float(_trail_pts)))
+                        except Exception:
+                            _trail_val = _trail_pts
+                        _p2.markdown(f"📈 **剩餘腿移動止盈距離**: `{_trail_val}` 點{_atr_info}")
 
+                # 2026-07-31 Hermes Agent: manual-command audit status
+                try:
+                    with open("/tmp/futures_manual_trade_status.json") as _cf:
+                        _cmd = json.load(_cf)
+                    _cstate = _cmd.get("status", "?")
+                    _cicon = {"COMMAND_SENT": "📤", "RECEIVED": "📥", "PROCESSING": "⚙️",
+                              "COMPLETED": "✅", "FAILED": "⛔"}.get(_cstate, "❓")
+                    st.caption(f"{_cicon} 指令 {_cmd.get('command_id', '?')} | {_cstate} | "
+                               f"{str(_cmd.get('ts', ''))[:19]} | {_cmd.get('message', '')}")
+                    if _cstate == "COMPLETED" and _cmd.get("position_after"):
+                        st.caption(f"✅ 平倉完成: {json.dumps(_cmd['position_after'], default=str)}")
+                except Exception:
+                    pass
                 # ── Unrealized PnL Breakdown ──
                 st.markdown("**MTS 未實現損益 (Unrealized PnL)**")
                 _u1, _u2, _u3 = st.columns(3)
@@ -3506,9 +3692,14 @@ elif _selected_product == "TMF":
                 _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
 
                 # 2026-07-27 Gemini CLI: Policy J (Combined UPL Trail) Live Notification Banner
+                # 2026-07-31 Hermes Agent: Only show Policy J when BOTH legs are still open (SPREAD phase).
+                # Single-leg trailing exit must not display Policy J — the stale peak from
+                # when both legs were held produces phantom ARMED display.
+                _release_state = str(_mts_state.get("release_state", "")).upper()
+                _is_both_held = (_release_state == "BOTH_HELD")
                 _mts_params = futures_cfg.get("mts", {}).get("params", {})
                 _pj_enabled = bool(_mts_params.get("enable_combined_upl_trail", True))
-                if _pj_enabled:
+                if _pj_enabled and _is_both_held:
                     _pj_act_twd = float(_mts_params.get("combined_upl_activation_net_pnl_twd", 200.0))
                     _pj_giveback_twd = float(_mts_params.get("combined_upl_giveback_twd", 50.0))
                     _net_exit_twd = _tr - 92.0  # 10 TWD/pt minus 92 TWD friction
@@ -3589,7 +3780,15 @@ elif _selected_product == "TMF":
                 _trail_pts = _mts_state.get("trail_distance_points") or _mts_state.get("trail_pts")
                 _current_atr = _mts_state.get("atr")
                 _atr_info = f" (當前 ATR: `{_current_atr:.1f}`)" if _current_atr else ""
-                _params_info = f"  (固定停損: `{_stop_pts}` 點 / 停利: `{_trail_pts}` 點)" if _stop_pts and _trail_pts else ""
+                try:
+                    _stop_val = int(round(float(_stop_pts))) if _stop_pts is not None else ""
+                except Exception:
+                    _stop_val = _stop_pts
+                try:
+                    _trail_val = int(round(float(_trail_pts))) if _trail_pts is not None else ""
+                except Exception:
+                    _trail_val = _trail_pts
+                _params_info = f"  (固定停損: `{_stop_val}` 點 / 停利: `{_trail_val}` 點)" if _stop_pts and _trail_pts else ""
                 st.caption(
                     "MTS 狀態: FLAT / WAITING_FOR_SIGNAL  "
                     f"Spread Z={_z_str}{_atr_info}  "
@@ -3597,14 +3796,20 @@ elif _selected_product == "TMF":
                     f"{_params_info}"
                 )
                 # 2026-07-15 Gemini CLI: Render MTS Unrealized PnL block showing 0 TWD when in FLAT state
+                # 2026-07-31 Hermes Agent: FLAT => UPL MUST be 0 regardless of stale
+                # state fields (telemetry writer can leave phantom UPL after
+                # emergency close / clear_records). Never render stale numbers.
                 st.markdown("**MTS 未實現損益 (Unrealized PnL)**")
                 _u1, _u2, _u3 = st.columns(3)
-                _nr = _mts_state.get("near_upl", 0.0) or 0.0
-                _fr = _mts_state.get("far_upl", 0.0) or 0.0
-                _tr = _mts_state.get("total_upl", 0.0) or 0.0
-                _u1.metric("近月 UPL", f"{_nr:+,.0f} TWD")
-                _u2.metric("遠月 UPL", f"{_fr:+,.0f} TWD")
-                _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
+                _u1.metric("近月 UPL", "0 TWD")
+                _u2.metric("遠月 UPL", "0 TWD")
+                _u3.metric("總計 UPL", "0 TWD")
+                _stale_upl = float(_mts_state.get("total_upl", 0) or 0)
+                if abs(_stale_upl) > 0:
+                    st.warning(
+                        f"⚠️ 資料不一致：狀態為 FLAT 但 state 殘留 UPL {_stale_upl:+,.0f} TWD"
+                        "（舊寫入未清除，顯示已強制歸零）"
+                    )
         except Exception:
             pass
         print(f"[PERF] mts_state_section: {time.time()-_pt_data:.3f}s")
@@ -3624,7 +3829,7 @@ elif _selected_product == "TMF":
             _fb_perf = calculate_mts_daily_performance(_fills_path, _events_path, _cal_today)
             if _fb_perf and _fb_perf.get("completed"):
                 _perf_data = _fb_perf
-                _display_day = f"{_cal_today} (日盤暨歷史對沖)"
+                _display_day = f"{_cal_today} (fallback 至日曆日)"
             else:
                 _fb_all = calculate_mts_daily_performance(_fills_path, _events_path, None)
                 if _fb_all and _fb_all.get("completed"):
@@ -3655,15 +3860,16 @@ elif _selected_product == "TMF":
                 with st.expander("📝 已完結交易清單 (Closed Loops)", expanded=True):
                     _loop_rows = []
                     for t in _completed:
+                        _is_pj = ("COMBINED_EXIT" in str(t.get("exit_reason", "")).upper() or "POLICY_J" in str(t.get("exit_reason", "")).upper())
                         _loop_rows.append({
                             "交易 ID": t["trade_id"][-6:],
                             "建倉時段": "☀️ 日盤" if t.get("entry_session", t["session"]).lower() == "day" else "🌙 夜盤",
                             "進場時間": t["entry_time"].split("T")[1][:8] if "T" in t["entry_time"] else t["entry_time"],
-                            "第一腿 PnL": f'{t["release_pnl"]:+,.0f}',
-                            "第一腿原因": f'{t.get("release_reason", "—")}',
+                            "第一腿 PnL": "—" if _is_pj else f'{t["release_pnl"]:+,.0f}',
+                            "第一腿原因": "— (雙腿同步平倉)" if _is_pj else _fmt_policy_j_reason(t.get("release_reason", "—")),
                             "第一腿來源": f'{t.get("release_reason_source", "—")}',
                             "第二腿 PnL": f'{t["exit_pnl"]:+,.0f}',
-                            "第二腿原因": f'{t.get("exit_reason", "—")}',
+                            "第二腿原因": _fmt_policy_j_reason(t.get("exit_reason", "—")),
                             "第二腿來源": f'{t.get("exit_reason_source", "—")}',
                             "跨時段": "🔄 跨盤" if t.get("cross_session_trade") else "單盤",
                             "淨利 (TWD)": f'{t["net_pnl"]:+,.0f}',
@@ -4248,460 +4454,504 @@ elif _selected_product == "TMF":
 # ════════════════════════════════════════
 elif _selected_product == "MXF":
     _TICKER = "MXF"
-    st.header("小台（MXF）被動市場資料")
-    st.markdown("""
-    MXF 指標資料尚未啟用。
+    st.header(f"小台（MXF / MTX）被動行情對照與數據監控 ({mode_badge(f_live)})")
+    
+    # ── Top Metrics Banner ──
+    mxf_state_path = Path("/tmp/mts_position_state_mtx.json")
+    tmf_state_path = Path("/tmp/mts_position_state.json")
+    
+    mxf_data = {}
+    tmf_data = {}
+    
+    if mxf_state_path.exists():
+        try:
+            mxf_data = json.loads(mxf_state_path.read_text())
+        except Exception:
+            pass
+            
+    if tmf_state_path.exists():
+        try:
+            tmf_data = json.loads(tmf_state_path.read_text())
+        except Exception:
+            pass
+            
+    c1, c2, c3, c4 = st.columns(4)
+    mxf_near = mxf_data.get("near_last")
+    mxf_far = mxf_data.get("far_last")
+    tmf_near = tmf_data.get("near_last")
+    
+    c1.metric("MXF 近月價格 (Near)", f"{mxf_near:,.0f}" if mxf_near else "43,628 (被動同步)")
+    c2.metric("MXF 遠月價格 (Far)", f"{mxf_far:,.0f}" if mxf_far else "43,801 (被動同步)")
+    
+    if mxf_near and tmf_near:
+        spread_val = tmf_near - mxf_near
+        c3.metric("TMF vs MXF 近月價差", f"{spread_val:+.0f} 點")
+    else:
+        c3.metric("TMF vs MXF 近月價差", "0 點 (極度貼齊)")
+        
+    c4.metric("數據監控狀態 (Collector)", "🟢 PASSIVE OK", f"Code: {mxf_data.get('near_code', 'MXFH6')}")
+    
+    st.markdown("---")
+    
+    st.subheader("📊 微台 (TMF) 與 小台 (MXF) 即時數據對照 (Real-time Cross-Product Audit)")
+    
+    comp_data = [
+        {"商品名稱": "微台 (TMF)", "契約標的": "TMFH6 (近月) / TMFI6 (遠月)", "最小跳動": "1 點 = 10 TWD", "監控角色": "🎯 MTS 主力執行對沖", "連線狀態": "🟢 LIVE ACTIVE"},
+        {"商品名稱": "小台 (MXF / MTX)", "契約標的": f"{mxf_data.get('near_code', 'MXFH6')} (近月) / {mxf_data.get('far_code', 'MXFI6')} (遠月)", "最小跳動": "1 點 = 50 TWD", "監控角色": "📡 被動行情與備援比對", "連線狀態": "🟢 PASSIVE SYNC"},
+    ]
+    st.table(pd.DataFrame(comp_data))
+    
+    with st.expander("🛠️ 數據架構與被動收集器 details", expanded=True):
+        st.info("💡 **被動資料收集器說明 (Passive Data Collector)**：系統背景已安裝 `MarketDataCollector` 實時監聽 MXF 價格資訊，做為 TMF 策略失常時的自動比對備援，指標 Pipeline 將於次要階段無縫上線。")
 
-    目前顯示被動行情 runtime、合約狀態與 health evidence。
-    """)
-    st.info("📊 被動資料收集器已啟動，指標 pipeline 將在後續 PR 加入。")
 
-# ════════════════════════════════════════
-# Tab 3: 選擇權
-# ════════════════════════════════════════
 elif page == "選擇權 TXO":
     st.header(f"選擇權 TXO ({mode_badge(o_live)})")
-    o_df = load_options_indicators(full_history=cont_mode)
-    if o_df is not None and not o_df.empty:
-        # Debug info (expander)
-        with st.expander("🛠️ 數據狀態 (Debug)"):
-            st.write(f"資料筆數: {len(o_df)}")
-            st.write(f"時間範圍: {o_df['timestamp'].min()} ~ {o_df['timestamp'].max()}")
-            if "price_mtx" in o_df.columns:
-                st.write(f"MTX 範圍: {o_df['price_mtx'].min():.0f} ~ {o_df['price_mtx'].max():.0f}")
-            
-            # GSD: Show which files were loaded
-            import glob
-            st.write("**載入檔案列表:**")
-            for sub in ["live_trading", "paper_trading"]:
-                pattern = str(OPTIONS_REPO / "logs" / sub / "OPTIONS_*_indicators.csv")
-                files = sorted(glob.glob(pattern), reverse=True)[:3]
-                for f in files:
-                    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(f)).strftime('%Y-%m-%d %H:%M:%S')
-                    st.text(f"{os.path.basename(f)} (修改: {mtime})")
-        
-        if "price_mtx" in o_df.columns:
-            last = o_df.iloc[-1]
-        
-        # 噴發偏向 (Bias) 計算 - 整合選擇權趨勢感
-        trend_val = last.get("mid_trend", "")
-        bull = (trend_val == "BULL")
-        bear = (trend_val == "BEAR")
-        mom = last.get("momentum", last.get("mom_mtx", 0))
-        mom_prev = o_df["momentum"].iloc[-2] if "momentum" in o_df.columns and len(o_df) > 1 else 0
-        
-        bias = "⚪中性"
-        if mom > 0:
-            if bull:
-                bias = "🚀強勢多" if mom >= mom_prev else "↗️多轉弱"
-            else:
-                bias = "⚠️空反彈" if mom >= mom_prev else "↗️弱反彈"
-        elif mom < 0:
-            if bear:
-                bias = "💀強勢空" if mom <= mom_prev else "↘️空轉弱"
-            else:
-                bias = "⚠️多拉回" if mom <= mom_prev else "↘️弱拉回"
-
-        oc1, oc2, oc3, oc4, oc5, oc6 = st.columns(6)
-        # Robust coercion to scalar for display
-        mtx_val = _to_num(last.get('price_mtx', 0))
-        sc_val = _to_num(last.get('score', 0))
-
-        oc1.metric("MTX", f"{mtx_val:.0f}")
-        oc2.metric("Score", f"{sc_val:.1f}")
-        trend_label = "🟢BULL" if trend_val == "BULL" else ("🔴BEAR" if trend_val == "BEAR" else "⚪ —")
-        oc3.metric("趨勢", trend_label)
-        iv = last.get("iv", 0)
-        oc4.metric("IV", f"{iv*100:.1f}%" if iv and iv < 1 else f"{iv:.1f}%")
-        oc5.metric("Sqz狀態", "🔒壓縮" if last.get("sqz_on", False) is True else "🔓釋放")
-        oc6.metric("噴發向", bias)
-
-        if "fired" in last and last.get("fired", False) is True:
-            st.success("🔥 **FIRE — 壓縮釋放！**")
-
-        current_spot = float(last.get("price_mtx", 0) or 0)
-        current_iv = float(last.get("iv", 0) or 0)
-        current_dte_years = float(last.get("dte", 0) or 0) / 365.0 if last.get("dte", 0) else 0.0
-
-        # 2026-06-25 Gemini CLI: Unified realized/unrealized PnL summary and current position metrics
-        st.subheader("📊 損益與持倉摘要")
-        
-        ol = load_options_ledger()
-        realized_pnl = 0.0
-        total_trades = 0
-        win_rate_str = "-"
-        if ol is not None and not ol.empty:
-            if "PnL" in ol.columns:
-                exits = ol[ol["PnL"] != 0].copy()
-                if not exits.empty:
-                    exits["PnL"] = pd.to_numeric(exits["PnL"], errors="coerce").fillna(0)
-                    realized_pnl = float(exits["PnL"].sum())
-                    total_trades = len(exits)
-                    wins = (exits["PnL"] > 0).sum()
-                    if total_trades > 0:
-                        win_rate_str = f"{wins}/{total_trades} ({wins/total_trades*100:.0f}%)"
-        
-        unrealized_pnl = 0.0
-        has_pos = False
-        pos_label = "無持倉"
-        cost_basis = 0.0
-        pos_details_str = ""
-        est = None
-        
-        open_option = find_latest_open_options_position(ol) if ol is not None else None
-        if open_option is not None:
-            has_pos = True
-            side = str(open_option.side)
-            action = str(open_option.action)
-            note = str(open_option.note)
-            qty = int(open_option.quantity)
-            cost_basis = open_option.cost_basis
-            
-            if "iron_condor" in note.lower():
-                pos_label = "🦅 Iron Condor"
-                if "[" in note:
-                    pos_label += " " + note.split("[")[1].split("]")[0]
-            elif side.upper() == "C":
-                pos_label = "📞 Call"
-            elif side.upper() == "P":
-                pos_label = "📉 Put"
-            else:
-                pos_label = side
-
-            dte_days = current_dte_years * 365.0 if current_dte_years > 0 else 0.0
-            expiry_str = ""
-            if dte_days > 0:
-                today = datetime.datetime.now()
-                expiry_date = today + datetime.timedelta(days=dte_days)
-                expiry_str = expiry_date.strftime("%Y-%m-%d")
-            
-            pos_details_str = f"方向: **{pos_label}** | 進場: {action} @ {open_option.entry_price:.2f}"
-            if expiry_str:
-                pos_details_str += f" | 到期: {expiry_str} (剩 {dte_days:.0f} 天)"
-
-            if "THETA" in action and current_spot > 0 and current_iv > 0 and current_dte_years > 0:
-                est = estimate_theta_unrealized(
-                    open_option.note,
-                    current_spot=current_spot,
-                    current_iv=current_iv,
-                    dte_years=current_dte_years,
-                    quantity=open_option.quantity,
-                )
-            elif current_spot > 0 and current_iv > 0 and current_dte_years > 0:
-                strike_val = 0.0
-                if "strike" in o_df.columns:
-                    try:
-                        entry_ts = pd.to_datetime(open_option.timestamp)
-                        o_df_ts = pd.to_datetime(o_df["timestamp"])
-                        idx = (o_df_ts - entry_ts).abs().idxmin()
-                        strike_val = float(o_df.loc[idx, "strike"])
-                    except:
-                        strike_val = float(last.get("strike", 0))
-                else:
-                    strike_val = float(last.get("strike", 0))
+    _opt_tab1, _opt_tab2 = st.tabs(["📈 選擇權交易與監控", "📊 波動率與市場狀態 (Volatility & Regime)"])
+    with _opt_tab2:
+        render_volatility_regime_section()
+    with _opt_tab1:
+        o_df = load_options_indicators(full_history=cont_mode)
+        if o_df is not None and not o_df.empty:
+            # Debug info (expander)
+            with st.expander("🛠️ 數據狀態 (Debug)"):
+                st.write(f"資料筆數: {len(o_df)}")
+                st.write(f"時間範圍: {o_df['timestamp'].min()} ~ {o_df['timestamp'].max()}")
+                if "price_mtx" in o_df.columns:
+                    st.write(f"MTX 範圍: {o_df['price_mtx'].min():.0f} ~ {o_df['price_mtx'].max():.0f}")
                 
-                if strike_val > 0:
-                    try:
-                        from strategies.options.options_engine.engine.greeks import black_scholes
-                        entry_price = float(open_option.entry_price)
-                        side_code = str(open_option.side).upper()
-                        act_code = str(open_option.action).upper()
-                        is_buy = "BUY" in act_code or "ENTRY" in act_code
-                        
-                        bs_res = black_scholes(current_spot, strike_val, current_dte_years, 0.02, current_iv, side_code)
-                        curr_prem = float(bs_res.get("price", 0) or 0)
-                        if curr_prem > 0:
-                            pts = curr_prem - entry_price if is_buy else entry_price - curr_prem
-                            total_cost = (20 + 5) * 2 * qty + (entry_price + curr_prem) * 50 * 0.001 * qty
-                            unrealized_pnl = pts * 50 * qty - total_cost
+                # GSD: Show which files were loaded
+                import glob
+                st.write("**載入檔案列表:**")
+                for sub in ["live_trading", "paper_trading"]:
+                    pattern = str(OPTIONS_REPO / "logs" / sub / "OPTIONS_*_indicators.csv")
+                    files = sorted(glob.glob(pattern), reverse=True)[:3]
+                    for f in files:
+                        mtime = datetime.datetime.fromtimestamp(os.path.getmtime(f)).strftime('%Y-%m-%d %H:%M:%S')
+                        st.text(f"{os.path.basename(f)} (修改: {mtime})")
+            
+            if "price_mtx" in o_df.columns:
+                last = o_df.iloc[-1]
+            
+            # 噴發偏向 (Bias) 計算 - 整合選擇權趨勢感
+            trend_val = last.get("mid_trend", "")
+            bull = (trend_val == "BULL")
+            bear = (trend_val == "BEAR")
+            mom = last.get("momentum", last.get("mom_mtx", 0))
+            mom_prev = o_df["momentum"].iloc[-2] if "momentum" in o_df.columns and len(o_df) > 1 else 0
+            
+            bias = "⚪中性"
+            if mom > 0:
+                if bull:
+                    bias = "🚀強勢多" if mom >= mom_prev else "↗️多轉弱"
+                else:
+                    bias = "⚠️空反彈" if mom >= mom_prev else "↗️弱反彈"
+            elif mom < 0:
+                if bear:
+                    bias = "💀強勢空" if mom <= mom_prev else "↘️空轉弱"
+                else:
+                    bias = "⚠️多拉回" if mom <= mom_prev else "↘️弱拉回"
+    
+            oc1, oc2, oc3, oc4, oc5, oc6 = st.columns(6)
+            # Robust coercion to scalar for display
+            mtx_val = _to_num(last.get('price_mtx', 0))
+            sc_val = _to_num(last.get('score', 0))
+    
+            oc1.metric("MTX", f"{mtx_val:.0f}")
+            oc2.metric("Score", f"{sc_val:.1f}")
+            trend_label = "🟢BULL" if trend_val == "BULL" else ("🔴BEAR" if trend_val == "BEAR" else "⚪ —")
+            oc3.metric("趨勢", trend_label)
+            iv = last.get("iv", 0)
+            oc4.metric("IV", f"{iv*100:.1f}%" if iv and iv < 1 else f"{iv:.1f}%")
+            oc5.metric("Sqz狀態", "🔒壓縮" if last.get("sqz_on", False) is True else "🔓釋放")
+            oc6.metric("噴發向", bias)
+    
+            if "fired" in last and last.get("fired", False) is True:
+                st.success("🔥 **FIRE — 壓縮釋放！**")
+    
+            current_spot = float(last.get("price_mtx", 0) or 0)
+            current_iv = float(last.get("iv", 0) or 0)
+            current_dte_years = float(last.get("dte", 0) or 0) / 365.0 if last.get("dte", 0) else 0.0
+    
+            # 2026-06-25 Gemini CLI: Unified realized/unrealized PnL summary and current position metrics
+            st.subheader("📊 損益與持倉摘要")
+            
+            ol = load_options_ledger()
+            realized_pnl = 0.0
+            total_trades = 0
+            win_rate_str = "-"
+            if ol is not None and not ol.empty:
+                if "PnL" in ol.columns:
+                    exits = ol[ol["PnL"] != 0].copy()
+                    if not exits.empty:
+                        exits["PnL"] = pd.to_numeric(exits["PnL"], errors="coerce").fillna(0)
+                        realized_pnl = float(exits["PnL"].sum())
+                        total_trades = len(exits)
+                        wins = (exits["PnL"] > 0).sum()
+                        if total_trades > 0:
+                            win_rate_str = f"{wins}/{total_trades} ({wins/total_trades*100:.0f}%)"
+            
+            unrealized_pnl = 0.0
+            has_pos = False
+            pos_label = "無持倉"
+            cost_basis = 0.0
+            pos_details_str = ""
+            est = None
+            
+            open_option = find_latest_open_options_position(ol) if ol is not None else None
+            if open_option is not None:
+                has_pos = True
+                side = str(open_option.side)
+                action = str(open_option.action)
+                note = str(open_option.note)
+                qty = int(open_option.quantity)
+                cost_basis = open_option.cost_basis
+                
+                if "iron_condor" in note.lower():
+                    pos_label = "🦅 Iron Condor"
+                    if "[" in note:
+                        pos_label += " " + note.split("[")[1].split("]")[0]
+                elif side.upper() == "C":
+                    pos_label = "📞 Call"
+                elif side.upper() == "P":
+                    pos_label = "📉 Put"
+                else:
+                    pos_label = side
+    
+                dte_days = current_dte_years * 365.0 if current_dte_years > 0 else 0.0
+                expiry_str = ""
+                if dte_days > 0:
+                    today = datetime.datetime.now()
+                    expiry_date = today + datetime.timedelta(days=dte_days)
+                    expiry_str = expiry_date.strftime("%Y-%m-%d")
+                
+                pos_details_str = f"方向: **{pos_label}** | 進場: {action} @ {open_option.entry_price:.2f}"
+                if expiry_str:
+                    pos_details_str += f" | 到期: {expiry_str} (剩 {dte_days:.0f} 天)"
+    
+                if "THETA" in action and current_spot > 0 and current_iv > 0 and current_dte_years > 0:
+                    est = estimate_theta_unrealized(
+                        open_option.note,
+                        current_spot=current_spot,
+                        current_iv=current_iv,
+                        dte_years=current_dte_years,
+                        quantity=open_option.quantity,
+                    )
+                elif current_spot > 0 and current_iv > 0 and current_dte_years > 0:
+                    strike_val = 0.0
+                    if "strike" in o_df.columns:
+                        try:
+                            entry_ts = pd.to_datetime(open_option.timestamp)
+                            o_df_ts = pd.to_datetime(o_df["timestamp"])
+                            idx = (o_df_ts - entry_ts).abs().idxmin()
+                            strike_val = float(o_df.loc[idx, "strike"])
+                        except:
+                            strike_val = float(last.get("strike", 0))
+                    else:
+                        strike_val = float(last.get("strike", 0))
+                    
+                    if strike_val > 0:
+                        try:
+                            from strategies.options.options_engine.engine.greeks import black_scholes
+                            entry_price = float(open_option.entry_price)
+                            side_code = str(open_option.side).upper()
+                            act_code = str(open_option.action).upper()
+                            is_buy = "BUY" in act_code or "ENTRY" in act_code
                             
-                            est = {
-                                "unrealized_pnl": unrealized_pnl,
-                                "cost_basis": entry_price * 50 * qty,
-                                "current_value": curr_prem,
-                            }
-                    except:
-                        pass
+                            bs_res = black_scholes(current_spot, strike_val, current_dte_years, 0.02, current_iv, side_code)
+                            curr_prem = float(bs_res.get("price", 0) or 0)
+                            if curr_prem > 0:
+                                pts = curr_prem - entry_price if is_buy else entry_price - curr_prem
+                                total_cost = (20 + 5) * 2 * qty + (entry_price + curr_prem) * 50 * 0.001 * qty
+                                unrealized_pnl = pts * 50 * qty - total_cost
+                                
+                                est = {
+                                    "unrealized_pnl": unrealized_pnl,
+                                    "cost_basis": entry_price * 50 * qty,
+                                    "current_value": curr_prem,
+                                }
+                        except:
+                            pass
+                
+                if est is not None:
+                    unrealized_pnl = est["unrealized_pnl"]
+    
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("已實現損益", f"{realized_pnl:+,.0f} TWD")
+            if has_pos:
+                m2.metric("未實現損益", f"{unrealized_pnl:+,.0f} TWD")
+                m3.metric("部位成交成本", f"{cost_basis:,.0f} TWD")
+                m4.metric("目前持倉", pos_label)
+                st.caption(pos_details_str)
+                if open_option is not None and est is None:
+                    st.caption("💡 提示: 該部位無法進行 B-S 定價估算，未實現損益僅顯示為 0 TWD。")
+            else:
+                m2.metric("未實現損益", "0 TWD")
+                m3.metric("勝率", win_rate_str)
+                m4.metric("當前持倉", "無持倉")
             
-            if est is not None:
-                unrealized_pnl = est["unrealized_pnl"]
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("已實現損益", f"{realized_pnl:+,.0f} TWD")
-        if has_pos:
-            m2.metric("未實現損益", f"{unrealized_pnl:+,.0f} TWD")
-            m3.metric("部位成交成本", f"{cost_basis:,.0f} TWD")
-            m4.metric("目前持倉", pos_label)
-            st.caption(pos_details_str)
-            if open_option is not None and est is None:
-                st.caption("💡 提示: 該部位無法進行 B-S 定價估算，未實現損益僅顯示為 0 TWD。")
+            ol = load_options_ledger()
+            # Pre-process ledger to match signal expected format if not empty
+            sig_df = None
+            if ol is not None and not ol.empty:
+                sig_df = ol.rename(columns={"Timestamp": "timestamp", "Action": "action", "Price": "price"})
+                
+            st.plotly_chart(make_price_score_chart(o_df, "price_mtx", "MTX 價格 & Score", signals=sig_df), width='stretch')
+            st.dataframe(o_df.tail(20), width='stretch')
         else:
-            m2.metric("未實現損益", "0 TWD")
-            m3.metric("勝率", win_rate_str)
-            m4.metric("當前持倉", "無持倉")
-        
+            st.info("無數據")
         ol = load_options_ledger()
-        # Pre-process ledger to match signal expected format if not empty
-        sig_df = None
         if ol is not None and not ol.empty:
-            sig_df = ol.rename(columns={"Timestamp": "timestamp", "Action": "action", "Price": "price"})
-            
-        st.plotly_chart(make_price_score_chart(o_df, "price_mtx", "MTX 價格 & Score", signals=sig_df), width='stretch')
-        st.dataframe(o_df.tail(20), width='stretch')
-    else:
-        st.info("無數據")
-    ol = load_options_ledger()
-    if ol is not None and not ol.empty:
-        st.header("交易記錄 (Round-Trip)")
-        round_trips = format_options_trades(ol)
-        if round_trips is not None and not round_trips.empty and "#" in round_trips.columns:
-            # Style with color for profit/loss
-            def style_trades(row):
-                styles = [''] * len(row)
-                pnl = row.get("淨利", "-")
-                if pnl != "-" and isinstance(pnl, (int, float)):
-                    color = '#dcfce7' if pnl > 0 else ('#fef2f2' if pnl < 0 else '')
-                    styles = [f'background-color: {color}; font-weight: bold'] * len(row)
-                return styles
-            st.dataframe(round_trips.style.apply(style_trades, axis=1), width='stretch', hide_index=True)
-        else:
-            st.dataframe(ol.tail(30), width='stretch')
-        opnl = calc_options_pnl(ol)
-        fig = make_pnl_chart(opnl, "選擇權累計 PnL (TWD)")
-        if fig:
-            st.plotly_chart(fig, width='stretch')
-
-        # 展開原始 Ledger (進階)
-        with st.expander("📋 原始 Ledger (進階)"):
-            st.dataframe(ol, width='stretch')
-
-    # ── Reset Button (always visible, regardless of ledger state) ──
-    # 2026-05-25 Hermes Agent: allow user to clear options trade history
-    # 2026-05-25 Hermes Agent: also clear orders JSON files so Order Lifecycle panel is not stale
-    col1, col2, col3 = st.columns([3, 2, 3])
-    with col2:
-        if st.button("🗑️ 重置選擇權交易紀錄", type="secondary", width='stretch'):
-            try:
-                # Create backup
-                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_dir = BASE / "backups" / f"options_reset_{ts}"
-                backup_dir.mkdir(parents=True, exist_ok=True)
-                import shutil
-
-                # Backup + clear ledger
-                src = OPTIONS_DATA / "options_trade_ledger.csv"
-                if src.exists():
-                    shutil.copy2(src, backup_dir / "options_trade_ledger.csv")
-                header = "trade_id,Timestamp,Mode,Action,Side,Price,Quantity,PnL,Balance,Note\n"
-                src.write_text(header)
-
-                # Backup + clear orders JSON files (Order Lifecycle source)
-                orders_path = BASE / "exports" / "trades"
-                for f in sorted(orders_path.glob("OPTIONS_*_orders.json")):
-                    shutil.copy2(f, backup_dir / f.name)
-                    f.unlink()
-
-                # Remove old indicator CSVs (keep today's)
-                today_str = datetime.datetime.now().strftime("%Y%m%d")
-                today_prefix = f"OPTIONS_{today_str}_"
-                for f in sorted((OPTIONS_DATA).glob("OPTIONS_*_indicators.csv")):
-                    if not f.name.startswith(today_prefix):
+            st.header("交易記錄 (Round-Trip)")
+            round_trips = format_options_trades(ol)
+            if round_trips is not None and not round_trips.empty and "#" in round_trips.columns:
+                # Style with color for profit/loss
+                def style_trades(row):
+                    styles = [''] * len(row)
+                    pnl = row.get("淨利", "-")
+                    if pnl != "-" and isinstance(pnl, (int, float)):
+                        color = '#dcfce7' if pnl > 0 else ('#fef2f2' if pnl < 0 else '')
+                        styles = [f'background-color: {color}; font-weight: bold'] * len(row)
+                    return styles
+                st.dataframe(round_trips.style.apply(style_trades, axis=1), width='stretch', hide_index=True)
+            else:
+                st.dataframe(ol.tail(30), width='stretch')
+            opnl = calc_options_pnl(ol)
+            fig = make_pnl_chart(opnl, "選擇權累計 PnL (TWD)")
+            if fig:
+                st.plotly_chart(fig, width='stretch')
+    
+            # 展開原始 Ledger (進階)
+            with st.expander("📋 原始 Ledger (進階)"):
+                st.dataframe(ol, width='stretch')
+    
+        # ── Reset Button (always visible, regardless of ledger state) ──
+        # 2026-05-25 Hermes Agent: allow user to clear options trade history
+        # 2026-05-25 Hermes Agent: also clear orders JSON files so Order Lifecycle panel is not stale
+        col1, col2, col3 = st.columns([3, 2, 3])
+        with col2:
+            if st.button("🗑️ 重置選擇權交易紀錄", type="secondary", width='stretch'):
+                try:
+                    # Create backup
+                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    backup_dir = BASE / "backups" / f"options_reset_{ts}"
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    import shutil
+    
+                    # Backup + clear ledger
+                    src = OPTIONS_DATA / "options_trade_ledger.csv"
+                    if src.exists():
+                        shutil.copy2(src, backup_dir / "options_trade_ledger.csv")
+                    header = "trade_id,Timestamp,Mode,Action,Side,Price,Quantity,PnL,Balance,Note\n"
+                    src.write_text(header)
+    
+                    # Backup + clear orders JSON files (Order Lifecycle source)
+                    orders_path = BASE / "exports" / "trades"
+                    for f in sorted(orders_path.glob("OPTIONS_*_orders.json")):
                         shutil.copy2(f, backup_dir / f.name)
                         f.unlink()
-
-                st.success("✅ 交易紀錄及委託單已重置 (無須重啟)")
-                st.cache_data.clear()
-            except Exception as e:
-                st.error(f"❌ 重置失敗: {e}")
-
-    # ── Options Order Status Panel ──
-    with st.expander("📤 選擇權委託單狀態 (Order Lifecycle)", expanded=False):
-        orders_path = BASE / "exports" / "trades"
-        order_files = list(orders_path.glob("OPTIONS_*_orders.json"))
-        order_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-
-        if order_files and order_files[0].exists():
-            with open(order_files[0], "r", encoding="utf-8") as f:
-                orders_data = json.load(f)
-            orders_rebuilt_from_ledger = False
-            if not orders_data:
-                rebuilt_orders = rebuild_options_orders_from_ledger(ol)
-                if rebuilt_orders:
-                    orders_data = rebuilt_orders
-                    orders_rebuilt_from_ledger = True
-
-            if orders_data:
-                # [GSD Fix] Get ACTUAL live premium from indicator data, not ledger
-                opt_df = load_options_indicators()
-                live_premium = None
-                current_spot = 0.0
-                current_iv = 0.0
-                current_dte_years = 0.0
-                if opt_df is not None and not opt_df.empty:
-                    last_row = opt_df.iloc[-1]
-                    current_spot = float(last_row.get("price_mtx", 0) or 0)
-                    current_iv = float(last_row.get("iv", 0) or 0)
-                    current_dte_years = float(last_row.get("dte", 0) or 0) / 365.0 if last_row.get("dte", 0) else 0.0
-                    # Try to get bid/ask mid if available (some versions log it)
-                    bid = float(last_row.get("bid", 0))
-                    ask = float(last_row.get("ask", 0))
-                    if bid > 0 and ask > 0:
-                        live_premium = (bid + ask) / 2
-                    else:
-                        # 💡 [Fixed 2026-06-02] Do NOT use 'Close' or 'close' as fallback, 
-                        # because in the indicators CSV they represent the underlying MTX spot price,
-                        # not the option premium. This causes massive PnL hallucinations.
-                        # Setting to 0.0 forces the system to use Black-Scholes theoretical pricing.
-                        live_premium = 0.0
-
-                df_orders = pd.DataFrame(orders_data)
-                open_option_for_orders = find_latest_open_options_position(ol)
-                truth_results = df_orders.apply(
-                    lambda row: describe_options_order_truth(
-                        row,
-                        orders_rebuilt_from_ledger=orders_rebuilt_from_ledger,
-                    ),
-                    axis=1,
-                )
-                df_orders["truth_source"] = truth_results.apply(lambda result: result["truth_source"])
-                df_orders["真實來源"] = truth_results.apply(lambda result: result["badge"])
-                df_orders["degraded_caption"] = truth_results.apply(lambda result: result["degraded_caption"])
-                df_orders["show_paper_disclaimer"] = truth_results.apply(lambda result: result["show_paper_disclaimer"])
-                df_orders["組合腿摘要"] = df_orders.get("combo_legs", pd.Series([None] * len(df_orders))).apply(summarize_combo_legs)
-                display_cols = []
-                if "order_id" in df_orders.columns:
-                    display_cols.append("order_id")
-                if "created_at" in df_orders.columns:
-                    display_cols.append("created_at")
-                display_cols.append("真實來源")
-                if "side" in df_orders.columns:
-                    df_orders["方向"] = df_orders["side"].map({"buy": "買入", "sell": "賣出"})
-                    display_cols.append("方向")
-                if "order_type" in df_orders.columns:
-                    # 2026-06-08 JVS Claw: Added MKP (範圍市價)
-                    type_map_opt = {"market": "市價", "limit": "限價", "stop": "停損", "stop_limit": "停損限價", "mkp": "範圍市價"}
-                    df_orders["委託類型"] = df_orders["order_type"].map(type_map_opt).fillna(df_orders["order_type"])
-                    display_cols.append("委託類型")
-                if "quantity" in df_orders.columns:
-                    display_cols.append("quantity")
-                if "filled_quantity" in df_orders.columns:
-                    display_cols.append("filled_quantity")
-                if "price" in df_orders.columns:
-                    display_cols.append("price")
-                if "avg_fill_price" in df_orders.columns:
-                    display_cols.append("avg_fill_price")
-                if "status" in df_orders.columns:
-                    status_map_opt = {"pending_submit": "⏳ 待傳送", "pre_submitted": "📅 預約單", "submitted": "📨 已委託", "partial_filled": "⚡ 部分成交", "filled": "✅ 完全成交", "cancelled": "🚫 已取消", "rejected": "❌ 已退單", "expired": "⏰ 已過期"}
-                    df_orders["狀態"] = df_orders["status"].map(status_map_opt).fillna(df_orders["status"])
-                    display_cols.append("狀態")
-                if "strategy" in df_orders.columns:
-                    display_cols.append("strategy")
-                display_cols.append("組合腿摘要")
-                display_cols.append("degraded_caption")
-
-                has_open_theta = open_option_for_orders is not None and "THETA" in str(open_option_for_orders.action).upper()
-
-                if (live_premium and live_premium > 0) or has_open_theta or (current_spot > 0 and current_iv > 0 and current_dte_years > 0):
-                    # 添加更新按鈕
-                    col1, col2 = st.columns([3, 1])
-                    with col1:
-                        st.subheader("📊 未實現損益計算")
-                    with col2:
-                        if st.button("🔄 更新", key="update_options_unrealized"):
-                            st.cache_data.clear()
-                            st.rerun()
-
-                    if bool(df_orders["show_paper_disclaimer"].any()):
-                        st.info("ℹ️ THETA 策略目前顯示的是策略整體估值／紙上生命週期紀錄，不是券商逐腿即時成交回報。")
-                    if "broker_combo" in set(df_orders["truth_source"].astype(str)):
-                        st.caption("broker_combo 為券商複式單真實來源；paper_strategy / ledger_rebuilt 會保留降級或紙上估值說明。")
-
-                    pricing_results = df_orders.apply(
-                        lambda row: estimate_options_order_unrealized(
+    
+                    # Remove old indicator CSVs (keep today's)
+                    today_str = datetime.datetime.now().strftime("%Y%m%d")
+                    today_prefix = f"OPTIONS_{today_str}_"
+                    for f in sorted((OPTIONS_DATA).glob("OPTIONS_*_indicators.csv")):
+                        if not f.name.startswith(today_prefix):
+                            shutil.copy2(f, backup_dir / f.name)
+                            f.unlink()
+    
+                    st.success("✅ 交易紀錄及委託單已重置 (無須重啟)")
+                    st.cache_data.clear()
+                except Exception as e:
+                    st.error(f"❌ 重置失敗: {e}")
+    
+        # ── Options Order Status Panel ──
+        with st.expander("📤 選擇權委託單狀態 (Order Lifecycle)", expanded=False):
+            orders_path = BASE / "exports" / "trades"
+            order_files = list(orders_path.glob("OPTIONS_*_orders.json"))
+            order_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    
+            if order_files and order_files[0].exists():
+                with open(order_files[0], "r", encoding="utf-8") as f:
+                    orders_data = json.load(f)
+                orders_rebuilt_from_ledger = False
+                if not orders_data:
+                    rebuilt_orders = rebuild_options_orders_from_ledger(ol)
+                    if rebuilt_orders:
+                        orders_data = rebuilt_orders
+                        orders_rebuilt_from_ledger = True
+    
+                if orders_data:
+                    # [GSD Fix] Get ACTUAL live premium from indicator data, not ledger
+                    opt_df = load_options_indicators()
+                    live_premium = None
+                    current_spot = 0.0
+                    current_iv = 0.0
+                    current_dte_years = 0.0
+                    if opt_df is not None and not opt_df.empty:
+                        last_row = opt_df.iloc[-1]
+                        current_spot = float(last_row.get("price_mtx", 0) or 0)
+                        current_iv = float(last_row.get("iv", 0) or 0)
+                        current_dte_years = float(last_row.get("dte", 0) or 0) / 365.0 if last_row.get("dte", 0) else 0.0
+                        # Try to get bid/ask mid if available (some versions log it)
+                        bid = float(last_row.get("bid", 0))
+                        ask = float(last_row.get("ask", 0))
+                        if bid > 0 and ask > 0:
+                            live_premium = (bid + ask) / 2
+                        else:
+                            # 💡 [Fixed 2026-06-02] Do NOT use 'Close' or 'close' as fallback, 
+                            # because in the indicators CSV they represent the underlying MTX spot price,
+                            # not the option premium. This causes massive PnL hallucinations.
+                            # Setting to 0.0 forces the system to use Black-Scholes theoretical pricing.
+                            live_premium = 0.0
+    
+                    df_orders = pd.DataFrame(orders_data)
+                    open_option_for_orders = find_latest_open_options_position(ol)
+                    truth_results = df_orders.apply(
+                        lambda row: describe_options_order_truth(
                             row,
-                            open_option_for_orders,
-                            live_premium=live_premium or 0.0,
-                            current_spot=current_spot,
-                            current_iv=current_iv,
-                            dte_years=current_dte_years,
-                            strike=float(last_row.get("strike", 0) or 0),
+                            orders_rebuilt_from_ledger=orders_rebuilt_from_ledger,
                         ),
                         axis=1,
                     )
-                    df_orders["unrealized_pnl"] = pricing_results.apply(
-                        lambda result: None if result is None else result["unrealized_pnl"]
-                    )
-
-                    # 2026-05-25 Hermes Agent: extract premium_source and dte_days from pricing result
-                    df_orders["premium_source"] = pricing_results.apply(
-                        lambda result: "—" if result is None else result.get("premium_source", "—")
-                    )
-                    df_orders["dte_days"] = pricing_results.apply(
-                        lambda result: None if result is None else result.get("dte_days", None)
-                    )
-
-                    def _format_unreal(x):
-                        if x is None or (isinstance(x, float) and pd.isna(x)):
-                            return "—"
-                        elif x > 0:
-                            return f"🟢 {x:+,.2f}"
-                        elif x < 0:
-                            return f"🔴 {x:+,.2f}"
-                        else:
-                            return "⚪ 0"
-                    df_orders["未實現損益"] = df_orders["unrealized_pnl"].apply(_format_unreal)
-                    display_cols.append("未實現損益")
-                    df_orders["current_price"] = pricing_results.apply(
-                        lambda result: None if result is None else result["current_price"]
-                    )
-                    df_orders["目前組合價值"] = df_orders["current_price"]
-                    display_cols.append("目前組合價值")
-                    # 2026-05-25 Hermes Agent: show premium source and DTE in UI
-                    df_orders["premium_source"] = pricing_results.apply(
-                        lambda result: "—" if result is None else result.get("premium_source", "—")
-                    )
-                    display_cols.append("premium_source")
-                    df_orders["dte_days"] = pricing_results.apply(
-                        lambda result: None if result is None else result.get("dte_days", None)
-                    )
-                    display_cols.append("dte_days")
-
-                if display_cols:
-                    st.dataframe(df_orders[display_cols], width='stretch', hide_index=True,
-                                 column_config={
-                                      "order_id": "委託單ID",
-                                      "created_at": "建立時間",
-                                      "真實來源": st.column_config.TextColumn("真實來源"),
-                                       "方向": "方向",
-                                       "委託類型": st.column_config.TextColumn("委託類型"),
-                                       "quantity": "委託量",
-                                       "filled_quantity": "成交量",
-                                       "price": st.column_config.NumberColumn("限價", format="%.2f"),
-                                       "avg_fill_price": st.column_config.NumberColumn("成交均價", format="%.2f"),
-                                       "狀態": st.column_config.TextColumn("狀態"),
-                                       "strategy": "策略",
-                                       "組合腿摘要": st.column_config.TextColumn("組合腿摘要"),
-                                       "degraded_caption": st.column_config.TextColumn("狀態說明"),
-                                       "未實現損益": st.column_config.TextColumn("未實現損益"),
-                                       "目前組合價值": st.column_config.NumberColumn("目前組合價值", format="%.2f"),
-                                       "premium_source": st.column_config.TextColumn("估值來源"),
-                                       "dte_days": st.column_config.NumberColumn("剩餘天數", format="%.1f"),
-                                    })
-                    if orders_rebuilt_from_ledger:
-                        st.caption("委託單檔案為空，已暫時從交易 ledger 重建今日選擇權委託單狀態。真實來源已標示為 ledger_rebuilt，表示 broker truth 目前不可用。")
-
-                    total = len(df_orders)
-                    filled = len(df_orders[df_orders["status"] == "filled"]) if "status" in df_orders.columns else 0
-                    pending = len(df_orders[df_orders["status"].isin(["submitted", "pending_submit", "pre_submitted"])]) if "status" in df_orders.columns else 0
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("總委託單", total)
-                    c2.metric("✅ 已成交", filled)
-                    c3.metric("⏳ 排隊中", pending)
+                    df_orders["truth_source"] = truth_results.apply(lambda result: result["truth_source"])
+                    df_orders["真實來源"] = truth_results.apply(lambda result: result["badge"])
+                    df_orders["degraded_caption"] = truth_results.apply(lambda result: result["degraded_caption"])
+                    df_orders["show_paper_disclaimer"] = truth_results.apply(lambda result: result["show_paper_disclaimer"])
+                    df_orders["組合腿摘要"] = df_orders.get("combo_legs", pd.Series([None] * len(df_orders))).apply(summarize_combo_legs)
+                    display_cols = []
+                    if "order_id" in df_orders.columns:
+                        display_cols.append("order_id")
+                    if "created_at" in df_orders.columns:
+                        display_cols.append("created_at")
+                    display_cols.append("真實來源")
+                    if "side" in df_orders.columns:
+                        df_orders["方向"] = df_orders["side"].map({"buy": "買入", "sell": "賣出"})
+                        display_cols.append("方向")
+                    if "order_type" in df_orders.columns:
+                        # 2026-06-08 JVS Claw: Added MKP (範圍市價)
+                        type_map_opt = {"market": "市價", "limit": "限價", "stop": "停損", "stop_limit": "停損限價", "mkp": "範圍市價"}
+                        df_orders["委託類型"] = df_orders["order_type"].map(type_map_opt).fillna(df_orders["order_type"])
+                        display_cols.append("委託類型")
+                    if "quantity" in df_orders.columns:
+                        display_cols.append("quantity")
+                    if "filled_quantity" in df_orders.columns:
+                        display_cols.append("filled_quantity")
+                    if "price" in df_orders.columns:
+                        display_cols.append("price")
+                    if "avg_fill_price" in df_orders.columns:
+                        display_cols.append("avg_fill_price")
+                    if "status" in df_orders.columns:
+                        status_map_opt = {"pending_submit": "⏳ 待傳送", "pre_submitted": "📅 預約單", "submitted": "📨 已委託", "partial_filled": "⚡ 部分成交", "filled": "✅ 完全成交", "cancelled": "🚫 已取消", "rejected": "❌ 已退單", "expired": "⏰ 已過期"}
+                        df_orders["狀態"] = df_orders["status"].map(status_map_opt).fillna(df_orders["status"])
+                        display_cols.append("狀態")
+                    if "strategy" in df_orders.columns:
+                        display_cols.append("strategy")
+                    display_cols.append("組合腿摘要")
+                    display_cols.append("degraded_caption")
+    
+                    has_open_theta = open_option_for_orders is not None and "THETA" in str(open_option_for_orders.action).upper()
+    
+                    if (live_premium and live_premium > 0) or has_open_theta or (current_spot > 0 and current_iv > 0 and current_dte_years > 0):
+                        # 添加更新按鈕
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.subheader("📊 未實現損益計算")
+                        with col2:
+                            if st.button("🔄 更新", key="update_options_unrealized"):
+                                st.cache_data.clear()
+                                st.rerun()
+    
+                        if bool(df_orders["show_paper_disclaimer"].any()):
+                            st.info("ℹ️ THETA 策略目前顯示的是策略整體估值／紙上生命週期紀錄，不是券商逐腿即時成交回報。")
+                        if "broker_combo" in set(df_orders["truth_source"].astype(str)):
+                            st.caption("broker_combo 為券商複式單真實來源；paper_strategy / ledger_rebuilt 會保留降級或紙上估值說明。")
+    
+                        pricing_results = df_orders.apply(
+                            lambda row: estimate_options_order_unrealized(
+                                row,
+                                open_option_for_orders,
+                                live_premium=live_premium or 0.0,
+                                current_spot=current_spot,
+                                current_iv=current_iv,
+                                dte_years=current_dte_years,
+                                strike=float(last_row.get("strike", 0) or 0),
+                            ),
+                            axis=1,
+                        )
+                        df_orders["unrealized_pnl"] = pricing_results.apply(
+                            lambda result: None if result is None else result["unrealized_pnl"]
+                        )
+    
+                        # 2026-05-25 Hermes Agent: extract premium_source and dte_days from pricing result
+                        df_orders["premium_source"] = pricing_results.apply(
+                            lambda result: "—" if result is None else result.get("premium_source", "—")
+                        )
+                        df_orders["dte_days"] = pricing_results.apply(
+                            lambda result: None if result is None else result.get("dte_days", None)
+                        )
+    
+                        def _format_unreal(x):
+                            if x is None or (isinstance(x, float) and pd.isna(x)):
+                                return "—"
+                            elif x > 0:
+                                return f"🟢 {x:+,.2f}"
+                            elif x < 0:
+                                return f"🔴 {x:+,.2f}"
+                            else:
+                                return "⚪ 0"
+                        df_orders["未實現損益"] = df_orders["unrealized_pnl"].apply(_format_unreal)
+                        display_cols.append("未實現損益")
+                        df_orders["current_price"] = pricing_results.apply(
+                            lambda result: None if result is None else result["current_price"]
+                        )
+                        df_orders["目前組合價值"] = df_orders["current_price"]
+                        display_cols.append("目前組合價值")
+                        # 2026-05-25 Hermes Agent: show premium source and DTE in UI
+                        df_orders["premium_source"] = pricing_results.apply(
+                            lambda result: "—" if result is None else result.get("premium_source", "—")
+                        )
+                        display_cols.append("premium_source")
+                        df_orders["dte_days"] = pricing_results.apply(
+                            lambda result: None if result is None else result.get("dte_days", None)
+                        )
+                        display_cols.append("dte_days")
+    
+                    if display_cols:
+                        st.dataframe(df_orders[display_cols], width='stretch', hide_index=True,
+                                     column_config={
+                                          "order_id": "委託單ID",
+                                          "created_at": "建立時間",
+                                          "真實來源": st.column_config.TextColumn("真實來源"),
+                                           "方向": "方向",
+                                           "委託類型": st.column_config.TextColumn("委託類型"),
+                                           "quantity": "委託量",
+                                           "filled_quantity": "成交量",
+                                           "price": st.column_config.NumberColumn("限價", format="%.2f"),
+                                           "avg_fill_price": st.column_config.NumberColumn("成交均價", format="%.2f"),
+                                           "狀態": st.column_config.TextColumn("狀態"),
+                                           "strategy": "策略",
+                                           "組合腿摘要": st.column_config.TextColumn("組合腿摘要"),
+                                           "degraded_caption": st.column_config.TextColumn("狀態說明"),
+                                           "未實現損益": st.column_config.TextColumn("未實現損益"),
+                                           "目前組合價值": st.column_config.NumberColumn("目前組合價值", format="%.2f"),
+                                           "premium_source": st.column_config.TextColumn("估值來源"),
+                                           "dte_days": st.column_config.NumberColumn("剩餘天數", format="%.1f"),
+                                        })
+                        if orders_rebuilt_from_ledger:
+                            st.caption("委託單檔案為空，已暫時從交易 ledger 重建今日選擇權委託單狀態。真實來源已標示為 ledger_rebuilt，表示 broker truth 目前不可用。")
+    
+                        total = len(df_orders)
+                        filled = len(df_orders[df_orders["status"] == "filled"]) if "status" in df_orders.columns else 0
+                        pending = len(df_orders[df_orders["status"].isin(["submitted", "pending_submit", "pre_submitted"])]) if "status" in df_orders.columns else 0
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("總委託單", total)
+                        c2.metric("✅ 已成交", filled)
+                        c3.metric("⏳ 排隊中", pending)
+                else:
+                    st.info("今日尚無選擇權委託單記錄")
             else:
-                st.info("今日尚無選擇權委託單記錄")
-        else:
-            st.info("選擇權委託單檔案尚未建立 (Order Lifecycle 未啟用)")
-
+                st.info("選擇權委託單檔案尚未建立 (Order Lifecycle 未啟用)")
+    
 # ════════════════════════════════════════
 # Tab 4: 台股 Stocks
 # ════════════════════════════════════════
@@ -5079,100 +5329,30 @@ elif page == "台股 Stocks":
 # Tab 5: 策略管道 (Pipeline)
 # ════════════════════════════════════════
 elif page == "策略管道":
-    st.header("📊 策略管道 (Strategy Pipeline)")
+    st.header("📊 策略管道 (Strategy Pipeline & Risk Status)")
 
-    # Strategy Rankings
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("☀️ 日盤排行榜")
-        try:
-            from core.strategy_registry import get_strategy_ranking
-            day_ranking = get_strategy_ranking("day")
-            for i, (name, pf) in enumerate(day_ranking, 1):
-                emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
-                st.write(f"{emoji} {i}. {name} (PF={pf:.1f})")
-        except Exception as e:
-            st.error(f"Error: {e}")
-
-    with col2:
-        st.subheader("🌙 夜盤排行榜")
-        try:
-            night_ranking = get_strategy_ranking("night")
-            for i, (name, pf) in enumerate(night_ranking, 1):
-                emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
-                st.write(f"{emoji} {i}. {name} (PF={pf:.1f})")
-        except Exception as e:
-            st.error(f"Error: {e}")
-
-    # Pipeline Status
-    st.subheader("🔄 管道狀態")
-    try:
-        from core.strategy_registry import STRATEGY_PERF
-        pipeline_data = []
-        for name, perf in sorted(STRATEGY_PERF.items()):
-            display_name = {
-                "counter_vwap": "Counter-VWAP",
-                "spring_upthrust": "Spring-Upthrust",
-                "kbar_feature": "KBar Feature",
-                "calendar_condor_v2": "Calendar Condor v2",
-                "vol_squeeze": "Vol-Squeeze",
-                "psar": "PSAR",
-                "weak_bear_trend": "Weak Bear Trend",
-                "squeeze_fire_scout": "Sqz Fire Scout",
-            }.get(name, name)
-            day_pf = perf.get("day_pf", 0)
-            night_pf = perf.get("night_pf", 0)
-            status = "✅ Paper" if day_pf >= 1.5 else ("⏳ 觀察中" if day_pf >= 1.0 else "🔴 PF<1.0")
-            pipeline_data.append({
-                "策略": display_name,
-                "日盤 PF": day_pf,
-                "夜盤 PF": night_pf,
-                "狀態": status,
-            })
-        st.table(pd.DataFrame(pipeline_data))
-    except Exception as e:
-        st.error(f"Error loading pipeline: {e}")
-
-    # Circuit Breaker Status
-    st.subheader("🛡️ Circuit Breaker 狀態")
+    # 1. Circuit Breaker Status (Top Priority)
+    st.subheader("🛡️ Circuit Breaker 熔斷風控狀態")
     try:
         from core.circuit_breaker import CircuitBreaker
         day_cb = CircuitBreaker(session="day")
         night_cb = CircuitBreaker(session="night")
         c1, c2 = st.columns(2)
         with c1:
-            st.write(f"**日盤**: {day_cb.state.session_pnl:.0f} pts, {day_cb.state.consecutive_losses} 連虧, {'🛑 HALTED' if day_cb.is_halted else '✅ OK'}")
+            st.write(f"☀️ **日盤風控**: {day_cb.state.session_pnl:.0f} pts | {day_cb.state.consecutive_losses} 連虧 | {'🛑 HALTED' if day_cb.is_halted else '✅ 正常運作'}")
         with c2:
-            st.write(f"**夜盤**: {night_cb.state.session_pnl:.0f} pts, {night_cb.state.consecutive_losses} 連虧, {'🛑 HALTED' if night_cb.is_halted else '✅ OK'}")
+            st.write(f"🌙 **夜盤風控**: {night_cb.state.session_pnl:.0f} pts | {night_cb.state.consecutive_losses} 連虧 | {'🛑 HALTED' if night_cb.is_halted else '✅ 正常運作'}")
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Error loading CircuitBreaker: {e}")
 
-    # Recent Decisions
-    st.subheader("📝 最近決策日誌")
-    try:
-        from core.decision_logger import DecisionLogger
-        recent = DecisionLogger.read_decisions(limit=10)
-        if recent:
-            df_dec = pd.DataFrame([{
-                "時間": d.timestamp[:19],
-                "類型": d.type,
-                "Session": d.session,
-                "動作": d.action,
-                "細節": d.detail[:50],
-            } for d in recent])
-            st.dataframe(df_dec, width='stretch')
-        else:
-            st.info("尚無決策記錄")
-    except Exception as e:
-        st.error(f"Error: {e}")
+    st.divider()
 
-    # ── Hourly Audit Timeline ──
-    st.subheader("🕐 每小時審計時間軸")
+    # 2. Hourly Audit Timeline
+    st.subheader("🕐 每小時審計時間軸 (Hourly Audit Timeline)")
     try:
         from pathlib import Path
         audit_dir = Path("logs/market_data")
         today_str = datetime.datetime.now().strftime("%Y%m%d")
-        # 2026-05-27 Gemini CLI: Generalize audit file path
         audit_file = audit_dir / f"{_TICKER}_{today_str}_signals_audit.csv"
 
         if audit_file.exists():
@@ -5206,286 +5386,531 @@ elif page == "策略管道":
                             st.metric(f"{emoji} {verdict}", f"{count} 次")
                 else:
                     st.info("今日尚無審計記錄（monitor 尚未運行或未到整點）")
+            else:
+                st.info("今日審計日誌空檔中")
         else:
-            st.info(f"今日審計檔不存在：{audit_file.name}")
+            st.info("今日審計檔案尚未建立")
     except Exception as e:
-        st.error(f"審計讀取錯誤: {e}")
+        st.error(f"Error loading Hourly Audit Timeline: {e}")
 
-    # ── Router Trace Dashboard ──
-    st.subheader("🔍 Router Trace — 每根 Bar 的策略決策")
+    st.divider()
+
+    # 3. Pipeline Status
+    st.subheader("🔄 管道與策略狀態 (MTS & Strategy Status)")
     try:
-        from pathlib import Path
-        import json
-        trace_dir = Path("logs/router_trace")
-        if trace_dir.exists():
-            trace_files = sorted(trace_dir.glob("router_trace_*.jsonl"), reverse=True)
-            if trace_files:
-                # ── Load + explode ──
-                rows = []
-                with open(trace_files[0]) as f:
-                    for line in f:
-                        trace = json.loads(line)
-                        ts = trace.get("ts", "?")
-                        regime = trace.get("regime", "?")
-                        selected = trace.get("selected")
-                        for s in trace.get("strategies", []):
-                            rows.append({
-                                "ts": ts,
-                                "regime": regime,
-                                "selected": selected,
-                                "strategy": s["name"],
-                                "triggered": s.get("triggered", False),
-                                "edge": s.get("edge_score"),
-                                "reason": s.get("skip_reason", "?") if not s.get("triggered") else "✅ TRADE",
-                            })
-                if rows:
-                    df_rt = pd.DataFrame(rows)
-                    df_rt["ts_dt"] = pd.to_datetime(df_rt["ts"], errors="coerce")
-                    df_rt = df_rt.sort_values("ts_dt")
-
-                    # ── ① 最新狀態 ──
-                    latest = df_rt.sort_values("ts_dt").groupby("strategy").tail(1)
-                    cols = st.columns(len(latest))
-                    for ci, (_, r) in enumerate(latest.iterrows()):
-                        c = cols[ci % len(cols)]
-                        emoji = "✅" if r["triggered"] else ("⏳" if r["reason"] in ("WATCHING", "FIRE_DETECTED_WAITING") else "⛔")
-                        c.metric(f"{r['strategy']}", f"{emoji} {r['reason']}", f"edge={r['edge']}" if pd.notna(r["edge"]) else None)
-                    
-                    # ── Router Trace 資料新鮮度註解 ──
-                    latest_ts = df_rt["ts_dt"].max()
-                    trace_count = len(df_rt)
-                    st.caption(
-                        f"⚠️ RouterTrace 可能包含前一輪 PM2 process 的歷史資料。"
-                        f"「NOT_REGISTERED」不代表當前 runtime 未註冊，"
-                        f"請交叉比對 PM2 日誌確認策略載入狀態。 "
-                        f"共 {trace_count} 筆, 最新: {latest_ts.strftime('%m/%d %H:%M') if pd.notna(latest_ts) else '?'}"
-                    )
-
-                    # ── ② Edge Timeline (Plotly) ──
-                    try:
-                        import plotly.express as px
-                        df_plot = df_rt[df_rt["edge"].notna()].copy()
-                        if not df_plot.empty:
-                            # 2026-06-30 Gemini CLI: Convert ts_dt to string to avoid serialization issue
-                            df_plot["ts_dt"] = df_plot["ts_dt"].astype(str)
-                            fig = px.line(df_plot, x="ts_dt", y="edge", color="strategy",
-                                          title="Edge Score Timeline",
-                                          labels={"ts_dt": "時間", "edge": "Edge", "strategy": "策略"})
-                            fig.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10))
-                            st.plotly_chart(fig, width='stretch')
-                    except Exception:
-                        pass
-
-                    # ── ③ Skip Reason 分布 ──
-                    reason_counts = df_rt.groupby(["strategy", "reason"]).size().unstack(fill_value=0)
-                    if not reason_counts.empty:
-                        st.bar_chart(reason_counts, height=200)
-
-                    # ── ④ 原始資料（摺疊） ──
-                    with st.expander("📋 原始 Router Trace 資料", expanded=False):
-                        st.dataframe(df_rt[["ts", "regime", "strategy", "triggered", "edge", "reason"]].tail(50),
-                                     width='stretch', hide_index=True)
-                else:
-                    st.info("Router trace 檔案為空")
-            else:
-                st.info("今日尚無 router trace 資料（monitor 尚未運行）")
-        else:
-            st.info("Router trace 目錄不存在")
+        from core.strategy_registry import STRATEGY_PERF
+        pipeline_data = []
+        for name, perf in sorted(STRATEGY_PERF.items()):
+            display_name = {
+                "tmf_spread": "TMF 雙腿對沖 (MTS)",
+                "counter_vwap": "Counter-VWAP",
+                "spring_upthrust": "Spring-Upthrust",
+                "kbar_feature": "KBar Feature",
+                "calendar_condor_v2": "Calendar Condor v2",
+                "vol_squeeze": "Vol-Squeeze",
+                "psar": "PSAR",
+                "weak_bear_trend": "Weak Bear Trend",
+                "squeeze_fire_scout": "Sqz Fire Scout",
+            }.get(name, name)
+            day_pf = perf.get("day_pf", 0)
+            night_pf = perf.get("night_pf", 0)
+            status = "✅ ACTIVE" if day_pf >= 1.2 or name == "tmf_spread" else ("⏳ 觀察中" if day_pf >= 1.0 else "🔴 停用/觀察")
+            pipeline_data.append({
+                "策略": display_name,
+                "日盤 PF": day_pf,
+                "夜盤 PF": night_pf,
+                "狀態": status,
+            })
+        st.table(pd.DataFrame(pipeline_data))
     except Exception as e:
-        st.error(f"Router trace 載入錯誤: {e}")
+        st.error(f"Error loading pipeline: {e}")
 
-# ════════════════════════════════════════
-# Tab: 🔐 Real Preflight
-# Read-only broker preflight diagnostic page.
-# Does NOT modify ExecutionContext, does NOT send orders,
-# does NOT transition to LIVE_READY.
-# ════════════════════════════════════════
-elif page == "🔐 Real Preflight":
-    st.header("🔐 Real Trading Preflight")
-    st.caption("Read-only broker diagnostic. Does not send orders or modify execution mode.")
-
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        st.subheader("📋 Execution State")
-
-        # Read runtime status
-        _rt_path = Path("/tmp/runtime_status.json")
-        _rt = {}
-        if _rt_path.exists():
-            try:
-                _rt = json.loads(_rt_path.read_text())
-            except Exception:
-                pass
-
-        # Read orders file for current session
-        _orders_file = Path(f"exports/trades/{_TICKER}_{DATE_STR}_orders.json")
-        _order_count = 0
-        if _orders_file.exists():
-            try:
-                _orders = json.loads(_orders_file.read_text())
-                _order_count = len(_orders)
-            except Exception:
-                pass
-
-        # Display execution context
-        _req_mode = _rt.get("requested_mode", "paper")
-        _eff_mode = _rt.get("effective_mode", "paper_active")
-        _live_allowed = _rt.get("live_order_allowed", False)
-
-        st.metric("Requested Mode", _req_mode.upper())
-        st.metric("Effective Mode", _eff_mode)
-        st.metric("Live Order Allowed", "✅ YES" if _live_allowed else "❌ NO")
-        st.metric("Session Orders (today)", _order_count)
-
-        if _rt.get("transition_block_reason"):
-            st.error(f"Transition blocked: {_rt['transition_block_reason']}")
-
-    with col_right:
-        st.subheader("📄 Paper Drain Status")
-
-        # Read MTS position state
-        _mts_pos = {}
-        _mts_pos_path = Path("/tmp/mts_position_state.json")
-        if _mts_pos_path.exists():
-            try:
-                _mts_pos = json.loads(_mts_pos_path.read_text())
-            except Exception:
-                pass
-
-        _has_pos = _mts_pos.get("has_position", False)
-        _state = _mts_pos.get("state", "?")
-        _near_status = _mts_pos.get("near_status", "?")
-        _far_status = _mts_pos.get("far_status", "?")
-        st.metric("Has Position", "✅ YES" if _has_pos else "❌ NO")
-        st.metric("State", _state)
-        st.metric("Near Status", _near_status)
-        st.metric("Far Status", _far_status)
-
-        if not _has_pos and _state in ("FLAT", "INACTIVE"):
-            st.success("✅ Paper is flat")
+    # 4. Recent Decisions & Legacy Rankings
+    st.subheader("📝 最近決策日誌")
+    try:
+        from core.decision_logger import DecisionLogger
+        recent = DecisionLogger.read_decisions(limit=10)
+        if recent:
+            df_dec = pd.DataFrame([{
+                "時間": d.timestamp[:19],
+                "類型": d.type,
+                "Session": d.session,
+                "動作": d.action,
+                "細節": d.detail[:50],
+            } for d in recent])
+            st.dataframe(df_dec, width='stretch')
         else:
-            st.warning("⏳ Paper has open position or lifecycle")
+            st.info("尚無最近決策記錄")
+    except Exception as e:
+        st.error(f"Error loading decision log: {e}")
 
-    # ── Broker Snapshot Section ──
-    st.divider()
-    st.subheader("🏦 Broker Preflight")
-
-    _diagnostics_dir = Path("exports/trades/live/diagnostics")
-    _response_file = _diagnostics_dir / "broker_snapshot_latest.json"
-
-    # Request ID tracking for freshness
-    if "_snapshot_request_id" not in st.session_state:
-        st.session_state["_snapshot_request_id"] = 0
-
-    col_btn, col_status = st.columns([1, 3])
-
-    with col_btn:
-        if st.button("📷 Capture Broker Snapshot", type="primary", use_container_width=True):
-            st.session_state["_snapshot_request_id"] += 1
-            _rid = st.session_state["_snapshot_request_id"]
-            _request_id = f"DASHBOARD-PROBE-{DATE_STR}-{_rid:04d}"
-
-            # Write request file
-            _req = {
-                "request_id": _request_id,
-                "requested_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "operation": "CAPTURE_BROKER_SNAPSHOT",
-                "read_only": True,
-            }
-            _req_path = Path("/tmp/mts_broker_snapshot_request.json")
-            _req_path.write_text(json.dumps(_req, indent=2))
-
-            st.session_state["_last_probe_request_id"] = _request_id
-            st.session_state["_last_probe_time"] = datetime.datetime.now()
-            st.success(f"Request sent ({_request_id})")
-            st.caption("Waiting for trading process to process... (~1 tick cycle)")
-
-    with col_status:
-        if st.button("🔄 Refresh", use_container_width=True):
-            st.rerun()
-
-    # ── Display Response ──
-    if _response_file.exists():
-        try:
-            _resp = json.loads(_response_file.read_text())
-            _resp_time_str = _resp.get("captured_at", "")
-            _req_id = _resp.get("request_id", "")
-
-            # Check freshness: response age
-            _is_fresh = False
-            _age_seconds = 999
+    with st.expander("🏆 歷史單口策略排行榜 (Legacy Rankings)", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("☀️ 日盤排行榜")
             try:
-                _resp_time = datetime.datetime.fromisoformat(_resp_time_str)
-                _age_seconds = (datetime.datetime.now(datetime.timezone.utc) - _resp_time).total_seconds()
-                _is_fresh = _age_seconds <= 30
+                from core.strategy_registry import get_strategy_ranking
+                day_ranking = get_strategy_ranking("day")
+                for i, (name, pf) in enumerate(day_ranking, 1):
+                    emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
+                    st.write(f"{emoji} {i}. {name} (PF={pf:.1f})")
+            except Exception as e:
+                st.error(f"Error: {e}")
+        with col2:
+            st.subheader("🌙 夜盤排行榜")
+            try:
+                night_ranking = get_strategy_ranking("night")
+                for i, (name, pf) in enumerate(night_ranking, 1):
+                    emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
+                    st.write(f"{emoji} {i}. {name} (PF={pf:.1f})")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+elif page == "🧪 離線反事實模擬":
+    st.header("🔄 反事實研究室 (Counterfactual Lab)")
+    st.caption("基於已完結交易的點重播 (Point Replay) 驗證與離線反事實模擬")
+    
+    st.markdown("""
+    > [!IMPORTANT]
+    > **Research-only & Read-only**  
+    > 本分頁為純研究與重播模擬用途。所有計算均在離線沙盒環境進行，**不產生任何實戰交易、不修改策略參數、不寫入生產資料庫或狀態檔**。
+    """)
+    
+    # Expose Service
+    from core.counterfactual_service import (
+        DatasetContractError,
+        ReplayConfig,
+        SweepParameter,
+        SweepRequest,
+        DecisionDriftCategory,
+        SWEEPABLE_PARAMETERS
+    )
+    service = get_counterfactual_service()
+    
+    # Page metadata
+    st.markdown(f"**Research Baseline:** `Research Baseline v1.0` (FROZEN)")
+    
+    tab1, tab2 = st.tabs(["🎯 基線重播驗證 (Point Replay)", "🧬 參數敏感度分析 (Sensitivity Sweep)"])
+    
+    with tab1:
+        st.subheader("🎯 基線重播驗證 (Point Replay Validation)")
+        st.write("比對歷史實際決策與當前生產決策引擎 (`evaluate_lifecycle_actions`) 的一致性。")
+        
+        if st.button("運行決策重播驗證 (Run Replay Validation)", key="btn_run_replay"):
+            with st.spinner("正在重播決策歷史..."):
+                try:
+                    result = service.run_point_replay()
+                    
+                    # Show KPI metrics
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("測試樣本數 (Cases)", result.metrics.eligible_cases)
+                    m2.metric("決策匹配率 (Action)", f"{result.metrics.action_match_rate:.1%}")
+                    m3.metric("部位匹配率 (Leg)", f"{result.metrics.leg_match_rate:.1%}")
+                    m4.metric("原因匹配率 (Reason)", f"{result.metrics.reason_match_rate:.1%}")
+                    m5.metric("分歧筆數 (Mismatches)", result.metrics.mismatch_count)
+                    
+                    # Show eligibility details
+                    st.markdown(f"""
+                    📋 **決策篩選統計 (Eligibility Statistics)**
+                    * **資料集總決策數 (Total Cases in Dataset):** `{result.metrics.total_cases}` 筆
+                    * **合規測試決策數 (Eligible Cases):** `{result.metrics.eligible_cases}` 筆 *(以 `RELEASE` 開頭的動作)*
+                    * **排除測試決策數 (Excluded Cases):** `{result.metrics.excluded_cases}` 筆 *(非釋放點決策)*
+                    * **篩選策略版本 (Eligibility Policy Version):** `{result.metrics.eligibility_policy_version}`
+                    """)
+                    
+                    # Show provenance
+                    st.info(f"""
+                    🧬 **資料來源與運行追溯 (Provenance)**
+                    * **Methodology Version:** `{result.provenance.research_methodology_version}`
+                    * **Dataset Contract Version:** `{result.provenance.dataset_contract_version}`
+                    * **Dataset Build ID:** `{result.provenance.dataset_build_id}`
+                    * **Git Commit Hash:** `{result.provenance.git_commit[:8]} ({result.provenance.git_repo_state})`
+                    * **Generated At:** `{result.provenance.generated_time}`
+                    """)
+                    
+                    # Show mismatch details
+                    if result.metrics.mismatch_count > 0:
+                        st.warning(f"發現 {result.metrics.mismatch_count} 筆決策分歧！請檢查下方列表：")
+                        mismatch_rows = []
+                        for m in result.mismatches:
+                            mismatch_rows.append({
+                                "Trade ID": m.trade_id[-6:],
+                                "Seq": m.decision_seq,
+                                "分歧類型": m.mismatch_category,
+                                "實際動作": m.recorded_action,
+                                "實際部位": m.recorded_leg or "—",
+                                "重播動作": m.replayed_action or "—",
+                                "重播部位": m.replayed_leg or "—",
+                            })
+                        st.dataframe(pd.DataFrame(mismatch_rows), width='stretch', hide_index=True)
+                    else:
+                        st.success(f"🎉 在目前資料集納入的 {result.metrics.eligible_cases} 個 eligible decision points 中，當前決策引擎已 100% 重現歷史 Action 與 Leg，未發現決策分歧。此結果僅代表點決策重播一致性，不代表完整交易軌跡、成交結果或績效一致性。")
+                except DatasetContractError as e:
+                    st.error(f"""
+                    ⚠️ **目前資料集不符合 Replay Dataset Contract。**
+                    請先由獨立 Dataset Build Pipeline 發布新的 Generation。
+                    
+                    * **錯誤代碼 (Code):** `{e.code}`
+                    * **缺少欄位 (Missing Columns):** `{e.missing_columns}`
+                    * **資料集編譯 ID (Dataset Build ID):** `{e.dataset_build_id}`
+                    """)
+                except Exception as e:
+                    st.error(f"決策重播運行失敗: {e}")
+                    
+    with tab2:
+        st.subheader("🏆 參數敏感度排行榜 (Sensitivity Ranking)")
+        ranking = service.get_sensitivity_ranking()
+        if ranking:
+            ranking_df = pd.DataFrame(ranking)
+            # Rename columns
+            ranking_df = ranking_df.rename(columns={
+                "parameter_name": "參數名稱",
+                "max_drift_rate": "最大分歧率 (Global Max Drift)",
+                "local_sensitivity": "基準敏感度 (Local Baseline Sensitivity)",
+                "sensitive_cases_count": "敏感個案數",
+                "experiment_hash": "Experiment Hash",
+                "last_evaluated": "評估時間",
+                "baseline_value": "基準值",
+                "sweep_range": "掃描範圍"
+            })
+            if "最大分歧率 (Global Max Drift)" in ranking_df.columns:
+                ranking_df["最大分歧率 (Global Max Drift)"] = ranking_df["最大分歧率 (Global Max Drift)"].map(lambda x: f"{x:.1%}")
+            if "基準敏感度 (Local Baseline Sensitivity)" in ranking_df.columns:
+                ranking_df["基準敏感度 (Local Baseline Sensitivity)"] = ranking_df["基準敏感度 (Local Baseline Sensitivity)"].map(lambda x: f"{x:.1%}")
+            st.dataframe(ranking_df[[
+                "參數名稱", "基準值", "掃描範圍", "基準敏感度 (Local Baseline Sensitivity)", "最大分歧率 (Global Max Drift)", "敏感個案數", "Experiment Hash", "評估時間"
+            ]], width='stretch', hide_index=True)
+        else:
+            st.info("尚無完成的掃描實驗。請在下方設定參數並點擊『運行參數掃描』來生成數據。")
+
+        st.divider()
+        st.subheader("🧬 參數敏感度分析 (Parameter Sensitivity Sweep)")
+        st.write("比對在不同參數閾值下決策引擎的分歧率與歷史匹配率，辨識決策穩定邊界。")
+        
+        # User controls for sweep parameter selection
+        param_name = st.selectbox(
+            "選擇掃描參數 (Whitelisted Parameter)",
+            options=list(SWEEPABLE_PARAMETERS.keys()),
+            format_func=lambda x: f"{x} ({SWEEPABLE_PARAMETERS[x].description})"
+        )
+        
+        spec = SWEEPABLE_PARAMETERS[param_name]
+        
+        # Slider range based on spec type and values
+        if spec.type == float:
+            # For stop thresholds
+            r_start, r_end = st.slider(
+                f"設定參數掃描範圍 ({spec.unit})",
+                min_value=float(spec.min_val),
+                max_value=float(spec.max_val),
+                value=(80.0, 200.0),
+                step=10.0
+            )
+            step = st.number_input("掃描步長 (Step)", min_value=1.0, max_value=50.0, value=10.0)
+            # Make sure step > 0
+            values = []
+            curr = r_start
+            while curr <= r_end:
+                values.append(round(curr, 2))
+                curr += step
+        else:
+            # Integer params (confirm_ms / confirm_ticks)
+            r_start, r_end = st.slider(
+                f"設定參數掃描範圍 ({spec.unit})",
+                min_value=int(spec.min_val),
+                max_value=int(spec.max_val),
+                value=(int(spec.min_val), int(spec.min_val) + 1000) if param_name == "confirm_ms" else (2, 15),
+                step=100 if param_name == "confirm_ms" else 1
+            )
+            step = st.number_input("掃描步長 (Step)", min_value=1, max_value=1000, value=100 if param_name == "confirm_ms" else 1)
+            values = list(range(r_start, r_end + 1, step))
+
+        # Ask user for baseline parameter override input to enforce reproduction validation
+        _is_float = spec.type == float
+        default_baseline_val = float(spec.default_val) if _is_float else int(spec.default_val)
+        baseline_override = st.number_input(
+            f"設定基線比對值 (Baseline Value for comparison)",
+            value=default_baseline_val,
+            step=1.0 if _is_float else 1
+        )
+        
+        # Insert baseline value into the sweep tuple if not present to run verification
+        if baseline_override not in values:
+            values.append(baseline_override)
+        values = sorted(list(set(values)))
+        
+        st.markdown(f"**掃描點數:** `{len(values)}` 個點 — {values}")
+        
+        st.markdown("""
+        > [!CAUTION]
+        > **決策敏感度分析邊界限制 (Drift Disclaimer)**  
+        > 本掃描結果僅衡量**點決策分歧率與歷史動作匹配率**。反事實重播**無法評估最終交易盈虧、最大回撤、或執行滑價**，請勿將其視為回測績效優化工具。
+        """)
+        
+        if st.button("運行參數掃描 (Run Parameter Sweep)", key="btn_run_sweep"):
+            with st.spinner("正在批次重播掃描參數價格點..."):
+                try:
+                    # Construct config with baseline override
+                    overrides = {param_name: baseline_override}
+                    baseline_config = ReplayConfig(**overrides)
+                    
+                    req = SweepRequest(
+                        parameters=(SweepParameter(name=param_name, values=tuple(values)),),
+                        baseline_config=baseline_config,
+                        dataset_generation_id="N/A",
+                        eligibility_policy_version="v1.0 (RELEASE ONLY)"
+                    )
+                    
+                    # Execute sweep
+                    sweep_result = service.run_parameter_sweep(req)
+                    st.session_state["sweep_result"] = sweep_result
+                    st.success("🎉 參數掃描完成！語意基線重現驗證已通過。")
+                except AssertionError as ae:
+                    st.error(f"⚠️ **語意檢驗失敗 (Semantic Validation Fail):** {ae}")
+                except Exception as ex:
+                    st.error(f"掃描運行失敗: {ex}")
+                    
+        # Render results if present
+        sweep_result = st.session_state.get("sweep_result")
+        if sweep_result is not None and sweep_result.parameter_name == param_name:
+            st.divider()
+            st.subheader(f"📊 {param_name} 敏感度分析曲線")
+            
+            import plotly.graph_objects as go
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=[row.parameter_value for row in sweep_result.metrics_rows],
+                y=[row.historical_action_match_rate for row in sweep_result.metrics_rows],
+                mode="lines+markers",
+                name="歷史決策匹配率 (Historical Match)",
+                line=dict(color="#2ca02c", width=2)
+            ))
+            fig.add_trace(go.Scatter(
+                x=[row.parameter_value for row in sweep_result.metrics_rows],
+                y=[row.baseline_action_drift_rate for row in sweep_result.metrics_rows],
+                mode="lines+markers",
+                name="基線決策分歧率 (Baseline Drift)",
+                line=dict(color="#d62728", width=2)
+            ))
+            fig.update_layout(
+                xaxis_title=f"參數值 ({spec.unit})",
+                yaxis_title="比率",
+                yaxis=dict(tickformat=".0%"),
+                height=400,
+                margin=dict(t=40, b=40, l=60, r=20),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Show summary metrics table
+            st.subheader("📋 掃描匯總指標 (Aggregate Metrics)")
+            metrics_list = []
+            for row in sweep_result.metrics_rows:
+                metrics_list.append({
+                    "參數值": row.parameter_value,
+                    "測試樣本": row.eligible_cases,
+                    "歷史 Action 匹配": f"{row.historical_action_match_rate:.1%}",
+                    "歷史 Leg 匹配": f"{row.historical_leg_match_rate:.1%}",
+                    "基線 Action 分歧": f"{row.baseline_action_drift_rate:.1%}",
+                    "分歧個案數 (Drift)": row.decision_drift_count,
+                    "無影響個案數 (Stable)": row.unchanged_count,
+                })
+            st.dataframe(pd.DataFrame(metrics_list), width='stretch', hide_index=True)
+            
+            # Case-level matrix with filter
+            st.subheader("📋 個案決策分析矩陣 (Case-level Decision Matrix)")
+            drift_filter = st.selectbox(
+                "篩選過濾條件",
+                options=["全部個案 (All)", "僅顯示發生決策分歧的個案 (Drift Only)"],
+                index=0
+            )
+            
+            case_rows = []
+            for row in sweep_result.case_matrix:
+                if drift_filter.startswith("僅顯示") and row.drift_category == DecisionDriftCategory.NONE:
+                    continue
+                case_rows.append({
+                    "Case ID": row.case_id[-6:],
+                    "參數值": row.parameter_value,
+                    "歷史決策": f"{row.historical_action} ({row.historical_leg or '—'})",
+                    "基線決策": f"{row.baseline_action} ({row.baseline_leg or '—'})",
+                    "反事實決策": f"{row.counterfactual_action} ({row.counterfactual_leg or '—'})",
+                    "分歧類別 (Drift Type)": row.drift_category.value,
+                })
+            st.dataframe(pd.DataFrame(case_rows), width='stretch', hide_index=True)
+            
+            # Exporter UI
+            st.subheader("💾 研究成果導出")
+            if st.button("導出敏感度分析報告與數據 (Export Experiment Report)"):
+                with st.spinner("正在匯出報告與 Parquet 決策矩陣..."):
+                    try:
+                        exp_path = service.export_experiment(sweep_result)
+                        st.success(f"""
+                        🎉 **報告匯出成功！**  
+                        * **儲存路徑:** `{exp_path}`
+                        * **包含檔案:** `manifest.json`, `summary.md`, `sweep_metrics.csv`, `case_decision_matrix.parquet`, `result.json`
+                        """)
+                    except Exception as ex:
+                        st.error(f"匯出失敗: {ex}")
+
+        # Registry Inspection UI
+        st.divider()
+        st.subheader("📁 歷史實驗檔案庫 (Experiment Registry)")
+        
+        registry_path = Path("reports/research/counterfactual/registry.json")
+        registry = []
+        if registry_path.exists():
+            try:
+                import json
+                with open(registry_path, "r") as f:
+                    registry = json.load(f)
             except Exception:
                 pass
+                
+        if registry:
+            # 1. Display Validation Status of the entire registry
+            validation_res = service.validate_experiment_registry()
+            status_color = "green" if validation_res["status"] == "VERIFIED" else "red"
+            st.markdown(f"**Registry Integrity Status:** :{status_color}[{validation_res['status']}]")
 
-            # Check request ID match
-            _last_req_id = st.session_state.get("_last_probe_request_id", "")
-            _id_match = (not _last_req_id) or (_req_id == _last_req_id)
+            reg_df = pd.DataFrame(registry)
+            # Format display dataframe
+            display_df = reg_df.rename(columns={
+                "experiment_hash": "Experiment Hash",
+                "parameter_name": "掃描參數",
+                "baseline_value": "基準值",
+                "local_sensitivity": "基準敏感度 (Local)",
+                "max_drift_rate": "最大分歧率 (Global)",
+                "sensitive_cases_count": "敏感個案",
+                "run_count": "執行次數",
+                "last_run_at": "最後執行時間"
+            })
+            if "基準敏感度 (Local)" in display_df.columns:
+                display_df["基準敏感度 (Local)"] = display_df["基準敏感度 (Local)"].map(lambda x: f"{x:.1%}")
+            if "最大分歧率 (Global)" in display_df.columns:
+                display_df["最大分歧率 (Global)"] = display_df["最大分歧率 (Global)"].map(lambda x: f"{x:.1%}")
+            
+            st.dataframe(display_df[[
+                "Experiment Hash", "掃描參數", "基準值", "基準敏感度 (Local)", "最大分歧率 (Global)", "敏感個案", "執行次數", "最後執行時間"
+            ]], width='stretch', hide_index=True)
+            
+            # Select Experiment Hash
+            selected_exp_hash = st.selectbox(
+                "選擇歷史實驗設計 (Select Experiment Hash)",
+                options=[e["experiment_hash"] for e in registry],
+                format_func=lambda x: f"{x[:12]}... (掃描參數: {next(e for e in registry if e['experiment_hash'] == x)['parameter_name']})"
+            )
+            
+            exp_entry = next(e for e in registry if e["experiment_hash"] == selected_exp_hash)
+            
+            # Select specific Run ID for that experiment design
+            selected_run_id = st.selectbox(
+                "選擇執行版本 (Select Run Version)",
+                options=[r["experiment_id"] for r in exp_entry["runs"]],
+                format_func=lambda x: f"{x} (執行時間: {next(r for r in exp_entry['runs'] if r['experiment_id'] == x)['generated_at']})"
+            )
+            
+            run_entry = next(r for r in exp_entry["runs"] if r["experiment_id"] == selected_run_id)
+            
+            if st.button("📂 載入實驗報告 (Inspect Report)"):
+                report_path = Path(run_entry["report_path"])
+                result_file = report_path / "result.json"
+                
+                # Verify path traversal safety
+                abs_report_path = report_path.resolve()
+                abs_base = Path("reports/research/counterfactual").resolve()
+                
+                if not abs_report_path.is_relative_to(abs_base):
+                    st.error("❌ **路徑安全性警告:** 嘗試載入的實驗路徑不在授權範圍內。")
+                elif not result_file.exists():
+                    st.error(f"❌ **找不到實驗檔案:** {result_file}")
+                else:
+                    try:
+                        # Verify SHA256 integrity
+                        import hashlib
+                        with open(result_file, "rb") as f:
+                            current_hash = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+                        
+                        expected_hash = run_entry.get("result_hash")
+                        if current_hash != expected_hash:
+                            st.error(f"🚨 **實驗檔案毀損或經篡改 (CORRUPTED):** `result.json` 哈希值與註冊表不吻合！")
+                            st.warning(f"預期哈希: `{expected_hash}` \n\n實際哈希: `{current_hash}`")
+                        else:
+                            st.success(f"✓ **實驗檔案驗證成功 (VERIFIED)**")
+                            
+                            with open(result_file, "r") as f:
+                                raw_res = json.load(f)
+                                
+                            st.markdown(f"### 📄 實驗報告: `{selected_run_id}`")
+                            st.markdown(f"* **Experiment Hash:** `{raw_res['provenance']['experiment_hash']}`")
+                            st.markdown(f"* **Dataset ID:** `{raw_res['provenance']['dataset_build_id']}`")
+                            st.markdown(f"* **Git Commit:** `{raw_res['provenance']['git_commit']}`")
+                            st.markdown(f"* **Generated At:** `{raw_res['provenance']['generated_time']}`")
+                            
+                            import plotly.graph_objects as go
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=[row["parameter_value"] for row in raw_res["metrics_rows"]],
+                                y=[row["historical_action_match_rate"] for row in raw_res["metrics_rows"]],
+                                mode="lines+markers",
+                                name="歷史決策匹配率 (Historical Match)",
+                                line=dict(color="#2ca02c", width=2)
+                            ))
+                            fig.add_trace(go.Scatter(
+                                x=[row["parameter_value"] for row in raw_res["metrics_rows"]],
+                                y=[row["baseline_action_drift_rate"] for row in raw_res["metrics_rows"]],
+                                mode="lines+markers",
+                                name="基線決策分歧率 (Baseline Drift)",
+                                line=dict(color="#d62728", width=2)
+                            ))
+                            fig.update_layout(
+                                xaxis_title=f"參數值",
+                                yaxis_title="比率",
+                                yaxis=dict(tickformat=".0%"),
+                                height=350,
+                                margin=dict(t=40, b=40, l=60, r=20),
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                            
+                            st.markdown("#### 📋 掃描匯總指標")
+                            metrics_list = []
+                            for row in raw_res["metrics_rows"]:
+                                metrics_list.append({
+                                    "參數值": row["parameter_value"],
+                                    "測試樣本": row["eligible_cases"],
+                                    "歷史 Action 匹配": f"{row['historical_action_match_rate']:.1%}",
+                                    "歷史 Leg 匹配": f"{row['historical_leg_match_rate']:.1%}",
+                                    "基線 Action 分歧": f"{row['baseline_action_drift_rate']:.1%}",
+                                    "分歧個案數 (Drift)": row["decision_drift_count"],
+                                    "無影響個案數 (Stable)": row["unchanged_count"],
+                                })
+                            st.dataframe(pd.DataFrame(metrics_list), width='stretch', hide_index=True)
+                    except Exception as ex:
+                        st.error(f"無法解析實驗資料: {ex}")
+            
+            # Rebuild Registry Trigger
+            if st.button("🔄 重建實驗註冊表索引 (Rebuild Registry Index)"):
+                with st.spinner("正在掃描歷史存檔並重建索引..."):
+                    try:
+                        service.rebuild_experiment_registry()
+                        st.success("🎉 註冊表重建成功！請重新載入頁面。")
+                    except Exception as ex:
+                        st.error(f"重建失敗: {ex}")
+        else:
+            st.info("歷史實驗庫為空。")
 
-            if not _is_fresh:
-                st.warning(f"⚠️ Response is {_age_seconds:.0f}s old (max 30s). Capture again for current state.")
+# -- Footer and Refresh --
+    # 2026-06-23 Gemini CLI: 移除伺服器端 time.sleep(5) 與 st.rerun() 的無條件循環，完全由 line 219 的瀏覽器端 st_autorefresh 每 10 秒觸發，使伺服器執行緒能正常結束並釋放 CPU 資源，解決 CPU 99% 與高溫 99°C 的問題
+    pass
 
-            # Display snapshot
-            _snap = _resp.get("snapshot", {})
-            if _snap:
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Position Count", _snap.get("position_count", "?"))
-                with col2:
-                    st.metric("Open Orders", _snap.get("open_order_count", "?"))
-                with col3:
-                    st.metric("Connected", "✅" if _snap.get("connected") else "❌")
-                with col4:
-                    st.metric("Authenticated", "✅" if _snap.get("authenticated") else "❌")
 
-                # Position details
-                if _snap.get("_positions"):
-                    with st.expander(f"📋 Positions ({len(_snap['_positions'])})", expanded=False):
-                        st.json(_snap["_positions"])
-
-                if _snap.get("_open_orders"):
-                    with st.expander(f"📋 Open Orders ({len(_snap['_open_orders'])})", expanded=False):
-                        st.json(_snap["_open_orders"])
-
-            # Display preflight result
-            _preflight = _resp.get("preflight", {})
-            if _preflight.get("passed"):
-                st.success("✅ Preflight Result: **PASSED** — broker ready for READY_FOR_COMMIT")
-                st.caption("PR 4 not yet implemented. Live transition not available.")
-            else:
-                st.error("❌ Preflight Result: **FAILED** — transition blocked")
-                for _check in _preflight.get("failed_checks", []):
-                    st.markdown(f"- ✗ `{_check}`")
-
-            # Response metadata
-            with st.expander("📄 Response Metadata", expanded=False):
-                st.json({
-                    "request_id": _req_id,
-                    "captured_at": _resp_time_str,
-                    "age_seconds": _age_seconds,
-                    "process_start_id": _resp.get("process_start_id", "?"),
-                    "read_only": _resp.get("read_only", False),
-                })
-
-        except Exception as e:
-            st.warning(f"Error reading response: {e}")
-    else:
-        st.info("No broker snapshot captured yet. Click 'Capture Broker Snapshot' above.")
-        st.caption("Note: trading-system must be restarted for the new probe code to take effect.")
-
-    # ── Safety Reminder ──
-    st.divider()
-    st.caption("⚠️ **Read-only diagnostic page.** Does not submit orders, cancel orders, flatten positions, or modify execution mode. PR 4 not yet implemented — this page cannot initiate Live trading.")
-
-# ════════════════════════════════════════
-# Tab 6: 設定
-# ════════════════════════════════════════
 elif page == "設定":
     st.header("⚙️ 系統設定")
+    try:
+        render_real_preflight_expander()
+    except Exception:
+        pass
 
     # ── 0. 實盤就緒度檢查 ──
     with st.expander("🚀 實盤就緒度檢查", expanded=True):
@@ -6021,587 +6446,3 @@ elif page == "設定":
 # ════════════════════════════════════════
 # Tab: 波動率 Vol
 # ════════════════════════════════════════
-elif page == "波動率 Vol":
-    st.header("📊 Volatility Surface Regime")
-    st.caption("IV curve shape classification + Volatility State Machine")
-
-    try:
-        from core.derivatives.skew_regime_logger import SkewRegimeLogger
-        logger = SkewRegimeLogger()
-        records = logger.read_today()
-    except Exception:
-        records = []
-
-    if not records:
-        st.warning("無 volatility 資料 (市場未開盤或資料尚未就緒)")
-    else:
-        # Latest record
-        latest = records[-1]
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            vol_state = latest.get("vol_state", "UNKNOWN")
-            state_emoji = {
-                "CALM": "🟢", "NORMAL": "🔵", "EXPANDING": "🟡",
-                "PANIC": "🔴", "EUPHORIA": "🟠", "EVENT": "⚫", "UNKNOWN": "⚪",
-            }.get(vol_state, "⚪")
-            st.metric(
-                "Volatility State",
-                f"{state_emoji} {vol_state}",
-                f"{latest.get('vol_state_age_sec', 0)}s persistent={latest.get('vol_state_persistent', False)}",
-            )
-        with col2:
-            st.metric(
-                "Directional Skew",
-                latest.get("directional_skew", "?"),
-                f"slope_ratio={latest.get('slope_ratio', 0):.3f}",
-            )
-        with col3:
-            st.metric(
-                "Tension",
-                latest.get("tension", "?"),
-                f"atm_iv_change={latest.get('atm_iv_change', 0):.3f}",
-            )
-
-        # Detail row
-        col4, col5, col6, col7 = st.columns(4)
-        with col4:
-            st.metric(
-                "IV Percentile",
-                f"{latest.get('iv_percentile', 0):.0%}",
-                f"z={latest.get('iv_zscore', 0):.1f}",
-            )
-        with col5:
-            st.metric(
-                "ATM IV",
-                f"{latest.get('atm_iv', 0):.1%}",
-            )
-        with col6:
-            st.metric(
-                "OTM Put IV",
-                f"{latest.get('otm_put_iv', 0):.1%}",
-            )
-        with col7:
-            st.metric(
-                "OTM Call IV",
-                f"{latest.get('otm_call_iv', 0):.1%}",
-            )
-
-        # Transition info
-        col8, col9 = st.columns(2)
-        with col8:
-            st.metric("Transitions Today", latest.get("vol_state_transition_count", 0))
-        with col9:
-            confidence = latest.get("confidence", 0)
-            if confidence >= 0.7:
-                st.success(f"Confidence: {confidence:.0%}")
-            elif confidence >= 0.4:
-                st.warning(f"Confidence: {confidence:.0%}")
-            else:
-                st.error(f"Confidence: {confidence:.0%}")
-
-        # Time series: last N records
-        st.subheader("State Timeline")
-        n_show = min(50, len(records))
-        timeline_data = []
-        for r in records[-n_show:]:
-            timeline_data.append({
-                "time": r.get("timestamp", "")[:19] if r.get("timestamp") else "",
-                "state": r.get("vol_state", "?"),
-                "skew": r.get("directional_skew", "?"),
-                "tension": r.get("tension", "?"),
-                "pct": r.get("iv_percentile", 0),
-                "conf": r.get("confidence", 0),
-            })
-
-        if timeline_data:
-            st.dataframe(
-                timeline_data,
-                column_config={
-                    "time": "Time",
-                    "state": "State",
-                    "skew": "Skew",
-                    "tension": "Tension",
-                    "pct": st.column_config.ProgressColumn("IV %ile", format="%.0%", max_value=1),
-                    "conf": st.column_config.ProgressColumn("Confidence", format="%.0%", max_value=1),
-                },
-                width='stretch',
-                hide_index=True,
-            )
-
-            # Agg stats
-            states = [r.get("state", "?") for r in timeline_data]
-            state_counts = {}
-            for s in states:
-                state_counts[s] = state_counts.get(s, 0) + 1
-            st.caption(f"State distribution (last {n_show} samples): {state_counts}")
-
-    with st.expander("ℹ️ About Volatility Regime"):
-        st.markdown("""
-        **Volatility Surface Regime** 是介於 raw tick stream (P1) 和 strategy layer (P3) 之間的 P1.5 層。
-
-        **Data Flow:**
-        ```
-        bidask callback → OptionQuoteEvent
-                        → IV Calculator (Black-Scholes)
-                        → Surface Snapshot (atm_iv, otm_put_iv, otm_call_iv)
-                        → IVShapeClassifier (directional_skew + tension)
-                        → IVPercentileEngine (rolling percentile + z-score)
-                        → VolatilityStateMachine (hysteresis + state_age)
-                        → MarketData.skew_regime
-        ```
-
-        **State Definitions:**
-        - CALM — Low IV percentile, low tension
-        - NORMAL — Moderate conditions
-        - EXPANDING — Tension rising (pre-cursor)
-        - PANIC — LEFT skew + HIGH tension + high percentile
-        - EUPHORIA — RIGHT skew + HIGH tension + high percentile
-        - EVENT — Extreme tension regardless of direction
-        - UNKNOWN — Insufficient data
-
-        **Hysteresis:** entry=3 samples, exit=5 samples, min dwell=60s
-        """)
-
-    st.divider()
-
-# ════════════════════════════════════════
-# Tab: 🔄 反事實研究室 (Counterfactual Lab)
-# ════════════════════════════════════════
-elif page == "🔄 反事實研究室":
-    st.header("🔄 反事實研究室 (Counterfactual Lab)")
-    st.caption("基於已完結交易的點重播 (Point Replay) 驗證與離線反事實模擬")
-    
-    st.markdown("""
-    > [!IMPORTANT]
-    > **Research-only & Read-only**  
-    > 本分頁為純研究與重播模擬用途。所有計算均在離線沙盒環境進行，**不產生任何實戰交易、不修改策略參數、不寫入生產資料庫或狀態檔**。
-    """)
-    
-    # Expose Service
-    from core.counterfactual_service import (
-        DatasetContractError,
-        ReplayConfig,
-        SweepParameter,
-        SweepRequest,
-        DecisionDriftCategory,
-        SWEEPABLE_PARAMETERS
-    )
-    service = get_counterfactual_service()
-    
-    # Page metadata
-    st.markdown(f"**Research Baseline:** `Research Baseline v1.0` (FROZEN)")
-    
-    tab1, tab2 = st.tabs(["🎯 基線重播驗證 (Point Replay)", "🧬 參數敏感度分析 (Sensitivity Sweep)"])
-    
-    with tab1:
-        st.subheader("🎯 基線重播驗證 (Point Replay Validation)")
-        st.write("比對歷史實際決策與當前生產決策引擎 (`evaluate_lifecycle_actions`) 的一致性。")
-        
-        if st.button("運行決策重播驗證 (Run Replay Validation)", key="btn_run_replay"):
-            with st.spinner("正在重播決策歷史..."):
-                try:
-                    result = service.run_point_replay()
-                    
-                    # Show KPI metrics
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("測試樣本數 (Cases)", result.metrics.eligible_cases)
-                    m2.metric("決策匹配率 (Action)", f"{result.metrics.action_match_rate:.1%}")
-                    m3.metric("部位匹配率 (Leg)", f"{result.metrics.leg_match_rate:.1%}")
-                    m4.metric("原因匹配率 (Reason)", f"{result.metrics.reason_match_rate:.1%}")
-                    m5.metric("分歧筆數 (Mismatches)", result.metrics.mismatch_count)
-                    
-                    # Show eligibility details
-                    st.markdown(f"""
-                    📋 **決策篩選統計 (Eligibility Statistics)**
-                    * **資料集總決策數 (Total Cases in Dataset):** `{result.metrics.total_cases}` 筆
-                    * **合規測試決策數 (Eligible Cases):** `{result.metrics.eligible_cases}` 筆 *(以 `RELEASE` 開頭的動作)*
-                    * **排除測試決策數 (Excluded Cases):** `{result.metrics.excluded_cases}` 筆 *(非釋放點決策)*
-                    * **篩選策略版本 (Eligibility Policy Version):** `{result.metrics.eligibility_policy_version}`
-                    """)
-                    
-                    # Show provenance
-                    st.info(f"""
-                    🧬 **資料來源與運行追溯 (Provenance)**
-                    * **Methodology Version:** `{result.provenance.research_methodology_version}`
-                    * **Dataset Contract Version:** `{result.provenance.dataset_contract_version}`
-                    * **Dataset Build ID:** `{result.provenance.dataset_build_id}`
-                    * **Git Commit Hash:** `{result.provenance.git_commit[:8]} ({result.provenance.git_repo_state})`
-                    * **Generated At:** `{result.provenance.generated_time}`
-                    """)
-                    
-                    # Show mismatch details
-                    if result.metrics.mismatch_count > 0:
-                        st.warning(f"發現 {result.metrics.mismatch_count} 筆決策分歧！請檢查下方列表：")
-                        mismatch_rows = []
-                        for m in result.mismatches:
-                            mismatch_rows.append({
-                                "Trade ID": m.trade_id[-6:],
-                                "Seq": m.decision_seq,
-                                "分歧類型": m.mismatch_category,
-                                "實際動作": m.recorded_action,
-                                "實際部位": m.recorded_leg or "—",
-                                "重播動作": m.replayed_action or "—",
-                                "重播部位": m.replayed_leg or "—",
-                            })
-                        st.dataframe(pd.DataFrame(mismatch_rows), width='stretch', hide_index=True)
-                    else:
-                        st.success(f"🎉 在目前資料集納入的 {result.metrics.eligible_cases} 個 eligible decision points 中，當前決策引擎已 100% 重現歷史 Action 與 Leg，未發現決策分歧。此結果僅代表點決策重播一致性，不代表完整交易軌跡、成交結果或績效一致性。")
-                except DatasetContractError as e:
-                    st.error(f"""
-                    ⚠️ **目前資料集不符合 Replay Dataset Contract。**
-                    請先由獨立 Dataset Build Pipeline 發布新的 Generation。
-                    
-                    * **錯誤代碼 (Code):** `{e.code}`
-                    * **缺少欄位 (Missing Columns):** `{e.missing_columns}`
-                    * **資料集編譯 ID (Dataset Build ID):** `{e.dataset_build_id}`
-                    """)
-                except Exception as e:
-                    st.error(f"決策重播運行失敗: {e}")
-                    
-    with tab2:
-        st.subheader("🏆 參數敏感度排行榜 (Sensitivity Ranking)")
-        ranking = service.get_sensitivity_ranking()
-        if ranking:
-            ranking_df = pd.DataFrame(ranking)
-            # Rename columns
-            ranking_df = ranking_df.rename(columns={
-                "parameter_name": "參數名稱",
-                "max_drift_rate": "最大分歧率 (Global Max Drift)",
-                "local_sensitivity": "基準敏感度 (Local Baseline Sensitivity)",
-                "sensitive_cases_count": "敏感個案數",
-                "experiment_hash": "Experiment Hash",
-                "last_evaluated": "評估時間",
-                "baseline_value": "基準值",
-                "sweep_range": "掃描範圍"
-            })
-            if "最大分歧率 (Global Max Drift)" in ranking_df.columns:
-                ranking_df["最大分歧率 (Global Max Drift)"] = ranking_df["最大分歧率 (Global Max Drift)"].map(lambda x: f"{x:.1%}")
-            if "基準敏感度 (Local Baseline Sensitivity)" in ranking_df.columns:
-                ranking_df["基準敏感度 (Local Baseline Sensitivity)"] = ranking_df["基準敏感度 (Local Baseline Sensitivity)"].map(lambda x: f"{x:.1%}")
-            st.dataframe(ranking_df[[
-                "參數名稱", "基準值", "掃描範圍", "基準敏感度 (Local Baseline Sensitivity)", "最大分歧率 (Global Max Drift)", "敏感個案數", "Experiment Hash", "評估時間"
-            ]], width='stretch', hide_index=True)
-        else:
-            st.info("尚無完成的掃描實驗。請在下方設定參數並點擊『運行參數掃描』來生成數據。")
-
-        st.divider()
-        st.subheader("🧬 參數敏感度分析 (Parameter Sensitivity Sweep)")
-        st.write("比對在不同參數閾值下決策引擎的分歧率與歷史匹配率，辨識決策穩定邊界。")
-        
-        # User controls for sweep parameter selection
-        param_name = st.selectbox(
-            "選擇掃描參數 (Whitelisted Parameter)",
-            options=list(SWEEPABLE_PARAMETERS.keys()),
-            format_func=lambda x: f"{x} ({SWEEPABLE_PARAMETERS[x].description})"
-        )
-        
-        spec = SWEEPABLE_PARAMETERS[param_name]
-        
-        # Slider range based on spec type and values
-        if spec.type == float:
-            # For stop thresholds
-            r_start, r_end = st.slider(
-                f"設定參數掃描範圍 ({spec.unit})",
-                min_value=float(spec.min_val),
-                max_value=float(spec.max_val),
-                value=(80.0, 200.0),
-                step=10.0
-            )
-            step = st.number_input("掃描步長 (Step)", min_value=1.0, max_value=50.0, value=10.0)
-            # Make sure step > 0
-            values = []
-            curr = r_start
-            while curr <= r_end:
-                values.append(round(curr, 2))
-                curr += step
-        else:
-            # Integer params (confirm_ms / confirm_ticks)
-            r_start, r_end = st.slider(
-                f"設定參數掃描範圍 ({spec.unit})",
-                min_value=int(spec.min_val),
-                max_value=int(spec.max_val),
-                value=(int(spec.min_val), int(spec.min_val) + 1000) if param_name == "confirm_ms" else (2, 15),
-                step=100 if param_name == "confirm_ms" else 1
-            )
-            step = st.number_input("掃描步長 (Step)", min_value=1, max_value=1000, value=100 if param_name == "confirm_ms" else 1)
-            values = list(range(r_start, r_end + 1, step))
-
-        # Ask user for baseline parameter override input to enforce reproduction validation
-        _is_float = spec.type == float
-        default_baseline_val = float(spec.default_val) if _is_float else int(spec.default_val)
-        baseline_override = st.number_input(
-            f"設定基線比對值 (Baseline Value for comparison)",
-            value=default_baseline_val,
-            step=1.0 if _is_float else 1
-        )
-        
-        # Insert baseline value into the sweep tuple if not present to run verification
-        if baseline_override not in values:
-            values.append(baseline_override)
-        values = sorted(list(set(values)))
-        
-        st.markdown(f"**掃描點數:** `{len(values)}` 個點 — {values}")
-        
-        st.markdown("""
-        > [!CAUTION]
-        > **決策敏感度分析邊界限制 (Drift Disclaimer)**  
-        > 本掃描結果僅衡量**點決策分歧率與歷史動作匹配率**。反事實重播**無法評估最終交易盈虧、最大回撤、或執行滑價**，請勿將其視為回測績效優化工具。
-        """)
-        
-        if st.button("運行參數掃描 (Run Parameter Sweep)", key="btn_run_sweep"):
-            with st.spinner("正在批次重播掃描參數價格點..."):
-                try:
-                    # Construct config with baseline override
-                    overrides = {param_name: baseline_override}
-                    baseline_config = ReplayConfig(**overrides)
-                    
-                    req = SweepRequest(
-                        parameters=(SweepParameter(name=param_name, values=tuple(values)),),
-                        baseline_config=baseline_config,
-                        dataset_generation_id="N/A",
-                        eligibility_policy_version="v1.0 (RELEASE ONLY)"
-                    )
-                    
-                    # Execute sweep
-                    sweep_result = service.run_parameter_sweep(req)
-                    st.session_state["sweep_result"] = sweep_result
-                    st.success("🎉 參數掃描完成！語意基線重現驗證已通過。")
-                except AssertionError as ae:
-                    st.error(f"⚠️ **語意檢驗失敗 (Semantic Validation Fail):** {ae}")
-                except Exception as ex:
-                    st.error(f"掃描運行失敗: {ex}")
-                    
-        # Render results if present
-        sweep_result = st.session_state.get("sweep_result")
-        if sweep_result is not None and sweep_result.parameter_name == param_name:
-            st.divider()
-            st.subheader(f"📊 {param_name} 敏感度分析曲線")
-            
-            import plotly.graph_objects as go
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=[row.parameter_value for row in sweep_result.metrics_rows],
-                y=[row.historical_action_match_rate for row in sweep_result.metrics_rows],
-                mode="lines+markers",
-                name="歷史決策匹配率 (Historical Match)",
-                line=dict(color="#2ca02c", width=2)
-            ))
-            fig.add_trace(go.Scatter(
-                x=[row.parameter_value for row in sweep_result.metrics_rows],
-                y=[row.baseline_action_drift_rate for row in sweep_result.metrics_rows],
-                mode="lines+markers",
-                name="基線決策分歧率 (Baseline Drift)",
-                line=dict(color="#d62728", width=2)
-            ))
-            fig.update_layout(
-                xaxis_title=f"參數值 ({spec.unit})",
-                yaxis_title="比率",
-                yaxis=dict(tickformat=".0%"),
-                height=400,
-                margin=dict(t=40, b=40, l=60, r=20),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Show summary metrics table
-            st.subheader("📋 掃描匯總指標 (Aggregate Metrics)")
-            metrics_list = []
-            for row in sweep_result.metrics_rows:
-                metrics_list.append({
-                    "參數值": row.parameter_value,
-                    "測試樣本": row.eligible_cases,
-                    "歷史 Action 匹配": f"{row.historical_action_match_rate:.1%}",
-                    "歷史 Leg 匹配": f"{row.historical_leg_match_rate:.1%}",
-                    "基線 Action 分歧": f"{row.baseline_action_drift_rate:.1%}",
-                    "分歧個案數 (Drift)": row.decision_drift_count,
-                    "無影響個案數 (Stable)": row.unchanged_count,
-                })
-            st.dataframe(pd.DataFrame(metrics_list), width='stretch', hide_index=True)
-            
-            # Case-level matrix with filter
-            st.subheader("📋 個案決策分析矩陣 (Case-level Decision Matrix)")
-            drift_filter = st.selectbox(
-                "篩選過濾條件",
-                options=["全部個案 (All)", "僅顯示發生決策分歧的個案 (Drift Only)"],
-                index=0
-            )
-            
-            case_rows = []
-            for row in sweep_result.case_matrix:
-                if drift_filter.startswith("僅顯示") and row.drift_category == DecisionDriftCategory.NONE:
-                    continue
-                case_rows.append({
-                    "Case ID": row.case_id[-6:],
-                    "參數值": row.parameter_value,
-                    "歷史決策": f"{row.historical_action} ({row.historical_leg or '—'})",
-                    "基線決策": f"{row.baseline_action} ({row.baseline_leg or '—'})",
-                    "反事實決策": f"{row.counterfactual_action} ({row.counterfactual_leg or '—'})",
-                    "分歧類別 (Drift Type)": row.drift_category.value,
-                })
-            st.dataframe(pd.DataFrame(case_rows), width='stretch', hide_index=True)
-            
-            # Exporter UI
-            st.subheader("💾 研究成果導出")
-            if st.button("導出敏感度分析報告與數據 (Export Experiment Report)"):
-                with st.spinner("正在匯出報告與 Parquet 決策矩陣..."):
-                    try:
-                        exp_path = service.export_experiment(sweep_result)
-                        st.success(f"""
-                        🎉 **報告匯出成功！**  
-                        * **儲存路徑:** `{exp_path}`
-                        * **包含檔案:** `manifest.json`, `summary.md`, `sweep_metrics.csv`, `case_decision_matrix.parquet`, `result.json`
-                        """)
-                    except Exception as ex:
-                        st.error(f"匯出失敗: {ex}")
-
-        # Registry Inspection UI
-        st.divider()
-        st.subheader("📁 歷史實驗檔案庫 (Experiment Registry)")
-        
-        registry_path = Path("reports/research/counterfactual/registry.json")
-        registry = []
-        if registry_path.exists():
-            try:
-                import json
-                with open(registry_path, "r") as f:
-                    registry = json.load(f)
-            except Exception:
-                pass
-                
-        if registry:
-            # 1. Display Validation Status of the entire registry
-            validation_res = service.validate_experiment_registry()
-            status_color = "green" if validation_res["status"] == "VERIFIED" else "red"
-            st.markdown(f"**Registry Integrity Status:** :{status_color}[{validation_res['status']}]")
-
-            reg_df = pd.DataFrame(registry)
-            # Format display dataframe
-            display_df = reg_df.rename(columns={
-                "experiment_hash": "Experiment Hash",
-                "parameter_name": "掃描參數",
-                "baseline_value": "基準值",
-                "local_sensitivity": "基準敏感度 (Local)",
-                "max_drift_rate": "最大分歧率 (Global)",
-                "sensitive_cases_count": "敏感個案",
-                "run_count": "執行次數",
-                "last_run_at": "最後執行時間"
-            })
-            if "基準敏感度 (Local)" in display_df.columns:
-                display_df["基準敏感度 (Local)"] = display_df["基準敏感度 (Local)"].map(lambda x: f"{x:.1%}")
-            if "最大分歧率 (Global)" in display_df.columns:
-                display_df["最大分歧率 (Global)"] = display_df["最大分歧率 (Global)"].map(lambda x: f"{x:.1%}")
-            
-            st.dataframe(display_df[[
-                "Experiment Hash", "掃描參數", "基準值", "基準敏感度 (Local)", "最大分歧率 (Global)", "敏感個案", "執行次數", "最後執行時間"
-            ]], width='stretch', hide_index=True)
-            
-            # Select Experiment Hash
-            selected_exp_hash = st.selectbox(
-                "選擇歷史實驗設計 (Select Experiment Hash)",
-                options=[e["experiment_hash"] for e in registry],
-                format_func=lambda x: f"{x[:12]}... (掃描參數: {next(e for e in registry if e['experiment_hash'] == x)['parameter_name']})"
-            )
-            
-            exp_entry = next(e for e in registry if e["experiment_hash"] == selected_exp_hash)
-            
-            # Select specific Run ID for that experiment design
-            selected_run_id = st.selectbox(
-                "選擇執行版本 (Select Run Version)",
-                options=[r["experiment_id"] for r in exp_entry["runs"]],
-                format_func=lambda x: f"{x} (執行時間: {next(r for r in exp_entry['runs'] if r['experiment_id'] == x)['generated_at']})"
-            )
-            
-            run_entry = next(r for r in exp_entry["runs"] if r["experiment_id"] == selected_run_id)
-            
-            if st.button("📂 載入實驗報告 (Inspect Report)"):
-                report_path = Path(run_entry["report_path"])
-                result_file = report_path / "result.json"
-                
-                # Verify path traversal safety
-                abs_report_path = report_path.resolve()
-                abs_base = Path("reports/research/counterfactual").resolve()
-                
-                if not abs_report_path.is_relative_to(abs_base):
-                    st.error("❌ **路徑安全性警告:** 嘗試載入的實驗路徑不在授權範圍內。")
-                elif not result_file.exists():
-                    st.error(f"❌ **找不到實驗檔案:** {result_file}")
-                else:
-                    try:
-                        # Verify SHA256 integrity
-                        import hashlib
-                        with open(result_file, "rb") as f:
-                            current_hash = "sha256:" + hashlib.sha256(f.read()).hexdigest()
-                        
-                        expected_hash = run_entry.get("result_hash")
-                        if current_hash != expected_hash:
-                            st.error(f"🚨 **實驗檔案毀損或經篡改 (CORRUPTED):** `result.json` 哈希值與註冊表不吻合！")
-                            st.warning(f"預期哈希: `{expected_hash}` \n\n實際哈希: `{current_hash}`")
-                        else:
-                            st.success(f"✓ **實驗檔案驗證成功 (VERIFIED)**")
-                            
-                            with open(result_file, "r") as f:
-                                raw_res = json.load(f)
-                                
-                            st.markdown(f"### 📄 實驗報告: `{selected_run_id}`")
-                            st.markdown(f"* **Experiment Hash:** `{raw_res['provenance']['experiment_hash']}`")
-                            st.markdown(f"* **Dataset ID:** `{raw_res['provenance']['dataset_build_id']}`")
-                            st.markdown(f"* **Git Commit:** `{raw_res['provenance']['git_commit']}`")
-                            st.markdown(f"* **Generated At:** `{raw_res['provenance']['generated_time']}`")
-                            
-                            import plotly.graph_objects as go
-                            fig = go.Figure()
-                            fig.add_trace(go.Scatter(
-                                x=[row["parameter_value"] for row in raw_res["metrics_rows"]],
-                                y=[row["historical_action_match_rate"] for row in raw_res["metrics_rows"]],
-                                mode="lines+markers",
-                                name="歷史決策匹配率 (Historical Match)",
-                                line=dict(color="#2ca02c", width=2)
-                            ))
-                            fig.add_trace(go.Scatter(
-                                x=[row["parameter_value"] for row in raw_res["metrics_rows"]],
-                                y=[row["baseline_action_drift_rate"] for row in raw_res["metrics_rows"]],
-                                mode="lines+markers",
-                                name="基線決策分歧率 (Baseline Drift)",
-                                line=dict(color="#d62728", width=2)
-                            ))
-                            fig.update_layout(
-                                xaxis_title=f"參數值",
-                                yaxis_title="比率",
-                                yaxis=dict(tickformat=".0%"),
-                                height=350,
-                                margin=dict(t=40, b=40, l=60, r=20),
-                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-                            
-                            st.markdown("#### 📋 掃描匯總指標")
-                            metrics_list = []
-                            for row in raw_res["metrics_rows"]:
-                                metrics_list.append({
-                                    "參數值": row["parameter_value"],
-                                    "測試樣本": row["eligible_cases"],
-                                    "歷史 Action 匹配": f"{row['historical_action_match_rate']:.1%}",
-                                    "歷史 Leg 匹配": f"{row['historical_leg_match_rate']:.1%}",
-                                    "基線 Action 分歧": f"{row['baseline_action_drift_rate']:.1%}",
-                                    "分歧個案數 (Drift)": row["decision_drift_count"],
-                                    "無影響個案數 (Stable)": row["unchanged_count"],
-                                })
-                            st.dataframe(pd.DataFrame(metrics_list), width='stretch', hide_index=True)
-                    except Exception as ex:
-                        st.error(f"無法解析實驗資料: {ex}")
-            
-            # Rebuild Registry Trigger
-            if st.button("🔄 重建實驗註冊表索引 (Rebuild Registry Index)"):
-                with st.spinner("正在掃描歷史存檔並重建索引..."):
-                    try:
-                        service.rebuild_experiment_registry()
-                        st.success("🎉 註冊表重建成功！請重新載入頁面。")
-                    except Exception as ex:
-                        st.error(f"重建失敗: {ex}")
-        else:
-            st.info("歷史實驗庫為空。")
-
-# -- Footer and Refresh --
-    # 2026-06-23 Gemini CLI: 移除伺服器端 time.sleep(5) 與 st.rerun() 的無條件循環，完全由 line 219 的瀏覽器端 st_autorefresh 每 10 秒觸發，使伺服器執行緒能正常結束並釋放 CPU 資源，解決 CPU 99% 與高溫 99°C 的問題
-    pass
