@@ -101,8 +101,12 @@ def test_risk_meta_trail_matches_runtime(
 
 
 def test_no_atr_falls_back_to_fixed():
-    """When ATR is None/0/NaN, both runtime and risk_meta use fixed fallback."""
+    """When ATR is None/0/NaN and NO last-stable ATR, both runtime and risk_meta
+    use the configured fixed fallback. (ATR NaN with a cached _last_atr carries
+    the last stable value over — that is by design, 2026-06-26.)
+    """
     strategy = _make_strategy(trail_fixed=60.0, stop_fixed=88.0)
+    strategy._last_atr = 0.0  # no cached ATR -> pure fixed fallback
 
     for bad_atr in [None, 0, float("nan")]:
         import math

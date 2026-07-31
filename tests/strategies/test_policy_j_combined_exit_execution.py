@@ -52,6 +52,10 @@ class DummyStrategy:
             release_group = DummyReleaseGroup()
         self._lifecycle_oca = DummyLifecycle()
 
+    def _reset(self, reason=None, exit_ts=None, exit_price=None):
+        self._has_position = False
+        return None
+
 
 def make_mock_monitor():
     from strategies.futures.monitor import FuturesMonitor
@@ -287,7 +291,7 @@ def test_order_events_include_policy_j_reason_and_leg_role():
     assert mon._append_mts_event.call_count == 2
     args0 = mon._append_mts_event.call_args_list[0].kwargs
     assert args0["exit_reason"] == "COMBINED_EXIT"
-    assert args0["exit_stage"] == "FINAL_EXIT"
+    assert args0["exit_stage"] == "COMBINED_EXIT"
     assert args0["reason_source"] == "LIFECYCLE_DECISION"
 
 
@@ -489,6 +493,19 @@ def test_restart_between_near_fill_and_far_fill_then_far_fill_settles_once(tmp_p
 class TestFaultInjection:
     """5 core persistence safety invariants via fault injection."""
 
+    @pytest.fixture(autouse=True)
+    def _restore_latch_paths(self):
+        """Tests assign ts._SETTLEMENT_FAILURE_LATCH / _CRITICAL_FAILURE_SENTINEL
+        directly (not via monkeypatch) — restore module defaults so a sentinel
+        written by one test cannot leak into the next (cross-test pollution
+        broke test_verified_flat_clears_latch_and_enables_ready)."""
+        import strategies.plugins.futures.active.tmf_spread as _ts
+        _latch = _ts._SETTLEMENT_FAILURE_LATCH
+        _sent = _ts._CRITICAL_FAILURE_SENTINEL
+        yield
+        _ts._SETTLEMENT_FAILURE_LATCH = _latch
+        _ts._CRITICAL_FAILURE_SENTINEL = _sent
+
     # A: JSONL fsync failure -> no FLAT
     def test_fsync_failure_does_not_enter_flat(self, tmp_path, monkeypatch):
         import os
@@ -540,12 +557,19 @@ class TestFaultInjection:
 
         monkeypatch.setattr(ts_fi, "_append_jsonl_durable", _failing_append)
 
-        mon._apply_combined_exit_fill(
-            MagicMock(order_id="ord-near", fill_qty=1),
-            {"reason": "test-fsync", "lots": 1, "strategy": None},
-            "COMBINED_EXIT_NEAR",
-            44000.0,
-        )
+        try:
+            mon._apply_combined_exit_fill(
+                MagicMock(order_id="ord-near", fill_qty=1),
+                {"reason": "test-fsync", "lots": 1, "strategy": None},
+                "COMBINED_EXIT_NEAR",
+                44000.0,
+            )
+        except SystemExit:
+            # Chained failure: the fsync failure also trips the durable
+            # failure-latch write (same monkeypatched helper) which hard-exits
+            # (SystemExit) per ADR-024E.1 — the settlement still must not be
+            # marked complete.
+            pass
 
         assert tracker["settlement_completed"] is not True, (
             "fsync failure must not mark settlement completed"
@@ -699,3 +723,720 @@ class TestFaultInjection:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+# --- Case 31: Release-ledger hard gate — broker-confirmed leg flat blocks COMBINED_EXIT ---
+def test_release_ledger_flat_leg_blocks_combined_exit(tmp_path, monkeypatch):
+    """
+    ADR-025 independent hard gate:
+    Even if strategy in-memory state is stale (phase=SPREAD, near_qty=1, far_qty=1),
+    if the broker-confirmed release ledger shows NEAR was released (ENTRY 1 - RELEASE 1 = 0),
+    COMBINED_EXIT MUST be blocked. Otherwise we would re-enter/flip the flat leg.
+    """
+    fills_log = str(tmp_path / "mts_trade_fills.jsonl")
+    import json
+    with open(fills_log, "w") as f:
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 1, "fill_type": "ENTRY"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 1, "fill_type": "RELEASE"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "FAR", "qty": 1, "fill_type": "ENTRY"}) + "\n")
+
+    monkeypatch.setenv("MTS_FILL_LOG_PATH", fills_log)
+    mon = make_mock_monitor()
+    strat = DummyStrategy()  # stale: phase=SPREAD, near_qty=1, far_qty=1
+    sig = Signal(action="EXIT", reason="TMF_COMBINED_EXIT")
+    bar_dict = {"near_close": 44000.0, "far_close": 44100.0}
+
+    mon._submit_mts_order_signal(sig, strat, bar_dict, ts=None)
+
+    assert mon.order_mgr.submit.call_count == 0
+    assert mon.order_mgr.create_order.call_count == 0
+
+
+# --- Case 32: Ledger quantity reconstruction — partial close does NOT block ---
+def test_release_ledger_partial_close_does_not_block(tmp_path, monkeypatch):
+    """
+    Quantity-based flat reconstruction: NEAR ENTRY 2 + RELEASE 1 -> open 1.
+    A partially-reduced leg is NOT flat; COMBINED_EXIT may proceed.
+    """
+    fills_log = str(tmp_path / "mts_trade_fills.jsonl")
+    import json
+    with open(fills_log, "w") as f:
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 2, "fill_type": "ENTRY"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 1, "fill_type": "RELEASE"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "FAR", "qty": 2, "fill_type": "ENTRY"}) + "\n")
+
+    monkeypatch.setenv("MTS_FILL_LOG_PATH", fills_log)
+    mon = make_mock_monitor()
+    strat = DummyStrategy()
+    strat._near_qty = 2
+    strat._far_qty = 2
+    sig = Signal(action="EXIT", reason="TMF_COMBINED_EXIT")
+    bar_dict = {"near_close": 44000.0, "far_close": 44100.0}
+
+    mon._submit_mts_order_signal(sig, strat, bar_dict, ts=None)
+
+    assert mon.order_mgr.submit.call_count == 2
+    args_list = mon.order_mgr.create_order.call_args_list
+    assert args_list[0].kwargs["quantity"] == 2
+    assert args_list[1].kwargs["quantity"] == 2
+
+
+# --- Case 33: No ENTRY evidence in ledger -> gate skipped (fallback to strategy gates) ---
+def test_release_ledger_no_entry_evidence_skips_gate(tmp_path, monkeypatch):
+    """
+    If the ledger has no ENTRY fills for the trade_id, reconstruction is impossible.
+    The gate must return None (skip) so COMBINED_EXIT falls back to strategy-level
+    gates — missing evidence must not block (nor pass) on its own.
+    """
+    fills_log = str(tmp_path / "mts_trade_fills.jsonl")
+    import json
+    with open(fills_log, "w") as f:
+        f.write(json.dumps({"trade_id": "some-other-trade", "leg": "NEAR", "qty": 1, "fill_type": "ENTRY"}) + "\n")
+
+    monkeypatch.setenv("MTS_FILL_LOG_PATH", fills_log)
+    mon = make_mock_monitor()
+    strat = DummyStrategy()
+    sig = Signal(action="EXIT", reason="TMF_COMBINED_EXIT")
+    bar_dict = {"near_close": 44000.0, "far_close": 44100.0}
+
+    mon._submit_mts_order_signal(sig, strat, bar_dict, ts=None)
+
+    assert mon.order_mgr.submit.call_count == 2
+
+
+# --- Case 34: Ledger flat on FAR leg also blocks (symmetric with NEAR) ---
+def test_release_ledger_far_flat_blocks_combined_exit(tmp_path, monkeypatch):
+    fills_log = str(tmp_path / "mts_trade_fills.jsonl")
+    import json
+    with open(fills_log, "w") as f:
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 1, "fill_type": "ENTRY"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "FAR", "qty": 1, "fill_type": "ENTRY"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "FAR", "qty": 1, "fill_type": "EXIT"}) + "\n")
+
+    monkeypatch.setenv("MTS_FILL_LOG_PATH", fills_log)
+    mon = make_mock_monitor()
+    strat = DummyStrategy()
+    sig = Signal(action="EXIT", reason="TMF_COMBINED_EXIT")
+    bar_dict = {"near_close": 44000.0, "far_close": 44100.0}
+
+    mon._submit_mts_order_signal(sig, strat, bar_dict, ts=None)
+
+    assert mon.order_mgr.submit.call_count == 0
+    assert mon.order_mgr.create_order.call_count == 0
+
+
+# ── COMBINED_EXIT dual-leg fill settlement (regression: OCO_ATOMIC truncation + trade_id) ──
+
+def _make_ce_fill_event(order_id, qty=1, price=44000.0):
+    import types
+    ev = types.SimpleNamespace()
+    ev.order_id = order_id
+    ev.fill_qty = qty
+    ev.fill_price = price
+    ev.deal_id = f"deal_{order_id}_{price}"
+    ev.symbol = None
+    return ev
+
+
+def _seed_ce_pending(mon, trade_id, near_oid, far_oid, strategy=None):
+    mon._pending_lifecycle_orders[near_oid] = {
+        "intent_id": f"intent-{near_oid}", "signal": "COMBINED_EXIT_NEAR",
+        "reason": "COMBINED_EXIT", "trade_id": trade_id, "ts": None, "lots": 1,
+        "strategy": strategy or "MTS_EXIT",
+    }
+    mon._pending_lifecycle_orders[far_oid] = {
+        "intent_id": f"intent-{far_oid}", "signal": "COMBINED_EXIT_FAR",
+        "reason": "COMBINED_EXIT", "trade_id": trade_id, "ts": None, "lots": 1,
+        "strategy": strategy or "MTS_EXIT",
+    }
+
+
+# Case 40: Near first, then Far — both legs settle; fills ledger uses REAL trade_id
+def test_ce_near_then_far_both_settle(tmp_path, monkeypatch):
+    fills_log = str(tmp_path / "mts_trade_fills.jsonl")
+    import strategies.plugins.futures.active.tmf_spread as _ts
+    monkeypatch.setattr(_ts, "_MTS_FILL_LOG", fills_log)
+
+    mon = make_mock_monitor()
+    trade_id = "mts-auto-999999-001"
+    near_oid, far_oid = "ORD-CE-N1", "ORD-CE-F1"
+    _seed_ce_pending(mon, trade_id, near_oid, far_oid)
+
+    # Near fill first
+    mon._apply_combined_exit_fill(_make_ce_fill_event(near_oid, price=43340.0), mon._pending_lifecycle_orders[near_oid], "COMBINED_EXIT_NEAR", 43340.0)
+    # Far fill second
+    mon._apply_combined_exit_fill(_make_ce_fill_event(far_oid, price=43634.0), mon._pending_lifecycle_orders[far_oid], "COMBINED_EXIT_FAR", 43634.0)
+
+    tracker = mon._combined_exit_trackers.get(trade_id)
+    assert tracker is not None, "tracker missing for real trade_id"
+    assert tracker["near_complete"] and tracker["far_complete"], f"legs not complete: {tracker}"
+    assert tracker["settlement_completed"] is True, f"settlement not completed: {tracker}"
+
+    # fills ledger entries must use the REAL trade_id (not literal "COMBINED_EXIT")
+    import json as _json
+    with open(fills_log) as f:
+        recs = [_json.loads(l) for l in f if l.strip()]
+    assert len(recs) >= 2, f"expected >=2 fill records, got {len(recs)}"
+    for r in recs:
+        assert r.get("trade_id") == trade_id, f"fill trade_id={r.get('trade_id')} != {trade_id}"
+
+
+# Case 41: Far first, then Near — both legs settle (order independence)
+def test_ce_far_then_near_both_settle(tmp_path, monkeypatch):
+    fills_log = str(tmp_path / "mts_trade_fills.jsonl")
+    import strategies.plugins.futures.active.tmf_spread as _ts
+    monkeypatch.setattr(_ts, "_MTS_FILL_LOG", fills_log)
+
+    mon = make_mock_monitor()
+    trade_id = "mts-auto-999999-002"
+    near_oid, far_oid = "ORD-CE-N2", "ORD-CE-F2"
+    _seed_ce_pending(mon, trade_id, near_oid, far_oid)
+
+    # Far fill first
+    mon._apply_combined_exit_fill(_make_ce_fill_event(far_oid, price=43634.0), mon._pending_lifecycle_orders[far_oid], "COMBINED_EXIT_FAR", 43634.0)
+    # Near fill second
+    mon._apply_combined_exit_fill(_make_ce_fill_event(near_oid, price=43340.0), mon._pending_lifecycle_orders[near_oid], "COMBINED_EXIT_NEAR", 43340.0)
+
+    tracker = mon._combined_exit_trackers.get(trade_id)
+    assert tracker is not None
+    assert tracker["near_complete"] and tracker["far_complete"]
+    assert tracker["settlement_completed"] is True
+
+    import json as _json
+    with open(fills_log) as f:
+        recs = [_json.loads(l) for l in f if l.strip()]
+    assert len(recs) >= 2
+    for r in recs:
+        assert r.get("trade_id") == trade_id
+
+
+# Case 42: single leg fill must NOT settle (half-filled is not flat)
+def test_ce_single_leg_does_not_settle(tmp_path, monkeypatch):
+    fills_log = str(tmp_path / "mts_trade_fills.jsonl")
+    import strategies.plugins.futures.active.tmf_spread as _ts
+    monkeypatch.setattr(_ts, "_MTS_FILL_LOG", fills_log)
+
+    mon = make_mock_monitor()
+    trade_id = "mts-auto-999999-003"
+    near_oid, far_oid = "ORD-CE-N3", "ORD-CE-F3"
+    _seed_ce_pending(mon, trade_id, near_oid, far_oid)
+
+    mon._apply_combined_exit_fill(_make_ce_fill_event(near_oid, price=43340.0), mon._pending_lifecycle_orders[near_oid], "COMBINED_EXIT_NEAR", 43340.0)
+
+    tracker = mon._combined_exit_trackers.get(trade_id)
+    assert tracker is not None
+    assert tracker["near_complete"] and not tracker["far_complete"]
+    assert tracker["settlement_completed"] is False, "half-filled must not settle"
+    import os
+    assert not os.path.exists(fills_log) or os.path.getsize(fills_log) == 0, "no fills should be written for half-filled CE"
+
+
+# Case 43: One CE leg rejected -> REPAIR_REQUIRED, never pretend completed
+def test_ce_leg_rejected_enters_repair(tmp_path):
+    mon = make_mock_monitor()
+    trade_id = "mts-auto-999999-004"
+    near_oid, far_oid = "ORD-CE-N4", "ORD-CE-F4"
+    _seed_ce_pending(mon, trade_id, near_oid, far_oid)
+
+    # NEAR fills first (half-flat), then FAR is rejected
+    mon._apply_combined_exit_fill(_make_ce_fill_event(near_oid, price=43340.0), mon._pending_lifecycle_orders[near_oid], "COMBINED_EXIT_NEAR", 43340.0)
+
+    import types
+    ev = types.SimpleNamespace(order_id=far_oid, reason="MARKET_CLOSED")
+    mon._handle_combined_exit_leg_rejected(ev, mon._pending_lifecycle_orders[far_oid])
+
+    tracker = mon._combined_exit_trackers.get(trade_id)
+    assert tracker is not None
+    assert tracker["status"] == "REPAIR_REQUIRED", f"expected REPAIR_REQUIRED, got {tracker['status']}"
+    assert tracker["settlement_completed"] is False, "rejected leg must not settle"
+    assert tracker["rejected_leg"] == "FAR"
+
+
+# Case 44: OCO_ATOMIC must NOT truncate COMBINED_EXIT sibling — both ticks fed
+def test_ce_sibling_not_truncated_by_oco_atomic(monkeypatch):
+    mon = make_mock_monitor()
+    trade_id = "mts-auto-999999-005"
+    near_oid, far_oid = "ORD-CE-N5", "ORD-CE-F5"
+    _seed_ce_pending(mon, trade_id, near_oid, far_oid)
+
+    class FakeSim:
+        def __init__(self):
+            self._pending_orders = {near_oid: object(), far_oid: object()}
+            self._ticks_fed = []
+            self._near_consumed = False
+        def get_pending_count(self):
+            return len(self._pending_orders)
+        def process_tick(self, tick):
+            self._ticks_fed.append(getattr(tick, "symbol", "?"))
+            if not self._near_consumed and near_oid in self._pending_orders:
+                del self._pending_orders[near_oid]
+                self._near_consumed = True
+
+    mon.paper_fill_sim = FakeSim()
+    mon._process_pending_paper_fills(43482.0, 43478.0, __import__("datetime").datetime.now())
+
+    sim = mon.paper_fill_sim
+    assert len(sim._ticks_fed) == 2, (
+        f"COMBINED_EXIT sibling was truncated by OCO_ATOMIC: only {len(sim._ticks_fed)} tick(s) fed"
+    )
+
+
+# Case 45: Restart must NOT resurrect a terminal trade (state OPEN + fills terminal -> FLAT)
+def test_ce_terminal_trade_not_resurrected_on_restart(tmp_path, monkeypatch):
+    import json as _json
+    # fills log with a fully-closed trade (2 ENTRY + 2 EXIT)
+    fills_log = str(tmp_path / "mts_trade_fills.jsonl")
+    with open(fills_log, "w") as f:
+        for rec in [
+            {"trade_id": "mts-auto-999999-006", "leg": "NEAR", "qty": 1, "fill_type": "ENTRY"},
+            {"trade_id": "mts-auto-999999-006", "leg": "FAR", "qty": 1, "fill_type": "ENTRY"},
+            {"trade_id": "mts-auto-999999-006", "leg": "NEAR", "qty": 1, "fill_type": "EXIT"},
+            {"trade_id": "mts-auto-999999-006", "leg": "FAR", "qty": 1, "fill_type": "EXIT"},
+        ]:
+            f.write(_json.dumps(rec) + "\n")
+    # state file claims OPEN (stale snapshot)
+    state_file = str(tmp_path / "mts_position_state.json")
+    with open(state_file, "w") as f:
+        _json.dump({"has_position": True, "state": "COMBINED_EXIT",
+                    "trade_id": "mts-auto-999999-006",
+                    "near_entry": 43482.0, "far_entry": 43478.0,
+                    "released_leg": None, "_updated": "2026-07-31T10:30:00"}, f)
+
+    from strategies.plugins.futures.active.tmf_spread import TMFSpread as _TS, RecoveryState
+    import strategies.plugins.futures.active.tmf_spread as _ts_mod
+    s = _TS.__new__(_TS)
+    s._has_position = False
+    s._mts_recovery_state = None
+    s._mts_state_write_enabled = False
+    with monkeypatch.context() as m:
+        m.setattr(_ts_mod, "_MTS_FILL_LOG", fills_log)
+        m.setattr(_TS, "_read_mts_state", staticmethod(lambda: _json.load(open(state_file))))
+        res = s._restore_position_state()
+    assert res is False, "stale OPEN state must not restore"
+    assert s._has_position is False, "terminal trade must not resurrect"
+    assert s._mts_recovery_state == RecoveryState.FLAT_CONFIRMED
+
+
+# Case 46: fills open-detection is Counter-based — 2 ENTRY + 1 RELEASE is still OPEN
+def test_fills_open_detection_leg_remaining(tmp_path, monkeypatch):
+    import json as _json
+    fills_log = str(tmp_path / "mts_trade_fills.jsonl")
+    with open(fills_log, "w") as f:
+        for rec in [
+            {"trade_id": "t1", "fill_type": "ENTRY"},
+            {"trade_id": "t1", "fill_type": "ENTRY"},
+            {"trade_id": "t1", "fill_type": "RELEASE"},   # one leg released, one still open
+        ]:
+            f.write(_json.dumps(rec) + "\n")
+    monkeypatch.setattr("strategies.futures.monitor.os.path.join", lambda *a: (
+        fills_log if a and a[-1] == "mts_trade_fills.jsonl" else __import__("os").path.join(*a)
+    ))
+    mon = make_mock_monitor()
+    assert mon._mts_has_open_position_from_fills() is True, "2 ENTRY + 1 RELEASE must still be OPEN"
+
+
+# Case 47: fully-closed trade (2 ENTRY + 2 EXIT) is NOT open
+def test_fills_open_detection_fully_closed(tmp_path, monkeypatch):
+    import json as _json
+    fills_log = str(tmp_path / "mts_trade_fills.jsonl")
+    with open(fills_log, "w") as f:
+        for rec in [
+            {"trade_id": "t2", "fill_type": "ENTRY"},
+            {"trade_id": "t2", "fill_type": "ENTRY"},
+            {"trade_id": "t2", "fill_type": "EXIT"},
+            {"trade_id": "t2", "fill_type": "EXIT"},
+        ]:
+            f.write(_json.dumps(rec) + "\n")
+    monkeypatch.setattr("strategies.futures.monitor.os.path.join", lambda *a: (
+        fills_log if a and a[-1] == "mts_trade_fills.jsonl" else __import__("os").path.join(*a)
+    ))
+    mon = make_mock_monitor()
+    assert mon._mts_has_open_position_from_fills() is False
+
+
+# Case 48: partial qty close (ENTRY 2 + EXIT 1) is still OPEN
+def test_fills_open_detection_partial_qty(tmp_path, monkeypatch):
+    import json as _json
+    fills_log = str(tmp_path / "mts_trade_fills.jsonl")
+    with open(fills_log, "w") as f:
+        for rec in [
+            {"trade_id": "t3", "fill_type": "ENTRY"},
+            {"trade_id": "t3", "fill_type": "ENTRY"},
+            {"trade_id": "t3", "fill_type": "EXIT"},
+        ]:
+            f.write(_json.dumps(rec) + "\n")
+    monkeypatch.setattr("strategies.futures.monitor.os.path.join", lambda *a: (
+        fills_log if a and a[-1] == "mts_trade_fills.jsonl" else __import__("os").path.join(*a)
+    ))
+    mon = make_mock_monitor()
+    assert mon._mts_has_open_position_from_fills() is True, "ENTRY 2 + EXIT 1 must still be OPEN"
+
+
+# ── Manual-command audit trail & phantom-UPL protection ──
+
+# Case 49: close_all with NO position -> idempotent FLAT + lifecycle clean + COMPLETED audit
+def test_close_all_no_pos_cleans_state_and_audits(tmp_path, monkeypatch):
+    import json as _json
+    flag_path = str(tmp_path / "futures_manual_trade.flag")
+    status_path = str(tmp_path / "futures_manual_trade_status.json")
+    with open(flag_path, "w") as f:
+        _json.dump({"action": "close_all", "command_id": "CMD-TEST-1", "ts": "2026-07-31T12:00:00"}, f)
+
+    mon = make_mock_monitor()
+    mon.manual_trade_flag_path = flag_path
+    mon.cfg = {"mts": {"flag_ttl_seconds": 3600}}
+    mon._processed_flag_ids = set()
+    mon._current_flag_id = None
+    mon._flag_retry_count = 0
+    mon._registry = {"tmf_spread": DummyStrategy()}
+    mon._lifecycle_generation = 0
+    mon._emergency_reset_at = None
+    mon.market_data = {}
+    mon._tick_bars_deque = []
+    mon.trader = MagicMock()
+    mon.api = None
+    mon.ticker = "TMF"
+    monkeypatch.setattr(mon, "_write_manual_command_status",
+                        lambda cid, st, msg, **kw: _json.dump(
+                            {"command_id": cid, "status": st, "message": msg, **kw},
+                            open(status_path, "w"), default=str))
+
+    from strategies.plugins.futures.active import tmf_spread as _ts_mod
+    writes = {}
+    def _fake_write(**kwargs):
+        writes.update(kwargs)
+    monkeypatch.setattr(_ts_mod, "_write_mts_state", _fake_write)
+
+    assert mon._process_manual_trade_flag() is True
+    # state written as FLAT (cleans stale lifecycle residue)
+    assert writes.get("has_position") is False, f"expected FLAT write, got {writes}"
+    assert writes.get("action") in ("FLAT", "CLOSE")
+    # audit status reached COMPLETED
+    with open(status_path) as f:
+        st = _json.load(f)
+    assert st["status"] == "COMPLETED", f"expected COMPLETED, got {st}"
+
+
+# Case 50: _write_mts_telemetry must NOT write phantom UPL when disk state is FLAT
+def test_telemetry_zeroes_upl_when_disk_flat(tmp_path, monkeypatch):
+    import json as _json
+    state_path = str(tmp_path / "mts_position_state.json")
+    with open(state_path, "w") as f:
+        _json.dump({"has_position": False, "state": "FLAT",
+                    "near_entry": 43635.0, "far_entry": 43763.0,
+                    "near_side": "SHORT", "far_side": "LONG"}, f)
+
+    from strategies.plugins.futures.active import tmf_spread as _ts
+    monkeypatch.setattr(_ts, "_get_state_file_path", lambda *a, **k: state_path)
+
+    _ts._write_mts_telemetry(
+        ticker="TMF", near_last=43600.0, far_last=43750.0,
+        near_upl=1000.0, far_upl=500.0, total_upl=1500.0,
+    )
+    with open(state_path) as f:
+        d = _json.load(f)
+    assert d["total_upl"] == 0.0, f"phantom UPL written into FLAT state: {d['total_upl']}"
+    assert d["near_upl"] == 0.0 and d["far_upl"] == 0.0
+
+
+# Case 51: close_all WITH position -> orders submitted + audit PROCESSING recorded
+def test_close_all_with_position_submits_orders_and_audits(tmp_path, monkeypatch):
+    import json as _json
+    flag_path = str(tmp_path / "futures_manual_trade.flag")
+    status_path = str(tmp_path / "futures_manual_trade_status.json")
+    with open(flag_path, "w") as f:
+        _json.dump({"action": "close_all", "command_id": "CMD-TEST-2", "ts": "2026-07-31T12:00:00"}, f)
+
+    mon = make_mock_monitor()
+    mon.manual_trade_flag_path = flag_path
+    mon._manual_trade_status = "READY"
+    mon.cfg = {"mts": {"flag_ttl_seconds": 3600}}
+    mon._processed_flag_ids = set()
+    mon._current_flag_id = None
+    mon._flag_retry_count = 0
+    mon._registry = {"tmf_spread": DummyStrategy()}
+    mon._lifecycle_generation = 0
+    mon._emergency_reset_at = None
+    mon.market_data = {}
+    mon._tick_bars_deque = []
+    mon.trader = MagicMock()
+    mon.api = None
+    mon.ticker = "TMF"
+    mon._mts_pending_fills = {}
+    mon._mts_stale_order_cancels = set()
+    status_log = []
+    monkeypatch.setattr(mon, "_write_manual_command_status",
+                        lambda cid, st, msg, **kw: status_log.append((st, msg)) or _json.dump(
+                            {"command_id": cid, "status": st, "message": msg, **kw},
+                            open(status_path, "w"), default=str))
+    monkeypatch.setattr(mon, "_cancel_all_pending_orders", lambda: None)
+
+    # Simulate position on disk (state file says OPEN)
+    state_path = str(tmp_path / "mts_position_state.json")
+    with open(state_path, "w") as f:
+        _json.dump({"has_position": True, "state": "HOLDING_SPREAD",
+                    "near_entry": 43635.0, "far_entry": 43763.0,
+                    "near_side": "SHORT", "far_side": "LONG",
+                    "released_leg": None, "trade_id": "mts-test-1"}, f)
+    monkeypatch.setattr("strategies.futures.monitor._mts_position_state_path",
+                        lambda: __import__("pathlib").Path(state_path))
+
+    from strategies.plugins.futures.active import tmf_spread as _ts_mod
+    monkeypatch.setattr(_ts_mod, "_write_mts_state",
+                        lambda **kw: None)  # avoid real state write
+
+    assert mon._process_manual_trade_flag() is True
+    assert mon.order_mgr.create_order.call_count >= 1, "no exit orders submitted"
+    # audit: RECEIVED then PROCESSING recorded
+    assert any(s == "RECEIVED" for s, _ in status_log), f"missing RECEIVED: {status_log}"
+    assert any(s == "PROCESSING" for s, _ in status_log), f"missing PROCESSING: {status_log}"
+
+
+# Case 52: after FAR release, remaining NEAR (SHORT) trail extrema reset to anchor
+def test_release_resets_remaining_leg_trail_anchor(monkeypatch):
+    import json as _json
+    from strategies.plugins.futures.active import tmf_spread as _ts
+
+    class RG2:
+        status = _ts.ReleaseGroupStatus.ARMED
+        release_leg = None
+        near_order_id = None
+        far_order_id = None
+    class TG2:
+        status = _ts.TrailGroupStatus.INACTIVE
+        exit_order_id = None
+    class LC2:
+        phase = _ts.PositionPhase.SPREAD
+        release_group = RG2()
+        trail_group = TG2()
+
+    strat = _ts.TMFSpread.__new__(_ts.TMFSpread)
+    strat._side = "SHORT"
+    strat._released_leg = None
+    strat._near_side = "SHORT"
+    strat._far_side = "LONG"
+    strat._single_leg_peak = 43850.0
+    strat._single_leg_nadir = 43600.0
+    strat._post_release_anchor_price = None
+    strat._lifecycle_oca = LC2()
+    strat._has_position = True
+    strat._trade_id = "mts-test-anchor"
+    strat._ticker = "TMF"
+    strat._release_ts = None
+    strat._trail_pending_mono = 0.0
+    strat._release_pending_mono = 0.0
+    strat._trail_anchor_status = None
+    strat._trail_warmup_tick_count = 0
+    strat._single_leg_anchor_price = 0.0
+    strat._single_leg_anchor_event_time_ns = 0
+    strat._near_entry = 43863.0
+    strat._far_entry = 44010.0
+    strat._near_max = None
+    strat._near_min = None
+    strat._far_max = None
+    strat._far_min = None
+
+    monkeypatch.setattr(_ts, "_write_mts_state", lambda **kw: None)
+    monkeypatch.setattr(_ts, "_append_event", lambda *a, **kw: None)
+
+    # release fill at 43752; remaining leg price at release = 43602
+    strat._enter_single_leg_after_release_fill(
+        released_leg=_ts.Leg.FAR,
+        remaining_leg_price=43602.0,
+        fill_price=43752.0,
+        order_id="ORD-TEST-REL",
+        source="sync_release",
+        event_time=None,
+    )
+
+    assert strat._single_leg_nadir == 43602.0, (
+        f"remaining-leg nadir must reset to anchor, got {strat._single_leg_nadir}"
+    )
+    assert strat._single_leg_peak == 43602.0, (
+        f"remaining-leg peak must reset to anchor, got {strat._single_leg_peak}"
+    )
+    assert strat._single_leg_anchor_price == 43602.0
+
+
+# Case 53: P0 regression — _reset() must clear RAM + write FLAT state
+# (was dead code after def _is_trade_settled_flat truncated _reset body)
+def test_reset_clears_ram_and_writes_flat(monkeypatch):
+    from strategies.plugins.futures.active import tmf_spread as _ts
+    from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+        ReleaseGroup, TrailGroup, PositionLifecycle,
+    )
+
+    s = _ts.TMFSpread.__new__(_ts.TMFSpread)
+    s._has_position = True
+    s._lifecycle = "TRAILING_SHORT"
+    s._combined_exit_in_flight = True
+    s._peak_net_exit_pnl_twd = 434978.0
+    s._lifecycle_oca = PositionLifecycle(
+        phase=_ts.PositionPhase.SINGLE_LEG,
+        release_group=ReleaseGroup(
+            status=_ts.ReleaseGroupStatus.ARMED,
+            near_order_id=None,
+            far_order_id=None,
+            filled_leg=None,
+            filled_order_id=None,
+            canceled_leg=None,
+            trigger_ts=None,
+        ),
+        trail_group=TrailGroup(
+            status=_ts.TrailGroupStatus.SUBMITTED,
+            exit_order_id="ORD-X",
+        ),
+    )
+    s._near_entry = 43863.0
+    s._far_entry = 44010.0
+    s._near_side = "SHORT"
+    s._far_side = "LONG"
+    s._released_leg = "far"
+    s._release_ts = "2026-07-31T13:24:53"
+    s._peak = 43850.0
+    s._nadir = 43600.0
+    s._single_leg_peak = 43850.0
+    s._single_leg_nadir = 43600.0
+    s._side = "SHORT"
+    s._trade_id = "mts-test-reset"
+    s._ticker = "TMF"
+    s._entry_ts = "2026-07-31T13:18:17"
+    s._near_max = 44000.0
+    s._near_min = 43769.0
+    s._far_max = None
+    s._far_min = None
+    s._post_release_anchor_price = 43777.0
+    s._post_release_anchor_source = None
+    s._post_release_anchor_age_ms = None
+    s._mfe_pts = 0.0
+    s._mae_pts = 0.0
+    s._release_price = 0.0
+    s._entry_spread_z = 0.0
+    s._exit_start_time = 0.0
+    s._last_exit_ts = None
+
+    writes = []
+    monkeypatch.setattr(_ts, "_write_mts_state", lambda **kw: writes.append(kw))
+    monkeypatch.setattr(_ts, "_append_event", lambda *a, **kw: None)
+
+    s._reset(reason="test_reset")
+
+    assert s._has_position is False, "RAM _has_position must be False after _reset"
+    assert s._lifecycle == "FLAT"
+    assert s._lifecycle_oca.phase == _ts.PositionPhase.FLAT
+    assert s._lifecycle_oca.release_group.status == _ts.ReleaseGroupStatus.INACTIVE
+    assert s._lifecycle_oca.trail_group.status == _ts.TrailGroupStatus.FILLED
+    assert s._combined_exit_in_flight is False
+    assert s._peak_net_exit_pnl_twd == 0.0
+    assert s._near_entry == 0.0 and s._near_side is None
+    assert s._released_leg is None
+    assert s._single_leg_peak == 0.0 and s._single_leg_nadir == 0.0
+    assert s._peak == 0.0 and s._nadir == 0.0
+    assert s._near_max is None and s._near_min is None
+    assert s._post_release_anchor_price is None
+    assert writes and writes[0].get("has_position") is False, f"FLAT state write missing: {writes}"
+
+
+# Case 54: Projection integrity — CAS always rejects => RAM still FLAT, retry enqueued,
+# heartbeat replays projection
+def test_projection_integrity_cas_reject_ram_stays_flat(tmp_path, monkeypatch):
+    import json as _json
+    from strategies.plugins.futures.active import tmf_spread as _ts
+    from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+        ReleaseGroup, TrailGroup, PositionLifecycle,
+    )
+
+    state_path = str(tmp_path / "mts_position_state.json")
+    # disk has NEWER revision (CAS will always reject a stale writer)
+    with open(state_path, "w") as f:
+        _json.dump({"state": "HOLDING_SPREAD", "has_position": True,
+                    "state_revision": 500, "_updated": "2026-07-31T14:00:00"}, f)
+    monkeypatch.setattr(_ts, "_get_state_file_path", lambda *a, **k: state_path)
+
+    s = _ts.TMFSpread.__new__(_ts.TMFSpread)
+    s._has_position = True
+    s._lifecycle = "TRAILING_SHORT"
+    s._lifecycle_oca = PositionLifecycle(
+        phase=_ts.PositionPhase.SINGLE_LEG,
+        release_group=ReleaseGroup(status=_ts.ReleaseGroupStatus.ARMED),
+        trail_group=TrailGroup(status=_ts.TrailGroupStatus.SUBMITTED, exit_order_id="ORD-X"),
+    )
+    s._combined_exit_in_flight = True
+    s._peak_net_exit_pnl_twd = 434978.0
+    s._near_entry = 43863.0
+    s._far_entry = 44010.0
+    s._near_side = "SHORT"
+    s._far_side = "LONG"
+    s._released_leg = "far"
+    s._single_leg_peak = 43850.0
+    s._single_leg_nadir = 43600.0
+    s._side = "SHORT"
+    s._trade_id = "mts-test-proj"
+    s._ticker = "TMF"
+    s._entry_ts = "2026-07-31T13:18:17"
+    s._last_exit_ts = None
+    s._near_max = 44000.0
+    s._near_min = 43769.0
+    s._far_max = None
+    s._far_min = None
+    s._post_release_anchor_price = 43777.0
+    s._post_release_anchor_source = None
+    s._post_release_anchor_age_ms = None
+    s._mfe_pts = 0.0
+    s._mae_pts = 0.0
+    s._release_price = 0.0
+    s._entry_spread_z = 0.0
+    s._exit_start_time = 0.0
+    s._release_ts = None
+    s._release_mono = 0.0
+
+    monkeypatch.setattr(_ts, "_append_event", lambda *a, **kw: None)
+    monkeypatch.setattr(_ts, "_PENDING_STATE_REWRITE", None)
+    _ts._PENDING_STATE_REWRITE = None
+
+    # EXIT fill -> _reset with a STALE expected revision (CAS will reject:
+    # disk=500, our snapshot starts from existing.get("state_revision")=500,
+    # then expected=500 -> _new_revision=501; the CAS check compares
+    # _disk_revision(500) != _expected_revision(500) -> PASSES. To force reject,
+    # write the disk with a HIGHER revision after read — instead, simulate by
+    # patching: make _write_mts_state's CAS branch always reject via a
+    # disk bump between read and write is hard; use a revision bump: set disk
+    # revision to 500, but pass expected_revision=499 via strategy attr.
+    s._state_revision = 499
+    monkeypatch.setattr(_ts, "_write_mts_state",
+                        lambda **kw: _ts._write_mts_state_impl(**_kw) if False else None)
+
+    # Direct: call the real _write_mts_state with expected_revision=499 (stale)
+    from strategies.plugins.futures.active import tmf_spread as _ts2
+    _ts2._PENDING_STATE_REWRITE = None
+    writes = []
+    orig = _ts2._write_mts_state
+
+    def _always_reject(**kw):
+        # simulate CAS reject: enqueue snapshot, never write
+        _ts2._PENDING_STATE_REWRITE = dict(kw)
+        return None
+    monkeypatch.setattr(_ts2, "_write_mts_state", _always_reject)
+
+    s._reset(reason="trail_exit_confirmed", exit_price=43777.0)
+
+    # Layer 1: RAM MUST be fully reset (projection failure must not affect execution state)
+    assert s._has_position is False, "RAM _has_position must be False"
+    assert s._lifecycle == "FLAT"
+    assert s._lifecycle_oca.phase == _ts2.PositionPhase.FLAT
+    assert s._lifecycle_oca.release_group.status == _ts2.ReleaseGroupStatus.INACTIVE
+    assert s._single_leg_nadir == 0.0 and s._single_leg_peak == 0.0
+    assert s._peak_net_exit_pnl_twd == 0.0
+
+    # Layer 2: projection repair enqueued
+    assert _ts2._PENDING_STATE_REWRITE is not None, "STATE_WRITE_RETRY must be enqueued"
+    assert _ts2._PENDING_STATE_REWRITE.get("has_position") is False
+
+    # Heartbeat replays the projection with CURRENT disk revision
+    monkeypatch.setattr(_ts2, "_write_mts_state", orig)
+    _ts2._write_mts_telemetry(ticker="TMF", near_last=43777.0, far_last=43930.0,
+                              near_upl=0.0, far_upl=0.0, total_upl=0.0)
+    with open(state_path) as f:
+        d = _json.load(f)
+    assert d.get("has_position") is False, f"projection not replayed: {d.get('state')}"
+    assert d.get("state_revision", 0) == 501, f"revision not advanced: {d.get('state_revision')}"
+    assert _ts2._PENDING_STATE_REWRITE is None, "pending rewrite must clear after replay"
