@@ -1,3 +1,10 @@
+# ⚠️ ARCHIVED — DO NOT EDIT (2026-07-31)
+# Futures configs were consolidated into config/futures.yaml (SSOT) with
+# session_overrides. monitor._load_config redirects this path to futures.yaml,
+# so changes here have NO runtime effect. Edit config/futures.yaml instead.
+# This file is kept only because ui/dashboard.py, ui/weak_bear_monitor.py and
+# core/session_config.py still reference it for display / backward compat.
+
 ticker: TMF
 active_strategy: null
 products:
@@ -130,7 +137,8 @@ mts:
     release_stop_points: 88
     trail_distance_points: 66
     enable_combined_upl_trail: true
-    execution_enabled: true    combined_upl_activation_net_pnl_twd: 200.0
+    execution_enabled: true
+    combined_upl_activation_net_pnl_twd: 200.0
     combined_upl_giveback_twd: 50.0
     atr_cap: 250.0
     confirm_ticks: 2
