@@ -1804,10 +1804,23 @@ class FuturesMonitor:
                             pass
             _rt_bar["atr"] = _last_atr
             
+            # 2026-07-31 Antigravity: Multi-tier fallback for far_close_rt (check _far_current_bar then market_data FAR cache)
+            _far_rt = 0.0
+            _far_h = 0.0
+            _far_l = 0.0
             if hasattr(self, '_far_current_bar') and self._far_current_bar.get("close", 0) > 0:
-                _rt_bar["far_close_rt"] = self._far_current_bar["close"]
-                _rt_bar["far_high_rt"] = self._far_current_bar["high"]
-                _rt_bar["far_low_rt"] = self._far_current_bar["low"]
+                _far_rt = self._far_current_bar["close"]
+                _far_h = self._far_current_bar.get("high", _far_rt)
+                _far_l = self._far_current_bar.get("low", _far_rt)
+            elif self.market_data.get(f"{self.ticker}_FAR", {}).get("close", 0) > 0:
+                _far_rt = self.market_data[f"{self.ticker}_FAR"]["close"]
+                _far_h = _far_rt
+                _far_l = _far_rt
+
+            if _far_rt > 0:
+                _rt_bar["far_close_rt"] = _far_rt
+                _rt_bar["far_high_rt"] = _far_h
+                _rt_bar["far_low_rt"] = _far_l
             else:
                 # 💡 [Fixed 2026-05-27] Log warning if RT far price is missing
                 if _mts_enabled:
