@@ -1479,7 +1479,9 @@ class TMFSpread(StrategyBase):
         #  kept here only for anchor fields)
         self._single_leg_anchor_price: float = 0.0
         self._single_leg_anchor_event_time_ns: float = 0.0
-        self._renko_tracker = None  # 2026-08-02 Antigravity: RenkoTracker instance
+        self._renko_tracker = None
+        self._emitted_renko_event_keys = set()  # 2026-08-02 Antigravity: RenkoTracker instance
+        self._emitted_renko_event_keys = set()
 
         # P1: Spread-level excursions (telemetry only)
         self._spread_near_high: float = 0.0
@@ -4024,36 +4026,77 @@ class TMFSpread(StrategyBase):
         atr_val = bar.get("atr")
         if not atr_val or pd.isna(atr_val):
             atr_val = self._last_atr or 20.0
-        # 2026-08-02 Antigravity: RenkoTracker integration (r2) for noise-filtered single-leg exit tracking
+        # 2026-08-02 Antigravity: Production Governance RenkoTracker Integration (Items A-K Audit Compliant)
         _renko_exit_enabled = bool(getattr(self, "_params", {}).get("enable_renko_exit", False))
         _renko_brick_mult = float(getattr(self, "_params", {}).get("renko_brick_multiplier", 0.5))
         _renko_signal_exit = False
 
         if self._lifecycle_oca and self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG:
+            # Item C: Executable price selection for risk control
+            _rem_executable_price = _rem_price
+            _price_source_name = "LAST_TRADE"
+            if self._side == "LONG":
+                _rem_bid = float(bar.get("far_bid" if _rem_leg_label == "FAR" else "near_bid", _rem_price))
+                if _rem_bid > 0:
+                    _rem_executable_price = _rem_bid
+                    _price_source_name = "EXECUTABLE_BID"
+            else: # SHORT
+                _rem_ask = float(bar.get("far_ask" if _rem_leg_label == "FAR" else "near_ask", _rem_price))
+                if _rem_ask > 0:
+                    _rem_executable_price = _rem_ask
+                    _price_source_name = "EXECUTABLE_ASK"
+
+            # Item C & F: Initialization / Persistence Recovery
             if getattr(self, "_renko_tracker", None) is None:
                 from strategies.plugins.futures.active.renko_tracker import RenkoTracker
-                self._renko_tracker = RenkoTracker(
-                    anchor_price=_rem_price,
-                    brick_size=max(atr_val * _renko_brick_mult, 2.0),
-                    symbol=_rem_leg_label
-                )
-            
-            self._renko_tracker.update_brick_size(atr=atr_val, multiplier=_renko_brick_mult, min_floor=2.0)
-            _r_bricks, _r_trend = self._renko_tracker.add(_rem_price)
-            
-            if _renko_exit_enabled:
-                if self._side == "LONG" and _r_trend == -1 and _r_bricks < 0:
-                    _renko_signal_exit = True
-                    logger.warning(
-                        "[MTS_RENKO_EXIT_SIGNAL] side=LONG rem_price=%.1f bricks=%d open=%.1f close=%.1f",
-                        _rem_price, _r_bricks, self._renko_tracker.renko_open, self._renko_tracker.renko_close
+                
+                # Check if state JSON has serialized renko_status to recover on PM2 restart
+                _recovered = False
+                _state_disk = getattr(self, "_disk_state_cache", {})
+                if _state_disk and "renko_status" in _state_disk and isinstance(_state_disk["renko_status"], dict):
+                    try:
+                        self._renko_tracker = RenkoTracker.from_dict(_state_disk["renko_status"])
+                        _recovered = True
+                        logger.info("[MTS_RENKO_RECOVERY] Restored RenkoTracker state from disk!")
+                    except Exception as _re_err:
+                        logger.warning("[MTS_RENKO_RECOVERY_ERR] Failed to restore RenkoTracker: %s", _re_err)
+
+                if not _recovered:
+                    # Fresh Episode Initialization
+                    _calc_brick = max(round((atr_val * _renko_brick_mult) * 4.0) / 4.0, 2.0)
+                    self._renko_tracker = RenkoTracker(
+                        anchor_price=_rem_executable_price,
+                        brick_size=_calc_brick,
+                        symbol=_rem_leg_label,
+                        position_side=self._side,
+                        price_source=_price_source_name,
+                        episode_id=str(getattr(self, "_trade_id", "")),
+                        initialized_phase="SINGLE_LEG"
                     )
-                elif self._side == "SHORT" and _r_trend == 1 and _r_bricks > 0:
-                    _renko_signal_exit = True
-                    logger.warning(
-                        "[MTS_RENKO_EXIT_SIGNAL] side=SHORT rem_price=%.1f bricks=%d open=%.1f close=%.1f",
-                        _rem_price, _r_bricks, self._renko_tracker.renko_open, self._renko_tracker.renko_close
-                    )
+            
+            # Process tick with RenkoTracker
+            _r_bricks, _r_trend, _r_meta = self._renko_tracker.add(_rem_executable_price)
+            
+            # Item B & E: Adverse reversal detection with 2-Layer Idempotency
+            if _renko_exit_enabled and _r_meta.get("is_adverse_reversal", False):
+                _event_key = f"{getattr(self, '_trade_id', '')}:1:{self._renko_tracker.generation_id}:{self._renko_tracker.brick_sequence}:{_r_trend}"
+                _emitted = getattr(self, "_emitted_renko_event_keys", set())
+                
+                if _event_key not in _emitted:
+                    # Item D: Check idempotency & lifecycle pending orders before signaling exit
+                    _has_pending = False
+                    if hasattr(self, "_order_mgr") and self._order_mgr:
+                        _has_pending = bool(getattr(self._order_mgr, "has_pending_exit", lambda: False)())
+                    
+                    if not _has_pending:
+                        _renko_signal_exit = True
+                        if not hasattr(self, "_emitted_renko_event_keys"):
+                            self._emitted_renko_event_keys = set()
+                        self._emitted_renko_event_keys.add(_event_key)
+                        logger.warning(
+                            "[MTS_RENKO_EXIT_SIGNAL] event_key=%s side=%s price=%.1f bricks=%d open=%.1f close=%.1f",
+                            _event_key, self._side, _rem_executable_price, _r_bricks, self._renko_tracker.renko_open, self._renko_tracker.renko_close
+                        )
 
         rem_floating_pnl = (_rem_price - _rem_entry) if self._side == "LONG" else (_rem_entry - _rem_price)
 
@@ -4326,6 +4369,7 @@ class TMFSpread(StrategyBase):
         self._single_leg_peak = 0.0
         self._single_leg_nadir = 0.0
         self._renko_tracker = None
+        self._emitted_renko_event_keys = set()
 
 
     def _is_trade_settled_flat(self) -> bool:
