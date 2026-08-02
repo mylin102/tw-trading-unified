@@ -1,3 +1,20 @@
+"""
+# Renko Governance Mandate (MTS)
+Core Principle: Renko 在 MTS 中只能是由原始 tick 衍生出的觀測事件，不得被視為可成交市場資料。
+
+Governance Contracts (10 Mandates):
+1. Brick close 不得作為 fill price。
+2. Signal 必須綁定 source tick (source_receive_sequence, source timestamp, source input price, bricks_created_this_tick)。
+3. 同一 source tick 只執行一次 Policy Evaluation，最多產生一個 exit intent。
+4. Counterfactual fill 使用 signal 可觀測後的第一筆 Executable Quote (LONG exit 使用 Bid, SHORT exit 使用 Ask)。
+5. 必須記錄並分開五種價格: brick close price, source tick price, executable quote at signal, simulated fill, actual paper fill。
+6. 歷史研究從 tick/quote replay 重建，不得將 brick series 當價格回測。
+7. 分鐘 OHLC 重建標記為 APPROXIMATE，不得用於 execution promotion。
+8. Dashboard 顯示警示: Brick price is not fill price, same-tick batch count, one eval/tick, signal-to-executable gap。
+9. Promotion gate 比較三層 PnL: theoretical brick-close PnL, executable shadow PnL, actual paper-fill PnL。
+10. Theoretical edge 在加入 Bid/Ask, latency, slippage 後若消失，Renko execution 不得升級。
+"""
+
 # 2026-08-02 Antigravity: Production RenkoTracker with Explicit Exception Invariants, Enhanced Telemetry Loader Counters & Flexible Sequence Contract
 
 import math
