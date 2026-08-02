@@ -87,16 +87,16 @@ def test_normal_pair_emits_sample():
 
 
 # ── collector ─────────────────────────────────────────────────────────────
-def test_collector_rejects_gated_ticks():
+def test_collector_rejects_gated_ticks(tmp_path):
     """Collector only accepts ticks already passed Session→QuoteIntegrity→Jump."""
-    c = SpreadRenkoShadowCollector()
+    c = SpreadRenkoShadowCollector(telemetry_path=str(tmp_path / "s.jsonl"))
     # rejected tick (simulated upstream rejection) must not enter collector
     with pytest.raises(ValueError):
         c.accept_tick(sample=None, source="near", rejected_reason="SESSION_REJECT")
 
 
-def test_collector_exception_does_not_break_loop():
-    c = SpreadRenkoShadowCollector()
+def test_collector_exception_does_not_break_loop(tmp_path):
+    c = SpreadRenkoShadowCollector(telemetry_path=str(tmp_path / "s.jsonl"))
     # simulate a bad sample dict → collector must log, not raise
     bad = {"spread_value": {"unserializable": object()}}  # genuinely un-serializable
     result = c.record(bad)
