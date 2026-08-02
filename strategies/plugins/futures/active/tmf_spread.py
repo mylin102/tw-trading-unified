@@ -929,6 +929,27 @@ def settle_mts_trade(
 _PENDING_STATE_REWRITE = None  # dict | None: snapshot awaiting replay
 
 
+def _renko_status_payload(self_or_none=None):
+    """Build renko_status for canonical state write. Returns None when:
+    - no tracker exists, or
+    - tracker trade_id does not match the active trade (stale episode), or
+    - tracker is in FLAT/None state (post-reset).
+    """
+    try:
+        tracker = getattr(self_or_none, "_renko_tracker", None)
+        if tracker is None:
+            return None
+        active_trade = getattr(self_or_none, "_trade_id", None)
+        if active_trade and tracker.trade_id and tracker.trade_id != active_trade:
+            return None  # stale episode tracker — never persist
+        payload = tracker.to_dict()
+        payload["_bound_trade_id"] = active_trade
+        payload["_bound_episode_id"] = getattr(tracker, "episode_id", None)
+        return payload
+    except Exception:
+        return None
+
+
 def _write_mts_state(
     has_position: bool,
     action: str,
@@ -4074,8 +4095,30 @@ class TMFSpread(StrategyBase):
                         initialized_phase="SINGLE_LEG"
                     )
             
-            # Process tick with RenkoTracker
-            _r_bricks, _r_trend, _r_meta = self._renko_tracker.add(_rem_executable_price)
+            # Process tick with RenkoTracker — fail-closed capability guard
+            if not callable(getattr(self._renko_tracker, "add", None)):
+                logger.warning("[RENKO_CAPABILITY_UNAVAILABLE] add() missing on RenkoTracker — renko shadow disabled for this episode")
+                self._renko_tracker = None
+                return
+            try:
+                _r_bricks, _r_trend, _r_meta = self._renko_tracker.add(_rem_executable_price)
+            except Exception as _exc:
+                logger.warning("[RENKO_CAPABILITY_UNAVAILABLE] add() failed: %s — renko shadow disabled for this episode", _exc)
+                self._renko_tracker = None
+                return
+
+            # [B1] persist renko_status on brick events via canonical CAS writer
+            if _r_bricks > 0 and getattr(self, "_renko_tracker", None) is not None:
+                try:
+                    _write_mts_state(
+                        has_position=True, action="RENKO_BRICK", reason=f"bricks={_r_bricks}",
+                        trade_id=getattr(self, "_trade_id", ""),
+                        ticker=getattr(self, "_ticker", "TMF"),
+                        lifecycle=lifecycle_to_dict(self._lifecycle_oca) if hasattr(self, "_lifecycle_oca") else {},
+                        renko_status=_renko_status_payload(self),
+                    )
+                except Exception as _bexc:
+                    logger.warning("[RENKO_STATE_WRITE_ERR] %s", _bexc)
             
             # Item B & E: Adverse reversal detection with 2-Layer Idempotency
             if _renko_exit_enabled and _r_meta.get("is_adverse_reversal", False):
@@ -4337,7 +4380,9 @@ class TMFSpread(StrategyBase):
         _write_mts_state(has_position=False, action="CLOSE", reason=reason or "trail_exit",
                          ticker=_ticker,
                          lifecycle=lifecycle_to_dict(self._lifecycle_oca) if hasattr(self, '_lifecycle_oca') else {},
-                         trail_exit_realized=_trail_exit_realized)
+                         trail_exit_realized=_trail_exit_realized,
+                         renko_status={"tracker_initialized": False, "mode": "INACTIVE",
+                                       "recent_bricks": [], "clear_reason": "FLAT_RESET"})
         self._last_exit_ts = exit_ts or datetime.now()  # 2026-06-25 Gemini CLI: Support passing historical exit timestamp
         self._entry_ts = None
         self._near_entry = 0.0

@@ -1551,8 +1551,59 @@ class FuturesMonitor:
         except Exception as e:
             console.print(f" [yellow][FuturesMonitor] Tick CSV rebuild failed (non-fatal): {e}[/yellow] ")
 
+    # ── [P0b] Quote Integrity Gate ────────────────────────────────────
+    def _init_quote_guard(self):
+        """Lazy init — contract resolution happens after __init__."""
+        try:
+            from core.quote_integrity import QuoteIntegrityGuard
+            _csv = getattr(self, "csv_path", None)
+            _log_dir = os.path.dirname(str(_csv)) if _csv else os.path.join(os.getcwd(), "logs")
+            self._quote_guard = QuoteIntegrityGuard(
+                near_code=getattr(self.contract, "code", "TMFH6"),
+                far_code=getattr(self.far_contract, "code", "TMFI6"),
+                ticker=self.ticker,
+                anomalous_quotes_path=os.path.join(_log_dir, "anomalous_quotes.jsonl"),
+            )
+            self._quote_integrity_stats = self._quote_guard.stats
+            self.anomalous_quotes_path = self._quote_guard.anomalous_quotes_path
+        except Exception as _exc:  # non-fatal — degrade to existing gates
+            print(f"[QUOTE_GUARD_INIT_FAILED] {_exc}", flush=True)
+            self._quote_guard = None
+
+    def _build_quote_envelope(self, tick):
+        from core.quote_integrity import QuoteEnvelope
+        _close = float(getattr(tick, "close", 0) or 0)
+        _p = _close
+        return QuoteEnvelope(
+            raw_contract=getattr(tick, "code", "") or "",
+            normalized_contract=(getattr(tick, "code", "") or "").upper(),
+            expected_leg=None,
+            callback_source="shioaji_on_tick",
+            exchange_timestamp=str(getattr(tick, "datetime", "") or ""),
+            receive_timestamp=time.time(),
+            receive_sequence=0,
+            subscription_generation=self._quote_guard.generation,
+            source_kind="live",
+            price=_p,
+            close=_close,
+            bid=float(getattr(tick, "buy_price", _close) or _close),
+            ask=float(getattr(tick, "sell_price", _close) or _close),
+        )
+
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()  # [gstack] 更新數據更新時間
+
+        # [P0b] Quote Integrity Gate — one decision, one destination
+        if getattr(self, "_quote_guard", None) is None:
+            self._init_quote_guard()
+        if getattr(self, "_quote_guard", None) is not None:
+            try:
+                _decision = self._quote_guard.decide(self._build_quote_envelope(tick))
+                self._last_quote_decision = _decision
+                if _decision.destination.value == "NONE":
+                    return  # rejected quote — no cache write, no downstream
+            except Exception as _exc:
+                print(f"[QUOTE_GUARD_DECIDE_ERR] {_exc}", flush=True)
         
         # 2026-07-31 Antigravity P0 Guard: Only near-month primary ticks (tick.code == self.contract.code)
         # update _last_tmf_price and NEAR market_data slots to prevent far-month tick price pollution.
