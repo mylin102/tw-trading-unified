@@ -1852,7 +1852,14 @@ class FuturesMonitor:
     def _accumulate_far_tick(self, tick):
         """Accumulate far-month MXF ticks into _far_tick_bars_deque (5-min bars).
         Does NOT affect strategy signals, stop loss, or orders."""
-        price = float(tick.close)
+        if getattr(tick, 'close', None) is None:
+            return
+        try:
+            price = float(tick.close)
+            if price <= 0:
+                return
+        except (ValueError, TypeError):
+            return
         vol = int(getattr(tick, "volume", 0))
         tick_ts = pd.Timestamp(tick.datetime)
         ts_int = int(tick_ts.timestamp() / 300) * 300
