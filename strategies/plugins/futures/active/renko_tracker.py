@@ -1,4 +1,5 @@
-# 2026-08-02 Antigravity: Production RenkoTracker with Canonical Custom Brick Events & Telemetry
+# 2026-08-02 Antigravity: Production RenkoTracker with Explicit Exception Invariants, Enhanced Telemetry Loader Counters & Flexible Sequence Contract
+
 import math
 import time
 import json
@@ -14,7 +15,6 @@ TAIPEI_TZ = timezone(timedelta(hours=8))
 
 @dataclass
 class RenkoBrickEvent:
-    """Item One: Immutable Canonical Brick Event Schema"""
     brick_sequence: int
     created_at: str
     open: float
@@ -32,15 +32,53 @@ class RenkoBrickEvent:
     position_effect: str
     trade_id: str
     single_leg_episode_id: str
-    generation_id: int
+    generation_id: str
+    source_receive_sequence: Optional[int] = None
     signal_emitted: bool = False
     signal_reason: Optional[str] = None
     signal_event_id: Optional[str] = None
     data_quality: str = "VALID"
     recovery_mode: bool = False
 
+    def __post_init__(self):
+        if isinstance(self.bricks_created_this_tick, bool) or not isinstance(self.bricks_created_this_tick, int):
+            raise TypeError(f"bricks_created_this_tick must be int, got {type(self.bricks_created_this_tick)}")
+        if self.bricks_created_this_tick < 1:
+            raise ValueError(f"bricks_created_this_tick must be >= 1, got {self.bricks_created_this_tick}")
+
+        if self.trend not in (1, -1):
+            raise ValueError(f"trend must be 1 or -1, got {self.trend}")
+
+        if isinstance(self.brick_sequence, bool) or not isinstance(self.brick_sequence, int) or self.brick_sequence < 1:
+            raise ValueError(f"brick_sequence must be int >= 1, got {self.brick_sequence}")
+
+        if not isinstance(self.brick_size, (int, float)) or self.brick_size <= 0:
+            raise ValueError(f"brick_size must be > 0, got {self.brick_size}")
+
+        if math.isclose(self.open, self.close):
+            raise ValueError(f"close cannot equal open for a completed brick (open={self.open}, close={self.close})")
+
+        if self.position_side not in ("LONG", "SHORT"):
+            raise ValueError(f"invalid position_side: {self.position_side}")
+
+        if self.position_effect not in ("FAVORABLE", "ADVERSE"):
+            raise ValueError(f"invalid position_effect: {self.position_effect}")
+
+        if self.source_receive_sequence is not None:
+            if isinstance(self.source_receive_sequence, bool) or not isinstance(self.source_receive_sequence, int) or self.source_receive_sequence < 0:
+                raise ValueError(f"source_receive_sequence must be int >= 0 or None, got {self.source_receive_sequence}")
+
+        if not isinstance(self.generation_id, str):
+            raise TypeError("generation_id must be str")
+        if not isinstance(self.single_leg_episode_id, str):
+            raise TypeError("single_leg_episode_id must be str")
+        if not isinstance(self.trade_id, str):
+            raise TypeError("trade_id must be str")
+
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["schema_version"] = 1
+        return d
 
 
 class RenkoTracker:
@@ -53,6 +91,8 @@ class RenkoTracker:
         price_source: str = "EXECUTABLE_BID",
         episode_id: str = "",
         trade_id: str = "",
+        episode_ordinal: int = 1,
+        generation_id: str = "1",
         initialized_phase: str = "SINGLE_LEG",
         max_bricks_per_tick: int = 5,
         max_price_jump_points: float = 50.0,
@@ -60,8 +100,15 @@ class RenkoTracker:
         self.symbol = symbol
         self.position_side = position_side.upper()
         self.price_source = price_source
-        self.episode_id = episode_id or trade_id or "EPISODE_0"
-        self.trade_id = trade_id or self.episode_id
+        self.trade_id = str(trade_id) if trade_id else "TRADE_0"
+        self.episode_ordinal = int(episode_ordinal)
+        
+        if episode_id:
+            self.episode_id = str(episode_id)
+        else:
+            self.episode_id = f"{self.trade_id}:single-leg:{self.episode_ordinal}"
+        
+        self.generation_id = str(generation_id)
         self.initialized_phase = initialized_phase
         self.initialized_at = time.time()
         self.max_bricks_per_tick = max_bricks_per_tick
@@ -77,11 +124,17 @@ class RenkoTracker:
         self.renko_close = float(anchor_price)
         self.total_bricks = 0
         self.brick_sequence = 0
-        self.generation_id = 1
+        self.source_receive_sequence = 0
         
         self._recent_bricks = deque(maxlen=100)
         self._persisted_brick_keys = set()
         self.telemetry_failure_count = 0
+        
+        self.dedupe_keys_loaded = 0
+        self.dedupe_load_duration_ms = 0.0
+        self.malformed_lines_skipped = 0
+        
+        self._load_existing_telemetry_keys()
         
         self.last_tick_bricks_created = 0
         self.last_tick_jump_points = 0.0
@@ -91,6 +144,38 @@ class RenkoTracker:
         self.last_signal_event_id = None
         self.last_signal_at = None
         self.last_signal_reason = None
+
+    def _load_existing_telemetry_keys(self):
+        start_t = time.time()
+        try:
+            date_str = datetime.now(TAIPEI_TZ).strftime("%Y%m%d")
+            filepath = os.path.join("data", "telemetry", "renko_bricks", date_str, f"{self.symbol}_bricks.jsonl")
+            if os.path.exists(filepath):
+                with open(filepath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            evt = json.loads(line)
+                            if not isinstance(evt, dict):
+                                self.malformed_lines_skipped += 1
+                                continue
+                            g_id = str(evt.get("generation_id", "1"))
+                            ep_id = str(evt.get("single_leg_episode_id", ""))
+                            seq = evt.get("brick_sequence")
+                            if seq is None or not isinstance(seq, int):
+                                self.malformed_lines_skipped += 1
+                                continue
+                            key = f"{g_id}:{ep_id}:{seq}"
+                            self._persisted_brick_keys.add(key)
+                            self.dedupe_keys_loaded += 1
+                        except Exception:
+                            self.malformed_lines_skipped += 1
+        except Exception as e:
+            logger.warning("[RENKO_DEDUPE_LOAD_WARN] Failed to load existing keys: %s", e)
+        finally:
+            self.dedupe_load_duration_ms = round((time.time() - start_t) * 1000.0, 3)
 
     def update_brick_size(self, atr: float, multiplier: float = 0.5, min_floor: float = 2.0):
         pass
@@ -103,16 +188,19 @@ class RenkoTracker:
 
     def _create_and_store_brick(
         self,
+        *,
         b_open: float,
         b_close: float,
         trend: int,
         is_reversal: bool,
-        bricks_created: int,
+        bricks_created_this_tick: int,
         input_price: float,
         signal_emitted: bool = False,
         signal_reason: Optional[str] = None,
         signal_event_id: Optional[str] = None
     ) -> RenkoBrickEvent:
+        bricks_count_abs = max(int(abs(bricks_created_this_tick)), 1)
+        
         self.brick_sequence += 1
         self.total_bricks += 1
         
@@ -121,6 +209,7 @@ class RenkoTracker:
         
         event = RenkoBrickEvent(
             brick_sequence=self.brick_sequence,
+            source_receive_sequence=self.source_receive_sequence,
             created_at=created_at_str,
             open=b_open,
             close=b_close,
@@ -130,7 +219,7 @@ class RenkoTracker:
             trend_label="UP" if trend == 1 else "DOWN",
             is_reversal=is_reversal,
             brick_size=self.locked_brick_size,
-            bricks_created_this_tick=bricks_created,
+            bricks_created_this_tick=bricks_count_abs,
             input_price=input_price,
             price_source=self.price_source,
             position_side=self.position_side,
@@ -158,8 +247,9 @@ class RenkoTracker:
             os.makedirs(telemetry_dir, exist_ok=True)
             filepath = os.path.join(telemetry_dir, f"{self.symbol}_bricks.jsonl")
             
+            line_str = json.dumps(event.to_dict(), ensure_ascii=False)
             with open(filepath, "a", encoding="utf-8") as f:
-                f.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+                f.write(line_str + chr(10))
             
             self._persisted_brick_keys.add(dedupe_key)
         except Exception as e:
@@ -167,6 +257,7 @@ class RenkoTracker:
             logger.error("[RENKO_TELEMETRY_ERR] Failed to append brick event: %s", e)
 
     def add(self, price: float) -> Tuple[int, int, Dict[str, Any]]:
+        self.source_receive_sequence += 1
         self.last_tick_bricks_created = 0
         self.last_tick_jump_points = 0.0
         self.last_tick_capped = False
@@ -188,23 +279,22 @@ class RenkoTracker:
 
         price = float(price)
         
-        if self.trend != 0:
-            jump = abs(price - self.renko_close)
-            self.last_tick_jump_points = jump
-            meta["jump_points"] = jump
-            if jump > self.max_price_jump_points:
-                self.last_rejection_reason = f"SINGLE_TICK_JUMP_EXCEEDED ({jump:.1f} > {self.max_price_jump_points:.1f})"
-                meta["rejection_reason"] = self.last_rejection_reason
-                return 0, self.trend, meta
+        # [4A] jump validation applies to ALL states (including initial anchor).
+        # Rejected ticks return 0 bricks and mutate NOTHING (anchor/trend/
+        # sequence/reversal memory/previous accepted price all untouched).
+        jump = abs(price - self.renko_close)
+        self.last_tick_jump_points = jump
+        meta["jump_points"] = jump
+        if jump > self.max_price_jump_points:
+            self.last_rejection_reason = f"SINGLE_TICK_JUMP_EXCEEDED ({jump:.1f} > {self.max_price_jump_points:.1f})"
+            meta["rejection_reason"] = self.last_rejection_reason
+            return 0, self.trend, meta
 
         if self.trend == 0:
             diff = price - self.renko_close
             if abs(diff) >= self.locked_brick_size:
                 raw_num = int(abs(diff) // self.locked_brick_size)
-                num_bricks = min(raw_num, self.max_bricks_per_tick)
-                if raw_num > self.max_bricks_per_tick:
-                    self.last_tick_capped = True
-                    meta["capped"] = True
+                num_bricks = raw_num  # [4A] no cap-drop — full progression
                 
                 target_trend = 1 if diff > 0 else -1
                 self.trend = target_trend
@@ -219,7 +309,7 @@ class RenkoTracker:
                         b_close=b_close,
                         trend=target_trend,
                         is_reversal=False,
-                        bricks_created=1 if target_trend == 1 else -1,
+                        bricks_created_this_tick=num_bricks,
                         input_price=price
                     )
                     meta["brick_events"].append(event.to_dict())
@@ -233,10 +323,7 @@ class RenkoTracker:
             if price >= self.renko_close + self.locked_brick_size:
                 diff = price - self.renko_close
                 raw_num = int(diff // self.locked_brick_size)
-                num_bricks = min(raw_num, self.max_bricks_per_tick)
-                if raw_num > self.max_bricks_per_tick:
-                    self.last_tick_capped = True
-                    meta["capped"] = True
+                num_bricks = raw_num  # [4A] no cap-drop — full progression
 
                 for b_i in range(num_bricks):
                     b_open = self.renko_close
@@ -248,7 +335,7 @@ class RenkoTracker:
                         b_close=b_close,
                         trend=1,
                         is_reversal=False,
-                        bricks_created=1,
+                        bricks_created_this_tick=num_bricks,
                         input_price=price
                     )
                     meta["brick_events"].append(event.to_dict())
@@ -257,14 +344,10 @@ class RenkoTracker:
                 meta["bricks_created"] = num_bricks
                 return num_bricks, self.trend, meta
 
-
             elif price <= self.renko_open - self.locked_brick_size:
                 diff = (self.renko_open - self.locked_brick_size) - price
                 raw_num = 1 + int(diff // self.locked_brick_size)
-                num_bricks = min(raw_num, self.max_bricks_per_tick)
-                if raw_num > self.max_bricks_per_tick:
-                    self.last_tick_capped = True
-                    meta["rejection_reason"] = True
+                num_bricks = raw_num  # [4A] no cap-drop — full progression
 
                 self.trend = -1
                 self.last_reversal_timestamp = time.time()
@@ -288,7 +371,7 @@ class RenkoTracker:
                     b_close=b_close,
                     trend=-1,
                     is_reversal=True,
-                    bricks_created=-1,
+                    bricks_created_this_tick=num_bricks,
                     input_price=price,
                     signal_emitted=is_adverse,
                     signal_reason=self.last_signal_reason,
@@ -306,23 +389,20 @@ class RenkoTracker:
                         b_close=b_close,
                         trend=-1,
                         is_reversal=False,
-                        bricks_created=-1,
+                        bricks_created_this_tick=num_bricks,
                         input_price=price
                     )
                     meta["brick_events"].append(c_event.to_dict())
 
                 self.last_tick_bricks_created = -num_bricks
-                meta["rejection_reason"] = -num_bricks
+                meta["bricks_created"] = -num_bricks
                 return -num_bricks, self.trend, meta
 
         elif self.trend == -1:
             if price <= self.renko_close - self.locked_brick_size:
                 diff = self.renko_close - price
                 raw_num = int(diff // self.locked_brick_size)
-                num_bricks = min(raw_num, self.max_bricks_per_tick)
-                if raw_num > self.max_bricks_per_tick:
-                    self.last_tick_capped = True
-                    meta["capped"] = True
+                num_bricks = raw_num  # [4A] no cap-drop — full progression
 
                 for b_i in range(num_bricks):
                     b_open = self.renko_close
@@ -334,27 +414,19 @@ class RenkoTracker:
                         b_close=b_close,
                         trend=-1,
                         is_reversal=False,
-                        bricks_created=-1,
+                        bricks_created_this_tick=num_bricks,
                         input_price=price
                     )
-                    if not isinstance(meta.get("rejection_reason"), list):
-                        meta["rejection_reason"] = []
-                    if event is not None:
-                        meta["brick_events"].append(event.to_dict())
-                    else:
-                        meta["brick_events"].append({"brick_sequence": self.brick_sequence, "capped": True})
+                    meta["brick_events"].append(event.to_dict())
 
                 self.last_tick_bricks_created = -num_bricks
-                meta["rejection_reason"] = -num_bricks  # capped brick count
+                meta["bricks_created"] = -num_bricks
                 return -num_bricks, self.trend, meta
 
             elif price >= self.renko_open + self.locked_brick_size:
                 diff = price - (self.renko_open + self.locked_brick_size)
                 raw_num = 1 + int(diff // self.locked_brick_size)
-                num_bricks = min(raw_num, self.max_bricks_per_tick)
-                if raw_num > self.max_bricks_per_tick:
-                    self.last_tick_capped = True
-                    meta["capped"] = True
+                num_bricks = raw_num  # [4A] no cap-drop — full progression
 
                 self.trend = 1
                 self.last_reversal_timestamp = time.time()
@@ -365,7 +437,6 @@ class RenkoTracker:
                 b_close = b_open + self.locked_brick_size
                 self.renko_open = b_open
                 self.renko_close = b_close
-
 
                 sig_event_id = None
                 if is_adverse:
@@ -379,7 +450,7 @@ class RenkoTracker:
                     b_close=b_close,
                     trend=1,
                     is_reversal=True,
-                    bricks_created=1,
+                    bricks_created_this_tick=num_bricks,
                     input_price=price,
                     signal_emitted=is_adverse,
                     signal_reason=self.last_signal_reason,
@@ -397,16 +468,14 @@ class RenkoTracker:
                         b_close=b_close,
                         trend=1,
                         is_reversal=False,
-                        bricks_created=1,
+                        bricks_created_this_tick=num_bricks,
                         input_price=price
                     )
                     meta["brick_events"].append(c_event.to_dict())
 
-
                 self.last_tick_bricks_created = num_bricks
                 meta["bricks_created"] = num_bricks
                 return num_bricks, self.trend, meta
-
 
         return 0, self.trend, meta
 
@@ -417,15 +486,14 @@ class RenkoTracker:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "schema_version": 1,
-            "mode": "SINGLE_LEG_SHADOW",
             "capability_available": True,
-            "tracker_initialized": self.total_bricks > 0 or self.trend != 0,
-            "recovery_ready": self.total_bricks > 0,
+            "tracker_initialized": True,
             "symbol": self.symbol,
             "position_side": self.position_side,
             "price_source": self.price_source,
             "episode_id": self.episode_id,
             "trade_id": self.trade_id,
+            "episode_ordinal": self.episode_ordinal,
             "initialized_phase": self.initialized_phase,
             "initialized_at": self.initialized_at,
             "anchor_price": self.anchor_price,
@@ -435,6 +503,7 @@ class RenkoTracker:
             "locked_brick_size": self.locked_brick_size,
             "total_bricks": self.total_bricks,
             "brick_sequence": self.brick_sequence,
+            "source_receive_sequence": self.source_receive_sequence,
             "generation_id": self.generation_id,
             "max_bricks_per_tick": self.max_bricks_per_tick,
             "max_price_jump_points": self.max_price_jump_points,
@@ -443,6 +512,9 @@ class RenkoTracker:
             "last_signal_at": self.last_signal_at,
             "last_signal_reason": self.last_signal_reason,
             "telemetry_failure_count": self.telemetry_failure_count,
+            "dedupe_keys_loaded": self.dedupe_keys_loaded,
+            "dedupe_load_duration_ms": self.dedupe_load_duration_ms,
+            "malformed_lines_skipped": self.malformed_lines_skipped,
             "recent_bricks": self.get_recent_bricks(50)
         }
 
@@ -456,6 +528,8 @@ class RenkoTracker:
             price_source=str(data.get("price_source", "EXECUTABLE_BID")),
             episode_id=str(data.get("episode_id", "")),
             trade_id=str(data.get("trade_id", "")),
+            episode_ordinal=int(data.get("episode_ordinal", 1)),
+            generation_id=str(data.get("generation_id", "1")),
             initialized_phase=str(data.get("initialized_phase", "SINGLE_LEG")),
             max_bricks_per_tick=int(data.get("max_bricks_per_tick", 5)),
             max_price_jump_points=float(data.get("max_price_jump_points", 50.0)),
@@ -466,19 +540,27 @@ class RenkoTracker:
         tracker.trend = int(data.get("trend", 0))
         tracker.total_bricks = int(data.get("total_bricks", 0))
         tracker.brick_sequence = int(data.get("brick_sequence", 0))
-        tracker.generation_id = int(data.get("generation_id", 1))
+        tracker.source_receive_sequence = int(data.get("source_receive_sequence", 0))
+        tracker.generation_id = str(data.get("generation_id", "1"))
         tracker.last_reversal_timestamp = data.get("last_reversal_timestamp")
         tracker.last_signal_event_id = data.get("last_signal_event_id")
         tracker.last_signal_at = data.get("last_signal_at")
         tracker.last_signal_reason = data.get("last_signal_reason")
         tracker.telemetry_failure_count = int(data.get("telemetry_failure_count", 0))
+        tracker.dedupe_keys_loaded = int(data.get("dedupe_keys_loaded", 0))
+        tracker.dedupe_load_duration_ms = float(data.get("dedupe_load_duration_ms", 0.0))
+        tracker.malformed_lines_skipped = int(data.get("malformed_lines_skipped", 0))
         
         recent = data.get("recent_bricks", [])
         if isinstance(recent, list):
             for b in recent:
                 if isinstance(b, dict):
                     tracker._recent_bricks.append(b)
-                    key = f"{b.get('generation_id', 1)}:{b.get('single_leg_episode_id', '')}:{b.get('brick_sequence', 0)}"
-                    tracker._persisted_brick_keys.add(key)
+                    g_id = str(b.get("generation_id", 1))
+                    ep_id = str(b.get("single_leg_episode_id", ""))
+                    seq = b.get("brick_sequence")
+                    if seq is not None and isinstance(seq, int):
+                        key = f"{g_id}:{ep_id}:{seq}"
+                        tracker._persisted_brick_keys.add(key)
 
         return tracker

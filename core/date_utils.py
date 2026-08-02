@@ -202,6 +202,23 @@ def get_session(dt: Union[datetime, pd.Timestamp]):
     # 其餘為夜盤
     return 2
 
+def is_taifex_trading_session(dt) -> bool:
+    """Correct TAIFEX futures session calendar:
+    day 08:45-13:45, night 15:00-05:00 (wraps midnight).
+    Legacy get_session() uses a loose 08:00-14:59 day band — do not use it
+    for session gates. (2026-08-02 Step 4A)"""
+    if hasattr(dt, "dt"):
+        return dt.apply(is_taifex_trading_session)
+    try:
+        dt = pd.to_datetime(dt)
+    except Exception:
+        return True  # unknown → allow (fail-open for gate; downstream fail-closed)
+    hm = dt.hour * 100 + dt.minute
+    if 845 <= hm <= 1345:
+        return True
+    return hm >= 1500 or hm <= 500
+
+
 def is_night_session(dt: Union[datetime, pd.Timestamp, pd.DatetimeIndex, pd.Series]) -> Union[bool, pd.Series]:
     if isinstance(dt, pd.Series):
         return dt.apply(lambda x: get_session(x) == 2)

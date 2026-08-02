@@ -4095,51 +4095,81 @@ class TMFSpread(StrategyBase):
                         initialized_phase="SINGLE_LEG"
                     )
             
-            # Process tick with RenkoTracker — fail-closed capability guard
-            if not callable(getattr(self._renko_tracker, "add", None)):
-                logger.warning("[RENKO_CAPABILITY_UNAVAILABLE] add() missing on RenkoTracker — renko shadow disabled for this episode")
-                self._renko_tracker = None
-                return
-            try:
-                _r_bricks, _r_trend, _r_meta = self._renko_tracker.add(_rem_executable_price)
-            except Exception as _exc:
-                logger.warning("[RENKO_CAPABILITY_UNAVAILABLE] add() failed: %s — renko shadow disabled for this episode", _exc)
-                self._renko_tracker = None
-                return
-
-            # [B1] persist renko_status on brick events via canonical CAS writer
-            if _r_bricks > 0 and getattr(self, "_renko_tracker", None) is not None:
+            # [4A] Session Calendar Gate + Gap Re-entry (renko-only; hard-risk untouched)
+            _renko_gate_ok = True
+            _renko_bar_ts = bar.get("timestamp", bar.get("ts"))
+            if _renko_bar_ts is not None:
                 try:
-                    _write_mts_state(
-                        has_position=True, action="RENKO_BRICK", reason=f"bricks={_r_bricks}",
-                        trade_id=getattr(self, "_trade_id", ""),
-                        ticker=getattr(self, "_ticker", "TMF"),
-                        lifecycle=lifecycle_to_dict(self._lifecycle_oca) if hasattr(self, "_lifecycle_oca") else {},
-                        renko_status=_renko_status_payload(self),
-                    )
-                except Exception as _bexc:
-                    logger.warning("[RENKO_STATE_WRITE_ERR] %s", _bexc)
-            
-            # Item B & E: Adverse reversal detection with 2-Layer Idempotency
-            if _renko_exit_enabled and _r_meta.get("is_adverse_reversal", False):
-                _event_key = f"{getattr(self, '_trade_id', '')}:1:{self._renko_tracker.generation_id}:{self._renko_tracker.brick_sequence}:{_r_trend}"
-                _emitted = getattr(self, "_emitted_renko_event_keys", set())
-                
-                if _event_key not in _emitted:
-                    # Item D: Check idempotency & lifecycle pending orders before signaling exit
-                    _has_pending = False
-                    if hasattr(self, "_order_mgr") and self._order_mgr:
-                        _has_pending = bool(getattr(self._order_mgr, "has_pending_exit", lambda: False)())
-                    
-                    if not _has_pending:
-                        _renko_signal_exit = True
-                        if not hasattr(self, "_emitted_renko_event_keys"):
-                            self._emitted_renko_event_keys = set()
-                        self._emitted_renko_event_keys.add(_event_key)
-                        logger.warning(
-                            "[MTS_RENKO_EXIT_SIGNAL] event_key=%s side=%s price=%.1f bricks=%d open=%.1f close=%.1f",
-                            _event_key, self._side, _rem_executable_price, _r_bricks, self._renko_tracker.renko_open, self._renko_tracker.renko_close
+                    from core.date_utils import is_taifex_trading_session
+                    _renko_dt = pd.Timestamp(_renko_bar_ts)
+                    _renko_in_session = bool(is_taifex_trading_session(_renko_dt))
+                except Exception:
+                    _renko_in_session = True
+                if not _renko_in_session:
+                    _renko_gate_ok = False
+                    logger.info("[RENKO_SESSION_GATE_REJECT] ts=%s — non-session tick; renko add skipped (zero mutation)", _renko_bar_ts)
+            if _renko_gate_ok:
+                try:
+                    _renko_now_ts = float(pd.Timestamp(_renko_bar_ts).timestamp()) if _renko_bar_ts is not None else None
+                except Exception:
+                    _renko_now_ts = None
+                _renko_last = getattr(self, "_renko_last_accepted_ts", None)
+                if _renko_now_ts is not None and _renko_last is not None and (_renko_now_ts - _renko_last) >= 900:
+                    self._renko_gap_quarantine_left = 2
+                    logger.info("[RENKO_GAP_REENTRY] gap>=900s since last accepted renko tick — next 2 ticks quarantined")
+                if getattr(self, "_renko_gap_quarantine_left", 0) > 0:
+                    self._renko_gap_quarantine_left -= 1
+                    _renko_gate_ok = False
+                    logger.info("[RENKO_GAP_QUARANTINE] remaining=%d ts=%s — add skipped (zero mutation)",
+                                getattr(self, "_renko_gap_quarantine_left", 0), _renko_bar_ts)
+                elif _renko_now_ts is not None:
+                    self._renko_last_accepted_ts = _renko_now_ts
+            if _renko_gate_ok:
+                # Process tick with RenkoTracker — fail-closed capability guard
+                if not callable(getattr(self._renko_tracker, "add", None)):
+                    logger.warning("[RENKO_CAPABILITY_UNAVAILABLE] add() missing on RenkoTracker — renko shadow disabled for this episode")
+                    self._renko_tracker = None
+                    return
+                try:
+                    _r_bricks, _r_trend, _r_meta = self._renko_tracker.add(_rem_executable_price)
+                except Exception as _exc:
+                    logger.warning("[RENKO_CAPABILITY_UNAVAILABLE] add() failed: %s — renko shadow disabled for this episode", _exc)
+                    self._renko_tracker = None
+                    return
+
+                # [B1] persist renko_status on brick events via canonical CAS writer
+                if _r_bricks > 0 and getattr(self, "_renko_tracker", None) is not None:
+                    try:
+                        _write_mts_state(
+                            has_position=True, action="RENKO_BRICK", reason=f"bricks={_r_bricks}",
+                            trade_id=getattr(self, "_trade_id", ""),
+                            ticker=getattr(self, "_ticker", "TMF"),
+                            lifecycle=lifecycle_to_dict(self._lifecycle_oca) if hasattr(self, "_lifecycle_oca") else {},
+                            renko_status=_renko_status_payload(self),
                         )
+                    except Exception as _bexc:
+                        logger.warning("[RENKO_STATE_WRITE_ERR] %s", _bexc)
+            
+                # Item B & E: Adverse reversal detection with 2-Layer Idempotency
+                if _renko_exit_enabled and _r_meta.get("is_adverse_reversal", False):
+                    _event_key = f"{getattr(self, '_trade_id', '')}:1:{self._renko_tracker.generation_id}:{self._renko_tracker.brick_sequence}:{_r_trend}"
+                    _emitted = getattr(self, "_emitted_renko_event_keys", set())
+                
+                    if _event_key not in _emitted:
+                        # Item D: Check idempotency & lifecycle pending orders before signaling exit
+                        _has_pending = False
+                        if hasattr(self, "_order_mgr") and self._order_mgr:
+                            _has_pending = bool(getattr(self._order_mgr, "has_pending_exit", lambda: False)())
+                    
+                        if not _has_pending:
+                            _renko_signal_exit = True
+                            if not hasattr(self, "_emitted_renko_event_keys"):
+                                self._emitted_renko_event_keys = set()
+                            self._emitted_renko_event_keys.add(_event_key)
+                            logger.warning(
+                                "[MTS_RENKO_EXIT_SIGNAL] event_key=%s side=%s price=%.1f bricks=%d open=%.1f close=%.1f",
+                                _event_key, self._side, _rem_executable_price, _r_bricks, self._renko_tracker.renko_open, self._renko_tracker.renko_close
+                            )
 
         rem_floating_pnl = (_rem_price - _rem_entry) if self._side == "LONG" else (_rem_entry - _rem_price)
 
