@@ -48,6 +48,13 @@ class SpreadShadowBridge:
             if sample is not None:
                 self._collector.record(sample)
                 return sample
+            if self._sync.last_rejection is not None:
+                self._collector.record({
+                    "event_type": "REJECTION",
+                    "rejection_reason": self._sync.last_rejection,
+                    "contract_code": self._sync.last_rejection_code,
+                    "collector_sequence": self._collector.collector_sequence + 1,
+                })
         except Exception:
             self.errors += 1
         return None

@@ -53,6 +53,8 @@ class SpreadSynchronizer:
         self._consumed = set()  # (leg, seq) — one tick consumed at most once
         self.samples: List[SpreadSample] = []
         self.rejections: List[str] = []
+        self.last_rejection: Optional[str] = None
+        self.last_rejection_code: Optional[str] = None
         self._seq = 0
 
     def _accept_leg(self, leg, quote):
@@ -86,6 +88,8 @@ class SpreadSynchronizer:
         err = self._accept_leg("near", quote)
         if err:
             self.rejections.append(err)
+            self.last_rejection = err
+            self.last_rejection_code = quote.get("code", "")
             return None
         self._consumed.add(("near", int(quote["seq"])))
         self._near_last_seq = int(quote["seq"])
@@ -96,6 +100,8 @@ class SpreadSynchronizer:
         err = self._accept_leg("far", quote)
         if err:
             self.rejections.append(err)
+            self.last_rejection = err
+            self.last_rejection_code = quote.get("code", "")
             return None
         self._consumed.add(("far", int(quote["seq"])))
         self._far_last_seq = int(quote["seq"])
