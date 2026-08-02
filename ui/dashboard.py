@@ -4248,13 +4248,13 @@ elif _selected_product == "TMF":
                                 _ref_last = _fl if _trail_s == "SHORT" else _nl
                                 st.caption(f"Trail: {_trail_s} peak={_tp:.0f} nadir={_tn:.0f} stop={_ts_price:.0f} last={_ref_last:.0f} dist={_dist:.0f}pt")
 
-                            _renko_info = _mts_state.get("renko_status", {})
-                            if _renko_info and _renko_info.get("enabled"):
+                            _renko_info = _mts_state.get("renko_status")
+                            if isinstance(_renko_info, dict) and (_renko_info.get("tracker_initialized") or _renko_info.get("capability_available") or _renko_info.get("enabled")):
                                 _rt_trend = _renko_info.get("trend", 0)
-                                _rt_trend_str = "🟢 多頭" if _rt_trend == 1 else ("🔴 空頭" if _rt_trend == -1 else "⚪ 平盤")
-                                _rt_open = _renko_info.get("open", 0.0)
-                                _rt_close = _renko_info.get("close", 0.0)
-                                _rt_bsize = _renko_info.get("brick_size", 0.0)
+                                _rt_trend_str = "🟢 上行" if _rt_trend == 1 else ("🔴 下行" if _rt_trend == -1 else "⚪ 平盤")
+                                _rt_open = _renko_info.get("renko_open", _renko_info.get("open", 0.0))
+                                _rt_close = _renko_info.get("renko_close", _renko_info.get("close", 0.0))
+                                _rt_bsize = _renko_info.get("locked_brick_size", _renko_info.get("brick_size", 0.0))
                                 _rt_total = _renko_info.get("total_bricks", 0)
                                 st.caption(f"🧱 Renko 去噪線: {_rt_trend_str} | 磚寬: {_rt_bsize:.1f}pt | 當前磚: {_rt_open:.0f} ~ {_rt_close:.0f} | 累計磚: {_rt_total}")
                             st.caption(f"Total UPL={_tu:+.1f}  Realized={_tr:+.1f}  Spread Z={_sz:.2f}  Reason: {_rson}")
