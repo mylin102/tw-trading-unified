@@ -1591,7 +1591,24 @@ class FuturesMonitor:
         )
 
     def on_tick(self, exchange, tick):
-        self.last_tick_at = time.time()  # [gstack] 更新數據更新時間
+        self.last_tick_at = time.time()
+        # [P2] Spread shadow bridge — accepted-tick shadow path (disabled by default)
+        try:
+            if os.environ.get("MTS_SPREAD_SHADOW_ENABLED", "").lower() in ("1", "true", "yes"):
+                from core.spread_shadow_bridge import get_bridge
+                _br = get_bridge()
+                _code = str(getattr(tick, "code", "") or "")
+                _px = float(getattr(tick, "close", 0) or 0)
+                if _br.enabled and _code and _px > 0:
+                    _br.on_tick("near" if _code == getattr(self, "_near_code", "") else "far", {
+                        "code": _code,
+                        "price": _px,
+                        "seq": getattr(getattr(self, "_quote_guard", None), "_receive_seq", 0),
+                        "ts_ms": time.time() * 1000.0,
+                        "session_id": "UNKNOWN",
+                    })
+        except Exception:
+            pass  # shadow path must never affect the trading loop  # [gstack] 更新數據更新時間
 
         # [P0b] Quote Integrity Gate — one decision, one destination
         if getattr(self, "_quote_guard", None) is None:
