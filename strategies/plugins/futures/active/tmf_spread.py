@@ -1479,6 +1479,7 @@ class TMFSpread(StrategyBase):
         #  kept here only for anchor fields)
         self._single_leg_anchor_price: float = 0.0
         self._single_leg_anchor_event_time_ns: float = 0.0
+        self._renko_tracker = None  # 2026-08-02 Antigravity: RenkoTracker instance
 
         # P1: Spread-level excursions (telemetry only)
         self._spread_near_high: float = 0.0
@@ -4023,6 +4024,36 @@ class TMFSpread(StrategyBase):
         atr_val = bar.get("atr")
         if not atr_val or pd.isna(atr_val):
             atr_val = self._last_atr or 20.0
+        # 2026-08-02 Antigravity: RenkoTracker integration (r2) for noise-filtered single-leg exit tracking
+        _renko_exit_enabled = bool(getattr(self, "_params", {}).get("enable_renko_exit", False))
+        _renko_brick_mult = float(getattr(self, "_params", {}).get("renko_brick_multiplier", 0.5))
+        _renko_signal_exit = False
+
+        if self._lifecycle_oca and self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG:
+            if getattr(self, "_renko_tracker", None) is None:
+                from strategies.plugins.futures.active.renko_tracker import RenkoTracker
+                self._renko_tracker = RenkoTracker(
+                    anchor_price=_rem_price,
+                    brick_size=max(atr_val * _renko_brick_mult, 2.0),
+                    symbol=_rem_leg_label
+                )
+            
+            self._renko_tracker.update_brick_size(atr=atr_val, multiplier=_renko_brick_mult, min_floor=2.0)
+            _r_bricks, _r_trend = self._renko_tracker.add(_rem_price)
+            
+            if _renko_exit_enabled:
+                if self._side == "LONG" and _r_trend == -1 and _r_bricks < 0:
+                    _renko_signal_exit = True
+                    logger.warning(
+                        "[MTS_RENKO_EXIT_SIGNAL] side=LONG rem_price=%.1f bricks=%d open=%.1f close=%.1f",
+                        _rem_price, _r_bricks, self._renko_tracker.renko_open, self._renko_tracker.renko_close
+                    )
+                elif self._side == "SHORT" and _r_trend == 1 and _r_bricks > 0:
+                    _renko_signal_exit = True
+                    logger.warning(
+                        "[MTS_RENKO_EXIT_SIGNAL] side=SHORT rem_price=%.1f bricks=%d open=%.1f close=%.1f",
+                        _rem_price, _r_bricks, self._renko_tracker.renko_open, self._renko_tracker.renko_close
+                    )
 
         rem_floating_pnl = (_rem_price - _rem_entry) if self._side == "LONG" else (_rem_entry - _rem_price)
 
@@ -4294,6 +4325,7 @@ class TMFSpread(StrategyBase):
         # trade settle so stale extrema never leak into a new trade.
         self._single_leg_peak = 0.0
         self._single_leg_nadir = 0.0
+        self._renko_tracker = None
 
 
     def _is_trade_settled_flat(self) -> bool:

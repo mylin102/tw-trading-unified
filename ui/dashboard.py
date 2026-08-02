@@ -4247,6 +4247,16 @@ elif _selected_product == "TMF":
                                 _dist = _mts_state.get("distance_to_stop", 0)
                                 _ref_last = _fl if _trail_s == "SHORT" else _nl
                                 st.caption(f"Trail: {_trail_s} peak={_tp:.0f} nadir={_tn:.0f} stop={_ts_price:.0f} last={_ref_last:.0f} dist={_dist:.0f}pt")
+
+                            _renko_info = _mts_state.get("renko_status", {})
+                            if _renko_info and _renko_info.get("enabled"):
+                                _rt_trend = _renko_info.get("trend", 0)
+                                _rt_trend_str = "🟢 多頭" if _rt_trend == 1 else ("🔴 空頭" if _rt_trend == -1 else "⚪ 平盤")
+                                _rt_open = _renko_info.get("open", 0.0)
+                                _rt_close = _renko_info.get("close", 0.0)
+                                _rt_bsize = _renko_info.get("brick_size", 0.0)
+                                _rt_total = _renko_info.get("total_bricks", 0)
+                                st.caption(f"🧱 Renko 去噪線: {_rt_trend_str} | 磚寬: {_rt_bsize:.1f}pt | 當前磚: {_rt_open:.0f} ~ {_rt_close:.0f} | 累計磚: {_rt_total}")
                             st.caption(f"Total UPL={_tu:+.1f}  Realized={_tr:+.1f}  Spread Z={_sz:.2f}  Reason: {_rson}")
                         else:
                             st.info("MTS 價差: 無持倉")
@@ -6077,6 +6087,8 @@ elif page == "設定":
                     futures_cfg["mts"]["params"]["enable_combined_upl_trail"] = f_policy_j_enable
                     futures_cfg["mts"]["params"]["combined_upl_activation_net_pnl_twd"] = f_policy_j_activation
                     futures_cfg["mts"]["params"]["combined_upl_giveback_twd"] = f_policy_j_giveback
+                    futures_cfg["mts"]["params"]["enable_renko_exit"] = f_renko_enable
+                    futures_cfg["mts"]["params"]["renko_brick_multiplier"] = f_renko_mult
 
                 futures_cfg["strategy"]["active_strategy"] = f_strat_new
                 futures_cfg["strategy"]["regime_filter"] = f_regime
