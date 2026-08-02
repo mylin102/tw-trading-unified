@@ -10,8 +10,20 @@ import os
 from core.spread_renko_shadow import SpreadRenkoShadowCollector
 from core.spread_synchronizer import SpreadSynchronizer
 
-# Shadow activation: env var or explicit enable. Default OFF.
-_ENABLED = os.environ.get("MTS_SPREAD_SHADOW_ENABLED", "").lower() in ("1", "true", "yes")
+# Shadow activation: env var OR canary flag file (data/shadow_canary.flag).
+# Default OFF — production behaviour bit-identical without either.
+# Canary flag avoids touching PM2 saved config (ecosystem restart would change
+# --config futures -> futures,futures_mtx — NOT acceptable).
+def _shadow_enabled():
+    if os.environ.get("MTS_SPREAD_SHADOW_ENABLED", "").lower() in ("1", "true", "yes"):
+        return True
+    try:
+        return os.path.exists(os.path.join("data", "shadow_canary.flag"))
+    except OSError:
+        return False
+
+
+_ENABLED = _shadow_enabled()
 
 
 class SpreadShadowBridge:

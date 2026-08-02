@@ -1594,7 +1594,8 @@ class FuturesMonitor:
         self.last_tick_at = time.time()
         # [P2] Spread shadow bridge — accepted-tick shadow path (disabled by default)
         try:
-            if os.environ.get("MTS_SPREAD_SHADOW_ENABLED", "").lower() in ("1", "true", "yes"):
+            from core.spread_shadow_bridge import _shadow_enabled
+            if _shadow_enabled():
                 from core.spread_shadow_bridge import get_bridge
                 _br = get_bridge()
                 _code = str(getattr(tick, "code", "") or "")
