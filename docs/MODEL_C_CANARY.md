@@ -116,18 +116,52 @@ pre-open/stale spread mark for the trigger evaluation.
 validation (promotion gate: DO_NOT_REPLACE_MARKING_IN_EXECUTION_PATH).
 Record as Model C acceptance target case instead.
 
-**Model C validation check for TC-1**:
-- Can Model C rebuild the opening-instant (15:00:00.000) executable mark
-  (near/far bid-ask at first tick)?
-- Does Model C executable mark track realized (+4,950) far better than the
-  stale ctx mark (+348)?
-- If yes -> evidence that executable BBO marking fixes opening-gap
-  mis-marking; proceed to shadow decision comparison.
 
 ### TC-2: Far-leg release-stop intercept at open (same trade)
 Far leg hit release stop while combined net >= activation -> COMBINED_EXIT
-intercept. Verify Model C far-leg executable pnl (SHORT->ask) at the same
-instant matches the realized far pnl (-2,350) within tolerance.
+intercept. Position: NEAR SHORT 43260 / FAR LONG 43405; FAR exit action SELL.
+Verify Model C far-leg executable PnL for the FAR LONG leg using the
+executable bid (LONG -> bid) at the decision timestamp, and compare it with
+the realized FAR PnL of -2,350 TWD within the predefined tolerance.
+
+### TC-1 validation wording (corrections, 2026-08-03)
+
+**Timestamp** (do NOT fixate on 15:00:00.000): the actual submission event
+is `15:00:00.077`. Validate against:
+- the Policy J decision/submission timestamp (`15:00:00.077`, or the
+  canonical event timestamp from the raw record), OR
+- the most recent available as-of BBO snapshot strictly BEFORE that
+  timestamp (no future quotes — no look-ahead bias),
+recording near quote age, far quote age, inter-leg skew, snapshot
+completeness, and compliance with the Model C freshness contract.
+
+Can Model C reconstruct a complete, freshness-qualified executable BBO
+snapshot as of the Policy J decision timestamp, without using future quotes?
+
+**Three-error comparison** (executable mark != realized fill — order
+latency / market movement / slippage / fees / quote incompleteness may
+differ). Acceptance compares all three:
+
+```
+ctx_error     = abs(ctx_mark_pnl       - realized_gross_pnl)   # 4,602 TWD (348 vs 4950)
+event_error   = abs(event_mark_pnl     - realized_gross_pnl)   # 4,510 TWD (440 vs 4950)
+model_c_error = abs(model_c_executable - realized_gross_pnl)
+```
+
+TC-1 success:
+- Model C snapshot complete and passes freshness/skew contract; AND
+- `model_c_error` materially lower than both `ctx_error` and `event_error`;
+- error within predefined tolerance;
+- if the snapshot is incomplete -> mark result `UNOBSERVABLE` — never
+  fabricate a fill-in, never claim Model C failed on missing data.
+
+**Root cause wording (pending per-leg timestamp reconstruction)**: the
+opening decision used a stale or asynchronously refreshed spread mark. The
+exact composition — both legs stale versus one fresh leg paired with one
+stale leg — must be established from raw per-leg timestamps before labeling
+the whole mark `pre-open/stale`. Kept from the original record: NOT a
+wrong-exit bug; do NOT change current Policy J execution marking; remains a
+Model C acceptance target case.
 
 ## 8. Verdicts (fixed until canary completes)
 
