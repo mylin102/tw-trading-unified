@@ -1,0 +1,35 @@
+#!/bin/bash
+# commit-msg hook — enforce agent provenance on every commit.
+#
+# Every committing agent MUST export AGENT_NAME before committing:
+#   export AGENT_NAME=hermes        (Hermes Agent)
+#   export AGENT_NAME=gemini        (Gemini CLI)
+#   export AGENT_NAME=antigravity   (Antigravity CLI)
+#   export AGENT_NAME=human         (manual operator)
+#
+# Without it the commit is REJECTED (message kept in .git/COMMIT_EDITMSG).
+# When set, a provenance line is appended so history shows who authored it.
+
+if [ -z "$AGENT_NAME" ]; then
+    echo ""
+    echo "ERROR: AGENT_NAME not set — refusing commit without agent provenance." >&2
+    echo "       Export your identity first, e.g.:  export AGENT_NAME=hermes" >&2
+    echo "       Allowed: hermes | gemini | antigravity | human" >&2
+    echo "       (Your message is preserved in .git/COMMIT_EDITMSG)" >&2
+    exit 1
+fi
+
+case "$AGENT_NAME" in
+    hermes|gemini|antigravity|human) ;;
+    *)
+        echo "ERROR: AGENT_NAME='$AGENT_NAME' not in allowed list (hermes|gemini|antigravity|human)" >&2
+        exit 1
+        ;;
+esac
+
+if ! grep -q "^Provenance: committed-by=" "$1" 2>/dev/null; then
+    echo "" >> "$1"
+    echo "Provenance: committed-by=$AGENT_NAME" >> "$1"
+fi
+
+exit 0
