@@ -1510,6 +1510,9 @@ class TMFSpread(StrategyBase):
         self._single_leg_peak: float = 0.0
         self._single_leg_nadir: float = 0.0
         self._single_leg_post_fill_ticks: int = 0
+        self._single_leg_peak: float = 0.0
+        self._single_leg_nadir: float = 0.0
+        self._single_leg_post_fill_ticks: int = 0
         self._single_leg_anchor_price: float = 0.0
         self._single_leg_anchor_event_time_ns: float = 0.0
         self._renko_tracker = None
