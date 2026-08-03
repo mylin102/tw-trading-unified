@@ -1594,6 +1594,7 @@ class FuturesMonitor:
         self.last_tick_at = time.time()
         # [P2] Spread shadow bridge — accepted-tick shadow path (disabled by default)
         try:
+            self._shadow_seq = getattr(self, "_shadow_seq", 0) + 1
             from core.spread_shadow_bridge import _shadow_enabled
             if _shadow_enabled():
                 from core.spread_shadow_bridge import get_bridge
@@ -1613,7 +1614,7 @@ class FuturesMonitor:
                         _br.on_tick(_leg, {
                             "code": _code,
                             "price": _px,
-                            "seq": getattr(getattr(self, "_quote_guard", None), "_receive_seq", 0),
+                            "seq": getattr(self, "_shadow_seq", 0),
                             "ts_ms": time.time() * 1000.0,
                             "session_id": "UNKNOWN",
                         })
