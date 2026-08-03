@@ -244,6 +244,49 @@ def live_preflight_context(
     )
 
 
+def preflight_validate(api, contracts_ok: bool = True) -> list:
+    """Substantive preflight checks for LIVE transition (GAP-2 fix).
+
+    Returns a list of failure strings (empty list == all checks passed).
+    Checks are deliberately conservative (existence + readability), so a
+    misconfigured broker never silently authorizes live orders.
+    """
+    failures = []
+    if api is None:
+        failures.append("BROKER_NOT_CONNECTED")
+    else:
+        # login state: accept either login_info or an is_login()/is_logged_in flag
+        login_ok = bool(getattr(api, "login_info", None))
+        if not login_ok:
+            check = getattr(api, "is_login", None) or getattr(api, "is_logged_in", None)
+            if callable(check):
+                try:
+                    login_ok = bool(check())
+                except Exception:
+                    login_ok = False
+        if not login_ok:
+            failures.append("BROKER_NOT_LOGGED_IN")
+        # account readability
+        if not hasattr(api, "account"):
+            failures.append("ACCOUNT_UNREADABLE")
+    if not contracts_ok:
+        failures.append("CONTRACTS_NOT_READY")
+    return failures
+
+
+def transition_to_live_ready(ctx, failures) -> "ExecutionContext":
+    """PREFLIGHT -> LIVE_READY (all checks passed) or LIVE_QUARANTINED.
+
+    LIVE_QUARANTINED is permanent fail-closed: live orders stay blocked
+    until an operator explicitly rebuilds the context (no auto-retry).
+    """
+    if failures:
+        return with_effective_mode(ctx, ModeTransitionState.LIVE_QUARANTINED.value,
+                                   live_order_allowed=False)
+    return with_effective_mode(ctx, ModeTransitionState.LIVE_READY.value,
+                               live_order_allowed=True)
+
+
 def with_effective_mode(
     ctx: ExecutionContext,
     new_mode: str | ModeTransitionState,
