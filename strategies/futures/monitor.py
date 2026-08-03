@@ -7577,6 +7577,65 @@ class FuturesMonitor:
 
         tracker["status"] = "BOTH_FILLED"
 
+        # 2026-08-03 Phase B: canonical combined settlement event.
+        # One COMBINED_EXIT_SETTLED per trade — never re-emitted across
+        # restart / duplicate callback (dedupe by trade_id + fills log scan).
+        try:
+            from strategies.plugins.futures.active.tmf_spread import _append_fill
+            _ce_id = trade_id  # combined_exit_id == trade_id for MTS lifecycle
+            _has_settled = False
+            from strategies.plugins.futures.active.tmf_spread import _MTS_FILL_LOG as _FL
+            if os.path.exists(_FL):
+                with open(_FL, encoding="utf-8") as _flf:
+                    for _ln in _flf:
+                        try:
+                            _jr = json.loads(_ln.strip())
+                        except Exception:
+                            continue
+                        if _jr.get("event_type") == "COMBINED_EXIT_SETTLED" and _jr.get("trade_id") == trade_id:
+                            _has_settled = True
+                            break
+            if not _has_settled:
+                _pv2 = float((getattr(self, "cfg", None) or {}).get("point_value", 10) or 10)
+                _set = {}
+                for _lk, _ln in (("near", "NEAR"), ("far", "FAR")):
+                    _sb = tracker.get(f"{_lk}_side") or "UNKNOWN"
+                    _en = float(tracker.get(f"{_lk}_entry") or 0.0)
+                    _ex = tracker.get(f"{_lk}_price")
+                    if _ex is None:
+                        _ex = float(price or 0.0)
+                    _q = int(tracker.get(f"{_lk}_filled_qty") or 0)
+                    _sgn = 1.0 if str(_sb).upper() == "LONG" else -1.0
+                    _g = (_ex - _en) * _q * _pv2 * _sgn
+                    _set[f"{_lk}_entry_avg_price"] = _en
+                    _set[f"{_lk}_exit_avg_price"] = float(_ex)
+                    _set[f"{_lk}_closed_qty"] = _q
+                    _set[f"{_lk}_realized_pnl_gross"] = round(_g, 1)
+                _combined_gross = round(_set["near_realized_pnl_gross"] + _set["far_realized_pnl_gross"], 1)
+                _append_fill(
+                    ticker=getattr(self, "ticker", "TMF"),
+                    contract="", leg="", side="", qty=0, price=0.0,
+                    fill_type="COMBINED_EXIT_SETTLED",
+                    trade_id=trade_id,
+                    event_type="COMBINED_EXIT_SETTLED",
+                    combined_exit_id=_ce_id,
+                    near_contract=self.contract.code if getattr(self, "contract", None) else "NEAR",
+                    far_contract=self.far_contract.code if getattr(self, "far_contract", None) else "FAR",
+                    combined_realized_pnl_gross=_combined_gross,
+                    combined_realized_pnl_net=None,
+                    pnl_status="GROSS_ONLY",
+                    fees=None,
+                    tax=None,
+                    settlement_origin="LIVE",
+                    price_confidence="EXACT",
+                    settled_at=datetime.now().isoformat(),
+                    **_set,
+                )
+                console.print(f"[green]📗 [COMBINED_EXIT_SETTLED] trade_id={trade_id} gross={_combined_gross:+.0f}[/green]")
+        except Exception as _se:
+            console.print(f"[red] [COMBINED_EXIT_SETTLED_ERR] trade_id={trade_id} error={_se}[/red]")
+
+
         # ADR-024E: Validate tracker schema before durable commit
         try:
             self._validate_combined_exit_tracker(tracker)
