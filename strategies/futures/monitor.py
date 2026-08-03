@@ -1604,6 +1604,41 @@ class FuturesMonitor:
 
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()
+        # [Model C canary 2026-08-03] synchronized BBO executable marking —
+        # shadow only. Flag-gated dynamically (data/model_c_canary.flag).
+        try:
+            _mc_flag = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "model_c_canary.flag")
+            if os.path.exists(_mc_flag):
+                _code = str(getattr(tick, "code", "") or "")
+                _near_c = str(getattr(getattr(self, "contract", None), "code", "") or "")
+                _far_c = str(getattr(getattr(self, "far_contract", None), "code", "") or "")
+                _leg = None
+                if _code and _code == _near_c:
+                    _leg = "NEAR"
+                elif _code and _code == _far_c:
+                    _leg = "FAR"
+                if _leg:
+                    if not hasattr(self, "_model_c"):
+                        from core.model_c_collector import ModelCCollector
+                        _td = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "telemetry", "model_c")
+                        os.makedirs(_td, exist_ok=True)
+                        _day = datetime.now().strftime("%Y%m%d")
+                        self._model_c = ModelCCollector(
+                            os.path.join(_td, f"model_c_{_day}.jsonl"),
+                            bbo_raw_path=os.path.join(_td, f"bbo_raw_{_day}.jsonl"))
+                    _bid = getattr(tick, "buy_price", None)
+                    _ask = getattr(tick, "sell_price", None)
+                    if _bid is not None or _ask is not None:
+                        self._model_c.on_quote(
+                            _leg, _bid, _ask,
+                            bid_size=getattr(tick, "buy_volume", None),
+                            ask_size=getattr(tick, "sell_volume", None),
+                            receive_ts=datetime.now().isoformat(),
+                            seq=getattr(tick, "seq", None),
+                            contract_code=_code,
+                            source="shioaji_tick")
+        except Exception:
+            pass
         # [P2] Spread shadow bridge — accepted-tick shadow path (disabled by default)
         try:
             self._shadow_seq = getattr(self, "_shadow_seq", 0) + 1
