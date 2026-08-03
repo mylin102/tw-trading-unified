@@ -5476,7 +5476,7 @@ elif page == "策略管道":
             except Exception as e:
                 st.error(f"Error: {e}")
 
-elif page == "🧪 離線反事實模擬":
+elif page in ("🔄 反事實研究室", "🧪 離線反事實模擬"):
     st.header("🔄 反事實研究室 (Counterfactual Lab)")
     st.caption("基於已完結交易的點重播 (Point Replay) 驗證與離線反事實模擬")
     
