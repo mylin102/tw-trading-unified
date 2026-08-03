@@ -5940,10 +5940,11 @@ elif page == "設定":
             icon = "✅" if r.passed else "❌"
             st.caption(f"{icon} **{r.name}**: {r.detail}")
 
-        # Action recommendation
-        if passed == total:
-            st.success("🎉 所有檢查通過！可以考慮進入 Phase 2 小額實盤測試")
-            # 2026-05-27 Gemini CLI: Dynamic Ticker in Recommendation
+        # Action recommendation (mode-aware — 2026-08-03)
+        if status == "PAPER MODE":
+            st.info("📋 目前 Paper 模式 — 不建議實盤（go-live 前置條件未滿足，見 docs/LIVE_TRANSITION_SOP.md §5）")
+        elif status == "READY":
+            st.success("🎉 所有檢查通過且已完成 transition — 可考慮進入 Phase 2 小額實盤測試")
             st.info(f"建議: 先用 1 口 {_TICKER} 測試 5 個交易日，設定每日最大虧損 2%")
         elif passed >= total * 0.6:
             remaining = total - passed
