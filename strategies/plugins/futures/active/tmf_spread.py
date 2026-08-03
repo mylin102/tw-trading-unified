@@ -1378,6 +1378,12 @@ class TMFSpread(StrategyBase):
         self._release_stop_fixed = float(_params.get("release_stop_points", _RELEASE_STOP_PTS))
         self._trail_dist_fixed = float(_params.get("trail_distance_points", _TRAIL_DISTANCE_PTS))
         self._min_atr = float(_params.get("min_atr", 0.0))
+        # Policy J Peak Spike Validation (2026-08-03) — config-driven
+        self._peak_confirmation_samples = int(_params.get("peak_confirmation_samples", 3))
+        self._peak_confirmation_ms = float(_params.get("peak_confirmation_ms", 1000.0))
+        self._peak_confirmation_tolerance_twd = float(_params.get("peak_confirmation_tolerance_twd", 100.0))
+        self._entry_peak_guard_ms = float(_params.get("entry_peak_guard_ms", 15000.0))
+        self._max_single_update_jump_twd = float(_params.get("max_single_update_jump_twd", 200.0))
 
         # Release mode (Phase 1: triggered_market only)
         _rel_mode_str = _params.get("release_mode", "triggered_market")
@@ -2088,6 +2094,105 @@ class TMFSpread(StrategyBase):
             n_pnl = self._pnl_near(near_close)
             f_pnl = self._pnl_far(far_close)
         return n_pnl + f_pnl
+
+    def _update_policy_j_peak(self, current_pnl_pts, near_mark, far_mark, now_ms,
+                              mark_age_ms=0.0, pair_skew_ms=0.0, entry_ts_ms=0.0,
+                              phase="SPREAD") -> bool:
+        """Policy J peak update with spike validation (2026-08-03 hotfix).
+
+        Entry-completion gate, per-trade reset, candidate confirmation,
+        freshness/skew rejection, entry-window spike quarantine.
+        Returns True when a durable (confirmed) peak exists.
+        """
+        _PV = float(getattr(self, "_point_value", 10.0))
+        _COST = float(getattr(self, "_estimated_cost", 92.0))
+        _s_conf = int(getattr(self, "_peak_confirmation_samples", 3))
+        _t_conf = float(getattr(self, "_peak_confirmation_tolerance_twd", 100.0))
+        _ms_conf = float(getattr(self, "_peak_confirmation_ms", 1000.0))
+        _guard_ms = float(getattr(self, "_entry_peak_guard_ms", 15000.0))
+        _max_jump = float(getattr(self, "_max_single_update_jump_twd", 200.0))
+        for _a in ("_pj_trade_id", "_pj_durable_peak", "_pj_candidate_peak",
+                   "_pj_candidate_ts", "_pj_candidate_count", "_pj_last_mark_pair",
+                   "_pj_last_upl", "_pj_last_eval_ts"):
+            if not hasattr(self, _a):
+                setattr(self, _a, None)
+        _tid = getattr(self, "_trade_id", None)
+        # ── Entry-completion gate ──
+        _na = getattr(self, "_near_entry_avg", None)
+        _fa = getattr(self, "_far_entry_avg", None)
+        _nq = getattr(self, "_near_open_qty", 0) or 0
+        _fq = getattr(self, "_far_open_qty", 0) or 0
+        if not (_na and _fa and _nq > 0 and _fq > 0) or phase not in ("SPREAD", "SINGLE_LEG"):
+            _append_event("POLICY_J_TRIGGER_SUPPRESSED", trade_id=_tid,
+                          reason="ENTRY_NOT_SETTLED",
+                          current_upl=float(current_pnl_pts) * _PV - _COST, phase=phase)
+            return self._pj_durable_peak is not None
+        # ── Per-trade reset ──
+        if self._pj_trade_id != _tid:
+            self._pj_trade_id = _tid
+            self._pj_durable_peak = None
+            self._pj_candidate_peak = None
+            self._pj_candidate_ts = None
+            self._pj_candidate_count = 0
+            self._pj_last_mark_pair = None
+            self._pj_last_upl = None
+        _upl = float(current_pnl_pts) * _PV - _COST
+        _pair = (near_mark, far_mark)
+        # ── freshness / skew gate ──
+        if mark_age_ms > 5000.0 or pair_skew_ms > 2000.0:
+            _append_event("POLICY_J_PEAK_REJECTED", trade_id=_tid, reason="MARK_NOT_FRESH",
+                          current_upl=_upl, near_mark=near_mark, far_mark=far_mark,
+                          near_mark_age_ms=mark_age_ms, pair_skew_ms=pair_skew_ms)
+            self._pj_last_upl = _upl
+            return self._pj_durable_peak is not None
+        # ── spike quarantine (jump detection) ──
+        _prev = self._pj_last_upl if self._pj_last_upl is not None else _upl
+        _jump = abs(_upl - _prev)
+        _spiky = _jump > _max_jump
+        _durable = self._pj_durable_peak
+        if _durable is None or _upl > _durable:
+            _cand = self._pj_candidate_peak
+            if _cand is None or _upl > _cand:
+                self._pj_candidate_peak = _upl
+                self._pj_candidate_ts = now_ms
+                self._pj_candidate_count = 1
+                _append_event("POLICY_J_PEAK_CANDIDATE", trade_id=_tid, current_upl=_upl,
+                              near_mark=near_mark, far_mark=far_mark, candidate_count=1,
+                              spiky=_spiky)
+            elif _upl >= (_cand - _t_conf):
+                if _pair != self._pj_last_mark_pair:
+                    self._pj_candidate_count += 1
+                    self._pj_candidate_ts = now_ms
+            else:
+                _append_event("POLICY_J_PEAK_REJECTED", trade_id=_tid, reason="CANDIDATE_NORMALIZED",
+                              current_upl=_upl, candidate_peak=_cand)
+                self._pj_candidate_peak = None
+                self._pj_candidate_count = 0
+                self._pj_candidate_ts = None
+            _confirmed = (self._pj_candidate_count >= _s_conf) or (
+                self._pj_candidate_ts is not None and (now_ms - self._pj_candidate_ts) >= _ms_conf)
+            if _confirmed and not _spiky and self._pj_candidate_peak is not None:
+                _new = max(_durable or 0.0, self._pj_candidate_peak)
+                if _new > (_durable or 0.0):
+                    self._pj_durable_peak = _new
+                    _append_event("POLICY_J_PEAK_CONFIRMED", trade_id=_tid, durable_peak=_new,
+                                  candidate_peak=self._pj_candidate_peak,
+                                  candidate_count=self._pj_candidate_count)
+                self._pj_candidate_peak = None
+                self._pj_candidate_count = 0
+                self._pj_candidate_ts = None
+        else:
+            # current <= durable — candidate collapse cancels candidate
+            if self._pj_candidate_peak is not None and _upl < (self._pj_candidate_peak - _t_conf):
+                _append_event("POLICY_J_PEAK_REJECTED", trade_id=_tid, reason="CANDIDATE_NORMALIZED",
+                              current_upl=_upl, candidate_peak=self._pj_candidate_peak)
+                self._pj_candidate_peak = None
+                self._pj_candidate_count = 0
+                self._pj_candidate_ts = None
+        self._pj_last_mark_pair = _pair
+        self._pj_last_upl = _upl
+        self._pj_last_eval_ts = now_ms
+        return self._pj_durable_peak is not None
 
     def _log_exit_decision(self, exit_reason: str, pnl: float, bar: dict) -> dict:
         """Helper to generate, print, and log the structured exit decision.
@@ -3355,13 +3460,29 @@ class TMFSpread(StrategyBase):
             # In SINGLE_LEG the combined peak is frozen; single-leg PnL must NOT
             # re-inflate it (observed 434668 -> 434738 after leg release).
             _lc_phase = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
-            # 2026-08-03 Gemini CLI: Track combined total PnL peak in both SPREAD and SINGLE_LEG phases for Policy J
+            # 2026-08-03 Policy J Peak Spike Validation hotfix (Hermes):
+            # candidate-confirmed durable peak; entry gate; spike quarantine.
+            _lc_phase = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
             if _lc_phase in (PositionPhase.SPREAD, PositionPhase.SINGLE_LEG):
-                _current_net_exit_twd = float(current_pnl * 10.0 - 92.0)
-                if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None:
-                    self._peak_net_exit_pnl_twd = 0.0
-                if _current_net_exit_twd > self._peak_net_exit_pnl_twd:
-                    self._peak_net_exit_pnl_twd = _current_net_exit_twd
+                _bts = bar.get("timestamp", bar.get("ts"))
+                try:
+                    _now_ms = _bts.timestamp() * 1000.0 if hasattr(_bts, "timestamp")                         else datetime.fromisoformat(str(_bts)[:19]).timestamp() * 1000.0
+                except Exception:
+                    _now_ms = 0.0
+                _entry_ts_ms = 0.0
+                if getattr(self, "_entry_ts", None):
+                    try:
+                        _entry_ts_ms = self._entry_ts.timestamp() * 1000.0
+                    except Exception:
+                        _entry_ts_ms = 0.0
+                _pj_ok = self._update_policy_j_peak(
+                    current_pnl, near_close, far_close,
+                    now_ms=_now_ms, mark_age_ms=float(bar.get("quote_age_ms") or 0.0),
+                    pair_skew_ms=float(bar.get("pair_skew_ms") or 0.0),
+                    entry_ts_ms=_entry_ts_ms, phase=str(_lc_phase))
+                # durable peak (confirmed) is the Policy J reference
+                if self._pj_durable_peak is not None:
+                    self._peak_net_exit_pnl_twd = self._pj_durable_peak
 
             # Auto-repair stale lifecycle phase if state has_position=True but phase is FLAT
             if hasattr(self, "_lifecycle_oca") and self._lifecycle_oca.phase == PositionPhase.FLAT:
@@ -4413,6 +4534,11 @@ class TMFSpread(StrategyBase):
         self._lifecycle = "FLAT"
         self._combined_exit_in_flight = False
         self._peak_net_exit_pnl_twd = 0.0
+        for _a in ("_pj_trade_id", "_pj_durable_peak", "_pj_candidate_peak",
+                   "_pj_candidate_ts", "_pj_candidate_count", "_pj_last_mark_pair",
+                   "_pj_last_upl"):
+            if hasattr(self, _a):
+                setattr(self, _a, None)
         # ADR-009 Phase 2 / Task 7: sync lifecycle to FLAT after exit fill
         if hasattr(self, '_lifecycle_oca'):
             _was_trailing = self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG
