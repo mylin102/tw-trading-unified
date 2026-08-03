@@ -89,20 +89,26 @@ def check_broker_login():
 
 
 def check_go_live_preconditions():
-    """Go-live preconditions (from LIVE_TRANSITION_SOP §5). None are met yet."""
-    # 1. fake-PnL marking (guard before/after split) — NOT done
-    # 2. observation period (entry quality replay) — NOT complete
-    # 3. parameter validation (trail sweep) — NOT complete
-    # 4. cost/slippage inclusion — NOT done
-    # 5. liquidity verification — NOT done
-    unmet = [
-        "fake-PnL marking (guard split)",
-        "observation period",
-        "parameter validation",
-        "cost/slippage model",
-        "liquidity verification",
-    ]
-    return False, "5/5 unmet: " + ", ".join(unmet)
+    """Go-live preconditions (LIVE_TRANSITION_SOP §5).
+
+    2026-08-03 P0 accounting fix: #1 fake-PnL marking guard split is DONE
+    (parse_logs EXPLICIT_EVENT fallback removed; guard_period buckets
+    PRE_GUARD/POST_GUARD_PRE_PHASE_A/POST_PHASE_A_CANONICAL; golden side-sign
+    tests). #4 cost/slippage and #5 liquidity wait on Model C canary
+    (executable BBO marking); #2/#3 are time-based (observation accumulation
+    + parameter sweep).
+    """
+    done = ["fake-PnL marking (guard split)"]
+    waiting = {
+        "observation period": "POST_GUARD accumulation in progress",
+        "parameter validation": "trail sweep — pending (entry quality replay)",
+        "cost/slippage model": "waits Model C executable marking (canary)",
+        "liquidity verification": "waits Model C far-BBO richness data",
+    }
+    unmet = list(waiting.keys())
+    msg = f"{len(done)}/5 done ({', '.join(done)}); {len(unmet)}/5 unmet: " + "; ".join(
+        f"{k} ({v})" for k, v in waiting.items())
+    return False, msg
 
 
 def check_all():
