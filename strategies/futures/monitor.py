@@ -7409,6 +7409,13 @@ class FuturesMonitor:
                 "near_complete": False,
                 "far_complete": False,
                 "settlement_completed": False,
+                # 2026-08-03 COMBINED_EXIT fills audit fix
+                "near_side": None,
+                "far_side": None,
+                "near_entry": None,
+                "far_entry": None,
+                "near_exit_side": None,
+                "far_exit_side": None,
             }
             # 2026-07-31 Hermes Agent: initialize from fills log — after a
             # restart mid-COMBINED_EXIT, legs filled before restart must count
@@ -7491,6 +7498,26 @@ class FuturesMonitor:
         leg = "NEAR" if "NEAR" in str(signal) else "FAR"
         tracker = self._get_combined_exit_tracker(trade_id)
 
+        # 2026-08-03 COMBINED_EXIT fills audit fix: populate cost basis +
+        # position side from canonical state (first fill of the trade).
+        if tracker.get("near_side") is None or tracker.get("far_side") is None:
+            try:
+                from strategies.plugins.futures.active.tmf_spread import _get_state_file_path
+                _sp = _get_state_file_path()
+                if _sp and os.path.exists(_sp):
+                    with open(_sp, encoding="utf-8") as _sf:
+                        _sd = json.load(_sf)
+                    if tracker.get("near_side") is None:
+                        tracker["near_side"] = _sd.get("near_side")
+                    if tracker.get("far_side") is None:
+                        tracker["far_side"] = _sd.get("far_side")
+                    if tracker.get("near_entry") is None:
+                        tracker["near_entry"] = _sd.get("near_entry")
+                    if tracker.get("far_entry") is None:
+                        tracker["far_entry"] = _sd.get("far_entry")
+            except Exception:
+                pass
+
         # Update expected qty from pending metadata (first fill for each leg sets this)
         strategy = pending.get("strategy")
         if leg == "NEAR":
@@ -7561,31 +7588,46 @@ class FuturesMonitor:
         # Append COMBINED_EXIT fill records to persistent _MTS_FILL_LOG so recovery reads state correctly
         try:
             from strategies.plugins.futures.active.tmf_spread import _append_fill
-            _append_fill(
-                ticker=getattr(self, "ticker", "TMF"),
-                contract=self.contract.code if getattr(self, "contract", None) else "NEAR",
-                leg="NEAR",
-                side="SELL",
-                # 2026-07-31 Hermes Agent: ADR-024E durable settlement fill —
-                # fsync + propagate failure so lost writes hit the fail-closed
-                # branch below instead of silently marking settlement complete.
-                durable=True,
-                qty=tracker["near_filled_qty"],
-                price=tracker.get("near_price") or price,
-                fill_type="COMBINED_EXIT",
-                trade_id=trade_id,
-            )
-            _append_fill(
-                ticker=getattr(self, "ticker", "TMF"),
-                contract=self.far_contract.code if getattr(self, "far_contract", None) else "FAR",
-                leg="FAR",
-                side="BUY",
-                durable=True,
-                qty=tracker["far_filled_qty"],
-                price=tracker.get("far_price") or price,
-                fill_type="COMBINED_EXIT",
-                trade_id=trade_id,
-            )
+            # 2026-08-03 COMBINED_EXIT fills audit fix:
+            # canonical per-leg fill (exit-side mapping, actual fill price,
+            # realized PnL from state cost basis). No shared `price` for both
+            # legs; no hardcoded SELL/BUY.
+            _point_value = float((getattr(self, "cfg", None) or {}).get("point_value", 10) or 10)
+            for _leg_key, _leg_name, _ctr in (
+                ("near", "NEAR", self.contract.code if getattr(self, "contract", None) else "NEAR"),
+                ("far", "FAR", self.far_contract.code if getattr(self, "far_contract", None) else "FAR"),
+            ):
+                _side_before = tracker.get(f"{_leg_key}_side") or "UNKNOWN"
+                _exit_side = "SELL" if str(_side_before).upper() == "LONG" else "BUY"
+                _entry = float(tracker.get(f"{_leg_key}_entry") or 0.0)
+                _exit_px = tracker.get(f"{_leg_key}_price")
+                _px_source = "BROKER_FILL" if _exit_px is not None else "STATE_SNAPSHOT"
+                if _exit_px is None:
+                    _exit_px = float(price or 0.0)
+                _qty = int(tracker.get(f"{_leg_key}_filled_qty") or 0)
+                if str(_side_before).upper() == "LONG":
+                    _pnl = (_exit_px - _entry) * _qty * _point_value
+                else:
+                    _pnl = (_entry - _exit_px) * _qty * _point_value
+                _append_fill(
+                    ticker=getattr(self, "ticker", "TMF"),
+                    contract=_ctr,
+                    leg=_leg_name,
+                    side=_exit_side,
+                    # 2026-07-31 Hermes Agent: ADR-024E durable settlement fill —
+                    # fsync + propagate failure so lost writes hit the fail-closed
+                    # branch below instead of silently marking settlement complete.
+                    durable=True,
+                    qty=_qty,
+                    price=_exit_px,
+                    fill_type="COMBINED_EXIT",
+                    trade_id=trade_id,
+                    realized_pnl=round(_pnl, 1),
+                    position_side_before_exit=str(_side_before),
+                    position_effect="CLOSE",
+                    price_source=_px_source,
+                )
+                tracker[f"{_leg_key}_exit_side"] = _exit_side
             _append_fill(
                 ticker=getattr(self, "ticker", "TMF"),
                 contract=self.contract.code if getattr(self, "contract", None) else "NEAR",
