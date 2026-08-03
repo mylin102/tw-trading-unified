@@ -85,6 +85,50 @@ not max acceptance. Never loosen to re-accept stale far quotes.
 - Model C-to-realized median abs gap < current event-to-realized median abs gap
   (check p90/p95 tails, not just mean)
 
+## 7b. Target Cases (validation checkpoints, 2026-08-03)
+
+### TC-1: Opening-gap stale marking (recorded 2026-08-03)
+
+**Trade**: `mts-auto-134026-806` — entry 13:40:26 (NEAR SHORT 43260 /
+FAR LONG 43405), carried across day close, exited 15:00:00.077 (night open,
+first tick) via POLICY_J_RELEASE_INTERCEPT -> COMBINED_EXIT (ORD-635/636).
+
+**Observed three-layer mark discrepancy at the opening gap**:
+
+| layer | value | source |
+|-------|-------|--------|
+| strategy ctx UPL mark | +348 TWD | mts_lifecycle_adapter ctx (stale spread mark) |
+| trigger event (COMBINED_EXIT_SUBMITTED) | 44.0 pts = 440 TWD | mts_spread_events.jsonl |
+| actual realized (fills) | +4,950 TWD (NEAR +2,600 / FAR -2,350) | mts_trade_fills.jsonl |
+
+Mark vs actual ≈ 14x understatement at the opening tick. Policy J used the
+pre-open/stale spread mark for the trigger evaluation.
+
+**What this is / is not**:
+- NOT a wrong-exit bug: exit used market orders -> realized +4,950 locked.
+  Trigger condition (>= activation 200) held under both stale and accurate
+  marks in this case -> same timing.
+- IS an accuracy concern: stale mark can mis-time triggers in other cases
+  (missed profit when understated; premature exit when overstated).
+- Low frequency: 1/40 trades today.
+
+**Decision (2026-08-03)**: do NOT change Policy J marking before Model C
+validation (promotion gate: DO_NOT_REPLACE_MARKING_IN_EXECUTION_PATH).
+Record as Model C acceptance target case instead.
+
+**Model C validation check for TC-1**:
+- Can Model C rebuild the opening-instant (15:00:00.000) executable mark
+  (near/far bid-ask at first tick)?
+- Does Model C executable mark track realized (+4,950) far better than the
+  stale ctx mark (+348)?
+- If yes -> evidence that executable BBO marking fixes opening-gap
+  mis-marking; proceed to shadow decision comparison.
+
+### TC-2: Far-leg release-stop intercept at open (same trade)
+Far leg hit release stop while combined net >= activation -> COMBINED_EXIT
+intercept. Verify Model C far-leg executable pnl (SHORT->ask) at the same
+instant matches the realized far pnl (-2,350) within tolerance.
+
 ## 8. Verdicts (fixed until canary completes)
 
 ```
