@@ -75,7 +75,10 @@ not max acceptance. Never loosen to re-accept stale far quotes.
 
 ## 7. Acceptance gates (canary close)
 
-- >= 3 full trading days AND >= 100 POST_GUARD matched COMBINED_EXIT
+- Collection threshold (either completes the accumulation phase):
+  - >= 3 full trading days, OR
+  - >= 100 POST_GUARD matched COMBINED_EXIT
+  (2026-08-03 user decision: OR — do not wait for both)
 - cross-contract contamination = 0; duplicate accepted = 0; UNKNOWN reason = 0
 - accounting invariant failures = 0; execution influence = 0
 - Model C reconstructable trigger ratio >= 90%
