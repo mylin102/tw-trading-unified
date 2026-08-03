@@ -5982,6 +5982,18 @@ elif page == "設定":
             f_live_new = st.checkbox("啟用期貨實盤交易 (LIVE)", value=futures_cfg.get("live_trading", False))
             # 2026-05-22 Gemini CLI: Add MTS Mode toggle back to UI
             f_mts_new = st.checkbox("啟用 MTS 自適應價差模式 (MTS Mode)", value=futures_cfg.get("mts", {}).get("enabled", False))
+            _mts_params_def = futures_cfg.get("mts", {}).get("params", {})
+            f_mts_min_atr = float(_mts_params_def.get("min_atr", 10.0))
+            f_mts_atr_cap = float(_mts_params_def.get("atr_cap", 100.0))
+            f_mts_mult_stop = float(_mts_params_def.get("atr_multiplier_stop", 1.0))
+            f_mts_mult_trail = float(_mts_params_def.get("atr_multiplier_trail", 3.5))
+            f_mts_stop_fixed = int(_mts_params_def.get("release_stop_points", 20))
+            f_mts_trail_fixed = int(_mts_params_def.get("trail_distance_points", 30))
+            f_policy_j_enable = bool(_mts_params_def.get("enable_combined_upl_trail", True))
+            f_policy_j_activation = float(_mts_params_def.get("combined_upl_activation_net_pnl_twd", 300.0))
+            f_policy_j_giveback = float(_mts_params_def.get("combined_upl_giveback_twd", 100.0))
+            f_renko_enable = bool(_mts_params_def.get("enable_renko_exit", False))
+            f_renko_mult = float(_mts_params_def.get("renko_brick_multiplier", 0.5))
 
             # 2026-05-27 Gemini CLI: Restore MTS Parameter Adjustment Section
             if f_mts_new:
@@ -6016,6 +6028,10 @@ elif page == "設定":
                 f_policy_j_giveback = pj3.number_input("回吐門檻金額 (TWD)", min_value=10.0, max_value=2000.0,
                                                      value=float(_mts_params.get("combined_upl_giveback_twd", 100.0)), step=10.0)
                 st.caption("💡 提示：儲存時將自動同步更新日盤 (`futures.yaml`) 與夜盤 (`futures_night.yaml`) 設定檔。Policy J 啟動後若自最高淨利回吐指定 TWD 金額將觸發 COMBINED_EXIT 雙腿全平倉。")
+                st.markdown("###### 🧱 Renko 風控去噪訊號 (Renko Shadow Exit)")
+                rk1, rk2 = st.columns(2)
+                f_renko_enable = rk1.checkbox("啟用 Renko 訊號觀測", value=bool(_mts_params.get("enable_renko_exit", False)))
+                f_renko_mult = rk2.number_input("Renko 磚寬 ATR 倍數", min_value=0.1, max_value=5.0, value=float(_mts_params.get("renko_brick_multiplier", 0.5)), step=0.1)
                 st.markdown("---")
 
             # Strategy selector from Registry
@@ -6130,6 +6146,8 @@ elif page == "設定":
                             "enable_combined_upl_trail": f_policy_j_enable,
                             "combined_upl_activation_net_pnl_twd": f_policy_j_activation,
                             "combined_upl_giveback_twd": f_policy_j_giveback,
+                            "enable_renko_exit": f_renko_enable,
+                            "renko_brick_multiplier": f_renko_mult,
                         }
                         for _pkey, _pval in _incoming_params.items():
                             if _pkey in SESSION_SPECIFIC_MTS_PARAMS:
