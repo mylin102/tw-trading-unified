@@ -1601,13 +1601,22 @@ class FuturesMonitor:
                 _code = str(getattr(tick, "code", "") or "")
                 _px = float(getattr(tick, "close", 0) or 0)
                 if _br.enabled and _code and _px > 0:
-                    _br.on_tick("near" if _code == getattr(self, "_near_code", "") else "far", {
-                        "code": _code,
-                        "price": _px,
-                        "seq": getattr(getattr(self, "_quote_guard", None), "_receive_seq", 0),
-                        "ts_ms": time.time() * 1000.0,
-                        "session_id": "UNKNOWN",
-                    })
+                    _near_code = str(getattr(getattr(self, "contract", None), "code", "") or "")
+                    _far_code = str(getattr(getattr(self, "far_contract", None), "code", "") or "")
+                    if _code == _near_code:
+                        _leg = "near"
+                    elif _code == _far_code:
+                        _leg = "far"
+                    else:
+                        _leg = None  # unknown/virtual code — never enters synchronizer
+                    if _leg is not None:
+                        _br.on_tick(_leg, {
+                            "code": _code,
+                            "price": _px,
+                            "seq": getattr(getattr(self, "_quote_guard", None), "_receive_seq", 0),
+                            "ts_ms": time.time() * 1000.0,
+                            "session_id": "UNKNOWN",
+                        })
         except Exception:
             pass  # shadow path must never affect the trading loop  # [gstack] 更新數據更新時間
 
