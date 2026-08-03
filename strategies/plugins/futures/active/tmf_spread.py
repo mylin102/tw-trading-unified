@@ -3349,7 +3349,8 @@ class TMFSpread(StrategyBase):
             # In SINGLE_LEG the combined peak is frozen; single-leg PnL must NOT
             # re-inflate it (observed 434668 -> 434738 after leg release).
             _lc_phase = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
-            if _lc_phase == PositionPhase.SPREAD:
+            # 2026-08-03 Gemini CLI: Track combined total PnL peak in both SPREAD and SINGLE_LEG phases for Policy J
+            if _lc_phase in (PositionPhase.SPREAD, PositionPhase.SINGLE_LEG):
                 _current_net_exit_twd = float(current_pnl * 10.0 - 92.0)
                 if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None:
                     self._peak_net_exit_pnl_twd = 0.0

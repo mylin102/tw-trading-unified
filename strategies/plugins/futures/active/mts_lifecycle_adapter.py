@@ -249,44 +249,45 @@ def _check_combined_upl_trail_candidate(
     if not ctx.enable_combined_upl_trail:
         return []
     _phase_val = enum_value(lifecycle.phase)
-    if _phase_val != "SPREAD":
+    # 2026-08-03 Gemini CLI: Support Policy J combined total PnL exit in SINGLE_LEG phase (whichever hits first between Policy J & trailing exit)
+    if _phase_val not in ("SPREAD", "SINGLE_LEG"):
         return []
     _rg_status = enum_value(lifecycle.release_group.status)
     _owner = getattr(lifecycle, "exit_owner", None)
 
     # 1. Exit Ownership & In-Flight Guard:
-    # If Policy J (or another exit policy) already holds exit ownership, or if release_group is in-flight,
-    # do NOT re-evaluate or re-emit duplicate COMBINED_EXIT candidates.
     if _owner == "POLICY_J" or _rg_status in (
-        "TRIGGERED", "SUBMITTING", "SUBMITTED", "PARTIALLY_FILLED", "FILLED", "COMPLETED"
+        "TRIGGERED", "SUBMITTING", "SUBMITTED", "PARTIALLY_FILLED"
     ):
         return []
 
-    if _rg_status not in ("ARMED", "INACTIVE"):
+    if _phase_val == "SPREAD" and _rg_status not in ("ARMED", "INACTIVE"):
         return []
 
     # Calculate net exit PnL TWD (1pt = 10 TWD for TMF, minus friction 92 TWD)
+    # In SINGLE_LEG phase, (near_pnl_pts + far_pnl_pts) equals realized PnL of released leg + floating UPL of remaining leg
     total_net_pnl_twd = (ctx.near_pnl_pts + ctx.far_pnl_pts) * 10.0 - 92.0
     if ctx.peak_net_exit_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd:
         if total_net_pnl_twd <= (ctx.peak_net_exit_pnl_twd - ctx.combined_upl_giveback_twd):
             logger.info(
-                "[POLICY_J_TRIGGERED] Net Exit PnL TWD peak=%.1f current=%.1f giveback=%.1f -> COMBINED_EXIT",
-                ctx.peak_net_exit_pnl_twd, total_net_pnl_twd, ctx.combined_upl_giveback_twd,
+                "[POLICY_J_TRIGGERED] Net Exit PnL TWD phase=%s peak=%.1f current=%.1f giveback=%.1f -> EXIT",
+                _phase_val, ctx.peak_net_exit_pnl_twd, total_net_pnl_twd, ctx.combined_upl_giveback_twd,
             )
+            if _phase_val == "SINGLE_LEG":
+                return [LifecycleDecision(action=LifecycleAction.TRAIL)]
             return [LifecycleDecision(action=LifecycleAction.COMBINED_EXIT)]
 
-    # 2. Release-Stop Intercept Rule (Combined-First Protection)
-    # If a single leg hits release stop AND total net exit PnL is in profit / ARMED (>= activation threshold),
-    # intercept with COMBINED_EXIT to lock in total spread profit instead of splitting into single leg.
-    near_hit = ctx.near_pnl_pts <= -ctx.release_stop_threshold
-    far_hit = ctx.far_pnl_pts <= -ctx.release_stop_threshold
-    if (near_hit or far_hit) and (ctx.peak_net_exit_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd or total_net_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd):
-        logger.info(
-            "[POLICY_J_RELEASE_INTERCEPT] Single leg hit release stop (near_hit=%s far_hit=%s) "
-            "but Total Net PnL (%.1f TWD) >= Activation (%.1f TWD) -> Intercept with COMBINED_EXIT",
-            near_hit, far_hit, total_net_pnl_twd, ctx.combined_upl_activation_net_pnl_twd,
-        )
-        return [LifecycleDecision(action=LifecycleAction.COMBINED_EXIT)]
+    if _phase_val == "SPREAD":
+        # 2. Release-Stop Intercept Rule (Combined-First Protection in SPREAD phase)
+        near_hit = ctx.near_pnl_pts <= -ctx.release_stop_threshold
+        far_hit = ctx.far_pnl_pts <= -ctx.release_stop_threshold
+        if (near_hit or far_hit) and (ctx.peak_net_exit_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd or total_net_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd):
+            logger.info(
+                "[POLICY_J_RELEASE_INTERCEPT] Single leg hit release stop (near_hit=%s far_hit=%s) "
+                "but Total Net PnL (%.1f TWD) >= Activation (%.1f TWD) -> Intercept with COMBINED_EXIT",
+                near_hit, far_hit, total_net_pnl_twd, ctx.combined_upl_activation_net_pnl_twd,
+            )
+            return [LifecycleDecision(action=LifecycleAction.COMBINED_EXIT)]
     return []
 
 def _check_release_candidates(
