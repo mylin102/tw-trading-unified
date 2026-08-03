@@ -516,6 +516,9 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
                  # 2026-07-24 Hermes Agent: settlement tracking
                  settlement_status: str | None = None,
                  settled_from: str | None = None,
+                 # 2026-08-03 COMBINED_EXIT fills audit fix
+                 position_side_before_exit: str | None = None,
+                 position_effect: str | None = None,
                  # 2026-07-31 Hermes Agent: ADR-024E — durable (fsync) writes
                  # propagate failures instead of swallowing them. Used by the
                  # COMBINED_EXIT settlement path so a lost fill cannot be
@@ -566,6 +569,9 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
             # 2026-07-24 Hermes Agent: settlement tracking
             'settlement_status': settlement_status,
             'settled_from': settled_from,
+            # 2026-08-03 COMBINED_EXIT fills audit fix
+            'position_side_before_exit': position_side_before_exit,
+            'position_effect': position_effect,
         }
         # 💡 [Fixed 2026-05-27] Big warning for missing trade_id to catch leaks
         if trade_id == "?":
