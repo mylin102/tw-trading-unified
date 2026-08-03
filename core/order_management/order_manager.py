@@ -248,6 +248,15 @@ class OrderManager:
         combo_strategy: str = "",
     ) -> Order:
         """建立新委託單，狀態→ PENDING_SUBMIT"""
+        # 2026-08-03 Gemini CLI: Dynamically check and sync session date on order creation
+        try:
+            from core.date_utils import get_session_date_str
+            _cur_sess = get_session_date_str()
+            if _cur_sess and _cur_sess != self._session_date:
+                self._session_date = _cur_sess
+                self.reindex_orders()
+        except Exception:
+            pass
         # 2026-07-07 Hermes Agent: session_date-based order ID.
         # Format: ORD-{session_date}-{counter:06d}
         # Counter resets per trading session, persists across PM2 restarts
