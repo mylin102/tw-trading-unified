@@ -1507,6 +1507,9 @@ class TMFSpread(StrategyBase):
         # ── P1: Single-leg extrema (decision authority in SINGLE_LEG) ──
         # (_single_leg_peak/nadir initialized before _restore_position_state;
         #  kept here only for anchor fields)
+        self._single_leg_peak: float = 0.0
+        self._single_leg_nadir: float = 0.0
+        self._single_leg_post_fill_ticks: int = 0
         self._single_leg_anchor_price: float = 0.0
         self._single_leg_anchor_event_time_ns: float = 0.0
         self._renko_tracker = None
