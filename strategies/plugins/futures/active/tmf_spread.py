@@ -523,7 +523,8 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
                  # propagate failures instead of swallowing them. Used by the
                  # COMBINED_EXIT settlement path so a lost fill cannot be
                  # silently marked complete (fail-closed).
-                 durable: bool = False) -> None:
+                 durable: bool = False,
+                 **extra_fields) -> None:
     """Append a trade fill record (append-only JSONL)."""
     # 2026-06-25 Gemini CLI: Skip fill logging during backtesting
     if os.getenv("MTS_BACKTEST") == "1":
@@ -573,6 +574,8 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
             'position_side_before_exit': position_side_before_exit,
             'position_effect': position_effect,
         }
+        if extra_fields:
+            fill.update(extra_fields)
         # 💡 [Fixed 2026-05-27] Big warning for missing trade_id to catch leaks
         if trade_id == "?":
             logger.error("[MTS_FILL_ERROR] Missing trade_id in fill record! type=%s ticker=%s", fill_type, ticker)
