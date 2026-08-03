@@ -398,6 +398,18 @@ class FuturesMonitor:
                 from core.mode_transition import live_preflight_context, paper_context, LiveOrderBlocked, EntryBlocked
                 if self.live_trading:
                     self._execution_context = live_preflight_context()
+                    # [GAP-1/2 fix] substantive preflight -> LIVE_READY or LIVE_QUARANTINED
+                    try:
+                        from core.mode_transition import preflight_validate, transition_to_live_ready
+                        _contracts_ok = getattr(self, "contract", None) is not None
+                        _failures = preflight_validate(getattr(self, "client", None), _contracts_ok)
+                        self._execution_context = transition_to_live_ready(self._execution_context, _failures)
+                        if _failures:
+                            print(f"[MTS_EXEC_CTX] LIVE_QUARANTINED failures={_failures} — live orders blocked")
+                        else:
+                            print("[MTS_EXEC_CTX] LIVE_READY — live orders authorized (all preflight checks passed)")
+                    except Exception as _exc:
+                        print(f"[MTS_EXEC_CTX] transition error: {_exc} — stays LIVE_PREFLIGHT (blocked)")
                 else:
                     self._execution_context = paper_context()
             except ImportError:
