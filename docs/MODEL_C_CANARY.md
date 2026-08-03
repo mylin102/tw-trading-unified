@@ -163,6 +163,28 @@ the whole mark `pre-open/stale`. Kept from the original record: NOT a
 wrong-exit bug; do NOT change current Policy J execution marking; remains a
 Model C acceptance target case.
 
+## 7c. Renko brick-construction comparison (validation report item, 2026-08-03)
+
+Model C acceptance report must compare the two brick constructions on the
+synchronized spread data (executable spread = near executable - far
+executable, or explicit mid choice to be defined):
+
+| | M1: spread-then-brick | M2: per-leg brick then spread |
+|---|---|---|
+| price semantics | continuous net spread change | brick-level discrete (±brick integer steps) |
+| smoothing | high (parallel near/far moves cancel) | low (brick jumps) |
+| timing | single sequence | dual sequences misaligned (far sparse) |
+| signal | direct spread reversal | combined leg-momentum (complex) |
+| far-sparse behavior | few bricks (input-limited) | degrades: far no-brick -> near-only translation |
+| Policy J fit | high (spread semantics) | low (brick spread != executable spread) |
+
+Report metrics per method (on matched Model C spread data):
+- brick count, brick cadence (bricks/hour), max no-brick gap
+- reversal count (2-brick confirmations) vs spread reversals in raw data
+- lag: first brick after a raw spread reversal (median/p90 bars)
+- recommendation: M1 expected primary (pending data); M2 only viable if far
+  BBO richness (P1) proves sufficient for far bricks.
+
 ## 8. Verdicts (fixed until canary completes)
 
 ```
