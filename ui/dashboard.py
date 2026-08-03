@@ -5925,7 +5925,7 @@ elif page == "設定":
     # ── 0. 實盤就緒度檢查 ──
     with st.expander("🚀 實盤就緒度檢查", expanded=True):
         from core.live_readiness import check_all, get_readiness_items, get_readiness_summary
-        check_output = check_all()
+        _ready_flag, check_output = check_all()
         readiness_items = get_readiness_items(check_output)
         status, passed, total = get_readiness_summary(check_output)
 
