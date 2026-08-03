@@ -101,12 +101,174 @@ def resolve_release_reason(data: dict, events: list) -> tuple[str, str]:
     return "UNKNOWN", "INSUFFICIENT_EVIDENCE"
 
 
+# 2026-08-03 P0: side resolution — canonical priority, never guessed.
+# ENTRY BUY -> position LONG ; ENTRY SELL -> position SHORT
+# EXIT SELL -> closes LONG   ; EXIT BUY  -> closes SHORT
+def _fill_pnl_components(fill, entry, point_value=10.0):
+    """Canonical per-leg realized PnL from a fill + its entry (side-aware).
+
+    Side resolution priority (locked):
+      1. fill.position_side_before_exit (canonical Phase A)
+      2. entry.side -> position mapping (BUY->LONG / SELL->SHORT)
+      3. unresolved -> None (caller marks UNAUDITABLE)
+    Returns (pnl, entry_px, exit_px, qty, side_resolution_method).
+    """
+    try:
+        entry_px = float((entry or {}).get("price") or 0.0)
+        exit_px = float(fill.get("price") or 0.0)
+        qty = int(fill.get("qty") or 0)
+        pside = str(fill.get("position_side_before_exit") or "").upper()
+        if pside in ("LONG", "SHORT"):
+            method = "canonical-position_side_before_exit"
+        else:
+            eside = str((entry or {}).get("side") or "").upper()
+            if eside == "BUY":
+                pside = "LONG"; method = "entry-fill-side"
+            elif eside == "SELL":
+                pside = "SHORT"; method = "entry-fill-side"
+            elif eside == "LONG":
+                pside = "LONG"; method = "entry-fill-side"
+            elif eside == "SHORT":
+                pside = "SHORT"; method = "entry-fill-side"
+            else:
+                return None, entry_px, exit_px, qty, "UNRESOLVED"
+        if pside == "LONG":
+            return (exit_px - entry_px) * qty * point_value, entry_px, exit_px, qty, method
+        return (entry_px - exit_px) * qty * point_value, entry_px, exit_px, qty, method
+    except Exception:
+        return None, 0.0, 0.0, 0, "ERROR"
+
+
+def _compute_trade_pnl(data: dict, fills_path: str = None) -> dict:
+    """2026-08-03 P0 fix: canonical realized PnL per trade.
+
+    Priority:
+      1. COMBINED_EXIT_SETTLED net (then gross)
+      2. leg fills realized_pnl sum (Phase A canonical fills)
+      3. fills price backfill (legacy fills w/ price + entry — DERIVED)
+      4. unavailable -> null, never event theoretical PnL
+    Returns dict with net_pnl, gross, pnl_source, audit_status, confidence,
+    price_confidence, theoretical_pnl (EXPLICIT_EVENT, not realized).
+    """
+    from strategies.plugins.futures.active.tmf_spread import _MTS_FILL_LOG
+    point_value = 10.0
+
+    # 0. theoretical (EXPLICIT_EVENT) — never realized
+    theoretical = 0.0
+    for ev in data.get("events", []):
+        if ev.get("event") in ("COMBINED_EXIT_SUBMITTED", "EXIT_LOG"):
+            pts = ev.get("gross_points") if ev.get("gross_points") is not None else ev.get("pnl")
+            if pts is not None:
+                theoretical += float(pts) * point_value
+
+    # 1. COMBINED_EXIT_SETTLED event (canonical settlement)
+    settled = None
+    for ev in data.get("events", []):
+        if ev.get("event") == "COMBINED_EXIT_SETTLED":
+            settled = ev
+            break
+    if settled is None and fills_path and os.path.exists(fills_path):
+        with open(fills_path) as _f:
+            for _ln in _f:
+                try:
+                    _r = json.loads(_ln.strip())
+                except Exception:
+                    continue
+                if _r.get("event_type") == "COMBINED_EXIT_SETTLED" and _r.get("trade_id") == data.get("trade_id"):
+                    settled = _r
+                    break
+    if settled:
+        net = settled.get("combined_realized_pnl_net")
+        gross = settled.get("combined_realized_pnl_gross")
+        if net is not None:
+            return {"net_pnl": float(net), "gross_pnl": float(gross or net),
+                    "pnl_source": "SETTLEMENT", "settlement_origin": settled.get("settlement_origin", "LIVE"),
+                    "price_confidence": settled.get("price_confidence", "EXACT"),
+                    "audit_status": "AUDITABLE", "theoretical_pnl": theoretical,
+                    "pnl_status": "NET" if net is not None else "GROSS_ONLY"}
+        if gross is not None:
+            return {"net_pnl": None, "gross_pnl": float(gross),
+                    "pnl_source": "SETTLEMENT", "settlement_origin": settled.get("settlement_origin", "LIVE"),
+                    "price_confidence": settled.get("price_confidence", "EXACT"),
+                    "audit_status": "AUDITABLE", "theoretical_pnl": theoretical,
+                    "pnl_status": "GROSS_ONLY"}
+
+    # 2+3. leg fills: canonical realized sum, else price backfill
+    entries = {e.get("leg"): e for e in data.get("entries", [])}
+    exit_fills = [f for f in data.get("exit_fills", []) if int(f.get("qty") or 0) > 0]
+    if not exit_fills:
+        return {"net_pnl": None, "gross_pnl": None, "pnl_source": "UNAVAILABLE",
+                "audit_status": "PRE_FIX_UNAUDITABLE", "theoretical_pnl": theoretical,
+                "pnl_status": "GROSS_ONLY", "price_confidence": None}
+
+    total = 0.0
+    computed = 0
+    canonical_all = True
+    confidence = "EXACT"
+    side_methods = set()
+    for f in exit_fills:
+        leg = f.get("leg")
+        entry = entries.get(leg)
+        # canonical fill (Phase A): realized_pnl present + provenance fields
+        rp = f.get("realized_pnl")
+        if rp is not None and f.get("position_effect") == "CLOSE":
+            total += float(rp)
+            computed += 1
+            continue
+        # legacy: backfill from prices (DERIVED)
+        if entry and f.get("price") is not None:
+            pnl, _, _, _, _method = _fill_pnl_components(f, entry, point_value)
+            if pnl is not None:
+                total += pnl
+                computed += 1
+                canonical_all = False
+                confidence = "DERIVED"
+                side_methods.add(_method)
+                continue
+        # unavailable
+        canonical_all = False
+        confidence = None
+
+    if computed == 0:
+        return {"net_pnl": None, "gross_pnl": None, "pnl_source": "UNAVAILABLE",
+                "audit_status": "PRE_FIX_UNAUDITABLE", "theoretical_pnl": theoretical,
+                "pnl_status": "GROSS_ONLY", "price_confidence": None}
+
+    return {"net_pnl": None, "gross_pnl": round(total, 1), "pnl_source": "FILLS" if canonical_all else "FILLS_BACKFILL",
+            "settlement_origin": "LIVE" if canonical_all else "BACKFILL",
+            "price_confidence": confidence, "audit_status": "AUDITABLE" if confidence else "DERIVED_AUDITABLE" if confidence == "DERIVED" else "PRE_FIX_UNAUDITABLE",
+            "theoretical_pnl": theoretical, "pnl_status": "GROSS_ONLY",
+            "calculation_version": "pnl-backfill-v2",
+            "side_resolution_method": ",".join(sorted(side_methods)) if side_methods else None,
+            "generated_at": None}
+
+
+# 2026-08-03 P0: data-governance cutover buckets.
+# PRE_GUARD: before 7/31 19:08 far->near pollution guard.
+# POST_GUARD_PRE_PHASE_A: guarded, legacy fill schema (realized_pnl missing).
+# POST_PHASE_A_CANONICAL: Phase A fill schema (canonical per-leg realized).
+_PRE_GUARD_CUT = "2026-07-31T19:08"
+_PHASE_A_CUT = "2026-08-03T12:00"
+
+
+def _guard_period_of(ts_str):
+    ts = str(ts_str or "")
+    if not ts:
+        return "UNKNOWN"
+    if ts < _PRE_GUARD_CUT:
+        return "PRE_GUARD"
+    if ts < _PHASE_A_CUT:
+        return "POST_GUARD_PRE_PHASE_A"
+    return "POST_PHASE_A_CANONICAL"
+
+
 def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> dict:
     """Parse fills and events JSONL logs to aggregate trade data."""
     trades = defaultdict(lambda: {
         "entries": [],
         "release": None,
         "exit": None,
+        "exit_fills": [],   # 2026-08-03 P0 fix: ALL exit/combined_exit fills
         "entry_ts": None,
         "exit_ts": None,
         "session": "UNKNOWN",
@@ -144,6 +306,7 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
                         trades[trade_id]["release"] = fill
                     elif fill_type in ("EXIT", "COMBINED_EXIT"):
                         trades[trade_id]["exit"] = fill
+                        trades[trade_id]["exit_fills"].append(fill)
                         trades[trade_id]["exit_ts"] = ts_str
                 except Exception as e:
                     print(f"Warning: Failed to parse fill line: {e}", file=sys.stderr)
@@ -291,20 +454,19 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
             
             release_pnl = float(release_fill.get("realized_pnl") or 0.0) if release_fill else 0.0
             exit_pnl = float(exit_fill.get("realized_pnl") or 0.0) if exit_fill else 0.0
-            net_pnl = release_pnl + exit_pnl
-            
-            # 2026-07-31 Antigravity: Resolve Net PnL for Policy J COMBINED_EXIT trades when realized_pnl is None
-            if net_pnl == 0.0:
-                _ce_pnl_pts = None
-                for ev in data.get("events", []):
-                    if ev.get("event") in ("COMBINED_EXIT_SUBMITTED", "EXIT_LOG"):
-                        _pts = ev.get("gross_points") if ev.get("gross_points") is not None else ev.get("pnl")
-                        if _pts is not None:
-                            _ce_pnl_pts = float(_pts)
-                            break
-                if _ce_pnl_pts is not None:
-                    net_pnl = _ce_pnl_pts * 10.0  # 10 TWD/pt for TMF futures
-                    exit_pnl = net_pnl
+            # 2026-08-03 P0 fix: canonical realized PnL. EXPLICIT_EVENT
+            # theoretical PnL is NEVER used as realized.
+            _pnl = _compute_trade_pnl(data, fills_path)
+            net_pnl = _pnl.get("gross_pnl") if _pnl.get("net_pnl") is None else _pnl.get("net_pnl")
+            gross_pnl = _pnl.get("gross_pnl")
+            theoretical_pnl = _pnl.get("theoretical_pnl", 0.0)
+            pnl_source = _pnl.get("pnl_source", "UNAVAILABLE")
+            audit_status = _pnl.get("audit_status", "PRE_FIX_UNAUDITABLE")
+            price_confidence = _pnl.get("price_confidence")
+            pnl_status = _pnl.get("pnl_status", "GROSS_ONLY")
+            if release_fill:
+                # single-leg path: release + remaining-leg exit realized
+                net_pnl = (release_pnl + exit_pnl) or net_pnl
             report_data["completed"].append({
                 "trade_id": trade_id,
                 "entry_time": data["entry_ts"],
@@ -327,6 +489,14 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
                 "exit_reason": exit_r,
                 "exit_reason_source": exit_src,
                 "net_pnl": net_pnl,
+                "gross_pnl": gross_pnl,
+                "theoretical_pnl": theoretical_pnl,
+                "pnl_source": pnl_source,
+                "audit_status": audit_status,
+                "price_confidence": price_confidence,
+                "pnl_status": pnl_status,
+                "is_realized": pnl_source in ("SETTLEMENT", "FILLS", "FILLS_BACKFILL"),
+                "guard_period": _guard_period_of(exit_ts),
                 "risk_mode": data["risk_mode"],
                 "mtf_score": data.get("mtf_score"),
                 "entry_mtf": data.get("entry_mtf_score"),
@@ -337,6 +507,29 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
                 "exit_vwap": data.get("exit_vwap"),
             })
                 
+    # 2026-08-03 P0: trading-day session breakdown (canonical realized only)
+    _comp = report_data.get("completed", [])
+    _real = [t for t in _comp if t.get("is_realized") and t.get("gross_pnl") is not None]
+    _summ = {"calendar_dates": sorted({str(t.get("exit_time", ""))[:10] for t in _real if t.get("exit_time")}),
+             "sessions": {"night": {"count": 0, "gross": 0.0},
+                          "day": {"count": 0, "gross": 0.0}},
+             "pnl_source_dist": {}, "audit_dist": {}, "theoretical_total": 0.0}
+    from collections import Counter as _C
+    _summ["pnl_source_dist"] = dict(_C(t.get("pnl_source") for t in _real))
+    _summ["audit_dist"] = dict(_C(t.get("audit_status") for t in _real))
+    _summ["theoretical_total"] = sum((t.get("theoretical_pnl") or 0.0) for t in _comp)
+    from collections import defaultdict as _DD
+    _guard = _DD(lambda: [0, 0.0])
+    for t in _real:
+        _g = t.get("guard_period", "UNKNOWN")
+        _guard[_g][0] += 1
+        _guard[_g][1] += (t.get("gross_pnl") or 0.0)
+    _summ["guard_buckets"] = {k: {"count": v[0], "gross": round(v[1], 1)} for k, v in _guard.items()}
+    for t in _real:
+        _s = "night" if str(t.get("session", "")).upper() == "NIGHT" else "day"
+        _summ["sessions"][_s]["count"] += 1
+        _summ["sessions"][_s]["gross"] += (t.get("gross_pnl") or 0.0)
+    report_data["trading_day_summary"] = _summ
     return report_data
 
 

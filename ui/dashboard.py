@@ -3840,21 +3840,30 @@ elif _selected_product == "TMF":
             st.markdown("---")
             st.subheader(f"📈 MTS 績效檢討 (Daily Performance: {_display_day})")
             _completed = _perf_data["completed"]
-            _total_trades = len(_completed)
-            _total_net = sum(t["net_pnl"] for t in _completed)
+            # 2026-08-03 P0 fix: KPI uses canonical realized only
+            # (SETTLEMENT / FILLS / FILLS_BACKFILL + DERIVED_AUDITABLE).
+            # EXPLICIT_EVENT theoretical PnL never enters realized KPIs.
+            # guard-before (7/31 pollution) trades are excluded from KPI
+            _realized = [t for t in _completed if t.get("is_realized") and t.get("gross_pnl") is not None
+                         and t.get("guard_period") != "PRE_GUARD"]
+            _total_trades = len(_realized)
+            _total_net = sum((t.get("gross_pnl") or 0) for t in _realized)
+            _theoretical = sum((t.get("theoretical_pnl") or 0) for t in _completed)
             
-            _wins = sum(1 for t in _completed if t["net_pnl"] > 0)
+            _wins = sum(1 for t in _realized if (t.get("gross_pnl") or 0) > 0)
             _win_rate = (_wins / _total_trades) if _total_trades > 0 else 0.0
             
-            _gross_wins = sum(t["net_pnl"] for t in _completed if t["net_pnl"] > 0)
-            _gross_losses = sum(abs(t["net_pnl"]) for t in _completed if t["net_pnl"] <= 0)
+            _gross_wins = sum((t.get("gross_pnl") or 0) for t in _realized if (t.get("gross_pnl") or 0) > 0)
+            _gross_losses = sum(abs(t.get("gross_pnl") or 0) for t in _realized if (t.get("gross_pnl") or 0) <= 0)
             _pf = (_gross_wins / _gross_losses) if _gross_losses > 0 else (99.9 if _gross_wins > 0 else 0.0)
             
             _c1, _c2, _c3, _c4 = st.columns(4)
-            _c1.metric("MTS 本日淨損益", f"{_total_net:+,.0f} TWD")
-            _c2.metric("已完成圈數", _total_trades)
+            _c1.metric("MTS 實現毛損益 (Realized Gross)", f"{_total_net:+,.0f} TWD")
+            _c2.metric("已完成圈數 (Realized)", _total_trades)
             _c3.metric("勝率", f"{_win_rate:.1%}")
             _c4.metric("獲利因子", f"{_pf:.2f}" if _total_trades > 0 else "—")
+            if _theoretical:
+                st.caption(f"⚡ 觸發時理論 PnL: {_theoretical:+,.0f} TWD — THEORETICAL, NOT REALIZED (不含在 KPI)")
             
             if _completed:
                 with st.expander("📝 已完結交易清單 (Closed Loops)", expanded=True):
