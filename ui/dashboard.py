@@ -4001,13 +4001,30 @@ elif _selected_product == "TMF":
                 # dashboard always shows the most recent orders first,
                 # regardless of order_id sequence (which can be reset
                 # by PM2 restart or reindex after reconciliation).
-                if "created_at" in df_orders.columns and not df_orders.empty:
-                    df_orders["_created_dt"] = pd.to_datetime(
-                        df_orders["created_at"], errors="coerce"
+                # 2026-08-03 Gemini CLI: Sort newest orders first (ascending=False) and filter by current trading session date
+                if 'created_at' in df_orders.columns and not df_orders.empty:
+                    df_orders['_created_dt'] = pd.to_datetime(
+                        df_orders['created_at'], errors='coerce'
                     )
+                    try:
+                        from core.date_utils import get_session_date_str
+                        df_orders['_session_date'] = df_orders['_created_dt'].apply(
+                            lambda dt: get_session_date_str(dt) if pd.notna(dt) else ''
+                        )
+                        _target_session = _today if ('_today' in locals() and _today) else get_session_date_str()
+                        session_filtered = df_orders[df_orders['_session_date'] == _target_session]
+                        if not session_filtered.empty:
+                            df_orders = session_filtered
+                        else:
+                            latest_sess = df_orders['_session_date'].max()
+                            if latest_sess:
+                                df_orders = df_orders[df_orders['_session_date'] == latest_sess]
+                        df_orders = df_orders.drop(columns=['_session_date'])
+                    except Exception:
+                        pass
                     df_orders = df_orders.sort_values(
-                        "_created_dt", ascending=True
-                    ).drop(columns=["_created_dt"])
+                        '_created_dt', ascending=False
+                    ).drop(columns=['_created_dt'])
 
                 # Status translation map
                 status_map = {

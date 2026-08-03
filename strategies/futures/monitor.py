@@ -2399,6 +2399,23 @@ class FuturesMonitor:
                 cur_price = 0.0
 
             all_orders = self.order_mgr.get_completed() + self.order_mgr.get_pending()
+            # 2026-08-03 Gemini CLI: Filter exported orders by active session date to prevent historical memory leakage across days
+            try:
+                import pandas as _pd_import
+                from core.date_utils import get_session_date_str
+                filtered_orders = []
+                for o in all_orders:
+                    o_created = getattr(o, 'created_at', None)
+                    if o_created:
+                        o_dt = _pd_import.to_datetime(o_created, errors='coerce')
+                        o_sess = get_session_date_str(o_dt) if _pd_import.notna(o_dt) else None
+                        if o_sess and o_sess != _date:
+                            continue
+                    filtered_orders.append(o)
+                if filtered_orders:
+                    all_orders = filtered_orders
+            except Exception:
+                pass
             export_data = []
             for o in all_orders:
                 d = o.to_dict()
