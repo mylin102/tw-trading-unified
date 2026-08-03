@@ -3686,10 +3686,27 @@ elif _selected_product == "TMF":
                 _u1, _u2, _u3 = st.columns(3)
                 _nr = _mts_state.get("near_upl", 0)
                 _fr = _mts_state.get("far_upl", 0)
-                _tr = _mts_state.get("total_upl", 0)
-                _u1.metric("近月 UPL", f"{_nr:+,.0f} TWD")
-                _u2.metric("遠月 UPL", f"{_fr:+,.0f} TWD")
+                # 2026-08-03: released leg shows realized PnL (已平倉) instead of 0
+                _nr_label = f"{_nr:+,.0f} TWD"
+                _fr_label = f"{_fr:+,.0f} TWD"
+                _nr_status = str(_mts_state.get("near_status", "")).upper()
+                _fr_status = str(_mts_state.get("far_status", "")).upper()
+                if "RELEASED" in _fr_status:
+                    _r = _mts_state.get("far_realized_pnl")
+                    if _r:
+                        _fr = _r
+                        _fr_label = f"{_r:+,.0f} TWD (已平倉)"
+                if "RELEASED" in _nr_status:
+                    _r = _mts_state.get("near_realized_pnl")
+                    if _r:
+                        _nr = _r
+                        _nr_label = f"{_r:+,.0f} TWD (已平倉)"
+                _tr = (_nr or 0) + (_fr or 0)
+                _u1.metric("近月 UPL", _nr_label)
+                _u2.metric("遠月 UPL", _fr_label)
                 _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
+                if "RELEASED" in _fr_status or "RELEASED" in _nr_status:
+                    st.caption("總計 = 未實現 UPL + 已平倉腿 realized PnL（含釋放腿）")
 
                 # 2026-07-27 Gemini CLI: Policy J (Combined UPL Trail) Live Notification Banner
                 # 2026-07-31 Hermes Agent: Only show Policy J when BOTH legs are still open (SPREAD phase).
