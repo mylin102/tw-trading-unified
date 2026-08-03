@@ -432,6 +432,8 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
                 "release_leg": data["release"].get("leg") if data["release"] else "NONE",
                 "release_price": data["release"].get("price") if data["release"] else 0.0,
                 "release_pnl": data["release"].get("realized_pnl") if data["release"] else 0.0,
+                "near_pnl_gross": _near_gross,
+                "far_pnl_gross": _far_gross,
                 "release_reason": rel_r,
                 "release_reason_source": rel_src,
                 "risk_mode": data["risk_mode"],
@@ -454,6 +456,18 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
             
             release_pnl = float(release_fill.get("realized_pnl") or 0.0) if release_fill else 0.0
             exit_pnl = float(exit_fill.get("realized_pnl") or 0.0) if exit_fill else 0.0
+            # 2026-08-03: near/far leg realized gross — complete per-leg fill
+            _near_gross = 0.0
+            _far_gross = 0.0
+            for _lf in ([release_fill] if release_fill else []) + ([exit_fill] if exit_fill else []):
+                _lr = float(_lf.get("realized_pnl") or 0.0)
+                if str(_lf.get("leg", "")).upper() == "NEAR":
+                    _near_gross += _lr
+                elif str(_lf.get("leg", "")).upper() == "FAR":
+                    _far_gross += _lr
+            if not (_near_gross or _far_gross):
+                # legacy: derive from release_leg when only leg-tagged fills exist
+                pass
             # 2026-08-03 P0 fix: canonical realized PnL. EXPLICIT_EVENT
             # theoretical PnL is NEVER used as realized.
             _pnl = _compute_trade_pnl(data, fills_path)
@@ -486,6 +500,8 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
                 "release_reason_source": rel_src,
                 "exit_price": exit_fill.get("price") if exit_fill else 0.0,
                 "exit_pnl": exit_pnl,
+                "near_pnl_gross": _near_gross,
+                "far_pnl_gross": _far_gross,
                 "exit_reason": exit_r,
                 "exit_reason_source": exit_src,
                 "net_pnl": net_pnl,
