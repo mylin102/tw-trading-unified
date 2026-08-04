@@ -129,7 +129,7 @@ def main():
     print("\nSweep Complete! Saving results...")
     
     artifact_path = os.path.join(
-        os.getenv("ARTIFACT_DIR", "/Users/mylin/.gemini/antigravity-cli/brain/7e4cfbee-eaf2-4a7c-850a-ffc21c669a29"),
+        os.getenv("ARTIFACT_DIR", "/Users/myllin_mini/Documents/mylin102/tw-trading-unified-git/data/telemetry/shadow-soak"),
         "tmf_spread_sweep_results.md"
     )
     
