@@ -1615,6 +1615,17 @@ class FuturesMonitor:
                     str(getattr(getattr(self, "far_contract", None), "code", "") or "").split("/")[-1].strip())
                 _c._load_existing()
                 self._f_shadow_c = _c
+                self._f_shadow_funnel = {
+                    "hook_enter": 0, "target_contract": 0, "bbos_extracted": 0,
+                    "bbos_valid": 0, "envelope_created": 0, "pair_cache_updated": 0,
+                    "pair_ready": 0, "pair_rejected": 0, "mc_eval_called": 0,
+                    "mc_eval_returned": 0, "f_eval_called": 0, "f_eval_returned": 0,
+                    "telemetry_enqueued": 0, "telemetry_write_ok": 0,
+                    "telemetry_write_err": 0, "telemetry_dropped": 0,
+                    "reasons": {},
+                    "probe_start": datetime.now().isoformat(timespec="seconds"),
+                    "git_sha": "85b8e7de",
+                }
                 import atexit
                 atexit.register(self._f_shadow_flush)
                 self._install_signal_flush()
@@ -1683,18 +1694,59 @@ class FuturesMonitor:
             self._f_shadow_flush_log = {"attempted": True, "success": False,
                                         "unflushed": _buf_before if "_buf_before" in dir() else -1}
 
+    def _f_funnel(self, stage, reason=None):
+        try:
+            _f = getattr(self, "_f_shadow_funnel", None)
+            if _f is None:
+                return
+            _f[stage] = _f.get(stage, 0) + 1
+            if reason:
+                _k = f"{stage}:{reason}"
+                _f["reasons"][_k] = _f["reasons"].get(_k, 0) + 1
+            _now = time.time()
+            if _now - float(getattr(self, "_f_shadow_funnel_dump_ts", 0.0)) > 60.0:
+                self._f_shadow_funnel_dump_ts = _now
+                try:
+                    import logging
+                    logging.getLogger("FuturesMonitor").info(
+                        "[SHADOW_F_PROBE] %s",
+                        json.dumps({"funnel": _f, "as_of": datetime.now().isoformat(timespec="seconds"),
+                                    "session": "NIGHT" if datetime.now().hour >= 15 or datetime.now().hour < 5 else "DAY"},
+                                   ensure_ascii=False))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()
         self._f_shadow_t0 = time.time()
         try:
+            self._f_funnel("hook_enter")
             _c = self._f_shadow()
+            if _c is None:
+                self._f_funnel("hook_enter", "collector_none")
+                return
+            self._f_funnel("hook_enter", "collector_ok")
             if _c is not None:
                 _code = str(getattr(tick, "code", "") or "").split("/")[-1].strip()
                 _bid = getattr(tick, "buy_price", None)
                 _ask = getattr(tick, "sell_price", None)
+                _near_c = str(getattr(getattr(self, "contract", None), "code", "") or "").split("/")[-1].strip()
+                _far_c = str(getattr(getattr(self, "far_contract", None), "code", "") or "").split("/")[-1].strip()
+                self._f_funnel("target_contract" if _code in (_near_c, _far_c) else "target_contract",
+                               None if _code in (_near_c, _far_c) else f"other:{_code}")
+                if _bid is None or _ask is None:
+                    self._f_funnel("bbos_extracted", "missing_bid_or_ask")
+                else:
+                    self._f_funnel("bbos_extracted")
+                    self._f_funnel("bbos_valid")
                 if _bid is not None or _ask is not None:
+                    self._f_funnel("envelope_created")
                     _c.on_quote(_code, _bid, _ask, contract_code=_code,
                                 receive_ts=datetime.now().isoformat(timespec="milliseconds"))
+                    self._f_funnel("pair_cache_updated")
+                    self._f_funnel("pair_ready" if _c.pair_ready() else "pair_rejected")
                     _now_t = time.time()
                     _st = getattr(self, "_f_shadow_state", None) or {}
                     if _now_t - getattr(self, "_f_shadow_state_ts", 0) > 1.0:
