@@ -97,6 +97,11 @@ class AttributionDashboard:
         if strategy_df.empty:
             return pd.DataFrame()
         
+        # Ensure all columns exist before agg
+        for col in ['candidate', 'evaluated', 'winner', 'shadowed', 'regime_mismatch', 'no_signal', 'missing']:
+            if col not in strategy_df.columns:
+                strategy_df[col] = 0
+
         # Group by strategy
         summary = strategy_df.groupby('strategy_name').agg({
             'candidate': 'sum',
@@ -122,7 +127,7 @@ class AttributionDashboard:
     
     def _summarize_trades(self, trade_df: pd.DataFrame) -> pd.DataFrame:
         """Summarize trade attribution data."""
-        if trade_df.empty:
+        if trade_df is None or trade_df.empty or 'strategy_name' not in trade_df.columns:
             return pd.DataFrame()
         
         # Group by strategy
@@ -527,3 +532,49 @@ if __name__ == "__main__":
             print(f"  [{alert['level'].upper()}] {alert['message']}")
     else:
         print("\nNo alerts")
+
+# 2026-08-04 Gemini CLI: Session performance breakdown calculator (DAY vs NIGHT vs ALL)
+def compute_session_breakdown(completed_trades: list) -> dict:
+    """Compute realized PnL, trade counts, win rate, and profit factor broken down by trading session (DAY / NIGHT / ALL)."""
+    def _calc_metrics(trades: list) -> dict:
+        realized = [
+            t for t in trades
+            if t.get("is_realized") and t.get("gross_pnl") is not None and t.get("guard_period") != "PRE_GUARD"
+        ]
+        total_trades = len(realized)
+        total_net = sum((t.get("gross_pnl") or 0.0) for t in realized)
+        wins = sum(1 for t in realized if (t.get("gross_pnl") or 0.0) > 0)
+        win_rate = (wins / total_trades) if total_trades > 0 else 0.0
+
+        gross_wins = sum((t.get("gross_pnl") or 0.0) for t in realized if (t.get("gross_pnl") or 0.0) > 0)
+        gross_losses = sum(abs(t.get("gross_pnl") or 0.0) for t in realized if (t.get("gross_pnl") or 0.0) <= 0)
+        pf = (gross_wins / gross_losses) if gross_losses > 0 else (99.9 if gross_wins > 0 else 0.0)
+
+        return {
+            "total_trades": total_trades,
+            "total_net": total_net,
+            "wins": wins,
+            "win_rate": win_rate,
+            "profit_factor": pf,
+            "realized_trades": realized,
+        }
+
+    all_metrics = _calc_metrics(completed_trades)
+
+    day_trades = [
+        t for t in completed_trades
+        if str(t.get("entry_session", t.get("session", ""))).lower() == "day"
+    ]
+    day_metrics = _calc_metrics(day_trades)
+
+    night_trades = [
+        t for t in completed_trades
+        if str(t.get("entry_session", t.get("session", ""))).lower() == "night"
+    ]
+    night_metrics = _calc_metrics(night_trades)
+
+    return {
+        "ALL": all_metrics,
+        "DAY": day_metrics,
+        "NIGHT": night_metrics,
+    }

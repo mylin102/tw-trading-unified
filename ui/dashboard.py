@@ -3861,25 +3861,36 @@ elif _selected_product == "TMF":
             # (SETTLEMENT / FILLS / FILLS_BACKFILL + DERIVED_AUDITABLE).
             # EXPLICIT_EVENT theoretical PnL never enters realized KPIs.
             # guard-before (7/31 pollution) trades are excluded from KPI
-            _realized = [t for t in _completed if t.get("is_realized") and t.get("gross_pnl") is not None
-                         and t.get("guard_period") != "PRE_GUARD"]
-            _total_trades = len(_realized)
-            _total_net = sum((t.get("gross_pnl") or 0) for t in _realized)
-            _theoretical = sum((t.get("theoretical_pnl") or 0) for t in _completed)
-            
-            _wins = sum(1 for t in _realized if (t.get("gross_pnl") or 0) > 0)
-            _win_rate = (_wins / _total_trades) if _total_trades > 0 else 0.0
-            
-            _gross_wins = sum((t.get("gross_pnl") or 0) for t in _realized if (t.get("gross_pnl") or 0) > 0)
-            _gross_losses = sum(abs(t.get("gross_pnl") or 0) for t in _realized if (t.get("gross_pnl") or 0) <= 0)
-            _pf = (_gross_wins / _gross_losses) if _gross_losses > 0 else (99.9 if _gross_wins > 0 else 0.0)
-            
+            # 2026-08-04 Gemini CLI: Session Breakdown (DAY vs NIGHT vs ALL)
+            from ui.attribution_dashboard import compute_session_breakdown
+            _breakdown = compute_session_breakdown(_completed)
+
+            _sel_session = st.radio(
+                "交易時段視角 (Session Filter)",
+                ["🌐 全部 (All)", "☀️ 日盤 (Day Session)", "🌙 夜盤 (Night Session)"],
+                horizontal=True,
+                key="mts_session_filter_view"
+            )
+            _sess_key = "ALL" if "全部" in _sel_session else ("DAY" if "日盤" in _sel_session else "NIGHT")
+            _curr_metrics = _breakdown[_sess_key]
+
+            _total_trades = _curr_metrics["total_trades"]
+            _total_net = _curr_metrics["total_net"]
+            _win_rate = _curr_metrics["win_rate"]
+            _pf = _curr_metrics["profit_factor"]
+
             _c1, _c2, _c3, _c4 = st.columns(4)
             _c1.metric("MTS 實現毛損益 (Realized Gross)", f"{_total_net:+,.0f} TWD")
             _c2.metric("已完成圈數 (Realized)", _total_trades)
             _c3.metric("勝率", f"{_win_rate:.1%}")
             _c4.metric("獲利因子", f"{_pf:.2f}" if _total_trades > 0 else "—")
-            # 2026-08-04 Gemini CLI: Removed confusing theoretical event PnL caption to keep KPI clear
+
+            _day_m = _breakdown["DAY"]
+            _night_m = _breakdown["NIGHT"]
+            st.caption(
+                f"☀️ 日盤實現毛利: **{_day_m[total_net]:+,.0f} TWD** ({_day_m[total_trades]} 圈, 勝率 {_day_m[win_rate]:.1%}) | "
+                f"🌙 夜盤實現毛利: **{_night_m[total_net]:+,.0f} TWD** ({_night_m[total_trades]} 圈, 勝率 {_night_m[win_rate]:.1%})"
+            )
             
             if _completed:
                 with st.expander("📝 已完結交易清單 (Closed Loops)", expanded=True):
