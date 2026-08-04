@@ -1602,8 +1602,60 @@ class FuturesMonitor:
             ask=float(getattr(tick, "sell_price", _close) or _close),
         )
 
+    def _f_shadow(self):
+        """Lazy FShadowCollector (fail-open; read-only shadow)."""
+        try:
+            if getattr(self, "_f_shadow_c", None) is None:
+                from core.exit_shadow_f import FShadowCollector
+                _d = "data/telemetry/shadow_f"
+                os.makedirs(_d, exist_ok=True)
+                _c = FShadowCollector(f"{_d}/shadow_f_{datetime.now():%Y%m%d}.jsonl")
+                _c.bind_contracts(
+                    str(getattr(getattr(self, "contract", None), "code", "") or "").split("/")[-1].strip(),
+                    str(getattr(getattr(self, "far_contract", None), "code", "") or "").split("/")[-1].strip())
+                _c._load_existing()
+                self._f_shadow_c = _c
+            return self._f_shadow_c
+        except Exception:
+            return None
+
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()
+        try:
+            _c = self._f_shadow()
+            if _c is not None:
+                _code = str(getattr(tick, "code", "") or "").split("/")[-1].strip()
+                _bid = getattr(tick, "buy_price", None)
+                _ask = getattr(tick, "sell_price", None)
+                if _bid is not None or _ask is not None:
+                    _c.on_quote(_code, _bid, _ask, contract_code=_code,
+                                receive_ts=datetime.now().isoformat(timespec="milliseconds"))
+                    _now_t = time.time()
+                    if _now_t - getattr(self, "_f_shadow_state_ts", 0) > 1.0:
+                        try:
+                            with open(MTS_POSITION_STATE_PATH) as _fst:
+                                self._f_shadow_state = json.load(_fst)
+                        except Exception:
+                            self._f_shadow_state = {}
+                        self._f_shadow_state_ts = _now_t
+                    _st = getattr(self, "_f_shadow_state", None) or {}
+                    if _st.get("has_position") and _c.pair_ready():
+                        _c.evaluate({
+                            "trade_id": _st.get("trade_id"),
+                            "position_generation": _st.get("trade_id"),
+                            "near_side": _st.get("near_side"),
+                            "far_side": _st.get("far_side"),
+                            "near_entry": _st.get("near_entry"),
+                            "far_entry": _st.get("far_entry"),
+                            "near_contract": str(getattr(getattr(self, "contract", None), "code", "") or "").split("/")[-1].strip(),
+                            "far_contract": str(getattr(getattr(self, "far_contract", None), "code", "") or "").split("/")[-1].strip(),
+                            "release_threshold_pts": _st.get("release_stop_points", 88.0),
+                            "atr": _st.get("atr"),
+                            "mark_source": "PRODUCTION_RUNTIME",
+                            "point_value": 10.0,
+                        })
+        except Exception:
+            pass
         # [Model C canary 2026-08-03] synchronized BBO executable marking —
         # shadow only. Flag-gated dynamically (data/model_c_canary.flag).
         try:
