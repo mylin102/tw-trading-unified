@@ -2117,15 +2117,17 @@ class TMFSpread(StrategyBase):
             if not hasattr(self, _a):
                 setattr(self, _a, None)
         _tid = getattr(self, "_trade_id", None)
-        # ── Entry-completion gate ──
-        _na = getattr(self, "_near_entry_avg", None)
-        _fa = getattr(self, "_far_entry_avg", None)
-        _nq = getattr(self, "_near_open_qty", 0) or 0
-        _fq = getattr(self, "_far_open_qty", 0) or 0
-        if not (_na and _fa and _nq > 0 and _fq > 0) or phase not in ("SPREAD", "SINGLE_LEG"):
-            _append_event("POLICY_J_TRIGGER_SUPPRESSED", trade_id=_tid,
-                          reason="ENTRY_NOT_SETTLED",
-                          current_upl=float(current_pnl_pts) * _PV - _COST, phase=phase)
+        # ── Entry-completion gate (2026-08-04 hotfix: real attrs) ──
+        _na = float(getattr(self, "_near_entry", 0.0) or 0.0)
+        _fa = float(getattr(self, "_far_entry", 0.0) or 0.0)
+        if not (_na > 0 and _fa > 0) or phase not in ("SPREAD", "SINGLE_LEG"):
+            _now_ms_g = datetime.now().timestamp() * 1000.0
+            if _now_ms_g - float(getattr(self, "_pj_last_suppress_ms", 0.0)) > 5000.0:
+                _append_event("POLICY_J_TRIGGER_SUPPRESSED", trade_id=_tid,
+                              reason="ENTRY_NOT_SETTLED",
+                              current_upl=float(current_pnl_pts) * _PV - _COST,
+                              phase=phase, near_entry=_na, far_entry=_fa)
+                self._pj_last_suppress_ms = _now_ms_g
             return self._pj_durable_peak is not None
         # ── Per-trade reset ──
         if self._pj_trade_id != _tid:

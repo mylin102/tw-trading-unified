@@ -16,7 +16,7 @@ def make_strategy(**attrs):
         _peak_confirmation_samples=3, _peak_confirmation_ms=1000.0,
         _peak_confirmation_tolerance_twd=100.0, _entry_peak_guard_ms=15000.0,
         _max_single_update_jump_twd=200.0, _point_value=10.0, _estimated_cost=92.0,
-        _near_entry_avg=42830.0, _far_entry_avg=42967.0, _near_open_qty=1, _far_open_qty=1,
+        _near_entry=42830.0, _far_entry=42967.0,
         _phase="SPREAD",
     )
     for k, v in defaults.items():
@@ -51,7 +51,7 @@ def emit(s, event, **kw):
 
 
 def test_entry_not_settled_suppresses():
-    s = make_strategy(_near_open_qty=0)  # near not filled
+    s = make_strategy(_near_entry=0.0)  # near entry missing -> suppressed
     result = call(s, 72.0, 42800, 42975, 1000.0, entry_ts_ms=100.0)
     assert result is False  # suppressed
     assert s._pj_durable_peak is None
@@ -138,3 +138,40 @@ def test_normal_confirmed_path_functional():
     call(s, 30.4, 42798, 42989, 2000.0, entry_ts_ms=100.0)   # count 2
     call(s, 30.3, 42797, 42989, 2500.0, entry_ts_ms=100.0)   # count 3 -> confirm
     assert s._pj_durable_peak == pytest.approx(30.5 * 10 - 92, abs=5)
+
+
+# ── 2026-08-04 gate regression (real attrs) ─────────────────────────────
+
+def test_gate_passes_with_real_entry_attrs():
+    s = make_strategy()  # _near_entry/_far_entry set (real attr names)
+    result = call(s, 30.0, 42801, 42975, 1000.0, phase="SPREAD")
+    assert not any(e["event"] == "POLICY_J_TRIGGER_SUPPRESSED" for e in s._pj_events)
+    assert any(e["event"] == "POLICY_J_PEAK_CANDIDATE" for e in s._pj_events)
+
+
+def test_gate_suppresses_when_far_entry_missing():
+    s = make_strategy(_far_entry=0.0)
+    call(s, 30.0, 42801, 42975, 1000.0, phase="SPREAD")
+    assert any(e["event"] == "POLICY_J_TRIGGER_SUPPRESSED"
+               and e.get("reason") == "ENTRY_NOT_SETTLED" for e in s._pj_events)
+
+
+def test_gate_works_in_single_leg_phase():
+    s = make_strategy()  # both real entries present
+    result = call(s, 30.0, 42801, 42975, 1000.0, phase="SINGLE_LEG")
+    assert not any(e["event"] == "POLICY_J_TRIGGER_SUPPRESSED" for e in s._pj_events)
+
+
+def test_no_fake_attributes_created():
+    s = make_strategy()
+    assert not hasattr(s, "_near_entry_avg")
+    assert not hasattr(s, "_near_open_qty")
+
+
+def test_suppression_throttled_state_transition_only():
+    s = make_strategy(_far_entry=0.0)
+    for _ in range(5):
+        call(s, 30.0, 42801, 42975, 1000.0, phase="SPREAD")  # same now_ms
+    n_supp = sum(1 for e in s._pj_events
+                 if e["event"] == "POLICY_J_TRIGGER_SUPPRESSED")
+    assert n_supp <= 2  # throttled (5s window) — not one per call
