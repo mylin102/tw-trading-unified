@@ -2113,7 +2113,9 @@ class TMFSpread(StrategyBase):
         _max_jump = float(getattr(self, "_max_single_update_jump_twd", 200.0))
         for _a in ("_pj_trade_id", "_pj_durable_peak", "_pj_candidate_peak",
                    "_pj_candidate_ts", "_pj_candidate_count", "_pj_last_mark_pair",
-                   "_pj_last_upl", "_pj_last_eval_ts"):
+                   "_pj_last_upl", "_pj_last_eval_ts",
+                   "_pj_guard_state", "_pj_guard_provisional_peak",
+                   "_pj_guard_initialized", "_pj_guard_just_completed"):
             if not hasattr(self, _a):
                 setattr(self, _a, None)
         _tid = getattr(self, "_trade_id", None)
@@ -2139,6 +2141,10 @@ class TMFSpread(StrategyBase):
             self._pj_candidate_count = 0
             self._pj_last_mark_pair = None
             self._pj_last_upl = None
+            self._pj_guard_state = None
+            self._pj_guard_provisional_peak = None
+            self._pj_guard_initialized = False
+            self._pj_guard_just_completed = False
         _upl = float(current_pnl_pts) * _PV - _COST
         _pair = (near_mark, far_mark)
         # ── freshness / skew gate ──
@@ -2147,6 +2153,49 @@ class TMFSpread(StrategyBase):
                           current_upl=_upl, near_mark=near_mark, far_mark=far_mark,
                           near_mark_age_ms=mark_age_ms, pair_skew_ms=pair_skew_ms)
             self._pj_last_upl = _upl
+            return self._pj_durable_peak is not None
+        # ── Entry peak guard: provisional quarantine (2026-08-04) ──
+        # Dead-code fix: _entry_peak_guard_ms was initialized (2112) but never
+        # consumed — opening spikes became durable peaks and triggered giveback
+        # exits 0-11s after entry (5 trades 15:00-15:22 night session).
+        _guard_ms = float(getattr(self, "_entry_peak_guard_ms", 15000.0))
+        _elapsed_ms = None
+        if entry_ts_ms and entry_ts_ms > 0.0:
+            _elapsed_ms = now_ms - entry_ts_ms
+        if _elapsed_ms is not None and _elapsed_ms < _guard_ms:
+            # ── In guard window: provisional quarantine ──
+            self._pj_guard_state = "QUARANTINE"
+            self._pj_guard_initialized = False
+            if self._pj_guard_provisional_peak is None or _upl > self._pj_guard_provisional_peak:
+                self._pj_guard_provisional_peak = _upl
+            _append_event("POLICY_J_GUARD_QUARANTINE", trade_id=_tid,
+                          current_upl=_upl,
+                          provisional_peak=self._pj_guard_provisional_peak,
+                          elapsed_ms=round(_elapsed_ms, 1), guard_ms=_guard_ms,
+                          phase=phase)
+            self._pj_last_mark_pair = _pair
+            self._pj_last_upl = _upl
+            self._pj_last_eval_ts = now_ms
+            return self._pj_durable_peak is not None
+        if _elapsed_ms is None:
+            # ── Fail-safe: entry timestamp missing -> no quarantine, normal path.
+            #    Policy J must never be permanently disabled by a missing anchor.
+            self._pj_guard_state = None
+        elif not self._pj_guard_initialized:
+            # ── Guard window elapsed: baseline from CURRENT synchronized mark,
+            #    NEVER the window spike. No giveback evaluation on this tick.
+            self._pj_guard_state = "COMPLETE"
+            self._pj_guard_initialized = True
+            self._pj_guard_just_completed = True
+            self._pj_durable_peak = _upl
+            _append_event("POLICY_J_GUARD_BASELINE", trade_id=_tid,
+                          baseline=_upl,
+                          provisional_peak=self._pj_guard_provisional_peak,
+                          elapsed_ms=round(_elapsed_ms, 1), guard_ms=_guard_ms,
+                          phase=phase)
+            self._pj_last_mark_pair = _pair
+            self._pj_last_upl = _upl
+            self._pj_last_eval_ts = now_ms
             return self._pj_durable_peak is not None
         # ── spike quarantine (jump detection) ──
         _prev = self._pj_last_upl if self._pj_last_upl is not None else _upl
@@ -3504,6 +3553,7 @@ class TMFSpread(StrategyBase):
             from strategies.plugins.futures.active.mts_lifecycle_adapter import LifecycleEvaluationInput
             _adapter_input = LifecycleEvaluationInput(
                 strategy_state={
+                    "policy_j_guard_just_completed": bool(getattr(self, "_pj_guard_just_completed", False)),
                     "near_pnl_pts": _n_pnl,
                     "far_pnl_pts": _f_pnl,
                     "floating_pnl_pts": current_pnl,
@@ -3534,6 +3584,8 @@ class TMFSpread(StrategyBase):
                 execution_mode="BACKTEST" if _is_backtest else "LIVE",
             )
             self._ensure_lifecycle_adapter_initialized("LATE_INIT")
+            if getattr(self, "_pj_guard_just_completed", False):
+                self._pj_guard_just_completed = False  # consumed once
             _adapter_res = self._lifecycle_adapter.evaluate(_adapter_input)
             _decision = _adapter_res.decision
 

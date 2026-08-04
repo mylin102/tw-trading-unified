@@ -171,6 +171,7 @@ class LifecycleContext:
     combined_upl_giveback_twd: float = 100.0
     peak_net_exit_pnl_twd: float = 0.0
     combined_exit_execution_enabled: bool = True
+    policy_j_guard_just_completed: bool = False  # 2026-08-04: baseline tick, skip giveback eval
 
 @dataclass(frozen=True)
 class LifecycleEvaluationInput:
@@ -250,6 +251,10 @@ def _check_combined_upl_trail_candidate(
     if not ctx.enable_combined_upl_trail:
         return []
     if not getattr(ctx, "combined_exit_execution_enabled", True):
+        return []
+    # 2026-08-04: guard-completion tick establishes the baseline — never
+    # trigger giveback on the same tick (would exit on a spike-derived peak).
+    if getattr(ctx, "policy_j_guard_just_completed", False):
         return []
     _phase_val = enum_value(lifecycle.phase)
     # 2026-08-03 Gemini CLI: Support Policy J combined total PnL exit in SINGLE_LEG phase (whichever hits first between Policy J & trailing exit)
@@ -553,6 +558,7 @@ class MtsLifecycleAdapter:
         activation_twd = float(state.get("combined_upl_activation_net_pnl_twd", 300.0))
         giveback_twd = float(state.get("combined_upl_giveback_twd", 100.0))
         peak_net_exit_pnl = float(state.get("peak_net_exit_pnl_twd", 0.0))
+        guard_just_completed = bool(state.get("policy_j_guard_just_completed", False))
         
         ctx = LifecycleContext(
             near_pnl_pts=near_pnl,
@@ -574,6 +580,7 @@ class MtsLifecycleAdapter:
             combined_upl_activation_net_pnl_twd=activation_twd,
             combined_upl_giveback_twd=giveback_twd,
             peak_net_exit_pnl_twd=peak_net_exit_pnl,
+            policy_j_guard_just_completed=guard_just_completed,
         )
         
         # Calculate time above breakeven
