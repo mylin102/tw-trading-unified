@@ -1630,7 +1630,15 @@ class FuturesMonitor:
                 atexit.register(self._f_shadow_flush)
                 self._install_signal_flush()
             return self._f_shadow_c
-        except Exception:
+        except Exception as _e:
+            try:
+                _f = getattr(self, "_f_shadow_funnel", None)
+                if _f is None:
+                    _f = {"hook_enter": 0, "reasons": {}, "probe_start": "n/a", "git_sha": "41cde57a"}
+                    self._f_shadow_funnel = _f
+                _f["reasons"][f"shadow_init_error:{type(_e).__name__}"] =                     _f["reasons"].get(f"shadow_init_error:{type(_e).__name__}", 0) + 1
+            except Exception:
+                pass
             return None
 
     def _install_signal_flush(self):
@@ -1698,7 +1706,18 @@ class FuturesMonitor:
         try:
             _f = getattr(self, "_f_shadow_funnel", None)
             if _f is None:
-                return
+                _f = {
+                    "hook_enter": 0, "target_contract": 0, "bbos_extracted": 0,
+                    "bbos_valid": 0, "envelope_created": 0, "pair_cache_updated": 0,
+                    "pair_ready": 0, "pair_rejected": 0, "mc_eval_called": 0,
+                    "mc_eval_returned": 0, "f_eval_called": 0, "f_eval_returned": 0,
+                    "telemetry_enqueued": 0, "telemetry_write_ok": 0,
+                    "telemetry_write_err": 0, "telemetry_dropped": 0,
+                    "reasons": {},
+                    "probe_start": datetime.now().isoformat(timespec="seconds"),
+                    "git_sha": "41cde57a",
+                }
+                self._f_shadow_funnel = _f
             _f[stage] = _f.get(stage, 0) + 1
             if reason:
                 _k = f"{stage}:{reason}"
