@@ -82,9 +82,10 @@ _thread_local = threading.local()
 
 
 def _extract_bbo(quote_obj) -> tuple | None:
-    """Pure BBO extractor. Accepts scalar (futures tick) or list
-    (BidAskFOPv1) bid_price/ask_price. Rejects: empty/missing, non-numeric,
-    bid<=0, ask<=0, ask<bid. NEVER falls back to close/last to fake a BBO."""
+    """Pure BBO extractor. Accepts scalar or list bid_price/ask_price
+    (BidAskFOPv1 options) with buy_price/sell_price fallback (futures ticks).
+    Rejects: empty/missing, non-numeric, bid<=0, ask<=0, ask<bid.
+    NEVER falls back to close/last to fake a BBO."""
     try:
         _bp = getattr(quote_obj, "bid_price", None)
         _ap = getattr(quote_obj, "ask_price", None)
@@ -94,8 +95,15 @@ def _extract_bbo(quote_obj) -> tuple | None:
             if isinstance(v, list):
                 return v[0] if v else None
             return v
+        # bid_price/ask_price (BidAskFOPv1 options) -> fallback buy_price/sell_price (futures ticks)
         bid = _first(_bp)
+        if bid is None:
+            bid = _first(getattr(quote_obj, "buy_price", None))
         ask = _first(_ap)
+        if ask is None:
+            ask = _first(getattr(quote_obj, "sell_price", None))
+        if bid is None or ask is None:
+            return None
         try:
             bid = float(bid); ask = float(ask)
         except (TypeError, ValueError):
