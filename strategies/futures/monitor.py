@@ -1609,14 +1609,18 @@ class FuturesMonitor:
         try:
             _mc_flag = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "model_c_canary.flag")
             if os.path.exists(_mc_flag):
-                _code = str(getattr(tick, "code", "") or "")
-                _near_c = str(getattr(getattr(self, "contract", None), "code", "") or "")
-                _far_c = str(getattr(getattr(self, "far_contract", None), "code", "") or "")
+                _code = str(getattr(tick, "code", "") or "").split("/")[-1].strip()
+                _near_c = str(getattr(getattr(self, "contract", None), "code", "") or "").split("/")[-1].strip()
+                _far_c = str(getattr(getattr(self, "far_contract", None), "code", "") or "").split("/")[-1].strip()
                 _leg = None
                 if _code and _code == _near_c:
                     _leg = "NEAR"
                 elif _code and _code == _far_c:
                     _leg = "FAR"
+                if not _leg and not hasattr(self, "_mc_leg_miss_log"):
+                    self._mc_leg_miss_log = True
+                    logger.warning("[MODEL_C] leg mismatch code=%r near=%r far=%r",
+                                   _code, _near_c, _far_c)
                 if _leg:
                     if not hasattr(self, "_model_c"):
                         from core.model_c_collector import ModelCCollector
@@ -1637,8 +1641,10 @@ class FuturesMonitor:
                             seq=getattr(tick, "seq", None),
                             contract_code=_code,
                             source="shioaji_tick")
-        except Exception:
-            pass
+        except Exception as _mc_err:
+            if not hasattr(self, "_mc_err_log"):
+                self._mc_err_log = True
+                logger.warning("[MODEL_C] hook error: %r", _mc_err)
         # [P2] Spread shadow bridge — accepted-tick shadow path (disabled by default)
         try:
             self._shadow_seq = getattr(self, "_shadow_seq", 0) + 1
@@ -6154,7 +6160,7 @@ class FuturesMonitor:
         _last_exit = getattr(strategy, "_last_exit_ts", None)
         _in_cooldown = False
         if _last_exit:
-            if (datetime.now() - _last_exit).total_seconds() < 10:
+            if isinstance(_last_exit, datetime) and (datetime.now() - _last_exit).total_seconds() < 10:
                 _in_cooldown = True
 
         if (
