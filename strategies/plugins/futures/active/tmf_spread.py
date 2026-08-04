@@ -95,6 +95,68 @@ def resolve_entry_peak_guard_ms(params) -> tuple[float, str, str]:
         return (_lv, "LEGACY_CONFIG", legacy_key)
     return (_ENTRY_PEAK_GUARD_DEFAULT_MS, "DEFAULT", new_key)
 
+
+# ── Canonical Policy J guard clock (2026-08-04 P0) ──
+# The 8h skew root cause: bar/tick timestamps carry UTC-epoch semantics while
+# the entry state ISO is naive Asia/Taipei wall-clock; mixing .timestamp()
+# yields phantom elapsed and an instantly-expired guard. Contract:
+#   epoch integer ms = decision source of truth
+#   timezone-aware ISO = display/audit only
+#   guard starts at entry-settled receive epoch (same clock as lifecycle)
+_ENTRY_GUARD_REASON_MISSING = "ENTRY_TIME_MISSING"
+_ENTRY_GUARD_REASON_PARSE = "ENTRY_TIME_PARSE_ERROR"
+_ENTRY_GUARD_REASON_FUTURE = "ENTRY_TIME_FUTURE"
+_ENTRY_GUARD_REASON_IMPLAUSIBLE = "ENTRY_TIME_IMPLAUSIBLE"
+_ENTRY_GUARD_REASON_SCHEMA = "ENTRY_TIME_SCHEMA_UNKNOWN"
+_ENTRY_GUARD_REASON_ACTIVE = "ENTRY_GUARD_ACTIVE"
+
+
+def iso_to_epoch_ms(iso: str) -> float:
+    """Convert an ISO timestamp to epoch milliseconds.
+
+    timezone-aware -> UTC epoch ms (correct).
+    naive -> Asia/Taipei wall-clock per the documented legacy contract
+    (LEGACY_NAIVE_LOCAL_MIGRATED); NEVER guessed as UTC.
+    Raises ValueError on unparseable / far-future values.
+    """
+    if not iso:
+        raise ValueError(_ENTRY_GUARD_REASON_MISSING)
+    s = str(iso).strip()
+    if not s:
+        raise ValueError(_ENTRY_GUARD_REASON_MISSING)
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        raise ValueError(_ENTRY_GUARD_REASON_PARSE)
+    if dt.tzinfo is None:
+        # naive legacy contract: Asia/Taipei wall-clock
+        from zoneinfo import ZoneInfo
+        dt = dt.replace(tzinfo=ZoneInfo("Asia/Taipei"))
+    epoch_ms = dt.timestamp() * 1000.0
+    _now_ms = time.time() * 1000.0
+    if epoch_ms > _now_ms + 24 * 3600 * 1000:
+        raise ValueError(_ENTRY_GUARD_REASON_FUTURE)
+    return epoch_ms
+
+
+def migrate_entry_time(iso, entry_ts_ms=None):
+    """Resolve a trusted entry-time epoch for the guard clock.
+
+    Returns (epoch_ms, source) with source in
+      CANONICAL_EPOCH | TZ_AWARE | LEGACY_NAIVE_LOCAL_MIGRATED
+    Raises ValueError with an _ENTRY_GUARD_REASON_* code on untrusted input
+    (missing / unparseable / future).
+    """
+    if entry_ts_ms is not None and entry_ts_ms > 0:
+        _now_ms = time.time() * 1000.0
+        if entry_ts_ms > _now_ms + 24 * 3600 * 1000:
+            raise ValueError(_ENTRY_GUARD_REASON_FUTURE)
+        return float(entry_ts_ms), "CANONICAL_EPOCH"
+    ms = iso_to_epoch_ms(iso)
+    if "+" in str(iso) or "Z" in str(iso).upper():
+        return ms, "TZ_AWARE"
+    return ms, "LEGACY_NAIVE_LOCAL_MIGRATED"
+
 # 2026-07-14 Gemini CLI: Import decoupled risk engines under ADR-009 Phase 2
 from strategies.plugins.futures.active.risk_engine import (
     ReleaseRiskEngine,
@@ -1768,6 +1830,11 @@ class TMFSpread(StrategyBase):
         self._entry_ts = kwargs.get("entry_ts") or datetime.now()
         # 2026-05-27 Gemini CLI: Use monotonic time for robust grace period (P2)
         self._entry_time_monotonic = time.monotonic()
+        # 2026-08-04 P0: canonical guard clock — receive-epoch ms at entry
+        # settled, same clock domain as lifecycle transitions. ISO is display
+        # only; epoch integer is the decision source of truth.
+        self._entry_guard_start_ms = time.time() * 1000.0
+        self._entry_ts_ms = self._entry_guard_start_ms
         self._set_single_leg_extrema(peak=near_entry, nadir=far_entry)
         self._spread_near_high = near_entry
         self._spread_near_low = near_entry
@@ -2226,9 +2293,28 @@ class TMFSpread(StrategyBase):
         # exits 0-11s after entry (5 trades 15:00-15:22 night session).
         _guard_ms = float(getattr(self, "_entry_peak_guard_ms", 15000.0))
         _elapsed_ms = None
-        if entry_ts_ms and entry_ts_ms > 0.0:
-            _elapsed_ms = now_ms - entry_ts_ms
-        if _elapsed_ms is not None and _elapsed_ms < _guard_ms:
+        _entry_reason = None
+        if not (entry_ts_ms and entry_ts_ms > 0.0):
+            _entry_reason = _ENTRY_GUARD_REASON_MISSING
+        elif now_ms <= 0.0:
+            _entry_reason = "NOW_TS_MISSING"
+        else:
+            _elapsed_ms = max(0.0, now_ms - entry_ts_ms)
+            _max_age_ms = 48.0 * 3600.0 * 1000.0  # 48h plausibility cap
+            if _elapsed_ms > _max_age_ms:
+                _entry_reason = _ENTRY_GUARD_REASON_IMPLAUSIBLE
+        if _entry_reason is not None:
+            # Fail-safe: untrusted entry time blocks Policy J peak activation;
+            # other risk controllers (ATR/hard/release/emergency) keep running.
+            self._pj_guard_state = None
+            self._pj_guard_initialized = False
+            _append_event("POLICY_J_TRIGGER_SUPPRESSED", trade_id=_tid,
+                          reason=_entry_reason,
+                          current_upl=float(current_pnl_pts) * _PV - _COST,
+                          phase=phase, elapsed_ms=_elapsed_ms, guard_ms=_guard_ms)
+            self._pj_last_upl = float(current_pnl_pts) * _PV - _COST
+            return self._pj_durable_peak is not None
+        if _elapsed_ms < _guard_ms:
             # ── In guard window: provisional quarantine ──
             self._pj_guard_state = "QUARANTINE"
             self._pj_guard_initialized = False
@@ -2905,6 +2991,19 @@ class TMFSpread(StrategyBase):
                                 
                                 # Best effort timestamps
                                 self._entry_ts = datetime.fromisoformat(state.get("entry_ts")) if state.get("entry_ts") else datetime.now()
+                                # 2026-08-04 P0: canonical guard clock on restore
+                                try:
+                                    _g0 = float(state.get("entry_guard_start_ms") or state.get("entry_ts_ms") or 0.0)
+                                    if _g0 > 0.0:
+                                        self._entry_guard_start_ms = _g0
+                                        self._entry_ts_ms = _g0
+                                    else:
+                                        _m0, _src0 = migrate_entry_time(state.get("entry_ts"))
+                                        self._entry_guard_start_ms = _m0
+                                        self._entry_ts_ms = _m0
+                                except Exception:
+                                    self._entry_guard_start_ms = None
+                                    self._entry_ts_ms = None
                                 self._release_ts = datetime.now() if self._released_leg else None
                                 self._release_mono = time.monotonic() if self._released_leg else 0.0
                                 # 2026-05-27 Gemini CLI: Set monotonic entry time on restore to prevent immediate watchdog kill (P4)
@@ -3259,6 +3358,9 @@ class TMFSpread(StrategyBase):
         self._entry_ts = now
         # 2026-05-27 Gemini CLI: Use monotonic time for robust grace period (P2)
         self._entry_time_monotonic = time.monotonic()
+        # 2026-08-04 P0: canonical guard clock (receive epoch at entry)
+        self._entry_guard_start_ms = time.time() * 1000.0
+        self._entry_ts_ms = self._entry_guard_start_ms
         self._near_entry = near_close
         self._far_entry = far_close
         self._near_side = "SHORT" if spread_z_f > 0 else "LONG"
@@ -3291,6 +3393,10 @@ class TMFSpread(StrategyBase):
                 "entry_peak_guard_ms": float(getattr(self, "_pj_guard_effective_ms", 15000.0)),
                 "entry_peak_guard_source": str(getattr(self, "_pj_guard_source", "DEFAULT")),
                 "entry_peak_guard_config_key": str(getattr(self, "_pj_guard_config_key", "entry_peak_guard_ms")),
+                "entry_ts_ms": float(getattr(self, "_entry_ts_ms", 0.0) or 0.0),
+                "entry_guard_start_ms": float(getattr(self, "_entry_guard_start_ms", 0.0) or 0.0),
+                "time_schema_version": 2,
+                "clock_source": "RECEIVE_EPOCH_MS",
             },
         )
         _append_event("ENTRY_SUBMITTED", action=_action, near_side=self._near_side, far_side=self._far_side,
@@ -3590,15 +3696,24 @@ class TMFSpread(StrategyBase):
             # candidate-confirmed durable peak; entry gate; spike quarantine.
             _lc_phase = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
             if _lc_phase in (PositionPhase.SPREAD, PositionPhase.SINGLE_LEG):
-                _bts = bar.get("timestamp", bar.get("ts"))
+                # 2026-08-04 P0: canonical guard clock — receive-epoch ms via
+                # time.time()*1000 (same domain as entry settled / lifecycle).
+                # NEVER derive now from bar timestamp .timestamp() (mixed
+                # naive/aware semantics caused the 8h phantom elapsed).
                 try:
-                    _now_ms = _bts.timestamp() * 1000.0 if hasattr(_bts, "timestamp")                         else datetime.fromisoformat(str(_bts)[:19]).timestamp() * 1000.0
+                    _now_ms = time.time() * 1000.0
                 except Exception:
                     _now_ms = 0.0
                 _entry_ts_ms = 0.0
-                if getattr(self, "_entry_ts", None):
+                _g = getattr(self, "_entry_guard_start_ms", 0.0) or 0.0
+                if _g > 0.0:
+                    _entry_ts_ms = float(_g)
+                elif getattr(self, "_entry_ts_ms", 0.0) or 0.0 > 0.0:
+                    _entry_ts_ms = float(getattr(self, "_entry_ts_ms", 0.0) or 0.0)
+                elif getattr(self, "_entry_ts", None):
+                    # legacy fallback: epoch from naive Taipei ISO (documented)
                     try:
-                        _entry_ts_ms = self._entry_ts.timestamp() * 1000.0
+                        _entry_ts_ms = iso_to_epoch_ms(self._entry_ts.isoformat())
                     except Exception:
                         _entry_ts_ms = 0.0
                 _pj_ok = self._update_policy_j_peak(
