@@ -3879,8 +3879,7 @@ elif _selected_product == "TMF":
             _c2.metric("已完成圈數 (Realized)", _total_trades)
             _c3.metric("勝率", f"{_win_rate:.1%}")
             _c4.metric("獲利因子", f"{_pf:.2f}" if _total_trades > 0 else "—")
-            if _theoretical:
-                st.caption(f"⚡ 觸發時理論 PnL: {_theoretical:+,.0f} TWD — THEORETICAL, NOT REALIZED (不含在 KPI)")
+            # 2026-08-04 Gemini CLI: Removed confusing theoretical event PnL caption to keep KPI clear
             
             if _completed:
                 with st.expander("📝 已完結交易清單 (Closed Loops)", expanded=True):
