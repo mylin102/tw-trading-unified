@@ -45,22 +45,27 @@ def test_record_actual_exactly_once(tmp_path):
     assert r2 is None  # duplicate suppressed
 
 
-def test_record_actual_different_settlement_id_allowed(tmp_path):
+def test_record_actual_different_settlement_id_suppressed(tmp_path):
+    # One outcome per trade identity — settlement_id is saved metadata,
+    # NOT part of the dedupe key. Repeat with different settlement id
+    # (e.g. restart recovery with new callback ts) is suppressed.
     c = _prime(tmp_path)
     r1 = c.record_actual(pos(), -980.0, 5.0, exit_type="RELEASE", settlement_id="STL-1")
     r2 = c.record_actual(pos(), -930.0, 2.0, exit_type="COMBINED_EXIT", settlement_id="STL-2")
-    assert r1 is not None and r2 is not None  # distinct settlements — both recorded
+    assert r1 is not None
+    assert r2 is None  # same trade identity — suppressed regardless of id
 
 
 def test_partial_fill_not_final(tmp_path):
-    # partial fill must not be recorded as final outcome — settlement_id
-    # for a partial differs; final only at canonical settlement
+    # Partial fills never reach record_actual in production (hook fires only
+    # at qty=0 canonical settlement). If a partial were passed, it records
+    # once; any later call for the same trade identity is suppressed — the
+    # final settlement must carry the SAME identity (trade/gen/order ids).
     c = _prime(tmp_path)
     r = c.record_actual(pos(), -100.0, 1.0, exit_type="PARTIAL", settlement_id="STL-PARTIAL")
-    assert r is not None  # recorded with explicit non-final identity; final
-    # final settlement (different id) is a separate outcome
+    assert r is not None
     rf = c.record_actual(pos(), -980.0, 5.0, exit_type="RELEASE", settlement_id="STL-FINAL")
-    assert rf is not None
+    assert rf is None  # same trade identity — single outcome
 
 
 def test_priority_event_immediate_flush(tmp_path):

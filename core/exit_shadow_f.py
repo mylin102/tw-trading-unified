@@ -74,7 +74,11 @@ class FShadowCollector:
         self._flush_errors = 0
         self._last_flush_ts = None
         self._recorded_outcomes = set()   # (trade_id, generation, settlement_id)
-        self._latency = {"on_quote": [], "evaluate": [], "write": []}
+        self._evaluated_pairs = set()     # (near_seq, far_seq) — same pair eval once
+        self._decision_count = 0
+        self._decision_triggers = 0
+        self._latency = {"feed": [], "state_snapshot": [], "evaluate": [],
+                         "telemetry": [], "monitor_total": []}
         _d = os.path.dirname(out_path)
         if _d:
             os.makedirs(_d, exist_ok=True)
@@ -93,6 +97,11 @@ class FShadowCollector:
                         gen = r.get("position_generation")
                         if gen and gen not in self._candidates:
                             self._candidates[gen] = {"ts": r.get("ts"), "candidate": r}
+                    elif r.get("event") == "ACTUAL_PATH":
+                        gen = r.get("position_generation")
+                        tid = r.get("trade_id")
+                        self._recorded_outcomes.add(
+                            (tid, gen, tuple(sorted(r.get("entry_order_ids") or []))))
         except Exception:
             self._errors += 1
 
@@ -141,7 +150,7 @@ class FShadowCollector:
             with self._lock:
                 self._errors += 1
         finally:
-            self._latency["on_quote"].append(_now_ms() - _t0)
+            self._latency["feed"].append(_now_ms() - _t0)
 
     def evaluate(self, position):
         _t0 = _now_ms()
@@ -162,10 +171,15 @@ class FShadowCollector:
 
     def _evaluate_inner(self, position):
         gen = position.get("position_generation") or position.get("trade_id")
+        _pair_key = (self._near.get("seq"), self._far.get("seq"))
         with self._lock:
             if gen in self._candidates:
                 return {"event": "DUPLICATE_CANDIDATE", "position_generation": gen,
                         "first_candidate_ts": self._candidates[gen]["ts"]}
+            if _pair_key in self._evaluated_pairs:
+                return {"event": "DUPLICATE_PAIR_SKIPPED",
+                        "position_generation": gen, "pair": list(_pair_key)}
+            self._evaluated_pairs.add(_pair_key)
         if self._near_c and position.get("near_contract") and position["near_contract"] != self._near_c:
             return self._reject("CONTRACT_PAIR_MISMATCH", position, "NEAR")
         if self._far_c and position.get("far_contract") and position["far_contract"] != self._far_c:
@@ -232,6 +246,28 @@ class FShadowCollector:
             self._write(cand)
         return cand
 
+    def record_production_decision(self, position, triggered, breached_leg=None,
+                                  adverse_move_pts=None, threshold_pts=None,
+                                  atr=None, mark_source=None, evaluation_id=None):
+        """Layer-1 tap: production evaluator decision. All evaluations count;
+        only first trigger / state transition writes detail."""
+        self._decision_count += 1
+        if triggered:
+            self._decision_triggers += 1
+            rec = {"event": "PRODUCTION_DECISION_TRIGGER",
+                   "evaluation_id": evaluation_id,
+                   "trade_id": position.get("trade_id"),
+                   "position_generation": position.get("position_generation"),
+                   "triggered": True, "breached_leg": breached_leg,
+                   "adverse_move_pts": adverse_move_pts,
+                   "threshold_pts": threshold_pts, "atr": atr,
+                   "mark_source": mark_source,
+                   "decision_count": self._decision_count,
+                   "ts": _now(), "mode": "SHADOW_ONLY", "execution_influence": False,
+                   "adr": "ADR-026", "adr_status": "PROPOSED"}
+            self._write(rec)
+        return self._decision_count
+
     def _reject(self, reason, position, leg, age=None, skew=None):
         ev = {"event": "REJECTED", "reason": reason, "leg": leg,
               "position_generation": position.get("position_generation") or position.get("trade_id"),
@@ -284,7 +320,7 @@ class FShadowCollector:
                 self._flush_errors += 1
                 self._dropped += len(self._buffer)
                 self._buffer = []
-            self._latency["write"].append(_now_ms() - _t0)
+            self._latency["telemetry"].append(_now_ms() - _t0)
 
     def record_actual(self, position, actual_total_net, naked_leg_exposure_min,
                       remaining_exit_ts=None, exit_type=None, settlement_id=None):
@@ -293,7 +329,8 @@ class FShadowCollector:
         NOT write final outcome early; repeated callbacks / restart recovery
         must NOT emit a second outcome. Returns None if already recorded."""
         gen = position.get("position_generation") or position.get("trade_id")
-        key = (position.get("trade_id"), gen, settlement_id or "DEFAULT")
+        key = (position.get("trade_id"), gen,
+               tuple(sorted(position.get("entry_order_ids") or [])))
         with self._lock:
             if key in self._recorded_outcomes:
                 self._write({"event": "DUPLICATE_OUTCOME_SUPPRESSED",
@@ -303,8 +340,12 @@ class FShadowCollector:
                              "adr": "ADR-026", "adr_status": "PROPOSED"})
                 return None
             self._recorded_outcomes.add(key)
+        _has_cand = gen in self._candidates
         rec = {"event": "ACTUAL_PATH", "position_generation": gen,
                "trade_id": position.get("trade_id"),
+               "entry_order_ids": position.get("entry_order_ids") or [],
+               "has_shadow_candidate": _has_cand,
+               "shadow_status": None if _has_cand else "NO_SHADOW_CANDIDATE",
                "actual_total_net": actual_total_net,
                "naked_leg_exposure_min": naked_leg_exposure_min,
                "remaining_exit_ts": remaining_exit_ts,

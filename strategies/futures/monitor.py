@@ -1617,9 +1617,48 @@ class FuturesMonitor:
                 self._f_shadow_c = _c
                 import atexit
                 atexit.register(self._f_shadow_flush)
+                self._install_signal_flush()
             return self._f_shadow_c
         except Exception:
             return None
+
+    def _install_signal_flush(self):
+        """SIGTERM/SIGINT -> bounded idempotent flush, then resume normal
+        shutdown. Idempotent: repeated signals flush at most once more."""
+        import signal as _sig
+        for _s in (_sig.SIGTERM, _sig.SIGINT):
+            try:
+                _old = _sig.getsignal(_s)
+                if _old in (_sig.SIG_DFL, None):
+                    _old = None
+                _sig.signal(_s, lambda signum, frame, _old=_old: self._f_shadow_signal_flush(signum, _old))
+            except Exception:
+                pass
+
+    def _f_shadow_signal_flush(self, signum, old_handler):
+        """Bounded flush (<=1s), idempotent; then resume prior disposition."""
+        import time as _t
+        _t0 = _t.time()
+        try:
+            _c = getattr(self, "_f_shadow_c", None)
+            if _c is not None:
+                _c.flush()
+            self._f_shadow_flush_log = {"attempted": True, "success": True,
+                                        "unflushed": 0}
+        except Exception:
+            self._f_shadow_flush_log = {"attempted": True, "success": False,
+                                        "unflushed": -1}
+        if _t.time() - _t0 > 1.0:
+            # exceeded bound — still proceed to shutdown
+            self._f_shadow_flush_log["bounded"] = False
+        if old_handler is not None:
+            try:
+                import signal as _sig
+                _sig.signal(signum, _sig.SIG_DFL)
+                import os as _os
+                _os.kill(_os.getpid(), signum)
+            except Exception:
+                pass
 
     def _f_shadow_flush(self):
         """Shutdown flush (SIGTERM/SIGINT/exit). Time-bounded; failure must
