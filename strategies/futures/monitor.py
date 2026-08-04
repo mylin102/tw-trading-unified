@@ -1915,10 +1915,27 @@ class FuturesMonitor:
                         _mcst = getattr(self, "_f_shadow_state", None) or {}
                         if _mcst.get("has_position"):
                             try:
+                                _ms = getattr(self, "_mts_strategy", None)
+                                if _ms is None:
+                                    # locate strategy from state path owners
+                                    for _s2 in getattr(self, "_strategies", {}).values() if hasattr(self, "_strategies") else []:
+                                        _ms = _s2
+                                        break
+                                _nq = int(getattr(_ms, "_near_qty", getattr(_ms, "_lots", 0)) or 0) if _ms else 0
+                                _fq = int(getattr(_ms, "_far_qty", getattr(_ms, "_lots", 0)) or 0) if _ms else 0
+                                if _nq <= 0 or _fq <= 0:
+                                    _nq = int(getattr(_ms, "_near_qty", getattr(_ms, "_lots", 1)) or 1) if _ms else 1
+                                    _fq = int(getattr(_ms, "_far_qty", getattr(_ms, "_lots", 1)) or 1) if _ms else 1
+                                    _qsrc = "strategy_lots_default_1" if _ms else "no_strategy_default_1"
+                                else:
+                                    _qsrc = "strategy_near_far_qty"
                                 self._model_c.mark_position(
                                     _mcst.get("near_side"), _mcst.get("far_side"),
                                     _mcst.get("near_entry"), _mcst.get("far_entry"),
-                                    _mcst.get("near_qty") or 1, _mcst.get("far_qty") or 1)
+                                    _nq, _fq)
+                                _mk = getattr(self._model_c, "latest_accepted", None)
+                                if _mk is not None:
+                                    _mk["qty_source"] = _qsrc
                             except Exception as _me:
                                 logger.warning("[MODEL_C] mark_position error: %r", _me)
         except Exception as _mc_err:
