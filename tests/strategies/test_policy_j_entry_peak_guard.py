@@ -149,19 +149,20 @@ def test_entry_loss_during_guard_no_policy_j_noise():
 # ── 8. Restart mid-guard: remaining time continues, no fresh 15s ───────
 def test_restart_mid_guard_continues_remaining_time():
     s = make_strategy()
-    # trade entered at t=0; restart at t=10000 (5s of guard left)
-    call(s, 40.0, 42800, 43070, 10000.0, entry_ts_ms=0.0, phase="SPREAD")
+    # entry happened at t=10000 (persisted entry_ts_ms across restart);
+    # restart evaluation at t=20000 -> elapsed 10s < 15s -> still quarantined
+    call(s, 40.0, 42800, 43070, 20000.0, entry_ts_ms=10000.0, phase="SPREAD")
     assert s._pj_guard_state == "QUARANTINE"
-    # spike at t=10001 must still be quarantined (guard not reset)
-    call(s, 60.0, 42780, 43099, 10001.0, entry_ts_ms=0.0, phase="SPREAD")
+    # spike at t=20001 must still be quarantined (no fresh window, no promotion)
+    call(s, 60.0, 42780, 43099, 20001.0, entry_ts_ms=10000.0, phase="SPREAD")
     assert s._pj_durable_peak is None
 
 
 # ── 9. Restart after guard: no new window, baseline immediate ─────────
 def test_restart_after_guard_no_new_window():
     s = make_strategy()
-    # trade entered long ago (entry_ts=0, now=20000 > 15s)
-    call(s, 40.0, 42800, 43070, 20000.0, entry_ts_ms=0.0, phase="SPREAD")
+    # entry at t=10000; restart evaluation at t=30000 -> elapsed 20s > 15s
+    call(s, 40.0, 42800, 43070, 30000.0, entry_ts_ms=10000.0, phase="SPREAD")
     assert s._pj_guard_state == "COMPLETE"
     assert s._pj_durable_peak == pytest.approx(_net(40.0), abs=5)
 
