@@ -1,11 +1,9 @@
-"""F Shadow Canary — immediate atomic combined exit (pure shadow).
+"""F Shadow Canary — immediate atomic combined exit (pure shadow). v3 (Gate-7).
 
 ADR-026 PROPOSED. MODE=SHADOW_ONLY, EXECUTION_INFLUENCE=FALSE.
-Hard safety locks: execution_allowed=False, order_submission_allowed=False,
-state_mutation_allowed=False, lifecycle_transition_allowed=False.
-No broker/paper API calls, no Exit Arbiter participation, independent
-shadow_f.* namespace. Records three paths per eligible trade:
-A actual production, B F shadow executable, C continuation marks.
+Hard safety locks; synchronized-pair driven evaluate; fail-open (errors only
+counted, never raised into tick loop); bounded buffered writer; latency
+metrics; outcome hook at canonical settlement covering ALL exit types.
 
 2026-08-04."""
 import json
@@ -20,10 +18,40 @@ def _now():
     return datetime.now(_TZ).isoformat(timespec="milliseconds")
 
 
+def _now_ms():
+    return datetime.now(_TZ).timestamp() * 1000
+
+
+def _parse_ms(ts_iso):
+    s = str(ts_iso).strip()
+    for cand in (s, s[:26], s[:23]):
+        try:
+            t = datetime.fromisoformat(cand)
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=_TZ)
+            return t.timestamp() * 1000
+        except Exception:
+            continue
+    return None
+
+
+def age_ms(ts_iso, ref_ms=None):
+    ms = _parse_ms(ts_iso)
+    if ms is None:
+        return float("inf")
+    if ref_ms is None:
+        return abs(_now_ms() - ms)
+    if isinstance(ref_ms, str):
+        r = _parse_ms(ref_ms)
+        if r is None:
+            return float("inf")
+        ref_ms = r
+    return abs(ref_ms - ms)
+
+
 class FShadowCollector:
     """Collects F (atomic combined exit) shadow candidates only."""
 
-    # ── hard locks (asserted in tests via fault injection) ──────────────
     EXECUTION_ALLOWED = False
     ORDER_SUBMISSION_ALLOWED = False
     STATE_MUTATION_ALLOWED = False
@@ -33,80 +61,113 @@ class FShadowCollector:
         self._out = out_path
         self._bbo_path = bbo_path
         self._lock = threading.RLock()
-        self._near = {}   # contract_code -> {bid, ask, bid_size, ask_size, receive_ts, seq}
+        self._near = {}
         self._far = {}
         self._near_c = None
         self._far_c = None
-        self._candidates = {}   # position_generation -> first candidate (dedupe)
+        self._candidates = {}
         self._seq = 0
+        self._buffer = []
+        self._buffer_limit = 200
+        self._errors = 0
+        self._latency = {"on_quote": [], "evaluate": [], "write": []}
         _d = os.path.dirname(out_path)
         if _d:
             os.makedirs(_d, exist_ok=True)
 
     def _load_existing(self):
-        """Restart dedupe: rebuild first-candidate map from disk."""
         if not os.path.exists(self._out):
             return
-        with open(self._out) as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                except Exception:
-                    continue
-                if r.get("event") == "EXECUTABLE_CANDIDATE":
-                    gen = r.get("position_generation")
-                    if gen and gen not in self._candidates:
-                        self._candidates[gen] = {"ts": r.get("ts"), "candidate": r}
+        try:
+            with open(self._out) as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if r.get("event") == "EXECUTABLE_CANDIDATE":
+                        gen = r.get("position_generation")
+                        if gen and gen not in self._candidates:
+                            self._candidates[gen] = {"ts": r.get("ts"), "candidate": r}
+        except Exception:
+            self._errors += 1
 
-    # ── contract binding ────────────────────────────────────────────────
     def bind_contracts(self, near_code, far_code):
         self._near_c = near_code
         self._far_c = far_code
 
-    # ── BBO feed (from monitor ticks — executable marks only) ───────────
+    def pair_ready(self, max_age_ms=2000.0, max_skew_ms=500.0):
+        if not self._near or not self._far:
+            return False
+        try:
+            age_n = age_ms(self._near.get("receive_ts"))
+            age_f = age_ms(self._far.get("receive_ts"))
+            if age_n > max_age_ms or age_f > max_age_ms:
+                return False
+            skew = abs(age_ms(self._near.get("receive_ts"), self._far.get("receive_ts")))
+            return skew <= max_skew_ms
+        except Exception:
+            self._errors += 1
+            return False
+
     def on_quote(self, leg, bid, ask, bid_size=None, ask_size=None,
                  receive_ts=None, seq=None, contract_code=None):
-        if contract_code and contract_code == self._near_c:
-            leg = "NEAR"
-        elif contract_code and contract_code == self._far_c:
-            leg = "FAR"
-        if leg not in ("NEAR", "FAR"):
-            return
-        if bid is None and ask is None:
-            return
-        with self._lock:
-            self._seq += 1
-            q = {"bid": bid, "ask": ask, "bid_size": bid_size, "ask_size": ask_size,
-                 "receive_ts": receive_ts or _now(), "seq": seq}
-            if leg == "NEAR":
-                self._near = q
-            else:
-                self._far = q
-            if self._bbo_path:
-                with open(self._bbo_path, "a") as f:
-                    f.write(json.dumps({"event_type": "SHADOW_F_BBO", "leg": leg,
-                                        **q}) + "\n")
+        _t0 = _now_ms()
+        try:
+            if contract_code and contract_code == self._near_c:
+                leg = "NEAR"
+            elif contract_code and contract_code == self._far_c:
+                leg = "FAR"
+            if leg not in ("NEAR", "FAR"):
+                return
+            if bid is None and ask is None:
+                return
+            with self._lock:
+                self._seq += 1
+                q = {"bid": bid, "ask": ask, "bid_size": bid_size, "ask_size": ask_size,
+                     "receive_ts": receive_ts or _now(), "seq": seq}
+                if leg == "NEAR":
+                    self._near = q
+                else:
+                    self._far = q
+                if self._bbo_path:
+                    self._buffer.append({"event_type": "SHADOW_F_BBO", "leg": leg, **q})
+                    self._maybe_flush()
+        except Exception:
+            with self._lock:
+                self._errors += 1
+        finally:
+            self._latency["on_quote"].append(_now_ms() - _t0)
 
-    # ── candidate evaluation ────────────────────────────────────────────
     def evaluate(self, position):
-        """position: {trade_id, position_generation, entry_order_ids,
-        near_contract, far_contract, near_side, far_side, near_entry,
-        far_entry, release_threshold_pts, atr, mark_source,
-        production_release_leg, production_release_ts, point_value}
-        Returns dict event (SIGNAL_DETECTED -> EXECUTABILITY_CHECK ->
-        EXECUTABLE_CANDIDATE | REJECTED). Pure record — no side effects."""
+        _t0 = _now_ms()
+        try:
+            return self._evaluate_inner(position)
+        except Exception:
+            with self._lock:
+                self._errors += 1
+            ev = {"event": "REJECTED", "reason": "SHADOW_INTERNAL_ERROR",
+                  "trade_id": position.get("trade_id"),
+                  "position_generation": position.get("position_generation"),
+                  "ts": _now(), "mode": "SHADOW_ONLY", "execution_influence": False,
+                  "adr": "ADR-026", "adr_status": "PROPOSED"}
+            self._write(ev)
+            return ev
+        finally:
+            self._latency["evaluate"].append(_now_ms() - _t0)
+
+    def _evaluate_inner(self, position):
         gen = position.get("position_generation") or position.get("trade_id")
         with self._lock:
             if gen in self._candidates:
                 return {"event": "DUPLICATE_CANDIDATE", "position_generation": gen,
                         "first_candidate_ts": self._candidates[gen]["ts"]}
-        if self._near_c and position.get("near_contract") and \
-                position["near_contract"] != self._near_c:
+        if self._near_c and position.get("near_contract") and position["near_contract"] != self._near_c:
             return self._reject("CONTRACT_PAIR_MISMATCH", position, "NEAR")
-        if self._far_c and position.get("far_contract") and \
-                position["far_contract"] != self._far_c:
+        if self._far_c and position.get("far_contract") and position["far_contract"] != self._far_c:
             return self._reject("CONTRACT_PAIR_MISMATCH", position, "FAR")
-        nq = self._near; fq = self._far
+        nq = self._near
+        fq = self._far
         if not nq:
             return self._reject("MISSING_NEAR_BBO", position, "NEAR")
         if not fq:
@@ -126,7 +187,6 @@ class FShadowCollector:
         if nq["bid"] <= 0 or nq["ask"] <= 0 or nq["ask"] < nq["bid"] or \
                 fq["bid"] <= 0 or fq["ask"] <= 0 or fq["ask"] < fq["bid"]:
             return self._reject("LOCKED_OR_CROSSED_MARKET", position, None)
-        # executable breach: close LONG@bid, SHORT@ask
         pv = float(position.get("point_value", 10.0))
         thr = float(position.get("release_threshold_pts", 88.0))
         n_exit = nq["bid"] if str(position.get("near_side", "")).upper() in ("BUY", "LONG") else nq["ask"]
@@ -135,10 +195,12 @@ class FShadowCollector:
             else (float(position["near_entry"]) - n_exit) * pv
         f_pnl = (f_exit - float(position["far_entry"])) * pv if str(position.get("far_side", "")).upper() in ("BUY", "LONG") \
             else (float(position["far_entry"]) - f_exit) * pv
-        n_pts = n_pnl / pv; f_pts = f_pnl / pv
+        n_pts = n_pnl / pv
+        f_pts = f_pnl / pv
         if n_pts > -thr and f_pts > -thr:
-            return {"event": "SIGNAL_DETECTED", "breached": False, "position_generation": gen,
-                    "near_pts": round(n_pts, 1), "far_pts": round(f_pts, 1)}
+            return {"event": "SIGNAL_DETECTED", "breached": False,
+                    "position_generation": gen, "near_pts": round(n_pts, 1),
+                    "far_pts": round(f_pts, 1)}
         breached_leg = "NEAR" if n_pts <= -thr else "FAR"
         cand = {
             "event": "EXECUTABLE_CANDIDATE", "position_generation": gen,
@@ -181,50 +243,39 @@ class FShadowCollector:
 
     def _write(self, rec):
         with self._lock:
-            with open(self._out, "a") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            self._buffer.append(rec)
+            self._maybe_flush()
 
-    # ── production actual path (layer A) ────────────────────────────────
+    def _maybe_flush(self):
+        if len(self._buffer) >= self._buffer_limit:
+            self.flush()
+
+    def flush(self):
+        with self._lock:
+            if not self._buffer:
+                return
+            _t0 = _now_ms()
+            try:
+                with open(self._out, "a") as f:
+                    for rec in self._buffer:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    f.flush()
+                self._buffer = []
+            except Exception:
+                self._errors += 1
+            self._latency["write"].append(_now_ms() - _t0)
+
     def record_actual(self, position, actual_total_net, naked_leg_exposure_min,
-                      remaining_exit_ts=None):
+                      remaining_exit_ts=None, exit_type=None):
         gen = position.get("position_generation") or position.get("trade_id")
         rec = {"event": "ACTUAL_PATH", "position_generation": gen,
                "trade_id": position.get("trade_id"),
                "actual_total_net": actual_total_net,
                "naked_leg_exposure_min": naked_leg_exposure_min,
-               "remaining_exit_ts": remaining_exit_ts, "ts": _now(),
+               "remaining_exit_ts": remaining_exit_ts,
+               "exit_type": exit_type or "UNKNOWN",
+               "ts": _now(),
                "mode": "SHADOW_ONLY", "execution_influence": False,
                "adr": "ADR-026", "adr_status": "PROPOSED"}
         self._write(rec)
         return rec
-
-
-def _parse_ms(ts_iso):
-    s = str(ts_iso).strip()
-    for cand in (s, s[:26], s[:23]):
-        try:
-            t = datetime.fromisoformat(cand)
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=_TZ)
-            return t.timestamp() * 1000
-        except Exception:
-            continue
-    return None
-
-
-def age_ms(ts_iso, ref_ms=None):
-    ms = _parse_ms(ts_iso)
-    if ms is None:
-        return float("inf")
-    if ref_ms is None:
-        return abs(_now_ms() - ms)
-    if isinstance(ref_ms, str):
-        r = _parse_ms(ref_ms)
-        if r is None:
-            return float("inf")
-        ref_ms = r
-    return abs(ref_ms - ms)
-
-
-def _now_ms():
-    return datetime.now(_TZ).timestamp() * 1000

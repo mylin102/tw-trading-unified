@@ -126,6 +126,7 @@ def test_restart_dedupe_from_disk(tmp_path):
     c.on_quote("NEAR", 42690.0, 42700.0, receive_ts=ago(0))
     c.on_quote("FAR", 42860.0, 42870.0, receive_ts=ago(0))
     c.evaluate(pos())
+    c.flush()  # buffered writer — persist before restart
     # restart: new instance, same file — must not re-emit for same generation
     c2 = FShadowCollector(str(tmp_path / "shadow_f.jsonl"))
     c2.on_quote("NEAR", 42690.0, 42700.0, receive_ts=ago(0))
