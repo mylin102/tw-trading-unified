@@ -63,6 +63,10 @@ class DatasetCCell:
     ped_improvement_twd: float = 0.0
     fill_model: str = FillModel.EXECUTABLE.value
 
+    @property
+    def hypothetical_net_exit_pnl_twd(self) -> float | None:
+        return self.counterfactual_net_pnl_twd if self.triggered else None
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 

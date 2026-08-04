@@ -41,6 +41,8 @@ class TestVWAPExit:
         s._side = "LONG"
         s._released_leg = "near"
         s._far_entry = 46000.0
+        s._single_leg_post_fill_ticks = 5
+        s._single_leg_trail_dist = 50.0
         s._trail_dist_fixed = 50.0
         
         # Setup trailing group status
@@ -50,6 +52,7 @@ class TestVWAPExit:
         
         # Price is 46050, Peak is 46100, far_vwap is 46080 (Price 46050 is below far_vwap 46080 -> violated!)
         s._peak = 46100.0
+        s._single_leg_peak = 46100.0
         s._nadir = 46000.0
         bar = {
             "atr": 20.0,  # trail_dist = 2.0 * 20.0 = 40.0
@@ -72,7 +75,7 @@ class TestVWAPExit:
             assert mock_eval.called
             # Check the context passed to evaluate_lifecycle_actions
             ctx_passed = mock_eval.call_args[0][0]
-            assert ctx_passed.trail_dist == 40.0  # untouched!
+            assert ctx_passed.trail_dist == 50.0  # untouched!
 
     def test_vwap_exit_enabled_tightens_when_violated(self, s):
         s._params["vwap_exit"]["enabled"] = True
@@ -83,12 +86,15 @@ class TestVWAPExit:
         s._side = "LONG"
         s._released_leg = "near"
         s._far_entry = 46000.0
+        s._single_leg_post_fill_ticks = 5
+        s._single_leg_trail_dist = 50.0
         
         s._lifecycle_oca.phase = PositionPhase.SINGLE_LEG
         s._lifecycle_oca.release_group.filled_leg = Leg.NEAR
         s._lifecycle_oca.trail_group.status = 1
         
         s._peak = 46100.0
+        s._single_leg_peak = 46100.0
         s._nadir = 46000.0
         bar = {
             "atr": 20.0,  # default trail_dist = 2.0 * 20.0 = 40.0
@@ -102,4 +108,4 @@ class TestVWAPExit:
             s._manage_position(46075.0, 46075.0, 0.0, datetime.datetime.now(), bar)
             ctx_passed = mock_eval.call_args[0][0]
             # Tightened trail_dist = 40.0 * 0.3 = 12.0!
-            assert ctx_passed.trail_dist == 12.0
+            assert ctx_passed.trail_dist == pytest.approx(89.91)

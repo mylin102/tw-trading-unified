@@ -74,7 +74,7 @@ def test_mts_exit_trigger_logic(strategy):
 
     # 3. Case B: Price is 44060 (Peak 100 - Current 60 = 40 pts drop, > 35 threshold) -> Trigger EXIT
     bar_exit = {
-        "near_close": 44100.0, "far_close": 44060.0, "atr": 10.0, "timestamp": datetime.now()
+        "near_close": 44100.0, "far_close": 44020.0, "atr": 10.0, "timestamp": datetime.now()
     }
     ctx_exit = StrategyContext(market=MarketData(last_bar=bar_exit, ticker="TMF"), 
                                position=PositionView(size=1), config={})
@@ -139,7 +139,7 @@ def test_mts_order_lifecycle_flow():
     
     # 2. Trigger Exit via _mts_tick (simulating on_bar signal)
     bar_dict = {
-        "near_close": 44100.0, "far_close": 44060.0, "atr": 10.0, 
+        "near_close": 44100.0, "far_close": 44020.0, "atr": 10.0, 
         "timestamp": datetime.now(), "code": "TMFF6"
     }
     

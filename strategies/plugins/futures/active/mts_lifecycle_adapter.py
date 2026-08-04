@@ -170,6 +170,7 @@ class LifecycleContext:
     combined_upl_activation_net_pnl_twd: float = 300.0
     combined_upl_giveback_twd: float = 100.0
     peak_net_exit_pnl_twd: float = 0.0
+    combined_exit_execution_enabled: bool = True
 
 @dataclass(frozen=True)
 class LifecycleEvaluationInput:
@@ -247,6 +248,8 @@ def _check_combined_upl_trail_candidate(
 ) -> list[LifecycleDecision]:
     """2026-07-27 Gemini CLI: Policy J Primary Exit - Net Exit PnL TWD Combined Trailing Exit."""
     if not ctx.enable_combined_upl_trail:
+        return []
+    if not getattr(ctx, "combined_exit_execution_enabled", True):
         return []
     _phase_val = enum_value(lifecycle.phase)
     # 2026-08-03 Gemini CLI: Support Policy J combined total PnL exit in SINGLE_LEG phase (whichever hits first between Policy J & trailing exit)

@@ -148,6 +148,7 @@ def test_trail_stop_bypasses_quote_guard_when_exceeds_threshold(tmp_path):
     strategy._entry_ts = datetime.now()
     strategy._single_leg_started_at = datetime.now()
     strategy._peak = 45600.0  # Peak is 45600
+    strategy._single_leg_peak = 45600.0
 
     # ADR-011 Phase 4: simulate warmup expiry (entered 1s ago, 2 ticks received)
     import time as _time

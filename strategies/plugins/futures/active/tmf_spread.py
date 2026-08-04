@@ -3328,7 +3328,9 @@ class TMFSpread(StrategyBase):
         if self._lifecycle_oca and self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG:
             # Sync legacy _lifecycle string for compat
             self._lifecycle = f"TRAILING_{self._side}"
-            if self._single_leg_post_fill_ticks < getattr(self, "_single_leg_warmup_ticks", 2):
+            _pticks = getattr(self, "_single_leg_post_fill_ticks", 0)
+            _wticks = getattr(self, "_single_leg_warmup_ticks", 2)
+            if isinstance(_pticks, (int, float)) and isinstance(_wticks, (int, float)) and _pticks < _wticks:
                 if not _is_backtest:
                     self._single_leg_post_fill_ticks += 1
                 else:
@@ -4040,7 +4042,8 @@ class TMFSpread(StrategyBase):
                 _peak_or_nadir = self._peak if _rem_side == "LONG" else self._nadir
                 _retracement = (_peak_or_nadir - _exit_price) if _rem_side == "LONG" else (_exit_price - _peak_or_nadir)
                 _warmup_elapsed = round((time.monotonic() - self._single_leg_entered_mono) * 1000.0, 1) if self._single_leg_entered_mono > 0 else 0.0
-                _warmup_ticks = int(self._single_leg_post_fill_ticks)
+                _pt = getattr(self, "_single_leg_post_fill_ticks", 0)
+                _warmup_ticks = int(_pt) if isinstance(_pt, (int, float)) else 0
                 
                 self._risk_mode_at_exit = _risk_meta.get("risk_mode", "FIXED_FALLBACK")
                 _risk_meta["risk_mode_at_exit"] = self._risk_mode_at_exit
@@ -4349,6 +4352,7 @@ class TMFSpread(StrategyBase):
         # Re-evaluate lifecycle after peak/nadir + breakeven adjustments
         if _decision is None:
             try:
+                trail_dist = self._apply_vwap_exit(bar, trail_dist)
                 _ctx2 = LifecycleContext(
                     near_pnl_pts=0, far_pnl_pts=0,
                     floating_pnl_pts=rem_floating_pnl,
