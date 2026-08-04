@@ -3888,8 +3888,8 @@ elif _selected_product == "TMF":
             _day_m = _breakdown["DAY"]
             _night_m = _breakdown["NIGHT"]
             st.caption(
-                f"☀️ 日盤實現毛利: **{_day_m[total_net]:+,.0f} TWD** ({_day_m[total_trades]} 圈, 勝率 {_day_m[win_rate]:.1%}) | "
-                f"🌙 夜盤實現毛利: **{_night_m[total_net]:+,.0f} TWD** ({_night_m[total_trades]} 圈, 勝率 {_night_m[win_rate]:.1%})"
+                f"☀️ 日盤實現毛利: **{_day_m['total_net']:+,.0f} TWD** ({_day_m['total_trades']} 圈, 勝率 {_day_m['win_rate']:.1%}) | "
+                f"🌙 夜盤實現毛利: **{_night_m['total_net']:+,.0f} TWD** ({_night_m['total_trades']} 圈, 勝率 {_night_m['win_rate']:.1%})"
             )
             
             if _completed:
