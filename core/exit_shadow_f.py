@@ -70,6 +70,10 @@ class FShadowCollector:
         self._buffer = []
         self._buffer_limit = 200
         self._errors = 0
+        self._dropped = 0
+        self._flush_errors = 0
+        self._last_flush_ts = None
+        self._recorded_outcomes = set()   # (trade_id, generation, settlement_id)
         self._latency = {"on_quote": [], "evaluate": [], "write": []}
         _d = os.path.dirname(out_path)
         if _d:
@@ -241,10 +245,24 @@ class FShadowCollector:
         self._write(ev)
         return ev
 
+    PRIORITY_EVENTS = {"EXECUTABLE_CANDIDATE", "ACTUAL_PATH",
+                        "STATE_INFLUENCE_VIOLATION", "SHADOW_INTERNAL_ERROR"}
+
     def _write(self, rec):
         with self._lock:
             self._buffer.append(rec)
-            self._maybe_flush()
+            if rec.get("event") in self.PRIORITY_EVENTS:
+                self.flush()          # critical events flush immediately
+            else:
+                self._maybe_flush()
+
+    def buffer_stats(self):
+        with self._lock:
+            return {"buffer_depth": len(self._buffer),
+                    "last_flush_ts": self._last_flush_ts,
+                    "flush_errors": self._flush_errors,
+                    "dropped_events": self._dropped,
+                    "internal_errors": self._errors}
 
     def _maybe_flush(self):
         if len(self._buffer) >= self._buffer_limit:
@@ -261,13 +279,30 @@ class FShadowCollector:
                         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     f.flush()
                 self._buffer = []
+                self._last_flush_ts = _now()
             except Exception:
-                self._errors += 1
+                self._flush_errors += 1
+                self._dropped += len(self._buffer)
+                self._buffer = []
             self._latency["write"].append(_now_ms() - _t0)
 
     def record_actual(self, position, actual_total_net, naked_leg_exposure_min,
-                      remaining_exit_ts=None, exit_type=None):
+                      remaining_exit_ts=None, exit_type=None, settlement_id=None):
+        """Exactly-once outcome at canonical settlement. Dedup key:
+        (trade_id, position_generation, settlement_id). Partial fills must
+        NOT write final outcome early; repeated callbacks / restart recovery
+        must NOT emit a second outcome. Returns None if already recorded."""
         gen = position.get("position_generation") or position.get("trade_id")
+        key = (position.get("trade_id"), gen, settlement_id or "DEFAULT")
+        with self._lock:
+            if key in self._recorded_outcomes:
+                self._write({"event": "DUPLICATE_OUTCOME_SUPPRESSED",
+                             "trade_id": position.get("trade_id"),
+                             "position_generation": gen, "ts": _now(),
+                             "mode": "SHADOW_ONLY", "execution_influence": False,
+                             "adr": "ADR-026", "adr_status": "PROPOSED"})
+                return None
+            self._recorded_outcomes.add(key)
         rec = {"event": "ACTUAL_PATH", "position_generation": gen,
                "trade_id": position.get("trade_id"),
                "actual_total_net": actual_total_net,
