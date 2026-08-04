@@ -1615,12 +1615,38 @@ class FuturesMonitor:
                     str(getattr(getattr(self, "far_contract", None), "code", "") or "").split("/")[-1].strip())
                 _c._load_existing()
                 self._f_shadow_c = _c
+                import atexit
+                atexit.register(self._f_shadow_flush)
             return self._f_shadow_c
         except Exception:
             return None
 
+    def _f_shadow_flush(self):
+        """Shutdown flush (SIGTERM/SIGINT/exit). Time-bounded; failure must
+        not block shutdown. Records attempted/success/unflushed."""
+        try:
+            _c = getattr(self, "_f_shadow_c", None)
+            if _c is None:
+                return
+            _buf_before = _c.buffer_stats().get("buffer_depth", 0)
+            _c.flush()
+            _buf_after = _c.buffer_stats().get("buffer_depth", 0)
+            self._f_shadow_flush_log = {"attempted": True, "success": _buf_after == 0,
+                                        "unflushed": _buf_after}
+            if _buf_after > 0:
+                try:
+                    import logging
+                    logging.getLogger("FuturesMonitor").warning(
+                        "[SHADOW_F] unclean shutdown: %d unflushed events", _buf_after)
+                except Exception:
+                    pass
+        except Exception:
+            self._f_shadow_flush_log = {"attempted": True, "success": False,
+                                        "unflushed": _buf_before if "_buf_before" in dir() else -1}
+
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()
+        self._f_shadow_t0 = time.time()
         try:
             _c = self._f_shadow()
             if _c is not None:
@@ -1631,16 +1657,36 @@ class FuturesMonitor:
                     _c.on_quote(_code, _bid, _ask, contract_code=_code,
                                 receive_ts=datetime.now().isoformat(timespec="milliseconds"))
                     _now_t = time.time()
+                    _st = getattr(self, "_f_shadow_state", None) or {}
                     if _now_t - getattr(self, "_f_shadow_state_ts", 0) > 1.0:
+                        _t_st = time.time()
                         try:
                             with open(MTS_POSITION_STATE_PATH) as _fst:
                                 self._f_shadow_state = json.load(_fst)
+                                self._f_shadow_state_mtime = os.path.getmtime(MTS_POSITION_STATE_PATH)
                         except Exception:
                             self._f_shadow_state = {}
                         self._f_shadow_state_ts = _now_t
+                        _c._latency["state_snapshot"].append((time.time() - _t_st) * 1000.0)
                     _st = getattr(self, "_f_shadow_state", None) or {}
-                    if _st.get("has_position") and _c.pair_ready():
-                        _c.evaluate({
+                    _was_pos = getattr(self, "_f_shadow_had_pos", False)
+                    _has_pos = bool(_st.get("has_position"))
+                    self._f_shadow_had_pos = _has_pos
+                    if _has_pos and not _was_pos:
+                        self._f_shadow_gen = _st.get("trade_id")
+                    if _was_pos and not _has_pos and self._f_shadow_gen:
+                        # canonical settlement tap — position finalized
+                        _c.record_actual(
+                            {"trade_id": self._f_shadow_gen,
+                             "position_generation": self._f_shadow_gen},
+                            float(_st.get("total_realized_pnl") or
+                                  (_st.get("near_realized_pnl") or 0) + (_st.get("far_realized_pnl") or 0)),
+                            float(_st.get("naked_leg_exposure_min") or 0.0),
+                            exit_type=_st.get("last_exit_type") or "UNKNOWN",
+                            settlement_id=f"{self._f_shadow_gen}:{_st.get('settlement_ts') or _now_t}")
+                    _age_ms = (time.time() - self._f_shadow_state_ts) * 1000.0 if self._f_shadow_state_ts else 999999.0
+                    if _has_pos and _c.pair_ready() and _age_ms < 5000.0:
+                        _ev = _c.evaluate({
                             "trade_id": _st.get("trade_id"),
                             "position_generation": _st.get("trade_id"),
                             "near_side": _st.get("near_side"),
@@ -1653,7 +1699,37 @@ class FuturesMonitor:
                             "atr": _st.get("atr"),
                             "mark_source": "PRODUCTION_RUNTIME",
                             "point_value": 10.0,
+                            "snapshot_source": "STATE_FILE",
+                            "state_snapshot_ts": self._f_shadow_state_ts,
+                            "state_age_ms": round(_age_ms, 1),
+                            "state_file_mtime": getattr(self, "_f_shadow_state_mtime", None),
                         })
+                        if _ev:
+                            _c.record_production_decision(
+                                {"trade_id": _st.get("trade_id"),
+                                 "position_generation": _st.get("trade_id")},
+                                triggered=_ev.get("event") == "EXECUTABLE_CANDIDATE",
+                                breached_leg=_ev.get("breached_leg"),
+                                adverse_move_pts=abs(_ev.get("near_executable_pnl", 0) / 10.0)
+                                if _ev.get("breached_leg") == "NEAR" else abs(_ev.get("far_executable_pnl", 0) / 10.0),
+                                threshold_pts=_st.get("release_stop_points", 88.0),
+                                atr=_st.get("atr"),
+                                mark_source="STATE_FILE",
+                                evaluation_id=f"{_st.get('trade_id')}:{_now_t:.3f}")
+                    elif _has_pos:
+                        _c._write({"event": "REJECTED", "reason": "STALE_POSITION_SNAPSHOT",
+                                   "trade_id": _st.get("trade_id"),
+                                   "position_generation": _st.get("trade_id"),
+                                   "state_age_ms": round(_age_ms, 1),
+                                   "ts": datetime.now().isoformat(timespec="milliseconds"),
+                                   "mode": "SHADOW_ONLY", "execution_influence": False,
+                                   "adr": "ADR-026", "adr_status": "PROPOSED"})
+        except Exception:
+            pass
+        try:
+            _c = getattr(self, "_f_shadow_c", None)
+            if _c is not None and getattr(self, "_f_shadow_t0", None) is not None:
+                _c._latency["monitor_total"].append((time.time() - self._f_shadow_t0) * 1000.0)
         except Exception:
             pass
         # [Model C canary 2026-08-03] synchronized BBO executable marking —
