@@ -1932,7 +1932,7 @@ class FuturesMonitor:
                                 self._model_c.mark_position(
                                     _mcst.get("near_side"), _mcst.get("far_side"),
                                     _mcst.get("near_entry"), _mcst.get("far_entry"),
-                                    _nq, _fq)
+                                    _nq, _fq, qty_source=_qsrc)
                                 _mk = getattr(self._model_c, "latest_accepted", None)
                                 if _mk is not None:
                                     _mk["qty_source"] = _qsrc

@@ -172,7 +172,7 @@ class ModelCCollector:
         return rec
 
     def mark_position(self, near_side, far_side, near_entry, far_entry,
-                      near_qty, far_qty, point_value=10.0):
+                      near_qty, far_qty, point_value=10.0, qty_source=None):
         """Attach position context to the latest accepted pair (shadow)."""
         with self._lock:
             if self.latest_accepted is None:
@@ -197,6 +197,12 @@ class ModelCCollector:
             rec["executable_combined_gross_pnl"] = (
                 (near_pnl if near_pnl is not None else 0.0) + (far_pnl if far_pnl is not None else 0.0)
             )
+            if qty_source is not None:
+                rec["qty_source"] = qty_source
+            # accepted was ALREADY written (null position fields) — persist
+            # an explicit update event so the JSONL carries full economics.
+            self._write({**rec, "event_type": "MODEL_C_POSITION_MARKED",
+                         "timestamp": _now_iso()})
             return rec
 
     @staticmethod
