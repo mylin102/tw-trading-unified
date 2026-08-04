@@ -320,6 +320,11 @@ def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
                         f_mon.market_data[f_ticker]["ask"] = float(ask)
                         f_mon.market_data[f_ticker]["close"] = mid
                         f_mon.market_data[f_ticker]["bidask_at"] = time.time()
+                        # 2026-08-04 review item 1: feed Model C BBO (canary-gated)
+                        try:
+                            f_mon.on_bidask(exchange, bidask)
+                        except Exception:
+                            pass
                         matched = True
                         break
                     # TMF far
@@ -331,6 +336,11 @@ def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
                         f_mon.market_data[_far_key]["ask"] = float(ask)
                         f_mon.market_data[_far_key]["close"] = mid
                         f_mon.market_data[_far_key]["bidask_at"] = time.time()
+                        # 2026-08-04 review item 1: feed Model C BBO (canary-gated)
+                        try:
+                            f_mon.on_bidask(exchange, bidask)
+                        except Exception:
+                            pass
                         matched = True
                         break
 

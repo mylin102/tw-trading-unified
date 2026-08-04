@@ -1816,6 +1816,72 @@ class FuturesMonitor:
         except Exception:
             pass
 
+    def on_bidask(self, exchange, bidask):
+        """Model C BBO feed (2026-08-04 review item 1).
+
+        BidAskFOPv1 objects carry real bid/ask — the executable BBO contract
+        Model C requires. Flag-gated (data/model_c_canary.flag) exactly like
+        the tick path; _extract_bbo enforces BBO_VALID-only consumption.
+        Never falls back to last/close or buy_price/sell_price.
+        """
+        try:
+            _mc_flag = os.path.join(_repo_root(), "data", "model_c_canary.flag")
+            if not os.path.exists(_mc_flag):
+                return
+            if bidask is None or not hasattr(bidask, "code"):
+                return
+            _code = str(getattr(bidask, "code", "") or "").split("/")[-1].strip()
+            _nset = getattr(self, "_canonical_near_codes", None) or {getattr(getattr(self, "contract", None), "code", "")}
+            _fset = getattr(self, "_canonical_far_codes", None) or {getattr(getattr(self, "far_contract", None), "code", "")}
+            if _code in _nset:
+                _leg = "NEAR"
+            elif _code in _fset:
+                _leg = "FAR"
+            else:
+                return
+            _bbo = _extract_bbo(bidask)
+            if not _bbo or _bbo[2] != "BBO_VALID":
+                return  # TICK_ONLY / DATA_QUALITY_BLOCKED never feed Model C
+            if not hasattr(self, "_model_c"):
+                from core.model_c_collector import ModelCCollector
+                _td = os.path.join(_repo_root(), "data", "telemetry", "model_c")
+                os.makedirs(_td, exist_ok=True)
+                _day = datetime.now().strftime("%Y%m%d")
+                self._model_c = ModelCCollector(
+                    os.path.join(_td, f"model_c_{_day}.jsonl"),
+                    bbo_raw_path=os.path.join(_td, f"bbo_raw_{_day}.jsonl"))
+            self._model_c.on_quote(
+                _leg, _bbo[0], _bbo[1],
+                bid_size=getattr(bidask, "bid_volume", None),
+                ask_size=getattr(bidask, "ask_volume", None),
+                receive_ts=datetime.now().isoformat(),
+                seq=getattr(bidask, "seq", None),
+                contract_code=_code,
+                source="shioaji_bidask")
+        except Exception:
+            import sys as _sys
+            if not hasattr(self, "_mc_bidask_err_log"):
+                self._mc_bidask_err_log = True
+                logger.warning("[MODEL_C] on_bidask error: %r",
+                               _sys.exc_info()[1])
+        # also refresh market_data bid/ask caches used by downstream consumers
+        try:
+            _bid = float(getattr(bidask, "bid_price", [None])[0] if hasattr(getattr(bidask, "bid_price", None), "__getitem__") else getattr(bidask, "bid_price", None))
+            _ask = float(getattr(bidask, "ask_price", [None])[0] if hasattr(getattr(bidask, "ask_price", None), "__getitem__") else getattr(bidask, "ask_price", None))
+            if _bid and _ask and _bid > 0 and _ask > 0:
+                _code2 = str(getattr(bidask, "code", "") or "")
+                _k = _code2
+                if _code2 and _code2 in getattr(self, "_canonical_near_codes", set()):
+                    _k = str(getattr(self, "ticker", "TMF"))
+                elif _code2 and _code2 in getattr(self, "_canonical_far_codes", set()):
+                    _k = str(getattr(self, "ticker", "TMF")) + "_FAR"
+                if _k:
+                    self.market_data.setdefault(_k, {})["bid"] = _bid
+                    self.market_data.setdefault(_k, {})["ask"] = _ask
+                    self.market_data.setdefault(_k, {})["bidask_at"] = time.time()
+        except Exception:
+            pass
+
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()
         self._f_shadow_t0 = time.time()
