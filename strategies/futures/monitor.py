@@ -1912,6 +1912,15 @@ class FuturesMonitor:
                             seq=getattr(tick, "seq", None),
                             contract_code=_code,
                             source="shioaji_tick")
+                        _mcst = getattr(self, "_f_shadow_state", None) or {}
+                        if _mcst.get("has_position"):
+                            try:
+                                self._model_c.mark_position(
+                                    _mcst.get("near_side"), _mcst.get("far_side"),
+                                    _mcst.get("near_entry"), _mcst.get("far_entry"),
+                                    _mcst.get("near_qty") or 1, _mcst.get("far_qty") or 1)
+                            except Exception as _me:
+                                logger.warning("[MODEL_C] mark_position error: %r", _me)
         except Exception as _mc_err:
             if not hasattr(self, "_mc_err_log"):
                 self._mc_err_log = True
