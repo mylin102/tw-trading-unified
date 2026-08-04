@@ -16,6 +16,9 @@ from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
+
+import logging
+logger = logging.getLogger("FuturesMonitor")
 import pandas as pd
 from rich.console import Console
 
@@ -79,25 +82,29 @@ _thread_local = threading.local()
 
 
 def _extract_bbo(quote_obj) -> tuple | None:
-    """Pure BBO extractor: bid_price[0]/ask_price[0]/volumes.
-    Rejects: empty list, non-numeric, bid<=0, ask<=0, ask<bid.
-    NEVER falls back to close/last to fake a BBO."""
+    """Pure BBO extractor. Accepts scalar (futures tick) or list
+    (BidAskFOPv1) bid_price/ask_price. Rejects: empty/missing, non-numeric,
+    bid<=0, ask<=0, ask<bid. NEVER falls back to close/last to fake a BBO."""
     try:
         _bp = getattr(quote_obj, "bid_price", None)
         _ap = getattr(quote_obj, "ask_price", None)
         _bv = getattr(quote_obj, "bid_volume", None)
         _av = getattr(quote_obj, "ask_volume", None)
-        if isinstance(_bp, list) and _bp and isinstance(_ap, list) and _ap:
-            try:
-                bid = float(_bp[0]); ask = float(_ap[0])
-            except (TypeError, ValueError):
-                return None
-            if bid <= 0.0 or ask <= 0.0 or ask < bid:
-                return None
-            bv = _bv[0] if isinstance(_bv, list) and _bv else None
-            av = _av[0] if isinstance(_av, list) and _av else None
-            return (bid, ask, bv, av)
-        return None
+        def _first(v):
+            if isinstance(v, list):
+                return v[0] if v else None
+            return v
+        bid = _first(_bp)
+        ask = _first(_ap)
+        try:
+            bid = float(bid); ask = float(ask)
+        except (TypeError, ValueError):
+            return None
+        if bid <= 0.0 or ask <= 0.0 or ask < bid:
+            return None
+        bv = _first(_bv)
+        av = _first(_av)
+        return (bid, ask, bv, av)
     except Exception:
         return None
 
