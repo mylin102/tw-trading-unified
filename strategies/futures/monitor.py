@@ -78,6 +78,37 @@ import threading
 _thread_local = threading.local()
 
 
+def _extract_bbo(quote_obj) -> tuple | None:
+    """Pure BBO extractor: bid_price[0]/ask_price[0]/volumes.
+    Rejects: empty list, non-numeric, bid<=0, ask<=0, ask<bid.
+    NEVER falls back to close/last to fake a BBO."""
+    try:
+        _bp = getattr(quote_obj, "bid_price", None)
+        _ap = getattr(quote_obj, "ask_price", None)
+        _bv = getattr(quote_obj, "bid_volume", None)
+        _av = getattr(quote_obj, "ask_volume", None)
+        if isinstance(_bp, list) and _bp and isinstance(_ap, list) and _ap:
+            try:
+                bid = float(_bp[0]); ask = float(_ap[0])
+            except (TypeError, ValueError):
+                return None
+            if bid <= 0.0 or ask <= 0.0 or ask < bid:
+                return None
+            bv = _bv[0] if isinstance(_bv, list) and _bv else None
+            av = _av[0] if isinstance(_av, list) and _av else None
+            return (bid, ask, bv, av)
+        return None
+    except Exception:
+        return None
+
+
+def _repo_root() -> str:
+    """Repo root from __file__ (strategies/futures/monitor.py -> parents[2]).
+    Never cwd-dependent."""
+    import pathlib
+    return str(pathlib.Path(__file__).resolve().parents[2])
+
+
 def _mts_position_state_path() -> Path:
     """Return the MTS position state file path.
 
@@ -1749,8 +1780,9 @@ class FuturesMonitor:
             self._f_funnel("hook_enter", "collector_ok")
             if _c is not None:
                 _code = str(getattr(tick, "code", "") or "").split("/")[-1].strip()
-                _bid = getattr(tick, "buy_price", None)
-                _ask = getattr(tick, "sell_price", None)
+                _bbo = _extract_bbo(tick)
+                _bid = _bbo[0] if _bbo else None
+                _ask = _bbo[1] if _bbo else None
                 _near_c = str(getattr(getattr(self, "contract", None), "code", "") or "").split("/")[-1].strip()
                 _far_c = str(getattr(getattr(self, "far_contract", None), "code", "") or "").split("/")[-1].strip()
                 self._f_funnel("target_contract" if _code in (_near_c, _far_c) else "target_contract",
@@ -1845,7 +1877,7 @@ class FuturesMonitor:
         # [Model C canary 2026-08-03] synchronized BBO executable marking —
         # shadow only. Flag-gated dynamically (data/model_c_canary.flag).
         try:
-            _mc_flag = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "model_c_canary.flag")
+            _mc_flag = os.path.join(_repo_root(), "data", "model_c_canary.flag")
             if os.path.exists(_mc_flag):
                 _code = str(getattr(tick, "code", "") or "").split("/")[-1].strip()
                 _near_c = str(getattr(getattr(self, "contract", None), "code", "") or "").split("/")[-1].strip()
@@ -1862,14 +1894,15 @@ class FuturesMonitor:
                 if _leg:
                     if not hasattr(self, "_model_c"):
                         from core.model_c_collector import ModelCCollector
-                        _td = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "telemetry", "model_c")
+                        _td = os.path.join(_repo_root(), "data", "telemetry", "model_c")
                         os.makedirs(_td, exist_ok=True)
                         _day = datetime.now().strftime("%Y%m%d")
                         self._model_c = ModelCCollector(
                             os.path.join(_td, f"model_c_{_day}.jsonl"),
                             bbo_raw_path=os.path.join(_td, f"bbo_raw_{_day}.jsonl"))
-                    _bid = getattr(tick, "buy_price", None)
-                    _ask = getattr(tick, "sell_price", None)
+                    _bbo2 = _extract_bbo(tick)
+                    _bid = _bbo2[0] if _bbo2 else None
+                    _ask = _bbo2[1] if _bbo2 else None
                     if _bid is not None or _ask is not None:
                         self._model_c.on_quote(
                             _leg, _bid, _ask,

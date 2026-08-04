@@ -138,7 +138,8 @@ class FShadowCollector:
             with self._lock:
                 self._seq += 1
                 q = {"bid": bid, "ask": ask, "bid_size": bid_size, "ask_size": ask_size,
-                     "receive_ts": receive_ts or _now(), "seq": seq}
+                     "receive_ts": receive_ts or _now(),
+                     "seq": seq if seq is not None else self._seq}
                 if leg == "NEAR":
                     self._near = q
                 else:
