@@ -148,8 +148,8 @@ mts:
     max_age_sec: 420
   params:
     min_atr: 10.0
-    atr_multiplier_stop: 0.6
-    atr_multiplier_trail: 0.2
+    atr_multiplier_stop: 2.5
+    atr_multiplier_trail: 1.0
     release_stop_points: 88
     trail_distance_points: 66
     enable_combined_upl_trail: true
@@ -188,6 +188,8 @@ mts:
     post_release:
       breakeven_after_atr: 1.0
       force_lock_after_atr: 3.0
+    enable_renko_exit: true
+    renko_brick_multiplier: 0.5
   paper:
     allow_synthetic_price: true
     synthetic_near_price: 41000.0

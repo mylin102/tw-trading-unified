@@ -869,12 +869,8 @@ def run_system(dry_run=False, config_name="futures"):
         futures_mons = []
         for cfg_item in config_names:
             _base_cfg = cfg_item.replace(".yaml", "")
-            if _is_night:
-                _config_file = f"{_base_cfg}_night.yaml"
-                if not os.path.exists(os.path.join(BASE, "config", _config_file)):
-                    _config_file = f"{_base_cfg}.yaml"
-            else:
-                _config_file = f"{_base_cfg}.yaml"
+            # 2026-08-04 Gemini CLI: Unified single config source (futures.yaml) for both day & night
+            _config_file = f"{_base_cfg}.yaml"
             console.print(f"[dim]📋 Futures config for {cfg_item}: {_config_file} (session={'night' if _is_night else 'day'})[/dim]")
 
             fm_inst = FuturesMonitor(
@@ -1120,12 +1116,8 @@ def run_system(dry_run=False, config_name="futures"):
                     futures_mons = []
                     for cfg_item in config_names:
                         _base_cfg = cfg_item.replace(".yaml", "")
-                        if _is_night:
-                            _config_file = f"{_base_cfg}_night.yaml"
-                            if not os.path.exists(os.path.join(BASE, "config", _config_file)):
-                                _config_file = f"{_base_cfg}.yaml"
-                        else:
-                            _config_file = f"{_base_cfg}.yaml"
+                        # 2026-08-04 Gemini CLI: Unified single config source (futures.yaml) for both day & night
+                        _config_file = f"{_base_cfg}.yaml"
                         
                         fm_inst = FuturesMonitor(
                             api=api,
