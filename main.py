@@ -1024,6 +1024,13 @@ def run_system(dry_run=False, config_name="futures"):
                         console.print(f"[green]📡 Subscribed {f_mon.ticker} tick: {f_mon.contract.code}[/green]")
                     except Exception as e:
                         console.print(f"[yellow]⚠️ {f_mon.ticker} subscribe failed: {e}[/yellow]")
+                    # 2026-08-04 review: Model C needs executable BBO — futures
+                    # bidask (BidAskFOPv1) is the real source; tick carries last only.
+                    try:
+                        safe_subscribe(api, f_mon.contract, quote_type='bidask')
+                        console.print(f"[green]📡 Subscribed {f_mon.ticker} bidask: {f_mon.contract.code}[/green]")
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️ {f_mon.ticker} bidask subscribe failed: {e}[/yellow]")
 
                 if f_mon.far_contract is not None:
                     try:
@@ -1031,6 +1038,11 @@ def run_system(dry_run=False, config_name="futures"):
                         console.print(f"[green]📡 Subscribed far-month {f_mon.ticker} tick: {f_mon.far_contract.code}[/green]")
                     except Exception as e:
                         console.print(f"[yellow]⚠️ Far-month {f_mon.ticker} subscribe failed: {e}[/yellow]")
+                    try:
+                        safe_subscribe(api, f_mon.far_contract, quote_type='bidask')
+                        console.print(f"[green]📡 Subscribed far-month {f_mon.ticker} bidask: {f_mon.far_contract.code}[/green]")
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️ Far-month {f_mon.ticker} bidask subscribe failed: {e}[/yellow]")
 
             # ── Subscribe MTX ticks (passive collection) ──
             if _mtx_runtime is not None and _mtx_runtime.collector.is_resolved:
@@ -1164,6 +1176,12 @@ def run_system(dry_run=False, config_name="futures"):
                         for f_mon in futures_mons:
                             if f_mon.contract is not None:
                                 api.quote.subscribe(f_mon.contract, quote_type='tick')
+                                # 2026-08-04 review: reconnect must also restore
+                                # futures bidask (Model C BBO source)
+                                try:
+                                    api.quote.subscribe(f_mon.contract, quote_type=sj.constant.QuoteType.BidAsk)
+                                except Exception as e:
+                                    console.print(f"[yellow]⚠️ Re-subscribe {f_mon.ticker} bidask failed: {e}[/yellow]")
 
                             if f_mon.far_contract is not None:
                                 try:
@@ -1171,6 +1189,10 @@ def run_system(dry_run=False, config_name="futures"):
                                     console.print(f"[green]📡 Re-Subscribed far-month {f_mon.ticker} Futures tick: {f_mon.far_contract.code}[/green]")
                                 except Exception as e:
                                     console.print(f"[yellow]⚠️ Re-subscribe far-month {f_mon.ticker} Futures failed: {e}[/yellow]")
+                                try:
+                                    api.quote.subscribe(f_mon.far_contract, quote_type=sj.constant.QuoteType.BidAsk)
+                                except Exception as e:
+                                    console.print(f"[yellow]⚠️ Re-subscribe far-month {f_mon.ticker} bidask failed: {e}[/yellow]")
 
                         om.monitor.find_best_contracts(futures_mons[0])
                         om.monitor.pre_fill_bars()

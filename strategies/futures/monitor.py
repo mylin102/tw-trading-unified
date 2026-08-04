@@ -81,40 +81,50 @@ import threading
 _thread_local = threading.local()
 
 
-def _extract_bbo(quote_obj) -> tuple | None:
-    """Pure BBO extractor. Accepts scalar or list bid_price/ask_price
-    (BidAskFOPv1 options) with buy_price/sell_price fallback (futures ticks).
-    Rejects: empty/missing, non-numeric, bid<=0, ask<=0, ask<bid.
-    NEVER falls back to close/last to fake a BBO."""
-    try:
-        _bp = getattr(quote_obj, "bid_price", None)
-        _ap = getattr(quote_obj, "ask_price", None)
-        _bv = getattr(quote_obj, "bid_volume", None)
-        _av = getattr(quote_obj, "ask_volume", None)
-        def _first(v):
-            if isinstance(v, list):
-                return v[0] if v else None
-            return v
-        # bid_price/ask_price (BidAskFOPv1 options) -> fallback buy_price/sell_price (futures ticks)
-        bid = _first(_bp)
-        if bid is None:
-            bid = _first(getattr(quote_obj, "buy_price", None))
-        ask = _first(_ap)
-        if ask is None:
-            ask = _first(getattr(quote_obj, "sell_price", None))
-        if bid is None or ask is None:
-            return None
+def _extract_bbo(quote_obj):
+    """Pure BBO extractor with explicit quote-quality classification.
+
+    Returns (bid, ask, quality) where quality is one of:
+      "BBO_VALID"            — real bid/ask (BidAskFOPv1 or scalar bid/ask);
+      "TICK_ONLY"            — last/close present, no BBO (diagnostics only);
+      "DATA_QUALITY_BLOCKED" — no usable price at all.
+
+    2026-08-04 review: the buy_price/sell_price fallback (f3743daa) was
+    removed — runtime capture proved futures ticks carry last/close only, so
+    the fallback silently fabricated nothing and masked the real contract gap.
+    NEVER falls back to close/last to fake a BBO; callers must gate Model C
+    decisions on quality == "BBO_VALID" only.
+    """
+    def _first(v):
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+    _bp = _first(getattr(quote_obj, "bid_price", None))
+    _ap = _first(getattr(quote_obj, "ask_price", None))
+    # BidAskFOPv1 exposes bid_price/ask_price lists; scalar bid/ask also valid.
+    if _bp is None:
+        _bp = getattr(quote_obj, "bid", None)
+    if _ap is None:
+        _ap = getattr(quote_obj, "ask", None)
+    if _bp is not None and _ap is not None:
         try:
-            bid = float(bid); ask = float(ask)
+            _b = float(_bp)
+            _a = float(_ap)
         except (TypeError, ValueError):
-            return None
-        if bid <= 0.0 or ask <= 0.0 or ask < bid:
-            return None
-        bv = _first(_bv)
-        av = _first(_av)
-        return (bid, ask, bv, av)
-    except Exception:
-        return None
+            _b = _a = None
+        if _b is not None and _a is not None and _b > 0 and _a > 0 and _a >= _b:
+            return (_b, _a, "BBO_VALID")
+    # No real BBO: classify what IS available (last/close) for diagnostics.
+    _last = _first(getattr(quote_obj, "last", None))
+    if _last is None:
+        _last = _first(getattr(quote_obj, "close", None))
+    if _last is not None:
+        try:
+            float(_last)
+            return (None, None, "TICK_ONLY")
+        except (TypeError, ValueError):
+            pass
+    return (None, None, "DATA_QUALITY_BLOCKED")
 
 
 def _repo_root() -> str:
@@ -943,6 +953,29 @@ class FuturesMonitor:
 
         # [Bug Fix] Add contract rollover check
         self._last_contract_code = self.contract.code if self.contract else None
+
+        # 2026-08-04 review item 2: canonical contract identity.
+        # Shioaji streams the SAME near contract under two code families:
+        #   query code (TMFH6) and real stream code (MXFH6); far: TMFI6/MXFI6.
+        # FShadow/Model C compare against these alias sets — a tick whose code
+        # matches none of them is a CONTRACT_MISMATCH (blocked, never "other").
+        self._canonical_near_codes = set()
+        self._canonical_far_codes = set()
+        _c0 = getattr(self.contract, "code", None)
+        _f0 = getattr(self.far_contract, "code", None) if self.far_contract is not None else None
+        if _c0:
+            self._canonical_near_codes.add(_c0)
+            # stream-code alias: MXF<month> for TMF<month> (and vice versa)
+            if _c0.startswith("TMF"):
+                self._canonical_near_codes.add("MXF" + _c0[3:])
+            elif _c0.startswith("MXF"):
+                self._canonical_near_codes.add("TMF" + _c0[3:])
+        if _f0:
+            self._canonical_far_codes.add(_f0)
+            if _f0.startswith("TMF"):
+                self._canonical_far_codes.add("MXF" + _f0[3:])
+            elif _f0.startswith("MXF"):
+                self._canonical_far_codes.add("TMF" + _f0[3:])
 
         
         # 2026-06-24 Gemini CLI: Pre-fill near/far contract prices from snapshots at startup to prevent identical execution prices on first manual trade.
@@ -1798,15 +1831,25 @@ class FuturesMonitor:
                 _bbo = _extract_bbo(tick)
                 _bid = _bbo[0] if _bbo else None
                 _ask = _bbo[1] if _bbo else None
+                _bq = _bbo[2] if _bbo else "DATA_QUALITY_BLOCKED"
                 _near_c = str(getattr(getattr(self, "contract", None), "code", "") or "").split("/")[-1].strip()
                 _far_c = str(getattr(getattr(self, "far_contract", None), "code", "") or "").split("/")[-1].strip()
-                self._f_funnel("target_contract" if _code in (_near_c, _far_c) else "target_contract",
-                               None if _code in (_near_c, _far_c) else f"other:{_code}")
-                if _bid is None or _ask is None:
-                    self._f_funnel("bbos_extracted", "missing_bid_or_ask")
+                # 2026-08-04 review item 2: canonical alias sets (TMFH6/MXFH6
+                # are the same near contract). Code outside both sets =
+                # CONTRACT_MISMATCH -> block, never classify as generic other.
+                _nset = getattr(self, "_canonical_near_codes", None) or {_near_c}
+                _fset = getattr(self, "_canonical_far_codes", None) or {_far_c}
+                if _code in _nset or _code in _fset:
+                    self._f_funnel("target_contract")
                 else:
+                    self._f_funnel("target_contract", f"contract_mismatch:{_code}")
+                if _bq == "BBO_VALID":
                     self._f_funnel("bbos_extracted")
                     self._f_funnel("bbos_valid")
+                elif _bq == "TICK_ONLY":
+                    self._f_funnel("bbos_extracted", "tick_only")
+                else:
+                    self._f_funnel("bbos_extracted", "data_quality_blocked")
                 if _bid is not None or _ask is not None:
                     self._f_funnel("envelope_created")
                     _c.on_quote(_code, _bid, _ask, contract_code=_code,
@@ -1898,14 +1941,15 @@ class FuturesMonitor:
                 _near_c = str(getattr(getattr(self, "contract", None), "code", "") or "").split("/")[-1].strip()
                 _far_c = str(getattr(getattr(self, "far_contract", None), "code", "") or "").split("/")[-1].strip()
                 _leg = None
-                if _code and _code == _near_c:
+                if _code and _code in _nset:
                     _leg = "NEAR"
-                elif _code and _code == _far_c:
+                elif _code and _code in _fset:
                     _leg = "FAR"
                 if not _leg and not hasattr(self, "_mc_leg_miss_log"):
                     self._mc_leg_miss_log = True
-                    logger.warning("[MODEL_C] leg mismatch code=%r near=%r far=%r",
-                                   _code, _near_c, _far_c)
+                    logger.warning("[MODEL_C] leg mismatch code=%r near=%r far=%r (canonical %s/%s)",
+                                   _code, _near_c, _far_c,
+                                   sorted(_nset), sorted(_fset))
                 if _leg:
                     if not hasattr(self, "_model_c"):
                         from core.model_c_collector import ModelCCollector
@@ -1918,7 +1962,11 @@ class FuturesMonitor:
                     _bbo2 = _extract_bbo(tick)
                     _bid = _bbo2[0] if _bbo2 else None
                     _ask = _bbo2[1] if _bbo2 else None
-                    if _bid is not None or _ask is not None:
+                    _bq2 = _bbo2[2] if _bbo2 else "DATA_QUALITY_BLOCKED"
+                    # 2026-08-04 review: Model C consumes BBO only when quality
+                    # is BBO_VALID. TICK_ONLY / DATA_QUALITY_BLOCKED never feed
+                    # on_quote (no last/close fallback, no buy/sell fallback).
+                    if _bq2 == "BBO_VALID":
                         self._model_c.on_quote(
                             _leg, _bid, _ask,
                             bid_size=getattr(tick, "buy_volume", None),

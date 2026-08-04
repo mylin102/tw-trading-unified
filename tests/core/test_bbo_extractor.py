@@ -1,4 +1,8 @@
-# Tests: pure BBO extractor + internal seq pair-key uniqueness.
+# Tests: pure BBO extractor quote-quality gate (2026-08-04 review item 1).
+# _extract_bbo returns (bid, ask, quality) with quality in
+#   BBO_VALID / TICK_ONLY / DATA_QUALITY_BLOCKED.
+# The buy_price/sell_price fallback (f3743daa) was removed — futures ticks
+# carry last/close only and must NEVER masquerade as BBO.
 import sys, types, os, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -25,29 +29,78 @@ def make_no_bbo():
     return o
 
 
+def make_futures_tick(last=43423.0, buy_price=None, sell_price=None):
+    # exact runtime shape observed in dynamics capture: last present, no BBO
+    o = types.SimpleNamespace()
+    o.code = "TMFH6"
+    o.last = last
+    o.close = last
+    o.buy_price = buy_price
+    o.sell_price = sell_price
+    return o
+
+
 def test_extract_first_level_bbo():
     q = make_bidask(bid=["100.0"], ask=["100.5"], bv=[5], av=[7])
-    assert _extract_bbo(q) == (100.0, 100.5, 5, 7)
+    bid, ask, quality = _extract_bbo(q)
+    assert (bid, ask) == (100.0, 100.5)
+    assert quality == "BBO_VALID"
+
+
+def test_scalar_bid_ask_valid():
+    o = types.SimpleNamespace(bid=43542.0, ask=43545.0)
+    bid, ask, quality = _extract_bbo(o)
+    assert quality == "BBO_VALID" and (bid, ask) == (43542.0, 43545.0)
 
 
 def test_extract_empty_quotes_rejected():
-    assert _extract_bbo(make_bidask(bid=[], ask=[])) is None
-    assert _extract_bbo(make_no_bbo()) is None
+    bid, ask, quality = _extract_bbo(make_bidask(bid=[], ask=[]))
+    assert quality in ("TICK_ONLY", "DATA_QUALITY_BLOCKED")
+    assert bid is None and ask is None
 
 
 def test_extract_non_numeric_rejected():
-    assert _extract_bbo(make_bidask(bid=["abc"], ask=["100.5"])) is None
+    bid, ask, quality = _extract_bbo(make_bidask(bid=["abc"], ask=["100.5"]))
+    assert quality == "DATA_QUALITY_BLOCKED"
+    assert bid is None and ask is None
 
 
 def test_extract_invalid_prices_rejected():
-    assert _extract_bbo(make_bidask(bid=["0.0"], ask=["100.5"])) is None  # bid<=0
-    assert _extract_bbo(make_bidask(bid=["100.5"], ask=["100.4"])) is None  # ask<bid
-    assert _extract_bbo(make_bidask(bid=["-1"], ask=["100.5"])) is None
+    for bad in (["0.0"], ["-1"]):
+        bid, ask, quality = _extract_bbo(make_bidask(bid=bad, ask=["100.5"]))
+        assert quality == "DATA_QUALITY_BLOCKED"
+        assert bid is None and ask is None
+    # ask < bid inverted
+    bid, ask, quality = _extract_bbo(make_bidask(bid=["100.5"], ask=["100.4"]))
+    assert quality == "DATA_QUALITY_BLOCKED"
+
+
+def test_futures_tick_is_tick_only_never_bbo():
+    # The 2026-08-04 root cause: futures tick stream (TMFH6) has last only.
+    # buy_price/sell_price fallback must NOT resurrect it as BBO.
+    bid, ask, quality = _extract_bbo(make_futures_tick())
+    assert quality == "TICK_ONLY"
+    assert bid is None and ask is None
+
+
+def test_futures_tick_with_stale_buy_sell_still_not_bbo():
+    # Even if buy_price/sell_price exist on a tick, they are NOT the
+    # executable BBO contract — TICK_ONLY, never BBO_VALID.
+    bid, ask, quality = _extract_bbo(make_futures_tick(buy_price=43420.0, sell_price=43426.0))
+    assert quality == "TICK_ONLY"
+    assert bid is None and ask is None
 
 
 def test_no_close_fallback():
     q = make_no_bbo()  # no bid_price/ask_price — close exists but unused
-    assert _extract_bbo(q) is None
+    bid, ask, quality = _extract_bbo(q)
+    assert quality == "TICK_ONLY"   # close classifies as tick-only diagnostics
+    assert bid is None and ask is None
+
+
+def test_empty_object_blocked():
+    bid, ask, quality = _extract_bbo(types.SimpleNamespace())
+    assert quality == "DATA_QUALITY_BLOCKED"
 
 
 def test_same_datetime_updates_have_unique_pair_keys():
