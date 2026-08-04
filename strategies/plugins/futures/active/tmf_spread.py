@@ -49,6 +49,52 @@ from strategies.futures.squeeze_futures.engine.constants import get_point_value
 
 logger = logging.getLogger(__name__)
 
+# ── Policy J entry peak guard config (2026-08-04 contract alignment) ──
+# Canonical key: entry_peak_guard_ms — the quarantine window AFTER both legs
+# settle, during which Policy J durable peaks are suppressed (opening-spike
+# isolation). NOT a warmup knob; do not confuse with strategy/data warmup.
+_ENTRY_PEAK_GUARD_DEFAULT_MS = 15000.0
+_ENTRY_PEAK_GUARD_LEGACY_KEY = "policy_j_entry_warmup_ms"
+
+
+def resolve_entry_peak_guard_ms(params) -> tuple[float, str, str]:
+    """Resolve the effective entry-peak guard window from strategy params.
+
+    Returns (value_ms, source, config_key) with source in
+    CONFIG | LEGACY_CONFIG | DEFAULT.
+
+    Migration precedence (2026-08-04):
+      entry_peak_guard_ms present            -> new canonical key
+      only policy_j_entry_warmup_ms present  -> legacy, deprecation warning
+      both present, different values         -> ValueError (never silent pick)
+      neither present                        -> documented default, source=DEFAULT
+    """
+    params = params or {}
+    new_key = "entry_peak_guard_ms"
+    legacy_key = _ENTRY_PEAK_GUARD_LEGACY_KEY
+    has_new = new_key in params and params.get(new_key) is not None
+    has_legacy = legacy_key in params and params.get(legacy_key) is not None
+    if has_new and has_legacy:
+        _nv = float(params[new_key])
+        _lv = float(params[legacy_key])
+        if _nv != _lv:
+            raise ValueError(
+                f"Policy J guard config conflict: {new_key}={_nv} vs "
+                f"{legacy_key}={_lv} — remove the legacy key; refusing to "
+                f"silently pick one."
+            )
+        return (_nv, "CONFIG", new_key)
+    if has_new:
+        return (float(params[new_key]), "CONFIG", new_key)
+    if has_legacy:
+        _lv = float(params[legacy_key])
+        logger.warning(
+            "[POLICY_J_GUARD] deprecated key %s=%s used — migrate to %s",
+            legacy_key, _lv, new_key,
+        )
+        return (_lv, "LEGACY_CONFIG", legacy_key)
+    return (_ENTRY_PEAK_GUARD_DEFAULT_MS, "DEFAULT", new_key)
+
 # 2026-07-14 Gemini CLI: Import decoupled risk engines under ADR-009 Phase 2
 from strategies.plugins.futures.active.risk_engine import (
     ReleaseRiskEngine,
@@ -980,6 +1026,7 @@ def _write_mts_state(
     trade_id: str | None = None,
     ticker: str = "TMF",
     atr: float = 0.0,
+    policy_j_meta: dict | None = None,
     **kwargs,
 ) -> None:
     """
@@ -1156,6 +1203,20 @@ def _write_mts_state(
         _expected_revision_val = kwargs.pop("expected_revision", None)
         # 2026-06-26 Gemini CLI: merge extra risk metrics / kwargs
         state.update(kwargs)
+        # ── Policy J effective guard metadata (2026-08-04 config observability) ──
+        # Merged into the OUTPUT state (not just `existing`); only refresh
+        # guard CONFIG metadata, never touch per-trade peak/durable state.
+        _pj_meta = policy_j_meta or {}
+        _pj_out = dict(existing.get("policy_j") or {})
+        for _mk, _mv in (
+            ("entry_peak_guard_ms", _pj_meta.get("entry_peak_guard_ms")),
+            ("entry_peak_guard_source", _pj_meta.get("entry_peak_guard_source")),
+            ("entry_peak_guard_config_key", _pj_meta.get("entry_peak_guard_config_key")),
+        ):
+            if _mv is not None:
+                _pj_out[_mk] = _mv
+        if _pj_out:
+            state["policy_j"] = _pj_out
         # 2026-06-23 Gemini CLI: Use unique temporary filename to avoid race conditions with other writers
         # ── P0: CAS revision guard ──
         # 防止舊 process 或延遲的 heartbeat 覆寫較新的 lifecycle state。
@@ -1382,7 +1443,10 @@ class TMFSpread(StrategyBase):
         self._peak_confirmation_samples = int(_params.get("peak_confirmation_samples", 3))
         self._peak_confirmation_ms = float(_params.get("peak_confirmation_ms", 1000.0))
         self._peak_confirmation_tolerance_twd = float(_params.get("peak_confirmation_tolerance_twd", 100.0))
-        self._entry_peak_guard_ms = float(_params.get("entry_peak_guard_ms", 15000.0))
+        self._entry_peak_guard_ms, _pjg_src, _pjg_key = resolve_entry_peak_guard_ms(_params)
+        self._pj_guard_source = _pjg_src          # CONFIG | LEGACY_CONFIG | DEFAULT
+        self._pj_guard_config_key = _pjg_key      # entry_peak_guard_ms | policy_j_entry_warmup_ms
+        self._pj_guard_effective_ms = float(self._entry_peak_guard_ms)
         self._max_single_update_jump_twd = float(_params.get("max_single_update_jump_twd", 200.0))
 
         # Release mode (Phase 1: triggered_market only)
@@ -2115,7 +2179,9 @@ class TMFSpread(StrategyBase):
                    "_pj_candidate_ts", "_pj_candidate_count", "_pj_last_mark_pair",
                    "_pj_last_upl", "_pj_last_eval_ts",
                    "_pj_guard_state", "_pj_guard_provisional_peak",
-                   "_pj_guard_initialized", "_pj_guard_just_completed"):
+                   "_pj_guard_initialized", "_pj_guard_just_completed",
+                   "_pj_guard_source", "_pj_guard_config_key",
+                   "_pj_guard_effective_ms"):
             if not hasattr(self, _a):
                 setattr(self, _a, None)
         _tid = getattr(self, "_trade_id", None)
@@ -3220,6 +3286,12 @@ class TMFSpread(StrategyBase):
             atr=self._last_atr, # 2026-06-26 Gemini CLI: pass current ATR to state writer
             lifecycle=self._current_lifecycle_state(),
             peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
+            # 2026-08-04 config observability: effective guard value + source
+            policy_j_meta={
+                "entry_peak_guard_ms": float(getattr(self, "_pj_guard_effective_ms", 15000.0)),
+                "entry_peak_guard_source": str(getattr(self, "_pj_guard_source", "DEFAULT")),
+                "entry_peak_guard_config_key": str(getattr(self, "_pj_guard_config_key", "entry_peak_guard_ms")),
+            },
         )
         _append_event("ENTRY_SUBMITTED", action=_action, near_side=self._near_side, far_side=self._far_side,
                        near_entry=near_close, far_entry=far_close, spread_z=spread_z_f,
