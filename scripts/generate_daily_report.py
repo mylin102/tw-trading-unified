@@ -57,6 +57,12 @@ def resolve_exit_reason(data: dict, events: list) -> tuple[str, str]:
             r = ev.get("reason") or ev.get("exit_reason")
             if r and r not in ("UNKNOWN", ""):
                 return _format_exit_reason_label(str(r)), "EXPLICIT_EVENT"
+    # Level 1b: Policy J combined exit (2026-08-04) — trigger event is the
+    # explicit evidence (peak/current/giveback), previously fell to Level 5
+    # INSUFFICIENT_EVIDENCE despite being an explicit Policy J exit.
+    for ev in events_list:
+        if ev.get("event") in ("POLICY_J_TRIGGERED", "COMBINED_EXIT_SUBMITTED"):
+            return "Policy J (COMBINED_EXIT)", "EXPLICIT_EVENT"
     
     # Level 2: Order metadata
     for ev in events_list:
