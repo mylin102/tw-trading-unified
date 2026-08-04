@@ -3892,10 +3892,18 @@ elif _selected_product == "TMF":
                 f"🌙 夜盤實現毛利: **{_night_m['total_net']:+,.0f} TWD** ({_night_m['total_trades']} 圈, 勝率 {_night_m['win_rate']:.1%})"
             )
             
-            if _completed:
-                with st.expander("📝 已完結交易清單 (Closed Loops)", expanded=True):
+            # 2026-08-04 Gemini CLI: Synchronize closed loops table with session filter selection
+            if _sess_key == "DAY":
+                _completed_filtered = [t for t in _completed if str(t.get("entry_session", t.get("session", ""))).lower() == "day"]
+            elif _sess_key == "NIGHT":
+                _completed_filtered = [t for t in _completed if str(t.get("entry_session", t.get("session", ""))).lower() == "night"]
+            else:
+                _completed_filtered = _completed
+
+            if _completed_filtered:
+                with st.expander(f"📝 已完結交易清單 (Closed Loops - {_sel_session})", expanded=True):
                     _loop_rows = []
-                    for t in _completed:
+                    for t in _completed_filtered:
                         _is_pj = ("COMBINED_EXIT" in str(t.get("exit_reason", "")).upper() or "POLICY_J" in str(t.get("exit_reason", "")).upper())
                         _loop_rows.append({
                             "交易 ID": t["trade_id"][-6:],
