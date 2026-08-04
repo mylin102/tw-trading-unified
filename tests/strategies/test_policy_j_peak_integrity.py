@@ -175,3 +175,23 @@ def test_suppression_throttled_state_transition_only():
     n_supp = sum(1 for e in s._pj_events
                  if e["event"] == "POLICY_J_TRIGGER_SUPPRESSED")
     assert n_supp <= 2  # throttled (5s window) — not one per call
+
+
+def test_gate_passes_with_enum_phase_str():
+    # Real strategy passes phase as PositionPhase.SPREAD (enum str repr),
+    # not bare "SPREAD" — gate must accept suffix match.
+    s = make_strategy()
+    result = call(s, 30.0, 42801, 42975, 1000.0, phase="PositionPhase.SPREAD")
+    assert not any(e["event"] == "POLICY_J_TRIGGER_SUPPRESSED" for e in s._pj_events)
+
+
+def test_gate_passes_with_enum_phase_single_leg():
+    s = make_strategy()
+    result = call(s, 30.0, 42801, 42975, 1000.0, phase="PositionPhase.SINGLE_LEG")
+    assert not any(e["event"] == "POLICY_J_TRIGGER_SUPPRESSED" for e in s._pj_events)
+
+
+def test_gate_suppresses_other_phase():
+    s = make_strategy(_far_entry=0.0)
+    call(s, 30.0, 42801, 42975, 1000.0, phase="PositionPhase.FLAT")
+    assert any(e["event"] == "POLICY_J_TRIGGER_SUPPRESSED" for e in s._pj_events)

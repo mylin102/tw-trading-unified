@@ -2120,7 +2120,8 @@ class TMFSpread(StrategyBase):
         # ── Entry-completion gate (2026-08-04 hotfix: real attrs) ──
         _na = float(getattr(self, "_near_entry", 0.0) or 0.0)
         _fa = float(getattr(self, "_far_entry", 0.0) or 0.0)
-        if not (_na > 0 and _fa > 0) or phase not in ("SPREAD", "SINGLE_LEG"):
+        _ph = str(phase)
+        if not (_na > 0 and _fa > 0) or not _ph.endswith(("SPREAD", "SINGLE_LEG")):
             _now_ms_g = datetime.now().timestamp() * 1000.0
             if _now_ms_g - float(getattr(self, "_pj_last_suppress_ms", 0.0)) > 5000.0:
                 _append_event("POLICY_J_TRIGGER_SUPPRESSED", trade_id=_tid,
