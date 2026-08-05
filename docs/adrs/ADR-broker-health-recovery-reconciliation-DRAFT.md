@@ -134,8 +134,10 @@ Per-state behavior:
 
 - PM2 max_restarts window = (now - created_at) < min_uptime × max_restarts
   (God.js:455) — an EARLY-LIFE guard, not a sustained breaker
-- min_uptime must exceed worst-case boot+health-check cycle (85s observed)
-  → min_uptime = 120s, max_restarts = 5, restart_delay = 15s
+- CANONICAL config (ecosystem.config.js, HEAD): min_uptime = 120s,
+  restart_delay = 15s, max_restarts = 2. min_uptime (120s) > observed 85s
+  crash cycle → the storm is classified as unstable and max_restarts trips
+  after 2. DO NOT override with a different parameter set.
 - PM2 is last-resort process supervision, NOT broker recovery:
   - trading process down → dashboard must show TRADING_DOWN (watchdog)
   - alert via external channel (dashboard banner / notification)
