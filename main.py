@@ -640,6 +640,56 @@ def api_is_healthy(api):
     return False
 
 
+
+def verify_startup_reconciliation(api) -> bool:
+    """Fail closed after reboot until broker position and order state are known.
+
+    This function performs read-only broker reconciliation only.  It never
+    creates monitors, subscribes market data, or reaches order-routing code.
+    """
+    from core.channel_safety import (
+        AccountDegradedReason,
+        get_safety_state,
+    )
+
+    safety = get_safety_state()
+    try:
+        account = api.futopt_account
+        api.update_status(account)
+        positions = list(api.list_positions(account))
+        trades = list(api.list_trades())
+    except Exception as exc:
+        safety.set_account_degraded(
+            AccountDegradedReason.RECONCILIATION_PENDING,
+            f"STARTUP_BROKER_QUERY_FAILED: {type(exc).__name__}: {exc}",
+        )
+        console.print("[bold red]RECOVERY_REQUIRED: broker reconciliation query failed; new entries remain blocked[/bold red]")
+        return False
+
+    terminal_statuses = {"Filled", "Cancelled", "Expired", "Done"}
+    open_orders = [
+        trade
+        for trade in trades
+        if getattr(getattr(trade, "status", None), "status", "") not in terminal_statuses
+    ]
+
+    safety.set_account_healthy()
+    if positions or open_orders:
+        safety.set_account_degraded(
+            AccountDegradedReason.RECONCILIATION_PENDING,
+            f"STARTUP_RECONCILIATION_REQUIRED: positions={len(positions)} open_orders={len(open_orders)}",
+        )
+        console.print(
+            "[bold yellow]RECOVERY_REQUIRED: broker reports open position/order; "
+            "new entries remain blocked pending operator reconciliation[/bold yellow]"
+        )
+        return False
+
+    safety.set_reconciled()
+    console.print("[green]STARTUP_RECONCILED: broker flat and no open orders; entry gate may evaluate normally[/green]")
+    return True
+
+
 def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
     """Attempt in-process Shioaji re-login + re-subscribe after data stagnation.
 
@@ -883,12 +933,8 @@ def run_system(dry_run=False, config_name="futures"):
             api = get_api()
             console.print("[green]✅ Single Shioaji session established[/green]")
 
-            # Mark safety state as reconciled (post-restart, fresh login)
-            try:
-                from core.channel_safety import get_safety_state
-                get_safety_state().set_reconciled()
-            except Exception:
-                pass
+            # 2026-08-05 Codex: login alone never unlocks post-reboot entries.
+            verify_startup_reconciliation(api)
 
             # ── Shioaji quote event callback (provenance only) ──
             try:
