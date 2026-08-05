@@ -82,8 +82,8 @@ def sync():
     print(f"   目前監控名單: {updated_watchlist}")
     
     # 7. 觸發重啟 (如果 monitor 正在跑)
-    restart_flag = ROOT / ".restart"
-    restart_flag.touch()
+    # 2026-08-05 Antigravity AI: Disabled .restart touch for Commit 224cab05 P0 compliance
+    pass
 
 if __name__ == "__main__":
     sync()

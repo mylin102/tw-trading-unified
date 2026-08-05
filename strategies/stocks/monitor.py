@@ -435,7 +435,8 @@ class StockMonitor:
                     
                     console.print("[bold red]🛑 Cancelling ALL pending orders to prevent post-market execution[/bold red]")
                     self.cancel_all_pending_orders()
-                    Path(ROOT / ".restart").touch()
+                    # 2026-08-05 Antigravity AI: Disabled .restart touch for Commit 224cab05 P0 compliance
+                    pass
                 elif not self.live_trading and disk_live:
                     # PAPER → LIVE: promote to live mode, cancel any stale paper positions
                     console.print("[bold yellow]⚠️ Config changed to LIVE on disk! Switching to LIVE mode.[/bold yellow]")
@@ -447,7 +448,8 @@ class StockMonitor:
                     
                     console.print("[bold yellow]🛑 Cancelling ALL paper orders before going LIVE[/bold yellow]")
                     self.cancel_all_pending_orders()
-                    Path(ROOT / ".restart").touch()
+                    # 2026-08-05 Antigravity AI: Disabled .restart touch for Commit 224cab05 P0 compliance
+                    pass
                 return disk_live
         except Exception as e:
             console.print(f"[yellow]⚠️ Could not re-verify live flag: {e}[/yellow]")
