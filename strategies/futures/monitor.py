@@ -672,6 +672,7 @@ class FuturesMonitor:
 
     def _get_tick_bars_df(self):
         """[Wave 2] Rebuild deque cache on every call so _strategy_tick sees latest bars."""
+        _perf_started = time.perf_counter()
         if len(self._tick_bars_deque) > 0:
             records = list(self._tick_bars_deque)
             self._tick_bars_cache = pd.DataFrame({
@@ -681,7 +682,11 @@ class FuturesMonitor:
                 "Close": [r["close"] for r in records],
                 "Volume": [r["volume"] for r in records],
             }, index=[r["ts"] for r in records])
-        return self._tick_bars_cache if self._tick_bars_cache is not None else pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        _result = self._tick_bars_cache if self._tick_bars_cache is not None else pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        _elapsed_ms = (time.perf_counter() - _perf_started) * 1000
+        if _elapsed_ms >= 100:
+            logger.info("[PERF] tick_bars_dataframe duration_ms=%.1f rows=%d", _elapsed_ms, len(_result))
+        return _result
 
     def get_far_tick_bars_df(self):
         """Return far-month tick bars as DataFrame for dashboard consumption."""
@@ -5621,7 +5626,15 @@ class FuturesMonitor:
                 self._ingestion.set_contract(self.contract)
         except Exception:
             pass
-        return self._ingestion.fetch_backfill()
+        _will_fetch = (time.time() - getattr(self._ingestion, "_last_kbars_fetch_at", 0)) >= 120
+        _perf_started = time.perf_counter()
+        if _will_fetch:
+            logger.info("[PERF] periodic_backfill_start")
+        _result = self._ingestion.fetch_backfill()
+        _elapsed_ms = (time.perf_counter() - _perf_started) * 1000
+        if _will_fetch or _elapsed_ms >= 100:
+            logger.info("[PERF] periodic_backfill_done duration_ms=%.1f fetched=%s", _elapsed_ms, _result is not None)
+        return _result
 
     def _fetch_today_kbars(self):
         """[Phase 2] Fetch today's kbars via IngestionService.
@@ -8939,6 +8952,7 @@ class FuturesMonitor:
 
             for tf, frame in raw_frames.items():
                 if len(frame) >= 2:
+                    _indicator_started = time.perf_counter()
                     processed[tf] = attach_bar_metadata(
                         calculate_futures_squeeze(
                             frame,
@@ -8946,6 +8960,9 @@ class FuturesMonitor:
                             **self.PB_ARGS,
                         )
                     )
+                    _indicator_elapsed_ms = (time.perf_counter() - _indicator_started) * 1000
+                    if _indicator_elapsed_ms >= 100:
+                        logger.info("[PERF] indicator_pipeline timeframe=%s duration_ms=%.1f rows=%d", tf, _indicator_elapsed_ms, len(frame))
 
         console.print(
             "[STICK_03_PROCESSED_BEFORE_FALLBACK] keys=%s has_5m=%s"
