@@ -245,3 +245,12 @@ config/
 3. Night session (15:00~05:00) dates: use previous calendar day before 05:00
 4. `api.kbars()` has 5-min rate limit — tick bars are primary data source
 5. Options `position` field is overwritten (not accumulated) on entry — guard prevents double entry
+
+## Rule 17: PM2 Supervision and Dashboard Isolation (2026-08-05)
+
+1. PM2 is a process supervisor, not a dashboard configuration-apply mechanism. Dashboard UI/YAML/watchlist changes MUST NOT call PM2, touch `.restart`, or restart `trading-system`.
+2. Never use `pm2 restart all`, `pm2 reload`, or ad-hoc `pm2 start main.py` for trading. Use the canonical `ecosystem.config.js`; the CJS entry is compatibility-only.
+3. A trading-system restart/stop/start needs explicit user approval and may occur only after target preflight, broker position and working-order reconciliation, and `VERIFIED_FLAT`. Logs or stale local state alone are insufficient proof.
+4. During broker uncertainty with a possible open position: block new entries, preserve state, alert, and reconcile. Autonomous stop/restart is forbidden.
+5. Deployments use single-instance stop-then-start, never reload. Validate process identity, intended commit/cwd/interpreter/args, near/far Tick+BidAsk subscriptions, and 120 seconds stable observe-only operation.
+6. Only after validation may an agent run `pm2 save`; it must then verify `dump.pm2` contains `trading-system` with the intended settings and that launchd uses the same `PM2_HOME`.

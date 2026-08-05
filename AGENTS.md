@@ -74,3 +74,11 @@ Whenever generating Python code, execution steps, or terminal commands for runni
 - Do not mention `cpulimit` or typical Linux-based throttling utilities, as they are inefficient on Apple Silicon schedulers.
 - Remind the user that this policy applies to all spawned child processes automatically, maintaining a cool device with zero fan noise.
 
+
+## P0: PM2 and Dashboard Configuration Safety (2026-08-05)
+- Dashboard, YAML updates, watchlist sync, and UI mode changes MUST NOT create `.restart`, invoke `pm2`, or cause `trading-system` to exit.
+- Never use `pm2 restart all`, `pm2 reload`, or a dashboard-triggered restart for trading configuration. A dashboard-only code update may target `dashboard` only.
+- A trading-system stop/start/restart is a maintenance deployment: require explicit user approval, target preflight, broker position + working-order reconciliation, and `VERIFIED_FLAT`. Ledger or stale state files alone do not prove flat.
+- Start trading-system only from the canonical `ecosystem.config.js`; `ecosystem.config.cjs` is compatibility-only. Do not use ad-hoc `pm2 start main.py` commands.
+- After a deployment, verify exactly one trading process, the intended commit/cwd/interpreter/args, near/far Tick+BidAsk subscriptions, and 120 seconds of stable observe-only operation before `pm2 save`. Confirm `dump.pm2` contains `trading-system` and uses the same `PM2_HOME` as launchd.
+- If broker health is unknown while a position may be open: block new entries, preserve strategy state, alarm, and reconcile. Do not autonomously stop/restart the process.
