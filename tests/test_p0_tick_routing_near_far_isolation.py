@@ -45,6 +45,8 @@ def test_far_month_tick_does_not_pollute_near_month_price():
     
     mon.on_tick("TFE", far_tick)
     
+    # Far-month tick MUST be archived but must not pollute near-month state.
+    mon._write_raw_tick.assert_called_once_with(far_tick)
     # Far-month tick MUST NOT pollute near-month _last_tmf_price or TMF/TMF_NEAR slots
     assert mon._last_tmf_price == 0, f"Expected 0, got {mon._last_tmf_price}"
     assert "TMF" not in mon.market_data
@@ -63,6 +65,8 @@ def test_far_month_tick_does_not_pollute_near_month_price():
     
     mon.on_tick("TFE", near_tick)
     
+    # Both legs must reach the raw tick writer once.
+    assert mon._write_raw_tick.call_count == 2
     # Near-month tick MUST update _last_tmf_price and TMF/TMF_NEAR slots
     assert mon._last_tmf_price == 43680.0
     assert mon.market_data["TMF"]["close"] == 43680.0

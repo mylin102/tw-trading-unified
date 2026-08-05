@@ -49,7 +49,7 @@ from core.date_utils import get_taifex_futures_hhmm, is_taifex_futures_market_op
 from core.spread_loader import get_spread_loader
 from squeeze_futures.data.shioaji_client import ShioajiClient
 from squeeze_futures.data.data_storage import save_trade
-from squeeze_futures.data.tick_writer import RawTickWriter, get_trading_day_str
+from squeeze_futures.data.tick_writer import RawTickWriter
 from squeeze_futures.data.kbar_writer import RawKbarWriter
 
 try:
@@ -788,6 +788,8 @@ class FuturesMonitor:
 
         # [GSD Data Safety] RawTickWriter: every tick lands on CSV before memory
         self._tick_writer = None  # Initialised lazily on first real tick
+        # One append-only writer per subscribed contract, never shared across legs.
+        self._raw_tick_writers = {}
 
         # [GSD Data Safety] RawKbarWriter: every api.kbars() response lands on CSV before computation
         self._kbar_writer = None  # Initialised lazily on first kbar fetch
@@ -1597,17 +1599,23 @@ class FuturesMonitor:
     def _write_raw_tick(self, tick) -> None:
         """Write a single tick to the raw CSV store BEFORE any in-memory cache.
 
-        The RawTickWriter is lazy-initialised on the first real TMF tick, so it
-        always uses the correct trading-day string.
+        Each subscribed leg has an independent writer.  Session date follows the
+        shared TAIFEX 15:00 rollover helper so the two legs are replayable as one
+        pair, including the after-hours portion of a trading day.
         """
         try:
-            if self._tick_writer is None:
-                from datetime import datetime
-                trading_day = get_trading_day_str(datetime.now())
-                code = getattr(tick, "code", self.ticker)
-                self._tick_writer = RawTickWriter(code, trading_day)
-
-            self._tick_writer.write(tick)
+            code = str(getattr(tick, "code", "") or self.ticker)
+            writers = getattr(self, "_raw_tick_writers", None)
+            if writers is None:
+                writers = self._raw_tick_writers = {}
+            writer = writers.get(code)
+            if writer is None:
+                writer = RawTickWriter(code, get_session_date_str(datetime.now()))
+                writers[code] = writer
+                # Retain the legacy alias for startup bar rebuild callers.
+                if self.contract and code == self.contract.code:
+                    self._tick_writer = writer
+            writer.write(tick)
         except Exception:
             # Never let a CSV write failure crash the tick callback
             pass
@@ -2221,6 +2229,8 @@ class FuturesMonitor:
 
         if is_far_tick:
             self._accumulate_far_tick(tick)
+            # Far ticks are first-class audit evidence, not merely bar input.
+            self._write_raw_tick(tick)
             # 2026-05-27 Gemini CLI: Real-time MTS Execution on Far Tick (Contract 1)
             _mts_enabled = self.cfg.get("mts", {}).get("enabled", False)
             if _mts_enabled and not self.dry_run:
