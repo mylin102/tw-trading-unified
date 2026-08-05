@@ -205,7 +205,13 @@ def _compute_trade_pnl(data: dict, fills_path: str = None) -> dict:
 
     # 2+3. leg fills: canonical realized sum, else price backfill
     entries = {e.get("leg"): e for e in data.get("entries", [])}
+    # A released leg is a realized close just like the remaining-leg EXIT.
+    # Excluding it made KPI aggregation count only the profitable remaining
+    # leg and classify losing spreads as wins.
     exit_fills = [f for f in data.get("exit_fills", []) if int(f.get("qty") or 0) > 0]
+    release_fill = data.get("release")
+    if release_fill and int(release_fill.get("qty") or 0) > 0:
+        exit_fills.append(release_fill)
     if not exit_fills:
         return {"net_pnl": None, "gross_pnl": None, "pnl_source": "UNAVAILABLE",
                 "audit_status": "PRE_FIX_UNAUDITABLE", "theoretical_pnl": theoretical,
@@ -221,7 +227,7 @@ def _compute_trade_pnl(data: dict, fills_path: str = None) -> dict:
         entry = entries.get(leg)
         # canonical fill (Phase A): realized_pnl present + provenance fields
         rp = f.get("realized_pnl")
-        if rp is not None and f.get("position_effect") == "CLOSE":
+        if rp is not None and (f.get("position_effect") == "CLOSE" or f.get("fill_type") == "RELEASE"):
             total += float(rp)
             computed += 1
             continue
