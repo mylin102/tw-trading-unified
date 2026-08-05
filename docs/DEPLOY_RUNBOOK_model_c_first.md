@@ -29,9 +29,18 @@ Correct sequence:
 3. IMMEDIATELY: pm2 stop trading-system   (old code must not re-enter)
 4. confirm: PID gone, broker=0, working orders=0
 5. start release 806b19f1 trading-system (--only, canonical config)
-6. NEW runtime reads the EXISTING flag -> entry locked from first tick
-7. 120s observe-only
-8. validation passed -> DELETE flag (entry resumes)
+   - MUST start from the release source tree explicitly; PM2 must NOT
+     accidentally keep using the old source tree. Verify the running
+     process's cwd/script path resolves into the release worktree
+     (e.g. pm2 describe trading-system -> exec cwd == release worktree)
+     before proceeding.
+6. NEW runtime reads the EXISTING flag -> every entry evaluation on the
+   new runtime reads the lock, so it will not create a new ENTRY.
+   Existing positions can still only exit naturally / via risk controls.
+7. 120s observe-only (gate 3 execution-boundary checks)
+8. lock is held until ALL of: post-start broker reconciliation, the four
+   subscriptions, AND the 120s soak pass — then DELETE flag (entry
+   resumes). The lock is NOT released merely because the process started.
 ```
 
 Abort rule: if a NEW ENTRY appears between FLAT confirmation and `pm2
