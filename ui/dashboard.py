@@ -6298,23 +6298,13 @@ elif page == "設定":
                     # Step 2: Inform user about mandatory manual .env edit
                     st.error("🔒 **【重要提醒：需手動修改 .env】** 系統已更新雙 YAML 設定檔為 `live_trading: true`。請手動修改 `.env` 檔案，將 `PAPER_MODE=true` 改為 `PAPER_MODE=false` 實盤方可真正下單！")
 
-                    # Step 3: Execute pm2 stop trading system & request manual restart
-                    try:
-                        import subprocess as _sp
-                        _sp.run(["pm2", "stop", "trading"], check=False)
-                        _sp.run(["pm2", "stop", "pm2-trading"], check=False)
-                        st.warning("🛑 **PM2 交易服務已自動執行 `pm2 stop` 停止**。手動修改 `.env` 檔案後，請執行 `pm2 restart trading` 重新啟動交易系統！")
-                    except Exception as _pe:
-                        st.warning("🛑 已嘗試停止 PM2 交易服務，修改 `.env` 後請手動執行 `pm2 restart trading`。")
+                    # Step 3: 遵守 Commit 224cab05 P0 規則：Dashboard 禁止直接呼叫 PM2 或發送重啟
+                    # 2026-08-05 Antigravity AI: Strict compliance with Commit 224cab05 P0 rule (No direct PM2 invocation from dashboard)
+                    st.info("📋 **部署提醒**：設定已更新。請依據 Deployment Contract 手動執行 pm2/部署流程。")
                 else:
-                    # 2026-08-05 Antigravity AI: Revert to Paper Mode Protocol
-                    # 1. Inform user that futures.yaml & futures_night.yaml are both updated to live_trading: false
-                    # 2. Suggest restoring PAPER_MODE=true in .env to enforce double safety lock
-                    # 3. Automatically trigger_restart() to restart PM2 in paper mode
+                    # 2026-08-05 Antigravity AI: Pure notice for Revert to Paper Mode (No PM2 invocation)
                     st.info("ℹ️ **已切回 Paper 模擬模式**：已同步將雙 YAML 設定檔 (`futures.yaml` & `futures_night.yaml`) 設為 `live_trading: false`。")
-                    st.info("💡 **雙重防護建議**：若先前曾手動將 `.env` 修改為 `PAPER_MODE=false`，建議將其改回 `PAPER_MODE=true` 以補回最高安全鎖。")
-                    trigger_restart()
-                    st.info("🔄 **重啟交易服務**：PM2 重啟指令已送出，交易程序將在約 30 秒後以 Paper 模擬模式運行。")
+                    st.info("💡 **雙重防護建議**：若先前曾手動將 `.env` 修改為 `PAPER_MODE=false`，請手動將其改回 `PAPER_MODE=true` 補回最高安全鎖。")
                 # 2026-06-30 Hermes Agent: Hold success message for 3s before rerun
                 import time as _time
                 _time.sleep(3)
