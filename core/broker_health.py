@@ -60,27 +60,26 @@ _CLASS_POLICY = {
 def classify_broker_error(exc: BaseException) -> BrokerErrorClass:
     """Classify an exception from Shioaji list_positions / order calls.
 
-    Uses exception type + message heuristics. Never raises.
+    Uses class-name + message heuristics (deliberately NOT isinstance against
+    shioaji classes — module identity breaks under fakes and import order).
+    Never raises.
     """
-    import shioaji as sj
-
     name = type(exc).__name__
     msg = str(exc)
+    mod = type(exc).__module__ or ""
 
-    if isinstance(exc, (sj.TokenError, sj.AuthError, sj.AccountNotSignError)):
+    if name in ("TokenError", "AuthError", "AccountNotSignError", "AccountNotProvideError"):
         return BrokerErrorClass.AUTHENTICATION_FAILURE
-    if isinstance(exc, sj.SystemMaintenance):
+    if name in ("SystemMaintenance",):
         return BrokerErrorClass.MAINTENANCE
-    if isinstance(exc, sj.ServerError):
+    if name in ("ServerError",):
         # HTTP 5xx -> transient server; 429 rate limit
         if "429" in msg or "rate" in msg.lower():
             return BrokerErrorClass.RATE_LIMITED
         return BrokerErrorClass.TRANSIENT_SERVER_5XX
-    if isinstance(exc, sj.BadRequestError):
+    if name in ("BadRequestError", "ValidationError"):
         return BrokerErrorClass.REQUEST_VALIDATION_FAILURE
-    if isinstance(exc, sj.ValidationError):
-        return BrokerErrorClass.REQUEST_VALIDATION_FAILURE
-    if "ShioajiTimeoutError" in name or "Timeout" in name:
+    if "Timeout" in name:
         return BrokerErrorClass.NETWORK_TIMEOUT
     if "ConnectionError" in name or "ConnectionReset" in name or isinstance(exc, OSError):
         return BrokerErrorClass.CONNECTION_RESET
