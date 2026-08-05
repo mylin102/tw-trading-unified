@@ -309,6 +309,39 @@ with st.sidebar:
     _session_label = "🌙 夜盤" if _CURRENT_SESSION_NIGHT else "☀️ 日盤"
     _session_color = "#7c3aed" if _CURRENT_SESSION_NIGHT else "#f59e0b"
     st.markdown(f"<span style='color:{_session_color};font-weight:bold'>{_session_label}</span> — 設定檔: `{FUTURES_CFG_NAME}`", unsafe_allow_html=True)
+
+    # Cross-process safety status. Dashboard is read-only: it must never
+    # change the trading entry gate or process lifecycle.
+    try:
+        from core.channel_safety import read_persisted_safety_snapshot
+
+        _safety_snapshot = read_persisted_safety_snapshot()
+    except Exception:
+        _safety_snapshot = None
+
+    st.markdown("🛡️ **交易安全閘門 (Trading Safety Gate)**")
+    if not _safety_snapshot:
+        st.warning("⚠️ 尚未取得 trading-system 安全狀態；新進場應視為封鎖。")
+    elif not _safety_snapshot.get("entry_allowed", False):
+        _blocked_reason = _safety_snapshot.get("entry_blocked_reason") or "UNKNOWN"
+        _detail = _safety_snapshot.get("account_degraded_message")
+        st.error(f"⛔ 新進場已封鎖：{_blocked_reason}")
+        if _blocked_reason == "RECONCILIATION_PENDING":
+            st.caption("重啟後尚未完成券商持倉／委託對帳；請等待 trading-system 完成或人工處理。")
+        elif _detail:
+            st.caption(str(_detail))
+    else:
+        st.success("✅ 新進場安全閘門已解除（券商對帳完成）")
+
+    if _safety_snapshot and _safety_snapshot.get("updated_at"):
+        try:
+            _safety_updated = datetime.datetime.fromtimestamp(
+                float(_safety_snapshot["updated_at"])
+            ).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            st.caption(f"安全狀態最後更新：{_safety_updated}")
+        except (TypeError, ValueError, OSError):
+            st.caption("安全狀態最後更新時間無法解析")
+
     # ── [GSD 4.13] System Readiness Indicators (Pillar 4) ──
     st.markdown("🚦 **系統狀態 (Readiness)**")
     

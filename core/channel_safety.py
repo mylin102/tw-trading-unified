@@ -17,8 +17,12 @@ Design:
 
 from __future__ import annotations
 
+import json
+import os
 import threading
+import time
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 
@@ -36,6 +40,34 @@ class AccountDegradedReason(str, Enum):
     SHIOAJI_CONNECTION_ERROR = "SHIOAJI_CONNECTION_ERROR"   # Solace NotReady
     LIST_POSITIONS_FAILED = "LIST_POSITIONS_FAILED"         # Generic failure
     RECONCILIATION_PENDING = "RECONCILIATION_PENDING"       # Restart, not yet synced
+
+
+SAFETY_STATUS_PATH = Path(
+    os.environ.get("TRADING_SAFETY_STATUS_PATH", "/tmp/tw_trading_safety_state.json")
+)
+
+
+def _write_safety_snapshot(snapshot: dict[str, Any]) -> None:
+    """Atomically publish cross-process safety state for read-only consumers."""
+    try:
+        SAFETY_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = SAFETY_STATUS_PATH.with_name(
+            f".{SAFETY_STATUS_PATH.name}.{os.getpid()}.tmp"
+        )
+        temporary_path.write_text(json.dumps(snapshot, ensure_ascii=False, sort_keys=True))
+        os.replace(temporary_path, SAFETY_STATUS_PATH)
+    except OSError:
+        # Status export must never weaken or crash the in-process entry gate.
+        return
+
+
+def read_persisted_safety_snapshot(path: Path | None = None) -> dict[str, Any] | None:
+    """Read the trading-process safety snapshot without sharing process memory."""
+    try:
+        payload = json.loads((path or SAFETY_STATUS_PATH).read_text())
+        return payload if isinstance(payload, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 # ── Safety State ──
@@ -70,6 +102,9 @@ class ChannelSafetyState:
 
         # Degraded entry block
         self._entry_blocked_reason: str | None = None
+        self._updated_at: float = time.time()
+        # Replace any stale status left by a previous process before broker sync.
+        self._publish_locked()
 
     # ── Account Channel ──
 
@@ -94,6 +129,7 @@ class ChannelSafetyState:
             self._account_degraded_reason = AccountDegradedReason.NONE
             self._account_degraded_at = None
             self._account_degraded_message = None
+            self._publish_locked()
 
     def set_account_degraded(self, reason: AccountDegradedReason, message: str | None = None) -> None:
         with self._lock:
@@ -101,6 +137,7 @@ class ChannelSafetyState:
             self._account_degraded_reason = reason
             self._account_degraded_at = __import__("time").time()
             self._account_degraded_message = message
+            self._publish_locked()
 
     # ── Reconciliation ──
 
@@ -113,12 +150,14 @@ class ChannelSafetyState:
         with self._lock:
             self._reconciled_after_restart = True
             self._reconciled_at = __import__("time").time()
+            self._publish_locked()
 
     def reset_reconciled(self) -> None:
         """Call on process start before first broker sync."""
         with self._lock:
             self._reconciled_after_restart = False
             self._reconciled_at = None
+            self._publish_locked()
 
     # ── Entry Gate ──
 
@@ -154,7 +193,20 @@ class ChannelSafetyState:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return {
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict[str, Any]:
+        entry_allowed = (
+            self._reconciled_after_restart
+            and self._account_health == ChannelHealth.HEALTHY
+        )
+        blocked_reason = self._entry_blocked_reason
+        if not entry_allowed and not blocked_reason:
+            if not self._reconciled_after_restart:
+                blocked_reason = "RECONCILIATION_PENDING"
+            elif self._account_health in (ChannelHealth.DEGRADED, ChannelHealth.FAILED):
+                blocked_reason = f"ACCOUNT_DEGRADED:{self._account_degraded_reason.value}"
+        return {
                 "quote_health": self._quote_health.value,
                 "account_health": self._account_health.value,
                 "order_health": self._order_health.value,
@@ -162,9 +214,16 @@ class ChannelSafetyState:
                 "account_degraded_at": self._account_degraded_at,
                 "reconciled_after_restart": self._reconciled_after_restart,
                 "reconciled_at": self._reconciled_at,
-                "entry_allowed": self._reconciled_after_restart and self._account_health == ChannelHealth.HEALTHY,
-                "entry_blocked_reason": self._entry_blocked_reason,
-            }
+                "entry_allowed": entry_allowed,
+                "entry_blocked_reason": blocked_reason,
+                "account_degraded_message": self._account_degraded_message,
+                "updated_at": self._updated_at,
+                "pid": os.getpid(),
+        }
+
+    def _publish_locked(self) -> None:
+        self._updated_at = time.time()
+        _write_safety_snapshot(self._snapshot_locked())
 
 
 # ── Module-level singleton ──

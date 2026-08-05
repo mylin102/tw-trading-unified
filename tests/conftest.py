@@ -40,6 +40,7 @@ os.environ["SJ_LOG_PATH"] = "/tmp/shioaji.log"
 os.environ["MTS_FILL_LOG_PATH"] = "/tmp/test_mts_trade_fills.jsonl"
 os.environ["MTS_EVENT_LOG_PATH"] = "/tmp/test_mts_spread_events.jsonl"
 os.environ["MTS_STATE_PATH"] = "/tmp/test_mts_position_state.json"
+os.environ["TRADING_SAFETY_STATUS_PATH"] = "/tmp/test_tw_trading_safety_state.json"
 
 
 
