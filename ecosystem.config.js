@@ -30,6 +30,7 @@ module.exports = {
       env: {
         PYTHONPATH: PROJECT_ROOT, 
         PYTHONUNBUFFERED: "1",    // 💡 關鍵：解除快取，確保 pm2 logs 能即時跳出 print 訊息
+        TRADING_RUNTIME_DIR: "/Users/myllin_mini/Documents/mylin102/tw-trading-unified-runtime",
         NODE_ENV: "production"
       }
     },
@@ -50,7 +51,8 @@ module.exports = {
       pid_file: path.join(PROJECT_ROOT, "logs/pm2-dashboard.pid"),
       env: {
         PYTHONPATH: PROJECT_ROOT, 
-        PYTHONUNBUFFERED: "1",    // 💡 關鍵：Streamlit 輸出同步不延遲
+        PYTHONUNBUFFERED: "1",    // 💡 關鍵：Streamlit 輸出同步不延遁
+        TRADING_RUNTIME_DIR: "/Users/myllin_mini/Documents/mylin102/tw-trading-unified-runtime",
         NODE_ENV: "production"
       }
     },

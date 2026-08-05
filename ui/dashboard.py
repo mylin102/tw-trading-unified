@@ -220,6 +220,7 @@ h3 { font-size: 1.1rem !important; }
 """, unsafe_allow_html=True)
 
 BASE = Path(__file__).parent.parent
+from core.runtime_paths import runtime_path
 # GSD: Align DATE_STR with the ACTIVE trading session date (e.g. after 15:00 today, it's tomorrow's date)
 DATE_STR = get_session_date_str(datetime.datetime.now())
 # 新增：交易記錄日期，使用 get_trade_day 確保與交易記錄文件一致
@@ -654,8 +655,8 @@ def render_volatility_regime_section():
 
 
 OPTIONS_REPO = BASE / "strategies" / "options"
-FUTURES_MKT = BASE / "logs" / "market_data"
-FUTURES_TRADES = BASE / "exports" / "trades"
+FUTURES_MKT = Path(runtime_path("logs", "market_data"))
+FUTURES_TRADES = Path(runtime_path("exports", "trades"))
 OPTIONS_DATA = OPTIONS_REPO / "logs" / ("live_trading" if o_live else "paper_trading")
 
 # ── Filter by latest Trading Day ──
@@ -3155,7 +3156,7 @@ elif _selected_product == "TMF":
                     _archived = 0
                     # Archive fill/event logs instead of deleting
                     for _log_name in ["mts_trade_fills.jsonl", "mts_spread_events.jsonl"]:
-                        _log_path = os.path.join(_base, "logs", _log_name)
+                        _log_path = runtime_path("logs", _log_name)
                         if os.path.exists(_log_path) and os.path.getsize(_log_path) > 0:
                             _ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                             _archive_dir = os.path.join(_base, "logs", "archive")
@@ -3786,7 +3787,7 @@ elif _selected_product == "TMF":
 
                 # ── MTS 個別委託 (from mts_trade_fills.jsonl) ──
                 try:
-                    _fills_path = os.path.join(BASE, "logs/mts_trade_fills.jsonl")
+                    _fills_path = runtime_path("logs", "mts_trade_fills.jsonl")
                     _trade_id = _mts_state.get("trade_id", "")
                     if _trade_id and os.path.exists(_fills_path):
                         _order_rows = []
@@ -3864,8 +3865,8 @@ elif _selected_product == "TMF":
         print(f"[PERF] mts_state_section: {time.time()-_pt_data:.3f}s")
 
     # 2026-07-08 Gemini CLI: Calculate and render MTS daily performance metrics on the dashboard
-    _fills_path = os.path.join(BASE, "logs/mts_trade_fills.jsonl")
-    _events_path = os.path.join(BASE, "logs/mts_spread_events.jsonl")
+    _fills_path = runtime_path("logs", "mts_trade_fills.jsonl")
+    _events_path = runtime_path("logs", "mts_spread_events.jsonl")
     if os.path.exists(_fills_path):
         _dashed_today = f"{_today[:4]}-{_today[4:6]}-{_today[6:]}"
         _perf_data = calculate_mts_daily_performance(_fills_path, _events_path, _dashed_today)
@@ -4025,7 +4026,7 @@ elif _selected_product == "TMF":
 
     # ── Order Status Panel ──
     with st.expander("📤 委託單狀態 (Order Lifecycle)", expanded=False):
-        orders_path = BASE / "exports" / "trades"
+        orders_path = Path(runtime_path("exports", "trades"))
         # 2026-05-27 Gemini CLI: Generalize file patterns (no hardcoded TMF)
         _ui_ticker = futures_cfg.get("ticker", "TMF")
         order_files = list(orders_path.glob(f"{_ui_ticker}_{DATE_STR}_orders.json")) + list(orders_path.glob(f"{_ui_ticker}_*_orders.json"))
@@ -4419,7 +4420,7 @@ elif _selected_product == "TMF":
                 if not _mts_fallback_shown:
                     st.info("MTS 為 FLAT / IDLE 狀態：tick loop 正常，尚未達到進場條件，因此沒有委託或持倉。")
 
-                _fill_log_path = os.path.join(BASE, "logs/mts_trade_fills.jsonl")
+                _fill_log_path = runtime_path("logs", "mts_trade_fills.jsonl")
                 if os.path.exists(_fill_log_path):
                     try:
                         _fills = []
@@ -4849,7 +4850,7 @@ elif page == "選擇權 TXO":
                     src.write_text(header)
     
                     # Backup + clear orders JSON files (Order Lifecycle source)
-                    orders_path = BASE / "exports" / "trades"
+                    orders_path = Path(runtime_path("exports", "trades"))
                     for f in sorted(orders_path.glob("OPTIONS_*_orders.json")):
                         shutil.copy2(f, backup_dir / f.name)
                         f.unlink()
@@ -4869,7 +4870,7 @@ elif page == "選擇權 TXO":
     
         # ── Options Order Status Panel ──
         with st.expander("📤 選擇權委託單狀態 (Order Lifecycle)", expanded=False):
-            orders_path = BASE / "exports" / "trades"
+            orders_path = Path(runtime_path("exports", "trades"))
             order_files = list(orders_path.glob("OPTIONS_*_orders.json"))
             order_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
     
