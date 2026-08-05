@@ -88,3 +88,24 @@ def test_audit_rate_limited(flag_path, monkeypatch):
     finally:
         mod._append_event = _orig
     assert len(events) == 1
+
+
+# ── real-path regression (2026-08-05) ────────────────────────────────
+# tmf_spread.py sits at strategies/plugins/futures/active/ (4 dirs deep).
+# The flag must resolve to <repo_root>/data/maintenance_entry_lock.flag,
+# NOT strategies/data/... (the 5-dirname fix).
+
+def test_flag_resolves_to_repo_data_dir():
+    import os
+    # reset the cached path so the helper recomputes from __file__
+    mod._MAINT_LOCK_FLAG = None
+    mod._maintenance_entry_lock_active()
+    p = mod._MAINT_LOCK_FLAG
+    assert p is not None
+    assert p.endswith("data/maintenance_entry_lock.flag")
+    # must NOT be under strategies/
+    assert "strategies/data" not in p
+    # the computed repo root must contain strategies/ and core/
+    repo_root = os.path.dirname(os.path.dirname(p))  # data/ -> repo root
+    assert os.path.isdir(os.path.join(repo_root, "strategies"))
+    assert os.path.isdir(os.path.join(repo_root, "core"))

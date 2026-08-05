@@ -586,8 +586,10 @@ def _maintenance_entry_lock_active() -> bool:
     global _MAINT_LOCK_FLAG
     try:
         if _MAINT_LOCK_FLAG is None:
+            # tmf_spread.py sits at strategies/plugins/futures/active/ —
+            # 4 subdirs under repo root; 5 dirname calls reach the root.
             _repo = os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.dirname(os.path.abspath(__file__)))))
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
             _MAINT_LOCK_FLAG = os.path.join(_repo, "data",
                                             "maintenance_entry_lock.flag")
         return os.path.exists(_MAINT_LOCK_FLAG)
