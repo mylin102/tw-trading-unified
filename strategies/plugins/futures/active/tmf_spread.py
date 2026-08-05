@@ -575,6 +575,26 @@ def _commit_action(lifecycle: PositionLifecycle, decision: LifecycleDecision) ->
             lifecycle.exit_owner = "RELEASE"
 
 
+# ── Maintenance entry lock (2026-08-05) ──
+# data/maintenance_entry_lock.flag blocks NEW ENTRIES during controlled
+# deployment. Existing positions keep full monitoring/risk/exit. The flag is
+# read by the trading system itself (audited); Dashboard displays only.
+_MAINT_LOCK_FLAG = None  # resolved lazily (repo root unknown at import)
+
+
+def _maintenance_entry_lock_active() -> bool:
+    global _MAINT_LOCK_FLAG
+    try:
+        if _MAINT_LOCK_FLAG is None:
+            _repo = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__)))))
+            _MAINT_LOCK_FLAG = os.path.join(_repo, "data",
+                                            "maintenance_entry_lock.flag")
+        return os.path.exists(_MAINT_LOCK_FLAG)
+    except Exception:
+        return False
+
+
 def _append_event(event_type: str, **kwargs) -> None:
     """Append a lifecycle event to the MTS event ledger (append-only JSONL)."""
     # 2026-06-25 Gemini CLI: Skip event logging during backtesting
@@ -3317,6 +3337,19 @@ class TMFSpread(StrategyBase):
                 return None
         except Exception:
             pass
+
+        # ── [MAINT-LOCK] Maintenance entry lock (2026-08-05) ──
+        # Blocks NEW ENTRIES only; existing position risk/exit unaffected.
+        # Audited once per 5min (not per tick). Flag read by trading system.
+        if _maintenance_entry_lock_active():
+            _now_l = time.time()
+            if _now_l - float(getattr(self, "_maint_lock_log_ts", 0.0)) > 300.0:
+                self._maint_lock_log_ts = _now_l
+                _append_event("MAINTENANCE_ENTRY_LOCK", trade_id=self._trade_id,
+                              reason="maintenance_entry_lock_active",
+                              phase=str(getattr(self, "_lifecycle", "")))
+            self._set_eval(skip_reason="MAINTENANCE_ENTRY_LOCK")
+            return None
 
         # ── [Fix] Prevent duplicate submissions ──
         if self._lifecycle == "SUBMITTING":
