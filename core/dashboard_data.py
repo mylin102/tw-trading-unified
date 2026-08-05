@@ -1,7 +1,48 @@
 from __future__ import annotations
 
+import json
+from datetime import datetime
 import pandas as pd
 from pathlib import Path
+
+
+MTS_LIVE_STATE_PATH = Path("/tmp/mts_position_state.json")
+
+
+def read_mts_quote_freshness(
+    state_path: Path = MTS_LIVE_STATE_PATH,
+    *,
+    now: datetime | None = None,
+    max_heartbeat_age_seconds: float = 90.0,
+    max_quote_age_ms: float = 15_000.0,
+) -> dict[str, object]:
+    """Read the trading process' live quote heartbeat for display only.
+
+    Indicator CSV rows are completed bars, not a market-data heartbeat.  The
+    Dashboard uses this separate runtime state to avoid labelling a normal
+    incomplete bar as a Shioaji feed outage.
+    """
+    try:
+        payload = json.loads(state_path.read_text())
+        heartbeat_raw = payload.get("heartbeat_at") or payload.get("_updated")
+        heartbeat_at = datetime.fromisoformat(str(heartbeat_raw))
+        reference_now = now or datetime.now(tz=heartbeat_at.tzinfo)
+        heartbeat_age_seconds = max(
+            0.0, (reference_now - heartbeat_at).total_seconds()
+        )
+        quote_age_ms = float(payload["quote_age_ms"])
+        fresh = (
+            heartbeat_age_seconds <= max_heartbeat_age_seconds
+            and 0.0 <= quote_age_ms <= max_quote_age_ms
+        )
+        return {
+            "available": True,
+            "fresh": fresh,
+            "heartbeat_age_seconds": heartbeat_age_seconds,
+            "quote_age_ms": quote_age_ms,
+        }
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return {"available": False, "fresh": False}
 
 
 def _stable_string_identifier(value) -> str:

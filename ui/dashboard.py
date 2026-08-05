@@ -34,6 +34,7 @@ _STOCK_NAMES: dict[str, str] = {
 from core.dashboard_data import (
     build_stock_orders_from_trades,
     merge_indicator_frames,
+    read_mts_quote_freshness,
     extend_taifex_recess_continuity,
     resolve_preferred_or_latest_file,
     resolve_stock_orders_file,
@@ -2994,11 +2995,25 @@ elif _selected_product == "TMF":
         _same_trading_day = _last_trading_day == _today
         _market_open = is_taifex_futures_market_open() or session_type in ("day", "night")
 
-        if not data_fresh and _market_open:
+        _live_quote = read_mts_quote_freshness()
+        _bar_label = (
+            f"最後完整 indicator bar {last_ts.strftime('%H:%M')} "
+            f"({age_mins:.0f} 分鐘前)"
+            if pd.notna(last_ts)
+            else "最後完整 indicator bar 時間未知"
+        )
+
+        if _market_open and _live_quote.get("fresh", False):
+            _quote_age_ms = float(_live_quote["quote_age_ms"])
+            st.caption(
+                f"🟢 即時行情正常 · quote age {_quote_age_ms:.0f}ms · "
+                f"{_bar_label} · {session_label}"
+            )
+        elif not data_fresh and _market_open:
             last_ts_str = last_ts.strftime("%H:%M") if pd.notna(last_ts) else "?"
             st.warning(
-                f"⚠️ 資料停滯: 最後一筆 {last_ts_str} ({age_mins:.0f}分鐘前) "
-                f"| 目前 {session_label}"
+                f"⚠️ Indicator bar 停滯: 最後完整 bar {last_ts_str} "
+                f"({age_mins:.0f}分鐘前) | 即時行情狀態無法確認 | 目前 {session_label}"
             )
         elif not _market_open and pd.notna(last_ts):
             st.caption(f"📄 上次資料: {last_ts.strftime('%m/%d %H:%M')} ({age_mins:.0f}分鐘前) · 非交易時段")
