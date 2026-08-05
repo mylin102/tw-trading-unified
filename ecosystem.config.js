@@ -10,7 +10,10 @@ module.exports = {
     {
       name: "trading-system",
       script: "taskpolicy",
-      args: `-c background ${pythonPath} main.py --config futures,futures_mtx`,
+      // SSOT: futures.yaml owns both TMF and MTX product definitions.  A
+      // comma-separated config list creates multiple monitors and is never a
+      // production PM2 deployment mode.
+      args: `-c background ${pythonPath} main.py --config futures`,
       interpreter: "none",
       cwd: PROJECT_ROOT,
       restart_delay: 15000,        // 💡 關鍵：15秒延遲重啟，對齊原設計並保護券商連線
