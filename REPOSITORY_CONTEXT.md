@@ -1,6 +1,6 @@
 # tw-trading-unified-git — Repository Context for Codex CLI
 
-**Last Updated:** 2026-08-04 (afternoon — on_tick correction + runtime evidence)
+**Last Updated:** 2026-08-06 (deployment directory layout)
 
 ---
 
@@ -47,6 +47,28 @@ Monitor (f_mon.on_tick — monitor.py:1686)
 Only the strategy runtime may submit orders.
 
 Shadow collectors are STRICTLY READ ONLY.
+
+---
+
+# Deployment Directory Layout
+
+~/Documents/mylin102/ contains FOUR tw-trading-unified trees. Do not confuse them:
+
+| Path | Role | Who points at it |
+|---|---|---|
+| `tw-trading-unified-git` | **ONLY git repo.** All code fixes & commits land here (branch `feature/spread-renko-shadow`). | PM2 **dashboard** runs from here (cwd=repo). crontab `cd` target. `REPOSITORY_CONTEXT.md` lives here. |
+| `tw-trading-unified-releases/<full-sha>/` | **Immutable deploy trees**, one per pinned SHA (`8d8e8701…` retired, `9276629e…` A=emergency-close fix, `4adda0be…` B=+telemetry, current). | PM2 **trading-system** cwd = physical SHA dir. Rollback = point pm2 at an older SHA tree (seconds). Inside: `data/ logs/ exports/` are symlinks → runtime; `.venv/ .env` symlink → repo. |
+| `tw-trading-unified-runtime/` | **Single runtime-data authority** (`TRADING_RUNTIME_DIR`): `logs/` (pm2 out/err, `mts_trade_fills.jsonl`, `mts_spread_events.jsonl`), `data/`, `exports/`, `audit/`. | PM2 env `TRADING_RUNTIME_DIR` → dashboard reads ledgers via `core/runtime_paths.py`. Every release tree's `data/logs/exports` link here, so restarts/rollbacks never lose data and there is no split-brain. |
+| `tw-trading-unified-archive/` | **Historical archive** (old docs, superseded configs marked `redirect+ARCHIVED`). READ-ONLY, do not delete. | Reference only. |
+
+Flow:
+
+```
+git ──build/release──▶ releases/<SHA> (immutable) ──symlink──▶ runtime (live data)
+archive = history (read-only reference)
+```
+
+Also present (unrelated): `squeeze-backtest/` (research workspace).
 
 ---
 
