@@ -1697,8 +1697,12 @@ class FuturesMonitor:
                 self._f_shadow_funnel = {
                     "hook_enter": 0, "target_contract": 0, "bbos_extracted": 0,
                     "bbos_valid": 0, "envelope_created": 0, "pair_cache_updated": 0,
-                    "pair_ready": 0, "pair_rejected": 0, "mc_eval_called": 0,
-                    "mc_eval_returned": 0, "f_eval_called": 0, "f_eval_returned": 0,
+                    "pair_ready": 0, "pair_rejected": 0,
+                    # 2026-08-05: mc_eval_called/mc_eval_returned removed —
+                    # Model C has no evaluate() (dead counters looked like
+                    # runtime failures at 0). f_eval_* are REAL (wired to the
+                    # exit_shadow_f evaluate() call site below).
+                    "f_eval_called": 0, "f_eval_returned": 0,
                     "telemetry_enqueued": 0, "telemetry_write_ok": 0,
                     "telemetry_write_err": 0, "telemetry_dropped": 0,
                     "reasons": {},
@@ -1788,8 +1792,12 @@ class FuturesMonitor:
                 _f = {
                     "hook_enter": 0, "target_contract": 0, "bbos_extracted": 0,
                     "bbos_valid": 0, "envelope_created": 0, "pair_cache_updated": 0,
-                    "pair_ready": 0, "pair_rejected": 0, "mc_eval_called": 0,
-                    "mc_eval_returned": 0, "f_eval_called": 0, "f_eval_returned": 0,
+                    "pair_ready": 0, "pair_rejected": 0,
+                    # 2026-08-05: mc_eval_called/mc_eval_returned removed —
+                    # Model C has no evaluate() (dead counters looked like
+                    # runtime failures at 0). f_eval_* are REAL (wired to the
+                    # exit_shadow_f evaluate() call site below).
+                    "f_eval_called": 0, "f_eval_returned": 0,
                     "telemetry_enqueued": 0, "telemetry_write_ok": 0,
                     "telemetry_write_err": 0, "telemetry_dropped": 0,
                     "reasons": {},
@@ -1957,6 +1965,7 @@ class FuturesMonitor:
                             settlement_id=f"{self._f_shadow_gen}:{_st.get('settlement_ts') or _now_t}")
                     _age_ms = (time.time() - self._f_shadow_state_ts) * 1000.0 if self._f_shadow_state_ts else 999999.0
                     if _has_pos and _c.pair_ready() and _age_ms < 5000.0:
+                        self._f_funnel("f_eval_called")
                         _ev = _c.evaluate({
                             "trade_id": _st.get("trade_id"),
                             "position_generation": _st.get("trade_id"),
@@ -1975,6 +1984,7 @@ class FuturesMonitor:
                             "state_age_ms": round(_age_ms, 1),
                             "state_file_mtime": getattr(self, "_f_shadow_state_mtime", None),
                         })
+                        self._f_funnel("f_eval_returned")
                         if _ev:
                             _c.record_production_decision(
                                 {"trade_id": _st.get("trade_id"),
