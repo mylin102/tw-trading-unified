@@ -37,7 +37,7 @@ module.exports = {
     {
       name: "dashboard",
       script: "taskpolicy",
-      args: `-c background ${pythonPath} -m streamlit run ui/dashboard.py --server.port 8500 --server.fileWatcherType none`,
+      args: `-c background ${pythonPath} -m streamlit run ui/dashboard.py --server.port 8500 --server.headless=true --server.address 0.0.0.0 --server.fileWatcherType none`,
       interpreter: "none",
       cwd: PROJECT_ROOT,
       restart_delay: 5000,
