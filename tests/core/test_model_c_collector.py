@@ -238,3 +238,54 @@ def test_positive_exchange_age_keeps_valid():
     acc = c.latest_accepted
     assert acc["near_timestamp_quality"] == "VALID"
     assert acc["near_quote_age_ms"] == pytest.approx(50, abs=20)
+
+
+# ── 2026-08-05 bounded observation ──────────────────────────────────────
+
+def test_sample_rate_zero_drops_normal_keeps_anomaly(tmp_path):
+    import datetime
+    c, p = _mk(str(tmp_path))
+    c.sample_rate = 0.0
+    # normal accepted pair (no anomaly) -> sampled out
+    _q(c, "NEAR", 100.0, 102.0, age_ms=None, exchange_ts=None)
+    _q(c, "FAR", 200.0, 202.0, age_ms=None, exchange_ts=None)
+    acc = c.latest_accepted
+    recs = _read(p)
+    assert c.counters["accepted"] == 1          # counters always accumulate
+    assert c.counters["sampled_out"] == 1       # sampled out
+    assert all(r.get("event_type") != "MODEL_C_PAIR_ACCEPTED" for r in recs)  # not written
+
+
+def test_anomaly_always_written(tmp_path):
+    import datetime
+    c, p = _mk(str(tmp_path))
+    c.sample_rate = 0.0
+    # force a rejection (near missing)
+    _q(c, "NEAR", 100.0, 102.0, age_ms=None, exchange_ts=None)
+    _q(c, "NEAR", 105.0, 107.0, age_ms=None, exchange_ts=None)  # far never sent
+    rejs = [r for r in _read(p) if r.get("event_type") == "MODEL_C_PAIR_REJECTED"]
+    assert rejs, "rejection must be written even at sample_rate=0"
+    assert c.counters["anomaly_written"] >= 1
+
+
+def test_daily_cap_enforced(tmp_path):
+    c, p = _mk(str(tmp_path))
+    c.max_records_per_day = 3
+    c.sample_rate = 1.0
+    for i in range(6):
+        _q(c, "NEAR", 100.0 + i, 102.0 + i, age_ms=10)
+        _q(c, "FAR", 200.0 + i, 202.0 + i, age_ms=10)
+    recs = [r for r in _read(p) if r.get("event_type") == "MODEL_C_PAIR_ACCEPTED"]
+    assert len(recs) <= 3, f"daily cap breached: {len(recs)}"
+
+
+def test_full_capture_flag_overrides_sampling(tmp_path):
+    c, p = _mk(str(tmp_path))
+    c.sample_rate = 0.0
+    flag = os.path.join(str(tmp_path), "full.flag")
+    c._full_capture_flag = flag
+    open(flag, "w").close()
+    _q(c, "NEAR", 100.0, 102.0, age_ms=None, exchange_ts=None)
+    _q(c, "FAR", 200.0, 202.0, age_ms=None, exchange_ts=None)
+    recs = [r for r in _read(p) if r.get("event_type") == "MODEL_C_PAIR_ACCEPTED"]
+    assert recs, "full-capture flag must force write despite sample_rate=0"

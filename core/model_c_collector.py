@@ -89,7 +89,10 @@ def _classify_exchange_ts(exchange_ts):
 
 class ModelCCollector:
     def __init__(self, telemetry_path: str, max_quote_age_ms: int = MAX_QUOTE_AGE_MS,
-                 max_pair_skew_ms: int = MAX_PAIR_SKEW_MS, bbo_raw_path: str | None = None):
+                 max_pair_skew_ms: int = MAX_PAIR_SKEW_MS, bbo_raw_path: str | None = None,
+                 sample_rate: float = 1.0, snapshot_every: int = 1000,
+                 max_records_per_day: int = 2_000_000,
+                 full_capture_flag: str | None = None):
         self._path = telemetry_path
         self._bbo_raw_path = bbo_raw_path
         self.max_age = max_quote_age_ms
@@ -99,9 +102,20 @@ class ModelCCollector:
         self._episodes = {}   # key -> episode dict
         self._episode_seq = 0
         self.counters = {"pairing_attempts": 0, "accepted": 0, "rejected": 0,
-                         "bbos": 0, "episodes": 0}
+                         "bbos": 0, "episodes": 0,
+                         # 2026-08-05 bounded observation
+                         "sampled_out": 0, "anomaly_written": 0,
+                         "writer_errors": 0, "snapshots_written": 0}
         self.latest_accepted = None   # last accepted pair snapshot (for trigger ref)
         self.latest_pair = None       # last attempted pair (accepted or rejected)
+        # ── bounded observation (2026-08-05) ──
+        self.sample_rate = max(0.0, min(1.0, float(sample_rate)))
+        self.snapshot_every = max(1, int(snapshot_every))
+        self.max_records_per_day = max(1000, int(max_records_per_day))
+        self._full_capture_flag = full_capture_flag
+        self._written_today = 0
+        self._sampled = 0.0          # fractional counter for sampling
+        self._since_snapshot = 0
         os.makedirs(os.path.dirname(self._path), exist_ok=True)
 
     # ── quote ingest ────────────────────────────────────────────────────
@@ -237,6 +251,13 @@ class ModelCCollector:
             "model_version": MODEL_C_VERSION, "shadow_only": True,
             "timestamp": _now_iso(),
         }
+        _hist = getattr(self, "_skew_history", None)
+        if _hist is None:
+            _hist = self._skew_history = []
+        if skew is not None:
+            _hist.append(skew)
+            if len(_hist) > 5000:
+                del _hist[:1000]
         self._write(rec)
         self.latest_accepted = rec
         self.latest_pair = rec
@@ -353,14 +374,92 @@ class ModelCCollector:
             self._episodes = {}
 
     def _write(self, rec):
-        with open(self._path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, default=str) + "\n")
+        """Write a record with bounded-observation policy.
+
+        - anomaly records (rejected, non-VALID quality, skew breach) are
+          ALWAYS written
+        - normal accepted pairs are sampled by self.sample_rate
+        - counters always accumulate; percentile snapshots every
+          snapshot_every accepted pairs
+        - daily line cap (max_records_per_day) guards disk growth
+        - a debug flag file forces full capture temporarily
+        """
+        import random as _random
+        _full = False
+        if self._full_capture_flag:
+            try:
+                _full = os.path.exists(self._full_capture_flag)
+            except Exception:
+                _full = False
+        _anomaly = bool(rec.get("event_type") == "MODEL_C_PAIR_REJECTED"
+                        or rec.get("timestamp_quality") not in (None, EXCHANGE_TS_VALID)
+                        or (rec.get("event_type") == "MODEL_C_PAIR_ACCEPTED"
+                            and rec.get("receive_pair_skew_ms") is not None
+                            and rec.get("receive_pair_skew_ms", 0) > self.max_skew))
+        _write_it = _full or _anomaly
+        if not _write_it:
+            self._sampled += self.sample_rate
+            if self._sampled >= 1.0:
+                self._sampled -= 1.0
+                _write_it = True
+            else:
+                self.counters["sampled_out"] += 1
+        if _anomaly:
+            self.counters["anomaly_written"] += 1
+        if self._written_today >= self.max_records_per_day:
+            return  # daily cap reached — drop silently (counters still count)
+        if not _write_it:
+            return
+        try:
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, default=str) + "\n")
+            self._written_today += 1
+            if rec.get("event_type") == "MODEL_C_PAIR_ACCEPTED":
+                self._since_snapshot += 1
+                if self._since_snapshot >= self.snapshot_every:
+                    self._since_snapshot = 0
+                    self._write_snapshot()
+        except Exception:
+            self.counters["writer_errors"] += 1
+
+    def _write_snapshot(self):
+        """Periodic percentile snapshot (bounded observation)."""
+        import statistics as _st
+        _sk = [float(v) for v in getattr(self, "_skew_history", [])[-2000:]]
+        rec = {
+            "event_type": "MODEL_C_SNAPSHOT",
+            "counters": dict(self.counters),
+            "receive_skew_p50": _st.median(_sk) if _sk else None,
+            "receive_skew_p95": sorted(_sk)[int(len(_sk)*0.95)] if _sk else None,
+            "sample_rate": self.sample_rate,
+            "written_today": self._written_today,
+            "timestamp": _now_iso(),
+        }
+        try:
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, default=str) + "\n")
+            self.counters["snapshots_written"] += 1
+        except Exception:
+            self.counters["writer_errors"] += 1
 
     def _write_bbo_raw(self, quote):
         if not self._bbo_raw_path:
             return
-        with open(self._bbo_raw_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"event_type": "BBO_UPDATE", **quote}, default=str) + "\n")
+        _full = False
+        if self._full_capture_flag:
+            try:
+                _full = os.path.exists(self._full_capture_flag)
+            except Exception:
+                _full = False
+        if not _full and self.sample_rate < 1.0:
+            import random as _random
+            if _random.random() > self.sample_rate:
+                return
+        try:
+            with open(self._bbo_raw_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"event_type": "BBO_UPDATE", **quote}, default=str) + "\n")
+        except Exception:
+            self.counters["writer_errors"] += 1
 
     def snapshot(self):
         with self._lock:
