@@ -1878,6 +1878,23 @@ class FuturesMonitor:
         the tick path; _extract_bbo enforces BBO_VALID-only consumption.
         Never falls back to last/close or buy_price/sell_price.
         """
+        # Cache real BBO for both legs regardless of the Model C canary.  Policy J
+        # and post-trade replay need this evidence even while Model C is disabled.
+        try:
+            _code_cache = str(getattr(bidask, "code", "") or "").split("/")[-1].strip()
+            _bbo_cache = _extract_bbo(bidask) if bidask is not None else None
+            _nset_cache = getattr(self, "_canonical_near_codes", set())
+            _fset_cache = getattr(self, "_canonical_far_codes", set())
+            if _bbo_cache and _bbo_cache[2] == "BBO_VALID":
+                _key = (str(getattr(self, "ticker", "TMF")) if _code_cache in _nset_cache
+                        else str(getattr(self, "ticker", "TMF")) + "_FAR" if _code_cache in _fset_cache
+                        else None)
+                if _key:
+                    _slot = self.market_data.setdefault(_key, {})
+                    _slot.update({"bid": _bbo_cache[0], "ask": _bbo_cache[1],
+                                  "bidask_at": time.time(), "bidask_exchange_ts": getattr(bidask, "datetime", None)})
+        except Exception:
+            pass
         try:
             _mc_flag = os.path.join(_repo_root(), "data", "model_c_canary.flag")
             if not os.path.exists(_mc_flag):

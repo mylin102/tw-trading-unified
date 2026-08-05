@@ -1,7 +1,7 @@
 # 2026-07-31 Antigravity: P0 Tick Routing Near/Far Isolation Test
 import time
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from strategies.futures.monitor import FuturesMonitor
 
 def test_far_month_tick_does_not_pollute_near_month_price():
@@ -73,3 +73,24 @@ def test_far_month_tick_does_not_pollute_near_month_price():
     assert mon.market_data["TMF_NEAR"]["close"] == 43680.0
     assert mon.market_data["TMFH6"]["close"] == 43680.0
 
+
+
+def test_bidask_cache_updates_when_model_c_canary_is_disabled():
+    mon = FuturesMonitor.__new__(FuturesMonitor)
+    mon.market_data = {}
+    mon.ticker = "TMF"
+    mon._canonical_near_codes = {"TMFH6"}
+    mon._canonical_far_codes = {"TMFI6"}
+
+    bidask = MagicMock()
+    bidask.code = "TMFI6"
+    bidask.bid_price = [44400.0]
+    bidask.ask_price = [44405.0]
+    bidask.datetime = "2026-08-05T21:00:00"
+
+    with patch("strategies.futures.monitor.os.path.exists", return_value=False):
+        mon.on_bidask("TFE", bidask)
+
+    assert mon.market_data["TMF_FAR"]["bid"] == 44400.0
+    assert mon.market_data["TMF_FAR"]["ask"] == 44405.0
+    assert mon.market_data["TMF_FAR"]["bidask_exchange_ts"] == bidask.datetime
