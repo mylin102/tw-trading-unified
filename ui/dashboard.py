@@ -6307,8 +6307,14 @@ elif page == "設定":
                     except Exception as _pe:
                         st.warning("🛑 已嘗試停止 PM2 交易服務，修改 `.env` 後請手動執行 `pm2 restart trading`。")
                 else:
+                    # 2026-08-05 Antigravity AI: Revert to Paper Mode Protocol
+                    # 1. Inform user that futures.yaml & futures_night.yaml are both updated to live_trading: false
+                    # 2. Suggest restoring PAPER_MODE=true in .env to enforce double safety lock
+                    # 3. Automatically trigger_restart() to restart PM2 in paper mode
+                    st.info("ℹ️ **已切回 Paper 模擬模式**：已同步將雙 YAML 設定檔 (`futures.yaml` & `futures_night.yaml`) 設為 `live_trading: false`。")
+                    st.info("💡 **雙重防護建議**：若先前曾手動將 `.env` 修改為 `PAPER_MODE=false`，建議將其改回 `PAPER_MODE=true` 以補回最高安全鎖。")
                     trigger_restart()
-                    st.info("🔄 重啟指令已送出，monitor 將在約 30 秒後套用新設定。")
+                    st.info("🔄 **重啟交易服務**：PM2 重啟指令已送出，交易程序將在約 30 秒後以 Paper 模擬模式運行。")
                 # 2026-06-30 Hermes Agent: Hold success message for 3s before rerun
                 import time as _time
                 _time.sleep(3)
