@@ -4341,7 +4341,28 @@ class TMFSpread(StrategyBase):
                 self._lifecycle = "EXITING"
                 self._log_exit_decision(exit_reason=_exit_reason, pnl=current_pnl, bar=bar)
                 self._combined_exit_in_flight = True
-                _append_event("COMBINED_EXIT_SUBMITTED", exit_reason=_exit_reason, gross_points=current_pnl, **_risk_meta)
+                # Persist the actual Policy J decision evidence.  Without this,
+                # replay cannot distinguish a confirmed giveback from a rejected
+                # transient quote spike.
+                _pj_peak = getattr(self, "_peak_net_exit_pnl_twd", None)
+                _pj_current = float(current_pnl) * float(_mult) - float(getattr(self, "_estimated_cost", 92.0))
+                _pj_activation = float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0))
+                _pj_giveback = float(self._params.get("combined_upl_giveback_twd", 100.0))
+                _append_event(
+                    "COMBINED_EXIT_SUBMITTED",
+                    trade_id=self._trade_id,
+                    exit_reason=_exit_reason,
+                    gross_points=current_pnl,
+                    policy_j_durable_peak_twd=_pj_peak,
+                    policy_j_current_net_twd=_pj_current,
+                    policy_j_activation_twd=_pj_activation,
+                    policy_j_giveback_twd=_pj_giveback,
+                    policy_j_drawdown_twd=(float(_pj_peak) - _pj_current) if _pj_peak is not None else None,
+                    policy_j_peak_confirmed=bool(getattr(self, "_pj_durable_peak", None) is not None),
+                    policy_j_candidate_pending=bool(getattr(self, "_pj_candidate_peak", None) is not None),
+                    policy_j_guard_state=getattr(self, "_pj_guard_state", None),
+                    **_risk_meta,
+                )
                 _commit_action(self._lifecycle_oca, _decision)
                 # 2026-07-30: State write moved to monitor.py after successful order submission
                 return Signal("EXIT", "TMF_COMBINED_EXIT", confidence=1.0, stop_loss=0)
