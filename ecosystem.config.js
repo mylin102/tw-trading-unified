@@ -16,9 +16,8 @@ module.exports = {
       restart_delay: 15000,        // 💡 關鍵：15秒延遲重啟，對齊原設計並保護券商連線
       autorestart: true,
       watch: false,
-      max_restarts: 50,
-      exp_backoff_restart_delay: 100,
-      min_uptime: "10s",
+      max_restarts: 2,             // 2026-08-05 Codex: stop restart storms after two unstable starts,
+      min_uptime: "120s",        // Classifies the observed 85s crash cycle as unstable.
       kill_timeout: 30000,        // 30s graceful shutdown
       // listen_timeout removed — taskpolicy wrapper prevents PM2 readiness detection
       error_file: path.join(PROJECT_ROOT, "logs/pm2-trading-error.log"),
