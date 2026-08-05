@@ -5202,7 +5202,6 @@ class ShioajiOptionsSmartMonitor:
 
         try:
             while self._running:
-                if os.path.exists(".restart"): break
                 try:
                     self.run_strategy_logic()
                     self._diag_counter += 1

@@ -43,7 +43,6 @@ _lifecycle_recorder: Any = None
 _connection_dropped = False
 
 BASE = os.path.dirname(__file__)
-RESTART_FLAG = Path(BASE) / ".restart"
 HEALTH_INTERVAL = 30  # seconds between health checks
 RESTART_RETRY_LIMIT = 5
 RESTART_WINDOW_SECS = 300  # 5 minutes
@@ -834,11 +833,7 @@ def update_startup_progress(step: str, progress_pct: int, message: str, status: 
         pass
 
 def run_system(dry_run=False, config_name="futures"):
-    """運行交易系統，遇到斷線或重啟請求時結束進程，由外部腳本重新拉起"""
-    # 啟動時立即清除重啟旗標，避免循環重啟
-    if RESTART_FLAG.exists():
-        RESTART_FLAG.unlink()
-        console.print("[dim]Old restart flag cleared.[/dim]")
+    """Run the trading system; supervised recovery is limited to classified failures."""
     update_startup_progress("SHIOAJI_CONNECTING", 30, "📡 正在與 永豐期貨 建立安全連線與 Session...", status="STARTING")
 
     # ── Lifecycle provenance recorder ──
@@ -1343,11 +1338,6 @@ def run_system(dry_run=False, config_name="futures"):
                 console.print(f"[bold yellow]⚠️ DATA WARNING: No data for {stale_secs/60:.1f} mins. Watching...[/bold yellow]")
                 stagnation_warned = True
             
-            if RESTART_FLAG.exists():
-                RESTART_FLAG.unlink()
-                console.print("[bold yellow]🔄 Restart requested. Exiting for external supervisor...[/bold yellow]")
-                break
-
             now = time.time()
             if not dry_run and now > startup_grace_until and now > health_check_at:
                 # 1) API session health — classified; exit ONLY on

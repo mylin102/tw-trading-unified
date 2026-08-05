@@ -5728,7 +5728,6 @@ class FuturesMonitor:
         console.print(f"[green][FuturesMonitor] started ({mode}). Status: WARMING_UP[/green]")
 
         while self._running:
-            if os.path.exists(".restart"): break
             try:
                 self._strategy_tick()
                 self._diag_counter += 1

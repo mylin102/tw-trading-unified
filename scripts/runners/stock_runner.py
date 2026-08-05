@@ -69,14 +69,7 @@ def run_stock_monitor(dry_run=False):
         sm._save_orders_file()
 
         # 3. Execution Loop
-        RESTART_FLAG = BASE / ".restart"
-        
         while True:
-            # Check for restart flag from dashboard
-            if RESTART_FLAG.exists():
-                console.print("[bold yellow]🔄 Restart flag detected. Exiting for supervisor...[/bold yellow]")
-                break
-                
             try:
                 sm.run_iteration()
             except Exception as e:
