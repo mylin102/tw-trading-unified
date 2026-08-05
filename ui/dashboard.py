@@ -528,7 +528,6 @@ alloc = risk_cfg.get("allocation", {})
 reserve_pct = risk_cfg.get("account", {}).get("margin_reserve_pct", 0.20)
 
 # ── Paths ──
-RESTART_FLAG = BASE / ".restart"
 
 def render_real_preflight_expander():
     with st.expander("🔐 券商與賬戶安全 Preflight 診斷 (Read-Only)", expanded=False):
@@ -620,22 +619,6 @@ def render_volatility_regime_section():
             )
 
 
-def # 2026-08-05 Antigravity AI: Disabled trigger_restart for Commit 224cab05 P0 compliance:
-    # 2026-08-05 Antigravity AI: Comply with Commit 224cab05 P0 rule (No .restart writer)
-    pass
-    try:
-        import json, time
-        with open("/tmp/futures_system_startup.json", "w") as f:
-            json.dump({
-                "status": "RESTARTING",
-                "step": "RESTART_REQUESTED",
-                "progress_pct": 15,
-                "message": "🔄 已發送重啟請求，正在結束現有進程並重新啟動...",
-                "timestamp": time.time()
-            }, f)
-    except Exception:
-        pass
-    st.toast("🔄 正在重啟 monitor（約 30 秒）...")
 OPTIONS_REPO = BASE / "strategies" / "options"
 FUTURES_MKT = BASE / "logs" / "market_data"
 FUTURES_TRADES = BASE / "exports" / "trades"
@@ -6396,7 +6379,7 @@ elif page == "設定":
                                      value=float(opt_exec_cfg.get("exchange_fee_per_side", 5.0)),
                                      help="期交所收取的單口單邊費用。")
 
-            if st.form_submit_button("💾 儲存並重啟選擇權模組"):
+            if st.form_submit_button("💾 儲存選擇權設定"):
                 options_cfg["live_trading"] = o_live_new
                 options_cfg["active_mode"] = o_mode_new
                 options_cfg["mode"] = o_mode_new
@@ -6409,9 +6392,9 @@ elif page == "設定":
                 opt_risk_cfg["lots_per_trade"] = o_lots
                 opt_risk_cfg["max_positions"] = o_max_pos
                 save_yaml(OPTIONS_CFG_PATH, options_cfg)
-                # 2026-08-05 Antigravity AI: Disabled trigger_restart for Commit 224cab05 P0 compliance
+                # 2026-08-05 Antigravity AI: Removed legacy restart control for Commit 224cab05 P0 compliance
                 st.success(f"✅ 設定已寫入 `{OPTIONS_CFG_PATH}`\n模式: {o_mode_new} | 口數: {o_lots} | 最大持倉: {o_max_pos} | Fire閾值: {o_fire_thresh}")
-                st.info("🔄 重啟指令已送出，約 30 秒後套用新設定。")
+                st.info("設定已儲存；此操作不會重啟 trading-system。")
                 st.rerun()
 
     # ── 3. 台股 Stocks 設定 ──
@@ -6456,7 +6439,7 @@ elif page == "設定":
             tp_new = c4.slider("停利 (%)", 2.0, 20.0, value=float(stk_inner.get("take_profit_pct", 0.10)*100), step=0.5) / 100.0
             ts_new = c5.slider("移動停損 (%)", 0.5, 5.0, value=float(stk_inner.get("trailing_stop_pct", 0.01)*100), step=0.1) / 100.0
             
-            if st.form_submit_button("💾 儲存並重啟台股模組"):
+            if st.form_submit_button("💾 儲存台股設定"):
                 # 處理多行輸入，轉回 list
                 new_tickers = [t.strip() for t in watchlist_area.split("\n") if t.strip()]
                 new_stocks = {
@@ -6480,11 +6463,8 @@ elif page == "設定":
                     "stocks": new_stocks,
                 }
                 save_yaml(STOCK_CFG_PATH, new_stock_cfg)
-                # 2026-08-05 Antigravity AI: Disabled trigger_restart for Commit 224cab05 P0 compliance
-                # GSD Fix: stock_runner is independent process, must be killed separately
-                import subprocess
-                subprocess.run(["pkill", "-f", "stock_runner.py"], capture_output=True)
-                st.success("台股設定已更新，正在重啟系統...")
+                # 2026-08-05 Antigravity AI: Removed legacy restart control for Commit 224cab05 P0 compliance
+                st.success("台股設定已更新；此操作不會控制或重啟任何交易程序。")
 
     # ── 3.5. 通知設定 ──
     # 2026-06-26 Gemini CLI: Add email notification toggle in settings tab
