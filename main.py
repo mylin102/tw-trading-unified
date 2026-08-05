@@ -552,7 +552,65 @@ def _subscribe_otm_skew_contracts(api, om, fm, sk_engine, console=None):
     return otm_contracts
 
 
+# 2026-08-05: broker health tracker (INCIDENT_broker_session_recovery).
+# Replaces the binary 2-attempt-exit with a classified state machine.
+_BROKER_HEALTH_TRACKER = None
+
+
+def _get_broker_health():
+    global _BROKER_HEALTH_TRACKER
+    if _BROKER_HEALTH_TRACKER is None:
+        from core.broker_health import BrokerHealthTracker
+        _BROKER_HEALTH_TRACKER = BrokerHealthTracker()
+    return _BROKER_HEALTH_TRACKER
+
+
 def api_is_healthy(api):
+    """Classified broker health check.
+
+    Returns the BrokerHealthTracker state (str). The main loop exits ONLY on
+    PROCESS_RESTART_REQUIRED. Generic 500/timeout never exit the process.
+    """
+    if api is None:
+        return "UNKNOWN"
+    _tracker = _get_broker_health()
+    for attempt in range(2):
+        try:
+            api.list_positions(api.futopt_account)
+            try:
+                from core.channel_safety import get_safety_state
+                get_safety_state().set_account_healthy()
+            except Exception:
+                pass
+            _tracker.record_success()
+            return _tracker.state.value
+        except Exception as exc:
+            if attempt == 0:
+                time.sleep(1)
+                continue
+            _failed_msg = f"{type(exc).__name__}: {exc}"
+            console.print(f"[dim]api_is_healthy: list_positions failed (2 attempts): {_failed_msg}[/dim]")
+            from core.broker_health import BrokerErrorClass, classify_broker_error
+            _cls = classify_broker_error(exc)
+            _tracker.record_failure(exc)
+            try:
+                from core.channel_safety import get_safety_state, AccountDegradedReason
+                if _cls in (BrokerErrorClass.AUTHENTICATION_FAILURE,
+                            BrokerErrorClass.AUTHORIZATION_FAILURE,
+                            BrokerErrorClass.SDK_SESSION_CLOSED,
+                            BrokerErrorClass.CONNECTION_RESET):
+                    get_safety_state().set_account_degraded(
+                        AccountDegradedReason.SHIOAJI_CONNECTION_ERROR, _failed_msg)
+                else:
+                    get_safety_state().set_account_degraded(
+                        AccountDegradedReason.LIST_POSITIONS_FAILED, _failed_msg)
+            except Exception:
+                pass
+            return _tracker.state.value
+    return _tracker.state.value
+
+
+
     """Quick check if Shioaji session is still usable, with a small retry."""
     if api is None:
         return False
@@ -1292,10 +1350,15 @@ def run_system(dry_run=False, config_name="futures"):
 
             now = time.time()
             if not dry_run and now > startup_grace_until and now > health_check_at:
-                # 1) API session health
-                if not api_is_healthy(api):
-                    console.print("[red]💀 Shioaji session dead — exiting for external supervisor[/red]")
+                # 1) API session health — classified; exit ONLY on
+                #    PROCESS_RESTART_REQUIRED (auth exhaustion). Generic
+                #    500/timeout degrade state + block entry, never exit.
+                _bh_state = api_is_healthy(api)
+                if _bh_state == "PROCESS_RESTART_REQUIRED":
+                    console.print("[red]💀 Broker session unrecoverable (relogin exhausted) — exiting for external supervisor[/red]")
                     break
+                elif _bh_state in ("SESSION_INVALID", "DEGRADED", "TRANSIENT_FAILURE"):
+                    console.print(f"[yellow]⚠️ Broker health: {_bh_state} — entry blocked, feed/risk continue[/yellow]")
 
                 # 2) Feed freshness health
                 try:

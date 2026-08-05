@@ -8,11 +8,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # build a fake shioaji module with the exception hierarchy
-_sj = types.ModuleType("shioaji")
-
-
 class ShioajiError(Exception):
-    pass
+    """Plain exception (name-matched by core.broker_health classifier)."""
 
 
 class AuthError(ShioajiError):
@@ -50,12 +47,6 @@ class ShioajiTimeoutError(ShioajiError):
 class DecodeError(ShioajiError):
     pass
 
-
-for _n in ("ShioajiError", "AuthError", "TokenError", "AccountNotSignError",
-           "SystemMaintenance", "ServerError", "BadRequestError",
-           "ValidationError", "ShioajiTimeoutError", "DecodeError"):
-    setattr(_sj, _n, globals()[_n])
-sys.modules["shioaji"] = _sj
 
 from core.broker_health import (
     BrokerHealthTracker, classify_broker_error, BrokerErrorClass, HealthState,
