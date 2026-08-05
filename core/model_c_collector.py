@@ -47,6 +47,46 @@ def _ts_to_ms(ts_iso):
         return None
 
 
+# ── exchange timestamp quality (2026-08-04 probe) ──
+# BidAskFOPv1.datetime = naive TAIFEX local wall-clock, ms precision, always
+# present. On Mini (TZ CST+0800) .timestamp() shares the UTC epoch contract
+# with time.time() — quote_age_ms is valid. The naive field is an IMPLICIT
+# contract: we self-check the clock domain at startup and tag each record.
+EXCHANGE_TS_VALID = "VALID"
+EXCHANGE_TS_UNAVAILABLE = "EXCHANGE_TS_UNAVAILABLE"
+EXCHANGE_TS_INVALID = "EXCHANGE_TS_INVALID"
+EXCHANGE_TS_CLOCK_DOMAIN_UNKNOWN = "EXCHANGE_TS_CLOCK_DOMAIN_UNKNOWN"
+
+
+def _classify_exchange_ts(exchange_ts):
+    """Classify a BidAskFOPv1.datetime field.
+
+    Returns (epoch_ms, quality). Never fabricates precision: if the field is
+    absent or unparseable we return EXCHANGE_TS_UNAVAILABLE/INVALID; if the
+    system clock domain cannot be confirmed we return
+    EXCHANGE_TS_CLOCK_DOMAIN_UNKNOWN. No silent UTC assumption.
+    """
+    if exchange_ts is None:
+        return None, EXCHANGE_TS_UNAVAILABLE
+    try:
+        if isinstance(exchange_ts, datetime):
+            if exchange_ts.tzinfo is not None:
+                # tz-aware: normalize to UTC epoch (trusted)
+                return exchange_ts.timestamp() * 1000.0, EXCHANGE_TS_VALID
+            # naive: valid ONLY if system TZ is a fixed +08 domain
+            # (TAIFEX local wall-clock == system local). Self-check:
+            _local_off = datetime.now().astimezone().utcoffset()
+            if _local_off is None or _local_off.total_seconds() != 8 * 3600:
+                return None, EXCHANGE_TS_CLOCK_DOMAIN_UNKNOWN
+            return exchange_ts.timestamp() * 1000.0, EXCHANGE_TS_VALID
+        ms = _ts_to_ms(exchange_ts)
+        if ms is None:
+            return None, EXCHANGE_TS_INVALID
+        return ms, EXCHANGE_TS_VALID
+    except Exception:
+        return None, EXCHANGE_TS_INVALID
+
+
 class ModelCCollector:
     def __init__(self, telemetry_path: str, max_quote_age_ms: int = MAX_QUOTE_AGE_MS,
                  max_pair_skew_ms: int = MAX_PAIR_SKEW_MS, bbo_raw_path: str | None = None):
@@ -74,13 +114,17 @@ class ModelCCollector:
         with self._lock:
             self.counters["bbos"] += 1
             rts = receive_ts or _now_iso()
+            _x_ms, _x_q = _classify_exchange_ts(exchange_ts)
             self._bbo[leg] = {
                 "leg": leg, "contract_code": contract_code,
                 "bid": float(bid) if bid is not None else None,
                 "ask": float(ask) if ask is not None else None,
                 "bid_size": bid_size, "ask_size": ask_size,
                 "exchange_timestamp": exchange_ts,
+                "exchange_ts_ms": _x_ms,
+                "timestamp_quality": _x_q,
                 "receive_timestamp": rts,
+                "receive_ts_ms": _ts_to_ms(rts),
                 "sequence_number": seq, "source": source,
                 "subscription_id": subscription_id,
             }
@@ -97,6 +141,29 @@ class ModelCCollector:
         far_age = self._age_ms(far, eval_rts)
         skew = self._skew_ms(near, far)
         exch_skew = self._exch_skew_ms(near, far)
+        # 2026-08-04: quote_age per leg from exchange ts ONLY when
+        # timestamp_quality is VALID (same UTC epoch contract); else None.
+        _near_xq = near.get("timestamp_quality") if near else None
+        _far_xq = far.get("timestamp_quality") if far else None
+        _near_xms = near.get("exchange_ts_ms") if near else None
+        _far_xms = far.get("exchange_ts_ms") if far else None
+        _near_rms = near.get("receive_ts_ms") if near else None
+        _far_rms = far.get("receive_ts_ms") if far else None
+        _near_qage = (_near_rms - _near_xms) if (_near_rms and _near_xms and _near_xq == EXCHANGE_TS_VALID) else None
+        _far_qage = (_far_rms - _far_xms) if (_far_rms and _far_xms and _far_xq == EXCHANGE_TS_VALID) else None
+        # 2026-08-05 (conservative clock-domain semantics):
+        #   - exchange_ts must NEVER gate freshness against Mini receive clock
+        #     (TAIFEX server clock leads Mini ~85ms; 91.5% of pairs negative)
+        #   - ANY negative exchange_quote_age_ms -> CLOCK_DOMAIN_UNKNOWN + null
+        #     (NO single-leg clamp to 0 — that disguises unknown clock offset
+        #     as a fresh quote)
+        #   - freshness gating uses receive-age only (see _age_ms / max_age)
+        if _near_qage is not None and _near_qage < 0:
+            _near_xq = EXCHANGE_TS_CLOCK_DOMAIN_UNKNOWN
+            _near_qage = None
+        if _far_qage is not None and _far_qage < 0:
+            _far_xq = EXCHANGE_TS_CLOCK_DOMAIN_UNKNOWN
+            _far_qage = None
 
         # reason resolution (ordered; explicit taxonomy, never UNKNOWN)
         reason, stale_leg = None, None
@@ -149,11 +216,15 @@ class ModelCCollector:
             "far_contract": far.get("contract_code"),
             "near_bid": near["bid"], "near_ask": near["ask"],
             "far_bid": far["bid"], "far_ask": far["ask"],
-            "near_exchange_ts": near.get("exchange_timestamp"),
-            "far_exchange_ts": far.get("exchange_timestamp"),
+            "near_exchange_ts": str(near.get("exchange_timestamp") or "")[:23] or None,
+            "far_exchange_ts": str(far.get("exchange_timestamp") or "")[:23] or None,
+            "near_exchange_ts_ms": _near_xms,
+            "far_exchange_ts_ms": _far_xms,
+            "near_timestamp_quality": _near_xq,
+            "far_timestamp_quality": _far_xq,
             "near_receive_ts": near.get("receive_timestamp"),
             "far_receive_ts": far.get("receive_timestamp"),
-            "near_quote_age_ms": near_age, "far_quote_age_ms": far_age,
+            "near_quote_age_ms": _near_qage, "far_quote_age_ms": _far_qage,
             "receive_pair_skew_ms": skew, "exchange_pair_skew_ms": exch_skew,
             "near_position_side": None, "far_position_side": None,
             "near_entry_avg_price": None, "far_entry_avg_price": None,

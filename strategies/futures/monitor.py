@@ -1855,6 +1855,11 @@ class FuturesMonitor:
                 bid_size=getattr(bidask, "bid_volume", None),
                 ask_size=getattr(bidask, "ask_volume", None),
                 receive_ts=datetime.now().isoformat(),
+                # 2026-08-04: BidAskFOPv1.datetime = naive TAIFEX local
+                # wall-clock (probe-verified); on Mini (CST+0800) shares the
+                # UTC epoch contract with receive time. Collector classifies
+                # timestamp_quality; never silently cross-domains.
+                exchange_ts=getattr(bidask, "datetime", None),
                 seq=getattr(bidask, "seq", None),
                 contract_code=_code,
                 source="shioaji_bidask")

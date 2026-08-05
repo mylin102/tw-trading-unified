@@ -15,15 +15,26 @@ def _mk(tmp_path):
     return ModelCCollector(p, bbo_raw_path=raw), p
 
 
-def _q(collector, leg, bid, ask, age_ms=100, skew_shift=None, ts=None, sizes=(1, 1)):
-    """Inject a quote with controlled receive timestamps (ISO)."""
+def _q(collector, leg, bid, ask, age_ms=100, skew_shift=None, ts=None, sizes=(1, 1),
+      exchange_ts=None):
+    """Inject a quote with controlled receive timestamps (ISO).
+
+    2026-08-04 envelope contract: quote_age_ms requires a VALID exchange ts
+    (same UTC epoch contract). Pass exchange_ts to exercise the age path;
+    leave None to exercise EXCHANGE_TS_UNAVAILABLE semantics.
+    """
     import datetime
     base = datetime.datetime.now()
-    rts = (base - datetime.timedelta(milliseconds=age_ms)).isoformat()
+    _age = age_ms if age_ms is not None else 0
+    rts = (base - datetime.timedelta(milliseconds=_age)).isoformat()
     if skew_shift and skew_shift == leg:
-        rts = (base - datetime.timedelta(milliseconds=age_ms + 1000)).isoformat()
+        rts = (base - datetime.timedelta(milliseconds=_age + 1000)).isoformat()
+    if exchange_ts is None and age_ms is not None:
+        # exchange ts at receive time minus age_ms (quote already old on arrival)
+        exchange_ts = base - datetime.timedelta(milliseconds=2 * age_ms)
     return collector.on_quote(leg, bid, ask, bid_size=sizes[0], ask_size=sizes[1],
-                              receive_ts=rts, contract_code=f"TMF{leg}")
+                              receive_ts=rts, exchange_ts=exchange_ts,
+                              contract_code=f"TMF{leg}")
 
 
 def _read(p):
@@ -105,15 +116,19 @@ def test_quote_age_from_receive_ts():
     c, p = _mk(tempfile.mkdtemp())
     _q(c, "NEAR", 100.0, 102.0, age_ms=100)
     _q(c, "FAR", 200.0, 202.0, age_ms=100)
+    # exchange ts = receive - age_ms -> quote_age ~= age_ms (100ms)
     assert c.latest_accepted["near_quote_age_ms"] == pytest.approx(100, abs=50)
+    assert c.latest_accepted["near_timestamp_quality"] == "VALID"
 
 
 def test_exchange_ts_missing_marks_receive_only():
     c, p = _mk(tempfile.mkdtemp())
-    _q(c, "NEAR", 100.0, 102.0)
-    _q(c, "FAR", 200.0, 202.0)
+    _q(c, "NEAR", 100.0, 102.0, exchange_ts=None, age_ms=None)
+    _q(c, "FAR", 200.0, 202.0, exchange_ts=None, age_ms=None)
     acc = c.latest_accepted
     assert acc["near_exchange_ts"] is None  # no exchange ts -> RECEIVE_ONLY semantics
+    assert acc["near_timestamp_quality"] == "EXCHANGE_TS_UNAVAILABLE"
+    assert acc["near_quote_age_ms"] is None  # no fabricated age
 
 
 def test_episode_not_inflated_by_attempts():
@@ -190,3 +205,36 @@ def test_mark_position_sets_executable_pnl():
     assert acc["near_executable_gross_pnl"] == pytest.approx(50.0)   # (100-95)*10
     assert acc["far_executable_gross_pnl"] == pytest.approx(30.0)    # (205-202)*10
     assert acc["executable_combined_gross_pnl"] == pytest.approx(80.0)
+
+
+def test_negative_exchange_age_downgrades_quality():
+    """TAIFEX server clock leads Mini (~85ms systematic). A negative
+    exchange_quote_age_ms must NOT be clamped to 0 (would fake freshness) —
+    quality downgrades to EXCHANGE_TS_CLOCK_DOMAIN_UNKNOWN and age is null."""
+    import datetime
+    c, p = _mk(tempfile.mkdtemp())
+    base = datetime.datetime.now()
+    # exchange ts 100ms AHEAD of receive ts (server clock leads)
+    x_ts = base + datetime.timedelta(milliseconds=100)
+    _q(c, "NEAR", 100.0, 102.0, age_ms=0, exchange_ts=x_ts)
+    _q(c, "FAR", 200.0, 202.0, age_ms=0, exchange_ts=x_ts)
+    acc = c.latest_accepted
+    assert acc["near_timestamp_quality"] == "EXCHANGE_TS_CLOCK_DOMAIN_UNKNOWN"
+    assert acc["far_timestamp_quality"] == "EXCHANGE_TS_CLOCK_DOMAIN_UNKNOWN"
+    assert acc["near_quote_age_ms"] is None
+    assert acc["far_quote_age_ms"] is None
+    # exchange skew still computable (observation domain, not freshness)
+    assert acc["exchange_pair_skew_ms"] is not None
+
+
+def test_positive_exchange_age_keeps_valid():
+    """exchange ts behind receive ts (normal latency) -> VALID + positive age."""
+    import datetime
+    c, p = _mk(tempfile.mkdtemp())
+    base = datetime.datetime.now()
+    x_ts = base - datetime.timedelta(milliseconds=50)
+    _q(c, "NEAR", 100.0, 102.0, age_ms=0, exchange_ts=x_ts)
+    _q(c, "FAR", 200.0, 202.0, age_ms=0, exchange_ts=x_ts)
+    acc = c.latest_accepted
+    assert acc["near_timestamp_quality"] == "VALID"
+    assert acc["near_quote_age_ms"] == pytest.approx(50, abs=20)
