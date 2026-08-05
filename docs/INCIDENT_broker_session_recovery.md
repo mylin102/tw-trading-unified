@@ -20,6 +20,13 @@ self-recovered at 05:34:41.
 positions (verified: event ledger 05:10–05:35 has 0 order-related events;
 state file stayed FLAT throughout — restore path never exercised).
 
+**Causal framing (2026-08-05 correction)**: the session transition lacking a
+resubscribe path, followed by feed silence (GCA_TICK=0 05:00–05:09), then
+list_positions 500 + restart storm, STRONGLY SUPPORTS a causal link between
+the handoff gap and the failure. The exact broker-side cause remains
+UNVERIFIED — we have not confirmed that subscription loss caused the session
+to become invalid at the broker.
+
 ## Root-cause chain (confirmed)
 
 ```
