@@ -308,6 +308,10 @@ class FuturesMonitor:
         self._last_real_tmf_tick_at = self.last_tick_at
         self._runtime_status = None
         self._manual_trade_status = "READY"  # [GSD] Track manual trade state (READY, PROCESSING, FILLED, FAILED)
+        # Tracks the terminal audit status for a manual emergency close.  It is
+        # deliberately in-memory: a restart while orders are outstanding must
+        # remain reconcilable rather than being reported as completed.
+        self._emergency_cmd = None
         # 2026-06-26 Gemini CLI: Initialize dynamic flag path from environment variable
         # 2026-07-21 Gemini CLI: Use ticker-specific manual trade flag path for multi-instance separation
         _env_flag = os.environ.get("FUTURES_MANUAL_TRADE_FLAG_PATH")
@@ -3335,6 +3339,7 @@ class FuturesMonitor:
         # Must be called BEFORE early returns to ensure tracking dictionary is updated
         price = float(event.fill_price or 0)
         self._check_mts_multi_leg_fill(event.order_id, price)
+        self._maybe_complete_emergency_command(event, price)
 
         pending = self._pending_lifecycle_orders.get(event.order_id)
         # 2026-06-22 Gemini CLI: Use fill_qty to match OrderEvent class definition
@@ -3643,6 +3648,7 @@ class FuturesMonitor:
 
         def _on_cancel_callback(event):
             console.print(f" [yellow]🚫 Order CANCELLED: {event.order_id} ({event.reason})[/yellow] ")
+            self._fail_emergency_command(event, "CANCELLED")
             # 2026-07-07 Gemini CLI: P0: Stale callback guard based on lifecycle generation
             # 2026-07-07 Gemini CLI / Hermes Agent: Handle missing _lifecycle_generation gracefully for unit tests
             pending = self._pending_lifecycle_orders.get(event.order_id)
@@ -3659,6 +3665,7 @@ class FuturesMonitor:
 
         def _on_reject_callback(event):
             console.print(f"[red]❌ Order REJECTED: {event.order_id} ({event.reason})[/red]")
+            self._fail_emergency_command(event, "REJECTED")
             # 2026-07-31: COMBINED_EXIT leg rejected -> repair path, never pretend completed
             try:
                 _rp = self._pending_lifecycle_orders.get(event.order_id)
@@ -7075,6 +7082,58 @@ class FuturesMonitor:
         except Exception as _e:
             console.print(f"[red]⚠️ [CMD_STATUS] write failed: {_e}[/red]")
 
+    def _register_emergency_command_order(self, order_id: str) -> None:
+        """Associate a submitted emergency-close order with its audit command."""
+        tracker = getattr(self, "_emergency_cmd", None)
+        if tracker and not tracker.get("completed") and not tracker.get("failed"):
+            tracker["order_ids"].add(order_id)
+
+    def _maybe_complete_emergency_command(self, event, fill_price: float) -> None:
+        """Mark a manual close complete only after every expected order fills."""
+        from core.order_management.order import OrderStatus
+
+        tracker = getattr(self, "_emergency_cmd", None)
+        if not tracker or tracker.get("completed") or tracker.get("failed"):
+            return
+        order_id = getattr(event, "order_id", None)
+        if order_id not in tracker["order_ids"]:
+            return
+        if getattr(event, "status", None) != OrderStatus.FILLED:
+            return
+
+        tracker["filled_ids"].add(order_id)
+        tracker["fill_prices"][order_id] = float(fill_price)
+        if not tracker["order_ids"].issubset(tracker["filled_ids"]):
+            return
+
+        tracker["completed"] = True
+        order_ids = sorted(tracker["order_ids"])
+        self._write_manual_command_status(
+            tracker["command_id"], "COMPLETED", "平倉已成交",
+            position_after={"near_qty": 0, "far_qty": 0},
+            order_ids=order_ids,
+            fill_prices={order_id: tracker["fill_prices"].get(order_id) for order_id in order_ids},
+        )
+
+    def _fail_emergency_command(self, event, terminal_status: str) -> None:
+        """Record a rejected/cancelled emergency leg without masking a partial flat."""
+        tracker = getattr(self, "_emergency_cmd", None)
+        order_id = getattr(event, "order_id", None)
+        if (not tracker or tracker.get("completed") or tracker.get("failed")
+                or order_id not in tracker["order_ids"]):
+            return
+
+        tracker["failed"] = True
+        reason = getattr(event, "reason", "unknown")
+        self._write_manual_command_status(
+            tracker["command_id"], "FAILED",
+            f"平倉單 {terminal_status}: {order_id} ({reason})",
+            failed_order_id=order_id,
+            reason=reason,
+            order_ids=sorted(tracker["order_ids"]),
+            filled_order_ids=sorted(tracker["filled_ids"]),
+        )
+
     def _emergency_flatten_mts(self, strategy) -> None:
         """Emergency flatten all MTS positions. Used by settlement gate and manual close_all.
 
@@ -7321,6 +7380,14 @@ class FuturesMonitor:
                     },
                 )
                 if _has_pos and self.order_mgr:
+                    self._emergency_cmd = {
+                        "command_id": _command_id,
+                        "order_ids": set(),
+                        "filled_ids": set(),
+                        "fill_prices": {},
+                        "completed": False,
+                        "failed": False,
+                    }
                     # 2026-07-07 Hermes Agent: reindex order counter from
                     # persisted orders to prevent ID collision after PM2
                     # restart or order_mgr recreation.
@@ -7375,6 +7442,7 @@ class FuturesMonitor:
                             order_type=OrderType.MKP, quantity=1,
                             strategy="MTS_EMERGENCY",
                         )
+                        self._register_emergency_command_order(_o_near.order_id)
                         self.order_mgr.submit(_o_near)
                         if self.paper_fill_sim:
                             self.paper_fill_sim.register(_o_near)
@@ -7390,6 +7458,7 @@ class FuturesMonitor:
                             order_type=OrderType.MKP, quantity=1,
                             strategy="MTS_EMERGENCY",
                         )
+                        self._register_emergency_command_order(_o_far.order_id)
                         self.order_mgr.submit(_o_far)
                         if self.paper_fill_sim:
                             self.paper_fill_sim.register(_o_far)
@@ -7413,6 +7482,7 @@ class FuturesMonitor:
                             order_type=OrderType.MKP, quantity=1,
                             strategy="MTS_EMERGENCY",
                         )
+                        self._register_emergency_command_order(_order.order_id)
                         self.order_mgr.submit(_order)
                         if self.paper_fill_sim:
                             self.paper_fill_sim.register(_order)
@@ -7507,6 +7577,9 @@ class FuturesMonitor:
                         )
                 else:
                     self._manual_trade_status = "FAILED: NO_ORDER_MGR"
+                    self._write_manual_command_status(
+                        _command_id, "FAILED", "平倉失敗：OrderManager 不可用",
+                    )
 
                 # 2026-07-07 Gemini CLI / Hermes Agent: Save updated orders immediately after emergency close
                 self._save_orders_file_wrapper()
@@ -7518,6 +7591,7 @@ class FuturesMonitor:
 
             if _action == "clear_records":
                 console.print("[bold red]🗑️ [MANUAL_TRADE] MANUAL CLEAR RECORDS triggered[/bold red]")
+                self._emergency_cmd = None
                 # 2026-07-07 Gemini CLI: P0: Increment generation and reset everything on manual clear
                 self._lifecycle_generation += 1
                 self._emergency_reset_at = datetime.now()
