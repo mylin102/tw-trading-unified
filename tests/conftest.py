@@ -34,12 +34,12 @@ nb.jit = _strip_cache_flag(nb.jit)
 # Shioaji imports configure a file logger at import time. In the sandboxed test
 # environment, writing under the repo root is not allowed, so redirect broker
 # logs to a writable temp location before any module imports `shioaji`.
-os.environ.setdefault("SJ_LOG_PATH", "/tmp/shioaji.log")
+os.environ["SJ_LOG_PATH"] = "/tmp/shioaji.log"
 
 # 2026-06-25 Gemini CLI / Hermes Agent: Redirect MTS log paths for test environment isolation
-os.environ.setdefault("MTS_FILL_LOG_PATH", "/tmp/test_mts_trade_fills.jsonl")
-os.environ.setdefault("MTS_EVENT_LOG_PATH", "/tmp/test_mts_spread_events.jsonl")
-os.environ.setdefault("MTS_STATE_PATH", "/tmp/test_mts_position_state.json")
+os.environ["MTS_FILL_LOG_PATH"] = "/tmp/test_mts_trade_fills.jsonl"
+os.environ["MTS_EVENT_LOG_PATH"] = "/tmp/test_mts_spread_events.jsonl"
+os.environ["MTS_STATE_PATH"] = "/tmp/test_mts_position_state.json"
 
 
 
