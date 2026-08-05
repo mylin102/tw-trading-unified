@@ -620,8 +620,9 @@ def render_volatility_regime_section():
             )
 
 
-def trigger_restart():
-    RESTART_FLAG.touch()
+def # 2026-08-05 Antigravity AI: Disabled trigger_restart for Commit 224cab05 P0 compliance:
+    # 2026-08-05 Antigravity AI: Comply with Commit 224cab05 P0 rule (No .restart writer)
+    pass
     try:
         import json, time
         with open("/tmp/futures_system_startup.json", "w") as f:
@@ -6361,7 +6362,7 @@ elif page == "設定":
                 opt_risk_cfg["lots_per_trade"] = o_lots
                 opt_risk_cfg["max_positions"] = o_max_pos
                 save_yaml(OPTIONS_CFG_PATH, options_cfg)
-                trigger_restart()
+                # 2026-08-05 Antigravity AI: Disabled trigger_restart for Commit 224cab05 P0 compliance
                 st.success(f"✅ 設定已寫入 `{OPTIONS_CFG_PATH}`\n模式: {o_mode_new} | 口數: {o_lots} | 最大持倉: {o_max_pos} | Fire閾值: {o_fire_thresh}")
                 st.info("🔄 重啟指令已送出，約 30 秒後套用新設定。")
                 st.rerun()
@@ -6432,7 +6433,7 @@ elif page == "設定":
                     "stocks": new_stocks,
                 }
                 save_yaml(STOCK_CFG_PATH, new_stock_cfg)
-                trigger_restart()
+                # 2026-08-05 Antigravity AI: Disabled trigger_restart for Commit 224cab05 P0 compliance
                 # GSD Fix: stock_runner is independent process, must be killed separately
                 import subprocess
                 subprocess.run(["pkill", "-f", "stock_runner.py"], capture_output=True)

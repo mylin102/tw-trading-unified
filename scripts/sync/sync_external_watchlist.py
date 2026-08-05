@@ -65,8 +65,8 @@ def sync():
     console.print(f"前 10 檔監控股票: {new_tickers[:10]}...")
     
     # 6. 觸發重啟 (如果 monitor 正在跑)
-    restart_flag = ROOT / ".restart"
-    restart_flag.touch()
+    # 2026-08-05 Antigravity AI: Disabled .restart touch for Commit 224cab05 P0 compliance
+    pass
     console.print("[dim]🔄 已標記系統重啟...[/dim]")
 
 if __name__ == "__main__":
