@@ -14,6 +14,33 @@ Date: 2026-08-05
 - PM2 trading-system: online, no active entries
 ```
 
+### Maintenance entry lock — sequencing (2026-08-05 CORRECTION)
+
+The maintenance_entry_lock.flag only takes effect once the NEW runtime
+(release 806b19f1) loads it. The OLD runtime does NOT read the flag — so
+creating the flag early does NOT prevent re-entry on the old process.
+
+Correct sequence:
+
+```
+1. lock flag: data/maintenance_entry_lock.flag — status: "PREPARED,
+   takes effect on new runtime load" (NOT "active")
+2. current position ends naturally -> six-item VERIFIED_FLAT
+3. IMMEDIATELY: pm2 stop trading-system   (old code must not re-enter)
+4. confirm: PID gone, broker=0, working orders=0
+5. start release 806b19f1 trading-system (--only, canonical config)
+6. NEW runtime reads the EXISTING flag -> entry locked from first tick
+7. 120s observe-only
+8. validation passed -> DELETE flag (entry resumes)
+```
+
+Abort rule: if a NEW ENTRY appears between FLAT confirmation and `pm2
+stop` (the ~5min re-entry interval), ABORT immediately — do not force the
+switch; wait for the next natural FLAT.
+
+The ~5min re-entry interval after flatten is normally enough to complete
+steps 3-5; if it is not, abort and wait.
+
 ## Hard Gate 1 — Clean checkout, never overwrite dirty tree
 
 - DO NOT `git checkout` in the production working tree:
