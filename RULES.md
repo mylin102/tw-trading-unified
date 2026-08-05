@@ -191,11 +191,12 @@ Every strategy function MUST:
 - `stop_loss` must be > 0
 - Return `None` for no signal (never return empty dict)
 
-## Rule 9: Config Changes Don't Require Restart
+## Rule 9: Config Changes Do Not Restart Trading
 
-- `active_strategy` is read every tick cycle
-- Dashboard writes YAML → monitor reads next cycle
-- Exception: Shioaji connection changes need full restart
+- `active_strategy` is read every tick cycle.
+- Dashboard creates a configuration revision; trading-system applies a validated revision only at a safe point.
+- Dashboard, YAML updates, and sync scripts MUST NOT create `.restart`, invoke `pm2`, or cause `trading-system` to exit.
+- A Shioaji connection change is a maintenance deployment, not a dashboard action; it requires Rule 17.
 
 ## Rule 10: Test Before Deploy
 
