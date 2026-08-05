@@ -6194,6 +6194,8 @@ elif page == "設定":
 
                 if _counterpart_cfg_path.exists():
                     _counterpart_cfg = load_yaml(_counterpart_cfg_path)
+                    # 2026-08-05 Antigravity AI: Synchronize live_trading setting across both futures.yaml & futures_night.yaml
+                    _counterpart_cfg["live_trading"] = f_live_new
                     if "mts" not in _counterpart_cfg: _counterpart_cfg["mts"] = {}
                     _counterpart_cfg["mts"]["enabled"] = f_mts_new
                     if f_mts_new:
@@ -6253,11 +6255,60 @@ elif page == "設定":
                     _flat_diff("risk_mgmt", futures_cfg.get("risk_mgmt", {}), yaml.safe_load(_old_yaml).get("risk_mgmt", {}) if _old_yaml else {})
 
                 if _diff_lines:
-                    st.success(f"✅ 設定已寫入 `{FUTURES_CFG_PATH}`\n" + "\n".join(_diff_lines))
+                    st.success(f"✅ 設定已同步寫入日夜盤設定檔 (`futures.yaml` & `futures_night.yaml`)\n" + "\n".join(_diff_lines))
                 else:
-                    st.success(f"✅ 設定已寫入 `{FUTURES_CFG_PATH}`\n策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
-                trigger_restart()
-                st.info("🔄 重啟指令已送出，monitor 將在約 30 秒後套用新設定。")
+                    st.success(f"✅ 設定已同步寫入日夜盤設定檔 (`futures.yaml` & `futures_night.yaml`)\n策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
+
+                # 2026-08-05 Antigravity AI: Automated Live Trading Transition Protocol
+                # 1. Check & auto-flatten paper positions if switching/enabling live_trading
+                # 2. Inform user about mandatory manual .env edit (PAPER_MODE=false)
+                # 3. Stop pm2 trading system (pm2 stop) and prompt for manual restart after .env update
+                if f_live_new:
+                    # Step 1: Auto-check & auto-flatten paper positions if active
+                    _flatten_triggered = False
+                    try:
+                        _state_file = BASE / "data" / "tmf_spread_state.json"
+                        if _state_file.exists():
+                            import json as _json, time as _tm
+                            with open(_state_file, "r", encoding="utf-8") as _sf:
+                                _st_data = _json.load(_sf)
+                                _pos = _st_data.get("position", {})
+                                if _pos and (_pos.get("near_qty", 0) != 0 or _pos.get("far_qty", 0) != 0 or _pos.get("total_qty", 0) != 0):
+                                    _cmd_id = f"auto_flatten_{int(_tm.time())}"
+                                    _cmd_file = BASE / "data" / "emergency_commands.json"
+                                    _cmds = []
+                                    if _cmd_file.exists():
+                                        try:
+                                            with open(_cmd_file, "r", encoding="utf-8") as _cf:
+                                                _cmds = _json.load(_cf)
+                                        except Exception:
+                                            _cmds = []
+                                    _cmds.append({"command": "FLATTEN", "command_id": _cmd_id, "timestamp": _tm.time(), "source": "dashboard_live_transition"})
+                                    with open(_cmd_file, "w", encoding="utf-8") as _cf:
+                                        _json.dump(_cmds, _cf, indent=2)
+                                    _flatten_triggered = True
+                    except Exception as _fe:
+                        pass
+
+                    if _flatten_triggered:
+                        st.warning("⚠️ **自動平倉作業**：檢查到尚有未平倉之 Paper 倉位，已自動發送全平倉指令 (Emergency Flatten)！")
+                    else:
+                        st.info("ℹ️ **倉位檢查**：目前無尚未平倉之 Paper 倉位。")
+
+                    # Step 2: Inform user about mandatory manual .env edit
+                    st.error("🔒 **【重要提醒：需手動修改 .env】** 系統已更新雙 YAML 設定檔為 `live_trading: true`。請手動修改 `.env` 檔案，將 `PAPER_MODE=true` 改為 `PAPER_MODE=false` 實盤方可真正下單！")
+
+                    # Step 3: Execute pm2 stop trading system & request manual restart
+                    try:
+                        import subprocess as _sp
+                        _sp.run(["pm2", "stop", "trading"], check=False)
+                        _sp.run(["pm2", "stop", "pm2-trading"], check=False)
+                        st.warning("🛑 **PM2 交易服務已自動執行 `pm2 stop` 停止**。手動修改 `.env` 檔案後，請執行 `pm2 restart trading` 重新啟動交易系統！")
+                    except Exception as _pe:
+                        st.warning("🛑 已嘗試停止 PM2 交易服務，修改 `.env` 後請手動執行 `pm2 restart trading`。")
+                else:
+                    trigger_restart()
+                    st.info("🔄 重啟指令已送出，monitor 將在約 30 秒後套用新設定。")
                 # 2026-06-30 Hermes Agent: Hold success message for 3s before rerun
                 import time as _time
                 _time.sleep(3)
