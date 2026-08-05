@@ -1476,6 +1476,35 @@ class FuturesMonitor:
             console.print(f" [yellow]⚠️ Error calculating settlement time: {e}[/yellow] ")
             return None
     
+    def _resubscribe_after_session_transition(self):
+        """Re-subscribe near/far tick + bidask after a session transition.
+
+        2026-08-05 INCIDENT: night->day handoff (05:00) drops quote
+        subscriptions with no resubscribe; feed goes silent and the broker
+        session later dies (list_positions 500) -> PM2 restart storm.
+        This re-establishes the 4 subscriptions idempotently.
+        """
+        if not self.api or self.dry_run:
+            return
+        from core.broker.shioaji_compat import safe_subscribe
+        _subs = [
+            (self.contract, "tick"),
+            (self.contract, "bidask"),
+        ]
+        if self.far_contract is not None:
+            _subs += [
+                (self.far_contract, "tick"),
+                (self.far_contract, "bidask"),
+            ]
+        for _c, _qt in _subs:
+            try:
+                safe_subscribe(self.api, _c, quote_type=_qt)
+                console.print(
+                    f"[dim]📡 [TRANSITION_RESUB] {_c.code} {_qt}[/dim]")
+            except Exception as _e:
+                console.print(
+                    f"[yellow]⚠️ [TRANSITION_RESUB] {_c.code} {_qt} failed: {_e}[/yellow]")
+
     def _check_contract_rollover(self):
         """[GSD Fix] Check if MXF contract has rolled over and re-subscribe if needed."""
         if not self.api or self.dry_run or not self.contract:
@@ -9042,6 +9071,10 @@ class FuturesMonitor:
             if self.previous_session_type == "night" and self.session_type == "day":
                 console.print(f"[bold yellow]🔄 Session transition: {self.previous_session_type} -> {self.session_type}. Cancelling pending orders...[/bold yellow]")
                 self._cancel_all_pending_orders()
+                # 2026-08-05 INCIDENT fix: night->day handoff drops quote
+                # subscriptions (feed silent 05:00-05:09, GCA_TICK=0) — the
+                # 500s + restart storm followed. Re-subscribe idempotently.
+                self._resubscribe_after_session_transition()
             self.previous_session_type = self.session_type
         
         self._bars_since_session_open += 1
