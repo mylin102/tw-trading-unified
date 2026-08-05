@@ -18,9 +18,14 @@ def run(monkeypatch, tmp_path):
     """Run main() with controlled pm/state snapshots; return output dict."""
     outputs = {}
 
-    def _make(pm, st, baseline_pm=None):
+    def _make(pm, st, baseline_pm=None, feed=None):
         monkeypatch.setattr(wd, "_pm2_snapshot", lambda: pm)
         monkeypatch.setattr(wd, "_state_snapshot", lambda: st)
+        if feed is not None:
+            monkeypatch.setattr(wd, "_feed_snapshot", lambda: feed)
+        else:
+            monkeypatch.setattr(wd, "_feed_snapshot",
+                                lambda: {"TMFH6_tick": {"age_s": None, "count": 0}})
         monkeypatch.setattr(wd, "OUT_PATH", str(tmp_path / "state.json"))
         monkeypatch.setattr(wd, "FLAG_PATH", str(tmp_path / "alert.flag"))
         monkeypatch.setattr(wd, "LOG_PATH", str(tmp_path / "watchdog.log"))
@@ -85,3 +90,43 @@ def test_stale_state_alert(run):
           "updated_age_s": 600}
     out = run(pm, st)
     assert out["alert"] == "STUCK"
+
+
+# ── 2026-08-05 review item 3: feed-silence detection ─────────────────────
+
+def test_feed_silent_with_position_alerts(run):
+    pm = {"status": "online", "restarts": 181, "uptime_s": 1000, "unstable": 0}
+    st = {"has_position": True, "trade_id": "T1", "state": "HOLDING_SPREAD",
+          "updated_age_s": 1}
+    feed = {"TMFH6_tick": {"age_s": 500, "count": 100},
+            "TMFH6_bidask": {"age_s": 1, "count": 100},
+            "TMFI6_tick": {"age_s": 1, "count": 100},
+            "TMFI6_bidask": {"age_s": 1, "count": 100}}
+    out = run(pm, st, feed=feed)
+    assert out["alert"] == "POSITION_AT_RISK"
+    assert any("feed_silent" in r for r in out["reasons"])
+
+
+def test_feed_silent_no_position_alerts_feed_silent(run):
+    pm = {"status": "online", "restarts": 181, "uptime_s": 1000, "unstable": 0}
+    st = {"has_position": False, "trade_id": None, "state": "HEARTBEAT",
+          "updated_age_s": 1}
+    feed = {"TMFH6_tick": {"age_s": 500, "count": 100},
+            "TMFH6_bidask": {"age_s": 1, "count": 100},
+            "TMFI6_tick": {"age_s": 1, "count": 100},
+            "TMFI6_bidask": {"age_s": 1, "count": 100}}
+    out = run(pm, st, feed=feed)
+    assert out["alert"] == "FEED_SILENT"
+
+
+def test_empty_registry_no_false_alert(run):
+    """Empty registry (TMF via tick_dispatcher, not GCA) must NOT alert."""
+    pm = {"status": "online", "restarts": 181, "uptime_s": 1000, "unstable": 0}
+    st = {"has_position": True, "trade_id": "T1", "state": "HOLDING_SPREAD",
+          "updated_age_s": 1}
+    feed = {"TMFH6_tick": {"age_s": None, "count": 0},
+            "TMFH6_bidask": {"age_s": None, "count": 0},
+            "TMFI6_tick": {"age_s": None, "count": 0},
+            "TMFI6_bidask": {"age_s": None, "count": 0}}
+    out = run(pm, st, feed=feed)
+    assert out["alert"] == "OK"  # no data -> UNKNOWN, no alert
