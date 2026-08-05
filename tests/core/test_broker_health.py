@@ -194,3 +194,23 @@ def test_recovery_failure_keeps_entry_blocked():
     t.finish_recovery(g, ok=False)
     assert t.entry_blocked
     assert t.state == HealthState.DEGRADED
+
+
+
+def test_unknown_error_never_auto_exit():
+    """UNKNOWN_BROKER_ERROR must map to a safe state, never terminate."""
+    t = BrokerHealthTracker()
+    t.record_failure(RuntimeError("mystery"))
+    t.record_failure(RuntimeError("mystery"))
+    assert t.state != HealthState.PROCESS_RESTART_REQUIRED
+    assert not t.should_restart_process()
+    assert t.entry_blocked  # unknown state blocks new entries
+
+
+def test_unknown_error_blocks_entry_until_recovery():
+    t = BrokerHealthTracker()
+    t.record_failure(RuntimeError("mystery"))
+    assert t.entry_blocked
+    t.record_success()
+    assert not t.entry_blocked
+    assert t.state == HealthState.HEALTHY
