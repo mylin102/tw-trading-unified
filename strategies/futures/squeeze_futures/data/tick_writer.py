@@ -16,6 +16,7 @@ import csv
 import time
 from datetime import datetime
 from pathlib import Path
+from core.date_utils import get_session_date_str
 from typing import Optional
 import pandas as pd
 
@@ -30,19 +31,21 @@ class RawTickWriter:
     - A crash can always rebuild state from raw CSV.
     """
 
-    def __init__(self, contract_code: str, trading_day: str):
+    def __init__(self, contract_code: str, trading_day: str, *, base_dir: Optional[Path] = None, session_date_resolver=None):
         self._contract_code = contract_code
         self._trading_day = trading_day
         self._file_path: Optional[Path] = None
         self._file_handle = None
         self._csv_writer = None
         self._record_count = 0
+        self._base_dir = Path(base_dir) if base_dir is not None else None
+        self._session_date_resolver = session_date_resolver or (lambda: get_session_date_str(datetime.now()))
         self._open()
 
     def _open(self):
         """Open (or create) the CSV file for appending."""
         # Determine base directory; use project root relative to this file
-        base = Path(__file__).resolve().parents[4]  # navigates up to project root
+        base = self._base_dir or Path(__file__).resolve().parents[4]  # navigates up to project root
         raw_dir = base / "logs" / "raw_ticks"
         raw_dir.mkdir(parents=True, exist_ok=True)
 
@@ -60,9 +63,19 @@ class RawTickWriter:
             ])
             self._file_handle.flush()
 
+    def _rotate_if_session_changed(self) -> None:
+        """Rotate at the TAIFEX session boundary without restarting the monitor."""
+        session_day = str(self._session_date_resolver())
+        if session_day == self._trading_day:
+            return
+        self.close()
+        self._trading_day = session_day
+        self._open()
+
     def write(self, tick) -> None:
         """Append a single tick to CSV. Must be called before any in-memory use."""
         try:
+            self._rotate_if_session_changed()
             ts = tick.datetime
             if isinstance(ts, datetime):
                 ts_str = ts.isoformat()
