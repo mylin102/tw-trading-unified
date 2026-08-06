@@ -7,6 +7,7 @@ This repository central docs landing page. Canonical docs are in /docs.
 - Strategies: docs/strategies.md
 - Repository history: docs/repo-history.md
 - Daily checklist: docs/daily-trading-checklist.md
+- MTS position authority: docs/MTS_POSITION_AUTHORITY.md
 - Docs style guide: docs/docs-style-guide.md
 
 Branch scope: branch-scoped canonical docs include a "Scope: branch <name>" line when required (e.g., mac-m1).

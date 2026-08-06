@@ -13,6 +13,7 @@ from strategies.futures.mts_ledger_authority import (
     MtsAuthorityState,
     MtsGateAction,
     MtsLedgerProjection,
+    MtsTransition,
     gate_decision_post_signal,
     gate_decision_pre_signal,
     project_fills,
@@ -94,8 +95,8 @@ def test_old_leftover_alone_is_flat_not_open():
 def test_invalid_side_fails_closed():
     fills = [_fill("t4", "NEAR", "NEAR", 44251.0, "ENTRY")]  # garbage side
     auth = project_fills(fills)
-    assert auth.near_qty == 0
-    assert auth.near_side is None, "invalid side must not fabricate LONG/SHORT"
+    assert auth.status == MtsAuthority.UNKNOWN
+    assert "INVALID_FILL:t4" in auth.anomalies
 
 
 def test_entry_prices_captured():
@@ -129,7 +130,7 @@ def test_ledger_unreadable_never_resets():
     auth = MtsAuthorityState(MtsAuthority.UNKNOWN)
     action = gate_decision_pre_signal(auth, state_has_pos=False,
                                       strat_has_pos=True, strat_trade_id="t-x")
-    assert action == MtsGateAction.PASS, "UNKNOWN must never reset"
+    assert action == MtsGateAction.HOLD, "UNKNOWN must neither reset nor evaluate normal lifecycle"
 
 
 def test_strategy_lost_position_reconstructs():
@@ -163,7 +164,8 @@ def test_exit_blocked_when_flat():
 
 def test_exit_allowed_when_unknown_fail_open():
     auth = MtsAuthorityState(MtsAuthority.UNKNOWN)
-    assert gate_decision_post_signal(auth, "EXIT") == MtsGateAction.PASS
+    assert gate_decision_post_signal(auth, "EXIT") == MtsGateAction.BLOCK_SIGNAL
+    assert gate_decision_post_signal(auth, "EXIT", emergency=True) == MtsGateAction.PASS
 
 
 def test_non_exit_signal_never_blocked():
@@ -205,7 +207,8 @@ def test_paper_live_source_separation():
         for f in fills:
             p.apply_fill(f)
     assert p1.source == "PAPER" and p2.source == "LIVE"
-    assert p1.snapshot() == p2.snapshot(), "identical fills → identical authority regardless of source"
+    assert p1.snapshot().status == MtsAuthority.OPEN
+    assert p2.snapshot().status == MtsAuthority.UNKNOWN, "live must not trust local ledger"
 
 
 def test_projection_rotation_handles_truncated_file(tmp_path):
@@ -220,3 +223,53 @@ def test_projection_rotation_handles_truncated_file(tmp_path):
     proj.sync_from_ledger()
     auth = proj.snapshot()
     assert auth.status == MtsAuthority.OPEN and auth.trade_id == "t9"
+
+
+def test_pending_entry_is_transitioning_before_any_paper_fill():
+    auth = project_fills([], transition=MtsTransition.ENTRY_BOTH_PENDING)
+    assert auth.status == MtsAuthority.TRANSITIONING
+    assert gate_decision_pre_signal(auth, False, False, None) == MtsGateAction.HOLD
+
+
+def test_pending_exit_with_open_legs_is_transitioning_and_blocks_normal_on_bar():
+    auth = project_fills([
+        _fill("t10", "NEAR", "SHORT", 44100, "ENTRY"),
+        _fill("t10", "FAR", "LONG", 44200, "ENTRY"),
+    ], transition=MtsTransition.EXIT_BOTH_PENDING)
+    assert auth.status == MtsAuthority.TRANSITIONING
+    assert gate_decision_pre_signal(auth, True, True, "t10") == MtsGateAction.HOLD
+
+
+def test_illegal_transition_matrix_fails_closed():
+    auth = project_fills([], transition=MtsTransition.RELEASE_SIBLING_PENDING)
+    assert auth.status == MtsAuthority.UNKNOWN
+    assert "ILLEGAL_TRANSITION_MATRIX" in auth.anomalies
+
+
+def test_trailing_partial_jsonl_is_unknown_then_recovers_when_completed(tmp_path):
+    path = tmp_path / "fills.jsonl"
+    fill = _fill("t11", "NEAR", "SHORT", 44100, "ENTRY")
+    raw = json.dumps(fill).encode()
+    path.write_bytes(raw[:20])
+    proj = MtsLedgerProjection(path=str(path))
+    assert proj.sync_from_ledger() == 0
+    assert proj.snapshot().status == MtsAuthority.UNKNOWN
+    with open(path, "ab") as f:
+        f.write(raw[20:] + b"\n")
+    assert proj.sync_from_ledger() == 1
+    assert proj.snapshot().status == MtsAuthority.OPEN
+
+
+def test_same_size_replace_uses_file_identity_not_offset(tmp_path):
+    path = tmp_path / "fills.jsonl"
+    one = json.dumps(_fill("ta", "NEAR", "SHORT", 44100, "ENTRY")) + "\n"
+    path.write_text(one)
+    proj = MtsLedgerProjection(path=str(path))
+    proj.sync_from_ledger()
+    replacement = tmp_path / "replacement"
+    replacement.write_text(json.dumps(_fill("tb", "FAR", "LONG", 44200, "ENTRY")) + "\n")
+    os.replace(replacement, path)
+    proj.sync_from_ledger()
+    auth = proj.snapshot()
+    assert auth.trade_id == "tb"
+    assert auth.snapshot_token[0], "snapshot includes file identity"
