@@ -14,6 +14,13 @@ import traceback
 import uuid
 from pathlib import Path
 from collections import deque
+from strategies.futures.mts_ledger_authority import (
+    MtsAuthority,
+    MtsGateAction,
+    MtsLedgerProjection,
+    gate_decision_post_signal,
+    gate_decision_pre_signal,
+)
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
@@ -325,6 +332,18 @@ class FuturesMonitor:
                 self.manual_trade_flag_path = f"/tmp/futures_manual_trade_{_base_name}.flag"
         # 2026-06-05 JVS Claw: NO_LIVE_TICK fix — atomic flag lifecycle + idempotency
         self._processed_flag_ids: set = set()   # C2: idempotency set (in-memory, reset on restart)
+        # 2026-08-06 Hermes Agent P1: incremental fills-ledger authority
+        # (three-state FLAT/OPEN/UNKNOWN). Bootstrap reads the ledger once;
+        # afterwards only NEW bytes are tail-read (never a per-tick full scan).
+        self._ledger_projection = MtsLedgerProjection(
+            path=os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                "logs", "mts_trade_fills.jsonl",
+            ),
+            source="PAPER",
+        )
+        self._ledger_projection_sync_ts = 0.0
+
         self._flag_retry_count: int = 0         # C7: retry counter (in-memory)
         self._current_flag_id: str | None = None  # C2: tracks flag being processed
         # 2026-06-05 JVS Claw: R1 — startup cleanup of orphaned .processing files
@@ -6822,29 +6841,48 @@ class FuturesMonitor:
             pass
 
         _strat_has_pos = bool(getattr(strategy, "_has_position", False))
-        if not _authority_has_pos and _strat_has_pos:
+        _strat_tid = getattr(strategy, "_trade_id", None)
+
+        # 2026-08-06 Hermes Agent P1: three-state LEDGER authority drives both
+        # the pre-signal reset and the post-signal exit gate. The state file
+        # lags the ledger during multi-leg fills — a plain bool read of it
+        # forced a strategy._reset() on a freshly entered position (incident
+        # 2026-08-06 o-091403-145, 2h unmanaged). See
+        # strategies/futures/mts_ledger_authority.py for the pure decisions.
+        if time.monotonic() - self._ledger_projection_sync_ts > 2.0:
+            self._ledger_projection.sync_from_ledger()
+            self._ledger_projection_sync_ts = time.monotonic()
+        _auth = self._ledger_projection.snapshot()
+        _pre_action = gate_decision_pre_signal(
+            _auth, _authority_has_pos, _strat_has_pos, _strat_tid,
+        )
+        if _pre_action == MtsGateAction.RESET_STRATEGY:
             console.print(
-                f"[bold yellow]⚠️ [POSITION_AUTHORITY] State file says FLAT but strategy "
-                f"has _has_position=True — force-syncing strategy to FLAT[/bold yellow]"
+                f"[bold yellow]⚠️ [POSITION_AUTHORITY] Ledger FLAT + memory open "
+                f"(trade={_strat_tid}) — force-syncing strategy to FLAT[/bold yellow]"
             )
             strategy._reset(reason="POSITION_AUTHORITY_FLAT")
-            # Block any signal for this tick
-            signal = None
-        else:
-            signal = None
+        elif _pre_action == MtsGateAction.RECONSTRUCT:
+            self._reconstruct_position_from_ledger(strategy, _auth)
+
+        signal = None
+        if _pre_action != MtsGateAction.RESET_STRATEGY:
             # 2026-07-08 Hermes Agent: Risk control gates (settlement > SINGLE_LEG > normal)
             if not self._mts_risk_gate_settlement(strategy):
                 if not self._mts_risk_gate_single_leg_preclose(strategy, _bar_dict):
                     signal = strategy.on_bar(ctx)
 
         # 2026-07-07 Hermes Agent: P0 — Post-signal authority gate.
-        # Even if strategy generated an EXIT/RELEASE signal, reject it if the
-        # persistent authority still says FLAT (belt-and-suspenders).
-        if signal is not None and not _authority_has_pos:
+        # 2026-08-06 Hermes Agent P1: driven by the LEDGER authority (not the
+        # state file), so a lagging state file can no longer suppress a real
+        # exit. Block only when the ledger itself says FLAT; UNKNOWN stays
+        # fail-open for exits.
+        if signal is not None:
             _sig_action = getattr(signal, "action", "?")
-            if _sig_action in ("EXIT", "PARTIAL_EXIT"):
+            _post_action = gate_decision_post_signal(_auth, _sig_action)
+            if _post_action == MtsGateAction.BLOCK_SIGNAL:
                 console.print(
-                    f"[bold red]⛔ [MTS_ORDER_REJECT] Authority says FLAT; "
+                    f"[bold red]⛔ [MTS_ORDER_REJECT] Ledger FLAT; "
                     f"blocking signal={_sig_action} reason={getattr(signal, 'reason', '?')}[/bold red]"
                 )
                 signal = None
@@ -6990,52 +7028,64 @@ class FuturesMonitor:
     # ═══════════════════════════════════════════════════════════════
 
     def _mts_has_open_position_from_fills(self) -> bool:
-        """Scan fills ledger for any trade with ENTRY but no matching EXIT.
+        """Three-state ledger authority (incremental projection, 2026-08-06 P1).
 
-        The fills log (mts_trade_fills.jsonl) is an append-only ledger.
-        If any trade_id has ENTRY fills but no EXIT fill, there is an
-        orphaned open position that the state file may have lost track of.
-
-        Returns True if at least one trade has unclosed entries.
+        The old implementation re-scanned the whole fills JSONL on every call
+        (a per-tick full scan). The projection is maintained incrementally
+        (tail-read of new bytes only); this is now a thin snapshot read.
         """
-        _fills_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "logs", "mts_trade_fills.jsonl",
+        self._ledger_projection.sync_from_ledger()
+        return self._ledger_projection.snapshot().status == MtsAuthority.OPEN
+
+    def _reconstruct_position_from_ledger(self, strategy, auth):
+        """Rebuild the strategy position state from the ledger authority and
+        write it back to the state file (2026-08-06 P1).
+
+        Called when the state file lags the ledger (or the strategy holds a
+        stale trade_id): the position is reconstructed to the LEDGER truth —
+        correct side / qty / lifecycle — then persisted. This is not a
+        skipped reset; it is an authoritative rebuild.
+        """
+        strategy._has_position = True
+        strategy._trade_id = auth.trade_id
+        strategy._near_side = auth.near_side
+        strategy._far_side = auth.far_side
+        strategy._near_entry = auth.near_entry
+        strategy._far_entry = auth.far_entry
+        strategy._released_leg = None
+        console.print(
+            f"[bold yellow]♻️ [POSITION_AUTHORITY] Ledger reconstruct: "
+            f"trade={auth.trade_id} near={auth.near_side}x{abs(auth.near_qty)} "
+            f"far={auth.far_side}x{abs(auth.far_qty)} — writing back state[/bold yellow]"
         )
-        if not os.path.exists(_fills_path):
-            return False
         try:
-            # 2026-07-31: Counter-based, consistent with strategy
-            # _check_fills_has_open_position. The old set-based logic removed a
-            # trade from the open set after ANY single EXIT/RELEASE fill — even
-            # when one leg remained open (e.g. 2 ENTRY + 1 RELEASE), which fired
-            # a bogus SPLIT_BRAIN reset loop (10k+ iterations observed).
-            from collections import Counter
-            _entry_counts: Counter = Counter()
-            _exit_counts: Counter = Counter()
-            with open(_fills_path) as _f:
-                for _line in _f:
-                    _line = _line.strip()
-                    if not _line:
-                        continue
-                    try:
-                        _fill = json.loads(_line)
-                    except Exception:
-                        continue
-                    _tid = _fill.get("trade_id")
-                    _ft = _fill.get("fill_type")
-                    if not _tid or not _ft:
-                        continue
-                    if _ft == "ENTRY":
-                        _entry_counts[_tid] += 1
-                    elif _ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"):
-                        _exit_counts[_tid] += 1
-            for _tid, _ecnt in _entry_counts.items():
-                if _ecnt > _exit_counts.get(_tid, 0):
-                    return True
-            return False
-        except Exception:
-            return False
+            from strategies.plugins.futures.active.tmf_spread import (
+                _write_mts_state,
+                infer_lifecycle_from_legacy_state,
+            )
+            strategy._lifecycle_oca = infer_lifecycle_from_legacy_state(
+                {"has_position": True, "released_leg": None, "release_state": "BOTH_HELD"}
+            )
+            strategy._lifecycle = "RECOVERED_LEDGER"
+            _write_mts_state(
+                has_position=True, action="LEDGER_RECONSTRUCTED",
+                reason="authority_rebuild",
+                near_entry=auth.near_entry,
+                far_entry=auth.far_entry,
+                near_side=auth.near_side,
+                far_side=auth.far_side,
+                trade_id=auth.trade_id,
+                ticker=self.ticker,
+                atr=0.0,
+                lifecycle={"phase": "SPREAD",
+                           "release_group": {"status": "INACTIVE"},
+                           "trail_group": {"status": "INACTIVE"}},
+            )
+        except Exception as _e:
+            import logging
+            logging.getLogger("FuturesMonitor").warning(
+                "[POSITION_AUTHORITY] state write-back failed: %s", _e
+            )
 
     def _mts_has_pending_mts_orders(self) -> bool:
         """Check if order_mgr has any pending MTS lifecycle orders.
