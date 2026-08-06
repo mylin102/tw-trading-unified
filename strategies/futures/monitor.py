@@ -336,7 +336,7 @@ class FuturesMonitor:
         # (three-state FLAT/OPEN/UNKNOWN). Bootstrap reads the ledger once;
         # afterwards only NEW bytes are tail-read (never a per-tick full scan).
         self._ledger_projection = MtsLedgerProjection(
-            path=os.path.join(
+            path=os.environ.get("MTS_FILL_LOG_PATH") or os.path.join(
                 os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                 "logs", "mts_trade_fills.jsonl",
             ),
