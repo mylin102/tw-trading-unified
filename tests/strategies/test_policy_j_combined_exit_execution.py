@@ -57,7 +57,7 @@ class DummyStrategy:
         return None
 
 
-def make_mock_monitor():
+def make_mock_monitor(fills_log=None):
     from strategies.futures.monitor import FuturesMonitor
     with patch.object(FuturesMonitor, '__init__', lambda self: None):
         mon = FuturesMonitor()
@@ -83,6 +83,9 @@ def make_mock_monitor():
         mon.dry_run = True
         mon.live_trading = False
         mon._claimed_execution_keys = set()
+        if fills_log is not None:
+            from strategies.futures.mts_ledger_authority import MtsLedgerProjection
+            mon._ledger_projection = MtsLedgerProjection(path=fills_log)
         return mon
 
 
@@ -1017,57 +1020,48 @@ def test_ce_terminal_trade_not_resurrected_on_restart(tmp_path, monkeypatch):
 
 
 # Case 46: fills open-detection is Counter-based — 2 ENTRY + 1 RELEASE is still OPEN
-def test_fills_open_detection_leg_remaining(tmp_path, monkeypatch):
+def test_fills_open_detection_leg_remaining(tmp_path):
     import json as _json
     fills_log = str(tmp_path / "mts_trade_fills.jsonl")
     with open(fills_log, "w") as f:
         for rec in [
-            {"trade_id": "t1", "fill_type": "ENTRY"},
-            {"trade_id": "t1", "fill_type": "ENTRY"},
-            {"trade_id": "t1", "fill_type": "RELEASE"},   # one leg released, one still open
+            {"trade_id": "t1", "leg": "NEAR", "side": "LONG", "qty": 1, "price": 100, "fill_type": "ENTRY"},
+            {"trade_id": "t1", "leg": "FAR", "side": "LONG", "qty": 1, "price": 101, "fill_type": "ENTRY"},
+            {"trade_id": "t1", "leg": "NEAR", "side": "SELL", "qty": 1, "price": 102, "fill_type": "RELEASE"},   # one leg released, one still open
         ]:
             f.write(_json.dumps(rec) + "\n")
-    monkeypatch.setattr("strategies.futures.monitor.os.path.join", lambda *a: (
-        fills_log if a and a[-1] == "mts_trade_fills.jsonl" else __import__("os").path.join(*a)
-    ))
-    mon = make_mock_monitor()
+    mon = make_mock_monitor(fills_log)
     assert mon._mts_has_open_position_from_fills() is True, "2 ENTRY + 1 RELEASE must still be OPEN"
 
 
 # Case 47: fully-closed trade (2 ENTRY + 2 EXIT) is NOT open
-def test_fills_open_detection_fully_closed(tmp_path, monkeypatch):
+def test_fills_open_detection_fully_closed(tmp_path):
     import json as _json
     fills_log = str(tmp_path / "mts_trade_fills.jsonl")
     with open(fills_log, "w") as f:
         for rec in [
-            {"trade_id": "t2", "fill_type": "ENTRY"},
-            {"trade_id": "t2", "fill_type": "ENTRY"},
-            {"trade_id": "t2", "fill_type": "EXIT"},
-            {"trade_id": "t2", "fill_type": "EXIT"},
+            {"trade_id": "t2", "leg": "NEAR", "side": "LONG", "qty": 1, "price": 100, "fill_type": "ENTRY"},
+            {"trade_id": "t2", "leg": "FAR", "side": "LONG", "qty": 1, "price": 101, "fill_type": "ENTRY"},
+            {"trade_id": "t2", "leg": "NEAR", "side": "SELL", "qty": 1, "price": 102, "fill_type": "EXIT"},
+            {"trade_id": "t2", "leg": "FAR", "side": "SELL", "qty": 1, "price": 103, "fill_type": "EXIT"},
         ]:
             f.write(_json.dumps(rec) + "\n")
-    monkeypatch.setattr("strategies.futures.monitor.os.path.join", lambda *a: (
-        fills_log if a and a[-1] == "mts_trade_fills.jsonl" else __import__("os").path.join(*a)
-    ))
-    mon = make_mock_monitor()
+    mon = make_mock_monitor(fills_log)
     assert mon._mts_has_open_position_from_fills() is False
 
 
 # Case 48: partial qty close (ENTRY 2 + EXIT 1) is still OPEN
-def test_fills_open_detection_partial_qty(tmp_path, monkeypatch):
+def test_fills_open_detection_partial_qty(tmp_path):
     import json as _json
     fills_log = str(tmp_path / "mts_trade_fills.jsonl")
     with open(fills_log, "w") as f:
         for rec in [
-            {"trade_id": "t3", "fill_type": "ENTRY"},
-            {"trade_id": "t3", "fill_type": "ENTRY"},
-            {"trade_id": "t3", "fill_type": "EXIT"},
+            {"trade_id": "t3", "leg": "NEAR", "side": "LONG", "qty": 1, "price": 100, "fill_type": "ENTRY"},
+            {"trade_id": "t3", "leg": "NEAR", "side": "LONG", "qty": 1, "price": 101, "fill_type": "ENTRY"},
+            {"trade_id": "t3", "leg": "NEAR", "side": "SELL", "qty": 1, "price": 102, "fill_type": "EXIT"},
         ]:
             f.write(_json.dumps(rec) + "\n")
-    monkeypatch.setattr("strategies.futures.monitor.os.path.join", lambda *a: (
-        fills_log if a and a[-1] == "mts_trade_fills.jsonl" else __import__("os").path.join(*a)
-    ))
-    mon = make_mock_monitor()
+    mon = make_mock_monitor(fills_log)
     assert mon._mts_has_open_position_from_fills() is True, "ENTRY 2 + EXIT 1 must still be OPEN"
 
 
