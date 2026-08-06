@@ -51,6 +51,24 @@ def monitor(tmp_path, monkeypatch):
 
 def test_live_stream_flash_spike(monitor):
     m, state_path = monitor
+    # 2026-08-06: pre-gate authority is the fills-ledger projection (7e1bb459),
+    # not the state file and not the legacy _mts_has_open_position_from_fills
+    # mock. Simulate an OPEN authority matching the simulated position so the
+    # gate PASSes; without it the projection reads ambient stale/shared fills
+    # (repo logs or /tmp) and force-resets the strategy (_peak -> 0).
+    from strategies.futures.mts_ledger_authority import MtsAuthority, MtsAuthorityState
+    m._ledger_projection = MagicMock()
+    m._ledger_projection.sync_from_ledger.return_value = 0
+    m._ledger_projection.snapshot.return_value = MtsAuthorityState(
+        status=MtsAuthority.OPEN,
+        trade_id="live-stream-t1",
+        near_qty=-1,
+        far_qty=1,
+        near_side="SHORT",
+        far_side="LONG",
+        near_entry=43900.0,
+        far_entry=44000.0,
+    )
     from strategies.plugins.futures.active.tmf_spread import TMFSpread
     strat = TMFSpread()
     
@@ -71,6 +89,7 @@ def test_live_stream_flash_spike(monitor):
 
     # 1. Setup Active Position
     strat._has_position = True
+    strat._trade_id = "live-stream-t1"
     strat._lifecycle = "TRAILING_LONG"
     strat._side = "LONG"
     strat._released_leg = "near"
