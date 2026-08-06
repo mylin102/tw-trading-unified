@@ -6706,8 +6706,28 @@ class FuturesMonitor:
 
             strategy._near_entry = float(_disk.get("near_entry") or getattr(strategy, "_near_entry", 0) or 0.0)
             strategy._far_entry = float(_disk.get("far_entry") or getattr(strategy, "_far_entry", 0) or 0.0)
-            strategy._near_side = _disk.get("near_side") or getattr(strategy, "_near_side", None)
-            strategy._far_side = _disk.get("far_side") or getattr(strategy, "_far_side", None)
+            # 2026-08-06 Hermes Agent P1: sides must be authoritative — the
+            # reconcile previously copied whatever the state file held (once
+            # leg labels "NEAR"/"FAR"), and close_all's `else BUY` mapping then
+            # sent wrong-direction orders. Near derives from the broker
+            # position; far accepts only valid LONG/SHORT (else None, and
+            # close_all fails closed instead of sending a wrong order).
+            _near_side = _disk.get("near_side") or getattr(strategy, "_near_side", None)
+            _far_side = _disk.get("far_side") or getattr(strategy, "_far_side", None)
+            if _broker_pos > 0:
+                _near_side = "LONG"
+            elif _broker_pos < 0:
+                _near_side = "SHORT"
+            else:
+                _near_side = None
+            if _far_side not in ("LONG", "SHORT"):
+                console.print(
+                    f"[red]⚠️ [BROKER_RECONCILED] invalid far_side={_far_side!r} → None; "
+                    f"close_all will fail-closed[/red]"
+                )
+                _far_side = None
+            strategy._near_side = _near_side
+            strategy._far_side = _far_side
             strategy._released_leg = _disk.get("released_leg") or getattr(strategy, "_released_leg", None)
             strategy._trade_id = _disk.get("trade_id") or getattr(strategy, "_trade_id", None)
 
@@ -7435,6 +7455,36 @@ class FuturesMonitor:
 
                     _ts = datetime.now()
                     from core.order_management.order import OrderType, OrderSide
+                    # 2026-08-06 Hermes Agent P1: fail-closed sides guard.
+                    # BROKER_RECONCILED once wrote leg labels ("NEAR"/"FAR")
+                    # into near_side/far_side; the `SELL if == "LONG" else BUY`
+                    # mapping silently sent BUY for ANY non-LONG value — wrong
+                    # direction for a LONG far leg. Refuse to submit; write
+                    # FAILED (terminal, .processing removed so no retry loop).
+                    _invalid_sides = []
+                    if _released_leg is None:
+                        if _near_side not in ("LONG", "SHORT"):
+                            _invalid_sides.append(f"near={_near_side!r}")
+                        if _far_side not in ("LONG", "SHORT"):
+                            _invalid_sides.append(f"far={_far_side!r}")
+                    else:
+                        _rem_leg_side = _far_side if _released_leg == "near" else _near_side
+                        if _rem_leg_side not in ("LONG", "SHORT"):
+                            _invalid_sides.append(f"remaining={_rem_leg_side!r}")
+                    if _invalid_sides:
+                        self._write_manual_command_status(
+                            _command_id, "FAILED",
+                            f"close_all aborted: invalid side(s) "
+                            f"{', '.join(_invalid_sides)} — refusing to submit",
+                            has_pos=_has_pos,
+                        )
+                        console.print(
+                            f"[red]❌ [MANUAL_TRADE] close_all FAILED: invalid side(s) "
+                            f"{', '.join(_invalid_sides)} — refusing to submit[/red]"
+                        )
+                        if os.path.exists(_processing_path):
+                            os.remove(_processing_path)
+                        return True
                     _EXIT_BUFFER = 10
                     _TICK = 1.0
 
