@@ -1,18 +1,26 @@
-"""Fail-closed MTS position authority derived from local paper fills.
+"""Three-state MTS position authority derived from the fills ledger.
 
-The fills ledger establishes *facts* (per-leg signed exposure); active orders
-establish *intent* (a lifecycle transition).  They must not be conflated.
-This module is deliberately independent of the monitor so its safety contract
-can be exercised without a broker or a running strategy.
+Replaces the bool `has_position` authority with a ledger-derived three-state
+view (FLAT / OPEN(trade_id, per-leg net qty) / UNKNOWN) plus pure gate
+decisions for the pre-signal reset and the post-signal exit suppression.
+
+Design contract (2026-08-06, P1):
+- Pure functions (`project_fills`, `gate_decision_*`) are fully testable.
+- `MtsLedgerProjection` updates incrementally (tail-read of new bytes /
+  per-fill `apply_fill`) — never a per-tick full scan.
+- The CURRENT trade is the latest trade_id with an open leg; leftover
+  entries from older trades are anomalies and never protect the current
+  trade.
+- Invalid sides are never fabricated into LONG/SHORT (fail-closed).
+- UNKNOWN (unreadable ledger) never triggers a strategy reset.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable, Optional
 
@@ -20,291 +28,238 @@ from typing import Iterable, Optional
 class MtsAuthority(Enum):
     FLAT = "FLAT"
     OPEN = "OPEN"
-    TRANSITIONING = "TRANSITIONING"
     UNKNOWN = "UNKNOWN"
 
 
-class MtsTransition(Enum):
-    NONE = "NONE"
-    ENTRY_BOTH_PENDING = "ENTRY_BOTH_PENDING"
-    EXIT_BOTH_PENDING = "EXIT_BOTH_PENDING"
-    RELEASE_SIBLING_PENDING = "RELEASE_SIBLING_PENDING"
-    EXIT_REMAINING_PENDING = "EXIT_REMAINING_PENDING"
-    EXIT_SETTLEMENT_PENDING = "EXIT_SETTLEMENT_PENDING"
-
-
 class MtsGateAction(Enum):
-    RESET_STRATEGY = "RESET_STRATEGY"
-    RECONSTRUCT = "RECONSTRUCT"
-    HOLD = "HOLD"                 # do not run normal on_bar lifecycle work
-    PASS = "PASS"
-    BLOCK_SIGNAL = "BLOCK_SIGNAL"
+    RESET_STRATEGY = "RESET_STRATEGY"   # true divergence — force reset
+    RECONSTRUCT = "RECONSTRUCT"         # state lags / strategy stale — rebuild from ledger
+    PASS = "PASS"                       # nothing to do
+    BLOCK_SIGNAL = "BLOCK_SIGNAL"       # post-signal: reject exit (authority flat)
 
 
 @dataclass(frozen=True)
 class MtsAuthorityState:
     status: MtsAuthority
     trade_id: Optional[str] = None
-    near_qty: int = 0
+    near_qty: int = 0          # signed: +long / -short
     far_qty: int = 0
-    near_side: Optional[str] = None
+    near_side: Optional[str] = None   # "LONG"/"SHORT"/None — never fabricated
     far_side: Optional[str] = None
     near_entry: float = 0.0
     far_entry: float = 0.0
     current_trade_id: Optional[str] = None
-    transition: MtsTransition = MtsTransition.NONE
-    snapshot_token: tuple = ()
     anomalies: tuple = ()
 
 
 _VALID_SIDES = ("LONG", "SHORT")
+_EXIT_FILL_TYPES = ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_COMPLETED")
 
 
-def _fill_leg(fill: dict) -> Optional[str]:
+def _fill_leg(fill) -> Optional[str]:
     leg = str(fill.get("leg") or fill.get("contract") or "").upper()
     return leg if leg in ("NEAR", "FAR") else None
 
 
-def _side_delta(fill: dict) -> Optional[int]:
-    """Return signed quantity, or None for an invalid fact.
+def _side_delta(fill) -> int:
+    """Signed qty contribution. BUY/LONG → +1; SELL/SHORT → -1; garbage → 0.
 
-    Returning zero for malformed fields used to turn a corrupt open trade into
-    FLAT.  That is unsafe, so invalid side/qty is an UNKNOWN authority.
+    Convention: ENTRY fills carry the position side (SHORT/LONG); EXIT/RELEASE
+    fills carry the closing order direction (BUY/SELL). Both accumulate on the
+    same signed axis: closing a short IS a buy (+1).
     """
     try:
+        side = str(fill.get("side") or "")
         qty = int(fill.get("qty") or 1)
     except (TypeError, ValueError):
-        return None
-    if qty <= 0:
-        return None
-    side = str(fill.get("side") or "").upper()
+        return 0
     if side in ("BUY", "LONG"):
         return qty
     if side in ("SELL", "SHORT"):
         return -qty
-    return None
+    return 0  # invalid side → 0, never a fabricated direction
 
 
-def _fill_key(fill: dict) -> tuple:
-    """Prefer immutable order/deal identity; legacy fallback is conservative."""
-    deal_id = fill.get("deal_id") or fill.get("order_id")
-    if deal_id:
-        return ("deal", str(deal_id))
+def _fill_key(fill):
     return (
-        "legacy", fill.get("trade_id"), str(fill.get("leg") or fill.get("contract") or "").upper(),
-        fill.get("side"), fill.get("price"), fill.get("qty"), fill.get("timestamp"),
+        fill.get("trade_id"),
+        str(fill.get("leg") or fill.get("contract") or "").upper(),
+        fill.get("side"),
+        fill.get("price"),
+        fill.get("timestamp"),
     )
 
 
-def _new_trade() -> dict:
-    return {"NEAR": 0, "FAR": 0, "near_entry": 0.0, "far_entry": 0.0}
+def _reduce_trades(trades: dict, order: list) -> MtsAuthorityState:
+    """Shared reduction over a per-trade per-leg accumulator.
 
-
-def _transition_status(exposure: MtsAuthorityState, transition: MtsTransition) -> MtsAuthorityState:
-    if transition is MtsTransition.NONE:
-        return exposure
-    # The legal matrix deliberately permits the three orders of arrival seen
-    # in paper callbacks.  All other combinations are not inferred.
-    legal = {
-        (MtsAuthority.FLAT, MtsTransition.ENTRY_BOTH_PENDING),
-        (MtsAuthority.OPEN, MtsTransition.EXIT_BOTH_PENDING),
-        (MtsAuthority.OPEN, MtsTransition.RELEASE_SIBLING_PENDING),
-        (MtsAuthority.OPEN, MtsTransition.EXIT_REMAINING_PENDING),
-        (MtsAuthority.FLAT, MtsTransition.EXIT_SETTLEMENT_PENDING),
-        (MtsAuthority.OPEN, MtsTransition.EXIT_SETTLEMENT_PENDING),
-    }
-    # A partially filled entry/release is still OPEN exposure plus a pending
-    # order.  It belongs to TRANSITIONING, not a guessed SPREAD/SINGLE_LEG.
-    if (exposure.status, transition) in legal:
-        return MtsAuthorityState(
-            MtsAuthority.TRANSITIONING, trade_id=exposure.trade_id,
-            near_qty=exposure.near_qty, far_qty=exposure.far_qty,
-            near_side=exposure.near_side, far_side=exposure.far_side,
-            near_entry=exposure.near_entry, far_entry=exposure.far_entry,
-            current_trade_id=exposure.current_trade_id, transition=transition,
-            snapshot_token=exposure.snapshot_token, anomalies=exposure.anomalies,
-        )
-    return MtsAuthorityState(
-        MtsAuthority.UNKNOWN, current_trade_id=exposure.current_trade_id,
-        transition=transition, snapshot_token=exposure.snapshot_token,
-        anomalies=exposure.anomalies + ("ILLEGAL_TRANSITION_MATRIX",),
-    )
-
-
-def _reduce_trades(trades: dict, order: list, *, transition=MtsTransition.NONE, token=()) -> MtsAuthorityState:
+    The CURRENT trade is the LATEST trade_id in the ledger. Leftover open
+    legs from OLDER trades are anomalies — they never protect/define the
+    current position (2026-08-06 P1 contract).
+    """
     current = order[-1] if order else None
     if current is None:
-        return _transition_status(MtsAuthorityState(MtsAuthority.FLAT, snapshot_token=token), transition)
-    anomalies = tuple(tid for tid in order if tid != current and any(trades[tid][leg] for leg in ("NEAR", "FAR")))
-    nq, fq = trades[current]["NEAR"], trades[current]["FAR"]
-    if nq == 0 and fq == 0:
-        state = MtsAuthorityState(MtsAuthority.FLAT, current_trade_id=current, snapshot_token=token, anomalies=anomalies)
-    else:
-        state = MtsAuthorityState(
-            MtsAuthority.OPEN, trade_id=current, near_qty=nq, far_qty=fq,
-            near_side="LONG" if nq > 0 else ("SHORT" if nq < 0 else None),
-            far_side="LONG" if fq > 0 else ("SHORT" if fq < 0 else None),
-            near_entry=trades[current]["near_entry"], far_entry=trades[current]["far_entry"],
-            current_trade_id=current, snapshot_token=token, anomalies=anomalies,
+        return MtsAuthorityState(MtsAuthority.FLAT)
+    anomalies = tuple(
+        tid for tid in order
+        if tid != current and (trades[tid]["NEAR"] != 0 or trades[tid]["FAR"] != 0)
+    )
+    if trades[current]["NEAR"] == 0 and trades[current]["FAR"] == 0:
+        return MtsAuthorityState(
+            MtsAuthority.FLAT,
+            current_trade_id=current,
+            anomalies=anomalies,
         )
-    return _transition_status(state, transition)
+    nq, fq = trades[current]["NEAR"], trades[current]["FAR"]
+    return MtsAuthorityState(
+        MtsAuthority.OPEN,
+        trade_id=current,
+        near_qty=nq,
+        far_qty=fq,
+        near_side="LONG" if nq > 0 else ("SHORT" if nq < 0 else None),
+        far_side="LONG" if fq > 0 else ("SHORT" if fq < 0 else None),
+        near_entry=trades[current].get("near_entry", 0.0),
+        far_entry=trades[current].get("far_entry", 0.0),
+        current_trade_id=current,
+        anomalies=anomalies,
+    )
 
 
-def project_fills(fills: Iterable[dict], *, transition: MtsTransition = MtsTransition.NONE) -> MtsAuthorityState:
-    """Pure projection. Any malformed current-trade fact is UNKNOWN."""
+def project_fills(fills: Iterable[dict]) -> MtsAuthorityState:
+    """Pure: reduce an iterable of fill dicts to the three-state authority."""
     trades: dict = {}
     order: list = []
     seen = set()
-    invalid = []
     for fill in fills:
         tid = fill.get("trade_id")
         if not tid:
-            invalid.append("MISSING_TRADE_ID")
             continue
         key = _fill_key(fill)
         if key in seen:
-            continue
+            continue  # duplicate deal — never double count
         seen.add(key)
         if tid not in trades:
-            trades[tid] = _new_trade()
+            trades[tid] = {"NEAR": 0, "FAR": 0, "near_entry": 0.0, "far_entry": 0.0}
             order.append(tid)
-        leg, delta = _fill_leg(fill), _side_delta(fill)
-        if leg is None or delta is None:
-            invalid.append(f"INVALID_FILL:{tid}")
+        leg = _fill_leg(fill)
+        if leg is None:
             continue
-        trades[tid][leg] += delta
-        if str(fill.get("fill_type") or "") == "ENTRY" and trades[tid][f"{leg.lower()}_entry"] == 0.0:
+        ft = str(fill.get("fill_type") or "")
+        d = _side_delta(fill)
+        trades[tid][leg] += d
+        if ft == "ENTRY" and d != 0 and trades[tid].get(f"{leg.lower()}_entry", 0.0) == 0.0:
             try:
                 trades[tid][f"{leg.lower()}_entry"] = float(fill.get("price") or 0.0)
             except (TypeError, ValueError):
-                invalid.append(f"INVALID_PRICE:{tid}")
-    if invalid and (not order or any(x.endswith(str(order[-1])) for x in invalid)):
-        return MtsAuthorityState(MtsAuthority.UNKNOWN, current_trade_id=order[-1] if order else None, anomalies=tuple(invalid))
-    return _reduce_trades(trades, order, transition=transition)
+                pass
+    return _reduce_trades(trades, order)
 
 
-def gate_decision_pre_signal(auth: MtsAuthorityState, state_has_pos: bool, strat_has_pos: bool, strat_trade_id: Optional[str]) -> MtsGateAction:
-    if auth.status is MtsAuthority.TRANSITIONING:
-        return MtsGateAction.HOLD
-    if auth.status is MtsAuthority.UNKNOWN:
-        return MtsGateAction.HOLD
+# ── pure gate decisions ──
+
+def gate_decision_pre_signal(
+    auth: MtsAuthorityState,
+    state_has_pos: bool,
+    strat_has_pos: bool,
+    strat_trade_id: Optional[str],
+) -> MtsGateAction:
+    """Pre-signal gate: reset / reconstruct / pass before on_bar runs."""
     if strat_has_pos:
-        if auth.status is MtsAuthority.FLAT:
-            return MtsGateAction.RESET_STRATEGY
-        if auth.trade_id == strat_trade_id and state_has_pos:
-            return MtsGateAction.PASS
-        return MtsGateAction.RECONSTRUCT
-    if auth.status is MtsAuthority.OPEN:
-        return MtsGateAction.RECONSTRUCT
-    return MtsGateAction.PASS
-
-
-def gate_decision_post_signal(auth: MtsAuthorityState, signal_action: str, *, emergency: bool = False) -> MtsGateAction:
-    if emergency:
+        if auth.status == MtsAuthority.FLAT:
+            return MtsGateAction.RESET_STRATEGY   # true divergence
+        if auth.status == MtsAuthority.OPEN:
+            if auth.trade_id == strat_trade_id and state_has_pos:
+                return MtsGateAction.PASS
+            return MtsGateAction.RECONSTRUCT      # state lags or strategy stale
+        return MtsGateAction.PASS                 # UNKNOWN — never reset
+    else:
+        if auth.status == MtsAuthority.OPEN:
+            return MtsGateAction.RECONSTRUCT      # strategy lost the position
         return MtsGateAction.PASS
+
+
+def gate_decision_post_signal(auth: MtsAuthorityState, signal_action: str) -> MtsGateAction:
+    """Post-signal gate: suppress exit signals only when the ledger says FLAT."""
     if signal_action not in ("EXIT", "PARTIAL_EXIT"):
         return MtsGateAction.PASS
-    if auth.status in (MtsAuthority.FLAT, MtsAuthority.TRANSITIONING, MtsAuthority.UNKNOWN):
+    if auth.status == MtsAuthority.FLAT:
         return MtsGateAction.BLOCK_SIGNAL
-    return MtsGateAction.PASS
+    return MtsGateAction.PASS   # OPEN (ledger confirms) or UNKNOWN (fail-open)
 
+
+# ── incremental projection ──
 
 class MtsLedgerProjection:
-    """Event-driven ledger projection with rotation and partial-record safety.
+    """Incremental per-trade per-leg projection over the fills ledger.
 
-    ``sync_from_ledger`` only opens the ledger when its identity, size, or mtime
-    changed.  The exported token fences a decision against replacement,
-    truncation, and append races.  LIVE intentionally reports UNKNOWN unless a
-    broker adapter supplies an independently verified projection.
+    Bootstrap reads the whole file once; afterwards only NEW bytes are
+    tail-read (`sync_from_ledger`) or fills are pushed directly
+    (`apply_fill`). Never a per-tick full scan.
     """
 
     def __init__(self, path: Optional[str] = None, source: str = "PAPER"):
         self._path = path
-        self.source = source.upper()
+        self.source = source          # "PAPER" | "LIVE" — authority paths stay separate
         self._trades: dict = {}
         self._order: list = []
-        self._seen: deque = deque(maxlen=5000)
+        self._seen: deque = deque(maxlen=5000)   # recent fill keys (dedup)
         self._offset = 0
-        self._identity: tuple = ()
-        self._mtime_ns = 0
-        self._last_hash = ""
-        self._tail = b""
         self._unreadable = False
-        self._transition = MtsTransition.NONE
-        self._broker_state: Optional[MtsAuthorityState] = None
 
-    def set_transition(self, transition: MtsTransition) -> None:
-        self._transition = transition
-
-    def set_live_broker_state(self, state: MtsAuthorityState) -> None:
-        """Live callers must inject a broker-verified state, never ledger truth."""
-        self._broker_state = state
-
-    def _reset(self) -> None:
-        self._trades, self._order, self._seen = {}, [], deque(maxlen=5000)
-        self._offset, self._tail, self._last_hash = 0, b"", ""
-
-    def apply_fill(self, fill: dict) -> bool:
+    def apply_fill(self, fill: dict) -> None:
         key = _fill_key(fill)
         if key in self._seen:
-            return False
+            return
         self._seen.append(key)
-        tid, leg, delta = fill.get("trade_id"), _fill_leg(fill), _side_delta(fill)
-        if not tid or leg is None or delta is None:
-            self._unreadable = True
-            return False
+        tid = fill.get("trade_id")
+        if not tid:
+            return
         if tid not in self._trades:
-            self._trades[tid] = _new_trade()
+            self._trades[tid] = {"NEAR": 0, "FAR": 0, "near_entry": 0.0, "far_entry": 0.0}
             self._order.append(tid)
-        self._trades[tid][leg] += delta
-        if str(fill.get("fill_type") or "") == "ENTRY" and self._trades[tid][f"{leg.lower()}_entry"] == 0.0:
-            self._trades[tid][f"{leg.lower()}_entry"] = float(fill.get("price") or 0.0)
-        return True
+        leg = _fill_leg(fill)
+        if leg is None:
+            return
+        ft = str(fill.get("fill_type") or "")
+        d = _side_delta(fill)
+        self._trades[tid][leg] += d
+        if ft == "ENTRY" and d != 0 and self._trades[tid].get(f"{leg.lower()}_entry", 0.0) == 0.0:
+            try:
+                self._trades[tid][f"{leg.lower()}_entry"] = float(fill.get("price") or 0.0)
+            except (TypeError, ValueError):
+                pass
 
     def sync_from_ledger(self, path: Optional[str] = None) -> int:
+        """Incremental tail-read; returns the number of rows consumed."""
         path = path or self._path
-        if not path:
+        if not path or not os.path.exists(path):
             self._unreadable = True
             return 0
         try:
-            stat = os.stat(path)
-            identity = (stat.st_dev, stat.st_ino)
-            changed = identity != self._identity or stat.st_size != self._offset or stat.st_mtime_ns != self._mtime_ns
-            if not changed:
-                return 0
-            if identity != self._identity or stat.st_size < self._offset:
-                self._reset()
-                self._identity = identity
-            with open(path, "rb") as f:
+            size = os.path.getsize(path)
+            if size < self._offset:
+                self._offset = 0    # file rotated/truncated — re-read (dedup via _seen)
+            n = 0
+            with open(path) as f:
                 f.seek(self._offset)
-                data = self._tail + f.read()
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        fill = json.loads(line)
+                    except Exception:
+                        continue
+                    self.apply_fill(fill)
+                    n += 1
                 self._offset = f.tell()
-            lines = data.splitlines(keepends=True)
-            self._tail = b""
-            if lines and not lines[-1].endswith(b"\n"):
-                self._tail = lines.pop()
-            count = 0
-            for raw in lines:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                fill = json.loads(raw)
-                if not self.apply_fill(fill):
-                    self._unreadable = True
-                    return count
-                self._last_hash = hashlib.sha256(raw).hexdigest()
-                count += 1
-            self._mtime_ns = stat.st_mtime_ns
-            self._unreadable = bool(self._tail)
-            return count
+            self._unreadable = False
+            return n
         except Exception:
             self._unreadable = True
             return 0
 
     def snapshot(self) -> MtsAuthorityState:
-        if self.source == "LIVE":
-            return self._broker_state or MtsAuthorityState(MtsAuthority.UNKNOWN, anomalies=("LIVE_BROKER_SNAPSHOT_REQUIRED",))
-        token = (self._identity, self._offset, self._last_hash)
-        if self._unreadable:
-            return MtsAuthorityState(MtsAuthority.UNKNOWN, current_trade_id=self._order[-1] if self._order else None, snapshot_token=token, anomalies=("LEDGER_UNREADABLE_OR_TRAILING_PARTIAL",))
-        return _reduce_trades(self._trades, self._order, transition=self._transition, token=token)
+        if self._unreadable and not self._trades:
+            return MtsAuthorityState(MtsAuthority.UNKNOWN)
+        return _reduce_trades(self._trades, self._order)

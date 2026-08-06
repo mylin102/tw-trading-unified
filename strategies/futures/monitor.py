@@ -18,7 +18,6 @@ from strategies.futures.mts_ledger_authority import (
     MtsAuthority,
     MtsGateAction,
     MtsLedgerProjection,
-    MtsTransition,
     gate_decision_post_signal,
     gate_decision_pre_signal,
 )
@@ -341,7 +340,7 @@ class FuturesMonitor:
                 os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                 "logs", "mts_trade_fills.jsonl",
             ),
-            source="LIVE" if self.live_trading else "PAPER",
+            source="PAPER",
         )
         self._ledger_projection_sync_ts = 0.0
 
@@ -6853,9 +6852,6 @@ class FuturesMonitor:
         if time.monotonic() - self._ledger_projection_sync_ts > 2.0:
             self._ledger_projection.sync_from_ledger()
             self._ledger_projection_sync_ts = time.monotonic()
-        self._ledger_projection.set_transition(
-            self._mts_authority_transition(strategy)
-        )
         _auth = self._ledger_projection.snapshot()
         _pre_action = gate_decision_pre_signal(
             _auth, _authority_has_pos, _strat_has_pos, _strat_tid,
@@ -6870,7 +6866,7 @@ class FuturesMonitor:
             self._reconstruct_position_from_ledger(strategy, _auth)
 
         signal = None
-        if _pre_action not in (MtsGateAction.RESET_STRATEGY, MtsGateAction.HOLD):
+        if _pre_action != MtsGateAction.RESET_STRATEGY:
             # 2026-07-08 Hermes Agent: Risk control gates (settlement > SINGLE_LEG > normal)
             if not self._mts_risk_gate_settlement(strategy):
                 if not self._mts_risk_gate_single_leg_preclose(strategy, _bar_dict):
@@ -7041,26 +7037,6 @@ class FuturesMonitor:
         self._ledger_projection.sync_from_ledger()
         return self._ledger_projection.snapshot().status == MtsAuthority.OPEN
 
-    def _mts_authority_transition(self, strategy) -> MtsTransition:
-        """Project pending local MTS orders as intent, not filled exposure.
-
-        This is intentionally a cheap in-memory read.  It prevents the normal
-        bar evaluator from issuing a second lifecycle decision between order
-        submission and the paper/live fill callback.
-        """
-        pending = list(getattr(self, "_pending_lifecycle_orders", {}).values())
-        labels = {str(item.get("strategy") or "") for item in pending}
-        if not labels:
-            return MtsTransition.NONE
-        if "MTS_ENTRY" in labels or "MTS_MANUAL" in labels:
-            return MtsTransition.ENTRY_BOTH_PENDING
-        if "MTS_RELEASE" in labels:
-            return MtsTransition.RELEASE_SIBLING_PENDING
-        if labels & {"MTS_EXIT", "MTS_EMERGENCY"}:
-            return (MtsTransition.EXIT_REMAINING_PENDING
-                    if getattr(strategy, "_released_leg", None) else MtsTransition.EXIT_BOTH_PENDING)
-        return MtsTransition.NONE
-
     def _reconstruct_position_from_ledger(self, strategy, auth):
         """Rebuild the strategy position state from the ledger authority and
         write it back to the state file (2026-08-06 P1).
@@ -7159,8 +7135,7 @@ class FuturesMonitor:
             pass
 
         # Guard 2: fills ledger
-        _ledger_auth = self._ledger_projection.snapshot()
-        _fills_has_open = _ledger_auth.status == MtsAuthority.OPEN
+        _fills_has_open = self._mts_has_open_position_from_fills()
 
         # Guard 3: pending orders
         _has_pending = self._mts_has_pending_mts_orders()
@@ -7177,9 +7152,6 @@ class FuturesMonitor:
         if _fills_has_open:
             _blocked = True
             _reasons.append("fills_ledger_has_open_entry")
-        if _ledger_auth.status in (MtsAuthority.UNKNOWN, MtsAuthority.TRANSITIONING):
-            _blocked = True
-            _reasons.append(f"ledger_authority={_ledger_auth.status.value}")
         if _has_pending:
             _blocked = True
             _reasons.append("pending_mts_orders")
