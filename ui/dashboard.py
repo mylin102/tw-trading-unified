@@ -901,6 +901,7 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     import pandas as _pd
+    _perf_started = time.monotonic()
 
     # 2026-07-16 Gemini CLI: Print DataFrame lengths for debugging CPU issue
     print(f"[DEBUG_CHART] near_df raw_size={len(near_df)}, far_df raw_size={len(far_df) if far_df is not None else 0}")
@@ -932,6 +933,7 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
                         _df.dropna(subset=["timestamp"], inplace=True)
     except Exception as _de:
         print(f"[Dashboard] make_futures_dual_chart data cleaning error: {_de}")
+    print(f"[PERF_CHART_DETAIL] clean_ms={(time.monotonic() - _perf_started) * 1000:.1f}")
 
     if near_df.empty:
         print("[Dashboard] make_futures_dual_chart called with empty near_df after cleaning")
@@ -967,6 +969,7 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
         row_heights=row_heights, 
         vertical_spacing=0.05
     )
+    _trace_started = time.monotonic()
     
     # 1. 近月價格線
     # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
@@ -1089,6 +1092,11 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             ),
             row=atr_row, col=1
         )
+
+    print(
+        f"[PERF_CHART_DETAIL] traces_ms={(time.monotonic() - _trace_started) * 1000:.1f} "
+        f"traces={len(fig.data)} near_points={len(near_df)}"
+    )
     
     # 5. 添加交易時間標記
     from core.date_utils import is_night_session
@@ -1166,6 +1174,10 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             row=atr_row, col=1
         )
     
+    print(
+        f"[PERF_CHART_DETAIL] total_ms={(time.monotonic() - _perf_started) * 1000:.1f} "
+        f"traces={len(fig.data)}"
+    )
     return fig
 
 # ── Calendar Spread Chart ──
@@ -4496,60 +4508,42 @@ elif _selected_product == "TMF":
 
         print(f"[PERF] before_charts: {time.time()-_pt_data:.3f}s")
 
-        # ── Futures Dual Contract Chart (移至頁面最下方) ──
-        # 2026-07-16 Gemini CLI: Detailed profiling of chart steps to trace 100-second latency
-        t_chart_start = time.time()
-        ft, _ = load_futures_trades()
-        print(f"[PERF_CHART] load_futures_trades took {time.time()-t_chart_start:.3f}s")
-        
-        t_far_start = time.time()
-        df_far = load_far_month_data(_ov_ticker)
-        print(f"[PERF_CHART] load_far_month_data took {time.time()-t_far_start:.3f}s")
-        
-        t_build_start = time.time()
-        try:
-            if df_far is not None and not df_far.empty:
-                _fig = make_futures_dual_chart(
-                    f_df, 
-                    df_far, 
-                    f"{_ov_ticker} 近月/遠月價格 & Score", 
-                    signals=ft
-                )
-            else:
-                _fig = make_price_score_chart(f_df, "close", f"{_ov_ticker} 價格 & Score", signals=ft)
-            print(f"[PERF_CHART] build_chart took {time.time()-t_build_start:.3f}s")
-            
-            t_st_start = time.time()
-            st.plotly_chart(_fig, use_container_width=True)
-            print(f"[PERF_CHART] st.plotly_chart took {time.time()-t_st_start:.3f}s")
-        except Exception as _ce:
-            import logging as _logging
-            _logging.getLogger().exception("Dual chart failed, falling back to near-only")
-            st.warning(f"⚠️ 雙合約圖表異常，已切回近月圖: {_ce}")
+        # ── Futures Dual Contract Chart ──
+        # The old path rebuilt this expensive chart on every Streamlit rerun,
+        # starving safety and position panels for 155–198s.  Build only when
+        # the viewer explicitly requests it; keep the figure in this browser
+        # session through harmless auto-refreshes.
+        st.subheader("近月／遠月價格圖")
+        _chart_key = f"tmf_dual_chart_{_today}"
+        if st.button("載入／重新整理圖表", key=f"{_chart_key}_refresh"):
+            t_chart_start = time.monotonic()
+            ft, _ = load_futures_trades()
+            print(f"[PERF_CHART] load_futures_trades took {time.monotonic()-t_chart_start:.3f}s")
+            t_far_start = time.monotonic()
+            df_far = load_far_month_data(_ov_ticker)
+            print(f"[PERF_CHART] load_far_month_data took {time.monotonic()-t_far_start:.3f}s")
             try:
-                _f_clean = f_df.copy()
-                import pandas as _pd
-                if "timestamp" in _f_clean.columns:
-                    _f_clean["timestamp"] = _pd.to_datetime(_f_clean["timestamp"], errors="coerce")
-                if "close" in _f_clean.columns:
-                    _f_clean["close"] = _pd.to_numeric(_f_clean["close"], errors="coerce")
-                _f_clean = (
-                    _f_clean
-                    .dropna(subset=["timestamp", "close"])
-                    .sort_values("timestamp")
-                    .drop_duplicates(subset=["timestamp"])
-                    .tail(1000)
-                )
-                _fallback = make_price_score_chart(
-                    _f_clean,
-                    "close",
-                    f"{_ov_ticker} 價格 & Score (fallback)",
-                    signals=ft,
-                )
-                st.plotly_chart(_fallback, use_container_width=True)
-            except Exception as _fe:
-                _logging.getLogger().exception("Fallback chart also failed")
-                st.error("❌ 圖表渲染失敗，請檢查期貨指標資料")
+                if df_far is not None and not df_far.empty:
+                    _fig = make_futures_dual_chart(
+                        f_df, df_far, f"{_ov_ticker} 近月/遠月價格 & Score", signals=ft
+                    )
+                else:
+                    _fig = make_price_score_chart(f_df, "close", f"{_ov_ticker} 價格 & Score", signals=ft)
+                st.session_state[_chart_key] = _fig
+                print(f"[PERF_CHART] build_chart took {time.monotonic()-t_chart_start:.3f}s")
+            except Exception as _ce:
+                import logging as _logging
+                _logging.getLogger().exception("Dual chart failed")
+                st.session_state.pop(_chart_key, None)
+                st.error(f"❌ 圖表建立失敗：{_ce}")
+
+        _cached_chart = st.session_state.get(_chart_key)
+        if _cached_chart is None:
+            st.caption("圖表採手動載入，避免自動刷新阻塞持倉與安全狀態。")
+        else:
+            t_st_start = time.monotonic()
+            st.plotly_chart(_cached_chart, use_container_width=True)
+            print(f"[PERF_CHART] st.plotly_chart took {time.monotonic()-t_st_start:.3f}s")
         print(f"[PERF] charts_done: {time.time()-_pt_data:.3f}s")
         print(f"[PERF] futures page total: {time.time()-_pt_start:.3f}s")
 
