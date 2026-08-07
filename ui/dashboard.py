@@ -566,7 +566,32 @@ reserve_pct = risk_cfg.get("account", {}).get("margin_reserve_pct", 0.20)
 
 def render_real_preflight_expander():
     with st.expander("🔐 券商與賬戶安全 Preflight 診斷 (Read-Only)", expanded=False):
-        st.caption("唯讀券商診斷面板 (Read-only broker diagnostic)")
+        st.caption("唯讀券商診斷面板；執行不會修改 LIVE 設定或送出、取消、修改任何委託。")
+        _confirm = st.checkbox(
+            "我確認：這只會以真券商帳號做一次性唯讀查詢，不會進入 LIVE 或下單。",
+            key="live_preflight_readonly_confirm",
+        )
+        if st.button("▶️ 執行一次唯讀 LIVE Preflight", disabled=not _confirm, key="run_live_preflight"):
+            import subprocess
+            import sys
+            import uuid
+
+            _request_id = f"LIVE-PREFLIGHT-{uuid.uuid4().hex[:12]}"
+            _diag_dir = Path(runtime_path("exports", "trades", "live", "diagnostics"))
+            _diag_dir.mkdir(parents=True, exist_ok=True)
+            _log_path = _diag_dir / f"broker_snapshot_{_request_id}.runner.log"
+            _env = os.environ.copy()
+            _env["LIVE_PREFLIGHT_NO_ORDERS"] = "1"
+            try:
+                with open(_log_path, "ab") as _log:
+                    subprocess.Popen(
+                        [sys.executable, "scripts/run_live_readonly_preflight.py", "--request-id", _request_id],
+                        cwd=str(BASE), env=_env, stdout=_log, stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                st.success(f"已提交唯讀 preflight：{_request_id}。完成後重新整理本頁查看快照。")
+            except Exception as _exc:
+                st.error(f"無法啟動唯讀 preflight：{_exc}")
         col_left, col_right = st.columns(2)
         with col_left:
             st.subheader("📋 執行狀態 (Execution State)")
