@@ -122,14 +122,35 @@ def load_ticks() -> Dict[str, List[dict]]:
     }
 
 
-def derive_fee_schedule(trades: List[dict]) -> dict:
-    """Derive per-close fee from ledger (stored realized vs recomputed gross).
+def loaded_tick_paths() -> Dict[str, str]:
+    """Every raw/OHLC tick file actually loaded, for manifest hashing."""
+    raw_near = glob.glob(os.path.join(RAW_TICKS_DIR, "MXFH6_*_ticks.csv"))
+    raw_far = glob.glob(os.path.join(RAW_TICKS_DIR, "TMFH6_*_ticks.csv"))
+    ohlc_near = glob.glob(os.path.join(DATA_DIR, "tmf_near_*.csv"))
+    ohlc_far = glob.glob(os.path.join(DATA_DIR, "tmf_far_*.csv"))
+    out = {}
+    for p in sorted(raw_near + raw_far):
+        out["tick_raw_" + os.path.basename(p)] = p
+    for p in sorted(ohlc_near + ohlc_far):
+        out["tick_ohlc_" + os.path.basename(p)] = p
+    return out
 
-    fee = gross - stored (round trip per closing fill). Documented in the
-    manifest; the pipeline reconciliation validates consistency.
+
+def derive_fee_schedule(trades: List[dict]) -> dict:
+    """Infer per-close fee from the ledger (LEDGER_INFERRED — NOT validated).
+
+    Not circular when reported honestly: the fee is INFERRED from stored
+    realized values, so reconciliation against the same values cannot
+    validate it. Excludes CORRUPT trades; reports per-contract/qty
+    consistency so the inference is auditable.
     """
     diffs = []
+    per_contract: Dict[str, list] = {}
+    per_qty: Dict[str, list] = {}
     for t in trades:
+        tid = str(t.get("trade_id") or "")
+        if tid in {"mts-auto-222204-082"}:
+            continue  # CORRUPT — excluded from inference
         rel = t["releases"][0]
         leg = str(rel["leg"]).upper()
         entries = [e for e in t["entries"] if e["leg"] == leg]
@@ -141,14 +162,27 @@ def derive_fee_schedule(trades: List[dict]) -> dict:
         avg = sum(e["qty"] * e["price"] for e in entries) / qty
         sign = -1 if rel["side"] == "BUY" else 1
         gross = (rel["price"] - avg) * qty * CONTRACTS.get("DEFAULT", 10.0) * sign
-        diffs.append(gross - float(rel["realized_pnl"]))
-    per_contract = round(median(diffs), 2) if diffs else None
+        diff = gross - float(rel["realized_pnl"])
+        diffs.append(diff)
+        per_contract.setdefault(str(rel.get("ticker") or "TMF"), []).append(diff)
+        per_qty.setdefault(str(int(qty)), []).append(diff)
+    per_contract_stats = {k: {"n": len(v), "median": round(median(v), 2),
+                              "min": round(min(v), 2), "max": round(max(v), 2)}
+                          for k, v in per_contract.items()}
+    per_qty_stats = {k: {"n": len(v), "median": round(median(v), 2)}
+                     for k, v in per_qty.items()}
+    per_contract_val = round(median(diffs), 2) if diffs else None
     return {
-        "per_contract": per_contract,
+        "per_contract": per_contract_val,
+        "provenance": "LEDGER_INFERRED/UNVERIFIED",
         "effective_date": "2026-07-01",
-        "note": "derived from ledger (stored realized vs recomputed gross); "
-                "validated by reconciliation",
+        "note": "inferred from stored realized_pnl vs recomputed gross on "
+                "release fills (CORRUPT trades excluded). Reconciliation "
+                "against the same values is NOT validation — see "
+                "per_contract/per_qty consistency.",
         "sample_size": len(diffs),
+        "per_contract_consistency": per_contract_stats,
+        "per_qty_consistency": per_qty_stats,
     }
 
 
@@ -191,7 +225,24 @@ def stats_report(rows: List[dict], fee_schedule: dict, run_id: str) -> dict:
     ]
     ages = [v for r in rows for v in (r.get("quote_age_s") or {}).values()
             if isinstance(v, (int, float))]
+    # pair skew: |age_near - age_far| per row where both legs quoted
+    skews = []
+    for r in rows:
+        qa = r.get("quote_age_s") or {}
+        if len(qa) == 2 and all(isinstance(v, (int, float)) for v in qa.values()):
+            a, b = qa.values()
+            skews.append(abs(a - b))
     p = exact_sign_test_p(deltas)
+
+    def pctiles(vals):
+        if not vals:
+            return {"p50": None, "p95": None, "p99": None, "max": None}
+        s = sorted(vals)
+        def q(p_):
+            i = min(len(s) - 1, int(p_ * len(s)))
+            return round(s[i], 3)
+        return {"p50": q(0.50), "p95": q(0.95), "p99": q(0.99), "max": round(s[-1], 3)}
+
     return {
         "run_id": run_id,
         "n_trades": len(rows),
@@ -209,8 +260,12 @@ def stats_report(rows: List[dict], fee_schedule: dict, run_id: str) -> dict:
             "EXECUTABLE_BBO": tiers.get("EXECUTABLE_BBO", 0),
             "BOUNDED_TICK_PROXY": tiers.get("BOUNDED_TICK_PROXY", 0),
             "UNUSABLE": tiers.get("UNUSABLE", 0),
-            "quote_age_median_s": round(median(ages), 3) if ages else None,
-            "quote_age_max_s": round(max(ages), 3) if ages else None,
+            "note": "raw last-price (bid/ask <= 0) is PROXY by design; "
+                    "1-min OHLC Close used as last-price proxy only when "
+                    "within age bound",
+            "quote_age_s": pctiles(ages),
+            "pair_skew_ms_pctiles": pctiles([s * 1000 for s in skews]) if skews
+                                    else {"p50": None, "p95": None, "p99": None, "max": None},
         },
         "reconciliation": {
             "status_counts": statuses,
@@ -229,6 +284,7 @@ def stats_report(rows: List[dict], fee_schedule: dict, run_id: str) -> dict:
         "gate_notes": [
             "research-only; no production change, no GO claim",
             "immediate_executable_combined_pnl_gross populated ONLY for EXECUTABLE_BBO",
+            "fee provenance: LEDGER_INFERRED/UNVERIFIED (not validated)",
         ],
     }
 
@@ -249,13 +305,15 @@ def main() -> None:
 
     manifest = build_manifest(
         run_id=run_id,
-        input_paths={"fills": FILLS_PATH},
+        input_paths={"fills": FILLS_PATH, **loaded_tick_paths()},
         schema_version=SCHEMA_VERSION,
         repo_root=REPO_ROOT,
         fee_source_path="",
         fee_effective_date=fee_schedule.get("effective_date", ""),
         config={"contracts": CONTRACTS, "age_bound_s": AGE_BOUND_S,
-                "tick_size": TICK_SIZE, "fee_schedule": fee_schedule},
+                "tick_size": TICK_SIZE, "fee_schedule": fee_schedule,
+                "tick_file_retention": "raw_ticks (7/23-7/28) + 1-min OHLC"},
+        dirty_exclude=(f"reports/{run_id}/",),
     )
     manifest_path = write_manifest(manifest, out_dir)
 
