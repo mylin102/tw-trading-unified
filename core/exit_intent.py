@@ -407,25 +407,36 @@ class IntentLog:
             "supersedes": None,
         }
 
-    def _append_locked(self, intent_id: str, builder: Callable) -> dict:
+    def _append_locked(self, fence_intent_id: str, builder: Callable,
+                       path: Optional[str] = None) -> dict:
         """Single durable-append primitive with the generation fence
-        (codex B44/B45): before EVERY durable write, the intent version must
-        match what THIS lock holder last saw — external drift ⇒
+        (codex B44-B47): before EVERY durable write the fence intent's
+        version must match what THIS lock holder last saw — external drift ⇒
         StaleVersionError BEFORE any I/O. Our own transitions advance the
-        fence, so legitimate same-holder evolution is never blocked."""
+        fence, so legitimate same-holder evolution is never blocked.
+
+        fence_intent_id is the intent whose version gates the write; the
+        appended record may be that intent (transition/terminal) or a
+        parent-bound child/event (repair/emergency) that references it."""
         entry = _LOCK_HELD.get(self.lock_path)
         expected = None
         if entry is not None:
-            expected = entry.setdefault("intent_versions", {}).get(intent_id)
-        cur = self.get(intent_id)
+            expected = entry.setdefault("intent_versions", {}).get(fence_intent_id)
+        cur = self.get(fence_intent_id)
         if expected is not None and cur["version"] != expected:
             raise StaleVersionError(
-                f"intent {intent_id} version drifted externally "
+                f"intent {fence_intent_id} version drifted externally "
                 f"(holder saw {expected}, now {cur['version']})")
         rec = builder(cur)
-        _atomic_append(self.log_path, rec)
+        _atomic_append(path or self.log_path, rec)
         if entry is not None:
-            entry.setdefault("intent_versions", {})[intent_id] = rec["version"]
+            if rec.get("intent_id") == fence_intent_id:
+                entry.setdefault("intent_versions", {})[fence_intent_id] = \
+                    rec.get("version", cur["version"])
+            else:
+                # parent-bound child/event: parent version unchanged
+                entry.setdefault("intent_versions", {})[fence_intent_id] = \
+                    cur["version"]
         return rec
 
     def _transition_locked(self, intent_id: str, leg: str, status: str,
@@ -523,9 +534,8 @@ class IntentLog:
                 if r.get("parent") == intent_id and leg in r.get("legs", {}):
                     raise DuplicateRepairError(
                         f"active repair child {iid} exists for {intent_id} {leg}")
-            child = self._create_locked(cur["trade_id"], f"REPAIR:{reason}",
-                                        parent=intent_id, leg=leg)
-            _atomic_append(self.log_path, child)
+            child = self._append_locked(intent_id, lambda c: self._create_locked(
+                c["trade_id"], f"REPAIR:{reason}", parent=intent_id, leg=leg))
             return {"intent_id": child["intent_id"], "parent": intent_id,
                     "nonce": child["intent_id"].split("-")[-1],
                     "legs": child["legs"]}
@@ -533,15 +543,15 @@ class IntentLog:
 
     def emergency_supersede(self, intent_id: str, order_mgr=None) -> dict:
         def _do():
-            _atomic_append(self.log_path, {"event": "EMERGENCY_SUPERSEDES",
-                                           "intent_id": intent_id,
-                                           "supersedes": intent_id,
-                                           "ts": time.time()})
-            cur = self.get(intent_id)
-            rec = dict(cur)
-            rec["version"] = cur.get("version", 1) + 1
-            rec["terminal"] = "SUPERSEDED_BY_EMERGENCY"
-            _atomic_append(self.log_path, rec)
+            # audit event + terminal record BOTH fence-aware (B47): the
+            # parent version is validated immediately before each append
+            self._append_locked(intent_id, lambda c: {
+                "event": "EMERGENCY_SUPERSEDES", "intent_id": intent_id,
+                "supersedes": intent_id, "ts": time.time(),
+                "version": c["version"]})
+            self._append_locked(intent_id, lambda c: {
+                **dict(c), "version": c["version"] + 1,
+                "terminal": "SUPERSEDED_BY_EMERGENCY"})
             return {"supersedes": intent_id}
         return self._locked(_do, intent_id=intent_id)
 

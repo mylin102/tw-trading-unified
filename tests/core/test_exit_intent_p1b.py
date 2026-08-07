@@ -959,6 +959,48 @@ def test_b45_fence_blocks_second_durable_write(tmp_path):
         cm.__exit__(None, None, None)
 
 
+# ── B46: repair drift — parent version advanced externally ⇒ repair child
+#         creation is rejected BEFORE any child append ───────────────────
+def test_b46_repair_drift_fail_closed(tmp_path):
+    log = make_log(tmp_path)
+    iid = make_intent(log)
+    cm = log._file_lock(intent_id=iid)
+    cm.__enter__()
+    try:
+        cur = log.get(iid)
+        rec = dict(cur)
+        rec["version"] = cur["version"] + 1
+        ei._atomic_append(log.log_path, rec)
+        n_before = len(log.raw_lines())
+        with pytest.raises(ei.StaleVersionError):
+            log.repair_complete(iid, "FAR", reason="REJECTED")
+        assert len(log.raw_lines()) == n_before  # zero child append
+    finally:
+        cm.__exit__(None, None, None)
+
+
+# ── B47: emergency drift — parent version advanced externally ⇒ BOTH the
+#         EMERGENCY_SUPERSEDES audit event AND the terminal record are
+#         rejected; zero event/terminal append ───────────────────────────
+def test_b47_emergency_drift_fail_closed(tmp_path):
+    log = make_log(tmp_path)
+    iid = make_intent(log)
+    cm = log._file_lock(intent_id=iid)
+    cm.__enter__()
+    try:
+        cur = log.get(iid)
+        rec = dict(cur)
+        rec["version"] = cur["version"] + 1
+        ei._atomic_append(log.log_path, rec)
+        n_before = len(log.raw_lines())
+        with pytest.raises(ei.StaleVersionError):
+            log.emergency_supersede(iid)
+        assert len(log.raw_lines()) == n_before  # zero event + zero terminal
+        assert log.get(iid)["terminal"] is None  # not superseded
+    finally:
+        cm.__exit__(None, None, None)
+
+
 # ── B42: crash-tail malformed record ⇒ CorruptLogError fail-closed (never
 #         silently swallowed) ────────────────────────────────────────────
 def test_b42_crash_tail_fail_closed(tmp_path):
