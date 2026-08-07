@@ -210,15 +210,96 @@ def _assert_nonce_ok(issuer, cert):
     assert issuer.peek(cert.nonce) is not None
 
 
-# ── P0-1/P0-2: SessionRegistry — one hook at safe_login ────────────────────
+# ── P0-1/P0-2 (v7): SessionRegistry — strong-registration map ──────────────
 
-def test_registry_is_weak_keyed():
+def test_registry_strong_ref_and_opaque_generation():
     reg = SessionRegistry()
     api = _FakeApi()
     g = reg.register(api)
     assert isinstance(g, str) and len(g) >= 32          # secrets opaque
     assert reg.generation(api) == g
     assert g != reg.register(api)                        # every login = new gen
+    # strong ref: the entry holds the api object itself (id-reuse guard)
+    assert reg._entries[id(api)].api is api
+
+
+def test_registry_identity_mismatch_returns_none():
+    # v7: a stale entry at the same id with a DIFFERENT object must fail the
+    # identity check — no id-reuse can validate an old registration
+    reg = SessionRegistry()
+    api = _FakeApi()
+    other = _FakeApi()
+    reg._entries[id(api)] = type(reg)._entries[id(api)] = \
+        __import__("core.live_route_certificate", fromlist=["_SessionEntry"]) \
+        ._SessionEntry(api=other, generation="deadbeef" * 4, logged_in_at=0.0)
+    assert reg.generation(api) is None, "identity mismatch must invalidate"
+
+
+def test_unregister_removes_entry_and_generation():
+    reg = SessionRegistry()
+    api = _FakeApi()
+    g = reg.register(api)
+    assert reg.generation(api) == g
+    reg.unregister(api)                                  # logout()
+    assert reg.generation(api) is None
+
+
+def test_safe_login_hook_semantics_invalidate_before_register():
+    # v7 hook: unregister BEFORE each attempt; register ONLY after success
+    api = _FakeApi()
+    register_session(api)                                # initial success
+    session_registry.unregister(api)                     # pre-attempt invalidate
+    assert session_registry.generation(api) is None      # login attempt pending
+    register_session(api)                                # attempt succeeded
+    assert session_registry.generation(api) is not None
+
+
+def test_failed_relogin_leaves_no_valid_generation():
+    api = _FakeApi()
+    register_session(api)
+    cert, failures, issuer = _certify(api)
+    assert cert is not None
+    session_registry.unregister(api)                     # pre-attempt invalidate
+    # login FAILED → no register → no valid generation
+    assert session_registry.generation(api) is None
+    ok, reasons = _validated(cert, issuer)
+    assert not ok and any("SESSION" in r for r in reasons), reasons
+
+
+def test_reconnect_invalidates_cert_even_with_issuer_nonce():
+    # round-8 #3: certify AND transition check the CURRENT registry
+    # generation — a reconnect invalidates the old cert even though the
+    # issuer nonce is still valid
+    api = _FakeApi()
+    register_session(api)
+    cert, failures, issuer = _certify(api)
+    assert cert is not None and failures == []
+    assert issuer.peek(cert.nonce) is not None           # nonce still valid
+    register_session(api)                                # reconnect → new gen
+    ok, reasons = _validated(cert, issuer)
+    assert not ok and any("SESSION" in r for r in reasons), reasons
+
+
+def test_transition_checks_registry_generation():
+    api = _FakeApi()
+    register_session(api)
+    cert, failures, issuer = _certify(api)
+    assert cert is not None
+    register_session(api)                                # reconnect after certify
+    result = transition_with_certificate(_transition_ctx(), cert, issuer,
+                                         runtime=_ctx_runtime(api, cert))
+    assert not result.is_live_ready()
+    assert any("SESSION" in r for r in result.audit_reasons), result.audit_reasons
+
+
+def test_registry_is_module_level_not_api_attribute():
+    # round-8 #5: setattr is NOT available on the Rust api — the registry
+    # must be module-level; no session state may live on the api object
+    api = _FakeApi()
+    register_session(api)
+    assert not hasattr(api, "_session_generation"), \
+        "registry state must not be stored on the api object"
+    assert not hasattr(api, "_SessionEntry")
 
 
 def test_initial_login_registers_and_authenticates():
@@ -255,13 +336,14 @@ def test_logout_invalidation():
 
 
 def test_object_replacement_cannot_validate_old_cert():
-    # P0-2: id-reuse analogue — a NEW api object (even at a reused id) has no
-    # registry entry; the old cert's generation is gone → invalid
+    # P0-2/v7: after unregister + release, a NEW api object (even at a reused
+    # id) cannot validate the old cert — the old generation is gone
     api_old = _FakeApi()
     register_session(api_old)
     cert, failures, issuer = _certify(api_old)
     assert cert is not None
-    del api_old                                          # object gone (weak key)
+    session_registry.unregister(api_old)                 # logout / release
+    del api_old
     api_new = _FakeApi()                                 # replacement object
     register_session(api_new)                            # fresh login
     assert session_registry.generation(api_new) != cert.session_generation
