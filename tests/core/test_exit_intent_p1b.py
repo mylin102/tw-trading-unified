@@ -129,6 +129,11 @@ def build_monitor(tmp_path, monkeypatch):
     monitor.contract = MagicMock(code="TMFF6")
     monitor.far_contract = MagicMock(code="TMFH6")
     strat = _LenientTMFSpread()
+    monitor._registry = {"tmf_spread": strat}  # B48 fills registry lookup
+    monitor.market_data = {"TMF_FAR": {"close": 44100.0},
+                           "TMF_NEAR": {"close": 43400.0}}
+    monitor._far_current_bar = {"close": 44100.0}
+    monitor._current_bar = {"close": 43400.0}
     strat._restore_position_state = MagicMock(return_value=False)
     strat._has_position = True
     strat._released_leg = "near"
@@ -1092,3 +1097,178 @@ def test_b42_crash_tail_fail_closed(tmp_path):
         log.recover(iid, query_fn=lambda c: {"status": "NOT_FOUND"})
     with pytest.raises(ei.CorruptLogError):
         log.list_active()
+
+
+# ── B48 (codex Phase-2 acceptance): SINGLE-LEG Policy J combined-pnl
+#    wiring through the REAL TMFSpread + FuturesMonitor seam (distinct from
+#    the adapter-only test_policy_j_single_leg_combined_pnl_exit):
+#    1) confirmed RELEASE fill ⇒ reconstructed SINGLE_LEG state
+#    2) context carries released-leg realized + remaining-leg UPL; peak ≥200
+#       TWD, giveback ≥50 TWD
+#    3) signal/dispatch creates ONE exit order for the REMAINING leg only
+#       (correct side/qty) + durable intent
+#    4) second identical tick ⇒ zero re-submit + auditable
+#       POLICY_J_SINGLE_LEG_TRIGGERED event
+#    5) below activation / insufficient giveback ⇒ zero orders
+#    RED until the single-leg Policy J path is wired. ────────────────────
+def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch):
+    from datetime import datetime
+    from pathlib import Path
+    from unittest.mock import patch, MagicMock
+    from core.signal import Signal
+    from core.strategy_context import StrategyContext, MarketData, PositionView
+    from core.order_management.order import OrderStatus, OrderSide
+    from strategies.plugins.futures.active.tmf_spread import (
+        PositionLifecycle, PositionPhase, ReleaseGroup, ReleaseGroupStatus,
+        TrailGroup, TrailGroupStatus, Leg,
+    )
+    import types as _types
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monitor, strat, api = build_monitor(tmp_path, monkeypatch)
+    ctx = StrategyContext(
+        market=MarketData(last_bar={}, ticker="TMF"),
+        position=PositionView(),
+        config={"ticker": "TMF",
+                "params": {"atr_multiplier_stop": 3.5, "atr_multiplier_trail": 3.5,
+                           "trail_distance_points": 35.0, "min_atr": 5.0,
+                           "entry_z": -2.0, "confirm_ticks": 1, "confirm_ms": 0.0,
+                           "enable_combined_upl_trail": True,
+                           "combined_upl_activation_net_pnl_twd": 200.0,
+                           "combined_upl_giveback_twd": 50.0}},
+    )
+    strat.init(ctx)
+    # init() resets position state — re-apply the SPREAD trade identity
+    strat._trade_id = "t1"
+    strat._has_position = True
+    strat._released_leg = None
+    strat._side = "LONG"
+    strat._near_side = "LONG"
+    strat._far_side = "LONG"
+    strat._near_entry = 43770.0
+    strat._far_entry = 44000.0
+    strat._peak = 44500.0
+    strat._mfe_pts = 0.0
+    strat._mae_pts = 0.0
+    strat._peak_net_exit_pnl_twd = 0.0
+    strat._renko_gap_quarantine_left = 0
+    strat._point_value = 10.0
+    strat._estimated_cost = 92.0
+    strat._single_leg_warmup_ms = 0.0
+    strat._single_leg_warmup_ticks = 0
+    strat._single_leg_entered_mono = time.monotonic()
+    strat._single_leg_post_fill_ticks = 2
+    strat._single_leg_entry_price = 44000.0
+    strat._shadow_exit_ts = None
+    strat._shadow_exit_price = None
+    strat._shadow_exit_upl = None
+    strat._shadow_exit_triggered = False
+    strat._shadow_trail_dist_pts = 0.0
+    strat._single_leg_peak = 44500.0
+    strat._single_leg_nadir = 44000.0
+    strat._formal_max_giveback = 0.0
+    strat._shadow_max_giveback = 0.0
+    strat._post_shadow_mfe = 0.0
+    strat._post_shadow_mae = 0.0
+    strat._last_trail_dist_shadow = 20.0
+    strat._last_trail_dist_formal = 20.0
+    strat._release_near_ticks = 1
+    strat._release_far_ticks = 0
+    strat._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SPREAD,
+        release_group=ReleaseGroup(status=ReleaseGroupStatus.ARMED),
+    )
+    now = datetime.now()
+    state_path = Path(tmp_path) / "state.json"
+    with patch("strategies.futures.monitor._mts_position_state_path",
+               return_value=state_path), \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open",
+               return_value=True), \
+         patch.object(Path, "exists", return_value=False):
+        # ── phase 1: confirmed RELEASE fill ⇒ SINGLE_LEG ──
+        bar1 = {"near_close": 43400.0, "far_close": 44100.0, "atr": 10.0,
+                "timestamp": now, "code": "TMFF6"}
+        sig_rel = strat._manage_position(43400.0, 44100.0, -0.5, now, bar1)
+        assert sig_rel is not None, "release emission expected"
+        with patch("strategies.futures.monitor.save_trade"), \
+             patch("strategies.futures.monitor.DecisionLogger", create=True):
+            monitor._submit_mts_order_signal(sig_rel, strat, bar1, now)
+            rel_oid = next(o for o, p in monitor._pending_lifecycle_orders.items()
+                           if p.get("signal") == "RELEASE_NEAR")
+            ev = _types.SimpleNamespace(
+                order_id=rel_oid, fill_qty=1, fill_price=43400.0,
+                deal_id="deal-release", symbol="TMFF6",
+                status=OrderStatus.FILLED, side=OrderSide.SELL,
+                timestamp=now)
+            monitor._apply_confirmed_futures_deal(ev)
+        # reconstructed state: SINGLE_LEG after the confirmed release fill
+        _lc = strat._lifecycle_oca
+        assert _lc.phase.value == "SINGLE_LEG", \
+            f"expected SINGLE_LEG after release fill, got {_lc.phase.value}"
+        assert getattr(strat, "_released_leg", None) == "near"
+        strat._lifecycle = "TRAILING_LONG"  # release path marks EXITING; clear it
+        # durable peak ≥ 200 TWD (released realized + remaining mark)
+        strat._peak_net_exit_pnl_twd = 1300.0
+        # ── phase 2: giveback ≥ 50 TWD on the remaining leg ⇒ trigger ──
+        bar2 = {"near_close": 43400.0, "far_close": 44350.0, "atr": 10.0,
+                "timestamp": now, "code": "TMFF6"}
+        sig2 = strat._manage_position(43400.0, 44350.0, -0.5, now, bar2)
+        assert sig2 is not None, "single-leg Policy J exit emission expected"
+        monitor._submit_mts_order_signal(sig2, strat, bar2, now)
+        # ONE remaining-leg exit order (FAR SELL for LONG), no released-leg order
+        far_orders = [s for s in monitor.order_mgr.submits
+                      if getattr(s, "symbol", "") == "TMFH6"]
+        near_orders = [s for s in monitor.order_mgr.submits
+                       if getattr(s, "symbol", "") == "TMFF6"]
+        assert len(monitor.order_mgr.submits) == 1, \
+            f"expected exactly ONE order, got {len(monitor.order_mgr.submits)}"
+        assert len(near_orders) == 0, "released leg must NOT be re-exited"
+        # durable intent exists for t1
+        intent_log = ei.IntentLog(str(tmp_path / "logs"))
+        actives = [iid for iid in intent_log.list_active()
+                   if intent_log.get(iid)["trade_id"] == "t1"]
+        assert len(actives) == 1
+        # auditable event with provenance fields
+        events = [json.loads(l) for l in
+                  (tmp_path / "mts_spread_events.jsonl").read_text().splitlines()
+                  if l.strip()]
+        pj = [e for e in events if e.get("event") == "POLICY_J_SINGLE_LEG_TRIGGERED"]
+        assert len(pj) == 1
+        for key in ("trade_id", "released_leg", "realized", "remaining_upl",
+                    "peak", "giveback", "winner"):
+            assert key in pj[0], f"missing event field {key}"
+        # ── phase 3: identical second tick ⇒ ZERO re-submit ──
+        sig3 = strat._manage_position(43400.0, 44350.0, -0.5, now, bar2)
+        assert sig3 is None, "in-flight gate must suppress re-emission"
+        monitor._submit_mts_order_signal(sig3, strat, bar2, now) if sig3 else None
+        assert len(monitor.order_mgr.submits) == 1, "duplicate exit re-submitted"
+    # ── phase 4 (isolated): below activation ⇒ zero orders ──
+    mon2, strat2, api2 = build_monitor(tmp_path, monkeypatch)
+    strat2.init(ctx)
+    strat2._trade_id = "t2"
+    strat2._has_position = True
+    strat2._released_leg = "near"
+    strat2._side = "LONG"
+    strat2._near_side = "LONG"
+    strat2._far_side = "LONG"
+    strat2._near_entry = 43770.0
+    strat2._far_entry = 44000.0
+    strat2._peak_net_exit_pnl_twd = 150.0  # below activation 200
+    strat2._renko_gap_quarantine_left = 0
+    strat2._point_value = 10.0
+    strat2._estimated_cost = 92.0
+    strat2._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SINGLE_LEG,
+        release_group=ReleaseGroup(status=ReleaseGroupStatus.COMPLETED,
+                                   filled_leg=Leg.FAR, canceled_leg=Leg.NEAR),
+        trail_group=TrailGroup(status=TrailGroupStatus.ARMED),
+    )
+    with patch("strategies.futures.monitor._mts_position_state_path",
+               return_value=Path(tmp_path) / "state2.json"), \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open",
+               return_value=True), \
+         patch.object(Path, "exists", return_value=False):
+        sig_low = strat2._manage_position(43400.0, 44350.0, -0.5, now, bar2)
+        assert sig_low is None, "below-activation must NOT emit an exit"
+        assert len(mon2.order_mgr.submits) == 0, "zero orders below activation"
