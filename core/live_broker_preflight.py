@@ -11,11 +11,10 @@ import json
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, time as clock_time, timezone
 from pathlib import Path
 from typing import Any
 
-from core.contract_resolver import ContractResolver
 from core.deployment_role_gate import assert_broker_access_allowed
 from core.runtime_paths import runtime_path
 
@@ -53,6 +52,49 @@ def _contract_summary(contract: Any) -> dict[str, Any]:
         "delivery_date": str(getattr(contract, "delivery_date", "")),
         "category": getattr(contract, "category", None),
     }
+
+
+def _delivery_date(contract: Any) -> date | None:
+    value = getattr(contract, "delivery_date", None)
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value.replace("-", "/"), "%Y/%m/%d").date()
+        except ValueError:
+            return None
+    return None
+
+
+def resolve_near_far_contracts(api: Any, product: str) -> tuple[Any, Any]:
+    """Resolve with the monitor's rshioaji-safe contract-list adapter.
+
+    The native ``Futures[product]`` indexing is not portable on the installed
+    rshioaji binding.  Do not use it in this diagnostic path.
+    """
+    from core.broker.shioaji_compat import get_contracts_list
+
+    product = str(product).upper()
+    query_symbol = "MXF" if product == "MTX" else product
+    now = datetime.now()
+    today = now.date()
+    valid = []
+    for contract in get_contracts_list(api, "Futures", query_symbol):
+        delivery = _delivery_date(contract)
+        if delivery is None:
+            continue
+        if delivery > today or (delivery == today and now.time() < clock_time(13, 30)):
+            valid.append((delivery, contract))
+    valid.sort(key=lambda item: item[0])
+    if len(valid) < 2:
+        raise PreflightBlocked("NEAR_FAR_CONTRACT_RESOLUTION_FAILED")
+    near_date, near = valid[0]
+    far = next((contract for delivery, contract in valid[1:] if delivery != near_date), None)
+    if far is None:
+        raise PreflightBlocked("NEAR_FAR_CONTRACT_RESOLUTION_FAILED")
+    return near, far
 
 
 def _safe_positions(api: Any, account: Any) -> list[dict[str, Any]]:
@@ -99,10 +141,7 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
     if account is None:
         raise PreflightBlocked("FUTOPT_ACCOUNT_UNAVAILABLE")
 
-    resolver = ContractResolver(api)
-    near, far = resolver.get_near_far_contracts(product)
-    if near is None or far is None:
-        raise PreflightBlocked("NEAR_FAR_CONTRACT_RESOLUTION_FAILED")
+    near, far = resolve_near_far_contracts(api, product)
 
     positions = _safe_positions(api, account)
     open_orders = _safe_open_orders(api, account)

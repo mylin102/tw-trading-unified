@@ -32,7 +32,7 @@ def test_preflight_writes_read_only_snapshot(monkeypatch, tmp_path):
     monkeypatch.setenv(preflight.REQUEST_ENV, "1")
     monkeypatch.setattr(preflight, "diagnostics_dir", lambda: tmp_path)
     monkeypatch.setattr(preflight, "assert_broker_access_allowed", lambda: "mini")
-    monkeypatch.setattr(preflight.ContractResolver, "get_near_far_contracts", lambda *_: (near, far))
+    monkeypatch.setattr("core.broker.shioaji_compat.get_contracts_list", lambda *_: [near, far])
     monkeypatch.setattr("core.broker.shioaji_compat.safe_subscribe", lambda api, contract, quote_type: api.calls.append(f"subscribe:{contract.code}"))
     monkeypatch.setattr(preflight, "_unsubscribe_bidask", lambda api, contract: api.calls.append(f"unsubscribe:{contract.code}"))
     response = preflight.run_once(lambda: api, request_id="r1")
@@ -42,6 +42,14 @@ def test_preflight_writes_read_only_snapshot(monkeypatch, tmp_path):
     assert (tmp_path / "broker_snapshot_latest.json").exists()
     assert "logout" in api.calls
     assert not any("order" in c for c in api.calls)
+
+
+def test_contract_resolution_uses_compat_adapter_not_native_bracket(monkeypatch):
+    api = Api()
+    near = SimpleNamespace(code="TMFH6", delivery_date="2099/08/19")
+    far = SimpleNamespace(code="TMFI6", delivery_date="2099/09/16")
+    monkeypatch.setattr("core.broker.shioaji_compat.get_contracts_list", lambda *_: [near, far])
+    assert preflight.resolve_near_far_contracts(api, "TMF") == (near, far)
 
 
 def test_preflight_lock_fails_closed(monkeypatch, tmp_path):
