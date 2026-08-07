@@ -565,7 +565,7 @@ def build_artifact(fills_path: Path, events_path: Path, output_dir: Path,
 
     counts = Counter(rec["attribution_strength"] for rec in trades)
     reasons = []
-    if not _has_trigger_named_event(events):
+    if not _has_trigger_named_event(events, {c["trade_id"] for c in candidates}):
         reasons.append("NO_TRIGGER_NAMED_EVENT_IN_SCHEMA")
     if not _has_final_cause_event(events, {c["trade_id"] for c in candidates}):
         reasons.append("NO_FINAL_DECISION_CAUSE_EVENT")
@@ -647,14 +647,16 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def _has_trigger_named_event(events: list[dict]) -> bool:
+def _has_trigger_named_event(events: list[dict], candidate_trade_ids: set) -> bool:
     """Only explicit trigger/winner event types WITH a nonempty matching
-    trade_id count as trigger provenance. TRIGGER_SUPPRESSED is NOT a
-    trigger decision (per-tick suppression log) and never counts; unknown
-    *TRIGGER* names never count either."""
+    trade_id IN the audited candidate set count as trigger provenance
+    (round-4 P0: an unrelated P1-B trigger event must not clear the gap for
+    an old candidate set). TRIGGER_SUPPRESSED is NOT a trigger decision
+    (per-tick suppression log) and never counts; unknown *TRIGGER* names
+    never count either."""
     for e in events:
         ev = str(e.get("event") or "")
-        if ev in TRIGGER_NAMED_EVENTS and e.get("trade_id"):
+        if ev in TRIGGER_NAMED_EVENTS and e.get("trade_id") in candidate_trade_ids:
             return True
     return False
 
