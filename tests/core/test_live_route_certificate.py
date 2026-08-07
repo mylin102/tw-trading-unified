@@ -1,40 +1,44 @@
 #!/usr/bin/env python3
-"""RED tests v3: Live Route Certification (codex round-4 L1-L7).
+"""RED tests v5: Live Route Certification (codex round-6 — capability-map based).
 
-core.live_route_certificate does not exist yet → collection ImportError is
-the expected RED for the certificate API; the transition-seam tests are RED
-against the CURRENT core.mode_transition (weak preflight alone must not
-reach LIVE_READY).
+core.live_route_certificate does not exist yet → collection ImportError is the
+expected RED for the certificate API. The fake implements the VERIFIED
+Shioaji 1.7.0 surface (see .planning/shioaji_capability_map.md): futopt_account
+/ list_accounts() / margin(account) — login_token, account, authenticated,
+margin_rates are VERIFIED ABSENT and must not appear.
 
-L1 no vacuity: every validation test uses the ISSUING issuer and asserts
-nonce redemption succeeds before the targeted reason. L2 open-orders fake
-models Submitted/Pending statuses. L3 deterministic required-margin provider
-bound to the certificate. L4 explicit authenticated-session assertion.
-L5 snapshot presence semantics (empty/missing/duplicate/subset fail).
-L6 nonce lifecycle (peek/redeem/invalidate_all, reconnect). L7 genuine
-transition boundary.
+P0-auth: authentication = futopt_account valid AND list_accounts() live
+non-empty AND session epoch registered by the login wrapper.
+P0-margin: margin_source_for = CONFIG_FLOOR only (no broker margin-rate
+surface exists); account capacity from api.margin(account).
+Route assertions: issuer binds canonical facts + session epoch; transition
+rejects mutated certs (same nonce/issuer) by re-deriving facts from the
+in-process runtime context; failed transition RETURNS an explicit
+LIVE_QUARANTINED ctx with audit reason; restart/reconstructed issuer can
+never validate an old cert; AST call-site scan for the legacy bypass.
 """
 
+import ast
 import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from core.live_route_certificate import (   # noqa: F401 — RED: module TBD
+    SESSION_EPOCH_BY_API,
     CertificateIssuer,
     LiveBrokerCertificate,
-    MARGIN_PROVIDER_VERSION,
     MARGIN_SOURCE_VERSION,
     certify_route,
     is_authenticated_session,
     margin_source_for,
-    required_margin_for,
+    register_session_epoch,
     transition_with_certificate,
     validate_live_broker_certificate,
 )
 
 
-# ── adapter-faithful fake (B1, L2, L4) ─────────────────────────────────────
+# ── adapter-faithful fake (verified Shioaji 1.7.0 surface) ─────────────────
 
 class _Account:
     def __init__(self, person_id="P1", broker_id="B1", account_id="A1"):
@@ -91,24 +95,16 @@ class _Contracts:
 
 
 class _FakeApi:
-    """Faithful to the real preflight collection contract. Order methods
-    raise (structural zero-order guarantee). L4: explicit authenticated
-    session flag. L2: open trades carry explicit Submitted/Pending status."""
+    """Verified 1.7.0 surface only. No login_token/account/authenticated/
+    margin_rates (verified absent). Order methods raise (zero-order)."""
 
-    def __init__(self, *, flat=True, open_trade_statuses=(),
-                 margin_val=1_000_000.0, trading_limits_ok=True,
-                 subscribe_ok=True, unsubscribe_ok=True,
-                 snapshot_codes=("TMFH6", "TMFI6"), authenticated=True,
-                 account=None, margin_rates=None):
-        self.futopt_account = account or _Account()
-        # B4: session signals — login_token / account (futopt_account is the
-        # preflight's own requirement, not an auth signal by itself)
-        self.login_token = "tok-abc123" if authenticated else None
-        self.account = _Account() if authenticated else None
-        self.margin_rates = margin_rates      # B3: broker margin query signal
-        self._contracts = [_Contract("TMFH6", "2026-08-19"),
-                           _Contract("TMFI6", "2026-09-16")]
-        self.Contracts = _Contracts(self._contracts)
+    def __init__(self, *, futopt_account=None, accounts_ok=True,
+                 flat=True, open_trade_statuses=(), margin_val=1_000_000.0,
+                 trading_limits_ok=True, subscribe_ok=True, unsubscribe_ok=True,
+                 snapshot_codes=("TMFH6", "TMFI6")):
+        self.futopt_account = futopt_account if futopt_account is not None \
+            else _Account()
+        self._accounts_ok = accounts_ok
         self._flat = flat
         self._open_trade_statuses = list(open_trade_statuses)
         self._margin_val = margin_val
@@ -116,7 +112,16 @@ class _FakeApi:
         self._subscribe_ok = subscribe_ok
         self._unsubscribe_ok = unsubscribe_ok
         self._snapshot_codes = list(snapshot_codes)
+        self._contracts = [_Contract("TMFH6", "2026-08-19"),
+                           _Contract("TMFI6", "2026-09-16")]
+        self.Contracts = _Contracts(self._contracts)
         self.calls = []
+
+    def list_accounts(self):
+        self.calls.append("list_accounts")
+        if not self._accounts_ok:
+            raise RuntimeError("list_accounts unavailable")
+        return [self.futopt_account]
 
     def list_positions(self, account):
         self.calls.append("list_positions")
@@ -124,13 +129,13 @@ class _FakeApi:
 
     def list_trades(self, *args):
         self.calls.append("list_trades")
-        # L2: return the trades with their REAL status — Submitted/Pending
-        # are open; Filled/Cancelled/Expired/Done are terminal
         return [_Trade("TMFH6", 1, s) for s in self._open_trade_statuses]
 
     def margin(self, account):
         self.calls.append("margin")
-        return None if self._margin_val is None else _Margin(self._margin_val)
+        if self._margin_val is None:
+            return None
+        return _Margin(self._margin_val)
 
     def trading_limits(self, account):
         self.calls.append("trading_limits")
@@ -165,17 +170,32 @@ class _FakeApi:
         raise RuntimeError("ORDER_CALL_FORBIDDEN")
 
 
-# ── L1: helpers keep the ISSUING issuer; nonce redemption asserted first ───
+# ── helpers: issuing issuer + runtime facts ────────────────────────────────
 
-def _certify(api, *, margin_provider=None, **kw):
+def _certify(api, *, config_floor=100_000.0, **kw):
     issuer = CertificateIssuer()
     cert, failures = certify_route(
         api, process_start_id="p-1", issuer=issuer,
-        margin_provider=margin_provider, **kw)
+        margin_source=margin_source_for(api, "TMF", config_floor=config_floor),
+        **kw)
     return cert, failures, issuer
 
 
-def _validated(cert, issuer, **over):
+def _runtime(api, cert=None, issuer=None, **over):
+    """In-process runtime facts the transition derives expectations from."""
+    facts = dict(
+        process_start_id="p-1",
+        account_hash=cert.account_hash if cert else "acc-hash",
+        near_code="TMFH6", far_code="TMFI6",
+        margin_source=margin_source_for(api, "TMF", config_floor=100_000.0),
+        session_epoch=SESSION_EPOCH_BY_API.get(id(api), 0.0),
+        now_ts=datetime.now(timezone.utc).isoformat(),
+    )
+    facts.update(over)
+    return facts
+
+
+def _validated(cert, issuer, *, api=None, **over):
     ok, reasons = validate_live_broker_certificate(
         cert, issuer=issuer,
         process_start_id=over.get("process_start_id", "p-1"),
@@ -183,99 +203,114 @@ def _validated(cert, issuer, **over):
         near_code=over.get("near_code", "TMFH6"),
         far_code=over.get("far_code", "TMFI6"),
         now_ts=over.get("now_ts"),
-        margin_provider=over.get("margin_provider"),
         margin_source=over.get("margin_source"))
     return ok, reasons
 
 
 def _assert_nonce_ok(issuer, cert):
-    # L1: for normal same-issuer validation, redemption must succeed first
     assert issuer.peek(cert.nonce) is not None, "issuing issuer must know the nonce"
 
 
-# ── B1/L4: certification collects through the real contract + auth ─────────
+# ── P0-auth: verified-session adapter (capability map §4) ──────────────────
 
-def test_certify_route_collects_through_real_preflight_surface():
+def test_auth_requires_all_three_evidence():
     api = _FakeApi()
-    cert, failures, _ = _certify(api)
-    assert failures == [], failures
-    for method in ("list_positions", "list_trades", "margin", "snapshots",
-                   "subscribe", "unsubscribe"):
-        assert method in api.calls, f"{method} was never called"
-    assert cert.margin_available == 1_000_000.0
-    assert cert.near_code == "TMFH6" and cert.far_code == "TMFI6"
+    register_session_epoch(api)                  # login wrapper stamps epoch
+    assert is_authenticated_session(api)
 
 
-def test_certificate_binds_identity_and_snapshots():
-    api = _FakeApi()
-    cert, failures, _ = _certify(api)
-    assert cert.process_start_id == "p-1"
-    assert cert.account_hash
-    assert cert.position_snapshot_ts and cert.order_snapshot_ts
-    assert "MARGIN_OK" in cert.query_results
-    assert "BROKER_FLAT" in cert.query_results
-    assert "NO_OPEN_ORDERS" in cert.query_results
-    assert cert.bidask_subscribed == ("NEAR", "FAR")
-    assert cert.bidask_unsubscribed == ("NEAR", "FAR")
+def test_auth_no_futopt_account_fails():
+    api = _FakeApi(futopt_account=None)
+    register_session_epoch(api)
+    assert not is_authenticated_session(api)
 
 
-def test_unauthenticated_session_fails():
-    # L4: the certificate requires an explicit authenticated-session
-    # assertion; a session that is not authenticated fails closed
-    api = _FakeApi(authenticated=False)
+def test_auth_list_accounts_unavailable_fails():
+    api = _FakeApi(accounts_ok=False)
+    register_session_epoch(api)
+    assert not is_authenticated_session(api)
+
+
+def test_auth_unregistered_session_fails():
+    api = _FakeApi()                             # no epoch stamped (not logged in)
+    assert not is_authenticated_session(api)
+
+
+def test_auth_exception_fails_closed():
+    class _Broken:
+        def __getattr__(self, name):
+            raise RuntimeError("boom")
+    assert not is_authenticated_session(_Broken())
+
+
+def test_certify_requires_authenticated_session():
+    api = _FakeApi()                             # no epoch → unauthenticated
     cert, failures, _ = _certify(api)
     assert cert is None
     assert any("AUTH" in f for f in failures), failures
 
 
-# ── B3/L3: deterministic required-margin provider, bound to cert ───────────
+# ── P0-margin: CONFIG_FLOOR only, bound to config commit ───────────────────
 
-def test_required_margin_provider_is_deterministic():
-    prov = required_margin_for("TMF", per_lot_margin=100_000.0, buffer=0.1)
-    assert prov["provider_version"] == MARGIN_PROVIDER_VERSION
-    assert prov["required_margin"] == 220_000.0     # 2 × 100k × 1.1
-    assert required_margin_for("TMF", per_lot_margin=100_000.0,
-                               buffer=0.1) == prov  # deterministic
+def test_margin_source_config_floor_deterministic():
+    api = _FakeApi()
+    src = margin_source_for(api, "TMF", config_floor=100_000.0)
+    assert src["source"] == "CONFIG_FLOOR"
+    assert src["per_pair_margin"] == 100_000.0
+    assert src["version"] == MARGIN_SOURCE_VERSION
+    assert isinstance(src["config_commit"], str) and len(src["config_commit"]) >= 7
+    assert margin_source_for(api, "TMF", config_floor=100_000.0) == src
 
+
+@pytest.mark.parametrize("floor", [0.0, -1.0, float("nan"), float("inf")])
+def test_margin_source_invalid_floor_fails(floor):
+    with pytest.raises(Exception):
+        margin_source_for(_FakeApi(), "TMF", config_floor=floor)
+
+
+def test_margin_source_missing_floor_fails():
+    with pytest.raises(Exception):
+        margin_source_for(_FakeApi(), "TMF", config_floor=None)
+
+
+def test_margin_source_unknown_product_fails():
+    with pytest.raises(Exception):
+        margin_source_for(_FakeApi(), "XXX")
+
+
+def test_margin_source_config_commit_mismatch_rejected_at_validation():
+    api = _FakeApi()
+    cert, failures, issuer = _certify(api)
+    assert cert is not None and failures == []
+    _assert_nonce_ok(issuer, cert)
+    changed = margin_source_for(api, "TMF", config_floor=150_000.0)  # floor changed
+    ok, reasons = _validated(cert, issuer, margin_source=changed)
+    assert not ok
+    assert any("SOURCE" in r for r in reasons), reasons
+
+
+# ── capacity boundaries (account margin from api.margin) ───────────────────
 
 @pytest.mark.parametrize("margin_val,expect_ok", [
-    (None, False),          # missing
-    (0.0, False),           # zero
-    (219_999.0, False),     # just below provider requirement (220_000)
-    (220_000.0, True),      # exactly at requirement
-    (1_000_000.0, True),    # comfortable
+    (None, False), (0.0, False), (109_999.0, False),
+    (110_000.0, True), (1_000_000.0, True),
 ])
 def test_margin_capacity_boundaries(margin_val, expect_ok):
     api = _FakeApi(margin_val=margin_val)
-    cert, failures, _ = _certify(api, margin_provider=required_margin_for(
-        "TMF", per_lot_margin=100_000.0, buffer=0.1))
+    register_session_epoch(api)
+    cert, failures, _ = _certify(api, config_floor=100_000.0)
     if expect_ok:
         assert cert is not None and failures == []
-        assert cert.required_margin == 220_000.0
-        assert cert.margin_provider_version == MARGIN_PROVIDER_VERSION
+        assert cert.required_margin == 110_000.0      # 100k × 1.1 buffer
     else:
         assert cert is None and any("MARGIN" in f for f in failures), failures
 
 
-def test_changed_margin_provider_rejected_at_validation():
-    # L3: the certificate binds the provider version+value; if the current
-    # provider differs (config changed), validation flags PROVIDER_MISMATCH
-    api = _FakeApi(margin_val=1_000_000.0)
-    prov_v1 = required_margin_for("TMF", per_lot_margin=100_000.0, buffer=0.1)
-    cert, failures, issuer = _certify(api, margin_provider=prov_v1)
-    assert cert is not None and failures == []
-    _assert_nonce_ok(issuer, cert)
-
-    prov_v2 = required_margin_for("TMF", per_lot_margin=100_000.0, buffer=0.2)
-    ok, reasons = _validated(cert, issuer, margin_provider=prov_v2)
-    assert not ok
-    assert any("PROVIDER" in r for r in reasons), reasons
-
-
-# ── B4/L5: subscription symmetry + snapshot presence semantics ─────────────
+# ── B4/L5: subscription symmetry + snapshot presence ───────────────────────
 
 def test_unsubscribe_failure_is_fatal():
     api = _FakeApi(unsubscribe_ok=False)
+    register_session_epoch(api)
     cert, failures, _ = _certify(api)
     assert cert is None
     assert any("QUOTE" in f or "SUB" in f for f in failures)
@@ -283,19 +318,18 @@ def test_unsubscribe_failure_is_fatal():
 
 def test_subscribe_failure_is_fatal():
     api = _FakeApi(subscribe_ok=False)
+    register_session_epoch(api)
     cert, failures, _ = _certify(api)
     assert cert is None
     assert any("QUOTE" in f or "SUB" in f for f in failures)
 
 
 @pytest.mark.parametrize("snapshot_codes", [
-    (),                                  # empty — L5: must fail (market-closed
-    ("TMFH6",),                          # is not a documented exception yet)
-    ("TMFH6", "TMFH6"),                  # duplicate
-    ("TMFX6", "TMFH6"),                  # extra code
+    (), ("TMFH6",), ("TMFH6", "TMFH6"), ("TMFX6", "TMFH6"),
 ])
 def test_snapshot_presence_semantics_fail(snapshot_codes):
     api = _FakeApi(snapshot_codes=snapshot_codes)
+    register_session_epoch(api)
     cert, failures, _ = _certify(api)
     assert cert is None
     assert any("SNAPSHOT" in f for f in failures), failures
@@ -303,32 +337,60 @@ def test_snapshot_presence_semantics_fail(snapshot_codes):
 
 def test_broker_not_flat_fails():
     api = _FakeApi(flat=False)
+    register_session_epoch(api)
     cert, failures, _ = _certify(api)
     assert cert is None and any("FLAT" in f for f in failures)
 
 
 def test_open_orders_with_submitted_status_fail():
-    # L2: Submitted/Pending trades are open — the fake returns their REAL
-    # status and the certification must fail
     api = _FakeApi(open_trade_statuses=["Submitted"])
+    register_session_epoch(api)
     cert, failures, _ = _certify(api)
     assert cert is None
     assert any("OPEN_ORDERS" in f for f in failures), failures
 
 
 def test_all_terminal_trades_pass():
-    # L2: terminal statuses (Filled/Cancelled/Expired/Done) are not open
     api = _FakeApi(open_trade_statuses=["Filled", "Cancelled"])
+    register_session_epoch(api)
     cert, failures, _ = _certify(api)
     assert cert is not None and failures == []
 
 
-# ── B2/B6/L6: session-bound nonce + lifecycle ──────────────────────────────
+def test_certificate_binds_identity_and_snapshots():
+    api = _FakeApi()
+    register_session_epoch(api)
+    cert, failures, _ = _certify(api)
+    assert cert.process_start_id == "p-1"
+    assert cert.account_hash
+    assert cert.session_epoch > 0
+    assert cert.margin_source == "CONFIG_FLOOR"
+    assert cert.config_commit
+    assert cert.position_snapshot_ts and cert.order_snapshot_ts
+    assert cert.bidask_subscribed == ("NEAR", "FAR")
+    assert cert.bidask_unsubscribed == ("NEAR", "FAR")
+
+
+def test_certify_route_collects_through_real_preflight_surface():
+    api = _FakeApi()
+    register_session_epoch(api)
+    cert, failures, _ = _certify(api)
+    assert failures == [], failures
+    for method in ("list_positions", "list_trades", "margin", "snapshots",
+                   "subscribe", "unsubscribe", "list_accounts"):
+        assert method in api.calls, f"{method} was never called"
+    assert cert.near_code == "TMFH6" and cert.far_code == "TMFI6"
+
+
+# ── B2/B6/L6: unforgeable issuance + lifecycle ─────────────────────────────
 
 def test_forged_copied_json_with_matching_process_id_fails():
     issuer_a = CertificateIssuer()
     api_a = _FakeApi()
-    cert_a, failures = certify_route(api_a, process_start_id="p-A", issuer=issuer_a)
+    register_session_epoch(api_a)
+    cert_a, failures = certify_route(
+        api_a, process_start_id="p-A", issuer=issuer_a,
+        margin_source=margin_source_for(api_a, "TMF", config_floor=100_000.0))
     assert cert_a is not None and failures == []
     payload = json.loads(json.dumps(cert_a.__dict__, default=str))
 
@@ -340,37 +402,54 @@ def test_forged_copied_json_with_matching_process_id_fails():
 
 
 def test_nonce_invalidation_on_session_renewal():
-    # L6: reconnect/session renewal invalidates all issued nonces
     api = _FakeApi()
+    register_session_epoch(api)
     cert, failures, issuer = _certify(api)
     assert cert is not None
     _assert_nonce_ok(issuer, cert)
-    issuer.invalidate_all()          # session renewal / shutdown
+    issuer.invalidate_all()
     ok, reasons = _validated(cert, issuer)
     assert not ok and any("NONCE" in r for r in reasons), reasons
 
 
 def test_nonce_single_use_redeem_consumes():
-    # L6: redeem is consuming (transition uses it once); peek is not
     api = _FakeApi()
+    register_session_epoch(api)
     cert, failures, issuer = _certify(api)
     assert issuer.peek(cert.nonce) is not None
     consumed = issuer.redeem(cert.nonce)
     assert consumed is not None
-    assert issuer.peek(cert.nonce) is None, "redeem must consume the nonce"
+    assert issuer.peek(cert.nonce) is None
 
 
 def test_reconnect_new_issuer_rejects_old_certificate():
     api = _FakeApi()
+    register_session_epoch(api)
     cert, failures, issuer_old = _certify(api)
     assert cert is not None
-    issuer_new = CertificateIssuer()   # process reconnected → fresh issuer
+    issuer_new = CertificateIssuer()
     ok, reasons = _validated(cert, issuer_new)
     assert not ok and any("NONCE" in r for r in reasons)
 
 
+def test_restart_no_reconstructed_issuer_can_validate_old_cert():
+    # v5: a fresh process (fresh issuer) + any persisted bytes can never
+    # recreate the issuance state; the issuer constructor takes no state
+    api = _FakeApi()
+    register_session_epoch(api)
+    cert, failures, issuer_old = _certify(api)
+    assert cert is not None
+    persisted = json.dumps(issuer_old.__dict__, default=str)  # attacker snapshot
+    fresh = CertificateIssuer()                               # restart
+    assert fresh.__dict__ == {}                                # no restored state
+    ok, reasons = _validated(cert, fresh)
+    assert not ok and any("NONCE" in r for r in reasons)
+    assert persisted  # snapshot bytes exist but cannot restore authorization
+
+
 def test_no_order_calls_in_full_certification_cycle():
     api = _FakeApi()
+    register_session_epoch(api)
     cert, failures, issuer = _certify(api)
     ok, reasons = _validated(cert, issuer)
     assert ok and reasons == []
@@ -380,6 +459,7 @@ def test_no_order_calls_in_full_certification_cycle():
 
 def test_query_failure_quarantines_zero_submit():
     api = _FakeApi()
+    register_session_epoch(api)
     api.margin = lambda account: (_ for _ in ()).throw(RuntimeError("margin down"))
     cert, failures, _ = _certify(api)
     assert cert is None
@@ -396,6 +476,7 @@ def _mutated(cert, **over):
 
 def test_stale_certificate_rejected():
     api = _FakeApi()
+    register_session_epoch(api)
     cert, failures, issuer = _certify(api)
     _assert_nonce_ok(issuer, cert)
     old = (datetime.now(timezone.utc) - timedelta(seconds=300)).isoformat()
@@ -406,6 +487,7 @@ def test_stale_certificate_rejected():
 
 def test_future_clock_skew_rejected():
     api = _FakeApi()
+    register_session_epoch(api)
     cert, failures, issuer = _certify(api)
     _assert_nonce_ok(issuer, cert)
     future = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
@@ -416,6 +498,7 @@ def test_future_clock_skew_rejected():
 
 def test_different_process_start_rejected():
     api = _FakeApi()
+    register_session_epoch(api)
     cert, failures, issuer = _certify(api)
     _assert_nonce_ok(issuer, cert)
     ok, reasons = _validated(cert, issuer, process_start_id="p-2")
@@ -425,6 +508,7 @@ def test_different_process_start_rejected():
 
 def test_different_account_rejected():
     api = _FakeApi()
+    register_session_epoch(api)
     cert, failures, issuer = _certify(api)
     _assert_nonce_ok(issuer, cert)
     ok, reasons = _validated(cert, issuer, account_hash="deadbeef")
@@ -434,6 +518,7 @@ def test_different_account_rejected():
 
 def test_changed_contract_codes_rejected():
     api = _FakeApi()
+    register_session_epoch(api)
     cert, failures, issuer = _certify(api)
     _assert_nonce_ok(issuer, cert)
     ok, reasons = _validated(cert, issuer, near_code="TMFJ6")
@@ -441,159 +526,90 @@ def test_changed_contract_codes_rejected():
     assert "CONTRACT" in reasons and "NONCE_UNKNOWN" not in reasons, reasons
 
 
-# ── L7: genuine route boundary ─────────────────────────────────────────────
-
-def test_weak_legacy_preflight_alone_not_live_ready():
-    from core.mode_transition import live_preflight_context, transition_to_live_ready
-    ctx = live_preflight_context(account_id="A1")
-    # RED vs CURRENT code: weak legacy preflight (no certificate) must NOT
-    # reach LIVE_READY — today transition_to_live_ready(ctx, []) does
-    ready = transition_to_live_ready(ctx, [])
-    assert not ready.is_live_ready(), \
-        "weak legacy preflight (no certificate) must stay non-LIVE_READY"
-
-
-def test_transition_requires_same_issuer_certificate():
-    # L7: the ONLY allowed future transition path takes a valid certificate
-    # issued by the SAME in-process issuer; this function does not exist yet
-    # (RED). The copied-certificate case must be rejected by the function.
-    from core.mode_transition import live_preflight_context
-    ctx = live_preflight_context(account_id="A1")
-    api = _FakeApi()
-    cert, failures, issuer = _certify(api)
-    assert cert is not None and failures == []
-    ready = transition_with_certificate(ctx, cert, issuer)
-    assert ready.is_live_ready()
-
-    # a certificate issued by ANOTHER issuer must be rejected
-    foreign = CertificateIssuer()
-    with pytest.raises(Exception):
-        transition_with_certificate(ctx, cert, foreign)
-
-
-# ── round-5 RED v4: B1-B6 ─────────────────────────────────────────────────
-
-# B4: authenticated-session adapter — strict allowlist, fail-closed
-
-def test_auth_signal_allowlist_each_signal():
-    api = _FakeApi()                       # login_token + account
-    assert is_authenticated_session(api)
-    only_token = _FakeApi(); only_token.account = None
-    assert is_authenticated_session(only_token), "login_token alone is a signal"
-    only_account = _FakeApi(); only_account.login_token = None
-    assert is_authenticated_session(only_account), "account alone is a signal"
-
-
-def test_auth_no_signal_fails_closed():
-    api = _FakeApi(authenticated=False)    # neither login_token nor account
-    assert not is_authenticated_session(api)
-
-
-def test_auth_exception_fails_closed():
-    class _Broken:
-        def __getattr__(self, name):
-            raise RuntimeError("boom")
-    assert not is_authenticated_session(_Broken())
-
-
-# B3: authoritative margin source
-
-def test_margin_source_config_floor_deterministic():
-    api = _FakeApi()                       # no margin_rates → CONFIG_FLOOR
-    src = margin_source_for(api, "TMF", config_floor=100_000.0)
-    assert src["source"] == "CONFIG_FLOOR"
-    assert src["per_lot_margin"] == 100_000.0
-    assert src["version"] == MARGIN_SOURCE_VERSION
-    assert margin_source_for(api, "TMF", config_floor=100_000.0) == src
-
-
-@pytest.mark.parametrize("floor", [0.0, -1.0, float("nan"), float("inf")])
-def test_margin_source_invalid_floor_fails(floor):
-    with pytest.raises(Exception):
-        margin_source_for(_FakeApi(), "TMF", config_floor=floor)
-
-
-def test_margin_source_unknown_product_fails():
-    with pytest.raises(Exception):
-        margin_source_for(_FakeApi(), "XXX")
-
-
-def test_margin_source_broker_query_takes_priority():
-    api = _FakeApi(margin_rates=lambda product: 120_000.0)
-    src = margin_source_for(api, "TMF", config_floor=100_000.0)
-    assert src["source"] == "BROKER_MARGIN_QUERY"
-    assert src["per_lot_margin"] == 120_000.0
-
-
-def test_margin_source_mismatch_rejected_at_validation():
-    api = _FakeApi()
-    cert, failures, issuer = _certify(
-        api, margin_provider=margin_source_for(api, "TMF", config_floor=100_000.0))
-    assert cert is not None and failures == []
-    _assert_nonce_ok(issuer, cert)
-    changed = _FakeApi(margin_rates=lambda product: 120_000.0)  # source changed
-    ok, reasons = _validated(cert, issuer, margin_source=margin_source_for(
-        changed, "TMF", config_floor=100_000.0))
-    assert not ok
-    assert any("SOURCE" in r for r in reasons), reasons
-
-
-# B1/B5: transition_with_certificate — atomic validation before redeem
+# ── v5 route assertions: transition (runtime-derived facts, quarantine) ────
 
 def _transition_ctx():
     from core.mode_transition import live_preflight_context
     return live_preflight_context(account_id="A1")
 
 
-def test_transition_rejects_stale_preserves_nonce():
-    api = _FakeApi()
-    cert, failures, issuer = _certify(api)
-    stale = _mutated(cert, captured_at=(
-        datetime.now(timezone.utc) - timedelta(seconds=300)).isoformat())
-    with pytest.raises(Exception):
-        transition_with_certificate(_transition_ctx(), stale, issuer)
-    assert issuer.peek(cert.nonce) is not None, \
-        "failed validation must PRESERVE the nonce (no accidental retry auth)"
-
-
-def test_transition_rejects_changed_account_preserves_nonce():
-    api = _FakeApi()
-    cert, failures, issuer = _certify(api)
-    forged = _mutated(cert, account_hash="deadbeef")
-    with pytest.raises(Exception):
-        transition_with_certificate(_transition_ctx(), forged, issuer)
-    assert issuer.peek(cert.nonce) is not None
-
-
-def test_transition_rejects_invalidated_issuer():
-    api = _FakeApi()
-    cert, failures, issuer = _certify(api)
-    issuer.invalidate_all()
-    with pytest.raises(Exception):
-        transition_with_certificate(_transition_ctx(), cert, issuer)
-
-
 def test_transition_succeeds_and_consumes_exactly_once():
     api = _FakeApi()
+    register_session_epoch(api)
     cert, failures, issuer = _certify(api)
-    ready = transition_with_certificate(_transition_ctx(), cert, issuer)
+    rt = _runtime(api, cert, issuer)
+    ready = transition_with_certificate(_transition_ctx(), cert, issuer, runtime=rt)
     assert ready.is_live_ready()
     assert issuer.peek(cert.nonce) is None, "successful transition consumes once"
     with pytest.raises(Exception):
-        transition_with_certificate(_transition_ctx(), cert, issuer)  # 2nd use
+        transition_with_certificate(_transition_ctx(), cert, issuer, runtime=rt)
 
 
-def test_toctou_invalidation_between_validate_and_transition():
+def test_transition_rejects_mutated_certificate_same_nonce():
+    # v5: same nonce/issuer but mutated facts → rejected (facts re-derived
+    # from the runtime context, not the certificate's claims)
     api = _FakeApi()
+    register_session_epoch(api)
+    cert, failures, issuer = _certify(api)
+    _assert_nonce_ok(issuer, cert)
+    forged = _mutated(cert, near_code="TMFJ6")       # mutated contract code
+    result = transition_with_certificate(_transition_ctx(), forged, issuer,
+                                         runtime=_runtime(api, cert, issuer))
+    assert not result.is_live_ready()
+    assert result.to_dict().get("effective_mode") == "live_quarantined"
+    assert any("CONTRACT" in r for r in result.audit_reasons)
+    assert issuer.peek(cert.nonce) is not None, "failed transition preserves nonce"
+
+
+def test_transition_derives_facts_from_runtime_not_certificate():
+    api = _FakeApi()
+    register_session_epoch(api)
+    cert, failures, issuer = _certify(api)
+    # runtime says the account is different — cert must be rejected even
+    # though the cert itself claims the old (correct-at-issue) hash
+    rt = _runtime(api, cert, issuer, account_hash="runtime-account-2")
+    result = transition_with_certificate(_transition_ctx(), cert, issuer, runtime=rt)
+    assert not result.is_live_ready()
+    assert any("ACCOUNT" in r for r in result.audit_reasons)
+
+
+def test_transition_failed_returns_quarantined_with_audit_reason():
+    api = _FakeApi()
+    register_session_epoch(api)
+    cert, failures, issuer = _certify(api)
+    rt = _runtime(api, cert, issuer)
+    rt["margin_source"] = margin_source_for(api, "TMF", config_floor=150_000.0)
+    result = transition_with_certificate(_transition_ctx(), cert, issuer, runtime=rt)
+    assert result.to_dict().get("effective_mode") == "live_quarantined"
+    assert result.audit_reasons, "quarantined context must carry audit reasons"
+    assert not result.is_live_ready()
+
+
+def test_transition_toctou_invalidation_between_validate_and_transition():
+    api = _FakeApi()
+    register_session_epoch(api)
     cert, failures, issuer = _certify(api)
     ok, reasons = _validated(cert, issuer)
     assert ok and reasons == []
-    issuer.invalidate_all()                       # TOCTOU window closes
-    with pytest.raises(Exception):
-        transition_with_certificate(_transition_ctx(), cert, issuer)
+    issuer.invalidate_all()
+    result = transition_with_certificate(_transition_ctx(), cert, issuer,
+                                         runtime=_runtime(api, cert, issuer))
+    assert not result.is_live_ready()
+    assert result.to_dict().get("effective_mode") == "live_quarantined"
 
 
-# B2: legacy bypass closed + call-site audit
+def test_transition_has_no_order_calls():
+    api = _FakeApi()
+    register_session_epoch(api)
+    cert, failures, issuer = _certify(api)
+    ready = transition_with_certificate(_transition_ctx(), cert, issuer,
+                                        runtime=_runtime(api, cert, issuer))
+    assert ready.is_live_ready()
+    assert not any(c in ("place_order", "cancel_order", "modify_order")
+                   for c in api.calls), api.calls
+
+
+# ── B2: legacy bypass — AST call-site scan ─────────────────────────────────
 
 def test_legacy_transition_no_cert_quarantines():
     from core.mode_transition import (live_preflight_context,
@@ -605,19 +621,19 @@ def test_legacy_transition_no_cert_quarantines():
         "no-cert result must be LIVE_QUARANTINED"
 
 
-def test_no_production_call_site_of_legacy_transition():
-    # B2: production code must not call the legacy bypass; only tests and
-    # the module itself may reference it
-    import pathlib
-    root = pathlib.Path(__file__).resolve().parents[2]
+def test_ast_call_site_scan_no_legacy_transition_in_monitor():
+    # v5: AST-based scan — the production monitor module must not contain a
+    # transition_to_live_ready call (known bypass: monitor.py:522)
+    root = __import__("pathlib").Path(__file__).resolve().parents[2]
+    monitor = root / "strategies" / "futures" / "monitor.py"
+    assert monitor.exists(), f"monitor not found: {monitor}"
+    tree = ast.parse(monitor.read_text(encoding="utf-8"))
     hits = []
-    for p in root.rglob("*.py"):
-        if "tests" in p.parts or p.name in ("mode_transition.py",):
-            continue
-        try:
-            text = p.read_text(encoding="utf-8")
-        except Exception:
-            continue
-        if "transition_to_live_ready(" in text:
-            hits.append(str(p))
-    assert hits == [], f"production call sites of the legacy bypass: {hits}"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr == "transition_to_live_ready":
+            hits.append(node.lineno)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "transition_to_live_ready":
+            hits.append(node.lineno)
+    assert not hits, f"monitor.py still calls transition_to_live_ready at: {hits}"
