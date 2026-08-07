@@ -62,13 +62,32 @@ def test_t6_corrupt_trade_kept_not_dropped():
 
 
 def test_t7_fee_missing_fee_uncertain():
+    # no explicit fee on fill and no schedule -> FEE_UNCERTAIN (never 0)
     res = reconcile_fill(
         {"trade_id": "t1", "side": "SELL", "qty": 1, "price": 110.0},
-        100.0, 10.0, fee_source_available=False,
+        100.0, 10.0,
     )
     assert res.status == STATUS_FEE_UNCERTAIN
     assert "fee_missing" in res.issue_flags
     assert res.expected_realized == pytest.approx(100.0)  # gross still computed
+
+
+def test_t7b_fee_schedule_applied():
+    # no explicit fee but schedule present -> fee = qty * per_contract
+    res = reconcile_fill(
+        {"trade_id": "t1", "side": "SELL", "qty": 2, "price": 110.0},
+        100.0, 10.0, fee_schedule={"per_contract": 2.0},
+    )
+    assert res.status == STATUS_OK
+    assert res.expected_realized == pytest.approx(100.0 * 2 - 4.0)  # 200 - 4
+
+
+def test_t7c_entry_avg_none_never_zero():
+    # missing entry average must NOT become 0.0 (false PnL)
+    res = reconcile_fill({"trade_id": "t1", "side": "SELL", "qty": 1, "price": 110.0},
+                         None, 10.0)
+    assert res.status == STATUS_UNRECONCILED
+    assert "missing_entry_avg" in res.issue_flags
 
 
 def test_t8_single_status_plus_flags():

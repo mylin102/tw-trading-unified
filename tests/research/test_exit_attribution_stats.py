@@ -32,12 +32,16 @@ def test_t17_fixed_event_latency_first_valid_observation():
         {"ts": T0 + timedelta(seconds=5), "ask": 101.0, "bid": 100.5, "price": 100.8},
         {"ts": T0 + timedelta(seconds=30), "ask": 102.0, "bid": 101.5, "price": 101.8},
     ]
-    px, ts = fixed_event_latency_quote(ticks, T0, delay_s=2.0, window_s=10.0)
-    assert px == pytest.approx(101.0)  # FIRST valid at/after T0+2s (not worst-of)
-    assert ts == str(ticks[1]["ts"])
+    # SELL side -> bid
+    px, ts, src = fixed_event_latency_quote(ticks, T0, delay_s=2.0, window_s=10.0, side="SELL")
+    assert px == pytest.approx(100.5)  # bid, FIRST valid at/after T0+2s
+    assert ts == str(ticks[1]["ts"]) and src == "bid"
+    # BUY side -> ask
+    px2, _ts2, src2 = fixed_event_latency_quote(ticks, T0, delay_s=2.0, window_s=10.0, side="BUY")
+    assert px2 == pytest.approx(101.0) and src2 == "ask"
     # no valid observation in window (next tick at 5s > end T0+3s) -> NOT_AVAILABLE
-    px2, ts2 = fixed_event_latency_quote(ticks, T0, delay_s=2.0, window_s=1.0)
-    assert px2 is None and ts2 == "NOT_AVAILABLE"
+    px3, ts3, src3 = fixed_event_latency_quote(ticks, T0, delay_s=2.0, window_s=1.0)
+    assert px3 is None and ts3 == "NOT_AVAILABLE" and src3 is None
 
 
 def test_t17b_adversarial_envelope_separate():
