@@ -1118,33 +1118,30 @@ def test_b42_crash_tail_fail_closed(tmp_path):
 #    4) second identical tick ⇒ zero re-submit + auditable
 #       POLICY_J_SINGLE_LEG_TRIGGERED event
 #    5) below activation / insufficient giveback ⇒ zero orders
-#    RED until the single-leg Policy J path is wired. ────────────────────
-def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch, caplog):
+# ─────────────────────────────────────────────────────────────────────
+def _b48_build_released(tmp_path, monkeypatch):
+    """B48 harness: SPREAD → confirmed RELEASE_NEAR fill → SINGLE_LEG
+    (released near, remaining FAR, peak_net_exit_pnl_twd=1300).
+
+    Returns (monitor, strat, now, bar1, bar2)."""
     from datetime import datetime
     from pathlib import Path
-    from unittest.mock import patch, MagicMock
-    from core.signal import Signal
+    from unittest.mock import patch
     from core.strategy_context import StrategyContext, MarketData, PositionView
     from core.order_management.order import OrderStatus, OrderSide
     from strategies.plugins.futures.active.tmf_spread import (
         PositionLifecycle, PositionPhase, ReleaseGroup, ReleaseGroupStatus,
-        TrailGroup, TrailGroupStatus, Leg,
+        Leg,
     )
     import types as _types
-    import logging as _logging
 
-    caplog.set_level(_logging.INFO)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
-    # fills ledger: the release fill writes here AND the dispatcher's
-    # per-leg open-qty reconstruction reads the same path
     fills_path = tmp_path / "mts_trade_fills.jsonl"
     monkeypatch.setenv("MTS_FILL_LOG_PATH", str(fills_path))
     monkeypatch.setenv("MTS_EVENT_LOG_PATH", str(tmp_path / "mts_spread_events.jsonl"))
     import strategies.plugins.futures.active.tmf_spread as _tmf
     _tmf._MTS_FILL_LOG = str(fills_path)
-    # seed the entry fills (near+far) so open-qty reconstruction has
-    # ENTRY evidence for t1
     with open(fills_path, "a", encoding="utf-8") as _fh:
         for _leg, _code in (("NEAR", "TMFF6"), ("FAR", "TMFH6")):
             _fh.write(json.dumps({"trade_id": "t1", "leg": _leg,
@@ -1163,7 +1160,6 @@ def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch, caplog):
                            "combined_upl_giveback_twd": 50.0}},
     )
     strat.init(ctx)
-    # init() resets position state — re-apply the SPREAD trade identity
     strat._trade_id = "t1"
     strat._has_position = True
     strat._released_leg = None
@@ -1205,14 +1201,13 @@ def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch, caplog):
     )
     now = datetime.now()
     state_path = Path(tmp_path) / "state.json"
+    bar1 = {"near_close": 43400.0, "far_close": 44100.0, "atr": 10.0,
+            "timestamp": now, "code": "TMFF6"}
     with patch("strategies.futures.monitor._mts_position_state_path",
                return_value=state_path), \
          patch("strategies.futures.monitor.is_taifex_futures_market_open",
                return_value=True), \
          patch.object(Path, "exists", return_value=False):
-        # ── phase 1: confirmed RELEASE fill ⇒ SINGLE_LEG ──
-        bar1 = {"near_close": 43400.0, "far_close": 44100.0, "atr": 10.0,
-                "timestamp": now, "code": "TMFF6"}
         sig_rel = strat._manage_position(43400.0, 44100.0, -0.5, now, bar1)
         assert sig_rel is not None, "release emission expected"
         with patch("strategies.futures.monitor.save_trade"), \
@@ -1226,26 +1221,43 @@ def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch, caplog):
                 status=OrderStatus.FILLED, side=OrderSide.SELL,
                 timestamp=now)
             monitor._apply_confirmed_futures_deal(ev)
-        # reconstructed state: SINGLE_LEG after the confirmed release fill
         _lc = strat._lifecycle_oca
         assert _lc.phase.value == "SINGLE_LEG", \
             f"expected SINGLE_LEG after release fill, got {_lc.phase.value}"
         assert getattr(strat, "_released_leg", None) == "near"
         strat._lifecycle = "TRAILING_LONG"  # release path marks EXITING; clear it
-        # production enum semantics for a confirmed NEAR release:
-        # filled_leg=NEAR, canceled_leg=FAR, remaining_leg=FAR
         assert _lc.release_group.filled_leg == Leg.NEAR
         assert _lc.release_group.canceled_leg == Leg.FAR
         assert _lc.trail_group.remaining_leg == Leg.FAR
-        # per-leg open qty reconstructed from the fills ledger: near=0 far=1
         _qty = monitor._mts_ledger_reconstructed_open_qty("t1")
         assert _qty is not None, "ledger reconstruction must have entry evidence"
         assert _qty == {"NEAR": 0, "FAR": 1}, f"open qty mismatch: {_qty}"
-        # durable peak ≥ 200 TWD (released realized + remaining mark)
         strat._peak_net_exit_pnl_twd = 1300.0
+    bar2 = {"near_close": 43400.0, "far_close": 44350.0, "atr": 10.0,
+            "timestamp": now, "code": "TMFF6"}
+    return monitor, strat, now, bar1, bar2
+
+
+def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch, caplog):
+    from pathlib import Path
+    from unittest.mock import patch
+    from core.order_management.order import OrderSide
+    from core.strategy_context import StrategyContext, MarketData, PositionView
+    from strategies.plugins.futures.active.tmf_spread import (
+        PositionLifecycle, PositionPhase, ReleaseGroup, ReleaseGroupStatus,
+        TrailGroup, TrailGroupStatus, Leg,
+    )
+    import logging as _logging
+
+    caplog.set_level(_logging.INFO)
+    monitor, strat, now, bar1, bar2 = _b48_build_released(tmp_path, monkeypatch)
+    state_path = Path(tmp_path) / "state.json"
+    with patch("strategies.futures.monitor._mts_position_state_path",
+               return_value=state_path), \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open",
+               return_value=True), \
+         patch.object(Path, "exists", return_value=False):
         # ── phase 2: giveback ≥ 50 TWD on the remaining leg ⇒ trigger ──
-        bar2 = {"near_close": 43400.0, "far_close": 44350.0, "atr": 10.0,
-                "timestamp": now, "code": "TMFF6"}
         sig2 = strat._manage_position(43400.0, 44350.0, -0.5, now, bar2)
         assert sig2 is not None, "single-leg Policy J exit emission expected"
         # point 4: the signal must be Policy J PRODUCED (the adapter's
@@ -1290,24 +1302,59 @@ def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch, caplog):
         actives = [iid for iid in intent_log.list_active()
                    if intent_log.get(iid)["trade_id"] == "t1"]
         assert len(actives) == 1
-        # auditable event with provenance fields
+        # auditable decision event — durable in the INTENT log (fence-aware),
+        # with the full codex field contract
+        rows = [json.loads(l) for l in intent_log.raw_lines() if l.strip()]
+        pj = [r for r in rows if r.get("event") == "POLICY_J_SINGLE_LEG_TRIGGERED"]
+        assert len(pj) == 1
+        _pj = pj[0]
+        for key in ("event_id", "ts", "trade_id", "released_leg", "remaining_leg",
+                    "released_realized_pnl_twd", "remaining_upl_twd",
+                    "current_net_exit_pnl_twd", "peak_net_exit_pnl_twd",
+                    "activation_twd", "giveback_twd", "winner", "action", "reason"):
+            assert key in _pj, f"missing event field {key}"
+        assert _pj["winner"] == "POLICY_J_SINGLE_LEG"
+        assert _pj["action"] == "EXIT" and _pj["reason"] == "TMF_TRAIL"
+        assert _pj["trade_id"] == "t1" and _pj["released_leg"] == "near"
+        assert _pj["remaining_leg"] == "FAR"
+        assert abs(_pj["current_net_exit_pnl_twd"] - _current_net) < 1.0
+        assert abs(_pj["peak_net_exit_pnl_twd"] - _peak) < 1.0
+        # D-iv: ORDER_SUBMITTED event + pending-order metadata carry the
+        # SAME event_id (decision → order correlation)
         events = [json.loads(l) for l in
                   (tmp_path / "mts_spread_events.jsonl").read_text().splitlines()
                   if l.strip()]
-        pj = [e for e in events if e.get("event") == "POLICY_J_SINGLE_LEG_TRIGGERED"]
-        assert len(pj) == 1
-        for key in ("trade_id", "released_leg", "realized", "remaining_upl",
-                    "peak", "giveback", "winner"):
-            assert key in pj[0], f"missing event field {key}"
-        # ── phase 3: identical second tick ⇒ ZERO re-submit ──
+        _os = [e for e in events if e.get("event") == "ORDER_SUBMITTED"]
+        assert _os, "ORDER_SUBMITTED events missing"
+        assert _os[-1].get("event_id") == _pj["event_id"], \
+            "ORDER_SUBMITTED must carry the decision event_id"
+        assert _os[-1].get("winner") == "POLICY_J_SINGLE_LEG"
+        _pend = monitor._pending_lifecycle_orders
+        assert any(p.get("event_id") == _pj["event_id"] for p in _pend.values()), \
+            "pending-order metadata must carry the decision event_id"
+        # ── phase 3: identical second tick ⇒ ZERO re-submit, ONE event ──
         sig3 = strat._manage_position(43400.0, 44350.0, -0.5, now, bar2)
         assert sig3 is None, "in-flight gate must suppress re-emission"
         monitor._submit_mts_order_signal(sig3, strat, bar2, now) if sig3 else None
         assert len(monitor.order_mgr.submits) - _before == 1, \
             "duplicate exit re-submitted"
+        rows2 = [json.loads(l) for l in intent_log.raw_lines() if l.strip()]
+        pj2 = [r for r in rows2 if r.get("event") == "POLICY_J_SINGLE_LEG_TRIGGERED"]
+        assert len(pj2) == 1, "second tick must NOT duplicate the decision event"
     # ── phase 4 (isolated): below activation ⇒ zero orders ──
     mon2, strat2, api2 = build_monitor(tmp_path, monkeypatch)
-    strat2.init(ctx)
+    ctx2 = StrategyContext(
+        market=MarketData(last_bar={}, ticker="TMF"),
+        position=PositionView(),
+        config={"ticker": "TMF",
+                "params": {"atr_multiplier_stop": 3.5, "atr_multiplier_trail": 3.5,
+                           "trail_distance_points": 35.0, "min_atr": 5.0,
+                           "entry_z": -2.0, "confirm_ticks": 1, "confirm_ms": 0.0,
+                           "enable_combined_upl_trail": True,
+                           "combined_upl_activation_net_pnl_twd": 200.0,
+                           "combined_upl_giveback_twd": 50.0}},
+    )
+    strat2.init(ctx2)
     strat2._trade_id = "t2"
     strat2._has_position = True
     strat2._released_leg = "near"
@@ -1335,3 +1382,93 @@ def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch, caplog):
         sig_low = strat2._manage_position(43400.0, 44350.0, -0.5, now, bar2)
         assert sig_low is None, "below-activation must NOT emit an exit"
         assert len(mon2.order_mgr.submits) == 0, "zero orders below activation"
+
+
+# ── B48-D1 (codex D-i): decision-event append failure ⇒ fail-closed:
+#    no signal, no submit ──────────────────────────────────────────────
+def test_b48d1_event_append_failure_fail_closed(tmp_path, monkeypatch, caplog):
+    from pathlib import Path
+    from unittest.mock import patch
+    import logging as _logging
+
+    caplog.set_level(_logging.INFO)
+    monitor, strat, now, bar1, bar2 = _b48_build_released(tmp_path, monkeypatch)
+    with patch("strategies.futures.monitor._mts_position_state_path",
+               return_value=Path(tmp_path) / "state.json"), \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open",
+               return_value=True), \
+         patch.object(Path, "exists", return_value=False), \
+         patch.object(ei.IntentLog, "append_event",
+                      side_effect=RuntimeError("intent log io failure")):
+        _before = len(monitor.order_mgr.submits)
+        sig = strat._manage_position(43400.0, 44350.0, -0.5, now, bar2)
+        assert sig is None, \
+            "fail-closed: Policy J event append failure must suppress the signal"
+        monitor._submit_mts_order_signal(sig, strat, bar2, now) if sig else None
+        assert len(monitor.order_mgr.submits) == _before, \
+            "fail-closed: zero new orders when the decision event could not persist"
+
+
+# ── B48-D2 (codex D-ii): second identical tick ⇒ ONE decision event,
+#    ONE order (idempotent trigger generation) ─────────────────────────
+def test_b48d2_second_tick_single_event_single_order(tmp_path, monkeypatch, caplog):
+    from pathlib import Path
+    from unittest.mock import patch
+    import logging as _logging
+
+    caplog.set_level(_logging.INFO)
+    monitor, strat, now, bar1, bar2 = _b48_build_released(tmp_path, monkeypatch)
+    with patch("strategies.futures.monitor._mts_position_state_path",
+               return_value=Path(tmp_path) / "state.json"), \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open",
+               return_value=True), \
+         patch.object(Path, "exists", return_value=False):
+        sig1 = strat._manage_position(43400.0, 44350.0, -0.5, now, bar2)
+        assert sig1 is not None
+        _before = len(monitor.order_mgr.submits)
+        monitor._submit_mts_order_signal(sig1, strat, bar2, now)
+        assert len(monitor.order_mgr.submits) - _before == 1
+        # identical second tick — the in-flight gate suppresses re-emission
+        sig2 = strat._manage_position(43400.0, 44350.0, -0.5, now, bar2)
+        assert sig2 is None
+        monitor._submit_mts_order_signal(sig2, strat, bar2, now) if sig2 else None
+        assert len(monitor.order_mgr.submits) - _before == 1, \
+            "duplicate exit re-submitted"
+        intent_log = ei.IntentLog(str(tmp_path / "logs"))
+        rows = [json.loads(l) for l in intent_log.raw_lines() if l.strip()]
+        pj = [r for r in rows if r.get("event") == "POLICY_J_SINGLE_LEG_TRIGGERED"]
+        assert len(pj) == 1, \
+            f"exactly ONE decision event expected, got {len(pj)}"
+
+
+# ── B48-D3 (codex D-iii): a NATIVE remaining-leg trail (no Policy J win)
+#    must NOT impersonate the POLICY_J_SINGLE_LEG_TRIGGERED event ──────
+def test_b48d3_native_trail_does_not_impersonate(tmp_path, monkeypatch, caplog):
+    from pathlib import Path
+    from unittest.mock import patch
+    import logging as _logging
+
+    caplog.set_level(_logging.INFO)
+    monitor, strat, now, bar1, bar2 = _b48_build_released(tmp_path, monkeypatch)
+    # kill the Policy J win: peak below activation
+    strat._peak_net_exit_pnl_twd = 150.0
+    bar_native = {"near_close": 43400.0, "far_close": 43800.0, "atr": 10.0,
+                  "timestamp": now, "code": "TMFF6"}
+    with patch("strategies.futures.monitor._mts_position_state_path",
+               return_value=Path(tmp_path) / "state.json"), \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open",
+               return_value=True), \
+         patch.object(Path, "exists", return_value=False):
+        sig = strat._manage_position(43400.0, 43800.0, -0.5, now, bar_native)
+        # native trail may fire (legacy path) — but it must NEVER carry the
+        # Policy J winner or append the Policy J decision event
+        if sig is not None:
+            assert sig.winner != "POLICY_J_SINGLE_LEG", \
+                "native trail must not claim the Policy J winner"
+            assert sig.event_id == "", \
+                "native trail must not carry a Policy J event_id"
+        intent_log = ei.IntentLog(str(tmp_path / "logs"))
+        rows = [json.loads(l) for l in intent_log.raw_lines() if l.strip()]
+        pj = [r for r in rows if r.get("event") == "POLICY_J_SINGLE_LEG_TRIGGERED"]
+        assert len(pj) == 0, \
+            "native trail must NOT append the POLICY_J_SINGLE_LEG_TRIGGERED event"
