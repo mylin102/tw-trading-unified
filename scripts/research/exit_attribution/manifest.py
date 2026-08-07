@@ -35,8 +35,10 @@ def git_head(repo_root: str, exclude_paths=None) -> dict:
         if exclude_paths:
             for _p in exclude_paths:
                 st = "\n".join(l for l in st.splitlines() if _p not in l)
-        dirty = st.strip() != ""
-        return {"commit": sha, "dirty": dirty}
+        dirty_paths = [l.split()[1] if len(l.split()) > 1 else l
+                       for l in st.splitlines() if l.strip()]
+        dirty = bool(dirty_paths)
+        return {"commit": sha, "dirty": dirty, "dirty_paths": dirty_paths}
     except Exception as exc:  # pragma: no cover - environment guard
         return {"commit": None, "dirty": None, "error": str(exc)}
 
