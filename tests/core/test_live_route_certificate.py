@@ -24,7 +24,10 @@ from core.live_route_certificate import (   # noqa: F401 — RED: module TBD
     CertificateIssuer,
     LiveBrokerCertificate,
     MARGIN_PROVIDER_VERSION,
+    MARGIN_SOURCE_VERSION,
     certify_route,
+    is_authenticated_session,
+    margin_source_for,
     required_margin_for,
     transition_with_certificate,
     validate_live_broker_certificate,
@@ -96,9 +99,13 @@ class _FakeApi:
                  margin_val=1_000_000.0, trading_limits_ok=True,
                  subscribe_ok=True, unsubscribe_ok=True,
                  snapshot_codes=("TMFH6", "TMFI6"), authenticated=True,
-                 account=None):
+                 account=None, margin_rates=None):
         self.futopt_account = account or _Account()
-        self.authenticated = authenticated
+        # B4: session signals — login_token / account (futopt_account is the
+        # preflight's own requirement, not an auth signal by itself)
+        self.login_token = "tok-abc123" if authenticated else None
+        self.account = _Account() if authenticated else None
+        self.margin_rates = margin_rates      # B3: broker margin query signal
         self._contracts = [_Contract("TMFH6", "2026-08-19"),
                            _Contract("TMFI6", "2026-09-16")]
         self.Contracts = _Contracts(self._contracts)
@@ -176,7 +183,8 @@ def _validated(cert, issuer, **over):
         near_code=over.get("near_code", "TMFH6"),
         far_code=over.get("far_code", "TMFI6"),
         now_ts=over.get("now_ts"),
-        margin_provider=over.get("margin_provider"))
+        margin_provider=over.get("margin_provider"),
+        margin_source=over.get("margin_source"))
     return ok, reasons
 
 
@@ -461,3 +469,155 @@ def test_transition_requires_same_issuer_certificate():
     foreign = CertificateIssuer()
     with pytest.raises(Exception):
         transition_with_certificate(ctx, cert, foreign)
+
+
+# ── round-5 RED v4: B1-B6 ─────────────────────────────────────────────────
+
+# B4: authenticated-session adapter — strict allowlist, fail-closed
+
+def test_auth_signal_allowlist_each_signal():
+    api = _FakeApi()                       # login_token + account
+    assert is_authenticated_session(api)
+    only_token = _FakeApi(); only_token.account = None
+    assert is_authenticated_session(only_token), "login_token alone is a signal"
+    only_account = _FakeApi(); only_account.login_token = None
+    assert is_authenticated_session(only_account), "account alone is a signal"
+
+
+def test_auth_no_signal_fails_closed():
+    api = _FakeApi(authenticated=False)    # neither login_token nor account
+    assert not is_authenticated_session(api)
+
+
+def test_auth_exception_fails_closed():
+    class _Broken:
+        def __getattr__(self, name):
+            raise RuntimeError("boom")
+    assert not is_authenticated_session(_Broken())
+
+
+# B3: authoritative margin source
+
+def test_margin_source_config_floor_deterministic():
+    api = _FakeApi()                       # no margin_rates → CONFIG_FLOOR
+    src = margin_source_for(api, "TMF", config_floor=100_000.0)
+    assert src["source"] == "CONFIG_FLOOR"
+    assert src["per_lot_margin"] == 100_000.0
+    assert src["version"] == MARGIN_SOURCE_VERSION
+    assert margin_source_for(api, "TMF", config_floor=100_000.0) == src
+
+
+@pytest.mark.parametrize("floor", [0.0, -1.0, float("nan"), float("inf")])
+def test_margin_source_invalid_floor_fails(floor):
+    with pytest.raises(Exception):
+        margin_source_for(_FakeApi(), "TMF", config_floor=floor)
+
+
+def test_margin_source_unknown_product_fails():
+    with pytest.raises(Exception):
+        margin_source_for(_FakeApi(), "XXX")
+
+
+def test_margin_source_broker_query_takes_priority():
+    api = _FakeApi(margin_rates=lambda product: 120_000.0)
+    src = margin_source_for(api, "TMF", config_floor=100_000.0)
+    assert src["source"] == "BROKER_MARGIN_QUERY"
+    assert src["per_lot_margin"] == 120_000.0
+
+
+def test_margin_source_mismatch_rejected_at_validation():
+    api = _FakeApi()
+    cert, failures, issuer = _certify(
+        api, margin_provider=margin_source_for(api, "TMF", config_floor=100_000.0))
+    assert cert is not None and failures == []
+    _assert_nonce_ok(issuer, cert)
+    changed = _FakeApi(margin_rates=lambda product: 120_000.0)  # source changed
+    ok, reasons = _validated(cert, issuer, margin_source=margin_source_for(
+        changed, "TMF", config_floor=100_000.0))
+    assert not ok
+    assert any("SOURCE" in r for r in reasons), reasons
+
+
+# B1/B5: transition_with_certificate — atomic validation before redeem
+
+def _transition_ctx():
+    from core.mode_transition import live_preflight_context
+    return live_preflight_context(account_id="A1")
+
+
+def test_transition_rejects_stale_preserves_nonce():
+    api = _FakeApi()
+    cert, failures, issuer = _certify(api)
+    stale = _mutated(cert, captured_at=(
+        datetime.now(timezone.utc) - timedelta(seconds=300)).isoformat())
+    with pytest.raises(Exception):
+        transition_with_certificate(_transition_ctx(), stale, issuer)
+    assert issuer.peek(cert.nonce) is not None, \
+        "failed validation must PRESERVE the nonce (no accidental retry auth)"
+
+
+def test_transition_rejects_changed_account_preserves_nonce():
+    api = _FakeApi()
+    cert, failures, issuer = _certify(api)
+    forged = _mutated(cert, account_hash="deadbeef")
+    with pytest.raises(Exception):
+        transition_with_certificate(_transition_ctx(), forged, issuer)
+    assert issuer.peek(cert.nonce) is not None
+
+
+def test_transition_rejects_invalidated_issuer():
+    api = _FakeApi()
+    cert, failures, issuer = _certify(api)
+    issuer.invalidate_all()
+    with pytest.raises(Exception):
+        transition_with_certificate(_transition_ctx(), cert, issuer)
+
+
+def test_transition_succeeds_and_consumes_exactly_once():
+    api = _FakeApi()
+    cert, failures, issuer = _certify(api)
+    ready = transition_with_certificate(_transition_ctx(), cert, issuer)
+    assert ready.is_live_ready()
+    assert issuer.peek(cert.nonce) is None, "successful transition consumes once"
+    with pytest.raises(Exception):
+        transition_with_certificate(_transition_ctx(), cert, issuer)  # 2nd use
+
+
+def test_toctou_invalidation_between_validate_and_transition():
+    api = _FakeApi()
+    cert, failures, issuer = _certify(api)
+    ok, reasons = _validated(cert, issuer)
+    assert ok and reasons == []
+    issuer.invalidate_all()                       # TOCTOU window closes
+    with pytest.raises(Exception):
+        transition_with_certificate(_transition_ctx(), cert, issuer)
+
+
+# B2: legacy bypass closed + call-site audit
+
+def test_legacy_transition_no_cert_quarantines():
+    from core.mode_transition import (live_preflight_context,
+                                      transition_to_live_ready)
+    ctx = live_preflight_context(account_id="A1")
+    ready = transition_to_live_ready(ctx, [])     # no certificate
+    assert not ready.is_live_ready(), "legacy no-cert transition must not authorize"
+    assert ready.to_dict().get("effective_mode") == "live_quarantined", \
+        "no-cert result must be LIVE_QUARANTINED"
+
+
+def test_no_production_call_site_of_legacy_transition():
+    # B2: production code must not call the legacy bypass; only tests and
+    # the module itself may reference it
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    hits = []
+    for p in root.rglob("*.py"):
+        if "tests" in p.parts or p.name in ("mode_transition.py",):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        if "transition_to_live_ready(" in text:
+            hits.append(str(p))
+    assert hits == [], f"production call sites of the legacy bypass: {hits}"
