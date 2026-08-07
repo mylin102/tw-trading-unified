@@ -126,6 +126,8 @@ def build_monitor(tmp_path, monkeypatch):
     strat._release_price = 43434.0  # NEAR released at this price
     strat._mfe_pts = 0.0
     strat._mae_pts = 0.0
+    strat._peak_net_exit_pnl_twd = 0.0  # lifecycle ctx needs a real float
+    strat._peak_net_exit_pnl_twd = max(strat._peak_net_exit_pnl_twd, 0.0)
     strat._lifecycle_oca = PositionLifecycle(
         phase=PositionPhase.SINGLE_LEG,
         release_group=ReleaseGroup(status=ReleaseGroupStatus.COMPLETED,
@@ -562,21 +564,25 @@ def test_b23_real_producer_double_eval_one_submit(tmp_path, monkeypatch):
            "timestamp": now, "code": "TMFF6"}
     with patch("strategies.futures.monitor._mts_position_state_path",
                return_value=Path(tmp_path) / "state.json"), \
-         patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True), \
-         patch.object(Path, "exists", return_value=False):
+        patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True), \
+        patch.object(Path, "exists", return_value=False):
         # producer tick 1: the REAL remaining-leg trail branch emits a signal
         sig1 = strat._manage_position(44100.0, 44020.0, -0.5, now, bar)
-        # producer must have created ONE durable intent for t1 BEFORE emitting
+        # PRODUCER-REACHED assertion FIRST (codex): the qualifying RELEASE
+        # signal was genuinely emitted by the real branch — if the fixture/
+        # adapter swallowed it, THIS fails with a clear message, not the
+        # intent count
+        assert sig1 is not None, "producer did not reach exit emission"
+        # integration red (Phase-2 gap): no durable intent was created
         intent_log = ei.IntentLog(str(tmp_path / "logs"))
         actives = [iid for iid in intent_log.list_active()
                    if intent_log.get(iid)["trade_id"] == "t1"]
-        assert len(actives) == 1
+        assert len(actives) == 1  # red until dispatcher wiring (0==1)
         # producer tick 2: same qualifying state — NO second emission
         sig2 = strat._manage_position(44100.0, 44020.0, -0.5, now, bar)
         assert sig2 is None  # suppressed by the durable intent
         # the single emitted signal dispatches exactly once
-        if sig1 is not None:
-            monitor._submit_mts_order_signal(sig1, strat, bar, now)
+        monitor._submit_mts_order_signal(sig1, strat, bar, now)
     assert len(monitor.order_mgr.submits) == 1  # P1-2 regression: ONE order
 
 
@@ -923,6 +929,32 @@ def test_b44_stale_lock_holder_fails_stale_version(tmp_path):
         with pytest.raises(ei.StaleVersionError):
             log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED",
                            client_order_id="c")
+    finally:
+        cm.__exit__(None, None, None)
+
+
+# ── B45: fence before EVERY durable write — submit attempted → external
+#         drift → the NEXT durable write (FAR attempt) is rejected BEFORE
+#         any broker I/O and WITHOUT a second append ─────────────────────
+def test_b45_fence_blocks_second_durable_write(tmp_path):
+    log = make_log(tmp_path)
+    mgr = StubOrderMgr()
+    iid = make_intent(log)
+    cm = log._file_lock(intent_id=iid)
+    cm.__enter__()
+    try:
+        log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="c-near")
+        # external drift mid-operation (split-brain writer bypasses the lock)
+        cur = log.get(iid)
+        rec = dict(cur)
+        rec["version"] = cur["version"] + 1
+        ei._atomic_append(log.log_path, rec)
+        v_before = log.get(iid)["version"]
+        with pytest.raises(ei.StaleVersionError):
+            log.submit_leg(iid, "FAR", mgr,
+                           submit_fn=lambda cid, leg: {"order_id": "x"})
+        assert len(mgr.submits) == 0  # no broker I/O
+        assert log.get(iid)["version"] == v_before  # no second append
     finally:
         cm.__exit__(None, None, None)
 

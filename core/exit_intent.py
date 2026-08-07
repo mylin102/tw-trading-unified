@@ -308,8 +308,10 @@ class IntentLog:
                         pass
                 continue  # retry acquire
             self._write_lock(fd, self._lock_meta(intent_id))
-            _LOCK_HELD[self.lock_path] = {"thread": threading.get_ident(),
-                                          "depth": 1}
+            _LOCK_HELD[self.lock_path] = {
+                "thread": threading.get_ident(), "depth": 1,
+                "intent_versions": {intent_id: self._lock_meta(intent_id)["intent_version"]}
+                if intent_id is not None else {}}
             try:
                 yield
             finally:
@@ -320,16 +322,8 @@ class IntentLog:
     def _locked(self, fn: Callable, *a, intent_id: Optional[str] = None, **k):
         with self._mutex:
             with self._file_lock(intent_id=intent_id):
-                if intent_id is not None:
-                    # generation fence (codex B44): the version recorded in the
-                    # lock meta must match the intent NOW; drift ⇒ stale holder
-                    meta = self._read_owner() or {}
-                    expected = meta.get("intent_version")
-                    if expected is not None and \
-                            self.get(intent_id)["version"] != expected:
-                        raise StaleVersionError(
-                            f"intent {intent_id} version drifted "
-                            f"(lock expected {expected})")
+                # generation fence enforced per-durable-write in
+                # _append_locked (single primitive); no separate entry check
                 return fn(*a, **k)
 
     def try_acquire(self, meta: dict, owner_check_fn: Optional[Callable] = None,
@@ -413,6 +407,27 @@ class IntentLog:
             "supersedes": None,
         }
 
+    def _append_locked(self, intent_id: str, builder: Callable) -> dict:
+        """Single durable-append primitive with the generation fence
+        (codex B44/B45): before EVERY durable write, the intent version must
+        match what THIS lock holder last saw — external drift ⇒
+        StaleVersionError BEFORE any I/O. Our own transitions advance the
+        fence, so legitimate same-holder evolution is never blocked."""
+        entry = _LOCK_HELD.get(self.lock_path)
+        expected = None
+        if entry is not None:
+            expected = entry.setdefault("intent_versions", {}).get(intent_id)
+        cur = self.get(intent_id)
+        if expected is not None and cur["version"] != expected:
+            raise StaleVersionError(
+                f"intent {intent_id} version drifted externally "
+                f"(holder saw {expected}, now {cur['version']})")
+        rec = builder(cur)
+        _atomic_append(self.log_path, rec)
+        if entry is not None:
+            entry.setdefault("intent_versions", {})[intent_id] = rec["version"]
+        return rec
+
     def _transition_locked(self, intent_id: str, leg: str, status: str,
                            client_order_id: Optional[str] = None,
                            broker_order_id: Optional[str] = None,
@@ -426,16 +441,19 @@ class IntentLog:
         prev = cur["legs"][leg]["status"]
         if status not in _ALLOWED.get(prev, set()):
             raise IllegalTransitionError(f"{prev} -> {status} illegal")
-        legs = {k: dict(v) for k, v in cur["legs"].items()}
-        if client_order_id is not None:
-            legs[leg]["client_order_id"] = client_order_id
-        if broker_order_id is not None:
-            legs[leg]["broker_order_id"] = broker_order_id
-        legs[leg]["status"] = status
-        rec = dict(cur)
-        rec["version"] = cur.get("version", 1) + 1
-        rec["legs"] = legs
-        _atomic_append(self.log_path, rec)
+
+        def builder(c):
+            legs = {k: dict(v) for k, v in c["legs"].items()}
+            if client_order_id is not None:
+                legs[leg]["client_order_id"] = client_order_id
+            if broker_order_id is not None:
+                legs[leg]["broker_order_id"] = broker_order_id
+            legs[leg]["status"] = status
+            rec = dict(c)
+            rec["version"] = c.get("version", 1) + 1
+            rec["legs"] = legs
+            return rec
+        self._append_locked(intent_id, builder)
 
     # ── public mutations (all internally locked) ──────────────────────
     def create(self, trade_id: str, reason: str = "COMBINED_EXIT") -> str:
@@ -455,11 +473,12 @@ class IntentLog:
 
     def mark_terminal(self, intent_id: str, status: str) -> None:
         def _do():
-            cur = self.get(intent_id)
-            rec = dict(cur)
-            rec["version"] = cur.get("version", 1) + 1
-            rec["terminal"] = status
-            _atomic_append(self.log_path, rec)
+            def builder(c):
+                rec = dict(c)
+                rec["version"] = c.get("version", 1) + 1
+                rec["terminal"] = status
+                return rec
+            self._append_locked(intent_id, builder)
         self._locked(_do, intent_id=intent_id)
 
     def submit_leg(self, intent_id: str, leg: str, order_mgr,
@@ -575,11 +594,12 @@ class IntentLog:
         return self._locked(_do, intent_id=intent_id)
 
     def _transition_terminal_locked(self, intent_id: str, status: str) -> None:
-        cur = self.get(intent_id)
-        rec = dict(cur)
-        rec["version"] = cur.get("version", 1) + 1
-        rec["terminal"] = status
-        _atomic_append(self.log_path, rec)
+        def builder(c):
+            rec = dict(c)
+            rec["version"] = c.get("version", 1) + 1
+            rec["terminal"] = status
+            return rec
+        self._append_locked(intent_id, builder)
 
     # ── compaction / retention ────────────────────────────────────────
     def archive(self, intent_id: str) -> None:
@@ -587,10 +607,21 @@ class IntentLog:
             cur = self.get(intent_id)
             if cur.get("terminal") is None:
                 raise IntentNotTerminalError(intent_id)
+            # same generation fence before the archive write
+            entry = _LOCK_HELD.get(self.lock_path)
+            expected = None
+            if entry is not None:
+                expected = entry.setdefault("intent_versions", {}).get(intent_id)
+            if expected is not None and cur["version"] != expected:
+                raise StaleVersionError(
+                    f"intent {intent_id} version drifted externally "
+                    f"(holder saw {expected}, now {cur['version']})")
             rec = dict(cur)
             rec["version"] = cur.get("version", 1) + 1
             rec["retention_expires_at"] = time.time() + RETENTION_DAYS * 86400
             _atomic_append(self.archive_path, rec)
+            if entry is not None:
+                entry.setdefault("intent_versions", {})[intent_id] = rec["version"]
         self._locked(_do, intent_id=intent_id)
 
     def archive_index(self) -> List[str]:
