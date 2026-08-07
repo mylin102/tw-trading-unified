@@ -580,7 +580,7 @@ def render_real_preflight_expander():
             st.json(_rt if _rt else {"status": "NO_RUNTIME_STATUS_FILE"})
         with col_right:
             st.subheader("🏦 券商診斷快照 (Broker Snapshot)")
-            _diag_dir = Path("exports/trades/live/diagnostics")
+            _diag_dir = Path(runtime_path("exports", "trades", "live", "diagnostics"))
             _resp_file = _diag_dir / "broker_snapshot_latest.json"
             if _resp_file.exists():
                 try:

@@ -13,10 +13,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from dotenv import load_dotenv
+from core.runtime_paths import runtime_path
 
 logger = logging.getLogger("Readiness")
 
 REPO = Path(os.path.expanduser("~/Documents/mylin102/tw-trading-unified-git"))
+
+
+def _runtime_log(name: str) -> Path:
+    """Resolve engine logs from the shared runtime, never a release checkout."""
+    return Path(runtime_path("logs", name))
 
 
 def check_env_vars():
@@ -29,7 +35,7 @@ def check_env_vars():
 
 
 def check_directories():
-    needed = [REPO / "config", REPO / "logs", REPO / "data"]
+    needed = [REPO / "config", Path(runtime_path("logs")), Path(runtime_path("exports"))]
     missing = [str(p) for p in needed if not p.exists()]
     if missing:
         return False, f"Missing dirs: {missing}"
@@ -49,7 +55,7 @@ def check_config_mode():
 
 def check_transition_state():
     """Transition state from trading log (MTS_EXEC_CTX lines)."""
-    log = REPO / "logs/pm2-trading-out.log"
+    log = _runtime_log("pm2-trading-out.log")
     try:
         if not log.exists():
             return False, "log missing"
@@ -75,7 +81,7 @@ def check_transition_state():
 
 def check_broker_login():
     """Broker login from log (System status TRADING / login success)."""
-    log = REPO / "logs/pm2-trading-error.log"
+    log = _runtime_log("pm2-trading-error.log")
     try:
         if not log.exists():
             return False, "error log missing"
@@ -134,8 +140,24 @@ def check_all():
     return is_ready, results
 
 
+def _normalize_check_output(check_output):
+    """Accept both `check_all()`'s tuple and the normalized results mapping.
+
+    Older callers pass `(is_ready, results)`. Keeping this boundary tolerant
+    prevents the settings UI from degrading to an empty readiness panel.
+    """
+    if (
+        isinstance(check_output, tuple)
+        and len(check_output) == 2
+        and isinstance(check_output[1], dict)
+    ):
+        return check_output[1], True
+    return check_output, False
+
+
 def get_readiness_items(check_output):
     """Return list of objects with name/passed/detail."""
+    check_output, _legacy = _normalize_check_output(check_output)
     items = []
     for name, res in check_output.items():
         items.append(SimpleNamespace(
@@ -149,9 +171,12 @@ def get_readiness_items(check_output):
 def get_readiness_summary(check_output):
     """Return (status_text, passed, total). Recommendation logic now
     mode-aware — env-dirs passing alone never yields "can go live"."""
+    check_output, legacy = _normalize_check_output(check_output)
     total = len(check_output)
     passed = sum(1 for r in check_output.values() if getattr(r, "passed", False))
     mode = check_output.get("Execution Mode", SimpleNamespace(message="unknown")).message
+    if legacy and "Execution Mode" not in check_output:
+        return ("READY" if passed == total else "DEGRADED"), passed, total
     live = "LIVE" in mode
     if not live:
         return "PAPER MODE", passed, total
