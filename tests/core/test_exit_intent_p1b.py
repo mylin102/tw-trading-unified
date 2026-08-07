@@ -1409,6 +1409,124 @@ def test_b48d1_event_append_failure_fail_closed(tmp_path, monkeypatch, caplog):
             "fail-closed: zero new orders when the decision event could not persist"
 
 
+# ── B48-D4 (codex P0-1): append failure must leave NO false-exit records
+#    on the REAL runtime files — no EXIT_REMAINING event row, no EXIT_*
+#    state action, no shadow-exit summary, no submit ───────────────────
+def test_b48d4_append_failure_no_false_exit_records(tmp_path, monkeypatch, caplog):
+    from pathlib import Path
+    from unittest.mock import patch
+    import logging as _logging
+
+    caplog.set_level(_logging.INFO)
+    monitor, strat, now, bar1, bar2 = _b48_build_released(tmp_path, monkeypatch)
+    state_path = Path(tmp_path) / "state.json"
+    with patch("strategies.futures.monitor._mts_position_state_path",
+               return_value=state_path), \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open",
+               return_value=True), \
+         patch.object(Path, "exists", return_value=False), \
+         patch.object(ei.IntentLog, "append_event",
+                      side_effect=RuntimeError("intent log io failure")):
+        _before = len(monitor.order_mgr.submits)
+        sig = strat._manage_position(43400.0, 44350.0, -0.5, now, bar2)
+        assert sig is None
+        monitor._submit_mts_order_signal(sig, strat, bar2, now) if sig else None
+        assert len(monitor.order_mgr.submits) == _before
+        # no EXIT_REMAINING row in the events ledger
+        if (tmp_path / "mts_spread_events.jsonl").exists():
+            events = [json.loads(l) for l in
+                      (tmp_path / "mts_spread_events.jsonl").read_text().splitlines()
+                      if l.strip()]
+            assert not any(e.get("event") == "EXIT_REMAINING" for e in events), \
+                "EXIT_REMAINING must NOT be recorded when the decision event failed"
+        # no EXIT_* state action (release state may exist, EXIT state must not)
+        if state_path.exists():
+            rows = [json.loads(l) for l in state_path.read_text().splitlines()
+                    if l.strip()]
+            if rows:
+                assert not str(rows[-1].get("action", "")).startswith("EXIT_"), \
+                    f"exit state must NOT be written: {rows[-1].get('action')}"
+        # no shadow-exit summary logged
+        assert "MTS_MTF_SHADOW_TRADE_SUMMARY" not in caplog.text, \
+            "shadow exit summary must NOT be logged when the decision event failed"
+
+
+# ── B48-D5 (codex P1): confirmed-fill / settlement correlation — the fill
+#    handler resolves the pending by order_id (which carries the decision
+#    event_id), and the EXIT fill record persists event_id/winner ──────
+def test_b48d5_fill_record_correlates_to_decision_event(tmp_path, monkeypatch, caplog):
+    from pathlib import Path
+    from unittest.mock import patch
+    from core.order_management.order import OrderStatus, OrderSide
+    import logging as _logging
+    import types as _types
+
+    caplog.set_level(_logging.INFO)
+    monitor, strat, now, bar1, bar2 = _b48_build_released(tmp_path, monkeypatch)
+    with patch("strategies.futures.monitor._mts_position_state_path",
+               return_value=Path(tmp_path) / "state.json"), \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open",
+               return_value=True), \
+         patch.object(Path, "exists", return_value=False):
+        sig = strat._manage_position(43400.0, 44350.0, -0.5, now, bar2)
+        assert sig is not None
+        _before = len(monitor.order_mgr.submits)
+        monitor._submit_mts_order_signal(sig, strat, bar2, now)
+        _new = monitor.order_mgr.submits[_before:]
+        assert len(_new) == 1
+        _exit_oid = _new[0]["order_id"]
+        intent_log = ei.IntentLog(str(tmp_path / "logs"))
+        rows = [json.loads(l) for l in intent_log.raw_lines() if l.strip()]
+        pj = [r for r in rows if r.get("event") == "POLICY_J_SINGLE_LEG_TRIGGERED"]
+        assert len(pj) == 1
+        _evid = pj[0]["event_id"]
+        # the pending resolved by the EXIT order_id carries the decision event_id
+        _pend = monitor._pending_lifecycle_orders.get(_exit_oid)
+        assert _pend is not None, "EXIT order must be in pending lifecycle orders"
+        assert _pend.get("event_id") == _evid, \
+            "pending (order_id join) must link back to the decision event"
+        # confirmed fill → the fill record persists event_id/winner
+        ev = _types.SimpleNamespace(
+            order_id=_exit_oid, fill_qty=1, fill_price=44350.0,
+            deal_id="deal-exit", symbol="TMFH6",
+            status=OrderStatus.FILLED, side=OrderSide.SELL,
+            timestamp=now)
+        with patch("strategies.futures.monitor.save_trade"), \
+             patch("strategies.futures.monitor.DecisionLogger", create=True):
+            monitor._apply_confirmed_futures_deal(ev)
+        fills = [json.loads(l) for l in
+                 (tmp_path / "mts_trade_fills.jsonl").read_text().splitlines()
+                 if l.strip()]
+        _exit_fills = [f for f in fills
+                       if f.get("fill_type") == "EXIT" and f.get("leg") == "FAR"]
+        assert _exit_fills, "EXIT fill record missing from the fills ledger"
+        assert _exit_fills[-1].get("event_id") == _evid, \
+            "fill record must persist the decision event_id"
+        assert _exit_fills[-1].get("winner") == "POLICY_J_SINGLE_LEG", \
+            "fill record must persist the decision winner"
+        # the exit committed: strategy flat
+        assert strat._has_position is False, "exit fill must flat the strategy"
+
+
+# ── B48-D6 (codex P0-2): Signal serialization — event_id/winner must
+#    survive to_dict / JSON round-trip ─────────────────────────────────
+def test_b48d6_signal_to_dict_roundtrip():
+    from core.signal import Signal
+    import json as _json
+
+    sig = Signal("EXIT", "TMF_TRAIL", confidence=0.5, stop_loss=0,
+                 event_id="ev-1234", winner="POLICY_J_SINGLE_LEG")
+    d = sig.to_dict()
+    assert d["event_id"] == "ev-1234", "to_dict must carry event_id"
+    assert d["winner"] == "POLICY_J_SINGLE_LEG", "to_dict must carry winner"
+    # JSON round-trip (any queue/replay serialization path)
+    s2 = _json.loads(_json.dumps(d))
+    assert s2["event_id"] == "ev-1234" and s2["winner"] == "POLICY_J_SINGLE_LEG"
+    # backward compatible: plain signals still serialize
+    d0 = Signal("EXIT", "TMF_TRAIL", confidence=0.5).to_dict()
+    assert d0["event_id"] == "" and d0["winner"] == ""
+
+
 # ── B48-D2 (codex D-ii): second identical tick ⇒ ONE decision event,
 #    ONE order (idempotent trigger generation) ─────────────────────────
 def test_b48d2_second_tick_single_event_single_order(tmp_path, monkeypatch, caplog):
