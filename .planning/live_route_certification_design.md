@@ -1,10 +1,18 @@
-# Live Route Certification — 設計文件 v2（design + RED tests only）
+# Live Route Certification — 設計文件 v3（design + RED tests only）
 
-**狀態**: DESIGN v2（codex round-3 B1-B6 修正；本 phase 只交付設計 + RED tests，**不接線**）
+**狀態**: DESIGN v3（codex round-4 L1-L7 修正；本 phase 只交付設計 + RED tests，**不接線**）
 **範圍**: `core/live_route_certificate.py`（新模組，proposal）+ `core/mode_transition.py` /
 `core/live_broker_preflight.py` 的整合點。**不修改** monitor / order manager / production
 routing；**不觸碰** authority projection 與 historical-audit 檔案。
 **PAPER 必須維持現狀**：不切 config mode、不送/改/撤真單、不 deploy/restart/push。
+**v3 變更（L1-L7）**：L1 驗證測試一律用發行 issuer + 先斷言 nonce redemption —
+消除 NONCE_UNKNOWN 遮蔽；L2 open-orders 以顯式 Submitted/Pending 狀態建模；L3 確定性
+required-margin provider（1 near + 1 far micro × buffer）綁定 cert 版本/值；L4 顯式
+authenticated-session 斷言（Shioaji-appropriate，失敗 fail-closed）；L5 snapshot
+presence 語意（空/缺/重複/subset 全 fail；market-closed 需顯式文件化例外）；L6 nonce
+生命週期（peek/redeem/invalidate_all、reconnect 新 issuer、無序列化可還原授權）；
+L7 真正的 transition 邊界（弱 legacy preflight 不得 LIVE_READY；唯一允許路徑 =
+同 issuer 有效 cert 的 transition_with_certificate）。
 **v2 變更（B1-B6）**：B1 fake 改為 adapter-faithful（走真實 collect_read_only_preflight
 contract：futopt_account / Contracts.Futures.<sym> / list_positions / list_trades /
 margin / trading_limits / snapshots / subscribe / unsubscribe）；B2 certify_route
@@ -61,8 +69,38 @@ class CertificateIssuer:
     """In-memory unforgeable issuance registry (per-process)."""
     _issued: dict[str, LiveBrokerCertificate]   # nonce → cert（僅記憶體）
     def issue(self, cert_without_nonce) -> LiveBrokerCertificate  # 產生 nonce + 註冊
-    def redeem(self, nonce) -> LiveBrokerCertificate | None      # 查詢（不消費）
+    def peek(self, nonce) -> LiveBrokerCertificate | None         # 驗證用（不消費）
+    def redeem(self, nonce) -> LiveBrokerCertificate | None       # transition 用（消費一次）
+    def invalidate_all(self) -> None                              # session 續期/關閉
 ```
+
+### nonce 生命週期（L6）
+- `peek`：驗證用，不消費（cert 可多次驗證）
+- `redeem`：transition 用，**消費一次**（single-use — 進入 LIVE_READY 即用掉）
+- `invalidate_all`：session renewal / process shutdown 時清空 —
+  之後任何舊 nonce 驗證 → NONCE_UNKNOWN
+- reconnect → 新 `CertificateIssuer`（舊 cert 全部失效）
+- **無序列化路徑可還原授權**：cert JSON 只是 audit 記錄；nonce 只存在於
+  發行 process 的 issuer registry
+
+### required-margin provider（L3，確定性、版本化）
+```python
+MARGIN_PROVIDER_VERSION = 1
+def required_margin_for(product="TMF", *, per_lot_margin=100_000.0,
+                        buffer=0.1) -> dict:
+    """2 legs × per_lot_margin × (1 + buffer) — 確定性，可重算。"""
+    # → {"provider_version": 1, "per_lot_margin": …, "buffer": …,
+    #    "required_margin": round(2 * per_lot * (1 + buffer), 2)}
+```
+- cert 綁定 `margin_provider_version` + `required_margin`；
+  validation 以**目前** provider 比對 — 版本/值改變 → PROVIDER_MISMATCH
+- monitor wiring 不得接受任意 caller 輸入的 magic number — 一律走 provider
+
+### authenticated-session 斷言（L4）
+- certify 前必須確認 api session 為已認證（Shioaji-appropriate：
+  `api.authenticated is True` + `futopt_account` 存在），否則
+  `AUTH_SESSION_UNAVAILABLE` fail-closed
+- 不依賴 preflight dict 的 `authenticated: True` 自宣稱
 
 ## 3. 必要唯讀查核（全數 fail-closed）
 
@@ -73,7 +111,7 @@ class CertificateIssuer:
 | 3 | broker flat（無持倉） | QUARANTINE | _safe_positions |
 | 4 | no open orders | QUARANTINE | _safe_open_orders |
 | 5 | 兩腿 distinct valid contracts（近/遠不同、delivery 有效） | QUARANTINE | resolve_near_far_contracts |
-| 6 | snapshot code consistency（positions/orders 的 code 與 cert codes 一致） | QUARANTINE | 快照比對 |
+| 6 | snapshot presence（**精確集合**：`set(codes) == {near_code, far_code}`；空/缺/重複/subset → fail；market-closed 需顯式文件化例外） | QUARANTINE | 快照比對（L5） |
 | 7 | bidask subscribe 每腿 | QUARANTINE | safe_subscribe ×2 |
 | 8 | bidask unsubscribe 每腿（**失敗 → fatal**，成功才記錄對稱） | QUARANTINE | _unsubscribe_bidask ×2 |
 
@@ -106,6 +144,10 @@ class CertificateIssuer:
   `cert = certify_route(...)` 有效 + `validate_live_broker_certificate(cert)` 全過；
   缺 cert / 驗證失敗 → `ModeTransitionState.LIVE_QUARANTINED` +
   `assert_live_order_allowed()` raise
+- **transition 邊界（L7）**：弱 legacy preflight（login flag/hasattr/contract 物件）
+  **不得**單獨產生 LIVE_READY；唯一允許路徑 =
+  `transition_with_certificate(ctx, cert, issuer)` — cert 必須由
+  **同一個 in-process issuer** 發行（redeem 消費 nonce）
 - **PAPER requested mode 不得消費 cert**：`paper_context()` 行為不變；
   cert 只在 LIVE 路徑存在，PAPER 下 `assert_live_order_allowed()` 仍 raise
 - 認證流程中**禁止任何 order/cancel/modify API 呼叫**（測試以 recording api 證明）
