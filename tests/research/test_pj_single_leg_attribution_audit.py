@@ -358,6 +358,17 @@ def test_unknown_trigger_name_never_counts(tmp_path):
     assert "NO_TRIGGER_NAMED_EVENT_IN_SCHEMA" in art["summary"]["reasons"]
 
 
+def test_unrelated_trade_trigger_event_does_not_clear_gap(tmp_path):
+    # round-4 P0: a trigger-named event for a trade OUTSIDE the candidate set
+    # must not clear NO_TRIGGER_NAMED_EVENT_IN_SCHEMA for the audited trades
+    fills = _single_leg_trade()   # candidate = mts-auto-T1
+    events = [_event("POLICY_J_TRIGGERED", tid="mts-auto-OTHER"),
+              _event("EXIT_LOG")]
+    art = _audit(tmp_path, fills, events)
+    assert "NO_TRIGGER_NAMED_EVENT_IN_SCHEMA" in art["summary"]["reasons"], \
+        "unrelated trade trigger must not clear the provenance gap"
+
+
 def test_final_cause_requires_same_trade_and_type(tmp_path):
     # A2: unrelated rows (wrong event type / missing trade_id) must not clear
     # the provenance gap
