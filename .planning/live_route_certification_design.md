@@ -1,10 +1,18 @@
-# Live Route Certification — 設計文件（design + RED tests only）
+# Live Route Certification — 設計文件 v2（design + RED tests only）
 
-**狀態**: DESIGN（codex 審查中；本 phase 只交付設計 + RED tests，**不接線**）
+**狀態**: DESIGN v2（codex round-3 B1-B6 修正；本 phase 只交付設計 + RED tests，**不接線**）
 **範圍**: `core/live_route_certificate.py`（新模組，proposal）+ `core/mode_transition.py` /
 `core/live_broker_preflight.py` 的整合點。**不修改** monitor / order manager / production
 routing；**不觸碰** authority projection 與 historical-audit 檔案。
 **PAPER 必須維持現狀**：不切 config mode、不送/改/撤真單、不 deploy/restart/push。
+**v2 變更（B1-B6）**：B1 fake 改為 adapter-faithful（走真實 collect_read_only_preflight
+contract：futopt_account / Contracts.Futures.<sym> / list_positions / list_trades /
+margin / trading_limits / snapshots / subscribe / unsubscribe）；B2 certify_route
+**只能從目前 session 自行收集**，不接受任何外部 dict/JSON；B3 margin capacity = 明確
+required margin（1 near + 1 far micro）+ 邊界測試；B4 subscribe↔unsubscribe 對稱、
+unsubscribe 失敗 fatal、snapshot codes 綁定已解析合約；B5 弱 legacy preflight 不得
+單獨達 LIVE_READY、PAPER 連有效 cert 都拒絕；B6 in-memory issuance nonce —
+拷貝 JSON（即使 process_start_id 相同）無法通過驗證。
 
 ## 1. 目標
 
@@ -20,6 +28,7 @@ Certificate 不可變、可持久化；任何欄位缺失/查詢失敗/身份不
 @dataclass(frozen=True)
 class LiveBrokerCertificate:
     version: int = 1
+    nonce: str                   # in-memory 發行 handle（B6，不持久化）
     process_start_id: str            # 綁定產生 session（_generate_process_start_id）
     captured_at: str                 # ISO-8601（tz-aware）— 產生時刻
     account_hash: str                # _hash_account_id（不存明文帳號）
@@ -31,6 +40,7 @@ class LiveBrokerCertificate:
     query_results: tuple[str, ...]   # 全部必要查核通過清單（見 §3）
     bidask_subscribed: tuple[str, ...]   # 雙腿 subscribe 成功
     bidask_unsubscribed: tuple[str, ...] # 雙腿 unsubscribe 成功
+    warnings: tuple[str, ...] = ()   # trading_limits 等 warning-only 項目
     # trading_limits 不綁定：失敗僅為 auditable warning（§5）
 ```
 
@@ -38,9 +48,21 @@ class LiveBrokerCertificate:
   `[now - ttl, now + skew_secs(30)]` 內；超過 → stale；未來 → clock skew）
 - **process-bound**：驗證時 `process_start_id` 必須等於目前 process 的 start id；
   不同 process 產生的 cert 一律拒絕
-- **session-bound**：cert 只能由「同一個已認證的執行 session」產生 —
-  builder 必須接收 `api` 物件本身（或其 session token），**不得**由
-  別的 process 拷貝的 dashboard JSON 直接組出（§4）
+- **session-bound（B6 核心）**：`CertificateIssuer`（process 內 in-memory registry）
+  在發行時產生隨機 `nonce`（secrets.token_hex），cert 只存在於該 process 的
+  issuer registry；**驗證要求 nonce 能在「目前 process 的 issuer」redeem** —
+  拷貝的 JSON（即使 process_start_id 相同）nonce 不在 registry → NONCE_UNKNOWN
+  拒絕。持久化的 preflight 記錄（broker_snapshot_*.json）**僅為 audit**，
+  永不作為授權輸入
+
+### CertificateIssuer（B6）
+```python
+class CertificateIssuer:
+    """In-memory unforgeable issuance registry (per-process)."""
+    _issued: dict[str, LiveBrokerCertificate]   # nonce → cert（僅記憶體）
+    def issue(self, cert_without_nonce) -> LiveBrokerCertificate  # 產生 nonce + 註冊
+    def redeem(self, nonce) -> LiveBrokerCertificate | None      # 查詢（不消費）
+```
 
 ## 3. 必要唯讀查核（全數 fail-closed）
 
@@ -53,20 +75,23 @@ class LiveBrokerCertificate:
 | 5 | 兩腿 distinct valid contracts（近/遠不同、delivery 有效） | QUARANTINE | resolve_near_far_contracts |
 | 6 | snapshot code consistency（positions/orders 的 code 與 cert codes 一致） | QUARANTINE | 快照比對 |
 | 7 | bidask subscribe 每腿 | QUARANTINE | safe_subscribe ×2 |
-| 8 | bidask unsubscribe 每腿（完成後淨離開） | QUARANTINE | _unsubscribe_bidask ×2 |
+| 8 | bidask unsubscribe 每腿（**失敗 → fatal**，成功才記錄對稱） | QUARANTINE | _unsubscribe_bidask ×2 |
 
-全部通過 → `query_results` 記錄 8 項 → certificate 可核發。
+全部通過 → `query_results` 記錄 8 項 → `CertificateIssuer.issue()` 核發（含 nonce）。
 任一失敗 → `certify_route()` 回傳 `(None, failures)` → 呼叫端進 LIVE_QUARANTINED。
 
 ## 4. Session 綁定（防跨 process 偽造）
 
-- `build_live_broker_certificate(preflight: dict, api, process_start_id: str)`：
-  `preflight` 必須由**同一 api 物件**當下呼叫 `collect_read_only_preflight(api)` 產出
-  （builder 內部以 `api` 做一致性抽查：account hash 重算比對、process_start_id 相同）
-- 不接受「外部 JSON 檔案」直接當輸入；preflight dict 只作為同一 session 的
-  中間產物（process-bound 由 process_start_id + api session 雙重綁定）
-- 測試：以「拷貝的 dashboard JSON」組 cert → 必須被拒（account hash 不符 /
-  無 session 憑證）
+- `certify_route(api, *, process_start_id, issuer, product, required_margin,
+  margin_buffer)`：**只能從目前 session 收集** — 內部呼叫
+  `collect_read_only_preflight(api, product)`；**不接受任何外部 dict/JSON 參數**
+  （B2）— 拷貝/竄改的 dashboard JSON（含偽造 process_start_id）無法注入
+- 認證全程零 order/cancel/modify API 呼叫（B6：fake 的 order 方法直接 raise）
+
+### Margin capacity（B3）
+- `required_margin` = 1 near + 1 far micro 的明確需求（呼叫端依 config/計算提供）
+- capacity = `available_margin >= required_margin * (1 + margin_buffer)`
+- 邊界測試：None → fail；0 → fail；just-below → fail；exactly-at → pass
 
 ## 5. trading_limits 政策
 
