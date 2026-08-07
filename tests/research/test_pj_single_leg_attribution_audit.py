@@ -20,12 +20,13 @@ def _fill(tid, leg, side, ft, price, qty=1, ts="2026-08-06T09:14:03+08:00"):
             "side": side, "fill_type": ft, "qty": qty, "price": price}
 
 
-def _event(ev, ts="2026-08-06T09:14:03+08:00", tid=None, durable_peak=None):
+def _event(ev, ts="2026-08-06T09:14:03+08:00", tid=None, durable_peak=None, **extra):
     d = {"event": ev, "ts": ts}
     if tid is not None:
         d["trade_id"] = tid
     if durable_peak is not None:
         d["durable_peak"] = durable_peak
+    d.update(extra)
     return d
 
 
@@ -169,6 +170,9 @@ def test_incident_reproduction_not_provable_without_decision(tmp_path):
 
 def test_inferred_eligible_with_resolved_params_and_peak(tmp_path):
     fills = _single_leg_trade()
+    # decision-time proxy on the RELEASE row: (near_pnl+far_pnl)*10-92
+    fills[2]["near_pnl"] = -40.0
+    fills[2]["far_pnl"] = 0.0
     events = [
         _event("POLICY_J_PEAK_CONFIRMED", ts="2026-08-06T10:03:00+08:00",
                tid="mts-auto-T1", durable_peak=300.0),
@@ -231,3 +235,102 @@ def test_full_run_writes_artifact(tmp_path, monkeypatch):
     data = json.loads(arts[0].read_text())
     assert data["status"] == "OK"
     assert data["summary"]["SUPPORTED"]["PROVEN"] == 0
+
+
+# ── codex audit round 2: RED tests (strictness fixes, test-first) ─────────
+
+def test_invalid_utf8_inside_json_is_malformed(tmp_path):
+    # strict UTF-8: invalid bytes must make the WHOLE snapshot malformed,
+    # not be silently replaced
+    fp, ep = _write(tmp_path, [])
+    fp.write_bytes(b'{"trade_id": "t1", "leg": "NEAR", "contract": "NEAR", '
+                   b'"side": "SHORT", "fill_type": "ENTRY", "qty": 1, '
+                   b'"price": 1, "timestamp": "2026-08-06T09:00:00+08:00", '
+                   b'"note": "\xff\xfe"}\n')
+    art = build_artifact(fp, ep, tmp_path / "out", repo_root=tmp_path)
+    assert art["status"] == "SNAPSHOT_MALFORMED"
+
+
+def test_schema_keys_checked_on_every_row(tmp_path):
+    fills = _single_leg_trade()
+    fills.append(_fill("mts-auto-T5", "NEAR", "SHORT", "ENTRY", 44252.0,
+                       ts="2026-08-06T09:30:00+08:00"))
+    del fills[-1]["price"]
+    art = _audit(tmp_path, fills, _MIN_EVENTS)
+    assert art["status"] == "UNREADABLE"
+    assert art["schema_mismatch"]["fills"]["reason"] == "missing_core_keys"
+
+
+def test_nan_qty_is_malformed(tmp_path):
+    # python json.loads accepts NaN by default — must be rejected as malformed
+    fp, ep = _write(tmp_path, [])
+    fp.write_text('{"trade_id": "t1", "leg": "NEAR", "contract": "NEAR", '
+                  '"side": "SHORT", "fill_type": "ENTRY", "qty": NaN, '
+                  '"price": 1, "timestamp": "2026-08-06T09:00:00+08:00"}\n')
+    art = build_artifact(fp, ep, tmp_path / "out", repo_root=tmp_path)
+    assert art["status"] == "SNAPSHOT_MALFORMED"
+
+
+def test_fractional_qty_is_malformed(tmp_path):
+    fp, ep = _write(tmp_path, [])
+    fp.write_text('{"trade_id": "t1", "leg": "NEAR", "contract": "NEAR", '
+                  '"side": "SHORT", "fill_type": "ENTRY", "qty": 1.5, '
+                  '"price": 1, "timestamp": "2026-08-06T09:00:00+08:00"}\n')
+    art = build_artifact(fp, ep, tmp_path / "out", repo_root=tmp_path)
+    assert art["status"] == "SNAPSHOT_MALFORMED"
+
+
+def test_mixed_aware_naive_timestamps_no_crash(tmp_path):
+    fills = _single_leg_trade()
+    fills[0]["timestamp"] = fills[0]["timestamp"].replace("+08:00", "")  # naive
+    art = _audit(tmp_path, fills, _MIN_EVENTS)
+    assert art["status"] == "OK"          # must not crash on aware/naive compare
+    assert art["trades"][0]["attribution_strength"] == "NOT_PROVABLE"
+    assert "TS_NAIVE" in art["trades"][0]["source_limits"]
+
+
+def test_trigger_detection_excludes_suppressed(tmp_path):
+    # TRIGGER_SUPPRESSED is NOT a trigger decision → NO_TRIGGER reason must fire
+    fills = _single_leg_trade()
+    events = [_event("POLICY_J_TRIGGER_SUPPRESSED"),
+              _event("EXIT_LOG")]
+    art = _audit(tmp_path, fills, events)
+    assert "NO_TRIGGER_NAMED_EVENT_IN_SCHEMA" in art["summary"]["reasons"]
+
+
+def test_final_cause_marker_inspected_as_field(tmp_path):
+    # a final-decision cause marker is a FIELD (cause=...) on an event row,
+    # not a literal "cause" string value
+    fills = _single_leg_trade()
+    events = [_event("RELEASE_NEAR_SUBMITTED", tid="mts-auto-T1", cause="trail"),
+              _event("EXIT_LOG")]
+    art = _audit(tmp_path, fills, events)
+    assert "NO_FINAL_DECISION_CAUSE_EVENT" not in art["summary"]["reasons"]
+
+
+def test_eligibility_proxy_uses_release_fill_not_exit_fill(tmp_path):
+    fills = _single_leg_trade()
+    # decision-time pnl snapshot lives on the RELEASE fill row
+    fills[2]["near_pnl"] = 300.0
+    fills[2]["far_pnl"] = 0.0
+    events = [_event("POLICY_J_PEAK_CONFIRMED", ts="2026-08-06T10:03:00+08:00",
+                     tid="mts-auto-T1", durable_peak=300.0)]
+    fp, ep = _write(tmp_path, fills, events)
+    with patch("scripts.research.pj_single_leg_attribution.audit.resolve_params",
+               return_value={"param_source": "DEPLOYED_CONFIG_abc",
+                             "activation_twd": 200, "giveback_twd": 50,
+                             "mult": 10, "friction": 92}):
+        art = build_artifact(fp, ep, tmp_path / "out", repo_root=tmp_path)
+    trade = art["trades"][0]
+    assert trade["current_net_proxy"]["source_row"] == "RELEASE", \
+        "eligibility must use the decision-time (release) row, never the exit fill"
+    assert trade["current_net_proxy"]["formula"] == "(near_pnl+far_pnl)*mult-friction"
+
+
+def test_default_repo_root_is_actual_repo(tmp_path):
+    # repo_root must default to the script's own repository, not runtime.parent
+    fills = _single_leg_trade()
+    fp, ep = _write(tmp_path, fills, _MIN_EVENTS)
+    art = build_artifact(fp, ep, tmp_path / "out")   # no repo_root arg
+    sha = art.get("script_commit_sha", "")
+    assert len(sha) == 40 and sha != "unknown", f"got sha={sha!r}"
