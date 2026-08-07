@@ -85,15 +85,23 @@ def build_monitor(tmp_path, monkeypatch):
     return monitor, strat, api
 
 
-# ── B1: call-time durable snapshot ordering; both ids persisted pre-submit ─
+# ── B1: call-time durable snapshot ordering; both ids persisted pre-submit
+# The hook is invoked between the durable SUBMIT_ATTEMPTED write and the
+# actual manager I/O: it asserts the durable snapshot, then the dispatch
+# still performs the real manager submits (hook cannot be a pre-submit no-op).
 def test_b1_durable_snapshot_ordering_before_submit(tmp_path):
     log = make_log(tmp_path)
     mgr = StubOrderMgr()
     snapshots = {}
+    seen_submits = 0
 
     def submit_hook(leg, client_order_id, intent_id):
-        # durable snapshot AT CALL TIME (not in-memory events)
-        snapshots[leg] = (log.get(intent_id), log.raw_lines())
+        # durable snapshot AT CALL TIME (in-memory events are irrelevant)
+        snap = log.get(intent_id)
+        snapshots[leg] = (snap, log.raw_lines())
+        # manager must NOT have been called for this leg yet (hook runs
+        # before the actual submit I/O)
+        assert seen_submits == len([s for s in mgr.submits if s["leg"] == leg])
 
     result = ei.dispatch_combined_exit(log, "t1", mgr, submit_hook=submit_hook)
     iid = result["intent_id"]
@@ -104,14 +112,17 @@ def test_b1_durable_snapshot_ordering_before_submit(tmp_path):
     assert near_intent["legs"]["FAR"]["client_order_id"] is not None
     assert near_intent["legs"]["NEAR"]["status"] == "SUBMIT_ATTEMPTED"
     assert near_intent["legs"]["FAR"]["status"] == "NOT_SUBMITTED"
-    # intent record + NEAR attempt already durable (raw lines contain them)
+    # intent record + NEAR attempt already durable in the JSONL
     joined_near = "".join(near_raw)
     assert '"trade_id": "t1"' in joined_near
     assert '"leg": "NEAR"' in joined_near and "SUBMIT_ATTEMPTED" in joined_near
-    # immediately before FAR submit: FAR=SUBMIT_ATTEMPTED durable (fsync'd)
+    # immediately before FAR submit: FAR=SUBMIT_ATTEMPTED durable
     assert far_intent["legs"]["FAR"]["status"] == "SUBMIT_ATTEMPTED"
     assert "SUBMIT_ATTEMPTED" in "".join(far_raw)
-    assert len(far_raw) > len(near_raw)  # FAR attempt appended after NEAR's
+    assert len(far_raw) > len(near_raw)
+    # the hook observed BEFORE the real submits; dispatch then performed them
+    assert len(mgr.submits) == 2
+    assert mgr.submits[0]["client_order_id"] == near_intent["legs"]["NEAR"]["client_order_id"]
 
 
 # ── B2: intent write failure ⇒ fail-closed zero submits ──────────────────
@@ -359,9 +370,17 @@ def test_b19_real_combined_exit_artifacts(tmp_path, monkeypatch):
     # state file: COMBINED_EXIT action written
     assert (tmp_path / "state.json").exists()
     assert "COMBINED_EXIT" in (tmp_path / "state.json").read_text()
-    # durable intent exists and reaches terminal
-    log = ei.IntentLog(str(tmp_path / "intent"))
-    assert log.list_active() or True  # intent created by the dispatcher
+    # DURABLE INTENT at the production location (runtime/logs/): exactly one
+    # for t1, expected per-leg statuses + client ids, inflight matching stage
+    intent_log = ei.IntentLog(str(tmp_path / "logs"))
+    actives = [iid for iid in intent_log.list_active()
+               if intent_log.get(iid)["trade_id"] == "t1"]
+    assert len(actives) == 1  # NOT vacuous: dispatcher must have created it
+    intent = intent_log.get(actives[0])
+    for leg in ("NEAR", "FAR"):
+        assert intent["legs"][leg]["client_order_id"] is not None
+        assert intent["legs"][leg]["status"] in ("SUBMIT_ATTEMPTED", "SUBMITTED", "FILLED")
+    assert intent_log.has_inflight_exit_intent("t1") is True  # still in flight
     assert len(monitor.order_mgr.submits) == 2
 
 
@@ -375,7 +394,9 @@ def test_b20_capacity_fail_closed(tmp_path):
     assert len(log.list_active()) == ei.MAX_ACTIVE_INTENTS
 
 
-# ── B21: two INDEPENDENT IntentLog instances race ⇒ exactly ONE action ───
+# ── B21: two INDEPENDENT IntentLog instances, public recover WITHOUT
+#         external locks ⇒ exactly ONE durable action (serialization is
+#         INTERNAL to recovery, not caller discipline) ───────────────────
 def test_b21_two_instances_concurrent_single_action(tmp_path):
     log_a = ei.IntentLog(str(tmp_path))
     log_b = ei.IntentLog(str(tmp_path))  # second process instance, same runtime dir
@@ -387,10 +408,10 @@ def test_b21_two_instances_concurrent_single_action(tmp_path):
 
     def actor(name, log_inst):
         barrier.wait()
+        # NO external lock — recovery must serialize internally
         try:
-            with log_inst.lock(f"proc-{name}"):
-                r = log_inst.recover(iid, query_fn=lambda c: {"status": "NOT_FOUND"})
-                outcomes.append((name, r["legs"]["NEAR"]["status"]))
+            r = log_inst.recover(iid, query_fn=lambda c: {"status": "NOT_FOUND"})
+            outcomes.append((name, r["legs"]["NEAR"]["status"]))
         except ei.LockBusyError:
             outcomes.append((name, "LOCK_BUSY"))
 
@@ -399,9 +420,10 @@ def test_b21_two_instances_concurrent_single_action(tmp_path):
     t1.start(); t2.start()
     barrier.wait()
     t1.join(); t2.join()
-    performed = [o for o in outcomes if o[1] != "LOCK_BUSY"]
-    assert len(performed) == 1  # exactly ONE actor performed the transition
-    assert sum(1 for o in outcomes if o[1] == "LOCK_BUSY") == 1
+    transitions = [o for o in outcomes if o[1] == "NOT_FOUND_CONFIRMED"]
+    others = [o for o in outcomes if o[1] != "NOT_FOUND_CONFIRMED"]
+    assert len(transitions) == 1  # exactly ONE actor performed the transition
+    assert all(o[1] in ("LOCK_BUSY", "NOT_FOUND_CONFIRMED", "SUBMIT_ATTEMPTED") for o in others)
 
 
 # ── B22: foreign owner → owner-verified reclaim → second process acquires ─
@@ -421,30 +443,34 @@ def test_b22_restart_overlap_owner_verified(tmp_path):
                         owner_check_fn=lambda pid, token: {"alive": True})
 
 
-# ── B23: REAL producer — same qualifying signal fired twice ⇒ ONE submit ──
-def test_b23_real_producer_double_trigger_one_submit(tmp_path, monkeypatch):
+# ── B23: REAL tmf_spread remaining-leg producer — same qualifying state
+#         evaluated twice ⇒ ONE durable intent + ONE dispatch/submit ─────
+def test_b23_real_producer_double_eval_one_submit(tmp_path, monkeypatch):
     from datetime import datetime
-    from core.signal import Signal
+    from unittest.mock import patch
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
     monitor, strat, api = build_monitor(tmp_path, monkeypatch)
+    now = datetime.now()
     bar = {"near_close": 44100.0, "far_close": 44020.0, "atr": 10.0,
-           "timestamp": datetime.now(), "code": "TMFF6"}
-    sig = Signal("EXIT", "TMF_TRAIL_EXIT_LONG")
-    from unittest.mock import patch
+           "timestamp": now, "code": "TMFF6"}
     with patch("strategies.futures.monitor._mts_position_state_path") as msp, \
          patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True):
         msp.return_value.exists.return_value = False
-        # tick 1: the REAL producer dispatch
-        monitor._submit_mts_order_signal(sig, strat, bar, datetime.now())
-        # tick 2: same qualifying signal — must be suppressed by durable intent
-        monitor._submit_mts_order_signal(sig, strat, bar, datetime.now())
+        # producer tick 1: the REAL remaining-leg trail branch emits a signal
+        sig1 = strat._manage_position(44100.0, 44020.0, -0.5, now, bar)
+        # producer must have created ONE durable intent for t1 BEFORE emitting
+        intent_log = ei.IntentLog(str(tmp_path / "logs"))
+        actives = [iid for iid in intent_log.list_active()
+                   if intent_log.get(iid)["trade_id"] == "t1"]
+        assert len(actives) == 1
+        # producer tick 2: same qualifying state — NO second emission
+        sig2 = strat._manage_position(44100.0, 44020.0, -0.5, now, bar)
+        assert sig2 is None  # suppressed by the durable intent
+        # the single emitted signal dispatches exactly once
+        if sig1 is not None:
+            monitor._submit_mts_order_signal(sig1, strat, bar, now)
     assert len(monitor.order_mgr.submits) == 1  # P1-2 regression: ONE order
-    # one durable intent was created for this trade
-    log = ei.IntentLog(str(tmp_path / "intent"))
-    actives = [iid for iid in log.list_active()
-               if log.get(iid)["trade_id"] == "t1"]
-    assert len(actives) == 1
 
 
 # ── B24: crash after repair-child SUBMIT_ATTEMPTED before send ───────────
@@ -526,14 +552,25 @@ def test_b29_healthy_owner_not_stolen(tmp_path):
     assert log.lock_owner()["pid"] == os.getpid()  # not stolen
 
 
-# ── B30: PID reuse / start-token mismatch ⇒ safe reclaim ─────────────────
+# ── B30: PID reuse — live PID with start-token MISMATCH reclaimable;
+#         live PID with MATCHING token refuses (owner_check returns the
+#         CURRENT start token) ────────────────────────────────────────────
 def test_b30_pid_reuse_start_token_mismatch_reclaimable(tmp_path):
     log = make_log(tmp_path)
     log._force_lock_owner({"pid": 4242, "start_token": "old-boot-token", "host": "h"})
-    acquired = log.try_acquire({"pid": 4242, "start_token": "new-token", "host": "h"},
-                               owner_check_fn=lambda pid, token: {"alive": False})
+    # PID 4242 is ALIVE (alive=true) but its current token differs from the
+    # recorded one ⇒ the recorded owner is an old incarnation ⇒ reclaimable
+    acquired = log.try_acquire({"pid": 9999, "start_token": "new-token", "host": "h"},
+                               owner_check_fn=lambda pid, token: {"alive": True,
+                                                                  "start_token": "new-token"})
     assert acquired is True
     assert log.lock_owner()["start_token"] == "new-token"
+    # live PID with MATCHING token ⇒ owner is genuinely alive ⇒ refuse
+    log._force_lock_owner({"pid": 5555, "start_token": "same", "host": "h"})
+    with pytest.raises(ei.LockBusyError):
+        log.try_acquire({"pid": 9998, "start_token": "x", "host": "h"},
+                        owner_check_fn=lambda pid, token: {"alive": True,
+                                                           "start_token": "same"})
 
 
 # ── B31: emergency supersede write failure ⇒ fail-closed no orders ───────
