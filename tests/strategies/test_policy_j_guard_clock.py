@@ -106,15 +106,15 @@ def _call(s, current_pnl_pts, near_mark, far_mark, now_ms, mark_age_ms=0.0,
 
 def test_entry_200ms_inside_guard():
     s = _make_strategy()
-    # entry at t=0 (receive epoch); evaluation at t=200ms
-    _call(s, 47.0, 42830, 43077, 200.0, entry_ts_ms=0.0)
+    # entry at epoch 100000; evaluation at 100200 (200ms later)
+    _call(s, 47.0, 42830, 43077, 100200.0, entry_ts_ms=100000.0)
     assert s._pj_guard_state == "QUARANTINE"
     assert s._pj_durable_peak is None
 
 
 def test_entry_14999ms_still_quarantined():
     s = _make_strategy()
-    _call(s, 47.0, 42830, 43077, 14999.0, entry_ts_ms=0.0)
+    _call(s, 47.0, 42830, 43077, 114999.0, entry_ts_ms=100000.0)
     assert s._pj_guard_state == "QUARANTINE"
     assert s._pj_durable_peak is None
     assert not any(e["event"] == "POLICY_J_PEAK_CONFIRMED" for e in s._pj_events)
@@ -122,7 +122,7 @@ def test_entry_14999ms_still_quarantined():
 
 def test_entry_15000ms_baseline_only():
     s = _make_strategy()
-    _call(s, 47.0, 42830, 43077, 15000.0, entry_ts_ms=0.0)
+    _call(s, 47.0, 42830, 43077, 115000.0, entry_ts_ms=100000.0)
     assert s._pj_guard_state == "COMPLETE"
     assert s._pj_guard_just_completed is True
     assert s._pj_durable_peak == pytest.approx(47.0 * 10 - 92, abs=5)
@@ -131,7 +131,7 @@ def test_entry_15000ms_baseline_only():
 
 def test_baseline_tick_does_not_trigger():
     s = _make_strategy()
-    _call(s, 47.0, 42830, 43077, 15000.0, entry_ts_ms=0.0)
+    _call(s, 47.0, 42830, 43077, 115000.0, entry_ts_ms=100000.0)
     assert s._pj_guard_just_completed is True
     assert not any(e["event"] == "POLICY_J_TRIGGERED" for e in s._pj_events)
 
@@ -208,8 +208,9 @@ def test_guard_ms_frozen_per_trade():
 def test_replay_165028779_no_durable_peak_in_guard_window():
     import json
     events = []
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "logs", "mts_spread_events.jsonl")
+    # repo root = two parents of tests/strategies/<file>
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(repo, "logs", "mts_spread_events.jsonl")
     if not os.path.exists(path):
         pytest.skip("event ledger not available")
     for line in open(path):
