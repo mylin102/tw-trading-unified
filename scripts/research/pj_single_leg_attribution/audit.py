@@ -81,6 +81,7 @@ FILLS_REQUIRED_KEYS = {"trade_id", "timestamp", "leg", "contract", "side",
 EVENTS_REQUIRED_KEYS = {"event", "ts"}
 
 DEFAULT_RUNTIME = "/Users/myllin_mini/Documents/mylin102/tw-trading-unified-runtime"
+TRIGGER_NAMED_EVENTS = {"POLICY_J_TRIGGERED", "POLICY_J_SINGLE_LEG_TRIGGERED"}
 PARAMS_CURRENT = {"activation_twd": 200, "giveback_twd": 50, "mult": 10, "friction": 92}
 
 
@@ -113,7 +114,13 @@ def load_snapshot(path: Path) -> tuple[list[dict], dict]:
         "rows": 0,
     }
     rows: list[dict] = []
-    text = raw.decode("utf-8", errors="replace")
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise SnapshotLoadError(
+            f"SNAPSHOT_MALFORMED: invalid UTF-8 bytes in {path} — "
+            f"no classifications produced"
+        )
     for lineno, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
@@ -125,6 +132,9 @@ def load_snapshot(path: Path) -> tuple[list[dict], dict]:
         if not isinstance(row, dict):
             meta["malformed_lines"] += 1
             continue
+        if _bad_qty(row):
+            meta["malformed_lines"] += 1
+            continue
         rows.append(row)
         meta["rows"] += 1
         _record_ts_offset(row, meta["timestamp_offsets"])
@@ -134,6 +144,22 @@ def load_snapshot(path: Path) -> tuple[list[dict], dict]:
             f"line(s) in {path} — no classifications produced"
         )
     return rows, meta
+
+
+def _bad_qty(row: dict) -> bool:
+    """NaN / inf / fractional / missing qty → malformed (never int-truncated)."""
+    if "qty" not in row:
+        return False  # presence is enforced by the per-row required-keys check
+    q = row.get("qty")
+    if isinstance(q, bool):
+        return True
+    if isinstance(q, int):
+        return False
+    if isinstance(q, float):
+        if q != q or q in (float("inf"), float("-inf")):   # NaN / inf
+            return True
+        return q != int(q)                                  # fractional (1.5)
+    return True                                             # string/other
 
 
 def _record_ts_offset(row: dict, counter: Counter) -> None:
@@ -173,10 +199,12 @@ def validate_fills_schema(rows: list[dict]) -> dict:
     """Returns {} if OK, else a mismatch detail dict → UNREADABLE."""
     if not rows:
         return {"reason": "empty_fills_snapshot"}
-    first_keys = set(rows[0].keys())
-    missing = FILLS_REQUIRED_KEYS - first_keys
-    if missing:
-        return {"reason": "missing_core_keys", "missing": sorted(missing)}
+    # required keys on EVERY row, not just the first
+    for i, r in enumerate(rows):
+        missing = FILLS_REQUIRED_KEYS - set(r.keys())
+        if missing:
+            return {"reason": "missing_core_keys", "row": i,
+                    "missing": sorted(missing)}
     observed_by_type: dict[str, list] = defaultdict(list)
     for r in rows:
         ft = str(r.get("fill_type") or "")
@@ -202,10 +230,11 @@ def validate_events_schema(rows: list[dict]) -> dict:
     """Returns {} if OK, else a mismatch detail dict → UNREADABLE."""
     if not rows:
         return {"reason": "empty_events_snapshot"}
-    first_keys = set(rows[0].keys())
-    missing = EVENTS_REQUIRED_KEYS - first_keys
-    if missing:
-        return {"reason": "missing_core_keys", "missing": sorted(missing)}
+    for i, r in enumerate(rows):
+        missing = EVENTS_REQUIRED_KEYS - set(r.keys())
+        if missing:
+            return {"reason": "missing_core_keys", "row": i,
+                    "missing": sorted(missing)}
     event_counts = Counter(str(r.get("event") or "") for r in rows)
     per_trade_missing = Counter()
     for r in rows:
@@ -376,13 +405,22 @@ def classify_trade(cand: dict, events_by_trade: dict, params: dict,
     exit_fill = cand["exit"]
     exit_dt, exit_flag = parse_ts(exit_fill.get("timestamp"))
 
-    # v6: any timestamp uncertainty → NOT_PROVABLE + eligibility=null
-    if exit_flag != "ok":
+    # v6/codex: per-candidate timestamp semantics — any row with naive /
+    # mixed / missing / unparseable ts → NOT_PROVABLE + eligibility=null,
+    # before any aware-vs-naive comparison (which would crash).
+    ts_flags = {
+        "entry_near": parse_ts(cand["entry_near"].get("timestamp"))[1],
+        "entry_far": parse_ts(cand["entry_far"].get("timestamp"))[1],
+        "release": parse_ts(cand["release"].get("timestamp"))[1],
+        "exit": exit_flag,
+    }
+    bad_ts = [f"{k}={v}" for k, v in ts_flags.items() if v != "ok"]
+    if bad_ts:
         return {
             "trade_id": tid, "classification": "INSUFFICIENT_EVIDENCE",
             "attribution_strength": "NOT_PROVABLE",
             "eligibility_consistent": None,
-            "source_limits": ["TS_%s" % exit_flag.upper()],
+            "source_limits": ["TS_%s" % flag.split("=")[1].upper() for flag in bad_ts],
         }
     # timestamp contract ENTRY_A <= ENTRY_B < RELEASE_A < EXIT_B
     order_ok = _temporal_contract(cand)
@@ -415,7 +453,17 @@ def classify_trade(cand: dict, events_by_trade: dict, params: dict,
         }
     activation = float(params.get("activation_twd", 200))
     giveback = float(params.get("giveback_twd", 50))
-    current_net = _current_net_twd(fills, params)
+    current_net, proxy = _decision_time_net(cand, params)
+    if current_net is None:
+        return {
+            "trade_id": tid, "classification": "INSUFFICIENT_EVIDENCE",
+            "attribution_strength": "NOT_PROVABLE",
+            "eligibility_consistent": None,
+            "decision_event": {"type": decision[1] if decision else "NONE",
+                               "ts": decision[0].isoformat() if decision else None,
+                               "durable_peak": peak},
+            "source_limits": ["NO_DECISION_TIME_MARK"],
+        }
     eligible = peak >= activation and current_net <= peak - giveback
     return {
         "trade_id": tid, "classification": "INSUFFICIENT_EVIDENCE",
@@ -424,12 +472,13 @@ def classify_trade(cand: dict, events_by_trade: dict, params: dict,
         "decision_event": {"type": decision[1] if decision else "NONE",
                            "ts": decision[0].isoformat() if decision else None,
                            "durable_peak": peak},
-        "current_net_twd": current_net,
+        "current_net_proxy": proxy,
         "source_limits": ["NO_DECISION_PROVENANCE"],
     }
 
 
 def _temporal_contract(cand: dict) -> bool:
+    """All timestamps are verified tz-clean by the caller; compare safely."""
     en_ts, _ = parse_ts(cand["entry_near"].get("timestamp"))
     ef_ts, _ = parse_ts(cand["entry_far"].get("timestamp"))
     r_ts, _ = parse_ts(cand["release"].get("timestamp"))
@@ -439,31 +488,40 @@ def _temporal_contract(cand: dict) -> bool:
     return en_ts <= ef_ts < r_ts < x_ts
 
 
-def _current_net_twd(fills: list[dict], params: dict) -> float:
-    """Reconstruct the combined net at the exit from the fill pnl fields
-    (fallback: parity formula (near_pnl_pts + far_pnl_pts) * mult - friction)."""
-    last = fills[-1]
+def _decision_time_net(cand: dict, params: dict) -> tuple[Optional[float], Optional[dict]]:
+    """Decision-time combined net from the RELEASE fill row (labelled proxy).
+
+    Codex (audit round 2): the final EXIT fill is post-decision evidence and
+    must NOT be used as the decision-time remaining-leg mark. The closest
+    decision-time proxy is the RELEASE row's near_pnl/far_pnl snapshot.
+    Returns (value, proxy_info); (None, None) when no proxy exists →
+    eligibility NOT computable → NOT_PROVABLE.
+    """
     mult = float(params.get("mult", 10))
     friction = float(params.get("friction", 92))
+    rel = cand["release"]
     try:
-        if "spread_pnl" in last and last.get("spread_pnl") is not None:
-            return float(last["spread_pnl"])
-        if "realized_pnl" in last and last.get("realized_pnl") is not None:
-            return float(last["realized_pnl"])
+        near = float(rel.get("near_pnl"))
+        far = float(rel.get("far_pnl"))
     except (TypeError, ValueError):
-        pass
-    try:
-        near = float(last.get("near_pnl") or 0.0)
-        far = float(last.get("far_pnl") or 0.0)
-        return (near + far) * mult - friction
-    except (TypeError, ValueError):
-        return 0.0
+        return None, None
+    value = (near + far) * mult - friction
+    proxy = {
+        "proxy": "release_fill_pnl",
+        "source_row": "RELEASE",
+        "source_row_ts": rel.get("timestamp"),
+        "near_pnl": near, "far_pnl": far,
+        "formula": "(near_pnl+far_pnl)*mult-friction",
+        "value_twd": round(value, 2),
+    }
+    return value, proxy
 
 
 # ── main ───────────────────────────────────────────────────────────────────
 
 def build_artifact(fills_path: Path, events_path: Path, output_dir: Path,
-                   repo_root: Path) -> dict:
+                   repo_root: Optional[Path] = None) -> dict:
+    repo_root = repo_root or _repo_root()
     try:
         fills, fills_meta = load_snapshot(fills_path)
     except SnapshotLoadError as e:
@@ -520,12 +578,9 @@ def build_artifact(fills_path: Path, events_path: Path, output_dir: Path,
 
     counts = Counter(rec["attribution_strength"] for rec in trades)
     reasons = []
-    if not any(e.get("event", "").startswith("POLICY_J_") and "TRIGGER" in e.get("event", "")
-               for e in events):
+    if not _has_trigger_named_event(events):
         reasons.append("NO_TRIGGER_NAMED_EVENT_IN_SCHEMA")
-    if not any(e.get("event", "").startswith("FINAL_DECISION")
-               or "cause" in {k: v for k, v in e.items() if isinstance(v, str)}.values()
-               for e in events):
+    if not _has_final_cause_event(events):
         reasons.append("NO_FINAL_DECISION_CAUSE_EVENT")
 
     test_rows = sum(1 for f in fills if str(f.get("fill_type") or "") == "TEST")
@@ -598,6 +653,40 @@ def _git_sha(repo_root: Path) -> str:
         return "unknown"
 
 
+def _repo_root() -> Path:
+    """The script's own repository root (audit.py lives at
+    <repo>/scripts/research/pj_single_leg_attribution/audit.py)."""
+    return Path(__file__).resolve().parents[3]
+
+
+def _has_trigger_named_event(events: list[dict]) -> bool:
+    """A trigger DECISION event names the Policy-J trigger as the winner.
+    TRIGGER_SUPPRESSED is NOT a trigger decision (it is the per-tick
+    suppression log) and must not count."""
+    for e in events:
+        ev = str(e.get("event") or "")
+        if ev in TRIGGER_NAMED_EVENTS:
+            return True
+        if "TRIGGER" in ev and "SUPPRESS" not in ev and "REJECT" not in ev:
+            return True
+    return False
+
+
+def _has_final_cause_event(events: list[dict]) -> bool:
+    """A final-decision cause marker is a FIELD (cause=/reason=...) on an
+    event row naming the non-Policy-J winner for this exit."""
+    for e in events:
+        cause = e.get("cause")
+        if cause:
+            return True
+        reason = e.get("reason")
+        if isinstance(reason, str) and any(
+            kw in reason.lower() for kw in ("trail", "release_threshold", "not_policy_j")
+        ):
+            return True
+    return False
+
+
 def _git_dirty(repo_root: Path) -> str:
     try:
         out = subprocess.run(["git", "-C", str(repo_root), "status", "--porcelain"],
@@ -622,7 +711,7 @@ def main() -> int:
         return 2
     output_dir = Path(args.output_dir) if args.output_dir else runtime / "exports" / "research"
     output_dir.mkdir(parents=True, exist_ok=True)
-    repo_root = Path(args.repo_root) if args.repo_root else runtime.parent
+    repo_root = Path(args.repo_root) if args.repo_root else _repo_root()
 
     artifact = build_artifact(fills_path, events_path, output_dir, repo_root)
     out_path = output_dir / f"pj_single_leg_attribution_{datetime.now():%Y%m%d_%H%M%S}.json"
