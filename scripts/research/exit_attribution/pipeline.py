@@ -211,14 +211,25 @@ def build_trade_row(
             val = round(rv + ov, 2)
     immediate_exec = round(val, 2) if (tier == TIER_EXECUTABLE_BBO and val is not None) else None
 
-    # actual_full (gross + net): ONLY when fully closed
+    # actual_full (gross + net): only when fully closed AND every necessary
+    # reconciliation result is trustworthy — CORRUPT/UNRECONCILED results (or
+    # missing expected_realized) NEVER contribute a fabricated 0.0 (codex D3).
+    _res_list = [r for r in rel_results + other_results if r is not None]
     actual_gross = None
     actual_net = None
     fee_uncertain = False
-    if fully_closed:
+    _recon_trusted = (
+        bool(_res_list)
+        and all(
+            r.expected_realized is not None
+            and r.status not in ("CORRUPT", "UNRECONCILED")
+            for r in _res_list
+        )
+    )
+    if fully_closed and _recon_trusted:
         _g = 0.0
         _n = 0.0
-        for _r in rel_results + other_results:
+        for _r in _res_list:
             if _r.expected_realized is None:
                 continue
             fee = _fill_fee(_r.fill, fee_schedule)
@@ -228,6 +239,19 @@ def build_trade_row(
                 fee_uncertain = True
         actual_gross = round(_g, 2)
         actual_net = round(_n, 2) if not fee_uncertain else None
+
+    # underlying diagnostics: every stored-vs-recomputed mismatch, exposed
+    # even when a higher-severity structural flag dominates the status.
+    _recon_diag = [
+        {
+            "fill_type": _r.fill.get("fill_type"),
+            "leg": str(_r.fill.get("leg") or "").upper(),
+            "expected": _r.expected_realized,
+            "stored": _r.stored_realized,
+            "delta": round(_r.delta, 2),
+        }
+        for _r in _res_list if _r.delta is not None
+    ]
 
     post_inc = None
     if actual_gross is not None and pre_release_paired_pnl is not None:
@@ -241,7 +265,6 @@ def build_trade_row(
             unhedged_s = round((t2 - t1).total_seconds(), 2)
 
     # deterministic status aggregation: reconcile results + structural flags
-    _res_list = [r for r in rel_results + other_results if r is not None]
     if flags:
         _res_list.append(ReconcileResult(
             fill={"trade_id": trade_id}, status=STATUS_UNRECONCILED, issue_flags=flags,
@@ -271,6 +294,7 @@ def build_trade_row(
         "unhedged_seconds": unhedged_s,
         "status": status,
         "issue_flags": agg_flags,
+        "reconcile_diagnostics": _recon_diag,
         "data_quality": dq,
         "quote_age_s": {k: round(v, 3) if v is not None else None for k, v in
                         {released_leg: rel_age, other_leg: other_age}.items()},

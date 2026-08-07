@@ -166,4 +166,5 @@ def reconcile_fill(
     if stored_realized is not None and abs(expected - stored_realized) > RECONCILE_TOLERANCE_TWD:
         res.status = STATUS_MISMATCH
         res.delta = expected - stored_realized
+        res.issue_flags.append("stored_realized_mismatch")  # survives severity aggregation
     return res

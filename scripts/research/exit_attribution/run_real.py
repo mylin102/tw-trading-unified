@@ -223,6 +223,15 @@ def stats_report(rows: List[dict], fee_schedule: dict, run_id: str) -> dict:
          "status": r["status"]}
         for r in rows if r["status"] == "MISMATCH"
     ]
+    # underlying stored-vs-recomputed mismatches, exposed even when a higher
+    # severity structural flag dominates the final status (codex D3 #2)
+    stored_mismatch_rows = [r for r in rows
+                            if "stored_realized_mismatch" in (r.get("issue_flags") or [])]
+    stored_mismatch_diag = [
+        {"trade_id": r["trade_id"], "status": r["status"], "flags": r.get("issue_flags"),
+         "diagnostics": r.get("reconcile_diagnostics")}
+        for r in stored_mismatch_rows
+    ]
     ages = [v for r in rows for v in (r.get("quote_age_s") or {}).values()
             if isinstance(v, (int, float))]
     # pair skew: |age_near - age_far| per row where both legs quoted
@@ -271,6 +280,8 @@ def stats_report(rows: List[dict], fee_schedule: dict, run_id: str) -> dict:
             "status_counts": statuses,
             "flag_counts": flag_counts,
             "mismatch_list": mismatches,
+            "stored_realized_mismatch_count": len(stored_mismatch_rows),
+            "stored_realized_mismatch_diagnostics": stored_mismatch_diag,
             "corrupt_trades_excluded_from_sign_stats": [
                 r["trade_id"] for r in rows if "corrupt_realized_pnl" in (r.get("issue_flags") or [])
             ],
