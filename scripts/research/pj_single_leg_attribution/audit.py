@@ -82,6 +82,9 @@ EVENTS_REQUIRED_KEYS = {"event", "ts"}
 
 DEFAULT_RUNTIME = "/Users/myllin_mini/Documents/mylin102/tw-trading-unified-runtime"
 TRIGGER_NAMED_EVENTS = {"POLICY_J_TRIGGERED", "POLICY_J_SINGLE_LEG_TRIGGERED"}
+FINAL_DECISION_EVENT_TYPES = {"EXIT_SUBMITTED", "RELEASE_NEAR_SUBMITTED",
+                              "RELEASE_FAR_SUBMITTED", "COMBINED_EXIT_SUBMITTED"}
+NON_POLICY_J_CAUSES = ("trail", "release_threshold", "not_policy_j")
 PARAMS_CURRENT = {"activation_twd": 200, "giveback_twd": 50, "mult": 10, "friction": 92}
 
 
@@ -139,17 +142,21 @@ def load_snapshot(path: Path) -> tuple[list[dict], dict]:
         meta["rows"] += 1
         _record_ts_offset(row, meta["timestamp_offsets"])
     if meta["malformed_lines"]:
-        raise SnapshotLoadError(
+        err = SnapshotLoadError(
             f"SNAPSHOT_MALFORMED: {meta['malformed_lines']} malformed JSONL "
             f"line(s) in {path} — no classifications produced"
         )
+        err.meta = meta
+        raise err
     return rows, meta
 
 
 def _bad_qty(row: dict) -> bool:
-    """NaN / inf / fractional / missing qty → malformed (never int-truncated)."""
-    if "qty" not in row:
-        return False  # presence is enforced by the per-row required-keys check
+    """NaN / inf / fractional / missing qty → malformed (never int-truncated).
+    Applied ONLY where qty semantics are defined (fills rows carry fill_type;
+    event rows have no qty contract and are not checked here)."""
+    if "fill_type" not in row or "qty" not in row:
+        return False
     q = row.get("qty")
     if isinstance(q, bool):
         return True
@@ -352,31 +359,12 @@ def _int_qty(fill) -> int:
 # ── parameter provenance (v6 §7) ───────────────────────────────────────────
 
 def resolve_params(repo_root: Path) -> dict:
-    """DEPLOYED_CONFIG_<sha> if a single effective config commit is
-    resolvable for the current HEAD; else PARAMETER_VERSION_UNKNOWN."""
-    try:
-        cfg = repo_root / "config" / "futures.yaml"
-        if not cfg.exists():
-            return {"param_source": "PARAMETER_VERSION_UNKNOWN",
-                    **PARAMS_CURRENT, "params_assumed_from_current": True}
-        out = subprocess.run(
-            ["git", "-C", str(repo_root), "log", "--follow", "--format=%H", "--",
-             "config/futures.yaml"],
-            capture_output=True, text=True, timeout=10,
-        )
-        commits = [c for c in out.stdout.split() if c]
-        if not commits:
-            return {"param_source": "PARAMETER_VERSION_UNKNOWN",
-                    **PARAMS_CURRENT, "params_assumed_from_current": True}
-        # For the read-only audit: the HEAD config is the reference; a full
-        # per-trade-date deploy timeline is out of scope for the audit run,
-        # so provenance stays UNKNOWN unless a single stable commit is found.
-        return {"param_source": "PARAMETER_VERSION_UNKNOWN",
-                **PARAMS_CURRENT, "params_assumed_from_current": True,
-                "config_commits_observed": commits[:3]}
-    except Exception:
-        return {"param_source": "PARAMETER_VERSION_UNKNOWN",
-                **PARAMS_CURRENT, "params_assumed_from_current": True}
+    """Provenance-gap-only baseline (codex A5): per-trade deployed-config
+    mapping is NOT implemented in this read-only audit, so parameters are
+    always PARAMETER_VERSION_UNKNOWN. The script NEVER reports eligibility
+    (eligibility_consistent stays null) — see design v7 §7."""
+    return {"param_source": "PARAMETER_VERSION_UNKNOWN",
+            **PARAMS_CURRENT, "params_assumed_from_current": True}
 
 
 # ── classification (v6 §5) ─────────────────────────────────────────────────
@@ -434,45 +422,39 @@ def classify_trade(cand: dict, events_by_trade: dict, params: dict,
 
     # trigger-named evidence does not exist in the schema (v6) → SUPPORTED=0
     # final-decision cause marker does not exist (v6) → CONTRADICTED=0
-    decision = _last_decision_event(events_by_trade, tid, exit_dt)
-    peak = 0.0
-    if decision is not None:
-        peak = float(decision[2].get("durable_peak") or 0.0)
-
-    # eligibility requires: params resolved AND tz-clean AND peak+giveback
-    if params.get("param_source") == "PARAMETER_VERSION_UNKNOWN" or not tz_clean:
+    # codex A3: eligibility requires a timestamped same-trade decision record
+    # with BOTH durable_peak and current_net_twd at that moment; the RELEASE
+    # row PnL is a release-time proxy and never establishes eligibility.
+    record = _decision_eval_record(events_by_trade, tid, exit_dt)
+    if record is None or params.get("param_source") == "PARAMETER_VERSION_UNKNOWN" \
+            or not tz_clean:
+        limits = []
+        if record is None:
+            limits.append("NO_DECISION_TIME_MARK")
+        if params.get("param_source") == "PARAMETER_VERSION_UNKNOWN":
+            limits.append("PARAMETER_VERSION_UNKNOWN")
+        if not tz_clean:
+            limits.append("TS_SEMANTICS_UNKNOWN")
         return {
             "trade_id": tid, "classification": "INSUFFICIENT_EVIDENCE",
             "attribution_strength": "NOT_PROVABLE",
             "eligibility_consistent": None,
-            "decision_event": {"type": decision[1] if decision else "NONE",
-                               "ts": decision[0].isoformat() if decision else None,
-                               "durable_peak": peak},
-            "source_limits": (["NO_DECISION_PROVENANCE"] if decision is None else
-                              ["PARAMETER_VERSION_UNKNOWN"]),
+            "decision_event": None,
+            "source_limits": limits,
         }
+    peak = float(record[1].get("durable_peak") or 0.0)
+    net = float(record[1].get("current_net_twd") or 0.0)
     activation = float(params.get("activation_twd", 200))
     giveback = float(params.get("giveback_twd", 50))
-    current_net, proxy = _decision_time_net(cand, params)
-    if current_net is None:
-        return {
-            "trade_id": tid, "classification": "INSUFFICIENT_EVIDENCE",
-            "attribution_strength": "NOT_PROVABLE",
-            "eligibility_consistent": None,
-            "decision_event": {"type": decision[1] if decision else "NONE",
-                               "ts": decision[0].isoformat() if decision else None,
-                               "durable_peak": peak},
-            "source_limits": ["NO_DECISION_TIME_MARK"],
-        }
-    eligible = peak >= activation and current_net <= peak - giveback
+    eligible = peak >= activation and net <= peak - giveback
     return {
         "trade_id": tid, "classification": "INSUFFICIENT_EVIDENCE",
         "attribution_strength": "INFERRED_ELIGIBLE" if eligible else "NOT_PROVABLE",
         "eligibility_consistent": eligible,
-        "decision_event": {"type": decision[1] if decision else "NONE",
-                           "ts": decision[0].isoformat() if decision else None,
-                           "durable_peak": peak},
-        "current_net_proxy": proxy,
+        "decision_event": {"type": record[1].get("event"),
+                           "ts": record[0].isoformat(),
+                           "durable_peak": peak,
+                           "current_net_twd": net},
         "source_limits": ["NO_DECISION_PROVENANCE"],
     }
 
@@ -488,33 +470,26 @@ def _temporal_contract(cand: dict) -> bool:
     return en_ts <= ef_ts < r_ts < x_ts
 
 
-def _decision_time_net(cand: dict, params: dict) -> tuple[Optional[float], Optional[dict]]:
-    """Decision-time combined net from the RELEASE fill row (labelled proxy).
-
-    Codex (audit round 2): the final EXIT fill is post-decision evidence and
-    must NOT be used as the decision-time remaining-leg mark. The closest
-    decision-time proxy is the RELEASE row's near_pnl/far_pnl snapshot.
-    Returns (value, proxy_info); (None, None) when no proxy exists →
-    eligibility NOT computable → NOT_PROVABLE.
-    """
-    mult = float(params.get("mult", 10))
-    friction = float(params.get("friction", 92))
-    rel = cand["release"]
-    try:
-        near = float(rel.get("near_pnl"))
-        far = float(rel.get("far_pnl"))
-    except (TypeError, ValueError):
-        return None, None
-    value = (near + far) * mult - friction
-    proxy = {
-        "proxy": "release_fill_pnl",
-        "source_row": "RELEASE",
-        "source_row_ts": rel.get("timestamp"),
-        "near_pnl": near, "far_pnl": far,
-        "formula": "(near_pnl+far_pnl)*mult-friction",
-        "value_twd": round(value, 2),
-    }
-    return value, proxy
+def _decision_eval_record(events_by_trade: dict, trade_id: str, exit_dt):
+    """A timestamped same-trade decision/evaluation record carrying BOTH
+    durable_peak AND current combined net (current_net_twd) at that moment
+    (codex A3). RELEASE-row PnL is a release-time proxy — it is NOT evidence
+    that the giveback condition held later in [RELEASE, EXIT] — so it never
+    counts here. Returns (dt, event) or None."""
+    best = None
+    for e in events_by_trade.get(trade_id, []):
+        if str(e.get("event") or "") not in PER_TRADE_EVIDENCE_TYPES:
+            continue
+        dt, flag = parse_ts(e.get("ts"))
+        if flag != "ok":
+            continue
+        if exit_dt is not None and dt > exit_dt:
+            continue
+        if e.get("durable_peak") is None or e.get("current_net_twd") is None:
+            continue  # incomplete record — cannot establish decision-time net
+        if best is None or dt > best[0]:
+            best = (dt, e)
+    return best
 
 
 # ── main ───────────────────────────────────────────────────────────────────
@@ -525,13 +500,25 @@ def build_artifact(fills_path: Path, events_path: Path, output_dir: Path,
     try:
         fills, fills_meta = load_snapshot(fills_path)
     except SnapshotLoadError as e:
+        _m = getattr(e, "meta", {})
         return {"status": "SNAPSHOT_MALFORMED", "generated_at": datetime.now().isoformat(),
-                "detail": str(e), "script_commit_sha": _git_sha(repo_root)}
+                "detail": str(e),
+                "input_path": str(fills_path),
+                "input_sha256": _m.get("sha256"),
+                "input_bytes": _m.get("bytes"),
+                "parser_error": str(e),
+                "script_commit_sha": _git_sha(repo_root)}
     try:
         events, events_meta = load_snapshot(events_path)
     except SnapshotLoadError as e:
+        _m = getattr(e, "meta", {})
         return {"status": "SNAPSHOT_MALFORMED", "generated_at": datetime.now().isoformat(),
-                "detail": str(e), "script_commit_sha": _git_sha(repo_root)}
+                "detail": str(e),
+                "input_path": str(events_path),
+                "input_sha256": _m.get("sha256"),
+                "input_bytes": _m.get("bytes"),
+                "parser_error": str(e),
+                "script_commit_sha": _git_sha(repo_root)}
 
     fills_schema = validate_fills_schema(fills)
     if fills_schema:
@@ -580,7 +567,7 @@ def build_artifact(fills_path: Path, events_path: Path, output_dir: Path,
     reasons = []
     if not _has_trigger_named_event(events):
         reasons.append("NO_TRIGGER_NAMED_EVENT_IN_SCHEMA")
-    if not _has_final_cause_event(events):
+    if not _has_final_cause_event(events, {c["trade_id"] for c in candidates}):
         reasons.append("NO_FINAL_DECISION_CAUSE_EVENT")
 
     test_rows = sum(1 for f in fills if str(f.get("fill_type") or "") == "TEST")
@@ -621,6 +608,7 @@ def build_artifact(fills_path: Path, events_path: Path, output_dir: Path,
                 "INFERRED_ELIGIBLE": counts.get("INFERRED_ELIGIBLE", 0),
                 "NOT_PROVABLE": counts.get("NOT_PROVABLE", 0)},
             "reasons": reasons,
+            "provenance_gap_only": True,   # codex A5: params never resolved
         },
         "candidates_considered": len(candidates),
         "rejected_candidates": dict(rejected),
@@ -660,28 +648,34 @@ def _repo_root() -> Path:
 
 
 def _has_trigger_named_event(events: list[dict]) -> bool:
-    """A trigger DECISION event names the Policy-J trigger as the winner.
-    TRIGGER_SUPPRESSED is NOT a trigger decision (it is the per-tick
-    suppression log) and must not count."""
+    """Only explicit trigger/winner event types WITH a nonempty matching
+    trade_id count as trigger provenance. TRIGGER_SUPPRESSED is NOT a
+    trigger decision (per-tick suppression log) and never counts; unknown
+    *TRIGGER* names never count either."""
     for e in events:
         ev = str(e.get("event") or "")
-        if ev in TRIGGER_NAMED_EVENTS:
-            return True
-        if "TRIGGER" in ev and "SUPPRESS" not in ev and "REJECT" not in ev:
+        if ev in TRIGGER_NAMED_EVENTS and e.get("trade_id"):
             return True
     return False
 
 
-def _has_final_cause_event(events: list[dict]) -> bool:
-    """A final-decision cause marker is a FIELD (cause=/reason=...) on an
-    event row naming the non-Policy-J winner for this exit."""
+def _has_final_cause_event(events: list[dict], candidate_trade_ids: set) -> bool:
+    """Only an explicit final-decision event type WITH trade_id and an
+    allowed non-Policy-J cause counts, and the trade_id must be one of the
+    audited candidates. Global/unrelated rows (no trade_id, non-candidate
+    trade, or not a final-decision type) never clear the provenance gap —
+    historical data stays no-cause by design."""
     for e in events:
+        if str(e.get("event") or "") not in FINAL_DECISION_EVENT_TYPES:
+            continue
+        if e.get("trade_id") not in candidate_trade_ids:
+            continue
         cause = e.get("cause")
-        if cause:
+        if isinstance(cause, str) and cause.lower() in NON_POLICY_J_CAUSES:
             return True
         reason = e.get("reason")
         if isinstance(reason, str) and any(
-            kw in reason.lower() for kw in ("trail", "release_threshold", "not_policy_j")
+            kw in reason.lower() for kw in NON_POLICY_J_CAUSES
         ):
             return True
     return False
