@@ -170,12 +170,11 @@ def test_incident_reproduction_not_provable_without_decision(tmp_path):
 
 def test_inferred_eligible_with_resolved_params_and_peak(tmp_path):
     fills = _single_leg_trade()
-    # decision-time proxy on the RELEASE row: (near_pnl+far_pnl)*10-92
-    fills[2]["near_pnl"] = -40.0
-    fills[2]["far_pnl"] = 0.0
+    # codex A3: eligibility requires a timestamped same-trade decision record
+    # with BOTH durable_peak AND current_net_twd at that moment.
     events = [
         _event("POLICY_J_PEAK_CONFIRMED", ts="2026-08-06T10:03:00+08:00",
-               tid="mts-auto-T1", durable_peak=300.0),
+               tid="mts-auto-T1", durable_peak=300.0, current_net_twd=-40.0),
     ]
     fp, ep = _write(tmp_path, fills, events)
     with patch("scripts.research.pj_single_leg_attribution.audit.resolve_params",
@@ -308,13 +307,15 @@ def test_final_cause_marker_inspected_as_field(tmp_path):
     assert "NO_FINAL_DECISION_CAUSE_EVENT" not in art["summary"]["reasons"]
 
 
-def test_eligibility_proxy_uses_release_fill_not_exit_fill(tmp_path):
+def test_release_snapshot_alone_is_not_eligibility(tmp_path):
+    """codex A3 counterexample: the RELEASE row PnL satisfies the giveback
+    condition, but no timestamped decision record carries the net at a later
+    moment → NOT_PROVABLE / NO_DECISION_TIME_MARK (never INFERRED_ELIGIBLE)."""
     fills = _single_leg_trade()
-    # decision-time pnl snapshot lives on the RELEASE fill row
-    fills[2]["near_pnl"] = 300.0
+    fills[2]["near_pnl"] = 300.0   # release-time snapshot satisfies conditions
     fills[2]["far_pnl"] = 0.0
     events = [_event("POLICY_J_PEAK_CONFIRMED", ts="2026-08-06T10:03:00+08:00",
-                     tid="mts-auto-T1", durable_peak=300.0)]
+                     tid="mts-auto-T1", durable_peak=300.0)]  # NO current_net_twd
     fp, ep = _write(tmp_path, fills, events)
     with patch("scripts.research.pj_single_leg_attribution.audit.resolve_params",
                return_value={"param_source": "DEPLOYED_CONFIG_abc",
@@ -322,9 +323,9 @@ def test_eligibility_proxy_uses_release_fill_not_exit_fill(tmp_path):
                              "mult": 10, "friction": 92}):
         art = build_artifact(fp, ep, tmp_path / "out", repo_root=tmp_path)
     trade = art["trades"][0]
-    assert trade["current_net_proxy"]["source_row"] == "RELEASE", \
-        "eligibility must use the decision-time (release) row, never the exit fill"
-    assert trade["current_net_proxy"]["formula"] == "(near_pnl+far_pnl)*mult-friction"
+    assert trade["attribution_strength"] == "NOT_PROVABLE"
+    assert trade["eligibility_consistent"] is None
+    assert "NO_DECISION_TIME_MARK" in trade["source_limits"]
 
 
 def test_default_repo_root_is_actual_repo(tmp_path):
@@ -334,3 +335,68 @@ def test_default_repo_root_is_actual_repo(tmp_path):
     art = build_artifact(fp, ep, tmp_path / "out")   # no repo_root arg
     sha = art.get("script_commit_sha", "")
     assert len(sha) == 40 and sha != "unknown", f"got sha={sha!r}"
+
+
+# ── codex audit round 3: A1-A5 RED tests ───────────────────────────────────
+
+def test_trigger_named_event_requires_trade_id(tmp_path):
+    # A1: a trigger-named event WITHOUT trade_id must NOT count as provenance
+    fills = _single_leg_trade()
+    events = [_event("POLICY_J_TRIGGERED"),            # no trade_id
+              _event("POLICY_J_SINGLE_LEG_TRIGGERED"),  # no trade_id
+              _event("EXIT_LOG")]
+    art = _audit(tmp_path, fills, events)
+    assert "NO_TRIGGER_NAMED_EVENT_IN_SCHEMA" in art["summary"]["reasons"]
+
+
+def test_unknown_trigger_name_never_counts(tmp_path):
+    # A1: arbitrary *TRIGGER* names must not count — only the explicit set
+    fills = _single_leg_trade()
+    events = [_event("POLICY_J_TRIGGER_CUSTOM", tid="mts-auto-T1"),
+              _event("EXIT_LOG")]
+    art = _audit(tmp_path, fills, events)
+    assert "NO_TRIGGER_NAMED_EVENT_IN_SCHEMA" in art["summary"]["reasons"]
+
+
+def test_final_cause_requires_same_trade_and_type(tmp_path):
+    # A2: unrelated rows (wrong event type / missing trade_id) must not clear
+    # the provenance gap
+    fills = _single_leg_trade()
+    events = [
+        _event("MARKET_DATA_TRACE", cause="trail"),          # not a final-decision type
+        _event("RELEASE_NEAR_SUBMITTED", cause="trail"),      # no trade_id
+        _event("EXIT_SUBMITTED", tid="mts-auto-OTHER", cause="trail"),  # different trade
+        _event("EXIT_LOG"),
+    ]
+    art = _audit(tmp_path, fills, events)
+    assert "NO_FINAL_DECISION_CAUSE_EVENT" in art["summary"]["reasons"], \
+        "only same-trade explicit final-decision cause events clear the gap"
+
+
+def test_event_rows_qty_not_checked(tmp_path):
+    # A4: qty validation applies only where qty semantics are defined (fills);
+    # an event row carrying a stray qty must not make the snapshot malformed
+    fills = _single_leg_trade()
+    events = [_event("EXIT_LOG", qty=1.5)]
+    art = _audit(tmp_path, fills, events)
+    assert art["status"] == "OK"
+
+
+def test_malformed_failure_preserves_snapshot_evidence(tmp_path):
+    # A4: failure artifact keeps input path + parsed-byte hash + byte count
+    fp, ep = _write(tmp_path, [])
+    fp.write_text('{"trade_id": "t1", "broken json\n')
+    art = build_artifact(fp, ep, tmp_path / "out", repo_root=tmp_path)
+    assert art["status"] == "SNAPSHOT_MALFORMED"
+    assert art["input_path"] == str(fp)
+    assert isinstance(art.get("input_sha256"), str) and len(art["input_sha256"]) == 64
+    assert isinstance(art.get("input_bytes"), int) and art["input_bytes"] > 0
+    assert "parser_error" in art
+
+
+def test_provenance_gap_only_flag(tmp_path):
+    # A5: provenance-gap-only baseline is declared explicitly
+    fills = _single_leg_trade()
+    art = _audit(tmp_path, fills, _MIN_EVENTS)
+    assert art["summary"]["provenance_gap_only"] is True
+    assert art["manifest"]["params"]["param_source"] == "PARAMETER_VERSION_UNKNOWN"
