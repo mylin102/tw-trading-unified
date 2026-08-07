@@ -4370,30 +4370,9 @@ class TMFSpread(StrategyBase):
                 _turnover = (_rem_entry + _exit_price) * _mult
                 _cost = 40.0 + _turnover * 2e-5
                 _realized = _pnl_pts * _mult - _cost
-                self._lifecycle = "EXITING"
-                self._log_exit_decision(exit_reason=_exit_reason, pnl=_pnl_pts, bar=bar)
-
-                # 2026-07-23 Gemini CLI: Work Package A - Instrumentation & Provenance Metadata
-                _peak_or_nadir = self._peak if _rem_side == "LONG" else self._nadir
-                _retracement = (_peak_or_nadir - _exit_price) if _rem_side == "LONG" else (_exit_price - _peak_or_nadir)
-                _warmup_elapsed = round((time.monotonic() - self._single_leg_entered_mono) * 1000.0, 1) if self._single_leg_entered_mono > 0 else 0.0
-                _pt = getattr(self, "_single_leg_post_fill_ticks", 0)
-                _warmup_ticks = int(_pt) if isinstance(_pt, (int, float)) else 0
-                
-                self._risk_mode_at_exit = _risk_meta.get("risk_mode", "FIXED_FALLBACK")
-                _risk_meta["risk_mode_at_exit"] = self._risk_mode_at_exit
-                _risk_meta["single_leg_peak_or_nadir"] = round(float(_peak_or_nadir), 2) if _peak_or_nadir > 0 else None
-                _risk_meta["effective_trail_dist"] = _risk_meta.get("final_trail_dist")
-                _risk_meta["calculated_retracement"] = round(float(_retracement), 2) if _peak_or_nadir > 0 else None
-                _risk_meta["trigger_price"] = _exit_price
-                _risk_meta["warmup_elapsed_ms"] = _warmup_elapsed
-                _risk_meta["warmup_tick_count"] = _warmup_ticks
-
-                _append_event("EXIT_REMAINING", reason=_exit_reason, remaining_leg=_rem_leg.value, exit_price=_exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, **_risk_meta)
-                _write_mts_state(has_position=True, action=f"EXIT_{_exit_reason}", reason=_exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
-                self._log_shadow_trade_summary(_exit_price, _exit_reason, _pnl_pts, now, bar, near_close, far_close)
-                # P1-B durable-exit-intent: gate + ids persisted BEFORE the
-                # signal is emitted (the dispatcher submits via these ids)
+                # P0-1 (codex): Policy-J durable event + intent gate BEFORE
+                # any EXIT_REMAINING / EXIT_* state / shadow-exit mutation —
+                # an append failure must leave NO false "exited" records
                 _ilog = None
                 try:
                     _ilog = _exit_intent_log()
@@ -4406,15 +4385,9 @@ class TMFSpread(StrategyBase):
                         _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT", leg=_rem_leg_s)
                 except Exception:
                     pass  # intent log unavailable → legacy behavior
-                # B48 (codex A/B): SINGLE-LEG Policy J win — durable
-                # POLICY_J_SINGLE_LEG_TRIGGERED decision event BEFORE emission;
-                # append failure ⇒ fail-closed (no signal). The event_id rides
-                # the signal so ORDER_SUBMITTED + pending metadata correlate.
                 _pj_event = None
                 if getattr(_decision, "winner", None) == "POLICY_J_SINGLE_LEG":
                     try:
-                        if _ilog is None:
-                            _ilog = _exit_intent_log()
                         _rel_leg_s = str(getattr(self, "_released_leg", "") or "")
                         _rel_realized = getattr(self, f"_{_rel_leg_s}_realized_override", None)
                         if _rel_realized is None:
@@ -4450,9 +4423,35 @@ class TMFSpread(StrategyBase):
                                                        "COMBINED_EXIT", leg=_rem_leg_s)
                         _pj_event = _ilog.append_event(
                             _iid_for_ev, "POLICY_J_SINGLE_LEG_TRIGGERED", **_pj_fields)
+                        # P1 (codex): persist the correlation on the strategy so
+                        # the confirmed-fill settlement record carries it
+                        self._pj_exit_event_id = _pj_event["event_id"]
+                        self._pj_exit_winner = "POLICY_J_SINGLE_LEG"
                     except Exception:
                         logger.error("[P1B_POLICY_J_EVENT_FAILED] fail-closed — suppressing emission", exc_info=True)
                         return None
+                self._lifecycle = "EXITING"
+                self._log_exit_decision(exit_reason=_exit_reason, pnl=_pnl_pts, bar=bar)
+
+                # 2026-07-23 Gemini CLI: Work Package A - Instrumentation & Provenance Metadata
+                _peak_or_nadir = self._peak if _rem_side == "LONG" else self._nadir
+                _retracement = (_peak_or_nadir - _exit_price) if _rem_side == "LONG" else (_exit_price - _peak_or_nadir)
+                _warmup_elapsed = round((time.monotonic() - self._single_leg_entered_mono) * 1000.0, 1) if self._single_leg_entered_mono > 0 else 0.0
+                _pt = getattr(self, "_single_leg_post_fill_ticks", 0)
+                _warmup_ticks = int(_pt) if isinstance(_pt, (int, float)) else 0
+                
+                self._risk_mode_at_exit = _risk_meta.get("risk_mode", "FIXED_FALLBACK")
+                _risk_meta["risk_mode_at_exit"] = self._risk_mode_at_exit
+                _risk_meta["single_leg_peak_or_nadir"] = round(float(_peak_or_nadir), 2) if _peak_or_nadir > 0 else None
+                _risk_meta["effective_trail_dist"] = _risk_meta.get("final_trail_dist")
+                _risk_meta["calculated_retracement"] = round(float(_retracement), 2) if _peak_or_nadir > 0 else None
+                _risk_meta["trigger_price"] = _exit_price
+                _risk_meta["warmup_elapsed_ms"] = _warmup_elapsed
+                _risk_meta["warmup_tick_count"] = _warmup_ticks
+
+                _append_event("EXIT_REMAINING", reason=_exit_reason, remaining_leg=_rem_leg.value, exit_price=_exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, **_risk_meta)
+                _write_mts_state(has_position=True, action=f"EXIT_{_exit_reason}", reason=_exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
+                self._log_shadow_trade_summary(_exit_price, _exit_reason, _pnl_pts, now, bar, near_close, far_close)
                 return Signal("EXIT", f"TMF_{_exit_reason}", confidence=0.5, stop_loss=0,
                               event_id=_pj_event["event_id"] if _pj_event else "",
                               winner="POLICY_J_SINGLE_LEG" if _pj_event else "")
@@ -4959,7 +4958,10 @@ class TMFSpread(StrategyBase):
                 post_release_mae=_pr_mae,
                 post_release_giveback=_pr_giveback,
                 price_source=_LIVE_TICK,
-                quote_age_ms=0.0
+                quote_age_ms=0.0,
+                # P1 (codex): decision-event correlation rides the fill record
+                event_id=getattr(self, "_pj_exit_event_id", None),
+                winner=getattr(self, "_pj_exit_winner", None),
             )
 
         # 2026-07-01 Gemini CLI: Set in-memory position state to False first to prevent concurrent tick heartbeats from overwriting the file with True.
@@ -4970,7 +4972,7 @@ class TMFSpread(StrategyBase):
         self._peak_net_exit_pnl_twd = 0.0
         for _a in ("_pj_trade_id", "_pj_durable_peak", "_pj_candidate_peak",
                    "_pj_candidate_ts", "_pj_candidate_count", "_pj_last_mark_pair",
-                   "_pj_last_upl"):
+                   "_pj_last_upl", "_pj_exit_event_id", "_pj_exit_winner"):
             if hasattr(self, _a):
                 setattr(self, _a, None)
         # ADR-009 Phase 2 / Task 7: sync lifecycle to FLAT after exit fill

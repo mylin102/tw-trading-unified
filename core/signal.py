@@ -47,4 +47,6 @@ class Signal:
             "quantity": self.quantity,
             "trail_points": self.trail_points,
             "break_even_trigger": self.break_even_trigger,
+            "event_id": self.event_id,
+            "winner": self.winner,
         }
