@@ -48,7 +48,11 @@ def make_intent(log, trade_id="t1", reason="COMBINED_EXIT"):
 
 
 def build_monitor(tmp_path, monkeypatch):
-    """Real FuturesMonitor + released-position TMFSpread (existing-test pattern)."""
+    """Real FuturesMonitor + released-position TMFSpread (existing-test pattern).
+
+    Uses an ABSOLUTE repo config path so chdir(tmp_path) cannot break the
+    config load (codex #6: B19/B23 must fail on integration gap, not config).
+    """
     from unittest.mock import MagicMock
     from datetime import datetime
     from strategies.futures.monitor import FuturesMonitor
@@ -56,9 +60,11 @@ def build_monitor(tmp_path, monkeypatch):
         TMFSpread, PositionPhase, PositionLifecycle, ReleaseGroup,
         ReleaseGroupStatus, TrailGroup, TrailGroupStatus, Leg,
     )
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    config_path = os.path.join(repo_root, "config", "futures_night.yaml")
     api = MagicMock()
     api.Contracts.Futures.TMF = [MagicMock(code="TMFF6", delivery_date="2026-06-17")]
-    monitor = FuturesMonitor(api, "config/futures_night.yaml", dry_run=True)
+    monitor = FuturesMonitor(api, config_path, dry_run=True)
     monitor.ticker = "TMF"
     monitor._use_order_manager = True
     monitor.order_mgr = StubOrderMgr()
@@ -115,7 +121,8 @@ def test_b1_durable_snapshot_ordering_before_submit(tmp_path):
     # intent record + NEAR attempt already durable in the JSONL
     joined_near = "".join(near_raw)
     assert '"trade_id": "t1"' in joined_near
-    assert '"leg": "NEAR"' in joined_near and "SUBMIT_ATTEMPTED" in joined_near
+    assert '"NEAR"' in joined_near and "SUBMIT_ATTEMPTED" in joined_near
+    assert '"FAR"' in joined_near and "NOT_SUBMITTED" in joined_near
     # immediately before FAR submit: FAR=SUBMIT_ATTEMPTED durable
     assert far_intent["legs"]["FAR"]["status"] == "SUBMIT_ATTEMPTED"
     assert "SUBMIT_ATTEMPTED" in "".join(far_raw)
@@ -164,7 +171,6 @@ def test_b5_broker_accepted_no_return_unknown_fail_closed(tmp_path):
     log = make_log(tmp_path)
     mgr = StubOrderMgr()
     iid = make_intent(log)
-    log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="cid-near")
     def ambiguous(cid, leg, **kw):
         raise TimeoutError("network cut")
     with pytest.raises(TimeoutError):
@@ -185,17 +191,27 @@ def test_b6_recovery_query_unavailable_blocks(tmp_path):
     assert outcome["blocked"] is True
 
 
-# ── B7: repeated restart ⇒ idempotent recovery ───────────────────────────
+# ── B7: repeated restart ⇒ idempotent recovery (each restart queries
+#      until resolution; never resubmits) ───────────────────────────────
 def test_b7_repeated_restart_idempotent(tmp_path):
     log = make_log(tmp_path)
     mgr = StubOrderMgr()
     iid = make_intent(log)
     cid = ei.client_order_id("t1", "FAR")
     log.transition(iid, "FAR", "SUBMIT_ATTEMPTED", client_order_id=cid)
+    # three restarts: two while broker query is unavailable, then resolved
+    states = iter([{"status": "UNAVAILABLE"}, {"status": "UNAVAILABLE"},
+                   {"status": "NOT_FOUND"}])
+
+    def qf(qid):
+        mgr.queries.append(qid)
+        return next(states)
+
     for _ in range(3):
-        log.recover(iid, query_fn=mgr.query, order_mgr=mgr)
-    assert mgr.queries.count(cid) >= 3
-    assert mgr.submits == []
+        log.recover(iid, query_fn=qf, order_mgr=mgr)
+    assert mgr.queries.count(cid) == 3  # every restart queried before resolution
+    assert mgr.submits == []  # no duplicate actions across restarts
+    assert log.get(iid)["legs"]["FAR"]["status"] == "NOT_FOUND_CONFIRMED"
 
 
 # ── B8: crash after near attempted; far never attempted ⇒ reachable edge ─
@@ -221,7 +237,9 @@ def test_b9_both_submitted_before_state_write_converges(tmp_path):
     assert log.has_inflight_exit_intent("t1") is False
 
 
-# ── B10: partial fill ⇒ repair child; id+attempt persisted before I/O ────
+# ── B10: partial fill ⇒ repair child; child id persisted BEFORE repair I/O
+#         (repair_complete creates NOT_SUBMITTED child; submit_leg performs
+#         the durable SUBMIT_ATTEMPTED before the repair order) ───────────
 def test_b10_partial_fill_during_recovery_repair_child(tmp_path):
     log = make_log(tmp_path)
     iid = make_intent(log)
@@ -229,9 +247,22 @@ def test_b10_partial_fill_during_recovery_repair_child(tmp_path):
     log.transition(iid, "NEAR", "FILLED")
     log.transition(iid, "FAR", "SUBMIT_ATTEMPTED", client_order_id="cid-far")
     child = log.repair_complete(iid, "FAR", reason="PARTIAL_FILL")
-    cid = log.get(child["intent_id"])["legs"]["FAR"]["client_order_id"]
-    assert log.get(child["intent_id"])["legs"]["FAR"]["status"] == "SUBMIT_ATTEMPTED"
-    assert cid != "cid-far"
+    child_id = child["intent_id"]
+    assert child["parent"] == iid
+    cid = log.get(child_id)["legs"]["FAR"]["client_order_id"]
+    assert log.get(child_id)["legs"]["FAR"]["status"] == "NOT_SUBMITTED"
+    assert cid != "cid-far"  # NEW child id, persisted pre-I/O
+    # canonical submit: durable SUBMIT_ATTEMPTED before the repair order
+    mgr = StubOrderMgr()
+    seen = {}
+
+    def hook(leg, cid_, iid_):
+        seen["status_at_hook"] = log.get(iid_)["legs"]["FAR"]["status"]
+        seen["id_at_hook"] = cid_
+
+    log.submit_leg(child_id, "FAR", mgr, submit_hook=hook)
+    assert seen["status_at_hook"] == "SUBMIT_ATTEMPTED"  # durable BEFORE I/O
+    assert seen["id_at_hook"] == cid
 
 
 # ── B11: idempotency key duplicate ⇒ rejected, ONE fill ──────────────────
@@ -245,20 +276,23 @@ def test_b11_idempotency_key_dedup(tmp_path):
     assert len(mgr.submits) == 1
 
 
-# ── B12: repair complete_exit uses the PERSISTED child id ────────────────
+# ── B12: repair complete_exit uses the PERSISTED child id (submit_leg does
+#         the durable attempt before I/O) ────────────────────────────────
 def test_b12_near_ok_far_rejected_repair_complete(tmp_path):
     log = make_log(tmp_path)
     mgr = StubOrderMgr()
     iid = make_intent(log)
+    log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="c-near")
     log.transition(iid, "NEAR", "FILLED")
+    log.transition(iid, "FAR", "SUBMIT_ATTEMPTED", client_order_id="c-far")
     log.transition(iid, "FAR", "REJECTED")
     child = log.repair_complete(iid, "FAR", reason="REJECTED")
     child_id = child["intent_id"]
     persisted_cid = log.get(child_id)["legs"]["FAR"]["client_order_id"]
-    assert log.get(child_id)["legs"]["FAR"]["status"] == "SUBMIT_ATTEMPTED"
+    assert log.get(child_id)["legs"]["FAR"]["status"] == "NOT_SUBMITTED"
     log.submit_leg(child_id, "FAR", mgr)
     assert len(mgr.submits) == 1
-    assert mgr.submits[0]["client_order_id"] == persisted_cid
+    assert mgr.submits[0]["client_order_id"] == persisted_cid  # persisted id used
     assert persisted_cid != "cid-far"
 
 
@@ -267,7 +301,9 @@ def test_b13_far_cancelled_repair_no_orphan(tmp_path):
     log = make_log(tmp_path)
     mgr = StubOrderMgr()
     iid = make_intent(log)
+    log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="c-near")
     log.transition(iid, "NEAR", "FILLED")
+    log.transition(iid, "FAR", "SUBMIT_ATTEMPTED", client_order_id="c-far")
     log.transition(iid, "FAR", "CANCELLED")
     child = log.repair_complete(iid, "FAR", reason="CANCELLED")
     log.submit_leg(child["intent_id"], "FAR", mgr)
@@ -303,6 +339,7 @@ def test_b15_pregate_suppresses_duplicates(tmp_path):
 def test_b16_unknown_blocks_but_emergency_works(tmp_path):
     log = make_log(tmp_path)
     iid = make_intent(log)
+    log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="c")
     log.transition(iid, "NEAR", "UNKNOWN")
     assert log.entry_allowed("t1") is False
     assert log.exit_trigger_allowed("t1") is False
@@ -314,6 +351,7 @@ def test_b17_state_write_failure_intent_authority(tmp_path):
     log = make_log(tmp_path)
     iid = make_intent(log)
     for leg in ("NEAR", "FAR"):
+        log.transition(iid, leg, "SUBMIT_ATTEMPTED", client_order_id=f"c-{leg}")
         log.transition(iid, leg, "SUBMITTED", broker_order_id=f"O-{leg}")
     assert log.get(iid)["legs"]["NEAR"]["status"] == "SUBMITTED"
     assert log.has_inflight_exit_intent("t1") is True
@@ -325,8 +363,9 @@ def test_b18_compaction_gated_by_durable_terminal(tmp_path):
     iid = make_intent(log)
     with pytest.raises(ei.IntentNotTerminalError):
         log.archive(iid)
-    log.transition(iid, "NEAR", "FILLED")
-    log.transition(iid, "FAR", "FILLED")
+    for leg in ("NEAR", "FAR"):
+        log.transition(iid, leg, "SUBMIT_ATTEMPTED", client_order_id=f"c-{leg}")
+        log.transition(iid, leg, "FILLED")
     log.mark_terminal(iid, "COMPLETED")
     log.archive(iid)
     assert iid in log.archive_index()
@@ -479,6 +518,10 @@ def test_b24_repair_child_crash_before_send(tmp_path):
     mgr = StubOrderMgr()
     iid = make_intent(log)
     child = log.repair_complete(iid, "FAR", reason="REJECTED")
+    cid = log.get(child["intent_id"])["legs"]["FAR"]["client_order_id"]
+    # crash state: child durably SUBMIT_ATTEMPTED, send never happened
+    log.transition(child["intent_id"], "FAR", "SUBMIT_ATTEMPTED",
+                   client_order_id=cid)
     log2 = ei.IntentLog(str(tmp_path))
     outcome = log2.recover(child["intent_id"], query_fn=lambda c: {"status": "NOT_FOUND"})
     assert outcome["legs"]["FAR"]["status"] == "NOT_FOUND_CONFIRMED"
@@ -584,3 +627,120 @@ def test_b31_emergency_supersede_write_failure_fail_closed(tmp_path, monkeypatch
     with pytest.raises(OSError):
         log.emergency_supersede(iid, mgr)
     assert mgr.submits == [] and mgr.cancels == []
+
+
+# ── B32: submit_leg from SUBMIT_ATTEMPTED is REJECTED (no re-send without
+#         an authoritative query — codex #1) ─────────────────────────────
+def test_b32_submit_leg_rejects_already_attempted(tmp_path):
+    log = make_log(tmp_path)
+    mgr = StubOrderMgr()
+    iid = make_intent(log)
+    log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="cid")
+    with pytest.raises(ei.DuplicateSubmitError):
+        log.submit_leg(iid, "NEAR", mgr)  # attempted ⇒ recovery must query
+    assert mgr.submits == []
+    # SUBMITTED/UNKNOWN also rejected
+    log.transition(iid, "NEAR", "UNKNOWN")
+    with pytest.raises(ei.DuplicateSubmitError):
+        log.submit_leg(iid, "NEAR", mgr)
+    assert mgr.submits == []
+
+
+# ── B33: illegal state transitions are rejected (never FILLED→attempted) ─
+def test_b33_illegal_transition_rejected(tmp_path):
+    log = make_log(tmp_path)
+    iid = make_intent(log)
+    log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="c")
+    log.transition(iid, "NEAR", "FILLED")
+    with pytest.raises(ei.IllegalTransitionError):
+        log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED")  # FILLED→attempted
+    with pytest.raises(ei.IllegalTransitionError):
+        log.transition(iid, "NEAR", "SUBMITTED")  # FILLED→SUBMITTED
+    assert log.get(iid)["legs"]["NEAR"]["status"] == "FILLED"  # unchanged
+
+
+# ── B34: public mutation race — concurrent mark_terminal/transitions
+#         serialize (internal lock), version monotonic, no lost update ────
+def test_b34_public_mutation_race_serialized(tmp_path):
+    log = make_log(tmp_path)
+    iid = make_intent(log)
+    barrier = threading.Barrier(3)
+    errors = []
+
+    def worker():
+        barrier.wait()
+        try:
+            for _ in range(5):
+                log.mark_terminal(iid, "T")  # legal from any state
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    ts = [threading.Thread(target=worker) for _ in range(2)]
+    for t in ts:
+        t.start()
+    barrier.wait()
+    for t in ts:
+        t.join()
+    assert errors == []
+    # 2 workers × 5 mutations + the initial create row = version 11
+    assert log.get(iid)["version"] == 1 + 2 * 5  # no lost updates
+
+
+# ── B35: child repair race — concurrent repair_complete yields DISTINCT
+#         child ids (uuid nonce, no collision) ───────────────────────────
+def test_b35_child_repair_race_distinct_ids(tmp_path):
+    log = make_log(tmp_path)
+    iid = make_intent(log)
+    barrier = threading.Barrier(3)
+    children = []
+
+    def worker():
+        barrier.wait()
+        child = log.repair_complete(iid, "FAR", reason="RACE")
+        children.append(child["intent_id"])
+
+    ts = [threading.Thread(target=worker) for _ in range(2)]
+    for t in ts:
+        t.start()
+    barrier.wait()
+    for t in ts:
+        t.join()
+    assert len(children) == 2
+    assert children[0] != children[1]  # distinct ids
+
+
+# ── B36: id collision resistance — many creates yield unique ids ────────
+def test_b36_intent_id_collision_resistance(tmp_path):
+    log = make_log(tmp_path)
+    ids = set()
+    for i in range(60):
+        try:
+            ids.add(log.create(f"t{i % 3}", "COMBINED_EXIT"))
+        except ei.IntentCapacityError:
+            break
+    assert len(ids) <= ei.MAX_ACTIVE_INTENTS  # capacity fail-closed
+    assert len(ids) == len(set(ids))  # all distinct (uuid, no collision)
+
+
+# ── B37: attempted exit with NO fill (both legs rejected) ⇒ FAILED_NO_FILL,
+#         never silently COMPLETED (codex #5) ────────────────────────────
+def test_b37_failed_dual_leg_not_completed(tmp_path):
+    log = make_log(tmp_path)
+    iid = make_intent(log)
+    for leg in ("NEAR", "FAR"):
+        log.transition(iid, leg, "SUBMIT_ATTEMPTED", client_order_id=f"c-{leg}")
+    outcome = log.recover(iid, query_fn=lambda c: {"status": "REJECTED"})
+    assert outcome["terminal"] == "FAILED_NO_FILL"
+    assert log.has_inflight_exit_intent("t1") is True  # position still open
+
+
+# ── B38: one leg FILLED + other REJECTED ⇒ PARTIAL (repair needed) ───────
+def test_b38_partial_fill_terminal(tmp_path):
+    log = make_log(tmp_path)
+    iid = make_intent(log)
+    for leg in ("NEAR", "FAR"):
+        log.transition(iid, leg, "SUBMIT_ATTEMPTED", client_order_id=f"c-{leg}")
+    states = {"NEAR": "FILLED", "FAR": "REJECTED"}
+    outcome = log.recover(iid, query_fn=lambda c: {"status": states[c.split("-")[1]]})
+    assert outcome["terminal"] == "PARTIAL"
+    assert log.has_inflight_exit_intent("t1") is True  # repair still pending
