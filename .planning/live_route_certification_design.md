@@ -1,10 +1,23 @@
-# Live Route Certification — 設計文件 v4（design + RED tests only）
+# Live Route Certification — 設計文件 v5（design + RED tests only）
 
-**狀態**: DESIGN v4（codex round-5 B1-B6 修正；本 phase 只交付設計 + RED v4，**不接線**）
+**狀態**: DESIGN v5（codex round-6 P0-auth/P0-margin + route 斷言修正；本 phase 只交付
+capability map + 設計 + RED v5，**不接線**）
 **範圍**: `core/live_route_certificate.py`（新模組，proposal）+ `core/mode_transition.py` /
 `core/live_broker_preflight.py` 的整合點。**不修改** monitor / order manager / production
 routing；**不觸碰** authority projection 與 historical-audit 檔案。
 **PAPER 必須維持現狀**：不切 config mode、不送/改/撤真單、不 deploy/restart/push。
+**v5 變更（round-6）**：P0-auth — auth adapter 改以 **Shioaji 1.7.0 實證 surface**
+定義（見 `shioaji_capability_map.md`）：`futopt_account` 有效 **AND**
+`list_accounts()` live 查詢非空 **AND** session epoch（系統 login wrapper 註冊）
+一致；login_token/account/authenticated 等假想屬性**全部移除**。P0-margin —
+`margin_rates` 證實不存在 → `margin_source_for` = **CONFIG_FLOOR only**
+（reviewed pair-level floor，綁定 config commit/version；缺省/無效 fail-closed）；
+account capacity 仍由 `api.margin(account)` 提供。新增 route 斷言：
+issuer 綁定 canonical facts + **session epoch**；transition 拒收「同 nonce/issuer
+但被竄改」的 cert（facts 由 **in-process runtime context** 重推導，非 cert/
+caller 提供）；失敗 transition → **回傳顯式 LIVE_QUARANTINED ctx + audit reason**
+（非僅 raise）；restart → 無任何 persisted snapshot/reconstructed issuer 可驗證
+舊 cert；call-site 掃描改 **AST/import-aware**（斷言 monitor.py:522 已知呼叫移除）。
 **v4 變更（B1-B6）**：B1 transition_with_certificate 在 redeem 前**原子地**驗證全部
 fact（freshness/account/contracts/provider/session）；失敗 → 不達 LIVE_READY、
 ctx 維持 non-ready、nonce **preserve**（不消費、不意外授權重試）；B2 關閉 legacy 旁路 —
@@ -112,25 +125,36 @@ def required_margin_for(product="TMF", *, per_lot_margin=100_000.0,
 ```python
 MARGIN_SOURCE_VERSION = 1
 def margin_source_for(api, product="TMF", *, config_floor=100_000.0) -> dict:
-    """per-lot margin 的權威來源：
-    1) broker 支援的 margin query（api.margin_rates / 等效訊號）存在 →
-       BROKER_MARGIN_QUERY；2) 否則 → CONFIG_FLOOR（經審查的 config 下限）。
+    """per-pair margin 的權威來源（v5 — capability map 修正）：
+    Shioaji 1.7.0 **無任何 per-contract margin rate 介面**（margin_rates 證實
+    不存在）→ 唯一來源 = CONFIG_FLOOR（reviewed pair-level floor，
+    config/futures.yaml 的明確參數），綁定 config commit SHA + version。
     驗證：finite positive；product ∈ 已知產品集；near/far 適用性。
-    → {"source": "BROKER_MARGIN_QUERY"|"CONFIG_FLOOR", "version": 1,
-       "per_lot_margin": x, "product": product}"""
+    → {"source": "CONFIG_FLOOR", "version": 1, "config_commit": <sha>,
+       "per_pair_margin": x, "product": product}
+    config floor 缺省 / <=0 / NaN / 未知 product → raise（fail-closed）"""
 ```
-- cert 綁定 `margin_source` + `margin_source_version` + `required_margin`
-  （= 2 × per_lot × (1+buffer)）；validation 以目前 `margin_source_for()` 比對 —
-  source/值/版本改變 → SOURCE_MISMATCH
-- config_floor <= 0 / NaN / 未知 product → source 無效 → fail
+- cert 綁定 `margin_source` + `margin_source_version` + `config_commit` +
+  `required_margin`（= per_pair × (1+buffer)）；validation 以目前
+  `margin_source_for()` 比對 — config commit / 值 / 版本改變 → SOURCE_MISMATCH
+- **account capacity**（可用保證金）仍由 `api.margin(account)` 提供（preflight）
+- 不得 call 任何未證實的 broker margin 介面（capability map §3）
 
-### authenticated-session adapter（B4，取代 api.authenticated 慣例）
+### authenticated-session adapter（v5，Shioaji 實證 surface）
 ```python
 def is_authenticated_session(api) -> bool:
-    """Shioaji session 訊號 strict allowlist（無樂觀 fallback）：
-    login_token / account / futopt_account — 任一存在即視為已認證；
-    全部缺失 → False；任何訊號查詢 exception → False（fail-closed）。"""
+    """Shioaji 1.7.0 實證 surface（strict，無樂觀 fallback）：
+    (A) api.futopt_account 為有效 Account 物件
+    (B) api.list_accounts() live 查詢回傳非空
+    (C) session epoch 與系統 login wrapper 註冊值一致
+    任一缺失/exception → False（fail-closed）。
+    不得使用 login_token/account/authenticated（證實不存在）。"""
 ```
+- session epoch：`core/shioaji_session.py` 的 `_login()` 成功後註冊
+  `SESSION_EPOCH_BY_API[id(api)] = time.time()`（實作階段新增）；
+  cert 綁定 epoch — reconnect → 新 epoch → 舊 cert 失效
+- 登入證據 = (A)+(B)+(C) **AND** futopt_account 有效（單靠 account 物件
+  存在不再是登入證明 — 正是要取代的弱條件）
 
 ### authenticated-session 斷言（L4）
 - certify 前必須確認 api session 為已認證（Shioaji-appropriate：
@@ -187,13 +211,22 @@ def is_authenticated_session(api) -> bool:
 - **B2 legacy 旁路關閉**：`transition_to_live_ready(ctx, [])` 無 cert →
   **LIVE_QUARANTINED**（不再放行）；`with_effective_mode` 為 internal —
   任何 public route 不得暴露 LIVE_READY bypass；production call-site 掃描測試
-- **B1 原子驗證**：`transition_with_certificate` 在 redeem 前驗證全部
-  fact（freshness/account/contracts/provider/session）；任一失敗 →
-  raise + ctx 維持 non-ready + **nonce preserve**（不消費 — 失敗不授權重試；
-  成功才 redeem 消費一次）→ LIVE_READY
+- **B1/v5 原子驗證**：`transition_with_certificate` 在 redeem 前驗證全部
+  fact（freshness/account/contracts/margin-source/session-epoch）— **facts 由
+  in-process runtime context 重推導**（current account hash、near/far codes、
+  margin source、session epoch），**非** cert/test/caller 提供；
+  「同 nonce/issuer 但被竄改」的 cert → 拒收（非ce 只證明發行，facts 仍須
+  與 runtime 一致）；任一失敗 → **回傳顯式 LIVE_QUARANTINED ctx + audit
+  reason**（不單 raise）+ **nonce preserve**；成功才 redeem 消費一次 → LIVE_READY
 - **B5 TOCTOU**：validate 與 transition 之間 issuer.invalidate_all()/
   reconnect → redeem 失敗 → 不得 LIVE_READY；成功 transition 恰好消費一次 —
   第二次 transition 同 cert → NONCE_UNKNOWN
+- **restart（v5）**：無任何 persisted snapshot / reconstructed issuer 能
+  驗證或 transition 舊 cert — 重啟後 issuer registry 為空 → 舊 nonce 全滅；
+  唯一路徑 = 新 process 內重新 certify（fresh in-process cert）
+- **call-site 掃描（v5）**：AST/import-aware — 解析 `strategies/futures/
+  monitor.py` 的 AST，斷言 module 內無 `transition_to_live_ready` Call 節點
+  （或精確斷言 monitor.py:522 已知呼叫已移除）；substring 掃描不足
 - **PAPER requested mode 不得消費 cert**：`paper_context()` 行為不變；
   cert 只在 LIVE 路徑存在，PAPER 下 `assert_live_order_allowed()` 仍 raise
 - 認證流程中**禁止任何 order/cancel/modify API 呼叫**（測試以 recording api 證明）
