@@ -5,8 +5,9 @@ test_exit_attribution_stats.py::test_sign_test_3pos4neg_exact.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from math import comb
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 def exact_sign_test_p(deltas: List[float]) -> Optional[float]:
@@ -48,19 +49,27 @@ def fixed_event_latency_quote(
     delay_s: float,
     window_s: float = 10.0,
     side: str = "SELL",
-):
+) -> Tuple[Optional[float], str, Optional[str]]:
     """Pure fixed-event latency (design §6): FIRST valid observation at/after
-    release_ts + delay_s, within a bounded window. No valid observation in the
-    window -> (None, "NOT_AVAILABLE"). This is NOT a worst-of-two envelope.
+    release_ts + delay_s, within a bounded window.
+
+    Side-aware (codex blocker #5): BUY values the ask, SELL values the bid;
+    last price is used ONLY as a proxy and reported as source 'last_price'.
+    Returns (price, ts_or_NOT_AVAILABLE, source).
     """
-    start = release_ts + __import__("datetime").timedelta(seconds=delay_s)
-    end = start + __import__("datetime").timedelta(seconds=window_s)
+    s = (side or "").strip().upper()
+    start = release_ts + timedelta(seconds=delay_s)
+    end = start + timedelta(seconds=window_s)
     for t in ticks:
-        if t["ts"] >= start and t["ts"] <= end:
-            px = t.get("ask") or t.get("bid") or t.get("price")
-            if px:
-                return float(px), str(t.get("ts"))
-    return None, "NOT_AVAILABLE"
+        if not (start <= t["ts"] <= end):
+            continue
+        if s == "BUY" and (t.get("ask") or 0) > 0:
+            return float(t["ask"]), str(t["ts"]), "ask"
+        if s == "SELL" and (t.get("bid") or 0) > 0:
+            return float(t["bid"]), str(t["ts"]), "bid"
+        if t.get("price"):
+            return float(t["price"]), str(t["ts"]), "last_price"
+    return None, "NOT_AVAILABLE", None
 
 
 def adversarial_latency_envelope(
