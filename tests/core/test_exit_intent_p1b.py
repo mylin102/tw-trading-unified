@@ -517,18 +517,22 @@ def test_b21_two_instances_concurrent_single_action(tmp_path):
 
 # ── B22: foreign owner → owner-verified reclaim → second process acquires ─
 def test_b22_restart_overlap_owner_verified(tmp_path):
+    import socket
     log = make_log(tmp_path)
-    log._force_lock_owner({"pid": 99999, "start_token": "tokA", "host": "h",
-                           "acquired_at": time.time()})
+    log._force_lock_owner({"pid": 99999, "start_token": "tokA",
+                           "host": socket.gethostname(), "acquired_at": time.time()})
     # owner_check: OLD process dead (alive=False) ⇒ reclaim + acquire
-    acquired = log.try_acquire({"pid": os.getpid(), "start_token": "tokB", "host": "h"},
+    acquired = log.try_acquire({"pid": os.getpid(), "start_token": "tokB",
+                                "host": socket.gethostname()},
                                owner_check_fn=lambda pid, token: {"alive": False})
     assert acquired is True
     assert log.lock_owner()["pid"] == os.getpid()
     # healthy foreign owner (alive=True) ⇒ acquisition refused
-    log._force_lock_owner({"pid": 77777, "start_token": "alive", "host": "h"})
+    log._force_lock_owner({"pid": 77777, "start_token": "alive",
+                           "host": socket.gethostname()})
     with pytest.raises(ei.LockBusyError):
-        log.try_acquire({"pid": os.getpid(), "start_token": "tokC", "host": "h"},
+        log.try_acquire({"pid": os.getpid(), "start_token": "tokC",
+                         "host": socket.gethostname()},
                         owner_check_fn=lambda pid, token: {"alive": True})
 
 
@@ -648,12 +652,14 @@ def test_b28_cas_stale_transition_rejected(tmp_path):
 
 # ── B29: healthy owner with slow I/O is NOT stolen (age only alerts) ─────
 def test_b29_healthy_owner_not_stolen(tmp_path):
+    import socket
     log = make_log(tmp_path)
     acquired_at = time.time() - 9999  # older than ANY age threshold
-    log._force_lock_owner({"pid": os.getpid(), "start_token": "mine", "host": "h",
-                           "acquired_at": acquired_at})
+    log._force_lock_owner({"pid": os.getpid(), "start_token": "mine",
+                           "host": socket.gethostname(), "acquired_at": acquired_at})
     with pytest.raises(ei.LockBusyError):  # refusal despite age
-        log.try_acquire({"pid": 8888, "start_token": "other", "host": "h"},
+        log.try_acquire({"pid": 8888, "start_token": "other",
+                         "host": socket.gethostname()},
                         owner_check_fn=lambda pid, token: {"alive": True},  # owner alive
                         age_alert_threshold_s=1)
     assert log.lock_owner()["pid"] == os.getpid()  # not stolen
@@ -663,19 +669,24 @@ def test_b29_healthy_owner_not_stolen(tmp_path):
 #         live PID with MATCHING token refuses (owner_check returns the
 #         CURRENT start token) ────────────────────────────────────────────
 def test_b30_pid_reuse_start_token_mismatch_reclaimable(tmp_path):
+    import socket
     log = make_log(tmp_path)
-    log._force_lock_owner({"pid": 4242, "start_token": "old-boot-token", "host": "h"})
+    log._force_lock_owner({"pid": 4242, "start_token": "old-boot-token",
+                           "host": socket.gethostname()})
     # PID 4242 is ALIVE (alive=true) but its current token differs from the
     # recorded one ⇒ the recorded owner is an old incarnation ⇒ reclaimable
-    acquired = log.try_acquire({"pid": 9999, "start_token": "new-token", "host": "h"},
+    acquired = log.try_acquire({"pid": 9999, "start_token": "new-token",
+                                "host": socket.gethostname()},
                                owner_check_fn=lambda pid, token: {"alive": True,
                                                                   "start_token": "new-token"})
     assert acquired is True
     assert log.lock_owner()["start_token"] == "new-token"
     # live PID with MATCHING token ⇒ owner is genuinely alive ⇒ refuse
-    log._force_lock_owner({"pid": 5555, "start_token": "same", "host": "h"})
+    log._force_lock_owner({"pid": 5555, "start_token": "same",
+                           "host": socket.gethostname()})
     with pytest.raises(ei.LockBusyError):
-        log.try_acquire({"pid": 9998, "start_token": "x", "host": "h"},
+        log.try_acquire({"pid": 9998, "start_token": "x",
+                         "host": socket.gethostname()},
                         owner_check_fn=lambda pid, token: {"alive": True,
                                                            "start_token": "same"})
 
@@ -822,12 +833,13 @@ def test_b39_live_foreign_same_token_not_reclaimed(tmp_path):
     log = make_log(tmp_path)
     lock_path = str(tmp_path / "intent.lock")
     code = (
-        "import json,os,sys,time,subprocess\n"
+        "import json,os,sys,time,subprocess,socket\n"
         "pid=os.getpid()\n"
         "r=subprocess.run(['ps','-o','lstart=','-p',str(pid)],"
         "capture_output=True,text=True)\n"
         "tok=f'{pid}:{r.stdout.strip()}'\n"
-        "open(sys.argv[1],'w').write(json.dumps({'pid':pid,'start_token':tok}))\n"
+        "open(sys.argv[1],'w').write(json.dumps("
+        "{'pid':pid,'start_token':tok,'host':socket.gethostname()}))\n"
         "time.sleep(10)\n"
     )
     child = sp.Popen([sys.executable, "-c", code, lock_path])
@@ -850,23 +862,69 @@ def test_b39_live_foreign_same_token_not_reclaimed(tmp_path):
 
 # ── B40: LIVE pid with a STALE recorded token (PID reuse) ⇒ reclaimed ────
 def test_b40_foreign_mismatch_reclaimed(tmp_path):
+    import socket
     log = make_log(tmp_path)
     # stale token recorded for a live pid (the OS token no longer matches)
     log._force_lock_owner({"pid": os.getpid(),
-                           "start_token": f"{os.getpid()}:stale-token"})
+                           "start_token": f"{os.getpid()}:stale-token",
+                           "host": socket.gethostname()})
     with log._file_lock():
         assert log.lock_owner()["pid"] == os.getpid()
 
 
 # ── B41: UNVERIFIABLE owner query ⇒ fail-closed LOCK_BUSY, never reclaim ─
 def test_b41_unknown_owner_check_fail_closed(tmp_path, monkeypatch):
+    import socket
     log = make_log(tmp_path)
-    log._force_lock_owner({"pid": 12345, "start_token": "x"})
+    log._force_lock_owner({"pid": 12345, "start_token": "x",
+                           "host": socket.gethostname()})
     monkeypatch.setattr(ei, "_os_start_token",
                         lambda pid: ("unknown", None))
     with pytest.raises(ei.LockBusyError):
         with log._file_lock():
             pass
+
+
+# ── B43: REMOTE-host lock is NEVER reclaimed, even if the local PID is
+#         absent/reused (shared-runtime safety) ──────────────────────────
+def test_b43_remote_host_lock_never_reclaimed(tmp_path):
+    log = make_log(tmp_path)
+    # remote healthy owner, same numeric PID as a locally-absent process
+    log._force_lock_owner({"pid": 424242, "start_token": "remote-tok",
+                           "host": "some-other-host.example"})
+    with pytest.raises(ei.LockBusyError):
+        with log._file_lock():
+            pass
+    # try_acquire path must behave identically
+    with pytest.raises(ei.LockBusyError):
+        log.try_acquire({"pid": os.getpid(), "start_token": "x",
+                         "host": "local"},
+                        owner_check_fn=lambda pid, token: {"alive": False})
+    assert log.lock_owner()["host"] == "some-other-host.example"  # untouched
+
+
+# ── B44: intent_version generation fence — a stale lock holder whose intent
+#         advanced under it fails with StaleVersionError before any durable
+#         transition/submit ──────────────────────────────────────────────
+def test_b44_stale_lock_holder_fails_stale_version(tmp_path):
+    log = make_log(tmp_path)
+    iid = make_intent(log)
+    cm = log._file_lock(intent_id=iid)
+    cm.__enter__()
+    try:
+        meta = log.lock_owner()
+        assert meta.get("intent_version") == log.get(iid)["version"]
+        # external writer advances the intent (bypassing the lock — the
+        # split-brain the fence guards against)
+        cur = log.get(iid)
+        rec = dict(cur)
+        rec["version"] = cur["version"] + 1
+        ei._atomic_append(log.log_path, rec)
+        with pytest.raises(ei.StaleVersionError):
+            log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED",
+                           client_order_id="c")
+    finally:
+        cm.__exit__(None, None, None)
 
 
 # ── B42: crash-tail malformed record ⇒ CorruptLogError fail-closed (never

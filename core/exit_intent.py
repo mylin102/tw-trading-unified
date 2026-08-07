@@ -49,6 +49,9 @@ _ALLOWED = {
 # different import-time seed) — owner-verified reclaim uses it
 _PROCESS_TOKEN = f"{os.getpid()}-{int(time.time() * 1_000_000)}"
 
+# per-lock-path holder registry for same-thread reentrancy
+_LOCK_HELD: Dict[str, dict] = {}
+
 
 class IntentError(Exception):
     pass
@@ -215,14 +218,20 @@ class IntentLog:
                 if r.get("terminal") in (None, "PARTIAL", "FAILED_NO_FILL")]
 
     # ── durable lock (design §1.7: owner-verified; age never authorizes) ─
-    def _lock_meta(self) -> dict:
+    def _lock_meta(self, intent_id: Optional[str] = None) -> dict:
         state, token = _os_start_token(os.getpid())
+        v = 0
+        if intent_id is not None:
+            try:
+                v = self.get(intent_id)["version"]
+            except KeyError:
+                v = 0
         return {"pid": os.getpid(),
                 "start_token": token or _PROCESS_TOKEN,
-                "host": socket.gethostname(), "acquired_at": time.time()}
+                "host": socket.gethostname(), "acquired_at": time.time(),
+                "intent_version": v}
 
-    def _write_lock(self, fd) -> None:
-        meta = self._lock_meta()
+    def _write_lock(self, fd, meta: dict) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
             fh.flush()
@@ -240,15 +249,29 @@ class IntentLog:
         if own is None:
             return
         if own.get("pid") == os.getpid() and \
-                own.get("start_token") == self._lock_meta()["start_token"]:
+                own.get("start_token") == self._lock_meta()["start_token"] and \
+                own.get("host") == socket.gethostname():
             try:
                 os.unlink(self.lock_path)
             except OSError:
                 pass
 
     @contextmanager
-    def _file_lock(self):
-        """Cross-process exclusive lock with owner-verified reclaim."""
+    def _file_lock(self, intent_id: Optional[str] = None):
+        """Cross-process exclusive lock with owner-verified reclaim.
+
+        Reentrant for the SAME thread (mirrors the RLock); different threads
+        or processes contend via the O_EXCL file. Host mismatch on the
+        recorded owner ⇒ fail-closed (a remote healthy owner with the same
+        numeric PID must never be reclaimed)."""
+        entry = _LOCK_HELD.get(self.lock_path)
+        if entry is not None and entry["thread"] == threading.get_ident():
+            entry["depth"] += 1
+            try:
+                yield
+            finally:
+                entry["depth"] -= 1
+            return
         while True:
             try:
                 fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -259,6 +282,11 @@ class IntentLog:
                     # empty/partial lock file (writer mid-flight) or corrupt:
                     # NEVER reclaim — fail-closed (codex: unknown ⇒ LOCK_BUSY)
                     raise LockBusyError("lock file unreadable (writer in flight?)")
+                if owner.get("host") != socket.gethostname():
+                    # remote host with the same numeric PID must NEVER be
+                    # judged by local ps (codex B43)
+                    raise LockBusyError(
+                        f"lock held on remote host {owner.get('host')}")
                 verdict = _default_owner_check(owner.get("pid"),
                                                owner.get("start_token"))
                 state = verdict.get("state")
@@ -279,21 +307,35 @@ class IntentLog:
                     except OSError:
                         pass
                 continue  # retry acquire
-            self._write_lock(fd)
+            self._write_lock(fd, self._lock_meta(intent_id))
+            _LOCK_HELD[self.lock_path] = {"thread": threading.get_ident(),
+                                          "depth": 1}
             try:
                 yield
             finally:
+                _LOCK_HELD.pop(self.lock_path, None)
                 self._release_lock()
             return
 
-    def _locked(self, fn: Callable, *a, **k):
+    def _locked(self, fn: Callable, *a, intent_id: Optional[str] = None, **k):
         with self._mutex:
-            with self._file_lock():
+            with self._file_lock(intent_id=intent_id):
+                if intent_id is not None:
+                    # generation fence (codex B44): the version recorded in the
+                    # lock meta must match the intent NOW; drift ⇒ stale holder
+                    meta = self._read_owner() or {}
+                    expected = meta.get("intent_version")
+                    if expected is not None and \
+                            self.get(intent_id)["version"] != expected:
+                        raise StaleVersionError(
+                            f"intent {intent_id} version drifted "
+                            f"(lock expected {expected})")
                 return fn(*a, **k)
 
     def try_acquire(self, meta: dict, owner_check_fn: Optional[Callable] = None,
                     age_alert_threshold_s: Optional[float] = None) -> bool:
-        """Public lock API for tests/operators. owner_check_fn(pid, token)
+        """TEST/OPERATOR-only lock API — shares the same fsync + host-check
+        + owner-verified semantics as _file_lock. owner_check_fn(pid, token)
         returns {"alive": bool, "start_token": <current>|None}."""
         while True:
             try:
@@ -301,15 +343,19 @@ class IntentLog:
             except FileExistsError:
                 owner = self._read_owner()
                 reclaim = False
-                if owner is not None and owner_check_fn is not None:
-                    verdict = owner_check_fn(owner.get("pid"),
-                                             owner.get("start_token")) or {}
-                    alive = bool(verdict.get("alive", False))
-                    token = verdict.get("start_token")
-                    if alive and token is not None and token != owner.get("start_token"):
-                        reclaim = True  # PID reused
-                    elif not alive:
-                        reclaim = True
+                if owner is not None:
+                    if owner.get("host") != socket.gethostname():
+                        raise LockBusyError(
+                            f"lock held on remote host {owner.get('host')}")
+                    if owner_check_fn is not None:
+                        verdict = owner_check_fn(owner.get("pid"),
+                                                 owner.get("start_token")) or {}
+                        alive = bool(verdict.get("alive", False))
+                        token = verdict.get("start_token")
+                        if alive and token is not None and token != owner.get("start_token"):
+                            reclaim = True  # PID reused
+                        elif not alive:
+                            reclaim = True
                 # owner unreadable or no owner_check → fail-closed, no reclaim
                 if not reclaim:
                     raise LockBusyError(
@@ -320,8 +366,9 @@ class IntentLog:
                     except OSError:
                         pass
                 continue
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(meta, ensure_ascii=False))
+            rec = dict(meta)
+            rec.setdefault("host", socket.gethostname())
+            self._write_lock(fd, rec)
             return True
 
     def lock_owner(self) -> dict:
@@ -403,7 +450,8 @@ class IntentLog:
                    broker_order_id: Optional[str] = None,
                    expect_version: Optional[int] = None) -> None:
         self._locked(self._transition_locked, intent_id, leg, status,
-                     client_order_id, broker_order_id, expect_version)
+                     client_order_id, broker_order_id, expect_version,
+                     intent_id=intent_id)
 
     def mark_terminal(self, intent_id: str, status: str) -> None:
         def _do():
@@ -412,7 +460,7 @@ class IntentLog:
             rec["version"] = cur.get("version", 1) + 1
             rec["terminal"] = status
             _atomic_append(self.log_path, rec)
-        self._locked(_do)
+        self._locked(_do, intent_id=intent_id)
 
     def submit_leg(self, intent_id: str, leg: str, order_mgr,
                    submit_fn: Optional[Callable] = None,
@@ -442,7 +490,7 @@ class IntentLog:
             self._transition_locked(intent_id, leg, "SUBMITTED",
                                     broker_order_id=oid)
             return {"intent_id": intent_id, "order_id": oid}
-        return self._locked(_do)
+        return self._locked(_do, intent_id=intent_id)
 
     def repair_complete(self, intent_id: str, leg: str, reason: str) -> dict:
         def _do():
@@ -462,7 +510,7 @@ class IntentLog:
             return {"intent_id": child["intent_id"], "parent": intent_id,
                     "nonce": child["intent_id"].split("-")[-1],
                     "legs": child["legs"]}
-        return self._locked(_do)
+        return self._locked(_do, intent_id=intent_id)
 
     def emergency_supersede(self, intent_id: str, order_mgr=None) -> dict:
         def _do():
@@ -476,7 +524,7 @@ class IntentLog:
             rec["terminal"] = "SUPERSEDED_BY_EMERGENCY"
             _atomic_append(self.log_path, rec)
             return {"supersedes": intent_id}
-        return self._locked(_do)
+        return self._locked(_do, intent_id=intent_id)
 
     def reconciliation_view(self, intent_id: str) -> dict:
         intent = self.get(intent_id)
@@ -524,7 +572,7 @@ class IntentLog:
                 terminal = "PARTIAL"
             cur = self.get(intent_id)
             return {"legs": cur["legs"], "terminal": terminal, "blocked": blocked}
-        return self._locked(_do)
+        return self._locked(_do, intent_id=intent_id)
 
     def _transition_terminal_locked(self, intent_id: str, status: str) -> None:
         cur = self.get(intent_id)
@@ -543,7 +591,7 @@ class IntentLog:
             rec["version"] = cur.get("version", 1) + 1
             rec["retention_expires_at"] = time.time() + RETENTION_DAYS * 86400
             _atomic_append(self.archive_path, rec)
-        self._locked(_do)
+        self._locked(_do, intent_id=intent_id)
 
     def archive_index(self) -> List[str]:
         return [r["intent_id"] for r in self._archive_rows()]
