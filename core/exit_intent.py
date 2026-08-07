@@ -564,6 +564,20 @@ class IntentLog:
                 emg = r
         return {"intent": intent, "emergency": emg}
 
+    def append_event(self, intent_id: str, event_type: str, **fields) -> dict:
+        """Fence-aware durable audit event on an intent (B48 Policy J).
+
+        Mirrors the EMERGENCY_SUPERSEDES audit-row pattern: appends a new row
+        carrying the parent's current version (no version bump) under the same
+        lock.  Raises (StaleVersionError / CorruptLogError) on drift/corruption
+        so the caller can fail closed."""
+        def _do():
+            ev = {"event": event_type, "event_id": uuid.uuid4().hex[:16],
+                  "intent_id": intent_id, "ts": time.time(), **fields}
+            self._append_locked(intent_id, lambda c: {**ev, "version": c["version"]})
+            return ev
+        return self._locked(_do, intent_id=intent_id)
+
     # ── recovery (internally serialized) ──────────────────────────────
     def recover(self, intent_id: str, query_fn: Callable,
                 order_mgr=None) -> dict:

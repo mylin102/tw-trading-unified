@@ -5026,7 +5026,12 @@ class FuturesMonitor:
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting EXIT for {_leg_label}: {_side} (MKP Range Market)[/yellow]")
             # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
             _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_EXIT")
-            self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _ref_ohlc})
+            # B48 (codex C): correlate the decision event through the order
+            _order.event_id = getattr(signal, "event_id", "")
+            _order.winner = getattr(signal, "winner", "")
+            self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _ref_ohlc,
+                                                          "event_id": _order.event_id,
+                                                          "winner": _order.winner})
 
             # [GSD] Track in lifecycle orders so fill is not ignored
             self._pending_lifecycle_orders[_order.order_id] = {
@@ -5034,6 +5039,7 @@ class FuturesMonitor:
                 "ts": _ts, "lots": 1, "price": _ref_price, "ref_ohlc": _ref_ohlc,
                 "strategy": "MTS_EXIT",
                 "leg_role": _leg_label,  # P1-B: intent leg correlation for fills
+                "event_id": _order.event_id, "winner": _order.winner,
             }
 
             # P1-B durable-exit-intent: canonical submit — the producer

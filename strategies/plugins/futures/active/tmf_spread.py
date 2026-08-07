@@ -4394,6 +4394,7 @@ class TMFSpread(StrategyBase):
                 self._log_shadow_trade_summary(_exit_price, _exit_reason, _pnl_pts, now, bar, near_close, far_close)
                 # P1-B durable-exit-intent: gate + ids persisted BEFORE the
                 # signal is emitted (the dispatcher submits via these ids)
+                _ilog = None
                 try:
                     _ilog = _exit_intent_log()
                     _rem_name = _rem_leg.value if hasattr(_rem_leg, "value") else str(_rem_leg)
@@ -4405,7 +4406,56 @@ class TMFSpread(StrategyBase):
                         _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT", leg=_rem_leg_s)
                 except Exception:
                     pass  # intent log unavailable → legacy behavior
-                return Signal("EXIT", f"TMF_{_exit_reason}", confidence=0.5, stop_loss=0)
+                # B48 (codex A/B): SINGLE-LEG Policy J win — durable
+                # POLICY_J_SINGLE_LEG_TRIGGERED decision event BEFORE emission;
+                # append failure ⇒ fail-closed (no signal). The event_id rides
+                # the signal so ORDER_SUBMITTED + pending metadata correlate.
+                _pj_event = None
+                if getattr(_decision, "winner", None) == "POLICY_J_SINGLE_LEG":
+                    try:
+                        if _ilog is None:
+                            _ilog = _exit_intent_log()
+                        _rel_leg_s = str(getattr(self, "_released_leg", "") or "")
+                        _rel_realized = getattr(self, f"_{_rel_leg_s}_realized_override", None)
+                        if _rel_realized is None:
+                            _rel_entry = self._near_entry if _rel_leg_s == "near" else self._far_entry
+                            _rel_side = self._near_side if _rel_leg_s == "near" else self._far_side
+                            _rel_px = float(getattr(self, "_release_price", _rel_entry) or _rel_entry)
+                            _rel_realized = ((_rel_px - _rel_entry) if _rel_side == "LONG"
+                                             else (_rel_entry - _rel_px)) * _mult
+                        _remaining_upl = _pnl_pts * _mult
+                        _current_net = (_rel_realized + _remaining_upl
+                                        - float(getattr(self, "_estimated_cost", 92.0)))
+                        _pj_fields = dict(
+                            trade_id=getattr(self, "_trade_id", ""),
+                            released_leg=_rel_leg_s,
+                            remaining_leg=_rem_leg.value,
+                            released_realized_pnl_twd=round(float(_rel_realized), 2),
+                            remaining_upl_twd=round(float(_remaining_upl), 2),
+                            current_net_exit_pnl_twd=round(float(_current_net), 2),
+                            peak_net_exit_pnl_twd=round(float(getattr(self, "_peak_net_exit_pnl_twd", 0.0) or 0.0), 2),
+                            activation_twd=float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
+                            giveback_twd=float(self._params.get("combined_upl_giveback_twd", 100.0)),
+                            winner="POLICY_J_SINGLE_LEG",
+                            action="EXIT",
+                            reason=f"TMF_{_exit_reason}",
+                        )
+                        _iid_for_ev = None
+                        for _i in _ilog.list_active():
+                            if _ilog.get(_i).get("trade_id") == getattr(self, "_trade_id", ""):
+                                _iid_for_ev = _i
+                                break
+                        if _iid_for_ev is None:
+                            _iid_for_ev = _ilog.create(getattr(self, "_trade_id", ""),
+                                                       "COMBINED_EXIT", leg=_rem_leg_s)
+                        _pj_event = _ilog.append_event(
+                            _iid_for_ev, "POLICY_J_SINGLE_LEG_TRIGGERED", **_pj_fields)
+                    except Exception:
+                        logger.error("[P1B_POLICY_J_EVENT_FAILED] fail-closed — suppressing emission", exc_info=True)
+                        return None
+                return Signal("EXIT", f"TMF_{_exit_reason}", confidence=0.5, stop_loss=0,
+                              event_id=_pj_event["event_id"] if _pj_event else "",
+                              winner="POLICY_J_SINGLE_LEG" if _pj_event else "")
             elif _decision.action == LifecycleAction.COMBINED_EXIT:
                 _exit_reason = "COMBINED_EXIT"
                 logger.info("[POLICY_J_LIVE_TRIGGERED] Executing COMBINED_EXIT (SPREAD -> FLAT)")

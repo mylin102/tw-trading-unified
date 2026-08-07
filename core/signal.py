@@ -17,6 +17,11 @@ class Signal:
     quantity: int = 1
     trail_points: float = 0.0
     break_even_trigger: float = 0.0
+    # B48 (codex): decision-event correlation — the durable
+    # POLICY_J_SINGLE_LEG_TRIGGERED event_id + winner ride the signal so the
+    # dispatcher's ORDER_SUBMITTED event + pending-order metadata correlate
+    event_id: str = ""
+    winner: str = ""
 
     def validate(self) -> tuple[bool, str]:
         """Return (is_valid, error_message)."""

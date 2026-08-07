@@ -128,6 +128,9 @@ class LifecycleDecision:
     """Result of evaluate_lifecycle_actions()."""
     action: LifecycleAction
     release_leg: Leg | None = None  # which leg to release (only for RELEASE)
+    # B48 (codex): provenance of the decision — "POLICY_J_SINGLE_LEG" when the
+    # single-leg Policy J giveback block produced the TRAIL exit
+    winner: str | None = None
 
 logger = logging.getLogger(__name__)
 
@@ -282,7 +285,8 @@ def _check_combined_upl_trail_candidate(
                 _phase_val, ctx.peak_net_exit_pnl_twd, total_net_pnl_twd, ctx.combined_upl_giveback_twd,
             )
             if _phase_val == "SINGLE_LEG":
-                return [LifecycleDecision(action=LifecycleAction.TRAIL)]
+                return [LifecycleDecision(action=LifecycleAction.TRAIL,
+                                          winner="POLICY_J_SINGLE_LEG")]
             return [LifecycleDecision(action=LifecycleAction.COMBINED_EXIT)]
 
     if _phase_val == "SPREAD":
