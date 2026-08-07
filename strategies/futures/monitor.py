@@ -343,12 +343,18 @@ class FuturesMonitor:
             source="PAPER",
         )
         self._ledger_projection_sync_ts = 0.0
-        # 2026-08-06 codex audit: evaluator-lag SLO. While a position is open,
-        # strategy evaluation (on_bar) must heartbeat; alert when silent
-        # longer than mts.params.evaluator_lag_slo_secs (default 90s).
-        self._last_strategy_evaluation_mono = None
-        self._last_strategy_evaluation_wall = None
-        self._last_evaluator_lag_alert_mono = 0.0
+        # 2026-08-06 codex audit: evaluator-lag SLO (split clocks). While a
+        # position is open, both the tick loop and the strategy evaluator
+        # must heartbeat; alert when either goes silent past its SLO.
+        # Baselines are seeded at startup so a restored OPEN position with no
+        # first evaluation is detected (not silently skipped).
+        self._startup_mono = time.monotonic()
+        self._last_mts_tick_mono = self._startup_mono
+        self._last_mts_tick_wall = datetime.now().isoformat()
+        self._last_strategy_evaluation_mono = self._startup_mono
+        self._last_strategy_evaluation_wall = datetime.now().isoformat()
+        self._strategy_evaluated_once = False
+        self._last_slo_alert_mono: dict = {}
 
         self._flag_retry_count: int = 0         # C7: retry counter (in-memory)
         self._current_flag_id: str | None = None  # C2: tracks flag being processed
@@ -6846,6 +6852,8 @@ class FuturesMonitor:
         except Exception:
             pass
 
+        self._last_mts_tick_mono = time.monotonic()
+        self._last_mts_tick_wall = datetime.now().isoformat()
         _strat_has_pos = bool(getattr(strategy, "_has_position", False))
         _strat_tid = getattr(strategy, "_trade_id", None)
 
@@ -7102,49 +7110,83 @@ class FuturesMonitor:
         """Record the strategy evaluator heartbeat (evaluator-lag SLO)."""
         self._last_strategy_evaluation_mono = time.monotonic()
         self._last_strategy_evaluation_wall = datetime.now().isoformat()
+        self._strategy_evaluated_once = True
+
+    def _mts_evaluator_lag_slo(self, key: str, default: float) -> float:
+        """Read an SLO threshold from mts.params; invalid/<=0 falls back."""
+        try:
+            v = float(self.cfg.get("mts", {}).get("params", {}).get(key, default))
+        except (TypeError, ValueError):
+            v = default
+        if v <= 0 or v != v:  # zero / negative / NaN
+            v = default
+        return v
 
     def _mts_check_evaluator_lag(self, strategy, strat_has_pos: bool) -> None:
-        """Evaluator-lag SLO (2026-08-06 codex audit follow-up).
+        """Evaluator-lag SLO v2 (2026-08-06 codex audit corrections).
 
-        While a position is open, the lifecycle evaluator (on_bar) must
-        heartbeat. If it goes silent longer than
-        mts.params.evaluator_lag_slo_secs (default 90), emit a rate-limited
-        warning + MTS_EVALUATOR_LAG event. Catches the o-091403-145 class:
-        position open but no evaluation for hours.
+        Split clocks: tick-loop (every _mts_tick) and on_bar heartbeat.
+        Suppressed while FLAT, market closed, or MTS orders pending
+        (transition window — expected pause, not a stall). Baselines seeded
+        at startup so a restored OPEN position with no first evaluation
+        alerts after grace (first_eval=True).
         """
         if not strat_has_pos:
             return
-        _last = self._last_strategy_evaluation_mono
-        if _last is None:
-            return  # startup — nothing evaluated yet; wait for the first call
-        _now = time.monotonic()
-        _lag = _now - _last
         try:
-            _slo = float(
-                self.cfg.get("mts", {}).get("params", {}).get(
-                    "evaluator_lag_slo_secs", 90.0
-                )
-            )
-        except (TypeError, ValueError):
-            _slo = 90.0
+            if not is_taifex_futures_market_open():
+                return  # market closed — evaluator legitimately idle
+        except Exception:
+            pass  # fail-open on helper error (no false alarm)
+        try:
+            if self._mts_has_pending_mts_orders():
+                return  # transition window (entry/exit in flight)
+        except Exception:
+            pass
+        _now = time.monotonic()
+        _tid = getattr(strategy, "_trade_id", None)
+        self._mts_slo_clock(
+            "tick_loop", "tick_loop_slo_secs", 90.0,
+            self._last_mts_tick_mono, _now, _tid,
+        )
+        self._mts_slo_clock(
+            "on_bar", "on_bar_slo_secs", 90.0,
+            self._last_strategy_evaluation_mono, _now, _tid,
+        )
+
+    def _mts_slo_clock(
+        self, clock: str, cfg_key: str, default: float,
+        last_mono, now: float, tid,
+    ) -> None:
+        """Evaluate one SLO clock; emit a rate-limited alert when stale."""
+        if last_mono is None:
+            return
+        _lag = now - last_mono
+        _slo = self._mts_evaluator_lag_slo(cfg_key, default)
         if _lag <= _slo:
             return
-        if _now - self._last_evaluator_lag_alert_mono < 60.0:
-            return  # rate limit: at most one alert per minute
-        self._last_evaluator_lag_alert_mono = _now
-        _tid = getattr(strategy, "_trade_id", None)
+        if now - self._last_slo_alert_mono.get(clock, 0.0) < 60.0:
+            return  # rate limit: at most one alert per minute per clock
+        self._last_slo_alert_mono[clock] = now
+        _first = clock == "on_bar" and not self._strategy_evaluated_once
+        _last_wall = (
+            self._last_strategy_evaluation_wall
+            if clock == "on_bar" else self._last_mts_tick_wall
+        )
         logger.warning(
-            "[MTS_EVALUATOR_LAG] position open trade=%s but strategy "
-            "evaluator silent for %.0fs (SLO %.0fs) last_eval=%s",
-            _tid, _lag, _slo, self._last_strategy_evaluation_wall,
+            "[MTS_EVALUATOR_LAG] clock=%s position open trade=%s silent for "
+            "%.0fs (SLO %.0fs) first_eval=%s last_eval=%s",
+            clock, tid, _lag, _slo, _first, _last_wall,
         )
         try:
             self._append_mts_event(
                 "MTS_EVALUATOR_LAG",
-                trade_id=_tid,
+                clock=clock,
+                trade_id=tid,
                 lag_secs=round(_lag, 1),
                 slo_secs=_slo,
-                last_eval_at=self._last_strategy_evaluation_wall,
+                first_eval=_first,
+                last_eval_at=_last_wall,
             )
         except Exception as _e:  # never let telemetry break the tick path
             logger.warning("[MTS_EVALUATOR_LAG] event write failed: %s", _e)
