@@ -1,10 +1,22 @@
-# Live Route Certification — 設計文件 v3（design + RED tests only）
+# Live Route Certification — 設計文件 v4（design + RED tests only）
 
-**狀態**: DESIGN v3（codex round-4 L1-L7 修正；本 phase 只交付設計 + RED tests，**不接線**）
+**狀態**: DESIGN v4（codex round-5 B1-B6 修正；本 phase 只交付設計 + RED v4，**不接線**）
 **範圍**: `core/live_route_certificate.py`（新模組，proposal）+ `core/mode_transition.py` /
 `core/live_broker_preflight.py` 的整合點。**不修改** monitor / order manager / production
 routing；**不觸碰** authority projection 與 historical-audit 檔案。
 **PAPER 必須維持現狀**：不切 config mode、不送/改/撤真單、不 deploy/restart/push。
+**v4 變更（B1-B6）**：B1 transition_with_certificate 在 redeem 前**原子地**驗證全部
+fact（freshness/account/contracts/provider/session）；失敗 → 不達 LIVE_READY、
+ctx 維持 non-ready、nonce **preserve**（不消費、不意外授權重試）；B2 關閉 legacy 旁路 —
+`transition_to_live_ready(ctx, [])` 無 cert 必須 QUARANTINED（含 call-site 掃描測試）；
+B3 margin 來源權威化 — `margin_source_for(api, product, config_floor)`：
+broker margin query 優先、否則 reviewed config floor；finite positive 驗證、
+product 適用性、source/value/version 綁定 cert；B4 auth adapter —
+`is_authenticated_session(api)` 用實際 Shioaji session 訊號（strict allowlist，
+無樂觀 fallback，exception → fail-closed）；B5 TOCTOU — validate 與 transition 之間
+issuer invalidate/reconnect → 不得 LIVE_READY；成功 transition 恰好消費一次 nonce；
+B6 persisted snapshot 僅 audit — 永不重建 issuer state；process restart 一律
+PREFLIGHT/QUARANTINED 直到新 in-process cert。
 **v3 變更（L1-L7）**：L1 驗證測試一律用發行 issuer + 先斷言 nonce redemption —
 消除 NONCE_UNKNOWN 遮蔽；L2 open-orders 以顯式 Submitted/Pending 狀態建模；L3 確定性
 required-margin provider（1 near + 1 far micro × buffer）綁定 cert 版本/值；L4 顯式
@@ -96,6 +108,30 @@ def required_margin_for(product="TMF", *, per_lot_margin=100_000.0,
   validation 以**目前** provider 比對 — 版本/值改變 → PROVIDER_MISMATCH
 - monitor wiring 不得接受任意 caller 輸入的 magic number — 一律走 provider
 
+### margin 來源權威化（B3，取代 caller 輸入的 magic number）
+```python
+MARGIN_SOURCE_VERSION = 1
+def margin_source_for(api, product="TMF", *, config_floor=100_000.0) -> dict:
+    """per-lot margin 的權威來源：
+    1) broker 支援的 margin query（api.margin_rates / 等效訊號）存在 →
+       BROKER_MARGIN_QUERY；2) 否則 → CONFIG_FLOOR（經審查的 config 下限）。
+    驗證：finite positive；product ∈ 已知產品集；near/far 適用性。
+    → {"source": "BROKER_MARGIN_QUERY"|"CONFIG_FLOOR", "version": 1,
+       "per_lot_margin": x, "product": product}"""
+```
+- cert 綁定 `margin_source` + `margin_source_version` + `required_margin`
+  （= 2 × per_lot × (1+buffer)）；validation 以目前 `margin_source_for()` 比對 —
+  source/值/版本改變 → SOURCE_MISMATCH
+- config_floor <= 0 / NaN / 未知 product → source 無效 → fail
+
+### authenticated-session adapter（B4，取代 api.authenticated 慣例）
+```python
+def is_authenticated_session(api) -> bool:
+    """Shioaji session 訊號 strict allowlist（無樂觀 fallback）：
+    login_token / account / futopt_account — 任一存在即視為已認證；
+    全部缺失 → False；任何訊號查詢 exception → False（fail-closed）。"""
+```
+
 ### authenticated-session 斷言（L4）
 - certify 前必須確認 api session 為已認證（Shioaji-appropriate：
   `api.authenticated is True` + `futopt_account` 存在），否則
@@ -148,9 +184,25 @@ def required_margin_for(product="TMF", *, per_lot_margin=100_000.0,
   **不得**單獨產生 LIVE_READY；唯一允許路徑 =
   `transition_with_certificate(ctx, cert, issuer)` — cert 必須由
   **同一個 in-process issuer** 發行（redeem 消費 nonce）
+- **B2 legacy 旁路關閉**：`transition_to_live_ready(ctx, [])` 無 cert →
+  **LIVE_QUARANTINED**（不再放行）；`with_effective_mode` 為 internal —
+  任何 public route 不得暴露 LIVE_READY bypass；production call-site 掃描測試
+- **B1 原子驗證**：`transition_with_certificate` 在 redeem 前驗證全部
+  fact（freshness/account/contracts/provider/session）；任一失敗 →
+  raise + ctx 維持 non-ready + **nonce preserve**（不消費 — 失敗不授權重試；
+  成功才 redeem 消費一次）→ LIVE_READY
+- **B5 TOCTOU**：validate 與 transition 之間 issuer.invalidate_all()/
+  reconnect → redeem 失敗 → 不得 LIVE_READY；成功 transition 恰好消費一次 —
+  第二次 transition 同 cert → NONCE_UNKNOWN
 - **PAPER requested mode 不得消費 cert**：`paper_context()` 行為不變；
   cert 只在 LIVE 路徑存在，PAPER 下 `assert_live_order_allowed()` 仍 raise
 - 認證流程中**禁止任何 order/cancel/modify API 呼叫**（測試以 recording api 證明）
+
+### 持久化與重啟（B6）
+- `broker_snapshot_*.json` 等持久化記錄**僅為 audit** — 永不重建 issuer state、
+  永不還原 nonce 授權
+- **process restart 一律以 PREFLIGHT / LIVE_QUARANTINED 啟動**，直到
+  新 process 內發行一份新鮮 cert
 
 ## 7. 驗證函式
 
