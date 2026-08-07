@@ -105,6 +105,13 @@ def build_trade_row(
     if len(other_sides) == 1 and position_side_sign(next(iter(other_sides))) is not None:
         other_sign = position_side_sign(next(iter(other_sides)))
 
+    # release-leg coherence: all releases must be the same permitted leg and
+    # belong to one logical release event (codex: never silently filter)
+    _rel_legs = {str(f.get("leg") or "").upper() for f in releases}
+    _rel_leg_unknown = {l for l in _rel_legs if l not in ("NEAR", "FAR")}
+    _rel_evts = {str(f.get("release_id") or f.get("group_id") or "") for f in releases}
+    _rel_evts.discard("")
+
     # all release fills (released leg) + all sibling exit fills
     rel_fills = [f for f in releases if str(f.get("leg") or "").upper() == released_leg]
     sibling_fills = [f for f in exits if str(f.get("leg") or "").upper() == other_leg]
@@ -146,6 +153,12 @@ def build_trade_row(
         flags.append("missing_position_side")
     if other_sign is None and other_open_qty > 0:
         flags.append("missing_position_side")
+    if len(_rel_legs) > 1:
+        flags.append("mixed_release_legs")
+    if _rel_leg_unknown:
+        flags.append("unknown_release_leg")
+    if len(_rel_evts) > 1:
+        flags.append("multiple_release_events")
 
     # full-close verification (P0 blocker #2): never fabricate a settled trade
     fully_closed = (
@@ -155,12 +168,17 @@ def build_trade_row(
         and rel_sign is not None and other_sign is not None
         and entry_avg_rel is not None and entry_avg_other is not None
         and not rel_bad_px and not other_bad_px
+        and len(_rel_legs) == 1 and not _rel_leg_unknown and len(_rel_evts) <= 1
     )
     if not fully_closed:
         if rel_closed_qty < rel_open_qty - 1e-9:
             flags.append("partial_release")
+        elif rel_closed_qty > rel_open_qty + 1e-9:
+            flags.append("overclosed_release")
         if other_closed_qty < other_open_qty - 1e-9:
             flags.append("partial_sibling_exit")
+        elif other_closed_qty > other_open_qty + 1e-9:
+            flags.append("overclosed_sibling_exit")
         if other_open_qty > 0 and other_closed_qty < 1e-9:
             flags.append("missing_sibling_exit")
 

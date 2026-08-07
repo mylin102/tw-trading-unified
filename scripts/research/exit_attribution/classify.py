@@ -24,14 +24,18 @@ REL_UNKNOWN = "UNKNOWN"
 def classify_row(row: dict) -> dict:
     """Three independent axes from one output row (design §5)."""
     dq = str(row.get("data_quality") or DQ_UNRECONCILED)
-    if dq != DQ_OK:
+    pre = row.get("pre_release_paired_pnl")
+    inc = row.get("post_release_incremental_pnl")
+    if dq != DQ_OK or pre is None or inc is None:
+        # missing values are NEVER silently treated as 0 (would fabricate
+        # NOT_BAD / NEUTRAL) — attribution stays UNKNOWN.
         return {
             "data_quality": dq,
             "entry_attribution": ENTRY_UNKNOWN,
             "release_attribution": REL_UNKNOWN,
         }
-    pre = float(row.get("pre_release_paired_pnl") or 0.0)
-    inc = float(row.get("post_release_incremental_pnl") or 0.0)
+    pre = float(pre)
+    inc = float(inc)
     entry = ENTRY_BAD if pre < 0 else ENTRY_NOT_BAD
     release = REL_HARMFUL if inc < 0 else (REL_HELPFUL if inc > 0 else REL_NEUTRAL)
     return {
