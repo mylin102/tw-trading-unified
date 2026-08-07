@@ -184,7 +184,10 @@ def _mts_intent_log_dir() -> str:
         import hashlib as _hl
         _pt = os.environ.get("PYTEST_CURRENT_TEST", "") or ""
         _pt_id = _hl.md5(_pt.encode()).hexdigest()[:10] if _pt else "default"
-        return os.path.join(_tf.gettempdir(), f"test_mts_exit_intent_{_pt_id}")
+        # per-test AND per-run (pid): a previous run's SUBMITTED intent must
+        # never bleed into this run's assertions
+        return os.path.join(_tf.gettempdir(),
+                            f"test_mts_exit_intent_{_pt_id}_{os.getpid()}")
     from core.runtime_paths import runtime_root
     return os.path.join(runtime_root(), "logs")
 
@@ -3574,12 +3577,13 @@ class FuturesMonitor:
                                  fp = _ceg.get("far_fill_price", 0)
                                  _mts_strat._reset(reason="combined_exit_filled", exit_price=max(np, fp))
                                  lc = {"phase": "FLAT"}
-                                 _mts_strat._write_mts_state(has_position=False, action="COMBINED_EXIT_COMPLETED",
+                                 from strategies.plugins.futures.active.tmf_spread import _write_mts_state
+                                 _write_mts_state(has_position=False, action="COMBINED_EXIT_COMPLETED",
                                      reason="COMBINED_EXIT",
                                      near_entry=_mts_strat._near_entry, far_entry=_mts_strat._far_entry,
                                      near_last=np, far_last=fp,
                                      near_side=_mts_strat._near_side, far_side=_mts_strat._far_side,
-                                     trade_id=_trade_id, ticker=self.ticker,
+                                     trade_id=pending.get("trade_id", ""), ticker=self.ticker,
                                      lifecycle=lc)
                                  console.print("[bold green]\u2705 [MTS_ORDER] COMBINED_EXIT COMPLETED: group=" + str(_ce_group_id) + " near=" + str(np) + " far=" + str(fp) + "[/bold green]")
                              self._append_mts_event("COMBINED_EXIT_COMPLETED",

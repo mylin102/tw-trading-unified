@@ -614,6 +614,29 @@ def _append_event(event_type: str, **kwargs) -> None:
         pass
 
 
+def _p1b_exit_submitted(_ilog, trade_id: str, legs) -> bool:
+    """P1-B: True if any of the given legs of the trade's active intent is
+    already in a submitted state (SUBMIT_ATTEMPTED/SUBMITTED/UNKNOWN/FILLED).
+
+    The release creates the exit-intent for the REMAINING leg while it is
+    still NOT_SUBMITTED — a later remaining-leg exit must submit THROUGH that
+    same intent (not be suppressed, not re-create).  Only an already-submitted
+    leg suppresses re-emission (duplicate exit = the P1-2 double-submit)."""
+    try:
+        for _iid in _ilog.list_active():
+            _rec = _ilog.get(_iid)
+            if _rec.get("trade_id") != trade_id:
+                continue
+            for _leg in legs:
+                if _rec["legs"].get(_leg, {}).get("status") in (
+                    "SUBMIT_ATTEMPTED", "SUBMITTED", "UNKNOWN", "FILLED",
+                ):
+                    return True
+        return False
+    except Exception:
+        return False  # intent unavailable → legacy behavior (no gate)
+
+
 def _exit_intent_log():
     """P1-B: durable COMBINED_EXIT intent log at the shared runtime dir.
 
@@ -629,7 +652,10 @@ def _exit_intent_log():
         import hashlib as _hl
         _pt = os.environ.get("PYTEST_CURRENT_TEST", "") or ""
         _pt_id = _hl.md5(_pt.encode()).hexdigest()[:10] if _pt else "default"
-        return IntentLog(os.path.join(_tf.gettempdir(), f"test_mts_exit_intent_{_pt_id}"))
+        # per-test AND per-run (pid): a previous run's SUBMITTED intent must
+        # never bleed into this run's assertions
+        return IntentLog(os.path.join(_tf.gettempdir(),
+                                      f"test_mts_exit_intent_{_pt_id}_{os.getpid()}"))
     from core.runtime_paths import runtime_root
     return IntentLog(os.path.join(runtime_root(), "logs"))
 
@@ -4295,11 +4321,12 @@ class TMFSpread(StrategyBase):
                 # persist the intent for the REMAINING leg before emitting
                 try:
                     _ilog = _exit_intent_log()
-                    if _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
-                        logger.info("[P1B_GATE] exit intent in-flight for %s — suppressing release re-emission", getattr(self, "_trade_id", ""))
-                        return None
                     _rem_leg_s = "FAR" if _release_leg == Leg.NEAR else "NEAR"
-                    _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT", leg=_rem_leg_s)
+                    if _p1b_exit_submitted(_ilog, getattr(self, "_trade_id", ""), [_rem_leg_s]):
+                        logger.info("[P1B_GATE] exit already submitted for %s — suppressing release re-emission", getattr(self, "_trade_id", ""))
+                        return None
+                    if not _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
+                        _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT", leg=_rem_leg_s)
                 except Exception:
                     pass  # intent log unavailable → legacy behavior
                 return Signal("PARTIAL_EXIT", _signal_reason, confidence=0.4)
@@ -4369,11 +4396,13 @@ class TMFSpread(StrategyBase):
                 # signal is emitted (the dispatcher submits via these ids)
                 try:
                     _ilog = _exit_intent_log()
-                    if _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
-                        logger.info("[P1B_GATE] exit intent in-flight for %s — suppressing re-emission", getattr(self, "_trade_id", ""))
-                        return None
                     _rem_name = _rem_leg.value if hasattr(_rem_leg, "value") else str(_rem_leg)
-                    _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT", leg=str(_rem_name).upper())
+                    _rem_leg_s = str(_rem_name).upper()
+                    if _p1b_exit_submitted(_ilog, getattr(self, "_trade_id", ""), [_rem_leg_s]):
+                        logger.info("[P1B_GATE] exit already submitted for %s — suppressing re-emission", getattr(self, "_trade_id", ""))
+                        return None
+                    if not _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
+                        _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT", leg=_rem_leg_s)
                 except Exception:
                     pass  # intent log unavailable → legacy behavior
                 return Signal("EXIT", f"TMF_{_exit_reason}", confidence=0.5, stop_loss=0)
@@ -4411,10 +4440,11 @@ class TMFSpread(StrategyBase):
                 # BEFORE the signal is emitted (dispatcher submits via ids)
                 try:
                     _ilog = _exit_intent_log()
-                    if _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
-                        logger.info("[P1B_GATE] exit intent in-flight for %s — suppressing COMBINED_EXIT re-emission", getattr(self, "_trade_id", ""))
+                    if _p1b_exit_submitted(_ilog, getattr(self, "_trade_id", ""), ["NEAR", "FAR"]):
+                        logger.info("[P1B_GATE] exit already submitted for %s — suppressing COMBINED_EXIT re-emission", getattr(self, "_trade_id", ""))
                         return None
-                    _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT")
+                    if not _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
+                        _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT")
                 except Exception:
                     pass  # intent log unavailable → legacy behavior
                 return Signal("EXIT", "TMF_COMBINED_EXIT", confidence=1.0, stop_loss=0)
