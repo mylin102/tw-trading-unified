@@ -24,10 +24,14 @@ def test_live_starts_preflight_blocked():
     assert ctx.live_order_allowed is False  # fail-closed until transition
 
 
-def test_transition_all_pass_becomes_live_ready():
+def test_transition_no_cert_quarantines():
+    """Live Route Certification (round-8): the no-certificate success path
+    is CLOSED — without a certificate the transition must quarantine and
+    never authorize; LIVE_READY requires transition_with_certificate."""
     ctx = transition_to_live_ready(live_preflight_context(), [])
-    assert ctx.effective_mode == ModeTransitionState.LIVE_READY.value
-    assert ctx.live_order_allowed is True
+    assert ctx.effective_mode == ModeTransitionState.LIVE_QUARANTINED.value
+    assert ctx.live_order_allowed is False
+    assert "NO_CERTIFICATE" in ctx.audit_reasons
 
 
 def test_transition_failures_quarantine():

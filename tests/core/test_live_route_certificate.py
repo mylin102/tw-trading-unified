@@ -93,15 +93,18 @@ class _Contracts:
         self.Futures = _FuturesGroup({"TMF": contracts})
 
 
+_MISSING = object()          # sentinel: honor an explicit None futopt_account
+
+
 class _FakeApi:
     """Verified 1.7.0 surface only. Order methods raise (zero-order)."""
 
-    def __init__(self, *, futopt_account=None, accounts_ok=True,
+    def __init__(self, *, futopt_account=_MISSING, accounts_ok=True,
                  flat=True, open_trade_statuses=(), margin_val=1_000_000.0,
                  trading_limits_ok=True, subscribe_ok=True, unsubscribe_ok=True,
                  snapshot_codes=("TMFH6", "TMFI6")):
-        self.futopt_account = futopt_account if futopt_account is not None \
-            else _Account()
+        self.futopt_account = _Account() if futopt_account is _MISSING \
+            else futopt_account
         self._accounts_ok = accounts_ok
         self._flat = flat
         self._open_trade_statuses = list(open_trade_statuses)
