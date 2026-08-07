@@ -18,11 +18,30 @@ from core.runtime_paths import runtime_path
 logger = logging.getLogger("Readiness")
 
 REPO = Path(os.path.expanduser("~/Documents/mylin102/tw-trading-unified-git"))
+_LOG_TAIL_BYTES = 128 * 1024
 
 
 def _runtime_log(name: str) -> Path:
     """Resolve engine logs from the shared runtime, never a release checkout."""
     return Path(runtime_path("logs", name))
+
+
+def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_BYTES) -> str:
+    """Read only the newest complete log lines without loading a large PM2 log.
+
+    Trading logs are append-only and can grow to multiple GB.  Readiness is a
+    request-path dashboard check, so reading the whole file would stall the UI.
+    """
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        offset = max(0, size - max_bytes)
+        handle.seek(offset)
+        data = handle.read()
+    if offset:
+        _first_newline = data.find(b"\n")
+        data = data[_first_newline + 1:] if _first_newline >= 0 else b""
+    return data.decode("utf-8", errors="ignore")
 
 
 def check_env_vars():
@@ -59,8 +78,8 @@ def check_transition_state():
     try:
         if not log.exists():
             return False, "log missing"
-        # read last 200 lines, find latest MTS_EXEC_CTX
-        lines = log.read_text(errors="ignore").splitlines()[-200:]
+        # Read the tail only: PM2 trading logs can be multiple GB.
+        lines = _read_log_tail(log).splitlines()[-200:]
         found = None
         for ln in reversed(lines):
             if "MTS_EXEC_CTX" in ln:
@@ -85,7 +104,7 @@ def check_broker_login():
     try:
         if not log.exists():
             return False, "error log missing"
-        lines = log.read_text(errors="ignore").splitlines()[-200:]
+        lines = _read_log_tail(log).splitlines()[-200:]
         trading = any("System status changed to: TRADING" in ln for ln in lines)
         if trading:
             return True, "TRADING (logged in)"
