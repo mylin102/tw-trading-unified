@@ -1,7 +1,8 @@
-# Live Route Certification — 設計文件 v6（design + RED tests only）
+# Live Route Certification — 設計文件 v7（design + RED tests only）
 
-**狀態**: DESIGN v6（codex round-7 P0-1..6 修正；本 phase 只交付 call-path map +
-設計 + split RED tests，**不實作 core、不接 monitor**）
+**狀態**: DESIGN v7（codex round-8 P0 修正：WeakKeyDictionary 不可實作 —
+builtins.Shioaji 無法 weak-reference（TypeError 實證，capability map §6）；本 phase
+只交付設計 + RED v7，**不實作 core、不接 monitor**）
 **範圍**: `core/live_route_certificate.py`（新模組，proposal）+ `core/mode_transition.py` /
 `core/live_broker_preflight.py` 的整合點。**不修改** monitor / order manager / production
 routing；**不觸碰** authority projection 與 historical-audit 檔案。
@@ -279,24 +280,31 @@ options/stocks 為獨立 process（direct api.login/logout，不走 safe_login �
 失敗不註冊）+ `logout()` 內 `unregister(api)` — 一個 wrapper 覆蓋全部 4 call
 sites + 2 reconnect 路徑，無需改各 call site。
 
-## 6.2 SessionRegistry（P0-2 — weak-key + opaque generation）
+## 6.2 SessionRegistry（v7 — process-local strong-registration map）
 ```python
 @dataclass
-class _SessionRecord:
+class _SessionEntry:
+    api: object          # STRONG ref — 存續期間阻止 id reuse
     generation: str      # secrets.token_hex(16) — opaque、不可偽造
     logged_in_at: float
 
 class SessionRegistry:
-    """per-live-object weak-key mapping（WeakKeyDictionary — api 物件 GC 即
-    消失；無 id() 重用問題；無 persisted state）。"""
-    _sessions: weakref.WeakKeyDictionary   # api object → _SessionRecord
-    def register(self, api) -> str         # 每次成功 safe_login 後呼叫
-    def unregister(self, api) -> None      # logout / reconnect 失敗清理
-    def generation(self, api) -> str | None  # 目前 opaque generation
+    """Process-local strong-registration map（weakref 不可實作：
+    builtins.Shioaji 無法 weak-reference — capability map §6）。
+    以 id(api) 僅作 index；讀取時校驗 entry.api is api（identity mismatch
+    → 無效，防 id-reuse/stale entry）。module-level，不 setattr api。"""
+    _entries: dict[int, _SessionEntry]
+    def register(self, api) -> str          # 成功 safe_login 後才呼叫（新 generation）
+    def unregister(self, api) -> None       # logout / login 前 invalidate
+    def generation(self, api) -> str | None # 目前 generation；identity 不符 → None
 ```
-- cert 綁定 `session_generation`；驗證/transition 取**目前** registry 值比對
-- API-object 替換 / id-reuse：新物件無 entry → 舊 cert generation 查無 →
-  失效（測試含 id-reuse analogue）
+- **hook 語意（P0-2/round-8 #2）**：`safe_login` 內 —
+  **每次嘗試前先 `unregister(api)`（invalidate 舊 generation）** → `api.login(...)`
+  → **成功才 `register(api)`（新 generation）**；失敗 relogin → 無有效 generation；
+  `logout()` → unregister
+- **certify AND transition 都查 registry 目前 generation**（round-8 #3）—
+  reconnect 改變 generation → 舊 cert 失效（即使 issuer nonce 仍在）
+- strong ref：登入後 api 存活期間 id 不可能被其他物件重用（entry 強參照佔住）
 
 ## 6.3 RuntimeCertificationContext（P0-4 — 單一 trusted factory）
 ```python

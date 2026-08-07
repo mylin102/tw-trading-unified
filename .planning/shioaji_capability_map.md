@@ -46,3 +46,28 @@ is_authenticated_session(api) :=
 - fake 移除 `login_token` / `account` / `authenticated` / `margin_rates`
 - fake 實作真實 surface：`futopt_account` + `list_accounts()`（可設空/拋錯）+
   `margin(account)`（可設 None/拋錯）；session epoch 由測試註冊進 registry
+
+## 6. Rust 物件限制（round-8 實證 — exact command/output）
+```
+$ .venv/bin/python3 -c "
+import shioaji as sj, weakref
+api = sj.Shioaji()
+try:
+    weakref.ref(api)
+    print(\"weakref: OK\")
+except TypeError as e:
+    print(\"weakref: TypeError:\", e)
+try:
+    api._custom_attr = 123
+    print(\"setattr: OK\")
+except Exception as e:
+    print(\"setattr:\", type(e).__name__, e)
+"
+type: <class 'builtins.Shioaji'>
+weakref: TypeError: cannot create weak reference to 'builtins.Shioaji' object
+setattr: AttributeError 'builtins.Shioaji' object has no attribute '_custom_attr'
+```
+- **weakref 不可用** → WeakKeyDictionary 設計不可實作（round-7 P0）—
+  改 process-local **strong-registration map**（design v7 §6.2）
+- **setattr 不可用** → 不得 monkey-patch api 物件；registry 一律 module-level
+  （不得依賴 api 自訂屬性）
