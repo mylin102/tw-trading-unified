@@ -1,11 +1,29 @@
-# Live Route Certification — 設計文件 v5（design + RED tests only）
+# Live Route Certification — 設計文件 v6（design + RED tests only）
 
-**狀態**: DESIGN v5（codex round-6 P0-auth/P0-margin + route 斷言修正；本 phase 只交付
-capability map + 設計 + RED v5，**不接線**）
+**狀態**: DESIGN v6（codex round-7 P0-1..6 修正；本 phase 只交付 call-path map +
+設計 + split RED tests，**不實作 core、不接 monitor**）
 **範圍**: `core/live_route_certificate.py`（新模組，proposal）+ `core/mode_transition.py` /
 `core/live_broker_preflight.py` 的整合點。**不修改** monitor / order manager / production
 routing；**不觸碰** authority projection 與 historical-audit 檔案。
 **PAPER 必須維持現狀**：不切 config mode、不送/改/撤真單、不 deploy/restart/push。
+**v6 變更（round-7 P0-1..6）**：
+P0-1 session epoch 覆蓋 — epoch hook 設在 **`safe_login` 本身**（唯一 chokepoint，
+4 個 call site 全流經：core/shioaji_session.py:68、**main.py:733**、
+squeeze_futures/data/shioaji_client.py:48、scripts/run_live_readonly_preflight.py:30；
+reconnect 路徑 main.py:693 `_try_shioaji_reconnect` + shioaji_session:75 `_sync_worker`
+亦走 safe_login）→ 每次成功 safe_login 後註冊、logout 時 unregister；
+P0-2 epoch 身份 — 改 **WeakKeyDictionary（per-live-object）+ secrets.token_hex(16)
+opaque generation**（非 id()+time.time()；id 可重用、wall clock 不可偽造）；
+P0-3 config floor 來源 — 綁定 **effective config path + canonical parsed floor +
+檔案 SHA256 + deployed release SHA**（由 trusted loaded config 建構，非 caller
+參數；unknown/missing/dirty → quarantine）；
+P0-4 transition 輸入 — `runtime=dict` 改 **內部 immutable `RuntimeCertificationContext`**
+（單一 trusted factory 從 api + loaded config + process state 建構；public route
+無 dict/JSON 建構子；forged mapping → 拒絕）；
+P0-5 測試拆分 — **core 測試**（green-ready）與 **monitor 整合測試**（顯式 RED 至
+monitor wiring phase）分開；P0-6 monitor.py:522 的替代映射寫入整合設計
+（fresh in-process certify → transition_with_certificate → 失敗顯式 quarantine，
+全部在任何 order route 之前；PAPER 路徑不變）— 本 phase 不改 monitor。
 **v5 變更（round-6）**：P0-auth — auth adapter 改以 **Shioaji 1.7.0 實證 surface**
 定義（見 `shioaji_capability_map.md`）：`futopt_account` 有效 **AND**
 `list_accounts()` live 查詢非空 **AND** session epoch（系統 login wrapper 註冊）
@@ -236,6 +254,89 @@ def is_authenticated_session(api) -> bool:
   永不還原 nonce 授權
 - **process restart 一律以 PREFLIGHT / LIVE_QUARANTINED 啟動**，直到
   新 process 內發行一份新鮮 cert
+
+
+## 6.1 Login / Logout / Reconnect call-path map（P0-1，實證）
+
+**safe_login（core/broker/shioaji_compat.py:90）— 唯一成功登入 chokepoint：**
+| # | call site | 角色 |
+|---|---|---|
+| 1 | `core/shioaji_session.py:68` `_login(api)` | singleton wrapper（get_api） |
+| 2 | **`main.py:733`** | **MTS production futures runtime 初始登入** |
+| 3 | `strategies/futures/squeeze_futures/data/shioaji_client.py:48` | squeeze data client |
+| 4 | `scripts/run_live_readonly_preflight.py:30` | preflight script |
+
+**reconnect 路徑（亦流經 safe_login）：**
+- `main.py:693` `_try_shioaji_reconnect(api, fm, om, dry_run)` — phase 1 等待
+  auto-reconnect（code 12）後續 phase 重新登入
+- `core/shioaji_session.py:75` `_sync_worker` — 背景 sync（:84 `api.login(...)`）
+
+**logout：** `core/shioaji_session.py:212 logout()`（main.py:1520 同函式）；
+options/stocks 為獨立 process（direct api.login/logout，不走 safe_login —
+不在 MTS certificate 範圍，map 內註記）。
+
+**設計**：epoch hook 設在 **safe_login 內**（成功返回前 `SessionRegistry.register(api)`；
+失敗不註冊）+ `logout()` 內 `unregister(api)` — 一個 wrapper 覆蓋全部 4 call
+sites + 2 reconnect 路徑，無需改各 call site。
+
+## 6.2 SessionRegistry（P0-2 — weak-key + opaque generation）
+```python
+@dataclass
+class _SessionRecord:
+    generation: str      # secrets.token_hex(16) — opaque、不可偽造
+    logged_in_at: float
+
+class SessionRegistry:
+    """per-live-object weak-key mapping（WeakKeyDictionary — api 物件 GC 即
+    消失；無 id() 重用問題；無 persisted state）。"""
+    _sessions: weakref.WeakKeyDictionary   # api object → _SessionRecord
+    def register(self, api) -> str         # 每次成功 safe_login 後呼叫
+    def unregister(self, api) -> None      # logout / reconnect 失敗清理
+    def generation(self, api) -> str | None  # 目前 opaque generation
+```
+- cert 綁定 `session_generation`；驗證/transition 取**目前** registry 值比對
+- API-object 替換 / id-reuse：新物件無 entry → 舊 cert generation 查無 →
+  失效（測試含 id-reuse analogue）
+
+## 6.3 RuntimeCertificationContext（P0-4 — 單一 trusted factory）
+```python
+@dataclass(frozen=True)
+class RuntimeCertificationContext:
+    """內部 immutable context — public route 無 dict/JSON 建構子。"""
+    process_start_id: str
+    account_hash: str
+    near_code: str
+    far_code: str
+    margin_source: dict        # 見 6.4（含 config path/SHA/commit）
+    session_generation: str
+    now_ts: str
+
+def build_runtime_certification_context(api, config, process_state) -> RuntimeCertificationContext:
+    """唯一 trusted factory：api + **已載入的 trusted config** + process state
+    建構。不接收外部 dict/JSON；forged mapping/物件 → 拒絕（無建構子）。"""
+```
+
+## 6.4 Config floor 來源（P0-3 — 綁定 effective config）
+- `margin_source_for` 的輸入改為 **trusted loaded config**（系統 config loader
+  解析的 futures.yaml），綁定：
+  - `config_path`（effective config 絕對路徑）
+  - `config_sha256`（檔案 byte hash）
+  - `config_commit`（deployed release SHA — 該 config 的部署 commit）
+  - `per_pair_margin`（canonical parsed floor — 由 loader 給出，非 caller 數字）
+- unknown / missing / **dirty mismatch**（parsed floor 與檔內值不一致）→ quarantine
+- 測試：config changed-after-cert（SHA/commit 改變）→ SOURCE_MISMATCH；
+  malformed config；extra/未知 product
+
+## 6.5 Monitor 整合設計（P0-6 — 本 phase 不改 monitor）
+`monitor.py:522` 的替代映射（monitor wiring phase 才實作）：
+```
+任何 order route 之前：
+  1. cert, failures = certify_route(api, ..., issuer, ...)   # fresh in-process
+  2. failures 非空 → 進 LIVE_QUARANTINED + audit reasons（fail-closed，不送單）
+  3. ctx = transition_with_certificate(ctx, cert, issuer, ctx_runtime)
+  4. ctx.is_live_ready() False → LIVE_QUARANTINED（assert_live_order_allowed raise）
+PAPER 路徑不變：paper_context() 不消費 cert，行為與現況相同。
+```
 
 ## 7. 驗證函式
 
