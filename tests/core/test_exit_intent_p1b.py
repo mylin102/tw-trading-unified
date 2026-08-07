@@ -19,14 +19,34 @@ import core.exit_intent as ei  # noqa: E402,F401  (ImportError = RED)
 
 # ── helpers ──────────────────────────────────────────────────────────────
 class StubOrderMgr:
+    """Records every submit/cancel/query call for side-effect assertions.
+
+    Polymorphic submit: pure-core tests call submit(client_order_id, leg);
+    the real dispatcher calls submit(order) with an order object."""
+    from types import SimpleNamespace as _NS
+
     def __init__(self):
         self.submits = []
         self.cancels = []
         self.queries = []
 
-    def submit(self, client_order_id, leg, qty=1, **kw):
-        self.submits.append({"client_order_id": client_order_id, "leg": leg})
-        return {"order_id": f"ORD-{client_order_id}"}
+    def create_order(self, **kw):
+        from unittest.mock import MagicMock
+        o = MagicMock()
+        o.order_id = f"ORD-{len(self.submits) + 1}"
+        o.client_order_id = kw.get("client_order_id")
+        o.intent_id = kw.get("intent_id")
+        o.leg = kw.get("leg")
+        return o
+
+    def submit(self, arg, leg=None, **kw):
+        if hasattr(arg, "order_id"):  # dispatcher path: submit(order)
+            self.submits.append({"client_order_id": getattr(arg, "client_order_id", None),
+                                 "leg": leg or getattr(arg, "leg", None),
+                                 "order_id": arg.order_id})
+            return arg
+        self.submits.append({"client_order_id": arg, "leg": leg})
+        return {"order_id": f"ORD-{arg}"}
 
     def cancel(self, client_order_id):
         self.cancels.append(client_order_id)
@@ -52,6 +72,8 @@ def build_monitor(tmp_path, monkeypatch):
 
     Uses an ABSOLUTE repo config path so chdir(tmp_path) cannot break the
     config load (codex #6: B19/B23 must fail on integration gap, not config).
+    TMFSpread subclass returns None for unset strategy internals so the real
+    producer branch runs on minimal state (the exit decision itself is real).
     """
     from unittest.mock import MagicMock
     from datetime import datetime
@@ -60,6 +82,11 @@ def build_monitor(tmp_path, monkeypatch):
         TMFSpread, PositionPhase, PositionLifecycle, ReleaseGroup,
         ReleaseGroupStatus, TrailGroup, TrailGroupStatus, Leg,
     )
+
+    class _LenientTMFSpread(TMFSpread):
+        def __getattr__(self, name):
+            return None
+
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     config_path = os.path.join(repo_root, "config", "futures_night.yaml")
     api = MagicMock()
@@ -70,7 +97,7 @@ def build_monitor(tmp_path, monkeypatch):
     monitor.order_mgr = StubOrderMgr()
     monitor.contract = MagicMock(code="TMFF6")
     monitor.far_contract = MagicMock(code="TMFH6")
-    strat = TMFSpread()
+    strat = _LenientTMFSpread()
     strat._restore_position_state = MagicMock(return_value=False)
     strat._has_position = True
     strat._released_leg = "near"
@@ -82,6 +109,23 @@ def build_monitor(tmp_path, monkeypatch):
     strat._peak = 44100.0
     strat._ticker = "TMF"
     strat._trade_id = "t1"
+    strat._lifecycle = "MANAGING"  # needed by _manage_position exit branch
+    strat._single_leg_post_fill_ticks = 0  # warmup counter for single-leg path
+    strat._pending_exit = False
+    strat._near_status = "FILLED"
+    strat._far_status = "FILLED"
+    strat._trail_anchor_status = None
+    strat._atr_mult_stop = 3.5  # trail params accessed by the exit branch
+    strat._atr_mult_trail = 3.5
+    strat._release_stop_fixed = None
+    strat._trail_dist_fixed = None
+    strat._near_max = 44100.0
+    strat._near_min = 43800.0
+    strat._far_max = 44020.0
+    strat._far_min = 43365.0
+    strat._release_price = 43434.0  # NEAR released at this price
+    strat._mfe_pts = 0.0
+    strat._mae_pts = 0.0
     strat._lifecycle_oca = PositionLifecycle(
         phase=PositionPhase.SINGLE_LEG,
         release_group=ReleaseGroup(status=ReleaseGroupStatus.COMPLETED,
@@ -385,12 +429,25 @@ def test_b19_real_combined_exit_artifacts(tmp_path, monkeypatch):
            "timestamp": datetime.now(), "code": "TMFF6"}
     from unittest.mock import patch
     from pathlib import Path
-    with patch("strategies.futures.monitor._mts_position_state_path") as msp, \
-         patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True):
-        msp.return_value = Path(tmp_path) / "state.json"
-        msp.return_value.exists.return_value = False
+    state_path = Path(tmp_path) / "state.json"
+    with patch("strategies.futures.monitor._mts_position_state_path",
+               return_value=state_path), \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open",
+               return_value=True), \
+         patch.object(Path, "exists", return_value=False):
         sig = Signal("COMBINED_EXIT", "TMF_COMBINED_EXIT")
         monitor._submit_mts_order_signal(sig, strat, bar, datetime.now())
+    # DISCRIMINATING ASSERTION FIRST (Phase-2 integration gap): the
+    # dispatcher must create ONE durable intent at the production location
+    intent_log = ei.IntentLog(str(tmp_path / "logs"))
+    actives = [iid for iid in intent_log.list_active()
+               if intent_log.get(iid)["trade_id"] == "t1"]
+    assert len(actives) == 1  # RED until Phase 2 wires the dispatcher
+    intent = intent_log.get(actives[0])
+    for leg in ("NEAR", "FAR"):
+        assert intent["legs"][leg]["client_order_id"] is not None
+        assert intent["legs"][leg]["status"] in ("SUBMIT_ATTEMPTED", "SUBMITTED", "FILLED")
+    assert intent_log.has_inflight_exit_intent("t1") is True
     # REAL artifacts (not synthetic): fills ledger rows
     fills = [json.loads(l) for l in
              (tmp_path / "mts_trade_fills.jsonl").read_text().splitlines() if l.strip()]
@@ -409,17 +466,6 @@ def test_b19_real_combined_exit_artifacts(tmp_path, monkeypatch):
     # state file: COMBINED_EXIT action written
     assert (tmp_path / "state.json").exists()
     assert "COMBINED_EXIT" in (tmp_path / "state.json").read_text()
-    # DURABLE INTENT at the production location (runtime/logs/): exactly one
-    # for t1, expected per-leg statuses + client ids, inflight matching stage
-    intent_log = ei.IntentLog(str(tmp_path / "logs"))
-    actives = [iid for iid in intent_log.list_active()
-               if intent_log.get(iid)["trade_id"] == "t1"]
-    assert len(actives) == 1  # NOT vacuous: dispatcher must have created it
-    intent = intent_log.get(actives[0])
-    for leg in ("NEAR", "FAR"):
-        assert intent["legs"][leg]["client_order_id"] is not None
-        assert intent["legs"][leg]["status"] in ("SUBMIT_ATTEMPTED", "SUBMITTED", "FILLED")
-    assert intent_log.has_inflight_exit_intent("t1") is True  # still in flight
     assert len(monitor.order_mgr.submits) == 2
 
 
@@ -486,16 +532,30 @@ def test_b22_restart_overlap_owner_verified(tmp_path):
 #         evaluated twice ⇒ ONE durable intent + ONE dispatch/submit ─────
 def test_b23_real_producer_double_eval_one_submit(tmp_path, monkeypatch):
     from datetime import datetime
+    from pathlib import Path
     from unittest.mock import patch
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
     monitor, strat, api = build_monitor(tmp_path, monkeypatch)
+    # REAL strategy init via a minimal real StrategyContext — initializes the
+    # risk engines + params through the actual init() path (not stubs)
+    from core.strategy_context import StrategyContext, MarketData, PositionView
+    ctx = StrategyContext(
+        market=MarketData(last_bar={}, ticker="TMF"),
+        position=PositionView(),
+        config={"ticker": "TMF",
+                "params": {"atr_multiplier_stop": 3.5, "atr_multiplier_trail": 3.5,
+                           "trail_distance_points": 35.0, "min_atr": 5.0,
+                           "entry_z": -2.0, "confirm_ticks": 1, "confirm_ms": 0.0}},
+    )
+    strat.init(ctx)
     now = datetime.now()
     bar = {"near_close": 44100.0, "far_close": 44020.0, "atr": 10.0,
            "timestamp": now, "code": "TMFF6"}
-    with patch("strategies.futures.monitor._mts_position_state_path") as msp, \
-         patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True):
-        msp.return_value.exists.return_value = False
+    with patch("strategies.futures.monitor._mts_position_state_path",
+               return_value=Path(tmp_path) / "state.json"), \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True), \
+         patch.object(Path, "exists", return_value=False):
         # producer tick 1: the REAL remaining-leg trail branch emits a signal
         sig1 = strat._manage_position(44100.0, 44020.0, -0.5, now, bar)
         # producer must have created ONE durable intent for t1 BEFORE emitting
