@@ -156,6 +156,7 @@ mts:
     execution_enabled: true
     tick_loop_slo_secs: 90
     on_bar_slo_secs: 90
+    pending_order_stall_secs: 120
     combined_upl_activation_net_pnl_twd: 200.0
     combined_upl_giveback_twd: 50.0
     entry_peak_guard_ms: 15000

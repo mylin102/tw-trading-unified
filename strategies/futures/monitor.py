@@ -350,6 +350,7 @@ class FuturesMonitor:
         # first evaluation is detected (not silently skipped).
         self._startup_mono = time.monotonic()
         self._last_mts_tick_mono = self._startup_mono
+        self._prev_mts_tick_mono = self._startup_mono
         self._last_mts_tick_wall = datetime.now().isoformat()
         self._last_strategy_evaluation_mono = self._startup_mono
         self._last_strategy_evaluation_wall = datetime.now().isoformat()
@@ -6852,10 +6853,13 @@ class FuturesMonitor:
         except Exception:
             pass
 
-        self._last_mts_tick_mono = time.monotonic()
-        self._last_mts_tick_wall = datetime.now().isoformat()
         _strat_has_pos = bool(getattr(strategy, "_has_position", False))
         _strat_tid = getattr(strategy, "_trade_id", None)
+        # 2026-08-06 codex v2 audit: capture the PREVIOUS completed tick's age
+        # BEFORE stamping this tick, so a whole-loop stall is observed on the
+        # first tick after recovery (same-thread checkers cannot fire during
+        # an active C-level/API/I/O hang).
+        self._mts_stamp_tick_loop()
 
         # 2026-08-06 Hermes Agent P1: three-state LEDGER authority drives both
         # the pre-signal reset and the post-signal exit gate. The state file
@@ -7112,6 +7116,17 @@ class FuturesMonitor:
         self._last_strategy_evaluation_wall = datetime.now().isoformat()
         self._strategy_evaluated_once = True
 
+    def _mts_stamp_tick_loop(self) -> None:
+        """Record the tick-loop heartbeat, keeping the previous tick's age.
+
+        The tick_loop SLO clock compares the PREVIOUS completed tick (set
+        before this stamp) so a stall between ticks is observed on the first
+        tick after recovery.
+        """
+        self._prev_mts_tick_mono = self._last_mts_tick_mono
+        self._last_mts_tick_mono = time.monotonic()
+        self._last_mts_tick_wall = datetime.now().isoformat()
+
     def _mts_evaluator_lag_slo(self, key: str, default: float) -> float:
         """Read an SLO threshold from mts.params; invalid/<=0 falls back."""
         try:
@@ -7122,14 +7137,50 @@ class FuturesMonitor:
             v = default
         return v
 
-    def _mts_check_evaluator_lag(self, strategy, strat_has_pos: bool) -> None:
-        """Evaluator-lag SLO v2 (2026-08-06 codex audit corrections).
+    def _mts_pending_orders_age(self):
+        """Return (has_pending_mts_order, oldest_age_secs_or_None).
 
-        Split clocks: tick-loop (every _mts_tick) and on_bar heartbeat.
-        Suppressed while FLAT, market closed, or MTS orders pending
-        (transition window — expected pause, not a stall). Baselines seeded
-        at startup so a restored OPEN position with no first evaluation
-        alerts after grace (first_eval=True).
+        Age is None when a pending order carries no usable timestamp — in
+        that case the caller suppresses (cannot judge staleness).
+        """
+        if not self.order_mgr:
+            return False, None
+        try:
+            _active = getattr(self.order_mgr, "active_orders", []) or []
+            if isinstance(_active, dict):
+                _active = list(_active.values())
+            _mts_strategies = {"MTS_ENTRY", "MTS_MANUAL", "MTS_RELEASE", "MTS_EXIT"}
+            _ages = []
+            _now_dt = datetime.now()
+            for _o in _active:
+                if str(getattr(_o, "strategy", "") or "") not in _mts_strategies:
+                    continue
+                _ts = getattr(_o, "created_at", None)
+                if _ts is None:
+                    return True, None
+                try:
+                    if isinstance(_ts, datetime):
+                        _ages.append((_now_dt - _ts).total_seconds())
+                    else:
+                        _ages.append(time.time() - float(_ts))
+                except (TypeError, ValueError):
+                    return True, None
+            if not _ages:
+                return False, None
+            return True, min(_ages)
+        except Exception:
+            return False, None
+
+    def _mts_check_evaluator_lag(self, strategy, strat_has_pos: bool) -> None:
+        """Evaluator-lag SLO v2.1 (2026-08-06 codex v2 audit corrections).
+
+        Split clocks: tick-loop (PREVIOUS completed tick) and on_bar
+        heartbeat. Suppressed while FLAT or market closed. Fresh pending MTS
+        orders (transition window) suppress; orders older than
+        pending_order_stall_secs alert as TRANSITION_STALL (hung order must
+        not suppress evaluator alerts indefinitely). Baselines seeded at
+        startup so a restored OPEN position with no first evaluation alerts
+        after grace (first_eval=True).
         """
         if not strat_has_pos:
             return
@@ -7138,16 +7189,26 @@ class FuturesMonitor:
                 return  # market closed — evaluator legitimately idle
         except Exception:
             pass  # fail-open on helper error (no false alarm)
-        try:
-            if self._mts_has_pending_mts_orders():
-                return  # transition window (entry/exit in flight)
-        except Exception:
-            pass
         _now = time.monotonic()
         _tid = getattr(strategy, "_trade_id", None)
+        try:
+            _has_pending, _pending_age = self._mts_pending_orders_age()
+        except Exception:
+            _has_pending, _pending_age = False, None
+        if _has_pending:
+            if _pending_age is not None and                     _pending_age > self._mts_evaluator_lag_slo(
+                        "pending_order_stall_secs", 120.0):
+                # hung order — alert, don't suppress forever
+                self._mts_slo_alert(
+                    "pending_stall", "pending_order_stall_secs", 120.0,
+                    _pending_age, _now, _tid,
+                    first_eval=False,
+                    last_wall=self._last_strategy_evaluation_wall,
+                )
+            return  # fresh or unjudgeable pending order — suppress this tick
         self._mts_slo_clock(
             "tick_loop", "tick_loop_slo_secs", 90.0,
-            self._last_mts_tick_mono, _now, _tid,
+            self._prev_mts_tick_mono, _now, _tid,
         )
         self._mts_slo_clock(
             "on_bar", "on_bar_slo_secs", 90.0,
@@ -7161,32 +7222,40 @@ class FuturesMonitor:
         """Evaluate one SLO clock; emit a rate-limited alert when stale."""
         if last_mono is None:
             return
-        _lag = now - last_mono
+        self._mts_slo_alert(
+            clock, cfg_key, default, now - last_mono, now, tid,
+            first_eval=clock == "on_bar" and not self._strategy_evaluated_once,
+            last_wall=(
+                self._last_strategy_evaluation_wall
+                if clock == "on_bar" else self._last_mts_tick_wall
+            ),
+        )
+
+    def _mts_slo_alert(
+        self, clock: str, cfg_key: str, default: float,
+        lag: float, now: float, tid, first_eval: bool, last_wall,
+    ) -> None:
+        """Emit a rate-limited MTS_EVALUATOR_LAG alert when lag > SLO."""
         _slo = self._mts_evaluator_lag_slo(cfg_key, default)
-        if _lag <= _slo:
+        if lag <= _slo:
             return
         if now - self._last_slo_alert_mono.get(clock, 0.0) < 60.0:
             return  # rate limit: at most one alert per minute per clock
         self._last_slo_alert_mono[clock] = now
-        _first = clock == "on_bar" and not self._strategy_evaluated_once
-        _last_wall = (
-            self._last_strategy_evaluation_wall
-            if clock == "on_bar" else self._last_mts_tick_wall
-        )
         logger.warning(
             "[MTS_EVALUATOR_LAG] clock=%s position open trade=%s silent for "
             "%.0fs (SLO %.0fs) first_eval=%s last_eval=%s",
-            clock, tid, _lag, _slo, _first, _last_wall,
+            clock, tid, lag, _slo, first_eval, last_wall,
         )
         try:
             self._append_mts_event(
                 "MTS_EVALUATOR_LAG",
                 clock=clock,
                 trade_id=tid,
-                lag_secs=round(_lag, 1),
+                lag_secs=round(lag, 1),
                 slo_secs=_slo,
-                first_eval=_first,
-                last_eval_at=_last_wall,
+                first_eval=first_eval,
+                last_eval_at=last_wall,
             )
         except Exception as _e:  # never let telemetry break the tick path
             logger.warning("[MTS_EVALUATOR_LAG] event write failed: %s", _e)
@@ -7202,6 +7271,8 @@ class FuturesMonitor:
             return False
         try:
             _active = getattr(self.order_mgr, "active_orders", []) or []
+            if isinstance(_active, dict):  # 2026-08-06: active_orders is Dict[str, Order]
+                _active = list(_active.values())
             _mts_strategies = {"MTS_ENTRY", "MTS_MANUAL", "MTS_RELEASE", "MTS_EXIT"}  # 2026-07-09 Hermes Agent: include MTS_MANUAL so pending manual orders block duplicate entries
             for _o in _active:
                 _strat = str(getattr(_o, "strategy", "") or "")
