@@ -50,6 +50,11 @@ class StubOrderMgr:
         o.client_order_id = kw.get("client_order_id")
         o.intent_id = kw.get("intent_id")
         o.leg = kw.get("leg")
+        o.symbol = kw.get("symbol")
+        o.side = kw.get("side")
+        o.quantity = kw.get("quantity")
+        o.order_type = kw.get("order_type")
+        o.strategy = kw.get("strategy")
         o.created_at = kw.get("created_at") or _dt.now()
         self.active_orders[o.order_id] = o
         o.to_dict = lambda: {
@@ -74,7 +79,10 @@ class StubOrderMgr:
         if hasattr(arg, "order_id"):  # dispatcher path: submit(order)
             self.submits.append({"client_order_id": getattr(arg, "client_order_id", None),
                                  "leg": leg or getattr(arg, "leg", None),
-                                 "order_id": arg.order_id})
+                                 "order_id": arg.order_id,
+                                 "symbol": getattr(arg, "symbol", None),
+                                 "side": getattr(arg, "side", None),
+                                 "quantity": getattr(arg, "quantity", None)})
             return arg
         self.submits.append({"client_order_id": arg, "leg": leg})
         return {"order_id": f"ORD-{arg}"}
@@ -167,7 +175,7 @@ def build_monitor(tmp_path, monkeypatch):
     strat._lifecycle_oca = PositionLifecycle(
         phase=PositionPhase.SINGLE_LEG,
         release_group=ReleaseGroup(status=ReleaseGroupStatus.COMPLETED,
-                                   filled_leg=Leg.FAR, canceled_leg=Leg.NEAR),
+                                   filled_leg=Leg.NEAR, canceled_leg=Leg.FAR),
         trail_group=TrailGroup(status=TrailGroupStatus.ARMED),
     )
     return monitor, strat, api
@@ -1111,7 +1119,7 @@ def test_b42_crash_tail_fail_closed(tmp_path):
 #       POLICY_J_SINGLE_LEG_TRIGGERED event
 #    5) below activation / insufficient giveback ⇒ zero orders
 #    RED until the single-leg Policy J path is wired. ────────────────────
-def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch):
+def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch, caplog):
     from datetime import datetime
     from pathlib import Path
     from unittest.mock import patch, MagicMock
@@ -1123,9 +1131,25 @@ def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch):
         TrailGroup, TrailGroupStatus, Leg,
     )
     import types as _types
+    import logging as _logging
 
+    caplog.set_level(_logging.INFO)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    # fills ledger: the release fill writes here AND the dispatcher's
+    # per-leg open-qty reconstruction reads the same path
+    fills_path = tmp_path / "mts_trade_fills.jsonl"
+    monkeypatch.setenv("MTS_FILL_LOG_PATH", str(fills_path))
+    monkeypatch.setenv("MTS_EVENT_LOG_PATH", str(tmp_path / "mts_spread_events.jsonl"))
+    import strategies.plugins.futures.active.tmf_spread as _tmf
+    _tmf._MTS_FILL_LOG = str(fills_path)
+    # seed the entry fills (near+far) so open-qty reconstruction has
+    # ENTRY evidence for t1
+    with open(fills_path, "a", encoding="utf-8") as _fh:
+        for _leg, _code in (("NEAR", "TMFF6"), ("FAR", "TMFH6")):
+            _fh.write(json.dumps({"trade_id": "t1", "leg": _leg,
+                                  "contract": _code, "qty": 1,
+                                  "fill_type": "ENTRY", "side": "BUY"}) + "\n")
     monitor, strat, api = build_monitor(tmp_path, monkeypatch)
     ctx = StrategyContext(
         market=MarketData(last_bar={}, ticker="TMF"),
@@ -1208,6 +1232,15 @@ def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch):
             f"expected SINGLE_LEG after release fill, got {_lc.phase.value}"
         assert getattr(strat, "_released_leg", None) == "near"
         strat._lifecycle = "TRAILING_LONG"  # release path marks EXITING; clear it
+        # production enum semantics for a confirmed NEAR release:
+        # filled_leg=NEAR, canceled_leg=FAR, remaining_leg=FAR
+        assert _lc.release_group.filled_leg == Leg.NEAR
+        assert _lc.release_group.canceled_leg == Leg.FAR
+        assert _lc.trail_group.remaining_leg == Leg.FAR
+        # per-leg open qty reconstructed from the fills ledger: near=0 far=1
+        _qty = monitor._mts_ledger_reconstructed_open_qty("t1")
+        assert _qty is not None, "ledger reconstruction must have entry evidence"
+        assert _qty == {"NEAR": 0, "FAR": 1}, f"open qty mismatch: {_qty}"
         # durable peak ≥ 200 TWD (released realized + remaining mark)
         strat._peak_net_exit_pnl_twd = 1300.0
         # ── phase 2: giveback ≥ 50 TWD on the remaining leg ⇒ trigger ──
@@ -1215,15 +1248,43 @@ def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch):
                 "timestamp": now, "code": "TMFF6"}
         sig2 = strat._manage_position(43400.0, 44350.0, -0.5, now, bar2)
         assert sig2 is not None, "single-leg Policy J exit emission expected"
+        # point 4: the signal must be Policy J PRODUCED (the adapter's
+        # giveback block logged POLICY_J_TRIGGERED), not the native trailing
+        # stop coincidentally firing first
+        assert sig2.action == "EXIT" and sig2.reason == "TMF_TRAIL", \
+            f"unexpected signal {sig2}"
+        assert "POLICY_J_TRIGGERED" in caplog.text, \
+            "Policy J provenance missing — native trail may have fired first"
+        # point 5: the trigger arithmetic must hold on the REAL adapter
+        # context (computed, not assumed)
+        _n = strat._pnl_near(43400.0)
+        _f = strat._pnl_far(44350.0)
+        _current_net = (_n + _f) * 10.0 - 92.0
+        _peak = strat._peak_net_exit_pnl_twd
+        _act = float(strat._params.get("combined_upl_activation_net_pnl_twd", 300.0))
+        _gb = float(strat._params.get("combined_upl_giveback_twd", 100.0))
+        assert _peak >= _act, f"peak {_peak} below activation {_act}"
+        assert _current_net <= _peak - _gb, \
+            f"current {_current_net} not below giveback line {_peak - _gb}"
+        assert _current_net < _peak, "direction: current must be below peak"
+        # point 1: delta BEFORE the Policy-J dispatch — the release's own
+        # order must NOT be counted
+        _before = len(monitor.order_mgr.submits)
         monitor._submit_mts_order_signal(sig2, strat, bar2, now)
-        # ONE remaining-leg exit order (FAR SELL for LONG), no released-leg order
-        far_orders = [s for s in monitor.order_mgr.submits
-                      if getattr(s, "symbol", "") == "TMFH6"]
-        near_orders = [s for s in monitor.order_mgr.submits
-                       if getattr(s, "symbol", "") == "TMFF6"]
-        assert len(monitor.order_mgr.submits) == 1, \
-            f"expected exactly ONE order, got {len(monitor.order_mgr.submits)}"
-        assert len(near_orders) == 0, "released leg must NOT be re-exited"
+        _new = monitor.order_mgr.submits[_before:]
+        # point 2: ONE new order for the REMAINING leg only — FAR code, SELL,
+        # qty=1 — and NO near-code order in the delta set
+        assert len(_new) == 1, \
+            f"expected exactly ONE new order, got {len(_new)}: {_new}"
+        _order_rec = _new[0]
+        assert _order_rec["symbol"] == "TMFH6", \
+            f"remaining-leg order must be FAR code, got {_order_rec}"
+        assert _order_rec["side"] == OrderSide.SELL, \
+            f"LONG exit must SELL, got {_order_rec['side']}"
+        assert _order_rec["quantity"] == 1, \
+            f"qty must be 1, got {_order_rec['quantity']}"
+        assert not any(o["symbol"] == "TMFF6" for o in _new), \
+            "released NEAR leg must NOT be re-exited"
         # durable intent exists for t1
         intent_log = ei.IntentLog(str(tmp_path / "logs"))
         actives = [iid for iid in intent_log.list_active()
@@ -1242,7 +1303,8 @@ def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch):
         sig3 = strat._manage_position(43400.0, 44350.0, -0.5, now, bar2)
         assert sig3 is None, "in-flight gate must suppress re-emission"
         monitor._submit_mts_order_signal(sig3, strat, bar2, now) if sig3 else None
-        assert len(monitor.order_mgr.submits) == 1, "duplicate exit re-submitted"
+        assert len(monitor.order_mgr.submits) - _before == 1, \
+            "duplicate exit re-submitted"
     # ── phase 4 (isolated): below activation ⇒ zero orders ──
     mon2, strat2, api2 = build_monitor(tmp_path, monkeypatch)
     strat2.init(ctx)
@@ -1261,8 +1323,9 @@ def test_b48_policy_j_single_leg_wiring(tmp_path, monkeypatch):
     strat2._lifecycle_oca = PositionLifecycle(
         phase=PositionPhase.SINGLE_LEG,
         release_group=ReleaseGroup(status=ReleaseGroupStatus.COMPLETED,
-                                   filled_leg=Leg.FAR, canceled_leg=Leg.NEAR),
-        trail_group=TrailGroup(status=TrailGroupStatus.ARMED),
+                                   filled_leg=Leg.NEAR, canceled_leg=Leg.FAR),
+        trail_group=TrailGroup(status=TrailGroupStatus.ARMED,
+                               remaining_leg=Leg.FAR),
     )
     with patch("strategies.futures.monitor._mts_position_state_path",
                return_value=Path(tmp_path) / "state2.json"), \
