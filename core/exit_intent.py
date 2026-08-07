@@ -82,11 +82,47 @@ class IllegalTransitionError(IntentError):
     pass
 
 
+class DuplicateRepairError(IntentError):
+    pass
+
+
+class CorruptLogError(IntentError):
+    pass
+
+
 def client_order_id(trade_id: str, leg: str, nonce: Optional[str] = None) -> str:
     """Deterministic pre-I/O client id (per-leg idempotency key)."""
     import hashlib
     seed = f"{trade_id}:{leg}:{nonce or '0'}"
     return "CE-" + hashlib.sha256(seed.encode()).hexdigest()[:16]
+
+
+def _os_start_token(pid: int):
+    """Verifiable per-PID OS start token (codex: never guess a foreign
+    owner's identity). Returns ("alive", token) | ("dead", None) |
+    ("unknown", None)."""
+    import subprocess
+    try:
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return ("alive", f"{pid}:{r.stdout.strip()}")
+        if r.returncode == 1 and not r.stdout.strip():
+            return ("dead", None)  # verified absent
+        return ("unknown", None)   # unverifiable → fail-closed
+    except Exception:
+        return ("unknown", None)
+
+
+def _default_owner_check(pid, token) -> dict:
+    """Owner-verified check against the OS: returns
+    {"state": alive|dead|unknown, "start_token": current}. Callers reclaim
+    ONLY on dead or alive-with-token-mismatch (PID reuse); unknown and
+    alive-with-same-token are NEVER reclaimed."""
+    if not isinstance(pid, int):
+        return {"state": "unknown", "start_token": None}
+    state, cur_token = _os_start_token(pid)
+    return {"state": state, "start_token": cur_token}
 
 
 def _atomic_append(path: str, record: dict) -> None:
@@ -112,32 +148,25 @@ def _atomic_append(path: str, record: dict) -> None:
 
 
 def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError, PermissionError):
-        return False
-
-
-def _default_owner_check(pid, token) -> dict:
-    """Real owner-verified check: PID liveness + current process token."""
-    return {"alive": _pid_alive(pid) if isinstance(pid, int) else False,
-            "start_token": _PROCESS_TOKEN}
+    return _os_start_token(pid)[0] == "alive"
 
 
 def _read_rows(path: str) -> List[dict]:
+    """Read + parse; raises CorruptLogError on ANY malformed record
+    (fail-closed: a crash tail must never be silently swallowed)."""
     if not os.path.exists(path):
         return []
     out = []
     with open(path, encoding="utf-8") as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, 1):
             line = line.strip()
             if not line:
                 continue
             try:
                 out.append(json.loads(line))
-            except ValueError:
-                continue
+            except ValueError as exc:
+                raise CorruptLogError(
+                    f"malformed record at {path}:{lineno}") from exc
     return out
 
 
@@ -146,6 +175,7 @@ class IntentLog:
 
     def __init__(self, log_dir: str):
         self.log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)  # BEFORE any lock acquisition
         self.log_path = os.path.join(log_dir, INTENT_LOG_NAME)
         self.archive_path = os.path.join(log_dir, INTENT_ARCHIVE_NAME)
         self.lock_path = os.path.join(log_dir, LOCK_NAME)
@@ -186,8 +216,35 @@ class IntentLog:
 
     # ── durable lock (design §1.7: owner-verified; age never authorizes) ─
     def _lock_meta(self) -> dict:
-        return {"pid": os.getpid(), "start_token": _PROCESS_TOKEN,
+        state, token = _os_start_token(os.getpid())
+        return {"pid": os.getpid(),
+                "start_token": token or _PROCESS_TOKEN,
                 "host": socket.gethostname(), "acquired_at": time.time()}
+
+    def _write_lock(self, fd) -> None:
+        meta = self._lock_meta()
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        # fsync the parent dir so the lock file creation is durable
+        dfd = os.open(self.log_dir, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+    def _release_lock(self) -> None:
+        """Only unlink if the lock still belongs to THIS owner (fence)."""
+        own = self._read_owner()
+        if own is None:
+            return
+        if own.get("pid") == os.getpid() and \
+                own.get("start_token") == self._lock_meta()["start_token"]:
+            try:
+                os.unlink(self.lock_path)
+            except OSError:
+                pass
 
     @contextmanager
     def _file_lock(self):
@@ -198,17 +255,20 @@ class IntentLog:
             except FileExistsError:
                 owner = self._read_owner()
                 reclaim = False
-                if owner is not None:
-                    verdict = _default_owner_check(owner.get("pid"),
-                                                   owner.get("start_token"))
-                    alive = bool(verdict.get("alive"))
-                    token = verdict.get("start_token")
-                    if token is not None and token != owner.get("start_token"):
-                        reclaim = True  # PID reused by a new incarnation
-                    elif not alive:
-                        reclaim = True
-                else:
-                    reclaim = True  # corrupt/empty lock file
+                if owner is None:
+                    # empty/partial lock file (writer mid-flight) or corrupt:
+                    # NEVER reclaim — fail-closed (codex: unknown ⇒ LOCK_BUSY)
+                    raise LockBusyError("lock file unreadable (writer in flight?)")
+                verdict = _default_owner_check(owner.get("pid"),
+                                               owner.get("start_token"))
+                state = verdict.get("state")
+                cur_token = verdict.get("start_token")
+                if state == "dead":
+                    reclaim = True
+                elif state == "alive" and cur_token is not None and \
+                        cur_token != owner.get("start_token"):
+                    reclaim = True  # PID reused by a new incarnation
+                # alive+same-token and unknown ⇒ NEVER reclaim (fail-closed)
                 if not reclaim:
                     raise LockBusyError(
                         f"lock held by pid={owner.get('pid') if owner else '?'}")
@@ -219,15 +279,11 @@ class IntentLog:
                     except OSError:
                         pass
                 continue  # retry acquire
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(self._lock_meta(), ensure_ascii=False))
+            self._write_lock(fd)
             try:
                 yield
             finally:
-                try:
-                    os.unlink(self.lock_path)
-                except OSError:
-                    pass
+                self._release_lock()
             return
 
     def _locked(self, fn: Callable, *a, **k):
@@ -254,6 +310,7 @@ class IntentLog:
                         reclaim = True  # PID reused
                     elif not alive:
                         reclaim = True
+                # owner unreadable or no owner_check → fail-closed, no reclaim
                 if not reclaim:
                     raise LockBusyError(
                         f"lock held by pid={owner.get('pid') if owner else '?'}")
@@ -392,6 +449,13 @@ class IntentLog:
             cur = self.get(intent_id)
             if cur.get("terminal") == "SUPERSEDED_BY_EMERGENCY":
                 raise SupersededIntentError(intent_id)
+            # per-(parent, leg) ACTIVE child idempotency (codex #3): a second
+            # repair for the same leg must NOT create another submittable order
+            for iid in self.list_active():
+                r = self.get(iid)
+                if r.get("parent") == intent_id and leg in r.get("legs", {}):
+                    raise DuplicateRepairError(
+                        f"active repair child {iid} exists for {intent_id} {leg}")
             child = self._create_locked(cur["trade_id"], f"REPAIR:{reason}",
                                         parent=intent_id, leg=leg)
             _atomic_append(self.log_path, child)

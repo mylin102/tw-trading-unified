@@ -491,11 +491,15 @@ def test_b21_two_instances_concurrent_single_action(tmp_path):
     barrier = threading.Barrier(3)
     outcomes = []
 
+    def slow_query(c):
+        time.sleep(0.15)  # hold the lock long enough for the loser to collide
+        return {"status": "NOT_FOUND"}
+
     def actor(name, log_inst):
         barrier.wait()
         # NO external lock — recovery must serialize internally
         try:
-            r = log_inst.recover(iid, query_fn=lambda c: {"status": "NOT_FOUND"})
+            r = log_inst.recover(iid, query_fn=slow_query)
             outcomes.append((name, r["legs"]["NEAR"]["status"]))
         except ei.LockBusyError:
             outcomes.append((name, "LOCK_BUSY"))
@@ -746,18 +750,22 @@ def test_b34_public_mutation_race_serialized(tmp_path):
     assert log.get(iid)["version"] == 1 + 2 * 5  # no lost updates
 
 
-# ── B35: child repair race — concurrent repair_complete yields DISTINCT
-#         child ids (uuid nonce, no collision) ───────────────────────────
+# ── B35: child repair race — concurrent repair_complete yields EXACTLY ONE
+#         active child (per-(parent,leg) idempotency; the loser is rejected) ─
 def test_b35_child_repair_race_distinct_ids(tmp_path):
     log = make_log(tmp_path)
     iid = make_intent(log)
     barrier = threading.Barrier(3)
     children = []
+    errors = []
 
     def worker():
         barrier.wait()
-        child = log.repair_complete(iid, "FAR", reason="RACE")
-        children.append(child["intent_id"])
+        try:
+            child = log.repair_complete(iid, "FAR", reason="RACE")
+            children.append(child["intent_id"])
+        except ei.DuplicateRepairError:
+            errors.append("dup")
 
     ts = [threading.Thread(target=worker) for _ in range(2)]
     for t in ts:
@@ -765,8 +773,8 @@ def test_b35_child_repair_race_distinct_ids(tmp_path):
     barrier.wait()
     for t in ts:
         t.join()
-    assert len(children) == 2
-    assert children[0] != children[1]  # distinct ids
+    assert len(children) == 1  # exactly ONE active repair child
+    assert len(errors) == 1     # the second call was rejected (no double order)
 
 
 # ── B36: id collision resistance — many creates yield unique ids ────────
@@ -804,3 +812,74 @@ def test_b38_partial_fill_terminal(tmp_path):
     outcome = log.recover(iid, query_fn=lambda c: {"status": states[c.split("-")[1]]})
     assert outcome["terminal"] == "PARTIAL"
     assert log.has_inflight_exit_intent("t1") is True  # repair still pending
+
+
+# ── B39: LIVE foreign process with the SAME OS start token is NOT
+#         reclaimed (healthy owner; owner-verified against the OS) ────────
+def test_b39_live_foreign_same_token_not_reclaimed(tmp_path):
+    import subprocess as sp
+    import sys
+    log = make_log(tmp_path)
+    lock_path = str(tmp_path / "intent.lock")
+    code = (
+        "import json,os,sys,time,subprocess\n"
+        "pid=os.getpid()\n"
+        "r=subprocess.run(['ps','-o','lstart=','-p',str(pid)],"
+        "capture_output=True,text=True)\n"
+        "tok=f'{pid}:{r.stdout.strip()}'\n"
+        "open(sys.argv[1],'w').write(json.dumps({'pid':pid,'start_token':tok}))\n"
+        "time.sleep(10)\n"
+    )
+    child = sp.Popen([sys.executable, "-c", code, lock_path])
+    try:
+        for _ in range(100):
+            if os.path.exists(lock_path) and os.path.getsize(lock_path) > 10:
+                break
+            time.sleep(0.05)
+        with pytest.raises(ei.LockBusyError):
+            with log._file_lock():  # healthy foreign owner: NOT stolen
+                pass
+    finally:
+        child.kill()
+        child.wait()
+    # after the foreign process is VERIFIED dead → owner-verified reclaim works
+    # (the dead owner's lock file is reclaimed, not waited out)
+    with log._file_lock():
+        assert log.lock_owner()["pid"] == os.getpid()
+
+
+# ── B40: LIVE pid with a STALE recorded token (PID reuse) ⇒ reclaimed ────
+def test_b40_foreign_mismatch_reclaimed(tmp_path):
+    log = make_log(tmp_path)
+    # stale token recorded for a live pid (the OS token no longer matches)
+    log._force_lock_owner({"pid": os.getpid(),
+                           "start_token": f"{os.getpid()}:stale-token"})
+    with log._file_lock():
+        assert log.lock_owner()["pid"] == os.getpid()
+
+
+# ── B41: UNVERIFIABLE owner query ⇒ fail-closed LOCK_BUSY, never reclaim ─
+def test_b41_unknown_owner_check_fail_closed(tmp_path, monkeypatch):
+    log = make_log(tmp_path)
+    log._force_lock_owner({"pid": 12345, "start_token": "x"})
+    monkeypatch.setattr(ei, "_os_start_token",
+                        lambda pid: ("unknown", None))
+    with pytest.raises(ei.LockBusyError):
+        with log._file_lock():
+            pass
+
+
+# ── B42: crash-tail malformed record ⇒ CorruptLogError fail-closed (never
+#         silently swallowed) ────────────────────────────────────────────
+def test_b42_crash_tail_fail_closed(tmp_path):
+    log = make_log(tmp_path)
+    iid = make_intent(log)
+    # simulate a crash mid-append: truncated JSON line at the tail
+    with open(log.log_path, "a", encoding="utf-8") as fh:
+        fh.write('{"intent_id": "CE-t1-trunc')
+    with pytest.raises(ei.CorruptLogError):
+        log.get(iid)
+    with pytest.raises(ei.CorruptLogError):
+        log.recover(iid, query_fn=lambda c: {"status": "NOT_FOUND"})
+    with pytest.raises(ei.CorruptLogError):
+        log.list_active()
