@@ -395,7 +395,7 @@ class IntentLog:
             "FAR": {"status": "NOT_SUBMITTED", "client_order_id": None,
                     "broker_order_id": None},
         }
-        if parent and leg:
+        if leg:
             legs = {leg: {"status": "NOT_SUBMITTED", "client_order_id": None,
                           "broker_order_id": None}}
         for l in legs:
@@ -467,9 +467,10 @@ class IntentLog:
         self._append_locked(intent_id, builder)
 
     # ── public mutations (all internally locked) ──────────────────────
-    def create(self, trade_id: str, reason: str = "COMBINED_EXIT") -> str:
+    def create(self, trade_id: str, reason: str = "COMBINED_EXIT",
+               leg: Optional[str] = None) -> str:
         def _do():
-            rec = self._create_locked(trade_id, reason)
+            rec = self._create_locked(trade_id, reason, leg=leg)
             _atomic_append(self.log_path, rec)
             return rec["intent_id"]
         return self._locked(_do)

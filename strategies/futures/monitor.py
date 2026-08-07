@@ -144,6 +144,8 @@ def _repo_root() -> str:
 def _mts_position_state_path() -> Path:
     """Return the MTS position state file path.
 
+    P1-B: also hosts the durable exit-intent log under <runtime>/logs.
+
     Respects MTS_STATE_PATH env var override (used in production for
     alternate deployments), falling back to the module-level constant.
     Tests can monkeypatch MTS_POSITION_STATE_PATH to redirect.
@@ -166,6 +168,25 @@ def _mts_position_state_path() -> Path:
             return MTS_POSITION_STATE_PATH
         return Path("/tmp/test_mts_position_state.json")
     return Path(os.getenv("MTS_STATE_PATH", str(MTS_POSITION_STATE_PATH)))
+
+
+def _mts_intent_log_dir() -> str:
+    """P1-B: durable COMBINED_EXIT intent log at the shared runtime dir.
+
+    Same isolation convention as _mts_position_state_path: under pytest
+    without TRADING_RUNTIME_DIR, use a PER-TEST temp dir (never the repo)."""
+    import sys as _sys
+    if "pytest" in _sys.modules:
+        _rt = os.environ.get("TRADING_RUNTIME_DIR")
+        if _rt:
+            return os.path.join(_rt, "logs")
+        import tempfile as _tf
+        import hashlib as _hl
+        _pt = os.environ.get("PYTEST_CURRENT_TEST", "") or ""
+        _pt_id = _hl.md5(_pt.encode()).hexdigest()[:10] if _pt else "default"
+        return os.path.join(_tf.gettempdir(), f"test_mts_exit_intent_{_pt_id}")
+    from core.runtime_paths import runtime_root
+    return os.path.join(runtime_root(), "logs")
 
 try:
     from core.notification.notifier import notify_trade_event as _notify_trade_event
@@ -3514,6 +3535,23 @@ class FuturesMonitor:
                       self.trader.execute_signal(_mkt_action, price, ts, lots=lots)
                       console.print(f"[dim][MTS_SYNC] NEAR-leg synced to trader: {self.trader.position} ({_mkt_action})[/dim]")
 
+                 # P1-B: mirror the confirmed fill into the durable exit
+                 # intent (fence-aware transition, same runtime logs dir)
+                 try:
+                     _iid = pending.get("intent_id")
+                     _leg_role = pending.get("leg_role")
+                     if _iid and _leg_role:
+                         from core.exit_intent import IntentLog as _MTSIntentLog
+                         _ilog = _MTSIntentLog(_mts_intent_log_dir())
+                         _cur = _ilog.get(_iid)
+                         if _cur is not None and \
+                                 _cur.get("legs", {}).get(_leg_role, {}).get("status") != "FILLED":
+                             _ilog.transition(_iid, _leg_role, "FILLED")
+                 except Exception:
+                     import logging
+                     logging.getLogger("FuturesMonitor").warning(
+                         "[P1B_FILL_SYNC_FAILED] order_id=%s", event.order_id)
+
                  self._applied_lifecycle_deals.add(deal_key)
 
                  # Check Combined Exit group completion
@@ -3546,9 +3584,9 @@ class FuturesMonitor:
                                  console.print("[bold green]\u2705 [MTS_ORDER] COMBINED_EXIT COMPLETED: group=" + str(_ce_group_id) + " near=" + str(np) + " far=" + str(fp) + "[/bold green]")
                              self._append_mts_event("COMBINED_EXIT_COMPLETED",
                                  group_id=_ce_group_id,
-                                 near_fill_price=np if '_ceg' in dir() else 0,
-                                 far_fill_price=fp if '_ceg' in dir() else 0,
-                                 trade_id=_trade_id)
+                                 near_fill_price=_ceg.get("near_fill_price", 0) if _ceg else 0,
+                                 far_fill_price=_ceg.get("far_fill_price", 0) if _ceg else 0,
+                                 trade_id=pending.get("trade_id", ""))
 
                  # Execution Quality Audit
                  _ref_ohlc = pending.get("ref_ohlc", {})
@@ -4820,9 +4858,35 @@ class FuturesMonitor:
             _near_order = self.order_mgr.create_order(symbol=_near_code, side=_near_order_side, order_type=OrderType.MKP, quantity=_near_qty, strategy="MTS_EXIT")
             _far_order = self.order_mgr.create_order(symbol=_far_code, side=_far_order_side, order_type=OrderType.MKP, quantity=_far_qty, strategy="MTS_EXIT")
 
-            # Submit both orders
-            self.order_mgr.submit(_near_order)
-            self.order_mgr.submit(_far_order)
+            # P1-B durable-exit-intent: ids persisted BEFORE any broker I/O;
+            # each leg goes through the canonical submit_leg (durable
+            # SUBMIT_ATTEMPTED → I/O → SUBMITTED). This is the direct
+            # countermeasure for the P1-2 submission-layer double-submit.
+            from core.exit_intent import IntentLog as _MTSIntentLog
+            _ilog = _MTSIntentLog(_mts_intent_log_dir())
+            _iid = None
+            for _i in _ilog.list_active():
+                if _ilog.get(_i).get("trade_id") == _trade_id:
+                    _iid = _i
+                    break
+            if _iid is None:
+                _iid = _ilog.create(_trade_id, "COMBINED_EXIT")
+            _near_order.intent_id = _iid
+            _far_order.intent_id = _iid
+            _near_order.client_order_id = _ilog.get(_iid)["legs"]["NEAR"]["client_order_id"]
+            _far_order.client_order_id = _ilog.get(_iid)["legs"]["FAR"]["client_order_id"]
+            from core.exit_intent import DuplicateSubmitError as _MTSDupSubmit
+            try:
+                _ilog.submit_leg(_iid, "NEAR", self.order_mgr,
+                                 submit_fn=lambda cid, leg: self.order_mgr.submit(_near_order))
+            except _MTSDupSubmit:
+                # P1-2 dedup: a repeated exit decision must NOT re-send
+                console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} NEAR already submitted — suppressing duplicate[/yellow]")
+            try:
+                _ilog.submit_leg(_iid, "FAR", self.order_mgr,
+                                 submit_fn=lambda cid, leg: self.order_mgr.submit(_far_order))
+            except _MTSDupSubmit:
+                console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} FAR already submitted — suppressing duplicate[/yellow]")
             # 2026-07-30: Write state to COMBINED_EXIT only AFTER successful submission
             try:
                 from strategies.plugins.futures.active.tmf_spread import _write_mts_state
@@ -4841,12 +4905,14 @@ class FuturesMonitor:
                 "trade_id": _trade_id,  # 2026-07-31: real trade_id for fills-ledger correlation
                 "ts": _ts, "lots": _near_qty, "price": _near_close, "ref_ohlc": _snap["near"],
                 "strategy": "MTS_EXIT", "combined_exit_group_id": _ce_group_id,
+                "leg_role": "NEAR",  # P1-B: intent leg correlation for fills
             }
             self._pending_lifecycle_orders[_far_order.order_id] = {
                 "intent_id": _far_order.intent_id, "signal": "COMBINED_EXIT_FAR", "reason": "COMBINED_EXIT",
                 "trade_id": _trade_id,  # 2026-07-31: real trade_id for fills-ledger correlation
                 "ts": _ts, "lots": _far_qty, "price": _far_close, "ref_ohlc": _snap["far"],
                 "strategy": "MTS_EXIT", "combined_exit_group_id": _ce_group_id,
+                "leg_role": "FAR",  # P1-B: intent leg correlation for fills
             }
 
             # Append MTS events for audit trail
@@ -4963,9 +5029,30 @@ class FuturesMonitor:
                 "intent_id": _order.intent_id, "signal": "EXIT", "reason": _reason,
                 "ts": _ts, "lots": 1, "price": _ref_price, "ref_ohlc": _ref_ohlc,
                 "strategy": "MTS_EXIT",
+                "leg_role": _leg_label,  # P1-B: intent leg correlation for fills
             }
 
-            self.order_mgr.submit(_order)
+            # P1-B durable-exit-intent: canonical submit — the producer
+            # created the in-flight intent (remaining leg); if absent (legacy
+            # path), create it now. Durable SUBMIT_ATTEMPTED precedes the I/O.
+            from core.exit_intent import IntentLog as _MTSIntentLog
+            _ilog = _MTSIntentLog(_mts_intent_log_dir())
+            _iid = None
+            for _i in _ilog.list_active():
+                if _ilog.get(_i).get("trade_id") == _trade_id:
+                    _iid = _i
+                    break
+            if _iid is None:
+                _iid = _ilog.create(_trade_id, "COMBINED_EXIT", leg=_leg_label)
+            _order.intent_id = _iid
+            _order.client_order_id = _ilog.get(_iid)["legs"][_leg_label]["client_order_id"]
+            from core.exit_intent import DuplicateSubmitError as _MTSDupSubmit
+            try:
+                _ilog.submit_leg(_iid, _leg_label, self.order_mgr,
+                                 submit_fn=lambda cid, leg: self.order_mgr.submit(_order))
+            except _MTSDupSubmit:
+                # P1-2 dedup: a repeated exit decision must NOT re-send
+                console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} {_leg_label} already submitted — suppressing duplicate[/yellow]")
 
             # ADR-009 Task 9: confirm order submit before lifecycle SUBMITTED
             # Backfill exit_order_id + set SUBMITTED + flush state immediately.

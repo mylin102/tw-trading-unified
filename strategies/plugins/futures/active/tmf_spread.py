@@ -614,6 +614,26 @@ def _append_event(event_type: str, **kwargs) -> None:
         pass
 
 
+def _exit_intent_log():
+    """P1-B: durable COMBINED_EXIT intent log at the shared runtime dir.
+
+    Same isolation convention as _mts_position_state_path: under pytest
+    without TRADING_RUNTIME_DIR, use a PER-TEST temp dir (never the repo)."""
+    import sys as _sys
+    from core.exit_intent import IntentLog
+    if "pytest" in _sys.modules:
+        _rt = os.environ.get("TRADING_RUNTIME_DIR")
+        if _rt:
+            return IntentLog(os.path.join(_rt, "logs"))
+        import tempfile as _tf
+        import hashlib as _hl
+        _pt = os.environ.get("PYTEST_CURRENT_TEST", "") or ""
+        _pt_id = _hl.md5(_pt.encode()).hexdigest()[:10] if _pt else "default"
+        return IntentLog(os.path.join(_tf.gettempdir(), f"test_mts_exit_intent_{_pt_id}"))
+    from core.runtime_paths import runtime_root
+    return IntentLog(os.path.join(runtime_root(), "logs"))
+
+
 def _session_label() -> str:
     """Return 'night' if current time is in night session, else 'day'."""
     _h = datetime.now().hour
@@ -4271,6 +4291,17 @@ class TMFSpread(StrategyBase):
                 _commit_action(self._lifecycle_oca, _decision)
                 logger.warning("[LIFECYCLE_DECISION] action=%s release_leg=%s", _decision.action, _decision.release_leg)
                 _write_mts_state(has_position=True, action=f"RELEASE_{_release_leg.value}", reason=f"{_release_leg.value}_pnl={_pnl_pts:.1f}", near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, near_status="RELEASED" if _release_leg == Leg.NEAR else "OPEN", far_status="RELEASED" if _release_leg == Leg.FAR else "OPEN", near_realized_override=_realized if _release_leg == Leg.NEAR else None, far_realized_override=_realized if _release_leg == Leg.FAR else None, spread_z=spread_z, released_leg=_rel_leg_str, release_price=_exit_price, release_stop_points=int(release_stop), trail_distance_points=int(trail_dist), trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
+                # P1-B durable-exit-intent: a release STARTS the exit sequence —
+                # persist the intent for the REMAINING leg before emitting
+                try:
+                    _ilog = _exit_intent_log()
+                    if _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
+                        logger.info("[P1B_GATE] exit intent in-flight for %s — suppressing release re-emission", getattr(self, "_trade_id", ""))
+                        return None
+                    _rem_leg_s = "FAR" if _release_leg == Leg.NEAR else "NEAR"
+                    _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT", leg=_rem_leg_s)
+                except Exception:
+                    pass  # intent log unavailable → legacy behavior
                 return Signal("PARTIAL_EXIT", _signal_reason, confidence=0.4)
             elif _decision.action in (LifecycleAction.TRAIL, LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT):
                 # ── ADR-011 Phase 4: Post-fill warmup guard ──
@@ -4334,6 +4365,17 @@ class TMFSpread(StrategyBase):
                 _append_event("EXIT_REMAINING", reason=_exit_reason, remaining_leg=_rem_leg.value, exit_price=_exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, **_risk_meta)
                 _write_mts_state(has_position=True, action=f"EXIT_{_exit_reason}", reason=_exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
                 self._log_shadow_trade_summary(_exit_price, _exit_reason, _pnl_pts, now, bar, near_close, far_close)
+                # P1-B durable-exit-intent: gate + ids persisted BEFORE the
+                # signal is emitted (the dispatcher submits via these ids)
+                try:
+                    _ilog = _exit_intent_log()
+                    if _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
+                        logger.info("[P1B_GATE] exit intent in-flight for %s — suppressing re-emission", getattr(self, "_trade_id", ""))
+                        return None
+                    _rem_name = _rem_leg.value if hasattr(_rem_leg, "value") else str(_rem_leg)
+                    _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT", leg=str(_rem_name).upper())
+                except Exception:
+                    pass  # intent log unavailable → legacy behavior
                 return Signal("EXIT", f"TMF_{_exit_reason}", confidence=0.5, stop_loss=0)
             elif _decision.action == LifecycleAction.COMBINED_EXIT:
                 _exit_reason = "COMBINED_EXIT"
@@ -4365,6 +4407,16 @@ class TMFSpread(StrategyBase):
                 )
                 _commit_action(self._lifecycle_oca, _decision)
                 # 2026-07-30: State write moved to monitor.py after successful order submission
+                # P1-B durable-exit-intent: gate + both-leg intent persisted
+                # BEFORE the signal is emitted (dispatcher submits via ids)
+                try:
+                    _ilog = _exit_intent_log()
+                    if _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
+                        logger.info("[P1B_GATE] exit intent in-flight for %s — suppressing COMBINED_EXIT re-emission", getattr(self, "_trade_id", ""))
+                        return None
+                    _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT")
+                except Exception:
+                    pass  # intent log unavailable → legacy behavior
                 return Signal("EXIT", "TMF_COMBINED_EXIT", confidence=1.0, stop_loss=0)
             elif _decision.action == LifecycleAction.MANUAL:
                 # MANUAL: full flatten — same as STOPLOSS/TIMEOUT
