@@ -143,11 +143,23 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
 
     near, far = resolve_near_far_contracts(api, product)
 
-    positions = _safe_positions(api, account)
-    open_orders = _safe_open_orders(api, account)
-    margin = api.margin(account)
-    limits = api.trading_limits(account)
-    snapshots = list(api.snapshots([near, far]))
+    query_failures: list[str] = []
+
+    def query(name: str, fn: Callable[[], Any], fallback: Any) -> Any:
+        try:
+            return fn()
+        except Exception as exc:
+            query_failures.append(f"{name}_QUERY_FAILED: {type(exc).__name__}: {exc}")
+            return fallback
+
+    # Keep successfully completed evidence when one broker endpoint is down.
+    # A failed check remains a failed preflight; it must not erase the useful
+    # evidence needed to distinguish an account mapping issue from login loss.
+    positions = query("POSITIONS", lambda: _safe_positions(api, account), [])
+    open_orders = query("OPEN_ORDERS", lambda: _safe_open_orders(api, account), [])
+    margin = query("MARGIN", lambda: api.margin(account), None)
+    limits = query("TRADING_LIMITS", lambda: api.trading_limits(account), None)
+    snapshots = query("MARKET_SNAPSHOT", lambda: list(api.snapshots([near, far])), [])
 
     # Subscription proves the broker accepts the request.  It is immediately
     # removed and does not wait for market data (closed-market safe).
@@ -175,14 +187,15 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
         "positions": positions,
         "open_orders": open_orders,
         "margin": {
-            "available_margin": getattr(margin, "available_margin", None),
-            "equity_amount": getattr(margin, "equity_amount", None),
-            "risk_indicator": getattr(margin, "risk_indicator", None),
+            "available_margin": getattr(margin, "available_margin", None) if margin else None,
+            "equity_amount": getattr(margin, "equity_amount", None) if margin else None,
+            "risk_indicator": getattr(margin, "risk_indicator", None) if margin else None,
         },
-        "trading_limits": str(limits),
+        "trading_limits": str(limits) if limits is not None else None,
         "contracts": {"near": _contract_summary(near), "far": _contract_summary(far)},
         "snapshot_codes": [getattr(s, "code", None) for s in snapshots],
         "quote_subscription": quote_checks,
+        "query_failures": query_failures,
     }
 
 
@@ -209,6 +222,9 @@ def run_once(api_factory: Any, *, request_id: str | None = None, product: str = 
             api = api_factory()
             snapshot = collect_read_only_preflight(api, product=product)
             quote_ok = all(c.get("passed") for c in snapshot["quote_subscription"])
+            failed_checks = list(snapshot["query_failures"])
+            if not quote_ok:
+                failed_checks.append("QUOTE_SUBSCRIPTION_FAILED")
             response: dict[str, Any] = {
                 "schema_version": 1,
                 "request_id": request_id,
@@ -216,7 +232,7 @@ def run_once(api_factory: Any, *, request_id: str | None = None, product: str = 
                 "read_only": True,
                 "live_order_allowed": False,
                 "snapshot": snapshot,
-                "preflight": {"passed": quote_ok, "failed_checks": [] if quote_ok else ["QUOTE_SUBSCRIPTION_FAILED"]},
+                "preflight": {"passed": not failed_checks, "failed_checks": failed_checks},
             }
         except Exception as exc:
             response = {

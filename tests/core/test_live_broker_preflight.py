@@ -52,6 +52,27 @@ def test_contract_resolution_uses_compat_adapter_not_native_bracket(monkeypatch)
     assert preflight.resolve_near_far_contracts(api, "TMF") == (near, far)
 
 
+def test_preflight_preserves_evidence_when_trading_limits_fails(monkeypatch, tmp_path):
+    api = Api()
+    api.trading_limits = lambda account: (_ for _ in ()).throw(RuntimeError("broker mapping unavailable"))
+    near = SimpleNamespace(code="TMFH6", delivery_date="2099/08/19")
+    far = SimpleNamespace(code="TMFI6", delivery_date="2099/09/16")
+    monkeypatch.setenv(preflight.REQUEST_ENV, "1")
+    monkeypatch.setattr(preflight, "diagnostics_dir", lambda: tmp_path)
+    monkeypatch.setattr(preflight, "assert_broker_access_allowed", lambda: "mini")
+    monkeypatch.setattr("core.broker.shioaji_compat.get_contracts_list", lambda *_: [near, far])
+    monkeypatch.setattr("core.broker.shioaji_compat.safe_subscribe", lambda api, contract, quote_type: None)
+    monkeypatch.setattr(preflight, "_unsubscribe_bidask", lambda api, contract: None)
+    response = preflight.run_once(lambda: api, request_id="limits-fail")
+    assert response["snapshot"] is not None
+    assert response["snapshot"]["positions"] == []
+    assert response["snapshot"]["margin"]["available_margin"] == 1
+    assert response["preflight"]["passed"] is False
+    assert response["preflight"]["failed_checks"] == [
+        "TRADING_LIMITS_QUERY_FAILED: RuntimeError: broker mapping unavailable"
+    ]
+
+
 def test_preflight_lock_fails_closed(monkeypatch, tmp_path):
     monkeypatch.setenv(preflight.REQUEST_ENV, "1")
     monkeypatch.setattr(preflight, "diagnostics_dir", lambda: tmp_path)
