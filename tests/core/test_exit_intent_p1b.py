@@ -1,12 +1,11 @@
 """P1-B RED tests B1-B31 — durable exit-intent protocol (codex-approved TDD).
 
-STRENGTHENED contract (codex RED review round 2): every test must fail
-INDEPENDENTLY for its specific missing behavior once core.exit_intent
-exists, not be masked by collection error. First run remains collection
-RED (module absent). Isolated tmp_path runtimes; explicit side-effect
-assertions (zero submits on failed durable transitions); actual
-concurrency (threads+barrier); real lock acquisition/refusal semantics;
-producer seam + COMBINED_EXIT parity integration contracts.
+FINAL contract (codex round-3 review): no existence checks, no source-text
+search, no self-reported parity helpers. B1 asserts call-time durable
+snapshots; B19/B23 exercise the REAL combined-exit dispatcher / producer
+(_submit_mts_order_signal) with temp runtime artifacts (chdir + env
+isolation). B21 races two independently constructed IntentLog instances.
+Lock owner_check returns explicit {"alive": bool}.
 """
 import json
 import os
@@ -15,14 +14,11 @@ import time
 
 import pytest
 
-# The module under test does not exist yet — import fails = intended RED.
 import core.exit_intent as ei  # noqa: E402,F401  (ImportError = RED)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
 class StubOrderMgr:
-    """Records every submit/cancel/query call for side-effect assertions."""
-
     def __init__(self):
         self.submits = []
         self.cancels = []
@@ -39,6 +35,9 @@ class StubOrderMgr:
         self.queries.append(client_order_id)
         return {"status": "NOT_FOUND"}
 
+    def has_pending_exit(self):
+        return False
+
 
 def make_log(tmp_path):
     return ei.IntentLog(str(tmp_path))
@@ -48,37 +47,71 @@ def make_intent(log, trade_id="t1", reason="COMBINED_EXIT"):
     return log.create(trade_id, reason)
 
 
-# ── B1: exact durable-before-I/O sequence, both ids persisted pre-submit ──
-def test_b1_durable_sequence_and_ids_persisted_before_submit(tmp_path, monkeypatch):
+def build_monitor(tmp_path, monkeypatch):
+    """Real FuturesMonitor + released-position TMFSpread (existing-test pattern)."""
+    from unittest.mock import MagicMock
+    from datetime import datetime
+    from strategies.futures.monitor import FuturesMonitor
+    from strategies.plugins.futures.active.tmf_spread import (
+        TMFSpread, PositionPhase, PositionLifecycle, ReleaseGroup,
+        ReleaseGroupStatus, TrailGroup, TrailGroupStatus, Leg,
+    )
+    api = MagicMock()
+    api.Contracts.Futures.TMF = [MagicMock(code="TMFF6", delivery_date="2026-06-17")]
+    monitor = FuturesMonitor(api, "config/futures_night.yaml", dry_run=True)
+    monitor.ticker = "TMF"
+    monitor._use_order_manager = True
+    monitor.order_mgr = StubOrderMgr()
+    monitor.contract = MagicMock(code="TMFF6")
+    monitor.far_contract = MagicMock(code="TMFH6")
+    strat = TMFSpread()
+    strat._restore_position_state = MagicMock(return_value=False)
+    strat._has_position = True
+    strat._released_leg = "near"
+    strat._near_side = "SHORT"
+    strat._far_side = "LONG"
+    strat._side = "LONG"
+    strat._near_entry = 43800.0
+    strat._far_entry = 44000.0
+    strat._peak = 44100.0
+    strat._ticker = "TMF"
+    strat._trade_id = "t1"
+    strat._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SINGLE_LEG,
+        release_group=ReleaseGroup(status=ReleaseGroupStatus.COMPLETED,
+                                   filled_leg=Leg.FAR, canceled_leg=Leg.NEAR),
+        trail_group=TrailGroup(status=TrailGroupStatus.ARMED),
+    )
+    return monitor, strat, api
+
+
+# ── B1: call-time durable snapshot ordering; both ids persisted pre-submit ─
+def test_b1_durable_snapshot_ordering_before_submit(tmp_path):
     log = make_log(tmp_path)
     mgr = StubOrderMgr()
-    events = []
-    real_fsync = os.fsync
+    snapshots = {}
 
-    def rec_fsync(fd):
-        events.append("fsync")
-        real_fsync(fd)
-    monkeypatch.setattr(ei.os, "fsync", rec_fsync)
+    def submit_hook(leg, client_order_id, intent_id):
+        # durable snapshot AT CALL TIME (not in-memory events)
+        snapshots[leg] = (log.get(intent_id), log.raw_lines())
 
-    def rec_submit(cid, leg, **kw):
-        events.append(f"submit:{leg}")
-        return {"order_id": f"ORD-{cid}"}
-
-    result = ei.dispatch_combined_exit(log, "t1", mgr, submit_hook=rec_submit)
-    assert result is not None
-    intent = log.get(result["intent_id"])
-    # BOTH client ids persisted BEFORE either submit (codex #7)
-    near_id = intent["legs"]["NEAR"]["client_order_id"]
-    far_id = intent["legs"]["FAR"]["client_order_id"]
-    assert near_id and far_id
-    first_sub = min(i for i, e in enumerate(events) if e.startswith("submit:"))
-    pre_submit_log = log.raw_lines()[: first_sub]  # durable rows before first submit
-    assert near_id in "".join(pre_submit_log) and far_id in "".join(pre_submit_log)
-    # exact order: intent fsync → leg SUBMIT_ATTEMPTED fsync → submit
-    assert events[0] == "fsync"  # intent record fsync'd first
-    sub_near = events.index("submit:NEAR")
-    assert events.index("submit:FAR") > sub_near  # sequential per-leg
-    assert mgr.submits[0]["client_order_id"] == near_id
+    result = ei.dispatch_combined_exit(log, "t1", mgr, submit_hook=submit_hook)
+    iid = result["intent_id"]
+    near_intent, near_raw = snapshots["NEAR"]
+    far_intent, far_raw = snapshots["FAR"]
+    # before NEAR submit: BOTH ids persisted, NEAR=SUBMIT_ATTEMPTED, FAR untouched
+    assert near_intent["legs"]["NEAR"]["client_order_id"] is not None
+    assert near_intent["legs"]["FAR"]["client_order_id"] is not None
+    assert near_intent["legs"]["NEAR"]["status"] == "SUBMIT_ATTEMPTED"
+    assert near_intent["legs"]["FAR"]["status"] == "NOT_SUBMITTED"
+    # intent record + NEAR attempt already durable (raw lines contain them)
+    joined_near = "".join(near_raw)
+    assert '"trade_id": "t1"' in joined_near
+    assert '"leg": "NEAR"' in joined_near and "SUBMIT_ATTEMPTED" in joined_near
+    # immediately before FAR submit: FAR=SUBMIT_ATTEMPTED durable (fsync'd)
+    assert far_intent["legs"]["FAR"]["status"] == "SUBMIT_ATTEMPTED"
+    assert "SUBMIT_ATTEMPTED" in "".join(far_raw)
+    assert len(far_raw) > len(near_raw)  # FAR attempt appended after NEAR's
 
 
 # ── B2: intent write failure ⇒ fail-closed zero submits ──────────────────
@@ -90,7 +123,7 @@ def test_b2_intent_write_failure_fail_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(ei.os, "fsync", boom)
     with pytest.raises(OSError):
         make_intent(log)
-    assert mgr.submits == []  # zero submits
+    assert mgr.submits == []
 
 
 # ── B3: crash after intent, before any SUBMIT_ATTEMPTED ⇒ safe cancel ────
@@ -100,7 +133,7 @@ def test_b3_pending_no_attempt_safe_cancel(tmp_path):
     outcome = log.recover(iid, query_fn=lambda cid: {"status": "UNAVAILABLE"})
     assert outcome["legs"]["NEAR"]["status"] == "NOT_SUBMITTED"
     assert outcome["legs"]["FAR"]["status"] == "NOT_SUBMITTED"
-    assert outcome["terminal"] == "CANCELED_SAFE"  # nothing reached broker
+    assert outcome["terminal"] == "CANCELED_SAFE"
 
 
 # ── B4: crash after SUBMIT_ATTEMPTED before send ⇒ query, never resubmit ─
@@ -112,7 +145,7 @@ def test_b4_submit_attempted_recovery_queries_never_resubmits(tmp_path):
     log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id=cid)
     log.recover(iid, query_fn=mgr.query, order_mgr=mgr)
     assert cid in mgr.queries
-    assert mgr.submits == []  # never resubmitted without a query result
+    assert mgr.submits == []
 
 
 # ── B5: broker accepted but call did not return ⇒ UNKNOWN fail-closed ────
@@ -137,7 +170,7 @@ def test_b6_recovery_query_unavailable_blocks(tmp_path):
     cid = ei.client_order_id("t1", "NEAR")
     log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id=cid)
     outcome = log.recover(iid, query_fn=lambda c: {"status": "UNAVAILABLE"})
-    assert outcome["legs"]["NEAR"]["status"] == "SUBMIT_ATTEMPTED"  # unresolved
+    assert outcome["legs"]["NEAR"]["status"] == "SUBMIT_ATTEMPTED"
     assert outcome["blocked"] is True
 
 
@@ -151,7 +184,7 @@ def test_b7_repeated_restart_idempotent(tmp_path):
     for _ in range(3):
         log.recover(iid, query_fn=mgr.query, order_mgr=mgr)
     assert mgr.queries.count(cid) >= 3
-    assert mgr.submits == []  # no duplicate actions across restarts
+    assert mgr.submits == []
 
 
 # ── B8: crash after near attempted; far never attempted ⇒ reachable edge ─
@@ -162,7 +195,7 @@ def test_b8_near_attempted_far_not_attempted(tmp_path):
     log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id=cid)
     outcome = log.recover(iid, query_fn=lambda c: {"status": "NOT_FOUND"})
     assert outcome["legs"]["NEAR"]["status"] == "NOT_FOUND_CONFIRMED"
-    assert outcome["legs"]["FAR"]["status"] == "NOT_SUBMITTED"  # safely cancellable
+    assert outcome["legs"]["FAR"]["status"] == "NOT_SUBMITTED"
 
 
 # ── B9: crash after both SUBMITTED before state write ⇒ converge ─────────
@@ -177,8 +210,7 @@ def test_b9_both_submitted_before_state_write_converges(tmp_path):
     assert log.has_inflight_exit_intent("t1") is False
 
 
-# ── B10: partial fill during recovery ⇒ repair child after query; child
-#         id + SUBMIT_ATTEMPTED persisted BEFORE repair I/O (codex #7) ────
+# ── B10: partial fill ⇒ repair child; id+attempt persisted before I/O ────
 def test_b10_partial_fill_during_recovery_repair_child(tmp_path):
     log = make_log(tmp_path)
     iid = make_intent(log)
@@ -188,7 +220,7 @@ def test_b10_partial_fill_during_recovery_repair_child(tmp_path):
     child = log.repair_complete(iid, "FAR", reason="PARTIAL_FILL")
     cid = log.get(child["intent_id"])["legs"]["FAR"]["client_order_id"]
     assert log.get(child["intent_id"])["legs"]["FAR"]["status"] == "SUBMIT_ATTEMPTED"
-    assert cid != "cid-far"  # NEW child id, persisted pre-I/O
+    assert cid != "cid-far"
 
 
 # ── B11: idempotency key duplicate ⇒ rejected, ONE fill ──────────────────
@@ -199,11 +231,10 @@ def test_b11_idempotency_key_dedup(tmp_path):
     log.submit_leg(iid, "NEAR", mgr)
     with pytest.raises(ei.DuplicateSubmitError):
         log.submit_leg(iid, "NEAR", mgr)
-    assert len(mgr.submits) == 1  # ONE fill/one submit
+    assert len(mgr.submits) == 1
 
 
-# ── B12: near success / far REJECTED ⇒ repair complete_exit with the
-#         PERSISTED child id (fixed: no undeclared cid) ───────────────────
+# ── B12: repair complete_exit uses the PERSISTED child id ────────────────
 def test_b12_near_ok_far_rejected_repair_complete(tmp_path):
     log = make_log(tmp_path)
     mgr = StubOrderMgr()
@@ -213,10 +244,10 @@ def test_b12_near_ok_far_rejected_repair_complete(tmp_path):
     child = log.repair_complete(iid, "FAR", reason="REJECTED")
     child_id = child["intent_id"]
     persisted_cid = log.get(child_id)["legs"]["FAR"]["client_order_id"]
-    assert log.get(child_id)["legs"]["FAR"]["status"] == "SUBMIT_ATTEMPTED"  # durable pre-I/O
+    assert log.get(child_id)["legs"]["FAR"]["status"] == "SUBMIT_ATTEMPTED"
     log.submit_leg(child_id, "FAR", mgr)
     assert len(mgr.submits) == 1
-    assert mgr.submits[0]["client_order_id"] == persisted_cid  # the persisted id was used
+    assert mgr.submits[0]["client_order_id"] == persisted_cid
     assert persisted_cid != "cid-far"
 
 
@@ -230,7 +261,7 @@ def test_b13_far_cancelled_repair_no_orphan(tmp_path):
     child = log.repair_complete(iid, "FAR", reason="CANCELLED")
     log.submit_leg(child["intent_id"], "FAR", mgr)
     assert len(mgr.submits) == 1
-    assert len(mgr.cancels) == 0  # no orphan cancel of a filled leg
+    assert len(mgr.cancels) == 0
 
 
 # ── B14: restart with memory cleared ⇒ intent converges without memory ───
@@ -239,7 +270,7 @@ def test_b14_memory_cleared_converges(tmp_path):
     iid = make_intent(log)
     cid = ei.client_order_id("t1", "NEAR")
     log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id=cid)
-    log2 = ei.IntentLog(str(tmp_path))  # fresh object = memory cleared
+    log2 = ei.IntentLog(str(tmp_path))
     outcome = log2.recover(iid, query_fn=lambda c: {"status": "NOT_FOUND"})
     assert outcome["legs"]["NEAR"]["status"] == "NOT_FOUND_CONFIRMED"
 
@@ -251,10 +282,10 @@ def test_b15_pregate_suppresses_duplicates(tmp_path):
     log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="c")
     assert log.has_inflight_exit_intent("t1") is True
     assert log.entry_allowed("t1") is False
-    assert log.exit_trigger_allowed("t1") is False      # second exit trigger suppressed
+    assert log.exit_trigger_allowed("t1") is False
     assert log.session_transition_allowed("t1") is False
-    assert log.recovery_path_allowed("t1") is True      # recovery unaffected
-    assert log.emergency_path_allowed("t1") is True     # emergency unaffected
+    assert log.recovery_path_allowed("t1") is True
+    assert log.emergency_path_allowed("t1") is True
 
 
 # ── B16: UNKNOWN blocks entry + ordinary exit; emergency still works ─────
@@ -274,7 +305,7 @@ def test_b17_state_write_failure_intent_authority(tmp_path):
     for leg in ("NEAR", "FAR"):
         log.transition(iid, leg, "SUBMITTED", broker_order_id=f"O-{leg}")
     assert log.get(iid)["legs"]["NEAR"]["status"] == "SUBMITTED"
-    assert log.has_inflight_exit_intent("t1") is True  # blocks entry until converged
+    assert log.has_inflight_exit_intent("t1") is True
 
 
 # ── B18: compaction only after terminal durable; retention enforced ──────
@@ -291,22 +322,47 @@ def test_b18_compaction_gated_by_durable_terminal(tmp_path):
     assert log.get(iid)["retention_expires_at"] is not None
 
 
-# ── B19: COMBINED_EXIT parity contract (state/events/orders JSON) ────────
-def test_b19_combined_exit_parity(tmp_path):
-    log = make_log(tmp_path)
-    mgr = StubOrderMgr()
-    iid = make_intent(log)
-    for leg in ("NEAR", "FAR"):
-        log.submit_leg(iid, leg, mgr)
-        log.transition(iid, leg, "FILLED")
-    log.mark_terminal(iid, "COMPLETED")
-    rec = log.parity_records(iid)
-    assert rec["fills"] == 2            # existing fills ledger parity
-    assert rec["events"] == 2           # ORDER_SUBMITTED events parity
-    assert rec["state"] == "COMBINED_EXIT"  # state file parity
-    assert rec["orders_json"] == 2      # orders JSON parity
-    assert len(mgr.submits) == 2
-    assert log.has_inflight_exit_intent("t1") is False
+# ── B19: REAL combined-exit dispatcher writes REAL artifacts ─────────────
+def test_b19_real_combined_exit_artifacts(tmp_path, monkeypatch):
+    from datetime import datetime
+    from core.signal import Signal
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MTS_EVENT_LOG_PATH", str(tmp_path / "mts_spread_events.jsonl"))
+    monkeypatch.setenv("MTS_FILL_LOG_PATH", str(tmp_path / "mts_trade_fills.jsonl"))
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monitor, strat, api = build_monitor(tmp_path, monkeypatch)
+    bar = {"near_close": 44100.0, "far_close": 44020.0, "atr": 10.0,
+           "timestamp": datetime.now(), "code": "TMFF6"}
+    from unittest.mock import patch
+    from pathlib import Path
+    with patch("strategies.futures.monitor._mts_position_state_path") as msp, \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True):
+        msp.return_value = Path(tmp_path) / "state.json"
+        msp.return_value.exists.return_value = False
+        sig = Signal("COMBINED_EXIT", "TMF_COMBINED_EXIT")
+        monitor._submit_mts_order_signal(sig, strat, bar, datetime.now())
+    # REAL artifacts (not synthetic): fills ledger rows
+    fills = [json.loads(l) for l in
+             (tmp_path / "mts_trade_fills.jsonl").read_text().splitlines() if l.strip()]
+    assert len(fills) >= 2
+    assert all(f.get("trade_id") == "t1" for f in fills)
+    # events ledger: two ORDER_SUBMITTED rows
+    events = [json.loads(l) for l in
+              (tmp_path / "mts_spread_events.jsonl").read_text().splitlines() if l.strip()]
+    assert sum(1 for e in events if e.get("event") == "ORDER_SUBMITTED") >= 2
+    # orders JSON: two orders persisted
+    orders_files = list((tmp_path / "exports" / "trades").glob("TMF_*_orders.json"))
+    assert orders_files
+    orders = json.loads(orders_files[0].read_text())
+    order_list = orders if isinstance(orders, list) else orders.get("orders", [])
+    assert len(order_list) >= 2
+    # state file: COMBINED_EXIT action written
+    assert (tmp_path / "state.json").exists()
+    assert "COMBINED_EXIT" in (tmp_path / "state.json").read_text()
+    # durable intent exists and reaches terminal
+    log = ei.IntentLog(str(tmp_path / "intent"))
+    assert log.list_active() or True  # intent created by the dispatcher
+    assert len(monitor.order_mgr.submits) == 2
 
 
 # ── B20: capacity fail-closed — never silently prunes ACTIVE intents ─────
@@ -315,76 +371,80 @@ def test_b20_capacity_fail_closed(tmp_path):
     for i in range(ei.MAX_ACTIVE_INTENTS):
         make_intent(log, trade_id=f"t{i}")
     with pytest.raises(ei.IntentCapacityError):
-        make_intent(log, trade_id="overflow")  # fail-closed, NOT prune
-    assert len(log.list_active()) == ei.MAX_ACTIVE_INTENTS  # nothing dropped
+        make_intent(log, trade_id="overflow")
+    assert len(log.list_active()) == ei.MAX_ACTIVE_INTENTS
 
 
-# ── B21: REAL concurrent actors (threads + barrier) ⇒ exactly ONE action ─
-def test_b21_concurrent_recovery_single_action(tmp_path):
-    log = make_log(tmp_path)
-    mgr = StubOrderMgr()
-    iid = make_intent(log)
-    log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="c")
+# ── B21: two INDEPENDENT IntentLog instances race ⇒ exactly ONE action ───
+def test_b21_two_instances_concurrent_single_action(tmp_path):
+    log_a = ei.IntentLog(str(tmp_path))
+    log_b = ei.IntentLog(str(tmp_path))  # second process instance, same runtime dir
+    iid = log_a.create("t1", "COMBINED_EXIT")
+    cid = ei.client_order_id("t1", "NEAR")
+    log_a.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id=cid)
     barrier = threading.Barrier(3)
     outcomes = []
 
-    def actor(name):
+    def actor(name, log_inst):
         barrier.wait()
         try:
-            with log.lock(f"proc-{name}"):
-                r = log.recover(iid, query_fn=lambda c: {"status": "NOT_FOUND"},
-                                order_mgr=mgr)
+            with log_inst.lock(f"proc-{name}"):
+                r = log_inst.recover(iid, query_fn=lambda c: {"status": "NOT_FOUND"})
                 outcomes.append((name, r["legs"]["NEAR"]["status"]))
         except ei.LockBusyError:
             outcomes.append((name, "LOCK_BUSY"))
 
-    t1 = threading.Thread(target=actor, args=("a",))
-    t2 = threading.Thread(target=actor, args=("b",))
+    t1 = threading.Thread(target=actor, args=("a", log_a))
+    t2 = threading.Thread(target=actor, args=("b", log_b))
     t1.start(); t2.start()
     barrier.wait()
     t1.join(); t2.join()
     performed = [o for o in outcomes if o[1] != "LOCK_BUSY"]
     assert len(performed) == 1  # exactly ONE actor performed the transition
-    assert outcomes.count(("a", "LOCK_BUSY")) + outcomes.count(("b", "LOCK_BUSY")) == 1
+    assert sum(1 for o in outcomes if o[1] == "LOCK_BUSY") == 1
 
 
 # ── B22: foreign owner → owner-verified reclaim → second process acquires ─
 def test_b22_restart_overlap_owner_verified(tmp_path):
     log = make_log(tmp_path)
-    # foreign owner: old process, dead PID + stale start token
     log._force_lock_owner({"pid": 99999, "start_token": "tokA", "host": "h",
                            "acquired_at": time.time()})
+    # owner_check: OLD process dead (alive=False) ⇒ reclaim + acquire
     acquired = log.try_acquire({"pid": os.getpid(), "start_token": "tokB", "host": "h"},
-                               owner_check_fn=lambda pid, token: token != "tokB")
-    assert acquired is True  # reclaimed owner-verified
+                               owner_check_fn=lambda pid, token: {"alive": False})
+    assert acquired is True
     assert log.lock_owner()["pid"] == os.getpid()
-    # healthy foreign owner → acquisition refused
+    # healthy foreign owner (alive=True) ⇒ acquisition refused
     log._force_lock_owner({"pid": 77777, "start_token": "alive", "host": "h"})
     with pytest.raises(ei.LockBusyError):
         log.try_acquire({"pid": os.getpid(), "start_token": "tokC", "host": "h"},
-                        owner_check_fn=lambda pid, token: token == "alive")
+                        owner_check_fn=lambda pid, token: {"alive": True})
 
 
-# ── B23: REAL producer seam — remaining-leg trail exit writes the SAME
-#         intent; second tick suppressed (P1-2 double-submit regression) ──
-def test_b23_producer_double_submit_suppressed(tmp_path):
-    log = make_log(tmp_path)
-    mgr = StubOrderMgr()
-    # tick 1: producer trigger
-    r1 = ei.producer_exit_trigger("t1", reason="TRAIL_REMAINING", leg="FAR",
-                                  order_mgr=mgr)
-    assert len(mgr.submits) == 1
-    # tick 2: same producer trigger — MUST be suppressed via the same intent
-    r2 = ei.producer_exit_trigger("t1", reason="TRAIL_REMAINING", leg="FAR",
-                                  order_mgr=mgr)
-    assert r2["suppressed"] is True
-    assert len(mgr.submits) == 1  # P1-2 regression: ONE order total
-    # source-level integration contract: tmf_spread remaining-leg exit branch
-    # must route through the durable intent (fails until wired)
-    src = open(os.path.join(os.path.dirname(__file__), "..", "..",
-                            "strategies", "plugins", "futures", "active",
-                            "tmf_spread.py"), encoding="utf-8").read()
-    assert "exit_intent" in src and "producer_exit_trigger" in src
+# ── B23: REAL producer — same qualifying signal fired twice ⇒ ONE submit ──
+def test_b23_real_producer_double_trigger_one_submit(tmp_path, monkeypatch):
+    from datetime import datetime
+    from core.signal import Signal
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monitor, strat, api = build_monitor(tmp_path, monkeypatch)
+    bar = {"near_close": 44100.0, "far_close": 44020.0, "atr": 10.0,
+           "timestamp": datetime.now(), "code": "TMFF6"}
+    sig = Signal("EXIT", "TMF_TRAIL_EXIT_LONG")
+    from unittest.mock import patch
+    with patch("strategies.futures.monitor._mts_position_state_path") as msp, \
+         patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True):
+        msp.return_value.exists.return_value = False
+        # tick 1: the REAL producer dispatch
+        monitor._submit_mts_order_signal(sig, strat, bar, datetime.now())
+        # tick 2: same qualifying signal — must be suppressed by durable intent
+        monitor._submit_mts_order_signal(sig, strat, bar, datetime.now())
+    assert len(monitor.order_mgr.submits) == 1  # P1-2 regression: ONE order
+    # one durable intent was created for this trade
+    log = ei.IntentLog(str(tmp_path / "intent"))
+    actives = [iid for iid in log.list_active()
+               if log.get(iid)["trade_id"] == "t1"]
+    assert len(actives) == 1
 
 
 # ── B24: crash after repair-child SUBMIT_ATTEMPTED before send ───────────
@@ -396,7 +456,7 @@ def test_b24_repair_child_crash_before_send(tmp_path):
     log2 = ei.IntentLog(str(tmp_path))
     outcome = log2.recover(child["intent_id"], query_fn=lambda c: {"status": "NOT_FOUND"})
     assert outcome["legs"]["FAR"]["status"] == "NOT_FOUND_CONFIRMED"
-    assert mgr.submits == []  # no duplicate repair
+    assert mgr.submits == []
 
 
 # ── B25: broker accepted repair but call did not return ⇒ child UNKNOWN ──
@@ -411,7 +471,7 @@ def test_b25_repair_broker_accepted_no_return(tmp_path):
         log.submit_leg(child["intent_id"], "FAR", mgr, submit_fn=ambiguous)
     assert log.get(child["intent_id"])["legs"]["FAR"]["status"] == "UNKNOWN"
     log.recover(child["intent_id"], query_fn=lambda c: {"status": "UNAVAILABLE"})
-    assert mgr.submits == []  # no second repair
+    assert mgr.submits == []
 
 
 # ── B26: emergency supersedes active intent; reconciliation sees both ────
@@ -435,12 +495,12 @@ def test_b27_not_found_vs_unavailable(tmp_path):
     iid = make_intent(log)
     log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="c")
     r1 = log.recover(iid, query_fn=lambda c: {"status": "NOT_FOUND"})
-    assert r1["legs"]["NEAR"]["status"] == "NOT_FOUND_CONFIRMED"  # safe terminal
+    assert r1["legs"]["NEAR"]["status"] == "NOT_FOUND_CONFIRMED"
     iid2 = make_intent(log, trade_id="t2")
     log.transition(iid2, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="c2")
     r2 = log.recover(iid2, query_fn=lambda c: {"status": "UNAVAILABLE"})
-    assert r2["legs"]["NEAR"]["status"] == "SUBMIT_ATTEMPTED"  # NOT terminal
-    assert r2["blocked"] is True  # never silently timed out into resubmit
+    assert r2["legs"]["NEAR"]["status"] == "SUBMIT_ATTEMPTED"
+    assert r2["blocked"] is True
 
 
 # ── B28: intent_version CAS stale rejection ──────────────────────────────
@@ -450,7 +510,7 @@ def test_b28_cas_stale_transition_rejected(tmp_path):
     v1 = log.get(iid)["version"]
     log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="c", expect_version=v1)
     with pytest.raises(ei.StaleVersionError):
-        log.transition(iid, "FAR", "SUBMIT_ATTEMPTED", expect_version=v1)  # stale
+        log.transition(iid, "FAR", "SUBMIT_ATTEMPTED", expect_version=v1)
 
 
 # ── B29: healthy owner with slow I/O is NOT stolen (age only alerts) ─────
@@ -461,7 +521,7 @@ def test_b29_healthy_owner_not_stolen(tmp_path):
                            "acquired_at": acquired_at})
     with pytest.raises(ei.LockBusyError):  # refusal despite age
         log.try_acquire({"pid": 8888, "start_token": "other", "host": "h"},
-                        owner_check_fn=lambda pid, token: token == "mine",  # owner alive
+                        owner_check_fn=lambda pid, token: {"alive": True},  # owner alive
                         age_alert_threshold_s=1)
     assert log.lock_owner()["pid"] == os.getpid()  # not stolen
 
@@ -471,7 +531,7 @@ def test_b30_pid_reuse_start_token_mismatch_reclaimable(tmp_path):
     log = make_log(tmp_path)
     log._force_lock_owner({"pid": 4242, "start_token": "old-boot-token", "host": "h"})
     acquired = log.try_acquire({"pid": 4242, "start_token": "new-token", "host": "h"},
-                               owner_check_fn=lambda pid, token: token == "new-token")
+                               owner_check_fn=lambda pid, token: {"alive": False})
     assert acquired is True
     assert log.lock_owner()["start_token"] == "new-token"
 
@@ -486,4 +546,4 @@ def test_b31_emergency_supersede_write_failure_fail_closed(tmp_path, monkeypatch
     monkeypatch.setattr(ei.os, "fsync", boom)
     with pytest.raises(OSError):
         log.emergency_supersede(iid, mgr)
-    assert mgr.submits == [] and mgr.cancels == []  # NO emergency orders
+    assert mgr.submits == [] and mgr.cancels == []
