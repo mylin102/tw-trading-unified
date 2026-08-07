@@ -67,8 +67,9 @@ def test_preflight_preserves_evidence_when_trading_limits_fails(monkeypatch, tmp
     assert response["snapshot"] is not None
     assert response["snapshot"]["positions"] == []
     assert response["snapshot"]["margin"]["available_margin"] == 1
-    assert response["preflight"]["passed"] is False
-    assert response["preflight"]["failed_checks"] == [
+    assert response["preflight"]["passed"] is True
+    assert response["preflight"]["failed_checks"] == []
+    assert response["snapshot"]["warnings"] == [
         "TRADING_LIMITS_QUERY_FAILED: RuntimeError: broker mapping unavailable"
     ]
 

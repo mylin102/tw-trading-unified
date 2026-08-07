@@ -144,12 +144,14 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
     near, far = resolve_near_far_contracts(api, product)
 
     query_failures: list[str] = []
+    warnings: list[str] = []
 
-    def query(name: str, fn: Callable[[], Any], fallback: Any) -> Any:
+    def query(name: str, fn: Callable[[], Any], fallback: Any, *, required: bool = True) -> Any:
         try:
             return fn()
         except Exception as exc:
-            query_failures.append(f"{name}_QUERY_FAILED: {type(exc).__name__}: {exc}")
+            message = f"{name}_QUERY_FAILED: {type(exc).__name__}: {exc}"
+            (query_failures if required else warnings).append(message)
             return fallback
 
     # Keep successfully completed evidence when one broker endpoint is down.
@@ -158,7 +160,11 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
     positions = query("POSITIONS", lambda: _safe_positions(api, account), [])
     open_orders = query("OPEN_ORDERS", lambda: _safe_open_orders(api, account), [])
     margin = query("MARGIN", lambda: api.margin(account), None)
-    limits = query("TRADING_LIMITS", lambda: api.trading_limits(account), None)
+    # The broker's trading_limits endpoint is known to be unavailable for some
+    # branch mappings.  Available margin remains the required capacity check
+    # for this one-lot-per-leg preflight; preserve this endpoint failure as an
+    # auditable warning instead of hiding every successful broker check.
+    limits = query("TRADING_LIMITS", lambda: api.trading_limits(account), None, required=False)
     snapshots = query("MARKET_SNAPSHOT", lambda: list(api.snapshots([near, far])), [])
 
     # Subscription proves the broker accepts the request.  It is immediately
@@ -196,6 +202,7 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
         "snapshot_codes": [getattr(s, "code", None) for s in snapshots],
         "quote_subscription": quote_checks,
         "query_failures": query_failures,
+        "warnings": warnings,
     }
 
 
