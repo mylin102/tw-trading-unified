@@ -29,15 +29,46 @@ class StubOrderMgr:
         self.submits = []
         self.cancels = []
         self.queries = []
+        self._created = []
+        self.active_orders = {}
+        self.completed = []
+
+    def _unwrap(self, v, default=""):
+        from unittest.mock import MagicMock as _MM
+        if isinstance(v, _MM) or v is None:
+            return default
+        if hasattr(v, "value"):
+            return v.value
+        return v
 
     def create_order(self, **kw):
         from unittest.mock import MagicMock
+        from datetime import datetime as _dt
         o = MagicMock()
-        o.order_id = f"ORD-{len(self.submits) + 1}"
+        self._created.append(o)
+        o.order_id = f"ORD-{len(self._created)}"
         o.client_order_id = kw.get("client_order_id")
         o.intent_id = kw.get("intent_id")
         o.leg = kw.get("leg")
+        o.created_at = kw.get("created_at") or _dt.now()
+        self.active_orders[o.order_id] = o
+        o.to_dict = lambda: {
+            "order_id": self._unwrap(o.order_id),
+            "symbol": self._unwrap(getattr(o, "symbol", "")),
+            "side": self._unwrap(getattr(o, "side", "")),
+            "order_type": self._unwrap(getattr(o, "order_type", "")),
+            "quantity": self._unwrap(getattr(o, "quantity", 1)),
+            "strategy": self._unwrap(getattr(o, "strategy", "")),
+            "status": self._unwrap(getattr(o, "status", ""), "SUBMITTED"),
+            "created_at": str(self._unwrap(getattr(o, "created_at", ""))),
+        }
         return o
+
+    def get_completed(self):
+        return []
+
+    def get_pending(self):
+        return list(self.active_orders.values())
 
     def submit(self, arg, leg=None, **kw):
         if hasattr(arg, "order_id"):  # dispatcher path: submit(order)
@@ -439,6 +470,21 @@ def test_b19_real_combined_exit_artifacts(tmp_path, monkeypatch):
          patch.object(Path, "exists", return_value=False):
         sig = Signal("COMBINED_EXIT", "TMF_COMBINED_EXIT")
         monitor._submit_mts_order_signal(sig, strat, bar, datetime.now())
+        # simulate both COMBINED_EXIT leg fills through the REAL fill path
+        from core.order_management.order import OrderStatus, OrderSide
+        import types as _types
+        with patch("strategies.futures.monitor.save_trade"), \
+             patch("strategies.futures.monitor.DecisionLogger", create=True):
+            for leg_label, px in (("NEAR", 44100.0), ("FAR", 44020.0)):
+                oid = next(o for o, p in monitor._pending_lifecycle_orders.items()
+                           if p.get("leg_role") == leg_label)
+                ev = _types.SimpleNamespace(
+                    order_id=oid, fill_qty=1, fill_price=px,
+                    deal_id=f"deal-{leg_label}",
+                    symbol="TMFH6" if leg_label == "NEAR" else "TMFI6",
+                    status=OrderStatus.FILLED, side=OrderSide.SELL,
+                    timestamp=datetime.now())
+                monitor._apply_confirmed_futures_deal(ev)
     # DISCRIMINATING ASSERTION FIRST (Phase-2 integration gap): the
     # dispatcher must create ONE durable intent at the production location
     intent_log = ei.IntentLog(str(tmp_path / "logs"))
@@ -559,6 +605,37 @@ def test_b23_real_producer_double_eval_one_submit(tmp_path, monkeypatch):
                            "entry_z": -2.0, "confirm_ticks": 1, "confirm_ms": 0.0}},
     )
     strat.init(ctx)
+    # init() resets position state — re-apply the trade identity so the
+    # produced intent carries the real trade_id (release/exit flow intact)
+    from strategies.plugins.futures.active.tmf_spread import (
+        PositionLifecycle, PositionPhase, ReleaseGroup, ReleaseGroupStatus,
+        TrailGroup, TrailGroupStatus, Leg,
+    )
+    strat._trade_id = "t1"
+    strat._has_position = True
+    strat._released_leg = "near"
+    strat._side = "LONG"
+    strat._near_side = "SHORT"
+    strat._far_side = "LONG"
+    strat._near_entry = 43800.0
+    strat._far_entry = 44000.0
+    strat._far_max = 44020.0
+    strat._far_min = 43365.0
+    strat._mfe_pts = 0.0
+    strat._mae_pts = 0.0
+    strat._peak_net_exit_pnl_twd = 0.0
+    strat._renko_gap_quarantine_left = 0
+    strat._point_value = 10.0
+    strat._estimated_cost = 92.0
+    strat._single_leg_warmup_ms = 0.0
+    strat._single_leg_entered_mono = time.monotonic()
+    strat._single_leg_post_fill_ticks = 2
+    strat._release_near_ticks = 1  # tick-confirm gate for the release decision
+    strat._release_far_ticks = 0
+    strat._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SPREAD,
+        release_group=ReleaseGroup(status=ReleaseGroupStatus.ARMED),
+    )
     now = datetime.now()
     bar = {"near_close": 44100.0, "far_close": 44020.0, "atr": 10.0,
            "timestamp": now, "code": "TMFF6"}
