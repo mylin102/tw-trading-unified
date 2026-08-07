@@ -154,6 +154,7 @@ mts:
     trail_distance_points: 66
     enable_combined_upl_trail: true
     execution_enabled: true
+    evaluator_lag_slo_secs: 90
     combined_upl_activation_net_pnl_twd: 200.0
     combined_upl_giveback_twd: 50.0
     entry_peak_guard_ms: 15000

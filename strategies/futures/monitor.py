@@ -343,6 +343,12 @@ class FuturesMonitor:
             source="PAPER",
         )
         self._ledger_projection_sync_ts = 0.0
+        # 2026-08-06 codex audit: evaluator-lag SLO. While a position is open,
+        # strategy evaluation (on_bar) must heartbeat; alert when silent
+        # longer than mts.params.evaluator_lag_slo_secs (default 90s).
+        self._last_strategy_evaluation_mono = None
+        self._last_strategy_evaluation_wall = None
+        self._last_evaluator_lag_alert_mono = 0.0
 
         self._flag_retry_count: int = 0         # C7: retry counter (in-memory)
         self._current_flag_id: str | None = None  # C2: tracks flag being processed
@@ -6865,12 +6871,17 @@ class FuturesMonitor:
         elif _pre_action == MtsGateAction.RECONSTRUCT:
             self._reconstruct_position_from_ledger(strategy, _auth)
 
+        # 2026-08-06 codex audit: evaluator-lag SLO — runs every tick so a
+        # stalled evaluator is caught even when the gates skip on_bar.
+        self._mts_check_evaluator_lag(strategy, _strat_has_pos)
+
         signal = None
         if _pre_action != MtsGateAction.RESET_STRATEGY:
             # 2026-07-08 Hermes Agent: Risk control gates (settlement > SINGLE_LEG > normal)
             if not self._mts_risk_gate_settlement(strategy):
                 if not self._mts_risk_gate_single_leg_preclose(strategy, _bar_dict):
                     signal = strategy.on_bar(ctx)
+                    self._mts_note_strategy_evaluated()
 
         # 2026-07-07 Hermes Agent: P0 — Post-signal authority gate.
         # 2026-08-06 Hermes Agent P1: driven by the LEDGER authority (not the
@@ -7086,6 +7097,57 @@ class FuturesMonitor:
             logging.getLogger("FuturesMonitor").warning(
                 "[POSITION_AUTHORITY] state write-back failed: %s", _e
             )
+
+    def _mts_note_strategy_evaluated(self) -> None:
+        """Record the strategy evaluator heartbeat (evaluator-lag SLO)."""
+        self._last_strategy_evaluation_mono = time.monotonic()
+        self._last_strategy_evaluation_wall = datetime.now().isoformat()
+
+    def _mts_check_evaluator_lag(self, strategy, strat_has_pos: bool) -> None:
+        """Evaluator-lag SLO (2026-08-06 codex audit follow-up).
+
+        While a position is open, the lifecycle evaluator (on_bar) must
+        heartbeat. If it goes silent longer than
+        mts.params.evaluator_lag_slo_secs (default 90), emit a rate-limited
+        warning + MTS_EVALUATOR_LAG event. Catches the o-091403-145 class:
+        position open but no evaluation for hours.
+        """
+        if not strat_has_pos:
+            return
+        _last = self._last_strategy_evaluation_mono
+        if _last is None:
+            return  # startup — nothing evaluated yet; wait for the first call
+        _now = time.monotonic()
+        _lag = _now - _last
+        try:
+            _slo = float(
+                self.cfg.get("mts", {}).get("params", {}).get(
+                    "evaluator_lag_slo_secs", 90.0
+                )
+            )
+        except (TypeError, ValueError):
+            _slo = 90.0
+        if _lag <= _slo:
+            return
+        if _now - self._last_evaluator_lag_alert_mono < 60.0:
+            return  # rate limit: at most one alert per minute
+        self._last_evaluator_lag_alert_mono = _now
+        _tid = getattr(strategy, "_trade_id", None)
+        logger.warning(
+            "[MTS_EVALUATOR_LAG] position open trade=%s but strategy "
+            "evaluator silent for %.0fs (SLO %.0fs) last_eval=%s",
+            _tid, _lag, _slo, self._last_strategy_evaluation_wall,
+        )
+        try:
+            self._append_mts_event(
+                "MTS_EVALUATOR_LAG",
+                trade_id=_tid,
+                lag_secs=round(_lag, 1),
+                slo_secs=_slo,
+                last_eval_at=self._last_strategy_evaluation_wall,
+            )
+        except Exception as _e:  # never let telemetry break the tick path
+            logger.warning("[MTS_EVALUATOR_LAG] event write failed: %s", _e)
 
     def _mts_has_pending_mts_orders(self) -> bool:
         """Check if order_mgr has any pending MTS lifecycle orders.
