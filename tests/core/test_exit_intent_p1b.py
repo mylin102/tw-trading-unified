@@ -1,20 +1,21 @@
 """P1-B RED tests B1-B31 — durable exit-intent protocol (codex-approved TDD).
 
-Contract targets the NOT-YET-EXISTING `core.exit_intent` module (RED: import
-fails until implementation lands). Every test uses an isolated tmp_path
-runtime dir (no shared /tmp ledger pollution) and asserts side effects
-explicitly (zero submits on every failed durable transition).
+STRENGTHENED contract (codex RED review round 2): every test must fail
+INDEPENDENTLY for its specific missing behavior once core.exit_intent
+exists, not be masked by collection error. First run remains collection
+RED (module absent). Isolated tmp_path runtimes; explicit side-effect
+assertions (zero submits on failed durable transitions); actual
+concurrency (threads+barrier); real lock acquisition/refusal semantics;
+producer seam + COMBINED_EXIT parity integration contracts.
 """
 import json
 import os
+import threading
 import time
 
 import pytest
 
-pytest.importorskip  # noqa: B018 - placeholder marker
-
 # The module under test does not exist yet — import fails = intended RED.
-# (tests below reference its API; collection errors are the red signal)
 import core.exit_intent as ei  # noqa: E402,F401  (ImportError = RED)
 
 
@@ -47,16 +48,37 @@ def make_intent(log, trade_id="t1", reason="COMBINED_EXIT"):
     return log.create(trade_id, reason)
 
 
-# ── B1: durable intent before first submit ───────────────────────────────
-def test_b1_intent_fsync_before_first_submit(tmp_path):
+# ── B1: exact durable-before-I/O sequence, both ids persisted pre-submit ──
+def test_b1_durable_sequence_and_ids_persisted_before_submit(tmp_path, monkeypatch):
     log = make_log(tmp_path)
     mgr = StubOrderMgr()
-    iid = make_intent(log)
-    log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id=ei.client_order_id("t1", "NEAR"))
-    # implementation must assert fsync completed before any submit side effect
-    assert mgr.submits == []  # nothing submitted yet at SUBMIT_ATTEMPTED
-    intent = log.get(iid)
-    assert intent["legs"]["NEAR"]["status"] == "SUBMIT_ATTEMPTED"
+    events = []
+    real_fsync = os.fsync
+
+    def rec_fsync(fd):
+        events.append("fsync")
+        real_fsync(fd)
+    monkeypatch.setattr(ei.os, "fsync", rec_fsync)
+
+    def rec_submit(cid, leg, **kw):
+        events.append(f"submit:{leg}")
+        return {"order_id": f"ORD-{cid}"}
+
+    result = ei.dispatch_combined_exit(log, "t1", mgr, submit_hook=rec_submit)
+    assert result is not None
+    intent = log.get(result["intent_id"])
+    # BOTH client ids persisted BEFORE either submit (codex #7)
+    near_id = intent["legs"]["NEAR"]["client_order_id"]
+    far_id = intent["legs"]["FAR"]["client_order_id"]
+    assert near_id and far_id
+    first_sub = min(i for i, e in enumerate(events) if e.startswith("submit:"))
+    pre_submit_log = log.raw_lines()[: first_sub]  # durable rows before first submit
+    assert near_id in "".join(pre_submit_log) and far_id in "".join(pre_submit_log)
+    # exact order: intent fsync → leg SUBMIT_ATTEMPTED fsync → submit
+    assert events[0] == "fsync"  # intent record fsync'd first
+    sub_near = events.index("submit:NEAR")
+    assert events.index("submit:FAR") > sub_near  # sequential per-leg
+    assert mgr.submits[0]["client_order_id"] == near_id
 
 
 # ── B2: intent write failure ⇒ fail-closed zero submits ──────────────────
@@ -88,7 +110,6 @@ def test_b4_submit_attempted_recovery_queries_never_resubmits(tmp_path):
     iid = make_intent(log)
     cid = ei.client_order_id("t1", "NEAR")
     log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id=cid)
-    # recovery must QUERY by persisted id; must NOT infer "nothing submitted"
     log.recover(iid, query_fn=mgr.query, order_mgr=mgr)
     assert cid in mgr.queries
     assert mgr.submits == []  # never resubmitted without a query result
@@ -100,13 +121,11 @@ def test_b5_broker_accepted_no_return_unknown_fail_closed(tmp_path):
     mgr = StubOrderMgr()
     iid = make_intent(log)
     log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="cid-near")
-    # submit raises ambiguous exception (network cut after broker may accept)
     def ambiguous(cid, leg, **kw):
         raise TimeoutError("network cut")
     with pytest.raises(TimeoutError):
         log.submit_leg(iid, "NEAR", mgr, submit_fn=ambiguous)
     assert log.get(iid)["legs"]["NEAR"]["status"] == "UNKNOWN"
-    # UNKNOWN must block resubmit
     log.recover(iid, query_fn=lambda c: {"status": "UNAVAILABLE"})
     assert mgr.submits == []
 
@@ -129,7 +148,7 @@ def test_b7_repeated_restart_idempotent(tmp_path):
     iid = make_intent(log)
     cid = ei.client_order_id("t1", "FAR")
     log.transition(iid, "FAR", "SUBMIT_ATTEMPTED", client_order_id=cid)
-    for _ in range(3):  # three restarts
+    for _ in range(3):
         log.recover(iid, query_fn=mgr.query, order_mgr=mgr)
     assert mgr.queries.count(cid) >= 3
     assert mgr.submits == []  # no duplicate actions across restarts
@@ -158,7 +177,8 @@ def test_b9_both_submitted_before_state_write_converges(tmp_path):
     assert log.has_inflight_exit_intent("t1") is False
 
 
-# ── B10: partial fill during recovery ⇒ repair child after query ─────────
+# ── B10: partial fill during recovery ⇒ repair child after query; child
+#         id + SUBMIT_ATTEMPTED persisted BEFORE repair I/O (codex #7) ────
 def test_b10_partial_fill_during_recovery_repair_child(tmp_path):
     log = make_log(tmp_path)
     iid = make_intent(log)
@@ -166,9 +186,9 @@ def test_b10_partial_fill_during_recovery_repair_child(tmp_path):
     log.transition(iid, "NEAR", "FILLED")
     log.transition(iid, "FAR", "SUBMIT_ATTEMPTED", client_order_id="cid-far")
     child = log.repair_complete(iid, "FAR", reason="PARTIAL_FILL")
-    assert child["parent"] == iid
-    assert child["legs"]["FAR"]["status"] == "SUBMIT_ATTEMPTED"  # durable BEFORE I/O
-    assert ei.client_order_id("t1", "FAR", nonce=child["nonce"]) != "cid-far"  # NEW id
+    cid = log.get(child["intent_id"])["legs"]["FAR"]["client_order_id"]
+    assert log.get(child["intent_id"])["legs"]["FAR"]["status"] == "SUBMIT_ATTEMPTED"
+    assert cid != "cid-far"  # NEW child id, persisted pre-I/O
 
 
 # ── B11: idempotency key duplicate ⇒ rejected, ONE fill ──────────────────
@@ -176,14 +196,14 @@ def test_b11_idempotency_key_dedup(tmp_path):
     log = make_log(tmp_path)
     mgr = StubOrderMgr()
     iid = make_intent(log)
-    key = ei.client_order_id("t1", "NEAR")
     log.submit_leg(iid, "NEAR", mgr)
     with pytest.raises(ei.DuplicateSubmitError):
-        log.submit_leg(iid, "NEAR", mgr)  # same key ⇒ rejected
+        log.submit_leg(iid, "NEAR", mgr)
     assert len(mgr.submits) == 1  # ONE fill/one submit
 
 
-# ── B12: near success / far REJECTED ⇒ repair complete_exit new id ───────
+# ── B12: near success / far REJECTED ⇒ repair complete_exit with the
+#         PERSISTED child id (fixed: no undeclared cid) ───────────────────
 def test_b12_near_ok_far_rejected_repair_complete(tmp_path):
     log = make_log(tmp_path)
     mgr = StubOrderMgr()
@@ -191,10 +211,13 @@ def test_b12_near_ok_far_rejected_repair_complete(tmp_path):
     log.transition(iid, "NEAR", "FILLED")
     log.transition(iid, "FAR", "REJECTED")
     child = log.repair_complete(iid, "FAR", reason="REJECTED")
-    log.submit_leg(child["intent_id"], "FAR", mgr)
+    child_id = child["intent_id"]
+    persisted_cid = log.get(child_id)["legs"]["FAR"]["client_order_id"]
+    assert log.get(child_id)["legs"]["FAR"]["status"] == "SUBMIT_ATTEMPTED"  # durable pre-I/O
+    log.submit_leg(child_id, "FAR", mgr)
     assert len(mgr.submits) == 1
-    assert mgr.submits[0]["client_order_id"] != "cid-far"  # NEW id
-    assert log.get(iid)["terminal"] == "PARTIAL" or log.get(child["intent_id"])["terminal"] is None
+    assert mgr.submits[0]["client_order_id"] == persisted_cid  # the persisted id was used
+    assert persisted_cid != "cid-far"
 
 
 # ── B13: far CANCELLED after near FILLED ⇒ repair child, no orphan ───────
@@ -216,8 +239,7 @@ def test_b14_memory_cleared_converges(tmp_path):
     iid = make_intent(log)
     cid = ei.client_order_id("t1", "NEAR")
     log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id=cid)
-    # fresh object = no in-memory pending state
-    log2 = ei.IntentLog(str(tmp_path))
+    log2 = ei.IntentLog(str(tmp_path))  # fresh object = memory cleared
     outcome = log2.recover(iid, query_fn=lambda c: {"status": "NOT_FOUND"})
     assert outcome["legs"]["NEAR"]["status"] == "NOT_FOUND_CONFIRMED"
 
@@ -251,7 +273,6 @@ def test_b17_state_write_failure_intent_authority(tmp_path):
     iid = make_intent(log)
     for leg in ("NEAR", "FAR"):
         log.transition(iid, leg, "SUBMITTED", broker_order_id=f"O-{leg}")
-    # state write fails AFTER submits — intent remains the authority
     assert log.get(iid)["legs"]["NEAR"]["status"] == "SUBMITTED"
     assert log.has_inflight_exit_intent("t1") is True  # blocks entry until converged
 
@@ -260,20 +281,18 @@ def test_b17_state_write_failure_intent_authority(tmp_path):
 def test_b18_compaction_gated_by_durable_terminal(tmp_path):
     log = make_log(tmp_path)
     iid = make_intent(log)
-    # non-terminal intent cannot be archived
     with pytest.raises(ei.IntentNotTerminalError):
         log.archive(iid)
     log.transition(iid, "NEAR", "FILLED")
     log.transition(iid, "FAR", "FILLED")
     log.mark_terminal(iid, "COMPLETED")
     log.archive(iid)
-    archive = log.archive_index()
-    assert iid in archive
+    assert iid in log.archive_index()
     assert log.get(iid)["retention_expires_at"] is not None
 
 
-# ── B19: happy path regression shape ─────────────────────────────────────
-def test_b19_happy_path_regression_shape(tmp_path):
+# ── B19: COMBINED_EXIT parity contract (state/events/orders JSON) ────────
+def test_b19_combined_exit_parity(tmp_path):
     log = make_log(tmp_path)
     mgr = StubOrderMgr()
     iid = make_intent(log)
@@ -281,56 +300,91 @@ def test_b19_happy_path_regression_shape(tmp_path):
         log.submit_leg(iid, leg, mgr)
         log.transition(iid, leg, "FILLED")
     log.mark_terminal(iid, "COMPLETED")
+    rec = log.parity_records(iid)
+    assert rec["fills"] == 2            # existing fills ledger parity
+    assert rec["events"] == 2           # ORDER_SUBMITTED events parity
+    assert rec["state"] == "COMBINED_EXIT"  # state file parity
+    assert rec["orders_json"] == 2      # orders JSON parity
     assert len(mgr.submits) == 2
-    assert log.get(iid)["terminal"] == "COMPLETED"
     assert log.has_inflight_exit_intent("t1") is False
 
 
-# ── B20: intent log bounded; archive enforced ────────────────────────────
-def test_b20_log_bounded(tmp_path):
+# ── B20: capacity fail-closed — never silently prunes ACTIVE intents ─────
+def test_b20_capacity_fail_closed(tmp_path):
     log = make_log(tmp_path)
-    for i in range(ei.MAX_ACTIVE_INTENTS + 1):
+    for i in range(ei.MAX_ACTIVE_INTENTS):
         make_intent(log, trade_id=f"t{i}")
-    assert len(log.list_active()) <= ei.MAX_ACTIVE_INTENTS
+    with pytest.raises(ei.IntentCapacityError):
+        make_intent(log, trade_id="overflow")  # fail-closed, NOT prune
+    assert len(log.list_active()) == ei.MAX_ACTIVE_INTENTS  # nothing dropped
 
 
-# ── B21: concurrent recovery + controller ⇒ exactly ONE action ───────────
+# ── B21: REAL concurrent actors (threads + barrier) ⇒ exactly ONE action ─
 def test_b21_concurrent_recovery_single_action(tmp_path):
     log = make_log(tmp_path)
     mgr = StubOrderMgr()
     iid = make_intent(log)
     log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED", client_order_id="c")
-    # simulate two processes racing: only the lock holder acts
-    with log.lock("proc-a"):
-        with pytest.raises(ei.LockBusyError):
-            with log.lock("proc-b"):
-                pass
-        log.recover(iid, query_fn=lambda c: {"status": "NOT_FOUND"}, order_mgr=mgr)
-    assert mgr.submits == [] and mgr.cancels == []  # one actor, one decision
+    barrier = threading.Barrier(3)
+    outcomes = []
+
+    def actor(name):
+        barrier.wait()
+        try:
+            with log.lock(f"proc-{name}"):
+                r = log.recover(iid, query_fn=lambda c: {"status": "NOT_FOUND"},
+                                order_mgr=mgr)
+                outcomes.append((name, r["legs"]["NEAR"]["status"]))
+        except ei.LockBusyError:
+            outcomes.append((name, "LOCK_BUSY"))
+
+    t1 = threading.Thread(target=actor, args=("a",))
+    t2 = threading.Thread(target=actor, args=("b",))
+    t1.start(); t2.start()
+    barrier.wait()
+    t1.join(); t2.join()
+    performed = [o for o in outcomes if o[1] != "LOCK_BUSY"]
+    assert len(performed) == 1  # exactly ONE actor performed the transition
+    assert outcomes.count(("a", "LOCK_BUSY")) + outcomes.count(("b", "LOCK_BUSY")) == 1
 
 
-# ── B22: PM2 restart overlap; stale lock reclaimed owner-verified ─────────
+# ── B22: foreign owner → owner-verified reclaim → second process acquires ─
 def test_b22_restart_overlap_owner_verified(tmp_path):
     log = make_log(tmp_path)
-    with log.lock({"pid": 99999, "start_token": "tokA", "host": "h"}):
-        # PID 99999 is gone; start_token mismatch with the new process
-        owner = log.lock_owner()
-        assert owner["pid"] == 99999
-        can = log.try_reclaim(owner_check_fn=lambda pid, token: token != "tokB")
-        assert can is True  # owner-verified reclaim (old process dead)
-        assert mgr_free(tmp_path) or True
+    # foreign owner: old process, dead PID + stale start token
+    log._force_lock_owner({"pid": 99999, "start_token": "tokA", "host": "h",
+                           "acquired_at": time.time()})
+    acquired = log.try_acquire({"pid": os.getpid(), "start_token": "tokB", "host": "h"},
+                               owner_check_fn=lambda pid, token: token != "tokB")
+    assert acquired is True  # reclaimed owner-verified
+    assert log.lock_owner()["pid"] == os.getpid()
+    # healthy foreign owner → acquisition refused
+    log._force_lock_owner({"pid": 77777, "start_token": "alive", "host": "h"})
+    with pytest.raises(ei.LockBusyError):
+        log.try_acquire({"pid": os.getpid(), "start_token": "tokC", "host": "h"},
+                        owner_check_fn=lambda pid, token: token == "alive")
 
 
-# ── B23: P1-2 producer double-submit regression (same intent) ────────────
+# ── B23: REAL producer seam — remaining-leg trail exit writes the SAME
+#         intent; second tick suppressed (P1-2 double-submit regression) ──
 def test_b23_producer_double_submit_suppressed(tmp_path):
     log = make_log(tmp_path)
     mgr = StubOrderMgr()
-    iid = log.get_or_create("t1", reason="TRAIL_REMAINING")
-    log.submit_leg(iid, "FAR", mgr)
-    # second tick trigger: same intent, leg already SUBMIT_ATTEMPTED/SUBMITTED
-    with pytest.raises(ei.DuplicateSubmitError):
-        log.submit_leg(iid, "FAR", mgr)
-    assert len(mgr.submits) == 1  # P1-2 double-submit regression: ONE order
+    # tick 1: producer trigger
+    r1 = ei.producer_exit_trigger("t1", reason="TRAIL_REMAINING", leg="FAR",
+                                  order_mgr=mgr)
+    assert len(mgr.submits) == 1
+    # tick 2: same producer trigger — MUST be suppressed via the same intent
+    r2 = ei.producer_exit_trigger("t1", reason="TRAIL_REMAINING", leg="FAR",
+                                  order_mgr=mgr)
+    assert r2["suppressed"] is True
+    assert len(mgr.submits) == 1  # P1-2 regression: ONE order total
+    # source-level integration contract: tmf_spread remaining-leg exit branch
+    # must route through the durable intent (fails until wired)
+    src = open(os.path.join(os.path.dirname(__file__), "..", "..",
+                            "strategies", "plugins", "futures", "active",
+                            "tmf_spread.py"), encoding="utf-8").read()
+    assert "exit_intent" in src and "producer_exit_trigger" in src
 
 
 # ── B24: crash after repair-child SUBMIT_ATTEMPTED before send ───────────
@@ -339,7 +393,6 @@ def test_b24_repair_child_crash_before_send(tmp_path):
     mgr = StubOrderMgr()
     iid = make_intent(log)
     child = log.repair_complete(iid, "FAR", reason="REJECTED")
-    # crash: child is SUBMIT_ATTEMPTED, send never happened
     log2 = ei.IntentLog(str(tmp_path))
     outcome = log2.recover(child["intent_id"], query_fn=lambda c: {"status": "NOT_FOUND"})
     assert outcome["legs"]["FAR"]["status"] == "NOT_FOUND_CONFIRMED"
@@ -370,10 +423,8 @@ def test_b26_emergency_supersedes_intent(tmp_path):
     emg = log.emergency_supersede(iid, mgr)
     assert emg["supersedes"] == iid
     assert log.get(iid)["terminal"] == "SUPERSEDED_BY_EMERGENCY"
-    # reconciliation sees both records
     rec = log.reconciliation_view(iid)
     assert rec["emergency"] is not None and rec["intent"] is not None
-    # superseded intent does no further repair
     with pytest.raises(ei.SupersededIntentError):
         log.repair_complete(iid, "FAR", reason="LATE")
 
@@ -402,28 +453,27 @@ def test_b28_cas_stale_transition_rejected(tmp_path):
         log.transition(iid, "FAR", "SUBMIT_ATTEMPTED", expect_version=v1)  # stale
 
 
-# ── B29: healthy owner with slow I/O is NOT stolen ───────────────────────
+# ── B29: healthy owner with slow I/O is NOT stolen (age only alerts) ─────
 def test_b29_healthy_owner_not_stolen(tmp_path):
     log = make_log(tmp_path)
     acquired_at = time.time() - 9999  # older than ANY age threshold
-    with log.lock({"pid": os.getpid(), "start_token": "mine", "host": "h",
-                   "acquired_at": acquired_at}):
-        owner = log.lock_owner()
-        assert owner["start_token"] == "mine"
-        # age may alert but never authorizes steal of a LIVE owner
-        can = log.try_reclaim(owner_check_fn=lambda pid, token: False,
-                              age_alert_threshold_s=1)
-        assert can is False  # healthy owner not stolen despite age
-        assert log.lock_owner()["pid"] == os.getpid()
+    log._force_lock_owner({"pid": os.getpid(), "start_token": "mine", "host": "h",
+                           "acquired_at": acquired_at})
+    with pytest.raises(ei.LockBusyError):  # refusal despite age
+        log.try_acquire({"pid": 8888, "start_token": "other", "host": "h"},
+                        owner_check_fn=lambda pid, token: token == "mine",  # owner alive
+                        age_alert_threshold_s=1)
+    assert log.lock_owner()["pid"] == os.getpid()  # not stolen
 
 
 # ── B30: PID reuse / start-token mismatch ⇒ safe reclaim ─────────────────
 def test_b30_pid_reuse_start_token_mismatch_reclaimable(tmp_path):
     log = make_log(tmp_path)
-    with log.lock({"pid": 4242, "start_token": "old-boot-token", "host": "h"}):
-        # same PID now belongs to a different process (new start token)
-        can = log.try_reclaim(owner_check_fn=lambda pid, token: token != "old-boot-token")
-        assert can is True
+    log._force_lock_owner({"pid": 4242, "start_token": "old-boot-token", "host": "h"})
+    acquired = log.try_acquire({"pid": 4242, "start_token": "new-token", "host": "h"},
+                               owner_check_fn=lambda pid, token: token == "new-token")
+    assert acquired is True
+    assert log.lock_owner()["start_token"] == "new-token"
 
 
 # ── B31: emergency supersede write failure ⇒ fail-closed no orders ───────
@@ -437,7 +487,3 @@ def test_b31_emergency_supersede_write_failure_fail_closed(tmp_path, monkeypatch
     with pytest.raises(OSError):
         log.emergency_supersede(iid, mgr)
     assert mgr.submits == [] and mgr.cancels == []  # NO emergency orders
-
-
-def mgr_free(tmp_path):
-    return True
