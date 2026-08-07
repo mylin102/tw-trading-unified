@@ -91,19 +91,33 @@ def safe_login(api: sj.Shioaji, api_key: str, secret_key: str, **kwargs) -> Any:
     """
     Safely logins using parameters compatible with the installed version.
     Uses fallback for versions that don't support contracts_timeout.
+
+    Live Route Certification hook (round-8): the SessionRegistry is
+    invalidated BEFORE each login/reconnect attempt and a NEW opaque
+    generation is registered ONLY after a successful login — a failed
+    relogin leaves no valid generation and old certificates die with the
+    old generation. Import is function-local to avoid a circular import
+    (core.live_route_certificate imports live_broker_preflight which
+    imports this module).
     """
+    from core.live_route_certificate import session_registry  # local import
+    session_registry.unregister(api)   # invalidate before every attempt
     try:
         # [rshioaji 1.5.9+] login with contracts_timeout returns True if contracts loaded
-        return api.login(
+        res = api.login(
             api_key=api_key,
             secret_key=secret_key,
             contracts_timeout=kwargs.get("contracts_timeout", 10000),
             **kwargs
         )
+        session_registry.register(api)  # register exactly once, after success
+        return res
     except TypeError:
         # Fallback for 1.3.3
         kwargs.pop("contracts_timeout", None)
-        return api.login(api_key=api_key, secret_key=secret_key, **kwargs)
+        res = api.login(api_key=api_key, secret_key=secret_key, **kwargs)
+        session_registry.register(api)
+        return res
 
 def wait_for_contracts(api: sj.Shioaji, category: str = "Futures", symbol: str = "MXF", timeout: int = 30):
     """Wait for specific contracts to be available in the local cache."""

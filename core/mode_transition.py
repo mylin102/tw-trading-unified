@@ -151,6 +151,11 @@ class ExecutionContext:
     # Namespace
     state_namespace: str = "paper"         # "paper" | "live"
 
+    # Route certification audit trail (Live Route Certification): the only
+    # path to LIVE_READY is a valid in-process certificate; every failed
+    # transition returns an explicit quarantine with its audit reasons here.
+    audit_reasons: tuple[str, ...] = ()
+
     def is_live_ready(self) -> bool:
         """Shorthand: fully LIVE with authorization."""
         return (
@@ -202,6 +207,7 @@ class ExecutionContext:
             "process_start_id": self.process_start_id,
             "config_hash": self.config_hash,
             "state_namespace": self.state_namespace,
+            "audit_reasons": list(self.audit_reasons),
         }
 
 
@@ -279,18 +285,26 @@ def transition_to_live_ready(ctx, failures) -> "ExecutionContext":
 
     LIVE_QUARANTINED is permanent fail-closed: live orders stay blocked
     until an operator explicitly rebuilds the context (no auto-retry).
+
+    NOTE (Live Route Certification, round-8): the no-certificate success
+    path is CLOSED. Without a certificate this transition must quarantine
+    and never authorize — the only path to LIVE_READY is
+    ``transition_with_certificate`` in core/live_route_certificate.
     """
     if failures:
         return with_effective_mode(ctx, ModeTransitionState.LIVE_QUARANTINED.value,
-                                   live_order_allowed=False)
-    return with_effective_mode(ctx, ModeTransitionState.LIVE_READY.value,
-                               live_order_allowed=True)
+                                   live_order_allowed=False,
+                                   audit_reasons=tuple(failures))
+    return with_effective_mode(ctx, ModeTransitionState.LIVE_QUARANTINED.value,
+                               live_order_allowed=False,
+                               audit_reasons=("NO_CERTIFICATE",))
 
 
 def with_effective_mode(
     ctx: ExecutionContext,
     new_mode: str | ModeTransitionState,
     live_order_allowed: bool | None = None,
+    audit_reasons: tuple[str, ...] | None = None,
 ) -> ExecutionContext:
     """Create a new ExecutionContext with updated effective_mode.
 
@@ -315,6 +329,8 @@ def with_effective_mode(
     updates: dict = {"effective_mode": mode_value}
     if live_order_allowed is not None:
         updates["live_order_allowed"] = live_order_allowed
+    if audit_reasons is not None:
+        updates["audit_reasons"] = tuple(audit_reasons)
 
     return replace(ctx, **updates)
 
