@@ -217,11 +217,16 @@ def logout():
             # Live Route Certification (round-9 #1): invalidate the session
             # registration so no certificate remains generation-valid after
             # broker logout. Function-level import avoids import cycles.
+            # round-10 P0-2: invalidation is MANDATORY and must NOT be
+            # swallowed — if it fails we force global revocation and
+            # re-raise (broker logout must not proceed with a valid
+            # generation).
+            from core.live_route_certificate import session_registry
             try:
-                from core.live_route_certificate import unregister_session
-                unregister_session(_api)
+                session_registry.unregister(_api)
             except Exception:
-                pass
+                session_registry.invalidate_all()   # force global revocation
+                raise
             try:
                 _api.logout()
                 logger.info("[session] Logged out cleanly")

@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
+import re
 from pathlib import Path
 import secrets
 import time
@@ -40,7 +42,18 @@ MARGIN_SOURCE_VERSION = 1
 MARGIN_BUFFER = 0.1          # 1 near + 1 far micro: per_pair × (1 + buffer)
 TTL_SECS = 60
 SKEW_SECS = 30
-KNOWN_PRODUCTS = ("TMF", "MTX")
+KNOWN_PRODUCTS = ("TMF",)          # Phase 1: TMF only (round-10 hardening)
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _trusted_release_sha() -> str:
+    """Release identity derived from the trusted deploy context (env set by
+    the deployment), NEVER caller-supplied (round-10 P0-3)."""
+    sha = os.environ.get("LRC_RELEASE_SHA", "") or ""
+    if not _SHA_RE.match(sha):
+        raise ValueError("LRC_RELEASE_SHA missing or not a 40-hex commit SHA")
+    return sha
 
 
 def _now_iso() -> str:
@@ -111,6 +124,13 @@ class SessionRegistry:
         authoritative current session for certificate validation."""
         return self._last_generation
 
+    def invalidate_all(self) -> None:
+        """Force global revocation (round-10 P0-2 fallback): every
+        registration dies, current generation cleared."""
+        self._entries.clear()
+        self._last_generation = None
+        self._last_generation_api = None
+
 
 session_registry = SessionRegistry()
 
@@ -148,7 +168,10 @@ def is_authenticated_session(api: object) -> bool:
         # list_accounts — a non-empty list of a DIFFERENT account is not an
         # authenticated futures session.
         fut_ident = _account_identity(getattr(api, "futopt_account"))
-        if not any(_account_identity(a) == fut_ident for a in accounts):
+        if not any(fut_ident):
+            return False              # empty identity is not authentic
+        if not any(_account_identity(a) == fut_ident and any(_account_identity(a))
+                   for a in accounts):
             return False
     except Exception:
         return False
@@ -202,8 +225,8 @@ def parse_margin_config(raw: bytes, *, config_path: str, release_sha: str,
     product = str(product).upper()
     if product not in KNOWN_PRODUCTS:
         raise ValueError(f"unknown product {product!r}")
-    if not release_sha:
-        raise ValueError("release_sha (deployed commit) required")
+    if not _SHA_RE.match(release_sha or ""):
+        raise ValueError("release_sha must be a 40-hex deployed commit SHA")
     import yaml
     try:
         doc = yaml.safe_load(raw)
@@ -221,15 +244,18 @@ def parse_margin_config(raw: bytes, *, config_path: str, release_sha: str,
     )
 
 
-def load_trusted_margin_source(config_path, *, release_sha: str,
+def load_trusted_margin_source(config_path, *,
                                product: str = "TMF") -> SealedMarginSource:
     """Read the effective config FILE, verify and seal the margin source.
+    The release identity is derived INTERNALLY from the trusted deploy
+    context (LRC_RELEASE_SHA env) — callers cannot choose it (P0-3).
     Missing/unreadable file → ValueError (fail-closed)."""
     path = Path(config_path)
     if not path.is_file():
         raise ValueError(f"config not found: {path}")
     return parse_margin_config(path.read_bytes(), config_path=str(path),
-                               release_sha=release_sha, product=product)
+                               release_sha=_trusted_release_sha(),
+                               product=product)
 
 
 def _required_margin(source: SealedMarginSource,
@@ -319,16 +345,14 @@ class CertificateIssuer:
 
 def certify_route(api: object, *, process_start_id: str,
                   issuer: CertificateIssuer, config_path,
-                  release_sha: str, product: str = "TMF",
+                  product: str = "TMF",
                   margin_buffer: float = MARGIN_BUFFER,
                   ) -> tuple[Optional[LiveBrokerCertificate], list[str]]:
     """Collect from the CURRENT authenticated execution session and issue a
     certificate. No external dict/JSON payload is accepted (B2); the margin
     source is loaded and sealed HERE from the effective config file
     (round-9 #3/#4) — a caller-supplied source cannot be injected."""
-    margin_source = load_trusted_margin_source(config_path,
-                                               release_sha=release_sha,
-                                               product=product)
+    margin_source = load_trusted_margin_source(config_path, product=product)
     failures: list[str] = []
 
     if not is_authenticated_session(api):
@@ -344,6 +368,12 @@ def certify_route(api: object, *, process_start_id: str,
     account_hash = pre.get("account_id_hash") or ""
     if not account_hash:
         failures.append("ACCOUNT_UNREADABLE")
+
+    # round-10 P0-1: ANY required broker query failure must fail certification
+    # (trading_limits is the only warning-only path — it lands in warnings).
+    query_failures = pre.get("query_failures") or []
+    if query_failures:
+        failures.append("REQUIRED_QUERY_FAILURE")
 
     required = _required_margin(margin_source, margin_buffer)
     available = (pre.get("margin") or {}).get("available_margin")
@@ -369,13 +399,15 @@ def certify_route(api: object, *, process_start_id: str,
     if near_code and far_code and set(snapshot_codes) != {near_code, far_code}:
         failures.append("SNAPSHOT_CODES_INCONSISTENT")
 
-    # round-9 #5: all([]) is true — require EXACTLY two successful, unique
-    # quote checks whose codes are precisely {near_code, far_code}.
-    quote_checks = [c for c in (pre.get("quote_subscription") or [])
-                    if c.get("passed")]
-    quote_codes = {c.get("code") for c in quote_checks}
+    # round-9 #5 + round-10: the RAW quote_subscription must be exactly two
+    # rows, both passed, codes precisely {near_code, far_code} — no filtered
+    # view (2 good + extra failed/malformed row must fail).
+    raw_quotes = pre.get("quote_subscription") or []
+    quote_checks = raw_quotes
+    quote_codes = {c.get("code") for c in raw_quotes}
     if near_code and far_code and (
-            len(quote_checks) != 2 or len(quote_codes) != 2
+            len(raw_quotes) != 2 or len(quote_codes) != 2
+            or not all(c.get("passed") for c in raw_quotes)
             or quote_codes != {near_code, far_code}):
         failures.append("QUOTE_SUBSCRIPTION_FAILED")
 
@@ -501,8 +533,7 @@ def build_runtime_certification_context(api: object, config: dict,
         account_hash=_account_hash(account),
         near_code=getattr(near, "code", "") or "",
         far_code=getattr(far, "code", "") or "",
-        margin_source=load_trusted_margin_source(
-            config, release_sha=str(ps.get("release_sha", "") or "")),
+        margin_source=load_trusted_margin_source(config),
         session_generation=session_registry.generation(api) or "",
         now_ts=_now_iso(),
     )
