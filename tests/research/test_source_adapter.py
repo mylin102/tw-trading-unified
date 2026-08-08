@@ -273,6 +273,13 @@ MAPPING_V1 = {"windows": [
      "near": "TMFH6", "far": "TMFI6", "version": "map-v1"}]}
 
 
+def _unavailable_quote(reason):
+    """Mirror of the adapter's fixed typed unavailable quote shape."""
+    return {"available": False, "bid": None, "ask": None, "age_s": None,
+            "close_action": None, "quote_exchange_ts": None,
+            "quote_source": None, "reason": reason}
+
+
 def _fixture_sources(tmp_path, with_bbo=True, unknown_type=None):
     lines = [
         '{"fill_type": "ENTRY", "timestamp": "2026-08-08T09:00:00.000", '
@@ -357,6 +364,60 @@ def test_build_no_bbo_censored(tmp_path):
         q = result[0]["quotes"][leg]
         assert isinstance(q, dict) and q.get("available") is False, q
         assert q.get("reason"), "no-BBO must be explicit, never fake"
+        # v4: fixed typed shape — every runner QUOTE_FIELD present (None)
+        for f in ("bid", "ask", "age_s", "close_action",
+                  "quote_exchange_ts", "quote_source"):
+            assert f in q, f"{leg} quote missing field {f}"
+            assert q[f] is None, f"{leg} quote {f} must be null"
+
+
+def test_build_unmatched_release_fills_listed(tmp_path):
+    # v4: every RELEASE fill without a legal anchor is listed explicitly
+    fills, evs, bbo = _fixture_sources(tmp_path)
+    with fills.open("a", encoding="utf-8") as f:
+        f.write('{"fill_type": "RELEASE", "timestamp": '
+                '"2026-08-08T10:00:02.000", "leg": "near", '
+                '"contract": "NEAR", "side": "SHORT", "qty": 2, '
+                '"trade_id": "t9"}\n')
+    out = tmp_path / "out"
+    result = build_normalized_snapshot(
+        [str(fills), str(evs), str(bbo)], str(out),
+        mapping_input=MAPPING_V1)
+    assert isinstance(result, list), result
+    manifest = json.loads(
+        (out / "manifest.json").read_text(encoding="utf-8"))
+    unmatched = manifest.get("unmatched_release_fills", [])
+    assert len(unmatched) == 1, unmatched
+    u = unmatched[0]
+    assert u["trade_id"] == "t9", u
+    assert u["source"].endswith("fills.jsonl"), u
+    assert isinstance(u["record_no"], int) and \
+        isinstance(u["byte_offset"], int), u
+    assert "anchor" in u["reason"].lower(), u
+
+
+def test_runner_censors_typed_unavailable_as_value(tmp_path):
+    # v4: typed-unavailable quotes pass the runner schema gate (fields
+    # present) -> censored as VALUE, never 'schema: missing field'
+    from scripts.research.phase_transition_replay import run_replay
+    events = [{
+        "source_event_seq": 1, "exchange_ts": 1786183190000,
+        "recv_ts": 1786183190050, "decision_ts_ms": 1786183190000,
+        "quotes": {"near": _unavailable_quote("near: no valid BBO"),
+                   "far": _unavailable_quote("far: no valid BBO")},
+    }]
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps(events), encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1", "--dry-run"])
+    assert rc == 0, rc
+    manifest = json.loads(
+        (out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["n_kept"] == 0 and manifest["n_censored"] == 1
+    reasons = [c["reason"] for c in manifest["censored_reasons"]]
+    assert all("schema:" not in r for r in reasons), reasons
+    assert reasons and reasons[0], reasons
 
 
 def test_build_unknown_fill_type_counted(tmp_path):
