@@ -20,6 +20,8 @@ SOURCE_KINDS = ("fills", "events", "quotes")
 EXECUTABLE_QUOTE_FEEDS = ("bbo_near", "bbo_far")
 DECISION_KINDS = ("RELEASE_DECISION", "SUBMISSION")
 ANCHOR_TS_UNIT = "epoch_ms"
+EPOCH_MS_MIN = 1_400_000_000_000
+EPOCH_MS_MAX = 2_500_000_000_000
 
 
 # ── input: read-once + hash binding (TOCTOU) ─────────────────────────────────
@@ -86,6 +88,11 @@ def _parse_ts_text(ts_text):
         return None
 
 
+def _valid_epoch_ms(v):
+    return (isinstance(v, int) and not isinstance(v, bool)
+            and EPOCH_MS_MIN <= v <= EPOCH_MS_MAX)
+
+
 def attach_provenance(record):
     """Event-time provenance: byte hash + record number/byte offset +
     original timestamp text + parsed timestamp/unit/offset."""
@@ -137,6 +144,7 @@ def order_events(events):
 def _attach_leg(ev, leg, quote_records):
     anchor = ev.get("decision_ts_ms")
     contract = ev.get("contract")
+    position_side = ev.get("position_side")
     reasons = []
     best = None
     for q in quote_records or []:
@@ -147,7 +155,10 @@ def _attach_leg(ev, leg, quote_records):
             reasons.append(f"{leg}: feed {src!r} not executable")
             continue
         qc = q.get("contract")
-        if contract and qc and qc != contract:
+        if not qc:
+            reasons.append(f"{leg}: quote contract missing")
+            continue
+        if qc != contract:
             reasons.append(f"{leg}: contract {qc!r} != {contract!r}")
             continue
         qt = q.get("quote_exchange_ts")
@@ -158,6 +169,17 @@ def _attach_leg(ev, leg, quote_records):
             reasons.append(
                 f"{leg}: quote ts {qt} after legal decision anchor {anchor}")
             continue
+        # P0: close_action is DERIVED/VALIDATED from the pre-decision
+        # position record — never blindly trusted from the quote
+        if position_side not in ("LONG", "SHORT"):
+            reasons.append(f"{leg}: position_side missing from pre-decision "
+                           f"position record")
+            continue
+        if q.get("close_action") != position_side:
+            reasons.append(
+                f"{leg}: close_action {q.get('close_action')!r} != "
+                f"position side {position_side!r}")
+            continue
         if best is None or qt > (best.get("quote_exchange_ts") or 0):
             best = q
     if best is None:
@@ -165,7 +187,7 @@ def _attach_leg(ev, leg, quote_records):
                 "reason": "; ".join(reasons) or f"{leg}: no valid BBO"}
     return {"available": True, "bid": best.get("bid"), "ask": best.get("ask"),
             "age_s": best.get("age_s"),
-            "close_action": best.get("close_action"),
+            "close_action": position_side,
             "quote_exchange_ts": best.get("quote_exchange_ts"),
             "quote_source": best.get("quote_source"),
             "contract": best.get("contract")}
@@ -218,11 +240,27 @@ def _write_no_replace(out_dir, name, payload):
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
+    return target
+
+
+def _cleanup(out_dir, created):
+    """Remove newly-created output files + the fresh out-dir. Never touches
+    preexisting data (the out-dir was exclusively created by this run)."""
+    for f in created:
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
+    try:
+        os.rmdir(out_dir)
+    except OSError:
+        pass
 
 
 def emit_manifest(out_dir, events, sources):
     """Versioned manifest mapping every output event to source records and
-    hashes. Written no-replace (atomic); returns the manifest dict."""
+    hashes. Returns the manifest dict (pure — the caller owns the
+    all-or-nothing writes)."""
     event_map = {}
     for i, ev in enumerate(events or []):
         event_map[str(ev.get("source_event_seq"))] = {
@@ -237,12 +275,6 @@ def emit_manifest(out_dir, events, sources):
         "event_map": event_map,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    try:
-        _write_no_replace(out_dir, "manifest.json",
-                          json.dumps(manifest, indent=2, sort_keys=True,
-                                     ensure_ascii=False))
-    except FileExistsError as e:
-        raise FileExistsError(f"manifest target already exists: {e}") from e
     return manifest
 
 
@@ -264,12 +296,18 @@ def _merge_events(sources):
     anchor = legal_anchor(all_records)
     if isinstance(anchor, tuple) and anchor[0] == "NOT_AVAILABLE":
         return None, anchor[1]
-    anchor_ts = (anchor.get("parsed_ts")
-                 or anchor.get("exchange_ts") or anchor.get("ts"))
+    # P0: decision_ts_ms comes ONLY from the anchor's ts_text, parsed +
+    # validated as epoch-ms — never None, never a post-decision RELEASE
+    # fill timestamp
+    anchor_ts = _parse_ts_text(anchor.get("ts_text"))
+    if not _valid_epoch_ms(anchor_ts):
+        return None, (f"invalid/missing decision anchor timestamp: "
+                      f"{anchor.get('ts_text')!r}")
     ev = {"source_event_seq": anchor.get("source_event_seq") or 1,
           "exchange_ts": anchor.get("exchange_ts"),
           "recv_ts": anchor.get("recv_ts"),
           "decision_ts_ms": anchor_ts,
+          "decision_ts_text": anchor.get("ts_text"),
           "contract": anchor.get("contract"),
           "event_source": anchor.get("event_source"),
           "provenance": attach_provenance(anchor),
@@ -305,11 +343,26 @@ def build_snapshot(input_paths, out_dir):
     quote_records = [r for s in sources for r in s.get("records", [])
                      if r.get("leg")]
     events = attach_quotes(events, quote_records)
+    # P0: all-or-nothing — prepare BOTH payloads, write both with
+    # exclusive no-replace atomic finalization; on ANY failure remove the
+    # newly-created files/dir (never a partial output, never touching
+    # preexisting data)
+    events_payload = json.dumps(events, indent=2, sort_keys=True,
+                                ensure_ascii=False)
     try:
-        _write_no_replace(out_dir, "events.json",
-                          json.dumps(events, indent=2, sort_keys=True,
-                                     ensure_ascii=False))
-        emit_manifest(out_dir, events, sources)
-    except FileExistsError as e:
+        manifest = emit_manifest(out_dir, events, sources)
+    except (OSError, FileExistsError) as e:
+        _cleanup(out_dir, [])
+        return ("REFUSED", str(e))
+    manifest_payload = json.dumps(manifest, indent=2, sort_keys=True,
+                                  ensure_ascii=False)
+    created = []
+    try:
+        created.append(_write_no_replace(out_dir, "events.json",
+                                         events_payload))
+        created.append(_write_no_replace(out_dir, "manifest.json",
+                                         manifest_payload))
+    except (OSError, FileExistsError) as e:
+        _cleanup(out_dir, created)
         return ("REFUSED", str(e))
     return events
