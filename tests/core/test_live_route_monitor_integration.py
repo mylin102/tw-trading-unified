@@ -240,3 +240,63 @@ def test_release_head_check_in_release_tree():
     text = monitor.read_text(encoding="utf-8")
     assert "LRC_RELEASE_SHA" in text and "-C" in text, \
         "release-tree HEAD check not wired"
+
+
+# ── Live wiring Step 1: startup transition path (bounded task) ───────────────
+
+def _minimal_live_cfg(tmp_path):
+    cfg = tmp_path / "futures_test.yaml"
+    cfg.write_text("ticker: TMF\nlive_trading: true\n", encoding="utf-8")
+    return cfg
+
+
+def test_no_cert_startup_quarantines_no_certificate(tmp_path, monkeypatch):
+    """No certificate at startup -> LIVE_QUARANTINED + NO_CERTIFICATE
+    (fail-closed; live orders blocked)."""
+    monkeypatch.chdir(tmp_path)  # avoid config/futures.yaml fallback
+    cfg = _minimal_live_cfg(tmp_path)
+    from strategies.futures.monitor import FuturesMonitor
+    m = FuturesMonitor(api=None, config_path=str(cfg))
+    ctx = m._execution_context
+    assert ctx is not None
+    assert not ctx.is_live_ready(), "no-cert startup must never authorize"
+    assert "NO_CERTIFICATE" in ctx.audit_reasons, ctx.audit_reasons
+
+
+def test_valid_cert_startup_uses_transition_with_certificate(tmp_path, monkeypatch):
+    """Valid certificate path invokes transition_with_certificate with the
+    issued cert + trusted runtime context (the ONLY path to LIVE_READY)."""
+    monkeypatch.chdir(tmp_path)
+    cfg = _minimal_live_cfg(tmp_path)
+    import core.live_route_certificate as lrc
+    from core.mode_transition import (ModeTransitionState, live_preflight_context,
+                                      with_effective_mode)
+    cert_fake = object()
+    runtime_fake = object()
+    calls = {}
+
+    def fake_certify(api, **kwargs):
+        return (cert_fake, [])
+
+    def fake_build(api, config, process_state=None):
+        return runtime_fake
+
+    def spy_transition(ctx, cert, issuer, *, runtime):
+        calls["cert"] = cert
+        calls["runtime"] = runtime
+        calls["issuer"] = issuer
+        return with_effective_mode(ctx, ModeTransitionState.LIVE_READY.value,
+                                   live_order_allowed=True)
+
+    monkeypatch.setattr(lrc, "certify_route", fake_certify)
+    monkeypatch.setattr(lrc, "build_runtime_certification_context", fake_build)
+    monkeypatch.setattr(lrc, "transition_with_certificate", spy_transition)
+
+    from strategies.futures.monitor import FuturesMonitor
+    api_fake = object()
+    m = FuturesMonitor(api=api_fake, config_path=str(cfg))
+    assert calls.get("cert") is cert_fake, "monitor must use the issued cert"
+    assert calls.get("runtime") is runtime_fake, \
+        "monitor must pass the trusted runtime context"
+    assert m._execution_context.is_live_ready(), \
+        "valid-cert path transitions to LIVE_READY"
