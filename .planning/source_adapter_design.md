@@ -33,6 +33,29 @@
    （sources hashes + event_map + provenance）— **no-replace atomic
    writes**（同 builder/runner 政策）
 
+
+## 5. v2 修訂（critical source review — real runtime shapes）
+
+(1) **JSONL 解析**: 來源是 JSONL（一行一 record, 非單一 JSON list）;
+    讀 bytes 一次 → 分行保留**實際 byte offset**（line-start byte
+    位置, 非 record index）; torn/malformed line → 整份 REFUSED
+(2) **fill_type enum**: {ENTRY, RELEASE, EXIT, COMBINED_EXIT} 已知;
+    **ENTRY sides 是 LONG/SHORT**（非 Buy/Sell）; per-leg positions 由
+    ENTRY LONG/SHORT 推導 + **qty/side validation**（qty<=0 拒）
+(3) **Contract mapping（永不硬編碼）**: fills.contract = NEAR/FAR
+    **標籤**; BBO contract_code = 實際碼（TMFH6/TMFI6）— **永不直接
+    比較兩者**; mapping 由 authoritative event/order records（entry/
+    order contract codes + delivery metadata）或**顯式 versioned
+    mapping input**（validity windows）解析, **per decision timestamp**
+(4) **Roll 處理（P0）**: TMFH6/TMFI6 near/far 碼在月度結算/roll 後
+    變更; 每個 settlement window 一組 mapping; 解析依
+    decision_ts 落在哪個 window; roll boundary 上 ambiguous →
+    NOT_AVAILABLE（不猜）; **BBO join 用 per-event mapping + 同
+    validity window — 無 cross-roll reuse**; 錯 period 的 BBO code
+    拒絕
+(5) **Manifest**: 記錄 contract mapping evidence / version / hash
+    （+ 既有 sources hashes + event_map + provenance）
+
 ## 3. 輸出生態
 adapter → normalized snapshot → builder（既有）→ events.json +
 manifest → runner --input
