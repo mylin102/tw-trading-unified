@@ -5257,6 +5257,15 @@ class FuturesMonitor:
 
         live_ready = self.live_trading and not self.dry_run and self.contract is not None
         if live_ready and action is not None and not (self._use_order_manager and self.order_mgr):
+            # [Live wiring Step 4] execution-context gate on the DIRECT
+            # client.place_order path: non-LIVE_READY (PREFLIGHT/QUARANTINED)
+            # -> ZERO place_order/cancel_order calls + structured blocked
+            # result with audit reason. Manager path untouched.
+            _ctx = getattr(self, "_execution_context", None)
+            if _ctx is not None and not _ctx.is_live_ready():
+                return {"blocked": True, "reason": "LIVE_QUARANTINED",
+                        "audit_reasons": tuple(
+                            getattr(_ctx, "audit_reasons", ()) or ())}
             # 進場前檢查保證金（出場不擋）
             if signal in ("BUY", "SELL"):
                 if not self._margin_sufficient():
