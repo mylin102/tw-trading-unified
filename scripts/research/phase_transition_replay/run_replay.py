@@ -1,12 +1,17 @@
-"""Replay artifact runner — research-only (v4: dry-run acceptance).
+"""Replay artifact runner — research-only (v5: preregistration-sourced).
 
 The runner NEVER touches historical artifacts without explicit
-authorization. --dry-run validates the reproducible input, applies
-data-quality censoring and writes a manifest — no PnL is computed.
-Without --dry-run or --authorize the runner refuses (exit 2).
+authorization. ALL runnable parameters (M_economic, fee assumptions,
+staleness, config version) resolve from the committed pre-registration
+manifest (scripts/research/phase_transition_replay/preregistration.py) via
+a REQUIRED --prereg selector — there are NO value defaults on the CLI.
 
-Reproducible input: the input artifact's sha256 is recorded in the
-manifest; the same input always yields the same stream hash.
+Modes:
+- --dry-run: validate the input (schema + quality), write the manifest,
+  compute NO PnL. This is the ONLY accepted run mode while the engine is
+  not implemented.
+- --authorize without --dry-run: REFUSED (non-zero, zero output) — the
+  engine is not implemented; fake success is never returned.
 """
 
 import argparse
@@ -15,9 +20,17 @@ import json
 import sys
 from datetime import datetime, timezone
 
-MANIFEST_VERSION = "phase-transition-replay-manifest-v1"
+from scripts.research.phase_transition_replay import execution
+from scripts.research.phase_transition_replay import pipeline
+from scripts.research.phase_transition_replay import preregistration
+from scripts.research.phase_transition_replay import stream
+
+MANIFEST_VERSION = "phase-transition-replay-manifest-v2"
 QUALITY_GATE_TIER = "EXECUTABLE_BBO"   # incomplete quotes never produce
                                         # usable two-leg counterfactual PnL
+
+ORDERING_FIELDS = ("source_event_seq", "exchange_ts", "recv_ts")
+QUOTE_FIELDS = ("bid", "ask", "age_s", "close_action")
 
 
 def _sha256_file(path):
@@ -28,28 +41,57 @@ def _sha256_file(path):
     return h.hexdigest()
 
 
+def _validate_event(ev):
+    """Input schema validation — per-event; returns (ok, reason).
+
+    Requires ordering fields, a decision timestamp and the near/far quote
+    shape. Invalid events are censored WITH reason — never silently valid.
+    """
+    for f in ORDERING_FIELDS:
+        v = ev.get(f)
+        if not isinstance(v, int) or v <= 0:
+            return False, f"ordering field {f} missing/invalid: {v!r}"
+    if not ev.get("decision_ts"):
+        return False, "decision_ts missing"
+    quotes = ev.get("quotes")
+    if not isinstance(quotes, dict) or set(quotes) != {"near", "far"}:
+        return False, f"quotes must be exactly near/far: {quotes!r}"
+    for side in ("near", "far"):
+        q = quotes[side]
+        if not isinstance(q, dict):
+            return False, f"{side} quote not a dict: {q!r}"
+        for f in QUOTE_FIELDS:
+            if f not in q:
+                return False, f"{side} quote missing field {f}"
+    return True, None
+
+
 def _load_events(path):
-    """Load the reconciled event stream (JSON list of events)."""
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    """Load the reconciled event stream; whole-file problems REFUSE."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ValueError(f"input artifact unreadable: {path}: {e}") from e
     if not isinstance(data, list):
         raise ValueError(f"input artifact must be a JSON list: {path}")
     return data
 
 
-def _quality_censor(events, execution, staleness_bounds):
-    """Data-quality censoring: candidates with incomplete/stale quotes are
-    censored WITH reason — never dropped silently."""
+def _quality_censor(events, params):
+    """Schema + quality censoring: invalid/incomplete events are censored
+    WITH reason — never dropped silently, never treated as computable."""
+    staleness = params["staleness"]
     censored = []
     kept = []
     for ev in events:
-        quotes = ev.get("quotes")
-        if not quotes:
-            censored.append((ev, "no_quotes"))
+        ok, why = _validate_event(ev)
+        if not ok:
+            censored.append((ev, f"schema: {why}"))
             continue
         r = execution.executable_prices(
-            quotes, decision_ts=ev.get("decision_ts"),
-            staleness_bounds=staleness_bounds)
+            ev["quotes"], decision_ts=ev.get("decision_ts"),
+            staleness_bounds=staleness)
         if r["tier"] != QUALITY_GATE_TIER:
             censored.append((ev, "; ".join(r["reasons"]) or r["tier"]))
             continue
@@ -58,39 +100,51 @@ def _quality_censor(events, execution, staleness_bounds):
 
 
 def main(argv=None):
-    """Artifact runner (research-only)."""
+    """Artifact runner (research-only, v5)."""
     p = argparse.ArgumentParser(prog="phase_transition_replay")
     p.add_argument("--input", required=True,
                    help="reconciled event-stream artifact (JSON list)")
     p.add_argument("--out-dir", required=True, help="manifest output dir")
+    p.add_argument("--prereg", required=True, choices=preregistration.prereg_ids(),
+                   help="committed pre-registration selector (no value defaults)")
     p.add_argument("--dry-run", action="store_true",
                    help="validate input + write manifest, no PnL")
     p.add_argument("--authorize", action="store_true",
                    help="explicit authorization to run the engine")
-    p.add_argument("--config-version", default="research-v1")
-    p.add_argument("--fee-assumption-id", default="fee-v1")
-    p.add_argument("--m-economic", type=float, default=25.0)
     args = p.parse_args(argv)
 
-    if not args.dry_run and not args.authorize:
-        print("REFUSED: --dry-run or --authorize required",
+    params = preregistration.preregistration(args.prereg)
+
+    if not args.dry_run:
+        # the engine is NOT implemented: any non-dry-run attempt is a
+        # REFUSED, zero output — never a fake success
+        print("REFUSED: engine not implemented; only --dry-run is accepted",
               file=sys.stderr)
-        return 2
+        return 3
 
     import os
-    from scripts.research.phase_transition_replay import execution
-    from scripts.research.phase_transition_replay import stream
-    from scripts.research.phase_transition_replay import pipeline
-
     input_sha = _sha256_file(args.input)
-    events = _load_events(args.input)
+    try:
+        events = _load_events(args.input)
+    except ValueError as e:
+        print(f"REFUSED: {e}", file=sys.stderr)
+        return 4
     ordered, stream_hash, clock = stream.ordered_stream(
         events, clock_contract="immutable-global")
-    staleness = {"max_age_s": 30}
-    kept, censored = _quality_censor(ordered, execution, staleness)
+    kept, censored = _quality_censor(ordered, params)
     os.makedirs(args.out_dir, exist_ok=True)
     manifest = {
         "manifest_version": MANIFEST_VERSION,
+        "preregistration_id": args.prereg,
+        "preregistration_sha": preregistration.prereg_sha(args.prereg),
+        "parameters": {
+            "m_economic": params["m_economic"],
+            "fee_assumption_id": params["fee_assumption_id"],
+            "fee_assumptions": params["fee_assumptions"],
+            "staleness": params["staleness"],
+            "config_version": params["config_version"],
+            "classifier": params["classifier"],
+        },
         "input_path": args.input,
         "input_sha256": input_sha,
         "stream_hash": stream_hash,
@@ -98,20 +152,13 @@ def main(argv=None):
         "n_events": len(ordered),
         "n_kept": len(kept),
         "n_censored": len(censored),
-        "censored_reasons": [{"event_seq": e.get("replay_seq"),
+        "censored_reasons": [{"event_seq": e.get("source_event_seq"),
                               "reason": r} for e, r in censored],
-        "config_version": args.config_version,
-        "fee_assumption_id": args.fee_assumption_id,
-        "m_economic": args.m_economic,
-        "dry_run": bool(args.dry_run),
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "dry_run": True,
         "engine_run": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     with open(os.path.join(args.out_dir, "manifest.json"), "w",
               encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, sort_keys=True, ensure_ascii=False)
-    if args.dry_run:
-        return 0
-    # engine run not implemented — the manifest records that no historical
-    # artifact was executed
     return 0
