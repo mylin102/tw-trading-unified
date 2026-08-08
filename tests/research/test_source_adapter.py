@@ -12,7 +12,8 @@ RESEARCH ONLY, test-first. Actual runtime evidence:
 from scripts.research.event_snapshot import (  # noqa: F401
     ANCHOR_EVENT_KINDS, BBO_SOURCE_ALLOWLIST, FILL_TYPES, adapt_bbo,
     adapt_fill, adapt_spread_event, build_normalized_snapshot, join_anchor,
-    join_positions, normalize_sources, resolve_contract_mapping)
+    join_entries, join_positions, normalize_sources, release_leg,
+    resolve_contract_mapping)
 
 import json
 import pytest
@@ -105,6 +106,71 @@ def test_join_positions_from_entry_long_short():
               "side": "SHORT", "qty": 2}]
     pos = join_positions(fills, "t1")
     assert pos == {"near": "LONG", "far": "SHORT"}, pos
+
+
+# ── Step 1: entries + release_leg (replay conclusion gap) ────────────────────
+
+def test_join_entries_per_leg_from_entry_fills():
+    fills = [{"trade_id": "t1", "leg": "near", "fill_type": "ENTRY",
+              "side": "LONG", "price": 45.0, "qty": 2},
+             {"trade_id": "t1", "leg": "far", "fill_type": "ENTRY",
+              "side": "SHORT", "price": 30.0, "qty": 2}]
+    result = join_entries(fills, "t1")
+    assert result == {"near": {"price": 45.0, "qty": 2},
+                      "far": {"price": 30.0, "qty": 2}}, result
+
+
+def test_join_entries_missing_entry_fail_closed():
+    fills = [{"trade_id": "t1", "leg": "near", "fill_type": "RELEASE",
+              "side": "SHORT", "qty": 2}]
+    result = join_entries(fills, "t1")
+    assert isinstance(result, tuple) and result[0] == "NOT_AVAILABLE", result
+    assert "entry" in result[1].lower(), result
+
+
+def test_join_entries_missing_price_fail_closed():
+    fills = [{"trade_id": "t1", "leg": "near", "fill_type": "ENTRY",
+              "side": "LONG", "qty": 2}]
+    result = join_entries(fills, "t1")
+    assert isinstance(result, tuple) and result[0] == "NOT_AVAILABLE", result
+    assert "price" in result[1].lower(), result
+
+
+def test_release_leg_from_release_fill():
+    fills = [{"trade_id": "t1", "leg": "near", "fill_type": "RELEASE",
+              "side": "SHORT", "qty": 2}]
+    assert release_leg(fills, "t1") == "near"
+
+
+def test_release_leg_ambiguous_rejected():
+    fills = [{"trade_id": "t1", "leg": "near", "fill_type": "RELEASE",
+              "side": "SHORT", "qty": 2},
+             {"trade_id": "t1", "leg": "far", "fill_type": "RELEASE",
+              "side": "LONG", "qty": 2}]
+    result = release_leg(fills, "t1")
+    assert isinstance(result, tuple) and result[0] == "NOT_AVAILABLE", result
+
+
+def test_release_leg_missing_rejected():
+    fills = [{"trade_id": "t1", "leg": "near", "fill_type": "ENTRY",
+              "side": "LONG", "qty": 2}]
+    result = release_leg(fills, "t1")
+    assert isinstance(result, tuple) and result[0] == "NOT_AVAILABLE", result
+
+
+def test_build_event_carries_entries_and_release_leg(tmp_path):
+    # Step 1 integration: the emitted event carries per-leg entries +
+    # release_leg so the replay engine can produce Y0..Y3
+    fills, evs, bbo = _fixture_sources(tmp_path)
+    out = tmp_path / "out"
+    result = build_normalized_snapshot(
+        [str(fills), str(evs), str(bbo)], str(out),
+        mapping_input=MAPPING_V1)
+    assert isinstance(result, list), result
+    ev = result[0]
+    assert ev.get("release_leg") == "near", ev
+    assert ev.get("entries") == {"near": {"price": 45.0, "qty": 2},
+                                 "far": {"price": 30.0, "qty": 2}}, ev
 
 
 # ── contract mapping: labels vs codes, per-window, never hardcoded ───────────
@@ -284,13 +350,13 @@ def _fixture_sources(tmp_path, with_bbo=True, unknown_type=None):
     lines = [
         '{"fill_type": "ENTRY", "timestamp": "2026-08-08T09:00:00.000", '
         '"leg": "near", "contract": "NEAR", "side": "LONG", "qty": 2, '
-        '"trade_id": "t1"}',
+        '"price": 45.0, "trade_id": "t1"}',
         '{"fill_type": "ENTRY", "timestamp": "2026-08-08T09:00:01.000", '
         '"leg": "far", "contract": "FAR", "side": "SHORT", "qty": 2, '
-        '"trade_id": "t1"}',
+        '"price": 30.0, "trade_id": "t1"}',
         '{"fill_type": "RELEASE", "timestamp": "2026-08-08T10:00:02.000", '
         '"leg": "near", "contract": "NEAR", "side": "SHORT", "qty": 2, '
-        '"trade_id": "t1"}',
+        '"price": 52.0, "trade_id": "t1"}',
     ]
     if unknown_type:
         lines.append('{"fill_type": "%s", "timestamp": '
