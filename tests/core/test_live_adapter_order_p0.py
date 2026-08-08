@@ -61,6 +61,7 @@ class RecordingApi:
         self.last_order_kwargs = None
         self.fail_order_build = False
         self.fail_place = False
+        self.reject_trade = False
         self.futopt_account = SimpleNamespace(person_id="P1")
 
     def Order(self, **kw):
@@ -73,6 +74,8 @@ class RecordingApi:
         if self.fail_place:
             raise RuntimeError("place down")
         self.calls.append(("place_order", contract, order))
+        if self.reject_trade:
+            return SimpleNamespace(status=SimpleNamespace(status="Failed"))
         return SimpleNamespace(status=SimpleNamespace(status="Pending"))
 
     def update_order(self, trade, **kw):
@@ -103,10 +106,8 @@ _CONTRACT = SimpleNamespace(code="TMFH6")
 # ── market order maps to SDK-valid enums ────────────────────────────────────
 
 def test_market_order_builds_sdk_valid_enums():
-    # RED: a market order (price=0) must construct sj.Order with
-    # order_type in {ROD,IOC,FOK} and price_type in {MKP,LMT,MKT} — the
-    # current adapter uses OrderType.MTL and the build fails (AttributeError
-    # swallowed → None)
+    # a market order (price=0) must construct sj.Order with SDK-valid
+    # enums (the old adapter used OrderType.MTL — missing in 1.7.0)
     sj = _installed_sj()
     api = RecordingApi()
     c = _adapter(api)
@@ -118,6 +119,52 @@ def test_market_order_builds_sdk_valid_enums():
     assert api.last_order_kwargs.get("price_type") in (
         sj.FuturesPriceType.MKP, sj.FuturesPriceType.LMT,
         sj.FuturesPriceType.MKT), "price_type not SDK-valid"
+
+
+def test_market_order_uses_ioc_not_rod():
+    # TAIFEX: Market-With-Protection (MKP) requires IOC or FOK — ROD is
+    # for limit orders only. MTS intent = immediate with protection → IOC.
+    sj = _installed_sj()
+    api = RecordingApi()
+    c = _adapter(api)
+    c.place_order(_CONTRACT, "BUY", 1, price=0)
+    assert api.last_order_kwargs.get("order_type") == sj.OrderType.IOC, \
+        f"market order must use IOC: {api.last_order_kwargs.get('order_type')}"
+    assert api.last_order_kwargs.get("price_type") == sj.FuturesPriceType.MKP
+
+
+def test_limit_order_uses_rod():
+    sj = _installed_sj()
+    api = RecordingApi()
+    c = _adapter(api)
+    c.place_order(_CONTRACT, "SELL", 2, price=44300)
+    assert api.last_order_kwargs.get("order_type") == sj.OrderType.ROD, \
+        "limit order must use ROD"
+    assert api.last_order_kwargs.get("price_type") == sj.FuturesPriceType.LMT
+
+
+def test_octype_explicit_auto_not_sdk_default():
+    # FuturesOCType must be set explicitly (Auto — broker determines
+    # New/Cover from position) — never rely on SDK defaults
+    sj = _installed_sj()
+    api = RecordingApi()
+    c = _adapter(api)
+    c.place_order(_CONTRACT, "BUY", 1, price=0)
+    assert api.last_order_kwargs.get("octype") == sj.FuturesOCType.Auto, \
+        f"octype must be explicit Auto: {api.last_order_kwargs.get('octype')}"
+
+
+def test_rejected_trade_raises_structured_error():
+    # a Failed/Rejected trade must never be returned as success — the
+    # adapter raises ADAPTER_ORDER_REJECTED with context
+    api = RecordingApi()
+    api.reject_trade = True
+    c = _adapter(api)
+    with pytest.raises(Exception) as ei:
+        c.place_order(_CONTRACT, "BUY", 1, price=0)
+    assert type(ei.value).__name__ == "AdapterOrderError", ei.value
+    assert ei.value.code == "ADAPTER_ORDER_REJECTED", ei.value.code
+    assert ei.value.context.get("status") == "Failed"
 
 
 def test_market_order_success_exactly_one_intended_call():
