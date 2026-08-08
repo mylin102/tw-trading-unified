@@ -22,8 +22,10 @@ Modes:
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -119,16 +121,61 @@ def _validate_event(ev):
     return True, None
 
 
-def _load_events(path):
-    """Load the reconciled event stream; whole-file problems REFUSE."""
+def _read_input_once(path):
+    """Read the input bytes EXACTLY ONCE (P0-1 TOCTOU).
+    The sha256 is computed over the SAME in-memory bytes that are parsed
+    (json.loads from the bytes) — the pathname is NEVER reopened after
+    hashing, so a replaced file cannot decouple the manifest hash from the
+    parsed events.
+    """
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(path, "rb") as f:
+            data = f.read()
     except (OSError, ValueError) as e:
         raise ValueError(f"input artifact unreadable: {path}: {e}") from e
-    if not isinstance(data, list):
+    input_sha = hashlib.sha256(data).hexdigest()
+    try:
+        events = json.loads(data)
+    except ValueError as e:
+        raise ValueError(f"input artifact unparseable: {path}: {e}") from e
+    if not isinstance(events, list):
         raise ValueError(f"input artifact must be a JSON list: {path}")
-    return data
+    return input_sha, events
+
+
+def _exclusive_out_dir(path):
+    """Exclusive fresh output directory (P0-2 evidence overwrite).
+    Refuses when the path EXISTS (empty or not) — every run creates its
+    own new directory; an existing manifest can never be overwritten.
+    """
+    p = Path(path)
+    if p.exists():
+        raise FileExistsError(f"out-dir already exists: {path}")
+    p.mkdir(parents=True, exist_ok=False)
+    return p
+
+
+def _write_manifest_atomic(out_dir, manifest):
+    """temp + fsync + atomic rename — never a partially-written manifest,
+    never an overwrite of an existing manifest."""
+    target = os.path.join(out_dir, "manifest.json")
+    fd, tmp_path = tempfile.mkstemp(dir=out_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True,
+                      ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp_path, target)
+        dir_fd = os.open(out_dir, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
 
 def _quality_censor(events, params):
@@ -184,9 +231,8 @@ def main(argv=None):
         return 5
 
     params = preregistration.preregistration(args.prereg)
-    input_sha = _sha256_file(args.input)
     try:
-        events = _load_events(args.input)
+        input_sha, events = _read_input_once(args.input)
     except ValueError as e:
         print(f"REFUSED: {e}", file=sys.stderr)
         return 4
@@ -208,8 +254,11 @@ def main(argv=None):
             "near_age_s": near["age_s"],
             "far_age_s": far["age_s"],
         })
-    import os
-    os.makedirs(args.out_dir, exist_ok=True)
+    try:
+        _exclusive_out_dir(args.out_dir)
+    except FileExistsError as e:
+        print(f"REFUSED: {e}", file=sys.stderr)
+        return 6
     manifest = {
         "manifest_version": MANIFEST_VERSION,
         "preregistration_id": args.prereg,
@@ -241,9 +290,7 @@ def main(argv=None):
         "engine_run": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    with open(os.path.join(args.out_dir, "manifest.json"), "w",
-              encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True, ensure_ascii=False)
+    _write_manifest_atomic(args.out_dir, manifest)
     return 0
 
 
