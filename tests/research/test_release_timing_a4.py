@@ -10,6 +10,7 @@ stream/clone/tiers contracts — no ad hoc data loading.
 from scripts.research.release_timing_a4 import (  # noqa: F401
     branches, breach, decision, extrema, families, reports, reversal,
     state_machine, tiers)
+from scripts.research.phase_transition_replay import stream  # shared contract
 
 
 # ── state machine / hypothesis ──────────────────────────────────────────────
@@ -29,7 +30,9 @@ def test_decision_outputs_r0_r1_r2_r3():
 def test_safety_escapes_terminate_armed():
     for cause in ("combined_loss_floor", "max_adverse_excursion",
                   "max_wait", "quote_data_quality", "lifecycle_pending"):
-        assert state_machine.safety_escape(cause) is True, cause
+        td = state_machine.safety_escape(cause)
+        assert td.__class__.__name__ == "TerminalDecision", (cause, td)
+        assert td.cause == cause and td.terminal is True, (cause, td)
 
 
 def test_safety_escape_terminal_r3_must_not_continue():
@@ -188,7 +191,9 @@ def test_r3_deterministic_bounded():
 
 def test_all_branches_share_one_immutable_stream():
     # A4 v2.2 (3): four branch CONSUMERS share the SAME stream object
-    # identity/hash with identical derived bars — not two state keys
+    # identity/hash with identical derived bars. Each consumer accepts the
+    # SAME events stream and reports its input reference — the returned
+    # input_id must BE the events object's id (not merely equal bar values)
     events, stream_hash, clock = stream.ordered_stream(
         events=[{"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101},
                 {"source_event_seq": 2, "exchange_ts": 102, "recv_ts": 103}],
@@ -200,9 +205,12 @@ def test_all_branches_share_one_immutable_stream():
     consumers = []
     for i in range(4):
         consumers.append(branches.derived_bars(events))
-    assert len({id(c) for c in consumers}) == 1, \
-        "all four branch consumers must share the same stream object"
-    assert all(c == consumers[0] for c in consumers), \
+    for i, c in enumerate(consumers):
+        assert c["input_id"] == id(events), \
+            f"branch {i} must consume THE SAME events object"
+        assert c["stream_hash"] == stream_hash, \
+            f"branch {i} must report the same stream hash"
+    assert all(c["bars"] == consumers[0]["bars"] for c in consumers), \
         "identical derived-bar sequences across branches"
     assert clock == "immutable-global"
 
