@@ -19,6 +19,7 @@ Round-9 P0 fixes covered:
 
 import hashlib
 import json
+import os
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -185,7 +186,15 @@ class _FakeApi:
 # ── trusted config (round-9 #3: sealed from ACTUAL bytes) ──────────────────
 
 CONFIG_YAML = "mts:\n  live_required_margin_per_pair: 100000.0\n"
-RELEASE_SHA = "0123456789abcdef"
+RELEASE_SHA = "0123456789abcdef0123456789abcdef01234567"   # 40-hex
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _release_env():
+    """LRC_RELEASE_SHA is set by the deployment — tests emulate it."""
+    os.environ["LRC_RELEASE_SHA"] = RELEASE_SHA
+    yield
+    os.environ.pop("LRC_RELEASE_SHA", None)
 
 _SHARED_CFG_DIR = tempfile.mkdtemp(prefix="lrc_cfg_")
 _SHARED_CFG = Path(_SHARED_CFG_DIR) / "futures.yaml"
@@ -198,25 +207,25 @@ def _write_config(tmp_path, yaml_text=CONFIG_YAML, name="futures.yaml"):
     return p
 
 
-def _sealed(cfg_path, release_sha=RELEASE_SHA):
-    return load_trusted_margin_source(cfg_path, release_sha=release_sha)
+def _sealed(cfg_path):
+    return load_trusted_margin_source(cfg_path)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
-def _certify(api, *, config_path=None, release_sha=RELEASE_SHA, **kw):
+def _certify(api, *, config_path=None, **kw):
     cfg = config_path or _SHARED_CFG
     issuer = CertificateIssuer()
     cert, failures = certify_route(
         api, process_start_id="p-1", issuer=issuer,
-        config_path=cfg, release_sha=release_sha, **kw)
+        config_path=cfg, **kw)
     return cert, failures, issuer
 
 
-def _ctx_runtime(api, cert=None, config_path=None, release_sha=RELEASE_SHA):
+def _ctx_runtime(api, cert=None, config_path=None):
     cfg = config_path or _SHARED_CFG
     facts = dict(config=cfg, process_state={"process_start_id": "p-1",
-                                            "release_sha": release_sha})
+                                            })
     return build_runtime_certification_context(api, cfg, facts)
 
 
@@ -466,7 +475,34 @@ def test_margin_source_unknown_product_fails():
 def test_margin_source_empty_release_sha_fails():
     with pytest.raises(Exception):
         parse_margin_config(CONFIG_YAML.encode(), config_path="x",
-                            release_sha="")
+                            release_sha="not-a-sha")
+
+
+def test_margin_source_forged_release_sha_not_acceptable():
+    # round-10 P0-3: callers cannot choose the release identity — the loader
+    # derives it internally; any caller-supplied sha is rejected
+    with pytest.raises(TypeError):
+        load_trusted_margin_source(_SHARED_CFG, release_sha="deadbeef" * 5)
+
+
+def test_margin_source_malformed_release_env_fails(monkeypatch):
+    monkeypatch.setenv("LRC_RELEASE_SHA", "not-hex")
+    with pytest.raises(Exception):
+        load_trusted_margin_source(_SHARED_CFG)
+
+
+def test_release_sha_change_after_cert_rejected(monkeypatch):
+    # round-10 P0-3: the release identity is bound to the certificate; a
+    # different deployed release at validation → SOURCE_MISMATCH
+    api = _FakeApi()
+    register_session(api)
+    cert, failures, issuer = _certify(api)
+    assert cert is not None and failures == []
+    monkeypatch.setenv("LRC_RELEASE_SHA", "f" * 40)
+    result = transition_with_certificate(_transition_ctx(), cert, issuer,
+                                         runtime=_ctx_runtime(api, cert))
+    assert not result.is_live_ready()
+    assert any("SOURCE" in r for r in result.audit_reasons), result.audit_reasons
 
 
 def test_certify_rejects_forged_margin_source_dict():
@@ -528,6 +564,9 @@ def _preflight_base():
      {"code": "TMFI6", "passed": True}],             # wrong code
     [{"code": "TMFH6", "passed": False},
      {"code": "TMFI6", "passed": True}],             # one failed
+    [{"code": "TMFH6", "passed": True},
+     {"code": "TMFI6", "passed": True},
+     {"code": "TMFX6", "passed": False}],             # extra row (round-10)
 ])
 def test_quote_checks_require_exactly_two_unique_passed(tmp_path, monkeypatch,
                                                         quote_codes):
@@ -541,7 +580,7 @@ def test_quote_checks_require_exactly_two_unique_passed(tmp_path, monkeypatch,
                         lambda api, product="TMF": base)
     cert, failures = certify_route(api, process_start_id="p-1",
                                    issuer=CertificateIssuer(),
-                                   config_path=cfg, release_sha=RELEASE_SHA)
+                                   config_path=cfg)
     assert cert is None
     assert any("QUOTE" in f for f in failures), failures
 
@@ -559,7 +598,7 @@ def test_quote_checks_two_unique_passed_ok(tmp_path, monkeypatch):
                         lambda api, product="TMF": base)
     cert, failures = certify_route(api, process_start_id="p-1",
                                    issuer=CertificateIssuer(),
-                                   config_path=cfg, release_sha=RELEASE_SHA)
+                                   config_path=cfg)
     assert cert is not None and failures == []
 
 
@@ -821,7 +860,7 @@ def test_forged_copied_json_with_matching_process_id_fails():
     register_session(api_a)
     cert_a, failures = certify_route(
         api_a, process_start_id="p-A", issuer=issuer_a,
-        config_path=_SHARED_CFG, release_sha=RELEASE_SHA)
+        config_path=_SHARED_CFG)
     assert cert_a is not None and failures == []
     payload = json.loads(json.dumps(cert_a.__dict__, default=str))
     issuer_b = CertificateIssuer()
@@ -841,3 +880,81 @@ def test_restart_no_reconstructed_issuer_validates_old_cert():
     ok, reasons = _validated(cert, fresh)
     assert not ok and any("NONCE" in r for r in reasons)
     assert persisted
+
+
+# ── round-10 P0-1: required broker query failures must fail certification ──
+
+@pytest.mark.parametrize("method_name", [
+    "list_positions", "list_trades", "margin", "snapshots",
+])
+def test_required_query_failure_fails_certification(method_name):
+    # any required endpoint failure (recorded in preflight query_failures)
+    # must yield NO certificate — and zero order API calls
+    api = _FakeApi()
+    register_session(api)
+
+    def _boom(*a, **k):
+        raise RuntimeError(f"{method_name} down")
+
+    setattr(api, method_name, _boom)
+    cert, failures, _ = _certify(api)
+    assert cert is None, f"{method_name} failure must not certify"
+    assert any("QUERY" in f or "MARGIN" in f or "SNAPSHOT" in f
+               for f in failures), failures
+    assert not any(c in ("place_order", "cancel_order", "modify_order")
+                   for c in api.calls), api.calls
+
+
+def test_trading_limits_failure_remains_warning_only():
+    # the ONE warning-only endpoint: trading_limits failure stays a warning
+    api = _FakeApi(trading_limits_ok=False)
+    register_session(api)
+    cert, failures, _ = _certify(api)
+    assert cert is not None and failures == []
+
+
+# ── round-10 P0-2: logout invalidation is mandatory (no swallow) ───────────
+
+def test_logout_invalidation_failure_forces_global_revocation(monkeypatch):
+    from core import shioaji_session
+    from core.live_route_certificate import session_registry as sr
+    api = _FakeApi()
+    register_session(api)
+    cert, failures, issuer = _certify(api)
+    assert cert is not None
+    monkeypatch.setattr(shioaji_session, "_api", api)
+
+    def _boom(api_obj):
+        raise RuntimeError("registry down")
+
+    monkeypatch.setattr(sr, "unregister", _boom)
+    with pytest.raises(RuntimeError):
+        shioaji_session.logout()
+    # global revocation: no generation survives, no certificate validates
+    assert sr.current_generation() is None
+    ok, reasons = _validated(cert, issuer)
+    assert not ok and any("SESSION" in r for r in reasons), reasons
+
+
+# ── round-10 hardening: empty identity / product scope ─────────────────────
+
+def test_auth_empty_identity_rejected():
+    # two (None,None,None) objects must not authenticate
+    class _Bare:
+        pass
+
+    api = _FakeApi()
+    api.futopt_account = _Bare()
+    api.list_accounts = lambda: [_Bare()]
+    register_session(api)
+    assert not is_authenticated_session(api)
+
+
+def test_product_scope_tmf_only_rejects_mtx(tmp_path):
+    # Phase 1 is TMF-only — a TMF floor must never silently certify MTX
+    api = _FakeApi()
+    register_session(api)
+    cfg = _write_config(tmp_path)
+    with pytest.raises(Exception):
+        certify_route(api, process_start_id="p-1", issuer=CertificateIssuer(),
+                      config_path=cfg, product="MTX")
