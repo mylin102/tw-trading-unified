@@ -23,6 +23,20 @@ INTERVAL_MAP = {
     "1h": "1h",
 }
 
+
+class AdapterOrderError(Exception):
+    """Structured, stable-code adapter failure (P0 2026-08-08).
+
+    Raised on order build/API failures so callers can write a durable,
+    order-manager-visible failure reason — never an ambiguous None.
+    """
+
+    def __init__(self, code: str, context: dict):
+        super().__init__(f"{code}: {context}")
+        self.code = code
+        self.context = context
+
+
 class ShioajiClient:
     def __init__(self):
         self.api = None
@@ -194,38 +208,57 @@ class ShioajiClient:
             return None
 
     def place_order(self, contract, action: str, quantity: int, price: float = 0):
-        if not self.is_logged_in: return None
+        # P0 fix 2026-08-08 (verified on Mini shioaji 1.7.0):
+        # OrderType=[FOK,IOC,ROD] — MTL does not exist; FuturesPriceType=
+        # [LMT,MKP,MKT]; MarketType={Day,Night}; Order has NO market_type
+        # field. Market (price=0) -> MKP+ROD; limit -> LMT+ROD.
+        # Non-deprecated sj.OrderType/sj.FuturesPriceType/sj.Action used.
+        if not self.is_logged_in:
+            return None
         try:
-            action_value = sj.constant.Action.Buy if action.upper() in ("BUY", "LONG") else sj.constant.Action.Sell
+            action_value = sj.Action.Buy if action.upper() in ("BUY", "LONG") \
+                else sj.Action.Sell
             order = self.api.Order(
                 action=action_value, price=price, quantity=quantity,
-                order_type=sj.constant.OrderType.MTL,
-                price_type=sj.constant.FuturesPriceType.MKP if price == 0 else sj.constant.FuturesPriceType.LMT,
-                market_type=sj.constant.FuturesMarketType.Night if datetime.now().hour >= 15 or datetime.now().hour < 5 else sj.constant.FuturesMarketType.Common,
+                order_type=sj.OrderType.ROD,
+                price_type=sj.FuturesPriceType.MKP if price == 0
+                else sj.FuturesPriceType.LMT,
                 account=self.api.futopt_account,
             )
             return self.api.place_order(contract, order)
         except Exception as e:
             logger.error(f"Order placement failed: {e}")
-            return None
+            raise AdapterOrderError(
+                code="ADAPTER_ORDER_PLACE_FAILED",
+                context={"method": "place_order",
+                         "contract": getattr(contract, "code", None),
+                         "action": action, "quantity": quantity,
+                         "price": price, "error": str(e)}) from e
 
     def update_order(self, trade, price: float, quantity: int = 1):
-        if not self.is_logged_in: return False
+        if not self.is_logged_in:
+            return False
         try:
             self.api.update_order(trade, price=price, qty=quantity)
             return True
         except Exception as e:
             logger.error(f"Update order failed: {e}")
-            return False
+            raise AdapterOrderError(
+                code="ADAPTER_ORDER_UPDATE_FAILED",
+                context={"method": "update_order", "price": price,
+                         "quantity": quantity, "error": str(e)}) from e
 
     def cancel_order(self, trade):
-        if not self.is_logged_in: return False
+        if not self.is_logged_in:
+            return False
         try:
             self.api.cancel_order(trade)
             return True
         except Exception as e:
             logger.error(f"Cancel order failed: {e}")
-            return False
+            raise AdapterOrderError(
+                code="ADAPTER_ORDER_CANCEL_FAILED",
+                context={"method": "cancel_order", "error": str(e)}) from e
 
     def refresh_status(self, account=None, trade=None):
         if not self.is_logged_in: return None

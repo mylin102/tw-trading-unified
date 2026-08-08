@@ -54,7 +54,7 @@ from core.signal import Signal
 from core.bar_utils import attach_bar_metadata, build_canonical_bar_frames, build_preferred_canonical_bar_frames, resample_ohlcv
 from core.date_utils import get_taifex_futures_hhmm, is_taifex_futures_market_open, get_taifex_futures_session_type, get_session_date_str
 from core.spread_loader import get_spread_loader
-from squeeze_futures.data.shioaji_client import ShioajiClient
+from squeeze_futures.data.shioaji_client import AdapterOrderError, ShioajiClient
 from squeeze_futures.data.data_storage import save_trade
 from squeeze_futures.data.tick_writer import RawTickWriter
 from squeeze_futures.data.kbar_writer import RawKbarWriter
@@ -3844,7 +3844,18 @@ class FuturesMonitor:
                       f"[order_id={order.order_id}][/cyan]")
 
         if self.live_trading and not self.dry_run:
-            trade = self.client.place_order(self.contract, action=action, quantity=lots)
+            try:
+                trade = self.client.place_order(self.contract, action=action,
+                                                quantity=lots)
+            except AdapterOrderError as e:
+                # P0: structured durable failure — never swallowed
+                self._clear_pending_lifecycle_order(order.order_id)
+                self.order_mgr.reject(order.order_id,
+                                      f"api_order_failed:{e.code}")
+                console.print(
+                    f"[red][FuturesMonitor] Live order failed: {e.code} "
+                    f"{e.context}[/red]")
+                return None
             if trade is None:
                 self._clear_pending_lifecycle_order(order.order_id)
                 self.order_mgr.reject(order.order_id, "api_order_failed")
@@ -5205,7 +5216,21 @@ class FuturesMonitor:
             # 出場前先刪 safety stop，避免庫存不足
             if signal in ("EXIT", "PARTIAL_EXIT"):
                 self._cancel_safety_stop()
-            trade = self.client.place_order(self.contract, action=action, quantity=lots)
+            try:
+                trade = self.client.place_order(self.contract, action=action,
+                                                quantity=lots)
+            except AdapterOrderError as e:
+                # P0: structured durable failure — never swallowed
+                console.print(
+                    f"[red][FuturesMonitor] Live order failed: {e.code} "
+                    f"{signal} {lots}[/red]")
+                from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
+                save_signal_audit({
+                    "timestamp": ts, "signal": signal, "price": price,
+                    "reason": reason or "", "rejection": "api_order_failed",
+                    "lots": lots, "error_code": e.code,
+                    "error_context": e.context})
+                return None
             if trade is None:
                 console.print(f"[red][FuturesMonitor] Live order failed: {signal} {lots}[/red]")
                 from strategies.futures.squeeze_futures.data.data_storage import save_signal_audit
