@@ -1,0 +1,9 @@
+"""R3 deterministic bounded branch control — skeletal."""
+
+
+def branch_state_key(level, event_seq):
+    raise NotImplementedError("branches.branch_state_key: deterministic tree budget — no hindsight/combinatorial paths")
+
+
+def next_decision_level(level, max_wait, safety):
+    raise NotImplementedError("branches.next_decision_level: fixed next level / max wait / safety")

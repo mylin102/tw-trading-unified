@@ -1,0 +1,17 @@
+"""Pre-registered theta families (no ex-post selection) — skeletal."""
+
+
+def a4_leg_grid(recovery_distances):
+    raise NotImplementedError("families.a4_leg_grid: recovery distances grid")
+
+
+def a4_combined_grid(trough_recoveries):
+    raise NotImplementedError("families.a4_combined_grid: recovery-from-post-breach trough grid")
+
+
+def a4_spread_z_family(z_reversal, velocity, acceleration):
+    raise NotImplementedError("families.a4_spread_z_family: |z| / velocity sign+confirmation / acceleration-deceleration")
+
+
+def sweep_plan(single_factor, factorial_subset):
+    raise NotImplementedError("families.sweep_plan: single-factor first, small declared factorial; report every theta, no winner-by-max")
