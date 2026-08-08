@@ -63,6 +63,7 @@ class RecordingApi:
         self.fail_place = False
         self.reject_trade = False
         self.no_trade = False
+        self.false_return = False
         self.futopt_account = SimpleNamespace(person_id="P1")
 
     def Order(self, **kw):
@@ -87,6 +88,8 @@ class RecordingApi:
         self.calls.append(("update_order", trade, kw))
         if self.no_trade:
             return None
+        if self.false_return:
+            return False
         return True
 
     def cancel_order(self, trade):
@@ -95,6 +98,8 @@ class RecordingApi:
         self.calls.append(("cancel_order", trade))
         if self.no_trade:
             return None
+        if self.false_return:
+            return False
         return True
 
 
@@ -199,6 +204,24 @@ def test_api_none_return_raises_no_trade(method, args):
         getattr(c, method)(*args)
     assert type(ei.value).__name__ == "AdapterOrderError", ei.value
     assert ei.value.code == "ADAPTER_ORDER_NO_TRADE", ei.value.code
+
+
+@pytest.mark.parametrize("method,args,code", [
+    ("update_order", (SimpleNamespace(ts=1), 44300),
+     "ADAPTER_ORDER_UPDATE_FAILED"),
+    ("cancel_order", (SimpleNamespace(ts=1),),
+     "ADAPTER_ORDER_CANCEL_FAILED"),
+])
+def test_api_false_return_raises(method, args, code):
+    # the official API returns Trade — a False return is a silent failure;
+    # callers that ignore the return value must still get the typed error
+    api = RecordingApi()
+    api.false_return = True
+    c = _adapter(api)
+    with pytest.raises(Exception) as ei:
+        getattr(c, method)(*args)
+    assert type(ei.value).__name__ == "AdapterOrderError", ei.value
+    assert ei.value.code == code, ei.value.code
 
 
 def test_market_order_success_exactly_one_intended_call():
