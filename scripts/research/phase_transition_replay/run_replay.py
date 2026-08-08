@@ -1,36 +1,47 @@
-"""Replay artifact runner — research-only (v5: preregistration-sourced).
+"""Replay artifact runner — research-only (v6: git provenance + sync BBO).
 
 The runner NEVER touches historical artifacts without explicit
 authorization. ALL runnable parameters (M_economic, fee assumptions,
-staleness, config version) resolve from the committed pre-registration
-manifest (scripts/research/phase_transition_replay/preregistration.py) via
-a REQUIRED --prereg selector — there are NO value defaults on the CLI.
+staleness, pair-skew bound, config version, classifier) resolve from the
+committed pre-registration manifest via a REQUIRED --prereg selector —
+there are NO value defaults on the CLI.
+
+Git provenance gate (reproducibility, v6): the manifest records the repo
+HEAD commit, the runner + preregistration file sha256 and the research
+subtree dirty status. If the prereg/runner sources are untracked, modified
+vs HEAD, or the research subtree is dirty, the runner REFUSES with zero
+output — the selector cannot be proven against HEAD.
 
 Modes:
-- --dry-run: validate the input (schema + quality), write the manifest,
-  compute NO PnL. This is the ONLY accepted run mode while the engine is
-  not implemented.
-- --authorize without --dry-run: REFUSED (non-zero, zero output) — the
-  engine is not implemented; fake success is never returned.
+- --dry-run: validate the input (schema + quality + pair sync), write the
+  manifest, compute NO PnL. This is the ONLY accepted run mode while the
+  engine is not implemented.
+- --authorize without --dry-run: REFUSED (non-zero, zero output).
 """
 
 import argparse
 import hashlib
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from scripts.research.phase_transition_replay import execution
-from scripts.research.phase_transition_replay import pipeline
 from scripts.research.phase_transition_replay import preregistration
 from scripts.research.phase_transition_replay import stream
 
-MANIFEST_VERSION = "phase-transition-replay-manifest-v2"
-QUALITY_GATE_TIER = "EXECUTABLE_BBO"   # incomplete quotes never produce
-                                        # usable two-leg counterfactual PnL
+MANIFEST_VERSION = "phase-transition-replay-manifest-v3"
+QUALITY_GATE_TIER = "EXECUTABLE_BBO"   # incomplete/unsynchronized quotes
+                                        # never produce usable two-leg PnL
 
 ORDERING_FIELDS = ("source_event_seq", "exchange_ts", "recv_ts")
-QUOTE_FIELDS = ("bid", "ask", "age_s", "close_action")
+QUOTE_FIELDS = ("bid", "ask", "age_s", "close_action", "quote_exchange_ts")
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+RUNNER_REL = "scripts/research/phase_transition_replay/run_replay.py"
+PREREG_REL = "scripts/research/phase_transition_replay/preregistration.py"
+RESEARCH_SUBTREE = "scripts/research"
 
 
 def _sha256_file(path):
@@ -41,18 +52,59 @@ def _sha256_file(path):
     return h.hexdigest()
 
 
-def _validate_event(ev):
-    """Input schema validation — per-event; returns (ok, reason).
+def _git(args):
+    try:
+        r = subprocess.run(["git"] + args, cwd=str(REPO_ROOT),
+                           capture_output=True, text=True, timeout=15)
+        return r
+    except Exception:
+        return None
 
-    Requires ordering fields, a decision timestamp and the near/far quote
-    shape. Invalid events are censored WITH reason — never silently valid.
-    """
+
+def git_provenance():
+    """(ok, provenance_dict | reason) — reproducibility gate inputs."""
+    head = _git(["rev-parse", "HEAD"])
+    if head is None or head.returncode != 0 or not head.stdout.strip():
+        return False, {"reason": "repo HEAD unreadable"}
+    status = _git(["status", "--porcelain", "--untracked-files=all",
+                   RESEARCH_SUBTREE])
+    if status is None or status.returncode != 0:
+        return False, {"reason": "git status unreadable"}
+    dirty = bool(status.stdout.strip())
+    prov = {"repo_head": head.stdout.strip(),
+            "dirty": dirty,
+            "runner_sha256": _sha256_file(REPO_ROOT / RUNNER_REL),
+            "prereg_sha256": _sha256_file(REPO_ROOT / PREREG_REL)}
+    tracked = {}
+    blob_matches = {}
+    for name, rel in (("runner", RUNNER_REL), ("prereg", PREREG_REL)):
+        lsf = _git(["ls-files", "--error-unmatch", "--", rel])
+        tracked[name] = bool(lsf is not None and lsf.returncode == 0)
+        tree = _git(["ls-tree", "HEAD", "--", rel])
+        local = _git(["hash-object", str(REPO_ROOT / rel)])
+        head_blob = (tree.stdout.split("\t")[0].split()[-1]
+                     if tree is not None and tree.stdout.strip() else None)
+        local_blob = (local.stdout.strip() if local is not None else None)
+        blob_matches[name] = bool(head_blob and head_blob == local_blob)
+    prov["runner_tracked"] = tracked["runner"]
+    prov["prereg_tracked"] = tracked["prereg"]
+    prov["runner_matches_head"] = blob_matches["runner"]
+    prov["prereg_matches_head"] = blob_matches["prereg"]
+    prov["research_subtree_dirty"] = dirty
+    ok = (tracked["runner"] and tracked["prereg"]
+          and blob_matches["runner"] and blob_matches["prereg"]
+          and not dirty)
+    return ok, prov
+
+
+def _validate_event(ev):
+    """Input schema validation — per-event; returns (ok, reason)."""
     for f in ORDERING_FIELDS:
         v = ev.get(f)
         if not isinstance(v, int) or v <= 0:
             return False, f"ordering field {f} missing/invalid: {v!r}"
-    if not ev.get("decision_ts"):
-        return False, "decision_ts missing"
+    if not isinstance(ev.get("decision_ts_ms"), int) or ev["decision_ts_ms"] <= 0:
+        return False, f"decision_ts_ms invalid: {ev.get('decision_ts_ms')!r}"
     quotes = ev.get("quotes")
     if not isinstance(quotes, dict) or set(quotes) != {"near", "far"}:
         return False, f"quotes must be exactly near/far: {quotes!r}"
@@ -79,9 +131,10 @@ def _load_events(path):
 
 
 def _quality_censor(events, params):
-    """Schema + quality censoring: invalid/incomplete events are censored
-    WITH reason — never dropped silently, never treated as computable."""
-    staleness = params["staleness"]
+    """Schema + quality + pair-sync censoring (never silent, never
+    treated as computable)."""
+    staleness = dict(params["staleness"])
+    staleness["max_pair_skew_ms"] = params["max_pair_skew_ms"]
     censored = []
     kept = []
     for ev in events:
@@ -89,31 +142,32 @@ def _quality_censor(events, params):
         if not ok:
             censored.append((ev, f"schema: {why}"))
             continue
+        bounds = dict(staleness)
+        bounds["decision_ts_ms"] = ev["decision_ts_ms"]
         r = execution.executable_prices(
-            ev["quotes"], decision_ts=ev.get("decision_ts"),
-            staleness_bounds=staleness)
+            ev["quotes"], decision_ts=ev["decision_ts_ms"],
+            staleness_bounds=bounds)
         if r["tier"] != QUALITY_GATE_TIER:
             censored.append((ev, "; ".join(r["reasons"]) or r["tier"]))
             continue
-        kept.append(ev)
+        kept.append((ev, r))
     return kept, censored
 
 
 def main(argv=None):
-    """Artifact runner (research-only, v5)."""
+    """Artifact runner (research-only, v6)."""
     p = argparse.ArgumentParser(prog="phase_transition_replay")
     p.add_argument("--input", required=True,
                    help="reconciled event-stream artifact (JSON list)")
     p.add_argument("--out-dir", required=True, help="manifest output dir")
-    p.add_argument("--prereg", required=True, choices=preregistration.prereg_ids(),
+    p.add_argument("--prereg", required=True,
+                   choices=preregistration.prereg_ids(),
                    help="committed pre-registration selector (no value defaults)")
     p.add_argument("--dry-run", action="store_true",
                    help="validate input + write manifest, no PnL")
     p.add_argument("--authorize", action="store_true",
                    help="explicit authorization to run the engine")
     args = p.parse_args(argv)
-
-    params = preregistration.preregistration(args.prereg)
 
     if not args.dry_run:
         # the engine is NOT implemented: any non-dry-run attempt is a
@@ -122,7 +176,13 @@ def main(argv=None):
               file=sys.stderr)
         return 3
 
-    import os
+    prov_ok, provenance = git_provenance()
+    if not prov_ok:
+        print(f"REFUSED: git provenance not provable: "
+              f"{provenance.get('reason', provenance)}", file=sys.stderr)
+        return 5
+
+    params = preregistration.preregistration(args.prereg)
     input_sha = _sha256_file(args.input)
     try:
         events = _load_events(args.input)
@@ -132,16 +192,34 @@ def main(argv=None):
     ordered, stream_hash, clock = stream.ordered_stream(
         events, clock_contract="immutable-global")
     kept, censored = _quality_censor(ordered, params)
+    kept_records = []
+    for ev, r in kept:
+        near = r["prices"]["near"]
+        far = r["prices"]["far"]
+        skew = abs(near["quote_exchange_ts"] - far["quote_exchange_ts"])
+        kept_records.append({
+            "event_seq": ev["source_event_seq"],
+            "decision_ts_ms": ev["decision_ts_ms"],
+            "near_quote_exchange_ts": near["quote_exchange_ts"],
+            "far_quote_exchange_ts": far["quote_exchange_ts"],
+            "pair_skew_ms": skew,
+            "max_pair_skew_ms": params["max_pair_skew_ms"],
+            "near_age_s": near["age_s"],
+            "far_age_s": far["age_s"],
+        })
+    import os
     os.makedirs(args.out_dir, exist_ok=True)
     manifest = {
         "manifest_version": MANIFEST_VERSION,
         "preregistration_id": args.prereg,
         "preregistration_sha": preregistration.prereg_sha(args.prereg),
+        "git_provenance": provenance,
         "parameters": {
             "m_economic": params["m_economic"],
             "fee_assumption_id": params["fee_assumption_id"],
             "fee_assumptions": params["fee_assumptions"],
             "staleness": params["staleness"],
+            "max_pair_skew_ms": params["max_pair_skew_ms"],
             "config_version": params["config_version"],
             "classifier": params["classifier"],
         },
@@ -152,6 +230,7 @@ def main(argv=None):
         "n_events": len(ordered),
         "n_kept": len(kept),
         "n_censored": len(censored),
+        "kept_records": kept_records,
         "censored_reasons": [{"event_seq": e.get("source_event_seq"),
                               "reason": r} for e, r in censored],
         "dry_run": True,

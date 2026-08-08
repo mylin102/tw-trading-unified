@@ -1,9 +1,10 @@
-"""Committed immutable pre-registration manifest (research-only, v5).
+"""Committed immutable pre-registration manifest (research-only, v6).
 
 ALL runnable parameters — M_economic, fee assumptions, staleness bounds,
-config version, classifier id — resolve from THIS committed source. The
-runner accepts a preregistration selector (--prereg <id>) with NO value
-defaults; the manifest records the prereg id and its sha256.
+pair-skew bound, config version, classifier id — resolve from THIS
+committed source. The runner accepts a selector (--prereg <id>) with NO
+value defaults; the manifest records the prereg id, its sha256 AND the git
+provenance (repo HEAD, file hashes, dirty status — verified by the runner).
 
 MUST stay immutable: changing a value is a NEW preregistration id + new
 hash (never an in-place edit).
@@ -24,6 +25,7 @@ PREREGISTRATION = {
             }
         },
         "staleness": {"max_age_s": 30},
+        "max_pair_skew_ms": 1000,
         "config_version": "research-v1",
         "classifier": "frozen-precedence-2026-08-08",
     }
