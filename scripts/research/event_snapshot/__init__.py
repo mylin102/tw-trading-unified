@@ -19,3 +19,15 @@ from scripts.research.event_snapshot.builder import (  # noqa: F401
     order_events,
     read_source_once,
 )
+from scripts.research.event_snapshot.source_adapter import (  # noqa: F401
+    ANCHOR_EVENT_KINDS,
+    BBO_SOURCE_ALLOWLIST,
+    FILL_TYPES,
+    adapt_bbo,
+    adapt_fill,
+    adapt_spread_event,
+    build_normalized_snapshot,
+    join_anchor,
+    join_positions,
+    normalize_sources,
+)
