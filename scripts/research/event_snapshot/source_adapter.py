@@ -85,10 +85,17 @@ def adapt_bbo(raw, source_ctx):
         return ("NOT_AVAILABLE", f"source {src!r} not in allowlist")
     return {"leg": str(raw.get("leg") or "").lower(),
             "contract": raw.get("contract_code"),
-            "exchange_ts_ms": raw.get("exchange_ts_ms"),
-            "receive_ts_ms": raw.get("receive_ts_ms"),
+            "exchange_ts_ms": _norm_ts(raw.get("exchange_ts_ms")),
+            "receive_ts_ms": _norm_ts(raw.get("receive_ts_ms")),
             "feed": src, "bid": raw.get("bid"), "ask": raw.get("ask"),
             **source_ctx}
+
+
+def _norm_ts(v):
+    """Actual telemetry emits FLOAT epoch-ms — normalize to int ms."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return int(v)
 
 
 def _parse_jsonl(path):
@@ -158,19 +165,31 @@ def normalize_sources(input_paths):
 
 
 def join_anchor(fills, events):
-    """Legal same-trade anchor: a RELEASE_DECISION/SUBMISSION event joined
-    to its trade's RELEASE fills. Ambiguous/missing -> NOT_AVAILABLE."""
+    """EVERY legal same-trade anchor: each RELEASE_DECISION/SUBMISSION
+    event joined to its trade's RELEASE fills, one anchor per unique
+    trade/release. Ambiguous -> per-candidate NOT_AVAILABLE entries;
+    zero candidates -> ("NOT_AVAILABLE", reason)."""
     rel_fills = [f for f in (fills or []) if f.get("fill_type") == "RELEASE"]
     rel_trades = {f.get("trade_id") for f in rel_fills}
-    anchors = [e for e in (events or [])
-               if e.get("kind") in ANCHOR_EVENT_KINDS]
-    for a in anchors:
-        if a.get("trade_id") in rel_trades:
-            return a
     if not rel_trades:
         return ("NOT_AVAILABLE", "no RELEASE fill trade to join")
-    return ("NOT_AVAILABLE",
-            f"no anchor joins trades {rel_trades}")
+    seen = set()
+    anchors = []
+    for e in (events or []):
+        if e.get("kind") not in ANCHOR_EVENT_KINDS:
+            continue
+        tid = e.get("trade_id")
+        if tid not in rel_trades:
+            anchors.append(("NOT_AVAILABLE",
+                            f"anchor trade {tid!r} has no RELEASE fill"))
+            continue
+        if tid in seen:
+            continue  # unique trade/release event
+        seen.add(tid)
+        anchors.append(e)
+    if not seen:
+        return ("NOT_AVAILABLE", "no anchor joins a RELEASE fill trade")
+    return anchors
 
 
 def join_positions(fills, anchor_trade):
@@ -338,6 +357,13 @@ def _attach_leg_bbo(leg, contract, decision_ts_ms, position_side,
             "quote_source": f"{best['source']}:{best.get('byte_offset')}"}
 
 
+def _mapping_evidence(events_list):
+    evs = events_list or []
+    return [{"version": e.get("contract_mapping_version"),
+             "evidence": e.get("contract_mapping_evidence")}
+            for e in evs if e.get("contract_mapping_evidence")]
+
+
 def _build_event(anchor, positions, mapping, quotes, params):
     """One runner-compatible event with per-leg BBO attached."""
     decision_ts_ms = anchor.get("parsed_ts")
@@ -347,6 +373,7 @@ def _build_event(anchor, positions, mapping, quotes, params):
              "decision_ts_ms": decision_ts_ms,
              "contracts": {"near": mapping["near"], "far": mapping["far"]},
              "contract_mapping_version": mapping.get("version"),
+             "contract_mapping_evidence": mapping.get("evidence"),
              "quotes": {}}
     for leg in ("near", "far"):
         event["quotes"][leg] = _attach_leg_bbo(
@@ -380,52 +407,73 @@ def build_normalized_snapshot(input_paths, out_dir, mapping_input=None):
     if isinstance(norm, tuple):
         _cleanup(out_dir, [])
         return norm
-    anchor = join_anchor(norm["fills"], norm["events"])
-    if isinstance(anchor, tuple):
+    anchors = join_anchor(norm["fills"], norm["events"])
+    if isinstance(anchors, tuple):
         _cleanup(out_dir, [])
-        return anchor
-    decision_ts_ms = anchor.get("parsed_ts")
-    if not _valid_epoch_ms(decision_ts_ms):
+        return anchors
+    events_list = []
+    refused = []
+    event_map = {}
+    for anchor in anchors:
+        if isinstance(anchor, tuple):
+            refused.append({"anchor": str(anchor[0]), "reason": anchor[1]})
+            continue
+        decision_ts_ms = anchor.get("parsed_ts")
+        if not _valid_epoch_ms(decision_ts_ms):
+            refused.append({"trade_id": anchor.get("trade_id"),
+                            "reason": f"anchor timestamp invalid: "
+                                      f"{anchor.get('ts_text')!r}"})
+            continue
+        positions = join_positions(norm["fills"], anchor.get("trade_id"))
+        if isinstance(positions, tuple):
+            refused.append({"trade_id": anchor.get("trade_id"),
+                            "reason": str(positions[1])})
+            continue
+        mapping = resolve_contract_mapping(
+            [], mapping_input, decision_ts_ms)
+        if isinstance(mapping, tuple):
+            refused.append({"trade_id": anchor.get("trade_id"),
+                            "reason": str(mapping[1])})
+            continue
+        ev = _build_event(anchor, positions, mapping, norm["quotes"],
+                          params)
+        legs_ok = [ev["quotes"][l] for l in ("near", "far")
+                   if ev["quotes"][l].get("available")]
+        if len(legs_ok) == 2:
+            skew = abs(legs_ok[0]["quote_exchange_ts"]
+                       - legs_ok[1]["quote_exchange_ts"])
+            if skew > params["max_pair_skew_ms"]:
+                for l in ("near", "far"):
+                    ev["quotes"][l] = {"available": False,
+                                       "reason": f"pair skew {skew}ms > "
+                                                 f"{params['max_pair_skew_ms']}ms"}
+        seq = len(events_list) + 1
+        ev["source_event_seq"] = seq
+        events_list.append(ev)
+        event_map[str(seq)] = {
+            "trade_id": anchor.get("trade_id"),
+            "anchor": anchor.get("source"),
+            "anchor_byte_offset": anchor.get("byte_offset"),
+            "positions": positions,
+            "contracts": {"near": mapping["near"], "far": mapping["far"]}}
+    if not events_list:
         _cleanup(out_dir, [])
         return ("NOT_AVAILABLE",
-                f"anchor timestamp invalid: {anchor.get('ts_text')!r}")
-    positions = join_positions(norm["fills"], anchor.get("trade_id"))
-    if isinstance(positions, tuple):
-        _cleanup(out_dir, [])
-        return positions
-    mapping = resolve_contract_mapping(
-        [], mapping_input, decision_ts_ms)
-    if isinstance(mapping, tuple):
-        _cleanup(out_dir, [])
-        return mapping
-    events_list = [_build_event(anchor, positions, mapping, norm["quotes"],
-                                params)]
-    # pair-skew gate across the attached legs
-    ev = events_list[0]
-    legs_ok = [ev["quotes"][l] for l in ("near", "far")
-               if ev["quotes"][l].get("available")]
-    if len(legs_ok) == 2:
-        skew = abs(legs_ok[0]["quote_exchange_ts"]
-                   - legs_ok[1]["quote_exchange_ts"])
-        if skew > params["max_pair_skew_ms"]:
-            for l in ("near", "far"):
-                ev["quotes"][l] = {"available": False,
-                                   "reason": f"pair skew {skew}ms > "
-                                             f"{params['max_pair_skew_ms']}ms"}
+                "no candidate produced an event: " + str(refused))
     manifest = {
         "schema_version": "source-adapter-v2",
         "sources": norm.get("sources", []),
         "unknown_fill_types": norm.get("unknown_fill_types", {}),
-        "contract_mapping": {"near": mapping["near"], "far": mapping["far"],
-                             "version": mapping.get("version"),
-                             "evidence": mapping.get("evidence"),
-                             "hash": mapping.get("hash")},
-        "event_map": {
-            "1": {"anchor": anchor.get("source"),
-                  "anchor_byte_offset": anchor.get("byte_offset"),
-                  "positions": positions,
-                  "contracts": {"near": mapping["near"],
-                                "far": mapping["far"]}}},
+        "refused_candidates": refused,
+        "contract_mapping": {
+            "evidence": [m["evidence"] for m in
+                         (_mapping_evidence(events_list) if events_list
+                          else [])],
+            "versions": sorted({m["version"] for m in
+                                _mapping_evidence(events_list)}
+                               if events_list else []),
+        },
+        "event_map": event_map,
     }
     events_payload = json.dumps(events_list, indent=2, sort_keys=True,
                                 ensure_ascii=False)
