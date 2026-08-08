@@ -70,3 +70,59 @@ def test_paper_path_unchanged():
     # is_live_ready requires requested_mode == LIVE, so PAPER can never
     # become LIVE_READY no matter what (cert or not)
     assert ctx.to_dict().get("requested_mode") != "live"
+
+
+# ── Phase 2 test matrix (RED until the separately-reviewed wiring phase) ───
+
+def _repo_root():
+    return Path(__file__).resolve().parents[2]
+
+
+def test_release_identity_check_wired_before_certification():
+    """(3) RED: the LIVE startup path must verify cwd/HEAD == LRC_RELEASE_SHA
+    before any certification — the wiring does not exist yet."""
+    monitor = _monitor_path()
+    text = monitor.read_text(encoding="utf-8")
+    assert "LRC_RELEASE_SHA" in text, \
+        "release-identity env check not wired into monitor startup"
+
+
+def test_margin_floor_config_key_defined():
+    """(4) RED: the TMF pair margin floor must exist in the effective config
+    (owner/version documented) — fail-closed until the config key lands."""
+    cfg = _repo_root() / "config" / "futures.yaml"
+    assert cfg.exists()
+    text = cfg.read_text(encoding="utf-8")
+    assert "live_required_margin_per_pair" in text, \
+        "mts.live_required_margin_per_pair not defined in futures.yaml"
+
+
+def test_startup_live_path_recertifies_with_certificate_flow():
+    """(1)+(5) RED: the LIVE startup path must reference the certificate
+    flow (certify_route / transition_with_certificate) — the legacy
+    transition_to_live_ready path is closed in core, so without the wiring
+    a LIVE startup can never reach LIVE_READY."""
+    monitor = _monitor_path()
+    text = monitor.read_text(encoding="utf-8")
+    assert "certify_route" in text or "transition_with_certificate" in text, \
+        "monitor LIVE startup does not reference the certificate flow"
+
+
+def test_reconnect_path_recertifies_after_safe_login():
+    """(5) RED: main._try_shioaji_reconnect must re-certify after the
+    reconnected safe_login (the new registry generation kills the old cert)."""
+    main_py = _repo_root() / "main.py"
+    assert main_py.exists()
+    text = main_py.read_text(encoding="utf-8")
+    assert "certify_route" in text or "transition_with_certificate" in text, \
+        "main reconnect path does not re-certify after safe_login"
+
+
+def test_logout_invalidates_monitor_certificate_route():
+    """(5) RED: after broker logout the monitor must hold no usable
+    certificate — shioaji_session.logout unregisters (core, green); the
+    monitor must not retain a LIVE_READY context across it."""
+    monitor = _monitor_path()
+    text = monitor.read_text(encoding="utf-8")
+    assert "unregister_session" in text or "session_registry" in text, \
+        "monitor does not reference session invalidation on logout"
