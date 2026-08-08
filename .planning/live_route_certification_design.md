@@ -371,6 +371,27 @@ def validate_live_broker_certificate(cert, *, now_ts=None, process_start_id,
 7. trading_limits 失敗 → warning only；margin 缺失 → fail
 8. 認證全程零 order/cancel/modify API 呼叫（recording api）
 
+
+## 10. Release identity 部署整合準則（round-11 #3 — Phase-1 acceptance）
+
+- 部署程序（release/ecosystem env 注入）**必須**設定 `LRC_RELEASE_SHA` =
+  release 目錄當下的 commit（`git rev-parse HEAD` @ 部署時刻，40-hex）
+- Core 行為：缺 env / 格式不符 → `load_trusted_margin_source` fail-closed
+  （test: test_margin_source_malformed_release_env_fails 已存在）
+- **Integration acceptance 準則**（monitor/integration phase 驗收，本 phase
+  不 edit ecosystem/monitor）：啟動時驗證 `cwd/HEAD == LRC_RELEASE_SHA`；
+  不一致 → LIVE_QUARANTINED（release 目錄 commit 與 env 必須確定一致）
+- monitor wiring phase 才將 env 注入寫入 ecosystem.config.js
+
+## 11. safe_login 成功契約（round-11 #2 — 已實證）
+
+- Shioaji 1.7.0 `api.login` 的失敗模式 = exceptions（AuthError / TokenError /
+  ShioajiTimeoutError…）；無文件化 false-return 失敗
+- 實作採取 fail-closed：登入回傳 **falsey 值** 亦不註冊 generation
+  （test: test_safe_login_false_return_registers_nothing）
+- 即使註冊了 generation，`list_accounts()` live 查詢 + registry identity
+  校驗仍防止 stale session 誤認證（雙重保險）
+
 ## 9. 交付順序
 
 1. 本設計 + RED tests（commit）→ codex 審查 → 2. 實作 `core/live_route_certificate.py`
