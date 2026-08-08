@@ -39,10 +39,14 @@ def _full_event(seq=1, with_entries=True):
 
 
 def _full_event_beneficial(seq=1):
-    """Y0=Y3=100 (near LONG closes at bid 120), Y2=0 -> F_R >> F_N ->
-    RELEASE_BENEFICIAL under M=25."""
+    """Y0=Y3=700 (near LONG closes at bid 120, qty 10), Y1=500, Y2=0 ->
+    F_R=[650,750] vs F_N=[500,600] -> RELEASE_BENEFICIAL under M=25
+    (with the fee-based residual intervals)."""
     ev = _full_event(seq)
     ev["quotes"]["near"]["bid"] = 120.0
+    ev["quotes"]["far"]["ask"] = 15.0
+    ev["entries"]["near"]["qty"] = 10
+    ev["entries"]["far"]["qty"] = 10
     return ev
 
 
