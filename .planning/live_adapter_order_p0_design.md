@@ -16,10 +16,19 @@ certification 分離）; 先 design + RED，再 implementation/review 分離。
 
 ## 2. 修正契約（含 three-line correction B）
 
-1. **market/market-protection order 對映到 SDK-valid enum**（cite 安裝版
-   API, 不猜）: `price=0`（market）→ `price_type=MKP` + **`order_type=ROD`**
-   （ROD = 當日有效標準單; IOC/FOK 為特殊執行約束 — market-protection
-   safety stop 用 LMT+ROD, 已 valid, 不動）
+1. **market/market-protection order 對映到 SDK-valid + 期交所受理 enum**
+   （fix-forward 2026-08-08 — MKP+ROD 不可受理）:
+   **TAIFEX 規則: Market-With-Protection (MKP) 必須配 IOC 或 FOK**;
+   ROD 僅限 LIMIT。
+   - `price=0`（market）→ `price_type=MKP` + **`order_type=IOC`**
+     （MTS intent = immediate-with-protection; IOC = 部分成交其餘取消,
+     最貼近原 immediate-market intent; FOK = explicit all-or-none 替代,
+     留待日後明確選擇 — 不靜默選）
+   - `price>0`（limit）→ `price_type=LMT` + `order_type=ROD`
+   - **FuturesOCType 顯式設定 `Auto`**（broker 依倉位決定 New/Cover —
+     不依賴 SDK default）
+   - 回傳 trade 若 status=Failed/Rejected → **AdapterOrderError
+     (ADAPTER_ORDER_REJECTED)** — 永不把失敗單當成功回傳
 2. **sj.Order 用非 deprecated enums 建構**（`sj.OrderType` /
    `sj.FuturesPriceType`, 不用 `sj.constant.*`）; recording API 成功時
    **恰一次 intended call**
