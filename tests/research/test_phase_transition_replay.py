@@ -341,17 +341,20 @@ def test_runner_refuses_without_dry_run_or_authorize(tmp_path):
     assert not (out / "manifest.json").exists(), "zero output on refusal"
 
 
-def test_runner_authorize_without_dry_run_refused(tmp_path):
-    # v5: --authorize non-dry-run must NOT be a fake success — the engine
-    # is not implemented, so it refuses with zero output
+def test_runner_authorize_empty_input_runs_engine(tmp_path):
+    # engine implemented: --authorize on an EMPTY event list succeeds
+    # with an honest empty engine section (n_eligible=0, zero arms)
     import json
     inp = tmp_path / "events.json"
     inp.write_text(json.dumps([]), encoding="utf-8")
     out = tmp_path / "out"
     rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
                           "--prereg", "prereg-v1", "--authorize"])
-    assert rc == 3, rc
-    assert not (out / "manifest.json").exists(), "zero output on refusal"
+    assert rc == 0, rc
+    m = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert m["engine_run"] is True, m
+    assert m["engine"]["n_eligible"] == 0, m["engine"]
+    assert m["engine"]["arms"] == {}, m["engine"]
 
 
 def test_runner_prereg_required(tmp_path):
