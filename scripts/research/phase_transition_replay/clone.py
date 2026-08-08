@@ -35,25 +35,32 @@ def _canonical_hash(payload):
     ).hexdigest()
 
 
-def clone_from_state(event_stream, breach_replay_seq, state_snapshot):
+def clone_from_state(event_stream, breach_replay_seq, state_snapshot,
+                     schema_fields=None):
     """Value-complete pre-breach clone.
 
     - state_snapshot missing/empty -> NOT_AVAILABLE
-    - required schema fields absent from the snapshot -> NOT_AVAILABLE
+    - required schema fields (default: replay schema; adapters may pass
+      their own field set) absent from the snapshot -> NOT_AVAILABLE
       naming the exact missing fields
     - otherwise a deep copy + canonical hash (immutable under source
-      mutation; breach/release future events are never consulted)
+      mutation)
+    - the clone point is STRICTLY BEFORE the breach: only events with
+      replay_seq < breach_replay_seq may be referenced — the breach event
+      itself and all release/future events are never read
     """
+    fields = schema_fields or CLONE_SCHEMA_FIELDS
     if not state_snapshot:
         return ("NOT_AVAILABLE", ["state_snapshot"])
-    missing = sorted(CLONE_SCHEMA_FIELDS - set(state_snapshot))
+    missing = sorted(fields - set(state_snapshot))
     if missing:
         return ("NOT_AVAILABLE", missing)
     clone = copy.deepcopy(dict(state_snapshot))
     # the bounded stream prefix is the only event evidence the clone may
-    # rely on; future breach/release events are excluded by construction
+    # rely on; the breach event and release/future events are excluded by
+    # construction (strictly-before semantics)
     bounded = [e for e in (event_stream or [])
-               if e.get("replay_seq", 0) <= (breach_replay_seq or 0)]
+               if e.get("replay_seq", 0) < (breach_replay_seq or 0)]
     clone["_breach_replay_seq"] = breach_replay_seq
     clone["_stream_prefix_hash"] = _canonical_hash(bounded)
     clone["_canonical_hash"] = _canonical_hash(clone)
