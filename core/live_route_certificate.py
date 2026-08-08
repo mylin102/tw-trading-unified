@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from pathlib import Path
 import secrets
 import time
 from dataclasses import dataclass, replace
@@ -46,6 +47,13 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _account_identity(account: Any) -> tuple:
+    """Stable futures-account identity (capability map §4)."""
+    return (getattr(account, "person_id", None),
+            getattr(account, "broker_id", None),
+            getattr(account, "account_id", None))
+
+
 # ── SessionRegistry (round-8: strong-registration map, no weakref/setattr) ─
 
 @dataclass
@@ -71,17 +79,25 @@ class SessionRegistry:
     def __init__(self) -> None:
         self._entries: dict[int, _SessionEntry] = {}
         self._last_generation: Optional[str] = None
+        self._last_generation_api: Any = None   # identity-aware last owner
 
     def register(self, api: object) -> str:
         generation = secrets.token_hex(16)
         self._entries[id(api)] = _SessionEntry(
             api=api, generation=generation, logged_in_at=time.time())
         self._last_generation = generation
+        self._last_generation_api = api
         return generation
 
     def unregister(self, api: object) -> None:
-        self._entries.pop(id(api), None)
-        self._last_generation = None   # a failed relogin leaves NO generation
+        # identity-aware removal (round-9 #6): only clear the current
+        # generation when the EXACT registration that owns it is removed —
+        # removing another api must not invalidate the live session.
+        entry = self._entries.pop(id(api), None)
+        if entry is not None and entry.api is api \
+                and self._last_generation_api is api:
+            self._last_generation = None
+            self._last_generation_api = None
 
     def generation(self, api: object) -> Optional[str]:
         entry = self._entries.get(id(api))
@@ -108,6 +124,12 @@ def register_session(api: object) -> str:
     return session_registry.register(api)
 
 
+def unregister_session(api: object) -> None:
+    """Public logout hook — invalidates the registration (round-9 #1).
+    Invoked by core/shioaji_session.logout() around the broker logout."""
+    session_registry.unregister(api)
+
+
 # ── authenticated-session adapter (capability map §4) ──────────────────────
 
 def is_authenticated_session(api: object) -> bool:
@@ -122,51 +144,97 @@ def is_authenticated_session(api: object) -> bool:
         accounts = list(api.list_accounts())
         if not accounts:
             return False
+        # round-9 #2: the futures account must actually be REPRESENTED in
+        # list_accounts — a non-empty list of a DIFFERENT account is not an
+        # authenticated futures session.
+        fut_ident = _account_identity(getattr(api, "futopt_account"))
+        if not any(_account_identity(a) == fut_ident for a in accounts):
+            return False
     except Exception:
         return False
     return session_registry.generation(api) is not None
 
 
-# ── margin source (P0-3: trusted config only — no broker rate surface) ─────
+# ── margin source (round-9 #3/#4: sealed, trusted-config only) ─────────────
 
-def margin_source_from_config(config: dict, product: str = "TMF") -> dict:
-    """per-pair margin floor from the TRUSTED loaded config.
+@dataclass(frozen=True)
+class SealedMarginSource:
+    """Immutable, sealed per-pair margin source — the ONLY input type
+    certify_route accepts. Built exclusively by load_trusted_margin_source /
+    parse_margin_config which READ the effective config bytes and compute
+    the SHA256 internally (caller-supplied metadata is forgeable and is
+    rejected by the type check)."""
+    source: str                       # "CONFIG_FLOOR"
+    version: int
+    config_path: str
+    config_sha256: str
+    config_commit: str                # deployed release SHA
+    per_pair_margin: float
+    product: str
 
-    Shioaji 1.7.0 has no per-contract margin-rate surface (capability map
-    §3) — the only authoritative source is a reviewed pair-level floor in
-    the effective config, bound to path + byte sha256 + deploy commit.
-    Missing / non-finite / non-positive / unknown product → ValueError.
-    """
+
+MARGIN_FLOOR_KEY = ("mts", "live_required_margin_per_pair")
+
+
+def _parse_floor(doc: Any) -> float:
+    node = doc
+    for key in MARGIN_FLOOR_KEY:
+        if not isinstance(node, dict):
+            raise ValueError(f"config missing {'.'.join(MARGIN_FLOOR_KEY)}")
+        node = node.get(key)
+        if node is None:
+            raise ValueError(f"config missing {'.'.join(MARGIN_FLOOR_KEY)}")
+    if isinstance(node, bool):
+        raise ValueError("per_pair margin must be numeric")
+    try:
+        value = float(node)
+    except (TypeError, ValueError):
+        raise ValueError(f"per_pair margin not numeric: {node!r}")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"per_pair margin must be finite positive: {node!r}")
+    return value
+
+
+def parse_margin_config(raw: bytes, *, config_path: str, release_sha: str,
+                        product: str = "TMF") -> SealedMarginSource:
+    """Seal the margin source from the ACTUAL config bytes. The SHA256 is
+    computed here; caller-supplied hashes are never trusted (round-9 #3)."""
     product = str(product).upper()
     if product not in KNOWN_PRODUCTS:
         raise ValueError(f"unknown product {product!r}")
-    floor = config.get("per_pair_margin")
-    if floor is None or isinstance(floor, bool):
-        raise ValueError("per_pair_margin missing")
+    if not release_sha:
+        raise ValueError("release_sha (deployed commit) required")
+    import yaml
     try:
-        value = float(floor)
-    except (TypeError, ValueError):
-        raise ValueError(f"per_pair_margin not numeric: {floor!r}")
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError(f"per_pair_margin must be finite positive: {floor!r}")
-    path = config.get("path")
-    sha256 = config.get("sha256")
-    commit = config.get("commit")
-    if not path or not sha256 or not commit:
-        raise ValueError("config path/sha256/commit required for provenance")
-    return {
-        "source": "CONFIG_FLOOR",
-        "version": MARGIN_SOURCE_VERSION,
-        "config_path": str(path),
-        "config_sha256": str(sha256),
-        "config_commit": str(commit),
-        "per_pair_margin": value,
-        "product": product,
-    }
+        doc = yaml.safe_load(raw)
+    except Exception as exc:
+        raise ValueError(f"unparseable config: {exc}") from exc
+    floor = _parse_floor(doc)
+    return SealedMarginSource(
+        source="CONFIG_FLOOR",
+        version=MARGIN_SOURCE_VERSION,
+        config_path=str(config_path),
+        config_sha256=hashlib.sha256(raw).hexdigest(),
+        config_commit=str(release_sha),
+        per_pair_margin=floor,
+        product=product,
+    )
 
 
-def _required_margin(source: dict, buffer: float = MARGIN_BUFFER) -> float:
-    return round(float(source["per_pair_margin"]) * (1 + buffer), 2)
+def load_trusted_margin_source(config_path, *, release_sha: str,
+                               product: str = "TMF") -> SealedMarginSource:
+    """Read the effective config FILE, verify and seal the margin source.
+    Missing/unreadable file → ValueError (fail-closed)."""
+    path = Path(config_path)
+    if not path.is_file():
+        raise ValueError(f"config not found: {path}")
+    return parse_margin_config(path.read_bytes(), config_path=str(path),
+                               release_sha=release_sha, product=product)
+
+
+def _required_margin(source: SealedMarginSource,
+                     buffer: float = MARGIN_BUFFER) -> float:
+    return round(float(source.per_pair_margin) * (1 + buffer), 2)
 
 
 # ── certificate + issuer ───────────────────────────────────────────────────
@@ -186,7 +254,10 @@ class LiveBrokerCertificate:
     required_margin: float = 0.0
     margin_source: str = ""            # "CONFIG_FLOOR"
     margin_source_version: int = MARGIN_SOURCE_VERSION
+    config_path: str = ""
+    config_sha256: str = ""
     config_commit: str = ""
+    product: str = ""
     session_generation: str = ""
     query_results: tuple = ()
     bidask_subscribed: tuple = ()
@@ -247,12 +318,17 @@ class CertificateIssuer:
 # ── certification (collects from the session itself — no external payload) ─
 
 def certify_route(api: object, *, process_start_id: str,
-                  issuer: CertificateIssuer, margin_source: dict,
-                  product: str = "TMF",
+                  issuer: CertificateIssuer, config_path,
+                  release_sha: str, product: str = "TMF",
                   margin_buffer: float = MARGIN_BUFFER,
                   ) -> tuple[Optional[LiveBrokerCertificate], list[str]]:
     """Collect from the CURRENT authenticated execution session and issue a
-    certificate. No external dict/JSON payload is accepted (B2)."""
+    certificate. No external dict/JSON payload is accepted (B2); the margin
+    source is loaded and sealed HERE from the effective config file
+    (round-9 #3/#4) — a caller-supplied source cannot be injected."""
+    margin_source = load_trusted_margin_source(config_path,
+                                               release_sha=release_sha,
+                                               product=product)
     failures: list[str] = []
 
     if not is_authenticated_session(api):
@@ -293,8 +369,14 @@ def certify_route(api: object, *, process_start_id: str,
     if near_code and far_code and set(snapshot_codes) != {near_code, far_code}:
         failures.append("SNAPSHOT_CODES_INCONSISTENT")
 
-    quote_checks = pre.get("quote_subscription") or []
-    if not all(c.get("passed") for c in quote_checks):
+    # round-9 #5: all([]) is true — require EXACTLY two successful, unique
+    # quote checks whose codes are precisely {near_code, far_code}.
+    quote_checks = [c for c in (pre.get("quote_subscription") or [])
+                    if c.get("passed")]
+    quote_codes = {c.get("code") for c in quote_checks}
+    if near_code and far_code and (
+            len(quote_checks) != 2 or len(quote_codes) != 2
+            or quote_codes != {near_code, far_code}):
         failures.append("QUOTE_SUBSCRIPTION_FAILED")
 
     if failures:
@@ -311,15 +393,20 @@ def certify_route(api: object, *, process_start_id: str,
         order_snapshot_ts=pre.get("order_snapshot_time") or _now_iso(),
         margin_available=float(available),
         required_margin=required,
-        margin_source=margin_source["source"],
-        margin_source_version=margin_source["version"],
-        config_commit=margin_source["config_commit"],
+        margin_source=margin_source.source,
+        margin_source_version=margin_source.version,
+        config_path=margin_source.config_path,
+        config_sha256=margin_source.config_sha256,
+        config_commit=margin_source.config_commit,
+        product=margin_source.product,
         session_generation=generation,
         query_results=tuple(pre.get("query_failures") or []) + ("AUTH_OK",),
-        bidask_subscribed=tuple(c.get("code") for c in quote_checks
-                                if c.get("passed")),
-        bidask_unsubscribed=tuple(c.get("code") for c in quote_checks
-                                  if c.get("passed")),
+        bidask_subscribed=tuple(
+            "NEAR" if c.get("code") == near_code else "FAR"
+            for c in quote_checks),
+        bidask_unsubscribed=tuple(
+            "NEAR" if c.get("code") == near_code else "FAR"
+            for c in quote_checks),
         warnings=tuple(pre.get("warnings") or []),
     )
     return issuer.issue(cert), []
@@ -331,7 +418,7 @@ def validate_live_broker_certificate(
         cert: LiveBrokerCertificate, *, issuer: CertificateIssuer,
         process_start_id: str, account_hash: str, near_code: str,
         far_code: str, now_ts: Optional[str] = None,
-        margin_source: Optional[dict] = None,
+        margin_source: Optional[SealedMarginSource] = None,
         session_generation: Optional[str] = None,
         ttl_secs: int = TTL_SECS, skew_secs: int = SKEW_SECS,
         ) -> tuple[bool, list[str]]:
@@ -368,9 +455,12 @@ def validate_live_broker_certificate(
 
     if margin_source is not None:
         expected_required = _required_margin(margin_source)
-        if cert.margin_source != margin_source.get("source") \
-                or cert.margin_source_version != margin_source.get("version") \
-                or cert.config_commit != margin_source.get("config_commit") \
+        if cert.margin_source != margin_source.source \
+                or cert.margin_source_version != margin_source.version \
+                or cert.config_path != margin_source.config_path \
+                or cert.config_sha256 != margin_source.config_sha256 \
+                or cert.config_commit != margin_source.config_commit \
+                or cert.product != margin_source.product \
                 or cert.required_margin != expected_required:
             reasons.append("SOURCE_MISMATCH")
 
@@ -396,7 +486,9 @@ class RuntimeCertificationContext:
 def build_runtime_certification_context(api: object, config: dict,
                                         process_state: Optional[dict] = None,
                                         ) -> RuntimeCertificationContext:
-    """Trusted factory: current api + loaded config + process state."""
+    """Trusted factory: current api + loaded config + process state.
+    ``config`` is the effective config FILE PATH; the margin source is
+    sealed by load_trusted_margin_source (round-9 #3)."""
     account = getattr(api, "futopt_account", None)
     if account is None:
         raise PreflightBlocked("FUTOPT_ACCOUNT_UNAVAILABLE")
@@ -409,7 +501,8 @@ def build_runtime_certification_context(api: object, config: dict,
         account_hash=_account_hash(account),
         near_code=getattr(near, "code", "") or "",
         far_code=getattr(far, "code", "") or "",
-        margin_source=margin_source_from_config(config),
+        margin_source=load_trusted_margin_source(
+            config, release_sha=str(ps.get("release_sha", "") or "")),
         session_generation=session_registry.generation(api) or "",
         now_ts=_now_iso(),
     )
@@ -438,6 +531,17 @@ def transition_with_certificate(
     if issuer.peek(cert.nonce) is None and issuer.was_consumed(cert.nonce):
         raise CertificateAlreadyConsumed(
             f"certificate nonce {cert.nonce} already redeemed")
+
+    # round-9 #7 canonicality: the supplied certificate must be BYTE-EQUAL
+    # to the issuer's canonical issued certificate — the nonce alone only
+    # proves existence. Any tampering (captured_at/margin/account/contract/
+    # config) with the same nonce+issuer is rejected before fact checks.
+    canonical = issuer.peek(cert.nonce)
+    if canonical is not None and canonical != cert:
+        return with_effective_mode(
+            ctx, ModeTransitionState.LIVE_QUARANTINED.value,
+            live_order_allowed=False,
+            audit_reasons=("CERT_TAMPERED",))
 
     ok, reasons = validate_live_broker_certificate(
         cert, issuer=issuer,

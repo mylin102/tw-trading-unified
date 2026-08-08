@@ -214,6 +214,14 @@ def logout():
     global _api
     with _lock:
         if _api:
+            # Live Route Certification (round-9 #1): invalidate the session
+            # registration so no certificate remains generation-valid after
+            # broker logout. Function-level import avoids import cycles.
+            try:
+                from core.live_route_certificate import unregister_session
+                unregister_session(_api)
+            except Exception:
+                pass
             try:
                 _api.logout()
                 logger.info("[session] Logged out cleanly")
