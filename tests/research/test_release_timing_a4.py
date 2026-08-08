@@ -79,11 +79,17 @@ def test_pre_breach_clone_completeness():
                 "config_version"}
     assert required <= set(schema or {}), \
         f"clone schema missing: {required - set(schema or {})}"
-    clone = breach.clone_point_before_breach(event_seq=10)
-    assert clone is not None
+    snap = {f: f"<{f}>" for f in required}
+    clone = breach.clone_point_before_breach(
+        event_seq=10, state_snapshot=snap,
+        event_stream=[{"replay_seq": 1}, {"replay_seq": 2}])
+    assert isinstance(clone, dict), clone
+    assert clone.get("_canonical_hash"), "canonical hash required"
     for field in required:
         result = breach.clone_point_before_breach(
-            event_seq=10, missing_fields={field})
+            event_seq=10, missing_fields={field},
+            state_snapshot={k: v for k, v in snap.items() if k != field},
+            event_stream=[{"replay_seq": 1}])
         assert isinstance(result, tuple) and result[0] == "NOT_AVAILABLE", \
             f"missing {field} must yield typed NOT_AVAILABLE: {result}"
         assert field in result[1], \
@@ -91,12 +97,43 @@ def test_pre_breach_clone_completeness():
 
 
 def test_clone_immune_to_actual_branch_mutation():
-    # A4 v2.2 (2b): mutate the ACTUAL-release branch state — the A4 clone
-    # (taken before the breach) must remain unchanged
-    clone_a = breach.clone_point_before_breach(event_seq=10)
+    # A4 engine (codex audit #2): the clone is a DEEP copy of the PRE-breach
+    # snapshot — mutating the SOURCE afterwards must not affect it, and
+    # breach/release FUTURE events are never read
+    required = {"positions", "policy_peak", "guard_warmup", "guard_armed",
+                "atr", "reference_prices", "pending_candidates",
+                "pending_orders", "quote_freshness", "controller",
+                "lifecycle", "cooldown", "strategy_generation",
+                "config_version"}
+    snap = {f: f"<{f}>" for f in required}
+    snap["positions"] = {"near": 1}
+    clone_a = breach.clone_point_before_breach(
+        event_seq=2, state_snapshot=snap,
+        event_stream=[{"replay_seq": 1}, {"replay_seq": 2},
+                      {"replay_seq": 3, "sentinel": "RELEASE"}])
+    snap["positions"]["near"] = 999  # mutate the SOURCE after cloning
+    assert clone_a["positions"]["near"] == 1, \
+        "clone must be immune to source mutation"
     clone_b = breach.clone_point_before_breach(
-        event_seq=10, actual_branch_mutated={"released_leg": "near"})
-    assert clone_a == clone_b, "A4 clone must not see actual-release state"
+        event_seq=2, actual_branch_mutated={"released_leg": "near"},
+        state_snapshot={f: f"<{f}>" for f in required},
+        event_stream=[{"replay_seq": 1}, {"replay_seq": 2},
+                      {"replay_seq": 3, "sentinel": "RELEASE"}])
+    assert isinstance(clone_b, dict), clone_b
+    # future events (replay_seq 3 > breach 2) must not leak into evidence
+    bounded = [{"replay_seq": 1}, {"replay_seq": 2}]
+    import hashlib, json
+    expect_prefix = hashlib.sha256(
+        json.dumps(bounded, sort_keys=True, default=str).encode()).hexdigest()
+    assert clone_a["_stream_prefix_hash"] == expect_prefix, \
+        "breach/release future events must never be read"
+
+
+def test_clone_from_state_incomplete_input_not_available():
+    result = breach.clone_point_before_breach(
+        event_seq=10, state_snapshot=None, event_stream=[])
+    assert isinstance(result, tuple) and result[0] == "NOT_AVAILABLE"
+    assert "state_snapshot" in result[1], result
 
 
 def test_no_lookahead_extrema():
@@ -306,3 +343,40 @@ def test_reports_evidence_failed_overrides_same_economics():
     assert matrix["interval_classification"] == \
         "INDETERMINATE_DATA_QUALITY", \
         "evidence gate must override identical economics"
+
+
+def test_canonical_arm_mapping_explicit():
+    # codex audit #3: Y0/Y1/Y2/Y3 semantics MUST be explicit and tested
+    from scripts.research.release_timing_a4 import reports as a4_reports
+    assert a4_reports.CANONICAL_ARM_MAP == {
+        "Y0": "actual_release",
+        "Y1": "atomic_combined_exit",
+        "Y2": "remain_spread",
+        "Y3": "release_dedicated_controller",
+    }
+    # F_N (normal family) = {Y1, Y2} — do NOT release;
+    # F_R (release family) = {Y0, Y3}
+    assert a4_reports.F_N_ARMS == ("Y1", "Y2")
+    assert a4_reports.F_R_ARMS == ("Y0", "Y3")
+
+
+def test_arm_matrix_calls_canonical_classifier(monkeypatch):
+    # codex audit #1: A4 MUST call the canonical phase-transition
+    # classifier — no duplicate classifier may exist
+    from scripts.research.phase_transition_replay import classify as cmod
+    calls = []
+
+    def spy(**kw):
+        calls.append(kw)
+        return "INCONCLUSIVE_NEUTRAL"
+
+    monkeypatch.setattr(cmod, "classify_outcome", spy)
+    from scripts.research.release_timing_a4 import reports as a4_reports
+    a4_reports.arm_matrix(
+        arms={"Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0},
+        intervals={"Y0": (-310.0, -290.0), "Y1": (-55.0, -45.0),
+                   "Y2": (-45.0, -35.0), "Y3": (95.0, 105.0)},
+        evidence="ok")
+    assert calls, "arm_matrix must call the canonical classifier"
+    assert calls[0]["data_quality"] == "ok"
+    assert calls[0]["M_economic"] == a4_reports.M_ECONOMIC_DEFAULT

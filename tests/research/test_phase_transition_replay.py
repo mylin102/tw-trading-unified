@@ -83,8 +83,9 @@ def test_family_winner_flips_under_intervals():
 def test_equality_at_threshold_is_neutral():
     # lower(F_N)-upper(F_R) == M_economic exactly → neutral (no HARMFUL)
     label = classify.classify_outcome(
-        Y0=-100.0, Y1=0.0, Y2=0.0, Y3=-100.0, actual=0.0,
+        Y0=-25.0, Y1=0.0, Y2=0.0, Y3=-25.0, actual=0.0,
         data_quality="ok", M_economic=25.0)
+    # lower(F_N)=0 - upper(F_R)=-25 == 25 == M_economic exactly
     assert label == "INCONCLUSIVE_NEUTRAL", label
 
 
@@ -124,6 +125,35 @@ def test_clone_state_at_decision_no_branch_contamination():
         strategy_state={"released_leg": None, "_side": None},
         decision_ts="2026-08-08T10:00:00")
     assert state is not None
+
+
+def test_clone_from_state_immune_to_source_mutation():
+    # the clone is a DEEP copy — mutating the source snapshot afterwards
+    # must not affect the clone; a canonical hash is computed
+    snapshot = {"positions": {"near": 1}, "warmup": True,
+                "policy_peak": -300.0, "durable_candidate": None,
+                "armed": False, "atr": 40.0, "reference_prices": [44300.0],
+                "pending_orders": [], "quote_freshness": 1,
+                "controller": "none", "lifecycle": "NORMAL",
+                "release": None, "trail": None, "cooldown": 0,
+                "config_version": "v1"}
+    stream_events = [{"replay_seq": 1}, {"replay_seq": 2}]
+    result_clone = clone.clone_from_state(
+        event_stream=stream_events, breach_replay_seq=1,
+        state_snapshot=snapshot)
+    assert isinstance(result_clone, dict), result_clone
+    assert result_clone.get("_canonical_hash"), "canonical hash required"
+    snapshot["positions"]["near"] = 999  # mutate the SOURCE
+    assert result_clone["positions"]["near"] == 1, \
+        "clone must be immune to source mutation"
+
+
+def test_clone_from_state_missing_field_not_available():
+    snapshot = {"positions": {"near": 1}, "warmup": True}
+    result = clone.clone_from_state(
+        event_stream=[], breach_replay_seq=1, state_snapshot=snapshot)
+    assert isinstance(result, tuple) and result[0] == "NOT_AVAILABLE"
+    assert "atr" in result[1], f"exact missing field: {result}"
 
 
 def test_event_stream_integrity_fields():
