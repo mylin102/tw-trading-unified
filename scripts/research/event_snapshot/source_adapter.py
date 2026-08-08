@@ -339,6 +339,15 @@ def _valid_price(v):
     return f == f and f > 0.0 and f != float("inf")
 
 
+def _unavailable(reason):
+    """Fixed typed unavailable quote shape: every runner QUOTE_FIELD is
+    PRESENT (None) so the runner schema gate passes and the value gate
+    censors with the reason — never a 'schema: missing field'."""
+    return {"available": False, "bid": None, "ask": None, "age_s": None,
+            "close_action": None, "quote_exchange_ts": None,
+            "quote_source": None, "reason": reason}
+
+
 def _attach_leg_bbo(leg, contract, decision_ts_ms, position_side,
                     quotes, params):
     """Attach the pre-anchor, exact-code/leg BBO for one leg with age +
@@ -374,8 +383,7 @@ def _attach_leg_bbo(leg, contract, decision_ts_ms, position_side,
         if best is None or ts > (best.get("exchange_ts_ms") or 0):
             best = q
     if best is None:
-        return {"available": False,
-                "reason": "; ".join(reasons) or f"{leg}: no valid BBO"}
+        return _unavailable("; ".join(reasons) or f"{leg}: no valid BBO")
     return {"available": True, "bid": float(best["bid"]),
             "ask": float(best["ask"]),
             "age_s": ((best.get("receive_ts_ms") - best["exchange_ts_ms"])
@@ -495,9 +503,9 @@ def build_normalized_snapshot(input_paths, out_dir, mapping_input=None):
                        - legs_ok[1]["quote_exchange_ts"])
             if skew > params["max_pair_skew_ms"]:
                 for l in ("near", "far"):
-                    ev["quotes"][l] = {"available": False,
-                                       "reason": f"pair skew {skew}ms > "
-                                                 f"{params['max_pair_skew_ms']}ms"}
+                    ev["quotes"][l] = _unavailable(
+                        f"pair skew {skew}ms > "
+                        f"{params['max_pair_skew_ms']}ms")
         seq = len(events_list) + 1
         ev["source_event_seq"] = seq
         events_list.append(ev)
@@ -511,11 +519,23 @@ def build_normalized_snapshot(input_paths, out_dir, mapping_input=None):
         _cleanup(out_dir, [])
         return ("NOT_AVAILABLE",
                 "no candidate produced an event: " + str(refused))
+    matched_trades = {a.get("trade_id") for a in anchors
+                      if not isinstance(a, tuple)}
+    unmatched_release_fills = [
+        {"source": f.get("source"), "record_no": f.get("record_no"),
+         "byte_offset": f.get("byte_offset"),
+         "trade_id": f.get("trade_id"),
+         "reason": "no legal ORDER_SUBMITTED(MTS_RELEASE) anchor for "
+                   "this release fill"}
+        for f in norm.get("fills", [])
+        if f.get("fill_type") == "RELEASE"
+        and f.get("trade_id") not in matched_trades]
     manifest = {
         "schema_version": "source-adapter-v2",
         "sources": norm.get("sources", []),
         "unknown_fill_types": norm.get("unknown_fill_types", {}),
         "refused_candidates": refused,
+        "unmatched_release_fills": unmatched_release_fills,
         "contract_mapping": {
             "evidence": [m["evidence"] for m in
                          (_mapping_evidence(events_list) if events_list
