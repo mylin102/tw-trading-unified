@@ -540,6 +540,7 @@ class FuturesMonitor:
                                 ModeTransitionState.LIVE_QUARANTINED.value,
                                 live_order_allowed=False,
                                 audit_reasons=tuple(_cert_failures) or ("NO_CERTIFICATE",))
+                            self._persist_execution_context()
                             print(f"[MTS_EXEC_CTX] LIVE_QUARANTINED cert=None "
                                   f"reasons={_cert_failures or ['NO_CERTIFICATE']} "
                                   f"— live orders blocked")
@@ -551,6 +552,7 @@ class FuturesMonitor:
                             self._execution_context = transition_with_certificate(
                                 self._execution_context, _cert, _issuer,
                                 runtime=_runtime)
+                            self._persist_execution_context()
                             if self._execution_context.is_live_ready():
                                 print("[MTS_EXEC_CTX] LIVE_READY — "
                                       "certificate-required transition complete; "
@@ -2715,6 +2717,18 @@ class FuturesMonitor:
             console.print(f"[dim][FuturesMonitor] Far bar save failed (non-fatal): {e}[/dim]")
 
     # ── Safety Stop (exchange-side protection) ──
+    def _persist_execution_context(self):
+        """[Step 6] persist the execution context to the canonical
+        dashboard-readable file ({TRADING_RUNTIME_DIR}/execution_context.json)
+        atomically. A failure never enables LIVE — the reader is
+        file-based and keeps the last good state."""
+        try:
+            from core.execution_context_state import persist_execution_context
+            persist_execution_context(self._execution_context.to_dict())
+        except Exception as _pexc:
+            console.print(f"[dim]⚠️ exec ctx persist failed: {_pexc} "
+                          f"(file keeps last good state)[/dim]")
+
     def _place_safety_stop(self, entry_price, direction, lots, stop_loss_pts):
         """Place a far-limit order at exchange as safety stop for disconnect protection."""
         if not self.live_trading or self.dry_run or not self.contract or not self.api:

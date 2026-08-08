@@ -690,6 +690,18 @@ def verify_startup_reconciliation(api) -> bool:
     return True
 
 
+def _persist_ctx(mon):
+    """[Step 6] persist a monitor's execution context to the canonical
+    dashboard-readable file. Failure never enables LIVE (reader keeps the
+    last good state)."""
+    try:
+        from core.execution_context_state import persist_execution_context
+        persist_execution_context(mon._execution_context.to_dict())
+    except Exception as _pexc:
+        print(f"[dim]⚠️ exec ctx persist failed: {_pexc} "
+              f"(file keeps last good state)[/dim]")
+
+
 def _quarantine_for_handoff(monitors, reason="RECONNECT_HANDOFF"):
     """[Live wiring Step 5] atomic handoff: quarantine EVERY execution
     context BEFORE any re-login/wait — zero order calls during the
@@ -705,6 +717,7 @@ def _quarantine_for_handoff(monitors, reason="RECONNECT_HANDOFF"):
             live_order_allowed=False,
             audit_reasons=(reason,) + tuple(
                 getattr(ctx, "audit_reasons", ()) or ()))
+        _persist_ctx(m)
 
 
 def _reconnect_monitors(fm):
@@ -737,12 +750,14 @@ def _recertify_after_reconnect(mon, api):
                 ModeTransitionState.LIVE_QUARANTINED.value,
                 live_order_allowed=False,
                 audit_reasons=tuple(failures) or ("RECERTIFY_FAILED",))
+            _persist_ctx(mon)
             return False
         runtime = build_runtime_certification_context(
             api, cfg_path,
             {"process_state": {"process_start_id": f"monitor-{os.getpid()}"}})
         mon._execution_context = transition_with_certificate(
             mon._execution_context, cert, issuer, runtime=runtime)
+        _persist_ctx(mon)
         return bool(mon._execution_context.is_live_ready())
     except Exception:
         return False
