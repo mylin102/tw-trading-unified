@@ -2719,6 +2719,14 @@ class FuturesMonitor:
         """Place a far-limit order at exchange as safety stop for disconnect protection."""
         if not self.live_trading or self.dry_run or not self.contract or not self.api:
             return
+        # [Live wiring Step 2] execution-context gate: QUARANTINED/PREFLIGHT
+        # makes ZERO place_order calls and returns a structured blocked
+        # reason (audit); only LIVE_READY reaches the broker.
+        _ctx = getattr(self, "_execution_context", None)
+        if _ctx is not None and not _ctx.is_live_ready():
+            return {"blocked": True, "reason": "LIVE_QUARANTINED",
+                    "audit_reasons": tuple(
+                        getattr(_ctx, "audit_reasons", ()) or ())}
         try:
             import shioaji as sj
             # Safety stop is wider than strategy stop (2x) to avoid premature fills
