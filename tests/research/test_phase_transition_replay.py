@@ -367,13 +367,13 @@ def test_runner_prereg_required(tmp_path):
 
 def _schema_valid_event(**over):
     ev = {"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
-          "decision_ts_ms": 1_000_000,
+          "decision_ts_ms": 1_700_000_100_000,
           "quotes": {"near": {"bid": 50.0, "ask": 100.0, "age_s": 1,
                               "close_action": "SHORT",
-                              "quote_exchange_ts": 999_900},
+                              "quote_exchange_ts": 1_700_000_000_000},
                      "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
                              "close_action": "SHORT",
-                             "quote_exchange_ts": 999_950}}}
+                             "quote_exchange_ts": 1_700_000_000_050}}}
     ev.update(over)
     return ev
 
@@ -399,6 +399,8 @@ def test_runner_dry_run_writes_manifest(tmp_path):
     assert manifest["parameters"]["staleness"] == {"max_age_s": 30}
     assert manifest["parameters"]["m_economic"] == 25.0
     assert manifest["parameters"]["max_pair_skew_ms"] == 1000
+    assert manifest["parameters"]["timestamp_unit"] == "epoch_ms"
+    assert manifest["parameters"]["timestamp_validator_version"] == "v1"
     prov = manifest["git_provenance"]
     assert len(prov["repo_head"]) == 40
     assert prov["dirty"] is False
@@ -436,9 +438,11 @@ def test_runner_censors_incomplete_quotes(tmp_path):
     inp.write_text(json.dumps([
         _schema_valid_event(quotes={
             "near": {"bid": 50.0, "ask": 100.0, "age_s": None,
-                     "close_action": "SHORT", "quote_exchange_ts": 999_900},
+                     "close_action": "SHORT",
+                     "quote_exchange_ts": 1_700_000_000_000},
             "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
-                    "close_action": "SHORT", "quote_exchange_ts": 999_950}}),
+                    "close_action": "SHORT",
+                    "quote_exchange_ts": 1_700_000_000_050}}),
     ]), encoding="utf-8")
     out = tmp_path / "out"
     rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
@@ -494,9 +498,11 @@ def test_runner_json_dict_quotes_kept_when_valid(tmp_path):
         _schema_valid_event(
             source_event_seq=2, exchange_ts=200, recv_ts=201,
             quotes={"near": {"bid": 50.0, "ask": 100.0, "age_s": 1,
-                             "close_action": "SHORT"},
+                             "close_action": "SHORT",
+                             "quote_exchange_ts": 1_700_000_000_000},
                     "far": {"bid": 25.0, "ask": 50.0, "age_s": None,
-                            "close_action": "SHORT"}}),
+                            "close_action": "SHORT",
+                            "quote_exchange_ts": 1_700_000_000_050}}),
     ]), encoding="utf-8")
     out = tmp_path / "out"
     rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
@@ -530,9 +536,11 @@ def test_runner_censors_pair_skew_exceeding_bound(tmp_path):
     inp = tmp_path / "events.json"
     inp.write_text(json.dumps([_schema_valid_event(quotes={
         "near": {"bid": 50.0, "ask": 100.0, "age_s": 1,
-                 "close_action": "SHORT", "quote_exchange_ts": 998_000},
+                 "close_action": "SHORT",
+                 "quote_exchange_ts": 1_699_999_000_000},
         "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
-                "close_action": "SHORT", "quote_exchange_ts": 999_950}})]),
+                "close_action": "SHORT",
+                "quote_exchange_ts": 1_700_000_000_000}})]),
         encoding="utf-8")
     out = tmp_path / "out"
     rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
@@ -551,9 +559,11 @@ def test_runner_censors_quote_after_decision(tmp_path):
     inp = tmp_path / "events.json"
     inp.write_text(json.dumps([_schema_valid_event(quotes={
         "near": {"bid": 50.0, "ask": 100.0, "age_s": 1,
-                 "close_action": "SHORT", "quote_exchange_ts": 2_000_000},
+                 "close_action": "SHORT",
+                 "quote_exchange_ts": 1_700_000_200_000},
         "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
-                "close_action": "SHORT", "quote_exchange_ts": 999_950}})]),
+                "close_action": "SHORT",
+                "quote_exchange_ts": 1_700_000_000_050}})]),
         encoding="utf-8")
     out = tmp_path / "out"
     rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
@@ -579,6 +589,39 @@ def test_execution_malformed_quote_fail_closed():
             staleness_bounds={"max_age_s": 30})
         assert r["tier"] != "EXECUTABLE_BBO", (bad, r["tier"])
         assert r["reasons"], f"fail-closed reason required: {bad!r}"
+
+
+def test_validate_epoch_ms_rejects_non_ms_domains():
+    # v6.1: strict epoch-ms — bool, seconds, microseconds and nanoseconds
+    # must all be rejected; only plausible epoch-ms passes
+    assert execution.validate_epoch_ms(1_700_000_100_000) is True
+    for bad in (True, False, 1_700_000_100,        # seconds scale
+                1_700_000_100_000_000,             # microseconds scale
+                1_700_000_100_000_000_000,         # nanoseconds scale
+                0, -1, None, "1.7e12"):
+        assert execution.validate_epoch_ms(bad) is False, bad
+
+
+def test_runner_censors_seconds_scale_quote_ts(tmp_path):
+    # v6.1: a seconds-scale quote_exchange_ts must NOT pass as fresh —
+    # censored with an epoch-ms reason
+    import json
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([_schema_valid_event(quotes={
+        "near": {"bid": 50.0, "ask": 100.0, "age_s": 1,
+                 "close_action": "SHORT", "quote_exchange_ts": 1_700_000_100},
+        "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
+                "close_action": "SHORT",
+                "quote_exchange_ts": 1_700_000_000_050}})]),
+        encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1", "--dry-run"])
+    assert rc == 0, rc
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["n_censored"] == 1, manifest
+    reasons = [c["reason"] for c in manifest["censored_reasons"]]
+    assert any("epoch-ms" in r for r in reasons), reasons
 
 
 # ── reuse contract: the skeleton must wire the COMMITTED exit_attribution ───
