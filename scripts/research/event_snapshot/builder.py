@@ -114,22 +114,31 @@ def attach_provenance(record):
 
 # ── deterministic ordering (P0-2) ────────────────────────────────────────────
 
+IDENTITY_FIELDS = ("byte_offset", "record_no", "byte_hash")
+
+
 def _sort_key(e):
     return (e.get("exchange_ts"), e.get("source_event_seq"),
-            e.get("byte_offset") or 0)
+            e.get("byte_offset"), e.get("record_no"), e.get("byte_hash"))
 
 
 def order_events(events):
     """Deterministic total order by (exchange_ts, source_event_seq); EQUAL
-    timestamps tie by source record identity (byte_offset), never file
-    order. Duplicates -> ("DUPLICATE", reason)."""
+    timestamps tie by source record identity (byte_offset + record_no +
+    byte_hash), never file order, never a coerced 0. Missing identity ->
+    ("NOT_AVAILABLE", reason). Duplicates -> ("DUPLICATE", reason)."""
     evs = list(events or [])
+    for e in evs:
+        if any(e.get(f) is None for f in IDENTITY_FIELDS):
+            return ("NOT_AVAILABLE",
+                    "source record identity missing "
+                    "(byte_offset/record_no/byte_hash required)")
     seen = {}
     for e in evs:
-        key = _sort_key(e)[:2] + ((e.get("byte_offset") or 0),)
+        key = _sort_key(e)
         if key in seen:
             return ("DUPLICATE",
-                    f"duplicate (exchange_ts, seq, byte_offset): {key}")
+                    f"duplicate (exchange_ts, seq, identity): {key}")
         seen[key] = e
     sorted_evs = sorted(evs, key=_sort_key)
     reordered = any(evs[i] is not sorted_evs[i] for i in range(len(evs)))
@@ -144,7 +153,11 @@ def order_events(events):
 def _attach_leg(ev, leg, quote_records):
     anchor = ev.get("decision_ts_ms")
     contract = ev.get("contract")
-    position_side = ev.get("position_side")
+    # P0: per-leg pre-decision position mapping — each leg validates its
+    # OWN side; a single shared side is never reused across legs
+    positions = ev.get("position")
+    position_side = (positions.get(leg)
+                     if isinstance(positions, dict) else None)
     reasons = []
     best = None
     for q in quote_records or []:
@@ -169,11 +182,13 @@ def _attach_leg(ev, leg, quote_records):
             reasons.append(
                 f"{leg}: quote ts {qt} after legal decision anchor {anchor}")
             continue
-        # P0: close_action is DERIVED/VALIDATED from the pre-decision
-        # position record — never blindly trusted from the quote
+        # P0: close_action is DERIVED/VALIDATED from THIS leg's pre-decision
+        # position — never blindly trusted from the quote, never reused
+        # from the other leg
         if position_side not in ("LONG", "SHORT"):
-            reasons.append(f"{leg}: position_side missing from pre-decision "
-                           f"position record")
+            reasons.append(
+                f"{leg}: position[{leg}] missing from pre-decision "
+                f"position record")
             continue
         if q.get("close_action") != position_side:
             reasons.append(
@@ -303,12 +318,19 @@ def _merge_events(sources):
     if not _valid_epoch_ms(anchor_ts):
         return None, (f"invalid/missing decision anchor timestamp: "
                       f"{anchor.get('ts_text')!r}")
+    if any(anchor.get(f) is None for f in IDENTITY_FIELDS):
+        return None, ("source record identity missing "
+                      "(byte_offset/record_no/byte_hash required)")
     ev = {"source_event_seq": anchor.get("source_event_seq") or 1,
           "exchange_ts": anchor.get("exchange_ts"),
           "recv_ts": anchor.get("recv_ts"),
           "decision_ts_ms": anchor_ts,
           "decision_ts_text": anchor.get("ts_text"),
           "contract": anchor.get("contract"),
+          "byte_offset": anchor.get("byte_offset"),
+          "record_no": anchor.get("record_no"),
+          "byte_hash": anchor.get("byte_hash"),
+          "position": anchor.get("position"),
           "event_source": anchor.get("event_source"),
           "provenance": attach_provenance(anchor),
           "anchor_record": anchor.get("record")}
