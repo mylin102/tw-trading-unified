@@ -330,7 +330,7 @@ def _run_engine(kept, params):
         for k, v in payload["arms"].items():
             arms_agg.setdefault(k, []).append(v)
         for k, v in payload["pairwise_deltas"].items():
-            delta_agg.setdefault(list(k), []).append(v)
+            delta_agg.setdefault("-".join(k), []).append(v)
         labels[payload["classification"]] = \
             labels.get(payload["classification"], 0) + 1
     return {
