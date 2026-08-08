@@ -339,7 +339,7 @@ def test_reports_reuse_replay_classify_contract():
         "Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0},
         intervals={"Y0": (-310.0, -290.0), "Y1": (-55.0, -45.0),
                    "Y2": (-45.0, -35.0), "Y3": (95.0, 105.0)},
-        evidence="ok")
+        evidence="ok", M_economic=25.0, fee_assumption_id="fee-v1")
     assert matrix["absolute_Y"] == \
         {"Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0}, \
         f"exact four absolute Y required: {matrix.get('absolute_Y')}"
@@ -352,6 +352,11 @@ def test_reports_reuse_replay_classify_contract():
     assert matrix["interval_classification"] == \
         "RELEASE_OK_MANAGEMENT_BAD", \
         f"management-bad case must classify exactly: {matrix.get('interval_classification')}"
+    assert matrix["M_economic"] == 25.0
+    assert matrix["fee_assumption_id"] == "fee-v1"
+    assert matrix["intervals"] == {
+        "Y0": (-310.0, -290.0), "Y1": (-55.0, -45.0),
+        "Y2": (-45.0, -35.0), "Y3": (95.0, 105.0)}
 
 
 def test_reports_evidence_failed_overrides_same_economics():
@@ -361,10 +366,29 @@ def test_reports_evidence_failed_overrides_same_economics():
         "Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0},
         intervals={"Y0": (-310.0, -290.0), "Y1": (-55.0, -45.0),
                    "Y2": (-45.0, -35.0), "Y3": (95.0, 105.0)},
-        evidence="failed")
+        evidence="failed", M_economic=25.0, fee_assumption_id="fee-v1")
     assert matrix["interval_classification"] == \
         "INDETERMINATE_DATA_QUALITY", \
         "evidence gate must override identical economics"
+
+
+def test_arm_matrix_manifest_fail_closed():
+    # v3: M_economic / intervals / fee_assumption_id are REQUIRED — a
+    # missing value must never fall back to a silent default
+    from scripts.research.release_timing_a4 import reports as a4_reports
+    arms = {"Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0}
+    iv = {"Y0": (-310.0, -290.0), "Y1": (-55.0, -45.0),
+          "Y2": (-45.0, -35.0), "Y3": (95.0, 105.0)}
+    cases = [
+        {"M_economic": None, "fee_assumption_id": "fee-v1", "intervals": iv},
+        {"M_economic": 25.0, "fee_assumption_id": None, "intervals": iv},
+        {"M_economic": 25.0, "fee_assumption_id": "fee-v1",
+         "intervals": None},
+    ]
+    for kw in cases:
+        m = a4_reports.arm_matrix(arms=arms, evidence="ok", **kw)
+        assert m["interval_classification"] == "INDETERMINATE_DATA_QUALITY", kw
+        assert m.get("reason"), "fail-closed must carry a reason"
 
 
 def test_canonical_arm_mapping_explicit():
@@ -398,7 +422,7 @@ def test_arm_matrix_calls_canonical_classifier(monkeypatch):
         arms={"Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0},
         intervals={"Y0": (-310.0, -290.0), "Y1": (-55.0, -45.0),
                    "Y2": (-45.0, -35.0), "Y3": (95.0, 105.0)},
-        evidence="ok")
+        evidence="ok", M_economic=25.0, fee_assumption_id="fee-v1")
     assert calls, "arm_matrix must call the canonical classifier"
     assert calls[0]["data_quality"] == "ok"
-    assert calls[0]["M_economic"] == a4_reports.M_ECONOMIC_DEFAULT
+    assert calls[0]["M_economic"] == 25.0

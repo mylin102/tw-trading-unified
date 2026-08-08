@@ -239,6 +239,63 @@ def test_execution_close_side_prices():
     assert r["executable_prices"] == {"near": 99.0, "far": 51.0}, r
 
 
+def test_execution_age_fail_closed():
+    # v3: age missing / NaN / negative / timeout must NEVER be executable
+    from types import SimpleNamespace
+    good = dict(bid=50.0, ask=100.0, close_action="SHORT")
+    cases = [
+        {"near": SimpleNamespace(**good, age_s=None),
+         "far": SimpleNamespace(**good, age_s=1)},
+        {"near": SimpleNamespace(**good, age_s=float("nan")),
+         "far": SimpleNamespace(**good, age_s=1)},
+        {"near": SimpleNamespace(**good, age_s=-1),
+         "far": SimpleNamespace(**good, age_s=1)},
+        {"near": SimpleNamespace(**good, age_s=999),
+         "far": SimpleNamespace(**good, age_s=1)},
+    ]
+    for quotes in cases:
+        r = execution.executable_prices(
+            quotes, decision_ts="2026-08-08T10:00:00",
+            staleness_bounds={"max_age_s": 30})
+        assert r["tier"] != "EXECUTABLE_BBO", quotes
+        assert any(("age" in x) or ("stale" in x) for x in r["reasons"]), \
+            r["reasons"]
+
+
+def test_execution_close_action_fail_closed():
+    # v3: close_action not LONG/SHORT must NEVER be executable
+    from types import SimpleNamespace
+    good = dict(bid=50.0, ask=100.0, age_s=1)
+    for action in (None, "MARKET", "AUTO"):
+        quotes = {
+            "near": SimpleNamespace(**good, close_action="SHORT"),
+            "far": SimpleNamespace(**good, close_action=action),
+        }
+        r = execution.executable_prices(
+            quotes, decision_ts="2026-08-08T10:00:00",
+            staleness_bounds={"max_age_s": 30})
+        assert r["tier"] != "EXECUTABLE_BBO", (action, r["tier"])
+        assert any("close_action" in x for x in r["reasons"]), r["reasons"]
+
+
+def test_execution_leg_set_exact():
+    # v3: missing leg / extra leg / duplicate mapping are NEVER executable
+    from types import SimpleNamespace
+    good = dict(bid=50.0, ask=100.0, age_s=1, close_action="SHORT")
+    cases = [
+        {"near": SimpleNamespace(**good)},
+        {"near": SimpleNamespace(**good), "far": SimpleNamespace(**good),
+         "extra": SimpleNamespace(**good)},
+        {"near": SimpleNamespace(**good), "near2": SimpleNamespace(**good)},
+    ]
+    for quotes in cases:
+        r = execution.executable_prices(
+            quotes, decision_ts="2026-08-08T10:00:00",
+            staleness_bounds={"max_age_s": 30})
+        assert r["tier"] == "NOT_AVAILABLE", (quotes.keys(), r["tier"])
+        assert any("leg set" in x for x in r["reasons"]), r["reasons"]
+
+
 def test_threshold_sweep_overlap_contract():
     matrix = sweep.threshold_overlap(
         thresholds=[0, -100, -200],
