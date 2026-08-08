@@ -46,7 +46,8 @@ def adapt_fill(raw, source_ctx):
     return {"fill_type": ft, "trade_id": raw.get("trade_id"),
             "leg": str(raw.get("leg") or "").lower(),
             "contract": str(raw.get("contract") or "").lower(),
-            "side": side, "qty": qty, "ts_text": ts_text,
+            "side": side, "qty": qty, "price": raw.get("price"),
+            "ts_text": ts_text,
             "parsed_ts": _parse_ts(ts_text), "unit": "epoch_ms",
             **source_ctx}
 
@@ -241,17 +242,104 @@ def join_positions(fills, anchor_trade):
     return {"near": pos["near"], "far": pos["far"]}
 
 
-def join_entries(fills, anchor_trade):
+def join_entries(fills, anchor_trade, decision_ts_ms=None):
     """Per-leg ENTRY reference {near: {price, qty}, far: {price, qty}}
-    from the trade's ENTRY fills (price/qty required; missing/ambiguous
-    -> NOT_AVAILABLE, never inferred)."""
-    raise NotImplementedError("source_adapter.join_entries")
+    from the trade's ENTRY fills.
+
+    Aggregation contract (codex Step-1 review):
+    - MULTIPLE ENTRY fills per leg aggregate: qty = SUM(qty);
+      price = qty-WEIGHTED average of the fills' prices
+      (sum(price_i * qty_i) / sum(qty_i)) — the weighted formula is
+      explicit in the output
+    - each fill's source identity (source/record_no/byte_offset) +
+      source hash are preserved in the output
+    - price/qty missing -> NOT_AVAILABLE, never inferred
+    - temporal causality: every ENTRY fill must predate the anchor
+      decision (parsed_ts < decision) — violation -> NOT_AVAILABLE
+    """
+    entries = [f for f in (fills or [])
+               if f.get("fill_type") == "ENTRY"
+               and f.get("trade_id") == anchor_trade]
+    per_leg = {}
+    for f in entries:
+        leg = f.get("leg")
+        if leg not in ("near", "far"):
+            return ("NOT_AVAILABLE", f"entry leg invalid: {leg!r}")
+        price, qty = f.get("price"), f.get("qty")
+        if price is None or qty is None:
+            return ("NOT_AVAILABLE", f"{leg} entry price/qty missing")
+        try:
+            price = float(price)
+            qty = float(qty)
+        except (TypeError, ValueError):
+            return ("NOT_AVAILABLE", f"{leg} entry price/qty unparseable")
+        if qty <= 0:
+            return ("NOT_AVAILABLE", f"{leg} entry qty <= 0")
+        if decision_ts_ms is not None:
+            ts = f.get("parsed_ts")
+            if not _valid_epoch_ms(ts) or ts >= decision_ts_ms:
+                return ("NOT_AVAILABLE",
+                        f"{leg} entry not before decision (causality)")
+        per_leg.setdefault(leg, []).append({"price": price, "qty": qty,
+                                            "fill": f})
+    if set(per_leg) != {"near", "far"}:
+        return ("NOT_AVAILABLE",
+                f"entry legs incomplete: {sorted(per_leg)}")
+    out = {}
+    for leg in ("near", "far"):
+        fl = per_leg[leg]
+        total_qty = sum(x["qty"] for x in fl)
+        w_price = sum(x["price"] * x["qty"] for x in fl) / total_qty
+        out[leg] = {
+            "price": round(w_price, 8),
+            "qty": int(total_qty),
+            "weighted_formula": "sum(price_i*qty_i)/sum(qty_i)",
+            "fills": [_entry_fill_identity(x["fill"]) for x in fl],
+        }
+    return out
+
+
+def _entry_fill_identity(f):
+    return {"source": f.get("source"), "record_no": f.get("record_no"),
+            "byte_offset": f.get("byte_offset")}
 
 
 def release_leg(fills, anchor_trade):
     """The SINGLE-LEG release target from the trade's RELEASE fill leg.
-    Multiple RELEASE fills with inconsistent legs -> NOT_AVAILABLE."""
-    raise NotImplementedError("source_adapter.release_leg")
+
+    Reconciliation contract (codex Step-1 review):
+    - release fill identity + qty preserved; the release qty must
+      MATCH the released leg's position/entry qty (no partial/oversize
+      release) — mismatch -> NOT_AVAILABLE
+    - multiple RELEASE fills with inconsistent legs -> NOT_AVAILABLE;
+      no RELEASE fill -> NOT_AVAILABLE
+    """
+    rel = [f for f in (fills or [])
+           if f.get("fill_type") == "RELEASE"
+           and f.get("trade_id") == anchor_trade]
+    if not rel:
+        return ("NOT_AVAILABLE", "no RELEASE fill for trade")
+    legs = {f.get("leg") for f in rel}
+    if len(legs) != 1 or next(iter(legs)) not in ("near", "far"):
+        return ("NOT_AVAILABLE",
+                f"RELEASE fills span inconsistent legs: {sorted(legs)}")
+    leg = next(iter(legs))
+    try:
+        rel_qty = float(sum(float(f.get("qty") or 0) for f in rel))
+    except (TypeError, ValueError):
+        return ("NOT_AVAILABLE", "RELEASE qty unparseable")
+    if rel_qty <= 0:
+        return ("NOT_AVAILABLE", "RELEASE qty <= 0")
+    entries = join_entries(fills, anchor_trade)
+    if isinstance(entries, tuple):
+        return ("NOT_AVAILABLE",
+                f"cannot reconcile release qty: {entries[1]}")
+    if rel_qty != float(entries[leg]["qty"]):
+        return ("NOT_AVAILABLE",
+                f"release qty {rel_qty} != entry qty "
+                f"{entries[leg]['qty']} on {leg}")
+    return {"leg": leg, "qty": rel_qty,
+            "fills": [_entry_fill_identity(f) for f in rel]}
 
 
 def resolve_contract_mapping(records, mapping_input, decision_ts_ms):
@@ -501,6 +589,17 @@ def build_normalized_snapshot(input_paths, out_dir, mapping_input=None):
             refused.append({"trade_id": anchor.get("trade_id"),
                             "reason": str(positions[1])})
             continue
+        entries = join_entries(norm["fills"], anchor.get("trade_id"),
+                               decision_ts_ms)
+        if isinstance(entries, tuple):
+            refused.append({"trade_id": anchor.get("trade_id"),
+                            "reason": str(entries[1])})
+            continue
+        rel = release_leg(norm["fills"], anchor.get("trade_id"))
+        if isinstance(rel, tuple):
+            refused.append({"trade_id": anchor.get("trade_id"),
+                            "reason": str(rel[1])})
+            continue
         mapping = resolve_contract_mapping(
             [], mapping_input, decision_ts_ms)
         if isinstance(mapping, tuple):
@@ -509,6 +608,8 @@ def build_normalized_snapshot(input_paths, out_dir, mapping_input=None):
             continue
         ev = _build_event(anchor, positions, mapping, norm["quotes"],
                           params)
+        ev["entries"] = entries
+        ev["release_leg"] = rel["leg"]
         legs_ok = [ev["quotes"][l] for l in ("near", "far")
                    if ev["quotes"][l].get("available")]
         if len(legs_ok) == 2:
