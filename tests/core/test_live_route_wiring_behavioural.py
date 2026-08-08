@@ -16,9 +16,19 @@ Contracts:
   (centralized in shioaji_session — monitor must NOT re-implement it)
 """
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+
+STATE_CHANGING_ATTRS = ("place_order", "cancel_order", "update_order",
+                        "modify_order")
+
+
+def _repo_root():
+    return Path(__file__).resolve().parents[2]
 
 
 def _quarantined_ctx():
@@ -135,35 +145,48 @@ def test_order_manager_wrapper_gate_behaviour():
 
 
 def test_ast_inventory_strategy_package_scope():
-    # v3.1 #5: completeness tripwire over the MTS strategy package — every
-    # state-changing broker attr (place/cancel/update/modify) must sit in
-    # the explicit audited allowlist; NEW sites fail until audited
-    pkg = _repo_root() / "strategies" / "futures"
-    from collections import Counter
-    audited = Counter({
-        ("monitor.py", "place_order"): 3,      # 2707, 3847, 5208
-        ("monitor.py", "cancel_order"): 1,     # 2721
-        ("squeeze_futures/data/shioaji_client.py", "place_order"): 1,
-        ("squeeze_futures/data/shioaji_client.py", "update_order"): 1,
-        ("squeeze_futures/data/shioaji_client.py", "cancel_order"): 1,
-    })
-    found = Counter()
-    for py in sorted(pkg.rglob("*.py")):
-        rel = py.relative_to(pkg)
-        try:
-            tree = ast.parse(py.read_text(encoding="utf-8"))
-        except Exception:
-            continue
+    # v3.1 #5 (codex correction): EXACT (path, function, attr) inventory
+    # against the COMMITTED snapshot (git show HEAD:) — deterministic under
+    # concurrent working-tree edits; fail on ANY addition or changed
+    # qualification. No counting-only allowlist.
+    import subprocess
+
+    def _snapshot(rel):
+        return subprocess.check_output(
+            ["git", "show", f"HEAD:strategies/futures/{rel}"],
+            text=True, cwd=_repo_root())
+
+    def _sites(rel, src):
+        tree = ast.parse(src)
+        sites = []
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                    and node.func.attr in STATE_CHANGING_ATTRS:
-                found[(str(rel), node.func.attr)] += 1
-    unlisted = {k: found[k] for k in found if k not in audited}
-    count_delta = {k: (found.get(k, 0), audited.get(k, 0))
-                   for k in set(found) | set(audited) if found.get(k, 0) != audited.get(k, 0)}
-    assert not unlisted, f"unaudited state-changing broker sites: {unlisted}"
-    assert not count_delta, \
-        f"audited site-count drift (found, audited): {count_delta}"
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in STATE_CHANGING_ATTRS):
+                continue
+            enclosing = None
+            for fn in ast.walk(tree):
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and fn.lineno <= node.lineno <= getattr(fn, "end_lineno", node.lineno):
+                    enclosing = fn.name
+            sites.append((rel, enclosing, node.func.attr))
+        return sites
+
+    audited = {
+        ("monitor.py", "_place_safety_stop", "place_order"),
+        ("monitor.py", "_cancel_safety_stop", "cancel_order"),
+        ("monitor.py", "_submit_order_via_manager", "place_order"),
+        ("monitor.py", "_execute_trade", "place_order"),
+        ("squeeze_futures/data/shioaji_client.py", "place_order", "place_order"),
+        ("squeeze_futures/data/shioaji_client.py", "update_order", "update_order"),
+        ("squeeze_futures/data/shioaji_client.py", "cancel_order", "cancel_order"),
+    }
+    found = set()
+    for rel in ("monitor.py",
+                "squeeze_futures/data/shioaji_client.py"):
+        found |= set(_sites(rel, _snapshot(rel)))
+    assert found == audited, \
+        f"inventory drift (found={sorted(found)}, audited={sorted(audited)})"
 
 
 # ── (2) emergency (v3.1): BLOCKED under quarantine this phase; the future
