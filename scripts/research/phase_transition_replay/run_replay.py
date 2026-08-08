@@ -245,3 +245,7 @@ def main(argv=None):
               encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, sort_keys=True, ensure_ascii=False)
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
