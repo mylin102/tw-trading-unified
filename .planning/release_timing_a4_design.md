@@ -80,6 +80,28 @@ safety escape / R3 deterministic bounded progression / pending
 conflict+data quality / metric attribution 分離 / theta sweep 無
 selection / evidence tier+manifest。
 
+
+## 11. v2 修訂（codex 2026-08-08 — docs + RED only, 不授權實作）
+
+(a) **clone schema 完整欄位**: positions / policy peak / guard warmup+armed /
+    ATR+reference prices / pending candidates+orders / quote freshness /
+    controller / lifecycle / cooldown / **strategy generation** /
+    config version; 任一無法重建 → NOT_AVAILABLE; **clone 點 = breach 前
+    一個 event**（非 actual-release future state）
+(b) **immutable stream manifest**: source_event_seq / exchange_ts / recv_ts /
+    replay_seq / stream hash / clock ordering; **四分支共用同一 stream 與
+    derived bars**
+(c) **safety escape = terminal decision**: 觸發後 R3 不得 continue
+(d) **theta 依 metric 分別預註冊**, units/rationale 明確（no ex-post
+    selection）
+(e) **ex-post forward outcome 與可部署 decision rule 分離**; R0-R3 決策
+    不得用未來資訊（causal only）
+(f) **report 複用 phase-transition 契約**: 四 absolute Y / 六 pairwise
+    delta / interval dominance / evidence-first classifier（禁 ad hoc
+    metric stack）
+(g) **0/-100/-200 = nested sensitivity**（overlapping subsets）, 非選最好
+    門檻
+
 ## 10. 交付順序
 
 1. 本設計 + skeletal package + RED matrix（本輪）→ codex 審查 →
