@@ -238,8 +238,9 @@ def test_no_last_price_ohlc_conversion():
 def test_join_anchor_legal_same_trade():
     fills = [{"trade_id": "t1", "leg": "near", "fill_type": "RELEASE"}]
     events = [{"trade_id": "t1", "kind": "RELEASE_DECISION", "order_id": "o1"}]
-    anchor = join_anchor(fills, events)
-    assert anchor is not None
+    anchors = join_anchor(fills, events)
+    assert isinstance(anchors, list) and len(anchors) == 1, anchors
+    assert anchors[0]["trade_id"] == "t1"
 
 
 def test_join_anchor_ambiguous_rejected():
@@ -367,3 +368,68 @@ def test_build_unknown_fill_type_counted(tmp_path):
     manifest = json.loads(
         (out / "manifest.json").read_text(encoding="utf-8"))
     assert manifest.get("unknown_fill_types") == {"HEDGE": 1}, manifest
+
+
+def test_build_multiple_anchors_multiple_events(tmp_path):
+    # v3: EVERY legal anchor -> one output event; BBO keep/censor counted
+    lines = [
+        '{"fill_type": "ENTRY", "timestamp": "2026-08-08T08:00:00.000", '
+        '"leg": "near", "contract": "NEAR", "side": "LONG", "qty": 2, '
+        '"trade_id": "t2"}',
+        '{"fill_type": "ENTRY", "timestamp": "2026-08-08T08:00:01.000", '
+        '"leg": "far", "contract": "FAR", "side": "SHORT", "qty": 2, '
+        '"trade_id": "t2"}',
+        '{"fill_type": "RELEASE", "timestamp": "2026-08-08T09:00:02.000", '
+        '"leg": "near", "contract": "NEAR", "side": "SHORT", "qty": 2, '
+        '"trade_id": "t2"}',
+        '{"fill_type": "ENTRY", "timestamp": "2026-08-08T09:00:00.000", '
+        '"leg": "near", "contract": "NEAR", "side": "LONG", "qty": 2, '
+        '"trade_id": "t1"}',
+        '{"fill_type": "ENTRY", "timestamp": "2026-08-08T09:00:01.000", '
+        '"leg": "far", "contract": "FAR", "side": "SHORT", "qty": 2, '
+        '"trade_id": "t1"}',
+        '{"fill_type": "RELEASE", "timestamp": "2026-08-08T10:00:02.000", '
+        '"leg": "near", "contract": "NEAR", "side": "SHORT", "qty": 2, '
+        '"trade_id": "t1"}',
+    ]
+    fills = tmp_path / "fills.jsonl"
+    fills.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    evs = tmp_path / "events.jsonl"
+    evs.write_text(
+        '{"event": "ORDER_SUBMITTED", "ts": "2026-08-08T09:00:00.000", '
+        '"trade_id": "t2", "order_id": "o2", "strategy": "MTS_RELEASE"}\n'
+        '{"event": "ORDER_SUBMITTED", "ts": "2026-08-08T10:00:00.000", '
+        '"trade_id": "t1", "order_id": "o1", "strategy": "MTS_RELEASE"}\n',
+        encoding="utf-8")
+    bbo = tmp_path / "bbo.jsonl"
+    # BBO at 09:06:40Z (1786180000000) — pre-anchor for t1 (10:00Z),
+    # AFTER t2 (09:00Z) -> t2 censored
+    bbo.write_text(
+        '{"event_type": "BBO_UPDATE", "leg": "NEAR", '
+        '"contract_code": "TMFH6", "exchange_ts_ms": 1786180000000.0, '
+        '"receive_ts_ms": 1786180000050.0, "source": "shioaji_bidask", '
+        '"bid": 50.0, "ask": 100.0}\n'
+        '{"event_type": "BBO_UPDATE", "leg": "FAR", '
+        '"contract_code": "TMFI6", "exchange_ts_ms": 1786180000500.0, '
+        '"receive_ts_ms": 1786180000550.0, "source": "shioaji_bidask", '
+        '"bid": 25.0, "ask": 50.0}\n', encoding="utf-8")
+    out = tmp_path / "out"
+    result = build_normalized_snapshot(
+        [str(fills), str(evs), str(bbo)], str(out),
+        mapping_input=MAPPING_V1)
+    assert isinstance(result, list), result
+    assert len(result) == 2, \
+        "every legal anchor must produce an output event"
+    trades = [ev["contract_mapping_evidence"]["decision_ts_ms"]
+              for ev in result]
+    assert len(set(trades)) == 2
+    # t1 (10:00 decision) has pre-anchor BBO -> kept
+    kept = sum(1 for ev in result for leg in ("near", "far")
+               if ev["quotes"][leg].get("available") is True)
+    censored = sum(1 for ev in result for leg in ("near", "far")
+                   if ev["quotes"][leg].get("available") is False)
+    assert kept == 2, f"t1 quotes kept, got {kept}"
+    assert censored == 2, f"t2 no-BBO censored, got {censored}"
+    manifest = json.loads(
+        (out / "manifest.json").read_text(encoding="utf-8"))
+    assert len(manifest["event_map"]) == 2, manifest["event_map"]
