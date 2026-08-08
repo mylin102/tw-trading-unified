@@ -37,6 +37,22 @@ def test_installed_sdk_price_type_enum():
         assert hasattr(sj.FuturesPriceType, name)
 
 
+def test_adapter_must_use_non_deprecated_sj_enums():
+    # three-line correction (B): sj.Order construction must use the current
+    # non-deprecated enums (sj.OrderType / sj.FuturesPriceType), not
+    # sj.constant.* — the adapter currently uses sj.constant.OrderType.MTL
+    import re
+    from pathlib import Path
+    adapter = Path(__file__).resolve().parents[2] / "strategies" / "futures" \
+        / "squeeze_futures" / "data" / "shioaji_client.py"
+    text = adapter.read_text(encoding="utf-8")
+    assert "sj.OrderType" in text or "OrderType.ROD" in text or \
+        "OrderType.IOC" in text or "OrderType.FOK" in text, \
+        "adapter must construct sj.Order with non-deprecated sj enums"
+    assert "sj.constant.OrderType" not in text, \
+        "sj.constant.OrderType (deprecated + MTL bug) must be gone"
+
+
 # ── recording api (no real broker I/O) ──────────────────────────────────────
 
 class RecordingApi:
@@ -128,18 +144,20 @@ def test_limit_order_keeps_lmt_rod():
 # ── failures emit a structured reason, never ambiguous None ─────────────────
 
 def test_order_build_failure_emits_structured_reason():
-    # RED: a construction failure must surface a structured,
-    # order-manager-visible failure reason — the current adapter swallows
-    # and returns None
+    # three-line correction (B): a construction failure must raise a typed
+    # AdapterOrderError with a stable code + context — the current adapter
+    # swallows and returns None
     api = RecordingApi()
     api.fail_order_build = True
     c = _adapter(api)
     with pytest.raises(Exception) as ei:
         c.place_order(_CONTRACT, "BUY", 1, price=0)
-    assert "adapter" in type(ei.value).__module__ or \
-        "Order" in type(ei.value).__name__ or \
-        "Failure" in type(ei.value).__name__, \
+    assert type(ei.value).__name__ == "AdapterOrderError", \
         f"structured adapter failure expected: {ei.value!r}"
+    assert getattr(ei.value, "code", None), \
+        "AdapterOrderError must carry a stable code"
+    assert getattr(ei.value, "context", None), \
+        "AdapterOrderError must carry context (method/contract/order)"
     assert not api.calls, "no broker I/O on build failure"
 
 
@@ -149,6 +167,8 @@ def test_place_api_failure_emits_structured_reason():
     c = _adapter(api)
     with pytest.raises(Exception) as ei:
         c.place_order(_CONTRACT, "BUY", 1, price=0)
+    assert type(ei.value).__name__ == "AdapterOrderError"
+    assert getattr(ei.value, "code", None)
     assert not api.calls or api.calls[0][0] == "place_order"
 
 
@@ -166,6 +186,52 @@ def test_cancel_failure_emits_structured_reason():
     c = _adapter(api)
     with pytest.raises(Exception):
         c.cancel_order(SimpleNamespace(ts=1))
+
+
+def _adapter_error():
+    from strategies.futures.squeeze_futures.data.shioaji_client import (
+        AdapterOrderError)
+    return AdapterOrderError(
+        code="ADAPTER_ORDER_PLACE_FAILED",
+        context={"method": "place_order", "contract": "TMFH6"})
+
+
+def _monitor_with_raising_client(err):
+    from strategies.futures.monitor import FuturesMonitor
+    m = FuturesMonitor.__new__(FuturesMonitor)
+    m.live_trading = True
+    m.dry_run = False
+    m.contract = SimpleNamespace(code="TMFH6")
+    m._use_order_manager = False
+    m.trader = SimpleNamespace(position=1, entry_price=0.0,
+                               point_value=1, fee_per_side=0,
+                               exchange_fee_per_side=0, tax_rate=0)
+
+    class _RaisingClient:
+        def __init__(self, e):
+            self.e = e
+
+        def place_order(self, *a, **k):
+            raise self.e
+
+    m.client = _RaisingClient(err)
+    m.api = SimpleNamespace(cancel_order=lambda *a, **k: None)
+    return m
+
+
+def test_caller_records_durable_failure():
+    # three-line correction (B): the durable event/order-manager
+    # propagation is CALLER-owned — the monitor routes must catch
+    # AdapterOrderError and record a durable, order-manager-visible
+    # failure event (not merely propagate, not swallow)
+    m = _monitor_with_raising_client(_adapter_error())
+    try:
+        m._execute_trade("EXIT", 44300, "2026-08-08T10:00:00", 1,
+                         reason="TEST")
+    except Exception:
+        pass
+    assert getattr(m, "_last_order_failure", None) is not None, \
+        "caller must record a durable failure event (order-manager-visible)"
 
 
 # ── PAPER unchanged / no real order ─────────────────────────────────────────
