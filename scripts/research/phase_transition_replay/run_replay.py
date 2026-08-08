@@ -103,8 +103,9 @@ def _validate_event(ev):
         v = ev.get(f)
         if not isinstance(v, int) or v <= 0:
             return False, f"ordering field {f} missing/invalid: {v!r}"
-    if not isinstance(ev.get("decision_ts_ms"), int) or ev["decision_ts_ms"] <= 0:
-        return False, f"decision_ts_ms invalid: {ev.get('decision_ts_ms')!r}"
+    if not execution.validate_epoch_ms(ev.get("decision_ts_ms")):
+        return False, (f"decision_ts_ms invalid epoch-ms: "
+                       f"{ev.get('decision_ts_ms')!r}")
     quotes = ev.get("quotes")
     if not isinstance(quotes, dict) or set(quotes) != {"near", "far"}:
         return False, f"quotes must be exactly near/far: {quotes!r}"
@@ -220,6 +221,9 @@ def main(argv=None):
             "fee_assumptions": params["fee_assumptions"],
             "staleness": params["staleness"],
             "max_pair_skew_ms": params["max_pair_skew_ms"],
+            "timestamp_unit": params["timestamp_unit"],
+            "timestamp_validator_version": params[
+                "timestamp_validator_version"],
             "config_version": params["config_version"],
             "classifier": params["classifier"],
         },

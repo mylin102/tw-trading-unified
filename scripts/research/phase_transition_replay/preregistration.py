@@ -26,6 +26,8 @@ PREREGISTRATION = {
         },
         "staleness": {"max_age_s": 30},
         "max_pair_skew_ms": 1000,
+        "timestamp_unit": "epoch_ms",
+        "timestamp_validator_version": "v1",
         "config_version": "research-v1",
         "classifier": "frozen-precedence-2026-08-08",
     }

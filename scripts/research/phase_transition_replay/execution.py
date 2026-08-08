@@ -19,6 +19,22 @@ from types import SimpleNamespace
 
 EXPECTED_LEGS = ("near", "far")
 
+# strict epoch-ms domain (v6.1): covers 2014-05-13 .. 2049-04-16 in ms;
+# seconds (~1e9), microseconds (~1e15) and nanoseconds (~1e18) fall outside
+EPOCH_MS_MIN = 1_400_000_000_000
+EPOCH_MS_MAX = 2_500_000_000_000
+
+
+def validate_epoch_ms(v):
+    """Strict epoch-ms validator.
+    Rejects bool (an int subclass), non-ints, and any value outside the
+    plausible epoch-ms range — seconds/microseconds/nanoseconds scales
+    cannot pass. Returns bool.
+    """
+    if isinstance(v, bool) or not isinstance(v, int):
+        return False
+    return EPOCH_MS_MIN <= v <= EPOCH_MS_MAX
+
 
 def _normalize_quote(q):
     """dict -> SimpleNamespace (JSON input support); others pass through."""
@@ -81,8 +97,9 @@ def _pair_sync(quotes_norm, decision_ts_ms, max_pair_skew_ms):
     ts = {}
     for side in EXPECTED_LEGS:
         t = _get(quotes_norm[side], "quote_exchange_ts")
-        if not isinstance(t, int) or t <= 0:
-            return False, f"{side} quote_exchange_ts invalid: {t!r}", None
+        if not validate_epoch_ms(t):
+            return False, (f"{side} quote_exchange_ts invalid epoch-ms: "
+                           f"{t!r}"), None
         ts[side] = t
     if decision_ts_ms is not None:
         for side, t in ts.items():
