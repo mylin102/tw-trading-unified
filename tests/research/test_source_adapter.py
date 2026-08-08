@@ -262,3 +262,108 @@ def test_output_no_replace_atomic(tmp_path):
     result = build_normalized_snapshot([], str(tmp_path))
     assert isinstance(result, tuple) and result[0] == "REFUSED", result
     assert (tmp_path / "events.json").read_text(encoding="utf-8") == "OLD"
+
+
+# ── integration: runner-compatible event LIST pipeline ───────────────────────
+
+MAPPING_V1 = {"windows": [
+    {"valid_from_ms": 1_700_000_000_000,
+     "valid_to_ms": 1_800_000_000_000,
+     "near": "TMFH6", "far": "TMFI6", "version": "map-v1"}]}
+
+
+def _fixture_sources(tmp_path, with_bbo=True, unknown_type=None):
+    lines = [
+        '{"fill_type": "ENTRY", "timestamp": "2026-08-08T09:00:00.000", '
+        '"leg": "near", "contract": "NEAR", "side": "LONG", "qty": 2, '
+        '"trade_id": "t1"}',
+        '{"fill_type": "ENTRY", "timestamp": "2026-08-08T09:00:01.000", '
+        '"leg": "far", "contract": "FAR", "side": "SHORT", "qty": 2, '
+        '"trade_id": "t1"}',
+        '{"fill_type": "RELEASE", "timestamp": "2026-08-08T10:00:02.000", '
+        '"leg": "near", "contract": "NEAR", "side": "SHORT", "qty": 2, '
+        '"trade_id": "t1"}',
+    ]
+    if unknown_type:
+        lines.append('{"fill_type": "%s", "timestamp": '
+                     '"2026-08-08T10:00:03.000", "trade_id": "t9"}'
+                     % unknown_type)
+    fills = tmp_path / "fills.jsonl"
+    fills.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    evs = tmp_path / "events.jsonl"
+    evs.write_text('{"event": "RELEASE_DECISION", "ts": '
+                   '"2026-08-08T10:00:00.000", "trade_id": "t1", '
+                   '"order_id": "o1"}\n', encoding="utf-8")
+    bbo = tmp_path / "bbo.jsonl"
+    if with_bbo:
+        bbo.write_text(
+            '{"event_type": "BBO_UPDATE", "leg": "near", '
+            '"contract_code": "TMFH6", "exchange_ts_ms": 1785000000000, '
+            '"receive_ts_ms": 1785000000050, "source": "shioaji_bidask", '
+            '"bid": 50.0, "ask": 100.0}\n'
+            '{"event_type": "BBO_UPDATE", "leg": "far", '
+            '"contract_code": "TMFI6", "exchange_ts_ms": 1785000000500, '
+            '"receive_ts_ms": 1785000000550, "source": "shioaji_bidask", '
+            '"bid": 25.0, "ask": 50.0}\n', encoding="utf-8")
+    else:
+        bbo.write_text("", encoding="utf-8")
+    return fills, evs, bbo
+
+
+def test_build_emits_runner_compatible_list(tmp_path):
+    fills, evs, bbo = _fixture_sources(tmp_path)
+    out = tmp_path / "out"
+    result = build_normalized_snapshot(
+        [str(fills), str(evs), str(bbo)], str(out),
+        mapping_input=MAPPING_V1)
+    assert isinstance(result, list), result
+    ev = result[0]
+    assert {"source_event_seq", "exchange_ts", "recv_ts",
+            "decision_ts_ms"} <= set(ev), ev
+    assert set(ev["quotes"]) == {"near", "far"}, ev
+
+
+def test_build_attaches_mapping_positions_bbo(tmp_path):
+    fills, evs, bbo = _fixture_sources(tmp_path)
+    out = tmp_path / "out"
+    result = build_normalized_snapshot(
+        [str(fills), str(evs), str(bbo)], str(out),
+        mapping_input=MAPPING_V1)
+    ev = result[0]
+    assert ev["contracts"] == {"near": "TMFH6", "far": "TMFI6"}, ev
+    near = ev["quotes"]["near"]
+    far = ev["quotes"]["far"]
+    assert near.get("available") is True, near
+    assert far.get("available") is True, far
+    assert near["close_action"] == "LONG", \
+        "near close_action from ENTRY LONG position"
+    assert far["close_action"] == "SHORT", \
+        "far close_action from ENTRY SHORT position"
+    assert near["bid"] == 50.0 and far["ask"] == 50.0
+    assert near["quote_exchange_ts"] <= ev["decision_ts_ms"]
+
+
+def test_build_no_bbo_censored(tmp_path):
+    fills, evs, bbo = _fixture_sources(tmp_path, with_bbo=False)
+    out = tmp_path / "out"
+    result = build_normalized_snapshot(
+        [str(fills), str(evs), str(bbo)], str(out),
+        mapping_input=MAPPING_V1)
+    assert isinstance(result, list), result
+    for leg in ("near", "far"):
+        q = result[0]["quotes"][leg]
+        assert isinstance(q, dict) and q.get("available") is False, q
+        assert q.get("reason"), "no-BBO must be explicit, never fake"
+
+
+def test_build_unknown_fill_type_counted(tmp_path):
+    fills, evs, bbo = _fixture_sources(
+        tmp_path, unknown_type="HEDGE")
+    out = tmp_path / "out"
+    result = build_normalized_snapshot(
+        [str(fills), str(evs), str(bbo)], str(out),
+        mapping_input=MAPPING_V1)
+    assert isinstance(result, list), result
+    manifest = json.loads(
+        (out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest.get("unknown_fill_types") == {"HEDGE": 1}, manifest
