@@ -218,6 +218,9 @@ class ShioajiClient:
         # LMT + ROD. octype is set EXPLICITLY to Auto (broker determines
         # New/Cover from position) — never rely on SDK defaults.
         # Non-deprecated sj.OrderType/sj.FuturesPriceType/sj.Action used.
+        # Terminal failure/rejection semantics (fix-forward): a None API
+        # return is ADAPTER_ORDER_NO_TRADE; a trade with terminal status
+        # Failed/Rejected is ADAPTER_ORDER_REJECTED — zero silent failures.
         if not self.is_logged_in:
             return None
         try:
@@ -232,9 +235,17 @@ class ShioajiClient:
                 account=self.api.futopt_account,
             )
             trade = self.api.place_order(contract, order)
+            if trade is None:
+                raise AdapterOrderError(
+                    code="ADAPTER_ORDER_NO_TRADE",
+                    context={"method": "place_order",
+                             "contract": getattr(contract, "code", None),
+                             "action": action, "quantity": quantity,
+                             "price": price,
+                             "reason": "api returned no trade"})
             # never return a rejected/failed trade as success
             _status = getattr(getattr(trade, "status", None), "status", None)
-            if _status is not None and str(_status) == "Failed":
+            if _status is not None and str(_status) in ("Failed", "Rejected"):
                 raise AdapterOrderError(
                     code="ADAPTER_ORDER_REJECTED",
                     context={"method": "place_order",
@@ -257,8 +268,16 @@ class ShioajiClient:
         if not self.is_logged_in:
             return False
         try:
-            self.api.update_order(trade, price=price, qty=quantity)
-            return True
+            result = self.api.update_order(trade, price=price, qty=quantity)
+            if result is None:
+                raise AdapterOrderError(
+                    code="ADAPTER_ORDER_NO_TRADE",
+                    context={"method": "update_order", "price": price,
+                             "quantity": quantity,
+                             "reason": "api returned no result"})
+            return result is not False
+        except AdapterOrderError:
+            raise
         except Exception as e:
             logger.error(f"Update order failed: {e}")
             raise AdapterOrderError(
@@ -270,8 +289,15 @@ class ShioajiClient:
         if not self.is_logged_in:
             return False
         try:
-            self.api.cancel_order(trade)
-            return True
+            result = self.api.cancel_order(trade)
+            if result is None:
+                raise AdapterOrderError(
+                    code="ADAPTER_ORDER_NO_TRADE",
+                    context={"method": "cancel_order",
+                             "reason": "api returned no result"})
+            return result is not False
+        except AdapterOrderError:
+            raise
         except Exception as e:
             logger.error(f"Cancel order failed: {e}")
             raise AdapterOrderError(
