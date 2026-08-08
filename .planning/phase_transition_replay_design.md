@@ -74,24 +74,30 @@ quality+reconciliation status。
 
 ## 7. 因果分類（#25-5 + final refinement, predeclared, mutually exclusive）
 
-**Pairwise execution-uncertainty bounds（U_δ(i,j)）**:
-- M_ij = max(M_economic, U_delta(i,j)) — materiality 量的是**兩路徑 PnL 差**
-  的不確定度; **shared costs 相消**（不重複計入）
-- family max 比較: 採用 **conservative bound across applicable winner
-  comparisons**（或 interval dominance lower/upper bounds）— 實作時
-  擇一並文件化; 禁 generic ungrounded M
+**Interval dominance（freeze-classifier amendment 2026-08-08）**:
+- 每個 Yi **NET of path-specific deterministic fees/tax**; interval
+  [Li,Ui] = **residual execution uncertainty ONLY**（成本不重複計入）
+- F_N = [max(L1,L2), max(U1,U2)]; F_R = [max(L0,L3), max(U0,U3)]
+- HARMFUL iff `lower(F_N) − upper(F_R) > M_economic`; BENEFICIAL iff 反向;
+  overlap → neutral
+- MANAGEMENT_BAD（conservative）: `lower(Y3) − upper(Y0) > M_economic`
+  AND `lower(Y3) >= upper(F_N) − M_economic`
+- **M_economic = preregistered minimum economic decision benefit**
+  （fees/tax 已在 Yi 內, 不重加）
+- pairwise U_δ(i,j) 保留（M_ij = max(M_economic, U_δ); shared costs 相消）
 
 **Frozen precedence**:
-1. data gate → INDETERMINATE（最優先）
-2. MANAGEMENT_BAD first iff `Y3−Y0 > M_30 AND Y3 >= max(Y1,Y2) − M_3no_release`
-3. HARMFUL iff `max(Y1,Y2) − max(Y0,Y3) > M_family`
-4. BENEFICIAL iff 反向 `> M_family`
-5. INCONCLUSIVE_NEUTRAL（差異 ≤ M — 強制類別）
+1. evidence gate → INDETERMINATE（最優先, 壓過一切經濟分類）
+2. MANAGEMENT_BAD（保守式, 見上）
+3. HARMFUL（F_N/F_R interval dominance）
+4. BENEFICIAL（反向）
+5. INCONCLUSIVE_NEUTRAL（overlap / ≤ M — 強制類別）
 
 Y0=atomic, Y1=remain-SPREAD, Y2=actual, Y3=release+managed。
-MANAGEMENT_BAD 是 release family 不劣但 actual management 實質較差時的
-**更細標籤**（測試: Y3 使 release family beneficial 但 precedence 判
-MANAGEMENT_BAD; shared-cost cancellation; pair-specific uncertainty）。
+RED boundary tests（獨立 collection, 不 skip）: shared cost 完全相消 /
+單一路徑多一腿成本 / family winner 在 intervals 下翻轉 / threshold 相等
+→ neutral / management+beneficial overlap precedence / evidence gate
+壓過一切。
 
 ## 8. Conditional time stops（#25-4）
 
