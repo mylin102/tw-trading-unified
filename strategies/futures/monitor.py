@@ -2760,6 +2760,14 @@ class FuturesMonitor:
         """Cancel the exchange-side safety stop after normal exit."""
         if not self._safety_stop_trade or not self.api:
             return
+        # [Live wiring Step 3] execution-context gate: QUARANTINED/PREFLIGHT
+        # makes ZERO cancel_order calls and returns a structured blocked
+        # reason (audit); only LIVE_READY reaches the broker.
+        _ctx = getattr(self, "_execution_context", None)
+        if _ctx is not None and not _ctx.is_live_ready():
+            return {"blocked": True, "reason": "LIVE_QUARANTINED",
+                    "audit_reasons": tuple(
+                        getattr(_ctx, "audit_reasons", ()) or ())}
         try:
             self.api.cancel_order(self._safety_stop_trade)
             console.print("[dim]🛡️ Safety stop cancelled[/dim]")
