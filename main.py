@@ -690,6 +690,64 @@ def verify_startup_reconciliation(api) -> bool:
     return True
 
 
+def _quarantine_for_handoff(monitors, reason="RECONNECT_HANDOFF"):
+    """[Live wiring Step 5] atomic handoff: quarantine EVERY execution
+    context BEFORE any re-login/wait — zero order calls during the
+    reconnect window (the per-route gates block on the quarantined ctx).
+    Explicit audit reason, fail-closed."""
+    from core.mode_transition import ModeTransitionState, with_effective_mode
+    for m in monitors or []:
+        ctx = getattr(m, "_execution_context", None)
+        if ctx is None:
+            continue
+        m._execution_context = with_effective_mode(
+            ctx, ModeTransitionState.LIVE_QUARANTINED.value,
+            live_order_allowed=False,
+            audit_reasons=(reason,) + tuple(
+                getattr(ctx, "audit_reasons", ()) or ()))
+
+
+def _reconnect_monitors(fm):
+    """Normalize fm to a list of monitors (the call site passes a list)."""
+    if fm is None:
+        return []
+    return fm if isinstance(fm, (list, tuple)) else [fm]
+
+
+def _recertify_after_reconnect(mon, api):
+    """After a successful resubscribe the certificate-required transition
+    MAY proceed: fresh certify -> transition_with_certificate. Any
+    failure leaves the context LIVE_QUARANTINED with an explicit reason —
+    orders stay blocked until a successful recertification."""
+    from core.live_route_certificate import (
+        CertificateIssuer, build_runtime_certification_context, certify_route,
+        transition_with_certificate)
+    from core.mode_transition import ModeTransitionState, with_effective_mode
+    cfg_path = getattr(mon, "config_path", None)
+    if cfg_path is None:
+        return False
+    try:
+        issuer = CertificateIssuer()
+        cert, failures = certify_route(
+            api, process_start_id=f"monitor-{os.getpid()}",
+            issuer=issuer, config_path=cfg_path)
+        if cert is None:
+            mon._execution_context = with_effective_mode(
+                mon._execution_context,
+                ModeTransitionState.LIVE_QUARANTINED.value,
+                live_order_allowed=False,
+                audit_reasons=tuple(failures) or ("RECERTIFY_FAILED",))
+            return False
+        runtime = build_runtime_certification_context(
+            api, cfg_path,
+            {"process_state": {"process_start_id": f"monitor-{os.getpid()}"}})
+        mon._execution_context = transition_with_certificate(
+            mon._execution_context, cert, issuer, runtime=runtime)
+        return bool(mon._execution_context.is_live_ready())
+    except Exception:
+        return False
+
+
 def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
     """Attempt in-process Shioaji re-login + re-subscribe after data stagnation.
 
@@ -698,6 +756,7 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
     caller should exit for PM2 restart.
 
     Strategy:
+    0. ATOMIC HANDOFF: quarantine all execution contexts BEFORE re-login
     1. If Shioaji event callback already detected drop (code 12), wait for it
     2. Otherwise, attempt full re-login
     3. On network failure, wait with backoff before giving up
@@ -707,12 +766,21 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
 
     global _connection_dropped
 
+    mons = _reconnect_monitors(fm)
+    _om_mon = getattr(om, "monitor", None) if om is not None else None
+    handoff_targets = mons + ([_om_mon] if _om_mon is not None else [])
+
+    # ── Phase 0: quarantine BEFORE any re-login/wait (Step 5) ──
+    _quarantine_for_handoff(handoff_targets)
+
     # ── Phase 1: Shioaji auto-reconnect already in progress ──
     if _connection_dropped:
         console.print("[yellow]⏳ Shioaji auto-reconnect (code 12) in progress — waiting 30s...[/yellow]")
         time.sleep(30)
         if not _connection_dropped:
             console.print("[green]✅ Shioaji auto-reconnect completed[/green]")
+            for m in mons:
+                _recertify_after_reconnect(m, api)
             return True
         console.print("[yellow]⚠️ Shioaji auto-reconnect still pending — attempting manual re-login[/yellow]")
 
@@ -725,6 +793,7 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
 
     if not api_key or not secret_key:
         console.print("[red]❌ Missing API credentials — cannot reconnect[/red]")
+        _quarantine_for_handoff(handoff_targets, reason="RECONNECT_LOGIN_FAILED")
         return False
 
     for attempt in range(3):
@@ -733,13 +802,20 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
             safe_login(api, api_key, secret_key, contracts_timeout=10000)
             console.print("[green]✅ Shioaji re-login successful[/green]")
 
-            # Re-subscribe all contracts
-            if fm and fm.contract:
-                api.quote.subscribe(fm.contract, quote_type='tick')
-                console.print(f"[dim]📡 Re-subscribed: {fm.contract.code}[/dim]")
-            if fm and fm.far_contract:
-                api.quote.subscribe(fm.far_contract, quote_type='tick')
-                console.print(f"[dim]📡 Re-subscribed far: {fm.far_contract.code}[/dim]")
+            # Re-subscribe all contracts (per monitor; near + far)
+            for m in mons:
+                if getattr(m, "contract", None):
+                    api.quote.subscribe(m.contract, quote_type='tick')
+                    console.print(f"[dim]📡 Re-subscribed: {m.contract.code}[/dim]")
+                if getattr(m, "far_contract", None):
+                    try:
+                        api.quote.subscribe(m.far_contract, quote_type='tick')
+                        console.print(f"[dim]📡 Re-subscribed far: {m.far_contract.code}[/dim]")
+                    except Exception as _fexc:
+                        console.print(f"[red]❌ Far resubscribe failed: {_fexc} — QUARANTINED[/red]")
+                        _quarantine_for_handoff(handoff_targets,
+                                                reason="FAR_RESUBSCRIBE_FAILED")
+                        return False
             if om:
                 for key in ["MTX", "C", "P"]:
                     con = om.monitor.active_contracts.get(key)
@@ -754,6 +830,9 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
             # tick_dispatcher is defined in the outer scope — we pass None for now,
             # the existing callbacks should still be wired
             _connection_dropped = False
+            # post-success: recertification MAY proceed (Step 5)
+            for m in mons:
+                _recertify_after_reconnect(m, api)
             return True
 
         except Exception as e:
@@ -764,6 +843,7 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
                 time.sleep(wait)
 
     console.print("[red]❌ All re-login attempts failed — network may be down[/red]")
+    _quarantine_for_handoff(handoff_targets, reason="RECONNECT_LOGIN_FAILED")
     return False
 
 
