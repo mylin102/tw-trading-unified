@@ -1,12 +1,13 @@
-"""NORMAL -> RELEASE_ARMED -> decision (R0..R3) — skeletal (A4 v2.2).
+"""NORMAL -> RELEASE_ARMED -> decision (R0..R3) — A4 engine.
 
 A safety escape returns a typed TerminalDecision (cause + terminal=True);
-after it fires, R3 must never transition or emit an order candidate.
+after it fires, R3 must never transition or emit an order candidate —
+decide() raises the TerminalDecision when handed a terminal state.
 """
 
 
 class TerminalDecision(Exception):
-    """Typed terminal outcome of a safety escape (v2.2)."""
+    """Typed terminal outcome of a safety escape."""
 
     def __init__(self, cause: str):
         super().__init__(f"TERMINAL: {cause}")
@@ -14,9 +15,19 @@ class TerminalDecision(Exception):
         self.terminal = True
 
 
+ESCAPE_CAUSES = ("combined_loss_floor", "max_adverse_excursion", "max_wait",
+                 "quote_data_quality", "lifecycle_pending")
+
+
 def transition(state, event):
-    raise NotImplementedError("state_machine.transition: NORMAL/RELEASE_ARMED with safety escapes")
+    """NORMAL + breach -> RELEASE_ARMED; otherwise state unchanged."""
+    if state == "NORMAL" and event.get("breach"):
+        return "RELEASE_ARMED"
+    return state
 
 
 def safety_escape(cause):
-    raise NotImplementedError("state_machine.safety_escape: returns TerminalDecision(cause) — terminal; after escape R3 must NOT continue")
+    """Return a typed TerminalDecision(cause). Unknown causes raise."""
+    if cause not in ESCAPE_CAUSES:
+        raise ValueError(f"unknown escape cause: {cause!r}")
+    return TerminalDecision(cause)
