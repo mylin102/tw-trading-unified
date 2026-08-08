@@ -272,6 +272,21 @@ def test_registry_identity_mismatch_returns_none():
     assert reg.generation(api) is None, "identity mismatch must invalidate"
 
 
+def test_unregister_forged_entry_not_removed():
+    # round-11 #4: an entry whose api is NOT the caller belongs to another
+    # object — unregister must verify identity BEFORE removing anything
+    reg = SessionRegistry()
+    api = _FakeApi()
+    other = _FakeApi()
+    reg.register(api)
+    forged = __import__("core.live_route_certificate", fromlist=["_SessionEntry"]) \
+        ._SessionEntry(api=other, generation="f" * 32, logged_in_at=0.0)
+    reg._entries[id(api)] = type(reg)._entries[id(api)] = forged
+    reg.unregister(api)
+    assert id(api) in reg._entries, "forged entry (other api) must not be removed"
+    assert reg.generation(api) is None
+
+
 def test_unregister_removes_entry_and_generation():
     reg = SessionRegistry()
     api = _FakeApi()
@@ -600,6 +615,52 @@ def test_quote_checks_two_unique_passed_ok(tmp_path, monkeypatch):
                                    issuer=CertificateIssuer(),
                                    config_path=cfg)
     assert cert is not None and failures == []
+
+
+@pytest.mark.parametrize("bad_quotes", [
+    None,                                     # missing payload
+    "TMFH6",                                  # string, not a list
+    {},                                       # not a list
+    [None, {"code": "TMFI6", "passed": True}],
+    [{"passed": True}, {"code": "TMFI6", "passed": True}],   # missing code
+    [{"code": "TMFH6"}, {"code": "TMFI6", "passed": True}],  # missing passed
+    [{"code": "TMFH6", "passed": "yes"},                      # non-bool passed
+     {"code": "TMFI6", "passed": True}],
+])
+def test_quote_malformed_records_fail_closed(tmp_path, monkeypatch, bad_quotes):
+    # round-11 #1: malformed quote records must FAIL CLOSED, never crash
+    import core.live_route_certificate as lrc
+    cfg = _write_config(tmp_path)
+    api = _FakeApi()
+    register_session(api)
+    base = _preflight_base()
+    base["quote_subscription"] = bad_quotes
+    monkeypatch.setattr(lrc, "collect_read_only_preflight",
+                        lambda api, product="TMF": base)
+    cert, failures = certify_route(api, process_start_id="p-1",
+                                   issuer=CertificateIssuer(),
+                                   config_path=cfg)
+    assert cert is None
+    assert any("QUOTE" in f for f in failures), failures
+
+
+def test_snapshot_codes_malformed_fail_closed(tmp_path, monkeypatch):
+    import core.live_route_certificate as lrc
+    cfg = _write_config(tmp_path)
+    api = _FakeApi()
+    register_session(api)
+    base = _preflight_base()
+    base["snapshot_codes"] = 123                # non-list payload
+    base["quote_subscription"] = [
+        {"code": "TMFH6", "passed": True},
+        {"code": "TMFI6", "passed": True}]
+    monkeypatch.setattr(lrc, "collect_read_only_preflight",
+                        lambda api, product="TMF": base)
+    cert, failures = certify_route(api, process_start_id="p-1",
+                                   issuer=CertificateIssuer(),
+                                   config_path=cfg)
+    assert cert is None
+    assert any("SNAPSHOT" in f for f in failures), failures
 
 
 # ── capacity / snapshot / open-orders / zero-order ─────────────────────────

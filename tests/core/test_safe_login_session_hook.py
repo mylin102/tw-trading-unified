@@ -45,6 +45,17 @@ def test_safe_login_success_registers_once():
     assert api.calls[0]["contracts_timeout"] == 10000
 
 
+def test_safe_login_false_return_registers_nothing():
+    # round-11 #2: Shioaji's documented failure mode is exceptions, but a
+    # falsey login return is treated as failure (fail-closed) — no
+    # generation is registered
+    api = _FakeSj([False])
+    result = safe_login(api, api_key="k", secret_key="s")
+    assert result is False
+    assert session_registry.generation(api) is None, \
+        "a falsey login return must not register a generation"
+
+
 def test_safe_login_failure_leaves_no_generation():
     api = _FakeSj([RuntimeError("broker down")])
     with pytest.raises(RuntimeError):
