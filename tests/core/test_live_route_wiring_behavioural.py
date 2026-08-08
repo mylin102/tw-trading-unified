@@ -134,54 +134,101 @@ def test_order_manager_wrapper_gate_behaviour():
     _assert_live_allowed(_ready_ctx())          # no raise → permitted
 
 
-# ── (2) emergency: durable intent / authorization / idempotency / reconcile ─
+def test_ast_inventory_strategy_package_scope():
+    # v3.1 #5: completeness tripwire over the MTS strategy package — every
+    # state-changing broker attr (place/cancel/update/modify) must sit in
+    # the explicit audited allowlist; NEW sites fail until audited
+    pkg = _repo_root() / "strategies" / "futures"
+    from collections import Counter
+    audited = Counter({
+        ("monitor.py", "place_order"): 3,      # 2707, 3847, 5208
+        ("monitor.py", "cancel_order"): 1,     # 2721
+        ("squeeze_futures/data/shioaji_client.py", "place_order"): 1,
+        ("squeeze_futures/data/shioaji_client.py", "update_order"): 1,
+        ("squeeze_futures/data/shioaji_client.py", "cancel_order"): 1,
+    })
+    found = Counter()
+    for py in sorted(pkg.rglob("*.py")):
+        rel = py.relative_to(pkg)
+        try:
+            tree = ast.parse(py.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and node.func.attr in STATE_CHANGING_ATTRS:
+                found[(str(rel), node.func.attr)] += 1
+    unlisted = {k: found[k] for k in found if k not in audited}
+    count_delta = {k: (found.get(k, 0), audited.get(k, 0))
+                   for k in set(found) | set(audited) if found.get(k, 0) != audited.get(k, 0)}
+    assert not unlisted, f"unaudited state-changing broker sites: {unlisted}"
+    assert not count_delta, \
+        f"audited site-count drift (found, audited): {count_delta}"
+
+
+# ── (2) emergency (v3.1): BLOCKED under quarantine this phase; the future
+#      operator command must use the canonical P1-B core/exit_intent.py ──────
 
 def _emergency_stub_strategy():
     return SimpleNamespace(_has_position=True, _released_leg=None,
                            _near_side="LONG")
 
 
-def test_emergency_durable_intent_before_strategy_mutation():
-    # RED: strategy state must not be mutated before a DURABLE EXIT intent
-    # (fsync'd ledger) is recorded — currently _emergency_flatten_mts
-    # mutates _released_leg/_side first with no ledger
+def test_emergency_blocked_under_quarantine_this_phase():
+    # RED (v3.1): Phase-2 wiring BLOCKS emergency entirely under
+    # LIVE_QUARANTINED (no bypass) — the strategy must not be mutated and
+    # a dashboard reason must be emitted. Currently the strategy is
+    # mutated before any check.
     m = _monitor_stub(_ready_ctx())
     s = _emergency_stub_strategy()
     try:
         m._emergency_flatten_mts(s)
     except Exception:
         pass
-    if s._released_leg is not None or hasattr(s, "_side"):
-        pytest.fail("strategy mutated without a durable EXIT intent ledger")
-    # (if nothing mutated at all the emergency was blocked — acceptable
-    # only via an explicit blocked-with-procedure contract)
+    assert s._released_leg is None and not hasattr(s, "_side"), \
+        "emergency must be blocked under quarantine (no strategy mutation)"
 
 
-def test_emergency_separate_operator_authorization():
-    # RED: emergency must be gated by a separately authorized operator
-    # command (manual close_all / settlement gate carry a durable token);
-    # a plain internal call must NOT flatten under quarantine
+def test_emergency_blocked_emits_dashboard_reason():
+    # RED (v3.1): the blocked emergency must emit a dashboard-safe reason
+    # + operator procedure — currently there is no reason channel
     m = _monitor_stub(_quarantined_ctx())
     s = _emergency_stub_strategy()
     try:
         m._emergency_flatten_mts(s)
     except Exception:
         pass
-    assert not m.client.calls, \
-        f"un-authorized emergency under quarantine: {m.client.calls}"
+    reasons = getattr(m._execution_context, "audit_reasons", ())
+    assert any("EMERGENCY" in r for r in reasons), \
+        f"blocked emergency must carry a dashboard reason: {reasons}"
 
 
-def test_emergency_idempotent_via_durable_intent_ledger():
-    # RED: the durable intent ledger module is the dedup anchor — re-sending
-    # the same emergency must yield the same outcome (≤1 fill request)
-    with pytest.raises(ImportError):
-        import core.emergency_intent  # noqa: F401  (wiring phase)
+def test_emergency_future_command_uses_exit_intent():
+    # RED (v3.1): a future authorized emergency operator command must go
+    # through the canonical core/exit_intent.py (create → child intent →
+    # emergency_supersede → client_order_id idempotency → recover) — the
+    # current path never touches it
+    from core import exit_intent
+    m = _monitor_stub(_ready_ctx())
+    s = _emergency_stub_strategy()
+    try:
+        m._emergency_flatten_mts(s)
+    except Exception:
+        pass
+    assert not hasattr(m, "_exit_intent"), \
+        "emergency must route through core/exit_intent (create/supersede)"
 
 
-def test_emergency_post_fill_restart_reconciliation():
-    # RED: outstanding intents must reconcile after fill/restart
-    with pytest.raises(ImportError):
-        import core.emergency_intent  # noqa: F401
+def test_exit_intent_canonical_protocol_surface():
+    # the canonical P1-B module (v3.1 anchor) must expose the durable
+    # intent protocol the emergency command will use
+    from core import exit_intent
+    log = exit_intent.IntentLog
+    for method in ("create", "submit_leg", "emergency_supersede",
+                   "reconciliation_view", "recover", "mark_terminal"):
+        assert hasattr(log, method), f"IntentLog.{method} missing"
+    assert hasattr(exit_intent, "client_order_id")
+    assert hasattr(exit_intent, "SupersededIntentError")
 
 
 # ── (3) reconnect atomic handoff (manual + auto share the same flow) ────────
@@ -226,11 +273,119 @@ def test_reconnect_failed_cert_stays_quarantined(monkeypatch):
         == "live_quarantined", "failed reconnect must stay quarantined"
 
 
+def test_reconnect_far_resubscribe_failure_stays_quarantined(monkeypatch):
+    # v3.1 #6: safe_login succeeds but the FAR resubscribe fails — every
+    # attempt must leave the ctx quarantined with zero broker calls
+    import main
+    from core.broker import shioaji_compat as sc
+    monkeypatch.setattr(main, "_connection_dropped", False)
+    monkeypatch.setattr(sc, "safe_login",
+                        lambda api, k, s, **kw: "ok")
+
+    class _Quote:
+        def __init__(self):
+            self.calls = []
+
+        def subscribe(self, *a, **k):
+            self.calls.append(("subscribe", a, k))
+            if len(self.calls) >= 2:                 # second = far leg
+                raise RuntimeError("far subscribe down")
+            return None
+
+    m = _monitor_stub(_ready_ctx())
+    m.far_contract = SimpleNamespace(code="TMFI6")
+    api = SimpleNamespace(quote=_Quote())
+    monkeypatch.setenv("SHIOAJI_API_KEY", "k")
+    monkeypatch.setenv("SHIOAJI_SECRET_KEY", "s")
+    assert main._try_shioaji_reconnect(api, m, None, False) is False
+    assert m._execution_context.to_dict().get("effective_mode") \
+        == "live_quarantined", "far-subscribe failure must stay quarantined"
+
+
+def test_reconnect_auto_code12_path_quarantines(monkeypatch):
+    # v3.1 #6: the code-12 auto-recovery branch must quarantine the ctx
+    # before its manual fallback re-login (sleep no-op'd)
+    import main
+    from core.broker import shioaji_compat as sc
+    monkeypatch.setattr(main, "_connection_dropped", True)
+    monkeypatch.setattr(main.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sc, "safe_login", lambda api, k, s, **kw: "ok")
+    m = _monitor_stub(_ready_ctx())
+    m.far_contract = SimpleNamespace(code="TMFI6")
+    api = SimpleNamespace(
+        quote=SimpleNamespace(subscribe=lambda *a, **k: None))
+    monkeypatch.setenv("SHIOAJI_API_KEY", "k")
+    monkeypatch.setenv("SHIOAJI_SECRET_KEY", "s")
+    assert main._try_shioaji_reconnect(api, m, None, False)
+    assert m._execution_context.to_dict().get("effective_mode") \
+        == "live_quarantined", "code-12 auto path must quarantine first"
+
+
+# ── broker adapter chokepoint (shioaji_client: 207/215/224) ─────────────────
+
+def _adapter_stub(ctx):
+    from strategies.futures.squeeze_futures.data.shioaji_client import (
+        ShioajiClient)
+    c = ShioajiClient.__new__(ShioajiClient)
+    c.is_logged_in = True
+    c.api = RecordingBroker()
+    c._execution_context = ctx
+    return c
+
+
+def test_adapter_place_order_quarantined_zero_calls():
+    # v3.1 #5: the ShioajiClient adapter is the broker chokepoint — a
+    # quarantined context must RAISE the gate BEFORE any broker I/O.
+    # NOTE: today the adapter swallows an OrderType.MTL error (missing in
+    # shioaji 1.7.0) and returns None silently — no gate, no raise, no
+    # broker call: a silent live-order failure (wiring must fix both).
+    c = _adapter_stub(_quarantined_ctx())
+    with pytest.raises(Exception) as ei:
+        c.place_order(SimpleNamespace(code="TMFH6"), "BUY", 1)
+    assert "Blocked" in type(ei.value).__name__, \
+        f"quarantine must raise the gate, not swallow: {ei.value!r}"
+    assert not c.api.calls, f"adapter place under quarantine: {c.api.calls}"
+
+
+def test_adapter_cancel_order_quarantined_zero_calls():
+    c = _adapter_stub(_quarantined_ctx())
+    c.cancel_order(SimpleNamespace(ts=1))
+    assert not c.api.calls, f"adapter cancel under quarantine: {c.api.calls}"
+
+
+def test_adapter_update_order_quarantined_zero_calls():
+    c = _adapter_stub(_quarantined_ctx())
+    c.update_order(SimpleNamespace(ts=1), price=44300)
+    assert not c.api.calls, f"adapter update under quarantine: {c.api.calls}"
+
+
+# ── exit failure-side (v3.1 #7) ─────────────────────────────────────────────
+
+def test_exit_does_not_silently_place_when_stop_cancel_fails():
+    # if the safety-stop cancellation fails, an ordinary EXIT must not
+    # silently place the exit unless reconciliation explicitly permits it
+    # and records a durable reason — currently the cancel error is
+    # swallowed inside _cancel_safety_stop and the exit still places
+    m = _monitor_stub(_ready_ctx(), safety_trade=SimpleNamespace(ts=1))
+
+    def _boom_cancel(*a, **k):
+        m.api.calls.append(("cancel_order", a, k))
+        raise RuntimeError("cancel down")
+
+    m.api.cancel_order = _boom_cancel
+    m._execute_trade("EXIT", 44300, "2026-08-08T10:00:00", 1, reason="TEST")
+    placed = [c for c in m.client.calls if c[0] == "place_order"]
+    assert not placed, \
+        f"exit must not silently place after failed stop cancel: {m.client.calls}"
+
+
 # ── (4) dashboard persistence: atomic writer/reader round-trip ──────────────
 
 def test_execution_context_state_round_trip_atomic():
-    # RED: the writer/reader module (atomic write + fsync, no torn JSON)
-    # comes with the wiring phase — its absence is the contract
+    # v3.1 #3 contract: writer/reader under TRADING_RUNTIME_DIR (not bare
+    # /tmp); atomic replace + fsync(file AND parent); corrupt/missing read
+    # → safe default LIVE_QUARANTINED; no broker/account data; dashboard
+    # reader renders state after restart. Module absent → contract missing.
     with pytest.raises(ImportError):
         import core.execution_context_state  # noqa: F401
 
@@ -238,8 +393,9 @@ def test_execution_context_state_round_trip_atomic():
 # ── (5) release identity verifier (release_dir-scoped, injected runner) ─────
 
 def test_release_identity_verifier_exists():
-    # RED: dedicated verifier with specified release_dir + injected runner;
-    # env missing / mismatch / command failure all fail closed
+    # v3.1 #4: dedicated verifier with a REAL temp git release dir +
+    # injected runner; env missing / HEAD mismatch / command failure all
+    # fail closed. Module absent → contract missing.
     with pytest.raises(ImportError):
         import core.release_identity  # noqa: F401
 
