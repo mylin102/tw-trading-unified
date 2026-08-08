@@ -384,6 +384,16 @@ def test_arm_matrix_manifest_fail_closed():
         {"M_economic": 25.0, "fee_assumption_id": None, "intervals": iv},
         {"M_economic": 25.0, "fee_assumption_id": "fee-v1",
          "intervals": None},
+        # v4: present-but-invalid values are also fail-closed
+        {"M_economic": float("nan"), "fee_assumption_id": "fee-v1",
+         "intervals": iv},
+        {"M_economic": -5.0, "fee_assumption_id": "fee-v1",
+         "intervals": iv},
+        {"M_economic": 25.0, "fee_assumption_id": "ad-hoc-id",
+         "intervals": iv},
+        {"M_economic": 25.0, "fee_assumption_id": "fee-v1",
+         "intervals": {"Y0": (10.0, -10.0), "Y1": (-55.0, -45.0),
+                       "Y2": (-45.0, -35.0), "Y3": (95.0, 105.0)}},
     ]
     for kw in cases:
         m = a4_reports.arm_matrix(arms=arms, evidence="ok", **kw)

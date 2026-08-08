@@ -327,6 +327,79 @@ def test_replay_entrypoint_exists():
     assert callable(run_replay.main)
 
 
+def test_runner_refuses_without_dry_run_or_authorize(tmp_path):
+    inp = tmp_path / "events.json"
+    inp.write_text("[]", encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out)])
+    assert rc == 2, f"runner must refuse without --dry-run/--authorize: {rc}"
+
+
+def test_runner_dry_run_writes_manifest(tmp_path):
+    import json
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([
+        {"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
+         "decision_ts": "2026-08-08T10:00:00",
+         "quotes": {"near": {"bid": 50.0, "ask": 100.0, "age_s": 1,
+                             "close_action": "SHORT"},
+                    "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
+                            "close_action": "SHORT"}}},
+    ]), encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--dry-run"])
+    assert rc == 0, rc
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["dry_run"] is True
+    assert len(manifest["input_sha256"]) == 64
+    assert manifest["stream_hash"]
+    assert manifest["n_events"] == 1
+    assert manifest["n_censored"] == 0
+    assert manifest["engine_run"] is False
+
+
+def test_runner_reproducible_input_hash(tmp_path):
+    import json
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([{"source_event_seq": 1, "exchange_ts": 1}]),
+                   encoding="utf-8")
+    out1 = tmp_path / "o1"
+    out2 = tmp_path / "o2"
+    run_replay.main(["--input", str(inp), "--out-dir", str(out1),
+                     "--dry-run"])
+    run_replay.main(["--input", str(inp), "--out-dir", str(out2),
+                     "--dry-run"])
+    m1 = json.loads((out1 / "manifest.json").read_text(encoding="utf-8"))
+    m2 = json.loads((out2 / "manifest.json").read_text(encoding="utf-8"))
+    assert m1["input_sha256"] == m2["input_sha256"]
+    assert m1["stream_hash"] == m2["stream_hash"]
+
+
+def test_runner_censors_incomplete_quotes(tmp_path):
+    # v4: unknown-age / incomplete two-leg quotes must never produce usable
+    # two-leg counterfactual PnL — the candidate is censored WITH reason
+    import json
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([
+        {"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
+         "decision_ts": "2026-08-08T10:00:00",
+         "quotes": {"near": {"bid": 50.0, "ask": 100.0, "age_s": None,
+                             "close_action": "SHORT"},
+                    "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
+                            "close_action": "SHORT"}}},
+    ]), encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--dry-run"])
+    assert rc == 0, rc
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["n_censored"] == 1, manifest
+    assert manifest["n_kept"] == 0, manifest
+    reasons = [c["reason"] for c in manifest["censored_reasons"]]
+    assert any("age" in r or "stale" in r for r in reasons), reasons
+
+
 # ── reuse contract: the skeleton must wire the COMMITTED exit_attribution ───
 
 def test_pipeline_reuses_committed_exit_attribution():
