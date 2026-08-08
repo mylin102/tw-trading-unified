@@ -3,8 +3,8 @@
 clone_from_state(event_stream, breach_replay_seq, state_snapshot):
 - deep-copies the snapshot (actual source mutation NEVER affects the clone)
 - adds a canonical hash over the ordered clone payload
-- reads ONLY events with replay_seq <= breach_replay_seq — breach/release
-  FUTURE events are never read (the caller passes the bounded stream slice)
+- reads ONLY events with replay_seq < breach_replay_seq — the BREACH event
+  itself and release/future events are never read (strictly-before)
 - incomplete input (missing snapshot / schema fields) -> typed
   ("NOT_AVAILABLE", [exact missing fields])
 """
