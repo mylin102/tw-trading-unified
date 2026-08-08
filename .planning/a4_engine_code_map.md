@@ -20,10 +20,19 @@ historical artifact; 不 deploy/restart/push
 - **時鐘契約**: exchange_ts（交易所時間）為主鍵; recv_ts 保留為
   收訊延遲證據; replay_seq 為研究重播序
 
-### 2. State clone（breach 前一個 event, 絕不觸及 actual-release）
+### 2. State clone（strictly before breach, 絕不觸及 actual-release）
 - **來源**: controller/lifecycle/positions/guard/ATR/reference 欄位由
   對帳後的 event 序列重建（研究內 clone 為欄位佔位值 — 實際值於引擎
   對真實對帳資料 run 時填入; 目前無 real artifact 執行）
+- **A4 真委派 canonical**: A4 `breach.clone_from_state` 是 schema
+  adapter — 實際呼叫
+  `phase_transition_replay.clone.clone_from_state(...,
+  schema_fields=A4_CLONE_SCHEMA_FIELDS)`; deep-copy / canonical hash /
+  stream-prefix 的 primitive **只存在 canonical 一處**（monkeypatch
+  call proof 鎖定）
+- **strictly-before 語意**: 只讀 `replay_seq < breach_replay_seq` —
+  **breach event 本身**與 release/future events 永不讀取（prefix hash
+  測試含 BREACH + RELEASE sentinel）
 - **clone_point_before_breach(event_seq, missing_fields=..., ...)**:
   - 任何缺欄 → typed ("NOT_AVAILABLE", [精確缺欄]) — 永不靜默部分 clone
   - actual_branch_mutated 參數被契約忽略 — clone 看不到 release 分支
