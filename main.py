@@ -779,8 +779,10 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
         time.sleep(30)
         if not _connection_dropped:
             console.print("[green]✅ Shioaji auto-reconnect completed[/green]")
-            for m in mons:
-                _recertify_after_reconnect(m, api)
+            _recerts = [_recertify_after_reconnect(m, api) for m in mons]
+            if not all(_recerts):
+                console.print("[red]❌ Re-certification failed after auto-reconnect — QUARANTINED, exiting for restart[/red]")
+                return False
             return True
         console.print("[yellow]⚠️ Shioaji auto-reconnect still pending — attempting manual re-login[/yellow]")
 
@@ -830,9 +832,13 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
             # tick_dispatcher is defined in the outer scope — we pass None for now,
             # the existing callbacks should still be wired
             _connection_dropped = False
-            # post-success: recertification MAY proceed (Step 5)
-            for m in mons:
-                _recertify_after_reconnect(m, api)
+            # post-success: recertification proceeds (Step 5) — if it
+            # fails the reconnect is a FAILURE: return False (never True
+            # on failed recertification; context stays QUARANTINED)
+            _recerts = [_recertify_after_reconnect(m, api) for m in mons]
+            if not all(_recerts):
+                console.print("[red]❌ Re-certification failed after re-login — QUARANTINED, exiting for restart[/red]")
+                return False
             return True
 
         except Exception as e:
