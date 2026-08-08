@@ -275,7 +275,14 @@ class ShioajiClient:
                     context={"method": "update_order", "price": price,
                              "quantity": quantity,
                              "reason": "api returned no result"})
-            return result is not False
+            if result is False:
+                # official API returns Trade — False is a silent failure
+                raise AdapterOrderError(
+                    code="ADAPTER_ORDER_UPDATE_FAILED",
+                    context={"method": "update_order", "price": price,
+                             "quantity": quantity,
+                             "reason": "api returned False (not a Trade)"})
+            return result
         except AdapterOrderError:
             raise
         except Exception as e:
@@ -295,7 +302,12 @@ class ShioajiClient:
                     code="ADAPTER_ORDER_NO_TRADE",
                     context={"method": "cancel_order",
                              "reason": "api returned no result"})
-            return result is not False
+            if result is False:
+                raise AdapterOrderError(
+                    code="ADAPTER_ORDER_CANCEL_FAILED",
+                    context={"method": "cancel_order",
+                             "reason": "api returned False (not a Trade)"})
+            return result
         except AdapterOrderError:
             raise
         except Exception as e:
