@@ -367,11 +367,13 @@ def test_runner_prereg_required(tmp_path):
 
 def _schema_valid_event(**over):
     ev = {"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
-          "decision_ts": "2026-08-08T10:00:00",
+          "decision_ts_ms": 1_000_000,
           "quotes": {"near": {"bid": 50.0, "ask": 100.0, "age_s": 1,
-                              "close_action": "SHORT"},
+                              "close_action": "SHORT",
+                              "quote_exchange_ts": 999_900},
                      "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
-                             "close_action": "SHORT"}}}
+                             "close_action": "SHORT",
+                             "quote_exchange_ts": 999_950}}}
     ev.update(over)
     return ev
 
@@ -396,6 +398,18 @@ def test_runner_dry_run_writes_manifest(tmp_path):
     assert manifest["preregistration_sha"]
     assert manifest["parameters"]["staleness"] == {"max_age_s": 30}
     assert manifest["parameters"]["m_economic"] == 25.0
+    assert manifest["parameters"]["max_pair_skew_ms"] == 1000
+    prov = manifest["git_provenance"]
+    assert len(prov["repo_head"]) == 40
+    assert prov["dirty"] is False
+    assert len(prov["runner_sha256"]) == 64
+    assert len(prov["prereg_sha256"]) == 64
+    assert prov["runner_tracked"] and prov["prereg_tracked"]
+    assert prov["runner_matches_head"] and prov["prereg_matches_head"]
+    rec = manifest["kept_records"][0]
+    assert rec["pair_skew_ms"] == 50
+    assert rec["max_pair_skew_ms"] == 1000
+    assert rec["near_age_s"] == 1
 
 
 def test_runner_reproducible_input_hash(tmp_path):
@@ -422,9 +436,9 @@ def test_runner_censors_incomplete_quotes(tmp_path):
     inp.write_text(json.dumps([
         _schema_valid_event(quotes={
             "near": {"bid": 50.0, "ask": 100.0, "age_s": None,
-                     "close_action": "SHORT"},
+                     "close_action": "SHORT", "quote_exchange_ts": 999_900},
             "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
-                    "close_action": "SHORT"}}),
+                    "close_action": "SHORT", "quote_exchange_ts": 999_950}}),
     ]), encoding="utf-8")
     out = tmp_path / "out"
     rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
@@ -443,7 +457,8 @@ def test_runner_schema_invalid_event_censored(tmp_path):
     import json
     inp = tmp_path / "events.json"
     inp.write_text(json.dumps(
-        [_schema_valid_event(), _schema_valid_event(decision_ts=None)]),
+        [_schema_valid_event(),
+         _schema_valid_event(decision_ts_ms=None)]),
         encoding="utf-8")
     out = tmp_path / "out"
     rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
@@ -490,6 +505,80 @@ def test_runner_json_dict_quotes_kept_when_valid(tmp_path):
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["n_kept"] == 1, manifest
     assert manifest["n_censored"] == 1, manifest
+
+
+def test_runner_git_provenance_gate_refuses_dirty(monkeypatch, tmp_path):
+    # v6: when the provenance cannot be proven (dirty/untracked/modified),
+    # the runner REFUSES with zero output
+    import json
+    monkeypatch.setattr(
+        run_replay, "git_provenance",
+        lambda: (False, {"reason": "research subtree dirty"}))
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([_schema_valid_event()]), encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1", "--dry-run"])
+    assert rc == 5, rc
+    assert not (out / "manifest.json").exists(), "zero output on refusal"
+
+
+def test_runner_censors_pair_skew_exceeding_bound(tmp_path):
+    # v6: unsynchronized quotes (skew > bound) are censored — never
+    # treated as an executable pair
+    import json
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([_schema_valid_event(quotes={
+        "near": {"bid": 50.0, "ask": 100.0, "age_s": 1,
+                 "close_action": "SHORT", "quote_exchange_ts": 998_000},
+        "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
+                "close_action": "SHORT", "quote_exchange_ts": 999_950}})]),
+        encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1", "--dry-run"])
+    assert rc == 0, rc
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["n_kept"] == 0, manifest
+    assert manifest["n_censored"] == 1, manifest
+    reasons = [c["reason"] for c in manifest["censored_reasons"]]
+    assert any("skew" in r for r in reasons), reasons
+
+
+def test_runner_censors_quote_after_decision(tmp_path):
+    # v6: a quote_exchange_ts LATER than the decision time is censored
+    import json
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([_schema_valid_event(quotes={
+        "near": {"bid": 50.0, "ask": 100.0, "age_s": 1,
+                 "close_action": "SHORT", "quote_exchange_ts": 2_000_000},
+        "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
+                "close_action": "SHORT", "quote_exchange_ts": 999_950}})]),
+        encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1", "--dry-run"])
+    assert rc == 0, rc
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["n_censored"] == 1, manifest
+    reasons = [c["reason"] for c in manifest["censored_reasons"]]
+    assert any("later than decision" in r for r in reasons), reasons
+
+
+def test_execution_malformed_quote_fail_closed():
+    # v6: a malformed quote object produces a reason — NEVER AttributeError
+    from types import SimpleNamespace
+    for bad in ("junk", 42, object(), {"bid": 1.0}):
+        quotes = {
+            "near": bad,
+            "far": SimpleNamespace(bid=50.0, ask=100.0, age_s=1,
+                                   close_action="SHORT"),
+        }
+        r = execution.executable_prices(
+            quotes, decision_ts=1000,
+            staleness_bounds={"max_age_s": 30})
+        assert r["tier"] != "EXECUTABLE_BBO", (bad, r["tier"])
+        assert r["reasons"], f"fail-closed reason required: {bad!r}"
 
 
 # ── reuse contract: the skeleton must wire the COMMITTED exit_attribution ───
