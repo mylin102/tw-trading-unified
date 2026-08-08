@@ -725,6 +725,31 @@ def test_manifest_atomic_no_replace(tmp_path):
     assert leftovers == [], f"temp file must be cleaned up: {leftovers}"
 
 
+def test_runner_race_target_preserved(monkeypatch, tmp_path):
+    # P0-2 deterministic race (full runner path): manifest.json is created
+    # IMMEDIATELY BEFORE the atomic finalization — the concurrent creator
+    # is preserved, the run refuses (exit 6), nothing is overwritten
+    import os
+    real_finalize = run_replay._write_manifest_atomic
+
+    def racing(out_dir, manifest):
+        target = os.path.join(out_dir, "manifest.json")
+        if not os.path.exists(target):
+            with open(target, "w", encoding="utf-8") as f:
+                f.write("CONCURRENT")
+        return real_finalize(out_dir, manifest)
+
+    monkeypatch.setattr(run_replay, "_write_manifest_atomic", racing)
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([_schema_valid_event()]), encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1", "--dry-run"])
+    assert rc == 6, rc
+    assert (out / "manifest.json").read_text(encoding="utf-8") == \
+        "CONCURRENT", "concurrent creator must be preserved verbatim"
+
+
 # ── reuse contract: the skeleton must wire the COMMITTED exit_attribution ───
 
 def test_pipeline_reuses_committed_exit_attribution():
