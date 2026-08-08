@@ -1618,6 +1618,19 @@ def run_system(dry_run=False, config_name="futures"):
             # Final sleep before logout - reduces C++ crash risk
             time.sleep(2)
 
+            # [Step 7] session invalidation: quarantine every futures
+            # monitor context BEFORE the broker logout (centralized
+            # registry unregister lives in shioaji_session.logout —
+            # monitors only quarantine + persist, never re-implement)
+            try:
+                for _m in _reconnect_monitors(
+                        futures_mons if "futures_mons" in dir() else []):
+                    _on_logout = getattr(_m, "_on_session_logout", None)
+                    if callable(_on_logout):
+                        _on_logout()
+            except Exception as _lexc:
+                console.print(f"[dim]Session-logout quarantine error: {_lexc}[/dim]")
+
             logout()
 
             # Final buffer before process exit - prevents macOS "Python quit unexpectedly" dialog

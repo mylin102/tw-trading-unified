@@ -2729,6 +2729,28 @@ class FuturesMonitor:
             console.print(f"[dim]⚠️ exec ctx persist failed: {_pexc} "
                           f"(file keeps last good state)[/dim]")
 
+    def _on_session_logout(self):
+        """[Step 7] real broker logout: the current session registry
+        generation is invalidated BEFORE the broker logout (centralized
+        in shioaji_session.logout — unregister; failure -> invalidate_all
+        + re-raise). This monitor must NOT retain a LIVE_READY context
+        across it: quarantine + persist (SESSION_LOGOUT)."""
+        _ctx = getattr(self, "_execution_context", None)
+        if _ctx is None:
+            return
+        from core.live_route_certificate import session_registry
+        _gen = session_registry.current_generation()
+        from core.mode_transition import ModeTransitionState, with_effective_mode
+        self._execution_context = with_effective_mode(
+            _ctx, ModeTransitionState.LIVE_QUARANTINED.value,
+            live_order_allowed=False,
+            audit_reasons=("SESSION_LOGOUT",) + tuple(
+                getattr(_ctx, "audit_reasons", ()) or ()))
+        self._persist_execution_context()
+        console.print(f"[dim]🔒 Session logout: ctx QUARANTINED "
+                      f"(SESSION_LOGOUT; registry gen="
+                      f"{'valid' if _gen else 'revoked'})[/dim]")
+
     def _place_safety_stop(self, entry_price, direction, lots, stop_loss_pts):
         """Place a far-limit order at exchange as safety stop for disconnect protection."""
         if not self.live_trading or self.dry_run or not self.contract or not self.api:

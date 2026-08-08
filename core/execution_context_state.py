@@ -84,6 +84,9 @@ def _validate(data: object) -> list:
                 errs.append(f"schema: missing required key {key}")
             continue
         val = data[key]
+        if val is None and not required:
+            # optional safe fields may be null (e.g. no account hashed yet)
+            continue
         if not isinstance(val, typ):
             errs.append(f"schema: {key} is {type(val).__name__}, "
                         f"expected {typ.__name__}")
