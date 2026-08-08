@@ -62,6 +62,7 @@ class RecordingApi:
         self.fail_order_build = False
         self.fail_place = False
         self.reject_trade = False
+        self.no_trade = False
         self.futopt_account = SimpleNamespace(person_id="P1")
 
     def Order(self, **kw):
@@ -74,6 +75,8 @@ class RecordingApi:
         if self.fail_place:
             raise RuntimeError("place down")
         self.calls.append(("place_order", contract, order))
+        if self.no_trade:
+            return None
         if self.reject_trade:
             return SimpleNamespace(status=SimpleNamespace(status="Failed"))
         return SimpleNamespace(status=SimpleNamespace(status="Pending"))
@@ -82,12 +85,16 @@ class RecordingApi:
         if self.fail_place:
             raise RuntimeError("update down")
         self.calls.append(("update_order", trade, kw))
+        if self.no_trade:
+            return None
         return True
 
     def cancel_order(self, trade):
         if self.fail_place:
             raise RuntimeError("cancel down")
         self.calls.append(("cancel_order", trade))
+        if self.no_trade:
+            return None
         return True
 
 
@@ -165,6 +172,33 @@ def test_rejected_trade_raises_structured_error():
     assert type(ei.value).__name__ == "AdapterOrderError", ei.value
     assert ei.value.code == "ADAPTER_ORDER_REJECTED", ei.value.code
     assert ei.value.context.get("status") == "Failed"
+
+
+def test_rejected_status_variant_denied():
+    # terminal Rejected status must be denied too (allow/deny semantics)
+    api = RecordingApi()
+    api.reject_trade = True
+    c = _adapter(api)
+    with pytest.raises(Exception) as ei:
+        c.place_order(_CONTRACT, "BUY", 1, price=0)
+    assert ei.value.code == "ADAPTER_ORDER_REJECTED"
+
+
+@pytest.mark.parametrize("method,args", [
+    ("place_order", (_CONTRACT, "BUY", 1)),
+    ("update_order", (SimpleNamespace(ts=1), 44300)),
+    ("cancel_order", (SimpleNamespace(ts=1),)),
+])
+def test_api_none_return_raises_no_trade(method, args):
+    # a None API return must raise ADAPTER_ORDER_NO_TRADE — never leave an
+    # ambiguous None to the caller
+    api = RecordingApi()
+    api.no_trade = True
+    c = _adapter(api)
+    with pytest.raises(Exception) as ei:
+        getattr(c, method)(*args)
+    assert type(ei.value).__name__ == "AdapterOrderError", ei.value
+    assert ei.value.code == "ADAPTER_ORDER_NO_TRADE", ei.value.code
 
 
 def test_market_order_success_exactly_one_intended_call():
