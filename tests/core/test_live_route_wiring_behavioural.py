@@ -310,6 +310,9 @@ def test_exit_intent_canonical_protocol_surface():
 # ── (3) reconnect atomic handoff (manual + auto share the same flow) ────────
 
 def test_reconnect_quarantines_before_relogin_and_recertifies(monkeypatch):
+    # success path: quarantine happens BEFORE re-login; after successful
+    # resubscribe, recertification proceeds and a valid cert yields
+    # LIVE_READY -> reconnect returns True
     import main
     from core.broker import shioaji_compat as sc
     monkeypatch.setattr(main, "_connection_dropped", False)
@@ -317,18 +320,32 @@ def test_reconnect_quarantines_before_relogin_and_recertifies(monkeypatch):
     monkeypatch.setattr(
         sc, "safe_login",
         lambda api, k, s, **kw: (order.append("login"), "ok")[1])
+    cert_fake = object()
+    monkeypatch.setattr("core.live_route_certificate.certify_route",
+                        lambda api, **kw: (cert_fake, []))
+    monkeypatch.setattr("core.live_route_certificate."
+                        "build_runtime_certification_context",
+                        lambda api, cfg, process_state=None: object())
+
+    def _transition_spy(ctx, cert, issuer, *, runtime):
+        from core.mode_transition import (ModeTransitionState,
+                                          with_effective_mode)
+        return with_effective_mode(ctx, ModeTransitionState.LIVE_READY.value,
+                                   live_order_allowed=True)
+
+    monkeypatch.setattr("core.live_route_certificate."
+                        "transition_with_certificate", _transition_spy)
     m = _monitor_stub(_ready_ctx())
     m.far_contract = SimpleNamespace(code="TMFI6")
+    m.config_path = "/tmp/futures_test.yaml"
     api = SimpleNamespace(
         login=lambda *a, **k: "ok",
         quote=SimpleNamespace(subscribe=lambda *a, **k: None))
     monkeypatch.setenv("SHIOAJI_API_KEY", "k")
     monkeypatch.setenv("SHIOAJI_SECRET_KEY", "s")
     assert main._try_shioaji_reconnect(api, m, None, False)
-    # contract: quarantine BEFORE login; fresh cert only after resubscribe —
-    # currently the context is never touched (LIVE_READY survives)
     assert m._execution_context.to_dict().get("effective_mode") \
-        == "live_quarantined", "reconnect must quarantine before re-login"
+        == "live_ready", "successful recertification must reach LIVE_READY"
 
 
 def test_reconnect_failed_cert_stays_quarantined(monkeypatch):
@@ -370,6 +387,7 @@ def test_reconnect_far_resubscribe_failure_stays_quarantined(monkeypatch):
 
     m = _monitor_stub(_ready_ctx())
     m.far_contract = SimpleNamespace(code="TMFI6")
+    m.config_path = "/tmp/futures_test.yaml"
     api = SimpleNamespace(quote=_Quote())
     monkeypatch.setenv("SHIOAJI_API_KEY", "k")
     monkeypatch.setenv("SHIOAJI_SECRET_KEY", "s")
@@ -386,15 +404,82 @@ def test_reconnect_auto_code12_path_quarantines(monkeypatch):
     monkeypatch.setattr(main, "_connection_dropped", True)
     monkeypatch.setattr(main.time, "sleep", lambda s: None)
     monkeypatch.setattr(sc, "safe_login", lambda api, k, s, **kw: "ok")
+    cert_fake = object()
+    monkeypatch.setattr("core.live_route_certificate.certify_route",
+                        lambda api, **kw: (cert_fake, []))
+    monkeypatch.setattr("core.live_route_certificate."
+                        "build_runtime_certification_context",
+                        lambda api, cfg, process_state=None: object())
+
+    def _transition_spy(ctx, cert, issuer, *, runtime):
+        from core.mode_transition import (ModeTransitionState,
+                                          with_effective_mode)
+        return with_effective_mode(ctx, ModeTransitionState.LIVE_READY.value,
+                                   live_order_allowed=True)
+
+    monkeypatch.setattr("core.live_route_certificate."
+                        "transition_with_certificate", _transition_spy)
     m = _monitor_stub(_ready_ctx())
     m.far_contract = SimpleNamespace(code="TMFI6")
+    m.config_path = "/tmp/futures_test.yaml"
     api = SimpleNamespace(
         quote=SimpleNamespace(subscribe=lambda *a, **k: None))
     monkeypatch.setenv("SHIOAJI_API_KEY", "k")
     monkeypatch.setenv("SHIOAJI_SECRET_KEY", "s")
     assert main._try_shioaji_reconnect(api, m, None, False)
     assert m._execution_context.to_dict().get("effective_mode") \
-        == "live_quarantined", "code-12 auto path must quarantine first"
+        == "live_ready", "successful code-12 recovery + recert must reach LIVE_READY"
+
+
+def test_reconnect_manual_recert_failure_returns_false(monkeypatch):
+    # Step-5 corrective: recertification failure in the MANUAL branch must
+    # return False (never True) — ctx stays LIVE_QUARANTINED +
+    # RECERTIFY_FAILED, zero order calls
+    import main
+    from core.broker import shioaji_compat as sc
+    monkeypatch.setattr(main, "_connection_dropped", False)
+    monkeypatch.setattr(sc, "safe_login", lambda api, k, s, **kw: "ok")
+    monkeypatch.setattr("core.live_route_certificate.certify_route",
+                        lambda api, **kw: (None, []))
+    m = _monitor_stub(_ready_ctx())
+    m.far_contract = SimpleNamespace(code="TMFI6")
+    m.config_path = "/tmp/futures_test.yaml"
+    api = SimpleNamespace(
+        quote=SimpleNamespace(subscribe=lambda *a, **k: None))
+    monkeypatch.setenv("SHIOAJI_API_KEY", "k")
+    monkeypatch.setenv("SHIOAJI_SECRET_KEY", "s")
+    assert main._try_shioaji_reconnect(api, m, None, False) is False, \
+        "failed recertification must NEVER return True"
+    assert m._execution_context.to_dict().get("effective_mode") \
+        == "live_quarantined", "failed recert must stay LIVE_QUARANTINED"
+    assert "RECERTIFY_FAILED" in m._execution_context.audit_reasons, \
+        m._execution_context.audit_reasons
+
+
+def test_reconnect_code12_recert_failure_returns_false(monkeypatch):
+    # Step-5 corrective: recertification failure in the code-12 auto branch
+    # must return False (never True) — ctx stays LIVE_QUARANTINED +
+    # RECERTIFY_FAILED, zero order calls
+    import main
+    monkeypatch.setattr(main, "_connection_dropped", True)
+    monkeypatch.setattr("core.live_route_certificate.certify_route",
+                        lambda api, **kw: (None, []))
+
+    def fake_sleep(s):
+        main._connection_dropped = False  # auto-reconnect completes
+
+    monkeypatch.setattr(main.time, "sleep", fake_sleep)
+    m = _monitor_stub(_ready_ctx())
+    m.far_contract = SimpleNamespace(code="TMFI6")
+    m.config_path = "/tmp/futures_test.yaml"
+    api = SimpleNamespace(
+        quote=SimpleNamespace(subscribe=lambda *a, **k: None))
+    assert main._try_shioaji_reconnect(api, m, None, False) is False, \
+        "failed recertification must NEVER return True"
+    assert m._execution_context.to_dict().get("effective_mode") \
+        == "live_quarantined", "failed recert must stay LIVE_QUARANTINED"
+    assert "RECERTIFY_FAILED" in m._execution_context.audit_reasons, \
+        m._execution_context.audit_reasons
 
 
 # ── broker adapter chokepoint (shioaji_client: 207/215/224) ─────────────────
