@@ -49,22 +49,28 @@ def adapt_fill(raw, source_ctx):
         return ("NOT_AVAILABLE", f"invalid qty {qty!r}")
     ts_text = raw.get("timestamp")
     return {"fill_type": ft, "trade_id": raw.get("trade_id"),
-            "leg": raw.get("leg"), "contract": raw.get("contract"),
+            "leg": str(raw.get("leg") or "").lower(),
+            "contract": str(raw.get("contract") or "").lower(),
             "side": side, "qty": qty, "ts_text": ts_text,
             "parsed_ts": _parse_ts(ts_text), "unit": "epoch_ms",
             **source_ctx}
 
 
 def adapt_spread_event(raw, source_ctx):
-    """spread events JSONL record -> normalized event. Only legal anchor
-    kinds are accepted."""
+    """spread events JSONL record -> normalized event. Legal anchor kinds:
+    RELEASE_DECISION/SUBMISSION — the ACTUAL runtime encodes SUBMISSION as
+    ORDER_SUBMITTED with strategy=MTS_RELEASE."""
     kind = raw.get("event")
+    if kind == "ORDER_SUBMITTED" and raw.get("strategy") == "MTS_RELEASE":
+        kind = "SUBMISSION"
     if kind not in ANCHOR_EVENT_KINDS:
-        return ("NOT_AVAILABLE", f"event {kind!r} not a legal anchor kind")
+        return ("NOT_AVAILABLE", f"event {raw.get('event')!r} not a legal "
+                f"anchor kind")
     ts_text = raw.get("ts")
     return {"kind": kind, "trade_id": raw.get("trade_id"),
             "order_id": raw.get("order_id"), "ts_text": ts_text,
             "parsed_ts": _parse_ts(ts_text), "unit": "epoch_ms",
+            "strategy": raw.get("strategy"),
             **source_ctx}
 
 
@@ -77,7 +83,8 @@ def adapt_bbo(raw, source_ctx):
     src = raw.get("source")
     if src not in BBO_SOURCE_ALLOWLIST:
         return ("NOT_AVAILABLE", f"source {src!r} not in allowlist")
-    return {"leg": raw.get("leg"), "contract": raw.get("contract_code"),
+    return {"leg": str(raw.get("leg") or "").lower(),
+            "contract": raw.get("contract_code"),
             "exchange_ts_ms": raw.get("exchange_ts_ms"),
             "receive_ts_ms": raw.get("receive_ts_ms"),
             "feed": src, "bid": raw.get("bid"), "ask": raw.get("ask"),
@@ -138,7 +145,9 @@ def normalize_sources(input_paths):
                 else:
                     unknown_fill_types[rec["fill_type"]] = \
                         unknown_fill_types.get(rec["fill_type"], 0) + 1
-            elif rec.get("event") in ANCHOR_EVENT_KINDS:
+            elif rec.get("event") in ANCHOR_EVENT_KINDS or (
+                    rec.get("event") == "ORDER_SUBMITTED"
+                    and rec.get("strategy") == "MTS_RELEASE"):
                 r = adapt_spread_event(rec, ctx)
                 if not isinstance(r, tuple):
                     events.append(r)
