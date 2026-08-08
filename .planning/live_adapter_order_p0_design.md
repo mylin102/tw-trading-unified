@@ -14,17 +14,21 @@ certification 分離）; 先 design + RED，再 implementation/review 分離。
   try/except 吞掉 → `return None` — **live adapter 路徑每單必失敗且靜默**
   （P0: live order-build failure, not tuning）
 
-## 2. 修正契約
+## 2. 修正契約（含 three-line correction B）
 
 1. **market/market-protection order 對映到 SDK-valid enum**（cite 安裝版
    API, 不猜）: `price=0`（market）→ `price_type=MKP` + **`order_type=ROD`**
    （ROD = 當日有效標準單; IOC/FOK 為特殊執行約束 — market-protection
    safety stop 用 LMT+ROD, 已 valid, 不動）
-2. **sj.Order 在安裝 1.7.0 下建構成功**（無 broker I/O）; recording API
-   在成功時**恰一次 intended call**
-3. **建構/API 失敗 → structured durable/order-manager-visible failure
-   reason**（typed exception 或 failure record 進 order-manager 可見通道）
-   — **取代 ambiguous None**
+2. **sj.Order 用非 deprecated enums 建構**（`sj.OrderType` /
+   `sj.FuturesPriceType`, 不用 `sj.constant.*`）; recording API 成功時
+   **恰一次 intended call**
+3. **typed `AdapterOrderError`**（stable code + context: method/contract/
+   order/underlying）— adapter 不發明 durable ledger（缺 authoritative
+   trade/order context）; **durable event/order-manager propagation 由
+   caller 擁有**（monitor 3847/5208 捕捉 → 寫 durable failure event →
+   回傳 structured code）— 取代 ambiguous None; API 若仍 None-returning,
+   typed failure 不得被吞
 4. 涵蓋 adapter 全部 place/update/cancel 路徑; **PAPER 行為不變**
    （adapter 為 live-only, paper_fill_sim 不經此）; 測試零真實 order
 
