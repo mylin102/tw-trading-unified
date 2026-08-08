@@ -12,6 +12,7 @@ from scripts.research.event_snapshot import (  # noqa: F401
     attach_quotes, build_snapshot, emit_manifest, legal_anchor, order_events,
     read_source_once)
 
+import json
 import pytest
 
 
@@ -103,10 +104,12 @@ def test_missing_bbo_explicit_censored():
 def test_invalid_synchronized_bbo_explicit_censored():
     # quote ts AFTER the event exchange_ts (future quote) never attaches
     events = [{"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
-               "decision_ts_ms": 1_700_000_100_000}]
+               "decision_ts_ms": 1_700_000_100_000, "contract": "TMFH6",
+               "position_side": "SHORT"}]
     quotes = [{"leg": "near", "bid": 50.0, "ask": 100.0,
                "quote_exchange_ts": 1_700_000_200_000,
-               "quote_source": "bbo_near"}]
+               "quote_source": "bbo_near", "contract": "TMFH6",
+               "close_action": "SHORT"}]
     result = attach_quotes(events, quote_records=quotes)
     out = result if isinstance(result, list) else result.get("events")
     q = out[0]["quotes"]["near"]
@@ -241,3 +244,87 @@ def test_output_no_overwrite(tmp_path):
     assert isinstance(result, tuple) and result[0] == "REFUSED", result
     assert (tmp_path / "events.json").read_text(encoding="utf-8") == \
         "OLD-EVENTS", "existing output must never be overwritten"
+
+
+# ── v3 P0 conditions: anchor ts validation / contract+position / atomic ─────
+
+def test_invalid_anchor_timestamp_refused(tmp_path):
+    # v3(1): decision_ts_ms must be a VALIDATED epoch-ms parsed from the
+    # anchor's ts_text — invalid/missing timestamp REFUSES the build; a
+    # post-decision RELEASE fill timestamp is never used
+    fills = tmp_path / "fills.json"
+    fills.write_text(json.dumps([{"record": "fill", "trade_id": "t1",
+                                  "kind": "RELEASE",
+                                  "ts_text": "2026-08-08T10:00:02"}]),
+                     encoding="utf-8")
+    evs = tmp_path / "events.json"
+    evs.write_text(json.dumps([{"record": "submission", "trade_id": "t1",
+                                "kind": "RELEASE_DECISION",
+                                "ts_text": "NOT-A-TIMESTAMP"}]),
+                   encoding="utf-8")
+    result = build_snapshot([str(fills), str(evs)],
+                            str(tmp_path / "out"))
+    assert isinstance(result, tuple) and result[0] == "REFUSED", result
+    assert "timestamp" in result[1].lower(), result
+
+
+def test_missing_quote_contract_unavailable():
+    # v3(2): a quote WITHOUT a contract can never attach — unavailable
+    events = [{"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
+               "decision_ts_ms": 1_700_000_100_000, "contract": "TMFH6",
+               "position_side": "SHORT"}]
+    quotes = [{"leg": "near", "bid": 50.0, "ask": 100.0,
+               "quote_exchange_ts": 1_700_000_000_000,
+               "quote_source": "bbo_near", "close_action": "SHORT"}]
+    result = attach_quotes(events, quote_records=quotes)
+    q = result[0]["quotes"]["near"]
+    assert isinstance(q, dict) and q.get("available") is False, q
+    assert "contract" in q.get("reason", ""), q
+
+
+def test_close_side_provenance_validated():
+    # v3(2): close_action is validated against the pre-decision position
+    # record — a mismatched quote claim is unavailable; a matching claim
+    # attaches with the position-derived close_action
+    base = {"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
+            "decision_ts_ms": 1_700_000_100_000, "contract": "TMFH6",
+            "position_side": "LONG"}
+    quote = {"leg": "near", "contract": "TMFH6",
+             "bid": 50.0, "ask": 100.0,
+             "quote_exchange_ts": 1_700_000_000_000,
+             "quote_source": "bbo_near", "close_action": "SHORT"}
+    result = attach_quotes([base], [quote])
+    q = result[0]["quotes"]["near"]
+    assert isinstance(q, dict) and q.get("available") is False, q
+    assert "close_action" in q.get("reason", ""), q
+    quote_ok = dict(quote, close_action="LONG")
+    result2 = attach_quotes([base], [quote_ok])
+    q2 = result2[0]["quotes"]["near"]
+    assert q2.get("available") is True, q2
+    assert q2.get("close_action") == "LONG", \
+        "close_action must come from the validated position side"
+
+
+def test_manifest_failure_leaves_zero_files(tmp_path, monkeypatch):
+    # v3(3): all-or-nothing — a manifest failure removes every
+    # newly-created output file/dir (zero files, no partial output)
+    import scripts.research.event_snapshot.builder as bmod
+    fills = tmp_path / "fills.json"
+    fills.write_text(json.dumps([{"record": "fill", "trade_id": "t1",
+                                  "kind": "RELEASE",
+                                  "ts_text": "2026-08-08T10:00:02"}]),
+                     encoding="utf-8")
+    evs = tmp_path / "events.json"
+    evs.write_text(json.dumps([{"record": "submission", "trade_id": "t1",
+                                "kind": "RELEASE_DECISION",
+                                "ts_text": "2026-08-08T10:00:00"}]),
+                   encoding="utf-8")
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(bmod, "emit_manifest", boom)
+    out = tmp_path / "out"
+    result = build_snapshot([str(fills), str(evs)], str(out))
+    assert isinstance(result, tuple) and result[0] == "REFUSED", result
+    assert not out.exists(), "zero newly-created files on failure"
