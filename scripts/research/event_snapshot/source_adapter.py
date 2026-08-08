@@ -30,11 +30,6 @@ def _parse_ts(ts_text):
         return None
 
 
-def _ctx(source, sha, record_no, byte_offset):
-    return {"source": source, "sha256": sha, "record_no": record_no,
-            "byte_offset": byte_offset, "byte_hash": sha}
-
-
 def adapt_fill(raw, source_ctx):
     """fills JSONL record -> normalized fill. fill_type must be a known
     enum; ENTRY sides LONG/SHORT; qty > 0. contract is the NEAR/FAR LABEL."""
@@ -98,36 +93,68 @@ def _norm_ts(v):
     return int(v)
 
 
-def _parse_jsonl(path):
-    """Read bytes ONCE; parse each line with its ACTUAL byte offset."""
-    with open(path, "rb") as f:
-        data = f.read()
-    sha = hashlib.sha256(data).hexdigest()
+def _iter_jsonl(path, quote_window=None):
+    """Stream a JSONL source ONCE (read-once contract): yields
+    (record, record_no, byte_offset) with the ACTUAL byte offset per
+    line. quote_window bounds BBO retention inline — the full record
+    list is never held in memory. Malformed/torn line -> ValueError
+    (REFUSED)."""
     offset = 0
-    records = []
-    for i, raw_line in enumerate(data.splitlines(keepends=True), start=1):
-        line = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
-        if line.endswith(b"\r"):
-            line = line[:-1]
-        if not line.strip():
+    record_no = 0
+    with open(path, "rb") as f:
+        for raw_line in f:
+            line = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
+            if line.endswith(b"\r"):
+                line = line[:-1]
             offset += len(raw_line)
-            continue
-        try:
-            rec = json.loads(line)
-        except ValueError as e:
-            raise ValueError(
-                f"{path}: line {i} (byte {offset}) unparseable: {e}") from e
-        if not isinstance(rec, dict):
-            raise ValueError(f"{path}: line {i} not a JSON object")
-        records.append((rec, i, offset))
-        offset += len(raw_line)
-    return records, sha
+            if not line.strip():
+                continue
+            record_no += 1
+            try:
+                rec = json.loads(line)
+            except ValueError as e:
+                raise ValueError(
+                    f"{path}: line {record_no} (byte "
+                    f"{offset - len(raw_line)}) unparseable: {e}") from e
+            if not isinstance(rec, dict):
+                raise ValueError(f"{path}: line {record_no} not a JSON object")
+            if quote_window is not None and \
+                    rec.get("event_type") == "BBO_UPDATE":
+                ts = rec.get("exchange_ts_ms")
+                if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                    continue
+                if not (quote_window[0] <= int(ts) <= quote_window[1]):
+                    continue
+            yield rec, record_no, offset - len(raw_line)
 
 
-def normalize_sources(input_paths):
-    """Parse each JSONL source ONCE; adapt every record. Unsupported raw
+def _sha_of(path):
+    """Streaming sha256 of a source's exact bytes (one pass)."""
+    sha = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
+def _sniff_kind(path):
+    """Classify a source file by its first line without full parsing:
+    bbo vs fills/events (each file is then read exactly ONCE)."""
+    with open(path, "rb") as f:
+        first = f.readline()
+    try:
+        rec = json.loads(first)
+    except ValueError:
+        return "records"  # malformed -> REFUSED later at full parse
+    return "bbo" if rec.get("event_type") == "BBO_UPDATE" else "records"
+
+
+def normalize_sources(input_paths, quote_window=None):
+    """Stream each JSONL source ONCE; adapt every record. Unsupported raw
     tick CSV or malformed/torn line -> ("REFUSED", reason). Unknown
-    fill_type records are COUNTED (never silently dropped)."""
+    fill_type records are COUNTED (never silently dropped). quote_window
+    (min_ts, max_ts) bounds BBO retention — quotes outside the anchor
+    window are never held in memory."""
     fills, events, quotes = [], [], []
     sources = []
     unknown_fill_types = {}
@@ -135,30 +162,31 @@ def normalize_sources(input_paths):
         if str(path).lower().endswith(".csv"):
             return ("REFUSED", f"unsupported raw tick CSV: {path}")
         try:
-            records, sha = _parse_jsonl(path)
+            for rec, record_no, byte_offset in _iter_jsonl(
+                    path, quote_window):
+                ctx = {"source": str(path), "record_no": record_no,
+                       "byte_offset": byte_offset}
+                if rec.get("event_type") == "BBO_UPDATE":
+                    r = adapt_bbo(rec, ctx)
+                    if not isinstance(r, tuple):
+                        quotes.append(r)
+                elif rec.get("fill_type"):
+                    if rec["fill_type"] in FILL_TYPES:
+                        r = adapt_fill(rec, ctx)
+                        if not isinstance(r, tuple):
+                            fills.append(r)
+                    else:
+                        unknown_fill_types[rec["fill_type"]] = \
+                            unknown_fill_types.get(rec["fill_type"], 0) + 1
+                elif rec.get("event") in ANCHOR_EVENT_KINDS or (
+                        rec.get("event") == "ORDER_SUBMITTED"
+                        and rec.get("strategy") == "MTS_RELEASE"):
+                    r = adapt_spread_event(rec, ctx)
+                    if not isinstance(r, tuple):
+                        events.append(r)
         except (OSError, ValueError) as e:
             return ("REFUSED", str(e))
-        for rec, rec_no, off in records:
-            ctx = _ctx(str(path), sha, rec_no, off)
-            if rec.get("event_type") == "BBO_UPDATE":
-                r = adapt_bbo(rec, ctx)
-                if not isinstance(r, tuple):
-                    quotes.append(r)
-            elif rec.get("fill_type"):
-                if rec["fill_type"] in FILL_TYPES:
-                    r = adapt_fill(rec, ctx)
-                    if not isinstance(r, tuple):
-                        fills.append(r)
-                else:
-                    unknown_fill_types[rec["fill_type"]] = \
-                        unknown_fill_types.get(rec["fill_type"], 0) + 1
-            elif rec.get("event") in ANCHOR_EVENT_KINDS or (
-                    rec.get("event") == "ORDER_SUBMITTED"
-                    and rec.get("strategy") == "MTS_RELEASE"):
-                r = adapt_spread_event(rec, ctx)
-                if not isinstance(r, tuple):
-                    events.append(r)
-        sources.append({"path": str(path), "sha256": sha})
+        sources.append({"path": str(path), "sha256": _sha_of(path)})
     return {"fills": fills, "events": events, "quotes": quotes,
             "sources": sources,
             "unknown_fill_types": unknown_fill_types}
@@ -399,8 +427,11 @@ def build_normalized_snapshot(input_paths, out_dir, mapping_input=None):
         out_dir = _exclusive_out_dir(out_dir)
     except FileExistsError as e:
         return ("REFUSED", str(e))
+    # two-pass: fills/events first (small) -> anchors -> bounded BBO window
+    record_paths = [p for p in (input_paths or []) if _sniff_kind(p) != "bbo"]
+    bbo_paths = [p for p in (input_paths or []) if _sniff_kind(p) == "bbo"]
     try:
-        norm = normalize_sources(input_paths)
+        norm = normalize_sources(record_paths)
     except (OSError, ValueError) as e:
         _cleanup(out_dir, [])
         return ("REFUSED", str(e))
@@ -411,6 +442,26 @@ def build_normalized_snapshot(input_paths, out_dir, mapping_input=None):
     if isinstance(anchors, tuple):
         _cleanup(out_dir, [])
         return anchors
+    decisions = [a.get("parsed_ts") for a in anchors
+                 if not isinstance(a, tuple)
+                 and _valid_epoch_ms(a.get("parsed_ts"))]
+    if decisions:
+        lookback = params["max_age_s"] * 1000
+        window = (min(decisions) - lookback, max(decisions))
+    else:
+        window = None
+    if bbo_paths:
+        try:
+            bbo_norm = normalize_sources(bbo_paths, quote_window=window)
+        except (OSError, ValueError) as e:
+            _cleanup(out_dir, [])
+            return ("REFUSED", str(e))
+        if isinstance(bbo_norm, tuple):
+            _cleanup(out_dir, [])
+            return bbo_norm
+        norm["quotes"] = bbo_norm.get("quotes", [])
+        norm["sources"] = norm.get("sources", []) + bbo_norm.get(
+            "sources", [])
     events_list = []
     refused = []
     event_map = {}
