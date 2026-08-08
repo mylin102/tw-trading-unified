@@ -113,8 +113,19 @@ def test_safety_stop_placement_ready_permits_place():
 def test_safety_stop_cancel_quarantined_zero_calls():
     m = _monitor_stub(_quarantined_ctx(),
                       safety_trade=SimpleNamespace(ts=1))
-    m._cancel_safety_stop()
+    result = m._cancel_safety_stop()
     assert not m.api.calls, f"quarantined safety-stop cancel: {m.api.calls}"
+    assert isinstance(result, dict) and result.get("blocked") is True, \
+        f"quarantined cancel must return a structured blocked reason: {result}"
+    assert "audit_reasons" in result, result
+
+
+def test_safety_stop_cancel_ready_permits_cancel():
+    m = _monitor_stub(_ready_ctx(), safety_trade=SimpleNamespace(ts=1))
+    m._cancel_safety_stop()
+    kinds = [c[0] for c in m.api.calls]
+    assert "cancel_order" in kinds, \
+        f"LIVE_READY must permit the safety-stop cancel: {kinds}"
 
 
 def test_execute_trade_quarantined_zero_calls():
