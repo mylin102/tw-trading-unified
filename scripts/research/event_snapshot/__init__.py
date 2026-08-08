@@ -1,8 +1,10 @@
-"""Reconciled event snapshot builder + runtime source adapter —
-research-only.
+"""Reconciled event snapshot builder — research-only.
 
-Builder API (six P0 contracts) + source adapter API (runtime schema
-mappings, shioaji_bidask allowlist, no last-price/OHLC conversion).
+Re-exports the implemented API from builder.py (six P0 contracts):
+legal same-trade decision anchor, byte/record provenance + deterministic
+ties, executable BBO feed allowlist with typed unavailable legs,
+pre-anchor contract/leg/close-side validation, exclusive no-overwrite
+atomic events+manifest output, read-once hash binding.
 """
 
 from scripts.research.event_snapshot.builder import (  # noqa: F401
@@ -17,13 +19,10 @@ from scripts.research.event_snapshot.builder import (  # noqa: F401
     order_events,
     read_source_once,
 )
-
 from scripts.research.event_snapshot.source_adapter import (  # noqa: F401
     ANCHOR_EVENT_KINDS,
     BBO_SOURCE_ALLOWLIST,
     FILL_TYPES,
-    NORMALIZED_SCHEMA,
-    SIDE_MAP,
     adapt_bbo,
     adapt_fill,
     adapt_spread_event,
@@ -31,4 +30,5 @@ from scripts.research.event_snapshot.source_adapter import (  # noqa: F401
     join_anchor,
     join_positions,
     normalize_sources,
+    resolve_contract_mapping,
 )
