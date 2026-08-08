@@ -29,6 +29,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.research.phase_transition_replay import engine
 from scripts.research.phase_transition_replay import execution
 from scripts.research.phase_transition_replay import preregistration
 from scripts.research.phase_transition_replay import stream
@@ -227,11 +228,10 @@ def main(argv=None):
                    help="explicit authorization to run the engine")
     args = p.parse_args(argv)
 
-    if not args.dry_run:
-        # the engine is NOT implemented: any non-dry-run attempt is a
-        # REFUSED, zero output — never a fake success
-        print("REFUSED: engine not implemented; only --dry-run is accepted",
-              file=sys.stderr)
+    if not args.dry_run and not args.authorize:
+        # the engine is implemented but requires EXPLICIT --authorize:
+        # any non-dry-run attempt without it is a REFUSED, zero output
+        print("REFUSED: engine requires --authorize", file=sys.stderr)
         return 3
 
     prov_ok, provenance = git_provenance()
@@ -296,8 +296,9 @@ def main(argv=None):
         "kept_records": kept_records,
         "censored_reasons": [{"event_seq": e.get("source_event_seq"),
                               "reason": r} for e, r in censored],
-        "dry_run": True,
-        "engine_run": False,
+        "dry_run": bool(args.dry_run),
+        "engine_run": bool(not args.dry_run),
+        "engine": None if args.dry_run else _run_engine(kept, params),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
@@ -306,6 +307,42 @@ def main(argv=None):
         print(f"REFUSED: {e}", file=sys.stderr)
         return 6
     return 0
+
+
+def _run_engine(kept, params):
+    """Authorized engine path (research-only). Each kept event goes
+    through the CANONICAL engine.arm_pnl — which calls the canonical
+    classify.classify_outcome (never a duplicate classifier). Any event
+    with insufficient data fails closed to INDETERMINATE_DATA_QUALITY
+    with the reason recorded; zero fabricated arm values."""
+    eligible = []
+    fail_closed = []
+    arms_agg = {}
+    delta_agg = {}
+    labels = {}
+    for ev, _r in kept:
+        status, payload = engine.arm_pnl(ev, params)
+        seq = ev.get("source_event_seq")
+        if status != "ok":
+            fail_closed.append({"event_seq": seq, "reason": payload})
+            continue
+        eligible.append(seq)
+        for k, v in payload["arms"].items():
+            arms_agg.setdefault(k, []).append(v)
+        for k, v in payload["pairwise_deltas"].items():
+            delta_agg.setdefault(list(k), []).append(v)
+        labels[payload["classification"]] = \
+            labels.get(payload["classification"], 0) + 1
+    return {
+        "n_eligible": len(eligible),
+        "n_fail_closed": len(fail_closed),
+        "fail_closed_reasons": [f["reason"] for f in fail_closed],
+        "arms": {k: {"mean": sum(v) / len(v), "n": len(v)}
+                 for k, v in arms_agg.items()},
+        "pairwise_deltas": {k: {"mean": sum(v) / len(v), "n": len(v)}
+                            for k, v in delta_agg.items()},
+        "classifications": labels,
+    }
 
 
 if __name__ == "__main__":
