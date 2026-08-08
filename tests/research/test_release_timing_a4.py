@@ -33,13 +33,16 @@ def test_safety_escapes_terminate_armed():
 
 
 def test_safety_escape_terminal_r3_must_not_continue():
-    # A4 v2.1 (1): after a safety escape fires, explicitly CALLING R3 must
-    # be rejected/terminal — not merely asserting a string
-    state_machine.safety_escape("max_wait")
-    outcome = decision.decide(
-        theta={}, state="TERMINATED", extrema={}, params={})
-    assert outcome != "R3", \
-        "R3 must be rejected after a terminal safety escape"
+    # A4 v2.2 (2): a safety escape must return a typed TerminalDecision /
+    # raise a specific exception; after it fires there is ZERO R3
+    # transition and ZERO order candidate — not merely "!= R3"
+    td = state_machine.safety_escape("max_wait")
+    assert td.__class__.__name__ == "TerminalDecision", td
+    assert td.cause == "max_wait" and td.terminal is True
+    with pytest.raises(Exception) as ei:
+        decision.decide(theta={}, state=td, extrema={}, params={})
+    assert type(ei.value).__name__ == "TerminalDecision" or \
+        "terminal" in type(ei.value).__name__.lower(), ei.value
 
 
 def test_pending_conflict_escapes():
@@ -59,8 +62,8 @@ def test_breach_snapshot_fields():
 
 
 def test_pre_breach_clone_completeness():
-    # A4 v2.1 (2): a VALUE-COMPLETE clone; mutating the actual branch must
-    # NOT change the A4 clone; any missing field really yields NOT_AVAILABLE
+    # A4 v2.2 (1): the clone API must return a TYPED NOT_AVAILABLE result
+    # naming the exact missing field — no vacuous fallback
     schema = breach.clone_schema_version()
     required = {"positions", "policy_peak", "guard_warmup", "guard_armed",
                 "atr", "reference_prices", "pending_candidates",
@@ -72,15 +75,16 @@ def test_pre_breach_clone_completeness():
     clone = breach.clone_point_before_breach(event_seq=10)
     assert clone is not None
     for field in required:
-        missing = dict(clone)
-        missing.pop(field, None)
-        assert breach.clone_point_before_breach(
-            event_seq=10, missing_fields={field}) is None or \
-            missing is not None
+        result = breach.clone_point_before_breach(
+            event_seq=10, missing_fields={field})
+        assert isinstance(result, tuple) and result[0] == "NOT_AVAILABLE", \
+            f"missing {field} must yield typed NOT_AVAILABLE: {result}"
+        assert field in result[1], \
+            f"NOT_AVAILABLE must name the exact missing field: {result}"
 
 
 def test_clone_immune_to_actual_branch_mutation():
-    # A4 v2.1 (2b): mutate the ACTUAL-release branch state — the A4 clone
+    # A4 v2.2 (2b): mutate the ACTUAL-release branch state — the A4 clone
     # (taken before the breach) must remain unchanged
     clone_a = breach.clone_point_before_breach(event_seq=10)
     clone_b = breach.clone_point_before_breach(
@@ -118,34 +122,56 @@ def test_families_pre_registered_grids():
 
 
 def test_theta_sweep_no_selection():
-    # A4 v2.1 (4): per-metric unit/rationale + FINITE preregistered grid;
-    # nested thresholds all reported, no winner selection
+    # A4 v2.2 (4): every grid value FINITE + explicit unit/rationale per
+    # metric; NO default-true — all nested threshold result rows asserted
     reg = families.theta_registry()
+    assert reg, "registry must be non-empty"
     for metric, spec in (reg or {}).items():
         assert "unit" in spec and "rationale" in spec and "grid" in spec, \
             f"theta spec incomplete for {metric}: {spec}"
-        assert isinstance(spec["grid"], (list, tuple)) and spec["grid"], \
+        assert spec["unit"], f"explicit unit required for {metric}"
+        assert spec["rationale"], f"explicit rationale required for {metric}"
+        grid = spec["grid"]
+        assert isinstance(grid, (list, tuple)) and grid, \
             f"finite preregistered grid required for {metric}"
+        assert all(isinstance(v, (int, float)) and v == v
+                   and v != float("inf") and v != float("-inf")
+                   for v in grid), f"all grid values must be finite: {metric}"
     plan = families.sweep_plan(
         single_factor=["z", "leg_recovery", "combined_recovery"],
         factorial_subset={"z_x_leg": 3})
-    assert plan is not None and plan.get("reports_all_thetas", True), \
-        "every theta must be reported — no winner-by-max"
+    assert "reports_all_thetas" in plan, \
+        "reports_all_thetas must be explicit — no default-true"
+    assert plan["reports_all_thetas"] is True
+    rows = plan.get("nested_threshold_rows")
+    assert rows, "all nested threshold result rows must be asserted"
+    assert isinstance(rows, (list, tuple)) and len(rows) >= 3, \
+        "0/-100/-200 nested rows must all be present"
 
 
 def test_decision_rule_no_future_information():
-    # A4 v2.1 (5): a FUTURE sentinel event must not affect the decision —
-    # the decision rule reads only past events; the forward evaluator
-    # reads the future separately
-    base = decision.decide(theta={}, state="RELEASE_ARMED", extrema={},
-                           params={})
-    with_future = decision.decide(
-        theta={}, state="RELEASE_ARMED", extrema={}, params={},
-        future_sentinel={"event": "REVERSAL", "ts": 999999})
-    assert base == with_future, \
-        "decision rule must not read future information"
-    assert decision.forward_outcome_separate(
-        decision_rule={"action": "R0"}, forward_outcome={}) is not None
+    # A4 v2.2 (5): a FUTURE sentinel is embedded in the immutable stream
+    # AFTER the decision time; the decision trace/read-set must EXCLUDE
+    # its replay_seq while the forward evaluator consumes it
+    events, stream_hash, clock = stream.ordered_stream(
+        events=[{"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101},
+                {"source_event_seq": 2, "exchange_ts": 102, "recv_ts": 103},
+                {"source_event_seq": 3, "exchange_ts": 200, "recv_ts": 201,
+                 "sentinel": "REVERSAL"}],
+        clock_contract="immutable-global")
+    decision_ts = events[0]["replay_seq"]
+    future_seqs = {e["replay_seq"] for e in events
+                   if e["replay_seq"] > decision_ts}
+    assert future_seqs, "the stream must contain future events"
+    trace = decision.decide_trace(theta={}, state="RELEASE_ARMED",
+                                  extrema={}, params={}, events=events)
+    read_set = set(trace.get("read_replay_seqs", []))
+    assert read_set, "decision trace must report its read-set"
+    assert not (read_set & future_seqs), \
+        f"decision read-set must exclude future replay_seqs: {read_set}"
+    assert max(read_set) <= decision_ts
+    assert decision.forward_evaluator(
+        events=events, decision_ts=decision_ts) is not None
 
 
 # ── R3 deterministic bounded progression ────────────────────────────────────
@@ -161,9 +187,8 @@ def test_r3_deterministic_bounded():
 
 
 def test_all_branches_share_one_immutable_stream():
-    # A4 v2.1 (3): manifest must carry source_event_seq/exchange_ts/
-    # recv_ts/replay_seq + stream hash; all four branches share the SAME
-    # object/hash with identical derived-bar sequences
+    # A4 v2.2 (3): four branch CONSUMERS share the SAME stream object
+    # identity/hash with identical derived bars — not two state keys
     events, stream_hash, clock = stream.ordered_stream(
         events=[{"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101},
                 {"source_event_seq": 2, "exchange_ts": 102, "recv_ts": 103}],
@@ -172,9 +197,13 @@ def test_all_branches_share_one_immutable_stream():
         assert {"source_event_seq", "exchange_ts", "recv_ts", "replay_seq"} \
             <= set(ev), f"manifest fields missing: {ev}"
     assert stream_hash is not None
-    branches_a = branches.branch_state_key(level=1, event_seq=42)
-    branches_b = branches.branch_state_key(level=1, event_seq=42)
-    assert branches_a == branches_b
+    consumers = []
+    for i in range(4):
+        consumers.append(branches.derived_bars(events))
+    assert len({id(c) for c in consumers}) == 1, \
+        "all four branch consumers must share the same stream object"
+    assert all(c == consumers[0] for c in consumers), \
+        "identical derived-bar sequences across branches"
     assert clock == "immutable-global"
 
 
@@ -229,14 +258,22 @@ def test_reuses_replay_contracts_not_ad_hoc():
 
 
 def test_reports_reuse_replay_classify_contract():
-    # A4 v2.1 (6): value-bearing outcomes must actually produce the four
-    # absolute Y, six pairwise deltas, evidence-first classification and
-    # interval dominance — not just module identity
-    from scripts.research.phase_transition_replay import classify as rclassify
+    # A4 v2.2 (6): EXACT Y0..Y3 values, EXACTLY six named deltas with
+    # expected values, evidence-gate precedence and the ACTUAL interval
+    # classification result — not non-None/hasattr
     from scripts.research.release_timing_a4 import reports as a4_reports
-    outcome = a4_reports.paired_delta_vs_immediate(
-        arm={"Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0},
-        immediate={"Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0})
-    assert outcome is not None
-    assert hasattr(rclassify, "classify_outcome") and \
-        hasattr(rclassify, "family_intervals")
+    matrix = a4_reports.arm_matrix(arms={
+        "Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0})
+    assert matrix["absolute_Y"] == \
+        {"Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0}, \
+        f"exact four absolute Y required: {matrix.get('absolute_Y')}"
+    deltas = matrix["pairwise_deltas"]
+    assert set(deltas) == {"d01", "d02", "d03", "d12", "d13", "d23"}, \
+        f"exactly six named deltas required: {set(deltas)}"
+    assert deltas["d02"] == pytest.approx(-260.0), deltas["d02"]
+    assert matrix["evidence_gate_precedence"] is True, \
+        "evidence gate must precede every economic classification"
+    label = matrix["interval_classification"]
+    assert label in ("INDETERMINATE_DATA_QUALITY", "RELEASE_HARMFUL",
+                     "RELEASE_BENEFICIAL", "RELEASE_OK_MANAGEMENT_BAD",
+                     "INCONCLUSIVE_NEUTRAL"), label

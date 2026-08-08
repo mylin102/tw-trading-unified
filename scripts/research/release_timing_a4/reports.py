@@ -1,11 +1,10 @@
-"""Required reports — skeletal (A4 v2: reuse phase-transition contracts).
-
-Reuses phase_transition_replay.classify: four absolute Y, six pairwise
-deltas, interval dominance, evidence-first classifier — never a new
-ad hoc metric stack.
-"""
+"""Required reports — skeletal (A4 v2.2: exact 4Y/6delta matrix)."""
 
 from scripts.research.phase_transition_replay import classify as _replay_classify  # noqa: F401
+
+
+def arm_matrix(arms):
+    raise NotImplementedError("reports.arm_matrix: exact Y0..Y3 + exactly six named pairwise deltas (d01..d23) with expected values")
 
 
 def paired_delta_vs_immediate(arm, immediate):
