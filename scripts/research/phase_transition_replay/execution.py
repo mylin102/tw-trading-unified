@@ -25,7 +25,7 @@ def _valid_price(v):
 
 def _age_ok(q, max_age):
     """Fail-closed freshness: age missing/NaN/negative/timeout is NOT ok."""
-    age = getattr(q, "age_s", None)
+    age = q.get("age_s") if isinstance(q, dict) else getattr(q, "age_s", None)
     if age is None:
         return False, "age missing"
     try:
@@ -43,7 +43,8 @@ def _age_ok(q, max_age):
 
 def _close_action(q):
     """Explicit LONG/SHORT only — anything else is fail-closed."""
-    action = getattr(q, "close_action", None)
+    action = (q.get("close_action") if isinstance(q, dict)
+              else getattr(q, "close_action", None))
     if action not in ("LONG", "SHORT"):
         return None, f"close_action {action!r} not LONG/SHORT"
     return action, None
@@ -72,8 +73,8 @@ def executable_prices(quotes, decision_ts, staleness_bounds):
         if not ok:
             reasons.append(f"{side}: {why}")
             continue
-        bid = getattr(q, "bid", None)
-        ask = getattr(q, "ask", None)
+        bid = q.get("bid") if isinstance(q, dict) else getattr(q, "bid", None)
+        ask = q.get("ask") if isinstance(q, dict) else getattr(q, "ask", None)
         if not _valid_price(bid):
             reasons.append(f"{side}: bid missing/zero/NaN")
             continue
