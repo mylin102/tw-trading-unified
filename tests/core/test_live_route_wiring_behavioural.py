@@ -130,9 +130,13 @@ def test_safety_stop_cancel_ready_permits_cancel():
 
 def test_execute_trade_quarantined_zero_calls():
     m = _monitor_stub(_quarantined_ctx(), safety_trade=SimpleNamespace(ts=1))
-    m._execute_trade("EXIT", 44300, "2026-08-08T10:00:00", 1, reason="TEST")
+    result = m._execute_trade("EXIT", 44300, "2026-08-08T10:00:00", 1,
+                              reason="TEST")
     assert not m.client.calls, f"quarantined execute_trade: {m.client.calls}"
     assert not m.api.calls, f"quarantined safety-stop cancel: {m.api.calls}"
+    assert isinstance(result, dict) and result.get("blocked") is True, \
+        f"quarantined execute_trade must return a structured blocked result: {result}"
+    assert "audit_reasons" in result, result
 
 
 def test_execute_trade_ready_permits_intended_place():
