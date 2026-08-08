@@ -225,12 +225,14 @@ def test_reconnect_quarantines_before_relogin_and_recertifies():
 
 def test_execution_context_persisted_for_dashboard():
     """(4) RED: the execution context (effective_mode + audit_reasons) must
-    be PERSISTED to a dashboard-readable file at every transition (to_dict
-    alone is in-memory) with a restart-read round-trip."""
+    be PERSISTED to the canonical dashboard-readable file
+    ({TRADING_RUNTIME_DIR}/execution_context.json — core/execution_context_state)
+    at every transition (to_dict alone is in-memory) with a restart-read
+    round-trip."""
     monitor = _monitor_path()
     text = monitor.read_text(encoding="utf-8")
-    assert "futures_execution_context.json" in text, \
-        "execution-context persistence write point not wired"
+    assert "execution_context_state" in text, \
+        "execution-context persistence write point not wired into monitor"
 
 
 def test_release_head_check_in_release_tree():
