@@ -710,6 +710,21 @@ def test_runner_refuses_preexisting_dir_with_file(tmp_path):
     assert not (out / "manifest.json").exists(), "zero output on refusal"
 
 
+def test_manifest_atomic_no_replace(tmp_path):
+    # P0-2 race hardening: a manifest target created CONCURRENTLY (before
+    # the atomic finalization) is never overwritten — os.link no-replace
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / "manifest.json"
+    target.write_text("OLD", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        run_replay._write_manifest_atomic(str(out), {"dry_run": True})
+    assert target.read_text(encoding="utf-8") == "OLD", \
+        "concurrent creator must never be clobbered"
+    leftovers = [p for p in out.iterdir() if p.name != "manifest.json"]
+    assert leftovers == [], f"temp file must be cleaned up: {leftovers}"
+
+
 # ── reuse contract: the skeleton must wire the COMMITTED exit_attribution ───
 
 def test_pipeline_reuses_committed_exit_attribution():
