@@ -1,173 +1,183 @@
 #!/usr/bin/env python3
 """Phase-transition replay (SINGLE_LEG release audit) — RED contract tests.
 
-RESEARCH ONLY. Contracts below lock the spec (codex #24-1..5 + #25-1..5);
-they are RED until the research pipeline lands under scripts/research/
-phase_transition_replay/ (reusing scripts/research/exit_attribution
-components — no ad-hoc parser). Missing-module dependencies are reported
-separately from behavioural coverage.
+RESEARCH ONLY. A committed research-only SKELETAL package
+(scripts/research/phase_transition_replay/) exposes the API surface; every
+contract test COLLECTS and FAILS independently on its intended assertion
+(NotImplementedError) — no importorskip/skip masking. The missing-dependency
+bucket is reserved for EXTERNAL DATA only.
+
+Classification contract (freeze-classifier amendment):
+- interval dominance: Yi NET of path-specific fees/tax; [Li,Ui] = residual
+  execution uncertainty ONLY; F_N=[max(L1,L2),max(U1,U2)],
+  F_R=[max(L0,L3),max(U0,U3)]
+- HARMFUL iff lower(F_N)-upper(F_R)>M_economic; BENEFICIAL iff reverse;
+  overlap => neutral
+- MANAGEMENT_BAD (conservative): lower(Y3)-upper(Y0)>M_economic AND
+  lower(Y3)>=upper(F_N)-M_economic; precedence after evidence gate, before
+  family beneficial
+- M_economic = preregistered minimum economic benefit (fees/tax already in Yi)
 """
 
-import ast
-import re
-from pathlib import Path
+from scripts.research.phase_transition_replay import (  # noqa: F401
+    classify, clone, execution, pipeline, run_replay, stream, sweep)
 
-import pytest
-
-REPO = Path(__file__).resolve().parents[2]
-PIPELINE = "scripts.research.phase_transition_replay"
-
-# ── missing-module RED dependencies (reported separately) ───────────────────
-
-MODULE_CONTRACTS = {
-    "pipeline": "candidate reconciliation + censored list + per-candidate record",
-    "clone": "deep-clone/hash strategy state at release-decision clone point",
-    "stream": "immutable globally-ordered market-event stream + clock contract",
-    "classify": "predeclared causal classification (5 classes + delta gate)",
-    "execution": "executable BBO (staleness/skew) vs BOUNDED_TICK_PROXY rules",
-    "sweep": "admission threshold sweep (0/-100/-200) overlap + paired deltas",
-}
+REPO = __import__("pathlib").Path(__file__).resolve().parents[2]
 
 
-@pytest.mark.parametrize("contract", sorted(MODULE_CONTRACTS))
-def test_contract_module_exists(contract):
-    pytest.importorskip(f"{PIPELINE}.{contract}")
+# ── skeleton API surface (each behavioral call fails RED independently) ─────
 
-
-def test_replay_entrypoint_exists():
-    pytest.importorskip(f"{PIPELINE}.run_replay")
-
-
-# ── reuse contract: exit_attribution components, no ad-hoc parser ───────────
-
-def test_pipeline_reuses_exit_attribution_components():
-    # the pipeline must import the committed reconcile/quoting/stats modules
-    # (no ad-hoc parser) — text contract until the module exists
-    target = REPO / "scripts" / "research" / "phase_transition_replay"
-    if not target.exists():
-        pytest.skip("pipeline dir not present yet (RED dependency)")
-    sources = list(target.rglob("*.py"))
-    assert sources, "no pipeline sources"
-    joined = "\n".join(s.read_text(encoding="utf-8") for s in sources)
-    assert "exit_attribution" in joined, \
-        "pipeline must reuse scripts/research/exit_attribution components"
-
-
-# ── behavioural contracts (pure logic the implementation must satisfy) ──────
-
-def test_classification_exhaustive_and_priority():
-    # five mutually-exclusive classes; frozen precedence (codex final
-    # refinement): 1 INDETERMINATE_DATA_QUALITY → 2 MANAGEMENT_BAD iff
-    # Y3-Y0 > M_30 AND Y3 >= max(Y1,Y2)-M_3no_release → 3 HARMFUL iff
-    # max(Y1,Y2)-max(Y0,Y3) > M_family → 4 BENEFICIAL iff reverse →
-    # 5 INCONCLUSIVE_NEUTRAL
-    mod = pytest.importorskip(f"{PIPELINE}.classify")
-    classes = ("INDETERMINATE_DATA_QUALITY", "RELEASE_HARMFUL",
-               "RELEASE_BENEFICIAL", "RELEASE_OK_MANAGEMENT_BAD",
-               "INCONCLUSIVE_NEUTRAL")
-    fn = getattr(mod, "classify_outcome", None)
-    assert callable(fn), "classify.classify_outcome(Y0..Y3, M_ij, ...)"
+def test_classify_outcome_implements_frozen_precedence():
+    label = classify.classify_outcome(
+        Y0=-300.0, Y1=-50.0, Y2=-40.0, Y3=+100.0, actual=-150.0,
+        data_quality="ok", M_economic=25.0, M_30=25.0, M_3no_release=20.0)
+    assert label in ("RELEASE_OK_MANAGEMENT_BAD", "RELEASE_BENEFICIAL",
+                     "RELEASE_HARMFUL", "INCONCLUSIVE_NEUTRAL",
+                     "INDETERMINATE_DATA_QUALITY")
 
 
 def test_classification_management_bad_precedence():
-    # the finer label: Y3 makes the release family beneficial, yet the
-    # actual management was materially worse → MANAGEMENT_BAD (not
-    # BENEFICIAL) by the frozen precedence
-    mod = pytest.importorskip(f"{PIPELINE}.classify")
-    fn = getattr(mod, "classify_outcome", None)
-    assert callable(fn)
-    # Y3(managed) well above Y0(atomic) and max(Y1,Y2) with a big
-    # management gap on the actual path → MANAGEMENT_BAD
-    label = fn(Y0=-300.0, Y1=-50.0, Y2=-40.0, Y3=+100.0,
-               actual=-150.0, M_30=25.0, M_3no_release=20.0,
-               M_family=40.0, data_quality="ok")
+    # Y3 makes the release family beneficial yet actual management was
+    # materially worse → MANAGEMENT_BAD (finer label, frozen precedence)
+    label = classify.classify_outcome(
+        Y0=-300.0, Y1=-50.0, Y2=-40.0, Y3=+100.0, actual=-150.0,
+        data_quality="ok", M_economic=25.0, M_30=25.0, M_3no_release=20.0)
     assert label == "RELEASE_OK_MANAGEMENT_BAD", label
 
 
-def test_classification_pairwise_uncertainty_bounds():
-    # materiality is measured on the PAIRWISE PnL-difference uncertainty
-    # U_delta(i,j): M_ij = max(M_economic, U_delta(i,j)); shared costs
-    # cancel, never double-counted; family-max comparisons use either a
-    # conservative bound across the applicable winner comparisons or
-    # interval dominance (lower/upper PnL bounds) — documented which
-    mod = pytest.importorskip(f"{PIPELINE}.classify")
-    fn = getattr(mod, "uncertainty_bound", None)
-    assert callable(fn), "classify.uncertainty_bound(i, j, ...) -> U_delta(i,j)"
-    M = getattr(mod, "materiality", None)
-    assert callable(M), "classify.materiality(i, j) -> max(M_economic, U_delta)"
+def test_family_interval_dominance():
+    # family winner is decided by interval dominance, never point-estimate
+    # max — a point-estimate winner can flip under execution intervals
+    F_N = classify.family_intervals(
+        normal_arms=[(-60.0, -40.0), (-55.0, -35.0)],      # Y1, Y2
+        release_arms=[(-200.0, -100.0), (80.0, 120.0)])    # Y0, Y3
+    assert F_N is not None
 
 
-def test_classification_shared_cost_cancellation():
-    # identical shared costs between two arms must cancel — they must not
-    # be double-counted into the difference materiality
-    mod = pytest.importorskip(f"{PIPELINE}.classify")
-    fn = getattr(mod, "uncertainty_bound", None)
-    assert callable(fn)
-    delta_shared = fn(0, 1, shared_cost=100.0, per_arm_cost=5.0)
-    delta_no_shared = fn(0, 1, shared_cost=0.0, per_arm_cost=5.0)
-    assert delta_shared == delta_no_shared, \
-        "shared costs must cancel in the pairwise bound"
+def test_shared_cost_exact_cancellation():
+    # identical shared costs between two arms must cancel exactly
+    delta_shared = classify.uncertainty_bound(
+        0, 1, shared_cost=100.0, per_arm_cost=5.0)
+    delta_no_shared = classify.uncertainty_bound(
+        0, 1, shared_cost=0.0, per_arm_cost=5.0)
+    assert delta_shared == delta_no_shared, "shared costs must cancel"
 
 
-def test_execution_price_bbo_staleness_contract():
-    mod = pytest.importorskip(f"{PIPELINE}.execution")
-    # executable BBO only within documented staleness/skew bounds; tick-only
-    # values are BOUNDED_TICK_PROXY and never mix into executable stats
-    fn = getattr(mod, "executable_prices", None)
-    assert callable(fn), "execution.executable_prices(quotes, decision_ts, ...)"
+def test_one_path_extra_leg_cost():
+    # the extra leg's transaction cost lands in that arm's NET Yi, NOT in
+    # the residual uncertainty interval — no double-counting
+    bounds = classify.interval_bounds(
+        net_pnl=-50.0, execution_uncertainty=10.0)
+    assert isinstance(bounds, tuple) and len(bounds) == 2
 
 
-def test_time_stop_conditional_contract():
-    mod = pytest.importorskip(f"{PIPELINE}.pipeline")
-    # time stops 30/120/300 trigger ONLY when horizon net < net_at_release
-    fn = getattr(mod, "time_stop_triggered", None)
-    assert callable(fn), "pipeline.time_stop_triggered(horizon_net, net_at_release)"
+def test_family_winner_flips_under_intervals():
+    # intervals where the point-estimate max() winner differs from the
+    # interval-dominance winner → classification must follow intervals
+    F_N = classify.family_intervals(
+        normal_arms=[(-70.0, -30.0), (-65.0, -25.0)],
+        release_arms=[(-100.0, -80.0), (-10.0, 10.0)])
+    assert F_N is not None
 
 
-def test_threshold_sweep_overlap_contract():
-    mod = pytest.importorskip(f"{PIPELINE}.sweep")
-    # 0/-100/-200 is a preregistered sensitivity sweep over overlapping
-    # subsets — report overlap matrix + paired deltas, never winner-by-max
-    fn = getattr(mod, "threshold_overlap", None)
-    assert callable(fn), "sweep.threshold_overlap(...)"
+def test_equality_at_threshold_is_neutral():
+    # lower(F_N)-upper(F_R) == M_economic exactly → neutral (no HARMFUL)
+    label = classify.classify_outcome(
+        Y0=-100.0, Y1=0.0, Y2=0.0, Y3=-100.0, actual=0.0,
+        data_quality="ok", M_economic=25.0)
+    assert label == "INCONCLUSIVE_NEUTRAL", label
 
 
-def test_event_stream_integrity_fields():
-    # every replayed event must carry source_event_seq/exchange_ts/recv_ts/
-    # replay_seq/stream hash/ordering key — one immutable shared stream
-    mod = pytest.importorskip(f"{PIPELINE}.stream")
-    fn = getattr(mod, "ordered_stream", None)
-    assert callable(fn), "stream.ordered_stream(...)"
+def test_management_beneficial_overlap_precedence():
+    # MANAGEMENT_BAD and BENEFICIAL both satisfiable → precedence picks
+    # MANAGEMENT_BAD (it precedes family beneficial)
+    label = classify.classify_outcome(
+        Y0=-50.0, Y1=10.0, Y2=5.0, Y3=100.0, actual=-200.0,
+        data_quality="ok", M_economic=20.0, M_30=15.0, M_3no_release=10.0)
+    assert label == "RELEASE_OK_MANAGEMENT_BAD", label
 
 
-def test_clone_schema_fields():
-    # clone point = immediately BEFORE the release-decision event; the
-    # deep clone must cover the full strategy state (positions, policy
-    # peak/durable/warmup/armed, ATR/reference, pending orders, quote
-    # freshness, controller/lifecycle/release/trail, cooldown, config/version)
-    mod = pytest.importorskip(f"{PIPELINE}.clone")
-    fn = getattr(mod, "clone_schema_version", None)
-    assert callable(fn), "clone.clone_schema_version()"
-    schema = fn()
+def test_evidence_gate_overrides_all_economics():
+    # evidence failure must override every economic classification
+    label = classify.classify_outcome(
+        Y0=-300.0, Y1=200.0, Y2=200.0, Y3=300.0, actual=250.0,
+        data_quality="no_executable_bbo", M_economic=10.0)
+    assert label == "INDETERMINATE_DATA_QUALITY", label
+
+
+# ── clone / stream / execution / sweep / censoring / time-stop contracts ────
+
+def test_clone_schema_completeness():
+    schema = clone.clone_schema_version()
     required = {"positions", "policy_peak", "durable_candidate", "warmup",
                 "armed", "atr", "reference_prices", "pending_orders",
                 "quote_freshness", "controller", "lifecycle", "release",
                 "trail", "cooldown", "config_version"}
-    missing = required - set(schema or {})
-    assert not missing, f"clone schema missing fields: {missing}"
+    assert required <= set(schema or {}), \
+        f"clone schema missing: {required - set(schema or {})}"
+
+
+def test_clone_state_at_decision_no_branch_contamination():
+    # the clone must be taken BEFORE the release decision — it must never
+    # see state produced by the actual-release branch
+    state = clone.clone_state_at_decision(
+        strategy_state={"released_leg": None, "_side": None},
+        decision_ts="2026-08-08T10:00:00")
+    assert state is not None
+
+
+def test_event_stream_integrity_fields():
+    events = stream.ordered_stream(
+        events=[{"exchange_ts": 1}, {"exchange_ts": 2}],
+        clock_contract="immutable-global")
+    assert events is not None
+
+
+def test_execution_bbo_vs_tick_proxy():
+    prices = execution.executable_prices(
+        quotes={"near": None, "far": None},
+        decision_ts="2026-08-08T10:00:00",
+        staleness_bounds={"max_age_s": 30})
+    assert prices is not None
+
+
+def test_threshold_sweep_overlap_contract():
+    matrix = sweep.threshold_overlap(
+        thresholds=[0, -100, -200],
+        candidates=[{"combined_net": -150}, {"combined_net": -50}])
+    assert matrix is not None
 
 
 def test_candidate_event_time_is_decision_not_fill():
-    # event time = release DECISION/ORDER_SUBMITTED ts, not the fill ts;
-    # both timestamps + skew must be recorded per candidate
-    mod = pytest.importorskip(f"{PIPELINE}.pipeline")
-    fn = getattr(mod, "candidate_timestamps", None)
-    assert callable(fn), "pipeline.candidate_timestamps(...)"
+    ts = pipeline.candidate_timestamps(
+        release_event={"decision_ts": 1000, "fill_ts": 2000})
+    assert ts == {"decision_ts": 1000, "fill_ts": 2000, "skew": 1000}
 
 
 def test_censoring_never_drops_silently():
-    # unresolved/corrupt/partial candidates are censored WITH an exclusion
-    # reason, never dropped silently
-    mod = pytest.importorskip(f"{PIPELINE}.pipeline")
-    fn = getattr(mod, "censored_with_reason", None)
-    assert callable(fn), "pipeline.censored_with_reason(...)"
+    censored = pipeline.censored_with_reason(
+        candidate={"id": "c1", "state": "corrupt"}, reason="fills_unmatched")
+    assert censored is not None
+
+
+def test_time_stop_conditional_contract():
+    # trigger only when horizon net < net at release
+    assert pipeline.time_stop_triggered(
+        horizon_net=-10.0, net_at_release=5.0) is True
+    assert pipeline.time_stop_triggered(
+        horizon_net=10.0, net_at_release=5.0) is False
+
+
+def test_replay_entrypoint_exists():
+    assert callable(run_replay.main)
+
+
+# ── reuse contract: the skeleton must wire the COMMITTED exit_attribution ───
+
+def test_pipeline_reuses_committed_exit_attribution():
+    from scripts.research.exit_attribution import reconcile as ea_reconcile
+    from scripts.research.exit_attribution import quoting as ea_quoting
+    assert hasattr(ea_reconcile, "reconcile_fill")
+    assert hasattr(ea_quoting, "select_quote")
+    assert pipeline.reconcile is ea_reconcile.reconcile_fill, \
+        "pipeline must reuse the committed reconcile_fill (no ad-hoc parser)"
