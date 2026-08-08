@@ -3,8 +3,8 @@
 from scripts.research.phase_transition_replay import classify as _replay_classify  # noqa: F401
 
 
-def arm_matrix(arms):
-    raise NotImplementedError("reports.arm_matrix: exact Y0..Y3 + exactly six named pairwise deltas (d01..d23) with expected values")
+def arm_matrix(arms, intervals=None, evidence="ok"):
+    raise NotImplementedError("reports.arm_matrix: exact Y0..Y3 + exactly six named pairwise deltas (d01..d23) with expected values; intervals/evidence accepted, body not implemented")
 
 
 def paired_delta_vs_immediate(arm, immediate):
