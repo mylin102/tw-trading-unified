@@ -32,6 +32,13 @@ def test_safety_escapes_terminate_armed():
         assert state_machine.safety_escape(cause) is True, cause
 
 
+def test_safety_escape_terminal_r3_must_not_continue():
+    # A4 v2 (c): a safety escape is a TERMINAL decision — after it fires,
+    # R3 must never continue
+    outcome = state_machine.safety_escape("max_wait")
+    assert outcome in (True, "TERMINATED", "EXIT_ARMED"), outcome
+
+
 def test_pending_conflict_escapes():
     # lifecycle/pending conflict is a mandatory safety escape
     assert state_machine.safety_escape("lifecycle_pending") is True
@@ -49,11 +56,19 @@ def test_breach_snapshot_fields():
 
 
 def test_pre_breach_clone_completeness():
-    # clone is taken immediately BEFORE the breach event — never the
-    # actual-release future state
-    assert hasattr(__import__(
-        "scripts.research.release_timing_a4.breach", fromlist=["x"]),
-        "breach_snapshot")
+    # A4 v2 (a): clone point = the event BEFORE the breach; schema must
+    # cover peak/guard warmup+armed/ATR/reference/pending candidate+orders/
+    # quote freshness/controller/lifecycle/cooldown/strategy generation;
+    # non-reconstructible state -> NOT_AVAILABLE
+    schema = breach.clone_schema_version()
+    required = {"positions", "policy_peak", "guard_warmup", "guard_armed",
+                "atr", "reference_prices", "pending_candidates",
+                "pending_orders", "quote_freshness", "controller",
+                "lifecycle", "cooldown", "strategy_generation",
+                "config_version"}
+    assert required <= set(schema or {}), \
+        f"clone schema missing: {required - set(schema or {})}"
+    assert breach.clone_point_before_breach(event_seq=10) is not None
 
 
 def test_no_lookahead_extrema():
@@ -86,11 +101,21 @@ def test_families_pre_registered_grids():
 
 
 def test_theta_sweep_no_selection():
-    # single-factor sweeps first; every theta reported; no winner-by-max
+    # A4 v2 (d)+(g): thetas pre-registered per metric with units/rationale;
+    # 0/-100/-200 are NESTED sensitivity, never best-threshold selection
+    reg = families.theta_registry()
+    assert reg is not None
     plan = families.sweep_plan(
         single_factor=["z", "leg_recovery", "combined_recovery"],
         factorial_subset={"z_x_leg": 3})
     assert plan is not None
+
+
+def test_decision_rule_no_future_information():
+    # A4 v2 (e): R0-R3 decisions must not use future info — the forward
+    # outcome must be distinguishable from a deployable decision rule
+    assert decision.forward_outcome_separate(
+        decision_rule={"action": "R0"}, forward_outcome={}) is not None
 
 
 # ── R3 deterministic bounded progression ────────────────────────────────────
@@ -103,6 +128,16 @@ def test_r3_deterministic_bounded():
     assert k1 == k2, "branch state key must be deterministic"
     nxt = branches.next_decision_level(level=1, max_wait=300, safety="floor")
     assert nxt is not None
+
+
+def test_all_branches_share_one_immutable_stream():
+    # A4 v2 (b): the immutable stream manifest must carry the full ordering
+    # identity; all four branches consume the SAME stream (no per-branch
+    # derived bars)
+    events = stream.ordered_stream(
+        events=[{"exchange_ts": 1}, {"exchange_ts": 2}],
+        clock_contract="immutable-global")
+    assert events is not None
 
 
 # ── execution-quality tiers / config resolution ─────────────────────────────
@@ -153,3 +188,12 @@ def test_reuses_replay_contracts_not_ad_hoc():
     from scripts.research.release_timing_a4 import tiers as a4_tiers
     assert a4_tiers._replay_execution is rex, \
         "A4 must reuse the replay execution contract (no ad hoc loading)"
+
+
+def test_reports_reuse_replay_classify_contract():
+    # A4 v2 (f): reports reuse phase-transition's four absolute Y, six
+    # pairwise deltas, interval dominance and evidence-first classifier
+    from scripts.research.phase_transition_replay import classify as rclassify
+    from scripts.research.release_timing_a4 import reports as a4_reports
+    assert a4_reports._replay_classify is rclassify, \
+        "A4 reports must reuse the replay classifier (no ad hoc metrics)"

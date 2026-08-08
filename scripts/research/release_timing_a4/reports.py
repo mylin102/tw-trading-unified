@@ -1,4 +1,11 @@
-"""Required reports — skeletal."""
+"""Required reports — skeletal (A4 v2: reuse phase-transition contracts).
+
+Reuses phase_transition_replay.classify: four absolute Y, six pairwise
+deltas, interval dominance, evidence-first classifier — never a new
+ad hoc metric stack.
+"""
+
+from scripts.research.phase_transition_replay import classify as _replay_classify  # noqa: F401
 
 
 def paired_delta_vs_immediate(arm, immediate):

@@ -1,4 +1,8 @@
-"""Pre-registered theta families (no ex-post selection) — skeletal."""
+"""Pre-registered theta families (per-metric, units/rationale) — skeletal."""
+
+
+def theta_registry():
+    raise NotImplementedError("families.theta_registry: per-metric pre-registered thetas with explicit units + rationale (no ex-post selection)")
 
 
 def a4_leg_grid(recovery_distances):
@@ -14,4 +18,4 @@ def a4_spread_z_family(z_reversal, velocity, acceleration):
 
 
 def sweep_plan(single_factor, factorial_subset):
-    raise NotImplementedError("families.sweep_plan: single-factor first, small declared factorial; report every theta, no winner-by-max")
+    raise NotImplementedError("families.sweep_plan: single-factor first, small declared factorial; 0/-100/-200 are NESTED sensitivity, never best-threshold selection")
