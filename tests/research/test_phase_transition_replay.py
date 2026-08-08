@@ -156,6 +156,34 @@ def test_clone_from_state_missing_field_not_available():
     assert "atr" in result[1], f"exact missing field: {result}"
 
 
+def test_clone_prefix_excludes_breach_and_release_events():
+    # strictly-before semantics: replay_seq < breach_replay_seq — the
+    # breach event itself AND release/future events must never be read
+    from types import SimpleNamespace  # noqa: F401
+    snapshot = {"positions": {"near": 1}, "warmup": True,
+                "policy_peak": -300.0, "durable_candidate": None,
+                "armed": False, "atr": 40.0, "reference_prices": [44300.0],
+                "pending_orders": [], "quote_freshness": 1,
+                "controller": "none", "lifecycle": "NORMAL",
+                "release": None, "trail": None, "cooldown": 0,
+                "config_version": "v1"}
+    stream_events = [
+        {"replay_seq": 1},
+        {"replay_seq": 2, "sentinel": "BREACH"},
+        {"replay_seq": 3, "sentinel": "RELEASE"},
+    ]
+    result = clone.clone_from_state(
+        event_stream=stream_events, breach_replay_seq=2,
+        state_snapshot=snapshot)
+    import hashlib
+    import json
+    expect = hashlib.sha256(
+        json.dumps([{"replay_seq": 1}], sort_keys=True,
+                   default=str).encode()).hexdigest()
+    assert result["_stream_prefix_hash"] == expect, \
+        "breach event and release/future events must never be read"
+
+
 def test_event_stream_integrity_fields():
     events = stream.ordered_stream(
         events=[{"exchange_ts": 1}, {"exchange_ts": 2}],
@@ -169,6 +197,46 @@ def test_execution_bbo_vs_tick_proxy():
         decision_ts="2026-08-08T10:00:00",
         staleness_bounds={"max_age_s": 30})
     assert prices is not None
+
+
+def test_execution_bbo_requires_valid_bid_ask():
+    # missing/zero/NaN bid or ask must NEVER be EXECUTABLE_BBO
+    from types import SimpleNamespace
+    base = {"near": SimpleNamespace(bid=50.0, ask=100.0, age_s=1,
+                                    close_action="SHORT"),
+            "far": SimpleNamespace(bid=25.0, ask=50.0, age_s=1,
+                                   close_action="SHORT")}
+    bad_sides = [
+        ("near", "bid", None), ("far", "ask", None),
+        ("near", "bid", 0.0), ("far", "ask", 0.0),
+        ("near", "bid", float("nan")), ("far", "ask", float("nan")),
+    ]
+    for side, field, bad in bad_sides:
+        quotes = {k: SimpleNamespace(
+            bid=base[k].bid, ask=base[k].ask, age_s=1,
+            close_action=base[k].close_action) for k in base}
+        setattr(quotes[side], field, bad)
+        r = execution.executable_prices(
+            quotes, decision_ts="2026-08-08T10:00:00",
+            staleness_bounds={"max_age_s": 30})
+        assert r["tier"] != "EXECUTABLE_BBO", (side, field, bad, r["tier"])
+        assert r["reasons"], f"downgrade must carry a reason: {(side, field)}"
+
+
+def test_execution_close_side_prices():
+    # LONG closes at bid, SHORT closes at ask
+    from types import SimpleNamespace
+    quotes = {
+        "near": SimpleNamespace(bid=99.0, ask=101.0, age_s=1,
+                                close_action="LONG"),
+        "far": SimpleNamespace(bid=49.0, ask=51.0, age_s=1,
+                               close_action="SHORT"),
+    }
+    r = execution.executable_prices(
+        quotes, decision_ts="2026-08-08T10:00:00",
+        staleness_bounds={"max_age_s": 30})
+    assert r["tier"] == "EXECUTABLE_BBO", r
+    assert r["executable_prices"] == {"near": 99.0, "far": 51.0}, r
 
 
 def test_threshold_sweep_overlap_contract():

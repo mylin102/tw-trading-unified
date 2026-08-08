@@ -120,13 +120,35 @@ def test_clone_immune_to_actual_branch_mutation():
         event_stream=[{"replay_seq": 1}, {"replay_seq": 2},
                       {"replay_seq": 3, "sentinel": "RELEASE"}])
     assert isinstance(clone_b, dict), clone_b
-    # future events (replay_seq 3 > breach 2) must not leak into evidence
-    bounded = [{"replay_seq": 1}, {"replay_seq": 2}]
+    # strictly-before semantics: the BREACH event (replay_seq 2) AND the
+    # release/future event (replay_seq 3) must never leak into evidence
+    bounded = [{"replay_seq": 1}]
     import hashlib, json
     expect_prefix = hashlib.sha256(
         json.dumps(bounded, sort_keys=True, default=str).encode()).hexdigest()
     assert clone_a["_stream_prefix_hash"] == expect_prefix, \
-        "breach/release future events must never be read"
+        "breach event and release/future events must never be read"
+
+
+def test_breach_clone_delegates_to_canonical(monkeypatch):
+    # codex audit #1: A4 MUST delegate to the canonical
+    # phase_transition_replay.clone.clone_from_state — the deep-copy/hash/
+    # prefix primitives live in exactly ONE place
+    from scripts.research.phase_transition_replay import clone as cclone
+    calls = []
+
+    def spy(**kw):
+        calls.append(kw)
+        return {"_delegated": True}
+
+    monkeypatch.setattr(cclone, "clone_from_state", spy)
+    from scripts.research.release_timing_a4 import breach as a4_breach
+    snap = {f: f"<{f}>" for f in a4_breach.CLONE_SCHEMA_FIELDS}
+    a4_breach.clone_point_before_breach(
+        event_seq=2, state_snapshot=snap,
+        event_stream=[{"replay_seq": 1}])
+    assert calls, "A4 clone must delegate to the canonical clone_from_state"
+    assert calls[0]["schema_fields"] == a4_breach.CLONE_SCHEMA_FIELDS, calls
 
 
 def test_clone_from_state_incomplete_input_not_available():
