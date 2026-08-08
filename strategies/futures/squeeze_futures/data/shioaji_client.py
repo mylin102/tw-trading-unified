@@ -210,8 +210,13 @@ class ShioajiClient:
     def place_order(self, contract, action: str, quantity: int, price: float = 0):
         # P0 fix 2026-08-08 (verified on Mini shioaji 1.7.0):
         # OrderType=[FOK,IOC,ROD] — MTL does not exist; FuturesPriceType=
-        # [LMT,MKP,MKT]; MarketType={Day,Night}; Order has NO market_type
-        # field. Market (price=0) -> MKP+ROD; limit -> LMT+ROD.
+        # [LMT,MKP,MKT]; Order has NO market_type field.
+        # TAIFEX order rules: Market-With-Protection (MKP) requires IOC or
+        # FOK — ROD is for LIMIT orders only. MTS intent for a market order
+        # is immediate execution with protection → MKP + IOC (default;
+        # FOK is the explicit all-or-none alternative). price>0 (limit) →
+        # LMT + ROD. octype is set EXPLICITLY to Auto (broker determines
+        # New/Cover from position) — never rely on SDK defaults.
         # Non-deprecated sj.OrderType/sj.FuturesPriceType/sj.Action used.
         if not self.is_logged_in:
             return None
@@ -220,12 +225,25 @@ class ShioajiClient:
                 else sj.Action.Sell
             order = self.api.Order(
                 action=action_value, price=price, quantity=quantity,
-                order_type=sj.OrderType.ROD,
+                order_type=sj.OrderType.IOC if price == 0 else sj.OrderType.ROD,
                 price_type=sj.FuturesPriceType.MKP if price == 0
                 else sj.FuturesPriceType.LMT,
+                octype=sj.FuturesOCType.Auto,
                 account=self.api.futopt_account,
             )
-            return self.api.place_order(contract, order)
+            trade = self.api.place_order(contract, order)
+            # never return a rejected/failed trade as success
+            _status = getattr(getattr(trade, "status", None), "status", None)
+            if _status is not None and str(_status) == "Failed":
+                raise AdapterOrderError(
+                    code="ADAPTER_ORDER_REJECTED",
+                    context={"method": "place_order",
+                             "contract": getattr(contract, "code", None),
+                             "action": action, "quantity": quantity,
+                             "price": price, "status": str(_status)})
+            return trade
+        except AdapterOrderError:
+            raise                    # typed failures pass through unwrapped
         except Exception as e:
             logger.error(f"Order placement failed: {e}")
             raise AdapterOrderError(
