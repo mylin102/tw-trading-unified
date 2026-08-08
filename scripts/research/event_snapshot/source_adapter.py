@@ -241,6 +241,19 @@ def join_positions(fills, anchor_trade):
     return {"near": pos["near"], "far": pos["far"]}
 
 
+def join_entries(fills, anchor_trade):
+    """Per-leg ENTRY reference {near: {price, qty}, far: {price, qty}}
+    from the trade's ENTRY fills (price/qty required; missing/ambiguous
+    -> NOT_AVAILABLE, never inferred)."""
+    raise NotImplementedError("source_adapter.join_entries")
+
+
+def release_leg(fills, anchor_trade):
+    """The SINGLE-LEG release target from the trade's RELEASE fill leg.
+    Multiple RELEASE fills with inconsistent legs -> NOT_AVAILABLE."""
+    raise NotImplementedError("source_adapter.release_leg")
+
+
 def resolve_contract_mapping(records, mapping_input, decision_ts_ms):
     """Per-decision contract mapping {near, far, evidence, version, hash}
     from a versioned mapping input (validity windows). Codes change after

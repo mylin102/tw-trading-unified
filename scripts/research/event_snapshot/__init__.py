@@ -28,7 +28,9 @@ from scripts.research.event_snapshot.source_adapter import (  # noqa: F401
     adapt_spread_event,
     build_normalized_snapshot,
     join_anchor,
+    join_entries,
     join_positions,
     normalize_sources,
+    release_leg,
     resolve_contract_mapping,
 )
