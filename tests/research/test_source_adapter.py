@@ -297,14 +297,16 @@ def _fixture_sources(tmp_path, with_bbo=True, unknown_type=None):
                    '"order_id": "o1"}\n', encoding="utf-8")
     bbo = tmp_path / "bbo.jsonl"
     if with_bbo:
+        # decision at 2026-08-08T10:00Z (1786183200000); quotes must be
+        # within [decision - 30s, decision] to survive the window filter
         bbo.write_text(
             '{"event_type": "BBO_UPDATE", "leg": "near", '
-            '"contract_code": "TMFH6", "exchange_ts_ms": 1785000000000, '
-            '"receive_ts_ms": 1785000000050, "source": "shioaji_bidask", '
+            '"contract_code": "TMFH6", "exchange_ts_ms": 1786183190000, '
+            '"receive_ts_ms": 1786183190050, "source": "shioaji_bidask", '
             '"bid": 50.0, "ask": 100.0}\n'
             '{"event_type": "BBO_UPDATE", "leg": "far", '
-            '"contract_code": "TMFI6", "exchange_ts_ms": 1785000000500, '
-            '"receive_ts_ms": 1785000000550, "source": "shioaji_bidask", '
+            '"contract_code": "TMFI6", "exchange_ts_ms": 1786183190500, '
+            '"receive_ts_ms": 1786183190550, "source": "shioaji_bidask", '
             '"bid": 25.0, "ask": 50.0}\n', encoding="utf-8")
     else:
         bbo.write_text("", encoding="utf-8")
