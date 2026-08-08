@@ -50,7 +50,9 @@ def test_safety_escape_terminal_r3_must_not_continue():
 
 def test_pending_conflict_escapes():
     # lifecycle/pending conflict is a mandatory safety escape
-    assert state_machine.safety_escape("lifecycle_pending") is True
+    td = state_machine.safety_escape("lifecycle_pending")
+    assert td.__class__.__name__ == "TerminalDecision", td
+    assert td.cause == "lifecycle_pending" and td.terminal is True
 
 
 # ── breach snapshot / clone / causality ─────────────────────────────────────
@@ -203,8 +205,10 @@ def test_all_branches_share_one_immutable_stream():
             <= set(ev), f"manifest fields missing: {ev}"
     assert stream_hash is not None
     consumers = []
-    for i in range(4):
-        consumers.append(branches.derived_bars(events))
+    for branch_id in ("A0", "A1", "A2", "A3"):
+        consumers.append(branches.derived_bars(events, branch_id=branch_id))
+    assert [c["branch_id"] for c in consumers] == ["A0", "A1", "A2", "A3"], \
+        "four DISTINCT branch consumers (A0..A3) — not generic repeats"
     for i, c in enumerate(consumers):
         assert c["input_id"] == id(events), \
             f"branch {i} must consume THE SAME events object"
@@ -271,7 +275,10 @@ def test_reports_reuse_replay_classify_contract():
     # classification result — not non-None/hasattr
     from scripts.research.release_timing_a4 import reports as a4_reports
     matrix = a4_reports.arm_matrix(arms={
-        "Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0})
+        "Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0},
+        intervals={"Y0": (-310.0, -290.0), "Y1": (-55.0, -45.0),
+                   "Y2": (-45.0, -35.0), "Y3": (95.0, 105.0)},
+        evidence="ok")
     assert matrix["absolute_Y"] == \
         {"Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0}, \
         f"exact four absolute Y required: {matrix.get('absolute_Y')}"
@@ -281,7 +288,19 @@ def test_reports_reuse_replay_classify_contract():
     assert deltas["d02"] == pytest.approx(-260.0), deltas["d02"]
     assert matrix["evidence_gate_precedence"] is True, \
         "evidence gate must precede every economic classification"
-    label = matrix["interval_classification"]
-    assert label in ("INDETERMINATE_DATA_QUALITY", "RELEASE_HARMFUL",
-                     "RELEASE_BENEFICIAL", "RELEASE_OK_MANAGEMENT_BAD",
-                     "INCONCLUSIVE_NEUTRAL"), label
+    assert matrix["interval_classification"] == \
+        "RELEASE_OK_MANAGEMENT_BAD", \
+        f"management-bad case must classify exactly: {matrix.get('interval_classification')}"
+
+
+def test_reports_evidence_failed_overrides_same_economics():
+    # v2.4: SAME economics, evidence failed → INDETERMINATE_DATA_QUALITY
+    from scripts.research.release_timing_a4 import reports as a4_reports
+    matrix = a4_reports.arm_matrix(arms={
+        "Y0": -300.0, "Y1": -50.0, "Y2": -40.0, "Y3": 100.0},
+        intervals={"Y0": (-310.0, -290.0), "Y1": (-55.0, -45.0),
+                   "Y2": (-45.0, -35.0), "Y3": (95.0, 105.0)},
+        evidence="failed")
+    assert matrix["interval_classification"] == \
+        "INDETERMINATE_DATA_QUALITY", \
+        "evidence gate must override identical economics"
