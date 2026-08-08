@@ -12,6 +12,8 @@ from scripts.research.release_timing_a4 import (  # noqa: F401
     state_machine, tiers)
 from scripts.research.phase_transition_replay import stream  # shared contract
 
+import pytest
+
 
 # ── state machine / hypothesis ──────────────────────────────────────────────
 
