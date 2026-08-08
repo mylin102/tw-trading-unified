@@ -17,11 +17,11 @@ import pytest
 
 # ── output schema / versioning ───────────────────────────────────────────────
 
-def test_builder_emits_versioned_list():
+def test_builder_emits_versioned_list(tmp_path):
     # events.json must be a versioned list whose items match the run_replay
     # schema (source_event_seq/exchange_ts/recv_ts/decision_ts_ms/quotes)
     events = build_snapshot(
-        input_paths=[], out_dir="/tmp/snap_out")
+        input_paths=[], out_dir=str(tmp_path / "snap_out"))
     assert isinstance(events, list)
     if events:
         ev = events[0]
@@ -117,12 +117,12 @@ def test_invalid_synchronized_bbo_explicit_censored():
 
 # ── malformed / torn input ───────────────────────────────────────────────────
 
-def test_malformed_input_refused():
+def test_malformed_input_refused(tmp_path):
     # torn/malformed source bytes REFUSE the whole build — a typed
     # ("REFUSED", reason) result, zero output
     result = build_snapshot(
         input_paths=["/nonexistent/torn.json"],
-        out_dir="/tmp/snap_out")
+        out_dir=str(tmp_path / "snap_out"))
     assert isinstance(result, tuple) and result[0] == "REFUSED", result
     assert result[1], "refusal must carry a reason"
 
