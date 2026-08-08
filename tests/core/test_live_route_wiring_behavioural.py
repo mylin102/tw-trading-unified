@@ -95,8 +95,19 @@ def _monitor_stub(ctx, *, use_order_manager=False, safety_trade=None):
 
 def test_safety_stop_placement_quarantined_zero_calls():
     m = _monitor_stub(_quarantined_ctx())
-    m._place_safety_stop(44300, "LONG", 1, 50)
+    result = m._place_safety_stop(44300, "LONG", 1, 50)
     assert not m.api.calls, f"quarantined safety-stop placement: {m.api.calls}"
+    assert isinstance(result, dict) and result.get("blocked") is True, \
+        f"quarantined placement must return a structured blocked reason: {result}"
+    assert "audit_reasons" in result, result
+
+
+def test_safety_stop_placement_ready_permits_place():
+    m = _monitor_stub(_ready_ctx())
+    m._place_safety_stop(44300, "LONG", 1, 50)
+    kinds = [c[0] for c in m.api.calls]
+    assert "place_order" in kinds, \
+        f"LIVE_READY must permit the safety-stop placement: {kinds}"
 
 
 def test_safety_stop_cancel_quarantined_zero_calls():
