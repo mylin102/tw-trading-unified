@@ -80,7 +80,7 @@ def adapt_bbo(raw, source_ctx):
     return {"leg": raw.get("leg"), "contract": raw.get("contract_code"),
             "exchange_ts_ms": raw.get("exchange_ts_ms"),
             "receive_ts_ms": raw.get("receive_ts_ms"),
-            "source": src, "bid": raw.get("bid"), "ask": raw.get("ask"),
+            "feed": src, "bid": raw.get("bid"), "ask": raw.get("ask"),
             **source_ctx}
 
 
@@ -112,9 +112,11 @@ def _parse_jsonl(path):
 
 def normalize_sources(input_paths):
     """Parse each JSONL source ONCE; adapt every record. Unsupported raw
-    tick CSV or malformed/torn line -> ("REFUSED", reason)."""
+    tick CSV or malformed/torn line -> ("REFUSED", reason). Unknown
+    fill_type records are COUNTED (never silently dropped)."""
     fills, events, quotes = [], [], []
     sources = []
+    unknown_fill_types = {}
     for path in input_paths or []:
         if str(path).lower().endswith(".csv"):
             return ("REFUSED", f"unsupported raw tick CSV: {path}")
@@ -128,17 +130,22 @@ def normalize_sources(input_paths):
                 r = adapt_bbo(rec, ctx)
                 if not isinstance(r, tuple):
                     quotes.append(r)
-            elif rec.get("fill_type") in FILL_TYPES:
-                r = adapt_fill(rec, ctx)
-                if not isinstance(r, tuple):
-                    fills.append(r)
+            elif rec.get("fill_type"):
+                if rec["fill_type"] in FILL_TYPES:
+                    r = adapt_fill(rec, ctx)
+                    if not isinstance(r, tuple):
+                        fills.append(r)
+                else:
+                    unknown_fill_types[rec["fill_type"]] = \
+                        unknown_fill_types.get(rec["fill_type"], 0) + 1
             elif rec.get("event") in ANCHOR_EVENT_KINDS:
                 r = adapt_spread_event(rec, ctx)
                 if not isinstance(r, tuple):
                     events.append(r)
         sources.append({"path": str(path), "sha256": sha})
     return {"fills": fills, "events": events, "quotes": quotes,
-            "sources": sources}
+            "sources": sources,
+            "unknown_fill_types": unknown_fill_types}
 
 
 def join_anchor(fills, events):
@@ -257,10 +264,101 @@ def _cleanup(out_dir, created):
         pass
 
 
+EPOCH_MS_MIN = 1_400_000_000_000
+EPOCH_MS_MAX = 2_500_000_000_000
+
+
+def _valid_epoch_ms(v):
+    return (isinstance(v, int) and not isinstance(v, bool)
+            and EPOCH_MS_MIN <= v <= EPOCH_MS_MAX)
+
+
+def _valid_price(v):
+    if v is None or isinstance(v, bool):
+        return False
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return False
+    return f == f and f > 0.0 and f != float("inf")
+
+
+def _attach_leg_bbo(leg, contract, decision_ts_ms, position_side,
+                    quotes, params):
+    """Attach the pre-anchor, exact-code/leg BBO for one leg with age +
+    close-side gates. Missing/invalid -> typed unavailable."""
+    reasons = []
+    best = None
+    for q in quotes or []:
+        if q.get("leg") != leg:
+            continue
+        if q.get("feed") not in BBO_SOURCE_ALLOWLIST:
+            continue
+        if q.get("contract") != contract:
+            reasons.append(f"{leg}: code {q.get('contract')!r} != "
+                           f"{contract!r} (window mapping)")
+            continue
+        ts = q.get("exchange_ts_ms")
+        if not isinstance(ts, int) or ts <= 0:
+            reasons.append(f"{leg}: exchange_ts_ms invalid: {ts!r}")
+            continue
+        if ts > decision_ts_ms:
+            reasons.append(
+                f"{leg}: quote ts {ts} after decision anchor "
+                f"{decision_ts_ms}")
+            continue
+        if not _valid_price(q.get("bid")) or not _valid_price(q.get("ask")):
+            reasons.append(f"{leg}: bid/ask invalid")
+            continue
+        recv = q.get("receive_ts_ms")
+        age_s = ((recv - ts) / 1000.0) if isinstance(recv, int) else None
+        if age_s is None or age_s < 0 or age_s > params["max_age_s"]:
+            reasons.append(f"{leg}: age {age_s}s out of bounds")
+            continue
+        if best is None or ts > (best.get("exchange_ts_ms") or 0):
+            best = q
+    if best is None:
+        return {"available": False,
+                "reason": "; ".join(reasons) or f"{leg}: no valid BBO"}
+    return {"available": True, "bid": float(best["bid"]),
+            "ask": float(best["ask"]),
+            "age_s": ((best.get("receive_ts_ms") - best["exchange_ts_ms"])
+                      / 1000.0),
+            "close_action": position_side,
+            "quote_exchange_ts": best["exchange_ts_ms"],
+            "quote_source": f"{best['source']}:{best.get('byte_offset')}"}
+
+
+def _build_event(anchor, positions, mapping, quotes, params):
+    """One runner-compatible event with per-leg BBO attached."""
+    decision_ts_ms = anchor.get("parsed_ts")
+    event = {"source_event_seq": anchor.get("record_no") or 1,
+             "exchange_ts": decision_ts_ms,
+             "recv_ts": decision_ts_ms,
+             "decision_ts_ms": decision_ts_ms,
+             "contracts": {"near": mapping["near"], "far": mapping["far"]},
+             "contract_mapping_version": mapping.get("version"),
+             "quotes": {}}
+    for leg in ("near", "far"):
+        event["quotes"][leg] = _attach_leg_bbo(
+            leg, mapping[leg], decision_ts_ms, positions[leg], quotes,
+            params)
+    return event
+
+
 def build_normalized_snapshot(input_paths, out_dir, mapping_input=None):
-    """Normalized snapshot (builder-native) + manifest with contract
-    mapping evidence/version/hash — no-replace atomic writes; any failure
-    removes the newly-created files/dir."""
+    """Runner-compatible normalized snapshot pipeline:
+
+    normalize JSONL -> legal same-trade anchor -> validated anchor
+    epoch-ms -> per-leg ENTRY positions -> per-decision roll mapping ->
+    near/far actual codes -> attach pre-anchor allowlisted BBO with
+    age/skew/close-side gates -> emit events.json (runner LIST) +
+    manifest (event_map/mapping/source hashes) via no-replace atomic
+    all-or-nothing. Missing/invalid -> typed REFUSED, never fake success.
+    """
+    params = {"max_age_s": (mapping_input or {}).get("max_age_s", 30),
+              "max_pair_skew_ms": (mapping_input or {}).get(
+                  "max_pair_skew_ms", 1000)}
     try:
         out_dir = _exclusive_out_dir(out_dir)
     except FileExistsError as e:
@@ -273,11 +371,54 @@ def build_normalized_snapshot(input_paths, out_dir, mapping_input=None):
     if isinstance(norm, tuple):
         _cleanup(out_dir, [])
         return norm
-    manifest = {"schema_version": "source-adapter-v2",
-                "sources": norm.get("sources", []),
-                "contract_mapping": mapping_input or
-                {"status": "NOT_AVAILABLE", "reason": "no mapping input"}}
-    events_payload = json.dumps(norm, indent=2, sort_keys=True,
+    anchor = join_anchor(norm["fills"], norm["events"])
+    if isinstance(anchor, tuple):
+        _cleanup(out_dir, [])
+        return anchor
+    decision_ts_ms = anchor.get("parsed_ts")
+    if not _valid_epoch_ms(decision_ts_ms):
+        _cleanup(out_dir, [])
+        return ("NOT_AVAILABLE",
+                f"anchor timestamp invalid: {anchor.get('ts_text')!r}")
+    positions = join_positions(norm["fills"], anchor.get("trade_id"))
+    if isinstance(positions, tuple):
+        _cleanup(out_dir, [])
+        return positions
+    mapping = resolve_contract_mapping(
+        [], mapping_input, decision_ts_ms)
+    if isinstance(mapping, tuple):
+        _cleanup(out_dir, [])
+        return mapping
+    events_list = [_build_event(anchor, positions, mapping, norm["quotes"],
+                                params)]
+    # pair-skew gate across the attached legs
+    ev = events_list[0]
+    legs_ok = [ev["quotes"][l] for l in ("near", "far")
+               if ev["quotes"][l].get("available")]
+    if len(legs_ok) == 2:
+        skew = abs(legs_ok[0]["quote_exchange_ts"]
+                   - legs_ok[1]["quote_exchange_ts"])
+        if skew > params["max_pair_skew_ms"]:
+            for l in ("near", "far"):
+                ev["quotes"][l] = {"available": False,
+                                   "reason": f"pair skew {skew}ms > "
+                                             f"{params['max_pair_skew_ms']}ms"}
+    manifest = {
+        "schema_version": "source-adapter-v2",
+        "sources": norm.get("sources", []),
+        "unknown_fill_types": norm.get("unknown_fill_types", {}),
+        "contract_mapping": {"near": mapping["near"], "far": mapping["far"],
+                             "version": mapping.get("version"),
+                             "evidence": mapping.get("evidence"),
+                             "hash": mapping.get("hash")},
+        "event_map": {
+            "1": {"anchor": anchor.get("source"),
+                  "anchor_byte_offset": anchor.get("byte_offset"),
+                  "positions": positions,
+                  "contracts": {"near": mapping["near"],
+                                "far": mapping["far"]}}},
+    }
+    events_payload = json.dumps(events_list, indent=2, sort_keys=True,
                                 ensure_ascii=False)
     manifest_payload = json.dumps(manifest, indent=2, sort_keys=True,
                                   ensure_ascii=False)
@@ -290,6 +431,6 @@ def build_normalized_snapshot(input_paths, out_dir, mapping_input=None):
     except (OSError, FileExistsError) as e:
         _cleanup(out_dir, created)
         return ("REFUSED", str(e))
-    return norm
+    return events_list
 
 
