@@ -300,7 +300,11 @@ def main(argv=None):
         "engine_run": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    _write_manifest_atomic(args.out_dir, manifest)
+    try:
+        _write_manifest_atomic(args.out_dir, manifest)
+    except FileExistsError as e:
+        print(f"REFUSED: {e}", file=sys.stderr)
+        return 6
     return 0
 
 
