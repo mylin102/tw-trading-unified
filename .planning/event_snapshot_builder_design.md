@@ -47,6 +47,31 @@ list（run_replay schema 相容）+ 版本化 manifest。
 - 全部 skeletal（NotImplementedError at intended point）— 獨立
   collection, 無 skip
 
+
+## 7. v2 修訂（codex P0 review — design/RED only）
+
+(1) **Legal decision anchors**: output event 只能由**有時間戳、同一 trade
+    的 release-decision/submission record** 建構; **RELEASE fill 是
+    post-decision, 永不供應 decision_ts**; 無 legal anchor / trade join
+    失敗 → 不產 candidate 或顯式 **NOT_AVAILABLE provenance row** —
+    永不合成
+(2) **Event-time provenance**: 每 record 保留 source byte hash +
+    record number + byte offset + **原始 timestamp 文字** + parsed
+    timestamp/unit/offset; **tie ordering 用 source record identity**
+    （byte offset 等）, 非偶然 file order
+(3) **BBO allowlist**: quote_source ∈ 明確 allowlist（executable
+    bid/ask feeds）; **last/mark/OHLC 禁填 bid/ask**; missing → **typed
+    per-leg unavailable structure**（{"available": False, "reason"}）,
+    非 string（避免靜默變成 runner-schema error）
+(4) **Quote 驗證**: 只驗 exchange_ts <= legal decision anchor 且
+    **same contract/leg** 的 quotes; 需 exact contract mapping + 由
+    pre-decision position 推出的 valid close side; 否則 NOT_AVAILABLE
+(5) **輸出同 runner 政策**: events.json + manifest.json 用 exclusive
+    no-overwrite（os.link no-replace）+ atomic finalization
+(6) **新增 RED**: release-fill-only 拒絕 / wrong-trade anchor 拒絕 /
+    等時間戳 deterministic tie / last-price 拒絕 / wrong-contract
+    quote 拒絕 / 輸出 race no-overwrite
+
 ## 6. 交付順序
 design + RED → codex 審查 → 實作授權（research-only）→ runner 對接
 （--input 吃 builder 產物）→ dry-run evidence packet
