@@ -173,6 +173,51 @@ safe_login/connection_dropped）。
   經 emergency_intent ledger 留下 reconciliation 紀錄（RED→GREEN）;
   stop 本身為保護性 Cover 單，取消僅經 recovery
 
+
+## 9. v3.1 修訂（codex Phase-2 v3 review — 7 點）
+
+### 9.1 Emergency: 不另開帳本 — 用 P1-B core/exit_intent.py
+- **本 wiring phase: LIVE_QUARANTINED 也擋 emergency**（無 bypass）—
+  擋下時發 dashboard reason + operator procedure
+- 未來獨立授權的 emergency operator command 必須走 **core/exit_intent.py**
+  （canonical, P1-B）: IntentLog.create（durable + O_EXCL lock）→ child
+  intent → emergency_supersede → client_order_id（pre-I/O idempotency）
+  → recover（restart reconciliation）。平行帳本禁止（重新製造競態）。
+- RED tests: ①quarantine 下 strategy 不得被 mutation ②blocked 必須發
+  dashboard reason（EMERGENCY*）③future command 必須觸及 exit_intent
+  ④protocol surface 鎖（create/submit_leg/emergency_supersede/
+  reconciliation_view/recover/mark_terminal/client_order_id/
+  SupersededIntentError）
+
+### 9.2 ImportError tripwires 不計 GREEN
+- contract_missing 依賴（core.execution_context_state /
+  core.release_identity）單獨回報，不列入行為覆蓋數
+
+### 9.3 Persistence: TRADING_RUNTIME_DIR（非裸 /tmp）
+- 路徑 authority: {TRADING_RUNTIME_DIR}/execution_context.json —
+  所有 release tree + dashboard 讀同一 canonical 檔
+- 契約: atomic replace + fsync(file AND parent) / corrupt|missing →
+  安全預設 LIVE_QUARANTINED / 無 broker|account 資料 / restart 後
+  dashboard reader 正常 render
+
+### 9.4 Release identity: 真實 git release dir
+- 測試用真實 temp git repo + injected runner（env missing / HEAD
+  mismatch / command failure → fail-closed）; PM2 ecosystem 注入 = 獨立
+  integration RED（wiring phase 後續）
+
+### 9.5 AST inventory 範圍擴大到 strategy package + adapters
+- 實證新增 3 sites: shioaji_client.py:207 place / 215 update / 224 cancel
+  （broker 直通點）→ **adapter 成為 chokepoint gate**（quarantine →
+  零 place/cancel/update）; allowlist 7 sites; 新 site 出現 → tripwire fail
+
+### 9.6 Reconnect ×3
+- far resubscribe 失敗 / certification 失敗 / code-12 auto branch —
+  各自: ctx 維持 QUARANTINED + 零 state-changing broker calls
+
+### 9.7 Exit failure-side
+- safety-stop cancel 失敗時 ordinary exit **不得靜默送單**（除非
+  reconciliation policy 顯式允許 + durable reason 記錄）— RED
+
 ## 6. 交付順序
 
 1. 本設計 + RED tests（commit）→ codex 審查 → 2. monitor wiring phase
