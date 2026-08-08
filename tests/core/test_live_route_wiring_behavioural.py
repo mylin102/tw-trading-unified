@@ -144,49 +144,63 @@ def test_order_manager_wrapper_gate_behaviour():
     _assert_live_allowed(_ready_ctx())          # no raise → permitted
 
 
-def test_ast_inventory_strategy_package_scope():
-    # v3.1 #5 (codex correction): EXACT (path, function, attr) inventory
-    # against the COMMITTED snapshot (git show HEAD:) — deterministic under
-    # concurrent working-tree edits; fail on ANY addition or changed
-    # qualification. No counting-only allowlist.
+def test_ast_inventory_strategy_package_scope(tmp_path, monkeypatch):
+    # v3.1 #5 + codex three-line correction: EXACT (path, function, attr)
+    # inventory of the CANDIDATE under review, parsed from an isolated
+    # clean git worktree at that commit (default HEAD; the wiring phase
+    # sets CANDIDATE_COMMIT to the wiring commit AFTER it is committed).
+    # Deterministic AND candidate-accurate — never blind to uncommitted
+    # candidate changes, never the preceding HEAD.
     import subprocess
+    import os
 
-    def _snapshot(rel):
-        return subprocess.check_output(
-            ["git", "show", f"HEAD:strategies/futures/{rel}"],
-            text=True, cwd=_repo_root())
+    candidate = os.environ.get("CANDIDATE_COMMIT", "HEAD")
+    wt = tmp_path / "candidate_wt"
+    subprocess.check_call(
+        ["git", "worktree", "add", "--detach", str(wt), candidate],
+        cwd=_repo_root(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wt_root = wt / "strategies" / "futures"
 
-    def _sites(rel, src):
-        tree = ast.parse(src)
-        sites = []
-        for node in ast.walk(tree):
-            if not (isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr in STATE_CHANGING_ATTRS):
-                continue
-            enclosing = None
-            for fn in ast.walk(tree):
-                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                        and fn.lineno <= node.lineno <= getattr(fn, "end_lineno", node.lineno):
-                    enclosing = fn.name
-            sites.append((rel, enclosing, node.func.attr))
-        return sites
+        def _read(rel):
+            return (wt_root / rel).read_text(encoding="utf-8")
 
-    audited = {
-        ("monitor.py", "_place_safety_stop", "place_order"),
-        ("monitor.py", "_cancel_safety_stop", "cancel_order"),
-        ("monitor.py", "_submit_order_via_manager", "place_order"),
-        ("monitor.py", "_execute_trade", "place_order"),
-        ("squeeze_futures/data/shioaji_client.py", "place_order", "place_order"),
-        ("squeeze_futures/data/shioaji_client.py", "update_order", "update_order"),
-        ("squeeze_futures/data/shioaji_client.py", "cancel_order", "cancel_order"),
-    }
-    found = set()
-    for rel in ("monitor.py",
-                "squeeze_futures/data/shioaji_client.py"):
-        found |= set(_sites(rel, _snapshot(rel)))
-    assert found == audited, \
-        f"inventory drift (found={sorted(found)}, audited={sorted(audited)})"
+        def _sites(rel, src):
+            tree = ast.parse(src)
+            sites = []
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in STATE_CHANGING_ATTRS):
+                    continue
+                enclosing = None
+                for fn in ast.walk(tree):
+                    if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                            and fn.lineno <= node.lineno <= getattr(fn, "end_lineno", node.lineno):
+                        enclosing = fn.name
+                sites.append((rel, enclosing, node.func.attr))
+            return sites
+
+        audited = {
+            ("monitor.py", "_place_safety_stop", "place_order"),
+            ("monitor.py", "_cancel_safety_stop", "cancel_order"),
+            ("monitor.py", "_submit_order_via_manager", "place_order"),
+            ("monitor.py", "_execute_trade", "place_order"),
+            ("squeeze_futures/data/shioaji_client.py", "place_order", "place_order"),
+            ("squeeze_futures/data/shioaji_client.py", "update_order", "update_order"),
+            ("squeeze_futures/data/shioaji_client.py", "cancel_order", "cancel_order"),
+        }
+        found = set()
+        for rel in ("monitor.py",
+                    "squeeze_futures/data/shioaji_client.py"):
+            found |= set(_sites(rel, _read(rel)))
+        assert found == audited, \
+            f"inventory drift (found={sorted(found)}, audited={sorted(audited)})"
+    finally:
+        subprocess.check_call(
+            ["git", "worktree", "remove", "--force", str(wt)],
+            cwd=_repo_root(), stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
 
 
 # ── (2) emergency (v3.1): BLOCKED under quarantine this phase; the future
