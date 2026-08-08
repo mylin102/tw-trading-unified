@@ -16,8 +16,6 @@ Families: F_N (normal) = {Y1, Y2}; F_R (release) = {Y0, Y3}.
 from scripts.research.phase_transition_replay.classify import classify_outcome as _canonical_classify  # noqa: F401
 from scripts.research.phase_transition_replay import classify as _replay_classify  # noqa: F401
 
-M_ECONOMIC_DEFAULT = 20.0
-
 CANONICAL_ARM_MAP = {
     "Y0": "actual_release",
     "Y1": "atomic_combined_exit",
@@ -32,21 +30,43 @@ DELTA_PAIRS = [("d01", 0, 1), ("d02", 0, 2), ("d03", 0, 3),
                ("d12", 1, 2), ("d13", 1, 3), ("d23", 2, 3)]
 
 
-def arm_matrix(arms, intervals=None, evidence="ok"):
+def arm_matrix(arms, intervals=None, evidence="ok", M_economic=None,
+               fee_assumption_id=None):
     """Exact 4Y + six named deltas + evidence-gate precedence + the ACTUAL
-    canonical interval-dominance classification."""
+    canonical interval-dominance classification.
+
+    Fail-closed manifest (v3): M_economic, uncertainty intervals and the
+    fee/slippage assumption id are REQUIRED — any missing value yields
+    INDETERMINATE_DATA_QUALITY (no silent default) and all three are
+    written into the returned row.
+    """
     Y = {k: float(arms[k]) for k in ("Y0", "Y1", "Y2", "Y3")}
     deltas = {name: Y[f"Y{i}"] - Y[f"Y{j}"] for name, i, j in DELTA_PAIRS}
+    if M_economic is None or fee_assumption_id is None or not intervals:
+        return {
+            "absolute_Y": Y,
+            "pairwise_deltas": deltas,
+            "evidence_gate_precedence": True,
+            "interval_classification": "INDETERMINATE_DATA_QUALITY",
+            "canonical_arm_map": dict(CANONICAL_ARM_MAP),
+            "M_economic": M_economic,
+            "intervals": intervals,
+            "fee_assumption_id": fee_assumption_id,
+            "reason": "explicit M_economic/intervals/fee_assumption_id required",
+        }
     label = _replay_classify.classify_outcome(
         Y0=Y["Y0"], Y1=Y["Y1"], Y2=Y["Y2"], Y3=Y["Y3"],
         data_quality=("ok" if evidence == "ok" else "no_executable_bbo"),
-        M_economic=M_ECONOMIC_DEFAULT, intervals=intervals)
+        M_economic=M_economic, intervals=intervals)
     return {
         "absolute_Y": Y,
         "pairwise_deltas": deltas,
         "evidence_gate_precedence": True,
         "interval_classification": label,
         "canonical_arm_map": dict(CANONICAL_ARM_MAP),
+        "M_economic": M_economic,
+        "intervals": intervals,
+        "fee_assumption_id": fee_assumption_id,
     }
 
 
