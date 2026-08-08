@@ -112,12 +112,52 @@ def test_join_positions_from_entry_long_short():
 
 def test_join_entries_per_leg_from_entry_fills():
     fills = [{"trade_id": "t1", "leg": "near", "fill_type": "ENTRY",
-              "side": "LONG", "price": 45.0, "qty": 2},
+              "side": "LONG", "price": 45.0, "qty": 2,
+              "source": "f.jsonl", "record_no": 1, "byte_offset": 0},
              {"trade_id": "t1", "leg": "far", "fill_type": "ENTRY",
-              "side": "SHORT", "price": 30.0, "qty": 2}]
+              "side": "SHORT", "price": 30.0, "qty": 2,
+              "source": "f.jsonl", "record_no": 2, "byte_offset": 100}]
     result = join_entries(fills, "t1")
-    assert result == {"near": {"price": 45.0, "qty": 2},
-                      "far": {"price": 30.0, "qty": 2}}, result
+    assert result["near"]["price"] == 45.0, result
+    assert result["near"]["qty"] == 2, result
+    assert result["far"]["price"] == 30.0, result
+    assert result["far"]["qty"] == 2, result
+    assert "weighted_formula" in result["near"], result
+    assert result["near"]["fills"][0]["byte_offset"] == 0, result
+
+
+def test_join_entries_aggregates_multiple_fills():
+    # Step-1 review: multiple ENTRY fills per leg aggregate qty=SUM,
+    # price = qty-WEIGHTED average, fill identities preserved
+    fills = [
+        {"trade_id": "t1", "leg": "near", "fill_type": "ENTRY",
+         "side": "LONG", "price": 40.0, "qty": 1,
+         "source": "f.jsonl", "record_no": 1, "byte_offset": 0},
+        {"trade_id": "t1", "leg": "near", "fill_type": "ENTRY",
+         "side": "LONG", "price": 50.0, "qty": 3,
+         "source": "f.jsonl", "record_no": 2, "byte_offset": 100},
+        {"trade_id": "t1", "leg": "far", "fill_type": "ENTRY",
+         "side": "SHORT", "price": 30.0, "qty": 4,
+         "source": "f.jsonl", "record_no": 3, "byte_offset": 200},
+    ]
+    result = join_entries(fills, "t1")
+    assert result["near"]["qty"] == 4, result
+    assert result["near"]["price"] == pytest.approx(47.5), result
+    assert len(result["near"]["fills"]) == 2, result
+    assert result["near"]["fills"][1]["record_no"] == 2, result
+
+
+def test_join_entries_causality_violation():
+    # Step-1 review: an ENTRY fill NOT before the decision -> NOT_AVAILABLE
+    fills = [{"trade_id": "t1", "leg": "near", "fill_type": "ENTRY",
+              "side": "LONG", "price": 45.0, "qty": 2,
+              "parsed_ts": 1786183190000},
+             {"trade_id": "t1", "leg": "far", "fill_type": "ENTRY",
+              "side": "SHORT", "price": 30.0, "qty": 2,
+              "parsed_ts": 1786183180000}]
+    result = join_entries(fills, "t1", decision_ts_ms=1786183190000)
+    assert isinstance(result, tuple) and result[0] == "NOT_AVAILABLE", result
+    assert "causality" in result[1].lower(), result
 
 
 def test_join_entries_missing_entry_fail_closed():
@@ -138,8 +178,29 @@ def test_join_entries_missing_price_fail_closed():
 
 def test_release_leg_from_release_fill():
     fills = [{"trade_id": "t1", "leg": "near", "fill_type": "RELEASE",
-              "side": "SHORT", "qty": 2}]
-    assert release_leg(fills, "t1") == "near"
+              "side": "SHORT", "qty": 2,
+              "source": "f.jsonl", "record_no": 3, "byte_offset": 200},
+             {"trade_id": "t1", "leg": "near", "fill_type": "ENTRY",
+              "side": "LONG", "price": 45.0, "qty": 2},
+             {"trade_id": "t1", "leg": "far", "fill_type": "ENTRY",
+              "side": "SHORT", "price": 30.0, "qty": 2}]
+    result = release_leg(fills, "t1")
+    assert result["leg"] == "near", result
+    assert result["qty"] == 2, result
+    assert result["fills"][0]["record_no"] == 3, result
+
+
+def test_release_leg_qty_mismatch_rejected():
+    # Step-1 review: release qty != entry qty -> NOT_AVAILABLE
+    fills = [{"trade_id": "t1", "leg": "near", "fill_type": "RELEASE",
+              "side": "SHORT", "qty": 1},
+             {"trade_id": "t1", "leg": "near", "fill_type": "ENTRY",
+              "side": "LONG", "price": 45.0, "qty": 2},
+             {"trade_id": "t1", "leg": "far", "fill_type": "ENTRY",
+              "side": "SHORT", "price": 30.0, "qty": 2}]
+    result = release_leg(fills, "t1")
+    assert isinstance(result, tuple) and result[0] == "NOT_AVAILABLE", result
+    assert "qty" in result[1], result
 
 
 def test_release_leg_ambiguous_rejected():
@@ -169,8 +230,12 @@ def test_build_event_carries_entries_and_release_leg(tmp_path):
     assert isinstance(result, list), result
     ev = result[0]
     assert ev.get("release_leg") == "near", ev
-    assert ev.get("entries") == {"near": {"price": 45.0, "qty": 2},
-                                 "far": {"price": 30.0, "qty": 2}}, ev
+    entries = ev.get("entries") or {}
+    assert entries["near"]["price"] == 45.0, entries
+    assert entries["near"]["qty"] == 2, entries
+    assert entries["far"]["price"] == 30.0, entries
+    assert entries["far"]["qty"] == 2, entries
+    assert entries["near"]["fills"], entries
 
 
 # ── contract mapping: labels vs codes, per-window, never hardcoded ───────────
@@ -504,22 +569,22 @@ def test_build_multiple_anchors_multiple_events(tmp_path):
     lines = [
         '{"fill_type": "ENTRY", "timestamp": "2026-08-08T08:00:00.000", '
         '"leg": "near", "contract": "NEAR", "side": "LONG", "qty": 2, '
-        '"trade_id": "t2"}',
+        '"price": 45.0, "trade_id": "t2"}',
         '{"fill_type": "ENTRY", "timestamp": "2026-08-08T08:00:01.000", '
         '"leg": "far", "contract": "FAR", "side": "SHORT", "qty": 2, '
-        '"trade_id": "t2"}',
+        '"price": 30.0, "trade_id": "t2"}',
         '{"fill_type": "RELEASE", "timestamp": "2026-08-08T09:00:02.000", '
         '"leg": "near", "contract": "NEAR", "side": "SHORT", "qty": 2, '
-        '"trade_id": "t2"}',
+        '"price": 52.0, "trade_id": "t2"}',
         '{"fill_type": "ENTRY", "timestamp": "2026-08-08T09:00:00.000", '
         '"leg": "near", "contract": "NEAR", "side": "LONG", "qty": 2, '
-        '"trade_id": "t1"}',
+        '"price": 45.0, "trade_id": "t1"}',
         '{"fill_type": "ENTRY", "timestamp": "2026-08-08T09:00:01.000", '
         '"leg": "far", "contract": "FAR", "side": "SHORT", "qty": 2, '
-        '"trade_id": "t1"}',
+        '"price": 30.0, "trade_id": "t1"}',
         '{"fill_type": "RELEASE", "timestamp": "2026-08-08T10:00:02.000", '
         '"leg": "near", "contract": "NEAR", "side": "SHORT", "qty": 2, '
-        '"trade_id": "t1"}',
+        '"price": 52.0, "trade_id": "t1"}',
     ]
     fills = tmp_path / "fills.jsonl"
     fills.write_text("\n".join(lines) + "\n", encoding="utf-8")
