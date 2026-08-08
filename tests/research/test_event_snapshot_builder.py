@@ -153,17 +153,25 @@ def test_release_fill_only_rejected():
 
 def test_decision_anchor_from_submission_record():
     # a timestamped, SAME-TRADE release-decision/submission record IS a
-    # legal anchor
-    records = [{"record": "submission", "trade_id": "t1",
-                "ts_text": "2026-08-08T10:00:00", "kind": "RELEASE_DECISION"}]
+    # legal anchor when joined to its trade's fills
+    records = [
+        {"record": "fill", "trade_id": "t1", "kind": "RELEASE",
+         "ts_text": "2026-08-08T10:00:02"},
+        {"record": "submission", "trade_id": "t1",
+         "ts_text": "2026-08-08T10:00:00", "kind": "RELEASE_DECISION"},
+    ]
     anchor = legal_anchor(records=records)
     assert anchor is not None
 
 
 def test_wrong_trade_anchor_rejected():
     # v2(1): a record from a DIFFERENT trade cannot anchor the output event
-    records = [{"record": "submission", "trade_id": "t2",
-                "ts_text": "2026-08-08T10:00:00", "kind": "RELEASE_DECISION"}]
+    records = [
+        {"record": "fill", "trade_id": "t1", "kind": "RELEASE",
+         "ts_text": "2026-08-08T10:00:02"},
+        {"record": "submission", "trade_id": "t2",
+         "ts_text": "2026-08-08T10:00:00", "kind": "RELEASE_DECISION"},
+    ]
     anchor = legal_anchor(records=records)
     assert isinstance(anchor, tuple) and anchor[0] == "NOT_AVAILABLE", anchor
 
