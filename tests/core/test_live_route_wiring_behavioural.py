@@ -146,6 +146,19 @@ def test_execute_trade_ready_permits_intended_place():
     assert "place_order" in kinds, f"LIVE_READY must permit the exit: {kinds}"
 
 
+def test_execute_trade_ctx_none_fail_closed_zero_calls():
+    # Step-4 corrective: ctx=None (no certification context) is FAIL-CLOSED —
+    # zero broker calls + structured blocked reason NO_LIVE_CERTIFICATION
+    m = _monitor_stub(_quarantined_ctx(), safety_trade=SimpleNamespace(ts=1))
+    m._execution_context = None
+    result = m._execute_trade("EXIT", 44300, "2026-08-08T10:00:00", 1,
+                              reason="TEST")
+    assert not m.client.calls, f"ctx=None execute_trade: {m.client.calls}"
+    assert not m.api.calls, f"ctx=None safety-stop cancel: {m.api.calls}"
+    assert isinstance(result, dict) and result.get("blocked") is True, result
+    assert "NO_LIVE_CERTIFICATION" in str(result.get("reason", "")), result
+
+
 def test_dispatcher_gate_blocks_quarantined():
     m = _monitor_stub(_quarantined_ctx())
     with pytest.raises(Exception):
