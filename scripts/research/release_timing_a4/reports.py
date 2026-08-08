@@ -26,6 +26,10 @@ CANONICAL_ARM_MAP = {
 F_N_ARMS = ("Y1", "Y2")   # normal family: do NOT release
 F_R_ARMS = ("Y0", "Y3")   # release family
 
+# pre-registered fee/slippage assumption ids (v4: fee_assumption_id must
+# be one of these — no ad-hoc ids)
+FEE_ASSUMPTION_REGISTRY = {"fee-v1", "fee-v2"}
+
 DELTA_PAIRS = [("d01", 0, 1), ("d02", 0, 2), ("d03", 0, 3),
                ("d12", 1, 2), ("d13", 1, 3), ("d23", 2, 3)]
 
@@ -42,7 +46,8 @@ def arm_matrix(arms, intervals=None, evidence="ok", M_economic=None,
     """
     Y = {k: float(arms[k]) for k in ("Y0", "Y1", "Y2", "Y3")}
     deltas = {name: Y[f"Y{i}"] - Y[f"Y{j}"] for name, i, j in DELTA_PAIRS}
-    if M_economic is None or fee_assumption_id is None or not intervals:
+    problems = _manifest_problems(M_economic, intervals, fee_assumption_id)
+    if problems:
         return {
             "absolute_Y": Y,
             "pairwise_deltas": deltas,
@@ -52,7 +57,7 @@ def arm_matrix(arms, intervals=None, evidence="ok", M_economic=None,
             "M_economic": M_economic,
             "intervals": intervals,
             "fee_assumption_id": fee_assumption_id,
-            "reason": "explicit M_economic/intervals/fee_assumption_id required",
+            "reason": problems,
         }
     label = _replay_classify.classify_outcome(
         Y0=Y["Y0"], Y1=Y["Y1"], Y2=Y["Y2"], Y3=Y["Y3"],
@@ -68,6 +73,40 @@ def arm_matrix(arms, intervals=None, evidence="ok", M_economic=None,
         "intervals": intervals,
         "fee_assumption_id": fee_assumption_id,
     }
+
+
+def _manifest_problems(M_economic, intervals, fee_assumption_id):
+    """v4: values must be present AND finite/legal/pre-registered."""
+    problems = []
+    if M_economic is None:
+        problems.append("M_economic missing")
+    elif not (isinstance(M_economic, (int, float))
+              and M_economic == M_economic  # not NaN
+              and M_economic != float("inf") and M_economic != float("-inf")
+              and M_economic > 0.0):
+        problems.append(f"M_economic invalid: {M_economic!r}")
+    if fee_assumption_id is None:
+        problems.append("fee_assumption_id missing")
+    elif fee_assumption_id not in FEE_ASSUMPTION_REGISTRY:
+        problems.append(
+            f"fee_assumption_id {fee_assumption_id!r} not pre-registered "
+            f"(registry: {sorted(FEE_ASSUMPTION_REGISTRY)})")
+    if not intervals:
+        problems.append("intervals missing")
+    else:
+        for k in ("Y0", "Y1", "Y2", "Y3"):
+            iv = intervals.get(k)
+            if iv is None or len(iv) != 2:
+                problems.append(f"interval {k} missing/malformed")
+                continue
+            lo, hi = iv
+            if not (isinstance(lo, (int, float)) and lo == lo
+                    and isinstance(hi, (int, float)) and hi == hi
+                    and lo != float("inf") and hi != float("inf")):
+                problems.append(f"interval {k} not finite: {iv!r}")
+            elif lo > hi:
+                problems.append(f"interval {k} lower > upper: {iv!r}")
+    return problems or None
 
 
 def paired_delta_vs_immediate(arm, immediate):
