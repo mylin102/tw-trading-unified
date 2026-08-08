@@ -156,8 +156,13 @@ def _exclusive_out_dir(path):
 
 
 def _write_manifest_atomic(out_dir, manifest):
-    """temp + fsync + atomic rename — never a partially-written manifest,
-    never an overwrite of an existing manifest."""
+    """temp + fsync + NO-REPLACE atomic finalization.
+    os.rename() can silently replace an existing target — a manifest
+    created concurrently (between the exclusive mkdir and the rename)
+    could be clobbered. os.link() fails with FileExistsError when the
+    target exists, so a concurrent creator is never overwritten; the
+    hard link is atomic within the same directory.
+    """
     target = os.path.join(out_dir, "manifest.json")
     fd, tmp_path = tempfile.mkstemp(dir=out_dir, suffix=".tmp")
     try:
@@ -166,7 +171,12 @@ def _write_manifest_atomic(out_dir, manifest):
                       ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.rename(tmp_path, target)
+        try:
+            os.link(tmp_path, target)
+        except FileExistsError:
+            raise FileExistsError(
+                f"manifest target already exists: {target}") from None
+        os.unlink(tmp_path)
         dir_fd = os.open(out_dir, os.O_RDONLY)
         try:
             os.fsync(dir_fd)
