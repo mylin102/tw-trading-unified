@@ -624,6 +624,92 @@ def test_runner_censors_seconds_scale_quote_ts(tmp_path):
     assert any("epoch-ms" in r for r in reasons), reasons
 
 
+def test_runner_reads_input_once_no_reopen(monkeypatch, tmp_path):
+    # P0-1 TOCTOU: the input file is opened for reading EXACTLY ONCE —
+    # hash and parse derive from the same in-memory bytes; no pathname
+    # reopen exists to race
+    import builtins
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([_schema_valid_event()]), encoding="utf-8")
+    real_open = builtins.open
+    reads = []
+
+    def spy(path, *a, **kw):
+        r = real_open(path, *a, **kw)
+        mode = kw.get("mode", a[0] if a else "r")
+        if str(path) == str(inp) and "r" in mode and "b" in mode:
+            reads.append(1)
+        return r
+
+    monkeypatch.setattr(builtins, "open", spy)
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1", "--dry-run"])
+    assert rc == 0, rc
+    assert len(reads) == 1, \
+        f"input must be read exactly once (no reopen): {len(reads)}"
+
+
+def test_manifest_hash_binds_parsed_bytes(tmp_path):
+    # P0-1: the manifest sha256 covers the EXACT bytes that were parsed —
+    # replacing the file afterwards can never decouple hash from events
+    import hashlib
+    ev = _schema_valid_event()
+    payload = json.dumps([ev]).encode("utf-8")
+    inp = tmp_path / "events.json"
+    inp.write_bytes(payload)
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1", "--dry-run"])
+    assert rc == 0, rc
+    m = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert m["input_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert m["n_events"] == 1
+    # replace the file with DIFFERENT valid content — a fresh run must
+    # hash the NEW bytes; the OLD manifest stays bound to the OLD bytes
+    inp.write_bytes(
+        json.dumps([_schema_valid_event(source_event_seq=9)]).encode())
+    out2 = tmp_path / "out2"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out2),
+                          "--prereg", "prereg-v1", "--dry-run"])
+    assert rc == 0, rc
+    m2 = json.loads((out2 / "manifest.json").read_text(encoding="utf-8"))
+    assert m2["input_sha256"] != m["input_sha256"]
+    assert m2["n_events"] == 1 and m2["kept_records"][0]["event_seq"] == 9
+
+
+def test_runner_refuses_existing_out_dir(tmp_path):
+    # P0-2: an existing out-dir (empty or not) is REFUSED — every run
+    # creates its own exclusive directory; manifests are never overwritten
+    import json
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([_schema_valid_event()]), encoding="utf-8")
+    out = tmp_path / "out"
+    rc1 = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                           "--prereg", "prereg-v1", "--dry-run"])
+    assert rc1 == 0, rc1
+    m1 = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    rc2 = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                           "--prereg", "prereg-v1", "--dry-run"])
+    assert rc2 == 6, rc2
+    m_after = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert m_after == m1, "existing manifest must never be overwritten"
+
+
+def test_runner_refuses_preexisting_dir_with_file(tmp_path):
+    # P0-2: a pre-existing NON-EMPTY directory is refused (zero output)
+    import json
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([_schema_valid_event()]), encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "stale.txt").write_text("x", encoding="utf-8")
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1", "--dry-run"])
+    assert rc == 6, rc
+    assert not (out / "manifest.json").exists(), "zero output on refusal"
+
+
 # ── reuse contract: the skeleton must wire the COMMITTED exit_attribution ───
 
 def test_pipeline_reuses_committed_exit_attribution():
