@@ -53,9 +53,12 @@ def test_read_source_once_hash_binds_parsed_bytes(tmp_path):
 
 def test_order_events_by_exchange_ts_then_seq():
     ordered = order_events([
-        {"source_event_seq": 2, "exchange_ts": 200},
-        {"source_event_seq": 1, "exchange_ts": 100},
-        {"source_event_seq": 1, "exchange_ts": 100},
+        {"source_event_seq": 2, "exchange_ts": 200, "byte_offset": 30,
+         "record_no": 3, "byte_hash": "c"},
+        {"source_event_seq": 1, "exchange_ts": 100, "byte_offset": 10,
+         "record_no": 1, "byte_hash": "a"},
+        {"source_event_seq": 1, "exchange_ts": 100, "byte_offset": 20,
+         "record_no": 2, "byte_hash": "b"},
     ])
     assert ordered is not None
 
@@ -64,17 +67,32 @@ def test_duplicate_events_rejected_with_reason():
     # identical (exchange_ts, source_event_seq) pairs are rejected
     # deterministically — never silently deduped
     result = order_events([
-        {"source_event_seq": 1, "exchange_ts": 100},
-        {"source_event_seq": 1, "exchange_ts": 100},
+        {"source_event_seq": 1, "exchange_ts": 100, "byte_offset": 7,
+         "record_no": 3, "byte_hash": "same"},
+        {"source_event_seq": 1, "exchange_ts": 100, "byte_offset": 7,
+         "record_no": 3, "byte_hash": "same"},
     ])
     assert isinstance(result, tuple) and result[0] == "DUPLICATE", result
+
+
+def test_order_events_requires_record_identity():
+    # v4: missing source record identity must NOT silently sort as 0 —
+    # typed NOT_AVAILABLE
+    result = order_events([
+        {"source_event_seq": 1, "exchange_ts": 100},
+        {"source_event_seq": 2, "exchange_ts": 100},
+    ])
+    assert isinstance(result, tuple) and result[0] == "NOT_AVAILABLE", result
+    assert "identity" in result[1], result
 
 
 def test_out_of_order_flagged():
     # input order differing from (exchange_ts, seq) is flagged + reason
     result = order_events([
-        {"source_event_seq": 2, "exchange_ts": 200},
-        {"source_event_seq": 1, "exchange_ts": 100},
+        {"source_event_seq": 2, "exchange_ts": 200, "byte_offset": 20,
+         "record_no": 2, "byte_hash": "b"},
+        {"source_event_seq": 1, "exchange_ts": 100, "byte_offset": 10,
+         "record_no": 1, "byte_hash": "a"},
     ])
     assert result is not None
     if isinstance(result, dict):
@@ -105,7 +123,7 @@ def test_invalid_synchronized_bbo_explicit_censored():
     # quote ts AFTER the event exchange_ts (future quote) never attaches
     events = [{"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
                "decision_ts_ms": 1_700_000_100_000, "contract": "TMFH6",
-               "position_side": "SHORT"}]
+               "position": {"near": "SHORT", "far": "SHORT"}}]
     quotes = [{"leg": "near", "bid": 50.0, "ask": 100.0,
                "quote_exchange_ts": 1_700_000_200_000,
                "quote_source": "bbo_near", "contract": "TMFH6",
@@ -195,8 +213,10 @@ def test_provenance_preserves_original_timestamp_text():
 def test_equal_timestamp_deterministic_tie():
     # v2(2): EQUAL (exchange_ts, seq) ties resolve by source record
     # identity (byte offset), never incidental file order
-    a = {"source_event_seq": 1, "exchange_ts": 100, "byte_offset": 10}
-    b = {"source_event_seq": 1, "exchange_ts": 100, "byte_offset": 5}
+    a = {"source_event_seq": 1, "exchange_ts": 100, "byte_offset": 10,
+         "record_no": 2, "byte_hash": "a"}
+    b = {"source_event_seq": 1, "exchange_ts": 100, "byte_offset": 5,
+         "record_no": 1, "byte_hash": "b"}
     ordered = order_events([a, b])
     assert ordered is not None
     seq = [e.get("byte_offset") for e in
@@ -272,7 +292,7 @@ def test_missing_quote_contract_unavailable():
     # v3(2): a quote WITHOUT a contract can never attach — unavailable
     events = [{"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
                "decision_ts_ms": 1_700_000_100_000, "contract": "TMFH6",
-               "position_side": "SHORT"}]
+               "position": {"near": "SHORT", "far": "SHORT"}}]
     quotes = [{"leg": "near", "bid": 50.0, "ask": 100.0,
                "quote_exchange_ts": 1_700_000_000_000,
                "quote_source": "bbo_near", "close_action": "SHORT"}]
@@ -288,7 +308,7 @@ def test_close_side_provenance_validated():
     # attaches with the position-derived close_action
     base = {"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
             "decision_ts_ms": 1_700_000_100_000, "contract": "TMFH6",
-            "position_side": "LONG"}
+            "position": {"near": "LONG", "far": "LONG"}}
     quote = {"leg": "near", "contract": "TMFH6",
              "bid": 50.0, "ask": 100.0,
              "quote_exchange_ts": 1_700_000_000_000,
@@ -305,6 +325,38 @@ def test_close_side_provenance_validated():
         "close_action must come from the validated position side"
 
 
+def test_per_leg_position_mapping_required():
+    # v4: spread legs can have OPPOSITE pre-decision directions — each
+    # quote validates against ITS OWN leg; a shared side is never reused;
+    # missing mapping -> typed unavailable
+    base = {"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
+            "decision_ts_ms": 1_700_000_100_000, "contract": "TMFH6",
+            "position": {"near": "LONG", "far": "SHORT"}}
+    near_q = {"leg": "near", "contract": "TMFH6",
+              "bid": 50.0, "ask": 100.0,
+              "quote_exchange_ts": 1_700_000_000_000,
+              "quote_source": "bbo_near", "close_action": "SHORT"}
+    far_q = {"leg": "far", "contract": "TMFH6",
+             "bid": 25.0, "ask": 50.0,
+             "quote_exchange_ts": 1_700_000_000_000,
+             "quote_source": "bbo_far", "close_action": "SHORT"}
+    result = attach_quotes([base], [near_q, far_q])
+    near = result[0]["quotes"]["near"]
+    far = result[0]["quotes"]["far"]
+    assert near.get("available") is False, \
+        "near LONG vs quote SHORT must be unavailable"
+    assert "close_action" in near.get("reason", ""), near
+    assert far.get("available") is True, far
+    assert far.get("close_action") == "SHORT", \
+        "far validates against its OWN position side"
+    no_pos = dict(base)
+    no_pos.pop("position")
+    result2 = attach_quotes([no_pos], [near_q, far_q])
+    q = result2[0]["quotes"]["near"]
+    assert isinstance(q, dict) and q.get("available") is False, q
+    assert "position" in q.get("reason", ""), q
+
+
 def test_manifest_failure_leaves_zero_files(tmp_path, monkeypatch):
     # v3(3): all-or-nothing — a manifest failure removes every
     # newly-created output file/dir (zero files, no partial output)
@@ -317,7 +369,9 @@ def test_manifest_failure_leaves_zero_files(tmp_path, monkeypatch):
     evs = tmp_path / "events.json"
     evs.write_text(json.dumps([{"record": "submission", "trade_id": "t1",
                                 "kind": "RELEASE_DECISION",
-                                "ts_text": "2026-08-08T10:00:00"}]),
+                                "ts_text": "2026-08-08T10:00:00",
+                                "byte_offset": 5, "record_no": 1,
+                                "byte_hash": "h"}]),
                    encoding="utf-8")
 
     def boom(*a, **k):
