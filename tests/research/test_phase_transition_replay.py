@@ -22,6 +22,9 @@ Classification contract (freeze-classifier amendment):
 from scripts.research.phase_transition_replay import (  # noqa: F401
     classify, clone, execution, pipeline, run_replay, stream, sweep)
 
+import json
+import pytest
+
 REPO = __import__("pathlib").Path(__file__).resolve().parents[2]
 
 
@@ -329,47 +332,82 @@ def test_replay_entrypoint_exists():
 
 def test_runner_refuses_without_dry_run_or_authorize(tmp_path):
     inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([]), encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1"])
+    # v5: the engine is not implemented — ANY non-dry-run attempt refuses
+    assert rc == 3, f"runner must refuse without --dry-run: {rc}"
+    assert not (out / "manifest.json").exists(), "zero output on refusal"
+
+
+def test_runner_authorize_without_dry_run_refused(tmp_path):
+    # v5: --authorize non-dry-run must NOT be a fake success — the engine
+    # is not implemented, so it refuses with zero output
+    import json
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([]), encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1", "--authorize"])
+    assert rc == 3, rc
+    assert not (out / "manifest.json").exists(), "zero output on refusal"
+
+
+def test_runner_prereg_required(tmp_path):
+    # v5: --prereg is required — no value defaults may bypass
+    # pre-registration
+    inp = tmp_path / "events.json"
     inp.write_text("[]", encoding="utf-8")
     out = tmp_path / "out"
-    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out)])
-    assert rc == 2, f"runner must refuse without --dry-run/--authorize: {rc}"
+    with pytest.raises(SystemExit) as ei:
+        run_replay.main(["--input", str(inp), "--out-dir", str(out)])
+    assert ei.value.code != 0
+
+
+def _schema_valid_event(**over):
+    ev = {"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
+          "decision_ts": "2026-08-08T10:00:00",
+          "quotes": {"near": {"bid": 50.0, "ask": 100.0, "age_s": 1,
+                              "close_action": "SHORT"},
+                     "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
+                             "close_action": "SHORT"}}}
+    ev.update(over)
+    return ev
 
 
 def test_runner_dry_run_writes_manifest(tmp_path):
     import json
     inp = tmp_path / "events.json"
-    inp.write_text(json.dumps([
-        {"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
-         "decision_ts": "2026-08-08T10:00:00",
-         "quotes": {"near": {"bid": 50.0, "ask": 100.0, "age_s": 1,
-                             "close_action": "SHORT"},
-                    "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
-                            "close_action": "SHORT"}}},
-    ]), encoding="utf-8")
+    inp.write_text(json.dumps([_schema_valid_event()]), encoding="utf-8")
     out = tmp_path / "out"
     rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
-                          "--dry-run"])
+                          "--prereg", "prereg-v1", "--dry-run"])
     assert rc == 0, rc
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["dry_run"] is True
     assert len(manifest["input_sha256"]) == 64
     assert manifest["stream_hash"]
     assert manifest["n_events"] == 1
+    assert manifest["n_kept"] == 1
     assert manifest["n_censored"] == 0
     assert manifest["engine_run"] is False
+    assert manifest["preregistration_id"] == "prereg-v1"
+    assert manifest["preregistration_sha"]
+    assert manifest["parameters"]["staleness"] == {"max_age_s": 30}
+    assert manifest["parameters"]["m_economic"] == 25.0
 
 
 def test_runner_reproducible_input_hash(tmp_path):
     import json
     inp = tmp_path / "events.json"
-    inp.write_text(json.dumps([{"source_event_seq": 1, "exchange_ts": 1}]),
-                   encoding="utf-8")
+    inp.write_text(json.dumps([_schema_valid_event()]), encoding="utf-8")
     out1 = tmp_path / "o1"
     out2 = tmp_path / "o2"
     run_replay.main(["--input", str(inp), "--out-dir", str(out1),
-                     "--dry-run"])
+                     "--prereg", "prereg-v1", "--dry-run"])
     run_replay.main(["--input", str(inp), "--out-dir", str(out2),
-                     "--dry-run"])
+                     "--prereg", "prereg-v1", "--dry-run"])
     m1 = json.loads((out1 / "manifest.json").read_text(encoding="utf-8"))
     m2 = json.loads((out2 / "manifest.json").read_text(encoding="utf-8"))
     assert m1["input_sha256"] == m2["input_sha256"]
@@ -382,22 +420,76 @@ def test_runner_censors_incomplete_quotes(tmp_path):
     import json
     inp = tmp_path / "events.json"
     inp.write_text(json.dumps([
-        {"source_event_seq": 1, "exchange_ts": 100, "recv_ts": 101,
-         "decision_ts": "2026-08-08T10:00:00",
-         "quotes": {"near": {"bid": 50.0, "ask": 100.0, "age_s": None,
-                             "close_action": "SHORT"},
-                    "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
-                            "close_action": "SHORT"}}},
+        _schema_valid_event(quotes={
+            "near": {"bid": 50.0, "ask": 100.0, "age_s": None,
+                     "close_action": "SHORT"},
+            "far": {"bid": 25.0, "ask": 50.0, "age_s": 1,
+                    "close_action": "SHORT"}}),
     ]), encoding="utf-8")
     out = tmp_path / "out"
     rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
-                          "--dry-run"])
+                          "--prereg", "prereg-v1", "--dry-run"])
     assert rc == 0, rc
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["n_censored"] == 1, manifest
     assert manifest["n_kept"] == 0, manifest
     reasons = [c["reason"] for c in manifest["censored_reasons"]]
     assert any("age" in r or "stale" in r for r in reasons), reasons
+
+
+def test_runner_schema_invalid_event_censored(tmp_path):
+    # v5: input schema validation — an event missing the decision timestamp
+    # is censored per-event, never silently treated as valid
+    import json
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps(
+        [_schema_valid_event(), _schema_valid_event(decision_ts=None)]),
+        encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1", "--dry-run"])
+    assert rc == 0, rc
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["n_events"] == 2
+    assert manifest["n_kept"] == 1
+    assert manifest["n_censored"] == 1, manifest
+    reasons = [c["reason"] for c in manifest["censored_reasons"]]
+    assert any("schema" in r for r in reasons), reasons
+
+
+def test_runner_whole_file_invalid_refused(tmp_path):
+    # v5: a malformed whole-file input REFUSES (non-zero, zero output)
+    import json
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps({"not": "a list"}), encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1", "--dry-run"])
+    assert rc == 4, rc
+    assert not (out / "manifest.json").exists(), "zero output on refusal"
+
+
+def test_runner_json_dict_quotes_kept_when_valid(tmp_path):
+    # v5 integration: real JSON-list input with dict quotes — VALID near/far
+    # dict quotes are kept (normalize), invalid ones are censored
+    import json
+    inp = tmp_path / "events.json"
+    inp.write_text(json.dumps([
+        _schema_valid_event(),
+        _schema_valid_event(
+            source_event_seq=2, exchange_ts=200, recv_ts=201,
+            quotes={"near": {"bid": 50.0, "ask": 100.0, "age_s": 1,
+                             "close_action": "SHORT"},
+                    "far": {"bid": 25.0, "ask": 50.0, "age_s": None,
+                            "close_action": "SHORT"}}),
+    ]), encoding="utf-8")
+    out = tmp_path / "out"
+    rc = run_replay.main(["--input", str(inp), "--out-dir", str(out),
+                          "--prereg", "prereg-v1", "--dry-run"])
+    assert rc == 0, rc
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["n_kept"] == 1, manifest
+    assert manifest["n_censored"] == 1, manifest
 
 
 # ── reuse contract: the skeleton must wire the COMMITTED exit_attribution ───
