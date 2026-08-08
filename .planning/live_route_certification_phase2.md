@@ -115,6 +115,64 @@ return True — **無 recertification**。
 - value 選擇/owner = 獨立 approval — **本 phase 不加 config key**
 - RED: futures.yaml 無 key（現況）→ wiring/config phase 才轉綠
 
+
+## 8. v3 修訂（codex Phase-2 v2 review — 行為驗證取代文字/AST presence）
+
+### 8.1 Per-route behavioural contract（recording-client，非 string）
+| route | LIVE_QUARANTINED | LIVE_READY | 現況 |
+|---|---|---|---|
+| 2707 _place_safety_stop | **零 place** | 允許 | RED（無 gate） |
+| 2721 _cancel_safety_stop | **零 cancel** | 允許 | RED（無 gate） |
+| 3847 manager 路徑 | 零（_assert_live_allowed wrapper raise） | 允許 | GREEN（已 gate） |
+| 4598 dispatcher | 零（gate raise） | 允許 | GREEN（已 gate） |
+| 5208 _execute_trade | **零 place/cancel** | 允許 | RED（無 gate） |
+AST inventory 保留為 completeness tripwire（test_exhaustive_state_changing_
+routes_gated），**不是安全證明**。
+
+### 8.2 Emergency 決策（_emergency_flatten_mts, monitor.py:7519 已實證）
+現況: 設 `_mts_force_exit_inflight` → **改 strategy state**（_released_leg/
+_side）→ 委派 normal dispatcher。**無 durable intent、無獨立授權檢查**。
+決策: **quarantine 下允許，但需 4 項**（wiring phase 實作 + RED→GREEN）:
+1. 獨立授權 operator command（manual close_all / settlement gate 攜帶
+   durable authorization token）
+2. **durable EXIT intent 先於任何 strategy mutation / broker I/O**
+   （fsync'd intent ledger — core/emergency_intent）
+3. idempotent（ledger dedup — 同 intent 重送 ≤1 fill request）
+4. post-fill/restart reconciliation（outstanding intent 重啟後對帳）
+若未授權 → 明確 blocked + operator procedure（不靜默）。
+
+### 8.3 Reconnect atomic handoff（行為契約）
+_try_shioaji_reconnect（main.py:693, 實證 body）: 現況 safe_login →
+subscribe → return True — **不 quarantine、不 recertify**。
+契約: ①re-login 前 fm ctx → LIVE_QUARANTINED ②resubscribe 完成後才
+fresh certify ③login/subscribe/cert 任一失敗 → 維持 QUARANTINED。
+manual + auto（code 12）同流程。RED 測試驅動真實 fn（monkeypatch
+safe_login/connection_dropped）。
+
+### 8.4 Dashboard persistence（core/execution_context_state）
+- writer/reader 模組（wiring phase）: atomic write（tmp+rename+fsync,
+  無 torn JSON）+ round-trip read
+- RED: 模組不存在（ImportError）= 契約; wiring 後轉 GREEN
+
+### 8.5 Release identity verifier（core/release_identity）
+- verify_release_identity(release_dir, runner) — 指定 release_dir +
+  注入 runner（可測）; env missing / HEAD mismatch / command failure
+  全 fail-closed（QUARANTINED）
+- RED: 模組不存在（ImportError）= 契約
+
+### 8.6 Logout 集中化（移除 monitor-source 需求）
+- 撤銷 v1 test_logout_invalidates_monitor_certificate_route 的
+  monitor-source 斷言 — invalidation 正確集中於 shioaji_session.logout
+- 契約: REAL logout → registry generation 死 → 綁定該 session 的 ctx
+  無法達 LIVE_READY（core GREEN + 本檔案 behaviour 測試）
+
+### 8.7 Exit sequence + no-orphan policy
+- 正常 EXIT 順序（實證 5207→5208）: cancel safety stop → place exit
+  （GREEN 契約鎖 — 順序不得反）
+- quarantine 期間 outstanding exchange safety stop: **不 orphan** —
+  經 emergency_intent ledger 留下 reconciliation 紀錄（RED→GREEN）;
+  stop 本身為保護性 Cover 單，取消僅經 recovery
+
 ## 6. 交付順序
 
 1. 本設計 + RED tests（commit）→ codex 審查 → 2. monitor wiring phase
