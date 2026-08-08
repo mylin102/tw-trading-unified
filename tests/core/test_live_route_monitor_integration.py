@@ -126,3 +126,117 @@ def test_logout_invalidates_monitor_certificate_route():
     text = monitor.read_text(encoding="utf-8")
     assert "unregister_session" in text or "session_registry" in text, \
         "monitor does not reference session invalidation on logout"
+
+
+# ── Phase 2 v2 matrix (RED until wiring; codex static-audit findings) ──────
+
+STATE_CHANGING_ATTRS = ("place_order", "cancel_order", "update_order",
+                        "modify_order")
+# documented downstream-gated call sites (gate lives in OrderManager.submit)
+DOWNSTREAM_GATED = {3847}
+# the explicit, separately-authorized emergency marker (wiring phase)
+EMERGENCY_MARKERS = ("EMERGENCY_FLATTEN", "emergency_flatten")
+# the existing named emergency path (monitor.py:7519 _emergency_flatten_mts)
+EMERGENCY_FUNCS = {"_emergency_flatten_mts"}
+
+
+def _state_changing_sites(path):
+    """(site_lineno, enclosing_fn, attr) for every state-changing call."""
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    sites = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in STATE_CHANGING_ATTRS):
+            continue
+        enclosing = None
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and fn.lineno <= node.lineno <= getattr(fn, "end_lineno", node.lineno):
+                enclosing = fn.name
+        sites.append((node.lineno, enclosing, node.func.attr))
+    return sites
+
+
+def _fn_calls_gate(tree, fn_name):
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name == fn_name:
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Call):
+                    name = (n.func.attr if isinstance(n.func, ast.Attribute)
+                            else (n.func.id if isinstance(n.func, ast.Name) else ""))
+                    if name == "assert_live_order_allowed":
+                        return True
+    return False
+
+
+def test_exhaustive_state_changing_routes_gated():
+    """(1) RED: EVERY live state-changing call (place/cancel/update/modify)
+    must be dominated by assert_live_order_allowed, a documented downstream
+    gate, or an explicit emergency marker. Static audit found ungated sites:
+    2707 safety-stop place, 2721 safety-stop cancel, 5208 _execute_trade."""
+    monitor = _monitor_path()
+    tree = ast.parse(monitor.read_text(encoding="utf-8"))
+    monitor_text = monitor.read_text(encoding="utf-8")
+    ungated = []
+    for lineno, fn_name, attr in _state_changing_sites(monitor):
+        if lineno in DOWNSTREAM_GATED:
+            continue                          # OrderManager.submit gates it
+        if _fn_calls_gate(tree, fn_name):
+            continue                          # gate dominates this function
+        if fn_name in EMERGENCY_FUNCS:
+            continue                          # inside the named emergency path
+        ungated.append((lineno, fn_name, attr))
+    assert not ungated, f"ungated live state-changing calls: {ungated}"
+
+
+def test_order_manager_gate_exists():
+    """(1) RED-support: OrderManager.submit must itself assert the gate
+    (the downstream-gated allowlist is only valid while it does)."""
+    om = _repo_root() / "core" / "order_management" / "order_manager.py"
+    tree = ast.parse(om.read_text(encoding="utf-8"))
+    gated_fns = [fn.name for fn in ast.walk(tree)
+                 if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and _fn_calls_gate(tree, fn.name)]
+    assert gated_fns, "order_manager must contain an assert gate function"
+    assert "submit" in gated_fns or "_assert_live_allowed" in gated_fns, \
+        f"submit path must reach the gate (gated fns: {gated_fns})"
+
+
+def test_emergency_path_explicitly_named():
+    """(2) RED: an emergency flatten path must be explicitly named,
+    durable/idempotent and separately authorized — never an accidental
+    bypass of the gate."""
+    monitor = _monitor_path()
+    text = monitor.read_text(encoding="utf-8")
+    assert any(m in text for m in EMERGENCY_MARKERS), \
+        "no explicit emergency-flatten marker exists yet"
+
+
+def test_reconnect_quarantines_before_relogin_and_recertifies():
+    """(3) RED: reconnect must (a) quarantine the fm execution context
+    BEFORE re-login, (b) fresh-certify ONLY after resubscribe — covering
+    both the manual _try_shioaji_reconnect and the code-12 auto branch."""
+    main_py = _repo_root() / "main.py"
+    text = main_py.read_text(encoding="utf-8")
+    assert "certify_route" in text and ("transition_with_certificate" in text
+                                        or "LIVE_QUARANTINED" in text), \
+        "reconnect does not quarantine + recertify atomically"
+
+
+def test_execution_context_persisted_for_dashboard():
+    """(4) RED: the execution context (effective_mode + audit_reasons) must
+    be PERSISTED to a dashboard-readable file at every transition (to_dict
+    alone is in-memory) with a restart-read round-trip."""
+    monitor = _monitor_path()
+    text = monitor.read_text(encoding="utf-8")
+    assert "futures_execution_context.json" in text, \
+        "execution-context persistence write point not wired"
+
+
+def test_release_head_check_in_release_tree():
+    """(5) RED: the release identity check must run in the ACTUAL release
+    tree (git -C <release_dir> rev-parse HEAD), not an arbitrary cwd."""
+    monitor = _monitor_path()
+    text = monitor.read_text(encoding="utf-8")
+    assert "LRC_RELEASE_SHA" in text and "-C" in text, \
+        "release-tree HEAD check not wired"
