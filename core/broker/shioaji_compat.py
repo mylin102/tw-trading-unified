@@ -110,13 +110,17 @@ def safe_login(api: sj.Shioaji, api_key: str, secret_key: str, **kwargs) -> Any:
             contracts_timeout=kwargs.get("contracts_timeout", 10000),
             **kwargs
         )
-        session_registry.register(api)  # register exactly once, after success
+        if res:                        # round-11 #2: a falsey login return
+            # is treated as failure (fail-closed) even though Shioaji's
+            # documented failure mode is exceptions (AuthError/TokenError…)
+            session_registry.register(api)
         return res
     except TypeError:
         # Fallback for 1.3.3
         kwargs.pop("contracts_timeout", None)
         res = api.login(api_key=api_key, secret_key=secret_key, **kwargs)
-        session_registry.register(api)
+        if res:
+            session_registry.register(api)
         return res
 
 def wait_for_contracts(api: sj.Shioaji, category: str = "Futures", symbol: str = "MXF", timeout: int = 30):

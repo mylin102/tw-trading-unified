@@ -103,12 +103,16 @@ class SessionRegistry:
         return generation
 
     def unregister(self, api: object) -> None:
-        # identity-aware removal (round-9 #6): only clear the current
-        # generation when the EXACT registration that owns it is removed —
-        # removing another api must not invalidate the live session.
-        entry = self._entries.pop(id(api), None)
-        if entry is not None and entry.api is api \
-                and self._last_generation_api is api:
+        # identity-aware removal (round-9 #6 + round-11 #4): verify
+        # entry.api is api BEFORE removing anything — a forged entry at the
+        # same id (index collision) belongs to another object and must not
+        # be removed; only the exact registration may be deleted, and only
+        # then may the current generation be cleared.
+        entry = self._entries.get(id(api))
+        if entry is None or entry.api is not api:
+            return
+        del self._entries[id(api)]
+        if self._last_generation_api is api:
             self._last_generation = None
             self._last_generation_api = None
 
@@ -395,24 +399,41 @@ def certify_route(api: object, *, process_start_id: str,
     # snapshot presence semantics (L5): the exact set {near, far} — empty /
     # missing / duplicate / extra codes all fail (market-closed is not a
     # documented exception yet)
-    snapshot_codes = [c for c in (pre.get("snapshot_codes") or [])]
-    if near_code and far_code and set(snapshot_codes) != {near_code, far_code}:
+    raw_snapshot = pre.get("snapshot_codes")
+    snapshot_codes = (list(raw_snapshot) if isinstance(raw_snapshot, (list, tuple))
+                      else None)
+    if near_code and far_code and (
+            snapshot_codes is None or set(snapshot_codes) != {near_code, far_code}):
         failures.append("SNAPSHOT_CODES_INCONSISTENT")
 
-    # round-9 #5 + round-10: the RAW quote_subscription must be exactly two
-    # rows, both passed, codes precisely {near_code, far_code} — no filtered
-    # view (2 good + extra failed/malformed row must fail).
+    # round-9 #5 + round-10/11: the RAW quote_subscription must be exactly
+    # two rows, both passed, codes precisely {near_code, far_code} — no
+    # filtered view and NO malformed records (None / non-dict / missing
+    # code or passed) may crash the check: they all fail closed.
     raw_quotes = pre.get("quote_subscription") or []
-    quote_checks = raw_quotes
-    quote_codes = {c.get("code") for c in raw_quotes}
-    if near_code and far_code and (
-            len(raw_quotes) != 2 or len(quote_codes) != 2
-            or not all(c.get("passed") for c in raw_quotes)
-            or quote_codes != {near_code, far_code}):
+    quote_ok = False
+    if near_code and far_code and isinstance(raw_quotes, list) \
+            and len(raw_quotes) == 2:
+        quote_codes = set()
+        well_formed = True
+        for row in raw_quotes:
+            if not isinstance(row, dict):
+                well_formed = False
+                break
+            code = row.get("code")
+            if code is None or row.get("passed") is not True:
+                well_formed = False
+                break
+            quote_codes.add(code)
+        if well_formed and quote_codes == {near_code, far_code}:
+            quote_ok = True
+    if not quote_ok:
         failures.append("QUOTE_SUBSCRIPTION_FAILED")
 
     if failures:
         return None, failures
+
+    quote_checks = raw_quotes      # exactly the two valid rows
 
     generation = session_registry.generation(api) or ""
     cert = LiveBrokerCertificate(
