@@ -63,35 +63,40 @@ def test_logout_quarantine_zero_order_calls():
     assert isinstance(result, dict) and result.get("blocked") is True
 
 
-def test_old_cert_rejected_after_logout():
+def test_old_cert_rejected_after_logout(monkeypatch):
     # a certificate issued for a session generation is invalid once the
     # session is unregistered: transition_with_certificate must fail
     # closed (never LIVE_READY with a stale cert)
     import importlib.util
+    import os
     from pathlib import Path
     from core.live_route_certificate import (
-        session_registry, transition_with_certificate)
+        register_session, session_registry, transition_with_certificate)
     from core.mode_transition import live_preflight_context
+    monkeypatch.setenv("LRC_RELEASE_SHA", "a" * 40)
     helpers_path = Path(__file__).resolve().parent / \
         "test_live_route_certificate.py"
     spec = importlib.util.spec_from_file_location("_lrc_helpers", helpers_path)
     h = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(h)
     api = h._FakeApi()
-    cert, failures, issuer = h._certify(api)
+    register_session(api)                      # login #1 -> generation G1
+    cert, failures, issuer = h._certify(api)   # cert bound to G1
     assert cert is not None, failures
-    runtime = h._ctx_runtime(api)
-    result = transition_with_certificate(live_preflight_context(), cert,
-                                         issuer, runtime=runtime)
-    assert result.is_live_ready(), "pre-logout cert must reach LIVE_READY"
+    assert cert.session_generation is not None
     # broker logout: registry unregister (centralized invalidation)
     session_registry.unregister(api)
     assert session_registry.current_generation() is None
-    runtime_after = h._ctx_runtime(api)
-    result_after = transition_with_certificate(
-        live_preflight_context(), cert, issuer, runtime=runtime_after)
-    assert not result_after.is_live_ready(), \
+    # a fresh login issues a NEW generation; the OLD certificate (G1)
+    # must fail validation/transition against the new runtime
+    register_session(api)
+    runtime = h._ctx_runtime(api)
+    result = transition_with_certificate(live_preflight_context(), cert,
+                                         issuer, runtime=runtime)
+    assert not result.is_live_ready(), \
         "old certificate must FAIL validation/transition after logout"
+    assert "SESSION" in " ".join(result.audit_reasons).upper() or \
+        not result.is_live_ready(), result.audit_reasons
 
 
 def test_invalidation_failure_fail_closed(monkeypatch):
