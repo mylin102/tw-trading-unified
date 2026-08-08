@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Round-9 #8: safe_login hook behavior (core/broker/shioaji_compat).
+
+Contract:
+- a successful login registers exactly once (new opaque generation)
+- a FAILED login leaves NO valid generation (unregister-before + no
+  register-after)
+- the TypeError fallback path (1.3.3-style) registers exactly once too
+- existing return/error semantics are preserved (returns the login result,
+  propagates exceptions)
+- logout invalidation lives in core/shioaji_session (covered in
+  test_live_route_certificate.py)
+"""
+
+import pytest
+
+from core.broker.shioaji_compat import safe_login
+from core.live_route_certificate import session_registry
+
+
+class _FakeSj:
+    """Scripted login surface: each step is either "ok" or an exception."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    def login(self, **kwargs):
+        self.calls.append(kwargs)
+        step = self.script.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+
+def test_safe_login_success_registers_once():
+    api = _FakeSj(["ok"])
+    result = safe_login(api, api_key="k", secret_key="s")
+    assert result == "ok"
+    gen = session_registry.generation(api)
+    assert gen is not None and len(gen) >= 32
+    # exactly one registration (generation stable across reads)
+    assert session_registry.generation(api) == gen
+    # first attempt carries the contracts_timeout default
+    assert api.calls[0]["contracts_timeout"] == 10000
+
+
+def test_safe_login_failure_leaves_no_generation():
+    api = _FakeSj([RuntimeError("broker down")])
+    with pytest.raises(RuntimeError):
+        safe_login(api, api_key="k", secret_key="s")
+    assert session_registry.generation(api) is None, \
+        "failed login must leave no valid generation"
+
+
+def test_safe_login_typeerror_fallback_registers_once():
+    # 1.3.3-style: first call raises TypeError (contracts_timeout unsupported)
+    # → fallback retries without contracts_timeout → success
+    api = _FakeSj([TypeError("contracts_timeout"), "ok"])
+    result = safe_login(api, api_key="k", secret_key="s")
+    assert result == "ok"
+    gen = session_registry.generation(api)
+    assert gen is not None
+    assert session_registry.generation(api) == gen          # registered once
+    assert "contracts_timeout" in api.calls[0]
+    assert "contracts_timeout" not in api.calls[1]           # fallback dropped it
+
+
+def test_safe_login_fallback_failure_leaves_no_generation():
+    api = _FakeSj([TypeError("contracts_timeout"), RuntimeError("still down")])
+    with pytest.raises(RuntimeError):
+        safe_login(api, api_key="k", secret_key="s")
+    assert session_registry.generation(api) is None
+
+
+def test_safe_login_invalidates_previous_registration_before_attempt():
+    # pre-attempt invalidate: an old registration is dead before the attempt
+    api = _FakeSj([RuntimeError("down")])
+    session_registry.register(api)                # simulate previous session
+    old_gen = session_registry.generation(api)
+    assert old_gen is not None
+    with pytest.raises(RuntimeError):
+        safe_login(api, api_key="k", secret_key="s")
+    assert session_registry.generation(api) is None, \
+        "old registration must be invalidated before the attempt"
