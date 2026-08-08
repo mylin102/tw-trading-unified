@@ -189,8 +189,16 @@ def test_cancel_failure_emits_structured_reason():
 
 
 def _adapter_error():
-    from strategies.futures.squeeze_futures.data.shioaji_client import (
-        AdapterOrderError)
+    # the MONITOR catches AdapterOrderError from the `squeeze_futures...`
+    # identity (monitor.py:32 inserts strategies/futures on sys.path) —
+    # the test must raise THAT class, not the package-path twin
+    import os
+    import sys
+    from pathlib import Path
+    _sf = str(Path(__file__).resolve().parents[2] / "strategies" / "futures")
+    if _sf not in sys.path:
+        sys.path.insert(0, _sf)
+    from squeeze_futures.data.shioaji_client import AdapterOrderError
     return AdapterOrderError(
         code="ADAPTER_ORDER_PLACE_FAILED",
         context={"method": "place_order", "contract": "TMFH6"})
@@ -216,22 +224,27 @@ def _monitor_with_raising_client(err):
 
     m.client = _RaisingClient(err)
     m.api = SimpleNamespace(cancel_order=lambda *a, **k: None)
+    m._safety_stop_trade = None
     return m
 
 
-def test_caller_records_durable_failure():
+def test_caller_records_durable_failure(monkeypatch):
     # three-line correction (B): the durable event/order-manager
     # propagation is CALLER-owned — the monitor routes must catch
     # AdapterOrderError and record a durable, order-manager-visible
-    # failure event (not merely propagate, not swallow)
+    # failure event via the EXISTING audit channel (no new ledger)
+    import strategies.futures.squeeze_futures.data.data_storage as ds
+    records = []
+    monkeypatch.setattr(ds, "save_signal_audit", lambda r: records.append(r))
     m = _monitor_with_raising_client(_adapter_error())
     try:
         m._execute_trade("EXIT", 44300, "2026-08-08T10:00:00", 1,
                          reason="TEST")
     except Exception:
         pass
-    assert getattr(m, "_last_order_failure", None) is not None, \
-        "caller must record a durable failure event (order-manager-visible)"
+    assert records, "caller must audit the durable failure"
+    assert records[0].get("error_code") == "ADAPTER_ORDER_PLACE_FAILED", \
+        f"structured code must reach the durable audit: {records}"
 
 
 # ── PAPER unchanged / no real order ─────────────────────────────────────────
