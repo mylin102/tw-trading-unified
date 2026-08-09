@@ -285,10 +285,11 @@ def test_guard_freeze_first_post_freeze_refused(tmp_path, monkeypatch):
     assert "GUARD_HEAD_MISMATCH" in \
         guard_release_head(str(repo)).reasons
     # post-freeze manifest: manifest pinned to a different SHA
-    m = tmp_path / "PHASE1_RC_CANDIDATE.md"
-    m.write_text(f"Frozen SHA {'a' * 40}", encoding="utf-8")
+    m = tmp_path / "PHASE1_FINAL_FREEZE.md"
+    m.write_text(f"Frozen SHA {'a' * 40}\n", encoding="utf-8")
     assert "GUARD_MANIFEST_STALE" in \
-        guard_rollback_manifest([str(m)], head).reasons
+        guard_rollback_manifest(str(repo), [str(m)], head,
+                                exclude_paths=["PHASE1_FINAL_FREEZE.md"]).reasons
 
 
 def test_guard_flat_paper_holding_accepted_for_paper(tmp_path):
@@ -444,27 +445,89 @@ def test_guard_margin_none_and_invalid():
     assert "GUARD_MARGIN_INVALID" in guard_margin(-1.0).reasons
 
 
-# ── 9. rollback manifest + drift abort ─────────────────────────────────────
+# ── 9. rollback manifest + drift abort (exclude-self tree identity) ─────────
+
+def _tree_hash(repo, exclude_paths=()):
+    """Local exclude-self tree hash: sha256 of `git ls-tree -r HEAD` lines
+    minus the manifest/rollback docs (content-addressed identity that is
+    stable across manifest-only commits)."""
+    import hashlib
+    out = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "HEAD"],
+                         check=True, capture_output=True, text=True)
+    lines = [ln for ln in out.stdout.splitlines()
+             if not any(ln.split("\t")[-1] == p for p in exclude_paths)]
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+
+
+def _manifest_with(repo, exclude_paths, head=None):
+    m = Path(repo) / "PHASE1_FINAL_FREEZE.md"
+    m.write_text(
+        f"Frozen SHA {head or _head(repo)}\n"
+        f"frozen_tree_hash: {_tree_hash(repo, exclude_paths)}\n",
+        encoding="utf-8")
+    return m
+
 
 def test_guard_rollback_manifest_ok(tmp_path):
     from core.deployment_safety_gate import guard_rollback_manifest
-    m = tmp_path / "PHASE1_RC_CANDIDATE.md"
-    m.write_text(f"Frozen SHA {SHA}", encoding="utf-8")
-    r = guard_rollback_manifest([str(m)], SHA)
+    repo = _git_repo(tmp_path)
+    exclude = ["PHASE1_FINAL_FREEZE.md"]
+    m = _manifest_with(repo, exclude)
+    r = guard_rollback_manifest(str(repo), [str(m)], _head(repo),
+                                exclude_paths=exclude)
     assert r.ok, r.reasons
 
 
-def test_guard_rollback_manifest_stale(tmp_path):
+def test_guard_rollback_manifest_self_record_no_cycle(tmp_path):
+    # THE freeze/manifest cycle: recording the freeze in a manifest commit
+    # must NOT invalidate itself — the manifest is excluded from the tree
+    # identity, so a manifest-only commit keeps the guard PASSING
     from core.deployment_safety_gate import guard_rollback_manifest
-    m = tmp_path / "PHASE1_RC_CANDIDATE.md"
-    m.write_text(f"Frozen SHA {OTHER}", encoding="utf-8")
-    r = guard_rollback_manifest([str(m)], SHA)
+    repo = _git_repo(tmp_path)
+    exclude = ["PHASE1_FINAL_FREEZE.md"]
+    m = _manifest_with(repo, exclude)          # phase 1: record
+    subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm",
+                    "freeze record"], check=True)   # phase 2: freeze commit
+    new_head = _head(repo)
+    r = guard_rollback_manifest(str(repo), [str(m)], new_head,
+                                exclude_paths=exclude)
+    assert r.ok, r.reasons                      # no self-reference cycle
+    assert new_head != _head(repo) or True
+
+
+def test_guard_rollback_manifest_code_drift_refused(tmp_path):
+    # ANY code change after the freeze changes the exclude-self tree hash
+    # -> refused (fail-closed; freeze-first preserved)
+    from core.deployment_safety_gate import guard_rollback_manifest
+    repo = _git_repo(tmp_path)
+    exclude = ["PHASE1_FINAL_FREEZE.md"]
+    m = _manifest_with(repo, exclude)
+    (repo / "main.py").write_text("x = 2\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "main.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "code drift"],
+                   check=True)
+    r = guard_rollback_manifest(str(repo), [str(m)], _head(repo),
+                                exclude_paths=exclude)
+    assert not r.ok and "GUARD_MANIFEST_STALE" in r.reasons
+
+
+def test_guard_rollback_manifest_incomplete(tmp_path):
+    # a manifest that lacks the frozen_tree_hash cannot bind the tree
+    from core.deployment_safety_gate import guard_rollback_manifest
+    repo = _git_repo(tmp_path)
+    m = Path(repo) / "PHASE1_FINAL_FREEZE.md"
+    m.write_text(f"Frozen SHA {_head(repo)}\n", encoding="utf-8")
+    r = guard_rollback_manifest(str(repo), [str(m)], _head(repo),
+                                exclude_paths=["PHASE1_FINAL_FREEZE.md"])
     assert not r.ok and "GUARD_MANIFEST_STALE" in r.reasons
 
 
 def test_guard_rollback_manifest_missing(tmp_path):
     from core.deployment_safety_gate import guard_rollback_manifest
-    r = guard_rollback_manifest([str(tmp_path / "nope.md")], SHA)
+    r = guard_rollback_manifest(str(tmp_path / "nope.git"),
+                                [str(tmp_path / "nope.md")], SHA)
     assert not r.ok and "GUARD_MANIFEST_MISSING" in r.reasons
 
 
@@ -525,8 +588,8 @@ def test_aggregate_all_pass_readies(tmp_path, monkeypatch):
     rt = tmp_path / "rt"
     _ctx_file(rt, _live_ctx_dict())
     pf = _position_file(rt, _live_snapshot())
-    manifest = tmp_path / "PHASE1_RC_CANDIDATE.md"
-    manifest.write_text(f"Frozen SHA {head}", encoding="utf-8")
+    exclude = ["PHASE1_FINAL_FREEZE.md"]
+    manifest = _manifest_with(repo, exclude, head)
     monkeypatch.setenv("LRC_RELEASE_SHA", head)
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(rt))
     c = check_deployment(
@@ -534,7 +597,8 @@ def test_aggregate_all_pass_readies(tmp_path, monkeypatch):
         runtime_dir=str(rt), pid_file=str(tmp_path / "nope.pid"),
         position_state_path=str(pf), monitor_path=None,
         session_generation=1, margin_available=300_000.0,
-        manifest_paths=[str(manifest)], expected_sha=head)
+        manifest_paths=[str(manifest)], expected_sha=head,
+        manifest_exclude_paths=exclude)
     assert c.ok, [(g.guard, g.reasons) for g in c.results]
     assert c.refusal_codes == ()
 
