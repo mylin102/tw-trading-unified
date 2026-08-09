@@ -10,19 +10,27 @@ Guards:
   1. release_head   — exact release-dir HEAD == literal LRC_RELEASE_SHA,
                       cwd-independent (git -C <release_dir>)
   2. clean_tree     — closure files have zero uncommitted changes (provenance)
-  3. runtime_paths  — TRADING_RUNTIME_DIR set; dir/logs exist + writable;
-                      ctx namespace correct; no secrets in the ctx file
+  3. runtime_paths  — explicit TRADING_RUNTIME_DIR env REQUIRED (never a
+                      repo fallback); dir/logs exist + writable; ctx
+                      namespace = env runtime root; no secrets in the ctx
   4. single_process — no duplicate live instance (pid file + alive process)
-  5. flat_snapshot  — pre-restart read-only: positions FLAT + no pending orders
+  5. flat_snapshot  — provenance-aware pre-restart snapshot: live requires
+                      source=live_broker + positions=0/[] + open_orders=[] +
+                      fresh captured_at + hash + matching session_id; paper
+                      snapshots never satisfy live; missing/ambiguous
+                      source -> fail-closed
   6. quarantine_first_startup — AST: startup quarantines before cert; order
                       gates dominate every state-changing site
   7. session_generation — session/cert registry generation valid + not revoked
-  8. margin         — broker capacity query result valid and >= 220000;
-                      None / exception / invalid -> fail
+  8. margin         — broker capacity query result valid and >= 220000
+                      (caller-supplied, read-only source); None/invalid fail
   9. rollback_manifest — rollback release/env manifest present + records the
-                      exact expected SHA (drift abort)
-  10. ctx_atomic_health — dashboard execution_context atomic read/write health
-                      (canonical reader + non-destructive write probe)
+                      exact expected SHA (drift abort; freeze-first: any
+                      post-freeze change is refused)
+  10. ctx_atomic_health — dashboard execution_context atomic read/write
+                      health; a MISSING file may only bootstrap as
+                      LIVE_QUARANTINED (atomic write capability verified,
+                      never LIVE)
 """
 
 from __future__ import annotations
@@ -143,7 +151,10 @@ def _scan_secrets(path: Path) -> List[str]:
 def guard_runtime_paths(runtime_dir: str) -> GuardResult:
     reasons: List[str] = []
     details: List[str] = []
-    if not runtime_dir:
+    env_rt = os.environ.get("TRADING_RUNTIME_DIR", "")
+    # production/deploy mode REQUIRES the explicit TRADING_RUNTIME_DIR env —
+    # never fall back to the repo (the deployed process reads the env)
+    if not runtime_dir or not env_rt:
         return _fail("runtime_paths", ["GUARD_RUNTIME_ENV_MISSING"])
     rt = Path(runtime_dir)
     if not rt.is_dir():
@@ -157,16 +168,13 @@ def guard_runtime_paths(runtime_dir: str) -> GuardResult:
         if d.is_dir() and not os.access(d, os.W_OK):
             reasons.append("GUARD_RUNTIME_NOT_WRITABLE")
             details.append(str(d))
-    # canonical namespace: the ctx file must live at runtime_root/execution_context.json
+    # canonical namespace: the ctx file must live at the ENV runtime root
+    # (never a repo fallback)
     ctx = rt / _CTX_FILENAME
-    try:
-        from core.runtime_paths import runtime_root
-        canonical = Path(runtime_root()) / _CTX_FILENAME
-        if canonical.resolve() != ctx.resolve():
-            reasons.append("GUARD_RUNTIME_NAMESPACE")
-            details.append(f"{ctx} != {canonical}")
-    except Exception:
-        pass
+    canonical = Path(env_rt) / _CTX_FILENAME
+    if canonical.resolve() != ctx.resolve():
+        reasons.append("GUARD_RUNTIME_NAMESPACE")
+        details.append(f"{ctx} != {canonical}")
     secrets = _scan_secrets(ctx)
     if secrets:
         reasons.append("GUARD_RUNTIME_SECRETS")
@@ -261,13 +269,10 @@ def guard_flat_no_pending(position_state_path: str,
     if positions is None or open_orders is None:
         return _fail("flat_snapshot", ["GUARD_SNAPSHOT_INVALID"],
                      "positions/open_orders required")
-    try:
-        if float(positions) != 0.0:
-            return _fail("flat_snapshot", ["GUARD_POSITION_NOT_FLAT"],
-                         f"positions={positions}")
-    except (TypeError, ValueError):
+    # flat: 0 / 0.0 / [] / () (empty list is the Codex-contract shape)
+    if positions not in (0, 0.0, [], ()):
         return _fail("flat_snapshot", ["GUARD_POSITION_NOT_FLAT"],
-                     f"positions unparseable {positions!r}")
+                     f"positions={positions!r}")
     if open_orders:
         return _fail("flat_snapshot", ["GUARD_PENDING_ORDERS"],
                      f"{len(open_orders)} open")
@@ -382,12 +387,31 @@ def guard_ctx_atomic_health(runtime_dir: str) -> GuardResult:
     if not reasons and data.get("effective_mode") is None:
         reasons = ("GUARD_CTX_INVALID",)
     if reasons:
+        # first-deployment bootstrap: a MISSING ctx file may only be
+        # bootstrapped as LIVE_QUARANTINED (the startup writes it
+        # atomically); the gate verifies the atomic write capability and
+        # NEVER lets a missing file enable LIVE.
+        if reasons == ("RESTART_MAINTAIN_QUARANTINE",):
+            probe_ok = _atomic_write_probe(runtime_dir)
+            if not probe_ok:
+                return _fail("ctx_atomic_health", ["GUARD_CTX_WRITE_FAIL"])
+            return _pass("ctx_atomic_health",
+                         "bootstrap: missing ctx written LIVE_QUARANTINED "
+                         "atomically at startup (never LIVE)")
         mapped = tuple(
             "GUARD_CTX_MISSING" if r == "RESTART_MAINTAIN_QUARANTINE"
             else "GUARD_CTX_CORRUPT" if r == "STATE_FILE_CORRUPTED"
             else r for r in reasons)
         return _fail("ctx_atomic_health", mapped)
     # non-destructive write probe: same-dir temp file, fsync, read back, unlink
+    if not _atomic_write_probe(runtime_dir):
+        return _fail("ctx_atomic_health", ["GUARD_CTX_WRITE_FAIL"])
+    return _pass("ctx_atomic_health", f"revision={data.get('revision')}")
+
+
+def _atomic_write_probe(runtime_dir: str) -> bool:
+    """Non-destructive same-dir write probe (temp + fsync + read-back +
+    unlink). Never modifies the state file itself."""
     try:
         probe = Path(runtime_dir) / f"._gate_probe_{os.getpid()}"
         with open(probe, "w", encoding="utf-8") as fh:
@@ -396,11 +420,9 @@ def guard_ctx_atomic_health(runtime_dir: str) -> GuardResult:
             os.fsync(fh.fileno())
         ok = probe.read_text(encoding="utf-8") == "ok"
         probe.unlink(missing_ok=True)
-        if not ok:
-            return _fail("ctx_atomic_health", ["GUARD_CTX_WRITE_FAIL"])
+        return ok
     except OSError:
-        return _fail("ctx_atomic_health", ["GUARD_CTX_WRITE_FAIL"])
-    return _pass("ctx_atomic_health", f"revision={data.get('revision')}")
+        return False
 
 
 # ── aggregate ──────────────────────────────────────────────────────────────
