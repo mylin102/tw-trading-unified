@@ -143,6 +143,11 @@ mts:
   strategy: tmf_spread
   lots: 1
   release_mode: triggered_market
+  # [Live Route Certification] explicit TMF pair margin floor (no default):
+  # per_pair × (1 + MARGIN_BUFFER) = required margin for certification;
+  # broker account capacity must cover it. Changing this file after a
+  # certification yields SOURCE_MISMATCH -> LIVE_QUARANTINED (by design).
+  live_required_margin_per_pair: 100000.0
   mtf:
     mode: shadow
     max_age_sec: 420
