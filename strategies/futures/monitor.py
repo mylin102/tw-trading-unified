@@ -2814,7 +2814,11 @@ class FuturesMonitor:
             self.api.cancel_order(self._safety_stop_trade)
             console.print("[dim]🛡️ Safety stop cancelled[/dim]")
         except Exception as e:
-            console.print(f" [yellow]Safety stop cancel error: {e}[/yellow] ")
+            # [exit failure-side] NEVER swallow: the caller (ordinary EXIT)
+            # must not silently place the exit — structured failure
+            console.print(f" [yellow]🛡️ Safety stop cancel error: {e}[/yellow] ")
+            return {"blocked": True, "reason": "SAFETY_STOP_CANCEL_FAILED",
+                    "error": str(e)}
         self._safety_stop_trade = None
 
     # ── GSD Phase 0d: Hourly No-Trade Audit (V-Model during session) ──
@@ -5320,7 +5324,32 @@ class FuturesMonitor:
                     return None
             # 出場前先刪 safety stop，避免庫存不足
             if signal in ("EXIT", "PARTIAL_EXIT"):
-                self._cancel_safety_stop()
+                _cancel_result = self._cancel_safety_stop()
+                if isinstance(_cancel_result, dict) \
+                        and _cancel_result.get("blocked"):
+                    # [exit failure-side] safety-stop cancel failed — do
+                    # NOT silently place the ordinary exit: structured
+                    # failure + persisted dashboard reason + fail-closed
+                    # context; NO subsequent place_order call.
+                    _reason = _cancel_result.get(
+                        "reason", "SAFETY_STOP_CANCEL_FAILED")
+                    _ctx = getattr(self, "_execution_context", None)
+                    if _ctx is not None:
+                        from core.mode_transition import (ModeTransitionState,
+                                                          with_effective_mode)
+                        self._execution_context = with_effective_mode(
+                            _ctx, ModeTransitionState.LIVE_QUARANTINED.value,
+                            live_order_allowed=False,
+                            audit_reasons=(_reason,) + tuple(
+                                getattr(_ctx, "audit_reasons", ()) or ()))
+                        self._persist_execution_context()
+                    console.print(
+                        f"[red]🚫 EXIT blocked: {_reason} — safety-stop "
+                        f"cancel failed; NO exit placed[/red]")
+                    return {"blocked": True, "reason": _reason,
+                            "audit_reasons": list(
+                                getattr(self._execution_context,
+                                        "audit_reasons", ()) or ())}
             try:
                 trade = self.client.place_order(self.contract, action=action,
                                                 quantity=lots)
