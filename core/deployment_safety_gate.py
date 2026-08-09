@@ -269,13 +269,38 @@ def guard_flat_no_pending(position_state_path: str,
     if positions is None or open_orders is None:
         return _fail("flat_snapshot", ["GUARD_SNAPSHOT_INVALID"],
                      "positions/open_orders required")
+    # A) MTS flat scope = FUTURES account only (unless explicit
+    # global-risk config). Stock rows stay in the evidence but never
+    # block MTS futures flat. Untagged rows default to futures-relevant.
+    global_risk = bool(data.get("global_risk", False))
+
+    def _relevant(rows, kind):
+        if not isinstance(rows, list) or not rows:
+            return rows
+        if not all(isinstance(r, dict) for r in rows):
+            return rows                      # legacy rows: all relevant
+        if global_risk:
+            return rows
+        return [r for r in rows
+                if str(r.get("account", "") or "") in ("", "futures")]
+
+    _positions = _relevant(positions, "positions")
+    _open_orders = _relevant(open_orders, "open_orders")
+
     # flat: 0 / 0.0 / [] / () (empty list is the Codex-contract shape)
-    if positions not in (0, 0.0, [], ()):
+    if isinstance(_positions, list):
+        non_zero = [p for p in _positions
+                    if int(p.get("quantity", 0) or 0) != 0]
+        if non_zero:
+            return _fail("flat_snapshot", ["GUARD_POSITION_NOT_FLAT"],
+                         f"{len(non_zero)} futures position(s) "
+                         f"({', '.join(str(p.get('code')) for p in non_zero[:5])})")
+    elif _positions not in (0, 0.0, [], ()):
         return _fail("flat_snapshot", ["GUARD_POSITION_NOT_FLAT"],
-                     f"positions={positions!r}")
-    if open_orders:
+                     f"positions={_positions!r}")
+    if _open_orders:
         return _fail("flat_snapshot", ["GUARD_PENDING_ORDERS"],
-                     f"{len(open_orders)} open")
+                     f"{len(_open_orders)} open")
     if captured_at is None:
         return _fail("flat_snapshot", ["GUARD_SNAPSHOT_STALE"],
                      "captured_at missing")
@@ -291,8 +316,15 @@ def guard_flat_no_pending(position_state_path: str,
         return _fail("flat_snapshot", ["GUARD_SESSION_INTERVENED"],
                      f"snapshot session {snap_session} != ctx "
                      f"{ctx_session}")
-    return _pass("flat_snapshot",
-                 f"live_broker flat captured_at={captured_at:.0f}")
+    _stock_rows = 0
+    if isinstance(positions, list):
+        _stock_rows = sum(
+            1 for p in positions
+            if isinstance(p, dict) and str(p.get("account", "")) == "stock")
+    _detail = f"futures flat captured_at={captured_at:.0f}"
+    if _stock_rows:
+        _detail += f"; {_stock_rows} stock row(s) in evidence (not blocking)"
+    return _pass("flat_snapshot", _detail)
 
 
 # ── 6. quarantine-first startup (AST) ──────────────────────────────────────
@@ -338,8 +370,14 @@ def guard_quarantine_first_startup(monitor_path: Optional[str]) -> GuardResult:
 
 def guard_session_generation(generation: Optional[int],
                              revoked: bool) -> GuardResult:
-    if generation is None:
-        return _fail("session_generation", ["GUARD_SESSION_MISSING"])
+    # B) a live session generation is REGISTRY-BOUND: an integer generation
+    # counter. Standalone preflight identity (sha256(account_id) string) is
+    # NOT a session generation — missing/non-int => GUARD_SESSION_MISSING.
+    if generation is None or isinstance(generation, bool) \
+            or not isinstance(generation, int):
+        return _fail("session_generation", ["GUARD_SESSION_MISSING"],
+                     f"registry-bound int generation required, got "
+                     f"{type(generation).__name__}")
     if revoked:
         return _fail("session_generation", ["GUARD_SESSION_REVOKED"],
                      f"generation={generation}")
@@ -349,7 +387,8 @@ def guard_session_generation(generation: Optional[int],
 # ── 8. margin ──────────────────────────────────────────────────────────────
 
 def guard_margin(margin_available: Optional[float],
-                 floor: float = MARGIN_FLOOR) -> GuardResult:
+                 floor: float = MARGIN_FLOOR,
+                 margin_evidence: Optional[dict] = None) -> GuardResult:
     if margin_available is None:
         return _fail("margin", ["GUARD_MARGIN_UNAVAILABLE"])
     try:
@@ -361,6 +400,16 @@ def guard_margin(margin_available: Optional[float],
     if value < floor:
         return _fail("margin", ["GUARD_MARGIN_INSUFFICIENT"],
                      f"{value} < {floor}")
+    # margin acceptance requires traceable evidence: account identity,
+    # scope (futopt), captured_at and the canonical input hash (the
+    # read-only preflight packet provides all four)
+    if margin_evidence is not None:
+        missing = [k for k in ("account_identity_hash", "scope",
+                               "captured_at", "canonical_input_hash")
+                   if not margin_evidence.get(k)]
+        if missing:
+            return _fail("margin", ["GUARD_MARGIN_EVIDENCE_MISSING"],
+                         f"missing {','.join(missing)}")
     return _pass("margin", str(value))
 
 
