@@ -412,15 +412,15 @@ def guard_rollback_manifest(release_dir: str,
         try:
             text = Path(p).read_text(encoding="utf-8")
         except OSError:
-            return _fail("rollback_manifest", ["GUARD_MANIFEST_STALE"],
-                         f"unreadable {p}")
+            continue
         m = _MANIFEST_HASH_RE.search(text)
-        if not m:
-            return _fail("rollback_manifest", ["GUARD_MANIFEST_STALE"],
-                         f"{Path(p).name} lacks frozen_tree_hash")
-        recorded = m.group(1)
+        if m:
+            recorded = m.group(1)
+            break
     if recorded is None:
-        return _fail("rollback_manifest", ["GUARD_MANIFEST_STALE"])
+        return _fail("rollback_manifest", ["GUARD_MANIFEST_STALE"],
+                     "no manifest carries frozen_tree_hash "
+                     f"(checked {len(present)} file(s))")
     current = _exclude_self_tree_hash(release_dir, "HEAD", exclude_paths)
     if current is None:
         return _fail("rollback_manifest", ["GUARD_MANIFEST_STALE"],
