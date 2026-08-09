@@ -657,8 +657,68 @@ def test_exit_sequence_cancels_safety_stop_then_places():
         f"EXIT must cancel the safety stop FIRST: {kinds}"
 
 
-def test_quarantine_does_not_orphan_exchange_safety_stop():
-    # RED: with an outstanding exchange safety stop, quarantine must leave
-    # a reconciled recovery path (ledger marker) — never a silent orphan
-    with pytest.raises(ImportError):
-        import core.emergency_intent  # noqa: F401
+def test_quarantine_does_not_orphan_exchange_safety_stop(tmp_path, monkeypatch):
+    # orphan reconciliation (canonical core/exit_intent — NOT a parallel
+    # ledger): a quarantine-blocked safety-stop cancel with an outstanding
+    # exchange safety stop records a durable SAFETY_STOP_RECONCILE intent —
+    # never a silent orphan; zero broker calls on quarantine
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    m = _monitor_stub(_quarantined_ctx(), safety_trade=SimpleNamespace(ts=1))
+    result = m._cancel_safety_stop()
+    assert not m.api.calls, "zero broker calls on quarantined cancel"
+    assert isinstance(result, dict) and result.get("blocked") is True
+    from core.exit_intent import IntentLog
+    ilog = IntentLog(str(tmp_path / "logs"))
+    active = [i for i in ilog.list_active()
+              if ilog.get(i).get("reason") == "SAFETY_STOP_RECONCILE"]
+    assert active, "quarantine must record a durable reconcile intent"
+
+
+def test_emergency_blocked_records_reconcile(tmp_path, monkeypatch):
+    # the quarantine-blocked EMERGENCY path with an outstanding safety
+    # stop records the same canonical reconcile intent (no orphan)
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    m = _monitor_stub(_quarantined_ctx(), safety_trade=SimpleNamespace(ts=1))
+    m._emergency_flatten_mts(_emergency_stub_strategy())
+    from core.exit_intent import IntentLog
+    ilog = IntentLog(str(tmp_path / "logs"))
+    active = [i for i in ilog.list_active()
+              if ilog.get(i).get("reason") == "SAFETY_STOP_RECONCILE"]
+    assert active, "blocked emergency must record the reconcile intent"
+
+
+def test_reconcile_intent_restart_persistence(tmp_path, monkeypatch):
+    # restart: a FRESH IntentLog (new process) sees the pending reconcile
+    # intent; the startup gate keeps the context QUARANTINED until the
+    # broker state reconciles
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    m = _monitor_stub(_quarantined_ctx(), safety_trade=SimpleNamespace(ts=1))
+    m._cancel_safety_stop()          # records the intent
+    # restart: fresh monitor with a LIVE_READY ctx — the pending intent
+    # must prevent LIVE from being retained
+    m2 = _monitor_stub(_ready_ctx())
+    assert m2._pending_safety_stop_reconcile() is True, \
+        "restart must preserve the pending reconciliation"
+    m2._apply_reconcile_pending_gate()
+    assert not m2._execution_context.is_live_ready(), \
+        "pending reconciliation keeps QUARANTINED until broker reconciles"
+    assert "SAFETY_STOP_RECONCILE_PENDING" in \
+        m2._execution_context.audit_reasons, \
+        m2._execution_context.audit_reasons
+
+
+def test_paper_no_orphan_record(tmp_path, monkeypatch):
+    # PAPER behavior unchanged: the live route never engages, no safety
+    # stop exists -> zero broker calls, zero reconcile intents
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    from core.mode_transition import paper_context
+    m = _monitor_stub(paper_context(account_id="A1"))
+    m.live_trading = False
+    m._safety_stop_trade = None
+    m._cancel_safety_stop()
+    assert not m.api.calls
+    from core.exit_intent import IntentLog
+    ilog = IntentLog(str(tmp_path / "logs"))
+    assert not [i for i in ilog.list_active()
+                if ilog.get(i).get("reason") == "SAFETY_STOP_RECONCILE"], \
+        "paper must not record reconcile intents"
