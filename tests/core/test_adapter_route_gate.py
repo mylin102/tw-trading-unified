@@ -80,8 +80,8 @@ def _blocked_error(fn, *a, **k):
     with pytest.raises(Exception) as ei:
         fn(*a, **k)
     err = ei.value
-    assert "ADAPTER_ORDER_BLOCKED" in getattr(err, "code", "") or \
-        "BLOCKED" in str(type(err).__name__) or "BLOCKED" in str(err), err
+    assert "Blocked" in type(err).__name__, \
+        f"quarantine must raise the canonical gate (LiveOrderBlocked): {err!r}"
     return err
 
 
@@ -93,7 +93,7 @@ def test_client_place_order_quarantined_zero_calls():
     err = _blocked_error(c.place_order, SimpleNamespace(code="TMFH6"),
                          "BUY", 1, 0)
     assert not api.calls, f"quarantined place_order must be zero-call: {api.calls}"
-    assert "audit_reasons" in err.context or "reason" in err.context, err.context
+    assert "LIVE_QUARANTINED" in str(err), err
 
 
 def test_client_place_order_ctx_none_fail_closed():

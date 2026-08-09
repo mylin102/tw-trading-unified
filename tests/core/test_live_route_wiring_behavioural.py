@@ -510,13 +510,17 @@ def test_adapter_place_order_quarantined_zero_calls():
 
 def test_adapter_cancel_order_quarantined_zero_calls():
     c = _adapter_stub(_quarantined_ctx())
-    c.cancel_order(SimpleNamespace(ts=1))
+    with pytest.raises(Exception) as ei:
+        c.cancel_order(SimpleNamespace(ts=1))
+    assert "Blocked" in type(ei.value).__name__, ei.value
     assert not c.api.calls, f"adapter cancel under quarantine: {c.api.calls}"
 
 
 def test_adapter_update_order_quarantined_zero_calls():
     c = _adapter_stub(_quarantined_ctx())
-    c.update_order(SimpleNamespace(ts=1), price=44300)
+    with pytest.raises(Exception) as ei:
+        c.update_order(SimpleNamespace(ts=1), price=44300)
+    assert "Blocked" in type(ei.value).__name__, ei.value
     assert not c.api.calls, f"adapter update under quarantine: {c.api.calls}"
 
 
@@ -542,13 +546,26 @@ def test_exit_does_not_silently_place_when_stop_cancel_fails():
 
 # ── (4) dashboard persistence: atomic writer/reader round-trip ──────────────
 
-def test_execution_context_state_round_trip_atomic():
+def test_execution_context_state_round_trip_atomic(tmp_path):
     # v3.1 #3 contract: writer/reader under TRADING_RUNTIME_DIR (not bare
     # /tmp); atomic replace + fsync(file AND parent); corrupt/missing read
     # → safe default LIVE_QUARANTINED; no broker/account data; dashboard
-    # reader renders state after restart. Module absent → contract missing.
-    with pytest.raises(ImportError):
-        import core.execution_context_state  # noqa: F401
+    # reader renders state after restart. Wired by Step 6 — assert the
+    # implemented contract end-to-end.
+    import json
+    from core.execution_context_state import persist_execution_context, \
+        read_execution_context
+    ctx = {"requested_mode": "live", "effective_mode": "live_quarantined",
+           "live_order_allowed": False, "audit_reasons": ["TEST"]}
+    persist_execution_context(ctx, runtime_dir=str(tmp_path))
+    data = read_execution_context(runtime_dir=str(tmp_path))
+    assert data["effective_mode"] == "live_quarantined"
+    assert data["audit_reasons"] == ["TEST"]
+    p = tmp_path / "execution_context.json"
+    p.write_text("{corrupt", encoding="utf-8")
+    data = read_execution_context(runtime_dir=str(tmp_path))
+    assert data["effective_mode"] == "live_quarantined"
+    assert "STATE_FILE_CORRUPTED" in data["audit_reasons"], data
 
 
 # ── (5) release identity verifier (release_dir-scoped, injected runner) ─────
