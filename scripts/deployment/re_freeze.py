@@ -30,6 +30,19 @@ DEFAULT_EXCLUDE = [
     "PHASE1_FINAL_FREEZE.md",
 ]
 
+# Program-fixed allowlist of untracked RUNTIME artifacts that may remain
+# during a re-freeze. NO operator-supplied globs are accepted — anything
+# outside these prefixes (core/**, strategies/**, config/**, scripts/**,
+# tests/**, new top-level files, ...) blocks the re-freeze.
+UNTRACKED_ALLOWED_PREFIXES = (
+    "data/telemetry/",
+    "data/research/",
+    "data/backtest/",
+    "logs/",
+    ".venv/",
+)
+UNTRACKED_ALLOWED_FILES = (".DS_Store",)
+
 
 def _run(repo: Path, *args: str) -> str:
     return subprocess.run(
@@ -51,11 +64,6 @@ def main() -> int:
     ap.add_argument("--expected-sha", default=None)
     ap.add_argument("--manifest", default=None)
     ap.add_argument("--exclude-path", action="append", default=[])
-    ap.add_argument("--ignore-untracked", action="append", default=[],
-                    help="glob pattern (fnmatch) of untracked runtime "
-                         "artifacts that are explicitly controlled and "
-                         "allowed to remain; everything else untracked "
-                         "blocks the re-freeze")
     args = ap.parse_args()
 
     repo = Path(args.release_dir).resolve()
@@ -70,36 +78,34 @@ def main() -> int:
               f"!= HEAD {head}", file=sys.stderr)
         return 2
 
-    # fail-closed #2: dirty tree — TRACKED modifications AND untracked
-    # files both block (freeze-last: nothing may change after the freeze;
-    # untracked runtime artifacts only pass with an explicit controlled
-    # --ignore-untracked pattern). The re-record target manifest itself is
-    # excluded (its update IS the script's job).
+    # fail-closed #2: dirty tree — TRACKED modifications (INCLUDING a
+    # hand-staged manifest) AND untracked files block. Freeze-first: the
+    # index/worktree must be clean before the re-record; the re-record
+    # target manifest must be committed (a staged manifest is an
+    # operator bypass — rejected). Untracked runtime artifacts pass only
+    # the program-fixed allowlist (no operator globs).
     exclude = args.exclude_path or DEFAULT_EXCLUDE
     manifest = Path(args.manifest).resolve() if args.manifest \
         else repo / "PHASE1_FINAL_FREEZE.md"
     status = _run(repo, "status", "--porcelain", "-uall")
-    _manifest_rel = manifest.name
     tracked_dirty = [ln for ln in status.splitlines()
-                     if not ln.startswith("??")
-                     and not ln.strip().endswith(_manifest_rel)]
+                     if not ln.startswith("??")]
     untracked = [ln[3:] for ln in status.splitlines()
                  if ln.startswith("??")]
     if tracked_dirty:
         print(f"ABORT dirty tree ({len(tracked_dirty)} changed "
-              f"file(s)) — finish all commits before re-freezing:\n"
+              f"file(s)) — index/worktree must be clean (the manifest "
+              f"included) before re-freezing:\n"
               + "\n".join(tracked_dirty[:10]), file=sys.stderr)
         return 3
-    import fnmatch
-    remaining = []
-    for u in untracked:
-        if any(fnmatch.fnmatch(u, p) for p in args.ignore_untracked):
-            continue
-        remaining.append(u)
+    remaining = [u for u in untracked
+                 if not any(u.startswith(p) for p in
+                            UNTRACKED_ALLOWED_PREFIXES)
+                 and u not in UNTRACKED_ALLOWED_FILES]
     if remaining:
         print(f"ABORT untracked files ({len(remaining)}) block the "
-              f"re-freeze — commit them or pass --ignore-untracked "
-              f"patterns for controlled runtime artifacts:\n"
+              f"re-freeze — only the program-fixed runtime allowlist "
+              f"may remain (commit everything else):\n"
               + "\n".join(remaining[:10]), file=sys.stderr)
         return 6
 
