@@ -525,7 +525,7 @@ def test_guard_session_generation_revoked():
 def test_guard_margin_ok():
     from core.deployment_safety_gate import guard_margin
     ev = {"account_identity_hash": "a" * 64, "scope": "futopt",
-          "captured_at": 1786256565.0, "canonical_input_hash": "b" * 64}
+          "captured_at": time.time(), "canonical_input_hash": "b" * 64}
     assert guard_margin(300_000.0, margin_evidence=ev).ok
     assert guard_margin(220_000.0, margin_evidence=ev).ok  # exact boundary
 
@@ -534,9 +534,29 @@ def test_guard_margin_ok_with_evidence():
     # margin acceptance requires account/scope/captured_at/hash evidence
     from core.deployment_safety_gate import guard_margin
     ev = {"account_identity_hash": "a" * 64, "scope": "futopt",
-          "captured_at": 1786256565.0, "canonical_input_hash": "b" * 64}
+          "captured_at": time.time(), "canonical_input_hash": "b" * 64}
     r = guard_margin(343_082.0, margin_evidence=ev)
     assert r.ok, r.reasons
+
+
+def test_guard_margin_evidence_stale_rejected():
+    # the margin guard validates its OWN captured_at freshness (<=600s),
+    # it must not rely on the flat guard alone
+    from core.deployment_safety_gate import guard_margin
+    stale = {"account_identity_hash": "a" * 64, "scope": "futopt",
+             "captured_at": time.time() - 3600.0,
+             "canonical_input_hash": "b" * 64}
+    r = guard_margin(300_000.0, margin_evidence=stale)
+    assert not r.ok and "GUARD_MARGIN_EVIDENCE_STALE" in r.reasons
+
+
+def test_guard_margin_evidence_nonfinite_rejected():
+    from core.deployment_safety_gate import guard_margin
+    for bad in (float("inf"), "2026-08-09", None, -5.0):
+        ev = {"account_identity_hash": "a" * 64, "scope": "futopt",
+              "captured_at": bad, "canonical_input_hash": "b" * 64}
+        r = guard_margin(300_000.0, margin_evidence=ev)
+        assert not r.ok, bad
 
 
 def test_guard_margin_bare_value_insufficient():
@@ -721,7 +741,7 @@ def test_aggregate_all_pass_readies(tmp_path, monkeypatch):
         position_state_path=str(pf), monitor_path=None,
         session_generation=1, margin_available=300_000.0,
         margin_evidence={"account_identity_hash": "a" * 64,
-                         "scope": "futopt", "captured_at": 1786256565.0,
+                         "scope": "futopt", "captured_at": time.time(),
                          "canonical_input_hash": "b" * 64},
         manifest_paths=[str(manifest)], expected_sha=head,
         manifest_exclude_paths=exclude)
@@ -795,7 +815,7 @@ def test_pre_deploy_skips_session_generation(tmp_path, monkeypatch):
         session_generation=None, session_revoked=False,
         margin_available=300_000.0,
         margin_evidence={"account_identity_hash": "a" * 64,
-                         "scope": "futopt", "captured_at": 1786256565.0,
+                         "scope": "futopt", "captured_at": time.time(),
                          "canonical_input_hash": "b" * 64},
         manifest_paths=[str(manifest)], expected_sha=head,
         manifest_exclude_paths=exclude, phase="pre_deploy")
@@ -834,7 +854,7 @@ def test_post_startup_requires_registry_generation(tmp_path, monkeypatch):
         session_generation="ab" * 16, session_revoked=False,
         margin_available=300_000.0,
         margin_evidence={"account_identity_hash": "a" * 64,
-                         "scope": "futopt", "captured_at": 1786256565.0,
+                         "scope": "futopt", "captured_at": time.time(),
                          "canonical_input_hash": "b" * 64},
         manifest_paths=[str(manifest)], expected_sha=head,
         manifest_exclude_paths=exclude, phase="post_startup")
@@ -857,7 +877,7 @@ def test_cli_margin_evidence_and_ready_for_startup(tmp_path, monkeypatch):
     ev = tmp_path / "preflight.json"
     ev.write_text(__import__("json").dumps({
         "account_identity_hash": "a" * 64, "scope": "futopt",
-        "captured_at": 1786256565.0,
+        "captured_at": time.time(),
         "canonical_input_hash": "b" * 64,
         "available_margin": 300_000.0}), encoding="utf-8")
     env = dict(os.environ,
@@ -899,7 +919,85 @@ def test_re_freeze_refuses_dirty_tree(tmp_path):
     assert "dirty" in (r.stdout + r.stderr).lower(), (r.stdout + r.stderr)[-600:]
 
 
-def test_re_freeze_records_identity_at_head(tmp_path):
+def test_re_freeze_refuses_untracked(tmp_path):
+    # untracked files ALSO block the re-freeze (unless explicitly ignored)
+    import subprocess as sp
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    (repo / "stray.bin").write_text("x", encoding="utf-8")
+    r = sp.run(
+        [sys.executable, "-B",
+         str(Path(__file__).resolve().parents[2] /
+             "scripts/deployment/re_freeze.py"),
+         "--release-dir", str(repo), "--expected-sha", head],
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0, r.stdout[-600:]
+    assert "untracked" in (r.stdout + r.stderr).lower() or \
+        "dirty" in (r.stdout + r.stderr).lower(), (r.stdout + r.stderr)[-600:]
+
+
+def test_re_freeze_allow_untracked_ignore(tmp_path):
+    # explicitly controlled ignore patterns let runtime artifacts pass
+    import subprocess as sp
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    manifest = repo / "PHASE1_FINAL_FREEZE.md"
+    manifest.write_text(f"Frozen SHA {head}\n"
+                        f"frozen_tree_hash: {'0' * 64}\n",
+                        encoding="utf-8")
+    (repo / "data").mkdir()
+    (repo / "data" / "telemetry").mkdir()
+    (repo / "data" / "telemetry" / "run-1.json").write_text(
+        "{}", encoding="utf-8")
+    r = sp.run(
+        [sys.executable, "-B",
+         str(Path(__file__).resolve().parents[2] /
+             "scripts/deployment/re_freeze.py"),
+         "--release-dir", str(repo), "--expected-sha", head,
+         "--manifest", str(manifest),
+         "--ignore-untracked", "data/telemetry/*"],
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout[-600:] + r.stderr[-400:]
+    body = manifest.read_text(encoding="utf-8")
+    assert "frozen_tree_hash: " in body and "0" * 64 not in body
+
+
+def test_cli_verdict_never_partial_ready(tmp_path, monkeypatch):
+    # a failing guard => NOT_READY verdict, never a partial READY
+    import subprocess as sp
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    rt = tmp_path / "rt"
+    _ctx_file(rt, _live_ctx_dict())
+    pf = _position_file(rt, _live_snapshot(positions=[
+        {"account": "futures", "code": "TMFH6", "quantity": 1,
+         "direction": "Action.Sell"}]))   # futures non-flat -> FAIL
+    exclude = ["PHASE1_FINAL_FREEZE.md"]
+    manifest = _manifest_with(repo, exclude, head)
+    ev = tmp_path / "preflight.json"
+    ev.write_text(__import__("json").dumps({
+        "account_identity_hash": "a" * 64, "scope": "futopt",
+        "captured_at": time.time(),
+        "canonical_input_hash": "b" * 64,
+        "available_margin": 300_000.0}), encoding="utf-8")
+    env = dict(os.environ, LRC_RELEASE_SHA=head,
+               TRADING_RUNTIME_DIR=str(rt))
+    r = sp.run(
+        [sys.executable, "-B",
+         str(Path(__file__).resolve().parents[2] /
+             "scripts/deployment/check_deployment.py"),
+         "--release-dir", str(repo),
+         "--runtime-dir", str(rt), "--pid-file",
+         str(tmp_path / "nope.pid"), "--position-state", str(pf),
+         "--expected-sha", head, "--margin-available", "300000.0",
+         "--margin-evidence", str(ev),
+         "--manifest", str(manifest),
+         "--exclude-path", "PHASE1_FINAL_FREEZE.md",
+         "--phase", "pre_deploy"],
+        capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode != 0
+    assert "NOT_READY" in r.stdout
+    assert "READY_FOR_STARTUP" not in r.stdout
     import subprocess as sp
     repo = _git_repo(tmp_path)
     head = _head(repo)
