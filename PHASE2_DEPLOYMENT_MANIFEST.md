@@ -27,3 +27,22 @@
    - `test_market_data_runtime.py` EXIT=124（summary 後 non-daemon thread hang — 需獨立 bounded fix）
    - `test_background_snapshot_writer.py` / `test_global_callback_adapter.py` 各 1 個既有 RED
 4. Working tree 另有 sibling 的未提交 dirty（data/telemetry 等）— 非 closure 檔案，不影響上述判定。
+
+
+## Portable release-worktree PM2 config (ecosystem.config.js)
+
+The release candidate runs from an ISOLATED worktree with NO tracked
+.venv and must never receive PM2 log/pid files. The ecosystem config
+enforces:
+
+1. **TRADING_PYTHON_BIN** — REQUIRED in production (NODE_ENV=production
+   at `pm2 start` time); the config throws (fail-closed) rather than
+   guessing an interpreter from an untracked candidate-tree venv.
+   Dev/paper may use the shared dependency venv fallback.
+2. **Runtime log dir** — trading/dashboard/stock error/out/combined/pid
+   files live under TRADING_RUNTIME_DIR/logs (or TRADING_LOG_DIR) —
+   NEVER inside the release source tree.
+3. **Pre-start validation** — the runtime log dir must exist and be
+   writable or the config fails BEFORE PM2 starts any app.
+4. **No secrets** — failure messages name variables only; env values
+   are never echoed.
