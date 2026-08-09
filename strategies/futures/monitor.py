@@ -2721,7 +2721,13 @@ class FuturesMonitor:
         """[Step 6] persist the execution context to the canonical
         dashboard-readable file ({TRADING_RUNTIME_DIR}/execution_context.json)
         atomically. A failure never enables LIVE — the reader is
-        file-based and keeps the last good state."""
+        file-based and keeps the last good state.
+        [Step 8] also syncs the broker-adapter gate reference so the
+        adapter chokepoint enforces the same context."""
+        _client = getattr(self, "client", None)
+        if _client is not None and hasattr(_client, "_execution_context"):
+            _client._execution_context = getattr(
+                self, "_execution_context", None)
         try:
             from core.execution_context_state import persist_execution_context
             persist_execution_context(self._execution_context.to_dict())

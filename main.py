@@ -693,7 +693,11 @@ def verify_startup_reconciliation(api) -> bool:
 def _persist_ctx(mon):
     """[Step 6] persist a monitor's execution context to the canonical
     dashboard-readable file. Failure never enables LIVE (reader keeps the
-    last good state)."""
+    last good state). [Step 8] also syncs the broker-adapter gate
+    reference so the adapter chokepoint enforces the same context."""
+    _client = getattr(mon, "client", None)
+    if _client is not None and hasattr(_client, "_execution_context"):
+        _client._execution_context = getattr(mon, "_execution_context", None)
     try:
         from core.execution_context_state import persist_execution_context
         persist_execution_context(mon._execution_context.to_dict())

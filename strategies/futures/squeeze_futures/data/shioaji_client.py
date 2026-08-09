@@ -41,12 +41,34 @@ class ShioajiClient:
     def __init__(self):
         self.api = None
         self.is_logged_in = False
+        # [Step 8] execution-context gate reference — set by the monitor
+        # on every mode transition (None = no certification -> fail-closed)
+        self._execution_context = None
         self._tick_callbacks = {}  # 儲存 tick 回呼函數
         self._kbar_callbacks = {}  # 儲存 K 棒回呼函數
         self._latest_kbars: Dict[str, deque] = {}  # 儲存最新 K 棒數據
         if sj is None:
             return
         self.api = sj.Shioaji()
+
+    def _gate_or_raise(self, method: str):
+        """[Step 8] execution-context gate: non-LIVE_READY or ctx=None
+        makes ZERO broker calls and raises a structured AdapterOrderError
+        (typed reason); LIVE_READY permits the intended call. Fail-closed
+        by default (None context = no live certification)."""
+        ctx = getattr(self, "_execution_context", None)
+        if ctx is None:
+            raise AdapterOrderError(
+                code="ADAPTER_ORDER_BLOCKED_NO_LIVE_CERTIFICATION",
+                context={"method": method,
+                         "reason": "NO_LIVE_CERTIFICATION"})
+        if not ctx.is_live_ready():
+            raise AdapterOrderError(
+                code="ADAPTER_ORDER_BLOCKED_QUARANTINED",
+                context={"method": method,
+                         "reason": "LIVE_QUARANTINED",
+                         "audit_reasons": list(
+                             getattr(ctx, "audit_reasons", ()) or ())})
 
     def login(self, retries: int = 3, retry_delay: int = 10):
         api_key = os.getenv("SHIOAJI_API_KEY")
@@ -221,6 +243,7 @@ class ShioajiClient:
         # Terminal failure/rejection semantics (fix-forward): a None API
         # return is ADAPTER_ORDER_NO_TRADE; a trade with terminal status
         # Failed/Rejected is ADAPTER_ORDER_REJECTED — zero silent failures.
+        self._gate_or_raise("place_order")          # [Step 8] fail-closed
         if not self.is_logged_in:
             return None
         try:
@@ -265,6 +288,7 @@ class ShioajiClient:
                          "price": price, "error": str(e)}) from e
 
     def update_order(self, trade, price: float, quantity: int = 1):
+        self._gate_or_raise("update_order")         # [Step 8] fail-closed
         if not self.is_logged_in:
             return False
         try:
@@ -293,6 +317,7 @@ class ShioajiClient:
                          "quantity": quantity, "error": str(e)}) from e
 
     def cancel_order(self, trade):
+        self._gate_or_raise("cancel_order")        # [Step 8] fail-closed
         if not self.is_logged_in:
             return False
         try:
