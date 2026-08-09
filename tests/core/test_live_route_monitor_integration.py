@@ -373,12 +373,54 @@ def test_startup_binds_registry_generation_to_ctx(tmp_path, monkeypatch):
     m.live_trading = True
     m.api = api
     m.config_path = str(cfg)
-    m._execution_context = with_effective_mode(
-        live_preflight_context(), ModeTransitionState.LIVE_READY.value,
-        live_order_allowed=True)
+    # D1: the binding happens on the QUARANTINED ctx BEFORE certification —
+    # no circular LIVE_READY -> session -> gate -> LIVE_READY loop
+    m._execution_context = live_preflight_context()
     m._persist_execution_context = lambda: None
     m._apply_reconcile_pending_gate = lambda: None
     m._bind_session_generation()
     assert m._execution_context.session_id == gen, \
-        f"ctx must carry the registry-bound generation: " \
-        f"{m._execution_context.session_id} != {gen}"
+        f"ctx must carry the registry-bound generation BEFORE " \
+        f"certification: {m._execution_context.session_id} != {gen}"
+    assert not m._execution_context.is_live_ready(), \
+        "binding must not transition the ctx (still quarantined)"
+
+
+def test_bind_precedes_certification_in_startup(tmp_path, monkeypatch):
+    """D1 order contract: login -> registry generation -> atomic write of
+    the quarantined ctx.session_id BEFORE certification/post_startup
+    gate -> only then transition LIVE_READY."""
+    monkeypatch.chdir(tmp_path)
+    _set_release_env(monkeypatch)
+    cfg = _minimal_live_cfg(tmp_path)
+    import core.live_route_certificate as lrc
+    from core.mode_transition import ModeTransitionState, with_effective_mode
+    order = []
+
+    def fake_certify(api, **kwargs):
+        return (object(), [])
+
+    def fake_build(api, config, process_state=None):
+        return object()
+
+    def spy_transition(ctx, cert, issuer, *, runtime):
+        order.append("transition")
+        return with_effective_mode(ctx, ModeTransitionState.LIVE_READY.value,
+                                   live_order_allowed=True)
+
+    monkeypatch.setattr(lrc, "certify_route", fake_certify)
+    monkeypatch.setattr(lrc, "build_runtime_certification_context", fake_build)
+    monkeypatch.setattr(lrc, "transition_with_certificate", spy_transition)
+
+    from strategies.futures.monitor import FuturesMonitor
+
+    def _spy_bind(self):
+        order.append("bind")
+
+    monkeypatch.setattr(FuturesMonitor, "_bind_session_generation", _spy_bind)
+    api_fake = SimpleNamespace(futopt_account=object())
+    lrc.register_session(api_fake)
+    m = FuturesMonitor(api=api_fake, config_path=str(cfg))
+    assert order == ["bind", "transition"], \
+        f"binding must precede certification, got {order}"
+    assert m._execution_context.is_live_ready()
