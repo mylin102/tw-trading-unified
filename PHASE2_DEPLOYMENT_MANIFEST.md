@@ -46,3 +46,44 @@ enforces:
    writable or the config fails BEFORE PM2 starts any app.
 4. **No secrets** — failure messages name variables only; env values
    are never echoed.
+
+
+## Python release-tree write migration (runtime namespace)
+
+ALL trading-engine runtime writes now resolve through
+core/runtime_paths (runtime_logs / runtime_path — single authority,
+same module the dashboard already reads). Migration inventory
+(strategies/futures/monitor.py):
+
+| # | site | before (release-tree) | after |
+|---|------|----------------------|-------|
+| 1 | CSV warm-up fallback read | <repo>/logs/market_data | runtime_logs("market_data") |
+| 2 | indicators CSV read | logs/market_data/... | runtime_logs("market_data") |
+| 3 | anomalous quotes (quote guard) | os.getcwd()/logs | runtime_logs() |
+| 4 | far-bar CSV write | <repo>/logs/market_data | runtime_logs("market_data") |
+| 5 | trades/audit/options reads (backup) | logs/market_data/... | runtime_logs("market_data") |
+| 6 | stock trade records read | logs/stocks | runtime_logs("stocks") |
+| 7 | backups/trade_records write | logs/backups/trade_records | runtime_logs("backups","trade_records") |
+| 8 | orders export dir | exports/trades | runtime_path("exports","trades") |
+| 9 | MTS spread events | logs/ (cwd) | runtime_logs() |
+| 10 | indicators CSV write (_save_bar) | <repo>/logs/market_data | runtime_logs("market_data") |
+
+Production always sets TRADING_RUNTIME_DIR (PM2 env); dev/paper
+explicitly falls back to <repo>/logs. A source-level regression test
+(tests/core/test_runtime_paths.py) forbids any repo-relative log/export
+path in monitor.py.
+
+## Deploy flow: read-only production config-load check
+
+Before ANY pm2 start/restart, the deploy flow must run (read-only):
+
+    node --check ecosystem.config.js
+    NODE_ENV=production \
+      TRADING_PYTHON_BIN=<explicit python> \
+      TRADING_RUNTIME_DIR=<runtime root> \
+      LRC_RELEASE_SHA=<full deployed HEAD> \
+      node -e "require('./ecosystem.config.js')"
+
+The config throws (fail-closed) when TRADING_PYTHON_BIN is missing in
+production, the runtime log dir is missing/unwritable, or the
+interpreter does not exist — all BEFORE PM2 starts any app.
