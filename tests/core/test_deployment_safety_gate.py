@@ -230,7 +230,8 @@ def _live_snapshot(**over):
     data = {"source": "live_broker", "mode": "live",
             "positions": 0, "open_orders": [],
             "captured_at": time.time(),          # fresh (epoch seconds)
-            "hash": "a" * 40, "session_id": "sess-1"}
+            "hash": "b" * 64, "session_id": "sess-1",
+            "account_identity_hash": "a" * 64}
     data.update(over)
     return data
 
@@ -1004,6 +1005,111 @@ def test_re_freeze_allowlist_telemetry_passes(tmp_path):
     assert r.returncode == 0, r.stdout[-600:] + r.stderr[-400:]
     body = manifest.read_text(encoding="utf-8")
     assert "frozen_tree_hash: " in body and "0" * 64 not in body
+
+
+def test_guard_capture_consistency_ok(tmp_path):
+    # flat snapshot + margin evidence must come from the SAME preflight
+    # capture (canonical hash / captured_at / account identity / scope)
+    from core.deployment_safety_gate import guard_capture_consistency
+    ts = time.time()
+    pf = _position_file(tmp_path / "rt", _live_snapshot(captured_at=ts))
+    ev = {"account_identity_hash": "a" * 64, "scope": "futopt",
+          "captured_at": ts, "canonical_input_hash": "b" * 64}
+    r = guard_capture_consistency(str(pf), ev)
+    assert r.ok, r.reasons
+
+
+def test_guard_capture_consistency_mismatch(tmp_path):
+    # a different capture (hash) between snapshot and evidence => refusal
+    from core.deployment_safety_gate import guard_capture_consistency
+    ts = time.time()
+    pf = _position_file(tmp_path / "rt", _live_snapshot(captured_at=ts))
+    ev = {"account_identity_hash": "a" * 64, "scope": "futopt",
+          "captured_at": ts, "canonical_input_hash": "c" * 64}
+    r = guard_capture_consistency(str(pf), ev)
+    assert not r.ok and "GUARD_CAPTURE_MISMATCH" in r.reasons
+
+
+def test_guard_capture_consistency_requires_evidence(tmp_path):
+    from core.deployment_safety_gate import guard_capture_consistency
+    pf = _position_file(tmp_path / "rt", _live_snapshot())
+    r = guard_capture_consistency(str(pf), None)
+    assert not r.ok and "GUARD_CAPTURE_MISMATCH" in r.reasons
+
+
+# ── re_freeze: path normalization + verify command ─────────────────────────
+
+def test_re_freeze_rejects_symlink_escape(tmp_path):
+    # an untracked symlink escaping the repo must block the re-freeze
+    import subprocess as sp
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / "data").mkdir(exist_ok=True)
+    (repo / "data" / "telemetry").symlink_to(outside, target_is_directory=True)
+    r = sp.run(
+        [sys.executable, "-B",
+         str(Path(__file__).resolve().parents[2] /
+             "scripts/deployment/re_freeze.py"),
+         "--release-dir", str(repo), "--expected-sha", head],
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0, r.stdout[-600:]
+    assert "escape" in (r.stdout + r.stderr).lower() or \
+        "untracked" in (r.stdout + r.stderr).lower(), (r.stdout + r.stderr)[-600:]
+
+
+def test_re_freeze_verify_matches(tmp_path):
+    import subprocess as sp
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    manifest = repo / "PHASE1_FINAL_FREEZE.md"
+    manifest.write_text(f"Frozen SHA {head}\n"
+                        f"frozen_tree_hash: {'0' * 64}\n",
+                        encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "manifest"],
+                   check=True)
+    head = _head(repo)
+    sp.run([sys.executable, "-B",
+            str(Path(__file__).resolve().parents[2] /
+                "scripts/deployment/re_freeze.py"),
+            "--release-dir", str(repo), "--expected-sha", head,
+            "--manifest", str(manifest)],
+           capture_output=True, text=True, timeout=60)
+    subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "record"],
+                   check=True)
+    r = sp.run([sys.executable, "-B",
+                str(Path(__file__).resolve().parents[2] /
+                    "scripts/deployment/re_freeze.py"),
+                "--verify", "--release-dir", str(repo),
+                "--manifest", str(manifest)],
+               capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout[-600:] + r.stderr[-400:]
+
+
+def test_re_freeze_verify_stale_fails(tmp_path):
+    import subprocess as sp
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    manifest = repo / "PHASE1_FINAL_FREEZE.md"
+    manifest.write_text(f"Frozen SHA {head}\n"
+                        f"frozen_tree_hash: {'0' * 64}\n",
+                        encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "manifest"],
+                   check=True)
+    r = sp.run([sys.executable, "-B",
+                str(Path(__file__).resolve().parents[2] /
+                    "scripts/deployment/re_freeze.py"),
+                "--verify", "--release-dir", str(repo),
+                "--manifest", str(manifest)],
+               capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0, r.stdout[-600:]
 
 
 def test_re_freeze_records_identity_at_head(tmp_path):

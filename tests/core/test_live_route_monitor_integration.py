@@ -475,3 +475,57 @@ def test_session_generation_race_blocks_transition(tmp_path, monkeypatch):
     assert not m._execution_context.is_live_ready()
     assert "SESSION_GENERATION_MISMATCH" in \
         m._execution_context.audit_reasons
+
+
+def test_recertify_after_relogin_recovers_live_ready(tmp_path, monkeypatch):
+    """D1 retry path: generation mismatch => QUARANTINED => relogin (new
+    generation) => recertify => LIVE_READY. The old-generation path made
+    ZERO order calls (transition skipped, orders blocked)."""
+    monkeypatch.chdir(tmp_path)
+    _set_release_env(monkeypatch)
+    cfg = _minimal_live_cfg(tmp_path)
+    import core.live_route_certificate as lrc
+    from core.mode_transition import ModeTransitionState, with_effective_mode
+    calls = {"transitions": 0}
+
+    def fake_certify(api, **kwargs):
+        return (object(), [])
+
+    def fake_build(api, config, process_state=None):
+        return object()
+
+    def spy_transition(ctx, cert, issuer, *, runtime):
+        calls["transitions"] += 1
+        return with_effective_mode(ctx, ModeTransitionState.LIVE_READY.value,
+                                   live_order_allowed=True)
+
+    monkeypatch.setattr(lrc, "certify_route", fake_certify)
+    monkeypatch.setattr(lrc, "build_runtime_certification_context", fake_build)
+    monkeypatch.setattr(lrc, "transition_with_certificate", spy_transition)
+
+    from strategies.futures.monitor import FuturesMonitor
+    from main import _recertify_after_reconnect
+    api_fake = SimpleNamespace(futopt_account=object())
+    lrc.register_session(api_fake)          # generation A
+
+    original_bind = FuturesMonitor._bind_session_generation
+
+    def _racy_bind(self):
+        original_bind(self)                  # ctx.session_id = A
+        lrc.unregister_session(api_fake)     # logout
+        lrc.register_session(api_fake)       # relogin -> generation B
+
+    monkeypatch.setattr(FuturesMonitor, "_bind_session_generation",
+                        _racy_bind)
+    m = FuturesMonitor(api=api_fake, config_path=str(cfg))
+    # race path: quarantined, zero transitions, zero order calls
+    assert calls["transitions"] == 0
+    assert not m._execution_context.is_live_ready()
+    assert "SESSION_GENERATION_MISMATCH" in \
+        m._execution_context.audit_reasons
+    # retry: relogin already produced a NEW generation; recertify now
+    # binds the new generation + confirms + transitions to LIVE_READY
+    ok = _recertify_after_reconnect(m, api_fake)
+    assert ok, "recertify must succeed with the new generation"
+    assert m._execution_context.is_live_ready()
+    assert calls["transitions"] == 1
