@@ -514,59 +514,86 @@ class FuturesMonitor:
                 from core.mode_transition import live_preflight_context, paper_context, LiveOrderBlocked, EntryBlocked
                 if self.live_trading:
                     self._execution_context = live_preflight_context()
-                    # [Live Route Certification wiring] certificate-required
-                    # startup: certify_route -> transition_with_certificate is
-                    # the ONLY path to LIVE_READY; no certificate -> 
-                    # LIVE_QUARANTINED (NO_CERTIFICATE). Single startup-path
-                    # replacement — no reconnect/order-route changes here.
+                    # [release identity] release-dir HEAD == LRC_RELEASE_SHA
+                    # verified in the ACTUAL release tree BEFORE any
+                    # certification/transition (fail-closed; missing/
+                    # invalid env, git failure, mismatch -> QUARANTINED)
+                    _rel_ok = False
+                    _rel_reasons = ["RELEASE_IDENTITY_GIT_FAILED"]
                     try:
-                        from core.live_route_certificate import (
-                            CertificateIssuer, build_runtime_certification_context,
-                            certify_route, transition_with_certificate)
+                        from core.release_identity import verify_release_identity
+                        _rel_dir = str(Path(__file__).resolve().parents[2])
+                        _rel_ok, _rel_reasons = verify_release_identity(
+                            _rel_dir)
+                    except Exception:
+                        _rel_ok = False
+                        _rel_reasons = ["RELEASE_IDENTITY_GIT_FAILED"]
+                    if not _rel_ok:
                         from core.mode_transition import (ModeTransitionState,
                                                           with_effective_mode)
-                        _api = getattr(self, "api", None)
-                        _issuer = CertificateIssuer()
-                        _cert, _cert_failures = (
-                            certify_route(
-                                _api,
-                                process_start_id=f"monitor-{os.getpid()}",
-                                issuer=_issuer,
-                                config_path=self.config_path)
-                            if _api is not None else (None, []))
-                        if _cert is None:
-                            self._execution_context = with_effective_mode(
-                                self._execution_context,
-                                ModeTransitionState.LIVE_QUARANTINED.value,
-                                live_order_allowed=False,
-                                audit_reasons=tuple(_cert_failures) or ("NO_CERTIFICATE",))
-                            self._persist_execution_context()
-                            print(f"[MTS_EXEC_CTX] LIVE_QUARANTINED cert=None "
-                                  f"reasons={_cert_failures or ['NO_CERTIFICATE']} "
-                                  f"— live orders blocked")
-                        else:
-                            _runtime = build_runtime_certification_context(
-                                _api, self.config_path,
-                                {"process_state": {"process_start_id":
-                                                   f"monitor-{os.getpid()}"}})
-                            self._execution_context = transition_with_certificate(
-                                self._execution_context, _cert, _issuer,
-                                runtime=_runtime)
-                            self._persist_execution_context()
-                            # [orphan reconciliation] a pending
-                            # SAFETY_STOP_RECONCILE intent keeps QUARANTINED
-                            # until the broker state reconciles
-                            self._apply_reconcile_pending_gate()
-                            if self._execution_context.is_live_ready():
-                                print("[MTS_EXEC_CTX] LIVE_READY — "
-                                      "certificate-required transition complete; "
-                                      "live orders authorized")
-                            else:
-                                print(f"[MTS_EXEC_CTX] LIVE_QUARANTINED "
-                                      f"reasons={self._execution_context.audit_reasons} "
+                        self._execution_context = with_effective_mode(
+                            self._execution_context,
+                            ModeTransitionState.LIVE_QUARANTINED.value,
+                            live_order_allowed=False,
+                            audit_reasons=tuple(_rel_reasons))
+                        self._persist_execution_context()
+                        print(f"[MTS_EXEC_CTX] LIVE_QUARANTINED "
+                              f"{_rel_reasons} — release identity not "
+                              f"verified; live orders blocked")
+                    else:
+                        # [Live Route Certification wiring] certificate-required
+                        # startup: certify_route -> transition_with_certificate is
+                        # the ONLY path to LIVE_READY; no certificate -> 
+                        # LIVE_QUARANTINED (NO_CERTIFICATE). Single startup-path
+                        # replacement — no reconnect/order-route changes here.
+                        try:
+                            from core.live_route_certificate import (
+                                CertificateIssuer, build_runtime_certification_context,
+                                certify_route, transition_with_certificate)
+                            from core.mode_transition import (ModeTransitionState,
+                                                              with_effective_mode)
+                            _api = getattr(self, "api", None)
+                            _issuer = CertificateIssuer()
+                            _cert, _cert_failures = (
+                                certify_route(
+                                    _api,
+                                    process_start_id=f"monitor-{os.getpid()}",
+                                    issuer=_issuer,
+                                    config_path=self.config_path)
+                                if _api is not None else (None, []))
+                            if _cert is None:
+                                self._execution_context = with_effective_mode(
+                                    self._execution_context,
+                                    ModeTransitionState.LIVE_QUARANTINED.value,
+                                    live_order_allowed=False,
+                                    audit_reasons=tuple(_cert_failures) or ("NO_CERTIFICATE",))
+                                self._persist_execution_context()
+                                print(f"[MTS_EXEC_CTX] LIVE_QUARANTINED cert=None "
+                                      f"reasons={_cert_failures or ['NO_CERTIFICATE']} "
                                       f"— live orders blocked")
-                    except Exception as _exc:
-                        print(f"[MTS_EXEC_CTX] transition error: {_exc} — stays LIVE_PREFLIGHT (blocked)")
+                            else:
+                                _runtime = build_runtime_certification_context(
+                                    _api, self.config_path,
+                                    {"process_state": {"process_start_id":
+                                                       f"monitor-{os.getpid()}"}})
+                                self._execution_context = transition_with_certificate(
+                                    self._execution_context, _cert, _issuer,
+                                    runtime=_runtime)
+                                self._persist_execution_context()
+                                # [orphan reconciliation] a pending
+                                # SAFETY_STOP_RECONCILE intent keeps QUARANTINED
+                                # until the broker state reconciles
+                                self._apply_reconcile_pending_gate()
+                                if self._execution_context.is_live_ready():
+                                    print("[MTS_EXEC_CTX] LIVE_READY — "
+                                          "certificate-required transition complete; "
+                                          "live orders authorized")
+                                else:
+                                    print(f"[MTS_EXEC_CTX] LIVE_QUARANTINED "
+                                          f"reasons={self._execution_context.audit_reasons} "
+                                          f"— live orders blocked")
+                        except Exception as _exc:
+                            print(f"[MTS_EXEC_CTX] transition error: {_exc} — stays LIVE_PREFLIGHT (blocked)")
                 else:
                     self._execution_context = paper_context()
             except ImportError:
