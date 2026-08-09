@@ -28,7 +28,7 @@ def _git_repo(tmp_path):
                     "t@t"], check=True)
     subprocess.run(["git", "-C", str(tmp_path), "config", "user.name",
                     "t"], check=True)
-    (tmp_path / "config").mkdir()
+    (tmp_path / "config").mkdir(exist_ok=True)
     (tmp_path / "config" / "futures.yaml").write_text(
         "mts:\n  live_required_margin_per_pair: 100000.0\n", encoding="utf-8")
     (tmp_path / "main.py").write_text("x = 1\n", encoding="utf-8")
@@ -949,6 +949,8 @@ def test_re_freeze_allow_untracked_ignore(tmp_path):
     (repo / "data" / "telemetry").mkdir()
     (repo / "data" / "telemetry" / "run-1.json").write_text(
         "{}", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
+                   check=True)
     r = sp.run(
         [sys.executable, "-B",
          str(Path(__file__).resolve().parents[2] /
@@ -1005,6 +1007,8 @@ def test_cli_verdict_never_partial_ready(tmp_path, monkeypatch):
     manifest.write_text(f"Frozen SHA {head}\n"
                         f"frozen_tree_hash: {'0' * 64}\n",
                         encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
+                   check=True)
     r = sp.run(
         [sys.executable, "-B",
          str(Path(__file__).resolve().parents[2] /

@@ -579,18 +579,40 @@ class FuturesMonitor:
                                 # generation/session/snapshot consistency
                                 # before ANY LIVE_READY transition
                                 self._bind_session_generation()
-                                _runtime = build_runtime_certification_context(
-                                    _api, self.config_path,
-                                    {"process_state": {"process_start_id":
-                                                       f"monitor-{os.getpid()}"}})
-                                self._execution_context = transition_with_certificate(
-                                    self._execution_context, _cert, _issuer,
-                                    runtime=_runtime)
-                                self._persist_execution_context()
-                                # [orphan reconciliation] a pending
-                                # SAFETY_STOP_RECONCILE intent keeps QUARANTINED
-                                # until the broker state reconciles
-                                self._apply_reconcile_pending_gate()
+                                if not self._confirm_session_generation():
+                                    # [D1 race guard] the registry generation
+                                    # changed since binding (logout/relogin):
+                                    # do NOT promote — stay QUARANTINED with
+                                    # SESSION_GENERATION_MISMATCH (zero
+                                    # live-order calls; the cert flow is
+                                    # skipped entirely)
+                                    self._execution_context = (
+                                        with_effective_mode(
+                                            self._execution_context,
+                                            ModeTransitionState.
+                                            LIVE_QUARANTINED.value,
+                                            live_order_allowed=False,
+                                            audit_reasons=(
+                                                "SESSION_GENERATION_MISMATCH",)))
+                                    self._persist_execution_context()
+                                    print("[MTS_EXEC_CTX] LIVE_QUARANTINED "
+                                          "SESSION_GENERATION_MISMATCH — "
+                                          "generation changed before "
+                                          "certification; live orders blocked")
+                                else:
+                                    _runtime = build_runtime_certification_context(
+                                        _api, self.config_path,
+                                        {"process_state": {"process_start_id":
+                                                           f"monitor-{os.getpid()}"}})
+                                    self._execution_context = transition_with_certificate(
+                                        self._execution_context, _cert, _issuer,
+                                        runtime=_runtime)
+                                    self._persist_execution_context()
+                                    # [orphan reconciliation] a pending
+                                    # SAFETY_STOP_RECONCILE intent keeps
+                                    # QUARANTINED until the broker state
+                                    # reconciles
+                                    self._apply_reconcile_pending_gate()
                                 if self._execution_context.is_live_ready():
                                     print("[MTS_EXEC_CTX] LIVE_READY — "
                                           "certificate-required transition complete; "
@@ -2877,6 +2899,24 @@ class FuturesMonitor:
                 self._persist_execution_context()
         except Exception:
             return
+
+    def _confirm_session_generation(self) -> bool:
+        """[D1 race guard] re-confirm the registry-bound generation right
+        BEFORE the LIVE_READY transition: a logout/relogin between the
+        binding and the certification invalidates the old generation —
+        the transition must NOT promote with a stale session binding.
+        Returns True only if the ctx.session_id still matches the CURRENT
+        registry generation for this api."""
+        try:
+            _api = getattr(self, "api", None)
+            _ctx = getattr(self, "_execution_context", None)
+            if _api is None or _ctx is None:
+                return False
+            from core.live_route_certificate import session_registry
+            _gen = session_registry.generation(_api)
+            return bool(_gen) and str(_ctx.session_id) == str(_gen)
+        except Exception:
+            return False
 
     def _place_safety_stop(self, entry_price, direction, lots, stop_loss_pts):
         """Place a far-limit order at exchange as safety stop for disconnect protection."""

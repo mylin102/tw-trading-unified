@@ -51,6 +51,11 @@ def main() -> int:
     ap.add_argument("--expected-sha", default=None)
     ap.add_argument("--manifest", default=None)
     ap.add_argument("--exclude-path", action="append", default=[])
+    ap.add_argument("--ignore-untracked", action="append", default=[],
+                    help="glob pattern (fnmatch) of untracked runtime "
+                         "artifacts that are explicitly controlled and "
+                         "allowed to remain; everything else untracked "
+                         "blocks the re-freeze")
     args = ap.parse_args()
 
     repo = Path(args.release_dir).resolve()
@@ -65,20 +70,39 @@ def main() -> int:
               f"!= HEAD {head}", file=sys.stderr)
         return 2
 
-    # fail-closed #2: dirty closure tree (nothing may change after the
-    # freeze — the re-record is manifest-only)
-    status = _run(repo, "status", "--porcelain")
-    dirty = [ln for ln in status.splitlines()
-             if not ln.startswith("??")]
-    if dirty:
-        print(f"ABORT dirty tree ({len(dirty)} changed file(s)) — "
-              f"finish all commits before re-freezing:\n"
-              + "\n".join(dirty[:10]), file=sys.stderr)
-        return 3
-
+    # fail-closed #2: dirty tree — TRACKED modifications AND untracked
+    # files both block (freeze-last: nothing may change after the freeze;
+    # untracked runtime artifacts only pass with an explicit controlled
+    # --ignore-untracked pattern). The re-record target manifest itself is
+    # excluded (its update IS the script's job).
     exclude = args.exclude_path or DEFAULT_EXCLUDE
     manifest = Path(args.manifest).resolve() if args.manifest \
         else repo / "PHASE1_FINAL_FREEZE.md"
+    status = _run(repo, "status", "--porcelain", "-uall")
+    _manifest_rel = manifest.name
+    tracked_dirty = [ln for ln in status.splitlines()
+                     if not ln.startswith("??")
+                     and not ln.strip().endswith(_manifest_rel)]
+    untracked = [ln[3:] for ln in status.splitlines()
+                 if ln.startswith("??")]
+    if tracked_dirty:
+        print(f"ABORT dirty tree ({len(tracked_dirty)} changed "
+              f"file(s)) — finish all commits before re-freezing:\n"
+              + "\n".join(tracked_dirty[:10]), file=sys.stderr)
+        return 3
+    import fnmatch
+    remaining = []
+    for u in untracked:
+        if any(fnmatch.fnmatch(u, p) for p in args.ignore_untracked):
+            continue
+        remaining.append(u)
+    if remaining:
+        print(f"ABORT untracked files ({len(remaining)}) block the "
+              f"re-freeze — commit them or pass --ignore-untracked "
+              f"patterns for controlled runtime artifacts:\n"
+              + "\n".join(remaining[:10]), file=sys.stderr)
+        return 6
+
     if not manifest.is_file():
         print(f"FATAL manifest not found: {manifest}", file=sys.stderr)
         return 4

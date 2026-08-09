@@ -323,6 +323,7 @@ def test_valid_cert_startup_uses_transition_with_certificate(tmp_path, monkeypat
 
     from strategies.futures.monitor import FuturesMonitor
     api_fake = object()
+    lrc.register_session(api_fake)   # registry-bound generation (D1 gate)
     m = FuturesMonitor(api=api_fake, config_path=str(cfg))
     assert calls.get("cert") is cert_fake, "monitor must use the issued cert"
     assert calls.get("runtime") is runtime_fake, \
@@ -414,13 +415,63 @@ def test_bind_precedes_certification_in_startup(tmp_path, monkeypatch):
 
     from strategies.futures.monitor import FuturesMonitor
 
+    original_bind = FuturesMonitor._bind_session_generation
+
     def _spy_bind(self):
         order.append("bind")
+        original_bind(self)          # real binding (sets ctx.session_id)
 
     monkeypatch.setattr(FuturesMonitor, "_bind_session_generation", _spy_bind)
     api_fake = SimpleNamespace(futopt_account=object())
     lrc.register_session(api_fake)
     m = FuturesMonitor(api=api_fake, config_path=str(cfg))
-    assert order == ["bind", "transition"], \
+    assert order[:2] == ["bind", "transition"], \
         f"binding must precede certification, got {order}"
     assert m._execution_context.is_live_ready()
+
+
+def test_session_generation_race_blocks_transition(tmp_path, monkeypatch):
+    """D1 race guard: a logout/relogin between the binding and the
+    certification invalidates the old generation — the startup must NOT
+    promote (transition_with_certificate skipped, ctx stays QUARANTINED
+    with SESSION_GENERATION_MISMATCH)."""
+    monkeypatch.chdir(tmp_path)
+    _set_release_env(monkeypatch)
+    cfg = _minimal_live_cfg(tmp_path)
+    import core.live_route_certificate as lrc
+    from core.mode_transition import ModeTransitionState, with_effective_mode
+    calls = {}
+
+    def fake_certify(api, **kwargs):
+        return (object(), [])
+
+    def fake_build(api, config, process_state=None):
+        return object()
+
+    def spy_transition(ctx, cert, issuer, *, runtime):
+        calls["transition"] = True
+        return with_effective_mode(ctx, ModeTransitionState.LIVE_READY.value,
+                                   live_order_allowed=True)
+
+    monkeypatch.setattr(lrc, "certify_route", fake_certify)
+    monkeypatch.setattr(lrc, "build_runtime_certification_context", fake_build)
+    monkeypatch.setattr(lrc, "transition_with_certificate", spy_transition)
+
+    from strategies.futures.monitor import FuturesMonitor
+    api_fake = SimpleNamespace(futopt_account=object())
+    lrc.register_session(api_fake)          # generation A
+
+    original_bind = FuturesMonitor._bind_session_generation
+
+    def _racy_bind(self):
+        original_bind(self)                  # ctx.session_id = A
+        lrc.unregister_session(api_fake)     # logout
+        lrc.register_session(api_fake)       # relogin -> generation B
+
+    monkeypatch.setattr(FuturesMonitor, "_bind_session_generation",
+                        _racy_bind)
+    m = FuturesMonitor(api=api_fake, config_path=str(cfg))
+    assert "transition" not in calls, "race must skip the transition"
+    assert not m._execution_context.is_live_ready()
+    assert "SESSION_GENERATION_MISMATCH" in \
+        m._execution_context.audit_reasons

@@ -424,6 +424,20 @@ def guard_margin(margin_available: Optional[float],
     if missing:
         return _fail("margin", ["GUARD_MARGIN_EVIDENCE_MISSING"],
                      f"missing {','.join(missing)}")
+    # the margin guard validates its OWN evidence freshness — it must not
+    # rely on the flat guard: captured_at must be a finite epoch within
+    # SNAPSHOT_MAX_AGE_S
+    try:
+        _ts = float(margin_evidence.get("captured_at"))
+        if not math.isfinite(_ts) or _ts <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return _fail("margin", ["GUARD_MARGIN_EVIDENCE_STALE"],
+                     "captured_at must be a finite epoch")
+    if time.time() - _ts > SNAPSHOT_MAX_AGE_S:
+        return _fail("margin", ["GUARD_MARGIN_EVIDENCE_STALE"],
+                     f"captured_at {_ts:.0f} older than "
+                     f"{SNAPSHOT_MAX_AGE_S:.0f}s")
     return _pass("margin", str(value))
 
 
