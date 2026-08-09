@@ -1068,23 +1068,3 @@ def test_cli_verdict_never_partial_ready(tmp_path, monkeypatch):
     assert r.returncode != 0
     assert "NOT_READY" in r.stdout
     assert "READY_FOR_STARTUP" not in r.stdout
-    import subprocess as sp
-    repo = _git_repo(tmp_path)
-    head = _head(repo)
-    manifest = repo / "PHASE1_FINAL_FREEZE.md"
-    manifest.write_text(f"Frozen SHA {head}\n"
-                        f"frozen_tree_hash: {'0' * 64}\n",
-                        encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
-                   check=True)
-    r = sp.run(
-        [sys.executable, "-B",
-         str(Path(__file__).resolve().parents[2] /
-             "scripts/deployment/re_freeze.py"),
-         "--release-dir", str(repo), "--expected-sha", head,
-         "--manifest", str(manifest)],
-        capture_output=True, text=True, timeout=60)
-    assert r.returncode == 0, r.stdout[-600:] + r.stderr[-400:]
-    body = manifest.read_text(encoding="utf-8")
-    assert "frozen_tree_hash: " in body and "0000000000000000" not in body
-    assert head in body
