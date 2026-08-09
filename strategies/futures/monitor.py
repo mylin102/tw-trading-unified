@@ -7651,6 +7651,33 @@ class FuturesMonitor:
 
         Sets _mts_force_exit_inflight to prevent duplicate SINGLE_LEG preclose triggers.
         """
+        # [Step 9] emergency quarantine contract: under LIVE_QUARANTINED /
+        # PREFLIGHT the emergency flatten command is BLOCKED — zero
+        # strategy mutation, zero broker calls, durable dashboard-visible
+        # audit reason (persisted). ctx=None is fail-closed
+        # (NO_LIVE_CERTIFICATION). PAPER behavior unchanged (a paper
+        # context is not a LIVE context).
+        _ctx = getattr(self, "_execution_context", None)
+        _paper = _ctx is not None and \
+            getattr(_ctx, "requested_mode", "") == "paper"
+        if not _paper and (_ctx is None or not _ctx.is_live_ready()):
+            _reason = ("EMERGENCY_BLOCKED_NO_LIVE_CERTIFICATION"
+                       if _ctx is None else "EMERGENCY_BLOCKED_QUARANTINED")
+            if _ctx is not None:
+                from core.mode_transition import (ModeTransitionState,
+                                                  with_effective_mode)
+                self._execution_context = with_effective_mode(
+                    _ctx, ModeTransitionState.LIVE_QUARANTINED.value,
+                    live_order_allowed=False,
+                    audit_reasons=(_reason,) + tuple(
+                        getattr(_ctx, "audit_reasons", ()) or ()))
+                self._persist_execution_context()
+            console.print(
+                f"[red]🚫 [EMERGENCY_FLATTEN] BLOCKED: {_reason} — "
+                f"zero strategy mutation, zero broker calls. Operator "
+                f"procedure: restore LIVE_READY (reconnect/recertify) "
+                f"before emergency flatten.[/red]")
+            return {"blocked": True, "reason": _reason}
         self._mts_force_exit_inflight = True
         # If strategy has position, submit EXIT for remaining leg or close both
         _has_pos = bool(getattr(strategy, '_has_position', False))
