@@ -364,18 +364,74 @@ def guard_margin(margin_available: Optional[float],
     return _pass("margin", str(value))
 
 
-# ── 9. rollback manifest + drift abort ─────────────────────────────────────
+# ── 9. rollback manifest + drift abort (exclude-self tree identity) ─────────
 
-def guard_rollback_manifest(manifest_paths: Sequence[str],
-                            expected_sha: str) -> GuardResult:
+_MANIFEST_HASH_RE = re.compile(r"frozen_tree_hash:\s*([0-9a-f]{64})")
+
+
+def _exclude_self_tree_hash(release_dir: str,
+                            commit: str,
+                            exclude_paths: Sequence[str]) -> Optional[str]:
+    """Content-addressed release-tree identity: SHA-256 of the
+    `git ls-tree -r <commit>` entries EXCLUDING the manifest/rollback docs.
+
+    Exclude-self semantics resolve the freeze cycle: recording the freeze
+    in a manifest commit does NOT move the identity (the manifest is
+    excluded), while ANY code change after the freeze changes the hash and
+    is refused (GUARD_MANIFEST_STALE)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(release_dir), "ls-tree", "-r", commit],
+            capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            return None
+        lines = [ln for ln in (proc.stdout or "").splitlines()
+                 if not any(ln.split("\t")[-1] == p for p in exclude_paths)]
+        import hashlib
+        return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+    except Exception:
+        return None
+
+
+def guard_rollback_manifest(release_dir: str,
+                            manifest_paths: Sequence[str],
+                            expected_sha: str,
+                            exclude_paths: Sequence[str] = ()) -> GuardResult:
+    """Rollback manifest + drift abort with exclude-self tree identity.
+
+    The manifest must record `frozen_tree_hash` (the exclude-self tree
+    hash at freeze time). The guard re-derives the hash from the CURRENT
+    HEAD and refuses on ANY code drift; manifest-only commits (recording
+    the freeze itself) do NOT invalidate the record — the SHA cycle is
+    broken without weakening fail-closed."""
     present = [p for p in manifest_paths if Path(p).is_file()]
     if not present:
         return _fail("rollback_manifest", ["GUARD_MANIFEST_MISSING"])
+    recorded = None
     for p in present:
-        if expected_sha not in Path(p).read_text(encoding="utf-8"):
+        try:
+            text = Path(p).read_text(encoding="utf-8")
+        except OSError:
             return _fail("rollback_manifest", ["GUARD_MANIFEST_STALE"],
-                         f"{p} lacks {expected_sha[:12]}")
-    return _pass("rollback_manifest", ",".join(present))
+                         f"unreadable {p}")
+        m = _MANIFEST_HASH_RE.search(text)
+        if not m:
+            return _fail("rollback_manifest", ["GUARD_MANIFEST_STALE"],
+                         f"{Path(p).name} lacks frozen_tree_hash")
+        recorded = m.group(1)
+    if recorded is None:
+        return _fail("rollback_manifest", ["GUARD_MANIFEST_STALE"])
+    current = _exclude_self_tree_hash(release_dir, "HEAD", exclude_paths)
+    if current is None:
+        return _fail("rollback_manifest", ["GUARD_MANIFEST_STALE"],
+                     "cannot derive HEAD tree identity")
+    if current != recorded:
+        return _fail("rollback_manifest", ["GUARD_MANIFEST_STALE"],
+                     f"tree drift: recorded {recorded[:12]} != HEAD "
+                     f"{current[:12]}")
+    return _pass("rollback_manifest",
+                 f"exclude-self tree identity {current[:16]}… "
+                 f"(expected {expected_sha[:12]}…)")
 
 
 # ── 10. ctx atomic read/write health ───────────────────────────────────────
@@ -439,6 +495,7 @@ def check_deployment(
     session_revoked: bool = False,
     margin_available: Optional[float] = None,
     manifest_paths: Sequence[str] = (),
+    manifest_exclude_paths: Sequence[str] = (),
     expected_sha: Optional[str] = None,
 ) -> DeploymentCheck:
     """Run all guards. Fail-closed: ANY guard failure -> NOT_READY.
@@ -460,7 +517,8 @@ def check_deployment(
         guard_quarantine_first_startup(monitor_path),
         guard_session_generation(session_generation, session_revoked),
         guard_margin(margin_available),
-        guard_rollback_manifest(manifest_paths, expected_sha),
+        guard_rollback_manifest(release_dir, manifest_paths, expected_sha,
+                                exclude_paths=manifest_exclude_paths),
         guard_ctx_atomic_health(runtime_dir),
     )
     return DeploymentCheck(ok=all(r.ok for r in results), results=results)

@@ -46,6 +46,7 @@ def main() -> int:
     ap.add_argument("--margin-available", type=float, default=None)
     ap.add_argument("--expected-sha", default=None)
     ap.add_argument("--manifest", action="append", default=[])
+    ap.add_argument("--exclude-path", action="append", default=[])
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -54,6 +55,13 @@ def main() -> int:
     manifests = args.manifest or [
         str(_REPO_ROOT / "PHASE1_RC_CANDIDATE.md"),
         str(_REPO_ROOT / "PHASE2_DEPLOYMENT_MANIFEST.md"),
+        str(_REPO_ROOT / "PHASE1_FINAL_FREEZE.md"),
+    ]
+    # exclude-self: the manifest/rollback docs are excluded from the tree
+    # identity (recording the freeze must not invalidate itself)
+    exclude = args.exclude_path or [
+        "PHASE1_RC_CANDIDATE.md", "PHASE2_DEPLOYMENT_MANIFEST.md",
+        "PHASE1_FINAL_FREEZE.md",
     ]
     check = check_deployment(
         release_dir=args.release_dir,
@@ -66,6 +74,7 @@ def main() -> int:
         session_generation=args.session_generation,
         margin_available=args.margin_available,
         manifest_paths=manifests,
+        manifest_exclude_paths=exclude,
         expected_sha=args.expected_sha,
     )
     if args.json:
