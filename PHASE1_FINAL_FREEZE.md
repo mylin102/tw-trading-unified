@@ -5,6 +5,11 @@
 **此後禁改檔** — gate 對任何 post-freeze 變更 refuse）
 **Frozen release tree HEAD**: `63ea9e6817bca908f7066a77070d7c4e05b0f853`
 （= gate closure fix commit；其後僅此 freeze-record docs commit）
+**frozen_tree_hash（exclude-self tree identity — manifest/rollback docs
+排除）**: `ed2f316240a6914dcbd6f5ab3cb0bd7805dd189397077a8dcbe4b14dfae19464`
+（= `git ls-tree -r <commit> | grep -v manifest docs | sha256`；manifest-only
+commits 不影響此 identity — 解除 freeze/manifest SHA cycle；任何 code
+變更 → hash 變 → gate GUARD_MANIFEST_STALE 拒絕）
 **LRC_RELEASE_SHA（部署時）**: = deploy-time `git -C <release_dir>
 rev-parse HEAD` 之 literal（= 此 freeze-record commit 的 SHA；deployed
 tree 的 HEAD — gate 以 GUARD_HEAD_MISMATCH 強制一致）
