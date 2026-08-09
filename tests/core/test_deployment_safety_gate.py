@@ -229,7 +229,7 @@ def _position_file(runtime_dir, data):
 def _live_snapshot(**over):
     data = {"source": "live_broker", "mode": "live",
             "positions": 0, "open_orders": [],
-            "captured_at": time.time(),          # fresh (epoch seconds)
+            "captured_at": int(time.time() * 1000),  # canonical epoch-ms int
             "hash": "b" * 64, "session_id": "sess-1",
             "account_identity_hash": "a" * 64}
     data.update(over)
@@ -731,7 +731,7 @@ def test_aggregate_all_pass_readies(tmp_path, monkeypatch):
     head = _head(repo)
     rt = tmp_path / "rt"
     _ctx_file(rt, _live_ctx_dict())
-    _ts = time.time()
+    _ts = int(time.time() * 1000)
     pf = _position_file(rt, _live_snapshot(captured_at=_ts))
     exclude = ["PHASE1_FINAL_FREEZE.md"]
     manifest = _manifest_with(repo, exclude, head)
@@ -805,7 +805,7 @@ def test_pre_deploy_skips_session_generation(tmp_path, monkeypatch):
     head = _head(repo)
     rt = tmp_path / "rt"
     _ctx_file(rt, _live_ctx_dict())
-    _ts = time.time()
+    _ts = int(time.time() * 1000)
     pf = _position_file(rt, _live_snapshot(captured_at=_ts))
     exclude = ["PHASE1_FINAL_FREEZE.md"]
     manifest = _manifest_with(repo, exclude, head)
@@ -834,7 +834,7 @@ def test_post_startup_requires_registry_generation(tmp_path, monkeypatch):
     head = _head(repo)
     rt = tmp_path / "rt"
     _ctx_file(rt, _live_ctx_dict())
-    _ts = time.time()
+    _ts = int(time.time() * 1000)
     pf = _position_file(rt, _live_snapshot(captured_at=_ts))
     exclude = ["PHASE1_FINAL_FREEZE.md"]
     manifest = _manifest_with(repo, exclude, head)
@@ -875,7 +875,7 @@ def test_cli_margin_evidence_and_ready_for_startup(tmp_path, monkeypatch):
     head = _head(repo)
     rt = tmp_path / "rt"
     _ctx_file(rt, _live_ctx_dict())
-    _ts = time.time()
+    _ts = int(time.time() * 1000)
     pf = _position_file(rt, _live_snapshot(captured_at=_ts))
     exclude = ["PHASE1_FINAL_FREEZE.md"]
     manifest = _manifest_with(repo, exclude, head)
@@ -902,7 +902,7 @@ def test_cli_margin_evidence_and_ready_for_startup(tmp_path, monkeypatch):
          "--phase", "pre_deploy"],
         capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "READY_FOR_STARTUP" in r.stdout, r.stdout[-800:]
+    assert "phase=READY_FOR_STARTUP" in r.stdout, r.stdout[-800:]
     assert "GUARD_MARGIN" not in r.stdout, r.stdout[-800:]
 
 
@@ -1015,7 +1015,7 @@ def test_guard_capture_consistency_ok(tmp_path):
     # flat snapshot + margin evidence must come from the SAME preflight
     # capture (canonical hash / captured_at / account identity / scope)
     from core.deployment_safety_gate import guard_capture_consistency
-    ts = time.time()
+    ts = int(time.time() * 1000)
     pf = _position_file(tmp_path / "rt", _live_snapshot(captured_at=ts))
     ev = {"account_identity_hash": "a" * 64, "scope": "futopt",
           "captured_at": ts, "canonical_input_hash": "b" * 64}
@@ -1038,10 +1038,24 @@ def test_guard_capture_consistency_exact_captured_at(tmp_path):
     # the SAME preflight JSON capture => captured_at must be EXACT
     # (no skew tolerance for same-source artifacts)
     from core.deployment_safety_gate import guard_capture_consistency
-    ts = time.time()
+    ts = int(time.time() * 1000)
     pf = _position_file(tmp_path / "rt", _live_snapshot(captured_at=ts))
     ev = {"account_identity_hash": "a" * 64, "scope": "futopt",
-          "captured_at": ts + 0.001,     # 1ms skew — rejected
+          "captured_at": ts + 1,          # 1ms diff — rejected
+          "canonical_input_hash": "b" * 64}
+    r = guard_capture_consistency(str(pf), ev)
+    assert not r.ok and "GUARD_CAPTURE_MISMATCH" in r.reasons
+
+
+def test_guard_capture_consistency_epoch_ms_required(tmp_path):
+    # canonical epoch-ms INTEGER is required in both files — separate
+    # float time.time() values (the old non-canonical form) are rejected
+    from core.deployment_safety_gate import guard_capture_consistency
+    ts_ms = int(time.time() * 1000)
+    pf = _position_file(tmp_path / "rt", _live_snapshot(
+        captured_at=ts_ms))
+    ev = {"account_identity_hash": "a" * 64, "scope": "futopt",
+          "captured_at": ts_ms / 1000.0,  # float seconds — non-canonical
           "canonical_input_hash": "b" * 64}
     r = guard_capture_consistency(str(pf), ev)
     assert not r.ok and "GUARD_CAPTURE_MISMATCH" in r.reasons
@@ -1159,8 +1173,10 @@ def test_re_freeze_verify_labels_verify_only(tmp_path):
                 "--manifest", str(manifest)],
                capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, (r.stdout + r.stderr)[-600:]
-    assert "VERIFY_ONLY" in r.stdout, r.stdout[-600:]
+    assert "phase=VERIFY_ONLY" in r.stdout, r.stdout[-600:]
     assert "deploy" in (r.stdout + r.stderr).lower()  # NOT deploy-ready
+    assert "READY_FOR_STARTUP" not in r.stdout, \
+        "VERIFY_ONLY must be machine-distinguishable from pre_deploy READY"
 
 
 def test_re_freeze_internal_alias_allowed(tmp_path):
@@ -1227,7 +1243,7 @@ def test_cli_verdict_never_partial_ready(tmp_path, monkeypatch):
     head = _head(repo)
     rt = tmp_path / "rt"
     _ctx_file(rt, _live_ctx_dict())
-    _ts = time.time()
+    _ts = int(time.time() * 1000)
     pf = _position_file(rt, _live_snapshot(positions=[
         {"account": "futures", "code": "TMFH6", "quantity": 1,
          "direction": "Action.Sell"}]))   # futures non-flat -> FAIL
