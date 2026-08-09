@@ -147,3 +147,40 @@ def test_ecosystem_prints_no_secrets(runtime_logs):
         "TRADING_RUNTIME_DIR": str(runtime_logs),
         "SHIOAJI_API_KEY": secret})
     assert secret not in out
+
+
+def test_ecosystem_config_load_check_deploy_flow(runtime_logs):
+    # the deploy flow's read-only production config-load check:
+    # node --check + require with the explicit production env
+    # (TRADING_PYTHON_BIN / TRADING_RUNTIME_DIR / LRC_RELEASE_SHA) —
+    # NO pm2 start/restart involved
+    r = subprocess.run([_NODE, "--check", str(_ECOSYSTEM)],
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    rc, out = _load_config({
+        "NODE_ENV": "production",
+        "TRADING_PYTHON_BIN": str(Path(sys.executable).resolve()),
+        "TRADING_RUNTIME_DIR": str(runtime_logs),
+        "LRC_RELEASE_SHA": "ab" * 20})
+    assert rc == 0, out
+
+
+def test_ecosystem_lrc_release_sha_passthrough(runtime_logs):
+    # the deploy-time LRC_RELEASE_SHA must reach the app env (the
+    # release-identity gate reads it from the process env)
+    sha = "ab" * 20
+    out = subprocess.run(
+        [_NODE, "-e",
+         "console.log(JSON.stringify(require('" + str(_ECOSYSTEM) +
+         "').apps[0].env))"],
+        env={
+            **{k: v for k, v in os.environ.items()
+               if k not in ("NODE_ENV", "TRADING_PYTHON_BIN",
+                            "TRADING_RUNTIME_DIR", "TRADING_LOG_DIR",
+                            "DEPLOY_MODE", "LRC_RELEASE_SHA")},
+            "NODE_ENV": "production",
+            "TRADING_PYTHON_BIN": str(Path(sys.executable).resolve()),
+            "TRADING_RUNTIME_DIR": str(runtime_logs),
+            "LRC_RELEASE_SHA": sha},
+        capture_output=True, text=True, timeout=30).stdout
+    assert json.loads(out)["LRC_RELEASE_SHA"] == sha
