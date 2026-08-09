@@ -488,13 +488,23 @@ def test_guard_session_generation_ok():
     assert guard_session_generation(42, revoked=False).ok
 
 
+def test_guard_session_generation_registry_token_accepted():
+    # the registry produces token_hex(16) = 32-hex string generations
+    from core.deployment_safety_gate import guard_session_generation
+    token = "ab" * 16
+    r = guard_session_generation(token, revoked=False)
+    assert r.ok, r.reasons
+    assert guard_session_generation(0, revoked=False).ok
+
+
 def test_guard_session_generation_preflight_identity_rejected():
     # B) a standalone sha256(account_id) marker is preflight IDENTITY, not a
-    # live session generation — registry-bound generation must be an int
+    # live session generation — 16-hex identity never passes
     from core.deployment_safety_gate import guard_session_generation
     r = guard_session_generation("1d98890cdf1219ac", revoked=False)
     assert not r.ok and "GUARD_SESSION_MISSING" in r.reasons
-    assert guard_session_generation(0, revoked=False).ok
+    r2 = guard_session_generation("not-a-token", revoked=False)
+    assert not r2.ok and "GUARD_SESSION_MISSING" in r2.reasons
 
 
 def test_guard_session_generation_missing():
@@ -748,3 +758,65 @@ def test_aggregate_caller_supplied_required(tmp_path, monkeypatch):
     assert not c.ok
     assert "GUARD_SESSION_MISSING" in c.refusal_codes
     assert "GUARD_MARGIN_UNAVAILABLE" in c.refusal_codes
+
+
+# ── pre_deploy vs post_startup session gate ────────────────────────────────
+
+def test_pre_deploy_skips_session_generation(tmp_path, monkeypatch):
+    # the pre-deploy/static gate does NOT require the registry-bound
+    # session generation (assessed post_startup) — everything else green
+    from core.deployment_safety_gate import check_deployment
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    rt = tmp_path / "rt"
+    _ctx_file(rt, _live_ctx_dict())
+    pf = _position_file(rt, _live_snapshot())
+    exclude = ["PHASE1_FINAL_FREEZE.md"]
+    manifest = _manifest_with(repo, exclude, head)
+    monkeypatch.setenv("LRC_RELEASE_SHA", head)
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(rt))
+    c = check_deployment(
+        release_dir=str(repo), closure_files=CLOSURE,
+        runtime_dir=str(rt), pid_file=str(tmp_path / "nope.pid"),
+        position_state_path=str(pf), monitor_path=None,
+        session_generation=None, session_revoked=False,
+        margin_available=300_000.0,
+        manifest_paths=[str(manifest)], expected_sha=head,
+        manifest_exclude_paths=exclude, phase="pre_deploy")
+    assert c.ok, [(g.guard, g.reasons) for g in c.results]
+    sg = c.by_guard("session_generation")
+    assert sg is not None and sg.ok and "not assessed" in sg.detail
+
+
+def test_post_startup_requires_registry_generation(tmp_path, monkeypatch):
+    # the post_startup/live gate REQUIRES the registry-bound generation
+    from core.deployment_safety_gate import check_deployment
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    rt = tmp_path / "rt"
+    _ctx_file(rt, _live_ctx_dict())
+    pf = _position_file(rt, _live_snapshot())
+    exclude = ["PHASE1_FINAL_FREEZE.md"]
+    manifest = _manifest_with(repo, exclude, head)
+    monkeypatch.setenv("LRC_RELEASE_SHA", head)
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(rt))
+    c = check_deployment(
+        release_dir=str(repo), closure_files=CLOSURE,
+        runtime_dir=str(rt), pid_file=str(tmp_path / "nope.pid"),
+        position_state_path=str(pf), monitor_path=None,
+        session_generation=None, session_revoked=False,
+        margin_available=300_000.0,
+        manifest_paths=[str(manifest)], expected_sha=head,
+        manifest_exclude_paths=exclude, phase="post_startup")
+    assert not c.ok
+    assert "GUARD_SESSION_MISSING" in c.refusal_codes
+    # registry-bound token (32-hex) + not revoked => post_startup passes
+    c2 = check_deployment(
+        release_dir=str(repo), closure_files=CLOSURE,
+        runtime_dir=str(rt), pid_file=str(tmp_path / "nope.pid"),
+        position_state_path=str(pf), monitor_path=None,
+        session_generation="ab" * 16, session_revoked=False,
+        margin_available=300_000.0,
+        manifest_paths=[str(manifest)], expected_sha=head,
+        manifest_exclude_paths=exclude, phase="post_startup")
+    assert c2.ok, [(g.guard, g.reasons) for g in c2.results]

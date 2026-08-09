@@ -328,3 +328,56 @@ def test_valid_cert_startup_uses_transition_with_certificate(tmp_path, monkeypat
         "monitor must pass the trusted runtime context"
     assert m._execution_context.is_live_ready(), \
         "valid-cert path transitions to LIVE_READY"
+
+
+def test_startup_binds_registry_generation_to_ctx(tmp_path, monkeypatch):
+    """Post-startup session gate wiring: after login the registry holds the
+    registry-bound generation — the monitor binds it into the durable ctx
+    (session_id) so the post_startup gate can require it (standalone
+    account hash never passes)."""
+    monkeypatch.chdir(tmp_path)
+    _set_release_env(monkeypatch)
+    cfg = _minimal_live_cfg(tmp_path)
+    import core.live_route_certificate as lrc
+    from core.mode_transition import (ModeTransitionState, live_preflight_context,
+                                      with_effective_mode)
+    cert_fake = object()
+    runtime_fake = object()
+    calls = {}
+
+    def _fake_certify(*a, **k):
+        calls["cert"] = a[1] if len(a) > 1 else None
+        return (cert_fake, [])
+
+    def _fake_runtime(*a, **k):
+        calls["runtime"] = k.get("runtime") or a[-1]
+        return runtime_fake
+
+    def _fake_transition(ctx, cert, issuer, runtime=None):
+        calls["transition"] = True
+        return with_effective_mode(
+            ctx, ModeTransitionState.LIVE_READY.value,
+            live_order_allowed=True)
+
+    from strategies.futures.monitor import FuturesMonitor
+    monkeypatch.setattr(lrc, "certify_route", _fake_certify)
+    monkeypatch.setattr(lrc, "build_runtime_certification_context",
+                        _fake_runtime)
+    monkeypatch.setattr(lrc, "transition_with_certificate", _fake_transition)
+    # a registered session -> the registry holds a generation
+    api = lrc._FakeApi()
+    lrc.register_session(api)
+    gen = lrc.session_registry.generation(api)
+    m = FuturesMonitor.__new__(FuturesMonitor)
+    m.live_trading = True
+    m.api = api
+    m.config_path = str(cfg)
+    m._execution_context = with_effective_mode(
+        live_preflight_context(), ModeTransitionState.LIVE_READY.value,
+        live_order_allowed=True)
+    m._persist_execution_context = lambda: None
+    m._apply_reconcile_pending_gate = lambda: None
+    m._bind_session_generation()
+    assert m._execution_context.session_id == gen, \
+        f"ctx must carry the registry-bound generation: " \
+        f"{m._execution_context.session_id} != {gen}"
