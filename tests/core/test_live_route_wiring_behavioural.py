@@ -566,11 +566,11 @@ def test_adapter_update_order_quarantined_zero_calls():
 
 # ── exit failure-side (v3.1 #7) ─────────────────────────────────────────────
 
-def test_exit_does_not_silently_place_when_stop_cancel_fails():
-    # if the safety-stop cancellation fails, an ordinary EXIT must not
-    # silently place the exit unless reconciliation explicitly permits it
-    # and records a durable reason — currently the cancel error is
-    # swallowed inside _cancel_safety_stop and the exit still places
+def test_exit_does_not_silently_place_when_stop_cancel_fails(tmp_path, monkeypatch):
+    # if the safety-stop cancellation fails, an ordinary EXIT must NOT
+    # silently place the exit — structured blocked result + context
+    # quarantined + durable dashboard reason + ZERO place_order calls
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
     m = _monitor_stub(_ready_ctx(), safety_trade=SimpleNamespace(ts=1))
 
     def _boom_cancel(*a, **k):
@@ -578,10 +578,23 @@ def test_exit_does_not_silently_place_when_stop_cancel_fails():
         raise RuntimeError("cancel down")
 
     m.api.cancel_order = _boom_cancel
-    m._execute_trade("EXIT", 44300, "2026-08-08T10:00:00", 1, reason="TEST")
+    result = m._execute_trade("EXIT", 44300, "2026-08-08T10:00:00", 1,
+                              reason="TEST")
     placed = [c for c in m.client.calls if c[0] == "place_order"]
     assert not placed, \
         f"exit must not silently place after failed stop cancel: {m.client.calls}"
+    assert isinstance(result, dict) and result.get("blocked") is True, result
+    assert "SAFETY_STOP_CANCEL_FAILED" in str(result.get("reason", "")), result
+    assert not m._execution_context.is_live_ready(), \
+        "cancel failure must keep the context fail-closed (QUARANTINED)"
+    reasons = m._execution_context.audit_reasons
+    assert any("SAFETY_STOP_CANCEL_FAILED" in r for r in reasons), reasons
+    # durable: the dashboard-readable file carries the reason
+    from core.execution_context_state import read_execution_context
+    data = read_execution_context(runtime_dir=str(tmp_path))
+    assert data["effective_mode"] == "live_quarantined"
+    assert any("SAFETY_STOP_CANCEL_FAILED" in r
+               for r in data["audit_reasons"]), data
 
 
 # ── (4) dashboard persistence: atomic writer/reader round-trip ──────────────
