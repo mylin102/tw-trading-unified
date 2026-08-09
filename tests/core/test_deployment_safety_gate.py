@@ -161,18 +161,32 @@ def test_guard_runtime_paths_env_missing(tmp_path, monkeypatch):
     assert not r.ok and "GUARD_RUNTIME_ENV_MISSING" in r.reasons
 
 
-def test_guard_runtime_paths_secret_scan(tmp_path):
+def test_guard_runtime_paths_env_required_no_fallback(tmp_path, monkeypatch):
+    # production/deploy mode REQUIRES the explicit TRADING_RUNTIME_DIR env
+    # — never fall back to the repo; even an explicit runtime_dir param
+    # cannot bypass the env requirement (the deployed process reads the env)
+    from core.deployment_safety_gate import guard_runtime_paths
+    rt = tmp_path / "rt"
+    _ctx_file(rt, _ready_ctx_dict())
+    monkeypatch.delenv("TRADING_RUNTIME_DIR", raising=False)
+    r = guard_runtime_paths(str(rt))
+    assert not r.ok and "GUARD_RUNTIME_ENV_MISSING" in r.reasons
+
+
+def test_guard_runtime_paths_secret_scan(tmp_path, monkeypatch):
     from core.deployment_safety_gate import guard_runtime_paths
     rt = tmp_path / "rt"
     _ctx_file(rt, {"api_key": "S3CR3T", "effective_mode": "live_ready"})
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(rt))
     r = guard_runtime_paths(str(rt))
     assert not r.ok and "GUARD_RUNTIME_SECRETS" in r.reasons
 
 
-def test_guard_runtime_paths_not_writable(tmp_path):
+def test_guard_runtime_paths_not_writable(tmp_path, monkeypatch):
     from core.deployment_safety_gate import guard_runtime_paths
     rt = tmp_path / "rt"
     _ctx_file(rt, _ready_ctx_dict())
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(rt))
     (rt / "logs").chmod(0o500)
     try:
         r = guard_runtime_paths(str(rt))
@@ -241,6 +255,40 @@ def test_guard_flat_live_broker_ok(tmp_path):
     pf = _position_file(rt, _live_snapshot())
     r = guard_flat_no_pending(str(pf), _live_ctx_dict())
     assert r.ok, r.reasons
+
+
+def test_guard_flat_live_broker_positions_empty_list(tmp_path):
+    # the Codex contract: positions=[] (empty list) is flat evidence
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, _live_snapshot(positions=[]))
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
+    assert r.ok, r.reasons
+
+
+def test_guard_freeze_first_post_freeze_refused(tmp_path, monkeypatch):
+    # freeze-first rule: any change AFTER the freeze (dirty closure files,
+    # drifted HEAD, stale manifest) is refused — freeze last, never edit
+    # the frozen tree afterwards
+    from core.deployment_safety_gate import (guard_release_head,
+                                             guard_clean_tree,
+                                             guard_rollback_manifest)
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    monkeypatch.setenv("LRC_RELEASE_SHA", head)
+    # post-freeze edit: dirty a closure file
+    (repo / "config" / "futures.yaml").write_text("edited\n",
+                                                  encoding="utf-8")
+    assert "GUARD_TREE_DIRTY" in guard_clean_tree(str(repo), CLOSURE).reasons
+    # post-freeze drift: expected != current HEAD
+    monkeypatch.setenv("LRC_RELEASE_SHA", "9" * 40)
+    assert "GUARD_HEAD_MISMATCH" in \
+        guard_release_head(str(repo)).reasons
+    # post-freeze manifest: manifest pinned to a different SHA
+    m = tmp_path / "PHASE1_RC_CANDIDATE.md"
+    m.write_text(f"Frozen SHA {'a' * 40}", encoding="utf-8")
+    assert "GUARD_MANIFEST_STALE" in \
+        guard_rollback_manifest([str(m)], head).reasons
 
 
 def test_guard_flat_paper_holding_accepted_for_paper(tmp_path):
@@ -430,6 +478,35 @@ def test_guard_ctx_atomic_health_ok(tmp_path):
     assert r.ok, r.reasons
 
 
+def test_guard_ctx_bootstrap_missing_quarantine_ok(tmp_path, monkeypatch):
+    # first deployment: the ctx file does not exist yet. The gate may only
+    # bootstrap it as LIVE_QUARANTINED (atomic write capability) — it must
+    # never enable LIVE. A writable dir + atomic probe => pass (bootstrap).
+    from core.deployment_safety_gate import guard_ctx_atomic_health
+    rt = tmp_path / "rt"
+    rt.mkdir(parents=True, exist_ok=True)
+    (rt / "logs").mkdir()
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(rt))
+    r = guard_ctx_atomic_health(str(rt))
+    assert r.ok, r.reasons
+    assert "bootstrap" in r.detail and "QUARANTINED" in r.detail, r.detail
+
+
+def test_guard_ctx_bootstrap_missing_unwritable_refused(tmp_path, monkeypatch):
+    # missing ctx + unwritable dir => the atomic bootstrap cannot be
+    # guaranteed => refused (fail-closed; never LIVE)
+    from core.deployment_safety_gate import guard_ctx_atomic_health
+    rt = tmp_path / "rt"
+    rt.mkdir(parents=True, exist_ok=True)
+    rt.chmod(0o500)
+    try:
+        monkeypatch.setenv("TRADING_RUNTIME_DIR", str(rt))
+        r = guard_ctx_atomic_health(str(rt))
+        assert not r.ok and "GUARD_CTX_WRITE_FAIL" in r.reasons
+    finally:
+        rt.chmod(0o755)
+
+
 def test_guard_ctx_atomic_health_corrupt(tmp_path):
     from core.deployment_safety_gate import guard_ctx_atomic_health
     rt = tmp_path / "rt"
@@ -482,3 +559,25 @@ def test_aggregate_any_fail_blocks(tmp_path, monkeypatch):
     assert "GUARD_POSITION_NOT_FLAT" in c.refusal_codes
     assert "GUARD_MANIFEST_MISSING" in c.refusal_codes
     assert c.refusal_codes == tuple(sorted(c.refusal_codes))
+
+
+def test_aggregate_caller_supplied_required(tmp_path, monkeypatch):
+    # session/margin must come from read-only traceable sources — missing
+    # values are refused (never assumed)
+    from core.deployment_safety_gate import check_deployment
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    rt = tmp_path / "rt"
+    _ctx_file(rt, _live_ctx_dict())
+    pf = _position_file(rt, _live_snapshot())
+    monkeypatch.setenv("LRC_RELEASE_SHA", head)
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(rt))
+    c = check_deployment(
+        release_dir=str(repo), closure_files=CLOSURE,
+        runtime_dir=str(rt), pid_file=str(tmp_path / "nope.pid"),
+        position_state_path=str(pf), monitor_path=None,
+        session_generation=None, margin_available=None,
+        manifest_paths=[], expected_sha=head)
+    assert not c.ok
+    assert "GUARD_SESSION_MISSING" in c.refusal_codes
+    assert "GUARD_MARGIN_UNAVAILABLE" in c.refusal_codes
