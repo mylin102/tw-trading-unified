@@ -40,6 +40,7 @@ from squeeze_futures.data.data_storage import save_trade
 
 # GSD: Pluggable Strategy Integration
 from core.strategy_registry import StrategyRegistry
+from core.runtime_paths import runtime_logs, runtime_path
 from core.strategy_context import StrategyContext, PositionView, MarketData
 from core.signal import Signal
 from core.futures_bar_regime import classify_futures_bar_regime
@@ -976,7 +977,7 @@ class FuturesMonitor:
                 console.print(f" [yellow][FuturesMonitor] Parquet warm-up empty, trying CSV fallback...[/yellow] ")
                 from core.date_utils import get_session_date_str
                 import os as _os
-                log_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(__file__))), "logs", "market_data")
+                log_dir = runtime_logs("market_data")
                 date_str = get_session_date_str(datetime.now())
                 tag = "_PAPER" if not self.live_trading else "_LIVE"
                 csv_path = _os.path.join(log_dir, f"{self.ticker}_{date_str}{tag}_indicators.csv")
@@ -1235,7 +1236,7 @@ class FuturesMonitor:
         today = datetime.now()
         date_str = get_session_date_str(today)
         tag = "_DRY" if self.dry_run else ("_LIVE" if self.live_trading else "_PAPER")
-        csv_path = Path(f"logs/market_data/{self.ticker}_{date_str}{tag}_indicators.csv")
+        csv_path = Path(runtime_logs("market_data")) / f"{self.ticker}_{date_str}{tag}_indicators.csv"
         
         # [ARCHITECTURE FIX 2026-05-13] NEVER write indicator CSV if it doesn't exist yet.
         # The indicator CSV is an enriched output — only _save_bar should create it.
@@ -1847,7 +1848,7 @@ class FuturesMonitor:
         try:
             from core.quote_integrity import QuoteIntegrityGuard
             _csv = getattr(self, "csv_path", None)
-            _log_dir = os.path.dirname(str(_csv)) if _csv else os.path.join(os.getcwd(), "logs")
+            _log_dir = os.path.dirname(str(_csv)) if _csv else runtime_logs()
             self._quote_guard = QuoteIntegrityGuard(
                 near_code=getattr(self.contract, "code", "TMFH6"),
                 far_code=getattr(self.far_contract, "code", "TMFI6"),
@@ -2752,7 +2753,7 @@ class FuturesMonitor:
         """Append a completed far-month bar to shared CSV for dashboard consumption.
         Writes to: logs/market_data/{ticker}_far_{date_str}_{tag}.csv"""
         try:
-            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs", "market_data")
+            log_dir = runtime_logs("market_data")
             os.makedirs(log_dir, exist_ok=True)
             from core.date_utils import get_session_date_str
             date_str = get_session_date_str(datetime.now())
@@ -3073,15 +3074,15 @@ class FuturesMonitor:
             current_date = timestamp.strftime("%Y%m%d") if hasattr(timestamp, "strftime") else datetime.now().strftime("%Y%m%d")
             
             # Check futures trade records
-            futures_trade_file = Path(f"logs/market_data/TMF_{current_date}_trades.csv")
-            futures_audit_file = Path(f"logs/market_data/TMF_{current_date}_signals_audit.csv")
+            futures_trade_file = Path(runtime_logs("market_data")) / f"TMF_{current_date}_trades.csv"
+            futures_audit_file = Path(runtime_logs("market_data")) / f"TMF_{current_date}_signals_audit.csv"
             
             # Check stock trade records
-            stock_trade_dir = Path("logs/stocks")
+            stock_trade_dir = Path(runtime_logs("stocks"))
             stock_trade_files = list(stock_trade_dir.glob("*_trades.csv")) if stock_trade_dir.exists() else []
             
             # Check options trade records
-            options_trade_file = Path(f"logs/market_data/TXO_{current_date}_trades.csv")
+            options_trade_file = Path(runtime_logs("market_data")) / f"TXO_{current_date}_trades.csv"
             
             results = []
             
@@ -3149,7 +3150,7 @@ class FuturesMonitor:
             import shutil
             # datetime already imported at module top (datetime)
             
-            backup_dir = Path("logs/backups/trade_records")
+            backup_dir = Path(runtime_logs("backups", "trade_records"))
             backup_dir.mkdir(parents=True, exist_ok=True)
             
             # Check last backup time
@@ -3169,8 +3170,8 @@ class FuturesMonitor:
             if should_backup:
                 # Backup futures trade records
                 current_date = timestamp.strftime("%Y%m%d") if hasattr(timestamp, "strftime") else datetime.now().strftime("%Y%m%d")
-                futures_trade_file = Path(f"logs/market_data/TMF_{current_date}_trades.csv")
-                futures_audit_file = Path(f"logs/market_data/TMF_{current_date}_signals_audit.csv")
+                futures_trade_file = Path(runtime_logs("market_data")) / f"TMF_{current_date}_trades.csv"
+                futures_audit_file = Path(runtime_logs("market_data")) / f"TMF_{current_date}_signals_audit.csv"
                 
                 backup_files = []
                 
@@ -3384,7 +3385,7 @@ class FuturesMonitor:
 
             # 2026-07-08 Gemini CLI: Use session-date-aware orders_file path with test isolation to prevent test leakage
             import sys
-            orders_dir = "exports/trades"
+            orders_dir = runtime_path("exports", "trades")
             if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
                 current_cwd = Path.cwd().resolve()
                 if (current_cwd / "RULES.md").exists() and (current_cwd / "exports").exists():
@@ -4777,7 +4778,7 @@ class FuturesMonitor:
     def _append_mts_event(self, event_type: str, **kwargs):
         """Append an MTS-specific event to the shared event ledger."""
         try:
-            _dir = "logs"
+            _dir = runtime_logs()
             if not os.path.exists(_dir):
                 os.makedirs(_dir, exist_ok=True)
             # 2026-06-25 Gemini CLI / Hermes Agent: environmental isolation for MTS spread events
@@ -5856,7 +5857,7 @@ class FuturesMonitor:
             console.print(f"[red]Schema migration failed:[/red] {e}")
 
     def _save_bar(self, row, score, regime):
-        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs", "market_data")
+        log_dir = runtime_logs("market_data")
         os.makedirs(log_dir, exist_ok=True)
         
         from core.date_utils import get_session_date_str, get_session

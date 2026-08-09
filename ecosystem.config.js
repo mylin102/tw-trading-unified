@@ -82,6 +82,11 @@ const baseEnv = {
   NODE_ENV: 'production',
 };
 if (pythonBin) baseEnv.TRADING_PYTHON_BIN = pythonBin;
+// Deploy-time release identity: the release-identity gate reads the
+// literal full SHA from the process env — pass it through untouched.
+if (process.env.LRC_RELEASE_SHA) {
+  baseEnv.LRC_RELEASE_SHA = process.env.LRC_RELEASE_SHA;
+}
 
 const L = (app, file) => path.join(logDir, `pm2-${app}-${file}`);
 

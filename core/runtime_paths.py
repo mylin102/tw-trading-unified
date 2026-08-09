@@ -20,3 +20,14 @@ def runtime_root() -> str:
 
 def runtime_path(*parts) -> str:
     return os.path.join(runtime_root(), *parts)
+
+
+def runtime_logs(*parts) -> str:
+    """Runtime log namespace: <runtime_root>/logs[/...].
+
+    Both the trading engine and the dashboard resolve ALL log writes
+    (market_data CSVs, backups, stocks, anomalous quotes, MTS events)
+    through this — never into the release source tree. Production
+    always sets TRADING_RUNTIME_DIR (PM2 env); dev/paper falls back to
+    <repo>/logs explicitly."""
+    return os.path.join(runtime_root(), "logs", *parts)
