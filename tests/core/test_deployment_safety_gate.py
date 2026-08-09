@@ -9,6 +9,7 @@ reasons and refusal codes.
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,7 @@ CLOSURE = ["config/futures.yaml", "main.py"]
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
-def _git_repo(tmp_path, head=SHA):
+def _git_repo(tmp_path):
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     subprocess.run(["git", "-C", str(tmp_path), "config", "user.email",
                     "t@t"], check=True)
@@ -33,9 +34,37 @@ def _git_repo(tmp_path, head=SHA):
     subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "base"],
                    check=True)
-    subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
-                   check=True, stdout=subprocess.DEVNULL)
     return tmp_path
+
+
+def _head(repo) -> str:
+    out = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                         check=True, capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+def _monitor_text_gated():
+    return (
+        "def __init__(self):\n"
+        "    if self.live_trading:\n"
+        "        self._execution_context = live_preflight_context()\n"
+        "        _ = transition_with_certificate(None, None, None)\n"
+        "def _place_safety_stop(self):\n"
+        "    if not (self._execution_context and "
+        "self._execution_context.is_live_ready()):\n"
+        "        return {'blocked': True}\n"
+        "    self.api.place_order(None)\n"
+        "def _cancel_safety_stop(self):\n"
+        "    if not (self._execution_context and "
+        "self._execution_context.is_live_ready()):\n"
+        "        return {'blocked': True}\n"
+        "    self.api.cancel_order(None)\n"
+        "def _execute_trade(self):\n"
+        "    if not (self._execution_context and "
+        "self._execution_context.is_live_ready()):\n"
+        "        return {'blocked': True}\n"
+        "    self.client.place_order(None)\n"
+    )
 
 
 def _ctx_file(runtime_dir, data):
@@ -50,9 +79,10 @@ def _ctx_file(runtime_dir, data):
 def _ready_ctx_dict():
     return {"requested_mode": "live", "effective_mode": "live_ready",
             "live_order_allowed": True, "audit_reasons": [],
-            "revision": 3, "updated_at": 1, "account_id_hash": None,
-            "session_id": None, "process_start_id": None,
-            "config_hash": None, "state_namespace": "mts"}
+            "revision": 3, "updated_at": "2026-08-09T12:00:00Z",
+            "account_id_hash": None, "session_id": None,
+            "process_start_id": None, "config_hash": None,
+            "state_namespace": "mts"}
 
 
 # ── 1. release HEAD ────────────────────────────────────────────────────────
@@ -60,7 +90,7 @@ def _ready_ctx_dict():
 def test_guard_release_head_match(tmp_path, monkeypatch):
     from core.deployment_safety_gate import guard_release_head
     repo = _git_repo(tmp_path)
-    monkeypatch.setenv("LRC_RELEASE_SHA", SHA)
+    monkeypatch.setenv("LRC_RELEASE_SHA", _head(repo))
     r = guard_release_head(str(repo))
     assert r.ok, r.reasons
     assert r.reasons == ()
@@ -86,7 +116,7 @@ def test_guard_release_head_cwd_independent(tmp_path, monkeypatch):
     # git -C <release_dir> — works from ANY cwd (release dir, not cwd)
     from core.deployment_safety_gate import guard_release_head
     repo = _git_repo(tmp_path)
-    monkeypatch.setenv("LRC_RELEASE_SHA", SHA)
+    monkeypatch.setenv("LRC_RELEASE_SHA", _head(repo))
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
@@ -127,7 +157,7 @@ def test_guard_runtime_paths_ok(tmp_path, monkeypatch):
 def test_guard_runtime_paths_env_missing(tmp_path, monkeypatch):
     from core.deployment_safety_gate import guard_runtime_paths
     monkeypatch.delenv("TRADING_RUNTIME_DIR", raising=False)
-    r = guard_runtime_paths(str(tmp_path / "rt"))
+    r = guard_runtime_paths("")
     assert not r.ok and "GUARD_RUNTIME_ENV_MISSING" in r.reasons
 
 
@@ -171,7 +201,7 @@ def test_guard_single_process_stale_or_absent(tmp_path):
     assert r2.ok, r2.reasons
 
 
-# ── 5. flat / no pending order snapshot ────────────────────────────────────
+# ── 5. flat / no pending order snapshot (provenance-aware) ─────────────────
 
 def _position_file(runtime_dir, data):
     p = Path(runtime_dir) / "logs"
@@ -181,34 +211,122 @@ def _position_file(runtime_dir, data):
     return f
 
 
-def test_guard_flat_no_pending_ok(tmp_path):
+def _live_snapshot(**over):
+    data = {"source": "live_broker", "mode": "live",
+            "positions": 0, "open_orders": [],
+            "captured_at": time.time(),          # fresh (epoch seconds)
+            "hash": "a" * 40, "session_id": "sess-1"}
+    data.update(over)
+    return data
+
+
+def _live_ctx_dict():
+    d = _ready_ctx_dict()
+    d["session_id"] = "sess-1"
+    return d
+
+
+def _paper_ctx_dict():
+    return {"requested_mode": "paper", "effective_mode": "paper_active",
+            "live_order_allowed": False, "audit_reasons": [],
+            "revision": 1, "updated_at": "2026-08-09T12:00:00Z",
+            "account_id_hash": None, "session_id": None,
+            "process_start_id": None, "config_hash": None,
+            "state_namespace": "mts"}
+
+
+def test_guard_flat_live_broker_ok(tmp_path):
     from core.deployment_safety_gate import guard_flat_no_pending
     rt = tmp_path / "rt"
-    pf = _position_file(rt, {"position": 0, "pending_orders": []})
-    r = guard_flat_no_pending(str(pf), _ready_ctx_dict())
+    pf = _position_file(rt, _live_snapshot())
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
     assert r.ok, r.reasons
 
 
-def test_guard_flat_not_flat(tmp_path):
+def test_guard_flat_paper_holding_accepted_for_paper(tmp_path):
+    # paper HOLDING_SPREAD is accepted ONLY for a paper deployment —
+    # paper positions are allowed without claiming live readiness
     from core.deployment_safety_gate import guard_flat_no_pending
     rt = tmp_path / "rt"
-    pf = _position_file(rt, {"position": 2, "pending_orders": []})
-    r = guard_flat_no_pending(str(pf), _ready_ctx_dict())
+    pf = _position_file(rt, {"source": "paper", "mode": "paper",
+                             "has_position": True, "state": "HOLDING_SPREAD"})
+    r = guard_flat_no_pending(str(pf), _paper_ctx_dict())
+    assert r.ok, r.reasons
+    assert "paper" in r.detail
+
+
+def test_guard_flat_paper_never_satisfies_live(tmp_path):
+    # paper snapshot is NEVER live-flat evidence
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, {"source": "paper", "mode": "paper",
+                             "has_position": True, "state": "HOLDING_SPREAD"})
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
+    assert not r.ok and "GUARD_SNAPSHOT_PAPER_NOT_LIVE" in r.reasons
+
+
+def test_guard_flat_live_not_flat(tmp_path):
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, _live_snapshot(positions=2))
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
     assert not r.ok and "GUARD_POSITION_NOT_FLAT" in r.reasons
 
 
-def test_guard_flat_pending_orders(tmp_path):
+def test_guard_flat_live_pending_orders(tmp_path):
     from core.deployment_safety_gate import guard_flat_no_pending
     rt = tmp_path / "rt"
-    pf = _position_file(rt, {"position": 0, "pending_orders": ["o1"]})
-    r = guard_flat_no_pending(str(pf), _ready_ctx_dict())
+    pf = _position_file(rt, _live_snapshot(open_orders=["o1"]))
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
     assert not r.ok and "GUARD_PENDING_ORDERS" in r.reasons
 
 
 def test_guard_flat_snapshot_missing(tmp_path):
     from core.deployment_safety_gate import guard_flat_no_pending
-    r = guard_flat_no_pending(str(tmp_path / "nope.json"), _ready_ctx_dict())
+    r = guard_flat_no_pending(str(tmp_path / "nope.json"), _live_ctx_dict())
     assert not r.ok and "GUARD_SNAPSHOT_MISSING" in r.reasons
+
+
+def test_guard_flat_source_missing_ambiguous(tmp_path):
+    # no source/mode -> fail-closed (never assumed flat)
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, {"position": 0, "pending_orders": []})
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
+    assert not r.ok and "GUARD_SNAPSHOT_SOURCE_AMBIGUOUS" in r.reasons
+
+
+def test_guard_flat_source_unknown_ambiguous(tmp_path):
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, {"source": "backfill", "positions": 0})
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
+    assert not r.ok and "GUARD_SNAPSHOT_SOURCE_AMBIGUOUS" in r.reasons
+
+
+def test_guard_flat_stale_captured_at_refused(tmp_path):
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, _live_snapshot(captured_at=time.time() - 3600))
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
+    assert not r.ok and "GUARD_SNAPSHOT_STALE" in r.reasons
+
+
+def test_guard_flat_missing_hash_refused(tmp_path):
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, _live_snapshot(hash=None))
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
+    assert not r.ok and "GUARD_SNAPSHOT_HASH_MISSING" in r.reasons
+
+
+def test_guard_flat_intervening_live_session_refused(tmp_path):
+    # a live session that started after the snapshot = intervening session
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, _live_snapshot(session_id="sess-OLD"))
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())  # ctx sess-1
+    assert not r.ok and "GUARD_SESSION_INTERVENED" in r.reasons
 
 
 # ── 6. quarantine-first startup (AST) ──────────────────────────────────────
@@ -217,17 +335,7 @@ def test_guard_quarantine_first_startup(tmp_path):
     from core.deployment_safety_gate import guard_quarantine_first_startup
     repo = _git_repo(tmp_path)
     mon = repo / "monitor.py"
-    mon.write_text(
-        "def __init__(self):\n"
-        "    if self.live_trading:\n"
-        "        self._execution_context = live_preflight_context()\n"
-        "        _ = transition_with_certificate(None, None, None)\n"
-        "def _place_safety_stop(self):\n"
-        "    if not self._ctx_is_ready(): return {'blocked': True}\n"
-        "    self.api.place_order(None)\n"
-        "def _ctx_is_ready(self):\n"
-        "    return self._execution_context.is_live_ready()\n",
-        encoding="utf-8")
+    mon.write_text(_monitor_text_gated(), encoding="utf-8")
     r = guard_quarantine_first_startup(str(mon))
     assert r.ok, r.reasons
 
@@ -336,17 +444,20 @@ def test_guard_ctx_atomic_health_corrupt(tmp_path):
 def test_aggregate_all_pass_readies(tmp_path, monkeypatch):
     from core.deployment_safety_gate import check_deployment
     repo = _git_repo(tmp_path)
+    head = _head(repo)
     rt = tmp_path / "rt"
-    _ctx_file(rt, _ready_ctx_dict())
-    pf = _position_file(rt, {"position": 0, "pending_orders": []})
-    monkeypatch.setenv("LRC_RELEASE_SHA", SHA)
+    _ctx_file(rt, _live_ctx_dict())
+    pf = _position_file(rt, _live_snapshot())
+    manifest = tmp_path / "PHASE1_RC_CANDIDATE.md"
+    manifest.write_text(f"Frozen SHA {head}", encoding="utf-8")
+    monkeypatch.setenv("LRC_RELEASE_SHA", head)
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(rt))
     c = check_deployment(
         release_dir=str(repo), closure_files=CLOSURE,
         runtime_dir=str(rt), pid_file=str(tmp_path / "nope.pid"),
         position_state_path=str(pf), monitor_path=None,
         session_generation=1, margin_available=300_000.0,
-        manifest_paths=[], expected_sha=SHA)
+        manifest_paths=[str(manifest)], expected_sha=head)
     assert c.ok, [(g.guard, g.reasons) for g in c.results]
     assert c.refusal_codes == ()
 
@@ -355,17 +466,18 @@ def test_aggregate_any_fail_blocks(tmp_path, monkeypatch):
     # one failing guard -> NOT_READY with the refusal code surfaced
     from core.deployment_safety_gate import check_deployment
     repo = _git_repo(tmp_path)
+    head = _head(repo)
     rt = tmp_path / "rt"
-    _ctx_file(rt, _ready_ctx_dict())
-    pf = _position_file(rt, {"position": 2, "pending_orders": []})
-    monkeypatch.setenv("LRC_RELEASE_SHA", SHA)
+    _ctx_file(rt, _live_ctx_dict())
+    pf = _position_file(rt, _live_snapshot(positions=2))
+    monkeypatch.setenv("LRC_RELEASE_SHA", head)
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(rt))
     c = check_deployment(
         release_dir=str(repo), closure_files=CLOSURE,
         runtime_dir=str(rt), pid_file=str(tmp_path / "nope.pid"),
         position_state_path=str(pf), monitor_path=None,
         session_generation=1, margin_available=300_000.0,
-        manifest_paths=[], expected_sha=SHA)
+        manifest_paths=[], expected_sha=head)
     assert not c.ok
     assert "GUARD_POSITION_NOT_FLAT" in c.refusal_codes
     assert "GUARD_MANIFEST_MISSING" in c.refusal_codes
