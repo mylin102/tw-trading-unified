@@ -10,6 +10,9 @@
 （= `git ls-tree -r <commit> | grep -v manifest docs | sha256`；manifest-only
 commits 不影響此 identity — 解除 freeze/manifest SHA cycle；任何 code
 變更 → hash 變 → gate GUARD_MANIFEST_STALE 拒絕）
+```
+frozen_tree_hash: ed2f316240a6914dcbd6f5ab3cb0bd7805dd189397077a8dcbe4b14dfae19464
+```
 **LRC_RELEASE_SHA（部署時）**: = deploy-time `git -C <release_dir>
 rev-parse HEAD` 之 literal（= 此 freeze-record commit 的 SHA；deployed
 tree 的 HEAD — gate 以 GUARD_HEAD_MISMATCH 強制一致）
