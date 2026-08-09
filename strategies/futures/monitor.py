@@ -553,6 +553,10 @@ class FuturesMonitor:
                                 self._execution_context, _cert, _issuer,
                                 runtime=_runtime)
                             self._persist_execution_context()
+                            # [orphan reconciliation] a pending
+                            # SAFETY_STOP_RECONCILE intent keeps QUARANTINED
+                            # until the broker state reconciles
+                            self._apply_reconcile_pending_gate()
                             if self._execution_context.is_live_ready():
                                 print("[MTS_EXEC_CTX] LIVE_READY — "
                                       "certificate-required transition complete; "
@@ -2757,6 +2761,62 @@ class FuturesMonitor:
                       f"(SESSION_LOGOUT; registry gen="
                       f"{'valid' if _gen else 'revoked'})[/dim]")
 
+    def _record_safety_stop_reconcile(self):
+        """[orphan reconciliation] when quarantine blocks the safety-stop
+        cancel / emergency and an exchange-side safety stop is outstanding,
+        record a DURABLE SAFETY_STOP_RECONCILE intent via the canonical
+        core/exit_intent protocol (no parallel ledger, no bypass). The
+        pending intent survives restart and keeps QUARANTINED until the
+        broker state reconciles."""
+        _trade = getattr(self, "_safety_stop_trade", None)
+        if _trade is None:
+            return
+        try:
+            from core.exit_intent import IntentLog as _MTSIntentLog
+            _ilog = _MTSIntentLog(_mts_intent_log_dir())
+            _trade_id = str(getattr(_trade, "id", None) or "SAFETY_STOP")
+            for _iid in _ilog.list_active():
+                _row = _ilog.get(_iid)
+                if _row.get("reason") == "SAFETY_STOP_RECONCILE" and \
+                        _row.get("trade_id") == _trade_id:
+                    return  # already recorded
+            _iid = _ilog.create(_trade_id, "SAFETY_STOP_RECONCILE")
+            console.print(f"[yellow]🛡️ SAFETY_STOP_RECONCILE intent "
+                          f"recorded: {_iid} (trade {_trade_id}) — "
+                          f"QUARANTINED until broker state reconciles"
+                          f"[/yellow]")
+        except Exception as _exc:
+            console.print(f"[dim]⚠️ reconcile intent record failed: "
+                          f"{_exc}[/dim]")
+
+    def _pending_safety_stop_reconcile(self) -> bool:
+        """True if a durable SAFETY_STOP_RECONCILE intent is still active
+        (restart read — the canonical exit_intent log)."""
+        try:
+            from core.exit_intent import IntentLog as _MTSIntentLog
+            _ilog = _MTSIntentLog(_mts_intent_log_dir())
+            return any(
+                _ilog.get(i).get("reason") == "SAFETY_STOP_RECONCILE"
+                for i in _ilog.list_active())
+        except Exception:
+            return False
+
+    def _apply_reconcile_pending_gate(self) -> None:
+        """[orphan reconciliation] a pending SAFETY_STOP_RECONCILE intent
+        keeps the context QUARANTINED (SAFETY_STOP_RECONCILE_PENDING,
+        persisted) until the broker state reconciles — LIVE is never
+        retained across a pending reconciliation."""
+        _ctx = getattr(self, "_execution_context", None)
+        if _ctx is None or not self._pending_safety_stop_reconcile():
+            return
+        from core.mode_transition import ModeTransitionState, with_effective_mode
+        self._execution_context = with_effective_mode(
+            _ctx, ModeTransitionState.LIVE_QUARANTINED.value,
+            live_order_allowed=False,
+            audit_reasons=("SAFETY_STOP_RECONCILE_PENDING",) + tuple(
+                getattr(_ctx, "audit_reasons", ()) or ()))
+        self._persist_execution_context()
+
     def _place_safety_stop(self, entry_price, direction, lots, stop_loss_pts):
         """Place a far-limit order at exchange as safety stop for disconnect protection."""
         if not self.live_trading or self.dry_run or not self.contract or not self.api:
@@ -2807,6 +2867,7 @@ class FuturesMonitor:
         # reason (audit); only LIVE_READY reaches the broker.
         _ctx = getattr(self, "_execution_context", None)
         if _ctx is not None and not _ctx.is_live_ready():
+            self._record_safety_stop_reconcile()   # [orphan] never silent
             return {"blocked": True, "reason": "LIVE_QUARANTINED",
                     "audit_reasons": tuple(
                         getattr(_ctx, "audit_reasons", ()) or ())}
@@ -7692,6 +7753,7 @@ class FuturesMonitor:
         if not _paper and (_ctx is None or not _ctx.is_live_ready()):
             _reason = ("EMERGENCY_BLOCKED_NO_LIVE_CERTIFICATION"
                        if _ctx is None else "EMERGENCY_BLOCKED_QUARANTINED")
+            self._record_safety_stop_reconcile()   # [orphan] never silent
             if _ctx is not None:
                 from core.mode_transition import (ModeTransitionState,
                                                   with_effective_mode)
