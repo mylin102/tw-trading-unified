@@ -442,7 +442,7 @@ def test_guard_flat_stale_captured_at_refused(tmp_path):
 def test_guard_flat_missing_hash_refused(tmp_path):
     from core.deployment_safety_gate import guard_flat_no_pending
     rt = tmp_path / "rt"
-    pf = _position_file(rt, _live_snapshot(hash=None))
+    pf = _position_file(rt, _live_snapshot(canonical_input_hash=None))
     r = guard_flat_no_pending(str(pf), _live_ctx_dict())
     assert not r.ok and "GUARD_SNAPSHOT_HASH_MISSING" in r.reasons
 
