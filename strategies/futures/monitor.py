@@ -572,6 +572,13 @@ class FuturesMonitor:
                                       f"reasons={_cert_failures or ['NO_CERTIFICATE']} "
                                       f"— live orders blocked")
                             else:
+                                # [post_startup session gate; D1] bind the
+                                # registry-bound generation into the
+                                # QUARANTINED ctx BEFORE certification —
+                                # the post_startup gate validates
+                                # generation/session/snapshot consistency
+                                # before ANY LIVE_READY transition
+                                self._bind_session_generation()
                                 _runtime = build_runtime_certification_context(
                                     _api, self.config_path,
                                     {"process_state": {"process_start_id":
@@ -584,9 +591,6 @@ class FuturesMonitor:
                                 # SAFETY_STOP_RECONCILE intent keeps QUARANTINED
                                 # until the broker state reconciles
                                 self._apply_reconcile_pending_gate()
-                                # [post_startup session gate] bind the
-                                # registry-bound generation into the ctx
-                                self._bind_session_generation()
                                 if self._execution_context.is_live_ready():
                                     print("[MTS_EXEC_CTX] LIVE_READY — "
                                           "certificate-required transition complete; "
@@ -2848,15 +2852,19 @@ class FuturesMonitor:
         self._persist_execution_context()
 
     def _bind_session_generation(self) -> None:
-        """[post_startup session gate] after login the session_registry
-        holds the registry-bound generation — bind it into the durable ctx
-        (session_id) so the post_startup gate can require it. The
-        standalone account-hash preflight identity NEVER satisfies this.
-        No generation / not LIVE_READY -> no binding (fail-closed)."""
+        """[post_startup session gate; D1] the session_registry creates the
+        registry-bound generation at login — bind it into the (QUARANTINED)
+        ctx.session_id BEFORE certification/post_startup gate. This avoids
+        the circular LIVE_READY -> session -> gate -> LIVE_READY loop: the
+        gate validates generation/session/snapshot consistency on the
+        quarantined ctx, and only a passing post_startup gate + cert flow
+        may transition to LIVE_READY. Standalone account-hash identity
+        NEVER satisfies the gate. No generation -> no binding (fail-closed).
+        """
         try:
             _api = getattr(self, "api", None)
             _ctx = getattr(self, "_execution_context", None)
-            if _api is None or _ctx is None or not _ctx.is_live_ready():
+            if _api is None or _ctx is None:
                 return
             from core.live_route_certificate import session_registry
             _gen = session_registry.generation(_api)

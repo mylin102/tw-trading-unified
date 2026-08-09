@@ -44,6 +44,11 @@ def main() -> int:
     ap.add_argument("--monitor", default=None)
     ap.add_argument("--session-generation", type=int, default=None)
     ap.add_argument("--margin-available", type=float, default=None)
+    ap.add_argument("--margin-evidence", default=None,
+                    help="path to the read-only preflight JSON carrying "
+                         "account_identity_hash/scope/captured_at/"
+                         "canonical_input_hash (bare --margin-available "
+                         "is insufficient)")
     ap.add_argument("--expected-sha", default=None)
     ap.add_argument("--manifest", action="append", default=[])
     ap.add_argument("--exclude-path", action="append", default=[])
@@ -53,6 +58,15 @@ def main() -> int:
     args = ap.parse_args()
 
     from core.deployment_safety_gate import check_deployment
+
+    margin_evidence = None
+    if args.margin_evidence:
+        import json as _json
+        with open(args.margin_evidence, encoding="utf-8") as _fh:
+            _ev = _json.load(_fh)
+        margin_evidence = {k: _ev.get(k) for k in (
+            "account_identity_hash", "scope", "captured_at",
+            "canonical_input_hash")}
 
     manifests = args.manifest or [
         str(_REPO_ROOT / "PHASE1_RC_CANDIDATE.md"),
@@ -75,6 +89,7 @@ def main() -> int:
         or str(_REPO_ROOT / "strategies/futures/monitor.py"),
         session_generation=args.session_generation,
         margin_available=args.margin_available,
+        margin_evidence=margin_evidence,
         manifest_paths=manifests,
         manifest_exclude_paths=exclude,
         expected_sha=args.expected_sha,
@@ -94,8 +109,21 @@ def main() -> int:
             mark = "PASS" if g.ok else "FAIL"
             print(f"[{mark}] {g.guard}: {g.reasons or 'ok'}"
                   f"{'  ' + g.detail if g.detail else ''}")
-        print("READY" if check.ok else
-              f"NOT_READY refusal_codes={list(check.refusal_codes)}")
+        if check.ok:
+            # D3: explicit phase-specific verdict — pre_deploy READY is
+            # READY_FOR_STARTUP (never to be confused with a deploy READY)
+            if args.phase == "pre_deploy":
+                print("READY_FOR_STARTUP")
+            else:
+                print("READY")
+        else:
+            print(f"NOT_READY refusal_codes={list(check.refusal_codes)}")
+        # D6: stock-account rows stay warning/evidence (never block MTS
+        # futures flat unless global-risk policy)
+        flat = next((g for g in check.results if g.guard == "flat_snapshot"),
+                    None)
+        if flat is not None and "stock row" in flat.detail:
+            print(f"WARNING {flat.detail}")
     return 0 if check.ok else 1
 
 

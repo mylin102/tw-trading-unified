@@ -411,16 +411,19 @@ def guard_margin(margin_available: Optional[float],
     if value < floor:
         return _fail("margin", ["GUARD_MARGIN_INSUFFICIENT"],
                      f"{value} < {floor}")
-    # margin acceptance requires traceable evidence: account identity,
-    # scope (futopt), captured_at and the canonical input hash (the
-    # read-only preflight packet provides all four)
-    if margin_evidence is not None:
-        missing = [k for k in ("account_identity_hash", "scope",
-                               "captured_at", "canonical_input_hash")
-                   if not margin_evidence.get(k)]
-        if missing:
-            return _fail("margin", ["GUARD_MARGIN_EVIDENCE_MISSING"],
-                         f"missing {','.join(missing)}")
+    # D2: bare margin_available is NOT enough to pass — traceable evidence
+    # (account identity, scope, captured_at, canonical input hash) is
+    # REQUIRED (the read-only preflight packet provides all four)
+    if margin_evidence is None:
+        return _fail("margin", ["GUARD_MARGIN_EVIDENCE_MISSING"],
+                     "margin evidence required (account/scope/captured_at/"
+                     "hash) — bare value insufficient")
+    missing = [k for k in ("account_identity_hash", "scope",
+                           "captured_at", "canonical_input_hash")
+               if not margin_evidence.get(k)]
+    if missing:
+        return _fail("margin", ["GUARD_MARGIN_EVIDENCE_MISSING"],
+                     f"missing {','.join(missing)}")
     return _pass("margin", str(value))
 
 
