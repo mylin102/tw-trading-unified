@@ -47,6 +47,8 @@ def main() -> int:
     ap.add_argument("--expected-sha", default=None)
     ap.add_argument("--manifest", action="append", default=[])
     ap.add_argument("--exclude-path", action="append", default=[])
+    ap.add_argument("--phase", choices=["pre_deploy", "post_startup"],
+                    default="pre_deploy")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -76,6 +78,7 @@ def main() -> int:
         manifest_paths=manifests,
         manifest_exclude_paths=exclude,
         expected_sha=args.expected_sha,
+        phase=args.phase,
     )
     if args.json:
         print(json.dumps({

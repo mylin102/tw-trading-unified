@@ -584,6 +584,9 @@ class FuturesMonitor:
                                 # SAFETY_STOP_RECONCILE intent keeps QUARANTINED
                                 # until the broker state reconciles
                                 self._apply_reconcile_pending_gate()
+                                # [post_startup session gate] bind the
+                                # registry-bound generation into the ctx
+                                self._bind_session_generation()
                                 if self._execution_context.is_live_ready():
                                     print("[MTS_EXEC_CTX] LIVE_READY — "
                                           "certificate-required transition complete; "
@@ -2843,6 +2846,29 @@ class FuturesMonitor:
             audit_reasons=("SAFETY_STOP_RECONCILE_PENDING",) + tuple(
                 getattr(_ctx, "audit_reasons", ()) or ()))
         self._persist_execution_context()
+
+    def _bind_session_generation(self) -> None:
+        """[post_startup session gate] after login the session_registry
+        holds the registry-bound generation — bind it into the durable ctx
+        (session_id) so the post_startup gate can require it. The
+        standalone account-hash preflight identity NEVER satisfies this.
+        No generation / not LIVE_READY -> no binding (fail-closed)."""
+        try:
+            _api = getattr(self, "api", None)
+            _ctx = getattr(self, "_execution_context", None)
+            if _api is None or _ctx is None or not _ctx.is_live_ready():
+                return
+            from core.live_route_certificate import session_registry
+            _gen = session_registry.generation(_api)
+            if not _gen:
+                return
+            import dataclasses
+            if getattr(_ctx, "session_id", None) != _gen:
+                self._execution_context = dataclasses.replace(
+                    _ctx, session_id=str(_gen))
+                self._persist_execution_context()
+        except Exception:
+            return
 
     def _place_safety_stop(self, entry_price, direction, lots, stop_loss_pts):
         """Place a far-limit order at exchange as safety stop for disconnect protection."""

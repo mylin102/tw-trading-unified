@@ -366,17 +366,28 @@ def guard_quarantine_first_startup(monitor_path: Optional[str]) -> GuardResult:
     return _pass("quarantine_first_startup", "3/3 gates + cert wiring")
 
 
-# ── 7. session/cert generation ─────────────────────────────────────────────
+# ── 7. session/cert generation (registry-bound; split gate) ────────────────
+
+_REGISTRY_GEN_RE = re.compile(r"^[0-9a-f]{32}$")   # token_hex(16) format
+
 
 def guard_session_generation(generation: Optional[int],
                              revoked: bool) -> GuardResult:
-    # B) a live session generation is REGISTRY-BOUND: an integer generation
-    # counter. Standalone preflight identity (sha256(account_id) string) is
-    # NOT a session generation — missing/non-int => GUARD_SESSION_MISSING.
-    if generation is None or isinstance(generation, bool) \
-            or not isinstance(generation, int):
+    # The live session generation is REGISTRY-BOUND: the session_registry
+    # produces token_hex(16) (32-hex str) generations. Standalone preflight
+    # identity (sha256(account_id) 16-hex) NEVER passes. Assessed only in
+    # the post_startup phase (pre_deploy skips it).
+    if generation is None or isinstance(generation, bool):
         return _fail("session_generation", ["GUARD_SESSION_MISSING"],
-                     f"registry-bound int generation required, got "
+                     "registry-bound generation required")
+    if isinstance(generation, str):
+        if not _REGISTRY_GEN_RE.match(generation):
+            return _fail("session_generation", ["GUARD_SESSION_MISSING"],
+                         "standalone/foreign identity rejected (need "
+                         "registry-bound 32-hex generation)")
+    elif not isinstance(generation, int):
+        return _fail("session_generation", ["GUARD_SESSION_MISSING"],
+                     f"registry-bound generation required, got "
                      f"{type(generation).__name__}")
     if revoked:
         return _fail("session_generation", ["GUARD_SESSION_REVOKED"],
@@ -543,11 +554,20 @@ def check_deployment(
     session_generation: Optional[int] = None,
     session_revoked: bool = False,
     margin_available: Optional[float] = None,
+    margin_evidence: Optional[dict] = None,
     manifest_paths: Sequence[str] = (),
     manifest_exclude_paths: Sequence[str] = (),
     expected_sha: Optional[str] = None,
+    phase: str = "pre_deploy",
 ) -> DeploymentCheck:
     """Run all guards. Fail-closed: ANY guard failure -> NOT_READY.
+
+    phase="pre_deploy" (default): the static gate — session_generation is
+    NOT assessed (the registry-bound generation only exists after the
+    runtime logs in); all other guards run.
+    phase="post_startup": the live gate — requires the registry-bound
+    session generation (32-hex token / int), not revoked, and the
+    snapshot session consistency (GUARD_SESSION_INTERVENED).
 
     Never deploys / restarts / unlocks LIVE — the caller decides what to
     do with the structured result.
@@ -556,6 +576,14 @@ def check_deployment(
         else os.environ.get("TRADING_RUNTIME_DIR", "")
     expected_sha = expected_sha if expected_sha is not None \
         else os.environ.get("LRC_RELEASE_SHA", "")
+    if phase == "post_startup":
+        session_result = guard_session_generation(session_generation,
+                                                  session_revoked)
+    else:
+        session_result = GuardResult(
+            guard="session_generation", ok=True,
+            detail="not assessed in pre_deploy phase "
+                   "(post_startup gate requires registry-bound generation)")
     results = (
         guard_release_head(release_dir, expected_sha),
         guard_clean_tree(release_dir, closure_files),
@@ -564,8 +592,8 @@ def check_deployment(
         guard_flat_no_pending(position_state_path,
                               read_ctx_snapshot(runtime_dir)),
         guard_quarantine_first_startup(monitor_path),
-        guard_session_generation(session_generation, session_revoked),
-        guard_margin(margin_available),
+        session_result,
+        guard_margin(margin_available, margin_evidence=margin_evidence),
         guard_rollback_manifest(release_dir, manifest_paths, expected_sha,
                                 exclude_paths=manifest_exclude_paths),
         guard_ctx_atomic_health(runtime_dir),
