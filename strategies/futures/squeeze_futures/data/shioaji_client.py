@@ -53,22 +53,20 @@ class ShioajiClient:
 
     def _gate_or_raise(self, method: str):
         """[Step 8] execution-context gate: non-LIVE_READY or ctx=None
-        makes ZERO broker calls and raises a structured AdapterOrderError
-        (typed reason); LIVE_READY permits the intended call. Fail-closed
-        by default (None context = no live certification)."""
+        makes ZERO broker calls and raises the canonical structured gate
+        exception LiveOrderBlocked (typed reason); LIVE_READY permits the
+        intended call. Fail-closed by default (None context = no live
+        certification)."""
+        from core.mode_transition import LiveOrderBlocked
         ctx = getattr(self, "_execution_context", None)
         if ctx is None:
-            raise AdapterOrderError(
-                code="ADAPTER_ORDER_BLOCKED_NO_LIVE_CERTIFICATION",
-                context={"method": method,
-                         "reason": "NO_LIVE_CERTIFICATION"})
+            raise LiveOrderBlocked(
+                f"{method}: NO_LIVE_CERTIFICATION")
         if not ctx.is_live_ready():
-            raise AdapterOrderError(
-                code="ADAPTER_ORDER_BLOCKED_QUARANTINED",
-                context={"method": method,
-                         "reason": "LIVE_QUARANTINED",
-                         "audit_reasons": list(
-                             getattr(ctx, "audit_reasons", ()) or ())})
+            raise LiveOrderBlocked(
+                f"{method}: LIVE_QUARANTINED "
+                f"audit_reasons="
+                f"{list(getattr(ctx, 'audit_reasons', ()) or ())}")
 
     def login(self, retries: int = 3, retry_delay: int = 10):
         api_key = os.getenv("SHIOAJI_API_KEY")
