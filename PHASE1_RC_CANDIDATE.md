@@ -1,11 +1,16 @@
-# Phase 1 Release Candidate — Candidate Manifest (FREEZE)
+# Phase 1 Release Candidate — Candidate Manifest (FREEZE → RE-FREEZE)
 
-**日期**: 2026-08-09
+**日期**: 2026-08-09（re-freeze: 2026-08-09 Phase-2 recovery）
 **狀態**: FROZEN — 未 deploy / 未 restart / 未讀 broker / 未跑 replay
-**Frozen candidate SHA**: `39eb943a63cea4ba7e3d2239829329c06ca740e9`
+**Frozen candidate SHA (RE-FREEZE)**: `ba9ccaf4ebd94fc92ff81ddc0e4b15c0b377b097`
+**（原 freeze）**: `39eb943a63cea4ba7e3d2239829329c06ca740e9`
+**Re-freeze 理由**: Phase-2 驗證發現原 freeze HEAD 已移（Phase-1b test-only
+fix commit ba9ccaf4）→ 依 recovery 指令將 candidate 重新釘在含 test fix 的
+code HEAD。Code HEAD = ba9ccaf4；其上僅有 docs-only commit
+（`e6369072` Phase-2 manifest、`268dcbc5` 原 manifest）— 非 code。
 **Closure base**: `fca6b70a3add245624cfdc93fbd13a4f8cf2d18c`（replay engine
 commit — live wiring 前）
-**Closure commits**: 35（`git rev-list --count fca6b70a..HEAD`）
+**Closure commits**: 37（`git rev-list --count fca6b70a..ba9ccaf4`）
 
 ## 1) Closure commit 清單（Steps 1-9 + corrective + closures）
 
@@ -26,8 +31,9 @@ commit — live wiring 前）
 | Orphan reconciliation | SAFETY_STOP_RECONCILE intent | 6d0cc304 | 98f05287 |
 | Release identity | core/release_identity + startup wiring | f0f8a95a/f1064110 | 94bd3c47 |
 | Margin floor | config key + trusted source 驗證 | b6f82c5e | 39eb943a |
+| Phase-1b fix | P0-adapter fixtures LIVE_READY ctx + startup LRC_RELEASE_SHA env | — | ba9ccaf4 |
 
-## 2) Changed-file scope（closure range）
+## 2) Changed-file scope（closure range, fca6b70a..ba9ccaf4）
 
 ```
 config/futures.yaml                                    # margin key (+100000.0)
@@ -82,8 +88,17 @@ tests/core/test_live_route_wiring_behavioural.py
 
 ## 6) Limitations（frozen）
 
-1. **Full tests/core 未完成** — 43min 無結果（疑 hung），需分檔定位後補跑
-2. 未 deploy（依 freeze 指示）；PM2 上仍是先前 release（Release B 4adda0be）
-3. dashboard 端讀取路徑（streamlit app）未驗證 — reader 模組契約已驗
-4. LRC_RELEASE_SHA 需 PM2 env 注入才生效（deploy 時配置, 未動）
-5. sibling agent 同時在跑自身 tests/ 流程（38980）— 工作樹可能再變動
+1. **Deployment-only blocker（必須解決才可 deploy）**: PM2 必須在
+   ecosystem.config.js（app: trading-system）env 注入 **literal
+   `LRC_RELEASE_SHA` = deployed release HEAD** — 目前 ecosystem.config.js
+   0 處注入 → LIVE startup 會 fail-closed（RELEASE_IDENTITY_ENV_MISSING）。
+   **本次 re-freeze 未修改 ecosystem.config.js / PM2 env**（依指令）。
+2. Full tests/core 逐檔 matrix：49 PASS / 2 FAIL（out-of-scope 既有 RED:
+   test_background_snapshot_writer、test_global_callback_adapter）/ 1 TIMEOUT
+   （out-of-scope 既有: test_market_data_runtime EXIT=124 — summary 後
+   non-daemon thread hang，需獨立 bounded fix）
+3. 未 deploy（依 freeze 指示）；PM2 上仍是先前 release（Release B 4adda0be）
+4. dashboard 端 streamlit 讀取路徑未驗證
+5. working tree 另有非 closure 的 sibling dirty（446 entries —
+   data/telemetry、ledger 等）— 未 commit、未改動
+6. sibling agent 同時在跑自身 tests/ 流程 — 工作樹可能再變動
