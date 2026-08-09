@@ -155,12 +155,13 @@ def main() -> int:
     if args.verify:
         cur = _exclude_self_tree_hash(repo, "HEAD", exclude)
         if cur == recorded:
-            print(f"VERIFY_ONLY OK HEAD={head} frozen_tree_hash={recorded}")
+            print(f"phase=VERIFY_ONLY OK HEAD={head} "
+                  f"frozen_tree_hash={recorded}")
             print("VERIFY_ONLY: this is NOT a deploy-ready gate — run "
                   "check_deployment.py for the real pre_deploy decision "
                   "(clean tracked+untracked policy applies there)")
             return 0
-        print(f"VERIFY_ONLY FAIL recorded={recorded} != HEAD tree={cur} "
+        print(f"phase=VERIFY_ONLY FAIL recorded={recorded} != HEAD tree={cur} "
               f"(stale or tree moved)", file=sys.stderr)
         return 7
 

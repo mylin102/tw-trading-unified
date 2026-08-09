@@ -208,13 +208,17 @@ SNAPSHOT_MAX_AGE_S = 600.0          # live-broker snapshot freshness window
 
 
 def _parse_ts(value) -> Optional[float]:
+    """Parse a timestamp (int/float/str epoch SECONDS, ISO-8601, or the
+    canonical epoch-MS integer) into epoch SECONDS. None on failure."""
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        v = float(value)
+        return v / 1000.0 if v >= 1e12 else v
     if isinstance(value, str):
         try:
-            return float(value)
+            v = float(value)
+            return v / 1000.0 if v >= 1e12 else v
         except ValueError:
             pass
         try:
@@ -426,12 +430,10 @@ def guard_margin(margin_available: Optional[float],
                      f"missing {','.join(missing)}")
     # the margin guard validates its OWN evidence freshness — it must not
     # rely on the flat guard: captured_at must be a finite epoch within
-    # SNAPSHOT_MAX_AGE_S
-    try:
-        _ts = float(margin_evidence.get("captured_at"))
-        if not math.isfinite(_ts) or _ts <= 0:
-            raise ValueError
-    except (TypeError, ValueError):
+    # SNAPSHOT_MAX_AGE_S (canonical epoch-ms integers normalize via
+    # _parse_ts)
+    _ts = _parse_ts(margin_evidence.get("captured_at"))
+    if _ts is None or not math.isfinite(_ts) or _ts <= 0:
         return _fail("margin", ["GUARD_MARGIN_EVIDENCE_STALE"],
                      "captured_at must be a finite epoch")
     if time.time() - _ts > SNAPSHOT_MAX_AGE_S:
@@ -533,20 +535,33 @@ def guard_capture_consistency(position_state_path: Optional[str],
         return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
                      "snapshot unreadable")
     snap_hash = data.get("hash") or data.get("canonical_input_hash")
-    snap_ts = _parse_ts(data.get("captured_at"))
+    snap_raw = data.get("captured_at")
     snap_acct = data.get("account_identity_hash")
     ev_hash = margin_evidence.get("canonical_input_hash")
-    ev_ts = _parse_ts(margin_evidence.get("captured_at"))
+    ev_raw = margin_evidence.get("captured_at")
     ev_acct = margin_evidence.get("account_identity_hash")
     if not snap_hash or not ev_hash or snap_hash != ev_hash:
         return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
                      "canonical input hash differs between snapshot and "
                      "margin evidence")
-    if snap_ts is None or ev_ts is None or snap_ts != ev_ts:
+    # canonical epoch-ms INTEGER in BOTH files — the same preflight
+    # capture provides one value; separate float time.time() artifacts
+    # are rejected (no per-file timestamps)
+    if isinstance(snap_raw, bool) or not isinstance(snap_raw, int) or \
+            isinstance(ev_raw, bool) or not isinstance(ev_raw, int):
         return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
-                     f"captured_at differs (snapshot {snap_ts} vs "
-                     f"evidence {ev_ts}) — same-source capture must be "
+                     "captured_at must be the canonical epoch-ms integer "
+                     "in both snapshot and margin evidence")
+    if snap_raw != ev_raw:
+        return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
+                     f"captured_at differs (snapshot {snap_raw} vs "
+                     f"evidence {ev_raw}) — same-source capture must be "
                      f"exact")
+    snap_ts = _parse_ts(snap_raw)
+    ev_ts = _parse_ts(ev_raw)
+    if snap_ts is None or ev_ts is None:
+        return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
+                     "captured_at unparseable")
     if not snap_acct or not ev_acct or snap_acct != ev_acct:
         return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
                      "account identity differs")

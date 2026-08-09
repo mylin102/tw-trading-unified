@@ -111,13 +111,14 @@ def main() -> int:
                   f"{'  ' + g.detail if g.detail else ''}")
         if check.ok:
             # D3: explicit phase-specific verdict — pre_deploy READY is
-            # READY_FOR_STARTUP (never to be confused with a deploy READY)
+            # READY_FOR_STARTUP (never to be confused with a deploy READY);
+            # machine-readable phase= label for the deployment script
             if args.phase == "pre_deploy":
-                print("READY_FOR_STARTUP")
+                print("phase=READY_FOR_STARTUP")
             else:
-                print("READY")
+                print("phase=READY")
         else:
-            print(f"NOT_READY refusal_codes={list(check.refusal_codes)}")
+            print(f"phase=NOT_READY refusal_codes={list(check.refusal_codes)}")
         # D6: stock-account rows stay warning/evidence (never block MTS
         # futures flat unless global-risk policy)
         flat = next((g for g in check.results if g.guard == "flat_snapshot"),
