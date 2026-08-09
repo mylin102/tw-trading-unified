@@ -255,14 +255,19 @@ def test_emergency_blocked_under_quarantine_this_phase():
     # LIVE_QUARANTINED (no bypass) — the strategy must not be mutated and
     # a dashboard reason must be emitted. Currently the strategy is
     # mutated before any check.
-    m = _monitor_stub(_ready_ctx())
+    m = _monitor_stub(_quarantined_ctx())
     s = _emergency_stub_strategy()
+    result = None
     try:
-        m._emergency_flatten_mts(s)
+        result = m._emergency_flatten_mts(s)
     except Exception:
         pass
     assert s._released_leg is None and not hasattr(s, "_side"), \
         "emergency must be blocked under quarantine (no strategy mutation)"
+    assert not m.client.calls and not m.api.calls, \
+        "blocked emergency must make ZERO broker calls"
+    if result is not None:
+        assert isinstance(result, dict) and result.get("blocked") is True, result
 
 
 def test_emergency_blocked_emits_dashboard_reason():
@@ -277,6 +282,41 @@ def test_emergency_blocked_emits_dashboard_reason():
     reasons = getattr(m._execution_context, "audit_reasons", ())
     assert any("EMERGENCY" in r for r in reasons), \
         f"blocked emergency must carry a dashboard reason: {reasons}"
+
+
+def test_emergency_ctx_none_fail_closed():
+    # ctx=None (no certification) -> blocked with NO_LIVE_CERTIFICATION
+    # marker, zero strategy mutation, zero broker calls
+    m = _monitor_stub(_quarantined_ctx())
+    m._execution_context = None
+    s = _emergency_stub_strategy()
+    result = m._emergency_flatten_mts(s)
+    assert s._released_leg is None and not hasattr(s, "_side")
+    assert not m.client.calls and not m.api.calls
+    assert isinstance(result, dict) and result.get("blocked") is True
+    assert "NO_LIVE_CERTIFICATION" in str(result.get("reason", "")), result
+
+
+def test_emergency_ready_permits_and_paper_unchanged():
+    # LIVE_READY: emergency flatten proceeds (gate passes — any crash
+    # beyond the gate is the stub's missing strategy internals, not the
+    # gate); PAPER: behavior unchanged (no gate block, no quarantine)
+    m = _monitor_stub(_ready_ctx())
+    s = _emergency_stub_strategy()
+    try:
+        m._emergency_flatten_mts(s)
+    except Exception as e:
+        if "Blocked" in type(e).__name__ or "live" in type(e).__name__.lower():
+            pytest.fail(f"LIVE_READY emergency must not raise the gate: {e}")
+    from core.mode_transition import paper_context
+    mp = _monitor_stub(paper_context(account_id="A1"))
+    mp.live_trading = False
+    try:
+        mp._emergency_flatten_mts(_emergency_stub_strategy())
+    except Exception as e:
+        if "Blocked" in type(e).__name__:
+            pytest.fail(f"PAPER emergency behavior must be unchanged: {e}")
+    assert mp._execution_context.to_dict().get("requested_mode") == "paper"
 
 
 def test_emergency_future_command_uses_exit_intent():
