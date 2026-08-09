@@ -623,12 +623,16 @@ def test_execution_context_state_round_trip_atomic(tmp_path):
 
 # ── (5) release identity verifier (release_dir-scoped, injected runner) ─────
 
-def test_release_identity_verifier_exists():
+def test_release_identity_verifier_exists(tmp_path, monkeypatch):
     # v3.1 #4: dedicated verifier with a REAL temp git release dir +
     # injected runner; env missing / HEAD mismatch / command failure all
-    # fail closed. Module absent → contract missing.
-    with pytest.raises(ImportError):
-        import core.release_identity  # noqa: F401
+    # fail closed. Wired (Step: release identity) — assert the contract.
+    from core.release_identity import verify_release_identity
+    monkeypatch.delenv("LRC_RELEASE_SHA", raising=False)
+    ok, reasons = verify_release_identity(
+        str(tmp_path), runner=lambda cmd, cwd=None: (0, "a" * 40, ""))
+    assert ok is False
+    assert any("RELEASE_IDENTITY_ENV_MISSING" in r for r in reasons), reasons
 
 
 # ── (6) real logout invalidates an existing certificate / gate ─────────────
