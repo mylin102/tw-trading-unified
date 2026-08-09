@@ -867,6 +867,7 @@ def test_cli_margin_evidence_and_ready_for_startup(tmp_path, monkeypatch):
         [sys.executable, "-B",
          str(Path(__file__).resolve().parents[2] /
              "scripts/deployment/check_deployment.py"),
+         "--release-dir", str(repo),
          "--runtime-dir", str(rt), "--pid-file",
          str(tmp_path / "nope.pid"), "--position-state", str(pf),
          "--expected-sha", head, "--margin-available", "300000.0",
@@ -875,7 +876,7 @@ def test_cli_margin_evidence_and_ready_for_startup(tmp_path, monkeypatch):
          "--exclude-path", "PHASE1_FINAL_FREEZE.md",
          "--phase", "pre_deploy"],
         capture_output=True, text=True, env=env, timeout=60)
-    assert r.returncode == 0, r.stdout[-800:] + r.stderr[-400:]
+    assert r.returncode == 0, r.stdout + r.stderr
     assert "READY_FOR_STARTUP" in r.stdout, r.stdout[-800:]
     assert "GUARD_MARGIN" not in r.stdout, r.stdout[-800:]
 
@@ -903,7 +904,8 @@ def test_re_freeze_records_identity_at_head(tmp_path):
     repo = _git_repo(tmp_path)
     head = _head(repo)
     manifest = repo / "PHASE1_FINAL_FREEZE.md"
-    manifest.write_text("frozen_tree_hash: 0000000000000000\n",
+    manifest.write_text(f"Frozen SHA {head}\n"
+                        f"frozen_tree_hash: {'0' * 64}\n",
                         encoding="utf-8")
     r = sp.run(
         [sys.executable, "-B",
