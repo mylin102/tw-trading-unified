@@ -982,16 +982,16 @@ def test_re_freeze_allowlist_telemetry_passes(tmp_path):
     # program-fixed allowlist: data/telemetry/** runtime artifacts pass
     import subprocess as sp
     repo = _git_repo(tmp_path)
-    head = _head(repo)
     manifest = repo / "PHASE1_FINAL_FREEZE.md"
-    manifest.write_text(f"Frozen SHA {head}\n"
+    manifest.write_text(f"Frozen SHA {_head(repo)}\n"
                         f"frozen_tree_hash: {'0' * 64}\n",
                         encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
                    check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-qm", "manifest"],
                    check=True)
-    (repo / "data" / "telemetry").mkdir(parents=True)
+    head = _head(repo)                       # post-commit HEAD
+    (repo / "data" / "telemetry" / "nested").mkdir(parents=True)
     (repo / "data" / "telemetry" / "nested" / "run-1.json").write_text(
         "{}", encoding="utf-8")
     r = sp.run(
@@ -1010,15 +1010,15 @@ def test_re_freeze_records_identity_at_head(tmp_path):
     # clean tree + committed manifest => the re-record updates the hash
     import subprocess as sp
     repo = _git_repo(tmp_path)
-    head = _head(repo)
     manifest = repo / "PHASE1_FINAL_FREEZE.md"
-    manifest.write_text(f"Frozen SHA {head}\n"
+    manifest.write_text(f"Frozen SHA {_head(repo)}\n"
                         f"frozen_tree_hash: {'0' * 64}\n",
                         encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
                    check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-qm", "manifest"],
                    check=True)
+    head = _head(repo)                       # post-commit HEAD
     r = sp.run(
         [sys.executable, "-B",
          str(Path(__file__).resolve().parents[2] /
@@ -1029,7 +1029,7 @@ def test_re_freeze_records_identity_at_head(tmp_path):
     assert r.returncode == 0, r.stdout[-600:] + r.stderr[-400:]
     body = manifest.read_text(encoding="utf-8")
     assert "frozen_tree_hash: " in body and "0" * 64 not in body
-    assert head in body
+    assert head in r.stdout               # script prints the recorded HEAD
 
 
 def test_cli_verdict_never_partial_ready(tmp_path, monkeypatch):
