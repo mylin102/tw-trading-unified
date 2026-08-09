@@ -33,6 +33,7 @@ import math
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -195,31 +196,40 @@ def guard_single_process(pid_file: str) -> GuardResult:
 
 # ── 5. flat / no pending order snapshot ────────────────────────────────────
 
-def _is_flat(data: dict) -> Tuple[bool, str]:
-    pos = data.get("position")
-    if pos is not None:
+SNAPSHOT_MAX_AGE_S = 600.0          # live-broker snapshot freshness window
+
+
+def _parse_ts(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
         try:
-            if float(pos) != 0.0:
-                return False, f"position={pos}"
-        except (TypeError, ValueError):
-            return False, f"position unparseable {pos!r}"
-    legs = data.get("legs") or {}
-    for leg, meta in legs.items():
-        if isinstance(meta, dict):
-            qty = meta.get("qty") or meta.get("quantity")
-            if qty:
-                try:
-                    if float(qty) != 0.0:
-                        return False, f"leg {leg} qty={qty}"
-                except (TypeError, ValueError):
-                    return False, f"leg {leg} qty unparseable {qty!r}"
-    if pos is None and not legs:
-        return False, "no position/legs keys (cannot prove flat)"
-    return True, ""
+            return float(value)
+        except ValueError:
+            pass
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt.timestamp()
+        except ValueError:
+            return None
+    return None
 
 
 def guard_flat_no_pending(position_state_path: str,
                           ctx_data: dict) -> GuardResult:
+    """Provenance-aware flat check.
+
+    - paper snapshot (mode/source == paper) is accepted ONLY for a paper
+      context; it NEVER satisfies a live deployment (paper positions are
+      allowed without claiming live readiness).
+    - a live deployment requires a source=live_broker snapshot with
+      positions=0, open_orders=[], captured_at (fresh), a content hash,
+      and no intervening live session (snapshot session == ctx session).
+    - missing / ambiguous source -> fail-closed (never assumed flat).
+    """
     p = Path(position_state_path)
     if not p.is_file():
         return _fail("flat_snapshot", ["GUARD_SNAPSHOT_MISSING"])
@@ -227,14 +237,57 @@ def guard_flat_no_pending(position_state_path: str,
         data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return _fail("flat_snapshot", ["GUARD_SNAPSHOT_INVALID"])
-    flat, why = _is_flat(data)
-    if not flat:
-        return _fail("flat_snapshot", ["GUARD_POSITION_NOT_FLAT"], why)
-    pending = data.get("pending_orders") or data.get("open_orders") or []
-    if pending:
+
+    source = str(data.get("source") or data.get("mode") or "").lower()
+    ctx_mode = str((ctx_data or {}).get("requested_mode")
+                   or (ctx_data or {}).get("effective_mode") or "")
+    is_live_ctx = "live" in ctx_mode
+
+    if source == "paper":
+        if is_live_ctx:
+            return _fail("flat_snapshot",
+                         ["GUARD_SNAPSHOT_PAPER_NOT_LIVE"],
+                         "paper snapshot is never live-flat evidence")
+        return _pass("flat_snapshot", "paper snapshot (paper deployment)")
+
+    if source != "live_broker":
+        return _fail("flat_snapshot", ["GUARD_SNAPSHOT_SOURCE_AMBIGUOUS"],
+                     f"source={source!r} (missing/unknown)")
+
+    positions = data.get("positions", data.get("position", None))
+    open_orders = data.get("open_orders", data.get("pending_orders", None))
+    captured_at = _parse_ts(data.get("captured_at"))
+    digest = data.get("hash") or data.get("sha256") or data.get("digest")
+    if positions is None or open_orders is None:
+        return _fail("flat_snapshot", ["GUARD_SNAPSHOT_INVALID"],
+                     "positions/open_orders required")
+    try:
+        if float(positions) != 0.0:
+            return _fail("flat_snapshot", ["GUARD_POSITION_NOT_FLAT"],
+                         f"positions={positions}")
+    except (TypeError, ValueError):
+        return _fail("flat_snapshot", ["GUARD_POSITION_NOT_FLAT"],
+                     f"positions unparseable {positions!r}")
+    if open_orders:
         return _fail("flat_snapshot", ["GUARD_PENDING_ORDERS"],
-                     f"{len(pending)} pending")
-    return _pass("flat_snapshot", "flat + no pending")
+                     f"{len(open_orders)} open")
+    if captured_at is None:
+        return _fail("flat_snapshot", ["GUARD_SNAPSHOT_STALE"],
+                     "captured_at missing")
+    if time.time() - captured_at > SNAPSHOT_MAX_AGE_S:
+        return _fail("flat_snapshot", ["GUARD_SNAPSHOT_STALE"],
+                     f"captured_at {captured_at:.0f} older than "
+                     f"{SNAPSHOT_MAX_AGE_S:.0f}s")
+    if not digest:
+        return _fail("flat_snapshot", ["GUARD_SNAPSHOT_HASH_MISSING"])
+    snap_session = data.get("session_id")
+    ctx_session = (ctx_data or {}).get("session_id")
+    if snap_session and ctx_session and snap_session != ctx_session:
+        return _fail("flat_snapshot", ["GUARD_SESSION_INTERVENED"],
+                     f"snapshot session {snap_session} != ctx "
+                     f"{ctx_session}")
+    return _pass("flat_snapshot",
+                 f"live_broker flat captured_at={captured_at:.0f}")
 
 
 # ── 6. quarantine-first startup (AST) ──────────────────────────────────────
