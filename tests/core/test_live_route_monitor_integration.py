@@ -523,8 +523,12 @@ def test_recertify_after_relogin_recovers_live_ready(tmp_path, monkeypatch):
     assert not m._execution_context.is_live_ready()
     assert "SESSION_GENERATION_MISMATCH" in \
         m._execution_context.audit_reasons
-    # retry: relogin already produced a NEW generation; recertify now
-    # binds the new generation + confirms + transitions to LIVE_READY
+    # retry: restore the REAL bind (the racy monkeypatch must not race
+    # again during recertify), then relogin already produced a NEW
+    # generation — recertify binds the new generation + confirms +
+    # transitions to LIVE_READY
+    monkeypatch.setattr(FuturesMonitor, "_bind_session_generation",
+                        original_bind)
     ok = _recertify_after_reconnect(m, api_fake)
     assert ok, "recertify must succeed with the new generation"
     assert m._execution_context.is_live_ready()

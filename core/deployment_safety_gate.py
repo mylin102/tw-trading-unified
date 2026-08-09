@@ -511,6 +511,55 @@ def guard_rollback_manifest(release_dir: str,
                  f"(expected {expected_sha[:12]}…)")
 
 
+# ── 11. capture consistency (flat + margin same preflight capture) ─────────
+
+_CAPTURE_SKEW_S = 10.0
+
+
+def guard_capture_consistency(position_state_path: Optional[str],
+                              margin_evidence: Optional[dict]
+                              ) -> GuardResult:
+    """The flat snapshot and the margin evidence must come from the SAME
+    read-only preflight capture: canonical input hash, captured_at,
+    account identity and scope all consistent and fresh (<=600s).
+    Different/missing captures => GUARD_CAPTURE_MISMATCH (fail-closed)."""
+    if margin_evidence is None:
+        return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
+                     "margin evidence required for capture binding")
+    try:
+        data = json.loads(Path(position_state_path).read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError):
+        return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
+                     "snapshot unreadable")
+    snap_hash = data.get("hash") or data.get("canonical_input_hash")
+    snap_ts = _parse_ts(data.get("captured_at"))
+    snap_acct = data.get("account_identity_hash")
+    ev_hash = margin_evidence.get("canonical_input_hash")
+    ev_ts = _parse_ts(margin_evidence.get("captured_at"))
+    ev_acct = margin_evidence.get("account_identity_hash")
+    if not snap_hash or not ev_hash or snap_hash != ev_hash:
+        return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
+                     "canonical input hash differs between snapshot and "
+                     "margin evidence")
+    if snap_ts is None or ev_ts is None or abs(snap_ts - ev_ts) > \
+            _CAPTURE_SKEW_S:
+        return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
+                     f"captured_at differs (snapshot {snap_ts} vs "
+                     f"evidence {ev_ts})")
+    if not snap_acct or not ev_acct or snap_acct != ev_acct:
+        return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
+                     "account identity differs")
+    if not margin_evidence.get("scope"):
+        return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
+                     "margin scope missing")
+    if time.time() - ev_ts > SNAPSHOT_MAX_AGE_S:
+        return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
+                     f"capture stale ({ev_ts:.0f})")
+    return _pass("capture_consistency",
+                 f"single capture hash={str(snap_hash)[:12]}…")
+
+
 # ── 10. ctx atomic read/write health ───────────────────────────────────────
 
 def guard_ctx_atomic_health(runtime_dir: str) -> GuardResult:
@@ -611,6 +660,7 @@ def check_deployment(
         guard_quarantine_first_startup(monitor_path),
         session_result,
         guard_margin(margin_available, margin_evidence=margin_evidence),
+        guard_capture_consistency(position_state_path, margin_evidence),
         guard_rollback_manifest(release_dir, manifest_paths, expected_sha,
                                 exclude_paths=manifest_exclude_paths),
         guard_ctx_atomic_health(runtime_dir),

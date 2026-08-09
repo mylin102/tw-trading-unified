@@ -58,12 +58,33 @@ def _exclude_self_tree_hash(repo: Path, commit: str,
     return hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
+def _normalized_untracked(repo: Path, raw: str):
+    """Normalize an untracked path from git status; None => escape/reject.
+    Rejects `..`, absolute paths and symlink escapes (resolved path must
+    stay inside the repo)."""
+    p = Path(raw)
+    if p.is_absolute() or ".." in p.parts:
+        return None
+    try:
+        resolved = (repo / p).resolve()
+        root = repo.resolve()
+        if resolved != root and root not in resolved.parents:
+            return None                    # symlink/.. escape
+    except OSError:
+        return None
+    return p.as_posix()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--release-dir", default=str(Path.cwd()))
     ap.add_argument("--expected-sha", default=None)
     ap.add_argument("--manifest", default=None)
     ap.add_argument("--exclude-path", action="append", default=[])
+    ap.add_argument("--verify", action="store_true",
+                    help="read-only: verify the recorded frozen_tree_hash "
+                         "matches the CURRENT HEAD's exclude-self tree "
+                         "identity (no writes)")
     args = ap.parse_args()
 
     repo = Path(args.release_dir).resolve()
@@ -71,9 +92,13 @@ def main() -> int:
         print(f"FATAL not a git repo: {repo}", file=sys.stderr)
         return 1
 
-    # fail-closed #1: head drift
+    exclude = args.exclude_path or DEFAULT_EXCLUDE
+    manifest = Path(args.manifest).resolve() if args.manifest \
+        else repo / "PHASE1_FINAL_FREEZE.md"
+
+    # fail-closed #1: head drift (record mode)
     head = _run(repo, "rev-parse", "HEAD")
-    if args.expected_sha and args.expected_sha != head:
+    if not args.verify and args.expected_sha and args.expected_sha != head:
         print(f"ABORT head drift: expected {args.expected_sha} "
               f"!= HEAD {head}", file=sys.stderr)
         return 2
@@ -83,35 +108,57 @@ def main() -> int:
     # index/worktree must be clean before the re-record; the re-record
     # target manifest must be committed (a staged manifest is an
     # operator bypass — rejected). Untracked runtime artifacts pass only
-    # the program-fixed allowlist (no operator globs).
-    exclude = args.exclude_path or DEFAULT_EXCLUDE
-    manifest = Path(args.manifest).resolve() if args.manifest \
-        else repo / "PHASE1_FINAL_FREEZE.md"
-    status = _run(repo, "status", "--porcelain", "-uall")
-    tracked_dirty = [ln for ln in status.splitlines()
-                     if not ln.startswith("??")]
-    untracked = [ln[3:] for ln in status.splitlines()
-                 if ln.startswith("??")]
-    if tracked_dirty:
-        print(f"ABORT dirty tree ({len(tracked_dirty)} changed "
-              f"file(s)) — index/worktree must be clean (the manifest "
-              f"included) before re-freezing:\n"
-              + "\n".join(tracked_dirty[:10]), file=sys.stderr)
-        return 3
-    remaining = [u for u in untracked
-                 if not any(u.startswith(p) for p in
-                            UNTRACKED_ALLOWED_PREFIXES)
-                 and u not in UNTRACKED_ALLOWED_FILES]
-    if remaining:
-        print(f"ABORT untracked files ({len(remaining)}) block the "
-              f"re-freeze — only the program-fixed runtime allowlist "
-              f"may remain (commit everything else):\n"
-              + "\n".join(remaining[:10]), file=sys.stderr)
-        return 6
+    # the program-fixed allowlist (no operator globs); paths are
+    # normalized first — `..`, absolute paths and symlink escapes are
+    # rejected outright. (--verify is read-only and skips these.)
+    if not args.verify:
+        status = _run(repo, "status", "--porcelain", "-uall")
+        tracked_dirty = [ln for ln in status.splitlines()
+                         if not ln.startswith("??")]
+        untracked = [ln[3:] for ln in status.splitlines()
+                     if ln.startswith("??")]
+        if tracked_dirty:
+            print(f"ABORT dirty tree ({len(tracked_dirty)} changed "
+                  f"file(s)) — index/worktree must be clean (the manifest "
+                  f"included) before re-freezing:\n"
+                  + "\n".join(tracked_dirty[:10]), file=sys.stderr)
+            return 3
+        remaining = []
+        for u in untracked:
+            norm = _normalized_untracked(repo, u)
+            if norm is None:
+                remaining.append(f"{u} (path escape)")
+                continue
+            if norm.startswith(UNTRACKED_ALLOWED_PREFIXES) or \
+                    norm in UNTRACKED_ALLOWED_FILES:
+                continue
+            remaining.append(u)
+        if remaining:
+            print(f"ABORT untracked files ({len(remaining)}) block the "
+                  f"re-freeze — only the program-fixed runtime allowlist "
+                  f"may remain (commit everything else):\n"
+                  + "\n".join(remaining[:10]), file=sys.stderr)
+            return 6
 
     if not manifest.is_file():
         print(f"FATAL manifest not found: {manifest}", file=sys.stderr)
         return 4
+    body = manifest.read_text(encoding="utf-8")
+    import re
+    m = re.search(r"^frozen_tree_hash:\s*([0-9a-f]{64})$", body, re.M)
+    if not m:
+        print(f"FATAL {manifest.name} lacks a frozen_tree_hash line",
+              file=sys.stderr)
+        return 5
+    recorded = m.group(1)
+    if args.verify:
+        cur = _exclude_self_tree_hash(repo, "HEAD", exclude)
+        if cur == recorded:
+            print(f"VERIFY OK HEAD={head} frozen_tree_hash={recorded}")
+            return 0
+        print(f"VERIFY FAIL recorded={recorded} != HEAD tree={cur} "
+              f"(stale or tree moved)", file=sys.stderr)
+        return 7
 
     tree_hash = _exclude_self_tree_hash(repo, head, exclude)
     body = manifest.read_text(encoding="utf-8")

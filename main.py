@@ -759,6 +759,27 @@ def _recertify_after_reconnect(mon, api):
         runtime = build_runtime_certification_context(
             api, cfg_path,
             {"process_state": {"process_start_id": f"monitor-{os.getpid()}"}})
+        # [D1] after a relogin the registry holds a NEW generation — bind
+        # it into the quarantined ctx + confirm before promoting
+        bind = getattr(mon, "_bind_session_generation", None)
+        if callable(bind):
+            try:
+                bind()
+            except Exception:
+                pass
+        confirm = getattr(mon, "_confirm_session_generation", None)
+        if callable(confirm):
+            try:
+                if not confirm():
+                    mon._execution_context = with_effective_mode(
+                        mon._execution_context,
+                        ModeTransitionState.LIVE_QUARANTINED.value,
+                        live_order_allowed=False,
+                        audit_reasons=("SESSION_GENERATION_MISMATCH",))
+                    _persist_ctx(mon)
+                    return False
+            except Exception:
+                return False
         mon._execution_context = transition_with_certificate(
             mon._execution_context, cert, issuer, runtime=runtime)
         _persist_ctx(mon)
