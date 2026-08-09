@@ -129,7 +129,8 @@ def main() -> int:
             if norm is None:
                 remaining.append(f"{u} (path escape)")
                 continue
-            if norm.startswith(UNTRACKED_ALLOWED_PREFIXES) or \
+            if any(norm.startswith(p) or norm == p.rstrip("/")
+                   for p in UNTRACKED_ALLOWED_PREFIXES) or \
                     norm in UNTRACKED_ALLOWED_FILES:
                 continue
             remaining.append(u)
@@ -154,9 +155,12 @@ def main() -> int:
     if args.verify:
         cur = _exclude_self_tree_hash(repo, "HEAD", exclude)
         if cur == recorded:
-            print(f"VERIFY OK HEAD={head} frozen_tree_hash={recorded}")
+            print(f"VERIFY_ONLY OK HEAD={head} frozen_tree_hash={recorded}")
+            print("VERIFY_ONLY: this is NOT a deploy-ready gate — run "
+                  "check_deployment.py for the real pre_deploy decision "
+                  "(clean tracked+untracked policy applies there)")
             return 0
-        print(f"VERIFY FAIL recorded={recorded} != HEAD tree={cur} "
+        print(f"VERIFY_ONLY FAIL recorded={recorded} != HEAD tree={cur} "
               f"(stale or tree moved)", file=sys.stderr)
         return 7
 

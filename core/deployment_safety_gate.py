@@ -513,16 +513,16 @@ def guard_rollback_manifest(release_dir: str,
 
 # ── 11. capture consistency (flat + margin same preflight capture) ─────────
 
-_CAPTURE_SKEW_S = 10.0
-
 
 def guard_capture_consistency(position_state_path: Optional[str],
                               margin_evidence: Optional[dict]
                               ) -> GuardResult:
     """The flat snapshot and the margin evidence must come from the SAME
     read-only preflight capture: canonical input hash, captured_at,
-    account identity and scope all consistent and fresh (<=600s).
-    Different/missing captures => GUARD_CAPTURE_MISMATCH (fail-closed)."""
+    account identity and scope EXACTLY consistent (same-source artifact —
+    no skew tolerance) and fresh (<=600s). Different/missing captures =>
+    GUARD_CAPTURE_MISMATCH (fail-closed). Independent captures are NOT
+    supported yet (a future capture_id/skew policy would govern them)."""
     if margin_evidence is None:
         return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
                      "margin evidence required for capture binding")
@@ -542,11 +542,11 @@ def guard_capture_consistency(position_state_path: Optional[str],
         return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
                      "canonical input hash differs between snapshot and "
                      "margin evidence")
-    if snap_ts is None or ev_ts is None or abs(snap_ts - ev_ts) > \
-            _CAPTURE_SKEW_S:
+    if snap_ts is None or ev_ts is None or snap_ts != ev_ts:
         return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
                      f"captured_at differs (snapshot {snap_ts} vs "
-                     f"evidence {ev_ts})")
+                     f"evidence {ev_ts}) — same-source capture must be "
+                     f"exact")
     if not snap_acct or not ev_acct or snap_acct != ev_acct:
         return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
                      "account identity differs")

@@ -731,7 +731,8 @@ def test_aggregate_all_pass_readies(tmp_path, monkeypatch):
     head = _head(repo)
     rt = tmp_path / "rt"
     _ctx_file(rt, _live_ctx_dict())
-    pf = _position_file(rt, _live_snapshot())
+    _ts = time.time()
+    pf = _position_file(rt, _live_snapshot(captured_at=_ts))
     exclude = ["PHASE1_FINAL_FREEZE.md"]
     manifest = _manifest_with(repo, exclude, head)
     monkeypatch.setenv("LRC_RELEASE_SHA", head)
@@ -742,7 +743,7 @@ def test_aggregate_all_pass_readies(tmp_path, monkeypatch):
         position_state_path=str(pf), monitor_path=None,
         session_generation=1, margin_available=300_000.0,
         margin_evidence={"account_identity_hash": "a" * 64,
-                         "scope": "futopt", "captured_at": time.time(),
+                         "scope": "futopt", "captured_at": _ts,
                          "canonical_input_hash": "b" * 64},
         manifest_paths=[str(manifest)], expected_sha=head,
         manifest_exclude_paths=exclude)
@@ -804,7 +805,8 @@ def test_pre_deploy_skips_session_generation(tmp_path, monkeypatch):
     head = _head(repo)
     rt = tmp_path / "rt"
     _ctx_file(rt, _live_ctx_dict())
-    pf = _position_file(rt, _live_snapshot())
+    _ts = time.time()
+    pf = _position_file(rt, _live_snapshot(captured_at=_ts))
     exclude = ["PHASE1_FINAL_FREEZE.md"]
     manifest = _manifest_with(repo, exclude, head)
     monkeypatch.setenv("LRC_RELEASE_SHA", head)
@@ -816,7 +818,7 @@ def test_pre_deploy_skips_session_generation(tmp_path, monkeypatch):
         session_generation=None, session_revoked=False,
         margin_available=300_000.0,
         margin_evidence={"account_identity_hash": "a" * 64,
-                         "scope": "futopt", "captured_at": time.time(),
+                         "scope": "futopt", "captured_at": _ts,
                          "canonical_input_hash": "b" * 64},
         manifest_paths=[str(manifest)], expected_sha=head,
         manifest_exclude_paths=exclude, phase="pre_deploy")
@@ -832,7 +834,8 @@ def test_post_startup_requires_registry_generation(tmp_path, monkeypatch):
     head = _head(repo)
     rt = tmp_path / "rt"
     _ctx_file(rt, _live_ctx_dict())
-    pf = _position_file(rt, _live_snapshot())
+    _ts = time.time()
+    pf = _position_file(rt, _live_snapshot(captured_at=_ts))
     exclude = ["PHASE1_FINAL_FREEZE.md"]
     manifest = _manifest_with(repo, exclude, head)
     monkeypatch.setenv("LRC_RELEASE_SHA", head)
@@ -855,7 +858,7 @@ def test_post_startup_requires_registry_generation(tmp_path, monkeypatch):
         session_generation="ab" * 16, session_revoked=False,
         margin_available=300_000.0,
         margin_evidence={"account_identity_hash": "a" * 64,
-                         "scope": "futopt", "captured_at": time.time(),
+                         "scope": "futopt", "captured_at": _ts,
                          "canonical_input_hash": "b" * 64},
         manifest_paths=[str(manifest)], expected_sha=head,
         manifest_exclude_paths=exclude, phase="post_startup")
@@ -872,13 +875,14 @@ def test_cli_margin_evidence_and_ready_for_startup(tmp_path, monkeypatch):
     head = _head(repo)
     rt = tmp_path / "rt"
     _ctx_file(rt, _live_ctx_dict())
-    pf = _position_file(rt, _live_snapshot())
+    _ts = time.time()
+    pf = _position_file(rt, _live_snapshot(captured_at=_ts))
     exclude = ["PHASE1_FINAL_FREEZE.md"]
     manifest = _manifest_with(repo, exclude, head)
     ev = tmp_path / "preflight.json"
     ev.write_text(__import__("json").dumps({
         "account_identity_hash": "a" * 64, "scope": "futopt",
-        "captured_at": time.time(),
+        "captured_at": _ts,
         "canonical_input_hash": "b" * 64,
         "available_margin": 300_000.0}), encoding="utf-8")
     env = dict(os.environ,
@@ -1030,6 +1034,19 @@ def test_guard_capture_consistency_mismatch(tmp_path):
     assert not r.ok and "GUARD_CAPTURE_MISMATCH" in r.reasons
 
 
+def test_guard_capture_consistency_exact_captured_at(tmp_path):
+    # the SAME preflight JSON capture => captured_at must be EXACT
+    # (no skew tolerance for same-source artifacts)
+    from core.deployment_safety_gate import guard_capture_consistency
+    ts = time.time()
+    pf = _position_file(tmp_path / "rt", _live_snapshot(captured_at=ts))
+    ev = {"account_identity_hash": "a" * 64, "scope": "futopt",
+          "captured_at": ts + 0.001,     # 1ms skew — rejected
+          "canonical_input_hash": "b" * 64}
+    r = guard_capture_consistency(str(pf), ev)
+    assert not r.ok and "GUARD_CAPTURE_MISMATCH" in r.reasons
+
+
 def test_guard_capture_consistency_requires_evidence(tmp_path):
     from core.deployment_safety_gate import guard_capture_consistency
     pf = _position_file(tmp_path / "rt", _live_snapshot())
@@ -1042,10 +1059,10 @@ def test_guard_capture_consistency_requires_evidence(tmp_path):
 def test_re_freeze_rejects_symlink_escape(tmp_path):
     # an untracked symlink escaping the repo must block the re-freeze
     import subprocess as sp
+    import tempfile as _tf
     repo = _git_repo(tmp_path)
     head = _head(repo)
-    outside = tmp_path / "outside"
-    outside.mkdir()
+    outside = Path(_tf.mkdtemp())       # genuinely OUTSIDE the repo
     (repo / "data").mkdir(exist_ok=True)
     (repo / "data" / "telemetry").symlink_to(outside, target_is_directory=True)
     r = sp.run(
@@ -1112,6 +1129,71 @@ def test_re_freeze_verify_stale_fails(tmp_path):
     assert r.returncode != 0, r.stdout[-600:]
 
 
+def test_re_freeze_verify_labels_verify_only(tmp_path):
+    # --verify output must label VERIFY_ONLY — never deploy-ready
+    import subprocess as sp
+    repo = _git_repo(tmp_path)
+    manifest = repo / "PHASE1_FINAL_FREEZE.md"
+    manifest.write_text(f"Frozen SHA {_head(repo)}\n"
+                        f"frozen_tree_hash: {'0' * 64}\n",
+                        encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "manifest"],
+                   check=True)
+    head = _head(repo)
+    sp.run([sys.executable, "-B",
+            str(Path(__file__).resolve().parents[2] /
+                "scripts/deployment/re_freeze.py"),
+            "--release-dir", str(repo), "--expected-sha", head,
+            "--manifest", str(manifest)],
+           capture_output=True, text=True, timeout=60)
+    subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "record"],
+                   check=True)
+    r = sp.run([sys.executable, "-B",
+                str(Path(__file__).resolve().parents[2] /
+                    "scripts/deployment/re_freeze.py"),
+                "--verify", "--release-dir", str(repo),
+                "--manifest", str(manifest)],
+               capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, (r.stdout + r.stderr)[-600:]
+    assert "VERIFY_ONLY" in r.stdout, r.stdout[-600:]
+    assert "deploy" in (r.stdout + r.stderr).lower()  # NOT deploy-ready
+
+
+def test_re_freeze_internal_alias_allowed(tmp_path):
+    # an in-repo symlink alias (resolve stays inside the repo) is allowed;
+    # it must not cross the runtime/output namespace
+    import subprocess as sp
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    manifest = repo / "PHASE1_FINAL_FREEZE.md"
+    manifest.write_text(f"Frozen SHA {head}\n"
+                        f"frozen_tree_hash: {'0' * 64}\n",
+                        encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "manifest"],
+                   check=True)
+    head = _head(repo)
+    (repo / "data" / "telemetry").mkdir(parents=True)
+    (repo / "data" / "telemetry" / "run-1.json").write_text(
+        "{}", encoding="utf-8")
+    # an in-repo alias: logs -> data/telemetry (both inside the repo)
+    (repo / "logs").symlink_to(repo / "data" / "telemetry",
+                               target_is_directory=True)
+    r = sp.run(
+        [sys.executable, "-B",
+         str(Path(__file__).resolve().parents[2] /
+             "scripts/deployment/re_freeze.py"),
+         "--release-dir", str(repo), "--expected-sha", head,
+         "--manifest", str(manifest)],
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout[-600:] + r.stderr[-400:]
+
+
 def test_re_freeze_records_identity_at_head(tmp_path):
     # clean tree + committed manifest => the re-record updates the hash
     import subprocess as sp
@@ -1145,6 +1227,7 @@ def test_cli_verdict_never_partial_ready(tmp_path, monkeypatch):
     head = _head(repo)
     rt = tmp_path / "rt"
     _ctx_file(rt, _live_ctx_dict())
+    _ts = time.time()
     pf = _position_file(rt, _live_snapshot(positions=[
         {"account": "futures", "code": "TMFH6", "quantity": 1,
          "direction": "Action.Sell"}]))   # futures non-flat -> FAIL
@@ -1153,7 +1236,7 @@ def test_cli_verdict_never_partial_ready(tmp_path, monkeypatch):
     ev = tmp_path / "preflight.json"
     ev.write_text(__import__("json").dumps({
         "account_identity_hash": "a" * 64, "scope": "futopt",
-        "captured_at": time.time(),
+        "captured_at": _ts,
         "canonical_input_hash": "b" * 64,
         "available_margin": 300_000.0}), encoding="utf-8")
     env = dict(os.environ, LRC_RELEASE_SHA=head,
