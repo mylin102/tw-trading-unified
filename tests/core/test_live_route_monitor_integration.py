@@ -17,6 +17,7 @@ PAPER path unchanged: paper_context() never consumes a certificate.
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -365,7 +366,7 @@ def test_startup_binds_registry_generation_to_ctx(tmp_path, monkeypatch):
                         _fake_runtime)
     monkeypatch.setattr(lrc, "transition_with_certificate", _fake_transition)
     # a registered session -> the registry holds a generation
-    api = lrc._FakeApi()
+    api = SimpleNamespace(futopt_account=object())
     lrc.register_session(api)
     gen = lrc.session_registry.generation(api)
     m = FuturesMonitor.__new__(FuturesMonitor)

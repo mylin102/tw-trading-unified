@@ -740,7 +740,7 @@ def test_aggregate_any_fail_blocks(tmp_path, monkeypatch):
 
 def test_aggregate_caller_supplied_required(tmp_path, monkeypatch):
     # session/margin must come from read-only traceable sources — missing
-    # values are refused (never assumed)
+    # values are refused in the post_startup gate (never assumed)
     from core.deployment_safety_gate import check_deployment
     repo = _git_repo(tmp_path)
     head = _head(repo)
@@ -754,7 +754,7 @@ def test_aggregate_caller_supplied_required(tmp_path, monkeypatch):
         runtime_dir=str(rt), pid_file=str(tmp_path / "nope.pid"),
         position_state_path=str(pf), monitor_path=None,
         session_generation=None, margin_available=None,
-        manifest_paths=[], expected_sha=head)
+        manifest_paths=[], expected_sha=head, phase="post_startup")
     assert not c.ok
     assert "GUARD_SESSION_MISSING" in c.refusal_codes
     assert "GUARD_MARGIN_UNAVAILABLE" in c.refusal_codes
