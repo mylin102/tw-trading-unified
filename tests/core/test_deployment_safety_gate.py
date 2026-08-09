@@ -266,6 +266,82 @@ def test_guard_flat_live_broker_positions_empty_list(tmp_path):
     assert r.ok, r.reasons
 
 
+# ── A) MTS futures-scoped flat (stock non-zero does NOT block) ─────────────
+
+def test_guard_flat_stock_nonzero_futures_empty_passes(tmp_path):
+    # stock-account non-zero positions stay in the evidence but do NOT
+    # block MTS futures flat (futures account empty => flat)
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, _live_snapshot(positions=[
+        {"account": "stock", "code": "00919", "quantity": 1,
+         "direction": "Action.Buy"},
+        {"account": "stock", "code": "6126", "quantity": 1,
+         "direction": "Action.Buy"},
+    ]))
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
+    assert r.ok, r.reasons
+    assert "stock" in r.detail or "futures" in r.detail, r.detail
+
+
+def test_guard_flat_futures_nonzero_fails(tmp_path):
+    # futures-account non-zero position blocks MTS flat
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, _live_snapshot(positions=[
+        {"account": "futures", "code": "TMFH6", "quantity": 1,
+         "direction": "Action.Sell"},
+    ]))
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
+    assert not r.ok and "GUARD_POSITION_NOT_FLAT" in r.reasons
+
+
+def test_guard_flat_futures_pending_order_fails(tmp_path):
+    # futures open order blocks MTS flat (stock rows ignored for orders)
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, _live_snapshot(
+        positions=[],
+        open_orders=[{"account": "futures", "order_id": "o1",
+                      "status": "Submitted"}]))
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
+    assert not r.ok and "GUARD_PENDING_ORDERS" in r.reasons
+
+
+def test_guard_flat_stock_pending_order_ignored(tmp_path):
+    # stock-only pending orders do NOT block MTS futures flat
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, _live_snapshot(
+        positions=[],
+        open_orders=[{"account": "stock", "order_id": "s1",
+                      "status": "Submitted"}]))
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
+    assert r.ok, r.reasons
+
+
+def test_guard_flat_global_risk_blocks_stock(tmp_path):
+    # explicit global-risk config: ALL accounts count
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, _live_snapshot(
+        global_risk=True,
+        positions=[{"account": "stock", "code": "00919", "quantity": 1,
+                    "direction": "Action.Buy"}]))
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
+    assert not r.ok and "GUARD_POSITION_NOT_FLAT" in r.reasons
+
+
+def test_guard_flat_untagged_rows_futures_relevant(tmp_path):
+    # rows without an account tag default to futures-relevant (block)
+    from core.deployment_safety_gate import guard_flat_no_pending
+    rt = tmp_path / "rt"
+    pf = _position_file(rt, _live_snapshot(positions=[
+        {"code": "TMFH6", "quantity": 1, "direction": "Action.Sell"}]))
+    r = guard_flat_no_pending(str(pf), _live_ctx_dict())
+    assert not r.ok and "GUARD_POSITION_NOT_FLAT" in r.reasons
+
+
 def test_guard_freeze_first_post_freeze_refused(tmp_path, monkeypatch):
     # freeze-first rule: any change AFTER the freeze (dirty closure files,
     # drifted HEAD, stale manifest) is refused — freeze last, never edit
@@ -412,6 +488,15 @@ def test_guard_session_generation_ok():
     assert guard_session_generation(42, revoked=False).ok
 
 
+def test_guard_session_generation_preflight_identity_rejected():
+    # B) a standalone sha256(account_id) marker is preflight IDENTITY, not a
+    # live session generation — registry-bound generation must be an int
+    from core.deployment_safety_gate import guard_session_generation
+    r = guard_session_generation("1d98890cdf1219ac", revoked=False)
+    assert not r.ok and "GUARD_SESSION_MISSING" in r.reasons
+    assert guard_session_generation(0, revoked=False).ok
+
+
 def test_guard_session_generation_missing():
     from core.deployment_safety_gate import guard_session_generation
     r = guard_session_generation(None, revoked=False)
@@ -430,6 +515,24 @@ def test_guard_margin_ok():
     from core.deployment_safety_gate import guard_margin
     assert guard_margin(300_000.0).ok
     assert guard_margin(220_000.0).ok          # exact boundary
+
+
+def test_guard_margin_ok_with_evidence():
+    # margin acceptance requires account/scope/captured_at/hash evidence
+    from core.deployment_safety_gate import guard_margin
+    ev = {"account_identity_hash": "a" * 64, "scope": "futopt",
+          "captured_at": 1786256565.0, "canonical_input_hash": "b" * 64}
+    r = guard_margin(343_082.0, margin_evidence=ev)
+    assert r.ok, r.reasons
+
+
+def test_guard_margin_evidence_missing_fields():
+    from core.deployment_safety_gate import guard_margin
+    r = guard_margin(343_082.0, margin_evidence={})
+    assert not r.ok and "GUARD_MARGIN_EVIDENCE_MISSING" in r.reasons
+    r2 = guard_margin(343_082.0, margin_evidence={
+        "account_identity_hash": "a" * 64})
+    assert not r2.ok and "GUARD_MARGIN_EVIDENCE_MISSING" in r2.reasons
 
 
 def test_guard_margin_below():
