@@ -230,7 +230,7 @@ def _live_snapshot(**over):
     data = {"source": "live_broker", "mode": "live",
             "positions": 0, "open_orders": [],
             "captured_at": int(time.time() * 1000),  # canonical epoch-ms int
-            "hash": "b" * 64, "session_id": "sess-1",
+            "canonical_input_hash": "b" * 64, "session_id": "sess-1",
             "account_identity_hash": "a" * 64}
     data.update(over)
     return data
@@ -1234,6 +1234,37 @@ def test_re_freeze_records_identity_at_head(tmp_path):
     body = manifest.read_text(encoding="utf-8")
     assert "frozen_tree_hash: " in body and "0" * 64 not in body
     assert head in r.stdout               # script prints the recorded HEAD
+
+
+def test_cli_bare_margin_available_refused(tmp_path, monkeypatch):
+    # a bare --margin-available (no --margin-evidence) must NOT pass —
+    # the evidence (scope/account/hash/captured_at) is mandatory
+    import subprocess as sp
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    rt = tmp_path / "rt"
+    _ctx_file(rt, _live_ctx_dict())
+    _ts = int(time.time() * 1000)
+    pf = _position_file(rt, _live_snapshot(captured_at=_ts))
+    exclude = ["PHASE1_FINAL_FREEZE.md"]
+    manifest = _manifest_with(repo, exclude, head)
+    env = dict(os.environ, LRC_RELEASE_SHA=head,
+               TRADING_RUNTIME_DIR=str(rt))
+    r = sp.run(
+        [sys.executable, "-B",
+         str(Path(__file__).resolve().parents[2] /
+             "scripts/deployment/check_deployment.py"),
+         "--release-dir", str(repo),
+         "--runtime-dir", str(rt), "--pid-file",
+         str(tmp_path / "nope.pid"),
+         "--position-state", str(pf),
+         "--margin-available", "300000",
+         "--manifest", str(manifest),
+         "--exclude-path", *exclude,
+         "--expected-sha", head, "--phase", "pre_deploy"],
+        capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode != 0
+    assert "GUARD_MARGIN" in r.stdout, r.stdout[-800:]
 
 
 def test_cli_verdict_never_partial_ready(tmp_path, monkeypatch):
