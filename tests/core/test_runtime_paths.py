@@ -1,23 +1,69 @@
-"""RED/GREEN tests: Python release-tree write migration.
+"""RED/GREEN: exhaustive release-tree write migration (P0 decisions).
 
-The trading engine (strategies/futures/monitor.py) must write ALL
-runtime data (market_data CSVs, backups, stocks, anomalous quotes, MTS
-events, orders exports) under the runtime namespace
-(core.runtime_paths.runtime_logs / runtime_path) — NEVER into the
-release source tree. The dashboard already reads the runtime namespace,
-so repo-relative writes recreate the 2026-08-05 split incident class.
+ALL PM2-started production writers/readers must resolve through
+core.runtime_paths (runtime_logs / runtime_path) — the single runtime
+authority. The 14-site inventory:
+
+  core/health_evidence_exporter.py   exports/market_data (+soak)
+  core/dynamics_capture.py           logs/ticks/dynamics (default)
+  core/market_data_runtime.py        logs/ticks/dynamics (default pass)
+  core/strategy_eval.py              <repo>/logs/router_trace
+  strategies/futures/monitor.py      logs/market_data/TMF_trades.csv
+  strategies/futures/monitor.py      exports/trades/live/diagnostics
+  strategies/options/...squeeze...   CWD/strategies/options/logs/<sub>
+  strategies/options/...squeeze...   logs/market_data ×3 + options_watchdog
+  strategies/futures/mts/soak...     data/telemetry/shadow-soak
+  strategies/futures/mts/policy_j... exports/telemetry/policy_j
+  ui/dashboard.py                    logs/... reads (6 + options)
+
+Legacy squeeze_futures strategies + one-off scripts are NOT in the PM2
+scope: the manifest proves the PM2 entries never START them.
 """
 
 import os
-import subprocess
-import sys
+import re
 from pathlib import Path
 
 import pytest
 
-_MONITOR = Path(__file__).resolve().parents[2] / "strategies" / "futures" \
-    / "monitor.py"
+_REPO = Path(__file__).resolve().parents[2]
+_MONITOR = _REPO / "strategies" / "futures" / "monitor.py"
 
+# per-file forbidden release-tree path literals (exact evidence anchors)
+_FORBIDDEN = {
+    "core/health_evidence_exporter.py": ['"exports/market_data"'],
+    "core/dynamics_capture.py": ['"logs/ticks/dynamics"'],
+    "core/market_data_runtime.py": ['"logs/ticks/dynamics"'],
+    "core/strategy_eval.py": ['"router_trace"'],
+    "strategies/futures/monitor.py": [
+        'Path("logs/market_data/TMF_trades.csv")',
+        'Path("exports/trades/live/diagnostics")',
+    ],
+    "strategies/options/live_options_squeeze_monitor.py": [
+        "os.getcwd()",
+        '"logs/market_data"',
+        '"logs/options_watchdog"',
+    ],
+    "strategies/futures/mts/soak_collector.py": [
+        '"data/telemetry/shadow-soak"',
+    ],
+    "strategies/plugins/futures/active/tmf_spread.py": [
+        '"data/telemetry/shadow-soak"',
+    ],
+    "strategies/futures/mts/policy_j_telemetry_writer.py": [
+        '"policy_j"',
+    ],
+    "ui/dashboard.py": [
+        '"logs/router_trace"',
+        '"logs/market_data"',
+        '"logs/mts_spread_events.jsonl"',
+        '"logs/stocks"',
+        '"logs/backups/trade_records"',
+    ],
+}
+
+
+# ── runtime_logs() authority semantics ─────────────────────────────────────
 
 def test_runtime_logs_uses_runtime_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
@@ -32,8 +78,9 @@ def test_runtime_logs_fallback_repo_logs(monkeypatch):
     # explicit, tested behaviour (production always sets the env via PM2)
     monkeypatch.delenv("TRADING_RUNTIME_DIR", raising=False)
     from core.runtime_paths import runtime_logs, _REPO_ROOT
-    assert runtime_logs().startswith(
-        os.path.join(_REPO_ROOT, "logs") + os.sep)
+    assert runtime_logs() == os.path.join(_REPO_ROOT, "logs")
+    assert runtime_logs("stocks") == \
+        os.path.join(_REPO_ROOT, "logs", "stocks")
 
 
 def test_monitor_no_release_tree_log_paths():
@@ -52,6 +99,42 @@ def test_monitor_no_release_tree_log_paths():
     for pat in forbidden:
         assert pat not in src, \
             f"release-tree write path still present in monitor.py: {pat}"
-    # the repo-root-derived market_data dir must be gone too
     assert 'os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs"' \
         not in src, "repo-root logs/ dir derivation still present"
+
+
+# ── P0 exhaustive inventory (all PM2-started production sources) ───────────
+
+@pytest.mark.parametrize("rel,patterns", sorted(_FORBIDDEN.items()))
+def test_no_release_tree_paths_in_production_sources(rel, patterns):
+    src = (_REPO / rel).read_text(encoding="utf-8")
+    for pat in patterns:
+        assert pat not in src, \
+            f"{rel} still contains release-tree path: {pat}"
+
+
+def test_pm2_entries_never_start_legacy_strategies_or_scripts():
+    """Manifest: the PM2 apps (trading-system=main.py, dashboard=
+    ui/dashboard.py, stock-runner=scripts/runners/stock_runner.py) never
+    START the legacy squeeze_futures strategies or one-off scripts.
+    The only squeeze_futures references in the PM2 entries are dashboard
+    get_point_value CONSTANT lookups (never strategy execution)."""
+    dash = (_REPO / "ui" / "dashboard.py").read_text(encoding="utf-8")
+    sq_imports = re.findall(
+        r"(?:import|from)\s+strategies\.futures\.squeeze_futures\.[^\s(]+",
+        dash)
+    for imp in sq_imports:
+        assert "engine.constants" in imp, \
+            f"dashboard imports a non-constants squeeze_futures module: {imp}"
+    for entry in ("main.py", "ui/dashboard.py",
+                  "scripts/runners/stock_runner.py"):
+        src = (_REPO / entry).read_text(encoding="utf-8")
+        for banned in ("import scripts.", "from scripts.",
+                       "generate_adaptive_dataset",
+                       "run_portfolio_sweep"):
+            assert banned not in src, \
+                f"{entry} references a one-off script: {banned}"
+    for legacy in ("strategies/futures/squeeze_futures/engine/strategy",
+                   "strategies/futures/squeeze_futures/engine/live",
+                   "tmf_strategy", "TmfSpreadStrategy"):
+        assert legacy not in (_REPO / "main.py").read_text(encoding="utf-8")
