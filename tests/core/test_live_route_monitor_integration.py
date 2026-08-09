@@ -79,12 +79,14 @@ def _repo_root():
 
 
 def test_release_identity_check_wired_before_certification():
-    """(3) RED: the LIVE startup path must verify cwd/HEAD == LRC_RELEASE_SHA
-    before any certification — the wiring does not exist yet."""
+    """(3) GREEN (Step: release identity): the LIVE startup path must
+    verify release-dir HEAD == LRC_RELEASE_SHA (core/release_identity,
+    wired via verify_release_identity) BEFORE any certification — the
+    wiring exists in the monitor startup block."""
     monitor = _monitor_path()
     text = monitor.read_text(encoding="utf-8")
-    assert "LRC_RELEASE_SHA" in text, \
-        "release-identity env check not wired into monitor startup"
+    assert "verify_release_identity" in text, \
+        "release-identity check not wired into monitor startup"
 
 
 def test_margin_floor_config_key_defined():
@@ -242,12 +244,18 @@ def test_execution_context_persisted_for_dashboard():
 
 
 def test_release_head_check_in_release_tree():
-    """(5) RED: the release identity check must run in the ACTUAL release
-    tree (git -C <release_dir> rev-parse HEAD), not an arbitrary cwd."""
+    """(5) GREEN (Step: release identity): the release identity check runs
+    in the ACTUAL release tree — core/release_identity runs
+    `git -C <release_dir> rev-parse HEAD` (never an arbitrary cwd) and
+    the monitor wires verify_release_identity."""
     monitor = _monitor_path()
     text = monitor.read_text(encoding="utf-8")
-    assert "LRC_RELEASE_SHA" in text and "-C" in text, \
+    assert "verify_release_identity" in text, \
         "release-tree HEAD check not wired"
+    verifier = _repo_root() / "core" / "release_identity.py"
+    vtext = verifier.read_text(encoding="utf-8")
+    assert "LRC_RELEASE_SHA" in vtext and "-C" in vtext, \
+        "release-tree HEAD check must use git -C <release_dir>"
 
 
 # ── Live wiring Step 1: startup transition path (bounded task) ───────────────
