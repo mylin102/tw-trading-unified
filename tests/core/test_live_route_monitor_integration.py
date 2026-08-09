@@ -266,10 +266,21 @@ def _minimal_live_cfg(tmp_path):
     return cfg
 
 
+def _set_release_env(monkeypatch):
+    # the LIVE startup verifies release-dir HEAD == LRC_RELEASE_SHA
+    # BEFORE certification — the tests run at the repo HEAD
+    import subprocess
+    head = subprocess.check_output(
+        ["git", "-C", str(_repo_root()), "rev-parse", "HEAD"],
+        text=True).strip()
+    monkeypatch.setenv("LRC_RELEASE_SHA", head)
+
+
 def test_no_cert_startup_quarantines_no_certificate(tmp_path, monkeypatch):
     """No certificate at startup -> LIVE_QUARANTINED + NO_CERTIFICATE
     (fail-closed; live orders blocked)."""
     monkeypatch.chdir(tmp_path)  # avoid config/futures.yaml fallback
+    _set_release_env(monkeypatch)
     cfg = _minimal_live_cfg(tmp_path)
     from strategies.futures.monitor import FuturesMonitor
     m = FuturesMonitor(api=None, config_path=str(cfg))
@@ -283,6 +294,7 @@ def test_valid_cert_startup_uses_transition_with_certificate(tmp_path, monkeypat
     """Valid certificate path invokes transition_with_certificate with the
     issued cert + trusted runtime context (the ONLY path to LIVE_READY)."""
     monkeypatch.chdir(tmp_path)
+    _set_release_env(monkeypatch)
     cfg = _minimal_live_cfg(tmp_path)
     import core.live_route_certificate as lrc
     from core.mode_transition import (ModeTransitionState, live_preflight_context,

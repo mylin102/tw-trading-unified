@@ -103,12 +103,25 @@ class RecordingApi:
         return True
 
 
+def _ready_ctx():
+    from core.mode_transition import (ModeTransitionState,
+                                      live_preflight_context,
+                                      with_effective_mode)
+    ctx = with_effective_mode(
+        live_preflight_context(), ModeTransitionState.LIVE_READY.value)
+    object.__setattr__(ctx, "live_order_allowed", True)
+    return ctx
+
+
 def _adapter(api):
     from strategies.futures.squeeze_futures.data.shioaji_client import (
         ShioajiClient)
     c = ShioajiClient.__new__(ShioajiClient)
     c.is_logged_in = True
     c.api = api
+    # [Step-8] the adapter chokepoint gate requires a LIVE_READY context
+    # to permit the intended broker call (fail-closed by default)
+    c._execution_context = _ready_ctx()
     return c
 
 
@@ -315,6 +328,9 @@ def _monitor_with_raising_client(err):
     m.dry_run = False
     m.contract = SimpleNamespace(code="TMFH6")
     m._use_order_manager = False
+    # [Step-4 corrective] the direct-path gate requires a LIVE_READY
+    # context to reach the client (ctx=None is fail-closed by design)
+    m._execution_context = _ready_ctx()
     m.trader = SimpleNamespace(position=1, entry_price=0.0,
                                point_value=1, fee_per_side=0,
                                exchange_fee_per_side=0, tax_rate=0)
