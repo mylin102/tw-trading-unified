@@ -9,6 +9,7 @@ reasons and refusal codes.
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -523,8 +524,10 @@ def test_guard_session_generation_revoked():
 
 def test_guard_margin_ok():
     from core.deployment_safety_gate import guard_margin
-    assert guard_margin(300_000.0).ok
-    assert guard_margin(220_000.0).ok          # exact boundary
+    ev = {"account_identity_hash": "a" * 64, "scope": "futopt",
+          "captured_at": 1786256565.0, "canonical_input_hash": "b" * 64}
+    assert guard_margin(300_000.0, margin_evidence=ev).ok
+    assert guard_margin(220_000.0, margin_evidence=ev).ok  # exact boundary
 
 
 def test_guard_margin_ok_with_evidence():
@@ -857,7 +860,7 @@ def test_cli_margin_evidence_and_ready_for_startup(tmp_path, monkeypatch):
         "captured_at": 1786256565.0,
         "canonical_input_hash": "b" * 64,
         "available_margin": 300_000.0}), encoding="utf-8")
-    env = dict(monkeypatch.environ,
+    env = dict(os.environ,
                LRC_RELEASE_SHA=head,
                TRADING_RUNTIME_DIR=str(rt))
     r = sp.run(
