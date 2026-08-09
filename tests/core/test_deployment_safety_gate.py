@@ -920,7 +920,8 @@ def test_re_freeze_refuses_dirty_tree(tmp_path):
 
 
 def test_re_freeze_refuses_untracked(tmp_path):
-    # untracked files ALSO block the re-freeze (unless explicitly ignored)
+    # untracked files ALSO block the re-freeze — only the program-fixed
+    # allowlist (runtime artifacts) may remain
     import subprocess as sp
     repo = _git_repo(tmp_path)
     head = _head(repo)
@@ -936,8 +937,27 @@ def test_re_freeze_refuses_untracked(tmp_path):
         "dirty" in (r.stdout + r.stderr).lower(), (r.stdout + r.stderr)[-600:]
 
 
-def test_re_freeze_allow_untracked_ignore(tmp_path):
-    # explicitly controlled ignore patterns let runtime artifacts pass
+def test_re_freeze_rejects_core_untracked(tmp_path):
+    # protected paths (core/strategies/config/scripts/tests) NEVER pass —
+    # no operator glob can override the program-fixed allowlist
+    import subprocess as sp
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    (repo / "core").mkdir()
+    (repo / "core" / "evil.py").write_text("x = 1\n", encoding="utf-8")
+    r = sp.run(
+        [sys.executable, "-B",
+         str(Path(__file__).resolve().parents[2] /
+             "scripts/deployment/re_freeze.py"),
+         "--release-dir", str(repo), "--expected-sha", head],
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0, r.stdout[-600:]
+    assert "core/evil.py" in (r.stdout + r.stderr)
+
+
+def test_re_freeze_rejects_staged_manifest(tmp_path):
+    # freeze-first: the re-record target manifest must be committed-clean;
+    # a hand-staged manifest is NOT acceptable (no arbitrary bypass)
     import subprocess as sp
     repo = _git_repo(tmp_path)
     head = _head(repo)
@@ -945,23 +965,71 @@ def test_re_freeze_allow_untracked_ignore(tmp_path):
     manifest.write_text(f"Frozen SHA {head}\n"
                         f"frozen_tree_hash: {'0' * 64}\n",
                         encoding="utf-8")
-    (repo / "data").mkdir()
-    (repo / "data" / "telemetry").mkdir()
-    (repo / "data" / "telemetry" / "run-1.json").write_text(
-        "{}", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
+                   check=True)          # staged but NOT committed
+    r = sp.run(
+        [sys.executable, "-B",
+         str(Path(__file__).resolve().parents[2] /
+             "scripts/deployment/re_freeze.py"),
+         "--release-dir", str(repo), "--expected-sha", head,
+         "--manifest", str(manifest)],
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0, r.stdout[-600:]
+    assert "dirty" in (r.stdout + r.stderr).lower()
+
+
+def test_re_freeze_allowlist_telemetry_passes(tmp_path):
+    # program-fixed allowlist: data/telemetry/** runtime artifacts pass
+    import subprocess as sp
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    manifest = repo / "PHASE1_FINAL_FREEZE.md"
+    manifest.write_text(f"Frozen SHA {head}\n"
+                        f"frozen_tree_hash: {'0' * 64}\n",
+                        encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "manifest"],
+                   check=True)
+    (repo / "data" / "telemetry").mkdir(parents=True)
+    (repo / "data" / "telemetry" / "nested" / "run-1.json").write_text(
+        "{}", encoding="utf-8")
+    r = sp.run(
+        [sys.executable, "-B",
+         str(Path(__file__).resolve().parents[2] /
+             "scripts/deployment/re_freeze.py"),
+         "--release-dir", str(repo), "--expected-sha", head,
+         "--manifest", str(manifest)],
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout[-600:] + r.stderr[-400:]
+    body = manifest.read_text(encoding="utf-8")
+    assert "frozen_tree_hash: " in body and "0" * 64 not in body
+
+
+def test_re_freeze_records_identity_at_head(tmp_path):
+    # clean tree + committed manifest => the re-record updates the hash
+    import subprocess as sp
+    repo = _git_repo(tmp_path)
+    head = _head(repo)
+    manifest = repo / "PHASE1_FINAL_FREEZE.md"
+    manifest.write_text(f"Frozen SHA {head}\n"
+                        f"frozen_tree_hash: {'0' * 64}\n",
+                        encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "PHASE1_FINAL_FREEZE.md"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "manifest"],
                    check=True)
     r = sp.run(
         [sys.executable, "-B",
          str(Path(__file__).resolve().parents[2] /
              "scripts/deployment/re_freeze.py"),
          "--release-dir", str(repo), "--expected-sha", head,
-         "--manifest", str(manifest),
-         "--ignore-untracked", "data/telemetry/*"],
+         "--manifest", str(manifest)],
         capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stdout[-600:] + r.stderr[-400:]
     body = manifest.read_text(encoding="utf-8")
     assert "frozen_tree_hash: " in body and "0" * 64 not in body
+    assert head in body
 
 
 def test_cli_verdict_never_partial_ready(tmp_path, monkeypatch):
