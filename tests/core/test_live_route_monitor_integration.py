@@ -133,7 +133,8 @@ def test_logout_invalidates_monitor_certificate_route():
 STATE_CHANGING_ATTRS = ("place_order", "cancel_order", "update_order",
                         "modify_order")
 # documented downstream-gated call sites (gate lives in OrderManager.submit)
-DOWNSTREAM_GATED = {3847}
+# — function-name based (line numbers drift with edits)
+DOWNSTREAM_GATED_FUNCS = {"_submit_order_via_manager"}
 # the explicit, separately-authorized emergency marker (wiring phase)
 EMERGENCY_MARKERS = ("EMERGENCY_FLATTEN", "emergency_flatten")
 # the existing named emergency path (monitor.py:7519 _emergency_flatten_mts)
@@ -158,14 +159,19 @@ def _state_changing_sites(path):
 
 
 def _fn_calls_gate(tree, fn_name):
+    """Gate dominance: any fail-closed gate pattern inside fn —
+    assert_live_order_allowed (manager/order manager), the structured
+    is_live_ready gate (Steps 2-4), or _gate_or_raise (Step 8 adapter)."""
     for fn in ast.walk(tree):
         if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name == fn_name:
             for n in ast.walk(fn):
                 if isinstance(n, ast.Call):
                     name = (n.func.attr if isinstance(n.func, ast.Attribute)
                             else (n.func.id if isinstance(n.func, ast.Name) else ""))
-                    if name == "assert_live_order_allowed":
+                    if name in ("assert_live_order_allowed", "_gate_or_raise"):
                         return True
+                if isinstance(n, ast.Attribute) and n.attr == "is_live_ready":
+                    return True
     return False
 
 
@@ -179,7 +185,7 @@ def test_exhaustive_state_changing_routes_gated():
     monitor_text = monitor.read_text(encoding="utf-8")
     ungated = []
     for lineno, fn_name, attr in _state_changing_sites(monitor):
-        if lineno in DOWNSTREAM_GATED:
+        if fn_name in DOWNSTREAM_GATED_FUNCS:
             continue                          # OrderManager.submit gates it
         if _fn_calls_gate(tree, fn_name):
             continue                          # gate dominates this function

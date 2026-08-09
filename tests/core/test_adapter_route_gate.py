@@ -63,7 +63,7 @@ class _RecordingApi:
 
     def cancel_order(self, *a, **k):
         self.calls.append(("cancel_order", a, k))
-        return None
+        return SimpleNamespace(status=SimpleNamespace(status="Canceled"))
 
 
 def _client_stub(ctx, api=None):
