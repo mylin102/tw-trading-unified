@@ -67,6 +67,10 @@ def main() -> int:
         margin_evidence = {k: _ev.get(k) for k in (
             "account_identity_hash", "scope", "captured_at",
             "canonical_input_hash")}
+        # the margin VALUE comes from the SAME evidence JSON — a bare CLI
+        # --margin-available must never pass (the evidence is the single
+        # source of truth; missing value => fail-closed UNAVAILABLE)
+        args.margin_available = _ev.get("available_margin")
 
     manifests = args.manifest or [
         str(_REPO_ROOT / "PHASE1_RC_CANDIDATE.md"),

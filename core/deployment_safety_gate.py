@@ -269,7 +269,9 @@ def guard_flat_no_pending(position_state_path: str,
     positions = data.get("positions", data.get("position", None))
     open_orders = data.get("open_orders", data.get("pending_orders", None))
     captured_at = _parse_ts(data.get("captured_at"))
-    digest = data.get("hash") or data.get("sha256") or data.get("digest")
+    # single canonical digest name: canonical_input_hash (the preflight's
+    # content-addressed capture hash — no loose aliases)
+    digest = data.get("canonical_input_hash")
     if positions is None or open_orders is None:
         return _fail("flat_snapshot", ["GUARD_SNAPSHOT_INVALID"],
                      "positions/open_orders required")
@@ -534,7 +536,7 @@ def guard_capture_consistency(position_state_path: Optional[str],
     except (OSError, ValueError):
         return _fail("capture_consistency", ["GUARD_CAPTURE_MISMATCH"],
                      "snapshot unreadable")
-    snap_hash = data.get("hash") or data.get("canonical_input_hash")
+    snap_hash = data.get("canonical_input_hash")
     snap_raw = data.get("captured_at")
     snap_acct = data.get("account_identity_hash")
     ev_hash = margin_evidence.get("canonical_input_hash")
