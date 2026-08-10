@@ -280,6 +280,32 @@ def _set_release_env(monkeypatch):
     monkeypatch.setenv("LRC_RELEASE_SHA", head)
 
 
+def _stub_post_startup_gate(monkeypatch, ok=True, codes=()):
+    """Stub the in-process post-startup gate for tests that focus on the
+    cert/transition flow (the gate itself has dedicated tests)."""
+    from core.deployment_safety_gate import DeploymentCheck, GuardResult
+    from strategies.futures.monitor import FuturesMonitor
+
+    def _fake(self):
+        g = GuardResult(guard="post_startup", ok=ok, reasons=codes)
+        return DeploymentCheck(ok=ok, results=(g,)), None
+
+    monkeypatch.setattr(FuturesMonitor, "_run_post_startup_gate", _fake,
+                        raising=False)
+
+
+def test_no_hidden_cli_bypass():
+    """[P0] the monitor NEVER shells out to check_deployment.py — the
+    post-startup gate is in-process (imported), nothing skippable."""
+    src = (_repo_root() / "strategies/futures/monitor.py").read_text(
+        encoding="utf-8")
+    assert "check_deployment.py" not in src, \
+        "no CLI subprocess path may exist in the monitor"
+    assert "_run_post_startup_gate" in src
+    main_src = (_repo_root() / "main.py").read_text(encoding="utf-8")
+    assert "check_deployment.py" not in main_src
+
+
 def test_no_cert_startup_quarantines_no_certificate(tmp_path, monkeypatch):
     """No certificate at startup -> LIVE_QUARANTINED + NO_CERTIFICATE
     (fail-closed; live orders blocked)."""
@@ -327,6 +353,7 @@ def test_valid_cert_startup_uses_transition_with_certificate(tmp_path, monkeypat
     from strategies.futures.monitor import FuturesMonitor
     api_fake = object()
     lrc.register_session(api_fake)   # registry-bound generation (D1 gate)
+    _stub_post_startup_gate(monkeypatch)
     m = FuturesMonitor(api=api_fake, config_path=str(cfg))
     assert calls.get("cert") is cert_fake, "monitor must use the issued cert"
     assert calls.get("runtime") is runtime_fake, \
@@ -427,6 +454,7 @@ def test_bind_precedes_certification_in_startup(tmp_path, monkeypatch):
     monkeypatch.setattr(FuturesMonitor, "_bind_session_generation", _spy_bind)
     api_fake = SimpleNamespace(futopt_account=object())
     lrc.register_session(api_fake)
+    _stub_post_startup_gate(monkeypatch)
     m = FuturesMonitor(api=api_fake, config_path=str(cfg))
     assert order[:2] == ["bind", "transition"], \
         f"binding must precede certification, got {order}"
@@ -532,7 +560,108 @@ def test_recertify_after_relogin_recovers_live_ready(tmp_path, monkeypatch):
     # transitions to LIVE_READY
     monkeypatch.setattr(FuturesMonitor, "_bind_session_generation",
                         original_bind)
+    _stub_post_startup_gate(monkeypatch)
     ok = _recertify_after_reconnect(m, api_fake)
     assert ok, "recertify must succeed with the new generation"
     assert m._execution_context.is_live_ready()
     assert calls["transitions"] == 1
+
+
+def test_post_startup_gate_runs_before_transition_exactly_once(tmp_path, monkeypatch):
+    """[P0] the in-process post-startup gate runs BEFORE the transition
+    and exactly once; a passing gate yields exactly one transition."""
+    monkeypatch.chdir(tmp_path)
+    _set_release_env(monkeypatch)
+    cfg = _minimal_live_cfg(tmp_path)
+    import core.live_route_certificate as lrc
+    from core.mode_transition import ModeTransitionState, with_effective_mode
+    from core.deployment_safety_gate import DeploymentCheck, GuardResult
+    from strategies.futures.monitor import FuturesMonitor
+    calls = {"gate": 0, "transition": 0}
+
+    def fake_certify(api, **kwargs):
+        return (object(), [])
+
+    def fake_build(api, config, process_state=None):
+        return object()
+
+    def spy_transition(ctx, cert, issuer, *, runtime):
+        calls["transition"] += 1
+        return with_effective_mode(ctx, ModeTransitionState.LIVE_READY.value,
+                                   live_order_allowed=True)
+
+    def _spy_gate(self):
+        calls["gate"] += 1
+        assert calls["transition"] == 0, \
+            "post-startup gate must run BEFORE the transition"
+        g = GuardResult(guard="post_startup", ok=True)
+        return DeploymentCheck(ok=True, results=(g,)), None
+
+    monkeypatch.setattr(FuturesMonitor, "_run_post_startup_gate", _spy_gate)
+    monkeypatch.setattr(lrc, "certify_route", fake_certify)
+    monkeypatch.setattr(lrc, "build_runtime_certification_context", fake_build)
+    monkeypatch.setattr(lrc, "transition_with_certificate", spy_transition)
+    api_fake = SimpleNamespace(futopt_account=object())
+    lrc.register_session(api_fake)
+    m = FuturesMonitor(api=api_fake, config_path=str(cfg))
+    assert calls["gate"] == 1, "gate must run exactly once"
+    assert calls["transition"] == 1, "exactly one transition"
+    assert m._execution_context.is_live_ready()
+
+
+def test_gate_fail_zero_transition_persisted(tmp_path, monkeypatch):
+    """[P0] a failing gate => LIVE_QUARANTINED + POST_STARTUP_GATE_FAILED +
+    the refusal codes persisted; ZERO transitions."""
+    monkeypatch.chdir(tmp_path)
+    _set_release_env(monkeypatch)
+    cfg = _minimal_live_cfg(tmp_path)
+    import core.live_route_certificate as lrc
+    from core.mode_transition import ModeTransitionState, with_effective_mode
+    from core.deployment_safety_gate import DeploymentCheck, GuardResult
+    from strategies.futures.monitor import FuturesMonitor
+    calls = {"transition": 0}
+
+    def fake_certify(api, **kwargs):
+        return (object(), [])
+
+    def spy_transition(ctx, cert, issuer, *, runtime):
+        calls["transition"] += 1
+        return with_effective_mode(ctx, ModeTransitionState.LIVE_READY.value,
+                                   live_order_allowed=True)
+
+    def _fail_gate(self):
+        g = GuardResult(guard="post_startup", ok=False,
+                        reasons=("GUARD_MARGIN_UNAVAILABLE",))
+        return DeploymentCheck(ok=False, results=(g,)), None
+
+    monkeypatch.setattr(FuturesMonitor, "_run_post_startup_gate", _fail_gate)
+    monkeypatch.setattr(lrc, "certify_route", fake_certify)
+    monkeypatch.setattr(lrc, "transition_with_certificate", spy_transition)
+    api_fake = SimpleNamespace(futopt_account=object())
+    lrc.register_session(api_fake)
+    m = FuturesMonitor(api=api_fake, config_path=str(cfg))
+    assert calls["transition"] == 0, "a failing gate must never transition"
+    assert not m._execution_context.is_live_ready()
+    assert "POST_STARTUP_GATE_FAILED" in m._execution_context.audit_reasons
+    assert "GUARD_MARGIN_UNAVAILABLE" in m._execution_context.audit_reasons
+    assert m._execution_context.live_order_allowed is False
+
+
+def test_session_mismatch_gate_fails(tmp_path):
+    """[P0] the core gate's flat guard refuses when the snapshot session
+    != the bound generation (GUARD_SESSION_INTERVENED) — the post-startup
+    gate cannot be fooled by a stale session."""
+    import json
+    import time
+    from core.deployment_safety_gate import guard_flat_no_pending
+    _ts = int(time.time() * 1000)
+    snap = {"source": "live_broker", "mode": "live", "positions": [],
+            "open_orders": [], "captured_at": _ts,
+            "canonical_input_hash": "b" * 64,
+            "session_id": "deadbeefdeadbeef",
+            "account_identity_hash": "a" * 64}
+    pf = tmp_path / "preflight.json"
+    pf.write_text(json.dumps(snap), encoding="utf-8")
+    ctx = {"session_id": "ab" * 8}   # the bound registry generation
+    r = guard_flat_no_pending(str(pf), ctx)
+    assert not r.ok and "GUARD_SESSION_INTERVENED" in r.reasons
