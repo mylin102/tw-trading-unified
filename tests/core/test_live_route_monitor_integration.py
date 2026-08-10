@@ -926,3 +926,86 @@ def test_rollback_parity_active_canonical_manifest(tmp_path):
         assert not r2.ok and "GUARD_MANIFEST_STALE" in r2.reasons
     finally:
         os.chdir(old)
+
+
+def test_run_gate_real_check_deployment_no_crash(tmp_path, monkeypatch):
+    """[P0 regression — self-audit] _run_post_startup_gate with the REAL
+    core check_deployment (NO spy) must NOT TypeError into
+    POST_STARTUP_GATE_CRASHED — the wiring must be parameter-exact
+    (manifest_exclude_paths, NOT exclude_paths). The manifest guard
+    passes (active canonical freeze) and margin 343082 passes."""
+    import json
+    import os
+    import subprocess
+    from core.deployment_safety_gate import _exclude_self_tree_hash
+    # a tmp repo carrying the ACTIVE canonical freeze record
+    repo = tmp_path / "repo"
+    (repo / "strategies" / "futures").mkdir(parents=True)
+    (repo / "config").mkdir()
+    (repo / "core").mkdir()
+    (repo / "main.py").write_text("print(1)\n", encoding="utf-8")
+    (repo / "config" / "futures.yaml").write_text("a: 1\n", encoding="utf-8")
+    (repo / "config" / "futures_live.yaml").write_text(
+        "live_trading: true\nconfig_profile: futures_live\n",
+        encoding="utf-8")
+    (repo / "core" / "execution_context_state.py").write_text(
+        "x=1\n", encoding="utf-8")
+    (repo / "core" / "release_identity.py").write_text("x=1\n",
+                                                       encoding="utf-8")
+    (repo / "strategies" / "futures" / "monitor.py").write_text(
+        "x=1\n", encoding="utf-8")
+    (repo / "core" / "deployment_safety_gate.py").write_text(
+        "x=1\n", encoding="utf-8")
+    for d in ("PHASE1_RC_CANDIDATE.md", "PHASE2_DEPLOYMENT_MANIFEST.md"):
+        (repo / d).write_text(f"# {d} (history doc, no hash)\n",
+                              encoding="utf-8")
+    (repo / "PHASE1_FINAL_FREEZE.md").write_text("ph\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email",
+                    "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name",
+                    "t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m",
+                    "init"], check=True)
+    exclude = ["PHASE1_RC_CANDIDATE.md", "PHASE2_DEPLOYMENT_MANIFEST.md",
+               "PHASE1_FINAL_FREEZE.md"]
+    frozen = _exclude_self_tree_hash(str(repo), "HEAD", exclude)
+    (repo / "PHASE1_FINAL_FREEZE.md").write_text(
+        f"frozen_tree_hash: {frozen}\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m",
+                    "freeze"], check=True)
+    head = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    # runtime with an accepted REDEPLOY_BOOTSTRAP ctx
+    rt = tmp_path / "runtime"
+    (rt / "logs").mkdir(parents=True)
+    (rt / "execution_context.json").write_text(json.dumps({
+        "requested_mode": "live", "effective_mode": "live_quarantined",
+        "live_order_allowed": False, "audit_reasons": ["REDEPLOY_BOOTSTRAP"],
+        "revision": 1, "session_id": None, "config_hash": None}),
+        encoding="utf-8")
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(rt))
+    monkeypatch.setenv("LRC_RELEASE_SHA", head)
+    monkeypatch.setenv("PM2_PID_FILE", str(tmp_path / "nope.pid"))
+    monkeypatch.chdir(tmp_path)
+    import strategies.futures.monitor as mon_mod
+    monkeypatch.setattr(mon_mod, "__file__",
+                        str(repo / "strategies" / "futures" / "monitor.py"))
+    from strategies.futures.monitor import FuturesMonitor
+    import core.live_route_certificate as lrc
+    cfg = _minimal_live_cfg(tmp_path)
+    m = FuturesMonitor.__new__(FuturesMonitor)
+    m.api = _real_schema_api()
+    m.config_path = str(cfg)
+    m._execution_context = SimpleNamespace(session_id="ab" * 8)
+    lrc.register_session(m.api)
+    gate, _ev = m._run_post_startup_gate()   # the REAL gate, no spy
+    assert "POST_STARTUP_GATE_CRASHED" not in gate.refusal_codes, \
+        gate.refusal_codes
+    assert gate.ok, gate.refusal_codes
+    mg = gate.by_guard("margin")
+    assert mg is not None and mg.ok, f"margin guard: {mg}"
+    rg = gate.by_guard("rollback_manifest")
+    assert rg is not None and rg.ok, f"manifest guard: {rg.reasons if rg else None}"
