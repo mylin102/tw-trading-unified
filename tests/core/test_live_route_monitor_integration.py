@@ -665,3 +665,134 @@ def test_session_mismatch_gate_fails(tmp_path):
     ctx = {"session_id": "ab" * 8}   # the bound registry generation
     r = guard_flat_no_pending(str(pf), ctx)
     assert not r.ok and "GUARD_SESSION_INTERVENED" in r.reasons
+
+
+def _real_schema_api():
+    """A mock api shaped like the REAL shioaji 1.x instance: the read
+    methods are list_positions/list_trades/margin (NOT positions/orders —
+    the old attribute does not exist on the SDK)."""
+    from types import SimpleNamespace
+    acct = SimpleNamespace(account_id="A1", available_margin=None)
+    margin_obj = SimpleNamespace(available_margin=343082.0)
+    return SimpleNamespace(
+        futopt_account=acct,
+        stock_account=None,
+        list_positions=lambda a: [],          # live flat
+        list_trades=lambda a: [],
+        margin=lambda a: margin_obj,
+    )
+
+
+def test_capture_uses_real_shioaji_schema(tmp_path, monkeypatch):
+    """[P0 fix] the in-process capture must use the shioaji 1.x read
+    methods (list_positions/list_trades/margin) — the old 'positions'
+    attribute does not exist on the real SDK and made the capture fail
+    (GUARD_MARGIN_UNAVAILABLE at the real startup)."""
+    monkeypatch.chdir(tmp_path)
+    _set_release_env(monkeypatch)
+    cfg = _minimal_live_cfg(tmp_path)
+    from strategies.futures.monitor import FuturesMonitor
+    m = FuturesMonitor.__new__(FuturesMonitor)
+    m.api = _real_schema_api()
+    m.config_path = str(cfg)
+    m._execution_context = SimpleNamespace(session_id="ab" * 8)
+    snap = m._capture_post_startup_snapshot()
+    assert not snap["errors"], snap["errors"]
+    assert snap["available_margin"] == 343082.0
+    assert snap["positions"] == []
+    assert snap["open_orders"] == []
+    assert snap["session_id"] == "ab" * 8
+    assert isinstance(snap["captured_at"], int)
+    assert snap["canonical_input_hash"]
+
+
+def test_capture_normalize_with_account_tag(tmp_path):
+    """positions carry the account tag (futures/stock) + normalized
+    code/quantity/direction; open orders drop terminal states and keep
+    order_id/code/status."""
+    from types import SimpleNamespace
+    from strategies.futures.monitor import FuturesMonitor
+    pos = [SimpleNamespace(code="TMFH6", quantity=1,
+                           direction=SimpleNamespace(name="Buy"))]
+    out = FuturesMonitor._normalize_snapshot_positions(pos, "futures")
+    assert out == [{"account": "futures", "code": "TMFH6", "quantity": 1,
+                    "direction": "Buy"}]
+    t = SimpleNamespace(code="TMFH6", status=SimpleNamespace(name="Pending"),
+                        order=SimpleNamespace(id="o1"))
+    orders = FuturesMonitor._normalize_snapshot_orders([t])
+    assert orders == [{"order_id": "o1", "code": "TMFH6",
+                       "status": "Pending"}]
+
+
+def test_run_gate_passes_release_dir_manifests(tmp_path, monkeypatch):
+    """[P0 fix] the in-process gate call must pass the DEPLOYED
+    release_dir's canonical manifest paths — NEVER the CWD (a worktree/
+    dir change must not silently lose the manifest guard)."""
+    import os
+    monkeypatch.chdir(tmp_path)     # a random CWD must not matter
+    _set_release_env(monkeypatch)
+    cfg = _minimal_live_cfg(tmp_path)
+    from strategies.futures.monitor import FuturesMonitor
+    from core.deployment_safety_gate import DeploymentCheck, GuardResult
+    calls = {}
+
+    import core.deployment_safety_gate as dg
+
+    def _spy_check_deployment(**kw):
+        calls["manifest_paths"] = kw.get("manifest_paths")
+        g = GuardResult(guard="post_startup", ok=True)
+        return DeploymentCheck(ok=True, results=(g,))
+
+    monkeypatch.setattr(dg, "check_deployment", _spy_check_deployment)
+    m = FuturesMonitor.__new__(FuturesMonitor)
+    m.api = _real_schema_api()
+    m.config_path = str(cfg)
+    m._execution_context = SimpleNamespace(session_id="ab" * 8)
+    gate, _ = m._run_post_startup_gate()
+    assert gate.ok
+    rel = _repo_root()
+    expect = [str(rel / "PHASE1_RC_CANDIDATE.md"),
+              str(rel / "PHASE2_DEPLOYMENT_MANIFEST.md"),
+              str(rel / "PHASE1_FINAL_FREEZE.md")]
+    assert calls["manifest_paths"] == expect, calls["manifest_paths"]
+    for p in calls["manifest_paths"]:
+        assert os.path.exists(p), f"canonical manifest missing: {p}"
+
+
+def test_gate_fail_keeps_process_alive(tmp_path, monkeypatch):
+    """[P0 fix] a REAL (expected) gate refusal keeps the process ALIVE in
+    LIVE_QUARANTINED: the constructor returns normally (the supervisor
+    can keep monitoring), zero transitions, zero orders."""
+    monkeypatch.chdir(tmp_path)
+    _set_release_env(monkeypatch)
+    cfg = _minimal_live_cfg(tmp_path)
+    import core.live_route_certificate as lrc
+    from core.mode_transition import ModeTransitionState, with_effective_mode
+    from core.deployment_safety_gate import DeploymentCheck, GuardResult
+    from strategies.futures.monitor import FuturesMonitor
+    calls = {"transition": 0}
+
+    def fake_certify(api, **kwargs):
+        return (object(), [])
+
+    def spy_transition(ctx, cert, issuer, *, runtime):
+        calls["transition"] += 1
+        return with_effective_mode(ctx, ModeTransitionState.LIVE_READY.value,
+                                   live_order_allowed=True)
+
+    def _fail_gate(self):
+        g = GuardResult(guard="post_startup", ok=False,
+                        reasons=("GUARD_CAPTURE_MISMATCH",))
+        return DeploymentCheck(ok=False, results=(g,)), None
+
+    monkeypatch.setattr(FuturesMonitor, "_run_post_startup_gate", _fail_gate)
+    monkeypatch.setattr(lrc, "certify_route", fake_certify)
+    monkeypatch.setattr(lrc, "transition_with_certificate", spy_transition)
+    api = _real_schema_api()
+    lrc.register_session(api)
+    m = FuturesMonitor(api=api, config_path=str(cfg))  # must NOT raise/exit
+    assert calls["transition"] == 0
+    assert not m._execution_context.is_live_ready()
+    assert "POST_STARTUP_GATE_FAILED" in m._execution_context.audit_reasons
+    assert m._execution_context.live_order_allowed is False
+    assert getattr(m, "api", None) is api     # the process stays alive
