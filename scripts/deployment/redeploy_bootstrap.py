@@ -15,7 +15,8 @@ tool performs a CONTROLLED reset:
       3. sealed live config profile (config/futures_live.yaml + sha256)
       4. no pending safety reconcile in the ctx
       5. the ctx is readable and in an acceptable stale state
-         (SESSION_LOGOUT / RESTART_MAINTAIN_QUARANTINE). Corrupt,
+         (SESSION_LOGOUT / RESTART_MAINTAIN_QUARANTINE /
+         AUTH_SESSION_UNAVAILABLE). Corrupt,
          missing or any other audit state => refuse.
     Then:
       - archives the OLD ctx (full content + sha256 + timestamp) to
@@ -42,7 +43,15 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 # acceptable stale audit states for the reset (anything else => refuse)
-_ACCEPTABLE_STALE = {"SESSION_LOGOUT", "RESTART_MAINTAIN_QUARANTINE"}
+_ACCEPTABLE_STALE = {
+    "SESSION_LOGOUT",
+    "RESTART_MAINTAIN_QUARANTINE",
+    # A previous stopped process could not authenticate.  With every other
+    # bootstrap guard passing, archive that stale failure and restart only in
+    # LIVE_QUARANTINED; the post-startup certificate/gate still controls any
+    # later LIVE_READY transition.
+    "AUTH_SESSION_UNAVAILABLE",
+}
 _BLOCKING_AUDIT = {"SAFETY_STOP_RECONCILE_PENDING"}
 _BOOTSTRAP_REASON = "REDEPLOY_BOOTSTRAP"
 _RETRY_GATE_REASON = "POST_STARTUP_GATE_FAILED"
@@ -54,8 +63,8 @@ def _audit_acceptance(audits: set, retry_gate: bool, applying: bool):
 
     - a pending safety reconcile ALWAYS refuses (never reset under
       reconcile)
-    - the classic stale states (SESSION_LOGOUT / RESTART_MAINTAIN_
-      QUARANTINE) are always acceptable
+    - classic stale states (SESSION_LOGOUT / RESTART_MAINTAIN_QUARANTINE /
+      AUTH_SESSION_UNAVAILABLE) are always acceptable
     - a POST_STARTUP_GATE_FAILED ctx (with its known GUARD_* refusal
       codes) is retryable ONLY via --retry-post-startup-gate WITH
       --apply; default / dry-run / --apply alone refuse it
