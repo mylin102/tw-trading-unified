@@ -657,6 +657,20 @@ def guard_ctx_atomic_health(runtime_dir: str) -> GuardResult:
             return _pass("ctx_atomic_health",
                          "bootstrap: missing ctx written LIVE_QUARANTINED "
                          "atomically at startup (never LIVE)")
+        if reasons == ("REDEPLOY_BOOTSTRAP",):
+            # [redeploy bootstrap] an auditable reset (redeploy_bootstrap.py
+            # --apply) rewrote a stale ctx to LIVE_QUARANTINED with this
+            # reason after archiving the old content; pre_deploy accepts it
+            # (the ctx session_id is None — the flat guard performs NO
+            # standalone snapshot session comparison). post_startup still
+            # requires the registry-bound generation.
+            probe_ok = _atomic_write_probe(runtime_dir)
+            if not probe_ok:
+                return _fail("ctx_atomic_health", ["GUARD_CTX_WRITE_FAIL"])
+            return _pass("ctx_atomic_health",
+                         "redeploy bootstrap: LIVE_QUARANTINED "
+                         "REDEPLOY_BOOTSTRAP (archived, atomic, never "
+                         "LIVE_READY)")
         mapped = tuple(
             "GUARD_CTX_MISSING" if r == "RESTART_MAINTAIN_QUARANTINE"
             else "GUARD_CTX_CORRUPT" if r == "STATE_FILE_CORRUPTED"

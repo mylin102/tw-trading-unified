@@ -113,7 +113,7 @@ def test_dry_run_default_does_not_modify_ctx(env):
 
 
 def test_apply_requires_all_guards_pid_active(env):
-    (env["pid"]).write_text("999999999\n")     # active-looking pid
+    (env["pid"]).write_text(str(os.getpid()) + "\n")  # an ACTIVE pid
     r = _run(env["tmp"], *_base_args(env), "--apply")
     assert r.returncode != 0
     cur = json.loads((env["rt"] / "execution_context.json").read_text())
@@ -190,9 +190,9 @@ def test_predeploy_accepts_redeploy_bootstrap_ctx(env, monkeypatch):
     # session_id is None) and ctx_atomic_health accepts REDEPLOY_BOOTSTRAP
     from core.deployment_safety_gate import guard_flat_no_pending, \
         guard_ctx_atomic_health
-    ctx = {"audit_reasons": ["REDEPLOY_BOOTSTRAP"],
-           "effective_mode": "live_quarantined", "live_order_allowed": False,
-           "session_id": None, "config_hash": None}
+    ctx = {"requested_mode": "live", "effective_mode": "live_quarantined",
+           "live_order_allowed": False, "audit_reasons": ["REDEPLOY_BOOTSTRAP"],
+           "revision": 1, "session_id": None, "config_hash": None}
     _write_ctx(env["rt"], ctx)
     r1 = guard_flat_no_pending(str(env["pf"]), ctx)
     assert r1.ok, r1.reasons
