@@ -569,28 +569,41 @@ class OrderManager:
         if order.order_type == OrderType.MKP:
             order.price = 0  # MKP ignores price; ShioajiClient detects price==0 → MKP
 
-        # [GSD] Compatibility bridge for ShioajiClient object-based placement
-        if hasattr(self.broker_adapter, "place_order_object"):
-            result = self.broker_adapter.place_order_object(order)
-        else:
-            result = self.broker_adapter.place_order(order)
-            
+        try:
+            # The Shioaji adapter exposes this explicit object bridge.  Other
+            # legacy adapters keep their documented object interface.
+            if hasattr(self.broker_adapter, "place_order_object"):
+                result = self.broker_adapter.place_order_object(order)
+            else:
+                result = self.broker_adapter.place_order(order)
+        except Exception:
+            # No broker receipt means this is a local terminal rejection, not
+            # a submitted order that a watchdog may later cancel.
+            self.reject(order.order_id, reason="ADAPTER_SUBMIT_FAILED",
+                        source="broker_submit")
+            return False
+
         if result is None:
-            order.status = OrderStatus.REJECTED
-            order.reject_reason = "broker_api_failed"
-            self._emit("on_reject", OrderEvent(
-                order_id=order.order_id, status=OrderStatus.REJECTED,
-                symbol=order.symbol, side=order.side,
-                reason="broker_api_failed",
-            ))
+            self.reject(order.order_id, reason="BROKER_RECEIPT_MISSING",
+                        source="broker_submit")
+            return False
+
+        _status = getattr(result, "status", None)
+        _broker_order_id = (getattr(result, "id", None)
+                            or getattr(_status, "id", None))
+        _seqno = getattr(result, "seqno", None) or getattr(_status, "seqno", None)
+        _ordno = getattr(result, "ordno", None) or getattr(_status, "ordno", None)
+        if not any((_broker_order_id, _seqno, _ordno)):
+            self.reject(order.order_id, reason="BROKER_RECEIPT_MISSING",
+                        source="broker_submit")
             return False
 
         self.attach_submission(
             order.order_id,
             broker_trade=result,
-            broker_order_id=getattr(result, "id", None),
-            seqno=getattr(result, "seqno", None),
-            ordno=getattr(result, "ordno", None),
+            broker_order_id=_broker_order_id,
+            seqno=_seqno,
+            ordno=_ordno,
             raw_status="Submitted",
             source="broker_submit",
             reason="submit_live",

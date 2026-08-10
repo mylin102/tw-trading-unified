@@ -5692,7 +5692,7 @@ class FuturesMonitor:
             
             # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
             _o_near = self.order_mgr.create_order(symbol=_near_code, side=_near_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_ENTRY")
-            self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_o_near), "ref_ohlc": _snap["near"]})
+            self._append_mts_event("ORDER_INTENT_CREATED", **{**_ev_meta(_o_near), "ref_ohlc": _snap["near"]})
             
             # [GSD] Track in lifecycle orders so fill is not ignored
             self._pending_lifecycle_orders[_o_near.order_id] = {
@@ -5703,7 +5703,7 @@ class FuturesMonitor:
 
             # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
             _o_far = self.order_mgr.create_order(symbol=_far_code, side=_far_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_ENTRY")
-            self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_o_far), "ref_ohlc": _snap["far"]})
+            self._append_mts_event("ORDER_INTENT_CREATED", **{**_ev_meta(_o_far), "ref_ohlc": _snap["far"]})
             
             # [GSD] Track in lifecycle orders so fill is not ignored
             self._pending_lifecycle_orders[_o_far.order_id] = {
@@ -5732,13 +5732,28 @@ class FuturesMonitor:
                 "far_tick_age_ms": 0,
             }
             
-            self.order_mgr.submit(_o_near)
+            if not self.order_mgr.submit(_o_near):
+                self._pending_lifecycle_orders.pop(_o_near.order_id, None)
+                self._mts_pending_fills.pop(_trade_id, None)
+                self._append_mts_event("ORDER_REJECTED_LOCAL", **{
+                    **_ev_meta(_o_near), "ref_ohlc": _snap["near"],
+                    "reason": getattr(_o_near, "reject_reason", "ADAPTER_SUBMIT_FAILED"),
+                })
+                return
+            self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_o_near), "ref_ohlc": _snap["near"]})
             if self.paper_fill_sim:
                 self.paper_fill_sim.register(_o_near)
                 # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
                 self.paper_fill_sim.process_tick(self._make_synthetic_tick(_near_close, _ts, symbol=_near_code))
 
-            self.order_mgr.submit(_o_far)
+            if not self.order_mgr.submit(_o_far):
+                self._pending_lifecycle_orders.pop(_o_far.order_id, None)
+                self._append_mts_event("ORDER_REJECTED_LOCAL", **{
+                    **_ev_meta(_o_far), "ref_ohlc": _snap["far"],
+                    "reason": getattr(_o_far, "reject_reason", "ADAPTER_SUBMIT_FAILED"),
+                })
+                return
+            self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_o_far), "ref_ohlc": _snap["far"]})
             if self.paper_fill_sim:
                 self.paper_fill_sim.register(_o_far)
                 # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
@@ -5748,7 +5763,7 @@ class FuturesMonitor:
             from types import SimpleNamespace
             # 2026-05-27 Gemini CLI: Removed redundant process_tick loop
             # 2026-05-27 Gemini CLI: Removed redundant process_tick loop
-            console.print(f"[bold green]✅ [MTS_ORDER] ENTRY FILLED: near={_near_side}@{_near_close:.0f} far={_far_side}@{_far_close:.0f}[/bold green]")
+            console.print(f"[bold green]✅ [MTS_ORDER] ENTRY SUBMITTED: near={_near_side} far={_far_side}[/bold green]")
             return
 
         else:

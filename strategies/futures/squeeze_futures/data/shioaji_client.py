@@ -285,6 +285,30 @@ class ShioajiClient:
                          "action": action, "quantity": quantity,
                          "price": price, "error": str(e)}) from e
 
+    def place_order_object(self, order):
+        """Bridge the canonical OrderManager order object to Shioaji.
+
+        OrderManager submits domain ``Order`` objects, while this adapter's
+        broker boundary deliberately accepts contract/action/quantity.  Keep
+        that conversion here so a live MTS path cannot accidentally call
+        ``place_order(order)`` and fail after local intent creation.
+        """
+        symbol = getattr(order, "symbol", None)
+        contract = self.get_contract(symbol) if isinstance(symbol, str) else None
+        side = getattr(getattr(order, "side", None), "value",
+                       getattr(order, "side", None))
+        quantity = getattr(order, "quantity", None)
+        if contract is None or not isinstance(side, str) or not isinstance(quantity, int) \
+                or isinstance(quantity, bool) or quantity <= 0:
+            raise AdapterOrderError(
+                code="ADAPTER_ORDER_OBJECT_INVALID",
+                context={"method": "place_order_object", "symbol": symbol,
+                         "side": side, "quantity": quantity})
+        return self.place_order(
+            contract, action=side, quantity=quantity,
+            price=getattr(order, "price", 0) or 0,
+        )
+
     def update_order(self, trade, price: float, quantity: int = 1):
         self._gate_or_raise("update_order")         # [Step 8] fail-closed
         if not self.is_logged_in:
