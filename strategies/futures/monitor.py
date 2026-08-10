@@ -3214,7 +3214,7 @@ class FuturesMonitor:
                 config_profile_path=self.config_path,
                 config_profile_hash=_prof_hash,
                 manifest_paths=_manifests,
-                exclude_paths=_exclude,
+                manifest_exclude_paths=_exclude,
                 expected_sha=os.environ.get("LRC_RELEASE_SHA", ""),
                 phase="post_startup")
             return gate, _ev
