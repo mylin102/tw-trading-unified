@@ -184,6 +184,26 @@ def test_apply_archives_and_resets(env):
     assert cur.get("config_hash") == env["prof_hash"]
 
 
+def test_apply_archives_and_resets_stale_auth_unavailable_ctx(env):
+    """A stopped process's failed-auth startup is retryable only via quarantine.
+
+    The reset still requires every normal bootstrap guard; it archives the
+    failure and never promotes the execution context to LIVE_READY.
+    """
+    stale = {**_STALE_CTX, "audit_reasons": ["AUTH_SESSION_UNAVAILABLE"]}
+    _write_ctx(env["rt"], stale)
+
+    r = _run(env["tmp"], *_base_args(env), "--apply")
+    assert r.returncode == 0, r.stdout + r.stderr
+    archived = json.loads(next((env["rt"] / "logs" / "context_history").glob("*.json")).read_text())
+    assert archived["ctx"] == stale
+    cur = json.loads((env["rt"] / "execution_context.json").read_text())
+    assert cur["effective_mode"] == "live_quarantined"
+    assert cur["live_order_allowed"] is False
+    assert cur["audit_reasons"] == ["REDEPLOY_BOOTSTRAP"]
+    assert cur["session_id"] is None
+
+
 def test_predeploy_accepts_redeploy_bootstrap_ctx(env, monkeypatch):
     # after the reset, the pre_deploy gate accepts the bootstrap ctx: the
     # flat guard must NOT compare the standalone snapshot session (ctx
