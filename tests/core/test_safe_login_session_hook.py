@@ -16,7 +16,7 @@ import pytest
 import sys
 from types import SimpleNamespace
 
-from core.broker.shioaji_compat import safe_login
+from core.broker.shioaji_compat import fetch_all_contracts, safe_login
 from core.live_route_certificate import session_registry
 
 
@@ -215,3 +215,39 @@ def test_ca_material_returns_existing_path_and_password(monkeypatch):
 
     assert shioaji_session._require_ca_material(
         "/safe/certificate.pfx", "password") == ("/safe/certificate.pfx", "password")
+
+
+def test_contract_sync_uses_existing_futures_cache_without_child_refresh(monkeypatch):
+    """A live parent session must never trigger a second-login refresh worker."""
+    from core import shioaji_session
+    import core.broker.shioaji_compat as compat
+
+    class Api:
+        Contracts = SimpleNamespace(
+            Futures=SimpleNamespace(TMF=object()),
+        )
+
+    def unexpected_refresh(_api):
+        raise AssertionError("contract refresh must not re-login beside the live session")
+
+    monkeypatch.setattr(shioaji_session, "fetch_contracts", unexpected_refresh)
+    monkeypatch.setattr(compat.time, "sleep", lambda _seconds: None)
+
+    assert fetch_all_contracts(Api(), timeout=0.001) is True
+
+
+def test_contract_sync_missing_cache_refuses_without_child_refresh(monkeypatch):
+    """Missing cache is a safe startup refusal, not a child re-login loop."""
+    from core import shioaji_session
+    import core.broker.shioaji_compat as compat
+
+    class Api:
+        Contracts = SimpleNamespace(Futures=SimpleNamespace())
+
+    def unexpected_refresh(_api):
+        raise AssertionError("contract refresh must not re-login beside the live session")
+
+    monkeypatch.setattr(shioaji_session, "fetch_contracts", unexpected_refresh)
+    monkeypatch.setattr(compat.time, "sleep", lambda _seconds: None)
+
+    assert fetch_all_contracts(Api(), timeout=0.001) is False
