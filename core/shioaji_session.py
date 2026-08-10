@@ -97,7 +97,7 @@ def _sync_worker(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, q)
         api = sj.Shioaji()
         api.login(api_key, secret_key)
         if ca_path and os.path.exists(ca_path):
-            api.activate_ca(ca_path, ca_passwd, os.path.dirname(ca_path))
+            _activate_futopt_ca(api, ca_path, ca_passwd)
         api.fetch_contracts()
         q.put(True)
     except Exception as e:
