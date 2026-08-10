@@ -13,6 +13,7 @@ Contract:
 """
 
 import pytest
+import sys
 from types import SimpleNamespace
 
 from core.broker.shioaji_compat import safe_login
@@ -132,3 +133,40 @@ def test_ca_activation_refuses_missing_futopt_person_id():
 
     with pytest.raises(RuntimeError, match="futures account identity"):
         _activate_futopt_ca(Api(), "/safe/certificate.pfx", "password")
+
+
+def test_contract_sync_worker_uses_futopt_person_id(monkeypatch):
+    """The isolated contract-fetch session follows the same CA contract."""
+    from core import shioaji_session
+
+    class Api:
+        futopt_account = SimpleNamespace(person_id="FUTOPT_OWNER")
+
+        def __init__(self):
+            self.ca_calls = []
+
+        def login(self, *args):
+            assert args == ("api-key", "secret-key")
+
+        def activate_ca(self, **kwargs):
+            self.ca_calls.append(kwargs)
+
+        def fetch_contracts(self):
+            return None
+
+    api = Api()
+    received = []
+    monkeypatch.setitem(sys.modules, "shioaji", SimpleNamespace(Shioaji=lambda: api))
+    monkeypatch.setattr(shioaji_session.os.path, "exists", lambda path: True)
+
+    shioaji_session._sync_worker(
+        "api-key", "secret-key", "/safe/certificate.pfx", "password",
+        SimpleNamespace(put=received.append),
+    )
+
+    assert received == [True]
+    assert api.ca_calls == [{
+        "ca_path": "/safe/certificate.pfx",
+        "ca_passwd": "password",
+        "person_id": "FUTOPT_OWNER",
+    }]
