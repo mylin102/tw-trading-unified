@@ -780,6 +780,32 @@ def _recertify_after_reconnect(mon, api):
                     return False
             except Exception:
                 return False
+        # [P0 post-startup gate] in-process, UNAVOIDABLE — the reconnect's
+        # recertify is ALSO a LIVE_READY transition: the fresh read-only
+        # snapshot + the core gate run BEFORE the transition (no skippable
+        # operator CLI subprocess). Any failure keeps QUARANTINED +
+        # POST_STARTUP_GATE_FAILED + refusal codes.
+        _run_gate = getattr(mon, "_run_post_startup_gate", None)
+        if callable(_run_gate):
+            try:
+                _g, _g_ev = _run_gate()
+                if not _g.ok:
+                    mon._execution_context = with_effective_mode(
+                        mon._execution_context,
+                        ModeTransitionState.LIVE_QUARANTINED.value,
+                        live_order_allowed=False,
+                        audit_reasons=("POST_STARTUP_GATE_FAILED",) +
+                                      tuple(getattr(_g, "refusal_codes", ()) or ()))
+                    _persist_ctx(mon)
+                    return False
+            except Exception:
+                mon._execution_context = with_effective_mode(
+                    mon._execution_context,
+                    ModeTransitionState.LIVE_QUARANTINED.value,
+                    live_order_allowed=False,
+                    audit_reasons=("POST_STARTUP_GATE_FAILED",))
+                _persist_ctx(mon)
+                return False
         mon._execution_context = transition_with_certificate(
             mon._execution_context, cert, issuer, runtime=runtime)
         _persist_ctx(mon)

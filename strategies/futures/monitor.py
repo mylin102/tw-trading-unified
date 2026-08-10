@@ -619,19 +619,62 @@ class FuturesMonitor:
                                               "generation changed before "
                                               "certification; live orders blocked")
                                     else:
-                                        _runtime = build_runtime_certification_context(
-                                            _api, self.config_path,
-                                            {"process_state": {"process_start_id":
-                                                               f"monitor-{os.getpid()}"}})
-                                        self._execution_context = transition_with_certificate(
-                                            self._execution_context, _cert, _issuer,
-                                            runtime=_runtime)
-                                        self._persist_execution_context()
-                                        # [orphan reconciliation] a pending
-                                        # SAFETY_STOP_RECONCILE intent keeps
-                                        # QUARANTINED until the broker state
-                                        # reconciles
-                                        self._apply_reconcile_pending_gate()
+                                        # [P0 post-startup gate] in-process,
+                                        # UNAVOIDABLE — the fresh read-only
+                                        # snapshot (same authenticated
+                                        # api/session) + the core gate run
+                                        # BEFORE any transition_with_certificate
+                                        # / LIVE_READY. NO operator CLI
+                                        # subprocess — nothing skippable. Any
+                                        # failure keeps LIVE_QUARANTINED +
+                                        # POST_STARTUP_GATE_FAILED + refusal
+                                        # codes; zero transition / zero orders.
+                                        _gate, _gate_ev = self._run_post_startup_gate()
+                                        if not _gate.ok:
+                                            self._execution_context = with_effective_mode(
+                                                self._execution_context,
+                                                ModeTransitionState.LIVE_QUARANTINED.value,
+                                                live_order_allowed=False,
+                                                audit_reasons=(
+                                                    "POST_STARTUP_GATE_FAILED",) +
+                                                    tuple(getattr(
+                                                        _gate, "refusal_codes", ()) or ()))
+                                            self._persist_execution_context()
+                                            print(
+                                                "[MTS_EXEC_CTX] LIVE_QUARANTINED "
+                                                "POST_STARTUP_GATE_FAILED "
+                                                f"refusal_codes={getattr(_gate, 'refusal_codes', ())} "
+                                                "— live orders blocked")
+                                        elif not self._confirm_session_generation():
+                                            # [D1 race] the generation changed
+                                            # between the gate and the
+                                            # transition — do NOT promote
+                                            self._execution_context = with_effective_mode(
+                                                self._execution_context,
+                                                ModeTransitionState.LIVE_QUARANTINED.value,
+                                                live_order_allowed=False,
+                                                audit_reasons=(
+                                                    "SESSION_GENERATION_MISMATCH",))
+                                            self._persist_execution_context()
+                                            print(
+                                                "[MTS_EXEC_CTX] LIVE_QUARANTINED "
+                                                "SESSION_GENERATION_MISMATCH — "
+                                                "race after post-startup gate; "
+                                                "live orders blocked")
+                                        else:
+                                            _runtime = build_runtime_certification_context(
+                                                _api, self.config_path,
+                                                {"process_state": {"process_start_id":
+                                                                   f"monitor-{os.getpid()}"}})
+                                            self._execution_context = transition_with_certificate(
+                                                self._execution_context, _cert, _issuer,
+                                                runtime=_runtime)
+                                            self._persist_execution_context()
+                                            # [orphan reconciliation] a pending
+                                            # SAFETY_STOP_RECONCILE intent keeps
+                                            # QUARANTINED until the broker state
+                                            # reconciles
+                                            self._apply_reconcile_pending_gate()
                                     if self._execution_context.is_live_ready():
                                         print("[MTS_EXEC_CTX] LIVE_READY — "
                                               "certificate-required transition complete; "
@@ -2953,6 +2996,164 @@ class FuturesMonitor:
             return bool(_gen) and str(_ctx.session_id) == str(_gen)
         except Exception:
             return False
+
+    # ── [P0 post-startup gate] in-process, unavoidable ─────────────────────
+
+    @staticmethod
+    def _normalize_snapshot_positions(raw_positions) -> list:
+        """Normalize shioaji positions into the canonical snapshot shape
+        (account/code/quantity/direction); NEVER raw account numbers."""
+        out = []
+        for p in raw_positions or []:
+            try:
+                out.append({
+                    "account": "futures",
+                    "code": str(getattr(p, "code", "")),
+                    "quantity": int(getattr(p, "quantity", 0) or 0),
+                    "direction": getattr(getattr(p, "direction", None),
+                                         "name", None)
+                        or str(getattr(p, "direction", "")),
+                })
+            except Exception:
+                continue
+        return out
+
+    @staticmethod
+    def _normalize_snapshot_orders(raw_trades) -> list:
+        """Open orders only: terminal states are dropped (same canonical
+        terminal-state set as the standalone preflight)."""
+        terminal = {"Filled", "Canceled", "Cancelled", "Failed",
+                    "PartiallyFailed"}
+        out = []
+        for t in raw_trades or []:
+            st = getattr(t, "status", None)
+            name = getattr(st, "name", None) or str(st)
+            if name in terminal:
+                continue
+            out.append({
+                "code": str(getattr(t, "code", "")),
+                "action": getattr(getattr(t, "action", None), "name", None)
+                    or str(getattr(t, "action", "")),
+                "quantity": int(getattr(t, "quantity", 0) or 0),
+                "status": name,
+            })
+        return out
+
+    def _capture_post_startup_snapshot(self) -> dict:
+        """[P0 post-startup gate] fresh READ-ONLY capture from the SAME
+        authenticated api/session (no new login): futures positions +
+        open orders + margin + the bound registry generation as
+        session_id, with a canonical epoch-ms INT + canonical input
+        hash. Zero place/cancel/update calls; capture errors are
+        recorded in the payload (the gate fails closed)."""
+        import hashlib as _hl
+        import json as _json
+        captured_at = int(time.time() * 1000)
+        _api = getattr(self, "api", None)
+        _ctx = getattr(self, "_execution_context", None)
+        session_id = getattr(_ctx, "session_id", None) or None
+        positions, open_orders, margin = [], [], None
+        acct_hash = None
+        errors = {}
+        try:
+            _acct = getattr(_api, "futopt_account", None)
+            if _acct is None and hasattr(_api, "list_accounts"):
+                _accts = _api.list_accounts() or []
+                _acct = _accts[0] if _accts else None
+            if _acct is not None:
+                _aid = getattr(_acct, "account_id", None) \
+                    or getattr(_acct, "account_no", "") or ""
+                if _aid:
+                    acct_hash = _hl.sha256(str(_aid).encode()).hexdigest()
+                positions = self._normalize_snapshot_positions(
+                    _api.positions(_acct))
+                open_orders = self._normalize_snapshot_orders(
+                    _api.list_trades(_acct) or [])
+                margin = getattr(_acct, "available_margin", None)
+            else:
+                errors["capture"] = "no account available"
+        except Exception as exc:
+            errors["capture"] = f"{type(exc).__name__}: {exc}"
+        payload = {
+            "source": "live_broker",
+            "mode": "live",
+            "account_identity_hash": acct_hash,
+            "session_id": session_id,
+            "captured_at": captured_at,
+            "positions": positions,
+            "open_orders": open_orders,
+            "available_margin": margin,
+            "canonical_input_hash": None,
+            "fetch_status": {"capture": "OK" if not errors else "FAIL"},
+            "errors": errors,
+        }
+        blob = _json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                           default=str)
+        payload["canonical_input_hash"] = _hl.sha256(blob.encode()).hexdigest()
+        return payload
+
+    def _run_post_startup_gate(self):
+        """[P0 post-startup gate] the in-process, UNAVOIDABLE gate run
+        BEFORE any transition_with_certificate / LIVE_READY (startup AND
+        reconnect-recertify). Fresh read-only snapshot from the SAME
+        authenticated api/session; the evidence is archived under the
+        runtime logs; then the core gate (check_deployment) runs with
+        phase=post_startup + the bound generation. NO operator CLI
+        subprocess — nothing skippable. Returns (gate, evidence_path)."""
+        snapshot = self._capture_post_startup_snapshot()
+        _ev = None
+        try:
+            from core.runtime_paths import runtime_path
+            _ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+            _ev = Path(runtime_path("logs", f"post_startup_{_ts}.json"))
+            _ev.parent.mkdir(parents=True, exist_ok=True)
+            _ev.write_text(json.dumps(snapshot, ensure_ascii=False,
+                                      default=str), encoding="utf-8")
+        except Exception:
+            _ev = None
+        try:
+            from core.deployment_safety_gate import check_deployment
+            import hashlib as _hl
+            _prof_hash = ""
+            try:
+                if os.path.exists(self.config_path):
+                    _prof_hash = _hl.sha256(
+                        Path(self.config_path).read_bytes()).hexdigest()
+            except Exception:
+                _prof_hash = ""
+            _gen = None
+            try:
+                from core.live_route_certificate import session_registry
+                _gen = session_registry.generation(getattr(self, "api", None))
+            except Exception:
+                _gen = None
+            _closure = [
+                "config/futures.yaml", "config/futures_live.yaml",
+                "core/execution_context_state.py", "core/release_identity.py",
+                "main.py", "strategies/futures/monitor.py",
+                "core/deployment_safety_gate.py",
+            ]
+            gate = check_deployment(
+                release_dir=str(Path(__file__).resolve().parents[2]),
+                closure_files=_closure,
+                runtime_dir=None,
+                pid_file=os.environ.get("PM2_PID_FILE",
+                                        "/tmp/trading-unified.pid"),
+                position_state_path=str(_ev) if _ev is not None else None,
+                margin_evidence=snapshot,
+                session_generation=_gen, session_revoked=False,
+                config_profile_path=self.config_path,
+                config_profile_hash=_prof_hash,
+                expected_sha=os.environ.get("LRC_RELEASE_SHA", ""),
+                phase="post_startup")
+            return gate, _ev
+        except Exception:
+            from core.deployment_safety_gate import (
+                DeploymentCheck, GuardResult)
+            _g = GuardResult(guard="post_startup", ok=False,
+                             reasons=("POST_STARTUP_GATE_CRASHED",))
+            _c = DeploymentCheck(ok=False, results=(_g,))
+            return _c, _ev
 
     def _place_safety_stop(self, entry_price, direction, lots, stop_loss_pts):
         """Place a far-limit order at exchange as safety stop for disconnect protection."""
