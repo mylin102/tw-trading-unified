@@ -2874,6 +2874,42 @@ class FuturesMonitor:
             console.print(f"[dim]⚠️ exec ctx persist failed: {_pexc} "
                           f"(file keeps last good state)[/dim]")
 
+    def _quarantine_mts_entry_partial_submission(
+            self, *, trade_id: str, submitted_order, failed_order) -> None:
+        """Contain a sequential MTS entry after only one leg was accepted.
+
+        Acknowledgement of the first leg creates a real exposure or pending
+        broker order.  The second-leg rejection is therefore not an ordinary
+        local failure: live trading is quarantined and the durable event
+        identifies both legs for operator reconciliation.  This method never
+        sends an automatic broker cancel or compensating order.
+        """
+        _reason = "MTS_ENTRY_PARTIAL_SUBMISSION"
+        _ctx = getattr(self, "_execution_context", None)
+        if _ctx is not None and getattr(_ctx, "requested_mode", None) == "live":
+            from core.mode_transition import ModeTransitionState, with_effective_mode
+            self._execution_context = with_effective_mode(
+                _ctx, ModeTransitionState.LIVE_QUARANTINED.value,
+                live_order_allowed=False,
+                audit_reasons=(_reason,) + tuple(
+                    getattr(_ctx, "audit_reasons", ()) or ()))
+            self._persist_execution_context()
+
+        self._append_mts_event(
+            _reason,
+            trade_id=trade_id,
+            submitted_order_id=getattr(submitted_order, "order_id", None),
+            submitted_broker_order_id=getattr(
+                submitted_order, "exchange_order_id", None),
+            failed_order_id=getattr(failed_order, "order_id", None),
+            reason=getattr(failed_order, "reject_reason", None)
+                   or "ADAPTER_SUBMIT_FAILED",
+        )
+        console.print(
+            "[red]🚫 [MTS_ENTRY] partial submission: live trading "
+            "QUARANTINED; no compensating order was sent. Reconcile the "
+            "submitted leg with the broker before re-certification.[/red]")
+
     def _on_session_logout(self):
         """[Step 7] real broker logout: the current session registry
         generation is invalidated BEFORE the broker logout (centralized
@@ -5752,6 +5788,11 @@ class FuturesMonitor:
                     **_ev_meta(_o_far), "ref_ohlc": _snap["far"],
                     "reason": getattr(_o_far, "reject_reason", "ADAPTER_SUBMIT_FAILED"),
                 })
+                self._quarantine_mts_entry_partial_submission(
+                    trade_id=_trade_id,
+                    submitted_order=_o_near,
+                    failed_order=_o_far,
+                )
                 return
             self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_o_far), "ref_ohlc": _snap["far"]})
             if self.paper_fill_sim:
