@@ -229,3 +229,65 @@ def test_paper_second_leg_rejection_records_evidence_without_live_quarantine():
         ModeTransitionState.PAPER_ACTIVE.value)
     assert persisted == []
     assert events == ["MTS_ENTRY_PARTIAL_SUBMISSION"]
+
+
+def test_persist_syncs_live_context_to_wrapped_adapter_without_prior_attr(monkeypatch):
+    """A ``__new__``-wrapped live adapter must still receive LIVE_READY."""
+    from core import execution_context_state
+    from core.mode_transition import ExecutionContext, ModeTransitionState
+    from strategies.futures.monitor import FuturesMonitor
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.client = SimpleNamespace()
+    monitor._execution_context = ExecutionContext(
+        requested_mode="live",
+        effective_mode=ModeTransitionState.LIVE_READY.value,
+        live_order_allowed=True,
+    )
+    monkeypatch.setattr(execution_context_state, "persist_execution_context", lambda payload: None)
+
+    monitor._persist_execution_context()
+
+    assert monitor.client._execution_context is monitor._execution_context
+
+
+def test_mts_near_rejection_terminally_rejects_unsubmitted_far(monkeypatch):
+    """A failed first entry leg cannot leave an unsubmitted far leg for watchdog."""
+    from datetime import datetime
+    from strategies.futures import monitor as monitor_module
+    from strategies.futures.monitor import FuturesMonitor
+
+    manager = OrderManager(mode="paper")
+    submitted, events = [], []
+
+    def reject_near(order):
+        submitted.append(order.symbol)
+        manager.reject(order.order_id, reason="ADAPTER_SUBMIT_FAILED", source="test")
+        return False
+
+    manager.submit = reject_near
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.live_trading = True
+    monitor._execution_context = None
+    monitor.order_mgr = manager
+    monitor.paper_fill_sim = None
+    monitor.contract = SimpleNamespace(code="TMFH6")
+    monitor.far_contract = SimpleNamespace(code="TMFI6")
+    monitor._pending_lifecycle_orders = {}
+    monitor._mts_pending_fills = {}
+    monitor._mts_block_entry_if_open_position = lambda strategy, action: False
+    monitor._append_mts_event = lambda kind, **payload: events.append((kind, payload))
+    monkeypatch.setattr(monitor_module, "is_taifex_futures_market_open", lambda: True)
+
+    monitor._submit_mts_order_signal(
+        SimpleNamespace(action="SELL_NEAR_BUY_FAR", reason="test"),
+        SimpleNamespace(),
+        {"near_close": 100.0, "far_close": 110.0},
+        datetime(2026, 8, 10, 20, 6, 40),
+    )
+
+    assert submitted == ["TMFH6"]
+    assert manager.active_orders == {}
+    assert [order.status for order in manager.completed] == [OrderStatus.REJECTED, OrderStatus.REJECTED]
+    assert manager.completed[1].reject_reason == "PRECEDING_LEG_REJECTED"
+    assert [kind for kind, _ in events].count("ORDER_SUBMITTED") == 0
