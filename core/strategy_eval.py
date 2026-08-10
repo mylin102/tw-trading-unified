@@ -9,6 +9,7 @@ No trade IS a decision. Record it.
 """
 
 from __future__ import annotations
+from core.runtime_paths import runtime_logs
 
 import json
 import os
@@ -18,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-_log_dir = Path(__file__).resolve().parent.parent / "logs" / "router_trace"
+_log_dir = Path(runtime_logs("router_trace"))
 _lock = threading.Lock()
 
 

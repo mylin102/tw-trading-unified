@@ -5,6 +5,7 @@ tw-trading-unified — 整合儀表板 v2
 """
 import sys
 from pathlib import Path as _Path
+from core.runtime_paths import runtime_logs
 sys.path.insert(0, str(_Path(__file__).parent.parent))
 
 import streamlit as st
@@ -384,7 +385,7 @@ with st.sidebar:
     try:
         import json as _json
         import glob as _glob
-        _trace_files = sorted(_glob.glob("logs/router_trace/router_trace_*.jsonl"), reverse=True)
+        _trace_files = sorted(_glob.glob(os.path.join(runtime_logs("router_trace"), "router_trace_*.jsonl")), reverse=True)
         if _trace_files:
             with open(_trace_files[0]) as _f:
                 _lines = [l for l in _f if l.strip()]
@@ -2098,7 +2099,7 @@ def load_far_month_data(product="TMF"):
     # [Far Month Live] Priority 1: Read from trading-system's live far-month CSV
     # 2026-05-27 Gemini CLI: Search both case variants to avoid missing TMF_far_*.csv; Restored missing Path/log_dir
     from pathlib import Path
-    log_dir = Path("logs/market_data")
+    log_dir = Path(runtime_logs("market_data"))
     live_far_patterns = [f"{product.lower()}_far_*.csv", f"{product.upper()}_far_*.csv"]
     live_far_files = []
     if log_dir.exists():
@@ -2140,7 +2141,7 @@ def load_far_month_data(product="TMF"):
     search_patterns = [
         f"./data/{product.lower()}_far_*.csv",
         f"./data/{product.lower()}_far.csv",
-        f"./logs/market_data/{product}_*_far_*.csv",
+        fos.path.join(runtime_logs("market_data"), f"{product}_*_far_*.csv"),
         f"./exports/{product.lower()}_far_*.csv",
     ]
     
@@ -2329,7 +2330,7 @@ def load_calendar_spread_data():
         far_files = list(Path("data").glob("*far*.csv"))
         if not far_files:
             # 嘗試在 logs/market_data 中尋找
-            far_files = list(Path("logs/market_data").glob("*far*.csv"))
+            far_files = list(Path(runtime_logs("market_data")).glob("*far*.csv"))
         if not far_files:
             # 嘗試在 exports 中尋找
             far_files = list(Path("exports").glob("*far*.csv"))
@@ -4332,7 +4333,7 @@ elif _selected_product == "TMF":
                             _near_event = ""
                             _far_event = ""
                             try:
-                                _el_path = os.path.join(BASE, "logs/mts_spread_events.jsonl")
+                                _el_path = os.path.join(runtime_logs(), "mts_spread_events.jsonl")
                                 if os.path.exists(_el_path):
                                     _recent = []
                                     with open(_el_path) as _ef:
@@ -4424,7 +4425,7 @@ elif _selected_product == "TMF":
                 st.caption(f"Flag: {_flag_path}")
 
                 # ── MTS Spread Event Ledger ──
-                _event_log_path = os.path.join(BASE, "logs/mts_spread_events.jsonl")
+                _event_log_path = os.path.join(runtime_logs(), "mts_spread_events.jsonl")
                 if os.path.exists(_event_log_path):
                     try:
                         _events = []
@@ -5474,7 +5475,7 @@ elif page == "策略管道":
     st.subheader("🕐 每小時審計時間軸 (Hourly Audit Timeline)")
     try:
         from pathlib import Path
-        audit_dir = Path("logs/market_data")
+        audit_dir = Path(runtime_logs("market_data"))
         today_str = datetime.datetime.now().strftime("%Y%m%d")
         audit_file = audit_dir / f"{_TICKER}_{today_str}_signals_audit.csv"
 

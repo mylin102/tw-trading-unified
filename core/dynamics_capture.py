@@ -5,7 +5,7 @@ Instrumentation only — zero impact on trading decisions.
 Non-blocking bounded queue in callback → dedicated writer thread → per-generation JSONL.
 
 Usage:
-    capture = DynamicsCaptureHook(log_dir="logs/ticks/dynamics")
+    capture = DynamicsCaptureHook(log_dir=runtime_logs("ticks", "dynamics"))
     capture.start()
 
     # In callback:
@@ -16,6 +16,7 @@ Usage:
 """
 
 from __future__ import annotations
+from core.runtime_paths import runtime_logs
 
 import json
 import logging
@@ -131,7 +132,7 @@ class DynamicsCaptureHook:
 
     def __init__(
         self,
-        log_dir: str | Path = "logs/ticks/dynamics",
+        log_dir: str | Path = runtime_logs("ticks", "dynamics"),
         queue_maxsize: int = 10_000,
         flush_interval_ms: int = 500,
         flush_batch_size: int = 100,

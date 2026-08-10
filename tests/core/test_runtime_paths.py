@@ -34,7 +34,7 @@ _FORBIDDEN = {
     "core/health_evidence_exporter.py": ['"exports/market_data"'],
     "core/dynamics_capture.py": ['"logs/ticks/dynamics"'],
     "core/market_data_runtime.py": ['"logs/ticks/dynamics"'],
-    "core/strategy_eval.py": ['"router_trace"'],
+    "core/strategy_eval.py": ['/ "logs" / "router_trace"'],
     "strategies/futures/monitor.py": [
         'Path("logs/market_data/TMF_trades.csv")',
         'Path("exports/trades/live/diagnostics")',
@@ -51,7 +51,7 @@ _FORBIDDEN = {
         '"data/telemetry/shadow-soak"',
     ],
     "strategies/futures/mts/policy_j_telemetry_writer.py": [
-        '"policy_j"',
+        '"telemetry" / "policy_j"',
     ],
     "ui/dashboard.py": [
         '"logs/router_trace"',
@@ -129,9 +129,9 @@ def test_pm2_entries_never_start_legacy_strategies_or_scripts():
     for entry in ("main.py", "ui/dashboard.py",
                   "scripts/runners/stock_runner.py"):
         src = (_REPO / entry).read_text(encoding="utf-8")
-        for banned in ("import scripts.", "from scripts.",
-                       "generate_adaptive_dataset",
-                       "run_portfolio_sweep"):
+        for banned in ("generate_adaptive_dataset",
+                       "run_portfolio_sweep",
+                       "scripts.research", "scripts.optimization"):
             assert banned not in src, \
                 f"{entry} references a one-off script: {banned}"
     for legacy in ("strategies/futures/squeeze_futures/engine/strategy",

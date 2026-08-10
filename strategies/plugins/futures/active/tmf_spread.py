@@ -29,6 +29,7 @@ Re-entry:
 """
 
 from __future__ import annotations
+from core.runtime_paths import runtime_logs
 
 import logging
 import os
@@ -1736,7 +1737,7 @@ class TMFSpread(StrategyBase):
         try:
             from strategies.futures.mts.soak_collector import ShadowSoakCollector
             self._soak_collector = ShadowSoakCollector(
-                base_dir="data/telemetry/shadow-soak",
+                base_dir=runtime_logs("telemetry", "shadow-soak"),
                 deployment_id=f"tmf-spread-{self._ticker.lower()}",
                 authority="legacy",
                 override_git_clean=True,

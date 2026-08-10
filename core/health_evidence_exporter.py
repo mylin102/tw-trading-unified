@@ -15,6 +15,7 @@ Design:
 """
 
 from __future__ import annotations
+from core.runtime_paths import runtime_path
 
 import json
 import logging
@@ -51,7 +52,7 @@ class HealthEvidenceSampler:
         sampler = HealthEvidenceSampler(
             health_fn=runtime.health,
             product_code="MXF",
-            output_dir="exports/market_data",
+            output_dir=runtime_path("exports", "market_data"),
         )
         sampler.start()
 
@@ -64,7 +65,7 @@ class HealthEvidenceSampler:
         health_fn: Callable[[], Any],
         *,
         product_code: str = "MXF",
-        output_dir: str = "exports/market_data",
+        output_dir: str = runtime_path("exports", "market_data"),
         run_id: str | None = None,
         interval_sec: float = 30.0,
         git_commit: str | None = None,

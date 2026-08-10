@@ -6220,7 +6220,7 @@ class FuturesMonitor:
         threading.Thread(target=_bg_backfill, daemon=True).start()
 
         from core.diagnostic_engine import DiagnosticEngine
-        self.diag_engine = DiagnosticEngine(str(Path("logs/market_data/TMF_trades.csv")))
+        self.diag_engine = DiagnosticEngine(str(Path(runtime_logs("market_data")) / "TMF_trades.csv"))
         self._diag_counter = 0
 
         console.print(f"[green][FuturesMonitor] started ({mode}). Status: WARMING_UP[/green]")
@@ -6680,7 +6680,7 @@ class FuturesMonitor:
         console.print(f"[cyan]📷 [BROKER_PROBE] {request_id}: capturing snapshot...[/cyan]")
 
         # Create diagnostic output directory
-        diag_dir = Path("exports/trades/live/diagnostics")
+        diag_dir = Path(runtime_path("exports", "trades", "live", "diagnostics"))
         diag_dir.mkdir(parents=True, exist_ok=True)
 
         try:

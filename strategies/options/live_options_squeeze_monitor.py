@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from rich.console import Console
+from core.runtime_paths import runtime_logs
 
 # ── Contract date normalization helper ──────────────────────────────
 # Shioaji may return delivery_date as str, datetime.date, or datetime.datetime.
@@ -340,7 +341,7 @@ class ShioajiOptionsSmartMonitor:
     def _update_log_paths(self):
         log_sub_dir = "live_trading" if self.live_trading else "paper_trading"
         # Use cwd-based path (main.py runs from tw-trading-unified root)
-        log_base = Path(os.getcwd()) / "strategies" / "options" / "logs" / log_sub_dir
+        log_base = Path(runtime_logs("options")) / log_sub_dir
         try:
             if log_base.exists() and not log_base.is_dir():
                 log_base.unlink()
@@ -993,7 +994,7 @@ class ShioajiOptionsSmartMonitor:
 
             now = _dt.datetime.now()
             date_str = get_session_date_str(now)
-            log_base = Path("logs/market_data")
+            log_base = Path(runtime_logs("market_data"))
             log_base.mkdir(parents=True, exist_ok=True)
             csv_path = log_base / f"OPTIONS_{date_str}_indicators.csv"
 
@@ -2030,7 +2031,7 @@ class ShioajiOptionsSmartMonitor:
     def _resolve_futures_squeeze_state(self, bar_ts):
         bar_time = pd.Timestamp(bar_ts)
         date_str = get_session_date_str(bar_time.to_pydatetime())
-        market_dir = Path("logs/market_data")
+        market_dir = Path(runtime_logs("market_data"))
         patterns = [
             f"TMF_{date_str}_*_indicators.csv",
             "TMF_*_indicators.csv",
@@ -3425,7 +3426,7 @@ class ShioajiOptionsSmartMonitor:
     def _audit_signal(self, signal_type, side, signal_data, rejection_reason):
         """記錄信號審計軌跡到 CSV（與期貨系統共用格式）"""
         from pathlib import Path
-        log_dir = Path("logs/market_data")
+        log_dir = Path(runtime_logs("market_data"))
         log_dir.mkdir(parents=True, exist_ok=True)
         date_str = datetime.datetime.now().strftime("%Y%m%d")
         audit_file = log_dir / f"MTX_{date_str}_signals_audit.csv"
@@ -4514,7 +4515,7 @@ class ShioajiOptionsSmartMonitor:
             "watchdog_state": self._watchdog_state,
         }
         event.update(kwargs)
-        log_dir = Path("logs/options_watchdog")
+        log_dir = Path(runtime_logs("options_watchdog"))
         log_dir.mkdir(parents=True, exist_ok=True)
         with open(log_dir / "watchdog_events.jsonl", "a") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
