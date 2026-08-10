@@ -848,7 +848,7 @@ def test_run_gate_manifest_exclude_parity_with_cli(tmp_path, monkeypatch):
 
     def _spy_check_deployment(**kw):
         calls["manifest_paths"] = kw.get("manifest_paths")
-        calls["exclude_paths"] = kw.get("exclude_paths")
+        calls["exclude_paths"] = kw.get("manifest_exclude_paths")
         g = GuardResult(guard="post_startup", ok=True)
         return DeploymentCheck(ok=True, results=(g,))
 
