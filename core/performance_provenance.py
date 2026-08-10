@@ -31,6 +31,9 @@ import time
 SNAPSHOT_MAX_AGE_S = 600.0
 
 _EVIDENCE_FIELDS = ("mode", "run_id", "config_hash")
+# the ONLY accepted live source marker (documented canonical equivalent)
+LIVE_SOURCE = "live_broker_reconciled"
+_SESSION_KEYS = ("session_id", "generation", "session_generation")
 
 
 def _iter_records(path):
@@ -54,11 +57,17 @@ def classify_mts_evidence(fills_path, events_path) -> dict:
 
     Returns:
       evidence_mode: "live" | "paper" | "legacy" | "mixed" | "missing"
-      run_ids / config_hashes: the distinct values found
+      run_ids / config_hashes / session_ids / sources: distinct values
       record_count: scanned records
       reason: None or an explicit source-attribution explanation
+
+    LIVE is STRICT (fail-closed): evidence is classified "live" ONLY when
+    EVERY record carries mode="live" AND exactly one non-empty run_id AND
+    exactly one non-empty config_hash AND exactly one non-empty
+    session/generation AND every source == "live_broker_reconciled".
+    Any missing/mixed/unknown value degrades to "mixed" (N/A downstream).
     """
-    modes, run_ids, hashes = set(), set(), set()
+    modes, run_ids, hashes, sessions, sources = set(), set(), set(), set(), set()
     n = 0
     for path in (fills_path, events_path):
         for rec in _iter_records(path):
@@ -72,15 +81,25 @@ def classify_mts_evidence(fills_path, events_path) -> dict:
             c = rec.get("config_hash")
             if isinstance(c, str) and c:
                 hashes.add(c)
+            s = next((rec.get(k) for k in _SESSION_KEYS
+                      if isinstance(rec.get(k), str) and rec.get(k)), None)
+            if s:
+                sessions.add(s)
+            src = rec.get("source")
+            if isinstance(src, str) and src:
+                sources.add(src)
     if n == 0:
         return {"evidence_mode": "missing", "record_count": 0,
-                "run_ids": [], "config_hashes": [], "reason": None}
+                "run_ids": [], "config_hashes": [], "session_ids": [],
+                "sources": [], "reason": None}
     if modes:
         known = modes & {"paper", "live"}
         if known and len(known) > 1:
             return {"evidence_mode": "mixed", "record_count": n,
                     "run_ids": sorted(run_ids),
                     "config_hashes": sorted(hashes),
+                    "session_ids": sorted(sessions),
+                    "sources": sorted(sources),
                     "reason": "ledger mixes paper and live execution "
                               "evidence — cannot attribute"}
         if known:
@@ -90,20 +109,64 @@ def classify_mts_evidence(fills_path, events_path) -> dict:
                 return {"evidence_mode": "mixed", "record_count": n,
                         "run_ids": sorted(run_ids),
                         "config_hashes": sorted(hashes),
+                        "session_ids": sorted(sessions),
+                        "sources": sorted(sources),
                         "reason": f"ledger carries unknown modes "
                                   f"{sorted(unknown)} — cannot attribute"}
+            if mode == "live":
+                # STRICT live: the full provenance must be present and
+                # single-valued on EVERY record (audit correction — an
+                # unproven live ledger must NEVER pass)
+                missing = []
+                if not run_ids:
+                    missing.append("run_id")
+                elif len(run_ids) > 1:
+                    missing.append(f"multiple run_ids {sorted(run_ids)}")
+                if not hashes:
+                    missing.append("config_hash")
+                elif len(hashes) > 1:
+                    missing.append(f"multiple config_hashes "
+                                   f"{sorted(hashes)}")
+                if not sessions:
+                    missing.append("session/generation")
+                elif len(sessions) > 1:
+                    missing.append(f"multiple sessions {sorted(sessions)}")
+                if not sources:
+                    missing.append("source")
+                elif sources != {LIVE_SOURCE}:
+                    missing.append(f"source {sorted(sources)} != "
+                                   f"{LIVE_SOURCE}")
+                if missing:
+                    return {"evidence_mode": "mixed", "record_count": n,
+                            "run_ids": sorted(run_ids),
+                            "config_hashes": sorted(hashes),
+                            "session_ids": sorted(sessions),
+                            "sources": sorted(sources),
+                            "reason": "live ledger incomplete/unproven: "
+                                      + "; ".join(missing)}
+                return {"evidence_mode": "live", "record_count": n,
+                        "run_ids": sorted(run_ids),
+                        "config_hashes": sorted(hashes),
+                        "session_ids": sorted(sessions),
+                        "sources": sorted(sources), "reason": None}
+            # paper mode (explicit)
             return {"evidence_mode": mode, "record_count": n,
                     "run_ids": sorted(run_ids),
-                    "config_hashes": sorted(hashes), "reason": None}
+                    "config_hashes": sorted(hashes),
+                    "session_ids": sorted(sessions),
+                    "sources": sorted(sources), "reason": None}
         # only unknown mode strings
         return {"evidence_mode": "mixed", "record_count": n,
                 "run_ids": sorted(run_ids),
                 "config_hashes": sorted(hashes),
+                "session_ids": sorted(sessions),
+                "sources": sorted(sources),
                 "reason": "ledger carries no recognizable paper/live mode "
                           "provenance — cannot attribute"}
     # no per-record mode: legacy evidence
     return {"evidence_mode": "legacy", "record_count": n,
             "run_ids": sorted(run_ids), "config_hashes": sorted(hashes),
+            "session_ids": sorted(sessions), "sources": sorted(sources),
             "reason": "legacy ledger without per-record mode/run_id/"
                       "config_hash provenance"}
 
@@ -126,13 +189,24 @@ def scope_mts_performance(runtime_truth: dict, evidence: dict) -> dict:
     if rt.get("is_live_runtime"):
         mode = "live"
         if em == "live":
-            # config_hash must match the active sealed profile
-            if ev.get("config_hashes") and rt.get("config_hash") and \
-                    ev.get("config_hashes") != [rt["config_hash"]]:
+            # STRICT live (audit correction): the classifier already
+            # guarantees every record has mode=live + one run_id + one
+            # config_hash + one session + source=live_broker_reconciled.
+            # The scope additionally requires config_hash == the ACTIVE
+            # sealed profile hash AND the session == the ACTIVE runtime
+            # session/generation.
+            if ev.get("config_hashes") != [rt.get("config_hash")]:
                 return {"ok": False, "mode": mode, "reason":
                         "live view: ledger config_hash does not match the "
                         "active sealed profile — source mismatch",
                         "run_id": None, "config_hash": rt.get("config_hash")}
+            if rt.get("session_id") and \
+                    ev.get("session_ids") != [rt.get("session_id")]:
+                return {"ok": False, "mode": mode, "reason":
+                        "live view: ledger session/generation does not "
+                        "match the active runtime session — source "
+                        "mismatch", "run_id": None,
+                        "config_hash": rt.get("config_hash")}
             run_id = ev["run_ids"][0] if len(ev.get("run_ids") or []) == 1 \
                 else None
             return {"ok": True, "mode": mode, "reason": None,

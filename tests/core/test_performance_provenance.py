@@ -103,12 +103,13 @@ def test_missing_or_stale_evidence_na(tmp_path):
     assert ev["evidence_mode"] == "missing"
     scope = scope_mts_performance(_rt(is_live_runtime=True), ev)
     assert not scope["ok"] and "missing" in scope["reason"]
-    # live scope with a config_hash drift => N/A
-    fills = _write_ledger(tmp_path, [{"trade_id": "t1", "mode": "live",
-                                      "config_hash": "ff" * 32}])
+    # live scope with a config_hash drift => N/A (fully-proven live
+    # record whose hash != the active sealed profile)
+    fills = _write_ledger(tmp_path,
+                          _live_records(config_hash="ff" * 32))
     ev2 = classify_mts_evidence(fills, None)
-    scope2 = scope_mts_performance(_rt(is_live_runtime=True,
-                                       config_hash="ab" * 32), ev2)
+    assert ev2["evidence_mode"] == "live", ev2
+    scope2 = scope_mts_performance(_live_rt(), ev2)
     assert not scope2["ok"] and "config_hash" in scope2["reason"]
 
 
@@ -183,7 +184,7 @@ def test_live_evidence_missing_field_is_na(tmp_path, broken):
 def test_live_evidence_multiple_run_ids_na(tmp_path):
     """Two distinct run_ids in a live ledger => N/A (no merged runs)."""
     recs = [_live_records()[0],
-            _live_records(trade_id="t2", run_id="run-2")]
+            _live_records(trade_id="t2", run_id="run-2")[0]]
     fills = _write_ledger(tmp_path, recs)
     ev = classify_mts_evidence(fills, None)
     assert ev["evidence_mode"] != "live"

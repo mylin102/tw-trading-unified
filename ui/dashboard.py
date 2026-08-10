@@ -583,6 +583,7 @@ def summarize_execution_context(context, known_profile_hashes):
         "audit_reasons": audit_reasons,
         "context_version": context.get("revision", "unknown"),
         "context_freshness": context.get("updated_at") or "UNKNOWN",
+        "session_id": context.get("session_id") or None,
         "warning": warning,
         "is_live_runtime": is_live_runtime,
         "is_paper_runtime": is_paper_runtime,
