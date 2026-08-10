@@ -518,6 +518,66 @@ def guard_rollback_manifest(release_dir: str,
 # ── 11. capture consistency (flat + margin same preflight capture) ─────────
 
 
+def guard_config_profile(config_profile_path: Optional[str],
+                         recorded_hash: Optional[str],
+                         captured_at: Optional[float] = None
+                         ) -> GuardResult:
+    """Sealed live config profile gate (P0 decision 2).
+
+    The LIVE deployment must run the tracked, sealed
+    config/futures_live.yaml profile (live_trading=true +
+    config_profile=futures_live). The certification records the profile
+    path + sha256; this guard validates:
+
+      - profile file exists + live_trading true + config_profile marker
+        (the paper default NEVER passes)
+      - sha256(config bytes) == recorded_hash (tamper/drift => mismatch)
+      - captured_at fresh (<=600s)
+
+    Missing/unknown/mismatch => GUARD_CONFIG_PROFILE / _MISMATCH
+    (fail-closed; the deployment stays LIVE_QUARANTINED)."""
+    if not config_profile_path:
+        return _fail("config_profile", ["GUARD_CONFIG_PROFILE"],
+                     "config profile path required (live deployment must "
+                     "use config/futures_live.yaml)")
+    p = Path(config_profile_path)
+    if not p.is_file():
+        return _fail("config_profile", ["GUARD_CONFIG_PROFILE"],
+                     f"config profile missing: {config_profile_path}")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8")) \
+            if p.suffix == ".json" else _yaml_load(p)
+    except Exception:
+        return _fail("config_profile", ["GUARD_CONFIG_PROFILE"],
+                     "config profile unreadable")
+    if not isinstance(data, dict) or \
+            data.get("live_trading") is not True or \
+            data.get("config_profile") != "futures_live":
+        return _fail("config_profile", ["GUARD_CONFIG_PROFILE"],
+                     "not the sealed futures_live profile (paper default "
+                     "never passes the live gate)")
+    if recorded_hash:
+        import hashlib
+        cur = hashlib.sha256(p.read_bytes()).hexdigest()
+        if cur != recorded_hash:
+            return _fail("config_profile",
+                         ["GUARD_CONFIG_PROFILE_MISMATCH"],
+                         f"profile hash {cur[:12]} != recorded "
+                         f"{recorded_hash[:12]} (tampered/drifted)")
+    if captured_at is not None and \
+            time.time() - _parse_ts(captured_at) > SNAPSHOT_MAX_AGE_S:
+        return _fail("config_profile", ["GUARD_CONFIG_PROFILE_MISMATCH"],
+                     f"captured_at stale ({captured_at})")
+    return _pass("config_profile",
+                 f"sealed futures_live profile "
+                 f"hash={str(recorded_hash or '')[:12]}…")
+
+
+def _yaml_load(p: Path) -> dict:
+    import yaml
+    return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+
+
 def guard_capture_consistency(position_state_path: Optional[str],
                               margin_evidence: Optional[dict]
                               ) -> GuardResult:
@@ -638,6 +698,8 @@ def check_deployment(
     session_revoked: bool = False,
     margin_available: Optional[float] = None,
     margin_evidence: Optional[dict] = None,
+    config_profile_path: Optional[str] = None,
+    config_profile_hash: Optional[str] = None,
     manifest_paths: Sequence[str] = (),
     manifest_exclude_paths: Sequence[str] = (),
     expected_sha: Optional[str] = None,
@@ -677,6 +739,7 @@ def check_deployment(
         guard_quarantine_first_startup(monitor_path),
         session_result,
         guard_margin(margin_available, margin_evidence=margin_evidence),
+        guard_config_profile(config_profile_path, config_profile_hash),
         guard_capture_consistency(position_state_path, margin_evidence),
         guard_rollback_manifest(release_dir, manifest_paths, expected_sha,
                                 exclude_paths=manifest_exclude_paths),

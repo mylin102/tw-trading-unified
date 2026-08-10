@@ -1010,6 +1010,16 @@ def update_startup_progress(step: str, progress_pct: int, message: str, status: 
 
 def run_system(dry_run=False, config_name="futures"):
     """Run the trading system; supervised recovery is limited to classified failures."""
+    # [sealed live profile] validate the config name BEFORE any broker
+    # login — unknown/missing config => fast-fail (fail-closed; live
+    # deployments must use the sealed --config futures_live profile)
+    for _ci in (c.strip() for c in config_name.split(",") if c.strip()):
+        _cf = f"{_ci.replace('.yaml', '')}.yaml"
+        if not os.path.exists(os.path.join(BASE, "config", _cf)):
+            raise RuntimeError(
+                f"Unknown futures config: {_cf} — refusing to start "
+                f"(fail-closed; live deployments must use "
+                f"--config futures_live)")
     update_startup_progress("SHIOAJI_CONNECTING", 30, "📡 正在與 永豐期貨 建立安全連線與 Session...", status="STARTING")
 
     # ── Lifecycle provenance recorder ──
@@ -1106,11 +1116,20 @@ def run_system(dry_run=False, config_name="futures"):
             _base_cfg = cfg_item.replace(".yaml", "")
             # 2026-08-04 Gemini CLI: Unified single config source (futures.yaml) for both day & night
             _config_file = f"{_base_cfg}.yaml"
+            _config_path_full = os.path.join(BASE, "config", _config_file)
+            # [sealed live profile] unknown/missing config => FAST-FAIL
+            # before any broker/monitor startup (fail-closed; the LIVE
+            # deployment uses the sealed config/futures_live.yaml profile)
+            if not os.path.exists(_config_path_full):
+                raise RuntimeError(
+                    f"Unknown futures config: {_config_file} — refusing "
+                    f"to start (fail-closed; live deployments must use "
+                    f"--config futures_live)")
             console.print(f"[dim]📋 Futures config for {cfg_item}: {_config_file} (session={'night' if _is_night else 'day'})[/dim]")
 
             fm_inst = FuturesMonitor(
                 api=api,
-                config_path=os.path.join(BASE, "config", _config_file),
+                config_path=_config_path_full,
                 dry_run=dry_run,
             )
             fm_inst.setup()

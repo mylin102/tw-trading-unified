@@ -263,7 +263,10 @@ def test_release_head_check_in_release_tree():
 
 def _minimal_live_cfg(tmp_path):
     cfg = tmp_path / "futures_test.yaml"
-    cfg.write_text("ticker: TMF\nlive_trading: true\n", encoding="utf-8")
+    # [sealed live profile] the LIVE certification requires the
+    # futures_live profile marker — the test cfg is a live profile
+    cfg.write_text("ticker: TMF\nlive_trading: true\n"
+                   "config_profile: futures_live\n", encoding="utf-8")
     return cfg
 
 

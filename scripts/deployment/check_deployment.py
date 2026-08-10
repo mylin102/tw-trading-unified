@@ -49,6 +49,12 @@ def main() -> int:
                          "account_identity_hash/scope/captured_at/"
                          "canonical_input_hash (bare --margin-available "
                          "is insufficient)")
+    ap.add_argument("--config-profile", default=None,
+                    help="path to the sealed live config profile "
+                         "(config/futures_live.yaml)")
+    ap.add_argument("--config-hash", default=None,
+                    help="sha256 of the sealed live config profile "
+                         "(recorded at certification)")
     ap.add_argument("--expected-sha", default=None)
     ap.add_argument("--manifest", action="append", default=[])
     ap.add_argument("--exclude-path", action="append", default=[])
@@ -94,6 +100,8 @@ def main() -> int:
         session_generation=args.session_generation,
         margin_available=args.margin_available,
         margin_evidence=margin_evidence,
+        config_profile_path=args.config_profile,
+        config_profile_hash=args.config_hash,
         manifest_paths=manifests,
         manifest_exclude_paths=exclude,
         expected_sha=args.expected_sha,

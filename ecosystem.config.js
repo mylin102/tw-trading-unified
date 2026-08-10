@@ -98,7 +98,10 @@ module.exports = {
       // SSOT: futures.yaml owns both TMF and MTX product definitions. A
       // comma-separated config list creates multiple monitors and is never a
       // production PM2 deployment mode.
-      args: `-c background ${pythonPath} main.py --config futures`,
+      // [sealed live profile] the production deployment runs the tracked
+      // config/futures_live.yaml profile explicitly — the paper default can
+      // never enter live certification.
+      args: `-c background ${pythonPath} main.py --config futures_live`,
       interpreter: 'none',
       cwd: PROJECT_ROOT,
       restart_delay: 15000,

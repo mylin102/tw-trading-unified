@@ -542,93 +542,128 @@ class FuturesMonitor:
                               f"{_rel_reasons} — release identity not "
                               f"verified; live orders blocked")
                     else:
-                        # [Live Route Certification wiring] certificate-required
-                        # startup: certify_route -> transition_with_certificate is
-                        # the ONLY path to LIVE_READY; no certificate -> 
-                        # LIVE_QUARANTINED (NO_CERTIFICATE). Single startup-path
-                        # replacement — no reconnect/order-route changes here.
-                        try:
-                            from core.live_route_certificate import (
-                                CertificateIssuer, build_runtime_certification_context,
-                                certify_route, transition_with_certificate)
-                            from core.mode_transition import (ModeTransitionState,
-                                                              with_effective_mode)
-                            _api = getattr(self, "api", None)
-                            _issuer = CertificateIssuer()
-                            _cert, _cert_failures = (
-                                certify_route(
-                                    _api,
-                                    process_start_id=f"monitor-{os.getpid()}",
-                                    issuer=_issuer,
-                                    config_path=self.config_path)
-                                if _api is not None else (None, []))
-                            if _cert is None:
-                                self._execution_context = with_effective_mode(
-                                    self._execution_context,
-                                    ModeTransitionState.LIVE_QUARANTINED.value,
-                                    live_order_allowed=False,
-                                    audit_reasons=tuple(_cert_failures) or ("NO_CERTIFICATE",))
-                                self._persist_execution_context()
-                                print(f"[MTS_EXEC_CTX] LIVE_QUARANTINED cert=None "
-                                      f"reasons={_cert_failures or ['NO_CERTIFICATE']} "
-                                      f"— live orders blocked")
-                            else:
-                                # [post_startup session gate; D1] bind the
-                                # registry-bound generation into the
-                                # QUARANTINED ctx BEFORE certification —
-                                # the post_startup gate validates
-                                # generation/session/snapshot consistency
-                                # before ANY LIVE_READY transition
-                                self._bind_session_generation()
-                                if not self._confirm_session_generation():
-                                    # [D1 race guard] the registry generation
-                                    # changed since binding (logout/relogin):
-                                    # do NOT promote — stay QUARANTINED with
-                                    # SESSION_GENERATION_MISMATCH (zero
-                                    # live-order calls; the cert flow is
-                                    # skipped entirely)
-                                    self._execution_context = (
-                                        with_effective_mode(
-                                            self._execution_context,
-                                            ModeTransitionState.
-                                            LIVE_QUARANTINED.value,
-                                            live_order_allowed=False,
-                                            audit_reasons=(
-                                                "SESSION_GENERATION_MISMATCH",)))
+                        # [sealed live profile] the LIVE certification
+                        # requires the tracked config/futures_live.yaml
+                        # profile — the paper default (no config_profile)
+                        # can NEVER enter certification => QUARANTINED
+                        _profile = self.cfg.get("config_profile")
+                        if str(_profile) != "futures_live":
+                            self._execution_context = with_effective_mode(
+                                self._execution_context,
+                                ModeTransitionState.LIVE_QUARANTINED.value,
+                                live_order_allowed=False,
+                                audit_reasons=("GUARD_CONFIG_PROFILE",))
+                            self._persist_execution_context()
+                            print(
+                                "[MTS_EXEC_CTX] LIVE_QUARANTINED "
+                                "GUARD_CONFIG_PROFILE — sealed "
+                                "futures_live profile required; live "
+                                "orders blocked")
+                        else:
+                            # [Live Route Certification wiring] certificate-required
+                            # startup: certify_route -> transition_with_certificate is
+                            # the ONLY path to LIVE_READY; no certificate -> 
+                            # LIVE_QUARANTINED (NO_CERTIFICATE). Single startup-path
+                            # replacement — no reconnect/order-route changes here.
+                            try:
+                                from core.live_route_certificate import (
+                                    CertificateIssuer, build_runtime_certification_context,
+                                    certify_route, transition_with_certificate)
+                                from core.mode_transition import (ModeTransitionState,
+                                                                  with_effective_mode)
+                                _api = getattr(self, "api", None)
+                                _issuer = CertificateIssuer()
+                                _cert, _cert_failures = (
+                                    certify_route(
+                                        _api,
+                                        process_start_id=f"monitor-{os.getpid()}",
+                                        issuer=_issuer,
+                                        config_path=self.config_path)
+                                    if _api is not None else (None, []))
+                                if _cert is None:
+                                    self._execution_context = with_effective_mode(
+                                        self._execution_context,
+                                        ModeTransitionState.LIVE_QUARANTINED.value,
+                                        live_order_allowed=False,
+                                        audit_reasons=tuple(_cert_failures) or ("NO_CERTIFICATE",))
                                     self._persist_execution_context()
-                                    print("[MTS_EXEC_CTX] LIVE_QUARANTINED "
-                                          "SESSION_GENERATION_MISMATCH — "
-                                          "generation changed before "
-                                          "certification; live orders blocked")
-                                else:
-                                    _runtime = build_runtime_certification_context(
-                                        _api, self.config_path,
-                                        {"process_state": {"process_start_id":
-                                                           f"monitor-{os.getpid()}"}})
-                                    self._execution_context = transition_with_certificate(
-                                        self._execution_context, _cert, _issuer,
-                                        runtime=_runtime)
-                                    self._persist_execution_context()
-                                    # [orphan reconciliation] a pending
-                                    # SAFETY_STOP_RECONCILE intent keeps
-                                    # QUARANTINED until the broker state
-                                    # reconciles
-                                    self._apply_reconcile_pending_gate()
-                                if self._execution_context.is_live_ready():
-                                    print("[MTS_EXEC_CTX] LIVE_READY — "
-                                          "certificate-required transition complete; "
-                                          "live orders authorized")
-                                else:
-                                    print(f"[MTS_EXEC_CTX] LIVE_QUARANTINED "
-                                          f"reasons={self._execution_context.audit_reasons} "
+                                    print(f"[MTS_EXEC_CTX] LIVE_QUARANTINED cert=None "
+                                          f"reasons={_cert_failures or ['NO_CERTIFICATE']} "
                                           f"— live orders blocked")
-                        except Exception as _exc:
-                            print(f"[MTS_EXEC_CTX] transition error: {_exc} — stays LIVE_PREFLIGHT (blocked)")
+                                else:
+                                    # [post_startup session gate; D1] bind the
+                                    # registry-bound generation into the
+                                    # QUARANTINED ctx BEFORE certification —
+                                    # the post_startup gate validates
+                                    # generation/session/snapshot consistency
+                                    # before ANY LIVE_READY transition
+                                    self._bind_session_generation()
+                                    if not self._confirm_session_generation():
+                                        # [D1 race guard] the registry generation
+                                        # changed since binding (logout/relogin):
+                                        # do NOT promote — stay QUARANTINED with
+                                        # SESSION_GENERATION_MISMATCH (zero
+                                        # live-order calls; the cert flow is
+                                        # skipped entirely)
+                                        self._execution_context = (
+                                            with_effective_mode(
+                                                self._execution_context,
+                                                ModeTransitionState.
+                                                LIVE_QUARANTINED.value,
+                                                live_order_allowed=False,
+                                                audit_reasons=(
+                                                    "SESSION_GENERATION_MISMATCH",)))
+                                        self._persist_execution_context()
+                                        print("[MTS_EXEC_CTX] LIVE_QUARANTINED "
+                                              "SESSION_GENERATION_MISMATCH — "
+                                              "generation changed before "
+                                              "certification; live orders blocked")
+                                    else:
+                                        _runtime = build_runtime_certification_context(
+                                            _api, self.config_path,
+                                            {"process_state": {"process_start_id":
+                                                               f"monitor-{os.getpid()}"}})
+                                        self._execution_context = transition_with_certificate(
+                                            self._execution_context, _cert, _issuer,
+                                            runtime=_runtime)
+                                        self._persist_execution_context()
+                                        # [orphan reconciliation] a pending
+                                        # SAFETY_STOP_RECONCILE intent keeps
+                                        # QUARANTINED until the broker state
+                                        # reconciles
+                                        self._apply_reconcile_pending_gate()
+                                    if self._execution_context.is_live_ready():
+                                        print("[MTS_EXEC_CTX] LIVE_READY — "
+                                              "certificate-required transition complete; "
+                                              "live orders authorized")
+                                    else:
+                                        print(f"[MTS_EXEC_CTX] LIVE_QUARANTINED "
+                                              f"reasons={self._execution_context.audit_reasons} "
+                                              f"— live orders blocked")
+                            except Exception as _exc:
+                                print(f"[MTS_EXEC_CTX] transition error: {_exc} — stays LIVE_PREFLIGHT (blocked)")
                 else:
                     self._execution_context = paper_context()
             except ImportError:
                 self._execution_context = None
                 print("[MTS_EXEC_CTX] core.mode_transition not available — hard gate disabled")
+
+        # [sealed live profile] record the config identity (path + sha256)
+        # in the execution context for the certification/deployment gate
+        try:
+            if self._execution_context is not None and \
+                    not getattr(self._execution_context, "config_hash", None):
+                import hashlib as _hl
+                import dataclasses as _dc
+                _ch = _hl.sha256(
+                    Path(self.config_path).read_bytes()).hexdigest() \
+                    if os.path.exists(self.config_path) else ""
+                if _ch:
+                    self._execution_context = _dc.replace(
+                        self._execution_context, config_hash=_ch)
+                    self._persist_execution_context()
+        except Exception:
+            pass
 
         # 2026-07-07 Gemini CLI: Day and night session capital should share the same parameter.
         # Dynamically adjust trader state if balance changed

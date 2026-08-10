@@ -259,6 +259,15 @@ def test_guard_flat_live_broker_ok(tmp_path):
     assert r.ok, r.reasons
 
 
+def _live_profile(repo: Path):
+    """Write the sealed live profile into a tmp repo; return (path, sha256)."""
+    import hashlib
+    p = repo / "config" / "futures_live.yaml"
+    p.write_text("live_trading: true\nconfig_profile: futures_live\n",
+                 encoding="utf-8")
+    return str(p), hashlib.sha256(p.read_bytes()).hexdigest()
+
+
 def test_guard_flat_live_broker_positions_empty_list(tmp_path):
     # the Codex contract: positions=[] (empty list) is flat evidence
     from core.deployment_safety_gate import guard_flat_no_pending
@@ -745,6 +754,8 @@ def test_aggregate_all_pass_readies(tmp_path, monkeypatch):
         margin_evidence={"account_identity_hash": "a" * 64,
                          "scope": "futopt", "captured_at": _ts,
                          "canonical_input_hash": "b" * 64},
+        config_profile_path=_live_profile(repo)[0],
+        config_profile_hash=_live_profile(repo)[1],
         manifest_paths=[str(manifest)], expected_sha=head,
         manifest_exclude_paths=exclude)
     assert c.ok, [(g.guard, g.reasons) for g in c.results]
@@ -820,6 +831,8 @@ def test_pre_deploy_skips_session_generation(tmp_path, monkeypatch):
         margin_evidence={"account_identity_hash": "a" * 64,
                          "scope": "futopt", "captured_at": _ts,
                          "canonical_input_hash": "b" * 64},
+        config_profile_path=_live_profile(repo)[0],
+        config_profile_hash=_live_profile(repo)[1],
         manifest_paths=[str(manifest)], expected_sha=head,
         manifest_exclude_paths=exclude, phase="pre_deploy")
     assert c.ok, [(g.guard, g.reasons) for g in c.results]
@@ -860,6 +873,8 @@ def test_post_startup_requires_registry_generation(tmp_path, monkeypatch):
         margin_evidence={"account_identity_hash": "a" * 64,
                          "scope": "futopt", "captured_at": _ts,
                          "canonical_input_hash": "b" * 64},
+        config_profile_path=_live_profile(repo)[0],
+        config_profile_hash=_live_profile(repo)[1],
         manifest_paths=[str(manifest)], expected_sha=head,
         manifest_exclude_paths=exclude, phase="post_startup")
     assert c2.ok, [(g.guard, g.reasons) for g in c2.results]
@@ -897,6 +912,8 @@ def test_cli_margin_evidence_and_ready_for_startup(tmp_path, monkeypatch):
          str(tmp_path / "nope.pid"), "--position-state", str(pf),
          "--expected-sha", head, "--margin-available", "300000.0",
          "--margin-evidence", str(ev),
+         "--config-profile", _live_profile(repo)[0],
+         "--config-hash", _live_profile(repo)[1],
          "--manifest", str(manifest),
          "--exclude-path", "PHASE1_FINAL_FREEZE.md",
          "--phase", "pre_deploy"],
@@ -1297,6 +1314,8 @@ def test_cli_verdict_never_partial_ready(tmp_path, monkeypatch):
          str(tmp_path / "nope.pid"), "--position-state", str(pf),
          "--expected-sha", head, "--margin-available", "300000.0",
          "--margin-evidence", str(ev),
+         "--config-profile", _live_profile(repo)[0],
+         "--config-hash", _live_profile(repo)[1],
          "--manifest", str(manifest),
          "--exclude-path", "PHASE1_FINAL_FREEZE.md",
          "--phase", "pre_deploy"],
