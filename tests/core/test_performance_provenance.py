@@ -135,3 +135,100 @@ def test_unknown_runtime_fail_closed(tmp_path):
     scope = scope_mts_performance(_rt(runtime_status="UNKNOWN / QUARANTINED"),
                                   ev)
     assert not scope["ok"] and "fail-closed" in scope["reason"]
+
+
+def _live_records(**over):
+    """A fully-proven live record (the canonical shape the gate requires)."""
+    base = {"trade_id": "t1", "mode": "live", "run_id": "run-1",
+            "config_hash": "ab" * 32, "session_id": "sess-1",
+            "source": "live_broker_reconciled"}
+    base.update(over)
+    return [base]
+
+
+def _live_rt():
+    return _rt(is_live_runtime=True, config_hash="ab" * 32,
+               session_id="sess-1")
+
+
+def test_live_evidence_fully_proven_ok(tmp_path):
+    """The ONLY accepted live shape: every record mode=live + exactly one
+    run_id + one config_hash == active + one session == active +
+    source=live_broker_reconciled."""
+    fills = _write_ledger(tmp_path, _live_records())
+    ev = classify_mts_evidence(fills, None)
+    assert ev["evidence_mode"] == "live"
+    scope = scope_mts_performance(_live_rt(), ev)
+    assert scope["ok"] and scope["run_id"] == "run-1"
+
+
+@pytest.mark.parametrize("broken", [
+    {"run_id": None},                      # missing run_id
+    {"config_hash": None},                 # missing config_hash
+    {"session_id": None},                  # missing session
+    {"source": None},                      # missing source
+    {"mode": None},                        # missing mode on a live record
+])
+def test_live_evidence_missing_field_is_na(tmp_path, broken):
+    """Every live record MUST carry the full provenance — ANY missing
+    field (run_id/config_hash/session/source/mode) => N/A."""
+    rec = {k: v for k, v in broken.items() if v is None}
+    fills = _write_ledger(tmp_path, _live_records(**rec))
+    ev = classify_mts_evidence(fills, None)
+    assert ev["evidence_mode"] != "live", ev
+    scope = scope_mts_performance(_live_rt(), ev)
+    assert not scope["ok"]
+
+
+def test_live_evidence_multiple_run_ids_na(tmp_path):
+    """Two distinct run_ids in a live ledger => N/A (no merged runs)."""
+    recs = [_live_records()[0],
+            _live_records(trade_id="t2", run_id="run-2")]
+    fills = _write_ledger(tmp_path, recs)
+    ev = classify_mts_evidence(fills, None)
+    assert ev["evidence_mode"] != "live"
+    scope = scope_mts_performance(_live_rt(), ev)
+    assert not scope["ok"]
+
+
+def test_live_evidence_session_mismatch_na(tmp_path):
+    """The live session/generation must equal the ACTIVE runtime session —
+    a mismatch => N/A (stale/misattributed session)."""
+    fills = _write_ledger(tmp_path,
+                          _live_records(session_id="stale-sess"))
+    ev = classify_mts_evidence(fills, None)
+    assert ev["evidence_mode"] == "live"
+    scope = scope_mts_performance(_live_rt(), ev)
+    assert not scope["ok"] and "session" in scope["reason"]
+
+
+def test_live_evidence_config_hash_mismatch_na(tmp_path):
+    """The live config_hash must equal the ACTIVE sealed profile hash —
+    a mismatch => N/A."""
+    fills = _write_ledger(tmp_path,
+                          _live_records(config_hash="ff" * 32))
+    ev = classify_mts_evidence(fills, None)
+    scope = scope_mts_performance(_live_rt(), ev)
+    assert not scope["ok"] and "config_hash" in scope["reason"]
+
+
+def test_live_evidence_wrong_source_na(tmp_path):
+    """source must be exactly live_broker_reconciled — any other/missing
+    source => N/A (the evidence is not broker-reconciled)."""
+    fills = _write_ledger(tmp_path,
+                          _live_records(source="telemetry_writer"))
+    ev = classify_mts_evidence(fills, None)
+    assert ev["evidence_mode"] != "live"
+    scope = scope_mts_performance(_live_rt(), ev)
+    assert not scope["ok"]
+
+
+def test_paper_never_admits_live(tmp_path):
+    """Paper scope stays compatible with paper/legacy evidence but NEVER
+    admits live evidence."""
+    fills = _write_ledger(tmp_path, _live_records())
+    ev = classify_mts_evidence(fills, None)
+    scope = scope_mts_performance(
+        _rt(runtime_status="PAPER_ACTIVE", is_paper_runtime=True,
+            config_hash="cd" * 32), ev)
+    assert not scope["ok"] and "paper view with live" in scope["reason"]
