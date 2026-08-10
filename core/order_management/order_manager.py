@@ -581,10 +581,18 @@ class OrderManager:
                 result = self.broker_adapter.place_order_object(order)
             else:
                 result = self.broker_adapter.place_order(order)
-        except Exception:
+        except Exception as exc:
             # No broker receipt means this is a local terminal rejection, not
-            # a submitted order that a watchdog may later cancel.
-            self.reject(order.order_id, reason="ADAPTER_SUBMIT_FAILED",
+            # a submitted order that a watchdog may later cancel.  Preserve
+            # only a stable adapter code for operator diagnosis; never emit
+            # arbitrary exception text into the event/dashboard surface.
+            _code = getattr(exc, "code", None)
+            _reason = (
+                _code if isinstance(_code, str)
+                and _code.startswith("ADAPTER_") and len(_code) <= 96
+                else "ADAPTER_SUBMIT_FAILED"
+            )
+            self.reject(order.order_id, reason=_reason,
                         source="broker_submit")
             return False
 
