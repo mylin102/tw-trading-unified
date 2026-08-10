@@ -17,6 +17,17 @@ from dataclasses import dataclass, field
 from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
 
 
+# Only stable, operator-safe codes produced by the live submission adapter may
+# cross this boundary.  Exception objects can originate in third-party code;
+# never surface arbitrary ``.code`` values in lifecycle events or dashboards.
+_SAFE_ADAPTER_SUBMISSION_REASONS = frozenset({
+    "ADAPTER_ORDER_OBJECT_INVALID",
+    "ADAPTER_ORDER_NO_TRADE",
+    "ADAPTER_ORDER_REJECTED",
+    "ADAPTER_ORDER_PLACE_FAILED",
+})
+
+
 # ── Live Order Hard Gate ───────────────────────────────────────────────────
 # Import late to avoid circular dependency at module level.
 # ModeTransitionGate is the second layer of defense for all live orders.
@@ -589,7 +600,7 @@ class OrderManager:
             _code = getattr(exc, "code", None)
             _reason = (
                 _code if isinstance(_code, str)
-                and _code.startswith("ADAPTER_") and len(_code) <= 96
+                and _code in _SAFE_ADAPTER_SUBMISSION_REASONS
                 else "ADAPTER_SUBMIT_FAILED"
             )
             self.reject(order.order_id, reason=_reason,
