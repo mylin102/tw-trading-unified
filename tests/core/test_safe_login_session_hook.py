@@ -13,6 +13,7 @@ Contract:
 """
 
 import pytest
+from types import SimpleNamespace
 
 from core.broker.shioaji_compat import safe_login
 from core.live_route_certificate import session_registry
@@ -94,3 +95,40 @@ def test_safe_login_invalidates_previous_registration_before_attempt():
         safe_login(api, api_key="k", secret_key="s")
     assert session_registry.generation(api) is None, \
         "old registration must be invalidated before the attempt"
+
+
+def test_ca_activation_uses_logged_in_futopt_person_id():
+    """Order signing must bind the CA to the actual futures account owner."""
+    from core.shioaji_session import _activate_futopt_ca
+
+    class Api:
+        futopt_account = SimpleNamespace(person_id="FUTOPT_OWNER")
+
+        def __init__(self):
+            self.calls = []
+
+        def activate_ca(self, **kwargs):
+            self.calls.append(kwargs)
+
+    api = Api()
+    _activate_futopt_ca(api, "/safe/certificate.pfx", "password")
+
+    assert api.calls == [{
+        "ca_path": "/safe/certificate.pfx",
+        "ca_passwd": "password",
+        "person_id": "FUTOPT_OWNER",
+    }]
+
+
+def test_ca_activation_refuses_missing_futopt_person_id():
+    """A CA without its account identity must never appear activated."""
+    from core.shioaji_session import _activate_futopt_ca
+
+    class Api:
+        futopt_account = SimpleNamespace(person_id=None)
+
+        def activate_ca(self, **kwargs):
+            raise AssertionError("must not activate without a futures owner")
+
+    with pytest.raises(RuntimeError, match="futures account identity"):
+        _activate_futopt_ca(Api(), "/safe/certificate.pfx", "password")
