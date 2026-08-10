@@ -307,3 +307,19 @@ def test_live_typed_adapter_failure_preserves_stable_reason():
     assert manager.submit(order) is False
     assert order.status is OrderStatus.REJECTED
     assert order.reject_reason == "ADAPTER_ORDER_PLACE_FAILED"
+
+
+def test_live_unrecognized_adapter_code_is_redacted():
+    """Exception-controlled adapter text never reaches operator surfaces."""
+    class CodedFailure:
+        def place_order_object(self, order):
+            error = RuntimeError("broker context must not be exposed")
+            error.code = "ADAPTER_SECRET: broker context"
+            raise error
+
+    manager = OrderManager(mode="live", broker_adapter=CodedFailure())
+    order = _new_order(manager)
+
+    assert manager.submit(order) is False
+    assert order.status is OrderStatus.REJECTED
+    assert order.reject_reason == "ADAPTER_SUBMIT_FAILED"
