@@ -913,8 +913,10 @@ def test_rollback_parity_active_canonical_manifest(tmp_path):
                     "freeze record"], check=True)
     # random CWD
     import os
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(exist_ok=True)
     old = os.getcwd()
-    os.chdir(tmp_path / "elsewhere")
+    os.chdir(elsewhere)
     try:
         r = guard_rollback_manifest(str(repo), manifests, head,
                                     exclude_paths=exclude)
