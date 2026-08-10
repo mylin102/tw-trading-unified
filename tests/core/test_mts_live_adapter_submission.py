@@ -138,6 +138,74 @@ def test_live_second_leg_rejection_quarantines_without_compensating_order():
     })]
 
 
+def test_live_partial_submission_disables_watchdog_cancel_and_records_reconcile():
+    """An acknowledged first leg must be operator-reconciled, never auto-cancelled."""
+    from core.mode_transition import (ExecutionContext, ModeTransitionState)
+    from strategies.futures.monitor import FuturesMonitor
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._execution_context = ExecutionContext(
+        requested_mode="live",
+        effective_mode=ModeTransitionState.LIVE_READY.value,
+        live_order_allowed=True,
+    )
+    monitor._mts_stale_order_cancels = set()
+    recorded = []
+    monitor._record_mts_entry_reconcile = lambda trade_id: recorded.append(trade_id)
+    monitor._persist_execution_context = lambda: None
+    monitor._append_mts_event = lambda *args, **kwargs: None
+    near = SimpleNamespace(order_id="near-1", exchange_order_id="BRK-NEAR")
+
+    monitor._quarantine_mts_entry_partial_submission(
+        trade_id="trade-1", submitted_order=near,
+        failed_order=SimpleNamespace(order_id="far-1"))
+
+    assert recorded == ["trade-1"]
+    assert monitor._mts_stale_order_cancels == {"near-1"}
+
+
+def test_pending_entry_reconcile_requarantines_after_certification_attempt():
+    """A restart/recertification cannot clear durable entry reconciliation."""
+    from core.mode_transition import (ExecutionContext, ModeTransitionState)
+    from strategies.futures.monitor import FuturesMonitor
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._execution_context = ExecutionContext(
+        requested_mode="live",
+        effective_mode=ModeTransitionState.LIVE_READY.value,
+        live_order_allowed=True,
+    )
+    persisted = []
+    monitor._persist_execution_context = lambda: persisted.append(
+        monitor._execution_context)
+    monitor._pending_safety_stop_reconcile = lambda: False
+    monitor._pending_mts_entry_reconcile = lambda: True
+
+    monitor._apply_reconcile_pending_gate()
+
+    assert monitor._execution_context.effective_mode == (
+        ModeTransitionState.LIVE_QUARANTINED.value)
+    assert monitor._execution_context.live_order_allowed is False
+    assert "MTS_ENTRY_RECONCILE_PENDING" in monitor._execution_context.audit_reasons
+    assert persisted == [monitor._execution_context]
+
+
+def test_pending_entry_reconcile_fails_post_startup_gate_before_recertification():
+    """No startup/reconnect certificate transition may bypass reconciliation."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._pending_safety_stop_reconcile = lambda: False
+    monitor._pending_mts_entry_reconcile = lambda: True
+
+    gate, evidence = monitor._run_post_startup_gate()
+
+    assert gate.ok is False
+    assert evidence is None
+    assert gate.results[0].guard == "reconciliation"
+    assert gate.results[0].reasons == ("MTS_ENTRY_RECONCILE_PENDING",)
+
+
 def test_paper_second_leg_rejection_records_evidence_without_live_quarantine():
     """Paper retains its mode even if a test double rejects a second leg."""
     from core.mode_transition import (ExecutionContext, ModeTransitionState)
