@@ -3000,14 +3000,15 @@ class FuturesMonitor:
     # ── [P0 post-startup gate] in-process, unavoidable ─────────────────────
 
     @staticmethod
-    def _normalize_snapshot_positions(raw_positions) -> list:
+    def _normalize_snapshot_positions(raw_positions, account_tag="futures") \
+            -> list:
         """Normalize shioaji positions into the canonical snapshot shape
         (account/code/quantity/direction); NEVER raw account numbers."""
         out = []
         for p in raw_positions or []:
             try:
                 out.append({
-                    "account": "futures",
+                    "account": account_tag,
                     "code": str(getattr(p, "code", "")),
                     "quantity": int(getattr(p, "quantity", 0) or 0),
                     "direction": getattr(getattr(p, "direction", None),
@@ -3021,7 +3022,8 @@ class FuturesMonitor:
     @staticmethod
     def _normalize_snapshot_orders(raw_trades) -> list:
         """Open orders only: terminal states are dropped (same canonical
-        terminal-state set as the standalone preflight)."""
+        terminal-state set as the standalone preflight); the shape keeps
+        order_id/code/status so the gate can identify pending orders."""
         terminal = {"Filled", "Canceled", "Cancelled", "Failed",
                     "PartiallyFailed"}
         out = []
@@ -3031,10 +3033,8 @@ class FuturesMonitor:
             if name in terminal:
                 continue
             out.append({
+                "order_id": str(getattr(getattr(t, "order", None), "id", "")),
                 "code": str(getattr(t, "code", "")),
-                "action": getattr(getattr(t, "action", None), "name", None)
-                    or str(getattr(t, "action", "")),
-                "quantity": int(getattr(t, "quantity", 0) or 0),
                 "status": name,
             })
         return out
@@ -3044,8 +3044,12 @@ class FuturesMonitor:
         authenticated api/session (no new login): futures positions +
         open orders + margin + the bound registry generation as
         session_id, with a canonical epoch-ms INT + canonical input
-        hash. Zero place/cancel/update calls; capture errors are
-        recorded in the payload (the gate fails closed)."""
+        hash. Uses the shioaji 1.x read methods exactly like the
+        standalone preflight: api.list_positions(account) /
+        api.list_trades(account) / api.margin(futopt_account) with
+        available_margin (fallback deposit_balance). Zero
+        place/cancel/update calls; capture errors are recorded in the
+        payload (the gate fails closed)."""
         import hashlib as _hl
         import json as _json
         captured_at = int(time.time() * 1000)
@@ -3057,26 +3061,64 @@ class FuturesMonitor:
         errors = {}
         try:
             _acct = getattr(_api, "futopt_account", None)
-            if _acct is None and hasattr(_api, "list_accounts"):
-                _accts = _api.list_accounts() or []
-                _acct = _accts[0] if _accts else None
             if _acct is not None:
                 _aid = getattr(_acct, "account_id", None) \
                     or getattr(_acct, "account_no", "") or ""
                 if _aid:
                     acct_hash = _hl.sha256(str(_aid).encode()).hexdigest()
-                positions = self._normalize_snapshot_positions(
-                    _api.positions(_acct))
-                open_orders = self._normalize_snapshot_orders(
-                    _api.list_trades(_acct) or [])
-                margin = getattr(_acct, "available_margin", None)
+            # positions: list_positions per account (stock + futures)
+            if hasattr(_api, "list_positions"):
+                for _tag, _acct in (("stock", getattr(_api, "stock_account",
+                                                      None)),
+                                    ("futures", getattr(
+                                        _api, "futopt_account", None))):
+                    if _acct is None:
+                        continue
+                    try:
+                        _rows = _api.list_positions(_acct)
+                    except Exception:
+                        _rows = []
+                    positions.extend(
+                        self._normalize_snapshot_positions(_rows, _tag))
             else:
-                errors["capture"] = "no account available"
+                errors["capture"] = "api has no list_positions"
+            # open orders: list_trades, drop terminal states
+            if hasattr(_api, "list_trades"):
+                for _tag, _acct in (("stock", getattr(_api, "stock_account",
+                                                      None)),
+                                    ("futures", getattr(
+                                        _api, "futopt_account", None))):
+                    if _acct is None:
+                        continue
+                    try:
+                        _rows = _api.list_trades(_acct) or []
+                    except Exception:
+                        _rows = []
+                    open_orders.extend(
+                        self._normalize_snapshot_orders(_rows))
+            else:
+                errors["capture"] = "api has no list_trades"
+            # margin: api.margin(futopt_account) — the authenticated
+            # futures margin (NOT an attribute on the account object)
+            if hasattr(_api, "margin") and _acct is not None:
+                try:
+                    _m = _api.margin(_acct)
+                    _avail = getattr(_m, "available_margin", None)
+                    if _avail is None:
+                        _avail = getattr(_m, "deposit_balance", None)
+                    margin = float(_avail) if _avail is not None else None
+                except Exception as exc:
+                    errors["margin"] = f"{type(exc).__name__}: {exc}"
+            else:
+                errors["margin"] = "api has no margin / no futopt account"
+            if _acct is None:
+                errors["capture"] = "no futopt account available"
         except Exception as exc:
             errors["capture"] = f"{type(exc).__name__}: {exc}"
         payload = {
             "source": "live_broker",
             "mode": "live",
+            "scope": "futopt",
             "account_identity_hash": acct_hash,
             "session_id": session_id,
             "captured_at": captured_at,
@@ -3133,8 +3175,17 @@ class FuturesMonitor:
                 "main.py", "strategies/futures/monitor.py",
                 "core/deployment_safety_gate.py",
             ]
+            # [P0 fix] the canonical manifest paths come from the DEPLOYED
+            # release_dir — NEVER the CWD (a worktree/dir change must not
+            # silently lose the manifest guard)
+            _rel_dir = str(Path(__file__).resolve().parents[2])
+            _manifests = [
+                os.path.join(_rel_dir, "PHASE1_RC_CANDIDATE.md"),
+                os.path.join(_rel_dir, "PHASE2_DEPLOYMENT_MANIFEST.md"),
+                os.path.join(_rel_dir, "PHASE1_FINAL_FREEZE.md"),
+            ]
             gate = check_deployment(
-                release_dir=str(Path(__file__).resolve().parents[2]),
+                release_dir=_rel_dir,
                 closure_files=_closure,
                 runtime_dir=None,
                 pid_file=os.environ.get("PM2_PID_FILE",
@@ -3144,6 +3195,7 @@ class FuturesMonitor:
                 session_generation=_gen, session_revoked=False,
                 config_profile_path=self.config_path,
                 config_profile_hash=_prof_hash,
+                manifest_paths=_manifests,
                 expected_sha=os.environ.get("LRC_RELEASE_SHA", ""),
                 phase="post_startup")
             return gate, _ev
