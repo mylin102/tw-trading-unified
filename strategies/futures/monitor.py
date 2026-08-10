@@ -2887,6 +2887,13 @@ class FuturesMonitor:
         _reason = "MTS_ENTRY_PARTIAL_SUBMISSION"
         _ctx = getattr(self, "_execution_context", None)
         if _ctx is not None and getattr(_ctx, "requested_mode", None) == "live":
+            # The acknowledged leg remains visible to callbacks and broker
+            # reconciliation, but a watchdog must never cancel it blindly
+            # after the second leg failed locally.
+            self._mts_stale_order_cancels = getattr(
+                self, "_mts_stale_order_cancels", set())
+            self._mts_stale_order_cancels.add(submitted_order.order_id)
+            self._record_mts_entry_reconcile(trade_id)
             from core.mode_transition import ModeTransitionState, with_effective_mode
             self._execution_context = with_effective_mode(
                 _ctx, ModeTransitionState.LIVE_QUARANTINED.value,
@@ -2932,6 +2939,26 @@ class FuturesMonitor:
                       f"(SESSION_LOGOUT; registry gen="
                       f"{'valid' if _gen else 'revoked'})[/dim]")
 
+    def _record_reconcile_intent(self, trade_id: str, reason: str) -> bool:
+        """Record one canonical, restart-safe reconciliation requirement."""
+        try:
+            from core.exit_intent import IntentLog as _MTSIntentLog
+            _ilog = _MTSIntentLog(_mts_intent_log_dir())
+            for _iid in _ilog.list_active():
+                _row = _ilog.get(_iid)
+                if _row.get("reason") == reason and \
+                        _row.get("trade_id") == trade_id:
+                    return True
+            _iid = _ilog.create(trade_id, reason)
+            console.print(f"[yellow]🛡️ {reason} intent recorded: {_iid} "
+                          f"(trade {trade_id}) — QUARANTINED until broker "
+                          f"state reconciles[/yellow]")
+            return True
+        except Exception as _exc:
+            console.print(f"[dim]⚠️ reconcile intent record failed: "
+                          f"{_exc}[/dim]")
+            return False
+
     def _record_safety_stop_reconcile(self):
         """[orphan reconciliation] when quarantine blocks the safety-stop
         cancel / emergency and an exchange-side safety stop is outstanding,
@@ -2941,36 +2968,40 @@ class FuturesMonitor:
         broker state reconciles."""
         _trade = getattr(self, "_safety_stop_trade", None)
         if _trade is None:
-            return
+            return False
+        return self._record_reconcile_intent(
+            str(getattr(_trade, "id", None) or "SAFETY_STOP"),
+            "SAFETY_STOP_RECONCILE")
+
+    def _record_mts_entry_reconcile(self, trade_id: str) -> bool:
+        """Persist an acknowledged-first-leg entry requiring reconciliation."""
+        return self._record_reconcile_intent(trade_id, "MTS_ENTRY_RECONCILE")
+
+    def _pending_reconcile_intent(self, reason: str) -> bool:
         try:
             from core.exit_intent import IntentLog as _MTSIntentLog
             _ilog = _MTSIntentLog(_mts_intent_log_dir())
-            _trade_id = str(getattr(_trade, "id", None) or "SAFETY_STOP")
-            for _iid in _ilog.list_active():
-                _row = _ilog.get(_iid)
-                if _row.get("reason") == "SAFETY_STOP_RECONCILE" and \
-                        _row.get("trade_id") == _trade_id:
-                    return  # already recorded
-            _iid = _ilog.create(_trade_id, "SAFETY_STOP_RECONCILE")
-            console.print(f"[yellow]🛡️ SAFETY_STOP_RECONCILE intent "
-                          f"recorded: {_iid} (trade {_trade_id}) — "
-                          f"QUARANTINED until broker state reconciles"
-                          f"[/yellow]")
-        except Exception as _exc:
-            console.print(f"[dim]⚠️ reconcile intent record failed: "
-                          f"{_exc}[/dim]")
+            return any(_ilog.get(i).get("reason") == reason
+                       for i in _ilog.list_active())
+        except Exception:
+            return False
 
     def _pending_safety_stop_reconcile(self) -> bool:
         """True if a durable SAFETY_STOP_RECONCILE intent is still active
         (restart read — the canonical exit_intent log)."""
-        try:
-            from core.exit_intent import IntentLog as _MTSIntentLog
-            _ilog = _MTSIntentLog(_mts_intent_log_dir())
-            return any(
-                _ilog.get(i).get("reason") == "SAFETY_STOP_RECONCILE"
-                for i in _ilog.list_active())
-        except Exception:
-            return False
+        return self._pending_reconcile_intent("SAFETY_STOP_RECONCILE")
+
+    def _pending_mts_entry_reconcile(self) -> bool:
+        """True when a partial MTS entry needs broker reconciliation."""
+        return self._pending_reconcile_intent("MTS_ENTRY_RECONCILE")
+
+    def _pending_reconcile_reason(self):
+        """Return the canonical reason that must block re-certification."""
+        if self._pending_safety_stop_reconcile():
+            return "SAFETY_STOP_RECONCILE_PENDING"
+        if self._pending_mts_entry_reconcile():
+            return "MTS_ENTRY_RECONCILE_PENDING"
+        return None
 
     def _apply_reconcile_pending_gate(self) -> None:
         """[orphan reconciliation] a pending SAFETY_STOP_RECONCILE intent
@@ -2978,13 +3009,14 @@ class FuturesMonitor:
         persisted) until the broker state reconciles — LIVE is never
         retained across a pending reconciliation."""
         _ctx = getattr(self, "_execution_context", None)
-        if _ctx is None or not self._pending_safety_stop_reconcile():
+        _pending_reason = self._pending_reconcile_reason()
+        if _ctx is None or _pending_reason is None:
             return
         from core.mode_transition import ModeTransitionState, with_effective_mode
         self._execution_context = with_effective_mode(
             _ctx, ModeTransitionState.LIVE_QUARANTINED.value,
             live_order_allowed=False,
-            audit_reasons=("SAFETY_STOP_RECONCILE_PENDING",) + tuple(
+            audit_reasons=(_pending_reason,) + tuple(
                 getattr(_ctx, "audit_reasons", ()) or ()))
         self._persist_execution_context()
 
@@ -3178,6 +3210,15 @@ class FuturesMonitor:
         runtime logs; then the core gate (check_deployment) runs with
         phase=post_startup + the bound generation. NO operator CLI
         subprocess — nothing skippable. Returns (gate, evidence_path)."""
+        _pending_reason = self._pending_reconcile_reason()
+        if _pending_reason is not None:
+            from core.deployment_safety_gate import (
+                DeploymentCheck, GuardResult)
+            return DeploymentCheck(
+                ok=False,
+                results=(GuardResult(
+                    guard="reconciliation", ok=False,
+                    reasons=(_pending_reason,)),)), None
         snapshot = self._capture_post_startup_snapshot()
         _ev = None
         try:
