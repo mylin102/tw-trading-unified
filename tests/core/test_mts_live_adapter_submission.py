@@ -291,3 +291,19 @@ def test_mts_near_rejection_terminally_rejects_unsubmitted_far(monkeypatch):
     assert [order.status for order in manager.completed] == [OrderStatus.REJECTED, OrderStatus.REJECTED]
     assert manager.completed[1].reject_reason == "PRECEDING_LEG_REJECTED"
     assert [kind for kind, _ in events].count("ORDER_SUBMITTED") == 0
+
+
+def test_live_typed_adapter_failure_preserves_stable_reason():
+    """The dashboard/event path must retain the adapter code, not erase it."""
+    class CodedFailure:
+        def place_order_object(self, order):
+            error = RuntimeError("broker boundary refused")
+            error.code = "ADAPTER_ORDER_PLACE_FAILED"
+            raise error
+
+    manager = OrderManager(mode="live", broker_adapter=CodedFailure())
+    order = _new_order(manager)
+
+    assert manager.submit(order) is False
+    assert order.status is OrderStatus.REJECTED
+    assert order.reject_reason == "ADAPTER_ORDER_PLACE_FAILED"
