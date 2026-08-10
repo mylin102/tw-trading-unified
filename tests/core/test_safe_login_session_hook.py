@@ -195,3 +195,23 @@ def test_contract_sync_worker_redacts_sensitive_ca_error(monkeypatch):
     )
 
     assert received == [False]
+
+
+def test_ca_material_refuses_missing_certificate_file(monkeypatch):
+    """Live startup must not silently skip signing when CA material is absent."""
+    from core import shioaji_session
+
+    monkeypatch.setattr(shioaji_session.os.path, "isfile", lambda path: False)
+
+    with pytest.raises(RuntimeError, match="certificate file unavailable"):
+        shioaji_session._require_ca_material("/missing/certificate.pfx", "password")
+
+
+def test_ca_material_returns_existing_path_and_password(monkeypatch):
+    """Only verified certificate material can proceed to account activation."""
+    from core import shioaji_session
+
+    monkeypatch.setattr(shioaji_session.os.path, "isfile", lambda path: True)
+
+    assert shioaji_session._require_ca_material(
+        "/safe/certificate.pfx", "password") == ("/safe/certificate.pfx", "password")
