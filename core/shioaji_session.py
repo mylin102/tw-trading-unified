@@ -38,6 +38,20 @@ def _system_status_path() -> Path:
     """Helper for tests to mock the status file path."""
     return _STATUS_FILE
 
+
+def _activate_futopt_ca(api: sj.Shioaji, ca_path: str, ca_passwd: str) -> None:
+    """Activate order signing for the account that will place futures orders.
+
+    Shioaji requires the certificate owner's person ID, not a certificate
+    directory or API key.  Refuse startup if login did not expose that owner;
+    an unauthenticated signing path must never reach live order placement.
+    """
+    account = getattr(api, "futopt_account", None)
+    person_id = getattr(account, "person_id", None)
+    if not isinstance(person_id, str) or not person_id:
+        raise RuntimeError("Cannot activate CA: futures account identity unavailable")
+    api.activate_ca(ca_path=ca_path, ca_passwd=ca_passwd, person_id=person_id)
+
 def get_api() -> sj.Shioaji:
     """Get or create the singleton Shioaji API instance."""
     from core.deployment_role_gate import assert_broker_access_allowed
@@ -69,7 +83,7 @@ def _login(api: sj.Shioaji):
     logger.info(f"[session] Logged in (attempt 1)")
     
     if ca_path and os.path.exists(ca_path):
-        api.activate_ca(ca_path, ca_passwd, os.path.dirname(ca_path))
+        _activate_futopt_ca(api, ca_path, ca_passwd)
         logger.info(f"[session] CA activated: {ca_path}")
 
 def _sync_worker(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, q):
