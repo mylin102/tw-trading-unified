@@ -39,6 +39,22 @@ def _system_status_path() -> Path:
     return _STATUS_FILE
 
 
+def _require_ca_material(ca_path: str | None,
+                         ca_passwd: str | None) -> tuple[str, str]:
+    """Return usable signing material or refuse a live-session startup.
+
+    A successful login alone is not sufficient for a production order path.
+    Never silently continue without a readable certificate: that produces a
+    misleading LIVE_READY state followed by local order rejection.
+    """
+    if not isinstance(ca_path, str) or not ca_path or not isinstance(ca_passwd, str) \
+            or not ca_passwd:
+        raise RuntimeError("CA configuration unavailable")
+    if not os.path.isfile(ca_path):
+        raise RuntimeError("CA certificate file unavailable")
+    return ca_path, ca_passwd
+
+
 def _activate_futopt_ca(api: sj.Shioaji, ca_path: str, ca_passwd: str) -> None:
     """Activate order signing for the account that will place futures orders.
 
@@ -76,15 +92,15 @@ def _login(api: sj.Shioaji):
 
     if not api_key or not secret_key:
         raise ValueError("Missing Shioaji credentials in .env")
+    ca_path, ca_passwd = _require_ca_material(ca_path, ca_passwd)
 
     # Login
     from core.broker.shioaji_compat import safe_login
     res = safe_login(api, api_key, secret_key, contracts_timeout=10000)
     logger.info(f"[session] Logged in (attempt 1)")
     
-    if ca_path and os.path.exists(ca_path):
-        _activate_futopt_ca(api, ca_path, ca_passwd)
-        logger.info(f"[session] CA activated: {ca_path}")
+    _activate_futopt_ca(api, ca_path, ca_passwd)
+    logger.info("[session] CA activated for futures account")
 
 def _sync_worker(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, q):
     """Child process worker: logs in and fetches contracts to populate the local disk cache.
