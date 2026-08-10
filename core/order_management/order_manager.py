@@ -374,7 +374,12 @@ class OrderManager:
         ordno = ordno or getattr(broker_trade, "ordno", None) or broker_order_id
         seqno = seqno or getattr(broker_trade, "seqno", None)
         submit_status = self._normalize_raw_status(raw_status) or OrderStatus.SUBMITTED
-        exchange_id = ordno or broker_order_id or order.exchange_order_id or order.order_id
+        # ``seqno`` is a broker-issued submission receipt.  A seqno-only
+        # acknowledgement must stay traceable, but our local ``order_id`` is
+        # never a legitimate exchange identity and must not be fabricated.
+        exchange_id = ordno or broker_order_id or seqno or order.exchange_order_id
+        if exchange_id is None:
+            raise ValueError("broker submission receipt has no identity")
 
         if order.status == OrderStatus.PENDING_SUBMIT:
             order.submit(

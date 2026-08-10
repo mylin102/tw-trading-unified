@@ -309,6 +309,28 @@ class ShioajiClient:
             price=getattr(order, "price", 0) or 0,
         )
 
+    def get_contract(self, symbol: str):
+        """Resolve one exact futures code without guessing a near/far alias.
+
+        ``get_futures_contract`` intentionally accepts product aliases such as
+        ``TMF``.  The live order bridge instead receives broker codes (for
+        example ``TMFH6``), so it must fail closed on a missing or ambiguous
+        exact match, especially around a contract roll.
+        """
+        if self.api is None or not self.is_logged_in or not isinstance(symbol, str) or not symbol:
+            return None
+        try:
+            from core.broker.shioaji_compat import get_contracts_list
+
+            matches = [
+                contract for contract in get_contracts_list(self.api, "Futures", symbol[:3])
+                if str(getattr(contract, "code", "")) == symbol
+            ]
+            return matches[0] if len(matches) == 1 else None
+        except Exception as exc:
+            logger.error("[shioaji_client] exact contract resolve %s failed: %s", symbol, exc)
+            return None
+
     def update_order(self, trade, price: float, quantity: int = 1):
         self._gate_or_raise("update_order")         # [Step 8] fail-closed
         if not self.is_logged_in:
