@@ -100,3 +100,64 @@ def test_live_seqno_receipt_never_synthesizes_local_exchange_id():
     assert order.seqno == "SEQ-9001"
     assert order.exchange_order_id == "SEQ-9001"
     assert order.exchange_order_id != order.order_id
+
+
+def test_live_second_leg_rejection_quarantines_without_compensating_order():
+    """A submitted near leg plus failed far leg requires reconciliation."""
+    from core.mode_transition import (ExecutionContext, ModeTransitionState)
+    from strategies.futures.monitor import FuturesMonitor
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._execution_context = ExecutionContext(
+        requested_mode="live",
+        effective_mode=ModeTransitionState.LIVE_READY.value,
+        live_order_allowed=True,
+        audit_reasons=("CERTIFIED",),
+    )
+    persisted, events = [], []
+    monitor._persist_execution_context = lambda: persisted.append(
+        monitor._execution_context)
+    monitor._append_mts_event = lambda kind, **payload: events.append(
+        (kind, payload))
+    near = SimpleNamespace(order_id="near-1", exchange_order_id="BRK-NEAR")
+    far = SimpleNamespace(order_id="far-1", reject_reason="ADAPTER_SUBMIT_FAILED")
+
+    monitor._quarantine_mts_entry_partial_submission(
+        trade_id="trade-1", submitted_order=near, failed_order=far)
+
+    assert monitor._execution_context.effective_mode == (
+        ModeTransitionState.LIVE_QUARANTINED.value)
+    assert monitor._execution_context.live_order_allowed is False
+    assert persisted == [monitor._execution_context]
+    assert events == [("MTS_ENTRY_PARTIAL_SUBMISSION", {
+        "trade_id": "trade-1",
+        "submitted_order_id": "near-1",
+        "submitted_broker_order_id": "BRK-NEAR",
+        "failed_order_id": "far-1",
+        "reason": "ADAPTER_SUBMIT_FAILED",
+    })]
+
+
+def test_paper_second_leg_rejection_records_evidence_without_live_quarantine():
+    """Paper retains its mode even if a test double rejects a second leg."""
+    from core.mode_transition import (ExecutionContext, ModeTransitionState)
+    from strategies.futures.monitor import FuturesMonitor
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._execution_context = ExecutionContext(
+        requested_mode="paper",
+        effective_mode=ModeTransitionState.PAPER_ACTIVE.value,
+    )
+    persisted, events = [], []
+    monitor._persist_execution_context = lambda: persisted.append(True)
+    monitor._append_mts_event = lambda kind, **payload: events.append(kind)
+
+    monitor._quarantine_mts_entry_partial_submission(
+        trade_id="paper-trade",
+        submitted_order=SimpleNamespace(order_id="near-paper"),
+        failed_order=SimpleNamespace(order_id="far-paper"))
+
+    assert monitor._execution_context.effective_mode == (
+        ModeTransitionState.PAPER_ACTIVE.value)
+    assert persisted == []
+    assert events == ["MTS_ENTRY_PARTIAL_SUBMISSION"]
