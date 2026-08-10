@@ -100,8 +100,11 @@ def _sync_worker(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, q)
             _activate_futopt_ca(api, ca_path, ca_passwd)
         api.fetch_contracts()
         q.put(True)
-    except Exception as e:
-        q.put(str(e))
+    except Exception:
+        # Child-process failures can originate in the SDK and may carry a
+        # certificate path or account context.  The parent only needs the
+        # fail-closed outcome, never provider exception text.
+        q.put(False)
 
 
 def _fetch_contracts_subprocess(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, timeout: int = 120) -> bool:
@@ -152,7 +155,8 @@ def _fetch_contracts_subprocess(api_key: str, secret_key: str, ca_path: str, ca_
             return True
         else:
             logger.error(
-                f"[V-MODEL][CONTRACT_FETCH] Subprocess failed: {_val}"
+                "[V-MODEL][CONTRACT_FETCH] Subprocess failed: "
+                "CONTRACT_SYNC_FAILED"
             )
             return False
     except Exception:

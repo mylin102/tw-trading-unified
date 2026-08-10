@@ -71,8 +71,10 @@ class ShioajiClient:
     def login(self, retries: int = 3, retry_delay: int = 10):
         api_key = os.getenv("SHIOAJI_API_KEY")
         secret_key = os.getenv("SHIOAJI_SECRET_KEY")
-        cert_path = os.getenv("SHIOAJI_CERT_PATH")
-        cert_password = os.getenv("SHIOAJI_CERT_PASSWORD")
+        cert_path = (os.getenv("SHIOAJI_CA_PATH")
+                     or os.getenv("SHIOAJI_CERT_PATH"))
+        cert_password = (os.getenv("SHIOAJI_CA_PASSWD")
+                         or os.getenv("SHIOAJI_CERT_PASSWORD"))
         if not all([api_key, secret_key]):
             return False
         
@@ -81,11 +83,16 @@ class ShioajiClient:
             try:
                 safe_login(self.api, api_key=api_key, secret_key=secret_key, contracts_timeout=10000)
                 if cert_path and os.path.exists(cert_path):
-                    self.api.activate_ca(ca_path=cert_path, ca_passwd=cert_password, person_id=api_key)
+                    from core.shioaji_session import _activate_futopt_ca
+                    _activate_futopt_ca(self.api, cert_path, cert_password)
                 self.is_logged_in = True
                 return True
-            except Exception as e:
-                logger.error(f"Shioaji login failed (attempt {attempt}/{retries}): {e}")
+            except Exception:
+                # SDK failures can contain certificate/account details.  The
+                # caller receives only the fail-closed False result.
+                logger.error(
+                    "Shioaji login failed (attempt %s/%s): "
+                    "SHIOAJI_LOGIN_FAILED", attempt, retries)
                 if attempt < retries:
                     import time
                     time.sleep(retry_delay)
