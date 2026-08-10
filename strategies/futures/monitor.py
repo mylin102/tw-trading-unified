@@ -3175,15 +3175,32 @@ class FuturesMonitor:
                 "main.py", "strategies/futures/monitor.py",
                 "core/deployment_safety_gate.py",
             ]
-            # [P0 fix] the canonical manifest paths come from the DEPLOYED
-            # release_dir — NEVER the CWD (a worktree/dir change must not
-            # silently lose the manifest guard)
+            # [P0 fix] the canonical manifest paths + exclude semantics
+            # come from the DEPLOYED release_dir and match the production
+            # CLI EXACTLY — a worktree/dir change must not lose the
+            # manifest guard, and the exclude keeps the exclude-self tree
+            # identity stable (recording the freeze must not invalidate
+            # itself -> GUARD_MANIFEST_STALE)
             _rel_dir = str(Path(__file__).resolve().parents[2])
             _manifests = [
                 os.path.join(_rel_dir, "PHASE1_RC_CANDIDATE.md"),
                 os.path.join(_rel_dir, "PHASE2_DEPLOYMENT_MANIFEST.md"),
                 os.path.join(_rel_dir, "PHASE1_FINAL_FREEZE.md"),
             ]
+            _exclude = [
+                "PHASE1_RC_CANDIDATE.md", "PHASE2_DEPLOYMENT_MANIFEST.md",
+                "PHASE1_FINAL_FREEZE.md",
+            ]
+            # [P0 fix] the fresh snapshot's available_margin VALUE must be
+            # passed explicitly (guard_margin requires margin_available;
+            # the evidence alone was present but the guard received None)
+            _margin_available = None
+            try:
+                _mv = snapshot.get("available_margin")
+                if _mv is not None:
+                    _margin_available = float(_mv)
+            except (TypeError, ValueError):
+                _margin_available = None
             gate = check_deployment(
                 release_dir=_rel_dir,
                 closure_files=_closure,
@@ -3191,11 +3208,13 @@ class FuturesMonitor:
                 pid_file=os.environ.get("PM2_PID_FILE",
                                         "/tmp/trading-unified.pid"),
                 position_state_path=str(_ev) if _ev is not None else None,
+                margin_available=_margin_available,
                 margin_evidence=snapshot,
                 session_generation=_gen, session_revoked=False,
                 config_profile_path=self.config_path,
                 config_profile_hash=_prof_hash,
                 manifest_paths=_manifests,
+                exclude_paths=_exclude,
                 expected_sha=os.environ.get("LRC_RELEASE_SHA", ""),
                 phase="post_startup")
             return gate, _ev
