@@ -323,3 +323,36 @@ def test_live_unrecognized_adapter_code_is_redacted():
     assert manager.submit(order) is False
     assert order.status is OrderStatus.REJECTED
     assert order.reject_reason == "ADAPTER_SUBMIT_FAILED"
+
+
+def test_adapter_login_uses_futopt_owner_for_ca(monkeypatch):
+    """The legacy adapter-login path cannot reintroduce API-key CA binding."""
+    from core.broker import shioaji_compat
+    from strategies.futures.squeeze_futures import data as data_package
+
+    class Api:
+        futopt_account = SimpleNamespace(person_id="FUTOPT_OWNER")
+
+        def __init__(self):
+            self.ca_calls = []
+
+        def activate_ca(self, **kwargs):
+            self.ca_calls.append(kwargs)
+
+    api = Api()
+    client = ShioajiClient.__new__(ShioajiClient)
+    client.api = api
+    client.is_logged_in = False
+    monkeypatch.setenv("SHIOAJI_API_KEY", "api-key")
+    monkeypatch.setenv("SHIOAJI_SECRET_KEY", "secret-key")
+    monkeypatch.setenv("SHIOAJI_CA_PATH", "/safe/certificate.pfx")
+    monkeypatch.setenv("SHIOAJI_CA_PASSWD", "password")
+    monkeypatch.setattr(shioaji_compat, "safe_login", lambda *args, **kwargs: True)
+    monkeypatch.setattr(data_package.shioaji_client.os.path, "exists", lambda path: True)
+
+    assert client.login(retries=1) is True
+    assert api.ca_calls == [{
+        "ca_path": "/safe/certificate.pfx",
+        "ca_passwd": "password",
+        "person_id": "FUTOPT_OWNER",
+    }]

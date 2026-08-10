@@ -170,3 +170,28 @@ def test_contract_sync_worker_uses_futopt_person_id(monkeypatch):
         "ca_passwd": "password",
         "person_id": "FUTOPT_OWNER",
     }]
+
+
+def test_contract_sync_worker_redacts_sensitive_ca_error(monkeypatch):
+    """Certificate failures cannot leak provider context over IPC/logging."""
+    from core import shioaji_session
+
+    class Api:
+        futopt_account = SimpleNamespace(person_id="FUTOPT_OWNER")
+
+        def login(self, *args):
+            return None
+
+        def activate_ca(self, **kwargs):
+            raise RuntimeError("certificate=/safe/certificate.pfx owner=FUTOPT_OWNER")
+
+    received = []
+    monkeypatch.setitem(sys.modules, "shioaji", SimpleNamespace(Shioaji=Api))
+    monkeypatch.setattr(shioaji_session.os.path, "exists", lambda path: True)
+
+    shioaji_session._sync_worker(
+        "api-key", "secret-key", "/safe/certificate.pfx", "password",
+        SimpleNamespace(put=received.append),
+    )
+
+    assert received == [False]
