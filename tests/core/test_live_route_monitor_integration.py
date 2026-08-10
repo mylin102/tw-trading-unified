@@ -796,3 +796,131 @@ def test_gate_fail_keeps_process_alive(tmp_path, monkeypatch):
     assert "POST_STARTUP_GATE_FAILED" in m._execution_context.audit_reasons
     assert m._execution_context.live_order_allowed is False
     assert getattr(m, "api", None) is api     # the process stays alive
+
+
+def test_run_gate_passes_margin_available_same_source(tmp_path, monkeypatch):
+    """[P0 wiring] the in-process gate must pass the fresh snapshot's
+    available_margin VALUE + the SAME margin_evidence — the evidence has
+    343082.0 but the guard received None (GUARD_MARGIN_UNAVAILABLE at the
+    real release9 startup)."""
+    monkeypatch.chdir(tmp_path)     # a random CWD must not matter
+    _set_release_env(monkeypatch)
+    cfg = _minimal_live_cfg(tmp_path)
+    from strategies.futures.monitor import FuturesMonitor
+    from core.deployment_safety_gate import DeploymentCheck, GuardResult
+    calls = {}
+
+    import core.deployment_safety_gate as dg
+
+    def _spy_check_deployment(**kw):
+        calls["margin_available"] = kw.get("margin_available")
+        calls["margin_evidence"] = kw.get("margin_evidence")
+        g = GuardResult(guard="post_startup", ok=True)
+        return DeploymentCheck(ok=True, results=(g,))
+
+    monkeypatch.setattr(dg, "check_deployment", _spy_check_deployment)
+    m = FuturesMonitor.__new__(FuturesMonitor)
+    m.api = _real_schema_api()      # margin -> 343082.0
+    m.config_path = str(cfg)
+    m._execution_context = SimpleNamespace(session_id="ab" * 8)
+    gate, _ = m._run_post_startup_gate()
+    assert gate.ok
+    assert calls["margin_available"] == 343082.0, calls["margin_available"]
+    ev = calls["margin_evidence"]
+    assert ev["available_margin"] == 343082.0
+    assert ev["canonical_input_hash"] and ev["captured_at"]
+
+
+def test_run_gate_manifest_exclude_parity_with_cli(tmp_path, monkeypatch):
+    """[P0 wiring] the in-process gate passes the SAME manifest paths AND
+    exclude semantics as the production CLI (the ACTIVE canonical freeze
+    manifest rule) — the missing exclude made the exclude-self tree
+    include the manifest docs (GUARD_MANIFEST_STALE at release9)."""
+    import os
+    monkeypatch.chdir(tmp_path)
+    _set_release_env(monkeypatch)
+    cfg = _minimal_live_cfg(tmp_path)
+    from strategies.futures.monitor import FuturesMonitor
+    from core.deployment_safety_gate import DeploymentCheck, GuardResult
+    calls = {}
+
+    import core.deployment_safety_gate as dg
+
+    def _spy_check_deployment(**kw):
+        calls["manifest_paths"] = kw.get("manifest_paths")
+        calls["exclude_paths"] = kw.get("exclude_paths")
+        g = GuardResult(guard="post_startup", ok=True)
+        return DeploymentCheck(ok=True, results=(g,))
+
+    monkeypatch.setattr(dg, "check_deployment", _spy_check_deployment)
+    m = FuturesMonitor.__new__(FuturesMonitor)
+    m.api = _real_schema_api()
+    m.config_path = str(cfg)
+    m._execution_context = SimpleNamespace(session_id="ab" * 8)
+    gate, _ = m._run_post_startup_gate()
+    assert gate.ok
+    rel = _repo_root()
+    assert calls["manifest_paths"] == [
+        str(rel / "PHASE1_RC_CANDIDATE.md"),
+        str(rel / "PHASE2_DEPLOYMENT_MANIFEST.md"),
+        str(rel / "PHASE1_FINAL_FREEZE.md")]
+    assert calls["exclude_paths"] == [
+        "PHASE1_RC_CANDIDATE.md", "PHASE2_DEPLOYMENT_MANIFEST.md",
+        "PHASE1_FINAL_FREEZE.md"], calls["exclude_paths"]
+    assert os.path.exists(calls["manifest_paths"][-1])
+
+
+def test_rollback_parity_active_canonical_manifest(tmp_path):
+    """[P0 wiring] guard-level parity: with the CLI's manifest paths +
+    exclude semantics, a history-stale intermediate doc (no hash) is
+    SKIPPED and the ACTIVE canonical freeze manifest (PHASE1_FINAL_FREEZE)
+    governs — the verdict is CWD-independent and identical for the
+    in-process wiring."""
+    import subprocess
+    from core.deployment_safety_gate import guard_rollback_manifest
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email",
+                    "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name",
+                    "t"], check=True)
+    # history-stale docs: RC_CANDIDATE + PHASE2 carry NO hash
+    (repo / "PHASE1_RC_CANDIDATE.md").write_text(
+        "# RC candidate (history doc — no frozen hash)\n", encoding="utf-8")
+    (repo / "PHASE2_DEPLOYMENT_MANIFEST.md").write_text(
+        "# Phase2 manifest (no frozen hash)\n", encoding="utf-8")
+    (repo / "PHASE1_FINAL_FREEZE.md").write_text(
+        "placeholder\n", encoding="utf-8")
+    (repo / "main.py").write_text("print(1)\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"],
+                   check=True)
+    head = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    manifests = [str(repo / "PHASE1_RC_CANDIDATE.md"),
+                 str(repo / "PHASE2_DEPLOYMENT_MANIFEST.md"),
+                 str(repo / "PHASE1_FINAL_FREEZE.md")]
+    exclude = ["PHASE1_RC_CANDIDATE.md", "PHASE2_DEPLOYMENT_MANIFEST.md",
+               "PHASE1_FINAL_FREEZE.md"]
+    # the active freeze record (the exclude-self tree identity)
+    from core.deployment_safety_gate import _exclude_self_tree_hash
+    frozen = _exclude_self_tree_hash(str(repo), "HEAD", exclude)
+    (repo / "PHASE1_FINAL_FREEZE.md").write_text(
+        f"frozen_tree_hash: {frozen}\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m",
+                    "freeze record"], check=True)
+    # random CWD
+    import os
+    old = os.getcwd()
+    os.chdir(tmp_path / "elsewhere")
+    try:
+        r = guard_rollback_manifest(str(repo), manifests, head,
+                                    exclude_paths=exclude)
+        assert r.ok, r.reasons
+        # the SAME inputs WITHOUT the exclude semantics drift (the bug)
+        r2 = guard_rollback_manifest(str(repo), manifests, head)
+        assert not r2.ok and "GUARD_MANIFEST_STALE" in r2.reasons
+    finally:
+        os.chdir(old)
