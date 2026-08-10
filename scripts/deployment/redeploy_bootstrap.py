@@ -45,6 +45,33 @@ if str(_REPO_ROOT) not in sys.path:
 _ACCEPTABLE_STALE = {"SESSION_LOGOUT", "RESTART_MAINTAIN_QUARANTINE"}
 _BLOCKING_AUDIT = {"SAFETY_STOP_RECONCILE_PENDING"}
 _BOOTSTRAP_REASON = "REDEPLOY_BOOTSTRAP"
+_RETRY_GATE_REASON = "POST_STARTUP_GATE_FAILED"
+
+
+def _audit_acceptance(audits: set, retry_gate: bool, applying: bool):
+    """Return None if the ctx audit state is acceptable for a reset,
+    else a refusal reason string.
+
+    - a pending safety reconcile ALWAYS refuses (never reset under
+      reconcile)
+    - the classic stale states (SESSION_LOGOUT / RESTART_MAINTAIN_
+      QUARANTINE) are always acceptable
+    - a POST_STARTUP_GATE_FAILED ctx (with its known GUARD_* refusal
+      codes) is retryable ONLY via --retry-post-startup-gate WITH
+      --apply; default / dry-run / --apply alone refuse it
+    - ANY other/unknown reason refuses (no silent re-bootstrap)"""
+    if audits & _BLOCKING_AUDIT:
+        return ("safety reconcile pending — refuse (never reset under "
+                "reconcile)")
+    if audits.issubset(_ACCEPTABLE_STALE):
+        return None
+    if (applying and retry_gate and _RETRY_GATE_REASON in audits and
+            all(a in _ACCEPTABLE_STALE or a == _RETRY_GATE_REASON
+                or a.startswith("GUARD_") for a in audits)):
+        return None
+    return (f"unacceptable ctx audit state {sorted(audits)} — refuse "
+            f"(retry of POST_STARTUP_GATE_FAILED requires "
+            f"--retry-post-startup-gate WITH --apply)")
 
 
 def _ctx_path(runtime_dir: str) -> Path:
@@ -86,6 +113,11 @@ def main() -> int:
     ap.add_argument("--margin-evidence", required=True)
     ap.add_argument("--config-profile", required=True)
     ap.add_argument("--config-hash", required=True)
+    ap.add_argument("--retry-post-startup-gate", action="store_true",
+                    help="allow resetting a ctx whose audit carries "
+                         "POST_STARTUP_GATE_FAILED + the known GUARD_* "
+                         "refusal codes (REQUIRES --apply; default / "
+                         "dry-run / --apply alone refuse this reason)")
     ap.add_argument("--apply", action="store_true",
                     help="perform the reset (default: dry-run, no writes)")
     args = ap.parse_args()
@@ -118,13 +150,11 @@ def main() -> int:
 
     if ctx is not None:
         audits = set(ctx.get("audit_reasons") or ())
-        if audits & _BLOCKING_AUDIT:
-            failures.append(
-                "safety reconcile pending — refuse (never reset under "
-                "reconcile)")
-        elif audits and not audits.issubset(_ACCEPTABLE_STALE):
-            failures.append(
-                f"unacceptable ctx audit state {sorted(audits)} — refuse")
+        _reason = _audit_acceptance(audits,
+                                    args.retry_post_startup_gate,
+                                    args.apply)
+        if _reason:
+            failures.append(_reason)
         elif not audits and ctx.get("effective_mode") != "live_quarantined":
             failures.append(
                 "ctx in an unexpected clean state — refuse (nothing to "

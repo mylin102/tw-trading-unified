@@ -206,3 +206,123 @@ def test_post_startup_still_requires_generation(env, monkeypatch):
     from core.deployment_safety_gate import guard_session_generation
     r = guard_session_generation(None, False)
     assert not r.ok and "GUARD_SESSION_MISSING" in r.reasons
+
+
+_FAILED_GATE_CTX = {
+    "account_id_hash": None,
+    "audit_reasons": ["SESSION_LOGOUT", "POST_STARTUP_GATE_FAILED",
+                      "GUARD_CAPTURE_MISMATCH", "GUARD_MANIFEST_MISSING",
+                      "GUARD_MARGIN_UNAVAILABLE"],
+    "config_hash": "e798167389a5c1f42e6697da4e95138434478042eb5087155b826d57320a1c79",
+    "effective_mode": "live_quarantined",
+    "live_order_allowed": False,
+    "requested_mode": "live",
+    "revision": 2,
+    "session_id": "337ae6215a7f497df9da235be61f58a8",
+    "updated_at": "2026-08-10T13:07:53+08:00",
+}
+
+
+def _base_args_retry(e):
+    return _base_args(e) + ["--retry-post-startup-gate"]
+
+
+def _new_failed_gate_env(tmp_path, monkeypatch):
+    """A runtime whose ctx carries the previous POST_STARTUP_GATE_FAILED
+    audit (the real release8 blocker)."""
+    rt = tmp_path / "runtime"
+    (rt / "logs").mkdir(parents=True)
+    _write_ctx(rt, _FAILED_GATE_CTX)
+    pf = _write_snapshot(tmp_path)
+    prof, prof_hash = _write_profile(tmp_path)
+    pid = tmp_path / "nope.pid"
+    return {"rt": rt, "pf": pf, "prof": prof, "prof_hash": prof_hash,
+            "pid": pid, "tmp": tmp_path}
+
+
+def test_retry_apply_alone_refuses_failed_gate_ctx(tmp_path, monkeypatch):
+    """[P0 retry] --apply WITHOUT --retry-post-startup-gate must REFUSE a
+    ctx carrying POST_STARTUP_GATE_FAILED (no silent re-bootstrap)."""
+    e = _new_failed_gate_env(tmp_path, monkeypatch)
+    r = _run(e["tmp"], *_base_args(e), "--apply")
+    assert r.returncode != 0
+    assert "refuse" in (r.stdout + r.stderr).lower()
+    assert json.loads((e["rt"] / "execution_context.json").read_text()) \
+        == _FAILED_GATE_CTX
+
+
+def test_retry_dry_run_refuses_failed_gate_ctx(tmp_path, monkeypatch):
+    """[P0 retry] --retry-post-startup-gate WITHOUT --apply must refuse
+    (dry-run default; the reset requires the explicit apply)."""
+    e = _new_failed_gate_env(tmp_path, monkeypatch)
+    r = _run(e["tmp"], *_base_args_retry(e))
+    assert r.returncode != 0
+    assert json.loads((e["rt"] / "execution_context.json").read_text()) \
+        == _FAILED_GATE_CTX
+
+
+def test_retry_succeeds_after_all_guards(tmp_path, monkeypatch):
+    """[P0 retry] --retry-post-startup-gate + --apply with ALL guards
+    (pid inactive, flat + margin evidence, sealed profile, no reconcile)
+    archives the ENTIRE old ctx and atomically resets to
+    LIVE_QUARANTINED + REDEPLOY_BOOTSTRAP, session None."""
+    e = _new_failed_gate_env(tmp_path, monkeypatch)
+    r = _run(e["tmp"], *_base_args_retry(e), "--apply")
+    assert r.returncode == 0, r.stdout + r.stderr
+    hist = e["rt"] / "logs" / "context_history"
+    files = sorted(hist.glob("*.json"))
+    assert len(files) == 1, f"expected one archive, got {[f.name for f in files]}"
+    archived = json.loads(files[0].read_text())
+    assert archived["ctx"] == _FAILED_GATE_CTX
+    assert archived["sha256"] == hashlib.sha256(
+        json.dumps(_FAILED_GATE_CTX).encode()).hexdigest()
+    cur = json.loads((e["rt"] / "execution_context.json").read_text())
+    assert cur["effective_mode"] == "live_quarantined"
+    assert cur["audit_reasons"] == ["REDEPLOY_BOOTSTRAP"]
+    assert not cur.get("session_id")
+    assert cur["live_order_allowed"] is False
+
+
+def test_retry_refuses_unknown_failure_reason(tmp_path, monkeypatch):
+    """[P0 retry] ANY other/unknown failure reason (e.g. an emergency
+    block) must refuse WITHOUT modifying the file."""
+    e = _new_failed_gate_env(tmp_path, monkeypatch)
+    _write_ctx(e["rt"], {**_FAILED_GATE_CTX,
+                         "audit_reasons": ["EMERGENCY_BLOCKED_QUARANTINED",
+                                           "POST_STARTUP_GATE_FAILED"]})
+    r = _run(e["tmp"], *_base_args_retry(e), "--apply")
+    assert r.returncode != 0
+    cur = json.loads((e["rt"] / "execution_context.json").read_text())
+    assert "EMERGENCY_BLOCKED_QUARANTINED" in cur["audit_reasons"]
+    assert not (e["rt"] / "logs" / "context_history").exists() \
+        or not list((e["rt"] / "logs" / "context_history").glob("*.json"))
+
+
+def test_retry_refuses_nonflat_snapshot(tmp_path, monkeypatch):
+    """[P0 retry] the guards still apply: a non-flat snapshot refuses
+    and never touches the ctx."""
+    e = _new_failed_gate_env(tmp_path, monkeypatch)
+    pf = _write_snapshot(e["tmp"], positions=[
+        {"account": "futures", "code": "TMFH6", "quantity": 1,
+         "direction": "Action.Sell"}])
+    r = _run(e["tmp"], "--runtime-dir", str(e["rt"]), "--pid-file",
+             str(e["pid"]), "--position-state", str(pf),
+             "--margin-evidence", str(pf), "--config-profile",
+             str(e["prof"]), "--config-hash", e["prof_hash"],
+             "--retry-post-startup-gate", "--apply")
+    assert r.returncode != 0
+    assert json.loads((e["rt"] / "execution_context.json").read_text()) \
+        == _FAILED_GATE_CTX
+
+
+def test_retry_refuses_profile_mismatch(tmp_path, monkeypatch):
+    """[P0 retry] a profile/hash mismatch refuses and never modifies."""
+    e = _new_failed_gate_env(tmp_path, monkeypatch)
+    r = _run(e["tmp"], "--runtime-dir", str(e["rt"]), "--pid-file",
+             str(e["pid"]), "--position-state", str(e["pf"]),
+             "--margin-evidence", str(e["pf"]), "--config-profile",
+             str(e["prof"]), "--config-hash", "cd" * 32,
+             "--retry-post-startup-gate", "--apply")
+    assert r.returncode != 0
+    assert json.loads((e["rt"] / "execution_context.json").read_text()) \
+        == _FAILED_GATE_CTX
