@@ -532,6 +532,81 @@ def save_yaml(path, data):
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
+# 2026-08-10 Hermes Agent: render runtime mode only from the canonical execution context.
+def summarize_execution_context(context, known_profile_hashes):
+    """Return fail-closed dashboard truth for the active futures runtime."""
+    context = context if isinstance(context, dict) else {}
+    config_hash = context.get("config_hash")
+    profile_identity = next(
+        (name for name, digest in known_profile_hashes.items()
+         if digest and digest == config_hash),
+        None,
+    )
+    requested_mode = context.get("requested_mode")
+    effective_mode = context.get("effective_mode")
+    live_order_allowed = context.get("live_order_allowed") is True
+    audit_reasons = context.get("audit_reasons")
+    if not isinstance(audit_reasons, list):
+        audit_reasons = ["STATE_FILE_CORRUPTED"]
+
+    is_live_runtime = (
+        requested_mode == "live"
+        and effective_mode == "live_ready"
+        and live_order_allowed
+        and profile_identity == "futures_live.yaml"
+    )
+    is_paper_runtime = (
+        requested_mode == "paper"
+        and effective_mode == "paper_active"
+        and not live_order_allowed
+        and profile_identity == "futures.yaml (Paper baseline)"
+    )
+    if is_live_runtime:
+        runtime_status = "LIVE_READY"
+        warning = ""
+    elif is_paper_runtime:
+        runtime_status = "PAPER_ACTIVE"
+        warning = ""
+    else:
+        runtime_status = "UNKNOWN / QUARANTINED"
+        if not profile_identity:
+            warning = "Execution-context config hash does not match a known profile; runtime is fail-closed."
+        else:
+            warning = "Execution context is not an authorized active live or paper state; runtime is fail-closed."
+
+    return {
+        "runtime_status": runtime_status,
+        "profile_identity": profile_identity or "UNKNOWN (HASH MISMATCH)",
+        "requested_mode": requested_mode or "unknown",
+        "effective_mode": effective_mode or "unknown",
+        "live_order_allowed": live_order_allowed,
+        "audit_reasons": audit_reasons,
+        "context_version": context.get("revision", "unknown"),
+        "context_freshness": context.get("updated_at") or "UNKNOWN",
+        "warning": warning,
+        "is_live_runtime": is_live_runtime,
+        "is_paper_runtime": is_paper_runtime,
+        "research_evidence_is_runtime_authorization": False,
+    }
+
+
+# 2026-08-10 Hermes Agent: bind dashboard status to the shared runtime state, never futures.yaml.
+def load_active_runtime_truth(base):
+    import hashlib
+    from core.execution_context_state import read_execution_context
+
+    known_profile_hashes = {}
+    for filename, identity in (
+        ("futures.yaml", "futures.yaml (Paper baseline)"),
+        ("futures_live.yaml", "futures_live.yaml"),
+    ):
+        profile_path = base / "config" / filename
+        try:
+            known_profile_hashes[identity] = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+        except OSError:
+            known_profile_hashes[identity] = None
+    return summarize_execution_context(read_execution_context(), known_profile_hashes)
+
 # 2026-06-23 Gemini CLI: 快取策略註冊表探索流程，避免在每次頁面重整（每 10 秒）都重新掃描並載入 21 個策略 plugin，藉此降低 CPU 使用率
 @st.cache_resource(ttl=300)
 def get_cached_strategy_registry():
@@ -557,7 +632,9 @@ risk_cfg = load_yaml(RISK_CFG_PATH)
 stock_cfg = load_yaml(STOCK_CFG_PATH)
 # 2026-05-27 Gemini CLI: Global Ticker Reference (no hardcoding)
 _TICKER = futures_cfg.get("ticker", "TMF")
+# futures.yaml is the editable Paper baseline, not the active runtime identity.
 f_live = futures_cfg.get("live_trading", False)
+active_runtime_truth = load_active_runtime_truth(BASE)
 o_live = options_cfg.get("live_trading", False)
 s_live = stock_cfg.get("live_trading", False)
 alloc = risk_cfg.get("allocation", {})
@@ -2701,15 +2778,36 @@ except Exception:
 def mode_badge(live):
     return "🔴 LIVE" if live else "📝 PAPER"
 
+def runtime_mode_badge(truth):
+    if truth["is_live_runtime"]:
+        return "🔴 LIVE_READY"
+    if truth["is_paper_runtime"]:
+        return "📝 PAPER_ACTIVE"
+    return "⚠️ UNKNOWN / QUARANTINED"
+
 hc = st.columns([1.5, 1, 1, 1, 1.5])
 hc[0].title("Trading Unified")
 # 2026-05-27 Gemini CLI: Dynamic Ticker in Dashboard Header
-hc[1].metric(f"期貨 {_TICKER}", mode_badge(f_live))
+hc[1].metric(f"期貨 {_TICKER} Runtime", runtime_mode_badge(active_runtime_truth))
 hc[2].metric("選擇權 TXO", mode_badge(o_live))
 hc[3].metric("台股 Stocks", mode_badge(s_live))
 hc[4].caption(f"📅 {TODAY}")
 
-if f_live or o_live or s_live:
+st.caption(
+    "期貨執行內容："
+    f"requested={active_runtime_truth['requested_mode']} | "
+    f"effective={active_runtime_truth['effective_mode']} | "
+    f"live_order_allowed={active_runtime_truth['live_order_allowed']} | "
+    f"profile={active_runtime_truth['profile_identity']} | "
+    f"context version={active_runtime_truth['context_version']} | "
+    f"updated={active_runtime_truth['context_freshness']}"
+)
+if active_runtime_truth["audit_reasons"]:
+    st.caption("期貨執行稽核原因：" + ", ".join(active_runtime_truth["audit_reasons"]))
+if active_runtime_truth["warning"]:
+    st.error(active_runtime_truth["warning"])
+
+if active_runtime_truth["is_live_runtime"] or o_live or s_live:
     st.markdown('<div style="background:#ff4444;color:white;padding:8px;text-align:center;border-radius:4px;font-weight:bold;">⚠️ LIVE TRADING ACTIVE</div>', unsafe_allow_html=True)
 
 def _monitor_status():
@@ -2752,7 +2850,7 @@ if page == "總覽":
     with col1:
         # 2026-05-27 Gemini CLI: Dynamic Ticker in Header
         _ov_ticker = futures_cfg.get("ticker", "TMF")
-        st.header(f"期貨 {_ov_ticker} ({mode_badge(f_live)})")
+        st.header(f"期貨 {_ov_ticker} ({runtime_mode_badge(active_runtime_truth)})")
         if f_df is not None and not f_df.empty:
             last = f_df.iloc[-1]
             c1, c2, c3 = st.columns(3)
@@ -2987,7 +3085,7 @@ elif _selected_product == "TMF":
     _pt_start = time.time()
     # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Dynamic Ticker
     _ov_ticker = futures_cfg.get("ticker", "TMF")
-    st.header(f"期貨 {_ov_ticker} ({mode_badge(f_live)})")
+    st.header(f"期貨 {_ov_ticker} ({runtime_mode_badge(active_runtime_truth)})")
 
     # 2026-07-07 Hermes Agent: cache-busting key
     _today = get_session_date_str()
@@ -3778,6 +3876,18 @@ elif _selected_product == "TMF":
             """)
     
     # ── MTS Position State (from tmf_spread plugin) ──
+    # [provenance] canonical Paper/Live scope for EVERY MTS performance
+    # metric (UPL, realized PnL, closed-loop count / win rate / profit
+    # factor): mode + run_id + config_hash + session/source provenance.
+    # Legacy/mixed/unknown evidence renders N/A with the explicit reason —
+    # NEVER 0, NEVER merged Paper/Live PnL.
+    from core.performance_provenance import (
+        classify_mts_evidence, scope_mts_performance, upl_presentation)
+    _fills_path_scope = runtime_path("logs", "mts_trade_fills.jsonl")
+    _events_path_scope = runtime_path("logs", "mts_spread_events.jsonl")
+    _mts_perf_scope = scope_mts_performance(
+        active_runtime_truth,
+        classify_mts_evidence(_fills_path_scope, _events_path_scope))
     _mts_state_file = "/tmp/mts_position_state.json"
     if os.path.exists(_mts_state_file):
         try:
@@ -3855,11 +3965,20 @@ elif _selected_product == "TMF":
                         _nr = _r
                         _nr_label = f"{_r:+,.0f} TWD (已平倉)"
                 _tr = (_nr or 0) + (_fr or 0)
-                _u1.metric("近月 UPL", _nr_label)
-                _u2.metric("遠月 UPL", _fr_label)
-                _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
-                if "RELEASED" in _fr_status or "RELEASED" in _nr_status:
-                    st.caption("總計 = 未實現 UPL + 已平倉腿 realized PnL（含釋放腿）")
+                if _mts_perf_scope["ok"]:
+                    _u1.metric("近月 UPL", _nr_label)
+                    _u2.metric("遠月 UPL", _fr_label)
+                    _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
+                    if "RELEASED" in _fr_status or "RELEASED" in _nr_status:
+                        st.caption("總計 = 未實現 UPL + 已平倉腿 realized PnL（含釋放腿）")
+                else:
+                    # [provenance] no authorized scope (legacy/mixed/
+                    # unknown evidence or runtime) => N/A + explicit
+                    # source-mismatch reason — NEVER 0, NEVER merged PnL
+                    _u1.metric("近月 UPL", "N/A")
+                    _u2.metric("遠月 UPL", "N/A")
+                    _u3.metric("總計 UPL", "N/A")
+                    st.warning(f"⚠️ MTS UPL N/A — {_mts_perf_scope['reason']}")
 
                 # 2026-07-27 Gemini CLI: Policy J (Combined UPL Trail) Live Notification Banner
                 # 2026-07-31 Hermes Agent: Only show Policy J when BOTH legs are still open (SPREAD phase).
@@ -3969,13 +4088,26 @@ elif _selected_product == "TMF":
                 # 2026-07-31 Hermes Agent: FLAT => UPL MUST be 0 regardless of stale
                 # state fields (telemetry writer can leave phantom UPL after
                 # emergency close / clear_records). Never render stale numbers.
+                # [provenance] the live verified-flat 0 requires a FRESH
+                # snapshot timestamp (the state file mtime); missing/stale
+                # snapshot or no authorized scope => N/A + explicit reason.
                 st.markdown("**MTS 未實現損益 (Unrealized PnL)**")
                 _u1, _u2, _u3 = st.columns(3)
-                _u1.metric("近月 UPL", "0 TWD")
-                _u2.metric("遠月 UPL", "0 TWD")
-                _u3.metric("總計 UPL", "0 TWD")
+                _upl_pres = upl_presentation(
+                    _mts_perf_scope, True,
+                    os.path.getmtime(_mts_state_file)
+                    if os.path.exists(_mts_state_file) else None)
+                if _upl_pres["kind"] == "ZERO":
+                    _u1.metric("近月 UPL", "0 TWD")
+                    _u2.metric("遠月 UPL", "0 TWD")
+                    _u3.metric("總計 UPL", "0 TWD")
+                else:
+                    _u1.metric("近月 UPL", "N/A")
+                    _u2.metric("遠月 UPL", "N/A")
+                    _u3.metric("總計 UPL", "N/A")
+                    st.warning(f"⚠️ MTS UPL N/A — {_upl_pres['reason']}")
                 _stale_upl = float(_mts_state.get("total_upl", 0) or 0)
-                if abs(_stale_upl) > 0:
+                if _upl_pres["kind"] == "ZERO" and abs(_stale_upl) > 0:
                     st.warning(
                         f"⚠️ 資料不一致：狀態為 FLAT 但 state 殘留 UPL {_stale_upl:+,.0f} TWD"
                         "（舊寫入未清除，顯示已強制歸零）"
@@ -4033,17 +4165,27 @@ elif _selected_product == "TMF":
             _pf = _curr_metrics["profit_factor"]
 
             _c1, _c2, _c3, _c4 = st.columns(4)
-            _c1.metric("MTS 實現毛損益 (Realized Gross)", f"{_total_net:+,.0f} TWD")
-            _c2.metric("已完成圈數 (Realized)", _total_trades)
-            _c3.metric("勝率", f"{_win_rate:.1%}")
-            _c4.metric("獲利因子", f"{_pf:.2f}" if _total_trades > 0 else "—")
+            if _mts_perf_scope["ok"]:
+                _c1.metric("MTS 實現毛損益 (Realized Gross)", f"{_total_net:+,.0f} TWD")
+                _c2.metric("已完成圈數 (Realized)", _total_trades)
+                _c3.metric("勝率", f"{_win_rate:.1%}")
+                _c4.metric("獲利因子", f"{_pf:.2f}" if _total_trades > 0 else "—")
+            else:
+                # [provenance] no authorized scope => N/A + explicit
+                # source-mismatch reason — NEVER 0, NEVER merged PnL
+                _c1.metric("MTS 實現毛損益 (Realized Gross)", "N/A")
+                _c2.metric("已完成圈數 (Realized)", "N/A")
+                _c3.metric("勝率", "N/A")
+                _c4.metric("獲利因子", "N/A")
+                st.warning(f"⚠️ MTS 績效 N/A — {_mts_perf_scope['reason']}")
 
             _day_m = _breakdown["DAY"]
             _night_m = _breakdown["NIGHT"]
-            st.caption(
-                f"☀️ 日盤實現毛利: **{_day_m['total_net']:+,.0f} TWD** ({_day_m['total_trades']} 圈, 勝率 {_day_m['win_rate']:.1%}) | "
-                f"🌙 夜盤實現毛利: **{_night_m['total_net']:+,.0f} TWD** ({_night_m['total_trades']} 圈, 勝率 {_night_m['win_rate']:.1%})"
-            )
+            if _mts_perf_scope["ok"]:
+                st.caption(
+                    f"☀️ 日盤實現毛利: **{_day_m['total_net']:+,.0f} TWD** ({_day_m['total_trades']} 圈, 勝率 {_day_m['win_rate']:.1%}) | "
+                    f"🌙 夜盤實現毛利: **{_night_m['total_net']:+,.0f} TWD** ({_night_m['total_trades']} 圈, 勝率 {_night_m['win_rate']:.1%})"
+                )
             
             # 2026-08-04 Gemini CLI: Synchronize closed loops table with session filter selection
             if _sess_key == "DAY":
@@ -4660,7 +4802,7 @@ elif _selected_product == "TMF":
 # ════════════════════════════════════════
 elif _selected_product == "MXF":
     _TICKER = "MXF"
-    st.header(f"小台（MXF / MTX）被動行情對照與數據監控 ({mode_badge(f_live)})")
+    st.header(f"小台（MXF / MTX）被動行情對照與數據監控 ({runtime_mode_badge(active_runtime_truth)})")
     
     # ── Top Metrics Banner ──
     mxf_state_path = Path("/tmp/mts_position_state_mtx.json")
@@ -6118,14 +6260,14 @@ elif page == "設定":
     except Exception:
         pass
 
-    # ── 0. 實盤就緒度檢查 ──
-    with st.expander("🚀 實盤就緒度檢查", expanded=True):
+    # ── 0. Research / observation evidence (not runtime authorization) ──
+    with st.expander("🧪 研究／觀察證據（不構成執行中程序授權）", expanded=True):
         from core.live_readiness import check_all, get_readiness_items, get_readiness_summary
         _ready_flag, check_output = check_all()
         readiness_items = get_readiness_items(check_output)
         status, passed, total = get_readiness_summary(check_output)
 
-        st.markdown(f"### {status} ({passed}/{total} 項通過)")
+        st.markdown(f"### 研究／觀察證據：{status} ({passed}/{total} 項通過)")
 
         # Progress bar
         pct = passed / total if total > 0 else 0
@@ -6136,26 +6278,20 @@ elif page == "設定":
             icon = "✅" if r.passed else "❌"
             st.caption(f"{icon} **{r.name}**: {r.detail}")
 
-        # Action recommendation (mode-aware — 2026-08-03)
-        if status == "PAPER MODE":
-            st.info("📋 目前 Paper 模式 — 不建議實盤（go-live 前置條件未滿足，見 docs/LIVE_TRANSITION_SOP.md §5）")
-        elif status == "READY":
-            st.success("🎉 所有檢查通過且已完成 transition — 可考慮進入 Phase 2 小額實盤測試")
-            st.info(f"建議: 先用 1 口 {_TICKER} 測試 5 個交易日，設定每日最大虧損 2%")
-        elif passed >= total * 0.6:
-            remaining = total - passed
-            st.warning(f"⚠️ 還有 {remaining} 項未通過，建議繼續 Paper 觀察")
-            for r in readiness_items:
-                if not r.passed:
-                    st.caption(f"❌ 待解決: {r.name} (目前: {r.detail})")
+        # This evidence is deliberately separate from the execution_context runtime truth.
+        if active_runtime_truth["is_live_runtime"]:
+            st.info("執行中程序目前為 LIVE_READY；研究／觀察證據不構成執行中程序授權，也不會否定此 runtime 狀態。")
+        elif active_runtime_truth["is_paper_runtime"]:
+            st.info("執行中程序目前為 PAPER_ACTIVE；紙上交易工作流程與控制項維持可用。")
         else:
-            st.error("❌ 多數檢查未通過，不建議開啟實盤交易")
+            st.warning("執行中程序身份為 UNKNOWN / QUARANTINED；請以 execution_context 稽核原因處理，勿由研究進度推論 runtime。")
 
         st.divider()
         st.caption("參考文件: `docs/LIVE_TRADING_GUIDE.md`")
 
     # 2026-05-27 Gemini CLI: Dynamic Ticker in Settings
-    with st.expander(f"📈 期貨 {_TICKER} 設定", expanded=True):
+    with st.expander(f"📈 期貨 {_TICKER} Paper baseline 設定", expanded=True):
+        st.caption("此處只編輯 `futures.yaml` Paper baseline，並非執行中程序切換器；active runtime 請看 execution_context。")
         # 2026-06-23 Gemini CLI: 使用快取的策略註冊表以避免在每次重整時重複掃描目錄，優化 CPU 使用率
         _reg = get_cached_strategy_registry()
         fut_strats = {item["name"]: item for item in _reg.list_all() if item.get("asset_class") == "futures" and item.get("available", False)}
@@ -6176,7 +6312,12 @@ elif page == "設定":
         )
 
         with st.form("futures_settings_form"):
-            f_live_new = st.checkbox("啟用期貨實盤交易 (LIVE)", value=futures_cfg.get("live_trading", False))
+            f_live_new = st.checkbox(
+                "Paper baseline 的 LIVE 偏好（非執行中程序）",
+                value=futures_cfg.get("live_trading", False),
+                disabled=active_runtime_truth["is_live_runtime"],
+                help="當 active runtime 為 LIVE_READY 時，此 Paper baseline 控制項不可作為程序切換或 active profile 寫入。",
+            )
             # 2026-05-22 Gemini CLI: Add MTS Mode toggle back to UI
             f_mts_new = st.checkbox("啟用 MTS 自適應價差模式 (MTS Mode)", value=futures_cfg.get("mts", {}).get("enabled", False))
             _mts_params_def = futures_cfg.get("mts", {}).get("params", {})
