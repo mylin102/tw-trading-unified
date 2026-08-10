@@ -281,6 +281,10 @@ class FuturesMonitor:
         self.client._tick_callbacks = {}
         self.client._kbar_callbacks = {}
         self.client._latest_kbars = {}
+        # ``__new__`` bypasses ShioajiClient.__init__.  Initialize the
+        # fail-closed adapter gate explicitly, then persist/transition code
+        # can propagate LIVE_READY before any order is attempted.
+        self.client._execution_context = None
 
         # [ThetaGate] Latest router decision — consumed by options monitor
         # to check theta_allowed flag before entering theta positions.
@@ -2864,9 +2868,14 @@ class FuturesMonitor:
         [Step 8] also syncs the broker-adapter gate reference so the
         adapter chokepoint enforces the same context."""
         _client = getattr(self, "client", None)
-        if _client is not None and hasattr(_client, "_execution_context"):
-            _client._execution_context = getattr(
-                self, "_execution_context", None)
+        if _client is not None:
+            try:
+                _client._execution_context = getattr(
+                    self, "_execution_context", None)
+            except (AttributeError, TypeError):
+                # Non-Shioaji test/legacy adapters cannot receive this optional
+                # reference. Their own order boundary remains fail-closed.
+                pass
         try:
             from core.execution_context_state import persist_execution_context
             persist_execution_context(self._execution_context.to_dict())
@@ -5811,10 +5820,24 @@ class FuturesMonitor:
             
             if not self.order_mgr.submit(_o_near):
                 self._pending_lifecycle_orders.pop(_o_near.order_id, None)
+                # ``create_order`` registers both legs as active before the
+                # first I/O attempt so paper's synchronous fills can correlate
+                # them.  If near fails locally, far was never submitted and
+                # must become terminal immediately, not a watchdog timeout.
+                self._pending_lifecycle_orders.pop(_o_far.order_id, None)
+                self.order_mgr.reject(
+                    _o_far.order_id,
+                    reason="PRECEDING_LEG_REJECTED",
+                    source="mts_entry",
+                )
                 self._mts_pending_fills.pop(_trade_id, None)
                 self._append_mts_event("ORDER_REJECTED_LOCAL", **{
                     **_ev_meta(_o_near), "ref_ohlc": _snap["near"],
                     "reason": getattr(_o_near, "reject_reason", "ADAPTER_SUBMIT_FAILED"),
+                })
+                self._append_mts_event("ORDER_REJECTED_LOCAL", **{
+                    **_ev_meta(_o_far), "ref_ohlc": _snap["far"],
+                    "reason": "PRECEDING_LEG_REJECTED",
                 })
                 return
             self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_o_near), "ref_ohlc": _snap["near"]})
