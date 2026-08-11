@@ -44,12 +44,17 @@ def _capability():
     }
 
 
-def _exit_only_ctx(cap=None):
+_MISSING = object()
+
+
+def _exit_only_ctx(cap=_MISSING):
+    if cap is _MISSING:
+        cap = _capability()
     return ExecutionContext(
         requested_mode="live",
         effective_mode=ModeTransitionState.RECONCILED_EXIT_ONLY.value,
         live_order_allowed=False,
-        exit_only_capability=cap if cap is not None else _capability(),
+        exit_only_capability=cap,
     )
 
 
@@ -67,6 +72,11 @@ def _bbo_slots(now=None):
         "TMF": {"bid": 44900.0, "ask": 44910.0, "bidask_at": ts},
         "TMF_FAR": {"bid": 45040.0, "ask": 45060.0, "bidask_at": ts},
     }
+
+
+def _pure_bbo_slots(now=None):
+    slots = _bbo_slots(now)
+    return {"near": slots["TMF"], "far": slots["TMF_FAR"]}
 
 
 # ── pure hydration ────────────────────────────────────────────────────────
@@ -118,19 +128,21 @@ def test_bbo_binding_missing_stale_ambiguous():
 
     assert build_bbo_binding(None)[0] is None
     assert build_bbo_binding({"near": {}, "far": {}})[1] == "BBO_MISSING"
-    assert build_bbo_binding({"near": {"bid": 1, "ask": 2}, "far": {}})[1] \
-        == "BBO_MISSING"
-    assert build_bbo_binding(_bbo_slots(now=time.time() - 60))[1] \
+    assert build_bbo_binding({
+        "near": {"bid": 1, "ask": 2, "bidask_at": time.time()},
+        "far": {},
+    })[1] == "BBO_MISSING"
+    assert build_bbo_binding(_pure_bbo_slots(now=time.time() - 60))[1] \
         == "BBO_STALE"
-    ambiguous = _bbo_slots()
-    ambiguous["TMF"]["bid"] = 44920.0  # bid > ask
+    ambiguous = _pure_bbo_slots()
+    ambiguous["near"]["bid"] = 44920.0  # bid > ask
     assert build_bbo_binding(ambiguous)[1] == "BBO_AMBIGUOUS"
 
 
 def test_bbo_binding_valid():
     from core.exit_only_position import build_bbo_binding
 
-    binding, reason = build_bbo_binding(_bbo_slots())
+    binding, reason = build_bbo_binding(_pure_bbo_slots())
     assert reason is None
     assert binding["bbo_hash"]
     assert binding["bbo_captured_at"] > 0
@@ -139,7 +151,7 @@ def test_bbo_binding_valid():
 def test_attach_decision_binding():
     from core.exit_only_position import attach_decision_binding, build_bbo_binding
 
-    binding, _ = build_bbo_binding(_bbo_slots())
+    binding, _ = build_bbo_binding(_pure_bbo_slots())
     event = {"order_id": "ORD-1", "trade_id": "mts-20260811-085503"}
     bound = attach_decision_binding(event, _capability(), binding)
 

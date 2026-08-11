@@ -3146,6 +3146,105 @@ class FuturesMonitor:
             f"RECONCILED_EXIT_ONLY[/green]")
         return _record, None
 
+    def _hydrate_exit_only_position(self):
+        """Hydrate the managed exit-only position from the active capability.
+
+        Only when RECONCILED_EXIT_ONLY is effective; paper/normal live is
+        untouched.  The position carries broker-attested costs + trade_id,
+        never synthetic PnL.  Idempotent: never re-hydrates.
+        """
+        _ctx = getattr(self, "_execution_context", None)
+        if getattr(_ctx, "effective_mode", None) != "reconciled_exit_only":
+            return None
+        if getattr(self, "_exit_only_position", None) is not None:
+            return self._exit_only_position
+        _cap = getattr(_ctx, "exit_only_capability", None)
+        try:
+            from core.exit_only_position import hydrate_exit_only_position
+            _position = hydrate_exit_only_position(_cap)
+        except Exception as _exc:
+            _code = getattr(_exc, "code", "EXIT_ONLY_CAPABILITY_INVALID")
+            self._exit_only_position = None
+            self._append_mts_event("EXIT_ONLY_HYDRATION_FAILED",
+                                   reason=_code)
+            return None
+        self._exit_only_position = _position
+        self._append_mts_event(
+            "EXIT_ONLY_POSITION_HYDRATED",
+            trade_id=_position["trade_id"],
+            reconciliation_id=_position["reconciliation_id"],
+            snapshot_hash=_position["snapshot_hash"],
+            legs=_position["legs"],
+        )
+        return _position
+
+    def _hydrate_strategy_position(self, strategy) -> bool:
+        """Give the exit evaluation the broker-attested position attrs.
+
+        legs[0] = near, legs[1] = far (canonical allowed_orders order).
+        Sets open sides, qty, broker entry costs, trade_id and
+        _has_position so the existing Policy J / combined / single
+        release evaluation can run; entries stay blocked by the gate.
+        """
+        _position = getattr(self, "_exit_only_position", None)
+        if _position is None or strategy is None:
+            return False
+        _legs = _position.get("legs") or []
+        if len(_legs) != 2:
+            return False
+        _near, _far = _legs[0], _legs[1]
+        _near_side = "SHORT" if _near["side"] == "sell" else "LONG"
+        _far_side = "SHORT" if _far["side"] == "sell" else "LONG"
+        for _attr, _value in (
+                ("_near_side", _near_side), ("_far_side", _far_side),
+                ("_near_qty", _near["quantity"]),
+                ("_far_qty", _far["quantity"]),
+                ("_near_entry", _near["avg_cost"]),
+                ("_far_entry", _far["avg_cost"]),
+                ("_trade_id", _position.get("trade_id")),
+                ("_has_position", True),
+                ("_reconciliation_id",
+                 _position.get("reconciliation_id")),
+                ("_snapshot_hash", _position.get("snapshot_hash"))):
+            try:
+                setattr(strategy, _attr, _value)
+            except Exception:
+                return False
+        return True
+
+    def _exit_only_decision_guard(self, action, strategy=None):
+        """Bounded EXIT_ONLY gate for one order decision.
+
+        Returns (ok, binding, reason).  Non-EXIT_ONLY -> pass-through
+        (paper/normal live unchanged).  In EXIT_ONLY: entries are always
+        blocked; an exit requires the hydrated broker-attested position
+        and a contemporaneous near/far BBO - missing/stale/ambiguous
+        BBO is N/A + zero order.
+        """
+        self._exit_only_decision_binding = None
+        _ctx = getattr(self, "_execution_context", None)
+        if getattr(_ctx, "effective_mode", None) != "reconciled_exit_only":
+            return True, None, None
+        from core.exit_only_position import ENTRY_ACTIONS, build_bbo_binding
+        if action in ENTRY_ACTIONS:
+            return False, None, "EXIT_ONLY_ENTRY_BLOCKED"
+        self._hydrate_exit_only_position()
+        if getattr(self, "_exit_only_position", None) is None:
+            return False, None, "EXIT_ONLY_POSITION_MISSING"
+        if strategy is not None:
+            self._hydrate_strategy_position(strategy)
+        _ticker = getattr(self, "ticker", "TMF")
+        _slots = {
+            "near": getattr(self, "market_data", {}).get(_ticker, {}),
+            "far": getattr(self, "market_data", {}).get(
+                f"{_ticker}_FAR", {}),
+        }
+        _binding, _reason = build_bbo_binding(_slots)
+        if _binding is None:
+            return False, None, _reason
+        self._exit_only_decision_binding = _binding
+        return True, _binding, None
+
     def _process_reconciled_exit_attestation_command(self) -> bool:
         """Atomically consume one operator request for EXIT_ONLY attestation.
 
@@ -5725,7 +5824,9 @@ class FuturesMonitor:
             try:
                 if _state_path.exists():
                     _disk = json.loads(_state_path.read_text())
-                    if not _disk.get("has_position", False):
+                    if (not _disk.get("has_position", False)
+                            and getattr(self, "_exit_only_position", None)
+                            is None):
                         console.print(
                             f"[bold red]⛔ [MTS_ORDER_REJECT_NO_POSITION] "
                             f"Authority says FLAT; blocking {_action} "
@@ -5749,12 +5850,20 @@ class FuturesMonitor:
 
         # Helper for common fields in event log
         def _ev_meta(order):
-            return {
+            _meta = {
                 "order_id": order.order_id, "symbol": order.symbol,
                 "side": order.side.value, "type": order.order_type.value,
                 "price": order.price, "qty": order.quantity, "strategy": order.strategy,
                 "trade_id": _trade_id
             }
+            _binding = getattr(self, "_exit_only_decision_binding", None)
+            if _binding:
+                from core.exit_only_position import attach_decision_binding
+                _cap = getattr(getattr(self, "_execution_context", None),
+                               "exit_only_capability", None)
+                if isinstance(_cap, dict):
+                    return attach_decision_binding(_meta, _cap, _binding)
+            return _meta
 
         _TICK = 1.0
         _ENTRY_BUFFER = 4
@@ -5788,6 +5897,18 @@ class FuturesMonitor:
             "far": {k: bar_dict.get(f"far_{k}") for k in ("open", "high", "low", "close")},
             "spread_z": bar_dict.get("spread_z")
         }
+
+        # [EXIT_ONLY] bounded: hydrated broker-attested position + a
+        # contemporaneous near/far BBO; entry decisions are blocked;
+        # missing/stale/ambiguous BBO is N/A + zero order.
+        _guard_ok, _guard_binding, _guard_reason = \
+            self._exit_only_decision_guard(_action, strategy)
+        if not _guard_ok:
+            self._append_mts_event(
+                "EXIT_ONLY_DECISION_BLOCKED", action=_action,
+                reason=_guard_reason,
+                trade_id=getattr(strategy, "_trade_id", ""))
+            return
 
         if _action == "PARTIAL_EXIT":
             # 2026-06-17 Hermes Agent: use signal reason, not strategy._released_leg (still None before sync_release)
@@ -5899,7 +6020,9 @@ class FuturesMonitor:
             # be blocked — otherwise we would re-enter/flip the flat leg.
             # (Ledger absent/unreadable -> None -> fall back to strategy gates.)
             _ledger_qty = self._mts_ledger_reconstructed_open_qty(_trade_id)
-            if _ledger_qty is not None and (_ledger_qty["NEAR"] <= 0 or _ledger_qty["FAR"] <= 0):
+            if (_ledger_qty is not None
+                    and getattr(self, "_exit_only_position", None) is None
+                    and (_ledger_qty["NEAR"] <= 0 or _ledger_qty["FAR"] <= 0)):
                 console.print(
                     f"[bold red]⛔ [MTS_COMBINED_EXIT_BLOCKED] LEDGER_RECONSTRUCTED_LEG_FLAT: "
                     f"trade_id={_trade_id} near_open={_ledger_qty['NEAR']} far_open={_ledger_qty['FAR']}. "
@@ -10401,6 +10524,7 @@ class FuturesMonitor:
         # the legacy manual-entry flag and may be reviewed before any strategy
         # decision runs.
         self._process_reconciled_exit_attestation_command()
+        self._hydrate_exit_only_position()
 
         # 2026-05-27 Gemini CLI: MTS Safety Watchdog (P4)
         # Replaces and expands _check_stale_mts_orders

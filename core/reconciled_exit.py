@@ -215,6 +215,12 @@ def build_exit_only_capability(attestation: dict | None, snapshot: dict | None,
         "trade_id": trade_id.strip(), "snapshot_hash": snapshot_hash,
         "attestation_hash": attestation_hash, "snapshot_captured_at": captured_at,
         **identity, "release_sha": release_sha, "allowed_orders": allowed_orders,
+        "legs": [
+            {"symbol": leg["symbol"], "side": leg["side"],
+             "remaining_qty": leg["remaining_qty"],
+             "avg_cost": costs[(leg["symbol"], leg["side"])]}
+            for leg in expected_legs
+        ],
     }
     record = {
         **attestation_payload, "source": "live_broker", "snapshot_hash": snapshot_hash,
