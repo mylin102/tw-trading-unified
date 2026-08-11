@@ -526,6 +526,7 @@ def _monitor(ctx, adapter=None, mode="live", *, dry_run=False,
     monitor.api = adapter
     monitor.order_mgr = OrderManager(
         mode=mode, broker_adapter=adapter, execution_context=ctx)
+    monitor._gateway()  # init-equivalent: registry injected before any path
     return monitor, events
 
 
@@ -582,6 +583,129 @@ def test_e2e_exit_only_exact_cap_bound_orders_reach_adapter_once(
     assert near_bid.startswith("BROKER-") and far_bid.startswith("BROKER-")
     assert near_bid != rec["legs"]["NEAR"].get("client_order_id")
     assert far_bid != rec["legs"]["FAR"].get("client_order_id")
+
+
+def test_gateway_registry_injected_before_any_signal():
+    """[repair A] the registry is injected at init (before any MTS order
+    path): a direct adapter call is rejected even before the first signal."""
+    monitor, events = _monitor(_live_ctx())
+    assert monitor.api._gateway_registry is not None
+    with pytest.raises(RuntimeError) as exc:
+        monitor.api.place_order_object(_order("ORD-PRE", "MTS_ENTRY"))
+    assert "ADAPTER_GATEWAY_AUTHORIZATION_MISSING" in str(exc.value)
+
+
+def _flag_monitor(ctx, flag):
+    import json
+    import os
+    import tempfile
+
+    monitor, events = _monitor(ctx)
+    p = tempfile.mkdtemp(prefix="s0_flag_")
+    flag_path = os.path.join(p, "flag.json")
+    with open(flag_path, "w", encoding="utf-8") as f:
+        json.dump(flag, f)
+    monitor.manual_trade_flag_path = flag_path
+    monitor._processed_flag_ids = set()
+    monitor._flag_retry_count = 0
+    monitor._manual_trade_status = ""
+    monitor._current_flag_id = ""
+    monitor._registry = {"tmf_spread": _bound_strategy()}
+    return monitor, events
+
+
+def test_e2e_manual_entry_blocked_in_exit_only():
+    """[repair B] MTS_MANUAL in EXIT_ONLY is blocked BEFORE any Order
+    construction/submission — zero submit, zero adapter call."""
+    import time
+
+    monitor, events = _flag_monitor(_exit_only_ctx(), {
+        "action": "spread", "side": "SELL_NEAR_BUY_FAR",
+        "near_close": 44905, "far_close": 45038.5,
+        "created_at": time.time(), "command_id": "cmd-1"})
+    monitor._process_manual_trade_flag()
+    assert monitor.api.calls == []
+    blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
+    assert blocked and "STRATEGY_BLOCKED" in blocked[0][1]["reason"]
+
+
+def test_e2e_manual_entry_normal_live_submits(monkeypatch):
+    """[repair B] manual entry in normal live routes through the gateway
+    and reaches the adapter (ORDER_SUBMITTED only after the receipt)."""
+    import time
+    from pathlib import Path
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _flag_monitor(_live_ctx(), {
+        "action": "spread", "side": "SELL_NEAR_BUY_FAR",
+        "near_close": 44905, "far_close": 45038.5,
+        "created_at": time.time(), "command_id": "cmd-2"})
+    monitor._registry["tmf_spread"]._has_position = False
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s0_no_state.json"))
+    monitor._process_manual_trade_flag()
+    assert len(monitor.api.calls) == 2
+    assert {c["strategy"] for c in monitor.api.calls} == {"MTS_MANUAL"}
+    submitted = [e for e in events if e[0] == "ORDER_SUBMITTED"]
+    assert len(submitted) == 2
+
+
+def test_e2e_emergency_close_all_blocked_in_exit_only():
+    """[repair B] emergency close_all in EXIT_ONLY is explicitly blocked —
+    zero submit, zero adapter call."""
+    import time
+
+    monitor, events = _flag_monitor(_exit_only_ctx(), {
+        "action": "close_all", "created_at": time.time(),
+        "command_id": "cmd-close"})
+    monitor._process_manual_trade_flag()
+    assert monitor.api.calls == []
+    blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
+    assert blocked and "EXIT_ONLY_EMERGENCY_BLOCKED" in blocked[0][1]["reason"]
+
+
+def test_e2e_release_submitted_event_only_after_receipt(monkeypatch):
+    """[repair C] RELEASE emits ORDER_INTENT_CREATED before the submit and
+    ORDER_SUBMITTED only after the canonical broker receipt."""
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_exit_only_ctx())
+    monitor._hydrate_exit_only_position()
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    signal = SimpleNamespace(action="PARTIAL_EXIT", reason="RELEASE_NEAR")
+
+    monitor._submit_mts_order_signal(
+        signal, _bound_strategy(), {}, __import__("datetime").datetime.now())
+
+    assert len(monitor.api.calls) == 1
+    assert monitor.api.calls[0]["strategy"] == "MTS_RELEASE"
+    created = [e for e in events if e[0] == "ORDER_INTENT_CREATED"]
+    submitted = [e for e in events if e[0] == "ORDER_SUBMITTED"]
+    assert len(created) == 1 and len(submitted) == 1
+    assert events.index(submitted[0]) > events.index(created[0])
+
+
+def test_e2e_release_failure_no_false_submitted(monkeypatch):
+    """[repair C] a failed release submit emits ORDER_INTENT_BLOCKED —
+    never a false ORDER_SUBMITTED."""
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_exit_only_ctx())
+    monitor._hydrate_exit_only_position()
+    monitor.order_mgr.submit = lambda order: False
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    signal = SimpleNamespace(action="PARTIAL_EXIT", reason="RELEASE_NEAR")
+
+    monitor._submit_mts_order_signal(
+        signal, _bound_strategy(), {}, __import__("datetime").datetime.now())
+
+    assert [e[0] for e in events].count("ORDER_SUBMITTED") == 0
+    assert any(e[0] == "ORDER_INTENT_BLOCKED" for e in events)
+    assert monitor.api.calls == []
 
 
 def test_e2e_persist_failure_zero_adapter_calls(monkeypatch):
@@ -642,8 +766,14 @@ def test_combined_exit_gateway_failure_quarantines_no_second_leg(
 
     # near leg attempted exactly once; the FAR leg never submitted
     assert submitted == ["TMFH6"]
-    failed = [e for e in events if e[0] == "ORDER_INTENT_SUBMIT_FAILED"]
-    assert failed and "NEAR:SUBMIT_REJECTED" in failed[0][1]["reason"]
+    # [repair D] the failure atomically forces LIVE_QUARANTINED and persists
+    ctx = monitor._execution_context
+    assert ctx.effective_mode == "live_quarantined"
+    assert ctx.live_order_allowed is False
+    reasons = list(ctx.audit_reasons or ())
+    assert any("MTS_EXIT_LEG_FAILED:NEAR" in r for r in reasons)
+    quarantined = [e for e in events if e[0] == "EXIT_ONLY_QUARANTINED"]
+    assert quarantined and "NEAR:" in quarantined[0][1]["reason"]
 
 
 def test_combined_exit_far_failure_no_retry(monkeypatch, tmp_path):
