@@ -599,8 +599,17 @@ def _flag_monitor(ctx, flag):
     import json
     import os
     import tempfile
+    import time
+    from types import SimpleNamespace
 
     monitor, events = _monitor(ctx)
+    # manual entry prices come from LIVE_TICK only (flag prices are
+    # logging-only hints) — provide fresh ticks for the ticker + far code
+    now = time.time()
+    monitor.market_data["TMF"] = {"close": 44905, "local_arrival_at": now}
+    monitor.market_data["TMF_FAR"] = {"close": 45038.5, "local_arrival_at": now}
+    monitor._last_tmf_price = 44905
+    monitor.last_tick_at = now
     p = tempfile.mkdtemp(prefix="s0_flag_")
     flag_path = os.path.join(p, "flag.json")
     with open(flag_path, "w", encoding="utf-8") as f:
@@ -611,18 +620,27 @@ def _flag_monitor(ctx, flag):
     monitor._manual_trade_status = ""
     monitor._current_flag_id = ""
     monitor._registry = {"tmf_spread": _bound_strategy()}
+    monitor.trader = SimpleNamespace(
+        position=0, initial_balance=100000, balance=100000,
+        fee_per_side=0, exchange_fee_per_side=0,
+        execute_signal=lambda *a, **k: None)
     return monitor, events
 
 
-def test_e2e_manual_entry_blocked_in_exit_only():
+def test_e2e_manual_entry_blocked_in_exit_only(monkeypatch):
     """[repair B] MTS_MANUAL in EXIT_ONLY is blocked BEFORE any Order
     construction/submission — zero submit, zero adapter call."""
     import time
+    from pathlib import Path
+    import strategies.futures.monitor as monitor_mod
 
     monitor, events = _flag_monitor(_exit_only_ctx(), {
         "action": "spread", "side": "SELL_NEAR_BUY_FAR",
         "near_close": 44905, "far_close": 45038.5,
         "created_at": time.time(), "command_id": "cmd-1"})
+    monitor._registry["tmf_spread"]._has_position = False
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s0_no_state.json"))
     monitor._process_manual_trade_flag()
     assert monitor.api.calls == []
     blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
@@ -650,14 +668,19 @@ def test_e2e_manual_entry_normal_live_submits(monkeypatch):
     assert len(submitted) == 2
 
 
-def test_e2e_emergency_close_all_blocked_in_exit_only():
+def test_e2e_emergency_close_all_blocked_in_exit_only(monkeypatch):
     """[repair B] emergency close_all in EXIT_ONLY is explicitly blocked —
     zero submit, zero adapter call."""
     import time
+    from pathlib import Path
+    import strategies.futures.monitor as monitor_mod
 
     monitor, events = _flag_monitor(_exit_only_ctx(), {
         "action": "close_all", "created_at": time.time(),
         "command_id": "cmd-close"})
+    monitor._lifecycle_generation = 0
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s0_no_state.json"))
     monitor._process_manual_trade_flag()
     assert monitor.api.calls == []
     blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
@@ -722,6 +745,7 @@ def test_e2e_persist_failure_zero_adapter_calls(monkeypatch):
     def _fail_persist(view):
         raise GatewayIntentPersistFailed("disk full")
 
+    monitor._order_intent_gateway = None   # rebuild with the failing record_cb
     monitor._record_gateway_intent = _fail_persist
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
                         lambda: True)
@@ -731,8 +755,8 @@ def test_e2e_persist_failure_zero_adapter_calls(monkeypatch):
         signal, _bound_strategy(), {}, __import__("datetime").datetime.now())
 
     assert monitor.api.calls == []
-    failed = [e for e in events if e[0] == "ORDER_INTENT_SUBMIT_FAILED"]
-    assert failed and "GATEWAY_INTENT_PERSIST_FAILED" in failed[0][1]["reason"]
+    quarantined = [e for e in events if e[0] == "EXIT_ONLY_QUARANTINED"]
+    assert quarantined and "GATEWAY_INTENT_PERSIST_FAILED" in quarantined[0][1]["reason"]
 
 
 def test_combined_exit_gateway_failure_quarantines_no_second_leg(
@@ -805,8 +829,8 @@ def test_combined_exit_far_failure_no_retry(monkeypatch, tmp_path):
 
     assert submitted == ["TMFH6", "TMFI6"]
     assert submitted.count("TMFI6") == 1   # no retry
-    failed = [e for e in events if e[0] == "ORDER_INTENT_SUBMIT_FAILED"]
-    assert failed and "FAR:SUBMIT_REJECTED" in failed[0][1]["reason"]
+    quarantined = [e for e in events if e[0] == "EXIT_ONLY_QUARANTINED"]
+    assert quarantined and "FAR:SUBMIT_REJECTED" in quarantined[0][1]["reason"]
 
 
 def test_oco_blocked_all_modes():
