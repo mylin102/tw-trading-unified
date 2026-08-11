@@ -148,7 +148,9 @@ def _monitor_for_exit_only(statuses=("filled", "filled"), snapshot=None):
     monitor._persist_execution_context = lambda: setattr(monitor, "persisted", True)
     monitor.events = []
     monitor._append_mts_event = lambda typ, **kw: monitor.events.append((typ, kw))
-    monitor._clear_mts_entry_reconcile_intents = lambda *args: True
+    monitor.cleared_intents = []
+    monitor._clear_mts_entry_reconcile_intents = lambda *args: (
+        monitor.cleared_intents.append(args) or True)
     return monitor
 
 
@@ -161,6 +163,7 @@ def test_monitor_reconciles_only_after_both_filled_and_broker_flat():
     assert monitor._execution_context.effective_mode == ModeTransitionState.LIVE_QUARANTINED.value
     assert monitor._execution_context.exit_only_capability is None
     assert monitor.events[-1][0] == "EXIT_ONLY_FLAT_RECONCILED"
+    assert monitor.cleared_intents == [("mts-20260811-085503",)]
 
 
 def test_monitor_single_local_fill_never_resumes_or_queries_broker():
