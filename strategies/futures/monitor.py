@@ -3026,11 +3026,14 @@ class FuturesMonitor:
             except TypeError:
                 _trades_rows = _api.list_trades()
             for _p in (_pos_rows or []):
+                _raw_direction = (getattr(
+                    getattr(_p, "direction", None), "name", None)
+                    or str(getattr(_p, "direction", "")))
                 positions.append({
                     "code": str(getattr(_p, "code", "")),
-                    "direction": getattr(
-                        getattr(_p, "direction", None), "name",
-                        None) or str(getattr(_p, "direction", "")),
+                    # Unknown directions remain non-canonical and are
+                    # rejected later by the exit-only capability validator.
+                    "direction": str(_raw_direction).rsplit(".", 1)[-1].strip().lower(),
                     "quantity": int(getattr(_p, "quantity", 0) or 0),
                     "avg_cost": float(getattr(_p, "price", 0) or 0),
                 })
