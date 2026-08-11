@@ -879,6 +879,178 @@ def test_s1_exit_only_entry_blocked_after_hydration_zero_submit(monkeypatch):
     assert blocked and blocked[-1][1].get("reason") == "EXIT_ONLY_ENTRY_BLOCKED"
 
 
+def test_s1_e2e_mts_tick_exit_reaches_submit_with_flat_local_ledger(
+        monkeypatch, tmp_path):
+    """[S1 repair P0] integrated _mts_tick: local ledger FLAT + valid
+    capability + strategy returns EXIT => the capability-bound signal
+    reaches _submit_mts_order_signal (adapter stub records the order);
+    the local FLAT ledger must not reset the hydrated strategy nor block
+    the exit."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    import time as _time
+    import strategies.futures.monitor as monitor_mod
+    from strategies.futures.mts_ledger_authority import (
+        MtsAuthority, MtsAuthorityState)
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    # local ledger authority: FLAT (broker-attested manual position has no
+    # local fills-ledger rows)
+    monitor._ledger_projection.snapshot = lambda: MtsAuthorityState(
+        MtsAuthority.FLAT)
+    monitor._ledger_projection_sync_ts = 0.0
+    monitor._last_mts_tick_mono = None
+    monitor._prev_mts_tick_mono = None
+    monitor._mts_release_orders_flushed = True
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s1_no_state.json"))
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monitor.trader = SimpleNamespace(position=0)
+    # decision-support / telemetry stubs (config-derived, not under test)
+    monitor._mts_risk_gate_settlement = lambda strategy: False
+    monitor._mts_risk_gate_single_leg_preclose = lambda strategy, bar: False
+    monitor._mts_check_evaluator_lag = lambda strategy, has_pos: None
+    monitor._mts_note_strategy_evaluated = lambda: None
+    monitor._inject_mtf_snapshot = lambda bar: None
+
+    class _ExitStrategy:
+        calls = 0
+
+        def init(self, ctx):
+            pass
+
+        def on_bar(self, ctx):
+            _ExitStrategy.calls += 1
+            return SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+
+        def _reset(self, **kw):
+            pass
+
+    strategy = _ExitStrategy()
+    monitor._registry = {"tmf_spread": strategy}
+    bar = {"near_close": 44905.0, "far_close": 45038.5, "ts": 1754991000}
+    monitor._mts_tick(bar)
+
+    assert _ExitStrategy.calls == 1
+    # the capability-bound COMBINED_EXIT reached the adapter: both closing
+    # legs recorded once each (stub only)
+    assert len(monitor.api.calls) == 2
+    by_symbol = {c["symbol"]: c for c in monitor.api.calls}
+    assert set(by_symbol) == {"TMFH6", "TMFI6"}
+    assert by_symbol["TMFH6"]["side"] == "buy"
+    assert by_symbol["TMFI6"]["side"] == "sell"
+    assert all(c["strategy"] == "MTS_EXIT" for c in monitor.api.calls)
+    # no false hydration block
+    assert [e for e in events
+            if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"] == []
+
+
+def test_s1_e2e_mts_tick_stale_cap_zero_eval(monkeypatch, tmp_path):
+    """[S1 repair P0] integrated _mts_tick with a STALE capability: the
+    evaluator and submit are never reached (explicit BLOCKED event)."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    import time as _time
+    import strategies.futures.monitor as monitor_mod
+    from strategies.futures.mts_ledger_authority import (
+        MtsAuthority, MtsAuthorityState)
+    from strategies.futures.monitor import EXIT_ONLY_SNAPSHOT_TTL_MS
+
+    stale = _fresh_capability()
+    stale["snapshot_captured_at"] = (
+        int(_time.time() * 1000) - EXIT_ONLY_SNAPSHOT_TTL_MS - 1000)
+    monitor, events = _monitor(_fresh_exit_only_ctx(cap=stale))
+    monitor._ledger_projection.snapshot = lambda: MtsAuthorityState(
+        MtsAuthority.FLAT)
+    monitor._ledger_projection_sync_ts = 0.0
+    monitor._last_mts_tick_mono = None
+    monitor._prev_mts_tick_mono = None
+    monitor._mts_release_orders_flushed = True
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s1_no_state.json"))
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monitor.trader = SimpleNamespace(position=0)
+    monitor._mts_risk_gate_settlement = lambda strategy: False
+    monitor._mts_risk_gate_single_leg_preclose = lambda strategy, bar: False
+    monitor._mts_check_evaluator_lag = lambda strategy, has_pos: None
+    monitor._mts_note_strategy_evaluated = lambda: None
+    monitor._inject_mtf_snapshot = lambda bar: None
+
+    class _NoopStrategy:
+        calls = 0
+
+        def init(self, ctx):
+            pass
+
+        def on_bar(self, ctx):
+            _NoopStrategy.calls += 1
+            return SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+
+    strategy = _NoopStrategy()
+    monitor._registry = {"tmf_spread": strategy}
+    bar = {"near_close": 44905.0, "far_close": 45038.5, "ts": 1754991000}
+    monitor._mts_tick(bar)
+
+    assert _NoopStrategy.calls == 0
+    assert monitor.api.calls == []
+    blocked = [e for e in events if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"]
+    assert blocked and blocked[-1][1]["reason"] == "EXIT_ONLY_SNAPSHOT_STALE"
+
+
+def test_s1_exit_only_session_and_future_checks_fail_closed():
+    """[S1 repair #2/#3] the session binding requires BOTH non-empty and
+    exact equal; future-stamped snapshots are rejected (canonical 60s TTL)."""
+    from core.mode_transition import ModeTransitionState
+    from strategies.futures.monitor import EXIT_ONLY_SNAPSHOT_TTL_MS
+
+    class _NoopStrategy:
+        calls = 0
+
+        def on_bar(self, ctx):
+            _NoopStrategy.calls += 1
+            return None
+
+    def _assert_blocked(ctx, reason, name):
+        monitor, events = _monitor(ctx)
+        monitor._exit_only_position = None
+        _NoopStrategy.calls = 0
+        assert monitor._exit_only_pre_evaluation_hydration(
+            _NoopStrategy()) is False, name
+        assert _NoopStrategy.calls == 0
+        assert monitor.api.calls == []
+        blocked = [e for e in events
+                   if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"]
+        assert blocked and blocked[-1][1]["reason"] == reason, (
+            f"{name}: {blocked}")
+
+    # cap session empty -> fail-closed (was fail-open)
+    no_cap_session = _fresh_capability()
+    no_cap_session["session_id"] = ""
+    _assert_blocked(
+        _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
+             live_order_allowed=False, cap=no_cap_session,
+             session_id="c" * 32),
+        "EXIT_ONLY_SESSION_MISMATCH", "cap-session-empty")
+    # ctx session empty -> fail-closed (was fail-open)
+    _assert_blocked(
+        _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
+             live_order_allowed=False, cap=_fresh_capability(),
+             session_id=""),
+        "EXIT_ONLY_SESSION_MISMATCH", "ctx-session-empty")
+    # future-stamped snapshot -> rejected (canonical TTL rule)
+    future = _fresh_capability()
+    future["snapshot_captured_at"] = (
+        int(time.time() * 1000) + 5_000)
+    _assert_blocked(
+        _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
+             live_order_allowed=False, cap=future, session_id="c" * 32),
+        "EXIT_ONLY_SNAPSHOT_FUTURE", "future")
+
+
 def test_s1_normal_live_and_paper_untouched():
     """[S1] normal LIVE_READY / PAPER flow returns True and never
     overwrites the strategy's own state."""
