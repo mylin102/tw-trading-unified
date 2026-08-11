@@ -3146,6 +3146,49 @@ class FuturesMonitor:
             f"RECONCILED_EXIT_ONLY[/green]")
         return _record, None
 
+    def _submit_via_gateway(self, order, exchange_ordno=None):
+        """[S0] Route every MTS signal submission through the gateway."""
+        _gw = getattr(self, "_order_intent_gateway", None)
+        if _gw is None:
+            from core.order_intent_gateway import OrderIntentGateway
+            _gw = self._order_intent_gateway = OrderIntentGateway()
+            _gw_api = getattr(self, "api", None)
+            if _gw_api is not None:
+                try:
+                    setattr(_gw_api, "_gateway_registry", _gw.registry)
+                except Exception:
+                    pass
+        _ctx = getattr(self, "_execution_context", None)
+        _live = bool(getattr(self, "live_trading", False)
+                     and not getattr(self, "dry_run", False))
+        _mode = ("live" if (_live
+                            and getattr(_ctx, "effective_mode", "")
+                            in ("live_ready", "reconciled_exit_only"))
+                 else "paper")
+        _sg = getattr(_ctx, "session_id", "") or ""
+        return _gw.submit_with_authorization(
+            order, mode=_mode, session_generation=_sg,
+            exchange_ordno=exchange_ordno,
+            submit_callable=self.order_mgr.submit)
+
+    def _exit_only_bbo_slots(self):
+        _ticker = getattr(self, "ticker", "TMF")
+        return {
+            "near": getattr(self, "market_data", {}).get(_ticker, {}),
+            "far": getattr(self, "market_data", {}).get(
+                f"{_ticker}_FAR", {}),
+        }
+
+    def _exit_only_position_has_position(self) -> bool:
+        try:
+            _p = _mts_position_state_path()
+            if _p.exists():
+                return bool(json.loads(_p.read_text())
+                            .get("has_position", False))
+        except Exception:
+            pass
+        return False
+
     def _hydrate_exit_only_position(self):
         """Hydrate the managed exit-only position from the active capability.
 
@@ -3213,37 +3256,46 @@ class FuturesMonitor:
         return True
 
     def _exit_only_decision_guard(self, action, strategy=None):
-        """Bounded EXIT_ONLY gate for one order decision.
-
-        Returns (ok, binding, reason).  Non-EXIT_ONLY -> pass-through
-        (paper/normal live unchanged).  In EXIT_ONLY: entries are always
-        blocked; an exit requires the hydrated broker-attested position
-        and a contemporaneous near/far BBO - missing/stale/ambiguous
-        BBO is N/A + zero order.
-        """
-        self._exit_only_decision_binding = None
+        """Thin delegate to the S0 OrderIntentGateway policy."""
+        from core.order_intent_gateway import OrderIntentGateway
+        _gw = getattr(self, "_order_intent_gateway", None)
+        if _gw is None:
+            _gw = self._order_intent_gateway = OrderIntentGateway()
         _ctx = getattr(self, "_execution_context", None)
+        self._exit_only_decision_binding = None
         if getattr(_ctx, "effective_mode", None) != "reconciled_exit_only":
             return True, None, None
-        from core.exit_only_position import ENTRY_ACTIONS, build_bbo_binding
-        if action in ENTRY_ACTIONS:
-            return False, None, "EXIT_ONLY_ENTRY_BLOCKED"
         self._hydrate_exit_only_position()
-        if getattr(self, "_exit_only_position", None) is None:
-            return False, None, "EXIT_ONLY_POSITION_MISSING"
         if strategy is not None:
             self._hydrate_strategy_position(strategy)
-        _ticker = getattr(self, "ticker", "TMF")
-        _slots = {
-            "near": getattr(self, "market_data", {}).get(_ticker, {}),
-            "far": getattr(self, "market_data", {}).get(
-                f"{_ticker}_FAR", {}),
+        _authority = {
+            "live": getattr(_ctx, "effective_mode", "")
+            in ("live_ready", "reconciled_exit_only"),
+            "mode": getattr(_ctx, "effective_mode", ""),
+            "live_order_allowed": getattr(_ctx, "live_order_allowed", False),
+            "capability": getattr(_ctx, "exit_only_capability", None),
+            "hydrated_position": getattr(self, "_exit_only_position", None),
+            "strategy_reconciliation_id": getattr(
+                strategy, "_reconciliation_id", None),
+            "near_code": getattr(
+                getattr(self, "contract", None), "code", None),
+            "far_code": getattr(
+                getattr(self, "far_contract", None), "code", None),
+            "bbo_slots": self._exit_only_bbo_slots(),
+            "position_has_position": \
+                self._exit_only_position_has_position(),
         }
-        _binding, _reason = build_bbo_binding(_slots)
-        if _binding is None:
-            return False, None, _reason
-        self._exit_only_decision_binding = _binding
-        return True, _binding, None
+        _intent_strategy = ("MTS_ENTRY"
+                           if action in ("BUY_NEAR_SELL_FAR",
+                                          "SELL_NEAR_BUY_FAR")
+                           else "MTS_EXIT" if action == "EXIT"
+                           else "MTS_RELEASE")
+        _ok, _binding, _reason = _gw.authorize_intent(
+            action=action, strategy=_intent_strategy,
+            authority=_authority)
+        if _ok and _binding is not None:
+            self._exit_only_decision_binding = _binding
+        return _ok, _binding, _reason
 
     def _process_reconciled_exit_attestation_command(self) -> bool:
         """Atomically consume one operator request for EXIT_ONLY attestation.
@@ -5741,21 +5793,11 @@ class FuturesMonitor:
         through this function.  Guard checks here are the LAST line of
         defense before an order hits the broker or paper_fill_sim.
         """
-        # ── P0 Hard Gate: First layer defense (Strategy Level) ──
-        # Rejects live orders when transition state is not LIVE_READY.
-        # This guard is redundant with OrderManager.submit() — both must pass.
+        # [S0] live authorization moved into OrderIntentGateway policy
+        # (merged P0 live / entry / EXIT_ONLY / FLAT).  Gate 2 (paper
+        # drain) is paper-path behavior and stays.
         _exec_ctx = getattr(self, "_execution_context", None)
         if _exec_ctx is not None:
-            # Gate 1: Block live orders when transition not complete
-            if self.live_trading:
-                try:
-                    _exec_ctx.assert_live_order_allowed()
-                except LiveOrderBlocked as exc:
-                    console.print(
-                        f"[bold red]⛔ [MTS_ORDER_REJECT_LIVE_GATE] "
-                        f"{exc}[/bold red]"
-                    )
-                    return
             # Gate 2: Block new entries during paper drain
             # Even in paper mode, new positions cannot open during drain.
             # Normalize action: could be str ("ENTRY") or enum (LifecycleAction).
@@ -5815,26 +5857,9 @@ class FuturesMonitor:
                     logging.getLogger().warning("[COMBINED_EXIT_CLEANUP_FAILED] %s", _ce)
             return
 
-        # 2026-07-07 Hermes Agent: P0 — Position authority guard.
-        # Reject MTS_EXIT / MTS_RELEASE when the state file authority
-        # says has_position=False.  Strategy runtime flags can desync
-        # from persistent state; the state file is the single source of truth.
-        if _action in ("EXIT", "PARTIAL_EXIT"):
-            _state_path = _mts_position_state_path()
-            try:
-                if _state_path.exists():
-                    _disk = json.loads(_state_path.read_text())
-                    if (not _disk.get("has_position", False)
-                            and getattr(self, "_exit_only_position", None)
-                            is None):
-                        console.print(
-                            f"[bold red]⛔ [MTS_ORDER_REJECT_NO_POSITION] "
-                            f"Authority says FLAT; blocking {_action} "
-                            f"(reason={_reason})[/bold red]"
-                        )
-                        return
-            except Exception:
-                pass  # can't read state file → allow through (fail open)
+        # [S0] Position-authority FLAT check merged into the
+        # OrderIntentGateway policy (EXIT_FLAT_BLOCKED when the
+        # authority says flat and no capability-bound position exists).
 
         from core.order_management.order import OrderType, OrderSide
         _action = signal.action
@@ -5898,15 +5923,56 @@ class FuturesMonitor:
             "spread_z": bar_dict.get("spread_z")
         }
 
-        # [EXIT_ONLY] bounded: hydrated broker-attested position + a
-        # contemporaneous near/far BBO; entry decisions are blocked;
-        # missing/stale/ambiguous BBO is N/A + zero order.
-        _guard_ok, _guard_binding, _guard_reason = \
-            self._exit_only_decision_guard(_action, strategy)
-        if not _guard_ok:
+        # [S0 gateway] single MTS order-intent authorization boundary:
+        # merged P0 live / entry / EXIT_ONLY / FLAT policy.
+        _gw = getattr(self, "_order_intent_gateway", None)
+        if _gw is None:
+            from core.order_intent_gateway import OrderIntentGateway
+            _gw = self._order_intent_gateway = OrderIntentGateway()
+            _gw_api = getattr(self, "api", None)
+            if _gw_api is not None:
+                try:
+                    setattr(_gw_api, "_gateway_registry", _gw.registry)
+                except Exception:
+                    pass
+        self._hydrate_exit_only_position()
+        _gw_mode = getattr(
+            getattr(self, "_execution_context", None),
+            "effective_mode", "")
+        _gw_authority = {
+            "live": _gw_mode in ("live_ready", "reconciled_exit_only"),
+            "mode": _gw_mode,
+            "live_order_allowed": getattr(
+                getattr(self, "_execution_context", None),
+                "live_order_allowed", False),
+            "capability": getattr(
+                getattr(self, "_execution_context", None),
+                "exit_only_capability", None),
+            "hydrated_position": getattr(
+                self, "_exit_only_position", None),
+            "strategy_reconciliation_id": getattr(
+                strategy, "_reconciliation_id", None),
+            "near_code": getattr(
+                getattr(self, "contract", None), "code", None),
+            "far_code": getattr(
+                getattr(self, "far_contract", None), "code", None),
+            "bbo_slots": self._exit_only_bbo_slots(),
+            "position_has_position": \
+                self._exit_only_position_has_position(),
+        }
+        _gw_intent_strategy = ("MTS_ENTRY"
+                              if _action in ("BUY_NEAR_SELL_FAR",
+                                             "SELL_NEAR_BUY_FAR")
+                              else "MTS_EXIT" if _action == "EXIT"
+                              else "MTS_RELEASE")
+        _gw_ok, _gw_binding, _gw_reason = _gw.authorize_intent(
+            action=_action, strategy=_gw_intent_strategy,
+            authority=_gw_authority)
+        self._exit_only_decision_binding = _gw_binding
+        if not _gw_ok:
             self._append_mts_event(
-                "EXIT_ONLY_DECISION_BLOCKED", action=_action,
-                reason=_guard_reason,
+                "ORDER_INTENT_BLOCKED", action=_action,
+                reason=_gw_reason,
                 trade_id=getattr(strategy, "_trade_id", ""))
             return
 
@@ -5935,7 +6001,7 @@ class FuturesMonitor:
                     "strategy": "MTS_RELEASE",
                 }
                 
-                self.order_mgr.submit(_order)
+                self._submit_via_gateway(_order)
                 if self.paper_fill_sim:
                     self.paper_fill_sim.register(_order)
                     # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
@@ -5965,7 +6031,7 @@ class FuturesMonitor:
                     "strategy": "MTS_RELEASE",
                 }
                 
-                self.order_mgr.submit(_order)
+                self._submit_via_gateway(_order)
                 if self.paper_fill_sim:
                     self.paper_fill_sim.register(_order)
                     # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
@@ -6060,13 +6126,13 @@ class FuturesMonitor:
             from core.exit_intent import DuplicateSubmitError as _MTSDupSubmit
             try:
                 _ilog.submit_leg(_iid, "NEAR", self.order_mgr,
-                                 submit_fn=lambda cid, leg: self.order_mgr.submit(_near_order))
+                                 submit_fn=lambda cid, leg: self._submit_via_gateway(_near_order))
             except _MTSDupSubmit:
                 # P1-2 dedup: a repeated exit decision must NOT re-send
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} NEAR already submitted — suppressing duplicate[/yellow]")
             try:
                 _ilog.submit_leg(_iid, "FAR", self.order_mgr,
-                                 submit_fn=lambda cid, leg: self.order_mgr.submit(_far_order))
+                                 submit_fn=lambda cid, leg: self._submit_via_gateway(_far_order))
             except _MTSDupSubmit:
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} FAR already submitted — suppressing duplicate[/yellow]")
             # 2026-07-30: Write state to COMBINED_EXIT only AFTER successful submission
@@ -6237,7 +6303,7 @@ class FuturesMonitor:
             from core.exit_intent import DuplicateSubmitError as _MTSDupSubmit
             try:
                 _ilog.submit_leg(_iid, _leg_label, self.order_mgr,
-                                 submit_fn=lambda cid, leg: self.order_mgr.submit(_order))
+                                 submit_fn=lambda cid, leg: self._submit_via_gateway(_order))
             except _MTSDupSubmit:
                 # P1-2 dedup: a repeated exit decision must NOT re-send
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} {_leg_label} already submitted — suppressing duplicate[/yellow]")
@@ -6332,7 +6398,9 @@ class FuturesMonitor:
                 "far_tick_age_ms": 0,
             }
             
-            if not self.order_mgr.submit(_o_near):
+            _near_submit_ok, _near_submit_reason = \
+                self._submit_via_gateway(_o_near)
+            if not _near_submit_ok:
                 self._pending_lifecycle_orders.pop(_o_near.order_id, None)
                 # ``create_order`` registers both legs as active before the
                 # first I/O attempt so paper's synchronous fills can correlate
@@ -6360,7 +6428,9 @@ class FuturesMonitor:
                 # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
                 self.paper_fill_sim.process_tick(self._make_synthetic_tick(_near_close, _ts, symbol=_near_code))
 
-            if not self.order_mgr.submit(_o_far):
+            _far_submit_ok, _far_submit_reason = \
+                self._submit_via_gateway(_o_far)
+            if not _far_submit_ok:
                 self._pending_lifecycle_orders.pop(_o_far.order_id, None)
                 self._append_mts_event("ORDER_REJECTED_LOCAL", **{
                     **_ev_meta(_o_far), "ref_ohlc": _snap["far"],

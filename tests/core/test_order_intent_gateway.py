@@ -193,13 +193,17 @@ def test_policy_exit_only_only_capability_bound():
 
     gw = OrderIntentGateway(process_epoch="e1")
     cap = _capability()
+    bbo = {
+        "near": _bbo_slots()["TMF"],
+        "far": _bbo_slots()["TMF_FAR"],
+    }
     base = {
         "live": True, "mode": "reconciled_exit_only",
         "live_order_allowed": False, "capability": cap,
         "hydrated_position": {"trade_id": "mts-20260811-085503"},
         "strategy_reconciliation_id": cap["reconciliation_id"],
         "near_code": "TMFH6", "far_code": "TMFI6",
-        "bbo_slots": _bbo_slots(),
+        "bbo_slots": bbo,
     }
 
     # entry denied
@@ -330,6 +334,11 @@ def _monitor(ctx, adapter=None, mode="live", *, dry_run=False,
     monitor._exit_only_decision_binding = None
     monitor._pending_lifecycle_orders = {}
     monitor._claimed_execution_keys = set()
+    monitor._mts_pending_fills = {}
+    monitor._ledger_projection = SimpleNamespace(
+        sync_from_ledger=lambda: None,
+        snapshot=lambda: SimpleNamespace(status="FLAT"))
+    monitor._ledger_projection_sync_ts = 0.0
     monitor.paper_fill_sim = None
     monitor.cfg = {"mts": {}}
     monitor.EXEC = {}
@@ -398,6 +407,7 @@ def test_e2e_entry_and_oco_zero_calls(monkeypatch):
 
 
 def test_e2e_live_entry_retains_behavior(monkeypatch):
+    from pathlib import Path
     from types import SimpleNamespace
     import strategies.futures.monitor as monitor_mod
 
@@ -405,10 +415,14 @@ def test_e2e_live_entry_retains_behavior(monkeypatch):
     monitor._hydrate_exit_only_position()  # no-op (not exit-only)
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
                         lambda: True)
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s0_no_state.json"))
     signal = SimpleNamespace(action="BUY_NEAR_SELL_FAR", reason="ENTRY")
+    strat = _bound_strategy()
+    strat._has_position = False
 
     monitor._submit_mts_order_signal(
-        signal, _bound_strategy(), {}, __import__("datetime").datetime.now())
+        signal, strat, {}, __import__("datetime").datetime.now())
 
     # the entry path submits to the adapter as before (authorization flows)
     assert len(monitor.api.calls) == 2

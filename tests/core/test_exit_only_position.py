@@ -167,11 +167,14 @@ def test_attach_decision_binding():
 
 def _monitor(ctx, slots=None):
     from strategies.futures.monitor import FuturesMonitor
+    from types import SimpleNamespace
 
     monitor = FuturesMonitor.__new__(FuturesMonitor)
     monitor._execution_context = ctx
     monitor.market_data = dict(slots or {})
     monitor.ticker = "TMF"
+    monitor.contract = SimpleNamespace(code="TMFH6")
+    monitor.far_contract = SimpleNamespace(code="TMFI6")
     monitor._exit_only_position = None
     monitor._exit_only_decision_binding = None
     events = []
