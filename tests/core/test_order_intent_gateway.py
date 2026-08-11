@@ -49,13 +49,31 @@ def _capability():
     }
 
 
-def _ctx(mode, live_order_allowed=False, cap=None):
+def _ctx(mode, live_order_allowed=False, cap=None, session_id=None):
     return ExecutionContext(
         requested_mode="live",
         effective_mode=mode,
         live_order_allowed=live_order_allowed,
         exit_only_capability=cap,
+        session_id=session_id,
     )
+
+
+def _fresh_capability():
+    """Attested capability with a FRESH snapshot timestamp + bound session."""
+    _cap = _capability()
+    _cap["snapshot_captured_at"] = int(time.time() * 1000)
+    _cap["session_id"] = "c" * 32
+    return _cap
+
+
+def _fresh_exit_only_ctx(cap=None):
+    return _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
+                live_order_allowed=False, cap=cap or _fresh_capability(),
+                session_id="c" * 32)
+
+
+
 
 
 def _exit_only_ctx():
@@ -732,6 +750,189 @@ def test_e2e_manual_partial_far_failure_quarantines(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError) as exc:
         fresh.api.place_order_object(_order("ORD-PRE", "MTS_ENTRY"))
     assert "ADAPTER_GATEWAY_AUTHORIZATION_MISSING" in str(exc.value)
+
+
+# ── S1: EXIT_ONLY pre-evaluation position hydration ─────────────────────
+
+def test_s1_exit_only_pre_eval_hydrates_before_evaluator():
+    """[S1] EXIT_ONLY exact cap hydrates the strategy position BEFORE the
+    evaluator runs; the evaluator sees both legs/costs/trade/rid."""
+    from types import SimpleNamespace
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+
+    class _RecordingStrategy:
+        seen = None
+        calls = 0
+
+        def on_bar(self, ctx):
+            _RecordingStrategy.calls += 1
+            _RecordingStrategy.seen = {
+                "has_position": self._has_position,
+                "near_side": self._near_side,
+                "far_side": self._far_side,
+                "near_qty": self._near_qty,
+                "far_qty": self._far_qty,
+                "near_entry": self._near_entry,
+                "far_entry": self._far_entry,
+                "trade_id": self._trade_id,
+                "reconciliation_id": self._reconciliation_id,
+            }
+            return None
+
+    strategy = _RecordingStrategy()
+    assert monitor._exit_only_pre_evaluation_hydration(strategy) is True
+    # the evaluator (same sequence the tick uses) sees the hydrated state
+    strategy.on_bar(SimpleNamespace())
+    assert _RecordingStrategy.calls == 1
+    assert _RecordingStrategy.seen == {
+        "has_position": True, "near_side": "SHORT", "far_side": "LONG",
+        "near_qty": 1, "far_qty": 1,
+        "near_entry": 44909.0, "far_entry": 45052.0,
+        "trade_id": "mts-20260811-085503",
+        "reconciliation_id": "recon-abc123",
+    }
+    hydrated = [e for e in events if e[0] == "EXIT_ONLY_POSITION_HYDRATED"]
+    assert len(hydrated) == 1
+    assert hydrated[0][1]["snapshot_hash"] == "s" * 64
+
+
+def test_s1_exit_only_hydration_blocked_zero_eval():
+    """[S1] missing/stale/session/leg-mismatch/hydration failure -> explicit
+    BLOCKED event; the evaluator and submit are never reached."""
+    from core.mode_transition import ModeTransitionState
+    from strategies.futures.monitor import EXIT_ONLY_SNAPSHOT_TTL_MS
+
+    class _NoopStrategy:
+        calls = 0
+
+        def on_bar(self, ctx):
+            _NoopStrategy.calls += 1
+            return None
+
+    def _assert_blocked(ctx, reason, name):
+        monitor, events = _monitor(ctx)
+        monitor._exit_only_position = None
+        _NoopStrategy.calls = 0
+        assert monitor._exit_only_pre_evaluation_hydration(
+            _NoopStrategy()) is False, name
+        assert _NoopStrategy.calls == 0
+        assert monitor.api.calls == []
+        blocked = [e for e in events
+                   if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"]
+        assert blocked and blocked[-1][1]["reason"] == reason, (
+            f"{name}: {blocked}")
+
+    # missing capability
+    _assert_blocked(
+        _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
+             live_order_allowed=False, cap=None, session_id="c" * 32),
+        "EXIT_ONLY_CAPABILITY_MISSING", "missing")
+    # stale snapshot (older than the TTL)
+    stale = _fresh_capability()
+    stale["snapshot_captured_at"] = (
+        int(time.time() * 1000) - EXIT_ONLY_SNAPSHOT_TTL_MS - 1000)
+    _assert_blocked(
+        _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
+             live_order_allowed=False, cap=stale, session_id="c" * 32),
+        "EXIT_ONLY_SNAPSHOT_STALE", "stale")
+    # wrong session
+    wrong_session = _fresh_capability()
+    wrong_session["session_id"] = "f" * 32
+    _assert_blocked(
+        _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
+             live_order_allowed=False, cap=wrong_session,
+             session_id="c" * 32),
+        "EXIT_ONLY_SESSION_MISMATCH", "session")
+    # leg code mismatch (legs swapped)
+    swapped = _fresh_capability()
+    swapped["legs"] = [dict(swapped["legs"][1]), dict(swapped["legs"][0])]
+    _assert_blocked(
+        _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
+             live_order_allowed=False, cap=swapped, session_id="c" * 32),
+        "EXIT_ONLY_LEG_MISMATCH", "leg-code")
+    # hydration failure (invalid leg cost)
+    bad = _fresh_capability()
+    bad["legs"][0]["avg_cost"] = "NaN"
+    _assert_blocked(
+        _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
+             live_order_allowed=False, cap=bad, session_id="c" * 32),
+        "EXIT_ONLY_CAPABILITY_INVALID", "hydrate-fail")
+
+
+def test_s1_exit_only_entry_blocked_after_hydration_zero_submit(monkeypatch):
+    """[S1] after a successful hydration, an ENTRY output stays suppressed
+    in EXIT_ONLY — explicit block, zero adapter submission."""
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    strategy = _bound_strategy()
+    assert monitor._exit_only_pre_evaluation_hydration(strategy) is True
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    signal = SimpleNamespace(action="BUY_NEAR_SELL_FAR", reason="ENTRY")
+    monitor._submit_mts_order_signal(
+        signal, strategy, {}, __import__("datetime").datetime.now())
+    assert monitor.api.calls == []
+    blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
+    assert blocked and blocked[-1][1].get("reason") == "EXIT_ONLY_ENTRY_BLOCKED"
+
+
+def test_s1_normal_live_and_paper_untouched():
+    """[S1] normal LIVE_READY / PAPER flow returns True and never
+    overwrites the strategy's own state."""
+    from core.mode_transition import ExecutionMode
+
+    for ctx in (
+        _live_ctx(),
+        ExecutionContext(requested_mode="paper",
+                         effective_mode=ExecutionMode.PAPER.value,
+                         live_order_allowed=False),
+    ):
+        monitor, events = _monitor(ctx)
+        strategy = _bound_strategy()
+        strategy._has_position = "KEEP"
+        strategy._near_entry = 12345.0
+        assert monitor._exit_only_pre_evaluation_hydration(strategy) is True
+        assert strategy._has_position == "KEEP"
+        assert strategy._near_entry == 12345.0
+        assert [e for e in events
+                if e[0] in ("EXIT_ONLY_POSITION_HYDRATED",
+                            "EXIT_ONLY_HYDRATION_BLOCKED")] == []
+
+
+def test_s1_hydration_idempotent_per_snapshot_refresh_on_hash_change():
+    """[S1] hydration runs once per unchanged snapshot and refreshes when
+    a valid snapshot hash changes."""
+    from dataclasses import replace
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    strategy = _bound_strategy()
+    assert monitor._exit_only_pre_evaluation_hydration(strategy) is True
+    assert strategy._near_entry == 44909.0
+    # idempotent: same snapshot hash -> strategy state NOT overwritten
+    strategy._near_entry = 11111.0
+    assert monitor._exit_only_pre_evaluation_hydration(strategy) is True
+    assert strategy._near_entry == 11111.0
+    # refresh: new snapshot hash -> re-hydrated with the new costs
+    cap2 = _fresh_capability()
+    cap2["snapshot_hash"] = "t" * 64
+    cap2["legs"] = [
+        {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1,
+         "avg_cost": 46000.0},
+        {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1,
+         "avg_cost": 46100.0},
+    ]
+    monitor._execution_context = replace(
+        monitor._execution_context, exit_only_capability=cap2)
+    assert monitor._exit_only_pre_evaluation_hydration(strategy) is True
+    assert strategy._near_entry == 46000.0
+    assert strategy._far_entry == 46100.0
+    assert strategy._snapshot_hash == "t" * 64
+    hydrated = [e for e in events if e[0] == "EXIT_ONLY_POSITION_HYDRATED"]
+    assert len(hydrated) == 2
+    assert hydrated[-1][1]["snapshot_hash"] == "t" * 64
 
 
 def test_e2e_emergency_close_all_blocked_in_exit_only(monkeypatch):
