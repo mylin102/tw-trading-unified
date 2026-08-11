@@ -34,12 +34,19 @@ def _which_node():
 
 _NODE = _which_node()
 
+_BROKER_ENV = {
+    "SHIOAJI_API_KEY": "test-api-key",
+    "SHIOAJI_SECRET_KEY": "test-secret-key",
+    "SHIOAJI_CA_PATH": "/safe/test-certificate.pfx",
+    "SHIOAJI_CA_PASSWD": "test-ca-password",
+}
+
 
 def _load_config(env: dict):
     """Load the ecosystem config via node; returns (returncode, stdout)."""
     full_env = dict(os.environ)
     for k in ("NODE_ENV", "TRADING_PYTHON_BIN", "TRADING_RUNTIME_DIR",
-              "TRADING_LOG_DIR", "DEPLOY_MODE"):
+              "TRADING_LOG_DIR", "DEPLOY_MODE", *_BROKER_ENV):
         full_env.pop(k, None)
     full_env.update({k: str(v) for k, v in env.items()})
     r = subprocess.run(
@@ -72,7 +79,8 @@ def test_ecosystem_production_loads_with_python_bin(runtime_logs):
     rc, out = _load_config({
         "NODE_ENV": "production",
         "TRADING_PYTHON_BIN": str(bin_path),
-        "TRADING_RUNTIME_DIR": str(runtime_logs)})
+        "TRADING_RUNTIME_DIR": str(runtime_logs),
+        **_BROKER_ENV})
     assert rc == 0, out
     assert str(bin_path) in out or True  # load suffices; args checked below
 
@@ -83,7 +91,8 @@ def test_ecosystem_logs_never_in_release_tree(runtime_logs):
     rc, out = _load_config({
         "NODE_ENV": "production",
         "TRADING_PYTHON_BIN": str(Path(sys.executable).resolve()),
-        "TRADING_RUNTIME_DIR": str(runtime_logs)})
+        "TRADING_RUNTIME_DIR": str(runtime_logs),
+        **_BROKER_ENV})
     assert rc == 0, out
     root = str(_ECOSYSTEM.parent)
     for app in json.loads(subprocess.run(
@@ -94,10 +103,11 @@ def test_ecosystem_logs_never_in_release_tree(runtime_logs):
                 **{k: v for k, v in os.environ.items()
                    if k not in ("NODE_ENV", "TRADING_PYTHON_BIN",
                                 "TRADING_RUNTIME_DIR", "TRADING_LOG_DIR",
-                                "DEPLOY_MODE")},
+                                "DEPLOY_MODE", *_BROKER_ENV)},
                 "NODE_ENV": "production",
                 "TRADING_PYTHON_BIN": str(Path(sys.executable).resolve()),
-                "TRADING_RUNTIME_DIR": str(runtime_logs)},
+                "TRADING_RUNTIME_DIR": str(runtime_logs),
+                **_BROKER_ENV},
             timeout=30).stdout):
         for key in ("out_file", "error_file", "log_file", "pid_file"):
             p = app.get(key) or ""
@@ -113,7 +123,8 @@ def test_ecosystem_log_dir_missing_fails(runtime_logs):
     rc, out = _load_config({
         "NODE_ENV": "production",
         "TRADING_PYTHON_BIN": str(Path(sys.executable).resolve()),
-        "TRADING_LOG_DIR": str(missing)})
+        "TRADING_LOG_DIR": str(missing),
+        **_BROKER_ENV})
     assert rc != 0, f"config must fail on a missing log dir: {out}"
 
 
@@ -125,7 +136,8 @@ def test_ecosystem_log_dir_unwritable_fails(runtime_logs):
         rc, out = _load_config({
             "NODE_ENV": "production",
             "TRADING_PYTHON_BIN": str(Path(sys.executable).resolve()),
-            "TRADING_LOG_DIR": str(ro)})
+            "TRADING_LOG_DIR": str(ro),
+            **_BROKER_ENV})
         assert rc != 0, f"config must fail on a read-only log dir: {out}"
     finally:
         ro.chmod(0o700)
@@ -145,7 +157,7 @@ def test_ecosystem_prints_no_secrets(runtime_logs):
         "NODE_ENV": "production",
         "TRADING_PYTHON_BIN": str(Path(sys.executable).resolve()),
         "TRADING_RUNTIME_DIR": str(runtime_logs),
-        "SHIOAJI_API_KEY": secret})
+        **{**_BROKER_ENV, "SHIOAJI_API_KEY": secret}})
     assert secret not in out
 
 
@@ -161,7 +173,8 @@ def test_ecosystem_config_load_check_deploy_flow(runtime_logs):
         "NODE_ENV": "production",
         "TRADING_PYTHON_BIN": str(Path(sys.executable).resolve()),
         "TRADING_RUNTIME_DIR": str(runtime_logs),
-        "LRC_RELEASE_SHA": "ab" * 20})
+        "LRC_RELEASE_SHA": "ab" * 20,
+        **_BROKER_ENV})
     assert rc == 0, out
 
 
@@ -177,10 +190,43 @@ def test_ecosystem_lrc_release_sha_passthrough(runtime_logs):
             **{k: v for k, v in os.environ.items()
                if k not in ("NODE_ENV", "TRADING_PYTHON_BIN",
                             "TRADING_RUNTIME_DIR", "TRADING_LOG_DIR",
-                            "DEPLOY_MODE", "LRC_RELEASE_SHA")},
+                            "DEPLOY_MODE", "LRC_RELEASE_SHA", *_BROKER_ENV)},
             "NODE_ENV": "production",
             "TRADING_PYTHON_BIN": str(Path(sys.executable).resolve()),
             "TRADING_RUNTIME_DIR": str(runtime_logs),
-            "LRC_RELEASE_SHA": sha},
+            "LRC_RELEASE_SHA": sha,
+            **_BROKER_ENV},
         capture_output=True, text=True, timeout=30).stdout
     assert json.loads(out)["LRC_RELEASE_SHA"] == sha
+
+
+def test_ecosystem_production_requires_each_broker_credential(runtime_logs):
+    for missing in _BROKER_ENV:
+        env = {
+            "NODE_ENV": "production",
+            "TRADING_PYTHON_BIN": str(Path(sys.executable).resolve()),
+            "TRADING_RUNTIME_DIR": str(runtime_logs),
+            **_BROKER_ENV,
+        }
+        env.pop(missing)
+        rc, out = _load_config(env)
+        assert rc != 0
+        assert missing in out
+        assert all(value not in out for value in _BROKER_ENV.values())
+
+
+def test_ecosystem_passes_only_explicit_broker_allowlist(runtime_logs):
+    env = {
+        **{k: v for k, v in os.environ.items() if k not in _BROKER_ENV},
+        "NODE_ENV": "production",
+        "TRADING_PYTHON_BIN": str(Path(sys.executable).resolve()),
+        "TRADING_RUNTIME_DIR": str(runtime_logs),
+        "UNRELATED_SECRET": "must-not-pass",
+        **_BROKER_ENV,
+    }
+    out = subprocess.run(
+        [_NODE, "-e", "console.log(JSON.stringify(require('" + str(_ECOSYSTEM) + "').apps[0].env))"],
+        env=env, capture_output=True, text=True, timeout=30).stdout
+    app_env = json.loads(out)
+    assert {key: app_env[key] for key in _BROKER_ENV} == _BROKER_ENV
+    assert "UNRELATED_SECRET" not in app_env
