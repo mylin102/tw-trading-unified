@@ -410,6 +410,48 @@ def test_futures_deal_callback_matches_seqno_only_receipt():
     assert order.fills[0].deal_id == "DEAL-SEQ"
 
 
+def test_futures_callback_accepts_shioaji_fdeal_enum_value():
+    """Shioaji 1.7 uses ``FDEAL``, not ``FuturesDeal``, as enum.value."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    manager = OrderManager(mode="paper")
+    order = _new_order(manager)
+    manager.attach_submission(order.order_id, ordno="FDEAL-1", raw_status="Submitted")
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.order_mgr = manager
+
+    monitor.on_order_event(
+        SimpleNamespace(name="FuturesDeal", value="FDEAL"),
+        {"price": 44762, "quantity": 1, "ordno": "FDEAL-1", "trade_id": "D-1"},
+    )
+
+    assert order.status is OrderStatus.FILLED
+    assert order.fills[0].deal_id == "D-1"
+
+
+def test_futures_callback_accepts_forder_and_ignores_stock_state():
+    """FORDER updates a matched futures order; stock callbacks cannot mutate it."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    manager = OrderManager(mode="paper")
+    order = _new_order(manager)
+    manager.attach_submission(order.order_id, ordno="FORDER-1", raw_status="Submitted")
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.order_mgr = manager
+
+    monitor.on_order_event(
+        SimpleNamespace(name="StockDeal", value="SDEAL"),
+        {"price": 44762, "quantity": 1, "ordno": "FORDER-1", "trade_id": "stock"},
+    )
+    assert order.status is OrderStatus.SUBMITTED
+
+    monitor.on_order_event(
+        SimpleNamespace(name="FuturesOrder", value="FORDER"),
+        {"status": "Cancelled", "ordno": "FORDER-1"},
+    )
+    assert order.status is OrderStatus.CANCELLED
+
+
 def test_manual_spread_is_refused_while_automatic_mts_entry_is_in_flight(tmp_path):
     """Manual entry cannot overlap a submitted automatic MTS entry."""
     from strategies.futures.monitor import FuturesMonitor
