@@ -86,6 +86,31 @@ def test_capture_falls_back_to_noarg_list_positions_on_typeerror():
     assert snap["source"] == "live_broker"
     assert snap.get("capture_error") is not True
     assert snap["positions"] == [{
-        "code": "TMFH6", "direction": "Sell",
+        "code": "TMFH6", "direction": "sell",
         "quantity": 1, "avg_cost": 44909.0,
     }]
+
+
+def test_capture_normalizes_shioaji_action_direction_to_exit_contract():
+    """The live SDK exposes directions as ``Action.Sell``/``Action.Buy``."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.api = _make_api(
+        trades_with_acct=[],
+        trades_noarg=[],
+        positions_with_acct=[
+            SimpleNamespace(code="TMFH6", direction="Action.Sell",
+                            quantity=1, price=44909.0),
+            SimpleNamespace(code="TMFI6", direction="Action.Buy",
+                            quantity=1, price=45052.0),
+        ],
+        positions_noarg=[],
+    )
+    monitor._execution_context = _live_ctx()
+
+    snap = monitor._capture_exit_only_snapshot()
+
+    assert [(row["code"], row["direction"]) for row in snap["positions"]] == [
+        ("TMFH6", "sell"), ("TMFI6", "buy"),
+    ]
