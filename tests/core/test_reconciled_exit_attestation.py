@@ -226,7 +226,7 @@ def test_apply_exit_only_sets_distinct_mode_and_persists_capability():
     data = ctx.to_dict()
     assert data["effective_mode"] == "reconciled_exit_only"
     assert data["exit_only_capability"]["reconciliation_id"] == \
-        "mts-20260811-085503"
+        capability["reconciliation_id"]
 
     # original context unchanged
     assert _live_ctx().effective_mode == ModeTransitionState.LIVE_READY.value
@@ -283,7 +283,7 @@ def test_exit_order_stamped_with_reconciliation_id_in_exit_only():
     )
 
     capability, _ = build_exit_only_capability(
-        _valid_attestation(), _fresh_snapshot())
+        _valid_attestation(), _fresh_snapshot(), ctx=_live_ctx())
     ctx = apply_exit_only(_live_ctx(), capability)
     manager = OrderManager(mode="live", execution_context=ctx)
 
@@ -298,17 +298,27 @@ def test_exit_order_stamped_with_reconciliation_id_in_exit_only():
     assert release_order.reconciliation_id == capability["reconciliation_id"]
 
     # OCO requires cancel/update cleanup, which exit-only intentionally
-    # prohibits.  It must never receive a capability stamp.
-    oco = manager.create_order(
-        symbol="TMFH6", side=OrderSide.BUY, order_type=OrderType.MKP,
-        quantity=1, strategy="MTS_RELEASE_OCO")
-    assert oco.reconciliation_id is None
+    # prohibits.  It cannot even create lifecycle state.
+    with pytest.raises(LiveOrderBlocked) as exc:
+        manager.create_order(
+            symbol="TMFH6", side=OrderSide.BUY, order_type=OrderType.MKP,
+            quantity=1, strategy="MTS_RELEASE_OCO")
+    assert exc.value.reason == "EXIT_ONLY_STRATEGY_BLOCKED"
 
-    # entry-class orders are NEVER stamped (gate rejects them)
-    entry = manager.create_order(
-        symbol="TMFH6", side=OrderSide.SELL, order_type=OrderType.MKP,
-        quantity=1, strategy="MTS_ENTRY")
-    assert entry.reconciliation_id is None
+    # One capability may issue each exact closing leg only once; no retry or
+    # reissue is silently converted into another live order.
+    with pytest.raises(LiveOrderBlocked) as exc:
+        manager.create_order(
+            symbol="TMFH6", side=OrderSide.BUY, order_type=OrderType.MKP,
+            quantity=1, strategy="MTS_EXIT")
+    assert exc.value.reason == "EXIT_ONLY_ORDER_ALREADY_ISSUED"
+
+    # Entry-class orders cannot even create local lifecycle state.
+    with pytest.raises(LiveOrderBlocked) as exc:
+        manager.create_order(
+            symbol="TMFH6", side=OrderSide.SELL, order_type=OrderType.MKP,
+            quantity=1, strategy="MTS_ENTRY")
+    assert exc.value.reason == "EXIT_ONLY_STRATEGY_BLOCKED"
 
     # the stamped exit order now passes the capability gate
     ctx.assert_order_allowed(exit_order, method="place_order")
@@ -322,12 +332,32 @@ def test_exit_order_not_stamped_when_live_ready():
     assert order.reconciliation_id is None
 
 
+def test_exit_only_rejection_is_terminal_and_preserves_typed_reason():
+    from core.order_management.order import Order
+    from core.reconciled_exit import apply_exit_only, build_exit_only_capability
+
+    capability, _ = build_exit_only_capability(
+        _valid_attestation(), _fresh_snapshot(), ctx=_live_ctx())
+    manager = OrderManager(
+        mode="live", execution_context=apply_exit_only(_live_ctx(), capability))
+    order = Order(symbol="TMFH6", side=OrderSide.SELL,
+                  order_type=OrderType.MKP, quantity=1,
+                  strategy="MTS_ENTRY", reconciliation_id="wrong")
+    manager.active_orders[order.order_id] = order
+    assert manager.submit(order) is False
+    assert order.reject_reason == "EXIT_ONLY_RECONCILIATION_ID_MISMATCH"
+    assert order.order_id not in manager.active_orders
+    assert order in manager.completed
+
+
 # ── monitor flow ──────────────────────────────────────────────────────────
 
 def test_monitor_attestation_flow_applies_exit_only_and_emits_event(monkeypatch):
     from types import SimpleNamespace
 
     from strategies.futures.monitor import FuturesMonitor
+
+    monkeypatch.setenv("LRC_RELEASE_SHA", "d" * 40)
 
     monitor = FuturesMonitor.__new__(FuturesMonitor)
     monitor.api = SimpleNamespace(
@@ -391,8 +421,8 @@ def test_monitor_attestation_rejected_without_broker(monkeypatch):
     )
 
     assert record is None
-    # api=None -> empty positions -> leg mismatch (fail-closed, N/A)
-    assert err == "SNAPSHOT_LEG_MISMATCH"
+    # api=None cannot prove flat/open-orders evidence (fail-closed, N/A)
+    assert err == "BROKER_SNAPSHOT_UNAVAILABLE"
     assert monitor._execution_context.effective_mode == \
         ModeTransitionState.LIVE_READY.value
     assert not events
