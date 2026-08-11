@@ -4402,9 +4402,22 @@ class FuturesMonitor:
             return
 
         payload = self.order_mgr._payload_to_dict(data) or {}
-        state_value = str(getattr(order_state, "value", order_state))
-        is_futures_deal = "FuturesDeal" in state_value
-        is_futures_order = "FuturesOrder" in state_value
+        # Shioaji 1.7 enum names are FuturesDeal/FuturesOrder but their
+        # values are FDEAL/FORDER.  Never filter only on the display name:
+        # doing so silently drops every live futures callback.
+        state_name = str(getattr(order_state, "name", ""))
+        state_value = str(getattr(order_state, "value", "")).upper()
+        state_text = str(order_state)
+        is_futures_deal = (
+            state_name == "FuturesDeal"
+            or state_value == "FDEAL"
+            or state_text in ("FuturesDeal", "FDEAL")
+        )
+        is_futures_order = (
+            state_name == "FuturesOrder"
+            or state_value == "FORDER"
+            or state_text in ("FuturesOrder", "FORDER")
+        )
         if not (is_futures_deal or is_futures_order):
             return
 
