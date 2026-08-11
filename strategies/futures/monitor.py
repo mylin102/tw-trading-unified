@@ -3178,11 +3178,21 @@ class FuturesMonitor:
 
     def _record_gateway_intent(self, durable_view):
         """[S0] persist the gateway intent ledger via the
-        execution-context payload (existing durable mechanism)."""
+        execution-context payload.  Raises GatewayIntentPersistFailed
+        when the persist fails — the gateway must not issue an
+        authorization or call the adapter unless the durable
+        PENDING_SUBMIT is confirmed."""
+        from core.execution_context_state import persist_execution_context
+        from core.order_intent_gateway import GatewayIntentPersistFailed
+        _ctx = getattr(self, "_execution_context", None)
         try:
-            self._persist_execution_context()
-        except Exception:
-            pass
+            if _ctx is None:
+                raise RuntimeError("no execution context")
+            _payload = _ctx.to_dict()
+            _payload["gateway_intents"] = durable_view
+            persist_execution_context(_payload)
+        except Exception as _pexc:
+            raise GatewayIntentPersistFailed(str(_pexc)) from _pexc
 
     def _submit_via_gateway(self, order, exchange_ordno=None,
                             raise_on_failure=False):
@@ -5133,15 +5143,13 @@ class FuturesMonitor:
         """
         if not self.paper_fill_sim or not self.order_mgr:
             return
-        # [S0] EXIT_ONLY: OCO creation/submission is blocked at the
-        # gateway boundary (no Order construction, no submit) until
-        # S9 routes OCO through the gateway.
-        if (getattr(getattr(self, "_execution_context", None),
-                    "effective_mode", "") == "reconciled_exit_only"):
-            self._append_mts_event(
-                "ORDER_INTENT_BLOCKED", action="OCO_RECONCILE",
-                reason="GATEWAY_OCO_DISABLED", trade_id="")
-            return
+        # [S0] OCO is disabled at the gateway boundary (ALL modes — no
+        # Order construction, no submit) until S9 routes it through
+        # the gateway.  Direct OCO order/submit paths fail closed here.
+        self._append_mts_event(
+            "ORDER_INTENT_BLOCKED", action="OCO_RECONCILE",
+            reason="GATEWAY_OCO_DISABLED", trade_id="")
+        return
 
         _state_path = _mts_position_state_path()
         if not _state_path.exists():
@@ -5223,15 +5231,13 @@ class FuturesMonitor:
         """
         if not self.paper_fill_sim or not self.order_mgr:
             return
-        # [S0] EXIT_ONLY: OCO creation/submission is blocked at the
-        # gateway boundary (no Order construction, no submit) until
-        # S9 routes OCO through the gateway.
-        if (getattr(getattr(self, "_execution_context", None),
-                    "effective_mode", "") == "reconciled_exit_only"):
-            self._append_mts_event(
-                "ORDER_INTENT_BLOCKED", action="OCO_RECONCILE",
-                reason="GATEWAY_OCO_DISABLED", trade_id="")
-            return
+        # [S0] OCO is disabled at the gateway boundary (ALL modes — no
+        # Order construction, no submit) until S9 routes it through
+        # the gateway.  Direct OCO order/submit paths fail closed here.
+        self._append_mts_event(
+            "ORDER_INTENT_BLOCKED", action="OCO_RECONCILE",
+            reason="GATEWAY_OCO_DISABLED", trade_id="")
+        return
         if not hasattr(strategy, '_lifecycle_oca'):
             return
 
@@ -6177,17 +6183,35 @@ class FuturesMonitor:
             _near_order.client_order_id = _ilog.get(_iid)["legs"]["NEAR"]["client_order_id"]
             _far_order.client_order_id = _ilog.get(_iid)["legs"]["FAR"]["client_order_id"]
             from core.exit_intent import DuplicateSubmitError as _MTSDupSubmit
+            from core.order_intent_gateway import (
+                GatewaySubmitError as _MTSGWFail,
+            )
             try:
                 _ilog.submit_leg(_iid, "NEAR", self.order_mgr,
                                  submit_fn=lambda cid, leg: self._submit_via_gateway(_near_order, raise_on_failure=True))
             except _MTSDupSubmit:
                 # P1-2 dedup: a repeated exit decision must NOT re-send
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} NEAR already submitted — suppressing duplicate[/yellow]")
+            except _MTSGWFail as _gwe:
+                # [S0] failed near leg: durable UNKNOWN in the intent
+                # log — quarantine/reconcile; the FAR leg must never
+                # submit after a near failure.
+                self._append_mts_event(
+                    "ORDER_INTENT_SUBMIT_FAILED", action="COMBINED_EXIT",
+                    reason=f"NEAR:{_gwe}", trade_id=_trade_id)
+                return
             try:
                 _ilog.submit_leg(_iid, "FAR", self.order_mgr,
                                  submit_fn=lambda cid, leg: self._submit_via_gateway(_far_order, raise_on_failure=True))
             except _MTSDupSubmit:
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} FAR already submitted — suppressing duplicate[/yellow]")
+            except _MTSGWFail as _gwe:
+                # [S0] failed far leg: durable UNKNOWN in the intent log
+                # — quarantine/reconcile; no retry, no cancel.
+                self._append_mts_event(
+                    "ORDER_INTENT_SUBMIT_FAILED", action="COMBINED_EXIT",
+                    reason=f"FAR:{_gwe}", trade_id=_trade_id)
+                return
             # 2026-07-30: Write state to COMBINED_EXIT only AFTER successful submission
             try:
                 from strategies.plugins.futures.active.tmf_spread import _write_mts_state

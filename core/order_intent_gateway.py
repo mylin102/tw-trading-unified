@@ -48,6 +48,11 @@ class GatewaySubmitError(Exception):
     submit_leg contract requires a failed leg to never be marked SUBMITTED."""
 
 
+class GatewayIntentPersistFailed(Exception):
+    """Typed persistence failure: the durable PENDING_SUBMIT was not
+    confirmed, so no authorization may be issued and no submit may run."""
+
+
 @dataclass(frozen=True)
 class GatewayAuthorization:
     """Opaque process-local authorization. Never serialized as material."""
@@ -115,8 +120,10 @@ class GatewayAuthorizationRegistry:
         """Pending authorization must be live AND bound to the exact order."""
         if self._pending is None or not self.verify(self._pending):
             return False
+        if order is None:
+            return False
         oid = getattr(order, "order_id", None)
-        if oid is not None and oid != self._pending.intent_id:
+        if oid != self._pending.intent_id:
             return False
         return True
 
@@ -167,12 +174,16 @@ class OrderIntentGateway:
             out[iid] = {k: v for k, v in rec.items() if not k.startswith("_")}
         return out
 
-    def _record(self, intent_id: str) -> None:
-        if self._record_cb is not None:
-            try:
-                self._record_cb(self.durable_view())
-            except Exception:
-                pass
+    def _record(self, intent_id: str) -> bool:
+        """Push the ledger to record_cb.  Returns success — a persistence
+        failure must abort the submission (no auth issued, no adapter call)."""
+        if self._record_cb is None:
+            return True
+        try:
+            self._record_cb(self.durable_view())
+            return True
+        except Exception:
+            return False
 
     # ── merged policy (P0 live / entry / EXIT_ONLY / FLAT) ────────────────
 
@@ -267,7 +278,9 @@ class OrderIntentGateway:
                 return False, "SUBMIT_REJECTED"
             return True, _receipt()
         rec["execution_attempt"] += 1
-        self._record(intent_id)  # durable PENDING_SUBMIT before the adapter call
+        if not self._record(intent_id):
+            # durable PENDING_SUBMIT must be confirmed BEFORE any adapter I/O
+            return False, "GATEWAY_INTENT_PERSIST_FAILED"
         auth = self._registry.issue(
             intent_id, rec["execution_attempt"], session_generation)
         try:

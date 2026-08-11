@@ -517,7 +517,7 @@ class IntentLog:
                 # ambiguous (broker may have accepted): durable UNKNOWN
                 self._transition_locked(intent_id, leg, "UNKNOWN")
                 raise
-            oid = (r or {}).get("order_id") if isinstance(r, dict) else None
+            oid = (r or {}).get("broker_order_id") if isinstance(r, dict) else None
             self._transition_locked(intent_id, leg, "SUBMITTED",
                                     broker_order_id=oid)
             return {"intent_id": intent_id, "order_id": oid}
