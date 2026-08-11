@@ -555,3 +555,77 @@ def test_exit_only_cannot_be_promoted_by_certificate_without_fresh_reconciliatio
     result = transition_with_certificate(ctx, object(), object(), runtime=runtime)
     assert result.effective_mode == ModeTransitionState.LIVE_QUARANTINED.value
     assert "EXIT_ONLY_RECONCILIATION_REQUIRED" in result.audit_reasons
+
+
+# ── one-shot operator command ingress ─────────────────────────────────────
+
+def test_exit_only_attestation_command_is_atomic_and_never_places_orders(
+        monkeypatch, tmp_path):
+    """The command can only request the stricter attestation transition.
+
+    The monitor atomically consumes it; this test substitutes the attestation
+    method so no broker and no order manager are involved.
+    """
+    import json
+    import strategies.futures.monitor as monitor_module
+    from strategies.futures.monitor import FuturesMonitor
+
+    command_path = tmp_path / "commands" / "reconciled_exit_attestation.json"
+    command_path.parent.mkdir()
+    command_path.write_text(json.dumps({
+        "command_id": "attest-001",
+        "action": "ATTEST_EXIT_ONLY",
+        "created_at": int(time.time() * 1000),
+        "operator": "trader",
+        "trade_id": "mts-20260811-085503",
+        "evidence": "operator matched current broker positions",
+        "expected_legs": [
+            {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1},
+            {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1},
+        ],
+    }), encoding="utf-8")
+    monkeypatch.setattr(monitor_module, "runtime_path",
+                        lambda *parts: str(command_path))
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    calls, events = [], []
+    monitor._operator_attest_exit_only = lambda **kwargs: (
+        calls.append(kwargs) or ({"snapshot_hash": "x"}, None))
+    monitor._append_mts_event = lambda event_type, **kwargs: events.append(
+        (event_type, kwargs))
+
+    assert monitor._process_reconciled_exit_attestation_command() is True
+    assert calls and calls[0]["trade_id"] == "mts-20260811-085503"
+    assert not command_path.exists()
+    assert not command_path.with_suffix(".json.processing").exists()
+    assert monitor._exit_only_attestation_status == "ATTESTED"
+    assert events[-1][0] == "OPERATOR_ATTESTATION_COMMAND_APPLIED"
+
+
+def test_exit_only_attestation_command_rejects_stale_without_attestation(
+        monkeypatch, tmp_path):
+    import json
+    import strategies.futures.monitor as monitor_module
+    from strategies.futures.monitor import FuturesMonitor
+
+    command_path = tmp_path / "reconciled_exit_attestation.json"
+    command_path.write_text(json.dumps({
+        "command_id": "attest-stale",
+        "action": "ATTEST_EXIT_ONLY",
+        "created_at": int(time.time() * 1000) - 61_000,
+        "operator": "trader", "trade_id": "trade", "evidence": "e",
+        "expected_legs": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(monitor_module, "runtime_path",
+                        lambda *parts: str(command_path))
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    calls, events = [], []
+    monitor._operator_attest_exit_only = lambda **kwargs: calls.append(kwargs)
+    monitor._append_mts_event = lambda event_type, **kwargs: events.append(
+        (event_type, kwargs))
+
+    assert monitor._process_reconciled_exit_attestation_command() is True
+    assert not calls
+    assert monitor._exit_only_attestation_status == "REJECTED: COMMAND_EXPIRED"
+    assert events[-1][0] == "OPERATOR_ATTESTATION_COMMAND_REJECTED"
+    assert events[-1][1]["reason"] == "COMMAND_EXPIRED"
