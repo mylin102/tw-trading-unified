@@ -110,17 +110,20 @@ def build_bbo_binding(bbo_slots: Any, *, now_ms: Optional[int] = None,
                       far_code: Optional[str] = None,
                       identity: Optional[dict] = None) -> tuple:
     """[S2] Validate contemporaneous near/far BBO + decision identity and
-    return a version-2 canonical binding hash.
+    return a version-2 canonical binding (hash + raw payload).
 
-    Each leg requires: exact expected contract code (BBO_CODE_MISMATCH),
-    positive finite bid <= ask (BBO_MISSING / BBO_AMBIGUOUS), finite
-    positive epoch-ms exchange timestamp, not future beyond 1s
-    (BBO_FUTURE), TTL <= 15s (BBO_STALE); cross-leg skew <= 1s
-    (BBO_SKEW).  The decision identity (cap reconciliation_id, position
-    snapshot hash, config_hash, release_sha, session_id) must be present
-    (BBO_IDENTITY_MISSING).  The hash binds both raw bid/ask, exchange
-    timestamps, symbols AND the identity — any bad dimension returns
-    (None, reason) => N/A/BLOCKED, zero evaluator submit/order.
+    Each leg (dedicated EXIT_ONLY BBO evidence cache entry) requires:
+    exact expected contract code (BBO_CODE_MISMATCH), source ==
+    "shioaji_bidask" (BBO_SOURCE_MISMATCH), positive finite bid <= ask
+    (BBO_MISSING / BBO_AMBIGUOUS), finite int epoch-ms EXCHANGE timestamp
+    (BBO_STALE), not future beyond 1s (BBO_FUTURE), TTL <= 15s
+    (BBO_STALE); cross-leg skew <= 1s on EXCHANGE timestamps (BBO_SKEW).
+    The decision identity (cap reconciliation_id, position snapshot hash,
+    config_hash, release_sha, session_id) must be present
+    (BBO_IDENTITY_MISSING).  The version-2 hash AND the raw payload bind
+    raw bid/ask, exchange timestamps, received_at, source, symbols and
+    the identity — any bad dimension returns (None, reason) =>
+    N/A/BLOCKED, zero evaluator submit/order.
     """
     if not isinstance(bbo_slots, dict):
         return None, "BBO_MISSING"
@@ -143,9 +146,11 @@ def build_bbo_binding(bbo_slots: Any, *, now_ms: Optional[int] = None,
             return None, "BBO_MISSING"
         if slot.get("code") != expected[leg]:
             return None, "BBO_CODE_MISMATCH"
+        if slot.get("source") != "shioaji_bidask":
+            return None, "BBO_SOURCE_MISMATCH"
         if bid > ask:
             return None, "BBO_AMBIGUOUS"
-        ts = slot.get("bidask_at")
+        ts = slot.get("exchange_ts_ms")
         if (not isinstance(ts, (int, float)) or not math.isfinite(ts)
                 or ts <= 0):
             return None, "BBO_STALE"
@@ -154,8 +159,13 @@ def build_bbo_binding(bbo_slots: Any, *, now_ms: Optional[int] = None,
             return None, "BBO_FUTURE"
         if now - ts_ms > ttl_ms:
             return None, "BBO_STALE"
-        slots[leg] = {"symbol": slot.get("code"), "bid": bid, "ask": ask,
-                      "exchange_ts": ts_ms}
+        slots[leg] = {
+            "symbol": slot.get("code"), "bid": bid, "ask": ask,
+            "exchange_ts": ts_ms,
+            "received_at_ms": slot.get("received_at_ms"),
+            "source": slot.get("source"),
+            "seq": slot.get("seq"),
+        }
 
     if abs(slots["near"]["exchange_ts"] - slots["far"]["exchange_ts"]) \
             > skew_ms:
@@ -176,15 +186,19 @@ def build_bbo_binding(bbo_slots: Any, *, now_ms: Optional[int] = None,
     ).hexdigest()
     captured_at = max(slots["near"]["exchange_ts"],
                       slots["far"]["exchange_ts"])
-    return {"bbo_hash": bbo_hash, "bbo_captured_at": captured_at}, None
+    return {"bbo_hash": bbo_hash, "bbo_captured_at": captured_at,
+            "bbo_payload": payload}, None
 
 
 def attach_decision_binding(event: dict, capability: dict,
                             binding: dict) -> dict:
-    """Return a copy of the decision event bound to capability + BBO."""
+    """Return a copy of the decision event bound to capability + BBO —
+    the raw versioned payload rides along (not just the hash) so the
+    dashboard/review can reproduce the decision evidence."""
     merged = dict(event)
     merged["reconciliation_id"] = capability.get("reconciliation_id")
     merged["position_snapshot_hash"] = capability.get("snapshot_hash")
     merged["bbo_hash"] = binding.get("bbo_hash")
     merged["bbo_captured_at"] = binding.get("bbo_captured_at")
+    merged["bbo_payload"] = binding.get("bbo_payload")
     return merged

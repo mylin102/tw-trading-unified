@@ -2137,6 +2137,40 @@ class FuturesMonitor:
                     _slot = self.market_data.setdefault(_key, {})
                     _slot.update({"bid": _bbo_cache[0], "ask": _bbo_cache[1],
                                   "bidask_at": time.time(), "bidask_exchange_ts": getattr(bidask, "datetime", None)})
+                    # [S2 repair] dedicated EXIT_ONLY BBO evidence cache —
+                    # immutable-per-update; written ONLY here (validated
+                    # BidAskFOPv1/on_bidask).  Ticks never create or
+                    # overwrite it; _exit_only_bbo_slots reads ONLY this.
+                    _leg = ("near"
+                            if _key == str(getattr(self, "ticker", "TMF"))
+                            else "far")
+                    _xdt = getattr(bidask, "datetime", None)
+                    _xms = None
+                    if _xdt is not None:
+                        try:
+                            _xms = (_xdt.timestamp()
+                                    if hasattr(_xdt, "timestamp")
+                                    else float(_xdt))
+                        except Exception:
+                            _xms = None
+                    if _xms is None or not math.isfinite(_xms) or _xms <= 0:
+                        _xms = None
+                    elif _xms < 1e12:
+                        _xms = int(_xms * 1000)
+                    else:
+                        _xms = int(_xms)
+                    _cache = dict(
+                        getattr(self, "_exit_only_bbo_cache", None) or {})
+                    _cache[_leg] = {
+                        "code": _code_cache,
+                        "bid": _bbo_cache[0],
+                        "ask": _bbo_cache[1],
+                        "exchange_ts_ms": _xms,
+                        "received_at_ms": int(time.time() * 1000),
+                        "source": "shioaji_bidask",
+                        "seq": getattr(bidask, "seq", None),
+                    }
+                    self._exit_only_bbo_cache = _cache
         except Exception:
             pass
         try:
@@ -3297,16 +3331,12 @@ class FuturesMonitor:
         return _payload
 
     def _exit_only_bbo_slots(self):
-        # [S2] pass-through: each slot carries its OWN quoted contract
-        # code (verified against the bound contracts by the gateway
-        # binding) — never inject the bound code here (that would make
-        # the code check vacuous).
-        _ticker = getattr(self, "ticker", "TMF")
-        return {
-            "near": getattr(self, "market_data", {}).get(_ticker, {}),
-            "far": getattr(self, "market_data", {}).get(
-                f"{_ticker}_FAR", {}),
-        }
+        """[S2 repair] dedicated EXIT_ONLY BBO evidence only (written by
+        validated on_bidask).  The generic tick market_data is NEVER read
+        here: ticks carry last/close (no BBO) and must not satisfy the
+        binding.  Tick-only => empty slots => BBO_MISSING."""
+        _cache = getattr(self, "_exit_only_bbo_cache", None) or {}
+        return {"near": _cache.get("near"), "far": _cache.get("far")}
 
     def _exit_only_position_has_position(self) -> bool:
         try:
@@ -6203,10 +6233,16 @@ class FuturesMonitor:
             _action, _gw_intent_strategy, strategy)
         self._exit_only_decision_binding = _gw_binding
         if not _gw_ok:
-            self._append_mts_event(
-                "ORDER_INTENT_BLOCKED", action=_action,
-                reason=_gw_reason,
-                trade_id=getattr(strategy, "_trade_id", ""))
+            # [S2 repair] persist the raw BBO evidence with the blocked
+            # decision so dashboard/review can reproduce the rejection.
+            _block_ev = {
+                "action": _action, "reason": _gw_reason,
+                "trade_id": getattr(strategy, "_trade_id", ""),
+            }
+            _ev_slots = self._exit_only_bbo_slots()
+            if _ev_slots.get("near") or _ev_slots.get("far"):
+                _block_ev["bbo_evidence"] = _ev_slots
+            self._append_mts_event("ORDER_INTENT_BLOCKED", **_block_ev)
             return
 
         if _action == "PARTIAL_EXIT":
