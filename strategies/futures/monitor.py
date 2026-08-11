@@ -71,6 +71,11 @@ except ImportError:
 # monkeypatch the path without touching the live state file.
 MTS_POSITION_STATE_PATH = Path("/tmp/mts_position_state.json")
 
+# [S1] EXIT_ONLY snapshot staleness TTL (ms): the attested broker snapshot
+# is trusted for exit evaluation only within this window; beyond it the
+# position must be re-attested before any exit evaluation.
+EXIT_ONLY_SNAPSHOT_TTL_MS = 3_600_000
+
 # 2026-07-14 Gemini CLI: Dataclass snapshot for MTF score tracking under ADR-009 Phase 1
 from dataclasses import dataclass, field
 
@@ -3318,9 +3323,11 @@ class FuturesMonitor:
         _ctx = getattr(self, "_execution_context", None)
         if getattr(_ctx, "effective_mode", None) != "reconciled_exit_only":
             return None
-        if getattr(self, "_exit_only_position", None) is not None:
-            return self._exit_only_position
         _cap = getattr(_ctx, "exit_only_capability", None)
+        _cached = getattr(self, "_exit_only_position", None)
+        _cap_hash = (_cap or {}).get("snapshot_hash")
+        if _cached is not None and _cached.get("snapshot_hash") == _cap_hash:
+            return _cached
         try:
             from core.exit_only_position import hydrate_exit_only_position
             _position = hydrate_exit_only_position(_cap)
@@ -3372,6 +3379,80 @@ class FuturesMonitor:
                 setattr(strategy, _attr, _value)
             except Exception:
                 return False
+        return True
+
+    def _exit_only_pre_evaluation_hydration(self, strategy) -> bool:
+        """[S1] EXIT_ONLY: build the strategy position from the validated
+        capability/attested broker snapshot BEFORE every strategy
+        evaluation (never inside submit).  Returns False (the evaluator
+        must be skipped) with an explicit EXIT_ONLY_HYDRATION_BLOCKED
+        event on any missing/stale/session/leg-mismatch/hydration failure
+        — zero strategy order submission.  Idempotent per snapshot hash;
+        refreshes when the hash changes.  Normal LIVE/PAPER flow returns
+        True untouched (never overwrites strategy state)."""
+        _ctx = getattr(self, "_execution_context", None)
+        if getattr(_ctx, "effective_mode", None) != "reconciled_exit_only":
+            return True
+        _cap = getattr(_ctx, "exit_only_capability", None)
+        if not isinstance(_cap, dict):
+            self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
+                                   reason="EXIT_ONLY_CAPABILITY_MISSING")
+            return False
+        _cap_session = _cap.get("session_id") or ""
+        _cur_session = getattr(_ctx, "session_id", "") or ""
+        if _cap_session and _cur_session and _cap_session != _cur_session:
+            self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
+                                   reason="EXIT_ONLY_SESSION_MISMATCH")
+            return False
+        _captured = _cap.get("snapshot_captured_at")
+        if (not isinstance(_captured, int)
+                or int(time.time() * 1000) - _captured
+                > EXIT_ONLY_SNAPSHOT_TTL_MS):
+            self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
+                                   reason="EXIT_ONLY_SNAPSHOT_STALE")
+            return False
+        _cached = getattr(self, "_exit_only_position", None)
+        if (_cached is None
+                or _cached.get("snapshot_hash")
+                != _cap.get("snapshot_hash")):
+            try:
+                from core.exit_only_position import hydrate_exit_only_position
+                _position = hydrate_exit_only_position(_cap)
+            except Exception as _exc:
+                _code = getattr(_exc, "code", "EXIT_ONLY_CAPABILITY_INVALID")
+                self._exit_only_position = None
+                self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
+                                       reason=_code)
+                return False
+            self._exit_only_position = _position
+            self._append_mts_event(
+                "EXIT_ONLY_POSITION_HYDRATED",
+                trade_id=_position["trade_id"],
+                reconciliation_id=_position["reconciliation_id"],
+                snapshot_hash=_position["snapshot_hash"],
+                legs=_position["legs"],
+            )
+        _position = self._exit_only_position
+        _legs = _position.get("legs") or []
+        if len(_legs) != 2:
+            self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
+                                   reason="EXIT_ONLY_LEG_COUNT_INVALID")
+            return False
+        _near_code = getattr(getattr(self, "contract", None), "code", None)
+        _far_code = getattr(getattr(self, "far_contract", None), "code", None)
+        if (_legs[0]["code"] != _near_code or _legs[1]["code"] != _far_code
+                or _legs[0]["side"] == _legs[1]["side"]):
+            self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
+                                   reason="EXIT_ONLY_LEG_MISMATCH")
+            return False
+        if getattr(self, "_exit_only_strategy_hydrated_hash", None) \
+                == _position["snapshot_hash"]:
+            return True
+        if not self._hydrate_strategy_position(strategy):
+            self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
+                                   reason="EXIT_ONLY_STRATEGY_HYDRATION_FAILED")
+            return False
+        self._exit_only_strategy_hydrated_hash = _position["snapshot_hash"]
         return True
 
     def _exit_only_decision_guard(self, action, strategy=None):
@@ -8440,8 +8521,15 @@ class FuturesMonitor:
             # 2026-07-08 Hermes Agent: Risk control gates (settlement > SINGLE_LEG > normal)
             if not self._mts_risk_gate_settlement(strategy):
                 if not self._mts_risk_gate_single_leg_preclose(strategy, _bar_dict):
-                    signal = strategy.on_bar(ctx)
-                    self._mts_note_strategy_evaluated()
+                    # [S1] EXIT_ONLY: hydrate the strategy position from the
+                    # validated capability BEFORE every evaluation (never
+                    # inside submit).  On any missing/stale/session/leg-
+                    # mismatch/hydration failure an explicit
+                    # EXIT_ONLY_HYDRATION_BLOCKED event fires and the
+                    # evaluator is skipped — zero order submission.
+                    if self._exit_only_pre_evaluation_hydration(strategy):
+                        signal = strategy.on_bar(ctx)
+                        self._mts_note_strategy_evaluated()
 
         # 2026-07-07 Hermes Agent: P0 — Post-signal authority gate.
         # 2026-08-06 Hermes Agent P1: driven by the LEDGER authority (not the
