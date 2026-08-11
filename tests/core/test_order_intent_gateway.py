@@ -134,10 +134,12 @@ def test_authorization_single_use_expiry_and_restart():
     reg = GatewayAuthorizationRegistry(process_epoch="e1")
     auth = reg.issue("ORD-1", 1, "g1")
     assert reg.verify(auth) is True
-    assert reg.verify_pending_submission() is True
+    # pending verification requires the exact order object
+    assert reg.verify_pending_submission(_order("ORD-1", "MTS_EXIT")) is True
+    assert reg.verify_pending_submission() is False
     assert reg.consume(auth) is True
     assert reg.verify(auth) is False          # single-use
-    assert reg.verify_pending_submission() is False
+    assert reg.verify_pending_submission(_order("ORD-1", "MTS_EXIT")) is False
 
     auth2 = reg.issue("ORD-2", 1, "g1", expiry_ts=time.time() - 1)
     assert reg.verify(auth2) is False          # expired
@@ -166,7 +168,9 @@ def test_verify_pending_binds_exact_order():
     reg.issue("ORD-1", 1, "g1")
     assert reg.verify_pending_submission(_order("ORD-1", "MTS_EXIT")) is True
     assert reg.verify_pending_submission(_order("ORD-2", "MTS_EXIT")) is False
-    assert reg.verify_pending_submission() is True
+    # raw place_order passes no order -> must be rejected
+    assert reg.verify_pending_submission() is False
+    assert reg.verify_pending_submission(None) is False
 
 
 # ── unit: policy matrix ───────────────────────────────────────────────────
@@ -355,6 +359,72 @@ def test_submit_rejected_local_is_terminal():
     assert ok is False and reason == "GATEWAY_RECONCILE_REQUIRED"
 
 
+def test_persist_failure_blocks_adapter():
+    """[audit round2 #1] a failed durable PENDING_SUBMIT must abort BEFORE
+    the adapter: no authorization issued, no submit_callable invocation."""
+    from core.order_intent_gateway import GatewayIntentPersistFailed
+    from core.order_intent_gateway import OrderIntentGateway
+
+    def _failing_record(view):
+        raise GatewayIntentPersistFailed("disk full")
+
+    gw = OrderIntentGateway(process_epoch="e1",
+                            record_cb=_failing_record)
+    calls = []
+
+    def _submit(order):
+        calls.append(order.order_id)
+        order.exchange_order_id = f"BROKER-{order.order_id}"
+        return True
+
+    ok, reason = gw.submit_with_authorization(
+        _order("ORD-PF", "MTS_EXIT"), mode="live",
+        submit_callable=_submit)
+    assert ok is False
+    assert reason == "GATEWAY_INTENT_PERSIST_FAILED"
+    assert calls == []                       # zero adapter/submit calls
+    assert gw.registry.verify_pending_submission(
+        _order("ORD-PF", "MTS_EXIT")) is False  # no auth issued
+
+
+def test_direct_place_order_rejected_during_pending():
+    """[audit round2 #2] raw place_order (no order object) must always be
+    rejected while a live gateway registry is injected."""
+    from core.order_intent_gateway import GatewayAuthorizationRegistry
+    from strategies.futures.squeeze_futures.data.shioaji_client import (
+        AdapterOrderError,
+        ShioajiClient,
+    )
+
+    reg = GatewayAuthorizationRegistry(process_epoch="e1")
+    reg.issue("ORD-1", 1, "g1")          # valid pending order-object window
+    client = ShioajiClient.__new__(ShioajiClient)
+    client._gateway_registry = reg
+    client._execution_context = _live_ctx()
+
+    with pytest.raises(AdapterOrderError) as exc:
+        client.place_order("TMFH6", "Buy", 1)
+    assert exc.value.code == "ADAPTER_GATEWAY_AUTHORIZATION_MISSING"
+
+
+def test_exit_intent_ledger_broker_order_id(tmp_path):
+    """[audit round2 #3] the ledger persists the canonical BROKER identity
+    in broker_order_id — never the local order_id."""
+    from core.exit_intent import IntentLog
+
+    log = IntentLog(log_dir=str(tmp_path))
+    iid = log.create("mts-t1", "COMBINED_EXIT")
+    log.submit_leg(
+        iid, "NEAR", order_mgr=None,
+        submit_fn=lambda cid, leg: {
+            "order_id": "LOCAL-1",
+            "broker_order_id": "BROKER-1",
+        })
+    rec = log.get(iid)
+    assert rec["legs"]["NEAR"]["broker_order_id"] == "BROKER-1"
+    assert rec["legs"]["NEAR"]["broker_order_id"] != "LOCAL-1"
+
+
 def test_submit_paper_unchanged_no_authorization():
     from core.order_intent_gateway import OrderIntentGateway
 
@@ -450,6 +520,7 @@ def _monitor(ctx, adapter=None, mode="live", *, dry_run=False,
     events = []
     monitor._append_mts_event = lambda t, **k: events.append((t, k))
     monitor._save_orders_file_wrapper = lambda: True
+    monitor._persist_execution_context = lambda: None  # isolate ctx file
     if adapter is None:
         adapter = _FakeAdapter()
     monitor.api = adapter
@@ -467,7 +538,9 @@ def _bound_strategy(rid="recon-abc123", trade_id="mts-20260811-085503"):
 
 
 def test_e2e_exit_only_exact_cap_bound_orders_reach_adapter_once(
-        monkeypatch):
+        monkeypatch, tmp_path):
+    import json as _json
+    import os
     from types import SimpleNamespace
     import strategies.futures.monitor as monitor_mod
 
@@ -475,6 +548,8 @@ def test_e2e_exit_only_exact_cap_bound_orders_reach_adapter_once(
     monitor._hydrate_exit_only_position()
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
                         lambda: True)
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
     signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
 
     monitor._submit_mts_order_signal(
@@ -492,6 +567,104 @@ def test_e2e_exit_only_exact_cap_bound_orders_reach_adapter_once(
     assert by_symbol["TMFI6"]["reconciliation_id"] == "recon-abc123"
     # one call per order (no duplicate submits)
     assert [c["order_id"] for c in calls].count(calls[0]["order_id"]) == 1
+
+    # [audit round2 #3] the exit-intent ledger persisted the canonical
+    # BROKER identity in broker_order_id (never the local id)
+    rows = []
+    with open(os.path.join(str(tmp_path), "mts_exit_intent.jsonl"),
+              encoding="utf-8") as f:
+        for line in f:
+            rows.append(_json.loads(line))
+    rec = [r for r in rows
+           if r.get("trade_id") == "mts-20260811-085503"][-1]
+    near_bid = rec["legs"]["NEAR"]["broker_order_id"]
+    far_bid = rec["legs"]["FAR"]["broker_order_id"]
+    assert near_bid.startswith("BROKER-") and far_bid.startswith("BROKER-")
+    assert near_bid != rec["legs"]["NEAR"].get("client_order_id")
+    assert far_bid != rec["legs"]["FAR"].get("client_order_id")
+
+
+def test_e2e_persist_failure_zero_adapter_calls(monkeypatch):
+    """[audit round2 #1 E2E] persistence failure -> typed
+    GATEWAY_INTENT_PERSIST_FAILED -> zero adapter calls (the durable
+    PENDING_SUBMIT was not confirmed)."""
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+    from core.order_intent_gateway import GatewayIntentPersistFailed
+
+    monitor, events = _monitor(_exit_only_ctx())
+    monitor._hydrate_exit_only_position()
+
+    def _fail_persist(view):
+        raise GatewayIntentPersistFailed("disk full")
+
+    monitor._record_gateway_intent = _fail_persist
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+
+    monitor._submit_mts_order_signal(
+        signal, _bound_strategy(), {}, __import__("datetime").datetime.now())
+
+    assert monitor.api.calls == []
+    failed = [e for e in events if e[0] == "ORDER_INTENT_SUBMIT_FAILED"]
+    assert failed and "GATEWAY_INTENT_PERSIST_FAILED" in failed[0][1]["reason"]
+
+
+def test_combined_exit_gateway_failure_quarantines_no_second_leg(
+        monkeypatch, tmp_path):
+    """[audit round2 #4] a failed exit leg (GatewaySubmitError) is caught by
+    the combined-exit branch: typed event, quarantine/reconcile, zero
+    second-leg submission."""
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_exit_only_ctx())
+    monitor._hydrate_exit_only_position()
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
+    submitted = []
+
+    def _sub(order):
+        submitted.append(order.symbol)
+        if order.symbol == "TMFI6":       # far leg rejected locally
+            return False
+        order.exchange_order_id = f"BROKER-{order.order_id}"
+        return True
+
+    monitor.order_mgr.submit = _sub
+    signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+
+    monitor._submit_mts_order_signal(
+        signal, _bound_strategy(), {}, __import__("datetime").datetime.now())
+
+    # near leg submitted exactly once; the far leg never submitted
+    assert submitted == ["TMFH6"]
+    failed = [e for e in events if e[0] == "ORDER_INTENT_SUBMIT_FAILED"]
+    assert failed and "FAR:SUBMIT_REJECTED" in failed[0][1]["reason"]
+
+
+def test_oco_blocked_all_modes():
+    """[audit round2 #5] direct OCO paths fail closed in ALL modes (normal
+    live included) — zero Order construction, zero submit until S9."""
+    from types import SimpleNamespace
+
+    monitor, events = _monitor(_live_ctx())     # normal live
+    submitted = []
+    monitor.paper_fill_sim = SimpleNamespace(register=lambda o: None)
+
+    def _recording_submit(order):
+        submitted.append(order.order_id)
+        return True
+
+    monitor.order_mgr.submit = _recording_submit
+    monitor._reconcile_paper_oco_orders_from_state()
+    monitor._reconcile_paper_oco_orders(_bound_strategy())
+
+    assert submitted == []
+    assert monitor.api.calls == []
 
 
 def test_e2e_entry_and_oco_zero_calls(monkeypatch):
@@ -661,15 +834,15 @@ def test_exit_intent_failed_leg_never_submitted(tmp_path):
     from core.exit_intent import IntentLog
     from core.order_intent_gateway import GatewaySubmitError
 
-    log = IntentLog(log_path=str(tmp_path / "exit_intents.json"))
+    log = IntentLog(log_dir=str(tmp_path))
     iid = log.create("mts-t1", "COMBINED_EXIT")
 
     def _fail(cid, leg):
         raise GatewaySubmitError("SUBMIT_REJECTED")
 
     with pytest.raises(GatewaySubmitError):
-        log.submit_leg(iid, "near", order_mgr=None, submit_fn=_fail)
+        log.submit_leg(iid, "NEAR", order_mgr=None, submit_fn=_fail)
 
-    st = log.get(iid)["legs"]["near"]["status"]
+    st = log.get(iid)["legs"]["NEAR"]["status"]
     assert st == "UNKNOWN"
     assert st != "SUBMITTED"

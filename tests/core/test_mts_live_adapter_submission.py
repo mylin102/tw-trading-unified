@@ -280,6 +280,7 @@ def test_mts_near_rejection_terminally_rejects_unsubmitted_far(monkeypatch):
         requested_mode="live",
         effective_mode=ModeTransitionState.LIVE_READY.value,
         live_order_allowed=True)
+    monitor._persist_execution_context = lambda: None
     monitor.order_mgr = manager
     monitor.paper_fill_sim = None
     monitor.contract = SimpleNamespace(code="TMFH6")
