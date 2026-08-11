@@ -3196,6 +3196,11 @@ class FuturesMonitor:
         if _ctx is not None and getattr(_ctx, "requested_mode", None) == "live":
             from dataclasses import replace
             from core.mode_transition import ModeTransitionState
+            # [S0 verdict P0-2] durable restart-safe marker FIRST: even if
+            # the execution-context persist fails below, the pending
+            # MTS_EXIT_RECONCILE intent keeps the restart gate fail-closed
+            # (never log-only).
+            self._record_reconcile_intent(trade_id, "MTS_EXIT_RECONCILE")
             try:
                 _reasons = list(getattr(_ctx, "audit_reasons", ()) or ())
                 _reasons.append(f"MTS_EXIT_LEG_FAILED:{leg}:{reason}")
@@ -3205,8 +3210,11 @@ class FuturesMonitor:
                     live_order_allowed=False,
                     audit_reasons=tuple(_reasons[-64:]))
                 self._persist_execution_context()
-            except Exception:
-                pass
+            except Exception as _exc:
+                console.print(
+                    f"[red]⚠️ [MTS_EXIT] quarantine persist failed: "
+                    f"{_exc} — durable MTS_EXIT_RECONCILE intent "
+                    f"remains the restart gate[/red]")
         self._append_mts_event(
             "EXIT_ONLY_QUARANTINED", action="COMBINED_EXIT",
             reason=f"{leg}:{reason}", trade_id=trade_id)
@@ -3556,12 +3564,19 @@ class FuturesMonitor:
         """True when a partial MTS entry needs broker reconciliation."""
         return self._pending_reconcile_intent("MTS_ENTRY_RECONCILE")
 
+    def _pending_mts_exit_reconcile(self) -> bool:
+        """True when a combined-exit leg failure needs broker
+        reconciliation (restart read — the canonical exit_intent log)."""
+        return self._pending_reconcile_intent("MTS_EXIT_RECONCILE")
+
     def _pending_reconcile_reason(self):
         """Return the canonical reason that must block re-certification."""
         if self._pending_safety_stop_reconcile():
             return "SAFETY_STOP_RECONCILE_PENDING"
         if self._pending_mts_entry_reconcile():
             return "MTS_ENTRY_RECONCILE_PENDING"
+        if self._pending_mts_exit_reconcile():
+            return "MTS_EXIT_RECONCILE_PENDING"
         return None
 
     def _apply_reconcile_pending_gate(self) -> None:
@@ -9257,6 +9272,14 @@ class FuturesMonitor:
                         "far_entry": float(_disk.get("far_entry", 0)) if _disk else 0,
                     },
                 )
+                # [S0 P1 documented exclusion] normal-live MTS_EMERGENCY
+                # deliberately bypasses the OrderIntentGateway: the
+                # emergency path must be able to fire even when the
+                # gateway/registry is unavailable. It is NOT
+                # gateway-authorized (direct order_mgr.submit below);
+                # protection is the existing execution-context live gate
+                # + adapter gate. EXIT_ONLY is explicitly blocked above
+                # (EXIT_ONLY_EMERGENCY_BLOCKED, zero submit).
                 if _has_pos and self.order_mgr:
                     self._emergency_cmd = {
                         "command_id": _command_id,
@@ -9790,9 +9813,16 @@ class FuturesMonitor:
                         "strategy": "MTS_MANUAL",  # 2026-07-09 Hermes Agent: match near leg MTS_MANUAL tag
                     }
                     if not self._submit_via_gateway(_far_order):
-                        self._append_mts_event(
-                            "ORDER_INTENT_BLOCKED", action="MANUAL_TRADE",
-                            reason="SUBMIT_FAILED", trade_id="")
+                        # [S0 verdict P0-1] near accepted + far failed:
+                        # same containment as the automatic entry — force
+                        # LIVE_QUARANTINED + durable MTS_ENTRY_RECONCILE
+                        # (the restart gate blocks re-certification; the
+                        # accepted near leg keeps its broker receipt and
+                        # is never blindly cancelled).
+                        self._quarantine_mts_entry_partial_submission(
+                            trade_id=_trade_id,
+                            submitted_order=_near_order,
+                            failed_order=_far_order)
                         return
                     self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_far_order))
                     if self.paper_fill_sim:
