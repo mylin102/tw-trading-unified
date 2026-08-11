@@ -99,8 +99,7 @@ class _FakeAdapter:
         })
         order.exchange_order_id = f"BROKER-{order.order_id}"
         from types import SimpleNamespace
-        return SimpleNamespace(exchange_order_id=order.exchange_order_id,
-                               seqno="1")
+        return SimpleNamespace(id=order.exchange_order_id, seqno="1")
 
     def get_contract(self, symbol):
         from types import SimpleNamespace
@@ -521,6 +520,7 @@ def _monitor(ctx, adapter=None, mode="live", *, dry_run=False,
     monitor._append_mts_event = lambda t, **k: events.append((t, k))
     monitor._save_orders_file_wrapper = lambda: True
     monitor._persist_execution_context = lambda: None  # isolate ctx file
+    monitor._record_gateway_intent = lambda dv: None    # isolate durable ledger
     if adapter is None:
         adapter = _FakeAdapter()
     monitor.api = adapter
@@ -613,9 +613,42 @@ def test_e2e_persist_failure_zero_adapter_calls(monkeypatch):
 
 def test_combined_exit_gateway_failure_quarantines_no_second_leg(
         monkeypatch, tmp_path):
-    """[audit round2 #4] a failed exit leg (GatewaySubmitError) is caught by
+    """[audit round2 #4] a failed NEAR leg (GatewaySubmitError) is caught by
     the combined-exit branch: typed event, quarantine/reconcile, zero
-    second-leg submission."""
+    second-leg (FAR) submission."""
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_exit_only_ctx())
+    monitor._hydrate_exit_only_position()
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
+    submitted = []
+
+    def _sub(order):
+        submitted.append(order.symbol)
+        if order.symbol == "TMFH6":       # near leg rejected locally
+            return False
+        order.exchange_order_id = f"BROKER-{order.order_id}"
+        return True
+
+    monitor.order_mgr.submit = _sub
+    signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+
+    monitor._submit_mts_order_signal(
+        signal, _bound_strategy(), {}, __import__("datetime").datetime.now())
+
+    # near leg attempted exactly once; the FAR leg never submitted
+    assert submitted == ["TMFH6"]
+    failed = [e for e in events if e[0] == "ORDER_INTENT_SUBMIT_FAILED"]
+    assert failed and "NEAR:SUBMIT_REJECTED" in failed[0][1]["reason"]
+
+
+def test_combined_exit_far_failure_no_retry(monkeypatch, tmp_path):
+    """[audit round2 #4b] a failed FAR leg is attempted exactly once and
+    never retried — typed event, quarantine/reconcile."""
     from types import SimpleNamespace
     import strategies.futures.monitor as monitor_mod
 
@@ -640,8 +673,8 @@ def test_combined_exit_gateway_failure_quarantines_no_second_leg(
     monitor._submit_mts_order_signal(
         signal, _bound_strategy(), {}, __import__("datetime").datetime.now())
 
-    # near leg submitted exactly once; the far leg never submitted
-    assert submitted == ["TMFH6"]
+    assert submitted == ["TMFH6", "TMFI6"]
+    assert submitted.count("TMFI6") == 1   # no retry
     failed = [e for e in events if e[0] == "ORDER_INTENT_SUBMIT_FAILED"]
     assert failed and "FAR:SUBMIT_REJECTED" in failed[0][1]["reason"]
 
