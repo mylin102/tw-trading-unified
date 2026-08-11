@@ -7,6 +7,7 @@ matching live_broker snapshot the system stays N/A + zero orders.
 """
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +25,9 @@ def _live_ctx():
         requested_mode="live",
         effective_mode=ModeTransitionState.LIVE_READY.value,
         live_order_allowed=True,
+        account_id_hash="a" * 64,
+        session_id="b" * 32,
+        config_hash="c" * 64,
     )
 
 
@@ -31,6 +35,10 @@ def _fresh_snapshot(positions=None, open_orders=None, now_ms=None):
     return {
         "source": "live_broker",
         "captured_at": now_ms if now_ms is not None else int(time.time() * 1000),
+        "account_id_hash": "a" * 64,
+        "session_id": "b" * 32,
+        "config_hash": "c" * 64,
+        "release_sha": "d" * 40,
         "positions": positions if positions is not None else [
             {"code": "TMFH6", "direction": "Sell", "quantity": 1,
              "avg_cost": 44909.0},
@@ -59,7 +67,7 @@ def _valid_attestation(legs=None):
 def test_attestation_missing_fails_closed():
     from core.reconciled_exit import AttestationError, build_exit_only_capability
     with pytest.raises(AttestationError) as exc:
-        build_exit_only_capability(None, _fresh_snapshot())
+        build_exit_only_capability(None, _fresh_snapshot(), ctx=_live_ctx())
     assert exc.value.code == "ATTESTATION_INVALID"
 
 
@@ -68,19 +76,25 @@ def test_attestation_requires_operator_trade_id_and_two_legs():
     att = _valid_attestation()
     att["operator"] = ""
     with pytest.raises(AttestationError) as exc:
-        build_exit_only_capability(att, _fresh_snapshot())
+        build_exit_only_capability(att, _fresh_snapshot(), ctx=_live_ctx())
+    assert exc.value.code == "ATTESTATION_INVALID"
+
+    att = _valid_attestation()
+    att["evidence"] = ""
+    with pytest.raises(AttestationError) as exc:
+        build_exit_only_capability(att, _fresh_snapshot(), ctx=_live_ctx())
     assert exc.value.code == "ATTESTATION_INVALID"
 
     att = _valid_attestation()
     att["trade_id"] = ""
     with pytest.raises(AttestationError) as exc:
-        build_exit_only_capability(att, _fresh_snapshot())
+        build_exit_only_capability(att, _fresh_snapshot(), ctx=_live_ctx())
     assert exc.value.code == "ATTESTATION_INVALID"
 
     att = _valid_attestation()
     att["expected_legs"] = [att["expected_legs"][0]]
     with pytest.raises(AttestationError) as exc:
-        build_exit_only_capability(att, _fresh_snapshot())
+        build_exit_only_capability(att, _fresh_snapshot(), ctx=_live_ctx())
     assert exc.value.code == "ATTESTATION_INVALID"
 
 
@@ -89,7 +103,7 @@ def test_attestation_rejects_secret_material_in_evidence():
     att = _valid_attestation()
     att["evidence"] = "cert PASSWORD=hunter2"
     with pytest.raises(AttestationError) as exc:
-        build_exit_only_capability(att, _fresh_snapshot())
+        build_exit_only_capability(att, _fresh_snapshot(), ctx=_live_ctx())
     assert exc.value.code == "ATTESTATION_SECRET_REJECTED"
 
 
@@ -101,12 +115,12 @@ def test_snapshot_must_be_fresh_live_broker():
     snap = _fresh_snapshot()
     snap["source"] = "paper"
     with pytest.raises(AttestationError) as exc:
-        build_exit_only_capability(_valid_attestation(), snap)
+        build_exit_only_capability(_valid_attestation(), snap, ctx=_live_ctx())
     assert exc.value.code == "SNAPSHOT_SOURCE_INVALID"
 
     snap = _fresh_snapshot(now_ms=int(time.time() * 1000) - 120_000)
     with pytest.raises(AttestationError) as exc:
-        build_exit_only_capability(_valid_attestation(), snap)
+        build_exit_only_capability(_valid_attestation(), snap, ctx=_live_ctx())
     assert exc.value.code == "SNAPSHOT_STALE"
 
 
@@ -114,7 +128,7 @@ def test_open_orders_reject_attestation():
     from core.reconciled_exit import AttestationError, build_exit_only_capability
     snap = _fresh_snapshot(open_orders=[{"ordno": "X1"}])
     with pytest.raises(AttestationError) as exc:
-        build_exit_only_capability(_valid_attestation(), snap)
+        build_exit_only_capability(_valid_attestation(), snap, ctx=_live_ctx())
     assert exc.value.code == "OPEN_ORDERS_NOT_EMPTY"
 
 
@@ -129,7 +143,7 @@ def test_snapshot_leg_mismatch_rejects_attestation():
          "avg_cost": 45052.0},
     ])
     with pytest.raises(AttestationError) as exc:
-        build_exit_only_capability(_valid_attestation(), snap)
+        build_exit_only_capability(_valid_attestation(), snap, ctx=_live_ctx())
     assert exc.value.code == "SNAPSHOT_LEG_MISMATCH"
 
     # extra position
@@ -142,7 +156,7 @@ def test_snapshot_leg_mismatch_rejects_attestation():
          "avg_cost": 44935.0},
     ])
     with pytest.raises(AttestationError) as exc:
-        build_exit_only_capability(_valid_attestation(), snap)
+        build_exit_only_capability(_valid_attestation(), snap, ctx=_live_ctx())
     assert exc.value.code == "SNAPSHOT_LEG_MISMATCH"
 
     # wrong qty
@@ -153,7 +167,7 @@ def test_snapshot_leg_mismatch_rejects_attestation():
          "avg_cost": 45052.0},
     ])
     with pytest.raises(AttestationError) as exc:
-        build_exit_only_capability(_valid_attestation(), snap)
+        build_exit_only_capability(_valid_attestation(), snap, ctx=_live_ctx())
     assert exc.value.code == "SNAPSHOT_LEG_MISMATCH"
 
 
@@ -163,9 +177,15 @@ def test_attestation_success_builds_capability_and_record():
     from core.reconciled_exit import build_exit_only_capability
 
     capability, record = build_exit_only_capability(
-        _valid_attestation(), _fresh_snapshot())
+        _valid_attestation(), _fresh_snapshot(), ctx=_live_ctx())
 
-    assert capability["reconciliation_id"] == "mts-20260811-085503"
+    assert capability["trade_id"] == "mts-20260811-085503"
+    assert capability["reconciliation_id"] != capability["trade_id"]
+    assert capability["account_id_hash"] == "a" * 64
+    assert capability["session_id"] == "b" * 32
+    assert capability["config_hash"] == "c" * 64
+    assert capability["release_sha"] == "d" * 40
+    assert capability["snapshot_hash"] == record["snapshot_hash"]
     # allowed_orders carry the CLOSING sides (cover short / close long)
     assert capability["allowed_orders"] == [
         {"symbol": "TMFH6", "side": "buy", "remaining_qty": 1},
@@ -195,13 +215,13 @@ def test_apply_exit_only_sets_distinct_mode_and_persists_capability():
     )
 
     capability, _ = build_exit_only_capability(
-        _valid_attestation(), _fresh_snapshot())
+        _valid_attestation(), _fresh_snapshot(), ctx=_live_ctx())
     ctx = apply_exit_only(_live_ctx(), capability)
 
     assert ctx.effective_mode == ModeTransitionState.RECONCILED_EXIT_ONLY.value
     assert ctx.effective_mode != ModeTransitionState.LIVE_READY.value
     assert ctx.live_order_allowed is False
-    assert ctx.exit_only_capability["reconciliation_id"] == "mts-20260811-085503"
+    assert ctx.exit_only_capability["reconciliation_id"] == capability["reconciliation_id"]
 
     data = ctx.to_dict()
     assert data["effective_mode"] == "reconciled_exit_only"
@@ -222,7 +242,7 @@ def test_exit_only_without_attestation_is_zero_order():
     )
 
     capability, _ = build_exit_only_capability(
-        _valid_attestation(), _fresh_snapshot())
+        _valid_attestation(), _fresh_snapshot(), ctx=_live_ctx())
     ctx = apply_exit_only(_live_ctx(), capability)
 
     # an exit order WITHOUT the capability stamp is rejected (no stamp:
@@ -270,12 +290,19 @@ def test_exit_order_stamped_with_reconciliation_id_in_exit_only():
     exit_order = manager.create_order(
         symbol="TMFH6", side=OrderSide.BUY, order_type=OrderType.MKP,
         quantity=1, strategy="MTS_EXIT")
-    assert exit_order.reconciliation_id == "mts-20260811-085503"
+    assert exit_order.reconciliation_id == capability["reconciliation_id"]
 
     release_order = manager.create_order(
         symbol="TMFI6", side=OrderSide.SELL, order_type=OrderType.MKP,
         quantity=1, strategy="MTS_RELEASE")
-    assert release_order.reconciliation_id == "mts-20260811-085503"
+    assert release_order.reconciliation_id == capability["reconciliation_id"]
+
+    # OCO requires cancel/update cleanup, which exit-only intentionally
+    # prohibits.  It must never receive a capability stamp.
+    oco = manager.create_order(
+        symbol="TMFH6", side=OrderSide.BUY, order_type=OrderType.MKP,
+        quantity=1, strategy="MTS_RELEASE_OCO")
+    assert oco.reconciliation_id is None
 
     # entry-class orders are NEVER stamped (gate rejects them)
     entry = manager.create_order(
@@ -369,3 +396,44 @@ def test_monitor_attestation_rejected_without_broker(monkeypatch):
     assert monitor._execution_context.effective_mode == \
         ModeTransitionState.LIVE_READY.value
     assert not events
+
+
+def test_capability_rejects_identity_mismatch_future_snapshot_and_bad_position():
+    from core.reconciled_exit import AttestationError, build_exit_only_capability
+
+    snap = _fresh_snapshot()
+    snap["session_id"] = "e" * 32
+    with pytest.raises(AttestationError) as exc:
+        build_exit_only_capability(_valid_attestation(), snap, ctx=_live_ctx())
+    assert exc.value.code == "SNAPSHOT_IDENTITY_MISMATCH"
+
+    snap = _fresh_snapshot(now_ms=int(time.time() * 1000) + 5_000)
+    with pytest.raises(AttestationError) as exc:
+        build_exit_only_capability(_valid_attestation(), snap, ctx=_live_ctx())
+    assert exc.value.code == "SNAPSHOT_STALE"
+
+    snap = _fresh_snapshot(positions=[
+        {"code": "TMFH6", "direction": "Sell", "quantity": "one",
+         "avg_cost": 44909.0},
+        {"code": "TMFI6", "direction": "Buy", "quantity": 1,
+         "avg_cost": 45052.0},
+    ])
+    with pytest.raises(AttestationError) as exc:
+        build_exit_only_capability(_valid_attestation(), snap, ctx=_live_ctx())
+    assert exc.value.code == "SNAPSHOT_LEG_MISMATCH"
+
+
+def test_exit_only_cannot_be_promoted_by_certificate_without_fresh_reconciliation():
+    from core.reconciled_exit import apply_exit_only, build_exit_only_capability
+    from core.live_route_certificate import RuntimeCertificationContext, transition_with_certificate
+
+    capability, _ = build_exit_only_capability(
+        _valid_attestation(), _fresh_snapshot(), ctx=_live_ctx())
+    ctx = apply_exit_only(_live_ctx(), capability)
+    runtime = RuntimeCertificationContext(
+        process_start_id="test", account_hash="a" * 64,
+        near_code="TMFH6", far_code="TMFI6", margin_source=None,
+        session_generation="b" * 32, now_ts="2026-08-11T11:00:00+00:00")
+    result = transition_with_certificate(ctx, object(), object(), runtime=runtime)
+    assert result.effective_mode == ModeTransitionState.LIVE_QUARANTINED.value
+    assert "EXIT_ONLY_RECONCILIATION_REQUIRED" in result.audit_reasons
