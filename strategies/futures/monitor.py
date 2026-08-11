@@ -3044,6 +3044,45 @@ class FuturesMonitor:
             "open_orders": open_orders,
         }
 
+    def _bind_reconciled_exit_identity(self) -> bool:
+        """Bind the *current authenticated* identity while quarantined.
+
+        A non-flat account must fail normal certification and can therefore
+        never reach ``LIVE_READY`` first.  This helper supplies only the
+        account/config/registry bindings needed to validate an independently
+        attested, exact closing capability.  It does not relax any normal
+        gate, does not change the effective mode, and never enables orders.
+        """
+        try:
+            import dataclasses
+            import hashlib
+            from core.live_broker_preflight import _account_hash
+            from core.live_route_certificate import session_registry
+
+            _api = getattr(self, "api", None)
+            _ctx = getattr(self, "_execution_context", None)
+            _acct = getattr(_api, "futopt_account", None)
+            _gen = session_registry.generation(_api) if _api is not None else None
+            if _ctx is None or _acct is None or not _gen:
+                return False
+            _cfg_path = getattr(self, "config_path", "")
+            if not _cfg_path or not os.path.exists(_cfg_path):
+                return False
+            _cfg_hash = hashlib.sha256(Path(_cfg_path).read_bytes()).hexdigest()
+            if not _cfg_hash:
+                return False
+            self._execution_context = dataclasses.replace(
+                _ctx,
+                account_id_hash=_account_hash(_acct),
+                session_id=str(_gen),
+                config_hash=_cfg_hash,
+                live_order_allowed=False,
+            )
+            self._persist_execution_context()
+            return True
+        except Exception:
+            return False
+
     def _operator_attest_exit_only(self, *, operator: str, trade_id: str,
                                    evidence: str = "",
                                    expected_legs=None,
@@ -3062,6 +3101,13 @@ class FuturesMonitor:
             apply_exit_only,
             build_exit_only_capability,
         )
+        _ctx = getattr(self, "_execution_context", None)
+        # LIVE_READY already carries a bound identity.  The actual recovery
+        # case is position quarantine, so bind the same current account and
+        # registry generation before taking its read-only snapshot.
+        if _ctx is None or not _ctx.is_live_ready():
+            if not self._bind_reconciled_exit_identity():
+                return None, "EXIT_ONLY_CONTEXT_INVALID"
         _snap = self._capture_exit_only_snapshot()
         _att = {
             "operator": operator,

@@ -70,8 +70,23 @@ def _parse_attested_at(value: Any) -> str:
 def _require_context(ctx: ExecutionContext | None) -> dict:
     if not isinstance(ctx, ExecutionContext):
         raise AttestationError("EXIT_ONLY_CONTEXT_INVALID", "context required")
+    # Normal entry certification correctly refuses a non-flat account.  That
+    # must not make a manually reconciled position impossible to close.  The
+    # *only* non-LIVE_READY state accepted here is a live quarantine whose
+    # recorded reason is the broker-position gate; every other quarantine
+    # remains a hard stop (release identity, session, margin, etc.).
     if not ctx.is_live_ready():
-        raise AttestationError("EXIT_ONLY_CONTEXT_INVALID", "context not live-ready")
+        reasons = set(ctx.audit_reasons or ())
+        position_quarantine = (
+            ctx.requested_mode == "live"
+            and ctx.effective_mode == ModeTransitionState.LIVE_QUARANTINED.value
+            and not ctx.live_order_allowed
+            and bool(reasons & {"BROKER_NOT_FLAT", "GUARD_POSITION_NOT_FLAT"})
+            and ctx.exit_only_capability is None
+        )
+        if not position_quarantine:
+            raise AttestationError(
+                "EXIT_ONLY_CONTEXT_INVALID", "context not reconcilable")
     account = ctx.account_id_hash or ""
     session = ctx.session_id or ""
     config = ctx.config_hash or ""
