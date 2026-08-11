@@ -100,6 +100,31 @@ def test_flat_snapshot_revokes_capability_to_quarantine_not_live_ready():
     assert record["snapshot_hash"]
 
 
+def test_revoked_context_is_not_preblocked_from_normal_recognition(monkeypatch):
+    import core.live_route_certificate as certificate
+    from core.reconciled_exit import revoke_exit_only_after_flat_snapshot
+
+    revoked, _ = revoke_exit_only_after_flat_snapshot(_exit_ctx(), _snapshot(flat=True))
+    cert = SimpleNamespace(nonce="fresh", session_generation="b" * 32)
+    issuer = SimpleNamespace(
+        peek=lambda nonce: cert,
+        was_consumed=lambda nonce: False,
+        redeem=lambda nonce: None,
+    )
+    runtime = certificate.RuntimeCertificationContext(
+        process_start_id="test", account_hash="a" * 64,
+        near_code="TMFH6", far_code="TMFI6", margin_source=None,
+        session_generation="b" * 32, now_ts="2026-08-11T12:00:00+00:00")
+    # This is deliberately an invalid fresh certificate, but it proves the
+    # old-capability pre-block is gone: normal certificate validation runs.
+    monkeypatch.setattr(certificate, "validate_live_broker_certificate",
+                        lambda *args, **kwargs: (False, ["CERT_EXPECTED"]))
+    result = certificate.transition_with_certificate(
+        revoked, cert, issuer, runtime=runtime)
+    assert "EXIT_ONLY_RECONCILIATION_REQUIRED" not in result.audit_reasons
+    assert result.audit_reasons == ("CERT_EXPECTED",)
+
+
 @pytest.mark.parametrize("bad", [
     lambda: _snapshot(flat=False),
     lambda: _snapshot(flat=True, open_orders=[{"ordno": "open"}]),
