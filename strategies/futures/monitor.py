@@ -3016,7 +3016,16 @@ class FuturesMonitor:
         if _acct is None or not hasattr(_api, "list_trades"):
             return {"source": "unavailable", "capture_error": True}
         try:
-            for _p in (_api.list_positions(_acct) or []):
+            try:
+                _pos_rows = _api.list_positions(_acct)
+            except TypeError:
+                # same SDK signature quirk the preflight guards against
+                _pos_rows = _api.list_positions()
+            try:
+                _trades_rows = _api.list_trades(_acct)
+            except TypeError:
+                _trades_rows = _api.list_trades()
+            for _p in (_pos_rows or []):
                 positions.append({
                     "code": str(getattr(_p, "code", "")),
                     "direction": getattr(
@@ -3025,7 +3034,7 @@ class FuturesMonitor:
                     "quantity": int(getattr(_p, "quantity", 0) or 0),
                     "avg_cost": float(getattr(_p, "price", 0) or 0),
                 })
-            for _t in (_api.list_trades(_acct) or []):
+            for _t in (_trades_rows or []):
                 _st = getattr(getattr(_t, "status", None), "status", "")
                 if str(_st) not in ("Filled", "Cancelled", "Expired", "Done"):
                     open_orders.append({"ordno": getattr(_t, "ordno", None)})
