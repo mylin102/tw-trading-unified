@@ -31,6 +31,25 @@ def _live_ctx():
     )
 
 
+def _position_quarantine_ctx(*, reasons=(
+        "POST_STARTUP_GATE_FAILED", "GUARD_POSITION_NOT_FLAT")):
+    """A live session that is quarantined solely because it has positions.
+
+    Normal certification must reject this state.  It may only obtain the
+    narrower RECONCILED_EXIT_ONLY capability after the operator attests the
+    exact broker snapshot; it must never become generally LIVE_READY here.
+    """
+    return ExecutionContext(
+        requested_mode="live",
+        effective_mode=ModeTransitionState.LIVE_QUARANTINED.value,
+        live_order_allowed=False,
+        account_id_hash="a" * 64,
+        session_id="b" * 32,
+        config_hash="c" * 64,
+        audit_reasons=reasons,
+    )
+
+
 def _fresh_snapshot(positions=None, open_orders=None, now_ms=None):
     return {
         "source": "live_broker",
@@ -206,6 +225,24 @@ def test_attestation_success_builds_capability_and_record():
     joined = str(record).upper()
     for banned in ("PASSWORD", "API_KEY", "PRIVATE KEY"):
         assert banned not in joined
+
+
+def test_attestation_allows_only_position_quarantine_not_general_quarantine():
+    from core.reconciled_exit import AttestationError, build_exit_only_capability
+
+    # This is the real recovery path: normal certification rejects the
+    # non-flat broker account, but the bounded exit capability may be issued.
+    cap, _ = build_exit_only_capability(
+        _valid_attestation(), _fresh_snapshot(), ctx=_position_quarantine_ctx())
+    assert cap["reconciliation_id"]
+
+    # A quarantine caused by a different safety failure cannot be converted
+    # into an exit capability just by supplying an attestation.
+    with pytest.raises(AttestationError) as exc:
+        build_exit_only_capability(
+            _valid_attestation(), _fresh_snapshot(),
+            ctx=_position_quarantine_ctx(reasons=("RELEASE_IDENTITY_MISMATCH",)))
+    assert exc.value.code == "EXIT_ONLY_CONTEXT_INVALID"
 
 
 def test_apply_exit_only_sets_distinct_mode_and_persists_capability():
@@ -426,6 +463,57 @@ def test_monitor_attestation_rejected_without_broker(monkeypatch):
     assert monitor._execution_context.effective_mode == \
         ModeTransitionState.LIVE_READY.value
     assert not events
+
+
+def test_monitor_attestation_hydrates_bound_identity_in_position_quarantine(monkeypatch):
+    """A non-flat startup cannot be LIVE_READY, yet must support only
+    attested exit recovery after binding its current account/session/config.
+    """
+    import hashlib
+    import core.live_route_certificate as certificate
+    from strategies.futures.monitor import FuturesMonitor
+
+    monkeypatch.setenv("LRC_RELEASE_SHA", "d" * 40)
+    api = SimpleNamespace(
+        futopt_account=SimpleNamespace(
+            person_id="person", broker_id="broker", account_id="account"),
+        list_positions=lambda acct: [
+            SimpleNamespace(code="TMFH6", direction=SimpleNamespace(name="Sell"),
+                            quantity=1, price=44909.0),
+            SimpleNamespace(code="TMFI6", direction=SimpleNamespace(name="Buy"),
+                            quantity=1, price=45052.0),
+        ],
+        list_trades=lambda acct: [],
+    )
+    monkeypatch.setattr(certificate.session_registry, "generation",
+                        lambda candidate: "b" * 32)
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.api = api
+    monitor.config_path = "/definitely-not-read-in-this-unit-test"
+    monitor._execution_context = ExecutionContext(
+        requested_mode="live",
+        effective_mode=ModeTransitionState.LIVE_QUARANTINED.value,
+        live_order_allowed=False,
+        audit_reasons=("POST_STARTUP_GATE_FAILED", "GUARD_POSITION_NOT_FLAT"),
+    )
+    monitor._append_mts_event = lambda *args, **kwargs: None
+    monitor._persist_execution_context = lambda: None
+    monitor._bind_reconciled_exit_identity = lambda: (
+        setattr(monitor, "_execution_context", _position_quarantine_ctx(
+            reasons=("POST_STARTUP_GATE_FAILED", "GUARD_POSITION_NOT_FLAT"))) or True)
+
+    record, err = monitor._operator_attest_exit_only(
+        operator="trader", trade_id="mts-20260811-085503",
+        evidence="operator matched current broker positions",
+        expected_legs=[
+            {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1},
+            {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1},
+        ], attested_at="2026-08-11T11:00:00+08:00")
+
+    assert err is None
+    assert record["trade_id"] == "mts-20260811-085503"
+    assert monitor._execution_context.effective_mode == \
+        ModeTransitionState.RECONCILED_EXIT_ONLY.value
 
 
 def test_capability_rejects_identity_mismatch_future_snapshot_and_bad_position():
