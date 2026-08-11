@@ -31,7 +31,7 @@ def _capability():
         "trade_id": "mts-20260811-085503",
         "snapshot_hash": "s" * 64,
         "attestation_hash": "a" * 64,
-        "snapshot_captured_at": 1754991000000,
+        "snapshot_captured_at": int(time.time() * 1000),
         "account_id_hash": "b" * 64,
         "session_id": "c" * 32,
         "config_hash": "d" * 64,
@@ -78,7 +78,8 @@ def _fresh_exit_only_ctx(cap=None):
 
 def _exit_only_ctx():
     return _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
-                live_order_allowed=False, cap=_capability())
+                live_order_allowed=False, cap=_capability(),
+                session_id="c" * 32)
 
 
 def _live_ctx():
@@ -1049,6 +1050,84 @@ def test_s1_exit_only_session_and_future_checks_fail_closed():
         _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
              live_order_allowed=False, cap=future, session_id="c" * 32),
         "EXIT_ONLY_SNAPSHOT_FUTURE", "future")
+
+
+def test_s1_e2e_tick_stale_cap_blocks_risk_gate_direct_submit(
+        monkeypatch, tmp_path):
+    """[S1 final repair] valid capability on tick N permits exactly the
+    bounded exit through the risk-gate direct submit path; on tick N+1 a
+    stale capability blocks that same path — zero adapter call + one
+    typed EXIT_ONLY_HYDRATION_BLOCKED/EXIT_ONLY_SNAPSHOT_STALE event."""
+    from dataclasses import replace
+    from pathlib import Path
+    from types import SimpleNamespace
+    import time as _time
+    import strategies.futures.monitor as monitor_mod
+    from strategies.futures.mts_ledger_authority import (
+        MtsAuthority, MtsAuthorityState)
+    from strategies.futures.monitor import EXIT_ONLY_SNAPSHOT_TTL_MS
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    monitor._ledger_projection.snapshot = lambda: MtsAuthorityState(
+        MtsAuthority.FLAT)
+    monitor._ledger_projection_sync_ts = 0.0
+    monitor._last_mts_tick_mono = None
+    monitor._prev_mts_tick_mono = None
+    monitor._mts_release_orders_flushed = True
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s1_no_state.json"))
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monitor.trader = SimpleNamespace(position=0)
+    monitor._mts_risk_gate_settlement = lambda strategy: False
+    monitor._mts_check_evaluator_lag = lambda strategy, has_pos: None
+    monitor._mts_note_strategy_evaluated = lambda: None
+    monitor._inject_mtf_snapshot = lambda bar: None
+
+    class _Strategy:
+        def init(self, ctx):
+            pass
+
+        def on_bar(self, ctx):
+            return None          # evaluator emits nothing; only the risk
+                                 # gate submit path is under test
+
+        def _reset(self, **kw):
+            pass
+
+    strategy = _Strategy()
+    monitor._registry = {"tmf_spread": strategy}
+    # pre-hydrate so the risk-gate direct submit sees the strategy state
+    assert monitor._exit_only_pre_evaluation_hydration(strategy) is True
+
+    def _preclose(strategy, bar):
+        # simulates the single-leg preclose risk-gate direct submit
+        sig = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+        monitor._submit_mts_order_signal(
+            sig, strategy, bar, __import__("datetime").datetime.now())
+        return False
+
+    monitor._mts_risk_gate_single_leg_preclose = _preclose
+    bar = {"near_close": 44905.0, "far_close": 45038.5, "ts": 1754991000}
+
+    # tick N: valid cap -> the risk-gate submit reaches the adapter
+    monitor._mts_tick(bar)
+    assert len(monitor.api.calls) == 2
+    assert {c["symbol"] for c in monitor.api.calls} == {"TMFH6", "TMFI6"}
+    monitor.api.calls.clear()
+
+    # tick N+1: stale cap -> risk gate blocked, submit zero
+    stale = _fresh_capability()
+    stale["snapshot_captured_at"] = (
+        int(_time.time() * 1000) - EXIT_ONLY_SNAPSHOT_TTL_MS - 1000)
+    monitor._execution_context = replace(
+        monitor._execution_context, exit_only_capability=stale)
+    monitor._mts_tick(bar)
+    assert monitor.api.calls == []
+    blocked = [e for e in events if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"]
+    assert blocked and blocked[-1][1]["reason"] == "EXIT_ONLY_SNAPSHOT_STALE"
 
 
 def test_s1_normal_live_and_paper_untouched():
