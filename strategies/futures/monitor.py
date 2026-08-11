@@ -3382,44 +3382,69 @@ class FuturesMonitor:
                 return False
         return True
 
-    def _exit_only_pre_evaluation_hydration(self, strategy) -> bool:
-        """[S1] EXIT_ONLY: build the strategy position from the validated
-        capability/attested broker snapshot BEFORE every strategy
-        evaluation (never inside submit).  Returns False (the evaluator
-        must be skipped) with an explicit EXIT_ONLY_HYDRATION_BLOCKED
-        event on any missing/stale/session/leg-mismatch/hydration failure
-        — zero strategy order submission.  Idempotent per snapshot hash;
-        refreshes when the hash changes.  Normal LIVE/PAPER flow returns
-        True untouched (never overwrites strategy state)."""
+    def _build_exit_only_authority(self, position):
+        """[S1 repair] capability authority override for the pre/post
+        signal gates: OPEN MtsAuthorityState from the attested legs."""
+        _legs = position.get("legs") or []
+        if len(_legs) != 2:
+            return None
+        _near, _far = _legs[0], _legs[1]
+        from strategies.futures.mts_ledger_authority import (
+            MtsAuthority, MtsAuthorityState)
+        return MtsAuthorityState(
+            status=MtsAuthority.OPEN,
+            trade_id=position["trade_id"],
+            near_qty=_near["quantity"] * (1 if _near["side"] == "buy" else -1),
+            far_qty=_far["quantity"] * (1 if _far["side"] == "buy" else -1),
+            near_side="LONG" if _near["side"] == "buy" else "SHORT",
+            far_side="LONG" if _far["side"] == "buy" else "SHORT",
+            near_entry=_near["avg_cost"],
+            far_entry=_far["avg_cost"],
+            current_trade_id=position["trade_id"],
+        )
+
+    def _validate_exit_only_position(self):
+        """[S1 repair] ONE shared EXIT_ONLY capability validation.
+
+        Called at the start of every _mts_tick (before ANY risk gate /
+        strategy evaluation) and again by _submit_mts_order_signal (risk-
+        gate direct submits consume the SAME rule set — no divergent
+        copies).  Returns (valid, position, reason); on failure emits ONE
+        typed EXIT_ONLY_HYDRATION_BLOCKED event and clears the authority
+        override.  Non-EXIT_ONLY modes return (True, None, None) — Paper /
+        LIVE_READY untouched, and any lingering override is cleared on a
+        mode switch.
+        """
         _ctx = getattr(self, "_execution_context", None)
         if getattr(_ctx, "effective_mode", None) != "reconciled_exit_only":
-            return True
-        # [S1 repair] the capability authority override exists ONLY while
-        # this mode + a validated hydration hold; cleared until revalidated.
+            self._exit_only_auth_override = None
+            return True, None, None
+        # cleared until validated: a stale previous-tick override must
+        # never influence gates
         self._exit_only_auth_override = None
         _cap = getattr(_ctx, "exit_only_capability", None)
         if not isinstance(_cap, dict):
             self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
                                    reason="EXIT_ONLY_CAPABILITY_MISSING")
-            return False
+            return False, None, "EXIT_ONLY_CAPABILITY_MISSING"
         _cap_session = _cap.get("session_id") or ""
         _cur_session = getattr(_ctx, "session_id", "") or ""
         if (not _cap_session or not _cur_session
                 or _cap_session != _cur_session):
             self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
                                    reason="EXIT_ONLY_SESSION_MISMATCH")
-            return False
+            return False, None, "EXIT_ONLY_SESSION_MISMATCH"
         _captured = _cap.get("snapshot_captured_at")
         _now_ms = int(time.time() * 1000)
         if (not isinstance(_captured, int)
                 or _now_ms - _captured > EXIT_ONLY_SNAPSHOT_TTL_MS):
             self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
                                    reason="EXIT_ONLY_SNAPSHOT_STALE")
-            return False
+            return False, None, "EXIT_ONLY_SNAPSHOT_STALE"
         if _captured > _now_ms + 1_000:
             self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
                                    reason="EXIT_ONLY_SNAPSHOT_FUTURE")
-            return False
+            return False, None, "EXIT_ONLY_SNAPSHOT_FUTURE"
         _cached = getattr(self, "_exit_only_position", None)
         if (_cached is None
                 or _cached.get("snapshot_hash")
@@ -3432,7 +3457,7 @@ class FuturesMonitor:
                 self._exit_only_position = None
                 self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
                                        reason=_code)
-                return False
+                return False, None, _code
             self._exit_only_position = _position
             self._append_mts_event(
                 "EXIT_ONLY_POSITION_HYDRATED",
@@ -3446,41 +3471,44 @@ class FuturesMonitor:
         if len(_legs) != 2:
             self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
                                    reason="EXIT_ONLY_LEG_COUNT_INVALID")
-            return False
+            return False, None, "EXIT_ONLY_LEG_COUNT_INVALID"
         _near_code = getattr(getattr(self, "contract", None), "code", None)
         _far_code = getattr(getattr(self, "far_contract", None), "code", None)
         if (_legs[0]["code"] != _near_code or _legs[1]["code"] != _far_code
                 or _legs[0]["side"] == _legs[1]["side"]):
             self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
                                    reason="EXIT_ONLY_LEG_MISMATCH")
-            return False
-        if getattr(self, "_exit_only_strategy_hydrated_hash", None) \
-                == _position["snapshot_hash"]:
+            return False, None, "EXIT_ONLY_LEG_MISMATCH"
+        return True, _position, None
+
+    def _exit_only_pre_evaluation_hydration(self, strategy) -> bool:
+        """[S1] EXIT_ONLY: build the strategy position from the validated
+        capability/attested broker snapshot BEFORE every strategy
+        evaluation (never inside submit).  Consumes the shared
+        _validate_exit_only_position result (no duplicate rules); returns
+        False (evaluator skipped) with one typed blocked event on any
+        failure — zero strategy order submission.  Idempotent per snapshot
+        hash; refreshes when the hash changes.  Normal LIVE/PAPER flow
+        returns True untouched (never overwrites strategy state)."""
+        _ctx = getattr(self, "_execution_context", None)
+        if getattr(_ctx, "effective_mode", None) != "reconciled_exit_only":
             return True
-        if not self._hydrate_strategy_position(strategy):
-            self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
-                                   reason="EXIT_ONLY_STRATEGY_HYDRATION_FAILED")
+        _ok, _position, _reason = self._validate_exit_only_position()
+        if not _ok:
             return False
-        self._exit_only_strategy_hydrated_hash = _position["snapshot_hash"]
-        # [S1 repair] validated capability authority override for the
-        # pre/post signal gates: the local JSONL ledger is FLAT for a
-        # broker-attested manual position and must neither reset the
-        # hydrated strategy nor block capability-bound exits.
-        _near, _far = _legs[0], _legs[1]
-        from strategies.futures.mts_ledger_authority import (
-            MtsAuthority, MtsAuthorityState)
-        self._exit_only_auth_override = MtsAuthorityState(
-            status=MtsAuthority.OPEN,
-            trade_id=_position["trade_id"],
-            near_qty=_near["quantity"] * (1 if _near["side"] == "buy" else -1),
-            far_qty=_far["quantity"] * (1 if _far["side"] == "buy" else -1),
-            near_side="LONG" if _near["side"] == "buy" else "SHORT",
-            far_side="LONG" if _far["side"] == "buy" else "SHORT",
-            near_entry=_near["avg_cost"],
-            far_entry=_far["avg_cost"],
-            current_trade_id=_position["trade_id"],
-        )
+        _legs = _position["legs"]
+        if getattr(self, "_exit_only_strategy_hydrated_hash", None) \
+                != _position["snapshot_hash"]:
+            if not self._hydrate_strategy_position(strategy):
+                self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
+                                       reason="EXIT_ONLY_STRATEGY_HYDRATION_FAILED")
+                return False
+            self._exit_only_strategy_hydrated_hash = \
+                _position["snapshot_hash"]
+        self._exit_only_auth_override = \
+            self._build_exit_only_authority(_position)
         return True
+
 
     def _exit_only_decision_guard(self, action, strategy=None):
         """Thin delegate to the S0 OrderIntentGateway policy."""
@@ -6024,6 +6052,13 @@ class FuturesMonitor:
         # [S0] live authorization moved into OrderIntentGateway policy
         # (merged P0 live / entry / EXIT_ONLY / FLAT).  Gate 2 (paper
         # drain) is paper-path behavior and stays.
+        # [S1 repair] EXIT_ONLY submits consume the SAME shared capability
+        # validation (risk-gate direct submits included) — invalid/stale/
+        # missing => one typed blocked event + zero order submission.
+        _exit_ok, _exit_position, _exit_reason = \
+            self._validate_exit_only_position()
+        if not _exit_ok:
+            return
         _exec_ctx = getattr(self, "_execution_context", None)
         if _exec_ctx is not None:
             # Gate 2: Block new entries during paper drain
@@ -8527,13 +8562,17 @@ class FuturesMonitor:
             self._ledger_projection.sync_from_ledger()
             self._ledger_projection_sync_ts = time.monotonic()
         _auth = self._ledger_projection.snapshot()
-        # [S1 repair] EXIT_ONLY: after a validated pre-evaluation hydration
-        # the capability/attested snapshot IS the position authority — the
-        # legacy local JSONL ledger (FLAT for a broker-attested manual
-        # position) must not reset the hydrated strategy (pre-signal) nor
-        # block capability-bound exits (post-signal).  The override exists
-        # only while this mode + a validated hydration hold; LIVE_READY /
-        # PAPER / local-ledger authority are untouched.
+        # [S1 repair] ONE shared EXIT_ONLY capability validation at tick
+        # start — before ANY risk gate / strategy evaluation.  The
+        # previous tick's authority override is cleared here; when valid,
+        # the capability position IS the authority for the pre/post
+        # signal gates.  Invalid/stale/missing => risk gates, evaluator
+        # and submit all blocked (zero), with one typed blocked event.
+        _exit_ok, _exit_position, _exit_reason = \
+            self._validate_exit_only_position()
+        if _exit_ok and _exit_position is not None:
+            self._exit_only_auth_override = \
+                self._build_exit_only_authority(_exit_position)
         _exit_override = getattr(self, "_exit_only_auth_override", None)
         _gate_auth = _exit_override if _exit_override is not None else _auth
         _gate_state_has_pos = (_authority_has_pos
@@ -8555,7 +8594,7 @@ class FuturesMonitor:
         self._mts_check_evaluator_lag(strategy, _strat_has_pos)
 
         signal = None
-        if _pre_action != MtsGateAction.RESET_STRATEGY:
+        if _pre_action != MtsGateAction.RESET_STRATEGY and _exit_ok:
             # 2026-07-08 Hermes Agent: Risk control gates (settlement > SINGLE_LEG > normal)
             if not self._mts_risk_gate_settlement(strategy):
                 if not self._mts_risk_gate_single_leg_preclose(strategy, _bar_dict):
