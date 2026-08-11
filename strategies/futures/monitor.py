@@ -3000,6 +3000,96 @@ class FuturesMonitor:
         (restart read — the canonical exit_intent log)."""
         return self._pending_reconcile_intent("SAFETY_STOP_RECONCILE")
 
+    def _capture_exit_only_snapshot(self) -> dict:
+        """Fresh read-only broker snapshot for the exit-only attestation.
+
+        Uses the same read methods as the post-startup gate
+        (list_positions / list_trades) - zero place/cancel/update calls.
+        """
+        _api = getattr(self, "api", None)
+        positions, open_orders = [], []
+        captured_at = int(time.time() * 1000)
+        if _api is not None and hasattr(_api, "list_positions"):
+            try:
+                _acct = getattr(_api, "futopt_account", None)
+                if _acct is not None:
+                    for _p in (_api.list_positions(_acct) or []):
+                        positions.append({
+                            "code": str(getattr(_p, "code", "")),
+                            "direction": getattr(
+                                getattr(_p, "direction", None), "name",
+                                None) or str(getattr(_p, "direction", "")),
+                            "quantity": int(
+                                getattr(_p, "quantity", 0) or 0),
+                            "avg_cost": float(
+                                getattr(_p, "price", 0) or 0),
+                        })
+            except Exception:
+                positions = []
+        if _api is not None and hasattr(_api, "list_trades"):
+            try:
+                _acct = getattr(_api, "futopt_account", None)
+                if _acct is not None:
+                    for _t in (_api.list_trades(_acct) or []):
+                        _st = getattr(
+                            getattr(_t, "status", None), "status", "")
+                        if str(_st) not in ("Filled", "Cancelled",
+                                            "Expired", "Done"):
+                            open_orders.append(
+                                {"ordno": getattr(_t, "ordno", None)})
+            except Exception:
+                open_orders = []
+        return {
+            "source": "live_broker",
+            "captured_at": captured_at,
+            "positions": positions,
+            "open_orders": open_orders,
+        }
+
+    def _operator_attest_exit_only(self, *, operator: str, trade_id: str,
+                                   evidence: str = "",
+                                   expected_legs=None,
+                                   attested_at: str = "") -> tuple:
+        """RECONCILED_EXIT_ONLY attestation flow (P0 completion).
+
+        Hard requirement: operator attestation (who/when/evidence, no
+        secrets) + a fresh matching live_broker snapshot.  On success the
+        context transitions to the distinct exit-only mode (never
+        LIVE_READY) and an OPERATOR_ATTESTATION event is emitted; on any
+        failure returns (None, typed_code) - N/A + zero orders.
+        """
+        from datetime import datetime, timezone
+        from core.reconciled_exit import (
+            AttestationError,
+            apply_exit_only,
+            build_exit_only_capability,
+        )
+        _snap = self._capture_exit_only_snapshot()
+        _att = {
+            "operator": operator,
+            "attested_at": attested_at or datetime.now(
+                timezone.utc).isoformat(),
+            "trade_id": trade_id,
+            "evidence": evidence,
+            "expected_legs": list(expected_legs or []),
+        }
+        try:
+            _cap, _record = build_exit_only_capability(_att, _snap)
+        except AttestationError as _exc:
+            console.print(
+                f"[red]⛔ [OPERATOR_ATTESTATION] rejected: "
+                f"{_exc.code}[/red]")
+            return None, _exc.code
+        self._execution_context = apply_exit_only(
+            self._execution_context, _cap)
+        self._persist_execution_context()
+        self._append_mts_event("OPERATOR_ATTESTATION", **_record)
+        console.print(
+            f"[green]✅ [OPERATOR_ATTESTATION] {trade_id} -> "
+            f"RECONCILED_EXIT_ONLY[/green]")
+        return _record, None
+
+
     def _pending_mts_entry_reconcile(self) -> bool:
         """True when a partial MTS entry needs broker reconciliation."""
         return self._pending_reconcile_intent("MTS_ENTRY_RECONCILE")

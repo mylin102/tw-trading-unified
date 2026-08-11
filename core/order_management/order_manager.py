@@ -305,6 +305,19 @@ class OrderManager:
             reconciliation_id=reconciliation_id,
         )
         self.active_orders[order_id] = order
+        # [RECONCILED_EXIT_ONLY] stamp exit-class orders with the active
+        # capability so the adapter gate can authorize them
+        # (default-deny otherwise).  Entry-class orders are never stamped.
+        _exit_ctx = getattr(self, "execution_context", None)
+        _exit_cap = getattr(_exit_ctx, "exit_only_capability", None)
+        if (_exit_ctx is not None
+                and getattr(_exit_ctx, "effective_mode", None)
+                == "reconciled_exit_only"
+                and isinstance(_exit_cap, dict)
+                and strategy in ("MTS_EXIT", "MTS_RELEASE",
+                                 "MTS_RELEASE_OCO")
+                and isinstance(_exit_cap.get("reconciliation_id"), str)):
+            order.reconciliation_id = _exit_cap["reconciliation_id"]
         return order
 
     def _resolve_order(

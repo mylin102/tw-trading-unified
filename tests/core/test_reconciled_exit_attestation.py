@@ -215,6 +215,7 @@ def test_apply_exit_only_sets_distinct_mode_and_persists_capability():
 # ── capability without attestation: N/A + zero orders ─────────────────────
 
 def test_exit_only_without_attestation_is_zero_order():
+    from core.order_management.order import Order
     from core.reconciled_exit import (
         apply_exit_only,
         build_exit_only_capability,
@@ -224,21 +225,32 @@ def test_exit_only_without_attestation_is_zero_order():
         _valid_attestation(), _fresh_snapshot())
     ctx = apply_exit_only(_live_ctx(), capability)
 
-    # an unstamped exit order is rejected (reconciliation_id mismatch)
-    manager = OrderManager(mode="live", execution_context=ctx)
-    order = manager.create_order(
+    # an exit order WITHOUT the capability stamp is rejected (no stamp:
+    # the order did not originate from create_order in exit-only mode)
+    order = Order(
         symbol="TMFH6", side=OrderSide.BUY, order_type=OrderType.MKP,
         quantity=1, strategy="MTS_EXIT")
     with pytest.raises(LiveOrderBlocked) as exc:
         ctx.assert_order_allowed(order, method="place_order")
     assert "RECONCILIATION_ID" in str(exc.value.reason)
 
-    # an entry order is always rejected in exit-only
-    entry = manager.create_order(
-        symbol="TMFH6", side=OrderSide.SELL, order_type=OrderType.MKP,
-        quantity=1, strategy="MTS_ENTRY")
+    # a wrongly-stamped exit order is rejected too
+    wrong = Order(
+        symbol="TMFH6", side=OrderSide.BUY, order_type=OrderType.MKP,
+        quantity=1, strategy="MTS_EXIT", reconciliation_id="other-trade")
     with pytest.raises(LiveOrderBlocked) as exc:
-        ctx.assert_order_allowed(entry, method="place_order")
+        ctx.assert_order_allowed(wrong, method="place_order")
+    assert "RECONCILIATION_ID" in str(exc.value.reason)
+
+    # a stamped order with a NON-exit strategy is rejected (strategy gate:
+    # check order is rid -> strategy -> scope, so the entry must be stamped
+    # first to reach the strategy branch)
+    stamped_entry = Order(
+        symbol="TMFH6", side=OrderSide.SELL, order_type=OrderType.MKP,
+        quantity=1, strategy="MTS_ENTRY",
+        reconciliation_id=capability["reconciliation_id"])
+    with pytest.raises(LiveOrderBlocked) as exc:
+        ctx.assert_order_allowed(stamped_entry, method="place_order")
     assert "STRATEGY_BLOCKED" in str(exc.value.reason)
 
 
