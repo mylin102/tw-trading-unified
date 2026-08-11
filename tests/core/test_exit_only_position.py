@@ -67,12 +67,14 @@ def _live_ctx():
 
 
 def _bbo_slots(now=None):
-    ts = now if now is not None else time.time()
+    ts_ms = int((now if now is not None else time.time()) * 1000)
     return {
-        "TMF": {"bid": 44900.0, "ask": 44910.0, "bidask_at": ts,
-                "code": "TMFH6"},
-        "TMF_FAR": {"bid": 45040.0, "ask": 45060.0, "bidask_at": ts,
-                    "code": "TMFI6"},
+        "TMF": {"code": "TMFH6", "bid": 44900.0, "ask": 44910.0,
+                "exchange_ts_ms": ts_ms, "received_at_ms": ts_ms,
+                "source": "shioaji_bidask"},
+        "TMF_FAR": {"code": "TMFI6", "bid": 45040.0, "ask": 45060.0,
+                    "exchange_ts_ms": ts_ms, "received_at_ms": ts_ms,
+                    "source": "shioaji_bidask"},
     }
 
 
@@ -148,8 +150,9 @@ def test_bbo_binding_missing_stale_ambiguous():
     assert build_bbo_binding(
         {"near": {}, "far": {}}, **_s2_kwargs())[1] == "BBO_MISSING"
     assert build_bbo_binding({
-        "near": {"bid": 1, "ask": 2, "bidask_at": time.time(),
-                 "code": "TMFH6"},
+        "near": {"bid": 1, "ask": 2,
+                 "exchange_ts_ms": int(time.time() * 1000),
+                 "code": "TMFH6", "source": "shioaji_bidask"},
         "far": {},
     }, **_s2_kwargs())[1] == "BBO_MISSING"
     assert build_bbo_binding(
@@ -171,33 +174,40 @@ def test_bbo_binding_s2_hardening():
     # future-stamped (beyond 1s)
     fut = _pure_bbo_slots(now=time.time() + 5)
     assert build_bbo_binding(fut, **kw)[1] == "BBO_FUTURE"
-    # cross-leg skew > 1s (far older by 2s, within its own TTL)
+    # cross-leg skew > 1s on EXCHANGE timestamps (far older by 2s)
     skew = _pure_bbo_slots()
-    skew["far"]["bidask_at"] = time.time() - 2
+    skew["far"]["exchange_ts_ms"] = int(time.time() * 1000) - 2000
     assert build_bbo_binding(skew, **kw)[1] == "BBO_SKEW"
     # exact contract code mismatch
     wrong = _pure_bbo_slots()
     wrong["near"]["code"] = "TMFZ6"
     assert build_bbo_binding(wrong, **kw)[1] == "BBO_CODE_MISMATCH"
+    # source must be the validated bidask source
+    src = _pure_bbo_slots()
+    src["near"]["source"] = "tick"
+    assert build_bbo_binding(src, **kw)[1] == "BBO_SOURCE_MISMATCH"
     # mixed identity: missing field
     noid = _s2_kwargs(identity={"reconciliation_id": "x"})
     assert build_bbo_binding(_pure_bbo_slots(), **noid)[1] \
         == "BBO_IDENTITY_MISSING"
     # non-finite exchange ts -> fail-closed BBO_STALE, never a crash
     nan = _pure_bbo_slots()
-    nan["near"]["bidask_at"] = float("nan")
+    nan["near"]["exchange_ts_ms"] = float("nan")
     assert build_bbo_binding(nan, **kw)[1] == "BBO_STALE"
-    # valid: version-2 hash binds raw quotes + symbols + identity
+    # valid: version-2 hash + raw payload bind quotes/source/identity
     binding, reason = build_bbo_binding(_pure_bbo_slots(), **kw)
     assert reason is None
     assert binding["bbo_hash"] and binding["bbo_captured_at"] > 0
     import json as _json
+    _ts = binding["bbo_captured_at"]
     _payload = _json.dumps(
         {"version": 2,
          "near": {"symbol": "TMFH6", "bid": 44900.0, "ask": 44910.0,
-                  "exchange_ts": binding["bbo_captured_at"]},
+                  "exchange_ts": _ts, "received_at_ms": _ts,
+                  "source": "shioaji_bidask", "seq": None},
          "far": {"symbol": "TMFI6", "bid": 45040.0, "ask": 45060.0,
-                 "exchange_ts": binding["bbo_captured_at"]},
+                 "exchange_ts": _ts, "received_at_ms": _ts,
+                 "source": "shioaji_bidask", "seq": None},
          "reconciliation_id": "recon-abc123", "snapshot_hash": "s" * 64,
          "config_hash": "d" * 64, "release_sha": "e" * 40,
          "session_id": "c" * 32},
@@ -205,6 +215,8 @@ def test_bbo_binding_s2_hardening():
     import hashlib as _hl
     assert binding["bbo_hash"] == _hl.sha256(
         _payload.encode()).hexdigest()
+    # the raw payload is persisted with the binding (reproducible evidence)
+    assert binding["bbo_payload"] == _json.loads(_payload)
 
 
 def test_attach_decision_binding():
@@ -231,6 +243,10 @@ def _monitor(ctx, slots=None):
     monitor = FuturesMonitor.__new__(FuturesMonitor)
     monitor._execution_context = ctx
     monitor.market_data = dict(slots or {})
+    monitor._exit_only_bbo_cache = {
+        "near": dict((slots or {}).get("TMF") or {}),
+        "far": dict((slots or {}).get("TMF_FAR") or {}),
+    }
     monitor.ticker = "TMF"
     monitor.contract = SimpleNamespace(code="TMFH6")
     monitor.far_contract = SimpleNamespace(code="TMFI6")

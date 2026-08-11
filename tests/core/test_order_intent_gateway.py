@@ -92,12 +92,14 @@ def _quarantined_ctx():
 
 
 def _bbo_slots(now=None):
-    ts = now if now is not None else time.time()
+    ts_ms = int((now if now is not None else time.time()) * 1000)
     return {
-        "TMF": {"bid": 44900.0, "ask": 44910.0, "bidask_at": ts,
-                "code": "TMFH6"},
-        "TMF_FAR": {"bid": 45040.0, "ask": 45060.0, "bidask_at": ts,
-                    "code": "TMFI6"},
+        "TMF": {"code": "TMFH6", "bid": 44900.0, "ask": 44910.0,
+                "exchange_ts_ms": ts_ms, "received_at_ms": ts_ms,
+                "source": "shioaji_bidask"},
+        "TMF_FAR": {"code": "TMFI6", "bid": 45040.0, "ask": 45060.0,
+                    "exchange_ts_ms": ts_ms, "received_at_ms": ts_ms,
+                    "source": "shioaji_bidask"},
     }
 
 
@@ -520,6 +522,10 @@ def _monitor(ctx, adapter=None, mode="live", *, dry_run=False,
     monitor = FuturesMonitor.__new__(FuturesMonitor)
     monitor._execution_context = ctx
     monitor.market_data = dict(_bbo_slots())
+    monitor._exit_only_bbo_cache = {
+        "near": dict(_bbo_slots()["TMF"]),
+        "far": dict(_bbo_slots()["TMF_FAR"]),
+    }
     monitor.ticker = "TMF"
     monitor.contract = SimpleNamespace(code="TMFH6")
     monitor.far_contract = SimpleNamespace(code="TMFI6")
@@ -768,7 +774,10 @@ def test_s2_exit_only_bad_bbo_dimension_zero_submit(monkeypatch):
 
     def _drive(slots, trade_id):
         monitor, events = _monitor(_fresh_exit_only_ctx())
-        monitor.market_data = dict(slots)
+        monitor._exit_only_bbo_cache = {
+            "near": dict(slots.get("TMF") or {}),
+            "far": dict(slots.get("TMF_FAR") or {}),
+        }
         monitor._hydrate_exit_only_position()
         monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
                             lambda: True)
@@ -799,20 +808,26 @@ def test_s2_exit_only_bad_bbo_dimension_zero_submit(monkeypatch):
 
     _expect_blocked(lambda s: s.pop("TMF"), "BBO_MISSING", 1)
     _expect_blocked(
-        lambda s: s["TMF"].update(bidask_at=_time.time() - 60),
+        lambda s: s["TMF"].update(exchange_ts_ms=(
+            int(_time.time() * 1000) - 60000)),
         "BBO_STALE", 2)
     _expect_blocked(
-        lambda s: s["TMF"].update(bidask_at=_time.time() + 5),
+        lambda s: s["TMF"].update(exchange_ts_ms=(
+            int(_time.time() * 1000) + 5000)),
         "BBO_FUTURE", 3)
     _expect_blocked(
-        lambda s: s["TMF_FAR"].update(bidask_at=_time.time() - 2),
+        lambda s: s["TMF_FAR"].update(exchange_ts_ms=(
+            int(_time.time() * 1000) - 2000)),
         "BBO_SKEW", 4)
     _expect_blocked(
         lambda s: s["TMF"].update(code="TMFZ6"),
         "BBO_CODE_MISMATCH", 5)
     _expect_blocked(
+        lambda s: s["TMF"].update(source="tick"),
+        "BBO_SOURCE_MISMATCH", 6)
+    _expect_blocked(
         lambda s: s["TMF"].update(bid=44920.0),
-        "BBO_AMBIGUOUS", 6)
+        "BBO_AMBIGUOUS", 7)
 
 
 def test_s2_exit_only_mixed_identity_zero_submit(monkeypatch):
@@ -840,6 +855,142 @@ def test_s2_exit_only_mixed_identity_zero_submit(monkeypatch):
     blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
     assert blocked and blocked[-1][1].get("reason") \
         == "BBO_IDENTITY_MISSING"
+
+
+def test_s2_repair_on_bidask_evidence_survives_ticks(monkeypatch):
+    """[S2 repair] dedicated BBO evidence cache: valid on_bidask writes
+    {code, bid, ask, exchange_ts_ms, received_at_ms, source, seq} per
+    leg; a subsequent tick neither creates nor overwrites it; the binding
+    stays valid and the capability-bound exits reach the adapter."""
+    from types import SimpleNamespace
+    from datetime import datetime
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    monitor._canonical_near_codes = {"TMFH6"}
+    monitor._canonical_far_codes = {"TMFI6"}
+    monitor._f_shadow = lambda: None   # tick processed (early collector)
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+
+    _now = datetime.now()
+    monitor.on_bidask(None, SimpleNamespace(
+        code="TMFH6", bid_price=[44900.0], ask_price=[44910.0],
+        datetime=_now, seq=101))
+    monitor.on_bidask(None, SimpleNamespace(
+        code="TMFI6", bid_price=[45040.0], ask_price=[45060.0],
+        datetime=_now, seq=202))
+
+    cache = monitor._exit_only_bbo_cache
+    assert cache["near"]["code"] == "TMFH6"
+    assert cache["near"]["source"] == "shioaji_bidask"
+    assert isinstance(cache["near"]["exchange_ts_ms"], int)
+    assert cache["near"]["exchange_ts_ms"] > 0
+    assert cache["near"]["seq"] == 101
+    assert cache["far"]["code"] == "TMFI6"
+
+    def _submit(tid):
+        signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+        monitor._submit_mts_order_signal(
+            signal, _bound_strategy(trade_id=tid), {}, datetime.now())
+
+    _submit("mts-s2r-1")
+    assert len(monitor.api.calls) == 2
+    assert monitor._exit_only_decision_binding["bbo_hash"]
+    assert monitor._exit_only_decision_binding["bbo_payload"]
+    monitor.api.calls.clear()
+
+    # a tick update neither creates nor overwrites EXIT_ONLY BBO evidence
+    monitor.on_tick(None, SimpleNamespace(code="TMFH6", close=44905.0))
+    assert monitor._exit_only_bbo_cache == cache
+
+    # the binding is unchanged and still valid (authorize level; the
+    # order manager has already issued the single combined exit)
+    _ok, _binding, _reason = monitor._authorize_intent(
+        "EXIT", "MTS_EXIT", _bound_strategy(trade_id="mts-s2r-2"))
+    assert _ok is True and _reason is None
+    assert _binding and _binding["bbo_hash"]
+
+
+def test_s2_repair_tick_only_rejected(monkeypatch):
+    """[S2 repair] ticks alone never satisfy the BBO contract — no
+    on_bidask evidence => BBO_MISSING, zero adapter submission."""
+    from types import SimpleNamespace
+    from datetime import datetime
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    monitor._canonical_near_codes = {"TMFH6"}
+    monitor._canonical_far_codes = {"TMFI6"}
+    monitor._f_shadow = lambda: None
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monitor._exit_only_bbo_cache = {}   # no bidask evidence arrived
+    monitor.on_tick(None, SimpleNamespace(code="TMFH6", close=44905.0))
+    assert not getattr(monitor, "_exit_only_bbo_cache", None)
+
+    signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+    monitor._submit_mts_order_signal(
+        signal, _bound_strategy(trade_id="mts-s2r-tick-only"), {},
+        datetime.now())
+    assert monitor.api.calls == []
+    blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
+    assert blocked and blocked[-1][1].get("reason") == "BBO_MISSING"
+
+
+def test_s2_repair_raw_payload_persisted_in_events(monkeypatch):
+    """[S2 repair] the versioned raw evidence payload rides the decision
+    events (not just the hash): submitted orders carry bbo_payload; a
+    blocked decision carries the raw bbo_evidence slots."""
+    from types import SimpleNamespace
+    from datetime import datetime
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    monitor._canonical_near_codes = {"TMFH6"}
+    monitor._canonical_far_codes = {"TMFI6"}
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    _now = datetime.now()
+    monitor.on_bidask(None, SimpleNamespace(
+        code="TMFH6", bid_price=[44900.0], ask_price=[44910.0],
+        datetime=_now, seq=101))
+    monitor.on_bidask(None, SimpleNamespace(
+        code="TMFI6", bid_price=[45040.0], ask_price=[45060.0],
+        datetime=_now, seq=202))
+
+    def _submit(tid):
+        signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+        monitor._submit_mts_order_signal(
+            signal, _bound_strategy(trade_id=tid), {}, datetime.now())
+
+    # submitted decision events carry the raw payload
+    _submit("mts-s2r-p-1")
+    submitted = [e for e in events if e[0] == "ORDER_SUBMITTED"]
+    assert submitted
+    payload = submitted[0][1].get("bbo_payload")
+    assert payload and payload["version"] == 2
+    assert payload["near"]["symbol"] == "TMFH6"
+    assert payload["near"]["bid"] == 44900.0
+    assert payload["near"]["source"] == "shioaji_bidask"
+    assert payload["far"]["symbol"] == "TMFI6"
+    assert submitted[0][1].get("bbo_hash")
+    monitor.api.calls.clear()
+
+    # blocked decision event carries the raw evidence slots
+    monitor._exit_only_bbo_cache = {
+        "near": dict(monitor._exit_only_bbo_cache["near"],
+                     exchange_ts_ms=int(
+                         __import__("time").time() * 1000) - 60000),
+        "far": dict(monitor._exit_only_bbo_cache["far"]),
+    }
+    _submit("mts-s2r-p-2")
+    assert monitor.api.calls == []
+    blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
+    assert blocked and blocked[-1][1].get("reason") == "BBO_STALE"
+    evidence = blocked[-1][1].get("bbo_evidence")
+    assert evidence and evidence["near"]["code"] == "TMFH6"
+    assert evidence["near"]["source"] == "shioaji_bidask"
 
 
 def test_s1_exit_only_pre_eval_hydrates_before_evaluator():
