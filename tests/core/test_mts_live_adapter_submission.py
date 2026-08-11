@@ -1,5 +1,7 @@
 """Regression coverage for the live MTS order-manager adapter boundary."""
 
+import json
+import time
 from types import SimpleNamespace
 
 from core.order_management.order import OrderSide, OrderStatus, OrderType
@@ -356,3 +358,80 @@ def test_adapter_login_uses_futopt_owner_for_ca(monkeypatch):
         "ca_passwd": "password",
         "person_id": "FUTOPT_OWNER",
     }]
+
+
+def test_futures_deal_callback_marks_live_order_filled_and_emits_fill():
+    """A broker FuturesDeal must reach the futures lifecycle, not options only."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    manager = OrderManager(mode="paper")
+    order = _new_order(manager)
+    manager.attach_submission(
+        order.order_id,
+        broker_order_id="BRK-1",
+        ordno="ORDNO-1",
+        raw_status="Submitted",
+    )
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.order_mgr = manager
+    monitor._pending_lifecycle_orders = {}
+    monitor._apply_confirmed_futures_deal = lambda event: "MTS_LEG_FILL"
+    monitor._save_orders_file_wrapper = lambda: None
+    monitor._wire_order_callbacks()
+
+    monitor.on_order_event("FuturesDeal", {
+        "code": "TMFH6", "action": "Sell", "price": 44762,
+        "quantity": 1, "id": "BRK-1", "ordno": "ORDNO-1",
+        "trade_id": "DEAL-1", "status": "Filled",
+    })
+
+    assert order.status is OrderStatus.FILLED
+    assert order.filled_quantity == 1
+    assert order.fills[0].deal_id == "DEAL-1"
+    assert order.order_id not in manager.active_orders
+
+
+def test_futures_deal_callback_matches_seqno_only_receipt():
+    """A deal callback may carry only seqno; it still has to close the order."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    manager = OrderManager(mode="paper")
+    order = _new_order(manager)
+    manager.attach_submission(order.order_id, seqno="SEQ-1", raw_status="Submitted")
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.order_mgr = manager
+
+    monitor.on_order_event("FuturesDeal", {
+        "code": "TMFH6", "action": "Sell", "price": 44762,
+        "quantity": 1, "seqno": "SEQ-1", "trade_id": "DEAL-SEQ",
+    })
+
+    assert order.status is OrderStatus.FILLED
+    assert order.fills[0].deal_id == "DEAL-SEQ"
+
+
+def test_manual_spread_is_refused_while_automatic_mts_entry_is_in_flight(tmp_path):
+    """Manual entry cannot overlap a submitted automatic MTS entry."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    manager = OrderManager(mode="paper")
+    automatic = _new_order(manager)
+    manager.attach_submission(automatic.order_id, ordno="AUTO-1", raw_status="Submitted")
+    flag_path = tmp_path / "manual.flag"
+    flag_path.write_text(json.dumps({
+        "action": "spread", "side": "SELL_NEAR_BUY_FAR", "created_at": time.time(),
+    }))
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.manual_trade_flag_path = str(flag_path)
+    monitor._processed_flag_ids = set()
+    monitor._flag_retry_count = 0
+    monitor._manual_trade_status = "READY"
+    monitor.order_mgr = manager
+    monitor.cfg = {"mts": {"flag_ttl_seconds": 999999999}}
+
+    assert monitor._process_manual_trade_flag() is True
+    assert monitor._manual_trade_status == "SKIPPED: PENDING_MTS_ORDER_EXISTS"
+    assert not flag_path.exists()
+    assert not (tmp_path / "manual.flag.processing").exists()
+    assert automatic.status is OrderStatus.SUBMITTED
