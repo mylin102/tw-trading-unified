@@ -82,6 +82,27 @@ const baseEnv = {
   NODE_ENV: 'production',
 };
 if (pythonBin) baseEnv.TRADING_PYTHON_BIN = pythonBin;
+
+// PM2 app-level `env` is an explicit environment, not a safe implicit
+// inheritance of the shell that ran `pm2 start`.  Pass only the broker
+// credentials required by the Python live-login path; do not spread all of
+// process.env (which could accidentally expose unrelated secrets).  A
+// production deployment without any one of these values fails before PM2
+// starts the trading process.
+const brokerCredentialNames = [
+  'SHIOAJI_API_KEY',
+  'SHIOAJI_SECRET_KEY',
+  'SHIOAJI_CA_PATH',
+  'SHIOAJI_CA_PASSWD',
+];
+if (isProduction) {
+  for (const name of brokerCredentialNames) {
+    if (!process.env[name]) {
+      throw new Error(`${name} is REQUIRED in production (fail-closed)`);
+    }
+    baseEnv[name] = process.env[name];
+  }
+}
 // Deploy-time release identity: the release-identity gate reads the
 // literal full SHA from the process env — pass it through untouched.
 if (process.env.LRC_RELEASE_SHA) {
