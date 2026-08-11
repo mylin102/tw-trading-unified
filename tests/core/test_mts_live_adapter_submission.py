@@ -276,7 +276,10 @@ def test_mts_near_rejection_terminally_rejects_unsubmitted_far(monkeypatch):
     manager.submit = reject_near
     monitor = FuturesMonitor.__new__(FuturesMonitor)
     monitor.live_trading = True
-    monitor._execution_context = None
+    monitor._execution_context = ExecutionContext(
+        requested_mode="live",
+        effective_mode=ModeTransitionState.LIVE_READY.value,
+        live_order_allowed=True)
     monitor.order_mgr = manager
     monitor.paper_fill_sim = None
     monitor.contract = SimpleNamespace(code="TMFH6")

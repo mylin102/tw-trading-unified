@@ -4,6 +4,12 @@ E2E against a fake adapter: exact exit-only reaches adapter once;
 entry/manual/generic/OCO zero calls; direct adapter / no authorization
 rejected; PENDING_SUBMIT receipt missing -> PENDING_RECONCILE no retry;
 normal LIVE entry retains behavior; paper unchanged.
+
+S0 audit fixes: registry injected into the actual broker_adapter (real
+monitor->OrderManager->ShioajiClient chain); authorization bound to the
+exact order; restart/new gateway replays durable intents and never
+resubmits; live quarantine explicitly denied (never paper); OCO direct
+paths blocked in EXIT_ONLY; exit-intent failed leg never SUBMITTED.
 """
 
 import time
@@ -43,21 +49,27 @@ def _capability():
     }
 
 
-def _exit_only_ctx():
+def _ctx(mode, live_order_allowed=False, cap=None):
     return ExecutionContext(
         requested_mode="live",
-        effective_mode=ModeTransitionState.RECONCILED_EXIT_ONLY.value,
-        live_order_allowed=False,
-        exit_only_capability=_capability(),
+        effective_mode=mode,
+        live_order_allowed=live_order_allowed,
+        exit_only_capability=cap,
     )
+
+
+def _exit_only_ctx():
+    return _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
+                live_order_allowed=False, cap=_capability())
 
 
 def _live_ctx():
-    return ExecutionContext(
-        requested_mode="live",
-        effective_mode=ModeTransitionState.LIVE_READY.value,
-        live_order_allowed=True,
-    )
+    return _ctx(ModeTransitionState.LIVE_READY.value, live_order_allowed=True)
+
+
+def _quarantined_ctx():
+    return _ctx(ModeTransitionState.LIVE_QUARANTINED.value,
+                live_order_allowed=False)
 
 
 def _bbo_slots(now=None):
@@ -77,7 +89,7 @@ class _FakeAdapter:
 
     def place_order_object(self, order):
         reg = getattr(self, "_gateway_registry", None)
-        if reg is not None and not reg.verify_pending_submission():
+        if reg is not None and not reg.verify_pending_submission(order):
             raise RuntimeError("ADAPTER_GATEWAY_AUTHORIZATION_MISSING")
         self.calls.append({
             "order_id": order.order_id, "symbol": order.symbol,
@@ -146,6 +158,17 @@ def test_authorization_fingerprint_only():
     assert "ORD-1" not in fp
 
 
+def test_verify_pending_binds_exact_order():
+    """[audit #2] a different order during a valid pending window rejects."""
+    from core.order_intent_gateway import GatewayAuthorizationRegistry
+
+    reg = GatewayAuthorizationRegistry(process_epoch="e1")
+    reg.issue("ORD-1", 1, "g1")
+    assert reg.verify_pending_submission(_order("ORD-1", "MTS_EXIT")) is True
+    assert reg.verify_pending_submission(_order("ORD-2", "MTS_EXIT")) is False
+    assert reg.verify_pending_submission() is True
+
+
 # ── unit: policy matrix ───────────────────────────────────────────────────
 
 def test_policy_matrix_live_and_exit_only():
@@ -159,7 +182,7 @@ def test_policy_matrix_live_and_exit_only():
         authority={"live": False})
     assert ok is True and binding is None and reason is None
 
-    # non-ready live mode blocked
+    # live quarantined explicitly denied — never paper-pass-through
     ok, _, reason = gw.authorize_intent(
         action="EXIT", strategy="MTS_EXIT",
         authority={"live": True, "mode": "live_quarantined",
@@ -275,6 +298,63 @@ def test_submit_receipt_missing_pending_reconcile_no_retry():
     assert ok is False and reason == "GATEWAY_RECONCILE_REQUIRED"
 
 
+def test_restart_new_gateway_cannot_resubmit():
+    """[audit #3] durable intents replay across restart; PENDING_RECONCILE
+    and crash-mid-submit (PENDING_SUBMIT) are never resubmitted."""
+    from core.order_intent_gateway import OrderIntentGateway
+
+    def _no_receipt(order):
+        return True
+
+    records = []
+    gw1 = OrderIntentGateway(process_epoch="e1", record_cb=records.append)
+    ok, reason = gw1.submit_with_authorization(
+        _order("ORD-1", "MTS_EXIT"), mode="live",
+        submit_callable=_no_receipt)
+    assert ok is False and reason == "GATEWAY_RECEIPT_MISSING_RECONCILE"
+    assert records, "durable record_cb must have fired"
+    durable = gw1.durable_view()
+    assert durable["ORD-1"]["state"] == "PENDING_RECONCILE"
+
+    # restart: fresh gateway replays the durable ledger -> refuses resubmit
+    gw2 = OrderIntentGateway(process_epoch="e2", durable_intents=durable)
+    ok, reason = gw2.submit_with_authorization(
+        _order("ORD-1", "MTS_EXIT"), mode="live",
+        submit_callable=_no_receipt)
+    assert ok is False and reason == "GATEWAY_RECONCILE_REQUIRED"
+
+    # crash mid-submit: durable PENDING_SUBMIT -> restart must NOT resubmit
+    gw3 = OrderIntentGateway(process_epoch="e3", durable_intents={
+        "ORD-2": {"state": "PENDING_SUBMIT", "execution_attempt": 0,
+                  "strategy": "MTS_EXIT", "reconciliation_id": None,
+                  "session_generation": ""}})
+    ok, reason = gw3.submit_with_authorization(
+        _order("ORD-2", "MTS_EXIT"), mode="live",
+        submit_callable=_no_receipt)
+    assert ok is False and reason == "GATEWAY_RECONCILE_REQUIRED"
+
+
+def test_submit_rejected_local_is_terminal():
+    """A local rejection marks REJECTED (terminal) and never resubmits."""
+    from core.order_intent_gateway import OrderIntentGateway
+
+    gw = OrderIntentGateway(process_epoch="e1")
+
+    def _reject(order):
+        return False
+
+    ok, reason = gw.submit_with_authorization(
+        _order("ORD-R", "MTS_EXIT"), mode="live",
+        submit_callable=_reject)
+    assert ok is False and reason == "SUBMIT_REJECTED"
+    assert gw.intent_state("ORD-R") == "REJECTED"
+
+    ok, reason = gw.submit_with_authorization(
+        _order("ORD-R", "MTS_EXIT"), mode="live",
+        submit_callable=_reject)
+    assert ok is False and reason == "GATEWAY_RECONCILE_REQUIRED"
+
+
 def test_submit_paper_unchanged_no_authorization():
     from core.order_intent_gateway import OrderIntentGateway
 
@@ -285,10 +365,11 @@ def test_submit_paper_unchanged_no_authorization():
         calls.append(exchange_ordno)
         return True
 
-    ok, reason = gw.submit_with_authorization(
+    ok, payload = gw.submit_with_authorization(
         _order("ORD-P1", "MTS_ENTRY"), mode="paper",
         exchange_ordno="PAPER-ORD-P1", submit_callable=_paper)
-    assert ok is True and reason == ""
+    assert ok is True and isinstance(payload, dict)
+    assert payload["order_id"] == "ORD-P1"
     assert calls == ["PAPER-ORD-P1"]
     # no authorization was issued (pending stays empty)
     assert gw.registry.verify_pending_submission() is False
@@ -304,6 +385,30 @@ def test_direct_adapter_without_authorization_rejected():
         adapter.place_order_object(_order("ORD-D1", "MTS_EXIT"))
     assert "ADAPTER_GATEWAY_AUTHORIZATION_MISSING" in str(exc.value)
     assert adapter.calls == []
+
+
+def test_wrong_order_during_valid_pending_rejected():
+    """[audit #2 E2E] ORD-2 during ORD-1's pending window is rejected."""
+    from core.order_intent_gateway import (
+        GatewayAuthorizationRegistry,
+        OrderIntentGateway,
+    )
+
+    reg = GatewayAuthorizationRegistry(process_epoch="e1")
+    gw = OrderIntentGateway(registry=reg, process_epoch="e1")
+    adapter = _FakeAdapter(registry=reg)
+
+    # open a pending authorization for ORD-1 without submitting yet
+    reg.issue("ORD-1", 1, "g1")
+
+    # a direct adapter call for a DIFFERENT order must fail
+    with pytest.raises(RuntimeError) as exc:
+        adapter.place_order_object(_order("ORD-2", "MTS_EXIT"))
+    assert "ADAPTER_GATEWAY_AUTHORIZATION_MISSING" in str(exc.value)
+
+    # the bound order passes
+    adapter.place_order_object(_order("ORD-1", "MTS_EXIT"))
+    assert [c["order_id"] for c in adapter.calls] == ["ORD-1"]
 
 
 def _order(order_id, strategy, side=OrderSide.BUY, symbol="TMFH6",
@@ -444,3 +549,127 @@ def test_e2e_paper_unchanged(monkeypatch):
 
     # paper never touches the broker adapter
     assert monitor.api.calls == []
+
+
+def test_e2e_quarantine_zero_adapter_calls(monkeypatch):
+    """[audit #4] live quarantine is explicitly denied by the gateway,
+    independent of the OrderManager gate (permissive submit stub)."""
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_quarantined_ctx())
+    calls = []
+
+    def _permissive(order):
+        calls.append(order.order_id)
+        return True
+
+    monitor.order_mgr.submit = _permissive  # bypass the OrderManager gate
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    signal = SimpleNamespace(action="BUY_NEAR_SELL_FAR", reason="ENTRY")
+
+    monitor._submit_mts_order_signal(
+        signal, _bound_strategy(), {}, __import__("datetime").datetime.now())
+
+    assert calls == []               # OrderManager never reached
+    assert monitor.api.calls == []   # adapter never reached
+    blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
+    assert blocked and blocked[0][1]["reason"] == "LIVE_ORDER_AUTHORIZATION_FAILED"
+
+
+def test_e2e_real_chain_registry_injected_into_broker_adapter(monkeypatch):
+    """[audit #1] real monitor -> OrderManager -> ShioajiClient chain: the
+    registry lands on the actual broker_adapter and the real _gate_or_raise
+    enforces it (direct calls rejected, gateway-submitted orders pass)."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+    from strategies.futures.squeeze_futures.data.shioaji_client import (
+        ShioajiClient,
+    )
+
+    client = ShioajiClient.__new__(ShioajiClient)
+    client._execution_context = _live_ctx()
+    placed = []
+
+    def _unchecked(contract, action, quantity, price):
+        placed.append({"code": contract.code, "action": action})
+        return SimpleNamespace(exchange_order_id=f"BROKER-{action}",
+                               seqno="1")
+
+    client.get_contract = lambda s: SimpleNamespace(code=s)
+    client._place_order_unchecked = _unchecked
+
+    monitor, events = _monitor(_live_ctx())
+    monitor.api = client
+    monitor.order_mgr = OrderManager(mode="live", broker_adapter=client,
+                                     execution_context=_live_ctx())
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s0_no_state.json"))
+    signal = SimpleNamespace(action="BUY_NEAR_SELL_FAR", reason="ENTRY")
+    strat = _bound_strategy()
+    strat._has_position = False
+
+    monitor._submit_mts_order_signal(
+        signal, strat, {}, __import__("datetime").datetime.now())
+
+    # the REAL broker_adapter object received the registry
+    assert client._gateway_registry is not None
+    assert client._gateway_registry is monitor.order_mgr.broker_adapter._gateway_registry
+    # the real chain placed both entry legs through the real _gate_or_raise
+    assert len(placed) == 2
+
+    # direct adapter call (no gateway authorization) -> REAL gate rejects
+    with pytest.raises(Exception) as exc:
+        client.place_order_object(_order("ORD-DIRECT", "MTS_ENTRY"))
+    assert "ADAPTER_GATEWAY_AUTHORIZATION_MISSING" in str(exc.value)
+
+
+def test_e2e_oco_blocked_in_exit_only():
+    """[audit #5] OCO reconcile paths are blocked before Order construction
+    in EXIT_ONLY — zero OrderManager submit, zero adapter call."""
+    from types import SimpleNamespace
+    from strategies.futures.monitor import FuturesMonitor
+
+    monitor, events = _monitor(_exit_only_ctx())
+    submitted = []
+    monitor.paper_fill_sim = SimpleNamespace(register=lambda o: None)
+
+    def _recording_submit(order):
+        submitted.append(order.order_id)
+        return True
+
+    monitor.order_mgr.submit = _recording_submit
+
+    # both OCO reconcile entry points must return before any Order/submit
+    monitor._reconcile_paper_oco_orders_from_state()
+    monitor._reconcile_paper_oco_orders(_bound_strategy())
+
+    assert submitted == []
+    assert monitor.api.calls == []
+    blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
+    assert blocked and all(
+        b[1]["reason"] == "GATEWAY_OCO_DISABLED" for b in blocked)
+
+
+def test_exit_intent_failed_leg_never_submitted(tmp_path):
+    """[audit #6] a failed gateway submit (raise) must never leave the
+    exit-intent leg SUBMITTED — it lands in durable UNKNOWN instead."""
+    from core.exit_intent import IntentLog
+    from core.order_intent_gateway import GatewaySubmitError
+
+    log = IntentLog(log_path=str(tmp_path / "exit_intents.json"))
+    iid = log.create("mts-t1", "COMBINED_EXIT")
+
+    def _fail(cid, leg):
+        raise GatewaySubmitError("SUBMIT_REJECTED")
+
+    with pytest.raises(GatewaySubmitError):
+        log.submit_leg(iid, "near", order_mgr=None, submit_fn=_fail)
+
+    st = log.get(iid)["legs"]["near"]["status"]
+    assert st == "UNKNOWN"
+    assert st != "SUBMITTED"
