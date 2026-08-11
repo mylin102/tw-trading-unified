@@ -264,6 +264,35 @@ class OrderManager:
         reconciliation_id: Optional[str] = None,
     ) -> Order:
         """建立新委託單，狀態→ PENDING_SUBMIT"""
+        # A reconciled position may only create the two exact closing orders
+        # carried by its capability.  Refuse before creating local lifecycle
+        # state: entries, OCO brackets (which require cancel), and duplicate
+        # retries are not harmless bookkeeping in EXIT_ONLY.
+        _exit_ctx = getattr(self, "execution_context", None)
+        _exit_cap = getattr(_exit_ctx, "exit_only_capability", None)
+        _exit_only = (getattr(_exit_ctx, "effective_mode", None)
+                      == "reconciled_exit_only")
+        if _exit_only:
+            from core.mode_transition import LiveOrderBlocked
+            if strategy not in ("MTS_EXIT", "MTS_RELEASE"):
+                raise LiveOrderBlocked("EXIT_ONLY_STRATEGY_BLOCKED")
+            if not isinstance(_exit_cap, dict):
+                raise LiveOrderBlocked("EXIT_ONLY_CAPABILITY_MISSING")
+            _rid = _exit_cap.get("reconciliation_id")
+            _side = getattr(side, "value", side)
+            _allowed = any(
+                isinstance(item, dict)
+                and item.get("symbol") == symbol
+                and str(item.get("side", "")).lower() == str(_side).lower()
+                and item.get("remaining_qty") == quantity
+                for item in _exit_cap.get("allowed_orders", ()))
+            if not _allowed:
+                raise LiveOrderBlocked("EXIT_ONLY_ORDER_SCOPE_MISMATCH")
+            _issued = list(self.active_orders.values()) + list(self.completed)
+            if any(getattr(item, "reconciliation_id", None) == _rid
+                   and item.symbol == symbol and item.side == side
+                   for item in _issued):
+                raise LiveOrderBlocked("EXIT_ONLY_ORDER_ALREADY_ISSUED")
         # 2026-08-03 Gemini CLI: Dynamically check and sync session date on order creation
         try:
             from core.date_utils import get_session_date_str
@@ -308,14 +337,7 @@ class OrderManager:
         # [RECONCILED_EXIT_ONLY] stamp exit-class orders with the active
         # capability so the adapter gate can authorize them
         # (default-deny otherwise).  Entry-class orders are never stamped.
-        _exit_ctx = getattr(self, "execution_context", None)
-        _exit_cap = getattr(_exit_ctx, "exit_only_capability", None)
-        if (_exit_ctx is not None
-                and getattr(_exit_ctx, "effective_mode", None)
-                == "reconciled_exit_only"
-                and isinstance(_exit_cap, dict)
-                and strategy in ("MTS_EXIT", "MTS_RELEASE",
-                                 "MTS_RELEASE_OCO")
+        if (_exit_only and isinstance(_exit_cap, dict)
                 and isinstance(_exit_cap.get("reconciliation_id"), str)):
             order.reconciliation_id = _exit_cap["reconciliation_id"]
         return order
@@ -557,13 +579,14 @@ class OrderManager:
             try:
                 _assert_live_allowed(self.execution_context, order)
             except Exception as exc:
-                order.status = OrderStatus.REJECTED
-                order.reject_reason = str(exc)
-                self._emit("on_reject", OrderEvent(
-                    order_id=order.order_id, status=OrderStatus.REJECTED,
-                    symbol=order.symbol, side=order.side,
-                    reason=str(exc),
-                ))
+                # Preserve an in-process capability refusal verbatim; it is
+                # a finite local code, unlike third-party exception text.
+                _reason = getattr(exc, "reason", None)
+                if not (isinstance(_reason, str)
+                        and _reason.startswith("EXIT_ONLY_")):
+                    _reason = "LIVE_ORDER_AUTHORIZATION_FAILED"
+                self.reject(order.order_id, reason=_reason,
+                            source="authorization_gate")
                 return False
 
         # ── Paper Drain Gate: Block any order during drain ──
@@ -617,9 +640,12 @@ class OrderManager:
             # only a stable adapter code for operator diagnosis; never emit
             # arbitrary exception text into the event/dashboard surface.
             _code = getattr(exc, "code", None)
+            _blocked_reason = getattr(exc, "reason", None)
             _reason = (
                 _code if isinstance(_code, str)
                 and _code in _SAFE_ADAPTER_SUBMISSION_REASONS
+                else _blocked_reason if isinstance(_blocked_reason, str)
+                and _blocked_reason.startswith("EXIT_ONLY_")
                 else "ADAPTER_SUBMIT_FAILED"
             )
             self.reject(order.order_id, reason=_reason,

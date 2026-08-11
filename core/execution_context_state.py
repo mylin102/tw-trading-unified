@@ -105,12 +105,40 @@ def _validate(data: object) -> list:
         if not isinstance(cap, dict):
             errs.append("schema: exit-only capability missing")
         else:
-            if not isinstance(cap.get("reconciliation_id"), str) or not cap["reconciliation_id"]:
-                errs.append("schema: exit-only reconciliation_id invalid")
+            required = (
+                "schema_version", "reconciliation_id", "trade_id",
+                "snapshot_hash", "attestation_hash", "snapshot_captured_at",
+                "account_id_hash", "session_id", "config_hash", "release_sha",
+            )
+            if any(key not in cap for key in required):
+                errs.append("schema: exit-only capability provenance missing")
+            if (cap.get("schema_version") != 2
+                    or not isinstance(cap.get("reconciliation_id"), str)
+                    or not cap.get("reconciliation_id")
+                    or not isinstance(cap.get("trade_id"), str)
+                    or not cap.get("trade_id")
+                    or not isinstance(cap.get("snapshot_hash"), str)
+                    or not cap.get("snapshot_hash")
+                    or not isinstance(cap.get("attestation_hash"), str)
+                    or not cap.get("attestation_hash")
+                    or not isinstance(cap.get("snapshot_captured_at"), int)
+                    or isinstance(cap.get("snapshot_captured_at"), bool)
+                    or cap.get("snapshot_captured_at", 0) <= 0
+                    or not isinstance(cap.get("release_sha"), str)
+                    or not cap.get("release_sha")):
+                errs.append("schema: exit-only capability identity invalid")
+            for field in ("account_id_hash", "session_id", "config_hash"):
+                if (not isinstance(cap.get(field), str) or not cap.get(field)
+                        or cap.get(field) != data.get(field)):
+                    errs.append("schema: exit-only capability context mismatch")
+                    break
+            if data.get("live_order_allowed") is not False:
+                errs.append("schema: exit-only may not enable live orders")
             allowed = cap.get("allowed_orders")
-            if not isinstance(allowed, (list, tuple)) or not allowed:
+            if not isinstance(allowed, (list, tuple)) or len(allowed) != 2:
                 errs.append("schema: exit-only allowed_orders invalid")
             else:
+                seen = set()
                 for entry in allowed:
                     if not isinstance(entry, dict):
                         errs.append("schema: exit-only allowed order invalid")
@@ -119,9 +147,15 @@ def _validate(data: object) -> list:
                             or not isinstance(entry.get("side"), str)
                             or not isinstance(entry.get("remaining_qty"), int)
                             or isinstance(entry.get("remaining_qty"), bool)
-                            or entry["remaining_qty"] <= 0):
+                            or entry["remaining_qty"] <= 0
+                            or entry.get("side", "").lower() not in ("buy", "sell")):
                         errs.append("schema: exit-only allowed order fields invalid")
                         break
+                    key = (entry["symbol"], entry["side"].lower())
+                    if key in seen:
+                        errs.append("schema: exit-only allowed orders duplicate")
+                        break
+                    seen.add(key)
     return errs
 
 

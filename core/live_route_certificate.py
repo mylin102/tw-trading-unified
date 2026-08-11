@@ -580,6 +580,16 @@ def transition_with_certificate(
             "build_runtime_certification_context — external dict/JSON is "
             "not accepted as authorization input")
 
+    # A broker-reconciled spread is deliberately not a normal live session.
+    # Reconnect/relogin must never silently promote its persisted capability
+    # to LIVE_READY; a fresh operator attestation is required instead.
+    if (ctx.effective_mode == ModeTransitionState.RECONCILED_EXIT_ONLY.value
+            or ctx.exit_only_capability is not None):
+        return with_effective_mode(
+            ctx, ModeTransitionState.LIVE_QUARANTINED.value,
+            live_order_allowed=False,
+            audit_reasons=("EXIT_ONLY_RECONCILIATION_REQUIRED",))
+
     if issuer.peek(cert.nonce) is None and issuer.was_consumed(cert.nonce):
         raise CertificateAlreadyConsumed(
             f"certificate nonce {cert.nonce} already redeemed")

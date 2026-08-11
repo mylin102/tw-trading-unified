@@ -3007,41 +3007,39 @@ class FuturesMonitor:
         (list_positions / list_trades) - zero place/cancel/update calls.
         """
         _api = getattr(self, "api", None)
+        _ctx = getattr(self, "_execution_context", None)
+        if _api is None or _ctx is None or not hasattr(_api, "list_positions"):
+            return {"source": "unavailable", "capture_error": True}
         positions, open_orders = [], []
         captured_at = int(time.time() * 1000)
-        if _api is not None and hasattr(_api, "list_positions"):
-            try:
-                _acct = getattr(_api, "futopt_account", None)
-                if _acct is not None:
-                    for _p in (_api.list_positions(_acct) or []):
-                        positions.append({
-                            "code": str(getattr(_p, "code", "")),
-                            "direction": getattr(
-                                getattr(_p, "direction", None), "name",
-                                None) or str(getattr(_p, "direction", "")),
-                            "quantity": int(
-                                getattr(_p, "quantity", 0) or 0),
-                            "avg_cost": float(
-                                getattr(_p, "price", 0) or 0),
-                        })
-            except Exception:
-                positions = []
-        if _api is not None and hasattr(_api, "list_trades"):
-            try:
-                _acct = getattr(_api, "futopt_account", None)
-                if _acct is not None:
-                    for _t in (_api.list_trades(_acct) or []):
-                        _st = getattr(
-                            getattr(_t, "status", None), "status", "")
-                        if str(_st) not in ("Filled", "Cancelled",
-                                            "Expired", "Done"):
-                            open_orders.append(
-                                {"ordno": getattr(_t, "ordno", None)})
-            except Exception:
-                open_orders = []
+        _acct = getattr(_api, "futopt_account", None)
+        if _acct is None or not hasattr(_api, "list_trades"):
+            return {"source": "unavailable", "capture_error": True}
+        try:
+            for _p in (_api.list_positions(_acct) or []):
+                positions.append({
+                    "code": str(getattr(_p, "code", "")),
+                    "direction": getattr(
+                        getattr(_p, "direction", None), "name",
+                        None) or str(getattr(_p, "direction", "")),
+                    "quantity": int(getattr(_p, "quantity", 0) or 0),
+                    "avg_cost": float(getattr(_p, "price", 0) or 0),
+                })
+            for _t in (_api.list_trades(_acct) or []):
+                _st = getattr(getattr(_t, "status", None), "status", "")
+                if str(_st) not in ("Filled", "Cancelled", "Expired", "Done"):
+                    open_orders.append({"ordno": getattr(_t, "ordno", None)})
+        except Exception:
+            # Failure to prove either positions or open orders is not an
+            # empty account.  Return typed unavailable evidence instead.
+            return {"source": "unavailable", "capture_error": True}
         return {
             "source": "live_broker",
             "captured_at": captured_at,
+            "account_id_hash": getattr(_ctx, "account_id_hash", None),
+            "session_id": getattr(_ctx, "session_id", None),
+            "config_hash": getattr(_ctx, "config_hash", None),
+            "release_sha": os.environ.get("LRC_RELEASE_SHA", ""),
             "positions": positions,
             "open_orders": open_orders,
         }
@@ -3074,7 +3072,8 @@ class FuturesMonitor:
             "expected_legs": list(expected_legs or []),
         }
         try:
-            _cap, _record = build_exit_only_capability(_att, _snap)
+            _cap, _record = build_exit_only_capability(
+                _att, _snap, ctx=self._execution_context)
         except AttestationError as _exc:
             console.print(
                 f"[red]⛔ [OPERATOR_ATTESTATION] rejected: "
