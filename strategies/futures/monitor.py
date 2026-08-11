@@ -8232,6 +8232,9 @@ class FuturesMonitor:
         if _state_has_pos:
             _blocked = True
             _reasons.append("state.has_position=True")
+        if bool(getattr(strategy, "_has_position", False)):
+            _blocked = True
+            _reasons.append("strategy.has_position=True")
         if _lifecycle_phase and _lifecycle_phase != "FLAT":
             _blocked = True
             _reasons.append(f"lifecycle.phase={_lifecycle_phase}")
@@ -8543,7 +8546,23 @@ class FuturesMonitor:
                 return True
             
             _action = _flag.get("action", "")
-            
+
+            # A completed automatic entry is no longer an active order, but
+            # it remains an open spread.  Manual entry must use the same
+            # canonical position gate as automatic entry.
+            if _action == "spread":
+                _mts_strategy = getattr(self, "_registry", {}).get("tmf_spread")
+                _strategy_open = bool(getattr(_mts_strategy, "_has_position", False))
+                if _strategy_open or self._mts_block_entry_if_open_position(
+                    _mts_strategy, _flag.get("side", "")
+                ):
+                    self._manual_trade_status = "SKIPPED: MTS_POSITION_EXISTS"
+                    console.print(
+                        "[yellow]⏭️ [MANUAL_TRADE] Skipped: MTS position already open[/yellow]"
+                    )
+                    os.remove(_processing_path)
+                    return True
+
             # 2026-06-09 JVS Claw: C0 — State guard for spread actions only
             # Prevent double-click for spread entry, but always allow close_all
             # Only check for terminal states (FILLED, SUBMITTED), not PROCESSING (current call)
