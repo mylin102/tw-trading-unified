@@ -1,6 +1,7 @@
 """RED contract: RECONCILED_EXIT_ONLY completes only after broker-flat proof."""
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -111,3 +112,50 @@ def test_flat_revoke_requires_fresh_same_session_broker_proof(bad):
     with pytest.raises(AttestationError):
         revoke_exit_only_after_flat_snapshot(_exit_ctx(), bad())
 
+
+def _monitor_for_exit_only(statuses=("filled", "filled"), snapshot=None):
+    from strategies.futures.monitor import FuturesMonitor
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._execution_context = _exit_ctx()
+    monitor.order_mgr = SimpleNamespace(active_orders={}, completed=_orders(
+        monitor._execution_context, statuses))
+    monitor._capture_exit_only_snapshot = lambda: snapshot or _snapshot(flat=True)
+    monitor._persist_execution_context = lambda: setattr(monitor, "persisted", True)
+    monitor.events = []
+    monitor._append_mts_event = lambda typ, **kw: monitor.events.append((typ, kw))
+    monitor._clear_mts_entry_reconcile_intents = lambda: True
+    return monitor
+
+
+def test_monitor_reconciles_only_after_both_filled_and_broker_flat():
+    monitor = _monitor_for_exit_only()
+    record, error = monitor._maybe_finalize_exit_only_reconciliation()
+    assert error is None
+    assert record["snapshot_hash"]
+    assert monitor.persisted is True
+    assert monitor._execution_context.effective_mode == ModeTransitionState.LIVE_QUARANTINED.value
+    assert monitor._execution_context.exit_only_capability is None
+    assert monitor.events[-1][0] == "EXIT_ONLY_FLAT_RECONCILED"
+
+
+def test_monitor_single_local_fill_never_resumes_or_queries_broker():
+    monitor = _monitor_for_exit_only(statuses=("filled", "submitted"))
+    called = []
+    monitor._capture_exit_only_snapshot = lambda: called.append(True) or _snapshot(flat=True)
+    record, error = monitor._maybe_finalize_exit_only_reconciliation()
+    assert (record, error) == (None, None)
+    assert not called
+    assert monitor._execution_context.effective_mode == ModeTransitionState.RECONCILED_EXIT_ONLY.value
+
+
+@pytest.mark.parametrize("status", ["partial_filled", "cancelled", "rejected", "expired"])
+def test_monitor_exit_terminal_anomaly_quarantines_without_cancel(status):
+    monitor = _monitor_for_exit_only(statuses=(status, "submitted"))
+    cancel_calls = []
+    monitor.order_mgr.cancel = lambda *args, **kwargs: cancel_calls.append((args, kwargs))
+    record, error = monitor._maybe_finalize_exit_only_reconciliation()
+    assert record is None
+    assert error == "EXIT_ONLY_TERMINAL_AMBIGUITY"
+    assert monitor._execution_context.effective_mode == ModeTransitionState.LIVE_QUARANTINED.value
+    assert monitor._execution_context.exit_only_capability is not None
+    assert not cancel_calls
