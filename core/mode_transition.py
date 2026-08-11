@@ -53,6 +53,7 @@ class ModeTransitionState(str, Enum):
     LIVE_RECONCILING = "live_reconciling"
     LIVE_QUARANTINED = "live_quarantined"
     LIVE_READY = "live_ready"
+    RECONCILED_EXIT_ONLY = "reconciled_exit_only"
     TRANSITION_BLOCKED = "transition_blocked"
 
 
@@ -156,6 +157,10 @@ class ExecutionContext:
     # transition returns an explicit quarantine with its audit reasons here.
     audit_reasons: tuple[str, ...] = ()
 
+    # A restart-persisted, least-privilege capability for a single
+    # broker-reconciled position. It never grants general live-order access.
+    exit_only_capability: dict | None = None
+
     def is_live_ready(self) -> bool:
         """Shorthand: fully LIVE with authorization."""
         return (
@@ -180,6 +185,38 @@ class ExecutionContext:
 
         if not self.live_order_allowed:
             raise LiveOrderBlocked("LIVE_ORDER_FLAG_FALSE")
+
+    def assert_order_allowed(self, order, *, method: str) -> None:
+        """Authorize one broker operation; exit-only is default-deny."""
+        if self.requested_mode != ExecutionMode.LIVE.value:
+            return
+        if self.is_live_ready():
+            return
+        if self.effective_mode != ModeTransitionState.RECONCILED_EXIT_ONLY.value:
+            raise LiveOrderBlocked(
+                f"EFFECTIVE_MODE_NOT_ORDER_AUTHORIZED (effective={self.effective_mode})")
+        if method != "place_order" or order is None:
+            raise LiveOrderBlocked(f"EXIT_ONLY_{method.upper()}_BLOCKED")
+        cap = self.exit_only_capability
+        if not isinstance(cap, dict):
+            raise LiveOrderBlocked("EXIT_ONLY_CAPABILITY_MISSING")
+        if getattr(order, "reconciliation_id", None) != cap.get("reconciliation_id"):
+            raise LiveOrderBlocked("EXIT_ONLY_RECONCILIATION_ID_MISMATCH")
+        if getattr(order, "strategy", None) not in {"MTS_EXIT", "MTS_RELEASE"}:
+            raise LiveOrderBlocked("EXIT_ONLY_STRATEGY_BLOCKED")
+        symbol = getattr(order, "symbol", None)
+        side = getattr(getattr(order, "side", None), "value", getattr(order, "side", None))
+        quantity = getattr(order, "quantity", None)
+        for allowed in cap.get("allowed_orders", ()):
+            if not isinstance(allowed, dict):
+                continue
+            if (symbol == allowed.get("symbol")
+                    and str(side).lower() == str(allowed.get("side", "")).lower()
+                    and isinstance(quantity, int)
+                    and not isinstance(quantity, bool)
+                    and 0 < quantity <= allowed.get("remaining_qty", 0)):
+                return
+        raise LiveOrderBlocked("EXIT_ONLY_ORDER_SCOPE_MISMATCH")
 
     def assert_entry_allowed(self) -> None:
         """Raise EntryBlocked if paper drain is in progress.
@@ -208,6 +245,7 @@ class ExecutionContext:
             "config_hash": self.config_hash,
             "state_namespace": self.state_namespace,
             "audit_reasons": list(self.audit_reasons),
+            "exit_only_capability": self.exit_only_capability,
         }
 
 

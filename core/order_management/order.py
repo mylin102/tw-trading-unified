@@ -61,6 +61,7 @@ class Order:
         truth_source: str = "",
         combo_legs: Optional[List[Dict[str, Any]]] = None,
         combo_strategy: str = "",
+        reconciliation_id: Optional[str] = None,
     ):
         """
         初始化委託單
@@ -94,6 +95,7 @@ class Order:
         self.truth_source = truth_source
         self.combo_legs = [dict(leg) if isinstance(leg, dict) else leg for leg in (combo_legs or [])]
         self.combo_strategy = combo_strategy
+        self.reconciliation_id = reconciliation_id
         
         # 狀態追蹤
         self.status = OrderStatus.PENDING_SUBMIT

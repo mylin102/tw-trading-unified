@@ -35,6 +35,7 @@ SCHEMA_KEYS = (
     "process_start_id",
     "config_hash",
     "state_namespace",
+    "exit_only_capability",
 )
 
 # field -> (type, required)
@@ -50,6 +51,7 @@ _TYPE_RULES = {
     "process_start_id": (str, False),
     "config_hash": (str, False),
     "state_namespace": (str, False),
+    "exit_only_capability": (dict, False),
 }
 
 
@@ -98,6 +100,28 @@ def _validate(data: object) -> list:
                 errs.append("schema: audit_reasons too many entries")
         if key in ("revision",) and isinstance(val, bool):
             errs.append("schema: revision must be int (bool excluded)")
+    if data.get("effective_mode") == "reconciled_exit_only":
+        cap = data.get("exit_only_capability")
+        if not isinstance(cap, dict):
+            errs.append("schema: exit-only capability missing")
+        else:
+            if not isinstance(cap.get("reconciliation_id"), str) or not cap["reconciliation_id"]:
+                errs.append("schema: exit-only reconciliation_id invalid")
+            allowed = cap.get("allowed_orders")
+            if not isinstance(allowed, (list, tuple)) or not allowed:
+                errs.append("schema: exit-only allowed_orders invalid")
+            else:
+                for entry in allowed:
+                    if not isinstance(entry, dict):
+                        errs.append("schema: exit-only allowed order invalid")
+                        break
+                    if (not isinstance(entry.get("symbol"), str)
+                            or not isinstance(entry.get("side"), str)
+                            or not isinstance(entry.get("remaining_qty"), int)
+                            or isinstance(entry.get("remaining_qty"), bool)
+                            or entry["remaining_qty"] <= 0):
+                        errs.append("schema: exit-only allowed order fields invalid")
+                        break
     return errs
 
 
@@ -191,4 +215,5 @@ def _fail_closed(reasons: tuple) -> dict:
         "process_start_id": None,
         "config_hash": None,
         "state_namespace": "live",
+        "exit_only_capability": None,
     }

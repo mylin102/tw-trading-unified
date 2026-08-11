@@ -51,7 +51,7 @@ class ShioajiClient:
             return
         self.api = sj.Shioaji()
 
-    def _gate_or_raise(self, method: str):
+    def _gate_or_raise(self, method: str, order=None):
         """[Step 8] execution-context gate: non-LIVE_READY or ctx=None
         makes ZERO broker calls and raises the canonical structured gate
         exception LiveOrderBlocked (typed reason); LIVE_READY permits the
@@ -62,6 +62,13 @@ class ShioajiClient:
         if ctx is None:
             raise LiveOrderBlocked(
                 f"{method}: NO_LIVE_CERTIFICATION")
+        checker = getattr(ctx, "assert_order_allowed", None)
+        if callable(checker):
+            try:
+                checker(order, method=method)
+                return
+            except LiveOrderBlocked as exc:
+                raise LiveOrderBlocked(f"{method}: {exc.reason}") from exc
         if not ctx.is_live_ready():
             raise LiveOrderBlocked(
                 f"{method}: LIVE_QUARANTINED "
@@ -249,6 +256,10 @@ class ShioajiClient:
         # return is ADAPTER_ORDER_NO_TRADE; a trade with terminal status
         # Failed/Rejected is ADAPTER_ORDER_REJECTED — zero silent failures.
         self._gate_or_raise("place_order")          # [Step 8] fail-closed
+        return self._place_order_unchecked(contract, action, quantity, price)
+
+    def _place_order_unchecked(self, contract, action: str, quantity: int, price: float = 0):
+        """Broker call after an already-authorized route-specific gate."""
         if not self.is_logged_in:
             return None
         try:
@@ -300,6 +311,7 @@ class ShioajiClient:
         that conversion here so a live MTS path cannot accidentally call
         ``place_order(order)`` and fail after local intent creation.
         """
+        self._gate_or_raise("place_order", order)
         symbol = getattr(order, "symbol", None)
         contract = self.get_contract(symbol) if isinstance(symbol, str) else None
         side = getattr(getattr(order, "side", None), "value",
@@ -311,7 +323,7 @@ class ShioajiClient:
                 code="ADAPTER_ORDER_OBJECT_INVALID",
                 context={"method": "place_order_object", "symbol": symbol,
                          "side": side, "quantity": quantity})
-        return self.place_order(
+        return self._place_order_unchecked(
             contract, action=side, quantity=quantity,
             price=getattr(order, "price", 0) or 0,
         )

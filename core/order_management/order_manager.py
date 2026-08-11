@@ -49,8 +49,12 @@ def _get_live_gate():
     return _mode_transition_gate == "loaded"
 
 
-def _assert_live_allowed(execution_context) -> None:
-    """Thin wrapper: calls execution_context.assert_live_order_allowed()."""
+def _assert_live_allowed(execution_context, order=None) -> None:
+    """Second layer at the canonical OrderManager submission boundary."""
+    checker = getattr(execution_context, "assert_order_allowed", None)
+    if callable(checker):
+        checker(order, method="place_order")
+        return
     execution_context.assert_live_order_allowed()
 
 
@@ -257,6 +261,7 @@ class OrderManager:
         truth_source: str = "",
         combo_legs: Optional[List[Dict[str, Any]]] = None,
         combo_strategy: str = "",
+        reconciliation_id: Optional[str] = None,
     ) -> Order:
         """建立新委託單，狀態→ PENDING_SUBMIT"""
         # 2026-08-03 Gemini CLI: Dynamically check and sync session date on order creation
@@ -297,6 +302,7 @@ class OrderManager:
             truth_source=truth_source,
             combo_legs=combo_legs,
             combo_strategy=combo_strategy,
+            reconciliation_id=reconciliation_id,
         )
         self.active_orders[order_id] = order
         return order
@@ -536,7 +542,7 @@ class OrderManager:
         # ── P0 Hard Gate: Second layer defense ──
         if self.mode == "live" and self.execution_context is not None:
             try:
-                _assert_live_allowed(self.execution_context)
+                _assert_live_allowed(self.execution_context, order)
             except Exception as exc:
                 order.status = OrderStatus.REJECTED
                 order.reject_reason = str(exc)
