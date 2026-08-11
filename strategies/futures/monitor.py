@@ -71,10 +71,11 @@ except ImportError:
 # monkeypatch the path without touching the live state file.
 MTS_POSITION_STATE_PATH = Path("/tmp/mts_position_state.json")
 
-# [S1] EXIT_ONLY snapshot staleness TTL (ms): the attested broker snapshot
-# is trusted for exit evaluation only within this window; beyond it the
-# position must be re-attested before any exit evaluation.
-EXIT_ONLY_SNAPSHOT_TTL_MS = 3_600_000
+# [S1] EXIT_ONLY snapshot staleness TTL (ms): canonical with
+# core.reconciled_exit.SNAPSHOT_TTL_MS (60s) — a snapshot older than this,
+# or stamped in the future, is never trusted for exit evaluation.
+from core.reconciled_exit import \
+    SNAPSHOT_TTL_MS as EXIT_ONLY_SNAPSHOT_TTL_MS
 
 # 2026-07-14 Gemini CLI: Dataclass snapshot for MTF score tracking under ADR-009 Phase 1
 from dataclasses import dataclass, field
@@ -3393,6 +3394,9 @@ class FuturesMonitor:
         _ctx = getattr(self, "_execution_context", None)
         if getattr(_ctx, "effective_mode", None) != "reconciled_exit_only":
             return True
+        # [S1 repair] the capability authority override exists ONLY while
+        # this mode + a validated hydration hold; cleared until revalidated.
+        self._exit_only_auth_override = None
         _cap = getattr(_ctx, "exit_only_capability", None)
         if not isinstance(_cap, dict):
             self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
@@ -3400,16 +3404,21 @@ class FuturesMonitor:
             return False
         _cap_session = _cap.get("session_id") or ""
         _cur_session = getattr(_ctx, "session_id", "") or ""
-        if _cap_session and _cur_session and _cap_session != _cur_session:
+        if (not _cap_session or not _cur_session
+                or _cap_session != _cur_session):
             self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
                                    reason="EXIT_ONLY_SESSION_MISMATCH")
             return False
         _captured = _cap.get("snapshot_captured_at")
+        _now_ms = int(time.time() * 1000)
         if (not isinstance(_captured, int)
-                or int(time.time() * 1000) - _captured
-                > EXIT_ONLY_SNAPSHOT_TTL_MS):
+                or _now_ms - _captured > EXIT_ONLY_SNAPSHOT_TTL_MS):
             self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
                                    reason="EXIT_ONLY_SNAPSHOT_STALE")
+            return False
+        if _captured > _now_ms + 1_000:
+            self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
+                                   reason="EXIT_ONLY_SNAPSHOT_FUTURE")
             return False
         _cached = getattr(self, "_exit_only_position", None)
         if (_cached is None
@@ -3453,6 +3462,24 @@ class FuturesMonitor:
                                    reason="EXIT_ONLY_STRATEGY_HYDRATION_FAILED")
             return False
         self._exit_only_strategy_hydrated_hash = _position["snapshot_hash"]
+        # [S1 repair] validated capability authority override for the
+        # pre/post signal gates: the local JSONL ledger is FLAT for a
+        # broker-attested manual position and must neither reset the
+        # hydrated strategy nor block capability-bound exits.
+        _near, _far = _legs[0], _legs[1]
+        from strategies.futures.mts_ledger_authority import (
+            MtsAuthority, MtsAuthorityState)
+        self._exit_only_auth_override = MtsAuthorityState(
+            status=MtsAuthority.OPEN,
+            trade_id=_position["trade_id"],
+            near_qty=_near["quantity"] * (1 if _near["side"] == "buy" else -1),
+            far_qty=_far["quantity"] * (1 if _far["side"] == "buy" else -1),
+            near_side="LONG" if _near["side"] == "buy" else "SHORT",
+            far_side="LONG" if _far["side"] == "buy" else "SHORT",
+            near_entry=_near["avg_cost"],
+            far_entry=_far["avg_cost"],
+            current_trade_id=_position["trade_id"],
+        )
         return True
 
     def _exit_only_decision_guard(self, action, strategy=None):
@@ -8500,8 +8527,19 @@ class FuturesMonitor:
             self._ledger_projection.sync_from_ledger()
             self._ledger_projection_sync_ts = time.monotonic()
         _auth = self._ledger_projection.snapshot()
+        # [S1 repair] EXIT_ONLY: after a validated pre-evaluation hydration
+        # the capability/attested snapshot IS the position authority — the
+        # legacy local JSONL ledger (FLAT for a broker-attested manual
+        # position) must not reset the hydrated strategy (pre-signal) nor
+        # block capability-bound exits (post-signal).  The override exists
+        # only while this mode + a validated hydration hold; LIVE_READY /
+        # PAPER / local-ledger authority are untouched.
+        _exit_override = getattr(self, "_exit_only_auth_override", None)
+        _gate_auth = _exit_override if _exit_override is not None else _auth
+        _gate_state_has_pos = (_authority_has_pos
+                               if _exit_override is None else True)
         _pre_action = gate_decision_pre_signal(
-            _auth, _authority_has_pos, _strat_has_pos, _strat_tid,
+            _gate_auth, _gate_state_has_pos, _strat_has_pos, _strat_tid,
         )
         if _pre_action == MtsGateAction.RESET_STRATEGY:
             console.print(
@@ -8538,7 +8576,10 @@ class FuturesMonitor:
         # fail-open for exits.
         if signal is not None:
             _sig_action = getattr(signal, "action", "?")
-            _post_action = gate_decision_post_signal(_auth, _sig_action)
+            _post_override = getattr(self, "_exit_only_auth_override", None)
+            _post_action = gate_decision_post_signal(
+                _post_override if _post_override is not None else _auth,
+                _sig_action)
             if _post_action == MtsGateAction.BLOCK_SIGNAL:
                 console.print(
                     f"[bold red]⛔ [MTS_ORDER_REJECT] Ledger FLAT; "
