@@ -94,8 +94,10 @@ def _quarantined_ctx():
 def _bbo_slots(now=None):
     ts = now if now is not None else time.time()
     return {
-        "TMF": {"bid": 44900.0, "ask": 44910.0, "bidask_at": ts},
-        "TMF_FAR": {"bid": 45040.0, "ask": 45060.0, "bidask_at": ts},
+        "TMF": {"bid": 44900.0, "ask": 44910.0, "bidask_at": ts,
+                "code": "TMFH6"},
+        "TMF_FAR": {"bid": 45040.0, "ask": 45060.0, "bidask_at": ts,
+                    "code": "TMFI6"},
     }
 
 
@@ -754,6 +756,91 @@ def test_e2e_manual_partial_far_failure_quarantines(monkeypatch, tmp_path):
 
 
 # ── S1: EXIT_ONLY pre-evaluation position hydration ─────────────────────
+
+def test_s2_exit_only_bad_bbo_dimension_zero_submit(monkeypatch):
+    """[S2] each bad BBO dimension (missing/stale/future/skew/code/
+    ambiguous/identity) => ORDER_INTENT_BLOCKED with the typed reason and
+    zero adapter submission; a valid dual BBO binds the decision and the
+    capability-bound exits reach the adapter stub."""
+    import time as _time
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    def _drive(slots, trade_id):
+        monitor, events = _monitor(_fresh_exit_only_ctx())
+        monitor.market_data = dict(slots)
+        monitor._hydrate_exit_only_position()
+        monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                            lambda: True)
+        signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+        monitor._submit_mts_order_signal(
+            signal, _bound_strategy(trade_id=trade_id), {},
+            __import__("datetime").datetime.now())
+        return monitor, events
+
+    # valid dual BBO -> cap-bound exits reach the adapter, decision bound
+    monitor, events = _drive(dict(_bbo_slots()), "mts-s2-valid")
+    assert len(monitor.api.calls) == 2
+    assert {c["symbol"] for c in monitor.api.calls} == {"TMFH6", "TMFI6"}
+    # the decision was bound BEFORE submission (gateway authorize binding)
+    assert monitor._exit_only_decision_binding is not None
+    assert monitor._exit_only_decision_binding.get("bbo_hash")
+
+    def _expect_blocked(mutate, reason, i):
+        slots = dict(_bbo_slots())
+        mutate(slots)
+        monitor, events = _drive(slots, f"mts-s2-bad-{i}")
+        assert monitor.api.calls == [], f"{reason}: {monitor.api.calls}"
+        blocked = [e for e in events
+                   if e[0] in ("ORDER_INTENT_BLOCKED",
+                               "EXIT_ONLY_QUARANTINED")]
+        assert any(reason in (e[1].get("reason") or "") for e in blocked), (
+            reason, [e[1].get("reason") for e in blocked])
+
+    _expect_blocked(lambda s: s.pop("TMF"), "BBO_MISSING", 1)
+    _expect_blocked(
+        lambda s: s["TMF"].update(bidask_at=_time.time() - 60),
+        "BBO_STALE", 2)
+    _expect_blocked(
+        lambda s: s["TMF"].update(bidask_at=_time.time() + 5),
+        "BBO_FUTURE", 3)
+    _expect_blocked(
+        lambda s: s["TMF_FAR"].update(bidask_at=_time.time() - 2),
+        "BBO_SKEW", 4)
+    _expect_blocked(
+        lambda s: s["TMF"].update(code="TMFZ6"),
+        "BBO_CODE_MISMATCH", 5)
+    _expect_blocked(
+        lambda s: s["TMF"].update(bid=44920.0),
+        "BBO_AMBIGUOUS", 6)
+
+
+def test_s2_exit_only_mixed_identity_zero_submit(monkeypatch):
+    """[S2] a capability missing an identity field (config_hash) trips the
+    BBO identity requirement — ORDER_INTENT_BLOCKED/BBO_IDENTITY_MISSING,
+    zero adapter submission (S1 validation passes: session + TTL + legs)."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    ctx = _fresh_exit_only_ctx()
+    bad = ctx.exit_only_capability
+    bad["config_hash"] = None
+    ctx = replace(ctx, exit_only_capability=bad)
+    monitor, events = _monitor(ctx)
+    monitor.market_data = dict(_bbo_slots())
+    monitor._hydrate_exit_only_position()
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+    monitor._submit_mts_order_signal(
+        signal, _bound_strategy(), {},
+        __import__("datetime").datetime.now())
+    assert monitor.api.calls == []
+    blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
+    assert blocked and blocked[-1][1].get("reason") \
+        == "BBO_IDENTITY_MISSING"
+
 
 def test_s1_exit_only_pre_eval_hydrates_before_evaluator():
     """[S1] EXIT_ONLY exact cap hydrates the strategy position BEFORE the

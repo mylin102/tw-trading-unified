@@ -69,9 +69,27 @@ def _live_ctx():
 def _bbo_slots(now=None):
     ts = now if now is not None else time.time()
     return {
-        "TMF": {"bid": 44900.0, "ask": 44910.0, "bidask_at": ts},
-        "TMF_FAR": {"bid": 45040.0, "ask": 45060.0, "bidask_at": ts},
+        "TMF": {"bid": 44900.0, "ask": 44910.0, "bidask_at": ts,
+                "code": "TMFH6"},
+        "TMF_FAR": {"bid": 45040.0, "ask": 45060.0, "bidask_at": ts,
+                    "code": "TMFI6"},
     }
+
+
+_S2_IDENTITY = {
+    "reconciliation_id": "recon-abc123",
+    "snapshot_hash": "s" * 64,
+    "config_hash": "d" * 64,
+    "release_sha": "e" * 40,
+    "session_id": "c" * 32,
+}
+
+
+def _s2_kwargs(**over):
+    kw = {"near_code": "TMFH6", "far_code": "TMFI6",
+          "identity": dict(_S2_IDENTITY)}
+    kw.update(over)
+    return kw
 
 
 def _pure_bbo_slots(now=None):
@@ -126,32 +144,73 @@ def test_hydrate_preserves_broker_costs_and_trade_id_no_pnl():
 def test_bbo_binding_missing_stale_ambiguous():
     from core.exit_only_position import build_bbo_binding
 
-    assert build_bbo_binding(None)[0] is None
-    assert build_bbo_binding({"near": {}, "far": {}})[1] == "BBO_MISSING"
+    assert build_bbo_binding(None, **_s2_kwargs())[0] is None
+    assert build_bbo_binding(
+        {"near": {}, "far": {}}, **_s2_kwargs())[1] == "BBO_MISSING"
     assert build_bbo_binding({
-        "near": {"bid": 1, "ask": 2, "bidask_at": time.time()},
+        "near": {"bid": 1, "ask": 2, "bidask_at": time.time(),
+                 "code": "TMFH6"},
         "far": {},
-    })[1] == "BBO_MISSING"
-    assert build_bbo_binding(_pure_bbo_slots(now=time.time() - 60))[1] \
+    }, **_s2_kwargs())[1] == "BBO_MISSING"
+    assert build_bbo_binding(
+        _pure_bbo_slots(now=time.time() - 60), **_s2_kwargs())[1] \
         == "BBO_STALE"
     ambiguous = _pure_bbo_slots()
     ambiguous["near"]["bid"] = 44920.0  # bid > ask
-    assert build_bbo_binding(ambiguous)[1] == "BBO_AMBIGUOUS"
+    assert build_bbo_binding(ambiguous, **_s2_kwargs())[1] \
+        == "BBO_AMBIGUOUS"
 
 
-def test_bbo_binding_valid():
+def test_bbo_binding_s2_hardening():
+    """[S2] future / skew / code / identity / non-finite ts are each
+    fail-closed with the typed reason; the valid version-2 hash binds the
+    raw quotes + identity."""
     from core.exit_only_position import build_bbo_binding
 
-    binding, reason = build_bbo_binding(_pure_bbo_slots())
+    kw = _s2_kwargs()
+    # future-stamped (beyond 1s)
+    fut = _pure_bbo_slots(now=time.time() + 5)
+    assert build_bbo_binding(fut, **kw)[1] == "BBO_FUTURE"
+    # cross-leg skew > 1s (far older by 2s, within its own TTL)
+    skew = _pure_bbo_slots()
+    skew["far"]["bidask_at"] = time.time() - 2
+    assert build_bbo_binding(skew, **kw)[1] == "BBO_SKEW"
+    # exact contract code mismatch
+    wrong = _pure_bbo_slots()
+    wrong["near"]["code"] = "TMFZ6"
+    assert build_bbo_binding(wrong, **kw)[1] == "BBO_CODE_MISMATCH"
+    # mixed identity: missing field
+    noid = _s2_kwargs(identity={"reconciliation_id": "x"})
+    assert build_bbo_binding(_pure_bbo_slots(), **noid)[1] \
+        == "BBO_IDENTITY_MISSING"
+    # non-finite exchange ts -> fail-closed BBO_STALE, never a crash
+    nan = _pure_bbo_slots()
+    nan["near"]["bidask_at"] = float("nan")
+    assert build_bbo_binding(nan, **kw)[1] == "BBO_STALE"
+    # valid: version-2 hash binds raw quotes + symbols + identity
+    binding, reason = build_bbo_binding(_pure_bbo_slots(), **kw)
     assert reason is None
-    assert binding["bbo_hash"]
-    assert binding["bbo_captured_at"] > 0
+    assert binding["bbo_hash"] and binding["bbo_captured_at"] > 0
+    import json as _json
+    _payload = _json.dumps(
+        {"version": 2,
+         "near": {"symbol": "TMFH6", "bid": 44900.0, "ask": 44910.0,
+                  "exchange_ts": binding["bbo_captured_at"]},
+         "far": {"symbol": "TMFI6", "bid": 45040.0, "ask": 45060.0,
+                 "exchange_ts": binding["bbo_captured_at"]},
+         "reconciliation_id": "recon-abc123", "snapshot_hash": "s" * 64,
+         "config_hash": "d" * 64, "release_sha": "e" * 40,
+         "session_id": "c" * 32},
+        sort_keys=True, separators=(",", ":"))
+    import hashlib as _hl
+    assert binding["bbo_hash"] == _hl.sha256(
+        _payload.encode()).hexdigest()
 
 
 def test_attach_decision_binding():
     from core.exit_only_position import attach_decision_binding, build_bbo_binding
 
-    binding, _ = build_bbo_binding(_pure_bbo_slots())
+    binding, _ = build_bbo_binding(_pure_bbo_slots(), **_s2_kwargs())
     event = {"order_id": "ORD-1", "trade_id": "mts-20260811-085503"}
     bound = attach_decision_binding(event, _capability(), binding)
 
