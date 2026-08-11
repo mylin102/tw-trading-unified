@@ -219,3 +219,89 @@ def apply_exit_only(ctx: ExecutionContext, capability: dict) -> ExecutionContext
         raise AttestationError("EXIT_ONLY_CONTEXT_INVALID", "capability/context mismatch")
     return replace(ctx, effective_mode=ModeTransitionState.RECONCILED_EXIT_ONLY.value,
                    live_order_allowed=False, exit_only_capability=dict(capability))
+
+
+def _order_value(order: Any, field: str) -> Any:
+    value = getattr(order, field, None)
+    return getattr(value, "value", value)
+
+
+def capability_exit_completed(ctx: ExecutionContext, orders: list[Any]) -> bool:
+    """True only when each exact capability closing leg is FILLED once.
+
+    This intentionally does *not* alter mode or grant normal live trading.
+    It is only the local callback half of the post-exit proof.
+    """
+    cap = getattr(ctx, "exit_only_capability", None)
+    if (getattr(ctx, "effective_mode", None)
+            != ModeTransitionState.RECONCILED_EXIT_ONLY.value
+            or not isinstance(cap, dict) or not isinstance(orders, list)):
+        return False
+    allowed = cap.get("allowed_orders")
+    if not isinstance(allowed, list) or len(allowed) != 2:
+        return False
+    matching = [order for order in orders
+                if getattr(order, "reconciliation_id", None)
+                == cap.get("reconciliation_id")]
+    if len(matching) != 2:
+        return False
+    for item in allowed:
+        leg = [order for order in matching
+               if _order_value(order, "symbol") == item.get("symbol")
+               and str(_order_value(order, "side")).lower()
+               == str(item.get("side", "")).lower()
+               and _order_value(order, "quantity") == item.get("remaining_qty")]
+        if len(leg) != 1 or str(_order_value(leg[0], "status")).lower() != "filled":
+            return False
+    return True
+
+
+def revoke_exit_only_after_flat_snapshot(
+        ctx: ExecutionContext, snapshot: dict | None) -> tuple[ExecutionContext, dict]:
+    """Revoke one exit-only capability after same-session broker-flat proof.
+
+    The result is deliberately LIVE_QUARANTINED, not LIVE_READY.  A separate
+    fresh normal certificate is still required before MTS entries resume.
+    """
+    cap = getattr(ctx, "exit_only_capability", None)
+    if (not isinstance(ctx, ExecutionContext)
+            or ctx.effective_mode != ModeTransitionState.RECONCILED_EXIT_ONLY.value
+            or not isinstance(cap, dict)):
+        raise AttestationError("EXIT_ONLY_CAPABILITY_MISSING", "exit-only capability required")
+    if isinstance(snapshot, dict) and snapshot.get("capture_error"):
+        raise AttestationError("BROKER_SNAPSHOT_UNAVAILABLE", "broker capture failed")
+    if not isinstance(snapshot, dict) or snapshot.get("source") != "live_broker":
+        raise AttestationError("SNAPSHOT_SOURCE_INVALID", "live_broker source required")
+    captured_at = snapshot.get("captured_at")
+    now = int(time.time() * 1000)
+    if (not isinstance(captured_at, int) or isinstance(captured_at, bool)
+            or captured_at > now + 1_000 or now - captured_at > SNAPSHOT_TTL_MS):
+        raise AttestationError("SNAPSHOT_STALE", "post-exit snapshot stale")
+    for field in ("account_id_hash", "session_id", "config_hash", "release_sha"):
+        if snapshot.get(field) != cap.get(field):
+            raise AttestationError("SNAPSHOT_IDENTITY_MISMATCH", field)
+    if snapshot.get("positions") != []:
+        raise AttestationError("EXIT_ONLY_POSITION_NOT_FLAT", "broker still reports positions")
+    if snapshot.get("open_orders") != []:
+        raise AttestationError("OPEN_ORDERS_NOT_EMPTY", "broker still reports open orders")
+    flat_payload = {
+        "version": 2, "source": "live_broker", "captured_at": captured_at,
+        "account_id_hash": snapshot["account_id_hash"],
+        "session_id": snapshot["session_id"],
+        "config_hash": snapshot["config_hash"],
+        "release_sha": snapshot["release_sha"],
+        "positions": [], "open_orders": [],
+    }
+    record = {
+        "reconciliation_id": cap.get("reconciliation_id"),
+        "trade_id": cap.get("trade_id"),
+        "entry_snapshot_hash": cap.get("snapshot_hash"),
+        "snapshot_hash": _hash(flat_payload),
+        "snapshot_captured_at": captured_at,
+        "source": "live_broker",
+    }
+    return replace(ctx,
+                   effective_mode=ModeTransitionState.LIVE_QUARANTINED.value,
+                   live_order_allowed=False,
+                   exit_only_capability=None,
+                   audit_reasons=("EXIT_ONLY_FLAT_RECONCILED",)), record

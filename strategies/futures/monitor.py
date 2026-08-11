@@ -3088,6 +3088,95 @@ class FuturesMonitor:
             f"RECONCILED_EXIT_ONLY[/green]")
         return _record, None
 
+    def _clear_mts_entry_reconcile_intents(self, trade_id: str) -> bool:
+        """Resolve only the incident intent bound to the reconciled trade.
+
+        This is called only after the broker proves the account flat.  A
+        failure stays quarantined; it never re-opens ordinary MTS entry.
+        """
+        try:
+            from core.exit_intent import IntentLog as _MTSIntentLog
+            _ilog = _MTSIntentLog(_mts_intent_log_dir())
+            for _iid in _ilog.list_active():
+                _row = _ilog.get(_iid)
+                if (_row.get("reason") == "MTS_ENTRY_RECONCILE"
+                        and _row.get("trade_id") == trade_id):
+                    _ilog.mark_terminal(_iid, "RECONCILED")
+            return True
+        except Exception:
+            return False
+
+    def _maybe_finalize_exit_only_reconciliation(self) -> tuple:
+        """Turn two confirmed closing fills plus broker-flat proof into a
+        quarantined, re-certifiable context.
+
+        This method deliberately never calls ``transition_with_certificate``.
+        A local callback is not broker reconciliation and cannot resume MTS
+        entry.  Any partial/cancel/reject/expiry becomes quarantine without
+        canceling or reissuing either broker leg.
+        """
+        from core.mode_transition import ModeTransitionState, with_effective_mode
+        from core.reconciled_exit import (
+            AttestationError, capability_exit_completed,
+            revoke_exit_only_after_flat_snapshot,
+        )
+
+        _ctx = getattr(self, "_execution_context", None)
+        _cap = getattr(_ctx, "exit_only_capability", None)
+        if (_ctx is None
+                or getattr(_ctx, "effective_mode", None)
+                != ModeTransitionState.RECONCILED_EXIT_ONLY.value
+                or not isinstance(_cap, dict)):
+            return None, None
+        _orders = list(getattr(getattr(self, "order_mgr", None),
+                               "active_orders", {}).values()) + list(
+                                   getattr(getattr(self, "order_mgr", None),
+                                           "completed", []))
+        _rid = _cap.get("reconciliation_id")
+        _matching = [o for o in _orders
+                     if getattr(o, "reconciliation_id", None) == _rid]
+        _terminal_bad = {"partial_filled", "cancelled", "rejected", "expired"}
+        if any(str(getattr(getattr(o, "status", None), "value",
+                           getattr(o, "status", ""))).lower() in _terminal_bad
+               for o in _matching):
+            _reason = "EXIT_ONLY_TERMINAL_AMBIGUITY"
+            self._execution_context = with_effective_mode(
+                _ctx, ModeTransitionState.LIVE_QUARANTINED.value,
+                live_order_allowed=False, audit_reasons=(_reason,))
+            self._persist_execution_context()
+            self._append_mts_event(_reason, reconciliation_id=_rid)
+            return None, _reason
+        if not capability_exit_completed(_ctx, _matching):
+            return None, None
+        try:
+            _next, _record = revoke_exit_only_after_flat_snapshot(
+                _ctx, self._capture_exit_only_snapshot())
+        except AttestationError as _exc:
+            _reason = _exc.code
+            self._execution_context = with_effective_mode(
+                _ctx, ModeTransitionState.LIVE_QUARANTINED.value,
+                live_order_allowed=False, audit_reasons=(_reason,))
+            self._persist_execution_context()
+            self._append_mts_event("EXIT_ONLY_RECONCILE_FAILED",
+                                   reconciliation_id=_rid, reason=_reason)
+            return None, _reason
+        self._execution_context = _next
+        if not self._clear_mts_entry_reconcile_intents(_cap.get("trade_id", "")):
+            self._execution_context = with_effective_mode(
+                self._execution_context,
+                ModeTransitionState.LIVE_QUARANTINED.value,
+                live_order_allowed=False,
+                audit_reasons=("EXIT_ONLY_FLAT_RECONCILED",
+                               "MTS_ENTRY_RECONCILE_PENDING"))
+            self._persist_execution_context()
+            self._append_mts_event("EXIT_ONLY_RECONCILE_FAILED",
+                                   reconciliation_id=_rid,
+                                   reason="MTS_ENTRY_RECONCILE_PENDING")
+            return None, "MTS_ENTRY_RECONCILE_PENDING"
+        self._persist_execution_context()
+        self._append_mts_event("EXIT_ONLY_FLAT_RECONCILED", **_record)
+        return _record, None
+
 
     def _pending_mts_entry_reconcile(self) -> bool:
         """True when a partial MTS entry needs broker reconciliation."""
@@ -4571,6 +4660,7 @@ class FuturesMonitor:
             
             # [GSD] Always update dashboard file to reflect latest OrderManager state (e.g. FILLED)
             self._save_orders_file_wrapper()
+            self._maybe_finalize_exit_only_reconciliation()
 
         def _on_cancel_callback(event):
             console.print(f" [yellow]🚫 Order CANCELLED: {event.order_id} ({event.reason})[/yellow] ")
@@ -4588,6 +4678,7 @@ class FuturesMonitor:
                 return
             self._clear_pending_lifecycle_order(event.order_id)
             self._save_orders_file_wrapper()
+            self._maybe_finalize_exit_only_reconciliation()
 
         def _on_reject_callback(event):
             console.print(f"[red]❌ Order REJECTED: {event.order_id} ({event.reason})[/red]")
@@ -4613,6 +4704,7 @@ class FuturesMonitor:
                 return
             self._clear_pending_lifecycle_order(event.order_id)
             self._save_orders_file_wrapper()
+            self._maybe_finalize_exit_only_reconciliation()
 
         def _on_status_change(event):
             self._save_orders_file_wrapper()
