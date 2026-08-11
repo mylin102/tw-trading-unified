@@ -470,6 +470,8 @@ def test_b19_real_combined_exit_artifacts(tmp_path, monkeypatch):
     monkeypatch.setenv("MTS_EVENT_LOG_PATH", str(tmp_path / "mts_spread_events.jsonl"))
     monkeypatch.setenv("MTS_FILL_LOG_PATH", str(tmp_path / "mts_trade_fills.jsonl"))
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    import strategies.plugins.futures.active.tmf_spread as _tmf
+    _tmf._MTS_FILL_LOG = str(tmp_path / "mts_trade_fills.jsonl")
     monitor, strat, api = build_monitor(tmp_path, monkeypatch)
     bar = {"near_close": 44100.0, "far_close": 44020.0, "atr": 10.0,
            "timestamp": datetime.now(), "code": "TMFF6"}

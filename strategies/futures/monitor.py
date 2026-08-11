@@ -758,6 +758,8 @@ class FuturesMonitor:
             broker = self.client if self.live_trading else None
             self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=broker,
                                           execution_context=getattr(self, '_execution_context', None))
+            # [S0] registry injected BEFORE any order path (not lazily)
+            self._gateway()
             if _om_mode == "paper":
                 self.paper_fill_sim = PaperFillSimulator(self.order_mgr)
                 self.order_mgr.set_simulator(self.paper_fill_sim)
@@ -3150,6 +3152,65 @@ class FuturesMonitor:
             f"RECONCILED_EXIT_ONLY[/green]")
         return _record, None
 
+    def _gateway_authority(self, strategy=None):
+        """[S0] canonical gateway policy authority bundle."""
+        _ctx = getattr(self, "_execution_context", None)
+        _gw_mode = getattr(_ctx, "effective_mode", "")
+        return {
+            "live": bool(
+                (getattr(self, "live_trading", False)
+                 and not getattr(self, "dry_run", False))
+                or _gw_mode == "reconciled_exit_only"),
+            "mode": _gw_mode,
+            "live_order_allowed": getattr(_ctx, "live_order_allowed", False),
+            "capability": getattr(_ctx, "exit_only_capability", None),
+            "hydrated_position": getattr(self, "_exit_only_position", None),
+            "strategy_reconciliation_id": getattr(
+                strategy, "_reconciliation_id", None),
+            "near_code": getattr(
+                getattr(self, "contract", None), "code", None),
+            "far_code": getattr(
+                getattr(self, "far_contract", None), "code", None),
+            "bbo_slots": self._exit_only_bbo_slots(),
+            "position_has_position": \
+                self._exit_only_position_has_position(),
+        }
+
+    def _authorize_intent(self, action, strategy_name, strategy_obj=None):
+        """[S0] single authorize entry: every MTS order path (auto,
+        manual, emergency) authorizes through the gateway policy."""
+        _gw = self._gateway()
+        _ok, _binding, _reason = _gw.authorize_intent(
+            action=action, strategy=strategy_name,
+            authority=self._gateway_authority(strategy_obj))
+        if _ok and _binding is not None:
+            self._exit_only_decision_binding = _binding
+        return _ok, _binding, _reason
+
+    def _quarantine_mts_exit_leg_failure(self, *, trade_id, leg, reason):
+        """[S0] a combined-exit leg failed (GatewaySubmitError):
+        atomically force LIVE_QUARANTINED (reconciliation-required)
+        and persist.  The intent leg stays durable UNKNOWN; never
+        auto-retry, never cancel."""
+        _ctx = getattr(self, "_execution_context", None)
+        if _ctx is not None and getattr(_ctx, "requested_mode", None) == "live":
+            from dataclasses import replace
+            from core.mode_transition import ModeTransitionState
+            try:
+                _reasons = list(getattr(_ctx, "audit_reasons", ()) or ())
+                _reasons.append(f"MTS_EXIT_LEG_FAILED:{leg}:{reason}")
+                self._execution_context = replace(
+                    _ctx,
+                    effective_mode=ModeTransitionState.LIVE_QUARANTINED.value,
+                    live_order_allowed=False,
+                    audit_reasons=tuple(_reasons[-64:]))
+                self._persist_execution_context()
+            except Exception:
+                pass
+        self._append_mts_event(
+            "EXIT_ONLY_QUARANTINED", action="COMBINED_EXIT",
+            reason=f"{leg}:{reason}", trade_id=trade_id)
+
     def _gateway(self):
         """[S0] lazy OrderIntentGateway: replays the durable intent
         ledger (execution-context payload) and injects the registry
@@ -3167,13 +3228,15 @@ class FuturesMonitor:
             _gw = self._order_intent_gateway = OrderIntentGateway(
                 durable_intents=_durable,
                 record_cb=self._record_gateway_intent)
-            _gw_target = getattr(
-                getattr(self, "order_mgr", None), "broker_adapter", None)
-            if _gw_target is not None:
-                try:
-                    setattr(_gw_target, "_gateway_registry", _gw.registry)
-                except Exception:
-                    pass
+        # [S0] re-inject on every call: the broker_adapter may be
+        # replaced (tests/restarts); the registry stays current.
+        _gw_target = getattr(
+            getattr(self, "order_mgr", None), "broker_adapter", None)
+        if _gw_target is not None:
+            try:
+                setattr(_gw_target, "_gateway_registry", _gw.registry)
+            except Exception:
+                pass
         return _gw
 
     def _record_gateway_intent(self, durable_view):
@@ -3316,36 +3379,13 @@ class FuturesMonitor:
         self._hydrate_exit_only_position()
         if strategy is not None:
             self._hydrate_strategy_position(strategy)
-        _authority = {
-            "live": bool(
-                (getattr(self, "live_trading", False)
-                 and not getattr(self, "dry_run", False))
-                or getattr(_ctx, "effective_mode", "")
-                == "reconciled_exit_only"),
-            "mode": getattr(_ctx, "effective_mode", ""),
-            "live_order_allowed": getattr(_ctx, "live_order_allowed", False),
-            "capability": getattr(_ctx, "exit_only_capability", None),
-            "hydrated_position": getattr(self, "_exit_only_position", None),
-            "strategy_reconciliation_id": getattr(
-                strategy, "_reconciliation_id", None),
-            "near_code": getattr(
-                getattr(self, "contract", None), "code", None),
-            "far_code": getattr(
-                getattr(self, "far_contract", None), "code", None),
-            "bbo_slots": self._exit_only_bbo_slots(),
-            "position_has_position": \
-                self._exit_only_position_has_position(),
-        }
         _intent_strategy = ("MTS_ENTRY"
                            if action in ("BUY_NEAR_SELL_FAR",
                                           "SELL_NEAR_BUY_FAR")
                            else "MTS_EXIT" if action == "EXIT"
                            else "MTS_RELEASE")
-        _ok, _binding, _reason = _gw.authorize_intent(
-            action=action, strategy=_intent_strategy,
-            authority=_authority)
-        if _ok and _binding is not None:
-            self._exit_only_decision_binding = _binding
+        _ok, _binding, _reason = self._authorize_intent(
+            action, _intent_strategy, strategy)
         return _ok, _binding, _reason
 
     def _process_reconciled_exit_attestation_command(self) -> bool:
@@ -5992,41 +6032,13 @@ class FuturesMonitor:
         # merged P0 live / entry / EXIT_ONLY / FLAT policy.
         _gw = self._gateway()
         self._hydrate_exit_only_position()
-        _gw_mode = getattr(
-            getattr(self, "_execution_context", None),
-            "effective_mode", "")
-        _gw_authority = {
-            "live": bool(
-                (getattr(self, "live_trading", False)
-                 and not getattr(self, "dry_run", False))
-                or _gw_mode == "reconciled_exit_only"),
-            "mode": _gw_mode,
-            "live_order_allowed": getattr(
-                getattr(self, "_execution_context", None),
-                "live_order_allowed", False),
-            "capability": getattr(
-                getattr(self, "_execution_context", None),
-                "exit_only_capability", None),
-            "hydrated_position": getattr(
-                self, "_exit_only_position", None),
-            "strategy_reconciliation_id": getattr(
-                strategy, "_reconciliation_id", None),
-            "near_code": getattr(
-                getattr(self, "contract", None), "code", None),
-            "far_code": getattr(
-                getattr(self, "far_contract", None), "code", None),
-            "bbo_slots": self._exit_only_bbo_slots(),
-            "position_has_position": \
-                self._exit_only_position_has_position(),
-        }
         _gw_intent_strategy = ("MTS_ENTRY"
                               if _action in ("BUY_NEAR_SELL_FAR",
                                              "SELL_NEAR_BUY_FAR")
                               else "MTS_EXIT" if _action == "EXIT"
                               else "MTS_RELEASE")
-        _gw_ok, _gw_binding, _gw_reason = _gw.authorize_intent(
-            action=_action, strategy=_gw_intent_strategy,
-            authority=_gw_authority)
+        _gw_ok, _gw_binding, _gw_reason = self._authorize_intent(
+            _action, _gw_intent_strategy, strategy)
         self._exit_only_decision_binding = _gw_binding
         if not _gw_ok:
             self._append_mts_event(
@@ -6044,6 +6056,21 @@ class FuturesMonitor:
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_NEAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) instead of MARKET — 避免滑價
                 _order = self.order_mgr.create_order(symbol=_near_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
+                self._append_mts_event("ORDER_INTENT_CREATED", **_ev_meta(_order))
+
+                # [GSD] Track in lifecycle orders so fill is not ignored
+                self._pending_lifecycle_orders[_order.order_id] = {
+                    "intent_id": _order.intent_id, "signal": "RELEASE_NEAR", "reason": _reason, 
+                    "ts": _ts, "lots": 1, "price": _near_close, "ref_ohlc": _snap["near"],
+                    "strategy": "MTS_RELEASE",
+                }
+
+                if not self._submit_via_gateway(_order):
+                    self._append_mts_event(
+                        "ORDER_INTENT_BLOCKED", action=_action,
+                        reason="SUBMIT_FAILED",
+                        trade_id=getattr(strategy, "_trade_id", ""))
+                    return
                 self._append_mts_event("ORDER_SUBMITTED", **{
                     **_ev_meta(_order),
                     "ref_ohlc": _snap["near"],
@@ -6052,15 +6079,6 @@ class FuturesMonitor:
                     "release_reason": _reason or "RELEASE_STOP",
                     "reason_source": "LIFECYCLE_DECISION",
                 })
-                
-                # [GSD] Track in lifecycle orders so fill is not ignored
-                self._pending_lifecycle_orders[_order.order_id] = {
-                    "intent_id": _order.intent_id, "signal": "RELEASE_NEAR", "reason": _reason, 
-                    "ts": _ts, "lots": 1, "price": _near_close, "ref_ohlc": _snap["near"],
-                    "strategy": "MTS_RELEASE",
-                }
-                
-                self._submit_via_gateway(_order)
                 if self.paper_fill_sim:
                     self.paper_fill_sim.register(_order)
                     # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
@@ -6074,6 +6092,21 @@ class FuturesMonitor:
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_FAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
                 _order = self.order_mgr.create_order(symbol=_far_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
+                self._append_mts_event("ORDER_INTENT_CREATED", **_ev_meta(_order))
+
+                # [GSD] Track in lifecycle orders so fill is not ignored
+                self._pending_lifecycle_orders[_order.order_id] = {
+                    "intent_id": _order.intent_id, "signal": "RELEASE_FAR", "reason": _reason, 
+                    "ts": _ts, "lots": 1, "price": _far_close, "ref_ohlc": _snap["far"],
+                    "strategy": "MTS_RELEASE",
+                }
+
+                if not self._submit_via_gateway(_order):
+                    self._append_mts_event(
+                        "ORDER_INTENT_BLOCKED", action=_action,
+                        reason="SUBMIT_FAILED",
+                        trade_id=getattr(strategy, "_trade_id", ""))
+                    return
                 self._append_mts_event("ORDER_SUBMITTED", **{
                     **_ev_meta(_order),
                     "ref_ohlc": _snap["far"],
@@ -6082,15 +6115,6 @@ class FuturesMonitor:
                     "release_reason": _reason or "RELEASE_STOP",
                     "reason_source": "LIFECYCLE_DECISION",
                 })
-                
-                # [GSD] Track in lifecycle orders so fill is not ignored
-                self._pending_lifecycle_orders[_order.order_id] = {
-                    "intent_id": _order.intent_id, "signal": "RELEASE_FAR", "reason": _reason, 
-                    "ts": _ts, "lots": 1, "price": _far_close, "ref_ohlc": _snap["far"],
-                    "strategy": "MTS_RELEASE",
-                }
-                
-                self._submit_via_gateway(_order)
                 if self.paper_fill_sim:
                     self.paper_fill_sim.register(_order)
                     # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
@@ -6193,12 +6217,11 @@ class FuturesMonitor:
                 # P1-2 dedup: a repeated exit decision must NOT re-send
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} NEAR already submitted — suppressing duplicate[/yellow]")
             except _MTSGWFail as _gwe:
-                # [S0] failed near leg: durable UNKNOWN in the intent
-                # log — quarantine/reconcile; the FAR leg must never
+                # [S0] failed near leg: force LIVE_QUARANTINED + persist
+                # (reconciliation-required); the FAR leg must never
                 # submit after a near failure.
-                self._append_mts_event(
-                    "ORDER_INTENT_SUBMIT_FAILED", action="COMBINED_EXIT",
-                    reason=f"NEAR:{_gwe}", trade_id=_trade_id)
+                self._quarantine_mts_exit_leg_failure(
+                    trade_id=_trade_id, leg="NEAR", reason=str(_gwe))
                 return
             try:
                 _ilog.submit_leg(_iid, "FAR", self.order_mgr,
@@ -6206,11 +6229,10 @@ class FuturesMonitor:
             except _MTSDupSubmit:
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} FAR already submitted — suppressing duplicate[/yellow]")
             except _MTSGWFail as _gwe:
-                # [S0] failed far leg: durable UNKNOWN in the intent log
-                # — quarantine/reconcile; no retry, no cancel.
-                self._append_mts_event(
-                    "ORDER_INTENT_SUBMIT_FAILED", action="COMBINED_EXIT",
-                    reason=f"FAR:{_gwe}", trade_id=_trade_id)
+                # [S0] failed far leg: force LIVE_QUARANTINED + persist
+                # (reconciliation-required); no retry, no cancel.
+                self._quarantine_mts_exit_leg_failure(
+                    trade_id=_trade_id, leg="FAR", reason=str(_gwe))
                 return
             # 2026-07-30: Write state to COMBINED_EXIT only AFTER successful submission
             try:
@@ -6350,9 +6372,7 @@ class FuturesMonitor:
             # B48 (codex C): correlate the decision event through the order
             _order.event_id = getattr(signal, "event_id", "")
             _order.winner = getattr(signal, "winner", "")
-            self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _ref_ohlc,
-                                                          "event_id": _order.event_id,
-                                                          "winner": _order.winner})
+            self._append_mts_event("ORDER_INTENT_CREATED", **{**_ev_meta(_order), "ref_ohlc": _ref_ohlc})
 
             # [GSD] Track in lifecycle orders so fill is not ignored
             self._pending_lifecycle_orders[_order.order_id] = {
@@ -6378,12 +6398,22 @@ class FuturesMonitor:
             _order.intent_id = _iid
             _order.client_order_id = _ilog.get(_iid)["legs"][_leg_label]["client_order_id"]
             from core.exit_intent import DuplicateSubmitError as _MTSDupSubmit
+            from core.order_intent_gateway import (
+                GatewaySubmitError as _MTSGWFail,
+            )
             try:
                 _ilog.submit_leg(_iid, _leg_label, self.order_mgr,
                                  submit_fn=lambda cid, leg: self._submit_via_gateway(_order, raise_on_failure=True))
             except _MTSDupSubmit:
                 # P1-2 dedup: a repeated exit decision must NOT re-send
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} {_leg_label} already submitted — suppressing duplicate[/yellow]")
+            except _MTSGWFail as _gwe:
+                self._quarantine_mts_exit_leg_failure(
+                    trade_id=_trade_id, leg=_leg_label, reason=str(_gwe))
+                return
+            self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _ref_ohlc,
+                                                          "event_id": _order.event_id,
+                                                          "winner": _order.winner})
 
             # ADR-009 Task 9: confirm order submit before lifecycle SUBMITTED
             # Backfill exit_order_id + set SUBMITTED + flush state immediately.
@@ -9171,6 +9201,20 @@ class FuturesMonitor:
                 self._write_manual_command_status(
                     _command_id, "RECEIVED", "monitor 已接收緊急平倉指令", action="close_all",
                 )
+                # [S0] EXIT_ONLY: emergency close_all is NOT gateway
+                # capability-bound — explicitly blocked (zero submit)
+                # until routed through the gateway.
+                if (getattr(getattr(self, "_execution_context", None),
+                            "effective_mode", "")
+                        == "reconciled_exit_only"):
+                    self._append_mts_event(
+                        "ORDER_INTENT_BLOCKED",
+                        action="MTS_EMERGENCY_CLOSE_ALL",
+                        reason="EXIT_ONLY_EMERGENCY_BLOCKED", trade_id="")
+                    self._write_manual_command_status(
+                        _command_id, "FAILED",
+                        "close_all blocked: EXIT_ONLY (gateway capability required)")
+                    return True
                 # 2026-07-07 Gemini CLI: P0: Increment generation on emergency close to invalidate past callbacks
                 self._lifecycle_generation += 1
                 self._emergency_reset_at = datetime.now()
@@ -9702,8 +9746,17 @@ class FuturesMonitor:
                     console.print(f"[yellow]📝 [MANUAL_TRADE] NEAR={_near_side} ref={_near:.1f} (MKP) {_near_code}[/yellow]")
                     console.print(f"[yellow]📝 [MANUAL_TRADE] FAR={_far_side} ref={_far:.1f} (MKP) {_far_code}[/yellow]")
                     
+                    # [S0] manual entries authorize through the gateway
+                    # (EXIT_ONLY blocks MTS_MANUAL before any construction)
+                    _mn_ok, _mn_binding, _mn_reason = self._authorize_intent(
+                        "MANUAL_TRADE", "MTS_MANUAL")
+                    if not _mn_ok:
+                        self._append_mts_event(
+                            "ORDER_INTENT_BLOCKED", action="MANUAL_TRADE",
+                            reason=_mn_reason, trade_id="")
+                        return
                     _near_order = self.order_mgr.create_order(symbol=_near_code, side=_near_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_MANUAL")  # 2026-07-09 Hermes Agent: distinguish manual trade from auto MTS_ENTRY; enables active order guard at line 5710
-                    self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_near_order))
+                    self._append_mts_event("ORDER_INTENT_CREATED", **_ev_meta(_near_order))
                     # 2026-06-08 JVS Claw: Add trade_id for watchdog partial fill detection
                     # 2026-07-09 Hermes Agent: strategy=MTS_MANUAL to match order creation tag above
                     self._pending_lifecycle_orders[_near_order.order_id] = {
@@ -9714,13 +9767,18 @@ class FuturesMonitor:
                         "trade_id": _trade_id,
                         "strategy": "MTS_MANUAL",  # 2026-07-09 Hermes Agent: distinguish from auto MTS_ENTRY
                     }
-                    self.order_mgr.submit(_near_order)
+                    if not self._submit_via_gateway(_near_order):
+                        self._append_mts_event(
+                            "ORDER_INTENT_BLOCKED", action="MANUAL_TRADE",
+                            reason="SUBMIT_FAILED", trade_id="")
+                        return
+                    self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_near_order))
                     if self.paper_fill_sim:
                         self.paper_fill_sim.register(_near_order)
 
                     # 2026-06-08 JVS Claw: MKP (範圍市價)
                     _far_order = self.order_mgr.create_order(symbol=_far_code, side=_far_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_MANUAL")  # 2026-07-09 Hermes Agent: match near leg MTS_MANUAL tag
-                    self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_far_order))
+                    self._append_mts_event("ORDER_INTENT_CREATED", **_ev_meta(_far_order))
                     # 2026-06-08 JVS Claw: Add trade_id for watchdog partial fill detection
                     # 2026-07-09 Hermes Agent: strategy=MTS_MANUAL to match order creation tag above
                     self._pending_lifecycle_orders[_far_order.order_id] = {
@@ -9731,7 +9789,12 @@ class FuturesMonitor:
                         "trade_id": _trade_id,
                         "strategy": "MTS_MANUAL",  # 2026-07-09 Hermes Agent: match near leg MTS_MANUAL tag
                     }
-                    self.order_mgr.submit(_far_order)
+                    if not self._submit_via_gateway(_far_order):
+                        self._append_mts_event(
+                            "ORDER_INTENT_BLOCKED", action="MANUAL_TRADE",
+                            reason="SUBMIT_FAILED", trade_id="")
+                        return
+                    self._append_mts_event("ORDER_SUBMITTED", **_ev_meta(_far_order))
                     if self.paper_fill_sim:
                         self.paper_fill_sim.register(_far_order)
 

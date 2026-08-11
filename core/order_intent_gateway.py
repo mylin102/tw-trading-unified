@@ -260,9 +260,14 @@ class OrderIntentGateway:
             return False, "GATEWAY_RECONCILE_REQUIRED"
 
         def _receipt() -> dict:
+            # canonical broker identity only: a non-string (e.g. a mock
+            # attribute in tests) is never a legitimate exchange identity
+            _boid = getattr(order, "exchange_order_id", None)
+            if not isinstance(_boid, str) or not _boid:
+                _boid = None
             return {
-                "order_id": order.order_id,
-                "broker_order_id": getattr(order, "exchange_order_id", None),
+                "order_id": getattr(order, "order_id", None),
+                "broker_order_id": _boid,
             }
 
         if mode != "live" or exchange_ordno is not None:
