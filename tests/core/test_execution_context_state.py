@@ -128,3 +128,33 @@ def test_restart_round_trip(tmp_path):
     assert data["effective_mode"] == "live_ready"
     assert data["audit_reasons"] == ["CERT_OK"]
     assert data["live_order_allowed"] is True
+
+
+def test_exit_only_capability_round_trips_restart_safe(tmp_path):
+    import core.execution_context_state as st
+    capability = {
+        "reconciliation_id": "recon-1",
+        "allowed_orders": [{"symbol": "TMFH6", "side": "buy", "remaining_qty": 1}],
+    }
+    st.persist_execution_context(_ctx_dict(
+        effective_mode="reconciled_exit_only",
+        exit_only_capability=capability,
+    ), runtime_dir=str(tmp_path))
+    data = st.read_execution_context(runtime_dir=str(tmp_path))
+    assert data["effective_mode"] == "reconciled_exit_only"
+    assert data["live_order_allowed"] is False
+    assert data["exit_only_capability"]["reconciliation_id"] == "recon-1"
+
+
+def test_exit_only_without_valid_capability_fails_closed(tmp_path):
+    import core.execution_context_state as st
+    payload = _ctx_dict(
+        effective_mode="reconciled_exit_only",
+        exit_only_capability="not-a-capability",
+        revision=1,
+        updated_at="2026-08-11T00:00:00Z",
+    )
+    (tmp_path / "execution_context.json").write_text(json.dumps(payload))
+    data = st.read_execution_context(runtime_dir=str(tmp_path))
+    assert data["effective_mode"] == "live_quarantined"
+    assert "STATE_FILE_CORRUPTED" in data["audit_reasons"]

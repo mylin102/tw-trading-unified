@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from core.order_management.order import OrderSide, OrderStatus, OrderType
 from core.order_management.order_manager import OrderManager
+from core.mode_transition import ExecutionContext, ModeTransitionState
 from strategies.futures.squeeze_futures.data.shioaji_client import ShioajiClient
 
 
@@ -19,6 +20,11 @@ def _new_order(manager):
 def test_shioaji_object_bridge_passes_contract_action_and_quantity():
     """The domain Order never reaches the positional broker API directly."""
     client = ShioajiClient.__new__(ShioajiClient)
+    client._execution_context = ExecutionContext(
+        requested_mode="live",
+        effective_mode=ModeTransitionState.LIVE_READY.value,
+        live_order_allowed=True,
+    )
     contract = SimpleNamespace(code="TMFH6")
     received = {}
     client.get_contract = lambda symbol: contract
@@ -28,7 +34,7 @@ def test_shioaji_object_bridge_passes_contract_action_and_quantity():
                         quantity=quantity, price=price)
         return "receipt"
 
-    client.place_order = place_order
+    client._place_order_unchecked = place_order
     manager = OrderManager(mode="paper")
     result = client.place_order_object(_new_order(manager))
 
