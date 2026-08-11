@@ -668,6 +668,72 @@ def test_e2e_manual_entry_normal_live_submits(monkeypatch):
     assert len(submitted) == 2
 
 
+def test_e2e_manual_partial_far_failure_quarantines(monkeypatch, tmp_path):
+    """[verdict P0-1] live MTS_MANUAL: near accepted (broker receipt) then
+    FAR submit fails => exactly one far attempt (no retry), the ctx is
+    force-quarantined with a durable MTS_ENTRY_RECONCILE intent, and the
+    restart gate blocks re-certification (zero entry authorization)."""
+    import time
+    from pathlib import Path
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    class _PartialAdapter(_FakeAdapter):
+        """Near accepted; far rejected locally (no broker receipt)."""
+
+        def place_order_object(self, order):
+            self.calls.append({"order_id": order.order_id,
+                               "symbol": order.symbol})
+            order.exchange_order_id = f"BROKER-{order.order_id}"
+            if order.symbol == "TMFI6":
+                return None
+            return SimpleNamespace(id=order.exchange_order_id, seqno="1")
+
+    _adapter = _PartialAdapter()
+    monitor, events = _flag_monitor(_live_ctx(), {
+        "action": "spread", "side": "SELL_NEAR_BUY_FAR",
+        "near_close": 44905, "far_close": 45038.5,
+        "created_at": time.time(), "command_id": "cmd-partial"})
+    monitor.api = _adapter
+    monitor.order_mgr.broker_adapter = _adapter
+    monitor._gateway()          # registry injected into the new adapter
+    monitor._registry["tmf_spread"]._has_position = False
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s0_no_state.json"))
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
+    monitor._process_manual_trade_flag()
+
+    # near accepted once + far attempted exactly once (no retry)
+    symbols = [c["symbol"] for c in monitor.api.calls]
+    assert symbols == ["TMFH6", "TMFI6"]
+    assert symbols.count("TMFI6") == 1
+    # forced LIVE_QUARANTINED with the entry-partial audit reason
+    ctx = monitor._execution_context
+    assert ctx.effective_mode == "live_quarantined"
+    assert ctx.live_order_allowed is False
+    assert any("MTS_ENTRY_PARTIAL_SUBMISSION" in (r or "")
+               for r in ctx.audit_reasons)
+    # durable restart-safe reconciliation intent
+    from core.exit_intent import IntentLog
+    ilog = IntentLog(str(tmp_path))
+    reasons = [ilog.get(i).get("reason") for i in ilog.list_active()
+               if ilog.get(i).get("reason") == "MTS_ENTRY_RECONCILE"]
+    assert reasons, "durable MTS_ENTRY_RECONCILE intent missing"
+    # restart gate: a fresh LIVE ctx over the same intent dir is
+    # re-quarantined — entry authorization stays zero
+    assert monitor._pending_reconcile_reason() == "MTS_ENTRY_RECONCILE_PENDING"
+    fresh, _ = _monitor(_live_ctx())
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
+    fresh._apply_reconcile_pending_gate()
+    assert fresh._execution_context.effective_mode == "live_quarantined"
+    assert fresh._execution_context.live_order_allowed is False
+    with pytest.raises(RuntimeError) as exc:
+        fresh.api.place_order_object(_order("ORD-PRE", "MTS_ENTRY"))
+    assert "ADAPTER_GATEWAY_AUTHORIZATION_MISSING" in str(exc.value)
+
+
 def test_e2e_emergency_close_all_blocked_in_exit_only(monkeypatch):
     """[repair B] emergency close_all in EXIT_ONLY is explicitly blocked —
     zero submit, zero adapter call."""
@@ -831,6 +897,56 @@ def test_combined_exit_far_failure_no_retry(monkeypatch, tmp_path):
     assert submitted.count("TMFI6") == 1   # no retry
     quarantined = [e for e in events if e[0] == "EXIT_ONLY_QUARANTINED"]
     assert quarantined and "FAR:SUBMIT_REJECTED" in quarantined[0][1]["reason"]
+
+
+def test_combined_exit_far_failure_persist_failure_keeps_quarantined(
+        monkeypatch, tmp_path):
+    """[verdict P0-2] combined NEAR receipt + FAR failure with the context
+    persist RAISING must still leave a durable MTS_EXIT_RECONCILE marker;
+    a fresh LIVE ctx over the same intent dir is re-quarantined (zero
+    entry authorization) — a persist failure cannot restart into
+    certification."""
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    def _boom():
+        raise RuntimeError("PERSIST_FAILED")
+
+    monitor, events = _monitor(_exit_only_ctx())
+    monitor._hydrate_exit_only_position()
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
+
+    def _sub(order):
+        if order.symbol == "TMFI6":       # far leg rejected locally
+            return False
+        order.exchange_order_id = f"BROKER-{order.order_id}"
+        return True
+
+    monitor.order_mgr.submit = _sub
+    monitor._persist_execution_context = _boom
+    signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+    monitor._submit_mts_order_signal(
+        signal, _bound_strategy(), {}, __import__("datetime").datetime.now())
+
+    # in-memory quarantine still applied (replace precedes the persist)
+    ctx = monitor._execution_context
+    assert ctx.effective_mode == "live_quarantined"
+    assert ctx.live_order_allowed is False
+    # durable restart-safe marker exists despite the persist failure
+    from core.exit_intent import IntentLog
+    ilog = IntentLog(str(tmp_path))
+    reasons = [ilog.get(i).get("reason") for i in ilog.list_active()
+               if ilog.get(i).get("reason") == "MTS_EXIT_RECONCILE"]
+    assert reasons, "durable MTS_EXIT_RECONCILE intent missing"
+    assert monitor._pending_reconcile_reason() == "MTS_EXIT_RECONCILE_PENDING"
+    # fresh LIVE ctx over the same intent dir cannot certify
+    fresh, _ = _monitor(_live_ctx())
+    fresh._apply_reconcile_pending_gate()
+    assert fresh._execution_context.effective_mode == "live_quarantined"
+    assert fresh._execution_context.live_order_allowed is False
 
 
 def test_oco_blocked_all_modes():
