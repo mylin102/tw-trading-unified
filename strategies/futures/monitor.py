@@ -3134,6 +3134,80 @@ class FuturesMonitor:
             f"RECONCILED_EXIT_ONLY[/green]")
         return _record, None
 
+    def _process_reconciled_exit_attestation_command(self) -> bool:
+        """Atomically consume one operator request for EXIT_ONLY attestation.
+
+        This is deliberately separate from the legacy manual-entry flag.  A
+        command never names an order or an execution price: it can only ask
+        the monitor to take a fresh read-only broker snapshot and, if every
+        attestation rule passes, enter the *more restrictive* exit-only mode.
+        It is terminal on success or rejection; an operator must issue a new
+        current command after any failed proof.
+        """
+        try:
+            _path = Path(runtime_path(
+                "commands", "reconciled_exit_attestation.json"))
+            _processing = Path(str(_path) + ".processing")
+            if not _path.exists() and not _processing.exists():
+                return False
+            if _path.exists():
+                try:
+                    _path.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(_path, _processing)
+                except OSError:
+                    return False
+            try:
+                _raw = json.loads(_processing.read_text(encoding="utf-8"))
+            except Exception:
+                _raw = None
+            _reason = None
+            _record = None
+            _command_id = ""
+            if not isinstance(_raw, dict):
+                _reason = "COMMAND_INVALID"
+            else:
+                _command_id = _raw.get("command_id", "")
+                _created = _raw.get("created_at")
+                _allowed = {
+                    "command_id", "action", "created_at", "operator",
+                    "trade_id", "evidence", "expected_legs", "attested_at",
+                }
+                if (not isinstance(_command_id, str) or not _command_id
+                        or set(_raw) - _allowed
+                        or _raw.get("action") != "ATTEST_EXIT_ONLY"):
+                    _reason = "COMMAND_INVALID"
+                elif (not isinstance(_created, int) or isinstance(_created, bool)
+                      or abs(int(time.time() * 1000) - _created) > 60_000):
+                    _reason = "COMMAND_EXPIRED"
+                else:
+                    _record, _reason = self._operator_attest_exit_only(
+                        operator=_raw.get("operator", ""),
+                        trade_id=_raw.get("trade_id", ""),
+                        evidence=_raw.get("evidence", ""),
+                        expected_legs=_raw.get("expected_legs", []),
+                        attested_at=_raw.get("attested_at", ""),
+                    )
+            if _reason is None:
+                self._exit_only_attestation_status = "ATTESTED"
+                self._append_mts_event(
+                    "OPERATOR_ATTESTATION_COMMAND_APPLIED",
+                    command_id=_command_id,
+                    trade_id=(_record or {}).get("trade_id"),
+                    snapshot_hash=(_record or {}).get("snapshot_hash"),
+                )
+            else:
+                self._exit_only_attestation_status = f"REJECTED: {_reason}"
+                self._append_mts_event(
+                    "OPERATOR_ATTESTATION_COMMAND_REJECTED",
+                    command_id=_command_id, reason=_reason)
+            return True
+        finally:
+            try:
+                if '_processing' in locals() and _processing.exists():
+                    _processing.unlink()
+            except OSError:
+                pass
+
     def _clear_mts_entry_reconcile_intents(self, trade_id: str) -> bool:
         """Resolve only the incident intent bound to the reconciled trade.
 
@@ -10309,6 +10383,12 @@ class FuturesMonitor:
 
     def _strategy_tick(self):
         console.print("[STICK_00_ENTER] dry_run=%s" % self.dry_run)
+
+        # This command can only tighten a live position into the exact
+        # RECONCILED_EXIT_ONLY capability; it is intentionally independent of
+        # the legacy manual-entry flag and may be reviewed before any strategy
+        # decision runs.
+        self._process_reconciled_exit_attestation_command()
 
         # 2026-05-27 Gemini CLI: MTS Safety Watchdog (P4)
         # Replaces and expands _check_stale_mts_orders
