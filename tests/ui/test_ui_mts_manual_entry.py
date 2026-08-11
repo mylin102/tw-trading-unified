@@ -63,3 +63,19 @@ def test_dashboard_dual_config_sync():
     assert "_counterpart_cfg_name" in content
     assert "futures_night.yaml" in content
     assert "release_stop_points" in content
+
+
+def test_dashboard_exit_only_attestation_is_separate_from_manual_entry_flag():
+    """The recovery request is a one-shot attestation, never an entry flag.
+
+    The monitor has the final broker-snapshot validation; this UI contract
+    ensures the dashboard cannot accidentally reuse the legacy manual-entry
+    command channel or overwrite an outstanding request.
+    """
+    dashboard_path = Path(__file__).parent.parent.parent / "ui" / "dashboard.py"
+    content = dashboard_path.read_text(encoding="utf-8")
+    assert "對帳部位：受限平倉授權" in content
+    assert '"commands", "reconciled_exit_attestation.json"' in content
+    assert '"action": "ATTEST_EXIT_ONLY"' in content
+    assert "os.O_EXCL" in content
+    assert "建立受限平倉授權請求" in content
