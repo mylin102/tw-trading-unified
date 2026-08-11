@@ -4389,6 +4389,71 @@ class FuturesMonitor:
         self._save_orders_file_wrapper()
         return result
 
+    def on_order_event(self, order_state, data) -> None:
+        """Apply one Shioaji futures callback to the canonical lifecycle.
+
+        ``main.order_dispatcher`` is the single registered Shioaji callback.
+        It dispatches futures events here; without this bridge, a broker
+        receipt remains SUBMITTED forever even after an exchange fill.
+        Local order identity is never inferred from contract/side: the broker
+        receipt identifiers (id/seqno/ordno) must match an active order.
+        """
+        if not getattr(self, "order_mgr", None):
+            return
+
+        payload = self.order_mgr._payload_to_dict(data) or {}
+        state_value = str(getattr(order_state, "value", order_state))
+        is_futures_deal = "FuturesDeal" in state_value
+        is_futures_order = "FuturesOrder" in state_value
+        if not (is_futures_deal or is_futures_order):
+            return
+
+        broker_order_id = payload.get("id") or payload.get("broker_order_id")
+        ordno = payload.get("ordno")
+        seqno = payload.get("seqno")
+        reason = str(payload.get("errmsg") or payload.get("reason") or "")
+
+        if is_futures_deal:
+            try:
+                fill_price = float(payload.get("price") or 0)
+                fill_qty = int(payload.get("quantity") or 0)
+            except (TypeError, ValueError):
+                return
+            if fill_price <= 0 or fill_qty <= 0:
+                return
+            order = self.order_mgr.apply_deal_fill(
+                None,
+                deal_id=payload.get("trade_id") or payload.get("deal_id"),
+                fill_price=fill_price,
+                fill_qty=fill_qty,
+                exchange_fill_id=payload.get("trade_id") or payload.get("deal_id"),
+                broker_trade_id=payload.get("trade_id"),
+                exchange_seq=payload.get("exchange_seq"),
+                raw_payload=payload,
+                broker_order_id=broker_order_id,
+                seqno=seqno,
+                ordno=ordno,
+                source="shioaji_callback",
+                reason=reason,
+            )
+            if order is None:
+                logger.warning(
+                    "[FUTURES_DEAL_UNMATCHED] id=%s seqno=%s ordno=%s",
+                    broker_order_id, seqno, ordno,
+                )
+            return
+
+        self.order_mgr.apply_order_update(
+            None,
+            raw_status=payload.get("status") or state_value,
+            reason=reason,
+            raw_payload=payload,
+            broker_order_id=broker_order_id,
+            seqno=seqno,
+            ordno=ordno,
+            source="shioaji_callback",
+        )
+
     def _wire_order_callbacks(self):
         """Wire OrderManager callbacks to PaperTrader and audit system."""
         from core.order_management.order import OrderStatus, OrderSide
@@ -8469,14 +8534,13 @@ class FuturesMonitor:
             # (in-memory idempotency set is lost but broker still has pending orders).
             # Uses Order.strategy (NOT strategy_id) per Order class line 87.
             # active_orders is Dict[str, Order] → .values() to iterate.
-            if self.order_mgr and getattr(self.order_mgr, 'active_orders', None):
-                _existing = [o for o in self.order_mgr.active_orders.values()
-                             if getattr(o, 'strategy', '') == "MTS_MANUAL"]
-                if _existing:
-                    self._manual_trade_status = "SKIPPED: PENDING_ORDER_EXISTS"
-                    console.print(f"[yellow]⏭️ [MANUAL_TRADE] Skipped: order already in flight[/yellow]")
-                    os.remove(_processing_path)
-                    return True
+            if self._mts_has_pending_mts_orders():
+                self._manual_trade_status = "SKIPPED: PENDING_MTS_ORDER_EXISTS"
+                console.print(
+                    "[yellow]⏭️ [MANUAL_TRADE] Skipped: MTS order already in flight[/yellow]"
+                )
+                os.remove(_processing_path)
+                return True
             
             _action = _flag.get("action", "")
             

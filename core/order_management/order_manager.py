@@ -662,11 +662,17 @@ class OrderManager:
         tax: float = 0.0,
         raw_payload: Optional[Dict[str, Any]] = None,
         broker_order_id: Optional[str] = None,
+        seqno: Optional[str] = None,
         ordno: Optional[str] = None,
         source: str = "",
         reason: str = "",
     ) -> Optional[Order]:
-        order = self._resolve_order(order_id, broker_order_id=broker_order_id, ordno=ordno)
+        order = self._resolve_order(
+            order_id,
+            broker_order_id=broker_order_id,
+            seqno=seqno,
+            ordno=ordno,
+        )
         if order is None:
             return None
 
@@ -697,7 +703,7 @@ class OrderManager:
             to_status=order.status,
             payload=raw_payload,
             broker_order_id=broker_order_id or order.broker_order_id,
-            seqno=order.seqno,
+            seqno=seqno or order.seqno,
             ordno=ordno or order.ordno,
             deal_id=deal_id or broker_trade_id or exchange_fill_id or exchange_seq,
             fill_price=fill_price,
