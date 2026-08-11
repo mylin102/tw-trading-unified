@@ -123,7 +123,7 @@ def _monitor_for_exit_only(statuses=("filled", "filled"), snapshot=None):
     monitor._persist_execution_context = lambda: setattr(monitor, "persisted", True)
     monitor.events = []
     monitor._append_mts_event = lambda typ, **kw: monitor.events.append((typ, kw))
-    monitor._clear_mts_entry_reconcile_intents = lambda: True
+    monitor._clear_mts_entry_reconcile_intents = lambda *args: True
     return monitor
 
 
