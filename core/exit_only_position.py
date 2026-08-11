@@ -25,6 +25,7 @@ from core.reconciled_exit import AttestationError
 
 # Contemporaneous BBO window (ms) for an exit decision.
 BBO_TTL_MS: int = 15_000
+BBO_SKEW_MS: int = 1_000  # [S2] named conservative cross-leg skew bound
 
 ENTRY_ACTIONS: frozenset = frozenset(
     {"BUY_NEAR_SELL_FAR", "SELL_NEAR_BUY_FAR"})
@@ -103,16 +104,34 @@ def hydrate_exit_only_position(capability: Any) -> dict:
 
 
 def build_bbo_binding(bbo_slots: Any, *, now_ms: Optional[int] = None,
-                      ttl_ms: int = BBO_TTL_MS) -> tuple:
-    """Validate contemporaneous near/far BBO and return a decision binding.
+                      ttl_ms: int = BBO_TTL_MS,
+                      skew_ms: int = BBO_SKEW_MS,
+                      near_code: Optional[str] = None,
+                      far_code: Optional[str] = None,
+                      identity: Optional[dict] = None) -> tuple:
+    """[S2] Validate contemporaneous near/far BBO + decision identity and
+    return a version-2 canonical binding hash.
 
-    bbo_slots: {"near": {"bid", "ask", "bidask_at"}, "far": {...}}
-    Returns (binding, None) or (None, reason) where reason is one of
-    BBO_MISSING / BBO_STALE / BBO_AMBIGUOUS.
+    Each leg requires: exact expected contract code (BBO_CODE_MISMATCH),
+    positive finite bid <= ask (BBO_MISSING / BBO_AMBIGUOUS), finite
+    positive epoch-ms exchange timestamp, not future beyond 1s
+    (BBO_FUTURE), TTL <= 15s (BBO_STALE); cross-leg skew <= 1s
+    (BBO_SKEW).  The decision identity (cap reconciliation_id, position
+    snapshot hash, config_hash, release_sha, session_id) must be present
+    (BBO_IDENTITY_MISSING).  The hash binds both raw bid/ask, exchange
+    timestamps, symbols AND the identity — any bad dimension returns
+    (None, reason) => N/A/BLOCKED, zero evaluator submit/order.
     """
     if not isinstance(bbo_slots, dict):
         return None, "BBO_MISSING"
+    if not isinstance(identity, dict):
+        return None, "BBO_IDENTITY_MISSING"
+    _id_keys = ("reconciliation_id", "snapshot_hash", "config_hash",
+                "release_sha", "session_id")
+    if any(not identity.get(k) for k in _id_keys):
+        return None, "BBO_IDENTITY_MISSING"
     now = now_ms if now_ms is not None else int(time.time() * 1000)
+    expected = {"near": near_code, "far": far_code}
     slots = {}
     for leg in ("near", "far"):
         slot = bbo_slots.get(leg)
@@ -120,27 +139,43 @@ def build_bbo_binding(bbo_slots: Any, *, now_ms: Optional[int] = None,
             return None, "BBO_MISSING"
         bid = _positive_float(slot.get("bid"))
         ask = _positive_float(slot.get("ask"))
-        ts = slot.get("bidask_at")
         if bid is None or ask is None:
             return None, "BBO_MISSING"
+        if slot.get("code") != expected[leg]:
+            return None, "BBO_CODE_MISMATCH"
         if bid > ask:
             return None, "BBO_AMBIGUOUS"
-        if not isinstance(ts, (int, float)) or ts <= 0:
+        ts = slot.get("bidask_at")
+        if (not isinstance(ts, (int, float)) or not math.isfinite(ts)
+                or ts <= 0):
             return None, "BBO_STALE"
         ts_ms = int(ts * 1000) if ts < 1e12 else int(ts)
+        if ts_ms > now + 1_000:
+            return None, "BBO_FUTURE"
         if now - ts_ms > ttl_ms:
             return None, "BBO_STALE"
-        slots[leg] = {"bid": bid, "ask": ask, "bidask_at": ts_ms}
+        slots[leg] = {"symbol": slot.get("code"), "bid": bid, "ask": ask,
+                      "exchange_ts": ts_ms}
+
+    if abs(slots["near"]["exchange_ts"] - slots["far"]["exchange_ts"]) \
+            > skew_ms:
+        return None, "BBO_SKEW"
 
     payload = {
-        "version": 1,
+        "version": 2,
         "near": slots["near"],
         "far": slots["far"],
+        "reconciliation_id": identity["reconciliation_id"],
+        "snapshot_hash": identity["snapshot_hash"],
+        "config_hash": identity["config_hash"],
+        "release_sha": identity["release_sha"],
+        "session_id": identity["session_id"],
     }
     bbo_hash = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    captured_at = max(slots["near"]["bidask_at"], slots["far"]["bidask_at"])
+    captured_at = max(slots["near"]["exchange_ts"],
+                      slots["far"]["exchange_ts"])
     return {"bbo_hash": bbo_hash, "bbo_captured_at": captured_at}, None
 
 

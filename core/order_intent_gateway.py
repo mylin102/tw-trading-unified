@@ -218,7 +218,17 @@ class OrderIntentGateway:
                 or authority.get("strategy_reconciliation_id")
                 != cap.get("reconciliation_id")):
             return False, None, "EXIT_ONLY_STRATEGY_BLOCKED"
-        binding, reason = build_bbo_binding(authority.get("bbo_slots") or {})
+        _bbo_slots = authority.get("bbo_slots") or {}
+        _identity = {
+            "reconciliation_id": cap.get("reconciliation_id"),
+            "snapshot_hash": cap.get("snapshot_hash"),
+            "config_hash": cap.get("config_hash"),
+            "release_sha": cap.get("release_sha"),
+            "session_id": cap.get("session_id"),
+        }
+        binding, reason = build_bbo_binding(
+            _bbo_slots, near_code=authority.get("near_code"),
+            far_code=authority.get("far_code"), identity=_identity)
         if binding is None:
             return False, None, reason
         legs = cap.get("legs") or []

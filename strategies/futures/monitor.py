@@ -3297,6 +3297,10 @@ class FuturesMonitor:
         return _payload
 
     def _exit_only_bbo_slots(self):
+        # [S2] pass-through: each slot carries its OWN quoted contract
+        # code (verified against the bound contracts by the gateway
+        # binding) — never inject the bound code here (that would make
+        # the code check vacuous).
         _ticker = getattr(self, "ticker", "TMF")
         return {
             "near": getattr(self, "market_data", {}).get(_ticker, {}),
