@@ -57,9 +57,10 @@ class ShioajiClient:
         _gw_registry = getattr(self, "_gateway_registry", None)
         if (_gw_registry is not None
                 and method in ("place_order", "place_order_object")
-                and not _gw_registry.verify_pending_submission()):
+                and not _gw_registry.verify_pending_submission(order)):
             raise AdapterOrderError(
-                "ADAPTER_GATEWAY_AUTHORIZATION_MISSING")
+                code="ADAPTER_GATEWAY_AUTHORIZATION_MISSING",
+                context={"method": method})
         """[Step 8] execution-context gate: non-LIVE_READY or ctx=None
         makes ZERO broker calls and raises the canonical structured gate
         exception LiveOrderBlocked (typed reason); LIVE_READY permits the

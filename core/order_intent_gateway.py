@@ -3,19 +3,23 @@
 Process-local GatewayAuthorization (NOT a bearer string): bound to
 {intent_id, execution_attempt, session_generation, process_epoch, expiry};
 single-use; dies on restart.  The adapter verifies through the injected
-gateway registry; direct adapter calls without authorization fail.
-Only the authorization fingerprint is ever persistable; token material
-never leaves the process.
+gateway registry, bound to the exact order being submitted; direct adapter
+calls (or calls for a different order than the pending authorization)
+are rejected.  Only the authorization fingerprint is ever persistable.
 
 Policy (merged from the signal-level gates): paper passes through
 unchanged; LIVE_READY behaves as before (state-file FLAT check merged);
-RECONCILED_EXIT_ONLY admits only exact capability-bound MTS_EXIT /
-MTS_RELEASE (subject to OrderManager/adapter defense); entry / manual /
-generic / OCO are denied; OCO is explicitly rejected at the gateway.
+every other LIVE mode (LIVE_QUARANTINED etc.) is explicitly denied —
+never reclassified as paper; RECONCILED_EXIT_ONLY admits only exact
+capability-bound MTS_EXIT / MTS_RELEASE (subject to OrderManager/adapter
+defense); entry / manual / generic / OCO are denied; OCO is explicitly
+rejected at the gateway.
 
-PENDING_SUBMIT rule: the intent is durably represented (order_mgr order)
-before the adapter submission; a missing broker receipt marks
-PENDING_RECONCILE and the intent never resubmits automatically.
+PENDING_SUBMIT rule: the intent is durably recorded (record_cb -> the
+execution-context payload) BEFORE the adapter submission; a missing broker
+receipt marks PENDING_RECONCILE (a local rejection marks REJECTED) and
+the intent never resubmits automatically — a fresh gateway (restart)
+replays the durable intents and refuses resubmission (GATEWAY_RECONCILE_REQUIRED).
 """
 
 from __future__ import annotations
@@ -34,8 +38,14 @@ AUTH_TTL_S: float = 30.0
 PENDING_SUBMIT = "PENDING_SUBMIT"
 SUBMITTED = "SUBMITTED"
 PENDING_RECONCILE = "PENDING_RECONCILE"
+REJECTED = "REJECTED"
 
 EXIT_STRATEGIES: frozenset = frozenset({"MTS_EXIT", "MTS_RELEASE"})
+
+
+class GatewaySubmitError(Exception):
+    """Raised by _submit_via_gateway(raise_on_failure=True): the exit-intent
+    submit_leg contract requires a failed leg to never be marked SUBMITTED."""
 
 
 @dataclass(frozen=True)
@@ -64,8 +74,9 @@ class GatewayAuthorizationRegistry:
     """Process-local; single-use; dies on restart (fresh registry).
 
     The adapter is injected with this registry and verifies the pending
-    submission before any place call.  Direct adapter calls have no
-    pending authorization and fail.
+    submission — bound to the exact order_id — before any place call.
+    Direct adapter calls, or calls for a different order than the pending
+    authorization, fail.
     """
 
     def __init__(self, process_epoch: Optional[str] = None):
@@ -100,8 +111,14 @@ class GatewayAuthorizationRegistry:
             return False
         return True
 
-    def verify_pending_submission(self) -> bool:
-        return self._pending is not None and self.verify(self._pending)
+    def verify_pending_submission(self, order: Any = None) -> bool:
+        """Pending authorization must be live AND bound to the exact order."""
+        if self._pending is None or not self.verify(self._pending):
+            return False
+        oid = getattr(order, "order_id", None)
+        if oid is not None and oid != self._pending.intent_id:
+            return False
+        return True
 
     def consume(self, auth: Any) -> bool:
         if not self.verify(auth):
@@ -120,22 +137,50 @@ class GatewayAuthorizationRegistry:
 
 
 class OrderIntentGateway:
-    """In-memory intent ledger + merged policy + submission authorization."""
+    """In-memory intent ledger + merged policy + submission authorization.
+
+    ``durable_intents`` replays the persisted intent ledger (restart
+    recovery); every state change is pushed to ``record_cb`` so the caller
+    can persist it durably (execution-context payload).
+    """
 
     def __init__(self, registry: Optional[GatewayAuthorizationRegistry] = None,
-                 process_epoch: Optional[str] = None):
+                 process_epoch: Optional[str] = None,
+                 durable_intents: Optional[dict] = None,
+                 record_cb: Optional[Callable] = None):
         self._registry = registry or GatewayAuthorizationRegistry(process_epoch)
         self._intents: dict = {}
+        self._record_cb = record_cb
+        for iid, rec in (durable_intents or {}).items():
+            _rec = dict(rec)
+            _rec["_durable"] = True
+            self._intents[iid] = _rec
 
     @property
     def registry(self) -> GatewayAuthorizationRegistry:
         return self._registry
 
+    def durable_view(self) -> dict:
+        """The persisted-safe ledger (internal flags excluded)."""
+        out = {}
+        for iid, rec in self._intents.items():
+            out[iid] = {k: v for k, v in rec.items() if not k.startswith("_")}
+        return out
+
+    def _record(self, intent_id: str) -> None:
+        if self._record_cb is not None:
+            try:
+                self._record_cb(self.durable_view())
+            except Exception:
+                pass
+
     # ── merged policy (P0 live / entry / EXIT_ONLY / FLAT) ────────────────
 
     def authorize_intent(self, *, action: str, strategy: Any,
                          authority: dict) -> tuple:
-        """(ok, binding, reason).  Paper passes through unchanged."""
+        """(ok, binding, reason).  True paper passes through unchanged;
+        every live mode outside LIVE_READY / RECONCILED_EXIT_ONLY is
+        explicitly denied (never reclassified as paper)."""
         if not authority.get("live"):
             return True, None, None
         sname = strategy if isinstance(strategy, str) \
@@ -143,14 +188,13 @@ class OrderIntentGateway:
         if sname == "MTS_RELEASE_OCO":
             return False, None, "GATEWAY_OCO_DISABLED"
         mode = authority.get("mode")
-        if mode != "reconciled_exit_only":
-            if (mode == "live_ready"
-                    and authority.get("live_order_allowed") is True):
-                if action in ("EXIT", "PARTIAL_EXIT") \
-                        and not authority.get("position_has_position"):
-                    return False, None, "EXIT_FLAT_BLOCKED"
-                return True, None, None
+        if mode not in ("live_ready", "reconciled_exit_only"):
             return False, None, "LIVE_ORDER_AUTHORIZATION_FAILED"
+        if mode == "live_ready":
+            if action in ("EXIT", "PARTIAL_EXIT") \
+                    and not authority.get("position_has_position"):
+                return False, None, "EXIT_FLAT_BLOCKED"
+            return True, None, None
         # EXIT_ONLY: exact capability-bound closing orders only
         if action in ENTRY_ACTIONS:
             return False, None, "EXIT_ONLY_ENTRY_BLOCKED"
@@ -182,10 +226,11 @@ class OrderIntentGateway:
             session_generation: str = "", exchange_ordno: Optional[str] = None,
             submit_callable: Optional[Callable] = None) -> tuple:
         """Record the intent durably, issue a single-use authorization and
-        submit.  Receipt missing -> PENDING_RECONCILE, never auto-resubmit.
+        submit.  Returns (ok, payload): on success the canonical receipt
+        dict; on failure the typed reason.  A local rejection marks REJECTED,
+        a missing broker receipt PENDING_RECONCILE — never auto-resubmit.
 
         Paper (mode != live or exchange_ordno) -> direct submit unchanged.
-        Returns (ok, reason_or_empty).
         """
         intent_id = getattr(order, "order_id", None)
         if not intent_id or submit_callable is None:
@@ -197,27 +242,49 @@ class OrderIntentGateway:
             "reconciliation_id": getattr(order, "reconciliation_id", None),
             "session_generation": session_generation,
         })
-        if rec["state"] == PENDING_RECONCILE:
+        fresh = (not rec.get("_durable")
+                 and rec["state"] == PENDING_SUBMIT
+                 and rec["execution_attempt"] == 0)
+        if not fresh:
             return False, "GATEWAY_RECONCILE_REQUIRED"
+
+        def _receipt() -> dict:
+            return {
+                "order_id": order.order_id,
+                "broker_order_id": getattr(order, "exchange_order_id", None),
+            }
+
         if mode != "live" or exchange_ordno is not None:
             rec["state"] = SUBMITTED
+            self._record(intent_id)
             if exchange_ordno is not None:
                 ok = bool(submit_callable(order, exchange_ordno=exchange_ordno))
             else:
                 ok = bool(submit_callable(order))
-            return ok, ("" if ok else "SUBMIT_FAILED")
+            if not ok:
+                rec["state"] = REJECTED
+                self._record(intent_id)
+                return False, "SUBMIT_REJECTED"
+            return True, _receipt()
         rec["execution_attempt"] += 1
+        self._record(intent_id)  # durable PENDING_SUBMIT before the adapter call
         auth = self._registry.issue(
             intent_id, rec["execution_attempt"], session_generation)
         try:
             ok = bool(submit_callable(order))
         finally:
             self._registry.consume(auth)
-        if ok and getattr(order, "exchange_order_id", None):
-            rec["state"] = SUBMITTED
-            return True, ""
-        rec["state"] = PENDING_RECONCILE
-        return False, "GATEWAY_RECEIPT_MISSING_RECONCILE"
+        if not ok:
+            rec["state"] = REJECTED
+            self._record(intent_id)
+            return False, "SUBMIT_REJECTED"
+        if not getattr(order, "exchange_order_id", None):
+            rec["state"] = PENDING_RECONCILE
+            self._record(intent_id)
+            return False, "GATEWAY_RECEIPT_MISSING_RECONCILE"
+        rec["state"] = SUBMITTED
+        self._record(intent_id)
+        return True, _receipt()
 
     def intent_state(self, intent_id: str) -> Optional[str]:
         rec = self._intents.get(intent_id)

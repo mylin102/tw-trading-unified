@@ -2878,7 +2878,11 @@ class FuturesMonitor:
                 pass
         try:
             from core.execution_context_state import persist_execution_context
-            persist_execution_context(self._execution_context.to_dict())
+            _payload = self._execution_context.to_dict()
+            _gw = getattr(self, "_order_intent_gateway", None)
+            if _gw is not None:
+                _payload["gateway_intents"] = _gw.durable_view()
+            persist_execution_context(_payload)
         except Exception as _pexc:
             console.print(f"[dim]⚠️ exec ctx persist failed: {_pexc} "
                           f"(file keeps last good state)[/dim]")
@@ -3146,30 +3150,64 @@ class FuturesMonitor:
             f"RECONCILED_EXIT_ONLY[/green]")
         return _record, None
 
-    def _submit_via_gateway(self, order, exchange_ordno=None):
-        """[S0] Route every MTS signal submission through the gateway."""
+    def _gateway(self):
+        """[S0] lazy OrderIntentGateway: replays the durable intent
+        ledger (execution-context payload) and injects the registry
+        into the ACTUAL broker_adapter the OrderManager uses."""
         _gw = getattr(self, "_order_intent_gateway", None)
         if _gw is None:
             from core.order_intent_gateway import OrderIntentGateway
-            _gw = self._order_intent_gateway = OrderIntentGateway()
-            _gw_api = getattr(self, "api", None)
-            if _gw_api is not None:
+            _durable = {}
+            try:
+                from core.execution_context_state import read_execution_context
+                _st = read_execution_context()
+                _durable = (_st or {}).get("gateway_intents") or {}
+            except Exception:
+                pass
+            _gw = self._order_intent_gateway = OrderIntentGateway(
+                durable_intents=_durable,
+                record_cb=self._record_gateway_intent)
+            _gw_target = getattr(
+                getattr(self, "order_mgr", None), "broker_adapter", None)
+            if _gw_target is not None:
                 try:
-                    setattr(_gw_api, "_gateway_registry", _gw.registry)
+                    setattr(_gw_target, "_gateway_registry", _gw.registry)
                 except Exception:
                     pass
+        return _gw
+
+    def _record_gateway_intent(self, durable_view):
+        """[S0] persist the gateway intent ledger via the
+        execution-context payload (existing durable mechanism)."""
+        try:
+            self._persist_execution_context()
+        except Exception:
+            pass
+
+    def _submit_via_gateway(self, order, exchange_ordno=None,
+                            raise_on_failure=False):
+        """[S0] Route every MTS signal submission through the gateway.
+
+        Returns the canonical receipt dict on success, False on failure
+        (or raises GatewaySubmitError when raise_on_failure is set —
+        the exit-intent submit_leg contract: a failed leg must never
+        be marked SUBMITTED)."""
+        _gw = self._gateway()
         _ctx = getattr(self, "_execution_context", None)
         _live = bool(getattr(self, "live_trading", False)
                      and not getattr(self, "dry_run", False))
-        _mode = ("live" if (_live
-                            and getattr(_ctx, "effective_mode", "")
-                            in ("live_ready", "reconciled_exit_only"))
-                 else "paper")
+        _mode = "live" if _live else "paper"
         _sg = getattr(_ctx, "session_id", "") or ""
-        return _gw.submit_with_authorization(
+        _ok, _payload = _gw.submit_with_authorization(
             order, mode=_mode, session_generation=_sg,
             exchange_ordno=exchange_ordno,
             submit_callable=self.order_mgr.submit)
+        if not _ok:
+            if raise_on_failure:
+                from core.order_intent_gateway import GatewaySubmitError
+                raise GatewaySubmitError(_payload)
+            return False
+        return _payload
 
     def _exit_only_bbo_slots(self):
         _ticker = getattr(self, "ticker", "TMF")
@@ -3269,8 +3307,11 @@ class FuturesMonitor:
         if strategy is not None:
             self._hydrate_strategy_position(strategy)
         _authority = {
-            "live": getattr(_ctx, "effective_mode", "")
-            in ("live_ready", "reconciled_exit_only"),
+            "live": bool(
+                (getattr(self, "live_trading", False)
+                 and not getattr(self, "dry_run", False))
+                or getattr(_ctx, "effective_mode", "")
+                == "reconciled_exit_only"),
             "mode": getattr(_ctx, "effective_mode", ""),
             "live_order_allowed": getattr(_ctx, "live_order_allowed", False),
             "capability": getattr(_ctx, "exit_only_capability", None),
@@ -5092,6 +5133,15 @@ class FuturesMonitor:
         """
         if not self.paper_fill_sim or not self.order_mgr:
             return
+        # [S0] EXIT_ONLY: OCO creation/submission is blocked at the
+        # gateway boundary (no Order construction, no submit) until
+        # S9 routes OCO through the gateway.
+        if (getattr(getattr(self, "_execution_context", None),
+                    "effective_mode", "") == "reconciled_exit_only"):
+            self._append_mts_event(
+                "ORDER_INTENT_BLOCKED", action="OCO_RECONCILE",
+                reason="GATEWAY_OCO_DISABLED", trade_id="")
+            return
 
         _state_path = _mts_position_state_path()
         if not _state_path.exists():
@@ -5172,6 +5222,15 @@ class FuturesMonitor:
         Called from _mts_tick() after strategy init, before price polling.
         """
         if not self.paper_fill_sim or not self.order_mgr:
+            return
+        # [S0] EXIT_ONLY: OCO creation/submission is blocked at the
+        # gateway boundary (no Order construction, no submit) until
+        # S9 routes OCO through the gateway.
+        if (getattr(getattr(self, "_execution_context", None),
+                    "effective_mode", "") == "reconciled_exit_only"):
+            self._append_mts_event(
+                "ORDER_INTENT_BLOCKED", action="OCO_RECONCILE",
+                reason="GATEWAY_OCO_DISABLED", trade_id="")
             return
         if not hasattr(strategy, '_lifecycle_oca'):
             return
@@ -5925,22 +5984,16 @@ class FuturesMonitor:
 
         # [S0 gateway] single MTS order-intent authorization boundary:
         # merged P0 live / entry / EXIT_ONLY / FLAT policy.
-        _gw = getattr(self, "_order_intent_gateway", None)
-        if _gw is None:
-            from core.order_intent_gateway import OrderIntentGateway
-            _gw = self._order_intent_gateway = OrderIntentGateway()
-            _gw_api = getattr(self, "api", None)
-            if _gw_api is not None:
-                try:
-                    setattr(_gw_api, "_gateway_registry", _gw.registry)
-                except Exception:
-                    pass
+        _gw = self._gateway()
         self._hydrate_exit_only_position()
         _gw_mode = getattr(
             getattr(self, "_execution_context", None),
             "effective_mode", "")
         _gw_authority = {
-            "live": _gw_mode in ("live_ready", "reconciled_exit_only"),
+            "live": bool(
+                (getattr(self, "live_trading", False)
+                 and not getattr(self, "dry_run", False))
+                or _gw_mode == "reconciled_exit_only"),
             "mode": _gw_mode,
             "live_order_allowed": getattr(
                 getattr(self, "_execution_context", None),
@@ -6126,13 +6179,13 @@ class FuturesMonitor:
             from core.exit_intent import DuplicateSubmitError as _MTSDupSubmit
             try:
                 _ilog.submit_leg(_iid, "NEAR", self.order_mgr,
-                                 submit_fn=lambda cid, leg: self._submit_via_gateway(_near_order))
+                                 submit_fn=lambda cid, leg: self._submit_via_gateway(_near_order, raise_on_failure=True))
             except _MTSDupSubmit:
                 # P1-2 dedup: a repeated exit decision must NOT re-send
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} NEAR already submitted — suppressing duplicate[/yellow]")
             try:
                 _ilog.submit_leg(_iid, "FAR", self.order_mgr,
-                                 submit_fn=lambda cid, leg: self._submit_via_gateway(_far_order))
+                                 submit_fn=lambda cid, leg: self._submit_via_gateway(_far_order, raise_on_failure=True))
             except _MTSDupSubmit:
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} FAR already submitted — suppressing duplicate[/yellow]")
             # 2026-07-30: Write state to COMBINED_EXIT only AFTER successful submission
@@ -6303,7 +6356,7 @@ class FuturesMonitor:
             from core.exit_intent import DuplicateSubmitError as _MTSDupSubmit
             try:
                 _ilog.submit_leg(_iid, _leg_label, self.order_mgr,
-                                 submit_fn=lambda cid, leg: self._submit_via_gateway(_order))
+                                 submit_fn=lambda cid, leg: self._submit_via_gateway(_order, raise_on_failure=True))
             except _MTSDupSubmit:
                 # P1-2 dedup: a repeated exit decision must NOT re-send
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} {_leg_label} already submitted — suppressing duplicate[/yellow]")
@@ -6398,9 +6451,7 @@ class FuturesMonitor:
                 "far_tick_age_ms": 0,
             }
             
-            _near_submit_ok, _near_submit_reason = \
-                self._submit_via_gateway(_o_near)
-            if not _near_submit_ok:
+            if not self._submit_via_gateway(_o_near):
                 self._pending_lifecycle_orders.pop(_o_near.order_id, None)
                 # ``create_order`` registers both legs as active before the
                 # first I/O attempt so paper's synchronous fills can correlate
@@ -6428,9 +6479,7 @@ class FuturesMonitor:
                 # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
                 self.paper_fill_sim.process_tick(self._make_synthetic_tick(_near_close, _ts, symbol=_near_code))
 
-            _far_submit_ok, _far_submit_reason = \
-                self._submit_via_gateway(_o_far)
-            if not _far_submit_ok:
+            if not self._submit_via_gateway(_o_far):
                 self._pending_lifecycle_orders.pop(_o_far.order_id, None)
                 self._append_mts_event("ORDER_REJECTED_LOCAL", **{
                     **_ev_meta(_o_far), "ref_ohlc": _snap["far"],
