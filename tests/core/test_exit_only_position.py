@@ -180,6 +180,14 @@ def _monitor(ctx, slots=None):
     return monitor, events
 
 
+def _bound_strategy(rid="recon-abc123", trade_id="mts-20260811-085503"):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        _trade_id=trade_id, _reconciliation_id=rid,
+        _near_side="SHORT", _far_side="LONG",
+        _near_qty=1, _far_qty=1, _has_position=True)
+
+
 def test_monitor_hydrates_position_and_emits_event():
     monitor, events = _monitor(_exit_only_ctx())
 
@@ -225,7 +233,8 @@ def test_exit_only_guard_missing_bbo_zero_order():
     monitor._hydrate_exit_only_position()
     events.clear()
 
-    ok, binding, reason = monitor._exit_only_decision_guard("COMBINED_EXIT")
+    ok, binding, reason = monitor._exit_only_decision_guard(
+        "COMBINED_EXIT", _bound_strategy())
 
     assert ok is False and binding is None
     assert reason == "BBO_MISSING"
@@ -237,12 +246,14 @@ def test_exit_only_guard_eligible_with_valid_bbo():
     monitor._hydrate_exit_only_position()
     events.clear()
 
-    ok, binding, reason = monitor._exit_only_decision_guard("COMBINED_EXIT")
+    ok, binding, reason = monitor._exit_only_decision_guard(
+        "COMBINED_EXIT", _bound_strategy())
 
     assert ok is True and reason is None
     assert binding["bbo_hash"]
 
-    ok, binding, reason = monitor._exit_only_decision_guard("RELEASE_NEAR")
+    ok, binding, reason = monitor._exit_only_decision_guard(
+        "RELEASE_NEAR", _bound_strategy())
     assert ok is True and reason is None
 
 
