@@ -435,3 +435,26 @@ def test_manual_spread_is_refused_while_automatic_mts_entry_is_in_flight(tmp_pat
     assert not flag_path.exists()
     assert not (tmp_path / "manual.flag.processing").exists()
     assert automatic.status is OrderStatus.SUBMITTED
+
+
+def test_manual_spread_is_refused_after_automatic_entry_has_filled(tmp_path):
+    """A completed automatic pair remains an open MTS position."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    flag_path = tmp_path / "manual.flag"
+    flag_path.write_text(json.dumps({
+        "action": "spread", "side": "SELL_NEAR_BUY_FAR", "created_at": time.time(),
+    }))
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.manual_trade_flag_path = str(flag_path)
+    monitor._processed_flag_ids = set()
+    monitor._flag_retry_count = 0
+    monitor._manual_trade_status = "READY"
+    monitor.order_mgr = OrderManager(mode="paper")
+    monitor.cfg = {"mts": {"flag_ttl_seconds": 3600}}
+    monitor._registry = {"tmf_spread": SimpleNamespace(_has_position=True)}
+
+    assert monitor._process_manual_trade_flag() is True
+    assert monitor._manual_trade_status == "SKIPPED: MTS_POSITION_EXISTS"
+    assert monitor.order_mgr.active_orders == {}
+    assert not flag_path.exists()
