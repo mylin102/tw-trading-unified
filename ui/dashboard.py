@@ -594,15 +594,18 @@ def build_exit_only_attestation_request(
     if isinstance(capability, dict):
         locked_legs = _normalize_exit_only_expected_legs(
             capability.get("legs"))
+        # Refreshes retain the capability's audit identity.  In particular,
+        # never accept a form/caller-provided replacement Trade ID here.
+        locked_trade_id = str(capability.get("trade_id", "")).strip()
     else:
         locked_legs = _normalize_exit_only_expected_legs(expected_legs)
+        locked_trade_id = str(trade_id or "").strip()
     if locked_legs is None:
         raise ValueError("受限平倉授權必須是兩腿、非零且方向明確的部位")
 
     operator = str(operator or "").strip()
-    trade_id = str(trade_id or "").strip()
     evidence = str(evidence or "").strip()
-    if not operator or not trade_id or not evidence:
+    if not operator or not locked_trade_id or not evidence:
         raise ValueError("操作者、Trade ID 與人工佐證不可空白")
 
     created_at = int(time.time() * 1000) if now_ms is None else int(now_ms)
@@ -611,7 +614,7 @@ def build_exit_only_attestation_request(
         "action": "ATTEST_EXIT_ONLY",
         "created_at": created_at,
         "operator": operator,
-        "trade_id": trade_id,
+        "trade_id": locked_trade_id,
         "evidence": evidence,
         "expected_legs": locked_legs,
     }
@@ -3426,6 +3429,8 @@ elif _selected_product == "TMF":
                     _attest_path.exists() or _attest_processing.exists())
                 _cap_legs = _normalize_exit_only_expected_legs(
                     _cap.get("legs")) if isinstance(_cap, dict) else None
+                _cap_trade_id = str(_cap.get("trade_id", "")).strip() \
+                    if isinstance(_cap, dict) else ""
                 if _pending_attestation:
                     st.info("⏳ 已有對帳平倉授權指令待 Monitor 消費；不覆蓋既有指令。")
                 else:
@@ -3436,9 +3441,9 @@ elif _selected_product == "TMF":
                             f"目前為受限平倉：`{_effective}` · "
                             f"reconciliation `{str(_cap.get('reconciliation_id', ''))[:12]}`\n\n"
                             "新進場、一般手動建倉與泛用撤改單均已封鎖。")
-                        if _cap_legs is None:
+                        if _cap_legs is None or not _cap_trade_id:
                             st.error(
-                                "現有 capability 腿部資料不完整；為避免擴大受限範圍，"
+                                "現有 capability 腿部或 Trade ID 資料不完整；為避免擴大受限範圍，"
                                 "無法建立更新對帳。")
                             _submit_attestation = False
                             _operator = _trade_id = _evidence = ""
@@ -3451,10 +3456,8 @@ elif _selected_product == "TMF":
                             with _a1:
                                 _operator = st.text_input(
                                     "操作者", key="exit_only_update_operator")
-                                _trade_id = st.text_input(
-                                    "對帳 Trade ID",
-                                    value=str(_cap.get("trade_id", "mts-20260811-085503")),
-                                    key="exit_only_update_trade_id")
+                                _trade_id = _cap_trade_id
+                                st.text(f"對帳 Trade ID（鎖定）：{_trade_id}")
                             with _a2:
                                 _evidence = st.text_area(
                                     "新的人工佐證（不可輸入密碼、金鑰或憑證）",
