@@ -2947,15 +2947,18 @@ class FuturesMonitor:
                 return False
 
         # capture the prior canonical state for best-effort rollback
-        _prior_file_bytes = None
+        _prior_payload = None
+        _prior_file_existed = False
         _rf = None
         try:
             _rf = runtime_path("execution_context.json")
-            if os.path.exists(_rf):
-                with open(_rf, "rb") as _fr:
-                    _prior_file_bytes = _fr.read()
+            _prior_file_existed = os.path.exists(_rf)
+            if _prior_file_existed:
+                with open(_rf, "r", encoding="utf-8") as _fr:
+                    _prior_payload = json.loads(_fr.read() or "{}") or {}
         except Exception:
-            _prior_file_bytes = None
+            _prior_payload = None
+            _prior_file_existed = False
 
         try:
             from core.execution_context_state import persist_execution_context
@@ -2980,12 +2983,18 @@ class FuturesMonitor:
                         setattr(_c2, _a2, _p2)
                     except Exception:
                         pass
-                if _prior_file_bytes is not None and _rf is not None:
-                    try:
-                        with open(_rf, "wb") as _fw:
-                            _fw.write(_prior_file_bytes)
-                    except Exception:
-                        pass
+                try:
+                    from core.execution_context_state import (
+                        persist_execution_context as _persist_ctx_fn)
+                    if _prior_file_existed and _prior_payload is not None:
+                        # canonical ATOMIC re-persist of the prior state
+                        _persist_ctx_fn(_prior_payload)
+                    elif _rf is not None and os.path.exists(_rf):
+                        # no prior state: remove the new file so nothing
+                        # EXIT_ONLY survives a restart (no split-brain)
+                        os.remove(_rf)
+                except Exception:
+                    pass
                 return False
         return True
 
