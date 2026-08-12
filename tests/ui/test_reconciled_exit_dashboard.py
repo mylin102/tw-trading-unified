@@ -247,6 +247,31 @@ def test_exit_only_legacy_paper_data_is_never_a_pnl_fallback():
     assert result["total_pnl"] is None
 
 
+def test_exit_only_non_dict_leg_container_is_na():
+    """[P1 gap] a malformed leg CONTAINER (None / str / list element)
+    must yield typed EXIT_ONLY_CAPABILITY_INVALID — never an
+    AttributeError the dashboard broad-except would swallow."""
+    from ui.reconciled_exit_presentation import (
+        exit_only_upl_presentation)
+
+    for _leg in (None, "TMFH6", ["near"], 3, True):
+        c = _context()
+        c["exit_only_capability"] = dict(c["exit_only_capability"])
+        c["exit_only_capability"]["legs"] = [_leg, _leg]
+        res = exit_only_upl_presentation(
+            c, None, now_ms=NOW_MS)
+        assert res["kind"] == "NA", repr(_leg)
+        assert res["reason"] == "EXIT_ONLY_CAPABILITY_INVALID", repr(_leg)
+        assert res["total_pnl"] is None, repr(_leg)
+    # one dict + one non-dict is also typed NA
+    c = _context()
+    c["exit_only_capability"] = dict(c["exit_only_capability"])
+    c["exit_only_capability"]["legs"] = [
+        dict(c["exit_only_capability"]["legs"][0]), None]
+    res = exit_only_upl_presentation(c, None, now_ms=NOW_MS)
+    assert res["reason"] == "EXIT_ONLY_CAPABILITY_INVALID"
+
+
 def test_exit_only_malformed_capability_leg_is_na():
     """[P1 closure] malformed capability legs (bad side, non-numeric or
     non-positive qty, non-numeric cost) => typed
