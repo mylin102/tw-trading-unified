@@ -143,6 +143,74 @@ def test_hydrate_preserves_broker_costs_and_trade_id_no_pnl():
 
 # ── BBO binding ───────────────────────────────────────────────────────────
 
+def test_bbo_binding_rejects_float_or_seconds_timestamps():
+    """[S2 audit] exchange_ts_ms must be type(x) is int (not bool) and
+    >= 1e12 epoch-ms; float seconds / float epoch-ms / integer seconds /
+    bool are each rejected as BBO_STALE — the binding NEVER rescales."""
+    from core.exit_only_position import build_bbo_binding
+
+    kw = _s2_kwargs()
+    now = time.time()
+    # float current epoch seconds
+    fsec = _pure_bbo_slots(now=now)
+    fsec["near"]["exchange_ts_ms"] = float(now)
+    assert build_bbo_binding(fsec, **kw)[1] == "BBO_STALE"
+    # float epoch-ms
+    fms = _pure_bbo_slots(now=now)
+    fms["near"]["exchange_ts_ms"] = float(now * 1000)
+    assert build_bbo_binding(fms, **kw)[1] == "BBO_STALE"
+    # integer seconds
+    isec = _pure_bbo_slots(now=now)
+    isec["near"]["exchange_ts_ms"] = int(now)
+    assert build_bbo_binding(isec, **kw)[1] == "BBO_STALE"
+    # bool
+    bsec = _pure_bbo_slots(now=now)
+    bsec["near"]["exchange_ts_ms"] = True
+    assert build_bbo_binding(bsec, **kw)[1] == "BBO_STALE"
+    # missing
+    miss = _pure_bbo_slots(now=now)
+    miss["near"].pop("exchange_ts_ms")
+    assert build_bbo_binding(miss, **kw)[1] == "BBO_STALE"
+    # genuine int epoch-ms passes
+    ok, reason = build_bbo_binding(_pure_bbo_slots(now=now), **kw)
+    assert reason is None and ok and ok["bbo_hash"]
+
+
+def test_bbo_failure_evidence_canonical_payload():
+    """[S2 audit] blocked decisions carry a canonical bbo_input_v2 failure
+    payload: version, JSON-safe raw near/far, identity fields, reason and
+    a deterministic hash of that payload."""
+    from core.exit_only_position import build_bbo_failure_evidence
+
+    ev = build_bbo_failure_evidence(_pure_bbo_slots(), _S2_IDENTITY,
+                                    "BBO_STALE")
+    assert ev["version"] == "bbo_input_v2"
+    assert ev["near"]["code"] == "TMFH6"
+    assert ev["far"]["code"] == "TMFI6"
+    assert ev["near"]["bid"] == 44900.0 and ev["near"]["ask"] == 44910.0
+    assert ev["reconciliation_id"] == "recon-abc123"
+    assert ev["snapshot_hash"] == "s" * 64
+    assert ev["config_hash"] == "d" * 64
+    assert ev["release_sha"] == "e" * 40
+    assert ev["session_id"] == "c" * 32
+    assert ev["reason"] == "BBO_STALE"
+    assert ev["evidence_hash"]
+    import json as _json
+    import hashlib as _hl
+    _p = {k: ev[k] for k in ("version", "near", "far",
+                             "reconciliation_id", "snapshot_hash",
+                             "config_hash", "release_sha", "session_id",
+                             "reason")}
+    assert ev["evidence_hash"] == _hl.sha256(
+        _json.dumps(_p, sort_keys=True,
+                    separators=(",", ":")).encode()).hexdigest()
+    # JSON-safe: non-serializable values never break the payload
+    weird = _pure_bbo_slots()
+    weird["near"]["seq"] = object()
+    ev2 = build_bbo_failure_evidence(weird, _S2_IDENTITY, "BBO_SKEW")
+    assert ev2["reason"] == "BBO_SKEW" and ev2["evidence_hash"]
+
+
 def test_bbo_binding_missing_stale_ambiguous():
     from core.exit_only_position import build_bbo_binding
 

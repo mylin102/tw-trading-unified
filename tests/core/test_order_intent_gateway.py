@@ -763,6 +763,109 @@ def test_e2e_manual_partial_far_failure_quarantines(monkeypatch, tmp_path):
 
 # ── S1: EXIT_ONLY pre-evaluation position hydration ─────────────────────
 
+def test_s2_audit_blocked_event_canonical_failure_payload(monkeypatch):
+    """[S2 audit] every EXIT_ONLY ORDER_INTENT_BLOCKED persists the
+    canonical bbo_input_v2 failure payload: version, JSON-safe raw
+    near/far slots, cap identity fields, reason and a deterministic
+    evidence_hash — for stale, tick-only and wrong-code alike; zero
+    adapter submission."""
+    import json
+    import time as _time
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    def _drive(cache, reason_expect):
+        monitor, events = _monitor(_fresh_exit_only_ctx())
+        monitor._exit_only_bbo_cache = cache
+        monitor._hydrate_exit_only_position()
+        monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                            lambda: True)
+        signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+        monitor._submit_mts_order_signal(
+            signal, _bound_strategy(trade_id="mts-s2a-1"), {},
+            __import__("datetime").datetime.now())
+        assert monitor.api.calls == [], reason_expect
+        blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
+        assert blocked and blocked[-1][1].get("reason") == reason_expect, (
+            reason_expect, [e[1].get("reason") for e in blocked])
+        return blocked[-1][1]
+
+    def _slots(**over):
+        s = _bbo_slots()
+        for k, v in over.items():
+            s[k].update(v)
+        return s
+
+    # stale
+    ev = _drive(
+        {"near": _slots(TMF={"exchange_ts_ms":
+                             int(_time.time() * 1000) - 60_000})["TMF"],
+         "far": _bbo_slots()["TMF_FAR"]},
+        "BBO_STALE")
+    assert ev["bbo_input_v2"]["near"]["exchange_ts_ms"] <= int(_time.time() * 1000) - 50_000
+    # tick-only (no evidence) -> BBO_MISSING, payload still canonical
+    ev = _drive({"near": {}, "far": {}}, "BBO_MISSING")
+    # wrong code
+    ev = _drive(
+        {"near": _slots(TMF={"code": "TMFZ6"})["TMF"],
+         "far": _bbo_slots()["TMF_FAR"]},
+        "BBO_CODE_MISMATCH")
+    assert ev["bbo_input_v2"]["near"]["code"] == "TMFZ6"
+    # identity present in every failure payload
+    for _n in ("reconciliation_id", "snapshot_hash", "config_hash",
+               "release_sha", "session_id"):
+        assert ev["bbo_input_v2"][_n] is not None, _n
+    # hash is reproducible from the payload itself
+    import json as _json
+    import hashlib as _hl
+    _p = {k: ev["bbo_input_v2"][k] for k in (
+        "version", "near", "far", "reconciliation_id", "snapshot_hash",
+        "config_hash", "release_sha", "session_id", "reason")}
+    assert ev["bbo_input_v2"]["evidence_hash"] == _hl.sha256(
+        _json.dumps(_p, sort_keys=True,
+                    separators=(",", ":")).encode()).hexdigest()
+    # no secrets in the payload
+    assert "password" not in json.dumps(ev["bbo_input_v2"])
+    assert "token" not in json.dumps(ev["bbo_input_v2"])
+
+
+def test_s2_audit_float_seconds_timestamp_zero_submit(monkeypatch):
+    """[S2 audit] float seconds / float epoch-ms / integer seconds
+    exchange timestamps are each rejected (BBO_STALE) with zero adapter
+    submission; genuine int epoch-ms evidence still exits."""
+    import time as _time
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    def _drive(near_ts, expect_ok):
+        monitor, events = _monitor(_fresh_exit_only_ctx())
+        slots = _bbo_slots()
+        near = dict(slots["TMF"])
+        if near_ts is not None:
+            near["exchange_ts_ms"] = near_ts
+        monitor._exit_only_bbo_cache = {"near": near, "far": slots["TMF_FAR"]}
+        monitor._hydrate_exit_only_position()
+        monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                            lambda: True)
+        signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+        monitor._submit_mts_order_signal(
+            signal, _bound_strategy(trade_id="mts-s2a-2"), {},
+            __import__("datetime").datetime.now())
+        if expect_ok:
+            assert len(monitor.api.calls) == 2
+        else:
+            assert monitor.api.calls == []
+            blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
+            assert blocked and blocked[-1][1].get("reason") == "BBO_STALE"
+
+    now = _time.time()
+    _drive(now, expect_ok=False)            # float seconds
+    _drive(now * 1000, expect_ok=False)     # float epoch-ms
+    _drive(int(now), expect_ok=False)       # integer seconds
+    _drive(None, expect_ok=True)            # genuine int epoch-ms
+    _drive(True, expect_ok=False)           # bool
+
+
 def test_s2_exit_only_bad_bbo_dimension_zero_submit(monkeypatch):
     """[S2] each bad BBO dimension (missing/stale/future/skew/code/
     ambiguous/identity) => ORDER_INTENT_BLOCKED with the typed reason and
@@ -988,7 +1091,12 @@ def test_s2_repair_raw_payload_persisted_in_events(monkeypatch):
     assert monitor.api.calls == []
     blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
     assert blocked and blocked[-1][1].get("reason") == "BBO_STALE"
-    evidence = blocked[-1][1].get("bbo_evidence")
+    evidence = blocked[-1][1].get("bbo_input_v2")
+    assert evidence is not None
+    assert evidence["version"] == "bbo_input_v2"
+    assert evidence["reason"]
+    assert evidence["reconciliation_id"] == "recon-abc123"
+    assert evidence["evidence_hash"]
     assert evidence and evidence["near"]["code"] == "TMFH6"
     assert evidence["near"]["source"] == "shioaji_bidask"
 
