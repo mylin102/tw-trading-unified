@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 from ui.reconciled_exit_presentation import exit_only_upl_presentation
 
@@ -283,3 +284,14 @@ def test_paper_context_is_not_intercepted_by_exit_only_presentation():
     }
 
     assert exit_only_upl_presentation(paper, None, now_ms=NOW_MS) is None
+
+
+def test_exit_only_primary_panel_skips_legacy_state_and_daily_jsonl():
+    """The restricted-exit primary panel has a separate capability/BBO
+    presentation path; it must not fall through to /tmp state or MTS daily
+    performance JSONL.  LIVE/PAPER remain on their existing branch."""
+    source = (Path(__file__).parents[2] / "ui" / "dashboard.py").read_text()
+
+    assert "_mts_state_file = None if _exit_only_dashboard" in source
+    assert "if not _exit_only_dashboard and os.path.exists(_fills_path):" in source
+    assert "受限平倉模式—等待新鮮券商對帳與雙腿 BBO" in source
