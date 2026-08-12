@@ -131,7 +131,8 @@ def build_bbo_binding(bbo_slots: Any, *, now_ms: Optional[int] = None,
         return None, "BBO_IDENTITY_MISSING"
     _id_keys = ("reconciliation_id", "snapshot_hash", "config_hash",
                 "release_sha", "session_id")
-    if any(not identity.get(k) for k in _id_keys):
+    if any(not isinstance(identity.get(k), str)
+           or not identity.get(k) for k in _id_keys):
         return None, "BBO_IDENTITY_MISSING"
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     expected = {"near": near_code, "far": far_code}
@@ -165,9 +166,12 @@ def build_bbo_binding(bbo_slots: Any, *, now_ms: Optional[int] = None,
         slots[leg] = {
             "symbol": slot.get("code"), "bid": bid, "ask": ask,
             "exchange_ts": ts_ms,
-            "received_at_ms": slot.get("received_at_ms"),
+            # [S2 audit] optional raw fields are JSON-sanitized (NaN/Inf
+            # -> None) so the canonical hash can never crash; strict
+            # bid/ask/exchange_ts/code/source validation is unchanged.
+            "received_at_ms": _json_safe(slot.get("received_at_ms")),
             "source": slot.get("source"),
-            "seq": slot.get("seq"),
+            "seq": _json_safe(slot.get("seq")),
         }
 
     if abs(slots["near"]["exchange_ts"] - slots["far"]["exchange_ts"]) \
