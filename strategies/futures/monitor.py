@@ -72,7 +72,7 @@ except ImportError:
 MTS_POSITION_STATE_PATH = Path("/tmp/mts_position_state.json")
 
 # [S1] EXIT_ONLY snapshot staleness TTL (ms): canonical with
-# core.reconciled_exit.SNAPSHOT_TTL_MS (60s) — a snapshot older than this,
+# core.reconciled_exit.SNAPSHOT_TTL_MS (600s) — a snapshot older than this,
 # or stamped in the future, is never trusted for exit evaluation.
 from core.reconciled_exit import \
     SNAPSHOT_TTL_MS as EXIT_ONLY_SNAPSHOT_TTL_MS
