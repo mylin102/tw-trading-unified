@@ -4086,27 +4086,31 @@ class TMFSpread(StrategyBase):
         _check_near = _rel_leg is None or _rel_leg == Leg.NEAR
         _check_far = _rel_leg is None or _rel_leg == Leg.FAR
 
-        # [P0c] QUOTE VALIDITY: the checked leg(s) need REAL bid/ask —
-        # a missing field (fallback-to-close), a zero, non-finite or
-        # inverted (ask < bid) quote must NOT be treated as a "0-point
-        # width" that wrongly passes a single-leg close.  The raw bar
-        # keys are inspected BEFORE the fallback defaults.
+        # [P0c] QUOTE VALIDITY: a SINGLE-LEG RELEASE crosses the
+        # released leg's spread — the released leg must carry a REAL
+        # bid/ask in the raw bar.  A missing field (fallback-to-close),
+        # a zero, non-finite or inverted (ask < bid) quote must NOT be
+        # treated as a "0-point width" that wrongly passes the close.
+        # The default (both-leg) path keeps the conservative WIDTH check
+        # only (pre-existing semantics).
         _quote_ok = True
-        for _label, _bkey, _akey in (("NEAR", "near_bid", "near_ask"),
-                                     ("FAR", "far_bid", "far_ask")):
-            if (_label == "NEAR" and not _check_near) or (
-                    _label == "FAR" and not _check_far):
-                continue
-            _b = bar.get(_bkey)
-            _a = bar.get(_akey)
-            if (_bkey not in bar or _akey not in bar
-                    or not isinstance(_b, (int, float))
-                    or not isinstance(_a, (int, float))
-                    or _b != _b or _a != _a  # NaN
-                    or abs(_b) == float("inf") or abs(_a) == float("inf")
-                    or _b <= 0 or _a <= 0 or _a < _b):
-                _quote_ok = False
-                break
+        if _rel_leg is not None:
+            for _label, _bkey, _akey in (("NEAR", "near_bid", "near_ask"),
+                                         ("FAR", "far_bid", "far_ask")):
+                if _label == "NEAR" and _rel_leg != Leg.NEAR:
+                    continue
+                if _label == "FAR" and _rel_leg != Leg.FAR:
+                    continue
+                _b = bar.get(_bkey)
+                _a = bar.get(_akey)
+                if (_bkey not in bar or _akey not in bar
+                        or not isinstance(_b, (int, float))
+                        or not isinstance(_a, (int, float))
+                        or _b != _b or _a != _a  # NaN
+                        or abs(_b) == float("inf") or abs(_a) == float("inf")
+                        or _b <= 0 or _a <= 0 or _a < _b):
+                    _quote_ok = False
+                    break
         if not _quote_ok:
             self._set_eval(
                 skip_reason="QUOTE_INVALID",
