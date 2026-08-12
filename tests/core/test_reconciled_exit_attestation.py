@@ -389,6 +389,146 @@ def test_exit_only_rejection_is_terminal_and_preserves_typed_reason():
 
 # ── monitor flow ──────────────────────────────────────────────────────────
 
+def test_monitor_attestation_syncs_order_manager_and_client_e2e(
+        monkeypatch, tmp_path):
+    """[P0] after a successful attestation persist, BOTH client and the
+    REAL OrderManager are synced to the exact same new immutable
+    RECONCILED_EXIT_ONLY context — an exact MTS_RELEASE closing order is
+    stamped with the reconciliation_id and passes the OrderManager
+    authorization layer.  Prior behavior (stale LIVE_QUARANTINED in the
+    order manager) rejects locally."""
+    from types import SimpleNamespace
+
+    from strategies.futures.monitor import FuturesMonitor
+    from core.order_management.order_manager import OrderManager
+
+    monkeypatch.setenv("LRC_RELEASE_SHA", "d" * 40)
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.api = SimpleNamespace(
+        futopt_account=SimpleNamespace(),
+        list_positions=lambda acct: [
+            SimpleNamespace(code="TMFH6",
+                            direction=SimpleNamespace(name="Sell"),
+                            quantity=1, price=44909.0),
+            SimpleNamespace(code="TMFI6",
+                            direction=SimpleNamespace(name="Buy"),
+                            quantity=1, price=45052.0),
+        ],
+        list_trades=lambda acct: [],
+    )
+    old_ctx = _position_quarantine_ctx()
+    monitor._execution_context = old_ctx
+    monitor._bind_reconciled_exit_identity = lambda: True
+    adapter_calls = []
+    adapter = SimpleNamespace(
+        place_order_object=lambda order: adapter_calls.append(order))
+    monitor.client = SimpleNamespace(_execution_context=old_ctx)
+    monitor.order_mgr = OrderManager(mode="live", broker_adapter=adapter,
+                                     execution_context=old_ctx)
+    events = []
+    monitor._append_mts_event = lambda event_type, **kw: events.append(
+        (event_type, kw))
+
+    record, err = monitor._operator_attest_exit_only(
+        operator="trader",
+        trade_id="mts-20260811-085503",
+        evidence="remaining spread is the 08:55 manual pair",
+        expected_legs=[
+            {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1},
+            {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1},
+        ],
+        attested_at="2026-08-11T11:00:00+08:00",
+    )
+    assert err is None
+    assert monitor._execution_context.effective_mode == \
+        ModeTransitionState.RECONCILED_EXIT_ONLY.value
+    # the EXACT same immutable object is synced to both consumers
+    assert monitor.order_mgr.execution_context is monitor._execution_context
+    assert monitor.client._execution_context is monitor._execution_context
+    # canonical file persisted
+    assert (tmp_path / "execution_context.json").exists()
+
+    _rid = monitor._execution_context.exit_only_capability[
+        "reconciliation_id"]
+    release_order = monitor.order_mgr.create_order(
+        symbol="TMFH6", side=OrderSide.BUY, order_type=OrderType.MKP,
+        quantity=1, strategy="MTS_RELEASE")
+    assert release_order.reconciliation_id == _rid
+    # reaches the OrderManager authorization layer (adapter stub only:
+    # no submission happened)
+    monitor.order_mgr.execution_context.assert_order_allowed(
+        release_order, method="place_order")
+    assert adapter_calls == []
+
+
+def test_monitor_attestation_persist_failure_keeps_prior_context(
+        monkeypatch, tmp_path):
+    """[P0] a persist failure leaves client + OrderManager on the PRIOR
+    quarantined context (fail-closed) — zero adapter calls, no new allow
+    state exposed; the stale context still rejects the exit order."""
+    from types import SimpleNamespace
+
+    import core.execution_context_state as ecs
+    from strategies.futures.monitor import FuturesMonitor
+    from core.order_management.order_manager import OrderManager
+
+    monkeypatch.setenv("LRC_RELEASE_SHA", "d" * 40)
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        ecs, "persist_execution_context",
+        lambda payload: (_ for _ in ()).throw(RuntimeError("disk full")))
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.api = SimpleNamespace(
+        futopt_account=SimpleNamespace(),
+        list_positions=lambda acct: [
+            SimpleNamespace(code="TMFH6",
+                            direction=SimpleNamespace(name="Sell"),
+                            quantity=1, price=44909.0),
+            SimpleNamespace(code="TMFI6",
+                            direction=SimpleNamespace(name="Buy"),
+                            quantity=1, price=45052.0),
+        ],
+        list_trades=lambda acct: [],
+    )
+    old_ctx = _position_quarantine_ctx()
+    monitor._execution_context = old_ctx
+    monitor._bind_reconciled_exit_identity = lambda: True
+    adapter_calls = []
+    adapter = SimpleNamespace(
+        place_order_object=lambda order: adapter_calls.append(order))
+    monitor.client = SimpleNamespace(_execution_context=old_ctx)
+    monitor.order_mgr = OrderManager(mode="live", broker_adapter=adapter,
+                                     execution_context=old_ctx)
+    monitor._append_mts_event = lambda *args, **kwargs: None
+
+    record, err = monitor._operator_attest_exit_only(
+        operator="trader",
+        trade_id="mts-20260811-085503",
+        evidence="remaining spread is the 08:55 manual pair",
+        expected_legs=[
+            {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1},
+            {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1},
+        ],
+        attested_at="2026-08-11T11:00:00+08:00",
+    )
+    assert err is None  # attestation succeeded; persist failure contained
+    # fail-closed: both consumers keep the PRIOR quarantined context
+    assert monitor.client._execution_context is old_ctx
+    assert monitor.order_mgr.execution_context is old_ctx
+    assert adapter_calls == []
+    # the stale quarantined context still rejects the exit order locally
+    stale_order = monitor.order_mgr.create_order(
+        symbol="TMFH6", side=OrderSide.BUY, order_type=OrderType.MKP,
+        quantity=1, strategy="MTS_RELEASE")
+    assert stale_order.reconciliation_id is None
+    with pytest.raises(LiveOrderBlocked):
+        monitor.order_mgr.execution_context.assert_order_allowed(
+            stale_order, method="place_order")
+
+
 def test_monitor_attestation_flow_applies_exit_only_and_emits_event(monkeypatch):
     from types import SimpleNamespace
 
