@@ -3559,61 +3559,67 @@ class FuturesMonitor:
                 from core.mode_transition import ModeTransitionState
                 _reasons = list(getattr(_ctx, "audit_reasons", ()) or ())
                 _reasons.append(f"EXIT_ONLY_RENEWAL:{reason}")
-                _prior_ctx = _ctx
                 _new_ctx = replace(
                     _ctx,
                     effective_mode=(
                         ModeTransitionState.LIVE_QUARANTINED.value),
                     live_order_allowed=False,
                     audit_reasons=tuple(_reasons[-64:]))
-                # [P0 repair] the fatal/all-or-nothing persistence
-                # contract: the atomic persist path persists FIRST then
-                # syncs client + order_mgr to the SAME immutable object.
-                # A recoverable failure (False) restores the EXACT prior
-                # across all refs (fail-closed — authority stays
-                # EXIT_ONLY, never a split); a rollback/sync failure
-                # raises ExecutionContextSyncFatal which hard-disables
-                # the broker and propagates (process-terminating) —
-                # NEVER swallowed.
+                def _hard_disable_broker_routes():
+                    """api=None + _broker_capability_disabled on EVERY
+                    order-capable route: this monitor, the direct
+                    client, the order manager and its broker adapter.
+                    Nothing can re-enable it except an operator restart
+                    / reconciliation."""
+                    _targets = [self]
+                    _client = getattr(self, "client", None)
+                    if _client is not None:
+                        _targets.append(_client)
+                    _mgr = getattr(self, "order_mgr", None)
+                    if _mgr is not None:
+                        _targets.append(_mgr)
+                        _adapter = getattr(_mgr, "broker_adapter", None)
+                        if _adapter is not None:
+                            _targets.append(_adapter)
+                    for _t in _targets:
+                        try:
+                            setattr(_t, "api", None)
+                        except Exception:
+                            pass
+                        try:
+                            setattr(_t, "_broker_capability_disabled", True)
+                        except Exception:
+                            pass
+
+                # [P0c] the fatal/all-or-nothing persistence contract:
+                # persist FIRST then sync client + order_mgr to the SAME
+                # immutable object.  A safety-critical mismatch MUST
+                # land LIVE_QUARANTINED; if the canonical state cannot
+                # record it (False or raise) the broker is HARD-DISABLED
+                # so no direct/client/order_mgr route can trade and no
+                # later fresh snapshot can re-enable it — operator
+                # restart/reconciliation is required.  The prior
+                # EXIT_ONLY authority is NEVER restored after a
+                # mismatch.
                 try:
                     self._execution_context = _new_ctx
                     _persist_ok = self._persist_execution_context()
-                except ExecutionContextSyncFatal:
-                    # rollback failed: the persist path already forced
-                    # fail-closed quarantine + hard-disabled consumers.
-                    # HARD-DISABLE this monitor's own broker capability
-                    # too, then propagate (never a normal typed return).
-                    try:
-                        self.api = None
-                    except Exception:
-                        pass
-                    try:
-                        setattr(self, "_broker_capability_disabled", True)
-                    except Exception:
-                        pass
-                    raise
                 except Exception:
-                    # unexpected failure: never leave a split authority.
-                    # Restore the exact prior ctx across ALL refs
-                    # (best-effort, including a canonical re-persist of
-                    # the prior payload), then propagate.
+                    _hard_disable_broker_routes()
                     try:
-                        self._execution_context = _prior_ctx
-                        try:
-                            from core.execution_context_state import (
-                                persist_execution_context as _pf)
-                            _pf(_prior_ctx.to_dict())
-                        except Exception:
-                            pass
+                        self._execution_context = _new_ctx
                     except Exception:
                         pass
                     raise
                 if _persist_ok is False:
-                    # recoverable persist failure: client/order_mgr kept
-                    # the prior ctx — restore SELF to the exact prior so
-                    # there is no in-process split (fail-closed).
+                    # the canonical state could NOT record the mismatch:
+                    # hard-disable every order-capable route and keep
+                    # the in-memory quarantine — EXIT_ONLY authority
+                    # must not survive an unrecorded safety-critical
+                    # mismatch.
+                    _hard_disable_broker_routes()
                     try:
-                        self._execution_context = _prior_ctx
+                        self._execution_context = _new_ctx
                     except Exception:
                         pass
         self._append_mts_event(
