@@ -3472,6 +3472,55 @@ class FuturesMonitor:
             return False
         return _payload
 
+    def _observe_exit_only_bbo_evidence(self) -> None:
+        """[P1 dashboard-gap] observation-only persistent BBO evidence.
+
+        When the fresh valid dual BBO cache builds a version-2 binding
+        for the CURRENT exit_only_capability (identical code/identity/
+        15s-freshness/hash semantics as order binding — the same
+        build_bbo_binding over the same _exit_only_bbo_slots, no
+        duplicated quote validation), emit/refresh an
+        EXIT_ONLY_BBO_OBSERVED event (bbo_hash + bbo_payload) so the
+        presentation layer has identity-matched evidence after a fresh
+        attestation.  Observation-only: NEVER authorizes, creates,
+        submits, alters or cancels orders and NEVER changes strategy
+        decisions.  Deduped by (reconciliation_id, bbo_hash): at most
+        one event per distinct binding — never one per callback and no
+        artificial periodic refresh.  Invalid/missing/stale BBO emits
+        nothing; the Dashboard stays N/A."""
+        try:
+            _ctx = getattr(self, "_execution_context", None)
+            _cap = getattr(_ctx, "exit_only_capability", None)
+            if not isinstance(_cap, dict):
+                return
+            from core.exit_only_position import build_bbo_binding
+            _binding, _reason = build_bbo_binding(
+                self._exit_only_bbo_slots(),
+                now_ms=int(time.time() * 1000),
+                near_code=getattr(
+                    getattr(self, "contract", None), "code", None),
+                far_code=getattr(
+                    getattr(self, "far_contract", None), "code", None),
+                identity=_cap)
+            if not isinstance(_binding, dict):
+                return  # invalid/stale/missing: no false evidence
+            _hash = _binding.get("bbo_hash") or ""
+            _payload = _binding.get("bbo_payload")
+            if not _hash or not isinstance(_payload, dict):
+                return
+            _rid = _cap.get("reconciliation_id", "")
+            if (_rid, _hash) == getattr(
+                    self, "_exit_only_bbo_observed_key", None):
+                return  # dedupe: same binding, no re-emit
+            self._exit_only_bbo_observed_key = (_rid, _hash)
+            self._append_mts_event(
+                "EXIT_ONLY_BBO_OBSERVED",
+                bbo_hash=_hash,
+                bbo_payload=_payload,
+                reconciliation_id=_rid)
+        except Exception:
+            pass  # observation must never be fatal
+
     def _exit_only_bbo_slots(self):
         """[S2 repair] dedicated EXIT_ONLY BBO evidence only (written by
         validated on_bidask).  The generic tick market_data is NEVER read
@@ -8252,6 +8301,12 @@ class FuturesMonitor:
         """MTS minimal execution path. Uses enriched bar from pipeline when available,
         falls back to building bar from tick deque if none provided."""
         print("MTS_ALIVE", flush=True)
+
+        # [P1] observation-only: refresh persistent EXIT_ONLY_BBO_OBSERVED
+        # evidence when the current capability has fresh valid dual BBO
+        # (deduped by reconciliation_id + bbo_hash; never alters orders/
+        # decisions; invalid/stale emits nothing).
+        self._observe_exit_only_bbo_evidence()
 
         # ── Read-only broker snapshot probe (request file) ──
         if self._check_broker_snapshot_request():
