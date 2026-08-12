@@ -185,7 +185,8 @@ def build_bbo_binding(bbo_slots: Any, *, now_ms: Optional[int] = None,
         "session_id": identity["session_id"],
     }
     bbo_hash = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                   allow_nan=False).encode()
     ).hexdigest()
     captured_at = max(slots["near"]["exchange_ts"],
                       slots["far"]["exchange_ts"])
@@ -196,8 +197,12 @@ def build_bbo_binding(bbo_slots: Any, *, now_ms: Optional[int] = None,
 def _json_safe(value):
     """[S2 audit] JSON-safe deep-copy: datetime -> isoformat, other
     non-serializable -> str; never raises."""
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, str)):
         return value
+    if isinstance(value, float):
+        # [S2 audit] non-finite floats (NaN/+Inf/-Inf) are not
+        # JSON-compliant: deterministic None sentinel; finite preserved.
+        return value if math.isfinite(value) else None
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -239,7 +244,8 @@ def build_bbo_failure_evidence(bbo_slots: Any, identity: Any,
                       "received_at_ms", "source", "seq") if k in _slot})
     try:
         _canon = json.dumps(payload, sort_keys=True,
-                            separators=(",", ":")).encode()
+                            separators=(",", ":"),
+                            allow_nan=False).encode()
         payload["evidence_hash"] = hashlib.sha256(_canon).hexdigest()
     except Exception:
         payload["evidence_hash"] = None
