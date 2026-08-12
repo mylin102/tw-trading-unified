@@ -3031,7 +3031,21 @@ class FuturesMonitor:
                             try:
                                 setattr(_c2, _a2, _qctx)
                             except Exception:
-                                pass
+                                # [P1 fatal] this consumer rejected the
+                                # quarantine assignment — it may still
+                                # hold stale LIVE authority.  HARD-DISABLE
+                                # its broker capability so no direct
+                                # client route can trade (never swallow).
+                                try:
+                                    setattr(_c2, "api", None)
+                                except Exception:
+                                    pass
+                                try:
+                                    setattr(
+                                        _c2,
+                                        "_broker_capability_disabled", True)
+                                except Exception:
+                                    pass
                     raise ExecutionContextSyncFatal(
                         "execution-context rollback failed; in-memory "
                         "forced to fail-closed quarantine")
@@ -3297,10 +3311,12 @@ class FuturesMonitor:
         try:
             _persisted = self._persist_execution_context()
         except ExecutionContextSyncFatal:
-            # [P1] rollback of a committed write failed: in-memory is
-            # already fail-closed quarantine (never prior authority);
-            # typed fatal, NO success event.
-            return None, "EXECUTION_CONTEXT_SYNC_FATAL"
+            # [P1 fatal] rollback + quarantine could not be completed:
+            # this is process-terminating, NOT a normal attestation
+            # failure — re-raise so the process supervision stops an
+            # order-capable process (a stale authority must never keep
+            # trading).  No success event was emitted.
+            raise
         if _persisted is False:
             # [P1] persist failed: restore the exact prior immutable
             # context (client/order_mgr were never synced — fail-closed)
