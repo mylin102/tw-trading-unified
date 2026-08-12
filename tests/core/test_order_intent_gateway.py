@@ -1919,10 +1919,14 @@ def test_e2e_renewal_monitoring_continues_no_age_gate(
 
 def test_e2e_pre_submit_mismatch_persist_failure_no_split_refs(
         monkeypatch, tmp_path):
-    """[P0 repair] the pre-submit proof fails (open order) and the
-    quarantine PERSIST fails (recoverable False): the exact prior
-    context is restored across ALL refs (monitor == order_mgr == client,
-    same immutable object) — no split authority, zero adapter calls."""
+    """[P0c] the pre-submit proof fails (open order) and the quarantine
+    PERSIST fails (False): the canonical state could NOT record the
+    safety-critical mismatch — every order-capable route is HARD-DISABLED
+    (api=None + _broker_capability_disabled on monitor + client +
+    order_mgr incl. adapter), no later fresh snapshot can re-enable it,
+    zero order adapter calls, no successful event.  The prior EXIT_ONLY
+    authority is NEVER restored after a mismatch (operator restart /
+    reconciliation required)."""
     from dataclasses import replace
     from pathlib import Path
     from types import SimpleNamespace
@@ -1931,8 +1935,9 @@ def test_e2e_pre_submit_mismatch_persist_failure_no_split_refs(
         MtsAuthority, MtsAuthorityState)
 
     monitor, events = _monitor(_fresh_exit_only_ctx())
-    _prior_ctx = monitor._execution_context
-    assert monitor.order_mgr.execution_context is _prior_ctx
+    # the fixture builds no direct client — stub one so the hard-disable
+    # of the client route is exercised and asserted
+    monitor.client = SimpleNamespace(api=monitor.api)
     monitor._ledger_projection.snapshot = lambda: MtsAuthorityState(
         MtsAuthority.FLAT)
     monitor._ledger_projection_sync_ts = 0.0
@@ -1987,23 +1992,30 @@ def test_e2e_pre_submit_mismatch_persist_failure_no_split_refs(
     bar = {"near_close": 44905.0, "far_close": 45038.5, "ts": 1754991000}
     monitor._mts_tick(bar)
 
-    # no split authority: all refs hold the SAME prior immutable object
-    assert monitor._execution_context is _prior_ctx
-    assert monitor.order_mgr.execution_context is _prior_ctx
-    # zero ORDER/authorization adapter calls (the read-only snapshot
-    # queries of the proof are not order calls)
+    # the broker capability is HARD-DISABLED on every order-capable route
+    assert monitor.api is None
+    assert getattr(monitor, "_broker_capability_disabled", False) is True
+    assert getattr(monitor.client, "api", None) is None
+    assert getattr(monitor.order_mgr, "api", None) is None
+    assert monitor.order_mgr.broker_adapter.api is None
+    # no later fresh snapshot can re-enable the broker
+    ok, reason = monitor._pre_submit_exit_only_proof()
+    assert ok is False and reason == "EXIT_ONLY_RENEWAL_QUERY_FAILED"
+    # zero ORDER/authorization adapter calls
     assert monitor.order_mgr.broker_adapter.calls == []
     blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
     assert blocked and blocked[-1][1]["reason"] == "EXIT_ONLY_OPEN_ORDERS"
+    # no successful event
+    assert not [e for e in events if e[0] == "EXIT_ONLY_RENEWAL_SUCCESS"]
 
 
 def test_e2e_pre_submit_mismatch_persist_fatal_hard_disables_broker(
         monkeypatch, tmp_path):
-    """[P0 repair] the pre-submit proof fails and the quarantine persist
-    RAISES ExecutionContextSyncFatal: the fatal propagates (never
-    swallowed — process-terminating), the broker is hard-disabled
-    (api=None + _broker_capability_disabled) and zero adapter calls are
-    possible."""
+    """[P0c] the pre-submit proof fails and the quarantine persist
+    RAISES: the exception propagates (never swallowed — process-
+    terminating), every order-capable route is hard-disabled (api=None +
+    _broker_capability_disabled on monitor + client + order_mgr incl.
+    adapter) and zero order adapter calls are possible."""
     from dataclasses import replace
     from pathlib import Path
     from types import SimpleNamespace
@@ -2014,6 +2026,8 @@ def test_e2e_pre_submit_mismatch_persist_fatal_hard_disables_broker(
         MtsAuthority, MtsAuthorityState)
 
     monitor, events = _monitor(_fresh_exit_only_ctx())
+    # the fixture builds no direct client — stub one
+    monitor.client = SimpleNamespace(api=monitor.api)
     monitor._ledger_projection.snapshot = lambda: MtsAuthorityState(
         MtsAuthority.FLAT)
     monitor._ledger_projection_sync_ts = 0.0
@@ -2071,9 +2085,11 @@ def test_e2e_pre_submit_mismatch_persist_fatal_hard_disables_broker(
     with pytest.raises(ExecutionContextSyncFatal):
         monitor._mts_tick(bar)
 
-    # the broker capability is hard-disabled: no possible adapter call
+    # the broker capability is hard-disabled on every route
     assert monitor.api is None
     assert getattr(monitor, "_broker_capability_disabled", False) is True
+    assert getattr(monitor.client, "api", None) is None
+    assert monitor.order_mgr.broker_adapter.api is None
 
 
 def test_s1_normal_live_and_paper_untouched():
