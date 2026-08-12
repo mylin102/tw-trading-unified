@@ -2146,31 +2146,33 @@ class FuturesMonitor:
                             else "far")
                     _xdt = getattr(bidask, "datetime", None)
                     _xms = None
-                    if _xdt is not None:
+                    from datetime import datetime as _dtt
+                    if isinstance(_xdt, _dtt):
+                        # [S2 audit] datetime object only, converted ONCE
+                        # to integer epoch-ms; never float() numeric/
+                        # string timestamps, never scale seconds.
                         try:
-                            _xms = (_xdt.timestamp()
-                                    if hasattr(_xdt, "timestamp")
-                                    else float(_xdt))
+                            _xms = int(_xdt.timestamp() * 1000)
                         except Exception:
                             _xms = None
-                    if _xms is None or not math.isfinite(_xms) or _xms <= 0:
+                    if _xms is None or _xms <= 0:
+                        # no valid evidence: preserve the previous entry
+                        # (a bad quote never replaces good evidence)
                         _xms = None
-                    elif _xms < 1e12:
-                        _xms = int(_xms * 1000)
-                    else:
-                        _xms = int(_xms)
-                    _cache = dict(
-                        getattr(self, "_exit_only_bbo_cache", None) or {})
-                    _cache[_leg] = {
-                        "code": _code_cache,
-                        "bid": _bbo_cache[0],
-                        "ask": _bbo_cache[1],
-                        "exchange_ts_ms": _xms,
-                        "received_at_ms": int(time.time() * 1000),
-                        "source": "shioaji_bidask",
-                        "seq": getattr(bidask, "seq", None),
-                    }
-                    self._exit_only_bbo_cache = _cache
+                    if _xms is not None:
+                        _cache = dict(
+                            getattr(self, "_exit_only_bbo_cache", None)
+                            or {})
+                        _cache[_leg] = {
+                            "code": _code_cache,
+                            "bid": _bbo_cache[0],
+                            "ask": _bbo_cache[1],
+                            "exchange_ts_ms": _xms,
+                            "received_at_ms": int(time.time() * 1000),
+                            "source": "shioaji_bidask",
+                            "seq": getattr(bidask, "seq", None),
+                        }
+                        self._exit_only_bbo_cache = _cache
         except Exception:
             pass
         try:
@@ -3255,9 +3257,14 @@ class FuturesMonitor:
                     f"[red]⚠️ [MTS_EXIT] quarantine persist failed: "
                     f"{_exc} — durable MTS_EXIT_RECONCILE intent "
                     f"remains the restart gate[/red]")
+        from core.exit_only_position import build_bbo_failure_evidence
+        _cap = getattr(getattr(self, "_execution_context", None),
+                       "exit_only_capability", None)
         self._append_mts_event(
             "EXIT_ONLY_QUARANTINED", action="COMBINED_EXIT",
-            reason=f"{leg}:{reason}", trade_id=trade_id)
+            reason=f"{leg}:{reason}", trade_id=trade_id,
+            bbo_input_v2=build_bbo_failure_evidence(
+                self._exit_only_bbo_slots(), _cap, f"{leg}:{reason}"))
 
     def _gateway(self):
         """[S0] lazy OrderIntentGateway: replays the durable intent
@@ -6233,15 +6240,19 @@ class FuturesMonitor:
             _action, _gw_intent_strategy, strategy)
         self._exit_only_decision_binding = _gw_binding
         if not _gw_ok:
-            # [S2 repair] persist the raw BBO evidence with the blocked
-            # decision so dashboard/review can reproduce the rejection.
+            # [S2 audit] persist the canonical failure-evidence payload
+            # with the blocked decision (version bbo_input_v2 + JSON-safe
+            # raw slots + cap identity + reason + deterministic hash) so
+            # dashboard/review can reproduce the rejection.
             _block_ev = {
                 "action": _action, "reason": _gw_reason,
                 "trade_id": getattr(strategy, "_trade_id", ""),
             }
-            _ev_slots = self._exit_only_bbo_slots()
-            if _ev_slots.get("near") or _ev_slots.get("far"):
-                _block_ev["bbo_evidence"] = _ev_slots
+            from core.exit_only_position import build_bbo_failure_evidence
+            _cap = getattr(getattr(self, "_execution_context", None),
+                           "exit_only_capability", None)
+            _block_ev["bbo_input_v2"] = build_bbo_failure_evidence(
+                self._exit_only_bbo_slots(), _cap, _gw_reason)
             self._append_mts_event("ORDER_INTENT_BLOCKED", **_block_ev)
             return
 
@@ -6264,10 +6275,18 @@ class FuturesMonitor:
                 }
 
                 if not self._submit_via_gateway(_order):
+                    from core.exit_only_position import (
+                        build_bbo_failure_evidence)
+                    _cap = getattr(
+                        getattr(self, "_execution_context", None),
+                        "exit_only_capability", None)
                     self._append_mts_event(
                         "ORDER_INTENT_BLOCKED", action=_action,
                         reason="SUBMIT_FAILED",
-                        trade_id=getattr(strategy, "_trade_id", ""))
+                        trade_id=getattr(strategy, "_trade_id", ""),
+                        bbo_input_v2=build_bbo_failure_evidence(
+                            self._exit_only_bbo_slots(), _cap,
+                            "SUBMIT_FAILED"))
                     return
                 self._append_mts_event("ORDER_SUBMITTED", **{
                     **_ev_meta(_order),
@@ -6300,10 +6319,18 @@ class FuturesMonitor:
                 }
 
                 if not self._submit_via_gateway(_order):
+                    from core.exit_only_position import (
+                        build_bbo_failure_evidence)
+                    _cap = getattr(
+                        getattr(self, "_execution_context", None),
+                        "exit_only_capability", None)
                     self._append_mts_event(
                         "ORDER_INTENT_BLOCKED", action=_action,
                         reason="SUBMIT_FAILED",
-                        trade_id=getattr(strategy, "_trade_id", ""))
+                        trade_id=getattr(strategy, "_trade_id", ""),
+                        bbo_input_v2=build_bbo_failure_evidence(
+                            self._exit_only_bbo_slots(), _cap,
+                            "SUBMIT_FAILED"))
                     return
                 self._append_mts_event("ORDER_SUBMITTED", **{
                     **_ev_meta(_order),

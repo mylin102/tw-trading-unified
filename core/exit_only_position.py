@@ -151,10 +151,13 @@ def build_bbo_binding(bbo_slots: Any, *, now_ms: Optional[int] = None,
         if bid > ask:
             return None, "BBO_AMBIGUOUS"
         ts = slot.get("exchange_ts_ms")
-        if (not isinstance(ts, (int, float)) or not math.isfinite(ts)
-                or ts <= 0):
+        # [S2 audit] strict canonical timestamp: type(x) is int, not
+        # bool, >= 1e12 (epoch-ms).  float/seconds/missing are rejected —
+        # the binding NEVER rescales seconds-or-float timestamps.
+        if (not isinstance(ts, int) or isinstance(ts, bool)
+                or ts < 1e12):
             return None, "BBO_STALE"
-        ts_ms = int(ts * 1000) if ts < 1e12 else int(ts)
+        ts_ms = ts
         if ts_ms > now + 1_000:
             return None, "BBO_FUTURE"
         if now - ts_ms > ttl_ms:
@@ -188,6 +191,59 @@ def build_bbo_binding(bbo_slots: Any, *, now_ms: Optional[int] = None,
                       slots["far"]["exchange_ts"])
     return {"bbo_hash": bbo_hash, "bbo_captured_at": captured_at,
             "bbo_payload": payload}, None
+
+
+def _json_safe(value):
+    """[S2 audit] JSON-safe deep-copy: datetime -> isoformat, other
+    non-serializable -> str; never raises."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    try:
+        return str(value)
+    except Exception:
+        return "<unserializable>"
+
+
+def build_bbo_failure_evidence(bbo_slots: Any, identity: Any,
+                               reason: str) -> dict:
+    """[S2 audit] canonical failure-evidence payload for every EXIT_ONLY
+    ORDER_INTENT_BLOCKED: version bbo_input_v2, JSON-safe raw near/far
+    slots, cap identity fields, reason and a deterministic hash of that
+    payload (dashboard/review can reproduce the rejection).  Never
+    writes secrets."""
+    payload = {"version": "bbo_input_v2",
+               "near": {}, "far": {},
+               "reconciliation_id": None, "snapshot_hash": None,
+               "config_hash": None, "release_sha": None,
+               "session_id": None, "reason": reason}
+    if isinstance(identity, dict):
+        for _k in ("reconciliation_id", "snapshot_hash", "config_hash",
+                   "release_sha", "session_id"):
+            payload[_k] = identity.get(_k)
+    if isinstance(bbo_slots, dict):
+        for _leg in ("near", "far"):
+            _slot = bbo_slots.get(_leg)
+            if isinstance(_slot, dict):
+                payload[_leg] = _json_safe(
+                    {k: _slot.get(k) for k in
+                     ("code", "bid", "ask", "exchange_ts_ms",
+                      "received_at_ms", "source", "seq") if k in _slot})
+    try:
+        _canon = json.dumps(payload, sort_keys=True,
+                            separators=(",", ":")).encode()
+        payload["evidence_hash"] = hashlib.sha256(_canon).hexdigest()
+    except Exception:
+        payload["evidence_hash"] = None
+    return payload
 
 
 def attach_decision_binding(event: dict, capability: dict,
