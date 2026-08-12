@@ -567,6 +567,209 @@ def _exit_only_ctx_from(live_ctx):
     return apply_exit_only(live_ctx, _cap)
 
 
+def _flaky_rollback_persist(real_persist, fail_after=1):
+    """Succeed on the first N persist calls (forward write), then raise
+    (rollback of a committed canonical write fails)."""
+    calls = []
+
+    def _flaky(payload):
+        calls.append(payload)
+        if len(calls) > fail_after:
+            raise RuntimeError("rollback disk full")
+        return real_persist(payload)
+
+    return _flaky
+
+
+def test_persist_rollback_writer_failure_raises_fatal_quarantine(
+        monkeypatch, tmp_path):
+    """[P1] the canonical rollback WRITER failing after a committed
+    write => ExecutionContextSyncFatal raised; in-memory monitor +
+    order_mgr forced to fail-closed quarantine (never prior authority);
+    nothing silently swallowed."""
+    import core.execution_context_state as ecs
+    from core.execution_context_state import persist_execution_context
+    from strategies.futures.monitor import (
+        ExecutionContextSyncFatal, FuturesMonitor)
+
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    _live = _live_ctx()
+    persist_execution_context(_live.to_dict())  # prior canonical state
+    monkeypatch.setattr(
+        ecs, "persist_execution_context",
+        _flaky_rollback_persist(persist_execution_context))
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._execution_context = _live
+
+    class _Cranky:
+        def __init__(self, allowed):
+            self._allowed = allowed
+
+        @property
+        def _execution_context(self):
+            return self._allowed
+
+        @_execution_context.setter
+        def _execution_context(self, value):
+            if value is not self._allowed:
+                raise TypeError("cannot change")
+            self._allowed = value
+
+    cranky = _Cranky(_live)
+    monitor.client = cranky
+    order_mgr = SimpleNamespace(execution_context=_live)
+    monitor.order_mgr = order_mgr
+
+    new_ctx = _exit_only_ctx_from(_live)
+    monitor._execution_context = new_ctx
+
+    with pytest.raises(ExecutionContextSyncFatal):
+        monitor._persist_execution_context()
+    # in-memory forced to fail-closed quarantine (not exit-only, not
+    # prior live-ready)
+    assert monitor._execution_context.effective_mode == \
+        ModeTransitionState.LIVE_QUARANTINED.value
+    assert monitor._execution_context.live_order_allowed is False
+    assert "EXECUTION_CONTEXT_SYNC_FATAL" in \
+        (monitor._execution_context.audit_reasons or ())
+    assert order_mgr.execution_context.effective_mode == \
+        ModeTransitionState.LIVE_QUARANTINED.value
+
+
+def test_persist_rollback_remove_failure_raises_fatal_quarantine(
+        monkeypatch, tmp_path):
+    """[P1] the rollback REMOVE failing (no prior file) =>
+    ExecutionContextSyncFatal raised; in-memory monitor forced to
+    fail-closed quarantine."""
+    from strategies.futures.monitor import (
+        ExecutionContextSyncFatal, FuturesMonitor)
+
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    _live = _live_ctx()
+    assert not (tmp_path / "execution_context.json").exists()
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._execution_context = _live
+
+    class _Cranky:
+        def __init__(self, allowed):
+            self._allowed = allowed
+
+        @property
+        def _execution_context(self):
+            return self._allowed
+
+        @_execution_context.setter
+        def _execution_context(self, value):
+            if value is not self._allowed:
+                raise TypeError("cannot change")
+            self._allowed = value
+
+    cranky = _Cranky(_live)
+    monitor.client = cranky
+    order_mgr = SimpleNamespace(execution_context=_live)
+    monitor.order_mgr = order_mgr
+
+    new_ctx = _exit_only_ctx_from(_live)
+    monitor._execution_context = new_ctx
+
+    monkeypatch.setattr(os, "remove",
+                        lambda p: (_ for _ in ()).throw(OSError("EACCES")))
+    with pytest.raises(ExecutionContextSyncFatal):
+        monitor._persist_execution_context()
+    assert monitor._execution_context.effective_mode == \
+        ModeTransitionState.LIVE_QUARANTINED.value
+    assert monitor._execution_context.live_order_allowed is False
+
+
+def test_monitor_attestation_fatal_sync_no_success_no_prior_reuse(
+        monkeypatch, tmp_path):
+    """[P1] attestation with a failing rollback => typed
+    EXECUTION_CONTEXT_SYNC_FATAL, NO OPERATOR_ATTESTATION event, no
+    adapter call, and the in-memory monitor is quarantine — the prior
+    LIVE_READY authority is never reused."""
+    from types import SimpleNamespace
+
+    import core.execution_context_state as ecs
+    from core.execution_context_state import persist_execution_context
+    from strategies.futures.monitor import FuturesMonitor
+    from core.order_management.order_manager import OrderManager
+
+    monkeypatch.setenv("LRC_RELEASE_SHA", "d" * 40)
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    old_ctx = _live_ctx()  # prior = LIVE_READY authority
+    # prior canonical state exists so the rollback takes the WRITER path
+    persist_execution_context(old_ctx.to_dict())
+    monkeypatch.setattr(
+        ecs, "persist_execution_context",
+        _flaky_rollback_persist(persist_execution_context))
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.api = SimpleNamespace(
+        futopt_account=SimpleNamespace(),
+        list_positions=lambda acct: [
+            SimpleNamespace(code="TMFH6",
+                            direction=SimpleNamespace(name="Sell"),
+                            quantity=1, price=44909.0),
+            SimpleNamespace(code="TMFI6",
+                            direction=SimpleNamespace(name="Buy"),
+                            quantity=1, price=45052.0),
+        ],
+        list_trades=lambda acct: [],
+    )
+    monitor._execution_context = old_ctx
+
+    class _Cranky:
+        def __init__(self, allowed):
+            self._allowed = allowed
+
+        @property
+        def _execution_context(self):
+            return self._allowed
+
+        @_execution_context.setter
+        def _execution_context(self, value):
+            if value is not self._allowed:
+                raise TypeError("cannot change")
+            self._allowed = value
+
+    cranky = _Cranky(old_ctx)
+    monitor.client = cranky
+    adapter_calls = []
+    adapter = SimpleNamespace(
+        place_order_object=lambda order: adapter_calls.append(order))
+    monitor.order_mgr = OrderManager(mode="live", broker_adapter=adapter,
+                                     execution_context=old_ctx)
+    events = []
+    monitor._append_mts_event = lambda event_type, **kw: events.append(
+        (event_type, kw))
+
+    record, err = monitor._operator_attest_exit_only(
+        operator="trader",
+        trade_id="mts-20260811-085503",
+        evidence="remaining spread is the 08:55 manual pair",
+        expected_legs=[
+            {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1},
+            {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1},
+        ],
+        attested_at="2026-08-11T11:00:00+08:00",
+    )
+    assert record is None
+    assert err == "EXECUTION_CONTEXT_SYNC_FATAL"
+    assert events == []       # NO success event
+    assert adapter_calls == []
+    # never back to prior LIVE_READY: monitor is fail-closed quarantine
+    assert monitor._execution_context is not old_ctx
+    assert monitor._execution_context.effective_mode == \
+        ModeTransitionState.LIVE_QUARANTINED.value
+    assert monitor._execution_context.live_order_allowed is False
+    assert "EXECUTION_CONTEXT_SYNC_FATAL" in \
+        (monitor._execution_context.audit_reasons or ())
+    assert monitor.order_mgr.execution_context.effective_mode == \
+        ModeTransitionState.LIVE_QUARANTINED.value
+
+
 def test_persist_post_set_failure_rolls_back_canonical_file(
         monkeypatch, tmp_path):
     """[P1] post-set failure with a REAL canonical file already present:
