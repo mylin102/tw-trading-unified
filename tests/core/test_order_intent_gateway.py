@@ -1776,9 +1776,12 @@ def test_e2e_pre_submit_snapshot_mismatch_zero_authorization(
 
 
 def test_e2e_no_signal_no_broker_query(monkeypatch, tmp_path):
-    """[P0 repair] without an exit signal the tick performs NO broker
-    snapshot query — the pre-submit proof is taken only when a bounded
-    EXIT/RELEASE signal is about to submit."""
+    """[P0 repair] without an exit signal the tick performs NO
+    additional PRE-SUBMIT broker query — the pre-submit proof is taken
+    only when a bounded EXIT/RELEASE signal is about to submit (the
+    background 30s renewal hook is stubbed out in E2E; in production it
+    makes its own periodic health queries independently of the
+    pre-submit boundary)."""
     from dataclasses import replace
     from pathlib import Path
     from types import SimpleNamespace
@@ -1912,6 +1915,165 @@ def test_e2e_renewal_monitoring_continues_no_age_gate(
     assert not any(e[1].get("reason") == "EXIT_ONLY_SNAPSHOT_STALE"
                    for e in _hyd), [e[1] for e in _hyd]
     assert len(monitor.api.calls) == 2
+
+
+def test_e2e_pre_submit_mismatch_persist_failure_no_split_refs(
+        monkeypatch, tmp_path):
+    """[P0 repair] the pre-submit proof fails (open order) and the
+    quarantine PERSIST fails (recoverable False): the exact prior
+    context is restored across ALL refs (monitor == order_mgr == client,
+    same immutable object) — no split authority, zero adapter calls."""
+    from dataclasses import replace
+    from pathlib import Path
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+    from strategies.futures.mts_ledger_authority import (
+        MtsAuthority, MtsAuthorityState)
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    _prior_ctx = monitor._execution_context
+    assert monitor.order_mgr.execution_context is _prior_ctx
+    monitor._ledger_projection.snapshot = lambda: MtsAuthorityState(
+        MtsAuthority.FLAT)
+    monitor._ledger_projection_sync_ts = 0.0
+    monitor._last_mts_tick_mono = None
+    monitor._prev_mts_tick_mono = None
+    monitor._mts_release_orders_flushed = True
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s1_no_state.json"))
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monitor.trader = SimpleNamespace(position=0)
+    monitor._mts_risk_gate_settlement = lambda strategy: False
+    monitor._mts_check_evaluator_lag = lambda strategy, has_pos: None
+    monitor._mts_note_strategy_evaluated = lambda: None
+    monitor._inject_mtf_snapshot = lambda bar: None
+
+    class _Strategy:
+        def init(self, ctx):
+            pass
+
+        def on_bar(self, ctx):
+            return None
+
+        def _reset(self, **kw):
+            pass
+
+    strategy = _Strategy()
+    monitor._registry = {"tmf_spread": strategy}
+    monitor._read_exit_only_renewal_provenance = lambda: (
+        _renewal_proof_for(monitor, captured_age_ms=30_000,
+                           renewed_age_ms=30_000))
+    assert monitor._exit_only_pre_evaluation_hydration(strategy) is True
+
+    def _preclose(strategy, bar):
+        sig = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+        monitor._submit_mts_order_signal(
+            sig, strategy, bar, __import__("datetime").datetime.now())
+        return False
+
+    monitor._mts_risk_gate_single_leg_preclose = _preclose
+    # the pre-submit snapshot now shows an OPEN ORDER => proof fails
+    from tests.core.test_reconciled_exit_attestation import (
+        _exit_only_renew_api)
+    monitor.api = _exit_only_renew_api(trades=[
+        SimpleNamespace(status=SimpleNamespace(status="PendingSubmit"),
+                        ordno="ORD-1")])
+    # FORCE the quarantine persist to fail (recoverable False)
+    monitor._persist_execution_context = lambda: False
+
+    bar = {"near_close": 44905.0, "far_close": 45038.5, "ts": 1754991000}
+    monitor._mts_tick(bar)
+
+    # no split authority: all refs hold the SAME prior immutable object
+    assert monitor._execution_context is _prior_ctx
+    assert monitor.order_mgr.execution_context is _prior_ctx
+    # zero ORDER/authorization adapter calls (the read-only snapshot
+    # queries of the proof are not order calls)
+    assert monitor.order_mgr.broker_adapter.calls == []
+    blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
+    assert blocked and blocked[-1][1]["reason"] == "EXIT_ONLY_OPEN_ORDERS"
+
+
+def test_e2e_pre_submit_mismatch_persist_fatal_hard_disables_broker(
+        monkeypatch, tmp_path):
+    """[P0 repair] the pre-submit proof fails and the quarantine persist
+    RAISES ExecutionContextSyncFatal: the fatal propagates (never
+    swallowed — process-terminating), the broker is hard-disabled
+    (api=None + _broker_capability_disabled) and zero adapter calls are
+    possible."""
+    from dataclasses import replace
+    from pathlib import Path
+    from types import SimpleNamespace
+    import pytest
+    import strategies.futures.monitor as monitor_mod
+    from strategies.futures.monitor import ExecutionContextSyncFatal
+    from strategies.futures.mts_ledger_authority import (
+        MtsAuthority, MtsAuthorityState)
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    monitor._ledger_projection.snapshot = lambda: MtsAuthorityState(
+        MtsAuthority.FLAT)
+    monitor._ledger_projection_sync_ts = 0.0
+    monitor._last_mts_tick_mono = None
+    monitor._prev_mts_tick_mono = None
+    monitor._mts_release_orders_flushed = True
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s1_no_state.json"))
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monitor.trader = SimpleNamespace(position=0)
+    monitor._mts_risk_gate_settlement = lambda strategy: False
+    monitor._mts_check_evaluator_lag = lambda strategy, has_pos: None
+    monitor._mts_note_strategy_evaluated = lambda: None
+    monitor._inject_mtf_snapshot = lambda bar: None
+
+    class _Strategy:
+        def init(self, ctx):
+            pass
+
+        def on_bar(self, ctx):
+            return None
+
+        def _reset(self, **kw):
+            pass
+
+    strategy = _Strategy()
+    monitor._registry = {"tmf_spread": strategy}
+    monitor._read_exit_only_renewal_provenance = lambda: (
+        _renewal_proof_for(monitor, captured_age_ms=30_000,
+                           renewed_age_ms=30_000))
+    assert monitor._exit_only_pre_evaluation_hydration(strategy) is True
+
+    def _preclose(strategy, bar):
+        sig = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+        monitor._submit_mts_order_signal(
+            sig, strategy, bar, __import__("datetime").datetime.now())
+        return False
+
+    monitor._mts_risk_gate_single_leg_preclose = _preclose
+    from tests.core.test_reconciled_exit_attestation import (
+        _exit_only_renew_api)
+    monitor.api = _exit_only_renew_api(trades=[
+        SimpleNamespace(status=SimpleNamespace(status="PendingSubmit"),
+                        ordno="ORD-1")])
+
+    def _fatal(*a, **k):
+        raise ExecutionContextSyncFatal("rollback failed")
+
+    monitor._persist_execution_context = _fatal
+
+    bar = {"near_close": 44905.0, "far_close": 45038.5, "ts": 1754991000}
+    with pytest.raises(ExecutionContextSyncFatal):
+        monitor._mts_tick(bar)
+
+    # the broker capability is hard-disabled: no possible adapter call
+    assert monitor.api is None
+    assert getattr(monitor, "_broker_capability_disabled", False) is True
 
 
 def test_s1_normal_live_and_paper_untouched():
