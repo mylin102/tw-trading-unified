@@ -18,6 +18,7 @@ from core.mode_transition import (
 )
 from core.order_management.order import OrderSide, OrderType
 from core.order_management.order_manager import OrderManager
+import os
 
 
 def _live_ctx():
@@ -552,6 +553,116 @@ def test_persist_post_set_failure_restores_prior_and_false(
     assert monitor._persist_execution_context() is False
     assert cranky._execution_context is _live     # restored prior
     assert order_mgr.execution_context is _live   # restored prior
+
+
+def _exit_only_ctx_from(live_ctx):
+    """Valid RECONCILED_EXIT_ONLY context (full capability) so the real
+    canonical persist accepts it (schema requires capability v2)."""
+    from core.reconciled_exit import (
+        apply_exit_only,
+        build_exit_only_capability,
+    )
+    _cap, _ = build_exit_only_capability(
+        _valid_attestation(), _fresh_snapshot(), ctx=live_ctx)
+    return apply_exit_only(live_ctx, _cap)
+
+
+def test_persist_post_set_failure_rolls_back_canonical_file(
+        monkeypatch, tmp_path):
+    """[P1] post-set failure with a REAL canonical file already present:
+    the file is atomically restored to the prior payload; all in-memory
+    consumers restored to prior refs; False returned."""
+    import json
+
+    from core.execution_context_state import persist_execution_context
+    from strategies.futures.monitor import FuturesMonitor
+
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    _live = _live_ctx()
+    # prior canonical state exists (real atomic write)
+    persist_execution_context(_live.to_dict())
+    assert (tmp_path / "execution_context.json").exists()
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._execution_context = _live
+
+    class _Cranky:
+        def __init__(self, allowed):
+            self._allowed = allowed
+
+        @property
+        def _execution_context(self):
+            return self._allowed
+
+        @_execution_context.setter
+        def _execution_context(self, value):
+            if value is not self._allowed:
+                raise TypeError("cannot change")
+            self._allowed = value
+
+    cranky = _Cranky(_live)
+    monitor.client = cranky
+    order_mgr = SimpleNamespace(execution_context=_live)
+    monitor.order_mgr = order_mgr
+
+    new_ctx = _exit_only_ctx_from(_live)
+    monitor._execution_context = new_ctx
+
+    assert monitor._persist_execution_context() is False
+    # canonical file rolled back to the prior payload (atomic re-persist)
+    _after = json.loads(
+        (tmp_path / "execution_context.json").read_text(encoding="utf-8"))
+    assert _after["effective_mode"] == "live_ready"
+    assert cranky._execution_context is _live
+    assert order_mgr.execution_context is _live
+
+
+def test_persist_post_set_failure_removes_new_file_when_no_prior(
+        monkeypatch, tmp_path):
+    """[P1] post-set failure with NO prior canonical file: the new file
+    must be REMOVED (no EXIT_ONLY state survives a restart — split-brain
+    prevention); consumers restored; False returned."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    _live = _live_ctx()
+    assert not (tmp_path / "execution_context.json").exists()
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._execution_context = _live
+
+    class _Cranky:
+        def __init__(self, allowed):
+            self._allowed = allowed
+
+        @property
+        def _execution_context(self):
+            return self._allowed
+
+        @_execution_context.setter
+        def _execution_context(self, value):
+            if value is not self._allowed:
+                raise TypeError("cannot change")
+            self._allowed = value
+
+    cranky = _Cranky(_live)
+    monitor.client = cranky
+    order_mgr = SimpleNamespace(execution_context=_live)
+    monitor.order_mgr = order_mgr
+
+    new_ctx = _exit_only_ctx_from(_live)
+    monitor._execution_context = new_ctx
+
+    removed = []
+    monkeypatch.setattr(
+        os, "remove",
+        lambda p: (removed.append(p), os.unlink(p)))
+    assert monitor._persist_execution_context() is False
+    # the rollback MUST remove the new file (probe proves the path runs)
+    assert removed, "rollback must remove the new EXIT_ONLY file"
+    assert not (tmp_path / "execution_context.json").exists()
+    assert cranky._execution_context is _live
+    assert order_mgr.execution_context is _live
 
 
 def test_monitor_attestation_consumer_split_failure_no_success(
