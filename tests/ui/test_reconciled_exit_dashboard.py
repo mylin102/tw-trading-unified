@@ -340,6 +340,89 @@ def test_paper_context_is_not_intercepted_by_exit_only_presentation():
     assert exit_only_upl_presentation(paper, None, now_ms=NOW_MS) is None
 
 
+def _exit_only_ctx_dict(rid="rid-abc-123"):
+    """A RECONCILED_EXIT_ONLY context dict with the given rid."""
+    return {
+        "effective_mode": "reconciled_exit_only",
+        "exit_only_capability": {
+            "reconciliation_id": rid,
+            "legs": [
+                {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1,
+                 "avg_cost": 44909.0},
+                {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1,
+                 "avg_cost": 45052.0},
+            ],
+        },
+    }
+
+
+def test_exit_only_order_rows_current_rid_visible_others_isolated():
+    """[Dashboard] in RECONCILED_EXIT_ONLY the CURRENT order table keeps
+    only rows explicitly bound to the current capability rid; stale /
+    no-rid / legacy RECOVERED / prior-session rows are excluded and
+    counted (never deleted)."""
+    from ui.dashboard import filter_mts_order_rows_for_exit_only
+
+    rows = [
+        {"order_id": "ORD-20260812-000001", "status": "rejected",
+         "reconciliation_id": "rid-OLD-CAPABILITY"},
+        {"order_id": "RECOV-091207", "status": "filled",
+         "reconciliation_id": None},
+        {"order_id": "ORD-20260812-000002", "status": "filled",
+         "reconciliation_id": "rid-abc-123"},
+        {"order_id": "ORD-PAPER", "status": "filled",
+         "reconciliation_id": "paper"},
+    ]
+    kept, excluded = filter_mts_order_rows_for_exit_only(
+        rows, reconciliation_id="rid-abc-123")
+    assert [r["order_id"] for r in kept] == ["ORD-20260812-000002"]
+    assert excluded == 3  # stale rid + no rid + paper
+    # the source list is never mutated (no ledger deletion)
+    assert len(rows) == 4
+
+
+def test_exit_only_order_rows_no_rid_shows_nothing():
+    """[Dashboard] with no matching rid, the current table shows zero
+    rows and all records are counted as isolated."""
+    from ui.dashboard import filter_mts_order_rows_for_exit_only
+
+    rows = [
+        {"order_id": "RECOV-091207", "reconciliation_id": None},
+        {"order_id": "ORD-OLD", "reconciliation_id": "rid-old"},
+    ]
+    kept, excluded = filter_mts_order_rows_for_exit_only(
+        rows, reconciliation_id="rid-abc-123")
+    assert kept == []
+    assert excluded == 2
+
+
+def test_exit_only_order_visibility_paper_live_unchanged():
+    """[Dashboard] exit_only_order_visibility leaves PAPER / normal LIVE
+    displays untouched (no filtering, zero isolated)."""
+    from ui.dashboard import exit_only_order_visibility
+
+    rows = [
+        {"order_id": "ORD-1", "status": "filled", "reconciliation_id": None},
+        {"order_id": "ORD-2", "status": "rejected", "reconciliation_id": "old"},
+    ]
+    # paper (no exit-only context)
+    shown, isolated = exit_only_order_visibility(rows, context={})
+    assert shown == rows and isolated == 0
+    # normal live (live_ready)
+    shown, isolated = exit_only_order_visibility(
+        rows, context={"effective_mode": "live_ready"})
+    assert shown == rows and isolated == 0
+    # exit-only filters
+    shown, isolated = exit_only_order_visibility(
+        rows, context=_exit_only_ctx_dict("rid-abc-123"))
+    assert shown == [] and isolated == 2
+    # matching rid rows stay visible in exit-only
+    rows2 = [{"order_id": "ORD-NEW", "reconciliation_id": "rid-abc-123"}]
+    shown, isolated = exit_only_order_visibility(
+        rows2, context=_exit_only_ctx_dict("rid-abc-123"))
+    assert [r["order_id"] for r in shown] == ["ORD-NEW"] and isolated == 0
+
+
 def test_exit_only_primary_panel_skips_legacy_state_and_daily_jsonl():
     """The restricted-exit primary panel has a separate capability/BBO
     presentation path; it must not fall through to /tmp state or MTS daily
