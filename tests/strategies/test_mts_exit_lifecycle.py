@@ -64,7 +64,10 @@ def test_mts_exit_trigger_logic(strategy):
     
     # 2. Case A: Price is 44075 (Peak 100 - Current 75 = 25 pts drop, < 35 threshold) -> No signal
     bar_no_exit = {
-        "near_close": 44100.0, "far_close": 44075.0, "atr": 10.0, "timestamp": datetime.now()
+        "near_close": 44100.0, "far_close": 44075.0, "atr": 10.0,
+        "near_bid": 44099.0, "near_ask": 44101.0,
+        "far_bid": 44074.0, "far_ask": 44076.0,
+        "timestamp": datetime.now()
     }
     ctx_no_exit = StrategyContext(market=MarketData(last_bar=bar_no_exit, ticker="TMF"), 
                                  position=PositionView(size=1), config={})
@@ -74,7 +77,10 @@ def test_mts_exit_trigger_logic(strategy):
 
     # 3. Case B: Price is 44060 (Peak 100 - Current 60 = 40 pts drop, > 35 threshold) -> Trigger EXIT
     bar_exit = {
-        "near_close": 44100.0, "far_close": 44020.0, "atr": 10.0, "timestamp": datetime.now()
+        "near_close": 44100.0, "far_close": 44020.0, "atr": 10.0,
+        "near_bid": 44099.0, "near_ask": 44101.0,
+        "far_bid": 44019.0, "far_ask": 44021.0,
+        "timestamp": datetime.now()
     }
     ctx_exit = StrategyContext(market=MarketData(last_bar=bar_exit, ticker="TMF"), 
                                position=PositionView(size=1), config={})
@@ -387,7 +393,10 @@ def test_single_leg_trail_uses_post_release_tick_path_only_long(strategy):
     
     # Tick 1: Price rises to 44010.0. Peak should update to 44010.0.
     bar_tick1 = {
-        "near_close": 44100.0, "far_close": 44010.0, "atr": 10.0, "timestamp": datetime.now()
+        "near_close": 44100.0, "far_close": 44010.0, "atr": 10.0,
+        "near_bid": 44099.0, "near_ask": 44101.0,
+        "far_bid": 44009.0, "far_ask": 44011.0,
+        "timestamp": datetime.now()
     }
     ctx1 = StrategyContext(market=MarketData(last_bar=bar_tick1, ticker="TMF"), 
                            position=PositionView(size=1), config={})
@@ -397,7 +406,10 @@ def test_single_leg_trail_uses_post_release_tick_path_only_long(strategy):
     
     # Tick 2: Price drops to 43980.0 (Pullback = 30 pts < 35 threshold). No exit signal.
     bar_tick2 = {
-        "near_close": 44100.0, "far_close": 43980.0, "atr": 10.0, "timestamp": datetime.now()
+        "near_close": 44100.0, "far_close": 43980.0, "atr": 10.0,
+        "near_bid": 44099.0, "near_ask": 44101.0,
+        "far_bid": 43979.0, "far_ask": 43981.0,
+        "timestamp": datetime.now()
     }
     ctx2 = StrategyContext(market=MarketData(last_bar=bar_tick2, ticker="TMF"), 
                            position=PositionView(size=1), config={})
@@ -407,7 +419,10 @@ def test_single_leg_trail_uses_post_release_tick_path_only_long(strategy):
     
     # Tick 3: Price drops to 43970.0 (Pullback = 40 pts >= 35 threshold). Trigger EXIT.
     bar_tick3 = {
-        "near_close": 44100.0, "far_close": 43970.0, "atr": 10.0, "timestamp": datetime.now()
+        "near_close": 44100.0, "far_close": 43970.0, "atr": 10.0,
+        "near_bid": 44099.0, "near_ask": 44101.0,
+        "far_bid": 43969.0, "far_ask": 43971.0,
+        "timestamp": datetime.now()
     }
     ctx3 = StrategyContext(market=MarketData(last_bar=bar_tick3, ticker="TMF"), 
                            position=PositionView(size=1), config={})
@@ -456,7 +471,10 @@ def test_single_leg_trail_uses_post_release_tick_path_only_short(strategy):
     
     # Tick 1: Price drops to 43190.0. Nadir should update to 43190.0.
     bar_tick1 = {
-        "near_close": 43190.0, "far_close": 43450.0, "atr": 10.0, "timestamp": datetime.now()
+        "near_close": 43190.0, "far_close": 43450.0, "atr": 10.0,
+        "near_bid": 43189.0, "near_ask": 43191.0,
+        "far_bid": 43449.0, "far_ask": 43451.0,
+        "timestamp": datetime.now()
     }
     ctx1 = StrategyContext(market=MarketData(last_bar=bar_tick1, ticker="TMF"), 
                            position=PositionView(size=1), config={})
@@ -466,7 +484,10 @@ def test_single_leg_trail_uses_post_release_tick_path_only_short(strategy):
     
     # Tick 2: Price rises to 43220.0 (Rebound = 30 pts < 35 threshold). No exit signal.
     bar_tick2 = {
-        "near_close": 43220.0, "far_close": 43450.0, "atr": 10.0, "timestamp": datetime.now()
+        "near_close": 43220.0, "far_close": 43450.0, "atr": 10.0,
+        "near_bid": 43219.0, "near_ask": 43221.0,
+        "far_bid": 43449.0, "far_ask": 43451.0,
+        "timestamp": datetime.now()
     }
     ctx2 = StrategyContext(market=MarketData(last_bar=bar_tick2, ticker="TMF"), 
                            position=PositionView(size=1), config={})
@@ -476,7 +497,10 @@ def test_single_leg_trail_uses_post_release_tick_path_only_short(strategy):
     
     # Tick 3: Price rises to 43230.0 (Rebound = 40 pts >= 35 threshold). Trigger EXIT.
     bar_tick3 = {
-        "near_close": 43230.0, "far_close": 43450.0, "atr": 10.0, "timestamp": datetime.now()
+        "near_close": 43230.0, "far_close": 43450.0, "atr": 10.0,
+        "near_bid": 43229.0, "near_ask": 43231.0,
+        "far_bid": 43449.0, "far_ask": 43451.0,
+        "timestamp": datetime.now()
     }
     ctx3 = StrategyContext(market=MarketData(last_bar=bar_tick3, ticker="TMF"), 
                            position=PositionView(size=1), config={})
@@ -576,4 +600,123 @@ def test_release_far_wide_near_quote_does_not_block(strategy):
     # the single-leg release is surfaced as a PARTIAL_EXIT signal
     assert getattr(signal, "action", None) in (
         "RELEASE", "RELEASE_FAR", "PARTIAL_EXIT")
+
+def test_release_near_quote_zero_blocks(strategy):
+    """[P0c] the released leg's quote is 0/0: QUOTE_INVALID — never
+    treated as a 0-point width that wrongly passes a single-leg close."""
+    strategy = _release_armed_strategy(strategy)
+    bar = {
+        "near_close": 44120.0, "far_close": 44200.0, "atr": 10.0,
+        "near_bid": 0, "near_ask": 0,
+        "far_bid": 44199.0, "far_ask": 44201.0,
+        "near_tick_age_ms": 0, "far_tick_age_ms": 0,
+        "timestamp": datetime.now(),
+    }
+    ctx = StrategyContext(market=MarketData(last_bar=bar, ticker="TMF"),
+                          position=PositionView(size=1), config={})
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy.on_bar(ctx)
+    assert signal is None, "a zero quote must block the release"
+
+
+def test_release_near_quote_missing_fallback_blocks(strategy):
+    """[P0c] the released leg's bid/ask fields are MISSING (the gate
+    falls back to close => 0-point width): QUOTE_INVALID — block."""
+    strategy = _release_armed_strategy(strategy)
+    bar = {
+        "near_close": 44120.0, "far_close": 44200.0, "atr": 10.0,
+        # no near_bid / near_ask keys at all (fallback path)
+        "far_bid": 44199.0, "far_ask": 44201.0,
+        "near_tick_age_ms": 0, "far_tick_age_ms": 0,
+        "timestamp": datetime.now(),
+    }
+    ctx = StrategyContext(market=MarketData(last_bar=bar, ticker="TMF"),
+                          position=PositionView(size=1), config={})
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy.on_bar(ctx)
+    assert signal is None, "a missing quote (fallback) must block"
+
+
+def test_release_near_quote_nan_blocks(strategy):
+    """[P0c] the released leg's quote is NaN: QUOTE_INVALID — block."""
+    strategy = _release_armed_strategy(strategy)
+    bar = {
+        "near_close": 44120.0, "far_close": 44200.0, "atr": 10.0,
+        "near_bid": float("nan"), "near_ask": float("nan"),
+        "far_bid": 44199.0, "far_ask": 44201.0,
+        "near_tick_age_ms": 0, "far_tick_age_ms": 0,
+        "timestamp": datetime.now(),
+    }
+    ctx = StrategyContext(market=MarketData(last_bar=bar, ticker="TMF"),
+                          position=PositionView(size=1), config={})
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy.on_bar(ctx)
+    assert signal is None, "a NaN quote must block the release"
+
+
+def test_release_near_quote_inverted_blocks(strategy):
+    """[P0c] the released leg's quote is inverted (ask < bid):
+    QUOTE_INVALID — block."""
+    strategy = _release_armed_strategy(strategy)
+    bar = {
+        "near_close": 44120.0, "far_close": 44200.0, "atr": 10.0,
+        "near_bid": 44121.0, "near_ask": 44119.0,   # inverted
+        "far_bid": 44199.0, "far_ask": 44201.0,
+        "near_tick_age_ms": 0, "far_tick_age_ms": 0,
+        "timestamp": datetime.now(),
+    }
+    ctx = StrategyContext(market=MarketData(last_bar=bar, ticker="TMF"),
+                          position=PositionView(size=1), config={})
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy.on_bar(ctx)
+    assert signal is None, "an inverted quote must block the release"
+
+
+def test_combined_both_legs_wide_any_blocks(strategy):
+    """[P0c] the both-leg (non-single-leg) path stays conservative: any
+    leg wider than max_spread_width blocks — the single-leg scoping
+    must NOT leak into the default path."""
+    from strategies.plugins.futures.active.tmf_spread import (
+        PositionPhase, PositionLifecycle, ReleaseGroup, ReleaseGroupStatus,
+        TrailGroup, TrailGroupStatus, Leg)
+    import time
+    strategy._has_position = True
+    strategy._released_leg = "near"
+    strategy._side = "LONG"
+    strategy._far_entry = 44000.0
+    strategy._peak = 44100.0
+    strategy._ticker = "TMF"
+    strategy._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SINGLE_LEG,
+        release_group=ReleaseGroup(status=ReleaseGroupStatus.COMPLETED,
+                                   filled_leg=Leg.NEAR,
+                                   canceled_leg=Leg.FAR),
+        trail_group=TrailGroup(status=TrailGroupStatus.ARMED,
+                               remaining_leg=Leg.FAR))
+    strategy._single_leg_entered_mono = time.monotonic() - 10.0
+    strategy._single_leg_post_fill_ticks = 10
+    # far dropped 80pts (giveback 100-20 >> trail_dist 35) => trail EXIT
+    # BUT the remaining (FAR) leg's quote is wide (7 > max 3) => block
+    bar = {
+        "near_close": 44100.0, "far_close": 44020.0, "atr": 10.0,
+        "near_bid": 44099.0, "near_ask": 44101.0,   # width 2
+        "far_bid": 44013.0, "far_ask": 44020.0,     # width 7 > max 3
+        "near_tick_age_ms": 0, "far_tick_age_ms": 0,
+        "timestamp": datetime.now(),
+    }
+    ctx = StrategyContext(market=MarketData(last_bar=bar, ticker="TMF"),
+                          position=PositionView(size=1), config={})
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy.on_bar(ctx)
+    assert signal is None, "the both-leg path must keep blocking wide quotes"
 
