@@ -70,6 +70,28 @@ def exit_only_upl_presentation(context: Any, evidence: Any, *,
     if len(legs) != 2:
         return {"kind": "NA", "reason": "EXIT_ONLY_CAPABILITY_MISSING",
                 "total_pnl": None}
+    # [P1 closure] malformed capability legs are typed-rejected, never
+    # float-coerced: side must be buy/sell, qty positive finite, cost
+    # finite numeric.
+    import math as _math
+    for _leg in legs:
+        _side = _leg.get("side")
+        _qty = _leg.get("remaining_qty")
+        _cost = _leg.get("avg_cost")
+        if _side not in ("buy", "sell"):
+            return {"kind": "NA",
+                    "reason": "EXIT_ONLY_CAPABILITY_INVALID",
+                    "total_pnl": None}
+        if (not isinstance(_qty, (int, float)) or isinstance(_qty, bool)
+                or not _math.isfinite(float(_qty)) or float(_qty) <= 0):
+            return {"kind": "NA",
+                    "reason": "EXIT_ONLY_CAPABILITY_INVALID",
+                    "total_pnl": None}
+        if (not isinstance(_cost, (int, float)) or isinstance(_cost, bool)
+                or not _math.isfinite(float(_cost))):
+            return {"kind": "NA",
+                    "reason": "EXIT_ONLY_CAPABILITY_INVALID",
+                    "total_pnl": None}
     if not isinstance(evidence, dict):
         return {"kind": "NA", "reason": "EXIT_ONLY_BBO_MISSING",
                 "total_pnl": None}

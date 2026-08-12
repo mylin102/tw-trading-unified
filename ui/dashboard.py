@@ -3920,8 +3920,9 @@ elif _selected_product == "TMF":
         # state/ledger path.  A restricted-exit position has one authority:
         # broker-attested capability plus current, hash-bound dual BBO.
         from ui.reconciled_exit_presentation import exit_only_upl_metrics
+        _eo_ctx = load_exit_only_context()
         _exit_upl = exit_only_upl_metrics(
-            load_exit_only_context(), _events_path_scope,
+            _eo_ctx, _events_path_scope,
             now_ms=int(time.time() * 1000), point_value=10.0)
         st.header("MTS 受限平倉部位")
         _u1, _u2, _u3 = st.columns(3)
@@ -3929,7 +3930,7 @@ elif _selected_product == "TMF":
             _u1.metric("近月 UPL", f"{_exit_upl['near']['pnl']:+,.2f} TWD")
             _u2.metric("遠月 UPL", f"{_exit_upl['far']['pnl']:+,.2f} TWD")
             _u3.metric("總計 UPL", f"{_exit_upl['total_pnl']:+,.2f} TWD")
-            _cap = load_exit_only_context().get("exit_only_capability") or {}
+            _cap = _eo_ctx.get("exit_only_capability") or {}
             st.caption(
                 "受限平倉模式：僅使用券商對帳 capability 與雙腿 BBO。"
                 f"snapshot={str(_cap.get('snapshot_hash', ''))[:12]} · "
@@ -4030,36 +4031,7 @@ elif _selected_product == "TMF":
                         _nr = _r
                         _nr_label = f"{_r:+,.0f} TWD (已平倉)"
                 _tr = (_nr or 0) + (_fr or 0)
-                if active_runtime_truth.get("is_exit_only_runtime"):
-                    # [Dashboard] 受限平倉：UPL 僅來自 broker-attested
-                    # capability × hash-bound 雙腿 Shioaji BBO（event
-                    # JSONL 為 untrusted — 獨立驗證 source/bid/ask）。
-                    from ui.reconciled_exit_presentation import (
-                        exit_only_upl_metrics)
-                    _eo_upl = exit_only_upl_metrics(
-                        load_exit_only_context(), _events_path_scope,
-                        now_ms=int(time.time() * 1000), point_value=10.0,
-                        legacy_state=_mts_state)
-                    if _eo_upl and _eo_upl.get("kind") == "COMPUTED":
-                        _u1.metric("近月 UPL",
-                                   f"{_eo_upl['near']['pnl']:+,.2f} TWD")
-                        _u2.metric("遠月 UPL",
-                                   f"{_eo_upl['far']['pnl']:+,.2f} TWD")
-                        _u3.metric("總計 UPL",
-                                   f"{_eo_upl['total_pnl']:+,.2f} TWD")
-                        st.caption(
-                            "來源：broker-attested capability × 雙腿 "
-                            "Shioaji Bid/Ask（hash-bound）")
-                    else:
-                        _r = (_eo_upl or {}).get(
-                            "reason", "EXIT_ONLY_BBO_MISSING")
-                        _u1.metric("近月 UPL", "N/A")
-                        _u2.metric("遠月 UPL", "N/A")
-                        _u3.metric("總計 UPL", "N/A")
-                        st.warning(
-                            f"⚠️ MTS UPL N/A — 受限平倉等待新鮮券商對帳"
-                            f"與雙腿 BBO（{_r}）")
-                elif _mts_perf_scope["ok"]:
+                if _mts_perf_scope["ok"]:
                     _u1.metric("近月 UPL", _nr_label)
                     _u2.metric("遠月 UPL", _fr_label)
                     _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
@@ -4586,56 +4558,11 @@ elif _selected_product == "TMF":
                         _trader_bal = _mts_state.get("balance")
                         _live_eq = _mts_state.get("live_equity")
 
-                        # [Dashboard] RECONCILED_EXIT_ONLY: UPL ONLY from
-                        # the broker-attested capability + hash-bound dual
-                        # Shioaji BBO evidence; paper/local legacy ledger
-                        # values are never a fallback.
-                        _eo_upl = None
-                        _exit_only_active = False
-                        try:
-                            _eo_ctx_f = Path(
-                                runtime_path("execution_context.json"))
-                            _eo_ctx = {}
-                            if _eo_ctx_f.exists():
-                                _eo_ctx = json.loads(
-                                    _eo_ctx_f.read_text(encoding="utf-8")) \
-                                    or {}
-                            _exit_only_active = (
-                                _eo_ctx.get("effective_mode")
-                                == "reconciled_exit_only")
-                            if _exit_only_active:
-                                from ui.reconciled_exit_presentation import (
-                                    exit_only_upl_presentation,
-                                    latest_bbo_evidence_from_events)
-                                _eo_evidence =                                     latest_bbo_evidence_from_events(os.path.join(
-                                        runtime_logs(),
-                                        "mts_spread_events.jsonl"))
-                                _eo_upl = exit_only_upl_presentation(
-                                    _eo_ctx, _eo_evidence,
-                                    now_ms=int(time.time() * 1000),
-                                    point_value=10.0,
-                                    legacy_state=_mts_state)
-                        except Exception:
-                            _eo_upl = None
-                            _exit_only_active = False
-
-                        if not _exit_only_active and f_live \
+                        if f_live \
                                 and _live_eq is not None:
                             _bal = _live_eq
                             _label = "帳戶權益（券商）"
                             _source = "broker"
-                        elif _exit_only_active:
-                            _equity_row = st.columns([1, 1, 2])
-                            _equity_row[0].metric("受限平倉", "RECONCILED_EXIT_ONLY")
-                            if _eo_upl and _eo_upl.get("kind") == "COMPUTED":
-                                _equity_row[1].metric(
-                                    "UPL（券商佐證＋雙腿 BBO）",
-                                    f"{_eo_upl['total_pnl']:+,.2f}")
-                            else:
-                                _r = (_eo_upl or {}).get(
-                                    "reason", "EXIT_ONLY_BBO_MISSING")
-                                _equity_row[1].metric("UPL", "N/A")
-                                _equity_row[2].metric("原因", _r)
                         elif _has_pos or _realized != 0 or _upl != 0:
                             _bal = _init_bal + _realized + _upl
                             _label = "模擬帳戶權益（MTS）"
@@ -4654,40 +4581,7 @@ elif _selected_product == "TMF":
                             _equity_row[1].metric(_label, f"{_bal:,.0f}")
                             _pnl_total = _bal - _init_bal
                             _equity_row[2].metric("總損益", f"{_pnl_total:+,.0f}", delta=f"{_pnl_total/_init_bal*100:+.1f}%")
-                        if _exit_only_active:
-                            if _eo_upl and _eo_upl.get("kind") == "COMPUTED":
-                                _cap2 = _eo_ctx.get(
-                                    "exit_only_capability") or {}
-                                _legs2 = _cap2.get("legs") or []
-                                _rows2 = []
-                                for _i2, _leg2 in enumerate(_legs2):
-                                    _key2 = "near" if _i2 == 0 else "far"
-                                    _p2 = _eo_upl.get(_key2, {})
-                                    _rows2.append({
-                                        "Leg": "近月" if _key2 == "near"
-                                        else "遠月",
-                                        "方向": _leg2.get("side"),
-                                        "口數": _leg2.get("remaining_qty"),
-                                        "進場": _leg2.get("avg_cost"),
-                                        "損益": _p2.get("pnl"),
-                                    })
-                                st.markdown(
-                                    "**MTS 受限平倉 "
-                                    "(RECONCILED_EXIT_ONLY)** · "
-                                    "僅券商佐證＋雙腿 Bid/Ask")
-                                st.dataframe(pd.DataFrame(_rows2),
-                                             width='stretch',
-                                             hide_index=True)
-                                st.caption(
-                                    f"Total UPL={_eo_upl['total_pnl']:+.2f} "
-                                    " (broker_attested_dual_bbo)")
-                            else:
-                                _r2 = (_eo_upl or {}).get(
-                                    "reason", "EXIT_ONLY_BBO_MISSING")
-                                st.warning(
-                                    f"MTS 受限平倉: UPL N/A — {_r2}；"
-                                    "不顯示本地/模擬 ledger 數值。")
-                        elif _mts_state.get("has_position", False):
+                        if _mts_state.get("has_position", False):
                             _mts_fallback_shown = True
                             # Build per-leg status display
                             _st = _mts_state.get("state", "?")
