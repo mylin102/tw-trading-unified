@@ -1103,6 +1103,119 @@ def test_monitor_attestation_persist_failure_keeps_prior_context(
             stale_order, method="place_order")
 
 
+def _bbo_cache(*, near_ts=None, far_ts=None, now_ms=None):
+    """A fresh valid dual-leg EXIT_ONLY BBO cache (TMFH6/TMFI6)."""
+    _now = now_ms if now_ms is not None else int(time.time() * 1000)
+    return {
+        "near": {"code": "TMFH6", "bid": 99.0, "ask": 101.0,
+                 "exchange_ts_ms": near_ts or (_now - 1000),
+                 "received_at_ms": _now - 1000,
+                 "source": "shioaji_bidask"},
+        "far": {"code": "TMFI6", "bid": 94.0, "ask": 96.0,
+                "exchange_ts_ms": far_ts or (_now - 1000),
+                "received_at_ms": _now - 1000,
+                "source": "shioaji_bidask"},
+    }
+
+
+def _exit_only_monitor(monkeypatch, tmp_path=None):
+    from types import SimpleNamespace
+
+    from strategies.futures.monitor import FuturesMonitor
+
+    monkeypatch.setenv("LRC_RELEASE_SHA", "d" * 40)
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._execution_context = _exit_only_ctx_from(_live_ctx())
+    monitor.contract = SimpleNamespace(code="TMFH6")
+    monitor.far_contract = SimpleNamespace(code="TMFI6")
+    events = []
+    monitor._append_mts_event = lambda event_type, **kw: events.append(
+        (event_type, kw))
+    return monitor, events
+
+
+def test_monitor_bbo_observation_yields_valid_dashboard_evidence(
+        monkeypatch, tmp_path):
+    """[P1] a fresh valid dual BBO cache against the CURRENT capability
+    emits exactly one EXIT_ONLY_BBO_OBSERVED event (bbo_hash +
+    bbo_payload) that the dashboard evidence scan accepts; the same
+    binding within the rate-limit window emits nothing more."""
+    import json
+
+    from strategies.futures.monitor import FuturesMonitor
+    from ui.reconciled_exit_presentation import (
+        exit_only_upl_presentation, latest_bbo_evidence_from_events)
+
+    monitor, events = _exit_only_monitor(monkeypatch)
+    monitor._exit_only_bbo_cache = _bbo_cache()
+
+    monitor._observe_exit_only_bbo_evidence()
+
+    assert len(events) == 1
+    assert events[0][0] == "EXIT_ONLY_BBO_OBSERVED"
+    _payload = events[0][1]["bbo_payload"]
+    _hash = events[0][1]["bbo_hash"]
+    assert _hash and isinstance(_payload, dict)
+    assert events[0][1]["reconciliation_id"] == \
+        monitor._execution_context.exit_only_capability["reconciliation_id"]
+
+    # the dashboard evidence scan accepts the persisted event
+    _ev_path = tmp_path / "mts_spread_events.jsonl"
+    with open(_ev_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "event": "EXIT_ONLY_BBO_OBSERVED",
+            "ts": "2026-08-12T00:00:00",
+            "bbo_hash": _hash, "bbo_payload": _payload}) + "\n")
+    _ev = latest_bbo_evidence_from_events(_ev_path)
+    assert _ev and _ev["bbo_hash"] == _hash
+    # and the presentation computes a valid UPL from the evidence
+    _res = exit_only_upl_presentation(
+        monitor._execution_context.to_dict(), _ev,
+        now_ms=int(time.time() * 1000), point_value=10.0)
+    assert _res["kind"] == "COMPUTED", _res
+
+    # rate-limit: the same binding inside the window emits nothing
+    events.clear()
+    monitor._observe_exit_only_bbo_evidence()
+    assert events == []
+
+
+def test_monitor_bbo_observation_stale_or_wrong_identity_emits_nothing(
+        monkeypatch):
+    """[P1] stale BBO or a capability identity mismatch emits NO
+    EXIT_ONLY_BBO_OBSERVED evidence (Dashboard stays N/A) and zero
+    order/adapter calls happen."""
+    from dataclasses import replace
+
+    monitor, events = _exit_only_monitor(monkeypatch)
+    _now_ms = int(time.time() * 1000)
+
+    # stale near leg (exchange_ts > 15s TTL)
+    monitor._exit_only_bbo_cache = _bbo_cache(
+        near_ts=_now_ms - 20_000, now_ms=_now_ms)
+    monitor._observe_exit_only_bbo_evidence()
+    assert events == []
+
+    # capability identity mismatch (reconciliation_id empty)
+    _bad_cap = dict(monitor._execution_context.exit_only_capability)
+    _bad_cap["reconciliation_id"] = ""
+    monitor._execution_context = replace(
+        monitor._execution_context, exit_only_capability=_bad_cap)
+    monitor._exit_only_bbo_cache = _bbo_cache(now_ms=_now_ms)
+    monitor._observe_exit_only_bbo_evidence()
+    assert events == []
+
+
+def test_monitor_bbo_observation_paper_live_normal_unchanged(monkeypatch):
+    """[P1] live/paper modes (no exit-only capability) emit no
+    observation — normal behavior unchanged."""
+    monitor, events = _exit_only_monitor(monkeypatch)
+    monitor._execution_context = _live_ctx()  # LIVE_READY, no capability
+    monitor._exit_only_bbo_cache = _bbo_cache()
+    monitor._observe_exit_only_bbo_evidence()
+    assert events == []
+
+
 def test_monitor_attestation_flow_applies_exit_only_and_emits_event(monkeypatch):
     from types import SimpleNamespace
 
