@@ -481,6 +481,156 @@ def test_persist_execution_context_returns_bool(monkeypatch, tmp_path):
     assert monitor._persist_execution_context() is False
 
 
+def test_persist_preflight_client_not_settable_returns_false_no_persist(
+        monkeypatch, tmp_path):
+    """[P1] a consumer that cannot accept context assignment => False
+    BEFORE any canonical persist (nothing written); consumers unchanged."""
+    import core.execution_context_state as ecs
+    from strategies.futures.monitor import FuturesMonitor
+
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    persisted = []
+    monkeypatch.setattr(ecs, "persist_execution_context",
+                        lambda payload: persisted.append(payload))
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    _live = _live_ctx()
+    monitor._execution_context = _live
+
+    class _Rigid:
+        _execution_context = property(lambda self: None)  # no setter
+
+    monitor.client = _Rigid()
+    order_mgr = SimpleNamespace(execution_context=_live)
+    monitor.order_mgr = order_mgr
+
+    assert monitor._persist_execution_context() is False
+    assert persisted == []  # nothing was persisted
+    assert not (tmp_path / "execution_context.json").exists()
+    assert order_mgr.execution_context is _live
+
+
+def test_persist_post_set_failure_restores_prior_and_false(
+        monkeypatch, tmp_path):
+    """[P1] a consumer that accepts the prior ref but rejects the NEW one
+    => False with ALL in-memory consumers restored to the prior reference
+    (no split context) and the canonical file rolled back."""
+    import core.execution_context_state as ecs
+    from strategies.futures.monitor import FuturesMonitor
+
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    _live = _live_ctx()
+    monitor._execution_context = _live
+
+    class _Cranky:
+        def __init__(self, allowed):
+            self._allowed = allowed
+
+        @property
+        def _execution_context(self):
+            return self._allowed
+
+        @_execution_context.setter
+        def _execution_context(self, value):
+            if value is not self._allowed:
+                raise TypeError("cannot change")
+            self._allowed = value
+
+    cranky = _Cranky(_live)
+    monitor.client = cranky
+    order_mgr = SimpleNamespace(execution_context=_live)
+    monitor.order_mgr = order_mgr
+
+    # canonical write succeeds; the consumer accepts only the prior ref
+    monkeypatch.setattr(ecs, "persist_execution_context",
+                        lambda payload: None)
+    from dataclasses import replace
+    new_ctx = replace(_live, effective_mode="reconciled_exit_only")
+    monitor._execution_context = new_ctx
+
+    assert monitor._persist_execution_context() is False
+    assert cranky._execution_context is _live     # restored prior
+    assert order_mgr.execution_context is _live   # restored prior
+
+
+def test_monitor_attestation_consumer_split_failure_no_success(
+        monkeypatch, tmp_path):
+    """[P1] a consumer that fails the post-persist set => typed
+    EXECUTION_CONTEXT_PERSIST_FAILED, NO OPERATOR_ATTESTATION event,
+    monitor + order_mgr on the prior context (no split, no success)."""
+    from types import SimpleNamespace
+
+    import core.execution_context_state as ecs
+    from strategies.futures.monitor import FuturesMonitor
+    from core.order_management.order_manager import OrderManager
+
+    monkeypatch.setenv("LRC_RELEASE_SHA", "d" * 40)
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(ecs, "persist_execution_context",
+                        lambda payload: None)  # canonical write succeeds
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.api = SimpleNamespace(
+        futopt_account=SimpleNamespace(),
+        list_positions=lambda acct: [
+            SimpleNamespace(code="TMFH6",
+                            direction=SimpleNamespace(name="Sell"),
+                            quantity=1, price=44909.0),
+            SimpleNamespace(code="TMFI6",
+                            direction=SimpleNamespace(name="Buy"),
+                            quantity=1, price=45052.0),
+        ],
+        list_trades=lambda acct: [],
+    )
+    old_ctx = _position_quarantine_ctx()
+    monitor._execution_context = old_ctx
+    monitor._bind_reconciled_exit_identity = lambda: True
+
+    class _Cranky:
+        def __init__(self, allowed):
+            self._allowed = allowed
+
+        @property
+        def _execution_context(self):
+            return self._allowed
+
+        @_execution_context.setter
+        def _execution_context(self, value):
+            if value is not self._allowed:
+                raise TypeError("cannot change")
+            self._allowed = value
+
+    cranky = _Cranky(old_ctx)
+    monitor.client = cranky
+    adapter_calls = []
+    adapter = SimpleNamespace(
+        place_order_object=lambda order: adapter_calls.append(order))
+    monitor.order_mgr = OrderManager(mode="live", broker_adapter=adapter,
+                                     execution_context=old_ctx)
+    events = []
+    monitor._append_mts_event = lambda event_type, **kw: events.append(
+        (event_type, kw))
+
+    record, err = monitor._operator_attest_exit_only(
+        operator="trader",
+        trade_id="mts-20260811-085503",
+        evidence="remaining spread is the 08:55 manual pair",
+        expected_legs=[
+            {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1},
+            {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1},
+        ],
+        attested_at="2026-08-11T11:00:00+08:00",
+    )
+    assert record is None
+    assert err == "EXECUTION_CONTEXT_PERSIST_FAILED"
+    assert monitor._execution_context is old_ctx
+    assert monitor.client._execution_context is old_ctx
+    assert monitor.order_mgr.execution_context is old_ctx
+    assert events == []       # NO success event
+    assert adapter_calls == []
+
+
 def test_monitor_attestation_persist_failure_rolls_back_no_event(
         monkeypatch, tmp_path):
     """[P1] attestation persist failure: monitor._execution_context is
