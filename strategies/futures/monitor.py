@@ -239,6 +239,12 @@ class GenerationDict(dict):
         super().__setitem__(key, value)
 
 
+class ExecutionContextSyncFatal(RuntimeError):
+    """[P1] a committed canonical execution-context write could not be
+    rolled back.  In-memory state is already forced to fail-closed
+    quarantine; an order-capable process must not continue."""
+
+
 class FuturesMonitor:
     def __init__(self, api, config_path: str, dry_run: bool = False):
         self.api = api
@@ -2994,7 +3000,41 @@ class FuturesMonitor:
                         # EXIT_ONLY survives a restart (no split-brain)
                         os.remove(_rf)
                 except Exception:
-                    pass
+                    # [P1 fatal] rollback of the committed canonical write
+                    # FAILED: memory was restored to prior (possibly
+                    # LIVE_READY) while disk holds the new state.  Force
+                    # fail-closed quarantine in memory (never reuse prior
+                    # authority), then raise — the process must not
+                    # continue order-capable.
+                    _qctx = None
+                    try:
+                        from dataclasses import replace
+                        from core.mode_transition import ModeTransitionState
+                        _reasons = tuple(
+                            getattr(_ctx, "audit_reasons", ())) + (
+                                "EXECUTION_CONTEXT_SYNC_FATAL",)
+                        _qctx = replace(
+                            _ctx,
+                            effective_mode=(
+                                ModeTransitionState.LIVE_QUARANTINED.value),
+                            live_order_allowed=False,
+                            audit_reasons=_reasons,
+                        )
+                    except Exception:
+                        _qctx = None
+                    if _qctx is not None:
+                        try:
+                            self._execution_context = _qctx
+                        except Exception:
+                            pass
+                        for _c2, _a2 in _consumers:
+                            try:
+                                setattr(_c2, _a2, _qctx)
+                            except Exception:
+                                pass
+                    raise ExecutionContextSyncFatal(
+                        "execution-context rollback failed; in-memory "
+                        "forced to fail-closed quarantine")
                 return False
         return True
 
@@ -3254,7 +3294,14 @@ class FuturesMonitor:
             return None, _exc.code
         _prior_ctx = self._execution_context
         self._execution_context = apply_exit_only(_prior_ctx, _cap)
-        if self._persist_execution_context() is False:
+        try:
+            _persisted = self._persist_execution_context()
+        except ExecutionContextSyncFatal:
+            # [P1] rollback of a committed write failed: in-memory is
+            # already fail-closed quarantine (never prior authority);
+            # typed fatal, NO success event.
+            return None, "EXECUTION_CONTEXT_SYNC_FATAL"
+        if _persisted is False:
             # [P1] persist failed: restore the exact prior immutable
             # context (client/order_mgr were never synced — fail-closed)
             # and emit NO OPERATOR_ATTESTATION success event.
