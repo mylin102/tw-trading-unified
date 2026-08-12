@@ -71,6 +71,62 @@ def _evidence(context, *, near_ts=NOW_MS - 1_000, far_ts=NOW_MS - 800):
     }
 
 
+def test_exit_only_runtime_truth_not_unknown_quarantined():
+    """[Dashboard] RECONCILED_EXIT_ONLY must not render
+    UNKNOWN / QUARANTINED: classified as the limited-exit runtime
+    (live profile, live_order_allowed False); LIVE/PAPER unchanged."""
+    from ui.dashboard import summarize_execution_context
+
+    ctx = {
+        "requested_mode": "live",
+        "effective_mode": "reconciled_exit_only",
+        "live_order_allowed": False,
+        "config_hash": "cfg-live",
+    }
+    truth = summarize_execution_context(
+        ctx, {"futures_live.yaml": "cfg-live"})
+    assert truth["is_exit_only_runtime"] is True
+    assert truth["runtime_status"] == "RECONCILED_EXIT_ONLY"
+    assert "UNKNOWN" not in truth["runtime_status"]
+    assert "QUARANTINED" not in truth["runtime_status"]
+    assert truth["warning"] == ""
+
+    live = summarize_execution_context(
+        {"requested_mode": "live", "effective_mode": "live_ready",
+         "live_order_allowed": True, "config_hash": "cfg-live"},
+        {"futures_live.yaml": "cfg-live"})
+    assert live["runtime_status"] == "LIVE_READY"
+    assert live["is_exit_only_runtime"] is False
+
+    paper = summarize_execution_context(
+        {"requested_mode": "paper", "effective_mode": "paper_active",
+         "live_order_allowed": False, "config_hash": "cfg-paper"},
+        {"futures.yaml (Paper baseline)": "cfg-paper"})
+    assert paper["runtime_status"] == "PAPER_ACTIVE"
+    assert paper["is_exit_only_runtime"] is False
+
+
+def test_latest_bbo_evidence_from_events(tmp_path):
+    """[Dashboard] the newest event carrying bbo_hash+bbo_payload is the
+    evidence source; events without a payload are skipped; missing file
+    => None."""
+    from ui.reconciled_exit_presentation import (
+        latest_bbo_evidence_from_events)
+
+    p = tmp_path / "events.jsonl"
+    p.write_text(
+        json.dumps({"event": "OTHER"}) + "\n"
+        + json.dumps({"bbo_hash": "h1",
+                      "bbo_payload": {"version": 2, "near": {}}}) + "\n"
+        + json.dumps({"bbo_hash": "h2",
+                      "bbo_payload": {"version": 2, "near": {"x": 1}}})
+        + "\n")
+    ev = latest_bbo_evidence_from_events(str(p))
+    assert ev is not None and ev["bbo_hash"] == "h2"
+    assert latest_bbo_evidence_from_events(
+        str(tmp_path / "missing.jsonl")) is None
+
+
 def test_exit_only_valid_broker_attested_dual_bbo_calculates_pnl():
     context = _context()
 
