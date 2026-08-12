@@ -3557,18 +3557,65 @@ class FuturesMonitor:
                     _ctx, "effective_mode", "") == "reconciled_exit_only":
                 from dataclasses import replace
                 from core.mode_transition import ModeTransitionState
+                _reasons = list(getattr(_ctx, "audit_reasons", ()) or ())
+                _reasons.append(f"EXIT_ONLY_RENEWAL:{reason}")
+                _prior_ctx = _ctx
+                _new_ctx = replace(
+                    _ctx,
+                    effective_mode=(
+                        ModeTransitionState.LIVE_QUARANTINED.value),
+                    live_order_allowed=False,
+                    audit_reasons=tuple(_reasons[-64:]))
+                # [P0 repair] the fatal/all-or-nothing persistence
+                # contract: the atomic persist path persists FIRST then
+                # syncs client + order_mgr to the SAME immutable object.
+                # A recoverable failure (False) restores the EXACT prior
+                # across all refs (fail-closed — authority stays
+                # EXIT_ONLY, never a split); a rollback/sync failure
+                # raises ExecutionContextSyncFatal which hard-disables
+                # the broker and propagates (process-terminating) —
+                # NEVER swallowed.
                 try:
-                    _reasons = list(getattr(_ctx, "audit_reasons", ()) or ())
-                    _reasons.append(f"EXIT_ONLY_RENEWAL:{reason}")
-                    self._execution_context = replace(
-                        _ctx,
-                        effective_mode=(
-                            ModeTransitionState.LIVE_QUARANTINED.value),
-                        live_order_allowed=False,
-                        audit_reasons=tuple(_reasons[-64:]))
-                    self._persist_execution_context()
+                    self._execution_context = _new_ctx
+                    _persist_ok = self._persist_execution_context()
+                except ExecutionContextSyncFatal:
+                    # rollback failed: the persist path already forced
+                    # fail-closed quarantine + hard-disabled consumers.
+                    # HARD-DISABLE this monitor's own broker capability
+                    # too, then propagate (never a normal typed return).
+                    try:
+                        self.api = None
+                    except Exception:
+                        pass
+                    try:
+                        setattr(self, "_broker_capability_disabled", True)
+                    except Exception:
+                        pass
+                    raise
                 except Exception:
-                    pass
+                    # unexpected failure: never leave a split authority.
+                    # Restore the exact prior ctx across ALL refs
+                    # (best-effort, including a canonical re-persist of
+                    # the prior payload), then propagate.
+                    try:
+                        self._execution_context = _prior_ctx
+                        try:
+                            from core.execution_context_state import (
+                                persist_execution_context as _pf)
+                            _pf(_prior_ctx.to_dict())
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    raise
+                if _persist_ok is False:
+                    # recoverable persist failure: client/order_mgr kept
+                    # the prior ctx — restore SELF to the exact prior so
+                    # there is no in-process split (fail-closed).
+                    try:
+                        self._execution_context = _prior_ctx
+                    except Exception:
+                        pass
         self._append_mts_event(
             "EXIT_ONLY_RENEWAL_FAILED", reason=reason,
             renewal_provenance={
