@@ -156,6 +156,9 @@ class GlobalCallbackAdapter:
                 self._callback_error_count += 1
                 self._logger.exception("Fallback handler failed for %s/%s", exchange, tick.code)
                 print(f"[GCA_TICK] FALLBACK_EXCEPTION adapter_id={id(self)} code={code}", flush=True)
+                # [pre-existing fix] the tick fallback must PROPAGATE like
+                # the bidask fallback (test contract) — never swallow.
+                raise
         else:
             print(f"[GCA_TICK] EXIT no_fallback adapter_id={id(self)} code={code}", flush=True)
 
@@ -186,7 +189,15 @@ class GlobalCallbackAdapter:
 
         if route is not None:
             try:
-                route.handler.on_tick(route.leg, bidask)
+                # [fix] routed BidAsk goes to the handler's dedicated
+                # on_bidask when available — never to on_tick (which is
+                # for ticks); legacy TickHandler-only handlers keep the
+                # on_tick(leg, bidask) routing for backward compatibility.
+                _on_bidask = getattr(route.handler, "on_bidask", None)
+                if callable(_on_bidask):
+                    _on_bidask(route.leg, bidask)
+                else:
+                    route.handler.on_tick(route.leg, bidask)
             except Exception:
                 self._callback_error_count += 1
                 self._logger.exception(
