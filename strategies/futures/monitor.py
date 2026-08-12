@@ -3472,6 +3472,166 @@ class FuturesMonitor:
             return False
         return _payload
 
+    # [auto re-reconciliation] read-only renewal of the CURRENT
+    # capability's freshness: 30s cadence, bounded backoff (cap 300s).
+    # Monitoring display TTL = 1800s; execution submit proof TTL = 60s.
+    EXIT_ONLY_RENEWAL_INTERVAL_S = 30
+    EXIT_ONLY_RENEWAL_MAX_BACKOFF_S = 300
+    EXIT_ONLY_MONITOR_TTL_S = 1800
+    EXIT_ONLY_EXECUTION_TTL_S = 60
+
+    def _exit_only_renewal_provenance_path(self):
+        try:
+            return Path(runtime_path("exit_only_renewal_provenance.json"))
+        except Exception:
+            return None
+
+    def _read_exit_only_renewal_provenance(self) -> dict:
+        _p = self._exit_only_renewal_provenance_path()
+        try:
+            if _p is not None and _p.exists():
+                _d = json.loads(_p.read_text(encoding="utf-8"))
+                if isinstance(_d, dict):
+                    return _d
+        except Exception:
+            pass
+        return {}
+
+    def _persist_exit_only_renewal_provenance(self, **kw) -> None:
+        _p = self._exit_only_renewal_provenance_path()
+        if _p is None:
+            return
+        _d = self._read_exit_only_renewal_provenance()
+        _d.update(kw)
+        _d.setdefault("renewal_count", 0)
+        _d.setdefault("monitor_ttl_s", self.EXIT_ONLY_MONITOR_TTL_S)
+        _d.setdefault("execution_ttl_s", self.EXIT_ONLY_EXECUTION_TTL_S)
+        try:
+            _p.parent.mkdir(parents=True, exist_ok=True)
+            _tmp = f"{_p}.tmp.{os.getpid()}"
+            with open(_tmp, "w", encoding="utf-8") as f:
+                json.dump(_d, f, ensure_ascii=False, sort_keys=True)
+            os.replace(_tmp, _p)
+        except Exception:
+            try:
+                if os.path.exists(_tmp):
+                    os.remove(_tmp)
+            except Exception:
+                pass
+
+    def _exit_only_renewal_due(self) -> bool:
+        _prov = self._read_exit_only_renewal_provenance()
+        _last = (_prov.get("renewed_at_ms")
+                 or _prov.get("attempted_at_ms") or 0)
+        _backoff = int(_prov.get("backoff_s") or 0)
+        _interval_s = self.EXIT_ONLY_RENEWAL_INTERVAL_S + _backoff
+        return (int(time.time() * 1000) - int(_last)) >= _interval_s * 1000
+
+    def _exit_only_renewal_fail(self, reason: str) -> tuple:
+        """[auto re-reconciliation] a renewal failed: quarantine the
+        capability with the typed reason (LIVE_QUARANTINED + audit
+        reason), persist the failure provenance with a BOUNDED backoff,
+        emit a typed event — zero orders by construction."""
+        _now_ms = int(time.time() * 1000)
+        _prov = self._read_exit_only_renewal_provenance()
+        _backoff = min(
+            (int(_prov.get("backoff_s") or 0) * 2)
+            or self.EXIT_ONLY_RENEWAL_INTERVAL_S,
+            self.EXIT_ONLY_RENEWAL_MAX_BACKOFF_S)
+        self._persist_exit_only_renewal_provenance(
+            attempted_at_ms=_now_ms,
+            last_reason=reason,
+            backoff_s=_backoff,
+            status="QUARANTINED")
+        _ctx = getattr(self, "_execution_context", None)
+        if _ctx is not None and getattr(
+                _ctx, "effective_mode", "") == "reconciled_exit_only":
+            from dataclasses import replace
+            from core.mode_transition import ModeTransitionState
+            try:
+                _reasons = list(getattr(_ctx, "audit_reasons", ()) or ())
+                _reasons.append(f"EXIT_ONLY_RENEWAL:{reason}")
+                self._execution_context = replace(
+                    _ctx,
+                    effective_mode=(
+                        ModeTransitionState.LIVE_QUARANTINED.value),
+                    live_order_allowed=False,
+                    audit_reasons=tuple(_reasons[-64:]))
+                self._persist_execution_context()
+            except Exception:
+                pass
+        self._append_mts_event(
+            "EXIT_ONLY_RENEWAL_FAILED", reason=reason,
+            renewal_provenance={
+                "attempted_at_ms": _now_ms, "backoff_s": _backoff,
+                "status": "QUARANTINED"})
+        return False, reason
+
+    def _renew_exit_only_capability(self) -> tuple:
+        """[auto re-reconciliation] read-only renewal of the CURRENT
+        capability's freshness.  Success requires the exact same locked
+        two legs / account / session / config / release and
+        open_orders == [].  NEVER creates a new capability, never
+        widens, never resumes LIVE/entry."""
+        _ctx = getattr(self, "_execution_context", None)
+        _cap = getattr(_ctx, "exit_only_capability", None)
+        if not isinstance(_cap, dict):
+            return False, "EXIT_ONLY_CONTEXT_INVALID"
+        _snap = self._capture_exit_only_snapshot()
+        if _snap.get("source") != "live_broker":
+            return self._exit_only_renewal_fail(
+                "EXIT_ONLY_RENEWAL_QUERY_FAILED")
+        for _k in ("account_id_hash", "session_id", "config_hash",
+                   "release_sha"):
+            if _snap.get(_k) != _cap.get(_k):
+                return self._exit_only_renewal_fail(
+                    "EXIT_ONLY_IDENTITY_MISMATCH")
+        _pos = sorted(
+            (str(p.get("code", "")), str(p.get("direction", "")),
+             int(p.get("quantity", 0) or 0))
+            for p in (_snap.get("positions") or []))
+        _legs = sorted(
+            (str(l.get("symbol", "")), str(l.get("side", "")),
+             int(l.get("remaining_qty", 0) or 0))
+            for l in (_cap.get("legs") or []))
+        if _pos != _legs:
+            return self._exit_only_renewal_fail(
+                "EXIT_ONLY_POSITION_MISMATCH")
+        if _snap.get("open_orders"):
+            return self._exit_only_renewal_fail("EXIT_ONLY_OPEN_ORDERS")
+        _now_ms = int(time.time() * 1000)
+        _count = int(self._read_exit_only_renewal_provenance().get(
+            "renewal_count") or 0) + 1
+        _prov = {
+            "renewed_at_ms": _now_ms,
+            "next_renewal_at_ms": (
+                _now_ms + self.EXIT_ONLY_RENEWAL_INTERVAL_S * 1000),
+            "attempted_at_ms": _now_ms,
+            "snapshot_captured_at_ms": _snap.get("captured_at") or _now_ms,
+            "snapshot_hash": _cap.get("snapshot_hash", ""),
+            "reconciliation_id": _cap.get("reconciliation_id", ""),
+            "identity": {k: _cap.get(k) for k in (
+                "account_id_hash", "session_id", "config_hash",
+                "release_sha")},
+            "renewal_count": _count,
+            "backoff_s": 0,
+            "last_reason": None,
+            "status": "ACTIVE",
+        }
+        self._persist_exit_only_renewal_provenance(**_prov)
+        return True, _prov
+
+    def _maybe_renew_exit_only(self) -> None:
+        """[auto re-reconciliation] tick-driven hook: renew the CURRENT
+        capability's freshness on the 30s cadence (bounded backoff)."""
+        _ctx = getattr(self, "_execution_context", None)
+        if _ctx is None or getattr(
+                _ctx, "effective_mode", "") != "reconciled_exit_only":
+            return
+        if not self._exit_only_renewal_due():
+            return
+        self._renew_exit_only_capability()
+
     def _observe_exit_only_bbo_evidence(self) -> None:
         """[P1 dashboard-gap] observation-only persistent BBO evidence.
 
@@ -6284,6 +6444,27 @@ class FuturesMonitor:
             self._validate_exit_only_position()
         if not _exit_ok:
             return
+        # [auto re-reconciliation] execution needs <= 60s proof at
+        # submit: the read-only renewal must be fresh for any exit-order
+        # action, else a typed block and zero orders.
+        _exec_ctx = getattr(self, "_execution_context", None)
+        if (_exec_ctx is not None and getattr(
+                _exec_ctx, "effective_mode", "")
+                == "reconciled_exit_only"):
+            _sig_action = getattr(signal, "action", None)
+            _action_value = getattr(_sig_action, "value", _sig_action)
+            if _action_value in ("EXIT", "RELEASE", "PARTIAL_EXIT",
+                                 "COMBINED_EXIT", "COMBINED_EXIT_NEAR",
+                                 "COMBINED_EXIT_FAR"):
+                _prov = self._read_exit_only_renewal_provenance()
+                _renewed_ms = int(_prov.get("renewed_at_ms") or 0)
+                if (int(time.time() * 1000) - _renewed_ms) > \
+                        self.EXIT_ONLY_EXECUTION_TTL_S * 1000:
+                    self._append_mts_event(
+                        "ORDER_INTENT_BLOCKED", action=_action_value,
+                        reason="EXIT_ONLY_RENEWAL_STALE",
+                        trade_id=getattr(strategy, "_trade_id", ""))
+                    return
         _exec_ctx = getattr(self, "_execution_context", None)
         if _exec_ctx is not None:
             # Gate 2: Block new entries during paper drain
@@ -8307,6 +8488,10 @@ class FuturesMonitor:
         # (deduped by reconciliation_id + bbo_hash; never alters orders/
         # decisions; invalid/stale emits nothing).
         self._observe_exit_only_bbo_evidence()
+        # [auto re-reconciliation] read-only renewal of the CURRENT
+        # capability freshness (30s cadence, bounded backoff; failures
+        # quarantine with a typed reason, zero orders).
+        self._maybe_renew_exit_only()
 
         # ── Read-only broker snapshot probe (request file) ──
         if self._check_broker_snapshot_request():

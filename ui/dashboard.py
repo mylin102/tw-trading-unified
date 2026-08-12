@@ -670,6 +670,30 @@ def exit_only_order_visibility(orders_data, *, context):
         reconciliation_id=_cap.get("reconciliation_id", ""))
 
 
+def load_exit_only_renewal_status():
+    """[auto re-reconciliation] dashboard status from the renewal
+    provenance file: state/last/next + both TTLs; {} if absent."""
+    try:
+        _p = Path(runtime_path("exit_only_renewal_provenance.json"))
+        if _p.exists():
+            _d = json.loads(_p.read_text(encoding="utf-8")) or {}
+            if isinstance(_d, dict) and _d.get("renewed_at_ms"):
+                import datetime
+                _fmt = lambda ms: datetime.datetime.fromtimestamp(
+                    int(ms) / 1000).strftime("%H:%M:%S")
+                return {
+                    "status": _d.get("status", "ACTIVE"),
+                    "last": _fmt(_d.get("renewed_at_ms") or 0),
+                    "next": _fmt(_d.get("next_renewal_at_ms") or 0),
+                    "monitor_ttl_s": _d.get("monitor_ttl_s", 1800),
+                    "execution_ttl_s": _d.get("execution_ttl_s", 60),
+                    "last_reason": _d.get("last_reason"),
+                }
+    except Exception:
+        pass
+    return {}
+
+
 def summarize_execution_context(context, known_profile_hashes):
     """Return fail-closed dashboard truth for the active futures runtime."""
     context = context if isinstance(context, dict) else {}
@@ -4097,6 +4121,19 @@ elif _selected_product == "TMF":
             st.warning(
                 "⚠️ 受限平倉模式—等待新鮮券商對帳與雙腿 BBO"
                 f"（{_reason}）")
+        # [auto re-reconciliation] refresh state: last/next + both TTLs
+        _renew_status = load_exit_only_renewal_status()
+        if _renew_status:
+            _renew_txt = (
+                f"🔄 自動續核 {_renew_status['status']} · "
+                f"上次 {_renew_status['last']} · "
+                f"下次 {_renew_status['next']} · "
+                f"TTL 監控 {_renew_status['monitor_ttl_s']}s / "
+                f"執行 {_renew_status['execution_ttl_s']}s")
+            if _renew_status.get("last_reason"):
+                _renew_txt += (
+                    f" · 原因 {_renew_status['last_reason']}")
+            st.caption(_renew_txt)
         _mts_perf_scope = {"ok": False, "mode": "exit_only",
                            "reason": "RECONCILED_EXIT_ONLY"}
     else:
