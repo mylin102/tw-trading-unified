@@ -2910,19 +2910,17 @@ class FuturesMonitor:
         atomically. A failure never enables LIVE — the reader is
         file-based and keeps the last good state.
         [Step 8] also syncs the broker-adapter gate reference so the
-        adapter chokepoint enforces the same context."""
-        _client = getattr(self, "client", None)
-        if _client is not None:
-            try:
-                _client._execution_context = getattr(
-                    self, "_execution_context", None)
-            except (AttributeError, TypeError):
-                # Non-Shioaji test/legacy adapters cannot receive this optional
-                # reference. Their own order boundary remains fail-closed.
-                pass
+        adapter chokepoint enforces the same context.
+        [P0 fix] canonical persistence succeeds FIRST; only then are
+        BOTH client._execution_context and order_mgr.execution_context
+        synchronized to the exact same current immutable object.  On
+        persist failure both stay on the PRIOR context (fail-closed) —
+        a new allow state is never exposed through the chokepoints and
+        the OrderManager never builds orders against a stale mode."""
+        _ctx = getattr(self, "_execution_context", None)
         try:
             from core.execution_context_state import persist_execution_context
-            _payload = self._execution_context.to_dict()
+            _payload = _ctx.to_dict()
             _gw = getattr(self, "_order_intent_gateway", None)
             if _gw is not None:
                 _payload["gateway_intents"] = _gw.durable_view()
@@ -2930,6 +2928,24 @@ class FuturesMonitor:
         except Exception as _pexc:
             console.print(f"[dim]⚠️ exec ctx persist failed: {_pexc} "
                           f"(file keeps last good state)[/dim]")
+            # fail-closed: client/order_mgr keep the PRIOR context
+            return
+        _client = getattr(self, "client", None)
+        if _client is not None:
+            try:
+                _client._execution_context = _ctx
+            except (AttributeError, TypeError):
+                # Non-Shioaji test/legacy adapters cannot receive this optional
+                # reference. Their own order boundary remains fail-closed.
+                pass
+        _order_mgr = getattr(self, "order_mgr", None)
+        if _order_mgr is not None:
+            try:
+                _order_mgr.execution_context = _ctx
+            except (AttributeError, TypeError):
+                # Test/legacy order managers without a settable context stay
+                # fail-closed on their own boundary.
+                pass
 
     def _quarantine_mts_entry_partial_submission(
             self, *, trade_id: str, submitted_order, failed_order) -> None:
