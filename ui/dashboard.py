@@ -3913,13 +3913,48 @@ elif _selected_product == "TMF":
     # NEVER 0, NEVER merged Paper/Live PnL.
     from core.performance_provenance import (
         classify_mts_evidence, scope_mts_performance, upl_presentation)
-    _fills_path_scope = runtime_path("logs", "mts_trade_fills.jsonl")
+    _exit_only_dashboard = active_runtime_truth.get("is_exit_only_runtime")
     _events_path_scope = runtime_path("logs", "mts_spread_events.jsonl")
-    _mts_perf_scope = scope_mts_performance(
-        active_runtime_truth,
-        classify_mts_evidence(_fills_path_scope, _events_path_scope))
-    _mts_state_file = "/tmp/mts_position_state.json"
-    if os.path.exists(_mts_state_file):
+    if _exit_only_dashboard:
+        # This presentation is intentionally isolated from the ordinary MTS
+        # state/ledger path.  A restricted-exit position has one authority:
+        # broker-attested capability plus current, hash-bound dual BBO.
+        from ui.reconciled_exit_presentation import exit_only_upl_metrics
+        _exit_upl = exit_only_upl_metrics(
+            load_exit_only_context(), _events_path_scope,
+            now_ms=int(time.time() * 1000), point_value=10.0)
+        st.header("MTS 受限平倉部位")
+        _u1, _u2, _u3 = st.columns(3)
+        if _exit_upl and _exit_upl.get("kind") == "COMPUTED":
+            _u1.metric("近月 UPL", f"{_exit_upl['near']['pnl']:+,.2f} TWD")
+            _u2.metric("遠月 UPL", f"{_exit_upl['far']['pnl']:+,.2f} TWD")
+            _u3.metric("總計 UPL", f"{_exit_upl['total_pnl']:+,.2f} TWD")
+            _cap = load_exit_only_context().get("exit_only_capability") or {}
+            st.caption(
+                "受限平倉模式：僅使用券商對帳 capability 與雙腿 BBO。"
+                f"snapshot={str(_cap.get('snapshot_hash', ''))[:12]} · "
+                f"session={str(_cap.get('session_id', ''))[:12]}")
+        else:
+            _reason = (_exit_upl or {}).get(
+                "reason", "EXIT_ONLY_BBO_MISSING")
+            _u1.metric("近月 UPL", "N/A")
+            _u2.metric("遠月 UPL", "N/A")
+            _u3.metric("總計 UPL", "N/A")
+            st.warning(
+                "⚠️ 受限平倉模式—等待新鮮券商對帳與雙腿 BBO"
+                f"（{_reason}）")
+        _mts_perf_scope = {"ok": False, "mode": "exit_only",
+                           "reason": "RECONCILED_EXIT_ONLY"}
+    else:
+        _fills_path_scope = runtime_path("logs", "mts_trade_fills.jsonl")
+        _mts_perf_scope = scope_mts_performance(
+            active_runtime_truth,
+            classify_mts_evidence(_fills_path_scope, _events_path_scope))
+
+    # In restricted-exit mode the legacy /tmp state must not be read or
+    # presented.  The full legacy block remains unchanged for LIVE/PAPER.
+    _mts_state_file = None if _exit_only_dashboard else "/tmp/mts_position_state.json"
+    if _mts_state_file and os.path.exists(_mts_state_file):
         try:
             with open(_mts_state_file) as _f:
                 _mts_state = json.loads(_f.read())
@@ -4178,7 +4213,7 @@ elif _selected_product == "TMF":
     # 2026-07-08 Gemini CLI: Calculate and render MTS daily performance metrics on the dashboard
     _fills_path = runtime_path("logs", "mts_trade_fills.jsonl")
     _events_path = runtime_path("logs", "mts_spread_events.jsonl")
-    if os.path.exists(_fills_path):
+    if not _exit_only_dashboard and os.path.exists(_fills_path):
         _dashed_today = f"{_today[:4]}-{_today[4:6]}-{_today[6:]}"
         _perf_data = calculate_mts_daily_performance(_fills_path, _events_path, _dashed_today)
         _display_day = _dashed_today
@@ -4536,9 +4571,10 @@ elif _selected_product == "TMF":
             else:
                 # ── Check MTS spread position as fallback ──
                 _mts_fallback_shown = False
-                _mts_state_file = "/tmp/mts_position_state.json"
+                _mts_state_file = (None if _exit_only_dashboard
+                                   else "/tmp/mts_position_state.json")
                 _mts_state = {}  # [Fix] Initialize to prevent NameError if file doesn't exist
-                if os.path.exists(_mts_state_file):
+                if _mts_state_file and os.path.exists(_mts_state_file):
                     try:
                         with open(_mts_state_file) as _f:
                             _mts_state = json.loads(_f.read())
