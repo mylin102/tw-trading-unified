@@ -548,6 +548,95 @@ def load_exit_only_context():
     return {}
 
 
+def _normalize_exit_only_expected_legs(legs):
+    """Return the two locked exit-only legs, or ``None`` when invalid.
+
+    This deliberately accepts only the narrow two-leg shape used by the
+    monitor capability.  Re-attestation must never turn a dashboard form
+    into a way to change symbols, directions, or quantities.
+    """
+    if not isinstance(legs, (list, tuple)) or len(legs) != 2:
+        return None
+    normalized = []
+    for leg in legs:
+        if not isinstance(leg, dict):
+            return None
+        symbol = str(leg.get("symbol", "")).strip()
+        side = str(leg.get("side", "")).strip().lower()
+        quantity = leg.get("remaining_qty")
+        if (not symbol or side not in {"buy", "sell"}
+                or isinstance(quantity, bool)):
+            return None
+        try:
+            quantity = int(quantity)
+        except (TypeError, ValueError):
+            return None
+        if quantity <= 0:
+            return None
+        normalized.append({
+            "symbol": symbol,
+            "side": side,
+            "remaining_qty": quantity,
+        })
+    return normalized
+
+
+def build_exit_only_attestation_request(
+        capability, *, operator, trade_id, evidence, now_ms=None,
+        expected_legs=None):
+    """Build the monitor's unchanged ATTEST_EXIT_ONLY command schema.
+
+    When a current capability is supplied, its two legs are the sole source
+    of the request scope.  The optional ``expected_legs`` exists only for
+    the initial, no-capability attestation form and is normalized to the same
+    strict schema.
+    """
+    if isinstance(capability, dict):
+        locked_legs = _normalize_exit_only_expected_legs(
+            capability.get("legs"))
+    else:
+        locked_legs = _normalize_exit_only_expected_legs(expected_legs)
+    if locked_legs is None:
+        raise ValueError("受限平倉授權必須是兩腿、非零且方向明確的部位")
+
+    operator = str(operator or "").strip()
+    trade_id = str(trade_id or "").strip()
+    evidence = str(evidence or "").strip()
+    if not operator or not trade_id or not evidence:
+        raise ValueError("操作者、Trade ID 與人工佐證不可空白")
+
+    created_at = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    return {
+        "command_id": f"ATTEST-{datetime.datetime.now():%Y%m%d%H%M%S%f}",
+        "action": "ATTEST_EXIT_ONLY",
+        "created_at": created_at,
+        "operator": operator,
+        "trade_id": trade_id,
+        "evidence": evidence,
+        "expected_legs": locked_legs,
+    }
+
+
+def write_exit_only_attestation_request(path, payload):
+    """Atomically create a pending attestation request without replacement.
+
+    ``False`` means a pending request already exists.  Other OS failures are
+    allowed to reach the caller so the dashboard can state that no command
+    was accepted.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as out:
+        json.dump(payload, out, ensure_ascii=False)
+        out.flush()
+        os.fsync(out.fileno())
+    return True
+
+
 def filter_mts_order_rows_for_exit_only(rows, *, reconciliation_id):
     """[Dashboard] presentation-only filter for RECONCILED_EXIT_ONLY:
     keep only rows explicitly bound to the CURRENT capability's
@@ -3333,67 +3422,98 @@ elif _selected_product == "TMF":
                 st.caption(
                     "此操作不送單。Monitor 會重新查詢券商部位與未結委託；"
                     "只有完全符合兩腿、來源與新鮮度時，才切換為受限平倉模式。")
-                if isinstance(_cap, dict):
-                    st.warning(
-                        f"目前為受限平倉：`{_effective}` · "
-                        f"reconciliation `{str(_cap.get('reconciliation_id', ''))[:12]}`\n\n"
-                        "新進場、一般手動建倉與泛用撤改單均已封鎖。")
-                elif _attest_path.exists() or _attest_processing.exists():
+                _pending_attestation = (
+                    _attest_path.exists() or _attest_processing.exists())
+                _cap_legs = _normalize_exit_only_expected_legs(
+                    _cap.get("legs")) if isinstance(_cap, dict) else None
+                if _pending_attestation:
                     st.info("⏳ 已有對帳平倉授權指令待 Monitor 消費；不覆蓋既有指令。")
                 else:
-                    _a1, _a2 = st.columns(2)
-                    with _a1:
-                        _operator = st.text_input("操作者", key="exit_only_operator")
-                        _trade_id = st.text_input(
-                            "對帳 Trade ID", value="mts-20260811-085503",
-                            key="exit_only_trade_id")
-                        _near_code = st.text_input(
-                            "近月合約", value=_near_sym, key="exit_only_near_code")
-                        _near_side_attest = st.selectbox(
-                            "近月現有方向", ("sell", "buy"), key="exit_only_near_side")
-                    with _a2:
-                        _evidence = st.text_area(
-                            "人工佐證（不可輸入密碼、金鑰或憑證）",
-                            key="exit_only_evidence")
-                        _far_code = st.text_input(
-                            "遠月合約", value=_far_sym, key="exit_only_far_code")
-                        _far_side_attest = st.selectbox(
-                            "遠月現有方向", ("buy", "sell"), key="exit_only_far_side")
-                        _qty_attest = st.number_input(
-                            "每腿剩餘口數", min_value=1, max_value=10,
-                            value=1, step=1, key="exit_only_qty")
-                    if st.button("建立受限平倉授權請求", key="create_exit_only_attestation",
-                                 type="primary", width="stretch"):
-                        if not _operator.strip() or not _trade_id.strip() or not _evidence.strip():
-                            st.error("請填寫操作者、Trade ID 與人工佐證；此操作不接受空白佐證。")
+                    _attestation_capability = None
+                    _attestation_legs = None
+                    if isinstance(_cap, dict):
+                        st.warning(
+                            f"目前為受限平倉：`{_effective}` · "
+                            f"reconciliation `{str(_cap.get('reconciliation_id', ''))[:12]}`\n\n"
+                            "新進場、一般手動建倉與泛用撤改單均已封鎖。")
+                        if _cap_legs is None:
+                            st.error(
+                                "現有 capability 腿部資料不完整；為避免擴大受限範圍，"
+                                "無法建立更新對帳。")
+                            _submit_attestation = False
+                            _operator = _trade_id = _evidence = ""
                         else:
-                            _payload = {
-                                "command_id": f"ATTEST-{datetime.datetime.now():%Y%m%d%H%M%S%f}",
-                                "action": "ATTEST_EXIT_ONLY",
-                                "created_at": int(time.time() * 1000),
-                                "operator": _operator.strip(),
-                                "trade_id": _trade_id.strip(),
-                                "evidence": _evidence.strip(),
-                                "expected_legs": [
-                                    {"symbol": _near_code.strip(), "side": _near_side_attest,
-                                     "remaining_qty": int(_qty_attest)},
-                                    {"symbol": _far_code.strip(), "side": _far_side_attest,
-                                     "remaining_qty": int(_qty_attest)},
-                                ],
-                            }
-                            try:
-                                _attest_path.parent.mkdir(parents=True, exist_ok=True)
-                                _fd = os.open(str(_attest_path),
-                                              os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                                with os.fdopen(_fd, "w", encoding="utf-8") as _out:
-                                    json.dump(_payload, _out, ensure_ascii=False)
-                                    _out.flush()
-                                    os.fsync(_out.fileno())
-                                st.success("✅ 授權請求已寫入；等待 Monitor 以新鮮券商快照驗證。")
-                            except FileExistsError:
+                            st.markdown("#### 更新受限平倉對帳")
+                            st.caption(
+                                "此更新只可重送目前 capability 的兩腿、方向與口數；"
+                                "請補充新的人工佐證，Monitor 仍會以新鮮券商快照重新驗證。")
+                            _a1, _a2 = st.columns(2)
+                            with _a1:
+                                _operator = st.text_input(
+                                    "操作者", key="exit_only_update_operator")
+                                _trade_id = st.text_input(
+                                    "對帳 Trade ID",
+                                    value=str(_cap.get("trade_id", "mts-20260811-085503")),
+                                    key="exit_only_update_trade_id")
+                            with _a2:
+                                _evidence = st.text_area(
+                                    "新的人工佐證（不可輸入密碼、金鑰或憑證）",
+                                    key="exit_only_update_evidence")
+                            st.caption("鎖定的受限平倉兩腿（不可由此表單修改）：")
+                            st.code(json.dumps(_cap_legs, ensure_ascii=False), language="json")
+                            _attestation_capability = _cap
+                            _submit_attestation = st.button(
+                                "更新受限平倉對帳", key="update_exit_only_attestation",
+                                type="primary", width="stretch")
+                    else:
+                        _a1, _a2 = st.columns(2)
+                        with _a1:
+                            _operator = st.text_input("操作者", key="exit_only_operator")
+                            _trade_id = st.text_input(
+                                "對帳 Trade ID", value="mts-20260811-085503",
+                                key="exit_only_trade_id")
+                            _near_code = st.text_input(
+                                "近月合約", value=_near_sym, key="exit_only_near_code")
+                            _near_side_attest = st.selectbox(
+                                "近月現有方向", ("sell", "buy"), key="exit_only_near_side")
+                        with _a2:
+                            _evidence = st.text_area(
+                                "人工佐證（不可輸入密碼、金鑰或憑證）",
+                                key="exit_only_evidence")
+                            _far_code = st.text_input(
+                                "遠月合約", value=_far_sym, key="exit_only_far_code")
+                            _far_side_attest = st.selectbox(
+                                "遠月現有方向", ("buy", "sell"), key="exit_only_far_side")
+                            _qty_attest = st.number_input(
+                                "每腿剩餘口數", min_value=1, max_value=10,
+                                value=1, step=1, key="exit_only_qty")
+                        _attestation_legs = [
+                            {"symbol": _near_code.strip(), "side": _near_side_attest,
+                             "remaining_qty": int(_qty_attest)},
+                            {"symbol": _far_code.strip(), "side": _far_side_attest,
+                             "remaining_qty": int(_qty_attest)},
+                        ]
+                        _submit_attestation = st.button(
+                            "建立受限平倉授權請求", key="create_exit_only_attestation",
+                            type="primary", width="stretch")
+
+                    if _submit_attestation:
+                        try:
+                            _payload = build_exit_only_attestation_request(
+                                _attestation_capability,
+                                operator=_operator,
+                                trade_id=_trade_id,
+                                evidence=_evidence,
+                                expected_legs=_attestation_legs)
+                            if write_exit_only_attestation_request(_attest_path, _payload):
+                                st.success(
+                                    "✅ 授權請求已寫入；等待 Monitor 以新鮮券商快照驗證。")
+                            else:
                                 st.warning("已有待處理授權請求，未覆蓋。")
-                            except OSError:
-                                st.error("無法寫入受限平倉授權請求；沒有送出任何委託。")
+                        except ValueError as exc:
+                            st.error(f"無法建立受限平倉授權請求：{exc}")
+                        except OSError:
+                            st.error("無法寫入受限平倉授權請求；沒有送出任何委託。")
 
             if st.button("🗑️ MTS 清空紀錄", key="mts_clear_logs", type="secondary", width='stretch'):
                 # ── Safety guards: only allow when flat + idle ──
