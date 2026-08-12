@@ -4085,6 +4085,40 @@ class TMFSpread(StrategyBase):
             _rel_leg = _decision.release_leg
         _check_near = _rel_leg is None or _rel_leg == Leg.NEAR
         _check_far = _rel_leg is None or _rel_leg == Leg.FAR
+
+        # [P0c] QUOTE VALIDITY: the checked leg(s) need REAL bid/ask —
+        # a missing field (fallback-to-close), a zero, non-finite or
+        # inverted (ask < bid) quote must NOT be treated as a "0-point
+        # width" that wrongly passes a single-leg close.  The raw bar
+        # keys are inspected BEFORE the fallback defaults.
+        _quote_ok = True
+        for _label, _bkey, _akey in (("NEAR", "near_bid", "near_ask"),
+                                     ("FAR", "far_bid", "far_ask")):
+            if (_label == "NEAR" and not _check_near) or (
+                    _label == "FAR" and not _check_far):
+                continue
+            _b = bar.get(_bkey)
+            _a = bar.get(_akey)
+            if (_bkey not in bar or _akey not in bar
+                    or not isinstance(_b, (int, float))
+                    or not isinstance(_a, (int, float))
+                    or _b != _b or _a != _a  # NaN
+                    or abs(_b) == float("inf") or abs(_a) == float("inf")
+                    or _b <= 0 or _a <= 0 or _a < _b):
+                _quote_ok = False
+                break
+        if not _quote_ok:
+            self._set_eval(
+                skip_reason="QUOTE_INVALID",
+                near_bid=bar.get("near_bid"), near_ask=bar.get("near_ask"),
+                far_bid=bar.get("far_bid"), far_ask=bar.get("far_ask"))
+            logger.warning(
+                "[MTS_RELEASE_BLOCKED] reason=QUOTE_INVALID "
+                "near=%r/%r far=%r/%r",
+                bar.get("near_bid"), bar.get("near_ask"),
+                bar.get("far_bid"), bar.get("far_ask"))
+            return None
+
         if ((_check_near and near_width > self._max_spread_width)
                 or (_check_far and far_width > self._max_spread_width)):
             self._set_eval(skip_reason="WIDE_SPREAD_WIDTH", near_width=near_width, far_width=far_width)
