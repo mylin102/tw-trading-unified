@@ -15,6 +15,8 @@ def _make_bar(near_close=45500, far_close=45800, atr=10.0, near_age=5000.0, far_
         "near_close": near_close,
         "far_close": far_close,
         "atr": atr,
+        "near_bid": near_close - 1, "near_ask": near_close + 1,
+        "far_bid": far_close - 1, "far_ask": far_close + 1,
         "near_high": near_close,
         "near_low": near_close,
         "far_high": far_close,

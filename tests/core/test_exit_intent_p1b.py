@@ -474,6 +474,8 @@ def test_b19_real_combined_exit_artifacts(tmp_path, monkeypatch):
     _tmf._MTS_FILL_LOG = str(tmp_path / "mts_trade_fills.jsonl")
     monitor, strat, api = build_monitor(tmp_path, monkeypatch)
     bar = {"near_close": 44100.0, "far_close": 44020.0, "atr": 10.0,
+           "near_bid": 44099.0, "near_ask": 44101.0,
+           "far_bid": 44019.0, "far_ask": 44021.0,
            "timestamp": datetime.now(), "code": "TMFF6"}
     from unittest.mock import patch
     from pathlib import Path
@@ -653,6 +655,8 @@ def test_b23_real_producer_double_eval_one_submit(tmp_path, monkeypatch):
     )
     now = datetime.now()
     bar = {"near_close": 44100.0, "far_close": 44020.0, "atr": 10.0,
+           "near_bid": 44099.0, "near_ask": 44101.0,
+           "far_bid": 44019.0, "far_ask": 44021.0,
            "timestamp": now, "code": "TMFF6"}
     with patch("strategies.futures.monitor._mts_position_state_path",
                return_value=Path(tmp_path) / "state.json"), \
@@ -1204,6 +1208,8 @@ def _b48_build_released(tmp_path, monkeypatch):
     now = datetime.now()
     state_path = Path(tmp_path) / "state.json"
     bar1 = {"near_close": 43400.0, "far_close": 44100.0, "atr": 10.0,
+            "near_bid": 43399.0, "near_ask": 43401.0,
+            "far_bid": 44099.0, "far_ask": 44101.0,
             "timestamp": now, "code": "TMFF6"}
     with patch("strategies.futures.monitor._mts_position_state_path",
                return_value=state_path), \
@@ -1236,6 +1242,8 @@ def _b48_build_released(tmp_path, monkeypatch):
         assert _qty == {"NEAR": 0, "FAR": 1}, f"open qty mismatch: {_qty}"
         strat._peak_net_exit_pnl_twd = 1300.0
     bar2 = {"near_close": 43400.0, "far_close": 44350.0, "atr": 10.0,
+            "near_bid": 43399.0, "near_ask": 43401.0,
+            "far_bid": 44349.0, "far_ask": 44351.0,
             "timestamp": now, "code": "TMFF6"}
     return monitor, strat, now, bar1, bar2
 
@@ -1573,6 +1581,8 @@ def test_b48d3_native_trail_does_not_impersonate(tmp_path, monkeypatch, caplog):
     # kill the Policy J win: peak below activation
     strat._peak_net_exit_pnl_twd = 150.0
     bar_native = {"near_close": 43400.0, "far_close": 43800.0, "atr": 10.0,
+                  "near_bid": 43399.0, "near_ask": 43401.0,
+                  "far_bid": 43799.0, "far_ask": 43801.0,
                   "timestamp": now, "code": "TMFF6"}
     with patch("strategies.futures.monitor._mts_position_state_path",
                return_value=Path(tmp_path) / "state.json"), \
