@@ -176,6 +176,31 @@ def test_bbo_binding_rejects_float_or_seconds_timestamps():
     assert reason is None and ok and ok["bbo_hash"]
 
 
+def test_bbo_failure_evidence_json_safe_non_finite():
+    """[S2 audit] NaN / +Inf / -Inf in any evidence field must produce a
+    JSON-safe deterministic payload (allow_nan=False never raises),
+    reproducible evidence_hash, finite floats preserved, no secrets."""
+    import json as _json
+    from core.exit_only_position import build_bbo_failure_evidence
+
+    for _field in ("bid", "ask", "exchange_ts_ms", "received_at_ms",
+                   "seq"):
+        for _val in (float("nan"), float("inf"), float("-inf")):
+            slots = _pure_bbo_slots()
+            slots["near"][_field] = _val
+            ev = build_bbo_failure_evidence(slots, _S2_IDENTITY,
+                                            "BBO_STALE")
+            _s = _json.dumps(ev, allow_nan=False, sort_keys=True)
+            assert ev["evidence_hash"], (_field, _val)
+            assert "NaN" not in _s and "Infinity" not in _s, (_field, _val)
+            assert "password" not in _s and "token" not in _s
+    # finite floats preserved exactly
+    ev = build_bbo_failure_evidence(_pure_bbo_slots(), _S2_IDENTITY,
+                                    "BBO_STALE")
+    assert ev["near"]["bid"] == 44900.0 and ev["near"]["ask"] == 44910.0
+    _json.dumps(ev, allow_nan=False)
+
+
 def test_bbo_failure_evidence_canonical_payload():
     """[S2 audit] blocked decisions carry a canonical bbo_input_v2 failure
     payload: version, JSON-safe raw near/far, identity fields, reason and
