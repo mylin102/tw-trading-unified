@@ -488,3 +488,92 @@ def test_single_leg_trail_uses_post_release_tick_path_only_short(strategy):
         
     assert signal3 is not None
     assert signal3.action == "EXIT"
+
+def _release_armed_strategy(strategy, *, side="SHORT", near_entry=44100.0,
+                            far_entry=44200.0, far_moved=False):
+    """[P0b] minimal RELEASE-armed state: SPREAD phase, release group
+    ARMED, one leg's loss beyond the ATR stop so the lifecycle decides
+    RELEASE on that leg."""
+    from strategies.plugins.futures.active.tmf_spread import (
+        PositionPhase, PositionLifecycle, ReleaseGroup, ReleaseGroupStatus)
+    strategy._has_position = True
+    strategy._side = side
+    strategy._near_entry = near_entry
+    strategy._far_entry = far_entry
+    strategy._ticker = "TMF"
+    strategy._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SPREAD,
+        release_group=ReleaseGroup(status=ReleaseGroupStatus.ARMED))
+    return strategy
+
+
+def test_release_near_wide_far_quote_does_not_block(strategy):
+    """[P0b] the width gate is LEG-SCOPED for a single-leg RELEASE: a
+    wide FAR quote (7pt > max 3) must NOT block the RELEASE_NEAR whose
+    own leg quote is narrow (2pt <= 3)."""
+    strategy = _release_armed_strategy(strategy)
+    # near rose 20pts (SHORT near loss 20 > release stop atr10*1.0)
+    bar = {
+        "near_close": 44120.0, "far_close": 44200.0, "atr": 10.0,
+        "near_bid": 44119.0, "near_ask": 44121.0,   # width 2
+        "far_bid": 44197.0, "far_ask": 44204.0,     # width 7 > max 3
+        "near_tick_age_ms": 0, "far_tick_age_ms": 0,
+        "timestamp": datetime.now(),
+    }
+    ctx = StrategyContext(market=MarketData(last_bar=bar, ticker="TMF"),
+                          position=PositionView(size=1), config={})
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy.on_bar(ctx)
+    assert signal is not None, (
+        "RELEASE_NEAR must not be blocked by the wide FAR quote")
+    # the single-leg release is surfaced as a PARTIAL_EXIT signal
+    assert getattr(signal, "action", None) in (
+        "RELEASE", "RELEASE_NEAR", "PARTIAL_EXIT")
+
+
+def test_release_near_wide_near_quote_still_blocks(strategy):
+    """[P0b] the leg-scoped gate still blocks when the RELEASED leg's
+    own quote is wide: RELEASE_NEAR with near width 7 > max 3 => None."""
+    strategy = _release_armed_strategy(strategy)
+    bar = {
+        "near_close": 44120.0, "far_close": 44200.0, "atr": 10.0,
+        "near_bid": 44113.0, "near_ask": 44120.0,   # width 7 > max 3
+        "far_bid": 44199.0, "far_ask": 44201.0,     # width 2
+        "near_tick_age_ms": 0, "far_tick_age_ms": 0,
+        "timestamp": datetime.now(),
+    }
+    ctx = StrategyContext(market=MarketData(last_bar=bar, ticker="TMF"),
+                          position=PositionView(size=1), config={})
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy.on_bar(ctx)
+    assert signal is None  # the released leg's own wide quote blocks
+
+
+def test_release_far_wide_near_quote_does_not_block(strategy):
+    """[P0b] symmetric: a wide NEAR quote does not block the RELEASE_FAR
+    whose own leg quote is narrow."""
+    strategy = _release_armed_strategy(strategy)
+    # far rose 20pts (SHORT far loss 20 > the near's 0) => release FAR
+    bar = {
+        "near_close": 44100.0, "far_close": 44220.0, "atr": 10.0,
+        "near_bid": 44093.0, "near_ask": 44100.0,   # width 7 > max 3
+        "far_bid": 44219.0, "far_ask": 44221.0,     # width 2
+        "near_tick_age_ms": 0, "far_tick_age_ms": 0,
+        "timestamp": datetime.now(),
+    }
+    ctx = StrategyContext(market=MarketData(last_bar=bar, ticker="TMF"),
+                          position=PositionView(size=1), config={})
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy.on_bar(ctx)
+    assert signal is not None, (
+        "RELEASE_FAR must not be blocked by the wide NEAR quote")
+    # the single-leg release is surfaced as a PARTIAL_EXIT signal
+    assert getattr(signal, "action", None) in (
+        "RELEASE", "RELEASE_FAR", "PARTIAL_EXIT")
+
