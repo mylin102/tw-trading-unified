@@ -463,6 +463,91 @@ def test_monitor_attestation_syncs_order_manager_and_client_e2e(
     assert adapter_calls == []
 
 
+def test_persist_execution_context_returns_bool(monkeypatch, tmp_path):
+    """[P1] _persist_execution_context returns bool: True on a
+    successful canonical persist, False on persist failure."""
+    import core.execution_context_state as ecs
+    from strategies.futures.monitor import FuturesMonitor
+
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._execution_context = _live_ctx()
+    assert monitor._persist_execution_context() is True
+    assert (tmp_path / "execution_context.json").exists()
+
+    monkeypatch.setattr(
+        ecs, "persist_execution_context",
+        lambda payload: (_ for _ in ()).throw(RuntimeError("disk full")))
+    assert monitor._persist_execution_context() is False
+
+
+def test_monitor_attestation_persist_failure_rolls_back_no_event(
+        monkeypatch, tmp_path):
+    """[P1] attestation persist failure: monitor._execution_context is
+    restored to the exact prior immutable context, client/order_mgr
+    retain the same prior references, typed
+    EXECUTION_CONTEXT_PERSIST_FAILED, NO OPERATOR_ATTESTATION success
+    event, zero adapter calls."""
+    from types import SimpleNamespace
+
+    import core.execution_context_state as ecs
+    from strategies.futures.monitor import FuturesMonitor
+    from core.order_management.order_manager import OrderManager
+
+    monkeypatch.setenv("LRC_RELEASE_SHA", "d" * 40)
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        ecs, "persist_execution_context",
+        lambda payload: (_ for _ in ()).throw(RuntimeError("disk full")))
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.api = SimpleNamespace(
+        futopt_account=SimpleNamespace(),
+        list_positions=lambda acct: [
+            SimpleNamespace(code="TMFH6",
+                            direction=SimpleNamespace(name="Sell"),
+                            quantity=1, price=44909.0),
+            SimpleNamespace(code="TMFI6",
+                            direction=SimpleNamespace(name="Buy"),
+                            quantity=1, price=45052.0),
+        ],
+        list_trades=lambda acct: [],
+    )
+    old_ctx = _position_quarantine_ctx()
+    monitor._execution_context = old_ctx
+    monitor._bind_reconciled_exit_identity = lambda: True
+    adapter_calls = []
+    adapter = SimpleNamespace(
+        place_order_object=lambda order: adapter_calls.append(order))
+    monitor.client = SimpleNamespace(_execution_context=old_ctx)
+    monitor.order_mgr = OrderManager(mode="live", broker_adapter=adapter,
+                                     execution_context=old_ctx)
+    events = []
+    monitor._append_mts_event = lambda event_type, **kw: events.append(
+        (event_type, kw))
+
+    record, err = monitor._operator_attest_exit_only(
+        operator="trader",
+        trade_id="mts-20260811-085503",
+        evidence="remaining spread is the 08:55 manual pair",
+        expected_legs=[
+            {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1},
+            {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1},
+        ],
+        attested_at="2026-08-11T11:00:00+08:00",
+    )
+    assert record is None
+    assert err == "EXECUTION_CONTEXT_PERSIST_FAILED"
+    # exact prior immutable context restored on the monitor
+    assert monitor._execution_context is old_ctx
+    # consumers retain the same prior references
+    assert monitor.client._execution_context is old_ctx
+    assert monitor.order_mgr.execution_context is old_ctx
+    # NO success event, zero adapter calls
+    assert events == []
+    assert adapter_calls == []
+
+
 def test_monitor_attestation_persist_failure_keeps_prior_context(
         monkeypatch, tmp_path):
     """[P0] a persist failure leaves client + OrderManager on the PRIOR
@@ -514,7 +599,11 @@ def test_monitor_attestation_persist_failure_keeps_prior_context(
         ],
         attested_at="2026-08-11T11:00:00+08:00",
     )
-    assert err is None  # attestation succeeded; persist failure contained
+    # [P1] typed failure + full rollback: no success event, monitor
+    # restored to the exact prior immutable context
+    assert record is None
+    assert err == "EXECUTION_CONTEXT_PERSIST_FAILED"
+    assert monitor._execution_context is old_ctx
     # fail-closed: both consumers keep the PRIOR quarantined context
     assert monitor.client._execution_context is old_ctx
     assert monitor.order_mgr.execution_context is old_ctx
