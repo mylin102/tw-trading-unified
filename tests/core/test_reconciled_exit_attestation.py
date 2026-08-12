@@ -617,6 +617,7 @@ def test_persist_rollback_writer_failure_raises_fatal_quarantine(
             self._allowed = value
 
     cranky = _Cranky(_live)
+    cranky.api = object()  # a live broker capability
     monitor.client = cranky
     order_mgr = SimpleNamespace(execution_context=_live)
     monitor.order_mgr = order_mgr
@@ -626,6 +627,9 @@ def test_persist_rollback_writer_failure_raises_fatal_quarantine(
 
     with pytest.raises(ExecutionContextSyncFatal):
         monitor._persist_execution_context()
+    # the client rejected quarantine — its broker capability is
+    # HARD-DISABLED: not live-capable
+    assert getattr(monitor.client, "api", None) is None
     # in-memory forced to fail-closed quarantine (not exit-only, not
     # prior live-ready)
     assert monitor._execution_context.effective_mode == \
@@ -667,6 +671,7 @@ def test_persist_rollback_remove_failure_raises_fatal_quarantine(
             self._allowed = value
 
     cranky = _Cranky(_live)
+    cranky.api = object()  # a live broker capability
     monitor.client = cranky
     order_mgr = SimpleNamespace(execution_context=_live)
     monitor.order_mgr = order_mgr
@@ -678,6 +683,7 @@ def test_persist_rollback_remove_failure_raises_fatal_quarantine(
                         lambda p: (_ for _ in ()).throw(OSError("EACCES")))
     with pytest.raises(ExecutionContextSyncFatal):
         monitor._persist_execution_context()
+    assert getattr(monitor.client, "api", None) is None
     assert monitor._execution_context.effective_mode == \
         ModeTransitionState.LIVE_QUARANTINED.value
     assert monitor._execution_context.live_order_allowed is False
@@ -685,15 +691,17 @@ def test_persist_rollback_remove_failure_raises_fatal_quarantine(
 
 def test_monitor_attestation_fatal_sync_no_success_no_prior_reuse(
         monkeypatch, tmp_path):
-    """[P1] attestation with a failing rollback => typed
-    EXECUTION_CONTEXT_SYNC_FATAL, NO OPERATOR_ATTESTATION event, no
-    adapter call, and the in-memory monitor is quarantine — the prior
-    LIVE_READY authority is never reused."""
+    """[P1] attestation with a failing rollback => ExecutionContextSyncFatal
+    PROPAGATES (process-terminating, not a normal typed return), NO
+    OPERATOR_ATTESTATION event, no adapter call, monitor + order_mgr
+    quarantined, and the client that rejected quarantine is HARD-DISABLED
+    — its direct route refuses (zero broker capability)."""
     from types import SimpleNamespace
 
     import core.execution_context_state as ecs
     from core.execution_context_state import persist_execution_context
-    from strategies.futures.monitor import FuturesMonitor
+    from strategies.futures.monitor import (
+        ExecutionContextSyncFatal, FuturesMonitor)
     from core.order_management.order_manager import OrderManager
 
     monkeypatch.setenv("LRC_RELEASE_SHA", "d" * 40)
@@ -720,22 +728,31 @@ def test_monitor_attestation_fatal_sync_no_success_no_prior_reuse(
     )
     monitor._execution_context = old_ctx
 
-    class _Cranky:
-        def __init__(self, allowed):
-            self._allowed = allowed
+    class _Client:
+        """Client that accepts ONLY its own prior ctx — rejects the new
+        exit-only ctx AND the forced quarantine (pathological but
+        possible).  Carries a live broker api."""
+        def __init__(self, ctx):
+            self._ctx = ctx
+            self.api = object()
 
         @property
         def _execution_context(self):
-            return self._allowed
+            return self._ctx
 
         @_execution_context.setter
         def _execution_context(self, value):
-            if value is not self._allowed:
+            if value is not self._ctx:
                 raise TypeError("cannot change")
-            self._allowed = value
+            self._ctx = value
 
-    cranky = _Cranky(old_ctx)
-    monitor.client = cranky
+        def place_order_object(self, order):
+            if self.api is None:
+                raise RuntimeError("broker capability disabled")
+            return "BROKER_ORDER_ID"
+
+    client = _Client(old_ctx)
+    monitor.client = client
     adapter_calls = []
     adapter = SimpleNamespace(
         place_order_object=lambda order: adapter_calls.append(order))
@@ -745,22 +762,21 @@ def test_monitor_attestation_fatal_sync_no_success_no_prior_reuse(
     monitor._append_mts_event = lambda event_type, **kw: events.append(
         (event_type, kw))
 
-    record, err = monitor._operator_attest_exit_only(
-        operator="trader",
-        trade_id="mts-20260811-085503",
-        evidence="remaining spread is the 08:55 manual pair",
-        expected_legs=[
-            {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1},
-            {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1},
-        ],
-        attested_at="2026-08-11T11:00:00+08:00",
-    )
-    assert record is None
-    assert err == "EXECUTION_CONTEXT_SYNC_FATAL"
+    # process-terminating: the fatal propagates (never a normal return)
+    with pytest.raises(ExecutionContextSyncFatal):
+        monitor._operator_attest_exit_only(
+            operator="trader",
+            trade_id="mts-20260811-085503",
+            evidence="remaining spread is the 08:55 manual pair",
+            expected_legs=[
+                {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1},
+                {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1},
+            ],
+            attested_at="2026-08-11T11:00:00+08:00",
+        )
     assert events == []       # NO success event
     assert adapter_calls == []
     # never back to prior LIVE_READY: monitor is fail-closed quarantine
-    assert monitor._execution_context is not old_ctx
     assert monitor._execution_context.effective_mode == \
         ModeTransitionState.LIVE_QUARANTINED.value
     assert monitor._execution_context.live_order_allowed is False
@@ -768,6 +784,11 @@ def test_monitor_attestation_fatal_sync_no_success_no_prior_reuse(
         (monitor._execution_context.audit_reasons or ())
     assert monitor.order_mgr.execution_context.effective_mode == \
         ModeTransitionState.LIVE_QUARANTINED.value
+    # the client rejected quarantine: broker capability HARD-DISABLED —
+    # not live-capable, direct route refuses with zero broker calls
+    assert getattr(monitor.client, "api", None) is None
+    with pytest.raises(RuntimeError):
+        monitor.client.place_order_object("any-order")
 
 
 def test_persist_post_set_failure_rolls_back_canonical_file(
