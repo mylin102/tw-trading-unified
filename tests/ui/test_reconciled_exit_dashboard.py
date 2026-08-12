@@ -424,75 +424,38 @@ def test_exit_only_order_visibility_paper_live_unchanged():
 
 
 def test_exit_only_renewal_status_display(tmp_path, monkeypatch):
-    """[auto re-reconciliation] the dashboard renewal status helper
-    reads the provenance file: state/last/next + both TTLs; absent file
-    => {} (nothing to show)."""
+    """[simplified] the dashboard 自動對帳 status string: healthy /
+    degraded, last success, last failure, next attempt; absent file =>
+    "" (nothing to show).  No dual-TTL concept."""
     import json
     from ui.dashboard import load_exit_only_renewal_status
 
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
-    assert load_exit_only_renewal_status() == {}
+    assert load_exit_only_renewal_status() == ""
 
     _prov = {
         "status": "ACTIVE",
         "renewed_at_ms": 1_786_000_000_000,
         "next_renewal_at_ms": 1_786_000_030_000,
-        "monitor_ttl_s": 1800,
-        "execution_ttl_s": 60,
+        "last_failed_at_ms": None,
         "last_reason": None,
     }
     (tmp_path / "exit_only_renewal_provenance.json").write_text(
         json.dumps(_prov), encoding="utf-8")
     st = load_exit_only_renewal_status()
-    assert st["status"] == "ACTIVE"
-    assert st["last"] and st["next"]  # human-readable times
-    assert st["monitor_ttl_s"] == 1800
-    assert st["execution_ttl_s"] == 60
-    assert st["last_reason"] is None
+    assert "healthy" in st
+    assert "上次成功" in st and "下次" in st
+    assert "TTL" not in st  # no dual-TTL concept
 
-    _prov["status"] = "QUARANTINED"
-    _prov["last_reason"] = "EXIT_ONLY_OPEN_ORDERS"
+    _prov["status"] = "DEGRADED"
+    _prov["last_failed_at_ms"] = 1_786_000_000_500
+    _prov["last_reason"] = "EXIT_ONLY_RENEWAL_QUERY_FAILED"
     (tmp_path / "exit_only_renewal_provenance.json").write_text(
         json.dumps(_prov), encoding="utf-8")
     st = load_exit_only_renewal_status()
-    assert st["status"] == "QUARANTINED"
-    assert st["last_reason"] == "EXIT_ONLY_OPEN_ORDERS"
-
-
-def test_exit_only_renewal_status_display(tmp_path, monkeypatch):
-    """[auto re-reconciliation] the dashboard renewal status helper
-    reads the provenance file: state/last/next + both TTLs; absent file
-    => {} (nothing to show)."""
-    import json
-    from ui.dashboard import load_exit_only_renewal_status
-
-    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
-    assert load_exit_only_renewal_status() == {}
-
-    _prov = {
-        "status": "ACTIVE",
-        "renewed_at_ms": 1_786_000_000_000,
-        "next_renewal_at_ms": 1_786_000_030_000,
-        "monitor_ttl_s": 1800,
-        "execution_ttl_s": 60,
-        "last_reason": None,
-    }
-    (tmp_path / "exit_only_renewal_provenance.json").write_text(
-        json.dumps(_prov), encoding="utf-8")
-    st = load_exit_only_renewal_status()
-    assert st["status"] == "ACTIVE"
-    assert st["last"] and st["next"]  # human-readable times
-    assert st["monitor_ttl_s"] == 1800
-    assert st["execution_ttl_s"] == 60
-    assert st["last_reason"] is None
-
-    _prov["status"] = "QUARANTINED"
-    _prov["last_reason"] = "EXIT_ONLY_OPEN_ORDERS"
-    (tmp_path / "exit_only_renewal_provenance.json").write_text(
-        json.dumps(_prov), encoding="utf-8")
-    st = load_exit_only_renewal_status()
-    assert st["status"] == "QUARANTINED"
-    assert st["last_reason"] == "EXIT_ONLY_OPEN_ORDERS"
+    assert "degraded" in st
+    assert "上次失敗" in st
+    assert "EXIT_ONLY_RENEWAL_QUERY_FAILED" in st
 
 
 def test_exit_only_primary_panel_skips_legacy_state_and_daily_jsonl():

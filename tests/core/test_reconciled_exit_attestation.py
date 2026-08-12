@@ -1261,6 +1261,13 @@ def test_exit_only_renewal_success_persists_provenance(monkeypatch, tmp_path):
     _d = json.loads(_f.read_text(encoding="utf-8"))
     assert _d["renewal_count"] == 1
     assert _d["backoff_s"] == 0
+    # [P0 repair] the renewal proof persists the EXACT renewed legs so
+    # the monitoring validation can bind it to the capability
+    _cap_legs = sorted(
+        (str(l.get("symbol", "")), str(l.get("side", "")),
+         int(l.get("remaining_qty", 0) or 0))
+        for l in monitor._execution_context.exit_only_capability["legs"])
+    assert _d["legs"] == [list(x) for x in _cap_legs]
     assert _d["monitor_ttl_s"] == 1800
     assert _d["execution_ttl_s"] == 60
     assert _d["reconciliation_id"] == \
@@ -1319,11 +1326,12 @@ def test_exit_only_renewal_open_orders_quarantines(monkeypatch, tmp_path):
         ModeTransitionState.LIVE_QUARANTINED.value
 
 
-def test_exit_only_renewal_query_failure_quarantines(monkeypatch, tmp_path):
-    """[auto re-reconciliation] a broker query failure => typed
-    EXIT_ONLY_RENEWAL_QUERY_FAILED + quarantine, zero orders."""
-    from core.mode_transition import ModeTransitionState
-
+def test_exit_only_renewal_query_failure_degraded_no_quarantine(
+        monkeypatch, tmp_path):
+    """[simplified] a transient broker query failure => typed
+    EXIT_ONLY_RENEWAL_QUERY_FAILED with DEGRADED status + bounded
+    backoff — the capability is NOT quarantined and monitoring
+    continues (the pre-submit query is decisive)."""
     monitor, events = _exit_only_renew_monitor(monkeypatch, tmp_path)
     monitor.api = _exit_only_renew_api()
 
@@ -1333,8 +1341,17 @@ def test_exit_only_renewal_query_failure_quarantines(monkeypatch, tmp_path):
     monitor.api.list_positions = _boom
     ok, reason = monitor._renew_exit_only_capability()
     assert ok is False and reason == "EXIT_ONLY_RENEWAL_QUERY_FAILED"
+    # monitoring continues: still RECONCILED_EXIT_ONLY, no quarantine
     assert monitor._execution_context.effective_mode == \
-        ModeTransitionState.LIVE_QUARANTINED.value
+        ModeTransitionState.RECONCILED_EXIT_ONLY.value
+    _d = json.loads(
+        (tmp_path / "exit_only_renewal_provenance.json")
+        .read_text(encoding="utf-8"))
+    assert _d["status"] == "DEGRADED"
+    assert _d["backoff_s"] == 30
+    assert _d["last_reason"] == "EXIT_ONLY_RENEWAL_QUERY_FAILED"
+    assert _d["last_failed_at_ms"]
+    assert events and events[0][0] == "EXIT_ONLY_RENEWAL_FAILED"
 
 
 def test_exit_only_renewal_position_mismatch_quarantines(monkeypatch, tmp_path):
@@ -1375,274 +1392,56 @@ def test_exit_only_renewal_backoff_bounded(monkeypatch, tmp_path):
     assert seen == [30, 60, 120, 240, 300, 300]  # bounded at 300
 
 
-def test_exit_only_submit_requires_fresh_renewal(monkeypatch, tmp_path):
-    """[auto re-reconciliation] execution needs <= 60s proof at submit:
-    a stale renewal blocks the exit submit with typed
-    EXIT_ONLY_RENEWAL_STALE and zero adapter calls; a fresh renewal
-    passes the gate (any later block is NOT renewal-stale)."""
-    from types import SimpleNamespace
-    from strategies.futures.monitor import FuturesMonitor
-
-    monkeypatch.setenv("LRC_RELEASE_SHA", "d" * 40)
-    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
-    monitor = FuturesMonitor.__new__(FuturesMonitor)
-    monitor._execution_context = _exit_only_ctx_from(_live_ctx())
-    monitor.api = _exit_only_renew_api()
-    monitor.contract = SimpleNamespace(code="TMFH6")
-    monitor.far_contract = SimpleNamespace(code="TMFI6")
-    adapter_calls = []
-    adapter = SimpleNamespace(
-        place_order_object=lambda order: adapter_calls.append(order))
-    from core.order_management.order_manager import OrderManager
-    monitor.order_mgr = OrderManager(mode="live", broker_adapter=adapter,
-                                     execution_context=monitor._execution_context)
-    monitor._record_gateway_intent = lambda dv: None
-    monitor._last_mts_tick_mono = 0.0
-    _now_ms = int(time.time() * 1000)
-    # a stale renewal: last success 10 minutes ago
-    monitor._persist_exit_only_renewal_provenance(
-        renewed_at_ms=_now_ms - 600_000,
-        next_renewal_at_ms=0, attempted_at_ms=0, snapshot_hash="",
-        reconciliation_id="", identity={}, backoff_s=0, last_reason=None,
-        status="ACTIVE")
-    blocked = []
-    monitor._append_mts_event = lambda et, **kw: blocked.append(
-        (et, kw)) if et == "ORDER_INTENT_BLOCKED" else None
-    _sig = SimpleNamespace(action=SimpleNamespace(value="EXIT"))
-    _strat = SimpleNamespace(_trade_id="mts-20260811-085503")
-    monitor._submit_mts_order_signal(_sig, _strat, {}, 0.0)
-    assert any(b[1].get("reason") == "EXIT_ONLY_RENEWAL_STALE"
-               for b in blocked)
-    assert adapter_calls == []
-    # fresh renewal passes the gate (no renewal-stale block)
-    monitor._persist_exit_only_renewal_provenance(
-        renewed_at_ms=_now_ms,
-        next_renewal_at_ms=0, attempted_at_ms=0, snapshot_hash="",
-        reconciliation_id="", identity={}, backoff_s=0, last_reason=None,
-        status="ACTIVE")
-    blocked.clear()
-    monitor._submit_mts_order_signal(_sig, _strat, {}, 0.0)
-    assert not any(b[1].get("reason") == "EXIT_ONLY_RENEWAL_STALE"
-                   for b in blocked)
-
-
-def test_exit_only_renewal_paper_live_unchanged(monkeypatch, tmp_path):
-    """[auto re-reconciliation] paper/live (no capability) => the renewal
-    hook is a no-op and never writes provenance."""
-    monitor, events = _exit_only_renew_monitor(monkeypatch, tmp_path)
-    monitor._execution_context = _live_ctx()
-    monitor.api = _exit_only_renew_api()
-    monitor._maybe_renew_exit_only()
-    assert not (tmp_path / "exit_only_renewal_provenance.json").exists()
-    assert events == []
-
-
-def _exit_only_renew_api(*, positions=None, trades=None, ctx=None):
-    """A read-only broker api for the renewal path (same identity as the
-    capability by construction)."""
-    from types import SimpleNamespace
-    _pos = positions or [
-        SimpleNamespace(code="TMFH6", direction=SimpleNamespace(name="Sell"),
-                        quantity=1, price=44909.0),
-        SimpleNamespace(code="TMFI6", direction=SimpleNamespace(name="Buy"),
-                        quantity=1, price=45052.0),
-    ]
-    return SimpleNamespace(
-        futopt_account=SimpleNamespace(),
-        list_positions=lambda acct: _pos,
-        list_trades=lambda acct: trades or [],
-    )
-
-
-def _exit_only_renew_monitor(monkeypatch, tmp_path, ctx=None):
-    from strategies.futures.monitor import FuturesMonitor
-
-    monkeypatch.setenv("LRC_RELEASE_SHA", "d" * 40)
-    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
-    monitor = FuturesMonitor.__new__(FuturesMonitor)
-    monitor._execution_context = ctx or _exit_only_ctx_from(_live_ctx())
-    events = []
-    monitor._append_mts_event = lambda event_type, **kw: events.append(
-        (event_type, kw))
-    return monitor, events
-
-
-def test_exit_only_renewal_success_persists_provenance(monkeypatch, tmp_path):
-    """[auto re-reconciliation] a fresh read-only snapshot with the SAME
-    locked legs/identity and no open orders renews the capability:
-    (True, provenance) persisted (ACTIVE, count++, backoff reset)."""
-    monitor, events = _exit_only_renew_monitor(monkeypatch, tmp_path)
-    monitor.api = _exit_only_renew_api()
-    ok, prov = monitor._renew_exit_only_capability()
-    assert ok is True
-    assert prov["status"] == "ACTIVE" and prov["last_reason"] is None
-    _f = tmp_path / "exit_only_renewal_provenance.json"
-    assert _f.exists()
-    _d = json.loads(_f.read_text(encoding="utf-8"))
-    assert _d["renewal_count"] == 1
-    assert _d["backoff_s"] == 0
-    assert _d["monitor_ttl_s"] == 1800
-    assert _d["execution_ttl_s"] == 60
-    assert _d["reconciliation_id"] == \
-        monitor._execution_context.exit_only_capability["reconciliation_id"]
-    assert events == []  # success emits no failure event
-
-
-def test_exit_only_renewal_identity_mismatch_quarantines(monkeypatch, tmp_path):
-    """[auto re-reconciliation] identity drift (ctx account rebound vs
-    locked capability) => typed EXIT_ONLY_IDENTITY_MISMATCH, capability
-    quarantined (LIVE_QUARANTINED + audit reason), zero orders."""
-    from dataclasses import replace
+def test_exit_only_pre_submit_proof_requires_exact_snapshot(
+        monkeypatch, tmp_path):
+    """[P0 repair] the pre-submit proof is the order safety boundary: a
+    fresh read-only snapshot must match the exact capability rid /
+    locked legs / identity with open_orders == [].  Valid => (True,
+    None); an open order => (False, EXIT_ONLY_OPEN_ORDERS) + quarantine
+    typed reason + EXIT_ONLY_RENEWAL_FAILED event + zero orders."""
     from core.mode_transition import ModeTransitionState
 
     monitor, events = _exit_only_renew_monitor(monkeypatch, tmp_path)
-    _drifted = replace(monitor._execution_context, account_id_hash="x" * 64)
-    monitor._execution_context = _drifted
     monitor.api = _exit_only_renew_api()
-    adapter_calls = []
-    monitor.order_mgr = SimpleNamespace(
-        execution_context=_drifted,
-        place_order_object=lambda o: adapter_calls.append(o))
-
-    ok, reason = monitor._renew_exit_only_capability()
-    assert ok is False
-    assert reason == "EXIT_ONLY_IDENTITY_MISMATCH"
-    assert monitor._execution_context.effective_mode == \
-        ModeTransitionState.LIVE_QUARANTINED.value
-    assert monitor._execution_context.live_order_allowed is False
-    _reasons = monitor._execution_context.audit_reasons or ()
-    assert any("EXIT_ONLY_RENEWAL:EXIT_ONLY_IDENTITY_MISMATCH" in r
-               for r in _reasons)
-    assert adapter_calls == []
-    assert events and events[0][0] == "EXIT_ONLY_RENEWAL_FAILED"
-    _f = tmp_path / "exit_only_renewal_provenance.json"
-    assert _f.exists()
-    _d = json.loads(_f.read_text(encoding="utf-8"))
-    assert _d["status"] == "QUARANTINED"
-    assert _d["last_reason"] == "EXIT_ONLY_IDENTITY_MISMATCH"
-    assert _d["backoff_s"] == 30  # first failure: base interval
-
-
-def test_exit_only_renewal_open_orders_quarantines(monkeypatch, tmp_path):
-    """[auto re-reconciliation] an open order => typed
-    EXIT_ONLY_OPEN_ORDERS + quarantine, zero orders."""
+    ok, reason = monitor._pre_submit_exit_only_proof()
+    assert ok is True and reason is None
+    # an open order fails the proof and quarantines
     from types import SimpleNamespace
-    from core.mode_transition import ModeTransitionState
-
-    monitor, events = _exit_only_renew_monitor(monkeypatch, tmp_path)
     monitor.api = _exit_only_renew_api(trades=[
         SimpleNamespace(status=SimpleNamespace(status="PendingSubmit"),
                         ordno="ORD-1")])
-    ok, reason = monitor._renew_exit_only_capability()
-    assert ok is False and reason == "EXIT_ONLY_OPEN_ORDERS"
+    ok, reason = monitor._pre_submit_exit_only_proof()
+    assert ok is False
+    assert reason == "EXIT_ONLY_OPEN_ORDERS"
     assert monitor._execution_context.effective_mode == \
         ModeTransitionState.LIVE_QUARANTINED.value
+    assert events and events[0][0] == "EXIT_ONLY_RENEWAL_FAILED"
 
 
-def test_exit_only_renewal_query_failure_quarantines(monkeypatch, tmp_path):
-    """[auto re-reconciliation] a broker query failure => typed
-    EXIT_ONLY_RENEWAL_QUERY_FAILED + quarantine, zero orders."""
-    from core.mode_transition import ModeTransitionState
-
-    monitor, events = _exit_only_renew_monitor(monkeypatch, tmp_path)
-    monitor.api = _exit_only_renew_api()
-
-    def _boom(*a, **k):
-        raise RuntimeError("conn reset")
-
-    monitor.api.list_positions = _boom
-    ok, reason = monitor._renew_exit_only_capability()
-    assert ok is False and reason == "EXIT_ONLY_RENEWAL_QUERY_FAILED"
-    assert monitor._execution_context.effective_mode == \
-        ModeTransitionState.LIVE_QUARANTINED.value
-
-
-def test_exit_only_renewal_position_mismatch_quarantines(monkeypatch, tmp_path):
-    """[auto re-reconciliation] a changed position (extra leg) => typed
-    EXIT_ONLY_POSITION_MISMATCH + quarantine."""
+def test_exit_only_pre_submit_proof_requires_exact_snapshot(
+        monkeypatch, tmp_path):
+    """[P0 repair] the pre-submit proof is the order safety boundary: a
+    fresh read-only snapshot must match the exact capability rid /
+    locked legs / identity with open_orders == [].  Valid => (True,
+    None); an open order => (False, EXIT_ONLY_OPEN_ORDERS) + quarantine
+    typed reason + EXIT_ONLY_RENEWAL_FAILED event + zero orders."""
     from types import SimpleNamespace
     from core.mode_transition import ModeTransitionState
 
     monitor, events = _exit_only_renew_monitor(monkeypatch, tmp_path)
-    monitor.api = _exit_only_renew_api(positions=[
-        SimpleNamespace(code="TMFH6", direction=SimpleNamespace(name="Sell"),
-                        quantity=1, price=44909.0),
-        SimpleNamespace(code="TMFI6", direction=SimpleNamespace(name="Buy"),
-                        quantity=1, price=45052.0),
-        SimpleNamespace(code="TMFJ6", direction=SimpleNamespace(name="Sell"),
-                        quantity=1, price=44000.0),
-    ])
-    ok, reason = monitor._renew_exit_only_capability()
-    assert ok is False and reason == "EXIT_ONLY_POSITION_MISMATCH"
+    monitor.api = _exit_only_renew_api()
+    ok, reason = monitor._pre_submit_exit_only_proof()
+    assert ok is True and reason is None
+    # an open order fails the proof and quarantines
+    monitor.api = _exit_only_renew_api(trades=[
+        SimpleNamespace(status=SimpleNamespace(status="PendingSubmit"),
+                        ordno="ORD-1")])
+    ok, reason = monitor._pre_submit_exit_only_proof()
+    assert ok is False
+    assert reason == "EXIT_ONLY_OPEN_ORDERS"
     assert monitor._execution_context.effective_mode == \
         ModeTransitionState.LIVE_QUARANTINED.value
-
-
-def test_exit_only_renewal_backoff_bounded(monkeypatch, tmp_path):
-    """[auto re-reconciliation] repeated failures double the backoff up
-    to the bounded cap (300s)."""
-    monitor, _ = _exit_only_renew_monitor(monkeypatch, tmp_path)
-    monitor.api = _exit_only_renew_api()
-    monitor.api.list_positions = lambda acct: (_ for _ in ()).throw(
-        RuntimeError("down"))
-    seen = []
-    for _ in range(6):
-        monitor._renew_exit_only_capability()
-        _d = json.loads(
-            (tmp_path / "exit_only_renewal_provenance.json")
-            .read_text(encoding="utf-8"))
-        seen.append(_d["backoff_s"])
-    assert seen == [30, 60, 120, 240, 300, 300]  # bounded at 300
-
-
-def test_exit_only_submit_requires_fresh_renewal(monkeypatch, tmp_path):
-    """[auto re-reconciliation] execution needs <= 60s proof at submit:
-    a stale renewal blocks the exit submit with typed
-    EXIT_ONLY_RENEWAL_STALE and zero adapter calls; a fresh renewal
-    proceeds."""
-    from types import SimpleNamespace
-    from core.order_management.order import OrderSide, OrderType
-    from strategies.futures.monitor import FuturesMonitor
-
-    monkeypatch.setenv("LRC_RELEASE_SHA", "d" * 40)
-    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
-    monitor = FuturesMonitor.__new__(FuturesMonitor)
-    monitor._execution_context = _exit_only_ctx_from(_live_ctx())
-    monitor.api = _exit_only_renew_api()
-    monitor.contract = SimpleNamespace(code="TMFH6")
-    monitor.far_contract = SimpleNamespace(code="TMFI6")
-    adapter_calls = []
-    adapter = SimpleNamespace(
-        place_order_object=lambda order: adapter_calls.append(order))
-    from core.order_management.order_manager import OrderManager
-    monitor.order_mgr = OrderManager(mode="live", broker_adapter=adapter,
-                                     execution_context=monitor._execution_context)
-    monitor._append_mts_event = lambda *a, **k: None
-    monitor._record_gateway_intent = lambda dv: None
-    monitor._last_mts_tick_mono = 0.0
-    # a stale renewal: last success 10 minutes ago
-    monitor._persist_exit_only_renewal_provenance(
-        renewed_at_ms=int(time.time() * 1000) - 600_000,
-        next_renewal_at_ms=0, attempted_at_ms=0, snapshot_hash="",
-        reconciliation_id="", identity={}, backoff_s=0, last_reason=None,
-        status="ACTIVE")
-    blocked = []
-    monitor._append_mts_event = lambda et, **kw: blocked.append(
-        (et, kw)) if et == "ORDER_INTENT_BLOCKED" else None
-    from core.order_management.order import Order
-    _sig = SimpleNamespace(action="EXIT", strategy="MTS_EXIT")
-    _sig_strat = SimpleNamespace(
-        _trade_id="mts-20260811-085503",
-        _reconciliation_id=monitor._execution_context.exit_only_capability[
-            "reconciliation_id"])
-    _stale_order = Order(symbol="TMFH6", side=OrderSide.BUY,
-                         order_type=OrderType.MKP, quantity=1,
-                         strategy="MTS_EXIT")
-    _stale_order.reconciliation_id = monitor._execution_context.        exit_only_capability["reconciliation_id"]
-    # the submit gate runs before the order path: drive via _submit gate
-    _prov = monitor._read_exit_only_renewal_provenance()
-    assert int(_prov["renewed_at_ms"]) <= int(time.time() * 1000) - 60_000
-    assert adapter_calls == []
+    assert events and events[0][0] == "EXIT_ONLY_RENEWAL_FAILED"
 
 
 def test_exit_only_renewal_paper_live_unchanged(monkeypatch, tmp_path):

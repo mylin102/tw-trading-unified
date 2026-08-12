@@ -49,13 +49,18 @@ def _capability():
     }
 
 
-def _ctx(mode, live_order_allowed=False, cap=None, session_id=None):
+def _ctx(mode, live_order_allowed=False, cap=None, session_id=None,
+         account_id_hash=None, config_hash=None):
+    # [renewal] NOTE: ExecutionContext has no release_sha field — the
+    # snapshot identity derives release_sha from LRC_RELEASE_SHA env.
     return ExecutionContext(
         requested_mode="live",
         effective_mode=mode,
         live_order_allowed=live_order_allowed,
         exit_only_capability=cap,
         session_id=session_id,
+        account_id_hash=account_id_hash,
+        config_hash=config_hash,
     )
 
 
@@ -68,18 +73,30 @@ def _fresh_capability():
 
 
 def _fresh_exit_only_ctx(cap=None):
-    return _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
-                live_order_allowed=False, cap=cap or _fresh_capability(),
-                session_id="c" * 32)
+    # [renewal] the ctx identity MUST mirror the capability identity so
+    # the pre-submit proof / renewal identity lock holds (ctx drift is
+    # the failure signal — a consistent fixture is the baseline).
+    _cap = cap or _fresh_capability()
+    return _ctx(
+        ModeTransitionState.RECONCILED_EXIT_ONLY.value,
+        live_order_allowed=False, cap=_cap,
+        session_id=_cap.get("session_id"),
+        account_id_hash=_cap.get("account_id_hash"),
+        config_hash=_cap.get("config_hash"))
 
 
 
 
 
 def _exit_only_ctx():
+    # [renewal] mirror the capability identity (same rationale as the
+    # fresh variant) so the pre-submit proof identity lock holds.
+    _cap = _capability()
     return _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
-                live_order_allowed=False, cap=_capability(),
-                session_id="c" * 32)
+                live_order_allowed=False, cap=_cap,
+                session_id=_cap.get("session_id"),
+                account_id_hash=_cap.get("account_id_hash"),
+                config_hash=_cap.get("config_hash"))
 
 
 def _live_ctx():
@@ -109,6 +126,23 @@ class _FakeAdapter:
     def __init__(self, registry=None):
         self._gateway_registry = registry
         self.calls = []
+        from types import SimpleNamespace
+        # [renewal] read-only snapshot surface for the pre-submit proof
+        self.futopt_account = SimpleNamespace()
+
+    def list_positions(self, acct=None):
+        from types import SimpleNamespace
+        return [
+            SimpleNamespace(code="TMFH6",
+                            direction=SimpleNamespace(name="Sell"),
+                            quantity=1, price=44909.0),
+            SimpleNamespace(code="TMFI6",
+                            direction=SimpleNamespace(name="Buy"),
+                            quantity=1, price=45052.0),
+        ]
+
+    def list_trades(self, acct=None):
+        return []
 
     def place_order_object(self, order):
         reg = getattr(self, "_gateway_registry", None)
@@ -526,6 +560,12 @@ def _monitor(ctx, adapter=None, mode="live", *, dry_run=False,
         "near": dict(_bbo_slots()["TMF"]),
         "far": dict(_bbo_slots()["TMF_FAR"]),
     }
+    # [renewal] the snapshot identity reads release_sha from the env —
+    # pin it to the capability's value so the identity lock holds.
+    import os as _os
+    _os.environ.setdefault("LRC_RELEASE_SHA",
+                           str((ctx.exit_only_capability or {}).get(
+                               "release_sha") or "e" * 40))
     monitor.ticker = "TMF"
     monitor.contract = SimpleNamespace(code="TMFH6")
     monitor.far_contract = SimpleNamespace(code="TMFI6")
@@ -1015,8 +1055,10 @@ def test_s2_exit_only_mixed_identity_zero_submit(monkeypatch):
         __import__("datetime").datetime.now())
     assert monitor.api.calls == []
     blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
+    # the pre-submit proof (order safety boundary) fires first with the
+    # typed identity reason; the BBO binding gate is unreachable here
     assert blocked and blocked[-1][1].get("reason") \
-        == "BBO_IDENTITY_MISSING"
+        in ("EXIT_ONLY_IDENTITY_MISMATCH", "BBO_IDENTITY_MISSING")
 
 
 def test_s2_repair_on_bidask_evidence_survives_ticks(monkeypatch):
@@ -1234,14 +1276,8 @@ def test_s1_exit_only_hydration_blocked_zero_eval():
         _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
              live_order_allowed=False, cap=None, session_id="c" * 32),
         "EXIT_ONLY_CAPABILITY_MISSING", "missing")
-    # stale snapshot (older than the TTL)
-    stale = _fresh_capability()
-    stale["snapshot_captured_at"] = (
-        int(time.time() * 1000) - EXIT_ONLY_SNAPSHOT_TTL_MS - 1000)
-    _assert_blocked(
-        _ctx(ModeTransitionState.RECONCILED_EXIT_ONLY.value,
-             live_order_allowed=False, cap=stale, session_id="c" * 32),
-        "EXIT_ONLY_SNAPSHOT_STALE", "stale")
+    # [simplified] stale snapshot is NOT an age-gate anymore — the
+    # order safety boundary is the pre-submit fresh reconciliation.
     # wrong session
     wrong_session = _fresh_capability()
     wrong_session["session_id"] = "f" * 32
@@ -1354,9 +1390,11 @@ def test_s1_e2e_mts_tick_exit_reaches_submit_with_flat_local_ledger(
             if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"] == []
 
 
-def test_s1_e2e_mts_tick_stale_cap_zero_eval(monkeypatch, tmp_path):
-    """[S1 repair P0] integrated _mts_tick with a STALE capability: the
-    evaluator and submit are never reached (explicit BLOCKED event)."""
+def test_s1_e2e_mts_tick_stale_cap_monitoring_continues(
+        monkeypatch, tmp_path):
+    """[simplified] integrated _mts_tick with a STALE capability: the
+    monitoring is NOT age-gated — the evaluator still runs; the order
+    safety boundary is the pre-submit fresh reconciliation."""
     from pathlib import Path
     from types import SimpleNamespace
     import time as _time
@@ -1401,10 +1439,14 @@ def test_s1_e2e_mts_tick_stale_cap_zero_eval(monkeypatch, tmp_path):
     bar = {"near_close": 44905.0, "far_close": 45038.5, "ts": 1754991000}
     monitor._mts_tick(bar)
 
-    assert _NoopStrategy.calls == 0
-    assert monitor.api.calls == []
+    assert _NoopStrategy.calls == 1  # the evaluator runs (no age gate)
+    # the EXIT signal flows through the pre-submit fresh reconciliation
+    # (the order safety boundary) and the closing orders are submitted
+    assert len(monitor.api.calls) == 2
+    assert {c["symbol"] for c in monitor.api.calls} == {"TMFH6", "TMFI6"}
     blocked = [e for e in events if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"]
-    assert blocked and blocked[-1][1]["reason"] == "EXIT_ONLY_SNAPSHOT_STALE"
+    assert not any(e[1].get("reason") == "EXIT_ONLY_SNAPSHOT_STALE"
+                   for e in blocked)
 
 
 def test_s1_exit_only_session_and_future_checks_fail_closed():
@@ -1457,12 +1499,12 @@ def test_s1_exit_only_session_and_future_checks_fail_closed():
         "EXIT_ONLY_SNAPSHOT_FUTURE", "future")
 
 
-def test_s1_e2e_tick_stale_cap_blocks_risk_gate_direct_submit(
+def test_s1_e2e_tick_stale_cap_no_duplicate_resubmit(
         monkeypatch, tmp_path):
     """[S1 final repair] valid capability on tick N permits exactly the
-    bounded exit through the risk-gate direct submit path; on tick N+1 a
-    stale capability blocks that same path — zero adapter call + one
-    typed EXIT_ONLY_HYDRATION_BLOCKED/EXIT_ONLY_SNAPSHOT_STALE event."""
+    bounded exit through the risk-gate direct submit path; on tick N+1
+    the same closing pair is NOT resubmitted (one capability = one exact
+    closing pair) — no duplicate adapter calls and no age-gate block."""
     from dataclasses import replace
     from pathlib import Path
     from types import SimpleNamespace
@@ -1523,16 +1565,353 @@ def test_s1_e2e_tick_stale_cap_blocks_risk_gate_direct_submit(
     assert {c["symbol"] for c in monitor.api.calls} == {"TMFH6", "TMFI6"}
     monitor.api.calls.clear()
 
-    # tick N+1: stale cap -> risk gate blocked, submit zero
+    # tick N+1: a stale capability snapshot is NOT age-gated (monitoring
+    # continues) — but the closing orders were already issued on tick N
+    # (one capability = one exact closing pair), so no duplicate
+    # resubmission happens; the pre-submit fresh proof is the order
+    # safety boundary.
     stale = _fresh_capability()
     stale["snapshot_captured_at"] = (
         int(_time.time() * 1000) - EXIT_ONLY_SNAPSHOT_TTL_MS - 1000)
     monitor._execution_context = replace(
         monitor._execution_context, exit_only_capability=stale)
     monitor._mts_tick(bar)
-    assert monitor.api.calls == []
+    assert monitor.api.calls == []  # duplicate suppressed, no resubmit
     blocked = [e for e in events if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"]
-    assert blocked and blocked[-1][1]["reason"] == "EXIT_ONLY_SNAPSHOT_STALE"
+    assert not any(e[1].get("reason") == "EXIT_ONLY_SNAPSHOT_STALE"
+                   for e in blocked)
+
+
+def _renewal_proof_for(monitor, *, captured_age_ms, renewed_age_ms):
+    """An ACTIVE renewal proof bound to the monitor's capability at the
+    given ages (snapshot capture vs execution renewed_at)."""
+    _cap = monitor._execution_context.exit_only_capability
+    _now = int(time.time() * 1000)
+    return {
+        "status": "ACTIVE",
+        "reconciliation_id": _cap["reconciliation_id"],
+        "identity": {k: _cap.get(k) for k in (
+            "account_id_hash", "session_id", "config_hash", "release_sha")},
+        "legs": sorted(
+            (str(l.get("symbol", "")), str(l.get("side", "")),
+             int(l.get("remaining_qty", 0) or 0))
+            for l in (_cap.get("legs") or [])),
+        "snapshot_captured_at_ms": _now - captured_age_ms,
+        "renewed_at_ms": _now - renewed_age_ms,
+        "monitor_ttl_s": 1800, "execution_ttl_s": 60,
+    }
+
+
+def test_e2e_renewal_monitor_over_60s_evaluates_and_submits_after_fresh_snapshot(
+        monkeypatch, tmp_path):
+    """[P0 repair] a continuous valid monitor with an OLD attestation
+    capability (> 60s) keeps evaluating via the bound ACTIVE renewal
+    proof (<= 1800s monitoring TTL) — an EXIT signal takes a FRESH
+    read-only snapshot EXACTLY ONCE before authorization, then the
+    capability-bound closing orders are submitted (adapter stub)."""
+    from dataclasses import replace
+    from pathlib import Path
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+    from strategies.futures.mts_ledger_authority import (
+        MtsAuthority, MtsAuthorityState)
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    _stale_cap = _fresh_capability()
+    _stale_cap["snapshot_captured_at"] = int(time.time() * 1000) - 300_000
+    monitor._execution_context = replace(
+        monitor._execution_context, exit_only_capability=_stale_cap)
+    monitor._ledger_projection.snapshot = lambda: MtsAuthorityState(
+        MtsAuthority.FLAT)
+    monitor._ledger_projection_sync_ts = 0.0
+    monitor._last_mts_tick_mono = None
+    monitor._prev_mts_tick_mono = None
+    monitor._mts_release_orders_flushed = True
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s1_no_state.json"))
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monitor.trader = SimpleNamespace(position=0)
+    monitor._mts_risk_gate_settlement = lambda strategy: False
+    monitor._mts_check_evaluator_lag = lambda strategy, has_pos: None
+    monitor._mts_note_strategy_evaluated = lambda: None
+    monitor._inject_mtf_snapshot = lambda bar: None
+
+    class _Strategy:
+        def init(self, ctx):
+            pass
+
+        def on_bar(self, ctx):
+            return None
+
+        def _reset(self, **kw):
+            pass
+
+    strategy = _Strategy()
+    monitor._registry = {"tmf_spread": strategy}
+    # ACTIVE renewal proof bound to the capability (fresh for the 1800s
+    # monitoring TTL) — the order safety boundary is the PRE-SUBMIT
+    # snapshot, NOT a 60s timer.  Set BEFORE hydration so the monitoring
+    # validation sees the bound proof.
+    monitor._read_exit_only_renewal_provenance = lambda: (
+        _renewal_proof_for(monitor, captured_age_ms=30_000,
+                           renewed_age_ms=30_000))
+    assert monitor._exit_only_pre_evaluation_hydration(strategy) is True
+
+    def _preclose(strategy, bar):
+        sig = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+        monitor._submit_mts_order_signal(
+            sig, strategy, bar, __import__("datetime").datetime.now())
+        return False
+
+    monitor._mts_risk_gate_single_leg_preclose = _preclose
+    # count the fresh pre-submit snapshot queries
+    _snap_count = {"n": 0}
+    _orig_lp = monitor.api.list_positions
+    _orig_lt = monitor.api.list_trades
+
+    def _count_lp(*a, **k):
+        _snap_count["n"] += 1
+        return _orig_lp(*a, **k)
+
+    def _count_lt(*a, **k):
+        return _orig_lt(*a, **k)  # part of the same snapshot, not counted
+
+    monitor.api.list_positions = _count_lp
+    monitor.api.list_trades = _count_lt
+    bar = {"near_close": 44905.0, "far_close": 45038.5, "ts": 1754991000}
+
+    monitor._mts_tick(bar)
+
+    # monitoring evaluated: NO snapshot-stale block
+    _hyd = [e for e in events if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"]
+    assert not any(e[1].get("reason") == "EXIT_ONLY_SNAPSHOT_STALE"
+                   for e in _hyd), [e[1] for e in _hyd]
+    # the pre-submit fresh snapshot ran exactly once, then the orders
+    # were authorized and reached the adapter stub
+    assert _snap_count["n"] == 1, _snap_count
+    assert len(monitor.api.calls) == 2
+    assert {c["symbol"] for c in monitor.api.calls} == {"TMFH6", "TMFI6"}
+
+
+def test_e2e_pre_submit_snapshot_mismatch_zero_authorization(
+        monkeypatch, tmp_path):
+    """[P0 repair] a mismatching/failing pre-submit snapshot (open
+    order) => quarantine typed reason + ORDER_INTENT_BLOCKED + zero
+    adapter calls + NO retry."""
+    from dataclasses import replace
+    from pathlib import Path
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+    from strategies.futures.mts_ledger_authority import (
+        MtsAuthority, MtsAuthorityState)
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    _stale_cap = _fresh_capability()
+    _stale_cap["snapshot_captured_at"] = int(time.time() * 1000) - 300_000
+    monitor._execution_context = replace(
+        monitor._execution_context, exit_only_capability=_stale_cap)
+    monitor._ledger_projection.snapshot = lambda: MtsAuthorityState(
+        MtsAuthority.FLAT)
+    monitor._ledger_projection_sync_ts = 0.0
+    monitor._last_mts_tick_mono = None
+    monitor._prev_mts_tick_mono = None
+    monitor._mts_release_orders_flushed = True
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s1_no_state.json"))
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monitor.trader = SimpleNamespace(position=0)
+    monitor._mts_risk_gate_settlement = lambda strategy: False
+    monitor._mts_check_evaluator_lag = lambda strategy, has_pos: None
+    monitor._mts_note_strategy_evaluated = lambda: None
+    monitor._inject_mtf_snapshot = lambda bar: None
+
+    class _Strategy:
+        def init(self, ctx):
+            pass
+
+        def on_bar(self, ctx):
+            return None
+
+        def _reset(self, **kw):
+            pass
+
+    strategy = _Strategy()
+    monitor._registry = {"tmf_spread": strategy}
+    monitor._read_exit_only_renewal_provenance = lambda: (
+        _renewal_proof_for(monitor, captured_age_ms=30_000,
+                           renewed_age_ms=30_000))
+    assert monitor._exit_only_pre_evaluation_hydration(strategy) is True
+
+    def _preclose(strategy, bar):
+        sig = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+        monitor._submit_mts_order_signal(
+            sig, strategy, bar, __import__("datetime").datetime.now())
+        return False
+
+    monitor._mts_risk_gate_single_leg_preclose = _preclose
+    # the pre-submit snapshot now shows an OPEN ORDER
+    from core.mode_transition import ModeTransitionState
+    monitor.api.list_trades = lambda acct: [
+        SimpleNamespace(status=SimpleNamespace(status="PendingSubmit"),
+                        ordno="ORD-OPEN")]
+    bar = {"near_close": 44905.0, "far_close": 45038.5, "ts": 1754991000}
+
+    monitor._mts_tick(bar)
+
+    assert monitor.api.calls == []  # zero adapter calls
+    _blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
+    assert any(e[1].get("reason") == "EXIT_ONLY_OPEN_ORDERS"
+               for e in _blocked), [e[1] for e in _blocked]
+    # quarantined with the typed reason
+    assert monitor._execution_context.effective_mode == \
+        ModeTransitionState.LIVE_QUARANTINED.value
+    _reasons = monitor._execution_context.audit_reasons or ()
+    assert any("EXIT_ONLY_OPEN_ORDERS" in r for r in _reasons)
+
+
+def test_e2e_no_signal_no_broker_query(monkeypatch, tmp_path):
+    """[P0 repair] without an exit signal the tick performs NO broker
+    snapshot query — the pre-submit proof is taken only when a bounded
+    EXIT/RELEASE signal is about to submit."""
+    from dataclasses import replace
+    from pathlib import Path
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+    from strategies.futures.mts_ledger_authority import (
+        MtsAuthority, MtsAuthorityState)
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    _stale_cap = _fresh_capability()
+    _stale_cap["snapshot_captured_at"] = int(time.time() * 1000) - 300_000
+    monitor._execution_context = replace(
+        monitor._execution_context, exit_only_capability=_stale_cap)
+    monitor._ledger_projection.snapshot = lambda: MtsAuthorityState(
+        MtsAuthority.FLAT)
+    monitor._ledger_projection_sync_ts = 0.0
+    monitor._last_mts_tick_mono = None
+    monitor._prev_mts_tick_mono = None
+    monitor._mts_release_orders_flushed = True
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s1_no_state.json"))
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monitor.trader = SimpleNamespace(position=0)
+    monitor._mts_risk_gate_settlement = lambda strategy: False
+    monitor._mts_check_evaluator_lag = lambda strategy, has_pos: None
+    monitor._mts_note_strategy_evaluated = lambda: None
+    monitor._inject_mtf_snapshot = lambda bar: None
+
+    class _Strategy:
+        def init(self, ctx):
+            pass
+
+        def on_bar(self, ctx):
+            return None  # no signal
+
+        def _reset(self, **kw):
+            pass
+
+    strategy = _Strategy()
+    monitor._registry = {"tmf_spread": strategy}
+    monitor._read_exit_only_renewal_provenance = lambda: (
+        _renewal_proof_for(monitor, captured_age_ms=30_000,
+                           renewed_age_ms=30_000))
+    assert monitor._exit_only_pre_evaluation_hydration(strategy) is True
+    monitor._mts_risk_gate_single_leg_preclose = lambda strategy, bar: False
+    _snap_count = {"n": 0}
+    _orig_lp = monitor.api.list_positions
+
+    def _count_lp(*a, **k):
+        _snap_count["n"] += 1
+        return _orig_lp(*a, **k)
+
+    monitor.api.list_positions = _count_lp
+    bar = {"near_close": 44905.0, "far_close": 45038.5, "ts": 1754991000}
+
+    monitor._mts_tick(bar)
+
+    assert _snap_count["n"] == 0  # no signal => no broker query
+    assert monitor.api.calls == []
+
+
+def test_e2e_renewal_monitoring_continues_no_age_gate(
+        monkeypatch, tmp_path):
+    """[simplified] monitoring is NOT gated by snapshot age: a renewal
+    proof older than any TTL does not block the evaluator — the
+    capability scope is immutable and the ORDER safety boundary is the
+    synchronous pre-submit fresh broker reconciliation."""
+    from dataclasses import replace
+    from pathlib import Path
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+    from strategies.futures.mts_ledger_authority import (
+        MtsAuthority, MtsAuthorityState)
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    _stale_cap = _fresh_capability()
+    _stale_cap["snapshot_captured_at"] = int(time.time() * 1000) - 300_000
+    monitor._execution_context = replace(
+        monitor._execution_context, exit_only_capability=_stale_cap)
+    monitor._ledger_projection.snapshot = lambda: MtsAuthorityState(
+        MtsAuthority.FLAT)
+    monitor._ledger_projection_sync_ts = 0.0
+    monitor._last_mts_tick_mono = None
+    monitor._prev_mts_tick_mono = None
+    monitor._mts_release_orders_flushed = True
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s1_no_state.json"))
+    monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
+                        lambda: str(tmp_path))
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monitor.trader = SimpleNamespace(position=0)
+    monitor._mts_risk_gate_settlement = lambda strategy: False
+    monitor._mts_check_evaluator_lag = lambda strategy, has_pos: None
+    monitor._mts_note_strategy_evaluated = lambda: None
+    monitor._inject_mtf_snapshot = lambda bar: None
+
+    class _Strategy:
+        def init(self, ctx):
+            pass
+
+        def on_bar(self, ctx):
+            return None
+
+        def _reset(self, **kw):
+            pass
+
+    strategy = _Strategy()
+    monitor._registry = {"tmf_spread": strategy}
+    # a very old renewal proof: monitoring is NOT age-gated
+    monitor._read_exit_only_renewal_provenance = lambda: (
+        _renewal_proof_for(monitor, captured_age_ms=7_200_000,
+                           renewed_age_ms=7_200_000))
+    assert monitor._exit_only_pre_evaluation_hydration(strategy) is True
+
+    def _preclose(strategy, bar):
+        sig = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+        monitor._submit_mts_order_signal(
+            sig, strategy, bar, __import__("datetime").datetime.now())
+        return False
+
+    monitor._mts_risk_gate_single_leg_preclose = _preclose
+    bar = {"near_close": 44905.0, "far_close": 45038.5, "ts": 1754991000}
+
+    monitor._mts_tick(bar)
+
+    # the evaluator ran and the fresh pre-submit proof allowed the orders
+    _hyd = [e for e in events if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"]
+    assert not any(e[1].get("reason") == "EXIT_ONLY_SNAPSHOT_STALE"
+                   for e in _hyd), [e[1] for e in _hyd]
+    assert len(monitor.api.calls) == 2
 
 
 def test_s1_normal_live_and_paper_untouched():
