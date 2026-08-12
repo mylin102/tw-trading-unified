@@ -548,6 +548,36 @@ def load_exit_only_context():
     return {}
 
 
+def filter_mts_order_rows_for_exit_only(rows, *, reconciliation_id):
+    """[Dashboard] presentation-only filter for RECONCILED_EXIT_ONLY:
+    keep only rows explicitly bound to the CURRENT capability's
+    reconciliation_id.  Rows with a missing/different rid (legacy
+    RECOVERED, prior release/session, paper data) are excluded and
+    counted — NEVER deleted/archived/mutated (the event ledger is
+    untouched)."""
+    rows = list(rows or [])
+    if not reconciliation_id:
+        return [], len(rows)
+    kept = [r for r in rows
+            if isinstance(r, dict)
+            and r.get("reconciliation_id") == reconciliation_id]
+    return kept, len(rows) - len(kept)
+
+
+def exit_only_order_visibility(orders_data, *, context):
+    """[Dashboard] returns (display_rows, isolated_count).  PAPER and
+    normal LIVE displays are returned unchanged (no filtering); only
+    RECONCILED_EXIT_ONLY isolates the CURRENT order table to records
+    explicitly bound to the current capability reconciliation_id."""
+    if not isinstance(context, dict) \
+            or context.get("effective_mode") != "reconciled_exit_only":
+        return list(orders_data or []), 0
+    _cap = context.get("exit_only_capability") or {}
+    return filter_mts_order_rows_for_exit_only(
+        orders_data,
+        reconciliation_id=_cap.get("reconciliation_id", ""))
+
+
 def summarize_execution_context(context, known_profile_hashes):
     """Return fail-closed dashboard truth for the active futures runtime."""
     context = context if isinstance(context, dict) else {}
@@ -4261,6 +4291,22 @@ elif _selected_product == "TMF":
             else:
                 _completed_filtered = _completed
 
+            # [Dashboard] RECONCILED_EXIT_ONLY: presentation-only
+            # isolation of the closed-loop display — only records bound
+            # to the current capability rid; legacy/paper rows excluded.
+            _eo_ctx = load_exit_only_context()
+            if _eo_ctx.get("effective_mode") == "reconciled_exit_only":
+                _rid = (_eo_ctx.get("exit_only_capability") or {}).get(
+                    "reconciliation_id", "")
+                _completed_filtered, _loops_isolated = \
+                    filter_mts_order_rows_for_exit_only(
+                        _completed_filtered, reconciliation_id=_rid)
+                if _loops_isolated:
+                    st.caption(
+                        f"🔒 歷史事件已隔離（RECONCILED_EXIT_ONLY：僅顯示綁定"
+                        f"目前 reconciliation_id 的已完結交易；已隔離 "
+                        f"{_loops_isolated} 筆）")
+
             if _completed_filtered:
                 with st.expander(f"📝 已完結交易清單 (Closed Loops - {_sel_session})", expanded=True):
                     _loop_rows = []
@@ -4375,6 +4421,20 @@ elif _selected_product == "TMF":
                 orders_data = []
 
             if orders_data:
+                # [Dashboard] RECONCILED_EXIT_ONLY: presentation-only
+                # isolation of the CURRENT order table — only records
+                # explicitly bound to the current capability's
+                # reconciliation_id; stale/legacy/paper rows are excluded
+                # (never deleted from the ledger).
+                _eo_ctx = load_exit_only_context()
+                _orders_display, _orders_isolated = exit_only_order_visibility(
+                    orders_data, context=_eo_ctx)
+                if _orders_isolated:
+                    st.caption(
+                        f"🔒 歷史事件已隔離（RECONCILED_EXIT_ONLY：僅顯示綁定"
+                        f"目前 reconciliation_id 的紀錄；已隔離 "
+                        f"{_orders_isolated} 筆）")
+                orders_data = _orders_display
                 # Get LIVE price from the same data source as charts
                 # 2026-07-07 Hermes Agent: cache-busting key
                 _today = get_session_date_str()
