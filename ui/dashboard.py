@@ -671,8 +671,11 @@ def exit_only_order_visibility(orders_data, *, context):
 
 
 def load_exit_only_renewal_status():
-    """[auto re-reconciliation] dashboard status from the renewal
-    provenance file: state/last/next + both TTLs; {} if absent."""
+    """[auto re-reconciliation] dashboard status string: 自動對帳
+    healthy/degraded, last success, last failure, next attempt — BBO
+    freshness is displayed separately; "" if absent.  No TTL concept:
+    the order safety boundary is the synchronous pre-submit fresh
+    broker reconciliation."""
     try:
         _p = Path(runtime_path("exit_only_renewal_provenance.json"))
         if _p.exists():
@@ -681,17 +684,22 @@ def load_exit_only_renewal_status():
                 import datetime
                 _fmt = lambda ms: datetime.datetime.fromtimestamp(
                     int(ms) / 1000).strftime("%H:%M:%S")
-                return {
-                    "status": _d.get("status", "ACTIVE"),
-                    "last": _fmt(_d.get("renewed_at_ms") or 0),
-                    "next": _fmt(_d.get("next_renewal_at_ms") or 0),
-                    "monitor_ttl_s": _d.get("monitor_ttl_s", 1800),
-                    "execution_ttl_s": _d.get("execution_ttl_s", 60),
-                    "last_reason": _d.get("last_reason"),
-                }
+                _status = _d.get("status", "ACTIVE")
+                _label = "healthy" if _status == "ACTIVE" else "degraded"
+                _txt = (f"🔄 自動對帳: {_label} · 上次成功 "
+                        f"{_fmt(_d.get('renewed_at_ms') or 0)}")
+                _fail = _d.get("last_failed_at_ms")
+                if _fail:
+                    _txt += f" · 上次失敗 {_fmt(_fail)}"
+                    if _d.get("last_reason"):
+                        _txt += f" ({_d['last_reason']})"
+                _next = _d.get("next_renewal_at_ms")
+                if _next:
+                    _txt += f" · 下次 {_fmt(_next)}"
+                return _txt
     except Exception:
         pass
-    return {}
+    return ""
 
 
 def summarize_execution_context(context, known_profile_hashes):
@@ -4121,19 +4129,11 @@ elif _selected_product == "TMF":
             st.warning(
                 "⚠️ 受限平倉模式—等待新鮮券商對帳與雙腿 BBO"
                 f"（{_reason}）")
-        # [auto re-reconciliation] refresh state: last/next + both TTLs
+        # [auto re-reconciliation] 自動對帳 status: healthy/degraded,
+        # last success/failure, next attempt (BBO freshness separate)
         _renew_status = load_exit_only_renewal_status()
         if _renew_status:
-            _renew_txt = (
-                f"🔄 自動續核 {_renew_status['status']} · "
-                f"上次 {_renew_status['last']} · "
-                f"下次 {_renew_status['next']} · "
-                f"TTL 監控 {_renew_status['monitor_ttl_s']}s / "
-                f"執行 {_renew_status['execution_ttl_s']}s")
-            if _renew_status.get("last_reason"):
-                _renew_txt += (
-                    f" · 原因 {_renew_status['last_reason']}")
-            st.caption(_renew_txt)
+            st.caption(_renew_status)
         _mts_perf_scope = {"ok": False, "mode": "exit_only",
                            "reason": "RECONCILED_EXIT_ONLY"}
     else:

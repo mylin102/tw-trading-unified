@@ -3527,45 +3527,96 @@ class FuturesMonitor:
         _interval_s = self.EXIT_ONLY_RENEWAL_INTERVAL_S + _backoff
         return (int(time.time() * 1000) - int(_last)) >= _interval_s * 1000
 
-    def _exit_only_renewal_fail(self, reason: str) -> tuple:
-        """[auto re-reconciliation] a renewal failed: quarantine the
-        capability with the typed reason (LIVE_QUARANTINED + audit
-        reason), persist the failure provenance with a BOUNDED backoff,
-        emit a typed event — zero orders by construction."""
+    def _exit_only_renewal_fail(self, reason: str, *,
+                                quarantine: bool = True) -> tuple:
+        """[auto re-reconciliation] a renewal failed.  Mismatch / open
+        order / session change => quarantine the capability with the
+        typed reason (LIVE_QUARANTINED + audit reason).  A transient
+        QUERY failure => DEGRADED status + bounded backoff only —
+        monitoring continues (the pre-submit query is decisive and a
+        failure THERE quarantines).  Zero orders by construction."""
         _now_ms = int(time.time() * 1000)
         _prov = self._read_exit_only_renewal_provenance()
         _backoff = min(
             (int(_prov.get("backoff_s") or 0) * 2)
             or self.EXIT_ONLY_RENEWAL_INTERVAL_S,
             self.EXIT_ONLY_RENEWAL_MAX_BACKOFF_S)
+        _status = "QUARANTINED" if quarantine else "DEGRADED"
         self._persist_exit_only_renewal_provenance(
             attempted_at_ms=_now_ms,
+            last_failed_at_ms=_now_ms,
             last_reason=reason,
             backoff_s=_backoff,
-            status="QUARANTINED")
-        _ctx = getattr(self, "_execution_context", None)
-        if _ctx is not None and getattr(
-                _ctx, "effective_mode", "") == "reconciled_exit_only":
-            from dataclasses import replace
-            from core.mode_transition import ModeTransitionState
-            try:
-                _reasons = list(getattr(_ctx, "audit_reasons", ()) or ())
-                _reasons.append(f"EXIT_ONLY_RENEWAL:{reason}")
-                self._execution_context = replace(
-                    _ctx,
-                    effective_mode=(
-                        ModeTransitionState.LIVE_QUARANTINED.value),
-                    live_order_allowed=False,
-                    audit_reasons=tuple(_reasons[-64:]))
-                self._persist_execution_context()
-            except Exception:
-                pass
+            status=_status,
+            next_renewal_at_ms=(
+                _now_ms + (self.EXIT_ONLY_RENEWAL_INTERVAL_S + _backoff)
+                * 1000))
+        if quarantine:
+            _ctx = getattr(self, "_execution_context", None)
+            if _ctx is not None and getattr(
+                    _ctx, "effective_mode", "") == "reconciled_exit_only":
+                from dataclasses import replace
+                from core.mode_transition import ModeTransitionState
+                try:
+                    _reasons = list(getattr(_ctx, "audit_reasons", ()) or ())
+                    _reasons.append(f"EXIT_ONLY_RENEWAL:{reason}")
+                    self._execution_context = replace(
+                        _ctx,
+                        effective_mode=(
+                            ModeTransitionState.LIVE_QUARANTINED.value),
+                        live_order_allowed=False,
+                        audit_reasons=tuple(_reasons[-64:]))
+                    self._persist_execution_context()
+                except Exception:
+                    pass
         self._append_mts_event(
             "EXIT_ONLY_RENEWAL_FAILED", reason=reason,
             renewal_provenance={
                 "attempted_at_ms": _now_ms, "backoff_s": _backoff,
-                "status": "QUARANTINED"})
+                "status": _status})
         return False, reason
+
+    def _verify_exit_only_snapshot(self, _snap, _cap) -> tuple:
+        """[auto re-reconciliation] SHARED read-only snapshot contract:
+        live_broker source, exact identity lock, exact two legs, no open
+        orders.  Returns (True, None) or (False, typed_reason)."""
+        if not isinstance(_snap, dict) or _snap.get("source") != "live_broker":
+            return False, "EXIT_ONLY_RENEWAL_QUERY_FAILED"
+        for _k in ("account_id_hash", "session_id", "config_hash",
+                   "release_sha"):
+            if _snap.get(_k) != _cap.get(_k):
+                return False, "EXIT_ONLY_IDENTITY_MISMATCH"
+        _pos = sorted(
+            (str(p.get("code", "")), str(p.get("direction", "")),
+             int(p.get("quantity", 0) or 0))
+            for p in (_snap.get("positions") or []))
+        _legs = sorted(
+            (str(l.get("symbol", "")), str(l.get("side", "")),
+             int(l.get("remaining_qty", 0) or 0))
+            for l in (_cap.get("legs") or []))
+        if _pos != _legs:
+            return False, "EXIT_ONLY_POSITION_MISMATCH"
+        if _snap.get("open_orders"):
+            return False, "EXIT_ONLY_OPEN_ORDERS"
+        return True, None
+
+    def _pre_submit_exit_only_proof(self) -> tuple:
+        """[auto re-reconciliation] the ORDER SAFETY BOUNDARY: a
+        synchronous FRESH read-only broker snapshot taken immediately
+        BEFORE authorization.  Requires the exact capability rid /
+        locked two legs / account / session / config / release and
+        open_orders == [].  Returns (True, None) to proceed or
+        (False, typed_reason) — the failure path quarantines with the
+        typed reason, zero orders, NO retry."""
+        _ctx = getattr(self, "_execution_context", None)
+        _cap = getattr(_ctx, "exit_only_capability", None)
+        if not isinstance(_cap, dict):
+            return False, "EXIT_ONLY_CONTEXT_INVALID"
+        _snap = self._capture_exit_only_snapshot()
+        _ok, _reason = self._verify_exit_only_snapshot(_snap, _cap)
+        if not _ok:
+            return self._exit_only_renewal_fail(_reason)
+        return True, None
 
     def _renew_exit_only_capability(self) -> tuple:
         """[auto re-reconciliation] read-only renewal of the CURRENT
@@ -3578,27 +3629,19 @@ class FuturesMonitor:
         if not isinstance(_cap, dict):
             return False, "EXIT_ONLY_CONTEXT_INVALID"
         _snap = self._capture_exit_only_snapshot()
-        if _snap.get("source") != "live_broker":
+        _verify_ok, _verify_reason = self._verify_exit_only_snapshot(
+            _snap, _cap)
+        if not _verify_ok:
+            # a transient query failure is DEGRADED (monitoring
+            # continues); mismatch/open-order/session change quarantines
             return self._exit_only_renewal_fail(
-                "EXIT_ONLY_RENEWAL_QUERY_FAILED")
-        for _k in ("account_id_hash", "session_id", "config_hash",
-                   "release_sha"):
-            if _snap.get(_k) != _cap.get(_k):
-                return self._exit_only_renewal_fail(
-                    "EXIT_ONLY_IDENTITY_MISMATCH")
-        _pos = sorted(
-            (str(p.get("code", "")), str(p.get("direction", "")),
-             int(p.get("quantity", 0) or 0))
-            for p in (_snap.get("positions") or []))
+                _verify_reason,
+                quarantine=(_verify_reason
+                            != "EXIT_ONLY_RENEWAL_QUERY_FAILED"))
         _legs = sorted(
             (str(l.get("symbol", "")), str(l.get("side", "")),
              int(l.get("remaining_qty", 0) or 0))
             for l in (_cap.get("legs") or []))
-        if _pos != _legs:
-            return self._exit_only_renewal_fail(
-                "EXIT_ONLY_POSITION_MISMATCH")
-        if _snap.get("open_orders"):
-            return self._exit_only_renewal_fail("EXIT_ONLY_OPEN_ORDERS")
         _now_ms = int(time.time() * 1000)
         _count = int(self._read_exit_only_renewal_provenance().get(
             "renewal_count") or 0) + 1
@@ -3616,7 +3659,9 @@ class FuturesMonitor:
             "renewal_count": _count,
             "backoff_s": 0,
             "last_reason": None,
+            "last_failed_at_ms": None,
             "status": "ACTIVE",
+            "legs": [list(x) for x in _legs],
         }
         self._persist_exit_only_renewal_provenance(**_prov)
         return True, _prov
@@ -3821,12 +3866,12 @@ class FuturesMonitor:
             return False, None, "EXIT_ONLY_SESSION_MISMATCH"
         _captured = _cap.get("snapshot_captured_at")
         _now_ms = int(time.time() * 1000)
-        if (not isinstance(_captured, int)
-                or _now_ms - _captured > EXIT_ONLY_SNAPSHOT_TTL_MS):
-            self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
-                                   reason="EXIT_ONLY_SNAPSHOT_STALE")
-            return False, None, "EXIT_ONLY_SNAPSHOT_STALE"
-        if _captured > _now_ms + 1_000:
+        # [auto re-reconciliation] monitoring is NOT gated by snapshot
+        # age: the capability scope is immutable and the ORDER safety
+        # boundary is the synchronous pre-submit fresh broker
+        # reconciliation.  Only a future-dated capability (corruption)
+        # is rejected.
+        if (not isinstance(_captured, int) or _captured > _now_ms + 1_000):
             self._append_mts_event("EXIT_ONLY_HYDRATION_BLOCKED",
                                    reason="EXIT_ONLY_SNAPSHOT_FUTURE")
             return False, None, "EXIT_ONLY_SNAPSHOT_FUTURE"
@@ -6444,9 +6489,15 @@ class FuturesMonitor:
             self._validate_exit_only_position()
         if not _exit_ok:
             return
-        # [auto re-reconciliation] execution needs <= 60s proof at
-        # submit: the read-only renewal must be fresh for any exit-order
-        # action, else a typed block and zero orders.
+        # [auto re-reconciliation] the ORDER SAFETY BOUNDARY: when a
+        # bounded EXIT/RELEASE/COMBINED_EXIT signal is about to submit,
+        # synchronously take a FRESH read-only broker snapshot
+        # immediately BEFORE authorization and require the exact
+        # capability rid / locked two legs / account / session / config
+        # / release with open_orders == [].  Failure => quarantine typed
+        # reason + zero orders + NO retry.  This is NOT a timer — the
+        # proof is taken only when an exit-order signal is about to
+        # submit (no signal => no broker query).
         _exec_ctx = getattr(self, "_execution_context", None)
         if (_exec_ctx is not None and getattr(
                 _exec_ctx, "effective_mode", "")
@@ -6456,13 +6507,11 @@ class FuturesMonitor:
             if _action_value in ("EXIT", "RELEASE", "PARTIAL_EXIT",
                                  "COMBINED_EXIT", "COMBINED_EXIT_NEAR",
                                  "COMBINED_EXIT_FAR"):
-                _prov = self._read_exit_only_renewal_provenance()
-                _renewed_ms = int(_prov.get("renewed_at_ms") or 0)
-                if (int(time.time() * 1000) - _renewed_ms) > \
-                        self.EXIT_ONLY_EXECUTION_TTL_S * 1000:
+                _proof_ok, _proof_reason = self._pre_submit_exit_only_proof()
+                if not _proof_ok:
                     self._append_mts_event(
                         "ORDER_INTENT_BLOCKED", action=_action_value,
-                        reason="EXIT_ONLY_RENEWAL_STALE",
+                        reason=_proof_reason,
                         trade_id=getattr(strategy, "_trade_id", ""))
                     return
         _exec_ctx = getattr(self, "_execution_context", None)
