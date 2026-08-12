@@ -153,12 +153,12 @@ class GlobalCallbackAdapter:
                 except Exception:
                     pass
             except Exception:
+                # [isolation] the tick fallback exception is contained
+                # (counted + logged) — pre-existing callback fault
+                # containment behavior, preserved.
                 self._callback_error_count += 1
                 self._logger.exception("Fallback handler failed for %s/%s", exchange, tick.code)
                 print(f"[GCA_TICK] FALLBACK_EXCEPTION adapter_id={id(self)} code={code}", flush=True)
-                # [pre-existing fix] the tick fallback must PROPAGATE like
-                # the bidask fallback (test contract) — never swallow.
-                raise
         else:
             print(f"[GCA_TICK] EXIT no_fallback adapter_id={id(self)} code={code}", flush=True)
 

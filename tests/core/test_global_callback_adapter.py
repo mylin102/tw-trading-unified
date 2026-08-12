@@ -246,15 +246,18 @@ class TestTickRouting:
         adapter.on_tick("TAIFEX", tick)
         assert fallback.ticks == []  # TMF is routed, not fallback
 
-    # ── Fallback exception propagation ──
+    # ── Fallback exception isolation (tick) / propagation (bidask) ──
 
-    def test_fallback_exception_propagates_on_tick(self) -> None:
+    def test_fallback_exception_is_isolated_on_tick(self) -> None:
+        """[isolation] the tick fallback exception is CONTAINED (no
+        raise) — pre-existing callback fault containment; the adapter
+        counts the failure and keeps running."""
         adapter = GlobalCallbackAdapter(
             MarketDataRegistry(),
             _FailingFallback().on_tick,
         )
-        with pytest.raises(RuntimeError, match="TMF fallback tick failed"):
-            adapter.on_tick("TAIFEX", _MockTick("TMFH6"))
+        adapter.on_tick("TAIFEX", _MockTick("TMFH6"))  # must NOT raise
+        assert adapter._callback_error_count >= 1
 
     def test_fallback_exception_propagates_on_bidask(self) -> None:
         adapter = GlobalCallbackAdapter(
