@@ -127,6 +127,97 @@ def test_latest_bbo_evidence_from_events(tmp_path):
         str(tmp_path / "missing.jsonl")) is None
 
 
+def _rebound(evidence):
+    """Recompute the hash after a payload mutation.  allow_nan=True
+    because the deliberately-injected NaN case is exactly what the quote
+    validation must reject (production payloads never contain NaN)."""
+    evidence["bbo_hash"] = hashlib.sha256(json.dumps(
+        evidence["bbo_payload"], sort_keys=True, separators=(",", ":"),
+        allow_nan=True).encode()).hexdigest()
+    return evidence
+
+
+def test_exit_only_untrusted_evidence_source_or_quotes_is_na():
+    """[Dashboard] the event JSONL is untrusted: BBO source must be
+    shioaji_bidask and bid/ask must be finite positive with bid <= ask —
+    otherwise N/A with the typed reason (never a crash)."""
+    from core.exit_only_position import _json_safe  # noqa: F401
+    from ui.reconciled_exit_presentation import (
+        exit_only_upl_presentation)
+
+    ctx = _context()
+    # wrong source
+    bad_src = _evidence(ctx)
+    bad_src["bbo_payload"]["near"]["source"] = "tick_cache"
+    _rebound(bad_src)
+    assert exit_only_upl_presentation(
+        ctx, bad_src, now_ms=NOW_MS)["reason"] \
+        == "EXIT_ONLY_SOURCE_MISMATCH"
+    # NaN bid: not canonically hashable (allow_nan=False) => hash check
+    # blocks it as corrupted evidence (typed N/A, never a crash)
+    nan_bid = _evidence(ctx)
+    nan_bid["bbo_payload"]["near"]["bid"] = float("nan")
+    _rebound(nan_bid)
+    assert exit_only_upl_presentation(
+        ctx, nan_bid, now_ms=NOW_MS)["reason"] \
+        == "EXIT_ONLY_BBO_HASH_MISMATCH"
+    # non-positive ask
+    neg_ask = _evidence(ctx)
+    neg_ask["bbo_payload"]["far"]["ask"] = -1.0
+    _rebound(neg_ask)
+    assert exit_only_upl_presentation(
+        ctx, neg_ask, now_ms=NOW_MS)["reason"] \
+        == "EXIT_ONLY_BBO_INVALID"
+    # bid > ask
+    crossed = _evidence(ctx)
+    crossed["bbo_payload"]["near"]["bid"] = 102.0
+    _rebound(crossed)
+    assert exit_only_upl_presentation(
+        ctx, crossed, now_ms=NOW_MS)["reason"] \
+        == "EXIT_ONLY_BBO_INVALID"
+    # valid evidence still computes
+    ok = exit_only_upl_presentation(ctx, _evidence(ctx), now_ms=NOW_MS)
+    assert ok["kind"] == "COMPUTED" and ok["total_pnl"] == 60.0
+
+
+def test_exit_only_upl_metrics_helper(tmp_path):
+    """[Dashboard] exit_only_upl_metrics wires the event-ledger evidence
+    scan + presentation: valid ledger -> COMPUTED; empty ledger -> NA
+    BBO_MISSING; non-EXIT_ONLY context -> None."""
+    from ui.reconciled_exit_presentation import exit_only_upl_metrics
+
+    ctx = _context()
+    p = tmp_path / "events.jsonl"
+    assert exit_only_upl_metrics(ctx, str(p), now_ms=NOW_MS)[
+        "reason"] == "EXIT_ONLY_BBO_MISSING"
+    p.write_text(json.dumps(
+        {"event": "ORDER_SUBMITTED", "bbo_hash": "x",
+         "bbo_payload": {"v": 1}}) + "\n")
+    ev = _evidence(ctx)
+    p.write_text(json.dumps({"event": "ORDER_SUBMITTED", **ev}) + "\n")
+    res = exit_only_upl_metrics(ctx, str(p), now_ms=NOW_MS)
+    assert res["kind"] == "COMPUTED" and res["total_pnl"] == 60.0
+    assert exit_only_upl_metrics(
+        {"effective_mode": "paper_active"}, str(p), now_ms=NOW_MS) is None
+
+
+def test_load_exit_only_context(tmp_path, monkeypatch):
+    """[Dashboard] the primary panel reads the canonical execution
+    context: only RECONCILED_EXIT_ONLY contexts are returned."""
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    from ui.dashboard import load_exit_only_context
+
+    assert load_exit_only_context() == {}
+    (tmp_path / "execution_context.json").write_text(json.dumps({
+        "effective_mode": "reconciled_exit_only",
+        "exit_only_capability": {"legs": []}}))
+    ctx = load_exit_only_context()
+    assert ctx["effective_mode"] == "reconciled_exit_only"
+    (tmp_path / "execution_context.json").write_text(json.dumps({
+        "effective_mode": "live_ready"}))
+    assert load_exit_only_context() == {}
+
+
 def test_exit_only_valid_broker_attested_dual_bbo_calculates_pnl():
     context = _context()
 
