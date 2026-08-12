@@ -561,11 +561,22 @@ def summarize_execution_context(context, known_profile_hashes):
         and not live_order_allowed
         and profile_identity == "futures.yaml (Paper baseline)"
     )
+    # [Dashboard] RECONCILED_EXIT_ONLY is an authorized limited-exit
+    # runtime (live profile, orders disabled) — never UNKNOWN/QUARANTINED.
+    is_exit_only_runtime = (
+        requested_mode == "live"
+        and effective_mode == "reconciled_exit_only"
+        and not live_order_allowed
+        and profile_identity == "futures_live.yaml"
+    )
     if is_live_runtime:
         runtime_status = "LIVE_READY"
         warning = ""
     elif is_paper_runtime:
         runtime_status = "PAPER_ACTIVE"
+        warning = ""
+    elif is_exit_only_runtime:
+        runtime_status = "RECONCILED_EXIT_ONLY"
         warning = ""
     else:
         runtime_status = "UNKNOWN / QUARANTINED"
@@ -587,6 +598,7 @@ def summarize_execution_context(context, known_profile_hashes):
         "warning": warning,
         "is_live_runtime": is_live_runtime,
         "is_paper_runtime": is_paper_runtime,
+        "is_exit_only_runtime": is_exit_only_runtime,
         "research_evidence_is_runtime_authorization": False,
     }
 
@@ -2784,6 +2796,8 @@ def runtime_mode_badge(truth):
         return "🔴 LIVE_READY"
     if truth["is_paper_runtime"]:
         return "📝 PAPER_ACTIVE"
+    if truth.get("is_exit_only_runtime"):
+        return "🟠 RECONCILED_EXIT_ONLY"
     return "⚠️ UNKNOWN / QUARANTINED"
 
 hc = st.columns([1.5, 1, 1, 1, 1.5])
@@ -4492,10 +4506,56 @@ elif _selected_product == "TMF":
                         _trader_bal = _mts_state.get("balance")
                         _live_eq = _mts_state.get("live_equity")
 
-                        if f_live and _live_eq is not None:
+                        # [Dashboard] RECONCILED_EXIT_ONLY: UPL ONLY from
+                        # the broker-attested capability + hash-bound dual
+                        # Shioaji BBO evidence; paper/local legacy ledger
+                        # values are never a fallback.
+                        _eo_upl = None
+                        _exit_only_active = False
+                        try:
+                            _eo_ctx_f = Path(
+                                runtime_path("execution_context.json"))
+                            _eo_ctx = {}
+                            if _eo_ctx_f.exists():
+                                _eo_ctx = json.loads(
+                                    _eo_ctx_f.read_text(encoding="utf-8")) \
+                                    or {}
+                            _exit_only_active = (
+                                _eo_ctx.get("effective_mode")
+                                == "reconciled_exit_only")
+                            if _exit_only_active:
+                                from ui.reconciled_exit_presentation import (
+                                    exit_only_upl_presentation,
+                                    latest_bbo_evidence_from_events)
+                                _eo_evidence =                                     latest_bbo_evidence_from_events(os.path.join(
+                                        runtime_logs(),
+                                        "mts_spread_events.jsonl"))
+                                _eo_upl = exit_only_upl_presentation(
+                                    _eo_ctx, _eo_evidence,
+                                    now_ms=int(time.time() * 1000),
+                                    point_value=10.0,
+                                    legacy_state=_mts_state)
+                        except Exception:
+                            _eo_upl = None
+                            _exit_only_active = False
+
+                        if not _exit_only_active and f_live \
+                                and _live_eq is not None:
                             _bal = _live_eq
                             _label = "帳戶權益（券商）"
                             _source = "broker"
+                        elif _exit_only_active:
+                            _equity_row = st.columns([1, 1, 2])
+                            _equity_row[0].metric("受限平倉", "RECONCILED_EXIT_ONLY")
+                            if _eo_upl and _eo_upl.get("kind") == "COMPUTED":
+                                _equity_row[1].metric(
+                                    "UPL（券商佐證＋雙腿 BBO）",
+                                    f"{_eo_upl['total_pnl']:+,.2f}")
+                            else:
+                                _r = (_eo_upl or {}).get(
+                                    "reason", "EXIT_ONLY_BBO_MISSING")
+                                _equity_row[1].metric("UPL", "N/A")
+                                _equity_row[2].metric("原因", _r)
                         elif _has_pos or _realized != 0 or _upl != 0:
                             _bal = _init_bal + _realized + _upl
                             _label = "模擬帳戶權益（MTS）"
@@ -4514,7 +4574,40 @@ elif _selected_product == "TMF":
                             _equity_row[1].metric(_label, f"{_bal:,.0f}")
                             _pnl_total = _bal - _init_bal
                             _equity_row[2].metric("總損益", f"{_pnl_total:+,.0f}", delta=f"{_pnl_total/_init_bal*100:+.1f}%")
-                        if _mts_state.get("has_position", False):
+                        if _exit_only_active:
+                            if _eo_upl and _eo_upl.get("kind") == "COMPUTED":
+                                _cap2 = _eo_ctx.get(
+                                    "exit_only_capability") or {}
+                                _legs2 = _cap2.get("legs") or []
+                                _rows2 = []
+                                for _i2, _leg2 in enumerate(_legs2):
+                                    _key2 = "near" if _i2 == 0 else "far"
+                                    _p2 = _eo_upl.get(_key2, {})
+                                    _rows2.append({
+                                        "Leg": "近月" if _key2 == "near"
+                                        else "遠月",
+                                        "方向": _leg2.get("side"),
+                                        "口數": _leg2.get("remaining_qty"),
+                                        "進場": _leg2.get("avg_cost"),
+                                        "損益": _p2.get("pnl"),
+                                    })
+                                st.markdown(
+                                    "**MTS 受限平倉 "
+                                    "(RECONCILED_EXIT_ONLY)** · "
+                                    "僅券商佐證＋雙腿 Bid/Ask")
+                                st.dataframe(pd.DataFrame(_rows2),
+                                             width='stretch',
+                                             hide_index=True)
+                                st.caption(
+                                    f"Total UPL={_eo_upl['total_pnl']:+.2f} "
+                                    " (broker_attested_dual_bbo)")
+                            else:
+                                _r2 = (_eo_upl or {}).get(
+                                    "reason", "EXIT_ONLY_BBO_MISSING")
+                                st.warning(
+                                    f"MTS 受限平倉: UPL N/A — {_r2}；"
+                                    "不顯示本地/模擬 ledger 數值。")
+                        elif _mts_state.get("has_position", False):
                             _mts_fallback_shown = True
                             # Build per-leg status display
                             _st = _mts_state.get("state", "?")
