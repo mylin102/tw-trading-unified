@@ -101,6 +101,26 @@ def exit_only_upl_presentation(context: Any, evidence: Any, *,
             or far.get("symbol") != legs[1].get("symbol"):
         return {"kind": "NA", "reason": "EXIT_ONLY_SYMBOL_MISMATCH",
                 "total_pnl": None}
+    # [Dashboard] the event JSONL is untrusted — independently validate
+    # the BBO source and the quote shape (finite positive bid <= ask).
+    if near.get("source") != "shioaji_bidask" \
+            or far.get("source") != "shioaji_bidask":
+        return {"kind": "NA", "reason": "EXIT_ONLY_SOURCE_MISMATCH",
+                "total_pnl": None}
+    import math as _math
+    for _rec in (near, far):
+        _bid = _rec.get("bid")
+        _ask = _rec.get("ask")
+        if (not isinstance(_bid, (int, float)) or isinstance(_bid, bool)
+                or not _math.isfinite(float(_bid)) or float(_bid) <= 0
+                or not isinstance(_ask, (int, float))
+                or isinstance(_ask, bool)
+                or not _math.isfinite(float(_ask)) or float(_ask) <= 0):
+            return {"kind": "NA", "reason": "EXIT_ONLY_BBO_INVALID",
+                    "total_pnl": None}
+        if float(_bid) > float(_ask):
+            return {"kind": "NA", "reason": "EXIT_ONLY_BBO_INVALID",
+                    "total_pnl": None}
     _now = int(now_ms)
     for _rec in (near, far):
         _ts = _rec.get("exchange_ts")
@@ -132,3 +152,19 @@ def exit_only_upl_presentation(context: Any, evidence: Any, *,
             "far": {"pnl": round(_far_pnl, 6)},
             "total_pnl": round(_near_pnl + _far_pnl, 6),
             "source": "broker_attested_dual_bbo"}
+
+
+def exit_only_upl_metrics(context: Any, events_path: Any, *,
+                          now_ms: int, point_value: float = 10.0,
+                          legacy_state: Any = None) -> Optional[dict]:
+    """[Dashboard] exit-only UPL for the MTS panels: scan the event
+    ledger for the latest hash-bound dual BBO evidence and present it
+    against the capability.  None for non-EXIT_ONLY contexts; NA dict
+    with the typed reason otherwise."""
+    if not isinstance(context, dict) \
+            or context.get("effective_mode") != "reconciled_exit_only":
+        return None
+    evidence = latest_bbo_evidence_from_events(events_path)
+    return exit_only_upl_presentation(
+        context, evidence, now_ms=now_ms, point_value=point_value,
+        legacy_state=legacy_state)

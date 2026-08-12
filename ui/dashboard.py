@@ -533,6 +533,21 @@ def save_yaml(path, data):
         yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 # 2026-08-10 Hermes Agent: render runtime mode only from the canonical execution context.
+def load_exit_only_context():
+    """[Dashboard] canonical execution context when the active runtime is
+    RECONCILED_EXIT_ONLY (capability + mode); {} otherwise — the primary
+    MTS UPL panel must never read paper/local PnL in this mode."""
+    try:
+        _p = Path(runtime_path("execution_context.json"))
+        if _p.exists():
+            _ctx = json.loads(_p.read_text(encoding="utf-8")) or {}
+            if _ctx.get("effective_mode") == "reconciled_exit_only":
+                return _ctx
+    except Exception:
+        pass
+    return {}
+
+
 def summarize_execution_context(context, known_profile_hashes):
     """Return fail-closed dashboard truth for the active futures runtime."""
     context = context if isinstance(context, dict) else {}
@@ -3980,7 +3995,36 @@ elif _selected_product == "TMF":
                         _nr = _r
                         _nr_label = f"{_r:+,.0f} TWD (已平倉)"
                 _tr = (_nr or 0) + (_fr or 0)
-                if _mts_perf_scope["ok"]:
+                if active_runtime_truth.get("is_exit_only_runtime"):
+                    # [Dashboard] 受限平倉：UPL 僅來自 broker-attested
+                    # capability × hash-bound 雙腿 Shioaji BBO（event
+                    # JSONL 為 untrusted — 獨立驗證 source/bid/ask）。
+                    from ui.reconciled_exit_presentation import (
+                        exit_only_upl_metrics)
+                    _eo_upl = exit_only_upl_metrics(
+                        load_exit_only_context(), _events_path_scope,
+                        now_ms=int(time.time() * 1000), point_value=10.0,
+                        legacy_state=_mts_state)
+                    if _eo_upl and _eo_upl.get("kind") == "COMPUTED":
+                        _u1.metric("近月 UPL",
+                                   f"{_eo_upl['near']['pnl']:+,.2f} TWD")
+                        _u2.metric("遠月 UPL",
+                                   f"{_eo_upl['far']['pnl']:+,.2f} TWD")
+                        _u3.metric("總計 UPL",
+                                   f"{_eo_upl['total_pnl']:+,.2f} TWD")
+                        st.caption(
+                            "來源：broker-attested capability × 雙腿 "
+                            "Shioaji Bid/Ask（hash-bound）")
+                    else:
+                        _r = (_eo_upl or {}).get(
+                            "reason", "EXIT_ONLY_BBO_MISSING")
+                        _u1.metric("近月 UPL", "N/A")
+                        _u2.metric("遠月 UPL", "N/A")
+                        _u3.metric("總計 UPL", "N/A")
+                        st.warning(
+                            f"⚠️ MTS UPL N/A — 受限平倉等待新鮮券商對帳"
+                            f"與雙腿 BBO（{_r}）")
+                elif _mts_perf_scope["ok"]:
                     _u1.metric("近月 UPL", _nr_label)
                     _u2.metric("遠月 UPL", _fr_label)
                     _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
