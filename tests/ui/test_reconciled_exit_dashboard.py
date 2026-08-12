@@ -432,3 +432,57 @@ def test_exit_only_primary_panel_skips_legacy_state_and_daily_jsonl():
     assert "_mts_state_file = None if _exit_only_dashboard" in source
     assert "if not _exit_only_dashboard and os.path.exists(_fills_path):" in source
     assert "受限平倉模式—等待新鮮券商對帳與雙腿 BBO" in source
+
+
+def test_existing_capability_can_build_narrow_re_attestation_payload():
+    """An existing exit-only capability must show an update path whose
+    request carries exactly its two currently attested legs; user input
+    cannot widen codes, side, or quantities."""
+    from ui.dashboard import build_exit_only_attestation_request
+
+    cap = _context()["exit_only_capability"]
+    payload = build_exit_only_attestation_request(
+        cap, operator="operator", trade_id="trade-refresh",
+        evidence="fresh reconciliation requested", now_ms=NOW_MS)
+
+    assert payload["action"] == "ATTEST_EXIT_ONLY"
+    assert payload["operator"] == "operator"
+    assert payload["trade_id"] == "trade-refresh"
+    assert payload["expected_legs"] == [
+        {"symbol": "TMFH6", "side": "sell", "remaining_qty": 2},
+        {"symbol": "TMFI6", "side": "buy", "remaining_qty": 2},
+    ]
+
+
+def test_re_attestation_command_is_atomic_and_pending_is_not_overwritten(tmp_path):
+    """The dashboard writer uses the existing O_EXCL command protocol:
+    once a request is pending, an update must never replace it."""
+    from ui.dashboard import (
+        build_exit_only_attestation_request,
+        write_exit_only_attestation_request,
+    )
+
+    cap = _context()["exit_only_capability"]
+    first = build_exit_only_attestation_request(
+        cap, operator="operator", trade_id="trade-refresh",
+        evidence="first request", now_ms=NOW_MS)
+    second = build_exit_only_attestation_request(
+        cap, operator="operator", trade_id="trade-refresh",
+        evidence="must not overwrite", now_ms=NOW_MS + 1)
+    path = tmp_path / "commands" / "reconciled_exit_attestation.json"
+
+    assert write_exit_only_attestation_request(path, first) is True
+    original = path.read_text(encoding="utf-8")
+    assert write_exit_only_attestation_request(path, second) is False
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_attestation_update_controls_are_present_without_changing_live_paper_paths():
+    source = (Path(__file__).parents[2] / "ui" / "dashboard.py").read_text()
+
+    assert "更新受限平倉對帳" in source
+    assert "build_exit_only_attestation_request" in source
+    assert "write_exit_only_attestation_request" in source
+    # Existing runtime truth branches remain distinct.
+    assert 'effective_mode == "live_ready"' in source
+    assert 'effective_mode == "paper_active"' in source
