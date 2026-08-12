@@ -247,6 +247,35 @@ def test_exit_only_legacy_paper_data_is_never_a_pnl_fallback():
     assert result["total_pnl"] is None
 
 
+def test_exit_only_malformed_capability_leg_is_na():
+    """[P1 closure] malformed capability legs (bad side, non-numeric or
+    non-positive qty, non-numeric cost) => typed
+    EXIT_ONLY_CAPABILITY_INVALID — never float-coerced; valid legs
+    still compute."""
+    from ui.reconciled_exit_presentation import (
+        exit_only_upl_presentation)
+
+    def _cap_with(**over):
+        c = _context()
+        c["exit_only_capability"] = dict(c["exit_only_capability"])
+        legs = [dict(l) for l in c["exit_only_capability"]["legs"]]
+        legs[0].update(over)
+        c["exit_only_capability"]["legs"] = legs
+        return c
+
+    for _over in ({"side": "SHORT"}, {"side": "LONG"},
+                  {"remaining_qty": "abc"}, {"remaining_qty": 0},
+                  {"remaining_qty": -2}, {"avg_cost": None},
+                  {"avg_cost": "nan"}):
+        res = exit_only_upl_presentation(
+            _cap_with(**_over), _evidence(_context()), now_ms=NOW_MS)
+        assert res["kind"] == "NA", _over
+        assert res["reason"] == "EXIT_ONLY_CAPABILITY_INVALID", _over
+    ok = exit_only_upl_presentation(
+        _context(), _evidence(_context()), now_ms=NOW_MS)
+    assert ok["kind"] == "COMPUTED" and ok["total_pnl"] == 60.0
+
+
 def test_exit_only_missing_or_stale_dual_bbo_is_na():
     context = _context()
     stale = _evidence(context, near_ts=NOW_MS - 16_000,
