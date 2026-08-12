@@ -829,6 +829,33 @@ def test_s2_audit_blocked_event_canonical_failure_payload(monkeypatch):
     assert "token" not in json.dumps(ev["bbo_input_v2"])
 
 
+def test_s2_audit_seq_nan_binding_no_crash(monkeypatch):
+    """[S2 audit] optional seq=NaN on otherwise-valid evidence must not
+    crash the valid binding: sanitized to None, the decision binds and
+    the cap-bound orders reach the adapter; the submitted event payload
+    serializes with allow_nan=False."""
+    import json
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    slots = _bbo_slots()
+    slots["TMF"]["seq"] = float("nan")
+    monitor._exit_only_bbo_cache = {
+        "near": dict(slots["TMF"]), "far": dict(slots["TMF_FAR"])}
+    monitor._hydrate_exit_only_position()
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+    monitor._submit_mts_order_signal(
+        signal, _bound_strategy(trade_id="mts-s2seq-1"), {},
+        __import__("datetime").datetime.now())
+    assert len(monitor.api.calls) == 2  # valid decision, no crash
+    submitted = [e for e in events if e[0] == "ORDER_SUBMITTED"]
+    assert submitted and submitted[0][1].get("bbo_payload")
+    json.dumps(submitted[0][1]["bbo_payload"], allow_nan=False)
+
+
 def test_s2_audit_nan_evidence_blocked_event_persists(monkeypatch):
     """[S2 audit] a blocked decision with NaN bid evidence still persists
     the canonical bbo_input_v2 (json.dumps allow_nan=False safe) and

@@ -143,6 +143,34 @@ def test_hydrate_preserves_broker_costs_and_trade_id_no_pnl():
 
 # ── BBO binding ───────────────────────────────────────────────────────────
 
+def test_bbo_binding_optional_raw_fields_json_safe():
+    """[S2 audit] NaN/+Inf in optional raw fields (seq, received_at_ms)
+    must never crash the valid binding: sanitized to None, canonical
+    payload passes json.dumps(allow_nan=False); strict bid/ask/
+    exchange_ts/code/source validation is unchanged.  Non-string
+    identity values => BBO_IDENTITY_MISSING (never a hash crash)."""
+    import json as _json
+    from core.exit_only_position import build_bbo_binding
+
+    kw = _s2_kwargs()
+    for _field in ("seq", "received_at_ms"):
+        for _val in (float("nan"), float("inf"), float("-inf")):
+            slots = _pure_bbo_slots()
+            slots["near"][_field] = _val
+            binding, reason = build_bbo_binding(slots, **kw)
+            assert reason is None, (_field, _val, reason)
+            assert binding and binding["bbo_hash"]
+            _s = _json.dumps(binding["bbo_payload"], allow_nan=False)
+            assert "NaN" not in _s and "Infinity" not in _s, (_field, _val)
+            assert binding["bbo_payload"]["near"][_field] is None
+    # non-string identity value -> typed block, never a hash crash
+    bad_id = _s2_kwargs(identity={
+        "reconciliation_id": "x", "snapshot_hash": 12345,
+        "config_hash": "d", "release_sha": "e", "session_id": "c"})
+    assert build_bbo_binding(_pure_bbo_slots(), **bad_id)[1] \
+        == "BBO_IDENTITY_MISSING"
+
+
 def test_bbo_binding_rejects_float_or_seconds_timestamps():
     """[S2 audit] exchange_ts_ms must be type(x) is int (not bool) and
     >= 1e12 epoch-ms; float seconds / float epoch-ms / integer seconds /
