@@ -18,7 +18,7 @@ from typing import Any
 
 from core.mode_transition import ExecutionContext, ModeTransitionState
 
-SNAPSHOT_TTL_MS = 600_000
+SNAPSHOT_TTL_MS = 60_000
 _HEX_32 = re.compile(r"^[0-9a-f]{32}$")
 _HEX_40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
