@@ -282,9 +282,81 @@ class TestBidAskRouting:
         bidask = _MockBidAsk("TMFH6")
         adapter.on_bidask("TAIFEX", bidask)
 
-        # Bidask routed via on_tick (TickHandler protocol)
+        # [RED] routed BidAsk reaches on_bidask — NEVER on_tick
+        assert handler.bidasks == [("near", bidask)]
+        assert handler.ticks == []
+        assert fallback.bidasks == []
+
+    def test_routed_bidask_never_hits_on_tick(self) -> None:
+        """[RED] a routed BidAsk must be delivered to the handler's
+        dedicated on_bidask — on_tick must NOT receive it."""
+        registry = MarketDataRegistry()
+        handler = _RouteSpy()
+        registry.bind_contract(
+            ContractIdentity("TAIFEX", "TMFH6"),
+            ContractRoute(handler=handler, leg="near"),
+        )
+        fallback = _FallbackSpy()
+        adapter = GlobalCallbackAdapter(registry, fallback.on_tick,
+                                        fallback.on_bidask)
+
+        bidask = _MockBidAsk("TMFH6")
+        adapter.on_bidask("TAIFEX", bidask)
+
+        assert handler.bidasks == [("near", bidask)]
+        assert handler.ticks == []
+        assert fallback.bidasks == []
+
+    def test_routed_bidask_legacy_handler_without_on_bidask_uses_on_tick(
+            self) -> None:
+        """[RED] a legacy TickHandler-only route (no on_bidask) keeps the
+        on_tick(leg, bidask) routing — backward compatible."""
+        registry = MarketDataRegistry()
+
+        class _TickOnly:
+            def __init__(self) -> None:
+                self.ticks: list[tuple[SpreadLeg, Any]] = []
+
+            def on_tick(self, leg: SpreadLeg, tick: Any) -> None:
+                self.ticks.append((leg, tick))
+
+        handler = _TickOnly()
+        registry.bind_contract(
+            ContractIdentity("TAIFEX", "TMFH6"),
+            ContractRoute(handler=handler, leg="near"),
+        )
+        fallback = _FallbackSpy()
+        adapter = GlobalCallbackAdapter(registry, fallback.on_tick,
+                                        fallback.on_bidask)
+
+        bidask = _MockBidAsk("TMFH6")
+        adapter.on_bidask("TAIFEX", bidask)
+
         assert handler.ticks == [("near", bidask)]
         assert fallback.bidasks == []
+
+    def test_always_call_fallback_delivers_bidask_to_both(self) -> None:
+        """[RED] always_call_fallback=True delivers a routed BidAsk to
+        BOTH the handler (on_bidask) and the fallback."""
+        registry = MarketDataRegistry()
+        handler = _RouteSpy()
+        registry.bind_contract(
+            ContractIdentity("TAIFEX", "TMFH6"),
+            ContractRoute(handler=handler, leg="near"),
+        )
+        fallback = _FallbackSpy()
+        adapter = GlobalCallbackAdapter(
+            registry,
+            fallback.on_tick,
+            fallback.on_bidask,
+            always_call_fallback=True,
+        )
+
+        bidask = _MockBidAsk("TMFH6")
+        adapter.on_bidask("TAIFEX", bidask)
+
+        assert handler.bidasks == [("near", bidask)]
+        assert fallback.bidasks == [("TAIFEX", bidask)]
 
     def test_unrouted_bidask_delegates_to_fallback(self) -> None:
         registry = MarketDataRegistry()
