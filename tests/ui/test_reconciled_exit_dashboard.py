@@ -437,7 +437,7 @@ def test_exit_only_primary_panel_skips_legacy_state_and_daily_jsonl():
 def test_existing_capability_can_build_narrow_re_attestation_payload():
     """An existing exit-only capability must show an update path whose
     request carries exactly its two currently attested legs; user input
-    cannot widen codes, side, or quantities."""
+    cannot widen codes, side, quantities, or its audit Trade ID."""
     from ui.dashboard import build_exit_only_attestation_request
 
     cap = _context()["exit_only_capability"]
@@ -447,7 +447,10 @@ def test_existing_capability_can_build_narrow_re_attestation_payload():
 
     assert payload["action"] == "ATTEST_EXIT_ONLY"
     assert payload["operator"] == "operator"
-    assert payload["trade_id"] == "trade-refresh"
+    # The source capability, not an update-form caller, owns audit identity.
+    assert payload["trade_id"] == "trade-1"
+    # ``avg_cost`` in the capability is presentation evidence only; the
+    # attestation command carries exactly the monitor's expected-leg schema.
     assert payload["expected_legs"] == [
         {"symbol": "TMFH6", "side": "sell", "remaining_qty": 2},
         {"symbol": "TMFI6", "side": "buy", "remaining_qty": 2},
@@ -483,6 +486,8 @@ def test_attestation_update_controls_are_present_without_changing_live_paper_pat
     assert "更新受限平倉對帳" in source
     assert "build_exit_only_attestation_request" in source
     assert "write_exit_only_attestation_request" in source
+    assert "對帳 Trade ID（鎖定）" in source
+    assert 'key="exit_only_update_trade_id"' not in source
     # Existing runtime truth branches remain distinct.
     assert 'effective_mode == "live_ready"' in source
     assert 'effective_mode == "paper_active"' in source
