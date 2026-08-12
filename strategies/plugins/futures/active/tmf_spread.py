@@ -4075,7 +4075,18 @@ class TMFSpread(StrategyBase):
         near_width = near_ask - near_bid
         far_width = far_ask - far_bid
 
-        if near_width > self._max_spread_width or far_width > self._max_spread_width:
+        # [P0b] LEG-SCOPED width gate (aligns with the decoupled leg
+        # freshness check): a single-leg RELEASE only crosses the
+        # released leg's spread — a wide quote on the OTHER leg must not
+        # block it.  The default (no release / non-RELEASE decision)
+        # keeps checking BOTH legs (conservative).
+        _rel_leg = None
+        if _decision is not None and _decision.action == LifecycleAction.RELEASE:
+            _rel_leg = _decision.release_leg
+        _check_near = _rel_leg is None or _rel_leg == Leg.NEAR
+        _check_far = _rel_leg is None or _rel_leg == Leg.FAR
+        if ((_check_near and near_width > self._max_spread_width)
+                or (_check_far and far_width > self._max_spread_width)):
             self._set_eval(skip_reason="WIDE_SPREAD_WIDTH", near_width=near_width, far_width=far_width)
             logger.warning("[MTS_RELEASE_BLOCKED] reason=WIDE_SPREAD_WIDTH near=%.1f far=%.1f max=%.1f", near_width, far_width, self._max_spread_width)
             return None
