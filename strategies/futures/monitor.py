@@ -2904,7 +2904,7 @@ class FuturesMonitor:
             console.print(f"[dim][FuturesMonitor] Far bar save failed (non-fatal): {e}[/dim]")
 
     # ── Safety Stop (exchange-side protection) ──
-    def _persist_execution_context(self):
+    def _persist_execution_context(self) -> bool:
         """[Step 6] persist the execution context to the canonical
         dashboard-readable file ({TRADING_RUNTIME_DIR}/execution_context.json)
         atomically. A failure never enables LIVE — the reader is
@@ -2916,7 +2916,10 @@ class FuturesMonitor:
         synchronized to the exact same current immutable object.  On
         persist failure both stay on the PRIOR context (fail-closed) —
         a new allow state is never exposed through the chokepoints and
-        the OrderManager never builds orders against a stale mode."""
+        the OrderManager never builds orders against a stale mode.
+        [P1] returns True only when the canonical persist succeeded and
+        both consumers were synced; False on persist failure (prior
+        context retained everywhere)."""
         _ctx = getattr(self, "_execution_context", None)
         try:
             from core.execution_context_state import persist_execution_context
@@ -2929,7 +2932,7 @@ class FuturesMonitor:
             console.print(f"[dim]⚠️ exec ctx persist failed: {_pexc} "
                           f"(file keeps last good state)[/dim]")
             # fail-closed: client/order_mgr keep the PRIOR context
-            return
+            return False
         _client = getattr(self, "client", None)
         if _client is not None:
             try:
@@ -2946,6 +2949,7 @@ class FuturesMonitor:
                 # Test/legacy order managers without a settable context stay
                 # fail-closed on their own boundary.
                 pass
+        return True
 
     def _quarantine_mts_entry_partial_submission(
             self, *, trade_id: str, submitted_order, failed_order) -> None:
@@ -3201,9 +3205,14 @@ class FuturesMonitor:
                 f"[red]⛔ [OPERATOR_ATTESTATION] rejected: "
                 f"{_exc.code}[/red]")
             return None, _exc.code
-        self._execution_context = apply_exit_only(
-            self._execution_context, _cap)
-        self._persist_execution_context()
+        _prior_ctx = self._execution_context
+        self._execution_context = apply_exit_only(_prior_ctx, _cap)
+        if self._persist_execution_context() is False:
+            # [P1] persist failed: restore the exact prior immutable
+            # context (client/order_mgr were never synced — fail-closed)
+            # and emit NO OPERATOR_ATTESTATION success event.
+            self._execution_context = _prior_ctx
+            return None, "EXECUTION_CONTEXT_PERSIST_FAILED"
         self._append_mts_event("OPERATOR_ATTESTATION", **_record)
         console.print(
             f"[green]✅ [OPERATOR_ATTESTATION] {trade_id} -> "
