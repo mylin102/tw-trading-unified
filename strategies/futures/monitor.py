@@ -2921,6 +2921,42 @@ class FuturesMonitor:
         both consumers were synced; False on persist failure (prior
         context retained everywhere)."""
         _ctx = getattr(self, "_execution_context", None)
+        # [P1 all-or-nothing] each existing consumer must accept context
+        # assignment; a KNOWN inability is a typed failure BEFORE any
+        # canonical persist (nothing is written, nothing changes).
+        _consumers = []
+        _client = getattr(self, "client", None)
+        if _client is not None:
+            _consumers.append((_client, "_execution_context"))
+        _order_mgr = getattr(self, "order_mgr", None)
+        if _order_mgr is not None:
+            _consumers.append((_order_mgr, "execution_context"))
+
+        def _set_and_verify(consumer, attr, value) -> bool:
+            try:
+                setattr(consumer, attr, value)
+            except (AttributeError, TypeError):
+                return False
+            return getattr(consumer, attr, None) is value
+
+        _prior_refs = [(c, a, getattr(c, a, None)) for c, a in _consumers]
+        for _consumer, _attr, _prior in _prior_refs:
+            if not _set_and_verify(_consumer, _attr, _prior):
+                # known inability to sync a consumer: fail-closed,
+                # nothing persisted, no success event
+                return False
+
+        # capture the prior canonical state for best-effort rollback
+        _prior_file_bytes = None
+        _rf = None
+        try:
+            _rf = runtime_path("execution_context.json")
+            if os.path.exists(_rf):
+                with open(_rf, "rb") as _fr:
+                    _prior_file_bytes = _fr.read()
+        except Exception:
+            _prior_file_bytes = None
+
         try:
             from core.execution_context_state import persist_execution_context
             _payload = _ctx.to_dict()
@@ -2933,22 +2969,24 @@ class FuturesMonitor:
                           f"(file keeps last good state)[/dim]")
             # fail-closed: client/order_mgr keep the PRIOR context
             return False
-        _client = getattr(self, "client", None)
-        if _client is not None:
-            try:
-                _client._execution_context = _ctx
-            except (AttributeError, TypeError):
-                # Non-Shioaji test/legacy adapters cannot receive this optional
-                # reference. Their own order boundary remains fail-closed.
-                pass
-        _order_mgr = getattr(self, "order_mgr", None)
-        if _order_mgr is not None:
-            try:
-                _order_mgr.execution_context = _ctx
-            except (AttributeError, TypeError):
-                # Test/legacy order managers without a settable context stay
-                # fail-closed on their own boundary.
-                pass
+        for _consumer, _attr, _prior in _prior_refs:
+            if not _set_and_verify(_consumer, _attr, _ctx):
+                # [P1] unexpected post-persist sync failure: restore ALL
+                # in-memory consumers to their prior references (never a
+                # success event with split context) and best-effort
+                # restore the prior canonical state.
+                for _c2, _a2, _p2 in _prior_refs:
+                    try:
+                        setattr(_c2, _a2, _p2)
+                    except Exception:
+                        pass
+                if _prior_file_bytes is not None and _rf is not None:
+                    try:
+                        with open(_rf, "wb") as _fw:
+                            _fw.write(_prior_file_bytes)
+                    except Exception:
+                        pass
+                return False
         return True
 
     def _quarantine_mts_entry_partial_submission(
