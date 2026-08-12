@@ -547,6 +547,11 @@ def _monitor(ctx, adapter=None, mode="live", *, dry_run=False,
     monitor._append_mts_event = lambda t, **k: events.append((t, k))
     monitor._save_orders_file_wrapper = lambda: True
     monitor._persist_execution_context = lambda: None  # isolate ctx file
+    monitor._maybe_renew_exit_only = lambda: None  # [renewal] isolate
+    # the tick-driven auto re-reconciliation hook in E2E
+    monitor._read_exit_only_renewal_provenance = lambda: {
+        "renewed_at_ms": int(time.time() * 1000)}  # [renewal] fresh proof
+    # so the submit TTL gate passes in E2E (renewal not under test)
     monitor._record_gateway_intent = lambda dv: None    # isolate durable ledger
     if adapter is None:
         adapter = _FakeAdapter()
