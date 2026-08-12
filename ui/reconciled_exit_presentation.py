@@ -75,6 +75,12 @@ def exit_only_upl_presentation(context: Any, evidence: Any, *,
     # finite numeric.
     import math as _math
     for _leg in legs:
+        # [P1 gap] malformed leg CONTAINER (None/str/list) must be typed
+        # NA, never AttributeError on .get
+        if not isinstance(_leg, dict):
+            return {"kind": "NA",
+                    "reason": "EXIT_ONLY_CAPABILITY_INVALID",
+                    "total_pnl": None}
         _side = _leg.get("side")
         _qty = _leg.get("remaining_qty")
         _cost = _leg.get("avg_cost")
