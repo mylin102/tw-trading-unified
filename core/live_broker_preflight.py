@@ -206,6 +206,60 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
     }
 
 
+def _to_epoch_ms(value: Any) -> int:
+    """Canonical epoch-ms INTEGER from the preflight's ISO captured_at.
+    A malformed value degrades to 0 (the gate's freshness check then
+    fails closed — never a manual timestamp)."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        _dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return int(_dt.timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def derive_canonical_gate_artifact(response: dict[str, Any]) -> dict[str, Any]:
+    """Derive the FLAT canonical gate artifact from the SAME read-only
+    preflight response (no manual values): source=live_broker, mode=live,
+    positions/open_orders, account_identity_hash, scope=futopt,
+    captured_at (epoch-ms int), available_margin and the content-
+    addressed canonical_input_hash (sha256 of the sorted JSON of the
+    account hash + futures positions + open_orders + available_margin +
+    captured_at).  The deployment gate and the --margin-evidence CLI
+    consume this flat shape unchanged; the paper path is untouched."""
+    snapshot = response.get("snapshot") or {}
+    _acct = snapshot.get("account_id_hash")
+    _positions = snapshot.get("positions")
+    _open_orders = snapshot.get("open_orders")
+    _margin = ((snapshot.get("margin") or {}).get("available_margin"))
+    _cap_ms = _to_epoch_ms(response.get("captured_at"))
+    _canonical_input = {
+        "account_identity_hash": _acct,
+        "positions": _positions,
+        "open_orders": _open_orders,
+        "available_margin": _margin,
+        "captured_at": _cap_ms,
+    }
+    _canonical_input_hash = hashlib.sha256(
+        json.dumps(_canonical_input, sort_keys=True, ensure_ascii=False,
+                   default=str).encode("utf-8")).hexdigest()
+    return {
+        "source": "live_broker",
+        "mode": "live",
+        "positions": _positions,
+        "open_orders": _open_orders,
+        "account_identity_hash": _acct,
+        "scope": "futopt",
+        "captured_at": _cap_ms,
+        "available_margin": _margin,
+        "canonical_input_hash": _canonical_input_hash,
+        "session_id": str(response.get("request_id") or ""),
+    }
+
+
 def run_once(api_factory: Any, *, request_id: str | None = None, product: str = "TMF") -> dict[str, Any]:
     """Run a guarded preflight and persist its success or failure snapshot."""
     if os.environ.get(REQUEST_ENV) != "1":
@@ -259,6 +313,9 @@ def run_once(api_factory: Any, *, request_id: str | None = None, product: str = 
                     pass
         _atomic_json(diag / f"broker_snapshot_{request_id}.json", response)
         _atomic_json(diag / "broker_snapshot_latest.json", response)
+        if response.get("snapshot") is not None:
+            _atomic_json(diag / "broker_snapshot_canonical.json",
+                         derive_canonical_gate_artifact(response))
         return response
     finally:
         try:
