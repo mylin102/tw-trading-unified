@@ -51,6 +51,14 @@ _ACCEPTABLE_STALE = {
     # LIVE_QUARANTINED; the post-startup certificate/gate still controls any
     # later LIVE_READY transition.
     "AUTH_SESSION_UNAVAILABLE",
+    # A stale EXIT_ONLY quarantine (the broker was NOT flat at the last
+    # renewal / the capability legs mismatched) is retryable: the bootstrap
+    # re-verifies the CURRENT flatness with a fresh canonical live_broker
+    # snapshot (guard_flat_no_pending) and the sealed profile before any
+    # reset; the archived stale audits never promote LIVE.  Refusing them
+    # would deadlock the recovery (only a manual ctx deletion could clear).
+    "BROKER_NOT_FLAT",
+    "EXIT_ONLY_RENEWAL:EXIT_ONLY_POSITION_MISMATCH",
 }
 _BLOCKING_AUDIT = {"SAFETY_STOP_RECONCILE_PENDING"}
 _BOOTSTRAP_REASON = "REDEPLOY_BOOTSTRAP"
