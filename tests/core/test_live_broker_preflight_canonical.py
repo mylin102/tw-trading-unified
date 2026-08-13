@@ -168,10 +168,10 @@ def test_safe_positions_preserves_direction_and_avg_cost():
     rows = _safe_positions(_Api(), object())
     by_code = {r["code"]: r for r in rows}
     assert by_code["TMFH6"]["qty"] == 1
-    assert by_code["TMFH6"]["direction"] == "Sell"
+    assert by_code["TMFH6"]["direction"] == "sell"
     assert by_code["TMFH6"]["avg_cost"] == 46077.0
     assert by_code["TMFH6"]["pnl"] == 1850.0
-    assert by_code["TMFI6"]["direction"] == "Buy"
+    assert by_code["TMFI6"]["direction"] == "buy"
     assert by_code["TMFI6"]["avg_cost"] == 45231.0
 
 
@@ -539,4 +539,123 @@ def test_atomic_json_normalizes_int_like_action_key(tmp_path):
     _atomic_json(p, {_IntLikeAction(3): {"n": 1}})
     data = json.loads(p.read_text(encoding="utf-8"))
     assert data == {"_IntLikeAction": {"n": 1}}
+
+
+class _CEnumAction:
+    """Simulated Shioaji C-extension Action with a usable .name."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __str__(self):
+        raise TypeError("first argument must be a string, "
+                        "not builtins.Action")
+
+    def __repr__(self):
+        raise TypeError("first argument must be a string, "
+                        "not builtins.Action")
+
+
+class _IntLikeValueAction(int):
+    """Simulated int-like C-extension Action: .name unusable (raises),
+    direction carried by .value; str()/repr() raise."""
+
+    def __new__(cls, value):
+        obj = super().__new__(cls, 1)
+        obj.value = value
+        return obj
+
+    @property
+    def name(self):
+        raise TypeError("first argument must be a string, "
+                        "not builtins.Action")
+
+    def __str__(self):
+        raise TypeError("first argument must be a string, "
+                        "not builtins.Action")
+
+    def __repr__(self):
+        raise TypeError("first argument must be a string, "
+                        "not builtins.Action")
+
+
+def test_canonical_direction_maps_action_buy_sell():
+    """Shioaji Action enums map to canonical buy/sell via safe
+    name/value access (never str/repr, never the generic type name)."""
+    from core.live_broker_preflight import _canonical_direction
+
+    assert _canonical_direction(_CEnumAction("Buy")) == "buy"
+    assert _canonical_direction(_CEnumAction("Sell")) == "sell"
+    assert _canonical_direction(_IntLikeValueAction("Buy")) == "buy"
+    assert _canonical_direction(_IntLikeValueAction("Sell")) == "sell"
+    assert _canonical_direction(_CEnumAction("buy")) == "buy"
+
+
+def test_canonical_direction_unknown_is_none():
+    """Unknown/generic directions are None (fail-closed: the dashboard
+    and attestation reject a missing/invalid direction)."""
+    from core.live_broker_preflight import _canonical_direction
+
+    assert _canonical_direction(None) is None
+    assert _canonical_direction(_CEnumAction("Action")) is None
+    assert _canonical_direction("forward") is None
+
+
+def test_safe_positions_emits_canonical_direction():
+    """_safe_positions emits canonical buy/sell (never 'Action')."""
+    from core.live_broker_preflight import _safe_positions
+
+    class _Pos:
+        def __init__(self, code, quantity, price, direction, pnl):
+            self.code = code
+            self.quantity = quantity
+            self.price = price
+            self.direction = direction
+            self.pnl = pnl
+
+    class _Api:
+        def list_positions(self, account):
+            return [_Pos("TMFH6", 1, 46077.0, _CEnumAction("Sell"), 1850.0),
+                    _Pos("TMFI6", 1, 45231.0,
+                         _IntLikeValueAction("Buy"), -1740.0)]
+
+    rows = _safe_positions(_Api(), object())
+    by_code = {r["code"]: r for r in rows}
+    assert by_code["TMFH6"]["direction"] == "sell"
+    assert by_code["TMFI6"]["direction"] == "buy"
+
+
+def test_dashboard_authorization_generation_uses_canonical_direction():
+    """Canonical buy/sell directions flow into the dashboard
+    attestation legs without rejection."""
+    from core.live_broker_preflight import _safe_positions
+    from ui.dashboard import build_exit_only_attestation_request
+
+    class _Pos:
+        def __init__(self, code, quantity, price, direction, pnl):
+            self.code = code
+            self.quantity = quantity
+            self.price = price
+            self.direction = direction
+            self.pnl = pnl
+
+    class _Api:
+        def list_positions(self, account):
+            return [_Pos("TMFH6", 1, 46077.0, _CEnumAction("Sell"), 1850.0),
+                    _Pos("TMFI6", 1, 45231.0,
+                         _IntLikeValueAction("Buy"), -1740.0)]
+
+    rows = _safe_positions(_Api(), object())
+    legs = [
+        {"symbol": r["code"], "side": r["direction"],
+         "remaining_qty": r["qty"]}
+        for r in rows
+        if r["direction"] in ("buy", "sell") and r["qty"]
+    ]
+    assert len(legs) == 2
+    assert all(l["side"] in ("buy", "sell") for l in legs)
+    payload = build_exit_only_attestation_request(
+        None, operator="dashboard-confirmed", trade_id="ORD-1",
+        evidence="dashboard-confirmed", expected_legs=legs)
+    assert payload["expected_legs"] == legs
 
