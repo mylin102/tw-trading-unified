@@ -346,3 +346,38 @@ def test_retry_refuses_profile_mismatch(tmp_path, monkeypatch):
     assert r.returncode != 0
     assert json.loads((e["rt"] / "execution_context.json").read_text()) \
         == _FAILED_GATE_CTX
+
+def test_apply_archives_and_resets_stale_exit_only_quarantine_ctx(env):
+    """A stale EXIT_ONLY quarantine (broker-not-flat / position-mismatch
+    recorded before the broker went flat) is retryable: the fresh
+    canonical flat evidence supersedes it.  The reset still archives the
+    old ctx and only ever rewrites LIVE_QUARANTINED +
+    REDEPLOY_BOOTSTRAP (never LIVE_READY, never a session)."""
+    stale = {**_STALE_CTX,
+             "audit_reasons": ["BROKER_NOT_FLAT",
+                               "EXIT_ONLY_RENEWAL:EXIT_ONLY_POSITION_MISMATCH"]}
+    _write_ctx(env["rt"], stale)
+
+    r = _run(env["tmp"], *_base_args(env), "--apply")
+    assert r.returncode == 0, r.stdout + r.stderr
+    archived = json.loads(next(
+        (env["rt"] / "logs" / "context_history").glob("*.json")).read_text())
+    assert archived["ctx"] == stale
+    cur = json.loads((env["rt"] / "execution_context.json").read_text())
+    assert cur["effective_mode"] == "live_quarantined"
+    assert cur["live_order_allowed"] is False
+    assert cur["audit_reasons"] == ["REDEPLOY_BOOTSTRAP"]
+    assert cur["session_id"] is None
+
+
+def test_apply_still_refuses_unknown_audit(env):
+    """The acceptable set stays CLOSED: an unknown audit reason still
+    refuses the reset (no silent re-bootstrap)."""
+    stale = {**_STALE_CTX, "audit_reasons": ["SOME_UNKNOWN_REASON"]}
+    _write_ctx(env["rt"], stale)
+
+    r = _run(env["tmp"], *_base_args(env), "--apply")
+    assert r.returncode != 0
+    assert "unacceptable ctx audit state" in r.stderr or \
+        "unacceptable ctx audit state" in r.stdout
+
