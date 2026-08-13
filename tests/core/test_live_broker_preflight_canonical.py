@@ -434,3 +434,22 @@ def test_atomic_json_normalizes_keys_never_strs(tmp_path):
     data = json.loads(p.read_text(encoding="utf-8"))
     assert data == {"_SecretKey": "x"}
 
+
+def test_atomic_json_normalizes_nested_containers(tmp_path):
+    """Enum values nested inside non-dict containers (set / mapping-like
+    such as OrderedDict) — not just dict/list — normalize JSON-safe
+    without crashing the encoder."""
+    from collections import OrderedDict
+    from core.live_broker_preflight import _atomic_json
+
+    p = tmp_path / "out6.json"
+    _atomic_json(p, {
+        "legs": {_CEnum(): {"qty": 1}},
+        "tags": {_CEnum(), "x"},                    # set with an enum
+        "mapping": OrderedDict([(_CEnum(), 7)]),    # mapping-like, enum key
+    })
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["legs"]["SELL"]["qty"] == 1
+    assert "SELL" in data["tags"]
+    assert data["mapping"]["SELL"] == 7
+
