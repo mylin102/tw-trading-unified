@@ -4072,9 +4072,6 @@ class TMFSpread(StrategyBase):
         near_ask = bar.get("near_ask", near_close)
         far_bid = bar.get("far_bid", far_close)
         far_ask = bar.get("far_ask", far_close)
-        near_width = near_ask - near_bid
-        far_width = far_ask - far_bid
-
         # [P0b] LEG-SCOPED width gate (aligns with the decoupled leg
         # freshness check): a single-leg RELEASE only crosses the
         # released leg's spread — a wide quote on the OTHER leg must not
@@ -4086,28 +4083,39 @@ class TMFSpread(StrategyBase):
         _check_near = _rel_leg is None or _rel_leg == Leg.NEAR
         _check_far = _rel_leg is None or _rel_leg == Leg.FAR
 
-        # [P0c] QUOTE VALIDITY: a SINGLE-LEG RELEASE crosses the
-        # released leg's spread — the released leg must carry a REAL
-        # bid/ask in the raw bar.  A missing field (fallback-to-close),
-        # a zero, non-finite or inverted (ask < bid) quote must NOT be
-        # treated as a "0-point width" that wrongly passes the close.
-        # The default (both-leg) path keeps the conservative WIDTH check
-        # only (pre-existing semantics).
+        # [P0c2] QUOTE VALIDITY — BEFORE the width arithmetic.  Any raw
+        # bid/ask (present keys, either leg) that would corrupt the
+        # arithmetic — None / str / bool / non-numeric / NaN / ±Inf —
+        # blocks with QUOTE_INVALID (never a TypeError).  A SINGLE-LEG
+        # RELEASE additionally requires the RELEASED leg's quote to be
+        # present (no fallback-to-close), positive and non-inverted, so
+        # a missing/zero/inverted quote is never read as a "0-point
+        # width" that wrongly passes the close.  The default (both-leg)
+        # path keeps the conservative WIDTH check only (pre-existing
+        # semantics; a missing key falls back to the close safely).
         _quote_ok = True
-        if _rel_leg is not None:
-            for _label, _bkey, _akey in (("NEAR", "near_bid", "near_ask"),
-                                         ("FAR", "far_bid", "far_ask")):
-                if _label == "NEAR" and _rel_leg != Leg.NEAR:
+        for _label, _bkey, _akey in (("NEAR", "near_bid", "near_ask"),
+                                     ("FAR", "far_bid", "far_ask")):
+            _b = bar.get(_bkey)
+            _a = bar.get(_akey)
+            _key_present = _bkey in bar or _akey in bar
+            _strict_numeric = (isinstance(_b, (int, float))
+                               and not isinstance(_b, bool)
+                               and isinstance(_a, (int, float))
+                               and not isinstance(_a, bool)
+                               and _b == _b and _a == _a  # NaN
+                               and abs(_b) != float("inf")
+                               and abs(_a) != float("inf"))
+            if _key_present and not _strict_numeric:
+                _quote_ok = False
+                break
+            if _rel_leg is not None:
+                _rel = (_label == "NEAR" and _rel_leg == Leg.NEAR) or (
+                    _label == "FAR" and _rel_leg == Leg.FAR)
+                if not _rel:
                     continue
-                if _label == "FAR" and _rel_leg != Leg.FAR:
-                    continue
-                _b = bar.get(_bkey)
-                _a = bar.get(_akey)
-                if (_bkey not in bar or _akey not in bar
-                        or not isinstance(_b, (int, float))
-                        or not isinstance(_a, (int, float))
-                        or _b != _b or _a != _a  # NaN
-                        or abs(_b) == float("inf") or abs(_a) == float("inf")
+                if (not _key_present
+                        or not _strict_numeric
                         or _b <= 0 or _a <= 0 or _a < _b):
                     _quote_ok = False
                     break
@@ -4122,6 +4130,9 @@ class TMFSpread(StrategyBase):
                 bar.get("near_bid"), bar.get("near_ask"),
                 bar.get("far_bid"), bar.get("far_ask"))
             return None
+
+        near_width = near_ask - near_bid
+        far_width = far_ask - far_bid
 
         if ((_check_near and near_width > self._max_spread_width)
                 or (_check_far and far_width > self._max_spread_width)):
