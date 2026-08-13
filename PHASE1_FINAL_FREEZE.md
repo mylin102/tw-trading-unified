@@ -11,7 +11,7 @@
 commits 不影響此 identity — 解除 freeze/manifest SHA cycle；任何 code
 變更 → hash 變 → gate GUARD_MANIFEST_STALE 拒絕）
 ```
-frozen_tree_hash: 9427b17e9a3a0be4c2224a987841795b04887da1a505c5a7f6b2d4c0bbe9b17a
+frozen_tree_hash: f44186a222e6edc803fb5d58566c0b59ceda066b68d5df29ed38c4a2e8169089
 ```
 **LRC_RELEASE_SHA（部署時）**: = deploy-time `git -C <release_dir>
 rev-parse HEAD` 之 literal（= 此 freeze-record commit 的 SHA；deployed
