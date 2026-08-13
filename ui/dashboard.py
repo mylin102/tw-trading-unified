@@ -4447,7 +4447,7 @@ elif _selected_product == "TMF":
                     _live_upl, _upl_reason = broker_snapshot_live_upl(
                         Path(runtime_path("exports", "trades", "live",
                                           "diagnostics"))
-                        / "broker_snapshot_latest.json")
+                        / "broker_snapshot_canonical.json")
                     if _live_upl:
                         _codes = sorted(_live_upl.keys())
                         _near = _live_upl.get(_codes[0]) if _codes else None

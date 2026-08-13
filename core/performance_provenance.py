@@ -242,11 +242,35 @@ def scope_mts_performance(runtime_truth: dict, evidence: dict) -> dict:
             "run_id": None, "config_hash": rt.get("config_hash")}
 
 
-def broker_snapshot_live_upl(snapshot_path) -> tuple:
-    """Live UPL from the CURRENT broker-reconciled preflight snapshot:
-    per-code pnl (fresh snapshot only).  Missing / stale / malformed =>
-    (None, reason) so the UI renders N/A — the live UPL is NEVER
-    fabricated from the local state."""
+def _current_runtime_session_id() -> str:
+    """The current runtime execution-context session id, or ''."""
+    try:
+        from core.runtime_paths import runtime_path
+        _f = Path(runtime_path("execution_context.json"))
+        if _f.exists():
+            _ctx = json.loads(_f.read_text(encoding="utf-8"))
+            _s = _ctx.get("session_id")
+            if _s:
+                return str(_s)
+    except Exception:
+        pass
+    return ""
+
+
+def broker_snapshot_live_upl(snapshot_path, session_id=None) -> tuple:
+    """Live UPL from the CURRENT broker-reconciled preflight snapshot,
+    fail-closed on canonical live-broker provenance:
+
+    - source == "live_broker" and mode == "live"
+    - account_identity_hash and canonical_input_hash present
+    - session_id matches the explicit caller or the current runtime
+      execution context (mismatch => N/A)
+    - captured_at fresh
+    - the exact expected MTS legs (TMFH6/TMFI6) each carrying
+      direction / qty / avg_cost
+
+    Missing / malformed / mismatched => (None, reason) so the UI
+    renders N/A — the live UPL is NEVER fabricated from local state."""
     try:
         from pathlib import Path
         _p = Path(str(snapshot_path))
@@ -254,10 +278,30 @@ def broker_snapshot_live_upl(snapshot_path) -> tuple:
             return None, "no broker snapshot"
         _resp = json.loads(_p.read_text(encoding="utf-8"))
         _snap = _resp.get("snapshot") or {}
-        _positions = _snap.get("positions") or []
+        _src = _resp.get("source") or _snap.get("source")
+        _mode = _resp.get("mode") or _snap.get("mode")
+        _acc = (_resp.get("account_identity_hash")
+                or _snap.get("account_identity_hash")
+                or _snap.get("account_id_hash"))
+        _sess = str(_resp.get("session_id") or _snap.get("session_id") or "")
+        _chash = (_resp.get("canonical_input_hash")
+                  or _snap.get("canonical_input_hash"))
+        _positions = _snap.get("positions") or _resp.get("positions") or []
+        _cap_raw = _resp.get("captured_at") or _snap.get("captured_at")
+        if _src != "live_broker":
+            return None, "provenance: source is not live_broker"
+        if _mode != "live":
+            return None, "provenance: mode is not live"
+        if not _acc:
+            return None, "provenance: missing account_identity_hash"
+        if not _chash:
+            return None, "provenance: missing canonical_input_hash"
+        if session_id is None:
+            session_id = _current_runtime_session_id()
+        if not _sess or (session_id and _sess != str(session_id)):
+            return None, "snapshot session does not match current runtime"
         if not _positions:
             return None, "broker snapshot has no positions"
-        _cap_raw = _resp.get("captured_at")
         _cap_ms = None
         if isinstance(_cap_raw, (int, float)) and not isinstance(_cap_raw, bool):
             _cap_ms = int(_cap_raw)
@@ -274,10 +318,16 @@ def broker_snapshot_live_upl(snapshot_path) -> tuple:
         for _pos in _positions:
             _code = str(_pos.get("code") or "")
             _pnl = _pos.get("pnl")
-            if _code and isinstance(_pnl, (int, float)):
+            _dir = _pos.get("direction")
+            _qty = _pos.get("qty")
+            if _qty is None:
+                _qty = _pos.get("quantity")
+            _cost = _pos.get("avg_cost")
+            if _code in ("TMFH6", "TMFI6") and _dir and _qty and \
+                    _cost is not None and isinstance(_pnl, (int, float)):
                 _upl[_code] = _pnl
-        if not _upl:
-            return None, "no pnl in broker positions"
+        if set(_upl) != {"TMFH6", "TMFI6"}:
+            return None, "expected MTS legs (TMFH6/TMFI6) missing/mismatched"
         return _upl, None
     except Exception as exc:
         return None, str(exc)
