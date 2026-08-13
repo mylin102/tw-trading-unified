@@ -3,6 +3,7 @@
 import json
 import time
 from types import SimpleNamespace
+from pathlib import Path
 
 from core.order_management.order import OrderSide, OrderStatus, OrderType
 from core.order_management.order_manager import OrderManager
@@ -438,6 +439,115 @@ def test_futures_callback_accepts_shioaji_fdeal_enum_value():
 
     assert order.status is OrderStatus.FILLED
     assert order.fills[0].deal_id == "D-1"
+
+
+def test_futures_deal_callback_promotes_nested_order_identity():
+    """Shioaji wrapped payloads must still resolve the submitted order."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    manager = OrderManager(mode="paper")
+    order = _new_order(manager)
+    manager.attach_submission(order.order_id, broker_order_id="BRK-NEST", raw_status="Submitted")
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.order_mgr = manager
+
+    monitor.on_order_event("FuturesDeal", {
+        "price": 44909, "quantity": 1, "trade_id": "DEAL-NEST",
+        "order": {"id": "BRK-NEST", "ordno": "ORDNO-NEST"},
+    })
+
+    assert order.status is OrderStatus.FILLED
+    assert order.filled_quantity == 1
+    assert order.fills[0].deal_id == "DEAL-NEST"
+
+
+def test_filled_broker_snapshot_without_deals_updates_existing_order():
+    """Aggregate list_trades Filled rows must update a matched submission."""
+    manager = OrderManager(mode="paper")
+    order = _new_order(manager)
+    manager.attach_submission(order.order_id, broker_order_id="BRK-SNAPSHOT", raw_status="Submitted")
+    trade = SimpleNamespace(
+        id="BRK-SNAPSHOT", ordno="ORDNO-SNAPSHOT", seqno=None,
+        status=SimpleNamespace(status="Filled", price=44909, quantity=1),
+    )
+    result = manager.reconcile_broker_state(
+        filled_trades=[trade], source="live_broker_reconcile",
+        reason="streaming_callback_missed",
+    )
+    assert result["reconciled"]
+    assert order.status is OrderStatus.FILLED
+    assert order.filled_quantity == 1
+    assert order.avg_fill_price == 44909
+
+
+def test_futures_deal_callback_reaches_orders_export(tmp_path, monkeypatch):
+    """A broker fill must become a terminal order visible to dashboard export."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    runtime_dir = tmp_path / "runtime"
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(runtime_dir))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
+    monkeypatch.chdir(tmp_path)
+
+    manager = OrderManager(mode="paper")
+    order = _new_order(manager)
+    manager.attach_submission(order.order_id, broker_order_id="BRK-EXPORT", raw_status="Submitted")
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.order_mgr = manager
+    monitor.ticker = "TMF"
+    monitor.market_data = {}
+    monitor.trader = SimpleNamespace(position=0, entry_price=0.0)
+    monitor._registry = SimpleNamespace(get=lambda *_args, **_kwargs: None)
+
+    monitor.on_order_event("FuturesDeal", {
+        "price": 44909,
+        "quantity": 1,
+        "trade_id": "DEAL-EXPORT",
+        "order": {"id": "BRK-EXPORT"},
+    })
+    monitor._save_orders_file_wrapper()
+
+    files = list((runtime_dir / "exports" / "trades").glob("TMF_*_orders.json"))
+    assert len(files) == 1
+    exported = json.loads(files[0].read_text())
+    row = next(item for item in exported if item["order_id"] == order.order_id)
+    assert row["status"] == "filled"
+    assert row["filled_quantity"] == 1
+    assert row["avg_fill_price"] == 44909
+
+
+def test_orders_export_normalizes_shioaji_enum_session_date(tmp_path, monkeypatch):
+    """A Shioaji Action leaking into session metadata must not erase export."""
+    from shioaji import constant
+    from strategies.futures.monitor import FuturesMonitor
+
+    runtime_dir = tmp_path / "runtime"
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(runtime_dir))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
+    monkeypatch.chdir(tmp_path)
+
+    manager = OrderManager(mode="paper")
+    manager._session_date = constant.Action.Buy
+    order = _new_order(manager)
+    manager.attach_submission(order.order_id, broker_order_id="BRK-ENUM", raw_status="Submitted")
+    manager.apply_deal_fill(
+        None, deal_id="DEAL-ENUM", fill_price=44909, fill_qty=1,
+        broker_order_id="BRK-ENUM", source="test",
+    )
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.order_mgr = manager
+    monitor.ticker = "TMF"
+    monitor.market_data = {}
+    monitor.trader = SimpleNamespace(position=0, entry_price=0.0)
+    monitor._registry = SimpleNamespace(get=lambda *_args, **_kwargs: None)
+
+    monitor._save_orders_file_wrapper()
+    files = list((runtime_dir / "exports" / "trades").glob("TMF_*_orders.json"))
+    assert len(files) == 1
+    exported = json.loads(files[0].read_text())
+    assert any(item["order_id"] == order.order_id for item in exported)
 
 
 def test_futures_callback_accepts_forder_and_ignores_stock_state():
