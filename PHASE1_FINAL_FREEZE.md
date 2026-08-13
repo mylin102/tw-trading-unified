@@ -3,7 +3,8 @@
 **日期**: 2026-08-09（Codex bounded step — final freeze）
 **狀態**: FROZEN（freeze-first：所有 code/test commits 已完成後 freeze；
 **此後禁改檔** — gate 對任何 post-freeze 變更 refuse）
-**Frozen release tree HEAD**: `63ea9e6817bca908f7066a77070d7c4e05b0f853`
+**Frozen release tree HEAD**: `f9fe08fff7a1175a837bd6d59389b114fb19af48`
+（= serializer int-like exact-type fix commit；其後僅此 re-freeze docs commit）
 （= gate closure fix commit；其後僅此 freeze-record docs commit）
 **frozen_tree_hash（exclude-self tree identity — manifest/rollback docs
 排除）**: `ed2f316240a6914dcbd6f5ab3cb0bd7805dd189397077a8dcbe4b14dfae19464`
@@ -11,7 +12,7 @@
 commits 不影響此 identity — 解除 freeze/manifest SHA cycle；任何 code
 變更 → hash 變 → gate GUARD_MANIFEST_STALE 拒絕）
 ```
-frozen_tree_hash: f1fbeb9cf93871be455f905dea471e9303038179bb03fe234b65e4399682523e
+frozen_tree_hash: 49d66c3b98c014e3b1a2e245eaab5d45e090ead264768ffadacb6cad7c07a11e
 ```
 **LRC_RELEASE_SHA（部署時）**: = deploy-time `git -C <release_dir>
 rev-parse HEAD` 之 literal（= 此 freeze-record commit 的 SHA；deployed
