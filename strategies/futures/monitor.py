@@ -4015,6 +4015,52 @@ class FuturesMonitor:
             action, _intent_strategy, strategy)
         return _ok, _binding, _reason
 
+    def _process_live_upl_refresh_command(self) -> bool:
+        """[dashboard refresh] consume commands/live_upl_refresh.json
+        ONCE in the existing loop: re-capture the CURRENT-session
+        read-only broker truth through the SAME authenticated api
+        (list_positions / list_trades / margin; zero place/cancel/
+        update) and re-persist the canonical artifact on success.
+        Query failure records the typed status and leaves live UPL N/A
+        (no canonical overwrite).  Paper mode: no-op — the paper ledger
+        is its own truth.  Never creates a second Shioaji session."""
+        from core.runtime_paths import runtime_path
+        _path = Path(runtime_path("commands", "live_upl_refresh.json"))
+        _processing = Path(str(_path) + ".processing")
+        if not _path.exists() and not _processing.exists():
+            return False
+        if _path.exists():
+            try:
+                _path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(_path, _processing)
+            except OSError:
+                return False
+        try:
+            _raw = json.loads(_processing.read_text(encoding="utf-8"))
+        except Exception:
+            _raw = None
+        try:
+            _processing.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if not isinstance(_raw, dict):
+            return False
+        _allowed = {"command_id", "action", "created_at"}
+        if (not isinstance(_raw.get("command_id"), str)
+                or not _raw.get("command_id")
+                or set(_raw) - _allowed
+                or _raw.get("action") != "LIVE_UPL_REFRESH"):
+            return False
+        _ctx = getattr(self, "_execution_context", None)
+        _mode = getattr(_ctx, "effective_mode", "")
+        if str(_mode).startswith("paper"):
+            return True  # paper no-op: the paper ledger is its own truth
+        _snap = self._capture_post_startup_snapshot()
+        if ((_snap.get("fetch_status") or {}).get("capture") != "OK"):
+            return True  # typed failure — live UPL stays N/A
+        self._persist_current_session_canonical(_snap)
+        return True
+
     def _process_reconciled_exit_attestation_command(self) -> bool:
         """Atomically consume one operator request for EXIT_ONLY attestation.
 
@@ -4343,7 +4389,9 @@ class FuturesMonitor:
                         continue
                     try:
                         _rows = _api.list_positions(_acct)
-                    except Exception:
+                    except Exception as exc:
+                        errors[f"positions:{_tag}"] = \
+                            f"{type(exc).__name__}: {exc}"
                         _rows = []
                     positions.extend(
                         self._normalize_snapshot_positions(_rows, _tag))
@@ -4359,7 +4407,9 @@ class FuturesMonitor:
                         continue
                     try:
                         _rows = _api.list_trades(_acct) or []
-                    except Exception:
+                    except Exception as exc:
+                        errors[f"open_orders:{_tag}"] = \
+                            f"{type(exc).__name__}: {exc}"
                         _rows = []
                     open_orders.extend(
                         self._normalize_snapshot_orders(_rows))
@@ -11543,6 +11593,7 @@ class FuturesMonitor:
         # the legacy manual-entry flag and may be reviewed before any strategy
         # decision runs.
         self._process_reconciled_exit_attestation_command()
+        self._process_live_upl_refresh_command()
         self._hydrate_exit_only_position()
 
         # 2026-05-27 Gemini CLI: MTS Safety Watchdog (P4)

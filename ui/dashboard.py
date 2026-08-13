@@ -183,8 +183,52 @@ def check_password():
 if not check_password():
     st.stop()
 
+# [live UPL refresh] ask the RUNNING trading-system process (the
+# SAME Shioaji session) to re-capture and re-persist the canonical
+# broker snapshot — never a new preflight subprocess or a second
+# login.  Atomic O_EXCL write with only command_id / action /
+# created_at (no credentials, no order fields); a pending command
+# is never overwritten and is consumed once by the monitor loop.
+def write_live_upl_refresh_command(path=None) -> bool:
+    """Sidebar manual / auto refresh: ask the RUNNING trading-system
+    process (the SAME Shioaji session) to re-capture and re-persist the
+    canonical broker snapshot — never a new preflight subprocess or a
+    second login.  Atomic O_EXCL write with only command_id / action /
+    created_at (no credentials, no order fields); a pending command is
+    never overwritten and is consumed once by the monitor's existing
+    loop."""
+    _p = Path(path) if path is not None else Path(
+        runtime_path("commands", "live_upl_refresh.json"))
+    try:
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        _fd = os.open(str(_p), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    _payload = {
+        "command_id": f"UPL_REFRESH-{datetime.datetime.now():%Y%m%d%H%M%S%f}",
+        "action": "LIVE_UPL_REFRESH",
+        "created_at": int(time.time() * 1000),
+    }
+    try:
+        with os.fdopen(_fd, "w", encoding="utf-8") as _out:
+            json.dump(_payload, _out, ensure_ascii=False)
+            _out.flush()
+            os.fsync(_out.fileno())
+        return True
+    except OSError:
+        try:
+            os.unlink(str(_p))
+        except OSError:
+            pass
+        return False
+
 # 2026-06-30 Gemini CLI: Replaced auto-refresh with manual + optional auto refresh slider
 if st.sidebar.button("🔄 重新載入資料", use_container_width=True):
+    # [live UPL refresh] ask the RUNNING process (same session) to
+    # re-capture the canonical; the dashboard rereads it on rerun.
+    write_live_upl_refresh_command()
     st.cache_data.clear()
     st.rerun()
 
@@ -197,6 +241,9 @@ auto_refresh_sec = st.sidebar.selectbox(
 )
 if auto_refresh_sec != "關閉":
     interval_ms = int(auto_refresh_sec.replace("秒", "")) * 1000
+    # [live UPL refresh] auto-refresh also asks the running process for
+    # a same-session canonical re-capture (atomic no-replace write).
+    write_live_upl_refresh_command()
     safe_st_autorefresh(interval=interval_ms, key="auto_refresh_timer")
 
 # ── 全域字體縮小 CSS ──
@@ -640,6 +687,7 @@ def _derive_locked_trade_id_from_events(events_path, canonical_legs):
     if len(_matches) == 1:
         return next(iter(_matches))
     return None
+
 
 
 def build_exit_only_attestation_request(
