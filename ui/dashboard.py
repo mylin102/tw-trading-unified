@@ -4171,11 +4171,39 @@ elif _selected_product == "TMF":
 
     # In restricted-exit mode the legacy /tmp state must not be read or
     # presented.  The full legacy block remains unchanged for LIVE/PAPER.
-    _mts_state_file = None if _exit_only_dashboard else "/tmp/mts_position_state.json"
-    if _mts_state_file and os.path.exists(_mts_state_file):
+    _broker_mts_state = None
+    if not _exit_only_dashboard:
         try:
-            with open(_mts_state_file) as _f:
-                _mts_state = json.loads(_f.read())
+            _ctx_live = json.loads(Path(runtime_path("execution_context.json")).read_text())
+            _canon = json.loads((Path(runtime_path("exports", "trades", "live", "diagnostics"))
+                                 / "broker_snapshot_canonical.json").read_text())
+            _fut = [p for p in (_canon.get("positions") or [])
+                    if p.get("account") == "futures" and p.get("code") in {"TMFH6", "TMFI6"}
+                    and int(p.get("quantity", 0) or 0) > 0]
+            if (_ctx_live.get("effective_mode") == "live_ready"
+                    and _canon.get("session_id") == _ctx_live.get("session_id")
+                    and len({p.get("code") for p in _fut}) == 2
+                    and not _canon.get("open_orders")):
+                _by = {p["code"]: p for p in _fut}
+                _broker_mts_state = {
+                    "has_position": True,
+                    "near_entry": _by["TMFH6"].get("avg_cost"),
+                    "far_entry": _by["TMFI6"].get("avg_cost"),
+                    "near_side": _by["TMFH6"].get("direction"),
+                    "far_side": _by["TMFI6"].get("direction"),
+                    "trade_id": "broker-reconciled-" + str(_canon.get("canonical_input_hash", ""))[:16],
+                    "reason": "broker_snapshot",
+                    "position_phase": "SPREAD",
+                }
+        except Exception:
+            _broker_mts_state = None
+    _mts_state_file = None if _exit_only_dashboard else "/tmp/mts_position_state.json"
+    if _broker_mts_state is not None or (_mts_state_file and os.path.exists(_mts_state_file)):
+        try:
+            _mts_state = _broker_mts_state
+            if _mts_state is None:
+                with open(_mts_state_file) as _f:
+                    _mts_state = json.loads(_f.read())
             _has_pos = _mts_state.get("has_position", False)
             if _has_pos:
                 st.header("MTS 價差持倉 (tmf_spread)")
@@ -4419,11 +4447,10 @@ elif _selected_product == "TMF":
                                 .read_text(encoding="utf-8"))
                         except Exception:
                             _audit_ctx = {}
-                        st.warning(
-                            f"⚠️ MTS UPL N/A — "
-                            f"{live_upl_presented_reason(
-                                _upl_reason or _upl_pres['reason'],
-                                _audit_ctx.get('audit_reasons'))}")
+                        _upl_msg = live_upl_presented_reason(
+                            _upl_reason or _upl_pres['reason'],
+                            _audit_ctx.get('audit_reasons'))
+                        st.warning(f"⚠️ MTS UPL N/A — {_upl_msg}")
                 _stale_upl = float(_mts_state.get("total_upl", 0) or 0)
                 if _upl_pres["kind"] == "ZERO" and abs(_stale_upl) > 0:
                     st.warning(

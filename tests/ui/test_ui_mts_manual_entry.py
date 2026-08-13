@@ -74,8 +74,7 @@ def test_dashboard_exit_only_attestation_is_separate_from_manual_entry_flag():
     """
     dashboard_path = Path(__file__).parent.parent.parent / "ui" / "dashboard.py"
     content = dashboard_path.read_text(encoding="utf-8")
-    assert "對帳部位：受限平倉授權" in content
-    assert '"commands", "reconciled_exit_attestation.json"' in content
-    assert '"action": "ATTEST_EXIT_ONLY"' in content
-    assert "os.O_EXCL" in content
-    assert "建立受限平倉授權請求" in content
+    assert "對帳部位：受限平倉授權" not in content
+    assert '"commands", "reconciled_exit_attestation.json"' not in content
+    # request builder may remain as dead compatibility helper; no UI entry
+    assert "建立受限平倉授權請求" not in content
