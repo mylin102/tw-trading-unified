@@ -4251,16 +4251,19 @@ class FuturesMonitor:
             try:
                 _px = getattr(p, "price", None)
                 _pnl = getattr(p, "pnl", None)
-                out.append({
+                _row = {
                     "account": account_tag,
                     "code": str(getattr(p, "code", "")),
                     "quantity": int(getattr(p, "quantity", 0) or 0),
                     "direction": getattr(getattr(p, "direction", None),
                                          "name", None)
                         or str(getattr(p, "direction", "")),
-                    "avg_cost": float(_px) if _px is not None else None,
-                    "pnl": float(_pnl) if _pnl is not None else None,
-                })
+                }
+                if _px is not None:
+                    _row["avg_cost"] = float(_px)
+                if _pnl is not None:
+                    _row["pnl"] = float(_pnl)
+                out.append(_row)
             except Exception:
                 continue
         return out
@@ -4407,6 +4410,82 @@ class FuturesMonitor:
             os.replace(_tmp, _canon)
         except Exception:
             pass  # never block the post-startup gate on telemetry
+
+    def _refresh_live_broker_authority(self, strategy):
+        """Use the current authenticated broker snapshot as LIVE MTS truth.
+
+        Callbacks and local fills are telemetry; a missing FDEAL must not
+        make an actually-held spread appear FLAT.  This is read-only and is
+        never used in PAPER or legacy EXIT_ONLY mode.
+        """
+        from core.mode_transition import ModeTransitionState
+        if (not getattr(self, "live_trading", False)
+                or getattr(getattr(self, "_execution_context", None),
+                           "effective_mode", None)
+                != ModeTransitionState.LIVE_READY.value
+                or strategy is None):
+            return None
+        _now = time.monotonic()
+        if _now - getattr(self, "_live_broker_authority_at", 0.0) < 5.0:
+            return getattr(self, "_live_broker_authority", None)
+        _snap = self._capture_post_startup_snapshot()
+        if ((_snap.get("fetch_status") or {}).get("capture") != "OK"
+                or _snap.get("open_orders")):
+            self._live_broker_authority = None
+            self._live_broker_authority_at = _now
+            return None
+        self._persist_current_session_canonical(_snap)
+        _codes = {str(getattr(self.contract, "code", "")),
+                  str(getattr(self.far_contract, "code", ""))}
+        _rows = [p for p in (_snap.get("positions") or [])
+                 if p.get("account") == "futures"
+                 and p.get("code") in _codes
+                 and type(p.get("quantity")) is int
+                 and p.get("quantity", 0) > 0]
+        if len({p.get("code") for p in _rows}) != 2:
+            self._live_broker_authority = None
+            self._live_broker_authority_at = _now
+            return None
+        _by_code = {p["code"]: p for p in _rows}
+        _near = _by_code.get(str(getattr(self.contract, "code", "")))
+        _far = _by_code.get(str(getattr(self.far_contract, "code", "")))
+        def _side(row):
+            text = str(row.get("direction") or "").lower()
+            if "sell" in text or "short" in text:
+                return "SHORT"
+            if "buy" in text or "long" in text:
+                return "LONG"
+            return None
+        _near_side, _far_side = _side(_near), _side(_far)
+        if _near_side is None or _far_side is None:
+            self._live_broker_authority = None
+            self._live_broker_authority_at = _now
+            return None
+        _snapshot_hash = _snap.get("canonical_input_hash")
+        _trade_id = getattr(strategy, "_trade_id", None) or (
+            f"broker-reconciled-{str(_snapshot_hash or '')[:16]}")
+        for _name, _value in (
+                ("_near_side", _near_side), ("_far_side", _far_side),
+                ("_near_qty", _near["quantity"]),
+                ("_far_qty", _far["quantity"]),
+                ("_near_entry", _near.get("avg_cost")),
+                ("_far_entry", _far.get("avg_cost")),
+                ("_trade_id", _trade_id), ("_has_position", True),
+                ("_snapshot_hash", _snapshot_hash)):
+            setattr(strategy, _name, _value)
+        from strategies.futures.mts_ledger_authority import (
+            MtsAuthority, MtsAuthorityState)
+        _auth = MtsAuthorityState(
+            status=MtsAuthority.OPEN, trade_id=_trade_id,
+            near_qty=-_near["quantity"] if _near_side == "SHORT" else _near["quantity"],
+            far_qty=-_far["quantity"] if _far_side == "SHORT" else _far["quantity"],
+            near_side=_near_side, far_side=_far_side,
+            near_entry=float(_near.get("avg_cost") or 0.0),
+            far_entry=float(_far.get("avg_cost") or 0.0),
+            current_trade_id=_trade_id)
+        self._live_broker_authority = _auth
+        self._live_broker_authority_at = _now
+        return _auth
 
     def _run_post_startup_gate(self):
         """[P0 post-startup gate] the in-process, UNAVOIDABLE gate run
@@ -9158,6 +9237,13 @@ class FuturesMonitor:
             self._ledger_projection.sync_from_ledger()
             self._ledger_projection_sync_ts = time.monotonic()
         _auth = self._ledger_projection.snapshot()
+        # LIVE broker truth supersedes a silent/missing callback ledger.  The
+        # helper is read-only and leaves PAPER and legacy EXIT_ONLY untouched.
+        _broker_auth = self._refresh_live_broker_authority(strategy)
+        if _broker_auth is not None:
+            _auth = _broker_auth
+            _authority_has_pos = True
+            _state_has_pos = True
         # [S1 repair] ONE shared EXIT_ONLY capability validation at tick
         # start — before ANY risk gate / strategy evaluation.  The
         # previous tick's authority override is cleared here; when valid,
