@@ -4189,11 +4189,26 @@ elif _selected_product == "TMF":
                     "has_position": True,
                     "near_entry": _by["TMFH6"].get("avg_cost"),
                     "far_entry": _by["TMFI6"].get("avg_cost"),
+                    "near_upl": _by["TMFH6"].get("pnl"),
+                    "far_upl": _by["TMFI6"].get("pnl"),
                     "near_side": _by["TMFH6"].get("direction"),
                     "far_side": _by["TMFI6"].get("direction"),
+                    "action": (f'{_by["TMFH6"].get("direction", "?")} / '
+                               f'{_by["TMFI6"].get("direction", "?")}'),
+                    "release_state": "BOTH_HELD",
                     "trade_id": "broker-reconciled-" + str(_canon.get("canonical_input_hash", ""))[:16],
                     "reason": "broker_snapshot",
                     "position_phase": "SPREAD",
+                }
+                # Current broker-reconciled futures are the authoritative
+                # live performance scope; legacy fills are not required.
+                _mts_perf_scope = {
+                    "ok": True, "mode": "live",
+                    "run_id": _ctx_live.get("run_id"),
+                    "config_hash": _ctx_live.get("config_hash"),
+                    "session_id": _ctx_live.get("session_id"),
+                    "source": "live_broker_reconciled",
+                    "reason": "broker_snapshot",
                 }
         except Exception:
             _broker_mts_state = None
