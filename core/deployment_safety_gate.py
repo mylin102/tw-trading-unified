@@ -700,6 +700,51 @@ def _atomic_write_probe(runtime_dir: str) -> bool:
 
 # ── aggregate ──────────────────────────────────────────────────────────────
 
+# [gate consolidation] presentation-only aggregate groups.  Every
+# underlying guard and refusal code stays; the top-level result is the
+# four aggregate gate groups.  Authorization semantics / TTL /
+# query-on-demand are untouched.
+GATE_AGGREGATE_GROUPS: dict[str, tuple[str, ...]] = {
+    "RELEASE_INTEGRITY": ("release_head", "clean_tree",
+                          "rollback_manifest", "config_profile"),
+    "RUNTIME_READY": ("runtime_paths", "single_process",
+                      "ctx_atomic_health", "quarantine_first_startup"),
+    "BROKER_TRUTH": ("flat_snapshot", "margin", "capture_consistency"),
+    "STARTUP_AUTHORIZATION": ("session_generation",),
+}
+
+
+def aggregate_gate_groups(results: Sequence[GuardResult],
+                          phase: str = "pre_deploy") -> dict[str, dict]:
+    """Consolidate guard results into the four aggregate gate groups.
+    Presentation-only: every underlying check and refusal code is
+    preserved under ``guards``; the aggregate status is PASS when all
+    its guards pass, REFUSED with the typed refusal codes when any
+    fails, and NOT_ASSESSED for STARTUP_AUTHORIZATION in the pre_deploy
+    phase (the registry-bound session generation only exists after the
+    runtime logs in — post_startup gate required)."""
+    _groups: dict[str, dict] = {}
+    for _name, _guard_names in GATE_AGGREGATE_GROUPS.items():
+        _rs = [r for r in results if r.guard in _guard_names]
+        _refusals = [c for r in _rs if not r.ok for c in r.reasons]
+        if _name == "STARTUP_AUTHORIZATION" and phase != "post_startup":
+            _status = "NOT_ASSESSED"
+        elif _refusals:
+            _status = "REFUSED"
+        else:
+            _status = "PASS"
+        _groups[_name] = {
+            "status": _status,
+            "refusals": _refusals,
+            "guards": {
+                r.guard: {"ok": r.ok, "reasons": list(r.reasons),
+                          "detail": r.detail}
+                for r in _rs
+            },
+        }
+    return _groups
+
+
 def check_deployment(
     *,
     release_dir: str,

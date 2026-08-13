@@ -63,7 +63,8 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    from core.deployment_safety_gate import check_deployment
+    from core.deployment_safety_gate import (
+    check_deployment, aggregate_gate_groups)
 
     margin_evidence = None
     if args.margin_evidence:
@@ -111,12 +112,21 @@ def main() -> int:
         print(json.dumps({
             "ok": check.ok,
             "refusal_codes": list(check.refusal_codes),
+            "aggregates": aggregate_gate_groups(check.results, args.phase),
             "guards": [
                 {"guard": g.guard, "ok": g.ok, "reasons": list(g.reasons),
                  "detail": g.detail} for g in check.results
             ],
         }, indent=2, ensure_ascii=False))
     else:
+        _mark_map = {"PASS": "PASS", "REFUSED": "FAIL",
+                     "NOT_ASSESSED": "N/A"}
+        for _name, _agg in aggregate_gate_groups(
+                check.results, args.phase).items():
+            _mark = _mark_map.get(_agg["status"], "FAIL")
+            _ref = (f"  refusals={",".join(_agg["refusals"])}"
+                    if _agg["refusals"] else "")
+            print(f"[{_mark}] GATE {_name}: {_agg["status"]}{_ref}")
         for g in check.results:
             mark = "PASS" if g.ok else "FAIL"
             print(f"[{mark}] {g.guard}: {g.reasons or 'ok'}"
