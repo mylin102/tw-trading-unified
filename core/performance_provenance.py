@@ -242,6 +242,47 @@ def scope_mts_performance(runtime_truth: dict, evidence: dict) -> dict:
             "run_id": None, "config_hash": rt.get("config_hash")}
 
 
+def broker_snapshot_live_upl(snapshot_path) -> tuple:
+    """Live UPL from the CURRENT broker-reconciled preflight snapshot:
+    per-code pnl (fresh snapshot only).  Missing / stale / malformed =>
+    (None, reason) so the UI renders N/A — the live UPL is NEVER
+    fabricated from the local state."""
+    try:
+        from pathlib import Path
+        _p = Path(str(snapshot_path))
+        if not _p.exists():
+            return None, "no broker snapshot"
+        _resp = json.loads(_p.read_text(encoding="utf-8"))
+        _snap = _resp.get("snapshot") or {}
+        _positions = _snap.get("positions") or []
+        if not _positions:
+            return None, "broker snapshot has no positions"
+        _cap_raw = _resp.get("captured_at")
+        _cap_ms = None
+        if isinstance(_cap_raw, (int, float)) and not isinstance(_cap_raw, bool):
+            _cap_ms = int(_cap_raw)
+        elif isinstance(_cap_raw, str):
+            try:
+                from datetime import datetime
+                _dt = datetime.fromisoformat(_cap_raw.replace("Z", "+00:00"))
+                _cap_ms = int(_dt.timestamp() * 1000)
+            except Exception:
+                _cap_ms = None
+        if _cap_ms is None or time.time() - _cap_ms / 1000.0 > SNAPSHOT_MAX_AGE_S:
+            return None, "broker snapshot stale/missing timestamp"
+        _upl = {}
+        for _pos in _positions:
+            _code = str(_pos.get("code") or "")
+            _pnl = _pos.get("pnl")
+            if _code and isinstance(_pnl, (int, float)):
+                _upl[_code] = _pnl
+        if not _upl:
+            return None, "no pnl in broker positions"
+        return _upl, None
+    except Exception as exc:
+        return None, str(exc)
+
+
 def upl_presentation(scope: dict, is_flat: bool, snapshot_ts) -> dict:
     """Canonical UPL presentation.
 

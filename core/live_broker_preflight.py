@@ -98,8 +98,18 @@ def resolve_near_far_contracts(api: Any, product: str) -> tuple[Any, Any]:
 
 
 def _safe_positions(api: Any, account: Any) -> list[dict[str, Any]]:
+    """Preserve broker position identity: code / qty / direction /
+    avg_cost (Shioaji's Position.price is the average cost) / pnl so a
+    later consumer can render live UPL and the leg identity without
+    fabricating cost."""
     return [
-        {"code": getattr(p, "code", None), "qty": getattr(p, "quantity", None), "pnl": getattr(p, "pnl", None)}
+        {
+            "code": getattr(p, "code", None),
+            "qty": getattr(p, "quantity", None),
+            "direction": getattr(p, "direction", None),
+            "avg_cost": getattr(p, "price", None),
+            "pnl": getattr(p, "pnl", None),
+        }
         for p in list(api.list_positions(account))
     ]
 

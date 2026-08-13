@@ -4135,7 +4135,7 @@ elif _selected_product == "TMF":
     # Legacy/mixed/unknown evidence renders N/A with the explicit reason —
     # NEVER 0, NEVER merged Paper/Live PnL.
     from core.performance_provenance import (
-        classify_mts_evidence, scope_mts_performance, upl_presentation)
+        classify_mts_evidence, scope_mts_performance, upl_presentation, broker_snapshot_live_upl)
     _exit_only_dashboard = active_runtime_truth.get("is_exit_only_runtime")
     _events_path_scope = runtime_path("logs", "mts_spread_events.jsonl")
     if _exit_only_dashboard:
@@ -4441,10 +4441,33 @@ elif _selected_product == "TMF":
                     _u2.metric("遠月 UPL", "0 TWD")
                     _u3.metric("總計 UPL", "0 TWD")
                 else:
-                    _u1.metric("近月 UPL", "N/A")
-                    _u2.metric("遠月 UPL", "N/A")
-                    _u3.metric("總計 UPL", "N/A")
-                    st.warning(f"⚠️ MTS UPL N/A — {_upl_pres['reason']}")
+                    # [live truth] live UPL comes ONLY from the CURRENT
+                    # broker-reconciled preflight snapshot; missing/stale
+                    # => N/A (never a fabricated cost from local state).
+                    _live_upl, _upl_reason = broker_snapshot_live_upl(
+                        Path(runtime_path("exports", "trades", "live",
+                                          "diagnostics"))
+                        / "broker_snapshot_latest.json")
+                    if _live_upl:
+                        _codes = sorted(_live_upl.keys())
+                        _near = _live_upl.get(_codes[0]) if _codes else None
+                        _far = _live_upl.get(_codes[1]) if len(_codes) > 1 else None
+                        _tot = sum(v for v in _live_upl.values()
+                                   if isinstance(v, (int, float)))
+                        _u1.metric("近月 UPL",
+                                   f"{_near:+,.0f} TWD"
+                                   if _near is not None else "N/A")
+                        _u2.metric("遠月 UPL",
+                                   f"{_far:+,.0f} TWD"
+                                   if _far is not None else "N/A")
+                        _u3.metric("總計 UPL", f"{_tot:+,.0f} TWD")
+                    else:
+                        _u1.metric("近月 UPL", "N/A")
+                        _u2.metric("遠月 UPL", "N/A")
+                        _u3.metric("總計 UPL", "N/A")
+                        st.warning(
+                            f"⚠️ MTS UPL N/A — "
+                            f"{_upl_reason or _upl_pres['reason']}")
                 _stale_upl = float(_mts_state.get("total_upl", 0) or 0)
                 if _upl_pres["kind"] == "ZERO" and abs(_stale_upl) > 0:
                     st.warning(
