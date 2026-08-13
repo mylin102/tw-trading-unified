@@ -165,6 +165,54 @@ def exit_only_lifecycle_presentation(context: Any, events_path: Any) \
     return result
 
 
+def _latest_bbo_observation_info(events_path: Any,
+                                 capability: Any) -> Optional[dict]:
+    """Latest EXIT_ONLY_BBO_OBSERVED timestamp + count for the
+    capability's reconciliation id (nested in bbo_payload) —
+    presentation-only.  No valid matching observation => None."""
+    _rid = (capability or {}).get("reconciliation_id")
+    if not _rid:
+        return None
+    _count = 0
+    _latest = None
+    try:
+        with open(events_path, encoding="utf-8") as _f:
+            for _line in _f:
+                try:
+                    _ev = json.loads(_line)
+                except Exception:
+                    continue
+                if _ev.get("event") != "EXIT_ONLY_BBO_OBSERVED":
+                    continue
+                _ev_rid = ((_ev.get("bbo_payload") or {})
+                           .get("reconciliation_id"))
+                if str(_ev_rid or "") != str(_rid):
+                    continue
+                _count += 1
+                _latest = _ev.get("ts") or _latest
+    except Exception:
+        return None
+    if _count == 0:
+        return None
+    return {"count": _count, "latest_ts": _latest}
+
+
+def exit_only_presented_reason(reason: Any, audit_reasons: Any,
+                               bbo_info: Any) -> str:
+    """Presentation-only leading reason: a typed quarantine/renewal
+    mismatch comes FIRST; EXIT_ONLY_BBO_MISSING is only presented when
+    no valid matching BBO observation exists (the runtime has live
+    observations — a bare BBO_MISSING would be misleading)."""
+    _audit = [str(r) for r in (audit_reasons or [])]
+    _renewal = next((r for r in _audit
+                     if "EXIT_ONLY_RENEWAL" in r), None)
+    if _renewal:
+        return _renewal
+    if str(reason or "") == "EXIT_ONLY_BBO_MISSING" and bbo_info:
+        return "EXIT_ONLY_BBO_PRESENT_BUT_UNVERIFIED"
+    return str(reason or "EXIT_ONLY_BBO_MISSING")
+
+
 def exit_only_upl_presentation(context: Any, evidence: Any, *,
                                now_ms: int, point_value: float = 10.0,
                                legacy_state: Any = None) -> Optional[dict]:

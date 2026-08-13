@@ -4232,7 +4232,9 @@ elif _selected_product == "TMF":
         # This presentation is intentionally isolated from the ordinary MTS
         # state/ledger path.  A restricted-exit position has one authority:
         # broker-attested capability plus current, hash-bound dual BBO.
-        from ui.reconciled_exit_presentation import exit_only_upl_metrics
+        from ui.reconciled_exit_presentation import (
+    exit_only_upl_metrics, _latest_bbo_observation_info,
+    exit_only_presented_reason)
         _eo_ctx = load_exit_only_context()
         _exit_upl = exit_only_upl_metrics(
             _eo_ctx, _events_path_scope,
@@ -4251,12 +4253,24 @@ elif _selected_product == "TMF":
         else:
             _reason = (_exit_upl or {}).get(
                 "reason", "EXIT_ONLY_BBO_MISSING")
+            # [fix] quarantine/renewal mismatch leads; BBO_MISSING only
+            # when no valid matching observation exists; show the latest
+            # BBO observed timestamp/count when present.
+            _bbo_info = _latest_bbo_observation_info(
+                _events_path_scope,
+                _eo_ctx.get("exit_only_capability"))
+            _lead = exit_only_presented_reason(
+                _reason, _eo_ctx.get("audit_reasons"), _bbo_info)
+            _detail = ""
+            if _bbo_info:
+                _detail = (f" · BBO 已觀察 {_bbo_info['count']} 筆"
+                           f"（最新 {_bbo_info['latest_ts']}）")
             _u1.metric("近月 UPL", "N/A")
             _u2.metric("遠月 UPL", "N/A")
             _u3.metric("總計 UPL", "N/A")
             st.warning(
-                "⚠️ 受限平倉模式—等待新鮮券商對帳與雙腿 BBO"
-                f"（{_reason}）")
+                "⚠️ 受限平倉模式—受限範圍待券商對帳重新驗證"
+                f"（{_lead}{_detail}）")
         # [auto re-reconciliation] 自動對帳 status: healthy/degraded,
         # last success/failure, next attempt (BBO freshness separate)
         _renew_status = load_exit_only_renewal_status()
