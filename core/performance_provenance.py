@@ -333,6 +333,25 @@ def broker_snapshot_live_upl(snapshot_path, session_id=None) -> tuple:
         return None, str(exc)
 
 
+def live_upl_presented_reason(reason, audit_reasons):
+    """Presentation-only mapping for the live UPL N/A reason: a typed
+    quarantine/renewal audit reason takes precedence (the real cause is
+    a renewal/session mismatch, not a missing timestamp); a session
+    mismatch maps to the typed SESSION_MISMATCH; only a genuinely
+    missing/stale snapshot keeps the generic stale message.  N/A and
+    no-order behavior are unchanged."""
+    _audit = [str(r) for r in (audit_reasons or [])]
+    _renewal = next((r for r in _audit
+                     if "EXIT_ONLY_RENEWAL" in r), None)
+    if _renewal:
+        return _renewal
+    _r = str(reason or "")
+    _low = _r.lower()
+    if "session" in _low and "match" in _low:
+        return "SESSION_MISMATCH"
+    return _r or "broker snapshot stale/missing timestamp"
+
+
 def upl_presentation(scope: dict, is_flat: bool, snapshot_ts) -> dict:
     """Canonical UPL presentation.
 

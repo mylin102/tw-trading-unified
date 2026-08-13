@@ -4225,7 +4225,7 @@ elif _selected_product == "TMF":
     # Legacy/mixed/unknown evidence renders N/A with the explicit reason —
     # NEVER 0, NEVER merged Paper/Live PnL.
     from core.performance_provenance import (
-        classify_mts_evidence, scope_mts_performance, upl_presentation, broker_snapshot_live_upl)
+        classify_mts_evidence, scope_mts_performance, upl_presentation, broker_snapshot_live_upl, live_upl_presented_reason)
     _exit_only_dashboard = active_runtime_truth.get("is_exit_only_runtime")
     _events_path_scope = runtime_path("logs", "mts_spread_events.jsonl")
     if _exit_only_dashboard:
@@ -4569,9 +4569,21 @@ elif _selected_product == "TMF":
                         _u1.metric("近月 UPL", "N/A")
                         _u2.metric("遠月 UPL", "N/A")
                         _u3.metric("總計 UPL", "N/A")
+                        # [fix] presentation-only reason mapping: a
+                        # quarantine/renewal audit reason or a session
+                        # mismatch leads over the generic stale message.
+                        _audit_ctx = {}
+                        try:
+                            _audit_ctx = json.loads(
+                                Path(runtime_path("execution_context.json"))
+                                .read_text(encoding="utf-8"))
+                        except Exception:
+                            _audit_ctx = {}
                         st.warning(
                             f"⚠️ MTS UPL N/A — "
-                            f"{_upl_reason or _upl_pres['reason']}")
+                            f"{live_upl_presented_reason(
+                                _upl_reason or _upl_pres['reason'],
+                                _audit_ctx.get('audit_reasons'))}")
                 _stale_upl = float(_mts_state.get("total_upl", 0) or 0)
                 if _upl_pres["kind"] == "ZERO" and abs(_stale_upl) > 0:
                     st.warning(
