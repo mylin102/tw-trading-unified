@@ -393,9 +393,11 @@ def certify_route(api: object, *, process_start_id: str,
     # capability; it permits normal LIVE_READY Policy-J/release evaluation.
     _mts_codes = {str((contracts.get("near") or {}).get("code") or "TMFH6"),
                   str((contracts.get("far") or {}).get("code") or "TMFI6")}
+    _fut_positions = [p for p in _positions if isinstance(p, dict)
+                      and str(p.get("code")) in _mts_codes]
     _valid_existing_mts = (
-        isinstance(_positions, list) and len(_positions) == 2
-        and {str(p.get("code")) for p in _positions if isinstance(p, dict)} == _mts_codes
+        isinstance(_positions, list) and len(_fut_positions) == 2
+        and {str(p.get("code")) for p in _fut_positions} == _mts_codes
         and all(isinstance(p, dict)
                 and type(p.get("qty")) is int and p["qty"] > 0
                 and any(x in str(p.get("direction") or "").lower()
@@ -403,7 +405,7 @@ def certify_route(api: object, *, process_start_id: str,
                 and isinstance(p.get("avg_cost"), (int, float))
                 and not isinstance(p.get("avg_cost"), bool)
                 and math.isfinite(float(p["avg_cost"])) and float(p["avg_cost"]) > 0
-                for p in _positions)
+                for p in _fut_positions)
         and not pre.get("open_orders"))
     if _positions and not _valid_existing_mts:
         failures.append("BROKER_NOT_FLAT")
