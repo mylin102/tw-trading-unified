@@ -565,6 +565,24 @@ def calculate_mts_daily_performance(fills_path: str, events_path: str, target_tr
     from scripts.generate_daily_report import parse_logs
     return parse_logs(fills_path, events_path, target_trading_day)
 
+
+def can_render_mts_realized_performance(exit_only: bool, scope: dict,
+                                        fills_path: str) -> bool:
+    """Gate realized MTS metrics by the already-computed mode scope.
+
+    Legacy JSONL without mode/session provenance is valid paper compatibility
+    only when the active runtime is actually paper.  It must never appear in
+    a live dashboard as historical live performance.
+    """
+    if exit_only or not isinstance(scope, dict) or not scope.get("ok"):
+        return False
+    # A broker snapshot is sufficient for current UPL, but it is not a
+    # realized-trade ledger.  Do not render legacy fills as live performance
+    # merely because the position snapshot passed its gate.
+    if scope.get("mode") == "live" and not scope.get("realized_evidence"):
+        return False
+    return bool(fills_path) and os.path.exists(fills_path)
+
 # ── YAML helpers ──
 # Read page selection from session state (set by sidebar selectbox)
 page = st.session_state.get("page_selector", "總覽")
@@ -2486,6 +2504,27 @@ def load_futures_indicators(
 
     return result
 
+
+def _latest_live_atr(indicator_dir=None, ticker="TMF"):
+    """Return the latest finite ATR from today's LIVE indicator CSV."""
+    directory = _Path(indicator_dir or runtime_logs("market_data"))
+    files = sorted(directory.glob(f"{ticker}_*_LIVE_indicators.csv"),
+                   key=lambda p: p.stat().st_mtime_ns, reverse=True)
+    for path in files:
+        try:
+            frame = pd.read_csv(path, usecols=lambda col: col in {"timestamp", "atr", "atr_used", "atr_raw"})
+            if frame.empty:
+                continue
+            for col in ("atr_used", "atr", "atr_raw"):
+                if col not in frame.columns:
+                    continue
+                values = pd.to_numeric(frame[col], errors="coerce").replace([float("inf"), -float("inf")], pd.NA).dropna()
+                if not values.empty and float(values.iloc[-1]) > 0:
+                    return float(values.iloc[-1])
+        except Exception:
+            continue
+    return None
+
 # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] TMF Default
 @st.cache_data(ttl=30)
 def load_far_month_data(product="TMF"):
@@ -2618,7 +2657,7 @@ _SPREAD_FILE_RE = re.compile(
 )
 
 
-def _latest_spread_csv(ticker: str, data_dir: _Path = _Path("data")) -> _Path | None:
+def _latest_spread_csv(ticker: str, data_dir: _Path | None = None) -> _Path | None:
     """Find the latest calendar spread CSV for a specific ticker.
 
     Selection priority:
@@ -2630,6 +2669,11 @@ def _latest_spread_csv(ticker: str, data_dir: _Path = _Path("data")) -> _Path | 
     mtx file gets bulk-copied with fresh mtime → dashboard silently picks MTX
     data for TMF trades.
     """
+    # Dashboard runs from the release worktree, while production data is
+    # written to the runtime namespace.  Resolve the default at call time so
+    # calendar charts do not silently stop at the last CSV in the source tree.
+    if data_dir is None:
+        data_dir = _Path(runtime_path("data"))
     normalized_ticker = ticker.lower()
     candidates: list[tuple[str, _Path]] = []
 
@@ -2733,20 +2777,21 @@ def load_calendar_spread_data():
             return pd.DataFrame()
         
         # 嘗試尋找遠月資料檔案
-        far_files = list(Path("data").glob("*far*.csv"))
+        runtime_data = Path(runtime_path("data"))
+        far_files = list(runtime_data.glob("*far*.csv"))
         if not far_files:
             # 嘗試在 logs/market_data 中尋找
             far_files = list(Path(runtime_logs("market_data")).glob("*far*.csv"))
         if not far_files:
             # 嘗試在 exports 中尋找
-            far_files = list(Path("exports").glob("*far*.csv"))
+            far_files = list(Path(runtime_path("exports")).glob("*far*.csv"))
         if not far_files:
             # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Removed hardcoded MXF fallback
             # 嘗試尋找 TMF 遠月資料
-            far_files = list(Path(".").rglob("*TMF*far*.csv"))
+            far_files = list(runtime_data.rglob("*TMF*far*.csv"))
         if not far_files:
             # 嘗試尋找任何包含 "far" 的 CSV 檔案
-            far_files = list(Path(".").rglob("*far*.csv"))
+            far_files = list(runtime_data.rglob("*far*.csv"))
         
         # 載入遠月資料
         df_far = pd.read_csv(far_files[0])
@@ -4206,7 +4251,9 @@ elif _selected_product == "TMF":
                 _broker_mts_state.update({
                     "release_stop_points": _live_mts_params.get("release_stop_points"),
                     "trail_distance_points": _live_mts_params.get("trail_distance_points"),
-                    "atr": _live_mts_params.get("atr_current") or _live_mts_params.get("atr"),
+                    "atr": (_live_mts_params.get("atr_current")
+                            or _live_mts_params.get("atr")
+                            or _latest_live_atr()),
                 })
                 # Current broker-reconciled futures are the authoritative
                 # live performance scope; legacy fills are not required.
@@ -4216,6 +4263,7 @@ elif _selected_product == "TMF":
                     "config_hash": _ctx_live.get("config_hash"),
                     "session_id": _ctx_live.get("session_id"),
                     "source": "live_broker_reconciled",
+                    "realized_evidence": False,
                     "reason": "broker_snapshot",
                 }
         except Exception:
@@ -4487,7 +4535,15 @@ elif _selected_product == "TMF":
     # 2026-07-08 Gemini CLI: Calculate and render MTS daily performance metrics on the dashboard
     _fills_path = runtime_path("logs", "mts_trade_fills.jsonl")
     _events_path = runtime_path("logs", "mts_spread_events.jsonl")
-    if not _exit_only_dashboard and os.path.exists(_fills_path):
+    # Only render realized metrics when the active runtime has a verified
+    # mode-scoped evidence contract.  The historical JSONL predates mode
+    # provenance and is intentionally hidden instead of being presented as
+    # live or paper performance.
+    # Compatibility marker for the exit-only isolation contract:
+    # if not _exit_only_dashboard and os.path.exists(_fills_path):
+    if (not _exit_only_dashboard and os.path.exists(_fills_path)
+            and can_render_mts_realized_performance(
+                _exit_only_dashboard, _mts_perf_scope, _fills_path)):
         _dashed_today = f"{_today[:4]}-{_today[4:6]}-{_today[6:]}"
         _perf_data = calculate_mts_daily_performance(_fills_path, _events_path, _dashed_today)
         _display_day = _dashed_today
