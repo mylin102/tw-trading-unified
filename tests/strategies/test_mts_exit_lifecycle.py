@@ -720,3 +720,82 @@ def test_combined_both_legs_wide_any_blocks(strategy):
         signal = strategy.on_bar(ctx)
     assert signal is None, "the both-leg path must keep blocking wide quotes"
 
+def test_release_near_quote_none_blocks(strategy):
+    """[P0c2] the released leg's quote keys are present but None:
+    QUOTE_INVALID — the width arithmetic must never see None."""
+    strategy = _release_armed_strategy(strategy)
+    bar = {
+        "near_close": 44120.0, "far_close": 44200.0, "atr": 10.0,
+        "near_bid": None, "near_ask": None,
+        "far_bid": 44199.0, "far_ask": 44201.0,
+        "near_tick_age_ms": 0, "far_tick_age_ms": 0,
+        "timestamp": datetime.now(),
+    }
+    ctx = StrategyContext(market=MarketData(last_bar=bar, ticker="TMF"),
+                          position=PositionView(size=1), config={})
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy.on_bar(ctx)
+    assert signal is None, "a None quote must block (no TypeError)"
+
+
+def test_release_near_quote_string_blocks(strategy):
+    """[P0c2] the released leg's quote is a string: QUOTE_INVALID — the
+    width arithmetic must never subtract strings."""
+    strategy = _release_armed_strategy(strategy)
+    bar = {
+        "near_close": 44120.0, "far_close": 44200.0, "atr": 10.0,
+        "near_bid": "44099", "near_ask": "44101",
+        "far_bid": 44199.0, "far_ask": 44201.0,
+        "near_tick_age_ms": 0, "far_tick_age_ms": 0,
+        "timestamp": datetime.now(),
+    }
+    ctx = StrategyContext(market=MarketData(last_bar=bar, ticker="TMF"),
+                          position=PositionView(size=1), config={})
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy.on_bar(ctx)
+    assert signal is None, "a string quote must block (no TypeError)"
+
+
+def test_release_near_quote_bool_blocks(strategy):
+    """[P0c2] the released leg's quote is a bool (True is an int):
+    QUOTE_INVALID — a bool must never be read as a 1pt price."""
+    strategy = _release_armed_strategy(strategy)
+    bar = {
+        "near_close": 44120.0, "far_close": 44200.0, "atr": 10.0,
+        "near_bid": True, "near_ask": 44101.0,
+        "far_bid": 44199.0, "far_ask": 44201.0,
+        "near_tick_age_ms": 0, "far_tick_age_ms": 0,
+        "timestamp": datetime.now(),
+    }
+    ctx = StrategyContext(market=MarketData(last_bar=bar, ticker="TMF"),
+                          position=PositionView(size=1), config={})
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy.on_bar(ctx)
+    assert signal is None, "a bool quote must block"
+
+
+def test_release_near_other_leg_string_blocks(strategy):
+    """[P0c2] the NON-released leg's quote is a string: the width
+    arithmetic must not crash — QUOTE_INVALID blocks the eval."""
+    strategy = _release_armed_strategy(strategy)
+    bar = {
+        "near_close": 44120.0, "far_close": 44200.0, "atr": 10.0,
+        "near_bid": 44119.0, "near_ask": 44121.0,
+        "far_bid": 44199.0, "far_ask": "44201",
+        "near_tick_age_ms": 0, "far_tick_age_ms": 0,
+        "timestamp": datetime.now(),
+    }
+    ctx = StrategyContext(market=MarketData(last_bar=bar, ticker="TMF"),
+                          position=PositionView(size=1), config={})
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event"), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy.on_bar(ctx)
+    assert signal is None, "a malformed other-leg quote must block, not crash"
+
