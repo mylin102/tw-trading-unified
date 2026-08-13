@@ -453,3 +453,44 @@ def test_atomic_json_normalizes_nested_containers(tmp_path):
     assert "SELL" in data["tags"]
     assert data["mapping"]["SELL"] == 7
 
+
+class _ActionNoName:
+    """Simulated Shioaji C-extension enum whose .name is not exposed as
+    a usable str (getattr raises) and whose str()/repr() raise the
+    runtime TypeError ('first argument must be a string, not
+    builtins.Action')."""
+
+    @property
+    def name(self):
+        raise TypeError("first argument must be a string, "
+                        "not builtins.Action")
+
+    def __str__(self):
+        raise TypeError("first argument must be a string, "
+                        "not builtins.Action")
+
+    def __repr__(self):
+        raise TypeError("first argument must be a string, "
+                        "not builtins.Action")
+
+
+def test_atomic_json_normalizes_nested_no_name_action(tmp_path):
+    """A C-extension enum-like value nested at the exact runtime shape
+    response[str][str][0][str] (a list record under a string-keyed
+    dict) with no usable .name normalizes to the fixed type name —
+    getattr(.name)/str()/repr() never leak to the C object."""
+    from core.live_broker_preflight import _atomic_json
+
+    p = tmp_path / "out7.json"
+    _atomic_json(p, {
+        "snapshot": {
+            "records": [
+                {"field": _ActionNoName()},
+                {"field": _ActionNoName()},
+            ],
+        },
+    })
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["snapshot"]["records"][0]["field"] == "_ActionNoName"
+    assert data["snapshot"]["records"][1]["field"] == "_ActionNoName"
+
