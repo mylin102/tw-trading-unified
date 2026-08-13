@@ -39,7 +39,7 @@ def _json_safe(value: Any) -> Any:
     str()/repr() are never called on non-JSON objects (the C enum str()
     raises 'first argument must be a string, not builtins.Action').
     No secrets: non-JSON objects degrade to the type name."""
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if type(value) in (str, int, float, bool) or value is None:
         return value
     if isinstance(value, (datetime, date)):
         return value.isoformat()
@@ -66,7 +66,7 @@ def _json_safe_key(key: Any) -> Any:
         pass
     if isinstance(key, (datetime, date)):
         return key.isoformat()
-    if isinstance(key, (str, int, float, bool)) or key is None:
+    if type(key) in (str, int, float, bool) or key is None:
         return key
     return type(key).__name__
 
