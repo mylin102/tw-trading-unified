@@ -343,3 +343,61 @@ def test_post_startup_canonical_reconciles_current_session_live_upl(
     assert reason is None, reason
     assert upl == {"TMFH6": 1850.0, "TMFI6": -1740.0}
 
+
+class _CEnum:
+    """Simulated Shioaji C-extension enum: str() itself raises (the
+    exact runtime TypeError observed at preflight recovery-r12)."""
+
+    name = "SELL"
+
+    def __str__(self):
+        raise TypeError("first argument must be a string, "
+                        "not builtins.Action")
+
+
+def test_atomic_json_serializes_action_enums(tmp_path):
+    """Shioaji C-extension enum values (Action/OrderState/…) serialize
+    JSON-safe as their NAME without crashing the json encoder."""
+    from enum import Enum
+    from core.live_broker_preflight import _atomic_json
+
+    class _Action(Enum):
+        SELL = "sell"
+
+    p = tmp_path / "out.json"
+    _atomic_json(p, {"action": _Action.SELL,
+                     "order": {"side": _Action.SELL}, "n": 1})
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["action"] == "SELL"
+    assert data["order"]["side"] == "SELL"
+    assert data["n"] == 1
+
+
+def test_atomic_json_never_strs_c_enums(tmp_path):
+    """The serializer must use the enum NAME — str() on the C-extension
+    enum raises TypeError and must never be called."""
+    from core.live_broker_preflight import _atomic_json
+
+    p = tmp_path / "out2.json"
+    _atomic_json(p, {"action": _CEnum()})
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["action"] == "SELL"
+
+
+def test_atomic_json_preserves_no_secrets(tmp_path):
+    """Non-serializable fallback never leaks repr/str of the object
+    (no secrets); it degrades to the type name."""
+    from core.live_broker_preflight import _atomic_json
+
+    class _SecretObj:
+        def __repr__(self):
+            return "SECRET-123"
+
+        def __str__(self):
+            return "SECRET-123"
+
+    p = tmp_path / "out3.json"
+    _atomic_json(p, {"blob": _SecretObj()})
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["blob"] == "_SecretObj"
+
