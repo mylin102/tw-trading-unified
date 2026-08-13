@@ -4072,6 +4072,29 @@ class TMFSpread(StrategyBase):
         near_ask = bar.get("near_ask", near_close)
         far_bid = bar.get("far_bid", far_close)
         far_ask = bar.get("far_ask", far_close)
+        # A release leg can be identified from the current risk evaluation
+        # before the quote-width gate.  This matters after broker hydration
+        # or restart recovery, where the lifecycle adapter may not yet have
+        # materialized a RELEASE decision for the current bar.  Do not let a
+        # wide *other* leg suppress an already breached single-leg release.
+        _candidate_release_leg = None
+        if _decision is None:
+            try:
+                _release_stop_probe, _trail_probe, _ = self._evaluate_risk(
+                    near_close, far_close, current_pnl, bar)
+                _near_hit_probe = self._pnl_near(near_close) <= -_release_stop_probe
+                _far_hit_probe = self._pnl_far(far_close) <= -_release_stop_probe
+                _phase_probe = getattr(self._lifecycle_oca, "phase", None)
+                _rg_probe = getattr(self._lifecycle_oca, "release_group", None)
+                _armed_probe = str(getattr(getattr(_rg_probe, "status", None),
+                                           "value", "")) == "ARMED"
+                if _phase_probe == PositionPhase.SPREAD and _armed_probe:
+                    if _near_hit_probe and not _far_hit_probe:
+                        _candidate_release_leg = Leg.NEAR
+                    elif _far_hit_probe and not _near_hit_probe:
+                        _candidate_release_leg = Leg.FAR
+            except Exception:
+                _candidate_release_leg = None
         # [P0b] LEG-SCOPED width gate (aligns with the decoupled leg
         # freshness check): a single-leg RELEASE only crosses the
         # released leg's spread — a wide quote on the OTHER leg must not
@@ -4080,6 +4103,8 @@ class TMFSpread(StrategyBase):
         _rel_leg = None
         if _decision is not None and _decision.action == LifecycleAction.RELEASE:
             _rel_leg = _decision.release_leg
+        elif _candidate_release_leg is not None:
+            _rel_leg = _candidate_release_leg
         _check_near = _rel_leg is None or _rel_leg == Leg.NEAR
         _check_far = _rel_leg is None or _rel_leg == Leg.FAR
 
