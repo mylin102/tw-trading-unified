@@ -159,16 +159,50 @@ def resolve_near_far_contracts(api: Any, product: str) -> tuple[Any, Any]:
     return near, far
 
 
+def _canonical_direction(raw: Any) -> str | None:
+    """Canonical broker position direction: a Shioaji Action enum maps
+    to 'buy'/'sell' via SAFE enum member identity — name/value
+    attribute access only; NEVER str()/repr() on the C-extension
+    (which raises TypeError), never the generic type name.  Unknown
+    values => None (fail-closed: the dashboard and the attestation
+    reject a missing/invalid direction)."""
+    if raw is None:
+        return None
+    _candidates: list[str] = []
+    if isinstance(raw, str) and raw:
+        _candidates.append(raw)
+    try:
+        _n = getattr(raw, "name", None)
+        if isinstance(_n, str) and _n:
+            _candidates.append(_n)
+    except Exception:
+        pass
+    try:
+        _v = getattr(raw, "value", None)
+        if isinstance(_v, str) and _v:
+            _candidates.append(_v)
+    except Exception:
+        pass
+    for _c in _candidates:
+        _low = _c.strip().lower()
+        if _low in ("buy", "sell"):
+            return _low
+        if _low in ("b", "s"):
+            return "buy" if _low == "b" else "sell"
+    return None
+
+
 def _safe_positions(api: Any, account: Any) -> list[dict[str, Any]]:
-    """Preserve broker position identity: code / qty / direction /
-    avg_cost (Shioaji's Position.price is the average cost) / pnl so a
-    later consumer can render live UPL and the leg identity without
-    fabricating cost."""
+    """Preserve broker position identity: code / qty / direction
+    (canonical buy/sell) / avg_cost (Shioaji's Position.price is the
+    average cost) / pnl so a later consumer can render live UPL and
+    the leg identity without fabricating cost."""
     return [
         {
             "code": getattr(p, "code", None),
             "qty": getattr(p, "quantity", None),
-            "direction": getattr(p, "direction", None),
+            "direction": _canonical_direction(
+                getattr(p, "direction", None)),
             "avg_cost": getattr(p, "price", None),
             "pnl": getattr(p, "pnl", None),
         }
