@@ -4201,6 +4201,13 @@ elif _selected_product == "TMF":
                     "position_phase": "SPREAD",
                     "_updated": _canon.get("captured_at") or _canon.get("captured_at_ms") or "?",
                 }
+                _live_mts_params = (futures_cfg.get("mts", {}).get("params", {})
+                                    if isinstance(futures_cfg, dict) else {})
+                _broker_mts_state.update({
+                    "release_stop_points": _live_mts_params.get("release_stop_points"),
+                    "trail_distance_points": _live_mts_params.get("trail_distance_points"),
+                    "atr": _live_mts_params.get("atr_current") or _live_mts_params.get("atr"),
+                })
                 # Current broker-reconciled futures are the authoritative
                 # live performance scope; legacy fills are not required.
                 _mts_perf_scope = {
