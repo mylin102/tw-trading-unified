@@ -175,44 +175,100 @@ def test_safe_positions_preserves_direction_and_avg_cost():
     assert by_code["TMFI6"]["avg_cost"] == 45231.0
 
 
-def test_broker_snapshot_live_upl_fresh(tmp_path):
-    """Live UPL comes from the CURRENT fresh broker-reconciled snapshot
-    (per-code pnl); the identity is preserved."""
+def _canonical_snap(tmp_path, name="snap.json", **over):
+    """A fully-canonical live broker snapshot (the shape written by the
+    preflight adapter)."""
+    data = {
+        "source": "live_broker",
+        "mode": "live",
+        "account_identity_hash": "acc-hash-123",
+        "session_id": "req-42",
+        "canonical_input_hash": "sha256-deadbeef",
+        "captured_at": int(datetime.now(timezone.utc).timestamp() * 1000),
+        "positions": [
+            {"code": "TMFH6", "qty": 1, "direction": "Sell",
+             "avg_cost": 46077.0, "pnl": 1850.0},
+            {"code": "TMFI6", "qty": 1, "direction": "Buy",
+             "avg_cost": 45231.0, "pnl": -1740.0},
+        ],
+        "open_orders": [],
+    }
+    data.update(over)
+    snap = tmp_path / name
+    snap.write_text(json.dumps(data), encoding="utf-8")
+    return snap
+
+
+def test_broker_snapshot_live_upl_fresh_canonical(tmp_path):
+    """Live UPL requires the full canonical live-broker provenance and
+    the exact expected MTS legs with direction/qty/avg_cost."""
     from core.performance_provenance import broker_snapshot_live_upl
 
-    snap = tmp_path / "snap.json"
-    snap.write_text(json.dumps({
-        "captured_at": datetime.now(timezone.utc).isoformat(),
-        "snapshot": {
-            "positions": [
-                {"code": "TMFH6", "qty": 1, "direction": "Sell",
-                 "avg_cost": 46077.0, "pnl": 1850.0},
-                {"code": "TMFI6", "qty": 1, "direction": "Buy",
-                 "avg_cost": 45231.0, "pnl": -1740.0},
-            ],
-            "open_orders": [],
-        },
-    }), encoding="utf-8")
-
-    upl, reason = broker_snapshot_live_upl(snap)
+    snap = _canonical_snap(tmp_path)
+    upl, reason = broker_snapshot_live_upl(snap, session_id="req-42")
     assert reason is None, reason
-    assert upl["TMFH6"] == 1850.0
-    assert upl["TMFI6"] == -1740.0
+    assert upl == {"TMFH6": 1850.0, "TMFI6": -1740.0}
 
 
 def test_broker_snapshot_live_upl_missing_stale(tmp_path):
-    """No/missing/stale broker snapshot => None + a reason (the UI
-    renders N/A — the live UPL is never fabricated)."""
+    """No/stale snapshot => None + a reason (N/A, never fabricated)."""
     from core.performance_provenance import broker_snapshot_live_upl
 
     upl, reason = broker_snapshot_live_upl(tmp_path / "none.json")
     assert upl is None and reason
 
-    stale = tmp_path / "stale.json"
-    stale.write_text(json.dumps({
-        "captured_at": "2026-08-01T00:00:00+00:00",
-        "snapshot": {"positions": [{"code": "TMFH6", "pnl": 1.0}]},
-    }), encoding="utf-8")
-    upl2, reason2 = broker_snapshot_live_upl(stale)
+    stale = _canonical_snap(tmp_path, name="stale.json",
+                            captured_at=1754000000000)  # 2025-08
+    upl2, reason2 = broker_snapshot_live_upl(stale, session_id="req-42")
     assert upl2 is None and reason2
+
+
+def test_broker_snapshot_live_upl_requires_provenance(tmp_path):
+    """Missing/mismatched canonical provenance => N/A (fail-closed)."""
+    from core.performance_provenance import broker_snapshot_live_upl
+
+    for over, tag in (
+        ({"source": "paper"}, "source"),
+        ({"mode": "paper"}, "mode"),
+        ({"account_identity_hash": ""}, "account"),
+        ({"canonical_input_hash": ""}, "hash"),
+        ({"session_id": ""}, "session"),
+    ):
+        snap = _canonical_snap(tmp_path, name=tag + ".json", **over)
+        upl, reason = broker_snapshot_live_upl(snap, session_id="req-42")
+        assert upl is None and reason, (tag, reason)
+
+
+def test_broker_snapshot_live_upl_session_mismatch(tmp_path):
+    """A snapshot taken under a different session than the current
+    runtime context => N/A (fail-closed)."""
+    from core.performance_provenance import broker_snapshot_live_upl
+
+    snap = _canonical_snap(tmp_path, name="sess.json")
+    upl, reason = broker_snapshot_live_upl(snap, session_id="req-999")
+    assert upl is None and "session" in reason
+
+
+def test_broker_snapshot_live_upl_requires_exact_legs(tmp_path):
+    """Expected TMFH6/TMFI6 legs must carry direction/qty/avg_cost;
+    missing identity or extra/missing legs => N/A."""
+    from core.performance_provenance import broker_snapshot_live_upl
+
+    snap = _canonical_snap(tmp_path, name="legs.json",
+                           positions=[
+                               {"code": "TMFH6", "qty": 1, "pnl": 1850.0},
+                               {"code": "TMFI6", "qty": 1, "direction": "Buy",
+                                "avg_cost": 45231.0, "pnl": -1740.0},
+                           ])
+    upl, reason = broker_snapshot_live_upl(snap, session_id="req-42")
+    assert upl is None and reason  # near leg lacks direction/avg_cost
+
+    snap2 = _canonical_snap(tmp_path, name="extra.json",
+                            positions=[
+                                {"code": "TMFH6", "qty": 1,
+                                 "direction": "Sell", "avg_cost": 46077.0,
+                                 "pnl": 1850.0},
+                            ])
+    upl2, reason2 = broker_snapshot_live_upl(snap2, session_id="req-42")
+    assert upl2 is None and reason2  # far leg missing
 
