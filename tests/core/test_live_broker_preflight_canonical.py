@@ -146,3 +146,73 @@ def test_paper_path_preserved(tmp_path):
     r2 = guard_flat_no_pending(str(pf), {"effective_mode": "live"})
     assert not r2.ok
     assert "GUARD_SNAPSHOT_PAPER_NOT_LIVE" in r2.reasons
+
+def test_safe_positions_preserves_direction_and_avg_cost():
+    """Broker position identity (code/qty/direction/avg_cost/pnl) is
+    preserved in the preflight evidence."""
+    from core.live_broker_preflight import _safe_positions
+
+    class _Pos:
+        def __init__(self, code, quantity, price, direction, pnl):
+            self.code = code
+            self.quantity = quantity
+            self.price = price
+            self.direction = direction
+            self.pnl = pnl
+
+    class _Api:
+        def list_positions(self, account):
+            return [_Pos("TMFH6", 1, 46077.0, "Sell", 1850.0),
+                    _Pos("TMFI6", 1, 45231.0, "Buy", -1740.0)]
+
+    rows = _safe_positions(_Api(), object())
+    by_code = {r["code"]: r for r in rows}
+    assert by_code["TMFH6"]["qty"] == 1
+    assert by_code["TMFH6"]["direction"] == "Sell"
+    assert by_code["TMFH6"]["avg_cost"] == 46077.0
+    assert by_code["TMFH6"]["pnl"] == 1850.0
+    assert by_code["TMFI6"]["direction"] == "Buy"
+    assert by_code["TMFI6"]["avg_cost"] == 45231.0
+
+
+def test_broker_snapshot_live_upl_fresh(tmp_path):
+    """Live UPL comes from the CURRENT fresh broker-reconciled snapshot
+    (per-code pnl); the identity is preserved."""
+    from core.performance_provenance import broker_snapshot_live_upl
+
+    snap = tmp_path / "snap.json"
+    snap.write_text(json.dumps({
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "snapshot": {
+            "positions": [
+                {"code": "TMFH6", "qty": 1, "direction": "Sell",
+                 "avg_cost": 46077.0, "pnl": 1850.0},
+                {"code": "TMFI6", "qty": 1, "direction": "Buy",
+                 "avg_cost": 45231.0, "pnl": -1740.0},
+            ],
+            "open_orders": [],
+        },
+    }), encoding="utf-8")
+
+    upl, reason = broker_snapshot_live_upl(snap)
+    assert reason is None, reason
+    assert upl["TMFH6"] == 1850.0
+    assert upl["TMFI6"] == -1740.0
+
+
+def test_broker_snapshot_live_upl_missing_stale(tmp_path):
+    """No/missing/stale broker snapshot => None + a reason (the UI
+    renders N/A — the live UPL is never fabricated)."""
+    from core.performance_provenance import broker_snapshot_live_upl
+
+    upl, reason = broker_snapshot_live_upl(tmp_path / "none.json")
+    assert upl is None and reason
+
+    stale = tmp_path / "stale.json"
+    stale.write_text(json.dumps({
+        "captured_at": "2026-08-01T00:00:00+00:00",
+        "snapshot": {"positions": [{"code": "TMFH6", "pnl": 1.0}]},
+    }), encoding="utf-8")
+    upl2, reason2 = broker_snapshot_live_upl(stale)
+    assert upl2 is None and reason2
+
