@@ -385,12 +385,30 @@ def certify_route(api: object, *, process_start_id: str,
             or not math.isfinite(float(available)) or float(available) < required:
         failures.append("MARGIN_INSUFFICIENT")
 
-    if pre.get("positions"):
+    contracts = pre.get("contracts") or {}
+    _positions = pre.get("positions") or []
+    # A restart with an existing MTS spread is safe when broker truth is
+    # exact: two futures legs, complete direction/cost/qty, and no orders.
+    # Other positions remain fail-closed.  This does not create an exit-only
+    # capability; it permits normal LIVE_READY Policy-J/release evaluation.
+    _mts_codes = {str((contracts.get("near") or {}).get("code") or "TMFH6"),
+                  str((contracts.get("far") or {}).get("code") or "TMFI6")}
+    _valid_existing_mts = (
+        isinstance(_positions, list) and len(_positions) == 2
+        and {str(p.get("code")) for p in _positions if isinstance(p, dict)} == _mts_codes
+        and all(isinstance(p, dict)
+                and type(p.get("qty")) is int and p["qty"] > 0
+                and str(p.get("direction") or "").lower() in {"buy", "sell", "long", "short"}
+                and isinstance(p.get("avg_cost"), (int, float))
+                and not isinstance(p.get("avg_cost"), bool)
+                and math.isfinite(float(p["avg_cost"])) and float(p["avg_cost"]) > 0
+                for p in _positions)
+        and not pre.get("open_orders"))
+    if _positions and not _valid_existing_mts:
         failures.append("BROKER_NOT_FLAT")
     if pre.get("open_orders"):
         failures.append("OPEN_ORDERS_PRESENT")
 
-    contracts = pre.get("contracts") or {}
     near_code = (contracts.get("near") or {}).get("code")
     far_code = (contracts.get("far") or {}).get("code")
     if not near_code or not far_code or near_code == far_code:
