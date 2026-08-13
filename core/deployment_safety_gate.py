@@ -231,7 +231,8 @@ def _parse_ts(value) -> Optional[float]:
 
 
 def guard_flat_no_pending(position_state_path: str,
-                          ctx_data: dict) -> GuardResult:
+                          ctx_data: dict,
+                          allow_existing_mts_position: bool = False) -> GuardResult:
     """Provenance-aware flat check.
 
     - paper snapshot (mode/source == paper) is accepted ONLY for a paper
@@ -292,6 +293,23 @@ def guard_flat_no_pending(position_state_path: str,
 
     _positions = _relevant(positions, "positions")
     _open_orders = _relevant(open_orders, "open_orders")
+
+    # A normal post-startup restart may resume an already broker-held MTS
+    # spread.  Accept only the exact two futures legs with complete identity;
+    # arbitrary/non-MTS positions remain fail-closed.
+    if allow_existing_mts_position and isinstance(_positions, list) and _positions:
+        _codes = {str(p.get("code")) for p in _positions if isinstance(p, dict)}
+        if (_codes == {"TMFH6", "TMFI6"}
+                and len(_positions) == 2
+                and all(isinstance(p, dict)
+                        and type(p.get("quantity")) is int and p["quantity"] > 0
+                        and str(p.get("direction") or "").lower() in {"buy", "sell", "long", "short"}
+                        and isinstance(p.get("avg_cost"), (int, float))
+                        and not isinstance(p.get("avg_cost"), bool)
+                        and float(p["avg_cost"]) > 0 for p in _positions)):
+            _stock_rows = sum(1 for p in positions if isinstance(p, dict)
+                              and str(p.get("account", "")) == "stock")
+            return _pass("flat_snapshot", "existing MTS spread broker-reconciled")
 
     # flat: 0 / 0.0 / [] / () (empty list is the Codex-contract shape)
     if isinstance(_positions, list):
@@ -763,6 +781,7 @@ def check_deployment(
     manifest_exclude_paths: Sequence[str] = (),
     expected_sha: Optional[str] = None,
     phase: str = "pre_deploy",
+    allow_existing_mts_position: bool = False,
 ) -> DeploymentCheck:
     """Run all guards. Fail-closed: ANY guard failure -> NOT_READY.
 
@@ -794,7 +813,10 @@ def check_deployment(
         guard_runtime_paths(runtime_dir),
         guard_single_process(pid_file),
         guard_flat_no_pending(position_state_path,
-                              read_ctx_snapshot(runtime_dir)),
+                              read_ctx_snapshot(runtime_dir),
+                              allow_existing_mts_position=(
+                                  phase == "post_startup"
+                                  and allow_existing_mts_position)),
         guard_quarantine_first_startup(monitor_path),
         session_result,
         guard_margin(margin_available, margin_evidence=margin_evidence),

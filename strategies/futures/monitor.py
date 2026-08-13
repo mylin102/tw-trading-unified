@@ -4579,7 +4579,8 @@ class FuturesMonitor:
                 manifest_paths=_manifests,
                 manifest_exclude_paths=_exclude,
                 expected_sha=os.environ.get("LRC_RELEASE_SHA", ""),
-                phase="post_startup")
+                phase="post_startup",
+                allow_existing_mts_position=True)
             return gate, _ev
         except Exception:
             from core.deployment_safety_gate import (
