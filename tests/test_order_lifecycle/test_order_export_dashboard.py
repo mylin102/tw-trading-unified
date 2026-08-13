@@ -189,3 +189,70 @@ class TestOrdersFileExport:
         export_data = [o.to_dict() for o in pending]
         assert export_data[0]["order_type"] == "limit"
         assert export_data[0]["price"] == 36000
+
+class TestExportJsonSafe:
+    """[export fix] Shioaji enum / non-serializable values never crash
+    the orders export; order identity and dedupe keys are preserved."""
+
+    def test_order_to_dict_action_datetime_does_not_crash(self):
+        """A leaked Action where a datetime belongs serializes as None
+        instead of crashing on .isoformat()."""
+        from enum import Enum
+
+        class _Action(Enum):
+            SELL = "sell"
+
+        o = Order(symbol="TMFH6", side=OrderSide.SELL,
+                  order_type=OrderType.MARKET, quantity=1, price=0.0,
+                  strategy="MTS_ENTRY", account="futures",
+                  order_id="ORD-A1")
+        o.status = OrderStatus.SUBMITTED
+        o.created_at = _Action.SELL
+        o.filled_at = _Action.SELL
+        d = o.to_dict()
+        assert d["created_at"] is None
+        assert d["filled_at"] is None
+        assert d["order_id"] == "ORD-A1"
+        assert d["symbol"] == "TMFH6"
+
+    def test_save_orders_wrapper_persists_action_laden_records(
+            self, tmp_path, monkeypatch):
+        """The export wrapper normalizes enum-laden order records
+        JSON-safe and persists them without crashing; identity and
+        dedupe keys are unchanged."""
+        from enum import Enum
+        from strategies.futures.monitor import FuturesMonitor
+
+        class _Action(Enum):
+            SELL = "sell"
+
+        m = FuturesMonitor.__new__(FuturesMonitor)
+        om = OrderManager(mode="paper")
+        o = om.create_order("TMF", OrderSide.BUY, OrderType.MARKET, 1,
+                            strategy="MTS_ENTRY", account="futures")
+        om.submit(o, exchange_ordno="P-1")
+        o.account = _Action.SELL          # leaked enum in a string field
+        m.order_mgr = om
+        m.trader = MagicMock(position=0)
+        m._registry = {}
+        m.ticker = "TMF"
+        m._session_date = "20260813"
+        (tmp_path / "exports" / "trades").mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
+        # the wrapper writes under runtime_path("exports", "trades") —
+        # redirect the runtime dir to the tmp tree so the real runtime
+        # exports are never touched.
+        monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+
+        m._save_orders_file_wrapper()
+
+        # the wrapper derives the filename from the order manager's
+        # session date (not the monitor attribute)
+        f = tmp_path / "exports" / "trades" / \
+            f"TMF_{om._session_date}_orders.json"
+        assert f.exists()
+        data = json.loads(f.read_text(encoding="utf-8"))
+        assert len(data) == 1
+        assert data[0]["order_id"] == o.order_id
+        assert isinstance(data[0]["account"], str)
+
