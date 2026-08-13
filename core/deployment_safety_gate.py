@@ -303,7 +303,8 @@ def guard_flat_no_pending(position_state_path: str,
                 and len(_positions) == 2
                 and all(isinstance(p, dict)
                         and type(p.get("quantity")) is int and p["quantity"] > 0
-                        and str(p.get("direction") or "").lower() in {"buy", "sell", "long", "short"}
+                        and any(x in str(p.get("direction") or "").lower()
+                                for x in ("buy", "sell", "long", "short"))
                         and isinstance(p.get("avg_cost"), (int, float))
                         and not isinstance(p.get("avg_cost"), bool)
                         and float(p["avg_cost"]) > 0 for p in _positions)):

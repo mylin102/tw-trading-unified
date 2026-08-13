@@ -398,7 +398,8 @@ def certify_route(api: object, *, process_start_id: str,
         and {str(p.get("code")) for p in _positions if isinstance(p, dict)} == _mts_codes
         and all(isinstance(p, dict)
                 and type(p.get("qty")) is int and p["qty"] > 0
-                and str(p.get("direction") or "").lower() in {"buy", "sell", "long", "short"}
+                and any(x in str(p.get("direction") or "").lower()
+                        for x in ("buy", "sell", "long", "short"))
                 and isinstance(p.get("avg_cost"), (int, float))
                 and not isinstance(p.get("avg_cost"), bool)
                 and math.isfinite(float(p["avg_cost"])) and float(p["avg_cost"]) > 0
