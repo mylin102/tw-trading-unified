@@ -4270,6 +4270,8 @@ class FuturesMonitor:
         out = []
         for p in raw_positions or []:
             try:
+                _px = getattr(p, "price", None)
+                _pnl = getattr(p, "pnl", None)
                 out.append({
                     "account": account_tag,
                     "code": str(getattr(p, "code", "")),
@@ -4277,6 +4279,8 @@ class FuturesMonitor:
                     "direction": getattr(getattr(p, "direction", None),
                                          "name", None)
                         or str(getattr(p, "direction", "")),
+                    "avg_cost": float(_px) if _px is not None else None,
+                    "pnl": float(_pnl) if _pnl is not None else None,
                 })
             except Exception:
                 continue
@@ -4397,6 +4401,30 @@ class FuturesMonitor:
         payload["canonical_input_hash"] = _hl.sha256(blob.encode()).hexdigest()
         return payload
 
+    def _persist_current_session_canonical(self, snapshot) -> None:
+        """[P0] persist the CURRENT-session canonical artifact so the
+        dashboard live UPL reconciles against this runtime session
+        (never the standalone preflight's request id).  Telemetry-only:
+        capture failures / missing session never overwrite the artifact
+        and never block the gate."""
+        try:
+            from core.runtime_paths import runtime_path
+            if not (snapshot or {}).get("session_id"):
+                return
+            if ((snapshot.get("fetch_status") or {})
+                    .get("capture") != "OK"):
+                return
+            _diag = Path(runtime_path("exports", "trades", "live",
+                                      "diagnostics"))
+            _diag.mkdir(parents=True, exist_ok=True)
+            _canon = _diag / "broker_snapshot_canonical.json"
+            _tmp = _canon.with_name(_canon.name + ".tmp")
+            _tmp.write_text(json.dumps(snapshot, ensure_ascii=False,
+                                       default=str), encoding="utf-8")
+            os.replace(_tmp, _canon)
+        except Exception:
+            pass  # never block the post-startup gate on telemetry
+
     def _run_post_startup_gate(self):
         """[P0 post-startup gate] the in-process, UNAVOIDABLE gate run
         BEFORE any transition_with_certificate / LIVE_READY (startup AND
@@ -4415,6 +4443,7 @@ class FuturesMonitor:
                     guard="reconciliation", ok=False,
                     reasons=(_pending_reason,)),)), None
         snapshot = self._capture_post_startup_snapshot()
+        self._persist_current_session_canonical(snapshot)
         _ev = None
         try:
             from core.runtime_paths import runtime_path
