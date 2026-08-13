@@ -89,6 +89,55 @@ def _json_safe_normalize(payload: Any) -> Any:
     return _json_safe(payload)
 
 
+def _probe_payload_types(payload: Any, prefix: str = "response",
+                         depth: int = 0, seen: set | None = None) -> None:
+    """TEMPORARY type-only diagnostic (NO values/secrets): walks the
+    preflight response and prints the container/enum types and paths so
+    the serializer normalization can be extended to the exact runtime
+    container (recovery-r15 Action TypeError).  Depth/cycle guarded.
+    REMOVE after the recovery container is identified."""
+    if depth > 24 or payload is None:
+        return
+    if seen is None:
+        seen = set()
+    _tid = id(payload)
+    if _tid in seen:
+        return
+    seen.add(_tid)
+    _mod = type(payload).__module__
+    _tname = type(payload).__name__
+    if _mod != "builtins":
+        print(f"[PROBE][{prefix}] container={_mod}.{_tname}")
+    try:
+        if isinstance(payload, dict):
+            for _k, _v in payload.items():
+                _kt = type(_k).__name__
+                if _kt not in ("str", "int", "float", "bool"):
+                    print(f"[PROBE][{prefix}] KEY {_kt} "
+                          f"(mod={type(_k).__module__})")
+                _probe_payload_types(_v, f"{prefix}[{_kt}]",
+                                     depth + 1, seen)
+        elif isinstance(payload, (list, tuple)):
+            for _i, _v in enumerate(payload[:24]):
+                _probe_payload_types(_v, f"{prefix}[{_i}]",
+                                     depth + 1, seen)
+        elif isinstance(payload, (set, frozenset)):
+            for _v in list(payload)[:24]:
+                _probe_payload_types(_v, f"{prefix}<>",
+                                     depth + 1, seen)
+        else:
+            try:
+                _has_name = getattr(payload, "name", None) is not None
+                _has_val = getattr(payload, "value", None) is not None
+                if _has_name or _has_val:
+                    print(f"[PROBE][{prefix}] ENUM-LIKE "
+                          f"{_mod}.{_tname}")
+            except Exception:
+                pass
+    except Exception as _exc:
+        print(f"[PROBE][{prefix}] TRAVERSE-ERR {type(_exc).__name__}")
+
+
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -380,6 +429,7 @@ def run_once(api_factory: Any, *, request_id: str | None = None, product: str = 
                     api.logout()
                 except Exception:
                     pass
+        _probe_payload_types(response, prefix="response")  # TEMP r16
         _atomic_json(diag / f"broker_snapshot_{request_id}.json", response)
         _atomic_json(diag / "broker_snapshot_latest.json", response)
         if response.get("snapshot") is not None:
