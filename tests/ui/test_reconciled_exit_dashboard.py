@@ -466,7 +466,7 @@ def test_exit_only_primary_panel_skips_legacy_state_and_daily_jsonl():
 
     assert "_mts_state_file = None if _exit_only_dashboard" in source
     assert "if not _exit_only_dashboard and os.path.exists(_fills_path):" in source
-    assert "受限平倉模式—等待新鮮券商對帳與雙腿 BBO" in source
+    assert "受限平倉模式—受限範圍待券商對帳重新驗證" in source
 
 
 def test_existing_capability_can_build_narrow_re_attestation_payload():
@@ -597,3 +597,72 @@ def test_dashboard_renders_exit_only_lifecycle_without_live_paper_fallback():
     assert "SUBMITTED" in source
     assert "FILLED / CANCELLED / REJECTED / TIMEOUT" in source
     assert "exit_only_lifecycle_presentation" in source
+
+
+def test_latest_bbo_observation_info_matching_rid(tmp_path):
+    """The latest EXIT_ONLY_BBO_OBSERVED timestamp/count for the
+    capability's reconciliation id (nested in bbo_payload) is
+    presented — the runtime has live observations, not BBO_MISSING."""
+    from ui.reconciled_exit_presentation import _latest_bbo_observation_info
+
+    ev = tmp_path / "events.jsonl"
+    ev.write_text(
+        json.dumps({"event": "EXIT_ONLY_BBO_OBSERVED",
+                    "ts": "2026-08-13T22:01:00.000000",
+                    "bbo_payload": {"reconciliation_id": "rid-5278"}})
+        + "\n"
+        + json.dumps({"event": "EXIT_ONLY_BBO_OBSERVED",
+                      "ts": "2026-08-13T22:02:00.000000",
+                      "bbo_payload": {"reconciliation_id": "rid-5278"}})
+        + "\n"
+        + json.dumps({"event": "EXIT_ONLY_BBO_OBSERVED",
+                      "ts": "2026-08-13T22:03:00.000000",
+                      "bbo_payload": {"reconciliation_id": "rid-other"}})
+        + "\n",
+        encoding="utf-8")
+    info = _latest_bbo_observation_info(
+        ev, {"reconciliation_id": "rid-5278"})
+    assert info and info["count"] == 2
+    assert info["latest_ts"] == "2026-08-13T22:02:00.000000"
+
+
+def test_latest_bbo_observation_info_no_match_is_none(tmp_path):
+    """No valid matching observation => None (BBO_MISSING stays valid)."""
+    from ui.reconciled_exit_presentation import _latest_bbo_observation_info
+
+    ev = tmp_path / "events.jsonl"
+    ev.write_text(json.dumps({
+        "event": "EXIT_ONLY_BBO_OBSERVED", "ts": "2026-08-13T22:02:00",
+        "bbo_payload": {"reconciliation_id": "rid-x"}}) + "\n",
+        encoding="utf-8")
+    assert _latest_bbo_observation_info(
+        tmp_path / "none.jsonl", {"reconciliation_id": "rid-5278"}) is None
+    assert _latest_bbo_observation_info(
+        ev, {"reconciliation_id": "rid-5278"}) is None
+    assert _latest_bbo_observation_info(ev, None) is None
+
+
+def test_exit_only_presented_reason_quarantine_first():
+    """A quarantine/renewal mismatch leads over EXIT_ONLY_BBO_MISSING."""
+    from ui.reconciled_exit_presentation import exit_only_presented_reason
+
+    r = exit_only_presented_reason(
+        "EXIT_ONLY_BBO_MISSING",
+        ["BROKER_NOT_FLAT",
+         "EXIT_ONLY_RENEWAL:EXIT_ONLY_POSITION_MISMATCH"],
+        {"count": 5, "latest_ts": "2026-08-13T22:02:00"})
+    assert r == "EXIT_ONLY_RENEWAL:EXIT_ONLY_POSITION_MISMATCH"
+
+
+def test_exit_only_presented_reason_bbo_missing_only_when_no_observation():
+    """EXIT_ONLY_BBO_MISSING is only presented when no valid matching
+    observation exists; present-but-unverified otherwise."""
+    from ui.reconciled_exit_presentation import exit_only_presented_reason
+
+    assert exit_only_presented_reason(
+        "EXIT_ONLY_BBO_MISSING", [], None) == "EXIT_ONLY_BBO_MISSING"
+    assert exit_only_presented_reason(
+        "EXIT_ONLY_BBO_MISSING", [],
+        {"count": 3, "latest_ts": "t"}) == \
+        "EXIT_ONLY_BBO_PRESENT_BUT_UNVERIFIED"
+
