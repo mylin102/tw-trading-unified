@@ -640,6 +640,44 @@ def write_exit_only_attestation_request(path, payload):
     return True
 
 
+def mts_order_lifecycle_rows(orders_data):
+    """[dashboard lifecycle] per-leg TERMINAL-state rows for the order
+    lifecycle display.  Only FILLED / CANCELLED / REJECTED / TIMEOUT /
+    EXPIRED orders are shown with their terminal time, filled quantity
+    and fill price (missing => N/A).  Quote-observation records (e.g.
+    EXIT_ONLY_BBO_OBSERVED) are observation-only and are NEVER
+    displayed as a trigger; paper/live/exit-only rows are never mixed
+    (the caller passes the already-isolated presentation set)."""
+    _rows = []
+    for _o in orders_data or []:
+        if not isinstance(_o, dict):
+            continue
+        _status = str(_o.get("status") or "").strip().upper()
+        if _status not in ("FILLED", "CANCELLED", "REJECTED", "TIMEOUT",
+                           "EXPIRED"):
+            continue  # pending orders and observation records are not
+                      # terminal triggers
+        _term = (_o.get("filled_at") or _o.get("rejected_at")
+                 or _o.get("cancelled_at") or _o.get("expired_at"))
+        _qty = _o.get("filled_quantity")
+        _price = _o.get("avg_fill_price")
+        if _price is None:
+            _price = _o.get("price")
+        _rows.append({
+            "order_id": str(_o.get("order_id")) if _o.get("order_id")
+            else "N/A",
+            "symbol": str(_o.get("symbol")) if _o.get("symbol") else "N/A",
+            "side": str(_o.get("side") or "").upper() or "N/A",
+            "status": _status,
+            "terminal_at": str(_term) if _term else "N/A",
+            "filled_qty": _qty if isinstance(_qty, (int, float)) else "N/A",
+            "price": _price if isinstance(_price, (int, float)) else "N/A",
+            "reason": str(_o.get("reject_reason")
+                          or _o.get("cancel_reason") or ""),
+        })
+    return _rows
+
+
 def filter_mts_order_rows_for_exit_only(rows, *, reconciliation_id):
     """[Dashboard] presentation-only filter for RECONCILED_EXIT_ONLY:
     keep only rows explicitly bound to the CURRENT capability's
@@ -4748,6 +4786,28 @@ elif _selected_product == "TMF":
                                      "未實現損益": st.column_config.TextColumn("未實現損益"),
                                      "current_price": "目前價",
                                  })
+
+                    # [dashboard lifecycle] per-leg TERMINAL states:
+                    # FILLED/CANCELLED/REJECTED/TIMEOUT/EXPIRED with the
+                    # terminal time, filled qty and fill price; missing
+                    # => N/A.  Quote observations (EXIT_ONLY_BBO_OBSERVED)
+                    # are observation-only and never a trigger.
+                    _lifecycle = mts_order_lifecycle_rows(orders_data)
+                    if _lifecycle:
+                        st.markdown("**🔄 逐腿終態 (Order Lifecycle)**")
+                        st.dataframe(
+                            pd.DataFrame(_lifecycle), width='stretch',
+                            hide_index=True,
+                            column_config={
+                                "order_id": "委託單ID",
+                                "symbol": "腿別",
+                                "side": "方向",
+                                "status": "終態",
+                                "terminal_at": "終態時間",
+                                "filled_qty": "成交數量",
+                                "price": "成交價格",
+                                "reason": "原因",
+                            })
 
                     # Summary stats
                     total = len(df_orders)
