@@ -603,6 +603,45 @@ def _generated_exit_only_evidence(legs, trade_id=None, now_ms=None):
             f"legs={_legs}{_suffix}")
 
 
+def _derive_locked_trade_id_from_events(events_path, canonical_legs):
+    """Derive the locked EXIT_ONLY trade id from the CURRENT runtime
+    event history ONLY when exactly one unique MTS trade matches BOTH
+    canonical legs (symbol/side/qty).  No match or ambiguity => None
+    (fail closed — never fabricate an id; the backend build then
+    rejects a blank trade id)."""
+    if not canonical_legs:
+        return None
+    _expected = frozenset(
+        (str(l.get("symbol")), str(l.get("side") or "").lower(),
+         int(l.get("remaining_qty") or 0))
+        for l in canonical_legs if isinstance(l, dict))
+    _matches = set()
+    try:
+        with open(events_path, encoding="utf-8") as _f:
+            for _line in _f:
+                try:
+                    _ev = json.loads(_line)
+                except Exception:
+                    continue
+                _tid = _ev.get("trade_id")
+                if not _tid:
+                    continue
+                _legs = _ev.get("expected_legs") or _ev.get("legs")
+                if not isinstance(_legs, list):
+                    continue
+                _leg_set = frozenset(
+                    (str(l.get("symbol")), str(l.get("side") or "").lower(),
+                     int(l.get("remaining_qty") or 0))
+                    for l in _legs if isinstance(l, dict))
+                if _leg_set == _expected:
+                    _matches.add(str(_tid))
+    except Exception:
+        return None
+    if len(_matches) == 1:
+        return next(iter(_matches))
+    return None
+
+
 def build_exit_only_attestation_request(
         capability, *, operator, trade_id, evidence, now_ms=None,
         expected_legs=None):
@@ -3573,11 +3612,6 @@ elif _selected_product == "TMF":
                         # re-queries a fresh broker snapshot and rejects
                         # any mismatch — backend attestation unchanged.
                         _operator = _DASHBOARD_CONFIRMED_OPERATOR
-                        _gateway_intents = _ctx.get("gateway_intents") or {}
-                        _intent_keys = sorted(
-                            str(k) for k in _gateway_intents
-                            if str(k).startswith("ORD-"))
-                        _trade_id = _intent_keys[0] if _intent_keys else ""
                         _canon = {}
                         try:
                             _canon_path = Path(runtime_path(
@@ -3599,6 +3633,14 @@ elif _selected_product == "TMF":
                                     "remaining_qty": _q,
                                 })
                         _attestation_legs = _snap_legs or None
+                        # locked trade id from the CURRENT runtime event
+                        # history: exactly one unique MTS trade matching
+                        # both canonical legs; otherwise None (fail
+                        # closed — the backend rejects a blank id)
+                        _trade_id = _derive_locked_trade_id_from_events(
+                            Path(runtime_path("logs",
+                                              "mts_spread_events.jsonl")),
+                            _snap_legs)
                         _evidence = _generated_exit_only_evidence(
                             _attestation_legs, _trade_id)
                         st.markdown("#### 建立受限平倉授權請求")
