@@ -526,3 +526,74 @@ def test_attestation_update_controls_are_present_without_changing_live_paper_pat
     # Existing runtime truth branches remain distinct.
     assert 'effective_mode == "live_ready"' in source
     assert 'effective_mode == "paper_active"' in source
+
+
+def test_exit_only_lifecycle_presentation_is_capability_scoped_and_ignores_bbo(
+        tmp_path):
+    """The lifecycle panel is an EXIT_ONLY-only, current-capability view.
+    Quote-observation evidence is never a trigger or order state."""
+    from ui.reconciled_exit_presentation import exit_only_lifecycle_presentation
+
+    ctx = _context()
+    events = tmp_path / "events.jsonl"
+    events.write_text("\n".join(json.dumps(row) for row in (
+        {"event": "EXIT_ONLY_BBO_OBSERVED", "ts": "09:00:00",
+         "reconciliation_id": "reconcile-1"},
+        {"event": "POLICY_J_TRIGGERED", "ts": "09:01:00",
+         "reconciliation_id": "reconcile-1", "action": "COMBINED_EXIT",
+         "leg_role": "BOTH", "reason": "POLICY_J_GIVEBACK"},
+        {"event": "ORDER_INTENT_BLOCKED", "ts": "09:02:00",
+         "action": "RELEASE_NEAR", "reason": "BBO_STALE",
+         "bbo_input_v2": {"reconciliation_id": "reconcile-1"}},
+        {"event": "ORDER_SUBMITTED", "ts": "09:03:00",
+         "reconciliation_id": "reconcile-1", "action": "COMBINED_EXIT",
+         "leg_role": "NEAR", "reason": "POLICY_J_GIVEBACK",
+         "broker_order_id": "broker-1", "order_id": "local-1"},
+        {"event": "ORDER_FILLED", "ts": "09:04:00",
+         "reconciliation_id": "reconcile-1", "action": "COMBINED_EXIT",
+         "leg_role": "NEAR", "filled_qty": 2, "fill_price": 45001.0},
+        # Wrong reconciliation is legacy evidence and must not leak in.
+        {"event": "ORDER_REJECTED_LOCAL", "ts": "09:05:00",
+         "reconciliation_id": "old-rid", "reason": "old"},
+    )) + "\n", encoding="utf-8")
+
+    result = exit_only_lifecycle_presentation(ctx, events)
+    assert result["mode"] == "reconciled_exit_only"
+    assert result["capability"]["reconciliation_id"] == "reconcile-1"
+    assert result["monitoring"]["state"] == "MONITORING"
+    assert result["triggered"] == {
+        "state": "TRIGGERED", "timestamp": "09:01:00",
+        "action": "COMBINED_EXIT", "leg": "BOTH",
+        "reason": "POLICY_J_GIVEBACK"}
+    assert result["blocked"]["state"] == "BLOCKED"
+    assert result["blocked"]["reason"] == "BBO_STALE"
+    assert result["submitted"]["broker_order_id"] == "broker-1"
+    assert result["terminal"] == {
+        "state": "FILLED", "timestamp": "09:04:00",
+        "action": "COMBINED_EXIT", "leg": "NEAR", "reason": None,
+        "fill_qty": 2, "fill_price": 45001.0}
+
+
+def test_exit_only_lifecycle_presentation_is_na_when_data_is_missing(tmp_path):
+    from ui.reconciled_exit_presentation import exit_only_lifecycle_presentation
+
+    result = exit_only_lifecycle_presentation(_context(), tmp_path / "none")
+    assert result["monitoring"]["state"] == "MONITORING"
+    assert result["triggered"] is None
+    assert result["blocked"] is None
+    assert result["submitted"] is None
+    assert result["terminal"] is None
+    assert exit_only_lifecycle_presentation(
+        {"effective_mode": "paper_active"}, tmp_path / "none") is None
+
+
+def test_dashboard_renders_exit_only_lifecycle_without_live_paper_fallback():
+    source = (Path(__file__).parents[2] / "ui" / "dashboard.py").read_text()
+
+    assert "MTS 受限平倉生命週期" in source
+    assert "MONITORING" in source
+    assert "TRIGGERED" in source
+    assert "BLOCKED" in source
+    assert "SUBMITTED" in source
+    assert "FILLED / CANCELLED / REJECTED / TIMEOUT" in source
+    assert "exit_only_lifecycle_presentation" in source
