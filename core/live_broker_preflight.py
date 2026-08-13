@@ -31,11 +31,29 @@ def diagnostics_dir() -> Path:
     return Path(runtime_path("exports", "trades", "live", "diagnostics"))
 
 
+def _json_safe(value: Any) -> Any:
+    """JSON-safe serializer default: Shioaji C-extension enums
+    (Action/OrderState/…) serialize as their NAME — str() on the C
+    enum can itself raise TypeError ('first argument must be a string,
+    not builtins.Action').  Never passes secrets: the non-serializable
+    fallback degrades to the type name, not repr/str."""
+    try:
+        _name = getattr(value, "name", None)
+        if isinstance(_name, str):
+            return _name
+    except Exception:
+        pass
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return type(value).__name__
+
+
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+        json.dump(payload, handle, ensure_ascii=False, indent=2,
+                  default=_json_safe)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
