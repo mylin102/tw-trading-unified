@@ -4199,6 +4199,7 @@ elif _selected_product == "TMF":
                     "trade_id": "broker-reconciled-" + str(_canon.get("canonical_input_hash", ""))[:16],
                     "reason": "broker_snapshot",
                     "position_phase": "SPREAD",
+                    "_updated": _canon.get("captured_at") or _canon.get("captured_at_ms") or "?",
                 }
                 # Current broker-reconciled futures are the authoritative
                 # live performance scope; legacy fills are not required.
