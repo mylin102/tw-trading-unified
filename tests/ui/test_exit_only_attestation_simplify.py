@@ -3,11 +3,13 @@ trade-id / evidence inputs; fixed dashboard-confirmed operator marker;
 generated non-secret evidence; backend attestation contract unchanged.
 """
 import inspect
+import json
 
 import ui.dashboard as dash
 from ui.dashboard import (
     _DASHBOARD_CONFIRMED_OPERATOR,
     _generated_exit_only_evidence,
+    _derive_locked_trade_id_from_events,
     build_exit_only_attestation_request,
 )
 
@@ -56,3 +58,70 @@ def test_attestation_payload_live_and_paper_capability():
         assert payload["expected_legs"] == _LEGS
         assert payload["action"] == "ATTEST_EXIT_ONLY"
         assert payload["operator"] == "dashboard-confirmed"
+
+
+def test_derive_locked_trade_id_unique_event_match(tmp_path):
+    """Exactly one historical MTS trade matching BOTH canonical legs
+    derives its trade_id (ctx gateway_intents may be absent after
+    bootstrap)."""
+    ev = tmp_path / "events.jsonl"
+    ev.write_text(json.dumps({
+        "event": "OPERATOR_ATTESTATION",
+        "trade_id": "mts-20260811-085503",
+        "expected_legs": [
+            {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1},
+            {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1},
+        ],
+    }) + "\n", encoding="utf-8")
+    legs = [
+        {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1},
+        {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1},
+    ]
+    assert _derive_locked_trade_id_from_events(ev, legs) == \
+        "mts-20260811-085503"
+
+
+def test_derive_locked_trade_id_ambiguity_or_missing_is_none(tmp_path):
+    """No matching trade or MULTIPLE matching trades => None (fail
+    closed — never fabricate an id)."""
+    legs = [
+        {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1},
+        {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1},
+    ]
+    assert _derive_locked_trade_id_from_events(
+        tmp_path / "none.jsonl", legs) is None
+
+    ev = tmp_path / "amb.jsonl"
+    ev.write_text(
+        json.dumps({"event": "OPERATOR_ATTESTATION",
+                    "trade_id": "mts-20260810-000001",
+                    "expected_legs": [
+                        {"symbol": "TMFH6", "side": "sell",
+                         "remaining_qty": 1},
+                        {"symbol": "TMFI6", "side": "buy",
+                         "remaining_qty": 1},
+                    ]}) + "\n"
+        + json.dumps({"event": "OPERATOR_ATTESTATION",
+                      "trade_id": "mts-20260811-085503",
+                      "expected_legs": [
+                          {"symbol": "TMFH6", "side": "sell",
+                           "remaining_qty": 1},
+                          {"symbol": "TMFI6", "side": "buy",
+                           "remaining_qty": 1},
+                      ]}) + "\n",
+        encoding="utf-8")
+    assert _derive_locked_trade_id_from_events(ev, legs) is None
+
+
+def test_attestation_build_rejects_missing_trade_id():
+    """The backend still rejects a blank trade id (fail closed)."""
+    import pytest
+    legs = [
+        {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1},
+        {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1},
+    ]
+    with pytest.raises(ValueError):
+        build_exit_only_attestation_request(
+            None, operator="dashboard-confirmed", trade_id="",
+            evidence="dashboard-confirmed evidence", expected_legs=legs)
+
