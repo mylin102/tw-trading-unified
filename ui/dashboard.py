@@ -3479,6 +3479,25 @@ elif _selected_product == "TMF":
             # operator attestation request; the monitor then takes a fresh
             # broker snapshot and may enter only RECONCILED_EXIT_ONLY.  It
             # cannot create a general live-entry authorization.
+            # [dashboard lifecycle] EXIT_ONLY-only lifecycle view:
+            # states MONITORING / TRIGGERED / BLOCKED / SUBMITTED and
+            # the per-leg terminal state of the CURRENT capability.
+            with st.expander("🔀 MTS 受限平倉生命週期", expanded=False):
+                _lc = exit_only_lifecycle_presentation(
+                    load_exit_only_context(),
+                    Path(runtime_path("logs", "mts_spread_events.jsonl")))
+                if _lc:
+                    st.caption(
+                        f"監控 {_lc['monitoring']['state']} · "
+                        f"觸發 {_lc['triggered'] or '—'} · "
+                        f"阻擋 {_lc['blocked'] or '—'} · "
+                        f"送單 {_lc['submitted'] or '—'} · "
+                        f"終態 {_lc['terminal'] or '—'}")
+                    st.caption(
+                        "FILLED / CANCELLED / REJECTED / TIMEOUT 顯示"
+                        "終態時間、成交數量與價格；BBO 觀察事件僅為報價"
+                        "觀察，不代表觸發")
+
             with st.expander("🛡️ 對帳部位：受限平倉授權", expanded=False):
                 _attest_path = Path(runtime_path(
                     "commands", "reconciled_exit_attestation.json"))
@@ -4172,6 +4191,51 @@ elif _selected_product == "TMF":
         _renew_status = load_exit_only_renewal_status()
         if _renew_status:
             st.caption(_renew_status)
+        # [Dashboard lifecycle] The event view is capability-scoped and
+        # presentation-only.  It never falls back to ordinary Paper/LIVE
+        # orders or treats EXIT_ONLY_BBO_OBSERVED as a decision trigger.
+        from ui.reconciled_exit_presentation import \
+            exit_only_lifecycle_presentation
+        _exit_lifecycle = exit_only_lifecycle_presentation(
+            _eo_ctx, _events_path_scope)
+        st.subheader("MTS 受限平倉生命週期")
+        if _exit_lifecycle is None:
+            st.info("N/A：沒有可驗證的受限平倉 capability。")
+        else:
+            _life_cap = _exit_lifecycle["capability"]
+            st.caption(
+                f"mode={_exit_lifecycle['mode']} · capability="
+                f"{str(_life_cap.get('reconciliation_id') or 'N/A')[:12]} · "
+                f"trade={_life_cap.get('trade_id') or 'N/A'} · "
+                "auto-reconcile 狀態見上方。")
+            _life_rows = []
+            for _label, _key in (
+                    ("MONITORING", "monitoring"),
+                    ("TRIGGERED", "triggered"),
+                    ("BLOCKED", "blocked"),
+                    ("SUBMITTED", "submitted"),
+                    ("FILLED / CANCELLED / REJECTED / TIMEOUT", "terminal")):
+                _record = _exit_lifecycle.get(_key)
+                if not isinstance(_record, dict):
+                    _life_rows.append({"狀態": _label, "時間": "N/A",
+                                       "動作": "N/A", "腿": "N/A",
+                                       "原因": "N/A", "Broker Order ID": "N/A",
+                                       "成交口數": "N/A", "成交價": "N/A"})
+                    continue
+                _life_rows.append({
+                    "狀態": _record.get("state") or _label,
+                    "時間": _record.get("timestamp") or "N/A",
+                    "動作": _record.get("action") or "N/A",
+                    "腿": _record.get("leg") or "N/A",
+                    "原因": _record.get("reason") or "N/A",
+                    "Broker Order ID": _record.get("broker_order_id") or "N/A",
+                    "成交口數": (_record.get("fill_qty")
+                                 if _record.get("fill_qty") is not None else "N/A"),
+                    "成交價": (_record.get("fill_price")
+                               if _record.get("fill_price") is not None else "N/A"),
+                })
+            st.dataframe(pd.DataFrame(_life_rows), width="stretch",
+                         hide_index=True)
         _mts_perf_scope = {"ok": False, "mode": "exit_only",
                            "reason": "RECONCILED_EXIT_ONLY"}
     else:

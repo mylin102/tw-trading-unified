@@ -43,6 +43,128 @@ def latest_bbo_evidence_from_events(events_path: Any) -> Optional[dict]:
     return None
 
 
+def _exit_only_lifecycle_event_identity(event: dict) -> Any:
+    """Return the reconciliation id carried by an event, if any.
+
+    Exit-only blocked decisions keep their binding in the versioned failure
+    evidence, whereas submitted/fill events carry it at top level.  The
+    dashboard accepts either form but never guesses an identity from a trade
+    id or a current process state.
+    """
+    rid = event.get("reconciliation_id")
+    if rid:
+        return rid
+    evidence = event.get("bbo_input_v2")
+    if isinstance(evidence, dict):
+        return evidence.get("reconciliation_id")
+    return None
+
+
+def _exit_only_lifecycle_fields(event: dict, state: str) -> dict:
+    """Map a trusted lifecycle event into display-only, N/A-safe fields."""
+    action = (event.get("action") or event.get("exit_stage")
+              or event.get("signal"))
+    leg = (event.get("leg_role") or event.get("leg")
+           or event.get("release_leg"))
+    reason = (event.get("reason") or event.get("exit_reason")
+              or event.get("release_reason"))
+    return {
+        "state": state,
+        "timestamp": event.get("ts") or event.get("timestamp"),
+        "action": action,
+        "leg": leg,
+        "reason": reason,
+    }
+
+
+def exit_only_lifecycle_presentation(context: Any, events_path: Any) \
+        -> Optional[dict]:
+    """Read the current EXIT_ONLY capability's lifecycle evidence only.
+
+    The shared JSONL is append-only and may contain Paper, normal LIVE, old
+    reconciliations, malformed lines, and BBO observations.  This helper is
+    deliberately presentation-only: it accepts event records that are bound
+    to the active capability reconciliation id (including typed blocked
+    evidence's nested binding), ignores everything else, and never mutates
+    the ledger.  Missing lifecycle evidence remains ``None`` so the UI says
+    N/A rather than inventing zero/order state.
+    """
+    if not isinstance(context, dict) \
+            or context.get("effective_mode") != "reconciled_exit_only":
+        return None
+    cap = context.get("exit_only_capability")
+    if not isinstance(cap, dict):
+        return None
+    reconciliation_id = cap.get("reconciliation_id")
+    if not isinstance(reconciliation_id, str) or not reconciliation_id:
+        return None
+
+    result = {
+        "mode": "reconciled_exit_only",
+        "capability": {
+            "reconciliation_id": reconciliation_id,
+            "trade_id": cap.get("trade_id"),
+        },
+        "monitoring": {"state": "MONITORING", "timestamp": None},
+        "triggered": None,
+        "blocked": None,
+        "submitted": None,
+        "terminal": None,
+    }
+    if not events_path:
+        return result
+    try:
+        with open(str(events_path), encoding="utf-8") as stream:
+            lines = stream.read().splitlines()
+    except Exception:
+        return result
+
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(event, dict) \
+                or _exit_only_lifecycle_event_identity(event) \
+                != reconciliation_id:
+            continue
+        event_name = str(event.get("event", "")).upper()
+        # Observation is BBO provenance only: never a signal/trigger.
+        if event_name == "EXIT_ONLY_BBO_OBSERVED":
+            continue
+        if "TRIGGERED" in event_name and "ORDER" not in event_name:
+            result["triggered"] = _exit_only_lifecycle_fields(
+                event, "TRIGGERED")
+        elif "BLOCKED" in event_name:
+            result["blocked"] = _exit_only_lifecycle_fields(event, "BLOCKED")
+        elif event_name == "ORDER_SUBMITTED":
+            submitted = _exit_only_lifecycle_fields(event, "SUBMITTED")
+            submitted["broker_order_id"] = (
+                event.get("broker_order_id") or event.get("exchange_order_id"))
+            submitted["order_id"] = event.get("order_id")
+            result["submitted"] = submitted
+        elif ("FILLED" in event_name or "COMPLETED" in event_name
+              or "CANCEL" in event_name or "REJECT" in event_name
+              or "TIMEOUT" in event_name):
+            if "FILLED" in event_name or "COMPLETED" in event_name:
+                state = "FILLED"
+            elif "CANCEL" in event_name:
+                state = "CANCELLED"
+            elif "REJECT" in event_name:
+                state = "REJECTED"
+            else:
+                state = "TIMEOUT"
+            terminal = _exit_only_lifecycle_fields(event, state)
+            terminal["fill_qty"] = (event.get("filled_qty")
+                                    if event.get("filled_qty") is not None
+                                    else event.get("fill_qty"))
+            terminal["fill_price"] = (event.get("fill_price")
+                                      if event.get("fill_price") is not None
+                                      else event.get("avg_fill_price"))
+            result["terminal"] = terminal
+    return result
+
+
 def exit_only_upl_presentation(context: Any, evidence: Any, *,
                                now_ms: int, point_value: float = 10.0,
                                legacy_state: Any = None) -> Optional[dict]:
@@ -180,6 +302,92 @@ def exit_only_upl_presentation(context: Any, evidence: Any, *,
             "far": {"pnl": round(_far_pnl, 6)},
             "total_pnl": round(_near_pnl + _far_pnl, 6),
             "source": "broker_attested_dual_bbo"}
+
+
+def exit_only_lifecycle_presentation(ctx, events_path):
+    """[dashboard lifecycle] EXIT_ONLY-only lifecycle view of the
+    CURRENT capability from the event ledger: MONITORING / TRIGGERED /
+    BLOCKED / SUBMITTED / terminal states.  Quote-observation evidence
+    (EXIT_ONLY_BBO_OBSERVED) is observation-only and is never a trigger
+    or order state; events bound to another capability's
+    reconciliation_id never leak in; missing data => None; non-exit-only
+    modes => None (paper/live are never mixed in)."""
+    _mode = None
+    _cap = None
+    if isinstance(ctx, dict):
+        _mode = ctx.get("effective_mode")
+        _cap = ctx.get("exit_only_capability")
+    else:
+        _mode = getattr(ctx, "effective_mode", None)
+        _cap = getattr(ctx, "exit_only_capability", None)
+    if _mode != "reconciled_exit_only":
+        return None
+    _rid = (_cap or {}).get("reconciliation_id") \
+        if isinstance(_cap, dict) else None
+    _rows = []
+    try:
+        _p = events_path  # callers pass a Path (e.g. tmp_path / events)
+        if _p is not None and _p.exists():
+            for _line in _p.read_text(encoding="utf-8").splitlines():
+                _line = _line.strip()
+                if not _line:
+                    continue
+                try:
+                    _r = json.loads(_line)
+                except Exception:
+                    continue
+                if not isinstance(_r, dict):
+                    continue
+                # some decision events carry the capability rid nested in
+                # their evidence payload (bbo_input_v2)
+                _rid_of = _r.get("reconciliation_id")
+                if _rid_of is None:
+                    _rid_of = (_r.get("bbo_input_v2") or {}).get(
+                        "reconciliation_id")
+                if _rid and _rid_of != _rid:
+                    continue  # legacy evidence of another capability
+                _rows.append(_r)
+    except Exception:
+        pass
+    _triggered = _blocked = _submitted = _terminal = None
+    for _r in _rows:
+        _ev = _r.get("event")
+        if _ev == "POLICY_J_TRIGGERED" and _triggered is None:
+            _triggered = {
+                "state": "TRIGGERED",
+                "timestamp": _r.get("ts"),
+                "action": _r.get("action"),
+                "leg": _r.get("leg_role"),
+                "reason": _r.get("reason"),
+            }
+        elif _ev == "ORDER_INTENT_BLOCKED" and _blocked is None:
+            _blocked = {"state": "BLOCKED", "reason": _r.get("reason")}
+        elif _ev == "ORDER_SUBMITTED" and _submitted is None:
+            _submitted = {
+                "broker_order_id": _r.get("broker_order_id"),
+                "order_id": _r.get("order_id"),
+            }
+        elif _ev in ("ORDER_FILLED", "ORDER_REJECTED", "ORDER_CANCELLED",
+                     "ORDER_TIMEOUT") and _terminal is None:
+            _terminal = {
+                "state": _ev.replace("ORDER_", ""),
+                "timestamp": _r.get("ts"),
+                "action": _r.get("action"),
+                "leg": _r.get("leg_role"),
+                "reason": _r.get("reason"),
+                "fill_qty": _r.get("filled_qty"),
+                "fill_price": _r.get("fill_price"),
+            }
+        # EXIT_ONLY_BBO_OBSERVED is observation-only — never a trigger.
+    return {
+        "mode": _mode,
+        "capability": {"reconciliation_id": _rid},
+        "monitoring": {"state": "MONITORING"},
+        "triggered": _triggered,
+        "blocked": _blocked,
+        "submitted": _submitted,
+        "terminal": _terminal,
+    }
 
 
 def exit_only_upl_metrics(context: Any, events_path: Any, *,
