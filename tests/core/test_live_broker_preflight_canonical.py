@@ -494,3 +494,49 @@ def test_atomic_json_normalizes_nested_no_name_action(tmp_path):
     assert data["snapshot"]["records"][0]["field"] == "_ActionNoName"
     assert data["snapshot"]["records"][1]["field"] == "_ActionNoName"
 
+
+class _IntLikeAction(int):
+    """Simulated Shioaji C-extension Action: INT-LIKE (isinstance(x,
+    int) is True) with no usable .name; str()/repr() raise the runtime
+    TypeError.  isinstance-based primitive checks would pass it through
+    unchanged."""
+
+    @property
+    def name(self):
+        raise TypeError("first argument must be a string, "
+                        "not builtins.Action")
+
+    def __str__(self):
+        raise TypeError("first argument must be a string, "
+                        "not builtins.Action")
+
+    def __repr__(self):
+        raise TypeError("first argument must be a string, "
+                        "not builtins.Action")
+
+
+def test_atomic_json_normalizes_int_like_action_value(tmp_path):
+    """An int-like C-extension Action as a nested VALUE must degrade to
+    the fixed type name — exact-type primitive checks, not isinstance."""
+    from core.live_broker_preflight import _atomic_json
+
+    p = tmp_path / "out8.json"
+    _atomic_json(p, {"snapshot": {"records": [
+        {"side": _IntLikeAction(1)},
+        {"side": _IntLikeAction(2)},
+    ]}})
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["snapshot"]["records"][0]["side"] == "_IntLikeAction"
+    assert data["snapshot"]["records"][1]["side"] == "_IntLikeAction"
+
+
+def test_atomic_json_normalizes_int_like_action_key(tmp_path):
+    """An int-like C-extension Action as a dict KEY must degrade to the
+    fixed type name (the encoder's default covers values only)."""
+    from core.live_broker_preflight import _atomic_json
+
+    p = tmp_path / "out9.json"
+    _atomic_json(p, {_IntLikeAction(3): {"n": 1}})
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data == {"_IntLikeAction": {"n": 1}}
+
