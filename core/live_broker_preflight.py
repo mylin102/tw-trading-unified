@@ -45,15 +45,47 @@ def _json_safe(value: Any) -> Any:
         pass
     if isinstance(value, (datetime, date)):
         return value.isoformat()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
     return type(value).__name__
+
+
+def _json_safe_key(key: Any) -> Any:
+    """JSON-safe dict KEY: a Shioaji C-extension enum used as a key
+    (the encoder's default= covers values only) normalizes to its NAME;
+    datetime/date -> isoformat; anything else keeps str/int/float/bool/
+    None or degrades to the type name — never str/repr (no secrets)."""
+    try:
+        _name = getattr(key, "name", None)
+        if isinstance(_name, str):
+            return _name
+    except Exception:
+        pass
+    if isinstance(key, (datetime, date)):
+        return key.isoformat()
+    if isinstance(key, (str, int, float, bool)) or key is None:
+        return key
+    return type(key).__name__
+
+
+def _json_safe_normalize(payload: Any) -> Any:
+    """Recursive JSON-safe normalization applied BEFORE json.dump so a
+    Shioaji C-extension enum can never appear as a value OR a dict key
+    (the encoder's default= only covers values)."""
+    if isinstance(payload, dict):
+        return {_json_safe_key(k): _json_safe_normalize(v)
+                for k, v in payload.items()}
+    if isinstance(payload, (list, tuple)):
+        return [_json_safe_normalize(v) for v in payload]
+    return _json_safe(payload)
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2,
-                  default=_json_safe)
+        json.dump(_json_safe_normalize(payload), handle,
+                  ensure_ascii=False, indent=2, default=_json_safe)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
