@@ -77,6 +77,15 @@ def _json_safe_normalize(payload: Any) -> Any:
                 for k, v in payload.items()}
     if isinstance(payload, (list, tuple)):
         return [_json_safe_normalize(v) for v in payload]
+    if isinstance(payload, (set, frozenset)):
+        return [_json_safe_normalize(v) for v in payload]
+    try:
+        from collections.abc import Mapping
+        if isinstance(payload, Mapping):
+            return {_json_safe_key(k): _json_safe_normalize(v)
+                    for k, v in payload.items()}
+    except Exception:
+        pass
     return _json_safe(payload)
 
 
