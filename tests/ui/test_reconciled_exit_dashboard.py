@@ -515,13 +515,17 @@ def test_re_attestation_command_is_atomic_and_pending_is_not_overwritten(tmp_pat
     assert path.read_text(encoding="utf-8") == original
 
 
-def test_attestation_update_controls_are_present_without_changing_live_paper_paths():
+def test_attestation_entry_removed_without_changing_live_paper_paths():
     source = (Path(__file__).parents[2] / "ui" / "dashboard.py").read_text()
 
-    assert "更新受限平倉對帳" in source
+    # [EXIT_ONLY flow removed] the dashboard authorization entry is
+    # gone (the module-level build helper may keep its own message);
+    # the remaining live/paper paths are untouched.
+    assert "更新受限平倉對帳" not in source
+    assert "create_exit_only_attestation" not in source
     assert "build_exit_only_attestation_request" in source
     assert "write_exit_only_attestation_request" in source
-    assert "對帳 Trade ID（鎖定）" in source
+    assert "對帳 Trade ID（鎖定）" not in source
     assert 'key="exit_only_update_trade_id"' not in source
     # Existing runtime truth branches remain distinct.
     assert 'effective_mode == "live_ready"' in source

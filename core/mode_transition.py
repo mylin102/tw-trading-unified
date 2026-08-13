@@ -192,16 +192,12 @@ class ExecutionContext:
             return
         if self.is_live_ready():
             return
-        if self.effective_mode != ModeTransitionState.RECONCILED_EXIT_ONLY.value:
-            raise LiveOrderBlocked(
-                f"EFFECTIVE_MODE_NOT_ORDER_AUTHORIZED (effective={self.effective_mode})")
-        if method != "place_order" or order is None:
-            raise LiveOrderBlocked(f"EXIT_ONLY_{method.upper()}_BLOCKED")
-        cap = self.exit_only_capability
-        if not isinstance(cap, dict):
-            raise LiveOrderBlocked("EXIT_ONLY_CAPABILITY_MISSING")
-        if getattr(order, "reconciliation_id", None) != cap.get("reconciliation_id"):
-            raise LiveOrderBlocked("EXIT_ONLY_RECONCILIATION_ID_MISMATCH")
+        # [EXIT_ONLY flow removed 2026-08-14] the operator attestation /
+        # RECONCILED_EXIT_ONLY flow no longer exists as an execution
+        # mode: a non-live_ready context is default-deny, so a legacy
+        # persisted EXIT_ONLY capability can never authorize or submit.
+        raise LiveOrderBlocked(
+            f"EFFECTIVE_MODE_NOT_ORDER_AUTHORIZED (effective={self.effective_mode})")
         if getattr(order, "strategy", None) not in {"MTS_EXIT", "MTS_RELEASE"}:
             raise LiveOrderBlocked("EXIT_ONLY_STRATEGY_BLOCKED")
         symbol = getattr(order, "symbol", None)

@@ -4062,79 +4062,12 @@ class FuturesMonitor:
         return True
 
     def _process_reconciled_exit_attestation_command(self) -> bool:
-        """Atomically consume one operator request for EXIT_ONLY attestation.
-
-        This is deliberately separate from the legacy manual-entry flag.  A
-        command never names an order or an execution price: it can only ask
-        the monitor to take a fresh read-only broker snapshot and, if every
-        attestation rule passes, enter the *more restrictive* exit-only mode.
-        It is terminal on success or rejection; an operator must issue a new
-        current command after any failed proof.
-        """
-        try:
-            _path = Path(runtime_path(
-                "commands", "reconciled_exit_attestation.json"))
-            _processing = Path(str(_path) + ".processing")
-            if not _path.exists() and not _processing.exists():
-                return False
-            if _path.exists():
-                try:
-                    _path.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(_path, _processing)
-                except OSError:
-                    return False
-            try:
-                _raw = json.loads(_processing.read_text(encoding="utf-8"))
-            except Exception:
-                _raw = None
-            _reason = None
-            _record = None
-            _command_id = ""
-            if not isinstance(_raw, dict):
-                _reason = "COMMAND_INVALID"
-            else:
-                _command_id = _raw.get("command_id", "")
-                _created = _raw.get("created_at")
-                _allowed = {
-                    "command_id", "action", "created_at", "operator",
-                    "trade_id", "evidence", "expected_legs", "attested_at",
-                }
-                if (not isinstance(_command_id, str) or not _command_id
-                        or set(_raw) - _allowed
-                        or _raw.get("action") != "ATTEST_EXIT_ONLY"):
-                    _reason = "COMMAND_INVALID"
-                elif (not isinstance(_created, int) or isinstance(_created, bool)
-                      or abs(int(time.time() * 1000) - _created) > 60_000):
-                    _reason = "COMMAND_EXPIRED"
-                else:
-                    _record, _reason = self._operator_attest_exit_only(
-                        operator=_raw.get("operator", ""),
-                        trade_id=_raw.get("trade_id", ""),
-                        evidence=_raw.get("evidence", ""),
-                        expected_legs=_raw.get("expected_legs", []),
-                        attested_at=_raw.get("attested_at", ""),
-                    )
-            if _reason is None:
-                self._exit_only_attestation_status = "ATTESTED"
-                self._append_mts_event(
-                    "OPERATOR_ATTESTATION_COMMAND_APPLIED",
-                    command_id=_command_id,
-                    trade_id=(_record or {}).get("trade_id"),
-                    snapshot_hash=(_record or {}).get("snapshot_hash"),
-                )
-            else:
-                self._exit_only_attestation_status = f"REJECTED: {_reason}"
-                self._append_mts_event(
-                    "OPERATOR_ATTESTATION_COMMAND_REJECTED",
-                    command_id=_command_id, reason=_reason)
-            return True
-        finally:
-            try:
-                if '_processing' in locals() and _processing.exists():
-                    _processing.unlink()
-            except OSError:
-                pass
-
+        """[EXIT_ONLY flow removed 2026-08-14] the operator
+        attestation flow no longer exists as an execution mode —
+        the command is NEVER consumed and no EXIT_ONLY capability
+        can be authorized through it (fail-closed: a legacy pending
+        command stays untouched)."""
+        return False
     def _clear_mts_entry_reconcile_intents(self, trade_id: str) -> bool:
         """Resolve only the incident intent bound to the reconciled trade.
 
@@ -8696,11 +8629,9 @@ class FuturesMonitor:
         # evidence when the current capability has fresh valid dual BBO
         # (deduped by reconciliation_id + bbo_hash; never alters orders/
         # decisions; invalid/stale emits nothing).
-        self._observe_exit_only_bbo_evidence()
         # [auto re-reconciliation] read-only renewal of the CURRENT
         # capability freshness (30s cadence, bounded backoff; failures
         # quarantine with a typed reason, zero orders).
-        self._maybe_renew_exit_only()
 
         # ── Read-only broker snapshot probe (request file) ──
         if self._check_broker_snapshot_request():
@@ -11592,7 +11523,6 @@ class FuturesMonitor:
         # RECONCILED_EXIT_ONLY capability; it is intentionally independent of
         # the legacy manual-entry flag and may be reviewed before any strategy
         # decision runs.
-        self._process_reconciled_exit_attestation_command()
         self._process_live_upl_refresh_command()
         self._hydrate_exit_only_position()
 

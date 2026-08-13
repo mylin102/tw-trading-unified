@@ -291,7 +291,7 @@ def test_exit_only_without_attestation_is_zero_order():
         quantity=1, strategy="MTS_EXIT")
     with pytest.raises(LiveOrderBlocked) as exc:
         ctx.assert_order_allowed(order, method="place_order")
-    assert "RECONCILIATION_ID" in str(exc.value.reason)
+    assert "NOT_ORDER_AUTHORIZED" in str(exc.value.reason)
 
     # a wrongly-stamped exit order is rejected too
     wrong = Order(
@@ -299,7 +299,7 @@ def test_exit_only_without_attestation_is_zero_order():
         quantity=1, strategy="MTS_EXIT", reconciliation_id="other-trade")
     with pytest.raises(LiveOrderBlocked) as exc:
         ctx.assert_order_allowed(wrong, method="place_order")
-    assert "RECONCILIATION_ID" in str(exc.value.reason)
+    assert "NOT_ORDER_AUTHORIZED" in str(exc.value.reason)
 
     # a stamped order with a NON-exit strategy is rejected (strategy gate:
     # check order is rid -> strategy -> scope, so the entry must be stamped
@@ -310,7 +310,7 @@ def test_exit_only_without_attestation_is_zero_order():
         reconciliation_id=capability["reconciliation_id"])
     with pytest.raises(LiveOrderBlocked) as exc:
         ctx.assert_order_allowed(stamped_entry, method="place_order")
-    assert "STRATEGY_BLOCKED" in str(exc.value.reason)
+    assert "NOT_ORDER_AUTHORIZED" in str(exc.value.reason)
 
 
 # ── exit-order stamping via create_order ──────────────────────────────────
@@ -359,8 +359,11 @@ def test_exit_order_stamped_with_reconciliation_id_in_exit_only():
             quantity=1, strategy="MTS_ENTRY")
     assert exc.value.reason == "EXIT_ONLY_STRATEGY_BLOCKED"
 
-    # the stamped exit order now passes the capability gate
-    ctx.assert_order_allowed(exit_order, method="place_order")
+    # [EXIT_ONLY flow removed] even a stamped exit order is
+    # default-deny — no capability can authorize or submit.
+    with pytest.raises(LiveOrderBlocked) as exc:
+        ctx.assert_order_allowed(exit_order, method="place_order")
+    assert "NOT_ORDER_AUTHORIZED" in str(exc.value.reason)
 
 
 def test_exit_order_not_stamped_when_live_ready():
@@ -384,7 +387,7 @@ def test_exit_only_rejection_is_terminal_and_preserves_typed_reason():
                   strategy="MTS_ENTRY", reconciliation_id="wrong")
     manager.active_orders[order.order_id] = order
     assert manager.submit(order) is False
-    assert order.reject_reason == "EXIT_ONLY_RECONCILIATION_ID_MISMATCH"
+    assert order.reject_reason == "LIVE_ORDER_AUTHORIZATION_FAILED"
     assert order.order_id not in manager.active_orders
     assert order in manager.completed
 
@@ -460,8 +463,9 @@ def test_monitor_attestation_syncs_order_manager_and_client_e2e(
     assert release_order.reconciliation_id == _rid
     # reaches the OrderManager authorization layer (adapter stub only:
     # no submission happened)
-    monitor.order_mgr.execution_context.assert_order_allowed(
-        release_order, method="place_order")
+    with pytest.raises(LiveOrderBlocked):
+        monitor.order_mgr.execution_context.assert_order_allowed(
+            release_order, method="place_order")
     assert adapter_calls == []
 
 
@@ -1660,12 +1664,13 @@ def test_exit_only_attestation_command_is_atomic_and_never_places_orders(
     monitor._append_mts_event = lambda event_type, **kwargs: events.append(
         (event_type, kwargs))
 
-    assert monitor._process_reconciled_exit_attestation_command() is True
-    assert calls and calls[0]["trade_id"] == "mts-20260811-085503"
-    assert not command_path.exists()
+    # [EXIT_ONLY flow removed] the command is NEVER consumed and no
+    # capability can be authorized through it — fail-closed.
+    assert monitor._process_reconciled_exit_attestation_command() is False
+    assert calls == []
+    assert command_path.exists()  # never consumed, never authorized
     assert not command_path.with_suffix(".json.processing").exists()
-    assert monitor._exit_only_attestation_status == "ATTESTED"
-    assert events[-1][0] == "OPERATOR_ATTESTATION_COMMAND_APPLIED"
+    assert events == []
 
 
 def test_exit_only_attestation_command_rejects_stale_without_attestation(
@@ -1690,8 +1695,7 @@ def test_exit_only_attestation_command_rejects_stale_without_attestation(
     monitor._append_mts_event = lambda event_type, **kwargs: events.append(
         (event_type, kwargs))
 
-    assert monitor._process_reconciled_exit_attestation_command() is True
+    # [EXIT_ONLY flow removed] the command is NEVER consumed.
+    assert monitor._process_reconciled_exit_attestation_command() is False
     assert not calls
-    assert monitor._exit_only_attestation_status == "REJECTED: COMMAND_EXPIRED"
-    assert events[-1][0] == "OPERATOR_ATTESTATION_COMMAND_REJECTED"
-    assert events[-1][1]["reason"] == "COMMAND_EXPIRED"
+    assert events == []
