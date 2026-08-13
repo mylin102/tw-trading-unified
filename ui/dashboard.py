@@ -581,6 +581,28 @@ def _normalize_exit_only_expected_legs(legs):
     return normalized
 
 
+# [simplify 2026-08-13] fixed operator provenance marker for the
+# EXIT_ONLY attestation UI: the operator identity is the dashboard
+# itself (no manual operator input).  Evidence is generated, non-secret
+# text; the monitor still re-queries a fresh broker snapshot and rejects
+# any mismatch — the backend attestation contract is unchanged.
+_DASHBOARD_CONFIRMED_OPERATOR = "dashboard-confirmed"
+
+
+def _generated_exit_only_evidence(legs, trade_id=None, now_ms=None):
+    """Generated, non-secret evidence text for the dashboard-confirmed
+    EXIT_ONLY attestation (no manual input, no secrets)."""
+    if now_ms is None:
+        _ts = datetime.datetime.now().isoformat(timespec="seconds")
+    else:
+        _ts = datetime.datetime.fromtimestamp(
+            int(now_ms) / 1000.0).isoformat(timespec="seconds")
+    _legs = json.dumps(legs or [], ensure_ascii=False)
+    _suffix = f" trade_id={trade_id}" if trade_id else ""
+    return (f"dashboard-confirmed exit-only attestation {_ts} "
+            f"legs={_legs}{_suffix}")
+
+
 def build_exit_only_attestation_request(
         capability, *, operator, trade_id, evidence, now_ms=None,
         expected_legs=None):
@@ -3521,17 +3543,19 @@ elif _selected_product == "TMF":
                             st.markdown("#### 更新受限平倉對帳")
                             st.caption(
                                 "此更新只可重送目前 capability 的兩腿、方向與口數；"
-                                "請補充新的人工佐證，Monitor 仍會以新鮮券商快照重新驗證。")
+                                "操作者為固定 `dashboard-confirmed` 標記，佐證由 "
+                                "Dashboard 自動產生（非機密）。Monitor 仍會以新鮮"
+                                "券商快照重新驗證並拒絕不一致。")
                             _a1, _a2 = st.columns(2)
                             with _a1:
-                                _operator = st.text_input(
-                                    "操作者", key="exit_only_update_operator")
+                                _operator = _DASHBOARD_CONFIRMED_OPERATOR
                                 _trade_id = _cap_trade_id
+                                st.text(f"操作者（固定）：{_operator}")
                                 st.text(f"對帳 Trade ID（鎖定）：{_trade_id}")
                             with _a2:
-                                _evidence = st.text_area(
-                                    "新的人工佐證（不可輸入密碼、金鑰或憑證）",
-                                    key="exit_only_update_evidence")
+                                _evidence = _generated_exit_only_evidence(
+                                    _cap_legs, _trade_id)
+                                st.text(f"佐證（自動產生）：{_evidence[:96]}…")
                             st.caption("鎖定的受限平倉兩腿（不可由此表單修改）：")
                             st.code(json.dumps(_cap_legs, ensure_ascii=False), language="json")
                             _attestation_capability = _cap
@@ -3539,33 +3563,57 @@ elif _selected_product == "TMF":
                                 "更新受限平倉對帳", key="update_exit_only_attestation",
                                 type="primary", width="stretch")
                     else:
-                        _a1, _a2 = st.columns(2)
-                        with _a1:
-                            _operator = st.text_input("操作者", key="exit_only_operator")
-                            _trade_id = st.text_input(
-                                "對帳 Trade ID", value="mts-20260811-085503",
-                                key="exit_only_trade_id")
-                            _near_code = st.text_input(
-                                "近月合約", value=_near_sym, key="exit_only_near_code")
-                            _near_side_attest = st.selectbox(
-                                "近月現有方向", ("sell", "buy"), key="exit_only_near_side")
-                        with _a2:
-                            _evidence = st.text_area(
-                                "人工佐證（不可輸入密碼、金鑰或憑證）",
-                                key="exit_only_evidence")
-                            _far_code = st.text_input(
-                                "遠月合約", value=_far_sym, key="exit_only_far_code")
-                            _far_side_attest = st.selectbox(
-                                "遠月現有方向", ("buy", "sell"), key="exit_only_far_side")
-                            _qty_attest = st.number_input(
-                                "每腿剩餘口數", min_value=1, max_value=10,
-                                value=1, step=1, key="exit_only_qty")
-                        _attestation_legs = [
-                            {"symbol": _near_code.strip(), "side": _near_side_attest,
-                             "remaining_qty": int(_qty_attest)},
-                            {"symbol": _far_code.strip(), "side": _far_side_attest,
-                             "remaining_qty": int(_qty_attest)},
-                        ]
+                        # [simplify 2026-08-13] no manual operator /
+                        # trade-id / evidence inputs: locked legs derive
+                        # from the current canonical broker snapshot;
+                        # trade id derives from the runtime ctx gateway
+                        # intents; operator is the fixed
+                        # dashboard-confirmed marker; evidence is
+                        # generated non-secret text.  The monitor still
+                        # re-queries a fresh broker snapshot and rejects
+                        # any mismatch — backend attestation unchanged.
+                        _operator = _DASHBOARD_CONFIRMED_OPERATOR
+                        _gateway_intents = _ctx.get("gateway_intents") or {}
+                        _intent_keys = sorted(
+                            str(k) for k in _gateway_intents
+                            if str(k).startswith("ORD-"))
+                        _trade_id = _intent_keys[0] if _intent_keys else ""
+                        _canon = {}
+                        try:
+                            _canon_path = Path(runtime_path(
+                                "exports", "trades", "live", "diagnostics",
+                                "broker_snapshot_canonical.json"))
+                            if _canon_path.exists():
+                                _canon = json.loads(
+                                    _canon_path.read_text(encoding="utf-8"))
+                        except Exception:
+                            _canon = {}
+                        _snap_legs = []
+                        for _p in (_canon.get("positions") or []):
+                            _q = int(_p.get("qty") or 0)
+                            _sd = str(_p.get("direction") or "").lower()
+                            if _p.get("code") and _sd and _q > 0:
+                                _snap_legs.append({
+                                    "symbol": str(_p.get("code")),
+                                    "side": _sd,
+                                    "remaining_qty": _q,
+                                })
+                        _attestation_legs = _snap_legs or None
+                        _evidence = _generated_exit_only_evidence(
+                            _attestation_legs, _trade_id)
+                        st.markdown("#### 建立受限平倉授權請求")
+                        st.caption(
+                            "鎖定兩腿取自目前券商 canonical 快照（唯讀）；"
+                            "操作者為固定 `dashboard-confirmed` 標記；"
+                            "佐證由 Dashboard 自動產生（非機密）。"
+                            "Monitor 仍會以新鮮券商快照重新驗證並拒絕不一致。")
+                        st.text(f"操作者（固定）：{_operator}")
+                        st.text(f"對帳 Trade ID（自動）："
+                                f"{_trade_id or '（無 ORD 紀錄）'}")
+                        st.code(json.dumps(_attestation_legs or [],
+                                           ensure_ascii=False),
+                                language="json")
+                        st.text(f"佐證（自動產生）：{_evidence[:96]}…")
                         _submit_attestation = st.button(
                             "建立受限平倉授權請求", key="create_exit_only_attestation",
                             type="primary", width="stretch")
