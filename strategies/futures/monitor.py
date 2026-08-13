@@ -8649,6 +8649,19 @@ class FuturesMonitor:
         except Exception:
             pass
 
+        # A broker-attested EXIT_ONLY capability is the authority for the
+        # reconciled position.  A stale/local fills ledger may still say
+        # FLAT after restart; the legacy split-brain reset must not erase
+        # that hydrated position before the shared EXIT_ONLY validator runs.
+        # PAPER/LIVE retain the legacy reconciliation behavior.
+        _exit_only_authority_active = (
+            getattr(getattr(self, "_execution_context", None),
+                    "effective_mode", "") == "reconciled_exit_only"
+            and isinstance(
+                getattr(getattr(self, "_execution_context", None),
+                        "exit_only_capability", None), dict)
+        )
+
         if _fills_open and not _state_has_pos:
             # Split-brain: fills says open, state says closed.
             # Try fills-led recovery via strategy's _restore_from_fills_log
@@ -8674,7 +8687,8 @@ class FuturesMonitor:
                         f"[bold red]🚨 [MTS_SPLIT_BRAIN] Fills recovery failed — "
                         f"emergency flatten still available[/bold red]"
                     )
-        elif _state_has_pos and not _fills_open:
+        elif _state_has_pos and not _fills_open \
+                and not _exit_only_authority_active:
             console.print(
                 f"[bold yellow]⚠️ [MTS_SPLIT_BRAIN] State says POSITION but fills says closed. "
                 f"Resetting to FLAT.[/bold yellow]"
