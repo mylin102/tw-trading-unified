@@ -4797,6 +4797,12 @@ class FuturesMonitor:
                     _date = get_session_date_str()
                 except Exception:
                     _date = datetime.now().strftime("%Y%m%d")
+            # Shioaji enum values can leak into test/recovery objects.  They
+            # are not timestamps; never pass them to pandas/date helpers.
+            # A malformed timestamp is unscoped rather than fatal: retain the
+            # order for export and let its own serialized fields be audited.
+            if not isinstance(_date, str) or not _date.isdigit() or len(_date) != 8:
+                _date = datetime.now().strftime("%Y%m%d")
 
             # Get current market price for unrealized PnL
             cur_price = 0.0
@@ -5588,6 +5594,16 @@ class FuturesMonitor:
             return
 
         payload = self.order_mgr._payload_to_dict(data) or {}
+        # Shioaji 1.7 may wrap order identity and fill fields under
+        # ``order``/``deal``.  Preserve the raw payload, but promote only
+        # missing canonical fields so broker identity can resolve an active
+        # local order without guessing from symbol or side.
+        for _nested_key in ("order", "deal", "trade"):
+            _nested = payload.get(_nested_key)
+            if isinstance(_nested, dict):
+                for _key, _value in _nested.items():
+                    if payload.get(_key) is None and _value is not None:
+                        payload[_key] = _value
         # Shioaji 1.7 enum names are FuturesDeal/FuturesOrder but their
         # values are FDEAL/FORDER.  Never filter only on the display name:
         # doing so silently drops every live futures callback.
@@ -5607,7 +5623,8 @@ class FuturesMonitor:
         if not (is_futures_deal or is_futures_order):
             return
 
-        broker_order_id = payload.get("id") or payload.get("broker_order_id")
+        broker_order_id = (payload.get("id") or payload.get("broker_order_id")
+                           or payload.get("order_id"))
         ordno = payload.get("ordno")
         seqno = payload.get("seqno")
         reason = str(payload.get("errmsg") or payload.get("reason") or "")

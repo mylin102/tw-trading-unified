@@ -1113,6 +1113,43 @@ class OrderManager:
             )
 
         fills_added = 0
+        # Some Shioaji list_trades snapshots report a terminal Filled trade
+        # with aggregate price/quantity but omit ``status.deals``.  Once the
+        # broker identity matched an existing submitted order, the aggregate
+        # receipt is authoritative and can be applied exactly once; never
+        # synthesize an order or match by symbol/side.
+        if normalized_status in (OrderStatus.PARTIAL_FILLED, OrderStatus.FILLED) and not deals:
+            _fill_identity = self._extract_value(
+                trade, "trade_id", "deal_id", "fill_id", "exchange_fill_id"
+            ) or self._extract_value(
+                getattr(trade, "status", None), "trade_id", "deal_id", "fill_id"
+            ) or broker_order_id or ordno or seqno
+            _fill_price = self._extract_value(
+                getattr(trade, "status", None), "price", "avg_price"
+            ) or self._extract_value(trade, "price", "avg_price")
+            _fill_qty = self._extract_value(
+                getattr(trade, "status", None), "quantity", "filled_quantity", "qty"
+            ) or self._extract_value(trade, "quantity", "filled_quantity", "qty")
+            try:
+                _fill_price = float(_fill_price)
+                _fill_qty = int(_fill_qty)
+            except (TypeError, ValueError):
+                _fill_price, _fill_qty = 0.0, 0
+            if (_fill_identity and _fill_price > 0 and _fill_qty > 0
+                    and not self._has_fill_identity(
+                        order, deal_id=str(_fill_identity),
+                        broker_trade_id=str(_fill_identity),
+                        exchange_fill_id=str(_fill_identity))):
+                self.apply_deal_fill(
+                    order.order_id, deal_id=str(_fill_identity),
+                    fill_price=_fill_price, fill_qty=_fill_qty,
+                    exchange_fill_id=str(_fill_identity),
+                    broker_trade_id=str(_fill_identity),
+                    raw_payload=self._payload_to_dict(trade),
+                    broker_order_id=broker_order_id, seqno=seqno, ordno=ordno,
+                    source=source or "reconcile", reason=reason,
+                )
+                fills_added += 1
         for deal in deals:
             deal_id = self._extract_value(deal, "deal_id", "trade_id", "fill_id")
             broker_trade_id = self._extract_value(deal, "broker_trade_id", "trade_id")
