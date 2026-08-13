@@ -4278,7 +4278,13 @@ class FuturesMonitor:
         out = []
         for t in raw_trades or []:
             st = getattr(t, "status", None)
-            name = getattr(st, "name", None) or str(st)
+            _inner = getattr(st, "status", None)
+            name = (getattr(_inner, "name", None)
+                    or getattr(_inner, "value", None)
+                    or getattr(st, "name", None)
+                    or getattr(st, "value", None)
+                    or str(st))
+            name = str(name).split(".")[-1]
             if name in terminal:
                 continue
             out.append({
