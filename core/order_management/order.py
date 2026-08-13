@@ -315,11 +315,16 @@ class Order:
             "parent_order_id": self.parent_order_id,
             "fills": [fill.to_dict() for fill in self.fills],
             "raw_events": self.raw_events,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
-            "filled_at": self.filled_at.isoformat() if self.filled_at else None,
-            "cancelled_at": self.cancelled_at.isoformat() if self.cancelled_at else None,
-            "rejected_at": self.rejected_at.isoformat() if self.rejected_at else None,
+            "created_at": self.created_at.isoformat()
+            if isinstance(self.created_at, datetime) else None,
+            "submitted_at": self.submitted_at.isoformat()
+            if isinstance(self.submitted_at, datetime) else None,
+            "filled_at": self.filled_at.isoformat()
+            if isinstance(self.filled_at, datetime) else None,
+            "cancelled_at": self.cancelled_at.isoformat()
+            if isinstance(self.cancelled_at, datetime) else None,
+            "rejected_at": self.rejected_at.isoformat()
+            if isinstance(self.rejected_at, datetime) else None,
             "expired_at": self.expired_at.isoformat() if self.expired_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

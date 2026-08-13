@@ -4978,6 +4978,17 @@ class FuturesMonitor:
             orders_file = Path(orders_dir) / f"{self.ticker}_{_date}_orders.json"
             orders_file.parent.mkdir(parents=True, exist_ok=True)
 
+            # [export fix] Shioaji enum values (Action/… ) and other
+            # non-serializable values must never crash the export: the
+            # JSON-safe normalization turns them into strings WITHOUT
+            # changing order identity or the dedupe keys.
+            try:
+                export_data = json.loads(
+                    json.dumps(export_data, ensure_ascii=False,
+                               default=str))
+            except Exception:
+                pass  # never block the export on normalization
+
             # 2026-07-07 Hermes Agent: Deduplicate by order_id against
             # existing file content.  The state-file fallback adds OCO
             # orders unconditionally; if _save_orders_file_wrapper is
