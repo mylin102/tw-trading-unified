@@ -659,3 +659,37 @@ def test_dashboard_authorization_generation_uses_canonical_direction():
         evidence="dashboard-confirmed", expected_legs=legs)
     assert payload["expected_legs"] == legs
 
+
+def test_live_upl_presented_reason_quarantine_precedence():
+    """A quarantine/renewal audit reason takes precedence over the
+    generic snapshot reason."""
+    from core.performance_provenance import live_upl_presented_reason
+
+    r = live_upl_presented_reason(
+        "broker snapshot stale/missing timestamp",
+        ["BROKER_NOT_FLAT",
+         "EXIT_ONLY_RENEWAL:EXIT_ONLY_POSITION_MISMATCH"])
+    assert r == "EXIT_ONLY_RENEWAL:EXIT_ONLY_POSITION_MISMATCH"
+
+
+def test_live_upl_presented_reason_session_mismatch():
+    """A session mismatch displays the typed SESSION_MISMATCH (not a
+    misleading missing-timestamp message)."""
+    from core.performance_provenance import live_upl_presented_reason
+
+    r = live_upl_presented_reason(
+        "snapshot session does not match current runtime", [])
+    assert r == "SESSION_MISMATCH"
+
+
+def test_live_upl_presented_reason_stale_retained_without_typed_cause():
+    """Only a genuinely missing/stale snapshot keeps the generic stale
+    message (no audit reason, no session mismatch)."""
+    from core.performance_provenance import live_upl_presented_reason
+
+    assert live_upl_presented_reason(
+        "broker snapshot stale/missing timestamp", []) == \
+        "broker snapshot stale/missing timestamp"
+    assert live_upl_presented_reason(None, []) == \
+        "broker snapshot stale/missing timestamp"
+
