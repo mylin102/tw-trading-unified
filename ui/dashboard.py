@@ -3479,25 +3479,6 @@ elif _selected_product == "TMF":
             # operator attestation request; the monitor then takes a fresh
             # broker snapshot and may enter only RECONCILED_EXIT_ONLY.  It
             # cannot create a general live-entry authorization.
-            # [dashboard lifecycle] EXIT_ONLY-only lifecycle view:
-            # states MONITORING / TRIGGERED / BLOCKED / SUBMITTED and
-            # the per-leg terminal state of the CURRENT capability.
-            with st.expander("🔀 MTS 受限平倉生命週期", expanded=False):
-                _lc = exit_only_lifecycle_presentation(
-                    load_exit_only_context(),
-                    Path(runtime_path("logs", "mts_spread_events.jsonl")))
-                if _lc:
-                    st.caption(
-                        f"監控 {_lc['monitoring']['state']} · "
-                        f"觸發 {_lc['triggered'] or '—'} · "
-                        f"阻擋 {_lc['blocked'] or '—'} · "
-                        f"送單 {_lc['submitted'] or '—'} · "
-                        f"終態 {_lc['terminal'] or '—'}")
-                    st.caption(
-                        "FILLED / CANCELLED / REJECTED / TIMEOUT 顯示"
-                        "終態時間、成交數量與價格；BBO 觀察事件僅為報價"
-                        "觀察，不代表觸發")
-
             with st.expander("🛡️ 對帳部位：受限平倉授權", expanded=False):
                 _attest_path = Path(runtime_path(
                     "commands", "reconciled_exit_attestation.json"))
