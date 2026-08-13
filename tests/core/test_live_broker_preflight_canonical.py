@@ -272,3 +272,74 @@ def test_broker_snapshot_live_upl_requires_exact_legs(tmp_path):
     upl2, reason2 = broker_snapshot_live_upl(snap2, session_id="req-42")
     assert upl2 is None and reason2  # far leg missing
 
+
+class _SnapPos:
+    def __init__(self, code, quantity, price, direction, pnl):
+        self.code = code
+        self.quantity = quantity
+        self.price = price
+        self.direction = direction
+        self.pnl = pnl
+
+
+def test_post_startup_canonical_reconciles_current_session_live_upl(
+        tmp_path, monkeypatch):
+    """The in-process current-session capture persists the canonical
+    artifact with the RUNTIME session_id (full direction/qty/avg_cost/
+    pnl); broker_snapshot_live_upl then reconciles live UPL against
+    that same session — NOT a standalone preflight request id."""
+    import json as _json
+    from types import SimpleNamespace
+    from strategies.futures.monitor import FuturesMonitor
+    from core.performance_provenance import broker_snapshot_live_upl
+
+    class _Margin:
+        available_margin = 307126.0
+
+    class _Acct:
+        account_id = "acc-1"
+
+    class _Api:
+        futopt_account = _Acct()
+        stock_account = None
+
+        def list_positions(self, acct):
+            return [_SnapPos("TMFH6", 1, 46077.0, "Sell", 1850.0),
+                    _SnapPos("TMFI6", 1, 45231.0, "Buy", -1740.0)]
+
+        def list_trades(self, acct):
+            return []
+
+        def margin(self, acct):
+            return _Margin()
+
+    m = FuturesMonitor.__new__(FuturesMonitor)
+    m.api = _Api()
+    m._execution_context = SimpleNamespace(
+        session_id="SESS-95d", account_id_hash="acc-hash-123",
+        config_hash="cfg-hash", live_order_allowed=False)
+    m.config_path = "config/futures.yaml"
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    # the CURRENT runtime execution context (the same session)
+    (tmp_path / "execution_context.json").write_text(
+        _json.dumps({"session_id": "SESS-95d"}), encoding="utf-8")
+
+    snapshot = m._capture_post_startup_snapshot()
+    m._persist_current_session_canonical(snapshot)
+
+    _canon = (tmp_path / "exports" / "trades" / "live" / "diagnostics"
+              / "broker_snapshot_canonical.json")
+    assert _canon.exists(), "canonical artifact not persisted"
+    _resp = _json.loads(_canon.read_text(encoding="utf-8"))
+    assert _resp["session_id"] == "SESS-95d"
+    assert _resp["source"] == "live_broker" and _resp["mode"] == "live"
+    assert _resp["canonical_input_hash"]
+    legs = {p["code"]: p for p in _resp["positions"]}
+    assert legs["TMFH6"]["direction"] and legs["TMFH6"]["avg_cost"]
+    assert legs["TMFH6"]["pnl"] == 1850.0
+
+    # the helper reconciles against the current runtime session
+    upl, reason = broker_snapshot_live_upl(_canon)
+    assert reason is None, reason
+    assert upl == {"TMFH6": 1850.0, "TMFI6": -1740.0}
+
