@@ -401,3 +401,36 @@ def test_atomic_json_preserves_no_secrets(tmp_path):
     data = json.loads(p.read_text(encoding="utf-8"))
     assert data["blob"] == "_SecretObj"
 
+
+def test_atomic_json_serializes_action_dict_keys(tmp_path):
+    """A Shioaji C-extension enum used as a dict KEY (the encoder's
+    default= covers values only) must normalize to its NAME without
+    crashing the json encoder."""
+    from core.live_broker_preflight import _atomic_json
+
+    p = tmp_path / "out4.json"
+    _atomic_json(p, {_CEnum(): {"n": 1}, "nested": {_CEnum(): [1, 2]}})
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert "SELL" in data and data["SELL"]["n"] == 1
+    assert data["nested"]["SELL"] == [1, 2]
+
+
+def test_atomic_json_normalizes_keys_never_strs(tmp_path):
+    """The key normalizer uses .name — str()/repr() on the C enum or a
+    secret-bearing object must never be called for keys either."""
+    from core.live_broker_preflight import _atomic_json
+
+    class _SecretKey:
+        name = None
+
+        def __str__(self):
+            return "SECRET-KEY-456"
+
+        def __repr__(self):
+            return "SECRET-KEY-456"
+
+    p = tmp_path / "out5.json"
+    _atomic_json(p, {_SecretKey(): "x"})
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data == {"_SecretKey": "x"}
+
