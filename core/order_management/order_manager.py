@@ -1582,6 +1582,26 @@ class OrderManager:
 
         candidates = list(self.active_orders.values()) + list(self.completed)
         repaired = []
+        # Normalize durable rows that already contain a complete fill but
+        # were persisted with a stale non-terminal status.
+        for order in candidates:
+            if (order.quantity > 0
+                    and order.filled_quantity >= order.quantity
+                    and order.status != OrderStatus.FILLED):
+                previous = order.status
+                self.active_orders.pop(order.order_id, None)
+                if order not in self.completed:
+                    self.completed.append(order)
+                order.status = OrderStatus.FILLED
+                order.updated_at = datetime.now()
+                if order.filled_at is None:
+                    order.filled_at = order.updated_at
+                repaired.append({"order_id": order.order_id,
+                                 "code": str(order.symbol),
+                                 "filled_quantity": order.filled_quantity,
+                                 "avg_fill_price": order.avg_fill_price,
+                                 "previous_status": previous.value,
+                                 "action": "status_normalized"})
         for row in positions or []:
             if not isinstance(row, dict) or row.get("account") not in (None, "", "futures"):
                 continue
