@@ -4407,7 +4407,10 @@ class TMFSpread(StrategyBase):
                 self._lifecycle = f"RELEASE_{_release_leg.value}"
                 self._release_ts = now
                 self._release_mono = time.monotonic()
-                self._released_leg = _rel_leg_str
+                # released_leg is the FILL-confirmation marker, set only by
+                # sync_release/_enter_single_leg_after_release_fill on
+                # LEG_FILLED.  The trigger must NOT mark it (would hide the
+                # leg's inventory before the broker confirms the fill).
                 self._release_price = _exit_price
                 
                 # 2026-07-14 Gemini CLI: Reset shadow tracking variables on leg release
