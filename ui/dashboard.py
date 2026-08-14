@@ -592,6 +592,35 @@ def _fmt_release_stop_label(stop_pts, atr, mult):
     return _label
 
 
+def _fmt_trail_distance_label(trail_pts, atr, mult):
+    """MTS remaining-leg trail distance label incl. ATR-dynamic effective value.
+
+    Strategy effective trail = max(trail_distance_points, ATR * atr_multiplier_trail)
+    (tmf_spread._get_thresholds). 2026-08-14 Hermes Agent.
+    """
+    try:
+        _trail_val = int(round(float(trail_pts)))
+    except Exception:
+        _trail_val = trail_pts
+    _label = f"📈 **剩餘腿移動止盈距離**: `{_trail_val}` 點"
+    _atr_f = None
+    if atr:
+        try:
+            _atr_f = float(atr)
+            _label += f" (ATR: `{_atr_f:.1f}`)"
+        except Exception:
+            pass
+    if _atr_f and mult:
+        try:
+            _mult_f = float(mult)
+            _eff = max(float(_trail_val), _atr_f * _mult_f)
+            _label += (f" → 動態 `{_eff:.1f}` = max({_trail_val}, "
+                       f"ATR {_atr_f:.1f} × {_mult_f:.1f})")
+        except Exception:
+            pass
+    return _label
+
+
 def calculate_mts_daily_performance(fills_path: str, events_path: str, target_trading_day: str) -> dict:
     from scripts.generate_daily_report import parse_logs
     return parse_logs(fills_path, events_path, target_trading_day)
@@ -4375,7 +4404,13 @@ elif _selected_product == "TMF":
                             _trail_val = int(round(float(_trail_pts)))
                         except Exception:
                             _trail_val = _trail_pts
-                        _p2.markdown(f"📈 **剩餘腿移動止盈距離**: `{_trail_val}` 點{_atr_info}")
+                        _trail_mult = None
+                        try:
+                            _trail_mult = float((futures_cfg.get("mts", {}).get("params", {})
+                                                 or {}).get("atr_multiplier_trail") or 1.0)
+                        except Exception:
+                            _trail_mult = None
+                        _p2.markdown(_fmt_trail_distance_label(_trail_pts, _current_atr, _trail_mult))
 
                 # 2026-07-31 Hermes Agent: manual-command audit status
                 try:
