@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_DIR"
 PY="${TRADING_PYTHON_BIN:-/Users/myllin_mini/Documents/mylin102/tw-trading-unified-git/.venv/bin/python3}"
+ENV_FILE="${TRADING_ENV_FILE:-/Users/myllin_mini/Documents/mylin102/tw-trading-unified-git/.env}"
 
 if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "ERROR: tracked changes must be committed before restart" >&2
@@ -16,6 +17,13 @@ if ! "$PY" scripts/deployment/re_freeze.py --verify >/dev/null 2>&1; then
   AGENT_NAME="${AGENT_NAME:-human}" git commit -m "chore(deploy): re-freeze before live restart"
 fi
 
+if [ ! -f "$ENV_FILE" ]; then
+  echo "ERROR: credentials env file not found: $ENV_FILE" >&2
+  exit 1
+fi
+set -a
+. "$ENV_FILE"
+set +a
 export LRC_RELEASE_SHA="$(git rev-parse HEAD)"
 pm2 restart trading-system --update-env
 sleep 25
