@@ -653,9 +653,133 @@ def load_yaml(path):
             return yaml.safe_load(f) or {}
     return {}
 
+# 2026-08-14 Antigravity AI: Save YAML data preserving comments and structure via ruamel.yaml round-trip
 def save_yaml(path, data):
+    """Save YAML data preserving comments and formatting when possible via ruamel.yaml round-trip."""
+    from ruamel.yaml import YAML
+    _ryaml = YAML()
+    _ryaml.preserve_quotes = True
+
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                doc = _ryaml.load(f)
+            if isinstance(doc, dict) and isinstance(data, dict):
+                def _deep_update(target, source):
+                    for k, v in source.items():
+                        if isinstance(v, dict) and k in target and isinstance(target[k], dict):
+                            _deep_update(target[k], v)
+                        else:
+                            target[k] = v
+                _deep_update(doc, data)
+                with open(path, "w", encoding="utf-8") as f:
+                    _ryaml.dump(doc, f)
+                return
+        except Exception:
+            pass
     with open(path, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        _ryaml.dump(data, f)
+
+
+# 2026-08-14 Antigravity AI: Option A — Certified config change flow: resolve active profile target
+def resolve_active_futures_cfg_name(active_runtime_truth=None, is_night_session: bool = False) -> str:
+    """Return the active futures config file name based on runtime truth and session."""
+    if active_runtime_truth and (
+        active_runtime_truth.get("is_live_runtime")
+        or active_runtime_truth.get("is_exit_only_runtime")
+        or active_runtime_truth.get("profile_identity") == "futures_live.yaml"
+        or active_runtime_truth.get("requested_mode") == "live"
+    ):
+        return "futures_live.yaml"
+    return "futures_night.yaml" if is_night_session else "futures.yaml"
+
+
+# 2026-08-14 Antigravity AI: Option A — Certified config change flow: save futures settings targeting active profile and preserve comments
+def save_futures_settings(base_dir: Path, futures_cfg: dict, active_runtime_truth: dict, is_night_session: bool = False) -> dict:
+    """Save futures settings targeting active profile, preserving comments and enforcing re-certification warning on live changes."""
+    cfg_name = resolve_active_futures_cfg_name(active_runtime_truth, is_night_session)
+    primary_path = base_dir / "config" / cfg_name
+    is_live_target = (cfg_name == "futures_live.yaml")
+
+    saved_paths = []
+    diff_lines = []
+
+    # Read old YAML for diff summary
+    old_yaml = ""
+    if primary_path.exists():
+        try:
+            with open(primary_path, "r", encoding="utf-8") as _f:
+                old_yaml = _f.read()
+        except Exception:
+            pass
+
+    # Save to primary path preserving comments
+    save_yaml(primary_path, futures_cfg)
+    saved_paths.append(primary_path)
+
+    # If in paper mode, synchronize shared parameters across day and night configs
+    if not is_live_target:
+        _counterpart_cfg_name = "futures.yaml" if is_night_session else "futures_night.yaml"
+        _counterpart_cfg_path = base_dir / "config" / _counterpart_cfg_name
+        SESSION_SPECIFIC_MTS_PARAMS = {"atr_multiplier_stop", "atr_multiplier_trail"}
+
+        if _counterpart_cfg_path.exists():
+            _counterpart_cfg = load_yaml(_counterpart_cfg_path)
+            _counterpart_cfg["live_trading"] = futures_cfg.get("live_trading", False)
+            if "mts" not in _counterpart_cfg:
+                _counterpart_cfg["mts"] = {}
+            _counterpart_cfg["mts"]["enabled"] = futures_cfg.get("mts", {}).get("enabled", False)
+            if futures_cfg.get("mts", {}).get("enabled", False):
+                if "params" not in _counterpart_cfg["mts"]:
+                    _counterpart_cfg["mts"]["params"] = {}
+                incoming_params = futures_cfg.get("mts", {}).get("params", {})
+                for _pkey, _pval in incoming_params.items():
+                    if _pkey in SESSION_SPECIFIC_MTS_PARAMS:
+                        if _pkey not in _counterpart_cfg["mts"]["params"]:
+                            _counterpart_cfg["mts"]["params"][_pkey] = _pval
+                    else:
+                        _counterpart_cfg["mts"]["params"][_pkey] = _pval
+            save_yaml(_counterpart_cfg_path, _counterpart_cfg)
+            saved_paths.append(_counterpart_cfg_path)
+
+    # Build compact diff summary if old_yaml is available
+    if old_yaml and primary_path.exists():
+        try:
+            new_yaml = primary_path.read_text(encoding="utf-8")
+            old_lines = old_yaml.splitlines()
+            new_lines = new_yaml.splitlines()
+            import re as _re
+            old_kv = {}
+            for _l in old_lines:
+                _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
+                if _m:
+                    old_kv[_m.group(1)] = _m.group(2).strip()
+            for _l in new_lines:
+                _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
+                if _m:
+                    _k, _v = _m.group(1), _m.group(2).strip()
+                    _ov = old_kv.get(_k, '')
+                    if _ov != _v:
+                        diff_lines.append(f"  `{_k}`: `{_ov}` → `{_v}`")
+        except Exception:
+            pass
+
+    recert_prompt_required = is_live_target
+    recert_prompt_message = (
+        "⚠️ **【Live 實盤設定變更 — 必須執行 Re-Freeze 與 Re-Certification】**  \n"
+        f"`{cfg_name}` 內容已更新。因 live route certificate 與 deployment gate 粁定 `config_hash` 與 `frozen_tree_hash`，"
+        "您必須依循 Option A 流程：測試 → commit → 執行 re-freeze 更新 manifest → 重新簽發 live route certificate → 受控重啟。  \n"
+        "未完成 re-freeze 與 re-certification 逕行重啟將觸發 `GUARD_MANIFEST_STALE` / `SOURCE_MISMATCH` 進入 `LIVE_QUARANTINED` 阻斷下單！"
+    ) if is_live_target else ""
+
+    return {
+        "saved_paths": saved_paths,
+        "primary_path": primary_path,
+        "is_live_target": is_live_target,
+        "recert_prompt_required": recert_prompt_required,
+        "recert_prompt_message": recert_prompt_message,
+        "diff_lines": diff_lines,
+    }
 
 # 2026-08-10 Hermes Agent: render runtime mode only from the canonical execution context.
 def load_exit_only_context():
@@ -7030,88 +7154,23 @@ elif page == "設定":
                 futures_cfg["trade_mgmt"]["lots_per_trade"] = f_lots
                 futures_cfg["trade_mgmt"]["max_positions"] = f_max_pos
 
-                # 2026-06-30 Hermes Agent: Show config diff before saving
-                _old_yaml = ""
-                try:
-                    with open(FUTURES_CFG_PATH) as _f:
-                        _old_yaml = _f.read()
-                except Exception:
-                    pass
-                save_yaml(FUTURES_CFG_PATH, futures_cfg)
-                _new_yaml = open(FUTURES_CFG_PATH).read()
+                # 2026-08-14 Antigravity AI: Option A — Save settings targeting active profile and preserve comments
+                _save_res = save_futures_settings(
+                    base_dir=BASE,
+                    futures_cfg=futures_cfg,
+                    active_runtime_truth=active_runtime_truth,
+                    is_night_session=_CURRENT_SESSION_NIGHT,
+                )
+                _diff_lines = _save_res.get("diff_lines", [])
 
-                # 2026-07-27 Gemini CLI: Dual-config sync with explicit SESSION_SPECIFIC_MTS_PARAMS taxonomy
-                _counterpart_cfg_name = "futures.yaml" if _CURRENT_SESSION_NIGHT else "futures_night.yaml"
-                _counterpart_cfg_path = BASE / "config" / _counterpart_cfg_name
-                SESSION_SPECIFIC_MTS_PARAMS = {"atr_multiplier_stop", "atr_multiplier_trail"}
-
-                if _counterpart_cfg_path.exists():
-                    _counterpart_cfg = load_yaml(_counterpart_cfg_path)
-                    # 2026-08-05 Antigravity AI: Synchronize live_trading setting across both futures.yaml & futures_night.yaml
-                    _counterpart_cfg["live_trading"] = f_live_new
-                    if "mts" not in _counterpart_cfg: _counterpart_cfg["mts"] = {}
-                    _counterpart_cfg["mts"]["enabled"] = f_mts_new
-                    if f_mts_new:
-                        if "params" not in _counterpart_cfg["mts"]: _counterpart_cfg["mts"]["params"] = {}
-                        _incoming_params = {
-                            "min_atr": f_mts_min_atr,
-                            "atr_cap": f_mts_atr_cap,
-                            "atr_multiplier_stop": f_mts_mult_stop,
-                            "atr_multiplier_trail": f_mts_mult_trail,
-                            "release_stop_points": f_mts_stop_fixed,
-                            "trail_distance_points": f_mts_trail_fixed,
-                            "enable_combined_upl_trail": f_policy_j_enable,
-                            "combined_upl_activation_net_pnl_twd": f_policy_j_activation,
-                            "combined_upl_giveback_twd": f_policy_j_giveback,
-                            "enable_renko_exit": f_renko_enable,
-                            "renko_brick_multiplier": f_renko_mult,
-                        }
-                        for _pkey, _pval in _incoming_params.items():
-                            if _pkey in SESSION_SPECIFIC_MTS_PARAMS:
-                                # Preserve session-specific params in counterpart if already defined
-                                if _pkey not in _counterpart_cfg["mts"]["params"]:
-                                    _counterpart_cfg["mts"]["params"][_pkey] = _pval
-                            else:
-                                # Synchronize shared parameters across sessions
-                                _counterpart_cfg["mts"]["params"][_pkey] = _pval
-                    save_yaml(_counterpart_cfg_path, _counterpart_cfg)
-
-                # Build compact diff summary
-                _diff_lines = []
-                if _old_yaml:
-                    _old_lines = _old_yaml.splitlines()
-                    _new_lines = _new_yaml.splitlines()
-                    # Simple key-level diff for the most important changes
-                    import re as _re
-                    _old_kv = {}
-                    for _l in _old_lines:
-                        _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
-                        if _m: _old_kv[_m.group(1)] = _m.group(2).strip()
-                    for _l in _new_lines:
-                        _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
-                        if _m:
-                            _k, _v = _m.group(1), _m.group(2).strip()
-                            _ov = _old_kv.get(_k, '')
-                            if _ov != _v:
-                                _diff_lines.append(f"  `{_k}`: `{_ov}` → `{_v}`")
-                    # Also check nested strategy/risk keys
-                    def _flat_diff(_prefix, _new_d, _old_d):
-                        for _k, _v in _new_d.items():
-                            _pk = f"{_prefix}.{_k}"
-                            if isinstance(_v, dict):
-                                _flat_diff(_pk, _v, _old_d.get(_k, {}))
-                            else:
-                                _ov = _old_d.get(_k, _v)
-                                if _ov != _v:
-                                    _diff_lines.append(f"  `{_pk}`: `{_ov}` → `{_v}`")
-                    _flat_diff("strategy", futures_cfg.get("strategy", {}), yaml.safe_load(_old_yaml).get("strategy", {}) if _old_yaml else {})
-                    _flat_diff("risk_mgmt", futures_cfg.get("risk_mgmt", {}), yaml.safe_load(_old_yaml).get("risk_mgmt", {}) if _old_yaml else {})
-
-                if _diff_lines:
-                    st.success(f"✅ 設定已同步寫入日夜盤設定檔 (`futures.yaml` & `futures_night.yaml`)\n" + "\n".join(_diff_lines))
+                if _save_res.get("recert_prompt_required"):
+                    st.warning(_save_res.get("recert_prompt_message"))
+                    st.info(f"✅ 設定已成功寫入 `{_save_res['primary_path'].name}`（已保留註解）\n策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
                 else:
-                    st.success(f"✅ 設定已同步寫入日夜盤設定檔 (`futures.yaml` & `futures_night.yaml`)\n策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
-
+                    if _diff_lines:
+                        st.success(f"✅ 設定已同步寫入日夜盤設定檔 (`futures.yaml` & `futures_night.yaml`)\n" + "\n".join(_diff_lines))
+                    else:
+                        st.success(f"✅ 設定已同步寫入日夜盤設定檔 (`futures.yaml` & `futures_night.yaml`)\n策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
                 # 2026-08-05 Antigravity AI: Automated Live Trading Transition Protocol
                 # 1. Check & auto-flatten paper positions if switching/enabling live_trading
                 # 2. Inform user about mandatory manual .env edit (PAPER_MODE=false)
