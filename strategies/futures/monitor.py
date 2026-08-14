@@ -4308,6 +4308,7 @@ class FuturesMonitor:
             _inner = getattr(st, "status", None)
             name = (getattr(_inner, "name", None)
                     or getattr(_inner, "value", None)
+                    or (str(_inner) if _inner is not None else None)
                     or getattr(st, "name", None)
                     or getattr(st, "value", None)
                     or str(st))
@@ -4319,6 +4320,61 @@ class FuturesMonitor:
                 "code": str(getattr(t, "code", "")),
                 "status": name,
             })
+        return out
+
+    @staticmethod
+    def _normalize_snapshot_trades(raw_trades) -> list:
+        """Return JSON-safe terminal broker receipts for local backfill.
+
+        ``list_trades`` is the broker's authoritative read path when a live
+        callback was missed.  Keep only identity, terminal status and fill
+        facts; never persist the SDK object (which can contain account/CA
+        details or enum values that are not JSON serializable).
+        """
+        out = []
+        for trade in raw_trades or []:
+            status = getattr(trade, "status", None)
+            nested = getattr(status, "status", None)
+            raw_status = nested if nested is not None else status
+            if isinstance(raw_status, dict):
+                raw_status = raw_status.get("status")
+            status_name = (getattr(raw_status, "name", None)
+                           or getattr(raw_status, "value", None)
+                           or str(raw_status or ""))
+            status_name = str(status_name).split(".")[-1]
+            row = {
+                "id": getattr(trade, "id", None)
+                      or getattr(trade, "broker_order_id", None)
+                      or getattr(trade, "exchange_order_id", None),
+                "broker_order_id": getattr(trade, "broker_order_id", None),
+                "ordno": getattr(trade, "ordno", None),
+                "seqno": getattr(trade, "seqno", None),
+                "code": getattr(trade, "code", None),
+                "status": status_name,
+                "price": getattr(status, "price", None)
+                         or getattr(trade, "price", None),
+                "avg_price": getattr(status, "avg_price", None)
+                             or getattr(trade, "avg_price", None),
+                "quantity": getattr(status, "quantity", None)
+                            or getattr(trade, "quantity", None),
+                "filled_quantity": getattr(status, "filled_quantity", None)
+                                   or getattr(trade, "filled_quantity", None),
+                "deals": [],
+            }
+            deals = getattr(status, "deals", None) or getattr(trade, "deals", None) or []
+            for deal in deals if isinstance(deals, (list, tuple)) else []:
+                if isinstance(deal, dict):
+                    out_deal = dict(deal)
+                else:
+                    out_deal = {
+                        key: getattr(deal, key, None)
+                        for key in ("deal_id", "trade_id", "fill_id",
+                                    "exchange_fill_id", "exchange_seq",
+                                    "price", "avg_price", "quantity", "qty",
+                                    "ordno")
+                    }
+                row["deals"].append(out_deal)
+            out.append(row)
         return out
 
     def _capture_post_startup_snapshot(self) -> dict:
@@ -4338,7 +4394,7 @@ class FuturesMonitor:
         _api = getattr(self, "api", None)
         _ctx = getattr(self, "_execution_context", None)
         session_id = getattr(_ctx, "session_id", None) or None
-        positions, open_orders, margin = [], [], None
+        positions, open_orders, broker_trades, margin = [], [], [], None
         acct_hash = None
         errors = {}
         try:
@@ -4383,8 +4439,8 @@ class FuturesMonitor:
                         errors[f"open_orders:{_tag}"] = \
                             f"{type(exc).__name__}: {exc}"
                         _rows = []
-                    open_orders.extend(
-                        self._normalize_snapshot_orders(_rows))
+                    open_orders.extend(self._normalize_snapshot_orders(_rows))
+                    broker_trades.extend(self._normalize_snapshot_trades(_rows))
             else:
                 errors["capture"] = "api has no list_trades"
             # margin: api.margin(futopt_account) — the authenticated
@@ -4413,6 +4469,7 @@ class FuturesMonitor:
             "captured_at": captured_at,
             "positions": positions,
             "open_orders": open_orders,
+            "broker_trades": broker_trades,
             "available_margin": margin,
             "canonical_input_hash": None,
             "fetch_status": {"capture": "OK" if not errors else "FAIL"},
@@ -4422,6 +4479,32 @@ class FuturesMonitor:
                            default=str)
         payload["canonical_input_hash"] = _hl.sha256(blob.encode()).hexdigest()
         return payload
+
+    def _reconcile_local_orders_from_snapshot(self, snapshot) -> int:
+        """Backfill local order state from broker terminal receipts.
+
+        Exact broker identity matching is delegated to OrderManager; an
+        unmatched receipt must never create a synthetic MTS order.  This
+        path is read-only with respect to the broker and only repairs the
+        local ledger/export after a successful canonical snapshot.
+        """
+        if not snapshot or (snapshot.get("source") != "live_broker"):
+            return 0
+        if ((snapshot.get("fetch_status") or {}).get("capture") != "OK"):
+            return 0
+        manager = getattr(self, "order_mgr", None)
+        if manager is None or not hasattr(manager, "reconcile_broker_state"):
+            return 0
+        result = manager.reconcile_broker_state(
+            filled_trades=snapshot.get("broker_trades") or [],
+            source="live_broker_reconcile",
+            reason="callback_gap_snapshot",
+        )
+        reconciled = result.get("reconciled") or []
+        changed = sum(1 for item in reconciled if item.get("fills_added") or item.get("action") == "reconciled")
+        if changed and hasattr(self, "_save_orders_file_wrapper"):
+            self._save_orders_file_wrapper()
+        return changed
 
     def _persist_current_session_canonical(self, snapshot) -> None:
         """[P0] persist the CURRENT-session canonical artifact so the
@@ -4465,6 +4548,7 @@ class FuturesMonitor:
         if _now - getattr(self, "_live_broker_authority_at", 0.0) < 5.0:
             return getattr(self, "_live_broker_authority", None)
         _snap = self._capture_post_startup_snapshot()
+        self._reconcile_local_orders_from_snapshot(_snap)
         if ((_snap.get("fetch_status") or {}).get("capture") != "OK"
                 or _snap.get("open_orders")):
             self._live_broker_authority = None
@@ -4531,6 +4615,37 @@ class FuturesMonitor:
         self._live_broker_authority = _auth
         self._live_broker_authority_at = _now
         return _auth
+
+    def _finalize_local_orders_at_session_close(self) -> int:
+        """Mirror broker session close locally without issuing cancellations.
+
+        The broker removes unfilled orders at the session boundary.  First
+        prove that no futures order remains open; only then expire/cancel the
+        corresponding local active records.  Filled history is retained.
+        """
+        manager = getattr(self, "order_mgr", None)
+        if manager is None or getattr(self, "dry_run", False):
+            return 0
+        session_key = datetime.now().strftime("%Y%m%d")
+        if getattr(self, "_session_close_finalized_for", None) == session_key:
+            return 0
+        if getattr(self, "live_trading", False):
+            snapshot = self._capture_post_startup_snapshot()
+            if ((snapshot.get("fetch_status") or {}).get("capture") != "OK"):
+                return 0
+            codes = {str(getattr(getattr(self, "contract", None), "code", "")),
+                     str(getattr(getattr(self, "far_contract", None), "code", ""))}
+            if any((row.get("code") in codes or not row.get("code"))
+                   for row in (snapshot.get("open_orders") or [])):
+                return 0
+        finalized = manager.finalize_session_orders(
+            source="session_close_reconcile",
+            reason="BROKER_SESSION_CLOSED_UNFILLED",
+        )
+        if finalized and hasattr(self, "_save_orders_file_wrapper"):
+            self._save_orders_file_wrapper()
+        self._session_close_finalized_for = session_key
+        return finalized
 
     def _run_post_startup_gate(self):
         """[P0 post-startup gate] the in-process, UNAVOIDABLE gate run
@@ -11703,6 +11818,7 @@ class FuturesMonitor:
 
         # 在 dry_run 模式下跳過時間檢查，方便測試
         if not self.dry_run and not (is_day or is_night):
+            self._finalize_local_orders_at_session_close()
             return
 
         # 💡 GSD: Data Continuity - Generate virtual tick if volume is zero but bidask is updating

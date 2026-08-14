@@ -974,6 +974,67 @@ class OrderManager:
             symbol=order.symbol, side=order.side,
         ))
 
+    def finalize_session_orders(
+        self,
+        *,
+        source: str = "session_close",
+        reason: str = "BROKER_SESSION_CLOSED_UNFILLED",
+    ) -> int:
+        """Finalize local orders that the broker closed at session end.
+
+        This is a local lifecycle transition only: it never calls the broker
+        cancel API.  Fully unfilled active orders become ``EXPIRED``; orders
+        with a partial fill become ``CANCELLED`` so their fill history remains
+        intact while the unfilled remainder cannot leak into the next session.
+        Completed orders are deliberately retained for audit/dashboard history.
+        """
+        finalized = 0
+        for order_id in list(self.active_orders):
+            order = self.active_orders.get(order_id)
+            if order is None:
+                continue
+            previous_status = order.status
+            try:
+                if previous_status is OrderStatus.PARTIAL_FILLED:
+                    order.cancel(reason=reason)
+                    event_name = "cancel"
+                    callback = "on_cancel"
+                    status = OrderStatus.CANCELLED
+                elif previous_status in (
+                    OrderStatus.PENDING_SUBMIT,
+                    OrderStatus.PRE_SUBMITTED,
+                    OrderStatus.SUBMITTED,
+                ):
+                    order.expire()
+                    event_name = "expire"
+                    callback = "on_expire"
+                    status = OrderStatus.EXPIRED
+                else:
+                    continue
+            except ValueError:
+                # A concurrent callback may have made this order terminal;
+                # leave that authoritative terminal state untouched.
+                continue
+
+            self.completed.append(order)
+            del self.active_orders[order_id]
+            self._record_audit(
+                order,
+                event_name,
+                source=source,
+                reason=reason,
+                from_status=previous_status,
+                to_status=status,
+            )
+            self._emit(callback, OrderEvent(
+                order_id=order_id,
+                status=status,
+                symbol=order.symbol,
+                side=order.side,
+            ))
+            finalized += 1
+        return finalized
+
     # ── Recovery (重啟恢復) ──
 
     def restore_orders(self, serialized_orders: Optional[list]) -> Dict[str, int]:
