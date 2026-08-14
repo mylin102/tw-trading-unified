@@ -8,6 +8,9 @@ lifecycle stays RELEASE_PENDING (RELEASE_NEAR/FAR) with both legs shown.
 from unittest.mock import patch
 
 from core.strategy_context import StrategyContext, MarketData, PositionView
+from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+    PositionPhase, TrailGroupStatus,
+)
 from tests.strategies.test_tmf_spread_atr import _make_bar, _setup_armed
 
 
@@ -42,3 +45,7 @@ def test_release_fill_sync_still_marks_released(tmp_path):
                    order_id="test-fill-1")
     assert s._released_leg == "far"
     assert "TRAILING" in s._lifecycle
+    # LEG_FILLED path: enters SINGLE_LEG and re-arms the trailing stop
+    assert s._lifecycle_oca.phase == PositionPhase.SINGLE_LEG
+    assert s._lifecycle_oca.trail_group.status in (
+        TrailGroupStatus.ARMED, TrailGroupStatus.ACTIVE)
