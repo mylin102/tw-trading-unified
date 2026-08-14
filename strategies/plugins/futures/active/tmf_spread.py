@@ -3518,6 +3518,12 @@ class TMFSpread(StrategyBase):
             # 2026-05-27 Gemini CLI: Pass current ticker to _write_mts_state for dynamic point value
             ticker=self._ticker,
             atr=self._last_atr, # 2026-06-26 Gemini CLI: pass current ATR to state writer
+            # 2026-08-14 Hermes Agent: spread-dynamics telemetry mirror
+            # (display-only; the research SQL is authoritative)
+            dz=bar.get("dz"),
+            spread_slope=bar.get("spread_slope"),
+            velocity_ema=bar.get("velocity_ema"),
+            spread=bar.get("spread"),
             lifecycle=self._current_lifecycle_state(),
             peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
             # 2026-08-04 config observability: effective guard value + source
