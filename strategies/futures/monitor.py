@@ -4509,6 +4509,67 @@ class FuturesMonitor:
             out.append(row)
         return out
 
+    @staticmethod
+    def _normalize_order_deal_records(raw_records) -> list:
+        """Normalize Shioaji ``order_deal_records`` terminal deal rows.
+
+        ``list_trades()`` is an active-order view and can be empty after a
+        fill.  Shioaji's historical receipt API returns nested
+        ``(OrderState, OrderEventDict)`` tuples; only FuturesDeal/FDEAL rows
+        are terminal fill evidence.  FuturesOrder/FORDER rows are deliberately
+        ignored here and remain the responsibility of the active-order path.
+        """
+        out = []
+        for item in raw_records or []:
+            if not isinstance(item, (tuple, list)) or len(item) < 2:
+                continue
+            state, payload = item[0], item[1]
+            _name = getattr(state, "name", None)
+            _value = getattr(state, "value", None)
+            if not (_name == "FuturesDeal" or _value == "FDEAL"
+                    or str(_name or _value or "").split(".")[-1] == "FuturesDeal"):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            _broker_id = (payload.get("trade_id") or payload.get("id")
+                          or payload.get("broker_order_id"))
+            _price = payload.get("price")
+            _qty = payload.get("quantity") or payload.get("qty")
+            if not _broker_id or _price is None or not _qty:
+                continue
+            _code = str(payload.get("full_code") or payload.get("code") or "")
+            _delivery = str(payload.get("delivery_month") or "")
+            # Shioaji may return the product code plus a numeric delivery
+            # month rather than the monitor's canonical TMFH6/TMFI6 code.
+            if _code and _delivery.isdigit() and len(_delivery) == 6:
+                _month = int(_delivery[-2:])
+                if _month in range(1, 13) and _code == "TMF":
+                    _code = f"{_code}{chr(64 + _month)}{_delivery[-1]}"
+            _deal = {
+                "trade_id": str(_broker_id),
+                "broker_trade_id": str(_broker_id),
+                "exchange_fill_id": str(_broker_id),
+                "exchange_seq": payload.get("exchange_seq"),
+                "price": _price,
+                "quantity": _qty,
+                "ordno": payload.get("ordno"),
+            }
+            out.append({
+                "id": str(_broker_id),
+                "broker_order_id": str(_broker_id),
+                "ordno": payload.get("ordno"),
+                "seqno": payload.get("seqno"),
+                "code": _code,
+                "delivery_month": _delivery,
+                "status": "Filled",
+                "price": _price,
+                "quantity": _qty,
+                "filled_quantity": _qty,
+                "trade_id": str(_broker_id),
+                "deals": [_deal],
+            })
+        return out
+
     def _capture_post_startup_snapshot(self) -> dict:
         """[P0 post-startup gate] fresh READ-ONLY capture from the SAME
         authenticated api/session (no new login): futures positions +
@@ -4575,6 +4636,23 @@ class FuturesMonitor:
                     broker_trades.extend(self._normalize_snapshot_trades(_rows))
             else:
                 errors["capture"] = "api has no list_trades"
+            # Historical terminal receipts are separate from list_trades.
+            # Reconcile them by broker identity, but never treat them as open
+            # orders.  A missing/failed history query is observable and keeps
+            # the existing active-order evidence path intact.
+            _futopt_acct = getattr(_api, "futopt_account", None)
+            if hasattr(_api, "order_deal_records") and _futopt_acct is not None:
+                try:
+                    try:
+                        _deal_rows = _api.order_deal_records(
+                            account=_futopt_acct)
+                    except TypeError:
+                        _deal_rows = _api.order_deal_records()
+                    broker_trades.extend(
+                        self._normalize_order_deal_records(_deal_rows))
+                except Exception as exc:
+                    errors["order_deal_records"] = (
+                        f"{type(exc).__name__}: {exc}")
             # margin: api.margin(futopt_account) — the authenticated
             # futures margin (NOT an attribute on the account object)
             if hasattr(_api, "margin") and _acct is not None:
