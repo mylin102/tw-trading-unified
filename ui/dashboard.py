@@ -4720,10 +4720,20 @@ elif _selected_product == "TMF":
                 # snapshot or no authorized scope => N/A + explicit reason.
                 st.markdown("**MTS 未實現損益 (Unrealized PnL)**")
                 _u1, _u2, _u3 = st.columns(3)
-                _upl_pres = upl_presentation(
-                    _mts_perf_scope, True,
+                _flat_snapshot_ts = (
                     os.path.getmtime(_mts_state_file)
-                    if os.path.exists(_mts_state_file) else None)
+                    if _mts_state_file and os.path.exists(_mts_state_file)
+                    else None)
+                if _live_runtime and _broker_snapshot_flat:
+                    try:
+                        _flat_snapshot_ts = os.path.getmtime(
+                            runtime_path("exports", "trades", "live",
+                                         "diagnostics",
+                                         "broker_snapshot_canonical.json"))
+                    except OSError:
+                        _flat_snapshot_ts = None
+                _upl_pres = upl_presentation(
+                    _mts_perf_scope, True, _flat_snapshot_ts)
                 if _upl_pres["kind"] == "ZERO":
                     _u1.metric("近月 UPL", "0 TWD")
                     _u2.metric("遠月 UPL", "0 TWD")
