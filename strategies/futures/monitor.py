@@ -7706,7 +7706,15 @@ class FuturesMonitor:
                 "far_tick_age_ms": bar_dict.get("far_tick_age_ms"),
                 "signal_event_id": getattr(signal, "event_id", ""),
             }
-            if not self._append_mts_event_checked("ENTRY_AUDIT", **_entry_audit):
+            if self.live_trading:
+                _audit_ok = self._append_mts_event_checked(
+                    "ENTRY_AUDIT", **_entry_audit)
+            else:
+                # Preserve paper-mode behavior: telemetry remains best-effort
+                # and never changes the paper execution contract.
+                self._append_mts_event("ENTRY_AUDIT", **_entry_audit)
+                _audit_ok = True
+            if not _audit_ok:
                 console.print(
                     "[bold red]⛔ [MTS_ENTRY_BLOCKED] "
                     "ENTRY_AUDIT_PERSIST_FAILED — no legs created or submitted"
