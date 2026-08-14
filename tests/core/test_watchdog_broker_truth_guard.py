@@ -142,6 +142,22 @@ def test_stale_pending_receipt_cannot_regress_position_reconciled_fill():
     assert order.filled_quantity == 1
 
 
+def test_full_filled_quantity_normalizes_stale_submitted_status():
+    manager = OrderManager(mode="paper")
+    order = Order("TMFI6", OrderSide.BUY, OrderType.MKP, 1,
+                  order_id="ORD-1", strategy="MTS_ENTRY")
+    order.status = OrderStatus.SUBMITTED
+    order.filled_quantity = 1
+    order.avg_fill_price = 46329
+    manager.active_orders[order.order_id] = order
+    result = manager.reconcile_position_covered_orders([
+        {"account": "futures", "code": "TMFI6", "direction": "Buy",
+         "quantity": 1, "avg_cost": 46329},
+    ])
+    assert order.status is OrderStatus.FILLED
+    assert result["reconciled"][0]["action"] == "status_normalized"
+
+
 def test_terminal_order_is_restored_only_from_broker_truth_without_resubmit():
     manager = OrderManager(mode="paper")
     order = _order(manager)
