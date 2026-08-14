@@ -136,6 +136,26 @@ def test_no_broker_legs_emits_no_skip_event():
     assert mon.events == []
 
 
+def test_divergence_resolves_strategy_from_registry_get():
+    """Production path: self._registry.get('tmf_spread') is the real accessor."""
+    mon = _make_monitor()
+    mon._registry = SimpleNamespace(
+        get=lambda name: _make_strategy(_near_qty=0, _far_qty=0)
+        if name == "tmf_spread" else None)
+    mon._emit_release_eval_skip_no_local_position(_make_snapshot_with_legs())
+    assert len(mon.events) == 1
+    assert mon.events[0]["event"] == "RELEASE_EVAL_SKIP_NO_LOCAL_POSITION"
+
+
+def test_registry_strategy_with_position_emits_no_skip():
+    mon = _make_monitor()
+    mon._registry = SimpleNamespace(
+        get=lambda name: _make_strategy(_near_qty=1, _far_qty=1)
+        if name == "tmf_spread" else None)
+    mon._emit_release_eval_skip_no_local_position(_make_snapshot_with_legs())
+    assert mon.events == []
+
+
 def test_unknown_local_position_emits_no_skip_event():
     """Fail-closed: no strategy reference and no state file -> no event."""
     mon = _make_monitor()

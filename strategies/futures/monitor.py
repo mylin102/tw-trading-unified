@@ -4714,6 +4714,11 @@ class FuturesMonitor:
         """
         _ms = getattr(self, "_mts_strategy", None)
         if _ms is None:
+            try:
+                _ms = getattr(self, "_registry", None).get("tmf_spread")
+            except Exception:
+                _ms = None
+        if _ms is None:
             for _s in (getattr(self, "_strategies", {}) or {}).values():
                 _ms = _s
                 break
