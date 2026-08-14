@@ -32,3 +32,15 @@ no retry, and no inference from local state.
   receipt cannot regress the local row.
 - Paper mode continues to use its paper ledger and does not query the broker.
 
+## Entry decision provenance
+
+- Before either leg of a live MTS entry is created, one `ENTRY_AUDIT` event is
+  durably appended to the MTS event ledger.
+- The event records the spread calculation (`spread`, `spread_z`, `spread_ma`,
+  `spread_std`), configured entry threshold, ATR, expected reversion, both
+  leg prices/sides, quote source/age, trade id, and signal id.
+- If that audit write fails, neither entry intent is created and no broker
+  call is made. `ORDER_INTENT_CREATED` and `ORDER_SUBMITTED` are therefore
+  always explainable by a preceding decision record.
+- This rule applies only to live MTS entries; paper behavior remains
+  compatible and uses the same audit shape without broker effects.
