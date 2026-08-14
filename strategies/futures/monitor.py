@@ -4302,6 +4302,9 @@ class FuturesMonitor:
                     "PartiallyFailed"}
         out = []
         for t in raw_trades or []:
+            _order = getattr(t, "order", None)
+            _contract = getattr(t, "contract", None) or getattr(
+                _order, "contract", None)
             st = getattr(t, "status", None)
             _inner = getattr(st, "status", None)
             name = (getattr(_inner, "name", None)
@@ -4314,10 +4317,10 @@ class FuturesMonitor:
             if name in terminal:
                 continue
             row = {
-                "order_id": str(getattr(getattr(t, "order", None), "id", "")),
+                "order_id": str(getattr(_order, "id", "") or
+                                  getattr(t, "id", "")),
                 "code": str(getattr(t, "code", "")
-                             or getattr(getattr(getattr(t, "order", None),
-                                                 "contract", None), "code", "")),
+                             or getattr(_contract, "code", "")),
                 "status": name,
             }
             # Preserve the historical shape when SDK identity fields are not
@@ -4325,11 +4328,12 @@ class FuturesMonitor:
             # supplied by Shioaji for watchdog matching.
             for key, value in (
                     ("broker_order_id", getattr(t, "id", None)
-                     or getattr(t, "broker_order_id", None)),
+                     or getattr(t, "broker_order_id", None)
+                     or getattr(_order, "id", None)),
                     ("ordno", getattr(t, "ordno", None)
-                     or getattr(getattr(t, "order", None), "ordno", None)),
+                     or getattr(_order, "ordno", None)),
                     ("seqno", getattr(t, "seqno", None)
-                     or getattr(getattr(t, "order", None), "seqno", None))):
+                     or getattr(_order, "seqno", None))):
                 if value not in (None, ""):
                     row[key] = str(value)
             _action = (getattr(t, "action", None)
