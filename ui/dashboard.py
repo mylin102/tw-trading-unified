@@ -561,6 +561,37 @@ def _fmt_policy_j_reason(reason_str: str) -> str:
         return "🛡️ Policy J 組合停利"
     return str(reason_str)
 
+def _fmt_release_stop_label(stop_pts, atr, mult):
+    """MTS release-stop threshold label incl. ATR-dynamic effective value.
+
+    Strategy effective threshold = max(release_stop_points, ATR * atr_multiplier_stop)
+    (tmf_spread._get_thresholds). The dashboard previously showed only the fixed
+    floor, hiding the dynamic value actually used for the release decision.
+    2026-08-14 Hermes Agent.
+    """
+    try:
+        _stop_val = int(round(float(stop_pts)))
+    except Exception:
+        _stop_val = stop_pts
+    _label = f"🛑 **單腿釋放停損閾值**: `{_stop_val}` 點"
+    _atr_f = None
+    if atr:
+        try:
+            _atr_f = float(atr)
+            _label += f" (ATR: `{_atr_f:.1f}`)"
+        except Exception:
+            pass
+    if _atr_f and mult:
+        try:
+            _mult_f = float(mult)
+            _eff = max(float(_stop_val), _atr_f * _mult_f)
+            _label += (f" → 動態 `{_eff:.1f}` = max({_stop_val}, "
+                       f"ATR {_atr_f:.1f} × {_mult_f:.1f})")
+        except Exception:
+            pass
+    return _label
+
+
 def calculate_mts_daily_performance(fills_path: str, events_path: str, target_trading_day: str) -> dict:
     from scripts.generate_daily_report import parse_logs
     return parse_logs(fills_path, events_path, target_trading_day)
@@ -4332,7 +4363,13 @@ elif _selected_product == "TMF":
                             _stop_val = int(round(float(_stop_pts)))
                         except Exception:
                             _stop_val = _stop_pts
-                        _p1.markdown(f"🛑 **單腿釋放停損閾值**: `{_stop_val}` 點{_atr_info}")
+                        _stop_mult = None
+                        try:
+                            _stop_mult = float((futures_cfg.get("mts", {}).get("params", {})
+                                                or {}).get("atr_multiplier_stop") or 2.5)
+                        except Exception:
+                            _stop_mult = None
+                        _p1.markdown(_fmt_release_stop_label(_stop_pts, _current_atr, _stop_mult))
                     if _trail_pts:
                         try:
                             _trail_val = int(round(float(_trail_pts)))
