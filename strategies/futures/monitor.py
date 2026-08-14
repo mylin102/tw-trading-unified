@@ -377,10 +377,8 @@ class FuturesMonitor:
         # (three-state FLAT/OPEN/UNKNOWN). Bootstrap reads the ledger once;
         # afterwards only NEW bytes are tail-read (never a per-tick full scan).
         self._ledger_projection = MtsLedgerProjection(
-            path=os.environ.get("MTS_FILL_LOG_PATH") or os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                "logs", "mts_trade_fills.jsonl",
-            ),
+            path=os.environ.get("MTS_FILL_LOG_PATH")
+            or runtime_logs("mts_trade_fills.jsonl"),
             source="PAPER",
         )
         self._ledger_projection_sync_ts = 0.0
@@ -6235,6 +6233,11 @@ class FuturesMonitor:
                 return
             if fill_price <= 0 or fill_qty <= 0:
                 return
+            if not self._fills_bridge_mark_seen(
+                    broker_order_id,
+                    payload.get("trade_id") or payload.get("deal_id"),
+                    seqno):
+                return  # duplicate broker receipt — already applied
             order = self.order_mgr.apply_deal_fill(
                 None,
                 deal_id=payload.get("trade_id") or payload.get("deal_id"),
@@ -6267,6 +6270,30 @@ class FuturesMonitor:
             ordno=ordno,
             source="shioaji_callback",
         )
+
+    def _fills_bridge_mark_seen(self, order_id, deal_id, seqno) -> bool:
+        """Return True if this broker fill identity is NEW (not seen before).
+
+        Dedupe key: broker identity (order id | deal id | seqno).  Bounded:
+        entries older than 1h are pruned when the map exceeds 5000 keys.
+        Fail-open on internal error so a dedupe fault never drops a fill.
+        """
+        try:
+            _key = f"{order_id}|{deal_id}|{seqno}"
+            _seen = getattr(self, "_fills_bridge_seen", None)
+            if _seen is None:
+                _seen = self._fills_bridge_seen = {}
+            _now = time.monotonic()
+            if _key in _seen:
+                return False
+            if len(_seen) > 5000:
+                _old = _now - 3600.0
+                for _k in [k for k, v in _seen.items() if v < _old]:
+                    del _seen[_k]
+            _seen[_key] = _now
+            return True
+        except Exception:
+            return True
 
     def _wire_order_callbacks(self):
         """Wire OrderManager callbacks to PaperTrader and audit system."""

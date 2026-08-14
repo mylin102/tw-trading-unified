@@ -415,7 +415,20 @@ def _get_state_file_path() -> Path:
     except Exception:
         return Path(os.getenv("MTS_STATE_PATH", _default_state_path))
 _MTS_EVENT_LOG = os.getenv("MTS_EVENT_LOG_PATH", "logs/mts_spread_events.jsonl")
-_MTS_FILL_LOG = os.getenv("MTS_FILL_LOG_PATH", "logs/mts_trade_fills.jsonl")
+def _fills_ledger_path() -> str:
+    """Resolve the durable fills ledger path.
+
+    Authority: TRADING_RUNTIME_DIR/logs/mts_trade_fills.jsonl (runtime_paths);
+    MTS_FILL_LOG_PATH env override wins.  Preserves the legacy schema.
+    """
+    _env = os.getenv("MTS_FILL_LOG_PATH")
+    if _env:
+        return _env
+    from core.runtime_paths import runtime_logs
+    return runtime_logs("mts_trade_fills.jsonl")
+
+
+_MTS_FILL_LOG = _fills_ledger_path()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -707,7 +720,7 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
     if os.getenv("MTS_BACKTEST") == "1":
         return
     try:
-        _dir = os.path.dirname(_MTS_FILL_LOG)
+        _dir = os.path.dirname(_fills_ledger_path())
         if _dir and not os.path.exists(_dir):
             os.makedirs(_dir, exist_ok=True)
             
@@ -758,9 +771,9 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
             logger.error("[MTS_FILL_ERROR] Missing trade_id in fill record! type=%s ticker=%s", fill_type, ticker)
         
         if durable:
-            _append_jsonl_durable(_MTS_FILL_LOG, fill)
+            _append_jsonl_durable(_fills_ledger_path(), fill)
         else:
-            with open(_MTS_FILL_LOG, "a") as f:
+            with open(_fills_ledger_path(), "a") as f:
                 f.write(json.dumps(fill, default=str) + "\n")
     except Exception:
         if durable:
@@ -777,7 +790,7 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
 # failed settlement, risking phantom positions / double settlement).
 # ═══════════════════════════════════════════════════════════════
 _SETTLEMENT_FAILURE_LATCH = os.path.join(
-    os.path.dirname(_MTS_FILL_LOG), "runtime", "settlement_failure_latch.json"
+    os.path.dirname(_fills_ledger_path()), "runtime", "settlement_failure_latch.json"
 )
 _CRITICAL_FAILURE_SENTINEL = os.path.join(
     os.path.dirname(_SETTLEMENT_FAILURE_LATCH), "critical.sentinel"
@@ -914,7 +927,7 @@ def _has_settled_exit(
 
     Idempotency guard: prevents PnL double-counting on replay/retry.
     """
-    _log = log_path or _MTS_FILL_LOG
+    _log = log_path or _fills_ledger_path()
     if not os.path.exists(_log):
         return False
     try:
@@ -2505,7 +2518,7 @@ class TMFSpread(StrategyBase):
         """Check if fills log has an open (unclosed) position by looking for
         unmatched ENTRY records.  Returns True if at least one ENTRY has no
         matching EXIT/RELEASE that closes all legs."""
-        _log = log_path or _MTS_FILL_LOG
+        _log = log_path or _fills_ledger_path()
         if not os.path.exists(_log):
             return False
         _entries = []
@@ -2536,7 +2549,7 @@ class TMFSpread(StrategyBase):
 
     def _restore_from_fills_log(self) -> bool:
         """Rebuild position state from fills log. Returns True on success."""
-        if not os.path.exists(_MTS_FILL_LOG):
+        if not os.path.exists(_fills_ledger_path()):
             return False
         try:
             # Find the most recent open trade

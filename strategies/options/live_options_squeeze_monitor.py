@@ -172,6 +172,12 @@ class MockBrokerAdapter:
         return None
 
 
+def _ensure_central_dispatcher_ownership(api):
+    """No-op ownership guard: the central order dispatcher registered by
+    main.py is the single Shioaji order callback.  Options never re-register
+    (that would replace the futures fills bridge)."""
+
+
 class ShioajiOptionsSmartMonitor:
     def __init__(self, dry_run=False, run_once=False, replay_path=None, dry_run_live_orders=False):
         self.full_cfg = self.load_config()
@@ -329,14 +335,10 @@ class ShioajiOptionsSmartMonitor:
 
         # 設定日誌路徑
         self._update_log_paths()
-        if self.api is not None and hasattr(self.api, "set_order_callback"):
-            try:
-                self.api.set_order_callback(self.on_order_event)
-            except RuntimeError as e:
-                if "Already borrowed" in str(e):
-                    console.print("[dim]🔗 Options order callback already managed by parent session[/dim]")
-                else:
-                    raise
+        # Central order dispatcher (main.py) is the sole Shioaji callback owner;
+        # options events are routed through it.  Never re-register here: a
+        # direct set_order_callback would steal the futures fills bridge.
+        _ensure_central_dispatcher_ownership(self.api)
 
     def _update_log_paths(self):
         log_sub_dir = "live_trading" if self.live_trading else "paper_trading"
@@ -5145,14 +5147,10 @@ class ShioajiOptionsSmartMonitor:
                     self.broker = ShioajiBrokerAdapter(self.api, self.execution_cfg)
 
             # 3. Wire API callbacks
-            if self.api is not None and hasattr(self.api, "set_order_callback"):
-                try:
-                    self.api.set_order_callback(self.on_order_event)
-                except RuntimeError as e:
-                    if "Already borrowed" in str(e):
-                        console.print("[dim]🔗 Options order callback already managed by parent session[/dim]")
-                    else:
-                        raise
+            # Central order dispatcher (main.py) is the sole Shioaji callback owner;
+            # options events are routed through it.  Never re-register here: a
+            # direct set_order_callback would steal the futures fills bridge.
+            _ensure_central_dispatcher_ownership(self.api)
 
             # 4. Initialize OrderManager (SSOT for all orders)
             if self.order_mgr is None:
