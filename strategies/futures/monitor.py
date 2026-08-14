@@ -4924,17 +4924,25 @@ class FuturesMonitor:
             for p in positions or []:
                 _code = str(p.get("code") or "")
                 if _code.startswith("TMF"):
-                    # preserve missing/None pnl as None — NEVER coerce to 0
-                    # (the dashboard must render N/A, not a fake 0)
-                    _pnl_raw = p.get("pnl")
-                    _pnl = (float(_pnl_raw)
-                            if _pnl_raw is not None else None)
+                    # Per-field safe conversion: missing/non-numeric values
+                    # become None (reader renders N/A) — the artifact is
+                    # ALWAYS written fresh so a stale artifact can never
+                    # serve old UPL during the freshness window.
+                    def _fnum(v):
+                        if v is None:
+                            return None
+                        try:
+                            return float(v)
+                        except (TypeError, ValueError):
+                            return None
+
                     _legs[_code] = {
                         "direction": str(p.get("direction") or ""),
                         "quantity": int(p.get("quantity") or 0),
-                        "avg_cost": float(p.get("avg_cost")
-                                          or p.get("avg_price") or 0),
-                        "pnl": _pnl,
+                        "avg_cost": (_fnum(p.get("avg_cost"))
+                                     if _fnum(p.get("avg_cost")) is not None
+                                     else _fnum(p.get("avg_price"))),
+                        "pnl": _fnum(p.get("pnl")),
                     }
             _payload = {
                 "source": "live_broker_session",
