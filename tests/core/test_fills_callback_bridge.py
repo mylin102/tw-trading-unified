@@ -115,6 +115,35 @@ def test_restart_safe_dedupe_via_durable_order_fills():
     assert len(order.fills) == 1
 
 
+def test_restart_safe_dedupe_seqno_only_receipt():
+    """A restored order whose durable fill has exchange_seq but no deal id must
+    still dedupe a post-restart seqno-only duplicate callback (no reapply)."""
+    manager = OrderManager(mode="paper")
+    order = _order(manager)
+    # Restored fill: broker identity carried only via exchange_seq.
+    order.fills.append(OrderFill(
+        order_id=order.order_id, fill_price=46329.0, fill_quantity=1,
+        deal_id=None, exchange_fill_id=None, broker_trade_id=None,
+        exchange_seq="SEQ-9", fill_time=None,
+    ))
+    order.filled_quantity = 1
+    order.status = OrderStatus.FILLED
+    mon = _monitor_with(manager)
+    applied = []
+    manager.apply_deal_fill = lambda *a, **k: (applied.append(k), None)
+
+    order_state = SimpleNamespace(value="FDEAL")
+    # seqno (order identity) matches the order; fill identity carried only via
+    # exchange_seq; no deal id present.
+    mon.on_order_event(order_state, _deal_data(
+        trade_id="", id="", seqno="SEQ-1", ordno="",
+        exchange_seq="SEQ-9",
+        order=SimpleNamespace(id="", ordno="", seqno="")))
+
+    assert applied == []
+    assert len(order.fills) == 1
+
+
 # ── malformed / ambiguous fail-closed ──
 
 def test_malformed_deal_zero_quantity_fails_closed():
