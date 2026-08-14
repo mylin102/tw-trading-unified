@@ -4606,7 +4606,15 @@ class FuturesMonitor:
                     if _acct is None:
                         continue
                     try:
-                        _rows = _api.list_positions(account=_acct)
+                        try:
+                            _rows = _api.list_positions(account=_acct)
+                        except TypeError:
+                            # Some Shioaji-compatible adapters expose the
+                            # account as a positional-only parameter.  Keep
+                            # the same compatibility contract as the
+                            # standalone preflight rather than marking a
+                            # valid capture as failed.
+                            _rows = _api.list_positions(_acct)
                     except Exception as exc:
                         errors[f"positions:{_tag}"] = \
                             f"{type(exc).__name__}: {exc}"
