@@ -78,6 +78,24 @@ Whenever generating Python code, execution steps, or terminal commands for runni
 ## P0: PM2 and Dashboard Configuration Safety (2026-08-05)
 - Dashboard, YAML updates, watchlist sync, and UI mode changes MUST NOT create `.restart`, invoke `pm2`, or cause `trading-system` to exit.
 - Never use `pm2 restart all`, `pm2 reload`, or a dashboard-triggered restart for trading configuration. A dashboard-only code update may target `dashboard` only.
+
+## Production Release Immutability and Agent Handoff
+
+The deployed release worktree is immutable while `trading-system` is running.
+
+1. Do not edit or commit to a deployed release worktree during a live session.
+2. After any release commit, re-record the freeze manifest before deployment.
+3. Before every restart, require `git rev-parse HEAD` to equal PM2's
+   `LRC_RELEASE_SHA` exactly.
+4. Before bootstrap or restart, collect one fresh canonical broker preflight;
+   futures positions must be flat (or explicitly reconciled) and open orders
+   must be empty.
+5. Until freeze, preflight, and SHA alignment all pass, do not deploy or
+   restart. Never edit `execution_context.json` or bypass a refusal code.
+6. Runtime artifacts (logs, telemetry, snapshots, credentials, and context
+   files) must never be committed to the release tree.
+7. One slice has one implementer. Other agents hold the same files and only
+   perform read-only review until the implementer hands off a clean commit.
 - A trading-system stop/start/restart is a maintenance deployment: require explicit user approval, target preflight, broker position + working-order reconciliation, and `VERIFIED_FLAT`. Ledger or stale state files alone do not prove flat.
 - Start trading-system only from the canonical `ecosystem.config.js`; `ecosystem.config.cjs` is compatibility-only. Do not use ad-hoc `pm2 start main.py` commands.
 - After a deployment, verify exactly one trading process, the intended commit/cwd/interpreter/args, near/far Tick+BidAsk subscriptions, and 120 seconds of stable observe-only operation before `pm2 save`. Confirm `dump.pm2` contains `trading-system` and uses the same `PM2_HOME` as launchd.
