@@ -181,3 +181,29 @@ def test_rebind_ambiguous_quarantines(tmp_path):
     assert any(e.get("reason") == "LEG_LOCK_REBIND_AMBIGUOUS"
                for e in mon2.events)
 
+def test_concurrent_writers_no_lost_update(tmp_path):
+    """Codex #2: two writers racing on the lock file must never lose a
+    lock — read-modify-write must be serialized (writer flock), and the
+    final file must contain BOTH locks."""
+    import threading
+    mon = _monitor(tmp_path)
+    results = []
+    barrier = threading.Barrier(2)
+
+    def _w(idx):
+        k = _lock_key(contract=f"TMF{idx}H6", closing_side="SELL",
+                      broker_order_id=f"ORD-{idx}", seqno=str(idx))
+        barrier.wait()
+        results.append(mon._leg_lock_acquire(k))
+
+    t1 = threading.Thread(target=_w, args=(1,))
+    t2 = threading.Thread(target=_w, args=(2,))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert all(results)
+    with open(mon._leg_lock_path(), encoding="utf-8") as f:
+        d = json.load(f)
+    assert len(d) == 2  # both locks present — no lost update
+
