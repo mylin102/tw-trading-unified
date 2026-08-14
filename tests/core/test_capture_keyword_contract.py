@@ -49,4 +49,4 @@ def test_capture_positions_use_keyword_account_call():
     assert len(fut) == 1
     assert fut[0]["code"] == "TMFI6"
     assert fut[0]["direction"] == "Sell"
-    assert fut[0]["qty"] == 1
+    assert fut[0]["quantity"] == 1
