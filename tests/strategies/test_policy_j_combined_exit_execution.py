@@ -738,9 +738,9 @@ def test_release_ledger_flat_leg_blocks_combined_exit(tmp_path, monkeypatch):
     fills_log = str(tmp_path / "mts_trade_fills.jsonl")
     import json
     with open(fills_log, "w") as f:
-        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 1, "fill_type": "ENTRY"}) + "\n")
-        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 1, "fill_type": "RELEASE"}) + "\n")
-        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "FAR", "qty": 1, "fill_type": "ENTRY"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 1, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 1, "fill_type": "RELEASE", "timestamp": "2026-08-14T09:00:00.000000"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "FAR", "qty": 1, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"}) + "\n")
 
     monkeypatch.setenv("MTS_FILL_LOG_PATH", fills_log)
     mon = make_mock_monitor()
@@ -763,9 +763,9 @@ def test_release_ledger_partial_close_does_not_block(tmp_path, monkeypatch):
     fills_log = str(tmp_path / "mts_trade_fills.jsonl")
     import json
     with open(fills_log, "w") as f:
-        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 2, "fill_type": "ENTRY"}) + "\n")
-        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 1, "fill_type": "RELEASE"}) + "\n")
-        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "FAR", "qty": 2, "fill_type": "ENTRY"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 2, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 1, "fill_type": "RELEASE", "timestamp": "2026-08-14T09:00:00.000000"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "FAR", "qty": 2, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"}) + "\n")
 
     monkeypatch.setenv("MTS_FILL_LOG_PATH", fills_log)
     mon = make_mock_monitor()
@@ -793,7 +793,7 @@ def test_release_ledger_no_entry_evidence_skips_gate(tmp_path, monkeypatch):
     fills_log = str(tmp_path / "mts_trade_fills.jsonl")
     import json
     with open(fills_log, "w") as f:
-        f.write(json.dumps({"trade_id": "some-other-trade", "leg": "NEAR", "qty": 1, "fill_type": "ENTRY"}) + "\n")
+        f.write(json.dumps({"trade_id": "some-other-trade", "leg": "NEAR", "qty": 1, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"}) + "\n")
 
     monkeypatch.setenv("MTS_FILL_LOG_PATH", fills_log)
     mon = make_mock_monitor()
@@ -811,9 +811,9 @@ def test_release_ledger_far_flat_blocks_combined_exit(tmp_path, monkeypatch):
     fills_log = str(tmp_path / "mts_trade_fills.jsonl")
     import json
     with open(fills_log, "w") as f:
-        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 1, "fill_type": "ENTRY"}) + "\n")
-        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "FAR", "qty": 1, "fill_type": "ENTRY"}) + "\n")
-        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "FAR", "qty": 1, "fill_type": "EXIT"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "NEAR", "qty": 1, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "FAR", "qty": 1, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"}) + "\n")
+        f.write(json.dumps({"trade_id": "mts-test-policy-j-001", "leg": "FAR", "qty": 1, "fill_type": "EXIT", "timestamp": "2026-08-14T09:00:00.000000"}) + "\n")
 
     monkeypatch.setenv("MTS_FILL_LOG_PATH", fills_log)
     mon = make_mock_monitor()
@@ -990,10 +990,10 @@ def test_ce_terminal_trade_not_resurrected_on_restart(tmp_path, monkeypatch):
     fills_log = str(tmp_path / "mts_trade_fills.jsonl")
     with open(fills_log, "w") as f:
         for rec in [
-            {"trade_id": "mts-auto-999999-006", "leg": "NEAR", "qty": 1, "fill_type": "ENTRY"},
-            {"trade_id": "mts-auto-999999-006", "leg": "FAR", "qty": 1, "fill_type": "ENTRY"},
-            {"trade_id": "mts-auto-999999-006", "leg": "NEAR", "qty": 1, "fill_type": "EXIT"},
-            {"trade_id": "mts-auto-999999-006", "leg": "FAR", "qty": 1, "fill_type": "EXIT"},
+            {"trade_id": "mts-auto-999999-006", "leg": "NEAR", "qty": 1, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"},
+            {"trade_id": "mts-auto-999999-006", "leg": "FAR", "qty": 1, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"},
+            {"trade_id": "mts-auto-999999-006", "leg": "NEAR", "qty": 1, "fill_type": "EXIT", "timestamp": "2026-08-14T09:00:00.000000"},
+            {"trade_id": "mts-auto-999999-006", "leg": "FAR", "qty": 1, "fill_type": "EXIT", "timestamp": "2026-08-14T09:00:00.000000"},
         ]:
             f.write(_json.dumps(rec) + "\n")
     # state file claims OPEN (stale snapshot)
@@ -1025,9 +1025,9 @@ def test_fills_open_detection_leg_remaining(tmp_path):
     fills_log = str(tmp_path / "mts_trade_fills.jsonl")
     with open(fills_log, "w") as f:
         for rec in [
-            {"trade_id": "t1", "leg": "NEAR", "side": "LONG", "qty": 1, "price": 100, "fill_type": "ENTRY"},
-            {"trade_id": "t1", "leg": "FAR", "side": "LONG", "qty": 1, "price": 101, "fill_type": "ENTRY"},
-            {"trade_id": "t1", "leg": "NEAR", "side": "SELL", "qty": 1, "price": 102, "fill_type": "RELEASE"},   # one leg released, one still open
+            {"trade_id": "t1", "leg": "NEAR", "side": "LONG", "qty": 1, "price": 100, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"},
+            {"trade_id": "t1", "leg": "FAR", "side": "LONG", "qty": 1, "price": 101, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"},
+            {"trade_id": "t1", "leg": "NEAR", "side": "SELL", "qty": 1, "price": 102, "fill_type": "RELEASE", "timestamp": "2026-08-14T09:00:00.000000"},   # one leg released, one still open
         ]:
             f.write(_json.dumps(rec) + "\n")
     mon = make_mock_monitor(fills_log)
@@ -1040,10 +1040,10 @@ def test_fills_open_detection_fully_closed(tmp_path):
     fills_log = str(tmp_path / "mts_trade_fills.jsonl")
     with open(fills_log, "w") as f:
         for rec in [
-            {"trade_id": "t2", "leg": "NEAR", "side": "LONG", "qty": 1, "price": 100, "fill_type": "ENTRY"},
-            {"trade_id": "t2", "leg": "FAR", "side": "LONG", "qty": 1, "price": 101, "fill_type": "ENTRY"},
-            {"trade_id": "t2", "leg": "NEAR", "side": "SELL", "qty": 1, "price": 102, "fill_type": "EXIT"},
-            {"trade_id": "t2", "leg": "FAR", "side": "SELL", "qty": 1, "price": 103, "fill_type": "EXIT"},
+            {"trade_id": "t2", "leg": "NEAR", "side": "LONG", "qty": 1, "price": 100, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"},
+            {"trade_id": "t2", "leg": "FAR", "side": "LONG", "qty": 1, "price": 101, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"},
+            {"trade_id": "t2", "leg": "NEAR", "side": "SELL", "qty": 1, "price": 102, "fill_type": "EXIT", "timestamp": "2026-08-14T09:00:00.000000"},
+            {"trade_id": "t2", "leg": "FAR", "side": "SELL", "qty": 1, "price": 103, "fill_type": "EXIT", "timestamp": "2026-08-14T09:00:00.000000"},
         ]:
             f.write(_json.dumps(rec) + "\n")
     mon = make_mock_monitor(fills_log)
@@ -1056,9 +1056,9 @@ def test_fills_open_detection_partial_qty(tmp_path):
     fills_log = str(tmp_path / "mts_trade_fills.jsonl")
     with open(fills_log, "w") as f:
         for rec in [
-            {"trade_id": "t3", "leg": "NEAR", "side": "LONG", "qty": 1, "price": 100, "fill_type": "ENTRY"},
-            {"trade_id": "t3", "leg": "NEAR", "side": "LONG", "qty": 1, "price": 101, "fill_type": "ENTRY"},
-            {"trade_id": "t3", "leg": "NEAR", "side": "SELL", "qty": 1, "price": 102, "fill_type": "EXIT"},
+            {"trade_id": "t3", "leg": "NEAR", "side": "LONG", "qty": 1, "price": 100, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"},
+            {"trade_id": "t3", "leg": "NEAR", "side": "LONG", "qty": 1, "price": 101, "fill_type": "ENTRY", "timestamp": "2026-08-14T09:00:00.000000"},
+            {"trade_id": "t3", "leg": "NEAR", "side": "SELL", "qty": 1, "price": 102, "fill_type": "EXIT", "timestamp": "2026-08-14T09:00:00.000000"},
         ]:
             f.write(_json.dumps(rec) + "\n")
     mon = make_mock_monitor(fills_log)
