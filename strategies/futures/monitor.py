@@ -7702,6 +7702,82 @@ class FuturesMonitor:
             self._append_mts_event("ORDER_INTENT_BLOCKED", **_block_ev)
             return
 
+    def _leg_lock_path(self) -> str:
+        return getattr(self, "_leg_lock_store", "/tmp/mts_leg_locks.json")
+
+    def _leg_lock_id(self, key: dict) -> str:
+        return "|".join(str(key.get(k)) for k in (
+            "trade_id", "session_generation", "contract",
+            "closing_side", "qty"))
+
+    def _leg_lock_acquire(self, key: dict) -> bool:
+        """Persist a leg lock BEFORE submission.  Key:
+        trade_id + session_generation + contract + closing_side + qty.
+        Never released before the broker terminal state."""
+        try:
+            import json as _json
+            _p = self._leg_lock_path()
+            _locks = {}
+            if os.path.exists(_p):
+                with open(_p, encoding="utf-8") as _f:
+                    _locks = _json.load(_f)
+            _locks[self._leg_lock_id(key)] = {
+                "trade_id": key.get("trade_id"),
+                "session_generation": key.get("session_generation"),
+                "contract": key.get("contract"),
+                "closing_side": key.get("closing_side"),
+                "qty": key.get("qty"),
+                "terminal": "",
+                "locked_at": datetime.now().isoformat(),
+            }
+            _d = os.path.dirname(_p)
+            if _d:
+                os.makedirs(_d, exist_ok=True)
+            with open(_p, "w", encoding="utf-8") as _f:
+                _json.dump(_locks, _f, default=str)
+            return True
+        except Exception:
+            return False
+
+    def _leg_lock_release(self, key: dict) -> None:
+        try:
+            import json as _json
+            _p = self._leg_lock_path()
+            if not os.path.exists(_p):
+                return
+            with open(_p, encoding="utf-8") as _f:
+                _locks = _json.load(_f)
+            _locks.pop(self._leg_lock_id(key), None)
+            with open(_p, "w", encoding="utf-8") as _f:
+                _json.dump(_locks, _f, default=str)
+        except Exception:
+            pass
+
+    def _leg_lock_check(self, key: dict) -> bool:
+        """True when a non-terminal lock exists for this leg — a second
+        signal must NOT resubmit (zero submissions)."""
+        try:
+            import json as _json
+            _p = self._leg_lock_path()
+            if not os.path.exists(_p):
+                return False
+            with open(_p, encoding="utf-8") as _f:
+                _locks = _json.load(_f)
+            _lock = _locks.get(self._leg_lock_id(key))
+            if _lock is None:
+                return False
+            if str(_lock.get("terminal", "")).upper() in (
+                    "FILLED", "CANCELLED", "REJECTED", "CANCELED"):
+                return False
+            self._append_mts_event(
+                "ORDER_BLOCKED_PENDING_EXISTS",
+                reason="ORDER_BLOCKED_PENDING_EXISTS",
+                contract=key.get("contract"),
+                trade_id=key.get("trade_id"))
+            return True
+        except Exception:
+            return False
+
         if _action == "PARTIAL_EXIT":
             # 2026-06-17 Hermes Agent: use signal reason, not strategy._released_leg (still None before sync_release)
             _is_release_near = _reason and "RELEASE_NEAR" in str(_reason).upper()
