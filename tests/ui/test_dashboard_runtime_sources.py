@@ -32,3 +32,21 @@ def test_live_legacy_fills_are_not_rendered_as_realized_metrics(tmp_path):
         False, {"ok": False, "reason": "legacy"}, str(fills)) is False
     assert dashboard.can_render_mts_realized_performance(
         False, {"ok": True}, str(fills)) is True
+
+
+def test_calendar_live_pair_is_preferred_over_archival_csv(tmp_path, monkeypatch):
+    import ui.dashboard as dashboard
+    import pandas as pd
+
+    market = tmp_path / "market"
+    market.mkdir()
+    monkeypatch.setattr(dashboard, "FUTURES_MKT", market)
+    monkeypatch.setattr(dashboard, "_TICKER", "TMF")
+    monkeypatch.setattr(dashboard, "get_session_date_str", lambda: "20260814")
+    ts = pd.date_range("2026-08-14 09:00", periods=21, freq="5min")
+    pd.DataFrame({"timestamp": ts, "close": range(100, 121)}).to_csv(
+        market / "TMF_20260814_LIVE_indicators.csv", index=False)
+    pd.DataFrame({"timestamp": ts, "close": range(90, 111)}).to_csv(
+        market / "TMF_far_20260814_LIVE.csv", index=False)
+    result = dashboard.load_calendar_spread_data.__wrapped__()
+    assert result is not None and result["timestamp"].max() == ts[-1]

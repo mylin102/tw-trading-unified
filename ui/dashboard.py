@@ -2736,6 +2736,33 @@ def load_calendar_spread_data():
         import numpy as np
         from pathlib import Path
 
+        # Prefer the current session's LIVE near/far bars when both files
+        # exist.  Precomputed calendar CSVs are archival and can lag the
+        # runtime by days; they must not mask current broker-session data.
+        _live_near = FUTURES_MKT / f"{_TICKER}_{get_session_date_str()}_LIVE_indicators.csv"
+        _live_far = FUTURES_MKT / f"{_TICKER}_far_{get_session_date_str()}_LIVE.csv"
+        if _live_near.exists() and _live_far.exists():
+            _near = _load_spread_csv(str(_live_near.resolve()), _live_near.stat().st_mtime_ns)
+            _far = _load_spread_csv(str(_live_far.resolve()), _live_far.stat().st_mtime_ns)
+            if _near is not None and _far is not None and not _near.empty and not _far.empty:
+                _near_close = "close" if "close" in _near.columns else "Close"
+                _far_close = "close" if "close" in _far.columns else "Close"
+                if _near_close in _near.columns and _far_close in _far.columns:
+                    _live = pd.merge(
+                        _near[["timestamp", _near_close]].rename(columns={_near_close: "Close_near"}),
+                        _far[["timestamp", _far_close]].rename(columns={_far_close: "Close_far"}),
+                        on="timestamp", how="inner")
+                    if not _live.empty:
+                        _live["spread"] = _live["Close_near"] - _live["Close_far"]
+                        _live = _live.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+                        _live["spread_ma"] = _live["spread"].rolling(20, min_periods=20).mean()
+                        _live["spread_std"] = _live["spread"].rolling(20, min_periods=20).std()
+                        _std = _live["spread_std"].replace(0, np.nan)
+                        _live["spread_z"] = (_live["spread"] - _live["spread_ma"]) / _std
+                        print(f"[Calendar Spread] LIVE session data: {len(_live)} rows, "
+                              f"range {_live['timestamp'].min()} ~ {_live['timestamp'].max()}")
+                        return _live
+
         # 優先載入預先計算的價差檔案（ticker-scoped）
         spread_path = _latest_spread_csv(_TICKER)
         if spread_path is not None:
