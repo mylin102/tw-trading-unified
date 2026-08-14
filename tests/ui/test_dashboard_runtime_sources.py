@@ -34,6 +34,13 @@ def test_live_legacy_fills_are_not_rendered_as_realized_metrics(tmp_path):
         False, {"ok": True}, str(fills)) is True
 
 
+def test_live_dashboard_cannot_fall_back_to_legacy_position_state():
+    source = Path(__file__).parents[2] / "ui" / "dashboard.py"
+    text = source.read_text(encoding="utf-8")
+    assert "_mts_state_file = (None if (_exit_only_dashboard or _live_runtime)" in text
+    assert "_broker_snapshot_flat = True" in text
+
+
 def test_calendar_live_pair_is_preferred_over_archival_csv(tmp_path, monkeypatch):
     import ui.dashboard as dashboard
     import pandas as pd

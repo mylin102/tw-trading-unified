@@ -464,7 +464,7 @@ def test_exit_only_primary_panel_skips_legacy_state_and_daily_jsonl():
     performance JSONL.  LIVE/PAPER remain on their existing branch."""
     source = (Path(__file__).parents[2] / "ui" / "dashboard.py").read_text()
 
-    assert "_mts_state_file = None if _exit_only_dashboard" in source
+    assert "_mts_state_file = (None if (_exit_only_dashboard or _live_runtime)" in source
     assert "if not _exit_only_dashboard and os.path.exists(_fills_path):" in source
     assert "受限平倉模式—受限範圍待券商對帳重新驗證" in source
 
@@ -669,4 +669,3 @@ def test_exit_only_presented_reason_bbo_missing_only_when_no_observation():
         "EXIT_ONLY_BBO_MISSING", [],
         {"count": 3, "latest_ts": "t"}) == \
         "EXIT_ONLY_BBO_PRESENT_BUT_UNVERIFIED"
-

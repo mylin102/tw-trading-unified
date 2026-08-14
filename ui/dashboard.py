@@ -4428,6 +4428,12 @@ elif _selected_product == "TMF":
     # In restricted-exit mode the legacy /tmp state must not be read or
     # presented.  The full legacy block remains unchanged for LIVE/PAPER.
     _broker_mts_state = None
+    _broker_snapshot_flat = False
+    _live_runtime = bool(
+        active_runtime_truth.get("is_live_runtime")
+        or active_runtime_truth.get("profile_identity") == "futures_live.yaml"
+        or active_runtime_truth.get("requested_mode") == "live"
+    )
     if not _exit_only_dashboard:
         try:
             _ctx_live = json.loads(Path(runtime_path("execution_context.json")).read_text())
@@ -4438,34 +4444,38 @@ elif _selected_product == "TMF":
                     and int(p.get("quantity", 0) or 0) > 0]
             if (_ctx_live.get("effective_mode") == "live_ready"
                     and _canon.get("session_id") == _ctx_live.get("session_id")
-                    and len({p.get("code") for p in _fut}) == 2
+                    and (_canon.get("fetch_status") or {}).get("capture") == "OK"
                     and not _canon.get("open_orders")):
-                _by = {p["code"]: p for p in _fut}
-                _broker_mts_state = {
-                    "has_position": True,
-                    "near_entry": _by["TMFH6"].get("avg_cost"),
-                    "far_entry": _by["TMFI6"].get("avg_cost"),
-                    "near_upl": _by["TMFH6"].get("pnl"),
-                    "far_upl": _by["TMFI6"].get("pnl"),
-                    "near_side": _by["TMFH6"].get("direction"),
-                    "far_side": _by["TMFI6"].get("direction"),
-                    "action": (f'{_by["TMFH6"].get("direction", "?")} / '
-                               f'{_by["TMFI6"].get("direction", "?")}'),
-                    "release_state": "BOTH_HELD",
-                    "trade_id": "broker-reconciled-" + str(_canon.get("canonical_input_hash", ""))[:16],
-                    "reason": "broker_snapshot",
-                    "position_phase": "SPREAD",
-                    "_updated": _canon.get("captured_at") or _canon.get("captured_at_ms") or "?",
-                }
                 _live_mts_params = (futures_cfg.get("mts", {}).get("params", {})
                                     if isinstance(futures_cfg, dict) else {})
-                _broker_mts_state.update({
-                    "release_stop_points": _live_mts_params.get("release_stop_points"),
-                    "trail_distance_points": _live_mts_params.get("trail_distance_points"),
-                    "atr": (_live_mts_params.get("atr_current")
-                            or _live_mts_params.get("atr")
-                            or _latest_live_atr()),
-                })
+                if len({p.get("code") for p in _fut}) == 2:
+                    _by = {p["code"]: p for p in _fut}
+                    _broker_mts_state = {
+                        "has_position": True,
+                        "near_entry": _by["TMFH6"].get("avg_cost"),
+                        "far_entry": _by["TMFI6"].get("avg_cost"),
+                        "near_upl": _by["TMFH6"].get("pnl"),
+                        "far_upl": _by["TMFI6"].get("pnl"),
+                        "near_side": _by["TMFH6"].get("direction"),
+                        "far_side": _by["TMFI6"].get("direction"),
+                        "action": (f'{_by["TMFH6"].get("direction", "?")} / '
+                                   f'{_by["TMFI6"].get("direction", "?")}'),
+                        "release_state": "BOTH_HELD",
+                        "trade_id": "broker-reconciled-" + str(_canon.get("canonical_input_hash", ""))[:16],
+                        "reason": "broker_snapshot",
+                        "position_phase": "SPREAD",
+                        "_updated": _canon.get("captured_at") or _canon.get("captured_at_ms") or "?",
+                        "release_stop_points": _live_mts_params.get("release_stop_points"),
+                        "trail_distance_points": _live_mts_params.get("trail_distance_points"),
+                        "atr": (_live_mts_params.get("atr_current")
+                                or _live_mts_params.get("atr")
+                                or _latest_live_atr()),
+                    }
+                else:
+                    # A current, successful broker snapshot with no complete
+                    # spread is authoritative FLAT/partial evidence.  Do
+                    # not fall through to stale /tmp paper state.
+                    _broker_snapshot_flat = True
                 # Current broker-reconciled futures are the authoritative
                 # live performance scope; legacy fills are not required.
                 _mts_perf_scope = {
@@ -4479,7 +4489,19 @@ elif _selected_product == "TMF":
                 }
         except Exception:
             _broker_mts_state = None
-    _mts_state_file = None if _exit_only_dashboard else "/tmp/mts_position_state.json"
+    if _broker_snapshot_flat:
+        _broker_mts_state = {
+            "has_position": False,
+            "release_state": "FLAT",
+            "reason": "broker_snapshot_flat",
+            "position_phase": "FLAT",
+            "_updated": "broker_snapshot",
+        }
+    # A LIVE runtime must never fall through to the legacy paper state file;
+    # that stale file was the source of phantom Policy J/UPL after a broker
+    # flat reconciliation.  PAPER compatibility remains unchanged.
+    _mts_state_file = (None if (_exit_only_dashboard or _live_runtime)
+                       else "/tmp/mts_position_state.json")
     if _broker_mts_state is not None or (_mts_state_file and os.path.exists(_mts_state_file)):
         try:
             _mts_state = _broker_mts_state
