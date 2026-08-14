@@ -3397,6 +3397,26 @@ if active_runtime_truth["warning"]:
 if active_runtime_truth["is_live_runtime"] or o_live or s_live:
     st.markdown('<div style="background:#ff4444;color:white;padding:8px;text-align:center;border-radius:4px;font-weight:bold;">⚠️ LIVE TRADING ACTIVE</div>', unsafe_allow_html=True)
 
+def _build_flat_broker_mts_state(telemetry: dict) -> dict:
+    """Broker-authoritative FLAT state plus telemetry-only display fields.
+
+    The LIVE broker-first design never falls through to the /tmp legacy
+    state file for lifecycle truth; the flat stub it builds must still carry
+    the telemetry spread_z/atr so the dashboard renders live values instead
+    of N/A.  Lifecycle fields stay broker-derived; telemetry fields are
+    display-only and never drive position authority.
+    """
+    return {
+        "has_position": False,
+        "release_state": "FLAT",
+        "reason": "broker_snapshot_flat",
+        "position_phase": "FLAT",
+        "_updated": "broker_snapshot",
+        "spread_z": telemetry.get("spread_z"),
+        "atr": telemetry.get("atr"),
+    }
+
+
 def _monitor_status():
     try:
         r = subprocess.run(["pgrep", "-f", "main.py"], capture_output=True)
@@ -4490,13 +4510,13 @@ elif _selected_product == "TMF":
         except Exception:
             _broker_mts_state = None
     if _broker_snapshot_flat:
-        _broker_mts_state = {
-            "has_position": False,
-            "release_state": "FLAT",
-            "reason": "broker_snapshot_flat",
-            "position_phase": "FLAT",
-            "_updated": "broker_snapshot",
-        }
+        _mts_telemetry = {}
+        try:
+            _mts_telemetry = json.loads(
+                Path("/tmp/mts_position_state.json").read_text())
+        except Exception:
+            pass
+        _broker_mts_state = _build_flat_broker_mts_state(_mts_telemetry)
     # A LIVE runtime must never fall through to the legacy paper state file;
     # that stale file was the source of phantom Policy J/UPL after a broker
     # flat reconciliation.  PAPER compatibility remains unchanged.
