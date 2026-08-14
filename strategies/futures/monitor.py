@@ -4625,6 +4625,13 @@ class FuturesMonitor:
         blob = _json.dumps(payload, sort_keys=True, ensure_ascii=False,
                            default=str)
         payload["canonical_input_hash"] = _hl.sha256(blob.encode()).hexdigest()
+        # A successful snapshot is the authoritative boundary for repairing
+        # local lifecycle rows.  This also covers startup/watchdog captures
+        # where no strategy tick has run yet.
+        try:
+            self._reconcile_local_orders_from_snapshot(payload)
+        except Exception:
+            pass
         return payload
 
     def _reconcile_local_orders_from_snapshot(self, snapshot) -> int:
