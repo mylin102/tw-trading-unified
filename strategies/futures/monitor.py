@@ -436,15 +436,6 @@ class FuturesMonitor:
         self._spread_loaded = self._spread_loader.load_latest_csv(self.ticker)
         if self._spread_loaded:
             print(f"[V-Model] SpreadLoader initiated: {self._spread_loader.status()}")
-
-        # Research dynamics: dz / spread_slope / velocity_ema features.
-        # Best-effort — absence only leaves research columns NULL.
-        try:
-            from strategies.futures.mts.spread_dynamics import \
-                SpreadDynamicsCalculator
-            self._spread_dynamics = SpreadDynamicsCalculator()
-        except Exception:
-            self._spread_dynamics = None
         else:
             print("[V-Model] SpreadLoader: no calendar spread data found")
             active_strat = self.cfg.get("active_strategy") or self.cfg.get("strategy", {}).get("active_strategy")
@@ -454,6 +445,15 @@ class FuturesMonitor:
                     f"[V-Model] Critical error: active strategy is '{active_strat}' but calendar spread CSV "
                     f"data failed to load for ticker '{self.ticker}'. Silent start with missing data is blocked to prevent data pollution."
                 )
+
+        # Research dynamics: dz / spread_slope / velocity_ema features.
+        # Best-effort — absence only leaves research columns NULL.
+        try:
+            from strategies.futures.mts.spread_dynamics import \
+                SpreadDynamicsCalculator
+            self._spread_dynamics = SpreadDynamicsCalculator()
+        except Exception:
+            self._spread_dynamics = None
 
         # 2026-07-14 Gemini CLI: Initialize MTF snapshot cache for ADR-009 Phase 1
         self._current_mtf_snapshot = MtfSnapshot()
