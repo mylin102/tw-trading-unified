@@ -4608,6 +4608,9 @@ elif _selected_product == "TMF":
                 if _live_upl is not None:
                     _nr = _live_upl["legs"]["TMFH6"]["pnl"]
                     _fr = _live_upl["legs"]["TMFI6"]["pnl"]
+                elif isinstance(_broker_mts_state, dict) and _broker_mts_state.get("has_position"):
+                    _nr = _broker_mts_state.get("near_upl")
+                    _fr = _broker_mts_state.get("far_upl")
                 else:
                     _nr = None
                     _fr = None
