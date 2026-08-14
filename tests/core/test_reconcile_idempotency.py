@@ -97,7 +97,8 @@ def test_refresh_flow_saves_orders_export_once():
     monitor.contract = SimpleNamespace(code="TMFH6")
     monitor.far_contract = SimpleNamespace(code="TMFI6")
     monitor._execution_context = SimpleNamespace(
-        effective_mode="live_ready", session_id="session-1")
+        requested_mode="live", effective_mode="live_ready",
+        session_id="session-1")
     monitor._live_broker_authority_at = 0.0
     monitor._live_broker_authority = None
     monitor._persist_current_session_canonical = lambda snapshot: None
