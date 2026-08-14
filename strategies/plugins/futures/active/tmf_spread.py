@@ -1424,6 +1424,7 @@ def _write_mts_telemetry(
     total_upl: float = 0.0,
     atr: float = 0.0,
     quote_age_ms: float = 0.0,
+    spread_z: float = 0.0,
     **kwargs,
 ) -> None:
     """P0: Heartbeat-only telemetry update — NEVER writes lifecycle fields.
@@ -1510,6 +1511,8 @@ def _write_mts_telemetry(
             "far_upl": round(far_upl, 1),
             "total_upl": round(total_upl, 1),
             "atr": round(atr, 2) if atr else existing.get("atr"),
+            "spread_z": round(float(spread_z), 2) if spread_z
+                        else existing.get("spread_z", 0.0),
             "quote_age_ms": round(float(quote_age_ms), 1),
             "heartbeat_at": datetime.now().isoformat(),
             "heartbeat_pid": os.getpid(),

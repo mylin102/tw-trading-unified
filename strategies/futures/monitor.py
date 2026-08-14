@@ -9853,6 +9853,7 @@ class FuturesMonitor:
                         near_last=_n_last, far_last=_f_last,
                         near_upl=_n_upl, far_upl=_f_upl, total_upl=_n_upl + _f_upl,
                         quote_age_ms=_bar_dict.get("quote_age_ms", 0),
+                        spread_z=_bar_dict.get("spread_z", 0),
                     )
                 except Exception:
                     pass
@@ -9867,6 +9868,7 @@ class FuturesMonitor:
                         near_last=_n_last, far_last=_f_last,
                         near_upl=_n_upl, far_upl=_f_upl, total_upl=_n_upl + _f_upl,
                         quote_age_ms=_bar_dict.get("quote_age_ms", 0),
+                        spread_z=_bar_dict.get("spread_z", 0),
                     )
                 except Exception:
                     pass
@@ -9878,6 +9880,7 @@ class FuturesMonitor:
                         near_last=_n_last, far_last=_f_last,
                         near_upl=_n_upl, far_upl=_f_upl, total_upl=_n_upl + _f_upl,
                         quote_age_ms=_bar_dict.get("quote_age_ms", 0),
+                        spread_z=_bar_dict.get("spread_z", 0),
                     )
                 except Exception:
                     pass
