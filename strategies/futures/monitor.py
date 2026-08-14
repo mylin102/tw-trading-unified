@@ -7703,53 +7703,97 @@ class FuturesMonitor:
             return
 
     def _leg_lock_path(self) -> str:
-        return getattr(self, "_leg_lock_store", "/tmp/mts_leg_locks.json")
+        _p = getattr(self, "_leg_lock_store", "")
+        if _p:
+            return _p
+        try:
+            from core.runtime_paths import runtime_path
+            return runtime_path("exports", "trades", "live", "diagnostics",
+                                "mts_leg_locks.json")
+        except Exception:
+            return "/tmp/mts_leg_locks.json"
 
     def _leg_lock_id(self, key: dict) -> str:
         return "|".join(str(key.get(k)) for k in (
             "trade_id", "session_generation", "contract",
             "closing_side", "qty"))
 
-    def _leg_lock_acquire(self, key: dict) -> bool:
-        """Persist a leg lock BEFORE submission.  Key:
-        trade_id + session_generation + contract + closing_side + qty.
-        Never released before the broker terminal state."""
+    def _leg_lock_save(self, locks: dict) -> None:
+        """Atomic + fsync write so a crash cannot leave a torn lock file."""
+        _p = self._leg_lock_path()
+        _d = os.path.dirname(_p)
+        if _d:
+            os.makedirs(_d, exist_ok=True)
+        _tmp = _p + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            import json as _json
+            _json.dump(locks, _f, default=str)
+            _f.flush()
+            os.fsync(_f.fileno())
+        os.replace(_tmp, _p)
+
+    def _leg_lock_load(self) -> dict:
         try:
             import json as _json
             _p = self._leg_lock_path()
-            _locks = {}
-            if os.path.exists(_p):
-                with open(_p, encoding="utf-8") as _f:
-                    _locks = _json.load(_f)
+            if not os.path.exists(_p):
+                return {}
+            with open(_p, encoding="utf-8") as _f:
+                return _json.load(_f) or {}
+        except Exception:
+            return {}  # corrupted file -> fail-safe: no locks assumed
+
+    def _leg_lock_rebind(self, locks: dict, key: dict) -> dict | None:
+        """Match a lock by broker identity after a restart (generation
+        changed).  Rebind the lock to the new session generation."""
+        for _lid, _lock in locks.items():
+            if (str(_lock.get("trade_id") or "") == str(key.get("trade_id") or "")
+                    and str(_lock.get("contract") or "") == str(key.get("contract") or "")
+                    and str(_lock.get("closing_side") or "") == str(key.get("closing_side") or "")
+                    and int(_lock.get("qty") or 0) == int(key.get("qty") or 0)):
+                _lock["session_generation"] = key.get("session_generation")
+                self._leg_lock_save(locks)
+                return _lock
+        return None
+
+    def _leg_lock_acquire(self, key: dict,
+                          status: str = "PENDING_UNCONFIRMED") -> bool:
+        """Persist a leg lock BEFORE submission.  Key:
+        trade_id + session_generation + contract + closing_side + qty.
+        status: PENDING_UNCONFIRMED (receipt, never released early) or
+        SUBMIT_FAILED (released after failure handling)."""
+        try:
+            _locks = self._leg_lock_load()
             _locks[self._leg_lock_id(key)] = {
                 "trade_id": key.get("trade_id"),
                 "session_generation": key.get("session_generation"),
                 "contract": key.get("contract"),
                 "closing_side": key.get("closing_side"),
                 "qty": key.get("qty"),
+                "status": status,
                 "terminal": "",
                 "locked_at": datetime.now().isoformat(),
             }
-            _d = os.path.dirname(_p)
-            if _d:
-                os.makedirs(_d, exist_ok=True)
-            with open(_p, "w", encoding="utf-8") as _f:
-                _json.dump(_locks, _f, default=str)
+            self._leg_lock_save(_locks)
             return True
         except Exception:
             return False
 
-    def _leg_lock_release(self, key: dict) -> None:
+    def _leg_lock_release(self, key: dict,
+                          only_statuses=("FILLED", "CANCELLED", "REJECTED",
+                                         "CANCELED", "SUBMIT_FAILED")) -> None:
+        """Release a leg lock ONLY on terminal states or SUBMIT_FAILED.
+        PENDING_UNCONFIRMED is never released early (no resend)."""
         try:
-            import json as _json
-            _p = self._leg_lock_path()
-            if not os.path.exists(_p):
+            _locks = self._leg_lock_load()
+            _lid = self._leg_lock_id(key)
+            _lock = _locks.get(_lid)
+            if _lock is None:
                 return
-            with open(_p, encoding="utf-8") as _f:
-                _locks = _json.load(_f)
-            _locks.pop(self._leg_lock_id(key), None)
-            with open(_p, "w", encoding="utf-8") as _f:
-                _json.dump(_locks, _f, default=str)
+            _st = str(_lock.get("status", "")).upper()
+            if _st in tuple(s.upper() for s in only_statuses):
+                _locks.pop(_lid, None)
+                self._leg_lock_save(_locks)
         except Exception:
             pass
 
@@ -7765,8 +7809,13 @@ class FuturesMonitor:
                 _locks = _json.load(_f)
             _lock = _locks.get(self._leg_lock_id(key))
             if _lock is None:
+                # restart rebinding: session_generation changed after a
+                # restart — match by broker identity components
+                # (trade_id + contract + closing_side + qty) and rebind.
+                _lock = self._leg_lock_rebind(_locks, key)
+            if _lock is None:
                 return False
-            if str(_lock.get("terminal", "")).upper() in (
+            if str(_lock.get("status", "")).upper() in (
                     "FILLED", "CANCELLED", "REJECTED", "CANCELED"):
                 return False
             self._append_mts_event(
