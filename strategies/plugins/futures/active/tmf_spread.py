@@ -3310,10 +3310,27 @@ class TMFSpread(StrategyBase):
             if self._lifecycle in ("RELEASE_NEAR", "RELEASE_FAR") and getattr(self, "_release_mono", 0.0) > 0.0:
                 _release_age = time.monotonic() - self._release_mono
                 if _release_age > 60:
-                    logger.warning("[MTS_RELEASE_TIMEOUT] lifecycle=%s stuck for %.0fs. Resetting to OPEN for retry.", self._lifecycle, _release_age)
-                    self._lifecycle = "OPEN"
-                    self._release_ts = None
-                    self._release_mono = 0.0
+                    # Broker-truth guard: the watchdog may still protect a
+                    # live broker order/position.  Resetting to OPEN would
+                    # drop stop/trail protection and permit a resend, so it
+                    # is allowed ONLY when the broker proved flat.  While the
+                    # broker order/position is not terminal, keep the pending
+                    # lifecycle (EXIT_PENDING semantics) and never resend.
+                    if getattr(self, "_broker_truth_flat", False) is True:
+                        logger.warning("[MTS_RELEASE_TIMEOUT] lifecycle=%s stuck for %.0fs. Resetting to OPEN for retry.", self._lifecycle, _release_age)
+                        self._lifecycle = "OPEN"
+                        self._release_ts = None
+                        self._release_mono = 0.0
+                    else:
+                        logger.warning(
+                            "[MTS_RELEASE_TIMEOUT] lifecycle=%s stuck %.0fs "
+                            "but broker order/position still live — keeping "
+                            "pending (no reset, no resend)", self._lifecycle,
+                            _release_age)
+                        self._set_eval(
+                            skip_reason="MTS_RELEASE_PENDING_BROKER_LIVE",
+                            lifecycle=self._lifecycle)
+                        return None
                     # Fall through to continue processing
                 else:
                     self._set_eval(skip_reason="MTS_BUSY", lifecycle=self._lifecycle)
