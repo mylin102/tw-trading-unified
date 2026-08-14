@@ -4333,6 +4333,7 @@ class FuturesMonitor:
         """
         out = []
         for trade in raw_trades or []:
+            broker_order = getattr(trade, "order", None)
             status = getattr(trade, "status", None)
             nested = getattr(status, "status", None)
             raw_status = nested if nested is not None else status
@@ -4345,10 +4346,14 @@ class FuturesMonitor:
             row = {
                 "id": getattr(trade, "id", None)
                       or getattr(trade, "broker_order_id", None)
-                      or getattr(trade, "exchange_order_id", None),
-                "broker_order_id": getattr(trade, "broker_order_id", None),
-                "ordno": getattr(trade, "ordno", None),
-                "seqno": getattr(trade, "seqno", None),
+                      or getattr(trade, "exchange_order_id", None)
+                      or getattr(broker_order, "id", None),
+                "broker_order_id": getattr(trade, "broker_order_id", None)
+                                   or getattr(broker_order, "id", None),
+                "ordno": getattr(trade, "ordno", None)
+                        or getattr(broker_order, "ordno", None),
+                "seqno": getattr(trade, "seqno", None)
+                        or getattr(broker_order, "seqno", None),
                 "code": getattr(trade, "code", None),
                 "status": status_name,
                 "price": getattr(status, "price", None)
