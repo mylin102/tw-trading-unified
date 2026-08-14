@@ -7383,6 +7383,33 @@ class FuturesMonitor:
             return None
         return _open_qty
 
+    def _apply_spread_dynamics(self, bar: dict) -> None:
+        """Wire the SpreadDynamicsCalculator into the bar pipeline so the
+        entry_observation research records carry dz / spread_slope /
+        velocity_ema (research wiring gap — the calculator was never
+        called, leaving those columns NULL).  Also records the spread into
+        the candidate payload.  Never raises; the research features are
+        best-effort telemetry."""
+        _sd = getattr(self, "_spread_dynamics", None)
+        _z = bar.get("spread_z")
+        if _sd is None or _z is None:
+            return
+        try:
+            _ts = bar.get("ts") or bar.get("timestamp") or time.time()
+            _ts_f = float(_ts.timestamp()) if hasattr(_ts, "timestamp") \
+                else float(_ts)
+            _m = _sd.update(_ts_f, float(_z))
+            bar["dz"] = _m.z_velocity
+            bar["spread_slope"] = _m.rolling_slope
+            bar["velocity_ema"] = _m.velocity_ema
+            bar.setdefault(
+                "spread",
+                float(bar.get("near_close", 0.0) or 0.0)
+                - float(bar.get("far_close", 0.0) or 0.0))
+        except Exception:
+            pass
+
+
     def _record_mts_entry_research_candidate(self, strategy, bar_dict, ts):
         """Best-effort z-score candidate telemetry; never affects orders."""
         try:
@@ -9557,32 +9584,6 @@ class FuturesMonitor:
         # Signal caller to skip this tick (probe takes priority)
         return True
 
-    def _apply_spread_dynamics(self, bar: dict) -> None:
-        """Wire the SpreadDynamicsCalculator into the bar pipeline so the
-        entry_observation research records carry dz / spread_slope /
-        velocity_ema (research wiring gap — the calculator was never
-        called, leaving those columns NULL).  Also records the spread into
-        the candidate payload.  Never raises; the research features are
-        best-effort telemetry."""
-        _sd = getattr(self, "_spread_dynamics", None)
-        _z = bar.get("spread_z")
-        if _sd is None or _z is None:
-            return
-        try:
-            _ts = bar.get("ts") or bar.get("timestamp") or time.time()
-            _ts_f = float(_ts.timestamp()) if hasattr(_ts, "timestamp") \
-                else float(_ts)
-            _m = _sd.update(_ts_f, float(_z))
-            bar["dz"] = _m.z_velocity
-            bar["spread_slope"] = _m.rolling_slope
-            bar["velocity_ema"] = _m.velocity_ema
-            bar.setdefault(
-                "spread",
-                float(bar.get("near_close", 0.0) or 0.0)
-                - float(bar.get("far_close", 0.0) or 0.0))
-        except Exception:
-            pass
-
     def _mts_tick(self, enriched_bar: dict | None = None):
         # [P1] Periodic far snapshot refresh (60s cooldown) - inline
         _now = time.time()
@@ -10605,6 +10606,38 @@ class FuturesMonitor:
         except Exception:
             return False
 
+    def _canonical_confirms_flat(self) -> bool:
+        """Fresh broker snapshot is direct flat evidence for the entry guard.
+
+        The in-memory _live_broker_flat_proven flag can be stale during
+        degraded windows; the canonical snapshot (fresh + OK capture + no
+        futures position + no open orders) is authoritative.  Guards the
+        fills-ledger orphan case: a broker-side close the system never saw
+        (phone flatten) leaves an orphan ENTRY in the fills ledger that must
+        not block a fresh entry when the broker truth confirms flat.
+        """
+        try:
+            from core.runtime_paths import runtime_path
+            _p = Path(runtime_path("exports", "trades", "live",
+                                   "diagnostics",
+                                   "broker_snapshot_canonical.json"))
+            if not _p.exists():
+                return False
+            _d = json.loads(_p.read_text())
+            _age = time.time() - (int(_d.get("captured_at") or 0) / 1000.0)
+            if _age > 60:
+                return False
+            if ((_d.get("fetch_status") or {}).get("capture") != "OK"):
+                return False
+            if _d.get("open_orders"):
+                return False
+            _fut = [p for p in (_d.get("positions") or [])
+                    if p.get("account") == "futures"
+                    and int(p.get("quantity", 0) or 0) > 0]
+            return not _fut
+        except Exception:
+            return False
+
     def _mts_block_entry_if_open_position(
         self, strategy, signal_action: str
     ) -> bool:
@@ -10644,7 +10677,8 @@ class FuturesMonitor:
         _live_flat_proven = (
             getattr(getattr(self, "_execution_context", None),
                     "requested_mode", "") == "live"
-            and bool(getattr(self, "_live_broker_flat_proven", False))
+            and (bool(getattr(self, "_live_broker_flat_proven", False))
+                 or self._canonical_confirms_flat())
             and not bool(getattr(self, "_broker_authority_degraded", False))
         )
         if bool(getattr(self, "_broker_authority_degraded", False)):
