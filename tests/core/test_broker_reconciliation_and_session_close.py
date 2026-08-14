@@ -139,7 +139,8 @@ def test_monitor_refresh_reconciles_broker_trades_and_exports(monkeypatch):
     monitor.contract = SimpleNamespace(code="TMFH6")
     monitor.far_contract = SimpleNamespace(code="TMFI6")
     monitor._execution_context = SimpleNamespace(
-        effective_mode="live_ready", session_id="session-1"
+        requested_mode="live", effective_mode="live_ready",
+        session_id="session-1"
     )
     monitor._live_broker_authority_at = 0.0
     monitor._live_broker_authority = None
