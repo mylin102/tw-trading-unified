@@ -171,34 +171,35 @@ def classify_mts_evidence(fills_path, events_path) -> dict:
                       "config_hash provenance"}
 
 
-def broker_live_upl_from_session(api) -> dict | None:
-    """Direct per-leg PnL from the CURRENT Shioaji session via
-    list_positions(account=).  Returns {"legs": {code: {...}}, "total_pnl"}
-    or None on ANY failure (missing api/session, query exception, missing
-    leg, non-positive qty) — downstream renders N/A.  The stale canonical
-    JSON artifact is never used for the live view."""
+def _read_live_session_upl(rt: dict) -> dict | None:
+    """The trading-system session's live UPL artifact (read-only for the
+    dashboard — the dashboard NEVER opens a second Shioaji session and
+    NEVER falls back to local state UPL).  Fresh (<60s) + session match +
+    both legs with quantity/pnl -> payload; else None (N/A)."""
     try:
-        if api is None or getattr(api, "futopt_account", None) is None:
+        from pathlib import Path
+        from core.runtime_paths import runtime_path
+        if not rt.get("is_live_runtime"):
             return None
-        rows = api.list_positions(account=api.futopt_account)
-        legs = {}
-        for pos in rows or []:
-            code = str(getattr(pos, "code", "") or "")
-            if not code.startswith("TMF"):
-                continue
-            legs[code] = {
-                "direction": str(getattr(pos, "direction", "") or ""),
-                "quantity": int(getattr(pos, "quantity", 0) or 0),
-                "avg_cost": float(getattr(pos, "avg_price", 0) or 0),
-                "pnl": float(getattr(pos, "pnl", 0) or 0),
-            }
-        if not {"TMFH6", "TMFI6"}.issubset(legs.keys()):
+        _f = Path(runtime_path("exports", "trades", "live", "diagnostics",
+                               "live_session_upl.json"))
+        if not _f.exists():
             return None
-        for _leg in legs.values():
-            if _leg["quantity"] <= 0 or _leg["pnl"] is None:
+        _d = json.loads(_f.read_text(encoding="utf-8"))
+        if rt.get("session_id") \
+                and _d.get("session_id") != rt.get("session_id"):
+            return None
+        _age = time.time() - (int(_d.get("captured_at") or 0) / 1000.0)
+        if _age > 60:
+            return None
+        _legs = _d.get("legs") or {}
+        if not {"TMFH6", "TMFI6"}.issubset(_legs.keys()):
+            return None
+        for _leg in _legs.values():
+            if int(_leg.get("quantity") or 0) <= 0 \
+                    or _leg.get("pnl") is None:
                 return None
-        return {"legs": legs,
-                "total_pnl": sum(l["pnl"] for l in legs.values())}
+        return _d
     except Exception:
         return None
 
@@ -255,8 +256,7 @@ def _broker_canonical_complete(canon: dict, rt: dict) -> bool:
         return False
 
 
-def scope_mts_performance(runtime_truth: dict, evidence: dict,
-                            api=None) -> dict:
+def scope_mts_performance(runtime_truth: dict, evidence: dict) -> dict:
     """The canonical presentation scope for MTS performance data.
 
     runtime_truth: the dashboard's summarize_execution_context() result
@@ -297,18 +297,16 @@ def scope_mts_performance(runtime_truth: dict, evidence: dict,
             return {"ok": True, "mode": mode, "reason": None,
                     "run_id": run_id, "config_hash": rt.get("config_hash")}
         if em in ("paper", "legacy"):
-            # [B] BROKER_CANONICAL_RUNTIME fallback (v2, bounded): the
-            # CURRENT Shioaji session's list_positions() per-leg pnl is the
-            # UPL authority — never the stale canonical JSON artifact.
-            # Query failure / missing legs / no api -> N/A.  Legacy ledger
-            # stays history-only.
-            if api is not None:
-                _upl = broker_live_upl_from_session(api)
-                if _upl is not None:
-                    return {"ok": True, "mode": mode,
-                            "provenance": "BROKER_CANONICAL_RUNTIME",
-                            "reason": None, "run_id": None,
-                            "config_hash": rt.get("config_hash")}
+            # [B] BROKER_CANONICAL_RUNTIME fallback (v3): the trading-system
+            # session's live UPL artifact (monitor writes list_positions()
+            # .pnl) is the ONLY live UPL authority.  The dashboard never
+            # opens its own session; the legacy ledger and local state are
+            # never mixed in.  Stale/missing/session-mismatch -> N/A.
+            if _read_live_session_upl(rt) is not None:
+                return {"ok": True, "mode": mode,
+                        "provenance": "BROKER_CANONICAL_RUNTIME",
+                        "reason": None, "run_id": None,
+                        "config_hash": rt.get("config_hash")}
             return {"ok": False, "mode": mode, "reason":
                     f"live view with {em} execution evidence — source "
                     "mismatch (live view requires live broker-reconciled "
