@@ -5422,6 +5422,42 @@ class FuturesMonitor:
             except Exception:
                 pass  # corrupt existing file → overwrite with fresh data
 
+            # Projection-only correction: a successful live canonical
+            # position match must not be overwritten by stale in-memory
+            # submitted rows.  This never authorizes or submits an order.
+            if getattr(self, "live_trading", False):
+                try:
+                    _canon_path = Path(runtime_path(
+                        "exports", "trades", "live", "diagnostics",
+                        "broker_snapshot_canonical.json"))
+                    _snap = json.loads(_canon_path.read_text(encoding="utf-8"))
+                    if (_snap.get("source") == "live_broker"
+                            and (_snap.get("fetch_status") or {}).get("capture") == "OK"):
+                        _pos = {}
+                        for _p in _snap.get("positions") or []:
+                            if (_p.get("account") == "futures"
+                                    and int(_p.get("quantity", 0) or 0) > 0):
+                                _side = str(_p.get("direction") or "").lower().split(".")[-1]
+                                if _side in ("buy", "sell"):
+                                    _pos[(str(_p.get("code")), _side,
+                                          int(_p.get("quantity")))] = _p
+                        for _d in export_data:
+                            _side = str(_d.get("side") or "").lower().split(".")[-1]
+                            _key = (str(_d.get("symbol") or ""), _side,
+                                    int(_d.get("quantity", 0) or 0))
+                            _p = _pos.get(_key)
+                            if _p and _d.get("status") != "filled":
+                                _d.update({
+                                    "status": "filled",
+                                    "filled_quantity": int(_p["quantity"]),
+                                    "remaining_quantity": 0,
+                                    "avg_fill_price": float(_p["avg_cost"]),
+                                    "cancelled_at": None,
+                                    "cancel_reason": None,
+                                })
+                except Exception:
+                    pass
+
             # 2026-07-07 Hermes Agent: atomic write via temp + rename.
             # Dashboard reads this file on every refresh; a direct write
             # races with the read and produces corrupted JSON.  Writing
