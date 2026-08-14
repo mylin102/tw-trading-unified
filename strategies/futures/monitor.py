@@ -6244,7 +6244,8 @@ class FuturesMonitor:
             _dedupe_order = self.order_mgr._resolve_order(
                 None, broker_order_id=broker_order_id, seqno=seqno, ordno=ordno)
             if _dedupe_order is not None and not self._fills_bridge_mark_seen(
-                    _dedupe_order, _deal_id, seqno):
+                    _dedupe_order, _deal_id, seqno,
+                    exchange_seq=payload.get("exchange_seq")):
                 return  # duplicate broker receipt — already applied (session or durable)
             order = self.order_mgr.apply_deal_fill(
                 None,
@@ -6279,15 +6280,21 @@ class FuturesMonitor:
             source="shioaji_callback",
         )
 
-    def _fills_bridge_mark_seen(self, order, deal_id, seqno) -> bool:
+    def _fills_bridge_mark_seen(self, order, deal_id, seqno,
+                               exchange_seq=None) -> bool:
         """Return True if this broker fill identity is NEW (not seen before).
 
         Restart-safe: checks the order's durable fills first (order.fills
         carries the broker identity via OrderFill and round-trips through the
         orders JSON), so a restored order with an already-applied deal is never
-        re-applied after a restart.  Session dedupe: bounded map keyed by
-        (order id | deal id | seqno), entries older than 1h pruned at 5000.
-        Fail-open on internal error so a dedupe fault never drops a fill.
+        re-applied after a restart.  Deal-id match covers deal_id-carrying
+        receipts; a seqno-only receipt (no deal id) dedupes against the durable
+        fill's exchange_seq on the same order.  Session dedupe: bounded map
+        keyed by (order id | deal id | seqno), entries older than 1h pruned at
+        5000.  Fail-open on internal error — an explicit loss-vs-duplicate
+        tradeoff: a dedupe fault may let one duplicate through (a visible
+        over-fill the remaining-guard still caps) rather than silently drop a
+        real fill (a lost fill would strand the position without a record).
         """
         try:
             _oid = getattr(order, "order_id", None)
@@ -6297,6 +6304,9 @@ class FuturesMonitor:
                         or getattr(_f, "deal_id", None))
                 if _fid and _fid == deal_id:
                     return False  # durable — already applied (restored state)
+                _fseq = getattr(_f, "exchange_seq", None)
+                if _fseq and exchange_seq and _fseq == exchange_seq:
+                    return False  # seqno/exchange_seq-only receipt — already applied
             _key = f"{_oid}|{deal_id}|{seqno}"
             _seen = getattr(self, "_fills_bridge_seen", None)
             if _seen is None:
