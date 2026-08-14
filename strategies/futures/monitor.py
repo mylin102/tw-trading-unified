@@ -10069,6 +10069,10 @@ class FuturesMonitor:
             _auth = _broker_auth
             _authority_has_pos = (_broker_auth.status == MtsAuthority.OPEN)
             _state_has_pos = _authority_has_pos
+            # The strategy's own restore hook runs inside on_bar, before the
+            # next monitor gate.  Carry the current broker-flat proof into
+            # that hook so historical fills cannot resurrect a ghost.
+            strategy._broker_truth_flat = not _authority_has_pos
         # [S1 repair] ONE shared EXIT_ONLY capability validation at tick
         # start — before ANY risk gate / strategy evaluation.  The
         # previous tick's authority override is cleared here; when valid,

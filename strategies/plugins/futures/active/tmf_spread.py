@@ -2826,6 +2826,14 @@ class TMFSpread(StrategyBase):
         if os.getenv("MTS_BACKTEST") == "1":
             return False
 
+        # LIVE broker truth is authoritative for the current session.  When
+        # the monitor has just proved the futures account flat, historical
+        # fills are telemetry and must not resurrect a local ghost position.
+        if getattr(self, "_broker_truth_flat", False):
+            self._mts_recovery_state = RecoveryState.FLAT_CONFIRMED
+            self._mts_state_write_enabled = True
+            return False
+
         state = self._read_mts_state()
 
         # ═══════════════════════════════════════════════════════════════
