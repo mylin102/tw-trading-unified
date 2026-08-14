@@ -195,3 +195,46 @@ def test_paper_orders_are_not_broker_protected_by_missing_capture():
     truth = monitor._watchdog_broker_truth(order)
     assert truth["protect"] is True
     assert order.status is OrderStatus.SUBMITTED
+"""Append to tests/core/test_watchdog_broker_truth_guard.py (acceptance #4).
+
+Integration-level lock: the watchdog TIMEOUT BLOCK itself (not just the truth
+helper) must never cancel/resubmit an order the broker still holds.  Guards
+against a regression that re-wires the timeout path around the protect gate.
+"""
+from types import SimpleNamespace
+
+
+def test_watchdog_block_protect_path_never_cancels_or_resubmits():
+    manager = OrderManager(mode="paper")
+    order = _order(manager)
+    # Broker still holds the order (PendingSubmit receipt) -> protect.
+    monitor = _WatchdogMonitor(_snapshot(open_orders=[
+        {"broker_order_id": "BROKER-1", "ordno": "BROKER-1",
+         "code": "TMFI6", "status": "PendingSubmit"}]))
+    monitor.order_mgr = manager
+    monitor.dry_run = False
+    monitor.live_trading = True
+    monitor.trader = SimpleNamespace(position=0)
+    monitor._manual_trade_status = ""
+    monitor._mts_watchdog_last_lo = 0.0
+    monitor.cfg = {"mts": {"strategy": "tmf_spread"}}
+    monitor._registry = SimpleNamespace(
+        get=lambda name: SimpleNamespace(_lifecycle="FLAT", _exit_start_time=0.0))
+    monitor._mts_watchdog_last_hi = 0.0
+    monitor._mts_watchdog_last_lo = 0.0
+    monitor._mts_stale_order_cancels = set()
+    monitor._mts_pending_fills = {}
+    # Order is 90s old: far beyond the 30s entry timeout.
+    monitor._pending_lifecycle_orders = {
+        order.order_id: {"strategy": "MTS_ENTRY", "ts": datetime.now() - timedelta(seconds=90),
+                         "trade_id": None}}
+    cancelled = []
+    manager.cancel = lambda oid, **kw: cancelled.append(oid)
+
+    monitor._run_mts_watchdog()
+
+    assert order.status is OrderStatus.SUBMITTED       # no terminal transition
+    assert cancelled == []                              # zero cancel/submit
+    assert not monitor._mts_stale_order_cancels         # never entered cancel queues
+    assert all(e[0] != "ORDER_TIMEOUT" for e in monitor.events)
+    assert ("WATCHDOG_BROKER_HAS_POSITION_OR_ORDER",) in {(e[0],) for e in monitor.events}
