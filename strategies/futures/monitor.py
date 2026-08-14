@@ -4637,10 +4637,15 @@ class FuturesMonitor:
                         continue
                     try:
                         try:
-                            _rows = _api.list_trades() or []
+                            # Prefer explicit account scoping.  Some
+                            # Shioaji-compatible fakes accept no arguments
+                            # but return an unscoped/phantom stream there;
+                            # real 1.7 adapters may reject the keyword, so
+                            # retain the no-arg fallback.
+                            _rows = _api.list_trades(account=_acct) or []
                         except TypeError:
                             try:
-                                _rows = _api.list_trades(account=_acct) or []
+                                _rows = _api.list_trades() or []
                             except TypeError:
                                 _rows = _api.list_trades(_acct) or []
                     except Exception as exc:
@@ -4672,7 +4677,10 @@ class FuturesMonitor:
             # futures margin (NOT an attribute on the account object)
             if hasattr(_api, "margin") and _acct is not None:
                 try:
-                    _m = _api.margin(_acct)
+                    try:
+                        _m = _api.margin(account=_acct)
+                    except TypeError:
+                        _m = _api.margin(_acct)
                     _avail = getattr(_m, "available_margin", None)
                     if _avail is None:
                         _avail = getattr(_m, "deposit_balance", None)
