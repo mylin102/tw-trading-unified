@@ -171,6 +171,38 @@ def classify_mts_evidence(fills_path, events_path) -> dict:
                       "config_hash provenance"}
 
 
+def broker_live_upl_from_session(api) -> dict | None:
+    """Direct per-leg PnL from the CURRENT Shioaji session via
+    list_positions(account=).  Returns {"legs": {code: {...}}, "total_pnl"}
+    or None on ANY failure (missing api/session, query exception, missing
+    leg, non-positive qty) — downstream renders N/A.  The stale canonical
+    JSON artifact is never used for the live view."""
+    try:
+        if api is None or getattr(api, "futopt_account", None) is None:
+            return None
+        rows = api.list_positions(account=api.futopt_account)
+        legs = {}
+        for pos in rows or []:
+            code = str(getattr(pos, "code", "") or "")
+            if not code.startswith("TMF"):
+                continue
+            legs[code] = {
+                "direction": str(getattr(pos, "direction", "") or ""),
+                "quantity": int(getattr(pos, "quantity", 0) or 0),
+                "avg_cost": float(getattr(pos, "avg_price", 0) or 0),
+                "pnl": float(getattr(pos, "pnl", 0) or 0),
+            }
+        if not {"TMFH6", "TMFI6"}.issubset(legs.keys()):
+            return None
+        for _leg in legs.values():
+            if _leg["quantity"] <= 0 or _leg["pnl"] is None:
+                return None
+        return {"legs": legs,
+                "total_pnl": sum(l["pnl"] for l in legs.values())}
+    except Exception:
+        return None
+
+
 def _load_broker_canonical() -> dict | None:
     """The CURRENT session's live-broker canonical snapshot, or None."""
     try:
@@ -223,7 +255,8 @@ def _broker_canonical_complete(canon: dict, rt: dict) -> bool:
         return False
 
 
-def scope_mts_performance(runtime_truth: dict, evidence: dict) -> dict:
+def scope_mts_performance(runtime_truth: dict, evidence: dict,
+                            api=None) -> dict:
     """The canonical presentation scope for MTS performance data.
 
     runtime_truth: the dashboard's summarize_execution_context() result
@@ -264,20 +297,18 @@ def scope_mts_performance(runtime_truth: dict, evidence: dict) -> dict:
             return {"ok": True, "mode": mode, "reason": None,
                     "run_id": run_id, "config_hash": rt.get("config_hash")}
         if em in ("paper", "legacy"):
-            # [B] BROKER_CANONICAL_RUNTIME fallback (bounded): the fills
-            # ledger historically lacks per-record provenance, so live
-            # views degrade to legacy and hide real broker UPL.  When the
-            # CURRENT session's broker canonical snapshot is complete
-            # (hashes, session, both legs' direction/quantity/cost/PnL,
-            # fresh, capture OK) it is the UPL authority.  Legacy ledger
-            # stays history-only.  Missing/stale/session-mismatch -> N/A.
-            _canon = _load_broker_canonical()
-            if _canon is not None \
-                    and _broker_canonical_complete(_canon, rt):
-                return {"ok": True, "mode": mode,
-                        "provenance": "BROKER_CANONICAL_RUNTIME",
-                        "reason": None, "run_id": None,
-                        "config_hash": rt.get("config_hash")}
+            # [B] BROKER_CANONICAL_RUNTIME fallback (v2, bounded): the
+            # CURRENT Shioaji session's list_positions() per-leg pnl is the
+            # UPL authority — never the stale canonical JSON artifact.
+            # Query failure / missing legs / no api -> N/A.  Legacy ledger
+            # stays history-only.
+            if api is not None:
+                _upl = broker_live_upl_from_session(api)
+                if _upl is not None:
+                    return {"ok": True, "mode": mode,
+                            "provenance": "BROKER_CANONICAL_RUNTIME",
+                            "reason": None, "run_id": None,
+                            "config_hash": rt.get("config_hash")}
             return {"ok": False, "mode": mode, "reason":
                     f"live view with {em} execution evidence — source "
                     "mismatch (live view requires live broker-reconciled "
