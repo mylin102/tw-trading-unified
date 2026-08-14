@@ -171,6 +171,58 @@ def classify_mts_evidence(fills_path, events_path) -> dict:
                       "config_hash provenance"}
 
 
+def _load_broker_canonical() -> dict | None:
+    """The CURRENT session's live-broker canonical snapshot, or None."""
+    try:
+        from pathlib import Path
+        from core.runtime_paths import runtime_path
+        _f = Path(runtime_path("exports", "trades", "live", "diagnostics",
+                               "broker_snapshot_canonical.json"))
+        if not _f.exists():
+            return None
+        _d = json.loads(_f.read_text(encoding="utf-8"))
+        return _d if isinstance(_d, dict) else None
+    except Exception:
+        return None
+
+
+def _broker_canonical_complete(canon: dict, rt: dict) -> bool:
+    """Strict completeness for the BROKER_CANONICAL_RUNTIME fallback:
+    LIVE runtime only, CURRENT session only, both legs fully specified
+    (direction / quantity / cost / PnL), fresh, capture OK.  The legacy
+    ledger is history only and is never mixed into the UPL."""
+    try:
+        if not rt.get("is_live_runtime"):
+            return False
+        if not canon.get("account_identity_hash") \
+                or not canon.get("canonical_input_hash"):
+            return False
+        if not canon.get("session_id"):
+            return False
+        if rt.get("session_id") \
+                and canon.get("session_id") != rt.get("session_id"):
+            return False
+        _age = time.time() - (int(canon.get("captured_at") or 0) / 1000.0)
+        if _age > 60:
+            return False
+        if (canon.get("fetch_status") or {}).get("capture") != "OK":
+            return False
+        _legs = {p.get("code"): p for p in (canon.get("positions") or [])
+                 if p.get("account") == "futures"
+                 and str(p.get("code") or "").startswith("TMF")}
+        if not {"TMFH6", "TMFI6"}.issubset(_legs.keys()):
+            return False
+        for _leg in _legs.values():
+            if not (_leg.get("direction")
+                    and int(_leg.get("quantity") or 0) > 0
+                    and _leg.get("avg_cost") is not None
+                    and _leg.get("pnl") is not None):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def scope_mts_performance(runtime_truth: dict, evidence: dict) -> dict:
     """The canonical presentation scope for MTS performance data.
 
@@ -212,6 +264,20 @@ def scope_mts_performance(runtime_truth: dict, evidence: dict) -> dict:
             return {"ok": True, "mode": mode, "reason": None,
                     "run_id": run_id, "config_hash": rt.get("config_hash")}
         if em in ("paper", "legacy"):
+            # [B] BROKER_CANONICAL_RUNTIME fallback (bounded): the fills
+            # ledger historically lacks per-record provenance, so live
+            # views degrade to legacy and hide real broker UPL.  When the
+            # CURRENT session's broker canonical snapshot is complete
+            # (hashes, session, both legs' direction/quantity/cost/PnL,
+            # fresh, capture OK) it is the UPL authority.  Legacy ledger
+            # stays history-only.  Missing/stale/session-mismatch -> N/A.
+            _canon = _load_broker_canonical()
+            if _canon is not None \
+                    and _broker_canonical_complete(_canon, rt):
+                return {"ok": True, "mode": mode,
+                        "provenance": "BROKER_CANONICAL_RUNTIME",
+                        "reason": None, "run_id": None,
+                        "config_hash": rt.get("config_hash")}
             return {"ok": False, "mode": mode, "reason":
                     f"live view with {em} execution evidence — source "
                     "mismatch (live view requires live broker-reconciled "
