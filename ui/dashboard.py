@@ -1153,20 +1153,6 @@ def get_counterfactual_service():
     return CounterfactualService()
 
 
-@st.cache_resource(ttl=30)
-def _get_live_upl_api():
-    """Best-effort dashboard Shioaji session for live per-leg UPL
-    (Option B v2: CURRENT session list_positions().pnl, never the stale
-    canonical JSON).  None on any failure -> UPL renders N/A."""
-    try:
-        import shioaji as sj
-        _api = sj.Shioaji()
-        _api.login(os.environ["SHIOAJI_API_KEY"],
-                   os.environ["SHIOAJI_SECRET_KEY"])
-        return _api
-    except Exception:
-        return None
-
 # ── Configs ──
 FUTURES_CFG_PATH = BASE / "config" / FUTURES_CFG_NAME
 OPTIONS_CFG_PATH = BASE / "config" / "options_strategy.yaml"
@@ -4609,27 +4595,27 @@ elif _selected_product == "TMF":
                 # ── Unrealized PnL Breakdown ──
                 st.markdown("**MTS 未實現損益 (Unrealized PnL)**")
                 _u1, _u2, _u3 = st.columns(3)
-                # [B v2] live per-leg UPL from the CURRENT Shioaji session
-                # (list_positions().pnl) — never the stale canonical JSON.
-                # Query failure / no session -> state fallback (which the
-                # strict scope then gates to N/A when not live-attributable).
+                # [B v3] the trading-system session's live UPL artifact
+                # (monitor writes list_positions().pnl).  The dashboard
+                # NEVER opens its own Shioaji session and NEVER falls back
+                # to local state UPL — stale/missing -> N/A.
                 _live_upl = None
                 try:
                     from core.performance_provenance import \
-                        broker_live_upl_from_session
-                    _live_upl = broker_live_upl_from_session(
-                        _get_live_upl_api())
+                        _read_live_session_upl
+                    _live_upl = _read_live_session_upl(active_runtime_truth)
                 except Exception:
                     _live_upl = None
                 if _live_upl is not None:
                     _nr = _live_upl["legs"]["TMFH6"]["pnl"]
                     _fr = _live_upl["legs"]["TMFI6"]["pnl"]
                 else:
-                    _nr = _mts_state.get("near_upl", 0)
-                    _fr = _mts_state.get("far_upl", 0)
-                # 2026-08-03: released leg shows realized PnL (已平倉) instead of 0
-                _nr_label = f"{_nr:+,.0f} TWD"
-                _fr_label = f"{_fr:+,.0f} TWD"
+                    _nr = None
+                    _fr = None
+                _nr_label = (f"{_nr:+,.0f} TWD"
+                             if _nr is not None else "N/A")
+                _fr_label = (f"{_fr:+,.0f} TWD"
+                             if _fr is not None else "N/A")
                 _nr_status = str(_mts_state.get("near_status", "")).upper()
                 _fr_status = str(_mts_state.get("far_status", "")).upper()
                 if "RELEASED" in _fr_status:
@@ -4642,11 +4628,14 @@ elif _selected_product == "TMF":
                     if _r:
                         _nr = _r
                         _nr_label = f"{_r:+,.0f} TWD (已平倉)"
-                _tr = (_nr or 0) + (_fr or 0)
+                _tr = (None if (_nr is None or _fr is None)
+                       else (_nr + _fr))
                 if _mts_perf_scope["ok"]:
                     _u1.metric("近月 UPL", _nr_label)
                     _u2.metric("遠月 UPL", _fr_label)
-                    _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
+                    _u3.metric("總計 UPL",
+                               (f"{_tr:+,.0f} TWD"
+                                if _tr is not None else "N/A"))
                     if "RELEASED" in _fr_status or "RELEASED" in _nr_status:
                         st.caption("總計 = 未實現 UPL + 已平倉腿 realized PnL（含釋放腿）")
                 else:
