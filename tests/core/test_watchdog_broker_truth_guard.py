@@ -126,6 +126,22 @@ def test_position_truth_ambiguous_pending_receipts_stay_pending():
                for order in manager.active_orders.values())
 
 
+def test_stale_pending_receipt_cannot_regress_position_reconciled_fill():
+    manager = OrderManager(mode="paper")
+    order = Order("TMFH6", OrderSide.SELL, OrderType.MKP, 1,
+                  order_id="ORD-1", strategy="MTS_ENTRY")
+    manager.active_orders[order.order_id] = order
+    manager.reconcile_position_covered_orders([
+        {"account": "futures", "code": "TMFH6", "direction": "Sell",
+         "quantity": 1, "avg_cost": 46156},
+    ])
+    manager.apply_order_update(order.order_id, raw_status="PendingSubmit",
+                               broker_order_id="BROKER-1",
+                               source="stale_receipt")
+    assert order.status is OrderStatus.FILLED
+    assert order.filled_quantity == 1
+
+
 def test_terminal_order_is_restored_only_from_broker_truth_without_resubmit():
     manager = OrderManager(mode="paper")
     order = _order(manager)
