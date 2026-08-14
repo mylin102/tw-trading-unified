@@ -6947,13 +6947,39 @@ class FuturesMonitor:
         self.latest_router_decision = decision
         return decision, ctx, session_regime, bar_regime
 
-    def _append_mts_event(self, event_type: str, **kwargs):
-        """Append an MTS-specific event to the shared event ledger."""
+    def _append_mts_event_checked(self, event_type: str, **kwargs):
+        """Append an MTS event and report whether it was durably written.
+
+        Most historical telemetry is best-effort.  Entry decision evidence is
+        different: without a durable decision record we must not create broker
+        intents that cannot later be explained.  Keep this primitive small so
+        the normal writer remains backward-compatible while entry can enforce
+        the all-or-nothing contract.
+        """
         try:
             _dir = runtime_logs()
             if not os.path.exists(_dir):
                 os.makedirs(_dir, exist_ok=True)
             # 2026-06-25 Gemini CLI / Hermes Agent: environmental isolation for MTS spread events
+            path = os.getenv("MTS_EVENT_LOG_PATH", os.path.join(_dir, "mts_spread_events.jsonl"))
+            event = {"event": event_type, "ts": datetime.now().isoformat()}
+            event.update(kwargs)
+            with open(path, "a") as f:
+                f.write(json.dumps(event, default=str) + "\n")
+            return True
+        except Exception:
+            return False
+
+    def _append_mts_event(self, event_type: str, **kwargs):
+        """Append an MTS-specific event to the shared event ledger.
+
+        Legacy telemetry remains best-effort; callers that require a durable
+        audit record use :meth:`_append_mts_event_checked` explicitly.
+        """
+        try:
+            _dir = runtime_logs()
+            if not os.path.exists(_dir):
+                os.makedirs(_dir, exist_ok=True)
             path = os.getenv("MTS_EVENT_LOG_PATH", os.path.join(_dir, "mts_spread_events.jsonl"))
             event = {"event": event_type, "ts": datetime.now().isoformat()}
             event.update(kwargs)
@@ -7650,6 +7676,43 @@ class FuturesMonitor:
             # Entry: submit two legs
             _near_side = OrderSide.SELL if _action == "SELL_NEAR_BUY_FAR" else OrderSide.BUY
             _far_side = OrderSide.BUY if _action == "SELL_NEAR_BUY_FAR" else OrderSide.SELL
+
+            # Decision provenance is a hard precondition for a live entry.
+            # The order-intent rows alone preserve prices/sides but not the
+            # signal that selected them.  Persist the complete decision before
+            # constructing either leg; if the audit write fails, no order can
+            # be created or submitted without an explainable entry rationale.
+            _entry_audit = {
+                "action": _action,
+                "reason": _reason,
+                "trade_id": _trade_id,
+                "near_side": "SHORT" if _action == "SELL_NEAR_BUY_FAR" else "LONG",
+                "far_side": "LONG" if _action == "SELL_NEAR_BUY_FAR" else "SHORT",
+                "near_price": _near_close,
+                "far_price": _far_close,
+                "spread_now": bar_dict.get("spread"),
+                "spread_z": bar_dict.get("spread_z"),
+                "entry_z": getattr(strategy, "_entry_z", None),
+                "spread_ma": bar_dict.get("spread_ma"),
+                "spread_std": bar_dict.get("spread_std"),
+                "atr": bar_dict.get("atr"),
+                "expected_reversion": (
+                    "SPREAD_TO_NARROW" if _action == "SELL_NEAR_BUY_FAR"
+                    else "SPREAD_TO_WIDEN"
+                ),
+                "near_price_source": "LIVE_TICK" if "near_close_rt" in bar_dict else "BAR_CLOSE",
+                "far_price_source": "LIVE_TICK" if "far_close_rt" in bar_dict else "BAR_CLOSE",
+                "near_tick_age_ms": bar_dict.get("near_tick_age_ms"),
+                "far_tick_age_ms": bar_dict.get("far_tick_age_ms"),
+                "signal_event_id": getattr(signal, "event_id", ""),
+            }
+            if not self._append_mts_event_checked("ENTRY_AUDIT", **_entry_audit):
+                console.print(
+                    "[bold red]⛔ [MTS_ENTRY_BLOCKED] "
+                    "ENTRY_AUDIT_PERSIST_FAILED — no legs created or submitted"
+                    "[/bold red]"
+                )
+                return
 
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting ENTRY orders (MKP Range Market): NEAR={_near_side}, FAR={_far_side}[/yellow]")
             
