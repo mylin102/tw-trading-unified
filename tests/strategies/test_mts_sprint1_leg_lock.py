@@ -207,3 +207,40 @@ def test_concurrent_writers_no_lost_update(tmp_path):
         d = json.load(f)
     assert len(d) == 2  # both locks present — no lost update
 
+def test_stable_flock_file_exists(tmp_path):
+    """Codex inode-race: the flock must target a stable, never-replaced
+    .lock file (the JSON gets os.replace'd — its inode changes)."""
+    import os
+    mon = _monitor(tmp_path)
+    k = _lock_key()
+    assert mon._leg_lock_acquire(k) is True
+    assert os.path.exists(mon._leg_lock_flock_path())
+    # the flock file is separate from the JSON
+    assert mon._leg_lock_flock_path() != mon._leg_lock_path()
+
+
+def test_race_during_replace_no_lost_lock(tmp_path):
+    """Two writers racing while the JSON is atomically replaced must never
+    lose a lock — the flock lives on the stable .lock file."""
+    import threading
+    mon = _monitor(tmp_path)
+    results = []
+    barrier = threading.Barrier(2)
+
+    def _w(idx):
+        k = _lock_key(contract=f"TMF{idx}H6", closing_side="SELL",
+                      broker_order_id=f"ORD-{idx}", seqno=str(idx))
+        barrier.wait()
+        results.append(mon._leg_lock_acquire(k))
+
+    t1 = threading.Thread(target=_w, args=(1,))
+    t2 = threading.Thread(target=_w, args=(2,))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert all(results)
+    with open(mon._leg_lock_path(), encoding="utf-8") as f:
+        d = json.load(f)
+    assert len(d) == 2  # both locks present — no lost update
+
