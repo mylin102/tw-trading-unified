@@ -4933,6 +4933,8 @@ class FuturesMonitor:
         self._persist_current_session_canonical(_snap)
         _codes = {str(getattr(self.contract, "code", "")),
                   str(getattr(self.far_contract, "code", ""))}
+        from strategies.futures.mts_ledger_authority import (
+            MtsAuthority, MtsAuthorityState)
         _rows = [p for p in (_snap.get("positions") or [])
                  if p.get("account") == "futures"
                  and p.get("code") in _codes
@@ -4943,9 +4945,16 @@ class FuturesMonitor:
             # evidence.  Capture failures return above and must not clear the
             # marker, because an unknown broker state is not flat evidence.
             self._broker_position_observed = bool(_rows)
-            self._live_broker_authority = None
+            self._live_broker_authority = MtsAuthorityState(
+                status=MtsAuthority.FLAT,
+                trade_id=None,
+                near_qty=0,
+                far_qty=0,
+                near_side=None,
+                far_side=None,
+                current_trade_id=None)
             self._live_broker_authority_at = _now
-            return None
+            return self._live_broker_authority
         _by_code = {p["code"]: p for p in _rows}
         _near = _by_code.get(str(getattr(self.contract, "code", "")))
         _far = _by_code.get(str(getattr(self.far_contract, "code", "")))
@@ -4978,8 +4987,6 @@ class FuturesMonitor:
                 ("_trade_id", _trade_id), ("_has_position", True),
                 ("_snapshot_hash", _snapshot_hash)):
             setattr(strategy, _name, _value)
-        from strategies.futures.mts_ledger_authority import (
-            MtsAuthority, MtsAuthorityState)
         _auth = MtsAuthorityState(
             status=MtsAuthority.OPEN, trade_id=_trade_id,
             near_qty=-_near["quantity"] if _near_side == "SHORT" else _near["quantity"],
@@ -10056,11 +10063,12 @@ class FuturesMonitor:
         _auth = self._ledger_projection.snapshot()
         # LIVE broker truth supersedes a silent/missing callback ledger.  The
         # helper is read-only and leaves PAPER and legacy EXIT_ONLY untouched.
+        from strategies.futures.mts_ledger_authority import MtsAuthority
         _broker_auth = self._refresh_live_broker_authority(strategy)
         if _broker_auth is not None:
             _auth = _broker_auth
-            _authority_has_pos = True
-            _state_has_pos = True
+            _authority_has_pos = (_broker_auth.status == MtsAuthority.OPEN)
+            _state_has_pos = _authority_has_pos
         # [S1 repair] ONE shared EXIT_ONLY capability validation at tick
         # start — before ANY risk gate / strategy evaluation.  The
         # previous tick's authority override is cleared here; when valid,
