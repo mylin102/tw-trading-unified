@@ -4635,7 +4635,10 @@ class FuturesMonitor:
                         try:
                             _rows = _api.list_trades() or []
                         except TypeError:
-                            _rows = _api.list_trades(account=_acct) or []
+                            try:
+                                _rows = _api.list_trades(account=_acct) or []
+                            except TypeError:
+                                _rows = _api.list_trades(_acct) or []
                     except Exception as exc:
                         errors[f"open_orders:{_tag}"] = \
                             f"{type(exc).__name__}: {exc}"
