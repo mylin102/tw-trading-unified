@@ -7855,6 +7855,59 @@ class FuturesMonitor:
         except Exception:
             return False
 
+    def _leg_lock_acquire_pair(self, near_key: dict, far_key: dict) -> bool:
+        """③ combined all-or-none: acquire BOTH leg locks atomically.
+
+        - Both legs free -> lock both, return True.
+        - Either leg already holds a non-terminal lock -> acquire nothing
+          (no partial pair), record LEG_LOCK_PAIR_PARTIAL quarantine /
+          reconcile intent, return False.  The other leg is never left
+          locked, and neither leg is ever submitted."""
+        try:
+            _near_id = self._leg_lock_id(near_key)
+            _far_id = self._leg_lock_id(far_key)
+            _terminal = ("FILLED", "CANCELLED", "REJECTED", "CANCELED")
+            with self._leg_lock_flock(exclusive=True):
+                _locks = self._leg_lock_read()
+                _conflicts = []
+                for _kid, _k in ((_near_id, near_key), (_far_id, far_key)):
+                    _existing = _locks.get(_kid)
+                    if (_existing and str(_existing.get("status", "")).upper()
+                            not in _terminal):
+                        _conflicts.append(_k.get("contract"))
+                if _conflicts:
+                    self._append_mts_event(
+                        "LEG_LOCK_PAIR_PARTIAL",
+                        reason="LEG_LOCK_PAIR_PARTIAL",
+                        trade_id=near_key.get("trade_id"),
+                        contract=",".join(_conflicts))
+                    return False
+                _now = datetime.now().isoformat()
+                for _kid, _k in ((_near_id, near_key), (_far_id, far_key)):
+                    _locks[_kid] = {
+                        "trade_id": _k.get("trade_id"),
+                        "session_generation": _k.get("session_generation"),
+                        "contract": _k.get("contract"),
+                        "closing_side": _k.get("closing_side"),
+                        "qty": _k.get("qty"),
+                        "broker_order_id": _k.get("broker_order_id") or "",
+                        "seqno": _k.get("seqno") or "",
+                        "status": "PENDING_UNCONFIRMED",
+                        "terminal": "",
+                        "locked_at": _now,
+                    }
+                self._leg_lock_write(_locks)
+                return True
+        except Exception:
+            try:
+                self._append_mts_event(
+                    "LEG_LOCK_PAIR_PARTIAL",
+                    reason="LEG_LOCK_PAIR_PARTIAL",
+                    trade_id=near_key.get("trade_id"))
+            except Exception:
+                pass
+            return False
+
     def _leg_lock_release(self, key: dict,
                           only_statuses=("FILLED", "CANCELLED", "REJECTED",
                                          "CANCELED", "SUBMIT_FAILED")) -> None:
