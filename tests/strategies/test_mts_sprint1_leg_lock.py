@@ -244,3 +244,34 @@ def test_race_during_replace_no_lost_lock(tmp_path):
         d = json.load(f)
     assert len(d) == 2  # both locks present — no lost update
 
+def test_pair_all_or_none_both_locked(tmp_path):
+    """③ combined all-or-none: BOTH leg locks acquired together."""
+    mon = _monitor(tmp_path)
+    k_near = _lock_key(contract="TMFH6", closing_side="BUY",
+                       broker_order_id="ORD-N", seqno="1")
+    k_far = _lock_key(contract="TMFI6", closing_side="SELL",
+                      broker_order_id="ORD-F", seqno="2")
+    assert mon._leg_lock_acquire_pair(k_near, k_far) is True
+    assert mon._leg_lock_check(k_near) is True
+    assert mon._leg_lock_check(k_far) is True
+
+
+def test_pair_all_or_none_second_conflict_rolls_back(tmp_path):
+    """③ if EITHER leg already holds a non-terminal lock, the pair must
+    NOT acquire — the other leg must not be left locked, and a
+    quarantine/reconcile intent is recorded."""
+    mon = _monitor(tmp_path)
+    k_near = _lock_key(contract="TMFH6", closing_side="BUY",
+                       broker_order_id="ORD-N", seqno="1")
+    k_far = _lock_key(contract="TMFI6", closing_side="SELL",
+                      broker_order_id="ORD-F", seqno="2")
+    # the far leg is already locked (pending release from another signal)
+    mon2 = _monitor(tmp_path)
+    assert mon2._leg_lock_acquire(k_far) is True
+    assert mon._leg_lock_acquire_pair(k_near, k_far) is False
+    # the near leg must NOT be locked (all-or-none rollback)
+    assert mon._leg_lock_check(k_near) is False
+    # quarantine / reconcile intent recorded
+    assert any(e.get("reason") == "LEG_LOCK_PAIR_PARTIAL"
+               for e in mon.events)
+
