@@ -5475,8 +5475,30 @@ class FuturesMonitor:
         
         try:
             import csv
+            import json
             from pathlib import Path
             from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
+
+            # Restore the current session's JSON lifecycle before broker
+            # reconciliation.  The export is the durable source for orders
+            # submitted before a restart; broker truth will subsequently
+            # promote position-covered pending rows to FILLED.
+            try:
+                from core.runtime_paths import runtime_path
+                orders_file = Path(runtime_path(
+                    "exports", "trades",
+                    f"{self.ticker}_{datetime.now().strftime('%Y%m%d')}_orders.json"))
+                if orders_file.exists():
+                    saved = json.loads(orders_file.read_text(encoding="utf-8"))
+                    if isinstance(saved, list):
+                        restored = self.order_mgr.restore_orders(saved)
+                        if restored.get("active") or restored.get("completed"):
+                            console.print(
+                                f"[dim]♻️ Restored {restored.get('active', 0)} active / "
+                                f"{restored.get('completed', 0)} completed orders[/dim]"
+                            )
+            except Exception as _restore_exc:
+                console.print(f"[dim yellow]⚠️ Order JSON restore skipped: {_restore_exc}[/dim yellow]")
             
             # Find today's trades CSV
             today = datetime.now().strftime("%Y%m%d")
