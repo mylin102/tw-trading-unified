@@ -206,7 +206,7 @@ def _safe_positions(api: Any, account: Any) -> list[dict[str, Any]]:
             "avg_cost": getattr(p, "price", None),
             "pnl": getattr(p, "pnl", None),
         }
-        for p in list(api.list_positions(account))
+        for p in list(api.list_positions(account=account))
     ]
 
 
@@ -214,7 +214,7 @@ def _safe_open_orders(api: Any, account: Any) -> list[dict[str, Any]]:
     try:
         trades = list(api.list_trades())
     except TypeError:
-        trades = list(api.list_trades(account))
+        trades = list(api.list_trades(account=account))
     terminal = {"Filled", "Cancelled", "Expired", "Done"}
     return [
         {
@@ -327,12 +327,12 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
     open_orders = query("OPEN_ORDERS", lambda: _safe_open_orders(api, account), [])
     open_orders, position_covered_orders = _position_covered_orders(
         positions, open_orders)
-    margin = query("MARGIN", lambda: api.margin(account), None)
+    margin = query("MARGIN", lambda: api.margin(account=account), None)
     # The broker's trading_limits endpoint is known to be unavailable for some
     # branch mappings.  Available margin remains the required capacity check
     # for this one-lot-per-leg preflight; preserve this endpoint failure as an
     # auditable warning instead of hiding every successful broker check.
-    limits = query("TRADING_LIMITS", lambda: api.trading_limits(account), None, required=False)
+    limits = query("TRADING_LIMITS", lambda: api.trading_limits(account=account), None, required=False)
     snapshots = query("MARKET_SNAPSHOT", lambda: list(api.snapshots([near, far])), [])
 
     # Subscription proves the broker accepts the request.  It is immediately
