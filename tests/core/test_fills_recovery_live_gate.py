@@ -22,6 +22,7 @@ def _stub_monitor(tmp_path, monkeypatch):
     mon.ticker = "TMF"
     mon._oco_reconciled = True
     mon.market_data = {}
+    mon._current_mtf_snapshot = None
     mon._check_broker_snapshot_request = lambda: False
     mon._mts_has_open_position_from_fills = lambda: True  # fills say OPEN
 
