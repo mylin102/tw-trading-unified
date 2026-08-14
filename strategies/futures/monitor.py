@@ -21,6 +21,8 @@ from strategies.futures.mts_ledger_authority import (
     gate_decision_post_signal,
     gate_decision_pre_signal,
 )
+import contextlib
+import datetime
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
@@ -7719,39 +7721,68 @@ class FuturesMonitor:
             "closing_side", "qty"))
 
     def _leg_lock_save(self, locks: dict) -> None:
-        """Atomic + fsync write under an exclusive writer flock so a crash
-        cannot leave a torn file and concurrent processes cannot lose a
-        lock (single-writer semantics)."""
-        import fcntl
-        _p = self._leg_lock_path()
-        _d = os.path.dirname(_p)
-        if _d:
-            os.makedirs(_d, exist_ok=True)
-        _tmp = _p + ".tmp"
-        with open(_p, "a+", encoding="utf-8") as _lk:
-            fcntl.flock(_lk, fcntl.LOCK_EX)
-            with open(_tmp, "w", encoding="utf-8") as _f:
-                import json as _json
-                _json.dump(locks, _f, default=str)
-                _f.flush()
-                os.fsync(_f.fileno())
-            os.replace(_tmp, _p)
-            fcntl.flock(_lk, fcntl.LOCK_UN)
+        """Atomic replace under the stable .lock flock (single-writer)."""
+        try:
+            with self._leg_lock_flock(exclusive=True):
+                self._leg_lock_write(locks)
+        except Exception:
+            pass
 
     def _leg_lock_load(self) -> dict:
         try:
+            with self._leg_lock_flock(exclusive=False):
+                return self._leg_lock_read()
+        except Exception:
+            return {}  # corrupted file -> fail-safe: no locks assumed
+
+    def _leg_lock_flock_path(self) -> str:
+        """Stable flock target — NEVER replaced, so the lock survives the
+        JSON's atomic os.replace (inode race fix)."""
+        return self._leg_lock_path() + ".lock"
+
+    @contextlib.contextmanager
+    def _leg_lock_flock(self, exclusive: bool = True):
+        import fcntl
+        _p = self._leg_lock_flock_path()
+        _d = os.path.dirname(_p)
+        if _d:
+            os.makedirs(_d, exist_ok=True)
+        _f = open(_p, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(_f, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            yield _f
+        finally:
+            try:
+                fcntl.flock(_f, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            _f.close()
+
+    def _leg_lock_read(self) -> dict:
+        """Direct JSON read — callers hold the .lock flock."""
+        try:
             import json as _json
-            import fcntl
             _p = self._leg_lock_path()
             if not os.path.exists(_p):
                 return {}
             with open(_p, encoding="utf-8") as _f:
-                fcntl.flock(_f, fcntl.LOCK_SH)
-                _d = _json.load(_f) or {}
-                fcntl.flock(_f, fcntl.LOCK_UN)
-                return _d
+                return _json.load(_f) or {}
         except Exception:
-            return {}  # corrupted file -> fail-safe: no locks assumed
+            return {}
+
+    def _leg_lock_write(self, locks: dict) -> None:
+        """Atomic replace — callers hold the .lock flock."""
+        _p = self._leg_lock_path()
+        _d = os.path.dirname(_p)
+        if _d:
+            os.makedirs(_d, exist_ok=True)
+        import json as _json
+        _tmp = _p + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            _json.dump(locks, _f, default=str)
+            _f.flush()
+            os.fsync(_f.fileno())
+        os.replace(_tmp, _p)
 
     def _leg_lock_rebind(self, locks: dict, key: dict) -> dict | None:
         """Rebind a lock to the new session after a restart.
@@ -7805,13 +7836,8 @@ class FuturesMonitor:
             _d = os.path.dirname(_p)
             if _d:
                 os.makedirs(_d, exist_ok=True)
-            with open(_p, "a+", encoding="utf-8") as _lk:
-                fcntl.flock(_lk, fcntl.LOCK_EX)
-                _lk.seek(0)  # a+ puts the fd at EOF — read from the start
-                try:
-                    _locks = _json.load(_lk) or {}
-                except Exception:
-                    _locks = {}
+            with self._leg_lock_flock(exclusive=True):
+                _locks = self._leg_lock_read()
                 _locks[self._leg_lock_id(key)] = {
                     "trade_id": key.get("trade_id"),
                     "session_generation": key.get("session_generation"),
@@ -7824,12 +7850,7 @@ class FuturesMonitor:
                     "terminal": "",
                     "locked_at": datetime.now().isoformat(),
                 }
-                _lk.seek(0)
-                _lk.truncate()
-                _json.dump(_locks, _lk, default=str)
-                _lk.flush()
-                os.fsync(_lk.fileno())
-                fcntl.flock(_lk, fcntl.LOCK_UN)
+                self._leg_lock_write(_locks)
             return True
         except Exception:
             return False
