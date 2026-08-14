@@ -436,6 +436,15 @@ class FuturesMonitor:
         self._spread_loaded = self._spread_loader.load_latest_csv(self.ticker)
         if self._spread_loaded:
             print(f"[V-Model] SpreadLoader initiated: {self._spread_loader.status()}")
+
+        # Research dynamics: dz / spread_slope / velocity_ema features.
+        # Best-effort — absence only leaves research columns NULL.
+        try:
+            from strategies.futures.mts.spread_dynamics import \
+                SpreadDynamicsCalculator
+            self._spread_dynamics = SpreadDynamicsCalculator()
+        except Exception:
+            self._spread_dynamics = None
         else:
             print("[V-Model] SpreadLoader: no calendar spread data found")
             active_strat = self.cfg.get("active_strategy") or self.cfg.get("strategy", {}).get("active_strategy")
@@ -9506,6 +9515,32 @@ class FuturesMonitor:
         # Signal caller to skip this tick (probe takes priority)
         return True
 
+    def _apply_spread_dynamics(self, bar: dict) -> None:
+        """Wire the SpreadDynamicsCalculator into the bar pipeline so the
+        entry_observation research records carry dz / spread_slope /
+        velocity_ema (research wiring gap — the calculator was never
+        called, leaving those columns NULL).  Also records the spread into
+        the candidate payload.  Never raises; the research features are
+        best-effort telemetry."""
+        _sd = getattr(self, "_spread_dynamics", None)
+        _z = bar.get("spread_z")
+        if _sd is None or _z is None:
+            return
+        try:
+            _ts = bar.get("ts") or bar.get("timestamp") or time.time()
+            _ts_f = float(_ts.timestamp()) if hasattr(_ts, "timestamp") \
+                else float(_ts)
+            _m = _sd.update(_ts_f, float(_z))
+            bar["dz"] = _m.z_velocity
+            bar["spread_slope"] = _m.rolling_slope
+            bar["velocity_ema"] = _m.velocity_ema
+            bar.setdefault(
+                "spread",
+                float(bar.get("near_close", 0.0) or 0.0)
+                - float(bar.get("far_close", 0.0) or 0.0))
+        except Exception:
+            pass
+
     def _mts_tick(self, enriched_bar: dict | None = None):
         # [P1] Periodic far snapshot refresh (60s cooldown) - inline
         _now = time.time()
@@ -9690,6 +9725,10 @@ class FuturesMonitor:
             if _spread_std > 0:
                 _rt_spread = _bar_dict["near_close"] - _bar_dict["far_close"]
                 _bar_dict["spread_z"] = (_rt_spread - _spread_ma) / _spread_std
+
+        # Research wiring: dz / spread_slope / velocity_ema into the bar
+        # (entry_observation payload reads these; previously always NULL).
+        self._apply_spread_dynamics(_bar_dict)
 
         # 2026-07-08 Hermes Agent: Pass sqz_on to bar dict for BB filter gate.
         # Read from squeeze indicator pipeline (_last_processed_data["5m"]).
