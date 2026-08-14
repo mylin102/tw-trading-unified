@@ -126,7 +126,10 @@ module.exports = {
       interpreter: 'none',
       cwd: PROJECT_ROOT,
       restart_delay: 15000,
-      autorestart: true,
+      // Controlled restarts only (scripts/restart_live.sh).  An
+      // autorestart loop preserves a stale LRC_RELEASE_SHA env and
+      // re-triggers RELEASE_IDENTITY_MISMATCH quarantine forever.
+      autorestart: false,
       watch: false,
       max_restarts: 2,
       min_uptime: '120s',
