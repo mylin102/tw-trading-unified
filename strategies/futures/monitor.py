@@ -4269,6 +4269,33 @@ class FuturesMonitor:
         return out
 
     @staticmethod
+    def _stable_broker_trade_id(account_identity_hash, legs) -> str:
+        """Return a restart-stable identity for one broker-held spread.
+
+        The live snapshot hash includes capture-time data (and therefore
+        changes on every refresh).  It is evidence identity, not position
+        identity.  Position identity is deliberately limited to the account
+        and the exact broker legs/directions/quantities so a fresh snapshot
+        cannot mint a new trade on every tick.
+        """
+        _legs = []
+        for _leg in legs or ():
+            if not isinstance(_leg, dict):
+                continue
+            _legs.append({
+                "code": str(_leg.get("code") or ""),
+                "direction": str(_leg.get("direction") or "").lower(),
+                "quantity": int(_leg.get("quantity") or 0),
+            })
+        _legs.sort(key=lambda item: item["code"])
+        _payload = json.dumps({
+            "account_identity_hash": str(account_identity_hash or ""),
+            "legs": _legs,
+        }, sort_keys=True, separators=(",", ":"))
+        return "broker-reconciled-" + hashlib.sha256(
+            _payload.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
     def _normalize_snapshot_orders(raw_trades) -> list:
         """Open orders only: terminal states are dropped (same canonical
         terminal-state set as the standalone preflight); the shape keeps
@@ -4452,6 +4479,10 @@ class FuturesMonitor:
                  and type(p.get("quantity")) is int
                  and p.get("quantity", 0) > 0]
         if len({p.get("code") for p in _rows}) != 2:
+            # A successful, empty futures snapshot is authoritative flat
+            # evidence.  Capture failures return above and must not clear the
+            # marker, because an unknown broker state is not flat evidence.
+            self._broker_position_observed = bool(_rows)
             self._live_broker_authority = None
             self._live_broker_authority_at = _now
             return None
@@ -4467,12 +4498,17 @@ class FuturesMonitor:
             return None
         _near_side, _far_side = _side(_near), _side(_far)
         if _near_side is None or _far_side is None:
+            # Relevant broker rows exist but are ambiguous.  Keep entry
+            # blocked until a subsequent successful snapshot proves flat or
+            # provides two unambiguous legs.
+            self._broker_position_observed = True
             self._live_broker_authority = None
             self._live_broker_authority_at = _now
             return None
         _snapshot_hash = _snap.get("canonical_input_hash")
-        _trade_id = getattr(strategy, "_trade_id", None) or (
-            f"broker-reconciled-{str(_snapshot_hash or '')[:16]}")
+        self._broker_position_observed = True
+        _trade_id = self._stable_broker_trade_id(
+            _snap.get("account_identity_hash"), _rows)
         for _name, _value in (
                 ("_near_side", _near_side), ("_far_side", _far_side),
                 ("_near_qty", _near["quantity"]),
@@ -9741,6 +9777,9 @@ class FuturesMonitor:
         if _has_pending:
             _blocked = True
             _reasons.append("pending_mts_orders")
+        if bool(getattr(self, "_broker_position_observed", False)):
+            _blocked = True
+            _reasons.append("broker_snapshot_has_position")
 
         if _blocked:
             console.print(
