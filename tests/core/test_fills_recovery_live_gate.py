@@ -71,8 +71,9 @@ class _AutoStrategy:
 
 def test_fills_recovery_never_runs_in_live_even_before_live_ready(tmp_path, monkeypatch):
     mon = _AutoMonitor.__new__(_AutoMonitor)
-    mon.live_trading = True
-    mon._execution_context = SimpleNamespace(effective_mode="")  # pre-gate!
+    mon.live_trading = False  # futures_live.yaml has NO live_trading key!
+    mon._execution_context = SimpleNamespace(requested_mode="live",
+                                             effective_mode="")  # pre-gate!
     mon.cfg = {"mts": {"strategy": "tmf_spread"}}
     mon.far_contract = None
     mon.api = None
