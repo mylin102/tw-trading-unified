@@ -4915,6 +4915,39 @@ class FuturesMonitor:
         except Exception:
             pass  # never block the post-startup gate on telemetry
 
+    def _write_live_session_upl(self, positions, ctx) -> None:
+        """The trading-system session's read-only list_positions().pnl,
+        written for the dashboard (which NEVER opens its own Shioaji
+        session).  Best-effort; absence only leaves the dashboard N/A."""
+        try:
+            _legs = {}
+            for p in positions or []:
+                _code = str(p.get("code") or "")
+                if _code.startswith("TMF"):
+                    _legs[_code] = {
+                        "direction": str(p.get("direction") or ""),
+                        "quantity": int(p.get("quantity") or 0),
+                        "avg_cost": float(p.get("avg_cost")
+                                          or p.get("avg_price") or 0),
+                        "pnl": float(p.get("pnl") or 0),
+                    }
+            _payload = {
+                "source": "live_broker_session",
+                "session_id": getattr(ctx, "session_id", None),
+                "captured_at": int(time.time() * 1000),
+                "legs": _legs,
+                "total_pnl": sum(float(l.get("pnl") or 0)
+                                 for l in _legs.values()),
+            }
+            from core.runtime_paths import runtime_path
+            from pathlib import Path
+            _p = Path(runtime_path("exports", "trades", "live",
+                                   "diagnostics", "live_session_upl.json"))
+            _p.parent.mkdir(parents=True, exist_ok=True)
+            _p.write_text(json.dumps(_payload, default=str))
+        except Exception:
+            pass
+
     def _refresh_live_broker_authority(self, strategy):
         """Use the current authenticated broker snapshot as LIVE MTS truth.
 
@@ -4976,6 +5009,8 @@ class FuturesMonitor:
                  and p.get("code") in _codes
                  and type(p.get("quantity")) is int
                  and p.get("quantity", 0) > 0]
+        self._write_live_session_upl(
+            _rows, getattr(self, "_execution_context", None))
         if not _rows:
             # A successful, empty futures snapshot is authoritative flat
             # evidence.  Capture failures return above and must not clear the
