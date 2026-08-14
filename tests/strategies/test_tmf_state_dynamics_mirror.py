@@ -30,6 +30,8 @@ def test_entry_write_includes_dynamics(tmp_path):
     with patch("strategies.plugins.futures.active.tmf_spread._write_mts_state",
                side_effect=_cap), \
          patch("core.channel_safety.get_safety_state") as gs, \
+         patch("strategies.plugins.futures.active.tmf_spread."
+               "_maintenance_entry_lock_active", return_value=False), \
          patch("strategies.plugins.futures.active.tmf_spread._append_event"):
         gs.return_value.entry_allowed.return_value = True
         s.on_bar(ctx)
