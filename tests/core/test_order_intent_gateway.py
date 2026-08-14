@@ -2494,6 +2494,41 @@ def test_live_entry_blocks_when_decision_audit_persist_fails(monkeypatch):
     assert events == []
 
 
+def test_live_entry_shadow_store_is_observational(monkeypatch, tmp_path):
+    """Research persistence records the decision but cannot affect submit."""
+    import sqlite3
+    from pathlib import Path
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_live_ctx())
+    monkeypatch.setenv("MTS_ENTRY_RESEARCH_DB",
+                      str(tmp_path / "mts_entry_research.sqlite3"))
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s0_entry_research_state.json"))
+    signal = SimpleNamespace(action="SELL_NEAR_BUY_FAR", reason="TMF_SPREAD_WIDE")
+    strat = _bound_strategy()
+    strat._has_position = False
+    strat._entry_z = 3.0
+    monitor._submit_mts_order_signal(
+        signal, strat,
+        {"near_close": 46411.0, "far_close": 46566.0,
+         "spread": -155.0, "spread_z": 3.42,
+         "spread_std": 41.8, "atr": 51.2},
+        __import__("datetime").datetime.now())
+
+    assert len(monitor.api.calls) == 2
+    conn = sqlite3.connect(tmp_path / "mts_entry_research.sqlite3")
+    row = conn.execute(
+        "SELECT spread_z, candidate_direction, decision "
+        "FROM entry_observations"
+    ).fetchone()
+    conn.close()
+    assert row == (3.42, "SELL_NEAR_BUY_FAR", "ENTER")
+
+
 def test_e2e_paper_unchanged(monkeypatch):
     from types import SimpleNamespace
     import strategies.futures.monitor as monitor_mod
