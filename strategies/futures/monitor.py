@@ -4648,7 +4648,13 @@ class FuturesMonitor:
             reason="callback_gap_snapshot",
         )
         reconciled = result.get("reconciled") or []
-        changed = sum(1 for item in reconciled if item.get("fills_added") or item.get("action") == "reconciled")
+        position_result = manager.reconcile_position_covered_orders(
+            snapshot.get("positions") or [],
+            captured_at=snapshot.get("captured_at"),
+        )
+        changed = sum(1 for item in reconciled
+                      if item.get("fills_added") or item.get("action") == "reconciled")
+        changed += len(position_result.get("reconciled") or [])
         if changed and hasattr(self, "_save_orders_file_wrapper"):
             self._save_orders_file_wrapper()
         return changed

@@ -1532,6 +1532,94 @@ class OrderManager:
                 unmatched.append(result)
         return {"reconciled": reconciled, "unmatched": unmatched}
 
+    def reconcile_position_covered_orders(
+        self,
+        positions: Optional[list] = None,
+        *,
+        source: str = "broker_position_reconcile",
+        reason: str = "BROKER_POSITION_COVERED_PENDING",
+        captured_at: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Mark a local order filled only when broker position truth covers it.
+
+        Shioaji can retain a PendingSubmit receipt after the matching position
+        is already filled.  Matching is strict (futures code, side, and exact
+        quantity identify one local order); ambiguous data is left pending.
+        This is local reconciliation only: it never creates a broker order id
+        and never calls submit/cancel.
+        """
+        def _side(value):
+            text = str(value or "").lower().split(".")[-1]
+            if text in {"buy", "long"}:
+                return "buy"
+            if text in {"sell", "short"}:
+                return "sell"
+            return None
+
+        def _qty(value):
+            if isinstance(value, bool):
+                return None
+            try:
+                qty = int(value)
+            except (TypeError, ValueError):
+                return None
+            return qty if qty > 0 else None
+
+        candidates = list(self.active_orders.values()) + list(self.completed)
+        repaired = []
+        for row in positions or []:
+            if not isinstance(row, dict) or row.get("account") not in (None, "", "futures"):
+                continue
+            code = str(row.get("code") or "")
+            side = _side(row.get("direction") or row.get("action"))
+            qty = _qty(row.get("quantity", row.get("qty")))
+            try:
+                price = float(row.get("avg_cost"))
+            except (TypeError, ValueError):
+                price = 0.0
+            if not code or side is None or qty is None or price <= 0:
+                continue
+            matches = [order for order in candidates
+                       if str(order.symbol) == code
+                       and _side(getattr(order.side, "value", order.side)) == side
+                       and order.quantity == qty
+                       and order.status != OrderStatus.FILLED
+                       and order.filled_quantity == 0]
+            if len(matches) != 1:
+                continue
+            order = matches[0]
+            previous = order.status
+            if previous in (OrderStatus.CANCELLED, OrderStatus.EXPIRED):
+                self.completed = [item for item in self.completed
+                                  if item.order_id != order.order_id]
+                self.active_orders[order.order_id] = order
+                order.status = OrderStatus.SUBMITTED
+                order.cancelled_at = None
+                order.expired_at = None
+                order.cancel_reason = None
+            elif previous == OrderStatus.PENDING_SUBMIT:
+                broker_id = order.broker_order_id or order.exchange_order_id or order.order_id
+                order.submit(broker_id, broker_order_id=order.broker_order_id,
+                             seqno=order.seqno, ordno=order.ordno)
+            fill_time = None
+            if captured_at:
+                try:
+                    fill_time = datetime.fromtimestamp(float(captured_at) / 1000.0)
+                except (TypeError, ValueError, OverflowError, OSError):
+                    pass
+            filled = self.apply_deal_fill(
+                order.order_id, fill_price=price, fill_qty=qty,
+                fill_time=fill_time, broker_order_id=order.broker_order_id,
+                seqno=order.seqno, ordno=order.ordno,
+                source=source, reason=reason,
+                raw_payload={"position": row, "authority": "broker_position"},
+            )
+            if filled is not None:
+                repaired.append({"order_id": order.order_id, "code": code,
+                                 "filled_quantity": qty, "avg_fill_price": price,
+                                 "previous_status": previous.value})
+        return {"reconciled": repaired, "ambiguous": []}
+
     def recover_from_api(
         self,
         filled_trades: Optional[list] = None,
