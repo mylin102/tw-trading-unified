@@ -152,3 +152,32 @@ def test_concurrent_acquire_last_writer_wins_no_corruption(tmp_path):
         d = json.load(f)
     assert len(d) == 1  # one lock entry, not duplicated/corrupted
 
+def test_rebind_uses_broker_identity_unique(tmp_path):
+    """Codex #1: with a broker_order_id, rebinding must match by broker
+    identity (unique), not by the generic 4 fields."""
+    mon = _monitor(tmp_path)
+    k1 = _lock_key(session_generation="gen-OLD-1", broker_order_id="ORD-A")
+    assert mon._leg_lock_acquire(k1) is True
+    # two candidate locks share trade/contract/side/qty but differ in id
+    k2 = _lock_key(session_generation="gen-OLD-2", broker_order_id="ORD-B")
+    assert mon._leg_lock_acquire(k2) is True
+    mon2 = _monitor(tmp_path)
+    k3 = _lock_key(session_generation="gen-NEW-3", broker_order_id="ORD-B")
+    # unique via broker identity -> blocked (rebound to ORD-B lock)
+    assert mon2._leg_lock_check(k3) is True
+
+
+def test_rebind_ambiguous_quarantines(tmp_path):
+    """Codex #1: no broker_order_id + multiple candidates -> fail-closed
+    QUARANTINE (LEG_LOCK_REBIND_AMBIGUOUS), never a silent pass."""
+    mon = _monitor(tmp_path)
+    k1 = _lock_key(session_generation="gen-OLD-1", broker_order_id="ORD-A")
+    k2 = _lock_key(session_generation="gen-OLD-2", broker_order_id="ORD-B")
+    assert mon._leg_lock_acquire(k1) is True
+    assert mon._leg_lock_acquire(k2) is True
+    mon2 = _monitor(tmp_path)
+    k3 = _lock_key(session_generation="gen-NEW-3", broker_order_id="")
+    assert mon2._leg_lock_check(k3) is True  # fail-closed: still blocked
+    assert any(e.get("reason") == "LEG_LOCK_REBIND_AMBIGUOUS"
+               for e in mon2.events)
+

@@ -7744,16 +7744,39 @@ class FuturesMonitor:
             return {}  # corrupted file -> fail-safe: no locks assumed
 
     def _leg_lock_rebind(self, locks: dict, key: dict) -> dict | None:
-        """Match a lock by broker identity after a restart (generation
-        changed).  Rebind the lock to the new session generation."""
-        for _lid, _lock in locks.items():
-            if (str(_lock.get("trade_id") or "") == str(key.get("trade_id") or "")
-                    and str(_lock.get("contract") or "") == str(key.get("contract") or "")
-                    and str(_lock.get("closing_side") or "") == str(key.get("closing_side") or "")
-                    and int(_lock.get("qty") or 0) == int(key.get("qty") or 0)):
-                _lock["session_generation"] = key.get("session_generation")
-                self._leg_lock_save(locks)
-                return _lock
+        """Rebind a lock to the new session after a restart.
+
+        Broker identity (broker_order_id + seqno) is authoritative and
+        unique.  The generic 4-field match (trade_id + contract +
+        closing_side + qty) is allowed ONLY when it resolves to exactly one
+        candidate; multiple candidates -> fail-closed QUARANTINE
+        (LEG_LOCK_REBIND_AMBIGUOUS) — never a silent pass/resend."""
+        _bid = str(key.get("broker_order_id") or "")
+        if _bid:
+            _seq = str(key.get("seqno") or "")
+            for _lock in locks.values():
+                if (str(_lock.get("broker_order_id") or "") == _bid
+                        and (not _seq or str(_lock.get("seqno") or "") == _seq)):
+                    _lock["session_generation"] = key.get("session_generation")
+                    self._leg_lock_save(locks)
+                    return _lock
+            return None
+        _cands = [v for v in locks.values()
+                  if (str(v.get("trade_id") or "") == str(key.get("trade_id") or "")
+                      and str(v.get("contract") or "") == str(key.get("contract") or "")
+                      and str(v.get("closing_side") or "") == str(key.get("closing_side") or "")
+                      and int(v.get("qty") or 0) == int(key.get("qty") or 0))]
+        if len(_cands) == 1:
+            _cands[0]["session_generation"] = key.get("session_generation")
+            self._leg_lock_save(locks)
+            return _cands[0]
+        if len(_cands) > 1:
+            self._append_mts_event(
+                "LEG_LOCK_REBIND_AMBIGUOUS",
+                reason="LEG_LOCK_REBIND_AMBIGUOUS",
+                trade_id=key.get("trade_id"),
+                contract=key.get("contract"))
+            return _cands[0]  # fail-closed: still block submissions
         return None
 
     def _leg_lock_acquire(self, key: dict,
@@ -7770,6 +7793,8 @@ class FuturesMonitor:
                 "contract": key.get("contract"),
                 "closing_side": key.get("closing_side"),
                 "qty": key.get("qty"),
+                "broker_order_id": key.get("broker_order_id") or "",
+                "seqno": key.get("seqno") or "",
                 "status": status,
                 "terminal": "",
                 "locked_at": datetime.now().isoformat(),
