@@ -24,6 +24,7 @@ to a live runtime).
 """
 
 import json
+import math
 import os
 import time
 
@@ -196,8 +197,11 @@ def _read_live_session_upl(rt: dict) -> dict | None:
         if not {"TMFH6", "TMFI6"}.issubset(_legs.keys()):
             return None
         for _leg in _legs.values():
+            _pnl = _leg.get("pnl")
             if int(_leg.get("quantity") or 0) <= 0 \
-                    or _leg.get("pnl") is None:
+                    or _pnl is None \
+                    or not isinstance(_pnl, (int, float)) \
+                    or not math.isfinite(float(_pnl)):
                 return None
         return _d
     except Exception:
