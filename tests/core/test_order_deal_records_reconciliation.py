@@ -1,7 +1,7 @@
 """Historical Shioaji order_deal_records must reconcile terminal fills."""
 from types import SimpleNamespace
 
-from core.order_management.order import OrderSide, OrderStatus
+from core.order_management.order import OrderSide, OrderStatus, OrderType
 from core.order_management.order_manager import OrderManager
 from strategies.futures.monitor import FuturesMonitor
 
@@ -32,7 +32,8 @@ def test_nested_futures_deal_normalizes_to_terminal_receipt():
 def test_nested_deal_reconciles_existing_order_once():
     manager = OrderManager(mode="live")
     order = manager.create_order(symbol="TMFI6", side=OrderSide.SELL,
-                                 quantity=1, strategy="MTS_EXIT")
+                                 order_type=OrderType.MARKET, quantity=1,
+                                 strategy="MTS_EXIT")
     order.submit("BROKER-1", broker_order_id="BROKER-1",
                  seqno="SEQ-1", ordno="ORD-1")
     rows = FuturesMonitor._normalize_order_deal_records([_deal_record()])
