@@ -4696,17 +4696,47 @@ class FuturesMonitor:
             self._append_mts_event(
                 "RELEASE_CONDITION_MET",
                 signal=signal,
-                trade_id=getattr(strategy, "trade_id", None),
+                trade_id=(getattr(strategy, "_trade_id", None)
+                          or getattr(strategy, "trade_id", None)),
                 release_stop=(_st.get("release_stop_points")
                               if isinstance(_st, dict) else None),
             )
         except Exception:
             pass
 
+    def _resolve_mts_local_position_qty(self):
+        """Resolve the strategy's local position quantities.
+
+        Sources in order: the strategy reference (self._mts_strategy, then the
+        strategy registry), then the persisted MTS position state file.
+        Returns (None, None) when the local position is unknown -- callers
+        must not emit divergence claims without a position source.
+        """
+        _ms = getattr(self, "_mts_strategy", None)
+        if _ms is None:
+            for _s in (getattr(self, "_strategies", {}) or {}).values():
+                _ms = _s
+                break
+        if _ms is not None:
+            try:
+                return (int(getattr(_ms, "_near_qty", 0) or 0),
+                        int(getattr(_ms, "_far_qty", 0) or 0))
+            except (TypeError, ValueError):
+                return None, None
+        try:
+            with open(_mts_position_state_path(), "r", encoding="utf-8") as _f:
+                _st = json.load(_f)
+            if _st.get("has_position"):
+                return 1, 1
+            return 0, 0
+        except Exception:
+            return None, None
+
     def _emit_release_eval_skip_no_local_position(self, snapshot) -> None:
         """Emit RELEASE_EVAL_SKIP_NO_LOCAL_POSITION when broker holds TMF legs
         but the strategy sees no local position (fills gap).  Rate-limited to
-        30s so the divergence is visible without flooding the ledger.
+        30s.  Fail-closed: when the local position is unknown (no strategy
+        reference, no persisted state) no event is emitted.
         """
         try:
             _legs = [p for p in (snapshot.get("positions") or [])
@@ -4715,9 +4745,9 @@ class FuturesMonitor:
                      and int(p.get("quantity") or 0) > 0]
             if not _legs:
                 return
-            _ms = getattr(self, "_mts_strategy", None)
-            _nq = int(getattr(_ms, "_near_qty", 0) or 0) if _ms else 0
-            _fq = int(getattr(_ms, "_far_qty", 0) or 0) if _ms else 0
+            _nq, _fq = self._resolve_mts_local_position_qty()
+            if _nq is None and _fq is None:
+                return  # unknown -- fail-closed, no divergence claim
             if _nq > 0 or _fq > 0:
                 return
             _now = time.monotonic()
