@@ -7719,27 +7719,37 @@ class FuturesMonitor:
             "closing_side", "qty"))
 
     def _leg_lock_save(self, locks: dict) -> None:
-        """Atomic + fsync write so a crash cannot leave a torn lock file."""
+        """Atomic + fsync write under an exclusive writer flock so a crash
+        cannot leave a torn file and concurrent processes cannot lose a
+        lock (single-writer semantics)."""
+        import fcntl
         _p = self._leg_lock_path()
         _d = os.path.dirname(_p)
         if _d:
             os.makedirs(_d, exist_ok=True)
         _tmp = _p + ".tmp"
-        with open(_tmp, "w", encoding="utf-8") as _f:
-            import json as _json
-            _json.dump(locks, _f, default=str)
-            _f.flush()
-            os.fsync(_f.fileno())
-        os.replace(_tmp, _p)
+        with open(_p, "a+", encoding="utf-8") as _lk:
+            fcntl.flock(_lk, fcntl.LOCK_EX)
+            with open(_tmp, "w", encoding="utf-8") as _f:
+                import json as _json
+                _json.dump(locks, _f, default=str)
+                _f.flush()
+                os.fsync(_f.fileno())
+            os.replace(_tmp, _p)
+            fcntl.flock(_lk, fcntl.LOCK_UN)
 
     def _leg_lock_load(self) -> dict:
         try:
             import json as _json
+            import fcntl
             _p = self._leg_lock_path()
             if not os.path.exists(_p):
                 return {}
             with open(_p, encoding="utf-8") as _f:
-                return _json.load(_f) or {}
+                fcntl.flock(_f, fcntl.LOCK_SH)
+                _d = _json.load(_f) or {}
+                fcntl.flock(_f, fcntl.LOCK_UN)
+                return _d
         except Exception:
             return {}  # corrupted file -> fail-safe: no locks assumed
 
@@ -7784,22 +7794,42 @@ class FuturesMonitor:
         """Persist a leg lock BEFORE submission.  Key:
         trade_id + session_generation + contract + closing_side + qty.
         status: PENDING_UNCONFIRMED (receipt, never released early) or
-        SUBMIT_FAILED (released after failure handling)."""
+        SUBMIT_FAILED (released after failure handling).
+
+        The whole read-modify-write runs under ONE exclusive flock on the
+        lock file so concurrent processes/threads cannot lose a lock."""
         try:
-            _locks = self._leg_lock_load()
-            _locks[self._leg_lock_id(key)] = {
-                "trade_id": key.get("trade_id"),
-                "session_generation": key.get("session_generation"),
-                "contract": key.get("contract"),
-                "closing_side": key.get("closing_side"),
-                "qty": key.get("qty"),
-                "broker_order_id": key.get("broker_order_id") or "",
-                "seqno": key.get("seqno") or "",
-                "status": status,
-                "terminal": "",
-                "locked_at": datetime.now().isoformat(),
-            }
-            self._leg_lock_save(_locks)
+            import json as _json
+            import fcntl
+            _p = self._leg_lock_path()
+            _d = os.path.dirname(_p)
+            if _d:
+                os.makedirs(_d, exist_ok=True)
+            with open(_p, "a+", encoding="utf-8") as _lk:
+                fcntl.flock(_lk, fcntl.LOCK_EX)
+                _lk.seek(0)  # a+ puts the fd at EOF — read from the start
+                try:
+                    _locks = _json.load(_lk) or {}
+                except Exception:
+                    _locks = {}
+                _locks[self._leg_lock_id(key)] = {
+                    "trade_id": key.get("trade_id"),
+                    "session_generation": key.get("session_generation"),
+                    "contract": key.get("contract"),
+                    "closing_side": key.get("closing_side"),
+                    "qty": key.get("qty"),
+                    "broker_order_id": key.get("broker_order_id") or "",
+                    "seqno": key.get("seqno") or "",
+                    "status": status,
+                    "terminal": "",
+                    "locked_at": datetime.now().isoformat(),
+                }
+                _lk.seek(0)
+                _lk.truncate()
+                _json.dump(_locks, _lk, default=str)
+                _lk.flush()
+                os.fsync(_lk.fileno())
+                fcntl.flock(_lk, fcntl.LOCK_UN)
             return True
         except Exception:
             return False
