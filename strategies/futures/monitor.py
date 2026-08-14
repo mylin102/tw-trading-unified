@@ -6233,11 +6233,19 @@ class FuturesMonitor:
                 return
             if fill_price <= 0 or fill_qty <= 0:
                 return
-            if not self._fills_bridge_mark_seen(
-                    broker_order_id,
-                    payload.get("trade_id") or payload.get("deal_id"),
-                    seqno):
-                return  # duplicate broker receipt — already applied
+            _deal_id = payload.get("trade_id") or payload.get("deal_id")
+            if not (broker_order_id or _deal_id or seqno):
+                # Fail-closed: no broker identity to correlate — never apply.
+                self._append_mts_event(
+                    "FILL_REJECTED_MISSING_BROKER_IDENTITY",
+                    reason="no broker order/deal/seq identity in deal callback",
+                )
+                return
+            _dedupe_order = self.order_mgr._resolve_order(
+                None, broker_order_id=broker_order_id, seqno=seqno, ordno=ordno)
+            if _dedupe_order is not None and not self._fills_bridge_mark_seen(
+                    _dedupe_order, _deal_id, seqno):
+                return  # duplicate broker receipt — already applied (session or durable)
             order = self.order_mgr.apply_deal_fill(
                 None,
                 deal_id=payload.get("trade_id") or payload.get("deal_id"),
@@ -6271,15 +6279,25 @@ class FuturesMonitor:
             source="shioaji_callback",
         )
 
-    def _fills_bridge_mark_seen(self, order_id, deal_id, seqno) -> bool:
+    def _fills_bridge_mark_seen(self, order, deal_id, seqno) -> bool:
         """Return True if this broker fill identity is NEW (not seen before).
 
-        Dedupe key: broker identity (order id | deal id | seqno).  Bounded:
-        entries older than 1h are pruned when the map exceeds 5000 keys.
+        Restart-safe: checks the order's durable fills first (order.fills
+        carries the broker identity via OrderFill and round-trips through the
+        orders JSON), so a restored order with an already-applied deal is never
+        re-applied after a restart.  Session dedupe: bounded map keyed by
+        (order id | deal id | seqno), entries older than 1h pruned at 5000.
         Fail-open on internal error so a dedupe fault never drops a fill.
         """
         try:
-            _key = f"{order_id}|{deal_id}|{seqno}"
+            _oid = getattr(order, "order_id", None)
+            for _f in (getattr(order, "fills", None) or []):
+                _fid = (getattr(_f, "broker_trade_id", None)
+                        or getattr(_f, "exchange_fill_id", None)
+                        or getattr(_f, "deal_id", None))
+                if _fid and _fid == deal_id:
+                    return False  # durable — already applied (restored state)
+            _key = f"{_oid}|{deal_id}|{seqno}"
             _seen = getattr(self, "_fills_bridge_seen", None)
             if _seen is None:
                 _seen = self._fills_bridge_seen = {}
