@@ -15,3 +15,13 @@ def test_live_flat_proof_skips_historical_fills_restore():
     assert strategy._restore_position_state() is False
     assert strategy._mts_recovery_state is RecoveryState.FLAT_CONFIRMED
     assert strategy._mts_state_write_enabled is True
+
+
+def test_live_flat_proof_blocks_direct_fills_restore():
+    from strategies.plugins.futures.active.tmf_spread import TMFSpread
+
+    strategy = TMFSpread.__new__(TMFSpread)
+    strategy._broker_truth_flat = True
+    strategy._restore_from_fills_log = (
+        TMFSpread._restore_from_fills_log.__get__(strategy, TMFSpread))
+    assert strategy._restore_from_fills_log() is False

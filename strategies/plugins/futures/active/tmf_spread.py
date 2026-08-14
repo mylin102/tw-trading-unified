@@ -2553,6 +2553,11 @@ class TMFSpread(StrategyBase):
 
     def _restore_from_fills_log(self) -> bool:
         """Rebuild position state from fills log. Returns True on success."""
+        # The monitor sets this marker after a successful current-session
+        # broker snapshot.  In LIVE mode historical fills are evidence only;
+        # they must not recreate a position the broker has proved flat.
+        if getattr(self, "_broker_truth_flat", False):
+            return False
         if not os.path.exists(_MTS_FILL_LOG):
             return False
         try:
