@@ -7395,10 +7395,12 @@ class FuturesMonitor:
         if _sd is None or _z is None:
             return
         try:
-            _ts = bar.get("ts") or bar.get("timestamp") or time.time()
-            _ts_f = float(_ts.timestamp()) if hasattr(_ts, "timestamp") \
-                else float(_ts)
-            _m = _sd.update(_ts_f, float(_z))
+            # Real arrival time, not bar timestamps: bars carry a 5-minute
+            # cadence whose dt (300s) exceeds the calculator's
+            # max_derivative_gap_sec=15, resetting the sample counter every
+            # update so dz / spread_slope never form (the evaluation is
+            # stuck in CANDIDATE_AWAITING_EVALUATION forever).
+            _m = _sd.update(time.time(), float(_z))
             bar["dz"] = _m.z_velocity
             bar["spread_slope"] = _m.rolling_slope
             bar["velocity_ema"] = _m.velocity_ema
