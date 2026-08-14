@@ -24,7 +24,7 @@ def test_live_broker_flat_snapshot_is_explicit_flat_authority(monkeypatch, tmp_p
     monitor.contract = SimpleNamespace(code="TMFH6")
     monitor.far_contract = SimpleNamespace(code="TMFI6")
     monitor._execution_context = SimpleNamespace(
-        effective_mode="live_ready", session_id="sess")
+        requested_mode="live", effective_mode="live_ready", session_id="sess")
     monitor._live_broker_authority_at = 0.0
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
 

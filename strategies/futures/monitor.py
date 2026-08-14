@@ -4913,11 +4913,15 @@ class FuturesMonitor:
         make an actually-held spread appear FLAT.  This is read-only and is
         never used in PAPER or legacy EXIT_ONLY mode.
         """
-        from core.mode_transition import ModeTransitionState
-        if (not getattr(self, "live_trading", False)
-                or getattr(getattr(self, "_execution_context", None),
-                           "effective_mode", None)
-                != ModeTransitionState.LIVE_READY.value
+        # LIVE detection MUST use the ctx requested_mode (the live INTENT,
+        # set at ctx creation): the config's live_trading key is absent in
+        # futures_live.yaml (monitor defaults to False), and effective_mode
+        # is not yet LIVE_READY at startup (the certificate transition
+        # happens later).  An effective_mode/live_trading-keyed guard returns
+        # None on the first ticks, falling back to the stale fills-ledger
+        # authority and resurrecting a ghost (reason=authority_rebuild).
+        if (getattr(getattr(self, "_execution_context", None),
+                    "requested_mode", "") != "live"
                 or strategy is None):
             return None
         _now = time.monotonic()
