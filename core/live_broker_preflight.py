@@ -218,13 +218,73 @@ def _safe_open_orders(api: Any, account: Any) -> list[dict[str, Any]]:
     terminal = {"Filled", "Cancelled", "Expired", "Done"}
     return [
         {
-            "code": getattr(t, "code", None),
+            "code": (getattr(t, "code", None)
+                     or getattr(getattr(getattr(t, "order", None),
+                                         "contract", None), "code", None)),
             "qty": getattr(t, "quantity", None),
+            "direction": _canonical_direction(
+                getattr(t, "action", None)
+                or getattr(getattr(t, "order", None), "action", None)),
+            "broker_order_id": getattr(t, "id", None)
+                               or getattr(t, "broker_order_id", None)
+                               or getattr(getattr(t, "order", None), "id", None),
+            "ordno": getattr(t, "ordno", None)
+                     or getattr(getattr(t, "order", None), "ordno", None),
+            "seqno": getattr(t, "seqno", None)
+                     or getattr(getattr(t, "order", None), "seqno", None),
             "status": getattr(getattr(t, "status", None), "status", None),
         }
         for t in trades
         if getattr(getattr(t, "status", None), "status", "") not in terminal
     ]
+
+
+def _position_covered_orders(positions: list[dict[str, Any]],
+                             open_orders: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Remove only one-to-one stale pending receipts covered by positions.
+
+    ``list_trades`` can retain PendingSubmit after a fill.  We accept this
+    only when every non-zero futures position has exactly one matching order
+    by code, canonical direction, and quantity; missing/ambiguous fields
+    remain open and fail closed.  Raw rows are returned as audit evidence.
+    """
+    def _positive_qty(value):
+        try:
+            if isinstance(value, bool):
+                return None
+            qty = int(value)
+            return qty if qty > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    active_positions = [p for p in positions or []
+                        if isinstance(p, dict)
+                        and str(p.get("code") or "")
+                        and _positive_qty(p.get("qty")) is not None]
+    candidates = [o for o in open_orders or []
+                  if isinstance(o, dict)
+                  and o.get("code")
+                  and o.get("direction") in {"buy", "sell"}
+                  and _positive_qty(o.get("qty")) is not None]
+    if not active_positions or len(candidates) != len(active_positions):
+        return list(open_orders or []), []
+    remaining = list(active_positions)
+    covered = []
+    for order in candidates:
+        match = next((p for p in remaining
+                      if str(p.get("code")) == str(order.get("code"))
+                      and p.get("direction") == order.get("direction")
+                      and _positive_qty(p.get("qty")) == _positive_qty(order.get("qty"))),
+                     None)
+        if match is None:
+            return list(open_orders or []), []
+        remaining.remove(match)
+        covered.append(order)
+    if remaining:
+        return list(open_orders or []), []
+    covered_ids = {id(item) for item in covered}
+    filtered = [item for item in open_orders or [] if id(item) not in covered_ids]
+    return filtered, covered
 
 
 def _unsubscribe_bidask(api: Any, contract: Any) -> None:
@@ -265,6 +325,8 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
     # evidence needed to distinguish an account mapping issue from login loss.
     positions = query("POSITIONS", lambda: _safe_positions(api, account), [])
     open_orders = query("OPEN_ORDERS", lambda: _safe_open_orders(api, account), [])
+    open_orders, position_covered_orders = _position_covered_orders(
+        positions, open_orders)
     margin = query("MARGIN", lambda: api.margin(account), None)
     # The broker's trading_limits endpoint is known to be unavailable for some
     # branch mappings.  Available margin remains the required capacity check
@@ -298,6 +360,7 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
         "order_snapshot_time": datetime.now(timezone.utc).isoformat(),
         "positions": positions,
         "open_orders": open_orders,
+        "position_covered_orders": position_covered_orders,
         "margin": {
             "available_margin": getattr(margin, "available_margin", None) if margin else None,
             "equity_amount": getattr(margin, "equity_amount", None) if margin else None,

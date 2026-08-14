@@ -4317,7 +4317,9 @@ class FuturesMonitor:
                 continue
             row = {
                 "order_id": str(getattr(getattr(t, "order", None), "id", "")),
-                "code": str(getattr(t, "code", "")),
+                "code": str(getattr(t, "code", "")
+                             or getattr(getattr(getattr(t, "order", None),
+                                                 "contract", None), "code", "")),
                 "status": name,
             }
             # Preserve the historical shape when SDK identity fields are not
@@ -4332,6 +4334,16 @@ class FuturesMonitor:
                      or getattr(getattr(t, "order", None), "seqno", None))):
                 if value not in (None, ""):
                     row[key] = str(value)
+            _action = (getattr(t, "action", None)
+                       or getattr(getattr(t, "order", None), "action", None))
+            _direction = (getattr(_action, "name", None)
+                          or getattr(_action, "value", None)
+                          or (_action if isinstance(_action, str) else None))
+            if str(_direction or "").lower() in {"buy", "sell"}:
+                row["direction"] = str(_direction).lower()
+            _qty = getattr(t, "quantity", None)
+            if _qty is not None:
+                row["qty"] = _qty
             out.append(row)
         return out
 
@@ -4582,6 +4594,18 @@ class FuturesMonitor:
                 errors["capture"] = "no futopt account available"
         except Exception as exc:
             errors["capture"] = f"{type(exc).__name__}: {exc}"
+        try:
+            from core.live_broker_preflight import _position_covered_orders
+            _covered_positions = [
+                {"code": row.get("code"), "qty": row.get("quantity"),
+                 "direction": str(row.get("direction") or "").lower()
+                              .split(".")[-1]}
+                for row in positions if isinstance(row, dict)
+                and row.get("account") == "futures"]
+            open_orders, covered = _position_covered_orders(
+                _covered_positions, open_orders)
+        except Exception:
+            covered = []
         payload = {
             "source": "live_broker",
             "mode": "live",
@@ -4591,6 +4615,7 @@ class FuturesMonitor:
             "captured_at": captured_at,
             "positions": positions,
             "open_orders": open_orders,
+            "position_covered_orders": covered,
             "broker_trades": broker_trades,
             "available_margin": margin,
             "canonical_input_hash": None,

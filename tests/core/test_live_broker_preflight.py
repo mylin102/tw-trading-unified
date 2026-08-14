@@ -52,6 +52,33 @@ def test_contract_resolution_uses_compat_adapter_not_native_bracket(monkeypatch)
     assert preflight.resolve_near_far_contracts(api, "TMF") == (near, far)
 
 
+def test_position_covered_pending_receipts_are_not_open_orders():
+    positions = [
+        {"code": "TMFH6", "qty": 1, "direction": "sell"},
+        {"code": "TMFI6", "qty": 1, "direction": "buy"},
+    ]
+    pending = [
+        {"code": "TMFH6", "qty": 1, "direction": "sell",
+         "broker_order_id": "2bb663a2", "status": "PendingSubmit"},
+        {"code": "TMFI6", "qty": 1, "direction": "buy",
+         "broker_order_id": "c3847f71", "status": "PendingSubmit"},
+    ]
+    remaining, covered = preflight._position_covered_orders(positions, pending)
+    assert remaining == []
+    assert {row["broker_order_id"] for row in covered} == {
+        "2bb663a2", "c3847f71"
+    }
+
+
+def test_ambiguous_pending_receipt_remains_open():
+    positions = [{"code": "TMFH6", "qty": 1, "direction": "sell"}]
+    pending = [{"code": None, "qty": 1, "direction": "sell",
+                "broker_order_id": "unknown", "status": "PendingSubmit"}]
+    remaining, covered = preflight._position_covered_orders(positions, pending)
+    assert remaining == pending
+    assert covered == []
+
+
 def test_preflight_preserves_evidence_when_trading_limits_fails(monkeypatch, tmp_path):
     api = Api()
     api.trading_limits = lambda account: (_ for _ in ()).throw(RuntimeError("broker mapping unavailable"))
