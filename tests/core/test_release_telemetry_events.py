@@ -6,13 +6,17 @@ Events locked by this suite:
 - RELEASE_EVAL_SKIP_NO_LOCAL_POSITION — broker holds TMF legs but the strategy
                                         sees no local position (fills gap)
 - FILL_REJECTED_REMAINING         — apply_deal_fill rejected (remaining=0)
+
+Fail-closed rules: when the local position cannot be resolved (no strategy
+reference, no persisted state), NO divergence event is emitted.
 """
+import json
 import time
 from types import SimpleNamespace
 
 import pytest
 
-from strategies.futures.monitor import FuturesMonitor
+from strategies.futures.monitor import FuturesMonitor, _mts_position_state_path
 
 
 def _make_monitor():
@@ -32,6 +36,8 @@ def _make_monitor():
     mon._emit_release_eval_skip_no_local_position = (
         FuturesMonitor._emit_release_eval_skip_no_local_position.__get__(mon, type(mon)))
     mon._emit_fill_rejected = FuturesMonitor._emit_fill_rejected.__get__(mon, type(mon))
+    mon._resolve_mts_local_position_qty = (
+        FuturesMonitor._resolve_mts_local_position_qty.__get__(mon, type(mon)))
     return mon
 
 
@@ -50,16 +56,39 @@ def _make_snapshot_with_legs():
     }
 
 
+def _write_state_file(payload):
+    _p = _mts_position_state_path()
+    _p.parent.mkdir(parents=True, exist_ok=True)
+    with open(_p, "w", encoding="utf-8") as _f:
+        json.dump(payload, _f)
+
+
+@pytest.fixture(autouse=True)
+def _clean_state_file():
+    yield
+    _p = _mts_position_state_path()
+    try:
+        _p.unlink()
+    except OSError:
+        pass
+
+
 # ── RELEASE_CONDITION_MET ──
 
-def test_release_condition_met_emits_event():
+def test_release_condition_met_carries_production_trade_id():
     mon = _make_monitor()
-    strat = _make_strategy(trade_id="t-1")
+    strat = _make_strategy(_trade_id="t-1")  # production attr: strategy._trade_id
     mon._emit_release_telemetry("RELEASE_NEAR", strat, {})
     assert len(mon.events) == 1
     assert mon.events[0]["event"] == "RELEASE_CONDITION_MET"
     assert mon.events[0]["signal"] == "RELEASE_NEAR"
     assert mon.events[0]["trade_id"] == "t-1"
+
+
+def test_release_condition_met_falls_back_to_plain_trade_id():
+    mon = _make_monitor()
+    mon._emit_release_telemetry("RELEASE_NEAR", _make_strategy(trade_id="t-2"), {})
+    assert mon.events and mon.events[0]["trade_id"] == "t-2"
 
 
 def test_release_condition_met_emits_for_combined_exit():
@@ -85,6 +114,14 @@ def test_divergent_broker_legs_without_local_position_emits_event():
     assert "TMFH6" in mon.events[0]["broker_legs"][0]
 
 
+def test_divergence_resolves_strategy_from_registry():
+    mon = _make_monitor()  # no _mts_strategy attr
+    mon._strategies = {"mts": _make_strategy(_near_qty=0, _far_qty=0)}
+    mon._emit_release_eval_skip_no_local_position(_make_snapshot_with_legs())
+    assert len(mon.events) == 1
+    assert mon.events[0]["event"] == "RELEASE_EVAL_SKIP_NO_LOCAL_POSITION"
+
+
 def test_local_position_present_emits_no_skip_event():
     mon = _make_monitor()
     mon._mts_strategy = _make_strategy(_near_qty=1, _far_qty=1)
@@ -97,6 +134,28 @@ def test_no_broker_legs_emits_no_skip_event():
     mon._mts_strategy = _make_strategy(_near_qty=0, _far_qty=0)
     mon._emit_release_eval_skip_no_local_position({"positions": [], "source": "live_broker"})
     assert mon.events == []
+
+
+def test_unknown_local_position_emits_no_skip_event():
+    """Fail-closed: no strategy reference and no state file -> no event."""
+    mon = _make_monitor()
+    mon._emit_release_eval_skip_no_local_position(_make_snapshot_with_legs())
+    assert mon.events == []
+
+
+def test_state_file_position_present_emits_no_skip_event():
+    _write_state_file({"has_position": True, "trade_id": "t-1"})
+    mon = _make_monitor()
+    mon._emit_release_eval_skip_no_local_position(_make_snapshot_with_legs())
+    assert mon.events == []
+
+
+def test_state_file_flat_confirms_divergence():
+    _write_state_file({"has_position": False})
+    mon = _make_monitor()
+    mon._emit_release_eval_skip_no_local_position(_make_snapshot_with_legs())
+    assert len(mon.events) == 1
+    assert mon.events[0]["event"] == "RELEASE_EVAL_SKIP_NO_LOCAL_POSITION"
 
 
 def test_divergence_emission_rate_limited_to_30s():
