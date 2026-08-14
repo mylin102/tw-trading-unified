@@ -1152,6 +1152,21 @@ def get_counterfactual_service():
     from core.counterfactual_service import CounterfactualService
     return CounterfactualService()
 
+
+@st.cache_resource(ttl=30)
+def _get_live_upl_api():
+    """Best-effort dashboard Shioaji session for live per-leg UPL
+    (Option B v2: CURRENT session list_positions().pnl, never the stale
+    canonical JSON).  None on any failure -> UPL renders N/A."""
+    try:
+        import shioaji as sj
+        _api = sj.Shioaji()
+        _api.login(os.environ["SHIOAJI_API_KEY"],
+                   os.environ["SHIOAJI_SECRET_KEY"])
+        return _api
+    except Exception:
+        return None
+
 # ── Configs ──
 FUTURES_CFG_PATH = BASE / "config" / FUTURES_CFG_NAME
 OPTIONS_CFG_PATH = BASE / "config" / "options_strategy.yaml"
@@ -4594,8 +4609,24 @@ elif _selected_product == "TMF":
                 # ── Unrealized PnL Breakdown ──
                 st.markdown("**MTS 未實現損益 (Unrealized PnL)**")
                 _u1, _u2, _u3 = st.columns(3)
-                _nr = _mts_state.get("near_upl", 0)
-                _fr = _mts_state.get("far_upl", 0)
+                # [B v2] live per-leg UPL from the CURRENT Shioaji session
+                # (list_positions().pnl) — never the stale canonical JSON.
+                # Query failure / no session -> state fallback (which the
+                # strict scope then gates to N/A when not live-attributable).
+                _live_upl = None
+                try:
+                    from core.performance_provenance import \
+                        broker_live_upl_from_session
+                    _live_upl = broker_live_upl_from_session(
+                        _get_live_upl_api())
+                except Exception:
+                    _live_upl = None
+                if _live_upl is not None:
+                    _nr = _live_upl["legs"]["TMFH6"]["pnl"]
+                    _fr = _live_upl["legs"]["TMFI6"]["pnl"]
+                else:
+                    _nr = _mts_state.get("near_upl", 0)
+                    _fr = _mts_state.get("far_upl", 0)
                 # 2026-08-03: released leg shows realized PnL (已平倉) instead of 0
                 _nr_label = f"{_nr:+,.0f} TWD"
                 _fr_label = f"{_fr:+,.0f} TWD"
