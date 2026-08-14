@@ -4465,8 +4465,7 @@ elif _selected_product == "TMF":
                     and int(p.get("quantity", 0) or 0) > 0]
             if (_ctx_live.get("effective_mode") == "live_ready"
                     and _canon.get("session_id") == _ctx_live.get("session_id")
-                    and (_canon.get("fetch_status") or {}).get("capture") == "OK"
-                    and not _canon.get("open_orders")):
+                    and (_canon.get("fetch_status") or {}).get("capture") == "OK"):
                 _live_mts_params = (futures_cfg.get("mts", {}).get("params", {})
                                     if isinstance(futures_cfg, dict) else {})
                 if len({p.get("code") for p in _fut}) == 2:
@@ -4492,7 +4491,7 @@ elif _selected_product == "TMF":
                                 or _live_mts_params.get("atr")
                                 or _latest_live_atr()),
                     }
-                else:
+                elif not _canon.get("open_orders"):
                     # A current, successful broker snapshot with no complete
                     # spread is authoritative FLAT/partial evidence.  Do
                     # not fall through to stale /tmp paper state.
