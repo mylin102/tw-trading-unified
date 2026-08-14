@@ -2559,7 +2559,7 @@ class TMFSpread(StrategyBase):
         # The monitor sets this marker after a successful current-session
         # broker snapshot.  In LIVE mode historical fills are evidence only;
         # they must not recreate a position the broker has proved flat.
-        if getattr(self, "_broker_truth_flat", False):
+        if getattr(self, "_broker_truth_flat", False) is True:
             return False
         if not os.path.exists(_MTS_FILL_LOG):
             return False
@@ -2837,7 +2837,7 @@ class TMFSpread(StrategyBase):
         # LIVE broker truth is authoritative for the current session.  When
         # the monitor has just proved the futures account flat, historical
         # fills are telemetry and must not resurrect a local ghost position.
-        if getattr(self, "_broker_truth_flat", False):
+        if getattr(self, "_broker_truth_flat", False) is True:
             self._mts_recovery_state = RecoveryState.FLAT_CONFIRMED
             self._mts_state_write_enabled = True
             return False

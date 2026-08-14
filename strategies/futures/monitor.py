@@ -4937,9 +4937,32 @@ class FuturesMonitor:
         if _now - getattr(self, "_live_broker_authority_at", 0.0) < 5.0:
             return getattr(self, "_live_broker_authority", None)
         _snap = self._capture_post_startup_snapshot()
-        self._reconcile_local_orders_from_snapshot(_snap)
-        if ((_snap.get("fetch_status") or {}).get("capture") != "OK"
-                or _snap.get("open_orders")):
+        if ((_snap.get("fetch_status") or {}).get("capture") != "OK"):
+            # An unavailable snapshot is unknown, not flat.  Revoke any
+            # earlier flat proof and keep entry fail-closed; do not mutate
+            # the strategy's known-open local state.
+            self._live_broker_flat_proven = False
+            self._broker_authority_degraded = True
+            self._broker_position_observed = True
+            self._live_broker_authority = None
+            self._live_broker_authority_at = _now
+            return None
+        try:
+            self._reconcile_local_orders_from_snapshot(_snap)
+        except Exception as _reconcile_exc:
+            # Local receipt replay is best-effort and cannot override a
+            # successful broker snapshot.  In particular, a duplicate FDEAL
+            # must not conceal a proven broker-flat account.
+            logger.warning(
+                "[LIVE_BROKER_AUTHORITY] local reconcile failed: %s",
+                _reconcile_exc,
+            )
+        if _snap.get("open_orders"):
+            # Snapshot is successful but open orders leave the lifecycle
+            # unresolved.  This is degraded/blocked, never flat evidence.
+            self._live_broker_flat_proven = False
+            self._broker_authority_degraded = True
+            self._broker_position_observed = True
             self._live_broker_authority = None
             self._live_broker_authority_at = _now
             return None
@@ -4953,11 +4976,14 @@ class FuturesMonitor:
                  and p.get("code") in _codes
                  and type(p.get("quantity")) is int
                  and p.get("quantity", 0) > 0]
-        if len({p.get("code") for p in _rows}) != 2:
+        if not _rows:
             # A successful, empty futures snapshot is authoritative flat
             # evidence.  Capture failures return above and must not clear the
             # marker, because an unknown broker state is not flat evidence.
-            self._broker_position_observed = bool(_rows)
+            self._broker_position_observed = False
+            self._live_broker_flat_proven = True
+            self._broker_authority_degraded = False
+            strategy._broker_truth_flat = True
             self._live_broker_authority = MtsAuthorityState(
                 status=MtsAuthority.FLAT,
                 trade_id=None,
@@ -4968,6 +4994,16 @@ class FuturesMonitor:
                 current_trade_id=None)
             self._live_broker_authority_at = _now
             return self._live_broker_authority
+        if len({p.get("code") for p in _rows}) != 2:
+            # A partial relevant position is not proof of flatness and cannot
+            # safely be reconstructed as a two-leg spread.
+            self._broker_position_observed = True
+            self._live_broker_flat_proven = False
+            self._broker_authority_degraded = True
+            strategy._broker_truth_flat = False
+            self._live_broker_authority = None
+            self._live_broker_authority_at = _now
+            return None
         _by_code = {p["code"]: p for p in _rows}
         _near = _by_code.get(str(getattr(self.contract, "code", "")))
         _far = _by_code.get(str(getattr(self.far_contract, "code", "")))
@@ -4984,11 +5020,17 @@ class FuturesMonitor:
             # blocked until a subsequent successful snapshot proves flat or
             # provides two unambiguous legs.
             self._broker_position_observed = True
+            self._live_broker_flat_proven = False
+            self._broker_authority_degraded = True
+            strategy._broker_truth_flat = False
             self._live_broker_authority = None
             self._live_broker_authority_at = _now
             return None
         _snapshot_hash = _snap.get("canonical_input_hash")
         self._broker_position_observed = True
+        self._live_broker_flat_proven = False
+        self._broker_authority_degraded = False
+        strategy._broker_truth_flat = False
         _trade_id = self._stable_broker_trade_id(
             _snap.get("account_identity_hash"), _rows)
         for _name, _value in (
@@ -10599,18 +10641,28 @@ class FuturesMonitor:
         _blocked = False
         _reasons = []
 
-        if _state_has_pos:
+        _live_flat_proven = (
+            getattr(getattr(self, "_execution_context", None),
+                    "requested_mode", "") == "live"
+            and bool(getattr(self, "_live_broker_flat_proven", False))
+            and not bool(getattr(self, "_broker_authority_degraded", False))
+        )
+        if bool(getattr(self, "_broker_authority_degraded", False)):
             _blocked = True
-            _reasons.append("state.has_position=True")
-        if bool(getattr(strategy, "_has_position", False)):
-            _blocked = True
-            _reasons.append("strategy.has_position=True")
-        if _lifecycle_phase and _lifecycle_phase != "FLAT":
-            _blocked = True
-            _reasons.append(f"lifecycle.phase={_lifecycle_phase}")
-        if _fills_has_open:
-            _blocked = True
-            _reasons.append("fills_ledger_has_open_entry")
+            _reasons.append("broker_authority_degraded")
+        elif not _live_flat_proven:
+            if _state_has_pos:
+                _blocked = True
+                _reasons.append("state.has_position=True")
+            if bool(getattr(strategy, "_has_position", False)):
+                _blocked = True
+                _reasons.append("strategy.has_position=True")
+            if _lifecycle_phase and _lifecycle_phase != "FLAT":
+                _blocked = True
+                _reasons.append(f"lifecycle.phase={_lifecycle_phase}")
+            if _fills_has_open:
+                _blocked = True
+                _reasons.append("fills_ledger_has_open_entry")
         if _has_pending:
             _blocked = True
             _reasons.append("pending_mts_orders")
