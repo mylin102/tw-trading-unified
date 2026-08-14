@@ -59,6 +59,10 @@ _ACCEPTABLE_STALE = {
     # would deadlock the recovery (only a manual ctx deletion could clear).
     "BROKER_NOT_FLAT",
     "EXIT_ONLY_RENEWAL:EXIT_ONLY_POSITION_MISMATCH",
+    # A previous process may have quarantined itself because PM2 injected an
+    # older LRC_RELEASE_SHA. Fresh canonical broker evidence and the sealed
+    # profile remain mandatory before resetting this stale context.
+    "RELEASE_IDENTITY_MISMATCH",
 }
 _BLOCKING_AUDIT = {"SAFETY_STOP_RECONCILE_PENDING"}
 _BOOTSTRAP_REASON = "REDEPLOY_BOOTSTRAP"
@@ -146,9 +150,11 @@ def main() -> int:
     if _pid_alive(args.pid_file):
         failures.append("pid file references an ACTIVE process — refuse")
 
-    # 2. fresh live_broker futures-flat / no-orders snapshot
+    # 2. fresh live_broker futures-flat / no-orders snapshot. Local strategy
+    # state may be stale/ghosted after a stopped process; use the same
+    # canonical broker evidence supplied for the margin proof.
     from core.deployment_safety_gate import guard_flat_no_pending
-    flat = guard_flat_no_pending(args.position_state, {})
+    flat = guard_flat_no_pending(args.margin_evidence, {"requested_mode": "live"})
     if not flat.ok:
         failures.append(f"snapshot not flat: {flat.reasons}")
 
