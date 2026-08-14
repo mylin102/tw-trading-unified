@@ -29,3 +29,16 @@ from post-entry data.
 
 This database does not change `live_trading`, entry thresholds, release rules,
 or any PM2 configuration. Deploy/restart is a separate operator action.
+
+## Automated verification report
+
+Run `scripts/research/generate_entry_report.py` in read-only mode. It writes
+`exports/research/entry_research_report.json` atomically and reports
+`NO_DATABASE`, `NO_OBSERVATIONS_YET`, `INSUFFICIENT_EVIDENCE`,
+`READY_FOR_RESEARCH`, or `CORRUPT`. It checks schema, provenance, Paper/Live
+source separation, finite numeric values, duplicate-safe decisions, and the
+coverage of causal/BBO/cost features. A lock prevents overlapping runs.
+
+The intended Mini cron schedule is every five minutes (the cron template is
+`scripts/research/entry_research_report.cron`). The report process never calls
+the broker and never invokes the order or gateway modules.

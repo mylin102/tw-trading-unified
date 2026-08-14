@@ -7048,6 +7048,49 @@ class FuturesMonitor:
             return None
         return _open_qty
 
+    def _record_mts_entry_research_candidate(self, strategy, bar_dict, ts):
+        """Best-effort z-score candidate telemetry; never affects orders."""
+        try:
+            _z = float(bar_dict.get("spread_z"))
+            _threshold = bar_dict.get("entry_z_threshold", bar_dict.get("entry_z"))
+            if _threshold is None:
+                _threshold = getattr(strategy, "_entry_z", None)
+            _threshold = float(_threshold)
+            if not (math.isfinite(_z) and math.isfinite(_threshold)
+                    and _threshold > 0 and abs(_z) >= _threshold):
+                return
+            _action = "SELL_NEAR_BUY_FAR" if _z > 0 else "BUY_NEAR_SELL_FAR"
+            _audit = {
+                "event_time": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                "action": _action, "decision": "CANDIDATE",
+                "rejection_reason": "CANDIDATE_AWAITING_EVALUATION",
+                "trade_id": getattr(strategy, "_trade_id", None),
+                "near_contract": getattr(self, "near_code", None),
+                "far_contract": getattr(self, "far_code", None),
+                "spread": bar_dict.get("spread"), "spread_z": _z,
+                "entry_z": _threshold, "spread_ma": bar_dict.get("spread_ma"),
+                "spread_std": bar_dict.get("spread_std"), "dz": bar_dict.get("dz"),
+                "spread_slope": bar_dict.get("spread_slope"),
+                "velocity_ema": bar_dict.get("velocity_ema"),
+                "atr": bar_dict.get("atr"), "regime": bar_dict.get("regime"),
+                "near_bid": bar_dict.get("near_bid"), "near_ask": bar_dict.get("near_ask"),
+                "far_bid": bar_dict.get("far_bid"), "far_ask": bar_dict.get("far_ask"),
+                "quote_age_ms": bar_dict.get("quote_age_ms"),
+                "pair_skew_ms": bar_dict.get("pair_skew_ms"),
+            }
+            from core.entry_research_store import record_entry_observation
+            _ctx = getattr(self, "_execution_context", None)
+            record_entry_observation(
+                _audit, mode="live" if self.live_trading else "paper",
+                session_id=getattr(_ctx, "session_id", None),
+                config_hash=getattr(_ctx, "config_hash", None),
+                release_sha=os.environ.get("LRC_RELEASE_SHA"),
+                run_id=getattr(self, "run_id", None),
+                source=("live_strategy" if self.live_trading else "paper_strategy"),
+            )
+        except Exception:
+            pass
+
     def _submit_mts_order_signal(self, signal, strategy, bar_dict, ts):
         """Submit order via order_mgr for MTS signals (entry, release, exit).
 
@@ -7683,7 +7726,9 @@ class FuturesMonitor:
             # constructing either leg; if the audit write fails, no order can
             # be created or submitted without an explainable entry rationale.
             _entry_audit = {
+                "event_time": _ts.isoformat() if hasattr(_ts, "isoformat") else str(_ts),
                 "action": _action,
+                "decision": "ENTER",
                 "reason": _reason,
                 "trade_id": _trade_id,
                 "near_contract": _near_code,
@@ -9766,6 +9811,9 @@ class FuturesMonitor:
         # 2026-08-06 codex audit: evaluator-lag SLO — runs every tick so a
         # stalled evaluator is caught even when the gates skip on_bar.
         self._mts_check_evaluator_lag(strategy, _strat_has_pos)
+
+        if _exit_ok:
+            self._record_mts_entry_research_candidate(strategy, _bar_dict, datetime.now())
 
         signal = None
         if _pre_action != MtsGateAction.RESET_STRATEGY and _exit_ok:

@@ -96,6 +96,7 @@ def _event_id(audit: Mapping[str, Any], *, mode: str | None, session_id: str | N
         "near_price": audit.get("near_price"),
         "far_price": audit.get("far_price"),
         "spread_z": audit.get("spread_z"),
+        "decision": audit.get("decision"),
         "mode": mode,
         "session_id": session_id,
     }

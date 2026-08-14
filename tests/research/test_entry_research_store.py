@@ -57,6 +57,25 @@ def test_entry_research_store_duplicate_is_idempotent(tmp_path):
     conn.close()
 
 
+def test_candidate_and_enter_observations_are_distinct(tmp_path):
+    from core.entry_research_store import record_entry_observation
+
+    path = tmp_path / "mts_entry_research.sqlite3"
+    candidate = _audit() | {
+        "decision": "CANDIDATE",
+        "rejection_reason": "CANDIDATE_AWAITING_EVALUATION",
+    }
+    entered = _audit() | {"decision": "ENTER"}
+    assert record_entry_observation(candidate, mode="paper", db_path=path)
+    assert record_entry_observation(entered, mode="paper", db_path=path)
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT COUNT(*) FROM entry_observations").fetchone()[0] == 2
+    assert {row[0] for row in conn.execute("SELECT decision FROM entry_observations")} == {
+        "CANDIDATE", "ENTER"
+    }
+    conn.close()
+
+
 def test_entry_research_store_failure_is_non_blocking(monkeypatch, tmp_path):
     import core.entry_research_store as store
 
@@ -65,4 +84,3 @@ def test_entry_research_store_failure_is_non_blocking(monkeypatch, tmp_path):
 
     monkeypatch.setattr(store.sqlite3, "connect", fail_connect)
     assert store.record_entry_observation(_audit(), db_path=tmp_path / "blocked.db") is False
-
