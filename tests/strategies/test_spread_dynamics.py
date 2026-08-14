@@ -184,3 +184,92 @@ def test_serialization_roundtrip_invariant():
     assert deserialized_snap["rolling_slope_at_entry"] is None  # None preserved, not "null" or 0
     assert deserialized_snap["velocity_ema_valid_at_entry"] is True  # bool preserved, not "True"
 
+
+def _bare_monitor_for_dynamics():
+    """Exercise only the monitor's research-only bar telemetry seam."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._spread_dynamics = SpreadDynamicsCalculator(
+        tau_sec=2.0, max_derivative_gap_sec=15.0,
+        min_slope_samples=2, min_slope_duration_sec=0.1)
+    monitor._spread_dynamics_session = None
+    monitor.live_trading = False
+    monitor.ticker = "TMF"
+    monitor._execution_context = None
+    monitor.run_id = "test-run"
+    return monitor
+
+
+def test_monitor_dynamics_first_sample_warms_and_research_payload_is_raw(
+        monkeypatch):
+    """First input is telemetry warming-up only; it carries no derivative
+    and entry research sees the current raw near-minus-far spread, not a
+    future sample or a strategy gate."""
+    monitor = _bare_monitor_for_dynamics()
+    bar = {"ts": 100.0, "session_type": "day", "near_close": 101.0,
+           "far_close": 98.0, "spread_z": 2.0, "entry_z": 1.0}
+    metrics = monitor._update_mts_spread_dynamics(bar)
+
+    assert metrics.dynamics_status == DynamicsStatus.WARMING_UP
+    assert bar["raw_spread"] == 3.0
+    assert bar["dz"] is None
+    assert bar["spread_slope"] is None
+    assert bar["velocity_ema"] is None
+
+    captured = []
+    import core.entry_research_store as store
+    monkeypatch.setattr(store, "record_entry_observation",
+                        lambda audit, **kwargs: captured.append(audit) or True)
+    monitor._record_mts_entry_research_candidate(
+        type("Strategy", (), {"_entry_z": 1.0, "_trade_id": None})(),
+        bar, __import__("datetime").datetime.now())
+    assert captured[-1]["spread"] == 3.0
+    assert captured[-1]["dz"] is None
+    assert captured[-1]["spread_slope"] is None
+    assert captured[-1]["velocity_ema"] is None
+
+
+def test_monitor_dynamics_is_causal_then_resets_for_gap_and_session():
+    monitor = _bare_monitor_for_dynamics()
+    first = {"ts": 100.0, "session_type": "day", "near_close": 101.0,
+             "far_close": 98.0, "spread_z": 1.0}
+    second = {"ts": 101.0, "session_type": "day", "near_close": 103.0,
+              "far_close": 98.0, "spread_z": 1.5}
+    monitor._update_mts_spread_dynamics(first)
+    second_metrics = monitor._update_mts_spread_dynamics(second)
+    assert second["raw_spread"] == 5.0
+    assert second["dz"] == 0.5
+    assert second["velocity_ema"] == second_metrics.velocity_ema
+    assert second["spread_slope"] == second_metrics.rolling_slope
+
+    gap = {"ts": 120.0, "session_type": "day", "near_close": 104.0,
+           "far_close": 98.0, "spread_z": 2.0}
+    assert monitor._update_mts_spread_dynamics(gap).dynamics_status \
+        == DynamicsStatus.GAP_REANCHORED
+    assert gap["dz"] is None
+
+    session = {"ts": 121.0, "session_type": "night", "near_close": 105.0,
+               "far_close": 98.0, "spread_z": 2.5}
+    assert monitor._update_mts_spread_dynamics(session).dynamics_status \
+        == DynamicsStatus.WARMING_UP
+    assert session["dz"] is None
+
+
+def test_monitor_dynamics_time_regression_does_not_leak_future_state():
+    monitor = _bare_monitor_for_dynamics()
+    monitor._update_mts_spread_dynamics(
+        {"ts": 100.0, "session_type": "day", "near_close": 101.0,
+         "far_close": 98.0, "spread_z": 1.0})
+    backwards = {"ts": 99.0, "session_type": "day", "near_close": 200.0,
+                 "far_close": 98.0, "spread_z": 99.0}
+    assert monitor._update_mts_spread_dynamics(backwards).dynamics_status \
+        == DynamicsStatus.TIME_REGRESSION
+    assert backwards["dz"] is None
+
+    # The rejected 99.0/99.0 observation never becomes history: 101 only
+    # sees the causal 100.0 z=1.0 predecessor.
+    next_bar = {"ts": 101.0, "session_type": "day", "near_close": 102.0,
+                "far_close": 98.0, "spread_z": 2.0}
+    monitor._update_mts_spread_dynamics(next_bar)
+    assert next_bar["dz"] == 1.0
