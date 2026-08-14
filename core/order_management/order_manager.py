@@ -1035,6 +1035,54 @@ class OrderManager:
             finalized += 1
         return finalized
 
+    def restore_pending_from_broker_truth(
+        self, order_id: str, *, reason: str = "", source: str = ""
+    ) -> bool:
+        """Re-open a locally terminal order when broker truth is non-terminal.
+
+        This is deliberately a local-only reconciliation operation.  It is
+        permitted only for EXPIRED/CANCELLED orders, preserves all broker
+        identity fields, performs no submit/cancel call, and leaves the order
+        SUBMITTED until an explicit broker terminal receipt arrives.
+        """
+        order = next((candidate for candidate in self.completed
+                      if candidate.order_id == order_id), None)
+        if order is None or order.status not in (
+                OrderStatus.CANCELLED, OrderStatus.EXPIRED):
+            return False
+        previous = order.status
+        self.completed = [candidate for candidate in self.completed
+                          if candidate.order_id != order_id]
+        order.status = OrderStatus.SUBMITTED
+        order.cancelled_at = None
+        order.expired_at = None
+        order.cancel_reason = None
+        order.updated_at = datetime.now()
+        self.active_orders[order_id] = order
+        self._record_audit(
+            order,
+            "broker_truth_restore",
+            source=source or "broker_reconcile",
+            reason=reason or "BROKER_HAS_POSITION_OR_ORDER",
+            from_status=previous,
+            to_status=OrderStatus.SUBMITTED,
+            broker_order_id=order.broker_order_id,
+            seqno=order.seqno,
+            ordno=order.ordno,
+        )
+        self._emit("on_status_change", OrderEvent(
+            order_id=order.order_id,
+            status=OrderStatus.SUBMITTED,
+            symbol=order.symbol,
+            side=order.side,
+            broker_order_id=order.broker_order_id,
+            seqno=order.seqno,
+            ordno=order.ordno,
+            reason=reason or "BROKER_HAS_POSITION_OR_ORDER",
+            raw_status="broker_reconcile",
+        ))
+        return True
+
     # ── Recovery (重啟恢復) ──
 
     def restore_orders(self, serialized_orders: Optional[list]) -> Dict[str, int]:

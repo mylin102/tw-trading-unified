@@ -4315,12 +4315,129 @@ class FuturesMonitor:
             name = str(name).split(".")[-1]
             if name in terminal:
                 continue
-            out.append({
+            row = {
                 "order_id": str(getattr(getattr(t, "order", None), "id", "")),
                 "code": str(getattr(t, "code", "")),
                 "status": name,
-            })
+            }
+            # Preserve the historical shape when SDK identity fields are not
+            # present, while retaining every broker identity that is actually
+            # supplied by Shioaji for watchdog matching.
+            for key, value in (
+                    ("broker_order_id", getattr(t, "id", None)
+                     or getattr(t, "broker_order_id", None)),
+                    ("ordno", getattr(t, "ordno", None)
+                     or getattr(getattr(t, "order", None), "ordno", None)),
+                    ("seqno", getattr(t, "seqno", None)
+                     or getattr(getattr(t, "order", None), "seqno", None))):
+                if value not in (None, ""):
+                    row[key] = str(value)
+            out.append(row)
         return out
+
+    def _watchdog_broker_truth(self, order):
+        """Protect timeout decisions with a fresh broker read.
+
+        A local watchdog timeout is never broker evidence.  Before any local
+        cancel/expire transition, require a successful canonical capture and
+        check the exact broker identity or a unique matching futures position.
+        Capture failure is conservative: retain the order and record the
+        unavailable read rather than guessing that it is unfilled.
+        """
+        try:
+            snapshot = self._capture_post_startup_snapshot()
+        except Exception as exc:
+            snapshot = {"fetch_status": {"capture": "FAIL"},
+                        "errors": {"capture": type(exc).__name__}}
+        capture_ok = ((snapshot.get("fetch_status") or {}).get("capture")
+                      == "OK")
+        if not capture_ok:
+            reason = "BROKER_QUERY_UNAVAILABLE"
+            try:
+                self._append_mts_event("WATCHDOG_BROKER_QUERY_UNAVAILABLE",
+                                       order_id=order.order_id,
+                                       reason=reason)
+            except Exception:
+                pass
+            return {"protect": True, "reason": reason, "snapshot": snapshot}
+
+        def _ids(row):
+            return {str(row.get(key)) for key in
+                    ("order_id", "broker_order_id", "ordno", "seqno")
+                    if row.get(key) not in (None, "", "None")}
+
+        order_ids = {str(value) for value in (
+            getattr(order, "order_id", None),
+            getattr(order, "exchange_order_id", None),
+            getattr(order, "broker_order_id", None),
+            getattr(order, "ordno", None),
+            getattr(order, "seqno", None),
+        ) if value not in (None, "", "None")}
+        open_match = any(order_ids & _ids(row)
+                         for row in (snapshot.get("open_orders") or [])
+                         if isinstance(row, dict))
+
+        side = str(getattr(getattr(order, "side", None), "value", "")
+                   or getattr(getattr(order, "side", None), "name", "")
+                   or "").lower()
+        side_aliases = {"buy": {"buy", "long"},
+                        "sell": {"sell", "short"}}
+        code = str(getattr(order, "symbol", "") or "")
+        try:
+            qty = int(getattr(order, "quantity", 0) or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        position_match = False
+        for row in snapshot.get("positions") or []:
+            if not isinstance(row, dict) or str(row.get("code") or "") != code:
+                continue
+            try:
+                row_qty = abs(int(row.get("quantity") or 0))
+            except (TypeError, ValueError):
+                continue
+            direction = str(row.get("direction") or "").lower().split(".")[-1]
+            if row_qty >= max(qty, 1) and direction in side_aliases.get(side, {side}):
+                position_match = True
+                break
+
+        if open_match or position_match:
+            reason = "BROKER_HAS_POSITION_OR_ORDER"
+            try:
+                self._append_mts_event("WATCHDOG_BROKER_HAS_POSITION_OR_ORDER",
+                                       order_id=order.order_id,
+                                       reason=reason,
+                                       broker_order_id=getattr(order, "broker_order_id", None),
+                                       symbol=code)
+            except Exception:
+                pass
+            return {"protect": True, "reason": reason, "snapshot": snapshot,
+                    "open_match": open_match, "position_match": position_match}
+        # A successful empty read is still not an explicit broker terminal
+        # receipt.  Keep the local order pending; session-close reconciliation
+        # or a later Cancelled/Failed receipt owns the terminal transition.
+        reason = "BROKER_NO_POSITION_OR_ORDER"
+        try:
+            self._append_mts_event("WATCHDOG_BROKER_NO_POSITION_OR_ORDER",
+                                   order_id=order.order_id, reason=reason)
+        except Exception:
+            pass
+        return {"protect": True, "reason": reason, "snapshot": snapshot}
+
+    def _restore_terminal_watchdog_order(self, order, truth):
+        """Move a locally-terminal order back to broker-pending state.
+
+        This is a local reconciliation only.  It never submits or cancels;
+        the broker's identity remains the sole identity and the order stays
+        pending until an explicit broker terminal receipt arrives.
+        """
+        if not truth.get("protect") or order is None:
+            return False
+        manager = getattr(self, "order_mgr", None)
+        restore = getattr(manager, "restore_pending_from_broker_truth", None)
+        if not callable(restore):
+            return False
+        return bool(restore(order.order_id, reason=truth.get("reason", ""),
+                            source="live_broker_watchdog"))
 
     @staticmethod
     def _normalize_snapshot_trades(raw_trades) -> list:
@@ -8568,7 +8685,28 @@ class FuturesMonitor:
             if age_secs > _timeout:
                 order = self.order_mgr.get_order(order_id)
                 from core.order_management.order import OrderStatus
-                if order and order.status in (OrderStatus.PENDING_SUBMIT, OrderStatus.SUBMITTED):
+                if order is None:
+                    order = next((candidate for candidate in
+                                  getattr(self.order_mgr, "completed", [])
+                                  if candidate.order_id == order_id), None)
+                if order and order.status in (
+                        OrderStatus.PENDING_SUBMIT,
+                        OrderStatus.PRE_SUBMITTED,
+                        OrderStatus.SUBMITTED,
+                        OrderStatus.PARTIAL_FILLED,
+                        OrderStatus.CANCELLED,
+                        OrderStatus.EXPIRED):
+                    _truth = self._watchdog_broker_truth(order)
+                    if _truth.get("protect"):
+                        if (order.status in (OrderStatus.CANCELLED,
+                                             OrderStatus.EXPIRED)
+                                and _truth.get("reason") in (
+                                    "BROKER_HAS_POSITION_OR_ORDER",
+                                    "BROKER_QUERY_UNAVAILABLE")):
+                            self._restore_terminal_watchdog_order(order, _truth)
+                        # Broker position/open-order truth wins.  Do not put
+                        # this order into either cancellation queue.
+                        continue
                     if _is_exit:
                         console.print(f"[bold yellow]⚠️ [WATCHDOG] MTS Order {order_id} hanging >{_timeout}s. Cancelling...[/bold yellow]")
                         to_resubmit.append(order_id)
