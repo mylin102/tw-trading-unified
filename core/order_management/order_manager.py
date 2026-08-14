@@ -495,6 +495,21 @@ class OrderManager:
         if normalized is None:
             return order
 
+        # Broker position reconciliation is authoritative for a filled order.
+        # Shioaji may later replay an older PendingSubmit/Submitted receipt;
+        # never regress the local terminal state or its fill quantity.
+        if (order.status == OrderStatus.FILLED
+                and normalized != OrderStatus.FILLED):
+            self._record_audit(
+                order, "order_update_ignored", source=source or "order_update",
+                reason="STALE_RECEIPT_AFTER_BROKER_POSITION_FILL",
+                from_status=order.status, to_status=order.status,
+                raw_status=raw_status, payload=raw_payload,
+                broker_order_id=broker_order_id or order.broker_order_id,
+                seqno=seqno or order.seqno, ordno=ordno or order.ordno,
+            )
+            return order
+
         previous_status = order.status
         order.broker_order_id = broker_order_id or order.broker_order_id or order.exchange_order_id
         order.seqno = seqno or order.seqno
