@@ -40,8 +40,13 @@ UNTRACKED_ALLOWED_PREFIXES = (
     "data/backtest/",
     "logs/",
     ".venv/",
+    "commands/",
 )
-UNTRACKED_ALLOWED_FILES = (".DS_Store",)
+UNTRACKED_ALLOWED_FILES = (
+    ".DS_Store",
+    "execution_context.json",
+    "exit_only_renewal_provenance.json",
+)
 
 
 def _run(repo: Path, *args: str) -> str:
