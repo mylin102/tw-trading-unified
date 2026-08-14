@@ -85,6 +85,47 @@ def test_successful_empty_read_is_not_a_terminal_receipt():
     assert monitor.events[0][0] == "WATCHDOG_BROKER_NO_POSITION_OR_ORDER"
 
 
+def test_position_truth_reconciles_pending_receipt_to_filled_without_submit():
+    manager = OrderManager(mode="paper")
+    near = Order("TMFH6", OrderSide.SELL, OrderType.MKP, 1,
+                 order_id="ORD-NEAR", strategy="MTS_ENTRY")
+    far = Order("TMFI6", OrderSide.BUY, OrderType.MKP, 1,
+                order_id="ORD-FAR", strategy="MTS_ENTRY")
+    near.broker_order_id = "BROKER-NEAR"
+    far.broker_order_id = "BROKER-FAR"
+    manager.active_orders.update({near.order_id: near, far.order_id: far})
+
+    result = manager.reconcile_position_covered_orders([
+        {"account": "futures", "code": "TMFH6", "direction": "Sell",
+         "quantity": 1, "avg_cost": 46156},
+        {"account": "futures", "code": "TMFI6", "direction": "Buy",
+         "quantity": 1, "avg_cost": 46329},
+    ], captured_at=1786675115068)
+
+    assert {row["order_id"] for row in result["reconciled"]} == {"ORD-NEAR", "ORD-FAR"}
+    assert near.status is OrderStatus.FILLED
+    assert far.status is OrderStatus.FILLED
+    assert near.avg_fill_price == 46156
+    assert far.avg_fill_price == 46329
+    assert not manager.active_orders
+    assert {o.order_id for o in manager.completed} == {"ORD-NEAR", "ORD-FAR"}
+
+
+def test_position_truth_ambiguous_pending_receipts_stay_pending():
+    manager = OrderManager(mode="paper")
+    for order_id in ("ORD-1", "ORD-2"):
+        order = Order("TMFI6", OrderSide.BUY, OrderType.MKP, 1,
+                      order_id=order_id, strategy="MTS_ENTRY")
+        manager.active_orders[order_id] = order
+    result = manager.reconcile_position_covered_orders([
+        {"account": "futures", "code": "TMFI6", "direction": "Buy",
+         "quantity": 1, "avg_cost": 46329},
+    ])
+    assert result["reconciled"] == []
+    assert all(order.status is OrderStatus.PENDING_SUBMIT
+               for order in manager.active_orders.values())
+
+
 def test_terminal_order_is_restored_only_from_broker_truth_without_resubmit():
     manager = OrderManager(mode="paper")
     order = _order(manager)
