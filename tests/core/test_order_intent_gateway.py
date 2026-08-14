@@ -2424,6 +2424,76 @@ def test_e2e_live_entry_retains_behavior(monkeypatch):
     assert {c["strategy"] for c in monitor.api.calls} == {"MTS_ENTRY"}
 
 
+def test_live_entry_persists_decision_audit_before_intents(monkeypatch):
+    """Entry rationale must be durable before either leg is created."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_live_ctx())
+    checked = []
+
+    def _checked(event_type, **payload):
+        checked.append((event_type, payload))
+        events.append((event_type, payload))
+        return True
+
+    monitor._append_mts_event_checked = _checked
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s0_entry_audit_state.json"))
+    signal = SimpleNamespace(action="SELL_NEAR_BUY_FAR", reason="TMF_SPREAD_WIDE")
+    strat = _bound_strategy()
+    strat._has_position = False
+    strat._entry_z = 3.0
+    bar = {
+        "near_close": 46411.0, "far_close": 46566.0,
+        "spread": -155.0, "spread_z": 3.42,
+        "spread_ma": -12.0, "spread_std": 41.8,
+        "atr": 51.2, "near_close_rt": 46411.0,
+        "far_close_rt": 46566.0,
+    }
+
+    monitor._submit_mts_order_signal(signal, strat, bar,
+                                      __import__("datetime").datetime.now())
+
+    assert checked and checked[0][0] == "ENTRY_AUDIT"
+    audit = checked[0][1]
+    assert audit["spread_z"] == 3.42
+    assert audit["entry_z"] == 3.0
+    assert audit["expected_reversion"] == "SPREAD_TO_NARROW"
+    event_names = [name for name, _ in events]
+    assert event_names.index("ENTRY_AUDIT") < event_names.index("ORDER_INTENT_CREATED")
+    assert len(monitor.api.calls) == 2
+
+
+def test_live_entry_blocks_when_decision_audit_persist_fails(monkeypatch):
+    """No audit record means no order object and no broker call."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_live_ctx())
+    monitor._append_mts_event_checked = lambda *args, **kwargs: False
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
+                        lambda: Path("/tmp/test_s0_entry_audit_missing.json"))
+    signal = SimpleNamespace(action="SELL_NEAR_BUY_FAR", reason="TMF_SPREAD_WIDE")
+    strat = _bound_strategy()
+    strat._has_position = False
+
+    monitor._submit_mts_order_signal(
+        signal, strat,
+        {"near_close": 46411.0, "far_close": 46566.0,
+         "spread_z": 3.42, "atr": 51.2},
+        __import__("datetime").datetime.now())
+
+    assert monitor.api.calls == []
+    assert events == []
+
+
 def test_e2e_paper_unchanged(monkeypatch):
     from types import SimpleNamespace
     import strategies.futures.monitor as monitor_mod
