@@ -4649,11 +4649,19 @@ class FuturesMonitor:
         manager = getattr(self, "order_mgr", None)
         if manager is None or not hasattr(manager, "reconcile_broker_state"):
             return 0
-        result = manager.reconcile_broker_state(
-            filled_trades=snapshot.get("broker_trades") or [],
-            source="live_broker_reconcile",
-            reason="callback_gap_snapshot",
-        )
+        try:
+            result = manager.reconcile_broker_state(
+                filled_trades=snapshot.get("broker_trades") or [],
+                source="live_broker_reconcile",
+                reason="callback_gap_snapshot",
+            )
+        except ValueError as _fill_ve:
+            _oid = "unknown"
+            _m = re.search(r"for\s+(\S+)", str(_fill_ve))
+            if _m:
+                _oid = _m.group(1)
+            self._emit_fill_rejected(order_id=_oid, reason=str(_fill_ve))
+            result = {"reconciled": []}
         reconciled = result.get("reconciled") or []
         position_result = manager.reconcile_position_covered_orders(
             snapshot.get("positions") or [],
@@ -4664,7 +4672,81 @@ class FuturesMonitor:
         changed += len(position_result.get("reconciled") or [])
         if changed and hasattr(self, "_save_orders_file_wrapper"):
             self._save_orders_file_wrapper()
+        getattr(self, "_emit_release_eval_skip_no_local_position", lambda _snap: None)(snapshot)
         return changed
+
+
+    def _emit_release_telemetry(self, signal: str, strategy, bar_dict: dict) -> None:
+        """Emit RELEASE_CONDITION_MET when the strategy signals a release/exit.
+
+        Best-effort telemetry: the release condition was met by the strategy;
+        this fires before the submit attempt so a later gate rejection is
+        distinguishable from a silent non-evaluation.  Never affects orders.
+        """
+        try:
+            _release_signals = ("RELEASE_NEAR", "RELEASE_FAR", "EXIT",
+                                "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR")
+            if signal not in _release_signals:
+                return
+            _st = {}
+            try:
+                _st = getattr(strategy, "state", None) or {}
+            except Exception:
+                pass
+            self._append_mts_event(
+                "RELEASE_CONDITION_MET",
+                signal=signal,
+                trade_id=getattr(strategy, "trade_id", None),
+                release_stop=(_st.get("release_stop_points")
+                              if isinstance(_st, dict) else None),
+            )
+        except Exception:
+            pass
+
+    def _emit_release_eval_skip_no_local_position(self, snapshot) -> None:
+        """Emit RELEASE_EVAL_SKIP_NO_LOCAL_POSITION when broker holds TMF legs
+        but the strategy sees no local position (fills gap).  Rate-limited to
+        30s so the divergence is visible without flooding the ledger.
+        """
+        try:
+            _legs = [p for p in (snapshot.get("positions") or [])
+                     if isinstance(p, dict)
+                     and str(p.get("code") or "") in ("TMFH6", "TMFI6")
+                     and int(p.get("quantity") or 0) > 0]
+            if not _legs:
+                return
+            _ms = getattr(self, "_mts_strategy", None)
+            _nq = int(getattr(_ms, "_near_qty", 0) or 0) if _ms else 0
+            _fq = int(getattr(_ms, "_far_qty", 0) or 0) if _ms else 0
+            if _nq > 0 or _fq > 0:
+                return
+            _now = time.monotonic()
+            if _now - getattr(self, "_release_eval_skip_last_emit", 0.0) < 30.0:
+                return
+            self._release_eval_skip_last_emit = _now
+            self._append_mts_event(
+                "RELEASE_EVAL_SKIP_NO_LOCAL_POSITION",
+                broker_legs=[f"{p.get('code')}:{p.get('direction')}:{p.get('quantity')}"
+                             for p in _legs],
+                local_near_qty=_nq,
+                local_far_qty=_fq,
+            )
+        except Exception:
+            pass
+
+    def _emit_fill_rejected(self, order_id: str, reason: str) -> None:
+        """Emit FILL_REJECTED_REMAINING when a broker fill receipt is rejected
+        locally (remaining=0).  Rate-limited to 30s.
+        """
+        try:
+            _now = time.monotonic()
+            if _now - getattr(self, "_fill_rejected_last_emit", 0.0) < 30.0:
+                return
+            self._fill_rejected_last_emit = _now
+            self._append_mts_event("FILL_REJECTED_REMAINING",
+                                   order_id=order_id, reason=reason)
+        except Exception:
+            pass
 
     def _persist_current_session_canonical(self, snapshot) -> None:
         """[P0] persist the CURRENT-session canonical artifact so the
@@ -9884,6 +9966,7 @@ class FuturesMonitor:
             )
 
         if signal:
+            self._emit_release_telemetry(signal, strategy, _bar_dict)
             self._submit_mts_order_signal(signal, strategy, _bar_dict, datetime.now())
             # 💡 [Fixed 2026-05-27] Removed premature strategy._reset(). 
             # Reset now happens in _apply_confirmed_futures_deal upon fill to prevent runaway re-entry loops.
