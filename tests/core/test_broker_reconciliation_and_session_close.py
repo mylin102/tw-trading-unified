@@ -40,6 +40,31 @@ def test_broker_snapshot_terminal_trade_backfills_local_order():
     assert order in manager.get_completed()
 
 
+def test_broker_snapshot_uses_nested_order_identity():
+    """Shioaji Trade may expose the broker id as ``trade.order.id`` only."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    manager = OrderManager(mode="live")
+    order = _submitted(manager, "TMFH6", OrderSide.SELL, "BRK-NESTED")
+    raw_trade = SimpleNamespace(
+        order=SimpleNamespace(id="BRK-NESTED"),
+        code="TMFH6",
+        status=SimpleNamespace(status="Filled", price=46411.0,
+                                quantity=1, deals=[]),
+    )
+
+    normalized = FuturesMonitor._normalize_snapshot_trades([raw_trade])
+    assert normalized[0]["id"] == "BRK-NESTED"
+    result = manager.reconcile_broker_state(
+        filled_trades=normalized,
+        source="live_broker_reconcile",
+        reason="callback_gap_snapshot",
+    )
+
+    assert result["reconciled"]
+    assert order.status is OrderStatus.FILLED
+
+
 def test_session_close_finalizes_only_active_orders_and_preserves_fills():
     manager = OrderManager(mode="live")
     pending = _submitted(manager, "TMFI6", OrderSide.BUY, "BRK-PENDING")
