@@ -7686,6 +7686,8 @@ class FuturesMonitor:
                 "action": _action,
                 "reason": _reason,
                 "trade_id": _trade_id,
+                "near_contract": _near_code,
+                "far_contract": _far_code,
                 "near_side": "SHORT" if _action == "SELL_NEAR_BUY_FAR" else "LONG",
                 "far_side": "LONG" if _action == "SELL_NEAR_BUY_FAR" else "SHORT",
                 "near_price": _near_close,
@@ -7721,6 +7723,25 @@ class FuturesMonitor:
                     "[/bold red]"
                 )
                 return
+
+            # Research-only shadow write.  It is intentionally after the
+            # durable audit and has no authority over the order path: a
+            # missing/locked database must never reject or delay an entry.
+            try:
+                from core.entry_research_store import record_entry_observation
+                _ctx_for_research = getattr(self, "_execution_context", None)
+                record_entry_observation(
+                    _entry_audit,
+                    mode="live" if self.live_trading else "paper",
+                    session_id=getattr(_ctx_for_research, "session_id", None),
+                    config_hash=getattr(_ctx_for_research, "config_hash", None),
+                    release_sha=os.environ.get("LRC_RELEASE_SHA"),
+                    run_id=getattr(self, "run_id", None),
+                    source=("live_strategy" if self.live_trading
+                            else "paper_strategy"),
+                )
+            except Exception:
+                pass
 
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting ENTRY orders (MKP Range Market): NEAR={_near_side}, FAR={_far_side}[/yellow]")
             

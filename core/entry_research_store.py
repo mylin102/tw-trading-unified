@@ -139,7 +139,7 @@ def record_entry_observation(
                     estimated_total_cost, expected_net_edge, candidate_direction,
                     decision, rejection_reason, actual_fill_prices_json, mfe,
                     mae, final_net_pnl, payload_json, created_at_ms
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     event_id, SCHEMA_VERSION, event_time, mode, session_id,
                     config_hash, release_sha, run_id, source,
@@ -183,4 +183,3 @@ def record_entry_observation(
     except Exception:
         # Shadow research must never block, reject, or alter an order.
         return False
-
