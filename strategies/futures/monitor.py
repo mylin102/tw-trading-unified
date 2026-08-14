@@ -9598,11 +9598,15 @@ class FuturesMonitor:
 
         # LIVE broker truth is authoritative.  Never resurrect a local
         # position from historical fills in live mode — the recovery path is
-        # PAPER-only.  Gated on live_trading ALONE: at startup the execution
-        # context's effective_mode is not yet "live_ready" (the certificate
-        # transition happens later), so an effective_mode-keyed gate let the
-        # fills-led recovery resurrect a ghost (reason=fills_recovery).
-        _live_authority_runtime = bool(getattr(self, "live_trading", False))
+        # PAPER-only.  Gate on the execution context's requested_mode (the
+        # live INTENT, set at ctx creation): the config's live_trading key is
+        # absent in futures_live.yaml (monitor defaults to False), and
+        # effective_mode is not yet "live_ready" at startup (the certificate
+        # transition happens later) — either signal alone let the fills-led
+        # recovery resurrect a ghost (reason=fills_recovery observed).
+        _live_authority_runtime = bool(
+            getattr(getattr(self, "_execution_context", None),
+                    "requested_mode", "") == "live")
         if _fills_open and not _state_has_pos and not _live_authority_runtime:
             # Split-brain: fills says open, state says closed.
             # Try fills-led recovery via strategy's _restore_from_fills_log
