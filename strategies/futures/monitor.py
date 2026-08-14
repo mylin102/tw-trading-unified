@@ -9589,7 +9589,14 @@ class FuturesMonitor:
                         "exit_only_capability", None), dict)
         )
 
-        if _fills_open and not _state_has_pos:
+        # LIVE broker truth is authoritative.  Do not resurrect a local
+        # position from historical fills before _refresh_live_broker_authority
+        # has queried the current account; that recovery path is PAPER-only.
+        _live_authority_runtime = bool(
+            getattr(self, "live_trading", False)
+            and getattr(getattr(self, "_execution_context", None),
+                        "effective_mode", "") == "live_ready")
+        if _fills_open and not _state_has_pos and not _live_authority_runtime:
             # Split-brain: fills says open, state says closed.
             # Try fills-led recovery via strategy's _restore_from_fills_log
             console.print(
