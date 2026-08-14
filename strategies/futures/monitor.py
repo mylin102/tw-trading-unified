@@ -3184,12 +3184,12 @@ class FuturesMonitor:
             return {"source": "unavailable", "capture_error": True}
         try:
             try:
-                _pos_rows = _api.list_positions(_acct)
+                _pos_rows = _api.list_positions(account=_acct)
             except TypeError:
                 # same SDK signature quirk the preflight guards against
                 _pos_rows = _api.list_positions()
             try:
-                _trades_rows = _api.list_trades(_acct)
+                _trades_rows = _api.list_trades(account=_acct)
             except TypeError:
                 _trades_rows = _api.list_trades()
             for _p in (_pos_rows or []):
@@ -4545,7 +4545,7 @@ class FuturesMonitor:
                     if _acct is None:
                         continue
                     try:
-                        _rows = _api.list_positions(_acct)
+                        _rows = _api.list_positions(account=_acct)
                     except Exception as exc:
                         errors[f"positions:{_tag}"] = \
                             f"{type(exc).__name__}: {exc}"
@@ -4566,7 +4566,7 @@ class FuturesMonitor:
                         try:
                             _rows = _api.list_trades() or []
                         except TypeError:
-                            _rows = _api.list_trades(_acct) or []
+                            _rows = _api.list_trades(account=_acct) or []
                     except Exception as exc:
                         errors[f"open_orders:{_tag}"] = \
                             f"{type(exc).__name__}: {exc}"
