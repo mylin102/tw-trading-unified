@@ -12,6 +12,7 @@ import math
 import yaml
 import traceback
 import uuid
+import contextlib
 from pathlib import Path
 from collections import deque
 from strategies.futures.mts_ledger_authority import (
@@ -21,8 +22,6 @@ from strategies.futures.mts_ledger_authority import (
     gate_decision_post_signal,
     gate_decision_pre_signal,
 )
-import contextlib
-import datetime
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
@@ -7704,419 +7703,6 @@ class FuturesMonitor:
             self._append_mts_event("ORDER_INTENT_BLOCKED", **_block_ev)
             return
 
-    def _leg_lock_path(self) -> str:
-        _p = getattr(self, "_leg_lock_store", "")
-        if _p:
-            return _p
-        try:
-            from core.runtime_paths import runtime_path
-            return runtime_path("exports", "trades", "live", "diagnostics",
-                                "mts_leg_locks.json")
-        except Exception:
-            return "/tmp/mts_leg_locks.json"
-
-    def _leg_lock_id(self, key: dict) -> str:
-        return "|".join(str(key.get(k)) for k in (
-            "trade_id", "session_generation", "contract",
-            "closing_side", "qty"))
-
-    def _leg_lock_save(self, locks: dict) -> None:
-        """Atomic replace under the stable .lock flock (single-writer)."""
-        try:
-            with self._leg_lock_flock(exclusive=True):
-                self._leg_lock_write(locks)
-        except Exception:
-            pass
-
-    def _leg_lock_load(self) -> dict:
-        try:
-            with self._leg_lock_flock(exclusive=False):
-                return self._leg_lock_read()
-        except Exception:
-            return {}  # corrupted file -> fail-safe: no locks assumed
-
-    def _leg_lock_flock_path(self) -> str:
-        """Stable flock target — NEVER replaced, so the lock survives the
-        JSON's atomic os.replace (inode race fix)."""
-        return self._leg_lock_path() + ".lock"
-
-    @contextlib.contextmanager
-    def _leg_lock_flock(self, exclusive: bool = True):
-        import fcntl
-        _p = self._leg_lock_flock_path()
-        _d = os.path.dirname(_p)
-        if _d:
-            os.makedirs(_d, exist_ok=True)
-        _f = open(_p, "a+", encoding="utf-8")
-        try:
-            fcntl.flock(_f, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-            yield _f
-        finally:
-            try:
-                fcntl.flock(_f, fcntl.LOCK_UN)
-            except Exception:
-                pass
-            _f.close()
-
-    def _leg_lock_read(self) -> dict:
-        """Direct JSON read — callers hold the .lock flock."""
-        try:
-            import json as _json
-            _p = self._leg_lock_path()
-            if not os.path.exists(_p):
-                return {}
-            with open(_p, encoding="utf-8") as _f:
-                return _json.load(_f) or {}
-        except Exception:
-            return {}
-
-    def _leg_lock_write(self, locks: dict) -> None:
-        """Atomic replace — callers hold the .lock flock."""
-        _p = self._leg_lock_path()
-        _d = os.path.dirname(_p)
-        if _d:
-            os.makedirs(_d, exist_ok=True)
-        import json as _json
-        _tmp = _p + ".tmp"
-        with open(_tmp, "w", encoding="utf-8") as _f:
-            _json.dump(locks, _f, default=str)
-            _f.flush()
-            os.fsync(_f.fileno())
-        os.replace(_tmp, _p)
-
-    def _leg_lock_rebind(self, locks: dict, key: dict) -> dict | None:
-        """Rebind a lock to the new session after a restart.
-
-        Broker identity (broker_order_id + seqno) is authoritative and
-        unique.  The generic 4-field match (trade_id + contract +
-        closing_side + qty) is allowed ONLY when it resolves to exactly one
-        candidate; multiple candidates -> fail-closed QUARANTINE
-        (LEG_LOCK_REBIND_AMBIGUOUS) — never a silent pass/resend."""
-        _bid = str(key.get("broker_order_id") or "")
-        if _bid:
-            _seq = str(key.get("seqno") or "")
-            for _lock in locks.values():
-                if (str(_lock.get("broker_order_id") or "") == _bid
-                        and (not _seq or str(_lock.get("seqno") or "") == _seq)):
-                    _lock["session_generation"] = key.get("session_generation")
-                    self._leg_lock_save(locks)
-                    return _lock
-            return None
-        _cands = [v for v in locks.values()
-                  if (str(v.get("trade_id") or "") == str(key.get("trade_id") or "")
-                      and str(v.get("contract") or "") == str(key.get("contract") or "")
-                      and str(v.get("closing_side") or "") == str(key.get("closing_side") or "")
-                      and int(v.get("qty") or 0) == int(key.get("qty") or 0))]
-        if len(_cands) == 1:
-            _cands[0]["session_generation"] = key.get("session_generation")
-            self._leg_lock_save(locks)
-            return _cands[0]
-        if len(_cands) > 1:
-            self._append_mts_event(
-                "LEG_LOCK_REBIND_AMBIGUOUS",
-                reason="LEG_LOCK_REBIND_AMBIGUOUS",
-                trade_id=key.get("trade_id"),
-                contract=key.get("contract"))
-            return _cands[0]  # fail-closed: still block submissions
-        return None
-
-    def _leg_lock_acquire(self, key: dict,
-                          status: str = "PENDING_UNCONFIRMED") -> bool:
-        """Persist a leg lock BEFORE submission.  Key:
-        trade_id + session_generation + contract + closing_side + qty.
-        status: PENDING_UNCONFIRMED (receipt, never released early) or
-        SUBMIT_FAILED (released after failure handling).
-
-        The whole read-modify-write runs under ONE exclusive flock on the
-        lock file so concurrent processes/threads cannot lose a lock."""
-        try:
-            import json as _json
-            import fcntl
-            _p = self._leg_lock_path()
-            _d = os.path.dirname(_p)
-            if _d:
-                os.makedirs(_d, exist_ok=True)
-            with self._leg_lock_flock(exclusive=True):
-                _locks = self._leg_lock_read()
-                _locks[self._leg_lock_id(key)] = {
-                    "trade_id": key.get("trade_id"),
-                    "session_generation": key.get("session_generation"),
-                    "contract": key.get("contract"),
-                    "closing_side": key.get("closing_side"),
-                    "qty": key.get("qty"),
-                    "broker_order_id": key.get("broker_order_id") or "",
-                    "seqno": key.get("seqno") or "",
-                    "status": status,
-                    "terminal": "",
-                    "locked_at": datetime.now().isoformat(),
-                }
-                self._leg_lock_write(_locks)
-            return True
-        except Exception:
-            return False
-
-    def _leg_lock_acquire_pair(self, near_key: dict, far_key: dict) -> bool:
-        """③ combined all-or-none: acquire BOTH leg locks atomically.
-
-        - Both legs free -> lock both, return True.
-        - Either leg already holds a non-terminal lock -> acquire nothing
-          (no partial pair), record LEG_LOCK_PAIR_PARTIAL quarantine /
-          reconcile intent, return False.  The other leg is never left
-          locked, and neither leg is ever submitted."""
-        try:
-            _near_id = self._leg_lock_id(near_key)
-            _far_id = self._leg_lock_id(far_key)
-            _terminal = ("FILLED", "CANCELLED", "REJECTED", "CANCELED")
-            with self._leg_lock_flock(exclusive=True):
-                _locks = self._leg_lock_read()
-                _conflicts = []
-                for _kid, _k in ((_near_id, near_key), (_far_id, far_key)):
-                    _existing = _locks.get(_kid)
-                    if (_existing and str(_existing.get("status", "")).upper()
-                            not in _terminal):
-                        _conflicts.append(_k.get("contract"))
-                if _conflicts:
-                    self._append_mts_event(
-                        "LEG_LOCK_PAIR_PARTIAL",
-                        reason="LEG_LOCK_PAIR_PARTIAL",
-                        trade_id=near_key.get("trade_id"),
-                        contract=",".join(_conflicts))
-                    return False
-                _now = datetime.now().isoformat()
-                for _kid, _k in ((_near_id, near_key), (_far_id, far_key)):
-                    _locks[_kid] = {
-                        "trade_id": _k.get("trade_id"),
-                        "session_generation": _k.get("session_generation"),
-                        "contract": _k.get("contract"),
-                        "closing_side": _k.get("closing_side"),
-                        "qty": _k.get("qty"),
-                        "broker_order_id": _k.get("broker_order_id") or "",
-                        "seqno": _k.get("seqno") or "",
-                        "status": "PENDING_UNCONFIRMED",
-                        "terminal": "",
-                        "locked_at": _now,
-                    }
-                self._leg_lock_write(_locks)
-                return True
-        except Exception:
-            try:
-                self._append_mts_event(
-                    "LEG_LOCK_PAIR_PARTIAL",
-                    reason="LEG_LOCK_PAIR_PARTIAL",
-                    trade_id=near_key.get("trade_id"))
-            except Exception:
-                pass
-            return False
-
-    def _leg_lock_mark_terminal(self, key: dict, status: str) -> None:
-        """Mark a lock terminal (FILLED/CANCELLED/REJECTED) then release —
-        only explicit broker terminal evidence may do this."""
-        try:
-            with self._leg_lock_flock(exclusive=True):
-                _locks = self._leg_lock_read()
-                _lid = self._leg_lock_id(key)
-                if _lid in _locks:
-                    _locks[_lid]["status"] = status
-                    _locks[_lid]["terminal"] = status
-                    self._leg_lock_write(_locks)
-        except Exception:
-            pass
-        self._leg_lock_release(key)
-
-    def _leg_lock_apply_broker_deal(self, key: dict, filled_qty) -> bool:
-        """④ broker deal evidence: ONLY a full fill (filled_qty >= qty) is
-        terminal.  A partial fill retains the lock and records the
-        reconcile intent — release/resend stay forbidden."""
-        try:
-            _qty = int(key.get("qty") or 0)
-            try:
-                _filled = float(filled_qty)
-            except (TypeError, ValueError):
-                _filled = 0.0
-            if _qty > 0 and _filled >= _qty:
-                self._leg_lock_mark_terminal(key, "FILLED")
-                return True
-            self._append_mts_event(
-                "LEG_LOCK_PARTIAL_FILL",
-                reason="LEG_LOCK_PARTIAL_FILL",
-                contract=key.get("contract"),
-                trade_id=key.get("trade_id"),
-                filled_qty=_filled, qty=_qty)
-            return False
-        except Exception:
-            return False
-
-    def _leg_lock_apply_broker_query(self, key: dict, trades) -> bool:
-        """④ reconciliation query evidence: an empty result or a query
-        exception must NOT release the lock (no terminal proof) — only an
-        explicit full-fill deal in the queried trades releases."""
-        try:
-            if trades is None:
-                self._append_mts_event(
-                    "LEG_LOCK_QUERY_FAILED",
-                    reason="LEG_LOCK_QUERY_FAILED",
-                    contract=key.get("contract"),
-                    trade_id=key.get("trade_id"))
-                return False
-            _qty = int(key.get("qty") or 0)
-            _bid = str(key.get("broker_order_id") or "")
-            for _t in trades:
-                _id = str(getattr(_t, "order_id", "") or "")
-                _status = ""
-                _st = getattr(_t, "status", None)
-                if _st is not None:
-                    _status = str(getattr(_st, "status", _st))
-                _filled = float(getattr(_t, "fill_qty", 0) or 0)
-                if ((not _bid or _id == _bid)
-                        and _status.upper() == "FILLED"
-                        and _qty > 0 and _filled >= _qty):
-                    self._leg_lock_mark_terminal(key, "FILLED")
-                    return True
-            self._append_mts_event(
-                "LEG_LOCK_QUERY_NO_TERMINAL",
-                reason="LEG_LOCK_QUERY_NO_TERMINAL",
-                contract=key.get("contract"),
-                trade_id=key.get("trade_id"))
-            return False
-        except Exception:
-            return False
-
-    def _reconcile_intent_path(self) -> str:
-        _p = getattr(self, "_reconcile_intent_store", "")
-        if _p:
-            return _p
-        try:
-            from core.runtime_paths import runtime_path
-            return runtime_path("exports", "trades", "live", "diagnostics",
-                                "mts_reconcile_intents.json")
-        except Exception:
-            return "/tmp/mts_reconcile_intents.json"
-
-    def _mts_partial_submission_quarantine(self, near_key: dict,
-                                           far_key: dict) -> None:
-        """Partial-submission quarantine: the first leg's receipt landed
-        but the second leg's submit FAILED.  Record a DURABLE reconcile
-        intent (restored after restart).  No retry, no cancel, no
-        compensating order — the pair is not complete."""
-        try:
-            import json as _json
-            _p = self._reconcile_intent_path()
-            _intents = {}
-            if os.path.exists(_p):
-                with open(_p, encoding="utf-8") as _f:
-                    _intents = _json.load(_f) or {}
-            _intents[self._leg_lock_id(near_key)] = {
-                "reason": "PARTIAL_SUBMISSION_QUARANTINE",
-                "near": near_key, "far": far_key,
-                "ts": datetime.now().isoformat(),
-            }
-            _d = os.path.dirname(_p)
-            if _d:
-                os.makedirs(_d, exist_ok=True)
-            with open(_p, "w", encoding="utf-8") as _f:
-                _json.dump(_intents, _f, default=str)
-            self._append_mts_event(
-                "PARTIAL_SUBMISSION_QUARANTINE",
-                reason="PARTIAL_SUBMISSION_QUARANTINE",
-                contract=near_key.get("contract"),
-                trade_id=near_key.get("trade_id"))
-        except Exception:
-            pass
-
-    def _reconcile_intent_exists(self, key: dict) -> bool:
-        try:
-            import json as _json
-            _p = self._reconcile_intent_path()
-            if not os.path.exists(_p):
-                return False
-            with open(_p, encoding="utf-8") as _f:
-                _intents = _json.load(_f) or {}
-            return self._leg_lock_id(key) in _intents
-        except Exception:
-            return False
-
-    def _submit_release_pair(self, near_key: dict, far_key: dict,
-                             near_submit_ok: bool = True,
-                             far_submit_ok: bool = True) -> str:
-        """Release pair submission with partial-submission protection.
-
-        Acquires both leg locks (all-or-none), submits the near leg, then
-        the far leg.  If the FAR submit fails after the NEAR receipt, the
-        pair enters MTS_ENTRY_RECONCILE / partial-submission quarantine:
-        the near lock is retained, no retry/cancel/compensating order, and
-        a durable reconcile intent is recorded."""
-        try:
-            if not self._leg_lock_acquire_pair(near_key, far_key):
-                return "PAIR_LOCK_BLOCKED"
-            if near_submit_ok:
-                self._append_mts_event(
-                    "ORDER_SUBMITTED", event="ORDER_SUBMITTED",
-                    contract=near_key.get("contract"),
-                    trade_id=near_key.get("trade_id"),
-                    leg_role="RELEASED", exit_stage="FIRST_LEG_RELEASE")
-            else:
-                self._leg_lock_release(near_key)
-                return "NEAR_SUBMIT_FAILED"
-            if not far_submit_ok:
-                self._mts_partial_submission_quarantine(near_key, far_key)
-                return "MTS_ENTRY_RECONCILE"
-            self._append_mts_event(
-                "ORDER_SUBMITTED", event="ORDER_SUBMITTED",
-                contract=far_key.get("contract"),
-                trade_id=far_key.get("trade_id"),
-                leg_role="RELEASED", exit_stage="SECOND_LEG_RELEASE")
-            return "OK"
-        except Exception:
-            return "SUBMIT_ERROR"
-
-    def _leg_lock_release(self, key: dict,
-                          only_statuses=("FILLED", "CANCELLED", "REJECTED",
-                                         "CANCELED", "SUBMIT_FAILED")) -> None:
-        """Release a leg lock ONLY on terminal states or SUBMIT_FAILED.
-        PENDING_UNCONFIRMED is never released early (no resend)."""
-        try:
-            _locks = self._leg_lock_load()
-            _lid = self._leg_lock_id(key)
-            _lock = _locks.get(_lid)
-            if _lock is None:
-                return
-            _st = str(_lock.get("status", "")).upper()
-            if _st in tuple(s.upper() for s in only_statuses):
-                _locks.pop(_lid, None)
-                self._leg_lock_save(_locks)
-        except Exception:
-            pass
-
-    def _leg_lock_check(self, key: dict) -> bool:
-        """True when a non-terminal lock exists for this leg — a second
-        signal must NOT resubmit (zero submissions)."""
-        try:
-            import json as _json
-            _p = self._leg_lock_path()
-            if not os.path.exists(_p):
-                return False
-            with open(_p, encoding="utf-8") as _f:
-                _locks = _json.load(_f)
-            _lock = _locks.get(self._leg_lock_id(key))
-            if _lock is None:
-                # restart rebinding: session_generation changed after a
-                # restart — match by broker identity components
-                # (trade_id + contract + closing_side + qty) and rebind.
-                _lock = self._leg_lock_rebind(_locks, key)
-            if _lock is None:
-                return False
-            if str(_lock.get("status", "")).upper() in (
-                    "FILLED", "CANCELLED", "REJECTED", "CANCELED"):
-                return False
-            self._append_mts_event(
-                "ORDER_BLOCKED_PENDING_EXISTS",
-                reason="ORDER_BLOCKED_PENDING_EXISTS",
-                contract=key.get("contract"),
-                trade_id=key.get("trade_id"))
-            return True
-        except Exception:
-            return False
-
         if _action == "PARTIAL_EXIT":
             # 2026-06-17 Hermes Agent: use signal reason, not strategy._released_leg (still None before sync_release)
             _is_release_near = _reason and "RELEASE_NEAR" in str(_reason).upper()
@@ -8715,6 +8301,421 @@ class FuturesMonitor:
         else:
             console.print(f"[red]⚠️ [MTS_ORDER] Unknown signal action: {_action}[/red]")
             return
+
+
+
+    def _leg_lock_path(self) -> str:
+        _p = getattr(self, "_leg_lock_store", "")
+        if _p:
+            return _p
+        try:
+            from core.runtime_paths import runtime_path
+            return runtime_path("exports", "trades", "live", "diagnostics",
+                                "mts_leg_locks.json")
+        except Exception:
+            return "/tmp/mts_leg_locks.json"
+
+    def _leg_lock_id(self, key: dict) -> str:
+        return "|".join(str(key.get(k)) for k in (
+            "trade_id", "session_generation", "contract",
+            "closing_side", "qty"))
+
+    def _leg_lock_save(self, locks: dict) -> None:
+        """Atomic replace under the stable .lock flock (single-writer)."""
+        try:
+            with self._leg_lock_flock(exclusive=True):
+                self._leg_lock_write(locks)
+        except Exception:
+            pass
+
+    def _leg_lock_load(self) -> dict:
+        try:
+            with self._leg_lock_flock(exclusive=False):
+                return self._leg_lock_read()
+        except Exception:
+            return {}  # corrupted file -> fail-safe: no locks assumed
+
+    def _leg_lock_flock_path(self) -> str:
+        """Stable flock target — NEVER replaced, so the lock survives the
+        JSON's atomic os.replace (inode race fix)."""
+        return self._leg_lock_path() + ".lock"
+
+    @contextlib.contextmanager
+    def _leg_lock_flock(self, exclusive: bool = True):
+        import fcntl
+        _p = self._leg_lock_flock_path()
+        _d = os.path.dirname(_p)
+        if _d:
+            os.makedirs(_d, exist_ok=True)
+        _f = open(_p, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(_f, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            yield _f
+        finally:
+            try:
+                fcntl.flock(_f, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            _f.close()
+
+    def _leg_lock_read(self) -> dict:
+        """Direct JSON read — callers hold the .lock flock."""
+        try:
+            import json as _json
+            _p = self._leg_lock_path()
+            if not os.path.exists(_p):
+                return {}
+            with open(_p, encoding="utf-8") as _f:
+                return _json.load(_f) or {}
+        except Exception:
+            return {}
+
+    def _leg_lock_write(self, locks: dict) -> None:
+        """Atomic replace — callers hold the .lock flock."""
+        _p = self._leg_lock_path()
+        _d = os.path.dirname(_p)
+        if _d:
+            os.makedirs(_d, exist_ok=True)
+        import json as _json
+        _tmp = _p + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            _json.dump(locks, _f, default=str)
+            _f.flush()
+            os.fsync(_f.fileno())
+        os.replace(_tmp, _p)
+
+    def _leg_lock_rebind(self, locks: dict, key: dict) -> dict | None:
+        """Rebind a lock to the new session after a restart.
+
+        Broker identity (broker_order_id + seqno) is authoritative and
+        unique.  The generic 4-field match (trade_id + contract +
+        closing_side + qty) is allowed ONLY when it resolves to exactly one
+        candidate; multiple candidates -> fail-closed QUARANTINE
+        (LEG_LOCK_REBIND_AMBIGUOUS) — never a silent pass/resend."""
+        _bid = str(key.get("broker_order_id") or "")
+        if _bid:
+            _seq = str(key.get("seqno") or "")
+            for _lock in locks.values():
+                if (str(_lock.get("broker_order_id") or "") == _bid
+                        and (not _seq or str(_lock.get("seqno") or "") == _seq)):
+                    _lock["session_generation"] = key.get("session_generation")
+                    self._leg_lock_save(locks)
+                    return _lock
+            return None
+        _cands = [v for v in locks.values()
+                  if (str(v.get("trade_id") or "") == str(key.get("trade_id") or "")
+                      and str(v.get("contract") or "") == str(key.get("contract") or "")
+                      and str(v.get("closing_side") or "") == str(key.get("closing_side") or "")
+                      and int(v.get("qty") or 0) == int(key.get("qty") or 0))]
+        if len(_cands) == 1:
+            _cands[0]["session_generation"] = key.get("session_generation")
+            self._leg_lock_save(locks)
+            return _cands[0]
+        if len(_cands) > 1:
+            self._append_mts_event(
+                "LEG_LOCK_REBIND_AMBIGUOUS",
+                reason="LEG_LOCK_REBIND_AMBIGUOUS",
+                trade_id=key.get("trade_id"),
+                contract=key.get("contract"))
+            return _cands[0]  # fail-closed: still block submissions
+        return None
+
+    def _leg_lock_acquire(self, key: dict,
+                          status: str = "PENDING_UNCONFIRMED") -> bool:
+        """Persist a leg lock BEFORE submission.  Key:
+        trade_id + session_generation + contract + closing_side + qty.
+        status: PENDING_UNCONFIRMED (receipt, never released early) or
+        SUBMIT_FAILED (released after failure handling).
+
+        The whole read-modify-write runs under ONE exclusive flock on the
+        lock file so concurrent processes/threads cannot lose a lock."""
+        try:
+            import json as _json
+            import fcntl
+            _p = self._leg_lock_path()
+            _d = os.path.dirname(_p)
+            if _d:
+                os.makedirs(_d, exist_ok=True)
+            with self._leg_lock_flock(exclusive=True):
+                _locks = self._leg_lock_read()
+                _locks[self._leg_lock_id(key)] = {
+                    "trade_id": key.get("trade_id"),
+                    "session_generation": key.get("session_generation"),
+                    "contract": key.get("contract"),
+                    "closing_side": key.get("closing_side"),
+                    "qty": key.get("qty"),
+                    "broker_order_id": key.get("broker_order_id") or "",
+                    "seqno": key.get("seqno") or "",
+                    "status": status,
+                    "terminal": "",
+                    "locked_at": datetime.now().isoformat(),
+                }
+                self._leg_lock_write(_locks)
+            return True
+        except Exception:
+            return False
+
+    def _leg_lock_acquire_pair(self, near_key: dict, far_key: dict) -> bool:
+        """③ combined all-or-none: acquire BOTH leg locks atomically.
+
+        - Both legs free -> lock both, return True.
+        - Either leg already holds a non-terminal lock -> acquire nothing
+          (no partial pair), record LEG_LOCK_PAIR_PARTIAL quarantine /
+          reconcile intent, return False.  The other leg is never left
+          locked, and neither leg is ever submitted."""
+        try:
+            _near_id = self._leg_lock_id(near_key)
+            _far_id = self._leg_lock_id(far_key)
+            _terminal = ("FILLED", "CANCELLED", "REJECTED", "CANCELED")
+            with self._leg_lock_flock(exclusive=True):
+                _locks = self._leg_lock_read()
+                _conflicts = []
+                for _kid, _k in ((_near_id, near_key), (_far_id, far_key)):
+                    _existing = _locks.get(_kid)
+                    if (_existing and str(_existing.get("status", "")).upper()
+                            not in _terminal):
+                        _conflicts.append(_k.get("contract"))
+                if _conflicts:
+                    self._append_mts_event(
+                        "LEG_LOCK_PAIR_PARTIAL",
+                        reason="LEG_LOCK_PAIR_PARTIAL",
+                        trade_id=near_key.get("trade_id"),
+                        contract=",".join(_conflicts))
+                    return False
+                _now = datetime.now().isoformat()
+                for _kid, _k in ((_near_id, near_key), (_far_id, far_key)):
+                    _locks[_kid] = {
+                        "trade_id": _k.get("trade_id"),
+                        "session_generation": _k.get("session_generation"),
+                        "contract": _k.get("contract"),
+                        "closing_side": _k.get("closing_side"),
+                        "qty": _k.get("qty"),
+                        "broker_order_id": _k.get("broker_order_id") or "",
+                        "seqno": _k.get("seqno") or "",
+                        "status": "PENDING_UNCONFIRMED",
+                        "terminal": "",
+                        "locked_at": _now,
+                    }
+                self._leg_lock_write(_locks)
+                return True
+        except Exception:
+            try:
+                self._append_mts_event(
+                    "LEG_LOCK_PAIR_PARTIAL",
+                    reason="LEG_LOCK_PAIR_PARTIAL",
+                    trade_id=near_key.get("trade_id"))
+            except Exception:
+                pass
+            return False
+
+    def _leg_lock_mark_terminal(self, key: dict, status: str) -> None:
+        """Mark a lock terminal (FILLED/CANCELLED/REJECTED) then release —
+        only explicit broker terminal evidence may do this."""
+        try:
+            with self._leg_lock_flock(exclusive=True):
+                _locks = self._leg_lock_read()
+                _lid = self._leg_lock_id(key)
+                if _lid in _locks:
+                    _locks[_lid]["status"] = status
+                    _locks[_lid]["terminal"] = status
+                    self._leg_lock_write(_locks)
+        except Exception:
+            pass
+        self._leg_lock_release(key)
+
+    def _leg_lock_apply_broker_deal(self, key: dict, filled_qty) -> bool:
+        """④ broker deal evidence: ONLY a full fill (filled_qty >= qty) is
+        terminal.  A partial fill retains the lock and records the
+        reconcile intent — release/resend stay forbidden."""
+        try:
+            _qty = int(key.get("qty") or 0)
+            try:
+                _filled = float(filled_qty)
+            except (TypeError, ValueError):
+                _filled = 0.0
+            if _qty > 0 and _filled >= _qty:
+                self._leg_lock_mark_terminal(key, "FILLED")
+                return True
+            self._append_mts_event(
+                "LEG_LOCK_PARTIAL_FILL",
+                reason="LEG_LOCK_PARTIAL_FILL",
+                contract=key.get("contract"),
+                trade_id=key.get("trade_id"),
+                filled_qty=_filled, qty=_qty)
+            return False
+        except Exception:
+            return False
+
+    def _leg_lock_apply_broker_query(self, key: dict, trades) -> bool:
+        """④ reconciliation query evidence: an empty result or a query
+        exception must NOT release the lock (no terminal proof) — only an
+        explicit full-fill deal in the queried trades releases."""
+        try:
+            if trades is None:
+                self._append_mts_event(
+                    "LEG_LOCK_QUERY_FAILED",
+                    reason="LEG_LOCK_QUERY_FAILED",
+                    contract=key.get("contract"),
+                    trade_id=key.get("trade_id"))
+                return False
+            _qty = int(key.get("qty") or 0)
+            _bid = str(key.get("broker_order_id") or "")
+            for _t in trades:
+                _id = str(getattr(_t, "order_id", "") or "")
+                _status = ""
+                _st = getattr(_t, "status", None)
+                if _st is not None:
+                    _status = str(getattr(_st, "status", _st))
+                _filled = float(getattr(_t, "fill_qty", 0) or 0)
+                if ((not _bid or _id == _bid)
+                        and _status.upper() == "FILLED"
+                        and _qty > 0 and _filled >= _qty):
+                    self._leg_lock_mark_terminal(key, "FILLED")
+                    return True
+            self._append_mts_event(
+                "LEG_LOCK_QUERY_NO_TERMINAL",
+                reason="LEG_LOCK_QUERY_NO_TERMINAL",
+                contract=key.get("contract"),
+                trade_id=key.get("trade_id"))
+            return False
+        except Exception:
+            return False
+
+    def _reconcile_intent_path(self) -> str:
+        _p = getattr(self, "_reconcile_intent_store", "")
+        if _p:
+            return _p
+        try:
+            from core.runtime_paths import runtime_path
+            return runtime_path("exports", "trades", "live", "diagnostics",
+                                "mts_reconcile_intents.json")
+        except Exception:
+            return "/tmp/mts_reconcile_intents.json"
+
+    def _mts_partial_submission_quarantine(self, near_key: dict,
+                                           far_key: dict) -> None:
+        """Partial-submission quarantine: the first leg's receipt landed
+        but the second leg's submit FAILED.  Record a DURABLE reconcile
+        intent (restored after restart).  No retry, no cancel, no
+        compensating order — the pair is not complete."""
+        try:
+            import json as _json
+            _p = self._reconcile_intent_path()
+            _intents = {}
+            if os.path.exists(_p):
+                with open(_p, encoding="utf-8") as _f:
+                    _intents = _json.load(_f) or {}
+            _intents[self._leg_lock_id(near_key)] = {
+                "reason": "PARTIAL_SUBMISSION_QUARANTINE",
+                "near": near_key, "far": far_key,
+                "ts": datetime.now().isoformat(),
+            }
+            _d = os.path.dirname(_p)
+            if _d:
+                os.makedirs(_d, exist_ok=True)
+            with open(_p, "w", encoding="utf-8") as _f:
+                _json.dump(_intents, _f, default=str)
+            self._append_mts_event(
+                "PARTIAL_SUBMISSION_QUARANTINE",
+                reason="PARTIAL_SUBMISSION_QUARANTINE",
+                contract=near_key.get("contract"),
+                trade_id=near_key.get("trade_id"))
+        except Exception:
+            pass
+
+    def _reconcile_intent_exists(self, key: dict) -> bool:
+        try:
+            import json as _json
+            _p = self._reconcile_intent_path()
+            if not os.path.exists(_p):
+                return False
+            with open(_p, encoding="utf-8") as _f:
+                _intents = _json.load(_f) or {}
+            return self._leg_lock_id(key) in _intents
+        except Exception:
+            return False
+
+    def _submit_release_pair(self, near_key: dict, far_key: dict,
+                             near_submit_ok: bool = True,
+                             far_submit_ok: bool = True) -> str:
+        """Release pair submission with partial-submission protection.
+
+        Acquires both leg locks (all-or-none), submits the near leg, then
+        the far leg.  If the FAR submit fails after the NEAR receipt, the
+        pair enters MTS_ENTRY_RECONCILE / partial-submission quarantine:
+        the near lock is retained, no retry/cancel/compensating order, and
+        a durable reconcile intent is recorded."""
+        try:
+            if not self._leg_lock_acquire_pair(near_key, far_key):
+                return "PAIR_LOCK_BLOCKED"
+            if near_submit_ok:
+                self._append_mts_event(
+                    "ORDER_SUBMITTED", event="ORDER_SUBMITTED",
+                    contract=near_key.get("contract"),
+                    trade_id=near_key.get("trade_id"),
+                    leg_role="RELEASED", exit_stage="FIRST_LEG_RELEASE")
+            else:
+                self._leg_lock_release(near_key)
+                return "NEAR_SUBMIT_FAILED"
+            if not far_submit_ok:
+                self._mts_partial_submission_quarantine(near_key, far_key)
+                return "MTS_ENTRY_RECONCILE"
+            self._append_mts_event(
+                "ORDER_SUBMITTED", event="ORDER_SUBMITTED",
+                contract=far_key.get("contract"),
+                trade_id=far_key.get("trade_id"),
+                leg_role="RELEASED", exit_stage="SECOND_LEG_RELEASE")
+            return "OK"
+        except Exception:
+            return "SUBMIT_ERROR"
+
+    def _leg_lock_release(self, key: dict,
+                          only_statuses=("FILLED", "CANCELLED", "REJECTED",
+                                         "CANCELED", "SUBMIT_FAILED")) -> None:
+        """Release a leg lock ONLY on terminal states or SUBMIT_FAILED.
+        PENDING_UNCONFIRMED is never released early (no resend)."""
+        try:
+            _locks = self._leg_lock_load()
+            _lid = self._leg_lock_id(key)
+            _lock = _locks.get(_lid)
+            if _lock is None:
+                return
+            _st = str(_lock.get("status", "")).upper()
+            if _st in tuple(s.upper() for s in only_statuses):
+                _locks.pop(_lid, None)
+                self._leg_lock_save(_locks)
+        except Exception:
+            pass
+
+    def _leg_lock_check(self, key: dict) -> bool:
+        """True when a non-terminal lock exists for this leg — a second
+        signal must NOT resubmit (zero submissions)."""
+        try:
+            import json as _json
+            _p = self._leg_lock_path()
+            if not os.path.exists(_p):
+                return False
+            with open(_p, encoding="utf-8") as _f:
+                _locks = _json.load(_f)
+            _lock = _locks.get(self._leg_lock_id(key))
+            if _lock is None:
+                # restart rebinding: session_generation changed after a
+                # restart — match by broker identity components
+                # (trade_id + contract + closing_side + qty) and rebind.
+                _lock = self._leg_lock_rebind(_locks, key)
+            if _lock is None:
+                return False
+            if str(_lock.get("status", "")).upper() in (
+                    "FILLED", "CANCELLED", "REJECTED", "CANCELED"):
+                return False
+            self._append_mts_event(
+                "ORDER_BLOCKED_PENDING_EXISTS",
+                reason="ORDER_BLOCKED_PENDING_EXISTS",
+                contract=key.get("contract"),
+                trade_id=key.get("trade_id"))
+            return True
+        except Exception:
+            return False
 
     def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, trail_points=None, reason=None):
         action = None
