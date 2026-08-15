@@ -7981,6 +7981,94 @@ class FuturesMonitor:
         except Exception:
             return False
 
+    def _reconcile_intent_path(self) -> str:
+        _p = getattr(self, "_reconcile_intent_store", "")
+        if _p:
+            return _p
+        try:
+            from core.runtime_paths import runtime_path
+            return runtime_path("exports", "trades", "live", "diagnostics",
+                                "mts_reconcile_intents.json")
+        except Exception:
+            return "/tmp/mts_reconcile_intents.json"
+
+    def _mts_partial_submission_quarantine(self, near_key: dict,
+                                           far_key: dict) -> None:
+        """Partial-submission quarantine: the first leg's receipt landed
+        but the second leg's submit FAILED.  Record a DURABLE reconcile
+        intent (restored after restart).  No retry, no cancel, no
+        compensating order — the pair is not complete."""
+        try:
+            import json as _json
+            _p = self._reconcile_intent_path()
+            _intents = {}
+            if os.path.exists(_p):
+                with open(_p, encoding="utf-8") as _f:
+                    _intents = _json.load(_f) or {}
+            _intents[self._leg_lock_id(near_key)] = {
+                "reason": "PARTIAL_SUBMISSION_QUARANTINE",
+                "near": near_key, "far": far_key,
+                "ts": datetime.now().isoformat(),
+            }
+            _d = os.path.dirname(_p)
+            if _d:
+                os.makedirs(_d, exist_ok=True)
+            with open(_p, "w", encoding="utf-8") as _f:
+                _json.dump(_intents, _f, default=str)
+            self._append_mts_event(
+                "PARTIAL_SUBMISSION_QUARANTINE",
+                reason="PARTIAL_SUBMISSION_QUARANTINE",
+                contract=near_key.get("contract"),
+                trade_id=near_key.get("trade_id"))
+        except Exception:
+            pass
+
+    def _reconcile_intent_exists(self, key: dict) -> bool:
+        try:
+            import json as _json
+            _p = self._reconcile_intent_path()
+            if not os.path.exists(_p):
+                return False
+            with open(_p, encoding="utf-8") as _f:
+                _intents = _json.load(_f) or {}
+            return self._leg_lock_id(key) in _intents
+        except Exception:
+            return False
+
+    def _submit_release_pair(self, near_key: dict, far_key: dict,
+                             near_submit_ok: bool = True,
+                             far_submit_ok: bool = True) -> str:
+        """Release pair submission with partial-submission protection.
+
+        Acquires both leg locks (all-or-none), submits the near leg, then
+        the far leg.  If the FAR submit fails after the NEAR receipt, the
+        pair enters MTS_ENTRY_RECONCILE / partial-submission quarantine:
+        the near lock is retained, no retry/cancel/compensating order, and
+        a durable reconcile intent is recorded."""
+        try:
+            if not self._leg_lock_acquire_pair(near_key, far_key):
+                return "PAIR_LOCK_BLOCKED"
+            if near_submit_ok:
+                self._append_mts_event(
+                    "ORDER_SUBMITTED", event="ORDER_SUBMITTED",
+                    contract=near_key.get("contract"),
+                    trade_id=near_key.get("trade_id"),
+                    leg_role="RELEASED", exit_stage="FIRST_LEG_RELEASE")
+            else:
+                self._leg_lock_release(near_key)
+                return "NEAR_SUBMIT_FAILED"
+            if not far_submit_ok:
+                self._mts_partial_submission_quarantine(near_key, far_key)
+                return "MTS_ENTRY_RECONCILE"
+            self._append_mts_event(
+                "ORDER_SUBMITTED", event="ORDER_SUBMITTED",
+                contract=far_key.get("contract"),
+                trade_id=far_key.get("trade_id"),
+                leg_role="RELEASED", exit_stage="SECOND_LEG_RELEASE")
+            return "OK"
+        except Exception:
+            return "SUBMIT_ERROR"
+
     def _leg_lock_release(self, key: dict,
                           only_statuses=("FILLED", "CANCELLED", "REJECTED",
                                          "CANCELED", "SUBMIT_FAILED")) -> None:
