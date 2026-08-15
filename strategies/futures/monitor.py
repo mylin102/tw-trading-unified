@@ -4647,15 +4647,15 @@ class FuturesMonitor:
                         continue
                     try:
                         try:
-                            # Prefer explicit account scoping.  Some
-                            # Shioaji-compatible fakes accept no arguments
-                            # but return an unscoped/phantom stream there;
-                            # real 1.7 adapters may reject the keyword, so
-                            # retain the no-arg fallback.
-                            _rows = _api.list_trades(account=_acct) or []
+                            # Shioaji 1.7's no-argument stream is the current
+                            # broker order view.  The account-scoped overload
+                            # can retain stale PendingSubmit rows on Mini;
+                            # prefer no-arg and use account only for SDKs that
+                            # reject the no-argument form.
+                            _rows = _api.list_trades() or []
                         except TypeError:
                             try:
-                                _rows = _api.list_trades() or []
+                                _rows = _api.list_trades(account=_acct) or []
                             except TypeError:
                                 _rows = _api.list_trades(_acct) or []
                     except Exception as exc:
