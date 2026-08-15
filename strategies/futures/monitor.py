@@ -7908,6 +7908,79 @@ class FuturesMonitor:
                 pass
             return False
 
+    def _leg_lock_mark_terminal(self, key: dict, status: str) -> None:
+        """Mark a lock terminal (FILLED/CANCELLED/REJECTED) then release —
+        only explicit broker terminal evidence may do this."""
+        try:
+            with self._leg_lock_flock(exclusive=True):
+                _locks = self._leg_lock_read()
+                _lid = self._leg_lock_id(key)
+                if _lid in _locks:
+                    _locks[_lid]["status"] = status
+                    _locks[_lid]["terminal"] = status
+                    self._leg_lock_write(_locks)
+        except Exception:
+            pass
+        self._leg_lock_release(key)
+
+    def _leg_lock_apply_broker_deal(self, key: dict, filled_qty) -> bool:
+        """④ broker deal evidence: ONLY a full fill (filled_qty >= qty) is
+        terminal.  A partial fill retains the lock and records the
+        reconcile intent — release/resend stay forbidden."""
+        try:
+            _qty = int(key.get("qty") or 0)
+            try:
+                _filled = float(filled_qty)
+            except (TypeError, ValueError):
+                _filled = 0.0
+            if _qty > 0 and _filled >= _qty:
+                self._leg_lock_mark_terminal(key, "FILLED")
+                return True
+            self._append_mts_event(
+                "LEG_LOCK_PARTIAL_FILL",
+                reason="LEG_LOCK_PARTIAL_FILL",
+                contract=key.get("contract"),
+                trade_id=key.get("trade_id"),
+                filled_qty=_filled, qty=_qty)
+            return False
+        except Exception:
+            return False
+
+    def _leg_lock_apply_broker_query(self, key: dict, trades) -> bool:
+        """④ reconciliation query evidence: an empty result or a query
+        exception must NOT release the lock (no terminal proof) — only an
+        explicit full-fill deal in the queried trades releases."""
+        try:
+            if trades is None:
+                self._append_mts_event(
+                    "LEG_LOCK_QUERY_FAILED",
+                    reason="LEG_LOCK_QUERY_FAILED",
+                    contract=key.get("contract"),
+                    trade_id=key.get("trade_id"))
+                return False
+            _qty = int(key.get("qty") or 0)
+            _bid = str(key.get("broker_order_id") or "")
+            for _t in trades:
+                _id = str(getattr(_t, "order_id", "") or "")
+                _status = ""
+                _st = getattr(_t, "status", None)
+                if _st is not None:
+                    _status = str(getattr(_st, "status", _st))
+                _filled = float(getattr(_t, "fill_qty", 0) or 0)
+                if ((not _bid or _id == _bid)
+                        and _status.upper() == "FILLED"
+                        and _qty > 0 and _filled >= _qty):
+                    self._leg_lock_mark_terminal(key, "FILLED")
+                    return True
+            self._append_mts_event(
+                "LEG_LOCK_QUERY_NO_TERMINAL",
+                reason="LEG_LOCK_QUERY_NO_TERMINAL",
+                contract=key.get("contract"),
+                trade_id=key.get("trade_id"))
+            return False
+        except Exception:
+            return False
+
     def _leg_lock_release(self, key: dict,
                           only_statuses=("FILLED", "CANCELLED", "REJECTED",
                                          "CANCELED", "SUBMIT_FAILED")) -> None:
