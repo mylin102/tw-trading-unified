@@ -158,7 +158,9 @@ def test_mts_order_lifecycle_flow():
          patch.object(monitor, "_pre_submit_exit_only_proof",
                       return_value=(True, None)), \
          patch.object(monitor, "_authorize_intent",
-                      return_value=(True, {}, "ok")):
+                      return_value=(True, {}, "ok")), \
+         patch.object(monitor, "_validate_exit_only_position",
+                      return_value=(True, None, None)):
         mock_state_path.return_value.exists.return_value = False
         monitor._submit_mts_order_signal(signal_obj, strat, bar_dict, datetime.now())
         
