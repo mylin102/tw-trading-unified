@@ -314,3 +314,41 @@ def test_full_fill_releases_lock(tmp_path):
     assert mon._leg_lock_apply_broker_deal(k, filled_qty=1.0) is True
     assert mon._leg_lock_check(k) is False
 
+def test_partial_submission_quarantine_wiring(tmp_path):
+    """Wiring test (user spec): first leg receipt OK + second leg submit
+    FAILS -> MTS_ENTRY_RECONCILE / partial-submission quarantine.
+
+    - first leg keeps its lock
+    - NO successful second-leg ORDER_SUBMITTED
+    - NO auto retry / cancel / compensating order
+    - durable reconcile intent restores after restart
+    - ambiguous broker query still retains the first-leg lock
+    """
+    mon = _monitor(tmp_path)
+    k_near = _lock_key(contract="TMFH6", closing_side="BUY",
+                       broker_order_id="ORD-N", seqno="1")
+    k_far = _lock_key(contract="TMFI6", closing_side="SELL",
+                      broker_order_id="ORD-F", seqno="2")
+    outcome = mon._submit_release_pair(k_near, k_far,
+                                       near_submit_ok=True,
+                                       far_submit_ok=False)
+    assert outcome == "MTS_ENTRY_RECONCILE"
+    # quarantine intent recorded
+    assert any(e.get("reason") == "PARTIAL_SUBMISSION_QUARANTINE"
+               for e in mon.events)
+    # NO successful far ORDER_SUBMITTED
+    assert not any(e.get("event") == "ORDER_SUBMITTED"
+                   and e.get("contract") == "TMFI6" for e in mon.events)
+    # first leg lock retained
+    assert mon._leg_lock_check(k_near) is True
+    # durable reconcile intent + restart restoration
+    assert mon._reconcile_intent_exists(k_near) is True
+    mon2 = _monitor(tmp_path)
+    assert mon2._reconcile_intent_exists(k_near) is True
+    # ambiguous broker query retains the first-leg lock
+    assert mon2._leg_lock_apply_broker_query(k_near, trades=[]) is False
+    assert mon2._leg_lock_check(k_near) is True
+    # no auto retry / cancel / compensating orders
+    assert not any("RETRY" in str(e.get("event") or "") for e in mon.events)
+    assert not any("CANCEL" in str(e.get("event") or "") for e in mon.events)
+
