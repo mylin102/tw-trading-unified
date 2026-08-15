@@ -275,3 +275,42 @@ def test_pair_all_or_none_second_conflict_rolls_back(tmp_path):
     assert any(e.get("reason") == "LEG_LOCK_PAIR_PARTIAL"
                for e in mon.events)
 
+def test_partial_fill_retains_lock(tmp_path):
+    """④ a partial fill must NOT release the lock — only a FULL fill is
+    terminal; release and resend stay forbidden."""
+    mon = _monitor(tmp_path)
+    k = _lock_key(qty=1)
+    assert mon._leg_lock_acquire(k) is True
+    assert mon._leg_lock_apply_broker_deal(k, filled_qty=0.5) is False
+    assert mon._leg_lock_check(k) is True  # still locked
+    assert any(e.get("reason") == "LEG_LOCK_PARTIAL_FILL"
+               for e in mon.events)
+
+
+def test_empty_query_retains_lock(tmp_path):
+    """④ an empty list_trades result (no terminal proof) must NOT release
+    the lock."""
+    mon = _monitor(tmp_path)
+    k = _lock_key()
+    assert mon._leg_lock_acquire(k) is True
+    assert mon._leg_lock_apply_broker_query(k, trades=[]) is False
+    assert mon._leg_lock_check(k) is True
+
+
+def test_query_exception_retains_lock(tmp_path):
+    """④ a query exception must NOT release the lock — fail-closed."""
+    mon = _monitor(tmp_path)
+    k = _lock_key()
+    assert mon._leg_lock_acquire(k) is True
+    assert mon._leg_lock_apply_broker_query(k, trades=None) is False
+    assert mon._leg_lock_check(k) is True
+
+
+def test_full_fill_releases_lock(tmp_path):
+    """④ ONLY a full fill (filled_qty >= qty) is terminal -> releases."""
+    mon = _monitor(tmp_path)
+    k = _lock_key(qty=1)
+    assert mon._leg_lock_acquire(k) is True
+    assert mon._leg_lock_apply_broker_deal(k, filled_qty=1.0) is True
+    assert mon._leg_lock_check(k) is False
+
