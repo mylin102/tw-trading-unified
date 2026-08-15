@@ -154,7 +154,9 @@ def test_mts_order_lifecycle_flow():
     
     with patch.object(monitor.order_mgr, 'submit') as mock_submit, \
          patch("strategies.futures.monitor._mts_position_state_path") as mock_state_path, \
-         patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True):
+         patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True), \
+         patch.object(monitor, "_pre_submit_exit_only_proof",
+                      return_value=(True, None)):
         mock_state_path.return_value.exists.return_value = False
         monitor._submit_mts_order_signal(signal_obj, strat, bar_dict, datetime.now())
         
