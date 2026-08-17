@@ -5004,15 +5004,12 @@ class FuturesMonitor:
                 "[LIVE_BROKER_AUTHORITY] local reconcile failed: %s",
                 _reconcile_exc,
             )
-        if _snap.get("open_orders"):
-            # Snapshot is successful but open orders leave the lifecycle
-            # unresolved.  This is degraded/blocked, never flat evidence.
-            self._live_broker_flat_proven = False
-            self._broker_authority_degraded = True
-            self._broker_position_observed = True
-            self._live_broker_authority = None
-            self._live_broker_authority_at = _now
-            return None
+        _has_open_orders = bool(_snap.get("open_orders"))
+        # open orders leave the lifecycle unresolved for ENTRY, but they
+        # must NOT block the exit authority: when the snapshot shows both
+        # spread legs, the OPEN authority is still built below so release
+        # / trail evaluation keeps working.  open_orders keep new entries
+        # blocked via _broker_position_observed and the pending gate.
         self._persist_current_session_canonical(_snap)
         _codes = {str(getattr(self.contract, "code", "")),
                   str(getattr(self.far_contract, "code", ""))}
@@ -5026,6 +5023,15 @@ class FuturesMonitor:
         self._write_live_session_upl(
             _rows, getattr(self, "_execution_context", None))
         if not _rows:
+            if _has_open_orders:
+                # open orders with NO positions: unresolved, never flat.
+                self._broker_position_observed = True
+                self._live_broker_flat_proven = False
+                self._broker_authority_degraded = True
+                strategy._broker_truth_flat = False
+                self._live_broker_authority = None
+                self._live_broker_authority_at = _now
+                return None
             # A successful, empty futures snapshot is authoritative flat
             # evidence.  Capture failures return above and must not clear the
             # marker, because an unknown broker state is not flat evidence.
