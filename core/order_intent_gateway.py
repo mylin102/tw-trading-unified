@@ -199,6 +199,18 @@ class OrderIntentGateway:
         if sname == "MTS_RELEASE_OCO":
             return False, None, "GATEWAY_OCO_DISABLED"
         mode = authority.get("mode")
+        if mode == "live_quarantined":
+            # [QUARANTINE_EXIT 2026-08-18] narrow carve-out: only a
+            # snapshot-bound remaining-leg exit (per-order proof from
+            # the monitor's fresh broker-truth recheck) may submit.
+            _qproof = authority.get("quarantine_exit_proof")
+            if (isinstance(_qproof, dict)
+                    and sname in ("MTS_RELEASE", "MTS_EXIT")
+                    and _qproof.get("strategy") == sname
+                    and _qproof.get("contract") and _qproof.get("side")
+                    and _qproof.get("snapshot_hash")):
+                return True, _qproof, None
+            return False, None, "LIVE_ORDER_AUTHORIZATION_FAILED"
         if mode not in ("live_ready", "reconciled_exit_only"):
             return False, None, "LIVE_ORDER_AUTHORIZATION_FAILED"
         if mode == "live_ready":

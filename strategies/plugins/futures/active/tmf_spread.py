@@ -1803,6 +1803,11 @@ class TMFSpread(StrategyBase):
         # release-fill 路徑或 fill-log restore 記錄; baseline gate 用它
         # 比對報價 session, mismatch / unknown 一律 fail-closed ──
         self._position_session_type: str | None = None
+        # ── broker-reconciled single-leg recovery identity (2026-08-18)
+        self._broker_recovery_source: str | None = None
+        self._broker_recovery_order_id: str | None = None
+        self._broker_recovery_broker_order_id: str | None = None
+        self._broker_recovery_snapshot_hash: str | None = None
 
         # ── P1: Single-leg extrema (decision authority in SINGLE_LEG) ──
         # (_single_leg_peak/nadir initialized before _restore_position_state;
@@ -2143,6 +2148,50 @@ class TMFSpread(StrategyBase):
             fill_price, remaining_leg_price, source, order_id,
         )
 
+    def enter_broker_reconciled_single_leg(
+        self, *, released_leg: str, remaining_side: str,
+        order_id: str | None, broker_order_id: str | None,
+        snapshot_hash: str | None, position_session: str | None,
+    ) -> None:
+        """Broker-confirmed single-leg lifecycle transition (2026-08-18).
+
+        Local fills lack the RELEASE/FILLED record, but the canonical broker
+        snapshot proves the released contract is GONE and the remaining leg
+        is present.  Infer the SINGLE_LEG transition from position-level
+        broker evidence — WITHOUT synthesizing a release price / PnL — and
+        re-arm the trail via PENDING_REANCHOR so the RESTART_BASELINE gate
+        (first fresh remaining-leg BBO) establishes the anchor.
+        """
+        self._released_leg = released_leg
+        self._side = remaining_side
+        _rel = Leg.NEAR if released_leg == "near" else Leg.FAR
+        _rem = Leg.FAR if released_leg == "near" else Leg.NEAR
+        self._lifecycle = f"TRAILING_{remaining_side}"
+        self._lifecycle_oca = PositionLifecycle(
+            phase=PositionPhase.SINGLE_LEG,
+            release_group=ReleaseGroup(
+                status=ReleaseGroupStatus.FILLED,
+                filled_leg=_rel, canceled_leg=_rem),
+            trail_group=TrailGroup(
+                status=TrailGroupStatus.ARMED,
+                remaining_leg=_rem,
+                trigger_ts=datetime.now().isoformat()),
+        )
+        # ── RESTART_BASELINE: 水合/重啟後的單腿一律 PENDING_REANCHOR,
+        # anchor 由 baseline gate 從 fresh BBO 建立 (不用任何合成價) ──
+        self._set_single_leg_extrema(peak=0.0, nadir=0.0)
+        self._single_leg_anchor_price = 0.0
+        self._trail_anchor_status = TrailAnchorStatus.PENDING_REANCHOR
+        self._trail_warmup_tick_count = 0
+        self._trail_started_at = None
+        self._trail_anchor_source = "BROKER_RECONCILIATION"
+        self._position_session_type = position_session
+        # broker-reconciliation identity — persisted via the state write
+        self._broker_recovery_source = "broker_reconciliation"
+        self._broker_recovery_order_id = order_id
+        self._broker_recovery_broker_order_id = broker_order_id
+        self._broker_recovery_snapshot_hash = snapshot_hash
+
     def sync_release(self, leg: str | Leg, price: float, release_price: float = 0.0,
                      order_id: str = "", event_time: datetime | None = None) -> None:
         """
@@ -2380,6 +2429,10 @@ class TMFSpread(StrategyBase):
             atr=self._last_atr,
             lifecycle=self._current_lifecycle_state(),
             peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
+            # ── broker-reconciled single-leg recovery identity (2026-08-18)
+            broker_recovery_source=getattr(self, "_broker_recovery_source", None),
+            broker_recovery_order_id=getattr(self, "_broker_recovery_order_id", None),
+            broker_recovery_snapshot_hash=getattr(self, "_broker_recovery_snapshot_hash", None),
             **kw
         )
 
@@ -5158,6 +5211,10 @@ class TMFSpread(StrategyBase):
             trade_id=self._trade_id, ticker=self._ticker,
             lifecycle=self._current_lifecycle_state(),
             peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
+            # ── broker-reconciled single-leg recovery identity (2026-08-18)
+            broker_recovery_source=getattr(self, "_broker_recovery_source", None),
+            broker_recovery_order_id=getattr(self, "_broker_recovery_order_id", None),
+            broker_recovery_snapshot_hash=getattr(self, "_broker_recovery_snapshot_hash", None),
             **_risk_meta
         )
         self._last_applied_event_time = now

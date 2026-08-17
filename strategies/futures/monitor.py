@@ -3361,13 +3361,82 @@ class FuturesMonitor:
                 self._exit_only_position_has_position(),
         }
 
-    def _authorize_intent(self, action, strategy_name, strategy_obj=None):
+    def _mts_quarantine_exit_proof(self, strategy, sname, action):
+        """[QUARANTINE_EXIT 2026-08-18] Pre-submit FRESH broker-truth
+        recheck for a snapshot-bound remaining-leg exit while
+        LIVE_QUARANTINED.  Returns the per-order proof dict, or None
+        (zero submit) on any fail-closed condition: capture failure,
+        flat terminal, ambiguous legs, released contract back at broker,
+        session mismatch, missing recovery identity."""
+        _ctx = getattr(self, "_execution_context", None)
+        if getattr(_ctx, "effective_mode", "") != "live_quarantined":
+            return None
+        if sname not in ("MTS_RELEASE", "MTS_EXIT"):
+            return None
+        if (getattr(strategy, "_broker_recovery_source", None)
+                != "broker_reconciliation"):
+            return None
+        _snap = self._capture_post_startup_snapshot()
+        if (_snap.get("fetch_status") or {}).get("capture") != "OK":
+            return None
+        _codes = {str(getattr(self.contract, "code", "")),
+                  str(getattr(self.far_contract, "code", ""))}
+        _rows = [p for p in (_snap.get("positions") or [])
+                 if p.get("account") == "futures"
+                 and p.get("code") in _codes
+                 and type(p.get("quantity")) is int
+                 and p.get("quantity", 0) > 0]
+        if len(_rows) != 1:
+            return None  # flat terminal / ambiguous — no proof
+        _row = _rows[0]
+        _code = str(_row.get("code") or "")
+        _side_text = str(_row.get("direction") or "").lower()
+        if "sell" in _side_text or "short" in _side_text:
+            _side = "SHORT"
+        elif "buy" in _side_text or "long" in _side_text:
+            _side = "LONG"
+        else:
+            return None
+        _rel_str = getattr(strategy, "_released_leg", None)
+        if _rel_str not in ("near", "far"):
+            return None
+        _near_code = str(getattr(self.contract, "code", ""))
+        _far_code = str(getattr(self.far_contract, "code", ""))
+        _released_code = _near_code if _rel_str == "near" else _far_code
+        _remaining_code = _far_code if _rel_str == "near" else _near_code
+        if _code != _remaining_code:
+            return None  # snapshot remaining leg != strategy remaining leg
+        if _released_code in {r.get("code") for r in _rows}:
+            return None  # released contract back at broker — contradiction
+        _snap_sess = _snap.get("session_id")
+        if not _snap_sess or _snap_sess != getattr(_ctx, "session_id", ""):
+            return None
+        _hash = _snap.get("canonical_input_hash")
+        _recovery_oid = getattr(strategy, "_broker_recovery_order_id", None)
+        if not _hash or not _recovery_oid:
+            return None
+        return {
+            "strategy": sname,
+            "contract": _code,
+            "side": _side,
+            "qty": _row.get("quantity"),
+            "snapshot_hash": _hash,
+            "recovery_order_id": _recovery_oid,
+            "session": getattr(strategy, "_position_session_type", None),
+        }
+
+    def _authorize_intent(self, action, strategy_name, strategy_obj=None,
+                          quarantine_exit_proof=None):
         """[S0] single authorize entry: every MTS order path (auto,
         manual, emergency) authorizes through the gateway policy."""
         _gw = self._gateway()
+        _auth = self._gateway_authority(strategy_obj)
+        if quarantine_exit_proof is not None:
+            _auth = dict(_auth)
+            _auth["quarantine_exit_proof"] = quarantine_exit_proof
         _ok, _binding, _reason = _gw.authorize_intent(
             action=action, strategy=strategy_name,
-            authority=self._gateway_authority(strategy_obj))
+            authority=_auth)
         if _ok and _binding is not None:
             self._exit_only_decision_binding = _binding
         return _ok, _binding, _reason
@@ -5443,6 +5512,42 @@ class FuturesMonitor:
                 pass
         return _best
 
+    def _mts_release_order_identities(self, released_code: str) -> list:
+        """Distinct broker identities of MTS_RELEASE orders for the released
+        contract.  The same broker_order_id captured twice (stale session
+        cache) dedupes to one identity; two DISTINCT identities are
+        ambiguous (fail-closed upstream — no lifecycle inference)."""
+        _ids: list = []
+        _seen: set = set()
+        _om = getattr(self, "order_mgr", None)
+        _orders: list = []
+        if _om is not None:
+            _orders += list((getattr(_om, "active_orders", {}) or {}).values())
+            _orders += list(getattr(_om, "completed", None) or [])
+        for _o in _orders:
+            try:
+                _d = _o.to_dict() if hasattr(_o, "to_dict") else dict(_o or {})
+            except Exception:
+                continue
+            if str(_d.get("strategy") or "") != "MTS_RELEASE":
+                continue
+            if str(_d.get("symbol") or "") != released_code:
+                continue
+            _bid = str(_d.get("broker_order_id")
+                       or _d.get("ordno") or _d.get("order_id") or "")
+            if not _bid:
+                continue
+            if _bid in _seen:
+                continue
+            _seen.add(_bid)
+            _ids.append({
+                "order_id": _d.get("order_id"),
+                "broker_order_id": _d.get("broker_order_id")
+                                 or _d.get("ordno"),
+                "symbol": _d.get("symbol"),
+            })
+        return _ids
+
     def _refresh_live_broker_authority(self, strategy):
         """Use the current authenticated broker snapshot as LIVE MTS truth.
 
@@ -5641,6 +5746,39 @@ class FuturesMonitor:
             self._live_broker_flat_proven = False
             self._broker_authority_degraded = False
             strategy._broker_truth_flat = False
+            # ── broker-confirmed single-leg recovery inference (2026-08-18)
+            # 當 local fills 缺 RELEASE/FILLED, 但 canonical 證明 released
+            # contract 已不在、remaining 在 (valid side/qty/avg_cost) 且恰有
+            # 一個 current MTS_RELEASE order identity → 推導 SINGLE_LEG
+            # transition (不合成 release price/PnL) + PENDING_REANCHOR。
+            # ambiguous identity / session mismatch → fail-closed (不推導)。
+            _snap_session = _snap.get("session_id")
+            _ctx_session = getattr(getattr(self, "_execution_context", None),
+                                   "session_id", "") or ""
+            _released_code = (str(getattr(self.far_contract, "code", ""))
+                              if _code == str(getattr(self.contract, "code", ""))
+                              else str(getattr(self.contract, "code", "")))
+            _release_ids = self._mts_release_order_identities(_released_code)
+            if (len(_release_ids) == 1 and _snap_session
+                    and _snap_session == _ctx_session):
+                _rel_str = ("near" if _code
+                            == str(getattr(self.far_contract, "code", ""))
+                            else "far")
+                _rid = _release_ids[0]
+                try:
+                    from strategies.plugins.futures.active.tmf_spread import (
+                        _session_label)
+                    _pos_session = (getattr(self, "session_type", None)
+                                    or _session_label())
+                except Exception:
+                    _pos_session = None
+                strategy.enter_broker_reconciled_single_leg(
+                    released_leg=_rel_str,
+                    remaining_side=_side_value,
+                    order_id=_rid.get("order_id"),
+                    broker_order_id=_rid.get("broker_order_id"),
+                    snapshot_hash=_snap.get("canonical_input_hash"),
+                    position_session=_pos_session)
             _auth = MtsAuthorityState(
                 status=MtsAuthority.SINGLE_LEG, trade_id=_trade_id,
                 near_qty=_qty if _is_near and _side_value == "LONG" else
@@ -8412,8 +8550,19 @@ class FuturesMonitor:
                                              "SELL_NEAR_BUY_FAR")
                               else "MTS_EXIT" if _action == "EXIT"
                               else "MTS_RELEASE")
+        # [QUARANTINE_EXIT 2026-08-18] LIVE_QUARANTINED 窄化授權: 只有
+        # snapshot-bound remaining-leg MTS_RELEASE/MTS_EXIT 可送 —
+        # pre-submit fresh broker-truth recheck 生成 per-order proof;
+        # entry/manual/OCO 沒有 proof → 維持 blocked。
+        _q_proof = None
+        if (getattr(getattr(self, "_execution_context", None),
+                    "effective_mode", "") == "live_quarantined"
+                and _gw_intent_strategy in ("MTS_RELEASE", "MTS_EXIT")):
+            _q_proof = self._mts_quarantine_exit_proof(
+                strategy, _gw_intent_strategy, _action)
         _gw_ok, _gw_binding, _gw_reason = self._authorize_intent(
-            _action, _gw_intent_strategy, strategy)
+            _action, _gw_intent_strategy, strategy,
+            quarantine_exit_proof=_q_proof)
         self._exit_only_decision_binding = _gw_binding
         if not _gw_ok:
             # [S2 audit] persist the canonical failure-evidence payload
@@ -8453,6 +8602,7 @@ class FuturesMonitor:
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_NEAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) instead of MARKET — 避免滑價
                 _order = self.order_mgr.create_order(symbol=_near_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
+                _order.quarantine_exit_proof = _q_proof  # snapshot-bound exit proof (None outside quarantine)
                 self._append_mts_event("ORDER_INTENT_CREATED", **_ev_meta(_order))
 
                 # [GSD] Track in lifecycle orders so fill is not ignored
@@ -8513,6 +8663,7 @@ class FuturesMonitor:
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_FAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
                 _order = self.order_mgr.create_order(symbol=_far_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
+                _order.quarantine_exit_proof = _q_proof  # snapshot-bound exit proof (None outside quarantine)
                 self._append_mts_event("ORDER_INTENT_CREATED", **_ev_meta(_order))
 
                 # [GSD] Track in lifecycle orders so fill is not ignored
@@ -8639,6 +8790,8 @@ class FuturesMonitor:
 
             _near_order = self.order_mgr.create_order(symbol=_near_code, side=_near_order_side, order_type=OrderType.MKP, quantity=_near_qty, strategy="MTS_EXIT")
             _far_order = self.order_mgr.create_order(symbol=_far_code, side=_far_order_side, order_type=OrderType.MKP, quantity=_far_qty, strategy="MTS_EXIT")
+            _near_order.quarantine_exit_proof = _q_proof  # snapshot-bound exit proof (None outside quarantine)
+            _far_order.quarantine_exit_proof = _q_proof
 
             # P1-B durable-exit-intent: ids persisted BEFORE any broker I/O;
             # each leg goes through the canonical submit_leg (durable
@@ -8845,6 +8998,7 @@ class FuturesMonitor:
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting EXIT for {_leg_label}: {_side} (MKP Range Market)[/yellow]")
             # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
             _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_EXIT")
+            _order.quarantine_exit_proof = _q_proof  # snapshot-bound exit proof (None outside quarantine)
             # B48 (codex C): correlate the decision event through the order
             _order.event_id = getattr(signal, "event_id", "")
             _order.winner = getattr(signal, "winner", "")
