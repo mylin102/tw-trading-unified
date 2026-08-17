@@ -553,6 +553,21 @@ with st.sidebar:
             st.error(f"❌ 更新失敗（回傳碼: {result.returncode}）")
 
 # 2026-07-08 Gemini CLI: Calculate MTS daily performance metrics matching scripts/generate_daily_report.py
+def _manual_command_is_fresh(cmd, max_age_seconds=300):
+    """True when a manual-command status record is recent enough to show.
+
+    Stale statuses (old ts) must not keep displaying a past failure.
+    Missing/unparseable ts -> not fresh (fail-closed)."""
+    ts = (cmd or {}).get("ts", "")
+    if not ts:
+        return False
+    try:
+        dt = datetime.datetime.fromisoformat(ts)
+        return (datetime.datetime.now() - dt).total_seconds() < max_age_seconds
+    except Exception:
+        return False
+
+
 def _fmt_policy_j_reason(reason_str: str) -> str:
     if not reason_str or reason_str in ("—", "?"):
         return str(reason_str)
@@ -4582,13 +4597,16 @@ elif _selected_product == "TMF":
                 try:
                     with open("/tmp/futures_manual_trade_status.json") as _cf:
                         _cmd = json.load(_cf)
-                    _cstate = _cmd.get("status", "?")
-                    _cicon = {"COMMAND_SENT": "📤", "RECEIVED": "📥", "PROCESSING": "⚙️",
-                              "COMPLETED": "✅", "FAILED": "⛔"}.get(_cstate, "❓")
-                    st.caption(f"{_cicon} 指令 {_cmd.get('command_id', '?')} | {_cstate} | "
-                               f"{str(_cmd.get('ts', ''))[:19]} | {_cmd.get('message', '')}")
-                    if _cstate == "COMPLETED" and _cmd.get("position_after"):
-                        st.caption(f"✅ 平倉完成: {json.dumps(_cmd['position_after'], default=str)}")
+                    # stale statuses (old ts) must not keep showing past
+                    # failures — only commands from the last 5 minutes.
+                    if _manual_command_is_fresh(_cmd):
+                        _cstate = _cmd.get("status", "?")
+                        _cicon = {"COMMAND_SENT": "📤", "RECEIVED": "📥", "PROCESSING": "⚙️",
+                                  "COMPLETED": "✅", "FAILED": "⛔"}.get(_cstate, "❓")
+                        st.caption(f"{_cicon} 指令 {_cmd.get('command_id', '?')} | {_cstate} | "
+                                   f"{str(_cmd.get('ts', ''))[:19]} | {_cmd.get('message', '')}")
+                        if _cstate == "COMPLETED" and _cmd.get("position_after"):
+                            st.caption(f"✅ 平倉完成: {json.dumps(_cmd['position_after'], default=str)}")
                 except Exception:
                     pass
                 # ── Unrealized PnL Breakdown ──
