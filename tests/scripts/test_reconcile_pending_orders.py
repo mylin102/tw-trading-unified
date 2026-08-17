@@ -7,7 +7,7 @@ Broker-evidence contract (codex review):
 - broker still lists the order open     -> retained (in-flight).
 - broker shows a position on the symbol -> retained (local cancel wrong,
   order filled).
-- broker shows neither                  -> marked cancelled.
+- broker shows neither                  -> marked BROKER_NOT_FOUND (terminal).
 - pending without cancelled_at          -> always retained.
 """
 
