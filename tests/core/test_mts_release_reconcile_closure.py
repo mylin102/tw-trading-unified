@@ -232,6 +232,39 @@ def test_query_failure_fail_closed(tmp_path, monkeypatch):
     assert calls == []
 
 
+def test_partial_fill_does_not_advance_lifecycle(tmp_path, monkeypatch):
+    """A PARTIAL fill must NOT close the release lifecycle: only a fully
+    FILLED order (filled_quantity >= quantity) may advance to SINGLE_LEG.
+    Partial fills keep the order pending — never an early single-leg
+    release, never a hidden remaining quantity, never a premature trail."""
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    mon = _monitor()
+    manager = OrderManager(mode="live")
+    mon.order_mgr = manager
+    order = manager.create_order(symbol="TMFI6", side=OrderSide.BUY,
+                                 order_type=OrderType.MARKET, quantity=2,
+                                 strategy="MTS_RELEASE")
+    order.submit("BRK-REL", broker_order_id="BRK-REL",
+                 seqno="SEQ-9", ordno="ORD-9")
+    strat, calls = _release_strategy()
+    mon._mts_strategy = strat
+
+    # broker shows only 1 of 2 lots filled
+    mon._reconcile_local_orders_from_snapshot(_snap([_deal_row(qty=1)]))
+
+    assert order.status is OrderStatus.PARTIAL_FILLED
+    assert calls == []          # partial fill must NOT close the lifecycle
+
+    # remaining lot fills on the next refresh -> now fully FILLED
+    mon._reconcile_local_orders_from_snapshot(
+        _snap([_deal_row(deal_id="D-2", price=46020.0, qty=1)]))
+
+    assert order.status is OrderStatus.FILLED
+    assert len(calls) == 1
+    assert calls[0]["leg"] == "far"
+    assert calls[0]["release_price"] == 46020.0
+
+
 def test_non_release_order_fill_does_not_advance_lifecycle(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
     mon = _monitor()
