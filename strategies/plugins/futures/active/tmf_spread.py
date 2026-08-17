@@ -742,9 +742,11 @@ def _restart_baseline_quote(
     try:
         _age_f = float(_age)
     except (TypeError, ValueError):
-        return None, "TRAIL_REANCHOR_QUOTE_STALE"
-    if _age_f < 0:
-        _age_f = 0.0
+        return None, "TRAIL_REANCHOR_QUOTE_INVALID"
+    if (isinstance(_age, bool) or not math.isfinite(_age_f) or _age_f < 0):
+        # NaN / ±Inf / 負值 / bool 都不是可證明的 freshness — fail-closed;
+        # 負值不得 clamp 成 0 (0 = "just received" 是假的 freshness 證據)
+        return None, "TRAIL_REANCHOR_QUOTE_INVALID"
     if max_quote_age_ms > 0 and _age_f > max_quote_age_ms:
         return None, "TRAIL_REANCHOR_QUOTE_STALE"
 
