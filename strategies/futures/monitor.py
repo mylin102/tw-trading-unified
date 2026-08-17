@@ -5040,14 +5040,36 @@ class FuturesMonitor:
                 self._live_broker_authority_at = _now
                 return None
             if _has_open_orders:
-                # open orders with NO positions: unresolved, never flat.
-                self._broker_position_observed = True
-                self._live_broker_flat_proven = False
-                self._broker_authority_degraded = True
-                strategy._broker_truth_flat = False
-                self._live_broker_authority = None
-                self._live_broker_authority_at = _now
-                return None
+                # Stale PendingSubmit rows are session-cache residue only
+                # when every open order is explained one-to-one by a local
+                # FILLED entry (identity + symbol + direction + qty).  Any
+                # unmatched/ambiguous pending keeps the unresolved verdict.
+                _covered_flat = False
+                try:
+                    from core.broker_evidence import \
+                        open_orders_fully_covered_by_filled
+                    _om = getattr(self, "order_mgr", None)
+                    _filled_rows = []
+                    if _om is not None:
+                        _filled_rows = [
+                            _o.to_dict() for _o in _om.completed
+                            if hasattr(_o, "to_dict")]
+                    _covered_flat = open_orders_fully_covered_by_filled(
+                        _snap.get("open_orders") or [], _filled_rows)
+                except Exception:
+                    _covered_flat = False  # fail-closed: keep unresolved
+                if not _covered_flat:
+                    # open orders with NO positions: unresolved, never flat.
+                    self._broker_position_observed = True
+                    self._live_broker_flat_proven = False
+                    self._broker_authority_degraded = True
+                    strategy._broker_truth_flat = False
+                    self._live_broker_authority = None
+                    self._live_broker_authority_at = _now
+                    return None
+                # All open orders are covered by explicit local fills: the
+                # broker has no position and no unexplained pending.  Fall
+                # through to the authoritative flat evidence below.
             # A successful, empty futures snapshot is authoritative flat
             # evidence.  Capture failures return above and must not clear the
             # marker, because an unknown broker state is not flat evidence.
