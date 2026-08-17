@@ -63,13 +63,13 @@ def _stale(oid="ORD-1", bid="7e2d5bc7", sym="TMFI6"):
             "cancelled_at": "2026-08-15T05:01:18"}
 
 
-def test_broker_absent_and_no_position_marks_cancelled(tmp_path):
+def test_broker_absent_and_no_position_marks_broker_not_found(tmp_path):
     p = _write(tmp_path, [_stale(), {**BASE, "order_id": "ORD-2", "status": "filled"}])
     res = reconcile(p, broker=FakeBroker())
     assert res["cancelled"] == ["ORD-1"]
     assert res["retained"] == []
     d = json.loads(open(p, encoding="utf-8").read())
-    assert d[0]["status"] == "cancelled"
+    assert d[0]["status"] == "BROKER_NOT_FOUND"
     assert d[1]["status"] == "filled"
 
 
@@ -99,12 +99,49 @@ def test_broker_has_position_local_cancel_was_wrong_retained(tmp_path):
     assert d[0]["status"] == "pending_submit"
 
 
-def test_pending_without_cancelled_at_always_retained(tmp_path):
+def test_pending_without_cancelled_at_broker_absent_marks_broker_not_found(tmp_path):
+    """Phantom pending: no cancelled_at but the broker has neither the
+    order nor the position -> terminal BROKER_NOT_FOUND (not retained)."""
     p = _write(tmp_path, [
         {**BASE, "order_id": "ORD-1", "status": "pending_submit",
          "cancelled_at": None},
     ])
     res = reconcile(p, broker=FakeBroker())
+    assert res["cancelled"] == ["ORD-1"]
+    assert res["retained"] == []
+    d = json.loads(open(p, encoding="utf-8").read())
+    assert d[0]["status"] == "BROKER_NOT_FOUND"
+    assert "RECONCILE_REQUIRED" in d[0]["reconcile_note"]
+
+
+def test_pending_without_cancelled_at_broker_still_open_retained(tmp_path):
+    p = _write(tmp_path, [
+        {**BASE, "order_id": "ORD-1", "status": "pending_submit",
+         "cancelled_at": None},
+    ])
+    res = reconcile(p, broker=FakeBroker(open_order_ids={"7e2d5bc7"}))
+    assert res["cancelled"] == []
+    assert res["retained"] == ["ORD-1"]
+
+
+def test_pending_without_cancelled_at_broker_has_position_retained(tmp_path):
+    """The known historical failure: local watchdog cancel, broker FILLED
+    (position exists) — must be retained even without cancelled_at."""
+    p = _write(tmp_path, [
+        {**BASE, "order_id": "ORD-1", "status": "pending_submit",
+         "cancelled_at": None},
+    ])
+    res = reconcile(p, broker=FakeBroker(positions={"TMFI6"}))
+    assert res["cancelled"] == []
+    assert res["retained"] == ["ORD-1"]
+
+
+def test_pending_without_cancelled_at_no_probe_fail_closed(tmp_path):
+    p = _write(tmp_path, [
+        {**BASE, "order_id": "ORD-1", "status": "pending_submit",
+         "cancelled_at": None},
+    ])
+    res = reconcile(p, broker=None)
     assert res["cancelled"] == []
     assert res["retained"] == ["ORD-1"]
 
