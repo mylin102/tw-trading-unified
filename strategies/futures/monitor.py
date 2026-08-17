@@ -4505,6 +4505,7 @@ class FuturesMonitor:
                             or getattr(trade, "quantity", None),
                 "filled_quantity": getattr(status, "filled_quantity", None)
                                    or getattr(trade, "filled_quantity", None),
+                "ts": getattr(trade, "ts", None) or getattr(status, "ts", None),
                 "deals": [],
             }
             deals = getattr(status, "deals", None) or getattr(trade, "deals", None) or []
@@ -4567,6 +4568,7 @@ class FuturesMonitor:
                 "price": _price,
                 "quantity": _qty,
                 "ordno": payload.get("ordno"),
+                "deal_ts": payload.get("ts"),
             }
             out.append({
                 "id": str(_broker_id),
@@ -4580,6 +4582,7 @@ class FuturesMonitor:
                 "quantity": _qty,
                 "filled_quantity": _qty,
                 "trade_id": str(_broker_id),
+                "ts": payload.get("ts"),
                 "deals": [_deal],
             })
         return out
@@ -4781,7 +4784,6 @@ class FuturesMonitor:
         changed += len(position_result.get("reconciled") or [])
         if changed and hasattr(self, "_save_orders_file_wrapper"):
             self._save_orders_file_wrapper()
-        getattr(self, "_emit_release_eval_skip_no_local_position", lambda _snap: None)(snapshot)
         return changed
 
 
@@ -4962,6 +4964,98 @@ class FuturesMonitor:
         except Exception:
             pass
 
+    @staticmethod
+    def _to_epoch_ms(value):
+        """Normalize a timestamp to epoch milliseconds (decision domain).
+
+        Accepts epoch seconds (<1e11) or milliseconds (>=1e11) as int/float,
+        ISO-8601 strings, and datetime objects.  Returns None when the input
+        is missing or untrustworthy (0/NaN/parse failure) so callers stay
+        fail-closed.
+        """
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, datetime):
+            try:
+                return value.timestamp() * 1000.0
+            except Exception:
+                return None
+        if isinstance(value, (int, float)):
+            _v = float(value)
+            if _v <= 0 or _v != _v:
+                return None
+            return _v * 1000.0 if _v < 1e11 else _v
+        if isinstance(value, str):
+            _s = value.strip()
+            try:
+                _f = float(_s)
+                if _f > 0 and _f == _f:
+                    return _f * 1000.0 if _f < 1e11 else _f
+            except ValueError:
+                pass
+            try:
+                return (datetime.fromisoformat(
+                    _s.replace("Z", "+00:00")).timestamp() * 1000.0)
+            except Exception:
+                return None
+        return None
+
+    def _resolve_broker_hydration_entry_epoch(self, snapshot, codes):
+        """Resolve a broker-observed position's entry time (epoch ms).
+
+        Broker truth first: the earliest deal/trade timestamp across the
+        position's contracts (order_deal_records + list_trades, normalized).
+        Falls back to the durable local fills ledger (ENTRY rows by
+        contract), then the persisted state-file entry clock.  None = no
+        trustworthy anchor — fail-closed: Policy J stays suppressed while
+        release/ATR/emergency exits keep working.
+        """
+        _best = None
+        for _row in (snapshot.get("broker_trades") or []):
+            if not isinstance(_row, dict):
+                continue
+            if str(_row.get("code") or "") not in codes:
+                continue
+            _ms = self._to_epoch_ms(_row.get("ts") or _row.get("deal_ts"))
+            if _ms and (_best is None or _ms < _best):
+                _best = _ms
+        if _best is None:
+            try:
+                _rt = os.getenv("TRADING_RUNTIME_DIR")
+                _fills = os.getenv("MTS_FILL_LOG_PATH") or (
+                    os.path.join(_rt, "logs", "mts_trade_fills.jsonl")
+                    if _rt else "logs/mts_trade_fills.jsonl")
+                if os.path.exists(_fills):
+                    with open(_fills, "r", encoding="utf-8") as _f:
+                        for _line in _f:
+                            try:
+                                _r = json.loads(_line)
+                            except Exception:
+                                continue
+                            if (str(_r.get("fill_type") or "") != "ENTRY"
+                                    or str(_r.get("contract") or "")
+                                    not in codes):
+                                continue
+                            _ms = self._to_epoch_ms(_r.get("timestamp"))
+                            if _ms and (_best is None or _ms < _best):
+                                _best = _ms
+            except Exception:
+                pass
+        if _best is None:
+            try:
+                with open(_mts_position_state_path(), "r",
+                          encoding="utf-8") as _f:
+                    _st = json.load(_f)
+                if _st.get("has_position"):
+                    _ms = self._to_epoch_ms(
+                        _st.get("entry_guard_start_ms")
+                        or _st.get("entry_ts_ms") or _st.get("entry_ts"))
+                    if _ms:
+                        _best = _ms
+            except Exception:
+                pass
+        return _best
+
     def _refresh_live_broker_authority(self, strategy):
         """Use the current authenticated broker snapshot as LIVE MTS truth.
 
@@ -5120,6 +5214,7 @@ class FuturesMonitor:
                 strategy._broker_truth_flat = False
                 self._live_broker_authority = None
                 self._live_broker_authority_at = _now
+                self._emit_release_eval_skip_no_local_position(_snap)
                 return None
             _is_near = _code == str(getattr(self.contract, "code", ""))
             _released_leg = "far" if _is_near else "near"
@@ -5135,6 +5230,18 @@ class FuturesMonitor:
                     ("_lifecycle", "SINGLE_LEG"),
                     ("_snapshot_hash", _snapshot_hash)):
                 setattr(strategy, _name, _value)
+            # P0-A: broker-truth entry-time hydration — Policy J guard
+            # clock must never stay ENTRY_TIME_MISSING for a broker-observed
+            # position.  Broker deal/trade timestamps are truth; durable
+            # local fills / state file are fallbacks; None stays fail-closed.
+            _entry_ms = self._resolve_broker_hydration_entry_epoch(_snap, _codes)
+            if _entry_ms:
+                strategy._entry_guard_start_ms = _entry_ms
+                strategy._entry_ts_ms = _entry_ms
+                try:
+                    strategy._entry_ts = datetime.fromtimestamp(_entry_ms / 1000.0)
+                except Exception:
+                    strategy._entry_ts = None
             self._broker_position_observed = True
             self._live_broker_flat_proven = False
             self._broker_authority_degraded = False
@@ -5163,6 +5270,7 @@ class FuturesMonitor:
             strategy._broker_truth_flat = False
             self._live_broker_authority = None
             self._live_broker_authority_at = _now
+            self._emit_release_eval_skip_no_local_position(_snap)
             return None
         _by_code = {p["code"]: p for p in _rows}
         _near = _by_code.get(str(getattr(self.contract, "code", "")))
@@ -5178,20 +5286,38 @@ class FuturesMonitor:
             strategy._broker_truth_flat = False
             self._live_broker_authority = None
             self._live_broker_authority_at = _now
+            self._emit_release_eval_skip_no_local_position(_snap)
             return None
         self._broker_position_observed = True
         self._live_broker_flat_proven = False
         self._broker_authority_degraded = False
         strategy._broker_truth_flat = False
+        try:
+            _near_cost = float(_near.get("avg_cost") or 0.0)
+        except (TypeError, ValueError):
+            _near_cost = 0.0
+        try:
+            _far_cost = float(_far.get("avg_cost") or 0.0)
+        except (TypeError, ValueError):
+            _far_cost = 0.0
         for _name, _value in (
                 ("_near_side", _near_side), ("_far_side", _far_side),
                 ("_near_qty", _near["quantity"]),
                 ("_far_qty", _far["quantity"]),
-                ("_near_entry", _near.get("avg_cost")),
-                ("_far_entry", _far.get("avg_cost")),
+                ("_near_entry", _near_cost),
+                ("_far_entry", _far_cost),
                 ("_trade_id", _trade_id), ("_has_position", True),
                 ("_snapshot_hash", _snapshot_hash)):
             setattr(strategy, _name, _value)
+        # P0-A: broker-truth entry-time hydration (see single-leg branch).
+        _entry_ms = self._resolve_broker_hydration_entry_epoch(_snap, _codes)
+        if _entry_ms:
+            strategy._entry_guard_start_ms = _entry_ms
+            strategy._entry_ts_ms = _entry_ms
+            try:
+                strategy._entry_ts = datetime.fromtimestamp(_entry_ms / 1000.0)
+            except Exception:
+                strategy._entry_ts = None
         _auth = MtsAuthorityState(
             status=MtsAuthority.OPEN, trade_id=_trade_id,
             near_qty=-_near["quantity"] if _near_side == "SHORT" else _near["quantity"],
