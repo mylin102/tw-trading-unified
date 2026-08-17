@@ -2,21 +2,25 @@
 """Reconcile stale pending MTS orders at restart time.
 
 Problem: an order can be saved with status=pending_submit while the
-broker already cancelled it (cancelled_at stamped by the broker-cancel
-path).  The local pending guard (_mts_has_pending_mts_orders) then
-blocks new MTS entries forever even though the broker is flat.
+broker already cancelled it.  BUT `cancelled_at` alone is NOT broker
+evidence: core/order_management/order.py cancel() also stamps it
+(local watchdog cancel while the broker actually filled is a known
+historical failure).  Marking such an order cancelled would corrupt
+reconciliation and risk duplicate orders.
 
-This script runs before pm2 restart (wired into restart_live.sh):
+This script therefore requires EXPLICIT broker terminal evidence:
 
-  1. Find the latest TMF_*_orders.json in the trading runtime.
-  2. For every order with status == pending_submit:
-       - cancelled_at present  -> broker terminal evidence -> mark cancelled
-       - cancelled_at absent   -> leave untouched (fail-closed: may be a
-                                  real in-flight order)
-  3. Atomic write-back (backup + tmp + os.replace).  Dry-run supported.
+  - broker probe (read-only Shioaji query) MUST be available; if the
+    probe fails or is absent -> fail-closed: NO changes at all.
+  - For each pending_submit order with cancelled_at:
+      broker still lists the order as open  -> leave + warn (in-flight)
+      broker shows a position on the symbol -> leave + quarantine
+          (local cancel was wrong; the order FILLED)
+      broker shows neither                   -> truly cancelled -> mark
+  - pending_submit WITHOUT cancelled_at     -> always left untouched.
 
-Exit code 0 always (warnings on stderr) so a reconcile hiccup never
-blocks the restart; the pm2 start itself stays authoritative.
+Atomic write-back (backup + tmp + os.replace).  Exit code 0 always so
+a reconcile hiccup never blocks the restart.
 """
 
 import argparse
@@ -34,17 +38,74 @@ def find_orders_file(runtime_dir):
     return files[-1] if files else None
 
 
-def reconcile(orders_file, dry_run=False):
-    """Return the list of order_ids whose status was changed to cancelled."""
+class BrokerProbe:
+    """Read-only broker evidence.  Every query fails closed: on any
+    exception the order is treated as still open / position present."""
+
+    def __init__(self, api, account=None):
+        self._api = api
+        self._account = account
+
+    def has_open_order(self, broker_order_id):
+        if not broker_order_id:
+            return True  # no broker identity -> cannot prove cancelled
+        try:
+            trades = self._api.list_trades()
+            for trade in trades:
+                if str(getattr(trade, "ordno", "")) == str(broker_order_id):
+                    return True
+                if str(getattr(trade, "order_id", "")) == str(broker_order_id):
+                    return True
+            return False
+        except Exception:
+            return True  # query failed -> fail closed
+
+    def has_position(self, symbol):
+        try:
+            kwargs = {"account": self._account} if self._account else {}
+            positions = self._api.list_positions(**kwargs)
+            for pos in positions:
+                code = getattr(pos, "code", "") or getattr(
+                    getattr(pos, "contract", None), "code", "")
+                if code == symbol:
+                    return True
+            return False
+        except Exception:
+            return True  # query failed -> fail closed
+
+
+def reconcile(orders_file, broker=None, dry_run=False):
+    """Return dict {cancelled: [...], retained: [...]}.
+
+    Without a broker probe nothing is ever changed (fail-closed).
+    """
     with open(orders_file, encoding="utf-8") as fh:
         orders = json.load(fh)
     changed = []
+    retained = []
     for order in orders:
-        if order.get("status") == "pending_submit" and order.get("cancelled_at"):
-            order["status"] = "cancelled"
-            order["reconciled_at"] = datetime.now().isoformat()
-            order["reconcile_note"] = "stale pending with broker cancel evidence"
-            changed.append(order.get("order_id"))
+        if order.get("status") != "pending_submit":
+            continue
+        oid = order.get("order_id")
+        if not order.get("cancelled_at"):
+            retained.append(oid)
+            continue
+        if broker is None:
+            # no broker evidence available -> fail closed
+            retained.append(oid)
+            continue
+        broker_id = order.get("broker_order_id")
+        symbol = order.get("symbol")
+        if broker.has_open_order(broker_id):
+            retained.append(oid)  # still in-flight at broker
+            continue
+        if broker.has_position(symbol):
+            retained.append(oid)  # local cancel was wrong; order filled
+            continue
+        order["status"] = "cancelled"
+        order["reconciled_at"] = datetime.now().isoformat()
+        order["reconcile_note"] = "stale pending + broker evidence absent from open orders and positions"
+        changed.append(oid)
     if changed and not dry_run:
         backup = orders_file + ".bak"
         shutil.copy2(orders_file, backup)
@@ -52,7 +113,29 @@ def reconcile(orders_file, dry_run=False):
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(orders, fh, ensure_ascii=False, indent=2, default=str)
         os.replace(tmp, orders_file)
-    return changed
+    return {"cancelled": changed, "retained": retained}
+
+
+def _build_broker_probe():
+    """Build a read-only Shioaji probe from env credentials.
+
+    Returns None when unavailable -> reconcile fails closed.
+    """
+    try:
+        import shioaji as sj
+
+        api = sj.Shioaji()
+        api.login(
+            api_key=os.environ.get("SHIOAJI_API_KEY", ""),
+            secret_key=os.environ.get("SHIOAJI_SECRET_KEY", ""),
+            person_id=os.environ.get("SHIOAJI_PERSON_ID", ""),
+        )
+        return BrokerProbe(api, account=os.environ.get("SHIOAJI_ACCOUNT", ""))
+    except Exception as exc:
+        sys.stderr.write(
+            f"reconcile_pending_orders: broker probe unavailable ({exc}); "
+            f"fail-closed, no changes\n")
+        return None
 
 
 def main():
@@ -61,6 +144,8 @@ def main():
                     help="explicit orders file (default: latest in runtime)")
     ap.add_argument("--dry-run", action="store_true",
                     help="report only, do not write")
+    ap.add_argument("--skip-broker", action="store_true",
+                    help="do NOT query the broker (fail-closed no-op)")
     args = ap.parse_args()
 
     if args.orders_file:
@@ -70,9 +155,11 @@ def main():
         if not runtime_dir:
             try:
                 from core.runtime_paths import runtime_path
-                runtime_dir = os.path.dirname(os.path.dirname(runtime_path("exports", "x")))
+                runtime_dir = os.path.dirname(
+                    os.path.dirname(runtime_path("exports", "x")))
             except Exception:
-                sys.stderr.write("reconcile_pending_orders: TRADING_RUNTIME_DIR not set\n")
+                sys.stderr.write(
+                    "reconcile_pending_orders: TRADING_RUNTIME_DIR not set\n")
                 sys.exit(0)
         orders_file = find_orders_file(runtime_dir)
 
@@ -80,11 +167,18 @@ def main():
         sys.stderr.write("reconcile_pending_orders: no orders file found\n")
         sys.exit(0)
 
-    changed = reconcile(orders_file, dry_run=args.dry_run)
-    if changed:
-        tag = "DRY-RUN " if args.dry_run else ""
-        print(f"[reconcile] {tag}marked cancelled: {changed}")
-    else:
+    broker = None if args.skip_broker else _build_broker_probe()
+    if broker is None:
+        print("[reconcile] no broker evidence -> fail-closed, no changes")
+        sys.exit(0)
+
+    result = reconcile(orders_file, broker=broker, dry_run=args.dry_run)
+    tag = "DRY-RUN " if args.dry_run else ""
+    if result["cancelled"]:
+        print(f"[reconcile] {tag}marked cancelled: {result['cancelled']}")
+    if result["retained"]:
+        print(f"[reconcile] {tag}retained (no broker proof): {result['retained']}")
+    if not result["cancelled"] and not result["retained"]:
         print("[reconcile] no stale pending orders")
     sys.exit(0)
 
