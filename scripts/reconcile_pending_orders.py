@@ -12,11 +12,13 @@ This script therefore requires EXPLICIT broker terminal evidence:
 
   - broker probe (read-only Shioaji query) MUST be available; if the
     probe fails or is absent -> fail-closed: NO changes at all.
-  - For each pending_submit order with cancelled_at:
+  - For each pending_submit order (cancelled_at irrelevant — broker
+    query is the truth):
       broker still lists the order as open  -> leave + warn (in-flight)
       broker shows a position on the symbol -> leave + quarantine
           (local cancel was wrong; the order FILLED)
-      broker shows neither                   -> truly cancelled -> mark
+      broker shows neither                   -> mark BROKER_NOT_FOUND
+          (terminal, audit kept, never resubmit)
   - pending_submit WITHOUT cancelled_at     -> always left untouched.
 
 Atomic write-back (backup + tmp + os.replace).  Exit code 0 always so
@@ -49,7 +51,7 @@ class BrokerProbe:
 
     def has_open_order(self, broker_order_id):
         if not broker_order_id:
-            return True  # no broker identity -> cannot prove cancelled
+            return True  # no broker identity -> fail closed (treat as open)
         try:
             trades = self._api.list_trades()
             for trade in trades:
@@ -196,7 +198,7 @@ def main():
     result = reconcile(orders_file, broker=broker, dry_run=args.dry_run)
     tag = "DRY-RUN " if args.dry_run else ""
     if result["cancelled"]:
-        print(f"[reconcile] {tag}marked cancelled: {result['cancelled']}")
+        print(f"[reconcile] {tag}marked BROKER_NOT_FOUND (terminal, audit kept): {result['cancelled']}")
     if result["retained"]:
         print(f"[reconcile] {tag}retained (no broker proof): {result['retained']}")
     if not result["cancelled"] and not result["retained"]:

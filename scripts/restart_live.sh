@@ -26,7 +26,8 @@ set -a
 set +a
 export LRC_RELEASE_SHA="$(git rev-parse HEAD)"
 export TRADING_RUNTIME_DIR="/Users/myllin_mini/Documents/mylin102/tw-trading-unified-runtime"
-# [reconcile] mark stale pending MTS orders (broker cancel evidence) cancelled
+# [reconcile] mark stale pending MTS orders BROKER_NOT_FOUND (broker query truth;
+# cancelled_at irrelevant)
 # before restart so the entry guard is not blocked by phantom in-flight orders.
 "$PY" scripts/reconcile_pending_orders.py || echo "WARN: reconcile skipped"
 pm2 restart trading-system --update-env
