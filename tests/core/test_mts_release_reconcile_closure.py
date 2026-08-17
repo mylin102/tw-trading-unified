@@ -62,7 +62,7 @@ def _snap(broker_trades, capture="OK"):
 
 
 def _deal_row(order_id="BRK-REL", code="TMFI6", price=46016.0, qty=1,
-              deal_id="D-1"):
+              deal_id="D-1", exchange_seq="EX-1"):
     """Shape produced by _normalize_order_deal_records (FDEAL)."""
     return {
         "id": order_id, "broker_order_id": order_id, "ordno": "ORD-9",
@@ -70,7 +70,7 @@ def _deal_row(order_id="BRK-REL", code="TMFI6", price=46016.0, qty=1,
         "status": "Filled", "price": price, "quantity": qty,
         "filled_quantity": qty, "trade_id": order_id, "ts": 1786690800.0,
         "deals": [{"trade_id": deal_id, "broker_trade_id": deal_id,
-                   "exchange_fill_id": deal_id, "exchange_seq": "EX-1",
+                   "exchange_fill_id": deal_id, "exchange_seq": exchange_seq,
                    "price": price, "quantity": qty, "ordno": "ORD-9"}],
     }
 
@@ -257,7 +257,8 @@ def test_partial_fill_does_not_advance_lifecycle(tmp_path, monkeypatch):
 
     # remaining lot fills on the next refresh -> now fully FILLED
     mon._reconcile_local_orders_from_snapshot(
-        _snap([_deal_row(deal_id="D-2", price=46020.0, qty=1)]))
+        _snap([_deal_row(deal_id="D-2", price=46020.0, qty=1,
+                         exchange_seq="EX-2")]))
 
     assert order.status is OrderStatus.FILLED
     assert len(calls) == 1
