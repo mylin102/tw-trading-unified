@@ -54,31 +54,46 @@ def is_terminal_status(status: str) -> bool:
     return status in TERMINAL_TRADE_STATUSES
 
 
-def trade_identity(trade: Any) -> tuple[str, str, str, str]:
+def trade_identity(trade: Any) -> tuple[str, str, str, str] | None:
     """Raw broker identity: (ordno, id, broker_order_id, seqno).
 
     Nested ``order`` fields are the fallback for Shioaji 1.7 trades that
     omit top-level identity.
+
+    Returns None when NO identity field is present anywhere (top-level and
+    nested) — an identity-less row is non-reconcilable and must NEVER be
+    collapsed against another identity-less row (fail-closed; distinct
+    orders without identity must all survive).
     """
     order = getattr(trade, "order", None)
-    return (
-        str(getattr(trade, "ordno", None)
-            or getattr(order, "ordno", None) or ""),
-        str(getattr(trade, "id", None)
-            or getattr(order, "id", None) or ""),
-        str(getattr(trade, "broker_order_id", None)
-            or getattr(order, "id", None) or ""),
-        str(getattr(trade, "seqno", None)
-            or getattr(order, "seqno", None) or ""),
-    )
+    ordno = (getattr(trade, "ordno", None)
+             or getattr(order, "ordno", None))
+    id_ = (getattr(trade, "id", None)
+           or getattr(order, "id", None))
+    broker_id = (getattr(trade, "broker_order_id", None)
+                 or getattr(order, "id", None))
+    seqno = (getattr(trade, "seqno", None)
+             or getattr(order, "seqno", None))
+    if ordno is None and id_ is None and broker_id is None and seqno is None:
+        return None
+    return (str(ordno or ""), str(id_ or ""),
+            str(broker_id or ""), str(seqno or ""))
 
 
 def dedupe_trades(trades: list[Any]) -> list[Any]:
-    """Collapse rows sharing the same raw broker identity (first wins)."""
+    """Collapse rows sharing the same raw broker identity (first wins).
+
+    Identity-less rows (``trade_identity`` is None) are NEVER collapsed —
+    each is retained separately so a distinct order without broker
+    identity can never be dropped (fail-closed).
+    """
     seen: set[tuple[str, str, str, str]] = set()
     out: list[Any] = []
     for trade in trades or []:
         ident = trade_identity(trade)
+        if ident is None:
+            out.append(trade)  # non-reconcilable: keep every row
+            continue
         if ident in seen:
             continue
         seen.add(ident)
@@ -87,7 +102,12 @@ def dedupe_trades(trades: list[Any]) -> list[Any]:
 
 
 def normalize_trade_row(trade: Any) -> dict[str, Any]:
-    """Canonical trade evidence row with raw identity preserved."""
+    """Canonical trade evidence row with raw identity preserved.
+
+    Rows with no broker identity anywhere are flagged
+    ``identity_missing: True`` (typed disposition — fail-closed, never
+    silently treated as a known order).
+    """
     order = getattr(trade, "order", None)
     return {
         "id": getattr(trade, "id", None)
@@ -105,6 +125,7 @@ def normalize_trade_row(trade: Any) -> dict[str, Any]:
                 or getattr(getattr(order, "contract", None), "code", None),
         "status": normalize_trade_status(trade),
         "quantity": getattr(trade, "quantity", None),
+        "identity_missing": trade_identity(trade) is None,
     }
 
 
