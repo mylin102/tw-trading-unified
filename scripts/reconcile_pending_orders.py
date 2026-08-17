@@ -88,9 +88,6 @@ def reconcile(orders_file, broker=None, dry_run=False):
         if order.get("status") != "pending_submit":
             continue
         oid = order.get("order_id")
-        if not order.get("cancelled_at"):
-            retained.append(oid)
-            continue
         if broker is None:
             # no broker evidence available -> fail closed
             retained.append(oid)
@@ -101,11 +98,18 @@ def reconcile(orders_file, broker=None, dry_run=False):
             retained.append(oid)  # still in-flight at broker
             continue
         if broker.has_position(symbol):
-            retained.append(oid)  # local cancel was wrong; order filled
+            retained.append(oid)  # local state wrong; the order filled
             continue
-        order["status"] = "cancelled"
+        # The broker has NEITHER the open order NOR a position for this
+        # symbol: the pending is phantom (cancelled_at presence is
+        # irrelevant — the broker query is the truth).  Mark terminal —
+        # never treated as a successful fill, never resubmitted — the
+        # full record stays for audit.
+        order["status"] = "BROKER_NOT_FOUND"
         order["reconciled_at"] = datetime.now().isoformat()
-        order["reconcile_note"] = "stale pending + broker evidence absent from open orders and positions"
+        order["reconcile_note"] = (
+            "phantom pending: broker confirms neither open order nor "
+            "position (BROKER_NOT_FOUND, RECONCILE_REQUIRED)")
         changed.append(oid)
     if changed and not dry_run:
         backup = orders_file + ".bak"
