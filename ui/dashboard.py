@@ -3440,6 +3440,53 @@ def _build_flat_broker_mts_state(telemetry: dict) -> dict:
     }
 
 
+def _build_live_broker_mts_state(positions: list, canonical: dict,
+                                 params: dict | None = None) -> dict | None:
+    """Build broker-authoritative MTS state, including a remaining leg."""
+    params = params if isinstance(params, dict) else {}
+    rows = [p for p in (positions or [])
+            if isinstance(p, dict)
+            and p.get("account") == "futures"
+            and p.get("code") in {"TMFH6", "TMFI6"}
+            and int(p.get("quantity", 0) or 0) > 0]
+    by_code = {p.get("code"): p for p in rows}
+    if len(by_code) not in (1, 2):
+        return None
+
+    def _field(code, name, missing=None):
+        row = by_code.get(code)
+        return row.get(name, missing) if row else missing
+
+    state = {
+        "has_position": True,
+        "near_entry": _field("TMFH6", "avg_cost", 0.0),
+        "far_entry": _field("TMFI6", "avg_cost", 0.0),
+        "near_upl": _field("TMFH6", "pnl"),
+        "far_upl": _field("TMFI6", "pnl"),
+        "near_side": _field("TMFH6", "direction"),
+        "far_side": _field("TMFI6", "direction"),
+        "action": f'{_field("TMFH6", "direction", "?")} / '
+                   f'{_field("TMFI6", "direction", "?")}',
+        "release_state": "BOTH_HELD" if len(by_code) == 2 else "SINGLE_LEG",
+        "position_phase": "SPREAD" if len(by_code) == 2 else "SINGLE_LEG",
+        "trade_id": "broker-reconciled-" +
+                    str(canonical.get("canonical_input_hash", ""))[:16],
+        "reason": "broker_snapshot",
+        "_updated": canonical.get("captured_at") or
+                    canonical.get("captured_at_ms") or "?",
+        "release_stop_points": params.get("release_stop_points"),
+        "trail_distance_points": params.get("trail_distance_points"),
+        "atr": params.get("atr_current") or params.get("atr") or
+               _latest_live_atr(),
+    }
+    if len(by_code) == 1:
+        remaining = next(iter(by_code))
+        state["released_leg"] = "near" if remaining == "TMFI6" else "far"
+        state["near_status"] = "OPEN" if remaining == "TMFH6" else "RELEASED"
+        state["far_status"] = "OPEN" if remaining == "TMFI6" else "RELEASED"
+    return state
+
+
 def _monitor_status():
     try:
         r = subprocess.run(["pgrep", "-f", "main.py"], capture_output=True)
@@ -4490,30 +4537,9 @@ elif _selected_product == "TMF":
                     and (_canon.get("fetch_status") or {}).get("capture") == "OK"):
                 _live_mts_params = (futures_cfg.get("mts", {}).get("params", {})
                                     if isinstance(futures_cfg, dict) else {})
-                if len({p.get("code") for p in _fut}) == 2:
-                    _by = {p["code"]: p for p in _fut}
-                    _broker_mts_state = {
-                        "has_position": True,
-                        "near_entry": _by["TMFH6"].get("avg_cost"),
-                        "far_entry": _by["TMFI6"].get("avg_cost"),
-                        "near_upl": _by["TMFH6"].get("pnl"),
-                        "far_upl": _by["TMFI6"].get("pnl"),
-                        "near_side": _by["TMFH6"].get("direction"),
-                        "far_side": _by["TMFI6"].get("direction"),
-                        "action": (f'{_by["TMFH6"].get("direction", "?")} / '
-                                   f'{_by["TMFI6"].get("direction", "?")}'),
-                        "release_state": "BOTH_HELD",
-                        "trade_id": "broker-reconciled-" + str(_canon.get("canonical_input_hash", ""))[:16],
-                        "reason": "broker_snapshot",
-                        "position_phase": "SPREAD",
-                        "_updated": _canon.get("captured_at") or _canon.get("captured_at_ms") or "?",
-                        "release_stop_points": _live_mts_params.get("release_stop_points"),
-                        "trail_distance_points": _live_mts_params.get("trail_distance_points"),
-                        "atr": (_live_mts_params.get("atr_current")
-                                or _live_mts_params.get("atr")
-                                or _latest_live_atr()),
-                    }
-                elif not _canon.get("open_orders"):
+                _broker_mts_state = _build_live_broker_mts_state(
+                    _fut, _canon, _live_mts_params)
+                if _broker_mts_state is None and not _canon.get("open_orders"):
                     # A current, successful broker snapshot with no complete
                     # spread is authoritative FLAT/partial evidence.  Do
                     # not fall through to stale /tmp paper state.
