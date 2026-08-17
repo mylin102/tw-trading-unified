@@ -153,8 +153,9 @@ def test_release_fill_reconcile_closes_lifecycle_once(tmp_path, monkeypatch):
     assert len(calls) == 1
     assert calls[0]["leg"] == "far"
     assert calls[0]["release_price"] == 46016.0
-    # remaining-leg price falls back to the strategy entry when no quote
-    assert calls[0]["price"] == strat._far_entry
+    # remaining-leg price falls back to the strategy entry when no quote:
+    # released=far -> remaining=near -> near entry (same as the callback)
+    assert calls[0]["price"] == strat._near_entry
     assert calls[0]["order_id"] == order.order_id
     assert calls[0]["event_time"] is not None
 
