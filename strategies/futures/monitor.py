@@ -11480,17 +11480,26 @@ class FuturesMonitor:
                 return "LONG"
             return None
 
-        # 1. broker canonical first (broker facts are the authority)
+        # 1. broker canonical first (broker facts are the authority).
+        #    capture == OK is authoritative IMMEDIATELY — even an empty
+        #    positions list proves flat and must never fall back to a
+        #    possibly-stale local state (ghost resurrection).
         try:
             _snap = self._capture_post_startup_snapshot()
             if (_snap and (_snap.get("fetch_status") or {})
                     .get("capture") == "OK"):
+                _canon_ok = True
                 _codes = {str(getattr(self.contract, "code", "")),
                           str(getattr(self.far_contract, "code", ""))}
                 _rows = [p for p in (_snap.get("positions") or [])
                          if p.get("account") == "futures"
                          and str(p.get("code") or "") in _codes
                          and int(p.get("quantity") or 0) > 0]
+                if not _rows:
+                    # broker flat, or no target MTS contracts -> flat,
+                    # zero close info, zero orders
+                    return (False, None, None, None,
+                            "mts-emergency", None)
                 if _rows:
                     if len(_rows) != len({str(p.get("code")) for p in _rows}):
                         # duplicate contract: fail closed
