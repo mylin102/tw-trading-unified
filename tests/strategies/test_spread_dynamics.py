@@ -273,3 +273,69 @@ def test_monitor_dynamics_time_regression_does_not_leak_future_state():
                 "far_close": 98.0, "spread_z": 2.0}
     monitor._update_mts_spread_dynamics(next_bar)
     assert next_bar["dz"] == 1.0
+
+
+def test_research_rejects_stale_or_missing_quotes(monkeypatch):
+    """P1-C: a candidate whose bar EXPLICITLY carries a stale quote_age or
+    invalid BBO evidence must not be recorded as an entry observation.
+    Absent keys pass (legacy bars keep recording)."""
+    monitor = _bare_monitor_for_dynamics()
+    captured = []
+    import core.entry_research_store as store
+    import datetime
+    monkeypatch.setattr(store, "record_entry_observation",
+                        lambda audit, **kw: captured.append(audit) or True)
+    strat = type("Strategy", (), {"_entry_z": 1.0, "_trade_id": None,
+                                  "_max_quote_age_ms": 1000})()
+    now = datetime.datetime.now()
+
+    stale = {"ts": 100.0, "session_type": "day", "near_close": 101.0,
+             "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+             "quote_age_ms": 5000}
+    monitor._record_mts_entry_research_candidate(strat, stale, now)
+    assert captured == []          # stale quote rejected
+
+    invalid_bbo = {"ts": 101.0, "session_type": "day", "near_close": 101.0,
+                   "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+                   "near_bid": 0, "near_ask": None}
+    monitor._record_mts_entry_research_candidate(strat, invalid_bbo, now)
+    assert captured == []          # invalid BBO rejected
+
+    ok_bar = {"ts": 102.0, "session_type": "day", "near_close": 101.0,
+              "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+              "quote_age_ms": 100, "near_bid": 100.5, "near_ask": 101.5,
+              "far_bid": 97.5, "far_ask": 98.5}
+    monitor._record_mts_entry_research_candidate(strat, ok_bar, now)
+    assert len(captured) == 1
+
+
+def test_research_ma_std_evolve_across_observations(monkeypatch):
+    """P1-C: rolling mean/std are recorded per observation — never a
+    silently static cached constant across independent candidates, and the
+    dynamics features evolve with them."""
+    monitor = _bare_monitor_for_dynamics()
+    captured = []
+    import core.entry_research_store as store
+    import datetime
+    monkeypatch.setattr(store, "record_entry_observation",
+                        lambda audit, **kw: captured.append(audit) or True)
+    strat = type("Strategy", (), {"_entry_z": 1.0, "_trade_id": None})()
+    now = datetime.datetime.now()
+
+    bar1 = {"ts": 100.0, "session_type": "day", "near_close": 101.0,
+            "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+            "spread_ma": 2.0, "spread_std": 0.8}
+    bar2 = {"ts": 101.0, "session_type": "day", "near_close": 102.0,
+            "far_close": 98.0, "spread_z": 3.1, "entry_z": 1.0,
+            "spread_ma": 2.6, "spread_std": 1.1}
+
+    monitor._update_mts_spread_dynamics(bar1)
+    monitor._record_mts_entry_research_candidate(strat, bar1, now)
+    monitor._update_mts_spread_dynamics(bar2)
+    monitor._record_mts_entry_research_candidate(strat, bar2, now)
+
+    assert captured[0]["spread_ma"] == 2.0
+    assert captured[0]["spread_std"] == 0.8
+    assert captured[1]["spread_ma"] == 2.6
+    assert captured[1]["spread_std"] == 1.1
+    assert captured[1]["dz"] is not None      # dynamics evolve per bar
