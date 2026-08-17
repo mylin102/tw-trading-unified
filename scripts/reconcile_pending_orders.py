@@ -25,6 +25,7 @@ a reconcile hiccup never blocks the restart.
 
 import argparse
 import glob
+import inspect
 import json
 import os
 import shutil
@@ -124,16 +125,32 @@ def _build_broker_probe():
     try:
         import shioaji as sj
 
+        api_key = os.environ.get("SHIOAJI_API_KEY", "")
+        secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "")
+        person_id = os.environ.get("SHIOAJI_PERSON_ID", "")
+
+        # Shioaji 1.7 does not accept person_id on login; person_id is used
+        # by activate_ca instead.  Older/custom wrappers may expose it as an
+        # explicit login parameter, so detect that contract without passing
+        # speculative kwargs.  A signature-inspection failure is treated as
+        # the conservative no-person-id form.
         api = sj.Shioaji()
-        api.login(
-            api_key=os.environ.get("SHIOAJI_API_KEY", ""),
-            secret_key=os.environ.get("SHIOAJI_SECRET_KEY", ""),
-            person_id=os.environ.get("SHIOAJI_PERSON_ID", ""),
-        )
+        login_kwargs = {"api_key": api_key, "secret_key": secret_key}
+        try:
+            login_params = inspect.signature(api.login).parameters
+        except (TypeError, ValueError):
+            login_params = {}
+        if person_id and "person_id" in login_params:
+            login_kwargs["person_id"] = person_id
+
+        result = api.login(**login_kwargs)
+        if result is False:
+            raise RuntimeError("probe login failed")
         return BrokerProbe(api, account=os.environ.get("SHIOAJI_ACCOUNT", ""))
     except Exception as exc:
         sys.stderr.write(
-            f"reconcile_pending_orders: broker probe unavailable ({exc}); "
+            "reconcile_pending_orders: broker probe unavailable "
+            f"(BROKER_PROBE_UNAVAILABLE: {type(exc).__name__}); "
             f"fail-closed, no changes\n")
         return None
 
