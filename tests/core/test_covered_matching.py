@@ -71,7 +71,8 @@ def test_covered_with_duplicate_filled_rows():
 
 def test_nested_identity_fallback():
     # identity resolves from nested order.id when top-level absent
-    oo = [_oo(broker_order_id=None, ordno=None, seqno=None)]
+    oo = [_oo(broker_order_id=None, ordno=None, seqno=None,
+              order={"id": "B-1", "ordno": "B-1", "seqno": "S-1"})]
     filled = [_filled(broker_order_id="B-1", symbol="TMFH6", side="sell", quantity=1)]
     assert open_orders_fully_covered_by_filled(oo, filled) is True
 
