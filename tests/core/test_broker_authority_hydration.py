@@ -245,6 +245,128 @@ def test_valid_hydration_without_anchor_clears_stale_entry_clock(
     assert strategy._entry_ts is None
 
 
+def test_entry_time_missing_binding_fields_fails_closed(tmp_path, monkeypatch):
+    """A candidate row missing quantity or price cannot bind the entry time
+    (no wildcard) — fail-closed to no anchor."""
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
+    monitor = _monitor(tmp_path)
+    monitor._capture_post_startup_snapshot = lambda: _snap(
+        positions=[
+            {"account": "futures", "code": "TMFI6", "quantity": 1,
+             "direction": "Action.Buy", "avg_cost": 46033.0},
+        ],
+        broker_trades=[
+            # no price, no quantity -> cannot prove this is the current
+            # generation's fill
+            {"id": "NO-FIELDS", "code": "TMFI6", "status": "Filled",
+             "direction": "buy", "ts": "2026-08-17T23:35:00+08:00"},
+        ],
+    )
+    strategy = _strategy()
+    monitor._refresh_live_broker_authority(strategy)
+
+    assert strategy._has_position is True
+    assert strategy._entry_guard_start_ms is None
+    assert strategy._entry_ts_ms is None
+    assert strategy._entry_ts is None
+
+
+def test_entry_time_ignores_non_terminal_order_rows(tmp_path, monkeypatch):
+    """PendingSubmit / non-fill rows are NOT fill evidence: they must never
+    anchor the entry clock even when code/side/qty/price match."""
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
+    monitor = _monitor(tmp_path)
+    monitor._capture_post_startup_snapshot = lambda: _snap(
+        positions=[
+            {"account": "futures", "code": "TMFI6", "quantity": 1,
+             "direction": "Action.Buy", "avg_cost": 46033.0},
+        ],
+        broker_trades=[
+            {"id": "PENDING", "code": "TMFI6", "status": "PendingSubmit",
+             "direction": "buy", "price": 46033.0, "quantity": 1,
+             "ts": "2026-08-17T23:30:00+08:00"},
+            {"id": "FILLED", "code": "TMFI6", "status": "Filled",
+             "direction": "buy", "price": 46033.0, "quantity": 1,
+             "ts": "2026-08-17T23:35:00+08:00"},
+        ],
+    )
+    strategy = _strategy()
+    monitor._refresh_live_broker_authority(strategy)
+
+    _expected = datetime.fromisoformat(
+        "2026-08-17T23:35:00+08:00").timestamp() * 1000.0
+    assert strategy._entry_guard_start_ms is not None
+    assert abs(strategy._entry_guard_start_ms - _expected) < 2000.0
+
+    # only a non-terminal row -> no anchor at all
+    monitor2 = _monitor(tmp_path)
+    monitor2._capture_post_startup_snapshot = lambda: _snap(
+        positions=[
+            {"account": "futures", "code": "TMFI6", "quantity": 1,
+             "direction": "Action.Buy", "avg_cost": 46033.0},
+        ],
+        broker_trades=[
+            {"id": "PENDING", "code": "TMFI6", "status": "PendingSubmit",
+             "direction": "buy", "price": 46033.0, "quantity": 1,
+             "ts": "2026-08-17T23:30:00+08:00"},
+        ],
+    )
+    s2 = _strategy()
+    monitor2._refresh_live_broker_authority(s2)
+    assert s2._entry_guard_start_ms is None
+
+
+def _write_state(tmp_path, **over):
+    import json
+    from pathlib import Path
+    payload = {
+        "has_position": True,
+        "near_side": "SHORT", "far_side": "LONG",
+        "near_entry": 45879.0, "far_entry": 46033.0,
+        "trade_id": "mts-old-gen", "released_leg": None,
+        "entry_ts": "2026-08-10T09:01:00+08:00",
+    }
+    payload.update(over)
+    Path(tmp_path, "mts_position_state.json").write_text(
+        json.dumps(payload), encoding="utf-8")
+
+
+def test_state_fallback_rejects_other_generation(tmp_path, monkeypatch):
+    """The state-file fallback must verify the persisted legs belong to the
+    CURRENT broker generation (role + side + cost) before anchoring."""
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
+    _write_state(tmp_path, far_side="SHORT")  # wrong side vs current LONG
+    monitor = _monitor(tmp_path)
+    monitor._capture_post_startup_snapshot = lambda: _two_leg_snap_without_deals()
+    strategy = _strategy()
+    monitor._refresh_live_broker_authority(strategy)
+
+    assert strategy._has_position is True
+    assert strategy._entry_guard_start_ms is None
+    assert strategy._entry_ts_ms is None
+    assert strategy._entry_ts is None
+
+
+def test_state_fallback_accepts_matching_generation(tmp_path, monkeypatch):
+    """Positive control: a state file whose legs match the current broker
+    generation still provides the durable entry clock."""
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
+    _write_state(tmp_path)
+    monitor = _monitor(tmp_path)
+    monitor._capture_post_startup_snapshot = lambda: _two_leg_snap_without_deals()
+    strategy = _strategy()
+    monitor._refresh_live_broker_authority(strategy)
+
+    _expected = datetime.fromisoformat(
+        "2026-08-10T09:01:00+08:00").timestamp() * 1000.0
+    assert strategy._entry_guard_start_ms is not None
+    assert abs(strategy._entry_guard_start_ms - _expected) < 2000.0
+
+
 def _two_leg_snap_without_deals():
     """Two-leg snapshot with NO broker_trades / fills / state -> no anchor."""
     return _snap(
