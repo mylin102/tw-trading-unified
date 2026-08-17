@@ -324,10 +324,17 @@ def test_reconciled_state_write_persists_anchor_and_identity(tmp_path):
     broker-reconciliation identity (restart-safe persistence)."""
     s, config = _setup_armed(tmp_path, confirm_ticks=0)
     _qualified_monitor(tmp_path, s)
-    bar = _make_bar(near_close=45600, far_close=45900, session_type="day",
-                    far_bid=45890.0, far_ask=45930.0, far_tick_age_ms=5.0)
-    ctx = StrategyContext(
-        market=MarketData(last_bar=bar, ticker="TMF"),
+    # bar1: baseline tick (PENDING_REANCHOR -> READY, anchor 45910)
+    bar1 = _make_bar(near_close=45600, far_close=45900, session_type="day",
+                     far_bid=45890.0, far_ask=45930.0, far_tick_age_ms=5.0)
+    ctx1 = StrategyContext(
+        market=MarketData(last_bar=bar1, ticker="TMF"),
+        position=PositionView(size=1), config=config)
+    # bar2: benign manage tick (READY single-leg path -> state write)
+    bar2 = _make_bar(near_close=45610, far_close=45910, session_type="day",
+                     far_bid=45900.0, far_ask=45920.0, far_tick_age_ms=5.0)
+    ctx2 = StrategyContext(
+        market=MarketData(last_bar=bar2, ticker="TMF"),
         position=PositionView(size=1), config=config)
     calls = {}
 
@@ -337,7 +344,8 @@ def test_reconciled_state_write_persists_anchor_and_identity(tmp_path):
     with patch("strategies.plugins.futures.active.tmf_spread._write_mts_state",
                side_effect=_cap):
         with patch("strategies.plugins.futures.active.tmf_spread._append_event"):
-            s.on_bar(ctx)  # baseline tick
+            s.on_bar(ctx1)  # baseline tick
+            s.on_bar(ctx2)  # manage tick
     # a state write happened and carries the anchor + recovery identity
     assert calls, "no state write captured"
     assert calls.get("trail_peak") == pytest.approx(45910.0)

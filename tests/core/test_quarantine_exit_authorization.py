@@ -58,14 +58,19 @@ def test_quarantined_ctx_blocks_entry_manual_oco_cancel():
     ctx = _quarantined_ctx()
     for o in (_order(strategy="MTS_ENTRY", proof=_proof()),
               _order(strategy="MTS_RELEASE_OCO", proof=_proof()),
-              _order(strategy="MANUAL", proof=_proof()),
-              _order(strategy="MTS_RELEASE", proof=_proof())):
+              _order(strategy="MANUAL", proof=_proof())):
         with pytest.raises(LiveOrderBlocked):
             ctx.assert_order_allowed(o, method="place_order")
     # generic cancel without proof blocked
     with pytest.raises(LiveOrderBlocked):
         ctx.assert_order_allowed(_order(strategy="MTS_RELEASE"),
                                  method="cancel_order")
+    # generic cancel WITH a valid proof still blocked (carve-out is
+    # submit-only)
+    with pytest.raises(LiveOrderBlocked):
+        ctx.assert_order_allowed(
+            _order(strategy="MTS_RELEASE", proof=_proof()),
+            method="cancel_order")
 
 
 def test_quarantined_exit_without_proof_blocked():
@@ -242,12 +247,32 @@ def test_quarantine_exit_proof_requires_recovery_identity(tmp_path):
 
 # ── end-to-end: quarantined remaining-leg RELEASE via _submit_mts_order_signal
 
+class _FakeOrderMgr:
+    """Minimal OrderManager stand-in: order store + create_order."""
+
+    def __init__(self):
+        self.active_orders = {}
+        self.completed = []
+        self._n = 0
+
+    def create_order(self, **kw):
+        self._n += 1
+        return SimpleNamespace(
+            order_id=f"ORD-T{self._n}", intent_id=f"IT-T{self._n}",
+            price=0, status="pending_submit", filled_quantity=0,
+            avg_fill_price=None, broker_order_id=None, **kw)
+
+
 def _submit_monitor(tmp_path):
     m = _monitor_with_recovery(tmp_path)
-    m.order_mgr = SimpleNamespace(active_orders={}, completed=[])
+    m.order_mgr = _FakeOrderMgr()
+    m._pending_lifecycle_orders = {}
+    m.paper_fill_sim = False
     m._capture_post_startup_snapshot = lambda: _fresh_snap()
     m._hydrate_exit_only_position = lambda: None
     m._leg_lock_enabled = lambda: False
+    m._exit_only_bbo_slots = lambda: {}
+    m._exit_only_position_has_position = lambda: False
     m._submit_via_gateway = lambda order, **kw: True
     m._gateway = lambda: OrderIntentGateway()
     m._record_gateway_intent = lambda *a, **kw: None
@@ -256,6 +281,7 @@ def _submit_monitor(tmp_path):
 
 def test_quarantined_release_submits_with_proof(tmp_path):
     """Snapshot-bound remaining-leg MTS_RELEASE goes through in quarantine."""
+    from unittest.mock import patch as _patch
     from strategies.plugins.futures.active.tmf_spread import TMFSpread
     m = _submit_monitor(tmp_path)
     s = _recovered_strategy()
@@ -270,16 +296,20 @@ def test_quarantined_release_submits_with_proof(tmp_path):
                 "spread_z": 0.0}
     submitted = []
     m._submit_via_gateway = lambda order, **kw: submitted.append(order) or True
-    with patch.object(m, "_append_mts_event"):
-        m._submit_mts_order_signal(signal, s, bar_dict, "2026-08-18T08:00:00")
+    with _patch("strategies.futures.monitor.is_taifex_futures_market_open",
+                return_value=True):
+        with patch.object(m, "_append_mts_event"):
+            m._submit_mts_order_signal(signal, s, bar_dict, "2026-08-18T08:00:00")
     assert len(submitted) == 1
     assert submitted[0].strategy == "MTS_RELEASE"
     assert submitted[0].symbol == "TMFH6"  # released near leg close order
+    assert submitted[0].quarantine_exit_proof is not None
 
 
 def test_quarantined_release_without_proof_zero_submit(tmp_path):
     """No recovery identity -> proof None -> ORDER_INTENT_BLOCKED, zero
     submit."""
+    from unittest.mock import patch as _patch
     from strategies.plugins.futures.active.tmf_spread import TMFSpread
     m = _submit_monitor(tmp_path)
     s = _recovered_strategy()
@@ -297,6 +327,8 @@ def test_quarantined_release_without_proof_zero_submit(tmp_path):
     m._submit_via_gateway = lambda order, **kw: submitted.append(order) or True
     events = []
     m._append_mts_event = lambda event, **kw: events.append(event)
-    m._submit_mts_order_signal(signal, s, bar_dict, "2026-08-18T08:00:00")
+    with _patch("strategies.futures.monitor.is_taifex_futures_market_open",
+                return_value=True):
+        m._submit_mts_order_signal(signal, s, bar_dict, "2026-08-18T08:00:00")
     assert submitted == []
     assert "ORDER_INTENT_BLOCKED" in events
