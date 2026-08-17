@@ -48,6 +48,14 @@ def _identities(row: Any) -> set[str]:
     return {str(value) for value in values if value not in (None, "")}
 
 
+def _preferred_identity(row: Any, intersection: set[str]) -> str | None:
+    for name in ("broker_order_id", "id", "exchange_order_id", "ordno", "seqno"):
+        value = _value(row, name)
+        if value not in (None, "") and str(value) in intersection:
+            return str(value)
+    return next(iter(sorted(intersection)), None)
+
+
 def _status(row: Any) -> str:
     raw = _value(row, "status")
     if isinstance(raw, dict):
@@ -104,7 +112,7 @@ def reconcile_order(local_order: Any, snapshot: dict[str, Any]) -> LifecycleDeci
         if state in TERMINAL_STATES:
             return LifecycleDecision(order_id, state, "APPLY_TERMINAL",
                                      "EXPLICIT_BROKER_TERMINAL",
-                                     next(iter(_identities(row) & local_ids)))
+                                     _preferred_identity(row, _identities(row) & local_ids))
 
     for row in snapshot["open_orders"]:
         matched = _identities(row) & local_ids
@@ -113,14 +121,14 @@ def reconcile_order(local_order: Any, snapshot: dict[str, Any]) -> LifecycleDeci
             if state in TERMINAL_STATES:
                 return LifecycleDecision(order_id, state, "APPLY_TERMINAL",
                                          "EXPLICIT_BROKER_TERMINAL",
-                                         next(iter(matched)))
+                                         _preferred_identity(row, matched))
             if state == "PARTIAL_FILLED":
                 return LifecycleDecision(order_id, state, "RETAIN",
                                          "BROKER_PARTIAL_FILLED",
-                                         next(iter(matched)))
+                                         _preferred_identity(row, matched))
             return LifecycleDecision(order_id, "PENDING_UNCONFIRMED", "RETAIN",
                                      "BROKER_ORDER_PRESENT",
-                                     next(iter(matched)))
+                                     _preferred_identity(row, matched))
 
     symbol = _value(local_order, "symbol")
     if symbol and any(str(_value(pos, "code")) == str(symbol)
@@ -130,4 +138,3 @@ def reconcile_order(local_order: Any, snapshot: dict[str, Any]) -> LifecycleDeci
 
     return LifecycleDecision(order_id, "BROKER_NOT_FOUND", "MARK_TERMINAL",
                              "BROKER_ORDER_AND_POSITION_ABSENT")
-
