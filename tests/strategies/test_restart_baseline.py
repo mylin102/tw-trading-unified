@@ -216,6 +216,31 @@ def test_restart_baseline_unknown_quote_age_fails_closed(tmp_path):
     assert _skip_reason(s) == "TRAIL_REANCHOR_QUOTE_AGE_UNKNOWN"
 
 
+@pytest.mark.parametrize("far_tick_age_ms", [
+    float("nan"),               # NaN — comparisons are False, must not pass
+    float("inf"),               # +Inf
+    float("-inf"),              # -Inf
+    -1.0,                       # negative — must NOT be clamped to 0
+    -0.001,                     # tiny negative
+    "nan",                      # string float() parses to NaN
+    "abc",                      # unparseable string
+    True,                       # bool (int subclass) is not a real age
+])
+def test_restart_baseline_invalid_quote_age_fails_closed(tmp_path,
+                                                         far_tick_age_ms):
+    """NaN / ±Inf / negative / bool / unparseable age is NOT a provable
+    freshness — fail closed (typed reject), never anchor, never clamp to 0."""
+    s, config = _single_leg_pending(tmp_path, released_leg="near",
+                                    position_session="day")
+    bar = _make_bar(near_close=45600, far_close=45900, session_type="day",
+                    far_bid=45890.0, far_ask=45930.0,
+                    far_tick_age_ms=far_tick_age_ms)
+    _run_bar(s, config, bar)
+    assert s._trail_anchor_status == TrailAnchorStatus.PENDING_REANCHOR
+    assert s._single_leg_anchor_price == 0.0
+    assert _skip_reason(s) == "TRAIL_REANCHOR_QUOTE_INVALID"
+
+
 def test_restart_baseline_session_mismatch_fails_closed(tmp_path):
     s, config = _single_leg_pending(tmp_path, released_leg="near",
                                     position_session="day")
