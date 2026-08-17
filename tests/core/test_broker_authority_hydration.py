@@ -56,8 +56,10 @@ def _two_leg_snap():
         ],
         broker_trades=[
             {"id": "BRK-NEAR", "code": "TMFH6", "status": "Filled",
+             "direction": "sell", "price": 45879.0, "quantity": 1,
              "ts": "2026-08-17T09:01:00+08:00"},
             {"id": "BRK-FAR", "code": "TMFI6", "status": "Filled",
+             "direction": "buy", "price": 46033.0, "quantity": 1,
              "ts": "2026-08-17T09:01:02+08:00"},
         ],
     )
@@ -116,6 +118,7 @@ def test_single_leg_hydration_sets_entry_time_no_synthetic_leg(tmp_path, monkeyp
         ],
         broker_trades=[
             {"id": "BRK-FAR", "code": "TMFI6", "status": "Filled",
+             "direction": "buy", "price": 46033.0, "quantity": 1,
              "ts": "2026-08-17T23:35:00+08:00"},
         ],
     )
@@ -152,6 +155,101 @@ def test_restart_keeps_stable_trade_id_and_entry_epoch(tmp_path, monkeypatch):
     assert s1._entry_guard_start_ms is not None
     assert s1._entry_guard_start_ms == s2._entry_guard_start_ms
     assert s2._near_qty == 1 and s2._far_qty == 1
+
+
+def test_entry_time_binds_to_current_position_generation(tmp_path, monkeypatch):
+    """An OLD unrelated deal for the same code must not anchor the current
+    position's entry clock — the timestamp is bound to the current position
+    generation (direction + qty + avg_cost price basis)."""
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monitor = _monitor(tmp_path)
+    monitor._capture_post_startup_snapshot = lambda: _snap(
+        positions=[
+            {"account": "futures", "code": "TMFI6", "quantity": 1,
+             "direction": "Action.Buy", "avg_cost": 46033.0},
+        ],
+        broker_trades=[
+            # old generation: same code + direction, different price basis
+            {"id": "OLD-DEAL", "code": "TMFI6", "status": "Filled",
+             "direction": "buy", "price": 45200.0, "quantity": 1,
+             "ts": "2026-08-10T09:01:00+08:00"},
+            # current entry fill: price == avg_cost
+            {"id": "CUR-DEAL", "code": "TMFI6", "status": "Filled",
+             "direction": "buy", "price": 46033.0, "quantity": 1,
+             "ts": "2026-08-17T23:35:00+08:00"},
+        ],
+    )
+    strategy = _strategy()
+    monitor._refresh_live_broker_authority(strategy)
+
+    _expected = datetime.fromisoformat(
+        "2026-08-17T23:35:00+08:00").timestamp() * 1000.0
+    assert strategy._entry_guard_start_ms is not None
+    assert abs(strategy._entry_guard_start_ms - _expected) < 2000.0
+
+
+def test_entry_time_ambiguous_generation_fails_closed(tmp_path, monkeypatch):
+    """Without a cost basis the resolver cannot tell an old generation from
+    the current one -> no anchor (fail-closed), never the old timestamp."""
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monitor = _monitor(tmp_path)
+    monitor._capture_post_startup_snapshot = lambda: _snap(
+        positions=[
+            {"account": "futures", "code": "TMFH6", "quantity": 1,
+             "direction": "Action.Sell"},
+            {"account": "futures", "code": "TMFI6", "quantity": 1,
+             "direction": "Action.Buy"},
+        ],
+        broker_trades=[
+            {"id": "OLD-DEAL", "code": "TMFI6", "status": "Filled",
+             "direction": "buy", "price": 45200.0, "quantity": 1,
+             "ts": "2026-08-10T09:01:00+08:00"},
+            {"id": "CUR-DEAL", "code": "TMFI6", "status": "Filled",
+             "direction": "buy", "price": 46033.0, "quantity": 1,
+             "ts": "2026-08-17T23:35:00+08:00"},
+        ],
+    )
+    strategy = _strategy()
+    monitor._refresh_live_broker_authority(strategy)
+
+    # position still hydrated (2-leg), but no trustworthy entry clock
+    assert strategy._has_position is True
+    assert strategy._entry_guard_start_ms is None
+    assert strategy._entry_ts_ms is None
+    assert strategy._entry_ts is None
+
+
+def test_valid_hydration_without_anchor_clears_stale_entry_clock(
+        tmp_path, monkeypatch):
+    """A valid broker position with NO trustworthy anchor must explicitly
+    clear any stale prior entry clock — a previous trade's clock must never
+    survive into the new position (would bypass ENTRY_TIME_MISSING)."""
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monitor = _monitor(tmp_path)
+    monitor._capture_post_startup_snapshot = lambda: _two_leg_snap_without_deals()
+    strategy = _strategy(
+        _entry_guard_start_ms=1111111111111.0,   # stale prior-trade clock
+        _entry_ts_ms=1111111111111.0,
+        _entry_ts=datetime(2025, 1, 1))
+    monitor._refresh_live_broker_authority(strategy)
+
+    assert strategy._has_position is True        # broker position valid
+    assert strategy._entry_guard_start_ms is None  # stale clock cleared
+    assert strategy._entry_ts_ms is None
+    assert strategy._entry_ts is None
+
+
+def _two_leg_snap_without_deals():
+    """Two-leg snapshot with NO broker_trades / fills / state -> no anchor."""
+    return _snap(
+        positions=[
+            {"account": "futures", "code": "TMFH6", "quantity": 1,
+             "direction": "Action.Sell", "avg_cost": 45879.0},
+            {"account": "futures", "code": "TMFI6", "quantity": 1,
+             "direction": "Action.Buy", "avg_cost": 46033.0},
+        ],
+        broker_trades=[],
+    )
 
 
 def test_invalid_snapshot_fail_closed_no_hydration(tmp_path, monkeypatch):
