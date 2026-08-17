@@ -14,11 +14,17 @@ Broker-evidence contract (codex review):
 import json
 import os
 import sys
+import types
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
-from reconcile_pending_orders import reconcile, find_orders_file, BrokerProbe  # noqa: E402
+from reconcile_pending_orders import (  # noqa: E402
+    reconcile,
+    find_orders_file,
+    BrokerProbe,
+    _build_broker_probe,
+)
 
 BASE = {
     "order_id": "ORD-X",
@@ -138,3 +144,60 @@ def test_broker_probe_queries_fail_closed_on_exception():
     probe = BrokerProbe(Boom())
     assert probe.has_open_order("x") is True
     assert probe.has_position("TMFI6") is True
+
+
+def test_probe_omits_person_id_for_shioaji_17(monkeypatch):
+    class Api:
+        def __init__(self):
+            self.login_kwargs = None
+
+        def login(self, *, api_key, secret_key):
+            self.login_kwargs = {"api_key": api_key, "secret_key": secret_key}
+            return True
+
+    api = Api()
+    monkeypatch.setitem(sys.modules, "shioaji", types.SimpleNamespace(Shioaji=lambda: api))
+    monkeypatch.setenv("SHIOAJI_API_KEY", "key")
+    monkeypatch.setenv("SHIOAJI_SECRET_KEY", "secret")
+    monkeypatch.setenv("SHIOAJI_PERSON_ID", "person")
+
+    probe = _build_broker_probe()
+
+    assert isinstance(probe, BrokerProbe)
+    assert api.login_kwargs == {"api_key": "key", "secret_key": "secret"}
+
+
+def test_probe_passes_person_id_only_when_explicitly_supported(monkeypatch):
+    class Api:
+        def __init__(self):
+            self.login_kwargs = None
+
+        def login(self, *, api_key, secret_key, person_id):
+            self.login_kwargs = {
+                "api_key": api_key,
+                "secret_key": secret_key,
+                "person_id": person_id,
+            }
+            return True
+
+    api = Api()
+    monkeypatch.setitem(sys.modules, "shioaji", types.SimpleNamespace(Shioaji=lambda: api))
+    monkeypatch.setenv("SHIOAJI_API_KEY", "key")
+    monkeypatch.setenv("SHIOAJI_SECRET_KEY", "secret")
+    monkeypatch.setenv("SHIOAJI_PERSON_ID", "person")
+
+    probe = _build_broker_probe()
+
+    assert isinstance(probe, BrokerProbe)
+    assert api.login_kwargs["person_id"] == "person"
+
+
+def test_probe_login_false_fails_closed(monkeypatch):
+    class Api:
+        def login(self, *, api_key, secret_key):
+            return False
+
+    monkeypatch.setitem(
+        sys.modules, "shioaji", types.SimpleNamespace(Shioaji=Api)
+    )
+    assert _build_broker_probe() is None
