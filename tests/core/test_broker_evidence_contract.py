@@ -265,3 +265,41 @@ def test_session_id_required_for_capture():
 def test_build_requires_session_id():
     with pytest.raises(TypeError):
         build_session_snapshot(positions=[], trades=[], captured_at=1)
+
+
+# ---------------------------------------------------------------------------
+# 7. identity-less rows are never silently deduped (codex P1, fail-closed)
+# ---------------------------------------------------------------------------
+
+def _anonymous_trade():
+    """A row with NO broker identity anywhere (top-level or nested order)."""
+    return SimpleNamespace(
+        id=None, ordno=None, seqno=None, broker_order_id=None,
+        code="TMFI6", quantity=1, status=SimpleNamespace(status="PendingSubmit"),
+        order=None)
+
+
+def test_trade_identity_none_for_identity_less_row():
+    # must be None (typed missing), NOT ("", "", "", "") — a shared empty
+    # tuple would make every anonymous row look like the same order
+    assert trade_identity(_anonymous_trade()) is None
+
+
+def test_identity_less_rows_never_collapsed():
+    # two distinct orders that both lack identity must BOTH survive
+    # (fail-closed: no proof they are the same order)
+    assert len(dedupe_trades([_anonymous_trade(), _anonymous_trade()])) == 2
+
+
+def test_mixed_identity_and_anonymous_rows_all_kept():
+    rows = [_trade(), _anonymous_trade(), _anonymous_trade()]
+    assert len(dedupe_trades(rows)) == 3
+
+
+def test_normalized_anonymous_row_flagged_identity_missing():
+    row = normalize_trade_row(_anonymous_trade())
+    assert row.get("identity_missing") is True
+
+
+def test_identified_row_not_flagged_identity_missing():
+    assert normalize_trade_row(_trade()).get("identity_missing") is False
