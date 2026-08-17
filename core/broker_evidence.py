@@ -167,19 +167,16 @@ def build_session_snapshot(*, session_id: str, positions: list[Any],
     """
     if not session_id:
         return _invalid_session(session_id)
-    normalized_trades = [normalize_trade_row(t) for t in dedupe_trades(trades)]
     open_orders = [
-        row for row in normalized_trades
-        if not is_terminal_status(row["status"])
+        normalize_trade_row(t)
+        for t in dedupe_trades(trades)
+        if not is_terminal_status(normalize_trade_status(t))
     ]
     return {
         "source": "live_broker",
         "session_id": session_id,
         "captured_at": captured_at,
         "positions": [normalize_position_row(p) for p in positions or []],
-        # Keep terminal broker evidence for lifecycle reconciliation.  The
-        # open_orders projection remains non-terminal for watchdog consumers.
-        "trades": normalized_trades,
         "open_orders": open_orders,
     }
 
@@ -233,3 +230,125 @@ def capture_session_snapshot(api: Any, *, session_id: str) -> dict[str, Any]:
         trades=trades,
         captured_at=int(time.time() * 1000),
     )
+
+
+
+def _row_value(row: Any, *names: str) -> Any:
+    """First non-empty value among names (dict or object)."""
+    if isinstance(row, dict):
+        for name in names:
+            v = row.get(name)
+            if v not in (None, ""):
+                return v
+        return None
+    for name in names:
+        v = getattr(row, name, None)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def _row_identities(row: Any) -> set[str]:
+    """Broker-issued identity fields only; local order_id excluded.
+
+    Falls back to nested ``order`` fields for Shioaji 1.7 trades that omit
+    top-level identity.
+    """
+    order = _row_value(row, "order")
+    order = order if isinstance(order, (dict,)) or hasattr(order, "__dict__") else None
+    values = {
+        _row_value(row, "broker_order_id", "id", "exchange_order_id")
+        or (_row_value(order, "broker_order_id", "id", "exchange_order_id") if order else None),
+        _row_value(row, "ordno") or (_row_value(order, "ordno") if order else None),
+        _row_value(row, "seqno") or (_row_value(order, "seqno") if order else None),
+        _row_value(row, "deal_id", "trade_id", "fill_id"),
+    }
+    return {str(v) for v in values if v not in (None, "")}
+
+
+def _row_symbol(row: Any) -> str:
+    return str(_row_value(row, "symbol", "code") or "")
+
+
+def _row_qty(row: Any) -> int | None:
+    v = _row_value(row, "quantity", "qty")
+    try:
+        if isinstance(v, bool):
+            return None
+        q = int(v)
+        return q if q > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _row_direction(row: Any) -> str | None:
+    raw = str(_row_value(row, "direction", "side", "action") or "").lower()
+    if "sell" in raw or "short" in raw:
+        return "sell"
+    if "buy" in raw or "long" in raw:
+        return "buy"
+    return None
+
+
+def open_orders_fully_covered_by_filled(open_orders: list[Any],
+                                        filled_orders: list[Any]) -> bool:
+    """True ONLY when every open order is explained one-to-one by a local
+    FILLED order (identity + symbol + direction + quantity).
+
+    Stale ``PendingSubmit`` rows retained by a Shioaji session after a fill
+    are safe to treat as position-covered ONLY when each one matches an
+    explicit local terminal fill.  Fail-closed: an identity-less open order,
+    a direction/quantity/symbol mismatch, a non-terminal local order, or an
+    unmatched open order (real pending exit / add-on / reverse) all return
+    False so the caller keeps the unresolved/never-flat verdict.
+    """
+    if not open_orders:
+        return True
+    # Dedupe open_orders by broker identity first: repeated capture of the
+    # same order is ONE canonical pending, not N distinct orders (Phase 2
+    # spec 2.1).  Rows sharing an identity must agree on symbol/qty/direction,
+    # else the evidence is ambiguous and nothing is covered.
+    groups: dict[tuple[str, ...], list[Any]] = {}
+    for oo in open_orders:
+        oo_ids = _row_identities(oo)
+        if not oo_ids:
+            return False  # no broker identity -> cannot prove covered
+        key = tuple(sorted(oo_ids))
+        groups.setdefault(key, []).append(oo)
+    for key, rows in groups.items():
+        first = rows[0]
+        sym = _row_symbol(first)
+        qty = _row_qty(first)
+        direction = _row_direction(first)
+        if not sym or qty is None or direction is None:
+            return False
+        for extra in rows[1:]:
+            if (_row_symbol(extra) != sym or _row_qty(extra) != qty
+                    or _row_direction(extra) != direction):
+                return False  # same identity, conflicting facts
+    used: set[int] = set()
+    for key, rows in groups.items():
+        sym = _row_symbol(rows[0])
+        qty = _row_qty(rows[0])
+        direction = _row_direction(rows[0])
+        matched = False
+        for idx, fo in enumerate(filled_orders):
+            if idx in used:
+                continue
+            fo_status = str(_row_value(fo, "status") or "")
+            if fo_status.lower() not in ("filled", "fill", "complete", "completed"):
+                continue  # no terminal fill proof -> cannot cover
+            if not (set(key) & _row_identities(fo)):
+                continue
+            if _row_symbol(fo) != sym:
+                continue
+            if _row_qty(fo) != qty:
+                continue
+            if _row_direction(fo) != direction:
+                continue
+            used.add(idx)
+            matched = True
+            break
+        if not matched:
+            return False
+    return True
