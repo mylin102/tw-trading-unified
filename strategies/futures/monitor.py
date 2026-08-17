@@ -4484,6 +4484,12 @@ class FuturesMonitor:
                            or getattr(raw_status, "value", None)
                            or str(raw_status or ""))
             status_name = str(status_name).split(".")[-1]
+            _trade_action = getattr(trade, "action", None) or getattr(
+                broker_order, "action", None)
+            _direction = (getattr(_trade_action, "name", None)
+                          or getattr(_trade_action, "value", None)
+                          or (_trade_action if isinstance(_trade_action, str)
+                              else None))
             row = {
                 "id": getattr(trade, "id", None)
                       or getattr(trade, "broker_order_id", None)
@@ -4496,6 +4502,8 @@ class FuturesMonitor:
                 "seqno": getattr(trade, "seqno", None)
                         or getattr(broker_order, "seqno", None),
                 "code": getattr(trade, "code", None),
+                "direction": (str(_direction).lower()
+                              if _direction is not None else None),
                 "status": status_name,
                 "price": getattr(status, "price", None)
                          or getattr(trade, "price", None),
@@ -4577,6 +4585,7 @@ class FuturesMonitor:
                 "seqno": payload.get("seqno"),
                 "code": _code,
                 "delivery_month": _delivery,
+                "direction": payload.get("action"),
                 "status": "Filled",
                 "price": _price,
                 "quantity": _qty,
@@ -5000,43 +5009,127 @@ class FuturesMonitor:
                 return None
         return None
 
-    def _resolve_broker_hydration_entry_epoch(self, snapshot, codes):
-        """Resolve a broker-observed position's entry time (epoch ms).
+    def _resolve_broker_hydration_entry_epoch(self, snapshot, legs):
+        """Resolve a broker-observed position's entry time (epoch ms),
+        bound to the CURRENT position generation.
 
-        Broker truth first: the earliest deal/trade timestamp across the
-        position's contracts (order_deal_records + list_trades, normalized).
-        Falls back to the durable local fills ledger (ENTRY rows by
-        contract), then the persisted state-file entry clock.  None = no
-        trustworthy anchor — fail-closed: Policy J stays suppressed while
+        A candidate deal/trade must match the position's code, direction,
+        quantity (when both present) and — when the position carries an
+        avg_cost — price within 1% of that cost basis.  The earliest
+        matching timestamp is the entry time.  Without a cost basis,
+        multiple same-code/same-direction candidates cannot be told apart
+        (old generation vs current) and fail closed to None.  Falls back
+        to the durable local fills ledger (ENTRY rows, same binding), then
+        the persisted state-file entry clock.  None = no trustworthy
+        anchor — fail-closed: Policy J stays suppressed while
         release/ATR/emergency exits keep working.
         """
+
+        def _norm_side(text):
+            text = str(text or "").lower()
+            if "sell" in text or "short" in text:
+                return "SHORT"
+            if "buy" in text or "long" in text:
+                return "LONG"
+            return None
+
+        def _row_side(row):
+            return _norm_side(row.get("direction") or row.get("side"))
+
+        def _ts(row):
+            return self._to_epoch_ms(
+                row.get("ts") or row.get("deal_ts") or row.get("timestamp"))
+
+        def _matches(row, code, side, qty, avg):
+            if str(row.get("code") or row.get("contract") or "") != code:
+                return False
+            if _row_side(row) != side:
+                return False
+            _rq = (row.get("quantity") or row.get("filled_quantity")
+                   or row.get("qty"))
+            if qty is not None and _rq is not None:
+                try:
+                    if int(_rq) != int(qty):
+                        return False
+                except (TypeError, ValueError):
+                    pass
+            _rp = row.get("price") or row.get("avg_price")
+            if avg and avg > 0 and _rp is not None:
+                try:
+                    if abs(float(_rp) - float(avg)) / float(avg) > 0.01:
+                        return False
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+            return True
+
         _best = None
-        for _row in (snapshot.get("broker_trades") or []):
-            if not isinstance(_row, dict):
+        _ambiguous = False
+        for _leg in legs or ():
+            _code = str(_leg.get("code") or "")
+            _side = _norm_side(_leg.get("direction"))
+            if not _code or _side is None:
                 continue
-            if str(_row.get("code") or "") not in codes:
+            try:
+                _qty = int(_leg.get("quantity"))
+            except (TypeError, ValueError):
+                _qty = None
+            try:
+                _avg = float(_leg.get("avg_cost") or 0.0)
+            except (TypeError, ValueError):
+                _avg = 0.0
+            _cands = [
+                _row for _row in (snapshot.get("broker_trades") or [])
+                if isinstance(_row, dict)
+                and _matches(_row, _code, _side, _qty, _avg)]
+            if not _cands:
                 continue
-            _ms = self._to_epoch_ms(_row.get("ts") or _row.get("deal_ts"))
-            if _ms and (_best is None or _ms < _best):
-                _best = _ms
-        if _best is None:
+            if _avg <= 0 and len(_cands) > 1:
+                # no cost basis -> cannot distinguish old generation from
+                # the current one; never anchor on a guess
+                _ambiguous = True
+                continue
+            for _row in _cands:
+                _ms = _ts(_row)
+                if _ms and (_best is None or _ms < _best):
+                    _best = _ms
+        if _best is None and not _ambiguous:
             try:
                 _rt = os.getenv("TRADING_RUNTIME_DIR")
                 _fills = os.getenv("MTS_FILL_LOG_PATH") or (
                     os.path.join(_rt, "logs", "mts_trade_fills.jsonl")
                     if _rt else "logs/mts_trade_fills.jsonl")
                 if os.path.exists(_fills):
+                    _fill_rows = []
                     with open(_fills, "r", encoding="utf-8") as _f:
                         for _line in _f:
                             try:
                                 _r = json.loads(_line)
                             except Exception:
                                 continue
-                            if (str(_r.get("fill_type") or "") != "ENTRY"
-                                    or str(_r.get("contract") or "")
-                                    not in codes):
-                                continue
-                            _ms = self._to_epoch_ms(_r.get("timestamp"))
+                            if str(_r.get("fill_type") or "") == "ENTRY":
+                                _fill_rows.append(_r)
+                    for _leg in legs or ():
+                        _code = str(_leg.get("code") or "")
+                        _side = _norm_side(_leg.get("direction"))
+                        if not _code or _side is None:
+                            continue
+                        try:
+                            _qty = int(_leg.get("quantity"))
+                        except (TypeError, ValueError):
+                            _qty = None
+                        try:
+                            _avg = float(_leg.get("avg_cost") or 0.0)
+                        except (TypeError, ValueError):
+                            _avg = 0.0
+                        _cands = [_row for _row in _fill_rows
+                                  if _matches(_row, _code, _side, _qty, _avg)]
+                        if not _cands:
+                            continue
+                        if _avg <= 0 and len(_cands) > 1:
+                            _ambiguous = True
+                            continue
+                        for _row in _cands:
+                            _ms = _ts(_row)
                             if _ms and (_best is None or _ms < _best):
                                 _best = _ms
             except Exception:
@@ -5234,7 +5327,7 @@ class FuturesMonitor:
             # clock must never stay ENTRY_TIME_MISSING for a broker-observed
             # position.  Broker deal/trade timestamps are truth; durable
             # local fills / state file are fallbacks; None stays fail-closed.
-            _entry_ms = self._resolve_broker_hydration_entry_epoch(_snap, _codes)
+            _entry_ms = self._resolve_broker_hydration_entry_epoch(_snap, _rows)
             if _entry_ms:
                 strategy._entry_guard_start_ms = _entry_ms
                 strategy._entry_ts_ms = _entry_ms
@@ -5242,6 +5335,14 @@ class FuturesMonitor:
                     strategy._entry_ts = datetime.fromtimestamp(_entry_ms / 1000.0)
                 except Exception:
                     strategy._entry_ts = None
+            else:
+                # Fail-closed: a broker-valid position with no trustworthy
+                # anchor must not inherit a stale clock from a previous
+                # trade (that would bypass ENTRY_TIME_MISSING and corrupt
+                # the Policy-J guard clock).
+                strategy._entry_guard_start_ms = None
+                strategy._entry_ts_ms = None
+                strategy._entry_ts = None
             self._broker_position_observed = True
             self._live_broker_flat_proven = False
             self._broker_authority_degraded = False
@@ -5310,7 +5411,7 @@ class FuturesMonitor:
                 ("_snapshot_hash", _snapshot_hash)):
             setattr(strategy, _name, _value)
         # P0-A: broker-truth entry-time hydration (see single-leg branch).
-        _entry_ms = self._resolve_broker_hydration_entry_epoch(_snap, _codes)
+        _entry_ms = self._resolve_broker_hydration_entry_epoch(_snap, _rows)
         if _entry_ms:
             strategy._entry_guard_start_ms = _entry_ms
             strategy._entry_ts_ms = _entry_ms
@@ -5318,6 +5419,14 @@ class FuturesMonitor:
                 strategy._entry_ts = datetime.fromtimestamp(_entry_ms / 1000.0)
             except Exception:
                 strategy._entry_ts = None
+        else:
+            # Fail-closed: a broker-valid position with no trustworthy
+            # anchor must not inherit a stale clock from a previous
+            # trade (that would bypass ENTRY_TIME_MISSING and corrupt
+            # the Policy-J guard clock).
+            strategy._entry_guard_start_ms = None
+            strategy._entry_ts_ms = None
+            strategy._entry_ts = None
         _auth = MtsAuthorityState(
             status=MtsAuthority.OPEN, trade_id=_trade_id,
             near_qty=-_near["quantity"] if _near_side == "SHORT" else _near["quantity"],
