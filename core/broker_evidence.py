@@ -167,16 +167,19 @@ def build_session_snapshot(*, session_id: str, positions: list[Any],
     """
     if not session_id:
         return _invalid_session(session_id)
+    normalized_trades = [normalize_trade_row(t) for t in dedupe_trades(trades)]
     open_orders = [
-        normalize_trade_row(t)
-        for t in dedupe_trades(trades)
-        if not is_terminal_status(normalize_trade_status(t))
+        row for row in normalized_trades
+        if not is_terminal_status(row["status"])
     ]
     return {
         "source": "live_broker",
         "session_id": session_id,
         "captured_at": captured_at,
         "positions": [normalize_position_row(p) for p in positions or []],
+        # Keep terminal broker evidence for lifecycle reconciliation.  The
+        # open_orders projection remains non-terminal for watchdog consumers.
+        "trades": normalized_trades,
         "open_orders": open_orders,
     }
 
