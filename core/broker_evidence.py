@@ -141,13 +141,32 @@ def normalize_position_row(pos: Any, account_tag: str = "futures") -> dict[str, 
     }
 
 
+def _invalid_session(session_id: str | None) -> dict[str, Any]:
+    """Typed fail-closed payload for an empty/missing session identity.
+
+    Session-bound isolation: a snapshot without a non-empty session_id is
+    NOT broker evidence — never ``source=live_broker``.
+    """
+    return {
+        "source": "invalid_session",
+        "capture_error": True,
+        "session_id": session_id,
+        "error": "session_id is empty (session-bound isolation)",
+    }
+
+
 def build_session_snapshot(*, session_id: str, positions: list[Any],
                            trades: list[Any], captured_at: int) -> dict[str, Any]:
     """One session-bound broker snapshot (pure).
 
     Positions are normalized; trades are deduped and only NON-terminal rows
     (PendingSubmit included) become open_orders.
+
+    Empty/None session_id -> typed invalid_session payload (fail-closed,
+    never ``source=live_broker``).
     """
+    if not session_id:
+        return _invalid_session(session_id)
     open_orders = [
         normalize_trade_row(t)
         for t in dedupe_trades(trades)
@@ -166,8 +185,11 @@ def capture_session_snapshot(api: Any, *, session_id: str) -> dict[str, Any]:
     """Read-only session-bound capture, fail-closed.
 
     Zero place/cancel/update calls.  Any query exception -> typed
-    unavailable payload (never empty-as-flat).
+    unavailable payload (never empty-as-flat).  Empty/None session_id ->
+    typed invalid_session payload WITHOUT querying the broker.
     """
+    if not session_id:
+        return _invalid_session(session_id)
     if not hasattr(api, "list_positions") or not hasattr(api, "list_trades"):
         return {
             "source": "unavailable",
