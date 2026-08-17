@@ -275,10 +275,12 @@ def test_monitor_dynamics_time_regression_does_not_leak_future_state():
     assert next_bar["dz"] == 1.0
 
 
-def test_research_rejects_stale_or_missing_quotes(monkeypatch):
-    """P1-C: a candidate whose bar EXPLICITLY carries a stale quote_age or
-    invalid BBO evidence must not be recorded as an entry observation.
-    Absent keys pass (legacy bars keep recording)."""
+def test_research_rejects_are_recorded_with_standardized_reasons(monkeypatch):
+    """P1 observability follow-up: post-threshold candidates are ALWAYS
+    recorded — decision=CANDIDATE when quotes are trustworthy, or
+    decision=REJECT with a standardized rejection_reason (STALE_QUOTE /
+    BBO_INVALID / BBO_MISSING / BBO_NONFINITE).  Valid-candidate behavior
+    is unchanged and the record path can never submit an order."""
     monitor = _bare_monitor_for_dynamics()
     captured = []
     import core.entry_research_store as store
@@ -293,20 +295,68 @@ def test_research_rejects_stale_or_missing_quotes(monkeypatch):
              "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
              "quote_age_ms": 5000}
     monitor._record_mts_entry_research_candidate(strat, stale, now)
-    assert captured == []          # stale quote rejected
+    assert captured[-1]["decision"] == "REJECT"
+    assert captured[-1]["rejection_reason"] == "STALE_QUOTE"
+    assert captured[-1]["spread_z"] == 2.5      # z preserved
+    assert captured[-1]["entry_z"] == 1.0       # threshold preserved
+    assert captured[-1]["quote_age_ms"] == 5000
 
     invalid_bbo = {"ts": 101.0, "session_type": "day", "near_close": 101.0,
                    "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
                    "near_bid": 0, "near_ask": None}
     monitor._record_mts_entry_research_candidate(strat, invalid_bbo, now)
-    assert captured == []          # invalid BBO rejected
+    assert captured[-1]["decision"] == "REJECT"
+    assert captured[-1]["rejection_reason"] == "BBO_INVALID"
 
     ok_bar = {"ts": 102.0, "session_type": "day", "near_close": 101.0,
               "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
               "quote_age_ms": 100, "near_bid": 100.5, "near_ask": 101.5,
               "far_bid": 97.5, "far_ask": 98.5}
     monitor._record_mts_entry_research_candidate(strat, ok_bar, now)
-    assert len(captured) == 1
+    assert captured[-1]["decision"] == "CANDIDATE"
+
+    assert len(captured) == 3
+
+
+def test_research_bbomissing_and_bbo_nonfinite_reasons(monkeypatch):
+    """BBO_MISSING (None value / partial BBO) and BBO_NONFINITE (NaN/Inf)
+    land in the ledger with their standardized reasons; no order path is
+    ever touched (the bare monitor has no order manager at all)."""
+    monitor = _bare_monitor_for_dynamics()
+    captured = []
+    import core.entry_research_store as store
+    import datetime
+    monkeypatch.setattr(store, "record_entry_observation",
+                        lambda audit, **kw: captured.append(audit) or True)
+    strat = type("Strategy", (), {"_entry_z": 1.0, "_trade_id": None})()
+    now = datetime.datetime.now()
+
+    none_bbo = {"ts": 100.0, "session_type": "day", "near_close": 101.0,
+                "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+                "near_bid": None}
+    monitor._record_mts_entry_research_candidate(strat, none_bbo, now)
+    assert captured[-1]["decision"] == "REJECT"
+    assert captured[-1]["rejection_reason"] == "BBO_MISSING"
+
+    partial_bbo = {"ts": 101.0, "session_type": "day", "near_close": 101.0,
+                   "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+                   "near_bid": 100.5, "near_ask": 101.5}
+    monitor._record_mts_entry_research_candidate(strat, partial_bbo, now)
+    assert captured[-1]["decision"] == "REJECT"
+    assert captured[-1]["rejection_reason"] == "BBO_MISSING"
+
+    nan_bbo = {"ts": 102.0, "session_type": "day", "near_close": 101.0,
+               "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+               "near_bid": float("nan"), "near_ask": 101.5,
+               "far_bid": 97.5, "far_ask": 98.5}
+    monitor._record_mts_entry_research_candidate(strat, nan_bbo, now)
+    assert captured[-1]["decision"] == "REJECT"
+    assert captured[-1]["rejection_reason"] == "BBO_NONFINITE"
+
+    # zero order side effects
+    assert getattr(monitor, "order_mgr", None) is None
+
+    assert len(captured) == 3
 
 
 def test_research_ma_std_evolve_across_observations(monkeypatch):
