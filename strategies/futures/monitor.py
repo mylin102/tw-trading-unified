@@ -4932,10 +4932,12 @@ class FuturesMonitor:
         assumption).
 
         ``manager.reconcile_broker_state`` already applied identity-deduped
-        fills (fills_added > 0).  For MTS release orders that is
+        fills (fills_added > 0).  Only a FULLY FILLED MTS release order
+        (OrderStatus.FILLED and filled_quantity >= quantity) is
         authoritative fill evidence: advance the strategy to SINGLE_LEG via
         ``sync_release`` exactly once — its SINGLE_LEG phase guard plus the
-        fills-ledger RELEASE row make repeats no-ops.  Never synthesizes an
+        fills-ledger RELEASE row make repeats no-ops.  Partial fills stay
+        pending (no early lifecycle advance).  Never synthesizes an
         order or a leg; a failed capture never reaches here (the caller
         returns before reconciling).  Also never resends/cancels: this is
         strictly read-only broker evidence consumption.
@@ -4961,6 +4963,20 @@ class FuturesMonitor:
             if _order is None:
                 continue
             if str(getattr(_order, "strategy", "")) != "MTS_RELEASE":
+                continue
+            # Terminal-fill gate (P0): only a fully FILLED order may close
+            # the release lifecycle.  A partial fill keeps the order
+            # pending — never an early single-leg release, never a hidden
+            # remaining quantity, never a premature trail.
+            from core.order_management.order import OrderStatus
+            if getattr(_order, "status", None) is not OrderStatus.FILLED:
+                continue
+            try:
+                _filled_qty = int(getattr(_order, "filled_quantity", 0) or 0)
+                _order_qty = int(getattr(_order, "quantity", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if _filled_qty < _order_qty:
                 continue
             _symbol = str(getattr(_order, "symbol", "") or "")
             if _symbol == _near_code:
