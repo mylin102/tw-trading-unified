@@ -5020,9 +5020,25 @@ class FuturesMonitor:
                  and p.get("code") in _codes
                  and type(p.get("quantity")) is int
                  and p.get("quantity", 0) > 0]
+        _other_futures = [p for p in (_snap.get("positions") or [])
+                          if p.get("account") == "futures"
+                          and p.get("code") not in _codes
+                          and type(p.get("quantity")) is int
+                          and p.get("quantity", 0) > 0]
         self._write_live_session_upl(
             _rows, getattr(self, "_execution_context", None))
         if not _rows:
+            if _other_futures:
+                # A non-target futures position means the account is not
+                # provably flat for this MTS process.  Do not silently turn
+                # an unknown contract into FLAT authority.
+                self._broker_position_observed = True
+                self._live_broker_flat_proven = False
+                self._broker_authority_degraded = True
+                strategy._broker_truth_flat = False
+                self._live_broker_authority = None
+                self._live_broker_authority_at = _now
+                return None
             if _has_open_orders:
                 # open orders with NO positions: unresolved, never flat.
                 self._broker_position_observed = True
@@ -5049,9 +5065,76 @@ class FuturesMonitor:
                 current_trade_id=None)
             self._live_broker_authority_at = _now
             return self._live_broker_authority
+        def _side(row):
+            text = str(row.get("direction") or "").lower()
+            if "sell" in text or "short" in text:
+                return "SHORT"
+            if "buy" in text or "long" in text:
+                return "LONG"
+            return None
+
+        _snapshot_hash = _snap.get("canonical_input_hash")
+        _trade_id = self._stable_broker_trade_id(
+            _snap.get("account_identity_hash"), _rows)
+
+        if len(_rows) == 1:
+            # A broker-verified remaining leg is an exit-only authority.  Do
+            # not synthesize the missing leg or treat this as FLAT: the
+            # strategy must continue trailing/releasing the real position,
+            # while broker_position_observed keeps all new entries blocked.
+            _row = _rows[0]
+            _code = str(_row.get("code") or "")
+            _qty = _row.get("quantity")
+            _side_value = _side(_row)
+            try:
+                _entry = float(_row.get("avg_cost"))
+            except (TypeError, ValueError):
+                _entry = 0.0
+            if (_code not in _codes or type(_qty) is not int or _qty <= 0
+                    or _side_value is None or _entry <= 0):
+                self._broker_position_observed = True
+                self._live_broker_flat_proven = False
+                self._broker_authority_degraded = True
+                strategy._broker_truth_flat = False
+                self._live_broker_authority = None
+                self._live_broker_authority_at = _now
+                return None
+            _is_near = _code == str(getattr(self.contract, "code", ""))
+            _released_leg = "far" if _is_near else "near"
+            for _name, _value in (
+                    ("_near_side", _side_value if _is_near else None),
+                    ("_far_side", None if _is_near else _side_value),
+                    ("_near_qty", _qty if _is_near else 0),
+                    ("_far_qty", 0 if _is_near else _qty),
+                    ("_near_entry", _entry if _is_near else 0.0),
+                    ("_far_entry", 0.0 if _is_near else _entry),
+                    ("_trade_id", _trade_id), ("_has_position", True),
+                    ("_released_leg", _released_leg),
+                    ("_lifecycle", "SINGLE_LEG"),
+                    ("_snapshot_hash", _snapshot_hash)):
+                setattr(strategy, _name, _value)
+            self._broker_position_observed = True
+            self._live_broker_flat_proven = False
+            self._broker_authority_degraded = False
+            strategy._broker_truth_flat = False
+            _auth = MtsAuthorityState(
+                status=MtsAuthority.SINGLE_LEG, trade_id=_trade_id,
+                near_qty=_qty if _is_near and _side_value == "LONG" else
+                         (-_qty if _is_near else 0),
+                far_qty=_qty if (not _is_near and _side_value == "LONG") else
+                        (-_qty if not _is_near else 0),
+                near_side=_side_value if _is_near else None,
+                far_side=_side_value if not _is_near else None,
+                near_entry=_entry if _is_near else 0.0,
+                far_entry=_entry if not _is_near else 0.0,
+                current_trade_id=_trade_id)
+            self._live_broker_authority = _auth
+            self._live_broker_authority_at = _now
+            return _auth
+
         if len({p.get("code") for p in _rows}) != 2:
-            # A partial relevant position is not proof of flatness and cannot
-            # safely be reconstructed as a two-leg spread.
+            # More than one malformed/duplicate relevant row is ambiguous;
+            # it is not safe to infer either a spread or a single leg.
             self._broker_position_observed = True
             self._live_broker_flat_proven = False
             self._broker_authority_degraded = True
@@ -5062,13 +5145,6 @@ class FuturesMonitor:
         _by_code = {p["code"]: p for p in _rows}
         _near = _by_code.get(str(getattr(self.contract, "code", "")))
         _far = _by_code.get(str(getattr(self.far_contract, "code", "")))
-        def _side(row):
-            text = str(row.get("direction") or "").lower()
-            if "sell" in text or "short" in text:
-                return "SHORT"
-            if "buy" in text or "long" in text:
-                return "LONG"
-            return None
         _near_side, _far_side = _side(_near), _side(_far)
         if _near_side is None or _far_side is None:
             # Relevant broker rows exist but are ambiguous.  Keep entry
@@ -5081,13 +5157,10 @@ class FuturesMonitor:
             self._live_broker_authority = None
             self._live_broker_authority_at = _now
             return None
-        _snapshot_hash = _snap.get("canonical_input_hash")
         self._broker_position_observed = True
         self._live_broker_flat_proven = False
         self._broker_authority_degraded = False
         strategy._broker_truth_flat = False
-        _trade_id = self._stable_broker_trade_id(
-            _snap.get("account_identity_hash"), _rows)
         for _name, _value in (
                 ("_near_side", _near_side), ("_far_side", _far_side),
                 ("_near_qty", _near["quantity"]),
@@ -10809,7 +10882,8 @@ class FuturesMonitor:
         _broker_auth = self._refresh_live_broker_authority(strategy)
         if _broker_auth is not None:
             _auth = _broker_auth
-            _authority_has_pos = (_broker_auth.status == MtsAuthority.OPEN)
+            _authority_has_pos = (_broker_auth.status in (
+                MtsAuthority.OPEN, MtsAuthority.SINGLE_LEG))
             _state_has_pos = _authority_has_pos
             # The strategy's own restore hook runs inside on_bar, before the
             # next monitor gate.  Carry the current broker-flat proof into

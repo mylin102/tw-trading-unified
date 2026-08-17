@@ -28,6 +28,9 @@ from typing import Iterable, Optional
 class MtsAuthority(Enum):
     FLAT = "FLAT"
     OPEN = "OPEN"
+    # A broker-verified position with exactly one spread leg remaining.
+    # This is exit-only authority; it must never authorize a new entry.
+    SINGLE_LEG = "SINGLE_LEG"
     UNKNOWN = "UNKNOWN"
 
 
@@ -167,13 +170,13 @@ def gate_decision_pre_signal(
     if strat_has_pos:
         if auth.status == MtsAuthority.FLAT:
             return MtsGateAction.RESET_STRATEGY   # true divergence
-        if auth.status == MtsAuthority.OPEN:
+        if auth.status in (MtsAuthority.OPEN, MtsAuthority.SINGLE_LEG):
             if auth.trade_id == strat_trade_id and state_has_pos:
                 return MtsGateAction.PASS
             return MtsGateAction.RECONSTRUCT      # state lags or strategy stale
         return MtsGateAction.PASS                 # UNKNOWN — never reset
     else:
-        if auth.status == MtsAuthority.OPEN:
+        if auth.status in (MtsAuthority.OPEN, MtsAuthority.SINGLE_LEG):
             return MtsGateAction.RECONSTRUCT      # strategy lost the position
         return MtsGateAction.PASS
 
@@ -184,7 +187,7 @@ def gate_decision_post_signal(auth: MtsAuthorityState, signal_action: str) -> Mt
         return MtsGateAction.PASS
     if auth.status == MtsAuthority.FLAT:
         return MtsGateAction.BLOCK_SIGNAL
-    return MtsGateAction.PASS   # OPEN (ledger confirms) or UNKNOWN (fail-open)
+    return MtsGateAction.PASS   # OPEN/SINGLE_LEG or UNKNOWN (fail-open)
 
 
 # ── incremental projection ──
