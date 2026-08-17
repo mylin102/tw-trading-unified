@@ -303,3 +303,32 @@ def test_normalized_anonymous_row_flagged_identity_missing():
 
 def test_identified_row_not_flagged_identity_missing():
     assert normalize_trade_row(_trade()).get("identity_missing") is False
+
+
+# ---------------------------------------------------------------------------
+# 8. empty/None session_id is typed invalid, never live_broker (codex gap)
+# ---------------------------------------------------------------------------
+
+def test_build_snapshot_empty_session_is_typed_invalid():
+    snap = build_session_snapshot(
+        session_id="", positions=[], trades=[], captured_at=1)
+    assert snap["source"] != "live_broker"
+    assert snap["capture_error"] is True
+    assert "session_id" in snap.get("error", "")
+
+
+def test_build_snapshot_none_session_is_typed_invalid():
+    snap = build_session_snapshot(
+        session_id=None, positions=[], trades=[], captured_at=1)
+    assert snap["source"] != "live_broker"
+    assert snap["capture_error"] is True
+
+
+def test_capture_empty_session_is_typed_invalid_no_api_calls():
+    api = _fake_api(positions=[], trades=[_pending_trade()])
+    snap = capture_session_snapshot(api, session_id="")
+    assert snap["source"] != "live_broker"
+    assert snap["capture_error"] is True
+    assert "session_id" in snap.get("error", "")
+    # fail-closed: never queries the broker for an invalid session
+    assert api.calls == []
