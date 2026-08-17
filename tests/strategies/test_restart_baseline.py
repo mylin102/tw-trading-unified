@@ -29,6 +29,15 @@ from strategies.plugins.futures.active.tmf_spread import (
 from tests.strategies.test_tmf_spread_atr import _make_bar, _setup_armed
 
 
+@pytest.fixture(autouse=True)
+def _isolate_mts_state_path(tmp_path, monkeypatch):
+    """MTS_STATE_PATH 每測試隔離 — Mini 上 /tmp/test_mts_position_state.json
+    是 shared 殘留 (其他 suite / 平行 worktree 寫的), 不隔離會讓 state-file
+    路徑誤錨 (已知陷阱, P0-A round2)。"""
+    monkeypatch.setenv("MTS_STATE_PATH",
+                       str(tmp_path / "mts_position_state.json"))
+
+
 def _single_leg_pending(tmp_path, *, released_leg="near",
                         broker_flat=False,
                         position_session: str | None = "day",
@@ -117,6 +126,7 @@ def test_restart_baseline_uses_remaining_leg_bbo_only(tmp_path):
 
 def test_restart_baseline_is_trailing_metadata_only(tmp_path):
     """Never avg_cost / UPL / Policy-J / two-leg entry time."""
+    _MISSING = object()
     s, config = _single_leg_pending(tmp_path, released_leg="near",
                                     position_session="day")
     for _name in ("_entry_guard_start_ms", "_entry_ts_ms"):
@@ -125,8 +135,9 @@ def test_restart_baseline_is_trailing_metadata_only(tmp_path):
     before = {
         "_near_entry": s._near_entry,
         "_far_entry": s._far_entry,
-        "_peak_net_exit_pnl_twd": getattr(s, "_peak_net_exit_pnl_twd", 0.0),
-        "_pj_durable_peak": getattr(s, "_pj_durable_peak", None),
+        "_peak_net_exit_pnl_twd": getattr(s, "_peak_net_exit_pnl_twd",
+                                          _MISSING),
+        "_pj_durable_peak": getattr(s, "_pj_durable_peak", _MISSING),
         "_entry_guard_start_ms": s._entry_guard_start_ms,
         "_entry_ts_ms": s._entry_ts_ms,
         "_entry_ts": s._entry_ts,
@@ -139,8 +150,8 @@ def test_restart_baseline_is_trailing_metadata_only(tmp_path):
     assert s._trail_anchor_status == TrailAnchorStatus.READY
     assert s._trail_anchor_source == "RESTART_BASELINE_FRESH_BBO"
     for _k, _v in before.items():
-        assert getattr(s, _k) == _v, \
-            f"RESTART_BASELINE mutated {_k}: {_v!r} -> {getattr(s, _k)!r}"
+        assert getattr(s, _k, _MISSING) == _v, \
+            f"RESTART_BASELINE mutated {_k}: {_v!r} -> {getattr(s, _k, _MISSING)!r}"
     # the trail metadata itself IS the baseline
     assert s._single_leg_peak == pytest.approx(45910.0)
     assert s._nadir == pytest.approx(45910.0)
@@ -184,7 +195,8 @@ def test_restart_baseline_invalid_bbo_fails_closed(tmp_path, far_bid, far_ask):
 def test_restart_baseline_stale_quote_fails_closed(tmp_path):
     s, config = _single_leg_pending(tmp_path, released_leg="near",
                                     position_session="day")
-    s._max_quote_age_ms = 1000.0
+    # max_quote_age_ms is hot-reloaded from config.params on every bar (on_bar)
+    config["params"]["max_quote_age_ms"] = 1000.0
     bar = _make_bar(near_close=45600, far_close=45900, session_type="day",
                     far_bid=45890.0, far_ask=45930.0, far_tick_age_ms=5000.0)
     _run_bar(s, config, bar)
@@ -283,15 +295,15 @@ def test_restore_records_position_session_from_fills(tmp_path, monkeypatch):
     _now = datetime.now()
     rows = [
         {"fill_type": "ENTRY", "trade_id": "t-restart-1", "leg": "NEAR",
-         "price": 45700.0, "side": "SHORT",
+         "price": 45700.0, "side": "SHORT", "qty": 1,
          "timestamp": (_now - timedelta(minutes=30)).isoformat(),
          "session": "day"},
         {"fill_type": "ENTRY", "trade_id": "t-restart-1", "leg": "FAR",
-         "price": 46000.0, "side": "LONG",
+         "price": 46000.0, "side": "LONG", "qty": 1,
          "timestamp": (_now - timedelta(minutes=29)).isoformat(),
          "session": "day"},
         {"fill_type": "RELEASE", "trade_id": "t-restart-1", "leg": "NEAR",
-         "price": 45600.0, "side": "BUY",
+         "price": 45600.0, "side": "BUY", "qty": 1,
          "timestamp": (_now - timedelta(minutes=5)).isoformat(),
          "session": "night"},
     ]
