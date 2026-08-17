@@ -8166,31 +8166,46 @@ class FuturesMonitor:
             if not (math.isfinite(_z) and math.isfinite(_threshold)
                     and _threshold > 0 and abs(_z) >= _threshold):
                 return
-            # P1-C: reject stale / missing quotes — a candidate whose bar
-            # EXPLICITLY carries a stale quote_age or invalid BBO evidence
-            # is not a trustworthy entry observation (absent keys pass, so
-            # legacy bars keep recording).
+            # P1-C: stale / invalid quotes reject the candidate, but the
+            # rejection is RECORDED (decision=REJECT + standardized
+            # reason) so the research ledger explains every dropped
+            # candidate.  Absent BBO keys pass (legacy bars keep
+            # recording as CANDIDATE).
+            _reject_reason = None
             _q_age = bar_dict.get("quote_age_ms")
             if _q_age is not None:
                 try:
                     _max_age = float(getattr(
                         strategy, "_max_quote_age_ms", 30000) or 30000)
                     if float(_q_age) > _max_age:
-                        return
+                        _reject_reason = "STALE_QUOTE"
                 except (TypeError, ValueError):
-                    pass
-            for _k in ("near_bid", "near_ask", "far_bid", "far_ask"):
-                if _k not in bar_dict:
-                    continue
-                _v = bar_dict.get(_k)
-                if (_v is None or _v == 0 or _v == ""
-                        or (isinstance(_v, float) and math.isnan(_v))):
-                    return
+                    _reject_reason = "STALE_QUOTE"
+            if _reject_reason is None:
+                _bbo_present = [k for k in
+                                ("near_bid", "near_ask", "far_bid",
+                                 "far_ask") if k in bar_dict]
+                for _k in _bbo_present:
+                    _v = bar_dict.get(_k)
+                    if _v is None:
+                        _reject_reason = "BBO_MISSING"
+                        break
+                    if isinstance(_v, float) and (
+                            math.isnan(_v) or math.isinf(_v)):
+                        _reject_reason = "BBO_NONFINITE"
+                        break
+                    if _v == 0 or _v == "":
+                        _reject_reason = "BBO_INVALID"
+                        break
+                if _reject_reason is None and 0 < len(_bbo_present) < 4:
+                    _reject_reason = "BBO_MISSING"
             _action = "SELL_NEAR_BUY_FAR" if _z > 0 else "BUY_NEAR_SELL_FAR"
             _audit = {
                 "event_time": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
-                "action": _action, "decision": "CANDIDATE",
-                "rejection_reason": "CANDIDATE_AWAITING_EVALUATION",
+                "action": _action,
+                "decision": "REJECT" if _reject_reason else "CANDIDATE",
+                "rejection_reason": (_reject_reason if _reject_reason
+                                     else "CANDIDATE_AWAITING_EVALUATION"),
                 "trade_id": getattr(strategy, "_trade_id", None),
                 "near_contract": getattr(self, "near_code", None),
                 "far_contract": getattr(self, "far_code", None),
