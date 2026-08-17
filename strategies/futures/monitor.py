@@ -11116,13 +11116,20 @@ class FuturesMonitor:
         correct side / qty / lifecycle — then persisted. This is not a
         skipped reset; it is an authoritative rebuild.
         """
+        from strategies.futures.mts_ledger_authority import MtsAuthority
         strategy._has_position = True
         strategy._trade_id = auth.trade_id
         strategy._near_side = auth.near_side
         strategy._far_side = auth.far_side
+        strategy._near_qty = abs(auth.near_qty)
+        strategy._far_qty = abs(auth.far_qty)
         strategy._near_entry = auth.near_entry
         strategy._far_entry = auth.far_entry
-        strategy._released_leg = None
+        _single_leg = getattr(auth, "status", None) is MtsAuthority.SINGLE_LEG
+        strategy._released_leg = (
+            "near" if _single_leg and auth.far_qty else
+            "far" if _single_leg and auth.near_qty else None
+        )
         console.print(
             f"[bold yellow]♻️ [POSITION_AUTHORITY] Ledger reconstruct: "
             f"trade={auth.trade_id} near={auth.near_side}x{abs(auth.near_qty)} "
@@ -11134,9 +11141,15 @@ class FuturesMonitor:
                 infer_lifecycle_from_legacy_state,
             )
             strategy._lifecycle_oca = infer_lifecycle_from_legacy_state(
-                {"has_position": True, "released_leg": None, "release_state": "BOTH_HELD"}
+                {"has_position": True,
+                 "released_leg": strategy._released_leg,
+                 "release_state": (
+                     "NEAR_RELEASED" if strategy._released_leg == "near"
+                     else "FAR_RELEASED" if strategy._released_leg == "far"
+                     else "BOTH_HELD")}
             )
-            strategy._lifecycle = "RECOVERED_LEDGER"
+            strategy._lifecycle = (
+                "SINGLE_LEG" if _single_leg else "RECOVERED_LEDGER")
             _write_mts_state(
                 has_position=True, action="LEDGER_RECONSTRUCTED",
                 reason="authority_rebuild",
@@ -11144,10 +11157,11 @@ class FuturesMonitor:
                 far_entry=auth.far_entry,
                 near_side=auth.near_side,
                 far_side=auth.far_side,
+                released_leg=strategy._released_leg,
                 trade_id=auth.trade_id,
                 ticker=self.ticker,
                 atr=0.0,
-                lifecycle={"phase": "SPREAD",
+                lifecycle={"phase": "SINGLE_LEG" if _single_leg else "SPREAD",
                            "release_group": {"status": "INACTIVE"},
                            "trail_group": {"status": "INACTIVE"}},
             )
