@@ -76,6 +76,7 @@ def _strategy(**over):
 
 def test_two_leg_hydration_sets_entry_time_trade_id_and_cost(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
     from strategies.futures.mts_ledger_authority import MtsAuthority
 
     monitor = _monitor(tmp_path)
@@ -108,6 +109,7 @@ def test_two_leg_hydration_sets_entry_time_trade_id_and_cost(tmp_path, monkeypat
 
 def test_single_leg_hydration_sets_entry_time_no_synthetic_leg(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
     from strategies.futures.mts_ledger_authority import MtsAuthority
 
     monitor = _monitor(tmp_path)
@@ -140,6 +142,7 @@ def test_single_leg_hydration_sets_entry_time_no_synthetic_leg(tmp_path, monkeyp
 
 def test_restart_keeps_stable_trade_id_and_entry_epoch(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
     first = _monitor(tmp_path)
     first._capture_post_startup_snapshot = lambda: _two_leg_snap()
     s1 = _strategy()
@@ -162,6 +165,7 @@ def test_entry_time_binds_to_current_position_generation(tmp_path, monkeypatch):
     position's entry clock — the timestamp is bound to the current position
     generation (direction + qty + avg_cost price basis)."""
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
     monitor = _monitor(tmp_path)
     monitor._capture_post_startup_snapshot = lambda: _snap(
         positions=[
@@ -192,6 +196,7 @@ def test_entry_time_ambiguous_generation_fails_closed(tmp_path, monkeypatch):
     """Without a cost basis the resolver cannot tell an old generation from
     the current one -> no anchor (fail-closed), never the old timestamp."""
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
     monitor = _monitor(tmp_path)
     monitor._capture_post_startup_snapshot = lambda: _snap(
         positions=[
@@ -225,6 +230,7 @@ def test_valid_hydration_without_anchor_clears_stale_entry_clock(
     clear any stale prior entry clock — a previous trade's clock must never
     survive into the new position (would bypass ENTRY_TIME_MISSING)."""
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
     monitor = _monitor(tmp_path)
     monitor._capture_post_startup_snapshot = lambda: _two_leg_snap_without_deals()
     strategy = _strategy(
@@ -254,6 +260,7 @@ def _two_leg_snap_without_deals():
 
 def test_invalid_snapshot_fail_closed_no_hydration(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
     monitor = _monitor(tmp_path)
     monitor._capture_post_startup_snapshot = lambda: _snap(
         positions=[{"account": "futures", "code": "TMFH6", "quantity": 1,
@@ -277,6 +284,7 @@ def test_skip_event_not_emitted_during_valid_snapshot_hydration(
     RELEASE_EVAL_SKIP_NO_LOCAL_POSITION event, even when the strategy starts
     pre-hydration (local qty 0) inside the refresh call."""
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
     monitor = _monitor(tmp_path)
     monitor._capture_post_startup_snapshot = lambda: _two_leg_snap()
     events = []
@@ -298,6 +306,7 @@ def test_skip_event_fires_when_broker_legs_unresolvable(tmp_path, monkeypatch):
     """When broker legs exist but hydration fails (ambiguous direction), the
     skip event is the CORRECT telemetry and must still fire."""
     monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "mts_position_state.json"))
     monitor = _monitor(tmp_path)
     monitor._capture_post_startup_snapshot = lambda: _snap(
         positions=[
