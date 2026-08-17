@@ -5014,15 +5014,19 @@ class FuturesMonitor:
         bound to the CURRENT position generation.
 
         A candidate deal/trade must match the position's code, direction,
-        quantity (when both present) and — when the position carries an
-        avg_cost — price within 1% of that cost basis.  The earliest
-        matching timestamp is the entry time.  Without a cost basis,
-        multiple same-code/same-direction candidates cannot be told apart
-        (old generation vs current) and fail closed to None.  Falls back
-        to the durable local fills ledger (ENTRY rows, same binding), then
-        the persisted state-file entry clock.  None = no trustworthy
-        anchor — fail-closed: Policy J stays suppressed while
-        release/ATR/emergency exits keep working.
+        quantity and — when the position carries an avg_cost — price
+        within 1% of that cost basis; a candidate MISSING a binding field
+        cannot bind (no wildcards).  Only terminal fill evidence counts
+        (Filled/PartiallyFilled status or explicit deals — a
+        PendingSubmit order row is order state, never a fill).  The
+        earliest matching timestamp is the entry time.  Without a cost
+        basis, multiple same-code/same-direction candidates cannot be
+        told apart (old generation vs current) and fail closed to None.
+        Falls back to the durable local fills ledger (ENTRY rows, same
+        binding), then the persisted state-file entry clock — only when
+        the state legs match the current generation (role + side +
+        cost).  None = no trustworthy anchor — fail-closed: Policy J
+        stays suppressed while release/ATR/emergency exits keep working.
         """
 
         def _norm_side(text):
@@ -5040,26 +5044,47 @@ class FuturesMonitor:
             return self._to_epoch_ms(
                 row.get("ts") or row.get("deal_ts") or row.get("timestamp"))
 
+        def _terminal_fill_evidence(row):
+            """Fill evidence only: fills-ledger rows, Filled/PartiallyFilled
+            statuses, or rows carrying explicit deals.  A PendingSubmit /
+            Submitted / Canceled order row is order state, never a fill."""
+            if row.get("fill_type"):
+                return True
+            _st = str(row.get("status") or "").lower()
+            if "fill" in _st:
+                return True
+            if row.get("deals"):
+                return True
+            return False
+
         def _matches(row, code, side, qty, avg):
+            if not _terminal_fill_evidence(row):
+                return False
             if str(row.get("code") or row.get("contract") or "") != code:
                 return False
             if _row_side(row) != side:
                 return False
+            # Fail-closed: a candidate missing a binding field cannot be
+            # proven to belong to the current generation — no wildcards.
             _rq = (row.get("quantity") or row.get("filled_quantity")
                    or row.get("qty"))
-            if qty is not None and _rq is not None:
+            if qty is not None:
+                if _rq is None:
+                    return False
                 try:
                     if int(_rq) != int(qty):
                         return False
                 except (TypeError, ValueError):
-                    pass
+                    return False
             _rp = row.get("price") or row.get("avg_price")
-            if avg and avg > 0 and _rp is not None:
+            if avg and avg > 0:
+                if _rp is None:
+                    return False
                 try:
                     if abs(float(_rp) - float(avg)) / float(avg) > 0.01:
                         return False
                 except (TypeError, ValueError, ZeroDivisionError):
-                    pass
+                    return False
             return True
 
         _best = None
@@ -5140,11 +5165,52 @@ class FuturesMonitor:
                           encoding="utf-8") as _f:
                     _st = json.load(_f)
                 if _st.get("has_position"):
-                    _ms = self._to_epoch_ms(
-                        _st.get("entry_guard_start_ms")
-                        or _st.get("entry_ts_ms") or _st.get("entry_ts"))
-                    if _ms:
-                        _best = _ms
+                    # The persisted clock is usable only when the state file
+                    # describes the CURRENT broker generation: every position
+                    # leg maps to a near/far role whose side matches and
+                    # whose entry cost matches the broker avg_cost (1%).
+                    _near_code = str(getattr(
+                        getattr(self, "contract", None), "code", "") or "")
+                    _far_code = str(getattr(
+                        getattr(self, "far_contract", None), "code", "") or "")
+                    _gen_ok = True
+                    for _leg in legs or ():
+                        _code = str(_leg.get("code") or "")
+                        if _code == _near_code:
+                            _role = "near"
+                        elif _code == _far_code:
+                            _role = "far"
+                        else:
+                            _gen_ok = False
+                            break
+                        _pos_side = _norm_side(_leg.get("direction"))
+                        _st_side = _norm_side(_st.get(f"{_role}_side"))
+                        if _pos_side is None or _st_side != _pos_side:
+                            _gen_ok = False
+                            break
+                        try:
+                            _avg = float(_leg.get("avg_cost") or 0.0)
+                        except (TypeError, ValueError):
+                            _avg = 0.0
+                        _st_entry = _st.get(f"{_role}_entry")
+                        if _avg > 0:
+                            if _st_entry is None:
+                                _gen_ok = False
+                                break
+                            try:
+                                if (abs(float(_st_entry) - _avg) / _avg
+                                        > 0.01):
+                                    _gen_ok = False
+                                    break
+                            except (TypeError, ValueError, ZeroDivisionError):
+                                _gen_ok = False
+                                break
+                    if _gen_ok:
+                        _ms = self._to_epoch_ms(
+                            _st.get("entry_guard_start_ms")
+                            or _st.get("entry_ts_ms") or _st.get("entry_ts"))
+                        if _ms:
+                            _best = _ms
             except Exception:
                 pass
         return _best
