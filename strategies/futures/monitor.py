@@ -4567,7 +4567,7 @@ class FuturesMonitor:
             if _code and _delivery.isdigit() and len(_delivery) == 6:
                 _month = int(_delivery[-2:])
                 if _month in range(1, 13) and _code == "TMF":
-                    _code = f"{_code}{chr(64 + _month)}{_delivery[-1]}"
+                    _code = f"{_code}{chr(64 + _month)}{_delivery[-3]}"
             _deal = {
                 "trade_id": str(_broker_id),
                 "broker_trade_id": str(_broker_id),
@@ -4593,6 +4593,107 @@ class FuturesMonitor:
                 "trade_id": str(_broker_id),
                 "ts": payload.get("ts"),
                 "deals": [_deal],
+            })
+        return out
+
+    @staticmethod
+    def _normalize_order_state_records(raw_records) -> list:
+        """Normalize Shioaji ``order_deal_records`` FORDER rows into
+        trade-shaped terminal ORDER receipts.
+
+        FDEAL rows are fills (fills ledger); FORDER rows carry the order's
+        own nested status (``payload['status'].status``) plus optional
+        deals.  The nested status is authoritative for the terminal ORDER
+        state; deals embedded in the order snapshot feed the same
+        identity-deduped fill path.  A row without an order identity is
+        skipped (never a synthetic order).
+        """
+        out = []
+        for item in raw_records or []:
+            if not isinstance(item, (tuple, list)) or len(item) < 2:
+                continue
+            state, payload = item[0], item[1]
+            _name = getattr(state, "name", None)
+            _value = getattr(state, "value", None)
+            if not (_name == "FuturesOrder" or _value == "FORDER"
+                    or str(_name or _value or "").split(".")[-1]
+                    == "FuturesOrder"):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            _order = payload.get("order")
+            if not isinstance(_order, dict):
+                _order = payload
+            _broker_id = (_order.get("id") or _order.get("broker_order_id")
+                          or payload.get("trade_id") or payload.get("id"))
+            if not _broker_id:
+                continue
+            # nested order status: payload["status"] may be an OrderState
+            # object (status.status -> enum) or a dict with its own status
+            _st = payload.get("status")
+            _inner = getattr(_st, "status", None)
+            if isinstance(_inner, dict):
+                _inner = _inner.get("status")
+            _raw = (_inner if _inner is not None
+                    else (_st.get("status") if isinstance(_st, dict) else _st))
+            _status_name = (getattr(_raw, "name", None)
+                            or getattr(_raw, "value", None)
+                            or (_raw if isinstance(_raw, str) else None)
+                            or str(_raw or ""))
+            _status_name = str(_status_name).split(".")[-1]
+            _contract = payload.get("contract")
+            if not isinstance(_contract, dict):
+                _contract = {}
+            _code = str(payload.get("full_code")
+                        or _contract.get("code") or payload.get("code") or "")
+            _delivery = str(_contract.get("delivery_month")
+                            or payload.get("delivery_month") or "")
+            if _code and _delivery.isdigit() and len(_delivery) == 6:
+                _month = int(_delivery[-2:])
+                if _month in range(1, 13) and _code == "TMF":
+                    _code = f"{_code}{chr(64 + _month)}{_delivery[-3]}"
+            _price = (payload.get("price") or payload.get("avg_price")
+                      or _order.get("price") or _order.get("avg_price"))
+            _qty = (payload.get("quantity") or payload.get("filled_quantity")
+                    or _order.get("quantity") or _order.get("filled_quantity"))
+            _action = payload.get("action") or _order.get("action")
+            _deals = payload.get("deals")
+            _normalized_deals = []
+            for _d in _deals if isinstance(_deals, list) else []:
+                if not isinstance(_d, dict):
+                    continue
+                _did = (_d.get("deal_id") or _d.get("trade_id")
+                        or _d.get("fill_id"))
+                if not _did:
+                    continue
+                _dp = _d.get("price") or _d.get("avg_price")
+                _dq = _d.get("quantity") or _d.get("qty")
+                if _dp is None or not _dq:
+                    continue
+                _normalized_deals.append({
+                    "deal_id": str(_did),
+                    "trade_id": str(_did),
+                    "broker_trade_id": str(_did),
+                    "exchange_fill_id": str(_did),
+                    "exchange_seq": _d.get("exchange_seq"),
+                    "price": _dp,
+                    "quantity": _dq,
+                    "ordno": _d.get("ordno") or _order.get("ordno"),
+                })
+            out.append({
+                "id": str(_broker_id),
+                "broker_order_id": str(_broker_id),
+                "ordno": _order.get("ordno"),
+                "seqno": _order.get("seqno"),
+                "code": _code,
+                "direction": _action,
+                "status": _status_name or "Unknown",
+                "price": _price,
+                "avg_price": _price,
+                "quantity": _qty,
+                "filled_quantity": _qty,
+                "ts": payload.get("ts"),
+                "deals": _normalized_deals,
             })
         return out
 
@@ -4692,6 +4793,11 @@ class FuturesMonitor:
                         _deal_rows = _api.order_deal_records()
                     broker_trades.extend(
                         self._normalize_order_deal_records(_deal_rows))
+                    # FORDER rows: nested ORDER status receipts (terminal
+                    # order state + optional deals) — reconciled beside
+                    # FDEAL fill receipts (P0-B, no callback-only).
+                    broker_trades.extend(
+                        self._normalize_order_state_records(_deal_rows))
                 except Exception as exc:
                     errors["order_deal_records"] = (
                         f"{type(exc).__name__}: {exc}")
@@ -4793,8 +4899,114 @@ class FuturesMonitor:
         changed += len(position_result.get("reconciled") or [])
         if changed and hasattr(self, "_save_orders_file_wrapper"):
             self._save_orders_file_wrapper()
+        # P0-B: broker-confirmed MTS release fills must close the
+        # lifecycle even without the streaming callback.  Best-effort;
+        # exactly-once via sync_release SINGLE_LEG guard + fills ledger.
+        try:
+            self._close_mts_lifecycle_from_reconciled_fills(
+                result, manager, snapshot)
+        except Exception:
+            pass
         return changed
 
+
+    def _lookup_reconciled_order(self, manager, order_id):
+        """Resolve a reconciled order from active or completed collections."""
+        if not order_id or manager is None:
+            return None
+        try:
+            _o = manager.get_order(order_id)
+            if _o is not None:
+                return _o
+        except Exception:
+            pass
+        for _o in (getattr(manager, "completed", None) or []):
+            if getattr(_o, "order_id", None) == order_id:
+                return _o
+        return None
+
+    def _close_mts_lifecycle_from_reconciled_fills(self, result, manager,
+                                                   snapshot) -> int:
+        """[P0-B] Broker-confirmed fills must close the MTS lifecycle even
+        when the streaming callback was missed (no callback-only
+        assumption).
+
+        ``manager.reconcile_broker_state`` already applied identity-deduped
+        fills (fills_added > 0).  For MTS release orders that is
+        authoritative fill evidence: advance the strategy to SINGLE_LEG via
+        ``sync_release`` exactly once — its SINGLE_LEG phase guard plus the
+        fills-ledger RELEASE row make repeats no-ops.  Never synthesizes an
+        order or a leg; a failed capture never reaches here (the caller
+        returns before reconciling).  Also never resends/cancels: this is
+        strictly read-only broker evidence consumption.
+        """
+        _strat = getattr(self, "_mts_strategy", None)
+        if _strat is None:
+            try:
+                _strat = getattr(self, "_registry", None).get("tmf_spread")
+            except Exception:
+                _strat = None
+        if _strat is None or not hasattr(_strat, "sync_release"):
+            return 0
+        _near_code = str(getattr(
+            getattr(self, "contract", None), "code", "") or "")
+        _far_code = str(getattr(
+            getattr(self, "far_contract", None), "code", "") or "")
+        _closed = 0
+        for _r in (result.get("reconciled") or []):
+            if not _r.get("fills_added"):
+                continue
+            _order = self._lookup_reconciled_order(
+                manager, _r.get("order_id"))
+            if _order is None:
+                continue
+            if str(getattr(_order, "strategy", "")) != "MTS_RELEASE":
+                continue
+            _symbol = str(getattr(_order, "symbol", "") or "")
+            if _symbol == _near_code:
+                _leg = "near"
+            elif _symbol == _far_code:
+                _leg = "far"
+            else:
+                continue
+            _fills = getattr(_order, "fills", None) or []
+            if not _fills:
+                continue
+            _fill = _fills[-1]
+            try:
+                _fill_price = float(getattr(_fill, "fill_price", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if _fill_price <= 0:
+                continue
+            # remaining-leg price: same fallback chain as the release-fill
+            # callback (market data first, then the strategy's own entry)
+            _rem_price = 0.0
+            try:
+                _md = getattr(self, "market_data", None) or {}
+                _rem_key = (f"{self.ticker}_FAR" if _leg == "near"
+                            else f"{self.ticker}_NEAR")
+                _rem_price = float(
+                    (_md.get(_rem_key, {}) or {}).get("close") or 0.0)
+            except Exception:
+                _rem_price = 0.0
+            if _rem_price <= 0:
+                _rem_price = float(getattr(
+                    _strat,
+                    "_far_entry" if _leg == "near" else "_near_entry",
+                    0.0) or 0.0)
+            _ev_time = (getattr(_fill, "fill_time", None)
+                        or getattr(_fill, "timestamp", None))
+            try:
+                _strat.sync_release(
+                    leg=_leg, price=_rem_price,
+                    release_price=_fill_price,
+                    order_id=_r.get("order_id"),
+                    event_time=_ev_time)
+                _closed += 1
+            except Exception:
+                continue
+        return _closed
 
     def _emit_release_telemetry(self, signal: str, strategy, bar_dict: dict) -> None:
         """Emit RELEASE_CONDITION_MET when the strategy signals a release/exit.
