@@ -11457,9 +11457,10 @@ class FuturesMonitor:
 
 
     def _resolve_close_all_position(self):
-        """Resolve the position to close.  Local state first; when it is
-        empty/missing, fall back to the BROKER canonical (actual
-        positions) — broker facts are the authority.  Returns
+        """Resolve the position to close.  The BROKER canonical (actual
+        positions) is the authority — local state is used only when the
+        broker capture is unavailable.  Duplicate contracts or unknown
+        directions fail closed (no close info).  Returns
         (has_pos, near_side, far_side, released_leg, trade_id, disk)."""
         _has_pos = False
         _near_side = None
@@ -11467,58 +11468,74 @@ class FuturesMonitor:
         _released_leg = None
         _trade_id = "mts-emergency"
         _disk = None
+        _canon_ok = False
+
+        def _side(row):
+            if row is None:
+                return None
+            text = str(row.get("direction") or "").lower()
+            if "sell" in text or "short" in text:
+                return "SHORT"
+            if "buy" in text or "long" in text:
+                return "LONG"
+            return None
+
+        # 1. broker canonical first (broker facts are the authority)
         try:
-            _state_path = _mts_position_state_path()
-            if _state_path.exists():
-                _disk = json.loads(_state_path.read_text())
-            if _disk and _disk.get("has_position") is True:
-                _has_pos = True
-                _near_side = _disk.get("near_side")
-                _far_side = _disk.get("far_side")
-                _released_leg = _disk.get("released_leg")
-                _trade_id = _disk.get("trade_id", "mts-emergency")
-        except Exception as _sf_e:
+            _snap = self._capture_post_startup_snapshot()
+            if (_snap and (_snap.get("fetch_status") or {})
+                    .get("capture") == "OK"):
+                _codes = {str(getattr(self.contract, "code", "")),
+                          str(getattr(self.far_contract, "code", ""))}
+                _rows = [p for p in (_snap.get("positions") or [])
+                         if p.get("account") == "futures"
+                         and str(p.get("code") or "") in _codes
+                         and int(p.get("quantity") or 0) > 0]
+                if _rows:
+                    if len(_rows) != len({str(p.get("code")) for p in _rows}):
+                        # duplicate contract: fail closed
+                        return (False, None, None, None,
+                                "mts-emergency", None)
+                    _by_code = {str(p.get("code")): p for p in _rows}
+                    _near = _by_code.get(
+                        str(getattr(self.contract, "code", "")))
+                    _far = _by_code.get(
+                        str(getattr(self.far_contract, "code", "")))
+                    _near_side = _side(_near)
+                    _far_side = _side(_far)
+                    if _near_side is None and _far_side is None:
+                        # unknown directions: fail closed
+                        return (False, None, None, None,
+                                "mts-emergency", None)
+                    if len(_rows) == 1 and _near_side is not None:
+                        _released_leg = "far"
+                    elif len(_rows) == 1 and _far_side is not None:
+                        _released_leg = "near"
+                    _has_pos = True
+                    _trade_id = "mts-emergency-broker"
+                    _canon_ok = True
+                    console.print(
+                        "[yellow]📝 [MANUAL_TRADE] close_all: "
+                        "sides from broker canonical[/yellow]")
+        except Exception as _bc_e:
             console.print(
-                f"[red]⚠️ [MANUAL_TRADE] close_all: disk read failed: {_sf_e}[/red]")
-        if not _has_pos or (_near_side is None and _far_side is None):
+                f"[red]⚠️ [MANUAL_TRADE] close_all: broker canonical "
+                f"fallback failed: {_bc_e}[/red]")
+        # 2. local state fallback ONLY when the canonical is unavailable
+        if not _canon_ok:
             try:
-                _snap = self._capture_post_startup_snapshot()
-                if (_snap and (_snap.get("fetch_status") or {})
-                        .get("capture") == "OK"):
-                    _codes = {str(getattr(self.contract, "code", "")),
-                              str(getattr(self.far_contract, "code", ""))}
-                    _rows = [p for p in (_snap.get("positions") or [])
-                             if p.get("account") == "futures"
-                             and str(p.get("code") or "") in _codes
-                             and int(p.get("quantity") or 0) > 0]
-                    if _rows:
-                        def _side(row):
-                            if row is None:
-                                return None
-                            text = str(row.get("direction") or "").lower()
-                            if "sell" in text or "short" in text:
-                                return "SHORT"
-                            if "buy" in text or "long" in text:
-                                return "LONG"
-                            return None
-                        _by_code = {str(p.get("code")): p for p in _rows}
-                        _near = _by_code.get(
-                            str(getattr(self.contract, "code", "")))
-                        _far = _by_code.get(
-                            str(getattr(self.far_contract, "code", "")))
-                        _has_pos = True
-                        _near_side = _side(_near)
-                        _far_side = _side(_far)
-                        if len(_rows) == 1:
-                            _released_leg = "far" if _near else "near"
-                        _trade_id = "mts-emergency-broker"
-                        console.print(
-                            "[yellow]📝 [MANUAL_TRADE] close_all: "
-                            "sides from broker canonical[/yellow]")
-            except Exception as _bc_e:
+                _state_path = _mts_position_state_path()
+                if _state_path.exists():
+                    _disk = json.loads(_state_path.read_text())
+                if _disk and _disk.get("has_position") is True:
+                    _has_pos = True
+                    _near_side = _disk.get("near_side")
+                    _far_side = _disk.get("far_side")
+                    _released_leg = _disk.get("released_leg")
+                    _trade_id = _disk.get("trade_id", "mts-emergency")
+            except Exception as _sf_e:
                 console.print(
-                    f"[red]⚠️ [MANUAL_TRADE] close_all: broker canonical "
-                    f"fallback failed: {_bc_e}[/red]")
+                    f"[red]⚠️ [MANUAL_TRADE] close_all: disk read failed: {_sf_e}[/red]")
         return (_has_pos, _near_side, _far_side, _released_leg,
                 _trade_id, _disk)
 

@@ -557,13 +557,20 @@ def _manual_command_is_fresh(cmd, max_age_seconds=300):
     """True when a manual-command status record is recent enough to show.
 
     Stale statuses (old ts) must not keep displaying a past failure.
-    Missing/unparseable ts -> not fresh (fail-closed)."""
+    Future timestamps are rejected (clock skew / bad data).  TZ-aware
+    timestamps are normalised to UTC before comparison.  Missing or
+    unparseable ts -> not fresh (fail-closed)."""
     ts = (cmd or {}).get("ts", "")
     if not ts:
         return False
     try:
         dt = datetime.datetime.fromisoformat(ts)
-        return (datetime.datetime.now() - dt).total_seconds() < max_age_seconds
+        if dt.tzinfo is not None:
+            # normalise to the LOCAL naive clock (the writer uses naive
+            # local time) so naive and tz-aware timestamps compare alike
+            dt = dt.astimezone().replace(tzinfo=None)
+        age = (datetime.datetime.now() - dt).total_seconds()
+        return 0 <= age < max_age_seconds
     except Exception:
         return False
 
