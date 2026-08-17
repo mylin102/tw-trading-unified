@@ -32,7 +32,11 @@ import json
 import os
 import shutil
 import sys
+import time
 from datetime import datetime
+
+from core.broker_evidence import capture_session_snapshot
+from core.order_lifecycle_reconciler import reconcile_order
 
 
 def find_orders_file(runtime_dir):
@@ -48,6 +52,10 @@ class BrokerProbe:
     def __init__(self, api, account=None):
         self._api = api
         self._account = account
+
+    def capture_snapshot(self, *, session_id):
+        """Capture one read-only broker snapshot for the whole reconcile."""
+        return capture_session_snapshot(self._api, session_id=session_id)
 
     def has_open_order(self, broker_order_id):
         if not broker_order_id:
@@ -86,6 +94,12 @@ def reconcile(orders_file, broker=None, dry_run=False):
         orders = json.load(fh)
     changed = []
     retained = []
+    snapshot = None
+    capture = getattr(broker, "capture_snapshot", None) if broker else None
+    if callable(capture):
+        snapshot = capture(
+            session_id=f"restart-reconcile:{os.getpid()}:{time.time_ns()}"
+        )
     for order in orders:
         if order.get("status") != "pending_submit":
             continue
@@ -93,6 +107,22 @@ def reconcile(orders_file, broker=None, dry_run=False):
         if broker is None:
             # no broker evidence available -> fail closed
             retained.append(oid)
+            continue
+        if snapshot is not None:
+            decision = reconcile_order(order, snapshot)
+            if decision.action != "MARK_TERMINAL":
+                retained.append(oid)
+                continue
+            # Broker evidence proves neither this order nor a position exists.
+            # Keep the historical record but make the terminal disposition
+            # explicit; never interpret this as a fill or resubmit.
+            order["status"] = "BROKER_NOT_FOUND"
+            order["reconciled_at"] = datetime.now().isoformat()
+            order["reconcile_note"] = (
+                "phantom pending: broker confirms neither open order nor "
+                "position (BROKER_NOT_FOUND, RECONCILE_REQUIRED)"
+            )
+            changed.append(oid)
             continue
         broker_id = order.get("broker_order_id")
         symbol = order.get("symbol")
