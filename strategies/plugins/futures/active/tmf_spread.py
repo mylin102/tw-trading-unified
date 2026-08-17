@@ -678,6 +678,79 @@ def _exit_intent_log():
     return IntentLog(os.path.join(runtime_root(), "logs"))
 
 
+def _restart_baseline_quote(
+    bar: dict,
+    *,
+    rem_leg: Leg,
+    position_session_type: str | None,
+    max_quote_age_ms: float,
+) -> tuple[float | None, str | None]:
+    """RESTART_BASELINE quote resolution — (anchor_price, None) on success,
+    (None, fail_reason) on fail-closed.
+
+    Contract (bounded slice 2026-08-18):
+      1. single-leg remaining-leg BBO only — the other leg is never read
+      2. fresh — remaining-leg quote age (leg tick age -> leg age ->
+         bar quote_age_ms) must be present and <= max_quote_age_ms;
+         an unprovable age fails closed (QUOTE_AGE_UNKNOWN)
+      3. session match — bar session_type must equal the position's session
+         (unknown position session / unknown bar session -> fail-closed)
+      4. fail-closed — any missing / stale / session-mismatch input returns
+         (None, reason); the caller keeps PENDING_REANCHOR
+      5. metadata-only by construction — returns a price; the caller only
+         writes trail extrema / anchor fields (never avg_cost / UPL /
+         Policy-J / two-leg entry time)
+    """
+    _b = bar or {}
+    if position_session_type is None:
+        return None, "TRAIL_REANCHOR_SESSION_UNKNOWN"
+    _bar_sess = _b.get("session_type")
+    if _bar_sess is None:
+        return None, "TRAIL_REANCHOR_SESSION_UNKNOWN"
+    if str(_bar_sess) != str(position_session_type):
+        return None, "TRAIL_REANCHOR_SESSION_MISMATCH"
+
+    _leg_key = "near" if rem_leg == Leg.NEAR else "far"
+    _bid = _b.get(f"{_leg_key}_bid")
+    _ask = _b.get(f"{_leg_key}_ask")
+    if _bid is None or _ask is None:
+        return None, "TRAIL_REANCHOR_BBO_MISSING"
+    # type-safety BEFORE arithmetic (2026-08-13 width-gate lesson):
+    # bool is an int subclass; str / unparseable values must never anchor
+    if isinstance(_bid, bool) or isinstance(_ask, bool):
+        return None, "TRAIL_REANCHOR_BBO_INVALID"
+    if isinstance(_bid, str) or isinstance(_ask, str):
+        return None, "TRAIL_REANCHOR_BBO_INVALID"
+    try:
+        _bid_f = float(_bid)
+        _ask_f = float(_ask)
+    except (TypeError, ValueError):
+        return None, "TRAIL_REANCHOR_BBO_INVALID"
+    if (not math.isfinite(_bid_f) or not math.isfinite(_ask_f)
+            or _bid_f <= 0 or _ask_f <= 0):
+        return None, "TRAIL_REANCHOR_BBO_INVALID"
+    if _ask_f < _bid_f:
+        return None, "TRAIL_REANCHOR_BBO_INVALID"
+
+    _age = _b.get(f"{_leg_key}_tick_age_ms")
+    if _age is None:
+        _age = _b.get(f"{_leg_key}_age_ms")
+    if _age is None:
+        _age = _b.get("quote_age_ms")
+    if _age is None:
+        return None, "TRAIL_REANCHOR_QUOTE_AGE_UNKNOWN"
+    try:
+        _age_f = float(_age)
+    except (TypeError, ValueError):
+        return None, "TRAIL_REANCHOR_QUOTE_STALE"
+    if _age_f < 0:
+        _age_f = 0.0
+    if max_quote_age_ms > 0 and _age_f > max_quote_age_ms:
+        return None, "TRAIL_REANCHOR_QUOTE_STALE"
+
+    return (_bid_f + _ask_f) / 2.0, None
+
+
 def _session_label() -> str:
     """Return 'night' if current time is in night session, else 'day'."""
     _h = datetime.now().hour
@@ -1724,6 +1797,10 @@ class TMFSpread(StrategyBase):
         self._trail_warmup_tick_count: int = 0
         self._trail_started_at: float | None = None
         self._trail_anchor_source: str | None = None
+        # ── RESTART_BASELINE: 持倉的 trading session (day/night), 由
+        # release-fill 路徑或 fill-log restore 記錄; baseline gate 用它
+        # 比對報價 session, mismatch / unknown 一律 fail-closed ──
+        self._position_session_type: str | None = None
 
         # ── P1: Single-leg extrema (decision authority in SINGLE_LEG) ──
         # (_single_leg_peak/nadir initialized before _restore_position_state;
@@ -1990,6 +2067,9 @@ class TMFSpread(StrategyBase):
         self._release_ts = event_time or datetime.now()
         self._single_leg_started_at = self._release_ts
         self._release_mono = time.monotonic()
+        # ── RESTART_BASELINE: 記錄持倉的 trading session (fill-time),
+        # 供重啟後的 baseline gate 拒絕其他 session 的報價 ──
+        self._position_session_type = _session_label()
         # 2026-07-22 Gemini CLI: Avoid release price defaulting to 0.0 or remaining_leg_price if invalid
         _entry_fallback = self._near_entry if released_leg == Leg.NEAR else self._far_entry
         self._release_price = fill_price if fill_price > 0 else (remaining_leg_price if remaining_leg_price > 0 else _entry_fallback)
@@ -2699,6 +2779,21 @@ class TMFSpread(StrategyBase):
                     self._lifecycle = f"TRAILING_{self._side}"
                     self._release_price = float(_rf_price) if _rf_price is not None else 0.0
 
+            if self._released_leg is not None:
+                # ── RESTART_BASELINE: 重啟後的單腿 anchor 一律 PENDING_REANCHOR,
+                # 由 baseline gate 從 fresh BBO 建立 (不能用 release fill 價污染);
+                # 並記錄持倉 session 供 baseline gate 比對 ──
+                self._set_single_leg_extrema(peak=0.0, nadir=0.0)
+                self._single_leg_anchor_price = 0.0
+                self._trail_anchor_status = TrailAnchorStatus.PENDING_REANCHOR
+                self._trail_warmup_tick_count = 0
+                self._trail_started_at = None
+                self._trail_anchor_source = "RESTORE_RECONSTRUCTION"
+                self._position_session_type = (
+                    _release_fills[0].get("session")
+                    or _entry_fills[0].get("session")
+                )
+
             # Restore lifecycle OCA phase and group status
             if hasattr(self, "_lifecycle_oca"):
                 self._lifecycle_oca.phase = PositionPhase.SPREAD if self._released_leg is None else PositionPhase.SINGLE_LEG
@@ -3183,6 +3278,12 @@ class TMFSpread(StrategyBase):
                             if release_f:
                                 self._released_leg = "near" if release_f["leg"] == "NEAR" else "far"
                                 self._side = "LONG" if (self._released_leg == "near" and self._far_side == "LONG") or (self._released_leg == "far" and self._near_side == "LONG") else "SHORT"
+                                # ── RESTART_BASELINE: 記錄持倉 session (release fill
+                                # 優先, entry fill 兜底), 供 baseline gate 比對 ──
+                                self._position_session_type = (
+                                    release_f.get("session")
+                                    or last_entry.get("session")
+                                )
                                 # [P0 Fix] Restart recovery: released-leg fill price must NOT
                                 # become remaining-leg trail anchor. Set PENDING_REANCHOR instead,
                                 # so the first fresh remaining-leg tick initializes the real anchor.
@@ -3716,37 +3817,52 @@ class TMFSpread(StrategyBase):
                         self._single_leg_post_fill_ticks += 1
                         self._single_leg_last_tick_ts = _ts_float
 
-        # -- P0 Fix: Trail anchor re-anchor gate (2026-07-24) --
-        # After restart recovery, _trail_anchor_status may be PENDING_REANCHOR.
-        # Wait for a fresh remaining-leg tick before allowing trail evaluation.
+        # ── RESTART_BASELINE (bounded slice 2026-08-18) ──
+        # 重啟後的單腿 trail anchor 只能由「broker 確認的單腿 + 剩餘腿的
+        # fresh BBO + 同 trading session」建立; baseline 只是 trailing
+        # protection metadata, 永不寫入 avg_cost / UPL / Policy-J /
+        # two-leg entry time。任何輸入 missing / stale / session mismatch
+        # → fail-closed, 維持 PENDING_REANCHOR。
         if self._trail_anchor_status == TrailAnchorStatus.PENDING_REANCHOR:
-            _rem_leg = Leg.FAR if self._released_leg == "near" else Leg.NEAR
-            _rem_price = far_close if _rem_leg == Leg.FAR else near_close
-            _fresh = (
-                _rem_price > 0
-                and not (hasattr(_rem_price, "item") and pd.isna(_rem_price))
-            )
-            if _fresh:
-                self._set_single_leg_extrema(peak=_rem_price, nadir=_rem_price)
-                self._single_leg_anchor_price = _rem_price
-                self._single_leg_anchor_event_time_ns = time.monotonic_ns()
-                self._trail_anchor_status = TrailAnchorStatus.READY
-                self._trail_warmup_tick_count = 0
-                self._trail_started_at = None
-                self._trail_anchor_source = "FIRST_FRESH_QUOTE"
-                self._set_eval(skip_reason="TRAIL_REANCHOR_INITIALIZED")
-                logger.info(
-                    "[MTS_REANCHOR] status=READY side=%s anchor=%.2f leg=%s",
-                    self._side, _rem_price, _rem_leg.value,
-                )
+            # released_leg 缺失時無法推導剩餘腿 — 預設 NEAR 會造成跨腿污染
+            if self._released_leg not in ("near", "far"):
+                self._set_eval(skip_reason="TRAIL_REANCHOR_NOT_SINGLE_LEG")
                 return None
-            else:
-                self._set_eval(skip_reason="TRAIL_REANCHOR_WAITING_FRESH_QUOTE")
+            _rem_leg = Leg.FAR if self._released_leg == "near" else Leg.NEAR
+            # broker/fills truth 確認持倉存在 (_broker_truth_flat is False)
+            if getattr(self, "_broker_truth_flat", False) is True:
+                self._set_eval(skip_reason="TRAIL_REANCHOR_NOT_BROKER_CONFIRMED")
                 logger.info(
-                    "[MTS_REANCHOR] status=PENDING_REANCHOR no_fresh_quote side=%s",
+                    "[MTS_REANCHOR] status=PENDING_REANCHOR reason=NOT_BROKER_CONFIRMED side=%s",
                     self._side,
                 )
                 return None
+            _anchor, _reason = _restart_baseline_quote(
+                bar,
+                rem_leg=_rem_leg,
+                position_session_type=getattr(self, "_position_session_type", None),
+                max_quote_age_ms=float(getattr(self, "_max_quote_age_ms", 0.0) or 0.0),
+            )
+            if _anchor is None:
+                self._set_eval(skip_reason=_reason)
+                logger.info(
+                    "[MTS_REANCHOR] status=PENDING_REANCHOR reason=%s side=%s",
+                    _reason, self._side,
+                )
+                return None
+            self._set_single_leg_extrema(peak=_anchor, nadir=_anchor)
+            self._single_leg_anchor_price = _anchor
+            self._single_leg_anchor_event_time_ns = time.monotonic_ns()
+            self._trail_anchor_status = TrailAnchorStatus.READY
+            self._trail_warmup_tick_count = 0
+            self._trail_started_at = None
+            self._trail_anchor_source = "RESTART_BASELINE_FRESH_BBO"
+            self._set_eval(skip_reason="TRAIL_REANCHOR_INITIALIZED")
+            logger.info(
+                "[MTS_REANCHOR] status=READY side=%s anchor=%.2f leg=%s source=RESTART_BASELINE_FRESH_BBO",
+                self._side, _anchor, _rem_leg.value,
+            )
+            return None
 
         # 2026-06-26 Gemini CLI: build dynamic risk metadata
         _risk_meta = self._get_risk_meta(bar)
