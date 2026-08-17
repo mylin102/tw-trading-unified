@@ -8068,6 +8068,63 @@ class FuturesMonitor:
             return None
         return _open_qty
 
+    def _reset_mts_dynamics_for_session(self, bar) -> None:
+        """Reset the dynamics calculator when the bar's session changes so
+        derivatives never span sessions (day -> night etc.)."""
+        _sess = bar.get("session_type")
+        if _sess is None or _sess == getattr(
+                self, "_spread_dynamics_session", None):
+            return
+        self._spread_dynamics_session = _sess
+        _sd = getattr(self, "_spread_dynamics", None)
+        if _sd is None:
+            return
+        from strategies.futures.mts.spread_dynamics import (
+            SpreadDynamicsCalculator)
+        self._spread_dynamics = SpreadDynamicsCalculator(
+            tau_sec=_sd.tau_sec, window_sec=_sd.window_sec,
+            min_dt_sec=_sd.min_dt_sec,
+            max_derivative_gap_sec=_sd.max_derivative_gap_sec,
+            min_abs_z_for_ratio=_sd.min_abs_z_for_ratio,
+            min_slope_samples=_sd.min_slope_samples,
+            min_slope_duration_sec=_sd.min_slope_duration_sec)
+
+    def _update_mts_spread_dynamics(self, bar: dict):
+        """Dynamics telemetry seam (bar-timestamp clock, session-aware).
+
+        Bar timestamps drive dt so behavior is deterministic and a
+        session_type change resets the calculator so derivatives never
+        span sessions.  The production tick pipeline uses
+        _apply_spread_dynamics (real arrival time — the 5-minute bar
+        cadence would otherwise trip max_derivative_gap_sec on every bar).
+        Returns the metrics; never raises.
+        """
+        _sd = getattr(self, "_spread_dynamics", None)
+        _z = bar.get("spread_z")
+        if _sd is None or _z is None:
+            return None
+        try:
+            self._reset_mts_dynamics_for_session(bar)
+            _sd = getattr(self, "_spread_dynamics", None)
+            _ts_raw = bar.get("ts") or bar.get("timestamp") or time.time()
+            if hasattr(_ts_raw, "timestamp"):
+                _ts_float = float(_ts_raw.timestamp())
+            elif hasattr(_ts_raw, "tz"):
+                _ts_float = float(pd.Timestamp(_ts_raw).timestamp())
+            else:
+                _ts_float = float(_ts_raw)
+            _m = _sd.update(_ts_float, float(_z))
+            _raw = (float(bar.get("near_close", 0.0) or 0.0)
+                    - float(bar.get("far_close", 0.0) or 0.0))
+            bar["raw_spread"] = _raw
+            bar["dz"] = _m.z_velocity
+            bar["spread_slope"] = _m.rolling_slope
+            bar["velocity_ema"] = _m.velocity_ema
+            bar["spread"] = _raw
+            return _m
+        except Exception:
+            return None
+
     def _apply_spread_dynamics(self, bar: dict) -> None:
         """Wire the SpreadDynamicsCalculator into the bar pipeline so the
         entry_observation research records carry dz / spread_slope /
@@ -8080,6 +8137,7 @@ class FuturesMonitor:
         if _sd is None or _z is None:
             return
         try:
+            self._reset_mts_dynamics_for_session(bar)
             # Real arrival time, not bar timestamps: bars carry a 5-minute
             # cadence whose dt (300s) exceeds the calculator's
             # max_derivative_gap_sec=15, resetting the sample counter every
@@ -8108,6 +8166,26 @@ class FuturesMonitor:
             if not (math.isfinite(_z) and math.isfinite(_threshold)
                     and _threshold > 0 and abs(_z) >= _threshold):
                 return
+            # P1-C: reject stale / missing quotes — a candidate whose bar
+            # EXPLICITLY carries a stale quote_age or invalid BBO evidence
+            # is not a trustworthy entry observation (absent keys pass, so
+            # legacy bars keep recording).
+            _q_age = bar_dict.get("quote_age_ms")
+            if _q_age is not None:
+                try:
+                    _max_age = float(getattr(
+                        strategy, "_max_quote_age_ms", 30000) or 30000)
+                    if float(_q_age) > _max_age:
+                        return
+                except (TypeError, ValueError):
+                    pass
+            for _k in ("near_bid", "near_ask", "far_bid", "far_ask"):
+                if _k not in bar_dict:
+                    continue
+                _v = bar_dict.get(_k)
+                if (_v is None or _v == 0 or _v == ""
+                        or (isinstance(_v, float) and math.isnan(_v))):
+                    return
             _action = "SELL_NEAR_BUY_FAR" if _z > 0 else "BUY_NEAR_SELL_FAR"
             _audit = {
                 "event_time": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),

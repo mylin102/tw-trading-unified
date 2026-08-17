@@ -3440,6 +3440,50 @@ def _build_flat_broker_mts_state(telemetry: dict) -> dict:
     }
 
 
+def latest_entry_audit_line(events_path=None) -> str | None:
+    """Render the latest ENTRY_AUDIT event as a one-line caption.
+
+    Actual entry spread_z + threshold (entry_z) + source (reason/action)
+    + event time — never a 0.00 fallback from the state mirror (whose
+    current_spread_z is never updated).  Returns None when no ENTRY_AUDIT
+    event exists or the file is unreadable.
+    """
+    if events_path is None:
+        try:
+            events_path = os.path.join(runtime_logs(),
+                                       "mts_spread_events.jsonl")
+        except Exception:
+            return None
+    try:
+        if not os.path.exists(events_path):
+            return None
+        _audit = None
+        with open(events_path, "r", encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if not _line:
+                    continue
+                try:
+                    _ev = json.loads(_line)
+                except Exception:
+                    continue
+                if _ev.get("event") == "ENTRY_AUDIT":
+                    _audit = _ev
+        if _audit is None:
+            return None
+        _az = _audit.get("spread_z")
+        _aez = _audit.get("entry_z")
+        _az_str = f"{float(_az):.2f}" if _az is not None else "N/A"
+        _aez_str = f"{float(_aez):.2f}" if _aez is not None else "N/A"
+        _ats = str(_audit.get("ts", ""))
+        _ats = _ats.replace("T", " ")[:19] if _ats else "?"
+        _asrc = _audit.get("reason") or _audit.get("action") or "?"
+        return (f"Entry Audit Z: {_az_str} (threshold {_aez_str}) "
+                f"@ {_ats} [{_asrc}]")
+    except Exception:
+        return None
+
+
 def _build_live_broker_mts_state(positions: list, canonical: dict,
                                  params: dict | None = None) -> dict | None:
     """Build broker-authoritative MTS state, including a remaining leg."""
@@ -5417,10 +5461,24 @@ elif _selected_product == "TMF":
                                 {"Leg": _far_label, "方向": _far_side, "進場": _far_val, "現價": _far_now, f"{_far_pnl_lbl}損益": _far_pnl, "事件": _far_event},
                             ]
                             st.dataframe(pd.DataFrame(_mts_rows), width='stretch', hide_index=True)
-                            _ez = _mts_state.get("entry_spread_z")
-                            _cz = _mts_state.get("current_spread_z")
-                            if _ez is not None:
-                                st.caption(f"Entry Z: {_ez:.2f}  |  Current Z: {float(_cz):.2f}" if _cz is not None else f"Entry Z: {_ez:.2f}")
+                            # P1-C: render the ACTUAL latest ENTRY_AUDIT
+                            # (z + threshold + source + time) — never a
+                            # 0.00 Current-Z fallback from the state mirror.
+                            _audit_line = latest_entry_audit_line()
+                            if _audit_line is not None:
+                                st.caption(_audit_line)
+                            else:
+                                _ez = _mts_state.get("entry_spread_z")
+                                _cz = _mts_state.get("current_spread_z")
+                                if (_ez is not None
+                                        and float(_ez or 0.0) != 0.0):
+                                    _cz_part = (
+                                        f"  |  Current Z: {float(_cz):.2f}"
+                                        if (_cz is not None
+                                            and float(_cz or 0.0) != 0.0)
+                                        else "")
+                                    st.caption(
+                                        f"Entry Z: {_ez:.2f}{_cz_part}")
                             _trail_s = _mts_state.get("trail_side")
                             if _trail_s:
                                 _tp = _mts_state.get("trail_peak", 0)
