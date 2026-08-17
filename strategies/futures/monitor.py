@@ -6474,6 +6474,9 @@ class FuturesMonitor:
                 source="shioaji_callback",
                 reason=reason,
             )
+            if order is not None:
+                self._leg_lock_apply_order_event(
+                    order, getattr(order, "status", None), fill_qty=fill_qty)
             if order is None:
                 logger.warning(
                     "[FUTURES_DEAL_UNMATCHED] id=%s seqno=%s ordno=%s",
@@ -6481,7 +6484,7 @@ class FuturesMonitor:
                 )
             return
 
-        self.order_mgr.apply_order_update(
+        _updated_order = self.order_mgr.apply_order_update(
             None,
             raw_status=payload.get("status") or state_value,
             reason=reason,
@@ -6491,6 +6494,9 @@ class FuturesMonitor:
             ordno=ordno,
             source="shioaji_callback",
         )
+        if _updated_order is not None:
+            self._leg_lock_apply_order_event(
+                _updated_order, getattr(_updated_order, "status", None))
 
     def _fills_bridge_mark_seen(self, order, deal_id, seqno,
                                exchange_seq=None) -> bool:
@@ -7709,6 +7715,18 @@ class FuturesMonitor:
             _is_release_far = _reason and "RELEASE_FAR" in str(_reason).upper()
             if _is_release_near:
                 _side = OrderSide.BUY if getattr(strategy, "_near_side") == "SHORT" else OrderSide.SELL
+                _leg_key = None
+                if self._leg_lock_enabled():
+                    _leg_key = self._mts_leg_lock_key(
+                        trade_id=_trade_id, contract=_near_code, side=_side, qty=1)
+                    if self._leg_lock_check(_leg_key):
+                        return
+                    if not self._leg_lock_acquire(_leg_key):
+                        self._append_mts_event(
+                            "ORDER_INTENT_BLOCKED", action=_action,
+                            reason="LEG_LOCK_ACQUIRE_FAILED",
+                            trade_id=_trade_id, contract=_near_code)
+                        return
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_NEAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) instead of MARKET — 避免滑價
                 _order = self.order_mgr.create_order(symbol=_near_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
@@ -7722,6 +7740,8 @@ class FuturesMonitor:
                 }
 
                 if not self._submit_via_gateway(_order):
+                    if _leg_key is not None:
+                        self._leg_lock_mark_terminal(_leg_key, "SUBMIT_FAILED")
                     from core.exit_only_position import (
                         build_bbo_failure_evidence)
                     _cap = getattr(
@@ -7735,6 +7755,8 @@ class FuturesMonitor:
                             self._exit_only_bbo_slots(), _cap,
                             "SUBMIT_FAILED"))
                     return
+                if _leg_key is not None:
+                    self._leg_lock_bind_order(_leg_key, _order)
                 self._append_mts_event("ORDER_SUBMITTED", **{
                     **_ev_meta(_order),
                     "ref_ohlc": _snap["near"],
@@ -7753,6 +7775,18 @@ class FuturesMonitor:
                         console.print(f"[bold green]✅ [MTS_ORDER] RELEASE_NEAR FILLED: {_side} (MKP)[/bold green]")
             elif _is_release_far:
                 _side = OrderSide.BUY if getattr(strategy, "_far_side") == "SHORT" else OrderSide.SELL
+                _leg_key = None
+                if self._leg_lock_enabled():
+                    _leg_key = self._mts_leg_lock_key(
+                        trade_id=_trade_id, contract=_far_code, side=_side, qty=1)
+                    if self._leg_lock_check(_leg_key):
+                        return
+                    if not self._leg_lock_acquire(_leg_key):
+                        self._append_mts_event(
+                            "ORDER_INTENT_BLOCKED", action=_action,
+                            reason="LEG_LOCK_ACQUIRE_FAILED",
+                            trade_id=_trade_id, contract=_far_code)
+                        return
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_FAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
                 _order = self.order_mgr.create_order(symbol=_far_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
@@ -7766,6 +7800,8 @@ class FuturesMonitor:
                 }
 
                 if not self._submit_via_gateway(_order):
+                    if _leg_key is not None:
+                        self._leg_lock_mark_terminal(_leg_key, "SUBMIT_FAILED")
                     from core.exit_only_position import (
                         build_bbo_failure_evidence)
                     _cap = getattr(
@@ -7779,6 +7815,8 @@ class FuturesMonitor:
                             self._exit_only_bbo_slots(), _cap,
                             "SUBMIT_FAILED"))
                     return
+                if _leg_key is not None:
+                    self._leg_lock_bind_order(_leg_key, _order)
                 self._append_mts_event("ORDER_SUBMITTED", **{
                     **_ev_meta(_order),
                     "ref_ohlc": _snap["far"],
@@ -7851,7 +7889,25 @@ class FuturesMonitor:
                 )
                 return
 
-            # Claim idempotency key
+            # Acquire both leg locks before creating/submitting either order.
+            # A conflict on one leg blocks the whole pair; no partial local
+            # order objects or broker I/O may occur.
+            _near_lock_key = _far_lock_key = None
+            if self._leg_lock_enabled():
+                _near_lock_key = self._mts_leg_lock_key(
+                    trade_id=_trade_id, contract=_near_code,
+                    side=_near_order_side, qty=_near_qty)
+                _far_lock_key = self._mts_leg_lock_key(
+                    trade_id=_trade_id, contract=_far_code,
+                    side=_far_order_side, qty=_far_qty)
+                if (self._leg_lock_check(_near_lock_key)
+                        or self._leg_lock_check(_far_lock_key)):
+                    return
+                if not self._leg_lock_acquire_pair(_near_lock_key, _far_lock_key):
+                    return
+
+            # Claim idempotency only after the durable pair lock succeeds;
+            # a blocked attempt must be retryable after broker reconciliation.
             self._claimed_execution_keys.add(_claim_key)
 
             # Create combined_exit_group_id for correlation
@@ -7888,24 +7944,36 @@ class FuturesMonitor:
             except _MTSDupSubmit:
                 # P1-2 dedup: a repeated exit decision must NOT re-send
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} NEAR already submitted — suppressing duplicate[/yellow]")
+                return
             except _MTSGWFail as _gwe:
                 # [S0] failed near leg: force LIVE_QUARANTINED + persist
                 # (reconciliation-required); the FAR leg must never
                 # submit after a near failure.
                 self._quarantine_mts_exit_leg_failure(
                     trade_id=_trade_id, leg="NEAR", reason=str(_gwe))
+                if _near_lock_key is not None:
+                    self._leg_lock_mark_terminal(_near_lock_key, "SUBMIT_FAILED")
+                if _far_lock_key is not None:
+                    self._leg_lock_mark_terminal(_far_lock_key, "SUBMIT_FAILED")
                 return
+            if _near_lock_key is not None:
+                self._leg_lock_bind_order(_near_lock_key, _near_order)
             try:
                 _ilog.submit_leg(_iid, "FAR", self.order_mgr,
                                  submit_fn=lambda cid, leg: self._submit_via_gateway(_far_order, raise_on_failure=True))
             except _MTSDupSubmit:
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} FAR already submitted — suppressing duplicate[/yellow]")
+                return
             except _MTSGWFail as _gwe:
                 # [S0] failed far leg: force LIVE_QUARANTINED + persist
                 # (reconciliation-required); no retry, no cancel.
                 self._quarantine_mts_exit_leg_failure(
                     trade_id=_trade_id, leg="FAR", reason=str(_gwe))
+                if _far_lock_key is not None:
+                    self._leg_lock_mark_terminal(_far_lock_key, "SUBMIT_FAILED")
                 return
+            if _far_lock_key is not None:
+                self._leg_lock_bind_order(_far_lock_key, _far_order)
             # 2026-07-30: Write state to COMBINED_EXIT only AFTER successful submission
             try:
                 from strategies.plugins.futures.active.tmf_spread import _write_mts_state
@@ -8038,6 +8106,19 @@ class FuturesMonitor:
 
             _side = OrderSide.SELL if _remaining_side == "LONG" else OrderSide.BUY
 
+            _leg_key = None
+            if self._leg_lock_enabled():
+                _leg_key = self._mts_leg_lock_key(
+                    trade_id=_trade_id, contract=_symbol, side=_side, qty=1)
+                if self._leg_lock_check(_leg_key):
+                    return
+                if not self._leg_lock_acquire(_leg_key):
+                    self._append_mts_event(
+                        "ORDER_INTENT_BLOCKED", action=_action,
+                        reason="LEG_LOCK_ACQUIRE_FAILED",
+                        trade_id=_trade_id, contract=_symbol)
+                    return
+
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting EXIT for {_leg_label}: {_side} (MKP Range Market)[/yellow]")
             # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
             _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_EXIT")
@@ -8079,10 +8160,15 @@ class FuturesMonitor:
             except _MTSDupSubmit:
                 # P1-2 dedup: a repeated exit decision must NOT re-send
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} {_leg_label} already submitted — suppressing duplicate[/yellow]")
+                return
             except _MTSGWFail as _gwe:
                 self._quarantine_mts_exit_leg_failure(
                     trade_id=_trade_id, leg=_leg_label, reason=str(_gwe))
+                if _leg_key is not None:
+                    self._leg_lock_mark_terminal(_leg_key, "SUBMIT_FAILED")
                 return
+            if _leg_key is not None:
+                self._leg_lock_bind_order(_leg_key, _order)
             self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _ref_ohlc,
                                                           "event_id": _order.event_id,
                                                           "winner": _order.winner})
@@ -8320,6 +8406,90 @@ class FuturesMonitor:
             "trade_id", "session_generation", "contract",
             "closing_side", "qty"))
 
+    def _mts_leg_lock_key(self, *, trade_id, contract, side, qty) -> dict:
+        """Build the canonical lock key for a broker-facing MTS leg."""
+        _ctx = getattr(self, "_execution_context", None)
+        _side = getattr(side, "value", side)
+        return {
+            "trade_id": trade_id,
+            "session_generation": getattr(_ctx, "session_id", "") or "",
+            "contract": contract,
+            "closing_side": str(_side or "").upper(),
+            "qty": qty,
+        }
+
+    def _leg_lock_enabled(self) -> bool:
+        """Enable broker leg locks only for the live order path.
+
+        Paper mode has synchronous local fills and must retain its existing
+        compatibility semantics; the durable broker lock is a live-side
+        duplicate-submission barrier.
+        """
+        return bool(getattr(self, "live_trading", False)
+                    and not getattr(self, "dry_run", False))
+
+    def _leg_lock_bind_order(self, key: dict, order) -> None:
+        """Attach broker identity to an already-acquired leg lock."""
+        try:
+            _broker_id = (getattr(order, "broker_order_id", None)
+                          or getattr(order, "exchange_order_id", None)
+                          or "")
+            _seqno = getattr(order, "seqno", None) or ""
+            if not (_broker_id or _seqno):
+                return
+            with self._leg_lock_flock(exclusive=True):
+                _locks = self._leg_lock_read()
+                _lock = _locks.get(self._leg_lock_id(key))
+                if _lock is None:
+                    return
+                _lock["local_order_id"] = getattr(order, "order_id", "") or ""
+                _lock["broker_order_id"] = str(_broker_id)
+                _lock["seqno"] = str(_seqno)
+                self._leg_lock_write(_locks)
+        except Exception:
+            # Identity enrichment must never turn a confirmed receipt into a
+            # false success; the lock remains held under its canonical key.
+            return
+
+    def _leg_lock_apply_order_event(self, order, status, fill_qty=None) -> None:
+        """Release/retain the lock from an authoritative order event."""
+        if not self._leg_lock_enabled():
+            return
+        try:
+            _status = str(getattr(status, "value", status) or "").upper()
+            _broker_id = str(
+                getattr(order, "broker_order_id", None)
+                or getattr(order, "exchange_order_id", None) or "")
+            _seqno = str(getattr(order, "seqno", None) or "")
+            _local_id = str(getattr(order, "order_id", None) or "")
+            _locks = self._leg_lock_load()
+            for _record in list(_locks.values()):
+                if not (
+                    (_broker_id and str(_record.get("broker_order_id") or "") == _broker_id)
+                    or (_seqno and str(_record.get("seqno") or "") == _seqno)
+                    or (_local_id and str(_record.get("local_order_id") or "") == _local_id)
+                ):
+                    continue
+                _key = {
+                    "trade_id": _record.get("trade_id"),
+                    "session_generation": _record.get("session_generation"),
+                    "contract": _record.get("contract"),
+                    "closing_side": _record.get("closing_side"),
+                    "qty": _record.get("qty"),
+                    "broker_order_id": _record.get("broker_order_id"),
+                    "seqno": _record.get("seqno"),
+                }
+                if _status in {"FILLED", "PARTIAL_FILLED"}:
+                    _filled = fill_qty
+                    if _filled is None:
+                        _filled = getattr(order, "filled_quantity", 0)
+                    self._leg_lock_apply_broker_deal(_key, _filled)
+                elif _status in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
+                    self._leg_lock_mark_terminal(_key, _status)
+        except Exception:
+            # A callback parsing failure must never release a pending lock.
+            return
+
     def _leg_lock_save(self, locks: dict) -> None:
         """Atomic replace under the stable .lock flock (single-writer)."""
         try:
@@ -8444,6 +8614,7 @@ class FuturesMonitor:
                     "contract": key.get("contract"),
                     "closing_side": key.get("closing_side"),
                     "qty": key.get("qty"),
+                    "local_order_id": key.get("local_order_id") or "",
                     "broker_order_id": key.get("broker_order_id") or "",
                     "seqno": key.get("seqno") or "",
                     "status": status,
@@ -8490,6 +8661,7 @@ class FuturesMonitor:
                         "contract": _k.get("contract"),
                         "closing_side": _k.get("closing_side"),
                         "qty": _k.get("qty"),
+                        "local_order_id": _k.get("local_order_id") or "",
                         "broker_order_id": _k.get("broker_order_id") or "",
                         "seqno": _k.get("seqno") or "",
                         "status": "PENDING_UNCONFIRMED",
@@ -8561,12 +8733,22 @@ class FuturesMonitor:
             _qty = int(key.get("qty") or 0)
             _bid = str(key.get("broker_order_id") or "")
             for _t in trades:
-                _id = str(getattr(_t, "order_id", "") or "")
-                _status = ""
+                _order = getattr(_t, "order", None)
+                _id = str(
+                    getattr(_t, "order_id", None)
+                    or getattr(_t, "id", None)
+                    or getattr(_order, "id", None) or "")
                 _st = getattr(_t, "status", None)
-                if _st is not None:
-                    _status = str(getattr(_st, "status", _st))
-                _filled = float(getattr(_t, "fill_qty", 0) or 0)
+                _nested_st = getattr(_st, "status", None)
+                _raw_st = _nested_st if _nested_st is not None else _st
+                _status = str(
+                    getattr(_raw_st, "name", None)
+                    or getattr(_raw_st, "value", None)
+                    or _raw_st or "").split(".")[-1].upper()
+                _filled = float(
+                    getattr(_t, "fill_qty", None)
+                    or getattr(_t, "filled_quantity", None)
+                    or getattr(_t, "quantity", 0) or 0)
                 if ((not _bid or _id == _bid)
                         and _status.upper() == "FILLED"
                         and _qty > 0 and _filled >= _qty):
@@ -8671,7 +8853,7 @@ class FuturesMonitor:
 
     def _leg_lock_release(self, key: dict,
                           only_statuses=("FILLED", "CANCELLED", "REJECTED",
-                                         "CANCELED", "SUBMIT_FAILED")) -> None:
+                                         "CANCELED", "EXPIRED", "SUBMIT_FAILED")) -> None:
         """Release a leg lock ONLY on terminal states or SUBMIT_FAILED.
         PENDING_UNCONFIRMED is never released early (no resend)."""
         try:
@@ -8691,12 +8873,7 @@ class FuturesMonitor:
         """True when a non-terminal lock exists for this leg — a second
         signal must NOT resubmit (zero submissions)."""
         try:
-            import json as _json
-            _p = self._leg_lock_path()
-            if not os.path.exists(_p):
-                return False
-            with open(_p, encoding="utf-8") as _f:
-                _locks = _json.load(_f)
+            _locks = self._leg_lock_load()
             _lock = _locks.get(self._leg_lock_id(key))
             if _lock is None:
                 # restart rebinding: session_generation changed after a
@@ -8706,7 +8883,7 @@ class FuturesMonitor:
             if _lock is None:
                 return False
             if str(_lock.get("status", "")).upper() in (
-                    "FILLED", "CANCELLED", "REJECTED", "CANCELED"):
+                    "FILLED", "CANCELLED", "REJECTED", "CANCELED", "EXPIRED"):
                 return False
             self._append_mts_event(
                 "ORDER_BLOCKED_PENDING_EXISTS",

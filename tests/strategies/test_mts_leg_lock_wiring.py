@@ -31,6 +31,10 @@ def _monitor(tmp_path):
     mon.far_contract = _Contract("TMFI6")
     mon.order_mgr = OrderManager(api)
     mon._use_order_manager = True
+    # Exercise the production live submission branch; the gateway itself is
+    # stubbed in these tests, so no broker call is possible.
+    mon.live_trading = True
+    mon.dry_run = False
     mon._leg_lock_store = str(tmp_path / "mts_leg_locks.json")
     mon._claimed_execution_keys = set()
     return mon
