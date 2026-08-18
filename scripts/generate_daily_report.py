@@ -427,6 +427,19 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
         if len(data["entries"]) > 0 and not data["exit"]:
             near_entry = next((e for e in data["entries"] if e["leg"] == "NEAR"), None)
             far_entry = next((e for e in data["entries"] if e["leg"] == "FAR"), None)
+
+            # Active trades can have ENTRY/RELEASE evidence without a final
+            # EXIT fill.  Keep the report renderable and expose any realized
+            # release leg without assuming an exit exists.
+            _near_gross = 0.0
+            _far_gross = 0.0
+            _active_release = data.get("release")
+            if isinstance(_active_release, dict):
+                _release_pnl = float(_active_release.get("realized_pnl") or 0.0)
+                if str(_active_release.get("leg", "")).upper() == "NEAR":
+                    _near_gross = _release_pnl
+                elif str(_active_release.get("leg", "")).upper() == "FAR":
+                    _far_gross = _release_pnl
             
             entry_ts = data["entry_ts"]
             session = data["session"]

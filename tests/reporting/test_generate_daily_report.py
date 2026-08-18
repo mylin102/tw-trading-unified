@@ -53,3 +53,24 @@ def test_parse_logs_buckets_night_trades(tmp_path, monkeypatch):
     day_ids = [t["trade_id"] for t in d31["completed"]]
     assert "t-day-1" in day_ids
     assert "t-night-1" not in day_ids
+
+def test_parse_logs_active_trade_without_exit_is_renderable(tmp_path):
+    import json
+    fills = tmp_path / "fills.jsonl"
+    events = tmp_path / "events.jsonl"
+    events.write_text("")
+    rows = [
+        {"timestamp": "2026-08-18T09:00:00", "trade_id": "active-1",
+         "leg": "NEAR", "side": "SHORT", "qty": 1, "price": 45500.0,
+         "fill_type": "ENTRY", "session": "day", "realized_pnl": None},
+        {"timestamp": "2026-08-18T09:00:00", "trade_id": "active-1",
+         "leg": "FAR", "side": "LONG", "qty": 1, "price": 45600.0,
+         "fill_type": "ENTRY", "session": "day", "realized_pnl": None},
+    ]
+    fills.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    from scripts.generate_daily_report import parse_logs
+    report = parse_logs(str(fills), str(events), "2026-08-18")
+    assert len(report["active"]) == 1
+    assert report["active"][0]["near_pnl_gross"] == 0.0
+    assert report["active"][0]["far_pnl_gross"] == 0.0
