@@ -13,6 +13,7 @@ paths blocked in EXIT_ONLY; exit-intent failed leg never SUBMITTED.
 """
 
 import time
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,6 +42,10 @@ def _isolated_runtime(tmp_path, monkeypatch, request):
     monkeypatch.setenv("MTS_EVENT_LOG_PATH", str(runtime / "logs" / "mts_spread_events.jsonl"))
     monkeypatch.setenv("LRC_RELEASE_SHA", "e" * 40)
     return runtime
+
+
+def _isolated_state_path():
+    return Path(os.environ["MTS_STATE_PATH"])
 
 
 def _capability():
@@ -780,7 +785,7 @@ def test_e2e_manual_entry_blocked_in_exit_only(monkeypatch):
         "created_at": time.time(), "command_id": "cmd-1"})
     monitor._registry["tmf_spread"]._has_position = False
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s0_no_state.json"))
+                        _isolated_state_path)
     monitor._process_manual_trade_flag()
     assert monitor.api.calls == []
     blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
@@ -800,7 +805,7 @@ def test_e2e_manual_entry_normal_live_submits(monkeypatch):
         "created_at": time.time(), "command_id": "cmd-2"})
     monitor._registry["tmf_spread"]._has_position = False
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s0_no_state.json"))
+                        _isolated_state_path)
     monitor._process_manual_trade_flag()
     assert len(monitor.api.calls) == 2
     assert {c["strategy"] for c in monitor.api.calls} == {"MTS_MANUAL"}
@@ -839,7 +844,7 @@ def test_e2e_manual_partial_far_failure_quarantines(monkeypatch, tmp_path):
     monitor._gateway()          # registry injected into the new adapter
     monitor._registry["tmf_spread"]._has_position = False
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s0_no_state.json"))
+                        _isolated_state_path)
     monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
                         lambda: str(tmp_path))
     monitor._process_manual_trade_flag()
@@ -1413,7 +1418,7 @@ def test_s1_e2e_mts_tick_exit_reaches_submit_with_flat_local_ledger(
     monitor._prev_mts_tick_mono = None
     monitor._mts_release_orders_flushed = True
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s1_no_state.json"))
+                        _isolated_state_path)
     monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
                         lambda: str(tmp_path))
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
@@ -1482,7 +1487,7 @@ def test_s1_e2e_mts_tick_stale_cap_monitoring_continues(
     monitor._prev_mts_tick_mono = None
     monitor._mts_release_orders_flushed = True
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s1_no_state.json"))
+                        _isolated_state_path)
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
                         lambda: True)
     monitor.trader = SimpleNamespace(position=0)
@@ -1590,7 +1595,7 @@ def test_s1_e2e_tick_stale_cap_no_duplicate_resubmit(
     monitor._prev_mts_tick_mono = None
     monitor._mts_release_orders_flushed = True
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s1_no_state.json"))
+                        _isolated_state_path)
     monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
                         lambda: str(tmp_path))
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
@@ -1696,7 +1701,7 @@ def test_e2e_renewal_monitor_over_60s_evaluates_and_submits_after_fresh_snapshot
     monitor._prev_mts_tick_mono = None
     monitor._mts_release_orders_flushed = True
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s1_no_state.json"))
+                        _isolated_state_path)
     monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
                         lambda: str(tmp_path))
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
@@ -1788,7 +1793,7 @@ def test_e2e_pre_submit_snapshot_mismatch_zero_authorization(
     monitor._prev_mts_tick_mono = None
     monitor._mts_release_orders_flushed = True
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s1_no_state.json"))
+                        _isolated_state_path)
     monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
                         lambda: str(tmp_path))
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
@@ -1869,7 +1874,7 @@ def test_e2e_no_signal_no_broker_query(monkeypatch, tmp_path):
     monitor._prev_mts_tick_mono = None
     monitor._mts_release_orders_flushed = True
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s1_no_state.json"))
+                        _isolated_state_path)
     monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
                         lambda: str(tmp_path))
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
@@ -1938,7 +1943,7 @@ def test_e2e_renewal_monitoring_continues_no_age_gate(
     monitor._prev_mts_tick_mono = None
     monitor._mts_release_orders_flushed = True
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s1_no_state.json"))
+                        _isolated_state_path)
     monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
                         lambda: str(tmp_path))
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
@@ -2013,7 +2018,7 @@ def test_e2e_pre_submit_mismatch_persist_failure_no_split_refs(
     monitor._prev_mts_tick_mono = None
     monitor._mts_release_orders_flushed = True
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s1_no_state.json"))
+                        _isolated_state_path)
     monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
                         lambda: str(tmp_path))
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
@@ -2105,7 +2110,7 @@ def test_e2e_pre_submit_mismatch_persist_fatal_hard_disables_broker(
     monitor._prev_mts_tick_mono = None
     monitor._mts_release_orders_flushed = True
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s1_no_state.json"))
+                        _isolated_state_path)
     monkeypatch.setattr(monitor_mod, "_mts_intent_log_dir",
                         lambda: str(tmp_path))
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
@@ -2232,7 +2237,7 @@ def test_e2e_emergency_close_all_blocked_in_exit_only(monkeypatch):
         "command_id": "cmd-close"})
     monitor._lifecycle_generation = 0
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s0_no_state.json"))
+                        _isolated_state_path)
     monitor._process_manual_trade_flag()
     assert monitor.api.calls == []
     blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
@@ -2483,7 +2488,7 @@ def test_e2e_live_entry_retains_behavior(monkeypatch):
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
                         lambda: True)
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s0_no_state.json"))
+                        _isolated_state_path)
     signal = SimpleNamespace(action="BUY_NEAR_SELL_FAR", reason="ENTRY")
     strat = _bound_strategy()
     strat._has_position = False
@@ -2675,7 +2680,7 @@ def test_e2e_real_chain_registry_injected_into_broker_adapter(monkeypatch):
     monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
                         lambda: True)
     monkeypatch.setattr(monitor_mod, "_mts_position_state_path",
-                        lambda: Path("/tmp/test_s0_no_state.json"))
+                        _isolated_state_path)
     signal = SimpleNamespace(action="BUY_NEAR_SELL_FAR", reason="ENTRY")
     strat = _bound_strategy()
     strat._has_position = False
