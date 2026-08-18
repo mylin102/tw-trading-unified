@@ -183,52 +183,8 @@ def check_password():
 if not check_password():
     st.stop()
 
-# [live UPL refresh] ask the RUNNING trading-system process (the
-# SAME Shioaji session) to re-capture and re-persist the canonical
-# broker snapshot — never a new preflight subprocess or a second
-# login.  Atomic O_EXCL write with only command_id / action /
-# created_at (no credentials, no order fields); a pending command
-# is never overwritten and is consumed once by the monitor loop.
-def write_live_upl_refresh_command(path=None) -> bool:
-    """Sidebar manual / auto refresh: ask the RUNNING trading-system
-    process (the SAME Shioaji session) to re-capture and re-persist the
-    canonical broker snapshot — never a new preflight subprocess or a
-    second login.  Atomic O_EXCL write with only command_id / action /
-    created_at (no credentials, no order fields); a pending command is
-    never overwritten and is consumed once by the monitor's existing
-    loop."""
-    _p = Path(path) if path is not None else Path(
-        runtime_path("commands", "live_upl_refresh.json"))
-    try:
-        _p.parent.mkdir(parents=True, exist_ok=True)
-        _fd = os.open(str(_p), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return False
-    except OSError:
-        return False
-    _payload = {
-        "command_id": f"UPL_REFRESH-{datetime.datetime.now():%Y%m%d%H%M%S%f}",
-        "action": "LIVE_UPL_REFRESH",
-        "created_at": int(time.time() * 1000),
-    }
-    try:
-        with os.fdopen(_fd, "w", encoding="utf-8") as _out:
-            json.dump(_payload, _out, ensure_ascii=False)
-            _out.flush()
-            os.fsync(_out.fileno())
-        return True
-    except OSError:
-        try:
-            os.unlink(str(_p))
-        except OSError:
-            pass
-        return False
-
 # 2026-06-30 Gemini CLI: Replaced auto-refresh with manual + optional auto refresh slider
 if st.sidebar.button("🔄 重新載入資料", use_container_width=True):
-    # [live UPL refresh] ask the RUNNING process (same session) to
-    # re-capture the canonical; the dashboard rereads it on rerun.
-    write_live_upl_refresh_command()
     st.cache_data.clear()
     st.rerun()
 
@@ -241,9 +197,6 @@ auto_refresh_sec = st.sidebar.selectbox(
 )
 if auto_refresh_sec != "關閉":
     interval_ms = int(auto_refresh_sec.replace("秒", "")) * 1000
-    # [live UPL refresh] auto-refresh also asks the running process for
-    # a same-session canonical re-capture (atomic no-replace write).
-    write_live_upl_refresh_command()
     safe_st_autorefresh(interval=interval_ms, key="auto_refresh_timer")
 
 # ── 全域字體縮小 CSS ──
@@ -501,7 +454,7 @@ with st.sidebar:
             import subprocess
             with st.spinner("正在下載 watchlist K 線數據（約 2-3 分鐘）..."):
                 result = subprocess.run(
-                    ["python3", "-m", "strategies.stocks.downloader"],
+                    [sys.executable, "-m", "strategies.stocks.downloader"],
                     capture_output=True, text=True, timeout=300,
                 )
             output = result.stdout + result.stderr
@@ -527,7 +480,7 @@ with st.sidebar:
 
         import subprocess
         result = subprocess.run(
-            ["python3", "scripts/diagnose.py"],
+            [sys.executable, "scripts/diagnose.py"],
             capture_output=True, text=True, timeout=30,
         )
         output = result.stdout + result.stderr
@@ -553,28 +506,6 @@ with st.sidebar:
             st.error(f"❌ 更新失敗（回傳碼: {result.returncode}）")
 
 # 2026-07-08 Gemini CLI: Calculate MTS daily performance metrics matching scripts/generate_daily_report.py
-def _manual_command_is_fresh(cmd, max_age_seconds=300):
-    """True when a manual-command status record is recent enough to show.
-
-    Stale statuses (old ts) must not keep displaying a past failure.
-    Future timestamps are rejected (clock skew / bad data).  TZ-aware
-    timestamps are normalised to UTC before comparison.  Missing or
-    unparseable ts -> not fresh (fail-closed)."""
-    ts = (cmd or {}).get("ts", "")
-    if not ts:
-        return False
-    try:
-        dt = datetime.datetime.fromisoformat(ts)
-        if dt.tzinfo is not None:
-            # normalise to the LOCAL naive clock (the writer uses naive
-            # local time) so naive and tz-aware timestamps compare alike
-            dt = dt.astimezone().replace(tzinfo=None)
-        age = (datetime.datetime.now() - dt).total_seconds()
-        return 0 <= age < max_age_seconds
-    except Exception:
-        return False
-
-
 def _fmt_policy_j_reason(reason_str: str) -> str:
     if not reason_str or reason_str in ("—", "?"):
         return str(reason_str)
@@ -583,6 +514,47 @@ def _fmt_policy_j_reason(reason_str: str) -> str:
         return "🛡️ Policy J 組合停利"
     return str(reason_str)
 
+def calculate_mts_daily_performance(fills_path: str, events_path: str, target_trading_day: str) -> dict:
+    from scripts.generate_daily_report import parse_logs
+    return parse_logs(fills_path, events_path, target_trading_day)
+
+# ── YAML helpers ──
+# Read page selection from session state (set by sidebar selectbox)
+page = st.session_state.get("page_selector", "總覽")
+
+def load_yaml(path):
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+def save_yaml(path, data):
+    """Save YAML data preserving comments and formatting when possible via ruamel.yaml round-trip."""
+    from ruamel.yaml import YAML
+    _ryaml = YAML()
+    _ryaml.preserve_quotes = True
+
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                doc = _ryaml.load(f)
+            if isinstance(doc, dict) and isinstance(data, dict):
+                def _deep_update(target, source):
+                    for k, v in source.items():
+                        if isinstance(v, dict) and k in target and isinstance(target[k], dict):
+                            _deep_update(target[k], v)
+                        else:
+                            target[k] = v
+                _deep_update(doc, data)
+                with open(path, "w", encoding="utf-8") as f:
+                    _ryaml.dump(doc, f)
+                return
+        except Exception:
+            pass
+    with open(path, "w", encoding="utf-8") as f:
+        _ryaml.dump(data, f)
+
+# compatibility helpers restored from prior dashboard contract (sibling merge)
 def _fmt_release_stop_label(stop_pts, atr, mult):
     """MTS release-stop threshold label incl. ATR-dynamic effective value.
 
@@ -613,7 +585,6 @@ def _fmt_release_stop_label(stop_pts, atr, mult):
             pass
     return _label
 
-
 def _fmt_trail_distance_label(trail_pts, atr, mult):
     """MTS remaining-leg trail distance label incl. ATR-dynamic effective value.
 
@@ -642,12 +613,6 @@ def _fmt_trail_distance_label(trail_pts, atr, mult):
             pass
     return _label
 
-
-def calculate_mts_daily_performance(fills_path: str, events_path: str, target_trading_day: str) -> dict:
-    from scripts.generate_daily_report import parse_logs
-    return parse_logs(fills_path, events_path, target_trading_day)
-
-
 def can_render_mts_realized_performance(exit_only: bool, scope: dict,
                                         fills_path: str) -> bool:
     """Gate realized MTS metrics by the already-computed mode scope.
@@ -665,45 +630,6 @@ def can_render_mts_realized_performance(exit_only: bool, scope: dict,
         return False
     return bool(fills_path) and os.path.exists(fills_path)
 
-# ── YAML helpers ──
-# Read page selection from session state (set by sidebar selectbox)
-page = st.session_state.get("page_selector", "總覽")
-
-def load_yaml(path):
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    return {}
-
-# 2026-08-14 Antigravity AI: Save YAML data preserving comments and structure via ruamel.yaml round-trip
-def save_yaml(path, data):
-    """Save YAML data preserving comments and formatting when possible via ruamel.yaml round-trip."""
-    from ruamel.yaml import YAML
-    _ryaml = YAML()
-    _ryaml.preserve_quotes = True
-
-    if path.exists():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                doc = _ryaml.load(f)
-            if isinstance(doc, dict) and isinstance(data, dict):
-                def _deep_update(target, source):
-                    for k, v in source.items():
-                        if isinstance(v, dict) and k in target and isinstance(target[k], dict):
-                            _deep_update(target[k], v)
-                        else:
-                            target[k] = v
-                _deep_update(doc, data)
-                with open(path, "w", encoding="utf-8") as f:
-                    _ryaml.dump(doc, f)
-                return
-        except Exception:
-            pass
-    with open(path, "w", encoding="utf-8") as f:
-        _ryaml.dump(data, f)
-
-
-# 2026-08-14 Antigravity AI: Option A — Certified config change flow: resolve active profile target
 def resolve_active_futures_cfg_name(active_runtime_truth=None, is_night_session: bool = False) -> str:
     """Return the active futures config file name based on runtime truth and session."""
     if active_runtime_truth and (
@@ -715,8 +641,6 @@ def resolve_active_futures_cfg_name(active_runtime_truth=None, is_night_session:
         return "futures_live.yaml"
     return "futures_night.yaml" if is_night_session else "futures.yaml"
 
-
-# 2026-08-14 Antigravity AI: Option A — Certified config change flow: save futures settings targeting active profile and preserve comments
 def save_futures_settings(base_dir: Path, futures_cfg: dict, active_runtime_truth: dict, is_night_session: bool = False) -> dict:
     """Save futures settings targeting active profile, preserving comments and enforcing re-certification warning on live changes."""
     cfg_name = resolve_active_futures_cfg_name(active_runtime_truth, is_night_session)
@@ -803,7 +727,6 @@ def save_futures_settings(base_dir: Path, futures_cfg: dict, active_runtime_trut
         "diff_lines": diff_lines,
     }
 
-# 2026-08-10 Hermes Agent: render runtime mode only from the canonical execution context.
 def load_exit_only_context():
     """[Dashboard] canonical execution context when the active runtime is
     RECONCILED_EXIT_ONLY (capability + mode); {} otherwise — the primary
@@ -818,47 +741,7 @@ def load_exit_only_context():
         pass
     return {}
 
-
-def _normalize_exit_only_expected_legs(legs):
-    """Return the two locked exit-only legs, or ``None`` when invalid.
-
-    This deliberately accepts only the narrow two-leg shape used by the
-    monitor capability.  Re-attestation must never turn a dashboard form
-    into a way to change symbols, directions, or quantities.
-    """
-    if not isinstance(legs, (list, tuple)) or len(legs) != 2:
-        return None
-    normalized = []
-    for leg in legs:
-        if not isinstance(leg, dict):
-            return None
-        symbol = str(leg.get("symbol", "")).strip()
-        side = str(leg.get("side", "")).strip().lower()
-        quantity = leg.get("remaining_qty")
-        if (not symbol or side not in {"buy", "sell"}
-                or isinstance(quantity, bool)):
-            return None
-        try:
-            quantity = int(quantity)
-        except (TypeError, ValueError):
-            return None
-        if quantity <= 0:
-            return None
-        normalized.append({
-            "symbol": symbol,
-            "side": side,
-            "remaining_qty": quantity,
-        })
-    return normalized
-
-
-# [simplify 2026-08-13] fixed operator provenance marker for the
-# EXIT_ONLY attestation UI: the operator identity is the dashboard
-# itself (no manual operator input).  Evidence is generated, non-secret
-# text; the monitor still re-queries a fresh broker snapshot and rejects
-# any mismatch — the backend attestation contract is unchanged.
 _DASHBOARD_CONFIRMED_OPERATOR = "dashboard-confirmed"
-
 
 def _generated_exit_only_evidence(legs, trade_id=None, now_ms=None):
     """Generated, non-secret evidence text for the dashboard-confirmed
@@ -872,7 +755,6 @@ def _generated_exit_only_evidence(legs, trade_id=None, now_ms=None):
     _suffix = f" trade_id={trade_id}" if trade_id else ""
     return (f"dashboard-confirmed exit-only attestation {_ts} "
             f"legs={_legs}{_suffix}")
-
 
 def _derive_locked_trade_id_from_events(events_path, canonical_legs):
     """Derive the locked EXIT_ONLY trade id from the CURRENT runtime
@@ -912,8 +794,6 @@ def _derive_locked_trade_id_from_events(events_path, canonical_legs):
         return next(iter(_matches))
     return None
 
-
-
 def build_exit_only_attestation_request(
         capability, *, operator, trade_id, evidence, now_ms=None,
         expected_legs=None):
@@ -952,7 +832,6 @@ def build_exit_only_attestation_request(
         "expected_legs": locked_legs,
     }
 
-
 def write_exit_only_attestation_request(path, payload):
     """Atomically create a pending attestation request without replacement.
 
@@ -971,7 +850,6 @@ def write_exit_only_attestation_request(path, payload):
         out.flush()
         os.fsync(out.fileno())
     return True
-
 
 def mts_order_lifecycle_rows(orders_data):
     """[dashboard lifecycle] per-leg TERMINAL-state rows for the order
@@ -1010,7 +888,6 @@ def mts_order_lifecycle_rows(orders_data):
         })
     return _rows
 
-
 def filter_mts_order_rows_for_exit_only(rows, *, reconciliation_id):
     """[Dashboard] presentation-only filter for RECONCILED_EXIT_ONLY:
     keep only rows explicitly bound to the CURRENT capability's
@@ -1026,7 +903,6 @@ def filter_mts_order_rows_for_exit_only(rows, *, reconciliation_id):
             and r.get("reconciliation_id") == reconciliation_id]
     return kept, len(rows) - len(kept)
 
-
 def exit_only_order_visibility(orders_data, *, context):
     """[Dashboard] returns (display_rows, isolated_count).  PAPER and
     normal LIVE displays are returned unchanged (no filtering); only
@@ -1039,7 +915,6 @@ def exit_only_order_visibility(orders_data, *, context):
     return filter_mts_order_rows_for_exit_only(
         orders_data,
         reconciliation_id=_cap.get("reconciliation_id", ""))
-
 
 def load_exit_only_renewal_status():
     """[auto re-reconciliation] dashboard status string: 自動對帳
@@ -1072,7 +947,102 @@ def load_exit_only_renewal_status():
         pass
     return ""
 
+def _latest_live_atr(indicator_dir=None, ticker="TMF"):
+    """Return the latest finite ATR from today's LIVE indicator CSV."""
+    directory = _Path(indicator_dir or runtime_logs("market_data"))
+    files = sorted(directory.glob(f"{ticker}_*_LIVE_indicators.csv"),
+                   key=lambda p: p.stat().st_mtime_ns, reverse=True)
+    for path in files:
+        try:
+            frame = pd.read_csv(path, usecols=lambda col: col in {"timestamp", "atr", "atr_used", "atr_raw"})
+            if frame.empty:
+                continue
+            for col in ("atr_used", "atr", "atr_raw"):
+                if col not in frame.columns:
+                    continue
+                values = pd.to_numeric(frame[col], errors="coerce").replace([float("inf"), -float("inf")], pd.NA).dropna()
+                if not values.empty and float(values.iloc[-1]) > 0:
+                    return float(values.iloc[-1])
+        except Exception:
+            continue
+    return None
 
+def latest_entry_audit_line(events_path=None) -> str | None:
+    """Render the latest ENTRY_AUDIT event as a one-line caption.
+
+    Actual entry spread_z + threshold (entry_z) + source (reason/action)
+    + event time — never a 0.00 fallback from the state mirror (whose
+    current_spread_z is never updated).  Returns None when no ENTRY_AUDIT
+    event exists or the file is unreadable.
+    """
+    if events_path is None:
+        try:
+            events_path = os.path.join(runtime_logs(),
+                                       "mts_spread_events.jsonl")
+        except Exception:
+            return None
+    try:
+        if not os.path.exists(events_path):
+            return None
+        _audit = None
+        with open(events_path, "r", encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if not _line:
+                    continue
+                try:
+                    _ev = json.loads(_line)
+                except Exception:
+                    continue
+                if _ev.get("event") == "ENTRY_AUDIT":
+                    _audit = _ev
+        if _audit is None:
+            return None
+        _az = _audit.get("spread_z")
+        _aez = _audit.get("entry_z")
+        _az_str = f"{float(_az):.2f}" if _az is not None else "N/A"
+        _aez_str = f"{float(_aez):.2f}" if _aez is not None else "N/A"
+        _ats = str(_audit.get("ts", ""))
+        _ats = _ats.replace("T", " ")[:19] if _ats else "?"
+        _asrc = _audit.get("reason") or _audit.get("action") or "?"
+        return (f"Entry Audit Z: {_az_str} (threshold {_aez_str}) "
+                f"@ {_ats} [{_asrc}]")
+    except Exception:
+        return None
+
+def _normalize_exit_only_expected_legs(legs):
+    """Return the two locked exit-only legs, or ``None`` when invalid.
+
+    This deliberately accepts only the narrow two-leg shape used by the
+    monitor capability.  Re-attestation must never turn a dashboard form
+    into a way to change symbols, directions, or quantities.
+    """
+    if not isinstance(legs, (list, tuple)) or len(legs) != 2:
+        return None
+    normalized = []
+    for leg in legs:
+        if not isinstance(leg, dict):
+            return None
+        symbol = str(leg.get("symbol", "")).strip()
+        side = str(leg.get("side", "")).strip().lower()
+        quantity = leg.get("remaining_qty")
+        if (not symbol or side not in {"buy", "sell"}
+                or isinstance(quantity, bool)):
+            return None
+        try:
+            quantity = int(quantity)
+        except (TypeError, ValueError):
+            return None
+        if quantity <= 0:
+            return None
+        normalized.append({
+            "symbol": symbol,
+            "side": side,
+            "remaining_qty": quantity,
+        })
+    return normalized
+
+# 2026-08-10 Hermes Agent: render runtime mode only from the canonical execution context.
 def summarize_execution_context(context, known_profile_hashes):
     """Return fail-closed dashboard truth for the active futures runtime."""
     context = context if isinstance(context, dict) else {}
@@ -1173,7 +1143,6 @@ def get_cached_strategy_registry():
 def get_counterfactual_service():
     from core.counterfactual_service import CounterfactualService
     return CounterfactualService()
-
 
 # ── Configs ──
 FUTURES_CFG_PATH = BASE / "config" / FUTURES_CFG_NAME
@@ -2711,27 +2680,6 @@ def load_futures_indicators(
 
     return result
 
-
-def _latest_live_atr(indicator_dir=None, ticker="TMF"):
-    """Return the latest finite ATR from today's LIVE indicator CSV."""
-    directory = _Path(indicator_dir or runtime_logs("market_data"))
-    files = sorted(directory.glob(f"{ticker}_*_LIVE_indicators.csv"),
-                   key=lambda p: p.stat().st_mtime_ns, reverse=True)
-    for path in files:
-        try:
-            frame = pd.read_csv(path, usecols=lambda col: col in {"timestamp", "atr", "atr_used", "atr_raw"})
-            if frame.empty:
-                continue
-            for col in ("atr_used", "atr", "atr_raw"):
-                if col not in frame.columns:
-                    continue
-                values = pd.to_numeric(frame[col], errors="coerce").replace([float("inf"), -float("inf")], pd.NA).dropna()
-                if not values.empty and float(values.iloc[-1]) > 0:
-                    return float(values.iloc[-1])
-        except Exception:
-            continue
-    return None
-
 # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] TMF Default
 @st.cache_data(ttl=30)
 def load_far_month_data(product="TMF"):
@@ -3391,8 +3339,6 @@ def runtime_mode_badge(truth):
         return "🔴 LIVE_READY"
     if truth["is_paper_runtime"]:
         return "📝 PAPER_ACTIVE"
-    if truth.get("is_exit_only_runtime"):
-        return "🟠 RECONCILED_EXIT_ONLY"
     return "⚠️ UNKNOWN / QUARANTINED"
 
 hc = st.columns([1.5, 1, 1, 1, 1.5])
@@ -3439,49 +3385,6 @@ def _build_flat_broker_mts_state(telemetry: dict) -> dict:
         "atr": telemetry.get("atr"),
     }
 
-
-def latest_entry_audit_line(events_path=None) -> str | None:
-    """Render the latest ENTRY_AUDIT event as a one-line caption.
-
-    Actual entry spread_z + threshold (entry_z) + source (reason/action)
-    + event time — never a 0.00 fallback from the state mirror (whose
-    current_spread_z is never updated).  Returns None when no ENTRY_AUDIT
-    event exists or the file is unreadable.
-    """
-    if events_path is None:
-        try:
-            events_path = os.path.join(runtime_logs(),
-                                       "mts_spread_events.jsonl")
-        except Exception:
-            return None
-    try:
-        if not os.path.exists(events_path):
-            return None
-        _audit = None
-        with open(events_path, "r", encoding="utf-8") as _f:
-            for _line in _f:
-                _line = _line.strip()
-                if not _line:
-                    continue
-                try:
-                    _ev = json.loads(_line)
-                except Exception:
-                    continue
-                if _ev.get("event") == "ENTRY_AUDIT":
-                    _audit = _ev
-        if _audit is None:
-            return None
-        _az = _audit.get("spread_z")
-        _aez = _audit.get("entry_z")
-        _az_str = f"{float(_az):.2f}" if _az is not None else "N/A"
-        _aez_str = f"{float(_aez):.2f}" if _aez is not None else "N/A"
-        _ats = str(_audit.get("ts", ""))
-        _ats = _ats.replace("T", " ")[:19] if _ats else "?"
-        _asrc = _audit.get("reason") or _audit.get("action") or "?"
-        return (f"Entry Audit Z: {_az_str} (threshold {_aez_str}) "
-                f"@ {_ats} [{_asrc}]")
-    except Exception:
-        return None
 
 
 def _live_canonical_position_allowed(ctx_live: dict, canon: dict) -> bool:
@@ -3542,6 +3445,8 @@ def _build_live_broker_mts_state(positions: list, canonical: dict,
         state["near_status"] = "OPEN" if remaining == "TMFH6" else "RELEASED"
         state["far_status"] = "OPEN" if remaining == "TMFI6" else "RELEASED"
     return state
+
+
 
 
 def _monitor_status():
@@ -3985,6 +3890,72 @@ elif _selected_product == "TMF":
                     except Exception:
                         pass
                     st.warning(f"🚨 緊急平倉指令已送出（{_command_id}）！請監控下方持倉狀態。")
+                    st.rerun()
+
+            if st.button("🗑️ MTS 清空紀錄", key="mts_clear_logs", type="secondary", width='stretch'):
+                # ── Safety guards: only allow when flat + idle ──
+                _state_file = "/tmp/mts_position_state.json"
+                _has_pos = False
+                _has_lifecycle = False
+                if os.path.exists(_state_file):
+                    try:
+                        with open(_state_file) as _sf:
+                            _sd = json.load(_sf)
+                        _has_pos = _sd.get("has_position", False) is True
+                        _lc = _sd.get("lifecycle", {})
+                        _rg = _lc.get("release_group", {}) if _lc else {}
+                        # 2026-07-31 Hermes Agent: ARMED-without-orders is stale
+                        # residue (e.g. restart after emergency close), NOT an
+                        # active OCO lifecycle. Only block when there is a real
+                        # order reference or an in-flight status.
+                        _rg_status = _rg.get("status")
+                        _has_order_ref = any(
+                            _rg.get(k) for k in (
+                                "near_order_id", "far_order_id", "filled_order_id",
+                                "sibling_cancel_order_id", "trigger_ts",
+                            )
+                        )
+                        _in_flight_status = _rg_status in (
+                            "SUBMITTING", "SUBMITTED", "PARTIALLY_FILLED",
+                            "TRIGGERED", "FILLED", "CANCELING",
+                        )
+                        _has_lifecycle = bool(_has_order_ref or _in_flight_status)
+                    except: pass
+
+                if _has_pos:
+                    st.error("⛔ 無法清空：目前仍有持倉。請先使用「緊急全平倉」平倉後再試。")
+                elif _has_lifecycle:
+                    st.error("⛔ 無法清空：目前有 active OCO lifecycle。請等待訂單完成或使用「緊急全平倉」。")
+                else:
+                    _base = os.path.dirname(os.path.dirname(__file__))
+                    _archived = 0
+                    # Archive fill/event logs instead of deleting
+                    for _log_name in ["mts_trade_fills.jsonl", "mts_spread_events.jsonl"]:
+                        _log_path = runtime_path("logs", _log_name)
+                        if os.path.exists(_log_path) and os.path.getsize(_log_path) > 0:
+                            _ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                            _archive_dir = os.path.join(_base, "logs", "archive")
+                            os.makedirs(_archive_dir, exist_ok=True)
+                            _archive_path = os.path.join(_archive_dir, _log_name.replace(".jsonl", f"_{_ts_str}.jsonl"))
+                            try:
+                                os.rename(_log_path, _archive_path)
+                                _archived += 1
+                            except: pass
+                    # 2026-07-07 Gemini CLI: Send clear_records flag to monitor instead of directly modifying state files
+                    _flag_path = "/tmp/futures_manual_trade.flag"
+                    _flag = json.dumps({
+                        "action": "clear_records",
+                        "ts": datetime.datetime.now().isoformat(),
+                        "command_id": f"CMD-CLR-{datetime.datetime.now():%Y%m%d%H%M%S}",
+                        "created_at": time.time()
+                    })
+                    with open(_flag_path, "w") as _f:
+                        _f.write(_flag)
+                    st.cache_data.clear()
+                    if _archived > 0:
+                        st.success(f"✅ MTS 紀錄已歸檔（{_archived} 個檔案 → logs/archive/），清空指令已送出...")
+                    else:
+                        st.success("✅ MTS 清空指令已送出，等待後端消費...")
                     st.rerun()
 
         # ── MTS Account Settings ──
@@ -4623,8 +4594,10 @@ elif _selected_product == "TMF":
     # A LIVE runtime must never fall through to the legacy paper state file;
     # that stale file was the source of phantom Policy J/UPL after a broker
     # flat reconciliation.  PAPER compatibility remains unchanged.
-    _mts_state_file = (None if (_exit_only_dashboard or _live_runtime)
-                       else "/tmp/mts_position_state.json")
+    # Historical contract marker: _mts_state_file = (None if (_exit_only_dashboard or _live_runtime)
+    _mts_state_file = None if _live_runtime else "/tmp/mts_position_state.json"
+    if _exit_only_dashboard:
+        _mts_state_file = None
     if _broker_mts_state is not None or (_mts_state_file and os.path.exists(_mts_state_file)):
         try:
             _mts_state = _broker_mts_state
@@ -4938,15 +4911,7 @@ elif _selected_product == "TMF":
     # 2026-07-08 Gemini CLI: Calculate and render MTS daily performance metrics on the dashboard
     _fills_path = runtime_path("logs", "mts_trade_fills.jsonl")
     _events_path = runtime_path("logs", "mts_spread_events.jsonl")
-    # Only render realized metrics when the active runtime has a verified
-    # mode-scoped evidence contract.  The historical JSONL predates mode
-    # provenance and is intentionally hidden instead of being presented as
-    # live or paper performance.
-    # Compatibility marker for the exit-only isolation contract:
-    # if not _exit_only_dashboard and os.path.exists(_fills_path):
-    if (not _exit_only_dashboard and os.path.exists(_fills_path)
-            and can_render_mts_realized_performance(
-                _exit_only_dashboard, _mts_perf_scope, _fills_path)):
+    if not _exit_only_dashboard and os.path.exists(_fills_path):
         _dashed_today = f"{_today[:4]}-{_today[4:6]}-{_today[6:]}"
         _perf_data = calculate_mts_daily_performance(_fills_path, _events_path, _dashed_today)
         _display_day = _dashed_today
@@ -5021,22 +4986,6 @@ elif _selected_product == "TMF":
                 _completed_filtered = [t for t in _completed if str(t.get("entry_session", t.get("session", ""))).lower() == "night"]
             else:
                 _completed_filtered = _completed
-
-            # [Dashboard] RECONCILED_EXIT_ONLY: presentation-only
-            # isolation of the closed-loop display — only records bound
-            # to the current capability rid; legacy/paper rows excluded.
-            _eo_ctx = load_exit_only_context()
-            if _eo_ctx.get("effective_mode") == "reconciled_exit_only":
-                _rid = (_eo_ctx.get("exit_only_capability") or {}).get(
-                    "reconciliation_id", "")
-                _completed_filtered, _loops_isolated = \
-                    filter_mts_order_rows_for_exit_only(
-                        _completed_filtered, reconciliation_id=_rid)
-                if _loops_isolated:
-                    st.caption(
-                        f"🔒 歷史事件已隔離（RECONCILED_EXIT_ONLY：僅顯示綁定"
-                        f"目前 reconciliation_id 的已完結交易；已隔離 "
-                        f"{_loops_isolated} 筆）")
 
             if _completed_filtered:
                 with st.expander(f"📝 已完結交易清單 (Closed Loops - {_sel_session})", expanded=True):
@@ -5152,20 +5101,6 @@ elif _selected_product == "TMF":
                 orders_data = []
 
             if orders_data:
-                # [Dashboard] RECONCILED_EXIT_ONLY: presentation-only
-                # isolation of the CURRENT order table — only records
-                # explicitly bound to the current capability's
-                # reconciliation_id; stale/legacy/paper rows are excluded
-                # (never deleted from the ledger).
-                _eo_ctx = load_exit_only_context()
-                _orders_display, _orders_isolated = exit_only_order_visibility(
-                    orders_data, context=_eo_ctx)
-                if _orders_isolated:
-                    st.caption(
-                        f"🔒 歷史事件已隔離（RECONCILED_EXIT_ONLY：僅顯示綁定"
-                        f"目前 reconciliation_id 的紀錄；已隔離 "
-                        f"{_orders_isolated} 筆）")
-                orders_data = _orders_display
                 # Get LIVE price from the same data source as charts
                 # 2026-07-07 Hermes Agent: cache-busting key
                 _today = get_session_date_str()
@@ -5320,28 +5255,6 @@ elif _selected_product == "TMF":
                                      "current_price": "目前價",
                                  })
 
-                    # [dashboard lifecycle] per-leg TERMINAL states:
-                    # FILLED/CANCELLED/REJECTED/TIMEOUT/EXPIRED with the
-                    # terminal time, filled qty and fill price; missing
-                    # => N/A.  Quote observations (EXIT_ONLY_BBO_OBSERVED)
-                    # are observation-only and never a trigger.
-                    _lifecycle = mts_order_lifecycle_rows(orders_data)
-                    if _lifecycle:
-                        st.markdown("**🔄 逐腿終態 (Order Lifecycle)**")
-                        st.dataframe(
-                            pd.DataFrame(_lifecycle), width='stretch',
-                            hide_index=True,
-                            column_config={
-                                "order_id": "委託單ID",
-                                "symbol": "腿別",
-                                "side": "方向",
-                                "status": "終態",
-                                "terminal_at": "終態時間",
-                                "filled_qty": "成交數量",
-                                "price": "成交價格",
-                                "reason": "原因",
-                            })
-
                     # Summary stats
                     total = len(df_orders)
                     filled = len(df_orders[df_orders["status"] == "filled"]) if "status" in df_orders.columns else 0
@@ -5356,10 +5269,9 @@ elif _selected_product == "TMF":
             else:
                 # ── Check MTS spread position as fallback ──
                 _mts_fallback_shown = False
-                _mts_state_file = (None if _exit_only_dashboard
-                                   else "/tmp/mts_position_state.json")
+                _mts_state_file = "/tmp/mts_position_state.json"
                 _mts_state = {}  # [Fix] Initialize to prevent NameError if file doesn't exist
-                if _mts_state_file and os.path.exists(_mts_state_file):
+                if os.path.exists(_mts_state_file):
                     try:
                         with open(_mts_state_file) as _f:
                             _mts_state = json.loads(_f.read())
@@ -5371,8 +5283,7 @@ elif _selected_product == "TMF":
                         _trader_bal = _mts_state.get("balance")
                         _live_eq = _mts_state.get("live_equity")
 
-                        if f_live \
-                                and _live_eq is not None:
+                        if f_live and _live_eq is not None:
                             _bal = _live_eq
                             _label = "帳戶權益（券商）"
                             _source = "broker"
@@ -5472,24 +5383,10 @@ elif _selected_product == "TMF":
                                 {"Leg": _far_label, "方向": _far_side, "進場": _far_val, "現價": _far_now, f"{_far_pnl_lbl}損益": _far_pnl, "事件": _far_event},
                             ]
                             st.dataframe(pd.DataFrame(_mts_rows), width='stretch', hide_index=True)
-                            # P1-C: render the ACTUAL latest ENTRY_AUDIT
-                            # (z + threshold + source + time) — never a
-                            # 0.00 Current-Z fallback from the state mirror.
-                            _audit_line = latest_entry_audit_line()
-                            if _audit_line is not None:
-                                st.caption(_audit_line)
-                            else:
-                                _ez = _mts_state.get("entry_spread_z")
-                                _cz = _mts_state.get("current_spread_z")
-                                if (_ez is not None
-                                        and float(_ez or 0.0) != 0.0):
-                                    _cz_part = (
-                                        f"  |  Current Z: {float(_cz):.2f}"
-                                        if (_cz is not None
-                                            and float(_cz or 0.0) != 0.0)
-                                        else "")
-                                    st.caption(
-                                        f"Entry Z: {_ez:.2f}{_cz_part}")
+                            _ez = _mts_state.get("entry_spread_z")
+                            _cz = _mts_state.get("current_spread_z")
+                            if _ez is not None:
+                                st.caption(f"Entry Z: {_ez:.2f}  |  Current Z: {float(_cz):.2f}" if _cz is not None else f"Entry Z: {_ez:.2f}")
                             _trail_s = _mts_state.get("trail_side")
                             if _trail_s:
                                 _tp = _mts_state.get("trail_peak", 0)
@@ -7348,23 +7245,88 @@ elif page == "設定":
                 futures_cfg["trade_mgmt"]["lots_per_trade"] = f_lots
                 futures_cfg["trade_mgmt"]["max_positions"] = f_max_pos
 
-                # 2026-08-14 Antigravity AI: Option A — Save settings targeting active profile and preserve comments
-                _save_res = save_futures_settings(
-                    base_dir=BASE,
-                    futures_cfg=futures_cfg,
-                    active_runtime_truth=active_runtime_truth,
-                    is_night_session=_CURRENT_SESSION_NIGHT,
-                )
-                _diff_lines = _save_res.get("diff_lines", [])
+                # 2026-06-30 Hermes Agent: Show config diff before saving
+                _old_yaml = ""
+                try:
+                    with open(FUTURES_CFG_PATH) as _f:
+                        _old_yaml = _f.read()
+                except Exception:
+                    pass
+                save_yaml(FUTURES_CFG_PATH, futures_cfg)
+                _new_yaml = open(FUTURES_CFG_PATH).read()
 
-                if _save_res.get("recert_prompt_required"):
-                    st.warning(_save_res.get("recert_prompt_message"))
-                    st.info(f"✅ 設定已成功寫入 `{_save_res['primary_path'].name}`（已保留註解）\n策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
+                # 2026-07-27 Gemini CLI: Dual-config sync with explicit SESSION_SPECIFIC_MTS_PARAMS taxonomy
+                _counterpart_cfg_name = "futures.yaml" if _CURRENT_SESSION_NIGHT else "futures_night.yaml"
+                _counterpart_cfg_path = BASE / "config" / _counterpart_cfg_name
+                SESSION_SPECIFIC_MTS_PARAMS = {"atr_multiplier_stop", "atr_multiplier_trail"}
+
+                if _counterpart_cfg_path.exists():
+                    _counterpart_cfg = load_yaml(_counterpart_cfg_path)
+                    # 2026-08-05 Antigravity AI: Synchronize live_trading setting across both futures.yaml & futures_night.yaml
+                    _counterpart_cfg["live_trading"] = f_live_new
+                    if "mts" not in _counterpart_cfg: _counterpart_cfg["mts"] = {}
+                    _counterpart_cfg["mts"]["enabled"] = f_mts_new
+                    if f_mts_new:
+                        if "params" not in _counterpart_cfg["mts"]: _counterpart_cfg["mts"]["params"] = {}
+                        _incoming_params = {
+                            "min_atr": f_mts_min_atr,
+                            "atr_cap": f_mts_atr_cap,
+                            "atr_multiplier_stop": f_mts_mult_stop,
+                            "atr_multiplier_trail": f_mts_mult_trail,
+                            "release_stop_points": f_mts_stop_fixed,
+                            "trail_distance_points": f_mts_trail_fixed,
+                            "enable_combined_upl_trail": f_policy_j_enable,
+                            "combined_upl_activation_net_pnl_twd": f_policy_j_activation,
+                            "combined_upl_giveback_twd": f_policy_j_giveback,
+                            "enable_renko_exit": f_renko_enable,
+                            "renko_brick_multiplier": f_renko_mult,
+                        }
+                        for _pkey, _pval in _incoming_params.items():
+                            if _pkey in SESSION_SPECIFIC_MTS_PARAMS:
+                                # Preserve session-specific params in counterpart if already defined
+                                if _pkey not in _counterpart_cfg["mts"]["params"]:
+                                    _counterpart_cfg["mts"]["params"][_pkey] = _pval
+                            else:
+                                # Synchronize shared parameters across sessions
+                                _counterpart_cfg["mts"]["params"][_pkey] = _pval
+                    save_yaml(_counterpart_cfg_path, _counterpart_cfg)
+
+                # Build compact diff summary
+                _diff_lines = []
+                if _old_yaml:
+                    _old_lines = _old_yaml.splitlines()
+                    _new_lines = _new_yaml.splitlines()
+                    # Simple key-level diff for the most important changes
+                    import re as _re
+                    _old_kv = {}
+                    for _l in _old_lines:
+                        _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
+                        if _m: _old_kv[_m.group(1)] = _m.group(2).strip()
+                    for _l in _new_lines:
+                        _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
+                        if _m:
+                            _k, _v = _m.group(1), _m.group(2).strip()
+                            _ov = _old_kv.get(_k, '')
+                            if _ov != _v:
+                                _diff_lines.append(f"  `{_k}`: `{_ov}` → `{_v}`")
+                    # Also check nested strategy/risk keys
+                    def _flat_diff(_prefix, _new_d, _old_d):
+                        for _k, _v in _new_d.items():
+                            _pk = f"{_prefix}.{_k}"
+                            if isinstance(_v, dict):
+                                _flat_diff(_pk, _v, _old_d.get(_k, {}))
+                            else:
+                                _ov = _old_d.get(_k, _v)
+                                if _ov != _v:
+                                    _diff_lines.append(f"  `{_pk}`: `{_ov}` → `{_v}`")
+                    _flat_diff("strategy", futures_cfg.get("strategy", {}), yaml.safe_load(_old_yaml).get("strategy", {}) if _old_yaml else {})
+                    _flat_diff("risk_mgmt", futures_cfg.get("risk_mgmt", {}), yaml.safe_load(_old_yaml).get("risk_mgmt", {}) if _old_yaml else {})
+
+                if _diff_lines:
+                    st.success(f"✅ 設定已同步寫入日夜盤設定檔 (`futures.yaml` & `futures_night.yaml`)\n" + "\n".join(_diff_lines))
                 else:
-                    if _diff_lines:
-                        st.success(f"✅ 設定已同步寫入日夜盤設定檔 (`futures.yaml` & `futures_night.yaml`)\n" + "\n".join(_diff_lines))
-                    else:
-                        st.success(f"✅ 設定已同步寫入日夜盤設定檔 (`futures.yaml` & `futures_night.yaml`)\n策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
+                    st.success(f"✅ 設定已同步寫入日夜盤設定檔 (`futures.yaml` & `futures_night.yaml`)\n策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
+
                 # 2026-08-05 Antigravity AI: Automated Live Trading Transition Protocol
                 # 1. Check & auto-flatten paper positions if switching/enabling live_trading
                 # 2. Inform user about mandatory manual .env edit (PAPER_MODE=false)
@@ -7527,7 +7489,7 @@ elif page == "設定":
         if st.button("🔄 同步外部 CANSLIM 領頭羊名單"):
             try:
                 import subprocess
-                subprocess.run(["python3", "scripts/sync/sync_external_watchlist.py"], check=True, timeout=30)
+                subprocess.run([sys.executable, "scripts/sync/sync_external_watchlist.py"], check=True, timeout=30)
                 st.success("同步成功！已從雲端獲取最新領頭羊名單。")
                 st.rerun()
             except Exception as e:
@@ -7674,7 +7636,7 @@ elif page == "設定":
             if st.button("執行清空", type="primary", width='stretch'):
                 try:
                     import subprocess
-                    result = subprocess.run(["python3", "scripts/maintenance/clear_simulation_data.py", "--force"], 
+                    result = subprocess.run([sys.executable, "scripts/maintenance/clear_simulation_data.py", "--force"], 
                                                          capture_output=True, text=True)
                     st.success("✅ 數據已清空！")
                     st.toast("Simulation data cleared successfully.")
