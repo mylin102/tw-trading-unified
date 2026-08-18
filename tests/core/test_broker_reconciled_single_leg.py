@@ -319,6 +319,35 @@ def test_reconciled_restart_peak_reset(tmp_path):
     assert s2._broker_recovery_source == "broker_reconciliation"
 
 
+def test_reconciled_refresh_idempotent_keeps_baseline(tmp_path):
+    """Repeated refresh (5s cadence) must NOT re-run the inference: the
+    established baseline/anchor/peak survive (codex probe: a second refresh
+    reset PENDING_REANCHOR + peak 0.0)."""
+    s, config = _setup_armed(tmp_path, confirm_ticks=0)
+    m = _qualified_monitor(tmp_path, s)
+    bar = _make_bar(near_close=45600, far_close=45900, session_type="day",
+                    far_bid=45890.0, far_ask=45930.0, far_tick_age_ms=5.0)
+    ctx = StrategyContext(
+        market=MarketData(last_bar=bar, ticker="TMF"),
+        position=PositionView(size=1), config=config)
+    with patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        with patch("strategies.plugins.futures.active.tmf_spread._append_event"):
+            s.on_bar(ctx)  # baseline -> READY, anchor 45910
+    assert s._trail_anchor_status == TrailAnchorStatus.READY
+    assert s._single_leg_anchor_price == pytest.approx(45910.0)
+
+    m._live_broker_authority_at = 0.0  # force the 5s-throttled refresh
+    auth = m._refresh_live_broker_authority(s)
+    assert auth is not None
+    assert s._trail_anchor_status == TrailAnchorStatus.READY  # NOT reset
+    assert s._single_leg_anchor_price == pytest.approx(45910.0)
+    assert s._single_leg_peak == pytest.approx(45910.0)
+    assert s._single_leg_nadir == pytest.approx(45910.0)
+    assert s._broker_recovery_source == "broker_reconciliation"
+    assert s._broker_recovery_order_id == "ORD-1"
+    assert s._position_session_type == "day"
+
+
 def test_reconciled_state_write_persists_anchor_and_identity(tmp_path):
     """The single-leg state write carries the baseline anchor/peak AND the
     broker-reconciliation identity (restart-safe persistence)."""

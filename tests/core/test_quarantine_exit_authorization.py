@@ -23,9 +23,14 @@ from strategies.futures.monitor import FuturesMonitor
 
 
 def _proof(strategy="MTS_RELEASE", contract="TMFI6", side="LONG",
-           snapshot_hash="snap-hash-1"):
+           snapshot_hash="snap-hash-1", order_symbol="TMFI6",
+           order_side="SELL", order_qty=1):
+    """Remaining-leg closing-order proof: the bound order must be
+    symbol=order_symbol, side=order_side (closing side), qty=order_qty."""
     return {"strategy": strategy, "contract": contract, "side": side,
-            "qty": 1, "snapshot_hash": snapshot_hash,
+            "qty": 1, "order_symbol": order_symbol,
+            "order_side": order_side, "order_qty": order_qty,
+            "snapshot_hash": snapshot_hash,
             "recovery_order_id": "ORD-1", "session": "day"}
 
 
@@ -35,9 +40,10 @@ def _quarantined_ctx():
         live_order_allowed=False, audit_reasons=("BROKER_NOT_FLAT",))
 
 
-def _order(strategy="MTS_RELEASE", proof=None, method="place_order"):
-    o = SimpleNamespace(strategy=strategy, symbol="TMFI6",
-                        side=SimpleNamespace(value="LONG"), quantity=1)
+def _order(strategy="MTS_RELEASE", proof=None, method="place_order",
+           symbol="TMFI6", side="SELL", qty=1):
+    o = SimpleNamespace(strategy=strategy, symbol=symbol,
+                        side=SimpleNamespace(value=side), quantity=qty)
     if proof is not None:
         o.quarantine_exit_proof = proof
     return o
@@ -80,10 +86,33 @@ def test_quarantined_exit_without_proof_blocked():
                                  method="place_order")
 
 
+def test_quarantined_ctx_blocks_order_proof_binding_mismatch():
+    """The proof binds the ORDER, not just the strategy: order symbol/side/
+    qty must match the remaining-leg closing-order spec (codex probe: proof
+    contract=TMFI6 LONG qty1 vs order TMFH6 SHORT qty99 -> blocked)."""
+    ctx = _quarantined_ctx()
+    with pytest.raises(LiveOrderBlocked):
+        ctx.assert_order_allowed(
+            _order(strategy="MTS_RELEASE", proof=_proof(),
+                   symbol="TMFH6", side="SHORT", qty=99),
+            method="place_order")
+    with pytest.raises(LiveOrderBlocked):
+        ctx.assert_order_allowed(
+            _order(strategy="MTS_RELEASE", proof=_proof(),
+                   symbol="TMFI6", side="BUY"), method="place_order")
+    with pytest.raises(LiveOrderBlocked):
+        ctx.assert_order_allowed(
+            _order(strategy="MTS_RELEASE", proof=_proof(), qty=2),
+            method="place_order")
+
+
 def test_quarantined_proof_invalid_blocked():
     ctx = _quarantined_ctx()
     for bad in ({}, _proof(strategy="MTS_ENTRY"),
-                _proof(contract=""), _proof(snapshot_hash="")):
+                _proof(contract=""), _proof(snapshot_hash=""),
+                _proof(order_symbol="TMFH6"),   # order spec targets released
+                _proof(order_side="BUY"),       # not the closing side
+                _proof(order_qty=2)):
         with pytest.raises(LiveOrderBlocked):
             ctx.assert_order_allowed(
                 _order(strategy="MTS_RELEASE", proof=bad),
@@ -113,6 +142,22 @@ def test_gateway_authorize_quarantine_snapshot_bound_exit():
         authority={"live": True, "mode": "live_quarantined",
                    "quarantine_exit_proof": _proof(strategy="MTS_EXIT")})
     assert _ok is True and _reason is None
+
+
+def test_gateway_quarantine_incoherent_order_spec_denied():
+    """The proof's order spec must be self-coherent: order_symbol == the
+    remaining contract, order_side == the closing side of the position,
+    order_qty == the position qty.  Otherwise the gateway denies."""
+    gw = OrderIntentGateway()
+    for bad in (_proof(order_symbol="TMFH6"),
+                _proof(order_side="BUY"),
+                _proof(order_qty=2)):
+        _ok, _binding, _reason = gw.authorize_intent(
+            action="EXIT", strategy="MTS_EXIT",
+            authority={"live": True, "mode": "live_quarantined",
+                       "quarantine_exit_proof": bad})
+        assert _ok is False
+        assert _reason == "LIVE_ORDER_AUTHORIZATION_FAILED"
 
 
 def test_gateway_quarantine_without_proof_denied():
@@ -158,12 +203,22 @@ def _monitor_with_recovery(tmp_path):
 
 
 def _recovered_strategy():
-    from strategies.plugins.futures.active.tmf_spread import TMFSpread
+    from strategies.plugins.futures.active.tmf_spread import (
+        Leg, PositionLifecycle, PositionPhase, ReleaseGroup,
+        ReleaseGroupStatus, TMFSpread, TrailGroup, TrailGroupStatus)
     s = TMFSpread.__new__(TMFSpread)
     s._has_position = True
     s._released_leg = "near"
     s._side = "LONG"
     s._trade_id = "mts-recovered-1"
+    # lifecycle as produced by enter_broker_reconciled_single_leg
+    s._lifecycle_oca = PositionLifecycle(
+        phase=PositionPhase.SINGLE_LEG,
+        release_group=ReleaseGroup(status=ReleaseGroupStatus.FILLED,
+                                   filled_leg=Leg.NEAR,
+                                   canceled_leg=Leg.FAR),
+        trail_group=TrailGroup(status=TrailGroupStatus.ARMED,
+                               remaining_leg=Leg.FAR))
     s._broker_recovery_source = "broker_reconciliation"
     s._broker_recovery_order_id = "ORD-1"
     s._broker_recovery_broker_order_id = "e8c20826"
@@ -191,15 +246,19 @@ def _fresh_snap(released_present=False, capture="OK", session_id="sess-1"):
 
 def test_quarantine_exit_proof_requires_fresh_recheck(tmp_path):
     """The proof is generated ONLY when the FRESH snapshot still shows the
-    remaining leg with the released contract absent + session match."""
+    remaining leg with the released contract absent + session match; it
+    binds the remaining-leg closing order (symbol/side/qty)."""
     m = _monitor_with_recovery(tmp_path)
     m._capture_post_startup_snapshot = lambda: _fresh_snap()
     proof = m._mts_quarantine_exit_proof(
-        _recovered_strategy(), "MTS_RELEASE", "PARTIAL_EXIT")
+        _recovered_strategy(), "MTS_EXIT", "EXIT")
     assert proof is not None
-    assert proof["strategy"] == "MTS_RELEASE"
+    assert proof["strategy"] == "MTS_EXIT"
     assert proof["contract"] == "TMFI6"
     assert proof["side"] == "LONG"
+    assert proof["order_symbol"] == "TMFI6"
+    assert proof["order_side"] == "SELL"
+    assert proof["order_qty"] == 1
     assert proof["snapshot_hash"] == "snap-hash-1"
 
 
@@ -208,15 +267,26 @@ def test_quarantine_exit_proof_recheck_failure_fails_closed(tmp_path):
     # released contract BACK at broker -> contradicts the recovery
     m._capture_post_startup_snapshot = lambda: _fresh_snap(released_present=True)
     assert m._mts_quarantine_exit_proof(
-        _recovered_strategy(), "MTS_RELEASE", "PARTIAL_EXIT") is None
+        _recovered_strategy(), "MTS_EXIT", "EXIT") is None
     # capture failure
     m._capture_post_startup_snapshot = lambda: _fresh_snap(capture="FAIL")
     assert m._mts_quarantine_exit_proof(
-        _recovered_strategy(), "MTS_RELEASE", "PARTIAL_EXIT") is None
+        _recovered_strategy(), "MTS_EXIT", "EXIT") is None
     # session mismatch
     m._capture_post_startup_snapshot = lambda: _fresh_snap(session_id="sess-old")
     assert m._mts_quarantine_exit_proof(
+        _recovered_strategy(), "MTS_EXIT", "EXIT") is None
+
+
+def test_quarantine_exit_proof_released_leg_action_never_bound(tmp_path):
+    """A RELEASE action targets the RELEASED contract (already gone at the
+    broker) — the remaining-leg proof never binds it -> None (zero submit)."""
+    m = _monitor_with_recovery(tmp_path)
+    m._capture_post_startup_snapshot = lambda: _fresh_snap()
+    assert m._mts_quarantine_exit_proof(
         _recovered_strategy(), "MTS_RELEASE", "PARTIAL_EXIT") is None
+    assert m._mts_quarantine_exit_proof(
+        _recovered_strategy(), "MTS_RELEASE", "RELEASE_NEAR") is None
 
 
 def test_quarantine_exit_proof_flat_terminal_fails_closed(tmp_path):
@@ -242,7 +312,7 @@ def test_quarantine_exit_proof_requires_recovery_identity(tmp_path):
     m._capture_post_startup_snapshot = lambda: _fresh_snap()
     s = _recovered_strategy()
     del s._broker_recovery_source
-    assert m._mts_quarantine_exit_proof(s, "MTS_RELEASE", "PARTIAL_EXIT") is None
+    assert m._mts_quarantine_exit_proof(s, "MTS_EXIT", "EXIT") is None
 
 
 # ── end-to-end: quarantined remaining-leg RELEASE via _submit_mts_order_signal
@@ -268,6 +338,7 @@ def _submit_monitor(tmp_path):
     m.order_mgr = _FakeOrderMgr()
     m._pending_lifecycle_orders = {}
     m.paper_fill_sim = False
+    m.ticker = "TMF"
     m._capture_post_startup_snapshot = lambda: _fresh_snap()
     m._hydrate_exit_only_position = lambda: None
     m._leg_lock_enabled = lambda: False
@@ -279,8 +350,43 @@ def _submit_monitor(tmp_path):
     return m
 
 
-def test_quarantined_release_submits_with_proof(tmp_path):
-    """Snapshot-bound remaining-leg MTS_RELEASE goes through in quarantine."""
+def test_quarantined_remaining_leg_exit_submits_with_proof(tmp_path, monkeypatch):
+    """Snapshot-bound remaining-leg MTS_EXIT (TMFI6 SELL 1) goes through in
+    quarantine — the proof is bound to THIS order (not the released leg)."""
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    from unittest.mock import patch as _patch
+    from strategies.plugins.futures.active.tmf_spread import TMFSpread
+    m = _submit_monitor(tmp_path)
+    s = _recovered_strategy()  # released near -> remaining FAR TMFI6 LONG
+    s._near_side = "SHORT"
+    s._far_side = "LONG"
+    signal = SimpleNamespace(action="EXIT", reason="TRAIL_EXIT",
+                             event_id="", winner="")
+    bar_dict = {"near_close": 45600.0, "far_close": 45900.0,
+                "near_open": 45600.0, "near_high": 45650.0,
+                "near_low": 45550.0, "far_open": 45900.0,
+                "far_high": 45950.0, "far_low": 45850.0,
+                "spread_z": 0.0}
+    submitted = []
+    m._submit_via_gateway = lambda order, **kw: submitted.append(order) or True
+    with _patch("strategies.futures.monitor.is_taifex_futures_market_open",
+                return_value=True):
+        with patch.object(m, "_append_mts_event"):
+            m._submit_mts_order_signal(signal, s, bar_dict, "2026-08-18T08:00:00")
+    assert len(submitted) == 1
+    o = submitted[0]
+    assert o.strategy == "MTS_EXIT"
+    assert o.symbol == "TMFI6"  # remaining leg — NOT the released TMFH6
+    assert str(getattr(o.side, "value", o.side)).upper() == "SELL"
+    assert o.quantity == 1
+    assert o.quarantine_exit_proof is not None
+    assert o.quarantine_exit_proof["order_symbol"] == "TMFI6"
+
+
+def test_quarantined_released_leg_release_zero_submit(tmp_path):
+    """A RELEASE_NEAR order closes the RELEASED contract (already gone) —
+    the remaining-leg proof never binds it -> ORDER_INTENT_BLOCKED, zero
+    submit."""
     from unittest.mock import patch as _patch
     from strategies.plugins.futures.active.tmf_spread import TMFSpread
     m = _submit_monitor(tmp_path)
@@ -296,14 +402,40 @@ def test_quarantined_release_submits_with_proof(tmp_path):
                 "spread_z": 0.0}
     submitted = []
     m._submit_via_gateway = lambda order, **kw: submitted.append(order) or True
+    events = []
+    m._append_mts_event = lambda event, **kw: events.append(event)
     with _patch("strategies.futures.monitor.is_taifex_futures_market_open",
                 return_value=True):
-        with patch.object(m, "_append_mts_event"):
-            m._submit_mts_order_signal(signal, s, bar_dict, "2026-08-18T08:00:00")
-    assert len(submitted) == 1
-    assert submitted[0].strategy == "MTS_RELEASE"
-    assert submitted[0].symbol == "TMFH6"  # released near leg close order
-    assert submitted[0].quarantine_exit_proof is not None
+        m._submit_mts_order_signal(signal, s, bar_dict, "2026-08-18T08:00:00")
+    assert submitted == []
+    assert "ORDER_INTENT_BLOCKED" in events
+
+
+def test_quarantined_combined_exit_pair_zero_submit(tmp_path):
+    """COMBINED_EXIT submits a near+far PAIR — the remaining-leg proof binds
+    a single order, so the pair is never authorized -> zero submit."""
+    from unittest.mock import patch as _patch
+    from strategies.plugins.futures.active.tmf_spread import TMFSpread
+    m = _submit_monitor(tmp_path)
+    s = _recovered_strategy()
+    s._near_side = "SHORT"
+    s._far_side = "LONG"
+    signal = SimpleNamespace(action="EXIT",
+                             reason="COMBINED_EXIT: near+far")
+    bar_dict = {"near_close": 45600.0, "far_close": 45900.0,
+                "near_open": 45600.0, "near_high": 45650.0,
+                "near_low": 45550.0, "far_open": 45900.0,
+                "far_high": 45950.0, "far_low": 45850.0,
+                "spread_z": 0.0}
+    submitted = []
+    m._submit_via_gateway = lambda order, **kw: submitted.append(order) or True
+    events = []
+    m._append_mts_event = lambda event, **kw: events.append(event)
+    with _patch("strategies.futures.monitor.is_taifex_futures_market_open",
+                return_value=True):
+        m._submit_mts_order_signal(signal, s, bar_dict, "2026-08-18T08:00:00")
+    assert submitted == []
+    assert "ORDER_INTENT_BLOCKED" in events
 
 
 def test_quarantined_release_without_proof_zero_submit(tmp_path):
