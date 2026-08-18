@@ -99,6 +99,11 @@ def test_timeout_blocks_all_order_channels_and_preserves_pending_lock(monkeypatc
     mon._live_broker_flat_proven = True
     mon._broker_authority_degraded = False
     mon._broker_position_observed = False
+    sends = []
+    adapter = SimpleNamespace(place_order=lambda *a, **k: sends.append((a, k)))
+    manager = OrderManager(mode="live", broker_adapter=adapter,
+                           execution_context=mon._execution_context)
+    mon.order_mgr = manager
     mon._capture_post_startup_snapshot = lambda: {
         "fetch_status": {"capture": "FAIL"},
         "open_orders": [], "positions": [],
@@ -114,10 +119,6 @@ def test_timeout_blocks_all_order_channels_and_preserves_pending_lock(monkeypatc
     assert mon._live_broker_flat_proven is False
     assert mon._broker_authority_degraded is True
 
-    sends = []
-    adapter = SimpleNamespace(place_order=lambda *a, **k: sends.append((a, k)))
-    manager = OrderManager(mode="live", broker_adapter=adapter,
-                           execution_context=mon._execution_context)
     channels = ("ENTRY", "ADD_POSITION", "REVERSAL", "REBUILD", "MTS_EXIT")
     for channel in channels:
         order = manager.create_order(
