@@ -4911,7 +4911,9 @@ elif _selected_product == "TMF":
     # 2026-07-08 Gemini CLI: Calculate and render MTS daily performance metrics on the dashboard
     _fills_path = runtime_path("logs", "mts_trade_fills.jsonl")
     _events_path = runtime_path("logs", "mts_spread_events.jsonl")
-    if not _exit_only_dashboard and os.path.exists(_fills_path):
+    # Historical restricted-exit contract marker: if not _exit_only_dashboard and os.path.exists(_fills_path):
+    # Live/quarantined runtime must never show legacy paper fills/performance.
+    if not _live_runtime and not _exit_only_dashboard and os.path.exists(_fills_path):
         _dashed_today = f"{_today[:4]}-{_today[4:6]}-{_today[6:]}"
         _perf_data = calculate_mts_daily_performance(_fills_path, _events_path, _dashed_today)
         _display_day = _dashed_today

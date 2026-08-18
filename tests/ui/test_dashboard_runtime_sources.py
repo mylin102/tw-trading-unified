@@ -57,3 +57,8 @@ def test_calendar_live_pair_is_preferred_over_archival_csv(tmp_path, monkeypatch
         market / "TMF_far_20260814_LIVE.csv", index=False)
     result = dashboard.load_calendar_spread_data.__wrapped__()
     assert result is not None and result["timestamp"].max() == ts[-1]
+
+def test_live_runtime_hides_legacy_daily_pnl_panel():
+    source = Path(__file__).parents[2] / "ui" / "dashboard.py"
+    text = source.read_text(encoding="utf-8")
+    assert "if not _live_runtime and not _exit_only_dashboard and os.path.exists(_fills_path):" in text
