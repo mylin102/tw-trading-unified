@@ -106,19 +106,28 @@ class _FakeApi:
                             price=46569.0, pnl=250.0),
         ]
 
+    def update_status(self, account=None):
+        return None
+
     def list_trades(self, account=None):
         return [
             SimpleNamespace(
                 id="BRK-NEAR", ordno="BRK-NEAR", seqno="SEQ-1",
                 code="TMFH6",
                 status=SimpleNamespace(status="Filled", price=46411.0,
-                                        quantity=1, deals=[]),
+                                        quantity=1, order_quantity=1,
+                                        deal_quantity=1, deals=[SimpleNamespace(
+                                            price=46411.0, quantity=1,
+                                            exchange_seq="XS-NEAR")]),
             ),
             SimpleNamespace(
                 id="BRK-FAR", ordno="BRK-FAR", seqno="SEQ-2",
                 code="TMFI6",
                 status=SimpleNamespace(status="Filled", price=46569.0,
-                                        quantity=1, deals=[]),
+                                        quantity=1, order_quantity=1,
+                                        deal_quantity=1, deals=[SimpleNamespace(
+                                            price=46569.0, quantity=1,
+                                            exchange_seq="XS-FAR")]),
             ),
         ]
 

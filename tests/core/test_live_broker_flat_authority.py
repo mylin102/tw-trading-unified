@@ -9,6 +9,9 @@ def test_live_broker_flat_snapshot_is_explicit_flat_authority(monkeypatch, tmp_p
         futopt_account = SimpleNamespace(account_id="futopt")
         stock_account = None
 
+        def update_status(self, account=None):
+            return None
+
         def list_positions(self, account):
             return []
 
