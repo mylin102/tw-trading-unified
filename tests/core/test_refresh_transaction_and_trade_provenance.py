@@ -250,3 +250,19 @@ def test_near_and_far_refresh_states_are_independent():
         "broker_order_id": "far-1", "broker_status": "Submitted"})
     assert near.status is OrderStatus.FILLED
     assert far.status is OrderStatus.SUBMITTED
+
+
+def test_filled_then_delayed_submitted_receipt_never_regresses():
+    from core.order_management.order import OrderSide, OrderStatus, OrderType
+    from core.order_management.order_manager import OrderManager
+    mgr = OrderManager(mode="paper")
+    order = mgr.create_order("TMFI6", OrderSide.BUY, OrderType.MARKET, 1)
+    mgr.attach_submission(order.order_id, broker_order_id="filled-1")
+    mgr.reconcile_trade_snapshot(trade={
+        "broker_order_id": "filled-1", "broker_status": "Filled",
+        "filled_qty": 1, "deals": []})
+    mgr.apply_order_update(order.order_id, raw_status="PendingSubmit",
+                           broker_order_id="filled-1",
+                           observation_type="FORDER_CALLBACK")
+    assert order.status is OrderStatus.FILLED
+    assert order.filled_quantity == 1
