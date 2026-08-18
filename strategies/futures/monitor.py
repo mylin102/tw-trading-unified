@@ -4702,7 +4702,7 @@ class FuturesMonitor:
         threading.Thread(target=_worker, daemon=True).start()
         timeout = float(getattr(self, "_futures_refresh_timeout_s", 3.0) or 3.0)
         if not done.wait(timeout=max(0.1, timeout)):
-            result = {"state": "REFRESH_TIMEOUT", "rows": [],
+            result = {"state": "REFRESH_TIMEOUT_UNCERTAIN", "rows": [],
                       "snapshot_generation": None,
                       "elapsed_ms": int((time.monotonic() - started) * 1000),
                       "trades_count": 0}
@@ -4736,6 +4736,18 @@ class FuturesMonitor:
                   "raw_count": len(rows), "normalized_count": len(rows),
                   "rejected_count": 0, "rejection_reasons": {}}
         self._record_refresh_telemetry(result)
+        try:
+            self._append_mts_event(
+                "REFRESH_COMPLETED",
+                snapshot_generation=generation,
+                account_type="futures",
+                elapsed_ms=elapsed,
+                trades_count=len(rows),
+                status_distribution=_status_distribution,
+                raw_count=len(rows), normalized_count=len(rows),
+                rejected_count=0, rejection_reasons={})
+        except Exception:
+            pass
         self._last_futures_refresh = dict(result, rows=None)
         return result
 
@@ -4756,6 +4768,18 @@ class FuturesMonitor:
                                        "rejected_count", 0),
                                    rejection_reasons=result.get(
                                        "rejection_reasons", {}),
+                                   forder_count=getattr(
+                                       self, "_forder_callback_count", 0),
+                                   fdeal_count=getattr(
+                                       self, "_fdeal_callback_count", 0),
+                                   callback_exception_count=getattr(
+                                       self, "_callback_exception_count", 0),
+                                   last_order_callback_at=getattr(
+                                       self, "_last_order_callback_at", None),
+                                   last_fdeal_callback_at=getattr(
+                                       self, "_last_fdeal_callback_at", None),
+                                   callback_registration_generation=getattr(
+                                       self, "_callback_registration_generation", None),
                                    error=result.get("error"))
         except Exception:
             pass

@@ -126,6 +126,10 @@ class Order:
         self.cancel_reason: Optional[str] = None
         self.fills: List[OrderFill] = []
         self.raw_events: List[Dict[str, Any]] = []
+        # Broker may confirm a terminal Filled status before deal details are
+        # available.  Persist this explicit accounting state across restart;
+        # it must never be inferred as a zero-price fill.
+        self.fill_accounting_status: Optional[str] = None
         
         # 執行品質指標
         self.slippage = 0.0
@@ -318,6 +322,7 @@ class Order:
             "parent_order_id": self.parent_order_id,
             "fills": [fill.to_dict() for fill in self.fills],
             "raw_events": self.raw_events,
+            "fill_accounting_status": self.fill_accounting_status,
             "created_at": self.created_at.isoformat()
             if isinstance(self.created_at, datetime) else None,
             "submitted_at": self.submitted_at.isoformat()
@@ -375,6 +380,7 @@ class Order:
         order.cancel_reason = data.get("cancel_reason")
         order.fills = [OrderFill.from_dict(item) for item in data.get("fills", [])]
         order.raw_events = data.get("raw_events", [])
+        order.fill_accounting_status = data.get("fill_accounting_status")
         
         # 恢復時間戳記
         def parse_datetime(dt_str):

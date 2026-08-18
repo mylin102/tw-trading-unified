@@ -1656,13 +1656,11 @@ class OrderManager:
         reconciled = []
         unmatched = []
         for trade in (open_orders or []) + (filled_trades or []):
-            # Idempotency guard: a receipt for an already-FILLED order must not
-            # be re-processed.  Re-attaching the submission identity would
-            # regress the fill (attach_submission sets status=SUBMITTED) and
-            # re-trigger an orders-export save on every refresh cycle.  Only
-            # FILLED is skipped: CANCELLED/EXPIRED orders keep the C7
-            # broker-truth restore semantics (a live broker receipt may bring
-            # them back to SUBMITTED).
+            # A refresh is an observation of an older broker generation.  It
+            # must never regress a locally newer terminal state by reattaching
+            # the receipt (attach_submission sets SUBMITTED).  Explicit new
+            # order/deal callbacks use apply_order_update/apply_deal_fill and
+            # are therefore not covered by this stale-refresh guard.
             _pre = self._resolve_order(
                 None,
                 broker_order_id=self._extract_value(
@@ -1670,7 +1668,10 @@ class OrderManager:
                 seqno=self._extract_value(trade, "seqno"),
                 ordno=self._extract_value(trade, "ordno", "exchange_order_id"),
             )
-            if _pre is not None and _pre.status == OrderStatus.FILLED:
+            if _pre is not None and _pre.status in (
+                    OrderStatus.FILLED, OrderStatus.CANCELLED,
+                    OrderStatus.REJECTED, OrderStatus.EXPIRED,
+                    OrderStatus.BROKER_NOT_FOUND):
                 continue
             result = self.reconcile_trade_snapshot(
                 trade=trade,
