@@ -204,19 +204,35 @@ class OrderIntentGateway:
             # snapshot-bound remaining-leg exit (per-order proof from
             # the monitor's fresh broker-truth recheck) may submit.
             _qproof = authority.get("quarantine_exit_proof")
-            _close_side = ("SELL" if _qproof.get("side") == "LONG"
-                           else "BUY") if isinstance(_qproof, dict) else None
+            # strict proof values (follow-up audit): side LONG/SHORT only
+            # (no fall-through to a default close side), qty/order_qty
+            # positive int non-bool, order_side BUY/SELL.
+            _q_side = _qproof.get("side") if isinstance(_qproof, dict) else None
+            _q_qty = _qproof.get("qty") if isinstance(_qproof, dict) else None
+            _q_order_qty = (_qproof.get("order_qty")
+                            if isinstance(_qproof, dict) else None)
+            _q_order_side = (_qproof.get("order_side")
+                             if isinstance(_qproof, dict) else None)
+            _close_side = ("SELL" if _q_side == "LONG"
+                           else "BUY") if _q_side in ("LONG", "SHORT") else None
+            _strict_qty = (isinstance(_q_qty, int)
+                           and not isinstance(_q_qty, bool) and _q_qty > 0)
+            _strict_oqty = (isinstance(_q_order_qty, int)
+                            and not isinstance(_q_order_qty, bool)
+                            and _q_order_qty > 0)
             # order-spec coherence: the bound order closes the remaining
             # leg (order_symbol == contract, closing side, qty match).
             if (isinstance(_qproof, dict)
                     and sname in ("MTS_RELEASE", "MTS_EXIT")
                     and _qproof.get("strategy") == sname
-                    and _qproof.get("contract") and _qproof.get("side")
-                    and _qproof.get("snapshot_hash")
+                    and _q_side in ("LONG", "SHORT")
+                    and str(_q_order_side or "").upper() in ("BUY", "SELL")
+                    and _strict_qty and _strict_oqty
+                    and _qproof.get("contract") and _qproof.get("snapshot_hash")
                     and _qproof.get("order_symbol") == _qproof.get("contract")
-                    and str(_qproof.get("order_side") or "").lower()
+                    and str(_q_order_side or "").lower()
                         == str(_close_side or "").lower()
-                    and _qproof.get("order_qty") == _qproof.get("qty")):
+                    and _q_order_qty == _q_qty):
                 return True, _qproof, None
             return False, None, "LIVE_ORDER_AUTHORIZATION_FAILED"
         if mode not in ("live_ready", "reconciled_exit_only"):

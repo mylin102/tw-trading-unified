@@ -207,17 +207,32 @@ class ExecutionContext:
             _oqty = getattr(order, "quantity", None)
             # The proof binds THIS order: symbol/side/qty must match the
             # remaining-leg closing order spec (2026-08-18 review).
+            # Strict proof values (follow-up audit): side LONG/SHORT only,
+            # qty/order_qty positive int non-bool, order_side BUY/SELL.
+            _q_side = _qproof.get("side") if isinstance(_qproof, dict) else None
+            _q_qty = _qproof.get("qty") if isinstance(_qproof, dict) else None
+            _q_order_qty = (_qproof.get("order_qty")
+                            if isinstance(_qproof, dict) else None)
+            _q_order_side = (_qproof.get("order_side")
+                             if isinstance(_qproof, dict) else None)
+            _strict_qty = (isinstance(_q_qty, int)
+                           and not isinstance(_q_qty, bool) and _q_qty > 0)
+            _strict_oqty = (isinstance(_q_order_qty, int)
+                            and not isinstance(_q_order_qty, bool)
+                            and _q_order_qty > 0)
             if (method == "place_order"
                     and isinstance(_qproof, dict)
                     and _ostrategy in ("MTS_RELEASE", "MTS_EXIT")
                     and _qproof.get("strategy") == _ostrategy
-                    and _qproof.get("contract") and _qproof.get("side")
-                    and _qproof.get("snapshot_hash")
+                    and _q_side in ("LONG", "SHORT")
+                    and str(_q_order_side or "").upper() in ("BUY", "SELL")
+                    and _strict_qty and _strict_oqty
+                    and _qproof.get("contract") and _qproof.get("snapshot_hash")
                     and _qproof.get("order_symbol") == _osymbol
-                    and str(_qproof.get("order_side") or "").lower()
+                    and str(_q_order_side or "").lower()
                         == str(_oside or "").lower()
                     and isinstance(_oqty, int) and not isinstance(_oqty, bool)
-                    and _oqty == _qproof.get("order_qty")):
+                    and _oqty == _q_order_qty):
                 return
         # [EXIT_ONLY flow removed 2026-08-14] the operator attestation /
         # RECONCILED_EXIT_ONLY flow no longer exists as an execution
