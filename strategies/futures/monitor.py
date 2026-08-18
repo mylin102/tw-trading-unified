@@ -4680,17 +4680,11 @@ class FuturesMonitor:
 
         def _worker():
             try:
-                try:
-                    api.update_status(account=account)
-                except TypeError:
-                    api.update_status(account)
-                try:
-                    rows = api.list_trades()
-                except TypeError:
-                    try:
-                        rows = api.list_trades(account=account)
-                    except TypeError:
-                        rows = api.list_trades(account)
+                # Keep the transaction exact: a TypeError from the SDK is an
+                # exception state, not permission to issue a second refresh
+                # through a different overload.
+                api.update_status(account=account)
+                rows = api.list_trades()
                 if rows is None:
                     raise RuntimeError("list_trades returned None")
                 box["rows"] = list(rows)
