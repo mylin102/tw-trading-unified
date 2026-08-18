@@ -204,6 +204,7 @@ class OrderManager:
         deal_id: Optional[str] = None,
         fill_price: Optional[float] = None,
         fill_qty: int = 0,
+        observation_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         entry = {
             "type": event_type,
@@ -220,6 +221,11 @@ class OrderManager:
             "fill_price": fill_price,
             "fill_qty": fill_qty,
         }
+        if observation_type:
+            entry["observation_type"] = observation_type
+            entry["observed_at"] = entry["timestamp"]
+            entry["normalization_result"] = "ACCEPTED"
+            entry["rejection_reason"] = None
         payload_dict = self._payload_to_dict(payload)
         if payload_dict is not None:
             entry["payload"] = payload_dict
@@ -412,6 +418,7 @@ class OrderManager:
         raw_status=None,
         source: str = "",
         reason: str = "",
+        observation_type: Optional[str] = None,
     ) -> Order:
         order = self._resolve_order(order_id)
         if order is None:
@@ -462,6 +469,7 @@ class OrderManager:
             broker_order_id=broker_order_id,
             seqno=seqno,
             ordno=ordno,
+            observation_type=observation_type or "PLACE_RECEIPT",
         )
         self._emit("on_status_change", OrderEvent(
             order_id=order.order_id,
@@ -580,6 +588,40 @@ class OrderManager:
                 self.expire(order.order_id, source=source or "order_update", reason=reason)
             return order
 
+        return order
+
+    def _mark_broker_terminal_without_details(
+        self, order: Order, *, filled_qty=None, raw_payload=None,
+        source="", reason="DETAILS_PENDING",
+    ) -> Optional[Order]:
+        """Commit broker Filled without inventing a price/PnL.
+
+        A refreshed Trade can be terminal while its deal detail is delayed.
+        The order lifecycle must stop retrying immediately, but accounting
+        remains explicitly incomplete until a deal observation arrives.
+        """
+        if order is None:
+            return None
+        try:
+            if filled_qty is not None and isinstance(filled_qty, int) \
+                    and not isinstance(filled_qty, bool) \
+                    and 0 <= filled_qty <= order.quantity:
+                order.filled_quantity = max(order.filled_quantity, filled_qty)
+        except (TypeError, ValueError):
+            pass
+        previous = order.status
+        order.status = OrderStatus.FILLED
+        order.fill_accounting_status = "DETAILS_PENDING"
+        order.updated_at = datetime.now()
+        self._record_audit(
+            order, "order_terminal", source=source or "reconcile",
+            reason=reason, from_status=previous, to_status=order.status,
+            raw_status="Filled", payload=raw_payload,
+            broker_order_id=order.broker_order_id,
+            seqno=order.seqno, ordno=order.ordno)
+        if order.order_id in self.active_orders:
+            del self.active_orders[order.order_id]
+            self.completed.append(order)
         return order
 
     # ── Submit ──
@@ -727,6 +769,7 @@ class OrderManager:
         ordno: Optional[str] = None,
         source: str = "",
         reason: str = "",
+        observation_type: Optional[str] = None,
     ) -> Optional[Order]:
         order = self._resolve_order(
             order_id,
@@ -769,6 +812,7 @@ class OrderManager:
             deal_id=deal_id or broker_trade_id or exchange_fill_id or exchange_seq,
             fill_price=fill_price,
             fill_qty=fill_qty,
+            observation_type=observation_type,
         )
 
         if order.status == OrderStatus.FILLED:
@@ -1198,7 +1242,8 @@ class OrderManager:
         source: str = "",
         reason: str = "",
     ) -> Dict[str, Any]:
-        broker_order_id = broker_order_id or self._extract_value(trade, "id", "broker_order_id", "exchange_order_id")
+        broker_order_id = broker_order_id or self._extract_value(
+            trade, "broker_order_id", "id", "status_id", "exchange_order_id")
         ordno = ordno or self._extract_value(trade, "ordno", "exchange_order_id")
         seqno = self._extract_value(trade, "seqno")
         order = self._resolve_order(order_id, broker_order_id=broker_order_id, seqno=seqno, ordno=ordno)
@@ -1210,9 +1255,13 @@ class OrderManager:
                 "fills_added": 0,
             }
 
-        raw_status = self._extract_value(getattr(trade, "status", None), "status") or self._extract_value(trade, "status")
+        raw_status = (self._extract_value(trade, "broker_status")
+                      or self._extract_value(getattr(trade, "status", None), "status")
+                      or self._extract_value(trade, "status"))
         normalized_status = self._normalize_raw_status(raw_status)
-        deals = self._extract_value(getattr(trade, "status", None), "deals") or self._extract_value(trade, "deals") or []
+        deals = (self._extract_value(trade, "deals")
+                 or self._extract_value(getattr(trade, "status", None), "deals")
+                 or [])
         if broker_order_id or ordno or seqno:
             self.attach_submission(
                 order.order_id,
@@ -1243,43 +1292,36 @@ class OrderManager:
         # broker identity matched an existing submitted order, the aggregate
         # receipt is authoritative and can be applied exactly once; never
         # synthesize an order or match by symbol/side.
-        if normalized_status in (OrderStatus.PARTIAL_FILLED, OrderStatus.FILLED) and not deals:
-            _fill_identity = self._extract_value(
-                trade, "trade_id", "deal_id", "fill_id", "exchange_fill_id"
-            ) or self._extract_value(
-                getattr(trade, "status", None), "trade_id", "deal_id", "fill_id"
-            ) or broker_order_id or ordno or seqno
-            _fill_price = self._extract_value(
-                getattr(trade, "status", None), "price", "avg_price"
-            ) or self._extract_value(trade, "price", "avg_price")
-            _fill_qty = self._extract_value(
-                getattr(trade, "status", None), "quantity", "filled_quantity", "qty"
-            ) or self._extract_value(trade, "quantity", "filled_quantity", "qty")
+        if normalized_status == OrderStatus.FILLED and not deals:
+            _filled_qty = self._extract_value(trade, "filled_qty", "filled_quantity")
+            if _filled_qty is not None:
+                try:
+                    _filled_qty = int(_filled_qty)
+                except (TypeError, ValueError):
+                    _filled_qty = None
+            self._mark_broker_terminal_without_details(
+                order, filled_qty=_filled_qty,
+                raw_payload=self._payload_to_dict(trade),
+                source=source or "reconcile", reason="DETAILS_PENDING")
+        elif normalized_status == OrderStatus.PARTIAL_FILLED and not deals:
+            _filled_qty = self._extract_value(trade, "filled_qty", "filled_quantity")
             try:
-                _fill_price = float(_fill_price)
-                _fill_qty = int(_fill_qty)
+                _filled_qty = int(_filled_qty) if _filled_qty is not None else None
             except (TypeError, ValueError):
-                _fill_price, _fill_qty = 0.0, 0
-            if (_fill_identity and _fill_price > 0 and _fill_qty > 0
-                    and not self._has_fill_identity(
-                        order, deal_id=str(_fill_identity),
-                        broker_trade_id=str(_fill_identity),
-                        exchange_fill_id=str(_fill_identity))):
-                self.apply_deal_fill(
-                    order.order_id, deal_id=str(_fill_identity),
-                    fill_price=_fill_price, fill_qty=_fill_qty,
-                    exchange_fill_id=str(_fill_identity),
-                    broker_trade_id=str(_fill_identity),
-                    raw_payload=self._payload_to_dict(trade),
-                    broker_order_id=broker_order_id, seqno=seqno, ordno=ordno,
-                    source=source or "reconcile", reason=reason,
-                )
-                fills_added += 1
+                _filled_qty = None
+            if (_filled_qty is not None and not isinstance(_filled_qty, bool)
+                    and 0 < _filled_qty < order.quantity):
+                order.filled_quantity = max(order.filled_quantity, _filled_qty)
+                order.status = OrderStatus.PARTIAL_FILLED
+                order.fill_accounting_status = "DETAILS_PENDING"
+            # No deal identity means this observation is ambiguous.  Keep the
+            # raw refreshed Trade and its confirmed quantity, but do not
+            # manufacture a fill, price, or PnL from an order identity.
         for deal in deals:
             deal_id = self._extract_value(deal, "deal_id", "trade_id", "fill_id")
             broker_trade_id = self._extract_value(deal, "broker_trade_id", "trade_id")
             exchange_fill_id = self._extract_value(deal, "exchange_fill_id", "fill_id")
-            exchange_seq = self._extract_value(deal, "exchange_seq")
+            exchange_seq = self._extract_value(deal, "exchange_seq", "seq")
             if self._has_fill_identity(
                 order,
                 deal_id=deal_id,
@@ -1321,6 +1363,7 @@ class OrderManager:
             broker_order_id=broker_order_id,
             seqno=seqno,
             ordno=ordno,
+            observation_type="REFRESHED_TRADE",
         )
         return {
             "matched": True,

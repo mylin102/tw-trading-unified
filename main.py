@@ -41,6 +41,50 @@ _lifecycle_recorder: Any = None
 
 # [P0 Fix] Connection state tracking via Shioaji event callback
 _connection_dropped = False
+_order_callback_lock = threading.Lock()
+_order_callback_generation = 0
+_order_callback_fn = None
+
+
+def register_order_callback(api, futures_mons, options_mon):
+    """Idempotently install the single order callback after each login.
+
+    Shioaji may retain callbacks across reconnects, or may clear them; using
+    one stable dispatcher and safely re-registering it handles both cases.
+    A registration failure is a reconnect quarantine, never a permission to
+    continue with order-capable code.
+    """
+    global _order_callback_generation, _order_callback_fn
+    with _order_callback_lock:
+        try:
+            if _order_callback_fn is None:
+                _order_callback_fn = order_dispatcher(futures_mons, options_mon)
+            api.set_order_callback(_order_callback_fn)
+            _order_callback_generation += 1
+            for _mon in futures_mons or []:
+                try:
+                    _mon._callback_registration_generation = _order_callback_generation
+                    _mon._append_mts_event(
+                        "ORDER_CALLBACK_REGISTERED",
+                        registration_generation=_order_callback_generation,
+                        observation_type="CALLBACK_REGISTRATION",
+                        normalization_result="ACCEPTED")
+                except Exception:
+                    pass
+            return True
+        except Exception as exc:
+            for _mon in futures_mons or []:
+                try:
+                    _mon._append_mts_event(
+                        "ORDER_CALLBACK_REGISTRATION_FAILED",
+                        registration_generation=_order_callback_generation,
+                        observation_type="CALLBACK_REGISTRATION",
+                        normalization_result="REJECTED",
+                        rejection_reason=type(exc).__name__)
+                except Exception:
+                    pass
+            _quarantine_for_handoff(futures_mons, reason="ORDER_CALLBACK_REGISTRATION_FAILED")
+            return False
 
 BASE = os.path.dirname(__file__)
 HEALTH_INTERVAL = 30  # seconds between health checks
@@ -217,6 +261,18 @@ def order_dispatcher(futures_mons, options_mon):
                     f_mon.on_order_event(order_state, data)
             except Exception as e:
                 console.print(f"[red][futures order err] {e}[/red]")
+                try:
+                    f_mon._callback_exception_count = getattr(
+                        f_mon, "_callback_exception_count", 0) + 1
+                    f_mon._append_mts_event(
+                        "ORDER_CALLBACK_EXCEPTION",
+                        observation_type=("FDEAL_CALLBACK" if "Deal" in str(order_state)
+                                          or "FDEAL" in str(order_state)
+                                          else "FORDER_CALLBACK"),
+                        normalization_result="REJECTED",
+                        rejection_reason="CALLBACK_EXCEPTION")
+                except Exception:
+                    pass
             finally:
                 _thread_local.state_path = None
 
@@ -845,6 +901,9 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
         time.sleep(30)
         if not _connection_dropped:
             console.print("[green]✅ Shioaji auto-reconnect completed[/green]")
+            if not register_order_callback(api, mons, om):
+                console.print("[red]❌ Order callback restore failed — QUARANTINED[/red]")
+                return False
             _recerts = [_recertify_after_reconnect(m, api) for m in mons]
             if not all(_recerts):
                 console.print("[red]❌ Re-certification failed after auto-reconnect — QUARANTINED, exiting for restart[/red]")
@@ -869,6 +928,9 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
             console.print(f"[cyan]🔄 Re-login attempt {attempt+1}/3...[/cyan]")
             safe_login(api, api_key, secret_key, contracts_timeout=10000)
             console.print("[green]✅ Shioaji re-login successful[/green]")
+            if not register_order_callback(api, mons, om):
+                console.print("[red]❌ Order callback registration failed — QUARANTINED[/red]")
+                return False
 
             # Re-subscribe all contracts (per monitor; near + far)
             for m in mons:
@@ -949,6 +1011,11 @@ def _setup_event_callback(api, fm, om):
         elif event_code == 13:
             console.print("[bold green]✅ Shioaji 重連成功！恢復資料流[/bold green]")
             _connection_dropped = False
+            if not register_order_callback(api, [fm] if fm else [], om):
+                _connection_dropped = True
+                _quarantine_for_handoff([fm] if fm else [],
+                                        reason="ORDER_CALLBACK_REGISTRATION_FAILED")
+                return
             # Re-subscribe to ensure data flow restoration
             try:
                 if fm and fm.contract:
@@ -1289,7 +1356,9 @@ def run_system(dry_run=False, config_name="futures"):
                 set_bidask_callback(api, _tmf_bidask_fn)
 
             # [P0 Fix] Centralized order dispatcher to avoid "Already borrowed" error
-            api.set_order_callback(order_dispatcher(futures_mons, om))
+            if not register_order_callback(api, futures_mons, om):
+                console.print("[red]❌ Order event callback registration failed — QUARANTINED[/red]")
+                return
             console.print("[green]✅ Order event callback registered[/green]")
 
             # [Skew Integration] Wire skew engine into FuturesMonitor for strategy context

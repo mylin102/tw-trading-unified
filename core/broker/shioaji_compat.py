@@ -103,12 +103,16 @@ def safe_login(api: sj.Shioaji, api_key: str, secret_key: str, **kwargs) -> Any:
     from core.live_route_certificate import session_registry  # local import
     session_registry.unregister(api)   # invalidate before every attempt
     try:
+        _login_kwargs = dict(kwargs)
+        # Futures order/deal callbacks are part of the live truth channel;
+        # keep Shioaji's documented default explicit across reconnects.
+        _login_kwargs.setdefault("subscribe_trade", True)
         # [rshioaji 1.5.9+] login with contracts_timeout returns True if contracts loaded
         res = api.login(
             api_key=api_key,
             secret_key=secret_key,
-            contracts_timeout=kwargs.get("contracts_timeout", 10000),
-            **kwargs
+            contracts_timeout=_login_kwargs.pop("contracts_timeout", 10000),
+            **_login_kwargs
         )
         if res:                        # round-11 #2: a falsey login return
             # is treated as failure (fail-closed) even though Shioaji's
@@ -117,8 +121,9 @@ def safe_login(api: sj.Shioaji, api_key: str, secret_key: str, **kwargs) -> Any:
         return res
     except TypeError:
         # Fallback for 1.3.3
-        kwargs.pop("contracts_timeout", None)
-        res = api.login(api_key=api_key, secret_key=secret_key, **kwargs)
+        _login_kwargs.pop("contracts_timeout", None)
+        _login_kwargs.pop("subscribe_trade", None)
+        res = api.login(api_key=api_key, secret_key=secret_key, **_login_kwargs)
         if res:
             session_registry.register(api)
         return res

@@ -264,6 +264,14 @@ class FuturesMonitor:
         self.contract = None
         self.far_contract = None  # Far-month contract for dual chart
         self._running = False
+        # Futures broker refresh is a transaction: one in-flight update/list
+        # pair may publish one generation, while a timed-out worker keeps the
+        # lock until it really finishes.  This prevents overlapping
+        # update_status calls and pre/post mixed snapshots.
+        self._broker_refresh_lock = threading.Lock()
+        self._futures_refresh_generation = 0
+        self._last_futures_refresh = None
+        self._futures_refresh_timeout_s = 3.0
 
         # Far-month tick-based bar accumulation (independent from near-month)
         self._far_tick_bars_deque = deque(maxlen=300)
@@ -4554,7 +4562,8 @@ class FuturesMonitor:
                             source="live_broker_watchdog"))
 
     @staticmethod
-    def _normalize_snapshot_trades(raw_trades) -> list:
+    def _normalize_snapshot_trades(raw_trades, *, observation_type="REFRESHED_TRADE",
+                                   snapshot_generation=None, observed_at=None) -> list:
         """Return JSON-safe terminal broker receipts for local backfill.
 
         ``list_trades`` is the broker's authoritative read path when a live
@@ -4562,65 +4571,200 @@ class FuturesMonitor:
         facts; never persist the SDK object (which can contain account/CA
         details or enum values that are not JSON serializable).
         """
+        def _get(obj, key, default=None):
+            if isinstance(obj, dict):
+                return obj[key] if key in obj else default
+            return getattr(obj, key, default)
+
+        def _enum_text(value):
+            if value is None:
+                return None
+            name = _get(value, "name")
+            val = _get(value, "value")
+            text = name or val or value
+            return str(text).split(".")[-1]
+
+        def _json_value(value):
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            if isinstance(value, dict):
+                return {str(k): _json_value(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_json_value(v) for v in value]
+            return {key: _json_value(_get(value, key)) for key in (
+                "deal_id", "trade_id", "fill_id", "exchange_seq", "price",
+                "avg_price", "quantity", "qty", "ordno")
+                    if _get(value, key) is not None}
+
         out = []
         for trade in raw_trades or []:
-            broker_order = getattr(trade, "order", None)
-            status = getattr(trade, "status", None)
-            nested = getattr(status, "status", None)
+            broker_order = _get(trade, "order")
+            status = _get(trade, "status")
+            contract = _get(trade, "contract") or _get(broker_order, "contract")
+            nested = _get(status, "status")
             raw_status = nested if nested is not None else status
             if isinstance(raw_status, dict):
                 raw_status = raw_status.get("status")
-            status_name = (getattr(raw_status, "name", None)
-                           or getattr(raw_status, "value", None)
-                           or str(raw_status or ""))
-            status_name = str(status_name).split(".")[-1]
-            _trade_action = getattr(trade, "action", None) or getattr(
-                broker_order, "action", None)
-            _direction = (getattr(_trade_action, "name", None)
-                          or getattr(_trade_action, "value", None)
-                          or (_trade_action if isinstance(_trade_action, str)
-                              else None))
+            status_name = _enum_text(raw_status) or ""
+            _trade_action = _get(trade, "action") or _get(broker_order, "action")
+            _direction = _enum_text(_trade_action)
+            broker_order_id = (_get(broker_order, "id") or
+                               _get(status, "id") or _get(trade, "id"))
+            requested_qty = _get(broker_order, "quantity")
+            if requested_qty is None:
+                requested_qty = _get(status, "order_quantity")
+            filled_qty = _get(status, "deal_quantity")
+            cancelled_qty = _get(status, "cancel_quantity")
+            deals = _get(status, "deals")
+            if deals is None:
+                deals = _get(trade, "deals")
+            deals = [_json_value(deal) for deal in deals] if isinstance(
+                deals, (list, tuple)) else []
             row = {
-                "id": getattr(trade, "id", None)
-                      or getattr(trade, "broker_order_id", None)
-                      or getattr(trade, "exchange_order_id", None)
-                      or getattr(broker_order, "id", None),
-                "broker_order_id": getattr(trade, "broker_order_id", None)
-                                   or getattr(broker_order, "id", None),
-                "ordno": getattr(trade, "ordno", None)
-                        or getattr(broker_order, "ordno", None),
-                "seqno": getattr(trade, "seqno", None)
-                        or getattr(broker_order, "seqno", None),
-                "code": getattr(trade, "code", None),
-                "direction": (str(_direction).lower()
-                              if _direction is not None else None),
+                "id": broker_order_id,
+                "broker_order_id": broker_order_id,
+                "status_id": _get(status, "id"),
+                "ordno": _get(broker_order, "ordno"),
+                "seqno": _get(broker_order, "seqno"),
+                "code": _get(contract, "code"),
+                "direction": (str(_direction).lower() if _direction is not None else None),
                 "status": status_name,
-                "price": getattr(status, "price", None)
-                         or getattr(trade, "price", None),
-                "avg_price": getattr(status, "avg_price", None)
-                             or getattr(trade, "avg_price", None),
-                "quantity": getattr(status, "quantity", None)
-                            or getattr(trade, "quantity", None),
-                "filled_quantity": getattr(status, "filled_quantity", None)
-                                   or getattr(trade, "filled_quantity", None),
-                "ts": getattr(trade, "ts", None) or getattr(status, "ts", None),
-                "deals": [],
+                "broker_status": status_name,
+                "status_code": _get(status, "status_code"),
+                "price": _get(status, "price"),
+                "avg_price": _get(status, "avg_price"),
+                "quantity": requested_qty,
+                "requested_qty": requested_qty,
+                "filled_quantity": filled_qty,
+                "filled_qty": filled_qty,
+                "cancelled_qty": cancelled_qty,
+                "ts": _get(trade, "ts") if _get(trade, "ts") is not None else _get(status, "ts"),
+                "deals": deals,
+                "observation_type": observation_type,
+                "observed_at": observed_at or int(time.time() * 1000),
+                "snapshot_generation": snapshot_generation,
+                "source_status": status_name,
+                "normalization_result": "ACCEPTED",
+                "rejection_reason": None,
             }
-            deals = getattr(status, "deals", None) or getattr(trade, "deals", None) or []
-            for deal in deals if isinstance(deals, (list, tuple)) else []:
-                if isinstance(deal, dict):
-                    out_deal = dict(deal)
-                else:
-                    out_deal = {
-                        key: getattr(deal, key, None)
-                        for key in ("deal_id", "trade_id", "fill_id",
-                                    "exchange_fill_id", "exchange_seq",
-                                    "price", "avg_price", "quantity", "qty",
-                                    "ordno")
-                    }
-                row["deals"].append(out_deal)
             out.append(row)
         return out
+
+    def _refresh_futures_trade_view(self, api, account):
+        """Run one bounded, single-flight update_status -> list_trades pair.
+
+        A timeout does not cancel the SDK call; the worker owns the lock until
+        it exits, so a later refresh cannot overlap it.  The caller receives
+        no rows unless both calls completed successfully.
+        """
+        lock = getattr(self, "_broker_refresh_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._broker_refresh_lock = lock
+        if api is None or account is None or getattr(api, "is_connected", True) is False:
+            result = {"state": "REFRESH_SKIPPED_DISCONNECTED", "rows": [],
+                      "snapshot_generation": None, "elapsed_ms": 0,
+                      "trades_count": 0}
+            self._record_refresh_telemetry(result)
+            return result
+        if not lock.acquire(blocking=False):
+            result = {"state": "REFRESH_SKIPPED_INFLIGHT", "rows": [],
+                      "snapshot_generation": None, "elapsed_ms": 0,
+                      "trades_count": 0}
+            self._record_refresh_telemetry(result)
+            return result
+        done = threading.Event()
+        box = {}
+        started = time.monotonic()
+        generation = None
+
+        def _worker():
+            try:
+                try:
+                    api.update_status(account=account)
+                except TypeError:
+                    api.update_status(account)
+                try:
+                    rows = api.list_trades()
+                except TypeError:
+                    try:
+                        rows = api.list_trades(account=account)
+                    except TypeError:
+                        rows = api.list_trades(account)
+                if rows is None:
+                    raise RuntimeError("list_trades returned None")
+                box["rows"] = list(rows)
+                box["state"] = "REFRESH_SUCCEEDED"
+            except Exception as exc:
+                box["state"] = "REFRESH_EXCEPTION"
+                box["error"] = type(exc).__name__
+            finally:
+                done.set()
+                lock.release()
+
+        self._record_refresh_telemetry({"state": "REFRESH_STARTED",
+                                        "elapsed_ms": 0,
+                                        "trades_count": 0})
+        threading.Thread(target=_worker, daemon=True).start()
+        timeout = float(getattr(self, "_futures_refresh_timeout_s", 3.0) or 3.0)
+        if not done.wait(timeout=max(0.1, timeout)):
+            result = {"state": "REFRESH_TIMEOUT", "rows": [],
+                      "snapshot_generation": None,
+                      "elapsed_ms": int((time.monotonic() - started) * 1000),
+                      "trades_count": 0}
+            self._record_refresh_telemetry(result)
+            return result
+        elapsed = int((time.monotonic() - started) * 1000)
+        if box.get("state") != "REFRESH_SUCCEEDED":
+            result = {"state": "REFRESH_EXCEPTION", "rows": [],
+                      "snapshot_generation": None, "elapsed_ms": elapsed,
+                      "trades_count": 0, "error": box.get("error")}
+            self._record_refresh_telemetry(result)
+            return result
+        self._futures_refresh_generation = int(
+            getattr(self, "_futures_refresh_generation", 0) or 0) + 1
+        generation = f"futures-{self._futures_refresh_generation}"
+        rows = box.get("rows") or []
+        _status_distribution = {}
+        for _row in rows:
+            _status = getattr(getattr(_row, "status", None), "status", None)
+            if _status is None:
+                _status = getattr(_row, "status", None)
+            _name = getattr(_status, "name", None) or getattr(
+                _status, "value", None) or str(_status or "UNKNOWN")
+            _name = str(_name).split(".")[-1]
+            _status_distribution[_name] = _status_distribution.get(_name, 0) + 1
+        result = {"state": "REFRESH_SUCCEEDED", "rows": rows,
+                  "snapshot_generation": generation, "elapsed_ms": elapsed,
+                  "trades_count": len(rows),
+                  "observed_at": int(time.time() * 1000),
+                  "status_distribution": _status_distribution,
+                  "raw_count": len(rows), "normalized_count": len(rows),
+                  "rejected_count": 0, "rejection_reasons": {}}
+        self._record_refresh_telemetry(result)
+        self._last_futures_refresh = dict(result, rows=None)
+        return result
+
+    def _record_refresh_telemetry(self, result):
+        self._last_futures_refresh = dict(result, rows=None)
+        try:
+            self._append_mts_event(result.get("state", "REFRESH_EXCEPTION"),
+                                   snapshot_generation=result.get("snapshot_generation"),
+                                   account_type="futures",
+                                   elapsed_ms=result.get("elapsed_ms", 0),
+                                   trades_count=result.get("trades_count", 0),
+                                   status_distribution=result.get(
+                                       "status_distribution", {}),
+                                   raw_count=result.get("raw_count", 0),
+                                   normalized_count=result.get(
+                                       "normalized_count", 0),
+                                   rejected_count=result.get(
+                                       "rejected_count", 0),
+                                   rejection_reasons=result.get(
+                                       "rejection_reasons", {}),
+                                   error=result.get("error"))
+        except Exception:
+            pass
 
     @staticmethod
     def _normalize_order_deal_records(raw_records) -> list:
@@ -4840,13 +4984,32 @@ class FuturesMonitor:
                         self._normalize_snapshot_positions(_rows, _tag))
             else:
                 errors["capture"] = "api has no list_positions"
-            # open orders: list_trades, drop terminal states
+            # open orders: futures uses one transactional refresh.  Do not
+            # call list_trades once per account: the no-arg Shioaji stream is
+            # account-wide and doing so duplicated PendingSubmit rows.
             if hasattr(_api, "list_trades"):
                 for _tag, _acct in (("stock", getattr(_api, "stock_account",
                                                       None)),
                                     ("futures", getattr(
                                         _api, "futopt_account", None))):
                     if _acct is None:
+                        continue
+                    if _tag == "futures":
+                        _refresh = self._refresh_futures_trade_view(_api, _acct)
+                        _rows = _refresh.get("rows") or []
+                        if _refresh.get("state") == "REFRESH_SUCCEEDED":
+                            _generation = _refresh.get("snapshot_generation")
+                            _observed_at = _refresh.get("observed_at")
+                            open_orders.extend(
+                                self._normalize_snapshot_orders(_rows))
+                            broker_trades.extend(
+                                self._normalize_snapshot_trades(
+                                    _rows,
+                                    observation_type="REFRESHED_TRADE",
+                                    snapshot_generation=_generation,
+                                    observed_at=_observed_at))
+                        else:
+                            errors["refresh:futures"] = _refresh.get("state")
                         continue
                     try:
                         try:
@@ -4866,7 +5029,8 @@ class FuturesMonitor:
                             f"{type(exc).__name__}: {exc}"
                         _rows = []
                     open_orders.extend(self._normalize_snapshot_orders(_rows))
-                    broker_trades.extend(self._normalize_snapshot_trades(_rows))
+                    broker_trades.extend(self._normalize_snapshot_trades(
+                        _rows, observation_type="REFRESHED_TRADE"))
             else:
                 errors["capture"] = "api has no list_trades"
             # Historical terminal receipts are separate from list_trades.
@@ -4881,13 +5045,36 @@ class FuturesMonitor:
                             account=_futopt_acct)
                     except TypeError:
                         _deal_rows = _api.order_deal_records()
-                    broker_trades.extend(
-                        self._normalize_order_deal_records(_deal_rows))
+                    _deal_rows_normalized = self._normalize_order_deal_records(
+                        _deal_rows)
+                    for _row in _deal_rows_normalized:
+                        if isinstance(_row, dict):
+                            _row.update({
+                                "observation_type": "ORDER_DEAL_RECORD",
+                                "observed_at": int(time.time() * 1000),
+                                "snapshot_generation": getattr(
+                                    self, "_futures_refresh_generation", None),
+                                "source_status": _row.get("status"),
+                                "normalization_result": "ACCEPTED",
+                                "rejection_reason": None,
+                            })
+                    broker_trades.extend(_deal_rows_normalized)
                     # FORDER rows: nested ORDER status receipts (terminal
                     # order state + optional deals) — reconciled beside
                     # FDEAL fill receipts (P0-B, no callback-only).
-                    broker_trades.extend(
-                        self._normalize_order_state_records(_deal_rows))
+                    _state_rows = self._normalize_order_state_records(_deal_rows)
+                    for _row in _state_rows:
+                        if isinstance(_row, dict):
+                            _row.update({
+                                "observation_type": "ORDER_DEAL_RECORD",
+                                "observed_at": int(time.time() * 1000),
+                                "snapshot_generation": getattr(
+                                    self, "_futures_refresh_generation", None),
+                                "source_status": _row.get("status"),
+                                "normalization_result": "ACCEPTED",
+                                "rejection_reason": None,
+                            })
+                    broker_trades.extend(_state_rows)
                 except Exception as exc:
                     errors["order_deal_records"] = (
                         f"{type(exc).__name__}: {exc}")
@@ -4930,6 +5117,12 @@ class FuturesMonitor:
             "account_identity_hash": acct_hash,
             "session_id": session_id,
             "captured_at": captured_at,
+            "snapshot_generation": (
+                (getattr(self, "_last_futures_refresh", None) or {}).get(
+                    "snapshot_generation")),
+            "refresh_state": (
+                (getattr(self, "_last_futures_refresh", None) or {}).get(
+                    "state")),
             "positions": positions,
             "open_orders": open_orders,
             "position_covered_orders": covered,
@@ -7233,6 +7426,38 @@ class FuturesMonitor:
         if not (is_futures_deal or is_futures_order):
             return
 
+        # Keep callback provenance separate from refreshed Trade evidence;
+        # this is intentionally metadata-only and never drives matching.
+        _callback_observation = "FDEAL_CALLBACK" if is_futures_deal else "FORDER_CALLBACK"
+        _count_attr = ("_fdeal_callback_count" if is_futures_deal
+                       else "_forder_callback_count")
+        setattr(self, _count_attr, getattr(self, _count_attr, 0) + 1)
+        _callback_at = int(time.time() * 1000)
+        setattr(self, ("_last_fdeal_callback_at" if is_futures_deal
+                       else "_last_order_callback_at"), _callback_at)
+        try:
+            self._append_mts_event(
+                _callback_observation,
+                observation_type=_callback_observation,
+                observed_at=int(time.time() * 1000),
+                snapshot_generation=(
+                    (getattr(self, "_last_futures_refresh", None) or {}).get(
+                        "snapshot_generation")),
+                source_status=state_name or state_value,
+                normalization_result="RECEIVED",
+                rejection_reason=None,
+                forder_count=getattr(self, "_forder_callback_count", 0),
+                fdeal_count=getattr(self, "_fdeal_callback_count", 0),
+                callback_exception_count=getattr(
+                    self, "_callback_exception_count", 0),
+                last_order_callback_at=getattr(
+                    self, "_last_order_callback_at", None),
+                last_fdeal_callback_at=getattr(
+                    self, "_last_fdeal_callback_at", None),
+            )
+        except Exception:
+            pass
+
         broker_order_id = (payload.get("id") or payload.get("broker_order_id")
                            or payload.get("order_id"))
         ordno = payload.get("ordno")
@@ -7246,6 +7471,14 @@ class FuturesMonitor:
             except (TypeError, ValueError):
                 return
             if fill_price <= 0 or fill_qty <= 0:
+                try:
+                    self._append_mts_event(
+                        "FDEAL_CALLBACK_REJECTED",
+                        observation_type="FDEAL_CALLBACK",
+                        normalization_result="REJECTED",
+                        rejection_reason="INVALID_PRICE_OR_QUANTITY")
+                except Exception:
+                    pass
                 return
             _deal_id = payload.get("trade_id") or payload.get("deal_id")
             if not (broker_order_id or _deal_id or seqno):
@@ -7275,6 +7508,7 @@ class FuturesMonitor:
                 ordno=ordno,
                 source="shioaji_callback",
                 reason=reason,
+                observation_type="FDEAL_CALLBACK",
             )
             if order is not None:
                 self._leg_lock_apply_order_event(
