@@ -15,7 +15,7 @@ def test_live_broker_flat_snapshot_is_explicit_flat_authority(monkeypatch, tmp_p
         def list_positions(self, account):
             return []
 
-        def list_trades(self, account):
+        def list_trades(self, account=None):
             return []
 
         def margin(self, account):
