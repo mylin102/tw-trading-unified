@@ -1,5 +1,6 @@
 # 2026-08-14 Antigravity AI: Task 14 RED — Option A Certified Config-Change & Re-Freeze Flow Test Suite
 import os
+import hashlib
 import sys
 import subprocess as sp
 import tempfile
@@ -161,3 +162,52 @@ def test_refreeze_verify_mode_reports_verify_only_and_detects_drift(tmp_path):
     )
     assert r_ver.returncode == 0
     assert "phase=VERIFY_ONLY" in r_ver.stdout
+
+
+def test_refreeze_runtime_metadata_backup_is_atomic_and_bound(tmp_path):
+    """The promotion freeze binds runtime evidence and preserves the prior
+    manifest outside the source tree using the durable atomic writer."""
+    repo = _init_repo(tmp_path)
+    manifest = repo / "PHASE1_FINAL_FREEZE.md"
+    exclude = ["PHASE1_FINAL_FREEZE.md"]
+    initial_hash = _exclude_self_tree_hash(str(repo), "HEAD", exclude)
+    manifest.write_text(f"frozen_tree_hash: {initial_hash}\n", encoding="utf-8")
+    sp.run(["git", "-C", str(repo), "add", "."], check=True)
+    sp.run(["git", "-C", str(repo), "commit", "-qm", "manifest"], check=True)
+
+    runtime = tmp_path / "runtime"
+    diag = runtime / "exports/trades/live/diagnostics"
+    diag.mkdir(parents=True)
+    (runtime / "execution_context.json").write_text(
+        '{"effective_mode":"live_quarantined","live_order_allowed":false,'
+        '"session_id":"sess-1"}', encoding="utf-8")
+    (diag / "broker_snapshot_canonical.json").write_text(
+        '{"source":"live_broker","mode":"live","session_id":"sess-1",'
+        '"snapshot_generation":"gen-7","captured_at":1780000000000,'
+        '"fetch_status":{"capture":"OK"},"positions":[],"open_orders":[]}',
+        encoding="utf-8")
+    (diag / "mts_leg_locks.json").write_text(
+        '{"a":{"status":"RETIRED_UNRESOLVED"}}', encoding="utf-8")
+    backup_dir = tmp_path / "backup"
+    script = Path(__file__).resolve().parents[2] / "scripts/deployment/re_freeze.py"
+    r = sp.run(
+        [sys.executable, "-B", str(script), "--release-dir", str(repo),
+         "--expected-sha", _head_sha(repo), "--manifest", str(manifest),
+         "--runtime-dir", str(runtime), "--pid", str(os.getpid()),
+         "--callback-registration-generation", "1", "--ttl-seconds", "600",
+         "--backup-dir", str(backup_dir)],
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    backups = list(backup_dir.glob("*.bak"))
+    assert len(backups) == 1
+    prior = backups[0].read_bytes()
+    assert hashlib.sha256(prior).hexdigest() in r.stdout
+    assert backups[0].with_suffix(backups[0].suffix + ".sha256").exists()
+    body = manifest.read_text(encoding="utf-8")
+    assert "frozen_tree_hash:" in body
+    assert "RUNTIME_CERTIFICATION_METADATA" in body
+    assert '"candidate_head"' in body
+    assert '"refresh_generation": "gen-7"' in body
+    assert '"active_orders": 0' in body
+    assert '"retired_unresolved": 1' in body
+    assert not list(repo.glob(".PHASE1_FINAL_FREEZE.md.*"))
