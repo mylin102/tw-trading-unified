@@ -25,8 +25,7 @@ def test_broker_snapshot_terminal_trade_backfills_local_order():
             "id": "BRK-NEAR",
             "ordno": "BRK-NEAR",
             "status": "Filled",
-            "price": 46411.0,
-            "quantity": 1,
+            "filled_qty": 1,
             "deals": [],
         }],
         source="live_broker_reconcile",
@@ -36,7 +35,8 @@ def test_broker_snapshot_terminal_trade_backfills_local_order():
     assert result["reconciled"]
     assert order.status is OrderStatus.FILLED
     assert order.filled_quantity == 1
-    assert order.avg_fill_price == 46411.0
+    assert order.avg_fill_price is None
+    assert order.fill_accounting_status == "DETAILS_PENDING"
     assert order in manager.get_completed()
 
 
