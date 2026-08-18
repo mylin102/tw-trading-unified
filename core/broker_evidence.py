@@ -31,6 +31,13 @@ from typing import Any
 TERMINAL_TRADE_STATUSES = frozenset({"Filled", "Cancelled", "Expired", "Done"})
 
 
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    """Read a Shioaji field from either an object or a dict."""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
 def normalize_trade_status(trade: Any) -> str:
     """Canonical leaf status name from a Shioaji-like trade.
 
@@ -38,13 +45,13 @@ def normalize_trade_status(trade: Any) -> str:
     (name/value) and qualified enum names (``X.Y.Status`` -> ``Status``).
     Missing status -> "" (never terminal).
     """
-    status = getattr(trade, "status", None)
-    nested = getattr(status, "status", None)
+    status = _field(trade, "status")
+    nested = _field(status, "status")
     raw = nested if nested is not None else status
     if isinstance(raw, dict):
         raw = raw.get("status", "")
-    name = (getattr(raw, "name", None)
-            or getattr(raw, "value", None)
+    name = (_field(raw, "name")
+            or _field(raw, "value")
             or str(raw or ""))
     return str(name).split(".")[-1]
 
@@ -65,15 +72,14 @@ def trade_identity(trade: Any) -> tuple[str, str, str, str] | None:
     collapsed against another identity-less row (fail-closed; distinct
     orders without identity must all survive).
     """
-    order = getattr(trade, "order", None)
-    ordno = (getattr(trade, "ordno", None)
-             or getattr(order, "ordno", None))
-    id_ = (getattr(trade, "id", None)
-           or getattr(order, "id", None))
-    broker_id = (getattr(trade, "broker_order_id", None)
-                 or getattr(order, "id", None))
-    seqno = (getattr(trade, "seqno", None)
-             or getattr(order, "seqno", None))
+    order = _field(trade, "order")
+    status = _field(trade, "status")
+    ordno = (_field(trade, "ordno") or _field(order, "ordno"))
+    id_ = (_field(trade, "id") or _field(order, "id")
+           or _field(status, "id"))
+    broker_id = (_field(trade, "broker_order_id")
+                 or _field(order, "id") or _field(status, "id"))
+    seqno = (_field(trade, "seqno") or _field(order, "seqno"))
     if ordno is None and id_ is None and broker_id is None and seqno is None:
         return None
     return (str(ordno or ""), str(id_ or ""),
@@ -108,23 +114,35 @@ def normalize_trade_row(trade: Any) -> dict[str, Any]:
     ``identity_missing: True`` (typed disposition — fail-closed, never
     silently treated as a known order).
     """
-    order = getattr(trade, "order", None)
+    order = _field(trade, "order")
+    status = _field(trade, "status")
+    contract = _field(trade, "contract") or _field(order, "contract")
+    broker_id = (_field(trade, "broker_order_id")
+                 or _field(order, "id") or _field(status, "id"))
+    ordno = _field(trade, "ordno") or _field(order, "ordno")
+    seqno = _field(trade, "seqno") or _field(order, "seqno")
+    requested_qty = (_field(order, "quantity")
+                     if _field(order, "quantity") is not None
+                     else _field(status, "order_quantity"))
+    filled_qty = _field(status, "deal_quantity")
+    cancelled_qty = _field(status, "cancel_quantity")
+    deals = _field(status, "deals")
     return {
-        "id": getattr(trade, "id", None)
-              or getattr(trade, "broker_order_id", None)
-              or getattr(trade, "exchange_order_id", None)
-              or getattr(order, "id", None),
-        "broker_order_id": getattr(trade, "broker_order_id", None)
-                           or getattr(trade, "id", None)
-                           or getattr(order, "id", None),
-        "ordno": getattr(trade, "ordno", None)
-                 or getattr(order, "ordno", None),
-        "seqno": getattr(trade, "seqno", None)
-                 or getattr(order, "seqno", None),
-        "code": getattr(trade, "code", None)
-                or getattr(getattr(order, "contract", None), "code", None),
+        "id": _field(trade, "id") or broker_id,
+        "broker_order_id": broker_id,
+        "status_id": _field(status, "id"),
+        "ordno": ordno,
+        "seqno": seqno,
+        "code": _field(contract, "code") or _field(trade, "code"),
         "status": normalize_trade_status(trade),
-        "quantity": getattr(trade, "quantity", None),
+        "broker_status": normalize_trade_status(trade),
+        "status_code": _field(status, "status_code"),
+        "quantity": requested_qty,
+        "requested_qty": requested_qty,
+        "filled_quantity": filled_qty,
+        "filled_qty": filled_qty,
+        "cancelled_qty": cancelled_qty,
+        "deals": list(deals) if isinstance(deals, (list, tuple)) else deals,
         "identity_missing": trade_identity(trade) is None,
     }
 
