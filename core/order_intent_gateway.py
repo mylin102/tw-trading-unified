@@ -204,11 +204,19 @@ class OrderIntentGateway:
             # snapshot-bound remaining-leg exit (per-order proof from
             # the monitor's fresh broker-truth recheck) may submit.
             _qproof = authority.get("quarantine_exit_proof")
+            _close_side = ("SELL" if _qproof.get("side") == "LONG"
+                           else "BUY") if isinstance(_qproof, dict) else None
+            # order-spec coherence: the bound order closes the remaining
+            # leg (order_symbol == contract, closing side, qty match).
             if (isinstance(_qproof, dict)
                     and sname in ("MTS_RELEASE", "MTS_EXIT")
                     and _qproof.get("strategy") == sname
                     and _qproof.get("contract") and _qproof.get("side")
-                    and _qproof.get("snapshot_hash")):
+                    and _qproof.get("snapshot_hash")
+                    and _qproof.get("order_symbol") == _qproof.get("contract")
+                    and str(_qproof.get("order_side") or "").lower()
+                        == str(_close_side or "").lower()
+                    and _qproof.get("order_qty") == _qproof.get("qty")):
                 return True, _qproof, None
             return False, None, "LIVE_ORDER_AUTHORIZATION_FAILED"
         if mode not in ("live_ready", "reconciled_exit_only"):

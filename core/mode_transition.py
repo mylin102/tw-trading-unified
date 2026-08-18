@@ -201,12 +201,23 @@ class ExecutionContext:
         if self.effective_mode == ModeTransitionState.LIVE_QUARANTINED.value:
             _qproof = getattr(order, "quarantine_exit_proof", None)
             _ostrategy = getattr(order, "strategy", "") or ""
+            _osymbol = getattr(order, "symbol", "") or ""
+            _oside = getattr(getattr(order, "side", None), "value",
+                             getattr(order, "side", None))
+            _oqty = getattr(order, "quantity", None)
+            # The proof binds THIS order: symbol/side/qty must match the
+            # remaining-leg closing order spec (2026-08-18 review).
             if (method == "place_order"
                     and isinstance(_qproof, dict)
                     and _ostrategy in ("MTS_RELEASE", "MTS_EXIT")
                     and _qproof.get("strategy") == _ostrategy
                     and _qproof.get("contract") and _qproof.get("side")
-                    and _qproof.get("snapshot_hash")):
+                    and _qproof.get("snapshot_hash")
+                    and _qproof.get("order_symbol") == _osymbol
+                    and str(_qproof.get("order_side") or "").lower()
+                        == str(_oside or "").lower()
+                    and isinstance(_oqty, int) and not isinstance(_oqty, bool)
+                    and _oqty == _qproof.get("order_qty")):
                 return
         # [EXIT_ONLY flow removed 2026-08-14] the operator attestation /
         # RECONCILED_EXIT_ONLY flow no longer exists as an execution

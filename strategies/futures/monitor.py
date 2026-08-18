@@ -3415,11 +3415,30 @@ class FuturesMonitor:
         _recovery_oid = getattr(strategy, "_broker_recovery_order_id", None)
         if not _hash or not _recovery_oid:
             return None
+        # ── order binding (2026-08-18 review): the proof authorizes ONLY
+        # the remaining-leg closing order.  A RELEASE_* order targets the
+        # RELEASED contract (already gone at the broker) → never bound.
+        _action_u = str(action or "").upper()
+        if "RELEASE_NEAR" in _action_u:
+            _order_code = _near_code
+        elif "RELEASE_FAR" in _action_u:
+            _order_code = _far_code
+        elif _action_u == "EXIT":
+            _order_code = _remaining_code
+        else:
+            return None
+        if _order_code != _remaining_code:
+            return None  # released-leg order — zero submit
+        _order_side = "SELL" if _side == "LONG" else "BUY"
+        _order_qty = _row.get("quantity")
         return {
             "strategy": sname,
             "contract": _code,
             "side": _side,
-            "qty": _row.get("quantity"),
+            "qty": _order_qty,
+            "order_symbol": _order_code,
+            "order_side": _order_side,
+            "order_qty": _order_qty,
             "snapshot_hash": _hash,
             "recovery_order_id": _recovery_oid,
             "session": getattr(strategy, "_position_session_type", None),
@@ -5759,8 +5778,14 @@ class FuturesMonitor:
                               if _code == str(getattr(self.contract, "code", ""))
                               else str(getattr(self.contract, "code", "")))
             _release_ids = self._mts_release_order_identities(_released_code)
-            if (len(_release_ids) == 1 and _snap_session
-                    and _snap_session == _ctx_session):
+            # ── idempotence (2026-08-18 review): an already-reconciled
+            # strategy keeps its PENDING/READY status + anchor/extrema;
+            # repeated 5s-cadence refreshes never re-run the inference.
+            _already_reconciled = (
+                getattr(strategy, "_broker_recovery_source", None)
+                == "broker_reconciliation")
+            if (not _already_reconciled and len(_release_ids) == 1
+                    and _snap_session and _snap_session == _ctx_session):
                 _rel_str = ("near" if _code
                             == str(getattr(self.far_contract, "code", ""))
                             else "far")
@@ -8555,9 +8580,12 @@ class FuturesMonitor:
         # pre-submit fresh broker-truth recheck 生成 per-order proof;
         # entry/manual/OCO 沒有 proof → 維持 blocked。
         _q_proof = None
+        _is_combined = (_action == "EXIT"
+                        and "COMBINED_EXIT" in str(_reason).upper())
         if (getattr(getattr(self, "_execution_context", None),
                     "effective_mode", "") == "live_quarantined"
-                and _gw_intent_strategy in ("MTS_RELEASE", "MTS_EXIT")):
+                and _gw_intent_strategy in ("MTS_RELEASE", "MTS_EXIT")
+                and not _is_combined):
             _q_proof = self._mts_quarantine_exit_proof(
                 strategy, _gw_intent_strategy, _action)
         _gw_ok, _gw_binding, _gw_reason = self._authorize_intent(
