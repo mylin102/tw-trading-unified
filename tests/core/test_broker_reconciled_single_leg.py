@@ -348,6 +348,84 @@ def test_reconciled_refresh_idempotent_keeps_baseline(tmp_path):
     assert s._position_session_type == "day"
 
 
+def test_reconciled_baseline_fails_closed_on_untagged_bar(tmp_path):
+    """Guard: a bar WITHOUT the session tag keeps the gate fail-closed
+    (SESSION_UNKNOWN) — the injection lives in the monitor, never in the
+    strategy."""
+    s, config = _setup_armed(tmp_path, confirm_ticks=0)
+    _qualified_monitor(tmp_path, s)
+    assert s._trail_anchor_status == TrailAnchorStatus.PENDING_REANCHOR
+    bar = {"near_close": 45600.0, "far_close": 45900.0,
+           "near_high": 45650.0, "near_low": 45550.0,
+           "far_high": 45950.0, "far_low": 45850.0,
+           "far_bid": 45890.0, "far_ask": 45930.0,
+           "far_tick_age_ms": 5.0, "near_tick_age_ms": 5.0,
+           "spread_z": 0.0}  # production shape — NO session_type
+    ctx = StrategyContext(
+        market=MarketData(last_bar=bar, ticker="TMF"),
+        position=PositionView(size=1), config=config)
+    with patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        with patch("strategies.plugins.futures.active.tmf_spread._append_event"):
+            s.on_bar(ctx)
+    assert s._trail_anchor_status == TrailAnchorStatus.PENDING_REANCHOR
+    assert s._single_leg_anchor_price == 0.0
+
+
+def test_reconciled_baseline_establishes_with_production_shape_bar(tmp_path):
+    """The live deadlock: production MTS bars never carry session_type, so
+    the gate failed SESSION_UNKNOWN on every bar.  Once the monitor tags
+    the bar at construction, the RESTART_BASELINE gate establishes the
+    anchor from the fresh remaining-leg BBO."""
+    s, config = _setup_armed(tmp_path, confirm_ticks=0)
+    m = _qualified_monitor(tmp_path, s)
+    assert s._trail_anchor_status == TrailAnchorStatus.PENDING_REANCHOR
+    bar = {"near_close": 45600.0, "far_close": 45900.0,
+           "near_high": 45650.0, "near_low": 45550.0,
+           "far_high": 45950.0, "far_low": 45850.0,
+           "far_bid": 45890.0, "far_ask": 45930.0,
+           "far_tick_age_ms": 5.0, "near_tick_age_ms": 5.0,
+           "spread_z": 0.0}  # production shape — NO session_type
+    m._mts_tag_bar_session(bar)  # the construction-point injection
+    assert bar["session_type"] == "day"
+    ctx = StrategyContext(
+        market=MarketData(last_bar=bar, ticker="TMF"),
+        position=PositionView(size=1), config=config)
+    with patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        with patch("strategies.plugins.futures.active.tmf_spread._append_event"):
+            s.on_bar(ctx)
+    assert s._trail_anchor_status == TrailAnchorStatus.READY
+    assert s._single_leg_anchor_price == pytest.approx(45910.0)
+    assert s._single_leg_peak == pytest.approx(45910.0)
+    assert s._trail_anchor_source == "RESTART_BASELINE_FRESH_BBO"
+
+
+def test_mts_bar_session_tag_injected_when_missing(tmp_path):
+    """Production MTS bars never carry session_type; the bar-construction
+    tag injects the monitor's trading session (the gate's input)."""
+    m = _monitor(tmp_path, session_type="day")
+    bar = {"near_close": 45600.0, "far_close": 45900.0}  # production shape
+    _out = m._mts_tag_bar_session(bar)
+    assert _out is bar  # in-place
+    assert _out["session_type"] == "day"
+
+
+def test_mts_bar_session_tag_preserves_explicit_value(tmp_path):
+    m = _monitor(tmp_path, session_type="day")
+    bar = {"near_close": 1.0, "session_type": "night"}
+    assert m._mts_tag_bar_session(bar)["session_type"] == "night"
+
+
+def test_mts_bar_session_tag_fails_closed_when_unknown(tmp_path):
+    """When the monitor session AND the clock-derived session are both
+    unknown, the key stays absent — the gate remains fail-closed."""
+    m = _monitor(tmp_path, session_type=None)
+    with patch("strategies.futures.monitor.get_taifex_futures_session_type",
+               return_value=None):
+        bar = {"near_close": 1.0}
+        _out = m._mts_tag_bar_session(bar)
+    assert "session_type" not in _out
+
+
 def test_reconciled_state_write_persists_anchor_and_identity(tmp_path):
     """The single-leg state write carries the baseline anchor/peak AND the
     broker-reconciliation identity (restart-safe persistence)."""
