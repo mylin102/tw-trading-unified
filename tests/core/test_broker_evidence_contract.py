@@ -203,6 +203,26 @@ def test_normalize_row_resolves_nested_identity():
     assert row["broker_order_id"] == "2353c7b0"  # from nested order.id
 
 
+def test_normalize_nested_trade_uses_order_and_status_fields():
+    trade = SimpleNamespace(
+        order=SimpleNamespace(id="OID-1", seqno="S-1", ordno="O-1",
+                              quantity=2),
+        status=SimpleNamespace(
+            id="SID-1", status="Filled", status_code="F",
+            order_quantity=2, deal_quantity=1, cancel_quantity=0,
+            deals=[]),
+        contract=SimpleNamespace(code="TMFI6"),
+    )
+    row = normalize_trade_row(trade)
+    assert row["broker_order_id"] == "OID-1"
+    assert row["seqno"] == "S-1" and row["ordno"] == "O-1"
+    assert row["code"] == "TMFI6"
+    assert row["requested_qty"] == 2
+    assert row["filled_qty"] == 1
+    assert row["cancelled_qty"] == 0
+    assert row["deals"] == []
+
+
 # ---------------------------------------------------------------------------
 # 5. PendingSubmit is never terminal
 # ---------------------------------------------------------------------------

@@ -26,9 +26,8 @@ class _FakeApiOrders:
         return []
 
     def list_trades(self, account=None):
-        if account is None:
-            # wrong-scope no-arg call: junk rows without identity
-            return [SimpleNamespace(status=SimpleNamespace(status="PendingSubmit"))]
+        # The current futures refresh contract calls update_status(account)
+        # followed by the SDK's no-argument list_trades() stream.
         return [SimpleNamespace(
             status=SimpleNamespace(status="PendingSubmit", status_code="P",
                                    order_quantity=1, deal_quantity=0,
