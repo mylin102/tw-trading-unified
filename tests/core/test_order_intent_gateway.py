@@ -13,7 +13,6 @@ paths blocked in EXIT_ONLY; exit-intent failed leg never SUBMITTED.
 """
 
 import time
-import os
 from pathlib import Path
 from types import SimpleNamespace
 
