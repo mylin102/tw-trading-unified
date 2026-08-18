@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from core.order_management.order import OrderSide, OrderStatus, OrderType
 from core.order_management.order_manager import OrderManager
 
@@ -91,7 +93,9 @@ def test_cancel_reject_expire_and_recovery_record_normalized_audit_rows():
     mgr = OrderManager(mode="paper")
 
     cancel_order = mgr.create_order("TMF", OrderSide.BUY, OrderType.MARKET, 1)
-    mgr.attach_submission(cancel_order.order_id, raw_status="Submitted")
+    mgr.attach_submission(cancel_order.order_id,
+                           broker_order_id="BROKER-CANCEL",
+                           raw_status="Submitted")
     mgr.cancel(cancel_order.order_id, reason="user_cancel", source="operator")
     cancel_event = _latest_event_of_type(cancel_order, "cancel")
     _assert_normalized_audit(
@@ -112,7 +116,9 @@ def test_cancel_reject_expire_and_recovery_record_normalized_audit_rows():
     )
 
     expire_order = mgr.create_order("TMF", OrderSide.BUY, OrderType.LIMIT, 1, price=36400)
-    mgr.attach_submission(expire_order.order_id, raw_status="Submitted")
+    mgr.attach_submission(expire_order.order_id,
+                           broker_order_id="BROKER-EXPIRE",
+                           raw_status="Submitted")
     mgr.expire(expire_order.order_id, source="session_close", reason="market_closed")
     expire_event = _latest_event_of_type(expire_order, "expire")
     _assert_normalized_audit(
@@ -147,3 +153,33 @@ def test_cancel_reject_expire_and_recovery_record_normalized_audit_rows():
         reason="recover_from_api",
         to_status=OrderStatus.SUBMITTED.value,
     )
+
+
+def test_attach_submission_persists_broker_identity():
+    mgr = OrderManager(mode="paper")
+    order = mgr.create_order("TMF", OrderSide.BUY, OrderType.MARKET, 1)
+
+    mgr.attach_submission(order.order_id, broker_order_id="BROKER-ID-1",
+                           ordno="ORDNO-ID-1", seqno="SEQ-ID-1",
+                           raw_status="Submitted", source="broker_submit")
+
+    assert order.status == OrderStatus.SUBMITTED
+    assert order.broker_order_id == "BROKER-ID-1"
+    assert order.ordno == "ORDNO-ID-1"
+    assert order.seqno == "SEQ-ID-1"
+    submission = _latest_event_of_type(order, "submission")
+    assert submission["broker_order_id"] == "BROKER-ID-1"
+    assert submission["seqno"] == "SEQ-ID-1"
+
+
+def test_attach_submission_without_identity_fails_closed():
+    mgr = OrderManager(mode="paper")
+    order = mgr.create_order("TMF", OrderSide.BUY, OrderType.MARKET, 1)
+
+    with pytest.raises(ValueError, match="broker submission receipt has no identity"):
+        mgr.attach_submission(order.order_id, raw_status="Submitted")
+
+    assert order.status == OrderStatus.PENDING_SUBMIT
+    assert order.broker_order_id is None
+    assert order.exchange_order_id is None
+    assert not [e for e in order.raw_events if e.get("type") == "submission"]

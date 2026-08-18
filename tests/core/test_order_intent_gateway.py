@@ -13,6 +13,9 @@ paths blocked in EXIT_ONLY; exit-intent failed leg never SUBMITTED.
 """
 
 import time
+import os
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +25,23 @@ from core.mode_transition import (
 )
 from core.order_management.order import OrderSide, OrderType
 from core.order_management.order_manager import OrderManager
+
+
+@pytest.fixture(autouse=True)
+def _isolated_runtime(tmp_path, monkeypatch, request):
+    """Give every gateway test a private durable runtime namespace.
+
+    The production lock/intent semantics stay enabled; only the test
+    namespace is injected before monitor/manager construction.
+    """
+    runtime = tmp_path / request.node.name
+    runtime.mkdir()
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("MTS_STATE_PATH", str(runtime / "mts_position_state.json"))
+    monkeypatch.setenv("MTS_FILL_LOG_PATH", str(runtime / "logs" / "mts_trade_fills.jsonl"))
+    monkeypatch.setenv("MTS_EVENT_LOG_PATH", str(runtime / "logs" / "mts_spread_events.jsonl"))
+    monkeypatch.setenv("LRC_RELEASE_SHA", "e" * 40)
+    return runtime
 
 
 def _capability():
@@ -126,23 +146,40 @@ class _FakeAdapter:
     def __init__(self, registry=None):
         self._gateway_registry = registry
         self.calls = []
-        from types import SimpleNamespace
         # [renewal] read-only snapshot surface for the pre-submit proof
-        self.futopt_account = SimpleNamespace()
-
-    def list_positions(self, acct=None):
-        from types import SimpleNamespace
-        return [
-            SimpleNamespace(code="TMFH6",
-                            direction=SimpleNamespace(name="Sell"),
+        self.futopt_account = SimpleNamespace(account_id="fake-futures")
+        self.snapshots_calls = []
+        self.update_status_calls = []
+        self.order_callback = None
+        self._trades = []
+        self._positions = [
+            SimpleNamespace(code="TMFH6", direction=SimpleNamespace(name="Sell"),
                             quantity=1, price=44909.0),
-            SimpleNamespace(code="TMFI6",
-                            direction=SimpleNamespace(name="Buy"),
+            SimpleNamespace(code="TMFI6", direction=SimpleNamespace(name="Buy"),
                             quantity=1, price=45052.0),
         ]
 
-    def list_trades(self, acct=None):
+    def list_positions(self, account=None, acct=None):
+        return list(self._positions)
+
+    def list_trades(self, account=None, acct=None):
+        return list(self._trades)
+
+    def update_status(self, account=None, trade=None, timeout=None):
+        self.update_status_calls.append({"account": account, "trade": trade,
+                                         "timeout": timeout})
+        return None
+
+    def snapshots(self, contracts):
+        self.snapshots_calls.append(list(contracts or []))
+        return [SimpleNamespace(close=44905.0) for _ in (contracts or [])]
+
+    def order_deal_records(self, account=None, **kwargs):
         return []
+
+    def set_order_callback(self, callback):
+        self.order_callback = callback
+        return None
 
     def place_order_object(self, order):
         reg = getattr(self, "_gateway_registry", None)
@@ -549,7 +586,7 @@ def _order(order_id, strategy, side=OrderSide.BUY, symbol="TMFH6",
 # ── E2E: through the monitor signal path ──────────────────────────────────
 
 def _monitor(ctx, adapter=None, mode="live", *, dry_run=False,
-             live_trading=True):
+             live_trading=True, lock_path=None):
     from types import SimpleNamespace
     from strategies.futures.monitor import FuturesMonitor
 
@@ -571,6 +608,11 @@ def _monitor(ctx, adapter=None, mode="live", *, dry_run=False,
     monitor.far_contract = SimpleNamespace(code="TMFI6")
     monitor.live_trading = live_trading
     monitor.dry_run = dry_run
+    runtime = Path(_os.environ["TRADING_RUNTIME_DIR"])
+    monitor._leg_lock_store = str(
+        lock_path or (runtime / f"mts_leg_locks_{id(monitor)}.json"))
+    monitor._reconcile_intent_store = str(
+        runtime / f"mts_reconcile_intents_{id(monitor)}.json")
     monitor._exit_only_position = None
     monitor._exit_only_decision_binding = None
     monitor._pending_lifecycle_orders = {}
@@ -600,6 +642,33 @@ def _monitor(ctx, adapter=None, mode="live", *, dry_run=False,
         mode=mode, broker_adapter=adapter, execution_context=ctx)
     monitor._gateway()  # init-equivalent: registry injected before any path
     return monitor, events
+
+
+def test_leg_lock_runtime_isolation_and_same_runtime_restart(tmp_path, monkeypatch):
+    """Different test runtimes do not leak locks; restart in X does."""
+    key = {
+        "trade_id": "same-trade", "session_generation": "sess",
+        "contract": "TMFH6", "closing_side": "BUY", "qty": 1,
+    }
+    runtime_a = tmp_path / "runtime-a"
+    runtime_b = tmp_path / "runtime-b"
+    lock_a = runtime_a / "mts_leg_locks.json"
+
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(runtime_a))
+    default_a, _ = _monitor(_live_ctx())
+    default_b, _ = _monitor(_live_ctx())
+    assert default_a._leg_lock_path() != default_b._leg_lock_path()
+
+    first, _ = _monitor(_live_ctx(), lock_path=str(lock_a))
+    assert first._leg_lock_acquire(key)
+
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(runtime_b))
+    isolated, _ = _monitor(_live_ctx(), lock_path=str(runtime_b / "mts_leg_locks.json"))
+    assert isolated._leg_lock_check(key) is False
+
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(runtime_a))
+    restarted, _ = _monitor(_live_ctx(), lock_path=str(lock_a))
+    assert restarted._leg_lock_check(key) is True
 
 
 def _bound_strategy(rid="recon-abc123", trade_id="mts-20260811-085503"):
