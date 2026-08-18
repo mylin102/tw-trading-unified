@@ -24,11 +24,11 @@ from strategies.futures.monitor import FuturesMonitor
 
 def _proof(strategy="MTS_RELEASE", contract="TMFI6", side="LONG",
            snapshot_hash="snap-hash-1", order_symbol="TMFI6",
-           order_side="SELL", order_qty=1):
+           order_side="SELL", order_qty=1, qty=1):
     """Remaining-leg closing-order proof: the bound order must be
     symbol=order_symbol, side=order_side (closing side), qty=order_qty."""
     return {"strategy": strategy, "contract": contract, "side": side,
-            "qty": 1, "order_symbol": order_symbol,
+            "qty": qty, "order_symbol": order_symbol,
             "order_side": order_side, "order_qty": order_qty,
             "snapshot_hash": snapshot_hash,
             "recovery_order_id": "ORD-1", "session": "day"}
@@ -106,6 +106,24 @@ def test_quarantined_ctx_blocks_order_proof_binding_mismatch():
             method="place_order")
 
 
+def test_quarantined_ctx_blocks_malformed_proof_values():
+    """Fail-closed on malformed direct proof values (handoff: ambiguity /
+    missing fields fail closed): side must be LONG/SHORT, qty and order_qty
+    positive int non-bool, order_side BUY/SELL.  The order itself is valid
+    (TMFI6 SELL 1) — only the malformed proof value triggers the block."""
+    ctx = _quarantined_ctx()
+    for bad in (_proof(strategy="MTS_EXIT", side="UNKNOWN"),
+                _proof(strategy="MTS_EXIT", qty=0),
+                _proof(strategy="MTS_EXIT", qty=True),
+                _proof(strategy="MTS_EXIT", order_qty=0),
+                _proof(strategy="MTS_EXIT", order_qty=True),
+                _proof(strategy="MTS_EXIT", order_side="HOLD")):
+        with pytest.raises(LiveOrderBlocked):
+            ctx.assert_order_allowed(
+                _order(strategy="MTS_EXIT", proof=bad),
+                method="place_order")
+
+
 def test_quarantined_proof_invalid_blocked():
     ctx = _quarantined_ctx()
     for bad in ({}, _proof(strategy="MTS_ENTRY"),
@@ -149,9 +167,28 @@ def test_gateway_quarantine_incoherent_order_spec_denied():
     remaining contract, order_side == the closing side of the position,
     order_qty == the position qty.  Otherwise the gateway denies."""
     gw = OrderIntentGateway()
-    for bad in (_proof(order_symbol="TMFH6"),
-                _proof(order_side="BUY"),
-                _proof(order_qty=2)):
+    for bad in (_proof(strategy="MTS_EXIT", order_symbol="TMFH6"),
+                _proof(strategy="MTS_EXIT", order_side="BUY"),
+                _proof(strategy="MTS_EXIT", order_qty=2)):
+        _ok, _binding, _reason = gw.authorize_intent(
+            action="EXIT", strategy="MTS_EXIT",
+            authority={"live": True, "mode": "live_quarantined",
+                       "quarantine_exit_proof": bad})
+        assert _ok is False
+        assert _reason == "LIVE_ORDER_AUTHORIZATION_FAILED"
+
+
+def test_gateway_quarantine_malformed_proof_values_denied():
+    """Fail-closed on malformed direct proof values at the S0 boundary:
+    side must be LONG/SHORT, qty/order_qty positive int non-bool,
+    order_side BUY/SELL (codex follow-up audit)."""
+    gw = OrderIntentGateway()
+    for bad in (_proof(strategy="MTS_EXIT", side="UNKNOWN"),
+                _proof(strategy="MTS_EXIT", qty=0),
+                _proof(strategy="MTS_EXIT", qty=True),
+                _proof(strategy="MTS_EXIT", order_qty=0),
+                _proof(strategy="MTS_EXIT", order_qty=True),
+                _proof(strategy="MTS_EXIT", order_side="HOLD")):
         _ok, _binding, _reason = gw.authorize_intent(
             action="EXIT", strategy="MTS_EXIT",
             authority={"live": True, "mode": "live_quarantined",
