@@ -3484,6 +3484,19 @@ def latest_entry_audit_line(events_path=None) -> str | None:
         return None
 
 
+def _live_canonical_position_allowed(ctx_live: dict, canon: dict) -> bool:
+    """[QUARANTINE_DISPLAY 2026-08-18] Display gate for the fresh canonical
+    futures position.  LIVE_READY or LIVE_QUARANTINED are both shown: in
+    quarantine the broker still holds the remaining leg — hiding it on the
+    dashboard hides real risk.  Session-id match + capture==OK required;
+    stale / missing / session-mismatch stays fail-closed (no position)."""
+    return (
+        ctx_live.get("effective_mode") in ("live_ready", "live_quarantined")
+        and canon.get("session_id") == ctx_live.get("session_id")
+        and (canon.get("fetch_status") or {}).get("capture") == "OK"
+    )
+
+
 def _build_live_broker_mts_state(positions: list, canonical: dict,
                                  params: dict | None = None) -> dict | None:
     """Build broker-authoritative MTS state, including a remaining leg."""
@@ -4576,9 +4589,7 @@ elif _selected_product == "TMF":
             _fut = [p for p in (_canon.get("positions") or [])
                     if p.get("account") == "futures" and p.get("code") in {"TMFH6", "TMFI6"}
                     and int(p.get("quantity", 0) or 0) > 0]
-            if (_ctx_live.get("effective_mode") == "live_ready"
-                    and _canon.get("session_id") == _ctx_live.get("session_id")
-                    and (_canon.get("fetch_status") or {}).get("capture") == "OK"):
+            if _live_canonical_position_allowed(_ctx_live, _canon):
                 _live_mts_params = (futures_cfg.get("mts", {}).get("params", {})
                                     if isinstance(futures_cfg, dict) else {})
                 _broker_mts_state = _build_live_broker_mts_state(
