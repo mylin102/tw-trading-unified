@@ -84,11 +84,15 @@ def test_refresh_is_update_then_list_and_publishes_generation():
         def list_trades(self): self.calls.append("list"); return [_Trade()]
 
     api = API()
-    result = _monitor_for_refresh(api)._refresh_futures_trade_view(
+    mon = _monitor_for_refresh(api)
+    events = []
+    mon._append_mts_event = lambda *a, **kw: events.append(a[0])
+    result = mon._refresh_futures_trade_view(
         api, api.futopt_account)
     assert result["state"] == "REFRESH_SUCCEEDED"
     assert api.calls == ["update", "list"]
     assert result["snapshot_generation"].startswith("futures-")
+    assert events == ["REFRESH_STARTED", "REFRESH_SUCCEEDED", "REFRESH_COMPLETED"]
 
 
 def test_refresh_failure_never_reads_or_publishes_old_trades():
