@@ -4984,9 +4984,16 @@ class FuturesMonitor:
             snapshot.get("positions") or [],
             captured_at=snapshot.get("captured_at"),
         )
+        try:
+            pending_changed = manager.reconcile_pending_terminal(
+                snapshot, source="live_broker_reconcile",
+                reason="callback_gap_snapshot_terminal")
+        except Exception:
+            pending_changed = []
         changed = sum(1 for item in reconciled
                       if item.get("fills_added") or item.get("action") == "reconciled")
         changed += len(position_result.get("reconciled") or [])
+        changed += len(pending_changed)
         if changed and hasattr(self, "_save_orders_file_wrapper"):
             self._save_orders_file_wrapper()
         # P0-B: broker-confirmed MTS release fills must close the

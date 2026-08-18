@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, field
 
 from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
+from core.order_lifecycle_reconciler import reconcile_order
 
 
 # Only stable, operator-safe codes produced by the live submission adapter may
@@ -1525,6 +1526,49 @@ class OrderManager:
             "created": created,
             "status": order.status.value,
         }
+
+
+    def reconcile_pending_terminal(
+        self, snapshot: dict, *, source: str = "", reason: str = ""
+    ) -> List[Dict[str, Any]]:
+        """Apply broker terminal inference to local pending orders.
+
+        Wires core.order_lifecycle_reconciler.reconcile_order into the
+        periodic snapshot reconcile: an order the broker shows NEITHER as
+        an open order NOR backed by a position is a phantom pending —
+        mark BROKER_NOT_FOUND (terminal, audit kept, never resubmit).
+        APPLY_TERMINAL decisions (explicit broker terminal state) map
+        onto the OrderStatus terminal members.  RETAIN /
+        RECONCILE_REQUIRED are left untouched — fail-closed.  Only
+        PENDING_SUBMIT orders are considered (mirrors
+        scripts/reconcile_pending_orders.py)."""
+        changed: List[Dict[str, Any]] = []
+        for order in list(self.active_orders.values()):
+            if order.status != OrderStatus.PENDING_SUBMIT:
+                continue
+            decision = reconcile_order(order, snapshot)
+            action = getattr(decision, "action", "")
+            if action == "MARK_TERMINAL":
+                order.status = OrderStatus.BROKER_NOT_FOUND
+                changed.append({"order_id": order.order_id,
+                                "action": "MARK_TERMINAL"})
+            elif action == "APPLY_TERMINAL":
+                terminal = {
+                    "FILLED": OrderStatus.FILLED,
+                    "CANCELLED": OrderStatus.CANCELLED,
+                    "REJECTED": OrderStatus.REJECTED,
+                    "EXPIRED": OrderStatus.EXPIRED,
+                }.get(getattr(decision, "state", ""))
+                if terminal is None:
+                    continue  # unknown terminal state — fail-closed
+                order.status = terminal
+                changed.append({"order_id": order.order_id,
+                                "action": "APPLY_TERMINAL"})
+            else:
+                continue  # RETAIN / RECONCILE_REQUIRED — fail-closed
+            del self.active_orders[order.order_id]
+            self.completed.append(order)
+        return changed
 
     def reconcile_broker_state(
         self,

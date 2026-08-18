@@ -22,6 +22,9 @@ class OrderStatus(Enum):
     CANCELLED = "cancelled"              # 已取消（終端狀態）
     REJECTED = "rejected"                # 退單/失敗（終端狀態）
     EXPIRED = "expired"                  # 過期未成交（終端狀態）
+    BROKER_NOT_FOUND = "BROKER_NOT_FOUND"  # 券商查無訂單與持倉
+        # （phantom pending 終端狀態 — broker 證據證明訂單與持倉皆
+        # 不存在；永不重送、永不視為成交，紀錄保留供稽核）
 
 
 class OrderType(Enum):
