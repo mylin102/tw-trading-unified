@@ -281,6 +281,7 @@ class Order:
             OrderStatus.CANCELLED,
             OrderStatus.REJECTED,
             OrderStatus.EXPIRED,
+            OrderStatus.BROKER_NOT_FOUND,
         )
         
     def get_remaining_quantity(self) -> int:
