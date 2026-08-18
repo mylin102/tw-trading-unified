@@ -37,7 +37,7 @@ def test_live_legacy_fills_are_not_rendered_as_realized_metrics(tmp_path):
 def test_live_dashboard_cannot_fall_back_to_legacy_position_state():
     source = Path(__file__).parents[2] / "ui" / "dashboard.py"
     text = source.read_text(encoding="utf-8")
-    assert "_mts_state_file = (None if (_exit_only_dashboard or _live_runtime)" in text
+    assert '_mts_state_file = None if _live_runtime else "/tmp/mts_position_state.json"' in text
     assert "_broker_snapshot_flat = True" in text
 
 

@@ -57,3 +57,14 @@ def test_no_policy_j_banner_for_single_leg_display():
     source = Path(__file__).parents[2] / "ui" / "dashboard.py"
     text = source.read_text(encoding="utf-8")
     assert '_is_both_held = (_release_state == "BOTH_HELD")' in text
+
+
+def test_live_canonical_block_present_in_worktree():
+    """GREEN collection guard: the live canonical display block (helper +
+    gate + live-runtime /tmp guard) must exist in the working tree — a
+    sibling refactor once deleted it, breaking collection."""
+    source = Path(__file__).parents[2] / "ui" / "dashboard.py"
+    text = source.read_text(encoding="utf-8")
+    assert "_live_canonical_position_allowed(_ctx_live, _canon)" in text
+    assert '_mts_state_file = None if _live_runtime else "/tmp/mts_position_state.json"' in text
+    assert "broker_snapshot_canonical.json" in text
