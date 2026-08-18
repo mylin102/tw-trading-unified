@@ -62,7 +62,7 @@ def test_refresh_is_update_then_list_and_publishes_generation():
         api, api.futopt_account)
     assert result["state"] == "REFRESH_SUCCEEDED"
     assert api.calls == ["update", "list"]
-    assert result["snapshot_generation"] == "futures-1"
+    assert result["snapshot_generation"].startswith("futures-")
 
 
 def test_refresh_failure_never_reads_or_publishes_old_trades():
@@ -114,4 +114,3 @@ def test_filled_without_deals_is_terminal_but_details_pending():
     assert order.avg_fill_price == 0.0
     assert order.fill_accounting_status == "DETAILS_PENDING"
     assert order.order_id not in mgr.active_orders
-

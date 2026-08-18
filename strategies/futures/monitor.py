@@ -4723,7 +4723,7 @@ class FuturesMonitor:
             return result
         self._futures_refresh_generation = int(
             getattr(self, "_futures_refresh_generation", 0) or 0) + 1
-        generation = f"futures-{self._futures_refresh_generation}"
+        generation = f"futures-{time.time_ns()}-{self._futures_refresh_generation}"
         rows = box.get("rows") or []
         _status_distribution = {}
         for _row in rows:
@@ -5052,8 +5052,9 @@ class FuturesMonitor:
                             _row.update({
                                 "observation_type": "ORDER_DEAL_RECORD",
                                 "observed_at": int(time.time() * 1000),
-                                "snapshot_generation": getattr(
-                                    self, "_futures_refresh_generation", None),
+                                "snapshot_generation": (
+                                    (getattr(self, "_last_futures_refresh", None)
+                                     or {}).get("snapshot_generation")),
                                 "source_status": _row.get("status"),
                                 "normalization_result": "ACCEPTED",
                                 "rejection_reason": None,
@@ -5068,8 +5069,9 @@ class FuturesMonitor:
                             _row.update({
                                 "observation_type": "ORDER_DEAL_RECORD",
                                 "observed_at": int(time.time() * 1000),
-                                "snapshot_generation": getattr(
-                                    self, "_futures_refresh_generation", None),
+                                "snapshot_generation": (
+                                    (getattr(self, "_last_futures_refresh", None)
+                                     or {}).get("snapshot_generation")),
                                 "source_status": _row.get("status"),
                                 "normalization_result": "ACCEPTED",
                                 "rejection_reason": None,

@@ -1274,7 +1274,12 @@ class OrderManager:
                 reason=reason,
             )
 
-        if raw_status is not None and not (normalized_status == OrderStatus.FILLED and deals):
+        _terminal_with_deals = normalized_status in (
+            OrderStatus.FILLED, OrderStatus.CANCELLED,
+            OrderStatus.REJECTED, OrderStatus.EXPIRED) and bool(deals)
+        if (raw_status is not None
+                and not (normalized_status == OrderStatus.FILLED and deals)
+                and not _terminal_with_deals):
             self.apply_order_update(
                 order.order_id,
                 raw_status=raw_status,
@@ -1351,6 +1356,31 @@ class OrderManager:
                 reason=reason,
             )
             fills_added += 1
+
+        # A terminal broker status remains terminal even if deal detail was
+        # partial or omitted.  For Cancelled/Rejected/Expired, apply the
+        # status *after* deals so confirmed partial fills are preserved.
+        if normalized_status == OrderStatus.FILLED and order.status != OrderStatus.FILLED:
+            _filled_qty = self._extract_value(trade, "filled_qty", "filled_quantity")
+            try:
+                _filled_qty = int(_filled_qty) if _filled_qty is not None else None
+            except (TypeError, ValueError):
+                _filled_qty = None
+            self._mark_broker_terminal_without_details(
+                order, filled_qty=_filled_qty,
+                raw_payload=self._payload_to_dict(trade),
+                source=source or "reconcile", reason="DETAILS_PENDING")
+        elif normalized_status in (OrderStatus.CANCELLED, OrderStatus.REJECTED,
+                                   OrderStatus.EXPIRED) and order.status not in (
+                                       OrderStatus.CANCELLED,
+                                       OrderStatus.REJECTED,
+                                       OrderStatus.EXPIRED,
+                                       OrderStatus.FILLED):
+            self.apply_order_update(
+                order.order_id, raw_status=raw_status, reason=reason,
+                raw_payload=self._payload_to_dict(trade),
+                broker_order_id=broker_order_id, seqno=seqno, ordno=ordno,
+                source=source or "reconcile")
 
         self._record_audit(
             order,
