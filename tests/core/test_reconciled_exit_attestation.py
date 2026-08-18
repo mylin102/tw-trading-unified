@@ -1231,10 +1231,16 @@ def _exit_only_renew_api(*, positions=None, trades=None, ctx=None):
         SimpleNamespace(code="TMFI6", direction=SimpleNamespace(name="Buy"),
                         quantity=1, price=45052.0),
     ]
+    _trades = list(trades or [])
     return SimpleNamespace(
-        futopt_account=SimpleNamespace(),
-        list_positions=lambda acct: _pos,
-        list_trades=lambda acct: trades or [],
+        futopt_account=SimpleNamespace(account_id="fake-futures"),
+        list_positions=lambda account=None, acct=None: list(_pos),
+        list_trades=lambda account=None, acct=None: list(_trades),
+        update_status=lambda account=None, trade=None, timeout=None: None,
+        snapshots=lambda contracts: [SimpleNamespace(close=44905.0)
+                                     for _ in (contracts or [])],
+        order_deal_records=lambda account=None, **kwargs: [],
+        set_order_callback=lambda callback: None,
     )
 
 

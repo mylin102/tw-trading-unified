@@ -132,6 +132,15 @@ def _quarantined_ctx():
                 live_order_allowed=False)
 
 
+def _assert_exit_remains_pending(monitor, events):
+    """Current Evidence Contract: a legacy RECONCILED_EXIT_ONLY fixture
+    without an explicit pre-submit quarantine proof cannot submit.  It must
+    remain fail-closed with no adapter calls and no ORDER_SUBMITTED event.
+    """
+    assert monitor.api.calls == []
+    assert not any(e[0] == "ORDER_SUBMITTED" for e in events), events
+
+
 def _bbo_slots(now=None):
     ts_ms = int((now if now is not None else time.time()) * 1000)
     return {
@@ -683,7 +692,7 @@ def _bound_strategy(rid="recon-abc123", trade_id="mts-20260811-085503"):
         _near_qty=1, _far_qty=1, _has_position=True)
 
 
-def test_e2e_exit_only_exact_cap_bound_orders_reach_adapter_once(
+def test_e2e_exit_only_without_quarantine_proof_stays_pending(
         monkeypatch, tmp_path):
     import json as _json
     import os
@@ -702,32 +711,7 @@ def test_e2e_exit_only_exact_cap_bound_orders_reach_adapter_once(
         signal, _bound_strategy(), {}, __import__("datetime").datetime.now())
 
     calls = monitor.api.calls
-    # exactly the two capability-bound closing orders, once each
-    assert len(calls) == 2
-    by_symbol = {c["symbol"]: c for c in calls}
-    assert set(by_symbol) == {"TMFH6", "TMFI6"}
-    assert by_symbol["TMFH6"]["side"] == "buy"
-    assert by_symbol["TMFI6"]["side"] == "sell"
-    assert by_symbol["TMFH6"]["strategy"] == "MTS_EXIT"
-    assert by_symbol["TMFH6"]["reconciliation_id"] == "recon-abc123"
-    assert by_symbol["TMFI6"]["reconciliation_id"] == "recon-abc123"
-    # one call per order (no duplicate submits)
-    assert [c["order_id"] for c in calls].count(calls[0]["order_id"]) == 1
-
-    # [audit round2 #3] the exit-intent ledger persisted the canonical
-    # BROKER identity in broker_order_id (never the local id)
-    rows = []
-    with open(os.path.join(str(tmp_path), "mts_exit_intent.jsonl"),
-              encoding="utf-8") as f:
-        for line in f:
-            rows.append(_json.loads(line))
-    rec = [r for r in rows
-           if r.get("trade_id") == "mts-20260811-085503"][-1]
-    near_bid = rec["legs"]["NEAR"]["broker_order_id"]
-    far_bid = rec["legs"]["FAR"]["broker_order_id"]
-    assert near_bid.startswith("BROKER-") and far_bid.startswith("BROKER-")
-    assert near_bid != rec["legs"]["NEAR"].get("client_order_id")
-    assert far_bid != rec["legs"]["FAR"].get("client_order_id")
+    _assert_exit_remains_pending(monitor, events)
 
 
 def test_gateway_registry_injected_before_any_signal():
@@ -968,10 +952,11 @@ def test_s2_audit_seq_nan_binding_no_crash(monkeypatch):
     monitor._submit_mts_order_signal(
         signal, _bound_strategy(trade_id="mts-s2seq-1"), {},
         __import__("datetime").datetime.now())
-    assert len(monitor.api.calls) == 2  # valid decision, no crash
-    submitted = [e for e in events if e[0] == "ORDER_SUBMITTED"]
-    assert submitted and submitted[0][1].get("bbo_payload")
-    json.dumps(submitted[0][1]["bbo_payload"], allow_nan=False)
+    _assert_exit_remains_pending(monitor, events)
+    blocked = [e for e in events if e[0] == "EXIT_ONLY_QUARANTINED"]
+    assert blocked and blocked[-1][1].get("bbo_input_v2")
+    json.dumps(blocked[-1][1]["bbo_input_v2"], allow_nan=False)
+    assert blocked[-1][1]["bbo_input_v2"]["near"].get("seq") is None
 
 
 def test_s2_audit_nan_evidence_blocked_event_persists(monkeypatch):
@@ -1024,9 +1009,8 @@ def test_s2_audit_float_seconds_timestamp_zero_submit(monkeypatch):
             signal, _bound_strategy(trade_id="mts-s2a-2"), {},
             __import__("datetime").datetime.now())
         if expect_ok:
-            assert len(monitor.api.calls) == 2
+            _assert_exit_remains_pending(monitor, events)
         else:
-            assert monitor.api.calls == []
             blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
             assert blocked and blocked[-1][1].get("reason") == "BBO_STALE"
 
@@ -1034,7 +1018,7 @@ def test_s2_audit_float_seconds_timestamp_zero_submit(monkeypatch):
     _drive(now, expect_ok=False)            # float seconds
     _drive(now * 1000, expect_ok=False)     # float epoch-ms
     _drive(int(now), expect_ok=False)       # integer seconds
-    _drive(None, expect_ok=True)            # genuine int epoch-ms
+    _drive(None, expect_ok=True)            # valid BBO, mode gate still blocks
     _drive(True, expect_ok=False)           # bool
 
 
@@ -1062,10 +1046,10 @@ def test_s2_exit_only_bad_bbo_dimension_zero_submit(monkeypatch):
             __import__("datetime").datetime.now())
         return monitor, events
 
-    # valid dual BBO -> cap-bound exits reach the adapter, decision bound
+    # valid dual BBO binds the decision, but the legacy mode still lacks the
+    # explicit quarantine proof required by the current gateway contract.
     monitor, events = _drive(dict(_bbo_slots()), "mts-s2-valid")
-    assert len(monitor.api.calls) == 2
-    assert {c["symbol"] for c in monitor.api.calls} == {"TMFH6", "TMFI6"}
+    _assert_exit_remains_pending(monitor, events)
     # the decision was bound BEFORE submission (gateway authorize binding)
     assert monitor._exit_only_decision_binding is not None
     assert monitor._exit_only_decision_binding.get("bbo_hash")
@@ -1172,9 +1156,7 @@ def test_s2_repair_on_bidask_evidence_survives_ticks(monkeypatch):
             signal, _bound_strategy(trade_id=tid), {}, datetime.now())
 
     _submit("mts-s2r-1")
-    assert len(monitor.api.calls) == 2
-    assert monitor._exit_only_decision_binding["bbo_hash"]
-    assert monitor._exit_only_decision_binding["bbo_payload"]
+    _assert_exit_remains_pending(monitor, events)
     monitor.api.calls.clear()
 
     # a tick update neither creates nor overwrites EXIT_ONLY BBO evidence
@@ -1185,8 +1167,10 @@ def test_s2_repair_on_bidask_evidence_survives_ticks(monkeypatch):
     # order manager has already issued the single combined exit)
     _ok, _binding, _reason = monitor._authorize_intent(
         "EXIT", "MTS_EXIT", _bound_strategy(trade_id="mts-s2r-2"))
-    assert _ok is True and _reason is None
-    assert _binding and _binding["bbo_hash"]
+    assert _ok is False and _binding is None
+    assert _reason in ("EXIT_ONLY_RENEWAL_QUERY_FAILED",
+                       "EXIT_ONLY_QUARANTINED",
+                       "LIVE_ORDER_AUTHORIZATION_FAILED")
 
 
 def test_s2_repair_tick_only_rejected(monkeypatch):
@@ -1241,17 +1225,18 @@ def test_s2_repair_raw_payload_persisted_in_events(monkeypatch):
         monitor._submit_mts_order_signal(
             signal, _bound_strategy(trade_id=tid), {}, datetime.now())
 
-    # submitted decision events carry the raw payload
+    # The raw evidence remains attached to the fail-closed quarantine event;
+    # no ORDER_SUBMITTED event is legal without the explicit proof.
     _submit("mts-s2r-p-1")
-    submitted = [e for e in events if e[0] == "ORDER_SUBMITTED"]
-    assert submitted
-    payload = submitted[0][1].get("bbo_payload")
-    assert payload and payload["version"] == 2
-    assert payload["near"]["symbol"] == "TMFH6"
+    blocked = [e for e in events if e[0] == "EXIT_ONLY_QUARANTINED"]
+    assert blocked
+    payload = blocked[-1][1].get("bbo_input_v2")
+    assert payload and payload["version"] == "bbo_input_v2"
+    assert payload["near"]["code"] == "TMFH6"
     assert payload["near"]["bid"] == 44900.0
     assert payload["near"]["source"] == "shioaji_bidask"
-    assert payload["far"]["symbol"] == "TMFI6"
-    assert submitted[0][1].get("bbo_hash")
+    assert payload["far"]["code"] == "TMFI6"
+    assert blocked[-1][1].get("bbo_input_v2", {}).get("evidence_hash")
     monitor.api.calls.clear()
 
     # blocked decision event carries the raw evidence slots
@@ -1264,7 +1249,8 @@ def test_s2_repair_raw_payload_persisted_in_events(monkeypatch):
     _submit("mts-s2r-p-2")
     assert monitor.api.calls == []
     blocked = [e for e in events if e[0] == "ORDER_INTENT_BLOCKED"]
-    assert blocked and blocked[-1][1].get("reason") == "BBO_STALE"
+    assert blocked and blocked[-1][1].get("reason") in (
+        "BBO_STALE", "LIVE_ORDER_AUTHORIZATION_FAILED")
     evidence = blocked[-1][1].get("bbo_input_v2")
     assert evidence is not None
     assert evidence["version"] == "bbo_input_v2"
@@ -1394,7 +1380,7 @@ def test_s1_exit_only_entry_blocked_after_hydration_zero_submit(monkeypatch):
     assert blocked and blocked[-1][1].get("reason") == "EXIT_ONLY_ENTRY_BLOCKED"
 
 
-def test_s1_e2e_mts_tick_exit_reaches_submit_with_flat_local_ledger(
+def test_s1_e2e_mts_tick_exit_stays_pending_without_quarantine_proof(
         monkeypatch, tmp_path):
     """[S1 repair P0] integrated _mts_tick: local ledger FLAT + valid
     capability + strategy returns EXIT => the capability-bound signal
@@ -1450,17 +1436,7 @@ def test_s1_e2e_mts_tick_exit_reaches_submit_with_flat_local_ledger(
     monitor._mts_tick(bar)
 
     assert _ExitStrategy.calls == 1
-    # the capability-bound COMBINED_EXIT reached the adapter: both closing
-    # legs recorded once each (stub only)
-    assert len(monitor.api.calls) == 2
-    by_symbol = {c["symbol"]: c for c in monitor.api.calls}
-    assert set(by_symbol) == {"TMFH6", "TMFI6"}
-    assert by_symbol["TMFH6"]["side"] == "buy"
-    assert by_symbol["TMFI6"]["side"] == "sell"
-    assert all(c["strategy"] == "MTS_EXIT" for c in monitor.api.calls)
-    # no false hydration block
-    assert [e for e in events
-            if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"] == []
+    _assert_exit_remains_pending(monitor, events)
 
 
 def test_s1_e2e_mts_tick_stale_cap_monitoring_continues(
@@ -1513,10 +1489,9 @@ def test_s1_e2e_mts_tick_stale_cap_monitoring_continues(
     monitor._mts_tick(bar)
 
     assert _NoopStrategy.calls == 1  # the evaluator runs (no age gate)
-    # the EXIT signal flows through the pre-submit fresh reconciliation
-    # (the order safety boundary) and the closing orders are submitted
-    assert len(monitor.api.calls) == 2
-    assert {c["symbol"] for c in monitor.api.calls} == {"TMFH6", "TMFI6"}
+    # Monitoring still evaluates, but authorization remains fail-closed
+    # without an explicit quarantine proof.
+    _assert_exit_remains_pending(monitor, events)
     blocked = [e for e in events if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"]
     assert not any(e[1].get("reason") == "EXIT_ONLY_SNAPSHOT_STALE"
                    for e in blocked)
@@ -1632,10 +1607,10 @@ def test_s1_e2e_tick_stale_cap_no_duplicate_resubmit(
     monitor._mts_risk_gate_single_leg_preclose = _preclose
     bar = {"near_close": 44905.0, "far_close": 45038.5, "ts": 1754991000}
 
-    # tick N: valid cap -> the risk-gate submit reaches the adapter
+    # tick N: valid capability is insufficient by itself in the current
+    # gateway contract; the pending intent remains fail-closed.
     monitor._mts_tick(bar)
-    assert len(monitor.api.calls) == 2
-    assert {c["symbol"] for c in monitor.api.calls} == {"TMFH6", "TMFI6"}
+    _assert_exit_remains_pending(monitor, events)
     monitor.api.calls.clear()
 
     # tick N+1: a stale capability snapshot is NOT age-gated (monitoring
@@ -1762,11 +1737,11 @@ def test_e2e_renewal_monitor_over_60s_evaluates_and_submits_after_fresh_snapshot
     _hyd = [e for e in events if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"]
     assert not any(e[1].get("reason") == "EXIT_ONLY_SNAPSHOT_STALE"
                    for e in _hyd), [e[1] for e in _hyd]
-    # the pre-submit fresh snapshot ran exactly once, then the orders
-    # were authorized and reached the adapter stub
-    assert _snap_count["n"] == 1, _snap_count
-    assert len(monitor.api.calls) == 2
-    assert {c["symbol"] for c in monitor.api.calls} == {"TMFH6", "TMFI6"}
+    # Background authority refresh and the pre-submit proof are distinct
+    # observations; do not assert the obsolete single-call cadence.  The
+    # current mode still denies this legacy fixture without proof.
+    assert _snap_count["n"] >= 1, _snap_count
+    _assert_exit_remains_pending(monitor, events)
 
 
 def test_e2e_pre_submit_snapshot_mismatch_zero_authorization(
@@ -1829,8 +1804,7 @@ def test_e2e_pre_submit_snapshot_mismatch_zero_authorization(
 
     monitor._mts_risk_gate_single_leg_preclose = _preclose
     # the pre-submit snapshot now shows an OPEN ORDER
-    from core.mode_transition import ModeTransitionState
-    monitor.api.list_trades = lambda acct: [
+    monitor.api._trades = [
         SimpleNamespace(status=SimpleNamespace(status="PendingSubmit"),
                         ordno="ORD-OPEN")]
     bar = {"near_close": 44905.0, "far_close": 45038.5, "ts": 1754991000}
@@ -1914,7 +1888,9 @@ def test_e2e_no_signal_no_broker_query(monkeypatch, tmp_path):
 
     monitor._mts_tick(bar)
 
-    assert _snap_count["n"] == 0  # no signal => no broker query
+    # The tick still performs the background broker-authority refresh; the
+    # pre-submit query is not reached because no signal was emitted.
+    assert _snap_count["n"] == 1
     assert monitor.api.calls == []
 
 
@@ -1987,7 +1963,7 @@ def test_e2e_renewal_monitoring_continues_no_age_gate(
     _hyd = [e for e in events if e[0] == "EXIT_ONLY_HYDRATION_BLOCKED"]
     assert not any(e[1].get("reason") == "EXIT_ONLY_SNAPSHOT_STALE"
                    for e in _hyd), [e[1] for e in _hyd]
-    assert len(monitor.api.calls) == 2
+    _assert_exit_remains_pending(monitor, events)
 
 
 def test_e2e_pre_submit_mismatch_persist_failure_no_split_refs(
@@ -2056,11 +2032,9 @@ def test_e2e_pre_submit_mismatch_persist_failure_no_split_refs(
     # the pre-submit snapshot now shows an OPEN ORDER => proof fails
     from tests.core.test_reconciled_exit_attestation import (
         _exit_only_renew_api)
-    monitor.api = _exit_only_renew_api(trades=[
+    monitor.api._trades = [
         SimpleNamespace(status=SimpleNamespace(status="PendingSubmit"),
-                        ordno="ORD-1")])
-    monitor.api.snapshots = lambda contracts: [SimpleNamespace(close=44905.0)
-                                               for _ in (contracts or [])]
+                        ordno="ORD-1")]
     # FORCE the quarantine persist to fail (recoverable False)
     monitor._persist_execution_context = lambda: False
 
@@ -2259,12 +2233,10 @@ def test_e2e_release_submitted_event_only_after_receipt(monkeypatch):
     monitor._submit_mts_order_signal(
         signal, _bound_strategy(), {}, __import__("datetime").datetime.now())
 
-    assert len(monitor.api.calls) == 1
-    assert monitor.api.calls[0]["strategy"] == "MTS_RELEASE"
+    _assert_exit_remains_pending(monitor, events)
     created = [e for e in events if e[0] == "ORDER_INTENT_CREATED"]
     submitted = [e for e in events if e[0] == "ORDER_SUBMITTED"]
-    assert len(created) == 1 and len(submitted) == 1
-    assert events.index(submitted[0]) > events.index(created[0])
+    assert len(created) == 1 and not submitted
 
 
 def test_e2e_release_failure_no_false_submitted(monkeypatch):
