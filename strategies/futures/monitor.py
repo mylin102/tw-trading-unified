@@ -2584,6 +2584,7 @@ class FuturesMonitor:
                 _rt_bar["far_bid"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("bid", _rt_bar.get("far_close", 0.0))
                 _rt_bar["far_ask"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("ask", _rt_bar.get("far_close", 0.0))
                 
+                self._mts_tag_bar_session(_rt_bar)
                 self._mts_tick(enriched_bar=_rt_bar)
             return
 
@@ -2772,6 +2773,7 @@ class FuturesMonitor:
             _rt_bar["far_bid"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("bid", _rt_bar.get("far_close", 0.0))
             _rt_bar["far_ask"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("ask", _rt_bar.get("far_close", 0.0))
 
+            self._mts_tag_bar_session(_rt_bar)
             self._mts_tick(enriched_bar=_rt_bar)
 
         cb = self.client._tick_callbacks.get(tick.code)
@@ -11132,6 +11134,21 @@ class FuturesMonitor:
         # Signal caller to skip this tick (probe takes priority)
         return True
 
+    def _mts_tag_bar_session(self, bar: dict) -> dict:
+        """[MTS_SESSION_TAG 2026-08-18] RESTART_BASELINE gate input: the
+        production MTS bar never carried a session_type tag, so the gate
+        failed closed on every bar (TRAIL_REANCHOR_SESSION_UNKNOWN) and the
+        remaining-leg anchor could never be established.  Inject the
+        monitor's trading session at bar construction.  An explicit value
+        on the bar is preserved; when the session is itself unknown the
+        key is left absent so the gate stays fail-closed."""
+        if "session_type" not in bar:
+            _sess = (getattr(self, "session_type", None)
+                     or get_taifex_futures_session_type())
+            if _sess:
+                bar["session_type"] = _sess
+        return bar
+
     def _mts_tick(self, enriched_bar: dict | None = None):
         # [P1] Periodic far snapshot refresh (60s cooldown) - inline
         _now = time.time()
@@ -14702,6 +14719,7 @@ class FuturesMonitor:
                 _mts_bar["far_close_rt"] = self._far_current_bar["close"]
                 _mts_bar["far_high_rt"] = self._far_current_bar.get("high", _mts_bar["far_close_rt"])
                 _mts_bar["far_low_rt"] = self._far_current_bar.get("low", _mts_bar["far_close_rt"])
+            self._mts_tag_bar_session(_mts_bar)
             self._mts_tick(enriched_bar=_mts_bar)
             return
 
