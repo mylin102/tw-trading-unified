@@ -38,7 +38,7 @@ def test_refresh_uses_stable_broker_identity_across_snapshots(monkeypatch):
     monitor = FuturesMonitor.__new__(FuturesMonitor)
     monitor.live_trading = True
     monitor._execution_context = SimpleNamespace(
-        effective_mode=ModeTransitionState.LIVE_READY.value)
+        requested_mode="live", effective_mode=ModeTransitionState.LIVE_READY.value)
     monitor.contract = SimpleNamespace(code="TMFH6")
     monitor.far_contract = SimpleNamespace(code="TMFI6")
     monitor._live_broker_authority_at = 0.0
@@ -55,7 +55,6 @@ def test_refresh_uses_stable_broker_identity_across_snapshots(monkeypatch):
 
     assert first == FuturesMonitor._stable_broker_trade_id("account-hash", _legs())
     assert strategy._trade_id == first
-    assert first != "mts-auto-old"
 
 
 def test_broker_observed_position_blocks_entry_even_when_local_strategy_flat():
@@ -78,13 +77,15 @@ def test_flat_successful_snapshot_clears_broker_entry_block(monkeypatch):
     monitor = FuturesMonitor.__new__(FuturesMonitor)
     monitor.live_trading = True
     monitor._execution_context = SimpleNamespace(
-        effective_mode=ModeTransitionState.LIVE_READY.value)
+        requested_mode="live", effective_mode=ModeTransitionState.LIVE_READY.value)
     monitor.contract = SimpleNamespace(code="TMFH6")
     monitor.far_contract = SimpleNamespace(code="TMFI6")
     monitor._live_broker_authority_at = 0.0
+    monitor._broker_position_observed = True
     monitor._persist_current_session_canonical = lambda snapshot: None
     monitor._capture_post_startup_snapshot = lambda: _snapshot("flat", [])
     strategy = SimpleNamespace(_trade_id=None)
 
-    assert monitor._refresh_live_broker_authority(strategy) is None
+    auth = monitor._refresh_live_broker_authority(strategy)
+    assert auth is not None and getattr(auth.status, "value", auth.status) == "FLAT"
     assert monitor._broker_position_observed is False

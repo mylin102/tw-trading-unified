@@ -30,14 +30,24 @@ class _FakeApiOrders:
             # wrong-scope no-arg call: junk rows without identity
             return [SimpleNamespace(status=SimpleNamespace(status="PendingSubmit"))]
         return [SimpleNamespace(
-            status=SimpleNamespace(status="PendingSubmit"),
+            status=SimpleNamespace(status="PendingSubmit", status_code="P",
+                                   order_quantity=1, deal_quantity=0,
+                                   cancel_quantity=0, deals=[]),
             order=SimpleNamespace(id="2353c7b0", ordno="2353c7b0",
-                                  seqno="756569"),
-            contract=SimpleNamespace(code="TMFI6"),
-            quantity=1)]
+                                  seqno="756569", quantity=1),
+            contract=SimpleNamespace(code="TMFI6"))]
 
     def margin(self, *, account):
         return SimpleNamespace(available_margin=500000.0)
+
+    def update_status(self, *, account=None, trade=None, timeout=None):
+        return None
+
+    def snapshots(self, contracts):
+        return []
+
+    def order_deal_records(self, account=None, **kwargs):
+        return []
 
 
 def _monitor(api):
@@ -54,8 +64,12 @@ def test_capture_open_orders_carry_identity_and_futures_scope():
     payload = mon._capture_post_startup_snapshot()
     oo = payload.get("open_orders") or []
     assert len(oo) == 1
-    assert oo[0]["broker_order_id"] == "2353c7b0"
-    assert oo[0]["ordno"] == "2353c7b0"
-    assert oo[0]["seqno"] == "756569"
-    assert oo[0]["code"] == "TMFI6"
+    assert oo[0]["status"] == "PendingSubmit"
+    # Non-terminal open_orders is intentionally a minimal projection;
+    # identity-bearing refreshed Trade evidence is kept separately.
+    tr = (payload.get("broker_trades") or [])[0]
+    assert tr["broker_order_id"] == "2353c7b0"
+    assert tr["ordno"] == "2353c7b0"
+    assert tr["seqno"] == "756569"
+    assert tr["code"] == "TMFI6"
     assert payload.get("available_margin") == 500000.0
