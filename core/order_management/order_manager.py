@@ -1296,10 +1296,9 @@ class OrderManager:
 
         fills_added = 0
         # Some Shioaji list_trades snapshots report a terminal Filled trade
-        # with aggregate price/quantity but omit ``status.deals``.  Once the
-        # broker identity matched an existing submitted order, the aggregate
-        # receipt is authoritative and can be applied exactly once; never
-        # synthesize an order or match by symbol/side.
+        # with a confirmed quantity but omit ``status.deals``.  The broker
+        # identity is sufficient to close the lifecycle, but accounting stays
+        # DETAILS_PENDING: never invent a price/PnL from aggregate fields.
         if normalized_status == OrderStatus.FILLED and not deals:
             _filled_qty = self._extract_value(trade, "filled_qty", "filled_quantity")
             if _filled_qty is not None:
