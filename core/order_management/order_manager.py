@@ -495,6 +495,7 @@ class OrderManager:
         seqno: Optional[str] = None,
         ordno: Optional[str] = None,
         source: str = "",
+        observation_type: Optional[str] = None,
     ) -> Optional[Order]:
         order = self._resolve_order(order_id, broker_order_id=broker_order_id, seqno=seqno, ordno=ordno)
         if order is None:
@@ -516,6 +517,7 @@ class OrderManager:
                 raw_status=raw_status, payload=raw_payload,
                 broker_order_id=broker_order_id or order.broker_order_id,
                 seqno=seqno or order.seqno, ordno=ordno or order.ordno,
+                observation_type=observation_type,
             )
             return order
 
@@ -535,6 +537,7 @@ class OrderManager:
             broker_order_id=order.broker_order_id,
             seqno=order.seqno,
             ordno=order.ordno,
+            observation_type=observation_type,
         )
 
         if normalized in (OrderStatus.PENDING_SUBMIT, OrderStatus.PRE_SUBMITTED, OrderStatus.SUBMITTED):

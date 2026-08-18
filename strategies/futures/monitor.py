@@ -7531,6 +7531,7 @@ class FuturesMonitor:
             seqno=seqno,
             ordno=ordno,
             source="shioaji_callback",
+            observation_type="FORDER_CALLBACK",
         )
         if _updated_order is not None:
             self._leg_lock_apply_order_event(
