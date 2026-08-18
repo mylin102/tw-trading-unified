@@ -118,6 +118,9 @@ class OrderManager:
             self._session_source = "wall_clock_fallback"
         self._next_id = 1
         self.broker_adapter = broker_adapter
+        # LIVE order channels are fail-closed until the monitor has published
+        # a successful update_status -> list_trades refresh generation.
+        self._broker_refresh_channel_state = "HEALTHY"
 
         # 2026-07-07 Hermes Agent: reindex from disk immediately after init
         # so the counter survives PM2 restart even before the first caller
@@ -629,6 +632,10 @@ class OrderManager:
 
     # ── Submit ──
 
+    def set_broker_refresh_channel_state(self, state: str) -> None:
+        self._broker_refresh_channel_state = (
+            state if state in ("HEALTHY", "UNCERTAIN") else "UNCERTAIN")
+
     def submit(self, order: Order, exchange_ordno: Optional[str] = None) -> bool:
         """
         送出委託。
@@ -636,6 +643,12 @@ class OrderManager:
         - Live: 透過 broker_adapter.place_order() 送單
         """
         # ── P0 Hard Gate: Second layer defense ──
+        if (self.mode == "live"
+                and getattr(self, "_broker_refresh_channel_state", "HEALTHY")
+                != "HEALTHY"):
+            self.reject(order.order_id, reason="BROKER_REFRESH_UNCERTAIN",
+                        source="refresh_channel_gate")
+            return False
         if self.mode == "live" and self.execution_context is not None:
             try:
                 _assert_live_allowed(self.execution_context, order)

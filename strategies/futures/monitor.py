@@ -272,6 +272,11 @@ class FuturesMonitor:
         self._futures_refresh_generation = 0
         self._last_futures_refresh = None
         self._futures_refresh_timeout_s = 3.0
+        # Order-capable channels remain blocked until the first successful
+        # broker refresh. A late/failed refresh must not leave a LIVE_READY
+        # OrderManager able to submit against an uncertain SDK cache.
+        self._broker_refresh_channel_state = "UNCERTAIN"
+        self._broker_refresh_channel_history = []
 
         # Far-month tick-based bar accumulation (independent from near-month)
         self._far_tick_bars_deque = deque(maxlen=300)
@@ -786,6 +791,8 @@ class FuturesMonitor:
             broker = self.client if self.live_trading else None
             self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=broker,
                                           execution_context=getattr(self, '_execution_context', None))
+            self._set_broker_refresh_channel_state(
+                getattr(self, "_broker_refresh_channel_state", "UNCERTAIN"))
             # [S0] registry injected BEFORE any order path (not lazily)
             self._gateway()
             if _om_mode == "paper":
@@ -4650,6 +4657,30 @@ class FuturesMonitor:
             out.append(row)
         return out
 
+    def _set_broker_refresh_channel_state(self, state: str) -> None:
+        """Propagate refresh certainty to every order-capable channel."""
+        _state = state if state in ("HEALTHY", "UNCERTAIN") else "UNCERTAIN"
+        self._broker_refresh_channel_state = _state
+        _history = getattr(self, "_broker_refresh_channel_history", None)
+        if _history is None:
+            _history = []
+            self._broker_refresh_channel_history = _history
+        _history.append(_state)
+        try:
+            self._append_mts_event(
+                "REFRESH_CHANNEL_STATE",
+                state=_state,
+                observation_type="REFRESH_CHANNEL",
+                normalization_result="ACCEPTED")
+        except Exception:
+            pass
+        _manager = getattr(self, "order_mgr", None)
+        _setter = getattr(_manager, "set_broker_refresh_channel_state", None)
+        if callable(_setter):
+            _setter(_state)
+        elif _manager is not None:
+            _manager._broker_refresh_channel_state = _state
+
     def _refresh_futures_trade_view(self, api, account):
         """Run one bounded, single-flight update_status -> list_trades pair.
 
@@ -4662,12 +4693,14 @@ class FuturesMonitor:
             lock = threading.Lock()
             self._broker_refresh_lock = lock
         if api is None or account is None or getattr(api, "is_connected", True) is False:
+            self._set_broker_refresh_channel_state("UNCERTAIN")
             result = {"state": "REFRESH_SKIPPED_DISCONNECTED", "rows": [],
                       "snapshot_generation": None, "elapsed_ms": 0,
                       "trades_count": 0}
             self._record_refresh_telemetry(result)
             return result
         if not lock.acquire(blocking=False):
+            self._set_broker_refresh_channel_state("UNCERTAIN")
             result = {"state": "REFRESH_SKIPPED_INFLIGHT", "rows": [],
                       "snapshot_generation": None, "elapsed_ms": 0,
                       "trades_count": 0}
@@ -4696,12 +4729,14 @@ class FuturesMonitor:
                 done.set()
                 lock.release()
 
+        self._set_broker_refresh_channel_state("UNCERTAIN")
         self._record_refresh_telemetry({"state": "REFRESH_STARTED",
                                         "elapsed_ms": 0,
                                         "trades_count": 0})
         threading.Thread(target=_worker, daemon=True).start()
         timeout = float(getattr(self, "_futures_refresh_timeout_s", 3.0) or 3.0)
         if not done.wait(timeout=max(0.1, timeout)):
+            self._set_broker_refresh_channel_state("UNCERTAIN")
             result = {"state": "REFRESH_TIMEOUT_UNCERTAIN", "rows": [],
                       "snapshot_generation": None,
                       "elapsed_ms": int((time.monotonic() - started) * 1000),
@@ -4710,6 +4745,7 @@ class FuturesMonitor:
             return result
         elapsed = int((time.monotonic() - started) * 1000)
         if box.get("state") != "REFRESH_SUCCEEDED":
+            self._set_broker_refresh_channel_state("UNCERTAIN")
             result = {"state": "REFRESH_EXCEPTION", "rows": [],
                       "snapshot_generation": None, "elapsed_ms": elapsed,
                       "trades_count": 0, "error": box.get("error")}
@@ -4735,6 +4771,7 @@ class FuturesMonitor:
                   "status_distribution": _status_distribution,
                   "raw_count": len(rows), "normalized_count": len(rows),
                   "rejected_count": 0, "rejection_reasons": {}}
+        self._set_broker_refresh_channel_state("HEALTHY")
         self._record_refresh_telemetry(result)
         try:
             self._append_mts_event(
@@ -5816,6 +5853,7 @@ class FuturesMonitor:
             # earlier flat proof and keep entry fail-closed; do not mutate
             # the strategy's known-open local state.
             self._live_broker_flat_proven = False
+            self._set_broker_refresh_channel_state("UNCERTAIN")
             self._broker_authority_degraded = True
             self._broker_position_observed = True
             self._live_broker_authority = None
