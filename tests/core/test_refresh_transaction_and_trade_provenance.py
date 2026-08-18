@@ -92,7 +92,9 @@ def test_refresh_is_update_then_list_and_publishes_generation():
     assert result["state"] == "REFRESH_SUCCEEDED"
     assert api.calls == ["update", "list"]
     assert result["snapshot_generation"].startswith("futures-")
-    assert events == ["REFRESH_STARTED", "REFRESH_SUCCEEDED", "REFRESH_COMPLETED"]
+    assert [e for e in events if e != "REFRESH_CHANNEL_STATE"] == [
+        "REFRESH_STARTED", "REFRESH_SUCCEEDED", "REFRESH_COMPLETED"]
+    assert events.count("REFRESH_CHANNEL_STATE") == 2
 
 
 def test_refresh_failure_never_reads_or_publishes_old_trades():
