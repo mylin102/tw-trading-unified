@@ -143,9 +143,10 @@ def test_refresh_timeout_uncertain_orphan_worker_cannot_publish_or_send():
     deadline = time.time() + 1.0
     while getattr(mon, "_broker_refresh_lock").locked() and time.time() < deadline:
         time.sleep(0.01)
+    assert api.list_calls == 1
     third = mon._refresh_futures_trade_view(api, api.futopt_account)
     assert third["state"] == "REFRESH_SUCCEEDED"
-    assert third["rows"] and api.list_calls == 1
+    assert third["rows"] and api.list_calls == 2
     assert third["snapshot_generation"] != first.get("snapshot_generation")
     assert not any(item[1].get("snapshot_generation") is None
                    and item[0][0] == "REFRESH_SUCCEEDED"
@@ -189,8 +190,7 @@ def test_old_refresh_generation_never_regresses_terminal_order():
     from core.order_management.order import OrderSide, OrderStatus, OrderType
     from core.order_management.order_manager import OrderManager
     mgr = OrderManager(mode="paper")
-    order = mgr.create_order("TMFI6", OrderSide.BUY, OrderType.MARKET, 1,
-                             order_id="terminal-newer")
+    order = mgr.create_order("TMFI6", OrderSide.BUY, OrderType.MARKET, 1)
     mgr.attach_submission(order.order_id, broker_order_id="old-receipt")
     mgr.cancel(order.order_id, reason="newer-terminal")
     result = mgr.reconcile_broker_state(
