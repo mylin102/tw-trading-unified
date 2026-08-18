@@ -3449,6 +3449,38 @@ def _build_live_broker_mts_state(positions: list, canonical: dict,
 
 
 
+
+def _pending_live_mts_exit_orders(canonical: dict) -> list[dict]:
+    """Return deduplicated broker-pending TMF orders for display only.
+
+    A fresh canonical snapshot with no positions but a pending TMF order is
+    an in-flight exit, not a flat/legacy-paper state.  This helper never
+    authorizes, resubmits, cancels, or infers a fill.
+    """
+    if not isinstance(canonical, dict) or (canonical.get("fetch_status") or {}).get("capture") != "OK":
+        return []
+    rows = []
+    seen = set()
+    for order in canonical.get("open_orders") or []:
+        if not isinstance(order, dict) or order.get("code") not in {"TMFH6", "TMFI6"}:
+            continue
+        status = order.get("status")
+        if isinstance(status, dict):
+            status = status.get("status") or status.get("name")
+        status = str(status or "PENDING").upper()
+        key = (str(order.get("broker_order_id") or order.get("order_id") or ""),
+               str(order.get("seqno") or ""), str(order.get("code")))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "商品": order.get("code"),
+            "方向": order.get("direction") or order.get("side") or "N/A",
+            "券商委託": order.get("broker_order_id") or order.get("order_id") or "N/A",
+            "狀態": status,
+        })
+    return rows
+
 def _monitor_status():
     try:
         r = subprocess.run(["pgrep", "-f", "main.py"], capture_output=True)
@@ -4546,6 +4578,7 @@ elif _selected_product == "TMF":
     # In restricted-exit mode the legacy /tmp state must not be read or
     # presented.  The full legacy block remains unchanged for LIVE/PAPER.
     _broker_mts_state = None
+    _broker_open_orders = []
     _broker_snapshot_flat = False
     _live_runtime = bool(
         active_runtime_truth.get("is_live_runtime")
@@ -4557,6 +4590,7 @@ elif _selected_product == "TMF":
             _ctx_live = json.loads(Path(runtime_path("execution_context.json")).read_text())
             _canon = json.loads((Path(runtime_path("exports", "trades", "live", "diagnostics"))
                                  / "broker_snapshot_canonical.json").read_text())
+            _broker_open_orders = _pending_live_mts_exit_orders(_canon)
             _fut = [p for p in (_canon.get("positions") or [])
                     if p.get("account") == "futures" and p.get("code") in {"TMFH6", "TMFI6"}
                     and int(p.get("quantity", 0) or 0) > 0]
@@ -4583,6 +4617,11 @@ elif _selected_product == "TMF":
                 }
         except Exception:
             _broker_mts_state = None
+    if _broker_open_orders and _broker_mts_state is None:
+        st.header("MTS 剩餘腿出場委託")
+        st.warning("⚠️ 券商已收到剩餘腿出場委託，等待終態回報；不會重送或撤單。")
+        st.dataframe(pd.DataFrame(_broker_open_orders), width="stretch", hide_index=True)
+
     if _broker_snapshot_flat:
         _mts_telemetry = {}
         try:

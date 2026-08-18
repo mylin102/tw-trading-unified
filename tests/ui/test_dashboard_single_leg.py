@@ -30,3 +30,20 @@ def test_invalid_or_empty_broker_positions_do_not_create_position():
     assert _build_live_broker_mts_state([], {}, {}) is None
     assert _build_live_broker_mts_state(
         [{"account": "futures", "code": "TMFI6", "quantity": 0}], {}, {}) is None
+
+def test_pending_live_mts_exit_orders_are_deduplicated_and_display_only():
+    from ui.dashboard import _pending_live_mts_exit_orders
+
+    rows = _pending_live_mts_exit_orders({
+        "fetch_status": {"capture": "OK"},
+        "open_orders": [
+            {"code": "TMFI6", "status": "PendingSubmit",
+             "broker_order_id": "broker-1", "seqno": "7", "direction": "sell"},
+            {"code": "TMFI6", "status": "PendingSubmit",
+             "broker_order_id": "broker-1", "seqno": "7", "direction": "sell"},
+        ],
+    })
+    assert rows == [{"商品": "TMFI6", "方向": "sell",
+                     "券商委託": "broker-1", "狀態": "PENDINGSUBMIT"}]
+    assert _pending_live_mts_exit_orders({"fetch_status": {"capture": "FAIL"},
+                                          "open_orders": rows}) == []
