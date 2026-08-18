@@ -199,3 +199,11 @@ def test_old_refresh_generation_never_regresses_terminal_order():
     assert result["reconciled"] == []
     assert order.status is OrderStatus.CANCELLED
     assert order.order_id not in mgr.active_orders
+
+
+def test_broker_not_found_is_terminal_and_not_active():
+    from core.order_management.order import Order, OrderSide, OrderStatus, OrderType
+    order = Order("TMFI6", OrderSide.BUY, OrderType.MARKET, 1)
+    order.status = OrderStatus.BROKER_NOT_FOUND
+    assert order.is_completed()
+    assert not order.is_active()
