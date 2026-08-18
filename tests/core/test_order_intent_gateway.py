@@ -2055,6 +2055,8 @@ def test_e2e_pre_submit_mismatch_persist_failure_no_split_refs(
     monitor.api = _exit_only_renew_api(trades=[
         SimpleNamespace(status=SimpleNamespace(status="PendingSubmit"),
                         ordno="ORD-1")])
+    monitor.api.snapshots = lambda contracts: [SimpleNamespace(close=44905.0)
+                                               for _ in (contracts or [])]
     # FORCE the quarantine persist to fail (recoverable False)
     monitor._persist_execution_context = lambda: False
 
@@ -2144,6 +2146,8 @@ def test_e2e_pre_submit_mismatch_persist_fatal_hard_disables_broker(
     monitor.api = _exit_only_renew_api(trades=[
         SimpleNamespace(status=SimpleNamespace(status="PendingSubmit"),
                         ordno="ORD-1")])
+    monitor.api.snapshots = lambda contracts: [SimpleNamespace(close=44905.0)
+                                               for _ in (contracts or [])]
 
     def _fatal(*a, **k):
         raise ExecutionContextSyncFatal("rollback failed")
