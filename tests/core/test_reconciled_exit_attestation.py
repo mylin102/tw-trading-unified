@@ -413,7 +413,7 @@ def test_monitor_attestation_syncs_order_manager_and_client_e2e(
     monitor = FuturesMonitor.__new__(FuturesMonitor)
     monitor.api = SimpleNamespace(
         futopt_account=SimpleNamespace(),
-        list_positions=lambda acct: [
+        list_positions=lambda account=None, acct=None: [
             SimpleNamespace(code="TMFH6",
                             direction=SimpleNamespace(name="Sell"),
                             quantity=1, price=44909.0),
@@ -421,7 +421,7 @@ def test_monitor_attestation_syncs_order_manager_and_client_e2e(
                             direction=SimpleNamespace(name="Buy"),
                             quantity=1, price=45052.0),
         ],
-        list_trades=lambda acct: [],
+        list_trades=lambda account=None, acct=None: [],
     )
     old_ctx = _position_quarantine_ctx()
     monitor._execution_context = old_ctx
@@ -721,7 +721,7 @@ def test_monitor_attestation_fatal_sync_no_success_no_prior_reuse(
     monitor = FuturesMonitor.__new__(FuturesMonitor)
     monitor.api = SimpleNamespace(
         futopt_account=SimpleNamespace(),
-        list_positions=lambda acct: [
+        list_positions=lambda account=None, acct=None: [
             SimpleNamespace(code="TMFH6",
                             direction=SimpleNamespace(name="Sell"),
                             quantity=1, price=44909.0),
@@ -729,7 +729,7 @@ def test_monitor_attestation_fatal_sync_no_success_no_prior_reuse(
                             direction=SimpleNamespace(name="Buy"),
                             quantity=1, price=45052.0),
         ],
-        list_trades=lambda acct: [],
+        list_trades=lambda account=None, acct=None: [],
     )
     monitor._execution_context = old_ctx
 
@@ -913,7 +913,7 @@ def test_monitor_attestation_consumer_split_failure_no_success(
     monitor = FuturesMonitor.__new__(FuturesMonitor)
     monitor.api = SimpleNamespace(
         futopt_account=SimpleNamespace(),
-        list_positions=lambda acct: [
+        list_positions=lambda account=None, acct=None: [
             SimpleNamespace(code="TMFH6",
                             direction=SimpleNamespace(name="Sell"),
                             quantity=1, price=44909.0),
@@ -921,7 +921,7 @@ def test_monitor_attestation_consumer_split_failure_no_success(
                             direction=SimpleNamespace(name="Buy"),
                             quantity=1, price=45052.0),
         ],
-        list_trades=lambda acct: [],
+        list_trades=lambda account=None, acct=None: [],
     )
     old_ctx = _position_quarantine_ctx()
     monitor._execution_context = old_ctx
@@ -993,7 +993,7 @@ def test_monitor_attestation_persist_failure_rolls_back_no_event(
     monitor = FuturesMonitor.__new__(FuturesMonitor)
     monitor.api = SimpleNamespace(
         futopt_account=SimpleNamespace(),
-        list_positions=lambda acct: [
+        list_positions=lambda account=None, acct=None: [
             SimpleNamespace(code="TMFH6",
                             direction=SimpleNamespace(name="Sell"),
                             quantity=1, price=44909.0),
@@ -1001,7 +1001,7 @@ def test_monitor_attestation_persist_failure_rolls_back_no_event(
                             direction=SimpleNamespace(name="Buy"),
                             quantity=1, price=45052.0),
         ],
-        list_trades=lambda acct: [],
+        list_trades=lambda account=None, acct=None: [],
     )
     old_ctx = _position_quarantine_ctx()
     monitor._execution_context = old_ctx
@@ -1058,7 +1058,7 @@ def test_monitor_attestation_persist_failure_keeps_prior_context(
     monitor = FuturesMonitor.__new__(FuturesMonitor)
     monitor.api = SimpleNamespace(
         futopt_account=SimpleNamespace(),
-        list_positions=lambda acct: [
+        list_positions=lambda account=None, acct=None: [
             SimpleNamespace(code="TMFH6",
                             direction=SimpleNamespace(name="Sell"),
                             quantity=1, price=44909.0),
@@ -1066,7 +1066,7 @@ def test_monitor_attestation_persist_failure_keeps_prior_context(
                             direction=SimpleNamespace(name="Buy"),
                             quantity=1, price=45052.0),
         ],
-        list_trades=lambda acct: [],
+        list_trades=lambda account=None, acct=None: [],
     )
     old_ctx = _position_quarantine_ctx()
     monitor._execution_context = old_ctx
@@ -1475,7 +1475,7 @@ def test_monitor_attestation_flow_applies_exit_only_and_emits_event(monkeypatch)
     monitor = FuturesMonitor.__new__(FuturesMonitor)
     monitor.api = SimpleNamespace(
         futopt_account=SimpleNamespace(),
-        list_positions=lambda acct: [
+        list_positions=lambda account=None, acct=None: [
             SimpleNamespace(code="TMFH6",
                             direction=SimpleNamespace(name="Sell"),
                             quantity=1, price=44909.0),
@@ -1483,7 +1483,7 @@ def test_monitor_attestation_flow_applies_exit_only_and_emits_event(monkeypatch)
                             direction=SimpleNamespace(name="Buy"),
                             quantity=1, price=45052.0),
         ],
-        list_trades=lambda acct: [],
+        list_trades=lambda account=None, acct=None: [],
     )
     monitor._execution_context = _live_ctx()
     events = []
@@ -1553,13 +1553,13 @@ def test_monitor_attestation_hydrates_bound_identity_in_position_quarantine(monk
     api = SimpleNamespace(
         futopt_account=SimpleNamespace(
             person_id="person", broker_id="broker", account_id="account"),
-        list_positions=lambda acct: [
+        list_positions=lambda account=None, acct=None: [
             SimpleNamespace(code="TMFH6", direction=SimpleNamespace(name="Sell"),
                             quantity=1, price=44909.0),
             SimpleNamespace(code="TMFI6", direction=SimpleNamespace(name="Buy"),
                             quantity=1, price=45052.0),
         ],
-        list_trades=lambda acct: [],
+        list_trades=lambda account=None, acct=None: [],
     )
     monkeypatch.setattr(certificate.session_registry, "generation",
                         lambda candidate: "b" * 32)
