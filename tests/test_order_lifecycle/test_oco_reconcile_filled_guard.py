@@ -78,13 +78,15 @@ class TestOCOReconcileSkipsAfterFilledLeg:
         assert rg.filled_leg is None
         assert rg.status == ReleaseGroupStatus.SUBMITTED
 
-        # Register nothing in sim → reconciliation should re-register
+        # With no explicit broker/order evidence, reconciliation remains
+        # fail-closed and must not synthesize/register an order.
         assert len(sim._pending_orders) == 0
         assert len(sim.consumed_order_ids) == 0
 
         result = m._reconcile_paper_oco_orders(strategy)
-        # Since orders aren't in active or pending, reconciliation re-registers them
-        assert "ORD-000003" in sim._pending_orders or "ORD-000003" in m.order_mgr.active_orders
+        assert result is None
+        assert sim._pending_orders == {}
+        assert m.order_mgr.active_orders == {}
 
     def test_filled_leg_set_blocks_reconcile(self, monitor_with_oco_state):
         """filled_leg=NEAR → reconciliation returns immediately, sim untouched."""
