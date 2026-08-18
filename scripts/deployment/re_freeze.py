@@ -20,8 +20,13 @@ manifest so the deployment gate's GUARD_MANIFEST_STALE resolves honestly.
 
 import argparse
 import hashlib
+import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_EXCLUDE = [
@@ -80,12 +85,128 @@ def _normalized_untracked(repo: Path, raw: str):
     return p.as_posix()
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Replace *path* atomically and durably in its containing directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.",
+                                    dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _runtime_metadata(repo: Path, runtime_dir: Path, tree_hash: str, head: str,
+                      pid: int | None, callback_generation: int | None,
+                      config_profile: Path | None, ttl_seconds: float) -> dict:
+    """Build non-secret runtime binding metadata for the freeze record."""
+    ctx = {}
+    canonical = {}
+    locks = {}
+    ctx_path = runtime_dir / "execution_context.json"
+    canonical_path = runtime_dir / "exports/trades/live/diagnostics/broker_snapshot_canonical.json"
+    locks_path = runtime_dir / "exports/trades/live/diagnostics/mts_leg_locks.json"
+    for path, target in ((ctx_path, "ctx"), (canonical_path, "canonical"),
+                         (locks_path, "locks")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if target == "ctx": ctx = value
+            elif target == "canonical": canonical = value
+            else: locks = value
+        except (OSError, ValueError):
+            pass
+    rows = canonical.get("positions") or []
+    futures_rows = [r for r in rows if r.get("account") == "futures"]
+    lock_rows = locks.get("locks", locks) if isinstance(locks, dict) else locks
+    if isinstance(lock_rows, dict):
+        lock_rows = list(lock_rows.values())
+    lock_rows = lock_rows or []
+    retired = sum(1 for r in lock_rows
+                  if r.get("status") == "RETIRED_UNRESOLVED")
+    active = sum(1 for r in lock_rows
+                 if r.get("status") not in {"RETIRED_UNRESOLVED", "RETIRED"})
+    process_identity = None
+    if pid is not None:
+        try:
+            proc = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                                  capture_output=True, text=True, timeout=5)
+            process_identity = proc.stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            process_identity = None
+    config_hash = None
+    if config_profile is not None:
+        try:
+            config_hash = hashlib.sha256(config_profile.read_bytes()).hexdigest()
+        except OSError:
+            config_hash = None
+    return {
+        "candidate_head": head,
+        "clean_worktree": not bool(_run(repo, "status", "--porcelain", "-uall")),
+        "source_tree_hash": tree_hash,
+        "process": {"pid": pid, "start_identity": process_identity},
+        "session_id": canonical.get("session_id") or ctx.get("session_id"),
+        "refresh_generation": canonical.get("snapshot_generation"),
+        "captured_at": canonical.get("captured_at"),
+        "broker": {
+            "source": canonical.get("source"),
+            "mode": canonical.get("mode"),
+            "capture": (canonical.get("fetch_status") or {}).get("capture"),
+            "futures_positions": len(futures_rows),
+            "active_orders": len(canonical.get("open_orders") or []),
+        },
+        "durable_locks": {"active": active, "retired_unresolved": retired},
+        "callback_registration_generation": callback_generation,
+        "config_hash": config_hash,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "ttl_seconds": ttl_seconds,
+        "promotion_mode": ctx.get("effective_mode"),
+        "live_order_allowed": ctx.get("live_order_allowed"),
+    }
+
+
+def _embed_runtime_metadata(body: str, metadata: dict) -> str:
+    start = "\n## Runtime certification metadata\n<!-- BEGIN RUNTIME_CERTIFICATION_METADATA -->\n"
+    end = "<!-- END RUNTIME_CERTIFICATION_METADATA -->\n"
+    block = start + "```json\n" + json.dumps(metadata, indent=2,
+                                                  sort_keys=True) + "\n```\n" + end
+    begin_marker = "<!-- BEGIN RUNTIME_CERTIFICATION_METADATA -->"
+    end_marker = "<!-- END RUNTIME_CERTIFICATION_METADATA -->"
+    if begin_marker in body and end_marker in body:
+        left = body[:body.index(begin_marker)]
+        right = body[body.index(end_marker) + len(end_marker):]
+        return left.rstrip() + "\n" + block.lstrip("\n") + right
+    return body.rstrip() + "\n" + block
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--release-dir", default=str(Path.cwd()))
     ap.add_argument("--expected-sha", default=None)
     ap.add_argument("--manifest", default=None)
     ap.add_argument("--exclude-path", action="append", default=[])
+    ap.add_argument("--runtime-dir", default=None,
+                    help="runtime root to bind into certification metadata")
+    ap.add_argument("--pid", type=int, default=None,
+                    help="running process PID to bind into metadata")
+    ap.add_argument("--callback-registration-generation", type=int,
+                    default=None)
+    ap.add_argument("--config-profile", default=None)
+    ap.add_argument("--ttl-seconds", type=float, default=600.0)
+    ap.add_argument("--backup-dir", default=None,
+                    help="out-of-tree directory for the prior manifest + SHA256")
     ap.add_argument("--verify", action="store_true",
                     help="read-only: verify the recorded frozen_tree_hash "
                          "matches the CURRENT HEAD's exclude-self tree "
@@ -180,7 +301,28 @@ def main() -> int:
     updated = re.sub(
         r"(?m)^frozen_tree_hash:\s*[0-9a-f]{64}$",
         f"frozen_tree_hash: {tree_hash}", body)
-    manifest.write_text(updated, encoding="utf-8")
+    if args.runtime_dir:
+        updated = _embed_runtime_metadata(
+            updated,
+            _runtime_metadata(
+                repo, Path(args.runtime_dir).resolve(), tree_hash, head, args.pid,
+                args.callback_registration_generation,
+                Path(args.config_profile).resolve()
+                if args.config_profile else None,
+                args.ttl_seconds))
+    if args.backup_dir:
+        backup_dir = Path(args.backup_dir).resolve()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = backup_dir / f"{manifest.name}.{stamp}.bak"
+        prior = manifest.read_bytes()
+        _atomic_write_text(backup, prior.decode("utf-8"))
+        digest = hashlib.sha256(prior).hexdigest()
+        _atomic_write_text(backup.with_suffix(backup.suffix + ".sha256"),
+                           digest + "  " + backup.name + "\n")
+        print(f"manifest_backup: {backup}")
+        print(f"manifest_backup_sha256: {digest}")
+    _atomic_write_text(manifest, updated)
     print(f"re-freeze recorded: HEAD={head}")
     print(f"frozen_tree_hash: {tree_hash}")
     print(f"manifest: {manifest}")
