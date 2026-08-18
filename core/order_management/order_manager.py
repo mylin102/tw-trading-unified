@@ -1369,10 +1369,21 @@ class OrderManager:
                 _filled_qty = int(_filled_qty) if _filled_qty is not None else None
             except (TypeError, ValueError):
                 _filled_qty = None
-            self._mark_broker_terminal_without_details(
-                order, filled_qty=_filled_qty,
-                raw_payload=self._payload_to_dict(trade),
-                source=source or "reconcile", reason="DETAILS_PENDING")
+            # A broker Filled label with deal details that only account for
+            # part of the requested quantity is contradictory.  Preserve the
+            # confirmed partial quantity and lock the intent; do not advance
+            # the lifecycle or hide the remaining quantity until a later
+            # refresh proves full completion.
+            if order.filled_quantity < order.quantity:
+                if order.filled_quantity > 0:
+                    order.status = OrderStatus.PARTIAL_FILLED
+                    order.fill_accounting_status = "DETAILS_PENDING"
+                    order.updated_at = datetime.now()
+            else:
+                self._mark_broker_terminal_without_details(
+                    order, filled_qty=_filled_qty,
+                    raw_payload=self._payload_to_dict(trade),
+                    source=source or "reconcile", reason="DETAILS_PENDING")
         elif normalized_status in (OrderStatus.CANCELLED, OrderStatus.REJECTED,
                                    OrderStatus.EXPIRED) and order.status not in (
                                        OrderStatus.CANCELLED,
