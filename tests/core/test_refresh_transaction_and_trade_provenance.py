@@ -1,4 +1,5 @@
 from enum import Enum
+from types import SimpleNamespace
 import threading
 import time
 
@@ -36,6 +37,31 @@ def test_trade_normalizer_uses_nested_shioaji_fields_and_provenance():
     assert row["broker_status"] == "Filled"
     assert row["observation_type"] == "REFRESHED_TRADE"
     assert row["snapshot_generation"] == "futures-1"
+
+
+def test_missing_nested_quantity_stays_none_not_zero():
+    from strategies.futures.monitor import FuturesMonitor
+    trade = SimpleNamespace(
+        order=SimpleNamespace(id="missing-qty", seqno="s1", ordno="o1"),
+        status=SimpleNamespace(status="Submitted", deal_quantity=None,
+                                cancel_quantity=None, deals=[]),
+        contract=SimpleNamespace(code="TMFI6"))
+    row = FuturesMonitor._normalize_snapshot_trades([trade])[0]
+    assert row["requested_qty"] is None
+
+
+def test_pending_submit_then_refreshed_filled_leaves_no_active_order():
+    from core.order_management.order import OrderSide, OrderStatus, OrderType
+    from core.order_management.order_manager import OrderManager
+    mgr = OrderManager(mode="paper")
+    order = mgr.create_order("TMFI6", OrderSide.BUY, OrderType.MARKET, 1)
+    mgr.attach_submission(order.order_id, broker_order_id="refresh-1")
+    assert order.status is OrderStatus.SUBMITTED
+    mgr.reconcile_trade_snapshot(trade={
+        "broker_order_id": "refresh-1", "broker_status": "Filled",
+        "filled_qty": 1, "deals": []})
+    assert order.status is OrderStatus.FILLED
+    assert order.order_id not in mgr.active_orders
 
 
 def _monitor_for_refresh(api):
@@ -207,3 +233,20 @@ def test_broker_not_found_is_terminal_and_not_active():
     order.status = OrderStatus.BROKER_NOT_FOUND
     assert order.is_completed()
     assert not order.is_active()
+
+
+def test_near_and_far_refresh_states_are_independent():
+    from core.order_management.order import OrderSide, OrderStatus, OrderType
+    from core.order_management.order_manager import OrderManager
+    mgr = OrderManager(mode="paper")
+    near = mgr.create_order("TMFH6", OrderSide.SELL, OrderType.MARKET, 1)
+    far = mgr.create_order("TMFI6", OrderSide.BUY, OrderType.MARKET, 1)
+    mgr.attach_submission(near.order_id, broker_order_id="near-1")
+    mgr.attach_submission(far.order_id, broker_order_id="far-1")
+    mgr.reconcile_trade_snapshot(trade={
+        "broker_order_id": "near-1", "broker_status": "Filled",
+        "filled_qty": 1, "deals": []})
+    mgr.reconcile_trade_snapshot(trade={
+        "broker_order_id": "far-1", "broker_status": "Submitted"})
+    assert near.status is OrderStatus.FILLED
+    assert far.status is OrderStatus.SUBMITTED
