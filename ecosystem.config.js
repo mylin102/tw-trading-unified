@@ -24,8 +24,19 @@ const fs = require('fs');
 const path = require('path');
 
 const PROJECT_ROOT = __dirname;
+const CANONICAL_RELEASE_ROOT = '/Users/myllin_mini/Documents/mylin102/tw-trading-unified-release15';
 const isProduction = process.env.NODE_ENV === 'production'
   || process.env.DEPLOY_MODE === 'production';
+
+if (isProduction && path.resolve(PROJECT_ROOT) !== path.resolve(CANONICAL_RELEASE_ROOT)) {
+  throw new Error(
+    'RUNTIME_IDENTITY_REJECTED: production PM2 config must be loaded from '
+    + CANONICAL_RELEASE_ROOT);
+}
+if (isProduction && (PROJECT_ROOT.startsWith('/tmp/')
+    || PROJECT_ROOT.startsWith('/private/tmp/'))) {
+  throw new Error('RUNTIME_IDENTITY_REJECTED: temporary PM2 cwd is forbidden');
+}
 
 // ── 1. interpreter: explicit TRADING_PYTHON_BIN or fail-closed ────────────
 const pythonBin = process.env.TRADING_PYTHON_BIN;
@@ -77,6 +88,7 @@ try {
 const baseEnv = {
   PYTHONPATH: PROJECT_ROOT,
   PYTHONUNBUFFERED: '1',
+  TRADING_CANONICAL_ROOT: CANONICAL_RELEASE_ROOT,
   TRADING_RUNTIME_DIR: runtimeDir,
   TRADING_LOG_DIR: logDir,
   NODE_ENV: 'production',

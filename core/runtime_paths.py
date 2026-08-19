@@ -10,8 +10,49 @@ Resolution order:
   2. repo root fallback    (dev/backtest on Air4: identical to old behaviour)
 """
 import os
+import subprocess
+from typing import Optional
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_CANONICAL_RELEASE_ROOT = "/Users/myllin_mini/Documents/mylin102/tw-trading-unified-release15"
+
+
+def enforce_runtime_identity(source_file: Optional[str] = None) -> None:
+    """Fail closed when production code is launched from a temp worktree."""
+    repo_root = os.path.realpath(
+        os.path.dirname(os.path.dirname(os.path.abspath(source_file)))
+        if source_file else _REPO_ROOT
+    )
+    forbidden = ("/tmp", "/private/tmp")
+    if any(repo_root == root or repo_root.startswith(root + os.sep)
+           for root in forbidden):
+        raise RuntimeError(
+            f"RUNTIME_IDENTITY_REJECTED: source tree is temporary: {repo_root}")
+
+    if os.environ.get("NODE_ENV") != "production":
+        return
+
+    expected_root = os.path.realpath(
+        os.environ.get("TRADING_CANONICAL_ROOT", _CANONICAL_RELEASE_ROOT))
+    cwd = os.path.realpath(os.getcwd())
+    if repo_root != expected_root or cwd != expected_root:
+        raise RuntimeError(
+            "RUNTIME_IDENTITY_REJECTED: "
+            f"repo_root={repo_root} cwd={cwd} expected={expected_root}")
+
+    expected_sha = os.environ.get("LRC_RELEASE_SHA")
+    if expected_sha:
+        try:
+            actual_sha = subprocess.check_output(
+                ["git", "-C", repo_root, "rev-parse", "HEAD"],
+                text=True, stderr=subprocess.DEVNULL).strip()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise RuntimeError(
+                "RUNTIME_IDENTITY_REJECTED: cannot resolve release SHA") from exc
+        if actual_sha != expected_sha:
+            raise RuntimeError(
+                "RUNTIME_IDENTITY_REJECTED: "
+                f"actual_sha={actual_sha} expected_sha={expected_sha}")
 
 
 def runtime_root() -> str:

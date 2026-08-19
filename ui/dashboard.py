@@ -7,6 +7,8 @@ import sys
 from pathlib import Path as _Path
 from core.runtime_paths import runtime_logs, runtime_path
 sys.path.insert(0, str(_Path(__file__).parent.parent))
+from core.runtime_paths import enforce_runtime_identity
+enforce_runtime_identity(__file__)
 
 import streamlit as st
 import shioaji as sj  # GSD: Display version in sidebar

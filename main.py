@@ -16,6 +16,9 @@ from typing import Dict, Any
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from core.runtime_paths import enforce_runtime_identity
+enforce_runtime_identity(__file__)
+
 # ── [BOOT_FINGERPRINT] Unambiguous identity marker ──
 import core.futures_strategy_router as _boot_fsr
 print(
