@@ -5240,6 +5240,15 @@ class FuturesMonitor:
                 reason="callback_gap_snapshot_terminal")
         except Exception:
             pending_changed = []
+        # [RECONCILE-RULE 2026-08-19] Broker-confirmed leg-lock retirement:
+        # a lock carrying a broker_order_id the broker shows NEITHER as an
+        # open order NOR backed by a position is stale — retire it (terminal)
+        # and append to the manifest.  Only runs here (capture=OK, source
+        # live_broker) so an UNCERTAIN/failed query never mutates locks.
+        try:
+            lock_changed = self._reconcile_leg_locks_from_snapshot(snapshot)
+        except Exception:
+            lock_changed = 0
         changed = sum(1 for item in reconciled
                       if item.get("fills_added") or item.get("action") == "reconciled")
         changed += len(position_result.get("reconciled") or [])
@@ -5256,6 +5265,90 @@ class FuturesMonitor:
             pass
         return changed
 
+
+
+    def _reconcile_leg_locks_from_snapshot(self, snapshot) -> int:
+        """[RECONCILE-RULE 2026-08-19] Retire broker-confirmed-stale leg locks.
+
+        A leg lock that carries a broker_order_id which the successful broker
+        snapshot shows NEITHER as an open order NOR backed by a position is
+        stale: the broker no longer has the order and has no position behind
+        it.  Mark RETIRED_UNRESOLVED (terminal for _leg_lock_check) and append
+        a manifest record.  Locks WITHOUT broker identity are never guessed
+        (fail-closed).  Already-terminal locks are skipped.  Caller guarantees
+        capture=OK + source=live_broker — this method itself re-checks both.
+        Returns the number of locks retired.
+        """
+        if not snapshot or snapshot.get("source") != "live_broker":
+            return 0
+        if ((snapshot.get("fetch_status") or {}).get("capture") != "OK"):
+            return 0
+        try:
+            _open_ids = set()
+            for _oo in (snapshot.get("open_orders") or []):
+                for _k in ("id", "broker_order_id", "exchange_order_id"):
+                    _v = str(_oo.get(_k) or "")
+                    if _v:
+                        _open_ids.add(_v)
+            _pos_codes = set()
+            for _p in (snapshot.get("positions") or []):
+                _c = str(_p.get("code") or "")
+                if _c:
+                    _pos_codes.add(_c)
+            _locks = self._leg_lock_load()
+            _retired = []
+            for _lid, _lock in _locks.items():
+                _bid = str(_lock.get("broker_order_id") or "")
+                if not _bid:
+                    continue  # no broker identity -> never guess (rule 3)
+                _st = str(_lock.get("status") or "").upper()
+                if _st in ("FILLED", "CANCELLED", "REJECTED", "CANCELED",
+                           "EXPIRED", "RETIRED_UNRESOLVED",
+                           "BROKER_NOT_FOUND", "BROKER_RECONCILED"):
+                    continue  # already terminal
+                if _bid in _open_ids:
+                    continue  # broker still has the open order -> keep lock
+                _ct = str(_lock.get("contract") or "")
+                if _ct and _ct in _pos_codes:
+                    continue  # broker still has the position -> keep lock
+                _lock["status"] = "RETIRED_UNRESOLVED"
+                _lock["terminal"] = "BROKER_RECONCILED"
+                _lock["retirement_resolution"] = "BROKER_RECONCILED"
+                _lock["retired_by"] = "snapshot_reconcile"
+                _lock["retired_at"] = datetime.now().isoformat()
+                _retired.append({
+                    "lock_id": _lid,
+                    "trade_id": _lock.get("trade_id"),
+                    "contract": _ct,
+                    "closing_side": _lock.get("closing_side"),
+                    "broker_order_id": _bid,
+                    "snapshot_generation": snapshot.get("snapshot_generation"),
+                    "captured_at": snapshot.get("captured_at"),
+                })
+            if not _retired:
+                return 0
+            self._leg_lock_save(_locks)
+            try:
+                import json as _json
+                _m_path = os.path.join(
+                    os.path.dirname(self._leg_lock_path()),
+                    "mts_leg_locks_reconcile_manifest.jsonl")
+                with open(_m_path, "a", encoding="utf-8") as _mf:
+                    for _r in _retired:
+                        _mf.write(_json.dumps(_r, ensure_ascii=False,
+                                              default=str) + "\n")
+            except Exception:
+                pass  # manifest is best-effort; lock retirement already saved
+            for _r in _retired:
+                self._append_mts_event(
+                    "LEG_LOCK_RETIRED_BY_SNAPSHOT",
+                    reason="LEG_LOCK_RETIRED_BY_SNAPSHOT",
+                    contract=_r.get("contract"),
+                    trade_id=_r.get("trade_id"),
+                    broker_order_id=_r.get("broker_order_id"))
+            return len(_retired)
+        except Exception:
+            return 0
 
     def _lookup_reconciled_order(self, manager, order_id):
         """Resolve a reconciled order from active or completed collections."""
@@ -9844,7 +9937,8 @@ class FuturesMonitor:
         try:
             _near_id = self._leg_lock_id(near_key)
             _far_id = self._leg_lock_id(far_key)
-            _terminal = ("FILLED", "CANCELLED", "REJECTED", "CANCELED")
+            _terminal = ("FILLED", "CANCELLED", "REJECTED", "CANCELED",
+                         "EXPIRED", "RETIRED_UNRESOLVED")
             with self._leg_lock_flock(exclusive=True):
                 _locks = self._leg_lock_read()
                 _conflicts = []
@@ -10060,7 +10154,8 @@ class FuturesMonitor:
 
     def _leg_lock_release(self, key: dict,
                           only_statuses=("FILLED", "CANCELLED", "REJECTED",
-                                         "CANCELED", "EXPIRED", "SUBMIT_FAILED")) -> None:
+                                         "CANCELED", "EXPIRED", "RETIRED_UNRESOLVED",
+                                         "SUBMIT_FAILED")) -> None:
         """Release a leg lock ONLY on terminal states or SUBMIT_FAILED.
         PENDING_UNCONFIRMED is never released early (no resend)."""
         try:
@@ -10090,7 +10185,8 @@ class FuturesMonitor:
             if _lock is None:
                 return False
             if str(_lock.get("status", "")).upper() in (
-                    "FILLED", "CANCELLED", "REJECTED", "CANCELED", "EXPIRED"):
+                    "FILLED", "CANCELLED", "REJECTED", "CANCELED", "EXPIRED",
+                    "RETIRED_UNRESOLVED"):
                 return False
             self._append_mts_event(
                 "ORDER_BLOCKED_PENDING_EXISTS",
