@@ -19,10 +19,16 @@ _CANONICAL_RELEASE_ROOT = "/Users/myllin_mini/Documents/mylin102/tw-trading-unif
 
 def enforce_runtime_identity(source_file: Optional[str] = None) -> None:
     """Fail closed when production code is launched from a temp worktree."""
-    repo_root = os.path.realpath(
-        os.path.dirname(os.path.dirname(os.path.abspath(source_file)))
-        if source_file else _REPO_ROOT
-    )
+    source_dir = (os.path.dirname(os.path.abspath(source_file))
+                  if source_file else _REPO_ROOT)
+    try:
+        repo_root = os.path.realpath(subprocess.check_output(
+            ["git", "-C", source_dir, "rev-parse", "--show-toplevel"],
+            text=True, stderr=subprocess.DEVNULL).strip())
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            "RUNTIME_IDENTITY_REJECTED: cannot resolve repository root"
+        ) from exc
     forbidden = ("/tmp", "/private/tmp")
     if any(repo_root == root or repo_root.startswith(root + os.sep)
            for root in forbidden):
