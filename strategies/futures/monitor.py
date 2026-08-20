@@ -5274,8 +5274,9 @@ class FuturesMonitor:
         snapshot shows NEITHER as an open order NOR backed by a position is
         stale: the broker no longer has the order and has no position behind
         it.  Mark RETIRED_UNRESOLVED (terminal for _leg_lock_check) and append
-        a manifest record.  Locks WITHOUT broker identity are never guessed
-        (fail-closed).  Already-terminal locks are skipped.  Caller guarantees
+        a manifest record.  Locks WITHOUT broker identity OR with an empty
+        contract are never guessed (fail-closed).  Already-terminal locks are
+        skipped.  Caller guarantees
         capture=OK + source=live_broker — this method itself re-checks both.
         Returns the number of locks retired.
         """
@@ -5295,50 +5296,72 @@ class FuturesMonitor:
                 _c = str(_p.get("code") or "")
                 if _c:
                     _pos_codes.add(_c)
-            _locks = self._leg_lock_load()
             _retired = []
-            for _lid, _lock in _locks.items():
-                _bid = str(_lock.get("broker_order_id") or "")
-                if not _bid:
-                    continue  # no broker identity -> never guess (rule 3)
-                _st = str(_lock.get("status") or "").upper()
-                if _st in ("FILLED", "CANCELLED", "REJECTED", "CANCELED",
-                           "EXPIRED", "RETIRED_UNRESOLVED",
-                           "BROKER_NOT_FOUND", "BROKER_RECONCILED"):
-                    continue  # already terminal
-                if _bid in _open_ids:
-                    continue  # broker still has the open order -> keep lock
-                _ct = str(_lock.get("contract") or "")
-                if _ct and _ct in _pos_codes:
-                    continue  # broker still has the position -> keep lock
-                _lock["status"] = "RETIRED_UNRESOLVED"
-                _lock["terminal"] = "BROKER_RECONCILED"
-                _lock["retirement_resolution"] = "BROKER_RECONCILED"
-                _lock["retired_by"] = "snapshot_reconcile"
-                _lock["retired_at"] = datetime.now().isoformat()
-                _retired.append({
-                    "lock_id": _lid,
-                    "trade_id": _lock.get("trade_id"),
-                    "contract": _ct,
-                    "closing_side": _lock.get("closing_side"),
-                    "broker_order_id": _bid,
-                    "snapshot_generation": snapshot.get("snapshot_generation"),
-                    "captured_at": snapshot.get("captured_at"),
-                })
-            if not _retired:
-                return 0
-            self._leg_lock_save(_locks)
-            try:
-                import json as _json
-                _m_path = os.path.join(
-                    os.path.dirname(self._leg_lock_path()),
-                    "mts_leg_locks_reconcile_manifest.jsonl")
-                with open(_m_path, "a", encoding="utf-8") as _mf:
-                    for _r in _retired:
-                        _mf.write(_json.dumps(_r, ensure_ascii=False,
-                                              default=str) + "\n")
-            except Exception:
-                pass  # manifest is best-effort; lock retirement already saved
+            # [AUDIT-2026-08-20] ONE exclusive flock across read -> decide ->
+            # manifest -> write.  The previous _leg_lock_load()/_leg_lock_save()
+            # pair each grabbed their own flock and released it, so a
+            # concurrent writer could add an active lock between them and have
+            # it clobbered by this stale dict (duplicate-order barrier loss).
+            with self._leg_lock_flock(exclusive=True):
+                _locks = self._leg_lock_read()
+                for _lid, _lock in _locks.items():
+                    _bid = str(_lock.get("broker_order_id") or "")
+                    if not _bid:
+                        continue  # no broker identity -> never guess (rule 3)
+                    _st = str(_lock.get("status") or "").upper()
+                    if _st in ("FILLED", "CANCELLED", "REJECTED", "CANCELED",
+                               "EXPIRED", "RETIRED_UNRESOLVED",
+                               "BROKER_NOT_FOUND", "BROKER_RECONCILED"):
+                        continue  # already terminal
+                    if _bid in _open_ids:
+                        continue  # broker still has the open order -> keep lock
+                    _ct = str(_lock.get("contract") or "")
+                    # [AUDIT-2026-08-20] Empty contract = incomplete identity:
+                    # the old `if _ct and _ct in _pos_codes` silently failed for
+                    # empty contract and could retire a lock the broker may
+                    # still back.  Never guess (rule 3).
+                    if not _ct:
+                        continue
+                    if _ct in _pos_codes:
+                        continue  # broker still has the position -> keep lock
+                    _lock["status"] = "RETIRED_UNRESOLVED"
+                    _lock["terminal"] = "BROKER_RECONCILED"
+                    _lock["retirement_resolution"] = "BROKER_RECONCILED"
+                    _lock["retired_by"] = "snapshot_reconcile"
+                    _lock["retired_at"] = datetime.now().isoformat()
+                    _retired.append({
+                        "lock_id": _lid,
+                        "trade_id": _lock.get("trade_id"),
+                        "contract": _ct,
+                        "closing_side": _lock.get("closing_side"),
+                        "broker_order_id": _bid,
+                        "snapshot_generation": snapshot.get("snapshot_generation"),
+                        "captured_at": snapshot.get("captured_at"),
+                    })
+                if not _retired:
+                    return 0
+                # [AUDIT-2026-08-20] Manifest BEFORE lock mutation: a
+                # retirement must never lack audit evidence.  If the manifest
+                # cannot be written, nothing is retired and no success is
+                # reported.  The write itself raises on failure and is caught
+                # by the outer except (returns 0, no RETIRED event).
+                try:
+                    import json as _json
+                    _m_path = os.path.join(
+                        os.path.dirname(self._leg_lock_path()),
+                        "mts_leg_locks_reconcile_manifest.jsonl")
+                    with open(_m_path, "a", encoding="utf-8") as _mf:
+                        for _r in _retired:
+                            _mf.write(_json.dumps(_r, ensure_ascii=False,
+                                                  default=str) + "\n")
+                except Exception:
+                    self._append_mts_event(
+                        "LEG_LOCK_RECONCILE_MANIFEST_FAILED",
+                        reason="LEG_LOCK_RECONCILE_MANIFEST_FAILED",
+                        contract=None,
+                        detail="manifest write failed; locks NOT retired")
+                    return 0
+                self._leg_lock_write(_locks)
             for _r in _retired:
                 self._append_mts_event(
                     "LEG_LOCK_RETIRED_BY_SNAPSHOT",
