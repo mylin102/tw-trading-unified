@@ -9665,6 +9665,17 @@ class FuturesMonitor:
             except Exception:
                 pass
 
+            # Live MTS entries use one TAIFEX calendar-spread combo order.
+            # Paper mode intentionally keeps the existing two-leg simulator
+            # path until a paper combo fill model is added and verified.
+            if self.live_trading and not self.dry_run:
+                return self._submit_mts_combo_entry(
+                    trade_id=_trade_id, action=_action, reason=_reason,
+                    near_code=_near_code, far_code=_far_code,
+                    near_side=_near_side, far_side=_far_side,
+                    near_price=_near_close, far_price=_far_close,
+                    bar_dict=bar_dict, ts=_ts, snapshot=_snap)
+
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting ENTRY orders (MKP Range Market): NEAR={_near_side}, FAR={_far_side}[/yellow]")
             
             # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
@@ -9767,6 +9778,83 @@ class FuturesMonitor:
             return
 
 
+
+    def _submit_mts_combo_entry(
+        self, *, trade_id, action, reason, near_code, far_code,
+        near_side, far_side, near_price, far_price, bar_dict, ts, snapshot,
+    ):
+        """Submit a live MTS entry as one broker calendar-spread combo."""
+        from core.order_management.order import OrderSide, OrderType
+
+        _near_value = getattr(near_side, "value", near_side)
+        _far_value = getattr(far_side, "value", far_side)
+        _spread = bar_dict.get("spread")
+        try:
+            _spread = float(_spread)
+        except (TypeError, ValueError):
+            _spread = float(near_price) - float(far_price)
+        if not math.isfinite(_spread):
+            self._append_mts_event(
+                "ORDER_REJECTED_LOCAL", trade_id=trade_id,
+                strategy="MTS_ENTRY", reason="COMBO_PRICE_NONFINITE")
+            return
+        # Combo net price follows the leg order: near - far for Buy-near,
+        # far - near for Sell-near.  The broker receives per-leg actions.
+        _combo_price = _spread if action == "BUY_NEAR_SELL_FAR" else -_spread
+        _combo_legs = [
+            {"symbol": near_code, "side": str(_near_value).lower(),
+             "quantity": 1},
+            {"symbol": far_code, "side": str(_far_value).lower(),
+             "quantity": 1},
+        ]
+        try:
+            _order = self.order_mgr.create_order(
+                symbol=f"{near_code}-{far_code}", side=near_side,
+                order_type=OrderType.MKP, quantity=1, price=_combo_price,
+                strategy="MTS_ENTRY", truth_source="broker_combo",
+                combo_legs=_combo_legs, combo_strategy="TIME_SPREAD")
+        except Exception as exc:
+            self._append_mts_event(
+                "ORDER_REJECTED_LOCAL", trade_id=trade_id,
+                strategy="MTS_ENTRY", reason="COMBO_LIFECYCLE_CREATE_FAILED")
+            return
+
+        self._pending_lifecycle_orders[_order.order_id] = {
+            "intent_id": _order.intent_id, "signal": action, "reason": reason,
+            "ts": ts, "lots": 1, "price": _combo_price,
+            "ref_ohlc": snapshot, "strategy": "MTS_ENTRY",
+            "combo_legs": _combo_legs, "combo_order": True,
+        }
+        self._mts_pending_fills[trade_id] = {
+            "combo_order_id": _order.order_id,
+            "near_order_id": None, "far_order_id": None,
+            "near_filled": False, "far_filled": False,
+            "side": "SHORT" if action == "SELL_NEAR_BUY_FAR" else "LONG",
+            "spread_side": action, "near_label": "NEAR", "far_label": "FAR",
+            "near_ref": near_price, "far_ref": far_price, "ts": ts,
+            "combo": True,
+        }
+        self._append_mts_event(
+            "COMBO_ORDER_INTENT_CREATED", order_id=_order.order_id,
+            intent_id=_order.intent_id, symbol=_order.symbol,
+            side=_near_value, type="time_spread", price=_combo_price,
+            qty=1, strategy="MTS_ENTRY", trade_id=trade_id,
+            combo_legs=_combo_legs, ref_ohlc=snapshot)
+        if not self._submit_via_gateway(_order):
+            self._pending_lifecycle_orders.pop(_order.order_id, None)
+            self._mts_pending_fills.pop(trade_id, None)
+            self._append_mts_event(
+                "COMBO_ORDER_REJECTED", order_id=_order.order_id,
+                trade_id=trade_id, reason=getattr(
+                    _order, "reject_reason", "COMBO_SUBMIT_FAILED"))
+            return
+        self._append_mts_event(
+            "COMBO_ORDER_SUBMITTED", order_id=_order.order_id,
+            trade_id=trade_id, strategy="MTS_ENTRY", combo_legs=_combo_legs,
+            price=_combo_price)
+        console.print(
+            f"[green]✅ [MTS_ORDER] COMBO ENTRY SUBMITTED: "
+            f"{near_code}/{far_code} {action} price={_combo_price}[/green]")
 
     def _leg_lock_path(self) -> str:
         _p = getattr(self, "_leg_lock_store", "")
@@ -11623,6 +11711,106 @@ class FuturesMonitor:
                 bar["session_type"] = _sess
         return bar
 
+    def _reconcile_pending_mts_combos(self) -> None:
+        """Reconcile broker combo deals before promoting MTS entry state."""
+        if not self.live_trading or self.dry_run:
+            return
+        _manager = getattr(self, "order_mgr", None)
+        _adapter = getattr(_manager, "broker_adapter", None)
+        _list = getattr(_adapter, "list_combo_trades", None)
+        if _manager is None or not callable(_list):
+            return
+        _pending = getattr(self, "_mts_pending_fills", {}) or {}
+        if not any(isinstance(v, dict) and v.get("combo")
+                   for v in _pending.values()):
+            return
+        try:
+            _trades = _list()
+        except Exception:
+            return
+
+        def _value(obj, *keys):
+            for key in keys:
+                value = getattr(obj, key, None)
+                if value is None and isinstance(obj, dict):
+                    value = obj.get(key)
+                if value is not None:
+                    return value
+            return None
+
+        def _deal_summary(rows):
+            total = 0
+            notional = 0.0
+            for row in rows or []:
+                qty = _value(row, "quantity", "qty")
+                price = _value(row, "price", "fill_price")
+                try:
+                    qty = int(qty or 0)
+                    price = float(price)
+                except (TypeError, ValueError):
+                    continue
+                if qty > 0 and math.isfinite(price) and price > 0:
+                    total += qty
+                    notional += qty * price
+            return total, (notional / total if total else None)
+
+        for _trade_id, _pending in list(_pending.items()):
+            if not isinstance(_pending, dict) or not _pending.get("combo"):
+                continue
+            _order = self._get_lifecycle_order(
+                _pending.get("combo_order_id"))
+            if _order is None:
+                continue
+            _target_ids = {
+                str(x) for x in (
+                    getattr(_order, "broker_order_id", None),
+                    getattr(_order, "ordno", None),
+                    getattr(_order, "seqno", None),
+                ) if x
+            }
+            for _combo in _trades or []:
+                _combo_order = _value(_combo, "order")
+                _status = _value(_combo, "status")
+                _combo_ids = {
+                    str(x) for x in (
+                        _value(_combo_order, "id", "broker_order_id"),
+                        _value(_combo_order, "ordno"),
+                        _value(_combo_order, "seqno"),
+                        _value(_status, "id"),
+                    ) if x
+                }
+                if not _target_ids.intersection(_combo_ids):
+                    continue
+                _deals = _value(_status, "deals") or {}
+                _legs = _pending.get("combo_legs") or []
+                _prices = []
+                _complete = True
+                for _leg in _legs:
+                    _code = str(_leg.get("symbol"))
+                    _rows = (_deals.get(_code, []) if isinstance(_deals, dict)
+                             else [])
+                    _qty, _price = _deal_summary(_rows)
+                    if _qty < int(_leg.get("quantity") or 0) or _price is None:
+                        _complete = False
+                    _prices.append(_price)
+                _status_name = str(_value(_status, "status") or "")
+                _signature = repr((_status_name, _deals, _prices))
+                if _pending.get("combo_last_signature") == _signature:
+                    continue
+                _pending["combo_last_signature"] = _signature
+                if _complete and len(_prices) == 2:
+                    _pending["near_filled"] = True
+                    _pending["far_filled"] = True
+                    _pending["near_fill_price"] = _prices[0]
+                    _pending["far_fill_price"] = _prices[1]
+                try:
+                    _manager.reconcile_combo_trade_snapshot(
+                        combo_trade=_combo, source="mts_combo_refresh",
+                        reason="broker_combo_status")
+                except Exception:
+                    logger.exception("[MTS_COMBO_RECONCILE_FAILED]")
+                break
+
     def _mts_tick(self, enriched_bar: dict | None = None):
         # [P1] Periodic far snapshot refresh (60s cooldown) - inline
         _now = time.time()
@@ -11641,6 +11829,7 @@ class FuturesMonitor:
         """MTS minimal execution path. Uses enriched bar from pipeline when available,
         falls back to building bar from tick deque if none provided."""
         print("MTS_ALIVE", flush=True)
+        self._reconcile_pending_mts_combos()
 
         # [P1] observation-only: refresh persistent EXIT_ONLY_BBO_OBSERVED
         # evidence when the current capability has fresh valid dual BBO
@@ -13881,6 +14070,15 @@ class FuturesMonitor:
 
         found_tid = None
         for tid, data in self._mts_pending_fills.items():
+            if data.get("combo_order_id") == order_id and data.get("combo"):
+                # Combo reconciliation supplies the two per-leg prices from
+                # ComboStatus.deals before this helper is called.  Never
+                # synthesize leg prices from the net combo price.
+                if data.get("near_fill_price") is not None and data.get("far_fill_price") is not None:
+                    data["near_filled"] = True
+                    data["far_filled"] = True
+                    found_tid = tid
+                break
             if data.get("near_order_id") == order_id:
                 data["near_filled"] = True
                 data["near_fill_price"] = fill_price

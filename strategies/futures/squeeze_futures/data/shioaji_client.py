@@ -337,6 +337,100 @@ class ShioajiClient:
             price=getattr(order, "price", 0) or 0,
         )
 
+    def place_combo_order_object(self, order):
+        """Submit one futures calendar-spread order from a lifecycle Order.
+
+        The combo is deliberately a separate adapter method so MTS cannot
+        silently fall back to two independent leg orders.  Authorization is
+        still performed by the same execution-context gate as single orders.
+        """
+        self._gate_or_raise("place_order", order)
+        legs = getattr(order, "combo_legs", None)
+        if not isinstance(legs, list) or len(legs) != 2:
+            raise AdapterOrderError(
+                code="ADAPTER_COMBO_LEGS_INVALID",
+                context={"method": "place_combo_order_object"})
+        if self.api is None or not self.is_logged_in:
+            raise AdapterOrderError(
+                code="ADAPTER_NOT_LOGGED_IN",
+                context={"method": "place_combo_order_object"})
+
+        combo_bases = []
+        for leg in legs:
+            if not isinstance(leg, dict):
+                raise AdapterOrderError(
+                    code="ADAPTER_COMBO_LEG_INVALID",
+                    context={"method": "place_combo_order_object"})
+            symbol = leg.get("symbol") or leg.get("code")
+            side = str(leg.get("side") or "").lower()
+            quantity = leg.get("quantity")
+            if (not isinstance(symbol, str) or not symbol or side not in ("buy", "sell")
+                    or not isinstance(quantity, int) or isinstance(quantity, bool)
+                    or quantity <= 0):
+                raise AdapterOrderError(
+                    code="ADAPTER_COMBO_LEG_INVALID",
+                    context={"method": "place_combo_order_object"})
+            contract = self.get_contract(symbol)
+            if contract is None:
+                raise AdapterOrderError(
+                    code="ADAPTER_COMBO_CONTRACT_UNRESOLVED",
+                    context={"method": "place_combo_order_object"})
+            action = sj.Action.Buy if side == "buy" else sj.Action.Sell
+            combo_base_cls = getattr(getattr(sj, "contracts", sj), "ComboBase")
+            try:
+                combo_base = combo_base_cls.from_contract(contract, action=action)
+            except AttributeError:
+                combo_base = combo_base_cls(
+                    security_type=getattr(contract, "security_type"),
+                    exchange=getattr(contract, "exchange"),
+                    code=getattr(contract, "code"),
+                    symbol=getattr(contract, "symbol", symbol),
+                    category=getattr(contract, "category", ""),
+                    delivery_month=getattr(contract, "delivery_month", ""),
+                    action=action,
+                )
+            combo_bases.append(combo_base)
+
+        combo_contract_cls = getattr(getattr(sj, "contracts", sj), "ComboContract")
+        combo_contract = combo_contract_cls(legs=combo_bases)
+        combo_order_cls = getattr(
+            sj, "ComboOrder",
+            getattr(getattr(sj, "order", sj), "ComboOrder", None))
+        if combo_order_cls is None:
+            raise AdapterOrderError(
+                code="ADAPTER_COMBO_SDK_UNAVAILABLE",
+                context={"method": "place_combo_order_object"})
+        combo_order = combo_order_cls(
+            action=sj.Action.Sell,
+            price=float(getattr(order, "price", 0) or 0),
+            quantity=int(getattr(order, "quantity", 1)),
+            price_type=sj.FuturesPriceType.LMT,
+            order_type=sj.OrderType.IOC,
+            octype=sj.FuturesOCType.Auto,
+            account=self.api.futopt_account,
+        )
+        try:
+            trade = self.api.place_comboorder(combo_contract, combo_order)
+        except Exception as exc:
+            raise AdapterOrderError(
+                code="ADAPTER_COMBO_ORDER_FAILED",
+                context={"method": "place_combo_order_object"}) from exc
+        if trade is None:
+            raise AdapterOrderError(
+                code="ADAPTER_COMBO_RECEIPT_MISSING",
+                context={"method": "place_combo_order_object"})
+        return trade
+
+    def list_combo_trades(self):
+        """Read broker combo status for restart-safe MTS reconciliation."""
+        if self.api is None or not self.is_logged_in:
+            return []
+        try:
+            return list(self.api.list_combotrades() or [])
+        except Exception:
+            logger.warning("[shioaji_client] combo status refresh failed")
+            return []
+
     def get_contract(self, symbol: str):
         """Resolve one exact futures code without guessing a near/far alias.
 

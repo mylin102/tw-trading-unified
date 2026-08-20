@@ -683,9 +683,51 @@ class OrderManager:
             raise ValueError(f"Order {order.order_id} already submitted (status={order.status.value})")
 
         if self.mode == "live":
+            if getattr(order, "combo_legs", None):
+                return self._submit_live_combo(order)
             return self._submit_live(order)
         else:
             return self._submit_paper(order, exchange_ordno)
+
+    def _submit_live_combo(self, order: Order) -> bool:
+        """Submit a combo lifecycle order as one broker transaction."""
+        if self.broker_adapter is None:
+            raise RuntimeError("Live combo orders require broker_adapter")
+        submit_combo = getattr(self.broker_adapter,
+                               "place_combo_order_object", None)
+        if not callable(submit_combo):
+            self.reject(order.order_id, reason="COMBO_ADAPTER_UNAVAILABLE",
+                        source="broker_submit")
+            return False
+        try:
+            result = submit_combo(order)
+        except Exception as exc:
+            _code = getattr(exc, "code", None)
+            _reason = (_code if isinstance(_code, str)
+                       and _code.startswith("ADAPTER_COMBO_")
+                       else "ADAPTER_COMBO_ORDER_FAILED")
+            self.reject(order.order_id, reason=_reason,
+                        source="broker_combo_submit")
+            return False
+        if result is None:
+            self.reject(order.order_id, reason="BROKER_COMBO_RECEIPT_MISSING",
+                        source="broker_combo_submit")
+            return False
+        _status = getattr(result, "status", None)
+        _broker_order_id = (getattr(result, "id", None)
+                            or getattr(_status, "id", None))
+        _seqno = getattr(result, "seqno", None) or getattr(_status, "seqno", None)
+        _ordno = getattr(result, "ordno", None) or getattr(_status, "ordno", None)
+        if not any((_broker_order_id, _seqno, _ordno)):
+            self.reject(order.order_id, reason="BROKER_COMBO_RECEIPT_MISSING",
+                        source="broker_combo_submit")
+            return False
+        self.attach_submission(
+            order.order_id, broker_trade=result,
+            broker_order_id=_broker_order_id, seqno=_seqno, ordno=_ordno,
+            raw_status="Submitted", source="broker_combo_submit",
+            reason="submit_live_combo")
+        return True
 
     def _submit_live(self, order: Order) -> bool:
         if self.broker_adapter is None:
