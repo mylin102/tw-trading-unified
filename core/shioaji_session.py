@@ -47,26 +47,24 @@ def _require_ca_material(ca_path: str | None,
     Never silently continue without a readable certificate: that produces a
     misleading LIVE_READY state followed by local order rejection.
     """
-    if not isinstance(ca_path, str) or not ca_path or not isinstance(ca_passwd, str) \
-            or not ca_passwd:
+    if (not isinstance(ca_path, str) or not ca_path
+            or not isinstance(ca_passwd, str) or not ca_passwd):
         raise RuntimeError("CA configuration unavailable")
     if not os.path.isfile(ca_path):
         raise RuntimeError("CA certificate file unavailable")
     return ca_path, ca_passwd
 
 
-def _activate_futopt_ca(api: sj.Shioaji, ca_path: str, ca_passwd: str) -> None:
-    """Activate order signing for the account that will place futures orders.
-
-    Shioaji requires the certificate owner's person ID, not a certificate
-    directory or API key.  Refuse startup if login did not expose that owner;
-    an unauthenticated signing path must never reach live order placement.
-    """
+def _activate_futopt_ca(api: sj.Shioaji, ca_path: str,
+                        ca_passwd: str) -> None:
+    """Activate order signing for the futures/options account."""
     account = getattr(api, "futopt_account", None)
     person_id = getattr(account, "person_id", None)
     if not isinstance(person_id, str) or not person_id:
         raise RuntimeError("Cannot activate CA: futures account identity unavailable")
-    api.activate_ca(ca_path=ca_path, ca_passwd=ca_passwd, person_id=person_id)
+    api.activate_ca(ca_path=ca_path, ca_passwd=ca_passwd,
+                    person_id=person_id)
+
 
 def get_api() -> sj.Shioaji:
     """Get or create the singleton Shioaji API instance."""
@@ -80,10 +78,25 @@ def get_api() -> sj.Shioaji:
             _login(_api)
         return _api
 
+def _load_env_credentials():
+    """載入 Shioaji 憑證與環境變數，支援多重路徑 Fallback (包含隔離 worktree 與 runtime 目錄)
+    2026-08-18 Gemini CLI: 解決 PM2 / isolated worktree 環境下遺漏 .env 的問題
+    """
+    from dotenv import load_dotenv
+    env_candidates = [
+        os.getenv("TRADING_ENV_FILE"),
+        str(Path.cwd() / ".env"),
+        str(_PROJECT_ROOT / ".env"),
+        str(Path.home() / "Documents/mylin102/tw-trading-unified-runtime/credentials/.env"),
+    ]
+    for env_path in env_candidates:
+        if env_path and Path(env_path).is_file():
+            load_dotenv(dotenv_path=env_path, override=False)
+    load_dotenv(override=False)
+
 def _login(api: sj.Shioaji):
     """Internal login logic."""
-    from dotenv import load_dotenv
-    load_dotenv(override=True)
+    _load_env_credentials()
     
     api_key = os.getenv("SHIOAJI_API_KEY")
     secret_key = os.getenv("SHIOAJI_SECRET_KEY")
@@ -92,13 +105,16 @@ def _login(api: sj.Shioaji):
 
     if not api_key or not secret_key:
         raise ValueError("Missing Shioaji credentials in .env")
+
+    # Production order signing is fail-closed: login success is not live
+    # readiness unless the CA material and futures-account identity are valid.
     ca_path, ca_passwd = _require_ca_material(ca_path, ca_passwd)
 
     # Login
     from core.broker.shioaji_compat import safe_login
-    res = safe_login(api, api_key, secret_key, contracts_timeout=10000)
+    safe_login(api, api_key, secret_key, contracts_timeout=10000)
     logger.info(f"[session] Logged in (attempt 1)")
-    
+
     _activate_futopt_ca(api, ca_path, ca_passwd)
     logger.info("[session] CA activated for futures account")
 
@@ -117,9 +133,8 @@ def _sync_worker(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, q)
         api.fetch_contracts()
         q.put(True)
     except Exception:
-        # Child-process failures can originate in the SDK and may carry a
-        # certificate path or account context.  The parent only needs the
-        # fail-closed outcome, never provider exception text.
+        # Do not send certificate paths, account identity, or provider error
+        # text over the IPC queue.
         q.put(False)
 
 
@@ -171,8 +186,7 @@ def _fetch_contracts_subprocess(api_key: str, secret_key: str, ca_path: str, ca_
             return True
         else:
             logger.error(
-                "[V-MODEL][CONTRACT_FETCH] Subprocess failed: "
-                "CONTRACT_SYNC_FAILED"
+                f"[V-MODEL][CONTRACT_FETCH] Subprocess failed: {_val}"
             )
             return False
     except Exception:
