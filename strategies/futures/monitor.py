@@ -9665,10 +9665,11 @@ class FuturesMonitor:
             except Exception:
                 pass
 
-            # Live MTS entries use one TAIFEX calendar-spread combo order.
-            # Paper mode intentionally keeps the existing two-leg simulator
-            # path until a paper combo fill model is added and verified.
-            if self.live_trading and not self.dry_run:
+            # Both live and paper MTS entries use one calendar-spread combo
+            # lifecycle.  The paper branch uses the local two-leg fill model
+            # below; it never calls the broker adapter.
+            if ((self.live_trading and not self.dry_run)
+                    or (not self.live_trading and self.paper_fill_sim)):
                 return self._submit_mts_combo_entry(
                     trade_id=_trade_id, action=_action, reason=_reason,
                     near_code=_near_code, far_code=_far_code,
@@ -9783,7 +9784,12 @@ class FuturesMonitor:
         self, *, trade_id, action, reason, near_code, far_code,
         near_side, far_side, near_price, far_price, bar_dict, ts, snapshot,
     ):
-        """Submit a live MTS entry as one broker calendar-spread combo."""
+        """Submit one MTS combo lifecycle.
+
+        Live mode sends one broker calendar-spread order.  Paper mode sends
+        the same lifecycle through OrderManager's paper submit path and then
+        requires both synthetic leg ticks before emitting one parent fill.
+        """
         from core.order_management.order import OrderSide, OrderType
 
         _near_value = getattr(near_side, "value", near_side)
@@ -9833,6 +9839,7 @@ class FuturesMonitor:
             "spread_side": action, "near_label": "NEAR", "far_label": "FAR",
             "near_ref": near_price, "far_ref": far_price, "ts": ts,
             "combo": True,
+            "combo_legs": _combo_legs,
         }
         self._append_mts_event(
             "COMBO_ORDER_INTENT_CREATED", order_id=_order.order_id,
@@ -9852,6 +9859,18 @@ class FuturesMonitor:
             "COMBO_ORDER_SUBMITTED", order_id=_order.order_id,
             trade_id=trade_id, strategy="MTS_ENTRY", combo_legs=_combo_legs,
             price=_combo_price)
+        if not self.live_trading or self.dry_run:
+            if self.paper_fill_sim:
+                self.paper_fill_sim.register_combo(
+                    _order, near_symbol=near_code, far_symbol=far_code,
+                    metadata=self._mts_pending_fills[trade_id])
+                self.paper_fill_sim.process_combo_ticks(
+                    self._make_synthetic_tick(near_price, ts, symbol=near_code),
+                    self._make_synthetic_tick(far_price, ts, symbol=far_code))
+            console.print(
+                f"[green]✅ [MTS_ORDER] PAPER COMBO ENTRY: "
+                f"{near_code}/{far_code} {action} price={_combo_price}[/green]")
+            return
         console.print(
             f"[green]✅ [MTS_ORDER] COMBO ENTRY SUBMITTED: "
             f"{near_code}/{far_code} {action} price={_combo_price}[/green]")
