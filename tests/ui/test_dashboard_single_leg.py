@@ -1,6 +1,15 @@
 """Dashboard must expose broker-verified remaining MTS legs."""
 
-from ui.dashboard import _build_live_broker_mts_state
+from ui.dashboard import _build_live_broker_mts_state, _mts_direction_label
+
+
+def test_paper_mts_direction_falls_back_to_leg_sides():
+    assert _mts_direction_label({
+        "near_side": "SHORT", "far_side": "LONG"
+    }) == "SHORT / LONG"
+    assert _mts_direction_label({"action": "BUY_NEAR_SELL_FAR",
+                                 "near_side": "SHORT", "far_side": "LONG"}) \
+        == "BUY_NEAR_SELL_FAR"
 
 
 def test_single_remaining_far_leg_is_not_flat():

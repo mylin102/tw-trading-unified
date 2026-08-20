@@ -3415,6 +3415,26 @@ def _live_canonical_position_allowed(ctx_live: dict, canon: dict) -> bool:
     )
 
 
+def _mts_direction_label(state: dict) -> str:
+    """Return the explicit MTS direction, including paper state files.
+
+    Paper MTS state records the two leg directions as ``near_side`` and
+    ``far_side`` but historically did not persist the aggregate ``action``.
+    Do not render an open spread as ``?`` merely because that derived field is
+    absent.
+    """
+    if not isinstance(state, dict):
+        return "?"
+    action = state.get("action")
+    if action not in (None, "", "?"):
+        return str(action)
+    near_side = state.get("near_side")
+    far_side = state.get("far_side")
+    if near_side not in (None, "", "?") and far_side not in (None, "", "?"):
+        return f"{near_side} / {far_side}"
+    return "?"
+
+
 def _build_live_broker_mts_state(positions: list, canonical: dict,
                                  params: dict | None = None) -> dict | None:
     """Build broker-authoritative MTS state, including a remaining leg."""
@@ -4669,7 +4689,7 @@ elif _selected_product == "TMF":
                 _rel_label = "無" if _rel is None else f'{_rel}已釋放'
                 _c4.metric("釋放狀態", _rel_label)
                 _c5, _c6 = st.columns(2)
-                _direction = _mts_state.get("action", "?")
+                _direction = _mts_direction_label(_mts_state)
                 if _direction == "?" or _direction is None:
                     _direction = "FLAT" if not _has_pos else "?"
                 _c5.metric("方向", _direction)
