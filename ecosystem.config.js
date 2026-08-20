@@ -92,6 +92,10 @@ const baseEnv = {
   TRADING_RUNTIME_DIR: runtimeDir,
   TRADING_LOG_DIR: logDir,
   NODE_ENV: 'production',
+  // Explicit paper override for the currently approved non-live deployment.
+  // The profile and this flag must agree; PAPER_MODE alone never authorizes
+  // a live profile.
+  PAPER_MODE: 'true',
 };
 if (pythonBin) baseEnv.TRADING_PYTHON_BIN = pythonBin;
 
@@ -131,10 +135,9 @@ module.exports = {
       // SSOT: futures.yaml owns both TMF and MTX product definitions. A
       // comma-separated config list creates multiple monitors and is never a
       // production PM2 deployment mode.
-      // [sealed live profile] the production deployment runs the tracked
-      // config/futures_live.yaml profile explicitly — the paper default can
-      // never enter live certification.
-      args: `-c background ${pythonPath} main.py --config futures_live`,
+      // Current deployment is paper-only.  Live requires a separately
+      // approved futures_live profile and controlled promotion.
+      args: `-c background ${pythonPath} main.py --config futures`,
       interpreter: 'none',
       cwd: PROJECT_ROOT,
       restart_delay: 15000,
