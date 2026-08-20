@@ -5274,7 +5274,7 @@ class FuturesMonitor:
         snapshot shows NEITHER as an open order NOR backed by a position is
         stale: the broker no longer has the order and has no position behind
         it.  Mark RETIRED_UNRESOLVED (terminal for _leg_lock_check) and append
-        a manifest record.  Locks WITHOUT broker identity OR with an empty
+        a two-phase manifest record (prepared -> committed/retracted).  Locks WITHOUT broker identity OR with an empty
         contract are never guessed (fail-closed).  Already-terminal locks are
         skipped.  Caller guarantees
         capture=OK + source=live_broker — this method itself re-checks both.
@@ -5343,8 +5343,18 @@ class FuturesMonitor:
                 # [AUDIT-2026-08-20] Manifest BEFORE lock mutation: a
                 # retirement must never lack audit evidence.  If the manifest
                 # cannot be written, nothing is retired and no success is
-                # reported.  The write itself raises on failure and is caught
-                # by the outer except (returns 0, no RETIRED event).
+                # reported.
+                #
+                # [REVIEW-2026-08-20] Two-phase manifest: the manifest append
+                # and the lock write are not atomic.  The manifest therefore
+                # records stage="prepared" first; only a stage="committed"
+                # record (appended AFTER the lock write succeeds) makes the
+                # retirement true.  If the lock write fails, a stage=
+                # "retracted" record is appended and LEG_LOCK_RECONCILE_
+                # LOCK_WRITE_FAILED fires — the audit trail never claims a
+                # retirement that did not happen.  If the commit record itself
+                # cannot be appended (lock already retired), COMMIT_FAILED
+                # fires instead of failing silently.
                 try:
                     import json as _json
                     _m_path = os.path.join(
@@ -5352,8 +5362,9 @@ class FuturesMonitor:
                         "mts_leg_locks_reconcile_manifest.jsonl")
                     with open(_m_path, "a", encoding="utf-8") as _mf:
                         for _r in _retired:
-                            _mf.write(_json.dumps(_r, ensure_ascii=False,
-                                                  default=str) + "\n")
+                            _mf.write(_json.dumps(
+                                dict(_r, stage="prepared"),
+                                ensure_ascii=False, default=str) + "\n")
                 except Exception:
                     self._append_mts_event(
                         "LEG_LOCK_RECONCILE_MANIFEST_FAILED",
@@ -5361,7 +5372,51 @@ class FuturesMonitor:
                         contract=None,
                         detail="manifest write failed; locks NOT retired")
                     return 0
-                self._leg_lock_write(_locks)
+                try:
+                    self._leg_lock_write(_locks)
+                except Exception:
+                    # Lock write failed after prepared: roll the manifest back
+                    # with a retracted record so no phantom retirement stands.
+                    try:
+                        import json as _json_r
+                        with open(_m_path, "a", encoding="utf-8") as _mf:
+                            for _r in _retired:
+                                _mf.write(_json_r.dumps({
+                                    "lock_id": _r.get("lock_id"),
+                                    "broker_order_id": _r.get("broker_order_id"),
+                                    "stage": "retracted",
+                                    "reason": "lock_write_failed",
+                                    "retracted_at": datetime.now().isoformat(),
+                                }, ensure_ascii=False, default=str) + "\n")
+                    except Exception:
+                        pass  # retraction is best-effort; failure event below
+                    self._append_mts_event(
+                        "LEG_LOCK_RECONCILE_LOCK_WRITE_FAILED",
+                        reason="LEG_LOCK_RECONCILE_LOCK_WRITE_FAILED",
+                        contract=None,
+                        detail="lock write failed after manifest prepared; "
+                               "manifest retracted, locks NOT retired")
+                    return 0
+                try:
+                    import json as _json_c
+                    with open(_m_path, "a", encoding="utf-8") as _mf:
+                        for _r in _retired:
+                            _mf.write(_json_c.dumps({
+                                "lock_id": _r.get("lock_id"),
+                                "broker_order_id": _r.get("broker_order_id"),
+                                "stage": "committed",
+                                "committed_at": datetime.now().isoformat(),
+                            }, ensure_ascii=False, default=str) + "\n")
+                except Exception:
+                    # Lock IS retired but the commit record could not be
+                    # appended.  The prepared record still proves intent;
+                    # surface the inconsistency instead of hiding it.
+                    self._append_mts_event(
+                        "LEG_LOCK_RECONCILE_COMMIT_FAILED",
+                        reason="LEG_LOCK_RECONCILE_COMMIT_FAILED",
+                        contract=None,
+                        detail="lock retired but manifest commit record "
+                               "failed; prepared record remains")
             for _r in _retired:
                 self._append_mts_event(
                     "LEG_LOCK_RETIRED_BY_SNAPSHOT",
