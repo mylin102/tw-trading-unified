@@ -115,6 +115,27 @@ def test_retired_lock_writes_manifest(tmp_path):
         rec = json.loads(f.readline().strip())
     assert rec["broker_order_id"] == "broker-absent"
     assert rec["contract"] == "TMFI6"
+    assert rec["stage"] == "prepared"
+
+
+def test_successful_reconcile_appends_committed_record(tmp_path):
+    """Two-phase manifest: after the lock write succeeds a committed record
+    must follow the prepared record — the retirement is only true once
+    committed exists."""
+    mon = _monitor(tmp_path)
+    key = _lock_key()
+    _add_lock(mon, key, broker_order_id="broker-absent")
+
+    n = mon._reconcile_leg_locks_from_snapshot(_good_snapshot())
+
+    assert n == 1
+    manifest = _manifest_path(mon)
+    with open(manifest, encoding="utf-8") as f:
+        lines = [json.loads(l.strip()) for l in f if l.strip()]
+    stages = [r["stage"] for r in lines]
+    assert stages == ["prepared", "committed"]
+    assert lines[1]["lock_id"] == mon._leg_lock_id(key)
+    assert lines[1]["broker_order_id"] == "broker-absent"
 
 
 # ── Rule 2 guard: broker still has the open order -> keep ──────────────
@@ -417,5 +438,41 @@ def test_lock_write_failure_reported_as_failure(tmp_path, monkeypatch):
     n = mon._reconcile_leg_locks_from_snapshot(_good_snapshot())
 
     assert n == 0
+    assert not any(e.get("reason") == "LEG_LOCK_RETIRED_BY_SNAPSHOT"
+                   for e in mon.events)
+
+
+def test_lock_write_failure_appends_retracted_record(tmp_path, monkeypatch):
+    """Review 2026-08-20: manifest and lock write are not atomic.  If the
+    lock write fails after the prepared record, the manifest must NOT claim
+    a retirement that did not happen: a retracted record must follow, and
+    LEG_LOCK_RECONCILE_LOCK_WRITE_FAILED must fire.
+    """
+    mon = _monitor(tmp_path)
+    key = _lock_key()
+    _add_lock(mon, key, broker_order_id="broker-absent")
+
+    def boom_write(locks):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mon, "_leg_lock_write", boom_write)
+
+    n = mon._reconcile_leg_locks_from_snapshot(_good_snapshot())
+
+    assert n == 0
+    # Lock is still alive on disk.
+    locks = mon._leg_lock_load()
+    assert locks[mon._leg_lock_id(key)]["status"] == "PENDING_UNCONFIRMED"
+    # Manifest: prepared followed by retracted — no committed, no phantom.
+    manifest = _manifest_path(mon)
+    with open(manifest, encoding="utf-8") as f:
+        lines = [json.loads(l.strip()) for l in f if l.strip()]
+    stages = [r["stage"] for r in lines]
+    assert stages == ["prepared", "retracted"]
+    assert lines[1]["reason"] == "lock_write_failed"
+    assert lines[1]["lock_id"] == mon._leg_lock_id(key)
+    # Failure event fired; no false success event.
+    assert any(e.get("reason") == "LEG_LOCK_RECONCILE_LOCK_WRITE_FAILED"
+               for e in mon.events)
     assert not any(e.get("reason") == "LEG_LOCK_RETIRED_BY_SNAPSHOT"
                    for e in mon.events)
