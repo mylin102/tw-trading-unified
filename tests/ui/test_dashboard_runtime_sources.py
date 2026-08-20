@@ -41,6 +41,14 @@ def test_live_dashboard_cannot_fall_back_to_legacy_position_state():
     assert "_broker_snapshot_flat = True" in text
 
 
+def test_paper_dashboard_uses_local_mts_upl_state_only():
+    source = Path(__file__).parents[2] / "ui" / "dashboard.py"
+    text = source.read_text(encoding="utf-8")
+    assert 'active_runtime_truth.get("is_paper_runtime")' in text
+    assert '_nr = _mts_state.get("near_upl")' in text
+    assert '_fr = _mts_state.get("far_upl")' in text
+
+
 def test_calendar_live_pair_is_preferred_over_archival_csv(tmp_path, monkeypatch):
     import ui.dashboard as dashboard
     import pandas as pd

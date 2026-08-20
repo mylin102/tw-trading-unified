@@ -4764,6 +4764,16 @@ elif _selected_product == "TMF":
                 elif isinstance(_broker_mts_state, dict) and _broker_mts_state.get("has_position"):
                     _nr = _broker_mts_state.get("near_upl")
                     _fr = _broker_mts_state.get("far_upl")
+                elif (active_runtime_truth.get("is_paper_runtime")
+                      and isinstance(_mts_state, dict)
+                      and _mts_state.get("has_position")):
+                    # Paper mode has no broker/live UPL artifact.  Its
+                    # authoritative current quote PnL is written by the
+                    # paper trading monitor into the local MTS state.  Keep
+                    # this fallback paper-only; live mode remains fail-closed
+                    # and never uses local state as broker truth.
+                    _nr = _mts_state.get("near_upl")
+                    _fr = _mts_state.get("far_upl")
                 else:
                     _nr = None
                     _fr = None
