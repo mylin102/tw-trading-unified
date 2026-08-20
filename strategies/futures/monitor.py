@@ -8174,6 +8174,17 @@ class FuturesMonitor:
             self._make_synthetic_tick(far_price, ts, symbol=_far_symbol),
         ]
 
+        # Paper combo entries remain pending until both leg ticks are
+        # available.  Process that parent lifecycle first; the existing loop
+        # below continues to serve independent OCO/combined-exit orders.
+        if hasattr(self.paper_fill_sim, "process_combo_ticks"):
+            try:
+                self.paper_fill_sim.process_combo_ticks(ticks[0], ticks[1])
+            except Exception as exc:
+                import logging
+                logging.getLogger("FuturesMonitor").exception(
+                    "[MTS][PAPER_COMBO_FILL] process failed: %s", exc)
+
         for tick in ticks:
             # [ADR-010] Pre-tick guard: don't feed second tick if OCO already resolved
             _rg = None
