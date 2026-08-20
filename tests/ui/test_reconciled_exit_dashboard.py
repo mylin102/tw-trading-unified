@@ -106,6 +106,14 @@ def test_exit_only_runtime_truth_not_unknown_quarantined():
     assert paper["runtime_status"] == "PAPER_ACTIVE"
     assert paper["is_exit_only_runtime"] is False
 
+    hold = summarize_execution_context(
+        {"requested_mode": "live", "effective_mode": "live_quarantined",
+         "live_order_allowed": False, "config_hash": "cfg-live"},
+        {"futures_live.yaml": "cfg-live"})
+    assert hold["runtime_status"] == "PROMOTION_HOLD"
+    assert hold["is_promotion_hold"] is True
+    assert hold["live_order_allowed"] is False
+
 
 def test_latest_bbo_evidence_from_events(tmp_path):
     """[Dashboard] the newest event carrying bbo_hash+bbo_payload is the

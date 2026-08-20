@@ -1081,6 +1081,15 @@ def summarize_execution_context(context, known_profile_hashes):
         and not live_order_allowed
         and profile_identity == "futures_live.yaml"
     )
+    # A quarantined live context is an intentional promotion hold, not an
+    # unknown runtime.  Keep all order gates fail-closed while presenting the
+    # operator-facing state explicitly instead of claiming the context is an
+    # invalid active mode.
+    is_promotion_hold = (
+        requested_mode == "live"
+        and effective_mode == "live_quarantined"
+        and not live_order_allowed
+    )
     if is_live_runtime:
         runtime_status = "LIVE_READY"
         warning = ""
@@ -1090,6 +1099,9 @@ def summarize_execution_context(context, known_profile_hashes):
     elif is_exit_only_runtime:
         runtime_status = "RECONCILED_EXIT_ONLY"
         warning = ""
+    elif is_promotion_hold:
+        runtime_status = "PROMOTION_HOLD"
+        warning = "Live promotion is held; live orders remain disabled."
     else:
         runtime_status = "UNKNOWN / QUARANTINED"
         if not profile_identity:
@@ -1111,6 +1123,7 @@ def summarize_execution_context(context, known_profile_hashes):
         "is_live_runtime": is_live_runtime,
         "is_paper_runtime": is_paper_runtime,
         "is_exit_only_runtime": is_exit_only_runtime,
+        "is_promotion_hold": is_promotion_hold,
         "research_evidence_is_runtime_authorization": False,
     }
 
