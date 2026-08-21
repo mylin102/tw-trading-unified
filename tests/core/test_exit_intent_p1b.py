@@ -538,10 +538,46 @@ def test_b19_real_combined_exit_artifacts(tmp_path, monkeypatch):
 def test_b20_capacity_fail_closed(tmp_path):
     log = make_log(tmp_path)
     for i in range(ei.MAX_ACTIVE_INTENTS):
-        make_intent(log, trade_id=f"t{i}")
+        iid = make_intent(log, trade_id=f"t{i}")
+        # Attempted intents are not provably terminal and must continue to
+        # consume capacity until recovery resolves them.
+        log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED")
     with pytest.raises(ei.IntentCapacityError):
         make_intent(log, trade_id="overflow")
     assert len(log.list_active()) == ei.MAX_ACTIVE_INTENTS
+
+
+def test_capacity_reclaims_only_provable_terminal_states(tmp_path):
+    log = make_log(tmp_path)
+    stale = make_intent(log, trade_id="stale-not-submitted")
+    for i in range(ei.MAX_ACTIVE_INTENTS - 1):
+        iid = make_intent(log, trade_id=f"active-{i}")
+        log.transition(iid, "NEAR", "SUBMIT_ATTEMPTED")
+
+    created = make_intent(log, trade_id="after-safe-reclaim")
+    assert created
+    assert log.get(stale)["terminal"] == "CANCELED_SAFE"
+    assert len(log.list_active()) == ei.MAX_ACTIVE_INTENTS
+
+
+def test_capacity_reclaims_all_filled_without_touching_unknown(tmp_path):
+    log = make_log(tmp_path)
+    filled = make_intent(log, trade_id="stale-filled")
+    log.transition(filled, "NEAR", "SUBMIT_ATTEMPTED")
+    log.transition(filled, "NEAR", "SUBMITTED")
+    log.transition(filled, "NEAR", "FILLED")
+    log.transition(filled, "FAR", "SUBMIT_ATTEMPTED")
+    log.transition(filled, "FAR", "SUBMITTED")
+    log.transition(filled, "FAR", "FILLED")
+    unknown = make_intent(log, trade_id="unknown-submitted")
+    log.transition(unknown, "NEAR", "SUBMIT_ATTEMPTED")
+    log.transition(unknown, "NEAR", "SUBMITTED", broker_order_id="BROKER-UNKNOWN")
+
+    for i in range(ei.MAX_ACTIVE_INTENTS - 2):
+        make_intent(log, trade_id=f"active-{i}")
+    make_intent(log, trade_id="after-filled-reclaim")
+    assert log.get(filled)["terminal"] == "COMPLETED"
+    assert log.get(unknown)["terminal"] is None
 
 
 # ── B21: two INDEPENDENT IntentLog instances, public recover WITHOUT
@@ -899,7 +935,10 @@ def test_b36_intent_id_collision_resistance(tmp_path):
             ids.add(log.create(f"t{i % 3}", "COMBINED_EXIT"))
         except ei.IntentCapacityError:
             break
-    assert len(ids) <= ei.MAX_ACTIVE_INTENTS  # capacity fail-closed
+    # Unsubmitted records are reclaimed safely between creates; this test is
+    # about UUID collision resistance, while B20 covers attempted-intent
+    # capacity fail-closed behavior.
+    assert len(ids) == 60
     assert len(ids) == len(set(ids))  # all distinct (uuid, no collision)
 
 

@@ -385,6 +385,22 @@ class IntentLog:
     def _create_locked(self, trade_id: str, reason: str,
                        parent: Optional[str] = None,
                        leg: Optional[str] = None) -> dict:
+        # Reclaim only lifecycle states whose terminal outcome is provable
+        # without querying or changing broker state.  Historical intents
+        # created before the terminal callback was persisted otherwise count
+        # forever and can block a real exit at MAX_ACTIVE_INTENTS.
+        last: Dict[str, dict] = {}
+        for row in self._rows():
+            last[row["intent_id"]] = row
+        for iid, row in last.items():
+            if row.get("terminal") not in (None, "PARTIAL", "FAILED_NO_FILL"):
+                continue
+            statuses = [str(v.get("status", ""))
+                        for v in row.get("legs", {}).values()]
+            if statuses and all(s == "FILLED" for s in statuses):
+                self._transition_terminal_locked(iid, "COMPLETED")
+            elif statuses and all(s == "NOT_SUBMITTED" for s in statuses):
+                self._transition_terminal_locked(iid, "CANCELED_SAFE")
         if len(self.list_active()) >= MAX_ACTIVE_INTENTS:
             raise IntentCapacityError(f"active intents >= {MAX_ACTIVE_INTENTS}")
         uid = uuid.uuid4().hex[:12]
