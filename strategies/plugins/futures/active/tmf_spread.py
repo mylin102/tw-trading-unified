@@ -1874,6 +1874,54 @@ class TMFSpread(StrategyBase):
         self._single_leg_started_at = None
         self._ensure_lifecycle_adapter_initialized("INIT")
 
+    def _build_trend_release_input(self) -> tuple[bool, dict | None]:
+        """MTS 2.0 trend-release wiring seam (2026-08-22).
+
+        Returns (enabled, snapshot_or_None). Fail-closed by design:
+          * enabled only when env MTS_TREND_RELEASE_ENABLED == "1"
+          * snapshot only when a precomputed immutable TrendDecision-shaped
+            dict is present on the strategy (self._trend_confirmed_snapshot)
+            with required decision/asof/freshness metadata; anything missing
+            -> (False, None), never a synthesized guess.
+          * entry sides must map to a counter-trend leg (near LONG/far SHORT
+            -> release FAR; near SHORT/far LONG -> release NEAR); same-side or
+            unknown sides -> (False, None). Never inferred from current PNL.
+
+        INTEGRATION TODO (documented): the LIVE TrendDecision producer does
+        not exist yet. Production currently has no ADL-SNR / 15m / 60m
+        completed-bar producer wired to the tick path (only the pure replay
+        modules and _renko_tracker exist). This seam consumes a precomputed
+        immutable snapshot and refuses to synthesize one from incomplete
+        bars. To enable live, implement a producer that builds the snapshot
+        strictly from completed 5m/15m/60m bars as-of decision_ts with
+        freshness metadata, then assign it to self._trend_confirmed_snapshot.
+        """
+        try:
+            if os.getenv("MTS_TREND_RELEASE_ENABLED") != "1":
+                return False, None
+            snap = getattr(self, "_trend_confirmed_snapshot", None)
+            if not isinstance(snap, dict):
+                return False, None
+            _required = ("decision_ts", "pass_release", "direction", "confidence",
+                         "asof_ts", "decision_max_quote_age_ms", "window_max_quote_age_ms")
+            if not all(_k in snap for _k in _required):
+                return False, None
+            # entry-side -> counter-trend leg (pure; never PNL)
+            from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+                counter_trend_leg_from_sides,
+            )
+            _retained, _rel_leg = counter_trend_leg_from_sides(
+                getattr(self, "_near_side", None), getattr(self, "_far_side", None))
+            if _retained is None or _rel_leg is None:
+                return False, None
+            snap = dict(snap)
+            snap["release_leg"] = _rel_leg
+            snap["retained_direction"] = _retained.value if hasattr(_retained, "value") else str(_retained)
+            return True, snap
+        except Exception:
+            logger.warning("[MTS_TREND_RELEASE] seam fail-closed (exception)", exc_info=True)
+            return False, None
+
     def _ensure_lifecycle_adapter_initialized(self, source: str = "NORMAL") -> None:
         """
         Deterministic initialization boundary for MtsLifecycleAdapter.
@@ -4047,6 +4095,7 @@ class TMFSpread(StrategyBase):
 
             # 2026-07-20 Gemini CLI: PR 3B Production Decision Core Cutover (first evaluation block)
             from strategies.plugins.futures.active.mts_lifecycle_adapter import LifecycleEvaluationInput
+            _trend_enabled, _trend_snap = self._build_trend_release_input()
             _adapter_input = LifecycleEvaluationInput(
                 strategy_state={
                     "policy_j_guard_just_completed": bool(getattr(self, "_pj_guard_just_completed", False)),
@@ -4068,6 +4117,8 @@ class TMFSpread(StrategyBase):
                     "combined_upl_activation_net_pnl_twd": float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
                     "combined_upl_giveback_twd": float(self._params.get("combined_upl_giveback_twd", 100.0)),
                     "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
+                    "trend_release_enabled": (_trend_enabled, _trend_snap)[0],
+                    "trend_confirmed": (_trend_enabled, _trend_snap)[1],
                     "last_applied_event_time": self._last_applied_event_time.isoformat() if getattr(self, "_last_applied_event_time", None) else None,
                     "single_leg_started_at": self._single_leg_started_at.isoformat() if getattr(self, "_single_leg_started_at", None) else None,
                 },

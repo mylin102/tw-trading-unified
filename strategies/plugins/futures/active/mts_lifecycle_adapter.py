@@ -236,6 +236,22 @@ def calculate_peak_giveback_ratio(peak_rem_net_pnl: float, exit_rem_net_pnl: flo
         return None
     return (peak_rem_net_pnl - exit_rem_net_pnl) / peak_rem_net_pnl
 
+def counter_trend_leg_from_sides(near_side: str | None, far_side: str | None) -> tuple[Side | None, str | None]:
+    """MTS 2.0: map ENTRY sides to (retained_direction, counter_trend_leg).
+
+    Pure mapping, never reads PNL/price. near LONG + far SHORT -> BULLISH
+    retains near, releases FAR; near SHORT + far LONG -> BEARISH retains
+    far, releases NEAR. Any other combination -> (None, None) fail-closed.
+    """
+    ns = str(near_side or "").upper()
+    fs = str(far_side or "").upper()
+    if ns == "LONG" and fs == "SHORT":
+        return Side.LONG, "FAR"
+    if ns == "SHORT" and fs == "LONG":
+        return Side.SHORT, "NEAR"
+    return None, None
+
+
 def _check_manual_candidate(ctx: LifecycleContext) -> list[LifecycleDecision]:
     if ctx.manual_requested:
         return [LifecycleDecision(action=LifecycleAction.MANUAL)]
@@ -603,7 +619,22 @@ class MtsLifecycleAdapter:
         giveback_twd = float(state.get("combined_upl_giveback_twd", 100.0))
         peak_net_exit_pnl = float(state.get("peak_net_exit_pnl_twd", 0.0))
         guard_just_completed = bool(state.get("policy_j_guard_just_completed", False))
-        
+        # MTS 2.0 trend-release seam (2026-08-22): surfaced from strategy_state.
+        # Fail-closed defaults: disabled/None unless the caller supplied a valid
+        # immutable TrendDecision snapshot with decision/freshness metadata.
+        trend_enabled = bool(state.get("trend_release_enabled", False))
+        trend_confirmed = state.get("trend_confirmed") or None
+        if trend_confirmed is not None:
+            if not isinstance(trend_confirmed, dict):
+                trend_confirmed = None  # never trust a non-dict snapshot
+            else:
+                # Immutable TrendDecision snapshot requires decision/asof/freshness
+                # metadata; any missing field -> fail closed (never release from
+                # an incomplete-bar snapshot).
+                _required = ("decision_ts", "pass_release", "direction", "confidence",
+                             "asof_ts", "decision_max_quote_age_ms", "window_max_quote_age_ms")
+                if not all(_k in trend_confirmed for _k in _required):
+                    trend_confirmed = None  # incomplete snapshot -> fail closed
         ctx = LifecycleContext(
             near_pnl_pts=near_pnl,
             far_pnl_pts=far_pnl,
@@ -625,6 +656,8 @@ class MtsLifecycleAdapter:
             combined_upl_giveback_twd=giveback_twd,
             peak_net_exit_pnl_twd=peak_net_exit_pnl,
             policy_j_guard_just_completed=guard_just_completed,
+            trend_release_enabled=trend_enabled,
+            trend_confirmed=trend_confirmed,
         )
         
         # Calculate time above breakeven
