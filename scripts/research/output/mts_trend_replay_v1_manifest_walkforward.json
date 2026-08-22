@@ -1,0 +1,102 @@
+{
+  "harness": "mts_trend_replay_v1",
+  "version": "1.2",
+  "mode": "walk_forward",
+  "content_sha256": "7ffd33ee8d94f4db046ab69418a5f4987148b2d8f91d4377bf00daec68a11037",
+  "variant": "TOLERANT_VELOCITY",
+  "variant_params": {
+    "chop_vetoes": false,
+    "velocity_check": true,
+    "velocity_min_abs_slope_pts": 0.05,
+    "description": "TOLERANT + 15m near-far spread velocity agrees with trend"
+  },
+  "no_eval_window_tuning": true,
+  "fills_path": "data/frozen/parity_final/mts_trade_fills.jsonl",
+  "episodes": 35,
+  "shared_cost": {
+    "broker_fee": 20.0,
+    "tax_rate": 2e-05,
+    "point_value": 10.0
+  },
+  "windows": [
+    {
+      "name": "W1",
+      "dates": [
+        "2026-07-08",
+        "2026-07-09",
+        "2026-07-13"
+      ],
+      "oos": false,
+      "episodes": 12,
+      "eligible": 12,
+      "skipped": 0,
+      "coverage": 1.0,
+      "pnl": -16559.85,
+      "avg_pnl": -1379.99,
+      "max_drawdown": 23407.55,
+      "release": 6,
+      "combined": 6,
+      "exit_count": 24,
+      "baseline_pnl": -15889.93,
+      "baseline_release": 12,
+      "norevt_pnl": -22519.97,
+      "block_reason_distribution": {
+        "DIVERGENCE_OR_INSUFFICIENT": 4,
+        "VELOCITY_OPPOSITE": 1,
+        "INSUFFICIENT_SAME_DIRECTION": 1
+      }
+    },
+    {
+      "name": "W2",
+      "dates": [
+        "2026-07-14",
+        "2026-07-15",
+        "2026-07-16",
+        "2026-07-17"
+      ],
+      "oos": true,
+      "episodes": 23,
+      "eligible": 22,
+      "skipped": 1,
+      "coverage": 0.9565,
+      "pnl": 8683.87,
+      "avg_pnl": 394.72,
+      "max_drawdown": 9714.26,
+      "release": 5,
+      "combined": 17,
+      "exit_count": 44,
+      "baseline_pnl": 3213.34,
+      "baseline_release": 22,
+      "norevt_pnl": 2853.75,
+      "block_reason_distribution": {
+        "INSUFFICIENT_SAME_DIRECTION": 13,
+        "DIVERGENCE_OR_INSUFFICIENT": 4
+      }
+    }
+  ],
+  "oos": {
+    "name": "W2",
+    "dates": [
+      "2026-07-14",
+      "2026-07-15",
+      "2026-07-16",
+      "2026-07-17"
+    ],
+    "episodes": 23,
+    "eligible": 22,
+    "coverage": 0.9565,
+    "pnl": 8683.87,
+    "baseline_pnl": 3213.34,
+    "avg_pnl": 394.72,
+    "max_drawdown": 9714.26,
+    "release": 5,
+    "combined": 17,
+    "exit_count": 44,
+    "block_reason_distribution": {
+      "INSUFFICIENT_SAME_DIRECTION": 13,
+      "DIVERGENCE_OR_INSUFFICIENT": 4
+    }
+  },
+  "verdict": "ROBUST",
+  "verdict_reason": "all_oos_conditions_met"
+}
