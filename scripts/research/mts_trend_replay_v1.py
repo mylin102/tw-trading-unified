@@ -242,12 +242,21 @@ def _aggregate_completed_5m_blocks(five: list[dict], minutes: int) -> list[dict]
 def walk_trend_confirmation(keys: list[str], bars: dict[str, dict],
                             ts_from: str, ts_to: str, expected: TrendDirection | None = None,
                             ep: dict | None = None) -> dict | None:
-    """Find earliest as-of decision where completed 60m, 15m and pipeline align."""
+    """Find earliest as-of decision where completed 60m, 15m and pipeline align.
+
+    P0 (2026-08-22): pre-warm history — the 5m aggregation starts 60 minutes
+    BEFORE entry so ADL/regime/15m have their completed blocks available at the
+    first post-entry decision bar. Decision iteration still begins at the first
+    bar whose asof_ts >= entry_ts (never fires on pre-entry bars).
+    """
     if ep is not None and expected is None: expected, _ = entry_trend_mapping(ep)
     expected = expected or TrendDirection.UNKNOWN
-    five = agg_5m(keys, bars, "NEAR", ts_from, ts_to)
+    _warmup_from = _fmt(_dt(ts_from) - timedelta(minutes=60))
+    five = agg_5m(keys, bars, "NEAR", _warmup_from, ts_to)
     telemetry = []
-    for i, decision_bar in enumerate(five):
+    _entry_idx = next((i for i, b in enumerate(five) if _dt(b["asof_ts"]) >= _dt(ts_from)), 0)
+    for i in range(_entry_idx, len(five)):
+        decision_bar = five[i]
         dts = decision_bar["ts"]
         f_before = five[:i + 1]
         if len(f_before) < 12:
@@ -261,7 +270,12 @@ def walk_trend_confirmation(keys: list[str], bars: dict[str, dict],
             continue
         regime = _direction(h[-1])
         exit_dir = _direction(q[-1]) if q else TrendDirection.UNKNOWN
-        if regime != expected or exit_dir != expected:
+        # P1 loose 2-of-3 (2026-08-22): CHOP regime/exit does NOT veto; only a
+        # genuinely OPPOSITE (divergent) block does. The 2-of-3 arbitration
+        # inside the pipeline decides. Fail-closed if either is UNKNOWN.
+        _opposite_regime = regime in (TrendDirection.BEARISH, TrendDirection.BULLISH) and regime != expected
+        _opposite_exit = exit_dir in (TrendDirection.BEARISH, TrendDirection.BULLISH) and exit_dir != expected
+        if regime == TrendDirection.UNKNOWN or exit_dir == TrendDirection.UNKNOWN or _opposite_regime or _opposite_exit:
             reason = "INSUFFICIENT_SAME_DIRECTION"
             telemetry.append({"decision_ts": dts, "block_reason": reason, "signal_timestamps": {"adl": dts, "regime_60m": h[-1]["ts"], "exit_15m": q[-1]["ts"] if q else None}})
             continue
@@ -269,7 +283,7 @@ def walk_trend_confirmation(keys: list[str], bars: dict[str, dict],
         d["regime_60m"] = regime.value; d["exit_15m_direction"] = exit_dir.value
         d["signal_timestamps"] = {"adl": dts, "regime_60m": h[-1]["ts"], "exit_15m": q[-1]["ts"]}
         telemetry.append(d)
-        if d.get("pass_release") and d.get("direction") == expected.value:
+        if d.get("pass_release") and d.get("direction") == expected.value:  # P1: exact-direction pass only
             j = i + 1
             if j < len(five):
                 d["bar_ts"] = dts; d["execution_ts"] = five[j]["ts"]; d["execution_bar"] = five[j]
