@@ -8,8 +8,11 @@ Phase 2 — frozen replay variants (shared cost model, pre-registered params):
   and the SAME fill/execution semantics (next completed bar close).
 
 Phase 3 — multi-window walk-forward OOS:
-  * deterministic date split, LAST window = OOS, no eval-window tuning
-  * verdict HOLD when OOS loses to baseline; ROBUST when it beats it
+  * deterministic date split, LAST n_oos_windows = OOS, no eval-window tuning
+  * ROBUST requires >= OOS_MIN_ELIGIBLE (30) total OOS eligible across
+    >= OOS_MIN_WINDOWS (2) OOS windows AND OOS pnl > OOS baseline
+  * verdict HOLD / status RESEARCH_INSUFFICIENT_OOS_SAMPLE when the OOS
+    sample itself is insufficient (too few eligible or too few OOS windows)
 """
 import csv
 import json
@@ -272,6 +275,13 @@ def test_walk_forward_oos_split_no_eval_window_tuning(tmp_path):
     assert res["oos"]["name"] == "W2"
     assert res["oos"]["coverage"] >= 0.9
     assert res["oos"]["release"] > 0
+    # OOS sample is insufficient (2-day synthetic: W2 eligible=5 < 30, 1 OOS window < 2)
+    assert res["verdict"] == "HOLD"
+    assert res["status"] == "RESEARCH_INSUFFICIENT_OOS_SAMPLE"
+    assert "oos_insufficient_eligible" in res["verdict_reason"]
+    assert "oos_insufficient_windows" in res["verdict_reason"]
+    assert res["oos_summary"]["eligible_total"] == res["oos"]["eligible"]
+    assert res["oos_summary"]["windows"] == 1
 
 
 def test_walk_forward_hold_when_oos_loses_to_baseline(tmp_path, monkeypatch):
@@ -291,17 +301,88 @@ def test_walk_forward_hold_when_oos_loses_to_baseline(tmp_path, monkeypatch):
 
 
 def test_walk_forward_robust_when_oos_beats_baseline(tmp_path, monkeypatch):
+    """ROBUST requires >=30 total OOS eligible across >=2 OOS windows.
+
+    We monkeypatch _simulate_arm so the OOS windows carry a sufficient,
+    beat-baseline sample; the gate logic itself is what is under test.
+    """
     fills_path = _write_two_day_synthetic(tmp_path)
 
-    def _good_walk(keys, bars, ts_from, ts_to, expected=None, ep=None, **kwargs):
-        exp = expected or TrendDirection.BULLISH
-        return {"execution_bar": {"close": 45000.0}, "pass_release": True,
-                "direction": exp.value, "decision_ts": ts_from, "block_reason": None}
+    def _good_sim(arm, episodes, keys, near, far, telemetry_out=None, variant="TOLERANT"):
+        if arm == "TREND_CONFIRMED_RELEASE":
+            return {"eligible": 20, "skipped": 0, "pnl": 4000.0, "pnls": [200.0] * 20,
+                    "avg_pnl": 200.0, "max_drawdown": 100.0, "release": 10,
+                    "combined": 10, "exit_count": 40, "coverage": 1.0}
+        return {"eligible": 20, "skipped": 0, "pnl": 2000.0, "pnls": [100.0] * 20,
+                "avg_pnl": 100.0, "max_drawdown": 50.0, "release": 20,
+                "combined": 0, "exit_count": 40, "coverage": 1.0}
 
-    monkeypatch.setattr(h, "walk_trend_confirmation", _good_walk)
-    res = h.run_walk_forward(fills_path=fills_path, bars_root=str(tmp_path), variant="TOLERANT")
+    monkeypatch.setattr(h, "_simulate_arm", _good_sim)
+    res = h.run_walk_forward(fills_path=fills_path, bars_root=str(tmp_path), variant="TOLERANT",
+                             windows=[
+                                 {"name": "W1", "dates": ["2026-01-05"], "oos": False},
+                                 {"name": "W2", "dates": ["2026-01-06"], "oos": True},
+                                 {"name": "W3", "dates": ["2026-01-07"], "oos": True},
+                             ])
     assert res["verdict"] == "ROBUST"
+    assert res["status"] == "OBSERVED"
     assert res["verdict_reason"] == "all_oos_conditions_met"
+    assert res["oos_summary"]["windows"] == 2
+    assert res["oos_summary"]["eligible_total"] == 40
+    assert res["oos_summary"]["pnl_total"] > res["oos_summary"]["baseline_pnl_total"]
+    assert res["oos_summary"]["release_total"] > 0
+    assert res["oos_summary"]["coverage_min"] >= 0.9
     assert res["oos"]["pnl"] > res["oos"]["baseline_pnl"]
     assert res["oos"]["release"] > 0
     assert res["oos"]["coverage"] >= 0.9
+
+
+def test_walk_forward_hold_when_eligible_below_30(tmp_path, monkeypatch):
+    """OOS eligible total < 30 -> HOLD / RESEARCH_INSUFFICIENT_OOS_SAMPLE."""
+    fills_path = _write_two_day_synthetic(tmp_path)
+
+    def _small_sim(arm, episodes, keys, near, far, telemetry_out=None, variant="TOLERANT"):
+        if arm == "TREND_CONFIRMED_RELEASE":
+            return {"eligible": 10, "skipped": 0, "pnl": 5000.0, "pnls": [500.0] * 10,
+                    "avg_pnl": 500.0, "max_drawdown": 100.0, "release": 5,
+                    "combined": 5, "exit_count": 20, "coverage": 1.0}
+        return {"eligible": 10, "skipped": 0, "pnl": 1000.0, "pnls": [100.0] * 10,
+                "avg_pnl": 100.0, "max_drawdown": 50.0, "release": 10,
+                "combined": 0, "exit_count": 20, "coverage": 1.0}
+
+    monkeypatch.setattr(h, "_simulate_arm", _small_sim)
+    res = h.run_walk_forward(fills_path=fills_path, bars_root=str(tmp_path), variant="TOLERANT",
+                             windows=[
+                                 {"name": "W1", "dates": ["2026-01-05"], "oos": False},
+                                 {"name": "W2", "dates": ["2026-01-06"], "oos": True},
+                                 {"name": "W3", "dates": ["2026-01-07"], "oos": True},
+                             ])
+    assert res["verdict"] == "HOLD"
+    assert res["status"] == "RESEARCH_INSUFFICIENT_OOS_SAMPLE"
+    assert "oos_insufficient_eligible:20<30" in res["verdict_reason"]
+    assert res["oos_summary"]["eligible_total"] == 20
+
+
+def test_walk_forward_hold_when_single_oos_window(tmp_path, monkeypatch):
+    """Only 1 OOS window -> HOLD / RESEARCH_INSUFFICIENT_OOS_SAMPLE."""
+    fills_path = _write_two_day_synthetic(tmp_path)
+
+    def _good_sim(arm, episodes, keys, near, far, telemetry_out=None, variant="TOLERANT"):
+        if arm == "TREND_CONFIRMED_RELEASE":
+            return {"eligible": 40, "skipped": 0, "pnl": 8000.0, "pnls": [200.0] * 40,
+                    "avg_pnl": 200.0, "max_drawdown": 100.0, "release": 20,
+                    "combined": 20, "exit_count": 80, "coverage": 1.0}
+        return {"eligible": 40, "skipped": 0, "pnl": 4000.0, "pnls": [100.0] * 40,
+                "avg_pnl": 100.0, "max_drawdown": 50.0, "release": 40,
+                "combined": 0, "exit_count": 80, "coverage": 1.0}
+
+    monkeypatch.setattr(h, "_simulate_arm", _good_sim)
+    res = h.run_walk_forward(fills_path=fills_path, bars_root=str(tmp_path), variant="TOLERANT",
+                             windows=[
+                                 {"name": "W1", "dates": ["2026-01-05"], "oos": False},
+                                 {"name": "W2", "dates": ["2026-01-06"], "oos": True},
+                             ])
+    assert res["verdict"] == "HOLD"
+    assert res["status"] == "RESEARCH_INSUFFICIENT_OOS_SAMPLE"
+    assert "oos_insufficient_windows:1<2" in res["verdict_reason"]
+    assert res["oos_summary"]["windows"] == 1
