@@ -57,6 +57,7 @@ class LifecycleAction(Enum):
     STOPLOSS = "STOPLOSS"
     TIMEOUT = "TIMEOUT"
     COMBINED_EXIT = "COMBINED_EXIT"  # 2026-07-26 Gemini CLI: Policy J Primary Exit (Both Legs Simultaneous)
+    TREND_RELEASE = "TREND_RELEASE"  # 2026-08-22 MTS 2.0: Trend-Confirmed Release (counter-trend leg)
     RELEASE = "RELEASE"
     TRAIL = "TRAIL"
 
@@ -175,6 +176,9 @@ class LifecycleContext:
     peak_net_exit_pnl_twd: float = 0.0
     combined_exit_execution_enabled: bool = True
     policy_j_guard_just_completed: bool = False  # 2026-08-04: baseline tick, skip giveback eval
+    # MTS 2.0 trend-release support (2026-08-22): disabled by default (MTS_TREND_RELEASE_ENABLED=0).
+    trend_release_enabled: bool = False
+    trend_confirmed: dict | None = None  # Immutable TrendDecision snapshot dict (see mts_trend_signal_adapter.TrendDecision.to_dict)
 
 @dataclass(frozen=True)
 class LifecycleEvaluationInput:
@@ -362,6 +366,40 @@ def _check_release_candidates(
     )
     return []
 
+
+def _check_trend_release_candidates(
+    ctx: LifecycleContext, lifecycle: PositionLifecycle,
+) -> list[LifecycleDecision]:
+    """MTS 2.0: Trend-confirmed release (spec 5.5 priority chain).
+
+    Consumes an immutable TrendDecision snapshot (dict) computed upstream at
+    decision_ts. BLOCK unless: trend release enabled, phase==SPREAD,
+    release_group ARMED/INACTIVE, no exit owner, pass_release True, and a
+    valid release_leg (NEAR/FAR). The released leg is the counter-trend leg.
+    """
+    if not getattr(ctx, "trend_release_enabled", False):
+        return []
+    tc = getattr(ctx, "trend_confirmed", None)
+    if not isinstance(tc, dict) or not tc.get("pass_release"):
+        return []
+    _phase_val = enum_value(lifecycle.phase)
+    if _phase_val != "SPREAD":
+        return []
+    _rg_status = enum_value(lifecycle.release_group.status)
+    _owner = getattr(lifecycle, "exit_owner", None)
+    if _owner == "POLICY_J" or _rg_status in (
+        "TRIGGERED", "SUBMITTING", "SUBMITTED", "PARTIALLY_FILLED", "FILLED", "COMPLETED"
+    ):
+        return []
+    if _rg_status not in ("ARMED", "INACTIVE"):
+        return []
+    release_leg = tc.get("release_leg")
+    if release_leg not in ("NEAR", "FAR"):
+        return []
+    return [LifecycleDecision(action=LifecycleAction.TREND_RELEASE,
+                              release_leg=Leg(release_leg),
+                              winner="TREND_CONFIRMED_RELEASE")]
+
 def _check_trail_candidate(
     ctx: LifecycleContext, lifecycle: PositionLifecycle,
 ) -> list[LifecycleDecision]:
@@ -386,6 +424,7 @@ _LIFECYCLE_ACTION_PRIORITY = [
     LifecycleAction.STOPLOSS,
     LifecycleAction.TIMEOUT,
     LifecycleAction.COMBINED_EXIT, # 2026-07-26 Gemini CLI: Policy J Primary Exit priority over Release
+    LifecycleAction.TREND_RELEASE, # 2026-08-22 MTS 2.0: trend release below Policy J & hard stop, above protective RELEASE
     LifecycleAction.RELEASE,
     LifecycleAction.TRAIL,
 ]
@@ -407,6 +446,7 @@ def evaluate_lifecycle_actions(
     candidates.extend(_check_stoploss_candidate(ctx))
     candidates.extend(_check_timeout_candidate(ctx))
     candidates.extend(_check_combined_upl_trail_candidate(ctx, lifecycle)) # Policy J Primary Exit
+    candidates.extend(_check_trend_release_candidates(ctx, lifecycle))     # MTS 2.0 Trend-Confirmed Release
     candidates.extend(_check_release_candidates(ctx, lifecycle))           # ADR-011 Secondary Fallback
     candidates.extend(_check_trail_candidate(ctx, lifecycle))
 
