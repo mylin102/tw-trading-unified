@@ -23,12 +23,15 @@ VARIANT_PARAMS at the top of this module and are immutable (MappingProxyType):
                         VELOCITY_OPPOSITE.
 
 Phase 3 (2026-08-22): multi-window walk-forward.  run_walk_forward() splits
-the fills-covered dates into contiguous windows, designates the LAST window as
-out-of-sample (OOS), and records earlier windows only as observation.  There
-is NO parameter optimization on the evaluation window — parameters are
-pre-registered and fixed (no_eval_window_tuning=True).  OOS is ROBUST iff
-(a) OOS pnl > OOS baseline pnl under the SAME pessimistic cost model,
-(b) OOS release count > 0, and (c) coverage >= 0.9; otherwise HOLD.
+the fills-covered dates into contiguous windows, designates the LAST
+``n_oos_windows`` windows as out-of-sample (OOS), and records earlier windows
+only as observation.  There is NO parameter optimization on the evaluation
+window — parameters are pre-registered and fixed (no_eval_window_tuning=True).
+OOS is ROBUST iff (a) total OOS eligible >= OOS_MIN_ELIGIBLE (30),
+(b) at least OOS_MIN_WINDOWS (2) OOS windows, (c) aggregate OOS pnl > OOS
+baseline pnl under the SAME pessimistic cost model, (d) OOS release count > 0,
+and (e) OOS coverage >= 0.9; otherwise HOLD with status
+RESEARCH_INSUFFICIENT_OOS_SAMPLE when the OOS sample itself is insufficient.
 """
 from __future__ import annotations
 
@@ -69,7 +72,8 @@ TAX_RATE = 2e-5
 SHARED_COST = {"broker_fee": BROKER_FEE, "tax_rate": TAX_RATE, "point_value": POINT_VALUE}
 
 MIN_ELIGIBLE_FOR_APPROVAL = 30
-OOS_MIN_ELIGIBLE = 5
+OOS_MIN_ELIGIBLE = 30
+OOS_MIN_WINDOWS = 2
 ARMS = ("BASELINE_SINGLE_LEG_RELEASE", "TREND_CONFIRMED_RELEASE", "NO_REVT")
 SELF_PATH = Path(__file__)
 
@@ -552,20 +556,23 @@ def _episode_entry_date(ep: dict) -> str:
     return normalize_ts(an.get("timestamp", ""))[:10] if an else ""
 
 
-def split_windows(fills: list[dict], n_windows: int = 2) -> list[dict]:
+def split_windows(fills: list[dict], n_windows: int = 2,
+                  n_oos_windows: int = 1) -> list[dict]:
     """Deterministic split of fills-covered dates into contiguous windows.
 
-    The LAST window is designated out-of-sample (OOS).  Windows are disjoint
-    and cover every fills date.  Earlier windows serve only as observation —
-    parameters are pre-registered and fixed (no tuning on the eval window).
+    The LAST ``n_oos_windows`` windows are designated out-of-sample (OOS);
+    earlier windows serve only as observation.  Windows are disjoint and cover
+    every fills date.  Parameters are pre-registered and fixed (no tuning on
+    the eval window).
     """
     dates = sorted({normalize_ts(f.get("timestamp", ""))[:10] for f in fills if f.get("timestamp")})
     dates = [d for d in dates if d]
     if not dates:
         return []
     n = min(n_windows, len(dates))
+    n_oos = max(1, min(n_oos_windows, n))
     groups = [dates[i * len(dates) // n:(i + 1) * len(dates) // n] for i in range(n)]
-    return [{"name": f"W{i + 1}", "dates": g, "oos": i == n - 1} for i, g in enumerate(groups)]
+    return [{"name": f"W{i + 1}", "dates": g, "oos": i >= n - n_oos} for i, g in enumerate(groups)]
 
 
 def run_walk_forward(fills_path="", bars_root="", variant="TOLERANT",
@@ -607,27 +614,41 @@ def run_walk_forward(fills_path="", bars_root="", variant="TOLERANT",
             "norevt_pnl": round(norevt["pnl"], 2),
             "block_reason_distribution": _block_distribution(telemetry),
         })
-    oos = per_window[-1] if per_window else None
-    if oos is None or oos["episodes"] == 0:
-        return {"harness": "mts_trend_replay_v1", "version": "1.2", "mode": "walk_forward",
+    oos_windows = [w for w in per_window if w["oos"]]
+    if not per_window or not oos_windows:
+        return {"harness": "mts_trend_replay_v1", "version": "1.3", "mode": "walk_forward",
                 "content_sha256": _self_sha256(), "variant": variant,
                 "variant_params": _variant_params(variant), "no_eval_window_tuning": True,
                 "fills_path": str(fills_path), "episodes": len(episodes),
                 "shared_cost": SHARED_COST, "windows": per_window,
-                "oos": None, "verdict": "HOLD",
-                "verdict_reason": "oos_insufficient_eligible:no_oos_episodes"}
+                "oos": None, "status": "RESEARCH_INSUFFICIENT_OOS_SAMPLE",
+                "verdict": "HOLD",
+                "verdict_reason": "oos_insufficient_eligible:no_oos_windows"}
+    oos = oos_windows[-1]  # display metrics of the LAST OOS window (unchanged)
+    oos_eligible_total = sum(w["eligible"] for w in oos_windows)
+    n_oos = len(oos_windows)
+    oos_pnl_total = sum(w["pnl"] for w in oos_windows)
+    oos_baseline_total = sum(w["baseline_pnl"] for w in oos_windows)
+    oos_release_total = sum(w["release"] for w in oos_windows)
+    oos_coverage_min = min(w["coverage"] for w in oos_windows)
     reasons = []
-    if oos["eligible"] < OOS_MIN_ELIGIBLE:
-        reasons.append(f"oos_insufficient_eligible:{oos['eligible']}<{OOS_MIN_ELIGIBLE}")
-    if not (oos["pnl"] > oos["baseline_pnl"]):
-        reasons.append(f"oos_pnl_not_above_baseline:{oos['pnl']}<={oos['baseline_pnl']}")
-    if oos["release"] <= 0:
+    if oos_eligible_total < OOS_MIN_ELIGIBLE:
+        reasons.append(f"oos_insufficient_eligible:{oos_eligible_total}<{OOS_MIN_ELIGIBLE}")
+    if n_oos < OOS_MIN_WINDOWS:
+        reasons.append(f"oos_insufficient_windows:{n_oos}<{OOS_MIN_WINDOWS}")
+    if not (oos_pnl_total > oos_baseline_total):
+        reasons.append(f"oos_pnl_not_above_baseline:{oos_pnl_total}<={oos_baseline_total}")
+    if oos_release_total <= 0:
         reasons.append("oos_no_release")
-    if oos["coverage"] < 0.9:
-        reasons.append(f"oos_coverage_below_0.9:{oos['coverage']}")
+    if oos_coverage_min < 0.9:
+        reasons.append(f"oos_coverage_below_0.9:{oos_coverage_min}")
     robust = not reasons
+    if not robust and any(r.startswith("oos_insufficient") for r in reasons):
+        status = "RESEARCH_INSUFFICIENT_OOS_SAMPLE"
+    else:
+        status = "OBSERVED" if robust else "RESEARCH_INSUFFICIENT_SAMPLE"
     return {
-        "harness": "mts_trend_replay_v1", "version": "1.2", "mode": "walk_forward",
+        "harness": "mts_trend_replay_v1", "version": "1.3", "mode": "walk_forward",
         "content_sha256": _self_sha256(), "variant": variant,
         "variant_params": _variant_params(variant), "no_eval_window_tuning": True,
         "fills_path": str(fills_path), "episodes": len(episodes),
@@ -638,6 +659,15 @@ def run_walk_forward(fills_path="", bars_root="", variant="TOLERANT",
                 "avg_pnl": oos["avg_pnl"], "max_drawdown": oos["max_drawdown"],
                 "release": oos["release"], "combined": oos["combined"], "exit_count": oos["exit_count"],
                 "block_reason_distribution": oos["block_reason_distribution"]},
+        "oos_summary": {
+            "windows": n_oos,
+            "eligible_total": oos_eligible_total,
+            "pnl_total": round(oos_pnl_total, 2),
+            "baseline_pnl_total": round(oos_baseline_total, 2),
+            "release_total": oos_release_total,
+            "coverage_min": round(oos_coverage_min, 4),
+        },
+        "status": status,
         "verdict": "ROBUST" if robust else "HOLD",
         "verdict_reason": "; ".join(reasons) if reasons else "all_oos_conditions_met",
     }
@@ -717,7 +747,10 @@ def main(argv=None):
         if oos:
             print(f"[OOS {oos['name']}] eligible={oos['eligible']} coverage={oos['coverage']} pnl={oos['pnl']} baseline_pnl={oos['baseline_pnl']} release={oos['release']} combined={oos['combined']} exit_count={oos['exit_count']} avg_pnl={oos['avg_pnl']} max_drawdown={oos['max_drawdown']}")
             print("  block_reason_distribution:", json.dumps(oos["block_reason_distribution"], sort_keys=True))
-        print(f"OOS verdict : {res['verdict']}\nreason      : {res['verdict_reason']}")
+        if res.get("oos_summary"):
+            s = res["oos_summary"]
+            print(f"OOS summary : windows={s['windows']} eligible_total={s['eligible_total']} pnl_total={s['pnl_total']} baseline_pnl_total={s['baseline_pnl_total']} release_total={s['release_total']} coverage_min={s['coverage_min']}")
+        print(f"OOS status  : {res.get('status')}\nOOS verdict : {res['verdict']}\nreason      : {res['verdict_reason']}")
         print("=" * 76); print("manifest ->", path); return 0
     res = run_replay(fills, root, variant=variant)
     if res.get("error"): print("mts_trend_replay_v1: no fills log found under", root); return 2
@@ -731,4 +764,4 @@ def main(argv=None):
 
 if __name__ == "__main__": raise SystemExit(main())
 
-__all__ = ["agg_5m", "entry_trend_mapping", "walk_trend_confirmation", "_trend_decision", "gates_met", "run_replay", "run_all_variants", "run_walk_forward", "split_windows", "build_manifest", "cost", "leg_pnl", "VARIANT_PARAMS", "VALID_VARIANTS", "ARMS", "MIN_ELIGIBLE_FOR_APPROVAL", "OOS_MIN_ELIGIBLE", "SHARED_COST"]
+__all__ = ["agg_5m", "entry_trend_mapping", "walk_trend_confirmation", "_trend_decision", "gates_met", "run_replay", "run_all_variants", "run_walk_forward", "split_windows", "build_manifest", "cost", "leg_pnl", "VARIANT_PARAMS", "VALID_VARIANTS", "ARMS", "MIN_ELIGIBLE_FOR_APPROVAL", "OOS_MIN_ELIGIBLE", "OOS_MIN_WINDOWS", "SHARED_COST"]
