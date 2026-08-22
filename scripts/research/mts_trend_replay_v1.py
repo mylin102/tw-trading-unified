@@ -12,9 +12,17 @@ import bisect
 import csv
 import hashlib
 import json
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# 2026-08-22 MTS2: when run as a script, sys.path[0] is scripts/research/
+# (not the repo root), so the real trend modules would fail to import and
+# the fallback stub would silently mask every signal. Insert the repo root.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 HAS_MODULES = True
 try:
