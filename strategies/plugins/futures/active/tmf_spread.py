@@ -1906,6 +1906,23 @@ class TMFSpread(StrategyBase):
                          "asof_ts", "decision_max_quote_age_ms", "window_max_quote_age_ms")
             if not all(_k in snap for _k in _required):
                 return False, None
+            # ── Phase 1 (2026-08-22): freshness VALUE gate + session gate ──
+            # Presence alone is not enough: stale / non-finite / negative ages
+            # must fail closed (never release from a stale snapshot).
+            try:
+                _d_age = float(snap.get("decision_max_quote_age_ms"))
+                _w_age = float(snap.get("window_max_quote_age_ms"))
+                _max_age = float(getattr(self, "_max_quote_age_ms", 1000.0))
+            except (TypeError, ValueError):
+                return False, None
+            if not (0.0 <= _d_age <= _max_age) or not (0.0 <= _w_age <= _max_age):
+                return False, None
+            # session gate: snapshot session must match the position session
+            _snap_sess = snap.get("session") or snap.get("session_type")
+            _pos_sess = getattr(self, "_position_session_type", None)
+            if _pos_sess is not None and _snap_sess is not None:
+                if str(_snap_sess) != str(_pos_sess):
+                    return False, None
             # entry-side -> counter-trend leg (pure; never PNL)
             from strategies.plugins.futures.active.mts_lifecycle_adapter import (
                 counter_trend_leg_from_sides,
