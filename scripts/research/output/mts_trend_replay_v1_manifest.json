@@ -1,7 +1,7 @@
 {
   "harness": "mts_trend_replay_v1",
   "version": "1.1",
-  "content_sha256": "c2af56cf4f325ecc530dfb6727b9ca66fc2d41233314ef4a8ea471ca8fe81ee0",
+  "content_sha256": "ebb3c7247e835d1f0bc67b2bd01bbf7af2f5a5428810936b22e69ac514c0fd2a",
   "eligible": 34,
   "coverage": 0.9714,
   "coverage_per_arm": {
@@ -60,14 +60,14 @@
     "TREND_CONFIRMED_RELEASE": {
       "eligible": 34,
       "skipped": 1,
-      "pnl": -24276.308399999994,
+      "pnl": -9176.0064,
       "pnls": [
         -4396.7356,
-        -3346.8706,
+        -586.8154,
         -26.89020000000005,
         -4176.8632,
         -3736.7612,
-        -3906.7622,
+        -4506.7742,
         1993.6282,
         -2766.8226000000004,
         2724.2272000000003,
@@ -75,19 +75,19 @@
         3453.9453999999996,
         -2366.6182,
         -1676.6220000000003,
-        4363.314,
-        -2076.5984,
-        -1935.8092000000006,
-        2733.3742,
-        -2146.5678,
+        5853.3438,
+        1453.4722,
+        5114.3318,
+        2493.3694,
+        -1246.5498,
         5553.639800000001,
         -2446.7942000000003,
         -6436.334,
         2733.9361999999996,
         -2385.9922,
         3343.8131999999996,
-        -2776.9028,
-        -3066.7754,
+        -3156.9103999999998,
+        -2476.7635999999998,
         -2575.7628000000004,
         3204.2632000000003,
         -1745.8366,
@@ -97,10 +97,10 @@
         -1685.8629999999998,
         3103.6044000000006
       ],
-      "avg_pnl": -714.01,
-      "max_drawdown": 27379.91,
-      "release": 12,
-      "combined": 22,
+      "avg_pnl": -269.88,
+      "max_drawdown": 18204.03,
+      "release": 17,
+      "combined": 17,
       "exit_count": 68,
       "coverage": 0.9714
     },
@@ -153,7 +153,8 @@
     }
   },
   "block_reason_distribution": {
-    "DIVERGENCE_OR_INSUFFICIENT": 22
+    "DIVERGENCE_OR_INSUFFICIENT": 6,
+    "INSUFFICIENT_SAME_DIRECTION": 11
   },
   "episode_first_confirm_or_block": {
     "mts-20260709-085624": {
@@ -167,10 +168,10 @@
         "asof_ts": null,
         "detail": {
           "decision_ts": "2026-07-09 10:39:00",
-          "brick_size": 74.47619047619048,
-          "last_brick_close": 46080.0,
+          "brick_size": 74.6086956521739,
+          "last_brick_close": 46138.78260869565,
           "last_price": 46080.0,
-          "consecutive_same_direction": 3,
+          "consecutive_same_direction": 2,
           "direction": "DOWN",
           "brick_reverse": true,
           "n_bricks": 18
@@ -202,7 +203,7 @@
           "vwap_std": 100.96520254523773,
           "last_price": 46080.0,
           "deviation": -121.31795386158774,
-          "atr_1m": 148.95238095238096,
+          "atr_1m": 149.2173913043478,
           "deviation_status": "BELOW",
           "n_samples": 48,
           "n_samples_in_window": 48,
@@ -234,276 +235,81 @@
       }
     },
     "mts-20260709-125527": {
-      "decision_ts": "2026-07-09 12:59:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-      "signal_timestamps": {
-        "adl": "2026-07-09 12:59:00",
-        "regime_60m": null,
-        "exit_15m": null
-      },
-      "telemetry": [
-        {
-          "decision_ts": "2026-07-09 12:59:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-09 12:59:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
+      "decision_ts": "2026-07-09 13:04:00",
+      "direction": "BEARISH",
+      "confidence": 0.825,
+      "renko": {
+        "source": "renko",
+        "direction": "BEARISH",
+        "score": 1.0,
+        "asof_ts": null,
+        "detail": {
           "decision_ts": "2026-07-09 13:04:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-09 13:04:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 13:09:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-09 13:09:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 13:14:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-09 13:14:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 13:19:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-09 13:19:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 13:24:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-09 13:24:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 13:29:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-09 13:29:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 13:34:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-09 13:34:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 13:39:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-09 13:39:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 13:44:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-09 13:44:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 13:49:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-09 13:49:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 15:04:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 15:04:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 15:09:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 15:09:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 15:14:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 15:14:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 15:19:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 15:19:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 15:24:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 15:24:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 15:29:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 15:29:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 15:34:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 15:34:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 15:39:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 15:39:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 15:44:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 15:44:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 15:49:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 15:49:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 15:54:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 15:54:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 15:59:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 15:59:00",
-            "regime_60m": "2026-07-09 15:59:00",
-            "exit_15m": "2026-07-09 15:59:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 16:04:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 16:04:00",
-            "regime_60m": "2026-07-09 15:59:00",
-            "exit_15m": "2026-07-09 15:59:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 16:09:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 16:09:00",
-            "regime_60m": "2026-07-09 15:59:00",
-            "exit_15m": "2026-07-09 15:59:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 16:14:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 16:14:00",
-            "regime_60m": "2026-07-09 15:59:00",
-            "exit_15m": "2026-07-09 16:14:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 16:19:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 16:19:00",
-            "regime_60m": "2026-07-09 15:59:00",
-            "exit_15m": "2026-07-09 16:14:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 16:24:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 16:24:00",
-            "regime_60m": "2026-07-09 15:59:00",
-            "exit_15m": "2026-07-09 16:14:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-09 16:29:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-09 16:29:00",
-            "regime_60m": "2026-07-09 15:59:00",
-            "exit_15m": "2026-07-09 16:29:00"
-          }
+          "brick_size": 45.0,
+          "last_brick_close": 46030.0,
+          "last_price": 46023.0,
+          "consecutive_same_direction": 2,
+          "direction": "DOWN",
+          "brick_reverse": true,
+          "n_bricks": 7
         }
-      ]
+      },
+      "adl": {
+        "source": "adl",
+        "direction": "CHOP",
+        "score": 0.5,
+        "asof_ts": null,
+        "detail": {
+          "decision_ts": "2026-07-09 13:04:00",
+          "adl_value": -329.2197577744378,
+          "slope": -4.560022672444825,
+          "residual_std": 108.52261526253008,
+          "snr": -0.5042292008235645,
+          "direction": "CHOP",
+          "n_bars": 12
+        }
+      },
+      "vwap": {
+        "source": "vwap",
+        "direction": "BEARISH",
+        "score": 1.0,
+        "asof_ts": null,
+        "detail": {
+          "decision_ts": "2026-07-09 13:04:00",
+          "vwap": 46068.86416861827,
+          "vwap_std": 28.827766091827236,
+          "last_price": 46023.0,
+          "deviation": -45.864168618267286,
+          "atr_1m": 90.0,
+          "deviation_status": "BELOW",
+          "n_samples": 48,
+          "n_samples_in_window": 48,
+          "samples_missing": false
+        }
+      },
+      "pass_release": true,
+      "block_reason": null,
+      "decision_max_quote_age_ms": 0.0,
+      "window_max_quote_age_ms": 0.0,
+      "signal_timestamps": {
+        "adl": "2026-07-09 13:04:00",
+        "regime_60m": "2026-07-09 12:59:00",
+        "exit_15m": "2026-07-09 12:59:00"
+      },
+      "regime_60m": "BEARISH",
+      "exit_15m_direction": "BEARISH",
+      "bar_ts": "2026-07-09 13:04:00",
+      "execution_ts": "2026-07-09 13:09:00",
+      "execution_bar": {
+        "ts": "2026-07-09 13:09:00",
+        "open": 46025.0,
+        "high": 46032.0,
+        "low": 45920.0,
+        "close": 45944.0,
+        "volume": 229.0,
+        "leg": "NEAR",
+        "asof_ts": "2026-07-09 13:09:00"
+      }
     },
     "mts-20260709-170042": {
       "decision_ts": "2026-07-09 18:49:00",
@@ -516,13 +322,13 @@
         "asof_ts": null,
         "detail": {
           "decision_ts": "2026-07-09 18:49:00",
-          "brick_size": 30.681818181818183,
-          "last_brick_close": 46090.59090909092,
+          "brick_size": 29.220588235294116,
+          "last_brick_close": 46083.117647058825,
           "last_price": 46074.0,
           "consecutive_same_direction": 3,
           "direction": "DOWN",
           "brick_reverse": true,
-          "n_bricks": 11
+          "n_bricks": 14
         }
       },
       "adl": {
@@ -551,7 +357,7 @@
           "vwap_std": 40.032149061155486,
           "last_price": 46074.0,
           "deviation": -30.705394190874358,
-          "atr_1m": 61.36363636363637,
+          "atr_1m": 58.44117647058823,
           "deviation_status": "BELOW",
           "n_samples": 48,
           "n_samples_in_window": 48,
@@ -593,8 +399,8 @@
         "asof_ts": null,
         "detail": {
           "decision_ts": "2026-07-13 09:59:00",
-          "brick_size": 96.61538461538461,
-          "last_brick_close": 45987.53846153847,
+          "brick_size": 99.03333333333333,
+          "last_brick_close": 46005.8,
           "last_price": 45973.0,
           "consecutive_same_direction": 3,
           "direction": "DOWN",
@@ -628,7 +434,7 @@
           "vwap_std": 60.488697453345075,
           "last_price": 45973.0,
           "deviation": -50.22211507553584,
-          "atr_1m": 193.23076923076923,
+          "atr_1m": 198.06666666666666,
           "deviation_status": "NEUTRAL",
           "n_samples": 48,
           "n_samples_in_window": 48,
@@ -941,7 +747,7 @@
       ]
     },
     "mts-20260713-175629": {
-      "decision_ts": "2026-07-13 19:59:00",
+      "decision_ts": "2026-07-13 18:14:00",
       "direction": "BEARISH",
       "confidence": 1.0,
       "renko": {
@@ -950,14 +756,14 @@
         "score": 1.0,
         "asof_ts": null,
         "detail": {
-          "decision_ts": "2026-07-13 19:59:00",
-          "brick_size": 22.82,
-          "last_brick_close": 46038.72,
-          "last_price": 46021.0,
-          "consecutive_same_direction": 4,
+          "decision_ts": "2026-07-13 18:14:00",
+          "brick_size": 22.6875,
+          "last_brick_close": 46054.5625,
+          "last_price": 46035.0,
+          "consecutive_same_direction": 3,
           "direction": "DOWN",
           "brick_reverse": true,
-          "n_bricks": 16
+          "n_bricks": 9
         }
       },
       "adl": {
@@ -966,11 +772,11 @@
         "score": 1.0,
         "asof_ts": null,
         "detail": {
-          "decision_ts": "2026-07-13 19:59:00",
-          "adl_value": -146.63402130249762,
-          "slope": -15.924675614380892,
-          "residual_std": 74.7188066513512,
-          "snr": -2.5575368957204576,
+          "decision_ts": "2026-07-13 18:14:00",
+          "adl_value": -192.0257170439777,
+          "slope": -14.944959301675976,
+          "residual_std": 82.70198179165584,
+          "snr": -2.1685031672324793,
           "direction": "BEARISH",
           "n_bars": 12
         }
@@ -981,12 +787,12 @@
         "score": 1.0,
         "asof_ts": null,
         "detail": {
-          "decision_ts": "2026-07-13 19:59:00",
-          "vwap": 46050.33681462141,
-          "vwap_std": 31.813898752306855,
-          "last_price": 46021.0,
-          "deviation": -29.336814621412486,
-          "atr_1m": 45.64,
+          "decision_ts": "2026-07-13 18:14:00",
+          "vwap": 46074.30172413793,
+          "vwap_std": 33.91933123618605,
+          "last_price": 46035.0,
+          "deviation": -39.30172413792752,
+          "atr_1m": 45.375,
           "deviation_status": "BELOW",
           "n_samples": 48,
           "n_samples_in_window": 48,
@@ -998,23 +804,23 @@
       "decision_max_quote_age_ms": 0.0,
       "window_max_quote_age_ms": 0.0,
       "signal_timestamps": {
-        "adl": "2026-07-13 19:59:00",
-        "regime_60m": "2026-07-13 19:59:00",
-        "exit_15m": "2026-07-13 19:59:00"
+        "adl": "2026-07-13 18:14:00",
+        "regime_60m": "2026-07-13 17:59:00",
+        "exit_15m": "2026-07-13 18:14:00"
       },
       "regime_60m": "BEARISH",
       "exit_15m_direction": "BEARISH",
-      "bar_ts": "2026-07-13 19:59:00",
-      "execution_ts": "2026-07-13 20:04:00",
+      "bar_ts": "2026-07-13 18:14:00",
+      "execution_ts": "2026-07-13 18:19:00",
       "execution_bar": {
-        "ts": "2026-07-13 20:04:00",
-        "open": 46025.0,
-        "high": 46040.0,
-        "low": 45988.0,
-        "close": 45997.0,
-        "volume": 264.0,
+        "ts": "2026-07-13 18:19:00",
+        "open": 46040.0,
+        "high": 46071.0,
+        "low": 46040.0,
+        "close": 46057.0,
+        "volume": 75.0,
         "leg": "NEAR",
-        "asof_ts": "2026-07-13 20:04:00"
+        "asof_ts": "2026-07-13 18:19:00"
       }
     },
     "mts-20260714-203416": {
@@ -1028,13 +834,13 @@
         "asof_ts": null,
         "detail": {
           "decision_ts": "2026-07-14 22:14:00",
-          "brick_size": 39.76190476190476,
-          "last_brick_close": 45335.42857142855,
+          "brick_size": 37.303030303030305,
+          "last_brick_close": 45332.30303030303,
           "last_price": 45311.0,
-          "consecutive_same_direction": 3,
+          "consecutive_same_direction": 4,
           "direction": "DOWN",
           "brick_reverse": true,
-          "n_bricks": 8
+          "n_bricks": 25
         }
       },
       "adl": {
@@ -1063,7 +869,7 @@
           "vwap_std": 73.1775861962133,
           "last_price": 45311.0,
           "deviation": -71.71127167630038,
-          "atr_1m": 79.52380952380952,
+          "atr_1m": 74.60606060606061,
           "deviation_status": "BELOW",
           "n_samples": 48,
           "n_samples_in_window": 48,
@@ -1096,7 +902,7 @@
     },
     "mts-20260716-131700": {
       "decision_ts": "2026-07-16 13:19:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+      "block_reason": "INSUFFICIENT_SAME_DIRECTION",
       "signal_timestamps": {
         "adl": "2026-07-16 13:19:00",
         "regime_60m": null,
@@ -1105,7 +911,7 @@
       "telemetry": [
         {
           "decision_ts": "2026-07-16 13:19:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 13:19:00",
             "regime_60m": null,
@@ -1114,7 +920,7 @@
         },
         {
           "decision_ts": "2026-07-16 13:24:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 13:24:00",
             "regime_60m": null,
@@ -1123,7 +929,7 @@
         },
         {
           "decision_ts": "2026-07-16 13:29:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 13:29:00",
             "regime_60m": null,
@@ -1134,7 +940,7 @@
     },
     "mts-auto-001713-248": {
       "decision_ts": "2026-07-17 00:19:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+      "block_reason": "INSUFFICIENT_SAME_DIRECTION",
       "signal_timestamps": {
         "adl": "2026-07-17 00:19:00",
         "regime_60m": null,
@@ -1143,7 +949,7 @@
       "telemetry": [
         {
           "decision_ts": "2026-07-17 00:19:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 00:19:00",
             "regime_60m": null,
@@ -1152,7 +958,7 @@
         },
         {
           "decision_ts": "2026-07-17 00:24:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 00:24:00",
             "regime_60m": null,
@@ -1161,7 +967,7 @@
         },
         {
           "decision_ts": "2026-07-17 00:29:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 00:29:00",
             "regime_60m": null,
@@ -1170,7 +976,7 @@
         },
         {
           "decision_ts": "2026-07-17 00:34:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 00:34:00",
             "regime_60m": null,
@@ -1179,7 +985,7 @@
         },
         {
           "decision_ts": "2026-07-17 00:39:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 00:39:00",
             "regime_60m": null,
@@ -1188,7 +994,7 @@
         },
         {
           "decision_ts": "2026-07-17 00:44:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 00:44:00",
             "regime_60m": null,
@@ -1197,7 +1003,7 @@
         },
         {
           "decision_ts": "2026-07-17 00:49:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 00:49:00",
             "regime_60m": null,
@@ -1206,7 +1012,7 @@
         },
         {
           "decision_ts": "2026-07-17 00:54:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 00:54:00",
             "regime_60m": null,
@@ -1215,29 +1021,29 @@
         },
         {
           "decision_ts": "2026-07-17 00:59:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 00:59:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-17 00:59:00",
+            "exit_15m": "2026-07-17 00:59:00"
           }
         },
         {
           "decision_ts": "2026-07-17 01:04:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 01:04:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-17 00:59:00",
+            "exit_15m": "2026-07-17 00:59:00"
           }
         },
         {
           "decision_ts": "2026-07-17 01:09:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 01:09:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-17 00:59:00",
+            "exit_15m": "2026-07-17 00:59:00"
           }
         },
         {
@@ -1245,8 +1051,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 01:14:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-17 00:59:00",
+            "exit_15m": "2026-07-17 01:14:00"
           }
         },
         {
@@ -1254,8 +1060,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 01:19:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-17 00:59:00",
+            "exit_15m": "2026-07-17 01:14:00"
           }
         },
         {
@@ -1263,8 +1069,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 01:24:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-17 00:59:00",
+            "exit_15m": "2026-07-17 01:14:00"
           }
         },
         {
@@ -1272,8 +1078,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 01:29:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-17 00:59:00",
+            "exit_15m": "2026-07-17 01:29:00"
           }
         },
         {
@@ -1281,8 +1087,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 01:34:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-17 00:59:00",
+            "exit_15m": "2026-07-17 01:29:00"
           }
         },
         {
@@ -1290,8 +1096,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 01:39:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-17 00:59:00",
+            "exit_15m": "2026-07-17 01:29:00"
           }
         },
         {
@@ -1299,8 +1105,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 01:44:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-17 00:59:00",
+            "exit_15m": "2026-07-17 01:44:00"
           }
         },
         {
@@ -1308,8 +1114,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 01:49:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-17 00:59:00",
+            "exit_15m": "2026-07-17 01:44:00"
           }
         },
         {
@@ -1317,8 +1123,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-17 01:54:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-17 00:59:00",
+            "exit_15m": "2026-07-17 01:44:00"
           }
         },
         {
@@ -1458,8 +1264,8 @@
         },
         {
           "decision_ts": "2026-07-17 03:14:00",
-          "direction": "CHOP",
-          "confidence": 0.15,
+          "direction": "BULLISH",
+          "confidence": 0.45,
           "renko": {
             "source": "renko",
             "direction": "CHOP",
@@ -1467,13 +1273,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-17 03:14:00",
-              "brick_size": 33.138888888888886,
-              "last_brick_close": 44643.0,
+              "brick_size": 36.59375,
+              "last_brick_close": 44657.21875,
               "last_price": 44626.0,
               "consecutive_same_direction": 1,
-              "direction": "DOWN",
+              "direction": "UP",
               "brick_reverse": true,
-              "n_bricks": 16
+              "n_bricks": 27
             }
           },
           "adl": {
@@ -1493,8 +1299,8 @@
           },
           "vwap": {
             "source": "vwap",
-            "direction": "BEARISH",
-            "score": -1.0,
+            "direction": "CHOP",
+            "score": 0.5,
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-17 03:14:00",
@@ -1502,15 +1308,15 @@
               "vwap_std": 25.292567859657296,
               "last_price": 44626.0,
               "deviation": -20.77946127946052,
-              "atr_1m": 66.27777777777777,
-              "deviation_status": "BELOW",
+              "atr_1m": 73.1875,
+              "deviation_status": "NEUTRAL",
               "n_samples": 48,
               "n_samples_in_window": 48,
               "samples_missing": false
             }
           },
           "pass_release": false,
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "decision_max_quote_age_ms": 0.0,
           "window_max_quote_age_ms": 0.0,
           "signal_timestamps": {
@@ -1532,13 +1338,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-17 03:19:00",
-              "brick_size": 33.0,
-              "last_brick_close": 44643.0,
+              "brick_size": 36.41836734693877,
+              "last_brick_close": 44657.744897959186,
               "last_price": 44624.0,
               "consecutive_same_direction": 1,
-              "direction": "DOWN",
+              "direction": "UP",
               "brick_reverse": true,
-              "n_bricks": 16
+              "n_bricks": 27
             }
           },
           "adl": {
@@ -1567,7 +1373,7 @@
               "vwap_std": 24.287948886920034,
               "last_price": 44624.0,
               "deviation": -21.998433829285204,
-              "atr_1m": 66.0,
+              "atr_1m": 72.83673469387755,
               "deviation_status": "BELOW",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -1597,13 +1403,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-17 03:24:00",
-              "brick_size": 32.94736842105263,
-              "last_brick_close": 44610.05263157895,
+              "brick_size": 36.31,
+              "last_brick_close": 44585.45000000001,
               "last_price": 44585.0,
               "consecutive_same_direction": 2,
               "direction": "DOWN",
               "brick_reverse": true,
-              "n_bricks": 17
+              "n_bricks": 29
             }
           },
           "adl": {
@@ -1632,7 +1438,7 @@
               "vwap_std": 20.768022503629005,
               "last_price": 44585.0,
               "deviation": -37.727649006621505,
-              "atr_1m": 65.89473684210526,
+              "atr_1m": 72.62,
               "deviation_status": "BELOW",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -1680,30 +1486,198 @@
         },
         {
           "decision_ts": "2026-07-17 03:44:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "direction": "CHOP",
+          "confidence": -0.175,
+          "renko": {
+            "source": "renko",
+            "direction": "BEARISH",
+            "score": -1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-17 03:44:00",
+              "brick_size": 35.73148148148148,
+              "last_brick_close": 44588.34259259259,
+              "last_price": 44602.0,
+              "consecutive_same_direction": 2,
+              "direction": "DOWN",
+              "brick_reverse": true,
+              "n_bricks": 29
+            }
+          },
+          "adl": {
+            "source": "adl",
+            "direction": "CHOP",
+            "score": 0.5,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-17 03:44:00",
+              "adl_value": 247.39776644202038,
+              "slope": -2.038070456187485,
+              "residual_std": 165.8504673550217,
+              "snr": -0.14746322827317662,
+              "direction": "CHOP",
+              "n_bars": 12
+            }
+          },
+          "vwap": {
+            "source": "vwap",
+            "direction": "CHOP",
+            "score": 0.5,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-17 03:44:00",
+              "vwap": 44599.840452261305,
+              "vwap_std": 8.23208710394375,
+              "last_price": 44602.0,
+              "deviation": 2.1595477386945277,
+              "atr_1m": 71.46296296296296,
+              "deviation_status": "NEUTRAL",
+              "n_samples": 48,
+              "n_samples_in_window": 48,
+              "samples_missing": false
+            }
+          },
+          "pass_release": false,
+          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "decision_max_quote_age_ms": 0.0,
+          "window_max_quote_age_ms": 0.0,
           "signal_timestamps": {
             "adl": "2026-07-17 03:44:00",
             "regime_60m": "2026-07-17 02:59:00",
             "exit_15m": "2026-07-17 03:44:00"
-          }
+          },
+          "regime_60m": "BULLISH",
+          "exit_15m_direction": "CHOP"
         },
         {
           "decision_ts": "2026-07-17 03:49:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "direction": "CHOP",
+          "confidence": -0.475,
+          "renko": {
+            "source": "renko",
+            "direction": "BEARISH",
+            "score": -1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-17 03:49:00",
+              "brick_size": 35.64545454545455,
+              "last_brick_close": 44588.77272727273,
+              "last_price": 44559.0,
+              "consecutive_same_direction": 2,
+              "direction": "DOWN",
+              "brick_reverse": true,
+              "n_bricks": 31
+            }
+          },
+          "adl": {
+            "source": "adl",
+            "direction": "CHOP",
+            "score": 0.5,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-17 03:49:00",
+              "adl_value": -175.03117863208598,
+              "slope": 1.4650816263163178,
+              "residual_std": 161.47357299704152,
+              "snr": 0.10887836988186023,
+              "direction": "CHOP",
+              "n_bars": 12
+            }
+          },
+          "vwap": {
+            "source": "vwap",
+            "direction": "BEARISH",
+            "score": -1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-17 03:49:00",
+              "vwap": 44588.25824517735,
+              "vwap_std": 18.95834080045733,
+              "last_price": 44559.0,
+              "deviation": -29.258245177348726,
+              "atr_1m": 71.2909090909091,
+              "deviation_status": "BELOW",
+              "n_samples": 48,
+              "n_samples_in_window": 48,
+              "samples_missing": false
+            }
+          },
+          "pass_release": false,
+          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "decision_max_quote_age_ms": 0.0,
+          "window_max_quote_age_ms": 0.0,
           "signal_timestamps": {
             "adl": "2026-07-17 03:49:00",
             "regime_60m": "2026-07-17 02:59:00",
             "exit_15m": "2026-07-17 03:44:00"
-          }
+          },
+          "regime_60m": "BULLISH",
+          "exit_15m_direction": "CHOP"
         },
         {
           "decision_ts": "2026-07-17 03:54:00",
+          "direction": "BULLISH",
+          "confidence": 0.375,
+          "renko": {
+            "source": "renko",
+            "direction": "CHOP",
+            "score": 0.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-17 03:54:00",
+              "brick_size": 35.955357142857146,
+              "last_brick_close": 44623.17857142858,
+              "last_price": 44658.0,
+              "consecutive_same_direction": 1,
+              "direction": "UP",
+              "brick_reverse": true,
+              "n_bricks": 30
+            }
+          },
+          "adl": {
+            "source": "adl",
+            "direction": "CHOP",
+            "score": 0.5,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-17 03:54:00",
+              "adl_value": 438.49916324825597,
+              "slope": 22.52987514686651,
+              "residual_std": 202.13954327078332,
+              "snr": 1.337484472608831,
+              "direction": "CHOP",
+              "n_bars": 12
+            }
+          },
+          "vwap": {
+            "source": "vwap",
+            "direction": "BULLISH",
+            "score": 1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-17 03:54:00",
+              "vwap": 44611.86108108108,
+              "vwap_std": 36.79893724844574,
+              "last_price": 44658.0,
+              "deviation": 46.13891891892126,
+              "atr_1m": 71.91071428571429,
+              "deviation_status": "ABOVE",
+              "n_samples": 48,
+              "n_samples_in_window": 48,
+              "samples_missing": false
+            }
+          },
+          "pass_release": false,
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "decision_max_quote_age_ms": 0.0,
+          "window_max_quote_age_ms": 0.0,
           "signal_timestamps": {
             "adl": "2026-07-17 03:54:00",
             "regime_60m": "2026-07-17 02:59:00",
             "exit_15m": "2026-07-17 03:44:00"
-          }
+          },
+          "regime_60m": "BULLISH",
+          "exit_15m_direction": "CHOP"
         }
       ]
     },
@@ -1718,13 +1692,13 @@
         "asof_ts": null,
         "detail": {
           "decision_ts": "2026-07-16 01:59:00",
-          "brick_size": 29.321428571428573,
-          "last_brick_close": 45677.89285714285,
+          "brick_size": 34.57692307692308,
+          "last_brick_close": 45701.88461538461,
           "last_price": 45704.0,
-          "consecutive_same_direction": 9,
+          "consecutive_same_direction": 13,
           "direction": "UP",
-          "brick_reverse": false,
-          "n_bricks": 9
+          "brick_reverse": true,
+          "n_bricks": 21
         }
       },
       "adl": {
@@ -1753,7 +1727,7 @@
           "vwap_std": 22.319435499352636,
           "last_price": 45704.0,
           "deviation": 25.33745963401452,
-          "atr_1m": 58.642857142857146,
+          "atr_1m": 69.15384615384616,
           "deviation_status": "ABOVE",
           "n_samples": 48,
           "n_samples_in_window": 48,
@@ -1885,7 +1859,7 @@
         },
         {
           "decision_ts": "2026-07-14 09:44:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 09:44:00",
             "regime_60m": null,
@@ -2031,7 +2005,7 @@
         },
         {
           "decision_ts": "2026-07-16 09:44:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 09:44:00",
             "regime_60m": null,
@@ -2040,7 +2014,7 @@
         },
         {
           "decision_ts": "2026-07-16 09:49:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 09:49:00",
             "regime_60m": null,
@@ -2094,13 +2068,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-16 10:14:00",
-              "brick_size": 80.34375,
-              "last_brick_close": 45319.3125,
+              "brick_size": 82.55555555555556,
+              "last_brick_close": 45319.88888888889,
               "last_price": 45304.0,
               "consecutive_same_direction": 1,
               "direction": "DOWN",
               "brick_reverse": true,
-              "n_bricks": 4
+              "n_bricks": 6
             }
           },
           "adl": {
@@ -2129,7 +2103,7 @@
               "vwap_std": 28.54542258564589,
               "last_price": 45304.0,
               "deviation": -15.607346832817711,
-              "atr_1m": 160.6875,
+              "atr_1m": 165.11111111111111,
               "deviation_status": "NEUTRAL",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -2159,13 +2133,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-16 10:19:00",
-              "brick_size": 79.6470588235294,
-              "last_brick_close": 45320.70588235294,
+              "brick_size": 81.8157894736842,
+              "last_brick_close": 45321.368421052626,
               "last_price": 45399.0,
               "consecutive_same_direction": 1,
               "direction": "DOWN",
               "brick_reverse": true,
-              "n_bricks": 4
+              "n_bricks": 6
             }
           },
           "adl": {
@@ -2194,7 +2168,7 @@
               "vwap_std": 41.84596039995092,
               "last_price": 45399.0,
               "deviation": 75.69440396386199,
-              "atr_1m": 159.2941176470588,
+              "atr_1m": 163.6315789473684,
               "deviation_status": "ABOVE",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -2224,13 +2198,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-16 10:24:00",
-              "brick_size": 80.44444444444444,
-              "last_brick_close": 45560.444444444445,
+              "brick_size": 82.425,
+              "last_brick_close": 45567.425,
               "last_price": 45576.0,
               "consecutive_same_direction": 3,
               "direction": "UP",
               "brick_reverse": true,
-              "n_bricks": 7
+              "n_bricks": 9
             }
           },
           "adl": {
@@ -2259,7 +2233,7 @@
               "vwap_std": 120.26423684644578,
               "last_price": 45576.0,
               "deviation": 146.85508151231625,
-              "atr_1m": 160.88888888888889,
+              "atr_1m": 164.85,
               "deviation_status": "ABOVE",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -2642,7 +2616,7 @@
         },
         {
           "decision_ts": "2026-07-08 09:44:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-08 09:44:00",
             "regime_60m": null,
@@ -2652,37 +2626,37 @@
       ]
     },
     "mts-auto-094447-171": {
-      "decision_ts": "2026-07-15 11:29:00",
+      "decision_ts": "2026-07-15 09:59:00",
       "direction": "BULLISH",
-      "confidence": 0.825,
+      "confidence": 1.0,
       "renko": {
         "source": "renko",
         "direction": "BULLISH",
         "score": 1.0,
         "asof_ts": null,
         "detail": {
-          "decision_ts": "2026-07-15 11:29:00",
-          "brick_size": 43.84090909090909,
-          "last_brick_close": 45973.88636363638,
-          "last_price": 45991.0,
-          "consecutive_same_direction": 7,
+          "decision_ts": "2026-07-15 09:59:00",
+          "brick_size": 81.96666666666667,
+          "last_brick_close": 45810.9,
+          "last_price": 45841.0,
+          "consecutive_same_direction": 2,
           "direction": "UP",
-          "brick_reverse": false,
-          "n_bricks": 7
+          "brick_reverse": true,
+          "n_bricks": 11
         }
       },
       "adl": {
         "source": "adl",
-        "direction": "CHOP",
-        "score": 0.5,
+        "direction": "BULLISH",
+        "score": 1.0,
         "asof_ts": null,
         "detail": {
-          "decision_ts": "2026-07-15 11:29:00",
-          "adl_value": 1747.3929272857733,
-          "slope": -41.263364879494645,
-          "residual_std": 662.9905910824423,
-          "snr": -0.7468588309807614,
-          "direction": "CHOP",
+          "decision_ts": "2026-07-15 09:59:00",
+          "adl_value": 1798.0712628959266,
+          "slope": 482.58873189889687,
+          "residual_std": 1860.6111410144854,
+          "snr": 3.1124530279426206,
+          "direction": "BULLISH",
           "n_bars": 12
         }
       },
@@ -2692,12 +2666,12 @@
         "score": 1.0,
         "asof_ts": null,
         "detail": {
-          "decision_ts": "2026-07-15 11:29:00",
-          "vwap": 45943.337182448035,
-          "vwap_std": 40.71320467886073,
-          "last_price": 45991.0,
-          "deviation": 47.66281755196542,
-          "atr_1m": 87.68181818181819,
+          "decision_ts": "2026-07-15 09:59:00",
+          "vwap": 45700.24890562965,
+          "vwap_std": 72.17041717993206,
+          "last_price": 45841.0,
+          "deviation": 140.7510943703528,
+          "atr_1m": 163.93333333333334,
           "deviation_status": "ABOVE",
           "n_samples": 48,
           "n_samples_in_window": 48,
@@ -2709,914 +2683,332 @@
       "decision_max_quote_age_ms": 0.0,
       "window_max_quote_age_ms": 0.0,
       "signal_timestamps": {
-        "adl": "2026-07-15 11:29:00",
-        "regime_60m": "2026-07-15 10:59:00",
-        "exit_15m": "2026-07-15 11:29:00"
+        "adl": "2026-07-15 09:59:00",
+        "regime_60m": "2026-07-15 09:59:00",
+        "exit_15m": "2026-07-15 09:59:00"
       },
       "regime_60m": "BULLISH",
       "exit_15m_direction": "BULLISH",
-      "bar_ts": "2026-07-15 11:29:00",
-      "execution_ts": "2026-07-15 11:34:00",
+      "bar_ts": "2026-07-15 09:59:00",
+      "execution_ts": "2026-07-15 10:04:00",
       "execution_bar": {
-        "ts": "2026-07-15 11:34:00",
-        "open": 45991.0,
-        "high": 46033.0,
-        "low": 45972.0,
-        "close": 46029.0,
-        "volume": 2340.0,
+        "ts": "2026-07-15 10:04:00",
+        "open": 45840.0,
+        "high": 45918.0,
+        "low": 45829.0,
+        "close": 45880.0,
+        "volume": 2934.0,
         "leg": "NEAR",
-        "asof_ts": "2026-07-15 11:34:00"
+        "asof_ts": "2026-07-15 10:04:00"
       }
     },
     "mts-auto-095417-769": {
-      "decision_ts": "2026-07-08 09:54:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-      "signal_timestamps": {
-        "adl": "2026-07-08 09:54:00",
-        "regime_60m": null,
-        "exit_15m": null
-      },
-      "telemetry": [
-        {
-          "decision_ts": "2026-07-08 09:54:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 09:54:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 09:59:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 09:59:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 10:04:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 10:04:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
+      "decision_ts": "2026-07-08 10:09:00",
+      "direction": "BEARISH",
+      "confidence": 1.0,
+      "renko": {
+        "source": "renko",
+        "direction": "BEARISH",
+        "score": 1.0,
+        "asof_ts": null,
+        "detail": {
           "decision_ts": "2026-07-08 10:09:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 10:09:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 10:14:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 10:14:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 10:19:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 10:19:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 10:24:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 10:24:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 10:29:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 10:29:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 10:34:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 10:34:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 10:39:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 10:39:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 10:44:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 10:44:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 10:49:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-08 10:49:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
+          "brick_size": 92.5,
+          "last_brick_close": 45356.5,
+          "last_price": 45270.0,
+          "consecutive_same_direction": 2,
+          "direction": "DOWN",
+          "brick_reverse": true,
+          "n_bricks": 11
         }
-      ]
+      },
+      "adl": {
+        "source": "adl",
+        "direction": "BEARISH",
+        "score": 1.0,
+        "asof_ts": null,
+        "detail": {
+          "decision_ts": "2026-07-08 10:09:00",
+          "adl_value": -18543.109951571925,
+          "slope": -1910.5500306566507,
+          "residual_std": 3688.2833250237286,
+          "snr": -6.216062688599512,
+          "direction": "BEARISH",
+          "n_bars": 12
+        }
+      },
+      "vwap": {
+        "source": "vwap",
+        "direction": "BEARISH",
+        "score": 1.0,
+        "asof_ts": null,
+        "detail": {
+          "decision_ts": "2026-07-08 10:09:00",
+          "vwap": 45439.71594813255,
+          "vwap_std": 119.83994367339018,
+          "last_price": 45270.0,
+          "deviation": -169.7159481325507,
+          "atr_1m": 185.0,
+          "deviation_status": "BELOW",
+          "n_samples": 48,
+          "n_samples_in_window": 48,
+          "samples_missing": false
+        }
+      },
+      "pass_release": true,
+      "block_reason": null,
+      "decision_max_quote_age_ms": 0.0,
+      "window_max_quote_age_ms": 0.0,
+      "signal_timestamps": {
+        "adl": "2026-07-08 10:09:00",
+        "regime_60m": "2026-07-08 09:59:00",
+        "exit_15m": "2026-07-08 09:59:00"
+      },
+      "regime_60m": "BEARISH",
+      "exit_15m_direction": "BEARISH",
+      "bar_ts": "2026-07-08 10:09:00",
+      "execution_ts": "2026-07-08 10:14:00",
+      "execution_bar": {
+        "ts": "2026-07-08 10:14:00",
+        "open": 45265.0,
+        "high": 45470.0,
+        "low": 45242.0,
+        "close": 45427.0,
+        "volume": 5167.0,
+        "leg": "NEAR",
+        "asof_ts": "2026-07-08 10:14:00"
+      }
     },
     "mts-auto-101709-433": {
-      "decision_ts": "2026-07-14 10:19:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-      "signal_timestamps": {
-        "adl": "2026-07-14 10:19:00",
-        "regime_60m": null,
-        "exit_15m": null
-      },
-      "telemetry": [
-        {
-          "decision_ts": "2026-07-14 10:19:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-14 10:19:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 10:24:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-14 10:24:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 10:29:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-14 10:29:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 10:34:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-14 10:34:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 10:39:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-14 10:39:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 10:44:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-14 10:44:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 10:49:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-14 10:49:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 10:54:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-14 10:54:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
+      "decision_ts": "2026-07-14 10:59:00",
+      "direction": "BEARISH",
+      "confidence": 0.825,
+      "renko": {
+        "source": "renko",
+        "direction": "BEARISH",
+        "score": 1.0,
+        "asof_ts": null,
+        "detail": {
           "decision_ts": "2026-07-14 10:59:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-14 10:59:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 11:04:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-14 11:04:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 11:09:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-14 11:09:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 11:14:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 11:14:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 11:19:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 11:19:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 11:24:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 11:24:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 11:29:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 11:29:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 11:34:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 11:34:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 11:39:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 11:39:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 11:44:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 11:44:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 11:49:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 11:49:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 11:54:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 11:54:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 11:59:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 11:59:00",
-            "regime_60m": "2026-07-14 11:59:00",
-            "exit_15m": "2026-07-14 11:59:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 12:04:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 12:04:00",
-            "regime_60m": "2026-07-14 11:59:00",
-            "exit_15m": "2026-07-14 11:59:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 12:09:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 12:09:00",
-            "regime_60m": "2026-07-14 11:59:00",
-            "exit_15m": "2026-07-14 11:59:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 12:14:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 12:14:00",
-            "regime_60m": "2026-07-14 11:59:00",
-            "exit_15m": "2026-07-14 12:14:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 12:19:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 12:19:00",
-            "regime_60m": "2026-07-14 11:59:00",
-            "exit_15m": "2026-07-14 12:14:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 12:24:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 12:24:00",
-            "regime_60m": "2026-07-14 11:59:00",
-            "exit_15m": "2026-07-14 12:14:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 12:29:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 12:29:00",
-            "regime_60m": "2026-07-14 11:59:00",
-            "exit_15m": "2026-07-14 12:29:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 12:34:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 12:34:00",
-            "regime_60m": "2026-07-14 11:59:00",
-            "exit_15m": "2026-07-14 12:29:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 12:39:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 12:39:00",
-            "regime_60m": "2026-07-14 11:59:00",
-            "exit_15m": "2026-07-14 12:29:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 12:44:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 12:44:00",
-            "regime_60m": "2026-07-14 11:59:00",
-            "exit_15m": "2026-07-14 12:44:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 12:49:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 12:49:00",
-            "regime_60m": "2026-07-14 11:59:00",
-            "exit_15m": "2026-07-14 12:44:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 12:54:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 12:54:00",
-            "regime_60m": "2026-07-14 11:59:00",
-            "exit_15m": "2026-07-14 12:44:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 12:59:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 12:59:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 12:59:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 13:04:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 13:04:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 12:59:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 13:09:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 13:09:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 12:59:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 13:14:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 13:14:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 13:14:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 13:19:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 13:19:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 13:14:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 13:24:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 13:24:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 13:14:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 13:29:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 13:29:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 13:29:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 13:34:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 13:34:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 13:29:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 13:39:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 13:39:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 13:29:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 13:44:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 13:44:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 13:44:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 13:49:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 13:49:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 13:44:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 15:04:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 15:04:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 13:44:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 15:09:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 15:09:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 13:44:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 15:14:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 15:14:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 15:14:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 15:19:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 15:19:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 15:14:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 15:24:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 15:24:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 15:14:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 15:29:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 15:29:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 15:29:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 15:34:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 15:34:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 15:29:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 15:39:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 15:39:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 15:29:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 15:44:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 15:44:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 15:44:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 15:49:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 15:49:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 15:44:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 15:54:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 15:54:00",
-            "regime_60m": "2026-07-14 12:59:00",
-            "exit_15m": "2026-07-14 15:44:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 15:59:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 15:59:00",
-            "regime_60m": "2026-07-14 15:59:00",
-            "exit_15m": "2026-07-14 15:59:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-14 16:04:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-14 16:04:00",
-            "regime_60m": "2026-07-14 15:59:00",
-            "exit_15m": "2026-07-14 15:59:00"
-          }
+          "brick_size": 92.28571428571429,
+          "last_brick_close": 44454.42857142854,
+          "last_price": 44411.0,
+          "consecutive_same_direction": 2,
+          "direction": "DOWN",
+          "brick_reverse": true,
+          "n_bricks": 17
         }
-      ]
+      },
+      "adl": {
+        "source": "adl",
+        "direction": "CHOP",
+        "score": 0.5,
+        "asof_ts": null,
+        "detail": {
+          "decision_ts": "2026-07-14 10:59:00",
+          "adl_value": -1384.9167384739926,
+          "slope": -126.55877793476115,
+          "residual_std": 1014.1378817864966,
+          "snr": -1.4975333837685485,
+          "direction": "CHOP",
+          "n_bars": 12
+        }
+      },
+      "vwap": {
+        "source": "vwap",
+        "direction": "BEARISH",
+        "score": 1.0,
+        "asof_ts": null,
+        "detail": {
+          "decision_ts": "2026-07-14 10:59:00",
+          "vwap": 44560.805917481,
+          "vwap_std": 111.06627887772973,
+          "last_price": 44411.0,
+          "deviation": -149.80591748099687,
+          "atr_1m": 184.57142857142858,
+          "deviation_status": "BELOW",
+          "n_samples": 48,
+          "n_samples_in_window": 48,
+          "samples_missing": false
+        }
+      },
+      "pass_release": true,
+      "block_reason": null,
+      "decision_max_quote_age_ms": 0.0,
+      "window_max_quote_age_ms": 0.0,
+      "signal_timestamps": {
+        "adl": "2026-07-14 10:59:00",
+        "regime_60m": "2026-07-14 10:59:00",
+        "exit_15m": "2026-07-14 10:59:00"
+      },
+      "regime_60m": "BEARISH",
+      "exit_15m_direction": "BEARISH",
+      "bar_ts": "2026-07-14 10:59:00",
+      "execution_ts": "2026-07-14 11:04:00",
+      "execution_bar": {
+        "ts": "2026-07-14 11:04:00",
+        "open": 44429.0,
+        "high": 44466.0,
+        "low": 44368.0,
+        "close": 44395.0,
+        "volume": 621.0,
+        "leg": "NEAR",
+        "asof_ts": "2026-07-14 11:04:00"
+      }
     },
     "mts-auto-105607-780": {
       "decision_ts": "2026-07-08 10:59:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+      "direction": "BULLISH",
+      "confidence": 0.9,
+      "renko": {
+        "source": "renko",
+        "direction": "BULLISH",
+        "score": 1.0,
+        "asof_ts": null,
+        "detail": {
+          "decision_ts": "2026-07-08 10:59:00",
+          "brick_size": 85.61538461538461,
+          "last_brick_close": 45721.84615384615,
+          "last_price": 45672.0,
+          "consecutive_same_direction": 3,
+          "direction": "UP",
+          "brick_reverse": true,
+          "n_bricks": 11
+        }
+      },
+      "adl": {
+        "source": "adl",
+        "direction": "BULLISH",
+        "score": 1.0,
+        "asof_ts": null,
+        "detail": {
+          "decision_ts": "2026-07-08 10:59:00",
+          "adl_value": 4890.787089145248,
+          "slope": 685.2225154769164,
+          "residual_std": 2098.884437911476,
+          "snr": 3.9176383574445097,
+          "direction": "BULLISH",
+          "n_bars": 12
+        }
+      },
+      "vwap": {
+        "source": "vwap",
+        "direction": "CHOP",
+        "score": 0.5,
+        "asof_ts": null,
+        "detail": {
+          "decision_ts": "2026-07-08 10:59:00",
+          "vwap": 45690.09590811199,
+          "vwap_std": 69.71965184966815,
+          "last_price": 45672.0,
+          "deviation": -18.095908111987228,
+          "atr_1m": 171.23076923076923,
+          "deviation_status": "NEUTRAL",
+          "n_samples": 48,
+          "n_samples_in_window": 48,
+          "samples_missing": false
+        }
+      },
+      "pass_release": true,
+      "block_reason": null,
+      "decision_max_quote_age_ms": 0.0,
+      "window_max_quote_age_ms": 0.0,
       "signal_timestamps": {
         "adl": "2026-07-08 10:59:00",
-        "regime_60m": null,
-        "exit_15m": null
+        "regime_60m": "2026-07-08 10:59:00",
+        "exit_15m": "2026-07-08 10:59:00"
       },
-      "telemetry": [
-        {
-          "decision_ts": "2026-07-08 10:59:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 10:59:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 11:04:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 11:04:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 11:09:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 11:09:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 11:14:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 11:14:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 11:19:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 11:19:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 11:24:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 11:24:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 11:29:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 11:29:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 11:34:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 11:34:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 11:39:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 11:39:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        }
-      ]
+      "regime_60m": "BULLISH",
+      "exit_15m_direction": "BULLISH",
+      "bar_ts": "2026-07-08 10:59:00",
+      "execution_ts": "2026-07-08 11:04:00",
+      "execution_bar": {
+        "ts": "2026-07-08 11:04:00",
+        "open": 45669.0,
+        "high": 45759.0,
+        "low": 45633.0,
+        "close": 45745.0,
+        "volume": 2548.0,
+        "leg": "NEAR",
+        "asof_ts": "2026-07-08 11:04:00"
+      }
     },
     "mts-auto-114904-854": {
-      "decision_ts": "2026-07-08 11:49:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-      "signal_timestamps": {
-        "adl": "2026-07-08 11:49:00",
-        "regime_60m": null,
-        "exit_15m": null
-      },
-      "telemetry": [
-        {
-          "decision_ts": "2026-07-08 11:49:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 11:49:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 11:54:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 11:54:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
+      "decision_ts": "2026-07-08 11:59:00",
+      "direction": "BEARISH",
+      "confidence": 1.0,
+      "renko": {
+        "source": "renko",
+        "direction": "BEARISH",
+        "score": 1.0,
+        "asof_ts": null,
+        "detail": {
           "decision_ts": "2026-07-08 11:59:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 11:59:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 12:04:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 12:04:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 12:09:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 12:09:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 12:14:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 12:14:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 12:19:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 12:19:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 12:24:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 12:24:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 12:29:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 12:29:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 12:34:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 12:34:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 12:39:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-08 12:39:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 12:44:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-08 12:44:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 12:49:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-08 12:49:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 12:54:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-08 12:54:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 12:59:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-08 12:59:00",
-            "regime_60m": "2026-07-08 12:59:00",
-            "exit_15m": "2026-07-08 12:59:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 13:04:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-08 13:04:00",
-            "regime_60m": "2026-07-08 12:59:00",
-            "exit_15m": "2026-07-08 12:59:00"
-          }
-        },
-        {
-          "decision_ts": "2026-07-08 13:09:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
-          "signal_timestamps": {
-            "adl": "2026-07-08 13:09:00",
-            "regime_60m": "2026-07-08 12:59:00",
-            "exit_15m": "2026-07-08 12:59:00"
-          }
+          "brick_size": 52.6,
+          "last_brick_close": 45560.600000000006,
+          "last_price": 45535.0,
+          "consecutive_same_direction": 6,
+          "direction": "DOWN",
+          "brick_reverse": true,
+          "n_bricks": 10
         }
-      ]
+      },
+      "adl": {
+        "source": "adl",
+        "direction": "BEARISH",
+        "score": 1.0,
+        "asof_ts": null,
+        "detail": {
+          "decision_ts": "2026-07-08 11:59:00",
+          "adl_value": -6956.172715275278,
+          "slope": -787.7765078941218,
+          "residual_std": 2781.211096148199,
+          "snr": -3.3989933753761856,
+          "direction": "BEARISH",
+          "n_bars": 12
+        }
+      },
+      "vwap": {
+        "source": "vwap",
+        "direction": "BEARISH",
+        "score": 1.0,
+        "asof_ts": null,
+        "detail": {
+          "decision_ts": "2026-07-08 11:59:00",
+          "vwap": 45618.88332989478,
+          "vwap_std": 57.24583229596714,
+          "last_price": 45535.0,
+          "deviation": -83.88332989477931,
+          "atr_1m": 105.2,
+          "deviation_status": "BELOW",
+          "n_samples": 48,
+          "n_samples_in_window": 48,
+          "samples_missing": false
+        }
+      },
+      "pass_release": true,
+      "block_reason": null,
+      "decision_max_quote_age_ms": 0.0,
+      "window_max_quote_age_ms": 0.0,
+      "signal_timestamps": {
+        "adl": "2026-07-08 11:59:00",
+        "regime_60m": "2026-07-08 11:59:00",
+        "exit_15m": "2026-07-08 11:59:00"
+      },
+      "regime_60m": "BEARISH",
+      "exit_15m_direction": "BEARISH",
+      "bar_ts": "2026-07-08 11:59:00",
+      "execution_ts": "2026-07-08 12:04:00",
+      "execution_bar": {
+        "ts": "2026-07-08 12:04:00",
+        "open": 45533.0,
+        "high": 45577.0,
+        "low": 45485.0,
+        "close": 45521.0,
+        "volume": 3101.0,
+        "leg": "NEAR",
+        "asof_ts": "2026-07-08 12:04:00"
+      }
     },
     "mts-auto-131539-634": {
       "decision_ts": "2026-07-08 16:59:00",
@@ -3629,13 +3021,13 @@
         "asof_ts": null,
         "detail": {
           "decision_ts": "2026-07-08 16:59:00",
-          "brick_size": 65.46774193548387,
-          "last_brick_close": 44810.38709677418,
+          "brick_size": 63.01162790697674,
+          "last_brick_close": 44775.87209302325,
           "last_price": 44767.0,
           "consecutive_same_direction": 2,
           "direction": "DOWN",
           "brick_reverse": true,
-          "n_bricks": 28
+          "n_bricks": 35
         }
       },
       "adl": {
@@ -3664,7 +3056,7 @@
           "vwap_std": 61.29496420288855,
           "last_price": 44767.0,
           "deviation": -59.03938883401861,
-          "atr_1m": 130.93548387096774,
+          "atr_1m": 126.02325581395348,
           "deviation_status": "BELOW",
           "n_samples": 48,
           "n_samples_in_window": 48,
@@ -3697,7 +3089,7 @@
     },
     "mts-auto-133741-001": {
       "decision_ts": "2026-07-16 13:39:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+      "block_reason": "INSUFFICIENT_SAME_DIRECTION",
       "signal_timestamps": {
         "adl": "2026-07-16 13:39:00",
         "regime_60m": null,
@@ -3706,7 +3098,7 @@
       "telemetry": [
         {
           "decision_ts": "2026-07-16 13:39:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 13:39:00",
             "regime_60m": null,
@@ -3866,18 +3258,18 @@
         },
         {
           "decision_ts": "2026-07-16 15:59:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 15:59:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 15:59:00",
+            "exit_15m": "2026-07-16 15:59:00"
           }
         }
       ]
     },
     "mts-auto-160857-726": {
       "decision_ts": "2026-07-16 16:09:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+      "block_reason": "INSUFFICIENT_SAME_DIRECTION",
       "signal_timestamps": {
         "adl": "2026-07-16 16:09:00",
         "regime_60m": null,
@@ -3886,7 +3278,7 @@
       "telemetry": [
         {
           "decision_ts": "2026-07-16 16:09:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 16:09:00",
             "regime_60m": null,
@@ -3895,7 +3287,7 @@
         },
         {
           "decision_ts": "2026-07-16 16:14:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 16:14:00",
             "regime_60m": null,
@@ -3904,7 +3296,7 @@
         },
         {
           "decision_ts": "2026-07-16 16:19:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 16:19:00",
             "regime_60m": null,
@@ -3913,7 +3305,7 @@
         },
         {
           "decision_ts": "2026-07-16 16:24:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 16:24:00",
             "regime_60m": null,
@@ -3922,7 +3314,7 @@
         },
         {
           "decision_ts": "2026-07-16 16:29:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 16:29:00",
             "regime_60m": null,
@@ -3931,7 +3323,7 @@
         },
         {
           "decision_ts": "2026-07-16 16:34:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 16:34:00",
             "regime_60m": null,
@@ -3940,7 +3332,7 @@
         },
         {
           "decision_ts": "2026-07-16 16:39:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 16:39:00",
             "regime_60m": null,
@@ -3949,7 +3341,7 @@
         },
         {
           "decision_ts": "2026-07-16 16:44:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 16:44:00",
             "regime_60m": null,
@@ -3958,7 +3350,7 @@
         },
         {
           "decision_ts": "2026-07-16 16:49:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 16:49:00",
             "regime_60m": null,
@@ -3967,7 +3359,7 @@
         },
         {
           "decision_ts": "2026-07-16 16:54:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 16:54:00",
             "regime_60m": null,
@@ -3976,11 +3368,11 @@
         },
         {
           "decision_ts": "2026-07-16 16:59:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 16:59:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 16:59:00",
+            "exit_15m": "2026-07-16 16:59:00"
           }
         },
         {
@@ -3988,8 +3380,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 17:04:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 16:59:00",
+            "exit_15m": "2026-07-16 16:59:00"
           }
         },
         {
@@ -3997,8 +3389,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 17:09:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 16:59:00",
+            "exit_15m": "2026-07-16 16:59:00"
           }
         },
         {
@@ -4006,8 +3398,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 17:14:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 16:59:00",
+            "exit_15m": "2026-07-16 17:14:00"
           }
         },
         {
@@ -4015,8 +3407,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 17:19:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 16:59:00",
+            "exit_15m": "2026-07-16 17:14:00"
           }
         },
         {
@@ -4024,24 +3416,80 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 17:24:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 16:59:00",
+            "exit_15m": "2026-07-16 17:14:00"
           }
         },
         {
           "decision_ts": "2026-07-16 17:29:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "direction": "CHOP",
+          "confidence": -0.25,
+          "renko": {
+            "source": "renko",
+            "direction": "CHOP",
+            "score": 0.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-16 17:29:00",
+              "brick_size": 48.53448275862069,
+              "last_brick_close": 45010.327586206884,
+              "last_price": 45004.0,
+              "consecutive_same_direction": 1,
+              "direction": "DOWN",
+              "brick_reverse": true,
+              "n_bricks": 17
+            }
+          },
+          "adl": {
+            "source": "adl",
+            "direction": "BULLISH",
+            "score": -1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-16 17:29:00",
+              "adl_value": 2775.84142773672,
+              "slope": 208.98918881744842,
+              "residual_std": 1335.7822265788027,
+              "snr": 1.8774544338376686,
+              "direction": "BULLISH",
+              "n_bars": 12
+            }
+          },
+          "vwap": {
+            "source": "vwap",
+            "direction": "CHOP",
+            "score": 0.5,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-16 17:29:00",
+              "vwap": 45029.50895697305,
+              "vwap_std": 21.169738749954526,
+              "last_price": 45004.0,
+              "deviation": -25.508956973048043,
+              "atr_1m": 97.06896551724138,
+              "deviation_status": "NEUTRAL",
+              "n_samples": 48,
+              "n_samples_in_window": 48,
+              "samples_missing": false
+            }
+          },
+          "pass_release": false,
+          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "decision_max_quote_age_ms": 0.0,
+          "window_max_quote_age_ms": 0.0,
           "signal_timestamps": {
             "adl": "2026-07-16 17:29:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
+            "regime_60m": "2026-07-16 16:59:00",
+            "exit_15m": "2026-07-16 17:29:00"
+          },
+          "regime_60m": "BEARISH",
+          "exit_15m_direction": "BEARISH"
         }
       ]
     },
     "mts-auto-161229-714": {
       "decision_ts": "2026-07-14 16:14:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+      "block_reason": "INSUFFICIENT_SAME_DIRECTION",
       "signal_timestamps": {
         "adl": "2026-07-14 16:14:00",
         "regime_60m": null,
@@ -4050,7 +3498,7 @@
       "telemetry": [
         {
           "decision_ts": "2026-07-14 16:14:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 16:14:00",
             "regime_60m": null,
@@ -4059,7 +3507,7 @@
         },
         {
           "decision_ts": "2026-07-14 16:19:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 16:19:00",
             "regime_60m": null,
@@ -4068,7 +3516,7 @@
         },
         {
           "decision_ts": "2026-07-14 16:24:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 16:24:00",
             "regime_60m": null,
@@ -4077,7 +3525,7 @@
         },
         {
           "decision_ts": "2026-07-14 16:29:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 16:29:00",
             "regime_60m": null,
@@ -4086,7 +3534,7 @@
         },
         {
           "decision_ts": "2026-07-14 16:34:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 16:34:00",
             "regime_60m": null,
@@ -4095,7 +3543,7 @@
         },
         {
           "decision_ts": "2026-07-14 16:39:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 16:39:00",
             "regime_60m": null,
@@ -4104,7 +3552,7 @@
         },
         {
           "decision_ts": "2026-07-14 16:44:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 16:44:00",
             "regime_60m": null,
@@ -4113,7 +3561,7 @@
         },
         {
           "decision_ts": "2026-07-14 16:49:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 16:49:00",
             "regime_60m": null,
@@ -4122,7 +3570,7 @@
         },
         {
           "decision_ts": "2026-07-14 16:54:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 16:54:00",
             "regime_60m": null,
@@ -4131,20 +3579,20 @@
         },
         {
           "decision_ts": "2026-07-14 16:59:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 16:59:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-14 16:59:00",
+            "exit_15m": "2026-07-14 16:59:00"
           }
         },
         {
           "decision_ts": "2026-07-14 17:04:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 17:04:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-14 16:59:00",
+            "exit_15m": "2026-07-14 16:59:00"
           }
         },
         {
@@ -4152,44 +3600,212 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 17:09:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-14 16:59:00",
+            "exit_15m": "2026-07-14 16:59:00"
           }
         },
         {
           "decision_ts": "2026-07-14 17:14:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "direction": "CHOP",
+          "confidence": -0.25,
+          "renko": {
+            "source": "renko",
+            "direction": "CHOP",
+            "score": 0.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:14:00",
+              "brick_size": 29.02,
+              "last_brick_close": 45158.02,
+              "last_price": 45172.0,
+              "consecutive_same_direction": 1,
+              "direction": "UP",
+              "brick_reverse": true,
+              "n_bricks": 11
+            }
+          },
+          "adl": {
+            "source": "adl",
+            "direction": "BEARISH",
+            "score": -1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:14:00",
+              "adl_value": -78.61166095888069,
+              "slope": -21.779877613171404,
+              "residual_std": 114.80692679087775,
+              "snr": -2.276504879863388,
+              "direction": "BEARISH",
+              "n_bars": 12
+            }
+          },
+          "vwap": {
+            "source": "vwap",
+            "direction": "CHOP",
+            "score": 0.5,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:14:00",
+              "vwap": 45158.703812316715,
+              "vwap_std": 19.17086966026209,
+              "last_price": 45172.0,
+              "deviation": 13.296187683285098,
+              "atr_1m": 58.04,
+              "deviation_status": "NEUTRAL",
+              "n_samples": 48,
+              "n_samples_in_window": 48,
+              "samples_missing": false
+            }
+          },
+          "pass_release": false,
+          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "decision_max_quote_age_ms": 0.0,
+          "window_max_quote_age_ms": 0.0,
           "signal_timestamps": {
             "adl": "2026-07-14 17:14:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
+            "regime_60m": "2026-07-14 16:59:00",
+            "exit_15m": "2026-07-14 17:14:00"
+          },
+          "regime_60m": "BULLISH",
+          "exit_15m_direction": "BULLISH"
         },
         {
           "decision_ts": "2026-07-14 17:19:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "direction": "CHOP",
+          "confidence": -0.1,
+          "renko": {
+            "source": "renko",
+            "direction": "BULLISH",
+            "score": 1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:19:00",
+              "brick_size": 29.0,
+              "last_brick_close": 45158.0,
+              "last_price": 45144.0,
+              "consecutive_same_direction": 2,
+              "direction": "UP",
+              "brick_reverse": true,
+              "n_bricks": 15
+            }
+          },
+          "adl": {
+            "source": "adl",
+            "direction": "BEARISH",
+            "score": -1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:19:00",
+              "adl_value": -604.3626292887965,
+              "slope": -30.725360078979822,
+              "residual_std": 139.10136930719602,
+              "snr": -2.6506160229298903,
+              "direction": "BEARISH",
+              "n_bars": 12
+            }
+          },
+          "vwap": {
+            "source": "vwap",
+            "direction": "BEARISH",
+            "score": -1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:19:00",
+              "vwap": 45162.21470019342,
+              "vwap_std": 12.558810841226407,
+              "last_price": 45144.0,
+              "deviation": -18.214700193420867,
+              "atr_1m": 58.0,
+              "deviation_status": "BELOW",
+              "n_samples": 48,
+              "n_samples_in_window": 48,
+              "samples_missing": false
+            }
+          },
+          "pass_release": false,
+          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "decision_max_quote_age_ms": 0.0,
+          "window_max_quote_age_ms": 0.0,
           "signal_timestamps": {
             "adl": "2026-07-14 17:19:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
+            "regime_60m": "2026-07-14 16:59:00",
+            "exit_15m": "2026-07-14 17:14:00"
+          },
+          "regime_60m": "BULLISH",
+          "exit_15m_direction": "BULLISH"
         },
         {
           "decision_ts": "2026-07-14 17:24:00",
-          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "direction": "CHOP",
+          "confidence": 0.2,
+          "renko": {
+            "source": "renko",
+            "direction": "BULLISH",
+            "score": 1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:24:00",
+              "brick_size": 28.59259259259259,
+              "last_brick_close": 45157.59259259259,
+              "last_price": 45165.0,
+              "consecutive_same_direction": 2,
+              "direction": "UP",
+              "brick_reverse": true,
+              "n_bricks": 15
+            }
+          },
+          "adl": {
+            "source": "adl",
+            "direction": "BEARISH",
+            "score": -1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:24:00",
+              "adl_value": -378.96033043822183,
+              "slope": -42.38939018982278,
+              "residual_std": 132.9992153385771,
+              "snr": -3.8246291691143615,
+              "direction": "BEARISH",
+              "n_bars": 12
+            }
+          },
+          "vwap": {
+            "source": "vwap",
+            "direction": "CHOP",
+            "score": 0.5,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:24:00",
+              "vwap": 45165.613496932514,
+              "vwap_std": 10.169318195274403,
+              "last_price": 45165.0,
+              "deviation": -0.6134969325139537,
+              "atr_1m": 57.18518518518518,
+              "deviation_status": "NEUTRAL",
+              "n_samples": 48,
+              "n_samples_in_window": 48,
+              "samples_missing": false
+            }
+          },
+          "pass_release": false,
+          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "decision_max_quote_age_ms": 0.0,
+          "window_max_quote_age_ms": 0.0,
           "signal_timestamps": {
             "adl": "2026-07-14 17:24:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
+            "regime_60m": "2026-07-14 16:59:00",
+            "exit_15m": "2026-07-14 17:14:00"
+          },
+          "regime_60m": "BULLISH",
+          "exit_15m_direction": "BULLISH"
         },
         {
           "decision_ts": "2026-07-14 17:29:00",
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 17:29:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-14 16:59:00",
+            "exit_15m": "2026-07-14 17:29:00"
           }
         },
         {
@@ -4197,8 +3813,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 17:34:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-14 16:59:00",
+            "exit_15m": "2026-07-14 17:29:00"
           }
         },
         {
@@ -4206,36 +3822,204 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-14 17:39:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-14 16:59:00",
+            "exit_15m": "2026-07-14 17:29:00"
           }
         },
         {
           "decision_ts": "2026-07-14 17:44:00",
+          "direction": "BULLISH",
+          "confidence": 0.725,
+          "renko": {
+            "source": "renko",
+            "direction": "BULLISH",
+            "score": 1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:44:00",
+              "brick_size": 26.725806451612904,
+              "last_brick_close": 45182.45161290323,
+              "last_price": 45178.0,
+              "consecutive_same_direction": 3,
+              "direction": "UP",
+              "brick_reverse": true,
+              "n_bricks": 16
+            }
+          },
+          "adl": {
+            "source": "adl",
+            "direction": "CHOP",
+            "score": 0.5,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:44:00",
+              "adl_value": -252.00695997436551,
+              "slope": -21.135566055996346,
+              "residual_std": 162.03630442401814,
+              "snr": -1.5652467020169532,
+              "direction": "CHOP",
+              "n_bars": 12
+            }
+          },
+          "vwap": {
+            "source": "vwap",
+            "direction": "CHOP",
+            "score": 0.5,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:44:00",
+              "vwap": 45177.72196261682,
+              "vwap_std": 8.899479344137687,
+              "last_price": 45178.0,
+              "deviation": 0.2780373831774341,
+              "atr_1m": 53.45161290322581,
+              "deviation_status": "NEUTRAL",
+              "n_samples": 48,
+              "n_samples_in_window": 48,
+              "samples_missing": false
+            }
+          },
+          "pass_release": false,
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "decision_max_quote_age_ms": 0.0,
+          "window_max_quote_age_ms": 0.0,
           "signal_timestamps": {
             "adl": "2026-07-14 17:44:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
+            "regime_60m": "2026-07-14 16:59:00",
+            "exit_15m": "2026-07-14 17:44:00"
+          },
+          "regime_60m": "BULLISH",
+          "exit_15m_direction": "BULLISH"
         },
         {
           "decision_ts": "2026-07-14 17:49:00",
+          "direction": "BULLISH",
+          "confidence": 0.725,
+          "renko": {
+            "source": "renko",
+            "direction": "BULLISH",
+            "score": 1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:49:00",
+              "brick_size": 26.5625,
+              "last_brick_close": 45182.125,
+              "last_price": 45192.0,
+              "consecutive_same_direction": 3,
+              "direction": "UP",
+              "brick_reverse": true,
+              "n_bricks": 16
+            }
+          },
+          "adl": {
+            "source": "adl",
+            "direction": "CHOP",
+            "score": 0.5,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:49:00",
+              "adl_value": 25.178678540526448,
+              "slope": -12.270175468853703,
+              "residual_std": 176.13286047645067,
+              "snr": -0.8359718021496574,
+              "direction": "CHOP",
+              "n_bars": 12
+            }
+          },
+          "vwap": {
+            "source": "vwap",
+            "direction": "CHOP",
+            "score": 0.5,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:49:00",
+              "vwap": 45182.5625,
+              "vwap_std": 7.82465720761406,
+              "last_price": 45192.0,
+              "deviation": 9.4375,
+              "atr_1m": 53.125,
+              "deviation_status": "NEUTRAL",
+              "n_samples": 48,
+              "n_samples_in_window": 48,
+              "samples_missing": false
+            }
+          },
+          "pass_release": false,
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "decision_max_quote_age_ms": 0.0,
+          "window_max_quote_age_ms": 0.0,
           "signal_timestamps": {
             "adl": "2026-07-14 17:49:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
+            "regime_60m": "2026-07-14 16:59:00",
+            "exit_15m": "2026-07-14 17:44:00"
+          },
+          "regime_60m": "BULLISH",
+          "exit_15m_direction": "BULLISH"
         },
         {
           "decision_ts": "2026-07-14 17:54:00",
+          "direction": "BULLISH",
+          "confidence": 0.725,
+          "renko": {
+            "source": "renko",
+            "direction": "BULLISH",
+            "score": 1.0,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:54:00",
+              "brick_size": 26.318181818181817,
+              "last_brick_close": 45181.63636363637,
+              "last_price": 45177.0,
+              "consecutive_same_direction": 3,
+              "direction": "UP",
+              "brick_reverse": true,
+              "n_bricks": 16
+            }
+          },
+          "adl": {
+            "source": "adl",
+            "direction": "CHOP",
+            "score": 0.5,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:54:00",
+              "adl_value": -140.69854153669365,
+              "slope": -9.438075314035409,
+              "residual_std": 175.93253032443033,
+              "snr": -0.6437519139628148,
+              "direction": "CHOP",
+              "n_bars": 12
+            }
+          },
+          "vwap": {
+            "source": "vwap",
+            "direction": "CHOP",
+            "score": 0.5,
+            "asof_ts": null,
+            "detail": {
+              "decision_ts": "2026-07-14 17:54:00",
+              "vwap": 45183.10800744879,
+              "vwap_std": 6.27663569279405,
+              "last_price": 45177.0,
+              "deviation": -6.108007448790886,
+              "atr_1m": 52.63636363636363,
+              "deviation_status": "NEUTRAL",
+              "n_samples": 48,
+              "n_samples_in_window": 48,
+              "samples_missing": false
+            }
+          },
+          "pass_release": false,
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "decision_max_quote_age_ms": 0.0,
+          "window_max_quote_age_ms": 0.0,
           "signal_timestamps": {
             "adl": "2026-07-14 17:54:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
+            "regime_60m": "2026-07-14 16:59:00",
+            "exit_15m": "2026-07-14 17:44:00"
+          },
+          "regime_60m": "BULLISH",
+          "exit_15m_direction": "BULLISH"
         },
         {
           "decision_ts": "2026-07-14 17:59:00",
@@ -4294,21 +4078,21 @@
         {
           "decision_ts": "2026-07-14 18:29:00",
           "direction": "CHOP",
-          "confidence": -0.7,
+          "confidence": -0.25,
           "renko": {
             "source": "renko",
-            "direction": "BEARISH",
-            "score": -1.0,
+            "direction": "CHOP",
+            "score": 0.0,
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-14 18:29:00",
-              "brick_size": 20.053571428571427,
-              "last_brick_close": 45147.107142857145,
+              "brick_size": 24.275,
+              "last_brick_close": 45153.275,
               "last_price": 45150.0,
-              "consecutive_same_direction": 2,
+              "consecutive_same_direction": 1,
               "direction": "DOWN",
               "brick_reverse": true,
-              "n_bricks": 16
+              "n_bricks": 17
             }
           },
           "adl": {
@@ -4337,7 +4121,7 @@
               "vwap_std": 1.9706569137622216,
               "last_price": 45150.0,
               "deviation": 3.663778162910603,
-              "atr_1m": 40.107142857142854,
+              "atr_1m": 48.55,
               "deviation_status": "NEUTRAL",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -4359,21 +4143,21 @@
         {
           "decision_ts": "2026-07-14 18:34:00",
           "direction": "CHOP",
-          "confidence": -1.0,
+          "confidence": -0.25,
           "renko": {
             "source": "renko",
-            "direction": "BEARISH",
-            "score": -1.0,
+            "direction": "CHOP",
+            "score": 0.0,
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-14 18:34:00",
-              "brick_size": 20.379310344827587,
-              "last_brick_close": 45147.75862068965,
+              "brick_size": 24.402439024390244,
+              "last_brick_close": 45153.40243902439,
               "last_price": 45130.0,
-              "consecutive_same_direction": 2,
+              "consecutive_same_direction": 1,
               "direction": "DOWN",
               "brick_reverse": true,
-              "n_bricks": 16
+              "n_bricks": 17
             }
           },
           "adl": {
@@ -4393,8 +4177,8 @@
           },
           "vwap": {
             "source": "vwap",
-            "direction": "BEARISH",
-            "score": -1.0,
+            "direction": "CHOP",
+            "score": 0.5,
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-14 18:34:00",
@@ -4402,8 +4186,8 @@
               "vwap_std": 7.219988997658771,
               "last_price": 45130.0,
               "deviation": -12.814634146343451,
-              "atr_1m": 40.758620689655174,
-              "deviation_status": "BELOW",
+              "atr_1m": 48.80487804878049,
+              "deviation_status": "NEUTRAL",
               "n_samples": 48,
               "n_samples_in_window": 48,
               "samples_missing": false
@@ -4432,13 +4216,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-14 18:39:00",
-              "brick_size": 20.866666666666667,
-              "last_brick_close": 45169.600000000006,
+              "brick_size": 24.654761904761905,
+              "last_brick_close": 45178.30952380953,
               "last_price": 45181.0,
               "consecutive_same_direction": 1,
               "direction": "UP",
               "brick_reverse": true,
-              "n_bricks": 17
+              "n_bricks": 18
             }
           },
           "adl": {
@@ -4467,7 +4251,7 @@
               "vwap_std": 18.344009638743387,
               "last_price": 45181.0,
               "deviation": 29.35143769968272,
-              "atr_1m": 41.733333333333334,
+              "atr_1m": 49.30952380952381,
               "deviation_status": "ABOVE",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -4497,13 +4281,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-14 18:44:00",
-              "brick_size": 20.919354838709676,
-              "last_brick_close": 45169.758064516136,
+              "brick_size": 24.6046511627907,
+              "last_brick_close": 45178.20930232559,
               "last_price": 45157.0,
               "consecutive_same_direction": 1,
               "direction": "UP",
               "brick_reverse": true,
-              "n_bricks": 17
+              "n_bricks": 18
             }
           },
           "adl": {
@@ -4532,7 +4316,7 @@
               "vwap_std": 19.263096610086023,
               "last_price": 45157.0,
               "deviation": 1.714821763605869,
-              "atr_1m": 41.83870967741935,
+              "atr_1m": 49.2093023255814,
               "deviation_status": "NEUTRAL",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -4562,13 +4346,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-14 18:49:00",
-              "brick_size": 20.515625,
-              "last_brick_close": 45168.546875,
+              "brick_size": 24.227272727272727,
+              "last_brick_close": 45177.454545454544,
               "last_price": 45167.0,
               "consecutive_same_direction": 1,
               "direction": "UP",
               "brick_reverse": true,
-              "n_bricks": 17
+              "n_bricks": 18
             }
           },
           "adl": {
@@ -4597,7 +4381,7 @@
               "vwap_std": 20.561417344265696,
               "last_price": 45167.0,
               "deviation": 8.76382978723268,
-              "atr_1m": 41.03125,
+              "atr_1m": 48.45454545454545,
               "deviation_status": "NEUTRAL",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -4627,13 +4411,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-14 18:54:00",
-              "brick_size": 20.318181818181817,
-              "last_brick_close": 45147.63636363637,
+              "brick_size": 24.0,
+              "last_brick_close": 45153.0,
               "last_price": 45145.0,
               "consecutive_same_direction": 1,
               "direction": "DOWN",
               "brick_reverse": true,
-              "n_bricks": 18
+              "n_bricks": 19
             }
           },
           "adl": {
@@ -4662,7 +4446,7 @@
               "vwap_std": 14.435478476320714,
               "last_price": 45145.0,
               "deviation": -18.859728506788088,
-              "atr_1m": 40.63636363636363,
+              "atr_1m": 48.0,
               "deviation_status": "BELOW",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -4800,13 +4584,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-14 19:59:00",
-              "brick_size": 22.293478260869566,
-              "last_brick_close": 45285.347826086974,
+              "brick_size": 24.74137931034483,
+              "last_brick_close": 45277.44827586209,
               "last_price": 45277.0,
               "consecutive_same_direction": 1,
               "direction": "UP",
               "brick_reverse": true,
-              "n_bricks": 24
+              "n_bricks": 30
             }
           },
           "adl": {
@@ -4835,7 +4619,7 @@
               "vwap_std": 19.980287874330017,
               "last_price": 45277.0,
               "deviation": -7.34050632911385,
-              "atr_1m": 44.58695652173913,
+              "atr_1m": 49.48275862068966,
               "deviation_status": "NEUTRAL",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -4865,13 +4649,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-14 20:04:00",
-              "brick_size": 22.53191489361702,
-              "last_brick_close": 45264.723404255325,
+              "brick_size": 24.889830508474578,
+              "last_brick_close": 45253.449152542365,
               "last_price": 45247.0,
               "consecutive_same_direction": 1,
               "direction": "DOWN",
               "brick_reverse": true,
-              "n_bricks": 25
+              "n_bricks": 31
             }
           },
           "adl": {
@@ -4900,7 +4684,7 @@
               "vwap_std": 23.581846356038277,
               "last_price": 45247.0,
               "deviation": -31.452459016392822,
-              "atr_1m": 45.06382978723404,
+              "atr_1m": 49.779661016949156,
               "deviation_status": "BELOW",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -4930,13 +4714,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-14 20:09:00",
-              "brick_size": 22.416666666666668,
-              "last_brick_close": 45263.91666666665,
+              "brick_size": 24.758333333333333,
+              "last_brick_close": 45252.79166666666,
               "last_price": 45245.0,
               "consecutive_same_direction": 1,
               "direction": "DOWN",
               "brick_reverse": true,
-              "n_bricks": 25
+              "n_bricks": 31
             }
           },
           "adl": {
@@ -4965,7 +4749,7 @@
               "vwap_std": 22.6333820920433,
               "last_price": 45245.0,
               "deviation": -18.710176991153276,
-              "atr_1m": 44.833333333333336,
+              "atr_1m": 49.516666666666666,
               "deviation_status": "BELOW",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -5022,13 +4806,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-14 20:29:00",
-              "brick_size": 23.03846153846154,
-              "last_brick_close": 45360.42307692307,
+              "brick_size": 25.1171875,
+              "last_brick_close": 45355.0546875,
               "last_price": 45379.0,
               "consecutive_same_direction": 5,
               "direction": "UP",
               "brick_reverse": true,
-              "n_bricks": 31
+              "n_bricks": 39
             }
           },
           "adl": {
@@ -5057,7 +4841,7 @@
               "vwap_std": 50.79698350504527,
               "last_price": 45379.0,
               "deviation": 34.49121140142233,
-              "atr_1m": 46.07692307692308,
+              "atr_1m": 50.234375,
               "deviation_status": "ABOVE",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -5079,7 +4863,7 @@
       ]
     },
     "mts-auto-165644-850": {
-      "decision_ts": "2026-07-15 17:59:00",
+      "decision_ts": "2026-07-15 17:34:00",
       "direction": "BEARISH",
       "confidence": 0.825,
       "renko": {
@@ -5088,14 +4872,14 @@
         "score": 1.0,
         "asof_ts": null,
         "detail": {
-          "decision_ts": "2026-07-15 17:59:00",
-          "brick_size": 18.384615384615383,
-          "last_brick_close": 46053.076923076915,
-          "last_price": 46052.0,
-          "consecutive_same_direction": 3,
+          "decision_ts": "2026-07-15 17:34:00",
+          "brick_size": 21.45,
+          "last_brick_close": 46080.750000000015,
+          "last_price": 46080.0,
+          "consecutive_same_direction": 2,
           "direction": "DOWN",
           "brick_reverse": true,
-          "n_bricks": 7
+          "n_bricks": 13
         }
       },
       "adl": {
@@ -5104,11 +4888,11 @@
         "score": 0.5,
         "asof_ts": null,
         "detail": {
-          "decision_ts": "2026-07-15 17:59:00",
-          "adl_value": -526.390279490524,
-          "slope": -4.229624689668466,
-          "residual_std": 331.7441410423095,
-          "snr": -0.1529959081223156,
+          "decision_ts": "2026-07-15 17:34:00",
+          "adl_value": -241.07146009441112,
+          "slope": -37.427916473331535,
+          "residual_std": 255.9899570063078,
+          "snr": -1.7545024077425388,
           "direction": "CHOP",
           "n_bars": 12
         }
@@ -5119,12 +4903,12 @@
         "score": 1.0,
         "asof_ts": null,
         "detail": {
-          "decision_ts": "2026-07-15 17:59:00",
-          "vwap": 46074.14171428572,
-          "vwap_std": 24.077978734070836,
-          "last_price": 46052.0,
-          "deviation": -22.14171428571717,
-          "atr_1m": 36.76923076923077,
+          "decision_ts": "2026-07-15 17:34:00",
+          "vwap": 46097.02879453392,
+          "vwap_std": 10.982467529292597,
+          "last_price": 46080.0,
+          "deviation": -17.028794533922337,
+          "atr_1m": 42.9,
           "deviation_status": "BELOW",
           "n_samples": 48,
           "n_samples_in_window": 48,
@@ -5136,57 +4920,57 @@
       "decision_max_quote_age_ms": 0.0,
       "window_max_quote_age_ms": 0.0,
       "signal_timestamps": {
-        "adl": "2026-07-15 17:59:00",
-        "regime_60m": "2026-07-15 17:59:00",
-        "exit_15m": "2026-07-15 17:59:00"
+        "adl": "2026-07-15 17:34:00",
+        "regime_60m": "2026-07-15 16:59:00",
+        "exit_15m": "2026-07-15 17:29:00"
       },
       "regime_60m": "BEARISH",
       "exit_15m_direction": "BEARISH",
-      "bar_ts": "2026-07-15 17:59:00",
-      "execution_ts": "2026-07-15 18:04:00",
+      "bar_ts": "2026-07-15 17:34:00",
+      "execution_ts": "2026-07-15 17:39:00",
       "execution_bar": {
-        "ts": "2026-07-15 18:04:00",
-        "open": 46051.0,
-        "high": 46069.0,
-        "low": 46027.0,
-        "close": 46057.0,
-        "volume": 937.0,
+        "ts": "2026-07-15 17:39:00",
+        "open": 46080.0,
+        "high": 46104.0,
+        "low": 46047.0,
+        "close": 46095.0,
+        "volume": 1181.0,
         "leg": "NEAR",
-        "asof_ts": "2026-07-15 18:04:00"
+        "asof_ts": "2026-07-15 17:39:00"
       }
     },
     "mts-auto-183042-480": {
-      "decision_ts": "2026-07-15 20:59:00",
+      "decision_ts": "2026-07-15 20:39:00",
       "direction": "BULLISH",
-      "confidence": 1.0,
+      "confidence": 0.825,
       "renko": {
         "source": "renko",
         "direction": "BULLISH",
         "score": 1.0,
         "asof_ts": null,
         "detail": {
-          "decision_ts": "2026-07-15 20:59:00",
-          "brick_size": 24.566666666666666,
-          "last_brick_close": 46112.83333333333,
-          "last_price": 46120.0,
-          "consecutive_same_direction": 8,
+          "decision_ts": "2026-07-15 20:39:00",
+          "brick_size": 23.276315789473685,
+          "last_brick_close": 46010.17105263158,
+          "last_price": 46025.0,
+          "consecutive_same_direction": 4,
           "direction": "UP",
           "brick_reverse": true,
-          "n_bricks": 17
+          "n_bricks": 19
         }
       },
       "adl": {
         "source": "adl",
-        "direction": "BULLISH",
-        "score": 1.0,
+        "direction": "CHOP",
+        "score": 0.5,
         "asof_ts": null,
         "detail": {
-          "decision_ts": "2026-07-15 20:59:00",
-          "adl_value": 2586.225247543453,
-          "slope": 347.20227345463866,
-          "residual_std": 855.43865337159,
-          "snr": 4.870515565509891,
-          "direction": "BULLISH",
+          "decision_ts": "2026-07-15 20:39:00",
+          "adl_value": -1553.777859159129,
+          "slope": -116.25731180159023,
+          "residual_std": 775.4074451888221,
+          "snr": -1.7991673261277406,
+          "direction": "CHOP",
           "n_bars": 12
         }
       },
@@ -5196,12 +4980,12 @@
         "score": 1.0,
         "asof_ts": null,
         "detail": {
-          "decision_ts": "2026-07-15 20:59:00",
-          "vwap": 46089.85098849218,
-          "vwap_std": 20.986406461764393,
-          "last_price": 46120.0,
-          "deviation": 30.149011507819523,
-          "atr_1m": 49.13333333333333,
+          "decision_ts": "2026-07-15 20:39:00",
+          "vwap": 45992.743785850864,
+          "vwap_std": 48.1973871760743,
+          "last_price": 46025.0,
+          "deviation": 32.25621414913621,
+          "atr_1m": 46.55263157894737,
           "deviation_status": "ABOVE",
           "n_samples": 48,
           "n_samples_in_window": 48,
@@ -5213,23 +4997,23 @@
       "decision_max_quote_age_ms": 0.0,
       "window_max_quote_age_ms": 0.0,
       "signal_timestamps": {
-        "adl": "2026-07-15 20:59:00",
-        "regime_60m": "2026-07-15 20:59:00",
-        "exit_15m": "2026-07-15 20:59:00"
+        "adl": "2026-07-15 20:39:00",
+        "regime_60m": "2026-07-15 19:59:00",
+        "exit_15m": "2026-07-15 20:29:00"
       },
-      "regime_60m": "BULLISH",
+      "regime_60m": "CHOP",
       "exit_15m_direction": "BULLISH",
-      "bar_ts": "2026-07-15 20:59:00",
-      "execution_ts": "2026-07-15 21:04:00",
+      "bar_ts": "2026-07-15 20:39:00",
+      "execution_ts": "2026-07-15 20:44:00",
       "execution_bar": {
-        "ts": "2026-07-15 21:04:00",
-        "open": 46120.0,
-        "high": 46130.0,
-        "low": 46100.0,
-        "close": 46115.0,
-        "volume": 1142.0,
+        "ts": "2026-07-15 20:44:00",
+        "open": 46023.0,
+        "high": 46066.0,
+        "low": 46003.0,
+        "close": 46056.0,
+        "volume": 1505.0,
         "leg": "NEAR",
-        "asof_ts": "2026-07-15 21:04:00"
+        "asof_ts": "2026-07-15 20:44:00"
       }
     },
     "mts-auto-183154-722": {
@@ -5243,13 +5027,13 @@
         "asof_ts": null,
         "detail": {
           "decision_ts": "2026-07-16 20:09:00",
-          "brick_size": 42.0,
-          "last_brick_close": 44563.0,
+          "brick_size": 44.703125,
+          "last_brick_close": 44562.375,
           "last_price": 44553.0,
           "consecutive_same_direction": 2,
           "direction": "DOWN",
           "brick_reverse": true,
-          "n_bricks": 11
+          "n_bricks": 20
         }
       },
       "adl": {
@@ -5278,7 +5062,7 @@
           "vwap_std": 34.11993134604552,
           "last_price": 44553.0,
           "deviation": -36.824963685408875,
-          "atr_1m": 84.0,
+          "atr_1m": 89.40625,
           "deviation_status": "BELOW",
           "n_samples": 48,
           "n_samples_in_window": 48,
@@ -5310,26 +5094,17 @@
       }
     },
     "mts-auto-202908-887": {
-      "decision_ts": "2026-07-16 20:29:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+      "decision_ts": "2026-07-16 20:34:00",
+      "block_reason": "INSUFFICIENT_SAME_DIRECTION",
       "signal_timestamps": {
-        "adl": "2026-07-16 20:29:00",
+        "adl": "2026-07-16 20:34:00",
         "regime_60m": null,
         "exit_15m": null
       },
       "telemetry": [
         {
-          "decision_ts": "2026-07-16 20:29:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-16 20:29:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
           "decision_ts": "2026-07-16 20:34:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 20:34:00",
             "regime_60m": null,
@@ -5338,7 +5113,7 @@
         },
         {
           "decision_ts": "2026-07-16 20:39:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 20:39:00",
             "regime_60m": null,
@@ -5347,13 +5122,136 @@
         },
         {
           "decision_ts": "2026-07-16 20:44:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 20:44:00",
             "regime_60m": null,
             "exit_15m": null
           }
         },
+        {
+          "decision_ts": "2026-07-16 20:49:00",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "signal_timestamps": {
+            "adl": "2026-07-16 20:49:00",
+            "regime_60m": null,
+            "exit_15m": null
+          }
+        },
+        {
+          "decision_ts": "2026-07-16 20:54:00",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "signal_timestamps": {
+            "adl": "2026-07-16 20:54:00",
+            "regime_60m": null,
+            "exit_15m": null
+          }
+        },
+        {
+          "decision_ts": "2026-07-16 20:59:00",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "signal_timestamps": {
+            "adl": "2026-07-16 20:59:00",
+            "regime_60m": "2026-07-16 20:59:00",
+            "exit_15m": "2026-07-16 20:59:00"
+          }
+        },
+        {
+          "decision_ts": "2026-07-16 21:04:00",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "signal_timestamps": {
+            "adl": "2026-07-16 21:04:00",
+            "regime_60m": "2026-07-16 20:59:00",
+            "exit_15m": "2026-07-16 20:59:00"
+          }
+        },
+        {
+          "decision_ts": "2026-07-16 21:09:00",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "signal_timestamps": {
+            "adl": "2026-07-16 21:09:00",
+            "regime_60m": "2026-07-16 20:59:00",
+            "exit_15m": "2026-07-16 20:59:00"
+          }
+        },
+        {
+          "decision_ts": "2026-07-16 21:14:00",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "signal_timestamps": {
+            "adl": "2026-07-16 21:14:00",
+            "regime_60m": "2026-07-16 20:59:00",
+            "exit_15m": "2026-07-16 21:14:00"
+          }
+        },
+        {
+          "decision_ts": "2026-07-16 21:19:00",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "signal_timestamps": {
+            "adl": "2026-07-16 21:19:00",
+            "regime_60m": "2026-07-16 20:59:00",
+            "exit_15m": "2026-07-16 21:14:00"
+          }
+        }
+      ]
+    },
+    "mts-auto-212849-633": {
+      "decision_ts": "2026-07-16 21:29:00",
+      "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+      "signal_timestamps": {
+        "adl": "2026-07-16 21:29:00",
+        "regime_60m": null,
+        "exit_15m": null
+      },
+      "telemetry": [
+        {
+          "decision_ts": "2026-07-16 21:29:00",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "signal_timestamps": {
+            "adl": "2026-07-16 21:29:00",
+            "regime_60m": null,
+            "exit_15m": null
+          }
+        }
+      ]
+    },
+    "mts-auto-213700-512": {
+      "decision_ts": "2026-07-16 21:39:00",
+      "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+      "signal_timestamps": {
+        "adl": "2026-07-16 21:39:00",
+        "regime_60m": null,
+        "exit_15m": null
+      },
+      "telemetry": [
+        {
+          "decision_ts": "2026-07-16 21:39:00",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "signal_timestamps": {
+            "adl": "2026-07-16 21:39:00",
+            "regime_60m": null,
+            "exit_15m": null
+          }
+        },
+        {
+          "decision_ts": "2026-07-16 21:44:00",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
+          "signal_timestamps": {
+            "adl": "2026-07-16 21:44:00",
+            "regime_60m": null,
+            "exit_15m": null
+          }
+        }
+      ]
+    },
+    "mts-auto-214943-083": {
+      "decision_ts": "2026-07-16 20:49:00",
+      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+      "signal_timestamps": {
+        "adl": "2026-07-16 20:49:00",
+        "regime_60m": null,
+        "exit_15m": null
+      },
+      "telemetry": [
         {
           "decision_ts": "2026-07-16 20:49:00",
           "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
@@ -5416,18 +5314,16 @@
             "regime_60m": null,
             "exit_15m": null
           }
-        }
-      ]
-    },
-    "mts-auto-212849-633": {
-      "decision_ts": "2026-07-16 21:29:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-      "signal_timestamps": {
-        "adl": "2026-07-16 21:29:00",
-        "regime_60m": null,
-        "exit_15m": null
-      },
-      "telemetry": [
+        },
+        {
+          "decision_ts": "2026-07-16 21:24:00",
+          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "signal_timestamps": {
+            "adl": "2026-07-16 21:24:00",
+            "regime_60m": null,
+            "exit_15m": null
+          }
+        },
         {
           "decision_ts": "2026-07-16 21:29:00",
           "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
@@ -5436,18 +5332,16 @@
             "regime_60m": null,
             "exit_15m": null
           }
-        }
-      ]
-    },
-    "mts-auto-213700-512": {
-      "decision_ts": "2026-07-16 21:39:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-      "signal_timestamps": {
-        "adl": "2026-07-16 21:39:00",
-        "regime_60m": null,
-        "exit_15m": null
-      },
-      "telemetry": [
+        },
+        {
+          "decision_ts": "2026-07-16 21:34:00",
+          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "signal_timestamps": {
+            "adl": "2026-07-16 21:34:00",
+            "regime_60m": null,
+            "exit_15m": null
+          }
+        },
         {
           "decision_ts": "2026-07-16 21:39:00",
           "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
@@ -5459,27 +5353,16 @@
         },
         {
           "decision_ts": "2026-07-16 21:44:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 21:44:00",
             "regime_60m": null,
             "exit_15m": null
           }
-        }
-      ]
-    },
-    "mts-auto-214943-083": {
-      "decision_ts": "2026-07-16 21:49:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-      "signal_timestamps": {
-        "adl": "2026-07-16 21:49:00",
-        "regime_60m": null,
-        "exit_15m": null
-      },
-      "telemetry": [
+        },
         {
           "decision_ts": "2026-07-16 21:49:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 21:49:00",
             "regime_60m": null,
@@ -5490,36 +5373,36 @@
     },
     "mts-auto-215657-960": {
       "decision_ts": "2026-07-16 21:59:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+      "block_reason": "INSUFFICIENT_SAME_DIRECTION",
       "signal_timestamps": {
         "adl": "2026-07-16 21:59:00",
-        "regime_60m": null,
-        "exit_15m": null
+        "regime_60m": "2026-07-16 21:59:00",
+        "exit_15m": "2026-07-16 21:59:00"
       },
       "telemetry": [
         {
           "decision_ts": "2026-07-16 21:59:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 21:59:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 21:59:00",
+            "exit_15m": "2026-07-16 21:59:00"
           }
         },
         {
           "decision_ts": "2026-07-16 22:04:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 22:04:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 21:59:00",
+            "exit_15m": "2026-07-16 21:59:00"
           }
         }
       ]
     },
     "mts-auto-221230-855": {
       "decision_ts": "2026-07-16 22:14:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+      "block_reason": "INSUFFICIENT_SAME_DIRECTION",
       "signal_timestamps": {
         "adl": "2026-07-16 22:14:00",
         "regime_60m": null,
@@ -5528,7 +5411,7 @@
       "telemetry": [
         {
           "decision_ts": "2026-07-16 22:14:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 22:14:00",
             "regime_60m": null,
@@ -5537,7 +5420,7 @@
         },
         {
           "decision_ts": "2026-07-16 22:19:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 22:19:00",
             "regime_60m": null,
@@ -5546,7 +5429,7 @@
         },
         {
           "decision_ts": "2026-07-16 22:24:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 22:24:00",
             "regime_60m": null,
@@ -5555,7 +5438,7 @@
         },
         {
           "decision_ts": "2026-07-16 22:29:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 22:29:00",
             "regime_60m": null,
@@ -5564,7 +5447,7 @@
         },
         {
           "decision_ts": "2026-07-16 22:34:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 22:34:00",
             "regime_60m": null,
@@ -5573,7 +5456,7 @@
         },
         {
           "decision_ts": "2026-07-16 22:39:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 22:39:00",
             "regime_60m": null,
@@ -5582,7 +5465,7 @@
         },
         {
           "decision_ts": "2026-07-16 22:44:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 22:44:00",
             "regime_60m": null,
@@ -5591,7 +5474,7 @@
         },
         {
           "decision_ts": "2026-07-16 22:49:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 22:49:00",
             "regime_60m": null,
@@ -5600,7 +5483,7 @@
         },
         {
           "decision_ts": "2026-07-16 22:54:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 22:54:00",
             "regime_60m": null,
@@ -5609,20 +5492,20 @@
         },
         {
           "decision_ts": "2026-07-16 22:59:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 22:59:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 22:59:00",
+            "exit_15m": "2026-07-16 22:59:00"
           }
         },
         {
           "decision_ts": "2026-07-16 23:04:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 23:04:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 22:59:00",
+            "exit_15m": "2026-07-16 22:59:00"
           }
         },
         {
@@ -5630,8 +5513,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 23:09:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 22:59:00",
+            "exit_15m": "2026-07-16 22:59:00"
           }
         },
         {
@@ -5639,8 +5522,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 23:14:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 22:59:00",
+            "exit_15m": "2026-07-16 23:14:00"
           }
         },
         {
@@ -5648,8 +5531,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 23:19:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 22:59:00",
+            "exit_15m": "2026-07-16 23:14:00"
           }
         },
         {
@@ -5657,8 +5540,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 23:24:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 22:59:00",
+            "exit_15m": "2026-07-16 23:14:00"
           }
         },
         {
@@ -5666,8 +5549,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 23:29:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 22:59:00",
+            "exit_15m": "2026-07-16 23:29:00"
           }
         },
         {
@@ -5675,8 +5558,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 23:34:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 22:59:00",
+            "exit_15m": "2026-07-16 23:29:00"
           }
         },
         {
@@ -5684,8 +5567,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 23:39:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 22:59:00",
+            "exit_15m": "2026-07-16 23:29:00"
           }
         },
         {
@@ -5693,8 +5576,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 23:44:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 22:59:00",
+            "exit_15m": "2026-07-16 23:44:00"
           }
         },
         {
@@ -5702,8 +5585,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 23:49:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 22:59:00",
+            "exit_15m": "2026-07-16 23:44:00"
           }
         },
         {
@@ -5711,8 +5594,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-16 23:54:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-16 22:59:00",
+            "exit_15m": "2026-07-16 23:44:00"
           }
         },
         {
@@ -5726,13 +5609,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-16 23:59:00",
-              "brick_size": 50.38636363636363,
-              "last_brick_close": 44814.61363636364,
+              "brick_size": 60.14705882352941,
+              "last_brick_close": 44793.29411764706,
               "last_price": 44779.0,
               "consecutive_same_direction": 1,
               "direction": "DOWN",
               "brick_reverse": true,
-              "n_bricks": 9
+              "n_bricks": 16
             }
           },
           "adl": {
@@ -5761,7 +5644,7 @@
               "vwap_std": 17.56573063260431,
               "last_price": 44779.0,
               "deviation": -27.64428259286069,
-              "atr_1m": 100.77272727272727,
+              "atr_1m": 120.29411764705883,
               "deviation_status": "NEUTRAL",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -5791,13 +5674,13 @@
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-17 00:04:00",
-              "brick_size": 49.30434782608695,
-              "last_brick_close": 44815.69565217391,
+              "brick_size": 59.15714285714286,
+              "last_brick_close": 44791.31428571428,
               "last_price": 44776.0,
               "consecutive_same_direction": 1,
               "direction": "DOWN",
               "brick_reverse": true,
-              "n_bricks": 9
+              "n_bricks": 16
             }
           },
           "adl": {
@@ -5826,7 +5709,7 @@
               "vwap_std": 23.811254217384302,
               "last_price": 44776.0,
               "deviation": -25.528610823850613,
-              "atr_1m": 98.6086956521739,
+              "atr_1m": 118.31428571428572,
               "deviation_status": "NEUTRAL",
               "n_samples": 48,
               "n_samples_in_window": 48,
@@ -5848,21 +5731,21 @@
         {
           "decision_ts": "2026-07-17 00:09:00",
           "direction": "BEARISH",
-          "confidence": 0.825,
+          "confidence": 0.375,
           "renko": {
             "source": "renko",
-            "direction": "BEARISH",
-            "score": 1.0,
+            "direction": "CHOP",
+            "score": 0.0,
             "asof_ts": null,
             "detail": {
               "decision_ts": "2026-07-17 00:09:00",
-              "brick_size": 48.916666666666664,
-              "last_brick_close": 44767.16666666667,
+              "brick_size": 58.625,
+              "last_brick_close": 44790.25,
               "last_price": 44742.0,
-              "consecutive_same_direction": 2,
+              "consecutive_same_direction": 1,
               "direction": "DOWN",
               "brick_reverse": true,
-              "n_bricks": 10
+              "n_bricks": 18
             }
           },
           "adl": {
@@ -5891,15 +5774,15 @@
               "vwap_std": 32.26815462020814,
               "last_price": 44742.0,
               "deviation": -37.43324387789471,
-              "atr_1m": 97.83333333333333,
+              "atr_1m": 117.25,
               "deviation_status": "BELOW",
               "n_samples": 48,
               "n_samples_in_window": 48,
               "samples_missing": false
             }
           },
-          "pass_release": true,
-          "block_reason": "NO_NEXT_EXECUTION_BAR",
+          "pass_release": false,
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "decision_max_quote_age_ms": 0.0,
           "window_max_quote_age_ms": 0.0,
           "signal_timestamps": {
@@ -5913,26 +5796,17 @@
       ]
     },
     "mts-auto-224409-884": {
-      "decision_ts": "2026-07-15 22:44:00",
-      "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+      "decision_ts": "2026-07-15 22:49:00",
+      "block_reason": "INSUFFICIENT_SAME_DIRECTION",
       "signal_timestamps": {
-        "adl": "2026-07-15 22:44:00",
+        "adl": "2026-07-15 22:49:00",
         "regime_60m": null,
         "exit_15m": null
       },
       "telemetry": [
         {
-          "decision_ts": "2026-07-15 22:44:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
-          "signal_timestamps": {
-            "adl": "2026-07-15 22:44:00",
-            "regime_60m": null,
-            "exit_15m": null
-          }
-        },
-        {
           "decision_ts": "2026-07-15 22:49:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 22:49:00",
             "regime_60m": null,
@@ -5941,7 +5815,7 @@
         },
         {
           "decision_ts": "2026-07-15 22:54:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 22:54:00",
             "regime_60m": null,
@@ -5950,74 +5824,74 @@
         },
         {
           "decision_ts": "2026-07-15 22:59:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 22:59:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-15 22:59:00",
+            "exit_15m": "2026-07-15 22:59:00"
           }
         },
         {
           "decision_ts": "2026-07-15 23:04:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 23:04:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-15 22:59:00",
+            "exit_15m": "2026-07-15 22:59:00"
           }
         },
         {
           "decision_ts": "2026-07-15 23:09:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 23:09:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-15 22:59:00",
+            "exit_15m": "2026-07-15 22:59:00"
           }
         },
         {
           "decision_ts": "2026-07-15 23:14:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 23:14:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-15 22:59:00",
+            "exit_15m": "2026-07-15 23:14:00"
           }
         },
         {
           "decision_ts": "2026-07-15 23:19:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 23:19:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-15 22:59:00",
+            "exit_15m": "2026-07-15 23:14:00"
           }
         },
         {
           "decision_ts": "2026-07-15 23:24:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 23:24:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-15 22:59:00",
+            "exit_15m": "2026-07-15 23:14:00"
           }
         },
         {
           "decision_ts": "2026-07-15 23:29:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 23:29:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-15 22:59:00",
+            "exit_15m": "2026-07-15 23:29:00"
           }
         },
         {
           "decision_ts": "2026-07-15 23:34:00",
-          "block_reason": "DIVERGENCE_OR_INSUFFICIENT",
+          "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 23:34:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-15 22:59:00",
+            "exit_15m": "2026-07-15 23:29:00"
           }
         },
         {
@@ -6025,8 +5899,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 23:39:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-15 22:59:00",
+            "exit_15m": "2026-07-15 23:29:00"
           }
         },
         {
@@ -6034,8 +5908,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 23:44:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-15 22:59:00",
+            "exit_15m": "2026-07-15 23:44:00"
           }
         },
         {
@@ -6043,8 +5917,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 23:49:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-15 22:59:00",
+            "exit_15m": "2026-07-15 23:44:00"
           }
         },
         {
@@ -6052,8 +5926,8 @@
           "block_reason": "INSUFFICIENT_SAME_DIRECTION",
           "signal_timestamps": {
             "adl": "2026-07-15 23:54:00",
-            "regime_60m": null,
-            "exit_15m": null
+            "regime_60m": "2026-07-15 22:59:00",
+            "exit_15m": "2026-07-15 23:44:00"
           }
         },
         {
