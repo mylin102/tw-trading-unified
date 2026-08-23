@@ -516,6 +516,251 @@ def _fmt_policy_j_reason(reason_str: str) -> str:
         return "🛡️ Policy J 組合停利"
     return str(reason_str)
 
+
+# ── 2026-08-23 Hermes Agent: Hierarchical VWAP candidate telemetry panel ──
+# PURE, testable data-assembly + rendering helpers (display-only; never
+# alter runtime behavior). The strategy writes HVWAP_CANDIDATE /
+# HVWAP_RELEASE_INTENT / HVWAP_RELEASE_BLOCKED events to the MTS event
+# ledger (mts_spread_events.jsonl); the position state file carries the
+# leg sides / release / trail / ATR fields.
+
+def _hvwap_load_events(max_lines: int = 2000) -> list:
+    """Read the MTS event ledger (newest LAST). Pure IO, never raises."""
+    _events = []
+    try:
+        _p = runtime_path("logs", "mts_spread_events.jsonl")
+        if os.path.exists(_p):
+            with open(_p) as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    try:
+                        _events.append(json.loads(_line))
+                    except Exception:
+                        continue
+    except Exception:
+        return []
+    return _events[-max_lines:]
+
+
+def _hvwap_latest(events: list, event_type: str):
+    """Newest event of the given type (or None)."""
+    if not events:
+        return None
+    for _ev in reversed(events):
+        if _ev.get("event") == event_type:
+            return _ev
+    return None
+
+
+def _hvwap_execution_mode() -> dict:
+    """effective_mode / live_order_allowed (execution_context.json) plus the
+    PAPER_MODE env override. Display-only. Fail-closed: any read error or
+    missing context yields mode UNKNOWN / release wiring INACTIVE."""
+    _mode = None
+    _live_allowed = False
+    try:
+        _ctx = json.loads(Path(runtime_path("execution_context.json")).read_text())
+        _mode = _ctx.get("effective_mode")
+        _live_allowed = bool(_ctx.get("live_order_allowed", False))
+    except Exception:
+        _mode = None
+    _pm = (os.getenv("PAPER_MODE", "") or "").strip().lower()
+    _pm_on = _pm in ("true", "1", "yes")
+    _is_paper = (_mode == "paper_active") or _pm_on
+    _is_live = (not _is_paper) and str(_mode or "").startswith("live")
+    return {
+        "effective_mode": _mode,
+        "live_order_allowed": _live_allowed,
+        "paper_mode_env": _pm_on,
+        "mode_label": "PAPER" if _is_paper else ("LIVE" if _is_live else "UNKNOWN"),
+        "release_wiring_active": bool(_is_paper and not _live_allowed),
+    }
+
+
+def _hvwap_panel_payload(state: dict, events: list) -> dict:
+    """Assemble the HVWAP telemetry display payload (pure; missing fields
+    default to None/'—'). `state` = MTS position state dict, `events` =
+    ledger events (newest last)."""
+    _cand = _hvwap_latest(events, "HVWAP_CANDIDATE") or {}
+    _intent = _hvwap_latest(events, "HVWAP_RELEASE_INTENT") or {}
+    _blocked = _hvwap_latest(events, "HVWAP_RELEASE_BLOCKED") or {}
+    _mode = _hvwap_execution_mode()
+    _near = _cand.get("near") or {}
+    _far = _cand.get("far") or {}
+    _rel_intent = _intent.get("release_leg") or _intent.get("leg")
+    # winner / trigger source: the state reason (e.g. HVWAP_CANDIDATE after
+    # a candidate release); overridden by the release-intent source only when
+    # the intent is the newest release event (recency-consistent).
+    _winner = state.get("reason") or state.get("state")
+    # release status: the NEWEST of (intent, blocked) wins — a block that
+    # arrived after an intent means a later attempt failed; an intent after
+    # a block means the block was resolved.
+    _rel_src = None
+    _rel_is_intent = False
+    _rel_idx_i = next((i for i, e in enumerate(events)
+                       if e.get("event") == "HVWAP_RELEASE_INTENT"), -1)
+    _rel_idx_b = next((i for i, e in enumerate(events)
+                       if e.get("event") == "HVWAP_RELEASE_BLOCKED"), -1)
+    if _rel_idx_i >= 0 and (_rel_idx_i >= _rel_idx_b or _rel_idx_b < 0):
+        _rel_src, _rel_is_intent = _intent, True
+    elif _rel_idx_b >= 0:
+        _rel_src, _rel_is_intent = _blocked, False
+    if _rel_src and _rel_is_intent:
+        _winner = _rel_src.get("source") or _winner
+    _release_status = "—"
+    if _rel_src and _rel_is_intent:
+        _release_status = (
+            f"INTENT {_rel_src.get('release_leg', '?')} "
+            f"@ {_rel_src.get('exit_price', '—')} "
+            f"({str(_rel_src.get('decision_ts', ''))[:19]})")
+    elif _rel_src:
+        _release_status = (
+            f"BLOCKED ({_rel_src.get('reason', '?')}) "
+            f"{str(_rel_src.get('ts', ''))[:19]}")
+    return {
+        "mode": _mode,
+        "state": {
+            "has_position": bool(state.get("has_position", False)),
+            "near_side": state.get("near_side") or "—",
+            "far_side": state.get("far_side") or "—",
+            "released_leg": state.get("released_leg"),
+            "remaining_leg": state.get("remaining_leg"),
+            "remaining_side": state.get("remaining_side"),
+            "trail_side": state.get("trail_side"),
+            "trail_stop_price": state.get("trail_stop_price"),
+            "atr": state.get("atr"),
+            "lifecycle_state": state.get("state"),
+            "reason": state.get("reason"),
+        },
+        "baseline": {
+            "enabled": bool(_cand.get("baseline_enabled", False)),
+            "pass_release": bool(_cand.get("baseline_pass_release", False)),
+            "release_leg": _cand.get("baseline_release_leg"),
+        },
+        "hvwap": {
+            "status": _cand.get("status") or "—",
+            "block_reason": _cand.get("block_reason"),
+            "regime_60m": _cand.get("regime_60m"),
+            "signal_15m": _cand.get("signal_15m"),
+            "near": {
+                "vwap": _near.get("vwap"),
+                "slope": _near.get("slope"),
+                "source": _near.get("vwap_source") or _near.get("source"),
+                "aligned": _near.get("aligned"),
+                "issue": _near.get("issue"),
+            },
+            "far": {
+                "vwap": _far.get("vwap"),
+                "slope": _far.get("slope"),
+                "source": _far.get("vwap_source") or _far.get("source"),
+                "aligned": _far.get("aligned"),
+                "issue": _far.get("issue"),
+            },
+            "consecutive_confirmed_bars": _cand.get("consecutive_confirmed_bars"),
+            "bars_complete": _cand.get("bars_complete"),
+            "session_boundary_ok": _cand.get("session_boundary_ok"),
+            "n_completed_5m_bars": _cand.get("n_completed_5m_bars"),
+            "quote_age_ms": _cand.get("quote_age_ms"),
+            "session_label": _cand.get("session_label"),
+            "retained_direction": _cand.get("retained_direction"),
+            "hypothetical_release_leg": _cand.get("hypothetical_release_leg"),
+            "decision_ts": _cand.get("decision_ts"),
+            "event_ts": _cand.get("ts"),
+        },
+        "release": {
+            "status": _release_status,
+            "intent_leg": _rel_intent,
+            "intent_exit_price": _intent.get("exit_price"),
+            "intent_decision_ts": _intent.get("decision_ts"),
+            "block_reason": _blocked.get("reason"),
+            "blocked_quote_age_ms": _blocked.get("quote_age_ms"),
+            "blocked_width": _blocked.get("width"),
+        },
+        "winner": _winner,
+    }
+
+
+def _hvwap_panel_markdown(p: dict) -> str:
+    """Render the HVWAP telemetry panel as styled HTML (pure)."""
+    _mode = p["mode"]
+    _badge_color = "#16a34a" if _mode["mode_label"] == "PAPER" else (
+        "#dc2626" if _mode["mode_label"] == "LIVE" else "#94a3b8")
+    _wiring = ("ACTIVE (paper-only)" if _mode["release_wiring_active"]
+               else "INACTIVE")
+    _st = p["state"]
+    _h = p["hvwap"]
+    _rel = p["release"]
+    _baseline = p["baseline"]
+    _near = _h["near"]
+    _far = _h["far"]
+
+    def _f(v, suffix="", nd=2):
+        if v is None or v == "—":
+            return "—"
+        try:
+            return f"{float(v):.{nd}f}{suffix}"
+        except Exception:
+            return str(v)
+
+    _fresh = "✓" if (_h["bars_complete"] and _h["session_boundary_ok"]) else "✗"
+    _hl = []
+    _hl.append(
+        "<div style='border:1px solid #334155; border-radius:6px; "
+        "padding:6px 10px; margin:4px 0; background:#0f172a; "
+        "font-family:monospace; font-size:12px; line-height:1.6;'>")
+    _hl.append(
+        f"<b>📐 HVWAP 候選 (Hierarchical VWAP)</b> &nbsp; "
+        f"<span style='background:{_badge_color}; color:#fff; padding:1px 8px; "
+        f"border-radius:10px; font-size:10px;'>"
+        f"{_mode['mode_label']}</span> &nbsp; "
+        f"<span style='color:#94a3b8; font-size:10px;'>"
+        f"mode={_mode['effective_mode'] or 'N/A'} · live_order_allowed="
+        f"{_mode['live_order_allowed']} · 釋放接線: {_wiring}</span>")
+    _hl.append(
+        f"<div style='margin-top:2px;'>狀態: <b>{_h['status']}</b>"
+        f"{' · ' + str(_h['block_reason']) if _h['block_reason'] else ''}"
+        f" &nbsp;|&nbsp; 60m: {_h['regime_60m'] or '—'}"
+        f" &nbsp;|&nbsp; 15m: {_h['signal_15m'] or '—'}"
+        f" &nbsp;|&nbsp; 5m 確認: x{_h['consecutive_confirmed_bars'] or 0}"
+        f" &nbsp;|&nbsp; 完整度: {_fresh} ({_h['n_completed_5m_bars'] or 0} bars)"
+        f" &nbsp;|&nbsp; quote age: {_f(_h['quote_age_ms'], 'ms', 0)}</div>")
+    _hl.append(
+        f"<div>近月 VWAP: {_f(_near['vwap'])} ({_near['source'] or '—'}, "
+        f"slope={_f(_near['slope'])}, aligned={_near['aligned']})"
+        f" &nbsp;|&nbsp; 遠月 VWAP: {_f(_far['vwap'])} "
+        f"({_far['source'] or '—'}, slope={_f(_far['slope'])}, "
+        f"aligned={_far['aligned']})</div>")
+    _hl.append(
+        f"<div>方向: {_h['retained_direction'] or '—'} "
+        f"({_h['session_label'] or '—'})"
+        f" &nbsp;|&nbsp; 候選釋放腿: <b>{_h['hypothetical_release_leg'] or '—'}</b>"
+        f" &nbsp;|&nbsp; 基準趨勢釋放: "
+        f"{'ON' if _baseline['enabled'] else 'OFF'}"
+        f"(pass={_baseline['pass_release']}, leg={_baseline['release_leg'] or '—'})</div>")
+    _hl.append(
+        f"<div>候選釋放: <b>{_rel['status']}</b>"
+        f" &nbsp;|&nbsp; 目前觸發來源: <b>{p['winner'] or '—'}</b>"
+        f" &nbsp;|&nbsp; 無動作/阻擋: {_h['block_reason'] or '—'}</div>")
+    if _st["has_position"]:
+        _sides = f"近月 {_st['near_side']} / 遠月 {_st['far_side']}"
+        _sl_leg = (_st["released_leg"] or "無") + "已釋放" if _st["released_leg"] else "雙腿持倉"
+        _sl_trail = ("單腿停利: " + str(_st["trail_side"]) + " stop="
+                     + _f(_st["trail_stop_price"]) if _st["trail_side"]
+                     else "單腿停利: —")
+        _hl.append(
+            f"<div style='margin-top:2px;'>持倉: {_sides} · {_sl_leg} · "
+            f"{_sl_trail}"
+            f" &nbsp;|&nbsp; ATR: {_f(_st['atr'])}</div>")
+    else:
+        _hl.append(
+            f"<div style='margin-top:2px;'>持倉: FLAT &nbsp;|&nbsp; "
+            f"狀態: {_st['lifecycle_state'] or '—'} · "
+            f"原因: {_st['reason'] or '—'}</div>")
+    _hl.append("</div>")
+    return "".join(_hl)
+
 def calculate_mts_daily_performance(fills_path: str, events_path: str, target_trading_day: str) -> dict:
     from scripts.generate_daily_report import parse_logs
     return parse_logs(fills_path, events_path, target_trading_day)
@@ -4695,6 +4940,19 @@ elif _selected_product == "TMF":
                 _c5.metric("方向", _direction)
                 _c6.metric("理由", _fmt_policy_j_reason(_mts_state.get("reason", "?")))
 
+                # 2026-08-23 Hermes Agent: Hierarchical VWAP candidate panel
+                # (display-only telemetry: mode badge, candidate status,
+                # per-leg VWAP, 5m confirmation, freshness, release intent /
+                # block reason, winner). Never alters runtime behavior.
+                try:
+                    _hvwap_events = _hvwap_load_events()
+                    st.markdown(
+                        _hvwap_panel_markdown(
+                            _hvwap_panel_payload(_mts_state, _hvwap_events)),
+                        unsafe_allow_html=True)
+                except Exception:
+                    pass
+
                 # 2026-06-26 Gemini CLI: Render active fixed parameters and ATR when in position
                 # 2026-07-31 Antigravity: Format threshold points as integers without decimals
                 _stop_pts = _mts_state.get("release_stop_points") or _mts_state.get("release_stop")
@@ -4916,6 +5174,25 @@ elif _selected_product == "TMF":
                     f"原因: {_reason}"
                     f"{_params_info}"
                 )
+                # 2026-08-23 Hermes Agent: HVWAP candidate status while FLAT
+                # (compact; display-only telemetry — see the full panel when a
+                # position is held).
+                try:
+                    _hvwap_events = _hvwap_load_events()
+                    _hvwap_cand = _hvwap_latest(_hvwap_events, "HVWAP_CANDIDATE")
+                    if _hvwap_cand:
+                        _hvwap_block = _hvwap_cand.get("block_reason")
+                        _hvwap_block_sfx = f" · {_hvwap_block}" if _hvwap_block else ""
+                        st.caption(
+                            "📐 HVWAP 候選: "
+                            f"{_hvwap_cand.get('status', '?')}{_hvwap_block_sfx}"
+                            f" | 60m {_hvwap_cand.get('regime_60m', '—')}"
+                            f" | 15m {_hvwap_cand.get('signal_15m', '—')}"
+                            f" | 5m x{_hvwap_cand.get('consecutive_confirmed_bars', 0)}"
+                            f" | 釋放腿 {_hvwap_cand.get('hypothetical_release_leg', '—')}"
+                        )
+                except Exception:
+                    pass
                 # 2026-07-15 Gemini CLI: Render MTS Unrealized PnL block showing 0 TWD when in FLAT state
                 # 2026-07-31 Hermes Agent: FLAT => UPL MUST be 0 regardless of stale
                 # state fields (telemetry writer can leave phantom UPL after
