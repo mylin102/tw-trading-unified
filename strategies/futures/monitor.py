@@ -12063,6 +12063,12 @@ class FuturesMonitor:
             pass
         _bar_dict["near_vwap"] = _near_vwap
         _bar_dict["far_vwap"] = _far_vwap
+        # 2026-08-23 Hermes Agent: expose the FAR leg's OWN tick volume for the
+        # telemetry-only Hierarchical VWAP candidate arm. Per-leg session VWAP
+        # requires each leg's own volume; `far_vwap` above is a deque-wide
+        # aggregate (spans the 15:00 reset boundary) and must NEVER be used as
+        # a substitute for far volume. 0/missing -> candidate fails closed.
+        _bar_dict["far_volume"] = float(self._far_current_bar.get("volume", 0) or 0)
 
         # 2026-07-08 Hermes Agent: Compute BB bands for near/far release filter.
         # Only computed when BB filter is enabled AND sqz_on is active.

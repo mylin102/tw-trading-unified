@@ -36,6 +36,7 @@ import os
 import json
 import math
 import time
+from collections import deque
 import pandas as pd
 from datetime import datetime
 from typing import Any, TypeVar
@@ -1824,6 +1825,15 @@ class TMFSpread(StrategyBase):
         self._emitted_renko_event_keys = set()  # 2026-08-02 Antigravity: RenkoTracker instance
         self._emitted_renko_event_keys = set()
 
+        # 2026-08-23 Hermes Agent: Hierarchical VWAP candidate arm (MTS 2.0)
+        # TELEMETRY-ONLY bookkeeping: completed 5m bar ring (close-time ts)
+        # fed from the bar stream. Consumed solely by _hvwap_candidate_tick;
+        # never read by any baseline/lifecycle/order path.
+        self._hvwap_5m_bars: deque = deque(maxlen=320)
+        self._hvwap_last_bucket: int | None = None
+        self._hvwap_pending_snapshot: dict | None = None
+        self._hvwap_last_emit_bucket: int | None = None
+
         # P1: Spread-level excursions (telemetry only)
         self._spread_near_high: float = 0.0
         self._spread_near_low: float = 0.0
@@ -1938,6 +1948,177 @@ class TMFSpread(StrategyBase):
         except Exception:
             logger.warning("[MTS_TREND_RELEASE] seam fail-closed (exception)", exc_info=True)
             return False, None
+
+    def _hvwap_candidate_tick(self, bar: dict, now) -> None:
+        """2026-08-23 Hermes Agent: Hierarchical VWAP candidate arm (MTS 2.0).
+
+        PARALLEL, TELEMETRY-ONLY seam. It:
+          * accumulates COMPLETED 5m bars (close-time ts) into a ring buffer
+            from the bar stream (bucket-roll detection) — warms VWAP/slope
+            history even while FLAT;
+          * evaluates the pure Hierarchical VWAP candidate
+            (strategies.plugins.futures.active.mts_hvwap_candidate) and
+            appends one `HVWAP_CANDIDATE` telemetry record per completed 5m
+            bar while a position is held;
+          * NEVER gates the baseline Renko+ADL+Micro-VWAP 2-of-3 decision
+            arm, NEVER emits orders, NEVER touches lifecycle/position/order
+            state, and NEVER raises (any failure fails closed for the
+            candidate only).
+
+        VWAP contract (spec docs/mts/mts_vwap_filter_spec.md section 1.4):
+          per-leg session VWAP from each leg's OWN volume, trading day
+          resetting at 15:00 and carrying through the next-day session; no
+          prior-trading-day data. The NEAR leg accumulates its own volume
+          from the bar stream; the FAR leg carries its own tick volume via
+          the `far_volume` bar field (monitor exposes `_far_current_bar`
+          volume). When far volume is absent/zero the far leg fails closed
+          (MISSING_VWAP) — the monitor's deque-wide `far_vwap` is recorded
+          as `far_vwap_bar_ref` for reference only and is NEVER used as a
+          gate input or volume substitute.
+
+        Timestamp rule: `bar["ts"]` in this pipeline is a 5m bucket-START
+        (proven floor(epoch/300)*300); bar_close_time() shifts to the close
+        time ONLY for bucket-aligned timestamps and never double-shifts a
+        non-aligned (already point/close) timestamp.
+        """
+        try:
+            from strategies.plugins.futures.active.mts_hvwap_candidate import (
+                evaluate_hvwap_candidate,
+                compute_counterfactual_outcomes,
+                bar_close_time,
+            )
+            _close = bar_close_time(bar.get("ts") or bar.get("timestamp"))
+            if _close is None:
+                return  # no timestamp -> cannot bookkeep (fail-closed)
+            _bucket = int(_close // 300.0)
+
+            # bucket-roll: the previous bucket is now COMPLETE -> commit it
+            _last_bucket = getattr(self, "_hvwap_last_bucket", None)
+            if _last_bucket is not None and _bucket > _last_bucket:
+                _snap = getattr(self, "_hvwap_pending_snapshot", None)
+                if _snap is not None:
+                    self._hvwap_5m_bars.append(_snap)
+            self._hvwap_last_bucket = _bucket
+
+            _n_raw = bar.get("near_close")
+            if _n_raw is None:
+                _n_raw = bar.get("near_close_rt")
+            _f_raw = bar.get("far_close")
+            if _f_raw is None:
+                _f_raw = bar.get("far_close_rt")
+            try:
+                _n_f = float(_n_raw) if _n_raw is not None else 0.0
+            except (TypeError, ValueError):
+                _n_f = 0.0
+            try:
+                _f_f = float(_f_raw) if _f_raw is not None else 0.0
+            except (TypeError, ValueError):
+                _f_f = 0.0
+            _vol_raw = bar.get("volume")
+            try:
+                _n_vol = float(_vol_raw) if _vol_raw is not None else 0.0
+            except (TypeError, ValueError):
+                _n_vol = 0.0
+            _far_vol_raw = bar.get("far_volume") or bar.get("far_volume_rt")
+            try:
+                _far_vol = float(_far_vol_raw) if _far_vol_raw is not None else 0.0
+            except (TypeError, ValueError):
+                _far_vol = 0.0
+            self._hvwap_pending_snapshot = {
+                "ts": _close,
+                "close": _n_f,
+                "volume": _n_vol,
+                "far_close": _f_f,
+                "far_volume": _far_vol,
+                "far_vwap_ref": bar.get("far_vwap"),
+            }
+
+            # telemetry cadence: once per completed 5m bar, position held
+            if getattr(self, "_hvwap_last_emit_bucket", None) == _bucket:
+                return
+            self._hvwap_last_emit_bucket = _bucket
+            if self._has_position is not True:
+                return
+
+            _phase = "SPREAD"
+            try:
+                _ph = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
+                if _ph is not None:
+                    _phase = _ph.value if hasattr(_ph, "value") else str(_ph)
+            except Exception:
+                _phase = "SPREAD"
+            _atr_raw = bar.get("atr")
+            try:
+                _atr_f = float(_atr_raw) if _atr_raw is not None else None
+            except (TypeError, ValueError):
+                _atr_f = None
+            _n_age = bar.get("near_tick_age_ms")
+            _f_age = bar.get("far_tick_age_ms")
+
+            near_bars = list(self._hvwap_5m_bars)
+            far_bars = [
+                {"ts": _b["ts"], "close": _b["far_close"],
+                 "volume": _b.get("far_volume", 0.0)}
+                for _b in near_bars if _b.get("far_close", 0.0) > 0
+            ]
+            verdict = evaluate_hvwap_candidate(
+                decision_ts=_close,
+                near_bars=near_bars,
+                far_bars=far_bars,
+                near_price=_n_f if _n_f > 0 else None,
+                far_price=_f_f if _f_f > 0 else None,
+                near_side=getattr(self, "_near_side", None),
+                far_side=getattr(self, "_far_side", None),
+                atr_15m=_atr_f,
+                near_quote_age_ms=_n_age,
+                far_quote_age_ms=_f_age,
+                position_phase=_phase,
+            )
+
+            # baseline parity reference (read-only, idempotent)
+            _base_enabled, _base_snap = self._build_trend_release_input()
+            _base_pass = bool(_base_snap and _base_snap.get("pass_release")) if _base_enabled else False
+            _base_rel = (_base_snap or {}).get("release_leg") if _base_enabled else None
+
+            # paired counterfactual (hypothetical release, PURE & isolated)
+            _cf = None
+            _rel_leg = verdict.hypothetical_release_leg
+            if (_phase == "SPREAD" and _rel_leg and _n_f > 0 and _f_f > 0
+                    and getattr(self, "_near_entry", 0) and getattr(self, "_far_entry", 0)):
+                try:
+                    _mult = float(get_point_value(self._ticker))
+                except Exception:
+                    _mult = 10.0
+                _rel_price = _n_f if _rel_leg == "NEAR" else _f_f
+                _entry = self._near_entry if _rel_leg == "NEAR" else self._far_entry
+                _friction = 40.0 + (_rel_price + _entry) * _mult * 2e-5
+                _cf = compute_counterfactual_outcomes(
+                    near_side=getattr(self, "_near_side", None),
+                    far_side=getattr(self, "_far_side", None),
+                    near_entry=self._near_entry, far_entry=self._far_entry,
+                    release_leg=_rel_leg, release_price=_rel_price,
+                    near_now=_n_f, far_now=_f_f,
+                    point_value=_mult, release_friction_twd=_friction,
+                )
+
+            _payload = verdict.to_dict()
+            _payload.update({
+                "timestamp": now.isoformat() if hasattr(now, "isoformat") else str(now),
+                "trade_id": getattr(self, "_trade_id", None),
+                "position_phase": _phase,
+                "near_vwap_bar_ref": bar.get("near_vwap"),
+                "far_vwap_bar_ref": bar.get("far_vwap"),
+                "baseline_enabled": _base_enabled,
+                "baseline_pass_release": _base_pass,
+                "baseline_release_leg": _base_rel,
+                "release_action_emitted": False,
+                "release_outcome": "PENDING",
+                "counterfactual": _cf.to_dict() if _cf else None,
+            })
+            _append_event("HVWAP_CANDIDATE", **_payload)
+        except Exception:
+            # fail-closed for the candidate only: never disturb the baseline
+            logger.warning("[HVWAP_CANDIDATE] telemetry eval failed (fail-closed)", exc_info=True)
 
     def _ensure_lifecycle_adapter_initialized(self, source: str = "NORMAL") -> None:
         """
@@ -3522,6 +3703,11 @@ class TMFSpread(StrategyBase):
             now = ts
         else:
             now = datetime.now()
+
+        # 2026-08-23 Hermes Agent: Hierarchical VWAP candidate arm (MTS 2.0).
+        # Parallel, telemetry-only; cannot gate the baseline decision arm,
+        # cannot emit orders, cannot raise (fail-closed for the candidate).
+        self._hvwap_candidate_tick(bar, now)
 
         # ── [Fix] Prevent duplicate submissions ──
         # 2026-06-11 JVS Claw: Add timeout for RELEASE lifecycle states
