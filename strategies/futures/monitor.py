@@ -12431,6 +12431,14 @@ class FuturesMonitor:
             # next monitor gate.  Carry the current broker-flat proof into
             # that hook so historical fills cannot resurrect a ghost.
             strategy._broker_truth_flat = not _authority_has_pos
+        # 2026-08-23 Hermes Agent: inject the execution-mode gate for the
+        # telemetry-only HVWAP paper-release wiring (the strategy has no
+        # other access to the execution context). Fail-closed default: when
+        # the context is absent the strategy's paper gate returns MODE_UNKNOWN.
+        _hvwap_ctx = getattr(self, "_execution_context", None)
+        strategy._hvwap_execution_mode = getattr(_hvwap_ctx, "effective_mode", None)
+        strategy._hvwap_live_order_allowed = getattr(
+            _hvwap_ctx, "live_order_allowed", False)
         # [S1 repair] ONE shared EXIT_ONLY capability validation at tick
         # start — before ANY risk gate / strategy evaluation.  The
         # previous tick's authority override is cleared here; when valid,

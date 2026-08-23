@@ -1833,6 +1833,15 @@ class TMFSpread(StrategyBase):
         self._hvwap_last_bucket: int | None = None
         self._hvwap_pending_snapshot: dict | None = None
         self._hvwap_last_emit_bucket: int | None = None
+        # 2026-08-23 Hermes Agent: paper-only direct VWAP release wiring state
+        # (see _hvwap_maybe_paper_release). All telemetry/release state is
+        # observation-only for the baseline Renko+ADL+Micro-VWAP arm.
+        self._hvwap_last_verdict = None          # freshest pure candidate verdict
+        self._hvwap_armed = False                # first completed bar committed after wiring start
+        self._hvwap_release_sent_trade_id = None # idempotency: one candidate release per trade
+        self._hvwap_baseline_clear_tick = False  # baseline produced NO exit decision this tick
+        self._hvwap_execution_mode = None        # injected by monitor each tick (effective_mode)
+        self._hvwap_live_order_allowed = False   # injected by monitor each tick
 
         # P1: Spread-level excursions (telemetry only)
         self._spread_near_high: float = 0.0
@@ -1998,6 +2007,12 @@ class TMFSpread(StrategyBase):
                 _snap = getattr(self, "_hvwap_pending_snapshot", None)
                 if _snap is not None:
                     self._hvwap_5m_bars.append(_snap)
+                    # 2026-08-23 Hermes Agent: fresh completed bar after wiring
+                    # start — required before any candidate paper release (no
+                    # retroactive release on startup/recovery from an old
+                    # verdict; the first bar committed AFTER construction arms
+                    # the release path).
+                    self._hvwap_armed = True
             self._hvwap_last_bucket = _bucket
 
             _n_raw = bar.get("near_close")
@@ -2033,47 +2048,54 @@ class TMFSpread(StrategyBase):
                 "far_vwap_ref": bar.get("far_vwap"),
             }
 
-            # telemetry cadence: once per completed 5m bar, position held
-            if getattr(self, "_hvwap_last_emit_bucket", None) == _bucket:
-                return
-            self._hvwap_last_emit_bucket = _bucket
-            if self._has_position is not True:
-                return
-
-            _phase = "SPREAD"
-            try:
-                _ph = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
-                if _ph is not None:
-                    _phase = _ph.value if hasattr(_ph, "value") else str(_ph)
-            except Exception:
+            # ── fresh candidate verdict: computed EVERY tick while a position
+            # is held (the paper-release gate needs the CURRENT bar's verdict).
+            # Telemetry EMISSION stays rate-limited to one record per completed
+            # 5m bar; the verdict itself is refreshed per tick.
+            if self._has_position is True:
                 _phase = "SPREAD"
-            _atr_raw = bar.get("atr")
-            try:
-                _atr_f = float(_atr_raw) if _atr_raw is not None else None
-            except (TypeError, ValueError):
-                _atr_f = None
-            _n_age = bar.get("near_tick_age_ms")
-            _f_age = bar.get("far_tick_age_ms")
+                try:
+                    _ph = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
+                    if _ph is not None:
+                        _phase = _ph.value if hasattr(_ph, "value") else str(_ph)
+                except Exception:
+                    _phase = "SPREAD"
+                _atr_raw = bar.get("atr")
+                try:
+                    _atr_f = float(_atr_raw) if _atr_raw is not None else None
+                except (TypeError, ValueError):
+                    _atr_f = None
+                _n_age = bar.get("near_tick_age_ms")
+                _f_age = bar.get("far_tick_age_ms")
 
-            near_bars = list(self._hvwap_5m_bars)
-            far_bars = [
-                {"ts": _b["ts"], "close": _b["far_close"],
-                 "volume": _b.get("far_volume", 0.0)}
-                for _b in near_bars if _b.get("far_close", 0.0) > 0
-            ]
-            verdict = evaluate_hvwap_candidate(
-                decision_ts=_close,
-                near_bars=near_bars,
-                far_bars=far_bars,
-                near_price=_n_f if _n_f > 0 else None,
-                far_price=_f_f if _f_f > 0 else None,
-                near_side=getattr(self, "_near_side", None),
-                far_side=getattr(self, "_far_side", None),
-                atr_15m=_atr_f,
-                near_quote_age_ms=_n_age,
-                far_quote_age_ms=_f_age,
-                position_phase=_phase,
-            )
+                near_bars = list(self._hvwap_5m_bars)
+                far_bars = [
+                    {"ts": _b["ts"], "close": _b["far_close"],
+                     "volume": _b.get("far_volume", 0.0)}
+                    for _b in near_bars if _b.get("far_close", 0.0) > 0
+                ]
+                verdict = evaluate_hvwap_candidate(
+                    decision_ts=_close,
+                    near_bars=near_bars,
+                    far_bars=far_bars,
+                    near_price=_n_f if _n_f > 0 else None,
+                    far_price=_f_f if _f_f > 0 else None,
+                    near_side=getattr(self, "_near_side", None),
+                    far_side=getattr(self, "_far_side", None),
+                    atr_15m=_atr_f,
+                    near_quote_age_ms=_n_age,
+                    far_quote_age_ms=_f_age,
+                    position_phase=_phase,
+                )
+                self._hvwap_last_verdict = verdict
+                if getattr(self, "_hvwap_last_emit_bucket", None) == _bucket:
+                    return
+                self._hvwap_last_emit_bucket = _bucket
+            else:
+                # flat: advance the cadence bucket so the first in-position
+                # bar emits on its completion (existing cadence contract)
+                self._hvwap_last_emit_bucket = _bucket
+                return
 
             # baseline parity reference (read-only, idempotent)
             _base_enabled, _base_snap = self._build_trend_release_input()
@@ -2119,6 +2141,211 @@ class TMFSpread(StrategyBase):
         except Exception:
             # fail-closed for the candidate only: never disturb the baseline
             logger.warning("[HVWAP_CANDIDATE] telemetry eval failed (fail-closed)", exc_info=True)
+
+    def _hvwap_paper_gate(self) -> tuple[bool, str]:
+        """2026-08-23 Hermes Agent: paper-only activation gate (fail-closed).
+
+        Active ONLY when effective_mode == "paper_active" (injected by the
+        monitor each tick) or env PAPER_MODE is truthy, AND live_order_allowed
+        is False. Any live mode, live_order_allowed=True, or unknown mode ->
+        (False, reason): the candidate can never touch a live/broker path.
+        """
+        _mode = getattr(self, "_hvwap_execution_mode", None)
+        _live_allowed = bool(getattr(self, "_hvwap_live_order_allowed", False))
+        _pm = (os.getenv("PAPER_MODE", "") or "").strip().lower()
+        _pm_on = _pm in ("true", "1", "yes")
+        if _live_allowed:
+            return False, "LIVE_ORDER_ALLOWED"
+        if _mode is not None and str(_mode).startswith("live"):
+            return False, f"LIVE_MODE:{_mode}"
+        if _mode is not None and _mode != "paper_active":
+            return False, f"MODE:{_mode}"
+        if _mode == "paper_active" or _pm_on:
+            return True, ("PAPER_ACTIVE" if _mode == "paper_active" else "PAPER_MODE_ENV")
+        return False, "MODE_UNKNOWN"
+
+    def _hvwap_release_quote_age_ok(self, bar: dict, rel_leg: str) -> tuple[bool, float]:
+        """Defensive parity with the baseline freshness gate (decoupled-leg
+        semantics: only the RELEASED leg's quote age matters)."""
+        _key = "near_tick_age_ms" if rel_leg == "NEAR" else "far_tick_age_ms"
+        _age = bar.get(_key)
+        try:
+            _age_f = float(_age or 0.0)
+        except (TypeError, ValueError):
+            _age_f = 0.0
+        _max = float(getattr(self, "_max_quote_age_ms", 10000.0))
+        return _age_f <= _max, _age_f
+
+    def _hvwap_release_width_ok(self, bar: dict, rel_leg: str) -> tuple[bool, float]:
+        """Defensive parity with the baseline quote-validity + spread-width
+        gates for the released leg (missing quote keys are NOT a failure —
+        the baseline width gate only applies when keys are present)."""
+        _bid_k, _ask_k = (("near_bid", "near_ask") if rel_leg == "NEAR"
+                          else ("far_bid", "far_ask"))
+        _b, _a = bar.get(_bid_k), bar.get(_ask_k)
+        _max = float(getattr(self, "_max_spread_width", 50.0))
+        if _b is None and _a is None:
+            return True, 0.0
+        _numeric = (isinstance(_b, (int, float)) and not isinstance(_b, bool)
+                    and isinstance(_a, (int, float)) and not isinstance(_a, bool))
+        if not _numeric:
+            return False, float("nan")      # QUOTE_INVALID parity
+        _w = float(_a) - float(_b)
+        return _w <= _max, _w
+
+    def _hvwap_maybe_paper_release(self, bar: dict, now, near_close: float,
+                                    far_close: float) -> Signal | None:
+        """2026-08-23 Hermes Agent: paper-only direct VWAP release wiring.
+
+        Called from on_bar AFTER _manage_position returned None with the
+        baseline-clear marker set (no baseline lifecycle exit decision this
+        tick). An ALIGNED_PASS Hierarchical VWAP verdict MAY create a PAPER
+        release intent for verdict.hypothetical_release_leg via the EXISTING
+        paper lifecycle/order simulator — the same PARTIAL_EXIT signal path
+        the baseline RELEASE decision uses (monitor _submit_mts_order_signal
+        -> order_mgr + paper_fill_sim).
+
+        Guarantees:
+          * PAPER-ONLY: effective_mode paper_active / PAPER_MODE=true and
+            live_order_allowed False; live modes fail closed — never a
+            broker/live order path.
+          * NEVER blocks/replaces baseline: fires only when the baseline
+            adapter produced NO exit decision this tick (risk exits, Policy
+            J, timeout, baseline release all take precedence via
+            _hvwap_baseline_clear_tick), lifecycle is OPEN, phase SPREAD,
+            release_group ARMED/INACTIVE, no exit owner, no released leg.
+          * IDEMPOTENT: one candidate release intent per trade
+            (_hvwap_release_sent_trade_id); the lifecycle RELEASE_* state +
+            release_group TRIGGERED + release timer block duplicates on
+            subsequent ticks.
+          * FRESH-BAR: requires at least one completed 5m bar committed
+            after construction/recovery (_hvwap_armed) — never retroactive
+            on startup from an old verdict.
+          * DEFENSIVE PARITY: quote age and bid/ask validity/width are
+            re-checked so a stale/invalid/wide quote cannot be bypassed.
+        """
+        try:
+            from strategies.plugins.futures.active.mts_hvwap_candidate import (
+                HvwapStatus,
+            )
+        except Exception:
+            HvwapStatus = None
+        try:
+            _ok, _reason = self._hvwap_paper_gate()
+            if not _ok:
+                _append_event("HVWAP_RELEASE_BLOCKED", source="HVWAP_CANDIDATE",
+                              reason=_reason, trade_id=getattr(self, "_trade_id", None))
+                return None
+            # baseline-clear marker (defense in depth; on_bar checks it first):
+            # when the baseline lifecycle evaluation produced ANY exit
+            # decision this tick, the candidate must not act.
+            if not getattr(self, "_hvwap_baseline_clear_tick", False):
+                return None
+            _v = getattr(self, "_hvwap_last_verdict", None)
+            if (_v is None or HvwapStatus is None
+                    or _v.status != HvwapStatus.ALIGNED_PASS):
+                return None
+            if not getattr(self, "_hvwap_armed", False):
+                return None
+            if self._has_position is not True:
+                return None
+            if getattr(self, "_released_leg", None) is not None:
+                return None
+            if getattr(self, "_lifecycle", "OPEN") != "OPEN":
+                return None
+            if getattr(self, "_hvwap_release_sent_trade_id", None) == getattr(
+                    self, "_trade_id", None):
+                return None
+            if getattr(self, "_manual_exit_requested", False):
+                return None
+            if getattr(self, "_release_pending_mono", 0.0) > 0:
+                return None
+            if (getattr(self, "_release_near_ticks", 0) > 0
+                    or getattr(self, "_release_far_ticks", 0) > 0):
+                return None
+            _lc = getattr(self, "_lifecycle_oca", None)
+            if _lc is None:
+                return None
+            _phase = getattr(_lc, "phase", None)
+            if getattr(_phase, "value", _phase) != PositionPhase.SPREAD.value:
+                return None
+            _rg = getattr(_lc, "release_group", None)
+            _rg_status = getattr(getattr(_rg, "status", None), "value", "")
+            if _rg_status not in ("ARMED", "INACTIVE"):
+                return None
+            if getattr(_lc, "exit_owner", None) is not None:
+                return None
+            _rel = getattr(_v, "hypothetical_release_leg", None)
+            if _rel not in ("NEAR", "FAR"):
+                return None
+            _exit_price = near_close if _rel == "NEAR" else far_close
+            if _exit_price is None or _exit_price <= 0:
+                return None
+            _age_ok, _age = self._hvwap_release_quote_age_ok(bar, _rel)
+            if not _age_ok:
+                _append_event("HVWAP_RELEASE_BLOCKED", source="HVWAP_CANDIDATE",
+                              reason="STALE_QUOTE", quote_age_ms=_age,
+                              trade_id=getattr(self, "_trade_id", None))
+                return None
+            _width_ok, _w = self._hvwap_release_width_ok(bar, _rel)
+            if not _width_ok:
+                _append_event("HVWAP_RELEASE_BLOCKED", source="HVWAP_CANDIDATE",
+                              reason="QUOTE_INVALID_OR_WIDE", width=_w,
+                              trade_id=getattr(self, "_trade_id", None))
+                return None
+
+            # ── apply the PAPER release intent (existing lifecycle path) ──
+            _leg = Leg.NEAR if _rel == "NEAR" else Leg.FAR
+            self._lifecycle = f"RELEASE_{_leg.value}"
+            self._release_ts = now
+            self._release_mono = time.monotonic()
+            self._release_pending_mono = time.monotonic()
+            self._release_price = _exit_price
+            _decision = LifecycleDecision(action=LifecycleAction.RELEASE,
+                                          release_leg=_leg,
+                                          winner="HVWAP_CANDIDATE")
+            _commit_action(self._lifecycle_oca, _decision)
+            self._hvwap_release_sent_trade_id = self._trade_id
+            _append_event(
+                "HVWAP_RELEASE_INTENT",
+                source="HVWAP_CANDIDATE",
+                release_leg=_rel,
+                exit_price=_exit_price,
+                decision_ts=_v.decision_ts,
+                session_label=_v.session_label,
+                regime_60m=_v.regime_60m.value,
+                signal_15m=_v.signal_15m.value,
+                consecutive_confirmed_bars=_v.consecutive_confirmed_bars,
+                retained_direction=_v.retained_direction,
+                status=_v.status.value,
+                mode=_reason,
+                fresh_bar_after_wiring=self._hvwap_armed,
+                trade_id=getattr(self, "_trade_id", None),
+            )
+            try:
+                _write_mts_state(
+                    has_position=True, action=f"RELEASE_{_leg.value}",
+                    reason="HVWAP_CANDIDATE",
+                    near_entry=self._near_entry, far_entry=self._far_entry,
+                    near_last=near_close, far_last=far_close,
+                    near_side=self._near_side, far_side=self._far_side,
+                    spread_z=bar.get("spread_z") or 0.0,
+                    release_price=_exit_price,
+                    trade_id=self._trade_id, ticker=self._ticker,
+                    lifecycle=lifecycle_to_dict(self._lifecycle_oca),
+                )
+            except Exception:
+                logger.warning("[HVWAP_RELEASE] state write failed (non-fatal)",
+                               exc_info=True)
+            logger.warning(
+                "[HVWAP_RELEASE_INTENT] leg=%s price=%.1f decision_ts=%s "
+                "source=HVWAP_CANDIDATE mode=%s",
+                _rel, _exit_price, _v.decision_ts, _reason)
+            return Signal("PARTIAL_EXIT", f"TMF_RELEASE_{_leg.value}", confidence=0.4)
+        except Exception:
+            # fail-closed for the candidate only: never blocks the baseline
+            logger.warning("[HVWAP_RELEASE] eval failed (fail-closed)", exc_info=True)
+            return None
 
     def _ensure_lifecycle_adapter_initialized(self, source: str = "NORMAL") -> None:
         """
@@ -3783,8 +4010,17 @@ class TMFSpread(StrategyBase):
             # 💡 [Fixed 2026-05-27] Re-sync self._trade_id from bar data if missing
             if not self._trade_id:
                 self._trade_id = bar.get("trade_id")
-            
-            return self._manage_position(near_close, far_close, bar.get("spread_z"), now, bar)
+            _mgmt_result = self._manage_position(near_close, far_close, bar.get("spread_z"), now, bar)
+            # 2026-08-23 Hermes Agent: paper-only HVWAP release wiring. Fires
+            # ONLY when the baseline produced NO exit decision for this tick
+            # (_hvwap_baseline_clear_tick) and the baseline returned no signal
+            # — the candidate can never replace or block stop-loss, Policy J,
+            # emergency exit, timeout, baseline release, or reconciliation.
+            if _mgmt_result is None and getattr(self, "_hvwap_baseline_clear_tick", False):
+                _hvwap_sig = self._hvwap_maybe_paper_release(bar, now, near_close, far_close)
+                if _hvwap_sig is not None:
+                    return _hvwap_sig
+            return _mgmt_result
 
         # ── Staleness gate (only for new entry) ──
         atr = bar.get("atr", 0.0)
@@ -4092,6 +4328,10 @@ class TMFSpread(StrategyBase):
         # 2026-06-30 Gemini CLI: Expected behavior: Bypass time/tick confirmation checks during backtesting because backtests run instantly and monotonic time does not advance.
         _is_backtest = os.getenv("MTS_BACKTEST") == "1"
         """Manage existing spread position — release check + trailing exit."""
+        # 2026-08-23 Hermes Agent: HVWAP candidate release wiring — reset the
+        # baseline-clear marker; set True only after the lifecycle adapter
+        # evaluated with NO exit decision for this tick (see on_bar hook).
+        self._hvwap_baseline_clear_tick = False
         # 2026-05-27 Gemini CLI: Order in-flight guard (Contract 3)
         if self._lifecycle == "EXITING":
             self._set_eval(skip_reason="EXIT_ALREADY_SUBMITTED")
@@ -4338,6 +4578,11 @@ class TMFSpread(StrategyBase):
                 self._pj_guard_just_completed = False  # consumed once
             _adapter_res = self._lifecycle_adapter.evaluate(_adapter_input)
             _decision = _adapter_res.decision
+            # 2026-08-23 Hermes Agent: HVWAP candidate release wiring —
+            # baseline-clear marker: the candidate may act only when the
+            # baseline lifecycle evaluation produced NO exit decision (risk
+            # exits / Policy J / timeout / release all take precedence).
+            self._hvwap_baseline_clear_tick = (_decision is None)
 
             # ── Wave J1.5-BR: Policy J Shadow Telemetry Integration Hook ──
             if getattr(self, "_soak_collector", None) is not None:
@@ -5573,6 +5818,15 @@ class TMFSpread(StrategyBase):
         self._far_side = None
         self._entry_spread_z = 0.0
         self._released_leg = None
+        # 2026-08-23 Hermes Agent: per-trade HVWAP release sentinel — cleared
+        # on flat so the NEXT trade may release again (one intent per trade).
+        self._hvwap_release_sent_trade_id = None
+        # 2026-08-23 Hermes Agent: clear per-trade release timers/tick
+        # counters on flat — a stale baseline release attempt must not block
+        # (or be blocked by) the HVWAP release path on the next trade.
+        self._release_pending_mono = 0.0
+        self._release_near_ticks = 0
+        self._release_far_ticks = 0
         self._release_ts = None
         self._release_mono = 0.0
         self._peak = 0.0
