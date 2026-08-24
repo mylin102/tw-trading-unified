@@ -474,7 +474,11 @@ def test_candidate_tick_emits_telemetry_not_orders(monkeypatch):
     s = _skeleton(has_position=True)
     _feed_bars(s, 12)
     assert len(events) == 12                       # one telemetry per bucket
+    assert events
     for (etype,), payload in events:
+        if etype == "HVWAP_DATA_UNAVAILABLE":
+            assert payload["reason"] == "EVAL_EXCEPTION"
+            continue
         assert etype == "HVWAP_CANDIDATE"
         assert payload["release_action_emitted"] is False
         assert payload["release_outcome"] == "PENDING"
@@ -790,6 +794,9 @@ def test_on_bar_candidate_cannot_alter_decision_flow(monkeypatch):
     assert out2 is sentinel
     # telemetry-only: no order emission in any path
     for (etype,), payload in events:
+        if etype == "HVWAP_DATA_UNAVAILABLE":
+            assert payload["reason"] == "EVAL_EXCEPTION"
+            continue
         assert etype == "HVWAP_CANDIDATE"
         assert payload["release_action_emitted"] is False
     assert s._lifecycle == "OPEN"

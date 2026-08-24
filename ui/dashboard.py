@@ -582,13 +582,64 @@ def _hvwap_execution_mode() -> dict:
 def _hvwap_panel_payload(state: dict, events: list) -> dict:
     """Assemble the HVWAP telemetry display payload (pure; missing fields
     default to None/'—'). `state` = MTS position state dict, `events` =
-    ledger events (newest last)."""
+    ledger events (newest last).
+
+    Diagnosis states (2026-08-24) — the dashboard must distinguish a real
+    verdict from a missing/broken pipeline:
+      * OK               latest HVWAP_CANDIDATE is newer than any diagnostic
+      * NOT_EVALUATED    only HVWAP_DATA_UNAVAILABLE diagnostics exist (or the
+                         newest diagnostic is newer than the newest verdict);
+                         reason + last-event age shown
+      * DATA_PIPELINE_MISSING  no HVWAP_* event of ANY kind — the wiring is
+                         not producing telemetry (deployment gap / on_bar
+                         skipped / event-log path mismatch)
+    """
     _cand = _hvwap_latest(events, "HVWAP_CANDIDATE") or {}
     _intent = _hvwap_latest(events, "HVWAP_RELEASE_INTENT") or {}
     _blocked = _hvwap_latest(events, "HVWAP_RELEASE_BLOCKED") or {}
+    _diag = _hvwap_latest(events, "HVWAP_DATA_UNAVAILABLE") or {}
     _mode = _hvwap_execution_mode()
     _near = _cand.get("near") or {}
     _far = _cand.get("far") or {}
+
+    # ── diagnosis: which event is newest? ──
+    _all_hvwap = [e for e in events
+                  if e.get("event") in ("HVWAP_CANDIDATE", "HVWAP_DATA_UNAVAILABLE")]
+    _newest = _all_hvwap[-1] if _all_hvwap else None
+    _newest_ts = _newest.get("ts") if _newest else None
+    _last_age_s = None
+    if _newest_ts:
+        try:
+            _last_age_s = max(
+                0.0, time.time() - datetime.datetime.fromisoformat(
+                    str(_newest_ts)).timestamp())
+        except Exception:
+            _last_age_s = None
+    if _cand and not _diag:
+        _diag_state = "OK"
+        _diag_reason = None
+    elif _cand and _diag:
+        # newest wins: a diagnostic newer than the last verdict means the
+        # pipeline stopped producing verdicts
+        try:
+            _cand_ts = _cand.get("ts", "")
+            _diag_ts = _diag.get("ts", "")
+            if str(_diag_ts) >= str(_cand_ts):
+                _diag_state = "NOT_EVALUATED"
+                _diag_reason = _diag.get("reason")
+            else:
+                _diag_state = "OK"
+                _diag_reason = None
+        except Exception:
+            _diag_state = "OK"
+            _diag_reason = None
+    elif _diag:
+        _diag_state = "NOT_EVALUATED"
+        _diag_reason = _diag.get("reason")
+    else:
+        _diag_state = "DATA_PIPELINE_MISSING"
+        _diag_reason = None
+
     _rel_intent = _intent.get("release_leg") or _intent.get("leg")
     # winner / trigger source: the state reason (e.g. HVWAP_CANDIDATE after
     # a candidate release); overridden by the release-intent source only when
@@ -621,6 +672,16 @@ def _hvwap_panel_payload(state: dict, events: list) -> dict:
             f"{str(_rel_src.get('ts', ''))[:19]}")
     return {
         "mode": _mode,
+        "diagnosis": {
+            "state": _diag_state,
+            "reason": _diag_reason,
+            "detail": _diag.get("detail"),
+            "last_event_ts": _newest_ts,
+            "last_event_age_s": _last_age_s,
+            "diag_has_position": _diag.get("has_position"),
+            "diag_n_bars": _diag.get("n_completed_5m_bars"),
+            "diag_armed": _diag.get("armed"),
+        },
         "state": {
             "has_position": bool(state.get("has_position", False)),
             "near_side": state.get("near_side") or "—",
@@ -706,6 +767,7 @@ def _hvwap_panel_markdown(p: dict) -> str:
         "#dc2626" if _mode["mode_label"] == "LIVE" else "#64748b")
     _wiring = ("ACTIVE (paper-only)" if _mode["release_wiring_active"]
                else "INACTIVE")
+    _diag = p.get("diagnosis") or {}
     _st = p["state"]
     _h = p["hvwap"]
     _rel = p["release"]
@@ -727,6 +789,25 @@ def _hvwap_panel_markdown(p: dict) -> str:
         "<div style='border:1px solid #94a3b8; border-radius:6px; "
         "padding:6px 10px; margin:4px 0; background:#ffffff; color:#111827; "
         "font-family:monospace; font-size:12px; line-height:1.6;'>")
+    # ── pipeline diagnosis banner (2026-08-24): distinguishes a real verdict
+    # from a missing/broken pipeline, with last event age + reason.
+    _diag_state = _diag.get("state", "OK")
+    if _diag_state != "OK":
+        _diag_color = {"NOT_EVALUATED": "#b45309",
+                       "DATA_PIPELINE_MISSING": "#b91c1c"}.get(_diag_state,
+                                                               "#b45309")
+        _age_str = "—"
+        if _diag.get("last_event_age_s") is not None:
+            _a = float(_diag["last_event_age_s"])
+            _age_str = f"{_a:.0f}s" if _a < 120 else f"{_a / 60:.1f}m"
+        _reason_str = _diag.get("reason") or "—"
+        _detail_str = _diag.get("detail") or ""
+        _hl.append(
+            f"<div style='margin-bottom:3px; color:{_diag_color}; "
+            f"font-weight:bold;'>⚠️ {_diag_state}"
+            f" — 無 HVWAP 判讀 (reason={_reason_str}"
+            f"{' · ' + str(_detail_str)[:80] if _detail_str else ''}"
+            f" · 最後事件: {_age_str} 前)</div>")
     _hl.append(
         f"<b>📐 HVWAP 候選 (Hierarchical VWAP)</b> &nbsp; "
         f"<span style='background:{_badge_color}; color:#ffffff; padding:1px 8px; "

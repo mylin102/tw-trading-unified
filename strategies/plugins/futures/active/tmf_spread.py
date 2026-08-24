@@ -1842,6 +1842,13 @@ class TMFSpread(StrategyBase):
         self._hvwap_baseline_clear_tick = False  # baseline produced NO exit decision this tick
         self._hvwap_execution_mode = None        # injected by monitor each tick (effective_mode)
         self._hvwap_live_order_allowed = False   # injected by monitor each tick
+        # 2026-08-24 Hermes Agent: fail-closed diagnostics — the candidate
+        # pipeline must never fail SILENTLY. Every no-evaluate path emits an
+        # explicit HVWAP_DATA_UNAVAILABLE event (rate-limited once per 5m
+        # bucket via _hvwap_diag_last_bucket) so the dashboard can
+        # distinguish NOT_EVALUATED / DATA_PIPELINE_MISSING from a real
+        # UNKNOWN/BLOCK verdict. Telemetry-only; baseline/risk untouched.
+        self._hvwap_diag_last_bucket: int | None = None
 
         # P1: Spread-level excursions (telemetry only)
         self._spread_near_high: float = 0.0
@@ -1998,7 +2005,14 @@ class TMFSpread(StrategyBase):
             )
             _close = bar_close_time(bar.get("ts") or bar.get("timestamp"))
             if _close is None:
-                return  # no timestamp -> cannot bookkeep (fail-closed)
+                # 2026-08-24: explicit fail-closed diagnostic (previously a
+                # SILENT return -> production data gap with zero visibility).
+                self._hvwap_emit_data_unavailable(
+                    bar, reason="NO_BAR_TIMESTAMP",
+                    detail=f"ts_type={type(bar.get('ts')).__name__} "
+                           f"timestamp_type={type(bar.get('timestamp')).__name__} "
+                           f"keys={sorted(bar.keys())}")
+                return
             _bucket = int(_close // 300.0)
 
             # bucket-roll: the previous bucket is now COMPLETE -> commit it
@@ -2018,6 +2032,10 @@ class TMFSpread(StrategyBase):
             _n_raw = bar.get("near_close")
             if _n_raw is None:
                 _n_raw = bar.get("near_close_rt")
+            if _n_raw is None:
+                _n_raw = bar.get("close")
+            if _n_raw is None:
+                _n_raw = bar.get("Close")
             _f_raw = bar.get("far_close")
             if _f_raw is None:
                 _f_raw = bar.get("far_close_rt")
@@ -2029,7 +2047,10 @@ class TMFSpread(StrategyBase):
                 _f_f = float(_f_raw) if _f_raw is not None else 0.0
             except (TypeError, ValueError):
                 _f_f = 0.0
+            # Monitor 5m DataFrame bars may preserve OHLCV capitalization.
             _vol_raw = bar.get("volume")
+            if _vol_raw is None:
+                _vol_raw = bar.get("Volume")
             try:
                 _n_vol = float(_vol_raw) if _vol_raw is not None else 0.0
             except (TypeError, ValueError):
@@ -2053,6 +2074,16 @@ class TMFSpread(StrategyBase):
             # Telemetry EMISSION stays rate-limited to one record per completed
             # 5m bar; the verdict itself is refreshed per tick.
             if self._has_position is True:
+                # 2026-08-24: make the pre-first-emission warmup VISIBLE —
+                # when a position is held but no candidate event has ever been
+                # emitted, record an explicit WARMUP_PENDING diagnostic once
+                # per bucket instead of failing silently.
+                if (getattr(self, "_hvwap_last_verdict", None) is None
+                        and getattr(self, "_hvwap_last_emit_bucket", None) is not None):
+                    self._hvwap_emit_data_unavailable(
+                        bar, reason="WARMUP_PENDING",
+                        detail="position held, awaiting first completed-bar "
+                               "evaluation (emit cadence = 1 per 5m bar)")
                 _phase = "SPREAD"
                 try:
                     _ph = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
@@ -2092,6 +2123,14 @@ class TMFSpread(StrategyBase):
                     return
                 self._hvwap_last_emit_bucket = _bucket
             else:
+                # 2026-08-24: defensive diagnostic — a truthy-but-not-True
+                # _has_position (e.g. serialization artifact) would silently
+                # starve the in-position emit branch (production data gap).
+                if self._has_position:
+                    self._hvwap_emit_data_unavailable(
+                        bar, reason="HAS_POSITION_NON_BOOL",
+                        detail=f"type={type(self._has_position).__name__} "
+                               f"value={self._has_position!r}")
                 # flat: advance the cadence bucket so the first in-position
                 # bar emits on its completion (existing cadence contract)
                 self._hvwap_last_emit_bucket = _bucket
@@ -2138,9 +2177,56 @@ class TMFSpread(StrategyBase):
                 "counterfactual": _cf.to_dict() if _cf else None,
             })
             _append_event("HVWAP_CANDIDATE", **_payload)
-        except Exception:
-            # fail-closed for the candidate only: never disturb the baseline
+        except Exception as _hvwap_exc:
+            # 2026-08-24: fail-closed for the candidate only — NEVER disturb
+            # the baseline, but record an EXPLICIT diagnostic event (the
+            # previous warning-only path left the production ledger with zero
+            # visibility on pipeline failures).
             logger.warning("[HVWAP_CANDIDATE] telemetry eval failed (fail-closed)", exc_info=True)
+            try:
+                self._hvwap_emit_data_unavailable(
+                    bar, reason="EVAL_EXCEPTION",
+                    detail=f"{type(_hvwap_exc).__name__}: {_hvwap_exc}")
+            except Exception:
+                pass
+
+    def _hvwap_emit_data_unavailable(self, bar: dict, *, reason: str,
+                                     detail: str | None = None) -> None:
+        """2026-08-24 Hermes Agent: explicit fail-closed diagnostic for the
+        HVWAP candidate pipeline.
+
+        Emits one HVWAP_DATA_UNAVAILABLE event per 5m bucket (rate-limited)
+        whenever the pipeline cannot evaluate: NO_BAR_TIMESTAMP (no parseable
+        bar ts), EVAL_EXCEPTION (candidate evaluation raised), WARMUP_PENDING
+        (position held, first completed-bar emission pending), or
+        HAS_POSITION_NON_BOOL (truthy-but-not-True _has_position). The
+        dashboard uses these to distinguish NOT_EVALUATED /
+        DATA_PIPELINE_MISSING from a real UNKNOWN/BLOCK verdict, with last
+        event age + reason. Telemetry-only: never raises, never touches
+        baseline/risk/order state.
+        """
+        try:
+            from strategies.plugins.futures.active.mts_hvwap_candidate import (
+                bar_close_time,
+            )
+            _close = bar_close_time(bar.get("ts") or bar.get("timestamp"))
+            _bucket = int(_close // 300.0) if _close is not None else 0
+            if getattr(self, "_hvwap_diag_last_bucket", None) == _bucket:
+                return
+            self._hvwap_diag_last_bucket = _bucket
+            _payload = {
+                "reason": reason,
+                "detail": detail,
+                "has_position": self._has_position is True,
+                "lifecycle": getattr(self, "_lifecycle", None),
+                "trade_id": getattr(self, "_trade_id", None),
+                "n_completed_5m_bars": len(self._hvwap_5m_bars),
+                "armed": getattr(self, "_hvwap_armed", False),
+                "n_pending_bucket": _bucket,
+            }
+            _append_event("HVWAP_DATA_UNAVAILABLE", **_payload)
+        except Exception:
+            logger.warning("[HVWAP] diagnostic emission failed (non-fatal)", exc_info=True)
 
     def _hvwap_paper_gate(self) -> tuple[bool, str]:
         """2026-08-23 Hermes Agent: paper-only activation gate (fail-closed).
