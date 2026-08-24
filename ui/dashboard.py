@@ -682,11 +682,28 @@ def _hvwap_panel_payload(state: dict, events: list) -> dict:
     }
 
 
+def _hvwap_status_color(status: str) -> str:
+    """Distinct, white-background-readable colors for candidate statuses.
+    Pure display mapping; unknown statuses fall back to slate."""
+    _map = {
+        "ALIGNED_PASS": "#15803d",  # dark green (pass)
+        "BLOCK": "#b91c1c",         # dark red (blocked)
+        "HOLD": "#b45309",          # dark amber (overextended hold)
+        "UNKNOWN": "#64748b",       # slate gray (insufficient/fail-closed)
+    }
+    return _map.get(str(status or "").upper(), "#475569")
+
+
 def _hvwap_panel_markdown(p: dict) -> str:
-    """Render the HVWAP telemetry panel as styled HTML (pure)."""
+    """Render the HVWAP telemetry panel as styled HTML (pure).
+
+    Light theme: white card background, dark high-contrast text, readable
+    border. Status colors stay distinct per status (see _hvwap_status_color);
+    the PAPER/LIVE/UNKNOWN badge colors are unchanged semantics.
+    """
     _mode = p["mode"]
     _badge_color = "#16a34a" if _mode["mode_label"] == "PAPER" else (
-        "#dc2626" if _mode["mode_label"] == "LIVE" else "#94a3b8")
+        "#dc2626" if _mode["mode_label"] == "LIVE" else "#64748b")
     _wiring = ("ACTIVE (paper-only)" if _mode["release_wiring_active"]
                else "INACTIVE")
     _st = p["state"]
@@ -707,19 +724,20 @@ def _hvwap_panel_markdown(p: dict) -> str:
     _fresh = "✓" if (_h["bars_complete"] and _h["session_boundary_ok"]) else "✗"
     _hl = []
     _hl.append(
-        "<div style='border:1px solid #334155; border-radius:6px; "
-        "padding:6px 10px; margin:4px 0; background:#0f172a; "
+        "<div style='border:1px solid #94a3b8; border-radius:6px; "
+        "padding:6px 10px; margin:4px 0; background:#ffffff; color:#111827; "
         "font-family:monospace; font-size:12px; line-height:1.6;'>")
     _hl.append(
         f"<b>📐 HVWAP 候選 (Hierarchical VWAP)</b> &nbsp; "
-        f"<span style='background:{_badge_color}; color:#fff; padding:1px 8px; "
+        f"<span style='background:{_badge_color}; color:#ffffff; padding:1px 8px; "
         f"border-radius:10px; font-size:10px;'>"
         f"{_mode['mode_label']}</span> &nbsp; "
-        f"<span style='color:#94a3b8; font-size:10px;'>"
+        f"<span style='color:#475569; font-size:10px;'>"
         f"mode={_mode['effective_mode'] or 'N/A'} · live_order_allowed="
         f"{_mode['live_order_allowed']} · 釋放接線: {_wiring}</span>")
     _hl.append(
-        f"<div style='margin-top:2px;'>狀態: <b>{_h['status']}</b>"
+        f"<div style='margin-top:2px;'>狀態: "
+        f"<b style='color:{_hvwap_status_color(_h['status'])}'>{_h['status']}</b>"
         f"{' · ' + str(_h['block_reason']) if _h['block_reason'] else ''}"
         f" &nbsp;|&nbsp; 60m: {_h['regime_60m'] or '—'}"
         f" &nbsp;|&nbsp; 15m: {_h['signal_15m'] or '—'}"

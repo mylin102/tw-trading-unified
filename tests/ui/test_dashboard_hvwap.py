@@ -20,6 +20,7 @@ from ui.dashboard import (
     _hvwap_load_events,
     _hvwap_panel_markdown,
     _hvwap_panel_payload,
+    _hvwap_status_color,
 )
 
 
@@ -258,6 +259,34 @@ def test_markdown_empty_payload_never_raises(monkeypatch):
     assert "HVWAP 候選" in md
     assert "釋放接線" in md
     assert "無動作/阻擋" in md
+
+
+# ── readability (2026-08-24): white/light card, dark text, distinct colors ──
+
+def test_markdown_white_background_dark_text(monkeypatch):
+    """The panel card must be light (white background) with dark high-contrast
+    text and a readable border — not the previous dark navy card."""
+    md = _hvwap_panel_markdown(_hvwap_panel_payload(_state(), [_cand_event()]))
+    assert "background:#ffffff" in md            # white card
+    assert "color:#111827" in md                 # dark high-contrast text
+    assert "border:1px solid #94a3b8" in md      # readable border
+    assert "background:#0f172a" not in md        # old dark card removed
+    assert "color:#94a3b8" not in md             # old light-on-dark muted text
+
+
+def test_status_colors_distinct(monkeypatch):
+    """ALIGNED_PASS / BLOCK / HOLD / UNKNOWN map to distinct colors and the
+    rendered status line carries the mapped color."""
+    colors = {st: _hvwap_status_color(st)
+              for st in ("ALIGNED_PASS", "BLOCK", "HOLD", "UNKNOWN")}
+    assert len(set(colors.values())) == 4        # all four distinct
+    # rendered markdown: status-colored <b> for the current status
+    md = _hvwap_panel_markdown(
+        _hvwap_panel_payload(_state(), [_cand_event(status="BLOCK")]))
+    assert f"color:{colors['BLOCK']}" in md
+    assert ">BLOCK<" in md
+    # unknown status falls back to the slate default, still rendered
+    assert _hvwap_status_color("") == "#475569"
 
 
 # ── ledger helpers ─────────────────────────────────────────────────────────
