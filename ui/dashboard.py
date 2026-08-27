@@ -516,6 +516,472 @@ def _fmt_policy_j_reason(reason_str: str) -> str:
         return "🛡️ Policy J 組合停利"
     return str(reason_str)
 
+
+# ── 2026-08-23 Hermes Agent: Hierarchical VWAP candidate telemetry panel ──
+# PURE, testable data-assembly + rendering helpers (display-only; never
+# alter runtime behavior). The strategy writes HVWAP_CANDIDATE /
+# HVWAP_RELEASE_INTENT / HVWAP_RELEASE_BLOCKED events to the MTS event
+# ledger (mts_spread_events.jsonl); the position state file carries the
+# leg sides / release / trail / ATR fields.
+
+def _hvwap_load_events(max_lines: int = 2000) -> list:
+    """Read the MTS event ledger (newest LAST). Pure IO, never raises."""
+    _events = []
+    try:
+        _p = runtime_path("logs", "mts_spread_events.jsonl")
+        if os.path.exists(_p):
+            with open(_p) as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    try:
+                        _events.append(json.loads(_line))
+                    except Exception:
+                        continue
+    except Exception:
+        return []
+    return _events[-max_lines:]
+
+
+def _hvwap_latest(events: list, event_type: str):
+    """Newest event of the given type (or None)."""
+    if not events:
+        return None
+    for _ev in reversed(events):
+        if _ev.get("event") == event_type:
+            return _ev
+    return None
+
+
+def _hvwap_execution_mode() -> dict:
+    """effective_mode / live_order_allowed (execution_context.json) plus the
+    PAPER_MODE env override. Display-only. Fail-closed: any read error or
+    missing context yields mode UNKNOWN / release wiring INACTIVE."""
+    _mode = None
+    _live_allowed = False
+    try:
+        _ctx = json.loads(Path(runtime_path("execution_context.json")).read_text())
+        _mode = _ctx.get("effective_mode")
+        _live_allowed = bool(_ctx.get("live_order_allowed", False))
+    except Exception:
+        _mode = None
+    _pm = (os.getenv("PAPER_MODE", "") or "").strip().lower()
+    _pm_on = _pm in ("true", "1", "yes")
+    _is_paper = (_mode == "paper_active") or _pm_on
+    _is_live = (not _is_paper) and str(_mode or "").startswith("live")
+    return {
+        "effective_mode": _mode,
+        "live_order_allowed": _live_allowed,
+        "paper_mode_env": _pm_on,
+        "mode_label": "PAPER" if _is_paper else ("LIVE" if _is_live else "UNKNOWN"),
+        "release_wiring_active": bool(_is_paper and not _live_allowed),
+    }
+
+
+def _hvwap_panel_payload(state: dict, events: list) -> dict:
+    """Assemble the HVWAP telemetry display payload (pure; missing fields
+    default to None/'—'). `state` = MTS position state dict, `events` =
+    ledger events (newest last).
+
+    Diagnosis states (2026-08-24) — the dashboard must distinguish a real
+    verdict from a missing/broken pipeline:
+      * OK               latest HVWAP_CANDIDATE is newer than any diagnostic
+      * NOT_EVALUATED    only HVWAP_DATA_UNAVAILABLE diagnostics exist (or the
+                         newest diagnostic is newer than the newest verdict);
+                         reason + last-event age shown
+      * DATA_PIPELINE_MISSING  no HVWAP_* event of ANY kind — the wiring is
+                         not producing telemetry (deployment gap / on_bar
+                         skipped / event-log path mismatch)
+    """
+    # Scope telemetry to the displayed paper trade.  The ledger is shared by
+    # consecutive trades; selecting the newest event globally can show an old
+    # LIVE_MODE block on a current PAPER position (or vice versa).
+    _active_trade_id = state.get("trade_id") if isinstance(state, dict) else None
+    if _active_trade_id:
+        events = [e for e in events
+                  if e.get("trade_id") in (None, _active_trade_id)]
+    _cand = _hvwap_latest(events, "HVWAP_CANDIDATE") or {}
+    _intent = _hvwap_latest(events, "HVWAP_RELEASE_INTENT") or {}
+    _blocked = _hvwap_latest(events, "HVWAP_RELEASE_BLOCKED") or {}
+    _diag = _hvwap_latest(events, "HVWAP_DATA_UNAVAILABLE") or {}
+    _mode = _hvwap_execution_mode()
+    _near = _cand.get("near") or {}
+    _far = _cand.get("far") or {}
+
+    # ── diagnosis: which event is newest? ──
+    _all_hvwap = [e for e in events
+                  if e.get("event") in ("HVWAP_CANDIDATE", "HVWAP_DATA_UNAVAILABLE")]
+    _newest = _all_hvwap[-1] if _all_hvwap else None
+    _newest_ts = _newest.get("ts") if _newest else None
+    _last_age_s = None
+    if _newest_ts:
+        try:
+            _last_age_s = max(
+                0.0, time.time() - datetime.datetime.fromisoformat(
+                    str(_newest_ts)).timestamp())
+        except Exception:
+            _last_age_s = None
+    if _cand and not _diag:
+        _diag_state = "OK"
+        _diag_reason = None
+    elif _cand and _diag:
+        # newest wins: a diagnostic newer than the last verdict means the
+        # pipeline stopped producing verdicts
+        try:
+            _cand_ts = _cand.get("ts", "")
+            _diag_ts = _diag.get("ts", "")
+            if str(_diag_ts) >= str(_cand_ts):
+                _diag_state = "NOT_EVALUATED"
+                _diag_reason = _diag.get("reason")
+            else:
+                _diag_state = "OK"
+                _diag_reason = None
+        except Exception:
+            _diag_state = "OK"
+            _diag_reason = None
+    elif _diag:
+        _diag_state = "NOT_EVALUATED"
+        _diag_reason = _diag.get("reason")
+    else:
+        _diag_state = "DATA_PIPELINE_MISSING"
+        _diag_reason = None
+
+    _rel_intent = _intent.get("release_leg") or _intent.get("leg")
+    # winner / trigger source: the state reason (e.g. HVWAP_CANDIDATE after
+    # a candidate release); overridden by the release-intent source only when
+    # the intent is the newest release event (recency-consistent).
+    _winner = state.get("reason") or state.get("state")
+    # release status: the NEWEST of (intent, blocked) wins — a block that
+    # arrived after an intent means a later attempt failed; an intent after
+    # a block means the block was resolved.
+    _rel_src = None
+    _rel_is_intent = False
+    _rel_idx_i = next((i for i, e in enumerate(events)
+                       if e.get("event") == "HVWAP_RELEASE_INTENT"), -1)
+    _rel_idx_b = next((i for i, e in enumerate(events)
+                       if e.get("event") == "HVWAP_RELEASE_BLOCKED"), -1)
+    if _rel_idx_i >= 0 and (_rel_idx_i >= _rel_idx_b or _rel_idx_b < 0):
+        _rel_src, _rel_is_intent = _intent, True
+    elif _rel_idx_b >= 0:
+        _rel_src, _rel_is_intent = _blocked, False
+    # A release block is attempt-scoped. Once a newer candidate has been
+    # evaluated, an older block (especially a prior LIVE/quarantine event)
+    # must not remain displayed as the current release status.
+    if _rel_src and _cand:
+        if str(_rel_src.get("ts", "")) < str(_cand.get("ts", "")):
+            _rel_src, _rel_is_intent = None, False
+    if _rel_src and _rel_is_intent:
+        _winner = _rel_src.get("source") or _winner
+    _release_status = "—"
+    if _rel_src and _rel_is_intent:
+        _release_status = (
+            f"INTENT {_rel_src.get('release_leg', '?')} "
+            f"@ {_rel_src.get('exit_price', '—')} "
+            f"({str(_rel_src.get('decision_ts', ''))[:19]})")
+    elif _rel_src:
+        _release_status = (
+            f"BLOCKED ({_rel_src.get('reason', '?')}) "
+            f"{str(_rel_src.get('ts', ''))[:19]}")
+    return {
+        "mode": _mode,
+        "diagnosis": {
+            "state": _diag_state,
+            "reason": _diag_reason,
+            "detail": _diag.get("detail"),
+            "last_event_ts": _newest_ts,
+            "last_event_age_s": _last_age_s,
+            "diag_has_position": _diag.get("has_position"),
+            "diag_n_bars": _diag.get("n_completed_5m_bars"),
+            "diag_armed": _diag.get("armed"),
+        },
+        "state": {
+            "has_position": bool(state.get("has_position", False)),
+            "near_side": state.get("near_side") or "—",
+            "far_side": state.get("far_side") or "—",
+            "released_leg": state.get("released_leg"),
+            "remaining_leg": state.get("remaining_leg"),
+            "remaining_side": state.get("remaining_side"),
+            "trail_side": state.get("trail_side"),
+            "trail_stop_price": state.get("trail_stop_price"),
+            "atr": state.get("atr"),
+            "lifecycle_state": state.get("state"),
+            "reason": state.get("reason"),
+        },
+        "baseline": {
+            "enabled": bool(_cand.get("baseline_enabled", False)),
+            "pass_release": bool(_cand.get("baseline_pass_release", False)),
+            "release_leg": _cand.get("baseline_release_leg"),
+        },
+        "hvwap": {
+            "status": _cand.get("status") or "—",
+            "block_reason": _cand.get("block_reason"),
+            "regime_60m": _cand.get("regime_60m"),
+            "signal_15m": _cand.get("signal_15m"),
+            "micro_conflict": bool(_cand.get("micro_conflict", False)),
+            "near": {
+                "vwap": _near.get("vwap"),
+                "slope": _near.get("slope"),
+                "source": _near.get("vwap_source") or _near.get("source"),
+                "aligned": _near.get("aligned"),
+                "issue": _near.get("issue"),
+            },
+            "far": {
+                "vwap": _far.get("vwap"),
+                "slope": _far.get("slope"),
+                "source": _far.get("vwap_source") or _far.get("source"),
+                "aligned": _far.get("aligned"),
+                "issue": _far.get("issue"),
+            },
+            "consecutive_confirmed_bars": _cand.get("consecutive_confirmed_bars"),
+            "bars_complete": _cand.get("bars_complete"),
+            "session_boundary_ok": _cand.get("session_boundary_ok"),
+            "n_completed_5m_bars": _cand.get("n_completed_5m_bars"),
+            "quote_age_ms": _cand.get("quote_age_ms"),
+            "session_label": _cand.get("session_label"),
+            "regime_60m_provenance": _cand.get("regime_60m_provenance"),
+            "arbitration_score": _cand.get("arbitration_score"),
+            "support_count": _cand.get("support_count"),
+            "conflict_count": _cand.get("conflict_count"),
+            "neutral_count": _cand.get("neutral_count"),
+            "voters": _cand.get("voters") or {},
+            "retained_direction": _cand.get("retained_direction"),
+            "hypothetical_release_leg": _cand.get("hypothetical_release_leg"),
+            "decision_ts": _cand.get("decision_ts"),
+            "event_ts": _cand.get("ts"),
+        },
+        "release": {
+            "status": _release_status,
+            "intent_leg": _rel_intent,
+            "intent_exit_price": _intent.get("exit_price"),
+            "intent_decision_ts": _intent.get("decision_ts"),
+            "block_reason": _blocked.get("reason"),
+            "blocked_quote_age_ms": _blocked.get("quote_age_ms"),
+            "blocked_width": _blocked.get("width"),
+        },
+        "winner": _winner,
+    }
+
+
+def _hvwap_status_color(status: str) -> str:
+    """Distinct, white-background-readable colors for candidate statuses.
+    Pure display mapping; unknown statuses fall back to slate."""
+    _map = {
+        "ALIGNED_PASS": "#15803d",  # dark green (pass)
+        "BLOCK": "#b91c1c",         # dark red (blocked)
+        "HOLD": "#b45309",          # dark amber (overextended hold)
+        "UNKNOWN": "#64748b",       # slate gray (insufficient/fail-closed)
+    }
+    return _map.get(str(status or "").upper(), "#475569")
+
+
+def _hvwap_panel_markdown(p: dict) -> str:
+    """Render the HVWAP telemetry panel as styled HTML (pure).
+
+    Light theme: white card background, dark high-contrast text, readable
+    border. Status colors stay distinct per status (see _hvwap_status_color);
+    the PAPER/LIVE/UNKNOWN badge colors are unchanged semantics.
+    """
+    _mode = p["mode"]
+    _badge_color = "#16a34a" if _mode["mode_label"] == "PAPER" else (
+        "#dc2626" if _mode["mode_label"] == "LIVE" else "#64748b")
+    _wiring = ("ACTIVE (paper-only)" if _mode["release_wiring_active"]
+               else "INACTIVE")
+    _diag = p.get("diagnosis") or {}
+    _st = p["state"]
+    _h = p["hvwap"]
+    _rel = p["release"]
+    _baseline = p["baseline"]
+    _near = _h["near"]
+    _far = _h["far"]
+
+    _is_single_leg = bool(_st.get("released_leg"))
+    if _is_single_leg:
+        _policy_text = (
+            "單腿出場：15m 趨勢反轉 + 2 根完成 5m 確認 → 平剩餘順勢腿；"
+            "ATR trail 僅最後風控 fallback"
+        )
+    else:
+        _policy_text = (
+            "雙腿出場：趨勢確認 → 釋放反趨勢腿（不看該腿 PNL）；"
+            "ATR threshold 不可單獨釋放順勢腿；剩餘腿 ATR trail 僅最後防線"
+        )
+    _reversal_ready = (
+        _h.get("signal_15m") == "REVERSAL"
+        and bool(_h.get("micro_conflict"))
+        and bool(_h.get("bars_complete"))
+        and bool(_h.get("session_boundary_ok"))
+    )
+
+    def _f(v, suffix="", nd=2):
+        if v is None or v == "—":
+            return "—"
+        try:
+            return f"{float(v):.{nd}f}{suffix}"
+        except Exception:
+            return str(v)
+
+    _fresh = "✓" if (_h["bars_complete"] and _h["session_boundary_ok"]) else "✗"
+
+    def _tier_badge(label, state, color):
+        return (f"<span style='display:inline-block; margin:1px 4px 1px 0; "
+                f"padding:1px 7px; border-radius:9px; background:{color}; "
+                f"color:#fff; font-size:10px; font-weight:bold;'>"
+                f"{label}: {state}</span>")
+
+    def _tier_state(value, *, ok_values=(), unknown_values=(None, "UNKNOWN", "—")):
+        if value in ok_values:
+            return "DATA_VALID", "#15803d"
+        if value in unknown_values:
+            return "WARMUP", "#b45309"
+        return "BLOCK", "#b91c1c"
+
+    _r_state, _r_color = _tier_state(
+        _h.get("regime_60m"),
+        ok_values=("BULLISH_TREND", "BEARISH_TREND", "RANGING"),
+    )
+    _d_state, _d_color = _tier_state(
+        _h.get("signal_15m"),
+        ok_values=("CONFIRMED_CONTINUATION", "REVERSAL", "NEUTRAL"),
+    )
+    _n_slope_ok = _near.get("slope") is not None
+    _f_slope_ok = _far.get("slope") is not None
+    _vwap_state = "DATA_VALID" if (_near.get("vwap") is not None
+                              and _far.get("vwap") is not None
+                              and _n_slope_ok and _f_slope_ok) else "WARMUP"
+    _vwap_color = "#15803d" if _vwap_state == "DATA_VALID" else "#b45309"
+    _bars_ok = bool(_h.get("bars_complete")) and int(_h.get("n_completed_5m_bars") or 0) >= 2
+    _bar_state, _bar_color = ("DATA_VALID", "#15803d") if _bars_ok else ("WARMUP", "#b45309")
+    _quote_age = _h.get("quote_age_ms")
+    _quote_ok = _quote_age is not None and float(_quote_age) <= 10000.0
+    _quote_state, _quote_color = ("DATA_VALID", "#15803d") if _quote_ok else ("BLOCK", "#b91c1c")
+    _slope_note = ""
+    if _h.get("block_reason") == "SLOPE_UNAVAILABLE":
+        _slope_note = ("<span style='color:#92400e;'>"
+                       "（需同 session 內至少兩個相隔 ≥600 秒的完成 VWAP 點；"
+                       "暖機期間不判定）</span>")
+
+    _hl = []
+    _hl.append(
+        "<div style='border:1px solid #94a3b8; border-radius:6px; "
+        "padding:6px 10px; margin:4px 0; background:#ffffff; color:#111827; "
+        "font-family:monospace; font-size:12px; line-height:1.6;'>")
+    # ── pipeline diagnosis banner (2026-08-24): distinguishes a real verdict
+    # from a missing/broken pipeline, with last event age + reason.
+    _diag_state = _diag.get("state", "OK")
+    if _diag_state != "OK":
+        _diag_color = {"NOT_EVALUATED": "#b45309",
+                       "DATA_PIPELINE_MISSING": "#b91c1c"}.get(_diag_state,
+                                                               "#b45309")
+        _age_str = "—"
+        if _diag.get("last_event_age_s") is not None:
+            _a = float(_diag["last_event_age_s"])
+            _age_str = f"{_a:.0f}s" if _a < 120 else f"{_a / 60:.1f}m"
+        _reason_str = _diag.get("reason") or "—"
+        _detail_str = _diag.get("detail") or ""
+        _hl.append(
+            f"<div style='margin-bottom:3px; color:{_diag_color}; "
+            f"font-weight:bold;'>⚠️ {_diag_state}"
+            f" — 無 HVWAP 判讀 (reason={_reason_str}"
+            f"{' · ' + str(_detail_str)[:80] if _detail_str else ''}"
+            f" · 最後事件: {_age_str} 前)</div>")
+    _hl.append(
+        f"<b>📐 HVWAP 候選 (Hierarchical VWAP)</b> &nbsp; "
+        f"<span style='background:{_badge_color}; color:#ffffff; padding:1px 8px; "
+        f"border-radius:10px; font-size:10px;'>"
+        f"{_mode['mode_label']}</span> &nbsp; "
+        f"<span style='color:#475569; font-size:10px;'>"
+        f"mode={_mode['effective_mode'] or 'N/A'} · live_order_allowed="
+        f"{_mode['live_order_allowed']} · 釋放接線: {_wiring}</span>")
+    _hl.append(
+        "<div style='margin-top:5px; padding:5px 7px; background:#eff6ff; "
+        "border:1px solid #93c5fd; border-radius:5px; color:#1e3a8a;'>"
+        f"<b>📋 MTS 2.0 出場規則</b>：{_policy_text}<br>"
+        f"當前趨勢反轉訊號：<b style='color:{'#15803d' if _reversal_ready else '#64748b'}'>"
+        f"{'READY' if _reversal_ready else '未確認'}</b></div>")
+    _prov = _h.get("regime_60m_provenance") or "—"
+    _baseline_state = "ACTIVE" if _baseline.get("enabled") else "REFERENCE ONLY"
+    _hl.append(
+        "<div style='margin-top:5px; padding:5px 7px; background:#f8fafc; "
+        "border:1px solid #cbd5e1; border-radius:5px;'>"
+        f"<b>📊 判定來源分層</b>　Baseline（參考）：<b>{_baseline_state}</b>，"
+        f"pass={_baseline.get('pass_release')}、leg={_baseline.get('release_leg') or '—'}<br>"
+        f"MTS 2.0（最終）：<b>{_h.get('status') or 'UNKNOWN'}</b>，"
+        f"60m={_h.get('regime_60m') or 'UNKNOWN'}、15m={_h.get('signal_15m') or 'UNKNOWN'}、"
+        f"VWAP+slope={_vwap_state}、"
+        f"5m={_h.get('consecutive_confirmed_bars') or 0}/2、"
+        f"arbitration={_h.get('arbitration_score') if _h.get('arbitration_score') is not None else '—'}、"
+        f"provenance={_prov}<br><b>最終允許：</b>"
+        f"{'允許趨勢判定' if _h.get('status') == 'ALIGNED_PASS' else '不允許 release'}；"
+        f"原因={_h.get('block_reason') or '—'}</div>")
+    _voters = _h.get("voters") or {}
+    _vc = (f"support={_h.get('support_count', 0)} · "
+           f"conflict={_h.get('conflict_count', 0)} · "
+           f"neutral={_h.get('neutral_count', 0)}")
+    _vlines = []
+    for _vn in ("60m_regime", "15m_direction", "vwap_location"):
+        _vv = _voters.get(_vn) or {}
+        _vlines.append(
+            f"{_vn}: state={_vv.get('directional_state', 'UNKNOWN')} "
+            f"support={_vv.get('support', False)} "
+            f"conflict={_vv.get('conflict', False)} "
+            f"neutral={_vv.get('neutral', False)}")
+    _hl.append(f"<div>🗳️ 逐票：{_vc} · score={_h.get('arbitration_score', 0)}<br>"
+               + "<br>".join(_vlines) + "</div>")
+    _hl.append(
+        "<div style='margin-top:5px; padding:4px 6px; background:#f8fafc; "
+        "border:1px solid #cbd5e1; border-radius:5px;'>"
+        "<b>檢查層次</b> &nbsp;"
+        + _tier_badge("資料/quote", _quote_state, _quote_color)
+        + _tier_badge("60m regime", _r_state, _r_color)
+        + _tier_badge("15m direction", _d_state, _d_color)
+        + _tier_badge("雙腿 VWAP+slope", _vwap_state, _vwap_color)
+        + _tier_badge("5m confirmation", _bar_state, _bar_color)
+        + "</div>")
+    _hl.append(
+        f"<div style='margin-top:2px;'>狀態: "
+        f"<b style='color:{_hvwap_status_color(_h['status'])}'>{_h['status']}</b>"
+        f"{' · ' + str(_h['block_reason']) if _h['block_reason'] else ''}"
+        f" &nbsp;|&nbsp; 60m: {_h['regime_60m'] or '—'}"
+        f" &nbsp;|&nbsp; 15m: {_h['signal_15m'] or '—'}"
+        f" &nbsp;|&nbsp; 5m 確認: x{_h['consecutive_confirmed_bars'] or 0}"
+        f" &nbsp;|&nbsp; 完整度: {_fresh} ({_h['n_completed_5m_bars'] or 0} bars)"
+        f" &nbsp;|&nbsp; quote age: {_f(_h['quote_age_ms'], 'ms', 0)}</div>")
+    _hl.append(
+        f"<div>近月 VWAP: {_f(_near['vwap'])} ({_near['source'] or '—'}, "
+        f"slope={_f(_near['slope'], nd=4)}, aligned={_near['aligned']})"
+        f" &nbsp;|&nbsp; 遠月 VWAP: {_f(_far['vwap'])} "
+        f"({_far['source'] or '—'}, slope={_f(_far['slope'], nd=4)}, "
+        f"aligned={_far['aligned']}) {_slope_note}</div>")
+    _hl.append(
+        f"<div>方向: {_h['retained_direction'] or '—'} "
+        f"({_h['session_label'] or '—'})"
+        f" &nbsp;|&nbsp; 候選釋放腿: <b>{_h['hypothetical_release_leg'] or '—'}</b>"
+        f" &nbsp;|&nbsp; 基準趨勢釋放: "
+        f"{'ON' if _baseline['enabled'] else 'OFF'}"
+        f"(pass={_baseline['pass_release']}, leg={_baseline['release_leg'] or '—'})</div>")
+    _hl.append(
+        f"<div>候選釋放: <b>{_rel['status']}</b>"
+        f" &nbsp;|&nbsp; 目前觸發來源: <b>{p['winner'] or '—'}</b>"
+        f" &nbsp;|&nbsp; 無動作/阻擋: {_h['block_reason'] or '—'}</div>")
+    if _st["has_position"]:
+        _sides = f"近月 {_st['near_side']} / 遠月 {_st['far_side']}"
+        _sl_leg = (_st["released_leg"] or "無") + "已釋放" if _st["released_leg"] else "雙腿持倉"
+        _sl_trail = ("單腿停利: " + str(_st["trail_side"]) + " stop="
+                     + _f(_st["trail_stop_price"]) if _st["trail_side"]
+                     else "單腿停利: —")
+        _hl.append(
+            f"<div style='margin-top:2px;'>持倉: {_sides} · {_sl_leg} · "
+            f"{_sl_trail}"
+            f" &nbsp;|&nbsp; ATR: {_f(_st['atr'])}</div>")
+    else:
+        _hl.append(
+            f"<div style='margin-top:2px;'>持倉: FLAT &nbsp;|&nbsp; "
+            f"狀態: {_st['lifecycle_state'] or '—'} · "
+            f"原因: {_st['reason'] or '—'}</div>")
+    _hl.append("</div>")
+    return "".join(_hl)
+
 def calculate_mts_daily_performance(fills_path: str, events_path: str, target_trading_day: str) -> dict:
     from scripts.generate_daily_report import parse_logs
     return parse_logs(fills_path, events_path, target_trading_day)
@@ -631,6 +1097,81 @@ def can_render_mts_realized_performance(exit_only: bool, scope: dict,
     if scope.get("mode") == "live" and not scope.get("realized_evidence"):
         return False
     return bool(fills_path) and os.path.exists(fills_path)
+
+def latest_mts_terminal_event(events_path: str | os.PathLike,
+                              trade_id: str | None) -> dict | None:
+    """Return confirmed terminal state, excluding pre-fill exit intents."""
+    if not trade_id or not events_path:
+        return None
+    _terminal_events = {"COMBINED_EXIT_SETTLED", "TRADE_CLOSED"}
+    _latest = None
+    try:
+        with open(events_path, encoding="utf-8") as _ef:
+            for _line in _ef:
+                try:
+                    _record = json.loads(_line)
+                except Exception:
+                    continue
+                if (not isinstance(_record, dict)
+                        or str(_record.get("trade_id") or "") != str(trade_id)
+                        or str(_record.get("event") or "").upper()
+                        not in _terminal_events):
+                    continue
+                _latest = _record
+    except (OSError, TypeError):
+        return None
+    return _latest
+
+
+def latest_mts_exit_intent_event(events_path: str | os.PathLike,
+                                 trade_id: str | None) -> dict | None:
+    """Return EXIT_REMAINING intent for display; never clears position."""
+    if not trade_id or not events_path:
+        return None
+    _latest = None
+    try:
+        with open(events_path, encoding="utf-8") as _ef:
+            for _line in _ef:
+                try:
+                    _record = json.loads(_line)
+                except Exception:
+                    continue
+                if (not isinstance(_record, dict)
+                        or str(_record.get("trade_id") or "") != str(trade_id)
+                        or str(_record.get("event") or "").upper()
+                        != "EXIT_REMAINING"):
+                    continue
+                _latest = _record
+    except (OSError, TypeError):
+        return None
+    return _latest
+
+
+def latest_mts_terminal_fill(fills_path: str | os.PathLike,
+                             trade_id: str | None) -> dict | None:
+    """Return confirmed EXIT fill; this is the only fill-based FLAT authority."""
+    if not trade_id or not fills_path:
+        return None
+    _terminal_fill_types = {"EXIT", "COMBINED_EXIT", "COMBINED_EXIT_NEAR",
+                            "COMBINED_EXIT_FAR"}
+    _latest = None
+    try:
+        with open(fills_path, encoding="utf-8") as _ff:
+            for _line in _ff:
+                try:
+                    _record = json.loads(_line)
+                except Exception:
+                    continue
+                if (not isinstance(_record, dict)
+                        or str(_record.get("trade_id") or "") != str(trade_id)
+                        or str(_record.get("fill_type") or "").upper()
+                        not in _terminal_fill_types):
+                    continue
+                _latest = _record
+    except (OSError, TypeError):
+        return None
+    return _latest
+
 
 def resolve_active_futures_cfg_name(active_runtime_truth=None, is_night_session: bool = False) -> str:
     """Return the active futures config file name based on runtime truth and session."""
@@ -1838,6 +2379,19 @@ def make_calendar_spread_chart(spread_df):
         import pandas as pd
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
+
+        # Plotly becomes unresponsive when the full multi-day archive (often
+        # 30k+ points x 4 subplots) is serialized to the browser. Keep the
+        # source dataframe untouched for metrics/table; only thin the visual
+        # representation to a bounded, timestamp-ordered sample.
+        _max_plot_points = 6000
+        if len(spread_df) > _max_plot_points:
+            _step = max(1, (len(spread_df) + _max_plot_points - 1) // _max_plot_points)
+            _plot_df = spread_df.iloc[:: _step].copy()
+            if _plot_df.index[-1] != spread_df.index[-1]:
+                _plot_df = pd.concat([_plot_df, spread_df.iloc[[-1]]], ignore_index=False)
+            spread_df = _plot_df.sort_values("timestamp").reset_index(drop=True)
+            print(f"[Calendar Spread] chart downsample: {len(spread_df)} points")
         
         # 創建 4 行子圖 (新增第4行: 速度/加速度)
         fig = make_subplots(
@@ -1846,7 +2400,7 @@ def make_calendar_spread_chart(spread_df):
             row_heights=[0.35, 0.25, 0.2, 0.2],
             vertical_spacing=0.06,
             subplot_titles=(
-                "近月/遠月價格 (藍線: 近月, 橘虛線: 遠月)", 
+                "近月/遠月價格 (藍線: 近月, 橘虛線: 遠月, 青線: 近月 VWAP, 粉線: 遠月 VWAP)",
                 "價差 (綠線: Spread, 藍線: EMA 20, 紫線: EMA 60, 灰陰影: ±1 Std)", 
                 "Raw Z-score (紅線: Raw 20, 橘虛線/綠虛線: 進出場線)",
                 "Z-score 速度 (紫虛: dz/dt) / 加速度 (棕點: d²z/dt²)"
@@ -1877,6 +2431,43 @@ def make_calendar_spread_chart(spread_df):
                 ),
                 row=1, col=1
             )
+
+            # calendar spread CSV 的 vwap 是近月價格 VWAP（vwap_z
+            # 以 Close_near - vwap 計算），疊加在價格子圖而非 spread 軸。
+            # Archive rows use ``vwap`` while the current paper session uses
+            # ``near_vwap``. Prefer the current-session field only where it
+            # exists, then fall back row-by-row to the archive VWAP; choosing
+            # the column globally leaves most historical rows as NaN and can
+            # make Plotly render misleading vertical segments.
+            _near_vwap = None
+            if "near_vwap" in spread_df.columns and "vwap" in spread_df.columns:
+                _near_vwap = spread_df["near_vwap"].combine_first(spread_df["vwap"])
+            elif "near_vwap" in spread_df.columns:
+                _near_vwap = spread_df["near_vwap"]
+            elif "vwap" in spread_df.columns:
+                _near_vwap = spread_df["vwap"]
+            if _near_vwap is not None:
+                fig.add_trace(
+                    go.Scatter(
+                        x=_clean_list(spread_df["timestamp"], force_str=True),
+                        y=_clean_list(_near_vwap),
+                        name="近月 VWAP",
+                        line=dict(color="#00bcd4", width=1.8),
+                        mode="lines"
+                    ),
+                    row=1, col=1
+                )
+            if "far_vwap" in spread_df.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=_clean_list(spread_df["timestamp"], force_str=True),
+                        y=_clean_list(spread_df["far_vwap"]),
+                        name="遠月 VWAP",
+                        line=dict(color="#e377c2", width=1.8, dash="dot"),
+                        mode="lines"
+                    ),
+                    row=1, col=1
+                )
         
         # 2. 價差走勢
         # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
@@ -2868,6 +3459,34 @@ def _latest_spread_csv(ticker: str, data_dir: _Path | None = None) -> _Path | No
     return latest_path
 
 
+def _all_spread_csvs(ticker: str, data_dir: _Path | None = None) -> list[_Path]:
+    """Return all same-ticker daily spread files in chronological order."""
+    if data_dir is None:
+        data_dir = _Path(runtime_path("data"))
+    normalized_ticker = ticker.lower()
+    paths = []
+    for path in data_dir.glob(f"{normalized_ticker}_calendar_spread_*.csv"):
+        match = _SPREAD_FILE_RE.fullmatch(path.name)
+        if match and match.group("ticker") == normalized_ticker:
+            paths.append(path)
+    return sorted(paths, key=lambda p: (p.stem.rsplit("_", 1)[-1], p.name))
+
+
+def _limit_calendar_spread_to_recent_days(df: pd.DataFrame, days: int = 3) -> pd.DataFrame:
+    """Keep only the latest calendar-date rows for the chart.
+
+    Filtering happens after loading/merging so rolling statistics retain their
+    historical warm-up, while the dashboard stays focused on recent sessions.
+    """
+    if df is None or df.empty or "timestamp" not in df.columns or days <= 0:
+        return df
+    _dates = pd.to_datetime(df["timestamp"], errors="coerce").dt.normalize().dropna().drop_duplicates()
+    _recent_dates = set(_dates.sort_values().tail(days).tolist())
+    if not _recent_dates:
+        return df
+    return df[pd.to_datetime(df["timestamp"], errors="coerce").dt.normalize().isin(_recent_dates)].copy()
+
+
 @st.cache_data
 def _load_spread_csv(path_str: str, mtime_ns: int) -> pd.DataFrame | None:
     """Load spread CSV, keyed by resolved path + mtime_ns.
@@ -2905,53 +3524,106 @@ def load_calendar_spread_data():
     try:
         import numpy as np
         from pathlib import Path
+        _current_session = None
 
-        # Prefer the current session's LIVE near/far bars when both files
-        # exist.  Precomputed calendar CSVs are archival and can lag the
-        # runtime by days; they must not mask current broker-session data.
-        _live_near = FUTURES_MKT / f"{_TICKER}_{get_session_date_str()}_LIVE_indicators.csv"
-        _live_far = FUTURES_MKT / f"{_TICKER}_far_{get_session_date_str()}_LIVE.csv"
-        if _live_near.exists() and _live_far.exists():
+        # Prefer a same-session near/far pair.  Paper is a first-class
+        # runtime source; archival CSVs must not mask current paper data.
+        _session_date = get_session_date_str()
+        _live_pair = None
+        for _mode in ("LIVE", "PAPER"):
+            _near_candidate = FUTURES_MKT / f"{_TICKER}_{_session_date}_{_mode}_indicators.csv"
+            _far_candidate = FUTURES_MKT / f"{_TICKER}_far_{_session_date}_{_mode}.csv"
+            if _near_candidate.exists() and _far_candidate.exists():
+                _live_pair = (_near_candidate, _far_candidate, _mode)
+                break
+        if _live_pair is not None:
+            _live_near, _live_far, _mode = _live_pair
             _near = _load_spread_csv(str(_live_near.resolve()), _live_near.stat().st_mtime_ns)
             _far = _load_spread_csv(str(_live_far.resolve()), _live_far.stat().st_mtime_ns)
             if _near is not None and _far is not None and not _near.empty and not _far.empty:
                 _near_close = "close" if "close" in _near.columns else "Close"
                 _far_close = "close" if "close" in _far.columns else "Close"
                 if _near_close in _near.columns and _far_close in _far.columns:
+                    _near_cols = ["timestamp", _near_close]
+                    _far_cols = ["timestamp", _far_close]
+                    _near_volume = "Volume" if "Volume" in _near.columns else ("volume" if "volume" in _near.columns else None)
+                    _far_volume = "Volume" if "Volume" in _far.columns else ("volume" if "volume" in _far.columns else None)
+                    if _near_volume:
+                        _near_cols.append(_near_volume)
+                    if _far_volume:
+                        _far_cols.append(_far_volume)
                     _live = pd.merge(
-                        _near[["timestamp", _near_close]].rename(columns={_near_close: "Close_near"}),
-                        _far[["timestamp", _far_close]].rename(columns={_far_close: "Close_far"}),
+                        _near[_near_cols].rename(columns={_near_close: "Close_near", _near_volume: "Volume_near"} if _near_volume else {_near_close: "Close_near"}),
+                        _far[_far_cols].rename(columns={_far_close: "Close_far", _far_volume: "Volume_far"} if _far_volume else {_far_close: "Close_far"}),
                         on="timestamp", how="inner")
                     if not _live.empty:
+                        for _close_col, _volume_col, _vwap_col in (
+                            ("Close_near", "Volume_near", "near_vwap"),
+                            ("Close_far", "Volume_far", "far_vwap"),
+                        ):
+                            if _volume_col in _live.columns:
+                                _prices = pd.to_numeric(_live[_close_col], errors="coerce")
+                                _volumes = pd.to_numeric(_live[_volume_col], errors="coerce").fillna(0.0)
+                                _cum_volume = _volumes.cumsum().replace(0, np.nan)
+                                _live[_vwap_col] = (_prices * _volumes).cumsum() / _cum_volume
                         _live["spread"] = _live["Close_near"] - _live["Close_far"]
                         _live = _live.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
                         _live["spread_ma"] = _live["spread"].rolling(20, min_periods=20).mean()
                         _live["spread_std"] = _live["spread"].rolling(20, min_periods=20).std()
                         _std = _live["spread_std"].replace(0, np.nan)
                         _live["spread_z"] = (_live["spread"] - _live["spread_ma"]) / _std
-                        print(f"[Calendar Spread] LIVE session data: {len(_live)} rows, "
+                        print(f"[Calendar Spread] {_mode} session data: {len(_live)} rows, "
                               f"range {_live['timestamp'].min()} ~ {_live['timestamp'].max()}")
-                        return _live
+                        _current_session = _live
 
-        # 優先載入預先計算的價差檔案（ticker-scoped）
-        spread_path = _latest_spread_csv(_TICKER)
-        if spread_path is not None:
-            stat = spread_path.stat()
-            df = _load_spread_csv(str(spread_path.resolve()), stat.st_mtime_ns)
-            if df is not None and not df.empty:
-                # 確保數值欄位是數值類型
-                numeric_cols = ["spread", "spread_z", "spread_ma", "spread_std",
-                               "vwap_z", "price_vs_vwap", "Close_near", "Close_far"]
+        # 載入所有同 ticker daily CSV；只選單檔會讓圖表停在最後一個
+        # 有檔案的日期（曾經是 2026-08-05），遺失更早或後續 session。
+        spread_paths = _all_spread_csvs(_TICKER)
+        if spread_paths:
+            frames = []
+            numeric_cols = ["spread", "spread_z", "spread_ma", "spread_std",
+                            "vwap_z", "price_vs_vwap", "Close_near", "Close_far"]
+            for path in spread_paths:
+                stat = path.stat()
+                frame = _load_spread_csv(str(path.resolve()), stat.st_mtime_ns)
+                if frame is None or frame.empty:
+                    continue
                 for col in numeric_cols:
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors="coerce")
-                # 處理無限值
-                df = df.replace([np.inf, -np.inf], np.nan)
+                    if col in frame.columns:
+                        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+                # Historical archives predate the dual-leg VWAP columns. Build
+                # the far-leg display series from the same 20-bar rolling
+                # semantics as the archived near-leg ``vwap``. Current paper
+                # rows already carry ``far_vwap`` and are left untouched.
+                if "far_vwap" not in frame.columns and "Close_far" in frame.columns:
+                    frame["far_vwap"] = (
+                        pd.to_numeric(frame["Close_far"], errors="coerce")
+                        .rolling(20, min_periods=20)
+                        .mean()
+                    )
+                frames.append(frame.replace([np.inf, -np.inf], np.nan))
+            if frames:
+                df = (pd.concat(frames, ignore_index=True, sort=False)
+                      .sort_values("timestamp")
+                      .drop_duplicates("timestamp", keep="last")
+                      .reset_index(drop=True))
+                if _current_session is not None and not _current_session.empty:
+                    df = (pd.concat([df, _current_session], ignore_index=True, sort=False)
+                          .sort_values("timestamp")
+                          .drop_duplicates("timestamp", keep="last")
+                          .reset_index(drop=True))
                 print(f"[Calendar Spread] 載入價差資料: {len(df)} 筆, "
-                      f"來自 {spread_path.name}, "
+                      f"來自 {len(frames)} 個 daily CSV, "
                       f"範圍 {df['timestamp'].min()} ~ {df['timestamp'].max()}")
-                return df
-            print(f"[Calendar Spread] 載入失敗或空資料: {spread_path.name}")
+                _chart_df = _limit_calendar_spread_to_recent_days(df)
+                print(f"[Calendar Spread] 圖表限制最近 3 天: {len(_chart_df)} 筆, "
+                      f"日期 {_chart_df['timestamp'].dt.date.nunique()} 天")
+                return _chart_df
+            print("[Calendar Spread] daily spread CSV 全部為空或無法載入")
+        elif _current_session is not None and not _current_session.empty:
+            return _limit_calendar_spread_to_recent_days(
+                _current_session.sort_values("timestamp").reset_index(drop=True)
+            )
         else:
             print(f"[Calendar Spread] 找不到 {_TICKER} calendar spread CSV")
 
@@ -3038,7 +3710,7 @@ def load_calendar_spread_data():
         df_merged["price_vs_vwap"] = df_merged["Close_near"] - df_merged["vwap"]
         
         print(f"[Calendar Spread] 計算價差資料完成: {len(df_merged)} 筆")
-        return df_merged
+        return _limit_calendar_spread_to_recent_days(df_merged)
         
     except Exception as e:
         print(f"[Calendar Spread] 載入價差資料錯誤: {e}")
@@ -4606,9 +5278,11 @@ elif _selected_product == "TMF":
                            "reason": "RECONCILED_EXIT_ONLY"}
     else:
         _fills_path_scope = runtime_path("logs", "mts_trade_fills.jsonl")
+        _scope_trading_day = f"{TRADE_DATE_STR[:4]}-{TRADE_DATE_STR[4:6]}-{TRADE_DATE_STR[6:]}"
         _mts_perf_scope = scope_mts_performance(
             active_runtime_truth,
-            classify_mts_evidence(_fills_path_scope, _events_path_scope))
+            classify_mts_evidence(_fills_path_scope, _events_path_scope,
+                                  target_trading_day=_scope_trading_day))
 
     # In restricted-exit mode the legacy /tmp state must not be read or
     # presented.  The full legacy block remains unchanged for LIVE/PAPER.
@@ -4678,9 +5352,48 @@ elif _selected_product == "TMF":
             if _mts_state is None:
                 with open(_mts_state_file) as _f:
                     _mts_state = json.loads(_f.read())
+            # EXIT_REMAINING is an intent emitted before fill confirmation.
+            # Only a confirmed fill/settlement may clear stale paper state.
+            _trade_id_for_state = _mts_state.get("trade_id")
+            _terminal_fill = latest_mts_terminal_fill(
+                runtime_path("logs", "mts_trade_fills.jsonl"),
+                _trade_id_for_state)
+            _terminal_event = latest_mts_terminal_event(
+                _events_path_scope, _trade_id_for_state)
+            _exit_intent = latest_mts_exit_intent_event(
+                _events_path_scope, _trade_id_for_state)
+            if ((_terminal_fill is not None or _terminal_event is not None)
+                    and _mts_state.get("has_position")):
+                _confirmed_exit = _terminal_fill or _terminal_event
+                _mts_state = dict(_mts_state)
+                _mts_state["has_position"] = False
+                _mts_state["state"] = "FLAT"
+                _mts_state["reason"] = (
+                    _confirmed_exit.get("reason")
+                    or _confirmed_exit.get("event")
+                    or _confirmed_exit.get("fill_type")
+                    or "TERMINAL_EVENT")
+                _mts_state["release_state"] = "CLOSED"
+                _mts_state["released_leg"] = None
+                _mts_state["remaining_leg"] = None
+                _mts_state["near_status"] = "CLOSED"
+                _mts_state["far_status"] = "CLOSED"
+                _mts_state["_terminal_exit_event"] = _confirmed_exit
+            elif (_exit_intent is not None and _mts_state.get("has_position")):
+                _mts_state = dict(_mts_state)
+                _mts_state["_pending_exit_intent"] = _exit_intent
             _has_pos = _mts_state.get("has_position", False)
             if _has_pos:
                 st.header("MTS 價差持倉 (tmf_spread)")
+                _pending_exit = _mts_state.get("_pending_exit_intent")
+                if isinstance(_pending_exit, dict):
+                    _pending_reason = (_pending_exit.get("reason") or "TRAIL")
+                    _pending_ts = (_pending_exit.get("ts")
+                                   or _pending_exit.get("timestamp") or "N/A")
+                    st.warning(
+                        f"⚠️ MTS {_pending_reason} 已觸發，等待成交回報 · {_pending_ts}")
+                    st.caption(
+                        "目前仍以持倉狀態顯示；只有 confirmed fill 才會轉為 FLAT。")
                 _c1, _c2, _c3, _c4 = st.columns(4)
                 _c1.metric("近月進場", f'{_mts_state.get("near_entry", 0):.0f}')
                 _c2.metric("遠月進場", f'{_mts_state.get("far_entry", 0):.0f}')
@@ -4694,6 +5407,19 @@ elif _selected_product == "TMF":
                     _direction = "FLAT" if not _has_pos else "?"
                 _c5.metric("方向", _direction)
                 _c6.metric("理由", _fmt_policy_j_reason(_mts_state.get("reason", "?")))
+
+                # 2026-08-23 Hermes Agent: Hierarchical VWAP candidate panel
+                # (display-only telemetry: mode badge, candidate status,
+                # per-leg VWAP, 5m confirmation, freshness, release intent /
+                # block reason, winner). Never alters runtime behavior.
+                try:
+                    _hvwap_events = _hvwap_load_events()
+                    st.markdown(
+                        _hvwap_panel_markdown(
+                            _hvwap_panel_payload(_mts_state, _hvwap_events)),
+                        unsafe_allow_html=True)
+                except Exception:
+                    pass
 
                 # 2026-06-26 Gemini CLI: Render active fixed parameters and ATR when in position
                 # 2026-07-31 Antigravity: Format threshold points as integers without decimals
@@ -4781,6 +5507,19 @@ elif _selected_product == "TMF":
                              if _nr is not None else "N/A")
                 _fr_label = (f"{_fr:+,.0f} TWD"
                              if _fr is not None else "N/A")
+                # Display the position direction next to each leg's UPL.
+                # Paper state is authoritative in paper mode; broker state is
+                # used only when the live/session artifact is authoritative.
+                _upl_state = (_mts_state if isinstance(_mts_state, dict)
+                              else _broker_mts_state)
+                _near_direction = str(
+                    (_upl_state or {}).get("near_side") or "").upper()
+                _far_direction = str(
+                    (_upl_state or {}).get("far_side") or "").upper()
+                _near_suffix = f" ({_near_direction.title()})" if _near_direction in {"LONG", "SHORT"} else ""
+                _far_suffix = f" ({_far_direction.title()})" if _far_direction in {"LONG", "SHORT"} else ""
+                _near_upl_title = f"近月 UPL{_near_suffix}"
+                _far_upl_title = f"遠月 UPL{_far_suffix}"
                 _nr_status = str(_mts_state.get("near_status", "")).upper()
                 _fr_status = str(_mts_state.get("far_status", "")).upper()
                 if "RELEASED" in _fr_status:
@@ -4795,14 +5534,30 @@ elif _selected_product == "TMF":
                         _nr_label = f"{_r:+,.0f} TWD (已平倉)"
                 _tr = (None if (_nr is None or _fr is None)
                        else (_nr + _fr))
-                if _mts_perf_scope["ok"]:
-                    _u1.metric("近月 UPL", _nr_label)
-                    _u2.metric("遠月 UPL", _fr_label)
+                # Current paper UPL is a state/mark estimate and must not be
+                # hidden by the historical ledger provenance scope. Keep
+                # cumulative performance fail-closed; this branch is only
+                # for the currently open paper position.
+                _paper_position_upl = bool(
+                    active_runtime_truth.get("is_paper_runtime")
+                    and isinstance(_mts_state, dict)
+                    and _mts_state.get("has_position")
+                    and _nr is not None and _fr is not None)
+                if _mts_perf_scope["ok"] or _paper_position_upl:
+                    _u1.metric(_near_upl_title, _nr_label)
+                    _u2.metric(_far_upl_title, _fr_label)
                     _u3.metric("總計 UPL",
                                (f"{_tr:+,.0f} TWD"
                                 if _tr is not None else "N/A"))
                     if "RELEASED" in _fr_status or "RELEASED" in _nr_status:
                         st.caption("總計 = 未實現 UPL + 已平倉腿 realized PnL（含釋放腿）")
+                    elif _paper_position_upl and not _mts_perf_scope["ok"]:
+                        _mark_ts = (_mts_state.get("heartbeat_at")
+                                    or _mts_state.get("_updated") or "—")
+                        st.caption(
+                            "⚠️ STRATEGY_MARK_UPL · "
+                            "UNVERIFIED_PAPER_ATTRIBUTION · "
+                            f"mark=state near_last/far_last · mark_at={_mark_ts}")
                 else:
                     # [provenance] no authorized scope (legacy/mixed/
                     # unknown evidence or runtime) => N/A + explicit
@@ -4916,6 +5671,25 @@ elif _selected_product == "TMF":
                     f"原因: {_reason}"
                     f"{_params_info}"
                 )
+                # 2026-08-23 Hermes Agent: HVWAP candidate status while FLAT
+                # (compact; display-only telemetry — see the full panel when a
+                # position is held).
+                try:
+                    _hvwap_events = _hvwap_load_events()
+                    _hvwap_cand = _hvwap_latest(_hvwap_events, "HVWAP_CANDIDATE")
+                    if _hvwap_cand:
+                        _hvwap_block = _hvwap_cand.get("block_reason")
+                        _hvwap_block_sfx = f" · {_hvwap_block}" if _hvwap_block else ""
+                        st.caption(
+                            "📐 HVWAP 候選: "
+                            f"{_hvwap_cand.get('status', '?')}{_hvwap_block_sfx}"
+                            f" | 60m {_hvwap_cand.get('regime_60m', '—')}"
+                            f" | 15m {_hvwap_cand.get('signal_15m', '—')}"
+                            f" | 5m x{_hvwap_cand.get('consecutive_confirmed_bars', 0)}"
+                            f" | 釋放腿 {_hvwap_cand.get('hypothetical_release_leg', '—')}"
+                        )
+                except Exception:
+                    pass
                 # 2026-07-15 Gemini CLI: Render MTS Unrealized PnL block showing 0 TWD when in FLAT state
                 # 2026-07-31 Hermes Agent: FLAT => UPL MUST be 0 regardless of stale
                 # state fields (telemetry writer can leave phantom UPL after
@@ -4998,23 +5772,9 @@ elif _selected_product == "TMF":
     # Historical restricted-exit contract marker: if not _exit_only_dashboard and os.path.exists(_fills_path):
     # Live/quarantined runtime must never show legacy paper fills/performance.
     if not _live_runtime and not _exit_only_dashboard and os.path.exists(_fills_path):
-        _dashed_today = f"{_today[:4]}-{_today[4:6]}-{_today[6:]}"
+        _dashed_today = f"{TRADE_DATE_STR[:4]}-{TRADE_DATE_STR[4:6]}-{TRADE_DATE_STR[6:]}"
         _perf_data = calculate_mts_daily_performance(_fills_path, _events_path, _dashed_today)
         _display_day = _dashed_today
-        
-        # 2026-07-27 Gemini CLI: Fallback to calendar date or recent trades if current trading day has 0 completed trades (e.g. night session rollover)
-        if not _perf_data or not _perf_data.get("completed"):
-            import datetime as _dt_mod
-            _cal_today = _dt_mod.datetime.now().strftime("%Y-%m-%d")
-            _fb_perf = calculate_mts_daily_performance(_fills_path, _events_path, _cal_today)
-            if _fb_perf and _fb_perf.get("completed"):
-                _perf_data = _fb_perf
-                _display_day = f"{_cal_today} (fallback 至日曆日)"
-            else:
-                _fb_all = calculate_mts_daily_performance(_fills_path, _events_path, None)
-                if _fb_all and _fb_all.get("completed"):
-                    _perf_data = _fb_all
-                    _display_day = "近期歷史 (Recent)"
                     
         if _perf_data and (_perf_data["completed"] or _perf_data["active"]):
             st.markdown("---")
@@ -5195,16 +5955,37 @@ elif _selected_product == "TMF":
                     _loop_rows = []
                     for t in _completed_filtered:
                         _is_pj = ("COMBINED_EXIT" in str(t.get("exit_reason", "")).upper() or "POLICY_J" in str(t.get("exit_reason", "")).upper())
+                        # For a single-leg release, the release reason belongs
+                        # to the released leg and the final exit reason belongs
+                        # to the remaining leg.  Do not bind reasons to the
+                        # near/far columns by position: FAR can be released
+                        # first (as in TMF_RELEASE_FAR).
+                        _release_leg = str(t.get("release_leg", "")).upper()
+                        if not _is_pj and _release_leg == "FAR":
+                            _near_reason = t.get("exit_reason", "—")
+                            _near_reason_source = t.get("exit_reason_source", "—")
+                            _far_reason = t.get("release_reason", "—")
+                            _far_reason_source = t.get("release_reason_source", "—")
+                        elif not _is_pj and _release_leg == "NEAR":
+                            _near_reason = t.get("release_reason", "—")
+                            _near_reason_source = t.get("release_reason_source", "—")
+                            _far_reason = t.get("exit_reason", "—")
+                            _far_reason_source = t.get("exit_reason_source", "—")
+                        else:
+                            _near_reason = t.get("release_reason", "—")
+                            _near_reason_source = t.get("release_reason_source", "—")
+                            _far_reason = t.get("exit_reason", "—")
+                            _far_reason_source = t.get("exit_reason_source", "—")
                         _loop_rows.append({
                             "交易 ID": t["trade_id"][-6:],
                             "建倉時段": "☀️ 日盤" if t.get("entry_session", t["session"]).lower() == "day" else "🌙 夜盤",
                             "進場時間": t["entry_time"].split("T")[1][:8] if "T" in t["entry_time"] else t["entry_time"],
                             "近月 PnL": f'{t.get("near_pnl_gross", t.get("release_pnl", 0)):+,.0f}',
-                            "近月原因": ("— (雙腿同步平倉)" if _is_pj else _fmt_policy_j_reason(t.get("release_reason", "—"))),
-                            "近月來源": f'{t.get("release_reason_source", "—")}',
+                            "近月原因": ("— (雙腿同步平倉)" if _is_pj else _fmt_policy_j_reason(_near_reason)),
+                            "近月來源": f'{_near_reason_source}',
                             "遠月 PnL": f'{t.get("far_pnl_gross", t.get("exit_pnl", 0)):+,.0f}',
-                            "遠月原因": _fmt_policy_j_reason(t.get("exit_reason", "—")),
-                            "遠月來源": f'{t.get("exit_reason_source", "—")}',
+                            "遠月原因": _fmt_policy_j_reason(_far_reason),
+                            "遠月來源": f'{_far_reason_source}',
                             "跨時段": "🔄 跨盤" if t.get("cross_session_trade") else "單盤",
                             "淨利 (TWD)": f'{t["net_pnl"]:+,.0f}',
                             "風控": t["risk_mode"]

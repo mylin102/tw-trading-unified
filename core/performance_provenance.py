@@ -53,7 +53,27 @@ def _iter_records(path):
                 yield rec
 
 
-def classify_mts_evidence(fills_path, events_path) -> dict:
+def _record_trading_day(rec: dict) -> str | None:
+    """Return the exchange trading day for a ledger record."""
+    if not isinstance(rec, dict):
+        return None
+    ts = next((rec.get(k) for k in
+               ("timestamp", "event_ts", "ts", "fill_timestamp", "created_at")
+               if rec.get(k) not in (None, "")), None)
+    if ts is None:
+        return None
+    session = rec.get("session") or rec.get("session_label") or "UNKNOWN"
+    try:
+        from scripts.generate_daily_report import get_trading_day
+        day = get_trading_day(ts, session)
+        return day.strftime("%Y-%m-%d") if hasattr(day, "strftime") else str(day)
+    except Exception:
+        value = str(ts)
+        return value[:10] if len(value) >= 10 else None
+
+
+def classify_mts_evidence(fills_path, events_path,
+                          target_trading_day: str | None = None) -> dict:
     """Scan the MTS ledger and classify the execution evidence.
 
     Returns:
@@ -72,6 +92,8 @@ def classify_mts_evidence(fills_path, events_path) -> dict:
     n = 0
     for path in (fills_path, events_path):
         for rec in _iter_records(path):
+            if target_trading_day is not None and _record_trading_day(rec) != target_trading_day:
+                continue
             n += 1
             m = rec.get("mode")
             if isinstance(m, str) and m:
