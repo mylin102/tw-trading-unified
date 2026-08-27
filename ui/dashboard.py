@@ -5114,7 +5114,10 @@ elif _selected_product == "TMF":
             # record that classifies the SCOPE as mixed.  Reconstruction
             # excludes live trades per-trade and still displays safely
             # rebuildable paper/legacy trades.
-            if _mts_perf_scope.get("mode") == "paper":
+            # The ledger may be mixed/legacy even while the canonical runtime
+            # is paper.  Use runtime authority for rendering the isolated
+            # reconstruction block; live records remain excluded per trade.
+            if active_runtime_truth.get("is_paper_runtime") is True:
                 try:
                     from core.paper_performance_reconstruction import (
                         reconstruct_paper_daily as _reconstruct_paper)
