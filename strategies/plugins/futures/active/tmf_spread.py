@@ -765,6 +765,44 @@ _MISSING = "MISSING"
 _UNSET = "UNSET"
 
 
+def _authorized_fill_mode() -> str:
+    """Authorized execution mode for fill provenance from the canonical
+    runtime execution context (codex spec §3, v2).  paper_active ->
+    "paper"; live_ready / live_quarantined / reconciled_exit_only ->
+    "live"; anything else -> "unknown" (fail-closed: reconstruction will
+    never classify an unknown-mode fill as VERIFIED_PAPER).  NEVER reads
+    an arbitrary env override.
+    """
+    try:
+        from core.execution_context_state import read_execution_context
+        _ctx = read_execution_context() or {}
+        _mode = str(_ctx.get("effective_mode") or "").lower()
+        if _mode == "paper_active":
+            return "paper"
+        if _mode.startswith("live") or _mode == "reconciled_exit_only":
+            return "live"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _fill_provenance_defaults(trade_id: str, fill_type: str) -> dict:
+    """Complete fill provenance at the single writer boundary."""
+    try:
+        from core.execution_context_state import read_execution_context
+        _ctx = read_execution_context() or {}
+    except Exception:
+        _ctx = {}
+    _tid = str(trade_id or "")
+    return {
+        "mode": _authorized_fill_mode(),
+        "session_id": _ctx.get("session_id"),
+        "generation_id": _ctx.get("process_start_id"),
+        "parent_combo_order_id": f"PAPER-COMBO-{_tid}" if _tid else None,
+        "release_group_id": f"MTS-RG-{_tid}" if _tid else None,
+    }
+
+
 def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
                  price: float, fill_type: str, trade_id: str,
                  spread_z: float | None = None,
@@ -809,6 +847,7 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
             logger.warning("[MTS_FILL_FALLBACK] Missing trade_id, using fallback=%s", _fallback)
             trade_id = _fallback
 
+        _prov = _fill_provenance_defaults(trade_id, fill_type)
         fill = {
             "timestamp": datetime.now().isoformat(),
             "ticker": ticker,
@@ -819,6 +858,41 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
             "price": price,
             "fill_type": fill_type.upper(),
             "trade_id": trade_id,
+            # ── 2026-08-27 (codex-approved spec §3): future paper-fill
+            # provenance contract.  Every paper fill carries explicit
+            # provenance so downstream reconstruction can classify
+            # VERIFIED_PAPER without guessing.  Never uses
+            # settlement_origin=LIVE / BROKER_FILL for paper fills.
+            #
+            # mode is decided by the AUTHORIZED runtime execution context
+            # (canonical execution_context.json effective_mode), never by
+            # an arbitrary env override.  paper_active -> paper; any
+            # live_* / reconciled_exit_only -> live; unknown -> "unknown"
+            # (reconstruction fails closed on unknown mode).  An env
+            # override is NOT accepted — a paper runtime cannot be
+            # mislabeled live and vice versa.
+            "mode": _prov["mode"],
+            "execution_source": (
+                "PAPER_EXIT_FILL"
+                if str(fill_type).upper() in ("EXIT", "RELEASE",
+                                              "COMBINED_EXIT",
+                                              "COMBINED_EXIT_SETTLED")
+                else "PAPER_COMBO_FILL"),
+            "paper_fill_id": extra_fields.pop("paper_fill_id", None)
+            or f"PF-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{leg.upper()}",
+            "parent_combo_order_id": extra_fields.pop(
+                "parent_combo_order_id", None) or _prov["parent_combo_order_id"],
+            "leg_role": str(leg).upper(),
+            "expected_qty": extra_fields.pop("expected_qty", None) or qty,
+            "filled_qty": extra_fields.pop("filled_qty", None) or qty,
+            "fill_status": "FILLED",
+            "fill_price": price,
+            "fill_timestamp": datetime.now().isoformat(),
+            "attribution_key": extra_fields.pop("attribution_key", None)
+            or f"{trade_id}:{str(leg).upper()}:{str(fill_type).upper()}",
+            "session_id": extra_fields.pop("session_id", None) or _prov["session_id"],
+            "generation_id": extra_fields.pop("generation_id", None) or _prov["generation_id"],
+            "release_group_id": extra_fields.pop("release_group_id", None) or _prov["release_group_id"],
             "session": _session_label(),
             "spread_z": round(spread_z, 2) if spread_z is not None else None,
             "realized_pnl": round(realized_pnl, 1) if realized_pnl is not None else None,

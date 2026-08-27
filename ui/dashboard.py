@@ -5042,12 +5042,45 @@ elif _selected_product == "TMF":
             _win_rate = _curr_metrics["win_rate"]
             _pf = _curr_metrics["profit_factor"]
 
+            # ── 2026-08-27 (codex review v2): the FORMAL KPI must reflect
+            # VERIFIED_PAPER provenance ONLY.  parse_logs() mixes legacy/
+            # reconstructed trades into its totals; the formal cards must
+            # NOT read them.  When no VERIFIED_PAPER record exists, show
+            # N/A with an explicit reason (never 0, never reconstructed).
+            _formal_metrics = None
+            try:
+                from core.paper_performance_reconstruction import (
+                    reconstruct_paper_daily as _reconstruct_formal)
+                _formal = _reconstruct_formal(_fills_path, _events_path,
+                                              _dashed_today)
+                _formal_metrics = _formal.get("formal_metrics") or {}
+                _formal_breakdown = _formal.get("formal_breakdown") or {}
+            except Exception:
+                _formal_metrics = None
+                _formal_breakdown = {}
+
             _c1, _c2, _c3, _c4 = st.columns(4)
-            if _mts_perf_scope["ok"]:
-                _c1.metric("MTS 實現毛損益 (Realized Gross)", f"{_total_net:+,.0f} TWD")
-                _c2.metric("已完成圈數 (Realized)", _total_trades)
-                _c3.metric("勝率", f"{_win_rate:.1%}")
-                _c4.metric("獲利因子", f"{_pf:.2f}" if _total_trades > 0 else "—")
+            if _mts_perf_scope["ok"] and _formal_metrics is not None \
+                    and (_formal_metrics.get("completed_trades") or 0) > 0:
+                _c1.metric("MTS 實現毛損益 (Realized Gross)",
+                           f"{_formal_metrics.get('realized_gross', 0):+,.0f} TWD")
+                _c2.metric("已完成圈數 (Realized)",
+                           _formal_metrics.get("completed_trades", 0))
+                _c3.metric("勝率",
+                           f"{(_formal_metrics.get('win_rate') or 0):.1%}")
+                _pf_f = _formal_metrics.get("profit_factor")
+                _c4.metric("獲利因子",
+                           f"{_pf_f:.2f}" if _pf_f else "—")
+            elif _mts_perf_scope["ok"]:
+                # paper scope ok but NO VERIFIED_PAPER provenance yet —
+                # formal KPI is N/A (reconstructed lives in its own block)
+                _c1.metric("MTS 實現毛損益 (Realized Gross)", "N/A")
+                _c2.metric("已完成圈數 (Realized)", "N/A")
+                _c3.metric("勝率", "N/A")
+                _c4.metric("獲利因子", "N/A")
+                st.caption(
+                    "⚠️ 正式累計 N/A — 尚無 VERIFIED_PAPER provenance 記錄；"
+                    "legacy 重建結果請見下方獨立區塊（不計入正式累計）")
             else:
                 # [provenance] no authorized scope => N/A + explicit
                 # source-mismatch reason — NEVER 0, NEVER merged PnL
@@ -5057,13 +5090,94 @@ elif _selected_product == "TMF":
                 _c4.metric("獲利因子", "N/A")
                 st.warning(f"⚠️ MTS 績效 N/A — {_mts_perf_scope['reason']}")
 
-            _day_m = _breakdown["DAY"]
-            _night_m = _breakdown["NIGHT"]
-            if _mts_perf_scope["ok"]:
+            _day_m = _formal_breakdown.get("DAY") or {
+                "realized_gross": 0, "completed_trades": 0,
+                "win_rate": 0.0, "profit_factor": None}
+            _night_m = _formal_breakdown.get("NIGHT") or {
+                "realized_gross": 0, "completed_trades": 0,
+                "win_rate": 0.0, "profit_factor": None}
+            if _mts_perf_scope["ok"] and _formal_metrics is not None \
+                    and (_formal_metrics.get("completed_trades") or 0) > 0:
                 st.caption(
-                    f"☀️ 日盤實現毛利: **{_day_m['total_net']:+,.0f} TWD** ({_day_m['total_trades']} 圈, 勝率 {_day_m['win_rate']:.1%}) | "
-                    f"🌙 夜盤實現毛利: **{_night_m['total_net']:+,.0f} TWD** ({_night_m['total_trades']} 圈, 勝率 {_night_m['win_rate']:.1%})"
+                    f"☀️ 日盤正式實現毛利: **{_day_m['realized_gross']:+,.0f} TWD** ({_day_m['completed_trades']} 圈, 勝率 {_day_m['win_rate']:.1%}) | "
+                    f"🌙 夜盤正式實現毛利: **{_night_m['realized_gross']:+,.0f} TWD** ({_night_m['completed_trades']} 圈, 勝率 {_night_m['win_rate']:.1%})"
                 )
+
+            # ── 2026-08-27 (codex-approved spec): reconstructed paper daily
+            # metrics.  Legacy complete paper trades (pre-provenance
+            # contract) are shown in a SEPARATE block, badged
+            # PAPER·RECONSTRUCTED·UNVERIFIED, and NEVER merged into the
+            # formal cumulative totals above (formal = VERIFIED_PAPER only).
+            #
+            # 2026-08-27 (codex review v2): show this block whenever the
+            # runtime is paper — even if the ledger carries a mode=live
+            # record that classifies the SCOPE as mixed.  Reconstruction
+            # excludes live trades per-trade and still displays safely
+            # rebuildable paper/legacy trades.
+            if _mts_perf_scope.get("mode") == "paper":
+                try:
+                    from core.paper_performance_reconstruction import (
+                        reconstruct_paper_daily as _reconstruct_paper)
+                    _rec = _reconstruct_paper(_fills_path, _events_path,
+                                              _dashed_today)
+                    _rec_m = _rec.get("metrics") or {}
+                    _f_m = _rec.get("formal_metrics") or {}
+                    _el = _rec.get("eligible") or {}
+                    _n_rec = len(_el.get("RECONSTRUCTED") or [])
+                    _n_unv = len(_el.get("UNVERIFIED") or [])
+                    _n_ver = len(_el.get("VERIFIED_PAPER") or [])
+                    _n_ex = len(_rec.get("excluded") or [])
+                    _badge = ("🟢 PAPER · VERIFIED" if _n_ver
+                              else "🟡 PAPER · RECONSTRUCTED" if _n_rec
+                              else "🔴 PAPER · UNVERIFIED" if _n_unv
+                              else "⚪ 無可重建交易")
+                    with st.expander(
+                            f"📊 MTS Paper 重建績效 (Reconstructed — {_badge})",
+                            expanded=_n_rec > 0):
+                        st.caption(
+                            "僅顯示 legacy paper 交易重建結果；**不計入上方正式累計**。"
+                            f"eligible={_n_ver + _n_rec + _n_unv} "
+                            f"(verified={_n_ver} · reconstructed={_n_rec} · "
+                            f"unverified={_n_unv}) · excluded={_n_ex}")
+                        _rc1, _rc2, _rc3, _rc4 = st.columns(4)
+                        _rc1.metric("重建實現損益 (Gross)",
+                                    f"{_rec_m.get('realized_gross', 0):+,.0f} TWD")
+                        _rc2.metric("重建完成圈數",
+                                    _rec_m.get("completed_trades", 0))
+                        _rc3.metric("重建勝率",
+                                    f"{(_rec_m.get('win_rate') or 0):.1%}")
+                        _pf = _rec_m.get("profit_factor")
+                        _rc4.metric("重建獲利因子",
+                                    f"{_pf:.2f}" if _pf else "—")
+                        st.caption(
+                            f"正式累計 (VERIFIED_PAPER only): "
+                            f"{_f_m.get('completed_trades', 0)} 圈 / "
+                            f"{_f_m.get('realized_gross', 0):+,.0f} TWD")
+                        if _rec.get("exclusion_reasons"):
+                            st.caption(
+                                "排除原因: " + "; ".join(
+                                    f"{k}×{v}" for k, v in
+                                    (_rec.get("exclusion_reasons") or {}).items()))
+                        if _rec.get("eligible"):
+                            _rec_rows = []
+                            for _blist in (_el.get("VERIFIED_PAPER") or [],
+                                           _el.get("RECONSTRUCTED") or [],
+                                           _el.get("UNVERIFIED") or []):
+                                for _t in _blist:
+                                    _rec_rows.append({
+                                        "trade_id": _t["trade_id"],
+                                        "net_pnl": (_t.get("net_pnl")
+                                                    if _t.get("net_pnl") is not None
+                                                    else "—"),
+                                        "badge": _t.get("provenance_badge", "?"),
+                                        "session": _t.get("session", "?"),
+                                    })
+                            if _rec_rows:
+                                st.dataframe(
+                                    pd.DataFrame(_rec_rows),
+                                    width="stretch", hide_index=True)
+                except Exception as _rec_exc:
+                    st.caption(f"重建不可用: {_rec_exc}")
             
             # 2026-08-04 Gemini CLI: Synchronize closed loops table with session filter selection
             if _sess_key == "DAY":
