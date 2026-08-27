@@ -72,6 +72,25 @@ def _record_trading_day(rec: dict) -> str | None:
         return value[:10] if len(value) >= 10 else None
 
 
+def select_mts_reporting_day(fills_path, events_path,
+                             current_trading_day: str) -> str:
+    """Choose current day when it has records, otherwise latest prior day.
+
+    This is deliberately a date selector, not a performance aggregation:
+    provenance classification still receives exactly one trading day.
+    """
+    days = set()
+    for path in (fills_path, events_path):
+        for rec in _iter_records(path):
+            day = _record_trading_day(rec)
+            if day:
+                days.add(day)
+    if current_trading_day in days:
+        return current_trading_day
+    prior = [day for day in days if day < current_trading_day]
+    return max(prior) if prior else current_trading_day
+
+
 def classify_mts_evidence(fills_path, events_path,
                           target_trading_day: str | None = None) -> dict:
     """Scan the MTS ledger and classify the execution evidence.

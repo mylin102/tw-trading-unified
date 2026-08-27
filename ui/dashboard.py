@@ -5178,7 +5178,8 @@ elif _selected_product == "TMF":
     # Legacy/mixed/unknown evidence renders N/A with the explicit reason —
     # NEVER 0, NEVER merged Paper/Live PnL.
     from core.performance_provenance import (
-        classify_mts_evidence, scope_mts_performance, upl_presentation, broker_snapshot_live_upl, live_upl_presented_reason)
+        classify_mts_evidence, scope_mts_performance, upl_presentation, broker_snapshot_live_upl, live_upl_presented_reason,
+        select_mts_reporting_day)
     _exit_only_dashboard = active_runtime_truth.get("is_exit_only_runtime")
     _events_path_scope = runtime_path("logs", "mts_spread_events.jsonl")
     if _exit_only_dashboard:
@@ -5278,7 +5279,9 @@ elif _selected_product == "TMF":
                            "reason": "RECONCILED_EXIT_ONLY"}
     else:
         _fills_path_scope = runtime_path("logs", "mts_trade_fills.jsonl")
-        _scope_trading_day = f"{TRADE_DATE_STR[:4]}-{TRADE_DATE_STR[4:6]}-{TRADE_DATE_STR[6:]}"
+        _scope_current_day = f"{TRADE_DATE_STR[:4]}-{TRADE_DATE_STR[4:6]}-{TRADE_DATE_STR[6:]}"
+        _scope_trading_day = select_mts_reporting_day(
+            _fills_path_scope, _events_path_scope, _scope_current_day)
         _mts_perf_scope = scope_mts_performance(
             active_runtime_truth,
             classify_mts_evidence(_fills_path_scope, _events_path_scope,
@@ -5772,7 +5775,7 @@ elif _selected_product == "TMF":
     # Historical restricted-exit contract marker: if not _exit_only_dashboard and os.path.exists(_fills_path):
     # Live/quarantined runtime must never show legacy paper fills/performance.
     if not _live_runtime and not _exit_only_dashboard and os.path.exists(_fills_path):
-        _dashed_today = f"{TRADE_DATE_STR[:4]}-{TRADE_DATE_STR[4:6]}-{TRADE_DATE_STR[6:]}"
+        _dashed_today = _scope_trading_day
         _perf_data = calculate_mts_daily_performance(_fills_path, _events_path, _dashed_today)
         _display_day = _dashed_today
                     
