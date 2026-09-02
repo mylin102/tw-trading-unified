@@ -14351,9 +14351,19 @@ class FuturesMonitor:
                     _set[f"{_lk}_closed_qty"] = _q
                     _set[f"{_lk}_realized_pnl_gross"] = round(_g, 1)
                 _combined_gross = round(_set["near_realized_pnl_gross"] + _set["far_realized_pnl_gross"], 1)
+                _effective_mode = getattr(
+                    getattr(self, "_execution_context", None),
+                    "effective_mode", "")
+                _live_settlement = {
+                    "settlement_origin": "LIVE",
+                } if _effective_mode in {
+                    "live", "live_preflight", "live_reconciling",
+                    "live_quarantined", "live_ready",
+                    "reconciled_exit_only",
+                } else {}
                 _append_fill(
                     ticker=getattr(self, "ticker", "TMF"),
-                    contract="", leg="", side="", qty=0, price=0.0,
+                    contract="", leg="SETTLED", side="", qty=0, price=0.0,
                     fill_type="COMBINED_EXIT_SETTLED",
                     trade_id=trade_id,
                     event_type="COMBINED_EXIT_SETTLED",
@@ -14365,9 +14375,9 @@ class FuturesMonitor:
                     pnl_status="GROSS_ONLY",
                     fees=None,
                     tax=None,
-                    settlement_origin="LIVE",
                     price_confidence="EXACT",
                     settled_at=datetime.now().isoformat(),
+                    **_live_settlement,
                     **_set,
                 )
                 console.print(f"[green]📗 [COMBINED_EXIT_SETTLED] trade_id={trade_id} gross={_combined_gross:+.0f}[/green]")
