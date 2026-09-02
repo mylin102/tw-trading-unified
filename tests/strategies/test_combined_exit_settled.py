@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from strategies.futures.monitor import FuturesMonitor
+from core.paper_performance_reconstruction import reconstruct_paper_daily
+from scripts.generate_daily_report import get_trading_day
 
 
 def _make_monitor(tmp_path):
@@ -72,17 +74,6 @@ def _pp(tmp_path):
 def test_settled_emitted_once_after_both_legs(tmp_path):
     mon = _make_monitor(tmp_path)
     _both(mon, "T1", 43825.0, 43910.0, _state_file(tmp_path))
-    import os as _os
-    _p = tmp_path / "fills.jsonl"
-    print(f"\nDEBUG path={_p} exists={_os.path.exists(_p)}")
-    if _os.path.exists(_p):
-        for _l in _p.read_text().splitlines():
-            import json as _j
-            try:
-                _d = _j.loads(_l)
-                print("DEBUG row:", _d.get("event_type") or _d.get("fill_type"), _d.get("trade_id"))
-            except Exception:
-                pass
     rows = _rows(tmp_path)
     s = _settled(rows)
     assert len(s) == 1, f"exactly one SETTLED, got {len(s)}"
@@ -161,6 +152,62 @@ def test_paper_settled_has_non_empty_leg_role_and_no_live_origin(tmp_path):
     s = _settled(_rows(tmp_path))[0]
     assert s["leg_role"] == "SETTLED"
     assert s.get("settlement_origin") != "LIVE"
+
+
+@pytest.mark.parametrize("session", ["day", "night"])
+def test_writer_output_reconstructs_as_verified_paper_in_session_bucket(
+        tmp_path, session):
+    """The real monitor writer output must feed the formal KPI path."""
+    mon = _make_monitor(tmp_path)
+    mon._execution_context = SimpleNamespace(effective_mode="paper_active")
+    from strategies.plugins.futures.active import tmf_spread
+    with patch("core.execution_context_state.read_execution_context",
+               return_value={"effective_mode": "paper_active",
+                             "session_id": "E2E-PAPER",
+                             "process_start_id": "GEN-PAPER"}), \
+            patch.object(tmf_spread, "_session_label", return_value=session):
+        tmf_spread._append_fill(
+            "TMF", "TMFH6", "NEAR", "LONG", 1, 43770.0, "ENTRY",
+            "E2E-PAPER-" + session)
+        tmf_spread._append_fill(
+            "TMF", "TMFI6", "FAR", "SHORT", 1, 43914.0, "ENTRY",
+            "E2E-PAPER-" + session)
+        _both(mon, "E2E-PAPER-" + session, 43825.0, 43910.0,
+              _state_file(tmp_path))
+    ep = tmp_path / "mts_spread_events.jsonl"
+    ep.write_text("")
+    target_day = get_trading_day(_rows(tmp_path)[0]["timestamp"], session)
+    result = reconstruct_paper_daily(
+        str(tmp_path / "fills.jsonl"), str(ep), target_day)
+    assert [r["provenance_badge"] for r in result["eligible"]["VERIFIED_PAPER"]] == [
+        "VERIFIED_PAPER"]
+    bucket = result["formal_breakdown"][session.upper()]
+    assert bucket["completed_trades"] == 1
+
+
+def test_live_fill_in_twin_trade_is_excluded_from_paper_reconstruction(tmp_path):
+    """A live fill in the same writer path cannot enter formal paper KPI."""
+    mon = _make_monitor(tmp_path)
+    mon._execution_context = SimpleNamespace(effective_mode="live_ready")
+    from strategies.plugins.futures.active import tmf_spread
+    with patch("core.execution_context_state.read_execution_context",
+               return_value={"effective_mode": "live_ready",
+                             "session_id": "E2E-LIVE",
+                             "process_start_id": "GEN-LIVE"}), \
+            patch.object(tmf_spread, "_session_label", return_value="day"):
+        tid = "E2E-LIVE"
+        tmf_spread._append_fill("TMF", "TMFH6", "NEAR", "LONG", 1,
+                                43770.0, "ENTRY", tid)
+        tmf_spread._append_fill("TMF", "TMFI6", "FAR", "SHORT", 1,
+                                43914.0, "ENTRY", tid)
+        _both(mon, tid, 43825.0, 43910.0, _state_file(tmp_path))
+    ep = tmp_path / "mts_spread_events.jsonl"
+    ep.write_text("")
+    target_day = get_trading_day(_rows(tmp_path)[0]["timestamp"], "day")
+    result = reconstruct_paper_daily(
+        str(tmp_path / "fills.jsonl"), str(ep), target_day)
+    assert result["eligible"]["VERIFIED_PAPER"] == []
+    assert any(e["reason"] == "mode=live" for e in result["excluded"])
 
 
 def test_settled_carries_contracts_and_entry_exit(tmp_path):
