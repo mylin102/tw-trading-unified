@@ -1,5 +1,6 @@
 # Phase B tests: COMBINED_EXIT_SETTLED canonical settlement event.
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,6 +21,7 @@ def _make_monitor(tmp_path):
         mon.order_mgr = MagicMock()
         mon._pending_lifecycle_orders = {}
         mon._combined_exit_trackers = {}
+        mon._execution_context = SimpleNamespace(effective_mode="paper_active")
         from strategies.plugins.futures.active import tmf_spread
         mon._fill_log = str(tmp_path / "fills.jsonl")
         p = patch.object(tmf_spread, "_MTS_FILL_LOG", mon._fill_log)
@@ -145,10 +147,20 @@ def test_net_null_when_no_fees(tmp_path):
 
 def test_origin_live_and_confidence_exact(tmp_path):
     mon = _make_monitor(tmp_path)
+    mon._execution_context = SimpleNamespace(effective_mode="live_ready")
     _both(mon, "T7", 43825.0, 43910.0, _state_file(tmp_path))
     s = _settled(_rows(tmp_path))[0]
     assert s["settlement_origin"] == "LIVE"
     assert s["price_confidence"] == "EXACT"
+
+
+def test_paper_settled_has_non_empty_leg_role_and_no_live_origin(tmp_path):
+    mon = _make_monitor(tmp_path)
+    _both(mon, "T-PAPER-PROVENANCE", 43825.0, 43910.0,
+          _state_file(tmp_path))
+    s = _settled(_rows(tmp_path))[0]
+    assert s["leg_role"] == "SETTLED"
+    assert s.get("settlement_origin") != "LIVE"
 
 
 def test_settled_carries_contracts_and_entry_exit(tmp_path):
