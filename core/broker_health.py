@@ -81,9 +81,19 @@ def classify_broker_error(exc: BaseException) -> BrokerErrorClass:
         return BrokerErrorClass.REQUEST_VALIDATION_FAILURE
     if "Timeout" in name:
         return BrokerErrorClass.NETWORK_TIMEOUT
+    # A dead Shioaji transport can surface as a generic SDK error whose
+    # message says that the session could not be established.  This is
+    # session death, not a retryable broker-query failure.
+    _lower_msg = msg.lower()
+    if ("sessionnotestablished" in name.lower()
+            or ("unable to wait for session" in _lower_msg
+                and "established" in _lower_msg)
+            or ("session error" in _lower_msg
+                and "sessionnotestablished" in _lower_msg)):
+        return BrokerErrorClass.SDK_SESSION_CLOSED
     if "ConnectionError" in name or "ConnectionReset" in name or isinstance(exc, OSError):
         return BrokerErrorClass.CONNECTION_RESET
-    if "session" in msg.lower() and ("closed" in msg.lower() or "invalid" in msg.lower()):
+    if "session" in _lower_msg and ("closed" in _lower_msg or "invalid" in _lower_msg):
         return BrokerErrorClass.SDK_SESSION_CLOSED
     if "DecodeError" in name or "ResponseError" in name or "decode" in msg.lower():
         return BrokerErrorClass.MALFORMED_RESPONSE

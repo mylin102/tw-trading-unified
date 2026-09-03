@@ -6,7 +6,8 @@ import pandas as pd
 from pathlib import Path
 
 
-MTS_LIVE_STATE_PATH = Path("/tmp/mts_position_state.json")
+from core.runtime_paths import mts_position_state_path
+MTS_LIVE_STATE_PATH = Path(mts_position_state_path())
 
 
 def read_mts_quote_freshness(

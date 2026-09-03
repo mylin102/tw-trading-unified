@@ -53,6 +53,9 @@ def _iter_records(path):
                 yield rec
 
 
+_TD_CACHE: dict = {}
+
+
 def _record_trading_day(rec: dict) -> str | None:
     """Return the exchange trading day for a ledger record."""
     if not isinstance(rec, dict):
@@ -63,13 +66,26 @@ def _record_trading_day(rec: dict) -> str | None:
     if ts is None:
         return None
     session = rec.get("session") or rec.get("session_label") or "UNKNOWN"
+    # [PERF] get_trading_day is ~0.5ms/record; the MTS events ledger has
+    # ~90K records, so the dashboard evidence classification took ~105s per
+    # rerun.  The trading day only changes at the 15:00 night-session
+    # boundary, so an hour-precision key is a pure function of (ts, session)
+    # with identical output — memoizing drops the scan to well under a
+    # second (2026-08-28 Hermes Agent).
+    _key = (str(ts)[:13], session)
+    _cached = _TD_CACHE.get(_key)
+    if _cached is not None:
+        return _cached
     try:
         from scripts.generate_daily_report import get_trading_day
         day = get_trading_day(ts, session)
-        return day.strftime("%Y-%m-%d") if hasattr(day, "strftime") else str(day)
+        _result = day.strftime("%Y-%m-%d") if hasattr(day, "strftime") else str(day)
     except Exception:
         value = str(ts)
-        return value[:10] if len(value) >= 10 else None
+        _result = value[:10] if len(value) >= 10 else None
+    if _result is not None:
+        _TD_CACHE[_key] = _result
+    return _result
 
 
 def select_mts_reporting_day(fills_path, events_path,
@@ -106,10 +122,15 @@ def classify_mts_evidence(fills_path, events_path,
     exactly one non-empty config_hash AND exactly one non-empty
     session/generation AND every source == "live_broker_reconciled".
     Any missing/mixed/unknown value degrades to "mixed" (N/A downstream).
+
+    Execution evidence = the FILLS ledger only (2026-09-02). The events file
+    holds diagnostics; HVWAP_RELEASE_INTENT writes its gate state into a
+    'mode' field, which previously collided with the provenance contract and
+    degraded clean paper ledgers to 'mixed'.
     """
     modes, run_ids, hashes, sessions, sources = set(), set(), set(), set(), set()
     n = 0
-    for path in (fills_path, events_path):
+    for path in (fills_path,):
         for rec in _iter_records(path):
             if target_trading_day is not None and _record_trading_day(rec) != target_trading_day:
                 continue

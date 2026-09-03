@@ -9,8 +9,11 @@ Resolution order:
   1. $TRADING_RUNTIME_DIR  (set by PM2 ecosystem.config.js env for both apps)
   2. repo root fallback    (dev/backtest on Air4: identical to old behaviour)
 """
+from __future__ import annotations
+import hashlib
 import os
 import subprocess
+from pathlib import Path
 from typing import Optional
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -61,12 +64,85 @@ def enforce_runtime_identity(source_file: Optional[str] = None) -> None:
                 f"actual_sha={actual_sha} expected_sha={expected_sha}")
 
 
+RUNTIME_STATE_SCHEMA = 1
+
+
+def _is_test_runtime() -> bool:
+    return "pytest" in __import__("sys").modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
 def runtime_root() -> str:
-    return os.environ.get("TRADING_RUNTIME_DIR") or _REPO_ROOT
+    """Return the one absolute runtime data root.
+
+    Production must provide TRADING_RUNTIME_DIR.  Development/tests may use
+    the repository root, but never silently fall back to /tmp.
+    """
+    raw = os.environ.get("TRADING_RUNTIME_DIR")
+    if not raw:
+        if os.environ.get("NODE_ENV") == "production":
+            raise RuntimeError("RUNTIME_ROOT_UNSET: TRADING_RUNTIME_DIR is required")
+        raw = _REPO_ROOT
+    return str(Path(raw).expanduser().resolve())
 
 
 def runtime_path(*parts) -> str:
     return os.path.join(runtime_root(), *parts)
+
+
+def mts_position_state_path() -> str:
+    """Canonical MTS state path; production has no implicit override/fallback."""
+    explicit = os.environ.get("MTS_STATE_PATH")
+    if explicit:
+        if os.environ.get("NODE_ENV") == "production" and not _is_test_runtime():
+            expected = os.path.realpath(runtime_path("data", "state", "mts_position_state.json"))
+            actual = str(Path(explicit).expanduser().resolve())
+            if actual != expected:
+                raise RuntimeError(
+                    f"RUNTIME_STATE_PATH_REJECTED: expected={expected} actual={actual}")
+        if _is_test_runtime():
+            return str(Path(explicit).expanduser().resolve())
+    return runtime_path("data", "state", "mts_position_state.json")
+
+
+def runtime_id() -> str:
+    """Stable identity for the resolved runtime root, optionally deployment-pinned."""
+    explicit = os.environ.get("TRADING_RUNTIME_ID")
+    if explicit:
+        return explicit
+    return "runtime-" + hashlib.sha256(runtime_root().encode("utf-8")).hexdigest()[:16]
+
+
+def stamp_runtime_state(state: dict, existing: dict | None = None,
+                        *, writer_identity: str = "mts_spread") -> dict:
+    """Stamp state with identity metadata without changing lifecycle fields."""
+    previous = existing or {}
+    try:
+        generation = int(previous.get("generation", 0)) + 1
+    except (TypeError, ValueError):
+        generation = 1
+    state["runtime_id"] = runtime_id()
+    state["runtime_root"] = runtime_root()
+    state["writer_identity"] = f"{writer_identity}:{os.getpid()}"
+    state["generation"] = generation
+    state["runtime_state_schema"] = RUNTIME_STATE_SCHEMA
+    return state
+
+
+def validate_runtime_state(state: object) -> tuple[bool, str]:
+    """Validate canonical state identity; never accept unknown identity."""
+    if not isinstance(state, dict):
+        return False, "STATE_UNAVAILABLE"
+    if state.get("runtime_id") != runtime_id():
+        return False, "IDENTITY_MISMATCH"
+    if str(Path(str(state.get("runtime_root", ""))).expanduser().resolve()) != runtime_root():
+        return False, "RUNTIME_STATE_SPLIT_BRAIN"
+    if state.get("runtime_state_schema") != RUNTIME_STATE_SCHEMA:
+        return False, "SCHEMA_MISMATCH"
+    if not isinstance(state.get("writer_identity"), str) or not state.get("writer_identity"):
+        return False, "IDENTITY_MISMATCH"
+    if not isinstance(state.get("generation"), int) or isinstance(state.get("generation"), bool):
+        return False, "SCHEMA_MISMATCH"
+    return True, "OK"
 
 
 def runtime_logs(*parts) -> str:

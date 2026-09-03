@@ -306,6 +306,7 @@ def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
     _lock = threading.Lock()
     _last_mtx_update_log_at = {"ts": 0.0}
     _mtx_update_log_interval_secs = 5.0
+    from core.callback_trace_context import emit as _trace_emit
     
     def on_bidask(exchange, bidask):
         # Safety checks
@@ -325,6 +326,8 @@ def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
             # Use monitor instance (handle OptionsMonitor wrapper)
             mon = options_mon.monitor if hasattr(options_mon, 'monitor') else options_mon
             code = bidask.code
+            _trace_emit("FALLBACK_DISPATCHER_ENTRY", dispatcher="bidask_dispatcher",
+                        route_result="FALLBACK_ENTERED")
             
             # Safe price extraction
             try:
@@ -372,33 +375,52 @@ def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
                         continue
                     # TMF near
                     if f_mon.contract and code == f_mon.contract.code:
-                        if f_ticker not in f_mon.market_data:
-                            f_mon.market_data[f_ticker] = {}
-                        f_mon.market_data[f_ticker]["bid"] = float(bid)
-                        f_mon.market_data[f_ticker]["ask"] = float(ask)
-                        f_mon.market_data[f_ticker]["close"] = mid
-                        f_mon.market_data[f_ticker]["bidask_at"] = time.time()
-                        # 2026-08-04 review item 1: feed Model C BBO (canary-gated)
+                        _before = dict(f_mon.market_data.get(f_ticker, {}) or {})
+                        # 2026-08-27 (codex review v5): NEVER write
+                        # bid/ask/bidask_at directly here.  on_bidask() is
+                        # the SINGLE validated writer (finite/positive/
+                        # non-crossed validation, canonical route,
+                        # generation_id, bidask_received_at).  A direct
+                        # write here would pollute BidAsk freshness before
+                        # validation and race the verified writer.
                         try:
                             f_mon.on_bidask(exchange, bidask)
                         except Exception:
                             pass
+                        _after = dict(f_mon.market_data.get(f_ticker, {}) or {})
+                        _trace_emit("MTS_BBO_CACHE_UPDATE", monitor_instance_identity=id(f_mon),
+                                    active_near_code=getattr(getattr(f_mon, "contract", None), "code", None),
+                                    active_far_code=getattr(getattr(f_mon, "far_contract", None), "code", None),
+                                    active_near_aliases=sorted(getattr(f_mon, "_canonical_near_codes", set()) or set()),
+                                    active_far_aliases=sorted(getattr(f_mon, "_canonical_far_codes", set()) or set()),
+                                    resolved_role="near", route_result="EXACT_NEAR_MATCH",
+                                    validation_result="BBO_VALID" if bid <= ask else "BBO_INVALID",
+                                    cache_before=_before, cache_after=_after,
+                                    cache_updated=_after != _before,
+                                    cache_update_monotonic_ns=time.monotonic_ns())
                         matched = True
                         break
                     # TMF far
                     if f_mon.far_contract and code == f_mon.far_contract.code:
                         _far_key = f"{f_ticker}_FAR"
-                        if _far_key not in f_mon.market_data:
-                            f_mon.market_data[_far_key] = {}
-                        f_mon.market_data[_far_key]["bid"] = float(bid)
-                        f_mon.market_data[_far_key]["ask"] = float(ask)
-                        f_mon.market_data[_far_key]["close"] = mid
-                        f_mon.market_data[_far_key]["bidask_at"] = time.time()
-                        # 2026-08-04 review item 1: feed Model C BBO (canary-gated)
+                        _before = dict(f_mon.market_data.get(_far_key, {}) or {})
+                        # 2026-08-27 (codex review v5): sole validated
+                        # writer is on_bidask() — see near branch note.
                         try:
                             f_mon.on_bidask(exchange, bidask)
                         except Exception:
                             pass
+                        _after = dict(f_mon.market_data.get(_far_key, {}) or {})
+                        _trace_emit("MTS_BBO_CACHE_UPDATE", monitor_instance_identity=id(f_mon),
+                                    active_near_code=getattr(getattr(f_mon, "contract", None), "code", None),
+                                    active_far_code=getattr(getattr(f_mon, "far_contract", None), "code", None),
+                                    active_near_aliases=sorted(getattr(f_mon, "_canonical_near_codes", set()) or set()),
+                                    active_far_aliases=sorted(getattr(f_mon, "_canonical_far_codes", set()) or set()),
+                                    resolved_role="far", route_result="EXACT_FAR_MATCH",
+                                    validation_result="BBO_VALID" if bid <= ask else "BBO_INVALID",
+                                    cache_before=_before, cache_after=_after,
+                                    cache_updated=_after != _before,
+                                    cache_update_monotonic_ns=time.monotonic_ns())
                         matched = True
                         break
 
@@ -873,12 +895,20 @@ def _recertify_after_reconnect(mon, api):
         return False
 
 
-def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
+def _try_shioaji_reconnect(api, fm, om, dry_run: bool,
+                          recertify: bool = True) -> bool:
     """Attempt in-process Shioaji re-login + re-subscribe after data stagnation.
 
     Returns True if reconnect succeeded and system can continue.
     Returns False if reconnect failed (network down or session expired) —
     caller should exit for PM2 restart.
+
+    recertify=True (default): re-certify to LIVE_READY inside this call
+    (existing behavior — callers that need immediate recertification).
+    recertify=False: defer recertification to the caller so the 30s
+    verification window runs BEFORE any LIVE_READY promotion (strict
+    recertify ordering, 2026-08-27 codex review).  The context stays
+    QUARANTINED until the caller recertifies after a passing window.
 
     Strategy:
     0. ATOMIC HANDOFF: quarantine all execution contexts BEFORE re-login
@@ -907,10 +937,11 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
             if not register_order_callback(api, mons, om):
                 console.print("[red]❌ Order callback restore failed — QUARANTINED[/red]")
                 return False
-            _recerts = [_recertify_after_reconnect(m, api) for m in mons]
-            if not all(_recerts):
-                console.print("[red]❌ Re-certification failed after auto-reconnect — QUARANTINED, exiting for restart[/red]")
-                return False
+            if recertify:
+                _recerts = [_recertify_after_reconnect(m, api) for m in mons]
+                if not all(_recerts):
+                    console.print("[red]❌ Re-certification failed after auto-reconnect — QUARANTINED, exiting for restart[/red]")
+                    return False
             return True
         console.print("[yellow]⚠️ Shioaji auto-reconnect still pending — attempting manual re-login[/yellow]")
 
@@ -935,15 +966,20 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
                 console.print("[red]❌ Order callback registration failed — QUARANTINED[/red]")
                 return False
 
-            # Re-subscribe all contracts (per monitor; near + far)
+            # Re-subscribe all contracts (per monitor; near + far). BBO is
+            # required for entry freshness; tick-only recovery leaves the
+            # strategy permanently stale while last trades continue.
+            from core.broker.shioaji_compat import safe_subscribe
             for m in mons:
                 if getattr(m, "contract", None):
-                    api.quote.subscribe(m.contract, quote_type='tick')
-                    console.print(f"[dim]📡 Re-subscribed: {m.contract.code}[/dim]")
+                    safe_subscribe(api, m.contract, quote_type='tick')
+                    safe_subscribe(api, m.contract, quote_type='bidask')
+                    console.print(f"[dim]📡 Re-subscribed tick+bidask: {m.contract.code}[/dim]")
                 if getattr(m, "far_contract", None):
                     try:
-                        api.quote.subscribe(m.far_contract, quote_type='tick')
-                        console.print(f"[dim]📡 Re-subscribed far: {m.far_contract.code}[/dim]")
+                        safe_subscribe(api, m.far_contract, quote_type='tick')
+                        safe_subscribe(api, m.far_contract, quote_type='bidask')
+                        console.print(f"[dim]📡 Re-subscribed far tick+bidask: {m.far_contract.code}[/dim]")
                     except Exception as _fexc:
                         console.print(f"[red]❌ Far resubscribe failed: {_fexc} — QUARANTINED[/red]")
                         _quarantine_for_handoff(handoff_targets,
@@ -965,11 +1001,14 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
             _connection_dropped = False
             # post-success: recertification proceeds (Step 5) — if it
             # fails the reconnect is a FAILURE: return False (never True
-            # on failed recertification; context stays QUARANTINED)
-            _recerts = [_recertify_after_reconnect(m, api) for m in mons]
-            if not all(_recerts):
-                console.print("[red]❌ Re-certification failed after re-login — QUARANTINED, exiting for restart[/red]")
-                return False
+            # on failed recertification; context stays QUARANTINED).
+            # recertify=False defers this to the caller (verification
+            # window runs first — strict ordering).
+            if recertify:
+                _recerts = [_recertify_after_reconnect(m, api) for m in mons]
+                if not all(_recerts):
+                    console.print("[red]❌ Re-certification failed after re-login — QUARANTINED, exiting for restart[/red]")
+                    return False
             return True
 
         except Exception as e:
@@ -982,6 +1021,229 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
     console.print("[red]❌ All re-login attempts failed — network may be down[/red]")
     _quarantine_for_handoff(handoff_targets, reason="RECONNECT_LOGIN_FAILED")
     return False
+
+
+def _shutdown_exit_code(reason: str) -> int:
+    """Map lifecycle shutdown causes to supervisor-visible exit codes."""
+    if reason == "RECOVERABLE_SESSION_LOSS":
+        return 75
+    if reason.startswith("SIGNAL_") or reason == "OPERATOR_STOP":
+        return 0
+    return 1
+
+
+def _feed_stale_session_decision(api, monitors, feed_health,
+                                   try_reconnect, verify_window,
+                                   market_open=True,
+                                   health_check_now=None,
+                                   health_interval=300):
+    """Feed-stale decision, session-first (2026-08-27 Phase 1).
+
+    Returns one of:
+      "keep_alive" — market closed / recess: stay alive, no action
+      "degrade"    — session HEALTHY but feed stale (low-volume silence):
+                     degrade in place, NEVER exit
+      "resume"     — session down -> reconnect ok -> verify window pass:
+                     resume monitoring (entry stays blocked until
+                     recertification; exits are untouched)
+      "exit"       — reconnect failed OR verification window failed:
+                     exit to human supervision
+
+    Pure decision: recovery hooks are injected (testable without booting
+    the main loop).  Never touches entry/exit layers directly.
+    """
+    if not market_open:
+        return "keep_alive"
+    _bh = api_is_healthy(api)
+    # A broker query can be reported as DEGRADED after the underlying session
+    # has died. Combine that state with stale futures data as a second signal;
+    # a live feed still degrades in place.
+    _feed_stale = False
+    try:
+        _ages = (feed_health.snapshot() or {}).get("ages", {})
+        _feed_stale = float(_ages.get("MXF", float("inf"))) > 300.0
+    except (AttributeError, TypeError, ValueError):
+        _feed_stale = False
+
+    # A SESSION-level state always triggers reconnect. DEGRADED /
+    # TRANSIENT_FAILURE are broker-query-level when the stream (Tick/BidAsk)
+    # is healthy; they must remain degrade-only in that case. When the
+    # futures feed is also stale, the conjunction is session-level evidence.
+    # SESSION_INVALID is always session-down; PROCESS_RESTART_REQUIRED is
+    # auth exhaustion (handled above in the main loop, but kept
+    # session-level here too for the pure decision). DEGRADED/
+    # TRANSIENT_FAILURE join this set only when futures data is also stale.
+    _session_down = _bh in (
+        "SESSION_INVALID", "PROCESS_RESTART_REQUIRED",
+    ) or (_bh in ("DEGRADED", "TRANSIENT_FAILURE") and _feed_stale)
+    if not _session_down:
+        return "degrade"
+    if try_reconnect(api, monitors, None, False):
+        if verify_window(monitors, api, duration_s=30, interval_s=5):
+            return "resume"
+    return "exit"
+
+
+def _verify_reconnect_window(monitors, api, duration_s=30, interval_s=5,
+                           quarantine_callable=None):
+    """Post-reconnect verification window (2026-08-27 Phase 1, codex-approved).
+
+    After _try_shioaji_reconnect(..., recertify=False) succeeds, the system
+    must NOT resume monitoring immediately: it runs a bounded verification
+    window first (MONOTONIC clock — NTP steps must not truncate it).
+
+    Checks every `interval_s` seconds for `duration_s`:
+      1. session ready  — api_is_healthy(api) returns a healthy state
+      2. per-leg BidAsk callbacks live — near AND far market_data slots'
+         bidask_at must advance across the window (a monitor-level tick
+         timestamp can hide a dead far BidAsk subscription)
+      3. BBO valid on BOTH legs — bid/ask finite, positive, ask >= bid
+         (non-crossed), bidask_at present (entry-freshness contract)
+      4. generation fencing — every BBO slot must carry generation_id ==
+         the CURRENT session_registry generation for this api (stale
+         generation caches are rejected)
+
+    Entry stays blocked during the window: `quarantine_callable` is
+    invoked on EVERY interval (idempotent re-assert of QUARANTINED /
+    live_order_allowed=False) so a premature recertify cannot unblock
+    entry mid-window.  Policy J / stop-loss / emergency exit run in the
+    strategy layer and are NEVER touched.  True only if the whole window
+    passes; any violation -> False (caller exits to human supervision).
+    """
+    _deadline = time.monotonic() + duration_s
+    # per-leg BidAsk liveness: record each slot's bidask_at at window start
+    _base_bidask = {}
+    for m in monitors:
+        _md = getattr(m, "market_data", {}) or {}
+        for _code in _leg_codes(m):
+            # BidAsk liveness uses bidask_received_at (monotonic, written
+            # ONLY by on_bidask).  NEVER bidask_at — the tick path wrote
+            # that in earlier revisions and must not fake BidAsk
+            # freshness (codex review v4).
+            _base_bidask[(id(m), _code)] = (
+                (_md.get(_code) or {}).get("bidask_received_at") or 0.0)
+    _saw_advance = {k: False for k in _base_bidask}
+    while time.monotonic() < _deadline:
+        # 0. entry stays blocked for the whole window (idempotent)
+        if quarantine_callable is not None:
+            try:
+                quarantine_callable()
+            except Exception:
+                return False
+        # 1. session ready
+        _h = api_is_healthy(api)
+        if _h not in ("HEALTHY", "OK", "healthy", "ok", "RECOVERING"):
+            console.print(
+                f"[red]⛔ [RECONNECT_VERIFY] session not ready: {_h}[/red]")
+            return False
+        for m in monitors:
+            _md = getattr(m, "market_data", {}) or {}
+            # 3. BBO valid on BOTH legs + 4. generation fencing
+            for _code in _leg_codes(m):
+                _slot = _md.get(_code) or {}
+                if not _valid_leg_bbo(_slot):
+                    console.print(
+                        f"[red]⛔ [RECONNECT_VERIFY] {_code} invalid BBO "
+                        f"({_bbo_invalid_reason(_slot)})[/red]")
+                    return False
+                if not _bbo_matches_generation(_slot, api):
+                    console.print(
+                        f"[red]⛔ [RECONNECT_VERIFY] {_code} stale-generation "
+                        f"BBO (slot gen != current)[/red]")
+                    return False
+                # 2. per-leg BidAsk advance vs window start (monotonic
+                #    receive timestamp — tick writes must NOT count)
+                _at = _slot.get("bidask_received_at") or 0.0
+                if _at > _base_bidask.get((id(m), _code), 0.0):
+                    _saw_advance[(id(m), _code)] = True
+            # generation confirm (ctx binding still current)
+            _cf = getattr(m, "_confirm_session_generation", None)
+            if callable(_cf):
+                try:
+                    if not _cf():
+                        console.print(
+                            f"[red]⛔ [RECONNECT_VERIFY] session generation "
+                            f"mismatch[/red]")
+                        return False
+                except Exception:
+                    return False
+        time.sleep(interval_s)
+    # every near+far slot must have seen at least one BidAsk advance
+    for _k, _saw in _saw_advance.items():
+        if not _saw:
+            console.print(
+                f"[red]⛔ [RECONNECT_VERIFY] slot {_k[1]} no BidAsk advance "
+                f"in window[/red]")
+            return False
+    console.print("[green]✅ [RECONNECT_VERIFY] verification window passed[/green]")
+    return True
+
+
+def _leg_codes(mon):
+    """Near + far market_data slot codes for a monitor (contract codes +
+    <ticker>_FAR naming)."""
+    _codes = []
+    for _contract in (getattr(mon, "contract", None),
+                      getattr(mon, "far_contract", None)):
+        _c = getattr(_contract, "code", None)
+        if _c:
+            _codes.append(_c)
+    _ticker = getattr(mon, "ticker", "") or ""
+    if _ticker:
+        _codes.append(f"{_ticker}_FAR")
+    return _codes
+
+
+def _valid_leg_bbo(slot):
+    """BBO validity: bid/ask finite, positive, ask >= bid (non-crossed),
+    bidask_at present."""
+    _b, _a, _at = (slot.get("bid"), slot.get("ask"), slot.get("bidask_at"))
+    if not (_b and _a and _at):
+        return False
+    try:
+        _bf, _af = float(_b), float(_a)
+    except (TypeError, ValueError):
+        return False
+    import math as _m
+    if not (_m.isfinite(_bf) and _m.isfinite(_af)):
+        return False
+    if _bf <= 0 or _af <= 0:
+        return False
+    if _af < _bf:
+        return False
+    return True
+
+
+def _bbo_invalid_reason(slot):
+    _b, _a, _at = (slot.get("bid"), slot.get("ask"), slot.get("bidask_at"))
+    if not (_b and _a and _at):
+        return "MISSING"
+    try:
+        _bf, _af = float(_b), float(_a)
+    except (TypeError, ValueError):
+        return "NON_NUMERIC"
+    import math as _m
+    if not (_m.isfinite(_bf) and _m.isfinite(_af)):
+        return "NON_FINITE"
+    if _bf <= 0 or _af <= 0:
+        return "NON_POSITIVE"
+    if _af < _bf:
+        return "CROSSED"
+    return "OK"
+
+
+def _bbo_matches_generation(slot, api):
+    """BBO cache generation fencing: slot.generation_id must equal the
+    current session_registry generation for this api.  A slot written by
+    a PREVIOUS generation (stale subscription) is rejected."""
+    try:
+        from core.live_route_certificate import session_registry
+        _gen = session_registry.generation(api)
+        if not _gen:
+            return False  # no current generation -> cannot fence
+        return str(slot.get("generation_id") or "") == str(_gen)
+    except Exception:
+        return False
 
 
 def _setup_event_callback(api, fm, om):
@@ -1160,6 +1422,7 @@ def run_system(dry_run=False, config_name="futures"):
             )
             time.sleep(_delay)
 
+    _shutdown_reason = "MAIN_LOOP_RETURNED"
     try:
         if not dry_run:
             api = get_api()
@@ -1574,6 +1837,7 @@ def run_system(dry_run=False, config_name="futures"):
                     console.print(f"[bold red]💥 Restart failed: {e}[/bold red]")
                     import traceback
                     console.print(traceback.format_exc())
+                    _shutdown_reason = "RECOVERABLE_SESSION_LOSS"
                     break
 
             now = time.time()
@@ -1622,6 +1886,7 @@ def run_system(dry_run=False, config_name="futures"):
                     continue
                 else:
                     console.print("[red]💀 Reconnect failed — exiting for PM2 restart[/red]")
+                    _shutdown_reason = "RECOVERABLE_SESSION_LOSS"
                     break
             elif stale_secs > (stale_limit * 0.6) and not stagnation_warned:
                 console.print(f"[bold yellow]⚠️ DATA WARNING: No data for {stale_secs/60:.1f} mins. Watching...[/bold yellow]")
@@ -1635,6 +1900,7 @@ def run_system(dry_run=False, config_name="futures"):
                 _bh_state = api_is_healthy(api)
                 if _bh_state == "PROCESS_RESTART_REQUIRED":
                     console.print("[red]💀 Broker session unrecoverable (relogin exhausted) — exiting for external supervisor[/red]")
+                    _shutdown_reason = "RECOVERABLE_SESSION_LOSS"
                     break
                 elif _bh_state in ("SESSION_INVALID", "DEGRADED", "TRANSIENT_FAILURE"):
                     console.print(f"[yellow]⚠️ Broker health: {_bh_state} — entry blocked, feed/risk continue[/yellow]")
@@ -1671,11 +1937,74 @@ def run_system(dry_run=False, config_name="futures"):
                         health_check_at = now + HEALTH_INTERVAL
                         time.sleep(2)
                         continue
+                    # ── 2026-08-27 Phase 1 (codex-approved): session health
+                    # takes priority over tick age (see
+                    # _feed_stale_session_decision).  Low-volume silence with
+                    # a healthy session degrades in place, never exits.
+                    _decision = _feed_stale_session_decision(
+                        api, futures_mons, feed_health,
+                        try_reconnect=lambda _a, _fm, _om, _dr:
+                            _try_shioaji_reconnect(
+                                _a, _fm, _om if 'om' in dir() else None, _dr,
+                                recertify=False),
+                        verify_window=lambda _mons, _a, duration_s, interval_s:
+                            _verify_reconnect_window(
+                                _mons, _a, duration_s=duration_s,
+                                interval_s=interval_s,
+                                quarantine_callable=lambda:
+                                    _quarantine_for_handoff(
+                                        _reconnect_monitors(futures_mons))),
+                        market_open=is_taifex_futures_market_open(),
+                    )
+                    if _decision == "keep_alive":
+                        health_check_at = now + HEALTH_INTERVAL
+                        time.sleep(2)
+                        continue
+                    if _decision == "degrade":
+                        console.print(
+                            "[yellow]Feed stale but session healthy — "
+                            "degrading, NOT exiting (night-session "
+                            "low-volume guard)[/yellow]")
+                        health_check_at = now + HEALTH_INTERVAL
+                        time.sleep(2)
+                        continue
+                    if _decision == "resume":
+                        # verification window PASSED — recertify NOW so the
+                        # context leaves QUARANTINED only after the window
+                        # proved session/callback/BBO/generation health.
+                        # (quarantine_callable kept it blocked throughout.)
+                        _recerts = [_recertify_after_reconnect(m, api)
+                                    for m in _reconnect_monitors(futures_mons)]
+                        if not all(_recerts):
+                            console.print(
+                                "[red]❌ Recertification failed after "
+                                "verification window — exiting for human "
+                                "supervision[/red]")
+                            console.print(
+                                "[bold red]Feed stale — exiting for external "
+                                "supervisor: " + "; ".join(problems) +
+                                "[/bold red]")
+                            _shutdown_reason = "RECOVERABLE_SESSION_LOSS"
+                            break
+                        console.print(
+                            "[green]✅ Controlled recovery complete — "
+                            "resuming monitoring[/green]")
+                        for bucket in ['TX', 'MXF', 'OPTIONS']:
+                            feed_health.last_tick_ts[bucket] = time.time()
+                        last_data_at = time.time()
+                        health_check_at = now + HEALTH_INTERVAL
+                        time.sleep(2)
+                        continue
+                    # "exit"
+                    console.print(
+                        "[red]❌ Controlled recovery failed — exiting "
+                        "for human supervision[/red]")
                     console.print(
                         "[bold red]Feed stale — exiting for external supervisor: "
                         + "; ".join(problems)
                         + "[/bold red]"
                     )
+                    _shutdown_reason = "RECOVERABLE_SESSION_LOSS"
                     break
 
                 health_check_at = now + HEALTH_INTERVAL
@@ -1697,8 +2026,12 @@ def run_system(dry_run=False, config_name="futures"):
         _rec = _lifecycle_recorder
         if _rec is not None:
             try:
-                _rec.set_shutdown_cause("MAIN_LOOP_RETURNED", "MAIN_LOOP")
-                _rec.record_event("MAIN_LOOP_RETURNED")
+                _rec.set_shutdown_cause(_shutdown_reason, "MAIN_LOOP")
+                _rec.record_event(
+                    "MAIN_LOOP_RETURNED",
+                    shutdown_reason=_shutdown_reason,
+                    pm2_exit_code=_shutdown_exit_code(_shutdown_reason),
+                )
                 _rec.record_event("SHUTDOWN_BEGIN")
             except Exception:
                 pass
@@ -1783,6 +2116,9 @@ def run_system(dry_run=False, config_name="futures"):
             console.print(f"[dim]Cleanup error: {e}[/dim]")
             # Still sleep to reduce C++ crash risk
             time.sleep(2)
+
+    if _shutdown_reason != "MAIN_LOOP_RETURNED":
+        raise SystemExit(_shutdown_exit_code(_shutdown_reason))
     
 def main():
     """Main entry point with macOS signal handling."""

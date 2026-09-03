@@ -21,9 +21,15 @@ from strategies.stocks.position_state import (
     merge_recovery,
 )
 
-ROOT = Path(__file__).parent.parent.parent
-MKT_LOGS = ROOT / "logs" / "market_data"
-TRADE_LOGS = ROOT / "exports" / "trades"
+# 2026-08-18 Gemini CLI: 統一對齊 TRADING_RUNTIME_DIR 數據總線 (runtime_paths SSOT)
+try:
+    from core.runtime_paths import runtime_path, runtime_logs
+    MKT_LOGS = Path(runtime_logs("market_data"))
+    TRADE_LOGS = Path(runtime_path("exports", "trades"))
+except ImportError:
+    ROOT = Path(__file__).parent.parent.parent
+    MKT_LOGS = ROOT / "logs" / "market_data"
+    TRADE_LOGS = ROOT / "exports" / "trades"
 MKT_LOGS.mkdir(parents=True, exist_ok=True)
 TRADE_LOGS.mkdir(parents=True, exist_ok=True)
 
@@ -319,18 +325,42 @@ class StockMonitor:
         return False
 
     def _update_market_regime(self):
-        """用加權指數 EMA 判斷大盤多空"""
+        """用加權指數 (IX0001) 或台指期 EMA 判斷大盤多空
+        2026-08-18 Gemini CLI: 修正加權指數合約代碼為 IX0001 (發行量加權股價指數)，並加入台指期 Fallback
+        """
         if not self.bear_defense:
             return
         try:
-            taiex = self.api.Contracts.Indexs.TSE["001"]
+            taiex = None
+            if hasattr(self.api.Contracts, "Indexs") and hasattr(self.api.Contracts.Indexs, "TSE"):
+                for code in ["IX0001", "001", "TSE001"]:
+                    try:
+                        taiex = self.api.Contracts.Indexs.TSE[code]
+                        if taiex:
+                            break
+                    except (KeyError, IndexError):
+                        continue
+            
+            if taiex is None:
+                # Fallback: 嘗試透過 ContractResolver 取得台指期連續月合約作為大盤參考
+                try:
+                    from core.contract_resolver import ContractResolver
+                    cr = ContractResolver(self.api)
+                    taiex = cr.resolve_futures("TXF")
+                except Exception:
+                    pass
+
+            if taiex is None:
+                console.print("[yellow]⚠️ 無法解析大盤指標合約 (IX0001/TXF)，維持既有市場狀態[/yellow]")
+                return
+
             start = (datetime.now() - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
             kbars = self.api.kbars(taiex, start=start)
             df = pd.DataFrame({**kbars})
             if len(df) < self.market_ema_length:
                 return
             df["ema"] = df["Close"].ewm(span=self.market_ema_length, adjust=False).mean()
-            self.is_bear_market = df["Close"].iloc[-1] < df["ema"].iloc[-1]
+            self.is_bear_market = bool(df["Close"].iloc[-1] < df["ema"].iloc[-1])
             tag = "🐻 空頭" if self.is_bear_market else "🐂 多頭"
             console.print(f"[dim]📊 大盤 regime: {tag} (Close={df['Close'].iloc[-1]:.0f}, EMA{self.market_ema_length}={df['ema'].iloc[-1]:.0f})[/dim]")
         except Exception as e:
@@ -710,13 +740,15 @@ class StockMonitor:
                     })
 
                 # --- B. Entry Filter (Market Gate + Edge Model) ---
+                # 2026-08-18 Gemini CLI: 傳入 StockMonitor 由加權指數 (IX0001) / 台指期判斷之大盤多空作為 Fallback
                 if res and res["action"] == "BUY" and not self._check_bear_defense():
                     from strategies.stocks.market_gate import get_gate_result, strategy_allowed
-                    gate_res = get_gate_result()
+                    current_regime = "BEAR" if self.is_bear_market else "BULL"
+                    gate_res = get_gate_result(fallback_regime=current_regime)
                     if not gate_res.allowed:
                         console.print(f"[dim]🚫 Market gate {gate_res.gate} — skip {ticker} ({gate_res.reason})[/dim]")
                         continue
-                    if not strategy_allowed(self.strat_name):
+                    if not strategy_allowed(self.strat_name, regime=gate_res.regime):
                         console.print(f"[dim]🚫 Strategy {self.strat_name} not allowed in current regime — skip {ticker}[/dim]")
                         continue
                     

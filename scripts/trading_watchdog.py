@@ -17,7 +17,8 @@ from datetime import datetime, timezone
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
-STATE_PATH = "/tmp/mts_position_state.json"
+from core.runtime_paths import mts_position_state_path
+STATE_PATH = mts_position_state_path()
 OUT_PATH = "/tmp/trading_watchdog_state.json"
 FLAG_PATH = "/tmp/trading_watchdog_alert.flag"
 LOG_PATH = os.path.join(BASE, "logs", "watchdog.log")

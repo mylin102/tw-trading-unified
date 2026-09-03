@@ -5,7 +5,13 @@ tw-trading-unified — 整合儀表板 v2
 """
 import sys
 from pathlib import Path as _Path
-from core.runtime_paths import runtime_logs, runtime_path
+from core.runtime_paths import (
+    runtime_logs,
+    runtime_path,
+    mts_position_state_path,
+    runtime_id,
+    validate_runtime_state,
+)
 sys.path.insert(0, str(_Path(__file__).parent.parent))
 from core.runtime_paths import enforce_runtime_identity
 enforce_runtime_identity(__file__)
@@ -84,6 +90,25 @@ if str(ROOT) not in sys.path:
 
 # Load environment variables early
 load_dotenv(Path(__file__).parent.parent / ".env")
+
+
+def _read_canonical_mts_state() -> tuple[dict | None, str, str]:
+    """Read only the canonical runtime state and fail closed on identity."""
+    try:
+        _path = mts_position_state_path()
+    except Exception:
+        return None, "STATE_UNAVAILABLE", "<unresolved>"
+    if not os.path.isfile(_path):
+        return None, "STATE_UNAVAILABLE", _path
+    try:
+        with open(_path, encoding="utf-8") as _f:
+            _state = json.load(_f)
+    except Exception:
+        return None, "STATE_UNAVAILABLE", _path
+    _valid, _reason = validate_runtime_state(_state)
+    if not _valid:
+        return None, _reason, _path
+    return _state, "OK", _path
 
 
 # ── [weak_bear_trend Monitor] Import auto_select monitoring panel ──
@@ -231,7 +256,7 @@ TRADE_DATE_STR = get_trade_day(datetime.datetime.now()).strftime("%Y%m%d")
 TODAY = datetime.datetime.now().strftime("%Y-%m-%d")
 
 # ── Session detection (used by sidebar + config loading) ──
-from core.date_utils import is_night_session
+from core.date_utils import is_night_session, is_taifex_futures_market_open
 _CURRENT_SESSION_NIGHT = is_night_session(datetime.datetime.now())
 FUTURES_CFG_NAME = "futures.yaml"
 
@@ -303,16 +328,29 @@ with st.sidebar:
     
     ver_tag = " (Rust)" if is_rust_version() else " (Legacy)"
     st.caption(f"🚀 Shioaji API: {sj.__version__}{ver_tag}")
-    st.markdown(f"🗓️ **交易日 (Trading Day)**")
-    st.code(f"{DATE_STR[:4]}-{DATE_STR[4:6]}-{DATE_STR[6:]}")
+    st.markdown("🗓️ **自然日 (Calendar Date)**")
+    st.code(TODAY)
+    st.caption(
+        f"期貨交易日 (Futures Trading Day)：{DATE_STR[:4]}-{DATE_STR[4:6]}-{DATE_STR[6:]}"
+        + (" · 本夜盤歸屬下一交易日" if _CURRENT_SESSION_NIGHT else "")
+    )
     
     # 💡 GSD: Continuous Chart Mode toggle
     cont_mode = st.toggle("🕒 連續圖表模式", value=True, help="顯示最近 24 小時資料，而非僅今日交易日。")
     
     st.markdown(f"🕒 **最後更新**: {datetime.datetime.now().strftime('%H:%M:%S')}")
-    # Session indicator
-    _session_label = "🌙 夜盤" if _CURRENT_SESSION_NIGHT else "☀️ 日盤"
-    _session_color = "#7c3aed" if _CURRENT_SESSION_NIGHT else "#f59e0b"
+    # Session indicator: distinguish an inter-session close from a weekend or
+    # holiday closure instead of inferring state from day/night alone.
+    _now_hhmm = int(datetime.datetime.now().strftime("%H%M"))
+    _market_is_open = is_taifex_futures_market_open()
+    _between_sessions = (500 <= _now_hhmm < 845) or (1346 <= _now_hhmm < 1500)
+    if _market_is_open:
+        _session_label = "🌙 夜盤" if _CURRENT_SESSION_NIGHT else "☀️ 日盤"
+        _session_color = "#7c3aed" if _CURRENT_SESSION_NIGHT else "#f59e0b"
+    elif _between_sessions:
+        _session_label, _session_color = "⏸️ 收盤", "#64748b"
+    else:
+        _session_label, _session_color = "⛔ 休市", "#dc2626"
     st.markdown(f"<span style='color:{_session_color};font-weight:bold'>{_session_label}</span> — 設定檔: `{FUTURES_CFG_NAME}`", unsafe_allow_html=True)
 
     # Cross-process safety status. Dashboard is read-only: it must never
@@ -861,6 +899,20 @@ def _hvwap_panel_markdown(p: dict) -> str:
                        "（需同 session 內至少兩個相隔 ≥600 秒的完成 VWAP 點；"
                        "暖機期間不判定）</span>")
 
+    def _vote_value(name, fallback):
+        """Color the directional result without changing DATA_VALID semantics."""
+        _vote = (_h.get("voters") or {}).get(name) or {}
+        _value = _vote.get("directional_state") or fallback or "UNKNOWN"
+        if _vote.get("support") is True:
+            _color = "#15803d"
+        elif _vote.get("conflict") is True:
+            _color = "#b91c1c"
+        elif _vote.get("neutral") is True or _value in ("UNKNOWN", "—"):
+            _color = "#b45309"
+        else:
+            _color = "#b91c1c"
+        return f"<span style='color:{_color};font-weight:bold;'>{_value}</span>"
+
     _hl = []
     _hl.append(
         "<div style='border:1px solid #94a3b8; border-radius:6px; "
@@ -900,6 +952,8 @@ def _hvwap_panel_markdown(p: dict) -> str:
         f"當前趨勢反轉訊號：<b style='color:{'#15803d' if _reversal_ready else '#64748b'}'>"
         f"{'READY' if _reversal_ready else '未確認'}</b></div>")
     _prov = _h.get("regime_60m_provenance") or "—"
+    _block_reason_display = str(_h.get("block_reason") or "—").replace(
+        "2OF3", "2-of-3")
     _baseline_state = "ACTIVE" if _baseline.get("enabled") else "REFERENCE ONLY"
     _hl.append(
         "<div style='margin-top:5px; padding:5px 7px; background:#f8fafc; "
@@ -907,13 +961,14 @@ def _hvwap_panel_markdown(p: dict) -> str:
         f"<b>📊 判定來源分層</b>　Baseline（參考）：<b>{_baseline_state}</b>，"
         f"pass={_baseline.get('pass_release')}、leg={_baseline.get('release_leg') or '—'}<br>"
         f"MTS 2.0（最終）：<b>{_h.get('status') or 'UNKNOWN'}</b>，"
-        f"60m={_h.get('regime_60m') or 'UNKNOWN'}、15m={_h.get('signal_15m') or 'UNKNOWN'}、"
+        f"60m={_vote_value('60m_regime', _h.get('regime_60m'))}、"
+        f"15m={_vote_value('15m_direction', _h.get('signal_15m'))}、"
         f"VWAP+slope={_vwap_state}、"
         f"5m={_h.get('consecutive_confirmed_bars') or 0}/2、"
-        f"arbitration={_h.get('arbitration_score') if _h.get('arbitration_score') is not None else '—'}、"
+        f"仲裁=2-of-3，score={_h.get('arbitration_score') if _h.get('arbitration_score') is not None else '—'}、"
         f"provenance={_prov}<br><b>最終允許：</b>"
         f"{'允許趨勢判定' if _h.get('status') == 'ALIGNED_PASS' else '不允許 release'}；"
-        f"原因={_h.get('block_reason') or '—'}</div>")
+        f"原因={_block_reason_display}</div>")
     _voters = _h.get("voters") or {}
     _vc = (f"support={_h.get('support_count', 0)} · "
            f"conflict={_h.get('conflict_count', 0)} · "
@@ -941,10 +996,11 @@ def _hvwap_panel_markdown(p: dict) -> str:
     _hl.append(
         f"<div style='margin-top:2px;'>狀態: "
         f"<b style='color:{_hvwap_status_color(_h['status'])}'>{_h['status']}</b>"
-        f"{' · ' + str(_h['block_reason']) if _h['block_reason'] else ''}"
-        f" &nbsp;|&nbsp; 60m: {_h['regime_60m'] or '—'}"
-        f" &nbsp;|&nbsp; 15m: {_h['signal_15m'] or '—'}"
-        f" &nbsp;|&nbsp; 5m 確認: x{_h['consecutive_confirmed_bars'] or 0}"
+        f"{' · ' + _block_reason_display if _h['block_reason'] else ''}"
+        f" &nbsp;|&nbsp; 60m: {_vote_value('60m_regime', _h['regime_60m'])}"
+        f" &nbsp;|&nbsp; 15m: {_vote_value('15m_direction', _h['signal_15m'])}"
+        f" &nbsp;|&nbsp; 5m 確認: <span style='color:{'#15803d' if _bars_ok else '#b91c1c'};font-weight:bold;'>"
+        f"x{_h['consecutive_confirmed_bars'] or 0}/2</span>"
         f" &nbsp;|&nbsp; 完整度: {_fresh} ({_h['n_completed_5m_bars'] or 0} bars)"
         f" &nbsp;|&nbsp; quote age: {_f(_h['quote_age_ms'], 'ms', 0)}</div>")
     _hl.append(
@@ -4240,7 +4296,7 @@ if page == "總覽":
             c3.metric("Bars", len(f_df))
         else:
             # ── No indicator data: show live MTS near/far prices ──
-            _mts_f = "/tmp/mts_position_state.json"
+            _mts_f = mts_position_state_path()
             _nl = None
             _fl = None
             try:
@@ -4330,7 +4386,7 @@ if page == "總覽":
     else:
         # Fallback: show MTS live price as a horizontal line
         try:
-            _mts_pf = "/tmp/mts_position_state.json"
+            _mts_pf = mts_position_state_path()
             if os.path.exists(_mts_pf):
                 with open(_mts_pf) as _pf:
                     _ps = json.load(_pf)
@@ -4501,14 +4557,19 @@ elif _selected_product == "TMF":
         # 💡 Gemini CLI: Use get_session_date_str and is_taifex_futures_market_open to accurately map night session to trading day
         from core.date_utils import get_taifex_futures_session_type, get_session_date_str, is_taifex_futures_market_open
         session_type = get_taifex_futures_session_type()
-        session_label = "夜盤" if session_type == "night" else ("日盤" if session_type == "day" else "收盤")
+        _clock_hhmm = int(datetime.datetime.now().strftime("%H%M"))
+        _market_open = is_taifex_futures_market_open()
+        _between_sessions = (500 <= _clock_hhmm < 845) or (1346 <= _clock_hhmm < 1500)
+        session_label = (
+            ("夜盤" if session_type == "night" else "日盤")
+            if _market_open else ("收盤" if _between_sessions else "休市")
+        )
 
         # 資料新鮮度閾值：日盤 15 分鐘、夜盤 15 分鐘
         stale_threshold = 15.0
         data_fresh = age_mins < stale_threshold
         _last_trading_day = get_session_date_str(last_ts.to_pydatetime()) if pd.notna(last_ts) else None
         _same_trading_day = _last_trading_day == _today
-        _market_open = is_taifex_futures_market_open() or session_type in ("day", "night")
 
         _live_quote = read_mts_quote_freshness()
         _bar_label = (
@@ -4633,7 +4694,7 @@ elif _selected_product == "TMF":
 
             if st.button("🗑️ MTS 清空紀錄", key="mts_clear_logs", type="secondary", width='stretch'):
                 # ── Safety guards: only allow when flat + idle ──
-                _state_file = "/tmp/mts_position_state.json"
+                _state_file = mts_position_state_path()
                 _has_pos = False
                 _has_lifecycle = False
                 if os.path.exists(_state_file):
@@ -4699,7 +4760,7 @@ elif _selected_product == "TMF":
 
         # ── MTS Account Settings ──
         with st.expander("⚙️ MTS 帳戶設定", expanded=False):
-            _state_file = "/tmp/mts_position_state.json"
+            _state_file = mts_position_state_path()
             _current_init = 100000
             if os.path.exists(_state_file):
                 try:
@@ -4769,7 +4830,7 @@ elif _selected_product == "TMF":
                     st.rerun()
 
         # 2026-05-22 Gemini CLI: Add MTS manual trade status banner
-        _mts_state_file = "/tmp/mts_position_state.json"
+        _mts_state_file = mts_position_state_path()
         if os.path.exists(_mts_state_file):
             try:
                 with open(_mts_state_file) as _f:
@@ -5017,7 +5078,7 @@ elif _selected_product == "TMF":
         print(f"[PERF] indicator_table: {time.time()-_pt_data:.3f}s")
     else:
         # ── No indicator data: show live MTS near/far prices as fallback ──
-        _mts_price_file = "/tmp/mts_position_state.json"
+        _mts_price_file = mts_position_state_path()
         _near_live = None
         _far_live = None
         try:
@@ -5056,11 +5117,42 @@ elif _selected_product == "TMF":
                     _f.write(_flag)
                 st.warning("🚨 緊急平倉指令已送出！")
 
+    # ── MTS quick state (before the slow calendar chart) ──
+    # Keep the operator-facing position visible even while calendar data is
+    # loading. This is read-only and uses the same canonical fail-closed
+    # resolver as the detailed MTS section below.
+    _quick_is_live_runtime = bool(
+        active_runtime_truth.get("is_live_runtime")
+        or active_runtime_truth.get("is_exit_only_runtime")
+        or active_runtime_truth.get("profile_identity") == "futures_live.yaml"
+        or active_runtime_truth.get("requested_mode") == "live"
+    )
+    _quick_mts_state, _quick_mts_status, _quick_mts_path = (
+        _read_canonical_mts_state() if not _quick_is_live_runtime
+        else (None, "LIVE_BROKER_SCOPE", "—")
+    )
+    st.subheader("📌 MTS 即時持倉摘要")
+    if isinstance(_quick_mts_state, dict):
+        _quick_has_pos = bool(_quick_mts_state.get("has_position"))
+        _q1, _q2, _q3, _q4 = st.columns(4)
+        _q1.metric("狀態", _quick_mts_state.get("state", "UNKNOWN"))
+        _q2.metric("近月 UPL", f'{float(_quick_mts_state.get("near_upl", 0) or 0):+,.0f} TWD')
+        _q3.metric("遠月 UPL", f'{float(_quick_mts_state.get("far_upl", 0) or 0):+,.0f} TWD')
+        _q4.metric("總 UPL", f'{float(_quick_mts_state.get("total_upl", 0) or 0):+,.0f} TWD')
+        st.caption(
+            f"trade_id={_quick_mts_state.get('trade_id', 'N/A')} · "
+            f"{'雙腿持倉' if _quick_has_pos else 'FLAT'} · "
+            f"state_path={_quick_mts_path}")
+    else:
+        st.error(
+            f"⚠️ MTS 狀態不可用：{_quick_mts_status} · "
+            f"state_path={_quick_mts_path} · 不使用 legacy/tmp fallback。")
+
     # ── Calendar Spread 顯示 ──
     ft, _ = load_futures_trades()
-    st.header("📊 日曆價差分析 (Calendar Spread)")
+    st.caption("📊 日曆價差分析暫停載入（診斷中）")
     
-    with st.expander("📈 價差圖表與策略條件", expanded=True):
+    if False:  # Rendered at the bottom after MTS/performance sections.
         # 載入 calendar spread 資料
         spread_df = load_calendar_spread_data()
         
@@ -5338,7 +5430,7 @@ elif _selected_product == "TMF":
         _mts_telemetry = {}
         try:
             _mts_telemetry = json.loads(
-                Path("/tmp/mts_position_state.json").read_text())
+                Path(mts_position_state_path()).read_text())
         except Exception:
             pass
         _broker_mts_state = _build_flat_broker_mts_state(_mts_telemetry)
@@ -5346,15 +5438,33 @@ elif _selected_product == "TMF":
     # that stale file was the source of phantom Policy J/UPL after a broker
     # flat reconciliation.  PAPER compatibility remains unchanged.
     # Historical contract marker: _mts_state_file = (None if (_exit_only_dashboard or _live_runtime)
-    _mts_state_file = None if _live_runtime else "/tmp/mts_position_state.json"
+    _mts_state_file = None if _live_runtime else mts_position_state_path()
+    _canonical_paper_state, _paper_state_status, _resolved_state_path = (
+        _read_canonical_mts_state()
+        if not _live_runtime else (None, "LIVE_BROKER_SCOPE", _mts_state_file or "—")
+    )
+    if _paper_state_status not in {"OK", "LIVE_BROKER_SCOPE"} and not _live_runtime:
+        st.error(
+            f"⚠️ MTS state blocked: {_paper_state_status} · "
+            f"resolved_path={_resolved_state_path} · runtime_id={runtime_id()}"
+        )
+    _identity_state = _canonical_paper_state or {}
+    st.caption(
+        "Runtime diagnostics · "
+        f"state_path={_resolved_state_path} · "
+        f"runtime_id={_identity_state.get('runtime_id', runtime_id())} · "
+        f"writer={_identity_state.get('writer_identity', 'UNKNOWN')} · "
+        f"generation={_identity_state.get('generation', 'UNKNOWN')} · "
+        f"schema={_identity_state.get('runtime_state_schema', 'UNKNOWN')}"
+    )
     if _exit_only_dashboard:
         _mts_state_file = None
-    if _broker_mts_state is not None or (_mts_state_file and os.path.exists(_mts_state_file)):
+    _mts_panel_rendered = False
+    if _broker_mts_state is not None or _canonical_paper_state is not None:
         try:
             _mts_state = _broker_mts_state
             if _mts_state is None:
-                with open(_mts_state_file) as _f:
-                    _mts_state = json.loads(_f.read())
+                _mts_state = _canonical_paper_state
             # EXIT_REMAINING is an intent emitted before fill confirmation.
             # Only a confirmed fill/settlement may clear stale paper state.
             _trade_id_for_state = _mts_state.get("trade_id")
@@ -5386,8 +5496,15 @@ elif _selected_product == "TMF":
                 _mts_state = dict(_mts_state)
                 _mts_state["_pending_exit_intent"] = _exit_intent
             _has_pos = _mts_state.get("has_position", False)
-            if _has_pos:
+            # A valid canonical state must always produce an MTS section.
+            # Do not hide the section merely because the state is flat or a
+            # secondary presentation field is unavailable.
+            if isinstance(_mts_state, dict):
+                _mts_panel_rendered = True
                 st.header("MTS 價差持倉 (tmf_spread)")
+                if not _has_pos:
+                    st.info("目前沒有已驗證的 MTS 未平倉部位（FLAT）。")
+            if _has_pos:
                 _pending_exit = _mts_state.get("_pending_exit_intent")
                 if isinstance(_pending_exit, dict):
                     _pending_reason = (_pending_exit.get("reason") or "TRAIL")
@@ -5765,8 +5882,24 @@ elif _selected_product == "TMF":
                         f"⚠️ 資料不一致：狀態為 FLAT 但 state 殘留 UPL {_stale_upl:+,.0f} TWD"
                         "（舊寫入未清除，顯示已強制歸零）"
                     )
-        except Exception:
-            pass
+        except Exception as _mts_panel_exc:
+            print(f"[MTS_PANEL_RENDER_FAILED] {_mts_panel_exc!r}", flush=True)
+            if not _mts_panel_rendered and isinstance(_canonical_paper_state, dict):
+                st.header("MTS 價差持倉 (tmf_spread)")
+                st.warning(
+                    "⚠️ MTS 詳細面板載入失敗，以下為 canonical state 保守顯示；"
+                    f"原因={type(_mts_panel_exc).__name__}")
+                _fb = _canonical_paper_state
+                _fb1, _fb2, _fb3 = st.columns(3)
+                _fb1.metric("近月 UPL", f"{float(_fb.get('near_upl', 0) or 0):+,.0f} TWD")
+                _fb2.metric("遠月 UPL", f"{float(_fb.get('far_upl', 0) or 0):+,.0f} TWD")
+                _fb3.metric("總計 UPL", f"{float(_fb.get('total_upl', 0) or 0):+,.0f} TWD")
+        if not _mts_panel_rendered and not _live_runtime:
+            st.header("MTS 價差持倉 (tmf_spread)")
+            st.error(
+                f"⚠️ MTS 區域資料不可用：{_paper_state_status} · "
+                f"state_path={_resolved_state_path} · 不使用 legacy/tmp fallback。"
+            )
         print(f"[PERF] mts_state_section: {time.time()-_pt_data:.3f}s")
 
     # 2026-07-08 Gemini CLI: Calculate and render MTS daily performance metrics on the dashboard
@@ -5781,7 +5914,7 @@ elif _selected_product == "TMF":
                     
         if _perf_data and (_perf_data["completed"] or _perf_data["active"]):
             st.markdown("---")
-            st.subheader(f"📈 MTS 績效檢討 (Daily Performance: {_display_day})")
+            st.subheader(f"📈 MTS 績效檢討 (Futures Trading Day: {_display_day})")
             _completed = _perf_data["completed"]
             # 2026-08-03 P0 fix: KPI uses canonical realized only
             # (SETTLEMENT / FILLS / FILLS_BACKFILL + DERIVED_AUDITABLE).
@@ -6256,12 +6389,14 @@ elif _selected_product == "TMF":
             else:
                 # ── Check MTS spread position as fallback ──
                 _mts_fallback_shown = False
-                _mts_state_file = "/tmp/mts_position_state.json"
-                _mts_state = {}  # [Fix] Initialize to prevent NameError if file doesn't exist
-                if os.path.exists(_mts_state_file):
-                    try:
-                        with open(_mts_state_file) as _f:
-                            _mts_state = json.loads(_f.read())
+                _mts_state, _state_status, _state_path = _read_canonical_mts_state()
+                _mts_state = _mts_state or {}
+                if _state_status != "OK":
+                    st.caption(
+                        f"MTS state unavailable: {_state_status} · "
+                        f"resolved_path={_state_path}")
+                try:
+                    if _mts_state:
                         # ── Account equity: mode-aware (broker / MTS paper / paper trader) ──
                         _init_bal = _mts_state.get("initial_balance", 100000)
                         _has_pos = _mts_state.get("has_position", False)
@@ -6395,8 +6530,8 @@ elif _selected_product == "TMF":
                             st.caption(f"Total UPL={_tu:+.1f}  Realized={_tr:+.1f}  Spread Z={_sz:.2f}  Reason: {_rson}")
                         else:
                             st.info("MTS 價差: 無持倉")
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
 
                 # ── MTS Manual Order Status ──
                 st.markdown("**MTS Manual Order Status**")
@@ -6584,8 +6719,8 @@ elif _selected_product == "MXF":
     st.header(f"小台（MXF / MTX）被動行情對照與數據監控 ({runtime_mode_badge(active_runtime_truth)})")
     
     # ── Top Metrics Banner ──
-    mxf_state_path = Path("/tmp/mts_position_state_mtx.json")
-    tmf_state_path = Path("/tmp/mts_position_state.json")
+    mxf_state_path = Path(runtime_path("data", "state", "mts_position_state_mtx.json"))
+    tmf_state_path = Path(mts_position_state_path())
     
     mxf_data = {}
     tmf_data = {}
@@ -8633,6 +8768,21 @@ elif page == "設定":
                     st.error(f"清空失敗: {e}")
 
     st.info("💡 提示: 部分進階設定可直接編輯 `config/*.yaml` 檔案。")
+
+# ── Calendar Spread (bottom, after MTS details) ──
+st.divider()
+with st.expander("📈 日曆價差圖表（頁面底部）", expanded=False):
+    _bottom_spread_df = load_calendar_spread_data()
+    if _bottom_spread_df is not None and not _bottom_spread_df.empty:
+        _bottom_chart = make_calendar_spread_chart(_bottom_spread_df)
+        if _bottom_chart:
+            st.plotly_chart(_bottom_chart, width="stretch")
+        st.caption(
+            f"資料筆數：{len(_bottom_spread_df)} · "
+            f"時間範圍：{_bottom_spread_df['timestamp'].min()} ~ "
+            f"{_bottom_spread_df['timestamp'].max()}")
+    else:
+        st.info("目前沒有可用的 calendar spread 資料。")
 
 # ════════════════════════════════════════
 # Tab: 波動率 Vol

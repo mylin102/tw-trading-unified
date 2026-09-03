@@ -18,7 +18,8 @@ st.caption("即時部位與歷史委託單明細視圖")
 
 # 1. Open Positions
 st.subheader("📦 即時部位 (Active Positions)")
-pos_file = Path("/tmp/mts_position_state.json")
+from core.runtime_paths import mts_position_state_path
+pos_file = Path(mts_position_state_path())
 
 if pos_file.exists():
     try:

@@ -509,6 +509,32 @@ class IntentLog:
             self._append_locked(intent_id, builder)
         self._locked(_do, intent_id=intent_id)
 
+    def mark_paper_filled(self, intent_id: str, leg: str) -> dict:
+        """Record a locally proven paper fill without broker inference."""
+        leg = str(leg or "").upper()
+        if leg not in ("NEAR", "FAR"):
+            raise ValueError(f"invalid paper leg: {leg}")
+
+        def _do():
+            cur = self.get(intent_id)
+            if cur.get("terminal") not in (None, "PARTIAL", "FAILED_NO_FILL"):
+                return cur
+            if leg not in cur.get("legs", {}):
+                raise IllegalTransitionError(f"{intent_id} has no {leg} leg")
+            if cur["legs"][leg].get("status") != "SUBMITTED":
+                raise IllegalTransitionError(
+                    f"paper fill requires SUBMITTED, got "
+                    f"{cur['legs'][leg].get('status')}")
+            self._transition_locked(intent_id, leg, "FILLED")
+            cur = self.get(intent_id)
+            if cur.get("legs") and all(
+                    v.get("status") == "FILLED"
+                    for v in cur["legs"].values()):
+                self._transition_terminal_locked(intent_id, "COMPLETED")
+                cur = self.get(intent_id)
+            return cur
+        return self._locked(_do, intent_id=intent_id)
+
     def submit_leg(self, intent_id: str, leg: str, order_mgr,
                    submit_fn: Optional[Callable] = None,
                    submit_hook: Optional[Callable] = None) -> dict:
