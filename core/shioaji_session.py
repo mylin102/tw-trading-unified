@@ -74,8 +74,15 @@ def get_api() -> sj.Shioaji:
     global _api
     with _lock:
         if _api is None:
-            _api = sj.Shioaji()
-            _login(_api)
+            candidate = sj.Shioaji()
+            try:
+                _login(candidate)
+            except Exception:
+                # Do not let a failed login leave an unauthenticated
+                # singleton that startup retries would silently reuse.
+                _api = None
+                raise
+            _api = candidate
         return _api
 
 def _load_env_credentials():
