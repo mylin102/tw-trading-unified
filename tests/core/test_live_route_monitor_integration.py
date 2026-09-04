@@ -429,6 +429,7 @@ def test_bind_precedes_certification_in_startup(tmp_path, monkeypatch):
     order = []
 
     def fake_certify(api, **kwargs):
+        order.append("certify")
         return (object(), [])
 
     def fake_build(api, config, process_state=None):
@@ -456,8 +457,11 @@ def test_bind_precedes_certification_in_startup(tmp_path, monkeypatch):
     lrc.register_session(api_fake)
     _stub_post_startup_gate(monkeypatch)
     m = FuturesMonitor(api=api_fake, config_path=str(cfg))
-    assert order[:2] == ["bind", "transition"], \
+    gen = lrc.session_registry.generation(api_fake)
+    assert order[:3] == ["bind", "certify", "transition"], \
         f"binding must precede certification, got {order}"
+    assert m._execution_context.session_id == gen, \
+        "certification path must retain the registry-bound session id"
     assert m._execution_context.is_live_ready()
 
 
