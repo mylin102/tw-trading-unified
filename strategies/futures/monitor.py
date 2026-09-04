@@ -662,6 +662,11 @@ class FuturesMonitor:
                                                                   with_effective_mode)
                                 _api = getattr(self, "api", None)
                                 _issuer = CertificateIssuer()
+                                # [F1] bind the login-created registry generation
+                                # into the quarantined context before certification.
+                                # The post-startup gate reads the durable ctx, so
+                                # certification must never run with session_id=None.
+                                self._bind_session_generation()
                                 _cert, _cert_failures = (
                                     certify_route(
                                         _api,
@@ -680,13 +685,6 @@ class FuturesMonitor:
                                           f"reasons={_cert_failures or ['NO_CERTIFICATE']} "
                                           f"— live orders blocked")
                                 else:
-                                    # [post_startup session gate; D1] bind the
-                                    # registry-bound generation into the
-                                    # QUARANTINED ctx BEFORE certification —
-                                    # the post_startup gate validates
-                                    # generation/session/snapshot consistency
-                                    # before ANY LIVE_READY transition
-                                    self._bind_session_generation()
                                     if not self._confirm_session_generation():
                                         # [D1 race guard] the registry generation
                                         # changed since binding (logout/relogin):
