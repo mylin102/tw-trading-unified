@@ -3830,6 +3830,21 @@ class TMFSpread(StrategyBase):
 
         state = self._read_mts_state()
 
+        # An audited abandon is terminal across every recovery authority.
+        # The JSON state writer may have persisted a stale OPEN snapshot after
+        # the abandon decision; never let that snapshot resurrect the trade.
+        if state and state.get("has_position") is True:
+            _state_trade_id = str(state.get("trade_id") or "").strip()
+            if _state_trade_id and _state_trade_id in _abandoned_trade_ids():
+                logger.warning(
+                    "[MTS_RESTORE_SKIP] reason=ABANDONED_TRADE trade_id=%s",
+                    _state_trade_id,
+                )
+                self._has_position = False
+                self._mts_recovery_state = RecoveryState.FLAT_CONFIRMED
+                self._mts_state_write_enabled = True
+                return False
+
         # ═══════════════════════════════════════════════════════════════
         # P0: Fills log authority check
         # state file 說 FLAT 不等於真的 FLAT。

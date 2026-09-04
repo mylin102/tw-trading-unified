@@ -13118,7 +13118,21 @@ class FuturesMonitor:
         (tail-read of new bytes only); this is now a thin snapshot read.
         """
         self._ledger_projection.sync_from_ledger()
-        return self._ledger_projection.snapshot().status == MtsAuthority.OPEN
+        _authority = self._ledger_projection.snapshot()
+        if _authority.status == MtsAuthority.OPEN:
+            # An audited abandon is terminal even when the append-only fills
+            # ledger still contains historical ENTRY rows. Keep this check at
+            # the authority consumer so the generic projection remains pure.
+            from strategies.plugins.futures.active.tmf_spread import (
+                _abandoned_trade_ids,
+            )
+            if _authority.trade_id in _abandoned_trade_ids():
+                import logging
+                logging.getLogger("FuturesMonitor").warning(
+                    "[MTS_ABANDON_SKIP] trade_id=%s", _authority.trade_id
+                )
+                return False
+        return _authority.status == MtsAuthority.OPEN
 
     def _reconstruct_position_from_ledger(self, strategy, auth):
         """Rebuild the strategy position state from the ledger authority and
