@@ -451,6 +451,33 @@ def _fills_ledger_path() -> str:
 
 
 _MTS_FILL_LOG = _fills_ledger_path()
+_MTS_RECOVERY_AUDIT_LOG = os.getenv(
+    "MTS_RECOVERY_AUDIT_LOG_PATH",
+    os.path.join(runtime_logs(), "mts_recovery_audit.jsonl"),
+)
+
+
+def _abandoned_trade_ids(log_path: str | None = None) -> set[str]:
+    """Return trade IDs explicitly abandoned by an audited recovery decision."""
+    _path = log_path or _MTS_RECOVERY_AUDIT_LOG
+    if not os.path.exists(_path):
+        return set()
+    _ids: set[str] = set()
+    try:
+        with open(_path, encoding="utf-8") as _f:
+            for _line in _f:
+                try:
+                    _rec = json.loads(_line.strip())
+                except (TypeError, ValueError):
+                    continue
+                if _rec.get("event_type") != "MTS_RECOVERY_ABANDON":
+                    continue
+                _tid = str(_rec.get("abandoned_trade_id") or "").strip()
+                if _tid:
+                    _ids.add(_tid)
+    except OSError:
+        return set()
+    return _ids
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3485,11 +3512,14 @@ class TMFSpread(StrategyBase):
                         pass
         except Exception:
             return False
+        _abandoned = _abandoned_trade_ids()
         # An entry is "open" if its trade_id appears more in ENTRY than in EXIT+RELEASE
         from collections import Counter
         _entry_counts = Counter(_entries)
         _exit_counts = Counter(_exits)
         for tid, ecnt in _entry_counts.items():
+            if tid in _abandoned:
+                continue
             if ecnt > _exit_counts.get(tid, 0):
                 return True
         return False
@@ -3504,6 +3534,7 @@ class TMFSpread(StrategyBase):
         if not os.path.exists(_MTS_FILL_LOG):
             return False
         try:
+            _abandoned = _abandoned_trade_ids()
             # Find the most recent open trade
             _trades: dict[str, list[dict]] = {}
             with open(_MTS_FILL_LOG) as _f:
@@ -3511,7 +3542,7 @@ class TMFSpread(StrategyBase):
                     try:
                         rec = json.loads(_line.strip())
                         tid = rec.get("trade_id")
-                        if tid:
+                        if tid and tid not in _abandoned:
                             _trades.setdefault(tid, []).append(rec)
                     except Exception:
                         pass
