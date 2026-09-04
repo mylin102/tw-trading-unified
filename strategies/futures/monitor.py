@@ -41,7 +41,7 @@ from squeeze_futures.data.data_storage import save_trade
 
 # GSD: Pluggable Strategy Integration
 from core.strategy_registry import StrategyRegistry
-from core.runtime_paths import runtime_logs, runtime_path
+from core.runtime_paths import runtime_logs, runtime_path, mts_position_state_path
 from core.strategy_context import StrategyContext, PositionView, MarketData
 from core.signal import Signal
 from core.futures_bar_regime import classify_futures_bar_regime
@@ -68,9 +68,10 @@ except ImportError:
 
 # Structured notification system (core/notification/)
 
-# 2026-07-07 Hermes Agent: Module-level constant so tests can
-# monkeypatch the path without touching the live state file.
-MTS_POSITION_STATE_PATH = Path("/tmp/mts_position_state.json")
+# 2026-07-07 Hermes Agent: Module-level compatibility seam for tests.  The
+# production value is resolved from the shared runtime root; it is never a
+# /tmp fallback.
+MTS_POSITION_STATE_PATH = Path(mts_position_state_path())
 
 # [S1] EXIT_ONLY snapshot staleness TTL (ms): canonical with
 # core.reconciled_exit.SNAPSHOT_TTL_MS (60s) — a snapshot older than this,
@@ -142,6 +143,43 @@ def _extract_bbo(quote_obj):
     return (None, None, "DATA_QUALITY_BLOCKED")
 
 
+def _bbo_tick_fields(tick, bbo_now: float | None = None,
+                        generation_id: str | None = None) -> dict:
+    """Return bid/ask/tick_bbo_at fields for a tick IF it carries a real
+    BBO (buy_price/sell_price both present, > 0, finite, NON-CROSSED).
+    Snapshot/close-only ticks return {} — never fabricate a BBO from
+    close/last.
+
+    2026-08-27 (codex review, v4): a TICK must NEVER write bidask_at —
+    BidAsk callback freshness is the exclusive property of on_bidask().
+    Tick-borne BBO carries its own tick_bbo_at timestamp so consumers can
+    see the tick path wrote it; the reconnect verification window and the
+    entry freshness gate both treat tick_bbo_at as NOT BidAsk freshness.
+    Also adds the crossed-book check (ask >= bid) so the tick path cannot
+    inject an invalid BBO that downstream validators would accept.
+    """
+    import math as _math
+    _buy = getattr(tick, "buy_price", None)
+    _sell = getattr(tick, "sell_price", None)
+    if _buy is None or _sell is None:
+        return {}
+    try:
+        _b = float(_buy)
+        _a = float(_sell)
+    except (TypeError, ValueError):
+        return {}
+    if not (_math.isfinite(_b) and _math.isfinite(_a)) or _b <= 0 or _a <= 0:
+        return {}
+    if _a < _b:
+        return {}  # crossed book — never write a crossed BBO
+    if bbo_now is None:
+        bbo_now = time.time()
+    _out = {"bid": _b, "ask": _a, "tick_bbo_at": bbo_now}
+    if generation_id is not None:
+        _out["generation_id"] = generation_id
+    return _out
+
+
 def _repo_root() -> str:
     """Repo root from __file__ (strategies/futures/monitor.py -> parents[2]).
     Never cwd-dependent."""
@@ -161,7 +199,8 @@ def _mts_position_state_path() -> Path:
     # 2026-07-21 Gemini CLI: Support thread-local path override for multi-instance concurrent processes
     if getattr(_thread_local, "state_path", None) is not None:
         return Path(_thread_local.state_path)
-    # 2026-07-08 Gemini CLI: Allow test injection but fall back to test path to avoid leaking to production /tmp/mts_position_state.json
+    # 2026-07-08 Gemini CLI: test injection is isolated; production always
+    # resolves through core.runtime_paths.
     import sys
     import os
     if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
@@ -169,13 +208,14 @@ def _mts_position_state_path() -> Path:
         if _env:
             return Path(_env)
         # If the constant was monkeypatched in the test, honor the patch!
-        if MTS_POSITION_STATE_PATH != Path("/tmp/mts_position_state.json"):
+        if MTS_POSITION_STATE_PATH != Path(mts_position_state_path()):
             return MTS_POSITION_STATE_PATH
         # Allow contract test to verify default constant fallback
         if "uses_constant" in os.getenv("PYTEST_CURRENT_TEST", ""):
             return MTS_POSITION_STATE_PATH
-        return Path("/tmp/test_mts_position_state.json")
-    return Path(os.getenv("MTS_STATE_PATH", str(MTS_POSITION_STATE_PATH)))
+        import tempfile
+        return Path(tempfile.gettempdir()) / "test_mts_position_state.json"
+    return Path(mts_position_state_path())
 
 
 def _mts_intent_log_dir() -> str:
@@ -247,6 +287,18 @@ class ExecutionContextSyncFatal(RuntimeError):
 
 
 class FuturesMonitor:
+
+    def _bbo_generation_tag(self):
+        """Current session generation for BBO cache tagging (reconnect
+        verification fencing).  None when no registry generation exists —
+        the verification window fails closed on missing tags."""
+        try:
+            from core.live_route_certificate import session_registry
+            return session_registry.generation(getattr(self, "api", None))
+        except Exception:
+            return None
+
+
     def __init__(self, api, config_path: str, dry_run: bool = False):
         self.api = api
         self.config_path = config_path
@@ -258,9 +310,9 @@ class FuturesMonitor:
         # 2026-07-21 Gemini CLI: Determine state path based on ticker name for multi-instance isolation
         _base_name = self.ticker.lower()
         if _base_name == "tmf":
-            self._state_path = Path("/tmp/mts_position_state.json")
+            self._state_path = Path(mts_position_state_path())
         else:
-            self._state_path = Path(f"/tmp/mts_position_state_{_base_name}.json")
+            self._state_path = Path(runtime_path("data", "state", f"mts_position_state_{_base_name}.json"))
         self.contract = None
         self.far_contract = None  # Far-month contract for dual chart
         self._running = False
@@ -477,7 +529,7 @@ class FuturesMonitor:
         """Get initial balance dynamically. Day and night sessions share the same capital.
 
         Check order:
-        1. State file (/tmp/mts_position_state.json) if exists and valid.
+        1. Canonical runtime state file if it exists and is valid.
         2. Master config (config/futures.yaml) to keep day/night in sync.
         3. Local session config execution.initial_balance fallback.
         """
@@ -974,6 +1026,80 @@ class FuturesMonitor:
             "Volume": [r["volume"] for r in records],
         }, index=[r["ts"] for r in records])
 
+    def _get_hvwap_regime_prewarm_bars(self, decision_ts):
+        """Load only the immediately prior session's completed 5m bars.
+
+        This buffer is exclusively for the 60m regime builder.  It is never
+        merged into the current-session deque used by VWAP/15m/5m logic.
+        """
+        try:
+            from strategies.plugins.futures.active.mts_hvwap_candidate import (
+                to_epoch_secs, vwap_session_bounds,
+            )
+            _dts = to_epoch_secs(decision_ts)
+            if _dts is None:
+                return []
+            _current_label, _current_start = vwap_session_bounds(_dts)
+            _prior_label, _prior_start = vwap_session_bounds(_current_start - 1.0)
+            if _prior_label == _current_label:
+                _prior_label, _prior_start = vwap_session_bounds(_current_start - 86400.0)
+            _cache_key = (_current_start, _prior_label, bool(self.live_trading))
+            if getattr(self, "_hvwap_regime_prewarm_key", None) == _cache_key:
+                return list(getattr(self, "_hvwap_regime_prewarm_bars", []))
+
+            from pathlib import Path
+            _tag = "_LIVE" if self.live_trading else "_PAPER"
+            _base = Path(runtime_logs("market_data"))
+            _paths = sorted(_base.glob(f"{self.ticker}_*{_tag}_indicators.csv"))
+            if not _paths:
+                self._hvwap_regime_prewarm_key = _cache_key
+                self._hvwap_regime_prewarm_bars = []
+                return []
+            _rows = {}
+            for _path in _paths:
+                try:
+                    _df = pd.read_csv(_path)
+                    _ts_col = "timestamp" if "timestamp" in _df.columns else "ts"
+                    if _ts_col not in _df.columns:
+                        continue
+                    _df["timestamp"] = pd.to_datetime(_df[_ts_col], errors="coerce")
+                    _df = _df.dropna(subset=["timestamp"])
+                    _close = "close" if "close" in _df.columns else "Close"
+                    _volume = "volume" if "volume" in _df.columns else "Volume"
+                    if _close not in _df.columns or _volume not in _df.columns:
+                        continue
+                    for _, _row in _df.iterrows():
+                        _ts = float(_row["timestamp"].timestamp())
+                        if not (_prior_start <= _ts < _current_start and _ts <= _dts):
+                            continue
+                        if int(_ts) % 300 != 0:
+                            continue
+                        _rows[int(_ts)] = (_row, _close, _volume)
+                except Exception:
+                    continue
+            _out = []
+            for _ts_int in sorted(_rows):
+                _row, _close, _volume = _rows[_ts_int]
+                try:
+                    _out.append({
+                        "ts": _row["timestamp"],
+                        "open": float(_row.get("open", _row.get("Open", _row[_close]))),
+                        "high": float(_row.get("high", _row.get("High", _row[_close]))),
+                        "low": float(_row.get("low", _row.get("Low", _row[_close]))),
+                        "close": float(_row[_close]),
+                        "volume": float(_row[_volume]),
+                    })
+                except (TypeError, ValueError):
+                    continue
+            self._hvwap_regime_prewarm_key = _cache_key
+            self._hvwap_regime_prewarm_bars = _out
+            return list(_out)
+        except Exception as _exc:
+            logger.warning("[HVWAP] prior-session regime prewarm unavailable: %s", _exc)
+            self._hvwap_regime_prewarm_key = None
+            self._hvwap_regime_prewarm_bars = []
+            return []
+
     def _bars_time_aligned(self, tx_bars, df_5m):
         """Check that the latest TX bar and MXF 5m bar share the same timestamp bucket.
 
@@ -1260,6 +1386,26 @@ class FuturesMonitor:
                 self._canonical_far_codes.add("MXF" + _f0[3:])
             elif _f0.startswith("MXF"):
                 self._canonical_far_codes.add("TMF" + _f0[3:])
+
+        # Telemetry-only startup snapshot: records the resolver decision once
+        # before subscriptions begin.  No gate or dispatch behavior changes.
+        try:
+            self._append_mts_event(
+                "MTS_ACTIVE_PAIR_SNAPSHOT",
+                near_contract_code=_c0,
+                far_contract_code=_f0,
+                near_delivery_date=getattr(self.contract, "delivery_date", None),
+                far_delivery_date=getattr(self.far_contract, "delivery_date", None),
+                canonical_near_aliases=sorted(self._canonical_near_codes),
+                canonical_far_aliases=sorted(self._canonical_far_codes),
+                resolver_ready_monotonic_ns=time.monotonic_ns(),
+                subscription_generation=getattr(
+                    getattr(self, "_quote_guard", None), "generation", None),
+                session_identity=getattr(
+                    getattr(self, "_execution_context", None), "session_id", None),
+            )
+        except Exception:
+            pass
 
         
         # 2026-06-24 Gemini CLI: Pre-fill near/far contract prices from snapshots at startup to prevent identical execution prices on first manual trade.
@@ -1793,6 +1939,8 @@ class FuturesMonitor:
         """[GSD Fix] Check if MXF contract has rolled over and re-subscribe if needed."""
         if not self.api or self.dry_run or not self.contract:
             return
+
+        from core.broker.shioaji_compat import safe_subscribe
         
         try:
             current_code = self.contract.code
@@ -1843,14 +1991,22 @@ class FuturesMonitor:
                     self.api.quote.unsubscribe(self.contract, quote_type='tick')
                 except Exception as e:
                     console.print(f"[dim]Unsubscribe old {current_code}: {e}[/dim]")
+                try:
+                    self.api.quote.unsubscribe(self.contract, quote_type='bidask')
+                except Exception as e:
+                    console.print(f"[dim]Unsubscribe old {current_code} bidask: {e}[/dim]")
                 
                 # Switch to new contract
                 self.contract = first_contract
                 self._last_contract_code = first_contract.code
                 
                 # Re-subscribe to new contract
-                self.api.quote.subscribe(first_contract, quote_type='tick')
-                console.print(f"[bold green]✅ Re-subscribed to {first_contract.code}[/bold green]")
+                safe_subscribe(self.api, first_contract, quote_type='tick')
+                safe_subscribe(self.api, first_contract, quote_type='bidask')
+                if self.far_contract is not None:
+                    safe_subscribe(self.api, self.far_contract, quote_type='tick')
+                    safe_subscribe(self.api, self.far_contract, quote_type='bidask')
+                console.print(f"[bold green]✅ Re-subscribed to {first_contract.code} tick+bidask[/bold green]")
                 
                 # Reset tick timestamp to force immediate data freshness check
                 self.last_tick_at = time.time()
@@ -1860,9 +2016,14 @@ class FuturesMonitor:
                 console.print(f"[dim]⚠️ Contract {current_code} is correct but no ticks, re-subscribing...[/dim]")
                 try:
                     self.api.quote.unsubscribe(self.contract, quote_type='tick')
+                    self.api.quote.unsubscribe(self.contract, quote_type='bidask')
                     time.sleep(0.5)
-                    self.api.quote.subscribe(self.contract, quote_type='tick')
-                    console.print(f"[dim]✅ Re-subscription complete[/dim]")
+                    safe_subscribe(self.api, self.contract, quote_type='tick')
+                    safe_subscribe(self.api, self.contract, quote_type='bidask')
+                    if self.far_contract is not None:
+                        safe_subscribe(self.api, self.far_contract, quote_type='tick')
+                        safe_subscribe(self.api, self.far_contract, quote_type='bidask')
+                    console.print(f"[dim]✅ Re-subscription complete (tick+bidask)[/dim]")
                 except Exception as e:
                     console.print(f" [yellow]⚠️ Re-subscription failed: {e}[/yellow] ")
         except Exception as e:
@@ -2150,7 +2311,17 @@ class FuturesMonitor:
         Model C requires. Flag-gated (data/model_c_canary.flag) exactly like
         the tick path; _extract_bbo enforces BBO_VALID-only consumption.
         Never falls back to last/close or buy_price/sell_price.
+
+        2026-08-27 (codex review, v4): this is the ONLY writer of
+        bidask_at / bidask_received_at — Tick-borne BBO must not advance
+        BidAsk freshness (tick path writes tick_bbo_at instead).  The
+        reconnect verification window reads last_bidask_receive_monotonic
+        for per-leg BidAsk callback liveness.
         """
+        # 2026-08-27: per-leg BidAsk callback liveness (monotonic) — ONLY
+        # on_bidask advances this; ticks cannot fake BidAsk freshness.
+        _bidask_recv_now = time.monotonic()
+        self._last_bidask_receive_monotonic = _bidask_recv_now
         # Cache real BBO for both legs regardless of the Model C canary.  Policy J
         # and post-trade replay need this evidence even while Model C is disabled.
         try:
@@ -2164,8 +2335,21 @@ class FuturesMonitor:
                         else None)
                 if _key:
                     _slot = self.market_data.setdefault(_key, {})
+                    # 2026-08-27 (reconnect verification): tag the BBO cache
+                    # with the CURRENT session generation so the post-reconnect
+                    # verification window can reject stale-generation slots
+                    # (_bbo_matches_generation in main.py).
+                    _gen_id = None
+                    try:
+                        from core.live_route_certificate import session_registry
+                        _gen_id = session_registry.generation(self.api)
+                    except Exception:
+                        pass
                     _slot.update({"bid": _bbo_cache[0], "ask": _bbo_cache[1],
-                                  "bidask_at": time.time(), "bidask_exchange_ts": getattr(bidask, "datetime", None)})
+                                  "bidask_at": time.time(),
+                                  "bidask_received_at": _bidask_recv_now,
+                                  "bidask_exchange_ts": getattr(bidask, "datetime", None),
+                                  "generation_id": _gen_id})
                     # [S2 repair] dedicated EXIT_ONLY BBO evidence cache —
                     # immutable-per-update; written ONLY here (validated
                     # BidAskFOPv1/on_bidask).  Ticks never create or
@@ -2249,23 +2433,9 @@ class FuturesMonitor:
                 self._mc_bidask_err_log = True
                 logger.warning("[MODEL_C] on_bidask error: %r",
                                _sys.exc_info()[1])
-        # also refresh market_data bid/ask caches used by downstream consumers
-        try:
-            _bid = float(getattr(bidask, "bid_price", [None])[0] if hasattr(getattr(bidask, "bid_price", None), "__getitem__") else getattr(bidask, "bid_price", None))
-            _ask = float(getattr(bidask, "ask_price", [None])[0] if hasattr(getattr(bidask, "ask_price", None), "__getitem__") else getattr(bidask, "ask_price", None))
-            if _bid and _ask and _bid > 0 and _ask > 0:
-                _code2 = str(getattr(bidask, "code", "") or "")
-                _k = _code2
-                if _code2 and _code2 in getattr(self, "_canonical_near_codes", set()):
-                    _k = str(getattr(self, "ticker", "TMF"))
-                elif _code2 and _code2 in getattr(self, "_canonical_far_codes", set()):
-                    _k = str(getattr(self, "ticker", "TMF")) + "_FAR"
-                if _k:
-                    self.market_data.setdefault(_k, {})["bid"] = _bid
-                    self.market_data.setdefault(_k, {})["ask"] = _ask
-                    self.market_data.setdefault(_k, {})["bidask_at"] = time.time()
-        except Exception:
-            pass
+        # The validated block above is the sole market_data BBO writer.
+        # Do not add a raw bid_price/ask_price fallback here: it would bypass
+        # validation, canonical routing, and generation fencing.
 
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()
@@ -2312,9 +2482,9 @@ class FuturesMonitor:
                     if _now_t - getattr(self, "_f_shadow_state_ts", 0) > 1.0:
                         _t_st = time.time()
                         try:
-                            with open(MTS_POSITION_STATE_PATH) as _fst:
+                            with open(_mts_position_state_path()) as _fst:
                                 self._f_shadow_state = json.load(_fst)
-                                self._f_shadow_state_mtime = os.path.getmtime(MTS_POSITION_STATE_PATH)
+                                self._f_shadow_state_mtime = os.path.getmtime(_mts_position_state_path())
                         except Exception:
                             self._f_shadow_state = {}
                         self._f_shadow_state_ts = _now_t
@@ -2504,12 +2674,12 @@ class FuturesMonitor:
         if getattr(tick, 'close', None) and float(tick.close) > 0:
             _p = float(tick.close)
             _t_code = getattr(tick, 'code', None)
+            _bbo_now = time.time()
             _tick_info = {
                 "close": _p,
                 "datetime": getattr(tick, 'datetime', None),
                 "local_arrival_at": self.last_tick_at,
-                "bid": float(getattr(tick, 'buy_price', _p) or _p),
-                "ask": float(getattr(tick, 'sell_price', _p) or _p),
+                **_bbo_tick_fields(tick, bbo_now=_bbo_now, generation_id=self._bbo_generation_tag()),
             }
             if _t_code:
                 self.market_data[_t_code] = _tick_info
@@ -2641,29 +2811,28 @@ class FuturesMonitor:
         # 2026-06-24 Gemini CLI: Maintain near/far/code-specific market data caches for spread execution price integrity.
         # 2026-07-31 Antigravity P0 Guard Phase 2: Gate NEAR slot updates strictly on is_primary tick.
         # Prevent far-month/secondary ticks from contaminating NEAR bid/ask/close cache at Line 1693.
+        _bbo_now = time.time()
+        _bbo_fields = _bbo_tick_fields(tick, bbo_now=_bbo_now, generation_id=self._bbo_generation_tag())
         if is_primary:
             self.market_data[self.ticker] = {
                 "close": price, 
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
-                # 2026-06-26 Gemini CLI: cache bid/ask prices
-                "bid": float(getattr(tick, 'buy_price', price) or price),
-                "ask": float(getattr(tick, 'sell_price', price) or price)
+                # 2026-06-26 Gemini CLI: cache bid/ask prices (real BBO only)
+                **_bbo_fields,
             }
             self.market_data[f"{self.ticker}_NEAR"] = {
                 "close": price,
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
-                "bid": float(getattr(tick, 'buy_price', price) or price),
-                "ask": float(getattr(tick, 'sell_price', price) or price)
+                **_bbo_fields,
             }
         elif is_far_tick:
             self.market_data[f"{self.ticker}_FAR"] = {
                 "close": float(getattr(tick, 'close', price) or price),
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
-                "bid": float(getattr(tick, 'buy_price', price) or price),
-                "ask": float(getattr(tick, 'sell_price', price) or price)
+                **_bbo_fields,
             }
 
         if getattr(tick, 'code', None):
@@ -2671,8 +2840,7 @@ class FuturesMonitor:
                 "close": price,
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
-                "bid": float(getattr(tick, 'buy_price', price) or price),
-                "ask": float(getattr(tick, 'sell_price', price) or price)
+                **_bbo_fields,
             }
 
         # Only count volume for primary ticker to keep indicators accurate
@@ -2814,21 +2982,21 @@ class FuturesMonitor:
         ts_int = int(tick_ts.timestamp() / 300) * 300
 
         # 2026-06-24 Gemini CLI: Maintain far/code-specific market data caches for spread execution price integrity.
+        _bbo_now = time.time()
+        _bbo_fields = _bbo_tick_fields(tick, bbo_now=_bbo_now, generation_id=self._bbo_generation_tag())
         self.market_data[f"{self.ticker}_FAR"] = {
             "close": price,
             "datetime": tick.datetime,
             "local_arrival_at": time.time(),
-            # 2026-06-26 Gemini CLI: cache bid/ask prices
-            "bid": float(getattr(tick, 'buy_price', price) or price),
-            "ask": float(getattr(tick, 'sell_price', price) or price)
+            # 2026-06-26 Gemini CLI: cache bid/ask prices (real BBO only)
+            **_bbo_fields,
         }
         if getattr(tick, 'code', None):
             self.market_data[tick.code] = {
                 "close": price,
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
-                "bid": float(getattr(tick, 'buy_price', price) or price),
-                "ask": float(getattr(tick, 'sell_price', price) or price)
+                **_bbo_fields,
             }
 
         # [Debug] Periodic far tick log (every 30s)
@@ -6887,7 +7055,7 @@ class FuturesMonitor:
                             })
 
             # 2026-07-07 Hermes Agent: State-file fallback — read
-            # /tmp/mts_position_state.json directly as a last resort.
+            # the canonical runtime state directly as a last resort.
             # The strategy-based fallback above relies on _lifecycle_oca
             # being restored on the plugin instance, which may not have
             # happened yet after a PM2 restart. This fallback guarantees
@@ -7819,7 +7987,31 @@ class FuturesMonitor:
                 action = "BUY" if event.side == OrderSide.BUY else "SELL"
                 # 2026-06-22 Gemini CLI: Use fill_qty to match OrderEvent
                 console.print(f"[green]📦 Confirmed deal: {action} {event.fill_qty} @ {event.fill_price:.0f} deal={event.deal_id} → {msg}[/green]")
-            
+
+            # 2026-08-25 Item1 (Hermes): advance the durable exit intent on a
+            # confirmed paper fill.  Without this, the intent leg stays
+            # SUBMITTED forever, active intents accumulate to
+            # MAX_ACTIVE_INTENTS (20), and every later EXIT fails at intent
+            # creation with IntentCapacityError (ORDER_INTENT_CREATED emitted
+            # but ORDER_SUBMITTED never).  mark_paper_filled only advances a
+            # leg that is already SUBMITTED and never guesses UNKNOWN —
+            # unknown/attempted intents are left untouched for reconciliation.
+            _fill_iid = getattr(event, "intent_id", None)
+            if _fill_iid and not self.live_trading:
+                try:
+                    from core.exit_intent import IntentLog as _MTSIntentLog
+                    _ilog = _MTSIntentLog(_mts_intent_log_dir())
+                    _row = _ilog.get(_fill_iid)
+                    if _row is not None:
+                        for _leg, _leg_meta in (_row.get("legs") or {}).items():
+                            if str(_leg_meta.get("status", "")) == "SUBMITTED":
+                                _ilog.mark_paper_filled(_fill_iid, _leg)
+                except Exception as _fill_intent_exc:
+                    import logging as _logging
+                    _logging.getLogger().warning(
+                        "[PAPER_FILL_INTENT_MARK_FAILED] intent=%s err=%s",
+                        _fill_iid, _fill_intent_exc)
+
             # [GSD] Always update dashboard file to reflect latest OrderManager state (e.g. FILLED)
             self._save_orders_file_wrapper()
             self._maybe_finalize_exit_only_reconciliation()
@@ -7966,7 +8158,7 @@ class FuturesMonitor:
     def _reconcile_paper_oco_orders_from_state(self) -> None:
         """Re-register OCO orders from state file (no strategy dependency).
         
-        Reads /tmp/mts_position_state.json directly for lifecycle.release_group.
+        Reads the canonical runtime state directly for lifecycle.release_group.
         Used at startup before market open when strategy lifecycle isn't restored yet.
         """
         if not self.paper_fill_sim or not self.order_mgr:
@@ -8655,6 +8847,105 @@ class FuturesMonitor:
         except Exception:
             pass
 
+    def _check_entry_quote_freshness(
+            self, *, near_slot: dict, far_slot: dict,
+            near_trade_age_ms, far_trade_age_ms,
+            near_source: str, far_source: str,
+            threshold_ms: int = 12000) -> tuple[bool, dict]:
+        """BBO-based freshness hard gate for a NEW manual spread entry.
+
+        Both legs must carry a valid BBO update:
+          - bid and ask present, finite positive numeric, ask >= bid, and
+          - BBO update timestamp (bidask_at, seconds epoch) age <= threshold.
+        A missing/invalid/crossed/stale BBO on EITHER leg blocks the entry
+        (fail-closed), in paper and live mode alike.  Returns
+        (ok, detail) where detail carries per-leg evidence for the
+        ENTRY_BLOCKED_STALE_QUOTE audit event.  Last-trade age is included
+        in detail as telemetry only — it never gates.
+        """
+        import math as _math
+
+        def _bbo_evidence(slot: dict, leg: str) -> dict:
+            _bid = slot.get("bid")
+            _ask = slot.get("ask")
+            _bbo_at = slot.get("bidask_at")
+            _ev = {
+                f"{leg}_bid": _bid,
+                f"{leg}_ask": _ask,
+                f"{leg}_bbo_age_ms": None,
+                f"{leg}_bbo_reason": None,
+            }
+            if _bid is None or _ask is None:
+                _ev[f"{leg}_bbo_reason"] = "BBO_MISSING"
+                return _ev
+            try:
+                _b = float(_bid)
+                _a = float(_ask)
+            except (TypeError, ValueError):
+                _b = _a = None
+            if _b is None or _a is None or not (
+                    _math.isfinite(_b) and _math.isfinite(_a)):
+                _ev[f"{leg}_bbo_reason"] = "BBO_NONFINITE"
+                return _ev
+            if _b <= 0 or _a <= 0:
+                _ev[f"{leg}_bbo_reason"] = "BBO_NON_POSITIVE"
+                return _ev
+            if _a < _b:
+                _ev[f"{leg}_bbo_reason"] = "BBO_CROSSED"
+                return _ev
+            if _bbo_at is None:
+                _ev[f"{leg}_bbo_reason"] = "BBO_NO_TIMESTAMP"
+                return _ev
+            try:
+                _age_ms = (time.time() - float(_bbo_at)) * 1000.0
+            except (TypeError, ValueError):
+                _ev[f"{leg}_bbo_reason"] = "BBO_TS_INVALID"
+                return _ev
+            _ev[f"{leg}_bbo_age_ms"] = int(_age_ms)
+            if _age_ms > threshold_ms:
+                _ev[f"{leg}_bbo_reason"] = "BBO_STALE"
+            return _ev
+
+        _near = _bbo_evidence(near_slot or {}, "near")
+        _far = _bbo_evidence(far_slot or {}, "far")
+        _near_reason = _near["near_bbo_reason"]
+        _far_reason = _far["far_bbo_reason"]
+        _ok = _near_reason is None and _far_reason is None
+        _detail = {
+            **_near, **_far,
+            # last-trade age retained as TELEMETRY only (not the gate)
+            "near_age_ms": (int(near_trade_age_ms)
+                             if isinstance(near_trade_age_ms, (int, float))
+                             and near_trade_age_ms >= 0 else None),
+            "far_age_ms": (int(far_trade_age_ms)
+                            if isinstance(far_trade_age_ms, (int, float))
+                            and far_trade_age_ms >= 0 else None),
+            "near_source": near_source,
+            "far_source": far_source,
+            "reason": (_near_reason or _far_reason) if not _ok else None,
+        }
+        try:
+            from core.callback_trace_context import emit as _trace_emit
+            _trace_emit(
+                "STALE_GATE_READ",
+                gate_name="ENTRY_BBO_FRESHNESS",
+                gate_timestamp_field="bidask_at",
+                near_bbo_age_ms=_near.get("near_bbo_age_ms"),
+                far_bbo_age_ms=_far.get("far_bbo_age_ms"),
+                near_tick_age_ms=_detail.get("near_age_ms"),
+                far_tick_age_ms=_detail.get("far_age_ms"),
+                computed_age_ms=max(
+                    [x for x in (_near.get("near_bbo_age_ms"),
+                                 _far.get("far_bbo_age_ms"))
+                     if isinstance(x, (int, float))], default=None),
+                final_reason=_detail.get("reason"),
+                gate_pass=_ok,
+                read_monotonic_ns=time.monotonic_ns(),
+            )
+        except Exception:
+            pass
+        return _ok, _detail
+
     def _mts_ledger_reconstructed_open_qty(self, trade_id: str) -> dict[str, int] | None:
         """Rebuild per-leg open quantity from the append-only fills ledger.
 
@@ -8673,8 +8964,7 @@ class FuturesMonitor:
         if not trade_id:
             return None
         _fills_path = os.environ.get("MTS_FILL_LOG_PATH") or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "logs", "mts_trade_fills.jsonl",
+            runtime_logs(), "mts_trade_fills.jsonl",
         )
         if not os.path.exists(_fills_path):
             return None
@@ -8714,6 +9004,38 @@ class FuturesMonitor:
         if not _found_entry:
             return None
         return _open_qty
+
+    def _reclaim_proven_paper_exit_intents(self, intent_log) -> int:
+        """Close only paper intents proven flat by the fills ledger."""
+        if self.live_trading:
+            return 0
+        reclaimed = 0
+        try:
+            for iid in list(intent_log.list_active()):
+                row = intent_log.get(iid)
+                legs = row.get("legs") or {}
+                if not legs or any(
+                        str(v.get("status", "")) != "SUBMITTED"
+                        for v in legs.values()):
+                    continue
+                qty = self._mts_ledger_reconstructed_open_qty(
+                    row.get("trade_id"))
+                if not isinstance(qty, dict) or any(
+                        qty.get(leg, 1) > 0 for leg in legs):
+                    continue
+                for leg in legs:
+                    intent_log.mark_paper_filled(iid, leg)
+                self._append_mts_event(
+                    "PAPER_EXIT_INTENT_RECLAIMED",
+                    intent_id=iid, trade_id=row.get("trade_id"),
+                    legs=list(legs), reason="FILLS_LEDGER_PROVES_FLAT")
+                reclaimed += 1
+        except Exception as exc:
+            self._append_mts_event(
+                "PAPER_EXIT_INTENT_RECONCILE_FAILED",
+                reason="DURABLE_RECONCILE_ERROR",
+                error_type=type(exc).__name__)
+        return reclaimed
 
     def _reset_mts_dynamics_for_session(self, bar) -> None:
         """Reset the dynamics calculator when the bar's session changes so
@@ -9313,8 +9635,19 @@ class FuturesMonitor:
             _ilog = _MTSIntentLog(_mts_intent_log_dir())
             _iid = None
             for _i in _ilog.list_active():
-                if _ilog.get(_i).get("trade_id") == _trade_id:
+                _existing_intent = _ilog.get(_i)
+                if _existing_intent.get("trade_id") == _trade_id:
                     _iid = _i
+                    # Paper retries must not inherit a malformed historical
+                    # intent containing only one leg.  No broker order exists
+                    # in paper mode; retire the incomplete local intent and
+                    # create a canonical two-leg intent.  Live mode remains
+                    # fail-closed and requires explicit reconciliation.
+                    if (not self.live_trading
+                            and set((_existing_intent.get("legs") or {}))
+                            != {"NEAR", "FAR"}):
+                        _ilog.mark_terminal(_i, "SUPERSEDED_PAPER_INCOMPLETE")
+                        _iid = None
                     break
             if _iid is None:
                 _iid = _ilog.create(_trade_id, "COMBINED_EXIT")
@@ -9408,6 +9741,14 @@ class FuturesMonitor:
             if self.paper_fill_sim:
                 self.paper_fill_sim.register(_near_order)
                 self.paper_fill_sim.register(_far_order)
+                # Paper exits are local accounting events.  They must not be
+                # stranded by the market-hours gate used to protect live
+                # orders; consume both legs immediately using the latest
+                # validated synthetic prices and the normal fill callback.
+                self.paper_fill_sim.process_tick(
+                    self._make_synthetic_tick(_near_close, _ts, symbol=_near_order.symbol))
+                self.paper_fill_sim.process_tick(
+                    self._make_synthetic_tick(_far_close, _ts, symbol=_far_order.symbol))
 
             # Persist orders to Dashboard-readable file
             self._save_orders_file_wrapper()
@@ -9536,7 +9877,19 @@ class FuturesMonitor:
                     _iid = _i
                     break
             if _iid is None:
-                _iid = _ilog.create(_trade_id, "COMBINED_EXIT", leg=_leg_label)
+                self._reclaim_proven_paper_exit_intents(_ilog)
+                try:
+                    _iid = _ilog.create(_trade_id, "COMBINED_EXIT", leg=_leg_label)
+                except Exception as _intent_exc:
+                    if _leg_key is not None:
+                        self._leg_lock_mark_terminal(_leg_key, "SUBMIT_FAILED")
+                    self._append_mts_event(
+                        "ORDER_SUBMIT_FAILED",
+                        action=_action, trade_id=_trade_id,
+                        contract=_symbol, strategy="MTS_EXIT",
+                        reason="EXIT_INTENT_CREATE_FAILED",
+                        error_type=type(_intent_exc).__name__)
+                    return
             _order.intent_id = _iid
             _order.client_order_id = _ilog.get(_iid)["legs"][_leg_label]["client_order_id"]
             from core.exit_intent import DuplicateSubmitError as _MTSDupSubmit
@@ -9551,10 +9904,24 @@ class FuturesMonitor:
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} {_leg_label} already submitted — suppressing duplicate[/yellow]")
                 return
             except _MTSGWFail as _gwe:
+                self._append_mts_event(
+                    "ORDER_SUBMIT_FAILED", action=_action,
+                    trade_id=_trade_id, contract=_symbol,
+                    strategy="MTS_EXIT", reason="GATEWAY_SUBMIT_FAILED",
+                    error_type=type(_gwe).__name__)
                 self._quarantine_mts_exit_leg_failure(
                     trade_id=_trade_id, leg=_leg_label, reason=str(_gwe))
                 if _leg_key is not None:
                     self._leg_lock_mark_terminal(_leg_key, "SUBMIT_FAILED")
+                return
+            except Exception as _submit_exc:
+                if _leg_key is not None:
+                    self._leg_lock_mark_terminal(_leg_key, "SUBMIT_FAILED")
+                self._append_mts_event(
+                    "ORDER_SUBMIT_FAILED", action=_action,
+                    trade_id=_trade_id, contract=_symbol,
+                    strategy="MTS_EXIT", reason="EXIT_INTENT_SUBMIT_FAILED",
+                    error_type=type(_submit_exc).__name__)
                 return
             if _leg_key is not None:
                 self._leg_lock_bind_order(_leg_key, _order)
@@ -9588,6 +9955,17 @@ class FuturesMonitor:
                     self.paper_fill_sim.register(_order)
                     # [Fixed 2026-05-27] Force immediate fill in paper mode
                     self.paper_fill_sim.process_tick(self._make_synthetic_tick(_ref_price, _ts, symbol=_symbol))
+                    if str(getattr(getattr(_order, "status", None),
+                                   "value", getattr(_order, "status", ""))).upper() == "FILLED":
+                        try:
+                            _ilog.mark_paper_filled(_iid, _leg_label)
+                        except Exception as _fill_intent_exc:
+                            self._append_mts_event(
+                                "PAPER_EXIT_INTENT_RECONCILE_FAILED",
+                                intent_id=_iid, trade_id=_trade_id,
+                                leg=_leg_label,
+                                reason="FILL_CALLBACK_DURABLE_WRITE_FAILED",
+                                error_type=type(_fill_intent_exc).__name__)
 
                     # Force fill ONLY in paper mode
                     if self.dry_run or not self.live_trading:
@@ -10882,6 +11260,65 @@ class FuturesMonitor:
                 "volume", "volume_spike", "vwap",
             ]
             
+            # 2026-08-26 (feature precision cleanup, rev2): normalize float
+            # columns to meaningful precision BEFORE writing.  Raw pandas
+            # float64 (e.g. VWAP=44998.806593605535) bloats the CSV and
+            # implies fake 1e-14 precision.  Classification:
+            #   ROUND0  exchange-native whole prices / observed extremes:
+            #           OHLC, actual traded prices, recent high/low, day
+            #           high/low (rounding these to the tick is lossless).
+            #   ROUND2  computed price levels where decimals are meaningful:
+            #           ATR (mean of integer TRs, e.g. 67.93), VWAP, EMA,
+            #           Bollinger bands, MACD (price-difference), and the
+            #           percent columns consumed by dashboards/research.
+            #   ROUND4  ratios / normalized / oscillator values: volume_spike,
+            #           breakout_strength*, mom_velo, score, RSI, RSV, K, D,
+            #           trend_strength_raw.
+            #   ROUND6  price_vs_vwap keeps its RATIO semantics (monitor
+            #           threshold trend_hold_min_price_vs_vwap=0.0003
+            #           depends on it).
+            # Booleans, strings and NaN are preserved verbatim; non-finite
+            # (+/-Inf) are never rounded (round() would raise) and pass
+            # through unchanged.  Unclassified numeric columns are left
+            # untouched (never silently rounded).
+            _ROUND0 = {
+                "Close", "High", "Low", "Open", "close", "high", "low", "open",
+                "recent_high", "recent_low", "day_max", "day_min", "day_open",
+                "high_20_prev", "low_20_prev",
+            }
+            _ROUND2 = {
+                "atr", "atr_raw", "atr_floor", "atr_used",
+                "vwap",
+                "bb_low", "bb_lower", "bb_mid", "bb_up", "bb_upper",
+                "ema_fast", "ema_slow", "ema_filter", "ema_macro", "ema_200_up",
+                "macd_hist", "macd_line", "macd_signal",
+                "price_vs_vwap_pct", "intraday_strength_pct",
+            }
+            _ROUND4 = {
+                "breakout_strength", "breakout_strength_atr",
+                "bear_breakout_strength", "bear_breakout_strength_atr",
+                "volume_spike", "trend_strength_raw", "mom_velo", "score",
+                "rsi", "rsv", "k_val", "d_val", "momentum",
+            }
+            import math as _precision_math
+            for _k, _v in list(data.items()):
+                if isinstance(_v, bool):
+                    continue  # bool is an int subclass — never round to 0/1
+                if not isinstance(_v, (int, float)):
+                    continue
+                _f = float(_v)
+                if not _precision_math.isfinite(_f):
+                    continue  # keep NaN / +/-Inf as-is
+                if _k in _ROUND0:
+                    data[_k] = round(_f)
+                elif _k in _ROUND2:
+                    data[_k] = round(_f, 2)
+                elif _k in _ROUND4:
+                    data[_k] = round(_f, 4)
+                elif _k == "price_vs_vwap":
+                    data[_k] = round(_f, 6)
+                # else: unclassified numeric column passes through unchanged
+
             if not path.exists():
                 # First time: Write header with canonical column order
                 cols = [c for c in CANONICAL_INDICATOR_COLS if c in data]
@@ -12003,6 +12440,24 @@ class FuturesMonitor:
             _bar_dict["ts"] = last_5m.name if hasattr(last_5m, "name") else None
 
         if not _bar_dict: return
+        # HVWAP requires a real bucket timestamp.  DataFrame rows normally
+        # carry a Timestamp index, but enriched/runtime bars may originate
+        # from a serialized numeric index.  Normalize seconds-only epoch
+        # values here and fail closed for RangeIndex-like values instead of
+        # allowing 99 to become 1970-01-01 in the strategy.
+        _raw_bar_ts = _bar_dict.get("ts") or _bar_dict.get("timestamp")
+        if isinstance(_raw_bar_ts, (int, float)) and not isinstance(_raw_bar_ts, bool):
+            if float(_raw_bar_ts) >= 1_000_000_000:
+                _bar_dict["ts"] = pd.Timestamp(float(_raw_bar_ts), unit="s")
+            else:
+                _bar_dict["ts"] = None
+        elif _raw_bar_ts is not None:
+            try:
+                _bar_dict["ts"] = pd.Timestamp(_raw_bar_ts)
+            except Exception:
+                _bar_dict["ts"] = None
+        if _bar_dict.get("ts") is not None and _bar_dict.get("timestamp") is None:
+            _bar_dict["timestamp"] = _bar_dict["ts"]
         if hasattr(self, '_spread_loader') and self._spread_loaded:
             try: self._spread_loader.enrich_bar(_bar_dict)
             except: pass
@@ -12063,6 +12518,14 @@ class FuturesMonitor:
             pass
         _bar_dict["near_vwap"] = _near_vwap
         _bar_dict["far_vwap"] = _far_vwap
+        # 2026-08-23 Hermes Agent: expose the FAR leg's OWN tick volume for the
+        # telemetry-only Hierarchical VWAP candidate arm. Per-leg session VWAP
+        # requires each leg's own volume; `far_vwap` above is a deque-wide
+        # aggregate (spans the 15:00 reset boundary) and must NEVER be used as
+        # a substitute for far volume. 0/missing -> candidate fails closed.
+        _bar_dict["far_volume"] = float(self._far_current_bar.get("volume", 0) or 0)
+        _bar_dict["regime_prewarm_bars"] = self._get_hvwap_regime_prewarm_bars(
+            _bar_dict.get("ts"))
 
         # 2026-07-08 Hermes Agent: Compute BB bands for near/far release filter.
         # Only computed when BB filter is enabled AND sqz_on is active.
@@ -12425,6 +12888,14 @@ class FuturesMonitor:
             # next monitor gate.  Carry the current broker-flat proof into
             # that hook so historical fills cannot resurrect a ghost.
             strategy._broker_truth_flat = not _authority_has_pos
+        # 2026-08-23 Hermes Agent: inject the execution-mode gate for the
+        # telemetry-only HVWAP paper-release wiring (the strategy has no
+        # other access to the execution context). Fail-closed default: when
+        # the context is absent the strategy's paper gate returns MODE_UNKNOWN.
+        _hvwap_ctx = getattr(self, "_execution_context", None)
+        strategy._hvwap_execution_mode = getattr(_hvwap_ctx, "effective_mode", None)
+        strategy._hvwap_live_order_allowed = getattr(
+            _hvwap_ctx, "live_order_allowed", False)
         # [S1 repair] ONE shared EXIT_ONLY capability validation at tick
         # start — before ANY risk gate / strategy evaluation.  The
         # previous tick's authority override is cleared here; when valid,
@@ -12440,6 +12911,14 @@ class FuturesMonitor:
         _gate_auth = _exit_override if _exit_override is not None else _auth
         _gate_state_has_pos = (_authority_has_pos
                                if _exit_override is None else True)
+        # Read-only authority handoff for telemetry consumers.  During PAPER
+        # recovery the strategy's private _has_position can remain UNKNOWN
+        # until its next hydration, while the ledger already proves the
+        # spread is open.  Do not mutate strategy state; expose the authority
+        # on this bar so HVWAP can observe the position without weakening any
+        # order/risk gate.
+        _bar_dict["_mts_authority_has_position"] = bool(_gate_state_has_pos)
+        _bar_dict["_mts_authority_status"] = str(getattr(_gate_auth, "status", "UNKNOWN"))
         _pre_action = gate_decision_pre_signal(
             _gate_auth, _gate_state_has_pos, _strat_has_pos, _strat_tid,
         )
@@ -12747,10 +13226,32 @@ class FuturesMonitor:
             if isinstance(_active, dict):
                 _active = list(_active.values())
             _mts_strategies = {"MTS_ENTRY", "MTS_MANUAL", "MTS_RELEASE", "MTS_EXIT"}
+            _terminal = {
+                "FILLED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED",
+                "BROKER_NOT_FOUND", "BROKER_RECONCILED",
+            }
+            # Paper truth is the local simulator queue, not broker-style
+            # lifecycle history.  A stale active OrderManager row must not
+            # suppress the evaluator when paper_fill_sim has no corresponding
+            # pending order.  Live mode deliberately keeps the stricter
+            # OrderManager-based gate and is unchanged.
+            _paper_pending_ids = None
+            if not self.live_trading and self.paper_fill_sim is not None:
+                _paper_pending_ids = set(
+                    getattr(self.paper_fill_sim, "_pending_orders", {}) or {}
+                )
+                _paper_pending_ids.update(
+                    getattr(self.paper_fill_sim, "_pending_combos", {}) or {}
+                )
             _ages = []
             _now_dt = datetime.now()
             for _o in _active:
                 if str(getattr(_o, "strategy", "") or "") not in _mts_strategies:
+                    continue
+                _status = str(getattr(getattr(_o, "status", None), "value", getattr(_o, "status", "")) or "").upper()
+                if _status in _terminal:
+                    continue
+                if _paper_pending_ids is not None and getattr(_o, "order_id", None) not in _paper_pending_ids:
                     continue
                 _ts = getattr(_o, "created_at", None)
                 if _ts is None:
@@ -13787,10 +14288,13 @@ class FuturesMonitor:
 
                 _spread_side = _flag.get("side", "SELL_NEAR_BUY_FAR")
                 
-                # 2026-05-27 Gemini CLI: P0: Strict Price Integrity Contract
-                # Manual entry ONLY accepted from fresh LIVE_TICK.
-                # Use local_arrival_at to avoid clock drift issues. Increased limit to 5s.
-                _MAX_ENTRY_AGE_MS = 5000
+                # 2026-08-25 Item1 (Hermes): entry freshness is decided by
+                # the BBO-based hard gate (_check_entry_quote_freshness),
+                # not by last-trade age.  Last-trade age is telemetry only.
+                # 2026-08-25 Item1 (Hermes): dual-leg entry freshness hard gate
+                # threshold (config-overridable, default 12000ms).
+                _MAX_QUOTE_AGE_GATE_MS = int(self.cfg.get(
+                    "mts", {}).get("manual_entry_max_quote_age_ms", 12000))
                 _price = None
                 # 2026-06-23 Gemini CLI: Initialize with valid UNSET to satisfy price provenance test
                 _price_source = "UNSET"
@@ -13829,24 +14333,13 @@ class FuturesMonitor:
                     
                     if _price_raw and _price_raw > 0 and _arrival_at:
                         _tick_age_ms = (time.time() - _arrival_at) * 1000
-                        if _tick_age_ms <= _MAX_ENTRY_AGE_MS:
-                            _price = float(_price_raw)
-                            _price_source = "LIVE_TICK"
-                        else:
-                            self._manual_trade_status = f"REJECTED: STALE_TICK ({int(_tick_age_ms)}ms)"
-                            console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: Latest tick is stale ({int(_tick_age_ms)}ms > {_MAX_ENTRY_AGE_MS}ms)[/red]")
-                            
-                            # 2026-05-27 Gemini CLI: P3: Detailed rejection logging for observability
-                            self._append_mts_event("REJECTED_ENTRY", 
-                                                  reason="STALE_TICK",
-                                                  near_age_ms=int(_tick_age_ms),
-                                                  far_age_ms=-1, # Unknown
-                                                  max_allowed_age_ms=_MAX_ENTRY_AGE_MS,
-                                                  ticker=self.ticker)
-                            # 2026-06-05 JVS Claw: retryable — keep .processing for next tick
-                            self._flag_retry_count += 1
-                            console.print(f"[dim]🔄 [MANUAL_TRADE] Retry {self._flag_retry_count}/10 (STALE_TICK)[/dim]")
-                            return True
+                        # 2026-08-25 Item1 (Hermes): last-trade age is NO
+                        # LONGER the entry freshness gate (revised BBO spec).
+                        # The price is still usable; entry freshness is decided
+                        # solely by _check_entry_quote_freshness (BBO update
+                        # age).  Last-trade age remains as audit telemetry.
+                        _price = float(_price_raw)
+                        _price_source = "LIVE_TICK"
 
                     # 2026-06-05 JVS Claw: retryable — first tick hasn't arrived yet,
                     # next tick populates market_data → succeeds
@@ -13855,6 +14348,16 @@ class FuturesMonitor:
                     if _src != "LIVE_TICK":
                         self._manual_trade_status = "REJECTED: NO_LIVE_TICK"
                         console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: No fresh LIVE_TICK available (Source={_price_source})[/red]")
+                        # 2026-08-25 Item1 (Hermes): missing/unknown near quote
+                        # also records the unified stale-quote audit event.
+                        self._append_mts_event("ENTRY_BLOCKED_STALE_QUOTE",
+                                              reason="NO_LIVE_TICK",
+                                              action="MANUAL_TRADE",
+                                              near_age_ms=None,
+                                              far_age_ms=None,
+                                              near_source=_price_source,
+                                              far_source="UNRESOLVED_YET",
+                                              threshold=_MAX_QUOTE_AGE_GATE_MS)
                         self._flag_retry_count += 1
                         console.print(f"[dim]🔄 [MANUAL_TRADE] Retry {self._flag_retry_count}/10 (NO_LIVE_TICK)[/dim]")
                         return True
@@ -13885,6 +14388,43 @@ class FuturesMonitor:
                 else:
                     # Guard for test check: self.dry_run or not self.live_trading or paper
                     _far_price_source = "FLAG_FALLBACK"
+
+                # ── 2026-08-25 Item1 (Hermes): MTS manual ENTRY freshness
+                # hard gate — BBO-based (revised spec) ──
+                # Reject a NEW spread entry unless BOTH legs carry a valid,
+                # fresh BBO update: bid & ask present, finite positive
+                # numeric, ask >= bid (never crossed), and BBO update
+                # timestamp age <= 12000ms.  Last-trade age is kept ONLY as
+                # telemetry (audit fields) and never gates the entry.
+                # Fail-closed in paper AND live mode alike.  This gate runs
+                # only on the ENTRY path (spread action); it never touches
+                # existing-position release / stop-loss / emergency exit,
+                # which live in the strategy and close_all paths.
+                _gate_ok, _gate_detail = self._check_entry_quote_freshness(
+                    near_slot=self.market_data.get(self.ticker, {}),
+                    far_slot=self.market_data.get(f"{self.ticker}_FAR", {})
+                    or self.market_data.get(
+                        getattr(self.far_contract, "code", ""), {}),
+                    near_trade_age_ms=_tick_age_ms,
+                    far_trade_age_ms=_far_tick_age_ms,
+                    near_source=_price_source,
+                    far_source=_far_price_source,
+                )
+                if not _gate_ok:
+                    self._manual_trade_status = "REJECTED: STALE_QUOTE"
+                    console.print(
+                        "[red]⛔ [MANUAL_TRADE] Rejected: stale/invalid BBO "
+                        f"({_gate_detail.get('reason')})[/red]")
+                    self._append_mts_event(
+                        "ENTRY_BLOCKED_STALE_QUOTE",
+                        action="MANUAL_TRADE",
+                        threshold=_MAX_QUOTE_AGE_GATE_MS,
+                        **_gate_detail)
+                    # retryable — keep .processing for the next tick
+                    self._flag_retry_count += 1
+                    console.print(
+                        f"[dim]🔄 [MANUAL_TRADE] Retry {self._flag_retry_count}/10 (STALE_QUOTE)[/dim]")
+                    return True
 
                 _ts = datetime.now()
                 _trade_id = f"mts-{_ts.strftime('%Y%m%d-%H%M%S')}"
@@ -14409,7 +14949,14 @@ class FuturesMonitor:
                 _exit_side = "SELL" if str(_side_before).upper() == "LONG" else "BUY"
                 _entry = float(tracker.get(f"{_leg_key}_entry") or 0.0)
                 _exit_px = tracker.get(f"{_leg_key}_price")
-                _px_source = "BROKER_FILL" if _exit_px is not None else "STATE_SNAPSHOT"
+                # 2026-08-27 (codex spec §3): paper fills must NEVER be
+                # marked BROKER_FILL — that is broker-truth provenance for
+                # live fills only.  Paper mode uses PAPER_FILL so the
+                # performance reconstruction can classify provenance.
+                _px_source = (
+                    "BROKER_FILL" if (self.live_trading and _exit_px is not None)
+                    else "PAPER_FILL" if _exit_px is not None
+                    else "STATE_SNAPSHOT")
                 if _exit_px is None:
                     _exit_px = float(price or 0.0)
                 _qty = int(tracker.get(f"{_leg_key}_filled_qty") or 0)

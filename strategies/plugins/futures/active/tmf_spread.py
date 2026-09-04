@@ -29,13 +29,18 @@ Re-entry:
 """
 
 from __future__ import annotations
-from core.runtime_paths import runtime_logs
+from core.runtime_paths import (
+    runtime_logs,
+    mts_position_state_path,
+    stamp_runtime_state,
+)
 
 import logging
 import os
 import json
 import math
 import time
+from collections import deque
 import pandas as pd
 from datetime import datetime
 from typing import Any, TypeVar
@@ -401,8 +406,13 @@ _TRAIL_DISTANCE_PTS = 30  # remaining leg trailing stop distance (pt)
 # 2026-05-27 Gemini CLI: Environmental isolation for state file
 # 2026-07-08 Gemini CLI: Default to test path if running under pytest to prevent state file leakage
 import sys
-_default_state_path = "/tmp/test_mts_position_state.json" if ("pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ) else "/tmp/mts_position_state.json"
-_MTS_STATE_FILE = os.getenv("MTS_STATE_PATH", _default_state_path)
+import tempfile
+_default_state_path = os.path.join(tempfile.gettempdir(), "test_mts_position_state.json")
+_MTS_STATE_FILE = os.getenv(
+    "MTS_STATE_PATH",
+    _default_state_path if ("pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ)
+    else mts_position_state_path(),
+)
 
 # 💡 Gemini CLI: Dynamic state file path supporting thread-local overrides for multi-instance monitors
 def _get_state_file_path() -> Path:
@@ -413,8 +423,16 @@ def _get_state_file_path() -> Path:
         from strategies.futures.monitor import _mts_position_state_path
         return _mts_position_state_path()
     except Exception:
-        return Path(os.getenv("MTS_STATE_PATH", _default_state_path))
-_MTS_EVENT_LOG = os.getenv("MTS_EVENT_LOG_PATH", "logs/mts_spread_events.jsonl")
+        return Path(mts_position_state_path())
+# One canonical append-only ledger for strategy and dashboard.  A relative
+# default follows PM2 cwd, which can be the release worktree while the
+# dashboard reads the shared runtime directory; that split silently hides all
+# HVWAP telemetry (and makes the panel report DATA_PIPELINE_MISSING).  Allow
+# an explicit override for tests, otherwise always use the runtime SSOT.
+_MTS_EVENT_LOG = os.getenv(
+    "MTS_EVENT_LOG_PATH",
+    os.path.join(runtime_logs(), "mts_spread_events.jsonl"),
+)
 def _fills_ledger_path() -> str:
     """Resolve the durable fills ledger path.
 
@@ -495,7 +513,7 @@ class QuoteFreshnessPolicy:
     def __init__(
         self,
         near_max_ms: float = 3000.0,
-        near_hard_stale_ms: float = 10000.0,
+        near_hard_stale_ms: float = 12000.0,
         far_max_ms: float = 8000.0,
         far_hard_stale_ms: float = 15000.0,
         emergency_stale_ms: float = 30000.0,
@@ -1500,6 +1518,10 @@ def _write_mts_state(
         _expected_revision_val = kwargs.pop("expected_revision", None)
         # 2026-06-26 Gemini CLI: merge extra risk metrics / kwargs
         state.update(kwargs)
+        # Identity metadata is part of the canonical state contract.  It is
+        # stamped immediately before the existing CAS + atomic replace path;
+        # no lifecycle semantics are changed.
+        stamp_runtime_state(state, existing)
         # ── Policy J effective guard metadata (2026-08-04 config observability) ──
         # Merged into the OUTPUT state (not just `existing`); only refresh
         # guard CONFIG metadata, never touch per-trade peak/durable state.
@@ -1690,6 +1712,7 @@ def _write_mts_telemetry(
             if _key in existing:
                 telemetry[_key] = existing[_key]
 
+        stamp_runtime_state(telemetry, existing)
         import random
         _tmp = f"{_target_state_file}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
         with open(_tmp, "w") as f:
@@ -1898,6 +1921,31 @@ class TMFSpread(StrategyBase):
         self._emitted_renko_event_keys = set()  # 2026-08-02 Antigravity: RenkoTracker instance
         self._emitted_renko_event_keys = set()
 
+        # 2026-08-23 Hermes Agent: Hierarchical VWAP candidate arm (MTS 2.0)
+        # TELEMETRY-ONLY bookkeeping: completed 5m bar ring (close-time ts)
+        # fed from the bar stream. Consumed solely by _hvwap_candidate_tick;
+        # never read by any baseline/lifecycle/order path.
+        self._hvwap_5m_bars: deque = deque(maxlen=320)
+        self._hvwap_last_bucket: int | None = None
+        self._hvwap_pending_snapshot: dict | None = None
+        self._hvwap_last_emit_bucket: int | None = None
+        # 2026-08-23 Hermes Agent: paper-only direct VWAP release wiring state
+        # (see _hvwap_maybe_paper_release). All telemetry/release state is
+        # observation-only for the baseline Renko+ADL+Micro-VWAP arm.
+        self._hvwap_last_verdict = None          # freshest pure candidate verdict
+        self._hvwap_armed = False                # first completed bar committed after wiring start
+        self._hvwap_release_sent_trade_id = None # idempotency: one candidate release per trade
+        self._hvwap_baseline_clear_tick = False  # baseline produced NO exit decision this tick
+        self._hvwap_execution_mode = None        # injected by monitor each tick (effective_mode)
+        self._hvwap_live_order_allowed = False   # injected by monitor each tick
+        # 2026-08-24 Hermes Agent: fail-closed diagnostics — the candidate
+        # pipeline must never fail SILENTLY. Every no-evaluate path emits an
+        # explicit HVWAP_DATA_UNAVAILABLE event (rate-limited once per 5m
+        # bucket via _hvwap_diag_last_bucket) so the dashboard can
+        # distinguish NOT_EVALUATED / DATA_PIPELINE_MISSING from a real
+        # UNKNOWN/BLOCK verdict. Telemetry-only; baseline/risk untouched.
+        self._hvwap_diag_last_bucket: int | None = None
+
         # P1: Spread-level excursions (telemetry only)
         self._spread_near_high: float = 0.0
         self._spread_near_low: float = 0.0
@@ -2012,6 +2060,548 @@ class TMFSpread(StrategyBase):
         except Exception:
             logger.warning("[MTS_TREND_RELEASE] seam fail-closed (exception)", exc_info=True)
             return False, None
+
+    def _hvwap_candidate_tick(self, bar: dict, now) -> None:
+        """2026-08-23 Hermes Agent: Hierarchical VWAP candidate arm (MTS 2.0).
+
+        PARALLEL, TELEMETRY-ONLY seam. It:
+          * accumulates COMPLETED 5m bars (close-time ts) into a ring buffer
+            from the bar stream (bucket-roll detection) — warms VWAP/slope
+            history even while FLAT;
+          * evaluates the pure Hierarchical VWAP candidate
+            (strategies.plugins.futures.active.mts_hvwap_candidate) and
+            appends one `HVWAP_CANDIDATE` telemetry record per completed 5m
+            bar while a position is held;
+          * NEVER gates the baseline Renko+ADL+Micro-VWAP 2-of-3 decision
+            arm, NEVER emits orders, NEVER touches lifecycle/position/order
+            state, and NEVER raises (any failure fails closed for the
+            candidate only).
+
+        VWAP contract (spec docs/mts/mts_vwap_filter_spec.md section 1.4):
+          per-leg session VWAP from each leg's OWN volume, trading day
+          resetting at 15:00 and carrying through the next-day session; no
+          prior-trading-day data. The NEAR leg accumulates its own volume
+          from the bar stream; the FAR leg carries its own tick volume via
+          the `far_volume` bar field (monitor exposes `_far_current_bar`
+          volume). When far volume is absent/zero the far leg fails closed
+          (MISSING_VWAP) — the monitor's deque-wide `far_vwap` is recorded
+          as `far_vwap_bar_ref` for reference only and is NEVER used as a
+          gate input or volume substitute.
+
+        Timestamp rule: `bar["ts"]` in this pipeline is a 5m bucket-START
+        (proven floor(epoch/300)*300); bar_close_time() shifts to the close
+        time ONLY for bucket-aligned timestamps and never double-shifts a
+        non-aligned (already point/close) timestamp.
+        """
+        try:
+            from strategies.plugins.futures.active.mts_hvwap_candidate import (
+                evaluate_hvwap_candidate,
+                compute_counterfactual_outcomes,
+                bar_close_time,
+            )
+            _close = bar_close_time(bar.get("ts") or bar.get("timestamp"))
+            if _close is None:
+                # 2026-08-24: explicit fail-closed diagnostic (previously a
+                # SILENT return -> production data gap with zero visibility).
+                self._hvwap_emit_data_unavailable(
+                    bar, reason="NO_BAR_TIMESTAMP",
+                    detail=f"ts_type={type(bar.get('ts')).__name__} "
+                           f"timestamp_type={type(bar.get('timestamp')).__name__} "
+                           f"keys={sorted(bar.keys())}")
+                return
+            _bucket = int(_close // 300.0)
+
+            # bucket-roll: the previous bucket is now COMPLETE -> commit it
+            _last_bucket = getattr(self, "_hvwap_last_bucket", None)
+            if _last_bucket is not None and _bucket > _last_bucket:
+                _snap = getattr(self, "_hvwap_pending_snapshot", None)
+                if _snap is not None:
+                    self._hvwap_5m_bars.append(_snap)
+                    # 2026-08-23 Hermes Agent: fresh completed bar after wiring
+                    # start — required before any candidate paper release (no
+                    # retroactive release on startup/recovery from an old
+                    # verdict; the first bar committed AFTER construction arms
+                    # the release path).
+                    self._hvwap_armed = True
+            self._hvwap_last_bucket = _bucket
+
+            _n_raw = bar.get("near_close")
+            if _n_raw is None:
+                _n_raw = bar.get("near_close_rt")
+            if _n_raw is None:
+                _n_raw = bar.get("close")
+            if _n_raw is None:
+                _n_raw = bar.get("Close")
+            _f_raw = bar.get("far_close")
+            if _f_raw is None:
+                _f_raw = bar.get("far_close_rt")
+            try:
+                _n_f = float(_n_raw) if _n_raw is not None else 0.0
+            except (TypeError, ValueError):
+                _n_f = 0.0
+            try:
+                _f_f = float(_f_raw) if _f_raw is not None else 0.0
+            except (TypeError, ValueError):
+                _f_f = 0.0
+            # Monitor 5m DataFrame bars may preserve OHLCV capitalization.
+            _vol_raw = bar.get("volume")
+            if _vol_raw is None:
+                _vol_raw = bar.get("Volume")
+            try:
+                _n_vol = float(_vol_raw) if _vol_raw is not None else 0.0
+            except (TypeError, ValueError):
+                _n_vol = 0.0
+            _far_vol_raw = bar.get("far_volume") or bar.get("far_volume_rt")
+            try:
+                _far_vol = float(_far_vol_raw) if _far_vol_raw is not None else 0.0
+            except (TypeError, ValueError):
+                _far_vol = 0.0
+            self._hvwap_pending_snapshot = {
+                "ts": _close,
+                "close": _n_f,
+                "volume": _n_vol,
+                "far_close": _f_f,
+                "far_volume": _far_vol,
+                "far_vwap_ref": bar.get("far_vwap"),
+            }
+
+            # ── fresh candidate verdict: computed EVERY tick while a position
+            # is held (the paper-release gate needs the CURRENT bar's verdict).
+            # Telemetry EMISSION stays rate-limited to one record per completed
+            # 5m bar; the verdict itself is refreshed per tick.
+            # Ledger authority is read-only input from FuturesMonitor.  It is
+            # needed during PAPER recovery because _has_position may still be
+            # None before the normal strategy hydration pass completes.
+            _authority_has_position = (
+                bar.get("_mts_authority_has_position") is True
+            )
+            _hvwap_has_position = self._has_position is True or _authority_has_position
+            if _hvwap_has_position:
+                # 2026-08-24: make the pre-first-emission warmup VISIBLE —
+                # when a position is held but no candidate event has ever been
+                # emitted, record an explicit WARMUP_PENDING diagnostic once
+                # per bucket instead of failing silently.
+                if (getattr(self, "_hvwap_last_verdict", None) is None
+                        and getattr(self, "_hvwap_last_emit_bucket", None) is not None):
+                    self._hvwap_emit_data_unavailable(
+                        bar, reason="WARMUP_PENDING",
+                        detail="position held, awaiting first completed-bar "
+                               "evaluation (emit cadence = 1 per 5m bar)")
+                _phase = "SPREAD"
+                try:
+                    _ph = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
+                    if _ph is not None:
+                        _phase = _ph.value if hasattr(_ph, "value") else str(_ph)
+                except Exception:
+                    _phase = "SPREAD"
+                _atr_raw = bar.get("atr")
+                try:
+                    _atr_f = float(_atr_raw) if _atr_raw is not None else None
+                except (TypeError, ValueError):
+                    _atr_f = None
+                _n_age = bar.get("near_tick_age_ms")
+                _f_age = bar.get("far_tick_age_ms")
+
+                near_bars = list(self._hvwap_5m_bars)
+                _prewarm_bars = bar.get("regime_prewarm_bars") or []
+                far_bars = [
+                    {"ts": _b["ts"], "close": _b["far_close"],
+                     "volume": _b.get("far_volume", 0.0)}
+                    for _b in near_bars if _b.get("far_close", 0.0) > 0
+                ]
+                verdict = evaluate_hvwap_candidate(
+                    decision_ts=_close,
+                    near_bars=near_bars,
+                    far_bars=far_bars,
+                    regime_prewarm_bars=_prewarm_bars,
+                    near_price=_n_f if _n_f > 0 else None,
+                    far_price=_f_f if _f_f > 0 else None,
+                    near_side=getattr(self, "_near_side", None),
+                    far_side=getattr(self, "_far_side", None),
+                    atr_15m=_atr_f,
+                    near_quote_age_ms=_n_age,
+                    far_quote_age_ms=_f_age,
+                    position_phase=_phase,
+                )
+                self._hvwap_last_verdict = verdict
+                if getattr(self, "_hvwap_last_emit_bucket", None) == _bucket:
+                    return
+                self._hvwap_last_emit_bucket = _bucket
+            else:
+                # 2026-08-24: defensive diagnostic — a truthy-but-not-True
+                # _has_position (e.g. serialization artifact) would silently
+                # starve the in-position emit branch (production data gap).
+                if self._has_position:
+                    self._hvwap_emit_data_unavailable(
+                        bar, reason="HAS_POSITION_NON_BOOL",
+                        detail=f"type={type(self._has_position).__name__} "
+                               f"value={self._has_position!r}")
+                # flat: advance the cadence bucket so the first in-position
+                # bar emits on its completion (existing cadence contract)
+                self._hvwap_last_emit_bucket = _bucket
+                return
+
+            # baseline parity reference (read-only, idempotent)
+            _base_enabled, _base_snap = self._build_trend_release_input()
+            _base_pass = bool(_base_snap and _base_snap.get("pass_release")) if _base_enabled else False
+            _base_rel = (_base_snap or {}).get("release_leg") if _base_enabled else None
+
+            # paired counterfactual (hypothetical release, PURE & isolated)
+            _cf = None
+            _rel_leg = verdict.hypothetical_release_leg
+            if (_phase == "SPREAD" and _rel_leg and _n_f > 0 and _f_f > 0
+                    and getattr(self, "_near_entry", 0) and getattr(self, "_far_entry", 0)):
+                try:
+                    _mult = float(get_point_value(self._ticker))
+                except Exception:
+                    _mult = 10.0
+                _rel_price = _n_f if _rel_leg == "NEAR" else _f_f
+                _entry = self._near_entry if _rel_leg == "NEAR" else self._far_entry
+                _friction = 40.0 + (_rel_price + _entry) * _mult * 2e-5
+                _cf = compute_counterfactual_outcomes(
+                    near_side=getattr(self, "_near_side", None),
+                    far_side=getattr(self, "_far_side", None),
+                    near_entry=self._near_entry, far_entry=self._far_entry,
+                    release_leg=_rel_leg, release_price=_rel_price,
+                    near_now=_n_f, far_now=_f_f,
+                    point_value=_mult, release_friction_twd=_friction,
+                )
+
+            _payload = verdict.to_dict()
+            _payload.update({
+                "timestamp": now.isoformat() if hasattr(now, "isoformat") else str(now),
+                "trade_id": getattr(self, "_trade_id", None),
+                "position_phase": _phase,
+                "near_vwap_bar_ref": bar.get("near_vwap"),
+                "far_vwap_bar_ref": bar.get("far_vwap"),
+                "baseline_enabled": _base_enabled,
+                "baseline_pass_release": _base_pass,
+                "baseline_release_leg": _base_rel,
+                "release_action_emitted": False,
+                "release_outcome": "PENDING",
+                "counterfactual": _cf.to_dict() if _cf else None,
+            })
+            _append_event("HVWAP_CANDIDATE", **_payload)
+        except Exception as _hvwap_exc:
+            # 2026-08-24: fail-closed for the candidate only — NEVER disturb
+            # the baseline, but record an EXPLICIT diagnostic event (the
+            # previous warning-only path left the production ledger with zero
+            # visibility on pipeline failures).
+            logger.warning("[HVWAP_CANDIDATE] telemetry eval failed (fail-closed)", exc_info=True)
+            try:
+                self._hvwap_emit_data_unavailable(
+                    bar, reason="EVAL_EXCEPTION",
+                    detail=f"{type(_hvwap_exc).__name__}: {_hvwap_exc}")
+            except Exception:
+                pass
+
+    def _hvwap_emit_data_unavailable(self, bar: dict, *, reason: str,
+                                     detail: str | None = None) -> None:
+        """2026-08-24 Hermes Agent: explicit fail-closed diagnostic for the
+        HVWAP candidate pipeline.
+
+        Emits one HVWAP_DATA_UNAVAILABLE event per 5m bucket (rate-limited)
+        whenever the pipeline cannot evaluate: NO_BAR_TIMESTAMP (no parseable
+        bar ts), EVAL_EXCEPTION (candidate evaluation raised), WARMUP_PENDING
+        (position held, first completed-bar emission pending), or
+        HAS_POSITION_NON_BOOL (truthy-but-not-True _has_position). The
+        dashboard uses these to distinguish NOT_EVALUATED /
+        DATA_PIPELINE_MISSING from a real UNKNOWN/BLOCK verdict, with last
+        event age + reason. Telemetry-only: never raises, never touches
+        baseline/risk/order state.
+        """
+        try:
+            from strategies.plugins.futures.active.mts_hvwap_candidate import (
+                bar_close_time,
+            )
+            _close = bar_close_time(bar.get("ts") or bar.get("timestamp"))
+            _bucket = int(_close // 300.0) if _close is not None else 0
+            if getattr(self, "_hvwap_diag_last_bucket", None) == _bucket:
+                return
+            self._hvwap_diag_last_bucket = _bucket
+            _payload = {
+                "reason": reason,
+                "detail": detail,
+                "has_position": (
+                    self._has_position is True
+                    or bar.get("_mts_authority_has_position") is True
+                ),
+                "lifecycle": getattr(self, "_lifecycle", None),
+                "trade_id": getattr(self, "_trade_id", None),
+                "n_completed_5m_bars": len(self._hvwap_5m_bars),
+                "armed": getattr(self, "_hvwap_armed", False),
+                "n_pending_bucket": _bucket,
+            }
+            _append_event("HVWAP_DATA_UNAVAILABLE", **_payload)
+        except Exception:
+            logger.warning("[HVWAP] diagnostic emission failed (non-fatal)", exc_info=True)
+
+    def _hvwap_paper_gate(self) -> tuple[bool, str]:
+        """2026-08-23 Hermes Agent: paper-only activation gate (fail-closed).
+
+        Active ONLY when effective_mode == "paper_active" (injected by the
+        monitor each tick) or env PAPER_MODE is truthy, AND live_order_allowed
+        is False. Any live mode, live_order_allowed=True, or unknown mode ->
+        (False, reason): the candidate can never touch a live/broker path.
+        """
+        _mode = getattr(self, "_hvwap_execution_mode", None)
+        _live_allowed = bool(getattr(self, "_hvwap_live_order_allowed", False))
+        _pm = (os.getenv("PAPER_MODE", "") or "").strip().lower()
+        _pm_on = _pm in ("true", "1", "yes")
+        if _live_allowed:
+            return False, "LIVE_ORDER_ALLOWED"
+        if _mode is not None and str(_mode).startswith("live"):
+            return False, f"LIVE_MODE:{_mode}"
+        if _mode is not None and _mode != "paper_active":
+            return False, f"MODE:{_mode}"
+        if _mode == "paper_active" or _pm_on:
+            return True, ("PAPER_ACTIVE" if _mode == "paper_active" else "PAPER_MODE_ENV")
+        return False, "MODE_UNKNOWN"
+
+    def _mts_atr_release_trend_gate(self) -> tuple[bool, str]:
+        """2026-08-26 Hermes Agent: paper-only ATR-release trend gate (fail-closed).
+
+        ON only when the monitor-injected effective_mode == "paper_active"
+        AND live_order_allowed is False AND env MTS_ATR_RELEASE_TREND_GATE is
+        not "0" (default ON for paper). Any live/unknown mode,
+        live_order_allowed=True, or explicit "0" -> OFF: the baseline ATR
+        release fallback keeps its existing behavior (no trend requirement).
+        The result is surfaced into the lifecycle adapter context as the
+        pure boolean key release_trend_gate_enabled.
+        """
+        _mode = getattr(self, "_hvwap_execution_mode", None)
+        _live_allowed = bool(getattr(self, "_hvwap_live_order_allowed", False))
+        if _live_allowed:
+            return False, "LIVE_ORDER_ALLOWED"
+        if _mode is not None and _mode != "paper_active":
+            return False, f"MODE:{_mode}"
+        if _mode is None:
+            return False, "MODE_UNKNOWN"
+        _env = (os.getenv("MTS_ATR_RELEASE_TREND_GATE", "") or "").strip().lower()
+        if _env == "0":
+            return False, "ENV_DISABLED"
+        return True, "PAPER_ACTIVE"
+
+    def _build_trend_reversal_input(self) -> dict | None:
+        """Build paper-only reversal evidence from the latest HVWAP verdict.
+
+        Reversal requires a completed/session-valid verdict, a 15m reversal,
+        and two opposing completed 5m confirmations. Missing or stale data is
+        never converted into an exit signal.
+        """
+        ok, _ = self._hvwap_paper_gate()
+        if not ok:
+            return None
+        verdict = getattr(self, "_hvwap_last_verdict", None)
+        if verdict is None:
+            return None
+        _sig15 = getattr(getattr(verdict, "signal_15m", None), "value", getattr(verdict, "signal_15m", None))
+        if _sig15 != "REVERSAL" or not bool(getattr(verdict, "micro_conflict", False)):
+            return None
+        if not bool(getattr(verdict, "bars_complete", False)) or not bool(getattr(verdict, "session_boundary_ok", False)):
+            return None
+        if int(getattr(verdict, "n_completed_5m_bars", 0) or 0) < 2:
+            return None
+        _age = getattr(verdict, "quote_age_ms", None)
+        try:
+            _age_f = float(_age)
+            _max_age = float(getattr(self, "_max_quote_age_ms", 10000.0))
+        except (TypeError, ValueError):
+            return None
+        if not (0.0 <= _age_f <= _max_age):
+            return None
+        return {
+            "decision_ts": str(getattr(verdict, "decision_ts", "")),
+            "asof_ts": str(getattr(verdict, "decision_ts", "")),
+            "reversal_confirmed": True,
+            "decision_max_quote_age_ms": _age_f,
+            "window_max_quote_age_ms": _age_f,
+            "signal_15m": _sig15,
+            "micro_conflict": True,
+        }
+
+    def _hvwap_release_quote_age_ok(self, bar: dict, rel_leg: str) -> tuple[bool, float]:
+        """Defensive parity with the baseline freshness gate (decoupled-leg
+        semantics: only the RELEASED leg's quote age matters)."""
+        _key = "near_tick_age_ms" if rel_leg == "NEAR" else "far_tick_age_ms"
+        _age = bar.get(_key)
+        try:
+            _age_f = float(_age or 0.0)
+        except (TypeError, ValueError):
+            _age_f = 0.0
+        _max = float(getattr(self, "_max_quote_age_ms", 10000.0))
+        return _age_f <= _max, _age_f
+
+    def _hvwap_release_width_ok(self, bar: dict, rel_leg: str) -> tuple[bool, float]:
+        """Defensive parity with the baseline quote-validity + spread-width
+        gates for the released leg (missing quote keys are NOT a failure —
+        the baseline width gate only applies when keys are present)."""
+        _bid_k, _ask_k = (("near_bid", "near_ask") if rel_leg == "NEAR"
+                          else ("far_bid", "far_ask"))
+        _b, _a = bar.get(_bid_k), bar.get(_ask_k)
+        _max = float(getattr(self, "_max_spread_width", 50.0))
+        if _b is None and _a is None:
+            return True, 0.0
+        _numeric = (isinstance(_b, (int, float)) and not isinstance(_b, bool)
+                    and isinstance(_a, (int, float)) and not isinstance(_a, bool))
+        if not _numeric:
+            return False, float("nan")      # QUOTE_INVALID parity
+        _w = float(_a) - float(_b)
+        return _w <= _max, _w
+
+    def _hvwap_maybe_paper_release(self, bar: dict, now, near_close: float,
+                                    far_close: float) -> Signal | None:
+        """2026-08-23 Hermes Agent: paper-only direct VWAP release wiring.
+
+        Called from on_bar AFTER _manage_position returned None with the
+        baseline-clear marker set (no baseline lifecycle exit decision this
+        tick). An ALIGNED_PASS Hierarchical VWAP verdict MAY create a PAPER
+        release intent for verdict.hypothetical_release_leg via the EXISTING
+        paper lifecycle/order simulator — the same PARTIAL_EXIT signal path
+        the baseline RELEASE decision uses (monitor _submit_mts_order_signal
+        -> order_mgr + paper_fill_sim).
+
+        Guarantees:
+          * PAPER-ONLY: effective_mode paper_active / PAPER_MODE=true and
+            live_order_allowed False; live modes fail closed — never a
+            broker/live order path.
+          * NEVER blocks/replaces baseline: fires only when the baseline
+            adapter produced NO exit decision this tick (risk exits, Policy
+            J, timeout, baseline release all take precedence via
+            _hvwap_baseline_clear_tick), lifecycle is OPEN, phase SPREAD,
+            release_group ARMED/INACTIVE, no exit owner, no released leg.
+          * IDEMPOTENT: one candidate release intent per trade
+            (_hvwap_release_sent_trade_id); the lifecycle RELEASE_* state +
+            release_group TRIGGERED + release timer block duplicates on
+            subsequent ticks.
+          * FRESH-BAR: requires at least one completed 5m bar committed
+            after construction/recovery (_hvwap_armed) — never retroactive
+            on startup from an old verdict.
+          * DEFENSIVE PARITY: quote age and bid/ask validity/width are
+            re-checked so a stale/invalid/wide quote cannot be bypassed.
+        """
+        try:
+            from strategies.plugins.futures.active.mts_hvwap_candidate import (
+                HvwapStatus,
+            )
+        except Exception:
+            HvwapStatus = None
+        try:
+            _ok, _reason = self._hvwap_paper_gate()
+            if not _ok:
+                _append_event("HVWAP_RELEASE_BLOCKED", source="HVWAP_CANDIDATE",
+                              reason=_reason, trade_id=getattr(self, "_trade_id", None))
+                return None
+            # baseline-clear marker (defense in depth; on_bar checks it first):
+            # when the baseline lifecycle evaluation produced ANY exit
+            # decision this tick, the candidate must not act.
+            if not getattr(self, "_hvwap_baseline_clear_tick", False):
+                return None
+            _v = getattr(self, "_hvwap_last_verdict", None)
+            if (_v is None or HvwapStatus is None
+                    or _v.status != HvwapStatus.ALIGNED_PASS):
+                return None
+            if not getattr(self, "_hvwap_armed", False):
+                return None
+            if self._has_position is not True:
+                return None
+            if getattr(self, "_released_leg", None) is not None:
+                return None
+            if getattr(self, "_lifecycle", "OPEN") != "OPEN":
+                return None
+            if getattr(self, "_hvwap_release_sent_trade_id", None) == getattr(
+                    self, "_trade_id", None):
+                return None
+            if getattr(self, "_manual_exit_requested", False):
+                return None
+            if getattr(self, "_release_pending_mono", 0.0) > 0:
+                return None
+            if (getattr(self, "_release_near_ticks", 0) > 0
+                    or getattr(self, "_release_far_ticks", 0) > 0):
+                return None
+            _lc = getattr(self, "_lifecycle_oca", None)
+            if _lc is None:
+                return None
+            _phase = getattr(_lc, "phase", None)
+            if getattr(_phase, "value", _phase) != PositionPhase.SPREAD.value:
+                return None
+            _rg = getattr(_lc, "release_group", None)
+            _rg_status = getattr(getattr(_rg, "status", None), "value", "")
+            if _rg_status not in ("ARMED", "INACTIVE"):
+                return None
+            if getattr(_lc, "exit_owner", None) is not None:
+                return None
+            _rel = getattr(_v, "hypothetical_release_leg", None)
+            if _rel not in ("NEAR", "FAR"):
+                return None
+            _exit_price = near_close if _rel == "NEAR" else far_close
+            if _exit_price is None or _exit_price <= 0:
+                return None
+            _age_ok, _age = self._hvwap_release_quote_age_ok(bar, _rel)
+            if not _age_ok:
+                _append_event("HVWAP_RELEASE_BLOCKED", source="HVWAP_CANDIDATE",
+                              reason="STALE_QUOTE", quote_age_ms=_age,
+                              trade_id=getattr(self, "_trade_id", None))
+                return None
+            _width_ok, _w = self._hvwap_release_width_ok(bar, _rel)
+            if not _width_ok:
+                _append_event("HVWAP_RELEASE_BLOCKED", source="HVWAP_CANDIDATE",
+                              reason="QUOTE_INVALID_OR_WIDE", width=_w,
+                              trade_id=getattr(self, "_trade_id", None))
+                return None
+
+            # ── apply the PAPER release intent (existing lifecycle path) ──
+            _leg = Leg.NEAR if _rel == "NEAR" else Leg.FAR
+            self._lifecycle = f"RELEASE_{_leg.value}"
+            self._release_ts = now
+            self._release_mono = time.monotonic()
+            self._release_pending_mono = time.monotonic()
+            self._release_price = _exit_price
+            _decision = LifecycleDecision(action=LifecycleAction.RELEASE,
+                                          release_leg=_leg,
+                                          winner="HVWAP_CANDIDATE")
+            _commit_action(self._lifecycle_oca, _decision)
+            self._hvwap_release_sent_trade_id = self._trade_id
+            _append_event(
+                "HVWAP_RELEASE_INTENT",
+                source="HVWAP_CANDIDATE",
+                release_leg=_rel,
+                exit_price=_exit_price,
+                decision_ts=_v.decision_ts,
+                session_label=_v.session_label,
+                regime_60m=_v.regime_60m.value,
+                signal_15m=_v.signal_15m.value,
+                consecutive_confirmed_bars=_v.consecutive_confirmed_bars,
+                retained_direction=_v.retained_direction,
+                status=_v.status.value,
+                gate_mode=_reason,
+                fresh_bar_after_wiring=self._hvwap_armed,
+                trade_id=getattr(self, "_trade_id", None),
+            )
+            try:
+                _write_mts_state(
+                    has_position=True, action=f"RELEASE_{_leg.value}",
+                    reason="HVWAP_CANDIDATE",
+                    near_entry=self._near_entry, far_entry=self._far_entry,
+                    near_last=near_close, far_last=far_close,
+                    near_side=self._near_side, far_side=self._far_side,
+                    spread_z=bar.get("spread_z") or 0.0,
+                    release_price=_exit_price,
+                    trade_id=self._trade_id, ticker=self._ticker,
+                    lifecycle=lifecycle_to_dict(self._lifecycle_oca),
+                )
+            except Exception:
+                logger.warning("[HVWAP_RELEASE] state write failed (non-fatal)",
+                               exc_info=True)
+            logger.warning(
+                "[HVWAP_RELEASE_INTENT] leg=%s price=%.1f decision_ts=%s "
+                "source=HVWAP_CANDIDATE mode=%s",
+                _rel, _exit_price, _v.decision_ts, _reason)
+            return Signal("PARTIAL_EXIT", f"TMF_RELEASE_{_leg.value}", confidence=0.4)
+        except Exception:
+            # fail-closed for the candidate only: never blocks the baseline
+            logger.warning("[HVWAP_RELEASE] eval failed (fail-closed)", exc_info=True)
+            return None
 
     def _ensure_lifecycle_adapter_initialized(self, source: str = "NORMAL") -> None:
         """
@@ -2524,7 +3114,7 @@ class TMFSpread(StrategyBase):
         }
 
     def write_state(self, action: str, reason: str, **kwargs) -> None:
-        """Write the current state to /tmp/mts_position_state.json.
+        """Write the current state to the canonical runtime state file.
         2026-06-26 Gemini CLI: Centralized state writing to avoid heartbeat wipes.
         """
         kw = dict(kwargs)
@@ -2761,6 +3351,81 @@ class TMFSpread(StrategyBase):
         self._pj_last_eval_ts = now_ms
         return self._pj_durable_peak is not None
 
+    def _build_decision_evidence(self, exit_reason: str, pnl: float, bar: dict) -> dict:
+        """Capture every release/exit predicate at the decision timestamp.
+
+        This is deliberately a snapshot, not a reconstructed explanation: a
+        later fill/reconciliation pass must be able to tell which ATR, PnL,
+        trail, VWAP and trend predicates were true or false when the action
+        was selected.
+        """
+        risk = self._get_risk_meta(bar)
+        near = float(bar.get("near_close", 0.0) or 0.0)
+        far = float(bar.get("far_close", 0.0) or 0.0)
+        near_pnl = self._pnl_near(near) if near else None
+        far_pnl = self._pnl_far(far) if far else None
+        release_threshold = risk.get("final_release_stop")
+        if release_threshold is None:
+            release_threshold = risk.get("release_stop")
+        release_threshold = float(release_threshold or 0.0)
+        try:
+            release_gate = bool(self._mts_atr_release_trend_gate()[0])
+        except Exception:
+            release_gate = False
+        trend = getattr(self, "_trend_confirmed_snapshot", None)
+        try:
+            reversal = self._build_trend_reversal_input()
+        except Exception as exc:
+            # Evidence collection must never change the decision/execution path.
+            reversal = {"available": False, "error": type(exc).__name__}
+        phase = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
+        phase = getattr(phase, "value", phase)
+        released = getattr(self, "_released_leg", None)
+        remaining = None
+        if released in ("near", "far"):
+            remaining = "far" if released == "near" else "near"
+        rem_price = far if remaining == "far" else near if remaining == "near" else None
+        rem_vwap = bar.get(f"{remaining}_vwap") if remaining else None
+        rem_side = getattr(self, "_side", None)
+        vwap_violated = (
+            rem_price is not None and rem_vwap is not None and
+            ((rem_side == "LONG" and rem_price < rem_vwap) or
+             (rem_side == "SHORT" and rem_price > rem_vwap))
+        )
+        return {
+            "action": exit_reason,
+            "pnl_pts": round(float(pnl), 4),
+            "phase": phase,
+            "near_side": getattr(self, "_near_side", None),
+            "far_side": getattr(self, "_far_side", None),
+            "near_pnl_pts": near_pnl,
+            "far_pnl_pts": far_pnl,
+            "atr": risk.get("atr"),
+            "release_stop_mode": risk.get("release_stop_mode"),
+            "release_stop_base_pts": risk.get("release_stop"),
+            "release_stop_threshold_pts": release_threshold,
+            "trail_distance_mode": risk.get("trail_distance_mode"),
+            "trail_distance_pts": risk.get("final_trail_dist"),
+            "peak": getattr(self, "_peak", None),
+            "nadir": getattr(self, "_nadir", None),
+            "remaining_leg": remaining,
+            "remaining_side": rem_side,
+            "remaining_price": rem_price,
+            "remaining_vwap": rem_vwap,
+            "vwap_exit_enabled": bool(getattr(self, "_params", {}).get("vwap_exit", {}).get("enabled", False)),
+            "vwap_violated": bool(vwap_violated),
+            "release_near_stop_hit": near_pnl is not None and near_pnl <= -release_threshold,
+            "release_far_stop_hit": far_pnl is not None and far_pnl <= -release_threshold,
+            "trend_release_enabled": os.getenv("MTS_TREND_RELEASE_ENABLED") == "1",
+            "trend_snapshot": trend if isinstance(trend, dict) else None,
+            "trend_release_pass": bool(trend and trend.get("pass_release")),
+            "trend_reversal": reversal,
+            "atr_release_trend_gate_enabled": release_gate,
+            "manual_requested": bool(getattr(self, "_manual_exit_requested", False)),
+            "mfe_pts": round(float(getattr(self, "_mfe_pts", 0.0)), 4),
+            "mae_pts": round(float(getattr(self, "_mae_pts", 0.0)), 4),
+        }
+
     def _log_exit_decision(self, exit_reason: str, pnl: float, bar: dict) -> dict:
         """Helper to generate, print, and log the structured exit decision.
         2026-06-26 Gemini CLI: exit logging implementation.
@@ -2784,6 +3449,7 @@ class TMFSpread(StrategyBase):
             "post_release_anchor": round(self._post_release_anchor_price, 2) if self._post_release_anchor_price is not None else None,
             # 2026-07-16 Hermes Agent: MTF score at exit time
             "mtf_score": self._mtf_score_at_release,
+            "decision_evidence": self._build_decision_evidence(exit_reason, pnl, bar),
         }
         logger.info("[MTS_EXIT_LOG] %s", json.dumps(exit_data))
         _append_event("EXIT_LOG", **exit_data)
@@ -3110,7 +3776,7 @@ class TMFSpread(StrategyBase):
 
     def _restore_position_state(self) -> bool:
         """
-        Attempt to restore in-memory state from /tmp/mts_position_state.json.
+        Attempt to restore in-memory state from the canonical runtime state file.
         2026-05-27 Gemini CLI: Enhanced with log reconstruction for 100% confidence.
 
         Called at the top of on_bar() when _has_position is False.
@@ -3597,6 +4263,11 @@ class TMFSpread(StrategyBase):
         else:
             now = datetime.now()
 
+        # 2026-08-23 Hermes Agent: Hierarchical VWAP candidate arm (MTS 2.0).
+        # Parallel, telemetry-only; cannot gate the baseline decision arm,
+        # cannot emit orders, cannot raise (fail-closed for the candidate).
+        self._hvwap_candidate_tick(bar, now)
+
         # ── [Fix] Prevent duplicate submissions ──
         # 2026-06-11 JVS Claw: Add timeout for RELEASE lifecycle states
         # If release is stuck >60s without fill confirmation, reset to OPEN
@@ -3671,8 +4342,17 @@ class TMFSpread(StrategyBase):
             # 💡 [Fixed 2026-05-27] Re-sync self._trade_id from bar data if missing
             if not self._trade_id:
                 self._trade_id = bar.get("trade_id")
-            
-            return self._manage_position(near_close, far_close, bar.get("spread_z"), now, bar)
+            _mgmt_result = self._manage_position(near_close, far_close, bar.get("spread_z"), now, bar)
+            # 2026-08-23 Hermes Agent: paper-only HVWAP release wiring. Fires
+            # ONLY when the baseline produced NO exit decision for this tick
+            # (_hvwap_baseline_clear_tick) and the baseline returned no signal
+            # — the candidate can never replace or block stop-loss, Policy J,
+            # emergency exit, timeout, baseline release, or reconciliation.
+            if _mgmt_result is None and getattr(self, "_hvwap_baseline_clear_tick", False):
+                _hvwap_sig = self._hvwap_maybe_paper_release(bar, now, near_close, far_close)
+                if _hvwap_sig is not None:
+                    return _hvwap_sig
+            return _mgmt_result
 
         # ── Staleness gate (only for new entry) ──
         atr = bar.get("atr", 0.0)
@@ -3980,6 +4660,10 @@ class TMFSpread(StrategyBase):
         # 2026-06-30 Gemini CLI: Expected behavior: Bypass time/tick confirmation checks during backtesting because backtests run instantly and monotonic time does not advance.
         _is_backtest = os.getenv("MTS_BACKTEST") == "1"
         """Manage existing spread position — release check + trailing exit."""
+        # 2026-08-23 Hermes Agent: HVWAP candidate release wiring — reset the
+        # baseline-clear marker; set True only after the lifecycle adapter
+        # evaluated with NO exit decision for this tick (see on_bar hook).
+        self._hvwap_baseline_clear_tick = False
         # 2026-05-27 Gemini CLI: Order in-flight guard (Contract 3)
         if self._lifecycle == "EXITING":
             self._set_eval(skip_reason="EXIT_ALREADY_SUBMITTED")
@@ -4187,6 +4871,11 @@ class TMFSpread(StrategyBase):
             # 2026-07-20 Gemini CLI: PR 3B Production Decision Core Cutover (first evaluation block)
             from strategies.plugins.futures.active.mts_lifecycle_adapter import LifecycleEvaluationInput
             _trend_enabled, _trend_snap = self._build_trend_release_input()
+            _trend_reversal_snap = self._build_trend_reversal_input()
+            # 2026-08-26 Hermes Agent: paper-only ATR-release trend gate —
+            # computed here (monitor-injected mode + live flag + env) and
+            # surfaced into the adapter context as a pure boolean.
+            _atr_gate_on, _atr_gate_reason = self._mts_atr_release_trend_gate()
             _adapter_input = LifecycleEvaluationInput(
                 strategy_state={
                     "policy_j_guard_just_completed": bool(getattr(self, "_pj_guard_just_completed", False)),
@@ -4210,6 +4899,8 @@ class TMFSpread(StrategyBase):
                     "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
                     "trend_release_enabled": (_trend_enabled, _trend_snap)[0],
                     "trend_confirmed": (_trend_enabled, _trend_snap)[1],
+                    "trend_reversal_confirmed": _trend_reversal_snap,
+                    "release_trend_gate_enabled": _atr_gate_on,
                     "last_applied_event_time": self._last_applied_event_time.isoformat() if getattr(self, "_last_applied_event_time", None) else None,
                     "single_leg_started_at": self._single_leg_started_at.isoformat() if getattr(self, "_single_leg_started_at", None) else None,
                 },
@@ -4226,6 +4917,11 @@ class TMFSpread(StrategyBase):
                 self._pj_guard_just_completed = False  # consumed once
             _adapter_res = self._lifecycle_adapter.evaluate(_adapter_input)
             _decision = _adapter_res.decision
+            # 2026-08-23 Hermes Agent: HVWAP candidate release wiring —
+            # baseline-clear marker: the candidate may act only when the
+            # baseline lifecycle evaluation produced NO exit decision (risk
+            # exits / Policy J / timeout / release all take precedence).
+            self._hvwap_baseline_clear_tick = (_decision is None)
 
             # ── Wave J1.5-BR: Policy J Shadow Telemetry Integration Hook ──
             if getattr(self, "_soak_collector", None) is not None:
@@ -4285,11 +4981,16 @@ class TMFSpread(StrategyBase):
                     }), file=_sys.stderr)
 
             # 2026-07-16 Gemini CLI: P0 Invariant Assertion to detect evaluate_lifecycle_actions regression (Phase 3a)
+            # 2026-08-26 Hermes Agent: the paper-only ATR-release trend gate
+            # deliberately suppresses RELEASE when no valid/matching trend
+            # snapshot exists — decision=None on an ATR stop hit is then the
+            # expected gate outcome, not a regression.
             if (
                 _decision is None
                 and self._lifecycle_oca.phase == PositionPhase.SPREAD
                 and self._lifecycle_oca.release_group.status == ReleaseGroupStatus.ARMED
                 and (_n_pnl <= -_release_stop or _f_pnl <= -_release_stop)
+                and not _atr_gate_on
             ):
                 logger.error(
                     "[MTS_RELEASE_DECISION_INVARIANT_VIOLATION] far_hit/near_hit is True but evaluate_lifecycle_actions returned None — P0"
@@ -4313,7 +5014,7 @@ class TMFSpread(StrategyBase):
             if self._release_pending_mono <= 0:
                 self._release_pending_mono = time.monotonic()
                 logger.info("[MTS_ACTION_TIMEOUT_STATE] action=RELEASE event=TIMER_START")
-        elif _active_action == LifecycleAction.TRAIL:
+        elif _active_action in (LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT):
             # TRAIL: only legal in SINGLE_LEG with confirmed fill
             _rg = self._lifecycle_oca.release_group
             if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG and _rg.status in (
@@ -4359,7 +5060,7 @@ class TMFSpread(StrategyBase):
             if _decision.action == LifecycleAction.RELEASE:
                 _target_leg = _decision.release_leg
                 _target_age = near_age if _target_leg == Leg.NEAR else far_age
-            elif _decision.action == LifecycleAction.TRAIL:
+            elif _decision.action in (LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT):
                 _rel = self._lifecycle_oca.release_group.filled_leg
                 if _rel is None and self._released_leg:
                     _rel = Leg.FAR if self._released_leg == "far" else Leg.NEAR
@@ -4398,7 +5099,7 @@ class TMFSpread(StrategyBase):
                 _loss = abs(_n_pnl) if _rel_leg == Leg.NEAR else abs(_f_pnl)
                 if _loss > _release_stop * _mult:
                     _risk_escalated = True
-            elif _decision.action == LifecycleAction.TRAIL:
+            elif _decision.action in (LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT):
                 _rel = self._lifecycle_oca.release_group.filled_leg
                 if _rel is None and self._released_leg:
                     _rel = Leg.FAR if self._released_leg == "far" else Leg.NEAR
@@ -4788,7 +5489,7 @@ class TMFSpread(StrategyBase):
                 except Exception:
                     pass  # intent log unavailable → legacy behavior
                 return Signal("PARTIAL_EXIT", _signal_reason, confidence=0.4)
-            elif _decision.action in (LifecycleAction.TRAIL, LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT):
+            elif _decision.action in (LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT, LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT):
                 # ── ADR-011 Phase 4: Post-fill warmup guard ──
                 # Blocks TRAIL if warmup (500ms / 2 ticks) hasn't completed.
                 # Prevents immediate EXIT triggered by stale pre-fill prices or
@@ -4926,10 +5627,25 @@ class TMFSpread(StrategyBase):
                 _pj_current = float(current_pnl) * float(_mult) - float(getattr(self, "_estimated_cost", 92.0))
                 _pj_activation = float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0))
                 _pj_giveback = float(self._params.get("combined_upl_giveback_twd", 100.0))
+                _pj_trigger_path = getattr(_decision, "winner", None) or "POLICY_J_SPREAD_GIVEBACK"
+                # Durable event counterpart to the logger-only marker.  The
+                # winner is assigned by the pure lifecycle adapter enum path;
+                # report/replay must not infer it from PnL after the fact.
+                _append_event(
+                    "POLICY_J_LIVE_TRIGGERED",
+                    trade_id=self._trade_id,
+                    trigger_path=_pj_trigger_path,
+                    action="COMBINED_EXIT",
+                    phase="SPREAD",
+                    current_net_exit_pnl_twd=round(_pj_current, 2),
+                    peak_net_exit_pnl_twd=(round(float(_pj_peak), 2)
+                                           if _pj_peak is not None else None),
+                )
                 _append_event(
                     "COMBINED_EXIT_SUBMITTED",
                     trade_id=self._trade_id,
                     exit_reason=_exit_reason,
+                    policy_j_trigger_path=_pj_trigger_path,
                     gross_points=current_pnl,
                     policy_j_durable_peak_twd=_pj_peak,
                     policy_j_current_net_twd=_pj_current,
@@ -5307,7 +6023,7 @@ class TMFSpread(StrategyBase):
         # Force_lock bypass removed: if force_lock is needed, add to LifecycleContext /
         # evaluate_lifecycle_actions in a separate change.
         # [P0 Guard] TRAIL must have READY anchor
-        if _decision is not None and _decision.action == LifecycleAction.TRAIL:
+        if _decision is not None and _decision.action in (LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT):
             assert self._trail_anchor_status == TrailAnchorStatus.READY, (
                 f"[P0_ANCHOR_GUARD] TRAIL without READY anchor: "
                 f"status={self._trail_anchor_status} side={self._side} "
@@ -5315,7 +6031,7 @@ class TMFSpread(StrategyBase):
             )
 
         if _decision is not None and _decision.action in (
-            LifecycleAction.TRAIL, LifecycleAction.STOPLOSS,
+            LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT, LifecycleAction.STOPLOSS,
             LifecycleAction.TIMEOUT, LifecycleAction.MANUAL,
         ):
             exit_triggered = True
@@ -5461,6 +6177,15 @@ class TMFSpread(StrategyBase):
         self._far_side = None
         self._entry_spread_z = 0.0
         self._released_leg = None
+        # 2026-08-23 Hermes Agent: per-trade HVWAP release sentinel — cleared
+        # on flat so the NEXT trade may release again (one intent per trade).
+        self._hvwap_release_sent_trade_id = None
+        # 2026-08-23 Hermes Agent: clear per-trade release timers/tick
+        # counters on flat — a stale baseline release attempt must not block
+        # (or be blocked by) the HVWAP release path on the next trade.
+        self._release_pending_mono = 0.0
+        self._release_near_ticks = 0
+        self._release_far_ticks = 0
         self._release_ts = None
         self._release_mono = 0.0
         self._peak = 0.0

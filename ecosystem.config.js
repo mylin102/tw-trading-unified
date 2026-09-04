@@ -42,7 +42,7 @@ if (isProduction && (PROJECT_ROOT.startsWith('/tmp/')
 const pythonBin = process.env.TRADING_PYTHON_BIN;
 // Shared dependency venv fallback (dev/paper only — the main repo's venv
 // holds the dependencies the candidate tree imports).
-const SHARED_VENV = '/Users/myllin_mini/Documents/mylin102/tw-trading-unified-git/.venv/bin/python3';
+const SHARED_VENV = '/Users/myllin_mini/Documents/mylin102/tw-trading-unified-release15/.venv/bin/python3';
 let pythonPath = null;
 if (pythonBin) {
   pythonPath = pythonBin;
@@ -90,6 +90,8 @@ const baseEnv = {
   PYTHONUNBUFFERED: '1',
   TRADING_CANONICAL_ROOT: CANONICAL_RELEASE_ROOT,
   TRADING_RUNTIME_DIR: runtimeDir,
+  TRADING_RUNTIME_ID: process.env.TRADING_RUNTIME_ID || 'runtime-adfdc1fe51fcd866',
+  MTS_STATE_PATH: path.join(runtimeDir, 'data', 'state', 'mts_position_state.json'),
   TRADING_LOG_DIR: logDir,
   NODE_ENV: 'production',
   // Explicit paper override for the currently approved non-live deployment.
@@ -137,14 +139,15 @@ module.exports = {
       // production PM2 deployment mode.
       // Current deployment is paper-only.  Live requires a separately
       // approved futures_live profile and controlled promotion.
-      args: `-c background ${pythonPath} main.py --config futures`,
+      args: `-c background ${pythonPath} main.py --config futures_live`,
       interpreter: 'none',
       cwd: PROJECT_ROOT,
       restart_delay: 15000,
       // Controlled restarts only (scripts/restart_live.sh).  An
       // autorestart loop preserves a stale LRC_RELEASE_SHA env and
       // re-triggers RELEASE_IDENTITY_MISMATCH quarantine forever.
-      autorestart: false,
+      autorestart: true,
+      stop_exit_codes: [0],
       watch: false,
       max_restarts: 2,
       min_uptime: '120s',
