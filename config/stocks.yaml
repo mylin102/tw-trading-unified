@@ -1,37 +1,6 @@
 live_trading: false
 stocks:
-  watchlist:
-  - '2330'
-  - '2303'
-  - '2516'
-  - '2610'
-  - '2618'
-  - '2634'
-  - '2646'
-  - '2706'
-  - '2753'
-  - '2845'
-  - '2849'
-  - '2852'
-  - '2890'
-  - '2911'
-  - '2945'
-  - '3010'
-  - '3014'
-  - '3015'
-  - '3030'
-  - '3034'
-  - '3035'
-  - '3041'
-  - '3054'
-  strategy: mean_reversion
-  total_portfolio_budget: 300000
-  capital_per_trade: 100000
-  entry_score: 15
   atr_mult: 1.8
-  stop_loss_pct: 0.02
-  take_profit_pct: 0.125
-  trailing_stop_pct: 0.01
   bear_defense:
     bear_max_positions: 1
     enabled: true
@@ -39,3 +8,36 @@ stocks:
     max_consecutive_losses: 3
     max_daily_loss: 3000
     normal_max_positions: 3
+  capital_per_trade: 100000
+  entry_score: 15
+  stop_loss_pct: 0.02
+  strategy: mean_reversion
+  take_profit_pct: 0.125
+  total_portfolio_budget: 300000
+  trailing_stop_pct: 0.01
+  watchlist:
+  - '5269'
+  - '3665'
+  - '7631'
+  - '7856'
+  - '7861'
+  - '2360'
+  - '6409'
+  - '2379'
+  - '5297'
+  - '7869'
+  - '7907'
+  - '1203'
+  - '2330'
+  - '2546'
+  - '2603'
+  - '2609'
+  - '2611'
+  - '2615'
+  - '2634'
+  - '2636'
+  - '2845'
+  - '2905'
+  - '2915'
+  - '3005'
+  - '2249'
