@@ -206,6 +206,16 @@ def test_guard_single_process_alive(tmp_path):
     assert not r.ok and "GUARD_DUPLICATE_INSTANCE" in r.reasons
 
 
+def test_guard_single_process_post_startup_allows_current_instance(tmp_path):
+    """post_startup validates the running instance named by its pid file."""
+    from core.deployment_safety_gate import guard_single_process
+    pid_file = tmp_path / "app.pid"
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    r = guard_single_process(str(pid_file), phase="post_startup")
+    assert r.ok
+    assert r.detail == f"current instance pid={os.getpid()}"
+
+
 def test_guard_single_process_stale_or_absent(tmp_path):
     from core.deployment_safety_gate import guard_single_process
     pid_file = tmp_path / "app.pid"
