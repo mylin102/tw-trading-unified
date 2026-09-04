@@ -186,13 +186,18 @@ def guard_runtime_paths(runtime_dir: str) -> GuardResult:
 
 # ── 4. single process ──────────────────────────────────────────────────────
 
-def guard_single_process(pid_file: str) -> GuardResult:
+def guard_single_process(pid_file: str, *, phase: str = "pre_deploy") -> GuardResult:
+    """Reject stale/duplicate pids before startup; accept the attested pid
+    during post_startup validation of the already-running single instance."""
     p = Path(pid_file)
     if not p.is_file():
         return _pass("single_process", "no pid file")
     try:
         pid = int(p.read_text(encoding="utf-8").strip())
-        os.kill(pid, 0)          # alive -> duplicate instance
+        os.kill(pid, 0)
+        if phase == "post_startup":
+            return _pass("single_process", f"current instance pid={pid}")
+        # pre_deploy: any live pid is a duplicate of the not-yet-started app.
         return _fail("single_process", ["GUARD_DUPLICATE_INSTANCE"],
                      f"pid={pid}")
     except (ValueError, ProcessLookupError):
@@ -812,7 +817,7 @@ def check_deployment(
         guard_release_head(release_dir, expected_sha),
         guard_clean_tree(release_dir, closure_files),
         guard_runtime_paths(runtime_dir),
-        guard_single_process(pid_file),
+        guard_single_process(pid_file, phase=phase),
         guard_flat_no_pending(position_state_path,
                               read_ctx_snapshot(runtime_dir),
                               allow_existing_mts_position=(
