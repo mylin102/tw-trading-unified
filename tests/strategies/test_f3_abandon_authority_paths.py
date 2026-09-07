@@ -5,7 +5,13 @@ from datetime import datetime, timezone
 
 from strategies.plugins.futures.active import tmf_spread
 from strategies.futures.monitor import FuturesMonitor
-from strategies.futures.mts_ledger_authority import MtsLedgerProjection
+from strategies.futures.mts_ledger_authority import (
+    MtsAuthority,
+    MtsAuthorityState,
+    MtsGateAction,
+    MtsLedgerProjection,
+    gate_decision_pre_signal,
+)
 
 
 TRADE_ID = "mts-auto-022000-772"
@@ -92,3 +98,36 @@ def test_non_abandoned_open_fills_remain_open(tmp_path, monkeypatch):
     monitor._ledger_projection = MtsLedgerProjection(path=str(fills))
 
     assert monitor._mts_has_open_position_from_fills() is True
+
+
+def test_abandoned_authority_is_flat_before_pre_signal_gate(monkeypatch):
+    """The authority choke point must neutralize abandoned ledger OPEN state."""
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    auth = MtsAuthorityState(
+        MtsAuthority.OPEN,
+        trade_id=TRADE_ID,
+        near_qty=1,
+        far_qty=-1,
+        near_side="LONG",
+        far_side="SHORT",
+    )
+    filtered = monitor._apply_abandon_authority_filter(auth, {TRADE_ID})
+
+    assert filtered.status is MtsAuthority.FLAT
+    assert filtered.trade_id == TRADE_ID
+    assert gate_decision_pre_signal(
+        filtered, state_has_pos=False, strat_has_pos=False, strat_trade_id=None,
+    ) is MtsGateAction.PASS
+
+
+def test_non_abandoned_authority_still_reconstructs():
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    auth = MtsAuthorityState(MtsAuthority.OPEN, trade_id="mts-normal-open")
+
+    filtered = monitor._apply_abandon_authority_filter(auth, {TRADE_ID})
+
+    assert filtered.status is MtsAuthority.OPEN
+    assert gate_decision_pre_signal(
+        filtered, state_has_pos=False, strat_has_pos=False,
+        strat_trade_id=None,
+    ) is MtsGateAction.RECONSTRUCT
