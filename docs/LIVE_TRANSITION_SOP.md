@@ -87,3 +87,18 @@ signal (tmf_spread / monitor)
 - [ ] LIVE_QUARANTINED 路徑測試（任一檢查失敗 → 擋單）
 - [ ] LIVE_READY 路徑測試（全過 → L1 Gate 放行）
 - [ ] dry-run 驗證（不實際切 — 用 mock api 走一遍）
+
+## 7. Release SHA Pin Synchronization
+
+When `release16` moves to a new final HEAD, the PM2 environment pin must be
+updated for all three apps before any app rerun or reboot:
+
+1. Set `LRC_RELEASE_SHA` to the new full 40-hex release HEAD.
+2. Restart `trading-system`, `dashboard`, and `stock-runner` with
+   `--update-env` (preserve all other environment values).
+3. Verify all three apps use the same SHA and release16 cwd; verify dashboard
+   HTTP health and that no `RUNTIME_IDENTITY_REJECTED` occurred.
+4. Run `pm2 save` only after all three pins and health checks pass.
+
+This pin synchronization is part of the release flow, not an optional
+dashboard follow-up.
