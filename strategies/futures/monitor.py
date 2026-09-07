@@ -17,6 +17,7 @@ from pathlib import Path
 from collections import deque
 from strategies.futures.mts_ledger_authority import (
     MtsAuthority,
+    MtsAuthorityState,
     MtsGateAction,
     MtsLedgerProjection,
     gate_decision_post_signal,
@@ -12886,6 +12887,14 @@ class FuturesMonitor:
             # next monitor gate.  Carry the current broker-flat proof into
             # that hook so historical fills cannot resurrect a ghost.
             strategy._broker_truth_flat = not _authority_has_pos
+        # An audited abandon is terminal authority, even when the append-only
+        # ledger still contains historical ENTRY rows.  Read the audit set
+        # once for this cycle so every authority consumer sees the same view.
+        from strategies.plugins.futures.active.tmf_spread import (
+            _abandoned_trade_ids,
+        )
+        _abandoned_ids = _abandoned_trade_ids()
+        _auth = self._apply_abandon_authority_filter(_auth, _abandoned_ids)
         # 2026-08-23 Hermes Agent: inject the execution-mode gate for the
         # telemetry-only HVWAP paper-release wiring (the strategy has no
         # other access to the execution context). Fail-closed default: when
@@ -13109,6 +13118,21 @@ class FuturesMonitor:
     # ═══════════════════════════════════════════════════════════════
     # 2026-07-08 Hermes Agent: P0 — Multi-source open position detection
     # ═══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _apply_abandon_authority_filter(auth, abandoned_trade_ids):
+        """Downgrade an abandoned ledger authority to terminal FLAT."""
+        if getattr(auth, "trade_id", None) not in abandoned_trade_ids:
+            return auth
+        logger.warning(
+            "[MTS_ABANDON_SKIP] authority trade_id=%s", auth.trade_id,
+        )
+        return MtsAuthorityState(
+            MtsAuthority.FLAT,
+            trade_id=auth.trade_id,
+            current_trade_id=getattr(auth, "current_trade_id", None),
+            anomalies=getattr(auth, "anomalies", ()),
+        )
 
     def _mts_has_open_position_from_fills(self) -> bool:
         """Three-state ledger authority (incremental projection, 2026-08-06 P1).
