@@ -401,7 +401,7 @@ def guard_quarantine_first_startup(monitor_path: Optional[str]) -> GuardResult:
 _REGISTRY_GEN_RE = re.compile(r"^[0-9a-f]{32}$")   # token_hex(16) format
 
 
-def guard_session_generation(generation: Optional[int],
+def guard_session_generation(generation: Optional[int | str],
                              revoked: bool) -> GuardResult:
     # The live session generation is REGISTRY-BOUND: the session_registry
     # produces token_hex(16) (32-hex str) generations. Standalone preflight
@@ -777,7 +777,7 @@ def check_deployment(
     pid_file: str,
     position_state_path: str,
     monitor_path: Optional[str] = None,
-    session_generation: Optional[int] = None,
+    session_generation: Optional[int | str] = None,
     session_revoked: bool = False,
     margin_available: Optional[float] = None,
     margin_evidence: Optional[dict] = None,

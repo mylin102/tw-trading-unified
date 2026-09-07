@@ -42,7 +42,9 @@ def main() -> int:
     ap.add_argument("--pid-file", required=True)
     ap.add_argument("--position-state", required=True)
     ap.add_argument("--monitor", default=None)
-    ap.add_argument("--session-generation", type=int, default=None)
+    ap.add_argument("--session-generation", default=None,
+                    help="registry-bound 32-hex token; when omitted in "
+                         "post_startup, read execution_context.json")
     ap.add_argument("--margin-available", type=float, default=None)
     ap.add_argument("--margin-evidence", default=None,
                     help="path to the read-only preflight JSON carrying "
@@ -62,6 +64,19 @@ def main() -> int:
                     default="pre_deploy")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
+
+    session_generation = args.session_generation
+    if session_generation is None and args.phase == "post_startup":
+        runtime_root = args.runtime_dir or os.environ.get(
+            "TRADING_RUNTIME_DIR", "")
+        try:
+            with open(Path(runtime_root) / "execution_context.json",
+                      encoding="utf-8") as _ctx_fh:
+                session_generation = json.load(_ctx_fh).get("session_id")
+        except (OSError, json.JSONDecodeError, TypeError):
+            # The gate remains fail-closed: an unreadable/missing ctx leaves
+            # the generation as None and guard_session_generation refuses it.
+            session_generation = None
 
     from core.deployment_safety_gate import (
     check_deployment, aggregate_gate_groups)
@@ -98,7 +113,7 @@ def main() -> int:
         position_state_path=args.position_state,
         monitor_path=args.monitor
         or str(_REPO_ROOT / "strategies/futures/monitor.py"),
-        session_generation=args.session_generation,
+        session_generation=session_generation,
         margin_available=args.margin_available,
         margin_evidence=margin_evidence,
         config_profile_path=args.config_profile,
