@@ -46,3 +46,45 @@ def test_hold_clear_allows_trail_evaluation_input():
         broker_legs=_legs(1), canonical_legs=_legs(1))
     assert report.hold is False
     assert report.events == []
+
+
+def test_working_broker_order_enters_hold_before_any_exit_action():
+    report = detect_broker_reconciliation(
+        broker_trades=[{"id": "mobile-near", "code": "TMFI6",
+                        "status": "Working"}],
+        ledger_rows=[], broker_legs=_legs(1), canonical_legs=_legs(1))
+    assert report.hold is True
+    assert report.entry_blocked is True
+    assert any(event.code == "BROKER_WORKING_ORDER_HOLD"
+               for event in report.events)
+
+
+def test_broker_flat_local_holding_without_exit_fill_blocks_entry():
+    report = detect_broker_reconciliation(
+        broker_trades=[], ledger_rows=[], broker_legs=[],
+        canonical_legs=_legs(1), trade_id="broker-reconciled-b1769ea375a331bd")
+    assert report.hold is True
+    assert report.entry_blocked is True
+    assert any(event.code == "BROKER_FLAT_WITHOUT_EXIT_EVIDENCE"
+               for event in report.events)
+
+
+def test_broker_flat_local_holding_with_audited_exit_fill_can_reconcile():
+    rows = [{"trade_id": "broker-reconciled-b1769ea375a331bd",
+             "deal_id": "near-exit", "instrument_code": "TMFI6",
+             "execution_source": "BROKER_FILL", "fill_type": "EXIT"}]
+    report = detect_broker_reconciliation(
+        broker_trades=[], ledger_rows=rows, broker_legs=[],
+        canonical_legs=[], trade_id="broker-reconciled-b1769ea375a331bd")
+    assert report.entry_blocked is False
+    assert not any(event.code == "BROKER_FLAT_WITHOUT_EXIT_EVIDENCE"
+                   for event in report.events)
+
+
+def test_broker_evidence_unavailable_is_fail_closed_not_flat():
+    report = detect_broker_reconciliation(
+        broker_trades=None, ledger_rows=[], broker_legs=[], canonical_legs=[])
+    assert report.hold is True
+    assert report.entry_blocked is True
+    assert any(event.code == "BROKER_EVIDENCE_UNAVAILABLE"
+               for event in report.events)
