@@ -306,6 +306,15 @@ def guard_flat_no_pending(position_state_path: str,
         _codes = {str(p.get("code")) for p in _positions if isinstance(p, dict)}
         _cap = (ctx_data or {}).get("exit_only_capability")
         _cap_legs = (_cap or {}).get("legs") if isinstance(_cap, dict) else None
+        if _cap_legs is None:
+            _evidence = (ctx_data or {}).get("canonical_holding") or {}
+            _raw_legs = _evidence.get("canonical_legs")
+            _cap_legs = [{
+                "symbol": leg.get("code"),
+                "side": "buy" if leg.get("side") == "LONG" else "sell",
+                "remaining_qty": leg.get("qty"),
+                "avg_cost": leg.get("avg_cost"),
+            } for leg in (_raw_legs or []) if isinstance(leg, dict)]
         if (_cap_legs and _codes == {str(leg.get("symbol")) for leg in _cap_legs}
                 and len(_positions) == 2
                 and all(isinstance(p, dict)
