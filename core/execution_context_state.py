@@ -36,6 +36,7 @@ SCHEMA_KEYS = (
     "config_hash",
     "state_namespace",
     "exit_only_capability",
+    "canonical_holding",
 )
 
 # field -> (type, required)
@@ -52,6 +53,7 @@ _TYPE_RULES = {
     "config_hash": (str, False),
     "state_namespace": (str, False),
     "exit_only_capability": (dict, False),
+    "canonical_holding": (dict, False),
 }
 
 
@@ -250,4 +252,5 @@ def _fail_closed(reasons: tuple) -> dict:
         "config_hash": None,
         "state_namespace": "live",
         "exit_only_capability": None,
+        "canonical_holding": None,
     }
