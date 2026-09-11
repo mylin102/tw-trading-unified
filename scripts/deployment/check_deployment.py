@@ -63,6 +63,7 @@ def main() -> int:
     ap.add_argument("--phase", choices=["pre_deploy", "post_startup"],
                     default="pre_deploy")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--allow-existing-mts-position", action="store_true", help="Allow an exactly reconciled MTS spread during deployment")
     args = ap.parse_args()
 
     session_generation = args.session_generation
@@ -122,6 +123,7 @@ def main() -> int:
         manifest_exclude_paths=exclude,
         expected_sha=args.expected_sha,
         phase=args.phase,
+        allow_existing_mts_position=args.allow_existing_mts_position,
     )
     if args.json:
         print(json.dumps({

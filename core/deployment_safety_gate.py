@@ -820,9 +820,7 @@ def check_deployment(
         guard_single_process(pid_file, phase=phase),
         guard_flat_no_pending(position_state_path,
                               read_ctx_snapshot(runtime_dir),
-                              allow_existing_mts_position=(
-                                  phase == "post_startup"
-                                  and allow_existing_mts_position)),
+                              allow_existing_mts_position=allow_existing_mts_position),
         guard_quarantine_first_startup(monitor_path),
         session_result,
         guard_margin(margin_available, margin_evidence=margin_evidence),
