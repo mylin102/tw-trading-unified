@@ -4706,7 +4706,12 @@ class FuturesMonitor:
             "broker_trades": broker_trades,
             "available_margin": margin,
             "canonical_input_hash": None,
-            "fetch_status": {"capture": "OK" if not errors else "FAIL"},
+            # list_trades() has no historical-period scope and [] is not
+            # authoritative proof that no trades exist.
+            "fetch_status": {
+                "capture": "OK" if not errors else "FAIL",
+                "trades": ("OK" if broker_trades else "UNAVAILABLE"),
+            },
             "errors": errors,
         }
         blob = _json.dumps(payload, sort_keys=True, ensure_ascii=False,
@@ -4765,8 +4770,9 @@ class FuturesMonitor:
                         rows.append(item)
             capture_ok = ((snapshot or {}).get("fetch_status") or {}).get(
                 "capture") == "OK"
+            trade_evidence_ok = ((snapshot or {}).get("fetch_status") or {}).get("trades", "OK") == "OK"
             broker_trades = ((snapshot or {}).get("broker_trades")
-                             if capture_ok else None)
+                             if capture_ok and trade_evidence_ok else None)
 
             def _side(row):
                 value = str(row.get("direction") or row.get("side")
