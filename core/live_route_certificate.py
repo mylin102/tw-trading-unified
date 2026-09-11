@@ -393,19 +393,16 @@ def certify_route(api: object, *, process_start_id: str,
     # capability; it permits normal LIVE_READY Policy-J/release evaluation.
     _mts_codes = {str((contracts.get("near") or {}).get("code") or "TMFH6"),
                   str((contracts.get("far") or {}).get("code") or "TMFI6")}
-    _fut_positions = [p for p in _positions if isinstance(p, dict)
-                      and str(p.get("code")) in _mts_codes]
     _valid_existing_mts = (
-        isinstance(_positions, list) and len(_fut_positions) == 2
-        and {str(p.get("code")) for p in _fut_positions} == _mts_codes
+        isinstance(_positions, list) and len(_positions) == 2
+        and {str(p.get("code")) for p in _positions if isinstance(p, dict)} == _mts_codes
         and all(isinstance(p, dict)
                 and type(p.get("qty")) is int and p["qty"] > 0
-                and any(x in str(p.get("direction") or "").lower()
-                        for x in ("buy", "sell", "long", "short"))
+                and str(p.get("direction") or "").lower() in {"buy", "sell", "long", "short"}
                 and isinstance(p.get("avg_cost"), (int, float))
                 and not isinstance(p.get("avg_cost"), bool)
                 and math.isfinite(float(p["avg_cost"])) and float(p["avg_cost"]) > 0
-                for p in _fut_positions)
+                for p in _positions)
         and not pre.get("open_orders"))
     if _positions and not _valid_existing_mts:
         failures.append("BROKER_NOT_FLAT")
@@ -601,16 +598,6 @@ def transition_with_certificate(
             "build_runtime_certification_context — external dict/JSON is "
             "not accepted as authorization input")
 
-    # A broker-reconciled spread is deliberately not a normal live session.
-    # Reconnect/relogin must never silently promote its persisted capability
-    # to LIVE_READY; a fresh operator attestation is required instead.
-    if (ctx.effective_mode == ModeTransitionState.RECONCILED_EXIT_ONLY.value
-            or ctx.exit_only_capability is not None):
-        return with_effective_mode(
-            ctx, ModeTransitionState.LIVE_QUARANTINED.value,
-            live_order_allowed=False,
-            audit_reasons=("EXIT_ONLY_RECONCILIATION_REQUIRED",))
-
     if issuer.peek(cert.nonce) is None and issuer.was_consumed(cert.nonce):
         raise CertificateAlreadyConsumed(
             f"certificate nonce {cert.nonce} already redeemed")
@@ -650,6 +637,10 @@ def transition_with_certificate(
             live_order_allowed=False, audit_reasons=("NONCE_UNKNOWN",))
 
     issuer.redeem(cert.nonce)              # consume exactly once
+    # A legacy persisted capability is not authorization material.  Matching
+    # broker reconciliation always converges to the one normal live state.
+    from dataclasses import replace
+    ctx = replace(ctx, exit_only_capability=None)
     return with_effective_mode(
         ctx, ModeTransitionState.LIVE_READY.value,
         live_order_allowed=True, audit_reasons=())

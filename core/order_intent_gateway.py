@@ -8,12 +8,10 @@ calls (or calls for a different order than the pending authorization)
 are rejected.  Only the authorization fingerprint is ever persistable.
 
 Policy (merged from the signal-level gates): paper passes through
-unchanged; LIVE_READY behaves as before (state-file FLAT check merged);
-every other LIVE mode (LIVE_QUARANTINED etc.) is explicitly denied —
-never reclassified as paper; RECONCILED_EXIT_ONLY admits only exact
-capability-bound MTS_EXIT / MTS_RELEASE (subject to OrderManager/adapter
-defense); entry / manual / generic / OCO are denied; OCO is explicitly
-rejected at the gateway.
+unchanged; LIVE_READY is the only order-capable live state.  Existing
+positions block entries, while standard exits still require the same base
+identity/route/session gateway checks.  There is no exit-only capability
+branch.
 
 PENDING_SUBMIT rule: the intent is durably recorded (record_cb -> the
 execution-context payload) BEFORE the adapter submission; a missing broker
@@ -31,7 +29,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from core.exit_only_position import ENTRY_ACTIONS, build_bbo_binding
+from core.exit_only_position import ENTRY_ACTIONS
 
 AUTH_TTL_S: float = 30.0
 
@@ -185,13 +183,17 @@ class OrderIntentGateway:
         except Exception:
             return False
 
-    # ── merged policy (P0 live / entry / EXIT_ONLY / FLAT) ────────────────
+    # ── merged policy (P0 live / entry / standard exit / FLAT) ───────────
 
     def authorize_intent(self, *, action: str, strategy: Any,
                          authority: dict) -> tuple:
-        """(ok, binding, reason).  True paper passes through unchanged;
-        every live mode outside LIVE_READY / RECONCILED_EXIT_ONLY is
-        explicitly denied (never reclassified as paper)."""
+        """(ok, binding, reason).
+
+        Reconciled holdings are ordinary ``LIVE_READY`` holdings.  The
+        gateway remains the sole submit boundary: identity, route and
+        authenticated-session failures are terminal for both entries and
+        exits.  Position/pending/startup checks are entry-specific.
+        """
         if not authority.get("live"):
             return True, None, None
         sname = strategy if isinstance(strategy, str) \
@@ -199,82 +201,24 @@ class OrderIntentGateway:
         if sname == "MTS_RELEASE_OCO":
             return False, None, "GATEWAY_OCO_DISABLED"
         mode = authority.get("mode")
-        if mode == "live_quarantined":
-            # [QUARANTINE_EXIT 2026-08-18] narrow carve-out: only a
-            # snapshot-bound remaining-leg exit (per-order proof from
-            # the monitor's fresh broker-truth recheck) may submit.
-            _qproof = authority.get("quarantine_exit_proof")
-            # strict proof values (follow-up audit): side LONG/SHORT only
-            # (no fall-through to a default close side), qty/order_qty
-            # positive int non-bool, order_side BUY/SELL.
-            _q_side = _qproof.get("side") if isinstance(_qproof, dict) else None
-            _q_qty = _qproof.get("qty") if isinstance(_qproof, dict) else None
-            _q_order_qty = (_qproof.get("order_qty")
-                            if isinstance(_qproof, dict) else None)
-            _q_order_side = (_qproof.get("order_side")
-                             if isinstance(_qproof, dict) else None)
-            _close_side = ("SELL" if _q_side == "LONG"
-                           else "BUY") if _q_side in ("LONG", "SHORT") else None
-            _strict_qty = (isinstance(_q_qty, int)
-                           and not isinstance(_q_qty, bool) and _q_qty > 0)
-            _strict_oqty = (isinstance(_q_order_qty, int)
-                            and not isinstance(_q_order_qty, bool)
-                            and _q_order_qty > 0)
-            # order-spec coherence: the bound order closes the remaining
-            # leg (order_symbol == contract, closing side, qty match).
-            if (isinstance(_qproof, dict)
-                    and sname in ("MTS_RELEASE", "MTS_EXIT")
-                    and _qproof.get("strategy") == sname
-                    and _q_side in ("LONG", "SHORT")
-                    and str(_q_order_side or "").upper() in ("BUY", "SELL")
-                    and _strict_qty and _strict_oqty
-                    and _qproof.get("contract") and _qproof.get("snapshot_hash")
-                    and _qproof.get("order_symbol") == _qproof.get("contract")
-                    and str(_q_order_side or "").lower()
-                        == str(_close_side or "").lower()
-                    and _q_order_qty == _q_qty):
-                return True, _qproof, None
+        if mode != "live_ready" or not authority.get("live_order_allowed"):
             return False, None, "LIVE_ORDER_AUTHORIZATION_FAILED"
-        if mode not in ("live_ready", "reconciled_exit_only"):
-            return False, None, "LIVE_ORDER_AUTHORIZATION_FAILED"
-        if mode == "live_ready":
-            if action in ("EXIT", "PARTIAL_EXIT") \
-                    and not authority.get("position_has_position"):
-                return False, None, "EXIT_FLAT_BLOCKED"
-            return True, None, None
-        # EXIT_ONLY: exact capability-bound closing orders only
+        for field, reason in (("identity_ok", "GATEWAY_IDENTITY_FAILED"),
+                              ("route_ok", "GATEWAY_ROUTE_FAILED"),
+                              ("session_ok", "GATEWAY_SESSION_FAILED")):
+            if field in authority and authority[field] is not True:
+                return False, None, reason
         if action in ENTRY_ACTIONS:
-            return False, None, "EXIT_ONLY_ENTRY_BLOCKED"
-        if sname not in EXIT_STRATEGIES:
-            return False, None, "EXIT_ONLY_STRATEGY_BLOCKED"
-        if authority.get("hydrated_position") is None:
-            return False, None, "EXIT_ONLY_POSITION_MISSING"
-        cap = authority.get("capability")
-        if (not isinstance(cap, dict)
-                or authority.get("strategy_reconciliation_id")
-                != cap.get("reconciliation_id")):
-            return False, None, "EXIT_ONLY_STRATEGY_BLOCKED"
-        _bbo_slots = authority.get("bbo_slots") or {}
-        _identity = {
-            "reconciliation_id": cap.get("reconciliation_id"),
-            "snapshot_hash": cap.get("snapshot_hash"),
-            "config_hash": cap.get("config_hash"),
-            "release_sha": cap.get("release_sha"),
-            "session_id": cap.get("session_id"),
-        }
-        binding, reason = build_bbo_binding(
-            _bbo_slots, near_code=authority.get("near_code"),
-            far_code=authority.get("far_code"), identity=_identity)
-        if binding is None:
-            return False, None, reason
-        legs = cap.get("legs") or []
-        if len(legs) == 2:
-            near_code = authority.get("near_code")
-            far_code = authority.get("far_code")
-            if legs[0].get("symbol") != near_code \
-                    or legs[1].get("symbol") != far_code:
-                return False, None, "BBO_CODE_MISMATCH"
-        return True, binding, None
+            if authority.get("startup_not_ready"):
+                return False, None, "STARTUP_NOT_READY"
+            if authority.get("pending_order"):
+                return False, None, "PENDING_ORDER_BLOCKED"
+            if authority.get("position_has_position"):
+                return False, None, "OPEN_POSITION_BLOCKED"
+        elif action in ("EXIT", "PARTIAL_EXIT") \
+                and not authority.get("position_has_position"):
+            return False, None, "EXIT_FLAT_BLOCKED"
+        return True, None, None
 
     # ── submission (authorization + receipt rule) ─────────────────────────
 
