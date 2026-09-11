@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from core.reconciliation.holding_state import reconcile_holding
 
 
@@ -19,16 +22,34 @@ def _legs_from_snapshot(snapshot: dict) -> list[dict]:
     return result
 
 
-def _legs_from_stale_context(ctx: dict) -> list[dict] | None:
+def _legs_from_stale_context(ctx: dict, runtime_dir: str) -> list[dict] | None:
     cap = ctx.get("exit_only_capability")
     rows = cap.get("legs") if isinstance(cap, dict) else None
-    if not isinstance(rows, list):
-        return None
-    return [{
+    if isinstance(rows, list):
+        return [{
         "code": row["symbol"],
         "side": "SHORT" if str(row.get("side", "")).lower() == "sell" else "LONG",
         "qty": row["remaining_qty"], "avg_cost": row["avg_cost"],
-    } for row in rows if isinstance(row, dict)]
+        } for row in rows if isinstance(row, dict)]
+    # After a restart the old ctx may already have been rewritten without
+    # the legacy capability.  Use durable BROKER_FILL ledger rows as the
+    # local side of reconciliation; never infer from broker shape alone.
+    ledger = Path(runtime_dir) / "logs" / "mts_trade_fills.jsonl"
+    latest = {}
+    try:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            if (row.get("trade_id", "").startswith("broker-reconciled-")
+                    and row.get("execution_source") == "BROKER_FILL"):
+                latest[row.get("instrument_code")] = row
+    except (OSError, ValueError, TypeError):
+        return None
+    return [{
+        "code": row.get("instrument_code"),
+        "side": "LONG" if str(row.get("side", "")).upper() == "BUY" else "SHORT",
+        "qty": row.get("quantity") or row.get("qty"),
+        "avg_cost": row.get("price") or row.get("avg_price"),
+    } for row in latest.values()]
 
 
 def migrate_stale_live_context(runtime_dir: str, snapshot: dict,
@@ -39,7 +60,7 @@ def migrate_stale_live_context(runtime_dir: str, snapshot: dict,
     capture_ok = ((snapshot or {}).get("fetch_status") or {}).get("capture") == "OK"
     decision = reconcile_holding(
         _legs_from_snapshot(snapshot or {}) if capture_ok else None,
-        _legs_from_stale_context(ctx), tick_size=tick_size,
+        _legs_from_stale_context(ctx, runtime_dir), tick_size=tick_size,
         broker_query_error=None if capture_ok else "BROKER_CAPTURE_UNCERTAIN")
     evidence = {"status": decision.status.value, "reason": decision.reason,
                 "raw_broker_legs": list(decision.raw_broker_legs),
