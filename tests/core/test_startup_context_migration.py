@@ -67,3 +67,39 @@ def test_durable_fill_ledger_is_primary_and_survives_context_rewrite(tmp_path):
     after = read_execution_context(runtime_dir=str(tmp_path))
     assert after["canonical_holding"]["trade_id"] == tid
     assert after["canonical_holding"]["source"] == "durable_broker_fill_ledger"
+
+
+def test_flat_settled_reconciliation_clears_stale_holding_hold(tmp_path):
+    from core.execution_context_state import persist_execution_context
+    import json
+    ledger = tmp_path / "logs"
+    ledger.mkdir()
+    tid = "broker-reconciled-b1769ea375a331bd"
+    fills = [
+        {"trade_id": tid, "execution_source": "BROKER_FILL", "instrument_code": "TMFI6",
+         "side": "BUY", "quantity": 1, "price": 45876.0, "fill_type": "ENTRY"},
+        {"trade_id": tid, "execution_source": "BROKER_FILL", "instrument_code": "TMFJ6",
+         "side": "SELL", "quantity": 1, "price": 46059.0, "fill_type": "ENTRY"},
+        {"trade_id": tid, "execution_source": "USER_MANUAL_BROKER_FILL", "instrument_code": "TMFI6",
+         "side": "SELL", "quantity": 1, "price": 46341.0, "fill_type": "EXIT"},
+        {"trade_id": tid, "execution_source": "BROKER_FILL", "instrument_code": "TMFJ6",
+         "side": "BUY", "quantity": 1, "price": 46551.0, "fill_type": "RELEASE"},
+    ]
+    (ledger / "mts_trade_fills.jsonl").write_text("\n".join(json.dumps(x) for x in fills) + "\n")
+    (tmp_path / "data" / "state").mkdir(parents=True)
+    (tmp_path / "data" / "state" / "mts_position_state.json").write_text(json.dumps({
+        "has_position": False, "state": "FLAT", "settlement_status": "SETTLED",
+        "trade_id": tid,
+    }))
+    persist_execution_context({"requested_mode": "live", "effective_mode": "live_quarantined",
+        "live_order_allowed": False, "audit_reasons": ["RECONCILIATION_HOLD"],
+        "state_namespace": "live", "canonical_holding": {"status": "HOLD"}},
+        runtime_dir=str(tmp_path))
+    ok, ctx = migrate_stale_live_context(str(tmp_path), {
+        "source": "live_broker", "fetch_status": {"capture": "OK"},
+        "positions": [], "open_orders": [],
+    })
+    assert ok is True
+    assert ctx["effective_mode"] == "live_ready"
+    assert ctx["live_order_allowed"] is True
+    assert ctx["canonical_holding"]["status"] != "HOLD"
