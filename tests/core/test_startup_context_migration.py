@@ -103,3 +103,26 @@ def test_flat_settled_reconciliation_clears_stale_holding_hold(tmp_path):
     assert ctx["effective_mode"] == "live_ready"
     assert ctx["live_order_allowed"] is True
     assert ctx["canonical_holding"]["status"] != "HOLD"
+
+
+def test_legacy_fill_without_instrument_identity_cannot_poison_current_trade(tmp_path):
+    from core.execution_context_state import persist_execution_context
+    import json
+    ledger = tmp_path / "logs"
+    ledger.mkdir()
+    tid = "broker-reconciled-new"
+    rows = [
+        {"trade_id": "broker-reconciled-old", "execution_source": "BROKER_FILL",
+         "instrument_code": None, "side": "BUY", "quantity": 1, "price": 46551.0},
+        {"trade_id": tid, "execution_source": "BROKER_FILL", "instrument_code": "TMFI6",
+         "side": "SELL", "quantity": 1, "price": 46288.0},
+        {"trade_id": tid, "execution_source": "BROKER_FILL", "instrument_code": "TMFJ6",
+         "side": "BUY", "quantity": 1, "price": 46451.0},
+    ]
+    (ledger / "mts_trade_fills.jsonl").write_text("\n".join(json.dumps(x) for x in rows) + "\n")
+    persist_execution_context({"requested_mode": "live", "effective_mode": "live_quarantined",
+        "live_order_allowed": False, "state_namespace": "live"}, runtime_dir=str(tmp_path))
+    ok, ctx = migrate_stale_live_context(str(tmp_path), _snapshot())
+    assert ok is True
+    assert ctx["canonical_holding"]["trade_id"] == tid
+    assert {x["code"] for x in ctx["canonical_holding"]["canonical_legs"]} == {"TMFI6", "TMFJ6"}
