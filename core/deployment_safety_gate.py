@@ -304,7 +304,9 @@ def guard_flat_no_pending(position_state_path: str,
     # arbitrary/non-MTS positions remain fail-closed.
     if allow_existing_mts_position and isinstance(_positions, list) and _positions:
         _codes = {str(p.get("code")) for p in _positions if isinstance(p, dict)}
-        if (_codes == {"TMFH6", "TMFI6"}
+        _cap = (ctx_data or {}).get("exit_only_capability")
+        _cap_legs = (_cap or {}).get("legs") if isinstance(_cap, dict) else None
+        if (_cap_legs and _codes == {str(leg.get("symbol")) for leg in _cap_legs}
                 and len(_positions) == 2
                 and all(isinstance(p, dict)
                         and type(p.get("quantity")) is int and p["quantity"] > 0
