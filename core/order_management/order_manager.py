@@ -837,6 +837,25 @@ class OrderManager:
         if order is None:
             return None
 
+        # A broker fill is authoritative only when it carries at least one
+        # broker-issued receipt identity.  Never mutate order state from a
+        # symbol/price/quantity-shaped observation, and make duplicate
+        # callbacks idempotent across restart-restored ``order.fills``.
+        if not any((deal_id, broker_trade_id, exchange_fill_id, exchange_seq)):
+            self._record_audit(
+                order, "deal_fill_rejected", source=source or "deal_fill",
+                reason="BROKER_RECEIPT_IDENTITY_MISSING", payload=raw_payload,
+                broker_order_id=broker_order_id, seqno=seqno, ordno=ordno,
+                fill_price=fill_price, fill_qty=fill_qty,
+                observation_type=observation_type,
+            )
+            return None
+        if self._has_fill_identity(
+            order, deal_id=deal_id, broker_trade_id=broker_trade_id,
+            exchange_fill_id=exchange_fill_id, exchange_seq=exchange_seq,
+        ):
+            return order
+
         remaining = order.quantity - order.filled_quantity
         if fill_qty > remaining:
             raise ValueError(f"Fill qty {fill_qty} exceeds remaining {remaining} for {order.order_id}")

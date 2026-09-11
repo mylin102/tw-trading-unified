@@ -6320,6 +6320,58 @@ class FuturesMonitor:
         self._save_orders_file_wrapper()
         return result
 
+    def _fills_bridge_mark_seen(self, order, deal_id=None, seqno=None) -> bool:
+        """Return False for a callback already seen or durably restored."""
+        if order is None or not (deal_id or seqno):
+            return True
+        if getattr(self, "_fills_bridge_seen", None) is None:
+            self._fills_bridge_seen = {}
+        for fill in getattr(order, "fills", ()):
+            if deal_id and (getattr(fill, "deal_id", None) == deal_id
+                            or getattr(fill, "broker_trade_id", None) == deal_id
+                            or getattr(fill, "exchange_fill_id", None) == deal_id):
+                return False
+            if seqno and getattr(fill, "exchange_seq", None) == seqno:
+                return False
+        key = (getattr(order, "order_id", None), deal_id or seqno)
+        if key in self._fills_bridge_seen:
+            return False
+        self._fills_bridge_seen[key] = True
+        return True
+
+    @staticmethod
+    def _normalize_order_deal_records(records):
+        """Normalize Shioaji ``(state, payload)`` deal records only.
+
+        Order-status records are deliberately excluded: terminalization must
+        be driven by a broker deal receipt, never by local inference.
+        """
+        normalized = []
+        for state, raw in records or ():
+            state_name = str(getattr(state, "name", ""))
+            state_value = str(getattr(state, "value", "")).upper()
+            if not (state_name == "FuturesDeal" or state_value == "FDEAL"
+                    or str(state) in ("FuturesDeal", "FDEAL")):
+                continue
+            payload = raw if isinstance(raw, dict) else {}
+            if not payload:
+                continue
+            identity = (payload.get("trade_id") or payload.get("deal_id")
+                        or payload.get("fill_id"))
+            if not identity:
+                continue
+            deal = dict(payload)
+            deal.setdefault("exchange_seq", payload.get("exchange_seq")
+                            or payload.get("seqno"))
+            normalized.append({
+                "id": identity,
+                "status": "Filled",
+                "code": payload.get("code"),
+                "delivery_month": payload.get("delivery_month"),
+                "deals": [deal],
+            })
+        return normalized
+
     def on_order_event(self, order_state, data) -> None:
         """Apply one Shioaji futures callback to the canonical lifecycle.
 
@@ -6376,14 +6428,25 @@ class FuturesMonitor:
                 return
             if fill_price <= 0 or fill_qty <= 0:
                 return
+            _deal_id = payload.get("trade_id") or payload.get("deal_id")
+            _exchange_seq = payload.get("exchange_seq")
+            if not any((_deal_id, _exchange_seq, broker_order_id, seqno, ordno)):
+                logger.warning("[FUTURES_DEAL_REJECTED] broker identity missing")
+                return
+            _order = self.order_mgr._resolve_order(
+                None, broker_order_id=broker_order_id, seqno=seqno, ordno=ordno
+            )
+            if _order is not None and not self._fills_bridge_mark_seen(
+                    _order, _deal_id, _exchange_seq):
+                return
             order = self.order_mgr.apply_deal_fill(
                 None,
-                deal_id=payload.get("trade_id") or payload.get("deal_id"),
+                deal_id=_deal_id,
                 fill_price=fill_price,
                 fill_qty=fill_qty,
                 exchange_fill_id=payload.get("trade_id") or payload.get("deal_id"),
                 broker_trade_id=payload.get("trade_id"),
-                exchange_seq=payload.get("exchange_seq"),
+                exchange_seq=_exchange_seq,
                 raw_payload=payload,
                 broker_order_id=broker_order_id,
                 seqno=seqno,
@@ -9436,6 +9499,26 @@ class FuturesMonitor:
                 getattr(getattr(self, "_execution_context", None),
                         "exit_only_capability", None), dict)
         )
+
+        _requested_mode = str(getattr(getattr(self, "_execution_context", None),
+                                     "requested_mode", "")).lower()
+        _effective_mode = str(getattr(getattr(self, "_execution_context", None),
+                                      "effective_mode", "")).lower()
+        if (_fills_open and not _state_has_pos
+                and (bool(getattr(self, "live_trading", False))
+                     or "live" in _requested_mode
+                     or "live" in _effective_mode)):
+            console.print(
+                "[yellow]⚠️ [MTS_RECOVERY_BLOCKED_LIVE] broker truth "
+                "must establish live position; historical fills are "
+                "evidence only[/yellow]"
+            )
+            if hasattr(self, "_append_mts_event"):
+                self._append_mts_event(
+                    "MTS_RECOVERY_BLOCKED_LIVE",
+                    reason="BROKER_TRUTH_REQUIRED",
+                )
+            _fills_open = False
 
         if _fills_open and not _state_has_pos:
             # Split-brain: fills says open, state says closed.
