@@ -121,7 +121,8 @@ def test_legacy_fill_without_instrument_identity_cannot_poison_current_trade(tmp
     ]
     (ledger / "mts_trade_fills.jsonl").write_text("\n".join(json.dumps(x) for x in rows) + "\n")
     persist_execution_context({"requested_mode": "live", "effective_mode": "live_quarantined",
-        "live_order_allowed": False, "state_namespace": "live"}, runtime_dir=str(tmp_path))
+        "live_order_allowed": False, "audit_reasons": ["RECONCILIATION_HOLD"],
+        "state_namespace": "live"}, runtime_dir=str(tmp_path))
     ok, ctx = migrate_stale_live_context(str(tmp_path), _snapshot())
     assert ok is True
     assert ctx["canonical_holding"]["trade_id"] == tid
