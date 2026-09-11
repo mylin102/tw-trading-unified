@@ -73,7 +73,9 @@ def test_clear_session_orders_wipes_state(mock_orders_setup):
     # Verify everything wiped
     assert len(om.active_orders) == 0
     assert len(om.completed) == 0
-    assert om._next_id == 1
+    # Clearing lifecycle state must not reset the durable global order-id
+    # sequence; otherwise a later session can reuse an old local ID.
+    assert om._next_id >= 3
 
 
 def test_monitor_clear_records_flag_processing(mock_orders_setup, monkeypatch, tmp_path):
