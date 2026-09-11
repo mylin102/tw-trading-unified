@@ -123,7 +123,12 @@ def test_legacy_fill_without_instrument_identity_cannot_poison_current_trade(tmp
     persist_execution_context({"requested_mode": "live", "effective_mode": "live_quarantined",
         "live_order_allowed": False, "audit_reasons": ["RECONCILIATION_HOLD"],
         "state_namespace": "live"}, runtime_dir=str(tmp_path))
-    ok, ctx = migrate_stale_live_context(str(tmp_path), _snapshot())
+    current = _snapshot()
+    current["positions"][0]["direction"] = "Action.Sell"
+    current["positions"][1]["direction"] = "Action.Buy"
+    current["positions"][0]["avg_cost"] = 46288.0
+    current["positions"][1]["avg_cost"] = 46451.0
+    ok, ctx = migrate_stale_live_context(str(tmp_path), current)
     assert ok is True
     assert ctx["canonical_holding"]["trade_id"] == tid
     assert {x["code"] for x in ctx["canonical_holding"]["canonical_legs"]} == {"TMFI6", "TMFJ6"}
