@@ -63,6 +63,23 @@ def _legs_from_stale_context(ctx: dict, runtime_dir: str) -> tuple[list[dict] | 
     return None, None, "none"
 
 
+def _state_proves_settled_flat(runtime_dir: str) -> bool:
+    """Return true only for the explicit persisted flat/settled state.
+
+    Historical fill rows are not open-position evidence after a fresh broker
+    flat capture.  This exception is deliberately narrow: a missing,
+    unreadable, non-flat, or non-settled state never clears reconciliation.
+    """
+    path = Path(runtime_dir) / "data" / "state" / "mts_position_state.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        return (state.get("has_position") is False
+                and str(state.get("state", "")).upper() == "FLAT"
+                and str(state.get("settlement_status", "")).upper() == "SETTLED")
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def migrate_stale_live_context(runtime_dir: str, snapshot: dict,
                                *, tick_size: float = 1.0) -> tuple[bool, dict]:
     """Reconcile and atomically replace stale ctx; never calls broker APIs."""
@@ -70,6 +87,15 @@ def migrate_stale_live_context(runtime_dir: str, snapshot: dict,
     ctx = read_execution_context(runtime_dir=runtime_dir)
     capture_ok = ((snapshot or {}).get("fetch_status") or {}).get("capture") == "OK"
     local_legs, ledger_trade_id, evidence_source = _legs_from_stale_context(ctx, runtime_dir)
+    broker_legs = _legs_from_snapshot(snapshot or {}) if capture_ok else None
+    if (capture_ok and broker_legs == []
+            and _state_proves_settled_flat(runtime_dir)):
+        # Current reconciliation is authoritative: a fresh broker-flat
+        # snapshot plus explicit settled-flat state means the ledger's entry
+        # rows are historical, not current holding legs.  Evaluate this on
+        # every migration call so a stale HOLD cannot persist across rewrites.
+        local_legs = []
+        evidence_source = "broker_flat_settled_reconcile"
     canonical = ctx.get("canonical_holding")
     if local_legs is not None and isinstance(canonical, dict) and canonical.get("canonical_legs"):
         secondary = reconcile_holding(local_legs, canonical.get("canonical_legs"), tick_size=tick_size)
@@ -77,7 +103,7 @@ def migrate_stale_live_context(runtime_dir: str, snapshot: dict,
             local_legs = None
             evidence_source = "ledger_canonical_mismatch"
     decision = reconcile_holding(
-        _legs_from_snapshot(snapshot or {}) if capture_ok else None,
+        broker_legs,
         local_legs, tick_size=tick_size,
         broker_query_error=None if capture_ok else "BROKER_CAPTURE_UNCERTAIN")
     evidence = {"status": decision.status.value, "reason": decision.reason,
