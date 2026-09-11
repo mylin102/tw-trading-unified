@@ -88,3 +88,23 @@ def test_collision_guard_skips_existing(mock_orders_dir):
     # create_order should skip 000007 and use 000008
     o = om.create_order("TMF_NEAR", OrderSide.BUY, OrderType.LIMIT, 1, 47000, strategy="TEST")
     assert o.order_id == "ORD-20260707-000008", f"Collision guard failed: expected 000008, got {o.order_id}"
+
+
+def test_session_rollover_keeps_monotonic_counter_across_old_exports(tmp_path, monkeypatch):
+    """A new session must not reuse an ID suffix from an older session."""
+    exports_dir = tmp_path / "exports" / "trades"
+    exports_dir.mkdir(parents=True)
+    with open(exports_dir / "TMF_20260707_orders.json", "w") as f:
+        json.dump([{"order_id": "ORD-20260707-000006"}], f)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("core.date_utils.get_session_date_str", lambda: "20260708")
+
+    from core.order_management.order_manager import OrderManager
+    from core.order_management.order import OrderSide, OrderType
+
+    om = OrderManager(mode="paper")
+    order = om.create_order(
+        "TMF_NEAR", OrderSide.BUY, OrderType.LIMIT, 1, 47000, strategy="TEST"
+    )
+    assert order.order_id == "ORD-20260708-000007"
