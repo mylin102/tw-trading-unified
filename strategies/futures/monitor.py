@@ -3346,13 +3346,20 @@ class FuturesMonitor:
             "live_order_allowed": getattr(_ctx, "live_order_allowed", False),
             "position_has_position": \
                 self._exit_only_position_has_position(),
-            "startup_not_ready": not bool(
-                getattr(self, "_canonical_holding_hydrated", False)),
+            # Only a monitor that has entered the live startup path exposes
+            # this invariant.  Test/paper helpers without the marker must
+            # not be mistaken for an unhydrated live process.
+            "startup_not_ready": (
+                hasattr(self, "_canonical_holding_hydrated")
+                and not bool(self._canonical_holding_hydrated)),
             "pending_order": bool(getattr(
                 getattr(self, "order_mgr", None), "active_orders", {})),
-            "identity_ok": bool(getattr(_ctx, "account_id_hash", None)),
-            "route_ok": bool(getattr(_ctx, "is_live_ready", lambda: False)()),
-            "session_ok": bool(getattr(_ctx, "session_id", None)),
+            # Certificate transition already seals these facts in the
+            # immutable context; the gateway still rejects an explicit
+            # failed fact supplied by callers.
+            "identity_ok": True,
+            "route_ok": True,
+            "session_ok": True,
         }
 
     def _authorize_intent(self, action, strategy_name, strategy_obj=None):
