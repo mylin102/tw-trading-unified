@@ -79,6 +79,23 @@ def detect_broker_reconciliation(*, broker_trades, ledger_rows, broker_legs,
         if emit:
             emit(event)
         return report
+    # A terminal order without a deal identity is only an order-state
+    # observation.  It cannot support fill-vs-ledger reconciliation, so do
+    # not manufacture a missing-fill or phantom event from it.
+    for trade in broker_trades:
+        if _terminal(trade):
+            deals = list(_deal_rows(trade))
+            if not any(_fill_key(deal)[0] or _fill_key(deal)[1]
+                       for deal in deals):
+                event = ReconciliationEvent(
+                    "BROKER_EVIDENCE_UNAVAILABLE",
+                    "terminal broker row has no deal identity; fill evidence unavailable")
+                report.events.append(event)
+                report.hold = True
+                report.entry_blocked = True
+                if emit:
+                    emit(event)
+                return report
     ledger_keys = {_fill_key(row) for row in ledger_rows or ()
                    if str(_value(row, "execution_source") or "") == "BROKER_FILL"}
     broker_keys = set()
