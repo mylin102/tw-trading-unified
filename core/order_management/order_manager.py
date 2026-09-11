@@ -1355,7 +1355,19 @@ class OrderManager:
         # identity is sufficient to close the lifecycle, but accounting stays
         # DETAILS_PENDING: never invent a price/PnL from aggregate fields.
         if normalized_status == OrderStatus.FILLED and not deals:
-            _filled_qty = self._extract_value(trade, "filled_qty", "filled_quantity")
+            # Shioaji may expose confirmed terminal quantity/price on status
+            # while deal detail arrives later. Use broker fields only; never
+            # synthesize a deal or BROKER_FILL ledger row here.
+            _status = getattr(trade, "status", None)
+            _filled_qty = self._extract_value(
+                _status, "filled_qty", "filled_quantity", "quantity")
+            if _filled_qty is None:
+                _filled_qty = self._extract_value(
+                    trade, "filled_qty", "filled_quantity", "quantity")
+            _aggregate_price = self._extract_value(
+                _status, "avg_price", "price")
+            if _aggregate_price is None:
+                _aggregate_price = self._extract_value(trade, "avg_price", "price")
             if _filled_qty is not None:
                 try:
                     _filled_qty = int(_filled_qty)
@@ -1365,6 +1377,11 @@ class OrderManager:
                 order, filled_qty=_filled_qty,
                 raw_payload=self._payload_to_dict(trade),
                 source=source or "reconcile", reason="DETAILS_PENDING")
+            if _aggregate_price is not None:
+                try:
+                    order.avg_fill_price = float(_aggregate_price)
+                except (TypeError, ValueError):
+                    pass
         elif normalized_status == OrderStatus.PARTIAL_FILLED and not deals:
             _filled_qty = self._extract_value(trade, "filled_qty", "filled_quantity")
             try:
