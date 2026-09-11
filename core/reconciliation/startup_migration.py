@@ -30,8 +30,12 @@ def _legs_from_fill_ledger(runtime_dir: str) -> tuple[list[dict] | None, str | N
         for line in ledger.read_text(encoding="utf-8").splitlines():
             row = json.loads(line)
             if (row.get("trade_id", "").startswith("broker-reconciled-")
-                    and row.get("execution_source") == "BROKER_FILL"):
-                latest[row.get("instrument_code")] = row
+                    and row.get("execution_source") == "BROKER_FILL"
+                    and row.get("instrument_code")):
+                # A historical release row may predate instrument identity.
+                # It is not valid current-leg evidence and must not create a
+                # synthetic ``None`` leg or mix trade ids after restart.
+                latest[row["instrument_code"]] = row
     except (OSError, ValueError, TypeError):
         return None, None
     if not latest:
