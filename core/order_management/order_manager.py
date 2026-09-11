@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import json
+import tempfile
 from datetime import datetime
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, field
@@ -316,16 +317,14 @@ class OrderManager:
         # Format: ORD-{session_date}-{counter:06d}
         # Counter resets per trading session, persists across PM2 restarts
         # via reindex_orders() scanning existing orders for current session.
-        order_id = f"ORD-{self._session_date}-{self._next_id:06d}"
-        self._next_id += 1
-
-        # 2026-07-07 Hermes Agent: collision guard — skip IDs that already
-        # exist in active_orders or completed (counter may backtrack after
-        # PM2 restart if reindex_orders wasn't called yet).
+        # Reserve from a durable, session-independent sequence before creating
+        # the order.  The date remains useful for operators, but never defines
+        # uniqueness: a new trading session must not reuse yesterday's suffix.
         _existing_ids = set(self.active_orders.keys()) | {o.order_id for o in self.completed}
-        while order_id in _existing_ids:
-            order_id = f"ORD-{self._session_date}-{self._next_id:06d}"
-            self._next_id += 1
+        while True:
+            order_id = self._reserve_order_id()
+            if order_id not in _existing_ids:
+                break
 
         order = Order(
             symbol=symbol,
@@ -1228,13 +1227,14 @@ class OrderManager:
         return restored
 
     def reindex_orders(self) -> Dict[str, int]:
-        """Scan existing orders for current session_date, set _next_id to max+1.
+        """Recover a monotonic order sequence from all durable order history.
 
         2026-07-07 Hermes Agent: session_date-aware reindex.
         Supports both old format (ORD-XXXXXX) and new format (ORD-YYYYMMDD-XXXXXX).
         Scans in-memory orders AND the persisted orders JSON file so the counter
         survives PM2 restart (when in-memory state is empty but disk has history).
-        On session boundary, _session_date changes → finds no matching orders → resets to 1.
+        The session date is only a display component.  It must not reset the
+        numeric sequence, because daily exports can be compacted or replaced.
         """
         max_order_index = 0
 
@@ -1245,7 +1245,7 @@ class OrderManager:
             parts = suffix.split("-", 1)
             if len(parts) == 2:
                 date_part, counter_part = parts
-                if date_part == self._session_date and counter_part.isdigit():
+                if date_part.isdigit() and counter_part.isdigit():
                     return int(counter_part)
             elif suffix.isdigit():
                 return int(suffix)
@@ -1254,14 +1254,16 @@ class OrderManager:
         for order in list(self.active_orders.values()) + self.completed:
             max_order_index = max(max_order_index, _scan_id(order.order_id))
 
-        # 2026-07-07 Hermes Agent: also scan persisted orders file.
-        # After PM2 restart the in-memory collections are empty, but the
-        # orders file holds the full history for this session.
+        # Scan every daily export, not just today's file.  The separate
+        # sequence registry below is authoritative when an export was
+        # compacted/replaced and an old order is no longer in that JSON.
         try:
-            import json, os as _os
-            _orders_file = f"exports/trades/TMF_{self._session_date}_orders.json"
-            if _os.path.exists(_orders_file):
-                with open(_orders_file) as _of:
+            _trades_dir = "exports/trades"
+            for _orders_file in sorted(
+                _name for _name in os.listdir(_trades_dir)
+                if _name.startswith("TMF_") and _name.endswith("_orders.json")
+            ):
+                with open(os.path.join(_trades_dir, _orders_file)) as _of:
                     _orders_data = json.load(_of)
                 if isinstance(_orders_data, list):
                     for _entry in _orders_data:
@@ -1273,22 +1275,95 @@ class OrderManager:
         except Exception:
             pass
 
+        try:
+            with open(self._order_id_registry_path()) as _rf:
+                _registry = json.load(_rf)
+            max_order_index = max(
+                max_order_index, int(_registry.get("next_id", 1)) - 1
+            )
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        try:
+            with open(self._order_id_audit_path(), encoding="utf-8") as _af:
+                for _line in _af:
+                    try:
+                        _entry = json.loads(_line)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(_entry, dict):
+                        max_order_index = max(
+                            max_order_index, _scan_id(_entry.get("order_id", ""))
+                        )
+        except OSError:
+            pass
+
         self._next_id = max(self._next_id, max_order_index + 1)
+        self._persist_next_order_id()
         return {"active": len(self.active_orders), "completed": len(self.completed)}
 
+    @staticmethod
+    def _order_id_registry_path() -> str:
+        return os.path.join("exports", "trades", "order_id_sequence.json")
+
+    def _persist_next_order_id(self) -> None:
+        """Atomically persist the next global numeric suffix."""
+        path = self._order_id_registry_path()
+        directory = os.path.dirname(path)
+        if not os.path.isdir(directory):
+            return
+        fd, tmp_path = tempfile.mkstemp(prefix=".order_id_sequence.", dir=directory)
+        try:
+            with os.fdopen(fd, "w") as handle:
+                json.dump({"next_id": self._next_id}, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    @staticmethod
+    def _order_id_audit_path() -> str:
+        return os.path.join("exports", "trades", "order_id_audit.jsonl")
+
+    def _append_order_id_audit(self, order_id: str) -> None:
+        """Keep append-only local identity history independent of daily exports."""
+        path = self._order_id_audit_path()
+        directory = os.path.dirname(path)
+        if not os.path.isdir(directory):
+            return
+        record = {
+            "order_id": order_id,
+            "session_date": self._session_date,
+            "created_at": datetime.now().isoformat(),
+            "source": "LOCAL_ORDER_ID_ALLOCATOR",
+        }
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _reserve_order_id(self) -> str:
+        next_id = self._next_id
+        self._next_id += 1
+        self._persist_next_order_id()
+        order_id = f"ORD-{self._session_date}-{next_id:06d}"
+        self._append_order_id_audit(order_id)
+        return order_id
+
     def clear_session_orders(self) -> None:
-        """Clear all active and completed orders for the current session and reset next ID.
+        """Clear in-memory session orders without resetting durable IDs.
 
         2026-07-07 Gemini CLI / Hermes Agent: Reset session-date-aware state and next_id.
         """
         self.active_orders.clear()
         self.completed = []
-        self._next_id = 1
         try:
             from core.date_utils import get_session_date_str
             self._session_date = get_session_date_str()
         except Exception:
             self._session_date = datetime.now().strftime("%Y%m%d")
+        self.reindex_orders()
 
     def reconcile_trade_snapshot(
         self,
