@@ -195,6 +195,27 @@ def test_missing_broker_identity_fails_closed_without_polluting_dedupe():
     assert len(applied) == 1
 
 
+def test_order_manager_fill_receipt_requires_identity_and_is_idempotent():
+    """The canonical manager boundary also enforces receipt invariants."""
+    manager = OrderManager(mode="paper")
+    order = _order(manager)
+    assert manager.apply_deal_fill(
+        None, fill_price=46329.0, fill_qty=1, broker_order_id="BRK-1"
+    ) is None
+    assert order.filled_quantity == 0
+
+    assert manager.apply_deal_fill(
+        None, fill_price=46329.0, fill_qty=1, broker_order_id="BRK-1",
+        deal_id="deal-1", exchange_seq="SEQ-1"
+    ) is order
+    assert manager.apply_deal_fill(
+        None, fill_price=46329.0, fill_qty=1, broker_order_id="BRK-1",
+        deal_id="deal-1", exchange_seq="SEQ-1"
+    ) is order
+    assert order.filled_quantity == 1
+    assert len(order.fills) == 1
+
+
 # ── ledger path unification ──
 
 def test_fills_ledger_path_resolves_runtime_logs(monkeypatch):
