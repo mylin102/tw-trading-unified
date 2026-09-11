@@ -23,6 +23,7 @@ class ReconciliationReport:
     events: list[ReconciliationEvent] = field(default_factory=list)
     repaired_fill_count: int = 0
     hold: bool = False
+    entry_blocked: bool = False
 
 
 def _value(row, *keys):
@@ -63,10 +64,21 @@ def _fill_key(row):
 
 def detect_broker_reconciliation(*, broker_trades, ledger_rows, broker_legs,
                                  canonical_legs, tick_size: float = 1.0,
+                                 trade_id: str = "",
                                  repair_fill: Callable[[dict], None] | None = None,
                                  emit: Callable[[ReconciliationEvent], None] | None = None) -> ReconciliationReport:
     """Compare both directions and repair only broker-proven missing fills."""
     report = ReconciliationReport()
+    if broker_trades is None:
+        event = ReconciliationEvent(
+            "BROKER_EVIDENCE_UNAVAILABLE",
+            "authoritative broker trade evidence unavailable; empty is not inferred")
+        report.events.append(event)
+        report.hold = True
+        report.entry_blocked = True
+        if emit:
+            emit(event)
+        return report
     ledger_keys = {_fill_key(row) for row in ledger_rows or ()
                    if str(_value(row, "execution_source") or "") == "BROKER_FILL"}
     broker_keys = set()
@@ -98,6 +110,20 @@ def detect_broker_reconciliation(*, broker_trades, ledger_rows, broker_legs,
             if emit:
                 emit(event)
 
+    # A broker working order is an active risk, even when positions currently
+    # match.  The detector is read-only and deliberately does not cancel it.
+    for order in broker_trades:
+        if not _terminal(order):
+            event = ReconciliationEvent(
+                "BROKER_WORKING_ORDER_HOLD",
+                "broker reports a non-terminal working order",
+                order_id=str(_value(order, "broker_order_id", "id", "order_id") or ""))
+            report.events.append(event)
+            report.hold = True
+            report.entry_blocked = True
+            if emit:
+                emit(event)
+
     def legs_map(rows):
         return {str(_value(row, "code", "instrument_code", "symbol")): row for row in rows or ()}
     broker_map, canonical_map = legs_map(broker_legs), legs_map(canonical_legs)
@@ -119,4 +145,20 @@ def detect_broker_reconciliation(*, broker_trades, ledger_rows, broker_legs,
         report.hold = True
         if emit:
             emit(event)
+    if not broker_map and canonical_map and trade_id:
+        has_exit = any(
+            str(_value(row, "trade_id") or "") == str(trade_id)
+            and str(_value(row, "fill_type") or "").upper() == "EXIT"
+            for row in ledger_rows or ()
+        )
+        if not has_exit:
+            event = ReconciliationEvent(
+                "BROKER_FLAT_WITHOUT_EXIT_EVIDENCE",
+                "broker is flat but no audited exit fill proves local closure",
+                trade_id=str(trade_id))
+            report.events.append(event)
+            report.hold = True
+            report.entry_blocked = True
+            if emit:
+                emit(event)
     return report

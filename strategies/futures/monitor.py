@@ -4741,6 +4741,78 @@ class FuturesMonitor:
             self._save_orders_file_wrapper()
         return changed + stale_changed
 
+    def _run_broker_reconciliation_detector(self, snapshot) -> None:
+        """Run the read-only broker/ledger drift detector on each capture.
+
+        Broker terminal evidence is handed to the existing OrderManager
+        reconciliation callback; this method never talks to the broker or
+        writes a ledger row directly.  A failed capture is passed as
+        ``None`` so the detector emits an explicit fail-closed event rather
+        than treating an empty result as proof of no drift.
+        """
+        try:
+            from core.broker_reconciliation_detector import (
+                detect_broker_reconciliation)
+            ledger_path = Path(runtime_logs("mts_trade_fills.jsonl"))
+            rows = []
+            if ledger_path.is_file():
+                for line in ledger_path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        item = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(item, dict):
+                        rows.append(item)
+            capture_ok = ((snapshot or {}).get("fetch_status") or {}).get(
+                "capture") == "OK"
+            broker_trades = ((snapshot or {}).get("broker_trades")
+                             if capture_ok else None)
+
+            def _side(row):
+                value = str(row.get("direction") or row.get("side")
+                            or row.get("action") or "").lower()
+                return "LONG" if any(x in value for x in ("buy", "long")) \
+                    else "SHORT" if any(x in value for x in ("sell", "short")) \
+                    else value.upper()
+
+            broker_legs = []
+            for row in (snapshot or {}).get("positions") or []:
+                if row.get("account") == "futures" and int(
+                        row.get("quantity", 0) or 0) != 0:
+                    broker_legs.append({
+                        "code": row.get("code"), "side": _side(row),
+                        "qty": abs(int(row.get("quantity"))),
+                        "avg_cost": row.get("avg_cost"),
+                    })
+            holding = getattr(getattr(self, "_execution_context", None),
+                              "canonical_holding", None) or {}
+            canonical_legs = holding.get("canonical_legs") or []
+            trade_id = str(holding.get("trade_id") or "")
+            manager = getattr(self, "order_mgr", None)
+
+            def _repair(fill):
+                if manager is not None and hasattr(
+                        manager, "reconcile_broker_state"):
+                    manager.reconcile_broker_state(
+                        filled_trades=[{"id": fill.get("broker_order_id"),
+                                        "status": "Filled",
+                                        "code": fill.get("instrument_code"),
+                                        "deals": [fill]}],
+                        source="periodic_broker_reconcile",
+                        reason="detector_missing_fill")
+
+            def _emit(event):
+                self._append_mts_event(
+                    event.code, detail=event.detail,
+                    trade_id=event.trade_id, order_id=event.order_id)
+
+            detect_broker_reconciliation(
+                broker_trades=broker_trades, ledger_rows=rows,
+                broker_legs=broker_legs, canonical_legs=canonical_legs,
+                trade_id=trade_id, repair_fill=_repair, emit=_emit)
+        except Exception as exc:
+            logger.warning("[BROKER_RECONCILIATION_DETECTOR_ERROR] %s", exc)
+
     def _reconcile_stale_active_mts_orders(self, snapshot) -> int:
         """Terminalize stale, unfilled MTS orders only after broker absence.
 
@@ -4884,6 +4956,7 @@ class FuturesMonitor:
             return getattr(self, "_live_broker_authority", None)
         _snap = self._capture_post_startup_snapshot()
         self._reconcile_local_orders_from_snapshot(_snap)
+        self._run_broker_reconciliation_detector(_snap)
         if ((_snap.get("fetch_status") or {}).get("capture") != "OK"
                 or _snap.get("open_orders")):
             self._live_broker_authority = None
