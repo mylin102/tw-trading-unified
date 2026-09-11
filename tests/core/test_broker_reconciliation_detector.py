@@ -88,3 +88,13 @@ def test_broker_evidence_unavailable_is_fail_closed_not_flat():
     assert report.entry_blocked is True
     assert any(event.code == "BROKER_EVIDENCE_UNAVAILABLE"
                for event in report.events)
+
+
+def test_terminal_trade_without_deal_identity_is_evidence_unavailable():
+    report = detect_broker_reconciliation(
+        broker_trades=[{"id": "broker-order", "status": "Filled",
+                        "deals": [{"price": 46288, "quantity": 1}]}],
+        ledger_rows=[], broker_legs=[], canonical_legs=[])
+    assert report.hold is True
+    assert report.entry_blocked is True
+    assert [e.code for e in report.events] == ["BROKER_EVIDENCE_UNAVAILABLE"]
