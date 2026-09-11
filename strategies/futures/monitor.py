@@ -5037,6 +5037,21 @@ class FuturesMonitor:
                     guard="reconciliation", ok=False,
                     reasons=(_pending_reason,)),)), None
         snapshot = self._capture_post_startup_snapshot()
+        # Re-run sanctioned migration before the atomic-health gate and keep
+        # its evidence in the immutable context for subsequent rewrites.
+        try:
+            import dataclasses
+            from core.reconciliation.startup_migration import migrate_stale_live_context
+            from core.runtime_paths import runtime_root
+            _migrated, _migration_ctx = migrate_stale_live_context(runtime_root(), snapshot)
+            if isinstance(_migration_ctx, dict):
+                self._execution_context = dataclasses.replace(
+                    self._execution_context,
+                    canonical_holding=_migration_ctx.get("canonical_holding"),
+                )
+                self._canonical_holding_hydrated = bool(_migrated)
+        except Exception:
+            self._canonical_holding_hydrated = False
         # Reconcile persisted local orders before the startup gate evaluates
         # pending-entry state.  A successful broker snapshot may prove a stale
         # submitted MTS entry absent; a failed snapshot remains fail-closed.

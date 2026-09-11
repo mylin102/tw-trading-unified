@@ -161,6 +161,9 @@ class ExecutionContext:
     # broker-reconciled position. It never grants general live-order access.
     exit_only_capability: dict | None = None
 
+    # Durable broker-truth migration evidence; preserved by every rewrite.
+    canonical_holding: dict | None = None
+
     def is_live_ready(self) -> bool:
         """Shorthand: fully LIVE with authorization."""
         return (
@@ -284,6 +287,7 @@ class ExecutionContext:
             "state_namespace": self.state_namespace,
             "audit_reasons": list(self.audit_reasons),
             "exit_only_capability": self.exit_only_capability,
+            "canonical_holding": self.canonical_holding,
         }
 
 

@@ -22,18 +22,8 @@ def _legs_from_snapshot(snapshot: dict) -> list[dict]:
     return result
 
 
-def _legs_from_stale_context(ctx: dict, runtime_dir: str) -> list[dict] | None:
-    cap = ctx.get("exit_only_capability")
-    rows = cap.get("legs") if isinstance(cap, dict) else None
-    if isinstance(rows, list):
-        return [{
-        "code": row["symbol"],
-        "side": "SHORT" if str(row.get("side", "")).lower() == "sell" else "LONG",
-        "qty": row["remaining_qty"], "avg_cost": row["avg_cost"],
-        } for row in rows if isinstance(row, dict)]
-    # After a restart the old ctx may already have been rewritten without
-    # the legacy capability.  Use durable BROKER_FILL ledger rows as the
-    # local side of reconciliation; never infer from broker shape alone.
+def _legs_from_fill_ledger(runtime_dir: str) -> tuple[list[dict] | None, str | None]:
+    """Read durable BROKER_FILL rows as primary local position evidence."""
     ledger = Path(runtime_dir) / "logs" / "mts_trade_fills.jsonl"
     latest = {}
     try:
@@ -43,13 +33,34 @@ def _legs_from_stale_context(ctx: dict, runtime_dir: str) -> list[dict] | None:
                     and row.get("execution_source") == "BROKER_FILL"):
                 latest[row.get("instrument_code")] = row
     except (OSError, ValueError, TypeError):
-        return None
+        return None, None
+    if not latest:
+        return None, None
+    trade_ids = {str(row.get("trade_id")) for row in latest.values()}
+    if len(trade_ids) != 1:
+        return None, None
     return [{
         "code": row.get("instrument_code"),
         "side": "LONG" if str(row.get("side", "")).upper() == "BUY" else "SHORT",
         "qty": row.get("quantity") or row.get("qty"),
         "avg_cost": row.get("price") or row.get("avg_price"),
-    } for row in latest.values()]
+    } for row in latest.values()], next(iter(trade_ids))
+
+
+def _legs_from_stale_context(ctx: dict, runtime_dir: str) -> tuple[list[dict] | None, str | None, str]:
+    # The durable fill ledger is primary after restart.
+    legs, trade_id = _legs_from_fill_ledger(runtime_dir)
+    if legs is not None:
+        return legs, trade_id, "durable_broker_fill_ledger"
+    cap = ctx.get("exit_only_capability")
+    rows = cap.get("legs") if isinstance(cap, dict) else None
+    if isinstance(rows, list):
+        return ([{
+            "code": row["symbol"],
+            "side": "SHORT" if str(row.get("side", "")).lower() == "sell" else "LONG",
+            "qty": row["remaining_qty"], "avg_cost": row["avg_cost"],
+        } for row in rows if isinstance(row, dict)], cap.get("trade_id"), "legacy_context")
+    return None, None, "none"
 
 
 def migrate_stale_live_context(runtime_dir: str, snapshot: dict,
@@ -58,11 +69,22 @@ def migrate_stale_live_context(runtime_dir: str, snapshot: dict,
     from core.execution_context_state import persist_execution_context, read_execution_context
     ctx = read_execution_context(runtime_dir=runtime_dir)
     capture_ok = ((snapshot or {}).get("fetch_status") or {}).get("capture") == "OK"
+    local_legs, ledger_trade_id, evidence_source = _legs_from_stale_context(ctx, runtime_dir)
+    canonical = ctx.get("canonical_holding")
+    if local_legs is not None and isinstance(canonical, dict) and canonical.get("canonical_legs"):
+        secondary = reconcile_holding(local_legs, canonical.get("canonical_legs"), tick_size=tick_size)
+        if secondary.fail_closed:
+            local_legs = None
+            evidence_source = "ledger_canonical_mismatch"
     decision = reconcile_holding(
         _legs_from_snapshot(snapshot or {}) if capture_ok else None,
-        _legs_from_stale_context(ctx, runtime_dir), tick_size=tick_size,
+        local_legs, tick_size=tick_size,
         broker_query_error=None if capture_ok else "BROKER_CAPTURE_UNCERTAIN")
     evidence = {"status": decision.status.value, "reason": decision.reason,
+                "trade_id": ledger_trade_id or "",
+                "evidence_hash": (snapshot or {}).get("canonical_input_hash") or
+                    ((canonical or {}).get("evidence_hash", "") if isinstance(canonical, dict) else ""),
+                "source": evidence_source,
                 "raw_broker_legs": list(decision.raw_broker_legs),
                 "raw_local_legs": list(decision.raw_local_legs),
                 "canonical_legs": list(decision.canonical_legs)}

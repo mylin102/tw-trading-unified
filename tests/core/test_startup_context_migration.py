@@ -39,3 +39,31 @@ def test_stale_context_mismatch_is_hold_and_no_live_authority(tmp_path):
     assert ok is False and ctx["effective_mode"] == "live_quarantined"
     assert ctx["audit_reasons"][0] == "RECONCILIATION_HOLD"
     assert ctx["live_order_allowed"] is False
+
+
+def test_durable_fill_ledger_is_primary_and_survives_context_rewrite(tmp_path):
+    from core.execution_context_state import persist_execution_context, read_execution_context
+    ledger = tmp_path / "logs"
+    ledger.mkdir()
+    tid = "broker-reconciled-b1769ea375a331bd"
+    (ledger / "mts_trade_fills.jsonl").write_text(
+        __import__("json").dumps({"trade_id": tid, "execution_source": "BROKER_FILL",
+            "instrument_code": "TMFI6", "side": "BUY", "quantity": 1, "price": 45876.0}) + "\n" +
+        __import__("json").dumps({"trade_id": tid, "execution_source": "BROKER_FILL",
+            "instrument_code": "TMFJ6", "side": "SELL", "quantity": 1, "price": 46059.0}) + "\n")
+    persist_execution_context({"requested_mode": "live", "effective_mode": "live_quarantined",
+        "live_order_allowed": False, "audit_reasons": ["BROKER_NOT_FLAT"],
+        "state_namespace": "live", "exit_only_capability": None}, runtime_dir=str(tmp_path))
+    ok, ctx = migrate_stale_live_context(str(tmp_path), _snapshot())
+    assert ok and ctx["canonical_holding"]["trade_id"] == tid
+    assert ctx["canonical_holding"]["source"] == "durable_broker_fill_ledger"
+    # Model the monitor's normal immutable-context rewrite, then re-run the
+    # post-startup evidence gate inputs: migration evidence must not vanish.
+    from core.mode_transition import ExecutionContext
+    rewritten = ExecutionContext(requested_mode="live", effective_mode="live_ready",
+        live_order_allowed=True, state_namespace="live",
+        canonical_holding=ctx["canonical_holding"])
+    persist_execution_context(rewritten.to_dict(), runtime_dir=str(tmp_path))
+    after = read_execution_context(runtime_dir=str(tmp_path))
+    assert after["canonical_holding"]["trade_id"] == tid
+    assert after["canonical_holding"]["source"] == "durable_broker_fill_ledger"
