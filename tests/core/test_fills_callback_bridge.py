@@ -12,6 +12,7 @@ Locks:
 - no direct module-var fills-log reads in monitor/tmf_spread
 """
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -222,7 +223,7 @@ def test_fills_ledger_path_resolves_runtime_logs(monkeypatch):
     monkeypatch.setenv("TRADING_RUNTIME_DIR", "/tmp/rt-unified-test")
     monkeypatch.delenv("MTS_FILL_LOG_PATH", raising=False)
     from strategies.plugins.futures.active import tmf_spread
-    assert tmf_spread._fills_ledger_path() == "/tmp/rt-unified-test/logs/mts_trade_fills.jsonl"
+    assert tmf_spread._fills_ledger_path() == str(Path("/tmp/rt-unified-test/logs/mts_trade_fills.jsonl").resolve())
 
 
 def test_fills_ledger_path_env_override_wins(monkeypatch):
