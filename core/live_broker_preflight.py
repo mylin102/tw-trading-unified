@@ -108,6 +108,16 @@ def _account_hash(account: Any) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def _account_is_bound(account: Any) -> bool:
+    """Require a resolved futures account identity before querying it."""
+    if account is None:
+        return False
+    return any(
+        bool(getattr(account, attr, None))
+        for attr in ("person_id", "broker_id", "account_id", "account_no")
+    )
+
+
 def _contract_summary(contract: Any) -> dict[str, Any]:
     return {
         "code": getattr(contract, "code", None),
@@ -197,6 +207,13 @@ def _safe_positions(api: Any, account: Any) -> list[dict[str, Any]]:
     (canonical buy/sell) / avg_cost (Shioaji's Position.price is the
     average cost) / pnl so a later consumer can render live UPL and
     the leg identity without fabricating cost."""
+    try:
+        raw_positions = api.list_positions(account=account)
+    except TypeError:
+        # Compatibility with the installed SDK/test doubles whose bound
+        # account parameter is positional-only.  The account object is still
+        # resolved and passed; this does not permit an unbound query.
+        raw_positions = api.list_positions(account)
     return [
         {
             "code": getattr(p, "code", None),
@@ -206,7 +223,7 @@ def _safe_positions(api: Any, account: Any) -> list[dict[str, Any]]:
             "avg_cost": getattr(p, "price", None),
             "pnl": getattr(p, "pnl", None),
         }
-        for p in list(api.list_positions(account=account))
+        for p in list(raw_positions)
     ]
 
 
@@ -304,7 +321,7 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
     There is intentionally no order/cancel/modify method in this adapter.
     """
     account = getattr(api, "futopt_account", None)
-    if account is None:
+    if not _account_is_bound(account):
         raise PreflightBlocked("FUTOPT_ACCOUNT_UNAVAILABLE")
 
     near, far = resolve_near_far_contracts(api, product)
@@ -323,16 +340,39 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
     # Keep successfully completed evidence when one broker endpoint is down.
     # A failed check remains a failed preflight; it must not erase the useful
     # evidence needed to distinguish an account mapping issue from login loss.
-    positions = query("POSITIONS", lambda: _safe_positions(api, account), [])
-    open_orders = query("OPEN_ORDERS", lambda: _safe_open_orders(api, account), [])
+    positions = query("POSITIONS", lambda: _safe_positions(api, account), None)
+    open_orders = query("OPEN_ORDERS", lambda: _safe_open_orders(api, account), None)
+    if positions is None:
+        query_failures.append("POSITIONS_UNAVAILABLE")
+    if open_orders is None:
+        query_failures.append("OPEN_ORDERS_UNAVAILABLE")
+    if not isinstance(positions, list):
+        query_failures.append("POSITIONS_INVALID_RESPONSE")
+    if not isinstance(open_orders, list):
+        query_failures.append("OPEN_ORDERS_INVALID_RESPONSE")
     open_orders, position_covered_orders = _position_covered_orders(
-        positions, open_orders)
-    margin = query("MARGIN", lambda: api.margin(account=account), None)
+        positions or [], open_orders or [])
+    def _margin_query() -> Any:
+        try:
+            return api.margin(account=account)
+        except TypeError:
+            return api.margin(account)
+
+    margin = query("MARGIN", _margin_query, None)
+    available_margin = getattr(margin, "available_margin", None) if margin else None
+    if available_margin is None:
+        query_failures.append("MARGIN_UNAVAILABLE")
     # The broker's trading_limits endpoint is known to be unavailable for some
     # branch mappings.  Available margin remains the required capacity check
     # for this one-lot-per-leg preflight; preserve this endpoint failure as an
     # auditable warning instead of hiding every successful broker check.
-    limits = query("TRADING_LIMITS", lambda: api.trading_limits(account=account), None, required=False)
+    def _limits_query() -> Any:
+        try:
+            return api.trading_limits(account=account)
+        except TypeError:
+            return api.trading_limits(account)
+
+    limits = query("TRADING_LIMITS", _limits_query, None, required=False)
     snapshots = query("MARKET_SNAPSHOT", lambda: list(api.snapshots([near, far])), [])
 
     # Subscription proves the broker accepts the request.  It is immediately
@@ -362,7 +402,7 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
         "open_orders": open_orders,
         "position_covered_orders": position_covered_orders,
         "margin": {
-            "available_margin": getattr(margin, "available_margin", None) if margin else None,
+            "available_margin": available_margin,
             "equity_amount": getattr(margin, "equity_amount", None) if margin else None,
             "risk_indicator": getattr(margin, "risk_indicator", None) if margin else None,
         },
@@ -405,6 +445,24 @@ def derive_canonical_gate_artifact(response: dict[str, Any]) -> dict[str, Any]:
     _open_orders = snapshot.get("open_orders")
     _margin = ((snapshot.get("margin") or {}).get("available_margin"))
     _cap_ms = _to_epoch_ms(response.get("captured_at"))
+    _failed = list((response.get("preflight") or {}).get("failed_checks") or ())
+    _error = snapshot.get("capture_error") or response.get("capture_error")
+    if _failed or _error or _positions is None or _open_orders is None or _margin is None:
+        _reason = "; ".join(str(x) for x in _failed if x)
+        _reason = _reason or str(_error or "BROKER_CAPTURE_UNAVAILABLE")
+        return {
+            "source": "unavailable",
+            "mode": "unavailable",
+            "capture_error": True,
+            "error": _reason,
+            "positions": None,
+            "open_orders": None,
+            "account_identity_hash": _acct,
+            "scope": "futopt",
+            "captured_at": _cap_ms,
+            "available_margin": None,
+            "session_id": str(response.get("request_id") or ""),
+        }
     _canonical_input = {
         "account_identity_hash": _acct,
         "positions": _positions,
@@ -464,6 +522,27 @@ def run_once(api_factory: Any, *, request_id: str | None = None, product: str = 
                 "snapshot": snapshot,
                 "preflight": {"passed": not failed_checks, "failed_checks": failed_checks},
             }
+            # An empty response after a previously successful holding capture
+            # is ambiguous (account/session drift), never proof of flatness.
+            try:
+                _prior_path = diag / "broker_snapshot_canonical.json"
+                if (not failed_checks and snapshot.get("positions") == []
+                        and _prior_path.exists()):
+                    _prior = json.loads(_prior_path.read_text(encoding="utf-8"))
+                    _prior_positions = _prior.get("positions") or []
+                    _prior_holding = any(
+                        isinstance(row, dict)
+                        and int(row.get("qty", row.get("quantity", 0)) or 0) > 0
+                        for row in _prior_positions
+                    )
+                    if _prior.get("source") == "live_broker" and _prior_holding:
+                        failed_checks.append("POSITIONS_EMPTY_AFTER_PRIOR_HOLDING")
+            except (OSError, ValueError, TypeError):
+                pass
+            if failed_checks:
+                snapshot["capture_error"] = True
+                snapshot["error"] = "; ".join(failed_checks)
+                response["preflight"] = {"passed": False, "failed_checks": failed_checks}
         except Exception as exc:
             response = {
                 "schema_version": 1,
@@ -482,9 +561,11 @@ def run_once(api_factory: Any, *, request_id: str | None = None, product: str = 
                     pass
         _atomic_json(diag / f"broker_snapshot_{request_id}.json", response)
         _atomic_json(diag / "broker_snapshot_latest.json", response)
-        if response.get("snapshot") is not None:
-            _atomic_json(diag / "broker_snapshot_canonical.json",
-                         derive_canonical_gate_artifact(response))
+        # Always replace the canonical artifact, including top-level query
+        # failures.  A failed capture must leave explicit UNAVAILABLE evidence;
+        # retaining an older live/flat artifact would be unsafe.
+        _atomic_json(diag / "broker_snapshot_canonical.json",
+                     derive_canonical_gate_artifact(response))
         return response
     finally:
         try:

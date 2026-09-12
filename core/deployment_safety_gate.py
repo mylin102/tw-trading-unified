@@ -256,6 +256,10 @@ def guard_flat_no_pending(position_state_path: str,
     except (OSError, ValueError):
         return _fail("flat_snapshot", ["GUARD_SNAPSHOT_INVALID"])
 
+    if data.get("capture_error"):
+        return _fail("flat_snapshot", ["GUARD_CAPTURE_UNAVAILABLE"],
+                     str(data.get("error") or "broker capture unavailable"))
+
     source = str(data.get("source") or data.get("mode") or "").lower()
     ctx_mode = str((ctx_data or {}).get("requested_mode")
                    or (ctx_data or {}).get("effective_mode") or "")
