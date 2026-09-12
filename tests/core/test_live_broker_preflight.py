@@ -28,7 +28,7 @@ def test_preflight_requires_explicit_no_order_guard(monkeypatch):
 
 def test_preflight_writes_read_only_snapshot(monkeypatch, tmp_path):
     api = Api()
-    near, far = SimpleNamespace(code="TMFH6", delivery_date="2026/08/19"), SimpleNamespace(code="TMFI6", delivery_date="2026/09/16")
+    near, far = SimpleNamespace(code="TMFH6", delivery_date="2099/08/19"), SimpleNamespace(code="TMFI6", delivery_date="2099/09/16")
     monkeypatch.setenv(preflight.REQUEST_ENV, "1")
     monkeypatch.setattr(preflight, "diagnostics_dir", lambda: tmp_path)
     monkeypatch.setattr(preflight, "assert_broker_access_allowed", lambda: "mini")
