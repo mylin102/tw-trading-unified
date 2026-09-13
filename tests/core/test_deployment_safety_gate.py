@@ -1333,3 +1333,15 @@ def test_cli_verdict_never_partial_ready(tmp_path, monkeypatch):
     assert r.returncode != 0
     assert "NOT_READY" in r.stdout
     assert "READY_FOR_STARTUP" not in r.stdout
+def test_read_only_capture_session_id_does_not_trigger_intervention(tmp_path):
+    from core.deployment_safety_gate import guard_flat_no_pending
+    path = tmp_path / "capture.json"
+    path.write_text(json.dumps({
+        "source": "live_broker", "mode": "live",
+        "positions": [], "open_orders": [],
+        "captured_at": time.time(), "canonical_input_hash": "a" * 64,
+        "session_id": "readonly-request", "session_scope": "read_only_capture",
+    }))
+    result = guard_flat_no_pending(
+        str(path), {"session_id": "runtime-generation"})
+    assert result.ok
