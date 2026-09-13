@@ -357,7 +357,11 @@ def guard_flat_no_pending(position_state_path: str,
         return _fail("flat_snapshot", ["GUARD_SNAPSHOT_HASH_MISSING"])
     snap_session = data.get("session_id")
     ctx_session = (ctx_data or {}).get("session_id")
-    if snap_session and ctx_session and snap_session != ctx_session:
+    # A sanctioned authenticated preflight is read-only evidence.  Its
+    # request id identifies the capture, not a runtime session generation;
+    # only runtime-bound evidence may trigger SESSION_INTERVENED.
+    if (snap_session and ctx_session and snap_session != ctx_session
+            and data.get("session_scope") != "read_only_capture"):
         return _fail("flat_snapshot", ["GUARD_SESSION_INTERVENED"],
                      f"snapshot session {snap_session} != ctx "
                      f"{ctx_session}")

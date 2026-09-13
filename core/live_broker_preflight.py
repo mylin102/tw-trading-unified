@@ -462,6 +462,7 @@ def derive_canonical_gate_artifact(response: dict[str, Any]) -> dict[str, Any]:
             "captured_at": _cap_ms,
             "available_margin": None,
             "session_id": str(response.get("request_id") or ""),
+            "session_scope": "read_only_capture",
         }
     _canonical_input = {
         "account_identity_hash": _acct,
@@ -484,6 +485,7 @@ def derive_canonical_gate_artifact(response: dict[str, Any]) -> dict[str, Any]:
         "available_margin": _margin,
         "canonical_input_hash": _canonical_input_hash,
         "session_id": str(response.get("request_id") or ""),
+        "session_scope": "read_only_capture",
     }
 
 
