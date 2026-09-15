@@ -88,6 +88,20 @@ def test_command_write_atomic_idempotent(tmp_path):
     assert isinstance(_data["created_at"], int)
 
 
+def test_command_write_contains_no_credentials_or_order_fields(tmp_path):
+    """The external command is only a refresh request, never an order or
+    credential transport.  This test must fail if those protections are
+    removed from the writer payload."""
+    assert write_live_upl_refresh_command(_cmd_path(tmp_path)) is True
+    _data = json.loads(_cmd_path(tmp_path).read_text(encoding="utf-8"))
+    _forbidden = {
+        "api_key", "secret_key", "access_token", "password",
+        "broker", "symbol", "code", "side", "action_type", "quantity",
+        "qty", "price", "order_id", "order", "order_fields",
+    }
+    assert not (_forbidden & set(_data)), sorted(_forbidden & set(_data))
+
+
 def test_monitor_consumes_once_and_same_query_methods(
         monkeypatch, tmp_path):
     """The monitor consumes the command once via its existing loop hook
