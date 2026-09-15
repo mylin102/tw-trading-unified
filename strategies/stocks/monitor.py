@@ -20,6 +20,7 @@ from strategies.stocks.position_state import (
     save_position_state,
     merge_recovery,
 )
+from strategies.stocks.order_chokepoint import StockOrderChokepoint
 
 # 2026-08-18 Gemini CLI: 統一對齊 TRADING_RUNTIME_DIR 數據總線 (runtime_paths SSOT)
 try:
@@ -58,6 +59,7 @@ class StockMonitor:
         
         self.positions = {} 
         self.pending_orders = {} # {ticker: {"order_id": str, "time": datetime}}
+        self._stock_order_gateway_instance = None
         self.running = False
         
         # 空頭防禦
@@ -78,6 +80,38 @@ class StockMonitor:
         
         # 數據儲存管理器
         self.data_storages = {}  # {ticker: StockDataStorage}
+
+    def _stock_order_gateway(self):
+        if self._stock_order_gateway_instance is None:
+            self._stock_order_gateway_instance = StockOrderChokepoint(
+                self.api,
+                intent_path=TRADE_LOGS / f"STOCK_{self.date_str}_intents.jsonl",
+                config=self.cfg,
+                mode=self.mode_tag,
+            )
+        return self._stock_order_gateway_instance
+
+    def _stock_order_intent(self, ticker, action, price, qty, reason):
+        now = datetime.now()
+        return {
+            "decision_id": f"{ticker}:{action}:{reason}",
+            "bar_id": now.strftime("%Y%m%d%H%M"),
+            "symbol": ticker,
+            "side": action,
+            "qty": qty,
+            "price": price,
+            "strategy_version": self.strat_name,
+            "reason": reason,
+            "metadata": {"mode": self.mode_tag},
+            "current_exposure": self.get_current_exposure(),
+            "open_positions": list(self.positions),
+            "daily_pnl": self.daily_pnl,
+            "is_bear_market": self.is_bear_market,
+            "pending_order": ticker in self.pending_orders,
+            "position_snapshot_ok": getattr(self, "_broker_position_snapshot_verified", False),
+            "price_limit_ok": getattr(self, "_price_limit_verified", False),
+            "now": now,
+        }
 
     def _run_daily_scan(self):
         """執行日線級別型態掃描，更新 Pivot 點"""
@@ -266,7 +300,8 @@ class StockMonitor:
                         console.print(f"[yellow]⚠️ 訂單時間解析錯誤: {e}, 使用當前時間[/yellow]")
                 if trade.status.status == sj.constant.Status.Submitted and (now - order_time).total_seconds() > 300:
                     console.print(f"[yellow]⏳ Order Timeout: Cancelling {trade.contract.code}...[/yellow]")
-                    self.api.cancel_order(trade)
+                    self._stock_order_gateway().cancel_stock_order(
+                        trade, reason="STALE_ORDER_TIMEOUT")
 
     def cancel_all_pending_orders(self):
         """BUG FIX 2026-04-13: Cancel ALL pending orders immediately.
@@ -295,7 +330,8 @@ class StockMonitor:
                 if trade.status.status == sj.constant.Status.Submitted:
                     console.print(f"[yellow]🚨 EOD Cancel: {trade.contract.code} (status={trade.status.status})[/yellow]")
                     try:
-                        self.api.cancel_order(trade)
+                        self._stock_order_gateway().cancel_stock_order(
+                            trade, reason="END_OF_DAY_CLEANUP")
                         cancelled += 1
                     except Exception as e:
                         console.print(f"[red]❌ Failed to cancel {trade.contract.code}: {e}[/red]")
@@ -947,7 +983,13 @@ class StockMonitor:
                     order_type=sj.constant.OrderType.ROD,
                     order_lot=sj.constant.StockOrderLot.IntradayOdd
                 )
-                trade = self.api.place_order(contract, order)
+                result = self._stock_order_gateway().submit_stock_order(
+                    intent=self._stock_order_intent(ticker, "BUY", price, qty, reason),
+                    contract=contract, order=order)
+                if not result.accepted:
+                    console.print(f"[red]❌ BUY {ticker} blocked: {result.reason}[/red]")
+                    return
+                trade = result.trade
                 # 等待委託回報確認 (最多 10 秒)
                 self.api.update_status()
                 if trade.status.status != sj.constant.Status.Submitted and trade.status.status != sj.constant.Status.Filled:
@@ -1008,7 +1050,13 @@ class StockMonitor:
                     order_type=sj.constant.OrderType.ROD,
                     order_lot=sj.constant.StockOrderLot.IntradayOdd
                 )
-                trade = self.api.place_order(contract, order)
+                result = self._stock_order_gateway().submit_stock_order(
+                    intent=self._stock_order_intent(ticker, "SELL", price, pos["qty"], reason),
+                    contract=contract, order=order)
+                if not result.accepted:
+                    console.print(f"[red]❌ SELL {ticker} blocked: {result.reason}[/red]")
+                    return
+                trade = result.trade
                 self.api.update_status()
                 if trade.status.status != sj.constant.Status.Submitted and trade.status.status != sj.constant.Status.Filled:
                     console.print(f"[red]❌ SELL {ticker} order rejected: {trade.status.status}[/red]")
