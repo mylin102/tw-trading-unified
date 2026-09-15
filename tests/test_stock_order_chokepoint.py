@@ -48,6 +48,25 @@ def test_authorization_rejects_limit_without_broker_call(tmp_path):
     assert "RECEIVED" in (tmp_path / "intents.jsonl").read_text()
 
 
+@pytest.mark.parametrize("strategy_version", ["mean_reversion", None])
+def test_plain_or_missing_strategy_version_is_rejected(tmp_path, strategy_version):
+    broker = SimpleNamespace(place_order=lambda *_: pytest.fail("broker called"))
+    result = _gateway(tmp_path, broker).submit_stock_order(
+        intent=_intent(strategy_version=strategy_version),
+        contract=object(), order=object())
+    assert result.accepted is False
+    assert result.reason == "STRATEGY_VERSION_UNAUTHORIZED"
+
+
+def test_enhanced_strategy_version_is_authorized(tmp_path):
+    broker = SimpleNamespace(place_order=lambda *_: "TRADE")
+    result = _gateway(tmp_path, broker).submit_stock_order(
+        intent=_intent(strategy_version="mean_reversion_enhanced"),
+        contract=object(), order=object())
+    assert result.accepted is True
+    assert result.reason == "BROKER_SUBMITTED"
+
+
 @pytest.mark.parametrize(("overrides", "reason"), [
     ({"current_exposure": 29600}, "TOTAL_EXPOSURE_LIMIT"),
     ({"open_positions": ["1101", "1102", "1103"]}, "MAX_POSITIONS_LIMIT"),
