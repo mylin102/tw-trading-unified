@@ -63,6 +63,7 @@ class StockOrderChokepoint:
                 continue
             if event.get("idempotency_key") and event.get("status") in {
                 "AUTHORIZED", "PAPER_ACCEPTED", "BROKER_SUBMITTED", "DUPLICATE",
+                "BROKER_SUBMIT_FAILED",
             }:
                 seen.add(event["idempotency_key"])
         return seen
@@ -129,8 +130,10 @@ class StockOrderChokepoint:
         if duplicate and authorized:
             authorized, reason = False, "DUPLICATE_INTENT"
         try:
+            status = ("DUPLICATE" if duplicate else
+                      "AUTHORIZED" if authorized else "REJECTED")
             self._append_intent({"idempotency_key": key, "status":
-                                 "AUTHORIZED" if authorized else "REJECTED",
+                                 status,
                                  "reason": reason,
                                  "recorded_at": self._now().isoformat()})
         except Exception:
