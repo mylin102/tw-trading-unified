@@ -48,6 +48,20 @@ def test_authorization_rejects_limit_without_broker_call(tmp_path):
     assert "RECEIVED" in (tmp_path / "intents.jsonl").read_text()
 
 
+@pytest.mark.parametrize(("overrides", "reason"), [
+    ({"current_exposure": 29600}, "TOTAL_EXPOSURE_LIMIT"),
+    ({"open_positions": ["1101", "1102", "1103"]}, "MAX_POSITIONS_LIMIT"),
+    ({"daily_pnl": -3001}, "DAILY_LOSS_LIMIT"),
+    ({"now": datetime(2026, 9, 15, 8, 59)}, "OUTSIDE_TRADING_SESSION"),
+    ({"price_limit_ok": False}, "PRICE_LIMIT_UNVERIFIED"),
+])
+def test_each_risk_boundary_rejects_without_broker_call(tmp_path, overrides, reason):
+    broker = SimpleNamespace(place_order=lambda *_: pytest.fail("broker called"))
+    result = _gateway(tmp_path, broker).submit_stock_order(
+        intent=_intent(**overrides), contract=object(), order=object())
+    assert result.reason == reason
+
+
 def test_persist_failure_is_no_trade(tmp_path, monkeypatch):
     gateway = _gateway(tmp_path)
     monkeypatch.setattr(gateway, "_append_intent", lambda _: (_ for _ in ()).throw(OSError("disk")))
@@ -69,6 +83,19 @@ def test_auth_error_is_fail_closed(tmp_path):
     result = _gateway(tmp_path, broker).submit_stock_order(
         intent=_intent(position_snapshot_ok=None), contract=object(), order=object())
     assert result.reason == "POSITION_SNAPSHOT_UNVERIFIED"
+
+
+def test_paper_accepts_without_broker_call_and_keeps_intent(tmp_path):
+    broker = SimpleNamespace(place_order=lambda *_: pytest.fail("broker called"))
+    gateway = StockOrderChokepoint(
+        broker, intent_path=tmp_path / "intents.jsonl", config=_cfg(), mode="PAPER")
+    result = gateway.submit_stock_order(intent=_intent(), contract=object(), order=object())
+    assert result.accepted is True
+    assert result.reason == "PAPER_ACCEPTED"
+    events = [json.loads(line) for line in (tmp_path / "intents.jsonl").read_text().splitlines()]
+    assert events[0]["decision_id"] == "decision-1"
+    assert events[0]["strategy_version"] == "mean_reversion_enhanced"
+    assert events[-1]["status"] == "PAPER_ACCEPTED"
 
 
 def test_source_has_no_stock_broker_order_calls_outside_chokepoint():
