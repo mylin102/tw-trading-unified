@@ -40,9 +40,11 @@ class StockMonitor:
     def __init__(self, api, config_path, dry_run=False):
         self.api = api
         self.dry_run = dry_run
+        self.config_path = Path(config_path)
         
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(self.config_path, "r", encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
+        self._config_mtime = self.config_path.stat().st_mtime
             
         stk_cfg = self.cfg.get("stocks", {})
         self.watchlist = stk_cfg.get("watchlist", ["2330"])
@@ -112,6 +114,44 @@ class StockMonitor:
             "price_limit_ok": getattr(self, "_price_limit_verified", False),
             "now": now,
         }
+
+    def _reload_config_if_changed(self):
+        """Reload stock config after an mtime change, preserving old state on error."""
+        if not self.config_path.exists():
+            return
+
+        mtime = self.config_path.stat().st_mtime
+        if mtime <= self._config_mtime:
+            return
+
+        try:
+            with self.config_path.open("r", encoding="utf-8") as f:
+                new_cfg = yaml.safe_load(f)
+            if not isinstance(new_cfg, dict):
+                raise ValueError("stock config must be a mapping")
+
+            stocks_cfg = new_cfg.get("stocks", {}) or {}
+            if not isinstance(stocks_cfg, dict):
+                raise ValueError("stocks config must be a mapping")
+
+            self.cfg = new_cfg
+            self.watchlist = stocks_cfg.get("watchlist", ["2330"])
+            self.total_budget = stocks_cfg.get("total_portfolio_budget", 100000)
+            self.capital_per_trade = stocks_cfg.get("capital_per_trade", 20000)
+            self.strat_name = stocks_cfg.get("strategy", "scout_strategy")
+            bear_cfg = stocks_cfg.get("bear_defense", {}) or {}
+            self.bear_defense = bear_cfg.get("enabled", False)
+            self.market_ema_length = bear_cfg.get("market_ema_length", 60)
+            self.max_daily_loss = bear_cfg.get("max_daily_loss", 3000)
+            self.max_consecutive_losses = bear_cfg.get("max_consecutive_losses", 3)
+            self.bear_max_positions = bear_cfg.get("bear_max_positions", 1)
+            self.normal_max_positions = bear_cfg.get("normal_max_positions", 3)
+            if hasattr(self, "_loop_state"):
+                self._loop_state["active_watchlist"] = None
+            self._config_mtime = mtime
+            console.print(f"[cyan]🔄 Stock config hot-reloaded from {self.config_path}[/cyan]")
+        except Exception as e:
+            console.print(f"[red]❌ Failed to reload stock config: {e}[/red]")
 
     def _run_daily_scan(self):
         """執行日線級別型態掃描，更新 Pivot 點"""
@@ -525,6 +565,7 @@ class StockMonitor:
         """Run a single iteration of the scanning and execution logic."""
         # [GSD Fix] Daily reset for long-running process
         self._check_date_reset()
+        self._reload_config_if_changed()
         
         if not hasattr(self, '_loop_state'):
             from strategies.stocks.entry_strategies import STOCK_STRATEGIES
