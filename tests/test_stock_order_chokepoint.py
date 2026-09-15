@@ -76,6 +76,8 @@ def test_duplicate_decision_bar_is_rejected(tmp_path):
     second = gateway.submit_stock_order(intent=_intent(), contract=object(), order=object())
     assert first.accepted is True
     assert second.reason == "DUPLICATE_INTENT"
+    events = [json.loads(line) for line in (tmp_path / "intents.jsonl").read_text().splitlines()]
+    assert events[-1]["status"] == "DUPLICATE"
 
 
 def test_auth_error_is_fail_closed(tmp_path):
