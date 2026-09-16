@@ -212,6 +212,74 @@ def guard_single_process(pid_file: str, *, phase: str = "pre_deploy") -> GuardRe
 SNAPSHOT_MAX_AGE_S = 600.0          # live-broker snapshot freshness window
 
 
+def is_reconciled_mts_position(positions, open_orders, ctx_data,
+                               allow_existing_mts_position=False,
+                               allow_stale_context=True) -> bool:
+    """Recognize an explicitly allowed, broker-reconciled MTS holding.
+
+    The broker may expose one leg while the persisted canonical context is
+    empty or still contains the old spread.  That is safe only for one
+    complete futures identity, with no pending orders, and only when the
+    operator supplied the explicit allow flag.  A two-leg spread (or a
+    converged one-leg context) must still match canonical symbols.
+    """
+    if not allow_existing_mts_position or not isinstance(positions, list):
+        return False
+    if open_orders != [] or len(positions) not in (1, 2):
+        return False
+    if not all(isinstance(p, dict)
+               and str(p.get("account", "") or "") in ("", "futures")
+               for p in positions):
+        return False
+
+    def _side(value):
+        value = str(value or "").lower().replace("action.", "")
+        return {"long": "buy", "short": "sell"}.get(value, value)
+
+    def _identity(p):
+        direction = _side(p.get("direction"))
+        avg = p.get("avg_cost")
+        return (bool(str(p.get("code") or ""))
+                and direction in {"buy", "sell"}
+                and type(p.get("quantity")) is int and p["quantity"] > 0
+                and isinstance(avg, (int, float)) and not isinstance(avg, bool)
+                and float(avg) > 0)
+
+    if not all(_identity(p) for p in positions):
+        return False
+
+    cap = (ctx_data or {}).get("exit_only_capability")
+    cap_legs = cap.get("legs") if isinstance(cap, dict) else None
+    if cap_legs is None:
+        evidence = (ctx_data or {}).get("canonical_holding") or {}
+        raw_legs = evidence.get("canonical_legs") or []
+        cap_legs = [{
+            "symbol": leg.get("code"),
+            "side": "buy" if leg.get("side") == "LONG" else "sell",
+            "remaining_qty": leg.get("qty"),
+            "avg_cost": leg.get("avg_cost"),
+        } for leg in raw_legs if isinstance(leg, dict)]
+    if not isinstance(cap_legs, list):
+        return False
+
+    position_codes = {str(p.get("code")) for p in positions}
+    canonical_codes = {str(leg.get("symbol")) for leg in cap_legs
+                       if isinstance(leg, dict)}
+
+    # Existing spread, and the converged single-leg case, require canonical
+    # symbol agreement.  For one broker leg with stale/empty canonical state,
+    # the broker identity is the authoritative reconciled evidence.
+    if len(positions) == 2:
+        return (len(cap_legs) == 2 and position_codes == canonical_codes)
+    if len(cap_legs) == 1 and position_codes == canonical_codes:
+        leg = cap_legs[0]
+        p = positions[0]
+        return (_side(leg.get("side")) == _side(p.get("direction"))
+                and leg.get("remaining_qty") == p.get("quantity")
+                and leg.get("avg_cost") == p.get("avg_cost"))
+    return allow_stale_context
+
+
 def _parse_ts(value) -> Optional[float]:
     """Parse a timestamp (int/float/str epoch SECONDS, ISO-8601, or the
     canonical epoch-MS integer) into epoch SECONDS. None on failure."""
@@ -303,34 +371,10 @@ def guard_flat_no_pending(position_state_path: str,
     _positions = _relevant(positions, "positions")
     _open_orders = _relevant(open_orders, "open_orders")
 
-    # A normal post-startup restart may resume an already broker-held MTS
-    # spread.  Accept only the exact two futures legs with complete identity;
-    # arbitrary/non-MTS positions remain fail-closed.
-    if allow_existing_mts_position and isinstance(_positions, list) and _positions:
-        _codes = {str(p.get("code")) for p in _positions if isinstance(p, dict)}
-        _cap = (ctx_data or {}).get("exit_only_capability")
-        _cap_legs = (_cap or {}).get("legs") if isinstance(_cap, dict) else None
-        if _cap_legs is None:
-            _evidence = (ctx_data or {}).get("canonical_holding") or {}
-            _raw_legs = _evidence.get("canonical_legs")
-            _cap_legs = [{
-                "symbol": leg.get("code"),
-                "side": "buy" if leg.get("side") == "LONG" else "sell",
-                "remaining_qty": leg.get("qty"),
-                "avg_cost": leg.get("avg_cost"),
-            } for leg in (_raw_legs or []) if isinstance(leg, dict)]
-        if (_cap_legs and _codes == {str(leg.get("symbol")) for leg in _cap_legs}
-                and len(_positions) == 2
-                and all(isinstance(p, dict)
-                        and type(p.get("quantity")) is int and p["quantity"] > 0
-                        and any(x in str(p.get("direction") or "").lower()
-                                for x in ("buy", "sell", "long", "short"))
-                        and isinstance(p.get("avg_cost"), (int, float))
-                        and not isinstance(p.get("avg_cost"), bool)
-                        and float(p["avg_cost"]) > 0 for p in _positions)):
-            _stock_rows = sum(1 for p in positions if isinstance(p, dict)
-                              and str(p.get("account", "")) == "stock")
-            return _pass("flat_snapshot", "existing MTS spread broker-reconciled")
+    if is_reconciled_mts_position(
+            positions if isinstance(positions, list) else _positions,
+            _open_orders, ctx_data, allow_existing_mts_position):
+        return _pass("flat_snapshot", "existing MTS position broker-reconciled")
 
     # flat: 0 / 0.0 / [] / () (empty list is the Codex-contract shape)
     if isinstance(_positions, list):
