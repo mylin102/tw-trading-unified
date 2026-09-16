@@ -36,6 +36,7 @@ def test_t1_held_position_risk_is_before_entry_gate():
 def test_t2_cache_still_reaches_exit():
     s = _run_source()
     assert s.index("self.check_risk(ticker") < s.rindex('if data_source == "cache"')
+    assert "if ticker in self.positions:" in s
 
 
 def test_t3_cache_has_no_entry_path():
