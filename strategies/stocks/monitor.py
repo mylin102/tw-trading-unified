@@ -589,6 +589,18 @@ class StockMonitor:
         # BUG FIX 2026-04-13: Cancel pending orders when trading window closes
         if now.hour < 9 or (now.hour == 13 and now.minute > 30) or now.hour >= 14:
             console.print(f"[dim]⏸️ Outside trading hours, skipping iteration[/dim]")
+            # EOD/time exits remain active even when the normal scan is closed.
+            if 13 <= now.hour <= 14:
+                for ticker in list(self.positions):
+                    try:
+                        contract = self.api.Contracts.Stocks[ticker]
+                        snapshot = self.api.snapshots([contract])[0]
+                        price = snapshot.close
+                    except Exception:
+                        price = self.positions[ticker].get("entry_price", 0.0)
+                    self.check_risk(ticker, price, context={"regime": "NORMAL",
+                                                             "last_bar": {},
+                                                             "now": now})
             # Only cancel once per session end (track with flag)
             if not getattr(self, '_eod_cancelled_today', False):
                 self.cancel_all_pending_orders()
@@ -1075,29 +1087,7 @@ class StockMonitor:
             if qty < 1000 and self._is_same_trade_date(pos):
                 return
             if qty < 1000:
-                # 檢查是否為當天買入的零股
-                is_today_buy = False
-                try:
-                    # 從交易紀錄中查找這個ticker的最近買入時間
-                    if self.ledger_path.exists():
-                        trades_df = pd.read_csv(self.ledger_path)
-                        # 將ticker轉換為整數進行比較（交易紀錄中的ticker是整數）
-                        ticker_int = int(ticker)
-                        ticker_trades = trades_df[trades_df["ticker"] == ticker_int]
-                        buy_trades = ticker_trades[ticker_trades["action"] == "BUY"]
-                        if not buy_trades.empty:
-                            # 獲取最近一筆買入交易的時間
-                            latest_buy = buy_trades.iloc[-1]
-                            buy_timestamp = pd.to_datetime(latest_buy["timestamp"])
-                            buy_date = buy_timestamp.date()
-                            today = datetime.now().date()
-                            is_today_buy = (buy_date == today)
-                except Exception as e:
-                    console.print(f"[yellow]⚠️ Failed to check odd-lot day-trade: {e}[/yellow]")
-                
-                if not is_today_buy:
-                    # 零股但不是今天買入的（可能是隔夜持倉），允許賣出
-                    console.print(f"[cyan]ℹ️ 零股賣出允許: {ticker} ({qty}股) 非今天買入[/cyan]")
+                console.print(f"[cyan]ℹ️ 零股賣出允許: {ticker} ({qty}股) 非今天買入[/cyan]")
             
             # --- LIVE: 下單後等確認，才更新 position ---
             if self.mode_tag == "LIVE":
