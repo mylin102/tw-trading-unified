@@ -139,6 +139,10 @@ def main() -> int:
                          "POST_STARTUP_GATE_FAILED + the known GUARD_* "
                          "refusal codes (REQUIRES --apply; default / "
                          "dry-run / --apply alone refuse this reason)")
+    ap.add_argument("--allow-existing-mts-position", action="store_true",
+                    help="allow one explicitly reconciled broker-held MTS "
+                         "position; requires complete identity and no "
+                         "pending orders")
     ap.add_argument("--apply", action="store_true",
                     help="perform the reset (default: dry-run, no writes)")
     args = ap.parse_args()
@@ -150,11 +154,23 @@ def main() -> int:
     if _pid_alive(args.pid_file):
         failures.append("pid file references an ACTIVE process — refuse")
 
+    # Read ctx before the broker guard so the shared reconciled-position
+    # predicate can compare broker shape with canonical capability state.
+    try:
+        ctx, raw = _read_ctx(rt)
+    except ValueError as e:
+        failures.append(str(e))
+        ctx, raw = None, b""
+
     # 2. fresh live_broker futures-flat / no-orders snapshot. Local strategy
     # state may be stale/ghosted after a stopped process; use the same
     # canonical broker evidence supplied for the margin proof.
     from core.deployment_safety_gate import guard_flat_no_pending
-    flat = guard_flat_no_pending(args.margin_evidence, {"requested_mode": "live"})
+    flat = guard_flat_no_pending(
+        args.margin_evidence,
+        ctx if ctx is not None else {"requested_mode": "live"},
+        args.allow_existing_mts_position,
+        reject_stale_two_leg=True)
     if not flat.ok:
         failures.append(f"snapshot not flat: {flat.reasons}")
 
@@ -165,12 +181,6 @@ def main() -> int:
         failures.append(f"config profile invalid: {prof.reasons}")
 
     # 4/5. ctx readable + acceptable stale state + no reconcile pending
-    try:
-        ctx, raw = _read_ctx(rt)
-    except ValueError as e:
-        failures.append(str(e))
-        ctx, raw = None, b""
-
     if ctx is not None:
         audits = set(ctx.get("audit_reasons") or ())
         _reason = _audit_acceptance(audits,

@@ -214,7 +214,8 @@ SNAPSHOT_MAX_AGE_S = 600.0          # live-broker snapshot freshness window
 
 def is_reconciled_mts_position(positions, open_orders, ctx_data,
                                allow_existing_mts_position=False,
-                               allow_stale_context=True) -> bool:
+                               allow_stale_context=True,
+                               reject_stale_two_leg=False) -> bool:
     """Recognize an explicitly allowed, broker-reconciled MTS holding.
 
     The broker may expose one leg while the persisted canonical context is
@@ -271,6 +272,9 @@ def is_reconciled_mts_position(positions, open_orders, ctx_data,
     # the broker identity is the authoritative reconciled evidence.
     if len(positions) == 2:
         return (len(cap_legs) == 2 and position_codes == canonical_codes)
+    if (len(positions) == 1 and len(cap_legs) == 2
+            and reject_stale_two_leg):
+        return False
     if len(cap_legs) == 1 and position_codes == canonical_codes:
         leg = cap_legs[0]
         p = positions[0]
@@ -305,7 +309,8 @@ def _parse_ts(value) -> Optional[float]:
 
 def guard_flat_no_pending(position_state_path: str,
                           ctx_data: dict,
-                          allow_existing_mts_position: bool = False) -> GuardResult:
+                          allow_existing_mts_position: bool = False,
+                          reject_stale_two_leg: bool = False) -> GuardResult:
     """Provenance-aware flat check.
 
     - paper snapshot (mode/source == paper) is accepted ONLY for a paper
@@ -373,7 +378,8 @@ def guard_flat_no_pending(position_state_path: str,
 
     if is_reconciled_mts_position(
             positions if isinstance(positions, list) else _positions,
-            _open_orders, ctx_data, allow_existing_mts_position):
+            _open_orders, ctx_data, allow_existing_mts_position,
+            reject_stale_two_leg=reject_stale_two_leg):
         return _pass("flat_snapshot", "existing MTS position broker-reconciled")
 
     # flat: 0 / 0.0 / [] / () (empty list is the Codex-contract shape)
