@@ -8,8 +8,8 @@ stocks:
     market_ema_length: 60
     max_consecutive_losses: 3
     max_daily_loss: 3000
-    normal_max_positions: 3
-  capital_per_trade: 100000
+    normal_max_positions: 2
+  capital_per_trade: 150000
   entry_score: 15
   stop_loss_pct: 0.02
   strategy: mean_reversion

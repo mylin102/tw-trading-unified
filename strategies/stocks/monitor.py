@@ -49,7 +49,7 @@ class StockMonitor:
         stk_cfg = self.cfg.get("stocks", {})
         self.watchlist = stk_cfg.get("watchlist", ["2330"])
         self.total_budget = stk_cfg.get("total_portfolio_budget", 100000)
-        self.capital_per_trade = stk_cfg.get("capital_per_trade", 20000)
+        self.capital_per_trade = stk_cfg.get("capital_per_trade", 150000)
         self.strat_name = stk_cfg.get("strategy", "scout_strategy")
         self.live_trading = self.cfg.get("live_trading", False)
         
@@ -71,7 +71,7 @@ class StockMonitor:
         self.max_daily_loss = bear_cfg.get("max_daily_loss", 3000)
         self.max_consecutive_losses = bear_cfg.get("max_consecutive_losses", 3)
         self.bear_max_positions = bear_cfg.get("bear_max_positions", 1)
-        self.normal_max_positions = bear_cfg.get("normal_max_positions", 3)
+        self.normal_max_positions = bear_cfg.get("normal_max_positions", 2)
         self.daily_pnl = 0.0
         self.consecutive_losses = 0
         self.is_bear_market = False
@@ -137,7 +137,7 @@ class StockMonitor:
             self.cfg = new_cfg
             self.watchlist = stocks_cfg.get("watchlist", ["2330"])
             self.total_budget = stocks_cfg.get("total_portfolio_budget", 100000)
-            self.capital_per_trade = stocks_cfg.get("capital_per_trade", 20000)
+            self.capital_per_trade = stocks_cfg.get("capital_per_trade", 150000)
             self.strat_name = stocks_cfg.get("strategy", "scout_strategy")
             bear_cfg = stocks_cfg.get("bear_defense", {}) or {}
             self.bear_defense = bear_cfg.get("enabled", False)
@@ -145,7 +145,7 @@ class StockMonitor:
             self.max_daily_loss = bear_cfg.get("max_daily_loss", 3000)
             self.max_consecutive_losses = bear_cfg.get("max_consecutive_losses", 3)
             self.bear_max_positions = bear_cfg.get("bear_max_positions", 1)
-            self.normal_max_positions = bear_cfg.get("normal_max_positions", 3)
+            self.normal_max_positions = bear_cfg.get("normal_max_positions", 2)
             if hasattr(self, "_loop_state"):
                 self._loop_state["active_watchlist"] = None
             self._config_mtime = mtime
@@ -776,9 +776,21 @@ class StockMonitor:
                     except Exception as e:
                         console.print(f"[yellow]⚠️ Failed to save indicators for {ticker}: {e}[/yellow]")
 
-                # 檢查數據來源，如果是緩存數據則跳過交易
+                # Exits are evaluated before entry gates; cached prices are exit-only.
+                try:
+                    snapshot = self.api.snapshots([contract])[0]
+                    current_price = snapshot.close
+                except Exception:
+                    current_price = float(df.iloc[-1]["Close"])
+                last_bar = df.iloc[-1].to_dict()
+                regime = tf_analysis.get("regime", "NORMAL")
+                last_bar["regime"] = regime
+                if ticker in self.positions:
+                    self.check_risk(ticker, current_price, context={
+                        "regime": regime, "last_bar": last_bar, "now": now})
+
+                # Cache is exit-only: it cannot enable a new entry.
                 if data_source == "cache":
-                    console.print(f"[yellow]⚠️ Skipping trade for {ticker} - using cached data (trading disabled)[/yellow]")
                     continue
                 
                 should_trade, tf_details = self._loop_state["should_trade_based_on_tf"](df)
@@ -799,21 +811,7 @@ class StockMonitor:
                 
                 res = self._loop_state["STOCK_STRATEGIES"][self.strat_name]["func"](state, self.cfg)
                 
-                # 3. Execution & Risk with Decision Intelligence
-                snapshot = self.api.snapshots([contract])[0]
-                last_bar = df.iloc[-1].to_dict()
-                regime = tf_analysis.get("regime", "NORMAL")
-                last_bar["regime"] = regime
-                
-                # --- A. Risk Check (Consolidated Exit Engine) ---
-                if ticker in self.positions:
-                    self.check_risk(ticker, snapshot.close, context={
-                        "regime": regime,
-                        "last_bar": last_bar,
-                        "now": now
-                    })
-
-                # --- B. Entry Filter (Market Gate + Edge Model) ---
+                # --- Entry Filter (Market Gate + Edge Model) ---
                 # 2026-08-18 Gemini CLI: 傳入 StockMonitor 由加權指數 (IX0001) / 台指期判斷之大盤多空作為 Fallback
                 if res and res["action"] == "BUY" and not self._check_bear_defense():
                     from strategies.stocks.market_gate import get_gate_result, strategy_allowed
@@ -986,12 +984,34 @@ class StockMonitor:
             console.print(f"[yellow]⚠️ [STOCK_STOP_PENDING] {ticker} stop triggered at {curr_price:.2f}, exit pending EOD[/yellow]")
             return
 
+    def _is_same_trade_date(self, pos):
+        stamp = pos.get("entry_ts")
+        if not stamp:
+            return False
+        try:
+            return datetime.fromisoformat(str(stamp)).date() == datetime.now().date()
+        except (TypeError, ValueError):
+            return False
+
+    def _is_day_strategy(self):
+        return str(self.strat_name).lower() in {
+            "mean_reversion", "intraday", "day_trading", "day_strategy"
+        }
+
+    def _stock_order_lot(self, quantity, overnight=False):
+        if quantity >= 1000:
+            return sj.constant.StockOrderLot.Common
+        return (sj.constant.StockOrderLot.Odd if overnight
+                else sj.constant.StockOrderLot.IntradayOdd)
+
     def execute_trade(self, ticker, action, price, qty_mode, reason):
         if action == "BUY":
             # GSD Fix: Prevent duplicate entry for same ticker
             if ticker in self.positions and qty_mode == "SCOUT":
                 return
 
+            if ticker not in self.positions and len(self.positions) >= 2:
+                return
             current_exposure = self.get_current_exposure()
             remaining = self.total_budget - current_exposure
             if remaining <= 5000: return
@@ -1008,6 +1028,8 @@ class StockMonitor:
                 total_target = min(self.total_budget - (current_exposure - pos_cost), self.capital_per_trade)
                 qty = int(total_target // (price * 1.002)) - pos_qty
             
+            if self._is_day_strategy():
+                qty = (qty // 1000) * 1000
             if qty <= 0: return
 
             # --- LIVE: 下單後等確認，才更新 position ---
@@ -1019,7 +1041,7 @@ class StockMonitor:
                     price=price, quantity=qty, action=sj.constant.Action.Buy,
                     price_type=sj.constant.StockPriceType.LMT,
                     order_type=sj.constant.OrderType.ROD,
-                    order_lot=sj.constant.StockOrderLot.IntradayOdd
+                    order_lot=self._stock_order_lot(qty)
                 )
                 result = self._stock_order_gateway().submit_stock_order(
                     intent=self._stock_order_intent(ticker, "BUY", price, qty, reason),
@@ -1046,9 +1068,12 @@ class StockMonitor:
             if ticker not in self.positions: return
             pos = self.positions[ticker]
             
-            # GSD Fix: 零股禁止當沖檢查
+            # Same-day odd-lot positions are not sellable; defer silently
+            # until the next session (no retry/log storm).
             # 台灣股市規則：零股（<1000股）禁止當天賣出
             qty = pos.get("qty", 0)
+            if qty < 1000 and self._is_same_trade_date(pos):
+                return
             if qty < 1000:
                 # 檢查是否為當天買入的零股
                 is_today_buy = False
@@ -1070,11 +1095,7 @@ class StockMonitor:
                 except Exception as e:
                     console.print(f"[yellow]⚠️ Failed to check odd-lot day-trade: {e}[/yellow]")
                 
-                # 如果零股是今天買入的，則禁止賣出（當沖）
-                if is_today_buy:
-                    console.print(f"[yellow]⚠️ 零股禁止當沖: {ticker} ({qty}股) 今天買入，禁止當天賣出[/yellow]")
-                    return
-                else:
+                if not is_today_buy:
                     # 零股但不是今天買入的（可能是隔夜持倉），允許賣出
                     console.print(f"[cyan]ℹ️ 零股賣出允許: {ticker} ({qty}股) 非今天買入[/cyan]")
             
@@ -1086,7 +1107,7 @@ class StockMonitor:
                     price=price, quantity=pos["qty"], action=sj.constant.Action.Sell,
                     price_type=sj.constant.StockPriceType.LMT,
                     order_type=sj.constant.OrderType.ROD,
-                    order_lot=sj.constant.StockOrderLot.IntradayOdd
+                    order_lot=self._stock_order_lot(pos["qty"], overnight=qty < 1000)
                 )
                 result = self._stock_order_gateway().submit_stock_order(
                     intent=self._stock_order_intent(ticker, "SELL", price, pos["qty"], reason),
