@@ -25,7 +25,7 @@ def _run(tmp_path, positions, flag=False, canonical=None):
         "canonical_input_hash": "b" * 64, "session_id": "s",
         "account_identity_hash": "a" * 64}))
     profile = tmp_path / "futures_live.yaml"
-    profile.write_text("live_trading: true\n")
+    profile.write_text("live_trading: true\nconfig_profile: futures_live\n")
     args = [sys.executable, "-B", str(SCRIPT), "--runtime-dir", str(rt),
             "--pid-file", str(tmp_path / "missing.pid"),
             "--position-state", str(snap), "--margin-evidence", str(snap),
