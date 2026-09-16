@@ -724,9 +724,6 @@ class StockMonitor:
 
                 df.columns = [c.capitalize() if c.lower() in ["open", "high", "low", "close", "volume"] else c for c in df.columns]
                 
-                # 調試：檢查傳遞給 calculate_stock_squeeze 的 DataFrame
-                console.print(f"[dim]📊 DEBUG: Before calculate_stock_squeeze for {ticker}[/dim]")
-                
                 df = self._loop_state["calculate_stock_squeeze"](df)
                 
                 # Indicator logic

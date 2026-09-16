@@ -1,4 +1,5 @@
 live_trading: false
+loop_interval_sec: 30
 stocks:
   atr_mult: 1.8
   bear_defense:
