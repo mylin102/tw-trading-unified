@@ -4941,6 +4941,7 @@ class FuturesMonitor:
         self._run_broker_reconciliation_detector(_snap)
         if ((_snap.get("fetch_status") or {}).get("capture") != "OK"
                 or _snap.get("open_orders")):
+            strategy._broker_truth_flat = False
             self._live_broker_authority = None
             self._live_broker_authority_at = _now
             return None
@@ -4957,6 +4958,7 @@ class FuturesMonitor:
             # evidence.  Capture failures return above and must not clear the
             # marker, because an unknown broker state is not flat evidence.
             self._broker_position_observed = bool(_rows)
+            strategy._broker_truth_flat = True
             self._live_broker_authority = None
             self._live_broker_authority_at = _now
             return None
@@ -4976,6 +4978,7 @@ class FuturesMonitor:
             # blocked until a subsequent successful snapshot proves flat or
             # provides two unambiguous legs.
             self._broker_position_observed = True
+            strategy._broker_truth_flat = False
             self._live_broker_authority = None
             self._live_broker_authority_at = _now
             return None
@@ -5007,6 +5010,7 @@ class FuturesMonitor:
             _broker_legs, _local_legs, tick_size=1.0)
         if not _decision.fail_closed or _decision.status.value == "RECONCILED":
             self._canonical_holding_hydrated = True
+            strategy._broker_truth_flat = False
         else:
             self._canonical_holding_hydrated = False
             self._live_broker_authority = None
