@@ -12,7 +12,7 @@
 commits 不影響此 identity — 解除 freeze/manifest SHA cycle；任何 code
 變更 → hash 變 → gate GUARD_MANIFEST_STALE 拒絕）
 ```
-frozen_tree_hash: ffa4e286b1b4a1af266d0da79891602b3dd2296471ebe42d10ad69b945d2abf0
+frozen_tree_hash: fea9ccc857767e39677fb4fc88c9020ed6d6c8dd8935d3f5b656723053221422
 ```
 **LRC_RELEASE_SHA（部署時）**: = deploy-time `git -C <release_dir>
 rev-parse HEAD` 之 literal（= 此 freeze-record commit 的 SHA；deployed
@@ -61,6 +61,7 @@ NOT_READY refusal_codes=['GUARD_MANIFEST_STALE','GUARD_MARGIN_UNAVAILABLE',
 - ecosystem.config.js 本 freeze **未修改**
 
 ## Runtime certification metadata
+## Runtime certification metadata
 <!-- BEGIN RUNTIME_CERTIFICATION_METADATA -->
 ```json
 {
@@ -71,26 +72,27 @@ NOT_READY refusal_codes=['GUARD_MANIFEST_STALE','GUARD_MARGIN_UNAVAILABLE',
     "mode": "live",
     "source": "live_broker"
   },
-  "callback_registration_generation": 1,
-  "candidate_head": "e5c91cfecddf95e8d1a863cd75a2150d351b81f1",
-  "captured_at": 1787040118050,
+  "callback_registration_generation": null,
+  "candidate_head": "6dd9a7de6e5e1c6b0a2162e9cfa46845c731e5ad",
+  "captured_at": 1789611061307,
   "clean_worktree": true,
-  "config_hash": "e798167389a5c1f42e6697da4e95138434478042eb5087155b826d57320a1c79",
+  "config_hash": null,
   "durable_locks": {
     "active": 0,
-    "retired_unresolved": 5
+    "retired_unresolved": 2
   },
-  "generated_at": "2026-08-18T08:02:00.033942+00:00",
+  "generated_at": "2026-09-17T05:03:43.433858+00:00",
   "live_order_allowed": false,
   "process": {
-    "pid": 98987,
-    "start_identity": "Tue Aug 18 15:13:57 2026"
+    "pid": null,
+    "start_identity": null
   },
   "promotion_mode": "live_quarantined",
-  "refresh_generation": "futures-1787040118214403000-529",
-  "session_id": "4b46ac5c2f4a0b904d62d6244d1cdfd5",
-  "source_tree_hash": "4dff21e05cf9908ba585832372cc3697495c91b432ef913c91ca67815e364c7b",
+  "refresh_generation": null,
+  "session_id": "b7f96eec510c24a87ce2ef659c34e5fb",
+  "source_tree_hash": "fea9ccc857767e39677fb4fc88c9020ed6d6c8dd8935d3f5b656723053221422",
   "ttl_seconds": 600.0
 }
 ```
 <!-- END RUNTIME_CERTIFICATION_METADATA -->
+
