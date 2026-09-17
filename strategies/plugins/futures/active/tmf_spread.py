@@ -1467,6 +1467,23 @@ def _write_mts_state(
         else:
             release_state = f"{released_leg.upper()}_RELEASED"
 
+        # P2 canonical holding projection.  Legacy fields remain during the
+        # migration window, but every state write now also carries one
+        # normalized legs[] table; FLAT is represented only by [] there.
+        if not has_position:
+            legs = []
+        else:
+            _near_qty = int(kwargs.get("near_qty", existing.get("near_qty", 1)) or 1)
+            _far_qty = int(kwargs.get("far_qty", existing.get("far_qty", 1)) or 1)
+            legs = [
+                {"leg": "near", "status": near_status,
+                 "side": _f_near_side, "qty": _near_qty,
+                 "entry": round(_f_near_entry, 1)},
+                {"leg": "far", "status": far_status,
+                 "side": _f_far_side, "qty": _far_qty,
+                 "entry": round(_f_far_entry, 1)},
+            ]
+
         # Trail stop price + distance
         _rem_side = _f_far_side if released_leg == "near" else _f_near_side
         _trail_side = _rem_side if release_state != "BOTH_HELD" else None
@@ -1494,6 +1511,7 @@ def _write_mts_state(
             "entry_spread_z": round(spread_z, 2) if (spread_z is not None and spread_z != 0) else existing.get("entry_spread_z"),
             "current_spread_z": existing.get("current_spread_z"),
             "release_state": release_state,
+            "legs": legs,
             "released_leg": released_leg,
             "remaining_leg": remaining_leg,
             "remaining_side": _trail_side,
