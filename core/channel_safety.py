@@ -24,6 +24,7 @@ import time
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from core.runtime_paths import runtime_path
 
 
 # ── Channel States ──
@@ -43,7 +44,10 @@ class AccountDegradedReason(str, Enum):
 
 
 SAFETY_STATUS_PATH = Path(
-    os.environ.get("TRADING_SAFETY_STATUS_PATH", "/tmp/tw_trading_safety_state.json")
+    os.environ.get(
+        "TRADING_SAFETY_STATUS_PATH",
+        runtime_path("data", "state", "trading_safety_state.json"),
+    )
 )
 
 

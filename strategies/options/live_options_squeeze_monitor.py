@@ -1289,13 +1289,7 @@ class ShioajiOptionsSmartMonitor:
             print(f"⚠️ Failed to save options orders: {e}")
 
     def _options_orders_file_path(self, now=None):
-        # 2026-07-08 Gemini CLI: Support test isolation to prevent test leakage
-        import sys
-        orders_dir = "exports/trades"
-        if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
-            current_cwd = Path.cwd().resolve()
-            if (current_cwd / "RULES.md").exists() and (current_cwd / "exports").exists():
-                orders_dir = "tests/temp_exports_trades"
+        orders_dir = os.environ.get("TRADING_TEST_EXPORT_DIR", "exports/trades")
         current_time = now or datetime.datetime.now()
         date_str = current_time.strftime("%Y%m%d")
         return Path(orders_dir) / f"OPTIONS_{date_str}_orders.json"

@@ -67,10 +67,6 @@ def enforce_runtime_identity(source_file: Optional[str] = None) -> None:
 RUNTIME_STATE_SCHEMA = 1
 
 
-def _is_test_runtime() -> bool:
-    return "pytest" in __import__("sys").modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
-
-
 def runtime_root() -> str:
     """Return the one absolute runtime data root.
 
@@ -93,13 +89,13 @@ def mts_position_state_path() -> str:
     """Canonical MTS state path; production has no implicit override/fallback."""
     explicit = os.environ.get("MTS_STATE_PATH")
     if explicit:
-        if os.environ.get("NODE_ENV") == "production" and not _is_test_runtime():
+        if os.environ.get("NODE_ENV") == "production":
             expected = os.path.realpath(runtime_path("data", "state", "mts_position_state.json"))
             actual = str(Path(explicit).expanduser().resolve())
             if actual != expected:
                 raise RuntimeError(
                     f"RUNTIME_STATE_PATH_REJECTED: expected={expected} actual={actual}")
-        if _is_test_runtime():
+        if os.environ.get("NODE_ENV") != "production":
             return str(Path(explicit).expanduser().resolve())
     return runtime_path("data", "state", "mts_position_state.json")
 

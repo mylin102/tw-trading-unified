@@ -40,6 +40,7 @@ import os
 import json
 import math
 import time
+from pathlib import Path
 from collections import deque
 import pandas as pd
 from datetime import datetime
@@ -404,26 +405,13 @@ _ENTRY_Z = 2.5            # entry z-score threshold
 _RELEASE_STOP_PTS = 20    # losing leg release threshold (pt)
 _TRAIL_DISTANCE_PTS = 30  # remaining leg trailing stop distance (pt)
 # 2026-05-27 Gemini CLI: Environmental isolation for state file
-# 2026-07-08 Gemini CLI: Default to test path if running under pytest to prevent state file leakage
-import sys
-import tempfile
-_default_state_path = os.path.join(tempfile.gettempdir(), "test_mts_position_state.json")
-_MTS_STATE_FILE = os.getenv(
-    "MTS_STATE_PATH",
-    _default_state_path if ("pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ)
-    else mts_position_state_path(),
-)
+# State isolation is an explicit runtime injection, never inferred from the
+# test runner.  Production therefore always resolves through runtime_paths.
+_MTS_STATE_FILE = os.getenv("MTS_STATE_PATH") or mts_position_state_path()
 
 # 💡 Gemini CLI: Dynamic state file path supporting thread-local overrides for multi-instance monitors
 def _get_state_file_path() -> Path:
-    from pathlib import Path
-    if "pytest" in sys.modules and _MTS_STATE_FILE != _default_state_path and _MTS_STATE_FILE != os.getenv("MTS_STATE_PATH"):
-        return Path(_MTS_STATE_FILE)
-    try:
-        from strategies.futures.monitor import _mts_position_state_path
-        return _mts_position_state_path()
-    except Exception:
-        return Path(mts_position_state_path())
+    return Path(_MTS_STATE_FILE)
 # One canonical append-only ledger for strategy and dashboard.  A relative
 # default follows PM2 cwd, which can be the release worktree while the
 # dashboard reads the shared runtime directory; that split silently hides all
@@ -703,22 +691,12 @@ def _p1b_exit_submitted(_ilog, trade_id: str, legs) -> bool:
 def _exit_intent_log():
     """P1-B: durable COMBINED_EXIT intent log at the shared runtime dir.
 
-    Same isolation convention as _mts_position_state_path: under pytest
-    without TRADING_RUNTIME_DIR, use a PER-TEST temp dir (never the repo)."""
-    import sys as _sys
+    The runtime directory is injected through TRADING_RUNTIME_DIR in tests
+    and supplied by the process supervisor in production."""
     from core.exit_intent import IntentLog
-    if "pytest" in _sys.modules:
-        _rt = os.environ.get("TRADING_RUNTIME_DIR")
-        if _rt:
-            return IntentLog(os.path.join(_rt, "logs"))
-        import tempfile as _tf
-        import hashlib as _hl
-        _pt = os.environ.get("PYTEST_CURRENT_TEST", "") or ""
-        _pt_id = _hl.md5(_pt.encode()).hexdigest()[:10] if _pt else "default"
-        # per-test AND per-run (pid): a previous run's SUBMITTED intent must
-        # never bleed into this run's assertions
-        return IntentLog(os.path.join(_tf.gettempdir(),
-                                      f"test_mts_exit_intent_{_pt_id}_{os.getpid()}"))
+    _rt = os.environ.get("TRADING_RUNTIME_DIR")
+    if _rt:
+        return IntentLog(os.path.join(_rt, "logs"))
     from core.runtime_paths import runtime_root
     return IntentLog(os.path.join(runtime_root(), "logs"))
 

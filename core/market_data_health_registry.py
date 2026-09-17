@@ -12,8 +12,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from core.runtime_paths import runtime_path
 
-_HEALTH_FILE = Path("/tmp/market_data_health.json")
+_HEALTH_FILE = Path(runtime_path("data", "telemetry", "market_data_health.json"))
 _lock = threading.Lock()
 _registry: dict[str, "FeedHealth"] = {}
 

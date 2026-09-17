@@ -1852,7 +1852,7 @@ def render_real_preflight_expander():
         col_left, col_right = st.columns(2)
         with col_left:
             st.subheader("📋 執行狀態 (Execution State)")
-            _rt_path = Path("/tmp/runtime_status.json")
+            _rt_path = Path(runtime_path("data", "state", "runtime_status.json"))
             _rt = {}
             if _rt_path.exists():
                 try:
@@ -4723,7 +4723,7 @@ elif _selected_product == "TMF":
                     with open(_flag_path, "w") as _f:
                         _f.write(_flag)
                     try:
-                        with open("/tmp/futures_manual_trade_status.json", "w") as _sf:
+                        with open(runtime_path("data", "state", "futures_manual_trade_status.json"), "w") as _sf:
                             json.dump({
                                 "command_id": _command_id,
                                 "status": "COMMAND_SENT",
@@ -5620,7 +5620,7 @@ elif _selected_product == "TMF":
 
                 # 2026-07-31 Hermes Agent: manual-command audit status
                 try:
-                    with open("/tmp/futures_manual_trade_status.json") as _cf:
+                    with open(runtime_path("data", "state", "futures_manual_trade_status.json")) as _cf:
                         _cmd = json.load(_cf)
                     # stale statuses (old ts) must not keep showing past
                     # failures — only commands from the last 5 minutes.

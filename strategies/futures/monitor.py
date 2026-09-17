@@ -40,7 +40,7 @@ from squeeze_futures.data.data_storage import save_trade
 
 # GSD: Pluggable Strategy Integration
 from core.strategy_registry import StrategyRegistry
-from core.runtime_paths import runtime_logs, runtime_path
+from core.runtime_paths import runtime_logs, runtime_path, mts_position_state_path
 from core.strategy_context import StrategyContext, PositionView, MarketData
 from core.signal import Signal
 from core.futures_bar_regime import classify_futures_bar_regime
@@ -67,9 +67,9 @@ except ImportError:
 
 # Structured notification system (core/notification/)
 
-# 2026-07-07 Hermes Agent: Module-level constant so tests can
-# monkeypatch the path without touching the live state file.
-MTS_POSITION_STATE_PATH = Path("/tmp/mts_position_state.json")
+# Runtime state is always rooted by the production runtime-path authority.
+# Tests inject MTS_STATE_PATH or monkeypatch this compatibility seam explicitly.
+MTS_POSITION_STATE_PATH = Path(mts_position_state_path())
 
 # [S1] EXIT_ONLY snapshot staleness TTL (ms): canonical with
 # core.reconciled_exit.SNAPSHOT_TTL_MS (60s) — a snapshot older than this,
@@ -160,41 +160,17 @@ def _mts_position_state_path() -> Path:
     # 2026-07-21 Gemini CLI: Support thread-local path override for multi-instance concurrent processes
     if getattr(_thread_local, "state_path", None) is not None:
         return Path(_thread_local.state_path)
-    # 2026-07-08 Gemini CLI: Allow test injection but fall back to test path to avoid leaking to production /tmp/mts_position_state.json
-    import sys
-    import os
-    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
-        _env = os.getenv("MTS_STATE_PATH")
-        if _env:
-            return Path(_env)
-        # If the constant was monkeypatched in the test, honor the patch!
-        if MTS_POSITION_STATE_PATH != Path("/tmp/mts_position_state.json"):
-            return MTS_POSITION_STATE_PATH
-        # Allow contract test to verify default constant fallback
-        if "uses_constant" in os.getenv("PYTEST_CURRENT_TEST", ""):
-            return MTS_POSITION_STATE_PATH
-        return Path("/tmp/test_mts_position_state.json")
     return Path(os.getenv("MTS_STATE_PATH", str(MTS_POSITION_STATE_PATH)))
 
 
 def _mts_intent_log_dir() -> str:
     """P1-B: durable COMBINED_EXIT intent log at the shared runtime dir.
 
-    Same isolation convention as _mts_position_state_path: under pytest
-    without TRADING_RUNTIME_DIR, use a PER-TEST temp dir (never the repo)."""
-    import sys as _sys
-    if "pytest" in _sys.modules:
-        _rt = os.environ.get("TRADING_RUNTIME_DIR")
-        if _rt:
-            return os.path.join(_rt, "logs")
-        import tempfile as _tf
-        import hashlib as _hl
-        _pt = os.environ.get("PYTEST_CURRENT_TEST", "") or ""
-        _pt_id = _hl.md5(_pt.encode()).hexdigest()[:10] if _pt else "default"
-        # per-test AND per-run (pid): a previous run's SUBMITTED intent must
-        # never bleed into this run's assertions
-        return os.path.join(_tf.gettempdir(),
-                            f"test_mts_exit_intent_{_pt_id}_{os.getpid()}")
+    The runtime directory is injected through TRADING_RUNTIME_DIR in tests
+    and supplied by the process supervisor in production."""
+    _rt = os.environ.get("TRADING_RUNTIME_DIR")
+    if _rt:
+        return os.path.join(_rt, "logs")
     from core.runtime_paths import runtime_root
     return os.path.join(runtime_root(), "logs")
 
@@ -254,12 +230,9 @@ class FuturesMonitor:
         self.cfg = self._load_config(config_path)
         # 2026-05-27 Gemini CLI: Generalize ticker initialization (no hardcoded default)
         self.ticker = self.cfg.get("ticker", "UNKNOWN")
-        # 2026-07-21 Gemini CLI: Determine state path based on ticker name for multi-instance isolation
-        _base_name = self.ticker.lower()
-        if _base_name == "tmf":
-            self._state_path = Path("/tmp/mts_position_state.json")
-        else:
-            self._state_path = Path(f"/tmp/mts_position_state_{_base_name}.json")
+        # State path is shared by the runtime authority; ticker isolation is
+        # configured outside production code when a deployment needs it.
+        self._state_path = _mts_position_state_path()
         self.contract = None
         self.far_contract = None  # Far-month contract for dual chart
         self._running = False
@@ -5691,12 +5664,10 @@ class FuturesMonitor:
                 )
 
             # 2026-07-08 Gemini CLI: Use session-date-aware orders_file path with test isolation to prevent test leakage
-            import sys
             orders_dir = runtime_path("exports", "trades")
-            if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
-                current_cwd = Path.cwd().resolve()
-                if (current_cwd / "RULES.md").exists() and (current_cwd / "exports").exists():
-                    orders_dir = "tests/temp_exports_trades"
+            injected_orders_dir = os.environ.get("TRADING_TEST_EXPORT_DIR")
+            if injected_orders_dir:
+                orders_dir = injected_orders_dir
             orders_file = Path(orders_dir) / f"{self.ticker}_{_date}_orders.json"
             orders_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -7343,6 +7314,109 @@ class FuturesMonitor:
             return None
         return _open_qty
 
+    def _release_startup_safety_gate(self, strategy, near_symbol, far_symbol):
+        """L4: reconcile release decision inputs from a fresh broker snapshot."""
+        if getattr(self, "_release_startup_checked", False):
+            return not getattr(self, "_release_safety_halted", False)
+        from core.futures_release_guard import sanitize_startup_state
+
+        try:
+            snapshot = self._capture_post_startup_snapshot()
+            state = {}
+            state_path = _mts_position_state_path()
+            if state_path.exists():
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            decision = sanitize_startup_state(
+                state, snapshot, near_symbol=near_symbol, far_symbol=far_symbol)
+        except Exception as exc:
+            decision = None
+            self._append_mts_event(
+                "ORDER_INTENT_BLOCKED", action="RELEASE",
+                reason="BROKER_QUERY_UNAVAILABLE",
+                error=f"{type(exc).__name__}: {exc}")
+        if decision is None or not decision.release_allowed:
+            self._release_safety_halted = True
+            self._append_mts_event(
+                "ORDER_INTENT_BLOCKED", action="RELEASE",
+                reason=(decision.reason if decision is not None
+                        else "BROKER_QUERY_UNAVAILABLE"),
+                audit=(decision.audit if decision is not None else {}))
+            console.print(
+                "[bold red]⛔ [MTS_RELEASE_BLOCKED] startup broker premise "
+                "not confirmed; no-order mode[/bold red]")
+            return False
+
+        clean = decision.state
+        for attr, key in (("_near_side", "near_side"),
+                          ("_far_side", "far_side"),
+                          ("_released_leg", "released_leg"),
+                          ("_near_entry", "near_entry"),
+                          ("_far_entry", "far_entry")):
+            if key in clean:
+                setattr(strategy, attr, clean.get(key))
+        strategy._has_position = bool(clean.get("has_position"))
+        self._release_startup_checked = True
+        return True
+
+    def _release_pre_submit_guard(self, *, action, reason, strategy,
+                                  symbol, leg):
+        """L1/L2: require a fresh broker-held leg immediately before create_order."""
+        from core.futures_release_guard import (
+            ReleaseIntent, evaluate_release_precondition,
+        )
+        try:
+            snapshot = self._capture_post_startup_snapshot()
+            raw_side = getattr(strategy, f"_{leg}_side", None)
+            premise = {"kind": "HOLD_LEG", "leg": leg,
+                       "side": str(raw_side or "").upper(), "qty": 1}
+            intent = ReleaseIntent(
+                action=action, symbol=symbol,
+                side="BUY" if premise["side"] == "SHORT" else "SELL",
+                qty=1, premise=premise)
+            decision = evaluate_release_precondition(intent, snapshot)
+        except Exception as exc:
+            self._append_mts_event(
+                "ORDER_INTENT_BLOCKED", action=action,
+                reason="BROKER_QUERY_UNAVAILABLE",
+                error=f"{type(exc).__name__}: {exc}")
+            return None
+        if not decision.allowed:
+            self._append_mts_event(
+                "ORDER_INTENT_BLOCKED", action=action,
+                reason=decision.reason, premise=intent.premise,
+                audit=decision.audit)
+            console.print(
+                f"[bold red]⛔ [MTS_RELEASE_BLOCKED] {decision.reason}: "
+                f"{symbol} {reason}[/bold red]")
+            return None
+        return snapshot
+
+    def _release_post_submit_guard(self, before_snapshot, symbol):
+        """L3: reject further sends if a release increases the target leg."""
+        from core.futures_release_guard import validate_release_effect
+        try:
+            after_snapshot = self._capture_post_startup_snapshot()
+            decision = validate_release_effect(
+                before=before_snapshot, after=after_snapshot, symbol=symbol)
+        except Exception as exc:
+            decision = None
+            self._append_mts_event(
+                "POST_RELEASE_EFFECT_BLOCKED", symbol=symbol,
+                reason="POST_RELEASE_QUERY_UNAVAILABLE",
+                error=f"{type(exc).__name__}: {exc}")
+        if decision is None or not decision.allowed:
+            self._release_safety_halted = True
+            self._append_mts_event(
+                "POST_RELEASE_EFFECT_BLOCKED", symbol=symbol,
+                reason=(decision.reason if decision is not None
+                        else "POST_RELEASE_QUERY_UNAVAILABLE"),
+                audit=(decision.audit if decision is not None else {}))
+            console.print(
+                "[bold red]⛔ [MTS_RELEASE_HALTED] post-release broker "
+                "effect invalid; further orders halted[/bold red]")
+            return False
+        return True
+
     def _submit_mts_order_signal(self, signal, strategy, bar_dict, ts):
         """Submit order via order_mgr for MTS signals (entry, release, exit).
 
@@ -7454,6 +7528,15 @@ class FuturesMonitor:
         from core.order_management.order import OrderType, OrderSide
         _action = signal.action
         _reason = signal.reason
+
+        # L0-L4 release safety is intentionally kept in this monitor
+        # chokepoint.  It does not modify OrderManager, watchdog, or Combo.
+        if (self.live_trading and getattr(self, "_release_safety_halted", False)):
+            self._append_mts_event(
+                "ORDER_INTENT_BLOCKED", action=_action,
+                reason="RELEASE_SAFETY_HALTED",
+                trade_id=getattr(strategy, "_trade_id", ""))
+            return
         _near_close = float(bar_dict.get("near_close", 0))
         _far_close = float(bar_dict.get("far_close", 0))
         _ts = ts or datetime.now()
@@ -7505,6 +7588,25 @@ class FuturesMonitor:
         # [GSD] Use real contract codes instead of synthetic symbols
         _near_code = self.contract.code
         _far_code = self.far_contract.code
+
+        _release_before_snapshot = None
+        _release_leg = None
+        if _action == "PARTIAL_EXIT":
+            if _reason and "RELEASE_NEAR" in str(_reason).upper():
+                _release_leg = "near"
+            elif _reason and "RELEASE_FAR" in str(_reason).upper():
+                _release_leg = "far"
+        if self.live_trading and _release_leg:
+            if not self._release_startup_safety_gate(strategy, _near_code, _far_code):
+                return
+            _release_before_snapshot = self._release_pre_submit_guard(
+                action=str(_action), reason=str(_reason or ""),
+                strategy=strategy,
+                symbol=_near_code if _release_leg == "near" else _far_code,
+                leg=_release_leg,
+            )
+            if _release_before_snapshot is None:
+                return
 
         # [Snapshot] Capture submission-time OHLC for slippage analysis
         _snap = {
@@ -7574,6 +7676,9 @@ class FuturesMonitor:
                             self._exit_only_bbo_slots(), _cap,
                             "SUBMIT_FAILED"))
                     return
+                if not self._release_post_submit_guard(
+                        _release_before_snapshot, _near_code):
+                    return
                 self._append_mts_event("ORDER_SUBMITTED", **{
                     **_ev_meta(_order),
                     "ref_ohlc": _snap["near"],
@@ -7617,6 +7722,9 @@ class FuturesMonitor:
                         bbo_input_v2=build_bbo_failure_evidence(
                             self._exit_only_bbo_slots(), _cap,
                             "SUBMIT_FAILED"))
+                    return
+                if not self._release_post_submit_guard(
+                        _release_before_snapshot, _far_code):
                     return
                 self._append_mts_event("ORDER_SUBMITTED", **{
                     **_ev_meta(_order),
@@ -9851,13 +9959,30 @@ class FuturesMonitor:
             # sent wrong-direction orders. Near derives from the broker
             # position; far accepts only valid LONG/SHORT (else None, and
             # close_all fails closed instead of sending a wrong order).
-            _near_side = _disk.get("near_side") or getattr(strategy, "_near_side", None)
-            _far_side = _disk.get("far_side") or getattr(strategy, "_far_side", None)
-            if _broker_pos > 0:
-                _near_side = "LONG"
-            elif _broker_pos < 0:
-                _near_side = "SHORT"
-            else:
+            # L0: never use a state-file side or a hard-coded direction as a
+            # release premise.  Recover the near side only from the fresh
+            # broker position row for the actual near contract; absence or an
+            # unreadable query remains unknown and is fail-closed later.
+            _near_side = None
+            _far_side = None
+            try:
+                _fresh = self._capture_post_startup_snapshot()
+                _rows = (_fresh.get("positions") or []) if isinstance(_fresh, dict) else []
+                for _row in _rows:
+                    if _row.get("account") != "futures":
+                        continue
+                    _code = str(_row.get("code"))
+                    if _code not in {str(self.contract.code), str(self.far_contract.code)}:
+                        continue
+                    _direction = str(_row.get("direction") or _row.get("side") or "").lower()
+                    _side = ("LONG" if "buy" in _direction or "long" in _direction
+                             else "SHORT" if "sell" in _direction or "short" in _direction
+                             else None)
+                    if _code == str(self.contract.code):
+                        _near_side = _side
+                    elif _code == str(self.far_contract.code):
+                        _far_side = _side
+            except Exception:
                 _near_side = None
             if _far_side not in ("LONG", "SHORT"):
                 console.print(
@@ -10499,7 +10624,7 @@ class FuturesMonitor:
         timestamp; COMPLETED carries position_before/position_after/order_ids.
         """
         try:
-            _path = "/tmp/futures_manual_trade_status.json"
+            _path = runtime_path("data", "state", "futures_manual_trade_status.json")
             _data = {
                 "command_id": command_id,
                 "status": status,
