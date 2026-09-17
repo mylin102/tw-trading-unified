@@ -32,7 +32,7 @@ def test_t2_all_failures_raise_round_alert(capsys):
         monitor._record_analysis_failure(ticker, KeyError("Close"))
     monitor._finish_analysis_round()
     output = capsys.readouterr().out
-    assert "ALL" in output and "2/2" in output
+    assert "ERROR" in output and "2/2" in output
 
 
 def test_t3_lowercase_ohlcv_is_normalized_at_analysis_entry():
