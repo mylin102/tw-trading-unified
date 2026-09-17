@@ -37,7 +37,7 @@ from core.runtime_paths import (
 
 # A caller may explicitly clear an immutable field; omitted arguments retain
 # the legacy field-level protection behavior.
-_UNSET = object()
+_UNSET_SENTINEL = object()
 
 import logging
 import os
@@ -1337,8 +1337,8 @@ def _write_mts_state(
     far_entry: float = 0,
     near_last: float = 0,
     far_last: float = 0,
-    near_side: str | None | object = _UNSET,
-    far_side: str | None | object = _UNSET,
+    near_side: str | None | object = _UNSET_SENTINEL,
+    far_side: str | None | object = _UNSET_SENTINEL,
     spread_z: float = 0,
     released_leg: str | None = None,
     release_price: float = 0,
@@ -1347,11 +1347,11 @@ def _write_mts_state(
     trail_nadir: float = 0,
     release_stop_points: int = 0,
     trail_distance_points: int = 0,
-    trade_id: str | None | object = _UNSET,
+    trade_id: str | None | object = _UNSET_SENTINEL,
     ticker: str = "TMF",
     atr: float = 0.0,
     policy_j_meta: dict | None = None,
-    entry_ts: str | None | object = _UNSET,
+    entry_ts: str | None | object = _UNSET_SENTINEL,
     **kwargs,
 ) -> None:
     """
@@ -1396,13 +1396,13 @@ def _write_mts_state(
         _f_near_entry = near_entry if near_entry > 0 else float(existing.get("near_entry") or 0.0)
         _f_far_entry = far_entry if far_entry > 0 else float(existing.get("far_entry") or 0.0)
         _f_near_side = (existing.get("near_side")
-                        if near_side is _UNSET else near_side)
+                        if near_side is _UNSET_SENTINEL else near_side)
         _f_far_side = (existing.get("far_side")
-                       if far_side is _UNSET else far_side)
+                       if far_side is _UNSET_SENTINEL else far_side)
         _f_trade_id = (existing.get("trade_id")
-                       if trade_id is _UNSET else trade_id)
+                       if trade_id is _UNSET_SENTINEL else trade_id)
         _f_entry_ts = (existing.get("entry_ts")
-                      if entry_ts is _UNSET else entry_ts)
+                      if entry_ts is _UNSET_SENTINEL else entry_ts)
         if not _f_entry_ts and has_position:
             _f_entry_ts = datetime.now().isoformat()
 
