@@ -56,7 +56,7 @@ def test_standard_exit_uses_base_gateway_authorization_without_capability():
     assert reason is None
 
 
-def test_mismatch_is_reconciliation_hold_and_preserves_raw_values():
+def test_mismatch_converges_to_broker_and_preserves_raw_values():
     decision = reconcile_holding(
         broker_legs=[_leg("TMFI6", "LONG", avg_cost=45876.0),
                      _leg("TMFJ6", "SHORT", avg_cost=46059.0)],
@@ -65,9 +65,9 @@ def test_mismatch_is_reconciliation_hold_and_preserves_raw_values():
         tick_size=1.0,
     )
 
-    assert decision.status is ReconciliationStatus.HOLD
-    assert decision.context_mode == "reconciliation_hold"
-    assert decision.fail_closed is True
+    assert decision.status is ReconciliationStatus.RECONCILED
+    assert decision.context_mode == ModeTransitionState.LIVE_READY.value
+    assert decision.fail_closed is False
     assert decision.raw_broker_legs[0]["avg_cost"] == 45876.0
     assert decision.raw_local_legs[0]["avg_cost"] == 45870.0
 

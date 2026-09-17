@@ -58,7 +58,7 @@ def test_t20_every_mismatch_emits_divergence_audit_and_alert(tmp_path):
         broker_legs=broker, local_legs=[], tick_size=1.0,
         audit_path=audit, alert_path=alerts, broker_capture=_capture(broker),
         local_source_path="/tmp/local-state.json")
-    event = json.loads(audit.read_text())[-1]
+    event = json.loads(audit.read_text().splitlines()[-1])
     assert event["event"] == "BROKER_STATE_DIVERGENCE"
     assert event["broker_legs"] == broker and event["local_legs"] == []
     assert event["canonical_input_hash"] == "a" * 64
