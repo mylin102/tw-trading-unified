@@ -3,7 +3,7 @@ import logging
 import pandas as pd
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from typing import Callable, Dict
+from typing import Any, Callable, Dict
 from collections import deque
 
 try:
@@ -83,6 +83,66 @@ class ShioajiClient:
                 f"{method}: LIVE_QUARANTINED "
                 f"audit_reasons="
                 f"{list(getattr(ctx, 'audit_reasons', ()) or ())}")
+
+    def _broker_truth_snapshot(self) -> dict[str, Any]:
+        """Return a fail-closed, normalized snapshot for the order boundary."""
+        provider = getattr(self, "_broker_snapshot_provider", None)
+        if callable(provider):
+            snapshot = provider()
+            if not isinstance(snapshot, dict):
+                raise RuntimeError("broker snapshot provider returned invalid data")
+            return snapshot
+        api = getattr(self, "api", None)
+        if api is None or not hasattr(api, "list_positions"):
+            raise RuntimeError("broker position query unavailable")
+        account = getattr(api, "futopt_account", None)
+        rows = api.list_positions(account=account) if account is not None else api.list_positions()
+        positions = []
+        for row in rows or []:
+            code = getattr(row, "code", None) or getattr(row, "symbol", None)
+            direction = getattr(row, "direction", None) or getattr(row, "side", None)
+            direction = str(getattr(direction, "value", direction) or "").upper()
+            direction = ("LONG" if "BUY" in direction or "LONG" in direction
+                         else "SHORT" if "SELL" in direction or "SHORT" in direction
+                         else direction)
+            qty = getattr(row, "quantity", None)
+            if qty is None:
+                qty = getattr(row, "qty", None)
+            positions.append({"code": str(code), "side": direction,
+                              "direction": direction, "qty": qty,
+                              "quantity": qty})
+        return {"source": "live_broker", "positions": positions,
+                "fetch_status": {"capture": "OK"}}
+
+    def _authorize_broker_premise(self, contract, action, quantity,
+                                  premise, intent_action=None):
+        """Lowest live send boundary: broker truth must satisfy the premise."""
+        if not isinstance(premise, dict):
+            raise AdapterOrderError(
+                code="ORDER_PREMISE_MISSING",
+                context={"method": "place_order", "action": intent_action})
+        from core.futures_release_guard import ReleaseIntent, evaluate_release_precondition
+        symbol = getattr(contract, "code", None) or getattr(contract, "symbol", None)
+        intent = ReleaseIntent(
+            action=str(intent_action or "ORDER"), symbol=str(symbol),
+            side=str(action), qty=int(quantity), premise=premise)
+        try:
+            snapshot = self._broker_truth_snapshot()
+        except Exception as exc:
+            raise AdapterOrderError(
+                code="BROKER_QUERY_UNAVAILABLE",
+                context={"method": "place_order", "symbol": symbol,
+                         "error": f"{type(exc).__name__}: {exc}"}) from exc
+        decision = evaluate_release_precondition(intent, snapshot)
+        if not decision.allowed:
+            logger.warning("[ORDER_INTENT_BLOCKED] reason=%s audit=%s",
+                           decision.reason, decision.audit)
+            raise AdapterOrderError(
+                code=decision.reason,
+                context={"method": "place_order", "symbol": symbol,
+                         "action": intent_action, "premise": premise,
+                         "audit": decision.audit})
+        return snapshot
 
     def login(self, retries: int = 3, retry_delay: int = 10):
         api_key = os.getenv("SHIOAJI_API_KEY")
@@ -250,7 +310,8 @@ class ShioajiClient:
             logger.error(f"[shioaji_client] Get contract {ticker} error: {e}")
             return None
 
-    def place_order(self, contract, action: str, quantity: int, price: float = 0):
+    def place_order(self, contract, action: str, quantity: int, price: float = 0,
+                    *, premise=None, intent_action=None, octype=None):
         # P0 fix 2026-08-08 (verified on Mini shioaji 1.7.0):
         # OrderType=[FOK,IOC,ROD] — MTL does not exist; FuturesPriceType=
         # [LMT,MKP,MKT]; Order has NO market_type field.
@@ -265,21 +326,27 @@ class ShioajiClient:
         # return is ADAPTER_ORDER_NO_TRADE; a trade with terminal status
         # Failed/Rejected is ADAPTER_ORDER_REJECTED — zero silent failures.
         self._gate_or_raise("place_order")          # [Step 8] fail-closed
-        return self._place_order_unchecked(contract, action, quantity, price)
+        self._authorize_broker_premise(
+            contract, action, quantity, premise, intent_action)
+        return self._place_order_unchecked(contract, action, quantity, price, octype)
 
-    def _place_order_unchecked(self, contract, action: str, quantity: int, price: float = 0):
+    def _place_order_unchecked(self, contract, action: str, quantity: int,
+                               price: float = 0, octype=None):
         """Broker call after an already-authorized route-specific gate."""
         if not self.is_logged_in:
             return None
         try:
             action_value = sj.Action.Buy if action.upper() in ("BUY", "LONG") \
                 else sj.Action.Sell
+            _octype = octype or sj.FuturesOCType.Auto
+            if isinstance(_octype, str):
+                _octype = getattr(sj.FuturesOCType, _octype, sj.FuturesOCType.Auto)
             order = self.api.Order(
                 action=action_value, price=price, quantity=quantity,
                 order_type=sj.OrderType.IOC if price == 0 else sj.OrderType.ROD,
                 price_type=sj.FuturesPriceType.MKP if price == 0
                 else sj.FuturesPriceType.LMT,
-                octype=sj.FuturesOCType.Auto,
+                octype=_octype,
                 account=self.api.futopt_account,
             )
             trade = self.api.place_order(contract, order)
@@ -332,9 +399,19 @@ class ShioajiClient:
                 code="ADAPTER_ORDER_OBJECT_INVALID",
                 context={"method": "place_order_object", "symbol": symbol,
                          "side": side, "quantity": quantity})
-        return self._place_order_unchecked(
+        strategy = str(getattr(order, "strategy", "") or "").upper()
+        premise = getattr(order, "premise", None)
+        if premise is None and strategy == "MTS_ENTRY":
+            premise = {"kind": "NOT_HOLD"}
+        elif premise is None and strategy in {"MTS_RELEASE", "MTS_EXIT"}:
+            side_name = "BUY" if str(side).upper() == "BUY" else "SELL"
+            premise = {"kind": "HOLD_LEG", "leg": "target",
+                       "side": "SHORT" if side_name == "BUY" else "LONG",
+                       "qty": quantity}
+        return self.place_order(
             contract, action=side, quantity=quantity,
             price=getattr(order, "price", 0) or 0,
+            premise=premise, intent_action=strategy or "ORDER",
         )
 
     def place_combo_order_object(self, order):

@@ -270,6 +270,9 @@ class FuturesMonitor:
         # fail-closed adapter gate explicitly, then persist/transition code
         # can propagate LIVE_READY before any order is attempted.
         self.client._execution_context = None
+        # The adapter is the lowest live send boundary; inject the monitor's
+        # fresh broker snapshot provider instead of allowing route-local truth.
+        self.client._broker_snapshot_provider = self._capture_post_startup_snapshot
 
         # [ThetaGate] Latest router decision — consumed by options monitor
         # to check theta_allowed flag before entering theta positions.
@@ -5225,7 +5228,16 @@ class FuturesMonitor:
                 octype=sj.constant.FuturesOCType.Cover,
                 account=self.api.futopt_account,
             )
-            trade = self.api.place_order(self.contract, order)
+            trade = self.client.place_order(
+                self.contract,
+                action=action.value,
+                quantity=lots,
+                price=safety_price,
+                octype="Cover",
+                premise={"kind": "HOLD_LEG", "leg": "safety_stop",
+                         "side": direction, "qty": lots},
+                intent_action="EXIT_SAFETY_STOP",
+            )
             if trade and trade.status.status != sj.constant.Status.Failed:
                 self._safety_stop_trade = trade
                 console.print(f"[bold yellow]🛡️ Safety stop placed: {action.value} @ {safety_price:.0f} ({safety_pts:.0f}pts from entry)[/bold yellow]")
@@ -6555,8 +6567,14 @@ class FuturesMonitor:
 
         if self.live_trading and not self.dry_run:
             try:
-                trade = self.client.place_order(self.contract, action=action,
-                                                quantity=lots)
+                _premise = ({"kind": "NOT_HOLD"}
+                            if signal in ("BUY", "SELL") else
+                            {"kind": "HOLD_LEG", "leg": "target",
+                             "side": "LONG" if self.trader.position > 0 else "SHORT",
+                             "qty": lots})
+                trade = self.client.place_order(
+                    self.contract, action=action, quantity=lots,
+                    premise=_premise, intent_action=signal)
             except AdapterOrderError as e:
                 # P0: structured durable failure — never swallowed
                 self._clear_pending_lifecycle_order(order.order_id)
@@ -7985,6 +8003,21 @@ class FuturesMonitor:
 
             _side = OrderSide.SELL if _remaining_side == "LONG" else OrderSide.BUY
 
+            # L2 also applies to the remaining-leg EXIT path.  The target leg
+            # is derived only from the confirmed single-leg lifecycle; broker
+            # truth is still the final premise immediately before submission.
+            _exit_before_snapshot = None
+            if self.live_trading and _released in ("near", "far"):
+                if not self._release_startup_safety_gate(strategy, _near_code, _far_code):
+                    return
+                _exit_before_snapshot = self._release_pre_submit_guard(
+                    action="EXIT", reason=str(_reason or "EXIT_REMAINING"),
+                    strategy=strategy, symbol=_symbol,
+                    leg="far" if _released == "near" else "near",
+                )
+                if _exit_before_snapshot is None:
+                    return
+
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting EXIT for {_leg_label}: {_side} (MKP Range Market)[/yellow]")
             # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
             _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_EXIT")
@@ -8029,6 +8062,9 @@ class FuturesMonitor:
             except _MTSGWFail as _gwe:
                 self._quarantine_mts_exit_leg_failure(
                     trade_id=_trade_id, leg=_leg_label, reason=str(_gwe))
+                return
+            if (_exit_before_snapshot is not None
+                    and not self._release_post_submit_guard(_exit_before_snapshot, _symbol)):
                 return
             self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _ref_ohlc,
                                                           "event_id": _order.event_id,
@@ -8247,8 +8283,12 @@ class FuturesMonitor:
                                 getattr(self._execution_context,
                                         "audit_reasons", ()) or ())}
             try:
-                trade = self.client.place_order(self.contract, action=action,
-                                                quantity=lots)
+                _premise = ({"kind": "NOT_HOLD"}
+                            if signal in ("BUY", "SELL") else
+                            {"kind": "HOLD_ANY"})
+                trade = self.client.place_order(
+                    self.contract, action=action, quantity=lots,
+                    premise=_premise, intent_action=signal)
             except AdapterOrderError as e:
                 # P0: structured durable failure — never swallowed
                 console.print(
