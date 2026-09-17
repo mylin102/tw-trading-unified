@@ -198,12 +198,25 @@ def sanitize_startup_state(state: dict[str, Any], broker_snapshot: dict[str, Any
     positions = _positions(broker_snapshot) or []
     near = _matching_position(positions, near_symbol)
     far = _matching_position(positions, far_symbol)
+    broker_legs = []
+    for leg_name, row in (("near", near), ("far", far)):
+        if row:
+            broker_legs.append({
+                "leg": leg_name,
+                "status": "OPEN",
+                "side": str(row.get("side") or row.get("direction") or "").upper() or None,
+                "qty": abs(int(row.get("qty") or row.get("quantity") or 0)),
+                "entry": row.get("avg_cost"),
+            })
+    local_legs = state.get("legs")
+    legs_diverged = isinstance(local_legs, list) and local_legs != broker_legs
     if not near and not far:
         for field in ("near_side", "far_side", "released_leg", "remaining_leg",
                       "near_entry", "far_entry"):
             clean[field] = None
         clean["has_position"] = False
         clean["state"] = "FLAT"
+        clean["legs"] = []
         reason = "BROKER_FLAT_NO_RELEASE"
         return StartupDecision(False, reason, clean,
                                _audit(event="STARTUP_ORDER_BLOCKED", reason=reason,
@@ -217,7 +230,12 @@ def sanitize_startup_state(state: dict[str, Any], broker_snapshot: dict[str, Any
         clean["far_entry"] = far.get("avg_cost")
     clean["has_position"] = True
     clean["state"] = "POSITION"
+    clean["legs"] = broker_legs
+    audit = _audit(event="STARTUP_RECONCILED",
+                   reason="BROKER_POSITION_RECONCILED",
+                   intent=None, snapshot=broker_snapshot)
+    if legs_diverged:
+        audit.update({"local_legs": local_legs, "broker_legs": broker_legs,
+                      "legs_action": "RECONCILED_FROM_BROKER"})
     return StartupDecision(True, "BROKER_POSITION_RECONCILED", clean,
-                           _audit(event="STARTUP_RECONCILED",
-                                  reason="BROKER_POSITION_RECONCILED",
-                                  intent=None, snapshot=broker_snapshot))
+                           audit)
