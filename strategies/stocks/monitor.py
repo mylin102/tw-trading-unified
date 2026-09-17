@@ -454,7 +454,7 @@ class StockMonitor:
                 if snap.total_amount > 0 and snap.close > snap.open:
                     scored.append((ticker, snap.total_amount))
             except Exception:
-                pass
+                self._record_analysis_failure(ticker, e)
         # 按成交金額排序，取前半
         scored.sort(key=lambda x: -x[1])
         max_tickers = max(3, len(self.watchlist) // 2)
@@ -561,6 +561,25 @@ class StockMonitor:
             console.print(f"[yellow]⚠️ Could not re-verify live flag: {e}[/yellow]")
             return self.live_trading
 
+    def _record_analysis_failure(self, ticker, error):
+        failures = getattr(self, "_analysis_failures", None)
+        if failures is None:
+            failures = self._analysis_failures = []
+        failures.append(str(ticker))
+        first_line = str(error).splitlines()[0] if str(error) else type(error).__name__
+        console.print(f"[yellow][WARN] Stock analysis failed ticker={ticker} "
+                      f"error={type(error).__name__}: {first_line}[/yellow]")
+
+    def _finish_analysis_round(self):
+        failures = getattr(self, "_analysis_failures", [])
+        total = int(getattr(self, "_analysis_total", 0) or 0)
+        if not failures:
+            return
+        level = "ERROR" if total and len(failures) >= total else "WARN"
+        console.print(f"[{'red' if level == 'ERROR' else 'yellow'}][{level}] "
+                      f"Stock analysis failures this round: {len(failures)}/{total} "
+                      f"tickers={failures}[/{'red' if level == 'ERROR' else 'yellow'}]")
+
     def run_iteration(self):
         """Run a single iteration of the scanning and execution logic."""
         # [GSD Fix] Daily reset for long-running process
@@ -625,6 +644,8 @@ class StockMonitor:
 
         self.clean_unfilled_orders()
         scan_list = self._loop_state["active_watchlist"] if self._loop_state["active_watchlist"] else self.watchlist
+        self._analysis_failures = []
+        self._analysis_total = len(scan_list)
         # Also scan open positions (may include overnight holdings not in watchlist)
         position_tickers = [t for t in self.positions.keys() if t not in scan_list]
         if position_tickers:
@@ -875,7 +896,9 @@ class StockMonitor:
                             console.print(f"[dim]🛡️ Entry blocked: {ticker} {edge_res['reason']}[/dim]")
                         
             except Exception as e:
-                console.print(f"[red]Error {ticker}: {e}[/red]")
+                pass
+
+        self._finish_analysis_round()
 
     def run(self):
         """Legacy run method for backward compatibility."""
