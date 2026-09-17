@@ -44,3 +44,16 @@ def test_p2_mutation_legacy_only_state_is_not_accepted():
     from pathlib import Path
     source = Path("strategies/plugins/futures/active/tmf_spread.py").read_text()
     assert '"legs"' in source
+
+
+def test_p2_startup_reconciles_legacy_legs_from_broker():
+    from core.futures_release_guard import sanitize_startup_state
+    decision = sanitize_startup_state(
+        {"has_position": True, "legs": [{"leg": "near", "side": "SHORT"}]},
+        {"source": "live_broker", "positions": [
+            {"code": "TMFI6", "side": "LONG", "qty": 1}],
+         "fetch_status": {"capture": "OK"}},
+        near_symbol="TMFI6", far_symbol="TMFJ6",
+    )
+    assert decision.state["legs"][0]["side"] == "LONG"
+    assert decision.audit["legs_action"] == "RECONCILED_FROM_BROKER"
