@@ -35,6 +35,10 @@ from core.runtime_paths import (
     stamp_runtime_state,
 )
 
+# A caller may explicitly clear an immutable field; omitted arguments retain
+# the legacy field-level protection behavior.
+_UNSET = object()
+
 import logging
 import os
 import json
@@ -1333,8 +1337,8 @@ def _write_mts_state(
     far_entry: float = 0,
     near_last: float = 0,
     far_last: float = 0,
-    near_side: str | None = None,
-    far_side: str | None = None,
+    near_side: str | None | object = _UNSET,
+    far_side: str | None | object = _UNSET,
     spread_z: float = 0,
     released_leg: str | None = None,
     release_price: float = 0,
@@ -1343,10 +1347,11 @@ def _write_mts_state(
     trail_nadir: float = 0,
     release_stop_points: int = 0,
     trail_distance_points: int = 0,
-    trade_id: str | None = None,
+    trade_id: str | None | object = _UNSET,
     ticker: str = "TMF",
     atr: float = 0.0,
     policy_j_meta: dict | None = None,
+    entry_ts: str | None | object = _UNSET,
     **kwargs,
 ) -> None:
     """
@@ -1370,9 +1375,13 @@ def _write_mts_state(
             except:
                 pass
 
-        # ── Per-leg status: OPEN or RELEASED ──
-        near_status = "RELEASED" if released_leg == "near" else "OPEN"
-        far_status = "RELEASED" if released_leg == "far" else "OPEN"
+        # ── Per-leg status: OPEN, RELEASED, or CLOSED ──
+        if not has_position:
+            near_status = "CLOSED"
+            far_status = "CLOSED"
+        else:
+            near_status = "RELEASED" if released_leg == "near" else "OPEN"
+            far_status = "RELEASED" if released_leg == "far" else "OPEN"
 
         # Remaining leg labels for dashboard
         remaining_leg = None
@@ -1386,10 +1395,14 @@ def _write_mts_state(
         # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
         _f_near_entry = near_entry if near_entry > 0 else float(existing.get("near_entry") or 0.0)
         _f_far_entry = far_entry if far_entry > 0 else float(existing.get("far_entry") or 0.0)
-        _f_near_side = near_side or existing.get("near_side")
-        _f_far_side = far_side or existing.get("far_side")
-        _f_trade_id = trade_id or existing.get("trade_id")
-        _f_entry_ts = existing.get("entry_ts")
+        _f_near_side = (existing.get("near_side")
+                        if near_side is _UNSET else near_side)
+        _f_far_side = (existing.get("far_side")
+                       if far_side is _UNSET else far_side)
+        _f_trade_id = (existing.get("trade_id")
+                       if trade_id is _UNSET else trade_id)
+        _f_entry_ts = (existing.get("entry_ts")
+                      if entry_ts is _UNSET else entry_ts)
         if not _f_entry_ts and has_position:
             _f_entry_ts = datetime.now().isoformat()
 
@@ -1447,7 +1460,9 @@ def _write_mts_state(
             )
 
         # ── Release state label ──
-        if released_leg is None:
+        if not has_position:
+            release_state = "FLAT"
+        elif released_leg is None:
             release_state = "BOTH_HELD"
         else:
             release_state = f"{released_leg.upper()}_RELEASED"
