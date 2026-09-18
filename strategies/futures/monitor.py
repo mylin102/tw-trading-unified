@@ -141,7 +141,9 @@ def _extract_bbo(quote_obj):
     return (None, None, "DATA_QUALITY_BLOCKED")
 
 
-def _bbo_tick_fields(tick, observed_at: float) -> dict:
+def _bbo_tick_fields(
+    tick, bbo_now: float, generation_id: str | None = None,
+) -> dict:
     """Return tick-carried BBO telemetry without granting BidAsk freshness."""
     bid = getattr(tick, "buy_price", None)
     ask = getattr(tick, "sell_price", None)
@@ -154,7 +156,19 @@ def _bbo_tick_fields(tick, observed_at: float) -> dict:
         return {}
     if bid_f <= 0 or ask_f <= 0 or ask_f < bid_f:
         return {}
-    return {"bid": bid_f, "ask": ask_f, "tick_bbo_at": observed_at}
+    fields = {"bid": bid_f, "ask": ask_f, "tick_bbo_at": bbo_now}
+    if generation_id is not None:
+        fields["generation_id"] = generation_id
+    return fields
+
+
+def _session_generation(api) -> str | None:
+    try:
+        from core.live_route_certificate import session_registry
+        generation = session_registry.generation(api)
+        return str(generation) if generation is not None else None
+    except Exception:
+        return None
 
 
 def _repo_root() -> str:
@@ -2135,6 +2149,9 @@ class FuturesMonitor:
                     _slot = self.market_data.setdefault(_key, {})
                     _slot.update({"bid": _bbo_cache[0], "ask": _bbo_cache[1],
                                   "bidask_at": time.time(), "bidask_exchange_ts": getattr(bidask, "datetime", None)})
+                    _generation_id = _session_generation(getattr(self, "api", None))
+                    if _generation_id is not None:
+                        _slot["generation_id"] = _generation_id
                     # [S2 repair] dedicated EXIT_ONLY BBO evidence cache —
                     # immutable-per-update; written ONLY here (validated
                     # BidAskFOPv1/on_bidask).  Ticks never create or
@@ -2478,7 +2495,9 @@ class FuturesMonitor:
                 "datetime": getattr(tick, 'datetime', None),
                 "local_arrival_at": self.last_tick_at,
             }
-            _tick_info.update(_bbo_tick_fields(tick, self.last_tick_at))
+            _tick_info.update(_bbo_tick_fields(
+                tick, self.last_tick_at,
+                _session_generation(getattr(self, "api", None))))
             if _t_code:
                 self.market_data[_t_code] = _tick_info
             
@@ -2614,7 +2633,9 @@ class FuturesMonitor:
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
             }
-            _near_tick_info.update(_bbo_tick_fields(tick, self.last_tick_at))
+            _near_tick_info.update(_bbo_tick_fields(
+                tick, self.last_tick_at,
+                _session_generation(getattr(self, "api", None))))
             self.market_data[self.ticker] = _near_tick_info
             self.market_data[f"{self.ticker}_NEAR"] = _near_tick_info
         elif is_far_tick:
@@ -2623,7 +2644,9 @@ class FuturesMonitor:
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
             }
-            _far_tick_info.update(_bbo_tick_fields(tick, self.last_tick_at))
+            _far_tick_info.update(_bbo_tick_fields(
+                tick, self.last_tick_at,
+                _session_generation(getattr(self, "api", None))))
             self.market_data[f"{self.ticker}_FAR"] = _far_tick_info
 
         if getattr(tick, 'code', None):
@@ -2632,7 +2655,9 @@ class FuturesMonitor:
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
             }
-            _code_tick_info.update(_bbo_tick_fields(tick, self.last_tick_at))
+            _code_tick_info.update(_bbo_tick_fields(
+                tick, self.last_tick_at,
+                _session_generation(getattr(self, "api", None))))
             self.market_data[tick.code] = _code_tick_info
 
         # Only count volume for primary ticker to keep indicators accurate
@@ -2778,7 +2803,9 @@ class FuturesMonitor:
             "datetime": tick.datetime,
             "local_arrival_at": time.time(),
         }
-        _far_tick_info.update(_bbo_tick_fields(tick, self.last_tick_at))
+        _far_tick_info.update(_bbo_tick_fields(
+            tick, self.last_tick_at,
+            _session_generation(getattr(self, "api", None))))
         self.market_data[f"{self.ticker}_FAR"] = _far_tick_info
         if getattr(tick, 'code', None):
             self.market_data[tick.code] = _far_tick_info
