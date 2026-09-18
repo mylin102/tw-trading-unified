@@ -123,8 +123,10 @@ class _FakeApi:
         self._subscribe_ok = subscribe_ok
         self._unsubscribe_ok = unsubscribe_ok
         self._snapshot_codes = list(snapshot_codes)
-        self._contracts = [_Contract("TMFH6", "2026-08-19"),
-                           _Contract("TMFI6", "2026-09-16")]
+        # Keep the fake contract chain future-dated relative to the test
+        # clock; otherwise the real resolver correctly rejects stale fixtures.
+        self._contracts = [_Contract("TMFH6", "2099-08-19"),
+                           _Contract("TMFI6", "2099-09-16")]
         self.Contracts = _Contracts(self._contracts)
         self.calls = []
 
