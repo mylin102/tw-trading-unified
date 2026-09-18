@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -21,8 +21,8 @@ def leg(code, bid=100.0, ask=101.0, quote_time=NOW, last=99999.0):
 
 def quote(near=None, far=None, **kwargs):
     return build_tmf_spread_quote(
-        near or leg("TMFJ6", 100.0, 101.0),
-        far or leg("TMFK6", 90.0, 91.0),
+        leg("TMFJ6", 100.0, 101.0) if near is None else near,
+        leg("TMFK6", 90.0, 91.0) if far is None else far,
         now=NOW,
         session_confirmed=True,
         trading_date_confirmed=True,
@@ -68,14 +68,20 @@ def test_invalid_or_missing_bbo_is_blocked(near, far, reason):
 
 
 def test_missing_far_leg_is_blocked():
-    result = quote(far=None)
+    result = build_tmf_spread_quote(
+        leg("TMFJ6"),
+        None,
+        now=NOW,
+        session_confirmed=True,
+        trading_date_confirmed=True,
+    )
 
     assert result.data_quality == "BLOCKED"
     assert result.rejection_reason == "MISSING_FAR_QUOTE"
 
 
 def test_far_stale_is_blocked_and_old_far_price_is_not_reused():
-    result = quote(far=leg("TMFK6", 90.0, 91.0, NOW.replace(second=0)))
+    result = quote(far=leg("TMFK6", 90.0, 91.0, NOW - timedelta(seconds=3)))
 
     assert result.data_quality == "BLOCKED"
     assert result.rejection_reason == "STALE_QUOTE"
@@ -85,7 +91,7 @@ def test_far_stale_is_blocked_and_old_far_price_is_not_reused():
 
 
 def test_pair_skew_over_existing_sync_threshold_is_blocked():
-    result = quote(far=leg("TMFK6", 90.0, 91.0, NOW.replace(microsecond=501000)))
+    result = quote(far=leg("TMFK6", 90.0, 91.0, NOW - timedelta(milliseconds=501)))
 
     assert result.data_quality == "BLOCKED"
     assert result.rejection_reason == "QUOTE_SKEW_TOO_LARGE"
@@ -116,4 +122,3 @@ def test_session_and_trading_date_must_be_confirmed(
 
     assert result.data_quality == "BLOCKED"
     assert result.rejection_reason == reason
-
