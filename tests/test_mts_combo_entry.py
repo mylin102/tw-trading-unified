@@ -46,11 +46,15 @@ def test_futures_adapter_places_one_two_leg_combo(monkeypatch):
     )
     client.is_logged_in = True
     client._gate_or_raise = MagicMock()
+    client._broker_truth_snapshot = MagicMock(return_value={
+        "source": "live_broker", "positions": [],
+        "fetch_status": {"capture": "OK"},
+    })
     contracts = {code: SimpleNamespace(code=code) for code in ("TMF1", "TMF2")}
     client.get_contract = lambda code: contracts.get(code)
 
     order = SimpleNamespace(
-        price=12.0, quantity=1,
+        price=12.0, quantity=1, strategy="MTS_ENTRY",
         combo_legs=[
             {"symbol": "TMF1", "side": "buy", "quantity": 1},
             {"symbol": "TMF2", "side": "sell", "quantity": 1},
@@ -65,6 +69,37 @@ def test_futures_adapter_places_one_two_leg_combo(monkeypatch):
     assert [leg.code for leg in combo_contract.legs] == ["TMF1", "TMF2"]
     assert combo_order.price == 12.0
     assert combo_order.order_type == "IOC"
+
+
+def test_futures_combo_adapter_blocks_broker_call_when_premise_mismatches(monkeypatch):
+    from strategies.futures.squeeze_futures.data import shioaji_client as mod
+
+    monkeypatch.setattr(mod, "sj", _fake_sdk())
+    client = mod.ShioajiClient.__new__(mod.ShioajiClient)
+    client.api = SimpleNamespace(
+        futopt_account="acct", place_comboorder=MagicMock())
+    client.is_logged_in = True
+    client._gate_or_raise = MagicMock()
+    contracts = {code: SimpleNamespace(code=code) for code in ("TMF1", "TMF2")}
+    client.get_contract = lambda code: contracts.get(code)
+    client._broker_truth_snapshot = MagicMock(return_value={
+        "source": "live_broker",
+        "positions": [{"code": "TMF1", "side": "LONG", "qty": 1}],
+        "fetch_status": {"capture": "OK"},
+    })
+    order = SimpleNamespace(
+        price=12.0, quantity=1, strategy="MTS_ENTRY",
+        combo_legs=[
+            {"symbol": "TMF1", "side": "buy", "quantity": 1},
+            {"symbol": "TMF2", "side": "sell", "quantity": 1},
+        ],
+    )
+
+    with pytest.raises(mod.AdapterOrderError) as exc:
+        client.place_combo_order_object(order)
+
+    assert exc.value.code == "BROKER_PREMISE_MISMATCH"
+    client.api.place_comboorder.assert_not_called()
 
 
 def test_futures_adapter_rejects_non_two_leg_combo(monkeypatch):

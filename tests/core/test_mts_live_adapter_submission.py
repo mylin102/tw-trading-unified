@@ -29,10 +29,14 @@ def test_shioaji_object_bridge_passes_contract_action_and_quantity():
     contract = SimpleNamespace(code="TMFH6")
     received = {}
     client.get_contract = lambda symbol: contract
+    client._broker_truth_snapshot = lambda: {
+        "source": "live_broker", "positions": [],
+        "fetch_status": {"capture": "OK"},
+    }
 
-    def place_order(actual_contract, action, quantity, price=0):
+    def place_order(actual_contract, action, quantity, price=0, octype=None):
         received.update(contract=actual_contract, action=action,
-                        quantity=quantity, price=price)
+                        quantity=quantity, price=price, octype=octype)
         return "receipt"
 
     client._place_order_unchecked = place_order
@@ -42,6 +46,7 @@ def test_shioaji_object_bridge_passes_contract_action_and_quantity():
     assert result == "receipt"
     assert received == {
         "contract": contract, "action": "sell", "quantity": 1, "price": 0,
+        "octype": None,
     }
 
 
@@ -78,6 +83,23 @@ def test_live_adapter_exception_rejects_without_active_pending_order():
     assert order.reject_reason == "ADAPTER_SUBMIT_FAILED"
     assert order.order_id not in manager.active_orders
     assert manager.completed == [order]
+
+
+def test_live_adapter_preserves_safe_premise_failure_code():
+    """A typed fail-closed cause must not collapse into ADAPTER_SUBMIT_FAILED."""
+    class PremiseBlocked(Exception):
+        code = "BROKER_PREMISE_MISMATCH"
+
+    class FailingAdapter:
+        def place_order_object(self, order):
+            raise PremiseBlocked("broker truth contradicts intent")
+
+    manager = OrderManager(mode="live", broker_adapter=FailingAdapter())
+    order = _new_order(manager)
+
+    assert manager.submit(order) is False
+    assert order.status is OrderStatus.REJECTED
+    assert order.reject_reason == "BROKER_PREMISE_MISMATCH"
 
 
 def test_live_missing_broker_receipt_rejects_without_active_pending_order():
