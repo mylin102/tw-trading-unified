@@ -4538,42 +4538,13 @@ class TMFSpread(StrategyBase):
         # Calculate initial thresholds for state logging
         _init_stop, _init_trail = self._get_thresholds(bar)
 
-        _write_mts_state(
-            has_position=False, action="SUBMITTING", reason=_reason,
-            near_entry=near_close, far_entry=far_close,
-            near_last=near_close, far_last=far_close,
-            near_side=self._near_side, far_side=self._far_side,
-            spread_z=spread_z_f, released_leg=None,
-            release_stop_points=_init_stop,
-            trail_distance_points=_init_trail,
-            trade_id=self._trade_id,
-            # 2026-05-27 Gemini CLI: Pass current ticker to _write_mts_state for dynamic point value
-            ticker=self._ticker,
-            atr=self._last_atr, # 2026-06-26 Gemini CLI: pass current ATR to state writer
-            # 2026-08-14 Hermes Agent: spread-dynamics telemetry mirror
-            # (display-only; the research SQL is authoritative)
-            dz=bar.get("dz"),
-            spread_slope=bar.get("spread_slope"),
-            velocity_ema=bar.get("velocity_ema"),
-            spread=bar.get("spread"),
-            lifecycle=self._current_lifecycle_state(),
-            peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
-            # 2026-08-04 config observability: effective guard value + source
-            policy_j_meta={
-                "entry_peak_guard_ms": float(getattr(self, "_pj_guard_effective_ms", 15000.0)),
-                "entry_peak_guard_source": str(getattr(self, "_pj_guard_source", "DEFAULT")),
-                "entry_peak_guard_config_key": str(getattr(self, "_pj_guard_config_key", "entry_peak_guard_ms")),
-                "entry_ts_ms": float(getattr(self, "_entry_ts_ms", 0.0) or 0.0),
-                "entry_guard_start_ms": float(getattr(self, "_entry_guard_start_ms", 0.0) or 0.0),
-                "time_schema_version": 2,
-                "clock_source": "RECEIVE_EPOCH_MS",
-            },
-        )
-        _append_event("ENTRY_SUBMITTED", action=_action, near_side=self._near_side, far_side=self._far_side,
-                       near_entry=near_close, far_entry=far_close, spread_z=spread_z_f,
-                       # 2026-07-16 Gemini CLI: Record indicators for generate_daily_report.py
-                       mtf_score=bar.get("mtf_score"), vwap=bar.get("vwap"),
-                       near_vwap=bar.get("near_vwap"), far_vwap=bar.get("far_vwap"))
+        # Broker-truth boundary: this method only creates a submission intent.
+        # Do not persist leg sides/prices or emit *_SUBMITTED here.  The
+        # monitor emits submission telemetry only after the broker gateway
+        # accepts the order; confirmed fills then call sync_position(), which
+        # is the owner of durable open-position state.  In particular, a
+        # rejected/quarantined entry must not resurrect stale near_side/far_side
+        # on the next release evaluation.
         
         # [Fix] Fill log moved to sync_position for true deferred sync
         # _append_fill(...) - removed from here
@@ -5527,12 +5498,11 @@ class TMFSpread(StrategyBase):
                 _mae = (self._near_entry - self._near_min) if self._near_side == "LONG" else (self._near_max - self._near_entry)
                 self._log_exit_decision(exit_reason="RELEASE_STOP", pnl=_pnl_pts, bar=bar)
                 _risk_meta["mtf_score"] = self._mtf_score_at_release
-                _append_event(f"RELEASE_{_release_leg.value}_SUBMITTED", released_leg=_release_leg.value, exit_price=_exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, mfe=round(_mfe,2), mae=round(_mae,2), **_risk_meta)
-                # 2026-07-09 Hermes Agent: P0 — commit lifecycle state NOW, after all
-                # pre-order guards (tick confirmation, BB filter) have passed.
-                _commit_action(self._lifecycle_oca, _decision)
+                # Broker-truth boundary: lifecycle/state and *_SUBMITTED
+                # telemetry are committed by monitor.py only after the
+                # gateway accepts the release order.  A blocked release must
+                # leave no leg-bearing state behind.
                 logger.warning("[LIFECYCLE_DECISION] action=%s release_leg=%s", _decision.action, _decision.release_leg)
-                _write_mts_state(has_position=True, action=f"RELEASE_{_release_leg.value}", reason=f"{_release_leg.value}_pnl={_pnl_pts:.1f}", near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, near_status="OPEN", far_status="OPEN", spread_z=spread_z, release_price=_exit_price, release_stop_points=int(release_stop), trail_distance_points=int(trail_dist), trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
                 # P1-B durable-exit-intent: a release STARTS the exit sequence —
                 # persist the intent for the REMAINING leg before emitting
                 try:

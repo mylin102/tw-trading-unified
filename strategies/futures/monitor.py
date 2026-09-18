@@ -9536,6 +9536,11 @@ class FuturesMonitor:
                     "release_reason": _reason or "RELEASE_STOP",
                     "reason_source": "LIFECYCLE_DECISION",
                 })
+                self._append_mts_event(
+                    "RELEASE_NEAR_SUBMITTED",
+                    **{**_ev_meta(_order),
+                       "released_leg": "near",
+                       "release_reason": _reason or "RELEASE_STOP"})
                 if self.paper_fill_sim:
                     self.paper_fill_sim.register(_order)
                     # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
@@ -9597,6 +9602,11 @@ class FuturesMonitor:
                     "release_reason": _reason or "RELEASE_STOP",
                     "reason_source": "LIFECYCLE_DECISION",
                 })
+                self._append_mts_event(
+                    "RELEASE_FAR_SUBMITTED",
+                    **{**_ev_meta(_order),
+                       "released_leg": "far",
+                       "release_reason": _reason or "RELEASE_STOP"})
                 if self.paper_fill_sim:
                     self.paper_fill_sim.register(_order)
                     # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
@@ -10312,6 +10322,19 @@ class FuturesMonitor:
             "COMBO_ORDER_SUBMITTED", order_id=_order.order_id,
             trade_id=trade_id, strategy="MTS_ENTRY", combo_legs=_combo_legs,
             price=_combo_price)
+        self._append_mts_event(
+            "ENTRY_SUBMITTED",
+            order_id=_order.order_id,
+            intent_id=_order.intent_id,
+            trade_id=trade_id,
+            action=action,
+            near_side=_near_value,
+            far_side=_far_value,
+            near_entry=near_price,
+            far_entry=far_price,
+            spread_z=bar_dict.get("spread_z"),
+            combo_legs=_combo_legs,
+        )
         if not self.live_trading or self.dry_run:
             if self.paper_fill_sim:
                 self.paper_fill_sim.register_combo(
@@ -12392,6 +12415,18 @@ class FuturesMonitor:
             )
             strategy.init(ctx)
 
+        # LIVE startup authority must be latched before any local recovery.
+        # A fills-ledger restore below is allowed only after the broker truth
+        # query has had first refusal; otherwise a stale local fills record can
+        # recreate the ghost release state before the broker gate runs.
+        _live_authority_runtime = bool(
+            getattr(getattr(self, "_execution_context", None),
+                    "requested_mode", "") == "live")
+        _early_broker_auth = (
+            self._refresh_live_broker_authority(strategy)
+            if _live_authority_runtime else None
+        )
+
         # ── [ADR-010] OCO reconciliation: runs even when market closed ──
         # Must reconcile paper_fill_sim after restart before first market tick,
         # otherwise SUBMITTED OCO orders from previous session become orphans.
@@ -12445,9 +12480,6 @@ class FuturesMonitor:
         # effective_mode is not yet "live_ready" at startup (the certificate
         # transition happens later) — either signal alone let the fills-led
         # recovery resurrect a ghost (reason=fills_recovery observed).
-        _live_authority_runtime = bool(
-            getattr(getattr(self, "_execution_context", None),
-                    "requested_mode", "") == "live")
         if _fills_open and not _state_has_pos and not _live_authority_runtime:
             # Split-brain: fills says open, state says closed.
             # Try fills-led recovery via strategy's _restore_from_fills_log
@@ -12587,7 +12619,8 @@ class FuturesMonitor:
         # requires each leg's own volume; `far_vwap` above is a deque-wide
         # aggregate (spans the 15:00 reset boundary) and must NEVER be used as
         # a substitute for far volume. 0/missing -> candidate fails closed.
-        _bar_dict["far_volume"] = float(self._far_current_bar.get("volume", 0) or 0)
+        _far_current_bar = getattr(self, "_far_current_bar", None) or {}
+        _bar_dict["far_volume"] = float(_far_current_bar.get("volume", 0) or 0)
         _bar_dict["regime_prewarm_bars"] = self._get_hvwap_regime_prewarm_bars(
             _bar_dict.get("ts"))
 
@@ -12941,7 +12974,11 @@ class FuturesMonitor:
         # LIVE broker truth supersedes a silent/missing callback ledger.  The
         # helper is read-only and leaves PAPER and legacy EXIT_ONLY untouched.
         from strategies.futures.mts_ledger_authority import MtsAuthority
-        _broker_auth = self._refresh_live_broker_authority(strategy)
+        _broker_auth = (
+            _early_broker_auth
+            if _live_authority_runtime
+            else self._refresh_live_broker_authority(strategy)
+        )
         if _broker_auth is not None:
             _auth = _broker_auth
             _authority_has_pos = (_broker_auth.status in (
@@ -13336,7 +13373,8 @@ class FuturesMonitor:
             # pending order.  Live mode deliberately keeps the stricter
             # OrderManager-based gate and is unchanged.
             _paper_pending_ids = None
-            if not self.live_trading and self.paper_fill_sim is not None:
+            if (not getattr(self, "live_trading", False)
+                    and getattr(self, "paper_fill_sim", None) is not None):
                 _paper_pending_ids = set(
                     getattr(self.paper_fill_sim, "_pending_orders", {}) or {}
                 )

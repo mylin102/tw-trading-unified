@@ -208,6 +208,22 @@ class _FakeAdapter:
         from types import SimpleNamespace
         return SimpleNamespace(id=order.exchange_order_id, seqno="1")
 
+    def place_combo_order_object(self, order):
+        """Model the live calendar-spread bridge as one receipt with two legs."""
+        reg = getattr(self, "_gateway_registry", None)
+        if reg is not None and not reg.verify_pending_submission(order):
+            raise RuntimeError("ADAPTER_GATEWAY_AUTHORIZATION_MISSING")
+        _legs = getattr(order, "combo_legs", None) or []
+        self.calls.extend({
+            "order_id": order.order_id,
+            "symbol": leg.get("symbol"),
+            "side": leg.get("side"),
+            "quantity": leg.get("quantity"),
+            "strategy": order.strategy,
+        } for leg in _legs)
+        order.exchange_order_id = f"BROKER-{order.order_id}"
+        return SimpleNamespace(id=order.exchange_order_id, seqno="combo-1")
+
     def get_contract(self, symbol):
         from types import SimpleNamespace
         return SimpleNamespace(code=symbol)
@@ -735,8 +751,16 @@ def _flag_monitor(ctx, flag):
     # manual entry prices come from LIVE_TICK only (flag prices are
     # logging-only hints) — provide fresh ticks for the ticker + far code
     now = time.time()
-    monitor.market_data["TMF"] = {"close": 44905, "local_arrival_at": now}
-    monitor.market_data["TMF_FAR"] = {"close": 45038.5, "local_arrival_at": now}
+    # The live manual-entry contract requires a current BBO on both legs;
+    # keep the fixture representative of the Shioaji callback payload.
+    monitor.market_data["TMF"] = {
+        "close": 44905, "local_arrival_at": now,
+        "bid": 44900.0, "ask": 44910.0, "bidask_at": now,
+    }
+    monitor.market_data["TMF_FAR"] = {
+        "close": 45038.5, "local_arrival_at": now,
+        "bid": 45030.0, "ask": 45050.0, "bidask_at": now,
+    }
     monitor._last_tmf_price = 44905
     monitor.last_tick_at = now
     p = tempfile.mkdtemp(prefix="s0_flag_")

@@ -39,7 +39,8 @@ def test_release_submitted_event_is_not_emitted_by_pre_submit_strategy_evaluatio
         if not (isinstance(call.func, ast.Name) and call.func.id == "_append_event"):
             continue
         text = ast.unparse(call)
-        assert "SUBMITTED" not in text, (
+        assert "RELEASE_NEAR_SUBMITTED" not in text
+        assert "RELEASE_FAR_SUBMITTED" not in text, (
             "release SUBMITTED telemetry must be emitted only by the broker-success path"
         )
 
@@ -47,8 +48,8 @@ def test_release_submitted_event_is_not_emitted_by_pre_submit_strategy_evaluatio
 def test_reconnect_has_p1_evidence_hook():
     source = MAIN.read_text(encoding="utf-8")
     calls = _method_calls(source, "_try_shioaji_reconnect")
-    assert any(isinstance(c.func, ast.Attribute)
-               and c.func.attr == "_append_mts_event" for c in calls), (
+    assert any(isinstance(c.func, ast.Name)
+               and c.func.id == "_reconnect_evidence" for c in calls), (
         "session reconnect must leave an auditable P1 event"
     )
 
@@ -58,3 +59,28 @@ def test_broker_submit_success_path_owns_submission_events_and_state():
     assert "ENTRY_SUBMITTED" in source
     assert "RELEASE_NEAR_SUBMITTED" in source
     assert "RELEASE_FAR_SUBMITTED" in source
+
+
+def test_live_startup_latches_broker_truth_before_local_fills_restore():
+    """A stale local fills ledger must not rebuild live state first."""
+    tree = ast.parse(MONITOR.read_text(encoding="utf-8"))
+    mts_tick = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_mts_tick"
+    )
+    refresh_lines = [
+        node.lineno for node in ast.walk(mts_tick)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_refresh_live_broker_authority"
+    ]
+    restore_lines = [
+        node.lineno for node in ast.walk(mts_tick)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_restore_from_fills_log"
+    ]
+    assert refresh_lines and restore_lines
+    assert min(refresh_lines) < min(restore_lines), (
+        "broker truth must be queried before fills-led startup recovery"
+    )

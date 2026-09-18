@@ -925,6 +925,24 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool,
     _om_mon = getattr(om, "monitor", None) if om is not None else None
     handoff_targets = mons + ([_om_mon] if _om_mon is not None else [])
 
+    def _reconnect_evidence(event: str, **payload):
+        """Leave a P1 reconnect trace on every monitor when available."""
+        for _m in mons:
+            _append = getattr(_m, "_append_mts_event", None)
+            if callable(_append):
+                try:
+                    _append(event, **payload)
+                except Exception:
+                    # Evidence must never turn a recovered session into a
+                    # false success/failure; the execution gate remains the
+                    # authority for trading permission.
+                    pass
+
+    _reconnect_evidence(
+        "SESSION_RECONNECT_ATTEMPT",
+        reason="SESSION_DEATH_OR_DATA_STAGNATION",
+    )
+
     # ── Phase 0: quarantine BEFORE any re-login/wait (Step 5) ──
     _quarantine_for_handoff(handoff_targets)
 
@@ -942,6 +960,7 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool,
                 if not all(_recerts):
                     console.print("[red]❌ Re-certification failed after auto-reconnect — QUARANTINED, exiting for restart[/red]")
                     return False
+            _reconnect_evidence("SESSION_RECONNECT_READY")
             return True
         console.print("[yellow]⚠️ Shioaji auto-reconnect still pending — attempting manual re-login[/yellow]")
 
@@ -962,6 +981,7 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool,
             console.print(f"[cyan]🔄 Re-login attempt {attempt+1}/3...[/cyan]")
             safe_login(api, api_key, secret_key, contracts_timeout=10000)
             console.print("[green]✅ Shioaji re-login successful[/green]")
+            _reconnect_evidence("SESSION_RECONNECT_RELOGIN_SUCCESS")
             if not register_order_callback(api, mons, om):
                 console.print("[red]❌ Order callback registration failed — QUARANTINED[/red]")
                 return False
@@ -1009,9 +1029,15 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool,
                 if not all(_recerts):
                     console.print("[red]❌ Re-certification failed after re-login — QUARANTINED, exiting for restart[/red]")
                     return False
+            _reconnect_evidence("SESSION_RECONNECT_READY")
             return True
 
         except Exception as e:
+            _reconnect_evidence(
+                "SESSION_RECONNECT_FAILED",
+                attempt=attempt + 1,
+                error_type=type(e).__name__,
+            )
             console.print(f"[yellow]⚠️ Re-login attempt {attempt+1} failed: {e}[/yellow]")
             if attempt < 2:
                 wait = (attempt + 1) * 15  # 15s, 30s, 45s backoff

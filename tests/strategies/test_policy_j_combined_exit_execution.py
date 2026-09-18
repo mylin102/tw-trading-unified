@@ -90,9 +90,10 @@ def make_mock_monitor(fills_log=None):
 
 
 @pytest.fixture(autouse=True)
-def patch_state_path():
+def patch_state_path(tmp_path):
     with patch("strategies.futures.monitor._mts_position_state_path") as mock_path, \
-         patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True):
+         patch("strategies.futures.monitor.is_taifex_futures_market_open", return_value=True), \
+         patch("strategies.futures.monitor._mts_intent_log_dir", return_value=str(tmp_path)):
         mock_path.return_value.exists.return_value = False
         yield mock_path
 
