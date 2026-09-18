@@ -48,6 +48,9 @@ class TmfSpreadQuote:
     spread_bid: float | None
     spread_ask: float | None
     spread_mid: float | None
+    spread_width: float | None
+    tick_size: float
+    price_unit: str
     near_quote_time: Any
     far_quote_time: Any
     near_quote_age_ms: float | None
@@ -75,8 +78,10 @@ def build_tmf_spread_quote(
     far_quote: dict[str, Any] | None,
     *,
     now: datetime,
-    max_quote_age_ms: int = 2000,
-    max_leg_time_skew_ms: int = 500,
+    max_quote_age_ms: int,
+    max_leg_time_skew_ms: int,
+    tick_size: float = 1.0,
+    price_unit: str = "index_points",
     session_confirmed: bool = False,
     trading_date_confirmed: bool = False,
 ) -> TmfSpreadQuote:
@@ -96,6 +101,7 @@ def build_tmf_spread_quote(
             _number(near_quote, "bid"), _number(near_quote, "ask"),
             _number(far_quote, "bid"), _number(far_quote, "ask"),
             None, None, None,
+            None, tick_size, price_unit,
             near_quote.get("quote_time") if near_quote else None,
             far_quote.get("quote_time") if far_quote else None,
             near_age, far_age, skew, "BLOCKED", reason,
@@ -141,6 +147,8 @@ def build_tmf_spread_quote(
     return TmfSpreadQuote(
         near_code, far_code, nb, na, fb, fa, spread_bid, spread_ask,
         (spread_bid + spread_ask) / 2.0,
+        spread_ask - spread_bid,
+        tick_size, price_unit,
         near_quote.get("quote_time"), far_quote.get("quote_time"),
         near_age, far_age, skew, "VALID", None,
     )

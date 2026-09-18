@@ -158,6 +158,8 @@ def test_session_and_trading_date_must_be_confirmed(
         leg("TMFJ6"),
         leg("TMFK6"),
         now=NOW,
+        max_quote_age_ms=30000,
+        max_leg_time_skew_ms=500,
         session_confirmed=session_confirmed,
         trading_date_confirmed=trading_date_confirmed,
     )
