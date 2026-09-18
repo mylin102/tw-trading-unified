@@ -311,7 +311,8 @@ class ShioajiClient:
             return None
 
     def place_order(self, contract, action: str, quantity: int, price: float = 0,
-                    *, premise=None, intent_action=None, octype=None):
+                    *, premise=None, intent_action=None, octype=None,
+                    _verified_order=None):
         # P0 fix 2026-08-08 (verified on Mini shioaji 1.7.0):
         # OrderType=[FOK,IOC,ROD] — MTL does not exist; FuturesPriceType=
         # [LMT,MKP,MKT]; Order has NO market_type field.
@@ -325,7 +326,13 @@ class ShioajiClient:
         # Terminal failure/rejection semantics (fix-forward): a None API
         # return is ADAPTER_ORDER_NO_TRADE; a trade with terminal status
         # Failed/Rejected is ADAPTER_ORDER_REJECTED — zero silent failures.
-        self._gate_or_raise("place_order")          # [Step 8] fail-closed
+        # Nested calls (place_order_object -> place_order) must verify against
+        # the SAME order object the gateway authorized.  Passing no order here
+        # made verify_pending_submission(None) always False, so every
+        # object-bridge submission was refused as
+        # ADAPTER_GATEWAY_AUTHORIZATION_MISSING.  Direct callers keep the old
+        # fail-closed behaviour (no order => registry check fails).
+        self._gate_or_raise("place_order", _verified_order)
         self._authorize_broker_premise(
             contract, action, quantity, premise, intent_action)
         return self._place_order_unchecked(contract, action, quantity, price, octype)
@@ -338,9 +345,15 @@ class ShioajiClient:
         try:
             action_value = sj.Action.Buy if action.upper() in ("BUY", "LONG") \
                 else sj.Action.Sell
-            _octype = octype or sj.FuturesOCType.Auto
-            if isinstance(_octype, str):
-                _octype = getattr(sj.FuturesOCType, _octype, sj.FuturesOCType.Auto)
+            # shioaji's C-extension enum members are str-like, so
+            # isinstance(_octype, str) is True for a real member; passing that
+            # member to getattr(sj.FuturesOCType, ...) raises
+            # "attribute name must be string".  Resolve by NAME only for a
+            # plain string; a member already carries .value — use it as-is.
+            _octype = octype if octype is not None else sj.FuturesOCType.Auto
+            if not hasattr(_octype, "value"):
+                _octype = getattr(sj.FuturesOCType, str(_octype),
+                                  sj.FuturesOCType.Auto)
             order = self.api.Order(
                 action=action_value, price=price, quantity=quantity,
                 order_type=sj.OrderType.IOC if price == 0 else sj.OrderType.ROD,
@@ -412,6 +425,7 @@ class ShioajiClient:
             contract, action=side, quantity=quantity,
             price=getattr(order, "price", 0) or 0,
             premise=premise, intent_action=strategy or "ORDER",
+            _verified_order=order,
         )
 
     def place_combo_order_object(self, order):
