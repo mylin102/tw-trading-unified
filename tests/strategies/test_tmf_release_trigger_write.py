@@ -1,9 +1,8 @@
-"""The trigger's state write must NOT mark the release before the broker
-confirms the fill: far_status/near_status stay OPEN, no realized override
-is persisted, and released_leg is absent from the write.  The RELEASED
-status / realized / released_leg are FILL-confirmation-only (sync_release
-on LEG_FILLED) — otherwise the Dashboard hides the second leg while the
-broker still shows a pending release order.
+"""The trigger must not write leg state before broker confirmation.
+
+The strategy now emits only a decision; monitor/client owns broker submission
+and fill-confirmed state.  This test is intentionally updated from the old
+pre-submit state-write contract.
 """
 from unittest.mock import patch
 
@@ -34,12 +33,7 @@ def _capture_trigger_write(tmp_path, release_leg="far"):
 
 def test_trigger_write_keeps_both_legs_open_far(tmp_path):
     s, calls = _capture_trigger_write(tmp_path, "far")
-    assert calls.get("action") == "RELEASE_FAR"
-    assert calls.get("far_status") == "OPEN"       # NOT RELEASED
-    assert calls.get("near_status") == "OPEN"
-    assert calls.get("far_realized_override") is None
-    assert calls.get("near_realized_override") is None
-    assert "released_leg" not in calls             # marker is fill-only
+    assert calls == {}
     assert s._released_leg is None
     # no trailing while the release is pending (PendingSubmit, no fill)
     assert s._lifecycle_oca.trail_group.status == TrailGroupStatus.INACTIVE
@@ -47,11 +41,6 @@ def test_trigger_write_keeps_both_legs_open_far(tmp_path):
 
 def test_trigger_write_keeps_both_legs_open_near(tmp_path):
     s, calls = _capture_trigger_write(tmp_path, "near")
-    assert calls.get("action") == "RELEASE_NEAR"
-    assert calls.get("far_status") == "OPEN"
-    assert calls.get("near_status") == "OPEN"
-    assert calls.get("far_realized_override") is None
-    assert calls.get("near_realized_override") is None
-    assert "released_leg" not in calls
+    assert calls == {}
     assert s._released_leg is None
     assert s._lifecycle_oca.trail_group.status == TrailGroupStatus.INACTIVE

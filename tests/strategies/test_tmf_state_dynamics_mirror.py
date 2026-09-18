@@ -1,7 +1,7 @@
-"""State telemetry mirror: the strategy's entry state write must carry the
-spread-dynamics fields (dz / spread_slope / velocity_ema / spread) so the
-Dashboard can show them.  The SQL is authoritative; the state mirrors it
-for display only.
+"""Entry dynamics are no longer written by the strategy pre-submit path.
+
+The monitor's broker-accepted submission event is the telemetry boundary;
+this test protects against restoring the old ghost-state write.
 """
 from unittest.mock import patch
 
@@ -35,7 +35,4 @@ def test_entry_write_includes_dynamics(tmp_path):
          patch("strategies.plugins.futures.active.tmf_spread._append_event"):
         gs.return_value.entry_allowed.return_value = True
         s.on_bar(ctx)
-    assert calls.get("dz") == -4.5
-    assert calls.get("spread_slope") == 0.12
-    assert calls.get("velocity_ema") == -0.15
-    assert calls.get("spread") == 150.0
+    assert calls == {}
