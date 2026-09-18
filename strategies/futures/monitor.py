@@ -6194,6 +6194,7 @@ class FuturesMonitor:
             self._set_broker_refresh_channel_state("UNCERTAIN")
             self._broker_authority_degraded = True
             self._broker_position_observed = True
+            strategy._broker_truth_flat = False
             self._live_broker_authority = None
             self._live_broker_authority_at = _now
             return None
@@ -9201,6 +9202,36 @@ class FuturesMonitor:
         except Exception:
             pass
 
+    def _release_pre_submit_guard(self, *, action, reason, strategy,
+                                  symbol, leg):
+        """Require a fresh broker-held target leg immediately before send."""
+        from core.futures_release_guard import (
+            ReleaseIntent, evaluate_release_precondition,
+        )
+        try:
+            snapshot = self._capture_post_startup_snapshot()
+            raw_side = getattr(strategy, f"_{leg}_side", None)
+            premise = {"kind": "HOLD_LEG", "leg": leg,
+                       "side": str(raw_side or "").upper(), "qty": 1}
+            intent = ReleaseIntent(
+                action=action, symbol=symbol,
+                side="BUY" if premise["side"] == "SHORT" else "SELL",
+                qty=1, premise=premise)
+            decision = evaluate_release_precondition(intent, snapshot)
+        except Exception as exc:
+            self._append_mts_event(
+                "ORDER_INTENT_BLOCKED", action=action,
+                reason="BROKER_QUERY_UNAVAILABLE",
+                error=f"{type(exc).__name__}: {exc}")
+            return None
+        if not decision.allowed:
+            self._append_mts_event(
+                "ORDER_INTENT_BLOCKED", action=action,
+                reason=decision.reason, premise=intent.premise,
+                audit=decision.audit)
+            return None
+        return snapshot
+
     def _submit_mts_order_signal(self, signal, strategy, bar_dict, ts):
         """Submit order via order_mgr for MTS signals (entry, release, exit).
 
@@ -9415,6 +9446,17 @@ class FuturesMonitor:
             return
 
         if _action == "PARTIAL_EXIT":
+            _release_leg = ("near" if "RELEASE_NEAR" in str(_reason).upper()
+                            else "far" if "RELEASE_FAR" in str(_reason).upper()
+                            else None)
+            if self.live_trading and _release_leg:
+                _release_symbol = (_near_code if _release_leg == "near"
+                                   else _far_code)
+                if self._release_pre_submit_guard(
+                        action=str(_action), reason=str(_reason or ""),
+                        strategy=strategy, symbol=_release_symbol,
+                        leg=_release_leg) is None:
+                    return
             # 2026-06-17 Hermes Agent: use signal reason, not strategy._released_leg (still None before sync_release)
             _is_release_near = _reason and "RELEASE_NEAR" in str(_reason).upper()
             _is_release_far = _reason and "RELEASE_FAR" in str(_reason).upper()
@@ -10056,7 +10098,7 @@ class FuturesMonitor:
             # Both live and paper MTS entries use one calendar-spread combo
             # lifecycle.  The paper branch uses the local two-leg fill model
             # below; it never calls the broker adapter.
-            if ((self.live_trading and not self.dry_run)
+            if ((self.live_trading and not getattr(self, "dry_run", False))
                     or (not self.live_trading and self.paper_fill_sim)):
                 return self._submit_mts_combo_entry(
                     trade_id=_trade_id, action=_action, reason=_reason,
@@ -12749,11 +12791,10 @@ class FuturesMonitor:
             # close_all fails closed instead of sending a wrong order).
             _near_side = _disk.get("near_side") or getattr(strategy, "_near_side", None)
             _far_side = _disk.get("far_side") or getattr(strategy, "_far_side", None)
-            if _broker_pos > 0:
-                _near_side = "LONG"
-            elif _broker_pos < 0:
-                _near_side = "SHORT"
-            else:
+            # Quantity sign is not an entry-side premise.  Never synthesize
+            # direction from the current net position; only canonical state
+            # may provide LONG/SHORT, otherwise downstream exits fail closed.
+            if _near_side not in ("LONG", "SHORT"):
                 _near_side = None
             if _far_side not in ("LONG", "SHORT"):
                 console.print(
