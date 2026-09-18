@@ -282,8 +282,8 @@ def test_persist_syncs_live_context_to_wrapped_adapter_without_prior_attr(monkey
     assert monitor.client._execution_context is monitor._execution_context
 
 
-def test_mts_near_rejection_terminally_rejects_unsubmitted_far(monkeypatch):
-    """A failed first entry leg cannot leave an unsubmitted far leg for watchdog."""
+def test_live_mts_entry_never_uses_sequential_order_manager_submit(monkeypatch):
+    """Live entry is combo-only; the removed sequential leg path stays unreachable."""
     from datetime import datetime
     from strategies.futures import monitor as monitor_module
     from strategies.futures.monitor import FuturesMonitor
@@ -322,10 +322,9 @@ def test_mts_near_rejection_terminally_rejects_unsubmitted_far(monkeypatch):
         datetime(2026, 8, 10, 20, 6, 40),
     )
 
-    assert submitted == ["TMFH6"]
+    assert submitted == []
     assert manager.active_orders == {}
-    assert [order.status for order in manager.completed] == [OrderStatus.REJECTED, OrderStatus.REJECTED]
-    assert manager.completed[1].reject_reason == "PRECEDING_LEG_REJECTED"
+    assert manager.completed == []
     assert [kind for kind, _ in events].count("ORDER_SUBMITTED") == 0
 
 

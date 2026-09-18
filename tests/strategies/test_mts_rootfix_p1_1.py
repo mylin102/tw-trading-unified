@@ -23,12 +23,15 @@ def _monitor(snapshot):
 
 
 def test_p1_1_successful_flat_snapshot_sets_truth_flag():
+    from strategies.futures.mts_ledger_authority import MtsAuthority
     monitor = _monitor({
         "positions": [], "open_orders": [],
         "fetch_status": {"capture": "OK"},
     })
     strategy = SimpleNamespace(_has_position=False)
-    assert monitor._refresh_live_broker_authority(strategy) is None
+    authority = monitor._refresh_live_broker_authority(strategy)
+    assert authority is not None
+    assert authority.status == MtsAuthority.FLAT
     assert strategy._broker_truth_flat is True
 
 
